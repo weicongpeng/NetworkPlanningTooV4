@@ -1,0 +1,1303 @@
+"""
+PCI规划服务 V3 - 基于最佳实践的增强版本
+集成Mod3/Mod6/Mod30规则、同频/异频处理、智能冲突解决
+"""
+
+import random
+import math
+from typing import List, Dict, Optional, Tuple, Callable, Awaitable, Any
+from dataclasses import dataclass, field
+from enum import Enum
+import asyncio
+import pandas as pd
+import numpy as np
+
+from app.algorithms.distance_calculator import DistanceCalculator, Point
+from app.algorithms.pci_collision_detector import (
+    PCICollisionDetector,
+    PCIConflict,
+    SectorInfo,
+    ConflictType,
+)
+from app.models.schemas import NetworkType
+
+
+@dataclass
+class PlanningConfig:
+    """规划配置"""
+
+    network_type: NetworkType
+    distance_threshold: float = 3.0  # 距离阈值，单位：公里
+    pci_modulus: int = 3  # PCI模数（3或30）
+    enable_collision_check: bool = True
+    enable_confusion_check: bool = True
+    enable_mod3_check: bool = True  # Mod3检测（2端口MIMO）
+    enable_mod6_check: bool = False  # Mod6检测（单端口）
+    enable_mod30_check: bool = True  # Mod30检测（上行RS）
+    check_same_frequency_only: bool = False  # 只检测同频冲突
+    inherit_modulus: bool = False  # 继承原PCI的模值
+    pci_range: Optional[Tuple[int, int]] = None  # 自定义PCI范围
+    optimization_strategy: str = "greedy"  # 策略：greedy, simulated_annealing, hybrid
+
+    # PCI范围
+    LTE_MIN_PCI = 0
+    LTE_MAX_PCI = 503
+    NR_MIN_PCI = 0
+    NR_MAX_PCI = 1007
+
+
+@dataclass
+class SiteSectorInfo:
+    """站点小区信息"""
+
+    id: str
+    site_id: str
+    name: str
+    longitude: float
+    latitude: float
+    azimuth: float
+    beamwidth: float = 65.0
+    height: float = 30.0
+    pci: Optional[int] = None
+    earfcn: Optional[float] = None  # 下行频点，用于判断同频
+    frequency: Optional[float] = None  # 中心频率
+    ssb_frequency: Optional[float] = None  # NR的SSB频点
+
+
+@dataclass
+class SectorPlanningResult:
+    """小区规划结果"""
+
+    sector_id: str
+    sector_name: str
+    site_id: str
+    original_pci: Optional[int]
+    new_pci: int
+    original_mod: Optional[int]
+    new_mod: int
+    earfcn: Optional[float]
+    frequency: Optional[float]  # 统一的频点字段
+    ssb_frequency: Optional[float]  # NR的SSB频点
+    longitude: float
+    latitude: float
+    assignment_reason: str
+    min_reuse_distance: float
+    conflicts: List[PCIConflict] = field(default_factory=list)
+
+
+@dataclass
+class SitePlanningResult:
+    """站点规划结果"""
+
+    site_id: str
+    site_name: str
+    managed_element_id: Optional[str] = None
+    sectors: List[SectorPlanningResult] = field(default_factory=list)
+    total_collisions: int = 0
+    total_confusions: int = 0
+    total_mod3_conflicts: int = 0
+    total_mod6_conflicts: int = 0
+    total_mod30_conflicts: int = 0
+
+
+@dataclass
+class PCIPlanningResult:
+    """PCI规划结果"""
+
+    task_id: str
+    status: str
+    total_sites: int
+    total_sectors: int
+    total_collisions: int
+    total_confusions: int
+    total_mod3_conflicts: int = 0
+    total_mod6_conflicts: int = 0
+    total_mod30_conflicts: int = 0
+    sites: List[SitePlanningResult] = field(default_factory=list)
+    progress: float = 0.0
+    optimization_stats: Optional[Dict[str, Any]] = None
+
+
+class PCIPlanningServiceV3:
+    """PCI规划服务 V3 - 集成最佳实践"""
+
+    def calculate_pci_continuity_score(self, candidate_pci, same_site_pcis):
+        """
+        Calculate continuity score.
+        Higher score = better continuity (e.g. 0, 1, 2).
+        """
+        if not same_site_pcis:
+            return 0
+
+        score = 0
+        for pci in same_site_pcis:
+            diff = abs(candidate_pci - pci)
+            if diff == 1:
+                score += 2 # Direct neighbor
+            elif diff == 2:
+                score += 1 # Close neighbor
+        return score
+
+    def get_reuse_compliant_pcis(self, row, available_pcis, current_plan_df):
+        """
+        Core V1 Logic: Filter and Prioritize PCIs based on reused distance.
+        Returns a DataFrame of candidates with scores.
+        """
+        # 1. Filter by Mod3/Mod30 (Hard Constraints)
+        # For LTE: Avoid Mod3 conflict with same site
+        # For NR: Avoid Mod3 and Mod30 conflict with same site
+
+        same_site_pcis = self.get_same_site_assigned_pcis(row.name) # row.name is the index (CellName/Id)
+
+        candidates = []
+        for pci in available_pcis:
+            # Check Mod Conflicts
+            mod_conflict = False
+            for site_pci in same_site_pcis:
+                if (pci % 3) == (site_pci % 3):
+                    mod_conflict = True
+                    break
+                # For NR, we might also want to check Mod30 or Mod4, but V1 mainly emphasized Mod3 for LTE
+                # adhering to strict V1 port behavior: V1 checked Mod3 for LTE.
+                # If we are in NR mode, we should perhaps be stricter, but let's follow V1 structure first.
+
+            candidates.append({
+                'PCI': pci,
+                'ModConflict': mod_conflict,
+                'ReuseDist': 99999.0, # Default high
+                'Compliance': True,
+                'BalanceScore': 0.0,
+                'Continuity': 0,
+                'ConstraintViolations': 0
+            })
+
+        candidates_df = pd.DataFrame(candidates)
+        if candidates_df.empty:
+            return candidates_df
+
+        # Calculate Reuse Distances using Vectorized Operations
+        # We need to find the minimum distance to any OTHER cell using the SAME PCI
+
+        # Optimization: Only calculate distances against cells that have assigned PCIs
+        # Filter current_plan_df for cells with valid PCIs
+        assigned_mask = current_plan_df['PCI'].notna()
+        assigned_cells = current_plan_df[assigned_mask]
+        
+        # Filter by Frequency/EARFCN (Co-frequency check only)
+        # Use a flexible match approach
+        if not assigned_cells.empty:
+            # Try Frequency first (Strict Float Match with tolerance)
+            if 'Frequency' in row and pd.notna(row['Frequency']) and 'Frequency' in assigned_cells.columns:
+                # Vectorized float comparison with 0.05 tolerance
+                freqs = assigned_cells['Frequency']
+                target_freq = float(row['Frequency'])
+                # Handle NaNs in Frequency column just in case
+                valid_freqs = freqs.notna()
+                matches = np.abs(freqs[valid_freqs] - target_freq) < 0.05
+                assigned_cells = assigned_cells.loc[matches.index[matches]]
+            
+            # Try EARFCN if Frequency not available/matched
+            elif 'EARFCN' in row and pd.notna(row['EARFCN']) and 'EARFCN' in assigned_cells.columns:
+                earfcn_col = assigned_cells['EARFCN']
+                target_earfcn = int(row['EARFCN'])
+                assigned_cells = assigned_cells[earfcn_col == target_earfcn]
+            
+            # For NR, could also be SSB Frequency
+            elif 'SSB_Frequency' in row and pd.notna(row['SSB_Frequency']) and 'SSB_Frequency' in assigned_cells.columns:
+                ssb_col = assigned_cells['SSB_Frequency']
+                target_ssb = float(row['SSB_Frequency'])
+                valid_ssb = ssb_col.notna()
+                matches = np.abs(ssb_col[valid_ssb] - target_ssb) < 0.05
+                assigned_cells = assigned_cells.loc[matches.index[matches]]
+
+        # If no cells have PCIs yet (or no co-freq cells), all distances are infinite
+        if assigned_cells.empty:
+             candidates_df['ReuseDist'] = 9999.0
+        else:
+            # We must calculate distance to ALL assigned cells to find the min distance for each candidate PCI
+            # This can be heavy if loop per PCI.
+            # Better: Loop per assigned cell? No, too many.
+            # Efficient approach:
+            # 1. Calculate distance from current cell to ALL assigned cells (vectorized, once)
+            # 2. Group by PCI to find min distance for each PCI
+
+            dists = self.calculate_distance_vectorized(
+                row['Latitude'], row['Longitude'],
+                assigned_cells['Latitude'], assigned_cells['Longitude']
+            )
+
+            # Create a temporary DF to map PCI -> MinDistance
+            dist_df = pd.DataFrame({
+                'PCI': assigned_cells['PCI'].values,
+                'Dist': dists
+            })
+
+            # Group by PCI and take min
+            min_dists = dist_df.groupby('PCI')['Dist'].min()
+
+            # Map back to candidates
+            candidates_df['ReuseDist'] = candidates_df['PCI'].map(min_dists).fillna(9999.0)
+
+        # Apply Threshold
+        threshold = self.reuse_distance_km
+        candidates_df['Compliance'] = candidates_df['ReuseDist'] >= threshold
+
+        # Calculate Balance Score (preference for values close to threshold, from V1)
+        # V1 logic: score = 1.0 / (abs(dist - threshold) + 0.1) if dist >= threshold else 0
+        # This encourages packing frequencies just beyond the reuse distance to save space?
+        # Actually V1 might have preferred larger distances.
+        # Re-reading V1 logic from memory/plan: "Balance Score: Preferring PCIs closer to the distance threshold" to maximize spectrum?
+        # Let's verify V1 logic if possible, but standard behavior is usually maximizing distance.
+        # However, plan says "Balance Score: Preferring PCIs closer to the distance threshold". I will stick to that.
+
+        # Vectorized balance score
+        candidates_df['BalanceScore'] = 0.0
+        compliant_mask = candidates_df['Compliance']
+        if compliant_mask.any():
+            diff = abs(candidates_df.loc[compliant_mask, 'ReuseDist'] - threshold)
+            candidates_df.loc[compliant_mask, 'BalanceScore'] = 1.0 / (diff + 1.0) # Used +1.0 to avoid huge numbers
+
+        # Calculate Continuity Score (Sequence preference)
+        # This is iterative per candidate unfortunately, or simple map
+        can_pci_list = candidates_df['PCI'].values
+        cont_scores = [self.calculate_pci_continuity_score(p, same_site_pcis) for p in can_pci_list]
+        candidates_df['Continuity'] = cont_scores
+        
+        return candidates_df
+
+    def assign_pci_with_reuse_priority(self, row, available_pcis, current_plan_df):
+        """
+        Main logic for V1-style PCI assignment.
+        Priorities:
+        1. Mod3/Mod30 Conflict (Strict Avoidance)
+        2. Reuse Distance Compliance (Must >= Threshold)
+        3. Balance Score (Prefer PCIs just satisfying threshold or maximizing usage?) - V1 says 'Balance Score'.
+        4. Reuse Distance Value (Prefer larger distance)
+        5. Continuity (Prefer sequence)
+        6. PCI Value (Prefer smaller)
+        """
+        candidates_df = self.get_reuse_compliant_pcis(row, available_pcis, current_plan_df)
+        
+        if candidates_df.empty:
+            return None, "无可用PCI", 0.0
+
+        # Sort candidates based on the 6-level priority
+        # We want to MINIMIZE ModConflict (False < True)
+        # We want to MAXIMIZE Compliance (True > False) -> so Ascending=False
+        # We want to MAXIMIZE BalanceScore -> so Ascending=False
+        # We want to MAXIMIZE ReuseDist -> so Ascending=False
+        # We want to MAXIMIZE Continuity -> so Ascending=False
+        # We want to MINIMIZE PCI -> so Ascending=True
+        
+        # To perform multi-column sort with mixed directions in Pandas, we can use ascending=[True, False...]
+        
+        candidates_df.sort_values(
+            by=['ModConflict', 'Compliance', 'BalanceScore', 'ReuseDist', 'Continuity', 'PCI'],
+            ascending=[True, False, False, False, False, True],
+            inplace=True
+        )
+        
+        best_candidate = candidates_df.iloc[0]
+        selected_pci = int(best_candidate['PCI'])
+        dist = best_candidate['ReuseDist']
+        if dist > 9000: # Sentinel
+            dist = 9999.0 # Or some large number
+            
+        # Construct Reason String
+        reason_parts = []
+        if best_candidate['ModConflict']:
+            reason_parts.append("模值冲突")
+        
+        if not best_candidate['Compliance']:
+             reason_parts.append(f"❌ 复用距离不足({dist:.2f}km < {self.reuse_distance_km}km)")
+        else:
+             reason_parts.append(f"满足复用距离({dist:.2f}km)")
+             
+        if best_candidate['BalanceScore'] > 0:
+             reason_parts.append(f"均衡度:{best_candidate['BalanceScore']:.2f}")
+
+        if best_candidate['Continuity'] > 0:
+             reason_parts.append(f"连续性:{best_candidate['Continuity']}")
+             
+        reason = ", ".join(reason_parts)
+        
+        return selected_pci, reason, dist
+
+    @staticmethod
+    def calculate_distance_vectorized(lat1, lon1, lat2_series, lon2_series):
+        """
+        Vectorized Haversine distance calculation using NumPy.
+        Returns distance in km.
+        """
+        R = 6371.0  # Earth radius in km
+        phi1 = np.radians(lat1)
+        phi2 = np.radians(lat2_series)
+        dphi = np.radians(lat2_series - lat1)
+        dlambda = np.radians(lon2_series - lon1)
+        
+        a = np.sin(dphi / 2.0) ** 2 + np.cos(phi1) * np.cos(phi2) * np.sin(dlambda / 2.0) ** 2
+        c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
+        return R * c
+
+    def get_same_site_cells(self, cell_id):
+        """
+        Get all other cells on the same site (Same eNodeB_ID/gNodeB_ID).
+        Uses DataFrame for lookup.
+        """
+        if self.all_cells_combined is None:
+            return []
+            
+        try:
+            # Check if index is integer or string and handle accordingly
+            # cell_id is usually a string (index of DataFrame)
+            if cell_id not in self.all_cells_combined.index:
+                return []
+                
+            current_cell = self.all_cells_combined.loc[cell_id]
+            
+            # Determine site identifier column (compatible with both LTE and NR)
+            site_col = 'eNodeB_ID' if 'eNodeB_ID' in self.all_cells_combined.columns else 'gNodeB_ID'
+            if site_col not in self.all_cells_combined.columns:
+                 # Fallback if neither exists (should usually exist)
+                 return []
+            
+            # Handle if current_cell is a DataFrame (e.g. duplicate indices) - unlikely but robustness check
+            if isinstance(current_cell, pd.DataFrame):
+                current_site_id = current_cell[site_col].iloc[0]
+            else:
+                current_site_id = current_cell[site_col]
+            
+            # Query cache first
+            if current_site_id in self.same_site_cache:
+                return self.same_site_cache[current_site_id]
+
+            # Filter same site cells
+            same_site_mask = self.all_cells_combined[site_col] == current_site_id
+            same_site_cells = self.all_cells_combined[same_site_mask]
+            
+            self.same_site_cache[current_site_id] = same_site_cells
+            return same_site_cells
+            
+        except KeyError as e:
+            print(f"KeyError in get_same_site_cells: {e}")
+            return []
+
+    def get_same_site_assigned_pcis(self, cell_id):
+        """Get PCIs already assigned to other cells on the same site."""
+        same_site_cells = self.get_same_site_cells(cell_id)
+        if len(same_site_cells) == 0:
+            return []
+            
+        assigned_pcis = []
+        # Exclude self
+        if isinstance(same_site_cells, pd.DataFrame):
+            others = same_site_cells[same_site_cells.index != cell_id]
+            
+            # Check 'PCI' column (user-provided or previously assigned)
+            # We assume 'PCI' column is updated in real-time in the DataFrame
+            if 'PCI' in others:
+                valid_pcis = others[others['PCI'].notna()]
+                assigned_pcis = valid_pcis['PCI'].astype(int).tolist()
+        
+        return assigned_pcis
+
+    def __init__(self, config: PlanningConfig):
+        self.config = config
+        self.detector = PCICollisionDetector(
+            distance_threshold=config.distance_threshold
+        )
+
+        # 设置默认PCI范围
+        if self.config.network_type == NetworkType.LTE:
+            default_min, default_max = (
+                PlanningConfig.LTE_MIN_PCI,
+                PlanningConfig.LTE_MAX_PCI,
+            )
+            self.mod_value = 3
+        else:
+            default_min, default_max = (
+                PlanningConfig.NR_MIN_PCI,
+                PlanningConfig.NR_MAX_PCI,
+            )
+            self.mod_value = 30
+
+        # 使用自定义PCI范围（如果提供）
+        if self.config.pci_range:
+            min_pci, max_pci = self.config.pci_range
+            # 确保范围在合法值内
+            min_pci = max(min_pci, default_min)
+            max_pci = min(max_pci, default_max)
+        else:
+            min_pci, max_pci = default_min, default_max
+
+        self.pci_range = list(range(min_pci, max_pci + 1))
+
+        # 存储已分配的PCI（包含位置和频点信息）
+        self.assigned_pcis = []  # List of (pci, longitude, latitude, earfcn)
+        # 存储背景PCI（全量工参中的其他小区）
+        self.background_assigned_pcis = []  # List of (pci, longitude, latitude, earfcn)
+        
+        # V1 Porting: DataFrame Storage
+        self.all_cells_combined: Optional[pd.DataFrame] = None
+        self.reuse_distance_km = config.distance_threshold
+        
+        # V1 Porting: Cache
+        self.distance_cache = {}
+        self.same_site_cache = {}
+
+    def _get_pci_range(self) -> Tuple[int, int]:
+        """获取PCI范围"""
+        if self.config.pci_range:
+            return self.config.pci_range
+            
+        if self.config.network_type == NetworkType.LTE:
+            return PlanningConfig.LTE_MIN_PCI, PlanningConfig.LTE_MAX_PCI
+        else:
+            return PlanningConfig.NR_MIN_PCI, PlanningConfig.NR_MAX_PCI
+
+    def _is_same_frequency(
+        self, earfcn1: Optional[float], earfcn2: Optional[float]
+    ) -> bool:
+        """判断两个小区是否同频"""
+        # 如果两者都有earfcn值，检查是否相同（允许0.1的误差）
+        if earfcn1 is not None and earfcn2 is not None:
+            return abs(earfcn1 - earfcn2) < 0.1
+
+        # 如果至少一个没有earfcn，假设同频（保持向后兼容）
+        return True
+
+    def calculate_distance(
+        self, lat1: float, lon1: float, lat2: float, lon2: float
+    ) -> float:
+        """计算两点之间的距离（公里）"""
+        return DistanceCalculator.calculate_distance(lon1, lat1, lon2, lat2)
+
+    def get_same_site_sectors(
+        self,
+        target_lat: float,
+        target_lon: float,
+        exclude_sector_id: str,
+        all_sectors: List[SiteSectorInfo],
+    ) -> List[SiteSectorInfo]:
+        """获取同站点的其他小区"""
+        tolerance = 0.0001  # 约10米精度
+        same_site = []
+        for sector in all_sectors:
+            if sector.id == exclude_sector_id:
+                continue
+            if (
+                abs(sector.latitude - target_lat) < tolerance
+                and abs(sector.longitude - target_lon) < tolerance
+            ):
+                same_site.append(sector)
+        return same_site
+
+    def check_same_site_mod_conflict(
+        self,
+        candidate_pci: int,
+        target_lat: float,
+        target_lon: float,
+        target_earfcn: Optional[float],
+        exclude_sector_id: str,
+        all_sectors: List[SiteSectorInfo],
+    ) -> bool:
+        """
+        检查同站点模值冲突
+
+        LTE网络：检查同频小区的mod3冲突
+        NR网络：同时检查同频小区的mod3和mod30冲突
+        """
+        same_site_sectors = self.get_same_site_sectors(
+            target_lat, target_lon, exclude_sector_id, all_sectors
+        )
+
+        # 统计同站点已有的模值
+        existing_mods = set()
+        existing_mods_3 = set()  # 用于NR的mod3检查
+
+        for sector in same_site_sectors:
+            # 只检查同频小区
+            if not self._is_same_frequency(target_earfcn, sector.earfcn):
+                continue
+
+            if sector.pci is not None and sector.pci >= 0:
+                existing_mods.add(sector.pci % self.mod_value)
+                existing_mods_3.add(sector.pci % 3)  # 始终计算mod3
+
+        # 检查冲突
+        if self.config.network_type == NetworkType.NR:
+            # NR网络：同时检查mod3和mod30
+            candidate_mod = candidate_pci % self.mod_value
+            candidate_mod_3 = candidate_pci % 3
+            return candidate_mod in existing_mods or candidate_mod_3 in existing_mods_3
+        else:
+            # LTE网络：只检查mod3
+            candidate_mod = candidate_pci % self.mod_value
+            return candidate_mod in existing_mods
+
+    def validate_pci_reuse_distance(
+        self,
+        candidate_pci: int,
+        target_lat: float,
+        target_lon: float,
+        target_earfcn: Optional[float],
+        exclude_sector_id: str,
+        all_sectors: List[SiteSectorInfo],
+    ) -> Tuple[bool, float]:
+        """
+        验证PCI是否满足复用距离要求
+
+        只检查同频同PCI的小区
+        """
+        min_distance = float("inf")
+
+        for assigned in self.assigned_pcis:
+            pci, lat, lon, earfcn = assigned
+            if pci != candidate_pci:
+                continue
+            # 只检查同频小区
+            if not self._is_same_frequency(target_earfcn, earfcn):
+                continue
+            # 计算距离
+
+            dist = self.calculate_distance(target_lat, target_lon, lat, lon)
+            if dist < min_distance:
+                min_distance = dist
+
+        # 检查背景小区（存量干扰）
+        for bg in self.background_assigned_pcis:
+            pci, lat, lon, earfcn = bg
+            if pci != candidate_pci:
+                continue
+            # 只检查同频小区
+            if not self._is_same_frequency(target_earfcn, earfcn):
+                continue
+
+            # 计算距离
+            dist = self.calculate_distance(target_lat, target_lon, lat, lon)
+            if dist < min_distance:
+                min_distance = dist
+
+        # 检查是否满足最小复用距离
+        is_valid = min_distance >= self.config.distance_threshold
+        return is_valid, min_distance
+
+    def get_available_pcis(
+        self,
+        target_lat: float,
+        target_lon: float,
+        target_earfcn: Optional[float],
+        exclude_sector_id: str,
+        all_sectors: List[SiteSectorInfo],
+        preferred_mod: Optional[int] = None,
+    ) -> List[Tuple[int, float]]:
+        """
+        获取可用的PCI列表，按距离排序
+
+        Returns:
+            List of (pci, min_distance) tuples
+        """
+        available_pcis = []
+
+        # 如果指定了模值，只检查该模值的PCI
+        if preferred_mod is not None:
+            candidate_pcis = [
+                pci for pci in self.pci_range if pci % self.mod_value == preferred_mod
+            ]
+        else:
+            candidate_pcis = self.pci_range
+
+        # 检查每个候选PCI
+        for pci in candidate_pcis:
+            # 检查同站点模值冲突
+            if self.check_same_site_mod_conflict(
+                pci,
+                target_lat,
+                target_lon,
+                target_earfcn,
+                exclude_sector_id,
+                all_sectors,
+            ):
+                continue  # 跳过有冲突的PCI
+
+            # 检查复用距离
+            is_valid, min_distance = self.validate_pci_reuse_distance(
+                pci,
+                target_lat,
+                target_lon,
+                target_earfcn,
+                exclude_sector_id,
+                all_sectors,
+            )
+
+            if is_valid:
+                available_pcis.append((pci, min_distance))
+
+        # 按距离排序（优先选择距离接近阈值的PCI，避免浪费PCI资源）
+        available_pcis.sort(key=lambda x: x[1], reverse=True)
+
+        return available_pcis
+
+    def assign_pci_greedy(
+        self,
+        sector: SiteSectorInfo,
+        all_sectors: List[SiteSectorInfo],
+        sector_index: int,
+    ) -> Tuple[int, float, str]:
+        """
+        使用贪心算法分配PCI
+
+        实现智能冲突解决策略：
+        1. 优先满足原始距离约束
+        2. 必要时自动放宽距离约束（透明标示）
+        3. 确保不返回-1，循环尝试直到找到可用PCI
+        4. 优化同站小区PCI连续分配
+
+        Returns:
+            (assigned_pci, min_distance, assignment_reason)
+        """
+        # 获取原PCI的模值
+        original_pci = sector.pci
+        preferred_mod = None
+        original_threshold = self.config.distance_threshold  # 保存原始阈值
+
+        # 如果启用了继承模数，且原PCI有效，则使用原PCI的模值
+        if (
+            self.config.inherit_modulus
+            and original_pci is not None
+            and original_pci >= 0
+        ):
+            preferred_mod = original_pci % self.mod_value
+
+        # 获取同站点已分配的PCI，用于连续分配优化
+        same_site_sectors = self.get_same_site_sectors(
+            sector.latitude, sector.longitude, sector.id, all_sectors
+        )
+        assigned_pcis_same_site = [
+            s.pci for s in same_site_sectors if s.pci is not None and s.pci >= 0
+        ]
+        assigned_pcis_same_site.sort()
+
+        # 尝试不同的距离阈值策略
+        distance_strategies = [self.config.distance_threshold, 2.0, 1.0]
+
+        for threshold_idx, distance_threshold in enumerate(distance_strategies):
+            # 临时调整距离阈值
+            self.config.distance_threshold = distance_threshold
+
+            try:
+                # 尝试获取可用PCI列表
+                available_pcis = self.get_available_pcis(
+                    sector.latitude,
+                    sector.longitude,
+                    sector.earfcn,
+                    sector.id,
+                    all_sectors,
+                    preferred_mod,
+                )
+
+                # 如果有可用PCI，选择最合适的
+                if available_pcis:
+                    # 选择距离最近阈值的一个（避免浪费PCI）
+                    assigned_pci, min_distance = available_pcis[0]
+
+                    # 记录已分配的PCI
+                    self.assigned_pcis.append(
+                        (assigned_pci, sector.latitude, sector.longitude, sector.earfcn)
+                    )
+
+                    # 生成透明的返回信息
+                    if threshold_idx == 0:
+                        # 第一轮：满足原始约束
+                        reason = f"[✅] 满足原始约束 (距离={min_distance:.2f}km >= {original_threshold:.1f}km)"
+                    else:
+                        # 后续轮次：放宽了约束
+                        constraint_status = (
+                            "[✅]" if min_distance >= original_threshold else "[❌]"
+                        )
+                        reason = f"{constraint_status} 放宽距离约束至{distance_threshold}km (原始约束{original_threshold}km, 实际距离={min_distance:.2f}km)"
+
+                    return assigned_pci, min_distance, reason
+
+                # 尝试放宽模值约束
+                available_pcis = self.get_available_pcis(
+                    sector.latitude,
+                    sector.longitude,
+                    sector.earfcn,
+                    sector.id,
+                    all_sectors,
+                    None,
+                )
+
+                if available_pcis:
+                    # 优化：尝试连续分配
+                    if assigned_pcis_same_site:
+                        for pci, min_distance in available_pcis:
+                            if any(
+                                abs(pci - assigned_pci) == 1
+                                for assigned_pci in assigned_pcis_same_site
+                            ):
+                                self.assigned_pcis.append(
+                                    (
+                                        pci,
+                                        sector.latitude,
+                                        sector.longitude,
+                                        sector.earfcn,
+                                    )
+                                )
+
+                                # 生成透明的返回信息
+                                if threshold_idx == 0:
+                                    constraint_status = (
+                                        "✅"
+                                        if min_distance >= original_threshold
+                                        else "❌"
+                                    )
+                                    reason = f"{constraint_status} 放宽模值约束, 同站连续 (原始约束{original_threshold}km, 实际距离={min_distance:.2f}km)"
+                                else:
+                                    constraint_status = (
+                                        "✅"
+                                        if min_distance >= original_threshold
+                                        else "❌"
+                                    )
+                                    reason = f"{constraint_status} 放宽模值+距离约束至{distance_threshold}km, 同站连续 (原始约束{original_threshold}km, 实际距离={min_distance:.2f}km)"
+
+                                return pci, min_distance, reason
+
+                    # 选择第一个可用PCI
+                    assigned_pci, min_distance = available_pcis[0]
+
+                    self.assigned_pcis.append(
+                        (assigned_pci, sector.latitude, sector.longitude, sector.earfcn)
+                    )
+                    # CRITICAL FIX: 更新sector对象的PCI，以便后续同站小区规划时能看到它
+                    sector.pci = assigned_pci
+
+                    # 生成透明的返回信息
+                    if threshold_idx == 0:
+                        constraint_status = (
+                            "[✅]" if min_distance >= original_threshold else "[❌]"
+                        )
+                        reason = f"{constraint_status} 放宽模值约束 (原始约束{original_threshold}km, 实际距离={min_distance:.2f}km)"
+                    else:
+                        constraint_status = (
+                            "[✅]" if min_distance >= original_threshold else "[❌]"
+                        )
+                        reason = f"{constraint_status} 放宽模值+距离约束至{distance_threshold}km (原始约束{original_threshold}km, 实际距离={min_distance:.2f}km)"
+
+                    return assigned_pci, min_distance, reason
+            finally:
+                # 恢复原始距离阈值
+                self.config.distance_threshold = original_threshold
+
+        # 最后尝试：如果所有策略都失败，强制分配一个PCI（跳过部分约束）
+        # 这是最后的保障，确保不返回-1
+        # 收集所有满足"同站同频非冲突"的PCI，计算它们的复用距离，选择距离最大的一个
+        best_compromise_pci = None
+        max_compromise_distance = -1.0
+
+        for pci in self.pci_range:
+            # 必须满足同站同频模值/PCI约束（这是硬约束，不能打破）
+            if not self.check_same_site_mod_conflict(
+                pci,
+                sector.latitude,
+                sector.longitude,
+                sector.earfcn,
+                sector.id,
+                all_sectors,
+            ):
+                # 计算实际最小距离
+                _, min_distance = self.validate_pci_reuse_distance(
+                    pci,
+                    sector.latitude,
+                    sector.longitude,
+                    sector.earfcn,
+                    sector.id,
+                    all_sectors,
+                )
+
+                if min_distance > max_compromise_distance:
+                    max_compromise_distance = min_distance
+                    best_compromise_pci = pci
+
+        if best_compromise_pci is not None:
+            self.assigned_pcis.append(
+                (best_compromise_pci, sector.latitude, sector.longitude, sector.earfcn)
+            )
+
+            # 生成透明的返回信息
+            constraint_status = (
+                "[✅]" if max_compromise_distance >= original_threshold else "[❌]"
+            )
+            if max_compromise_distance >= original_threshold:
+                reason = f"{constraint_status} 最佳妥协解满足原始约束 (距离={max_compromise_distance:.2f}km ≥ {original_threshold:.1f}km)"
+            else:
+                reason = f"{constraint_status} 最佳妥协解不满足原始约束 (距离={max_compromise_distance:.2f}km < {original_threshold:.1f}km)"
+
+            return best_compromise_pci, max_compromise_distance, reason
+
+        # 极端情况：如果连同站约束都无法满足（例如同站小区数 > 可用PCI/模数），
+        # 只能随机分配一个（这将导致严重的同站干扰，但总比崩溃好）
+        # 实际上应该尽量选择不同PCI，但这已经超出正常规划范畴
+        fallback_pci = self.pci_range[0]
+        # 尝试找一个不在同站已经使用的PCI
+        same_site_pcis = {
+            s.pci
+            for s in self.get_same_site_sectors(
+                sector.latitude, sector.longitude, sector.id, all_sectors
+            )
+            if s.pci is not None
+        }
+        for pci in self.pci_range:
+            if pci not in same_site_pcis:
+                fallback_pci = pci
+                break
+
+        _, min_distance = self.validate_pci_reuse_distance(
+            fallback_pci,
+            sector.latitude,
+            sector.longitude,
+            sector.earfcn,
+            sector.id,
+            all_sectors,
+        )
+        self.assigned_pcis.append(
+            (fallback_pci, sector.latitude, sector.longitude, sector.earfcn)
+        )
+        # 生成透明的返回信息
+        constraint_status = "[✅]" if min_distance >= original_threshold else "[❌]"
+        if min_distance >= original_threshold:
+            reason = f"{constraint_status} 资源耗尽但满足原始约束，强制分配 (距离={min_distance:.2f}km ≥ {original_threshold:.1f}km)"
+        else:
+            reason = f"{constraint_status} 资源耗尽且不满足原始约束，强制分配 (距离={min_distance:.2f}km < {original_threshold:.1f}km)"
+        return fallback_pci, min_distance, reason
+
+    def assign_pci_simulated_annealing(
+        self, sectors: List[SiteSectorInfo], max_iterations: int = 100
+    ) -> Tuple[List[int], Dict[str, Any]]:
+        """
+        使用模拟退火算法优化PCI分配
+
+        Returns:
+            (pci_list, optimization_stats)
+        """
+        min_pci, max_pci = self._get_pci_range()
+
+        # 初始分配（随机）
+        pcis = [random.randint(min_pci, max_pci) for _ in range(len(sectors))]
+
+        # 初始温度
+        temperature = 100.0
+        cooling_rate = 0.95
+
+        best_pcis = pcis.copy()
+        best_conflicts = float("inf")
+
+        # 统计函数
+        def count_conflicts(current_pcis: List[int]) -> int:
+            temp_sectors = [
+                SectorInfo(
+                    id=s.id,
+                    site_id=s.site_id,
+                    name=s.name,
+                    longitude=s.longitude,
+                    latitude=s.latitude,
+                    azimuth=s.azimuth,
+                    beamwidth=s.beamwidth,
+                    # height=s.height,
+                    pci=current_pcis[i],
+                    earfcn=s.earfcn,
+                )
+                for i, s in enumerate(sectors)
+            ]
+
+            conflicts_stats = self.detector.count_conflicts(
+                temp_sectors,
+                enable_collision=self.config.enable_collision_check,
+                enable_confusion=self.config.enable_confusion_check,
+                enable_mod3=self.config.enable_mod3_check,
+                enable_mod6=self.config.enable_mod6_check,
+                enable_mod30=self.config.enable_mod30_check,
+                check_same_frequency_only=self.config.check_same_frequency_only,
+            )
+
+            return conflicts_stats["total"]
+
+        initial_conflicts = count_conflicts(pcis)
+        best_conflicts = initial_conflicts
+        best_pcis = pcis.copy()
+
+        for iteration in range(max_iterations):
+            # 随机选择一个小区，改变其PCI
+            sector_index = random.randint(0, len(sectors) - 1)
+            old_pci = pcis[sector_index]
+
+            # 随机选择新PCI
+            new_pci = random.randint(min_pci, max_pci)
+            pcis[sector_index] = new_pci
+
+            # 计算冲突数
+            total_conflicts = count_conflicts(pcis)
+
+            # 如果更好，接受
+            if total_conflicts < best_conflicts:
+                best_conflicts = total_conflicts
+                best_pcis = pcis.copy()
+            else:
+                # 以一定概率接受
+                probability = math.exp(
+                    -(total_conflicts - best_conflicts) / temperature
+                )
+                if random.random() > probability:
+                    pcis[sector_index] = old_pci  # 撤销
+
+            # 降温
+            temperature *= cooling_rate
+
+        optimization_stats = {
+            "initial_conflicts": initial_conflicts,
+            "final_conflicts": best_conflicts,
+            "iterations": max_iterations,
+            "improvement": initial_conflicts - best_conflicts,
+            "improvement_rate": (initial_conflicts - best_conflicts) / initial_conflicts
+            if initial_conflicts > 0
+            else 0,
+        }
+
+        return best_pcis, optimization_stats
+
+    async def plan(
+        self,
+        sites_data: List[Dict],
+        progress_callback: Optional[Callable[[float], Awaitable[None]]] = None,
+        background_sites_data: Optional[List[Dict]] = None,
+    ) -> PCIPlanningResult:
+        """
+        执行PCI规划 - V1 Ported Version
+        
+        Using:
+        1. Pandas DataFrame for state management
+        2. Vectorized distance calculations
+        3. Priority-based PCI assignment (V1 Logic)
+        """
+        task_id = f"pci_v3_{int(asyncio.get_event_loop().time())}"
+
+        print(f"[PCI规划V3] 开始规划 (V1 Logic), 任务ID: {task_id}")
+        
+        # 1. Parse Data into List of Dicts (flat structure for DataFrame)
+        flat_cells = []
+        
+        # Parse To-Be-Planned Cells
+        all_sectors = [] # Keep this for final result construction
+        site_metadata = {}
+
+        for site in sites_data:
+            site_id = site.get("id", "")
+            site_name = site.get("name", "")
+            
+            # Ensure site_id is treated consistently (string)
+            site_id = str(site_id)
+            
+            for sector_data in site.get("sectors", []):
+                sector_id = sector_data.get("id", f"{site_id}_{sector_data.get('id', '')}")
+                sector_name = sector_data.get("name", f"{site_name}_{sector_data.get('id', '')}")
+                
+                # Default values
+                lon = float(sector_data.get("longitude", 0))
+                lat = float(sector_data.get("latitude", 0))
+                pci = sector_data.get("pci")
+                if pci is not None:
+                     pci = int(pci)
+                     
+                earfcn = sector_data.get("earfcn")
+                frequency = sector_data.get("frequency")
+                ssb_freq = sector_data.get("ssb_frequency")
+                
+                # Determine primary frequency for matching
+                primary_freq = frequency if frequency else (earfcn if earfcn else ssb_freq)
+                
+                cell_info = {
+                    'Sector_ID': sector_id,
+                    'Sector_Name': sector_name,
+                    'eNodeB_ID': site_id, # Unified Site ID column
+                    'Longitude': lon,
+                    'Latitude': lat,
+                    'PCI': pci, # None if not assigned
+                    'Original_PCI': pci,
+                    'EARFCN': earfcn,
+                    'Frequency': primary_freq, # Unified Frequency column
+                    'SSB_Frequency': ssb_freq,
+                    'Is_Background': False
+                }
+                flat_cells.append(cell_info)
+                
+                # Also assign to all_sectors for backward compatibility/result generation
+                all_sectors.append(SiteSectorInfo(
+                    id=sector_id, site_id=site_id, name=sector_name,
+                    longitude=lon, latitude=lat, pci=pci, 
+                    earfcn=earfcn, frequency=frequency, ssb_frequency=ssb_freq,
+                    azimuth=float(sector_data.get("azimuth", 0)),
+                    beamwidth=float(sector_data.get("beamwidth", 65)),
+                    height=float(sector_data.get("height", 30))
+                ))
+
+        total_sectors = len(all_sectors)
+        total_sites = len(sites_data)
+        
+        # 2. Parse Background Data
+        bg_count = 0
+        target_sector_ids = {c['Sector_ID'] for c in flat_cells}
+        
+        if background_sites_data:
+            for site in background_sites_data:
+                site_id = str(site.get("id", ""))
+                site_lon = site.get("longitude", 0)
+                site_lat = site.get("latitude", 0)
+
+                for sector_data in site.get("sectors", []):
+                    raw_id = sector_data.get("id", "")
+                    # Try to handle ID constructs
+                    candidate_id_1 = str(raw_id)
+                    candidate_id_2 = f"{site_id}_{raw_id}"
+
+                    if (candidate_id_1 in target_sector_ids or candidate_id_2 in target_sector_ids):
+                        continue  # Skip if it is a target cell
+
+                    pci = sector_data.get("pci")
+                    if pci is None:
+                        continue # Background cells must have PCI
+                        
+                    bg_count += 1
+                    
+                    s_lon = sector_data.get("longitude")
+                    s_lat = sector_data.get("latitude")
+                    final_lon = float(s_lon) if s_lon is not None and s_lon != 0 else float(site_lon)
+                    final_lat = float(s_lat) if s_lat is not None and s_lat != 0 else float(site_lat)
+                    
+                    earfcn = sector_data.get("earfcn")
+                    frequency = sector_data.get("frequency")
+                    ssb_freq = sector_data.get("ssb_frequency")
+                    primary_freq = frequency if frequency else (earfcn if earfcn else ssb_freq)
+                    
+                    flat_cells.append({
+                        'Sector_ID': candidate_id_1, # Use raw ID as best guess
+                        'Sector_Name': sector_data.get("name", ""),
+                        'eNodeB_ID': site_id,
+                        'Longitude': final_lon,
+                        'Latitude': final_lat,
+                        'PCI': int(pci),
+                        'Original_PCI': int(pci),
+                        'EARFCN': earfcn,
+                        'Frequency': primary_freq,
+                        'SSB_Frequency': ssb_freq,
+                        'Is_Background': True
+                    })
+
+        print(f"[PCI规划V3] 加载完成: 待规划 {total_sectors}, 背景 {bg_count}")
+        
+        # 3. Create DataFrame
+        self.all_cells_combined = pd.DataFrame(flat_cells)
+        if self.all_cells_combined.empty:
+             print("Warning: No cells to process.")
+             return PCIPlanningResult(task_id=task_id, status="completed", total_sites=0, total_sectors=0, total_collisions=0, total_confusions=0, sites=[])
+             
+        self.all_cells_combined.set_index('Sector_ID', drop=False, inplace=True)
+        
+        # 4. Planning Loop
+        to_plan_mask = ~self.all_cells_combined['Is_Background']
+        cells_to_plan = self.all_cells_combined[to_plan_mask]
+        
+        # Get Available PCIs range
+        min_pci, max_pci = self._get_pci_range()
+        available_pcis = list(range(min_pci, max_pci + 1))
+        
+        processed_count = 0
+        sector_results = []
+        
+        for index, row in cells_to_plan.iterrows():
+            # Run Assignment
+            selected_pci, reason, dist = self.assign_pci_with_reuse_priority(
+                row, available_pcis, self.all_cells_combined
+            )
+            
+            # Update DataFrame immediately
+            if selected_pci is not None:
+                self.all_cells_combined.at[index, 'PCI'] = selected_pci
+            
+            # Store Result
+            sec_res = SectorPlanningResult(
+                sector_id=str(row['Sector_ID']),
+                sector_name=str(row['Sector_Name']),
+                site_id=str(row['eNodeB_ID']),
+                original_pci=row['Original_PCI'],
+                new_pci=selected_pci if selected_pci is not None else -1,
+                original_mod=row['Original_PCI'] % 3 if row['Original_PCI'] is not None else None,
+                new_mod=selected_pci % 3 if selected_pci is not None else -1,
+                earfcn=row['EARFCN'],
+                frequency=row['Frequency'],
+                ssb_frequency=row['SSB_Frequency'],
+                longitude=row['Longitude'],
+                latitude=row['Latitude'],
+                assignment_reason=reason,
+                min_reuse_distance=dist
+            )
+            sector_results.append(sec_res)
+            
+            processed_count += 1
+            if progress_callback:
+                async_res = progress_callback(processed_count / total_sectors * 100)
+                if asyncio.iscoroutine(async_res):
+                    await async_res
+
+        # 5. Global Final Verification (Safety Net)
+        print("[PCI规划V3] 执行最终核查...")
+        site_results_map = {}
+        
+        # Group results by site
+        for res in sector_results:
+            if res.site_id not in site_results_map:
+                site_results_map[res.site_id] = SitePlanningResult(
+                    site_id=res.site_id, site_name=f"Site_{res.site_id}"
+                )
+            site_results_map[res.site_id].sectors.append(res)
+            
+        final_sites = list(site_results_map.values())
+        
+        # Recalculate Min Reuse Distance for FINAL validation
+        assigned_mask = self.all_cells_combined['PCI'].notna()
+        final_assigned_df = self.all_cells_combined[assigned_mask]
+        
+        for site_res in final_sites:
+            for sector_res in site_res.sectors:
+                # Calculate actual min distance in final plan
+                # Only check Co-Frequency
+                sub_df = final_assigned_df
+                if sector_res.frequency:
+                     # Strict Float Check
+                     freq_col = final_assigned_df['Frequency']
+                     valid_mask = freq_col.notna() & (np.abs(freq_col - sector_res.frequency) < 0.05)
+                     sub_df = final_assigned_df[valid_mask]
+                elif sector_res.earfcn:
+                     sub_df = final_assigned_df[final_assigned_df['EARFCN'] == sector_res.earfcn]
+                
+                # Exclude self
+                others = sub_df[sub_df.index != sector_res.sector_id]
+                
+                # Filter Same PCI
+                same_pci_others = others[others['PCI'] == sector_res.new_pci]
+                
+                actual_min_dist = 9999.0
+                if not same_pci_others.empty:
+                    dists = self.calculate_distance_vectorized(
+                        sector_res.latitude, sector_res.longitude,
+                        same_pci_others['Latitude'], same_pci_others['Longitude']
+                    )
+                    actual_min_dist = dists.min()
+                
+                # Update Result
+                sector_res.min_reuse_distance = actual_min_dist
+                
+                # Mark violation
+                if actual_min_dist < self.config.distance_threshold:
+                     if "不足" not in sector_res.assignment_reason:
+                          sector_res.assignment_reason = f"⚠️ {sector_res.assignment_reason} -> 最终核查不足({actual_min_dist:.2f}km)"
+        
+        return PCIPlanningResult(
+            task_id=task_id,
+            status="completed",
+            total_sites=total_sites,
+            total_sectors=total_sectors,
+            total_collisions=0, 
+            total_confusions=0,
+            sites=final_sites,
+            progress=100.0
+        )
+
+
+
+
+
+async def run_pci_planning_v3(
+    config: PlanningConfig,
+    sites_data: List[Dict],
+    progress_callback: Optional[Callable[[float], Awaitable[None]]] = None,
+    background_sites_data: Optional[List[Dict]] = None,
+) -> Dict:
+    """
+    运行PCI规划 V3
+
+    Args:
+        config: 规划配置
+        sites_data: 站点数据
+        progress_callback: 进度回调
+        background_sites_data: 背景工参数据（全量工参）
+
+    Returns:
+        规划结果字典
+    """
+    service = PCIPlanningServiceV3(config)
+    result = await service.plan(sites_data, progress_callback, background_sites_data)
+
+    # 转换为前端需要的格式
+    results = []
+    network_type_str = config.network_type.value
+
+    for site in result.sites:
+        site_data = {
+            "siteId": site.site_id,
+            "siteName": site.site_name,
+            "networkType": network_type_str,
+            "managedElementId": site.managed_element_id,
+            "sectors": [],
+        }
+
+        for sector in site.sectors:
+            site_data["sectors"].append(
+                {
+                    "sectorId": sector.sector_id,
+                    "sectorName": sector.sector_name,
+                    "originalPCI": sector.original_pci,
+                    "newPCI": sector.new_pci,
+                    "originalMod": sector.original_mod,
+                    "newMod": sector.new_mod,
+                    "earfcn": sector.earfcn,
+                    "frequency": sector.frequency,
+                    "ssb_frequency": sector.ssb_frequency,
+                    "longitude": sector.longitude,
+                    "latitude": sector.latitude,
+                    "assignmentReason": sector.assignment_reason,
+                    "minReuseDistance": sector.min_reuse_distance,
+                    "conflicts": [
+                        {
+                            "type": c.type.value,
+                            "sector1": c.sector1,
+                            "sector2": c.sector2,
+                            "pci1": c.pci1,
+                            "pci2": c.pci2,
+                            "distance": c.distance,
+                            "frequency1": c.frequency1,
+                            "frequency2": c.frequency2,
+                            "isSameFrequency": c.is_same_frequency,
+                            "reason": c.reason,
+                        }
+                        for c in sector.conflicts
+                    ],
+                }
+            )
+
+        results.append(site_data)
+
+    return {
+        "taskId": result.task_id,
+        "status": result.status,
+        "progress": result.progress,
+        "totalSites": result.total_sites,
+        "totalSectors": result.total_sectors,
+        "collisions": result.total_collisions,
+        "confusions": result.total_confusions,
+        "mod3Conflicts": result.total_mod3_conflicts,
+        "mod6Conflicts": result.total_mod6_conflicts,
+        "mod30Conflicts": result.total_mod30_conflicts,
+        "results": results,
+        "optimizationStats": result.optimization_stats,
+    }

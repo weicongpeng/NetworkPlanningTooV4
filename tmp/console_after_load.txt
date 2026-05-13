@@ -1,0 +1,161 @@
+Total messages: 160 (Errors: 0, Warnings: 7)
+Returning 158 messages for level "info"
+
+[INFO] %cDownload the React DevTools for a better development experience: https://reactjs.org/link/react-devtools font-weight:bold @ http://localhost:5173/node_modules/.vite/deps/chunk-PJEEZAML.js?v=b2e68fb4:21550
+[LOG] [API] Environment: {isDev: true, API_BASE_URL: /api/v1, DEV_BACKEND_URL: http://localhost:8000/api/v1} @ http://localhost:5173/src/renderer/services/api.ts:4
+[WARNING] ⚠️ React Router Future Flag Warning: React Router will begin wrapping state updates in `React.startTransition` in v7. You can use the `v7_startTransition` future flag to opt-in early. For more information, see https://reactrouter.com/v6/upgrading/future#v7_starttransition. @ http://localhost:5173/node_modules/.vite/deps/react-router-dom.js?v=b2e68fb4:4412
+[WARNING] ⚠️ React Router Future Flag Warning: Relative route resolution within Splat routes is changing in v7. You can use the `v7_relativeSplatPath` future flag to opt-in early. For more information, see https://reactrouter.com/v6/upgrading/future#v7_relativesplatpath. @ http://localhost:5173/node_modules/.vite/deps/react-router-dom.js?v=b2e68fb4:4412
+[LOG] [OnlineMap] 清理完成 @ http://localhost:5173/src/renderer/components/Map/OnlineMap.tsx?t=1771694560140:1019
+[LOG] [OnlineMap] 已经初始化过，跳过重复初始化 @ http://localhost:5173/src/renderer/components/Map/OnlineMap.tsx?t=1771694560140:855
+[LOG] [MapPage] 开始加载图层文件，总数据项: 8 @ http://localhost:5173/src/renderer/pages/MapPage.tsx?t=1771694560140:120
+[LOG] [MapPage] Map 类型数据项: 5 @ http://localhost:5173/src/renderer/pages/MapPage.tsx?t=1771694560140:122
+[LOG] [MapPage] 正在获取 MapInfo 图层列表: 9502c7e2-4c85-4193-841a-eb0fba71cfec 4G_TAC.zip @ http://localhost:5173/src/renderer/pages/MapPage.tsx?t=1771694560140:126
+[LOG] [MapPage] MapInfo 图层列表响应: {success: true, data: Object} @ http://localhost:5173/src/renderer/pages/MapPage.tsx?t=1771694560140:128
+[LOG] [MapPage] 4G_TAC.zip 包含 0 个图层 @ http://localhost:5173/src/renderer/pages/MapPage.tsx?t=1771694560140:131
+[LOG] [MapPage] 正在获取 MapInfo 图层列表: 419ba415-be6e-4192-9911-33b2d5709375 5G_TAC.zip @ http://localhost:5173/src/renderer/pages/MapPage.tsx?t=1771694560140:126
+[LOG] [MapPage] 开始加载图层文件，总数据项: 8 @ http://localhost:5173/src/renderer/pages/MapPage.tsx?t=1771694560140:120
+[LOG] [MapPage] Map 类型数据项: 5 @ http://localhost:5173/src/renderer/pages/MapPage.tsx?t=1771694560140:122
+[LOG] [MapPage] 正在获取 MapInfo 图层列表: 9502c7e2-4c85-4193-841a-eb0fba71cfec 4G_TAC.zip @ http://localhost:5173/src/renderer/pages/MapPage.tsx?t=1771694560140:126
+[LOG] [MapPage] MapInfo 图层列表响应: {success: true, data: Object} @ http://localhost:5173/src/renderer/pages/MapPage.tsx?t=1771694560140:128
+[LOG] [MapPage] 5G_TAC.zip 包含 0 个图层 @ http://localhost:5173/src/renderer/pages/MapPage.tsx?t=1771694560140:131
+[LOG] [MapPage] 正在获取 MapInfo 图层列表: 285602f3-f3d7-4cb9-b6e9-9671eece903d 5G_TAC.TAB @ http://localhost:5173/src/renderer/pages/MapPage.tsx?t=1771694560140:126
+[LOG] [MapPage] MapInfo 图层列表响应: {success: true, data: Object} @ http://localhost:5173/src/renderer/pages/MapPage.tsx?t=1771694560140:128
+[LOG] [MapPage] 4G_TAC.zip 包含 0 个图层 @ http://localhost:5173/src/renderer/pages/MapPage.tsx?t=1771694560140:131
+[LOG] [MapPage] 正在获取 MapInfo 图层列表: 419ba415-be6e-4192-9911-33b2d5709375 5G_TAC.zip @ http://localhost:5173/src/renderer/pages/MapPage.tsx?t=1771694560140:126
+[LOG] [MapPage] MapInfo 图层列表响应: {success: true, data: Object} @ http://localhost:5173/src/renderer/pages/MapPage.tsx?t=1771694560140:128
+[LOG] [MapPage] 5G_TAC.zip 包含 0 个图层 @ http://localhost:5173/src/renderer/pages/MapPage.tsx?t=1771694560140:131
+[LOG] [MapPage] 正在获取 MapInfo 图层列表: 285602f3-f3d7-4cb9-b6e9-9671eece903d 5G_TAC.TAB @ http://localhost:5173/src/renderer/pages/MapPage.tsx?t=1771694560140:126
+[LOG] [MapPage] MapInfo 图层列表响应: {success: true, data: Object} @ http://localhost:5173/src/renderer/pages/MapPage.tsx?t=1771694560140:128
+[LOG] [MapPage] 5G_TAC.TAB 包含 1 个图层 @ http://localhost:5173/src/renderer/pages/MapPage.tsx?t=1771694560140:131
+[LOG] [MapPage]   - 图层: 5G_TAC (polygon), ID: dec46556-4ffd-49b4-b382-b116acbe3157 @ http://localhost:5173/src/renderer/pages/MapPage.tsx?t=1771694560140:133
+[LOG] [MapPage] 正在获取 MapInfo 图层列表: 903d585b-525f-4750-a13b-6bd72a434fc9 电联4GTAC划分20240829.TAB @ http://localhost:5173/src/renderer/pages/MapPage.tsx?t=1771694560140:126
+[LOG] [MapPage] MapInfo 图层列表响应: {success: true, data: Object} @ http://localhost:5173/src/renderer/pages/MapPage.tsx?t=1771694560140:128
+[LOG] [MapPage] 5G_TAC.TAB 包含 1 个图层 @ http://localhost:5173/src/renderer/pages/MapPage.tsx?t=1771694560140:131
+[LOG] [MapPage]   - 图层: 5G_TAC (polygon), ID: dec46556-4ffd-49b4-b382-b116acbe3157 @ http://localhost:5173/src/renderer/pages/MapPage.tsx?t=1771694560140:133
+[LOG] [MapPage] 正在获取 MapInfo 图层列表: 903d585b-525f-4750-a13b-6bd72a434fc9 电联4GTAC划分20240829.TAB @ http://localhost:5173/src/renderer/pages/MapPage.tsx?t=1771694560140:126
+[LOG] [MapPage] MapInfo 图层列表响应: {success: true, data: Object} @ http://localhost:5173/src/renderer/pages/MapPage.tsx?t=1771694560140:128
+[LOG] [MapPage] 电联4GTAC划分20240829.TAB 包含 1 个图层 @ http://localhost:5173/src/renderer/pages/MapPage.tsx?t=1771694560140:131
+[LOG] [MapPage]   - 图层: 电联4GTAC划分20240829 (polygon), ID: f88899f3-5a61-4f3f-8f27-65b22c5b2bd2 @ http://localhost:5173/src/renderer/pages/MapPage.tsx?t=1771694560140:133
+[LOG] [MapPage] 正在获取 MapInfo 图层列表: e240cae9-5881-4e7a-a45b-c29ed56b7339 BaselineLab_172.16.34.163_1770778872_2962632.zip @ http://localhost:5173/src/renderer/pages/MapPage.tsx?t=1771694560140:126
+[LOG] [MapPage] MapInfo 图层列表响应: {success: true, data: Object} @ http://localhost:5173/src/renderer/pages/MapPage.tsx?t=1771694560140:128
+[LOG] [MapPage] 电联4GTAC划分20240829.TAB 包含 1 个图层 @ http://localhost:5173/src/renderer/pages/MapPage.tsx?t=1771694560140:131
+[LOG] [MapPage]   - 图层: 电联4GTAC划分20240829 (polygon), ID: f88899f3-5a61-4f3f-8f27-65b22c5b2bd2 @ http://localhost:5173/src/renderer/pages/MapPage.tsx?t=1771694560140:133
+[LOG] [MapPage] 正在获取 MapInfo 图层列表: e240cae9-5881-4e7a-a45b-c29ed56b7339 BaselineLab_172.16.34.163_1770778872_2962632.zip @ http://localhost:5173/src/renderer/pages/MapPage.tsx?t=1771694560140:126
+[LOG] [MapPage] MapInfo 图层列表响应: {success: true, data: Object} @ http://localhost:5173/src/renderer/pages/MapPage.tsx?t=1771694560140:128
+[LOG] [MapPage] BaselineLab_172.16.34.163_1770778872_2962632.zip 包含 0 个图层 @ http://localhost:5173/src/renderer/pages/MapPage.tsx?t=1771694560140:131
+[LOG] [MapPage] 总共加载 2 个 MapInfo 图层文件 @ http://localhost:5173/src/renderer/pages/MapPage.tsx?t=1771694560140:151
+[LOG] [MapPage] Excel 点数据项: 1 [Object] @ http://localhost:5173/src/renderer/pages/MapPage.tsx?t=1771694560140:156
+[LOG] [OnlineMap] 扇区数据加载完成: {lte: 18540, nr: 8637, coverType: Object} @ http://localhost:5173/src/renderer/components/Map/OnlineMap.tsx?t=1771694560140:428
+[LOG] [OnlineMap] 地图初始化完成 @ http://localhost:5173/src/renderer/components/Map/OnlineMap.tsx?t=1771694560140:993
+[LOG] [LayerControl] 处理点文件: {id: 4ddd984a-c270-4795-865a-3dae3ef75fde, name: 小区清单.xlsx, type: point, sourceType: excel, geometryType: undefined} @ http://localhost:5173/src/renderer/components/Map/LayerControl.tsx:280
+[LOG] [LayerControl] 处理点文件: {id: 4ddd984a-c270-4795-865a-3dae3ef75fde, name: 小区清单.xlsx, type: point, sourceType: excel, geometryType: undefined} @ http://localhost:5173/src/renderer/components/Map/LayerControl.tsx:280
+[LOG] [OnlineMap] Loading all layers, count: 3 @ http://localhost:5173/src/renderer/components/Map/OnlineMap.tsx?t=1771694560140:812
+[LOG] [OnlineMap] loadMapInfoLayer 开始加载: dec46556-4ffd-49b4-b382-b116acbe3157 5G_TAC sourceType: mapinfo visible: false @ http://localhost:5173/src/renderer/components/Map/OnlineMap.tsx?t=1771694560140:707
+[LOG] [OnlineMap] 从MapInfo文件加载图层, dataId: 285602f3-f3d7-4cb9-b6e9-9671eece903d @ http://localhost:5173/src/renderer/components/Map/OnlineMap.tsx?t=1771694560140:760
+[LOG] [SectorRenderer] 构造函数初始化 {sectorsCount: 18540, sampleSectors: Array(5)} @ http://localhost:5173/src/renderer/components/Map/SectorRendererSVG.tsx:58
+[LOG] [SectorRenderer] 构造函数中应用已保存的标签配置 {content: name, color: #000000, fontSize: 12} @ http://localhost:5173/src/renderer/components/Map/SectorRendererSVG.tsx:76
+[LOG] [SectorRenderer] 设置渲染模式: default @ http://localhost:5173/src/renderer/components/Map/SectorRendererSVG.tsx:244
+[LOG] [SectorRenderer] 构造函数初始化 {sectorsCount: 8637, sampleSectors: Array(5)} @ http://localhost:5173/src/renderer/components/Map/SectorRendererSVG.tsx:58
+[LOG] [SectorRenderer] 构造函数中应用已保存的标签配置 {content: name, color: #000000, fontSize: 12} @ http://localhost:5173/src/renderer/components/Map/SectorRendererSVG.tsx:76
+[LOG] [SectorRenderer] 设置渲染模式: default @ http://localhost:5173/src/renderer/components/Map/SectorRendererSVG.tsx:244
+[LOG] [LayerControl] 处理点文件: {id: 4ddd984a-c270-4795-865a-3dae3ef75fde, name: 小区清单.xlsx, type: point, sourceType: excel, geometryType: undefined} @ http://localhost:5173/src/renderer/components/Map/LayerControl.tsx:280
+[LOG] [MapPage] MapInfo 图层列表响应: {success: true, data: Object} @ http://localhost:5173/src/renderer/pages/MapPage.tsx?t=1771694560140:128
+[LOG] [MapPage] BaselineLab_172.16.34.163_1770778872_2962632.zip 包含 0 个图层 @ http://localhost:5173/src/renderer/pages/MapPage.tsx?t=1771694560140:131
+[LOG] [MapPage] 总共加载 2 个 MapInfo 图层文件 @ http://localhost:5173/src/renderer/pages/MapPage.tsx?t=1771694560140:151
+[LOG] [MapPage] Excel 点数据项: 1 [Object] @ http://localhost:5173/src/renderer/pages/MapPage.tsx?t=1771694560140:156
+[LOG] [LayerControl] 处理点文件: {id: 4ddd984a-c270-4795-865a-3dae3ef75fde, name: 小区清单.xlsx, type: point, sourceType: excel, geometryType: undefined} @ http://localhost:5173/src/renderer/components/Map/LayerControl.tsx:280
+[LOG] [LayerControl] 处理点文件: {id: 4ddd984a-c270-4795-865a-3dae3ef75fde, name: 小区清单.xlsx, type: point, sourceType: excel, geometryType: undefined} @ http://localhost:5173/src/renderer/components/Map/LayerControl.tsx:280
+[LOG] [OnlineMap] Loading all layers, count: 3 @ http://localhost:5173/src/renderer/components/Map/OnlineMap.tsx?t=1771694560140:812
+[LOG] [OnlineMap] loadMapInfoLayer 开始加载: dec46556-4ffd-49b4-b382-b116acbe3157 5G_TAC sourceType: mapinfo visible: false @ http://localhost:5173/src/renderer/components/Map/OnlineMap.tsx?t=1771694560140:707
+[LOG] [OnlineMap] 从MapInfo文件加载图层, dataId: 285602f3-f3d7-4cb9-b6e9-9671eece903d @ http://localhost:5173/src/renderer/components/Map/OnlineMap.tsx?t=1771694560140:760
+[LOG] [SectorRenderer] 构造函数初始化 {sectorsCount: 18540, sampleSectors: Array(5)} @ http://localhost:5173/src/renderer/components/Map/SectorRendererSVG.tsx:58
+[LOG] [SectorRenderer] 构造函数中应用已保存的标签配置 {content: name, color: #000000, fontSize: 12} @ http://localhost:5173/src/renderer/components/Map/SectorRendererSVG.tsx:76
+[LOG] [SectorRenderer] 设置渲染模式: default @ http://localhost:5173/src/renderer/components/Map/SectorRendererSVG.tsx:244
+[LOG] [SectorRenderer] 构造函数初始化 {sectorsCount: 8637, sampleSectors: Array(5)} @ http://localhost:5173/src/renderer/components/Map/SectorRendererSVG.tsx:58
+[LOG] [SectorRenderer] 构造函数中应用已保存的标签配置 {content: name, color: #000000, fontSize: 12} @ http://localhost:5173/src/renderer/components/Map/SectorRendererSVG.tsx:76
+[LOG] [SectorRenderer] 设置渲染模式: default @ http://localhost:5173/src/renderer/components/Map/SectorRendererSVG.tsx:244
+[LOG] [LayerControl] 处理点文件: {id: 4ddd984a-c270-4795-865a-3dae3ef75fde, name: 小区清单.xlsx, type: point, sourceType: excel, geometryType: undefined} @ http://localhost:5173/src/renderer/components/Map/LayerControl.tsx:280
+[LOG] [LayerControl] 处理点文件: {id: 4ddd984a-c270-4795-865a-3dae3ef75fde, name: 小区清单.xlsx, type: point, sourceType: excel, geometryType: undefined} @ http://localhost:5173/src/renderer/components/Map/LayerControl.tsx:280
+[LOG] [LayerControl] 处理点文件: {id: 4ddd984a-c270-4795-865a-3dae3ef75fde, name: 小区清单.xlsx, type: point, sourceType: excel, geometryType: undefined} @ http://localhost:5173/src/renderer/components/Map/LayerControl.tsx:280
+[LOG] [OnlineMap] MapInfo API响应: true 有数据: true @ http://localhost:5173/src/renderer/components/Map/OnlineMap.tsx?t=1771694560140:762
+[LOG] [OnlineMap] 开始创建MapInfoLayer, options: {id: dec46556-4ffd-49b4-b382-b116acbe3157, name: 5G_TAC, type: polygon} @ http://localhost:5173/src/renderer/components/Map/OnlineMap.tsx?t=1771694560140:780
+[LOG] [MapInfoLayer] Applied coordinate transformation to 51 features @ http://localhost:5173/src/renderer/components/Map/MapInfoLayer.tsx:242
+[LOG] [MapInfoLayer] Feature style sample: {geometry: Polygon, featureStyle: Object, properties: Array(2)} @ http://localhost:5173/src/renderer/components/Map/MapInfoLayer.tsx:274
+[LOG] [OnlineMap] MapInfoLayer创建完成, leafletLayer存在: true @ http://localhost:5173/src/renderer/components/Map/OnlineMap.tsx?t=1771694560140:783
+[LOG] [OnlineMap] 图层已存储到refs, loaded状态: true @ http://localhost:5173/src/renderer/components/Map/OnlineMap.tsx?t=1771694560140:787
+[LOG] [MapInfoLayer] setLabelVisibility: dec46556-4ffd-49b4-b382-b116acbe3157 false @ http://localhost:5173/src/renderer/components/Map/MapInfoLayer.tsx:411
+[WARNING] [MapInfoLayer] 图层未添加到地图，无法显示标签 @ http://localhost:5173/src/renderer/components/Map/MapInfoLayer.tsx:413
+[LOG] [OnlineMap] Layer created: dec46556-4ffd-49b4-b382-b116acbe3157 visible: false @ http://localhost:5173/src/renderer/components/Map/OnlineMap.tsx?t=1771694560140:793
+[LOG] [OnlineMap] Layer created but NOT added to map (visible=false, mapInstance=true) @ http://localhost:5173/src/renderer/components/Map/OnlineMap.tsx?t=1771694560140:799
+[LOG] [OnlineMap] loadMapInfoLayer 开始加载: f88899f3-5a61-4f3f-8f27-65b22c5b2bd2 电联4GTAC划分20240829 sourceType: mapinfo visible: false @ http://localhost:5173/src/renderer/components/Map/OnlineMap.tsx?t=1771694560140:707
+[LOG] [OnlineMap] 从MapInfo文件加载图层, dataId: 903d585b-525f-4750-a13b-6bd72a434fc9 @ http://localhost:5173/src/renderer/components/Map/OnlineMap.tsx?t=1771694560140:760
+[LOG] [LayerControl] 预取字段成功: 5G_TAC 1 个字段 @ http://localhost:5173/src/renderer/components/Map/LayerControl.tsx:204
+[LOG] [LayerControl] 预取字段成功: 电联4GTAC划分20240829 2 个字段 @ http://localhost:5173/src/renderer/components/Map/LayerControl.tsx:204
+[LOG] [OnlineMap] MapInfo API响应: true 有数据: true @ http://localhost:5173/src/renderer/components/Map/OnlineMap.tsx?t=1771694560140:762
+[LOG] [OnlineMap] 开始创建MapInfoLayer, options: {id: dec46556-4ffd-49b4-b382-b116acbe3157, name: 5G_TAC, type: polygon} @ http://localhost:5173/src/renderer/components/Map/OnlineMap.tsx?t=1771694560140:780
+[LOG] [MapInfoLayer] Applied coordinate transformation to 51 features @ http://localhost:5173/src/renderer/components/Map/MapInfoLayer.tsx:242
+[LOG] [OnlineMap] MapInfoLayer创建完成, leafletLayer存在: true @ http://localhost:5173/src/renderer/components/Map/OnlineMap.tsx?t=1771694560140:783
+[LOG] [OnlineMap] 图层已存储到refs, loaded状态: true @ http://localhost:5173/src/renderer/components/Map/OnlineMap.tsx?t=1771694560140:787
+[LOG] [MapInfoLayer] setLabelVisibility: dec46556-4ffd-49b4-b382-b116acbe3157 false @ http://localhost:5173/src/renderer/components/Map/MapInfoLayer.tsx:411
+[WARNING] [MapInfoLayer] 图层未添加到地图，无法显示标签 @ http://localhost:5173/src/renderer/components/Map/MapInfoLayer.tsx:413
+[LOG] [OnlineMap] Layer created: dec46556-4ffd-49b4-b382-b116acbe3157 visible: false @ http://localhost:5173/src/renderer/components/Map/OnlineMap.tsx?t=1771694560140:793
+[LOG] [OnlineMap] Layer created but NOT added to map (visible=false, mapInstance=true) @ http://localhost:5173/src/renderer/components/Map/OnlineMap.tsx?t=1771694560140:799
+[LOG] [OnlineMap] loadMapInfoLayer 开始加载: f88899f3-5a61-4f3f-8f27-65b22c5b2bd2 电联4GTAC划分20240829 sourceType: mapinfo visible: false @ http://localhost:5173/src/renderer/components/Map/OnlineMap.tsx?t=1771694560140:707
+[LOG] [OnlineMap] 从MapInfo文件加载图层, dataId: 903d585b-525f-4750-a13b-6bd72a434fc9 @ http://localhost:5173/src/renderer/components/Map/OnlineMap.tsx?t=1771694560140:760
+[LOG] [OnlineMap] MapInfo API响应: true 有数据: true @ http://localhost:5173/src/renderer/components/Map/OnlineMap.tsx?t=1771694560140:762
+[LOG] [OnlineMap] 开始创建MapInfoLayer, options: {id: f88899f3-5a61-4f3f-8f27-65b22c5b2bd2, name: 电联4GTAC划分20240829, type: polygon} @ http://localhost:5173/src/renderer/components/Map/OnlineMap.tsx?t=1771694560140:780
+[LOG] [MapInfoLayer] Applied coordinate transformation to 23 features @ http://localhost:5173/src/renderer/components/Map/MapInfoLayer.tsx:242
+[LOG] [OnlineMap] MapInfoLayer创建完成, leafletLayer存在: true @ http://localhost:5173/src/renderer/components/Map/OnlineMap.tsx?t=1771694560140:783
+[LOG] [OnlineMap] 图层已存储到refs, loaded状态: true @ http://localhost:5173/src/renderer/components/Map/OnlineMap.tsx?t=1771694560140:787
+[LOG] [MapInfoLayer] setLabelVisibility: f88899f3-5a61-4f3f-8f27-65b22c5b2bd2 false @ http://localhost:5173/src/renderer/components/Map/MapInfoLayer.tsx:411
+[WARNING] [MapInfoLayer] 图层未添加到地图，无法显示标签 @ http://localhost:5173/src/renderer/components/Map/MapInfoLayer.tsx:413
+[LOG] [OnlineMap] Layer created: f88899f3-5a61-4f3f-8f27-65b22c5b2bd2 visible: false @ http://localhost:5173/src/renderer/components/Map/OnlineMap.tsx?t=1771694560140:793
+[LOG] [OnlineMap] Layer created but NOT added to map (visible=false, mapInstance=true) @ http://localhost:5173/src/renderer/components/Map/OnlineMap.tsx?t=1771694560140:799
+[LOG] [OnlineMap] loadMapInfoLayer 开始加载: 4ddd984a-c270-4795-865a-3dae3ef75fde 小区清单.xlsx sourceType: excel visible: false @ http://localhost:5173/src/renderer/components/Map/OnlineMap.tsx?t=1771694560140:707
+[LOG] [OnlineMap] 从Excel加载点数据, dataId: 4ddd984a-c270-4795-865a-3dae3ef75fde @ http://localhost:5173/src/renderer/components/Map/OnlineMap.tsx?t=1771694560140:715
+[LOG] [LayerControl] 预取字段成功: 5G_TAC 1 个字段 @ http://localhost:5173/src/renderer/components/Map/LayerControl.tsx:204
+[LOG] [LayerControl] 预取字段成功: 电联4GTAC划分20240829 2 个字段 @ http://localhost:5173/src/renderer/components/Map/LayerControl.tsx:204
+[LOG] [OnlineMap] Excel API响应: true 有数据: true @ http://localhost:5173/src/renderer/components/Map/OnlineMap.tsx?t=1771694560140:717
+[LOG] [OnlineMap] response.data type: array @ http://localhost:5173/src/renderer/components/Map/OnlineMap.tsx?t=1771694560140:718
+[LOG] [OnlineMap] response.data keys: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99] @ http://localhost:5173/src/renderer/components/Map/OnlineMap.tsx?t=1771694560140:719
+[LOG] [OnlineMap] 数据是数组格式，长度: 1788 @ http://localhost:5173/src/renderer/components/Map/OnlineMap.tsx?t=1771694560140:723
+[LOG] [OnlineMap] 过滤后的点数据数量: 1788 @ http://localhost:5173/src/renderer/components/Map/OnlineMap.tsx?t=1771694560140:738
+[LOG] [OnlineMap] 开始创建MapInfoLayer, options: {id: 4ddd984a-c270-4795-865a-3dae3ef75fde, name: 小区清单.xlsx, type: point} @ http://localhost:5173/src/renderer/components/Map/OnlineMap.tsx?t=1771694560140:780
+[LOG] [MapInfoLayer] Applied coordinate transformation to 1788 features @ http://localhost:5173/src/renderer/components/Map/MapInfoLayer.tsx:242
+[LOG] [OnlineMap] MapInfoLayer创建完成, leafletLayer存在: true @ http://localhost:5173/src/renderer/components/Map/OnlineMap.tsx?t=1771694560140:783
+[LOG] [OnlineMap] 图层已存储到refs, loaded状态: true @ http://localhost:5173/src/renderer/components/Map/OnlineMap.tsx?t=1771694560140:787
+[LOG] [MapInfoLayer] setLabelVisibility: 4ddd984a-c270-4795-865a-3dae3ef75fde false @ http://localhost:5173/src/renderer/components/Map/MapInfoLayer.tsx:411
+[WARNING] [MapInfoLayer] 图层未添加到地图，无法显示标签 @ http://localhost:5173/src/renderer/components/Map/MapInfoLayer.tsx:413
+[LOG] [OnlineMap] Layer created: 4ddd984a-c270-4795-865a-3dae3ef75fde visible: false @ http://localhost:5173/src/renderer/components/Map/OnlineMap.tsx?t=1771694560140:793
+[LOG] [OnlineMap] Layer created but NOT added to map (visible=false, mapInstance=true) @ http://localhost:5173/src/renderer/components/Map/OnlineMap.tsx?t=1771694560140:799
+[LOG] [OnlineMap] 更新图层可见性, 总数: 3 @ http://localhost:5173/src/renderer/components/Map/OnlineMap.tsx?t=1771694560140:1123
+[LOG] [OnlineMap] 处理图层: dec46556-4ffd-49b4-b382-b116acbe3157 5G_TAC visible: false layerRef存在: true @ http://localhost:5173/src/renderer/components/Map/OnlineMap.tsx?t=1771694560140:1126
+[LOG] [OnlineMap]   - hasLayer检查结果: false leafletLayer存在: true @ http://localhost:5173/src/renderer/components/Map/OnlineMap.tsx?t=1771694560140:1129
+[LOG] [OnlineMap]   - 图层不在地图上，跳过移除 @ http://localhost:5173/src/renderer/components/Map/OnlineMap.tsx?t=1771694560140:1142
+[LOG] [OnlineMap] 处理图层: f88899f3-5a61-4f3f-8f27-65b22c5b2bd2 电联4GTAC划分20240829 visible: false layerRef存在: true @ http://localhost:5173/src/renderer/components/Map/OnlineMap.tsx?t=1771694560140:1126
+[LOG] [OnlineMap]   - hasLayer检查结果: false leafletLayer存在: true @ http://localhost:5173/src/renderer/components/Map/OnlineMap.tsx?t=1771694560140:1129
+[LOG] [OnlineMap]   - 图层不在地图上，跳过移除 @ http://localhost:5173/src/renderer/components/Map/OnlineMap.tsx?t=1771694560140:1142
+[LOG] [OnlineMap] 处理图层: 4ddd984a-c270-4795-865a-3dae3ef75fde 小区清单.xlsx visible: false layerRef存在: true @ http://localhost:5173/src/renderer/components/Map/OnlineMap.tsx?t=1771694560140:1126
+[LOG] [OnlineMap]   - hasLayer检查结果: false leafletLayer存在: true @ http://localhost:5173/src/renderer/components/Map/OnlineMap.tsx?t=1771694560140:1129
+[LOG] [OnlineMap]   - 图层不在地图上，跳过移除 @ http://localhost:5173/src/renderer/components/Map/OnlineMap.tsx?t=1771694560140:1142
+[LOG] [OnlineMap] MapInfo API响应: true 有数据: true @ http://localhost:5173/src/renderer/components/Map/OnlineMap.tsx?t=1771694560140:762
+[LOG] [OnlineMap] 开始创建MapInfoLayer, options: {id: f88899f3-5a61-4f3f-8f27-65b22c5b2bd2, name: 电联4GTAC划分20240829, type: polygon} @ http://localhost:5173/src/renderer/components/Map/OnlineMap.tsx?t=1771694560140:780
+[LOG] [MapInfoLayer] Applied coordinate transformation to 23 features @ http://localhost:5173/src/renderer/components/Map/MapInfoLayer.tsx:242
+[LOG] [OnlineMap] MapInfoLayer创建完成, leafletLayer存在: true @ http://localhost:5173/src/renderer/components/Map/OnlineMap.tsx?t=1771694560140:783
+[LOG] [OnlineMap] 图层已存储到refs, loaded状态: true @ http://localhost:5173/src/renderer/components/Map/OnlineMap.tsx?t=1771694560140:787
+[LOG] [MapInfoLayer] setLabelVisibility: f88899f3-5a61-4f3f-8f27-65b22c5b2bd2 false @ http://localhost:5173/src/renderer/components/Map/MapInfoLayer.tsx:411
+[WARNING] [MapInfoLayer] 图层未添加到地图，无法显示标签 @ http://localhost:5173/src/renderer/components/Map/MapInfoLayer.tsx:413
+[LOG] [OnlineMap] Layer created: f88899f3-5a61-4f3f-8f27-65b22c5b2bd2 visible: false @ http://localhost:5173/src/renderer/components/Map/OnlineMap.tsx?t=1771694560140:793
+[LOG] [OnlineMap] Layer created but NOT added to map (visible=false, mapInstance=true) @ http://localhost:5173/src/renderer/components/Map/OnlineMap.tsx?t=1771694560140:799
+[LOG] [OnlineMap] loadMapInfoLayer 开始加载: 4ddd984a-c270-4795-865a-3dae3ef75fde 小区清单.xlsx sourceType: excel visible: false @ http://localhost:5173/src/renderer/components/Map/OnlineMap.tsx?t=1771694560140:707
+[LOG] [OnlineMap] 图层已加载，跳过: 4ddd984a-c270-4795-865a-3dae3ef75fde @ http://localhost:5173/src/renderer/components/Map/OnlineMap.tsx?t=1771694560140:709
+[LOG] [OnlineMap] 更新图层可见性, 总数: 3 @ http://localhost:5173/src/renderer/components/Map/OnlineMap.tsx?t=1771694560140:1123
+[LOG] [OnlineMap] 处理图层: dec46556-4ffd-49b4-b382-b116acbe3157 5G_TAC visible: false layerRef存在: true @ http://localhost:5173/src/renderer/components/Map/OnlineMap.tsx?t=1771694560140:1126
+[LOG] [OnlineMap]   - hasLayer检查结果: false leafletLayer存在: true @ http://localhost:5173/src/renderer/components/Map/OnlineMap.tsx?t=1771694560140:1129
+[LOG] [OnlineMap]   - 图层不在地图上，跳过移除 @ http://localhost:5173/src/renderer/components/Map/OnlineMap.tsx?t=1771694560140:1142
+[LOG] [OnlineMap] 处理图层: f88899f3-5a61-4f3f-8f27-65b22c5b2bd2 电联4GTAC划分20240829 visible: false layerRef存在: true @ http://localhost:5173/src/renderer/components/Map/OnlineMap.tsx?t=1771694560140:1126
+[LOG] [OnlineMap]   - hasLayer检查结果: false leafletLayer存在: true @ http://localhost:5173/src/renderer/components/Map/OnlineMap.tsx?t=1771694560140:1129
+[LOG] [OnlineMap]   - 图层不在地图上，跳过移除 @ http://localhost:5173/src/renderer/components/Map/OnlineMap.tsx?t=1771694560140:1142
+[LOG] [OnlineMap] 处理图层: 4ddd984a-c270-4795-865a-3dae3ef75fde 小区清单.xlsx visible: false layerRef存在: true @ http://localhost:5173/src/renderer/components/Map/OnlineMap.tsx?t=1771694560140:1126
+[LOG] [OnlineMap]   - hasLayer检查结果: false leafletLayer存在: true @ http://localhost:5173/src/renderer/components/Map/OnlineMap.tsx?t=1771694560140:1129
+[LOG] [OnlineMap]   - 图层不在地图上，跳过移除 @ http://localhost:5173/src/renderer/components/Map/OnlineMap.tsx?t=1771694560140:1142

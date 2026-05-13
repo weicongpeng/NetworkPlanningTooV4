@@ -1,0 +1,36 @@
+# Web框架
+fastapi==0.115.0
+uvicorn[standard]==0.32.0
+python-multipart==0.0.12
+websockets==14.0
+
+# 数据处理
+pandas>=2.2.0
+openpyxl==3.1.2
+numpy>=1.26.3,<2.0
+
+# 数据验证
+pydantic==2.9.0
+pydantic-settings==2.6.0
+
+# 跨域支持
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+python-dotenv==1.0.0
+
+# 地图处理
+# GDAL 需要预编译的二进制文件，Windows 用户请从以下地址下载对应版本的 wheel:
+# https://github.com/cgohlke/geospatial-wheels/releases
+# 或使用 conda: conda install -c conda-forge gdal
+# gdal==3.8.4
+geopandas>=1.0.1
+shapely>=2.0.6
+
+# 工具库
+cryptography==43.0.1
+aiofiles==24.1.0
+
+# 测试
+pytest==8.3.0
+pytest-asyncio==0.24.0
+httpx==0.28.0

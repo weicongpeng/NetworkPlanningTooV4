@@ -1,0 +1,5 @@
+{
+  "name": "simple-test-app",
+  "version": "1.0.0",
+  "main": "electron/simple_main.js"
+}

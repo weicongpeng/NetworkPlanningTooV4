@@ -1,0 +1,55 @@
+# 项目级 gitignore
+
+# 前端
+/frontend/node_modules/
+/frontend/dist/
+/frontend/dist-electron/
+/frontend/dist-renderer/
+/frontend/.env
+/frontend/.env.local
+
+# 后端
+/backend/__pycache__/
+/backend/venv/
+/backend/env/
+/backend/.env
+/backend/uploads/
+/backend/outputs/
+/backend/data/
+/backend/licenses/
+/backend/*.log
+
+# 移动端
+/mobile-app/node_modules/
+/mobile-app/.expo/
+/mobile-app/dist/
+
+# 共享
+/shared/node_modules/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 测试
+coverage/
+.pytest_cache/
+
+# 构建产物
+*.egg-info/
+dist/
+
+# 项目级上传/输出/数据目录
+/uploads/
+/outputs/
+/data/
+/全量工参/
+/待规划小区/
+/输出文件/

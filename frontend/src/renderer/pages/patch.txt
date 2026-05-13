@@ -1,0 +1,56 @@
+228,282c\
+              <div className="space-y-4">\
+                <div className="flex items-start gap-4">\
+                    <div className="flex-1">\
+                        <UploadArea\
+                            title="全量工参"\
+                            accept=".xlsx,.xls"\
+                            onUpload={(e) => handleFileUpload(e, 'excel', 'full_params')}\
+                            loading={loading && uploadingType === 'full_params'}\
+                            icon={<FileSpreadsheet size={32} />\
+                        />\
+                    </div>\
+                    <button\
+                        onClick={() => handleDownloadTemplate('full_params')}\
+                        className="flex-shrink-0 px-4 py-2 bg-blue-500 text-white rounded-lg hover:bg-blue-600 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"\
+                        title="下载全量工参模板"\
+                    >\
+                        <FileDown size={16} />\
+                        <span className="text-sm">模板下载</span>\
+                    </button>\
+                </div>\
+                <div className="flex items-start gap-4">\
+                    <div className="flex-1">\
+                        <UploadArea\
+                            title="待规划小区"\
+                            accept=".xlsx,.xls"\
+                            onUpload={(e) => handleFileUpload(e, 'excel', 'target_cells')}\
+                            loading={loading && uploadingType === 'target_cells'}\
+                            icon={<FileSpreadsheet size={32} />\
+                        />\
+                    </div>\
+                    <button\
+                        onClick={() => handleDownloadTemplate('target_cells')}\
+                        className="flex-shrink-0 px-4 py-2 bg-blue-500 text-white rounded-lg hover:bg-blue-600 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"\
+                        title="下载待规划小区模板"\
+                    >\
+                        <FileDown size={16} />\
+                        <span className="text-sm">模板下载</span>\
+                    </button>\
+                </div>\
+                <UploadArea\
+                    title="现网工参"\
+                    accept=".zip"\
+                    onUpload={(e) => handleFileUpload(e, 'map', 'current_params')}\
+                    loading={loading && uploadingType === 'current_params'}\
+                    icon={<Upload size={32} />\
+                />\
+                <UploadArea\
+                    title="图层文件"\
+                    accept=".zip,.tab,.mif"\
+                    onUpload={(e) => handleFileUpload(e, 'map', 'map_layer')}\
+                    loading={loading && uploadingType === 'map_layer'}\
+                    icon={<Layers size={32} />\
+                    multiple={true}\
+                />\
+            </div>

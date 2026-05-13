@@ -1,0 +1,5 @@
+{
+  "name": "ultra-simple-test",
+  "version": "1.0.0",
+  "main": "electron/ultra_simple.js"
+}

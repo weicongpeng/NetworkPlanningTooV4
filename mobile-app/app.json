@@ -1,0 +1,46 @@
+{
+  "expo": {
+    "name": "工参地图",
+    "slug": "network-planning-mobile",
+    "version": "1.0.0",
+    "platforms": [
+      "android"
+    ],
+    "android": {
+      "package": "com.networkplanning.mobile",
+      "permissions": [
+        "ACCESS_FINE_LOCATION",
+        "ACCESS_COARSE_LOCATION",
+        "INTERNET",
+        "ACCESS_NETWORK_STATE",
+        "READ_EXTERNAL_STORAGE",
+        "WRITE_EXTERNAL_STORAGE"
+      ],
+      "runtimeVersion": "1.0.0"
+    },
+    "packagerOpts": {
+    "customHostUrl": "https://apk.pengwc.asia"
+    },
+    "plugins": [
+      "expo-asset",
+      [
+        "expo-location",
+        {
+          "locationAlwaysAndWhenInUsePermission": "允许\"工参地图\"在后台获取您的位置以便导航",
+          "locationWhenInUsePermission": "允许\"工参地图\"获取您的位置信息"
+        }
+      ]
+    ],
+    "web": {
+      "bundler": "metro"
+    },
+    "extra": {
+      "eas": {
+        "projectId": "0ced5215-39c6-4472-9497-65dc2d2a9da5"
+      }
+    },
+    "updates": {
+      "url": "https://u.expo.dev/0ced5215-39c6-4472-9497-65dc2d2a9da5"
+    }
+  }
+}

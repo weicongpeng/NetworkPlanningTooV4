@@ -1,0 +1,1376 @@
+/**
+ * 扇区渲染器 - SVG版本（使用 L.Polygon + L.CircleMarker）
+ *
+ * 特点：
+ * - Zoom <= 9: 对每个扇区使用 L.CircleMarker 绘制圆点（5米半径，无数量限制）
+ * - Zoom > 9: 使用 L.Polygon 绘制全部扇区（无数量限制，完整细节）
+ * - 解除所有扇区数量限制，确保密集区域也不缺失
+ * - Leaflet 自动处理坐标转换、缩放和定位
+ * - 原生 Leaflet 事件处理点击和悬停
+ * - 支持不同小区覆盖类型的渲染（室内圆形/室外扇形）
+ * - 支持扇区标签显示/隐藏
+ */
+import L from 'leaflet'
+import { RenderSectorData } from '../../services/mapDataService'
+import { SECTOR_CONFIG, getCellCoverStyle, getSectorColor } from '../../config/sector-config'
+
+/**
+ * PCI高亮配置接口
+ */
+export interface PCIHighlightConfig {
+  /** 选中的扇区ID */
+  selectedId: string | null
+  /** 同频同PCI的扇区ID列表 */
+  relatedIds: string[]
+}
+
+/**
+ * 扇区图层配置
+ */
+export interface SectorLayerOptions extends L.LayerOptions {
+  /** 扇区数据 */
+  sectors: RenderSectorData[]
+  /** 点击回调 */
+  onClick?: (sector: RenderSectorData, event: L.LeafletMouseEvent) => void
+  /** 当前缩放级别 */
+  zoom: number
+  /** 是否显示扇区标签 */
+  showLabels?: boolean
+  /** 渲染模式（用于PCI可视化） */
+  renderMode?: 'default' | 'pci-planning'
+}
+
+/**
+ * 扇区 SVG 图层（使用 L.Polygon + L.CircleMarker 实现）
+ *
+ * 继承 L.Layer，智能切换渲染模式：
+ * - zoom < 17: 扇区模式，每个扇区是一个 L.Polygon
+ * - zoom >= 17: 站点圆点模式，每个站点是一个 L.CircleMarker
+ */
+export class SectorSVGLayer extends L.Layer {
+  private sectors: RenderSectorData[] = []
+  private onClick?: (sector: RenderSectorData, event: L.LeafletMouseEvent) => void
+  private mapInstance?: L.Map
+  private currentZoom: number = 12
+  private showLabels: boolean = false
+  private renderMode: 'default' | 'pci-planning' = 'default'
+
+  // 动画帧请求ID
+  private _animRequestId: number | null = null
+  private _styleUpdateRequestId: number | null = null
+
+  // 频点可见性映射（用于过滤）
+  private frequencyVisibility: Map<number, boolean> = new Map()
+
+  // 扇区ID白名单（用于只渲染特定扇区）
+  private sectorIdWhitelist: Set<string> | null = null
+
+  // PCI高亮配置
+  private pciHighlightConfig: PCIHighlightConfig | null = null
+
+  // PCI模式标签启用状态（用于控制是否显示小区名称+PCI值标签）
+  private sectorLabelsEnabled: boolean = false
+
+  // 扇区多边形映射（带缓存时间戳）
+  private sectorPolygons = new Map<string, {
+    polygon: L.Polygon
+    lastUsed: number  // 最后使用时间戳
+    zoom: number      // 创建时的缩放级别
+  }>()
+
+  // 站点圆点映射（带缓存时间戳）
+  private siteMarkers = new Map<string, {
+    marker: L.CircleMarker
+    lastUsed: number
+    zoom: number
+  }>()
+
+  // 扇区标签映射
+  private sectorLabels = new Map<string, L.DivIcon | L.Marker>()
+
+  // 聚合图层
+  private featureGroup?: L.FeatureGroup
+
+  // 视口扇区缓存（避免重复计算）
+  private visibleSectorsCache: {
+    boundsKey: string
+    sectors: RenderSectorData[]
+    timestamp: number
+  } | null = null
+
+  // 延迟清理定时器
+  private cleanupTimer: number | null = null
+
+  constructor(options: SectorLayerOptions) {
+    super()
+    this.sectors = options.sectors
+    this.onClick = options.onClick
+    this.currentZoom = options.zoom
+    this.showLabels = options.showLabels || false
+    this.renderMode = options.renderMode || 'default'
+  }
+
+  /**
+   * Leaflet 图层生命周期：添加到地图
+   */
+  onAdd(map: L.Map): this {
+    this.mapInstance = map
+
+    // 创建 FeatureGroup 来管理所有扇区多边形和圆点
+    this.featureGroup = L.featureGroup()
+    this.featureGroup.addTo(map)
+
+    // 监听地图移动和缩放结束事件，重新渲染以显示新进入视口的扇区
+    map.on('moveend', this._render, this)
+
+    // zoom: 缩放过程中持续触发，用于平滑更新扇区大小
+    this._onZoom = this._onZoom.bind(this)
+    map.on('zoom', this._onZoom, this)
+
+    // 渲染所有扇区
+    this._render()
+
+    return this
+  }
+
+  /**
+   * Leaflet 图层生命周期：从地图移除
+   */
+  onRemove(map: L.Map): this {
+    // 移除事件监听
+    map.off('moveend', this._render, this)
+    map.off('zoom', this._onZoom, this)
+
+    // 取消挂起的动画帧
+    if (this._animRequestId !== null) {
+      L.Util.cancelAnimFrame(this._animRequestId)
+      this._animRequestId = null
+    }
+
+    // 取消样式更新请求
+    if (this._styleUpdateRequestId !== null) {
+      L.Util.cancelAnimFrame(this._styleUpdateRequestId)
+      this._styleUpdateRequestId = null
+    }
+
+    // 取消延迟清理定时器
+    if (this.cleanupTimer !== null) {
+      window.clearTimeout(this.cleanupTimer)
+      this.cleanupTimer = null
+    }
+
+    if (this.featureGroup) {
+      map.removeLayer(this.featureGroup)
+      this.featureGroup = undefined
+    }
+
+    this.sectorPolygons.clear()
+    this.siteMarkers.clear()
+    this.sectorLabels.clear()
+    this.visibleSectorsCache = null
+    return this
+  }
+
+  /**
+   * 更新扇区数据
+   */
+  updateSectors(sectors: RenderSectorData[]): void {
+    this.sectors = sectors
+    this._render()
+  }
+
+  /**
+   * 更新缩放级别
+   */
+  updateZoom(zoom: number): void {
+    this.currentZoom = zoom
+    // 强制重绘
+    if (!this.mapInstance) return
+    this._render()
+  }
+
+  /**
+   * 更新标签显示状态
+   */
+  updateShowLabels(showLabels: boolean): void {
+    this.showLabels = showLabels
+    this._render()
+  }
+
+  /**
+   * 设置频点可见性
+   * @param frequency 频点值
+   * @param visible 是否可见
+   */
+  setFrequencyVisibility(frequency: number, visible: boolean): void {
+    this.frequencyVisibility.set(frequency, visible)
+    this._render() // 重新渲染
+  }
+
+  /**
+   * 获取指定屏幕位置的所有扇区数据
+   * 用于处理重叠扇区点击
+   */
+  public getSectorsAt(clientX: number, clientY: number): RenderSectorData[] {
+    const sectors: RenderSectorData[] = []
+    const elements = document.elementsFromPoint(clientX, clientY)
+
+    // 遍历所有元素，寻找属于本图层的扇区多边形
+    for (const el of elements) {
+      if (el.classList.contains('sector-polygon')) {
+        // 通过寻找 FeatureGroup 中的对应 Layer 获取数据
+        if (this.featureGroup) {
+          this.featureGroup.eachLayer((layer: any) => {
+            if (layer.getElement?.() === el && layer.sectorData) {
+              sectors.push(layer.sectorData)
+            }
+          })
+        }
+      }
+    }
+
+    // 去重并返回
+    return sectors.filter((v, i, a) => a.findIndex(t => t.id === v.id) === i)
+  }
+
+  /**
+   * 批量设置频点可见性
+   * @param visibilityMap 频点可见性映射
+   */
+  setFrequenciesVisibility(visibilityMap: Map<number, boolean>): void {
+    this.frequencyVisibility = new Map(visibilityMap)
+    this._render()
+  }
+
+  /**
+   * 设置扇区ID白名单
+   * 只渲染白名单中的扇区，null表示渲染所有扇区
+   * @param whitelist 扇区ID集合，null表示清除白名单
+   */
+  setSectorIdWhitelist(whitelist: Set<string> | null): void {
+    this.sectorIdWhitelist = whitelist
+    console.log('[SectorRenderer] 设置扇区白名单', {
+      enabled: whitelist !== null,
+      count: whitelist?.size || 0
+    })
+    this._render()
+  }
+
+  /**
+   * 设置PCI高亮模式
+   * @param config PCI高亮配置，null表示清除高亮
+   */
+  setPCIHighlightMode(config: PCIHighlightConfig | null): void {
+    this.pciHighlightConfig = config
+    // 使用requestAnimationFrame批处理样式更新，提升性能
+    if (this._styleUpdateRequestId !== null) {
+      L.Util.cancelAnimFrame(this._styleUpdateRequestId)
+    }
+    this._styleUpdateRequestId = L.Util.requestAnimFrame(() => {
+      this._updateSectorStyles()
+      this._styleUpdateRequestId = null
+    }, this)
+  }
+
+  /**
+   * 设置扇区标签启用状态（用于PCI模式显示小区名称+PCI值）
+   * @param enabled 是否启用标签
+   */
+  setSectorLabelsEnabled(enabled: boolean): void {
+    this.sectorLabelsEnabled = enabled
+    console.log('[SectorRenderer] 设置扇区标签启用状态', { enabled })
+    // 重新渲染以更新标签
+    this._render()
+  }
+
+  /**
+   * 更新扇区样式（用于PCI高亮）
+   */
+  private _updateSectorStyles(): void {
+    if (!this.pciHighlightConfig) {
+      // 清除高亮，恢复默认样式
+      for (const [sectorId, cached] of this.sectorPolygons) {
+        if (this.renderMode === 'pci-planning') {
+          // PCI模式：透明黑边
+          cached.polygon.setStyle({
+            fillColor: 'rgba(0,0,0,0)',
+            color: '#000000',
+            weight: 1,
+            fillOpacity: 0
+          })
+        } else {
+          // 默认模式：彩色
+          const sector = (cached.polygon as any).sectorData as RenderSectorData
+          const colors = getSectorColor(sector)
+          const config = SECTOR_CONFIG[sector.networkType]
+          cached.polygon.setStyle({
+            fillColor: colors.fillColor,
+            color: config.strokeColor || '#000000',
+            weight: config.strokeWidth || 0.5,
+            fillOpacity: config.opacity
+          })
+        }
+      }
+
+      for (const [siteKey, cached] of this.siteMarkers) {
+        if (this.renderMode === 'pci-planning') {
+          // PCI模式：透明黑边
+          cached.marker.setStyle({
+            fillColor: 'rgba(0,0,0,0)',
+            color: '#000000',
+            weight: 1,
+            fillOpacity: 0.8
+          })
+        } else {
+          // 默认模式：彩色
+          const sector = (cached.marker as any).sectorData as RenderSectorData
+          const colors = getSectorColor(sector)
+          cached.marker.setStyle({
+            fillColor: colors.fillColor,
+            color: colors.strokeColor,
+            weight: 1,
+            fillOpacity: 0.8
+          })
+        }
+      }
+
+      return
+    }
+
+    // 应用高亮样式
+    const { selectedId, relatedIds } = this.pciHighlightConfig
+    const relatedIdsSet = new Set(relatedIds)
+
+    console.log('[SectorRenderer] 应用PCI高亮', {
+      selectedId,
+      relatedCount: relatedIds.length,
+      totalPolygons: this.sectorPolygons.size,
+      renderMode: this.renderMode,
+      samplePolygonIds: Array.from(this.sectorPolygons.keys()).slice(0, 10)
+    })
+
+    // 更新扇区多边形样式
+    let selectedCount = 0
+    let relatedCount = 0
+    let otherCount = 0
+
+    // 收集需要提升到最顶层的扇区
+    const highlightPolygons: L.Polygon[] = []
+
+    for (const [sectorId, cached] of this.sectorPolygons) {
+      const sector = (cached.polygon as any).sectorData as RenderSectorData
+
+      if (sectorId === selectedId) {
+        // 选中的扇区：不透明红色，高对比度
+        selectedCount++
+        cached.polygon.setStyle({
+          fillColor: '#ef4444',
+          color: '#dc2626',
+          weight: 3,
+          fillOpacity: 1
+        })
+        highlightPolygons.push(cached.polygon)
+      } else if (relatedIdsSet.has(sectorId)) {
+        // 同频同PCI的扇区：不透明蓝色，高对比度
+        relatedCount++
+        cached.polygon.setStyle({
+          fillColor: '#3b82f6',
+          color: '#2563eb',
+          weight: 3,
+          fillOpacity: 1
+        })
+        highlightPolygons.push(cached.polygon)
+      } else {
+        // 其他扇区：根据渲染模式选择默认样式
+        if (this.renderMode === 'pci-planning') {
+          // PCI模式：透明黑边
+          cached.polygon.setStyle({
+            fillColor: 'rgba(0,0,0,0)',
+            color: '#000000',
+            weight: 1,
+            fillOpacity: 0
+          })
+        } else {
+          // 默认模式：彩色
+          const colors = getSectorColor(sector)
+          const config = SECTOR_CONFIG[sector.networkType]
+          cached.polygon.setStyle({
+            fillColor: colors.fillColor,
+            color: config.strokeColor || '#000000',
+            weight: config.strokeWidth || 0.5,
+            fillOpacity: config.opacity
+          })
+        }
+      }
+    }
+
+    console.log('[SectorRenderer] PCI高亮应用完成', {
+      selectedCount,
+      relatedCount,
+      otherCount,
+      totalProcessed: selectedCount + relatedCount + otherCount
+    })
+
+    // 将所有高亮扇区提升到最顶层（在样式更新完成后）
+    for (const polygon of highlightPolygons) {
+      polygon.bringToFront()
+    }
+
+    // 更新站点圆点样式
+    for (const [siteKey, cached] of this.siteMarkers) {
+      const sector = (cached.marker as any).sectorData as RenderSectorData
+      const sectorId = sector.id
+
+      if (sectorId === selectedId) {
+        // 选中的扇区：不透明红色，高对比度
+        cached.marker.setStyle({
+          fillColor: '#ef4444',
+          color: '#dc2626',
+          weight: 3,
+          fillOpacity: 1
+        })
+      } else if (relatedIdsSet.has(sectorId)) {
+        // 同频同PCI的扇区：不透明蓝色，高对比度
+        cached.marker.setStyle({
+          fillColor: '#3b82f6',
+          color: '#2563eb',
+          weight: 3,
+          fillOpacity: 1
+        })
+      } else {
+        // 其他扇区：根据渲染模式选择默认样式
+        if (this.renderMode === 'pci-planning') {
+          // PCI模式：透明黑边
+          cached.marker.setStyle({
+            fillColor: 'rgba(0,0,0,0)',
+            color: '#000000',
+            weight: 1,
+            fillOpacity: 0
+          })
+        } else {
+          // 默认模式：彩色
+          const colors = getSectorColor(sector)
+          cached.marker.setStyle({
+            fillColor: colors.fillColor,
+            color: colors.strokeColor,
+            weight: 1,
+            fillOpacity: 0.8
+          })
+        }
+      }
+    }
+  }
+
+  /**
+   * 判断是否应该使用站点圆点模式
+   * Zoom <= 9：远景模式，显示圆点
+   * Zoom > 9：细节模式，显示全部扇区
+   */
+  private _shouldUseSiteMarkerMode(): boolean {
+    return this.currentZoom <= 9
+  }
+
+  /**
+   * 根据缩放级别计算弧线点数
+   * 优化策略：平衡性能和视觉效果
+   * PCI模式：使用更少的点数以提升性能
+   * 默认模式：
+   * - Zoom 10-12: 低细节（刚切换到扇区模式）
+   * - Zoom 13-15: 中等细节
+   * - Zoom 16+: 高细节
+   */
+  private _getArcPointsCount(zoom: number): number {
+    if (this.renderMode === 'pci-planning') {
+      // PCI模式：大幅减少点数以提升性能
+      if (zoom <= 12) return 6     // 低缩放：6点（三角形）
+      if (zoom <= 15) return 8     // 中缩放：8点
+      return 10                    // 高缩放：10点
+    }
+    // 默认模式：正常细节
+    if (zoom <= 12) return 12     // 低缩放：12点
+    if (zoom <= 15) return 20     // 中缩放：20点
+    if (zoom <= 17) return 30     // 高缩放：30点
+    return 40                     // 超高缩放：40点
+  }
+
+  /**
+   * 根据缩放级别计算圆形点数
+   */
+  private _getCirclePointsCount(zoom: number): number {
+    if (this.renderMode === 'pci-planning') {
+      // PCI模式：减少圆形点数
+      return 8
+    }
+    // 默认模式：正常点数
+    if (zoom <= 12) return 20     // 低缩放：20点
+    if (zoom <= 15) return 32     // 中缩放：32点
+    if (zoom <= 17) return 48     // 高缩放：48点
+    return 64                     // 超高缩放：64点
+  }
+
+  /**
+   * 处理缩放事件：使用 requestAnimationFrame 节流
+   */
+  private _onZoom(): void {
+    if (this._animRequestId !== null) return
+
+    this._animRequestId = L.Util.requestAnimFrame(() => {
+      this._updateSectorShapes()
+      this._animRequestId = null
+    }, this)
+  }
+
+  /**
+   * 计算当前缩放级别下的扇区物理半径（米）
+   * 策略：保持扇区的**视觉像素大小恒定**，无论地图如何缩放
+   * 这样用户在缩放地图时，扇区看起来大小"不变"
+   */
+  private _calculateRadius(zoom: number, centerLat: number = 39.9): number {
+    // 目标：室外扇区在屏幕上保持约 16 像素的半径
+    // 室内扇区在屏幕上保持约 8 像素的半径（在户外扇区大小的一半）
+    const TARGET_PIXEL_RADIUS_OUTDOOR = 16
+
+    // 在Web Mercator投影中，每像素代表的米数公式：
+    // metersPerPixel = 156543.03392 * Math.cos(lat * π/180) / 2^zoom
+    // 其中 156543.03392 是赤道在zoom 0时的米/像素
+    const METERS_PER_PIXEL_AT_EQUATOR_ZOOM_0 = 156543.03392
+    const latRad = centerLat * Math.PI / 180
+    const metersPerPixel = METERS_PER_PIXEL_AT_EQUATOR_ZOOM_0 * Math.cos(latRad) / Math.pow(2, zoom)
+
+    // 物理半径 = 目标像素半径 × 每像素米数
+    const physicalRadius = TARGET_PIXEL_RADIUS_OUTDOOR * metersPerPixel
+
+    // 设置合理的上下限，避免极端情况
+    // 最小5米（避免过小），最大5000米（避免过大影响性能）
+    return Math.max(5, Math.min(5000, physicalRadius))
+  }
+
+  /**
+   * 缩放过程中实时更新扇区形状（优化版）
+   */
+  private _updateSectorShapes(): void {
+    if (!this.mapInstance) return
+
+    const currentZoom = this.mapInstance.getZoom()
+    const mapCenter = this.mapInstance.getCenter()
+    const outdoorRadius = this._calculateRadius(currentZoom, mapCenter.lat)
+    const indoorRadius = outdoorRadius / 2
+
+    // 遍历所有已渲染的扇区多边形并更新形状
+    for (const [sectorId, cached] of this.sectorPolygons) {
+      const polygon = cached.polygon
+      const sector = (polygon as any).sectorData as RenderSectorData
+      if (!sector) continue
+
+      const coverStyle = getCellCoverStyle(sector.cell_cover_type, sector.networkType)
+      const radius = coverStyle.isCircular ? indoorRadius : outdoorRadius
+
+      const newLatLngs = this._generateSectorLatLngs(sector, radius)
+      polygon.setLatLngs(newLatLngs)
+
+      // 更新缩放级别
+      cached.zoom = currentZoom
+    }
+
+    // 同样更新圆点标记的缩放级别
+    for (const cached of this.siteMarkers.values()) {
+      cached.zoom = currentZoom
+    }
+  }
+
+  /**
+   * 生成扇区坐标点数组
+   */
+  private _generateSectorLatLngs(sector: RenderSectorData, radius: number): L.LatLngExpression[] {
+    const coverStyle = getCellCoverStyle(sector.cell_cover_type, sector.networkType)
+    const centerLatLng = L.latLng(sector.displayLat, sector.displayLng)
+
+    if (coverStyle.isCircular) {
+      const points = this._generateCirclePoints(centerLatLng, radius)
+      // 仅在首次渲染时记录（避免日志过多）
+      if (!this.sectorPolygons.has(sector.id)) {
+        console.log(`[SectorRenderer] 圆形点数: ${points.length}, Zoom: ${this.currentZoom}`)
+      }
+      return points
+    } else {
+      const halfAngle = coverStyle.angle / 2
+      const startAzimuth = sector.azimuth - halfAngle
+      const endAzimuth = sector.azimuth + halfAngle
+
+      const startPointLatLng = this._fastDestination(centerLatLng, startAzimuth, radius)
+      const endPointLatLng = this._fastDestination(centerLatLng, endAzimuth, radius)
+
+      const arcPoints = this._generateArcPoints(centerLatLng, startAzimuth, endAzimuth, radius)
+
+      // 仅在首次渲染时记录
+      if (!this.sectorPolygons.has(sector.id)) {
+        console.log(`[SectorRenderer] 扇形点数: ${arcPoints.length}, 夹角: ${coverStyle.angle}°, Zoom: ${this.currentZoom}`)
+      }
+
+      return [
+        [centerLatLng.lat, centerLatLng.lng],
+        [startPointLatLng.lat, startPointLatLng.lng],
+        ...arcPoints,
+        [endPointLatLng.lat, endPointLatLng.lng],
+        [centerLatLng.lat, centerLatLng.lng]
+      ]
+    }
+  }
+
+
+  /**
+   * 获取可见扇区（带缓存）
+   */
+  private _getVisibleSectors(paddedBounds: L.LatLngBounds): RenderSectorData[] {
+    const boundsKey = `${paddedBounds.toBBoxString()}-${this.currentZoom}`
+    const now = Date.now()
+
+    // 检查缓存（100ms 内有效）
+    if (this.visibleSectorsCache &&
+        this.visibleSectorsCache.boundsKey === boundsKey &&
+        now - this.visibleSectorsCache.timestamp < 100) {
+      return this.visibleSectorsCache.sectors
+    }
+
+    // 筛选可见扇区
+    const visibleSectors = this.sectors.filter(sector => {
+      if (!sector.displayLat || !sector.displayLng) return false
+      return paddedBounds.contains([sector.displayLat, sector.displayLng])
+    })
+
+    // 更新缓存
+    this.visibleSectorsCache = {
+      boundsKey,
+      sectors: visibleSectors,
+      timestamp: now
+    }
+
+    return visibleSectors
+  }
+
+  /**
+   * 延迟清理不可见的扇区（避免快速移动时频繁创建/销毁）
+   */
+  private _scheduleCleanup(): void {
+    if (this.cleanupTimer !== null) {
+      return // 已有定时器在运行
+    }
+
+    this.cleanupTimer = window.setTimeout(() => {
+      this._cleanupInvisibleSectors()
+      this.cleanupTimer = null
+    }, 2000) // 2秒后清理
+  }
+
+  /**
+   * 清理不可见的扇区
+   */
+  private _cleanupInvisibleSectors(): void {
+    if (!this.mapInstance) return
+
+    const now = Date.now()
+    const bounds = this.mapInstance.getBounds()
+    const latBuffer = (bounds.getNorth() - bounds.getSouth()) * 0.2
+    const lngBuffer = (bounds.getEast() - bounds.getWest()) * 0.2
+    const paddedBounds = L.latLngBounds(
+      [bounds.getSouth() - latBuffer, bounds.getWest() - lngBuffer],
+      [bounds.getNorth() + latBuffer, bounds.getEast() + lngBuffer]
+    )
+
+    const visibleSectorIds = new Set<string>()
+
+    // 收集当前可见的扇区ID
+    if (this._shouldUseSiteMarkerMode()) {
+      // 圆点模式
+      for (const sector of this.sectors) {
+        if (!sector.displayLat || !sector.displayLng) continue
+        if (paddedBounds.contains([sector.displayLat, sector.displayLng])) {
+          visibleSectorIds.add(sector.id)
+        }
+      }
+    } else {
+      // 扇区模式
+      const visibleSectors = this._getVisibleSectors(paddedBounds)
+      for (const sector of visibleSectors) {
+        visibleSectorIds.add(sector.id)
+      }
+    }
+
+    // 清理不可见的扇区多边形（超过2秒未使用）
+    let cleanedPolygons = 0
+    for (const [sectorId, cached] of this.sectorPolygons) {
+      if (!visibleSectorIds.has(sectorId) && now - cached.lastUsed > 2000) {
+        if (this.featureGroup && this.featureGroup.hasLayer(cached.polygon)) {
+          this.featureGroup.removeLayer(cached.polygon)
+        }
+        this.sectorPolygons.delete(sectorId)
+        cleanedPolygons++
+      }
+    }
+
+    // 清理不可见的圆点标记
+    let cleanedMarkers = 0
+    for (const [sectorId, cached] of this.siteMarkers) {
+      if (!visibleSectorIds.has(sectorId) && now - cached.lastUsed > 2000) {
+        if (this.featureGroup && this.featureGroup.hasLayer(cached.marker)) {
+          this.featureGroup.removeLayer(cached.marker)
+        }
+        this.siteMarkers.delete(sectorId)
+        cleanedMarkers++
+      }
+    }
+
+    if (cleanedPolygons > 0 || cleanedMarkers > 0) {
+      console.log(`[SectorRenderer] 清理完成: 扇区 ${cleanedPolygons}, 圆点 ${cleanedMarkers}`)
+    }
+  }
+
+  /**
+   * 优化的渲染方法 - 只更新变化的扇区
+   */
+  private _render(): void {
+    if (!this.mapInstance || !this.featureGroup) return
+
+    const startTime = performance.now()
+
+    // 获取当前地图的缩放级别，确保使用实时值
+    const currentZoom = this.mapInstance.getZoom()
+    const zoomChanged = currentZoom !== this.currentZoom
+    this.currentZoom = currentZoom
+    
+    // 当zoom<=6时关闭扇区图层渲染
+    if (currentZoom <= 6) {
+      // 清理所有已渲染的扇区和圆点
+      if (this.sectorPolygons.size > 0 || this.siteMarkers.size > 0) {
+        // 清理扇区多边形
+        for (const [sectorId, cached] of this.sectorPolygons) {
+          if (this.featureGroup && this.featureGroup.hasLayer(cached.polygon)) {
+            this.featureGroup.removeLayer(cached.polygon)
+          }
+        }
+        this.sectorPolygons.clear()
+        
+        // 清理圆点标记
+        for (const [sectorId, cached] of this.siteMarkers) {
+          if (this.featureGroup && this.featureGroup.hasLayer(cached.marker)) {
+            this.featureGroup.removeLayer(cached.marker)
+          }
+        }
+        this.siteMarkers.clear()
+        
+        console.log(`[SectorRenderer] Zoom=${currentZoom} <= 6, 关闭扇区渲染，已清理所有扇区对象`)
+      }
+      return
+    }
+    
+    const mapCenter = this.mapInstance.getCenter()
+
+    // 获取视口边界（添加缓冲区）
+    const bounds = this.mapInstance.getBounds()
+    const latBuffer = (bounds.getNorth() - bounds.getSouth()) * 0.2
+    const lngBuffer = (bounds.getEast() - bounds.getWest()) * 0.2
+    const paddedBounds = L.latLngBounds(
+      [bounds.getSouth() - latBuffer, bounds.getWest() - lngBuffer],
+      [bounds.getNorth() + latBuffer, bounds.getEast() + lngBuffer]
+    )
+
+    const now = Date.now()
+
+    // 根据缩放级别选择渲染模式
+    if (this._shouldUseSiteMarkerMode()) {
+      // 站点圆点模式
+      this._renderSiteMarkersOptimized(currentZoom, paddedBounds, now, zoomChanged)
+    } else {
+      // 扇区模式
+      this._renderSectorsOptimized(currentZoom, mapCenter, paddedBounds, now, zoomChanged)
+    }
+
+    // 调度延迟清理
+    this._scheduleCleanup()
+
+    const endTime = performance.now()
+    const renderTime = endTime - startTime
+
+    const renderCount = this._shouldUseSiteMarkerMode()
+      ? this.siteMarkers.size
+      : this.sectorPolygons.size
+
+    if (renderTime > 100 || !this._hasLoggedOnce) {
+      const mode = this._shouldUseSiteMarkerMode() ? '站点圆点' : '扇区'
+      console.log(`[SectorRenderer] ${mode}模式: ${renderCount} 对象, Zoom: ${currentZoom}, 耗时: ${renderTime.toFixed(1)}ms`)
+      this._hasLoggedOnce = true
+    }
+
+    // 渲染完成后，如果有PCI高亮配置，自动应用
+    if (this.pciHighlightConfig) {
+      console.log('[SectorRenderer] 渲染完成后应用PCI高亮配置')
+      // 使用requestAnimationFrame确保在下一帧应用样式
+      if (this._styleUpdateRequestId !== null) {
+        L.Util.cancelAnimFrame(this._styleUpdateRequestId)
+      }
+      this._styleUpdateRequestId = L.Util.requestAnimFrame(() => {
+        this._updateSectorStyles()
+        this._styleUpdateRequestId = null
+      }, this)
+    }
+  }
+
+  /**
+   * 优化的站点圆点模式渲染
+   */
+  private _renderSiteMarkersOptimized(
+    currentZoom: number,
+    paddedBounds: L.LatLngBounds,
+    now: number,
+    _zoomChanged: boolean
+  ): void {
+    // 获取可见扇区（带缓存）
+    const visibleSectors = this._getVisibleSectors(paddedBounds)
+
+    // 按频点过滤扇区
+    const frequencyFilteredSectors = visibleSectors.filter(sector => {
+      if (!sector.frequency) return true
+      const isVisible = this.frequencyVisibility.get(sector.frequency)
+      // 如果频点不在映射中（undefined），默认显示；只有在映射中且值为false时才过滤
+      return isVisible !== false
+    })
+
+    // 按白名单过滤扇区（如果设置了白名单）
+    const whitelistFilteredSectors = this.sectorIdWhitelist
+      ? frequencyFilteredSectors.filter(sector => this.sectorIdWhitelist!.has(sector.id))
+      : frequencyFilteredSectors
+
+    // 添加调试日志
+    console.log(`[SectorRenderer] 圆点模式: 总扇区=${this.sectors.length}, 可见=${visibleSectors.length}, 频点过滤后=${frequencyFilteredSectors.length}, 白名单过滤后=${whitelistFilteredSectors.length}, Zoom=${currentZoom}`)
+
+    // 标记当前应该可见的扇区ID
+    const currentVisibleIds = new Set<string>()
+
+    // 添加或更新圆点标记
+    for (const sector of whitelistFilteredSectors) {
+      currentVisibleIds.add(sector.id)
+
+      const cached = this.siteMarkers.get(sector.id)
+
+      if (!cached || cached.zoom !== currentZoom) {
+        // 需要创建新标记
+        if (cached) {
+          // 移除旧标记
+          if (this.featureGroup && this.featureGroup.hasLayer(cached.marker)) {
+            this.featureGroup.removeLayer(cached.marker)
+          }
+          this.siteMarkers.delete(sector.id)
+        }
+
+        // 创建新标记
+        const marker = this._createSectorMarker(sector)
+        marker.addTo(this.featureGroup!)
+        this.siteMarkers.set(sector.id, {
+          marker,
+          lastUsed: now,
+          zoom: currentZoom
+        })
+      } else {
+        // 更新时间戳
+        cached.lastUsed = now
+      }
+    }
+
+    // 立即移除不再可见的标记（快速移动时）
+    for (const [sectorId, cached] of this.siteMarkers) {
+      if (!currentVisibleIds.has(sectorId)) {
+        if (this.featureGroup && this.featureGroup.hasLayer(cached.marker)) {
+          this.featureGroup.removeLayer(cached.marker)
+        }
+        this.siteMarkers.delete(sectorId)
+      }
+    }
+  }
+
+  /**
+   * 渲染站点圆点模式（Zoom <= 9，远景）- 保留兼容性
+   */
+  private _renderSiteMarkers(currentZoom: number): void {
+    // 获取当前视口边界
+    const bounds = this.mapInstance!.getBounds()
+    const latBuffer = (bounds.getNorth() - bounds.getSouth()) * 0.2
+    const lngBuffer = (bounds.getEast() - bounds.getWest()) * 0.2
+    const paddedBounds = L.latLngBounds(
+      [bounds.getSouth() - latBuffer, bounds.getWest() - lngBuffer],
+      [bounds.getNorth() + latBuffer, bounds.getEast() + lngBuffer]
+    )
+
+    const now = Date.now()
+    this._renderSiteMarkersOptimized(currentZoom, paddedBounds, now, true)
+  }
+
+  /**
+   * 创建扇区圆点标记（每个扇区一个圆点）
+   */
+  private _createSectorMarker(sector: RenderSectorData): L.CircleMarker {
+    const centerLatLng = L.latLng(sector.displayLat, sector.displayLng)
+
+    // 计算圆点半径：5米转换为像素
+    const currentZoom = this.mapInstance!.getZoom()
+    const mapCenter = this.mapInstance!.getCenter()
+    const metersPerPixel = 156543.03392 * Math.cos(mapCenter.lat * Math.PI / 180) / Math.pow(2, currentZoom)
+    const radiusInMeters = 5
+    const radiusInPixels = radiusInMeters / metersPerPixel
+
+    // 确定圆点样式：先检查PCI高亮配置
+    let fillColor: string
+    let color: string
+    let weight: number
+    let fillOpacity: number
+
+    // 检查是否需要应用PCI高亮样式
+    const applyPCIHighlight = this.pciHighlightConfig && this.renderMode === 'pci-planning'
+
+    if (applyPCIHighlight && this.pciHighlightConfig) {
+      const { selectedId, relatedIds } = this.pciHighlightConfig
+      const relatedIdsSet = new Set(relatedIds)
+
+      if (sector.id === selectedId) {
+        // 选中的扇区：不透明红色，高对比度
+        fillColor = '#ef4444'
+        color = '#dc2626'
+        weight = 3
+        fillOpacity = 1
+      } else if (relatedIdsSet.has(sector.id)) {
+        // 同频同PCI的扇区：不透明蓝色，高对比度
+        fillColor = '#3b82f6'
+        color = '#2563eb'
+        weight = 3
+        fillOpacity = 1
+      } else {
+        // 其他扇区：透明黑边
+        fillColor = 'rgba(0,0,0,0)'
+        color = '#000000'
+        weight = 1
+        fillOpacity = 0
+      }
+    } else if (this.renderMode === 'pci-planning') {
+      // PCI模式无高亮：透明黑边
+      fillColor = 'rgba(0,0,0,0)'
+      color = '#000000'
+      weight = 1
+      fillOpacity = 0
+    } else {
+      // 默认模式：彩色（基于频点或网络类型）
+      const colors = getSectorColor(sector)
+      fillColor = colors.fillColor
+      color = colors.strokeColor
+      weight = 1
+      fillOpacity = 0.8
+    }
+
+    const marker = L.circleMarker(centerLatLng, {
+      radius: Math.max(radiusInPixels, 3), // 最小3像素，确保可见
+      fillColor: fillColor,
+      color: color,
+      weight: weight,
+      opacity: 1,
+      fillOpacity: fillOpacity,
+      className: 'sector-marker'
+    })
+
+    // 绑定点击事件
+    marker.on('click', (e: L.LeafletMouseEvent) => {
+      L.DomEvent.stopPropagation(e)
+      this.onClick?.(sector, e)
+      console.log(`[SectorRenderer] 扇区圆点被点击: ${sector.name}, ${sector.networkType}`)
+    })
+
+    // 存储扇区数据
+    ;(marker as any).sectorData = sector
+
+    return marker
+  }
+
+  /**
+   * 优化的扇区模式渲染
+   */
+  private _renderSectorsOptimized(
+    currentZoom: number,
+    mapCenter: L.LatLng,
+    paddedBounds: L.LatLngBounds,
+    now: number,
+    _zoomChanged: boolean
+  ): void {
+    // 预先计算当前半径（使用地图中心纬度）
+    const outdoorRadius = this._calculateRadius(currentZoom, mapCenter.lat)
+    const indoorRadius = outdoorRadius / 2
+
+    // 获取可见扇区（带缓存）
+    const visibleSectors = this._getVisibleSectors(paddedBounds)
+
+    // 按频点过滤扇区
+    const frequencyFilteredSectors = visibleSectors.filter(sector => {
+      if (!sector.frequency) return true
+      const isVisible = this.frequencyVisibility.get(sector.frequency)
+      // 如果频点不在映射中（undefined），默认显示；只有在映射中且值为false时才过滤
+      return isVisible !== false
+    })
+
+    // 按白名单过滤扇区（如果设置了白名单）
+    const sectorsToRender = this.sectorIdWhitelist
+      ? frequencyFilteredSectors.filter(sector => this.sectorIdWhitelist!.has(sector.id))
+      : frequencyFilteredSectors
+
+    // 添加调试日志
+    console.log(`[SectorRenderer] 扇区模式: 总扇区=${this.sectors.length}, 可见=${visibleSectors.length}, 频点过滤后=${frequencyFilteredSectors.length}, 白名单过滤后=${sectorsToRender.length}, Zoom=${currentZoom}`)
+
+    // 按站点ID和网络类型分组扇区
+    const groupedSectors = new Map<string, RenderSectorData[]>()
+
+    for (const sector of sectorsToRender) {
+      const key = `${sector.siteId || 'unknown'}-${sector.networkType}`
+      if (!groupedSectors.has(key)) {
+        groupedSectors.set(key, [])
+      }
+      groupedSectors.get(key)!.push(sector)
+    }
+
+    // 标记当前应该可见的扇区ID
+    const currentVisibleIds = new Set<string>()
+
+    let renderedCount = 0
+    // 渲染每个组内的扇区，处理同站多扇区重叠问题
+    for (const [, groupSectors] of groupedSectors.entries()) {
+      groupSectors.sort((a, b) => {
+        const aId = a.sectorId || ''
+        const bId = b.sectorId || ''
+        return aId.localeCompare(bId)
+      })
+
+      for (let i = 0; i < groupSectors.length; i++) {
+        const sector = groupSectors[i]
+        const coverStyle = getCellCoverStyle(sector.cell_cover_type, sector.networkType)
+        const radius = coverStyle.isCircular ? indoorRadius : outdoorRadius
+
+        currentVisibleIds.add(sector.id)
+
+        const cached = this.sectorPolygons.get(sector.id)
+
+        // 检查是否需要创建或更新多边形
+        if (!cached || cached.zoom !== currentZoom || _zoomChanged) {
+          // 需要创建新多边形
+          if (cached) {
+            // 移除旧多边形
+            if (this.featureGroup && this.featureGroup.hasLayer(cached.polygon)) {
+              this.featureGroup.removeLayer(cached.polygon)
+            }
+            this.sectorPolygons.delete(sector.id)
+          }
+
+          // 创建新多边形
+          const polygon = this._createSectorPolygon(sector, radius)
+          polygon.addTo(this.featureGroup!)
+          this.sectorPolygons.set(sector.id, {
+            polygon,
+            lastUsed: now,
+            zoom: currentZoom
+          })
+          renderedCount++
+        } else {
+          // 更新时间戳
+          cached.lastUsed = now
+        }
+
+        // 处理标签
+        if (this.showLabels || this.sectorLabelsEnabled) {
+          if (groupSectors.length <= 3 || i === 0) {
+            const existingLabel = this.sectorLabels.get(sector.id)
+            if (!existingLabel) {
+              const label = this._createSectorLabel(sector, i, groupSectors.length)
+              label.addTo(this.featureGroup!)
+              this.sectorLabels.set(sector.id, label)
+            }
+          }
+        } else {
+          // 清理标签
+          const label = this.sectorLabels.get(sector.id)
+          if (label && this.featureGroup && this.featureGroup.hasLayer(label)) {
+            this.featureGroup.removeLayer(label)
+          }
+          this.sectorLabels.delete(sector.id)
+        }
+      }
+    }
+  }
+
+  /**
+   * 渲染扇区模式（Zoom > 9，中近景，显示全部扇区）- 保留兼容性
+   */
+  private _renderSectors(currentZoom: number, mapCenter: L.LatLng): void {
+    // 获取当前视口边界，添加缓冲区以确保边缘附近的扇区也被渲染
+    const bounds = this.mapInstance!.getBounds()
+    const latBuffer = (bounds.getNorth() - bounds.getSouth()) * 0.2
+    const lngBuffer = (bounds.getEast() - bounds.getWest()) * 0.2
+    const paddedBounds = L.latLngBounds(
+      [bounds.getSouth() - latBuffer, bounds.getWest() - lngBuffer],
+      [bounds.getNorth() + latBuffer, bounds.getEast() + lngBuffer]
+    )
+
+    const now = Date.now()
+    this._renderSectorsOptimized(currentZoom, mapCenter, paddedBounds, now, true)
+  }
+
+  // 标记是否已记录过日志（避免重复）
+  private _hasLoggedOnce = false
+
+  /**
+   * 创建扇区多边形
+   * 根据小区覆盖类型绘制不同形状：
+   * - cell_cover_type = 1: 室外小区，扇形，半径60米，夹角40度，按方位角绘制
+   * - cell_cover_type = 4: 室内小区，圆形，半径30米，忽略方位角
+   */
+  private _createSectorPolygon(sector: RenderSectorData, adjustedRadius?: number): L.Polygon {
+    // 如果没有传入调整后的半径，则计算一个默认值 (避免 crash，但实际上应该总是传入)
+    let radius = adjustedRadius
+    if (!radius) {
+      // Fallback: 使用默认缩放进行计算
+      const currentZoom = this.mapInstance ? this.mapInstance.getZoom() : 12
+      const centerLat = this.mapInstance ? this.mapInstance.getCenter().lat : sector.displayLat
+      radius = this._calculateRadius(currentZoom, centerLat)
+      if (getCellCoverStyle(sector.cell_cover_type, sector.networkType).isCircular) {
+        radius = radius / 2
+      }
+    }
+
+    // 使用提取的坐标生成方法
+    const latLngs = this._generateSectorLatLngs(sector, radius)
+
+    // 确定扇区样式：先检查PCI高亮配置，再使用渲染模式默认样式
+    let fillColor: string
+    let strokeColor: string
+    let strokeWidth: number
+    let fillOpacity: number
+
+    // 检查是否需要应用PCI高亮样式
+    const applyPCIHighlight = this.pciHighlightConfig && this.renderMode === 'pci-planning'
+
+    if (applyPCIHighlight && this.pciHighlightConfig) {
+      const { selectedId, relatedIds } = this.pciHighlightConfig
+      const relatedIdsSet = new Set(relatedIds)
+
+      if (sector.id === selectedId) {
+        // 选中的扇区：不透明红色，高对比度
+        fillColor = '#ef4444'
+        strokeColor = '#dc2626'
+        strokeWidth = 3
+        fillOpacity = 1
+      } else if (relatedIdsSet.has(sector.id)) {
+        // 同频同PCI的扇区：不透明蓝色，高对比度
+        fillColor = '#3b82f6'
+        strokeColor = '#2563eb'
+        strokeWidth = 3
+        fillOpacity = 1
+      } else {
+        // 其他扇区：透明黑边
+        fillColor = 'rgba(0,0,0,0)'
+        strokeColor = '#000000'
+        strokeWidth = 1
+        fillOpacity = 0
+      }
+    } else if (this.renderMode === 'pci-planning') {
+      // PCI模式无高亮：透明黑边
+      fillColor = 'rgba(0,0,0,0)'
+      strokeColor = '#000000'
+      strokeWidth = 1
+      fillOpacity = 0
+    } else {
+      // 默认模式：彩色（基于频点或网络类型）
+      const colors = getSectorColor(sector)
+      const config = SECTOR_CONFIG[sector.networkType]
+      fillColor = colors.fillColor
+      strokeColor = config.strokeColor || '#000000'
+      strokeWidth = config.strokeWidth || 0.5
+      fillOpacity = config.opacity
+    }
+
+    // 获取当前缩放级别用于动态调整渲染质量
+    const currentZoom = this.mapInstance ? this.mapInstance.getZoom() : 12
+
+    // 创建多边形 - PCI模式下禁用平滑处理以提升性能
+    const polygon = L.polygon(latLngs, {
+      color: strokeColor,
+      weight: currentZoom >= 17 ? 0.3 : strokeWidth,
+      opacity: 1,
+      fillColor: fillColor,
+      fillOpacity: fillOpacity,
+      className: 'sector-polygon',
+      smoothFactor: this.renderMode === 'pci-planning' ? 0 : (currentZoom >= 17 ? 0.5 : 0.1),
+      noClip: this.renderMode !== 'pci-planning'  // PCI模式启用裁剪以提升性能
+    })
+
+    // 设置交互样式
+    polygon.setStyle({
+      className: 'sector-polygon'
+    })
+
+    // 绑定点击事件
+    polygon.on('click', (e: L.LeafletMouseEvent) => {
+      L.DomEvent.stopPropagation(e)
+      e.target = polygon
+      this.onClick?.(sector, e)
+      console.log('[SectorRenderer] 扇区被点击:', sector.name, sector.networkType, 'cell_cover_type:', sector.cell_cover_type)
+    })
+
+    // 添加数据属性（用于调试）
+    ; (polygon as any).sectorData = sector
+
+    // 调试：记录创建的扇区ID（仅PCI模式下记录前几个）
+    if (this.renderMode === 'pci-planning' && this.sectorPolygons.size < 5) {
+      console.log('[SectorRenderer] 创建扇区多边形', {
+        id: sector.id,
+        siteId: sector.siteId,
+        sectorId: sector.sectorId,
+        name: sector.name
+      })
+    }
+
+    return polygon
+  }
+
+  /**
+   * 生成弧线上的点
+   * 根据缩放级别自适应调整点数以平衡性能和视觉效果
+   */
+  private _generateArcPoints(
+    center: L.LatLng,
+    startAzimuth: number,
+    endAzimuth: number,
+    radius: number
+  ): L.LatLng[] {
+    const numPoints = this._getArcPointsCount(this.currentZoom)
+    const points: L.LatLng[] = []
+    const angleStep = (endAzimuth - startAzimuth) / numPoints
+
+    for (let i = 1; i < numPoints; i++) {
+      const azimuth = startAzimuth + angleStep * i
+      const point = this._fastDestination(center, azimuth, radius)
+      points.push(point)
+    }
+
+    return points
+  }
+
+  /**
+   * 创建扇区标签
+   * 显示小区名称，使用简洁的文字样式，无边框
+   * @param sector 扇区数据
+   * @param labelIndex 标签在组内的索引
+   * @param totalLabels 组内标签总数
+   */
+  private _createSectorLabel(sector: RenderSectorData, labelIndex: number, totalLabels: number): L.Marker {
+    const centerLatLng = L.latLng(sector.displayLat, sector.displayLng)
+    const config = SECTOR_CONFIG[sector.networkType]
+
+    // PCI模式标签：显示小区名称 + PCI值
+    let labelContent = sector.name || ''
+    if (this.sectorLabelsEnabled) {
+      const pci = (sector as any).syncedPCI ?? sector.pci
+      labelContent = `${labelContent}\nPCI: ${pci ?? 'N/A'}`
+    }
+    const strokeColor = config.strokeColor || '#333'
+
+    // 根据标签索引计算偏移量，避免重叠
+    let offsetLat = 0
+    let offsetLng = 0
+
+    if (totalLabels > 1) {
+      // 计算标签偏移半径（根据扇区类型和缩放级别调整）
+      const offsetRadius = this.currentZoom > 15 ? 25 : 20
+
+      // 将标签沿圆周均匀分布
+      const angleStep = 360 / totalLabels
+      const angle = angleStep * labelIndex
+
+      // 转换角度为弧度
+      const angleRad = (angle * Math.PI) / 180
+
+      // 计算偏移坐标
+      offsetLat = Math.sin(angleRad) * offsetRadius
+      offsetLng = Math.cos(angleRad) * offsetRadius
+    }
+
+    // 创建简洁的文字标签
+    const labelIcon = L.divIcon({
+      className: 'sector-label',
+      html: `<div style="font-size: 11px; color: #000; font-weight: 600; white-space: pre-line; background-color: rgba(255, 255, 255, 0.9); padding: 2px 4px; border-radius: 3px; border: 1px solid #ccc; text-align: center; min-width: 60px;">${labelContent}</div>`,
+      iconSize: L.point(0, 0),
+      iconAnchor: L.point(0, 0),
+      popupAnchor: L.point(0, 0)
+    })
+
+    // 创建标记并添加到地图
+    // 使用L.map.latLngToLayerPoint和L.map.layerPointToLatLng来计算偏移后的位置
+    let labelLatLng = centerLatLng
+    if (offsetLat !== 0 || offsetLng !== 0) {
+      // 将地理坐标转换为像素坐标
+      const centerPoint = this.mapInstance!.latLngToLayerPoint(centerLatLng)
+      // 添加偏移
+      const offsetPoint = centerPoint.add(L.point(offsetLng, offsetLat))
+      // 将像素坐标转换回地理坐标
+      labelLatLng = this.mapInstance!.layerPointToLatLng(offsetPoint)
+    }
+
+    const marker = L.marker(labelLatLng, {
+      icon: labelIcon,
+      interactive: false,
+      zIndexOffset: 1000
+    })
+
+    return marker
+  }
+
+  /**
+   * 生成圆形上的点
+   * 根据缩放级别自适应调整点数以平衡性能和视觉效果
+   */
+  private _generateCirclePoints(
+    center: L.LatLng,
+    radius: number
+  ): L.LatLng[] {
+    const numPoints = this._getCirclePointsCount(this.currentZoom)
+    const points: L.LatLng[] = []
+    const angleStep = 360 / numPoints
+
+    for (let i = 0; i <= numPoints; i++) {
+      const azimuth = angleStep * i
+      const point = this._fastDestination(center, azimuth, radius)
+      points.push(point)
+    }
+
+    return points
+  }
+
+  /**
+   * 快速计算终点坐标 (Flat-Earth Approximation)
+   * 适用于小范围（<几百公里）的高性能计算，避免昂贵的反三角函数
+   * 精度提示：在2300m范围内，误差极小，完全满足视觉需求
+   */
+  private _fastDestination(start: L.LatLng, azimuth: number, distance: number): L.LatLng {
+    // 将角度转换为弧度
+    const radAzimuth = azimuth * Math.PI / 180
+    // 纬度的每米度数 (常量 approximation)
+    const metersPerLatDegree = 111319.9
+    // 经度的每米度数 (随纬度变化)
+    const metersPerLngDegree = 111319.9 * Math.cos(start.lat * Math.PI / 180)
+
+    const dLat = (distance * Math.cos(radAzimuth)) / metersPerLatDegree
+    const dLng = (distance * Math.sin(radAzimuth)) / metersPerLngDegree
+
+    return L.latLng(start.lat + dLat, start.lng + dLng)
+  }
+
+
+}
+
+/**
+ * 创建扇区 SVG 图层
+ */
+export function createSectorLayer(options: SectorLayerOptions): SectorSVGLayer {
+  return new SectorSVGLayer(options)
+}

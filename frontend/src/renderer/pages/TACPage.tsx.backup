@@ -1,0 +1,455 @@
+import { useState, useEffect, useRef } from 'react'
+import { Play, Download, Loader2, AlertCircle, CheckCircle2, FileSpreadsheet } from 'lucide-react'
+import { tacApi } from '../services/api'
+import { useTACStore } from '../store/tacStore'
+
+interface TACResultData {
+  taskId: string
+  status: 'pending' | 'processing' | 'completed' | 'failed'
+  progress: number
+  totalCells: number
+  matchedCells: number
+  unmatchedCells: number
+  results: any[]
+  startTime: string
+  endTime?: string
+  error?: string
+  exportPath?: string
+}
+
+const MAX_ERRORS = 5
+
+export function TACPage() {
+  const { taskId, config, result, setTaskId, setConfig, setResult, clearTAC } = useTACStore()
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const taskResult = result as TACResultData | null
+
+  // 页面加载时检查任务是否仍然存在，如果不存在则清除状态
+  useEffect(() => {
+    const checkTaskExists = async () => {
+      if (taskId && result?.status === 'processing') {
+        try {
+          await tacApi.getProgress(taskId)
+          // 如果任务存在，不进行任何操作，轮询 useEffect 会继续处理
+        } catch (err: any) {
+          // 如果任务不存在（404）或其他错误，清除状态
+          console.log('任务已不存在，清除TAC状态')
+          clearTAC()
+          setError(null)
+        }
+      }
+    }
+
+    checkTaskExists()
+  }, [])
+
+  const pollingIntervalRef = useRef<NodeJS.Timeout | null>(null)
+  const errorCountRef = useRef(0)
+
+  // 轮询任务进度
+  useEffect(() => {
+    const clearPolling = () => {
+      if (pollingIntervalRef.current) {
+        clearInterval(pollingIntervalRef.current)
+        pollingIntervalRef.current = null
+      }
+    }
+
+    if (!taskId || taskResult?.status === 'completed' || taskResult?.status === 'failed') {
+      clearPolling()
+      return
+    }
+
+    // 每2秒轮询一次任务进度
+    pollingIntervalRef.current = setInterval(async () => {
+      try {
+        const response = await tacApi.getProgress(taskId)
+        if (response.success && response.data) {
+          setResult({
+            ...response.data,
+            exportPath: taskResult?.exportPath
+          })
+
+          // 任务完成或失败，停止轮询
+          if (response.data.status === 'completed' || response.data.status === 'failed') {
+            clearPolling()
+          }
+        }
+      } catch (err: any) {
+        errorCountRef.current++
+        console.error('轮询TAC规划进度失败:', err)
+
+        // 如果任务不存在（404），清除状态并停止轮询
+        if (err.code === 404 || err.message?.includes('任务不存在')) {
+          clearPolling()
+          clearTAC()
+          setError(null)
+          console.log('任务已不存在，已清除TAC状态')
+          return
+        }
+
+        // 连续失败5次则停止轮询
+        if (errorCountRef.current >= MAX_ERRORS) {
+          clearPolling()
+          setError('获取任务进度失败，请刷新页面重试')
+        }
+      }
+    }, 2000)
+
+    return clearPolling
+  }, [taskId, taskResult?.status])
+
+  // 组件卸载时清理轮询
+  useEffect(() => {
+    return () => {
+      if (pollingIntervalRef.current) {
+        clearInterval(pollingIntervalRef.current)
+      }
+    }
+  }, [])
+
+  const handleStartPlanning = async () => {
+    if (!config?.networkType) {
+      setError('请选择网络类型')
+      return
+    }
+
+    setLoading(true)
+    setError(null)
+    setResult(null)
+    clearTAC()
+    errorCountRef.current = 0
+
+    try {
+      const response = await tacApi.plan(config!)
+      if (response.success && response.data) {
+        const newTaskId = response.data.taskId
+        setTaskId(newTaskId)
+
+        // 初始获取任务状态
+        const progressResponse = await tacApi.getProgress(newTaskId)
+        if (progressResponse.success && progressResponse.data) {
+          setResult(progressResponse.data)
+        }
+      } else {
+        setError(response.message || '启动TAC规划任务失败')
+      }
+    } catch (err: any) {
+      console.error('启动TAC规划失败:', err)
+      setError(err.message || '启动TAC规划任务失败')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const handleExport = async (format: 'xlsx' | 'csv' = 'xlsx') => {
+    if (!taskId) return
+
+    try {
+      const blob = await tacApi.export(taskId, format)
+
+      // 创建下载链接
+      const url = window.URL.createObjectURL(blob)
+      const link = document.createElement('a')
+      link.href = url
+
+      // 生成文件名
+      const networkType = config?.networkType || 'LTE'
+      const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, -5)
+      const filename = `TAC规划结果_${networkType}_${timestamp}.${format}`
+
+      link.download = filename
+      document.body.appendChild(link)
+      link.click()
+
+      // 清理
+      setTimeout(() => {
+        document.body.removeChild(link)
+        window.URL.revokeObjectURL(url)
+      }, 100)
+
+      // 记录导出路径
+      setResult((prev: TACResultData | null) => prev ? { ...prev, exportPath: filename } : null)
+    } catch (err: any) {
+      console.error('导出失败:', err)
+      setError('导出失败: ' + (err.message || '未知错误'))
+    }
+  }
+
+  const getNetworkTypeLabel = (type: 'LTE' | 'NR') => {
+    return type === 'LTE' ? '4G LTE' : '5G NR'
+  }
+
+  return (
+    <div className="p-8">
+      <h1 className="text-3xl font-bold mb-8">TAC规划</h1>
+
+      {/* 配置区域 */}
+      <div className="bg-card p-6 rounded-lg border border-border mb-6">
+          <div className="flex items-center gap-3 mb-6">
+            {taskResult?.status === 'completed' ? (
+              <CheckCircle2 size={24} className="text-green-500" />
+            ) : taskResult?.status === 'failed' ? (
+              <AlertCircle size={24} className="text-red-500" />
+            ) : (
+              <Loader2 size={24} className="animate-spin text-primary" />
+            )}
+            <div>
+              <h2 className="text-xl font-semibold">规划结果</h2>
+              <p className="text-sm text-muted-foreground">
+                任务ID: {taskId} · {getNetworkTypeLabel(config?.networkType || 'LTE')}
+              </p>
+            </div>
+          </div>
+
+        <div className="space-y-4">
+          {/* 网络类型选择 */}
+          <div>
+            <label className="block text-sm font-medium mb-2">网络类型</label>
+            <div className="flex gap-4">
+              <label className="flex items-center gap-2 cursor-pointer">
+                <input
+                  type="radio"
+                  name="networkType"
+                  value="LTE"
+                  checked={config?.networkType === 'LTE'}
+                  onChange={(e) => setConfig({ networkType: e.target.value as 'LTE' | 'NR' })}
+                  disabled={loading || taskResult?.status === 'processing'}
+                  className="w-4 h-4 text-primary"
+                />
+                <span className="text-sm">4G LTE</span>
+              </label>
+              <label className="flex items-center gap-2 cursor-pointer">
+                <input
+                  type="radio"
+                  name="networkType"
+                  value="NR"
+                  checked={config?.networkType === 'NR'}
+                  onChange={(e) => setConfig({ networkType: e.target.value as 'LTE' | 'NR' })}
+                  disabled={loading || taskResult?.status === 'processing'}
+                  className="w-4 h-4 text-primary"
+                />
+                <span className="text-sm">5G NR</span>
+              </label>
+            </div>
+          </div>
+
+          {/* 说明文字 */}
+          <div className="p-4 bg-muted/50 rounded-lg text-sm text-muted-foreground">
+            <div className="flex items-start gap-2">
+              <FileSpreadsheet size={16} className="flex-shrink-0 mt-0.5" />
+              <div className="space-y-1">
+                <p>• 待规划小区：数据管理模块中前缀为"cell-tree-export"的Excel文件</p>
+                <p>• TAC图层：已导入的"4G_TAC.TAB"或"5G_TAC.TAB"</p>
+                <p>• 规划逻辑：基于TAC图层区域，将落在TAC区域内的小区匹配对应TAC编号</p>
+              </div>
+            </div>
+          </div>
+
+          {/* 开始按钮 */}
+          <button
+            onClick={handleStartPlanning}
+            disabled={loading || taskResult?.status === 'processing'}
+            className="w-full px-6 py-3 bg-primary text-primary-foreground rounded-lg hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2 font-medium"
+          >
+            {loading ? (
+              <>
+                <Loader2 className="animate-spin" size={20} />
+                <span>启动规划中...</span>
+              </>
+            ) : taskResult?.status === 'processing' ? (
+              <>
+                <Loader2 className="animate-spin" size={20} />
+                <span>规划进行中...</span>
+              </>
+            ) : (
+              <>
+                <Play size={20} />
+                <span>开始TAC规划</span>
+              </>
+            )}
+          </button>
+        </div>
+      </div>
+
+      {/* 错误提示 */}
+      {error && (
+        <div className="mb-6 p-4 bg-red-500/10 border border-red-500/20 rounded-lg flex items-start gap-3">
+          <AlertCircle size={20} className="text-red-500 flex-shrink-0 mt-0.5" />
+          <div className="flex-1">
+            <p className="text-red-500 font-medium mb-1">规划失败</p>
+            <p className="text-red-600 text-sm">{error}</p>
+          </div>
+        </div>
+      )}
+
+      {/* 规划结果 */}
+      {taskResult && (
+        <div className="bg-card p-6 rounded-lg border border-border">
+          <div className="flex items-center justify-between mb-6">
+            <div className="flex items-center gap-3">
+              {taskResult.status === 'completed' ? (
+                <CheckCircle2 size={24} className="text-green-500" />
+              ) : taskResult.status === 'failed' ? (
+                <AlertCircle size={24} className="text-red-500" />
+              ) : (
+                <Loader2 size={24} className="animate-spin text-primary" />
+              )}
+              <div>
+                <h2 className="text-xl font-semibold">规划结果</h2>
+                <p className="text-sm text-muted-foreground">
+                  任务ID: {taskId} · {getNetworkTypeLabel(config?.networkType || 'LTE')}
+                </p>
+              </div>
+            </div>
+
+            {taskResult.status === 'completed' && (
+              <button
+                onClick={() => handleExport('xlsx')}
+                className="flex items-center gap-2 px-4 py-2 bg-primary text-primary-foreground rounded-lg hover:bg-primary/90 transition-colors"
+              >
+                <Download size={16} />
+                <span>导出结果</span>
+              </button>
+            )}
+          </div>
+
+          {/* 任务状态 */}
+          <div className="mb-6">
+            <div className="flex items-center justify-between mb-2">
+              <span className="text-sm font-medium">规划进度</span>
+              <span className="text-sm text-muted-foreground">
+                {taskResult.status === 'completed'
+                  ? '已完成'
+                  : taskResult.status === 'failed'
+                  ? '失败'
+                  : taskResult.status === 'processing'
+                  ? '进行中'
+                  : '等待中'} ({taskResult.progress}%)
+              </span>
+            </div>
+            <div className="w-full bg-muted rounded-full h-2">
+              <div
+                className={`h-2 rounded-full transition-all duration-300 ${
+                  taskResult.status === 'completed'
+                    ? 'bg-green-500'
+                    : taskResult.status === 'failed'
+                    ? 'bg-red-500'
+                    : 'bg-primary'
+                }`}
+                style={{ width: `${taskResult.progress}%` }}
+              />
+            </div>
+          </div>
+
+          {/* 统计信息 */}
+          <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
+            <div className="p-4 bg-muted/50 rounded-lg">
+              <p className="text-xs text-muted-foreground mb-1">总小区数</p>
+              <p className="text-2xl font-bold">{taskResult.totalCells}</p>
+            </div>
+            <div className="p-4 bg-green-500/10 border border-green-500/20 rounded-lg">
+              <p className="text-xs text-green-600 mb-1">匹配成功</p>
+              <p className="text-2xl font-bold text-green-500">{taskResult.matchedCells}</p>
+            </div>
+            <div className="p-4 bg-orange-500/10 border border-orange-500/20 rounded-lg">
+              <p className="text-xs text-orange-600 mb-1">未匹配</p>
+              <p className="text-2xl font-bold text-orange-500">{taskResult.unmatchedCells}</p>
+            </div>
+            <div className="p-4 bg-muted/50 rounded-lg">
+              <p className="text-xs text-muted-foreground mb-1">匹配率</p>
+              <p className="text-2xl font-bold">
+                {taskResult.totalCells > 0
+                  ? ((taskResult.matchedCells / taskResult.totalCells) * 100).toFixed(1)
+                  : '0'}
+                %
+              </p>
+            </div>
+          </div>
+
+          {/* 任务错误信息 */}
+          {taskResult.status === 'failed' && taskResult.error && (
+            <div className="mb-6 p-4 bg-red-500/10 border border-red-500/20 rounded-lg">
+              <div className="flex items-start gap-2">
+                <AlertCircle size={16} className="text-red-500 flex-shrink-0 mt-0.5" />
+                <p className="text-sm text-red-600">{taskResult.error}</p>
+              </div>
+            </div>
+          )}
+
+          {/* 详细结果表格 */}
+          {taskResult.status === 'completed' && taskResult.results && (
+            <div>
+              <h3 className="text-lg font-semibold mb-4">小区TAC分配详情</h3>
+              <div className="overflow-x-auto max-h-[600px]">
+                <table className="w-full text-sm">
+                  <thead className="sticky top-0 bg-background border-b border-border">
+                    <tr>
+                      <th className="text-left p-3 font-medium">站点ID</th>
+                      <th className="text-left p-3 font-medium">站点名称</th>
+                      <th className="text-left p-3 font-medium">小区ID</th>
+                      <th className="text-left p-3 font-medium">小区名称</th>
+                      <th className="text-left p-3 font-medium">网络类型</th>
+                      <th className="text-left p-3 font-medium">经度</th>
+                      <th className="text-left p-3 font-medium">纬度</th>
+                      <th className="text-left p-3 font-medium">TAC</th>
+                      <th className="text-left p-3 font-medium">TAC区域名称</th>
+                      <th className="text-left p-3 font-medium">匹配状态</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {taskResult.results.map((cell, index) => (
+                      <tr key={`${cell.sectorId}-${index}`} className="border-b border-border hover:bg-muted/50">
+                        <td className="p-3 font-mono text-xs">{cell.siteId}</td>
+                        <td className="p-3">{cell.siteName}</td>
+                        <td className="p-3 font-mono text-xs">{cell.sectorId}</td>
+                        <td className="p-3">{cell.sectorName}</td>
+                        <td className="p-3">
+                          <span className={`px-2 py-1 rounded text-xs ${
+                            cell.networkType === 'LTE'
+                              ? 'bg-blue-500/10 text-blue-600'
+                              : 'bg-purple-500/10 text-purple-600'
+                          }`}>
+                            {cell.networkType}
+                          </span>
+                        </td>
+                        <td className="p-3 font-mono text-xs">{cell.longitude?.toFixed(6)}</td>
+                        <td className="p-3 font-mono text-xs">{cell.latitude?.toFixed(6)}</td>
+                        <td className="p-3 font-mono">{cell.tac || '-'}</td>
+                        <td className="p-3">{cell.tacAreaName || '-'}</td>
+                        <td className="p-3">
+                          {cell.matched ? (
+                            <span className="px-2 py-1 bg-green-500/10 text-green-600 rounded text-xs">
+                              已匹配
+                            </span>
+                          ) : (
+                            <span className="px-2 py-1 bg-orange-500/10 text-orange-600 rounded text-xs">
+                              未匹配
+                            </span>
+                          )}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
+          {/* 导出路径提示 */}
+          {taskResult?.exportPath && (
+            <div className="mt-4 p-3 bg-blue-500/10 border border-blue-500/20 rounded-lg text-sm">
+              <div className="flex items-center gap-2">
+                <Download size={16} className="text-blue-500 flex-shrink-0" />
+                <span className="text-blue-600">
+                  已导出文件: <span className="font-mono">{taskResult.exportPath}</span>
+                </span>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}

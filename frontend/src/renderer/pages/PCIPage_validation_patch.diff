@@ -1,0 +1,168 @@
+--- a/PCIPage.tsx
++++ b/PCIPage.tsx
+@@ -1,5 +1,5 @@
+ import { useState, useEffect, useRef } from 'react'
+-import { Play, Download, Settings, Loader2, AlertCircle, CheckCircle2 } from 'lucide-react'
++import { Play, Download, Settings, Loader2, AlertCircle } from 'lucide-react'
+ import { pciApi } from '../services/api'
+ import type { ApiResponse } from '@shared/types'
+ import { useTaskStore } from '../store/taskStore'
+@@ -20,6 +20,27 @@
+ const MAX_ERRORS =5
+ 
++// PCI范围常量
++const LTE_PCI_RANGE = { min: 0, max: 503 }
++const NR_PCI_RANGE = { min: 0, max: 1007 }
++
++// 验证PCI范围
++function validatePCIRange(min: number, max: number, networkType: 'LTE' | 'NR'): {
++  isValid: boolean
++  error?: string
++  correctedMin?: number
++  correctedMax?: number
++} {
++  const range = networkType === 'LTE' ? LTE_PCI_RANGE : NR_PCI_RANGE
++  
++  if (isNaN(min) || isNaN(max)) {
++    return {
++      isValid: false,
++      error: 'PCI范围必须是有效的数字',
++      correctedMin: range.min,
++      correctedMax: range.max
++    }
++  }
++  
++  if (!Number.isInteger(min) || !Number.isInteger(max)) {
++    return {
++      isValid: false,
++      error: 'PCI范围必须是整数',
++      correctedMin: Math.round(min),
++      correctedMax: Math.round(max)
++    }
++  }
++  
++  if (min < range.min || max > range.max) {
++    return {
++      isValid: false,
++      error: `${networkType}网络PCI范围限制为${range.min}-${range.max}`,
++      correctedMin: Math.max(range.min, Math.min(range.max, min)),
++      correctedMax: Math.min(range.max, Math.max(range.min, max))
++    }
++  }
++  
++  if (min > max) {
++    return {
++      isValid: false,
++      error: 'PCI最小值不能大于最大值',
++      correctedMin: min,
++      correctedMax: Math.max(min, max)
++    }
++  }
++  
++  return { isValid: true }
++}
++
+ export function PCIPage() {
+   const [config, setConfig] = useState({
+     networkType: 'LTE',
+@@ -33,6 +54,7 @@
+       max: 503              // 默认LTE范围
+     }
+   })
++  const [pciRangeError, setPciRangeError] = useState<string | null>(null)
+   const {
+     updateTaskProgress, completeTask, failTask, activeTaskIds, setActiveTaskId, startTask,
+     getLatestPCITask
+@@ -236,13 +258,20 @@
+                 options={['LTE', 'NR']}
+                 onChange={(value) => {
+                   setConfig({
+                     ...config,
+                     networkType: value,
+                     // 切换网络类型时自动调整模数选项
+                     useMod3: value === 'LTE',
+                     useMod30: value === 'NR',
+                     // 切换网络类型时自动调整PCI范围
+-                    pciRange: value === 'LTE' ? { min: 0, max: 503 } : { min: 0, max: 1007 }
++                    pciRange: value === 'LTE' ? LTE_PCI_RANGE : NR_PCI_RANGE
+                   })
++                  setPciRangeError(null)
+                 }}
+                 disabled={isRunning}
+               />
+@@ -292,8 +321,11 @@
+                   <ConfigInput
+                     label="最小值"
+                     type="number"
+                     value={config.pciRange.min}
+-                    onChange={(value) =>
+-                      setConfig({
+-                        ...config,
+-                        pciRange: {
+-                          ...config.pciRange,
+-                          min: parseInt(value) || 0
+-                        }
+-                      })
+-                    }
++                    onChange={(value) => {
++                      const numValue = parseInt(value)
++                      const validation = validatePCIRange(numValue, config.pciRange.max, config.networkType)
++                      if (!validation.isValid) {
++                        setPciRangeError(validation.error || 'PCI范围无效')
++                        if (validation.correctedMin !== undefined) {
++                          setConfig({ ...config, pciRange: { ...config.pciRange, min: validation.correctedMin }})
++                        }
++                      } else {
++                        setPciRangeError(null)
++                        setConfig({ ...config, pciRange: { ...config.pciRange, min: numValue }})
++                      }
++                    }}
+                     disabled={isRunning}
+                     min={config.networkType === 'LTE' ? LTE_PCI_RANGE.min : NR_PCI_RANGE.min}
+                     max={config.networkType === 'LTE' ? LTE_PCI_RANGE.max : NR_PCI_RANGE.max}
+@@ -308,20 +339,27 @@
+                   <ConfigInput
+                     label="最大值"
+                     type="number"
+                     value={config.pciRange.max}
+-                    onChange={(value) =>
+-                      setConfig({
+-                        ...config,
+-                        pciRange: {
+-                          ...config.pciRange,
+-                          max: parseInt(value) || (config.networkType === 'LTE' ? 503 : 1007)
+-                        }
+-                      })
+-                    }
++                    onChange={(value) => {
++                      const numValue = parseInt(value)
++                      const validation = validatePCIRange(config.pciRange.min, numValue, config.networkType)
++                      if (!validation.isValid) {
++                        setPciRangeError(validation.error || 'PCI范围无效')
++                        if (validation.correctedMax !== undefined) {
++                          setConfig({ ...config, pciRange: { ...config.pciRange, max: validation.correctedMax }})
++                        }
++                      } else {
++                        setPciRangeError(null)
++                        setConfig({ ...config, pciRange: { ...config.pciRange, max: numValue }})
++                      }
++                    }}
+                     disabled={isRunning}
+                     min={config.pciRange.min}
+                     max={config.networkType === 'LTE' ? LTE_PCI_RANGE.max : NR_PCI_RANGE.max}
+@@ -330,7 +358,7 @@
+                   />
+                 </div>
+                 <p className={`text-xs mt-2 ${pciRangeError ? 'text-red-600' : 'text-muted-foreground'}`}>
+-                  {config.networkType === 'LTE' ? 'LTE PCI范围：0-503' : 'NR PCI范围：0-1007'}
++                  {pciRangeError || `${config.networkType} PCI范围：${config.networkType === 'LTE' ? LTE_PCI_RANGE.min : NR_PCI_RANGE.min}-${config.networkType === 'LTE' ? LTE_PCI_RANGE.max : NR_PCI_RANGE.max}`}
+                 </p>
+               </div>
+@@ -338,7 +366,7 @@
+                 <button
+                   onClick={handleRunPCI}
+-                  disabled={loading || isRunning}
++                  disabled={loading || isRunning || !!pciRangeError}
+                   className="flex-1 flex items-center justify-center gap-2 bg-primary text-primary-foreground px-4 py-2 rounded-lg hover:opacity-90 transition-opacity disabled:opacity-50 disabled:cursor-not-allowed"
+                 >
+                   {loading ? (

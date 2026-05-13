@@ -1,0 +1,306 @@
+/* Leaflet地图样式 - 必须在最前面 */
+@import 'leaflet/dist/leaflet.css';
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    /* Default theme variables (dark mode with blue primary) */
+    /* These are dynamically updated by themeStore.ts based on user selection */
+    --background: 0 0% 20%;
+    --foreground: 0 0% 95%;
+
+    --card: 0 0% 23%;
+    --card-foreground: 0 0% 95%;
+
+    --popover: 0 0% 23%;
+    --popover-foreground: 0 0% 95%;
+
+    --primary: 217.2 91.2% 59.8%;
+    --primary-foreground: 222.2 47.4% 11.2%;
+
+    --secondary: 0 0% 16%;
+    --secondary-foreground: 0 0% 95%;
+
+    --muted: 0 0% 16%;
+    --muted-foreground: 0 0% 65%;
+
+    --accent: 0 0% 16%;
+    --accent-foreground: 0 0% 95%;
+
+    --destructive: 0 62.8% 30.6%;
+    --destructive-foreground: 0 0% 95%;
+
+    --border: 0 0% 16%;
+    --input: 0 0% 16%;
+    --ring: 207 90% 54%;
+
+    --radius: 0.5rem;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+}
+
+/* 自定义滚动条 */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  @apply bg-secondary;
+}
+
+::-webkit-scrollbar-thumb {
+  @apply bg-muted-foreground/30 rounded-md;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  @apply bg-muted-foreground/50;
+}
+
+/* Leaflet地图样式覆盖 */
+.leaflet-container {
+  background: #f0f2f5;
+}
+
+/* 瓦片缩放渲染优化 - 防止 zoom 过程中出现黑色块状拖影 */
+.leaflet-tile {
+  image-rendering: auto;
+  will-change: auto;
+}
+.leaflet-layer {
+  backface-visibility: hidden;
+  -webkit-backface-visibility: hidden;
+}
+
+/* 打点标记标签样式 - 确保标签框正确包裹文字 */
+.leaflet-marker-icon.marker-label-wrapper {
+  overflow: visible !important;
+  background: transparent !important;
+  border: none !important;
+}
+.marker-label-inner {
+  position: relative;
+  display: inline-block;
+  pointer-events: none;
+  text-shadow: none;
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 打点标记 - 确保可点击 */
+.leaflet-marker-icon.capture-marker {
+  cursor: pointer !important;
+}
+
+
+/* 抓取坐标弹窗样式 - 白色背景带细边框 */
+.leaflet-popup.capture-popup-white .leaflet-popup-content-wrapper {
+  background: #fff !important;
+  border: 1px solid #d1d5db !important;
+  border-radius: 4px !important;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.12) !important;
+  padding: 0 !important;
+}
+
+.leaflet-popup.capture-popup-white .leaflet-popup-tip {
+  background: #fff !important;
+  border: 1px solid #d1d5db !important;
+}
+
+.leaflet-popup.capture-popup-white .leaflet-popup-content {
+  margin: 0 !important;
+  color: #000 !important;
+}
+
+/* 通用弹窗样式（非定位标记、非抓取弹窗） */
+.leaflet-popup-content-wrapper:not(.capture-popup-white) {
+  background: rgba(30, 41, 59, 0.95);
+  backdrop-filter: blur(8px);
+  border: 1px solid hsl(var(--border));
+  border-radius: var(--radius);
+}
+
+.leaflet-popup-tip:not(.capture-popup-white) {
+  background: rgba(30, 41, 59, 0.95);
+}
+
+.leaflet-popup-content-wrapper:not(.capture-popup-white) .leaflet-popup-content {
+  margin: 12px;
+  color: hsl(var(--foreground));
+}
+
+.leaflet-control-zoom a {
+  background-color: hsl(var(--card));
+  color: hsl(var(--foreground));
+  border: 1px solid hsl(var(--border));
+}
+
+.leaflet-control-zoom a:hover {
+  background-color: hsl(var(--muted));
+}
+
+.leaflet-control-attribution {
+  background-color: rgba(30, 41, 59, 0.8);
+  color: hsl(var(--muted-foreground));
+}
+
+
+/* 动画效果 */
+@keyframes bounce-subtle {
+  0%, 100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-4px);
+  }
+}
+
+@keyframes fadeInUp {
+  from {
+    opacity: 0;
+    transform: translateX(-50%) translateY(20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0);
+  }
+}
+
+.bounce-subtle {
+  display: inline-block;
+  animation: bounce-subtle 1.5s ease-in-out infinite;
+}
+
+.group:hover .group-hover\:bounce-subtle {
+  animation: bounce-subtle 1s ease-in-out infinite;
+}
+
+/* 扇区鼠标悬停提示框样式 - 紧凑灰色框 */
+.leaflet-tooltip.sector-tooltip {
+  background: rgba(100, 100, 100, 0.95);
+  border: 1px solid rgba(0, 0, 0, 0.2);
+  border-radius: 4px;
+  padding: 2px 6px;
+  color: white;
+  font-size: 12px;
+  font-weight: 500;
+  white-space: nowrap;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.2);
+  pointer-events: none;
+  opacity: 1;
+  transform: none;
+  transition: none;
+}
+
+.leaflet-tooltip.sector-tooltip:before {
+  border-top-color: rgba(100, 100, 100, 0.95);
+}
+
+.leaflet-tooltip-top.sector-tooltip {
+  margin-bottom: 10px;
+}
+
+/* tooltip 内容 */
+.sector-tooltip-content {
+  display: block;
+}
+
+/* 测距模式下的扇区样式 - 禁用交互，保持十字光标 */
+.sector-polygon-measure,
+.sector-marker-measure {
+  pointer-events: none !important;
+  cursor: crosshair !important;
+}
+
+.sector-polygon-measure:hover,
+.sector-marker-measure:hover {
+  cursor: crosshair !important;
+}
+
+/* 框选模式全局样式 */
+/* 框选模式下鼠标样式由 OnlineMap.tsx 控制，不再使用 CSS 强制设置 */
+
+/* 当鼠标悬停在捕捉点附近时，允许显示手型 (光标效果) */
+.selection-active.snap-point-active {
+  cursor: pointer !important;
+}
+
+/* 网络状态指示器 - 雷达扫描动画 */
+@keyframes radar-sweep {
+  0% {
+    transform: rotate(0deg);
+  }
+  100% {
+    transform: rotate(360deg);
+  }
+}
+
+/* 网络状态指示器 - 脉冲动画 */
+@keyframes status-pulse {
+  0%, 100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.8;
+    transform: scale(0.95);
+  }
+}
+
+/* 网络离线状态的闪烁警告 */
+@keyframes offline-blink {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.7;
+  }
+}
+
+/* 表格列宽拖拽手柄样式 */
+.table-resize-handle {
+  position: absolute;
+  right: 0;
+  top: 0;
+  bottom: 0;
+  width: 4px;
+  cursor: col-resize;
+  background: transparent;
+  transition: background-color 0.15s ease;
+}
+
+.table-resize-handle:hover {
+  background: hsl(var(--primary) / 0.5);
+}
+
+.table-resize-handle:active,
+.table-resize-handle.resizing {
+  background: hsl(var(--primary));
+}
+
+/* 防止文本选择在拖拽时发生 */
+.table-resize-handle * {
+  user-select: none;
+}
+
+/* 拖拽时的全局样式 */
+body.resizing-column {
+  cursor: col-resize !important;
+  user-select: none;
+}
+
+body.resizing-column * {
+  cursor: col-resize !important;
+}
