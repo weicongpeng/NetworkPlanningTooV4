@@ -16,7 +16,7 @@ import { SECTOR_VALIDATION, getLODLevel } from '../config/sector-config'
 import { indexedDBService } from './indexedDBService'
 
 const CACHE_KEY = 'map_data_cache'
-const CACHE_TTL = 10 * 60 * 1000 // 10分钟缓存
+const CACHE_TTL = 24 * 60 * 60 * 1000 // 24小时缓存（持久化，仅在数据更新时失效）
 
 /**
  * 扇区数据接口
@@ -97,7 +97,7 @@ export interface ValidationResult {
 export class MapDataService {
   private cachedData: MapDataResponse | null = null
   private cacheExpiry: number = 0
-  private readonly CACHE_DURATION = 60000 // 1分钟缓存
+  private readonly CACHE_DURATION = 60 * 60 * 1000 // 1小时缓存（持久化，仅在数据更新时失效）
 
   /**
    * 验证扇区数据有效性
@@ -479,14 +479,20 @@ export class MapDataService {
   }
 
   /**
-   * 刷新缓存
+   * 刷新缓存（清除前端 + 后端所有地图缓存）
    */
   async clearCache(): Promise<void> {
     this.cachedData = null
     this.cacheExpiry = 0
+    // 清除后端 _map_data_cache，确保下次请求重新读取最新 data.json
+    try {
+      await mapApi.clearCache()
+    } catch (_) {
+      // 后端清理非关键，即使失败也继续清理前端
+    }
     try {
       await indexedDBService.delete(CACHE_KEY)
-      console.log('[MapDataService] 缓存已清除')
+      console.log('[MapDataService] 所有缓存已清除')
     } catch (error) {
       console.warn('[MapDataService] 清除 IndexedDB 缓存失败:', error)
     }
@@ -496,7 +502,7 @@ export class MapDataService {
    * 根据缩放级别更新数据（LOD）
    */
   async updateForZoom(zoom: number): Promise<MapDataResponse> {
-    return this.getMapData(zoom, true)
+    return this.getMapData(zoom, false)
   }
 }
 
@@ -521,11 +527,13 @@ interface CellListResponse {
   nr: CellListItem[]
 }
 
-// 独立缓存（10分钟，与后端缓存TTL一致，减少跨期错配）
+const _CELL_LIST_CACHE_KEY = 'cell_list_cache'
+const _CELL_LIST_CACHE_TTL = 24 * 60 * 60 * 1000 // 24小时缓存
+
+// 内存缓存（持久化，仅在数据更新时失效）
 let _cellListCache: { data: CellListResponse | null; time: number } = {
   data: null, time: 0
 }
-const _CELL_LIST_CACHE_TTL = 10 * 60 * 1000
 
 /**
  * 获取小区选择列表（轻量级，跳过坐标转换和扇区验证）
@@ -533,16 +541,28 @@ const _CELL_LIST_CACHE_TTL = 10 * 60 * 1000
  * 与 getMapData() 的区别：
  * - 只返回 id/name/siteId/networkType 四个字段
  * - 调用后端轻量 API /map/cells
- * - 独立缓存（10分钟 TTL）
- * - 不经过 IndexedDB
+ * - 双缓存：内存（快速） + IndexedDB（持久化，应用重启后仍可用）
  */
 export async function getCellList(): Promise<CellListResponse> {
-  // 检查缓存
+  // 1. 检查内存缓存
   if (_cellListCache.data && Date.now() - _cellListCache.time < _CELL_LIST_CACHE_TTL) {
     console.log('[CellList] 使用内存缓存')
     return _cellListCache.data
   }
 
+  // 2. 检查 IndexedDB 缓存
+  try {
+    const cached = await indexedDBService.get<CellListResponse>(_CELL_LIST_CACHE_KEY)
+    if (cached) {
+      console.log('[CellList] 使用 IndexedDB 缓存')
+      _cellListCache = { data: cached, time: Date.now() }
+      return cached
+    }
+  } catch (err) {
+    // IndexedDB 读取失败，回退到网络请求
+  }
+
+  // 3. 从后端获取
   try {
     const t0 = performance.now()
     console.log('[CellList] 从后端获取小区列表')
@@ -566,8 +586,13 @@ export async function getCellList(): Promise<CellListResponse> {
       nr: dedupNr
     }
 
-    // 写入缓存
+    // 写入双缓存
     _cellListCache = { data, time: Date.now() }
+    try {
+      await indexedDBService.set(_CELL_LIST_CACHE_KEY, data, _CELL_LIST_CACHE_TTL)
+    } catch (err) {
+      // IndexedDB 写入失败非关键
+    }
     console.log(`[CellList] 获取完成: LTE=${data.lte.length}, NR=${data.nr.length}, API耗时=${(t1-t0).toFixed(0)}ms, 去重耗时=${(t2-t1).toFixed(0)}ms`)
     return data
   } catch (error) {
@@ -577,9 +602,14 @@ export async function getCellList(): Promise<CellListResponse> {
 }
 
 /**
- * 清除小区列表缓存（当工参数据重新导入时调用）
+ * 清除小区列表缓存（内存 + IndexedDB）
  */
-export function clearCellListCache(): void {
+export async function clearCellListCache(): Promise<void> {
   _cellListCache = { data: null, time: 0 }
+  try {
+    await indexedDBService.delete(_CELL_LIST_CACHE_KEY)
+  } catch (err) {
+    // IndexedDB 删除失败非关键
+  }
   console.log('[CellList] 缓存已清除')
 }

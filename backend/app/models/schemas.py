@@ -168,6 +168,9 @@ class PCIRange(BaseModel):
 class PCIConfig(BaseModel):
     """PCI规划配置 - 增强验证"""
 
+    taskName: Optional[str] = Field(
+        default=None, description="任务名称"
+    )
     networkType: NetworkType
     distanceThreshold: float = Field(
         default=3.0,
@@ -559,3 +562,172 @@ class ApiResponse(BaseModel, Generic[T]):
     data: Optional[T] = None
     message: Optional[str] = None
     code: Optional[int] = None
+
+
+# ============== 认证相关 ==============
+class UserCreate(BaseModel):
+    """用户注册/创建请求"""
+
+    username: str = Field(min_length=3, max_length=50, description="用户名，3-50字符")
+    password: str = Field(min_length=6, max_length=128, description="密码，至少6字符")
+    confirm_password: str = Field(min_length=6, max_length=128, description="确认密码")
+    is_admin: bool = Field(default=False, description="是否设置为管理员")
+    license_expiry: Optional[str] = Field(default=None, description="授权截止日期 (ISO格式)")
+    city: Optional[str] = Field(default=None, max_length=100, description="地市")
+    operator: Optional[str] = Field(default=None, max_length=50, description="运营商")
+    @model_validator(mode="after")
+    def passwords_match(self) -> "UserCreate":
+        if self.password != self.confirm_password:
+            raise ValueError("两次输入的密码不一致")
+        return self
+
+
+class UserLogin(BaseModel):
+    """用户登录请求"""
+
+    username: str = Field(min_length=1, description="用户名")
+    password: str = Field(min_length=1, description="密码")
+
+
+class ChangePasswordRequest(BaseModel):
+    """修改密码请求"""
+
+    old_password: str = Field(min_length=1, description="旧密码")
+    new_password: str = Field(min_length=6, max_length=128, description="新密码，至少6字符")
+    confirm_password: str = Field(min_length=1, description="确认新密码")
+
+    @model_validator(mode="after")
+    def passwords_match(self) -> "ChangePasswordRequest":
+        if self.new_password != self.confirm_password:
+            raise ValueError("两次输入的新密码不一致")
+        return self
+
+
+class ResetPasswordRequest(BaseModel):
+    """管理员重置密码请求"""
+
+    new_password: str = Field(min_length=6, max_length=128, description="新密码，至少6字符")
+
+
+class UserResponse(BaseModel):
+    """用户信息响应"""
+
+    id: int
+    username: str
+    is_admin: bool
+    is_active: bool
+    is_online: Optional[bool] = None
+    must_change_password: bool
+    license_expiry: Optional[str] = None
+    total_usage_seconds: int
+    last_login: Optional[str] = None
+    last_login_ip: Optional[str] = None
+    created_at: Optional[str] = None
+    city: Optional[str] = None
+    operator: Optional[str] = None
+
+
+class TokenResponse(BaseModel):
+    """登录/注册令牌响应"""
+
+    access_token: str
+    token_type: str = "bearer"
+    user: UserResponse
+
+
+class UserUpdate(BaseModel):
+    """管理员更新用户请求"""
+
+    is_active: Optional[bool] = None
+    is_admin: Optional[bool] = None
+    license_expiry: Optional[str] = None
+    must_change_password: Optional[bool] = None
+    city: Optional[str] = None
+    operator: Optional[str] = None
+
+
+class UserSessionResponse(BaseModel):
+    """用户会话响应"""
+
+    id: int
+    user_id: int
+    token_jti: str
+    login_time: Optional[str] = None
+    logout_time: Optional[str] = None
+    last_activity: Optional[str] = None
+
+
+class UserDetailResponse(UserResponse):
+    """用户详情（含会话历史）"""
+
+    sessions: List[UserSessionResponse] = []
+
+
+class UserListResponse(BaseModel):
+    """用户列表响应"""
+
+    total: int
+    users: List[UserResponse]
+
+
+# ============== SQL 数据响应模型 ==============
+class WorkbookOut(BaseModel):
+    id: str
+    user_id: int
+    name: str
+    file_type: str
+    network_types: Optional[List[str]] = None
+    status: str
+    size: Optional[int] = None
+    original_path: Optional[str] = None
+    metadata: Optional[dict] = None
+    error_message: Optional[str] = None
+    created_at: str
+    updated_at: Optional[str] = None
+
+
+class SectorPreview(BaseModel):
+    """扇区预览（分页返回）"""
+    id: int
+    sector_id: str
+    name: Optional[str] = None
+    pci: Optional[int] = None
+    tac: Optional[int] = None
+    azimuth: Optional[float] = None
+    longitude: Optional[float] = None
+    latitude: Optional[float] = None
+    network_type: Optional[str] = None
+    cell_cover_type: Optional[int] = None
+
+
+class WorkbookPreview(BaseModel):
+    workbook: WorkbookOut
+    sectors: List[SectorPreview]
+    total: int
+    page: int
+    page_size: int
+
+
+class GeoFileOut(BaseModel):
+    id: str
+    user_id: int
+    filename: str
+    file_path: str
+    geometry_type: str
+    point_count: Optional[int] = None
+    bbox: Optional[List[float]] = None
+    file_size: Optional[int] = None
+    created_at: str
+
+
+class LayerOut(BaseModel):
+    id: str
+    user_id: int
+    name: str
+    file_path: str
+    layer_type: str
+    geometry_type: str
+    feature_count: Optional[int] = None
+    bbox: Optional[List[float]] = None
+    file_size: Optional[int] = None
+    created_at: str

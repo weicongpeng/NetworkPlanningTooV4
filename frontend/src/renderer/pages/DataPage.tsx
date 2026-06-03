@@ -5,6 +5,7 @@ import { dataApi } from '../services/api'
 import type { DataItem } from '@shared/types'
 import { DATA_REFRESH_EVENT, triggerDataRefresh } from '../store/dataStore'
 import { mapDataService } from '../services/mapDataService'
+import { indexedDBService } from '../services/indexedDBService'
 import { useTranslation } from 'react-i18next'
 
 export function DataPage() {
@@ -26,11 +27,13 @@ export function DataPage() {
   // 各上传项的状态
   const [uploadStatus, setUploadStatus] = useState<Record<string, 'idle' | 'success' | 'error'>>({
     full_params: 'idle',
-    target_cells: 'idle',
     current_params: 'idle',
     map_layer: 'idle',
     geo_data: 'idle',
   })
+
+  // 下载状态跟踪
+  const [downloadingIds, setDownloadingIds] = useState<Set<string>>(new Set())
 
   const {
     items,
@@ -82,7 +85,7 @@ export function DataPage() {
 
       console.log('[Template Download] Requesting:', templateType, 'as', filename)
 
-      // 强制使用 Fetch + Blob 模式，这种方式在 Electron 和浏览器中最稳定
+      // 强制使用 Fetch + Blob 模式
       const response = await fetch(url)
       if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`)
 
@@ -91,14 +94,38 @@ export function DataPage() {
 
       console.log('[Template Download] Blob size:', blob.size)
 
+      // 优先使用 File System Access API 弹出保存对话框
+      if ('showSaveFilePicker' in window) {
+        try {
+          const ext = filename.endsWith('.zip') ? '.zip' : '.xlsx';
+          const opts: any = {
+            suggestedName: filename,
+            types: ext === '.zip'
+              ? [{ description: 'ZIP Archive', accept: { 'application/zip': ['.zip'] } }]
+              : [{ description: 'Excel File', accept: { 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': ['.xlsx'] } }]
+          };
+          const handle = await (window as any).showSaveFilePicker(opts);
+          const writable = await handle.createWritable();
+          await writable.write(blob);
+          await writable.close();
+          console.log('[Template Download] Saved via File Picker:', filename);
+          return;
+        } catch (pickerErr: any) {
+          if (pickerErr.name === 'AbortError') {
+            console.log('[Template Download] User cancelled');
+            return;
+          }
+          console.warn('[Template Download] showSaveFilePicker failed, falling back:', pickerErr);
+        }
+      }
+
       const blobUrl = window.URL.createObjectURL(blob)
       const link = document.createElement('a')
       link.href = blobUrl
-      link.setAttribute('download', filename) // 显式设置文件名
+      link.setAttribute('download', filename)
       document.body.appendChild(link)
       link.click()
 
-      // 清理
       setTimeout(() => {
         document.body.removeChild(link)
         window.URL.revokeObjectURL(blobUrl)
@@ -211,9 +238,6 @@ export function DataPage() {
           case 'full_params':
             successMessage = `${t('data.fullParamsSuccess') || '全量工参上传成功'}！${t('data.fullParamsImported', { name: file.name }) || `「${file.name}」已导入`}`
             break
-          case 'target_cells':
-            successMessage = `${t('data.targetCellsSuccess') || '待规划小区上传成功'}！${t('data.targetCellsImported', { name: file.name }) || `「${file.name}」已导入`}`
-            break
           case 'current_params':
             successMessage = `${t('data.currentParamsSuccess') || '现网工参上传成功'}！${t('data.currentParamsImported', { name: file.name }) || `「${file.name}」已导入`}`
             break
@@ -237,34 +261,72 @@ export function DataPage() {
   }
 
   const handleDownload = async (item: DataItem) => {
+    setDownloadingIds(prev => new Set(prev).add(item.id))
     try {
         console.log('[Download] Requesting:', item.id);
         const url = `/api/v1/data/${item.id}/download`;
 
-        // 强制使用 Fetch + Blob 模式，这种方式在 Electron 和浏览器中最稳定
         const response = await fetch(url);
         if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
 
         const blob = await response.blob();
         if (blob.size === 0) throw new Error(t('data.emptyFile') || '文件内容为空');
 
+        const filename = item.name || 'download';
+
+        // 优先使用 File System Access API 弹出保存对话框
+        if ('showSaveFilePicker' in window) {
+            try {
+                const opts = {
+                    suggestedName: filename,
+                    types: [{
+                        description: 'Excel File',
+                        accept: { 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': ['.xlsx'] }
+                    }]
+                };
+                // 根据扩展名调整 types
+                if (filename.endsWith('.zip')) {
+                    opts.types = [{ description: 'ZIP Archive', accept: { 'application/zip': ['.zip'] } }];
+                }
+                const handle = await (window as any).showSaveFilePicker(opts);
+                const writable = await handle.createWritable();
+                await writable.write(blob);
+                await writable.close();
+                console.log('[Download] Saved via File Picker:', filename);
+                return;
+            } catch (pickerErr: any) {
+                // 用户取消或 API 不可用，回退到 a.click
+                if (pickerErr.name === 'AbortError') {
+                    console.log('[Download] User cancelled save dialog');
+                    return;
+                }
+                console.warn('[Download] showSaveFilePicker failed, falling back:', pickerErr);
+            }
+        }
+
+        // 后备方案：a.click() 触发下载
         const blobUrl = window.URL.createObjectURL(blob);
         const link = document.createElement('a');
         link.href = blobUrl;
-        link.setAttribute('download', item.name); // 显式设置文件名
+        link.setAttribute('download', filename);
         document.body.appendChild(link);
         link.click();
 
-        // 清理
         setTimeout(() => {
             document.body.removeChild(link);
             window.URL.revokeObjectURL(blobUrl);
         }, 100);
 
-        console.log('[Download] Success');
+        console.log('[Download] Success (fallback)');
     } catch (err: any) {
         console.error('[Download] Failed:', err);
         alert(`${t('data.downloadFailed') || '下载失败'}: ${err.message || (t('data.unknownError') || '未知错误')}`)
+    } finally {
+        setDownloadingIds(prev => {
+            const next = new Set(prev)
+            next.delete(item.id)
+            return next
+        })
     }
   }
 
@@ -295,7 +357,7 @@ export function DataPage() {
           if (result?.success) {
             alert(t('data.indexRemoved') || '已从索引中移除。如果后续遇到问题，请刷新页面或重新导入数据。')
             await fetchList(1, 50, true)
-            mapDataService.clearCache()
+            await mapDataService.clearCache()
             triggerDataRefresh()
           } else {
             alert(`${t('data.forceDeleteFailed') || '强制删除失败。请尝试：'}\n1. ${t('data.forceDeleteCloseExcel') || '关闭所有 Excel 文件'}\n2. ${t('data.forceDeleteRestartApp') || '重启应用后再试'}\n3. ${t('data.forceDeleteManually') || '手动删除 data 目录下的对应文件夹'}`)
@@ -305,7 +367,7 @@ export function DataPage() {
         }
       } else {
         await fetchList(1, 50, true)
-        mapDataService.clearCache()
+        await mapDataService.clearCache()
         triggerDataRefresh()
       }
     } catch (err: any) {
@@ -341,8 +403,10 @@ export function DataPage() {
 
     setBatchDeleting(false)
     setSelectedIds(new Set())
+    // 批量删除完成后统一刷新一次（deleteItem 已不内部刷新，避免 IndexedDB 缓存竞争）
+    await indexedDBService.delete('data_list_cache')
     await fetchList(1, 50, true)
-    mapDataService.clearCache()
+    await mapDataService.clearCache()
     triggerDataRefresh()
 
     if (failCount > 0) {
@@ -380,32 +444,48 @@ export function DataPage() {
      try {
          const result = await updateParameters(selectedFullParamId, selectedCurrentParamId)
          console.log('Update parameters result:', result);
-         if (result?.success) {
-            await fetchList(1, 50);
 
-             // 使用后端返回的新文件名
-             const newFileName = result?.data?.newFileName;
-             const savedToOriginal = result?.data?.savedToOriginal;
+         // 根据后端返回的 newFileId 检查新文件是否出现在列表中
+         const newFileId = result?.data?.newFileId;
+         const newFileName = result?.data?.newFileName;
+         const savedToOriginal = result?.data?.savedToOriginal;
+
+         // 轮询刷新列表，最多重试 5 次，确保新文件出现
+         let newFileFound = false;
+         for (let i = 0; i < 5; i++) {
+             await fetchList(1, 50, true);
              const updatedItems = useDataStore.getState().items;
-             const newFile = [...updatedItems].sort((a, b) =>
-                 new Date(b.uploadDate).getTime() - new Date(a.uploadDate).getTime()
-             )[0];
-             console.log('Newest file:', newFile);
+             if (newFileId && updatedItems.some(item => item.id === newFileId)) {
+                 newFileFound = true;
+                 break;
+             }
+             // 每次等待时间递增
+             await new Promise(r => setTimeout(r, 500 * (i + 1)));
+         }
 
-             if (newFile?.originalPath && savedToOriginal) {
-                 // 获取目录路径和文件名
-                 const originalDir = newFile.originalPath.substring(0, newFile.originalPath.lastIndexOf('\\') + 1);
-                 const fullPath = `${originalDir}${newFileName}`;
-                 setUpdateSuccess(`${t('data.updateSuccess') || '更新成功'}！${t('data.savedTo') || '已保存至：'}\n${fullPath}`)
-             } else if (newFile?.originalPath) {
-                 // 如果没有保存到原始路径，显示系统内保存提示
-                 setUpdateSuccess(`${t('data.updateSuccess') || '更新成功'}！${t('data.savedToSystemNoPath') || '文件已保存在系统内 (由于未记录原路径，无法写回原文件夹)，请手动下载。'}`)
+         if (result?.success || newFileFound) {
+             if (savedToOriginal && newFileName) {
+                 // 从列表中查找具有 originalPath 的文件以构造完整路径
+                 const items = useDataStore.getState().items;
+                 const matchedFile = newFileId ? items.find(i => i.id === newFileId) : null;
+                 if (matchedFile?.originalPath) {
+                     const originalDir = matchedFile.originalPath.substring(0, matchedFile.originalPath.lastIndexOf('\\') + 1);
+                     const fullPath = `${originalDir}${newFileName}`;
+                     setUpdateSuccess(`${t('data.updateSuccess') || '更新成功'}！${t('data.savedTo') || '已保存至：'}\n${fullPath}`)
+                 } else if (matchedFile?.originalPath) {
+                     setUpdateSuccess(`${t('data.updateSuccess') || '更新成功'}！${t('data.savedToSystemNoPath') || '文件已保存在系统内 (由于未记录原路径，无法写回原文件夹)，请手动下载。'}`)
+                 } else {
+                     setUpdateSuccess(`${t('data.updateSuccess') || '更新成功'}！${t('data.savedToSystem') || '文件已保存在系统内，请手动下载。'}`)
+                 }
              } else {
                  setUpdateSuccess(`${t('data.updateSuccess') || '更新成功'}！${t('data.savedToSystem') || '文件已保存在系统内，请手动下载。'}`)
              }
 
              setSelectedFullParamId('')
              setSelectedCurrentParamId('')
+         } else {
+             // 更新失败（后端返回错误状态且列表中也未找到新文件）
+             throw new Error(result?.message || t('data.updateFailed') || '工参更新失败')
          }
      } catch (err: any) {
          console.error('Update failed:', err);
@@ -416,6 +496,23 @@ export function DataPage() {
            currentParamId: selectedCurrentParamId,
            error: err
          });
+
+         // 发生错误时也尝试刷新列表，看更新是否实际成功
+         try {
+             console.log('[工参更新] 尝试刷新列表检查实际状态...')
+             await fetchList(1, 50, true)
+             const newItems = useDataStore.getState().items
+             const hasNewFullParam = newItems.some(i => i.fileType === 'full_params' && i.id !== selectedFullParamId)
+             if (hasNewFullParam) {
+                 setUpdateSuccess(`${t('data.updateSuccess') || '更新成功'}！${t('data.savedToSystem') || '文件已保存在系统内。'}`)
+                 setSelectedFullParamId('')
+                 setSelectedCurrentParamId('')
+                 return
+             }
+         } catch {
+             // 刷新失败不影响错误提示
+         }
+
          setUpdateSuccess(null);
          alert(`${t('data.updateFailed') || '工参更新失败'}: ${errorMsg}\n\n${t('data.updateFailedHint') || '提示：'} ${t('data.tryRefreshHint') || '请尝试刷新数据列表后重试。如果问题持续，请重启后端服务。'}`);
      }
@@ -429,12 +526,6 @@ export function DataPage() {
     <div className="p-8">
       <div className="flex justify-between items-center mb-8">
         <h1 className="text-3xl font-bold">{t('data.title')}</h1>
-        <div className={`px-3 py-1 rounded-full text-xs font-medium flex items-center gap-2 ${
-            isDesktop ? 'bg-green-100 text-green-700 border border-green-200' : 'bg-yellow-100 text-yellow-700 border border-yellow-200'
-        }`}>
-            <div className={`w-2 h-2 rounded-full ${isDesktop ? 'bg-green-500' : 'bg-yellow-500 animate-pulse'}`} />
-            {isDesktop ? (t('data.desktopMode') || '桌面模式 (已连接 Electron)') : (t('data.browserMode') || '浏览器模式 (受限)')}
-        </div>
       </div>
 
       {/* 错误提示 */}
@@ -442,7 +533,7 @@ export function DataPage() {
         <div className="mb-6 p-4 bg-red-50 border border-red-200 rounded-lg flex items-center gap-3 text-red-700">
           <AlertCircle size={20} />
           <span>{error}</span>
-          <button onClick={() => fetchList(1, 50)} className="ml-auto text-sm underline">{t('data.retry') || '重试'}</button>
+          <button onClick={() => fetchList(1, 50, true)} className="ml-auto text-sm underline">{t('data.retry') || '重试'}</button>
         </div>
       )}
       
@@ -476,12 +567,6 @@ export function DataPage() {
         </div>
       )}
 
-      {!isDesktop && (
-          <div className="mb-6 p-3 bg-blue-50 border border-blue-100 rounded-lg text-xs text-blue-700">
-              {t('data.browserTip') || '提示：您当前正在使用浏览器访问。若要实现"更新后保存到原文件夹"，请运行 start_app.bat 使用桌面应用。'}
-          </div>
-      )}
-
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
         <div className="space-y-8">
             {/* 文件上传 */}
@@ -506,29 +591,6 @@ export function DataPage() {
                             onClick={() => handleDownloadTemplate('full_params')}
                             className="w-full px-2 py-1.5 bg-blue-500 text-white rounded text-xs hover:bg-blue-600 disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-1"
                             title={t('data.downloadTemplate') || '下载全量工参模板'}
-                        >
-                            <FileDown size={12} />
-                            <span>{t('data.template') || '模板'}</span>
-                        </button>
-                    </div>
-                </div>
-                <div className="flex items-center gap-2">
-                    <div className="flex-1">
-                        <UploadArea
-                            title={t('data.targetCells') || '待规划小区'}
-                            accept=".xlsx,.xls"
-                            onUpload={(e) => handleFileUpload(e, 'excel', 'target_cells')}
-                            loading={loading && uploadingType === 'target_cells'}
-                            icon={<FileSpreadsheet size={20} />}
-                            inline={true}
-                            status={uploadStatus.target_cells}
-                        />
-                    </div>
-                    <div className="w-24">
-                        <button
-                            onClick={() => handleDownloadTemplate('target_cells')}
-                            className="w-full px-2 py-1.5 bg-blue-500 text-white rounded text-xs hover:bg-blue-600 disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-1"
-                            title={t('data.downloadTemplate') || '下载待规划小区模板'}
                         >
                             <FileDown size={12} />
                             <span>{t('data.template') || '模板'}</span>
@@ -676,9 +738,11 @@ export function DataPage() {
               )}
               <button
                 onClick={() => { fetchList(1, 50, true); setSelectedIds(new Set()) }}
-                className="text-sm text-primary hover:underline"
+                disabled={loading}
+                className="text-sm text-primary hover:underline disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1"
               >
-                {t('data.refresh') || '刷新'}
+                {loading && <Loader2 size={12} className="animate-spin" />}
+                {loading ? (t('data.refreshing') || '刷新中...') : (t('data.refresh') || '刷新')}
               </button>
             </div>
           </div>
@@ -728,7 +792,7 @@ export function DataPage() {
                           <Upload size={16} className="text-gray-600" />
                         )}
                       </div>
-                      <span className="truncate font-medium">{item.name}</span>
+                      <span className="truncate font-medium" title={item.name}>{item.name}</span>
                       {/* 文件类型标签 */}
                       <span className={`text-[10px] px-2 py-0.5 rounded-full font-medium inline-flex items-center gap-0.5 ${
                         item.status === 'error'
@@ -802,8 +866,20 @@ export function DataPage() {
                         )}
                       </span>
                       <span className="text-[10px] opacity-60">
-                        {new Date(item.uploadDate).toLocaleDateString('zh-CN')}
+                        {/* 时间格式: YYYY/M/D HH:mm username */}
+                        {(() => {
+                          const d = new Date(item.uploadDate)
+                          const pad = (n: number) => String(n).padStart(2, '0')
+                          const timeStr = `${d.getFullYear()}/${d.getMonth() + 1}/${d.getDate()} ${pad(d.getHours())}:${pad(d.getMinutes())}`
+                          const userName = (item as any).userName || (item as any).user_name || ''
+                          return `${timeStr}${userName ? ' ' + userName : ''}`
+                        })()}
                       </span>
+                      {(item as any).remark && (
+                        <span className="text-[10px] text-amber-600 bg-amber-50 px-1.5 py-0.5 rounded">
+                          {(item as any).remark}
+                        </span>
+                      )}
                     </div>
                   </div>
                   <div className="flex gap-1 items-center">
@@ -823,10 +899,11 @@ export function DataPage() {
                         e.stopPropagation()
                         handleDownload(item)
                       }}
-                      className="p-2 hover:bg-background rounded text-primary"
-                      title={t('data.download') || '下载'}
+                      disabled={downloadingIds.has(item.id)}
+                      className="p-2 hover:bg-background rounded text-primary disabled:opacity-50 disabled:cursor-wait"
+                      title={downloadingIds.has(item.id) ? (t('data.downloading') || '下载中...') : (t('data.download') || '下载')}
                     >
-                      <Download size={16} />
+                      {downloadingIds.has(item.id) ? <Loader2 size={16} className="animate-spin" /> : <Download size={16} />}
                     </button>
                     <button
                       onClick={(e) => {

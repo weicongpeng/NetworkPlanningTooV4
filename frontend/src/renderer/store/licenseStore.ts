@@ -7,92 +7,84 @@ interface LicenseState {
   expiryDate: string | null
   remainingDays: number | null
   errorMessage: string | null
-  checkAuthorization: () => Promise<void>
-  refreshStatus: () => Promise<void>
+
+  /** 基于 authStore.user 设置授权状态（由 ProtectedRoute 调用） */
+  setFromUser: (user: {
+    is_active: boolean
+    license_expiry: string | null
+  }) => void
+
+  /** 设置加载状态 */
+  setLoading: (loading: boolean) => void
 }
 
 export const useLicenseStore = create<LicenseState>()(
   persist(
-    (set, get) => ({
+    (set) => ({
       isAuthorized: false,
       isLoading: false,
       expiryDate: null,
       remainingDays: null,
       errorMessage: null,
 
-      checkAuthorization: async () => {
-        set({ isLoading: true })
-
-        try {
-          const response = await fetch('/api/v1/license/check')
-          const result = await response.json()
-
-          if (result.success) {
-            const { valid } = result.data
-
-            // 如果已授权，获取详细信息
-            if (valid) {
-              const statusResponse = await fetch('/api/v1/license/status')
-              const statusResult = await statusResponse.json()
-
-              if (statusResult.success && statusResult.data) {
-                set({
-                  isAuthorized: true,
-                  isLoading: false,
-                  expiryDate: statusResult.data.expiryDate || null,
-                  remainingDays: statusResult.data.remainingDays || null,
-                  errorMessage: null
-                })
-              } else {
-                set({
-                  isAuthorized: false,
-                  isLoading: false,
-                  errorMessage: '获取许可证状态失败'
-                })
-              }
-            } else {
-              // 获取错误消息
-              const statusResponse = await fetch('/api/v1/license/status')
-              const statusResult = await statusResponse.json()
-
-              set({
-                isAuthorized: false,
-                isLoading: false,
-                expiryDate: statusResult.data?.expiryDate || null,
-                remainingDays: 0,
-                errorMessage: statusResult.data?.errorMessage || '未授权'
-              })
-            }
-          } else {
-            set({
-              isAuthorized: false,
-              isLoading: false,
-              errorMessage: '授权检查失败'
-            })
-          }
-        } catch (error) {
-          console.error('授权检查失败:', error)
+      setFromUser: (user) => {
+        if (!user.is_active) {
           set({
             isAuthorized: false,
             isLoading: false,
-            errorMessage: '授权检查失败，请检查网络连接'
+            expiryDate: null,
+            remainingDays: 0,
+            errorMessage: '账号已被禁用',
+          })
+          return
+        }
+
+        const expiry = user.license_expiry
+        if (!expiry) {
+          set({
+            isAuthorized: true,
+            isLoading: false,
+            expiryDate: null,
+            remainingDays: -1,
+            errorMessage: null,
+          })
+          return
+        }
+
+        const now = new Date()
+        const expiryDate = new Date(expiry)
+        const remainingDays = Math.ceil((expiryDate.getTime() - now.getTime()) / (1000 * 60 * 60 * 24))
+
+        if (remainingDays < 0) {
+          set({
+            isAuthorized: false,
+            isLoading: false,
+            expiryDate: expiry,
+            remainingDays: 0,
+            errorMessage: '授权已过期，请联系管理员',
+          })
+        } else {
+          set({
+            isAuthorized: true,
+            isLoading: false,
+            expiryDate: expiry,
+            remainingDays,
+            errorMessage: null,
           })
         }
       },
 
-      refreshStatus: async () => {
-        const { checkAuthorization } = get()
-        await checkAuthorization()
-      }
+      setLoading: (loading) => {
+        set({ isLoading: loading })
+      },
     }),
     {
       name: 'license-storage',
-      onRehydrateStorage: () => (state) => {
-        // 重新加载时再次检查授权状态
-        if (state) {
-          state.checkAuthorization()
-        }
-      }
+      partialize: (state) => ({
+        isAuthorized: state.isAuthorized,
+        expiryDate: state.expiryDate,
+        remainingDays: state.remainingDays,
+      }),
     }
   )
 )

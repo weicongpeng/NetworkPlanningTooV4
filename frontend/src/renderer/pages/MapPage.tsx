@@ -16,16 +16,24 @@ import { OnlineMap, OnlineMapRef, CustomLayerOption } from '../components/Map/On
 import { LayerControl, SectorLayerOption, LayerFileOption, DecorationLayerOption } from '../components/Map/LayerControl'
 import { OfflineMap, createDefaultLayers } from '../components/Map'
 import type { LayerOption, FrequencyOption } from '../components/Map'
-import { mapStateService } from '../services/mapStateService'
 import { CoordinateTransformer } from '../utils/coordinate'
-import { mapApi, layerApi, dataApi } from '../services/api'
+import { mapApi, layerApi } from '../services/api'
 import { useDataStore, DATA_REFRESH_EVENT } from '../store/dataStore'
 import { useMapStore } from '../store/mapStore'
+import { useMapDataCacheStore } from '../store/mapDataCacheStore'
 import { mapDataService, type RenderSectorData } from '../services/mapDataService'
 import { frequencyColorMapper } from '../config/sector-config'
 import { LabelSettings } from '../components/Map/LabelSettingsModal'
 import { TreeNode } from '../components/Map/LayerControl'
 import { selectionManager } from '../services/selectionManager'
+
+// MapInfo 图层列表缓存（避免每次挂载都重新请求）
+interface LayerListCacheEntry {
+  data: any[]
+  time: number
+}
+const _layerListCache = new Map<string, LayerListCacheEntry>()
+const _LAYER_LIST_CACHE_TTL = 10 * 60 * 1000 // 10分钟
 
 /**
  * 搜索模式
@@ -63,17 +71,33 @@ type SearchResult = PlaceSearchResult | ParameterSearchResult
 
 export function MapPage() {
   const { t } = useTranslation()
+
+  // 从持久化 store 获取设置（必须放在所有使用 mapSettings 的 state 之前）
+  const {
+    mapSettings,
+    setLayerVisibility: storeSetLayerVisibility,
+    setLayerFileVisibility: storeSetLayerFileVisibility,
+    setPointFileVisibility: storeSetPointFileVisibility,
+    setDecorationLayerVisible: storeSetDecorationLayerVisible,
+    setSectorLabelVisibility: storeSetSectorLabelVisibility,
+    setPointFileLabelVisibility: storeSetPointFileLabelVisibility,
+    setLayerFileLabelVisibility: storeSetLayerFileLabelVisibility,
+    setMapType: storeSetMapType,
+    setLabelSettings: storeSetLabelSettings,
+    setBaseMapVisible: storeSetBaseMapVisible,
+  } = useMapStore()
+
   // 视图模式
   const [viewMode, setViewMode] = useState<'online' | 'offline'>(() => {
     // 从状态服务获取当前视图模式
     return 'online' // 默认在线地图
   })
 
-  // 地图类型（平面/卫星）
-  const [mapType, setMapType] = useState<'roadmap' | 'satellite'>(() => mapStateService.getState().mapLayerType)
+  // 地图类型（平面/卫星）- 从持久化 store 初始化
+  const [mapType, setMapType] = useState<'roadmap' | 'satellite'>(() => mapSettings.mapType)
 
-  // 在线地图可见性
-  const [onlineMapVisible, setOnlineMapVisible] = useState(true)
+  // 在线地图可见性 - 从持久化 store 初始化
+  const [onlineMapVisible, setOnlineMapVisible] = useState(() => mapSettings.baseMapVisible)
 
   // 数据存储 - 获取工参文件名
   const { items } = useDataStore()
@@ -126,15 +150,26 @@ export function MapPage() {
     fetchOfflineConfig()
   }, [])
 
-  // 图层控制
-  const [layers, setLayers] = useState<LayerOption[]>(createDefaultLayers())
-  // 扇区标签可见性
-  const [sectorLabelVisibility, setSectorLabelVisibility] = useState<Record<string, boolean>>({
-    'lte-sectors': false,
-    'nr-sectors': false
+  // 图层控制 - 从持久化 store 初始化
+  const [layers, setLayers] = useState<LayerOption[]>(() => {
+    const defaults = createDefaultLayers()
+    return defaults.map(l => ({
+      ...l,
+      visible: l.id === 'lte-sectors'
+        ? mapSettings.layerVisibility.lte
+        : l.id === 'nr-sectors'
+          ? mapSettings.layerVisibility.nr
+          : l.visible
+    }))
   })
+  // 扇区标签可见性
+  const [sectorLabelVisibility, setSectorLabelVisibility] = useState<Record<string, boolean>>(
+    mapSettings.sectorLabelVisibility
+  )
   // 点文件标签可见性（撒点文件的属性标签）
-  const [pointFileLabelVisibility, setPointFileLabelVisibility] = useState<Record<string, boolean>>({})
+  const [pointFileLabelVisibility, setPointFileLabelVisibility] = useState<Record<string, boolean>>(
+    mapSettings.pointFileLabelVisibility
+  )
   // 图层文件标签可见性
   const [layerFileLabelVisibility, setLayerFileLabelVisibility] = useState<Record<string, boolean>>({})
   const [layerFiles, setLayerFiles] = useState<LayerFileOption[]>([])
@@ -153,11 +188,11 @@ export function MapPage() {
   // 自定义图层 (用户创建的点)
   const [customLayers, setCustomLayers] = useState<CustomLayerOption[]>([])
 
-  // 装饰图层（打点、定位标记等）- 默认关闭
+  // 装饰图层（打点、定位标记等）- 从持久化 store 初始化
   const [decorationLayer, setDecorationLayer] = useState<DecorationLayerOption>({
     id: 'decoration-layer',
     name: '装饰图层',
-    visible: false,
+    visible: mapSettings.decorationLayerVisible,
     count: 0
   })
 
@@ -169,36 +204,11 @@ export function MapPage() {
     }))
   }, [t])
 
-  // 从持久化 store 获取标签设置
-  const { labelSettingsMap: persistedLabelSettings, setLabelSettings } = useMapStore()
-
-  // 标签配置状态（按图层ID存储）
-  const [labelSettingsMap, setLabelSettingsMap] = useState<Record<string, LabelSettings>>({
-    'lte-sectors': { content: 'name', color: '#000000', fontSize: 12 },
-    'nr-sectors': { content: 'name', color: '#000000', fontSize: 12 }
-  })
-
-  // 初始化时从持久化 store 加载设置
-  useEffect(() => {
-    // 当 store 中有持久化数据时，合并到本地状态
-    if (Object.keys(persistedLabelSettings).length > 0) {
-      console.log('[MapPage] 从持久化 store 加载标签设置:', persistedLabelSettings)
-      setLabelSettingsMap(prev => ({
-        ...prev,
-        ...persistedLabelSettings
-      }))
-    }
-  }, []) // 只在组件挂载时执行一次
-
-  // 当 store 中的持久化设置更新时，同步到本地状态（用于后续的保存操作）
-  useEffect(() => {
-    if (Object.keys(persistedLabelSettings).length > 0) {
-      setLabelSettingsMap(prev => ({
-        ...prev,
-        ...persistedLabelSettings
-      }))
-    }
-  }, [persistedLabelSettings])
+  // 标签配置状态（按图层ID存储）- 从持久化 store 初始化
+  const initialLabelSettings = Object.keys(mapSettings.labelSettingsMap).length > 0
+    ? mapSettings.labelSettingsMap
+    : { 'lte-sectors': { content: 'name' as const, color: '#000000', fontSize: 12 }, 'nr-sectors': { content: 'name' as const, color: '#000000', fontSize: 12 } }
+  const [labelSettingsMap, setLabelSettingsMap] = useState<Record<string, LabelSettings>>(initialLabelSettings)
 
 
 
@@ -227,11 +237,30 @@ export function MapPage() {
       const mapItems = items.filter(item => item.type === 'map')
       console.log('[MapPage] Map 类型数据项:', mapItems.length)
 
-      // 并行获取所有MapInfo图层
+      // 并行获取所有MapInfo图层（带缓存）
       const mapInfoPromises = mapItems.map(async (mapItem) => {
         try {
+          // 检查缓存
+          const cached = _layerListCache.get(mapItem.id)
+          if (cached && Date.now() - cached.time < _LAYER_LIST_CACHE_TTL) {
+            console.log('[MapPage] 使用图层列表缓存:', mapItem.id)
+            return cached.data.map((layer: any) => ({
+              id: layer.id,
+              name: layer.name,
+              type: layer.type as 'point' | 'line' | 'polygon',
+              visible: false,
+              dataId: mapItem.id,
+              sourceType: 'mapinfo' as const
+            }))
+          }
+
           const response = await layerApi.getLayers(mapItem.id)
           if (response.success && response.data?.layers) {
+            // 写入缓存
+            _layerListCache.set(mapItem.id, {
+              data: response.data.layers,
+              time: Date.now()
+            })
             return response.data.layers.map((layer: any) => ({
               id: layer.id,
               name: layer.name,
@@ -304,16 +333,57 @@ export function MapPage() {
     loadLayerFiles()
   }, [items, loadLayerFiles])
 
+  /**
+   * 加载工参数据用于搜索（带缓存检查）
+   */
+  const { cacheSectors, getCachedSectors, markSectorsDirty } = useMapDataCacheStore()
+
+  const loadSectorDataForSearch = useCallback(async () => {
+    try {
+      // 尝试从缓存加载当前激活的 workbook 数据
+      const loadedIds = useMapStore.getState().mapSettings.loadedWorkbookIds
+      if (loadedIds.length > 0) {
+        const primaryId = loadedIds[0]
+        const cached = getCachedSectors(primaryId)
+        if (cached) {
+          console.log('[MapPage] 使用缓存扇区数据')
+          setSectorDataCache({
+            lte: (cached as any).lteSectors || [],
+            nr: (cached as any).nrSectors || []
+          })
+          return
+        }
+      }
+
+      const data = await mapDataService.getMapData()
+      setSectorDataCache({
+        lte: data.lteSectors,
+        nr: data.nrSectors
+      })
+      // 缓存结果
+      if (loadedIds.length > 0) {
+        cacheSectors(loadedIds[0], data)
+      }
+    } catch (error) {
+      console.error('[MapPage] 加载工参数据失败:', error)
+    }
+  }, [getCachedSectors, cacheSectors])
+
   // 监听数据刷新事件（数据被删除或上传时重新加载扇区数据和图层文件）
   useEffect(() => {
     const handleDataRefresh = () => {
       console.log('[MapPage] 数据已变更，重新加载扇区数据')
+      // 清除图层列表缓存
+      _layerListCache.clear()
+      // 重载扇区数据缓存（用于频点提取和工参搜索）
+      loadSectorDataForSearch()
+      // 刷新在线地图（sectorData state + 图层重绘）
       onlineMapRef.current?.refreshData()
       loadLayerFiles()
     }
     window.addEventListener(DATA_REFRESH_EVENT, handleDataRefresh)
     return () => window.removeEventListener(DATA_REFRESH_EVENT, handleDataRefresh)
-  }, [loadLayerFiles])
+  }, [loadLayerFiles, loadSectorDataForSearch])
 
   // 搜索模式
   const [searchMode, setSearchMode] = useState<SearchMode>('parameter')
@@ -548,9 +618,18 @@ export function MapPage() {
       f.id === fileId ? { ...f, visible } : f
     ))
 
+    // 同步到持久化 store
+    // 判断是 MapInfo 文件还是 Excel 点文件
+    const isInLayerFiles = layerFiles.some(f => f.id === fileId)
+    if (isInLayerFiles) {
+      storeSetLayerFileVisibility(fileId, visible)
+    } else {
+      storeSetPointFileVisibility(fileId, visible)
+    }
+
     // 注意：不需要调用 onlineMapRef.current.setMapInfoLayerVisibility
     // 因为 OnlineMap 组件会通过 useEffect 监听 layerFiles prop 的变化自动处理
-  }, [selectionMode, layers, layerFiles, pointFiles])
+  }, [selectionMode, layers, layerFiles, pointFiles, storeSetLayerFileVisibility, storeSetPointFileVisibility])
 
   /**
    * 移除图层文件 (MapInfo)
@@ -585,28 +664,14 @@ export function MapPage() {
   const handleDecorationLayerToggle = useCallback((visible: boolean) => {
     console.log('[MapPage] 装饰图层切换:', visible)
     setDecorationLayer(prev => ({ ...prev, visible }))
+    storeSetDecorationLayerVisible(visible)
     if (onlineMapRef.current) {
       onlineMapRef.current.setDecorationLayerVisibility(visible)
     }
-  }, [])
+  }, [storeSetDecorationLayerVisible])
 
   /**
    * 加载工参数据用于搜索
-   */
-  const loadSectorDataForSearch = useCallback(async () => {
-    try {
-      const data = await mapDataService.getMapData()
-      setSectorDataCache({
-        lte: data.lteSectors,
-        nr: data.nrSectors
-      })
-    } catch (error) {
-      console.error('[MapPage] 加载工参数据失败:', error)
-    }
-  }, [])
-
-  /**
-   * 执行工参搜索
    */
   const executeParameterSearch = useCallback(async (keyword: string) => {
     if (!keyword.trim()) {
@@ -999,6 +1064,13 @@ export function MapPage() {
     }
 
     if (networkTypeLower && networkType) {
+      // 同步到持久化 store（使用 getState 获取最新值，避免闭包过期）
+      const currentVis = useMapStore.getState().mapSettings.layerVisibility
+      storeSetLayerVisibility(
+        networkTypeLower === 'lte' ? visible : currentVis.lte,
+        networkTypeLower === 'nr' ? visible : currentVis.nr
+      )
+
       // 扇区总开关现在是"快捷方式"：
       // - 勾选时：所有频点设为可见（显示所有扇区）
       // - 取消勾选时：所有频点设为不可见（隐藏所有扇区）
@@ -1013,7 +1085,7 @@ export function MapPage() {
         onlineMapRef.current.setLayerVisibility(networkTypeLower, visible)
       }
     }
-  }, [])
+  }, [storeSetLayerVisibility])
 
   /**
    * 处理地图类型切换
@@ -1021,12 +1093,13 @@ export function MapPage() {
   const handleMapTypeChange = useCallback((type: 'roadmap' | 'satellite') => {
     console.log('[MapPage] Map type change:', type)
     setMapType(type)
+    storeSetMapType(type)
     // 调用 OnlineMap 的 setMapType 方法直接设置地图类型
     if (onlineMapRef.current) {
       console.log('[MapPage] Calling onlineMapRef.current.setMapType')
       onlineMapRef.current.setMapType(type)
     }
-  }, [])
+  }, [storeSetMapType])
 
   /**
    * 处理在线地图可见性切换
@@ -1034,11 +1107,12 @@ export function MapPage() {
   const handleOnlineMapToggle = useCallback((visible: boolean) => {
     console.log('[MapPage] Online map visibility toggle:', visible)
     setOnlineMapVisible(visible)
+    storeSetBaseMapVisible(visible)
     // 调用 OnlineMap 的 setBaseMapVisibility 方法
     if (onlineMapRef.current) {
       onlineMapRef.current.setBaseMapVisibility(visible)
     }
-  }, [])
+  }, [storeSetBaseMapVisible])
 
   /**
    * 处理频点可见性切换
@@ -1101,6 +1175,7 @@ export function MapPage() {
       ...prev,
       [layerId]: visible
     }))
+    storeSetSectorLabelVisibility(layerId, visible)
 
     // 通知地图组件更新扇区标签可见性
     if (onlineMapRef.current) {
@@ -1108,7 +1183,7 @@ export function MapPage() {
       console.log('[MapPage] Calling onlineMapRef.current.setSectorLabelVisibility:', layerType, visible)
       onlineMapRef.current.setSectorLabelVisibility(layerType, visible)
     }
-  }, [])
+  }, [storeSetSectorLabelVisibility])
 
   /**
    * 处理点文件标签可见性切换
@@ -1119,12 +1194,13 @@ export function MapPage() {
       ...prev,
       [fileId]: visible
     }))
+    storeSetPointFileLabelVisibility(fileId, visible)
 
     // 通知地图组件
     if (onlineMapRef.current) {
       onlineMapRef.current.setPointFileLabelVisibility(fileId, visible)
     }
-  }, [])
+  }, [storeSetPointFileLabelVisibility])
 
   /**
    * 处理图层文件标签可见性切换
@@ -1135,13 +1211,14 @@ export function MapPage() {
       ...prev,
       [fileId]: visible
     }))
+    storeSetLayerFileLabelVisibility(fileId, visible)
 
     // 通知地图组件更新图层文件标签可见性
     if (onlineMapRef.current) {
       const settings = labelSettingsMap[fileId]
       onlineMapRef.current.setLayerFileLabelVisibility(fileId, visible, settings)
     }
-  }, [labelSettingsMap])
+  }, [labelSettingsMap, storeSetLayerFileLabelVisibility])
 
   /**
    * 处理标签设置变化
@@ -1169,7 +1246,7 @@ export function MapPage() {
     }))
 
     // 保存到持久化 store
-    setLabelSettings(layerId, settings)
+    storeSetLabelSettings(layerId, settings)
 
     // 通知地图组件更新标签配置
     if (!onlineMapRef.current) return

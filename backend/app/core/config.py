@@ -48,6 +48,11 @@ class Settings(BaseSettings):
     NPT_LICENSE_SECRET_KEY: str = "network-planning-tool-secret-key-2024"
     NPT_LICENSE_EXPIRY_DAYS: int = 365
 
+    # JWT 认证配置 - 从环境变量读取
+    NPT_JWT_SECRET_KEY: str = "network-planning-tool-jwt-secret-key-2024"
+    NPT_JWT_ALGORITHM: str = "HS256"
+    NPT_JWT_ACCESS_TOKEN_EXPIRE_MINUTES: int = 1440
+
     # 任务配置 - 从环境变量读取
     NPT_MAX_TASKS: int = 10
     NPT_TASK_TIMEOUT: int = 3600
@@ -92,6 +97,18 @@ class Settings(BaseSettings):
     @property
     def LICENSE_EXPIRY_DAYS(self) -> int:
         return self.NPT_LICENSE_EXPIRY_DAYS
+
+    @property
+    def JWT_SECRET_KEY(self) -> str:
+        return self.NPT_JWT_SECRET_KEY
+
+    @property
+    def JWT_ALGORITHM(self) -> str:
+        return self.NPT_JWT_ALGORITHM
+
+    @property
+    def JWT_ACCESS_TOKEN_EXPIRE_MINUTES(self) -> int:
+        return self.NPT_JWT_ACCESS_TOKEN_EXPIRE_MINUTES
 
     @property
     def MAX_TASKS(self) -> int:

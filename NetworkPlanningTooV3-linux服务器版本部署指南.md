@@ -1,8 +1,8 @@
 # NetworkPlanningTooV3 Linux 服务器版本部署指南
 
-> 文档版本：v1.0 — 2026-05-10  
+> 文档版本：v1.1 — 2026-05-21  
 > 目标系统：Armbian Linux (ARM64/aarch64)  
-> 部署方式：FastAPI 后端 + Cloudflare Tunnel 内网穿透
+> 部署方式：FastAPI 后端 + Cloudflare Tunnel 内网穿透 + Tailscale Funnel 备用通道
 
 ---
 
@@ -12,10 +12,14 @@
 2. [后端部署](#2-后端部署)
 3. [前端构建与部署](#3-前端构建与部署)
 4. [Cloudflare Tunnel 内网穿透](#4-cloudflare-tunnel-内网穿透)
+   - 4.6 [Tailscale Funnel 备用通道](#46-tailscale-funnel-备用通道突破企业防火墙)
 5. [Systemd 开机自启服务](#5-systemd-开机自启服务)
 6. [域名访问验证](#6-域名访问验证)
 7. [常见问题与故障排除](#7-常见问题与故障排除)
+   - 7.4 [Cloudflare 隧道连接异常 / 部分网络无法访问](#74-cloudflare-隧道连接异常--部分网络无法访问)
 8. [维护命令速查](#8-维护命令速查)
+   - 8.4 [Tailscale Funnel 备用通道](#84-tailscale-funnel-备用通道)
+   - 8.6 [一键全部重启](#86-一键全部重启)
 
 ---
 
@@ -25,7 +29,10 @@
 
 ```
 用户浏览器 ──HTTPS──▶ Cloudflare Tunnel ──▶ 本机 :8000 ──▶ FastAPI 后端
-                                             └── 静态文件服务 ──▶ 前端 SPA
+        │                                          └── 静态文件服务 ──▶ 前端 SPA
+        │
+        └───HTTPS 443──▶ Tailscale Funnel ──▶ 本机 :8000 ──▶ FastAPI 后端
+                                          (备用：受限网络环境)
 ```
 
 ### 1.2 环境信息
@@ -35,9 +42,13 @@
 | 操作系统 | Armbian Linux (RK3588 / ARM64) |
 | 后端框架 | FastAPI (Python 3) |
 | 前端框架 | React + Vite + TypeScript |
-| 内网穿透 | Cloudflare Tunnel (cloudflared) |
-| 域名 | `app.pengwc.asia` |
+| 主内网穿透 | Cloudflare Tunnel (cloudflared, HTTP2 协议) |
+| 备用内网穿透 | Tailscale Funnel (HTTPS 443, 突破企业防火墙) |
+| 域名（主） | `app.pengwc.asia` |
+| 域名（备） | `armbian.tail362392.ts.net` |
 | 后端地址 | `http://192.168.101.168:8000` |
+| Cloudflare 端口 | TCP 7844（非标准端口，部分企业防火墙阻断） |
+| Tailscale Funnel 端口 | TCP 443（标准 HTTPS，几乎所有防火墙放行） |
 
 ### 1.3 前置条件
 
@@ -252,26 +263,128 @@ chmod +x /usr/local/bin/cloudflared
 cloudflared tunnel run --token <YOUR_TOKEN>
 ```
 
-### 4.3 验证隧道状态
+### 4.3 Systemd 服务（cloudflared）
 
-```bash
-# 检查进程
-ps aux | grep cloudflared
+创建 `/etc/systemd/system/cloudflared.service`：
 
-# 检查进程详情
-systemctl status cloudflared  # 如使用 systemd 安装
+```ini
+[Unit]
+Description=cloudflared
+After=network-online.target
+Wants=network-online.target
 
-# 验证域名访问
-curl -s -o /dev/null -w "%{http_code}" https://app.pengwc.asia/health
-# 预期: 200
+[Service]
+TimeoutStartSec=30
+Type=notify
+ExecStart=/usr/bin/cloudflared --protocol http2 --edge-ip-version auto --no-autoupdate tunnel run --token <YOUR_TOKEN>
+Restart=always
+RestartSec=10s
+
+[Install]
+WantedBy=multi-user.target
 ```
 
-### 4.4 隧道配置要点
+**关键参数说明：**
+
+| 参数 | 说明 |
+|------|------|
+| `--protocol http2` | **必须**使用 HTTP2 (TCP) 协议。默认 QUIC (UDP) 在部分网络上超时严重 |
+| `--edge-ip-version auto` | 自动选择 IPv4/IPv6 |
+| `TimeoutStartSec=30` | 启动超时设为 30 秒（默认 15 秒不够） |
+| `Type=notify` | cloudflared 就绪后通知 systemd |
+
+启用服务：
+
+```bash
+systemctl daemon-reload
+systemctl enable cloudflared
+systemctl start cloudflared
+```
+
+### 4.4 验证隧道状态
+
+```bash
+systemctl status cloudflared --no-pager
+
+# 查看连接日志（确认 protocol=http2）
+journalctl -u cloudflared -n 20 --no-pager | grep "Registered tunnel connection"
+
+# 预期输出：
+# Registered tunnel connection ... location=hkg12 protocol=http2
+# Registered tunnel connection ... location=lax08 protocol=http2
+```
+
+### 4.5 隧道配置要点
 
 - Cloudflare Dashboard 中的隧道目标地址指向本机 `http://192.168.101.168:8000`
 - Cloudflare 会自动管理 SSL 证书，用户通过 HTTPS 访问
+- **Cloudflare Tunnel 连接目标是 `TCP 7844` 端口**（非标准端口）
+  - 家庭 WiFi / 手机数据网络通常放行 → 可正常访问
+  - **企业/办公室防火墙通常只放行 80/443 → 端口 7844 被阻断，无法访问**
+  - 受限网络下请使用备用通道：Tailscale Funnel（见 4.6 节）
 - Cloudflare 不会缓存 HTML 类型响应（`cf-cache-status: DYNAMIC`），确保前端始终最新
 - 静态资源（JS/CSS）的缓存时间由后端返回的 `cache-control` 头控制
+
+### 4.6 Tailscale Funnel 备用通道（突破企业防火墙）
+
+**为什么需要备用通道：** Cloudflare Tunnel 使用 TCP 7844 端口，企业/办公室防火墙通常只放行 80/443，导致通过 `app.pengwc.asia` 无法访问。Tailscale Funnel 走标准 HTTPS 443 端口，几乎任何能上网的网络都可以通过。
+
+#### 4.6.1 前置条件
+
+```bash
+# 安装 Tailscale（如未安装）
+curl -fsSL https://tailscale.com/install.sh | sh
+
+# 启动并登录
+tailscale up
+```
+
+**重要：** 需要在 Tailscale 管理后台（https://login.tailscale.com/admin/dns）启用 HTTPS 证书和 Funnel 功能。
+
+#### 4.6.2 配置 Funnel
+
+```bash
+# 第 1 步：配置反向代理规则
+tailscale serve --bg --set-path / http://localhost:8000
+
+# 第 2 步：开启 Funnel（暴露到公网）
+tailscale funnel --bg --set-path / http://localhost:8000
+
+# 第 3 步：验证
+tailscale funnel status
+# 输出: https://armbian.tail362392.ts.net (Funnel on)
+#       |-- / proxy http://localhost:8000
+```
+
+#### 4.6.3 验证 Funnel 公网访问
+
+```bash
+curl -s -o /dev/null -w "%{http_code}" https://armbian.tail362392.ts.net/health
+# 预期: 200
+```
+
+#### 4.6.4 Funnel 特性
+
+| 特性 | 说明 |
+|------|------|
+| 访问地址 | `https://armbian.tail362392.ts.net/` |
+| 端口 | TCP 443（标准 HTTPS） |
+| 是否需要客户端 | **否**，任何浏览器直接打开 |
+| 开机自启 | ✅ 配置存储在 Tailscale 云端，随 `tailscaled` 服务自动恢复 |
+| 适用网络 | 所有能访问互联网的网络（含企业/办公室防火墙环境） |
+
+#### 4.6.5 双通道架构总结
+
+```
+普通网络（家庭/手机）──▶ app.pengwc.asia ──▶ Cloudflare Tunnel (TCP 7844) ──▶ 后端
+受限网络（办公室WiFi）──▶ armbian.tail362392.ts.net ──▶ Tailscale Funnel (TCP 443) ──▶ 后端
+```
+
+| 网络环境 | app.pengwc.asia | armbian.tail362392.ts.net |
+|---------|:--------------:|:-------------------------:|
+| 家庭 WiFi | ✅ | ✅ |
+| 手机数据 | ✅ | ✅ |
+| 办公室 WiFi | ❌ 端口 7844 被阻断 | ✅ HTTPS 443 |
 
 ---
 
@@ -365,7 +478,8 @@ curl -s -o /dev/null -w "%{http_code}" \
 
 | 场景 | 访问地址 | 预期 |
 |------|---------|------|
-| 外网访问（手机/异地） | `https://app.pengwc.asia` | ✅ 完整应用 |
+| 外网（家庭/手机，端口 7844 放行） | `https://app.pengwc.asia` | ✅ 完整应用 |
+| 外网（办公室/企业 WiFi，端口受限） | `https://armbian.tail362392.ts.net` | ✅ 完整应用（Funnel 备用） |
 | 内网访问 | `http://192.168.101.168:8000` | ✅ 完整应用 |
 | 本地 localhost | `http://127.0.0.1:8000` | ✅ 完整应用 |
 
@@ -420,19 +534,51 @@ npm install react-colorful
 npm install terser  # 如果 vite.config.ts 使用 terser 压缩
 ```
 
-### 7.4 Cloudflare 隧道连接异常
+### 7.4 Cloudflare 隧道连接异常 / 部分网络无法访问
 
-**症状：** 域名无法访问
+**症状 1：** 域名在手机/家庭可以访问，办公室/企业 WiFi 无法访问
+
+**根因：** Cloudflare Tunnel 连接目标端口为 **TCP 7844**（非标准端口）。企业防火墙通常只放行 80/443 端口，导致 7844 被阻断。
+
+**诊断：**
+```bash
+# 查看 cloudflared 连接日志
+journalctl -u cloudflared -n 30 --no-pager | grep -E "Failed|timeout|Registered"
+
+# 如果看到以下错误，说明端口被阻断：
+# Failed to dial a quic connection error="... timeout: no recent network activity"
+# TLS handshake with edge error: ... i/o timeout
+```
+
+**解决方案：**
+1. **切换协议为 HTTP2**（TCP 比 QUIC/UDP 更稳定）：
+   ```bash
+   # 修改 cloudflared.service 中的 ExecStart：
+   # --protocol quic → --protocol http2
+   # TimeoutStartSec=15 → TimeoutStartSec=30
+   systemctl daemon-reload && systemctl restart cloudflared
+   ```
+
+2. **使用 Tailscale Funnel 作为备用通道**（在受限网络上使用）：
+   ```
+   https://armbian.tail362392.ts.net/  （走 HTTPS 443，任何防火墙放行）
+   ```
+   配置详见 4.6 节。
+
+**症状 2：** 隧道进程运行但无法连接
 
 **检查步骤：**
 ```bash
-# 1. 检查隧道进程
-ps aux | grep cloudflared
+# 1. 检查隧道服务状态
+systemctl status cloudflared --no-pager
 
 # 2. 检查本机后端
 curl http://127.0.0.1:8000/health
 
 # 3. 检查 Cloudflare Zero Trust Dashboard 中的隧道状态
+
+# 4. 测试端口 7844 出站连通性
+nc -zv -w5 cloudflared.argo.tools 7844
 ```
 
 ### 7.5 后端占用问题排查
@@ -637,20 +783,32 @@ npm run dev:web          # 启动开发服务器（端口 5173）
 npm run lint             # 代码检查
 ```
 
-### 8.3 Cloudflare 隧道
+### 8.3 Cloudflare Tunnel
 
 ```bash
-# 查看隧道进程
-ps aux | grep cloudflared
+systemctl status cloudflared --no-pager  # 查看状态
+systemctl restart cloudflared            # 重启隧道
+journalctl -u cloudflared -f             # 实时日志
+journalctl -u cloudflared -n 30          # 最近 30 条
 
-# 手动启动隧道
-cloudflared tunnel run --token <TOKEN>
-
-# 如果使用 systemd 安装的 cloudflared
-systemctl status cloudflared
+# 手动启动隧道（调试用）
+cloudflared tunnel run --token <TOKEN> --protocol http2
 ```
 
-### 8.4 快速部署流程（从零开始）
+### 8.4 Tailscale Funnel 备用通道
+
+```bash
+tailscale serve status           # 查看 serve 配置
+tailscale funnel status          # 查看 funnel 状态
+
+# 重新启用（重启后一般无需手动操作，配置自动恢复）
+tailscale funnel --bg --set-path / http://localhost:8000
+
+# 关闭 Funnel
+tailscale funnel --https=443 off
+```
+
+### 8.5 快速部署流程（从零开始）
 
 ```bash
 # 第 1 步：启动后端
@@ -672,7 +830,17 @@ curl -s https://app.pengwc.asia/health
 # 完成
 ```
 
-### 8.5 文件结构参考
+### 8.6 一键全部重启
+
+```bash
+# 重启所有系统服务
+systemctl restart tailscaled cloudflared npt-backend
+
+# 等 tailscaled 就绪后恢复 Funnel（配置在云端，2 秒后生效）
+sleep 2 && tailscale funnel --bg --set-path / http://localhost:8000
+```
+
+### 8.7 文件结构参考
 
 ```
 /DATA/AppData/NetworkPlanningTooV3/
@@ -733,6 +901,10 @@ sleep 3
 curl -s http://127.0.0.1:8000/health
 echo ""
 curl -s -o /dev/null -w "前端: %{http_code}\n" http://127.0.0.1:8000/
+echo ""
+curl -s -o /dev/null -w "Cloudflare: %{http_code}\n" https://app.pengwc.asia/health
+echo ""
+curl -s -o /dev/null -w "Funnel: %{http_code}\n" https://armbian.tail362392.ts.net/health
 
 echo "===== 部署完成 ====="
 ```

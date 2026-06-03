@@ -2,6 +2,7 @@
 TAC规划API端点
 """
 
+import asyncio
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Request
 from typing import Dict, Any
 from datetime import datetime

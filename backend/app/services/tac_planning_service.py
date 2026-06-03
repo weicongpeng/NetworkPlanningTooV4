@@ -81,8 +81,9 @@ class LRUCache:
 class TACPlanningService:
     """TAC规划服务"""
 
-    def __init__(self, data_dir: Path):
+    def __init__(self, data_dir: Path, data_service=None):
         self.data_dir = data_dir
+        self.data_service = data_service
         # 使用LRU缓存替代普通字典，默认最大缓存100个TAC区域
         self.tac_zones = LRUCache(capacity=100)
         self._seen_cells = {}  # 用于NR网络去重的字典
@@ -119,6 +120,8 @@ class TACPlanningService:
             # 辅助函数：在目录中查找 TAB 文件（不区分大小写）
             def _find_tab_file(directory: Path) -> Optional[Path]:
                 """在目录中查找第一个 .tab 文件（不区分大小写）"""
+                if not directory.exists():
+                    return None
                 for f in directory.rglob("*"):
                     if f.is_file() and f.suffix.lower() == ".tab":
                         return f
@@ -126,16 +129,56 @@ class TACPlanningService:
 
             def _find_named_tab_file(directory: Path, filename: str) -> Optional[Path]:
                 """在目录中查找指定名称的 TAB 文件（不区分大小写）"""
+                if not directory.exists():
+                    return None
                 for f in directory.rglob("*"):
                     if f.is_file() and f.name.lower() == filename.lower():
                         return f
                 return None
 
-            for item in items:
-                if item.type.value != "map":
-                    continue
+            # 收集所有 data 目录子目录的路径，用于后续搜索
+            _all_data_subdirs: List[Path] = []
 
+            for item in items:
+                # 无论 item 类型是什么，都收集其 data 子目录路径用于 TAB 文件搜索
                 data_dir = self.data_dir / item.id
+                if data_dir.exists():
+                    _all_data_subdirs.append(data_dir)
+
+                # 跳过非 map 类型，但如果有 layers 元数据也检查
+                if item.type.value != "map":
+                    # 检查非 map 条目是否包含图层元数据（如 ZIP 混合上传场景）
+                    if hasattr(item, 'metadata') and item.metadata:
+                        metadata_dict = item.metadata.model_dump() if hasattr(item.metadata, 'model_dump') else item.metadata
+                        layers = metadata_dict.get('layers', [])
+                        if layers:
+                            # 有图层元数据的非 map 条目，尝试在其中查找 TAB 文件
+                            for layer in layers:
+                                layer_name = layer.get('name', '')
+                                if network_type == "LTE":
+                                    if "4G_TAC" in layer_name or ("4G" in layer_name and "TAC" in layer_name):
+                                        candidate = _find_tab_file(data_dir)
+                                        if candidate:
+                                            tac_file = candidate
+                                            logger.info(f"[TAC图层搜索] 在非map条目的图层中找到: {candidate}")
+                                            break
+                                else:
+                                    if "5G_TAC" in layer_name or ("5G" in layer_name and "TAC" in layer_name) or "河源5G" in layer_name:
+                                        candidate = _find_tab_file(data_dir)
+                                        if candidate:
+                                            tac_file = candidate
+                                            logger.info(f"[TAC图层搜索] 在非map条目的图层中找到: {candidate}")
+                                            break
+                            if tac_file:
+                                break
+                    # 也尝试直接在非 map 条目的 data 目录中搜索 TAB 文件
+                    if tac_file is None:
+                        candidate = _find_named_tab_file(data_dir, tac_filename)
+                        if candidate:
+                            tac_file = candidate
+                            logger.info(f"[TAC图层搜索] 在非map条目目录中找到: {candidate}")
+                            break
+                    continue
 
                 # 方法1: 检查图层元数据中的layer名称（更可靠）
                 if hasattr(item, 'metadata') and item.metadata:
@@ -179,11 +222,33 @@ class TACPlanningService:
                             tac_file = candidate
                             break
 
-            # 如果在 data_service 中没找到，保留原有深度搜索逻辑作为备份（不区分大小写）
+            # 方法4: 在所有 data 子目录中搜索 TAB 文件（包括非 map 类型的 data 目录）
+            # 这解决了当 TAC 图层文件被打包在 ZIP 中通过 /upload/excel 上传时，
+            # 提取的 TAB 文件位于 excel 类型的 data 目录中而未被 map 搜索覆盖的问题
             if tac_file is None:
+                logger.info(f"[TAC图层搜索] 在 {len(_all_data_subdirs)} 个 data 子目录中搜索 {tac_filename}...")
+                for subdir in _all_data_subdirs:
+                    candidate = _find_named_tab_file(subdir, tac_filename)
+                    if candidate:
+                        tac_file = candidate
+                        logger.info(f"[TAC图层搜索] 在子目录中找到: {candidate}")
+                        break
+
+            # 方法5: 全局递归搜索（深度后备方案）
+            if tac_file is None:
+                logger.info(f"[TAC图层搜索] 在 DATA_DIR ({self.data_dir}) 中递归搜索 {tac_filename}...")
                 tac_file = _find_named_tab_file(self.data_dir, tac_filename)
+                if tac_file:
+                    logger.info(f"[TAC图层搜索] 在 DATA_DIR 中找到: {tac_file}")
 
             if tac_file is None or not tac_file.exists():
+                # 列出 data 目录中所有 .tab 文件以便调试
+                _all_tabs = list(self.data_dir.rglob("*.tab")) + list(self.data_dir.rglob("*.TAB"))
+                _tab_names = [str(t.relative_to(self.data_dir)) for t in _all_tabs[:20]]
+                if _tab_names:
+                    logger.warning(f"[TAC图层搜索] DATA_DIR 中存在以下 .tab 文件: {_tab_names}")
+                else:
+                    logger.warning(f"[TAC图层搜索] DATA_DIR 中未找到任何 .tab 文件")
                 raise ValueError(
                     f"加载TAC图层失败: 未找到TAC图层文件 {tac_filename}，请确保TAC图层在数据管理中导入"
                 )
@@ -373,36 +438,29 @@ class TACPlanningService:
             self._seen_cells = {}
             logger.info(f"从全量工参文件加载待规划{network_type}小区...")
 
-            # 读取索引文件，找到最新的全量工参文件
-            # 索引文件在 data/index.json，而不是 uploads/index.json
-            index_path = self.data_dir / "index.json"
-            if not index_path.exists():
-                logger.warning(f"未找到索引文件: {index_path}")
-                return cells
-
-            with open(index_path, "r", encoding="utf-8") as f:
-                index = json.load(f)
+            # 获取 data_service 引用
+            ds = self.data_service
+            if ds is None:
+                from app.services.data_service import data_service as _ds
+                ds = _ds
 
             # 收集所有全量工参文件并按上传时间降序排序（最新的在前）
             full_params_files = []
-            for data_id, data_info in index.items():
+            for data_id, data_info in ds.index.items():
                 file_type = data_info.get("type", "")
                 file_name = data_info.get("name", "")
-                upload_date = data_info.get("uploadDate", "")
 
-                # 只处理excel类型且文件名包含projectparameter的全量工参文件
-                if file_type == "excel" and "projectparameter" in file_name.lower():
+                if file_type == "excel" and data_info.get("fileType") == "full_params":
                     full_params_files.append({
                         "data_id": data_id,
                         "name": file_name,
-                        "upload_date": upload_date
+                        "upload_date": data_info.get("uploadDate", ""),
                     })
 
-            # 按上传时间降序排序
             full_params_files.sort(key=lambda x: x["upload_date"], reverse=True)
 
             if not full_params_files:
-                logger.warning(f"未找到全量工参文件（包含projectparameter）")
+                logger.warning(f"未找到全量工参文件")
                 return cells
 
             # 只读取最新的全量工参文件
@@ -412,14 +470,16 @@ class TACPlanningService:
 
             logger.info(f"正在读取最新全量工参文件: {file_name} (上传时间: {latest_file['upload_date']})")
 
-            data_json_path = self.data_dir / data_id / "data.json"
-            if not data_json_path.exists():
-                logger.warning(f"数据文件不存在: {data_json_path}")
-                return cells
-
-            # 读取数据
-            with open(data_json_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
+            # 从 SQLite 获取数据（回退到遗留 data.json）
+            data = ds.get_data_from_db(data_id)
+            if data is None:
+                data_json_path = self.data_dir / data_id / "data.json"
+                if data_json_path.exists():
+                    with open(data_json_path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                else:
+                    logger.warning(f"数据不存在: {data_id}")
+                    return cells
 
             # 提取指定网络类型的小区
             network_data = data.get(network_type, [])

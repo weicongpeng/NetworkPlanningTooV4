@@ -1,0 +1,7 @@
+{
+  "tool_name": "Bash",
+  "tool_input_preview": "{\"command\":\"git reset HEAD~1 --soft && git restore --staged .claude/ && git restore .claude/ 2>/dev/null; git add frontend/src/renderer/components/Layout/GlobalTaskIndicator.tsx frontend/src/renderer/...",
+  "error": "Exit code 128\nfatal: pathspec 'frontend/src/renderer/components/Layout/GlobalTaskIndicator.tsx' did not match any files",
+  "timestamp": "2026-06-03T13:36:48.465Z",
+  "retry_count": 1
+}

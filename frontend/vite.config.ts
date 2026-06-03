@@ -22,6 +22,8 @@ export default defineConfig({
         changeOrigin: true,
         // 确保代理正确转发 multipart/form-data
         rewrite: (path) => path,
+        // 工参更新操作（如应用到工参）对大文件处理可能超过120s
+        timeout: 600000, // 10分钟超时，避免 Proxy Read Timeout
       },
       '/ws': {
         target: 'ws://localhost:8000',
@@ -33,35 +35,14 @@ export default defineConfig({
     outDir: 'dist-renderer',
     emptyOutDir: true,
     // 生产优化配置
-    minify: 'terser',
-    terserOptions: {
-      compress: {
-        drop_console: true,
-        drop_debugger: true,
-        pure_funcs: ['console.log']
-      }
+    minify: 'esbuild',
+    esbuild: {
+      drop: ['console', 'debugger']
     },
     rollupOptions: {
       output: {
-        // 代码分割优化
-        manualChunks: {
-          // React 核心库
-          'react-vendor': ['react', 'react-dom', 'react-router-dom'],
-          // UI 组件库
-          'ui-vendor': [
-            '@radix-ui/react-dialog',
-            '@radix-ui/react-dropdown-menu',
-            '@radix-ui/react-label',
-            '@radix-ui/react-select',
-            '@radix-ui/react-slot',
-            '@radix-ui/react-tabs',
-            '@radix-ui/react-toast'
-          ],
-          // 地图库
-          'map-vendor': ['leaflet', 'react-leaflet', 'leaflet-defaulticon-compatibility'],
-          // 状态管理和工具
-          'utils-vendor': ['zustand', 'axios', 'clsx', 'tailwind-merge', 'class-variance-authority']
-        },
+        // 代码分割优化 - 由 Rollup 自动处理
+        // 不设置 manualChunks 避免跨块 TDZ 错误
         // 文件名优化
         chunkFileNames: 'assets/js/[name]-[hash].js',
         entryFileNames: 'assets/js/[name]-[hash].js',

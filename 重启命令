@@ -1,0 +1,1 @@
+日常最常用的就是 systemctl restart npt-backend（改后端代码）和 npm run build:vite && systemctl restart npt-backend（改前端代码）。

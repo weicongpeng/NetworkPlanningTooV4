@@ -313,19 +313,26 @@ class LTENRPCIPlanner:
     def get_reuse_compliant_pcis(self, target_lat: float, target_lon: float, target_earfcn: float,
                                 exclude_enodeb=None, exclude_cell=None,
                                 target_mod: Optional[int] = None,
-                                strict_site_mod: bool = True) -> List[Tuple[int, float, bool, float, str]]:
+                                strict_site_mod: bool = True,
+                                pci_conflicts: Optional[Dict] = None,
+                                same_site_cells: Optional[List[Dict]] = None) -> List[Tuple[int, float, bool, float, str]]:
         """
         获取满足要求的PCI列表
+        Args:
+            pci_conflicts: 预计算的PCI冲突结果，避免重复计算
+            same_site_cells: 预计算的同站小区列表
         Returns: (pci, min_distance, has_mod_conflict, balance_score, min_distance_cell_name)
         """
         # 获取所有可能的PCI冲突（20km半径）
-        pci_conflicts = self.find_pci_conflicts(target_lat, target_lon, target_earfcn, exclude_enodeb, exclude_cell)
+        if pci_conflicts is None:
+            pci_conflicts = self.find_pci_conflicts(target_lat, target_lon, target_earfcn, exclude_enodeb, exclude_cell)
         
         # 获取同站点模值和已使用的PCI（硬约束：同站点同频小区不能使用相同PCI）
         same_site_mods = set()
         same_site_mod3s = set()
         same_site_used_pcis = set()  # 新增：记录同站点同频小区已使用的PCI
-        same_site_cells = self.get_same_site_cells(target_lat, target_lon, exclude_enodeb, exclude_cell)
+        if same_site_cells is None:
+            same_site_cells = self.get_same_site_cells(target_lat, target_lon, exclude_enodeb, exclude_cell)
         for cell in same_site_cells:
             # 只有同频点的小区才参与模值冲突检查 (按用户最新要求)
             cell_earfcn = cell.get('earfcn_dl')
@@ -512,7 +519,8 @@ class LTENRPCIPlanner:
         
         # 第一阶段：尝试同时满足模值约束和复用距离约束
         if target_mod is not None:
-            compliant = self.get_reuse_compliant_pcis(lat, lon, earfcn, enodeb_id, cell_id, target_mod, strict_site_mod=True)
+            compliant = self.get_reuse_compliant_pcis(lat, lon, earfcn, enodeb_id, cell_id, target_mod, strict_site_mod=True,
+                                                       pci_conflicts=pci_conflicts, same_site_cells=same_site_cells)
             if compliant:
                 pci, dist, _, _, name = compliant[0]
                 mod_source = "preferred" if preferred_mod3 is not None else "inherit"
@@ -524,7 +532,8 @@ class LTENRPCIPlanner:
                 if step >= orig_threshold:
                     continue
                 self.reuse_distance_km = step
-                compliant = self.get_reuse_compliant_pcis(lat, lon, earfcn, enodeb_id, cell_id, preferred_mod3, strict_site_mod=True)
+                compliant = self.get_reuse_compliant_pcis(lat, lon, earfcn, enodeb_id, cell_id, preferred_mod3, strict_site_mod=True,
+                                                           pci_conflicts=pci_conflicts, same_site_cells=same_site_cells)
                 self.reuse_distance_km = orig_threshold  # 恢复
                 if compliant:
                     pci, dist, _, _, name = compliant[0]
@@ -532,7 +541,8 @@ class LTENRPCIPlanner:
                     return pci, reason, dist, name
         
         # 第三阶段：不使用特定模值，但保持复用距离约束
-        compliant = self.get_reuse_compliant_pcis(lat, lon, earfcn, enodeb_id, cell_id, None, strict_site_mod=True)
+        compliant = self.get_reuse_compliant_pcis(lat, lon, earfcn, enodeb_id, cell_id, None, strict_site_mod=True,
+                                           pci_conflicts=pci_conflicts, same_site_cells=same_site_cells)
         if compliant:
             pci, dist, _, _, name = compliant[0]
             return pci, f'reuse_compliant_{orig_threshold}km_strict_site_mod', dist, name
@@ -542,7 +552,8 @@ class LTENRPCIPlanner:
             if step >= orig_threshold:
                 continue
             self.reuse_distance_km = step
-            compliant = self.get_reuse_compliant_pcis(lat, lon, earfcn, enodeb_id, cell_id, None, strict_site_mod=True)
+            compliant = self.get_reuse_compliant_pcis(lat, lon, earfcn, enodeb_id, cell_id, None, strict_site_mod=True,
+                                           pci_conflicts=pci_conflicts, same_site_cells=same_site_cells)
             self.reuse_distance_km = orig_threshold  # 恢复
             if compliant:
                 pci, dist, _, _, name = compliant[0]
@@ -617,41 +628,46 @@ class LTENRPCIPlanner:
         print(f"[ERROR] 同站({enodeb_id})所有PCI都被同站同频小区占用，使用第一个PCI（违反约束！）")
         return self.pci_range[0], 'emergency_pci_constraint_violation_999.00km', 999.0, ""
 
-    async def plan(self, cells_to_plan: List[Dict], all_cells: List[Dict],
-                  progress_callback: Optional[Callable[[float], Any]] = None) -> PCIPlanningResult:
+    def plan(self, cells_to_plan: List[Dict], all_cells: List[Dict],
+             progress_callback: Optional[Callable[[float], Any]] = None) -> PCIPlanningResult:
         """执行PCI规划"""
         task_id = str(uuid.uuid4())
         self.load_data_from_sites(cells_to_plan, all_cells)
-        
+
         if self.cells_to_plan_df.empty:
             return PCIPlanningResult(task_id, "failed", 0, 0, 0, 0)
-        
+
         total = len(self.cells_to_plan_df)
         results_by_site = {}
-        
+
         for idx, row in self.cells_to_plan_df.iterrows():
             new_pci, reason, min_dist, dist_name = self.assign_pci(row)
-            
+
             # 更新内部全量表以供下一个小区参考
-            mask = ((self.all_cells_df['enodeb_id'].astype(str) == str(row['enodeb_id'])) & 
+            mask = ((self.all_cells_df['enodeb_id'].astype(str) == str(row['enodeb_id'])) &
                    (self.all_cells_df['cell_id'].astype(str) == str(row['cell_id'])))
             self.all_cells_df.loc[mask, 'pci'] = new_pci
             # 同时更新分组索引
             freq = row['earfcn_dl']
             if freq in self.all_cells_by_freq:
-                g_mask = ((self.all_cells_by_freq[freq]['enodeb_id'].astype(str) == str(row['enodeb_id'])) & 
+                g_mask = ((self.all_cells_by_freq[freq]['enodeb_id'].astype(str) == str(row['enodeb_id'])) &
                           (self.all_cells_by_freq[freq]['cell_id'].astype(str) == str(row['cell_id'])))
                 self.all_cells_by_freq[freq].loc[g_mask, 'pci'] = new_pci
 
             site_id = str(row['enodeb_id'])
             if site_id not in results_by_site:
                 results_by_site[site_id] = {
-                    "siteId": site_id, 
+                    "siteId": site_id,
                     "managedElementId": row.get('managed_element_id'),
                     "sectors": []
                 }
-            
+
             orig_pci = row.get('pci')
+            # 处理NaN和Inf值，避免JSON序列化失败
+            earfcn_val = row.get('earfcn_dl')
+            if earfcn_val is not None and (isinstance(earfcn_val, float) and (pd.isna(earfcn_val) or not math.isfinite(earfcn_val))):
+                earfcn_val = None
+            min_dist_val = min_dist if (min_dist is not None and isinstance(min_dist, float) and math.isfinite(min_dist)) else 999.0
             results_by_site[site_id]["sectors"].append({
                 "sectorId": str(row['cell_id']),
                 "sectorName": str(row.get('cell_name', '')),
@@ -659,30 +675,24 @@ class LTENRPCIPlanner:
                 "newPCI": int(new_pci),
                 "originalMod": int(orig_pci) % self.mod_value if pd.notna(orig_pci) else None,
                 "newMod": int(new_pci) % self.mod_value,
-                "earfcn": row.get('earfcn_dl'),
+                "earfcn": earfcn_val,
                 "longitude": row.get('lon', 0.0),
                 "latitude": row.get('lat', 0.0),
                 "assignmentReason": reason,
-                "minReuseDistance": min_dist,
+                "minReuseDistance": min_dist_val,
                 "minDistanceSectorName": dist_name,
                 "networkType": self.network_type,
                 "firstGroup": row.get('first_group')
             })
-            
-            if progress_callback and idx % 10 == 0:
-                if asyncio.iscoroutinefunction(progress_callback):
-                    await progress_callback((idx + 1) / total * 100)
-                else:
-                    progress_callback((idx + 1) / total * 100)
-        
-        if progress_callback:
-            if asyncio.iscoroutinefunction(progress_callback):
-                await progress_callback(100.0)
-            else:
-                progress_callback(100.0)
 
-        # 重新计算准确的最小复用距离（基于所有已规划小区）
-        print(f"[PCI规划] 开始重新计算准确的最小复用距离")
+            if progress_callback and idx % 10 == 0:
+                progress_callback((idx + 1) / total * 100)
+
+        if progress_callback:
+            progress_callback(100.0)
+
+        # 重新计算准确的最小复用距离（基于所有已规划小区 + 全量工参背景小区）
+        print(f"[PCI规划] 开始重新计算准确的最小复用距离（含全量工参背景小区）")
         planned_cells = []
         for site_id, site_data in results_by_site.items():
             for sector in site_data["sectors"]:
@@ -697,59 +707,89 @@ class LTENRPCIPlanner:
                     "sector_ref": sector,  # 引用原sector对象，用于后续更新
                 })
 
-        # 计算每个小区的真实最小复用距离
-        for i, cell in enumerate(planned_cells):
-            min_distance = float("inf")
-            min_distance_sector_name = None
+        from collections import defaultdict
 
-            # 查找其他规划小区中同频同PCI的小区
-            for j, other_cell in enumerate(planned_cells):
-                if i == j:
+        # 构建已规划小区key集合，用于去重
+        planned_cell_keys = set()
+        for cell in planned_cells:
+            planned_cell_keys.add(f"{cell['site_id']}_{cell['sector_id']}")
+
+        # 从 all_cells_by_freq 中收集背景小区
+        # all_cells_by_freq 在规划阶段已更新了已规划小区的PCI
+        # 相当于"使用规划后PCI更新到全量工参"后的状态
+        bg_cells_by_key = defaultdict(list)  # (pci, freq_rounded) → [bg_cell, ...]
+
+        for freq, df in self.all_cells_by_freq.items():
+            freq_rounded = round(float(freq), 1)
+            for _, row in df.iterrows():
+                cell_pci = row.get("pci")
+                if pd.isna(cell_pci):
                     continue
+                cell_key = f"{row['enodeb_id']}_{row['cell_id']}"
+                if cell_key in planned_cell_keys:
+                    continue  # 跳过已规划小区
+                bg_cells_by_key[(int(cell_pci), freq_rounded)].append({
+                    "sector_name": row.get("cell_name", f"背景_{cell_key}"),
+                    "longitude": row.get("lon"),
+                    "latitude": row.get("lat"),
+                })
 
-                # 检查是否同PCI
-                if cell["new_pci"] != other_cell["new_pci"]:
-                    continue
+        # 按 PCI 分组
+        pci_groups: Dict[int, List[Dict]] = defaultdict(list)
+        for cell in planned_cells:
+            pci_groups[cell["new_pci"]].append(cell)
 
-                # 检查是否同频
-                cell_earfcn = cell["earfcn"]
-                other_earfcn = other_cell["earfcn"]
-
-                # 使用频点判断逻辑：两者都有值且差值<=0.1视为同频
-                is_same_freq = False
-                if cell_earfcn is not None and other_earfcn is not None:
+        for pci, group in pci_groups.items():
+            # 按频点分亚组（EARFCN 通常为整数，四舍五入到 0.1 等价于原始 <=0.1 判断）
+            freq_groups: Dict[float, List[Dict]] = defaultdict(list)
+            for cell in group:
+                ef = cell["earfcn"]
+                if ef is not None:
                     try:
-                        if abs(float(cell_earfcn) - float(other_earfcn)) <= 0.1:
-                            is_same_freq = True
+                        fk = round(float(ef), 1)
+                        freq_groups[fk].append(cell)
                     except (ValueError, TypeError):
                         pass
 
-                if not is_same_freq:
+            for freq_key, fg in freq_groups.items():
+                # 获取同频同PCI的背景小区
+                bg_cells = bg_cells_by_key.get((pci, freq_key), [])
+
+                if len(fg) + len(bg_cells) < 2:
                     continue
 
-                # 计算距离
-                dist = DistanceCalculator.calculate_distance(
-                    cell["longitude"], cell["latitude"],
-                    other_cell["longitude"], other_cell["latitude"]
-                )
+                # 合并列表：已规划小区在前，背景小区在后
+                all_cells = fg + bg_cells
+                n = len(all_cells)
+                lats = np.array([c["latitude"] for c in all_cells], dtype=float)
+                lons = np.array([c["longitude"] for c in all_cells], dtype=float)
+                lat_rad = np.radians(lats)
+                lon_rad = np.radians(lons)
 
-                if dist < min_distance:
-                    min_distance = dist
-                    min_distance_sector_name = other_cell["sector_name"]
+                # 只更新已规划小区的最小复用距离（背景小区不更新）
+                num_planned = len(fg)
+                for i in range(num_planned):
+                    dlat = lat_rad - lat_rad[i]
+                    dlon = lon_rad - lon_rad[i]
+                    a = np.sin(dlat * 0.5) ** 2 + np.cos(lat_rad[i]) * np.cos(lat_rad) * np.sin(dlon * 0.5) ** 2
+                    dists = 2 * 6371 * np.arcsin(np.sqrt(np.clip(a, 0, 1)))
+                    dists[i] = np.inf  # 排除自身
 
-            # 更新sector的minReuseDistance和minDistanceSectorName
-            if min_distance != float("inf"):
-                cell["sector_ref"]["minReuseDistance"] = min_distance
-                cell["sector_ref"]["minDistanceSectorName"] = min_distance_sector_name
+                    min_idx = np.argmin(dists)
+                    min_dist = float(dists[min_idx])
 
-                # 更新assignment_reason，标注这是最终核查的真实距离
-                original_reason = cell["sector_ref"].get("assignmentReason", "")
-                if "最终核查" not in original_reason:
-                    is_satisfied = min_distance >= self.reuse_distance_km
-                    status_icon = "✅" if is_satisfied else "❌"
-                    cell["sector_ref"]["assignmentReason"] = f"{original_reason} | {status_icon} 最终核查真实距离={min_distance:.2f}km"
+                    if min_dist != float('inf'):
+                        fg[i]["sector_ref"]["minReuseDistance"] = min_dist
+                        fg[i]["sector_ref"]["minDistanceSectorName"] = all_cells[min_idx].get("sector_name", "")
 
-        print(f"[PCI规划] 准确复用距离计算完成")
+                        # 更新assignment_reason，标注这是最终核查的真实距离
+                        original_reason = fg[i]["sector_ref"].get("assignmentReason", "")
+                        if "最终核查" not in original_reason:
+                            is_satisfied = min_dist >= self.reuse_distance_km
+                            status_icon = "✅" if is_satisfied else "❌"
+                            fg[i]["sector_ref"]["assignmentReason"] = f"{original_reason} | {status_icon} 最终核查真实距离={min_dist:.2f}km"
+
+        print(f"[PCI规划] 准确复用距离计算完成（含背景小区）")
 
         # 映射回对象结构
         sites = []
@@ -770,7 +810,7 @@ class LTENRPCIPlanner:
         return PCIPlanningResult(task_id, "completed", len(sites), total, 0, 0, sites, 100.0)
 
 
-async def run_pci_planning(
+def run_pci_planning(
     config: PlanningConfig,
     cells_to_plan: List[Dict],
     progress_callback: Optional[Callable[[float], Any]] = None,
@@ -780,7 +820,7 @@ async def run_pci_planning(
 ) -> Dict[str, Any]:
     """运行PCI规划入口"""
     planner = LTENRPCIPlanner(config)
-    result = await planner.plan(cells_to_plan, all_cells or cells_to_plan, progress_callback)
+    result = planner.plan(cells_to_plan, all_cells or cells_to_plan, progress_callback)
     
     # 如果启用了TAC规划，执行TAC规划
     if enable_tac_planning and data_dir:

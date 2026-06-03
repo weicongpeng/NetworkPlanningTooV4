@@ -46,3 +46,28 @@ class ResourceLimitError(NetworkPlanningError):
 class ExternalServiceError(NetworkPlanningError):
     """外部服务调用失败异常"""
     pass
+
+
+class AuthenticationError(NetworkPlanningError):
+    """认证失败异常"""
+    pass
+
+
+class AuthorizationError(NetworkPlanningError):
+    """权限不足异常"""
+    pass
+
+
+class UserNotFoundError(NetworkPlanningError):
+    """用户不存在异常"""
+    pass
+
+
+class LicenseExpiredError(NetworkPlanningError):
+    """许可证过期异常"""
+    pass
+
+
+class PasswordChangeRequiredError(NetworkPlanningError):
+    """需要修改密码异常"""
+    pass

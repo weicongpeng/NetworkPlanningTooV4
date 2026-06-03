@@ -478,3 +478,99 @@ docker build -t network-planning-tool-frontend -f frontend/Dockerfile .
 # 使用 docker-compose 运行
 docker-compose up -d
 ```
+
+## 生产环境部署（Linux ARM / Cloudflare Tunnel）
+
+生产环境运行在 Linux ARM 服务器（Rockchip），使用 **Cloudflare Tunnel** 内网穿透提供公网访问。
+
+### 生产环境架构
+
+```
+用户浏览器 → https://app.pengwc.asia/neighbor
+         → Cloudflare Tunnel（cloudflared systemd 服务）
+         → http://localhost:8000（FastAPI 后端）
+         → FastAPI 静态文件服务（frontend/dist-renderer/）
+```
+
+**关键配置**:
+- 公网入口: https://app.pengwc.asia（Cloudflare Tunnel，token 认证）
+- 后端端口: `localhost:8000`
+- 前端构建产物: `frontend/dist-renderer/`（由 FastAPI 作为 SPA 静态文件服务）
+- 系统服务: `npt-backend.service`（systemd 管理）
+
+### 部署步骤（代码变更后）
+
+```bash
+# 1. 构建前端（在项目根目录）
+cd frontend && npm run build:vite
+
+# 2. 重启后端服务
+systemctl restart npt-backend
+
+# 或手动重启（调试用）
+# pkill -f "python3 main.py" && cd /DATA/AppData/NetworkPlanningTooV3/backend && python3 main.py
+```
+
+### 后端系统服务
+
+`/etc/systemd/system/npt-backend.service` 文件内容：
+
+```ini
+[Unit]
+Description=Network Planning Tool Backend (FastAPI)
+After=network.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/DATA/AppData/NetworkPlanningTooV3/backend
+ExecStart=/usr/bin/python3 main.py
+Restart=always
+RestartSec=5
+
+# 生产环境：禁用 reload 模式（避免 watchfiles 高 CPU）
+Environment=NPT_RELOAD=false
+Environment=NPT_WORKERS=1
+
+# OOM 保护
+OOMScoreAdjust=-500
+MemoryMax=2G
+MemoryHigh=1.5G
+
+StandardOutput=append:/var/log/npt-backend.log
+StandardError=append:/var/log/npt-backend.log
+
+[Install]
+WantedBy=multi-user.target
+```
+
+### Cloudflare Tunnel
+
+```bash
+# cloudflared 作为 systemd 服务运行
+systemctl status cloudflared
+
+# 使用 token 认证（Quick Tunnel），非命名隧道
+# 配置在 /etc/systemd/system/cloudflared.service
+```
+
+### 生产环境 CORS 配置
+
+`.env` 文件中的 `NPT_CORS_ORIGINS` 必须包含公网域名：
+
+```bash
+NPT_CORS_ORIGINS=http://app.pengwc.asia,http://apk.pengwc.asia,http://localhost:5173,http://127.0.0.1:5173
+NPT_HOST=0.0.0.0
+NPT_PORT=8000
+```
+
+### 生产环境注意事项
+
+1. **修改后端代码** → 仅需重启 systemd 服务（`systemctl restart npt-backend`）
+2. **修改前端代码** → 必须先构建（`npm run build:vite`），然后重启后端
+3. **API 环境**：生产环境前端通过同域 `/api/v1/...` 访问后端（同一端口，无 Vite Proxy）
+4. **编码设置**：生产环境使用 `UTF8JSONResponse`（`allow_nan=True`），前端已通过 `isFinite()` 处理非有限值
+5. **日志查看**: `journalctl -u npt-backend -n 100 --no-pager` 或 `tail -f /var/log/npt-backend.log`
+6. **内存限制**: systemd 配置了 MemoryMax=2G，避免内存泄漏导致系统 OOM

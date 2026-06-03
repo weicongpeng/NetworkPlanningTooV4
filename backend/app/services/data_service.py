@@ -2,6 +2,7 @@
 数据管理服务
 """
 
+import json
 import os
 import sys
 import uuid
@@ -16,6 +17,8 @@ import numpy as np
 import openpyxl
 
 from app.core.config import settings
+from app.core.database import SessionLocal
+from app.models.database import Workbook, Site, Sector, GeoFile, Layer
 from app.models.schemas import DataItem, DataType, DataStatus, SiteData
 
 # 设置stdout编码为utf-8，避免Windows下GBK编码问题
@@ -68,88 +71,337 @@ class DataService:
         settings.DATA_DIR.mkdir(parents=True, exist_ok=True)
 
     def _load_index(self):
-        """加载数据索引"""
+        """加载数据索引（优先 index.json，然后合并 SQLite 中缺失的条目）"""
         if self.data_index_file.exists():
             import json
-
-            with open(self.data_index_file, "r", encoding="utf-8") as f:
-                self.index = json.load(f)
+            try:
+                with open(self.data_index_file, "r", encoding="utf-8") as f:
+                    self.index = json.load(f)
+                safe_print(f"[DataService] 从 index.json 加载了 {len(self.index)} 个索引条目")
+            except Exception as e:
+                safe_print(f"[DataService] index.json 读取失败: {e}，重新构建索引")
+                self.index = {}
         else:
+            safe_print(f"[DataService] index.json 不存在，重新构建索引")
             self.index = {}
 
+        # 合并 SQLite 中缺失的条目（应对异步流程未持久化 index.json 等场景）
+        db_entries = self._collect_db_entries_for_index()
+        missing = {k: v for k, v in db_entries.items() if k not in self.index}
+        if missing:
+            self.index.update(missing)
+            self._save_index()
+            safe_print(f"[DataService] 从 SQLite 合并了 {len(missing)} 个缺失条目到 index.json")
+        safe_print(f"[DataService] 索引加载完成，共 {len(self.index)} 个条目")
+
+    def _collect_db_entries_for_index(self) -> Dict:
+        """从 SQLite 收集 Workbooks 和 GeoFiles 条目（用于合并到 index.json 缺失的部分）"""
+        from app.core.database import init_db
+        init_db()
+        from app.models.database import User, Workbook, GeoFile
+        entries: Dict = {}
+        db = SessionLocal()
+        try:
+            users = db.query(User).all()
+            user_name_map = {u.id: u.username for u in users}
+            for wb in db.query(Workbook).order_by(Workbook.created_at.desc()).all():
+                entries[wb.id] = {
+                    "id": wb.id, "name": wb.name, "type": "excel",
+                    "fileType": wb.file_type, "size": wb.size,
+                    "uploadDate": wb.created_at, "status": wb.status,
+                    "remark": wb.remark,
+                    "metadata": json.loads(wb.metadata_json) if wb.metadata_json else {},
+                    "user_id": wb.user_id,
+                    "userName": user_name_map.get(wb.user_id, ""),
+                    "originalPath": wb.original_path,
+                }
+            for gf in db.query(GeoFile).order_by(GeoFile.created_at.desc()).all():
+                entries[gf.id] = {
+                    "id": gf.id, "name": gf.filename, "type": "excel",
+                    "fileType": "geo_data", "geometryType": gf.geometry_type,
+                    "size": gf.file_size, "uploadDate": gf.created_at,
+                    "status": "ready", "user_id": gf.user_id,
+                    "userName": user_name_map.get(gf.user_id, ""),
+                    "originalPath": gf.file_path,
+                    "metadata": {"pointCount": gf.point_count},
+                }
+        finally:
+            db.close()
+        return entries
+
+    def _build_index_from_db(self):
+        """从 SQLite 构建内存索引（替代 index.json 文件读写）"""
+        # 确保数据库迁移已执行（DataService 在模块加载时实例化，早于 lifespan 中的 init_db()）
+        from app.core.database import init_db
+        init_db()
+        from app.models.database import User
+        self.index = {}
+        db = SessionLocal()
+        try:
+            # 预加载所有用户的 username 映射
+            users = db.query(User).all()
+            user_name_map: Dict[int, str] = {u.id: u.username for u in users}
+
+            # 1) Workbooks (Excel 工参)
+            for wb in db.query(Workbook).order_by(Workbook.created_at.desc()).all():
+                self.index[wb.id] = {
+                    "id": wb.id,
+                    "name": wb.name,
+                    "type": "excel",
+                    "fileType": wb.file_type,
+                    "size": wb.size,
+                    "uploadDate": wb.created_at,
+                    "status": wb.status,
+                    "remark": wb.remark,
+                    "metadata": json.loads(wb.metadata_json) if wb.metadata_json else {},
+                    "user_id": wb.user_id,
+                    "userName": user_name_map.get(wb.user_id, ""),
+                    "originalPath": wb.original_path,
+                }
+
+            # 2) GeoFiles (地理化数据)
+            for gf in db.query(GeoFile).order_by(GeoFile.created_at.desc()).all():
+                self.index[gf.id] = {
+                    "id": gf.id,
+                    "name": gf.filename,
+                    "type": "excel",
+                    "fileType": "geo_data",
+                    "geometryType": gf.geometry_type,
+                    "size": gf.file_size,
+                    "uploadDate": gf.created_at,
+                    "status": "ready",
+                    "user_id": gf.user_id,
+                    "userName": user_name_map.get(gf.user_id, ""),
+                    "originalPath": gf.file_path,
+                    "metadata": {"pointCount": gf.point_count},
+                }
+
+            # 3) Layers (MapInfo 图层) — 按数据目录分组，避免重复索引条目
+            all_layers = db.query(Layer).order_by(Layer.created_at.desc()).all()
+            # 从 file_path 提取父级 data_id 并将同目录的图层归组
+            _parent_map: Dict[str, List] = {}
+            for layer in all_layers:
+                # 尝试从文件路径推断 data_id（路径格式: .../data/<data_id>/...）
+                _fp = layer.file_path or ""
+                _parts = _fp.replace("\\", "/").split("/")
+                _inferred_id = None
+                for _i, _p in enumerate(_parts):
+                    if _p == "data" and _i + 1 < len(_parts):
+                        _candidate = _parts[_i + 1]
+                        if len(_candidate) == 36 and _candidate.count("-") == 4:
+                            _inferred_id = _candidate
+                            break
+                _parent_key = _inferred_id or layer.id
+                if _parent_key not in _parent_map:
+                    _parent_map[_parent_key] = []
+                _parent_map[_parent_key].append(layer)
+
+            _seen_parents = set()
+            for _parent_key, _group_layers in _parent_map.items():
+                if _parent_key in _seen_parents:
+                    continue
+                _seen_parents.add(_parent_key)
+
+                _first = _group_layers[0]
+                _layers_meta = []
+                for _l in _group_layers:
+                    _layers_meta.append({
+                        "id": _l.id,
+                        "name": _l.name,
+                        "type": _l.geometry_type,
+                        "feature_count": _l.feature_count,
+                    })
+
+                # 如果已有同名索引条目（如 Workbook），将图层信息合并进去
+                # 而不是跳过。这样 ZIP 同时包含工参和 TAC 图层时，TAC 图层也能被搜索到。
+                if _parent_key in self.index:
+                    _existing = self.index[_parent_key]
+                    # 将图层元数据追加到现有条目
+                    _existing_meta = _existing.get("metadata", {}) or {}
+                    _existing_layers = _existing_meta.get("layers", [])
+                    _existing_layer_ids = {l.get("id") for l in _existing_layers}
+                    for _lm in _layers_meta:
+                        if _lm["id"] not in _existing_layer_ids:
+                            _existing_layers.append(_lm)
+                    _existing["metadata"] = {
+                        **_existing_meta,
+                        "layers": _existing_layers,
+                        "layerCount": len(_existing_layers),
+                    }
+                    # 保持 type 为 map 以便 TAC 搜索能找到
+                    # 但如果原来是 excel，保留 subtype 信息用于前端显示
+                    if _existing.get("type") != "map":
+                        _existing["_hasLayers"] = True
+                    safe_print(f"[DataService] 已将 {len(_layers_meta)} 个图层合并到现有索引条目: {_parent_key}")
+                    continue
+
+                self.index[_parent_key] = {
+                    "id": _parent_key,
+                    "name": _first.name if len(_group_layers) == 1 else _first.name,
+                    "type": "map",
+                    "subType": "mapinfo",
+                    "size": _first.file_size,
+                    "uploadDate": _first.created_at,
+                    "status": "ready",
+                    "user_id": _first.user_id,
+                    "userName": user_name_map.get(_first.user_id, ""),
+                    "originalPath": _first.file_path,
+                    "metadata": {
+                        "layerCount": len(_group_layers),
+                        "layers": _layers_meta,
+                        "fileCount": len(_group_layers),
+                    },
+                }
+        finally:
+            db.close()
+
+        # 4) 扫描 DATA_DIR 中未入库的现网工参目录（before-fix 数据）
+        self._scan_missing_current_params()
+
+        # 5) 回退：从遗留 index.json 导入 SQLite 中不存在的条目（map/geo_data 等）
+        self._import_from_legacy_index()
+
+    def _scan_missing_current_params(self):
+        """扫描 DATA_DIR 中已有的现网工参目录，补充缺失的 Workbook 条目"""
+        import re as _re
+        _current_params_patterns = [
+            r'LTE_SDR_CellInfo_.*\.csv',
+            r'LTE_ITBBU_CellInfo_.*\.csv',
+            r'NR_CellInfo_.*\.csv',
+        ]
+
+        db = SessionLocal()
+        try:
+            for _subdir in settings.DATA_DIR.iterdir():
+                if not _subdir.is_dir():
+                    continue
+                _did = _subdir.name
+                # 已在索引中，跳过
+                if _did in self.index:
+                    continue
+                # 检查是否已有 Workbook 条目
+                _existing = db.query(Workbook).filter(Workbook.id == _did).first()
+                if _existing:
+                    continue
+
+                # 检查子目录是否包含现网工参 CSV 文件
+                _is_params = False
+                for _f in _subdir.rglob('*.csv'):
+                    for _pat in _current_params_patterns:
+                        if _re.match(_pat, _f.name, _re.IGNORECASE):
+                            _is_params = True
+                            break
+                    if _is_params:
+                        break
+
+                if not _is_params:
+                    continue
+
+                # 找到了未入库的现网工参目录 — 补充 Workbook 条目
+                safe_print(f"[DataService] 发现未入库的现网工参: {_did}")
+                try:
+                    _wb = Workbook(
+                        id=_did,
+                        user_id=1,
+                        name=_subdir.name,
+                        file_type="current_params",
+                        network_types="[]",
+                        status="ready",
+                        size=None,
+                        metadata_json=json.dumps({"isCurrentParams": True}, ensure_ascii=False),
+                        created_at=datetime.now().isoformat(),
+                    )
+                    db.add(_wb)
+                    db.commit()
+                    safe_print(f"[DataService] 已补充 Workbook 条目: {_did}")
+
+                    self.index[_did] = {
+                        "id": _did,
+                        "name": _subdir.name,
+                        "type": "excel",
+                        "fileType": "current_params",
+                        "size": None,
+                        "uploadDate": datetime.now().isoformat(),
+                        "status": "ready",
+                        "metadata": {"isCurrentParams": True},
+                    }
+                except Exception as _e:
+                    db.rollback()
+                    safe_print(f"[DataService] 补充 Workbook 失败 (非致命): {_e}")
+        finally:
+            db.close()
+
+    def _import_from_legacy_index(self):
+        """从遗留 index.json 导入 SQLite 中不存在的条目（过渡期兼容）"""
+        legacy_file = settings.DATA_DIR / "index.json"
+        if not legacy_file.exists():
+            return
+
+        try:
+            with open(legacy_file, "r", encoding="utf-8") as f:
+                legacy = json.load(f)
+
+            imported = 0
+            for data_id, data_info in legacy.items():
+                if data_id not in self.index:
+                    self.index[data_id] = data_info
+                    imported += 1
+
+            if imported > 0:
+                safe_print(f"[DataService] 从遗留 index.json 导入了 {imported} 个条目（共 {len(legacy)} 个）")
+        except Exception as e:
+            safe_print(f"[DataService] 遗留 index.json 导入失败 (非致命): {e}")
+
     def reload_index(self):
-        """重新加载数据索引（用于其他模块获取最新索引）"""
+        """重新加载数据索引（优先 index.json）"""
         self._load_index()
         safe_print(f"[DataService] 索引已重新加载，共 {len(self.index)} 个数据项")
 
     def _save_index(self):
-        """保存数据索引（原子写入：先写临时文件再重命名，防止写入中断导致文件损坏）"""
+        """保存数据索引到 index.json（原子写入）"""
         import json
         import tempfile
-        import os
+        import os as _os
 
         self.data_index_file.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp_path = tempfile.mkstemp(dir=str(self.data_index_file.parent), suffix=".tmp")
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
+            with _os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(self.index, f, ensure_ascii=False, indent=2)
-            os.replace(tmp_path, str(self.data_index_file))
+            _os.replace(tmp_path, str(self.data_index_file))
         except Exception:
-            if os.path.exists(tmp_path):
-                os.unlink(tmp_path)
+            if _os.path.exists(tmp_path):
+                _os.unlink(tmp_path)
             raise
 
     def _scan_uploads_directory(self):
-        """扫描uploads目录中的文件并添加到index中"""
+        """扫描uploads目录中的文件，发现 SQLite 中不存在的文件时自动迁移导入"""
         safe_print(f"[DataService] 开始扫描uploads目录...")
 
-        # 遍历uploads目录中的所有.xlsx文件
-        for file_path in settings.UPLOAD_DIR.glob("*.xlsx"):
-            # 从文件名中提取data_id
-            filename = file_path.stem
-            if "-" in filename and len(filename.split("-")) == 5:
-                data_id = filename
+        db = SessionLocal()
+        try:
+            existing_ids = {wb.id for wb in db.query(Workbook.id).all()}
+            existing_layer_ids = {l.id for l in db.query(Layer.id).all()}
+        finally:
+            db.close()
 
-                # 检查文件是否已经在index中
-                if data_id not in self.index:
-                    safe_print(f"[DataService] 找到新文件: {file_path.name}")
+        # 扫描 xlsx 和 zip 文件
+        _scan_patterns = ["*.xlsx", "*.zip"]
+        for _pattern in _scan_patterns:
+            for file_path in settings.UPLOAD_DIR.glob(_pattern):
+                filename = file_path.stem
+                if "-" in filename and len(filename.split("-")) == 5:
+                    data_id = filename
 
-                    # 尝试确定文件类型
-                    try:
-                        xls = pd.ExcelFile(file_path, engine='calamine')
-                        sheet_names = xls.sheet_names
+                    if data_id not in self.index and data_id not in existing_ids and data_id not in existing_layer_ids:
+                        safe_print(f"[DataService] 找到未入库文件: {file_path.name}, 尝试迁移...")
+                        data_dir = settings.DATA_DIR / data_id
+                        if data_dir.exists() and ((data_dir / "original.xlsx").exists() or (data_dir / "original.zip").exists()):
+                            try:
+                                self._migrate_legacy_data(data_id)
+                            except Exception as e:
+                                safe_print(f"[DataService] 迁移失败 {file_path.name}: {e}")
 
-                        file_type = "default"
-                        if (
-                            "LTE Project Parameters" in sheet_names
-                            and "NR Project Parameters" in sheet_names
-                        ):
-                            file_type = "full_params"
-                        elif "LTE" in sheet_names or "NR" in sheet_names:
-                            file_type = "target_cells"
-
-                        # 添加到index中
-                        self.index[data_id] = {
-                            "id": data_id,
-                            "name": file_path.name,
-                            "type": "excel",
-                            "fileType": file_type,
-                            "size": file_path.stat().st_size,
-                            "uploadDate": datetime.now().isoformat(),
-                            "status": "ready",
-                            "metadata": {},
-                        }
-
-                        safe_print(
-                            f"[DataService] 添加文件到索引: {data_id} ({file_type})"
-                        )
-
-                    except Exception as e:
-                        safe_print(f"[DataService] 处理文件 {file_path.name} 失败: {e}")
-                        continue
-
-        # 保存索引
-        self._save_index()
         safe_print(f"[DataService] 扫描完成，共 {len(self.index)} 个文件在索引中")
 
     def parse_points(self, file_path: str) -> List[Dict[str, Any]]:
@@ -238,30 +490,62 @@ class DataService:
         return points
 
     def update_parameters(
-        self, full_param_id: str, current_param_id: str
+        self, full_param_id: str, current_param_id: str,
+        username: str = "", user_id: int = 1,
     ) -> Dict[str, Any]:
         """更新工参"""
         safe_print(
             f"[DataService] 开始更新工参: Full={full_param_id}, Current={current_param_id}"
         )
 
-        # 【关键修复】在reload模式下，uvicorn重启后内存索引可能与磁盘不一致
-        # 先强制从磁盘重新加载索引，确保使用最新数据
-        self.reload_index()
-        safe_print(
-            f"[DataService] 索引重新加载后，当前索引共 {len(self.index)} 条"
-        )
+        # 先尝试从内存索引查找
+        full_info = self.index.get(full_param_id)
+        current_info = self.index.get(current_param_id)
 
-        # 1. 获取文件路径 - 提供更详细的错误信息
+        # 如果内存索引未找到，尝试从磁盘重新加载
+        if not full_info or not current_info:
+            safe_print(f"[DataService] 内存索引未找到ID，尝试从磁盘重新加载索引...")
+            self.reload_index()
+            full_info = self.index.get(full_param_id)
+            current_info = self.index.get(current_param_id)
+
+        # 如果磁盘索引也未找到，尝试在文件系统中查找
         missing_ids = []
-        if full_param_id not in self.index:
-            missing_ids.append(f"全量工参({full_param_id[:8]}...)")
-        if current_param_id not in self.index:
-            missing_ids.append(f"现网工参({current_param_id[:8]}...)")
+        if not full_info:
+            full_dir = settings.DATA_DIR / full_param_id
+            if full_dir.exists() and (full_dir / "original.xlsx").exists():
+                safe_print(f"[DataService] 在文件系统中找到全量工参数据目录，重建索引...")
+                full_info = {
+                    "id": full_param_id,
+                    "name": full_dir.name,
+                    "type": "excel",
+                    "fileType": "full_params",
+                    "status": "ready",
+                }
+                self.index[full_param_id] = full_info
+        
+            else:
+                missing_ids.append(f"全量工参({full_param_id[:8]}...)")
+
+        if not current_info:
+            current_dir = settings.DATA_DIR / current_param_id
+            if current_dir.exists():
+                safe_print(f"[DataService] 在文件系统中找到现网工参数据目录，重建索引...")
+                current_info = {
+                    "id": current_param_id,
+                    "name": current_dir.name,
+                    "type": "map",
+                    "fileType": "current_params",
+                    "status": "ready",
+                }
+                self.index[current_param_id] = current_info
+        
+            else:
+                missing_ids.append(f"现网工参({current_param_id[:8]}...)")
 
         if missing_ids:
             safe_print(
-                f"[DataService] ❌ ID不在索引中! 当前索引共 {len(self.index)} 条"
+                f"[DataService] ❌ ID不在索引中且文件系统中未找到! 当前索引共 {len(self.index)} 条"
             )
             safe_print(
                 f"[DataService] 请求: full={full_param_id}, current={current_param_id}"
@@ -270,9 +554,6 @@ class DataService:
                 f"[DataService] 索引中的全部ID: {list(self.index.keys())}"
             )
             raise ValueError(f"找不到指定的文件ID: {', '.join(missing_ids)}")
-
-        full_info = self.index[full_param_id]
-        current_info = self.index[current_param_id]
 
         full_dir = settings.DATA_DIR / full_param_id
         current_dir = settings.DATA_DIR / current_param_id
@@ -329,8 +610,8 @@ class DataService:
         wb.save(output_excel_path)
         wb.close()
 
-        # 7. 解析新文件以生成 data.json (复用 upload_excel 的部分逻辑)
-        safe_print(f"[DataService] 解析新文件生成 data.json...")
+        # 7. 解析新文件并写入 SQLite
+        safe_print(f"[DataService] 解析新文件并写入 SQLite...")
         metadata = {}
         try:
             import json
@@ -350,8 +631,21 @@ class DataService:
                             len(s.get("sectors", [])) for s in sites
                         )
 
-            with open(new_data_dir / "data.json", "w", encoding="utf-8") as f:
-                json.dump(parsed_data, f, ensure_ascii=False, indent=2)
+            # 写入 SQLite（含备注）
+            user_id_val = full_info.get("user_id", 1)
+            now_str = datetime.now().strftime("%Y/%m/%d %H:%M")
+            remark = f"{now_str} {username} 更新" if username else f"{now_str} 更新"
+            self._save_to_sqlite(
+                data_id=new_data_id,
+                filename=new_filename,
+                file_type="full_params",
+                user_id=user_id_val,
+                parsed_data=parsed_data,
+                metadata=metadata,
+                file_path=output_excel_path,
+                original_path=full_info.get("originalPath"),
+                remark=remark,
+            )
 
         except Exception as e:
             safe_print(f"[DataService] 解析新文件失败: {e}")
@@ -416,8 +710,10 @@ class DataService:
             "status": "ready",
             "originalPath": full_info.get("originalPath"),  # 继承路径
             "metadata": metadata,
+            "user_id": full_info.get("user_id", 1),
+            "remark": remark,
         }
-        self._save_index()
+
         safe_print(f"[DataService] 新文件已注册到索引: {new_data_id}")
 
         # 10. 删除原始的全量工参和其他旧的全量工参，保持唯一性
@@ -439,6 +735,10 @@ class DataService:
                     safe_print(f"[DataService] 删除旧文件失败: {old_id}, 错误: {e}")
 
         safe_print(f"[DataService] 索引已更新，当前全量工参数量: 1")
+        self._save_index()  # 持久化工参更新结果
+
+        # 验证新文件存在
+        safe_print(f"[DataService] 验证新文件: data/{new_data_id}/original.xlsx 存在={output_excel_path.exists()}, uploads/{new_data_id}.xlsx 存在={new_upload_path.exists()}")
 
         return {
             "newFileId": new_data_id,
@@ -1256,12 +1556,201 @@ class DataService:
         safe_print(f"[DataService] 总共加载 {len(updates)} 条 {network_type} 现网数据")
         return updates
 
+    def _parse_current_params_dataframe(
+        self, df: pd.DataFrame, filename: str
+    ) -> Dict[str, List[Dict]]:
+        """将现网工参CSV DataFrame解析为站点/扇区数据结构
+
+        根据文件名模式自动判断网络类型:
+        - LTE_SDR_CellInfo_*/LTE_ITBBU_CellInfo_* → LTE
+        - NR_CellInfo_* → NR
+
+        Returns:
+            {network_type: [{id, name, longitude, latitude, sectors: [...]}]}
+        """
+        import re as _re
+        _fn_lower = filename.lower()
+        if _re.match(r'lte_sdr_cellinfo_|lte_itbbu_cellinfo_', _fn_lower):
+            network_type = "LTE"
+        elif _re.match(r'nr_cellinfo_', _fn_lower):
+            network_type = "NR"
+        else:
+            safe_print(f"[DataService] 无法从文件名判断网络类型: {filename}，跳过解析")
+            return {}
+
+        safe_print(f"[DataService] 解析现网工参CSV: {filename} → {network_type}, {len(df)} 行")
+
+        # 按基站分组
+        if network_type == "LTE":
+            site_id_col = "eNBId"
+            site_name_col = "eNBName"
+            sector_id_col = "cellLocalId"
+            sector_name_col = "cellName"
+            lon_col = "longitude"
+            lat_col = "latitude"
+            # 备选列名
+            for _col in ["eNBId", "eNodeBId"]:
+                if _col in df.columns:
+                    site_id_col = _col
+                    break
+            for _col in ["eNBName", "UserLabel", "eNodeBName"]:
+                if _col in df.columns:
+                    site_name_col = _col
+                    break
+            for _col in ["cellLocalId", "CellId", "cellId"]:
+                if _col in df.columns:
+                    sector_id_col = _col
+                    break
+            for _col in ["cellName", "CellName"]:
+                if _col in df.columns:
+                    sector_name_col = _col
+                    break
+            for _col in ["longitude", "Longitude", "LONGITUDE", "lon", "Lon"]:
+                if _col in df.columns:
+                    lon_col = _col
+                    break
+            for _col in ["latitude", "Latitude", "LATITUDE", "lat", "Lat"]:
+                if _col in df.columns:
+                    lat_col = _col
+                    break
+        else:  # NR
+            site_id_col = "gNBId"
+            site_name_col = "gNBName"
+            sector_id_col = "cellLocalId"
+            sector_name_col = "cellName"
+            lon_col = "longitude"
+            lat_col = "latitude"
+            for _col in ["gNBId", "gNodeBId"]:
+                if _col in df.columns:
+                    site_id_col = _col
+                    break
+            for _col in ["gNBName", "UserLabel", "dra_GNBName"]:
+                if _col in df.columns:
+                    site_name_col = _col
+                    break
+            for _col in ["cellLocalId", "CellId", "cellId"]:
+                if _col in df.columns:
+                    sector_id_col = _col
+                    break
+            for _col in ["cellName", "CellName"]:
+                if _col in df.columns:
+                    sector_name_col = _col
+                    break
+            for _col in ["longitude", "Longitude", "LONGITUDE", "lon", "Lon"]:
+                if _col in df.columns:
+                    lon_col = _col
+                    break
+            for _col in ["latitude", "Latitude", "LATITUDE", "lat", "Lat"]:
+                if _col in df.columns:
+                    lat_col = _col
+                    break
+
+        # 检查必要列
+        _required = [site_id_col, sector_id_col]
+        _missing = [c for c in _required if c not in df.columns]
+        if _missing:
+            safe_print(f"[DataService] CSV缺少必要列: {_missing}, 可用列: {list(df.columns)}")
+            return {}
+
+        # 按站点ID分组
+        sites_map: Dict[str, Dict] = {}
+        for _, row in df.iterrows():
+            try:
+                _site_id = str(int(float(str(row[site_id_col])))) if pd.notna(row[site_id_col]) else ""
+                _sector_id = str(int(float(str(row[sector_id_col])))) if pd.notna(row[sector_id_col]) else ""
+                if not _site_id or not _sector_id:
+                    continue
+
+                _site_name = str(row[site_name_col]) if site_name_col in df.columns and pd.notna(row[site_name_col]) else f"Site_{_site_id}"
+                _sector_name = str(row[sector_name_col]) if sector_name_col in df.columns and pd.notna(row[sector_name_col]) else f"Cell_{_site_id}_{_sector_id}"
+
+                _lon = float(row[lon_col]) if lon_col in df.columns and pd.notna(row[lon_col]) else 0.0
+                _lat = float(row[lat_col]) if lat_col in df.columns and pd.notna(row[lat_col]) else 0.0
+
+                # 获取其他字段
+                _azimuth = 0.0
+                for _ac in ["azimuth", "Azimuth", "antennaAzimuth"]:
+                    if _ac in df.columns and pd.notna(row[_ac]):
+                        try:
+                            _azimuth = float(row[_ac])
+                        except:
+                            pass
+                        break
+
+                _pci = None
+                for _pc in ["pci", "PCI", "physicalCellId"]:
+                    if _pc in df.columns and pd.notna(row[_pc]):
+                        try:
+                            _pci = int(float(str(row[_pc])))
+                        except:
+                            pass
+                        break
+
+                _tac = None
+                for _tc in ["tac", "TAC", "trackingAreaCode"]:
+                    if _tc in df.columns and pd.notna(row[_tc]):
+                        try:
+                            _tac = int(float(str(row[_tc])))
+                        except:
+                            _tac = str(row[_tc]).strip()
+                        break
+
+                _height = 30.0
+                for _hc in ["height", "Height", "antennaHeight"]:
+                    if _hc in df.columns and pd.notna(row[_hc]):
+                        try:
+                            _height = float(row[_hc])
+                        except:
+                            pass
+                        break
+
+                _freq = None
+                for _fc in ["frequency", "Frequency", "ssbFrequency", "earfcn"]:
+                    if _fc in df.columns and pd.notna(row[_fc]):
+                        _freq = row[_fc]
+                        break
+
+                if _site_id not in sites_map:
+                    sites_map[_site_id] = {
+                        "id": _site_id,
+                        "name": _site_name,
+                        "longitude": _lon,
+                        "latitude": _lat,
+                        "networkType": network_type,
+                        "sectors": [],
+                    }
+
+                _sector = {
+                    "id": f"{_site_id}_{_sector_id}",
+                    "siteId": _site_id,
+                    "name": _sector_name,
+                    "longitude": _lon,
+                    "latitude": _lat,
+                    "azimuth": _azimuth,
+                    "beamwidth": 65.0,
+                    "height": _height,
+                    "pci": _pci,
+                    "tac": _tac,
+                }
+                if _freq is not None:
+                    _sector["earfcn"] = _freq
+                    _sector["ssb_frequency"] = _freq
+
+                sites_map[_site_id]["sectors"].append(_sector)
+            except Exception as _e:
+                continue
+
+        result = {network_type: list(sites_map.values())}
+        safe_print(f"[DataService] 解析完成: {filename} → {network_type}: {len(sites_map)} 个基站")
+        return result
+
     async def upload_excel(
-        self, file: Optional[Any], original_path: Optional[str] = None
+        self, file: Optional[Any], original_path: Optional[str] = None,
+        user_id: int = 1,
     ) -> Dict[str, Any]:
         """上传并解析Excel工参文件（同步模式，小文件使用）"""
         # 初始化上传（保存文件）
-        result = await self.init_upload(file, original_path)
+        result = await self.init_upload(file, original_path, user_id=user_id)
         data_id = result["id"]
         # 同步处理（直接等待结果）
         try:
@@ -1271,20 +1760,22 @@ class DataService:
             safe_print(f"[DataService] 同步处理失败: {e}")
             self.index[data_id]["status"] = "error"
             self.index[data_id]["errorMessage"] = str(e)
-            self._save_index()
+    
             raise
 
     async def init_upload(
-        self, file: Optional[Any], original_path: Optional[str] = None
+        self, file: Optional[Any], original_path: Optional[str] = None,
+        user_id: int = 1, overwrite: bool = False,
     ) -> Dict[str, Any]:
-        """上传文件初始化：保存文件并创建处理中的索引条目（快速返回）"""
+        """上传文件初始化：保存文件并创建处理中的索引条目（快速返回）
+
+        Args:
+            overwrite: 如果为 True 且存在同名文件，删除旧文件后用新 ID 覆盖
+        """
         safe_print(f"[DataService] ===== 开始上传Excel文件（初始化）=====")
 
         if original_path:
             original_path = original_path.strip("\"'")
-
-        data_id = str(uuid.uuid4())
-        safe_print(f"[DataService] 生成ID: {data_id}")
 
         if original_path:
             filename = os.path.basename(original_path)
@@ -1298,6 +1789,32 @@ class DataService:
             raise ValueError("必须提供文件或文件路径")
 
         safe_print(f"[DataService] 文件名: {filename}")
+
+        # 检查是否有同名文件
+        existing_id = None
+        for exist_id, exist_info in self.index.items():
+            if exist_info.get("name") == filename and exist_info.get("type") == "excel":
+                existing_id = exist_id
+                break
+
+        if existing_id and not overwrite:
+            return {
+                "id": existing_id,
+                "name": filename,
+                "status": "duplicate",
+                "fileType": self.index[existing_id].get("fileType", "unknown"),
+            }
+
+        # 覆盖：删除旧文件
+        if existing_id and overwrite:
+            safe_print(f"[DataService] 覆盖同名文件: {filename} (旧ID: {existing_id})")
+            try:
+                self.delete_data(existing_id)
+            except Exception as e:
+                safe_print(f"[DataService] 删除旧文件失败 (非致命): {e}")
+
+        data_id = str(uuid.uuid4())
+        safe_print(f"[DataService] 生成ID: {data_id}")
 
         import re
         safe_filename = re.sub(r'[<>:"/\\|?*]', "_", filename)
@@ -1333,7 +1850,8 @@ class DataService:
         data_dir.mkdir(parents=True, exist_ok=True)
 
         try:
-            shutil.copy(file_path, data_dir / "original.xlsx")
+            # 保留原始扩展名（xlsx/xls/csv/zip等），避免硬编码为 .xlsx
+            shutil.copy(file_path, data_dir / f"original{ext}")
         except Exception as e:
             safe_print(f"[DataService] 保存原始文件失败: {e}")
 
@@ -1347,9 +1865,11 @@ class DataService:
             "originalPath": original_path,
             "uploadDate": datetime.now().isoformat(),
             "status": "processing",
+            "user_id": user_id,
         }
-        self._save_index()
+
         safe_print(f"[DataService] 已创建处理中索引条目: {data_id}")
+        self._save_index()  # 持久化处理中状态
 
         return {
             "id": data_id,
@@ -1383,19 +1903,173 @@ class DataService:
             safe_print(f"[DataService] 文件不存在: {data_id}")
             self.index[data_id]["status"] = "error"
             self.index[data_id]["errorMessage"] = "上传文件不存在，可能是上传过程中服务器重启导致文件丢失"
-            self._save_index()
+    
             return
 
-        import json, time as _time
+        import json, time as _time, tempfile as _tempfile, zipfile as _zipfile
+        _zip_extract_dir = None  # ZIP解压临时目录，需要在finally中清理
         try:
             _t_start = _time.time()
 
-            # 读取Excel
-            if filename.lower().endswith(".csv"):
+            # === ZIP 解压处理 ===
+            if file_path.suffix.lower() in ['.zip']:
+                safe_print(f"[DataService] 检测到ZIP文件，开始解压...")
+                data_dir = settings.DATA_DIR / data_id
+                data_dir.mkdir(parents=True, exist_ok=True)
+                try:
+                    with _zipfile.ZipFile(file_path, 'r') as zf:
+                        zf.extractall(data_dir)
+                    safe_print(f"[DataService] ZIP已解压到: {data_dir}")
+                except Exception as e:
+                    raise ValueError(f"ZIP文件解压失败: {str(e)}")
+
+                # 在解压后的文件中查找 Excel/CSV/TXT
+                _found_excel = None
+                _found_csv = None
+                _found_txt = None
+                _found_mapinfo_tabs = []  # 记录找到的 MapInfo TAB 文件
+                for _f in data_dir.rglob('*'):
+                    if _f.is_file() and not _f.name.startswith('~$'):
+                        _ext_lower = _f.suffix.lower()
+                        if _ext_lower in ['.xlsx', '.xls'] and not _found_excel:
+                            _found_excel = _f
+                        elif _ext_lower == '.csv' and not _found_csv:
+                            _found_csv = _f
+                        elif _ext_lower in ['.txt'] and not _found_txt:
+                            _found_txt = _f
+                        elif _ext_lower == '.tab':
+                            # 记录 MapInfo TAB 文件以便后续注册为图层
+                            _found_mapinfo_tabs.append(_f)
+
+                _candidate = _found_excel or _found_csv or _found_txt
+                if _candidate:
+                    safe_print(f"[DataService] ZIP中找到数据文件: {_candidate.name}")
+                    file_path = _candidate
+                elif _found_mapinfo_tabs:
+                    # ZIP 中只有 MapInfo TAB 文件，没有 Excel/CSV
+                    safe_print(f"[DataService] ZIP中找到 {len(_found_mapinfo_tabs)} 个 MapInfo TAB 文件，尝试解析...")
+                    # 让 upload_map 逻辑处理（触发 MapInfo 解析）
+                    # 设定 file_path 为第一个 TAB 文件，并标记为 mapinfo 类型
+                    file_path = _found_mapinfo_tabs[0]
+                    # 此 ZIP 将被视为 MapInfo 图层上传，直接解析图层并返回
+                    from app.services.mapinfo_service import parse_mapinfo_files
+                    _mapinfo_layers = parse_mapinfo_files(data_dir, parent_id=data_id)
+                    layers_json_path = data_dir / "layers.json"
+                    with open(layers_json_path, "w", encoding="utf-8") as _lf:
+                        json.dump(_mapinfo_layers, _lf, ensure_ascii=False, indent=2)
+                    # 更新索引为 map 类型
+                    self.index[data_id].update({
+                        "type": "map",
+                        "subType": "mapinfo",
+                        "fileType": "tac_layer",
+                        "status": "ready",
+                        "metadata": {
+                            "fileCount": len(list(data_dir.rglob('*'))),
+                            "layerCount": len(_mapinfo_layers),
+                            "layers": _mapinfo_layers,
+                        },
+                    })
+                    safe_print(f"[DataService] MapInfo 图层已注册: {len(_mapinfo_layers)} 个图层")
+                    self._save_index()  # 持久化 MapInfo 图层索引
+                    return  # 早返回，跳过后续 Excel 处理逻辑
+                else:
+                    raise ValueError("ZIP文件中未找到有效的数据文件（支持 Excel/CSV/TXT/MapInfo TAB）")
+
+            # 检测是否为现网工参文件（LTE_SDR_CellInfo_*/NR_CellInfo_* CSV）
+            _current_params_patterns = [
+                r'LTE_SDR_CellInfo_.*\.csv',
+                r'LTE_ITBBU_CellInfo_.*\.csv',
+                r'NR_CellInfo_.*\.csv',
+            ]
+            _is_current_params = False
+            # 检查候选文件名是否匹配
+            _check_name = file_path.name if file_path else filename
+            for _pat in _current_params_patterns:
+                if re.match(_pat, _check_name, re.IGNORECASE):
+                    _is_current_params = True
+                    safe_print(f"[DataService] 文件名匹配现网工参模式: {_check_name}")
+                    break
+            # 如果候选文件不匹配，扫描解压目录中的所有文件（处理ZIP内混合内容的情况）
+            if not _is_current_params:
+                _extract_dir = settings.DATA_DIR / data_id
+                if _extract_dir.exists():
+                    for _f in _extract_dir.rglob('*'):
+                        if _f.is_file():
+                            for _pat in _current_params_patterns:
+                                if re.match(_pat, _f.name, re.IGNORECASE):
+                                    _is_current_params = True
+                                    safe_print(f"[DataService] 目录扫描检测到现网工参文件: {_f.name}")
+                                    break
+                        if _is_current_params:
+                            break
+
+            if _is_current_params:
+                safe_print(f"[DataService] 现网工参文件，解析CSV并保存到 data.json")
+                # 确保CSV文件以原始文件名存在于数据目录中
+                _data_dir = settings.DATA_DIR / data_id
+                if file_path.suffix.lower() == '.csv' and file_path.parent != _data_dir:
+                    _target_csv = _data_dir / file_path.name
+                    if not _target_csv.exists():
+                        shutil.copy2(file_path, _target_csv)
+                        safe_print(f"[DataService] 保留原始CSV文件名: {_target_csv.name}")
+                # 如果是ZIP且还没解压，先解压
+                if file_path.suffix.lower() in ['.zip'] and not (_data_dir / file_path.with_suffix('').name).exists():
+                    import zipfile as _zf2
+                    _extract_dir2 = _data_dir
+                    _extract_dir2.mkdir(parents=True, exist_ok=True)
+                    with _zf2.ZipFile(file_path, 'r') as zf:
+                        zf.extractall(_extract_dir2)
+                    safe_print(f"[DataService] 已解压现网工参ZIP到: {_extract_dir2}")
+
+                # 解析现网工参CSV文件并生成 data.json（传统文件处理逻辑）
+                parsed_data = {}
+                metadata = {"isCurrentParams": True}
+                _csv_files = list(_data_dir.glob("*.csv"))
+                safe_print(f"[DataService] 找到 {len(_csv_files)} 个CSV文件待解析")
+                for _csv_f in _csv_files:
+                    try:
+                        _df = pd.read_csv(_csv_f, encoding="gbk")
+                    except:
+                        try:
+                            _df = pd.read_csv(_csv_f, encoding="utf-8")
+                        except Exception as _e:
+                            safe_print(f"[DataService] 跳过无法解析的CSV: {_csv_f.name}: {_e}")
+                            continue
+                    _df.columns = [c.strip() for c in _df.columns]
+                    # 解析为站点/扇区数据
+                    _sites = self._parse_current_params_dataframe(_df, _csv_f.name)
+                    for _nt, _site_list in _sites.items():
+                        if _nt not in parsed_data:
+                            parsed_data[_nt] = []
+                        parsed_data[_nt].extend(_site_list)
+                        metadata[f"{_nt}SiteCount"] = metadata.get(f"{_nt}SiteCount", 0) + len(_site_list)
+                        metadata[f"{_nt}SectorCount"] = metadata.get(f"{_nt}SectorCount", 0) + sum(
+                            len(s.get("sectors", [])) for s in _site_list
+                        )
+                safe_print(f"[DataService] 现网工参解析完成: { {k: len(v) for k,v in parsed_data.items()} }")
+                file_type = "current_params"
+
+                # 保存到 data.json（传统文件存储，供工参更新使用）
+                with open(_data_dir / "data.json", "w", encoding="utf-8") as _dj:
+                    json.dump(parsed_data, _dj, ensure_ascii=False, indent=2)
+                safe_print(f"[DataService] 现网工参 data.json 已保存")
+            elif filename.lower().endswith(".csv") or file_path.suffix.lower() == '.csv':
                 try:
                     df = pd.read_csv(file_path, encoding="utf-8")
                 except:
                     df = pd.read_csv(file_path, encoding="gbk")
+                parsed_data = {"default": self._parse_dataframe(df, filename, "unknown")}
+                metadata = {"siteCount": len(parsed_data["default"])}
+                file_type = "default"
+            elif file_path.suffix.lower() in ['.txt', '.tab']:
+                safe_print(f"[DataService] 从ZIP中读取TXT/TAB文件: {file_path.name}")
+                for sep in [",", "\t", ";", " ", "|"]:
+                    try:
+                        df = pd.read_csv(file_path, sep=sep, encoding="gbk")
+                        if len(df.columns) > 1:
+                            break
+                    except:
+                        continue
                 parsed_data = {"default": self._parse_dataframe(df, filename, "unknown")}
                 metadata = {"siteCount": len(parsed_data["default"])}
                 file_type = "default"
@@ -1460,15 +2134,67 @@ class DataService:
                 finally:
                     xls.close()
 
-            # 检查解析结果
-            if not parsed_data:
+            # 检查解析结果（current_params 不需要解析，跳过此检查）
+            if file_type != "current_params" and not parsed_data:
                 raise ValueError("解析后数据为空，请检查Excel文件是否包含有效的LTE或NR数据")
 
-            # 保存 data.json
-            data_dir = settings.DATA_DIR / data_id
-            with open(data_dir / "data.json", "w", encoding="utf-8") as f:
-                json.dump(parsed_data, f, ensure_ascii=False, indent=2)
-            safe_print(f"[DataService] 数据已保存到 data.json")
+            # === ZIP混合内容处理：注册同目录下的 MapInfo TAB 文件为图层 ===
+            # 当 ZIP 同时包含工参 CSV 和 TAC 图层 TAB 文件时，
+            # 将 TAB 文件注册到 SQLite Layer 表，确保 TAC 核查/规划能搜索到
+            if file_path.suffix.lower() in ['.csv', '.xlsx', '.xls']:
+                _extract_data_dir = settings.DATA_DIR / data_id
+                if _extract_data_dir.exists():
+                    for _f in _extract_data_dir.rglob('*.tab'):
+                        if _f.is_file() and not _f.name.startswith('~$'):
+                            _f_lower = _f.name.lower()
+                            # 检查该 TAB 文件是否已入库（避免重复注册）
+                            _db = SessionLocal()
+                            try:
+                                _existing_layer = _db.query(Layer).filter(
+                                    Layer.file_path == str(_f)
+                                ).first()
+                                if not _existing_layer:
+                                    # 尝试解析 MapInfo 图层
+                                    try:
+                                        from app.services.mapinfo_service import parse_mapinfo_files
+                                        _map_layers = parse_mapinfo_files(_f, parent_id=data_id)
+                                        safe_print(f"[DataService] ZIP混合内容: 已注册 MapInfo 图层 {_f.name}, 共 {len(_map_layers)} 个图层")
+                                    except Exception as _me:
+                                        safe_print(f"[DataService] ZIP混合内容: 注册 MapInfo 图层失败 {_f.name}: {_me}")
+                            finally:
+                                _db.close()
+                    # 同时检查 .mif 文件
+                    for _f in _extract_data_dir.rglob('*.mif'):
+                        if _f.is_file() and not _f.name.startswith('~$'):
+                            _db = SessionLocal()
+                            try:
+                                _existing_layer = _db.query(Layer).filter(
+                                    Layer.file_path == str(_f)
+                                ).first()
+                                if not _existing_layer:
+                                    try:
+                                        from app.services.mapinfo_service import parse_mapinfo_files
+                                        _map_layers = parse_mapinfo_files(_f, parent_id=data_id)
+                                        safe_print(f"[DataService] ZIP混合内容: 已注册 MapInfo 图层 {_f.name}, 共 {len(_map_layers)} 个图层")
+                                    except Exception as _me:
+                                        safe_print(f"[DataService] ZIP混合内容: 注册 MapInfo 图层失败 {_f.name}: {_me}")
+                            finally:
+                                _db.close()
+            # === 结束 ZIP 混合内容处理 ===
+
+            # 写入 SQLite（数据持久化）
+            # current_params 只写 Workbook 元数据行，不写 Sites/Sectors（parsed_data 为空，循环自动跳过）
+            user_id = data_info.get("user_id", 1)
+            self._save_to_sqlite(
+                data_id=data_id,
+                filename=data_info.get("name", filename),
+                file_type=file_type,
+                user_id=user_id,
+                parsed_data=parsed_data,
+                metadata=metadata,
+                file_path=file_path,
+                original_path=data_info.get("originalPath"),
+            )
 
             _t_end = _time.time()
             safe_print(f"[DataService] 后台处理完成: {data_id}, 耗时: {_t_end-_t_start:.1f}s")
@@ -1479,8 +2205,9 @@ class DataService:
                 "status": "ready",
                 "metadata": metadata,
             })
-            self._save_index()
+
             safe_print(f"[DataService] 索引已更新为 ready")
+            self._save_index()  # 持久化索引到 index.json
 
         except Exception as e:
             safe_print(f"[DataService] 后台处理失败: {type(e).__name__}: {e}")
@@ -1488,14 +2215,113 @@ class DataService:
             traceback.print_exc()
             self.index[data_id]["status"] = "error"
             self.index[data_id]["errorMessage"] = str(e)
-            self._save_index()
+            self._save_index()  # 持久化错误状态
+    
+
+    def _save_to_sqlite(
+        self,
+        data_id: str,
+        filename: str,
+        file_type: str,
+        user_id: int,
+        parsed_data: Dict[str, List],
+        metadata: Dict[str, Any],
+        file_path: Path,
+        original_path: Optional[str] = None,
+        remark: Optional[str] = None,
+    ):
+        """将工参数据写入 SQLite（支持 upsert，避免重复写入报错）"""
+        db = SessionLocal()
+        try:
+            # 1) 写入 Workbook（使用 merge 避免重复主键报错）
+            network_types = list(parsed_data.keys())
+            _existing_wb = db.query(Workbook).filter(Workbook.id == data_id).first()
+            if _existing_wb:
+                # 更新已有记录
+                _existing_wb.name = filename
+                _existing_wb.file_type = file_type
+                _existing_wb.network_types = json.dumps(network_types) if network_types else None
+                _existing_wb.status = "ready"
+                _existing_wb.size = file_path.stat().st_size if file_path.exists() else None
+                _existing_wb.original_path = original_path
+                _existing_wb.metadata_json = json.dumps(metadata, ensure_ascii=False) if metadata else None
+                _existing_wb.remark = remark
+                _existing_wb.created_at = datetime.now().isoformat()
+                safe_print(f"[DataService] 已更新 Workbook 记录: {data_id}")
+            else:
+                wb = Workbook(
+                    id=data_id,
+                    user_id=user_id,
+                    name=filename,
+                    file_type=file_type,
+                    network_types=json.dumps(network_types) if network_types else None,
+                    status="ready",
+                    size=file_path.stat().st_size if file_path.exists() else None,
+                    original_path=original_path,
+                    metadata_json=json.dumps(metadata, ensure_ascii=False) if metadata else None,
+                    remark=remark,
+                    created_at=datetime.now().isoformat(),
+                )
+                db.add(wb)
+            db.flush()  # 确保障 Workbook 行已写入，满足 Sites 外键约束
+
+            # 2) 写入 Sites + Sectors
+            for network_type, sites in parsed_data.items():
+                for site_data in sites:
+                    site = Site(
+                        workbook_id=data_id,
+                        user_id=user_id,
+                        site_id=str(site_data.get("id", "")),
+                        name=site_data.get("name", "Unknown"),
+                        longitude=site_data.get("longitude", 0.0),
+                        latitude=site_data.get("latitude", 0.0),
+                        network_type=network_type,
+                        managed_element_id=site_data.get("managedElementId"),
+                        mcc=site_data.get("mcc"),
+                        mnc=site_data.get("mnc"),
+                    )
+                    db.add(site)
+                    db.flush()  # 获取 site.id
+
+                    # 批量构建扇区 dict
+                    sector_dicts = []
+                    for sec in site_data.get("sectors", []):
+                        sector_dicts.append({
+                            "site_id_fk": site.id,
+                            "workbook_id": data_id,
+                            "user_id": user_id,
+                            "sector_id": str(sec.get("id", "")),
+                            "name": sec.get("name", ""),
+                            "longitude": sec.get("longitude", 0.0),
+                            "latitude": sec.get("latitude", 0.0),
+                            "azimuth": sec.get("azimuth", 0.0),
+                            "beamwidth": sec.get("beamwidth", 65.0),
+                            "height": sec.get("height", 30.0),
+                            "pci": sec.get("pci"),
+                            "tac": sec.get("tac"),
+                            "frequency": sec.get("frequency") or sec.get("earfcn") or sec.get("ssb_frequency"),
+                            "cell_cover_type": sec.get("cell_cover_type", 1),
+                            "is_shared": sec.get("is_shared"),
+                            "first_group": sec.get("first_group"),
+                            "mcc": sec.get("mcc"),
+                            "mnc": sec.get("mnc"),
+                        })
+                    if sector_dicts:
+                        db.bulk_insert_mappings(Sector, sector_dicts)
+
+            db.commit()
+        except Exception as e:
+            db.rollback()
+            safe_print(f"[DataService] SQLite 写入失败 (非致命): {e}")
+        finally:
+            db.close()
 
     def _classify_file(self, filename: str, sheet_names: list) -> str:
         """根据文件名和sheet名称分类文件类型"""
         filename_lower = filename.lower()
 
-        # 待规划小区文件特征 - 以"cell-tree-export"开头
-        if filename_lower.startswith("cell-tree-export"):
+        # 待规划小区文件特征 - 以"cell-tree-export"或"cell-tree"开头
+        if filename_lower.startswith("cell-tree-export") or filename_lower.startswith("cell-tree"):
             return "target_cells"
 
         # 全量工参特征检测（提前定义，供后续逻辑使用）
@@ -2783,8 +3609,8 @@ class DataService:
             with zipfile.ZipFile(file_path, "r") as zip_ref:
                 zip_ref.extractall(data_dir)
 
-            # 检查解压后的文件是否为 MapInfo
-            extracted_files = list(data_dir.glob("*"))
+            # 检查解压后的文件是否为 MapInfo（递归搜索子目录）
+            extracted_files = list(data_dir.rglob("*"))
             has_mapinfo = any(
                 f.suffix.lower() in [".mif", ".tab"]
                 for f in extracted_files
@@ -2797,7 +3623,7 @@ class DataService:
                 import json
 
                 try:
-                    layers = parse_mapinfo_files(data_dir)
+                    layers = parse_mapinfo_files(data_dir, parent_id=data_id)
                 except ImportError as e:
                     # 缺少 geopandas 库
                     print(f"[DataService] ❌ 缺少必要的地理数据处理库")
@@ -2825,8 +3651,8 @@ class DataService:
                             "errorDetail": str(e),
                         },
                     }
-                    # 保存索引
-                    self._save_index()
+                    self._save_index()  # 持久化错误状态
+
                     raise ValueError(
                         f"MapInfo 文件解析失败：缺少必要的地理数据处理库。\n"
                         f"请运行以下命令安装依赖：\n"
@@ -2860,8 +3686,8 @@ class DataService:
                             "error": str(e),
                         },
                     }
-                    # 保存索引
-                    self._save_index()
+                    self._save_index()  # 持久化错误状态
+
                     raise ValueError(f"MapInfo 文件解析失败: {e}")
 
                 # 保存图层元数据
@@ -2869,6 +3695,10 @@ class DataService:
                     json.dump(layers, f, ensure_ascii=False, indent=2)
 
                 print(f"[DataService] 解析到 {len(layers)} 个 MapInfo 图层")
+                if len(layers) == 0:
+                    print(f"[DataService] ⚠️ 警告: 检测到 MapInfo 文件但未能解析任何图层！")
+                    print(f"[DataService] 请检查: 1) geopandas 是否已安装 2) .tab 文件配套的 .dat 文件是否存在")
+                    print(f"[DataService] 目录中的文件: {[f.name for f in extracted_files if f.is_file()]}")
                 for layer in layers:
                     print(
                         f"  - {layer['name']} ({layer['type']}): {layer['feature_count']} 个要素"
@@ -3060,7 +3890,7 @@ class DataService:
             from app.services.mapinfo_service import parse_mapinfo_files
 
             try:
-                layers = parse_mapinfo_files(target_file)
+                layers = parse_mapinfo_files(target_file, parent_id=data_id)
             except ImportError as e:
                 # 缺少 geopandas 库
                 print(f"[DataService] ❌ 缺少必要的地理数据处理库")
@@ -3088,7 +3918,7 @@ class DataService:
                         "errorDetail": str(e),
                     },
                 }
-                self._save_index()
+        
                 raise ValueError(
                     f"MapInfo 文件解析失败：缺少必要的地理数据处理库。\n"
                     f"请运行以下命令安装依赖：\n"
@@ -3155,8 +3985,9 @@ class DataService:
                 "metadata": {"fileCount": 1},
             }
 
-        self._save_index()
 
+
+        self._save_index()  # 持久化地图上传索引
         return {"id": data_id, "name": filename, "status": "ready"}
 
     def list_data(self, page: int = 1, page_size: int = 50) -> List[DataItem]:
@@ -3247,7 +4078,7 @@ class DataService:
         safe_print(f"[DataService] 数据已缓存: {cache_key}")
 
     def get_data(self, data_id: str) -> Optional[Dict]:
-        """获取数据详情（带缓存）"""
+        """获取数据详情（优先 SQLite，回退到遗留 data.json）"""
         if data_id not in self.index:
             return None
 
@@ -3263,51 +4094,32 @@ class DataService:
                 "errorMessage": data_info.get("errorMessage", "文件处理失败，详情未知"),
             }
 
-        data_dir = settings.DATA_DIR / data_id
-
         if data_info["type"] == "excel":
             import json
 
-            # 尝试多个可能的文件名
-            possible_files = [
-                "data.json",      # 标准格式（合并的 LTE+NR）
-                "default.json",  # 地理化数据格式
-                "LTE.json",      # LTE 分表
-                "NR.json"        # NR 分表
-            ]
+            # 主路径：读取 data.json 文件（传统文件处理逻辑）
+            data_file = settings.DATA_DIR / data_id / "data.json"
+            if data_file.exists():
+                with open(data_file, "r", encoding="utf-8") as f:
+                    return json.load(f)
 
-            for filename in possible_files:
-                data_file = data_dir / filename
+            # 回退：地理化数据 default.json 文件
+            default_file = settings.DATA_DIR / data_id / "default.json"
+            if default_file.exists():
+                with open(default_file, "r", encoding="utf-8") as f:
+                    return json.load(f)
 
-                if data_file.exists():
-                    # 尝试从缓存读取
-                    cached_data = self._get_cached_data(data_id, filename, data_file)
-                    if cached_data is not None:
-                        return cached_data
-
-                    # 缓存未命中，读取文件
-                    with open(data_file, "r", encoding="utf-8") as f:
-                        data = json.load(f)
-
-                    # 如果是分表格式（LTE.json 或 NR.json），包装成标准格式
-                    if filename in ["LTE.json", "NR.json"]:
-                        # 确保键是大写的，与_network_type.value保持一致
-                        key = filename.replace(".json", "").upper()
-                        result = {key: data}
-                        self._set_cached_data(data_id, filename, data_file, result)
-                        return result
-
-                    # 缓存并返回数据
-                    self._set_cached_data(data_id, filename, data_file, data)
-                    return data
+            # 最后回退：SQLite 遗留数据
+            result = self.get_data_from_db(data_id)
+            if result is not None:
+                return result
 
             return None
         else:
-            # 地图文件返回文件列表
-            files = list(data_dir.glob("*")) if data_dir.exists() else []
-            return {"files": [f.name for f in files]}
-
-        return None
+            # 地图文件返回文件列表（递归搜索子目录）
+            data_dir = settings.DATA_DIR / data_id
+            files = list(data_dir.rglob("*")) if data_dir.exists() else []
+            return {"files": [str(f.relative_to(data_dir)) for f in files if f.is_file()]}
 
     def clear_cache(self, data_id: Optional[str] = None):
         """清除缓存"""
@@ -3406,7 +4218,23 @@ class DataService:
                         # 旧文件删除失败不记录（可能不存在）
                         pass
 
-        # 4. 无论文件删除是否成功，都从索引中移除（保持索引一致性）
+        # 4. 清理 SQLite 中的数据
+        db = SessionLocal()
+        try:
+            deleted_sectors = db.query(Sector).filter(Sector.workbook_id == data_id).delete()
+            deleted_sites = db.query(Site).filter(Site.workbook_id == data_id).delete()
+            deleted_wb = db.query(Workbook).filter(Workbook.id == data_id).delete()
+            deleted_geo = db.query(GeoFile).filter(GeoFile.id == data_id).delete()
+            deleted_layer = db.query(Layer).filter(Layer.id == data_id).delete()
+            db.commit()
+            safe_print(f"[DataService] SQLite 清理完成: workbook={deleted_wb}, sites={deleted_sites}, sectors={deleted_sectors}, geo={deleted_geo}, layer={deleted_layer}")
+        except Exception as e:
+            db.rollback()
+            safe_print(f"[DataService] SQLite 清理失败 (非致命): {e}")
+        finally:
+            db.close()
+
+        # 5. 无论文件删除是否成功，都从索引中移除（保持索引一致性）
         # 但如果有严重错误，需要记录警告
         if deletion_errors and not force:
             # 非强制模式下，如果删除文件失败，仍然从索引中移除
@@ -3415,16 +4243,17 @@ class DataService:
             for error in deletion_errors:
                 safe_print(f"  - {error}")
 
-        # 5. 更新索引
+        # 6. 更新索引
         del self.index[data_id]
-        self._save_index()
+        self._save_index()  # 持久化删除操作
+
         safe_print(f"[DataService] 数据 {data_id} 已从索引中移除")
 
-        # 6. 如果是强制删除且有错误，仍然返回成功（因为索引已更新）
+        # 7. 如果是强制删除且有错误，仍然返回成功（因为索引已更新）
         return True
 
     def preview_data(self, data_id: str, rows: int = 100) -> Optional[Dict]:
-        """预览数据"""
+        """预览数据（优先 SQLite，回退到 Excel 文件读取）"""
         if data_id not in self.index:
             return None
 
@@ -3432,6 +4261,58 @@ class DataService:
         if data_info["type"] != "excel":
             return None
 
+        # 优先从 SQLite 查询（速度快）
+        try:
+            db = SessionLocal()
+            try:
+                wb = db.query(Workbook).filter(Workbook.id == data_id).first()
+                if wb is not None:
+                    sectors = db.query(Sector).filter(
+                        Sector.workbook_id == data_id
+                    ).limit(rows).all()
+
+                    if sectors:
+                        site_ids = list(set(s.site_id_fk for s in sectors if s.site_id_fk))
+                        sites_map = {}
+                        if site_ids:
+                            site_objs = db.query(Site).filter(Site.id.in_(site_ids)).all()
+                            sites_map = {s.id: s for s in site_objs}
+
+                        sector_rows = []
+                        for s in sectors:
+                            site = sites_map.get(s.site_id_fk)
+                            sector_rows.append({
+                                "network_type": site.network_type if site else "",
+                                "site_id": site.site_id if site else "",
+                                "site_name": site.name if site else "",
+                                "sector_id": s.sector_id,
+                                "sector_name": s.name or "",
+                                "pci": s.pci,
+                                "tac": s.tac,
+                                "azimuth": s.azimuth,
+                                "frequency": s.frequency,
+                                "longitude": s.longitude,
+                                "latitude": s.latitude,
+                                "height": s.height,
+                                "cell_cover_type": s.cell_cover_type,
+                            })
+
+                        total_count = db.query(Sector).filter(
+                            Sector.workbook_id == data_id
+                        ).count()
+
+                        if sector_rows:
+                            return {
+                                "columns": list(sector_rows[0].keys()) if sector_rows else [],
+                                "rows": sector_rows,
+                                "totalRows": total_count,
+                            }
+            finally:
+                db.close()
+        except Exception as e:
+            safe_print(f"[DataService] SQLite 预览失败，回退到 Excel: {e}")
+
+        # 回退：读取 Excel 文件
         data_dir = settings.DATA_DIR / data_id
         original_file = data_dir / "original.xlsx"
 
@@ -3445,8 +4326,265 @@ class DataService:
 
         return None
 
+    def get_workbooks_from_db(self, user_id: int = 1, is_admin: bool = False) -> List[Dict]:
+        """从 SQLite 获取所有数据列表（工参 + 地理数据 + 图层，所有用户共享）"""
+        db = SessionLocal()
+        try:
+            results = []
+
+            # 1) Workbooks (Excel 工参)
+            for wb in db.query(Workbook).order_by(Workbook.created_at.desc()).all():
+                results.append({
+                    "id": wb.id,
+                    "user_id": wb.user_id,
+                    "name": wb.name,
+                    "type": "excel",
+                    "fileType": wb.file_type,
+                    "size": wb.size,
+                    "status": wb.status,
+                    "uploadDate": wb.created_at,
+                    "remark": wb.remark,
+                    "metadata": json.loads(wb.metadata_json) if wb.metadata_json else {},
+                    "networkTypes": json.loads(wb.network_types) if wb.network_types else [],
+                })
+
+            # 2) GeoFiles (地理化数据)
+            for gf in db.query(GeoFile).order_by(GeoFile.created_at.desc()).all():
+                results.append({
+                    "id": gf.id,
+                    "user_id": gf.user_id,
+                    "name": gf.filename,
+                    "type": "excel",
+                    "fileType": "geo_data",
+                    "geometryType": gf.geometry_type,
+                    "size": gf.file_size,
+                    "status": "ready",
+                    "uploadDate": gf.created_at,
+                    "metadata": {"pointCount": gf.point_count},
+                })
+
+            # 3) Layers (MapInfo 图层)
+            for layer in db.query(Layer).order_by(Layer.created_at.desc()).all():
+                results.append({
+                    "id": layer.id,
+                    "user_id": layer.user_id,
+                    "name": layer.name,
+                    "type": "map",
+                    "subType": "mapinfo",
+                    "size": layer.file_size,
+                    "status": "ready",
+                    "uploadDate": layer.created_at,
+                    "metadata": {
+                        "layerCount": 1,
+                        "layers": [{
+                            "id": layer.id,
+                            "name": layer.name,
+                            "type": layer.geometry_type,
+                            "feature_count": layer.feature_count,
+                        }],
+                        "fileCount": 1,
+                    },
+                })
+
+            # 按上传日期排序（最新在前）
+            results.sort(key=lambda x: x.get("uploadDate", ""), reverse=True)
+            return results
+        finally:
+            db.close()
+
+    def _migrate_legacy_data(self, data_id: str, user_id: int = 1) -> bool:
+        """将遗留 data.json 中的数据迁移到 SQLite（可独立于 self.index 工作）"""
+        import json
+
+        data_dir = settings.DATA_DIR / data_id
+        data_json = data_dir / "data.json"
+
+        if not data_json.exists():
+            return False
+
+        with open(data_json, "r", encoding="utf-8") as f:
+            parsed_data = json.load(f)
+
+        # 从 self.index 或文件系统获取元数据
+        if data_id in self.index:
+            data_info = self.index[data_id]
+            filename = data_info.get("name", "legacy.xlsx")
+            file_type = data_info.get("fileType", "default")
+            metadata = data_info.get("metadata", {})
+            original_path = data_info.get("original_path") or data_info.get("originalPath")
+        else:
+            filename = f"{data_id}.xlsx"
+            file_type = "full_params" if "LTE" in parsed_data or "NR" in parsed_data else "default"
+            metadata = {}
+            for net in parsed_data:
+                sites = parsed_data[net]
+                if isinstance(sites, list):
+                    metadata[f"{net}SiteCount"] = len(sites)
+                    metadata[f"{net}SectorCount"] = sum(len(s.get("sectors", [])) for s in sites)
+            original_path = None
+
+        file_path = settings.UPLOAD_DIR / f"{data_id}.xlsx"
+        if not file_path.exists():
+            file_path = data_dir / "original.xlsx"
+
+        self._save_to_sqlite(
+            data_id=data_id,
+            filename=filename,
+            file_type=file_type,
+            user_id=user_id,
+            parsed_data=parsed_data,
+            metadata=metadata,
+            file_path=file_path,
+            original_path=original_path,
+        )
+
+        # 将迁移后的条目加入内存索引
+        self.index[data_id] = {
+            "id": data_id,
+            "name": filename,
+            "type": "excel",
+            "fileType": file_type,
+            "size": file_path.stat().st_size if file_path.exists() else 0,
+            "uploadDate": datetime.now().isoformat(),
+            "status": "ready",
+            "metadata": metadata,
+            "user_id": user_id,
+            "originalPath": original_path,
+        }
+        self._save_index()  # 持久化迁移条目
+        return True
+
+    def get_sectors_preview_from_db(
+        self, workbook_id: str, user_id: int = 1, page: int = 1, page_size: int = 100,
+        network_type: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """从 SQLite 获取扇区预览（分页，所有用户共享数据）"""
+        db = SessionLocal()
+        try:
+            exists = db.query(Workbook).filter(Workbook.id == workbook_id).first()
+            if not exists:
+                # 旧数据：先迁移
+                success = self._migrate_legacy_data(workbook_id, user_id)
+                if not success:
+                    raise ValueError(f"工参不存在: {workbook_id}")
+
+            query = db.query(Sector).filter(
+                Sector.workbook_id == workbook_id,
+            )
+            if network_type:
+                query = query.join(Site, Sector.site_id_fk == Site.id).filter(
+                    Site.network_type == network_type
+                )
+
+            total = query.count()
+            sectors = query.offset((page - 1) * page_size).limit(page_size).all()
+
+            site_ids = list(set(s.site_id_fk for s in sectors if s.site_id_fk))
+            sites_map = {}
+            if site_ids:
+                site_objs = db.query(Site).filter(Site.id.in_(site_ids)).all()
+                sites_map = {s.id: s for s in site_objs}
+
+            return {
+                "sectors": [{
+                    "id": s.id,
+                    "sector_id": s.sector_id,
+                    "name": s.name,
+                    "pci": s.pci,
+                    "tac": s.tac,
+                    "azimuth": s.azimuth,
+                    "longitude": s.longitude,
+                    "latitude": s.latitude,
+                    "network_type": sites_map[s.site_id_fk].network_type if s.site_id_fk in sites_map else None,
+                    "cell_cover_type": s.cell_cover_type,
+                } for s in sectors],
+                "total": total,
+                "page": page,
+                "page_size": page_size,
+            }
+        finally:
+            db.close()
+
+    def get_data_from_db(self, data_id: str, user_id: Optional[int] = None) -> Optional[Dict]:
+        """从 SQLite 获取完整站点/扇区数据，格式与 data.json 一致（所有用户共享数据）
+
+        Returns:
+            {network_type: [{id, name, longitude, latitude, networkType, sectors: [...]}]}
+            如果数据不存在返回 None
+        """
+        db = SessionLocal()
+        try:
+            sites = db.query(Site).filter(Site.workbook_id == data_id).all()
+
+            if not sites:
+                return None
+
+            sectors = db.query(Sector).filter(Sector.workbook_id == data_id).all()
+
+            sectors_by_site: Dict[int, List] = {}
+            for s in sectors:
+                if s.site_id_fk is not None:
+                    sectors_by_site.setdefault(s.site_id_fk, []).append(s)
+
+            result: Dict[str, List] = {}
+            for site in sites:
+                nt = site.network_type
+                if nt not in result:
+                    result[nt] = []
+
+                site_sectors = sectors_by_site.get(site.id, [])
+                site_entry = {
+                    "id": site.site_id,
+                    "name": site.name or "Unknown",
+                    "longitude": site.longitude or 0.0,
+                    "latitude": site.latitude or 0.0,
+                    "networkType": nt,
+                    "sectors": [{**self._sector_to_dict(sec)} for sec in site_sectors],
+                }
+                if site.managed_element_id:
+                    site_entry["managedElementId"] = site.managed_element_id
+                if site.mcc:
+                    site_entry["mcc"] = site.mcc
+                if site.mnc:
+                    site_entry["mnc"] = site.mnc
+
+                result[nt].append(site_entry)
+
+            return result if result else None
+        finally:
+            db.close()
+
+    def _sector_to_dict(self, sector) -> Dict[str, Any]:
+        """将 Sector ORM 对象转换为与 data.json 一致的 dict 格式"""
+        d = {
+            "id": sector.sector_id,
+            "siteId": sector.sector_id.split("_")[0] if "_" in sector.sector_id else "",
+            "name": sector.name or "",
+            "longitude": sector.longitude or 0.0,
+            "latitude": sector.latitude or 0.0,
+            "azimuth": sector.azimuth or 0.0,
+            "beamwidth": sector.beamwidth or 65.0,
+            "height": sector.height or 30.0,
+            "pci": sector.pci,
+            "cell_cover_type": sector.cell_cover_type or 1,
+        }
+        if sector.frequency is not None:
+            d["earfcn"] = sector.frequency
+            d["ssb_frequency"] = sector.frequency
+        if sector.tac is not None:
+            d["tac"] = sector.tac
+        if sector.is_shared:
+            d["is_shared"] = sector.is_shared
+        if sector.first_group:
+            d["first_group"] = sector.first_group
+        if sector.mcc:
+            d["mcc"] = sector.mcc
+        if sector.mnc:
+            d["mnc"] = sector.mnc
+        return d
+
     def cleanup_index(self) -> Dict[str, Any]:
-        """清理无效索引项（文件不存在但索引中存在的项）
+        """清理无效索引项（SQLite中不存在或文件目录不存在的项）
 
         Returns:
             dict: 包含 removed（移除的数量）和 items（被移除的项列表）
@@ -3455,6 +4593,13 @@ class DataService:
 
         removed_items = []
         ids_to_remove = []
+
+        db = SessionLocal()
+        try:
+            sql_workbook_ids = {wb.id for wb in db.query(Workbook.id).all()}
+            sql_geo_file_ids = {gf.id for gf in db.query(GeoFile.id).all()}
+        finally:
+            db.close()
 
         for data_id, data_info in list(self.index.items()):
             data_dir = settings.DATA_DIR / data_id
@@ -3470,33 +4615,37 @@ class DataService:
                 })
                 continue
 
-            # 对于 Excel 类型，检查必要文件是否存在
+            # 对于 Excel 类型，检查是否在 SQLite 中或至少存在数据文件
             if data_info.get("type") == "excel":
-                has_valid_file = False
-                for filename in ["data.json", "default.json", "original.xlsx"]:
-                    if (data_dir / filename).exists():
-                        has_valid_file = True
-                        break
+                file_type = data_info.get("fileType", "")
 
-                if not has_valid_file:
-                    safe_print(f"[DataService] 发现无效索引: {data_id} - {data_info.get('name', '未知')} (数据文件不存在)")
-                    ids_to_remove.append(data_id)
-                    removed_items.append({
-                        "id": data_id,
-                        "name": data_info.get("name", "未知"),
-                        "reason": "数据文件不存在"
-                    })
+                # 地理化数据：检查 GeoFile 表或 default.json
+                if file_type == "geo_data":
+                    if data_id not in sql_geo_file_ids and not (data_dir / "default.json").exists():
+                        safe_print(f"[DataService] 发现无效地理化数据索引: {data_id} - {data_info.get('name', '未知')} (GeoFile表和文件均不存在)")
+                        ids_to_remove.append(data_id)
+                        removed_items.append({
+                            "id": data_id,
+                            "name": data_info.get("name", "未知"),
+                            "reason": "GeoFile表中不存在且无数据文件"
+                        })
+                else:
+                    # 普通 Excel 数据：检查 Workbook 表或 original.xlsx
+                    if data_id not in sql_workbook_ids and not (data_dir / "original.xlsx").exists():
+                        safe_print(f"[DataService] 发现无效索引: {data_id} - {data_info.get('name', '未知')} (SQLite和文件均不存在)")
+                        ids_to_remove.append(data_id)
+                        removed_items.append({
+                            "id": data_id,
+                            "name": data_info.get("name", "未知"),
+                            "reason": "SQLite中不存在且无original.xlsx"
+                        })
 
         # 移除无效索引
         for data_id in ids_to_remove:
             del self.index[data_id]
 
-        # 如果有移除，保存索引
         if ids_to_remove:
-            self._save_index()
             safe_print(f"[DataService] 清理完成，移除了 {len(ids_to_remove)} 个无效索引项")
-
-            # 同时清理缓存
             for data_id in ids_to_remove:
                 self.clear_cache(data_id)
         else:

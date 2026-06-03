@@ -1302,7 +1302,7 @@ export function PCIPage() {
                             const networkType = config.networkType as 'LTE' | 'NR'
                             return networkType === 'LTE' ? cellListData.lte : cellListData.nr
                           })()}
-                          selectedCellIds={storeSelectedCellIds}
+                          selectedCellIds={selectedCellIdsSet}
                           onToggleCell={wizardStep === 'cells_selected' && !isRunning ? toggleCellSelection : () => {}}
                           onSelectAll={wizardStep === 'cells_selected' && !isRunning ? toggleSelectAll : () => {}}
                           onClearSelections={wizardStep === 'cells_selected' && !isRunning ? clearSelections : () => {}}

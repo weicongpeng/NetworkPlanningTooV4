@@ -5,13 +5,17 @@
 
 import re
 import math
+import uuid
+import json
 import pandas as pd
 from pathlib import Path
+from datetime import datetime
 from typing import Dict, Any, List, Tuple, Optional
-import json
 
 from app.services.geo_field_detector import GeoFieldDetector
 from app.utils.coordinate_transformer import CoordinateTransformer
+from app.core.database import SessionLocal
+from app.models.database import GeoFile
 
 
 class GeoDataService:
@@ -20,13 +24,15 @@ class GeoDataService:
     def __init__(self):
         self.detector = GeoFieldDetector()
 
-    def parse_geo_data(self, file_path: str, filename: str) -> Dict[str, Any]:
+    def parse_geo_data(self, file_path: str, filename: str, user_id: int = 1, geo_id: str = None) -> Dict[str, Any]:
         """
         解析地理化数据文件
 
         Args:
             file_path: 文件路径
             filename: 文件名
+            user_id: 用户ID（用于数据隔离）
+            geo_id: 可选的 geo 数据 ID（与 API 层 data_id 一致，避免写入时生成新 UUID）
 
         Returns:
             解析结果字典：
@@ -141,6 +147,19 @@ class GeoDataService:
                 f"  • 数据被过滤（如非数值类型）"
             )
 
+        # 元数据入库（阶段 0 双写）
+        _save_geo_file_metadata(
+            user_id=user_id,
+            filename=filename,
+            file_path=file_path,
+            geometry_type=geometry_type,
+            field_mapping=fields,
+            point_count=len(geo_data),
+            bbox=_compute_bbox(geo_data) if geo_data else None,
+            file_size=Path(file_path).stat().st_size if Path(file_path).exists() else None,
+            geo_id=geo_id,
+        )
+
         return {
             "geometryType": geometry_type,
             "fields": fields,
@@ -150,7 +169,7 @@ class GeoDataService:
 
     def _read_file(self, file_path: str) -> pd.DataFrame:
         """
-        根据扩展名读取文件
+        根据扩展名读取文件（支持 ZIP 压缩包自动解压）
 
         Args:
             file_path: 文件路径
@@ -163,6 +182,26 @@ class GeoDataService:
         """
         path = Path(file_path)
         ext = path.suffix.lower()
+
+        if ext == ".zip":
+            # ZIP 压缩包：解压到同目录，递归查找数据文件
+            import zipfile as _zipfile
+            data_dir = path.parent
+            try:
+                with _zipfile.ZipFile(path, 'r') as zf:
+                    zf.extractall(data_dir)
+                print(f"[GeoDataService] ZIP已解压到: {data_dir}")
+            except Exception as e:
+                raise ValueError(f"ZIP文件解压失败：{str(e)}")
+
+            # 递归查找 Excel/CSV/TXT 文件（排除临时文件）
+            for f in sorted(data_dir.rglob('*'), key=lambda x: x.name):
+                if f.is_file() and not f.name.startswith('~$'):
+                    f_ext = f.suffix.lower()
+                    if f_ext in ['.xlsx', '.xls', '.csv', '.txt', '.tab']:
+                        print(f"[GeoDataService] ZIP中找到数据文件: {f.name}")
+                        return self._read_file(str(f))
+            raise ValueError("ZIP文件中未找到有效的数据文件（.xlsx/.xls/.csv/.txt/.tab）")
 
         if ext in [".xlsx", ".xls"]:
             # Excel 文件
@@ -187,8 +226,8 @@ class GeoDataService:
                 f"💡 支持的编码：UTF-8、GBK\n"
                 f"💡 建议：用记事本打开文件，另存为 UTF-8 编码"
             )
-        elif ext == ".txt":
-            # TXT 文件，尝试多种分隔符
+        elif ext in [".txt", ".tab"]:
+            # TXT/TAB 文件，尝试多种分隔符
             last_error = None
             for sep in [",", "\t", ";", " ", "|"]:
                 try:
@@ -205,7 +244,7 @@ class GeoDataService:
         else:
             raise ValueError(
                 f"❌ 不支持的文件格式（.{ext}）\n\n"
-                f"💡 支持的格式：.xlsx、.xls、.csv、.txt"
+                f"💡 支持的格式：.xlsx、.xls、.csv、.txt、.tab、.zip"
             )
 
     def _extract_data(
@@ -428,3 +467,53 @@ class GeoDataService:
 
         print(f"[_extract_polygon_data] 完成，共提取 {len(result)} 个多边形")
         return result
+
+
+def _save_geo_file_metadata(
+    user_id: int,
+    filename: str,
+    file_path: str,
+    geometry_type: str,
+    field_mapping: dict,
+    point_count: int,
+    bbox: Optional[List[float]] = None,
+    file_size: Optional[int] = None,
+    geo_id: Optional[str] = None,
+):
+    """保存地理化数据文件元数据到 SQLite"""
+    db = SessionLocal()
+    try:
+        geo = GeoFile(
+            id=geo_id or str(uuid.uuid4()),
+            user_id=user_id,
+            filename=filename,
+            file_path=file_path,
+            geometry_type=geometry_type,
+            field_mapping=json.dumps(field_mapping, ensure_ascii=False) if field_mapping else None,
+            point_count=point_count,
+            bbox=json.dumps(bbox) if bbox else None,
+            file_size=file_size,
+            created_at=datetime.now().isoformat(),
+        )
+        db.add(geo)
+        db.commit()
+        print(f"[GeoDataService] 元数据已入库: id={geo.id}")
+    except Exception as e:
+        db.rollback()
+        print(f"[GeoDataService] 元数据入库失败 (非致命): {e}")
+    finally:
+        db.close()
+
+
+def _compute_bbox(data: List[Dict]) -> Optional[List[float]]:
+    """计算数据边界框 [minLng, minLat, maxLng, maxLat]"""
+    lats, lngs = [], []
+    for item in data:
+        lat = item.get("lat") or item.get("latitude")
+        lng = item.get("lng") or item.get("longitude")
+        if lat is not None and lng is not None:
+            lats.append(float(lat))
+            lngs.append(float(lng))
+    if not lats:
+        return None
+    return [min(lngs), min(lats), max(lngs), max(lats)]

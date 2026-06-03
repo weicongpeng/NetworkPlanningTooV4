@@ -8,7 +8,8 @@
  */
 
 import { useState, useRef, useCallback, useMemo, useEffect } from 'react'
-import { Search, Loader2, Check } from 'lucide-react'
+import { Search, Loader2, Check, Upload, Download, Play } from 'lucide-react'
+import { btn } from '../utils/buttonStyles'
 
 const ITEM_HEIGHT = 40
 const OVERSCAN = 5
@@ -32,8 +33,6 @@ export interface CellSelectionTableProps {
   onClearSelections: () => void
   /** 选中数量展示文本（可选） */
   selectedCountText?: string
-  /** 数据源展示文本（可选） */
-  dataSourceText?: string
   /** 搜索框占位文本（可选） */
   searchPlaceholder?: string
   /** 加载状态 */
@@ -45,7 +44,27 @@ export interface CellSelectionTableProps {
     cellName: string
     selectAll: string
     clearSelections: string
+    uploadCellFile?: string
+    downloadCellTemplate?: string
   }
+  /** 上传待规划小区文件回调 */
+  onUploadCellFile?: () => void
+  /** 下载待规划小区模板回调 */
+  onDownloadCellTemplate?: () => void
+  /** 上传中状态 */
+  uploading?: boolean
+  /** 执行按钮回调 */
+  onExecute?: () => void
+  /** 执行按钮标签 */
+  executeLabel?: string
+  /** 执行按钮是否禁用 */
+  executeDisabled?: boolean
+  /** 任务是否正在执行中 */
+  isExecuting?: boolean
+  /** 执行进度 (0-100) */
+  executionProgress?: number
+  /** 禁用交互（执行中禁止勾选操作） */
+  disabled?: boolean
 }
 
 export const CellSelectionTable = ({
@@ -53,12 +72,20 @@ export const CellSelectionTable = ({
   selectedCellIds,
   onToggleCell,
   onSelectAll,
-  onClearSelections,
+  onClearSelections: _onClearSelections,
   selectedCountText,
-  dataSourceText,
   searchPlaceholder = '搜索基站ID、小区ID或名称...',
   loading = false,
-  columnLabels
+  columnLabels,
+  onUploadCellFile,
+  onDownloadCellTemplate,
+  uploading = false,
+  onExecute,
+  executeLabel = '执行',
+  executeDisabled = true,
+  isExecuting = false,
+  executionProgress = 0,
+  disabled = false,
 }: CellSelectionTableProps) => {
   const [searchValue, setSearchValue] = useState('')
   const [scrollTop, setScrollTop] = useState(0)
@@ -125,14 +152,13 @@ export const CellSelectionTable = ({
 
   // 判断当前网络类型的所有小区是否都已选中
   const allSelected = sectors.length > 0 && sectors.every(s => selectedCellIds.has(s.id))
+  const someSelected = sectors.some(s => selectedCellIds.has(s.id))
+  const noneSelected = !someSelected
 
   return (
     <div className="flex flex-col h-full min-h-0">
-      {/* 操作栏：数据源 + 搜索 + 全选/清空 */}
+      {/* 操作栏：搜索 + 选中计数 */}
       <div className="flex items-center gap-2 mb-2 shrink-0">
-        {dataSourceText && (
-          <span className="text-xs text-muted-foreground shrink-0 whitespace-nowrap">{dataSourceText}</span>
-        )}
         <div className="relative flex-1 min-w-0">
           <Search size={14} className="absolute left-2 top-1/2 -translate-y-1/2 text-muted-foreground pointer-events-none" />
           <input
@@ -143,21 +169,50 @@ export const CellSelectionTable = ({
             className="w-full pl-7 pr-3 py-1.5 text-xs bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-inset focus:ring-primary"
           />
         </div>
-        <button
-          onClick={onSelectAll}
-          className="px-2 py-1.5 text-xs bg-card border border-border rounded-lg hover:bg-muted/80 transition-colors shrink-0"
-        >
-          {allSelected ? '取消全选' : colLabels.selectAll}
-        </button>
-        <button
-          onClick={onClearSelections}
-          className="px-2 py-1.5 text-xs bg-card border border-border rounded-lg hover:bg-muted/80 transition-colors shrink-0"
-        >
-          {colLabels.clearSelections}
-        </button>
-        <span className="text-xs text-muted-foreground ml-auto shrink-0 whitespace-nowrap">
+        {onUploadCellFile && (
+          <button
+            onClick={onUploadCellFile}
+            disabled={uploading || disabled}
+            className="p-1.5 text-xs bg-card border border-border rounded-lg hover:bg-muted/80 transition-colors shrink-0 disabled:opacity-50 disabled:cursor-not-allowed"
+            title={columnLabels?.uploadCellFile || '上传待规划小区文件'}
+          >
+            {uploading ? <Loader2 size={14} className="animate-spin" /> : <Upload size={14} />}
+          </button>
+        )}
+        {onDownloadCellTemplate && (
+          <button
+            onClick={onDownloadCellTemplate}
+            disabled={disabled}
+            className="p-1.5 text-xs bg-card border border-border rounded-lg hover:bg-muted/80 transition-colors shrink-0 disabled:opacity-50 disabled:cursor-not-allowed"
+            title={columnLabels?.downloadCellTemplate || '下载待规划小区模板'}
+          >
+            <Download size={14} />
+          </button>
+        )}
+        <span className="text-xs text-muted-foreground shrink-0 whitespace-nowrap">
           {selectedCountText ?? `已选中 ${selectedCellIds.size} 个小区`}
         </span>
+
+        {/* 执行按钮 */}
+        {onExecute && (
+          <button
+            onClick={onExecute}
+            disabled={executeDisabled || isExecuting}
+            className={`${btn.primary} ${isExecuting ? 'btn-task-executing' : ''} shrink-0`}
+          >
+            {isExecuting ? (
+              <>
+                <Loader2 size={16} className="animate-spin" />
+                <span>{executeLabel} ({executionProgress}%)</span>
+              </>
+            ) : (
+              <>
+                <Play size={16} />
+                <span>{executeLabel}</span>
+              </>
+            )}
+          </button>
+        )}
       </div>
 
 
@@ -179,7 +234,24 @@ export const CellSelectionTable = ({
             {/* 固定表头，使用 sticky 定位 */}
             <div className="sticky top-0 z-10 bg-background border-b border-border shadow-sm">
               <div className="flex text-[10px] font-medium">
-                <div className="p-2 bg-muted border-r border-border w-10 shrink-0"></div>
+                <div className="p-2 bg-muted border-r border-border w-10 shrink-0 flex items-center justify-center">
+                  <button
+                    onClick={() => !disabled && onSelectAll()}
+                    disabled={disabled}
+                    className="w-4 h-4 rounded-sm border flex items-center justify-center disabled:opacity-50 disabled:cursor-not-allowed"
+                    style={{
+                      borderColor: noneSelected ? 'hsl(var(--muted-foreground))' : '#3b82f6',
+                      backgroundColor: noneSelected ? 'transparent' : '#3b82f6',
+                    }}
+                  >
+                    {allSelected && (
+                      <Check size={12} className="text-white" />
+                    )}
+                    {someSelected && !allSelected && (
+                      <div className="w-[6px] h-[6px] bg-white rounded-[1px]" />
+                    )}
+                  </button>
+                </div>
                 <div className="p-2 bg-muted border-r border-border w-[80px] shrink-0">{colLabels.siteId}</div>
                 <div className="p-2 bg-muted border-r border-border w-[80px] shrink-0">{colLabels.cellId}</div>
                 <div className="p-2 bg-muted flex-1 min-w-0">{colLabels.cellName}</div>
@@ -194,11 +266,13 @@ export const CellSelectionTable = ({
               {visibleData.map(sector => (
                 <div
                   key={sector.id}
-                  onClick={() => onToggleCell(sector.id)}
-                  className={`flex cursor-pointer transition-colors text-xs border-b border-border ${
+                  onClick={() => !disabled && onToggleCell(sector.id)}
+                  className={`flex transition-colors text-xs border-b border-border ${
+                    disabled ? 'cursor-not-allowed' : 'cursor-pointer'
+                  } ${
                     selectedCellIds.has(sector.id)
                       ? 'bg-blue-50/50'
-                      : 'bg-card hover:bg-muted/50'
+                      : disabled ? 'bg-card' : 'bg-card hover:bg-muted/50'
                   }`}
                   style={{ height: ITEM_HEIGHT }}
                 >

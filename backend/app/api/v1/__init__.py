@@ -3,7 +3,7 @@ API v1 路由
 """
 
 from fastapi import APIRouter
-from app.api.v1.endpoints import license, data, pci, neighbor, tac, map, geo_data, system
+from app.api.v1.endpoints import license, data, pci, neighbor, tac, map, geo_data, system, auth, admin_users, user_settings, websocket
 
 api_router = APIRouter()
 
@@ -16,3 +16,7 @@ api_router.include_router(tac.router, prefix="/tac", tags=["TAC规划"])
 api_router.include_router(map.router, prefix="/map", tags=["地图服务"])
 api_router.include_router(geo_data.router, prefix="/data", tags=["地理化数据"])
 api_router.include_router(system.router, prefix="/system", tags=["系统服务"])
+api_router.include_router(auth.router, prefix="/auth", tags=["认证管理"])
+api_router.include_router(user_settings.router, prefix="/user", tags=["用户设置"])
+api_router.include_router(admin_users.router, prefix="/admin/users", tags=["用户管理"])
+api_router.include_router(websocket.router, tags=["WebSocket实时通信"])

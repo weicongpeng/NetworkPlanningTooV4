@@ -1,0 +1,7 @@
+{
+  "tool_name": "Bash",
+  "tool_input_preview": "{\"command\":\"git add backend/app/api/v1/endpoints/pci.py && git commit -m \\\"perf: PCI apply endpoint short-polls Phase 1 completion\\n\\n- Waits up to 5s for Phase 1 (SQLite) to complete\\n- Returns resul...",
+  "error": "Exit code 128\nwarning: could not open directory 'backend/backend/app/api/v1/endpoints/': No such file or directory\nfatal: pathspec 'backend/app/api/v1/endpoints/pci.py' did not match any files",
+  "timestamp": "2026-06-03T07:39:08.668Z",
+  "retry_count": 1
+}

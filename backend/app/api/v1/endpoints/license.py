@@ -1,13 +1,25 @@
 """
-许可证管理API端点（简化版）
+许可证管理API端点
+
+授权模型：以管理员用户的 license_expiry 为全局授权依据
 """
 
-from fastapi import APIRouter, UploadFile, File, HTTPException
-from typing import Dict, Any
+from fastapi import APIRouter, UploadFile, File, HTTPException, Depends
+from typing import Dict, Any, Optional
+from pydantic import BaseModel
+from sqlalchemy.orm import Session
+
+from app.core.database import get_db
+from app.core.security import get_current_admin_user
+from app.models.database import User
 from app.models.schemas import LicenseStatus, LicenseResponse
 from app.services.license_service import license_service
 
 router = APIRouter()
+
+
+class UpdateExpiryRequest(BaseModel):
+    expiry_date: Optional[str] = None  # "YYYY-MM-DD" 或 null（无限期）
 
 
 @router.get("/status", response_model=Dict[str, Any])
@@ -69,5 +81,26 @@ async def check_license() -> Dict[str, Any]:
     try:
         is_valid = license_service.check_permission()
         return {"success": True, "data": {"valid": is_valid}}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/update-expiry", response_model=Dict[str, Any])
+async def update_license_expiry(
+    data: UpdateExpiryRequest,
+    admin_user: User = Depends(get_current_admin_user),
+):
+    """
+    管理员更新全局授权期限（即管理员自身的 license_expiry）
+
+    expiry_date: "YYYY-MM-DD" 格式的日期字符串，或 null 表示无限期
+    """
+    try:
+        result = license_service.update_admin_license_expiry(data.expiry_date)
+        if result is None:
+            raise HTTPException(status_code=400, detail="更新授权期限失败")
+        return {"success": True, "data": result, "message": "授权期限更新成功"}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

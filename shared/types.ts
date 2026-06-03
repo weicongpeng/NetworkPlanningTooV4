@@ -79,6 +79,7 @@ export interface PCIRange {
 }
 
 export interface PCIConfig {
+  taskName?: string
   networkType: 'LTE' | 'NR'
   distanceThreshold: number
   pciModulus: 3 | 30
@@ -336,4 +337,78 @@ export interface LayerStyle {
   fillColor: string
   strokeWidth: number
   radius?: number
+}
+
+// ============== 用户认证相关类型 ==============
+export interface UserInfo {
+  id: number
+  username: string
+  is_admin: boolean
+  is_active: boolean
+  is_online?: boolean
+  must_change_password: boolean
+  license_expiry: string | null
+  total_usage_seconds: number
+  last_login: string | null
+  last_login_ip: string | null
+  created_at: string | null
+  city: string | null
+  operator: string | null
+}
+
+export interface TokenResponse {
+  access_token: string
+  token_type: string
+  user: UserInfo
+}
+
+export interface LoginRequest {
+  username: string
+  password: string
+}
+
+export interface RegisterRequest {
+  username: string
+  password: string
+  confirm_password: string
+  city?: string | null
+  operator?: string | null
+}
+
+export interface ChangePasswordRequest {
+  old_password: string
+  new_password: string
+  confirm_password: string
+}
+
+export interface UserListResponse {
+  total: number
+  users: UserInfo[]
+}
+
+export interface UserUpdateRequest {
+  is_active?: boolean
+  is_admin?: boolean
+  license_expiry?: string | null
+  must_change_password?: boolean
+  city?: string | null
+  operator?: string | null
+}
+
+export interface ResetPasswordRequest {
+  new_password: string
+}
+
+export interface UserSessionInfo {
+  id: number
+  user_id: number
+  token_jti: string
+  ip_address: string | null
+  login_time: string | null
+  logout_time: string | null
+  last_activity: string | null
+}
+
+export interface UserDetailResponse extends UserInfo {
+  sessions: UserSessionInfo[]
 }

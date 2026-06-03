@@ -75,11 +75,17 @@ export class PCIDataSyncService {
 
   /**
    * 初始化同步服务，加载全量工参数据
+   * @param forceRefresh 是否强制从后端重新加载（跳过所有缓存）
    */
-  async initialize(): Promise<void> {
+  async initialize(forceRefresh = false): Promise<void> {
     try {
-      // 从mapDataService获取全量工参数据（优先使用缓存）
-      const mapData = await mapDataService.getMapData()
+      // 重新初始化时，清除之前的规划结果缓存和临时数据
+      // 确保以最新的全量工参为准，不保留已应用PCI的旧数据
+      this.pciTempData = null
+      this.pciResultsMap.clear()
+
+      // 从mapDataService获取全量工参数据
+      const mapData = await mapDataService.getMapData(undefined, forceRefresh)
 
       // 检查是否有数据
       if (!mapData.lteSectors.length && !mapData.nrSectors.length) {
@@ -162,6 +168,26 @@ export class PCIDataSyncService {
     console.log('[PCIDataSyncService] PCI规划结果已加载', {
       count: this.pciResultsMap.size
     })
+
+    // 重建syncedData（从fullParamsData重新生成，确保新任务不会残留旧数据）
+    if (this.fullParamsData) {
+      this.syncedData = {
+        lte: this.fullParamsData.lte.map(s => ({
+          ...s,
+          syncedPCI: s.pci,
+          isPlannedSector: false
+        })),
+        nr: this.fullParamsData.nr.map(s => ({
+          ...s,
+          syncedPCI: s.pci,
+          isPlannedSector: false
+        }))
+      }
+      console.log('[PCIDataSyncService] syncedData已重建', {
+        lte: this.syncedData.lte.length,
+        nr: this.syncedData.nr.length
+      })
+    }
 
     // 创建临时工参副本，将规划后的PCI更新到副本中
     this.createTempDataWithUpdatedPCI()
@@ -690,6 +716,7 @@ export class PCIDataSyncService {
   clear(): void {
     this.fullParamsData = null
     this.syncedData = null
+    this.pciTempData = null
     this.pciResultsMap.clear()
     console.log('[PCIDataSyncService] 数据已清除')
   }

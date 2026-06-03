@@ -13,7 +13,7 @@ os.environ['PYTHONUTF8'] = '1'
 # 方法2：覆盖内置的 print 函数，确保所有输出都是安全的
 _original_print = print
 def _safe_print(*args, **kwargs):
-    """安全的print函数，处理编码错误"""
+    """安全的print函数，处理编码错误和管道断开"""
     try:
         _original_print(*args, **kwargs)
     except UnicodeEncodeError:
@@ -27,6 +27,10 @@ def _safe_print(*args, **kwargs):
             else:
                 safe_args.append(arg)
         _original_print(*safe_args, **kwargs)
+    except OSError:
+        # stdout/stderr 管道断开或关闭时（如 nohup/容器环境）静默忽略
+        # 避免 [Errno 32] Broken pipe 导致任务中断
+        pass
 
 # 替换全局print函数
 import builtins

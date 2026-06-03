@@ -8,7 +8,7 @@ import shutil
 import time
 import uuid
 from pathlib import Path
-from fastapi import APIRouter, UploadFile, File, HTTPException, Body, Form
+from fastapi import APIRouter, Depends, UploadFile, File, HTTPException, Body, Form
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
 from typing import Dict, Any, List, Optional
@@ -20,6 +20,7 @@ from app.models.schemas import (
     ImportPointsRequest,
 )
 from app.services.data_service import data_service
+from app.core.security import get_current_user
 
 router = APIRouter()
 
@@ -31,7 +32,8 @@ async def import_points(request: ImportPointsRequest) -> Dict[str, Any]:
         points = await run_in_threadpool(data_service.parse_points, request.file_path)
         return {"success": True, "data": points}
     except ValueError as e:
-        safe_detail = str(e).encode("gbk", "replace").decode("gbk")
+        error_msg = str(e).replace("✗", "x").replace("✗", "x")
+        safe_detail = error_msg.encode("utf-8", "replace").decode("utf-8")
         raise HTTPException(status_code=400, detail=safe_detail)
     except Exception as e:
         import traceback
@@ -45,11 +47,9 @@ async def import_points(request: ImportPointsRequest) -> Dict[str, Any]:
 async def download_file(data_id: str):
     """下载原始文件"""
     try:
-        # 获取文件信息
         data_dir = settings.DATA_DIR / data_id
-        file_path = data_dir / "original.xlsx"
 
-        # 按优先级查找原始文件：xlsx -> zip
+        # 按优先级查找原始文件
         candidates = [
             data_dir / "original.xlsx",
             data_dir / "original.zip",
@@ -62,7 +62,36 @@ async def download_file(data_id: str):
                 file_path = candidate
                 break
 
+        # 备用：扫描 data 目录下此 ID 文件夹中的所有文件
+        if not file_path and data_dir.exists():
+            for item in data_dir.iterdir():
+                if item.is_file() and item.suffix.lower() in ('.xlsx', '.xls', '.zip'):
+                    file_path = item
+                    print(f"[Download] 通过目录扫描找到文件: {file_path}")
+                    break
+
+        # 备用2：从 index 获取文件名，在 data 目录中按名查找
+        if not file_path and data_id in data_service.index:
+            stored_name = data_service.index[data_id].get("name", "")
+            if stored_name:
+                named_path = data_dir / stored_name
+                if named_path.exists():
+                    file_path = named_path
+                    print(f"[Download] 通过索引文件名找到文件: {file_path}")
+
+        # 备用3：清理上传文件名后缀
+        if not file_path and data_id in data_service.index:
+            stored_name = data_service.index[data_id].get("name", "")
+            base_name = stored_name.rsplit(".", 1)[0] if "." in stored_name else stored_name
+            for ext in (".xlsx", ".xls", ".zip"):
+                named_path = data_dir / f"{base_name}{ext}"
+                if named_path.exists():
+                    file_path = named_path
+                    print(f"[Download] 通过无后缀名查找找到文件: {file_path}")
+                    break
+
         if not file_path:
+            print(f"[Download] 未找到文件: data_id={data_id}, data_dir存在={data_dir.exists()}, index中存在={data_id in data_service.index}")
             raise HTTPException(status_code=404, detail="文件不存在")
 
         # 获取原始文件名
@@ -106,18 +135,27 @@ async def download_file(data_id: str):
 
 
 @router.post("/update-parameters", response_model=Dict[str, Any])
-async def update_parameters(request: UpdateParametersRequest) -> Dict[str, Any]:
+async def update_parameters(
+    request: UpdateParametersRequest,
+    current_user=Depends(get_current_user),
+) -> Dict[str, Any]:
     """更新工参"""
     try:
         # 在线程池中运行同步的耗时操作，避免阻塞主线程
-        result = await run_in_threadpool(
-            data_service.update_parameters, request.fullParamId, request.currentParamId
+        from app.services.task_manager import task_manager
+
+        task_id = await task_manager.create_update_params_task(
+            request.fullParamId, request.currentParamId,
+            username=current_user.username,
+            user_id=current_user.id,
         )
-        # 工参更新成功后清除地图数据缓存
+        # 清除地图数据缓存
         import app.api.v1.endpoints.map as map_module
-        map_module._map_data_cache = None
-        map_module._map_data_cache_time = 0
-        return {"success": True, "message": "工参更新成功", "data": result}
+        map_module.invalidate_map_data_cache()
+        return {
+            "success": True,
+            "data": {"taskId": task_id, "message": "工参更新任务已启动"},
+        }
     except ValueError as e:
         # 确保错误信息是安全的，避免GBK编码错误
         error_msg = str(e)
@@ -139,15 +177,49 @@ async def update_parameters(request: UpdateParametersRequest) -> Dict[str, Any]:
         raise HTTPException(status_code=500, detail=safe_detail)
 
 
+@router.get("/update-parameters/progress/{task_id}", response_model=Dict[str, Any])
+async def get_update_params_progress(task_id: str) -> Dict[str, Any]:
+    """获取工参更新进度/结果"""
+    try:
+        from app.services.task_manager import task_manager
+
+        progress = task_manager.get_task_progress(task_id)
+        if progress is None:
+            raise HTTPException(status_code=404, detail="任务不存在")
+        return {"success": True, "data": progress}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/update-parameters/result/{task_id}", response_model=Dict[str, Any])
+async def get_update_params_result(task_id: str) -> Dict[str, Any]:
+    """获取工参更新结果"""
+    try:
+        from app.services.task_manager import task_manager
+
+        result = task_manager.get_task_result(task_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail="任务不存在或尚未完成")
+        return {"success": True, "data": result}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.post("/upload/excel", response_model=Dict[str, Any])
 async def upload_excel(
-    file: Optional[UploadFile] = File(None), file_path: Optional[str] = Form(None)
+    file: Optional[UploadFile] = File(None), file_path: Optional[str] = Form(None),
+    overwrite: bool = Form(False),
+    current_user=Depends(get_current_user),
 ) -> Dict[str, Any]:
     """上传Excel工参文件"""
     try:
         print(f"[API] upload_excel called")
         try:
-            print(f"[API] file={file.filename if file else None}, file_path={file_path}")
+            print(f"[API] file={file.filename if file else None}, file_path={file_path}, overwrite={overwrite}")
         except:
             print(f"[API] upload_excel: file_path encoding error")
         print(f"[API] file object: {file}")
@@ -157,7 +229,17 @@ async def upload_excel(
 
     try:
         # 阶段1：保存文件并创建处理中索引（快速返回）
-        result = await data_service.init_upload(file, file_path)
+        result = await data_service.init_upload(file, file_path, user_id=current_user.id, overwrite=overwrite)
+
+        # 同名文件检测：未覆盖时返回提示
+        if result.get("status") == "duplicate":
+            return {
+                "success": True,
+                "data": result,
+                "duplicate": True,
+                "message": f"文件 \"{result.get('name')}\" 已存在，是否覆盖？"
+            }
+
         data_id = result["id"]
         print(f"[API] upload_excel init done: id={data_id}")
 
@@ -168,8 +250,7 @@ async def upload_excel(
                 print(f"[API] 后台处理完成: {data_id}")
                 # 清除地图数据缓存
                 import app.api.v1.endpoints.map as map_module
-                map_module._map_data_cache = None
-                map_module._map_data_cache_time = 0
+                map_module.invalidate_map_data_cache()
             except Exception as e:
                 print(f"[API] 后台处理失败: {data_id}: {e}")
 
@@ -213,8 +294,7 @@ async def upload_map(
         result = await data_service.upload_map(file, file_path)
         # 清除地图数据缓存
         import app.api.v1.endpoints.map as map_module
-        map_module._map_data_cache = None
-        map_module._map_data_cache_time = 0
+        map_module.invalidate_map_data_cache()
         return {"success": True, "data": result}
     except ValueError as e:
         print(f"[API] upload_map ValueError: {e}")
@@ -227,12 +307,32 @@ async def upload_map(
 
 
 @router.get("/list", response_model=Dict[str, Any])
-async def list_data(page: int = 1, page_size: int = 50) -> Dict[str, Any]:
-    """获取数据列表（支持分页）"""
+async def list_data(
+    page: int = 1, page_size: int = 50,
+    current_user=Depends(get_current_user),
+) -> Dict[str, Any]:
+    """获取数据列表（支持分页，所有用户共享数据）"""
     try:
+        # 主路径：使用内存索引（由 index.json 支持，传统文件处理逻辑）
         items = data_service.list_data(page=page, page_size=page_size)
         total = data_service.get_total_count()
-        return {"success": True, "data": items, "total": total, "page": page, "page_size": page_size}
+
+        if items:
+            return {"success": True, "data": items, "total": total, "page": page, "page_size": page_size}
+
+        # 回退：从 SQLite 查询（兼容旧数据）
+        try:
+            workbooks = data_service.get_workbooks_from_db()
+        except Exception:
+            workbooks = None
+
+        if workbooks:
+            total = len(workbooks)
+            start = (page - 1) * page_size
+            paginated = workbooks[start:start + page_size]
+            return {"success": True, "data": paginated, "total": total, "page": page, "page_size": page_size}
+
+        return {"success": True, "data": [], "total": 0, "page": page, "page_size": page_size}
     except Exception as e:
         safe_detail = str(e).encode("gbk", "replace").decode("gbk")
         raise HTTPException(status_code=500, detail=safe_detail)
@@ -269,8 +369,7 @@ async def delete_data(data_id: str, force: bool = False) -> Dict[str, Any]:
         # 删除成功后清除地图数据缓存
         if result:
             import app.api.v1.endpoints.map as map_module
-            map_module._map_data_cache = None
-            map_module._map_data_cache_time = 0
+            map_module.invalidate_map_data_cache()
         return {"success": result, "message": message}
     except Exception as e:
         safe_detail = str(e).encode("gbk", "replace").decode("gbk")
@@ -281,13 +380,12 @@ async def delete_data(data_id: str, force: bool = False) -> Dict[str, Any]:
 async def preview_data(data_id: str, rows: int = 100) -> Dict[str, Any]:
     """预览数据"""
     try:
-        items = data_service.list_data()
-        data_item = next((item for item in items if item.id == data_id), None)
-
-        if not data_item:
+        # O(1) 索引查找，替代原来的 list_data() + next() O(N) 扫描
+        data_info = data_service.index.get(data_id)
+        if not data_info:
             raise HTTPException(status_code=404, detail="数据不存在")
 
-        if data_item.type.value != "excel":
+        if data_info.get("type") != "excel":
             raise HTTPException(status_code=400, detail="只支持Excel文件预览")
 
         preview = data_service.preview_data(data_id, rows)
@@ -806,7 +904,6 @@ async def complete_chunked_upload(
             'uploadDate': time.strftime("%Y-%m-%dT%H:%M:%S"),
             'status': 'processing',
         }
-        data_service._save_index()
 
         async def _background_geo_process():
             try:
@@ -817,7 +914,9 @@ async def complete_chunked_upload(
                 parse_result = await run_in_threadpool(
                     geo_service.parse_geo_data,
                     str(file_path),
-                    safe_filename
+                    safe_filename,
+                    1,  # user_id
+                    data_id,  # geo_id
                 )
 
                 json_path = data_dir / 'default.json'
@@ -858,9 +957,24 @@ async def complete_chunked_upload(
         }
     else:
         # 默认：Excel 工参数据处理
+        # 检查同名文件
+        existing_id = None
+        for exist_id, exist_info in data_service.index.items():
+            if exist_info.get("name") == safe_filename and exist_info.get("type") == "excel":
+                existing_id = exist_id
+                break
+
+        if existing_id:
+            # 删除旧文件，覆盖
+            print(f"[ChunkedUpload] 覆盖同名文件: {safe_filename} (旧ID: {existing_id})")
+            try:
+                data_service.delete_data(existing_id)
+            except Exception as e:
+                print(f"[ChunkedUpload] 删除旧文件失败 (非致命): {e}")
+
         data_dir = settings.DATA_DIR / data_id
         data_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copy(file_path, data_dir / "original.xlsx")
+        shutil.copy(file_path, data_dir / f"original{ext}")
 
         data_service.index[data_id] = {
             "id": data_id,
@@ -871,7 +985,6 @@ async def complete_chunked_upload(
             "uploadDate": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "status": "processing",
         }
-        data_service._save_index()
         print(f"[ChunkedUpload] 索引条目已创建: {data_id}")
 
         async def _background_process():
@@ -879,8 +992,7 @@ async def complete_chunked_upload(
                 await run_in_threadpool(data_service._process_upload_sync, data_id)
                 print(f"[ChunkedUpload] 后台处理完成: {data_id}")
                 import app.api.v1.endpoints.map as map_module
-                map_module._map_data_cache = None
-                map_module._map_data_cache_time = 0
+                map_module.invalidate_map_data_cache()
             except Exception as e:
                 print(f"[ChunkedUpload] 后台处理失败: {data_id}: {e}")
 

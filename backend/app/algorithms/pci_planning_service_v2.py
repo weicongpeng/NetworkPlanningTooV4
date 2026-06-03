@@ -1290,6 +1290,10 @@ class PCIPlanningService:
                             if i == j:
                                 continue  # 跳过自身
 
+                            # 只考虑同PCI的小区（使用规划后的新PCI）
+                            if cell["new_pci"] != other_cell["new_pci"]:
+                                continue
+
                             # 检查是否同频
                             cell_earfcn = cell.get("earfcn")
                             other_earfcn = other_cell.get("earfcn")
@@ -1390,59 +1394,6 @@ class PCIPlanningService:
                                                 min_distance_sector_name = (
                                                     cell_key_to_name[cell_key]
                                                 )
-
-                        # 更新规划结果中的最小复用距离、对端小区名称和分配原因
-                        # 无论是否找到同频同PCI的小区，都更新分配原因
-                        if min_distance != float("inf"):
-                            cell["sector_obj"].min_reuse_distance = min_distance
-                            cell[
-                                "sector_obj"
-                            ].min_distance_sector_name = min_distance_sector_name
-
-                            # 重新生成分配原因，确保与实际距离匹配
-                            original_threshold = self.config.distance_threshold
-                            is_satisfied, new_reason = (
-                                self.is_distance_constraint_satisfied(
-                                    min_distance, original_threshold
-                                )
-                            )
-
-                            # 追加原因说明（保留原始分配原因）
-                            original_reason = cell["sector_obj"].assignment_reason
-                            if is_satisfied:
-                                # 如果最终满足约束，标记为"最终核查通过"
-                                cell[
-                                    "sector_obj"
-                                ].assignment_reason = (
-                                    f"{new_reason} (原始:{original_reason})"
-                                )
-                            else:
-                                # 如果最终不满足约束，标记为"最终核查未通过"
-                                # 查找具体原因（资源不足或频点缺失）
-                                if (
-                                    min_distance < 0.001
-                                ):  # 实际上没有找到同频同PCI的小区
-                                    reason_detail = "无同频同PCI小区"
-                                else:
-                                    reason_detail = (
-                                        f"最近同频同PCI小区距离{min_distance:.2f}km过近"
-                                    )
-
-                                cell[
-                                    "sector_obj"
-                                ].assignment_reason = f"{new_reason}, {reason_detail} (原始:{original_reason})"
-                        else:
-                            # 没有找到同频同PCI的小区，说明该PCI在频点范围内是唯一的
-                            cell["sector_obj"].min_reuse_distance = float("inf")
-                            cell["sector_obj"].min_distance_sector_name = None
-                            original_reason = cell["sector_obj"].assignment_reason
-
-                            # 标记为无同频同PCI小区
-                            cell[
-                                "sector_obj"
-                            ].assignment_reason = (
-                                f"✅ 无同频同PCI小区 (原始:{original_reason})"
-                            )
 
                         # 更新规划结果中的最小复用距离、对端小区名称和分配原因
                         # 无论是否找到同频同PCI的小区，都更新分配原因

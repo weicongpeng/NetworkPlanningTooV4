@@ -1,17 +1,27 @@
 import { create } from 'zustand'
+import { persist } from 'zustand/middleware'
 import { dataApi } from '../services/api'
+import { indexedDBService } from '../services/indexedDBService'
 import type { DataItem, ApiResponse } from '@shared/types'
 import { useTaskStore } from './taskStore'
-import { indexedDBService } from '../services/indexedDBService'
+import { clearCellListCache } from '../services/mapDataService'
 
-const DATA_LIST_CACHE_KEY = 'data_list_cache'
-const DATA_LIST_CACHE_TTL = 5 * 60 * 1000 // 5分钟缓存
+const CACHE_TTL_5MIN = 5 * 60 * 1000
 
 // 全局数据更新事件名称
 export const DATA_REFRESH_EVENT = 'data-list-refresh'
 
+// 防抖：2 秒内多次触发只发送一次事件，避免多页面同时响应产生惊群效应
+let _lastRefreshTime = 0
+const REFRESH_DEBOUNCE_MS = 2000
+
 // 触发数据刷新事件（用于跨页面通信）
 export function triggerDataRefresh() {
+  const now = Date.now()
+  if (now - _lastRefreshTime < REFRESH_DEBOUNCE_MS) return
+  _lastRefreshTime = now
+  // 清除小区列表缓存，确保各页面新建任务时获取最新数据
+  clearCellListCache()
   window.dispatchEvent(new CustomEvent(DATA_REFRESH_EVENT))
 }
 
@@ -57,11 +67,11 @@ export const useDataStore = create<DataState>((set, get) => ({
     // 尝试从缓存读取
     if (!forceRefresh) {
       try {
-        const cached = await indexedDBService.get<DataListCache>(DATA_LIST_CACHE_KEY)
+        const cached = await indexedDBService.get<DataListCache>('data_list_cache')
         if (cached && cached.page === page && cached.pageSize === pageSize) {
           // 检查缓存是否过期
           const now = Date.now()
-          if (now - cached.timestamp < DATA_LIST_CACHE_TTL) {
+          if (now - cached.timestamp < CACHE_TTL_5MIN) {
             console.log('[DataStore] 使用缓存的数据列表')
             set({
               items: cached.items,
@@ -101,7 +111,7 @@ export const useDataStore = create<DataState>((set, get) => ({
           pageSize,
           timestamp: Date.now()
         }
-        await indexedDBService.set(DATA_LIST_CACHE_KEY, cacheData, DATA_LIST_CACHE_TTL)
+        await indexedDBService.set('data_list_cache', cacheData, CACHE_TTL_5MIN)
       } catch (error) {
         console.warn('[DataStore] 写入缓存失败:', error)
       }
@@ -192,7 +202,8 @@ export const useDataStore = create<DataState>((set, get) => ({
     set({ loading: true, error: null })
     try {
       await dataApi.delete(id)
-      await get().fetchList(1, 50, true)  // 删除成功后强制刷新
+      // 删除后清除 IndexedDB 缓存（不内部刷新列表，由调用方统一处理刷新）
+      await indexedDBService.delete('data_list_cache')
       set({ loading: false })
       return true
     } catch (error: any) {
@@ -214,22 +225,65 @@ export const useDataStore = create<DataState>((set, get) => ({
       // 在全局任务store中开始任务
       useTaskStore.getState().startTask(taskId, 'parameter_update', '正在更新工参...')
 
+      // 1. 创建异步任务（立即返回 taskId，避免 Cloudflare 120s 超时）
       const response = await dataApi.updateParameters(fullParamId, currentParamId)
-      await get().fetchList(1, 50, true)  // 更新成功后强制刷新
+      const actualTaskId = response?.data?.taskId
 
-      // 任务完成
+      if (!actualTaskId) {
+        throw new Error(response?.message || '启动工参更新任务失败')
+      }
+
+      // 2. 轮询等待后台任务完成（最长 10 分钟）
+      const maxWait = 600000  // 10 min
+      const pollInterval = 2000  // 每 2 秒检查一次
+      const startTime = Date.now()
+      let finalResult: any = null
+
+      while (Date.now() - startTime < maxWait) {
+        await new Promise(r => setTimeout(r, pollInterval))
+
+        try {
+          const progressResp = await dataApi.getUpdateParamsProgress(actualTaskId)
+          const progressData = progressResp?.data
+
+          if (progressData?.status === 'completed') {
+            finalResult = progressData
+            break
+          } else if (progressData?.status === 'failed') {
+            throw new Error(progressData?.error || '工参更新失败')
+          }
+          // status === 'processing' 或 'pending'，继续轮询
+        } catch (pollErr: any) {
+          // 404 表示任务索引尚未持久化，继续轮询
+          if (pollErr?.code === 404) {
+            continue
+          }
+          throw pollErr
+        }
+      }
+
       useTaskStore.getState().completeTask(taskId)
 
+      if (finalResult) {
+        set({ isUpdating: false })
+        return {
+          success: true,
+          data: {
+            newFileId: finalResult.newFileId,
+            newFileName: finalResult.newFileName,
+            savedToOriginal: finalResult.savedToOriginal,
+          }
+        }
+      }
+
+      // 超时但后台可能仍在处理，视为失败
       set({ isUpdating: false })
-      return response
+      return { success: false, message: '工参更新超时，请稍后刷新数据列表查看结果', data: null }
     } catch (error: any) {
-      // 任务失败
+      // 任务失败 - 不在store中设置error（由页面组件处理异常后的刷新逻辑）
       useTaskStore.getState().failTask(taskId, error.message || '工参更新失败')
 
-      set({
-        error: error.message || '工参更新失败',
-        isUpdating: false
-      })
+      set({ isUpdating: false })
       return { success: false, message: error.message || '工参更新失败', data: null }
     }
   },

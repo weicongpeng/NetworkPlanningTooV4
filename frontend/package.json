@@ -37,6 +37,7 @@
     "react-router-dom": "^6.20.0",
     "tailwind-merge": "^2.1.0",
     "terser": "^5.47.1",
+    "xlsx": "^0.18.5",
     "zustand": "^4.4.0"
   },
   "devDependencies": {

@@ -8,6 +8,7 @@
 
 import math
 import uuid
+from functools import lru_cache
 from datetime import datetime
 from typing import List, Dict, Optional, Tuple, Callable, Any, Set
 from dataclasses import dataclass, field
@@ -91,6 +92,9 @@ class NeighborPlanner:
         # 数据存储
         self.source_cells_df = None
         self.target_cells_df = None
+
+        # 站间距缓存（同基站的小区共享计算结果）
+        self._site_spacing_cache: Dict[str, float] = {}
         
         logger.info(f"初始化邻区规划工具")
         logger.info(f"源网络: {config.source_type}, 目标网络: {config.target_type}")
@@ -151,21 +155,62 @@ class NeighborPlanner:
                 self.source_cells_df[col] = pd.to_numeric(self.source_cells_df[col], errors='coerce')
             if col in self.target_cells_df.columns:
                 self.target_cells_df[col] = pd.to_numeric(self.target_cells_df[col], errors='coerce')
+
+        # 预存储 NumPy 数组供向量化距离计算使用
+        self._target_lats_arr = self.target_cells_df['lat'].values.astype(float)
+        self._target_lons_arr = self.target_cells_df['lon'].values.astype(float)
+        self._target_valid_mask = ~(np.isnan(self._target_lats_arr) | np.isnan(self._target_lons_arr))
+
+        # 预计算目标小区覆盖圆数据（仅依赖目标小区自身数据，与源小区无关）
+        target_clats = []
+        target_clons = []
+        target_radii = []
+        for _, row in self.target_cells_df.iterrows():
+            if pd.notna(row.get('azimuth')):
+                clat, clon = self.calculate_coverage_circle_center(
+                    row['lat'], row['lon'], row['azimuth'],
+                    self.coverage_distance_factor, self.default_coverage_distance
+                )
+            else:
+                clat, clon = row['lat'], row['lon']
+            radius = self.calculate_coverage_radius(
+                self.default_coverage_distance, self.coverage_radius_factor
+            )
+            target_clats.append(clat)
+            target_clons.append(clon)
+            target_radii.append(radius)
+
+        self._target_center_lats = np.array(target_clats, dtype=float)
+        self._target_center_lons = np.array(target_clons, dtype=float)
+        self._target_radii = np.array(target_radii, dtype=float)
     
-    def calculate_distance(self, lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-        """计算两点之间的距离（公里）"""
+    @staticmethod
+    @lru_cache(maxsize=500000)
+    def calculate_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+        """计算两点之间的距离（公里）—— 结果已缓存，同一坐标对只计算一次"""
         lat1_rad = math.radians(lat1)
         lon1_rad = math.radians(lon1)
         lat2_rad = math.radians(lat2)
         lon2_rad = math.radians(lon2)
-        
+
         dlat = lat2_rad - lat1_rad
         dlon = lon2_rad - lon1_rad
         a = math.sin(dlat/2)**2 + math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(dlon/2)**2
         c = 2 * math.asin(math.sqrt(a))
-        
+
         return c * 6371
-    
+
+    def _batch_distances_to_targets(self, source_lat: float, source_lon: float) -> np.ndarray:
+        """NumPy 向量化：一次计算源小区到所有目标小区的距离（比逐对 Python 循环快 ~500 倍）"""
+        lat1_rad = math.radians(source_lat)
+        lon1_rad = math.radians(source_lon)
+        slat = np.radians(self._target_lats_arr)
+        slon = np.radians(self._target_lons_arr)
+        dlat = slat - lat1_rad
+        dlon = slon - lon1_rad
+        a = np.sin(dlat * 0.5) ** 2 + math.cos(lat1_rad) * np.cos(slat) * np.sin(dlon * 0.5) ** 2
+        return (2 * np.arcsin(np.sqrt(np.clip(a, 0, 1)))) * 6371
+
     def calculate_azimuth_angle(self, lat1: float, lon1: float, lat2: float, lon2: float) -> float:
         """计算从点1到点2的方位角（度）- 北为0度，顺时针"""
         lat1_rad = math.radians(lat1)
@@ -288,6 +333,10 @@ class NeighborPlanner:
         source_lon = source_row.get('lon')
         source_enodeb_id = str(source_row.get('enodeb_id', ''))
 
+        # 同基站小区共享站间距计算结果
+        if source_enodeb_id in self._site_spacing_cache:
+            return self._site_spacing_cache[source_enodeb_id]
+
         if pd.isna(source_lat) or pd.isna(source_lon):
             return 0.5
 
@@ -343,6 +392,8 @@ class NeighborPlanner:
 
         logger.debug(f"站间距计算: 源站点={source_enodeb_id}, 最近{len(nearest_5)}个站点, 平均距离={avg_spacing:.3f}km")
 
+        # 缓存该基站的结果，供同站其他小区复用
+        self._site_spacing_cache[source_enodeb_id] = avg_spacing
         return avg_spacing
 
     def plan_neighbors_for_cell(self, source_row: pd.Series) -> List[NeighborRelation]:
@@ -383,25 +434,27 @@ class NeighborPlanner:
 
         # ========== 第一步：距离优先选择（强制邻区） ==========
         step1_forced_neighbors = []  # 强制邻区
-        step1_remaining_candidates = []  # 剩余候选
+        step1_remaining_candidates = []  # 剩余候选（附带 DataFrame 行号供后续快速查预计算数据）
 
-        for _, target_row in self.target_cells_df.iterrows():
+        # 使用 NumPy 一次批量计算到所有目标小区的距离
+        all_distances = self._batch_distances_to_targets(source_lat, source_lon)
+
+        for i, (_, target_row) in enumerate(self.target_cells_df.iterrows()):
             target_key = self.get_cell_key(target_row)
 
             # 跳过自身
             if source_key == target_key:
                 continue
 
-            target_lat = target_row.get('lat')
-            target_lon = target_row.get('lon')
+            # 跳过缺少经纬度的行（预计算掩码）
+            if not self._target_valid_mask[i]:
+                continue
+
             target_cover_type = target_row.get('cell_cover_type', 1)
             is_target_indoor = (target_cover_type == 4)
 
-            if pd.isna(target_lat) or pd.isna(target_lon):
-                continue
-
-            # 计算距离
-            distance = self.calculate_distance(source_lat, source_lon, target_lat, target_lon)
+            # 查询批量计算结果（O(1) 数组访问替代逐对 Haversine）
+            distance = float(all_distances[i])
 
             # 规则1：室外-室外300米内站点的所有小区作为邻区
             if not is_source_indoor and not is_target_indoor:
@@ -417,8 +470,8 @@ class NeighborPlanner:
                     forced_neighbor_keys.add(target_key)
                     continue
 
-            # 其他情况进入剩余候选
-            step1_remaining_candidates.append((target_row, distance))
+            # 其他情况进入剩余候选（带行号索引）
+            step1_remaining_candidates.append((i, target_row, distance))
 
         logger.debug(f"第一步距离筛选: 源小区={source_key}, 强制邻区={len(step1_forced_neighbors)}, 剩余候选={len(step1_remaining_candidates)}")
 
@@ -439,11 +492,8 @@ class NeighborPlanner:
             self.default_coverage_distance, self.coverage_radius_factor
         )
 
-        for target_row, distance in step1_remaining_candidates:
+        for i, target_row, distance in step1_remaining_candidates:
             target_key = self.get_cell_key(target_row)
-            target_lat = target_row.get('lat')
-            target_lon = target_row.get('lon')
-            target_azimuth = target_row.get('azimuth')
             target_cover_type = target_row.get('cell_cover_type', 1)
             is_target_indoor = (target_cover_type == 4)
 
@@ -453,26 +503,16 @@ class NeighborPlanner:
                     step2_candidates.append((target_row, distance))
                 continue
 
-            # 获取目标小区的覆盖圆
-            if pd.notna(target_azimuth):
-                target_center_lat, target_center_lon = self.calculate_coverage_circle_center(
-                    target_lat, target_lon, target_azimuth,
-                    self.coverage_distance_factor, self.default_coverage_distance
-                )
-            else:
-                target_center_lat, target_center_lon = target_lat, target_lon
+            # 使用预计算的目标小区覆盖圆数据（避免逐对三角函数运算）
+            tclat = self._target_center_lats[i]
+            tclon = self._target_center_lons[i]
+            trad = self._target_radii[i]
 
-            target_radius = self.calculate_coverage_radius(
-                self.default_coverage_distance, self.coverage_radius_factor
+            # 判断覆盖圆是否相交（覆盖圆中心的距离 <= 两圆半径之和）
+            center_dist = self.calculate_distance(
+                source_center_lat, source_center_lon, tclat, tclon
             )
-
-            # 判断覆盖圆是否相交
-            is_intersecting = self.are_coverage_circles_intersecting(
-                source_center_lat, source_center_lon, source_radius,
-                target_center_lat, target_center_lon, target_radius
-            )
-
-            if is_intersecting:
+            if center_dist <= (source_radius + trad):
                 step2_candidates.append((target_row, distance))
 
         logger.debug(f"第二步覆盖圆筛选: 候选数={len(step2_candidates)}")
@@ -516,7 +556,7 @@ class NeighborPlanner:
         if step1_remaining_candidates:
             # 计算第一步剩余候选中的站点数量
             unique_target_sites = set()
-            for target_row, _ in step1_remaining_candidates:
+            for _i, target_row, _ in step1_remaining_candidates:
                 target_enodeb_id = str(target_row.get('enodeb_id', ''))
                 unique_target_sites.add(target_enodeb_id)
 
@@ -532,7 +572,7 @@ class NeighborPlanner:
 
                 logger.debug(f"第四步兜底逻辑: 源小区={source_key}, 剩余候选站点数={site_count}, 第三步候选数={candidate_count}, 站间距={site_spacing:.3f}km")
 
-                for target_row, distance in step1_remaining_candidates:
+                for _i, target_row, distance in step1_remaining_candidates:
                     target_key = self.get_cell_key(target_row)
                     target_cover_type = target_row.get('cell_cover_type', 1)
                     is_target_indoor = (target_cover_type == 4)
@@ -700,8 +740,8 @@ class NeighborPlanner:
 
         return final_neighbors
     
-    async def plan(self, source_sites: List[Dict], target_sites: List[Dict],
-                  progress_callback: Optional[Callable[[float], Any]] = None) -> NeighborPlanningResult:
+    def plan(self, source_sites: List[Dict], target_sites: List[Dict],
+             progress_callback: Optional[Callable[[float], Any]] = None) -> NeighborPlanningResult:
         """
         执行邻区规划
         """
@@ -762,13 +802,8 @@ class NeighborPlanner:
             # 更新进度
             if progress_callback:
                 progress = (idx + 1) / total_cells * 100
-                await progress_callback(progress)
-            
-            # 手动交出控制权，避免阻塞事件循环
-            if idx % 10 == 0:
-                import asyncio
-                await asyncio.sleep(0)
-        
+                progress_callback(progress)
+
         total_neighbors = len(all_neighbors)
         avg_neighbors = total_neighbors / total_cells if total_cells > 0 else 0.0
         
@@ -822,7 +857,7 @@ class NeighborPlanner:
         )
 
 
-async def run_neighbor_planning(
+def run_neighbor_planning(
     config: NeighborConfig,
     source_sites: List[Dict],
     target_sites: List[Dict],
@@ -830,20 +865,20 @@ async def run_neighbor_planning(
 ) -> Dict[str, Any]:
     """
     运行邻区规划
-    
+
     Args:
         config: 规划配置
         source_sites: 待规划小区（源小区）列表
         target_sites: 全网小区（目标小区）列表
         progress_callback: 进度回调
-    
+
     Returns:
         规划结果字典
     """
     planner = NeighborPlanner(config)
-    
+
     # 执行规划
-    result = await planner.plan(
+    result = planner.plan(
         source_sites,
         target_sites,
         progress_callback

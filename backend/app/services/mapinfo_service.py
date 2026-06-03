@@ -7,13 +7,23 @@ MapInfo 文件解析服务
 - .dat: 数据文件
 """
 import os
+import time
 import uuid
+import json
 from typing import List, Dict, Any, Optional
 from pathlib import Path
+from datetime import datetime
 from dataclasses import dataclass
 from enum import Enum
 
 from app.utils.coordinate_transformer import CoordinateTransformer
+from app.core.database import SessionLocal
+from app.models.database import Layer
+
+# MapInfo 图层数据缓存（避免每次请求都重新解析文件）
+_layer_cache: Dict[str, Dict] = {}
+_layer_cache_mtime: Dict[str, float] = {}
+_layer_cache_ttl: int = 600  # 缓存10分钟
 
 
 class GeometryType(Enum):
@@ -773,8 +783,8 @@ class MapInfoParser:
         layers = []
         processed_files = set()  # 跟踪已处理的文件（避免重复）
 
-        # 首先查找所有 .tab 文件（不区分大小写）
-        tab_files = sorted([f for f in dir_path.iterdir() if f.suffix.lower() == '.tab' and f.is_file()])
+        # 首先查找所有 .tab 文件（递归搜索子目录，不区分大小写）
+        tab_files = sorted([f for f in dir_path.rglob("*") if f.suffix.lower() == '.tab' and f.is_file()])
         for tab_file in tab_files:
             try:
                 print(f"[MapInfoParser] 解析 TAB 文件: {tab_file.name}")
@@ -792,8 +802,8 @@ class MapInfoParser:
                 import traceback
                 traceback.print_exc()
 
-        # 然后查找 .mif 文件（不区分大小写，只处理没有对应 .tab 文件的）
-        mif_files = sorted([f for f in dir_path.iterdir() if f.suffix.lower() == '.mif' and f.is_file()])
+        # 然后查找 .mif 文件（不区分大小写，递归搜索子目录，只处理没有对应 .tab 文件的）
+        mif_files = sorted([f for f in dir_path.rglob("*") if f.suffix.lower() == '.mif' and f.is_file()])
         for mif_file in mif_files:
             # 检查是否已经处理过同名的 .tab 文件
             if mif_file.stem.lower() in processed_files:
@@ -818,9 +828,14 @@ class MapInfoParser:
         return layers
 
 
-def parse_mapinfo_files(upload_path: Path) -> List[Dict[str, Any]]:
+def parse_mapinfo_files(upload_path: Path, user_id: int = 1, parent_id: str = None) -> List[Dict[str, Any]]:
     """
     解析上传的 MapInfo 文件
+
+    Args:
+        upload_path: 文件或目录路径
+        user_id: 用户ID
+        parent_id: 可选的父级 data_id（与 API 层 data_id 一致，避免写入时生成新 UUID）
 
     返回图层元数据列表
     """
@@ -837,13 +852,23 @@ def parse_mapinfo_files(upload_path: Path) -> List[Dict[str, Any]]:
                 "feature_count": len(layer.features),
                 "metadata": layer.metadata
             })
+            _save_layer_metadata(
+                user_id=user_id,
+                name=layer.name,
+                file_path=str(upload_path),
+                layer_type=layer.type.value,
+                geometry_type=layer.type.value,
+                feature_count=len(layer.features),
+                file_size=upload_path.stat().st_size if upload_path.exists() else None,
+                layer_id=parent_id,
+            )
         except Exception as e:
             print(f"[MapInfo] 解析文件失败 {upload_path}: {e}")
 
     elif upload_path.is_dir():
         # 目录，查找所有 MapInfo 文件
         mapinfo_layers = MapInfoParser.parse_directory(upload_path)
-        for layer in mapinfo_layers:
+        for idx, layer in enumerate(mapinfo_layers):
             layers.append({
                 "id": layer.id,
                 "name": layer.name,
@@ -851,22 +876,93 @@ def parse_mapinfo_files(upload_path: Path) -> List[Dict[str, Any]]:
                 "feature_count": len(layer.features),
                 "metadata": layer.metadata
             })
+            # 使用 parent_id；多个图层时追加序号
+            _layer_id = parent_id if idx == 0 and parent_id else (f"{parent_id}_{idx}" if parent_id else None)
+            _save_layer_metadata(
+                user_id=user_id,
+                name=layer.name,
+                file_path=str(upload_path / layer.name) if hasattr(layer, 'name') else str(upload_path),
+                layer_type=layer.type.value,
+                geometry_type=layer.type.value,
+                feature_count=len(layer.features),
+                file_size=None,
+                layer_id=_layer_id,
+            )
 
     return layers
+
+
+def _save_layer_metadata(
+    user_id: int,
+    name: str,
+    file_path: str,
+    layer_type: str,
+    geometry_type: str,
+    feature_count: int,
+    bbox: Optional[List[float]] = None,
+    file_size: Optional[int] = None,
+    layer_id: Optional[str] = None,
+):
+    """保存图层文件元数据到 SQLite"""
+    db = SessionLocal()
+    try:
+        layer = Layer(
+            id=layer_id or str(uuid.uuid4()),
+            user_id=user_id,
+            name=name,
+            file_path=file_path,
+            layer_type=layer_type,
+            geometry_type=geometry_type,
+            feature_count=feature_count,
+            bbox=json.dumps(bbox) if bbox else None,
+            file_size=file_size,
+            created_at=datetime.now().isoformat(),
+        )
+        db.add(layer)
+        db.commit()
+        print(f"[MapInfoService] 图层元数据已入库: id={layer.id}")
+    except Exception as e:
+        db.rollback()
+        print(f"[MapInfoService] 图层元数据入库失败 (非致命): {e}")
+    finally:
+        db.close()
+
+
+def clear_layer_cache(data_id: Optional[str] = None):
+    """清除图层数据缓存
+
+    Args:
+        data_id: 如果指定，只清除该数据ID的缓存；否则清除全部
+    """
+    global _layer_cache, _layer_cache_mtime
+    if data_id:
+        prefix = f"{data_id}:"
+        keys_to_remove = [k for k in _layer_cache if k.startswith(prefix)]
+        for key in keys_to_remove:
+            _layer_cache.pop(key, None)
+            _layer_cache_mtime.pop(key, None)
+        print(f"[MapInfo] 已清除 {len(keys_to_remove)} 个图层缓存 (data_id={data_id})")
+    else:
+        count = len(_layer_cache)
+        _layer_cache.clear()
+        _layer_cache_mtime.clear()
+        print(f"[MapInfo] 已清除全部 {count} 个图层缓存")
 
 
 def get_layer_data(data_id: str, layer_id: str, data_dir: Path) -> Optional[Dict]:
     """
     获取图层数据
 
-    返回 GeoJSON 格式的数据
+    返回 GeoJSON 格式的数据。包含缓存层，基于源文件 mtime 验证。
     """
     import json
-    
+
+    cache_key = f"{data_id}:{layer_id}"
+
     # 1. 尝试从 layers.json 中查找图层信息
     layers_file = data_dir / "layers.json"
     target_layer_info = None
-    
+
     if layers_file.exists():
         try:
             with open(layers_file, 'r', encoding='utf-8') as f:
@@ -878,56 +974,65 @@ def get_layer_data(data_id: str, layer_id: str, data_dir: Path) -> Optional[Dict
         except Exception as e:
             print(f"[MapInfo] 读取 layers.json 失败: {e}")
 
-    # 2. 如果找到了图层信息，直接解析源文件
+    # 2. 确定源文件路径（用于缓存 mtime 验证）
+    source_path = None
     if target_layer_info:
         source_file = target_layer_info.get('metadata', {}).get('source_file')
         if source_file:
-            source_path = Path(source_file)
-            if source_path.exists():
-                try:
-                    # 使用 parse_file (geopandas) 解析
-                    # 注意：parse_file 会生成新的 UUID，但我们要返回的是数据，ID不重要，或者可以覆盖
-                    layer = MapInfoParser.parse_file(source_path)
-                    # 覆盖 ID 以匹配请求的 ID (虽然前端可能不care，但保持一致更好)
-                    layer.id = layer_id
-                    return _convert_to_geojson(layer)
-                except Exception as e:
-                    print(f"[MapInfo] 解析源文件失败 {source_path}: {e}")
-        
-        # 如果没有 source_file，尝试通过 name 推断
-        name = target_layer_info.get('name')
-        if name:
-            # 尝试找同名文件
-            for ext in ['.tab', '.mif']:
-                potential_file = data_dir / f"{name}{ext}"
-                if potential_file.exists():
-                    try:
-                        layer = MapInfoParser.parse_file(potential_file)
-                        layer.id = layer_id
-                        return _convert_to_geojson(layer)
-                    except Exception as e:
-                        print(f"[MapInfo] 解析推断文件失败 {potential_file}: {e}")
+            candidate = Path(source_file)
+            if candidate.exists():
+                source_path = candidate
+        if source_path is None:
+            name = target_layer_info.get('name')
+            if name:
+                for ext in ['.tab', '.mif']:
+                    candidate = data_dir / f"{name}{ext}"
+                    if candidate.exists():
+                        source_path = candidate
+                        break
 
-    # 3. 如果 layers.json 不存在或没找到，回退到遍历目录 (旧逻辑，但改进匹配)
-    # 这主要用于兼容旧数据或直接上传的情况
-    print(f"[MapInfo] 未在 layers.json 中找到图层 {layer_id}，尝试遍历目录")
-    for file_path in list(data_dir.glob('*.tab')) + list(data_dir.glob('*.mif')):
+    # 3. 检查缓存（基于源文件 mtime）
+    if source_path and cache_key in _layer_cache:
         try:
-            # 解析文件
-            layer = MapInfoParser.parse_file(file_path)
-            # 这里的 ID 肯定是新的，所以无法通过 ID 匹配
-            # 除非我们假设只有一个图层，或者文件名匹配
-            # 这里如果不匹配 ID，就返回第一个成功的？这不可靠。
-            # 但没办法，如果 layers.json 丢失，我们只能做到这一步。
-            # 更好的做法是：如果不匹配 layers.json，就不返回。
-            
-            # 暂时逻辑：如果解析成功，且文件名匹配（如果 info 有 name），或者直接返回第一个
-            return _convert_to_geojson(layer)
-        except Exception as e:
-            print(f"[MapInfo] 解析失败 {file_path}: {e}")
-            continue
+            current_mtime = source_path.stat().st_mtime
+            if _layer_cache_mtime.get(cache_key) == current_mtime:
+                print(f"[MapInfo] 使用图层缓存: {cache_key}")
+                return _layer_cache[cache_key]
+        except Exception:
+            pass
 
-    return None
+    # 4. 缓存未命中，解析文件
+    result = None
+
+    if target_layer_info and source_path:
+        try:
+            layer = MapInfoParser.parse_file(source_path)
+            layer.id = layer_id
+            result = _convert_to_geojson(layer)
+        except Exception as e:
+            print(f"[MapInfo] 解析源文件失败 {source_path}: {e}")
+
+    # 5. 回退：遍历目录
+    if result is None:
+        print(f"[MapInfo] 未在 layers.json 中找到图层 {layer_id}，尝试遍历目录")
+        for file_path in list(data_dir.rglob('*.tab')) + list(data_dir.rglob('*.mif')):
+            try:
+                layer = MapInfoParser.parse_file(file_path)
+                result = _convert_to_geojson(layer)
+                break
+            except Exception as e:
+                print(f"[MapInfo] 解析失败 {file_path}: {e}")
+                continue
+
+    # 6. 写入缓存
+    if result is not None and source_path:
+        try:
+            _layer_cache[cache_key] = result
+            _layer_cache_mtime[cache_key] = source_path.stat().st_mtime
+        except Exception:
+            pass
+
+    return result
 
 
 def _convert_to_geojson(layer: MapInfoLayer, transform_coords: bool = False) -> Dict:

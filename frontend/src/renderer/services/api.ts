@@ -8,7 +8,16 @@ import type {
   PCIResult,
   UploadResponse,
   DataItem,
-  TaskProgress
+  TaskProgress,
+  LoginRequest,
+  RegisterRequest,
+  ChangePasswordRequest,
+  ResetPasswordRequest,
+  TokenResponse,
+  UserInfo,
+  UserListResponse,
+  UserUpdateRequest,
+  UserDetailResponse,
 } from '@shared/types'
 
 const API_BASE_URL = '/api/v1'
@@ -66,7 +75,17 @@ uploadClient.interceptors.request.use(
 // 请求拦截器
 apiClient.interceptors.request.use(
   (config) => {
-    // 可以在这里添加token等
+    // 添加认证 token
+    const stored = localStorage.getItem('auth-storage')
+    if (stored) {
+      try {
+        const parsed = JSON.parse(stored)
+        const token = parsed?.state?.token
+        if (token) {
+          config.headers.Authorization = `Bearer ${token}`
+        }
+      } catch { /* ignore parse errors */ }
+    }
     return config
   },
   (error) => {
@@ -121,8 +140,26 @@ apiClient.interceptors.response.use(
       // 兼容detail和message字段
       let message = error.message
 
-      // 对于二进制响应类型，我们无法解析错误信息
+      // 对于二进制响应类型，尝试从Blob中读取错误详情
       if (error.response.request.responseType === 'blob' || error.response.request.responseType === 'arraybuffer') {
+        const blob = error.response.data
+        if (blob && blob instanceof Blob && blob.size > 0) {
+          return new Promise((resolve, reject) => {
+            const reader = new FileReader()
+            reader.onload = () => {
+              try {
+                const text = reader.result as string
+                const errData = JSON.parse(text)
+                const detail = errData.detail || errData.message || message
+                reject(new Error(detail))
+              } catch {
+                reject(new Error(message))
+              }
+            }
+            reader.onerror = () => reject(new Error(message))
+            reader.readAsText(blob)
+          })
+        }
         return Promise.reject(new Error(message))
       }
 
@@ -144,6 +181,15 @@ apiClient.interceptors.response.use(
         message: message || '请求失败',
         code: error.response.status
       }
+
+      // 401 未认证时清除本地认证状态
+      if (error.response.status === 401) {
+        try {
+          localStorage.removeItem('auth-storage')
+          window.dispatchEvent(new CustomEvent('auth:required'))
+        } catch { /* ignore */ }
+      }
+
       return Promise.reject(errorObj)
     }
 
@@ -242,9 +288,13 @@ export const licenseApi = {
   upload: async (file: File): Promise<ApiResponse<{ success: boolean }>> => {
     const formData = new FormData()
     formData.append('file', file)
-    // 使用 uploadClient 发送
     return uploadClient.post('/license/upload', formData)
-  }
+  },
+
+  // 管理员更新全局授权期限
+  updateExpiry: async (expiryDate: string | null): Promise<ApiResponse<any>> => {
+    return apiClient.post('/license/update-expiry', { expiry_date: expiryDate }) as any
+  },
 }
 
 // ===== 分块上传辅助函数（解决 Cloudflare Tunnel 524 超时） =====
@@ -486,9 +536,19 @@ export const dataApi = {
     return apiClient.get(`/data/${id}`)
   },
 
-  // 工参更新
-  updateParameters: async (fullParamId: string, currentParamId: string): Promise<ApiResponse<{ newFileId: string; newFileName: string; savedToOriginal: boolean }>> => {
+  // 工参更新（异步任务）
+  updateParameters: async (fullParamId: string, currentParamId: string): Promise<ApiResponse<{ taskId: string; message: string }>> => {
     return apiClient.post('/data/update-parameters', { fullParamId, currentParamId })
+  },
+
+  /** 获取工参更新任务进度 */
+  getUpdateParamsProgress: async (taskId: string): Promise<ApiResponse<any>> => {
+    return apiClient.get(`/data/update-parameters/progress/${taskId}`)
+  },
+
+  /** 获取工参更新任务结果 */
+  getUpdateParamsResult: async (taskId: string): Promise<ApiResponse<any>> => {
+    return apiClient.get(`/data/update-parameters/result/${taskId}`)
   },
 
   // 导入点数据
@@ -594,9 +654,34 @@ export const pciApi = {
     return response.data  // Blob直接返回data
   },
 
-  // 应用到工参
-  applyToParams: async (taskId: string): Promise<ApiResponse<{ message: string; updatedCount: number }>> => {
+  // 应用到工参（异步任务模式）
+  applyToParams: async (taskId: string): Promise<ApiResponse<{ taskId: string; message: string }>> => {
     return apiClient.post(`/pci/apply-to-params/${taskId}`)
+  },
+
+  // 获取应用到工参进度
+  getApplyProgress: async (applyTaskId: string): Promise<ApiResponse<any>> => {
+    return apiClient.get(`/pci/apply-to-params/progress/${applyTaskId}`)
+  },
+
+  // 获取历史任务列表
+  getHistory: async (): Promise<ApiResponse<any[]>> => {
+    return apiClient.get('/pci/history')
+  },
+
+  // 删除历史任务
+  deleteHistory: async (taskId: string): Promise<ApiResponse<any>> => {
+    return apiClient.delete(`/pci/history/${taskId}`)
+  },
+
+  // 获取应用到工参结果
+  getApplyResult: async (applyTaskId: string): Promise<ApiResponse<any>> => {
+    return apiClient.get(`/pci/apply-to-params/result/${applyTaskId}`)
+  },
+
+  // 标记任务为已应用
+  markApplied: async (taskId: string): Promise<ApiResponse<any>> => {
+    return apiClient.post(`/pci/history/${taskId}/mark-applied`)
   }
 }
 
@@ -615,6 +700,16 @@ export const tacApi = {
   // 获取核查结果
   getResult: async (taskId: string): Promise<ApiResponse<any>> => {
     return apiClient.get(`/tac/result/${taskId}`)
+  },
+
+  // 获取历史任务列表
+  getHistory: async (): Promise<ApiResponse<any[]>> => {
+    return apiClient.get('/tac/history')
+  },
+
+  // 删除历史任务
+  deleteHistory: async (taskId: string): Promise<ApiResponse<any>> => {
+    return apiClient.delete(`/tac/history/${taskId}`)
   },
 
   // 导出核查结果
@@ -639,6 +734,16 @@ export const tacPlanningApi = {
     return apiClient.get(`/tac/planning/progress/${taskId}`)
   },
 
+  // 获取历史任务列表
+  getHistory: async (): Promise<ApiResponse<any[]>> => {
+    return apiClient.get('/tac/planning/history')
+  },
+
+  // 删除历史任务
+  deleteHistory: async (taskId: string): Promise<ApiResponse<any>> => {
+    return apiClient.delete(`/tac/planning/history/${taskId}`)
+  },
+
   // 获取规划结果
   getResult: async (taskId: string): Promise<ApiResponse<any>> => {
     return apiClient.get(`/tac/planning/result/${taskId}`)
@@ -651,6 +756,26 @@ export const tacPlanningApi = {
       params: { format }
     })
     return response.data
+  },
+
+  // 应用到工参（异步任务模式）
+  applyToParams: async (taskId: string): Promise<ApiResponse<{ taskId: string; message: string }>> => {
+    return apiClient.post(`/tac/planning/apply-to-params/${taskId}`)
+  },
+
+  // 获取应用到工参进度
+  getApplyProgress: async (applyTaskId: string): Promise<ApiResponse<any>> => {
+    return apiClient.get(`/tac/planning/apply-to-params/progress/${applyTaskId}`)
+  },
+
+  // 获取应用到工参结果
+  getApplyResult: async (applyTaskId: string): Promise<ApiResponse<any>> => {
+    return apiClient.get(`/tac/planning/apply-to-params/result/${applyTaskId}`)
+  },
+
+  // 标记任务为已应用
+  markApplied: async (taskId: string): Promise<ApiResponse<any>> => {
+    return apiClient.post(`/tac/planning/history/${taskId}/mark-applied`)
   }
 }
 
@@ -671,15 +796,23 @@ export const neighborApi = {
     return apiClient.get(`/neighbor/result/${taskId}`)
   },
 
+  // 获取历史任务列表
+  getHistory: async (): Promise<ApiResponse<any[]>> => {
+    return apiClient.get('/neighbor/history')
+  },
+
+  // 删除历史任务
+  deleteHistory: async (taskId: string): Promise<ApiResponse<any>> => {
+    return apiClient.delete(`/neighbor/history/${taskId}`)
+  },
+
   // 导出结果
   export: async (taskId: string, format: 'xlsx' | 'csv'): Promise<Blob> => {
     const response = await apiClient.get(`/neighbor/export/${taskId}`, {
       responseType: 'blob',
       params: { format }
     })
-    // 注意：对于blob响应，响应拦截器会返回完整的响应对象，而不是response.data
-    // 因此需要直接访问response.data获取Blob对象
-    return response.data  // Blob直接返回data
+    return response.data
   }
 }
 
@@ -803,3 +936,70 @@ export function stopHealthCheck(): void {
 }
 
 export default apiClient
+
+// ============== 认证API ==============
+export const authApi = {
+  login: async (data: LoginRequest): Promise<ApiResponse<TokenResponse>> => {
+    return apiClient.post('/auth/login', data) as any
+  },
+
+  register: async (data: RegisterRequest): Promise<ApiResponse<TokenResponse>> => {
+    return apiClient.post('/auth/register', data) as any
+  },
+
+  getMe: async (): Promise<ApiResponse<UserInfo>> => {
+    return apiClient.get('/auth/me') as any
+  },
+
+  logout: async (): Promise<ApiResponse<any>> => {
+    return apiClient.post('/auth/logout') as any
+  },
+
+  changePassword: async (data: ChangePasswordRequest): Promise<ApiResponse<any>> => {
+    return apiClient.post('/auth/change-password', data) as any
+  },
+}
+
+// ============== 管理员用户管理API ==============
+export const adminUserApi = {
+  listUsers: async (page: number = 1, pageSize: number = 20, search?: string, isActive?: boolean): Promise<ApiResponse<UserListResponse>> => {
+    const params: any = { page, page_size: pageSize }
+    if (search) params.search = search
+    if (isActive !== undefined) params.is_active = isActive
+    return apiClient.get('/admin/users/', { params }) as any
+  },
+
+  createUser: async (data: RegisterRequest & { is_admin?: boolean; license_expiry?: string | null }): Promise<ApiResponse<UserInfo>> => {
+    return apiClient.post('/admin/users/', data) as any
+  },
+
+  getUser: async (userId: number): Promise<ApiResponse<UserDetailResponse>> => {
+    return apiClient.get(`/admin/users/${userId}`) as any
+  },
+
+  updateUser: async (userId: number, data: UserUpdateRequest): Promise<ApiResponse<UserInfo>> => {
+    return apiClient.put(`/admin/users/${userId}`, data) as any
+  },
+
+  deleteUser: async (userId: number): Promise<ApiResponse<any>> => {
+    return apiClient.delete(`/admin/users/${userId}`) as any
+  },
+
+  resetPassword: async (userId: number, data: ResetPasswordRequest): Promise<ApiResponse<any>> => {
+    return apiClient.post(`/admin/users/${userId}/reset-password`, data) as any
+  },
+}
+
+// ============== 用户个性化设置 API ==============
+// 存储用户的图层控制、标签设置等个性化配置，按用户持久化
+export const userSettingsApi = {
+  /** 获取当前用户的个性化设置 */
+  getSettings: async (): Promise<ApiResponse<{ user_id: number; settings: Record<string, any>; updated_at: string | null }>> => {
+    return apiClient.get('/user/settings') as any
+  },
+
+  /** 更新当前用户的个性化设置（全量替换） */
+  updateSettings: async (settings: Record<string, any>): Promise<ApiResponse<{ user_id: number; settings: Record<string, any>; updated_at: string }>> => {
+    return apiClient.put('/user/settings', { settings }) as any
+  },
+}

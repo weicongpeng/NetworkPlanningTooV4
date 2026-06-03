@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import Response
 from contextlib import asynccontextmanager
 import logging
 import socket
@@ -68,6 +69,16 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"❌ 清理无效数据索引失败: {e}")
 
+    # 初始化用户数据库
+    try:
+        from app.core.database import init_db, create_default_admin
+        init_db()
+        logger.info("✅ 用户数据库初始化完成")
+        create_default_admin()
+        logger.info("✅ 默认管理员账号检查完成")
+    except Exception as e:
+        logger.error(f"❌ 用户数据库初始化失败: {e}")
+
     logger.info("应用启动完成")
     yield
 
@@ -89,13 +100,41 @@ def create_app() -> FastAPI:
     class UTF8JSONResponse(JSONResponse):
         def render(self, content: Any) -> bytes:
             # 使用UTF-8编码序列化JSON
-            return json.dumps(
-                content,
-                ensure_ascii=False,
-                allow_nan=False,
-                indent=None,
-                separators=(",", ":"),
-            ).encode("utf-8")
+            # 🔥 禁止 allow_nan，避免 NaN/Infinity 产生非法 JSON 导致前端 JSON.parse 失败
+            # NaN/Infinity 会被 json.dumps 拒绝（raise ValueError），通过 sanitize 转为字符串
+            try:
+                return json.dumps(
+                    content,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    indent=None,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            except (ValueError, OverflowError) as e:
+                # 回退：递归替换 NaN/Infinity 为字符串，确保响应始终有效 JSON
+                import math as _math
+                def _sanitize(obj):
+                    if isinstance(obj, float):
+                        if _math.isnan(obj):
+                            return None
+                        if _math.isinf(obj):
+                            return None
+                        return obj
+                    elif isinstance(obj, dict):
+                        return {k: _sanitize(v) for k, v in obj.items()}
+                    elif isinstance(obj, (list, tuple)):
+                        return [_sanitize(i) for i in obj]
+                    elif isinstance(obj, (int, bool, str, type(None))):
+                        return obj
+                    else:
+                        return str(obj)
+                return json.dumps(
+                    _sanitize(content),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    indent=None,
+                    separators=(",", ":"),
+                ).encode("utf-8")
 
     app = FastAPI(
         title=settings.PROJECT_NAME,
@@ -124,6 +163,14 @@ def create_app() -> FastAPI:
     # GZip 压缩（对大响应启用，移动端受益明显：9MB → ~1.5MB）
     app.add_middleware(GZipMiddleware, minimum_size=1024)
 
+    # 添加 Cache-Control 中间件：防止 HTML 被浏览器缓存
+    @app.middleware("http")
+    async def add_cache_control(request, call_next):
+        response = await call_next(request)
+        if response.headers.get("content-type", "").startswith("text/html"):
+            response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        return response
+
     # 注册路由
     app.include_router(api_router, prefix=settings.API_V1_STR)
 
@@ -132,12 +179,28 @@ def create_app() -> FastAPI:
     settings.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     app.mount("/static", StaticFiles(directory=str(settings.OUTPUT_DIR)), name="static")
 
+    def _serve_index():
+        """读取 index.html 并返回 HTML 响应（禁用缓存）"""
+        index_path = FRONTEND_DIST / "index.html"
+        if not index_path.exists():
+            return None
+        from fastapi.responses import Response
+        content = index_path.read_text(encoding="utf-8")
+        return Response(
+            content=content,
+            media_type="text/html",
+            headers={
+                "Cache-Control": "no-cache, no-store, must-revalidate",
+                "Pragma": "no-cache",
+                "Expires": "0",
+            }
+        )
+
     @app.get("/")
     async def root():
-        # 前端已构建时，返回前端页面
-        index_path = FRONTEND_DIST / "index.html"
-        if index_path.exists():
-            return HTMLResponse(index_path.read_text(encoding="utf-8"))
+        result = _serve_index()
+        if result:
+            return result
         return {
             "message": "网络规划工具API",
             "version": settings.VERSION,
@@ -158,12 +221,21 @@ def create_app() -> FastAPI:
 
         file_path = FRONTEND_DIST / full_path
         if file_path.exists() and file_path.is_file():
-            return FileResponse(file_path)
+            # JS/CSS 等带 hash 的静态资源可以缓存（Vite 输出文件名含内容哈希）
+            # 没有 hash 的普通文件短时间缓存
+            ext = Path(full_path).suffix
+            if ext in ('.js', '.css'):
+                return FileResponse(file_path, headers={
+                    "Cache-Control": "public, max-age=31536000, immutable",
+                })
+            return FileResponse(file_path, headers={
+                "Cache-Control": "no-cache, must-revalidate",
+            })
 
         # SPA 回退：所有前端路由都返回 index.html
-        index_path = FRONTEND_DIST / "index.html"
-        if index_path.exists():
-            return HTMLResponse(index_path.read_text(encoding="utf-8"), media_type="text/html")
+        result = _serve_index()
+        if result:
+            return result
 
         raise HTTPException(status_code=404)
 

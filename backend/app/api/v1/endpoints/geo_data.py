@@ -75,11 +75,13 @@ async def upload_geo_data(
         if not saved_file_path.exists():
             raise FileNotFoundError(f"文件保存失败: {saved_file_path}")
 
-        # 解析数据
+        # 解析数据（传入 data_id 避免元数据写入时生成新 UUID）
         parse_result = await run_in_threadpool(
             geo_data_service.parse_geo_data,
             str(saved_file_path),
-            filename
+            filename,
+            1,  # user_id
+            data_id,  # geo_id
         )
 
         # 保存解析结果到 JSON 文件
@@ -106,8 +108,8 @@ async def upload_geo_data(
                 'pointCount': parse_result['pointCount']
             }
         }
+        # 持久化索引到 index.json（防止重启后丢失）
         data_service._save_index()
-
         # 返回结果
         return {
             'success': True,

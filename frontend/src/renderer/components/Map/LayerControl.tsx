@@ -253,7 +253,8 @@ export function LayerControl({
   const { t } = useTranslation()
 
   // 从持久化 store 获取标签设置
-  const { labelSettingsMap: persistedLabelSettings, setLabelSettings } = useMapStore()
+  const { mapSettings, setLabelSettings: storeUpdateLabelSettings } = useMapStore()
+  const persistedLabelSettings = mapSettings.labelSettingsMap
 
   // 用户手动切换的展开节点ID集合
   const [expandedNodeIds, setExpandedNodeIds] = useState<Set<string>>(new Set(['root', 'sector-group', 'custom-group']))
@@ -842,7 +843,7 @@ export function LayerControl({
 
     if (layerId) {
       // 保存到持久化 store
-      setLabelSettings(layerId, settings)
+      storeUpdateLabelSettings(layerId, settings)
     }
 
     // 通知父组件更新标签配置

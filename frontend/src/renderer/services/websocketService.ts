@@ -4,7 +4,7 @@
  */
 
 interface WebSocketMessage {
-  type: 'progress' | 'complete' | 'failed' | 'pong'
+  type: 'progress' | 'complete' | 'failed' | 'pong' | 'task_deleted'
   taskId: string
   data?: any
   timestamp?: number
@@ -14,10 +14,13 @@ interface SubscribeCallback {
   (message: WebSocketMessage): void
 }
 
+type GlobalCallback = (message: WebSocketMessage) => void
+
 class WebSocketService {
   private static instance: WebSocketService
   private ws: WebSocket | null = null
   private subscriptions: Map<string, Set<SubscribeCallback>> = new Map()
+  private globalCallbacks: Set<GlobalCallback> = new Set()
   private reconnectAttempts = 0
   private maxReconnectAttempts = 2  // 减少重连次数，更快降级到轮询
   private reconnectDelay = 3000
@@ -220,7 +223,17 @@ class WebSocketService {
    * @param message 消息
    */
   private handleMessage(message: WebSocketMessage): void {
-    const { taskId } = message
+    const { taskId, type } = message
+
+    // "task_deleted" 事件: 通知所有全局监听器
+    if (type === 'task_deleted') {
+      this.globalCallbacks.forEach((callback) => {
+        try { callback(message) } catch (error) {
+          console.error('[WebSocketService] 全局回调执行失败:', error)
+        }
+      })
+      return
+    }
 
     // 触发该任务的所有订阅回调
     const callbacks = this.subscriptions.get(taskId)
@@ -232,6 +245,16 @@ class WebSocketService {
           console.error('[WebSocketService] 回调执行失败:', error)
         }
       })
+    }
+  }
+
+  /**
+   * 注册全局消息监听器（用于 task_deleted 等非特定任务事件）
+   */
+  onGlobalMessage(callback: GlobalCallback): () => void {
+    this.globalCallbacks.add(callback)
+    return () => {
+      this.globalCallbacks.delete(callback)
     }
   }
 

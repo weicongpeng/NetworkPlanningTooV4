@@ -1,11 +1,12 @@
 """
 地图服务API端点
 """
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.concurrency import run_in_threadpool
 from typing import Dict, Any, Optional, List
 from app.models.schemas import OnlineMapConfig, OfflineMapConfig, MapData
 from app.core.config import settings
+from app.core.security import get_current_user
 import logging
 import json
 import time
@@ -17,7 +18,7 @@ router = APIRouter()
 # 地图数据缓存
 _map_data_cache: Optional[Dict[str, Any]] = None
 _map_data_cache_time: float = 0
-_map_data_cache_ttl: int = 300  # 缓存5分钟
+_map_data_cache_ttl: int = 1800  # 缓存30分钟（数据变更时主动失效）
 
 
 def _filter_sites_by_bbox(sites: List[Dict], min_lat: float, max_lat: float, min_lon: float, max_lon: float) -> List[Dict]:
@@ -37,7 +38,8 @@ async def get_map_data(
     max_lat: Optional[float] = None,
     min_lon: Optional[float] = None,
     max_lon: Optional[float] = None,
-    limit: int = 10000
+    limit: int = 10000,
+    current_user=Depends(get_current_user),
 ) -> Dict[str, Any]:
     """获取地图数据 - 从已导入的Excel数据中聚合
     
@@ -86,95 +88,120 @@ async def get_map_data(
 
 
 def _load_map_data_from_files(data_service) -> Dict[str, Any]:
-    """从文件加载地图数据（在线程池中运行）"""
-    # 重新加载索引，确保获取最新的数据
-    data_service.reload_index()
+    """从 SQLite 加载地图数据（优化版：直接 SQL 查询，跳过 ORM 开销）"""
+    from app.services.data_service import SessionLocal
+    from app.models.database import Workbook, Site, Sector
 
-    # 收集所有站点数据
-    all_sites = []
-    min_lat, max_lat = 90, -90
-    min_lon, max_lon = 180, -180
+    db = SessionLocal()
+    try:
+        # 只取最新的 full_params 工作簿
+        wb = db.query(Workbook).filter(
+            Workbook.file_type == "full_params",
+            Workbook.status == "ready"
+        ).order_by(Workbook.created_at.desc()).first()
 
-    # 遍历所有已导入的数据，但只处理full_params类型
-    for data_id, data_info in data_service.index.items():
-        file_name = data_info.get("name", "unknown")
-        data_file_type = data_info.get("fileType", "unknown")
+        if not wb:
+            wb = db.query(Workbook).filter(
+                Workbook.file_type == "full_params"
+            ).order_by(Workbook.created_at.desc()).first()
 
-        # 只处理excel类型且fileType为full_params的数据
-        if data_info.get("type") != "excel":
-            continue
-        
-        # 关键：只读取全量工参数据，忽略待规划小区等辅助文件
-        if data_file_type != "full_params":
-            continue
+        if not wb:
+            return {"sites": [], "bounds": _default_bounds(), "center": _default_center()}
 
-        # 读取解析后的数据
-        data_dir = settings.DATA_DIR / data_id
-        data_file = data_dir / "data.json"
+        data_id = wb.id
 
-        if data_file.exists():
-            with open(data_file, 'r', encoding='utf-8') as f:
-                data = json.load(f)
+        # 批量加载站点
+        sites_raw = db.query(Site).filter(Site.workbook_id == data_id).all()
+        if not sites_raw:
+            return {"sites": [], "bounds": _default_bounds(), "center": _default_center()}
 
-                # 处理两种可能的JSON结构
-                sites_to_add = []
-                if isinstance(data, dict):
-                    for network_type in ['LTE', 'NR']:
-                        if network_type in data:
-                            sites_to_add.extend(data[network_type])
-                elif isinstance(data, list):
-                    sites_to_add = data
+        # 批量加载扇区
+        sectors_raw = db.query(Sector).filter(Sector.workbook_id == data_id).all()
 
-                all_sites.extend(sites_to_add)
+        # 构建扇区索引: {site_id_fk: [sector_dict, ...]}
+        sectors_by_site: Dict[int, List[Dict]] = {}
+        for s in sectors_raw:
+            if s.site_id_fk is not None:
+                sec_dict = {
+                    "id": s.sector_id,
+                    "siteId": s.sector_id.split("_")[0] if "_" in s.sector_id else "",
+                    "name": s.name or "",
+                    "longitude": s.longitude or 0.0,
+                    "latitude": s.latitude or 0.0,
+                    "azimuth": s.azimuth or 0.0,
+                    "beamwidth": s.beamwidth or 65.0,
+                    "height": s.height or 30.0,
+                    "pci": s.pci,
+                    "cell_cover_type": s.cell_cover_type or 1,
+                    "tac": s.tac,
+                    "frequency": s.frequency,
+                    "mcc": s.mcc,
+                    "mnc": s.mnc,
+                    "is_shared": s.is_shared,
+                }
+                sectors_by_site.setdefault(s.site_id_fk, []).append(sec_dict)
 
-                # 更新边界
-                for site in sites_to_add:
-                    lat = site.get('latitude', 0)
-                    lon = site.get('longitude', 0)
-                    if 0 < lat < 90:
-                        min_lat = min(min_lat, lat)
-                        max_lat = max(max_lat, lat)
-                    if 0 < lon < 180:
-                        min_lon = min(min_lon, lon)
-                        max_lon = max(max_lon, lon)
+        # 构建站点列表 + 边界计算
+        all_sites = []
+        min_lat, max_lat = 90.0, -90.0
+        min_lon, max_lon = 180.0, -180.0
 
-    # 如果没有数据，使用默认值
-    if not all_sites:
+        for site in sites_raw:
+            lat = site.latitude or 0.0
+            lon = site.longitude or 0.0
+            if 0 < lat < 90:
+                min_lat = min(min_lat, lat)
+                max_lat = max(max_lat, lat)
+            if 0 < lon < 180:
+                min_lon = min(min_lon, lon)
+                max_lon = max(max_lon, lon)
+
+            site_entry = {
+                "id": site.site_id,
+                "name": site.name or "Unknown",
+                "longitude": lon,
+                "latitude": lat,
+                "networkType": site.network_type,
+                "sectors": sectors_by_site.get(site.id, []),
+            }
+            if site.managed_element_id:
+                site_entry["managedElementId"] = site.managed_element_id
+            if site.mcc:
+                site_entry["mcc"] = site.mcc
+            if site.mnc:
+                site_entry["mnc"] = site.mnc
+            all_sites.append(site_entry)
+
+        # 计算边界
+        lat_buffer = max((max_lat - min_lat) * 0.1, 0.01)
+        lon_buffer = max((max_lon - min_lon) * 0.1, 0.01)
+
         return {
-            "sites": [],
+            "sites": all_sites,
             "bounds": {
-                "north": settings.DEFAULT_MAP_CENTER[0] + 0.1,
-                "south": settings.DEFAULT_MAP_CENTER[0] - 0.1,
-                "east": settings.DEFAULT_MAP_CENTER[1] + 0.1,
-                "west": settings.DEFAULT_MAP_CENTER[1] - 0.1
+                "north": max_lat + lat_buffer,
+                "south": max(0, min_lat - lat_buffer),
+                "east": max_lon + lon_buffer,
+                "west": max(0, min_lon - lon_buffer),
             },
             "center": {
-                "latitude": settings.DEFAULT_MAP_CENTER[0],
-                "longitude": settings.DEFAULT_MAP_CENTER[1]
-            }
+                "latitude": (min_lat + max_lat) / 2,
+                "longitude": (min_lon + max_lon) / 2,
+            },
         }
+    finally:
+        db.close()
 
-    # 计算中心点和边界
-    center_lat = (min_lat + max_lat) / 2
-    center_lon = (min_lon + max_lon) / 2
 
-    # 添加边界缓冲
-    lat_buffer = (max_lat - min_lat) * 0.1
-    lon_buffer = (max_lon - min_lon) * 0.1
-
+def _default_bounds():
     return {
-        "sites": all_sites,
-        "bounds": {
-            "north": max_lat + lat_buffer,
-            "south": max(0, min_lat - lat_buffer),
-            "east": max_lon + lon_buffer,
-            "west": max(0, min_lon - lon_buffer)
-        },
-        "center": {
-            "latitude": center_lat,
-            "longitude": center_lon
-        }
+        "north": 23.5, "south": 23.0,
+        "east": 114.5, "west": 114.0,
     }
+
+
+def _default_center():
+    return {"latitude": 23.25, "longitude": 114.25}
 
 
 @router.get("/cells", response_model=Dict[str, Any])
@@ -350,10 +377,20 @@ async def get_sectors_mobile(
 @router.post("/cache/clear", response_model=Dict[str, Any])
 async def clear_map_cache() -> Dict[str, Any]:
     """清除地图数据缓存"""
+    invalidate_map_data_cache()
+    return {"success": True, "message": "地图数据缓存已清除"}
+
+
+def invalidate_map_data_cache():
+    """清除地图数据缓存和 MapInfo 图层缓存（供其他模块调用）"""
     global _map_data_cache, _map_data_cache_time
     _map_data_cache = None
     _map_data_cache_time = 0
-    return {"success": True, "message": "地图数据缓存已清除"}
+    try:
+        from app.services.mapinfo_service import clear_layer_cache
+        clear_layer_cache()
+    except ImportError:
+        pass
 
 
 @router.get("/online-config", response_model=Dict[str, Any])
