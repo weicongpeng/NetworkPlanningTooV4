@@ -1,8 +1,11 @@
 import { useState, useEffect, useRef, useMemo, useCallback } from 'react'
-import { Play, Download, Loader2, AlertCircle, FileSpreadsheet, Search, GripVertical, List, Eye } from 'lucide-react'
-import { tacApi, mapApi } from '../services/api'
-import { useTACStore } from '../store/tacStore'
-import { useTaskStore } from '../store/taskStore'
+import { Download, Loader2, AlertCircle, Search, GripVertical, List, Eye } from 'lucide-react'
+import { tacApi } from '../services/api'
+import { useTACCheckStore } from '../store/tacCheckStore'
+import { useTaskStore, type Task } from '../store/taskStore'
+import { useMapStore } from '../store/mapStore'
+import { useAuthStore } from '../store/authStore'
+import { btn } from '../utils/buttonStyles'
 import { OnlineMap } from '../components/Map/OnlineMap'
 import { TACLegend } from '../components/Map/TACLegend'
 import { tacDataSyncService } from '../services/tacDataSyncService'
@@ -13,6 +16,10 @@ import { mapDataService, getCellList, clearCellListCache } from '../services/map
 import { DATA_REFRESH_EVENT } from '../store/dataStore'
 import { useTranslation } from 'react-i18next'
 import { CellSelectionTable } from '../components/CellSelectionTable'
+import { HistoryTable } from '../components/HistoryTable'
+import { StepIndicator } from '../components/StepIndicator'
+import { WizardFooter } from '../components/WizardFooter'
+import { extractCellIdsFromFile, matchCellIds, downloadCellTreeTemplate } from '../utils/cellFileHelper'
 
 // 虚拟滚动配置
 const ITEM_HEIGHT = 48 // 每行高度
@@ -60,6 +67,8 @@ interface TACResultData {
 
 const MAX_ERRORS = 5
 
+type WizardStep = 'idle' | 'task_created' | 'params_set' | 'cells_selected' | 'executing' | 'completed'
+
 export function TACPage() {
   const perfRef = useRef({ mountTime: performance.now(), renderCount: 0, firstCommitLogged: false })
   perfRef.current.renderCount++
@@ -69,34 +78,124 @@ export function TACPage() {
   }
 
   const { t } = useTranslation()
-  const { config, setConfig } = useTACStore()
-  const { activeTaskIds, setActiveTaskId, getLatestTACCheckTask } = useTaskStore()
+  const user = useAuthStore((s) => s.user)
+  const { wizardStep, setWizardStep, config, setConfig, selectedCellIds: storeSelectedCellIds, activeLeftTab, setActiveLeftTab, taskName, setTaskName, resetConfig: storeResetConfig } = useTACCheckStore()
+  const [taskNameError, setTaskNameError] = useState<string | null>(null)
+  const [nextTaskError, setNextTaskError] = useState<string | null>(null)
+  const { activeTaskIds, setActiveTaskId, getLatestTACCheckTask, startTask, updateTaskProgress, completeTask, failTask, syncHistoryFromBackend,
+    startGlobalPolling, stopGlobalPolling, isGlobalPollingActive } = useTaskStore()
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [localTaskResult, setLocalTaskResult] = useState<TACResultData | null>(null)
+  const viewedTaskIdRef = useRef<string | null>(null) // 防止 useEffect 覆盖 API 获取的结果
 
   // 从 taskStore 恢复最近的任务结果，行为与 PCI/邻区规划一致
   const t0 = performance.now()
   const latestTACCheckTask = getLatestTACCheckTask()
   const taskId = activeTaskIds.tac_check
+  const tacCheckHistoryCount = useTaskStore(s => Object.values(s.tasks).filter(t => t.type === 'tac_check').length)
   const taskResult = localTaskResult || (latestTACCheckTask?.result as TACResultData | null)
+  // 只有当有完整结果数据（含 results 数组）或由 handleViewTask 设置时才认为是有效结果
+  const hasFullResult = taskResult && (!!(taskResult as any).results || viewedTaskIdRef.current)
   const tStore = performance.now() - t0
 
   // 组件挂载时，检查是否有最新的TAC核查结果（与PCI/邻区规划逻辑一致）
   useEffect(() => {
     console.time('[TACPage] effect:sync-store')
-    if (latestTACCheckTask && latestTACCheckTask.result) {
+    // 如果用户通过"查看"按钮加载了特定任务，不要覆盖
+    if (viewedTaskIdRef.current && latestTACCheckTask && viewedTaskIdRef.current !== latestTACCheckTask.id) {
+      console.timeEnd('[TACPage] effect:sync-store')
+      return
+    }
+    if (latestTACCheckTask && latestTACCheckTask.result && latestTACCheckTask.result.results) {
       setLocalTaskResult(latestTACCheckTask.result as TACResultData)
     }
     console.log('[TACPage] 效果:sync-store fired, tStore=', tStore.toFixed(1), 'ms', 'hasTask=', !!latestTACCheckTask)
     console.timeEnd('[TACPage] effect:sync-store')
   }, [latestTACCheckTask])
 
-  // 小区选择页签状态
-  const [activeLeftTab, setActiveLeftTab] = useState<'cell-selection' | 'planning-result'>('planning-result')
-  const [selectedCellIds, setSelectedCellIds] = useState<Set<string>>(new Set())
+  // 选中的小区ID集合（格式：${siteId}_${sectorId}）- 本地 Set 桥接 store 的 string[]
+  const [selectedCellIdsSet, setSelectedCellIdsSet] = useState<Set<string>>(new Set(storeSelectedCellIds))
+  useEffect(() => { setSelectedCellIdsSet(new Set(storeSelectedCellIds)) }, [storeSelectedCellIds])
   const [cellListData, setCellListData] = useState<{ lte: CellListItem[]; nr: CellListItem[] }>({ lte: [], nr: [] })
   const [cellListLoading, setCellListLoading] = useState(false)
+  const [cellFileUploading, setCellFileUploading] = useState(false)
+  const cellFileInputRef = useRef<HTMLInputElement>(null)
+
+  // 全局地图控制
+  const setGlobalShowMap = useMapStore((s) => s.setGlobalShowMap)
+
+  // ===== 状态重置 =====
+  const resetConfig = useCallback(() => {
+    storeResetConfig()
+    setSelectedCellIdsSet(new Set())
+    setTaskNameError(null)
+    setActiveTaskId('tac_check', null)
+    setLocalTaskResult(null)
+    setError(null)
+  }, [storeResetConfig, setActiveTaskId])
+
+  useEffect(() => {
+    if (activeLeftTab === 'task-config') { resetConfig() }
+  }, [activeLeftTab, resetConfig])
+
+  // ===== 地图联动关闭 =====
+  useEffect(() => {
+    if (activeLeftTab !== 'planning-result') {
+      setShowMap(false)
+      setGlobalShowMap(false)
+    }
+  }, [activeLeftTab, setGlobalShowMap])
+
+  // ===== 结果自动加载 =====
+  useEffect(() => {
+    if (activeLeftTab === 'planning-result') {
+      // 如果用户通过"查看"按钮加载了特定任务的结果，不要自动加载最新的
+      if (viewedTaskIdRef.current) {
+        return
+      }
+      const loadLatest = async () => {
+        await syncHistoryFromBackend('tac_check')
+        const latest = getLatestTACCheckTask()
+        if (latest && latest.result) {
+          // 如果缺少完整 results（来自 resultSummary），尝试从 API 重新获取
+          if (!latest.result.results && latest.id) {
+            try {
+              const response = await tacApi.getResult(latest.id)
+              if (response?.success && response?.data?.results) {
+                const fullResult = response.data as TACResultData
+                setLocalTaskResult(fullResult)
+                tacDataSyncService.setTACResults({ results: fullResult.results })
+                setWizardStep('completed')
+                return
+              }
+            } catch (fetchErr: any) {
+              console.warn('[TACPage] 获取完整核查结果失败，使用缓存摘要:', fetchErr?.message)
+            }
+          }
+          // 有完整 results 或 API 获取失败时使用已有结果
+          setLocalTaskResult(latest.result as TACResultData)
+          if (latest.result.results) {
+            tacDataSyncService.setTACResults({ results: latest.result.results })
+          }
+          setWizardStep('completed')
+        }
+      }
+      loadLatest()
+    } else {
+      // 离开结果页时清除 viewedTaskIdRef
+      viewedTaskIdRef.current = null
+    }
+  }, [activeLeftTab])
+
+  // ===== getCellCount =====
+  const getCellCount = useCallback((task: Task): number | string => {
+    if (task.result?.totalCells !== undefined) return task.result.totalCells
+    if (task.result?.results && Array.isArray(task.result.results)) {
+      return task.result.results.length
+    }
+    return '-'
+  }, [])
 
   // 插花检测配置状态
   const [singularityConfig, setSingularityConfig] = useState({
@@ -141,75 +240,32 @@ export function TACPage() {
 
   const pollingIntervalRef = useRef<NodeJS.Timeout | null>(null)
   const errorCountRef = useRef(0)
-  const isPollingActiveRef = useRef(false)
-
-  // 轮询任务进度 - 统一管理轮询生命周期
+  // === 全局轮询：页面切换不中断 ===
   useEffect(() => {
-    // 如果没有任务ID或任务已完成，不启动轮询
-    if (!taskId || taskResult?.status === 'completed' || taskResult?.status === 'failed') {
+    if (taskId && (taskResult?.status === 'pending' || taskResult?.status === 'processing')) {
+      if (!isGlobalPollingActive('tac_check')) {
+        startGlobalPolling('tac_check')
+      }
+    }
+  }, [taskId, taskResult?.status])
+
+  // 从 taskStore 同步进度到 localTaskResult（但不要覆盖用户通过"查看"按钮加载的结果）
+  useEffect(() => {
+    if (taskId && viewedTaskIdRef.current === taskId) {
       return
     }
-
-    // 避免重复启动轮询
-    if (isPollingActiveRef.current) {
-      return
-    }
-
-    isPollingActiveRef.current = true
-
-    // 每2秒轮询一次任务进度
-    pollingIntervalRef.current = setInterval(async () => {
-      // 检查任务是否已完成
-      if (taskResult?.status === 'completed' || taskResult?.status === 'failed') {
-        stopPolling()
-        return
-      }
-
-      try {
-        const response = await tacApi.getProgress(taskId)
-        if (response.success && response.data) {
-          setLocalTaskResult(response.data as TACResultData)
-
-          // 任务完成或失败，停止轮询
-          if (response.data.status === 'completed' || response.data.status === 'failed') {
-            stopPolling()
-          }
+    if (taskId) {
+      const t = useTaskStore.getState().tasks[taskId]
+      if (t) {
+        if (t.result && Object.keys(t.result).length > 0) {
+          setLocalTaskResult(t.result as TACResultData)
         }
-      } catch (err: any) {
-        errorCountRef.current++
-        console.error('轮询TAC核查进度失败:', err)
-
-        // 如果任务不存在（404），清除状态并停止轮询
-        if (err.code === 404 || err.message?.includes('任务不存在')) {
-          stopPolling()
-          setActiveTaskId('tac_check', null); setLocalTaskResult(null)
-          setError(null)
-          console.log('任务已不存在，已清除TAC状态')
-          return
-        }
-
-        // 连续失败5次则停止轮询
-        if (errorCountRef.current >= MAX_ERRORS) {
-          stopPolling()
-          setError(t('tac.getProgressFailed') || '获取任务进度失败，请刷新页面重试')
+        if (t.status === 'completed' || t.status === 'failed') {
+          stopGlobalPolling('tac_check')
         }
       }
-    }, 2000)
-
-    // 统一的停止轮询函数
-    function stopPolling() {
-      if (pollingIntervalRef.current) {
-        clearInterval(pollingIntervalRef.current)
-        pollingIntervalRef.current = null
-      }
-      isPollingActiveRef.current = false
     }
-
-    // 组件卸载或依赖变化时清理
-    return () => {
-      stopPolling()
-    }
-  }, [taskId, taskResult?.status, setLocalTaskResult, setActiveTaskId])
+  }, [taskId])
 
   // 初始化TAC数据同步服务（异步执行，不阻塞页面渲染）
   useEffect(() => {
@@ -233,20 +289,14 @@ export function TACPage() {
 
     // 监听数据刷新事件（当在其他页面上传新工参时）
     const handleDataRefresh = async () => {
-      console.log('[TACPage] 收到数据刷新事件，正在重新初始化...')
+      console.log('[TACPage] 收到数据刷新事件，正在清除缓存...')
       try {
-        // 1. 清除前端地图数据和小区列表缓存
-        mapDataService.clearCache()
+        // 清除地图数据和小区列表缓存
+        await mapDataService.clearCache()
         clearCellListCache()
-        console.log('[TACPage] 已清除前端地图数据和小区列表缓存')
-
-        // 2. 清除后端地图数据缓存
-        await mapApi.clearCache()
-        console.log('[TACPage] 已清除后端地图数据缓存')
-
-        // 3. 重新初始化TAC数据同步服务，获取最新全量工参数据
-        await initMapServices()
-        console.log('[TACPage] 数据同步服务已重新初始化')
+        // 重新加载小区列表，确保新建任务页面使用最新数据
+        loadCellList()
+        console.log('[TACPage] 已清除缓存并重载小区列表')
       } catch (error) {
         console.warn('[TACPage] 数据刷新失败:', error)
       }
@@ -358,46 +408,104 @@ export function TACPage() {
     })
   }
 
-  const handleStartPlanning = async () => {
-    if (!config?.networkType) {
-      setError(t('tac.selectNetworkType') || '请选择网络类型')
+  // 监听任务完成/失败，自动推进向导步骤（使用 localTaskResult 避免从历史任务误判）
+  useEffect(() => {
+    if (wizardStep === 'executing') {
+      if (localTaskResult?.status === 'completed') { setWizardStep('completed'); setError(null) }
+      else if (localTaskResult?.status === 'failed') { setWizardStep('cells_selected') }
+    }
+  }, [localTaskResult?.status, wizardStep])
+
+  // === 向导步骤处理函数 ===
+  const validateTaskName = (name: string): string | null => {
+    if (!name.trim()) return '请输入任务名称'
+    if (name.length > 25) return '任务名称不能超过25个字符'
+    return null
+  }
+
+  const handleTaskNameChange = (value: string) => {
+    if (value.length > 25) return
+    setTaskName(value)
+    setTaskNameError(null)
+  }
+
+  const handleCancel = () => {
+    setWizardStep('idle'); setTaskName(''); setTaskNameError(null); setNextTaskError(null)
+    setSelectedCellIdsSet(new Set()); setError(null)
+    setConfig({ networkType: 'LTE' })
+    setSingularityConfig({ searchRadius: 1500, singularityThreshold: 0.5 })
+  }
+
+  // ===== 上一步逻辑 =====
+  const handleBack = useCallback(() => {
+    if (wizardStep === 'task_created') {
+      setWizardStep('idle'); setTaskName(''); setTaskNameError(null); setError(null)
+    } else if (wizardStep === 'params_set') {
+      setWizardStep('task_created'); setNextTaskError(null); setError(null)
+    } else if (wizardStep === 'cells_selected') {
+      setWizardStep('params_set'); setSelectedCellIdsSet(new Set()); setError(null)
+    }
+  }, [wizardStep])
+
+  // ===== 统一的"下一步"逻辑 =====
+  const handleNext = useCallback(() => {
+    if (wizardStep === 'idle') {
+      setWizardStep('task_created'); setTaskNameError(null); setError(null)
+    } else if (wizardStep === 'task_created') {
+      if (!config?.networkType) { setNextTaskError(t('tac.selectNetworkType') || '请选择网络类型'); return }
+      const nameError = validateTaskName(taskName)
+      if (nameError) { setTaskNameError(nameError); return }
+      setNextTaskError(null); setTaskNameError(null)
+      setWizardStep('params_set'); setError(null)
+    } else if (wizardStep === 'params_set') {
+      setNextTaskError(null); setWizardStep('cells_selected'); setSelectedCellIdsSet(new Set()); setError(null)
+    } else if (wizardStep === 'cells_selected') {
+      if (selectedCellIdsSet.size === 0) {
+        setError(t('tac.noCellsSelected') || '请在小区选择列表中至少选择一个小区后再执行TAC核查')
+        return
+      }
+      handleExecute()
+    } else if (wizardStep === 'completed') {
+      setActiveLeftTab('planning-result'); setShowMap(true)
+    }
+  }, [wizardStep, taskName, config, selectedCellIdsSet, t])
+
+  const handleNewTask = () => { setWizardStep('task_created'); setTaskNameError(null); setError(null) }
+
+  const handleParamsSetup = () => {
+    if (!config?.networkType) { setNextTaskError(t('tac.selectNetworkType') || '请选择网络类型'); return }
+    const nameError = validateTaskName(taskName)
+    if (nameError) { setTaskNameError(nameError); return }
+    setNextTaskError(null); setTaskNameError(null)
+    setWizardStep('params_set'); setError(null)
+  }
+
+  const handleSelectCells = () => {
+    setNextTaskError(null); setWizardStep('cells_selected'); setSelectedCellIdsSet(new Set()); setError(null)
+  }
+
+  const handleExecute = async () => {
+    if (!config?.networkType) { setError(t('tac.selectNetworkType') || '请选择网络类型'); return }
+    if (selectedCellIdsSet.size === 0) {
+      setError(t('tac.noCellsSelected') || '请在小区选择列表中至少选择一个小区后再执行TAC核查')
       return
     }
-
-    setLoading(true)
-    setError(null)
-    setLocalTaskResult(null)
-    setActiveTaskId('tac_check', null); setLocalTaskResult(null)
-    errorCountRef.current = 0
-
+    setLoading(true); setError(null); setLocalTaskResult(null)
+    setActiveTaskId('tac_check', null); setWizardStep('executing'); errorCountRef.current = 0
     try {
-      // 构建完整的TAC配置（包含插花检测配置和选中小区）
-      const fullConfig: any = {
-        networkType: config!.networkType,
-        enableSingularityCheck: true,
-        singularityConfig: singularityConfig,
-        selectedCellIds: selectedCellIds.size > 0 ? Array.from(selectedCellIds) : undefined,
-      }
-
+      const fullConfig: any = { taskName: taskName, networkType: config!.networkType, enableSingularityCheck: true, singularityConfig: singularityConfig, selectedCellIds: Array.from(selectedCellIdsSet) }
       const response = await tacApi.plan(fullConfig)
       if (response.success && response.data) {
         const newTaskId = response.data.taskId
         setActiveTaskId('tac_check', newTaskId)
-
-        // 初始获取任务状态
+        startTask(newTaskId, 'tac_check', 'TAC核查开始', taskName, user?.username)
         const progressResponse = await tacApi.getProgress(newTaskId)
-        if (progressResponse.success && progressResponse.data) {
-          setLocalTaskResult(progressResponse.data as TACResultData)
-        }
-      } else {
-        setError(response.message || (t('tac.startFailed') || '启动TAC核查任务失败'))
-      }
+        if (progressResponse.success && progressResponse.data) { setLocalTaskResult(progressResponse.data as TACResultData) }
+      } else { setError(response.message || (t('tac.startFailed') || '启动TAC核查任务失败')); setWizardStep('cells_selected') }
     } catch (err: any) {
       console.error('启动TAC核查失败:', err)
-      setError(err.message || (t('tac.startFailed') || '启动TAC核查任务失败'))
-    } finally {
-      setLoading(false)
-    }
+      setError(err.message || (t('tac.startFailed') || '启动TAC核查任务失败')); setWizardStep('cells_selected')
+    } finally { setLoading(false) }
   }
 
   const handleExport = async (format: 'xlsx' | 'csv' = 'xlsx') => {
@@ -454,6 +562,41 @@ export function TACPage() {
     }
   }
 
+  // 从历史任务查看 - 跳转到结果页并自动打开地图
+  const handleViewTask = async (task: any) => {
+    try {
+      const response = await tacApi.getResult(task.id)
+      if (response?.success && response?.data) {
+        const result = response.data as TACResultData
+        viewedTaskIdRef.current = task.id // 必须在 setActiveTaskId 之前设置！
+        setLocalTaskResult(result)
+        setActiveTaskId('tac_check', task.id)
+        setActiveLeftTab('planning-result')
+        setShowMap(true)
+        if (result.results) {
+          const taskNetworkType = result.networkType || config?.networkType || 'LTE'
+          const uniqueTACs = new Set<string>()
+          result.results.forEach((cell: any) => {
+            if (cell.tac) uniqueTACs.add(String(cell.tac))
+            if (cell.existingTac) uniqueTACs.add(String(cell.existingTac))
+          })
+          uniqueTACs.forEach(tac => {
+            tacColorMapper.getColor(tac, taskNetworkType)
+          })
+          tacDataSyncService.setTACResults({
+            results: result.results,
+            singularityCount: result.singularityCount || 0
+          })
+          if (mapRef.current) {
+            mapRef.current.setSectorIdWhitelist(null, 'tac-check', taskNetworkType)
+          }
+        }
+      }
+    } catch (err: any) {
+      console.error('加载TAC核查结果失败:', err)
+      setError('加载核查结果失败: ' + (err.message || '未知错误'))
+    }
+  }
 
   // 搜索功能状态
   const [searchEnabled, setSearchEnabled] = useState(false)
@@ -642,7 +785,7 @@ export function TACPage() {
   }, [])
 
   const toggleCellSelection = (cellId: string) => {
-    setSelectedCellIds(prev => {
+    setSelectedCellIdsSet(prev => {
       const next = new Set(prev)
       if (next.has(cellId)) next.delete(cellId)
       else next.add(cellId)
@@ -654,8 +797,8 @@ export function TACPage() {
     const networkType = (config?.networkType || 'LTE') as 'LTE' | 'NR'
     const sectors = networkType === 'LTE' ? cellListData.lte : cellListData.nr
     const allIds = sectors.map(s => s.id)
-    const allSelected = allIds.length > 0 && allIds.every(id => selectedCellIds.has(id))
-    setSelectedCellIds(prev => {
+    const allSelected = allIds.length > 0 && allIds.every(id => selectedCellIdsSet.has(id))
+    setSelectedCellIdsSet(prev => {
       const next = new Set(prev)
       if (allSelected) allIds.forEach(id => next.delete(id))
       else allIds.forEach(id => next.add(id))
@@ -663,128 +806,75 @@ export function TACPage() {
     })
   }
 
-  const clearSelections = () => setSelectedCellIds(new Set())
+  const clearSelections = () => setSelectedCellIdsSet(new Set())
+
+  // 上传待规划小区文件
+  const handleUploadCellFile = () => {
+    cellFileInputRef.current?.click()
+  }
+
+  const handleCellFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    if (!file) return
+
+    if (!file.name.toLowerCase().startsWith('cell-tree')) {
+      setError(t('tac.cellFilePrefixError') || '文件名必须以"cell-tree"开头')
+      e.target.value = ''
+      return
+    }
+
+    setCellFileUploading(true)
+    setError(null)
+    try {
+      // 1. 本地解析文件，提取小区ID
+      const extractedIds = await extractCellIdsFromFile(file)
+      if (extractedIds.length === 0) {
+        setError(t('tac.noCellIdsExtracted') || '未能从文件中提取到小区ID，请检查文件格式')
+        return
+      }
+
+      // 2. 获取并刷新小区选择列表（匹配优先于上传）
+      clearCellListCache()
+      setCellListLoading(true)
+      const data = await getCellList()
+      setCellListData({ lte: data.lte || [], nr: data.nr || [] })
+      setCellListLoading(false)
+
+      // 3. 匹配小区ID并自动勾选
+      const allAvailableIds = [...data.lte, ...data.nr].map(item => item.id)
+      const matchedIds = matchCellIds(extractedIds, allAvailableIds)
+
+      if (matchedIds.length > 0) {
+        setSelectedCellIdsSet(new Set(matchedIds))
+      } else {
+        setError(t('tac.noMatchingCells') || '未匹配到任何小区，请检查文件内容与当前工参数据是否一致')
+      }
+    } catch (err: any) {
+      console.error('[TACPage] 处理待规划小区文件失败:', err)
+      setError(err.message || (t('tac.cellFileUploadFailed') || '待规划小区文件处理失败'))
+    } finally {
+      setCellFileUploading(false)
+      e.target.value = ''
+    }
+  }
+
+  // 下载待规划小区模板（根据当前网络类型动态生成）
+  const handleDownloadCellTemplate = () => {
+    try {
+      const networkType = (config?.networkType as 'LTE' | 'NR') || 'LTE'
+      downloadCellTreeTemplate(networkType)
+    } catch (err: any) {
+      console.error('[TACPage] 下载模板失败:', err)
+      alert(`${t('data.downloadTemplateFailed') || '下载模板失败'}: ${err.message || ''}`)
+    }
+  }
+
+  const isRunning = loading || taskResult?.status === 'processing'
 
   return (
     <div className="h-full flex flex-col p-4 min-h-0">
       {/* 页面标题 */}
       <h1 className="text-3xl font-bold mb-6 shrink-0">{t('tac.title') || 'TAC核查'}</h1>
-
-      {/* 配置区域 */}
-      <div className="bg-card p-4 rounded-lg border border-border mb-6 shrink-0">
-        <div className="grid grid-cols-1 lg:grid-cols-12 gap-4">
-          {/* 网络类型选择 */}
-          <div className="lg:col-span-3">
-            <label className="block text-sm font-semibold mb-2 text-foreground">{t('tac.networkType') || '网络类型'}</label>
-            <div className="flex gap-2">
-              <label className="flex items-center gap-2 cursor-pointer px-3 py-1.5 rounded-md border border-border hover:bg-muted/50 transition-colors flex-1 justify-center">
-                <input
-                  type="radio"
-                  name="networkType"
-                  value="LTE"
-                  checked={config?.networkType === 'LTE'}
-                  onChange={(e) => {
-                    setSelectedCellIds(new Set())
-                    setConfig({ networkType: e.target.value as 'LTE' | 'NR' })
-                    loadCellList()
-                  }}
-                  disabled={loading || taskResult?.status === 'processing'}
-                  className="w-3 h-3 text-primary"
-                />
-                <span className="text-sm font-medium">4G LTE</span>
-              </label>
-              <label className="flex items-center gap-2 cursor-pointer px-3 py-1.5 rounded-md border border-border hover:bg-muted/50 transition-colors flex-1 justify-center">
-                <input
-                  type="radio"
-                  name="networkType"
-                  value="NR"
-                  checked={config?.networkType === 'NR'}
-                  onChange={(e) => {
-                    setSelectedCellIds(new Set())
-                    setConfig({ networkType: e.target.value as 'LTE' | 'NR' })
-                    loadCellList()
-                  }}
-                  disabled={loading || taskResult?.status === 'processing'}
-                  className="w-3 h-3 text-primary"
-                />
-                <span className="text-sm font-medium">5G NR</span>
-              </label>
-            </div>
-          </div>
-
-          {/* TAC插花检测配置 - 横向布局 */}
-          <div className="lg:col-span-4">
-            <label className="text-sm font-semibold text-foreground mb-2">
-              {t('tac.singularityDetection') || 'TAC插花检测'}
-            </label>
-            <div className="flex items-center gap-3">
-              <div className="flex items-center gap-1.5">
-                <label className="text-xs text-foreground whitespace-nowrap">{t('tac.searchRadius') || '搜索半径(米):'}</label>
-                <input
-                  type="number"
-                  value={singularityConfig.searchRadius}
-                  onChange={(e) => setSingularityConfig(prev => ({ ...prev, searchRadius: Number(e.target.value) }))}
-                  className="w-24 px-2 py-1 text-sm border border-purple-200/50 rounded-md bg-purple-50/30 focus:border-purple-500 focus:ring-1 focus:ring-purple-500/20 transition-all text-center"
-                  min={100}
-                  max={5000}
-                  step={100}
-                />
-              </div>
-              <div className="flex items-center gap-1.5">
-                <label className="text-xs text-foreground whitespace-nowrap">{t('tac.singularityThreshold') || '异TAC阈值(%):'}</label>
-                <input
-                  type="number"
-                  value={Math.round(singularityConfig.singularityThreshold * 100)}
-                  onChange={(e) => setSingularityConfig(prev => ({ ...prev, singularityThreshold: Number(e.target.value) / 100 }))}
-                  className="w-24 px-2 py-1 text-sm border border-purple-200/50 rounded-md bg-purple-50/30 focus:border-purple-500 focus:ring-1 focus:ring-purple-500/20 transition-all text-center"
-                  min={50}
-                  max={95}
-                  step={5}
-                />
-              </div>
-            </div>
-          </div>
-
-          {/* 说明文字 - 删除第三行 */}
-          <div className="lg:col-span-3">
-            <div className="h-full px-3 py-2 bg-blue-500/5 border border-blue-500/20 rounded-lg">
-              <div className="flex items-start gap-2">
-                <FileSpreadsheet size={12} className="flex-shrink-0 mt-0.5 text-blue-500" />
-                <div className="space-y-0.5">
-                  <p className="text-[10px] text-foreground leading-relaxed">{t('tac.importTacLayerTip') || '• 需导入TAC图层(4G_TAC.zip/5G_TAC.zip)'}</p>
-                  <p className="text-[10px] text-foreground leading-relaxed">{t('tac.importParamsTip') || '• 需导入全量工参(ProjectParameter_mongoose)'}</p>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          {/* 开始核查按钮 */}
-          <div className="lg:col-span-2 flex items-end">
-            <button
-              onClick={handleStartPlanning}
-              disabled={loading || taskResult?.status === 'processing'}
-              className="w-full px-3 py-2 bg-blue-400 text-white rounded-lg hover:bg-blue-500 disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2 text-sm font-medium transition-colors"
-            >
-              {loading ? (
-                <>
-                  <Loader2 className="animate-spin" size={16} />
-                  <span>{t('tac.starting') || '启动中...'}</span>
-                </>
-              ) : taskResult?.status === 'processing' ? (
-                <>
-                  <Loader2 className="animate-spin" size={16} />
-                  <span>{t('tac.checking') || '核查中...'}</span>
-                </>
-              ) : (
-                <>
-                  <Play size={16} />
-                  <span>{t('tac.startCheck') || '开始核查'}</span>
-                </>
-              )}
-            </button>
-          </div>
-        </div>
-      </div>
 
       {/* 错误提示 */}
       {error && (
@@ -801,59 +891,201 @@ export function TACPage() {
       <div className="bg-card p-4 rounded-lg border border-border flex-1 min-h-0 flex flex-col overflow-hidden">
         {/* 页签切换栏 */}
         <div className="flex items-center gap-1 mb-3 border-b border-border shrink-0">
+          {/* 历史任务 tab */}
           <button
-            onClick={() => setActiveLeftTab('cell-selection')}
-            className={`px-4 py-2 text-sm font-medium transition-colors border-b-2 ${
-              activeLeftTab === 'cell-selection'
-                ? 'border-blue-500 text-blue-600'
-                : 'border-transparent text-muted-foreground hover:text-foreground'
-            }`}
+            onClick={() => !isRunning && setActiveLeftTab('history')}
+            className={activeLeftTab === 'history' ? btn.activeTab : btn.ghost}
+            disabled={isRunning}
           >
-            {t('pci.cellSelection') || '小区选择'}
-            {selectedCellIds.size > 0 && (
-              <span className="ml-2 px-1.5 py-0.5 text-xs bg-blue-100 text-blue-700 rounded-full">
-                {selectedCellIds.size}
-              </span>
-            )}
+            {t('common.historyTask') || '历史任务'}
+            <span className={btn.badgeCount}>{tacCheckHistoryCount}</span>
           </button>
+
+          {/* 新建任务 tab */}
+          <button
+            onClick={() => !isRunning && setActiveLeftTab('task-config')}
+            className={activeLeftTab === 'task-config' ? btn.activeTab : btn.ghost}
+            disabled={isRunning}
+          >
+            {t('common.newTask') || '新建任务'}
+          </button>
+
+          {/* 核查结果 tab */}
           <button
             onClick={() => setActiveLeftTab('planning-result')}
-            className={`px-4 py-2 text-sm font-medium transition-colors border-b-2 ${
-              activeLeftTab === 'planning-result'
-                ? 'border-blue-500 text-blue-600'
-                : 'border-transparent text-muted-foreground hover:text-foreground'
-            }`}
+            className={activeLeftTab === 'planning-result' ? btn.activeTab : btn.ghost}
           >
             {t('tac.checkResult') || '核查结果'}
             {taskResult?.status === 'completed' && (
-              <span className="ml-2 px-1.5 py-0.5 text-xs bg-green-100 text-green-700 rounded-full">✓</span>
+              <span className={btn.badgeSuccess}>✓</span>
             )}
             {taskResult?.status === 'failed' && (
-              <span className="ml-2 inline-flex items-center justify-center w-5 h-5 rounded-full bg-red-500 text-white text-[10px] font-bold">!</span>
+              <span className={btn.badgeError}>!</span>
+            )}
+            {taskResult?.status === 'processing' && (
+              <span className="ml-2 inline-flex items-center">
+                <Loader2 size={12} className="animate-spin text-blue-500" />
+              </span>
             )}
           </button>
         </div>
 
         {/* 页签内容 */}
         <div className="flex-1 min-h-0 overflow-hidden">
-          {activeLeftTab === 'cell-selection' ? (
-            /* 小区选择面板 */
+          {activeLeftTab === 'task-config' && (
+                <div className="flex flex-col h-full overflow-hidden">
+                {/* 步骤指示器（执行步骤显示进度百分比） */}
+                <StepIndicator
+                  currentStep={
+                    wizardStep === 'idle' || wizardStep === 'task_created' ? 0
+                    : wizardStep === 'params_set' ? 1
+                    : wizardStep === 'cells_selected' ? 2
+                    : wizardStep === 'executing' ? 3
+                    : 4
+                  }
+                  executingProgress={wizardStep === 'executing' ? (taskResult?.progress ?? 0) : undefined}
+                />
+                <div className="flex flex-row gap-4 flex-1 min-h-0 overflow-hidden">
+                  {/* 左侧：任务名称 + 参数设置 */}
+                  <div className="flex flex-col overflow-y-auto flex-1 min-w-0">
+                    <div className="bg-card border border-border rounded-xl p-6 w-full">
+                      {nextTaskError && (
+                        <div className="mb-4 p-3 bg-red-50 border border-red-200 rounded-lg flex items-center gap-3 text-red-700">
+                          <AlertCircle size={18} />
+                          <span className="text-sm">{nextTaskError}</span>
+                          <button onClick={() => setNextTaskError(null)} className="ml-auto text-sm underline">{t('tac.close') || '关闭'}</button>
+                        </div>
+                      )}
+                      {/* 任务名称 */}
+                      <div className="mb-6">
+                        <label className="block text-sm font-semibold mb-2">{t('common.taskName') || '任务名称'}</label>
+                        <input
+                          type="text" value={taskName}
+                          onChange={(e) => handleTaskNameChange(e.target.value)}
+                          disabled={wizardStep !== 'idle' && wizardStep !== 'task_created'}
+                          placeholder={t('common.taskNamePlaceholder') || '请输入任务名称'}
+                          maxLength={25}
+                          className={`w-full px-3 py-2 text-sm bg-background border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary disabled:opacity-60 disabled:cursor-not-allowed ${taskNameError ? 'border-red-400 focus:ring-red-400' : wizardStep === 'task_created' && !taskName.trim() ? 'input-pulse' : 'border-border'}`}
+                        />
+                        {taskNameError && <p className="mt-1 text-xs text-red-500">{taskNameError}</p>}
+                        <p className="mt-1 text-xs text-muted-foreground">{taskName.length}/25</p>
+                      </div>
+
+                      {/* TAC核查参数 */}
+                      <div className="space-y-4">
+                        <div>
+                          <label className="block text-xs font-medium mb-1">{t('tac.networkType') || '网络类型'}</label>
+                          <div className="flex gap-4">
+                            <label className="flex items-center gap-2 text-sm cursor-pointer">
+                              <input type="radio" name="tacNetworkType" value="LTE" checked={config?.networkType === 'LTE'} onChange={() => setConfig({ networkType: 'LTE' })} disabled={wizardStep !== 'params_set'} className="w-4 h-4 disabled:opacity-60" />LTE
+                            </label>
+                            <label className="flex items-center gap-2 text-sm cursor-pointer">
+                              <input type="radio" name="tacNetworkType" value="NR" checked={config?.networkType === 'NR'} onChange={() => setConfig({ networkType: 'NR' })} disabled={wizardStep !== 'params_set'} className="w-4 h-4 disabled:opacity-60" />NR
+                            </label>
+                          </div>
+                        </div>
+                        <div className="grid grid-cols-2 gap-x-4 gap-y-3">
+                          <div>
+                            <label className="block text-xs font-medium mb-0.5">{t('tac.searchRadius') || '搜索半径(m)'}</label>
+                            <input type="number" value={singularityConfig.searchRadius} onChange={(e) => setSingularityConfig(prev => ({ ...prev, searchRadius: parseInt(e.target.value) || 0 }))} disabled={wizardStep !== 'params_set'} step={100} className="w-full px-2 py-1.5 text-sm bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary disabled:opacity-60 disabled:cursor-not-allowed" />
+                          </div>
+                          <div>
+                            <label className="block text-xs font-medium mb-0.5">{t('tac.singularityThreshold') || '异TAC阈值'}</label>
+                            <input type="number" value={singularityConfig.singularityThreshold} onChange={(e) => setSingularityConfig(prev => ({ ...prev, singularityThreshold: parseFloat(e.target.value) || 0 }))} disabled={wizardStep !== 'params_set'} step={0.1} className="w-full px-2 py-1.5 text-sm bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary disabled:opacity-60 disabled:cursor-not-allowed" />
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* 右侧：小区选择 */}
+                  <div className="flex flex-col flex-1 min-w-0 border-l border-border pl-4 overflow-hidden">
+                    <div className="flex flex-col h-full overflow-hidden">
+                      <input type="file" ref={cellFileInputRef} onChange={handleCellFileChange} accept=".xlsx,.xls" className="hidden" />
+                      <CellSelectionTable
+                        sectors={(() => { const nt = (config?.networkType || 'LTE') as 'LTE' | 'NR'; return nt === 'LTE' ? cellListData.lte : cellListData.nr })()}
+                        selectedCellIds={selectedCellIdsSet}
+                        onToggleCell={wizardStep === 'cells_selected' && !isRunning ? toggleCellSelection : () => {}}
+                        onSelectAll={wizardStep === 'cells_selected' && !isRunning ? toggleSelectAll : () => {}}
+                        onClearSelections={wizardStep === 'cells_selected' && !isRunning ? clearSelections : () => {}}
+                        selectedCountText={(t('tac.selectedCount') || '已选中 {{count}} 个小区').replace('{{count}}', String(selectedCellIdsSet.size))}
+                        loading={cellListLoading}
+                        onUploadCellFile={wizardStep === 'cells_selected' ? handleUploadCellFile : undefined}
+                        onDownloadCellTemplate={wizardStep === 'cells_selected' ? handleDownloadCellTemplate : undefined}
+                        uploading={cellFileUploading}
+                        disabled={wizardStep !== 'cells_selected' || isRunning}
+                        columnLabels={{ siteId: t('tac.siteId') || '基站ID', cellId: t('tac.cellId') || '小区ID', cellName: t('tac.cellName') || '小区名称', selectAll: t('tac.selectAll') || '全选', clearSelections: t('tac.clearSelections') || '清空选择', uploadCellFile: t('tac.uploadCellFile') || '上传待规划小区文件', downloadCellTemplate: t('tac.downloadCellTemplate') || '下载待规划小区模板' }}
+                      />
+                    </div>
+                  </div>
+                </div>
+
+                {/* === 向导流程底部导航 === */}
+                <WizardFooter
+                  currentStep={
+                    wizardStep === 'idle' || wizardStep === 'task_created' ? 0
+                    : wizardStep === 'params_set' ? 1
+                    : wizardStep === 'cells_selected' ? 2
+                    : wizardStep === 'executing' ? 3
+                    : 4
+                  }
+                  isExecuting={loading || isRunning}
+                  canProceed={
+                    wizardStep === 'idle' ? true
+                    : wizardStep === 'task_created' ? taskName.trim().length > 0
+                    : wizardStep === 'params_set' ? true
+                    : wizardStep === 'cells_selected' ? selectedCellIdsSet.size > 0
+                    : wizardStep === 'completed' ? true
+                    : false
+                  }
+                  onNext={handleNext}
+                  onCancel={handleCancel}
+                  onBack={handleBack}
+                  isTaskNameStep={wizardStep === 'task_created'}
+                />
+              </div>
+              )}
+
+          {activeLeftTab === 'history' && (
+            /* 历史任务面板 */
             <div className="flex flex-col h-full overflow-hidden">
-              <CellSelectionTable
-                sectors={(() => {
-                  const nt = (config?.networkType || 'LTE') as 'LTE' | 'NR'
-                  return nt === 'LTE' ? cellListData.lte : cellListData.nr
-                })()}
-                selectedCellIds={selectedCellIds}
-                onToggleCell={toggleCellSelection}
-                onSelectAll={toggleSelectAll}
-                onClearSelections={clearSelections}
-                selectedCountText={'已选中 {{count}} 个小区'.replace('{{count}}', String(selectedCellIds.size))}
-                dataSourceText={'数据源：{{type}} 小区'.replace('{{type}}', config?.networkType || 'LTE')}
-                loading={cellListLoading}
+              <HistoryTable
+                taskType="tac_check"
+                typeLabel="TAC核查"
+                onSelectTask={(task) => {
+                  if (task.result) {
+                    const result = task.result as TACResultData
+                    setLocalTaskResult(result)
+                    setActiveTaskId('tac_check', task.id)
+                    setActiveLeftTab('planning-result')
+                    if (result.results) {
+                      const taskNetworkType = result.networkType || config?.networkType || 'LTE'
+                      const uniqueTACs = new Set<string>()
+                      result.results.forEach((cell: any) => {
+                        if (cell.tac) uniqueTACs.add(String(cell.tac))
+                        if (cell.existingTac) uniqueTACs.add(String(cell.existingTac))
+                      })
+                      uniqueTACs.forEach(tac => {
+                        tacColorMapper.getColor(tac, taskNetworkType)
+                      })
+                      tacDataSyncService.setTACResults({
+                        results: result.results,
+                        singularityCount: result.singularityCount || 0
+                      })
+                      if (mapRef.current) {
+                        mapRef.current.setSectorIdWhitelist(null, 'tac-check', taskNetworkType)
+                      }
+                    }
+                  }
+                }}
+                onViewTask={handleViewTask}
+                getCellCount={getCellCount}
               />
             </div>
-          ) : (
+          )}
+
+          {activeLeftTab === 'planning-result' && (
+
             /* 规划结果面板 */
             <div className="flex flex-col h-full min-h-0 overflow-hidden">
               {taskResult ? (
@@ -982,7 +1214,17 @@ export function TACPage() {
                                 </span>
                               </button>
                             )}
-                            <button onClick={() => setSearchEnabled(!searchEnabled)}
+                            <button onClick={() => {
+                                if (searchEnabled) {
+                                  setSearchFilters({
+                                    firstGroup: '', siteId: '', siteName: '', sectorId: '', sectorName: '',
+                                    networkType: '', longitude: '', latitude: '', tac: '', existingTac: '',
+                                    tacConsistent: '', isSingularity: '', suggestedTac: '', matched: ''
+                                  })
+                                  setFilteredResults([])
+                                }
+                                setSearchEnabled(!searchEnabled)
+                              }}
                               className={`flex items-center gap-2 px-3 py-1.5 rounded-lg transition-colors text-sm ${searchEnabled ? 'bg-blue-400 text-white hover:bg-blue-500' : 'bg-muted hover:bg-muted/80'}`}>
                               <Search size={16} />
                               {t('tac.search') || '搜索'}
@@ -1017,7 +1259,7 @@ export function TACPage() {
                                   value={searchFilters[column.key as keyof typeof searchFilters]}
                                   onChange={(e) => handleSearchChange(column.key, e.target.value)}
                                   placeholder={t('tac.search') || '搜索'}
-                                  className="mt-1 w-full p-1 border border-border rounded text-[10px] bg-white dark:bg-slate-800"
+                                  className="mt-1 w-full p-1 border border-border rounded text-[10px] text-gray-900 bg-gray-100 placeholder:text-gray-400"
                                 />
                               )}
                               {/* 拖拽手柄 */}
@@ -1217,13 +1459,18 @@ export function TACPage() {
       ) : (
         <div className="flex-1 flex items-center justify-center text-muted-foreground flex-col">
           <List size={48} className="mb-4 opacity-30" />
-          <p>选择网络类型后点击「开始核查」查看结果</p>
+          {wizardStep === 'idle' ? (
+            <p>{t('common.configureFirst') || '请先点击"新建"按钮创建任务'}</p>
+          ) : (
+            <p>选择网络类型后点击「开始核查」查看结果</p>
+          )}
         </div>
       )}
             </div>
           )}
         </div>
       </div>
+
     </div>
   )
 }
