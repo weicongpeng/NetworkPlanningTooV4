@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react'
-import { Play, Download, Settings, Loader2, AlertCircle, HelpCircle, Search, X, Ruler, GripVertical, Check, Eye } from 'lucide-react'
+import { Play, Download, Settings, Loader2, AlertCircle, Search, X, Ruler, GripVertical, Check, Eye } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
+
 
 // 虚拟滚动配置
 const ITEM_HEIGHT = 40 // 每行高度
@@ -8,15 +9,24 @@ const VISIBLE_COUNT = 25 // 可见行数
 const BUFFER_COUNT = 5 // 缓冲行数
 import { neighborApi } from '../services/api'
 import type { ApiResponse } from '@shared/types'
-import { useTaskStore } from '../store/taskStore'
+import { useTaskStore, type Task } from '../store/taskStore'
+import { useMapStore } from '../store/mapStore'
+import { useAuthStore } from '../store/authStore'
+import { useNeighborStore } from '../store/neighborStore'
+import { btn } from '../utils/buttonStyles'
 import { OnlineMap, type OnlineMapRef } from '../components/Map/OnlineMap'
 import { NeighborLegend } from '../components/Map/NeighborLegend'
 import { MapTypeSwitch } from '../components/Map/MapTypeSwitch'
 import { neighborDataSyncService } from '../services/neighborDataSyncService'
 import type { RenderSectorData, CellListItem } from '../services/mapDataService'
-import { getCellList, clearCellListCache } from '../services/mapDataService'
+import { mapDataService, getCellList, clearCellListCache } from '../services/mapDataService'
 import { DATA_REFRESH_EVENT } from '../store/dataStore'
 import { CellSelectionTable } from '../components/CellSelectionTable'
+import { HistoryTable } from '../components/HistoryTable'
+import { StepIndicator } from '../components/StepIndicator'
+import { WizardFooter } from '../components/WizardFooter'
+import { NumberInput } from '../components/NumberInput'
+import { extractCellIdsFromFile, matchCellIds, downloadCellTreeTemplate } from '../utils/cellFileHelper'
 
 interface NeighborResultData {
   taskId: string
@@ -33,6 +43,8 @@ interface NeighborResultData {
 
 const MAX_ERRORS = 5
 
+type WizardStep = 'idle' | 'task_created' | 'params_set' | 'cells_selected' | 'executing' | 'completed'
+
 // 邻区规划类型最大邻区数限制
 const MAX_NEIGHBORS_LIMIT: Record<string, number> = {
   'LTE-LTE': 256,
@@ -42,6 +54,10 @@ const MAX_NEIGHBORS_LIMIT: Record<string, number> = {
 
 export function NeighborPage() {
   const { t } = useTranslation()
+  const user = useAuthStore((s) => s.user)
+  const { wizardStep, setWizardStep, config, setConfig, selectedCellIds: storeSelectedCellIds, activeLeftTab, setActiveLeftTab, taskName, setTaskName, resetConfig: storeResetConfig } = useNeighborStore()
+  const [taskNameError, setTaskNameError] = useState<string | null>(null)
+  const [nextTaskError, setNextTaskError] = useState<string | null>(null)
 
   // 翻译文本（带中文后备）
   const i18n = {
@@ -112,6 +128,13 @@ export function NeighborPage() {
     noCells: t('neighbor.noCells') || '暂无小区数据',
     loadingCells: t('neighbor.loadingCells') || '加载中...',
     cellListSource: t('neighbor.cellListSource') || '数据源：{{type}} 小区',
+    cellFilePrefixError: t('neighbor.cellFilePrefixError') || '文件名必须以"cell-tree"开头',
+    cellFileUploadFailed: t('neighbor.cellFileUploadFailed') || '待规划小区文件处理失败',
+    uploadCellFile: t('neighbor.uploadCellFile') || '上传待规划小区文件',
+    downloadCellTemplate: t('neighbor.downloadCellTemplate') || '下载待规划小区模板',
+    noCellsSelected: t('neighbor.noCellsSelected') || '请在小区选择列表中至少选择一个小区后再执行邻区规划',
+    noCellIdsExtracted: t('neighbor.noCellIdsExtracted') || '未能从文件中提取到小区ID，请检查文件格式',
+    noMatchingCells: t('neighbor.noMatchingCells') || '未匹配到任何小区，请检查文件内容与当前工参数据是否一致',
     // 工具提示
     distanceFactorTooltip: t('neighbor.distanceFactorTooltip') || '覆盖圆距离系数：站点到覆盖圆心的距离系数，默认5/9(≈0.556)',
     radiusFactorTooltip: t('neighbor.radiusFactorTooltip') || '覆盖圆半径系数：覆盖半径系数，默认5/9(≈0.556)',
@@ -180,32 +203,106 @@ export function NeighborPage() {
     { key: 'distance', label: i18n.distance, defaultWidth: 70 }
   ] as const
 
-  const [config, setConfig] = useState({
-    planningType: 'LTE-LTE',  // 邻区规划类型
-    maxNeighbors: 64,         // 最大邻区数
-    coverageDistanceFactor: 1.0,  // 覆盖圆距离系数
-    coverageRadiusFactor: 1.0     // 覆盖圆半径系数
-  })
   const [localTaskResult, setLocalTaskResult] = useState<NeighborResultData | null>(null)
+  const viewedTaskIdRef = useRef<string | null>(null) // 防止 useEffect 覆盖 API 获取的结果
   const {
     updateTaskProgress, completeTask, failTask, activeTaskIds, setActiveTaskId, startTask,
-    getLatestNeighborTask
+    getLatestNeighborTask,
+    startGlobalPolling, stopGlobalPolling, isGlobalPollingActive
   } = useTaskStore()
   const taskId = activeTaskIds.neighbor_planning
   const latestNeighborTask = getLatestNeighborTask()
+  const neighborHistoryCount = useTaskStore(s => Object.values(s.tasks).filter(t => t.type === 'neighbor_planning').length)
 
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [isLegendVisible, setIsLegendVisible] = useState(true)
   const [syncServiceInitialized, setSyncServiceInitialized] = useState(false)
 
-  // 左列页签状态：'cell-selection' | 'planning-result'
-  const [activeLeftTab, setActiveLeftTab] = useState<'cell-selection' | 'planning-result'>('planning-result')
-  // 选中的小区ID集合（格式：${siteId}_${sectorId}）
-  const [selectedCellIds, setSelectedCellIds] = useState<Set<string>>(new Set())
+  // 选中的小区ID集合（格式：${siteId}_${sectorId}）- 本地 Set 桥接 store 的 string[]
+  const [selectedCellIdsSet, setSelectedCellIdsSet] = useState<Set<string>>(new Set(storeSelectedCellIds))
+  useEffect(() => { setSelectedCellIdsSet(new Set(storeSelectedCellIds)) }, [storeSelectedCellIds])
   // 小区列表数据（从轻量API获取）
   const [cellListData, setCellListData] = useState<{ lte: CellListItem[]; nr: CellListItem[] }>({ lte: [], nr: [] })
   const [cellListLoading, setCellListLoading] = useState(false)
+  const [cellFileUploading, setCellFileUploading] = useState(false)
+  const cellFileInputRef = useRef<HTMLInputElement>(null)
+
+  // 全局地图控制
+  const setGlobalShowMap = useMapStore((s) => s.setGlobalShowMap)
+
+  // ===== 状态重置 =====
+  const resetConfig = useCallback(() => {
+    storeResetConfig()
+    setSelectedCellIdsSet(new Set())
+    setTaskNameError(null)
+    setActiveTaskId('neighbor_planning', null)
+    setLocalTaskResult(null)
+    setError(null)
+  }, [storeResetConfig, setActiveTaskId])
+
+  useEffect(() => {
+    if (activeLeftTab === 'task-config') { resetConfig() }
+  }, [activeLeftTab, resetConfig])
+
+  // ===== 地图联动关闭 =====
+  useEffect(() => {
+    if (activeLeftTab !== 'planning-result') {
+      setShowMap(false)
+      setGlobalShowMap(false)
+    }
+  }, [activeLeftTab, setGlobalShowMap])
+
+  // ===== 结果自动加载 =====
+  const { syncHistoryFromBackend } = useTaskStore()
+  useEffect(() => {
+    if (activeLeftTab === 'planning-result') {
+      // 如果用户通过"查看"按钮加载了特定任务的结果，不要自动加载最新的
+      if (viewedTaskIdRef.current) {
+        return
+      }
+      const loadLatest = async () => {
+        await syncHistoryFromBackend('neighbor_planning')
+        const latest = getLatestNeighborTask()
+        if (latest && latest.result) {
+          // 如果缺少完整 results（来自 resultSummary），尝试从 API 重新获取
+          if (!latest.result.results && latest.id) {
+            try {
+              const response = await neighborApi.getResult(latest.id)
+              if (response?.success && response?.data?.results) {
+                const fullResult = response.data as NeighborResultData
+                setLocalTaskResult(fullResult)
+                neighborDataSyncService.setNeighborResults({ results: fullResult.results })
+                setWizardStep('completed')
+                return
+              }
+            } catch (fetchErr: any) {
+              console.warn('[NeighborPage] 获取完整规划结果失败，使用缓存摘要:', fetchErr?.message)
+            }
+          }
+          // 有完整 results 或 API 获取失败时使用已有结果
+          setLocalTaskResult(latest.result as NeighborResultData)
+          if (latest.result.results) {
+            neighborDataSyncService.setNeighborResults({ results: latest.result.results })
+          }
+          setWizardStep('completed')
+        }
+      }
+      loadLatest()
+    } else {
+      // 离开结果页时清除 viewedTaskIdRef
+      viewedTaskIdRef.current = null
+    }
+  }, [activeLeftTab])
+
+  // ===== getCellCount =====
+  const getCellCount = useCallback((task: Task): number | string => {
+    if (task.result?.totalSectors !== undefined) return task.result.totalSectors
+    if (task.result?.results && Array.isArray(task.result.results)) {
+      return task.result.results.length
+    }
+    return '-'
+  }, [])
 
   // 搜索状态
   const [searchValue, setSearchValue] = useState('')
@@ -294,10 +391,13 @@ export function NeighborPage() {
   const [selectedSourceSector, setSelectedSourceSector] = useState<any | null>(null)
 
   const pollingIntervalRef = useRef<NodeJS.Timeout | null>(null)
+  const pollingTimeoutRef = useRef<NodeJS.Timeout | null>(null)
   const errorCountRef = useRef(0)
 
   // 确定当前显示的任务结果
   const taskResult = localTaskResult || (latestNeighborTask?.result as NeighborResultData | null)
+  // 只有当有完整结果数据（含 results 数组）或由 handleViewTask 设置时才认为是有效结果
+  const hasFullResult = taskResult && (!!(taskResult as any).results || viewedTaskIdRef.current)
 
   // 组件挂载时，检查是否有最新的邻区规划结果
   useEffect(() => {
@@ -365,16 +465,14 @@ export function NeighborPage() {
 
     // 监听数据刷新事件（当在其他页面上传新工参时）
     const handleDataRefresh = async () => {
-      console.log('[NeighborPage] 收到数据刷新事件，正在重新初始化...')
+      console.log('[NeighborPage] 收到数据刷新事件，正在清除缓存...')
       try {
         // 清除地图数据和小区列表缓存
-        mapDataService.clearCache()
+        await mapDataService.clearCache()
         clearCellListCache()
-        console.log('[NeighborPage] 已清除地图数据和小区列表缓存')
-
-        // 重新初始化邻区数据同步服务
-        await initSyncService()
-        console.log('[NeighborPage] 数据同步服务已重新初始化')
+        // 重新加载小区列表，确保新建任务页面使用最新数据
+        loadCellList()
+        console.log('[NeighborPage] 已清除缓存并重载小区列表')
       } catch (error) {
         console.warn('[NeighborPage] 数据刷新失败:', error)
       }
@@ -397,7 +495,13 @@ export function NeighborPage() {
   // 邻区规划模式：仅在规划结果完成时加载全量扇区数据
   // 根据规划结果的关系类型决定加载哪些网络类型的扇区
   useEffect(() => {
-    // 仅在规划任务完成且有结果时加载数据，避免页面进入时自动加载
+    // 确保同步服务已初始化
+    if (!syncServiceInitialized) {
+      console.log('[NeighborPage] 等待同步服务初始化完成')
+      return
+    }
+
+    // 仅在规划任务完成且有结果时加载数据
     if (taskResult?.status !== 'completed' || !taskResult?.results || taskResult.results.length === 0) {
       return
     }
@@ -468,6 +572,12 @@ export function NeighborPage() {
           nr: shouldLoadNR
         })
 
+        // 同时加载邻区规划结果（在过滤后的数据上处理，避免被初始化全量数据覆盖）
+        if (taskResult.results) {
+          neighborDataSyncService.setNeighborResults({ results: taskResult.results })
+          console.log('[NeighborPage] 邻区规划结果已加载到同步服务（在过滤数据基础上）')
+        }
+
         // 如果有地图实例，刷新数据
         if (mapRef.current) {
           await mapRef.current.refreshData()
@@ -479,44 +589,6 @@ export function NeighborPage() {
     }
 
     loadFullParamsData()
-  }, [taskResult?.status, taskResult?.results]) // 当规划任务完成且有结果时加载
-
-  // 当规划结果完成时，加载结果到同步服务并刷新地图
-  useEffect(() => {
-    // 确保同步服务已初始化
-    if (!syncServiceInitialized) {
-      console.log('[NeighborPage] 等待同步服务初始化完成')
-      return
-    }
-
-    if (taskResult?.status === 'completed' && taskResult?.results && mapRef.current) {
-      const map = mapRef.current
-      const loadResults = async () => {
-        try {
-          console.log('[NeighborPage] 开始加载邻区规划结果', { resultsCount: taskResult.results.length })
-          
-          // 加载邻区规划结果到同步服务
-          neighborDataSyncService.setNeighborResults({ results: taskResult.results })
-          console.log('[NeighborPage] 邻区规划结果已加载到同步服务')
-
-          // 检查同步服务数据是否正常
-          const syncedData = neighborDataSyncService.getFullParamsData()
-          console.log('[NeighborPage] 同步服务数据状态:', {
-            hasSyncedData: !!syncedData,
-            lteCount: syncedData?.lte.length || 0,
-            nrCount: syncedData?.nr.length || 0
-          })
-
-          // 刷新地图数据
-          await map.refreshData()
-          console.log('[NeighborPage] 规划完成后刷新地图数据')
-        } catch (error) {
-          console.error('[NeighborPage] 刷新地图数据失败:', error)
-          setError(i18n.loadResultFailed + ': ' + (error instanceof Error ? error.message : String(error)))
-        }
-      }
-      loadResults()
-    }
   }, [taskResult?.status, taskResult?.results, syncServiceInitialized])
 
   // 处理规划结果搜索过滤
@@ -567,93 +639,32 @@ export function NeighborPage() {
     }))
   }
 
-  // 轮询任务进度
+  // === 全局轮询：页面切换不中断 ===
   useEffect(() => {
-    const clearPolling = () => {
-      if (pollingIntervalRef.current) {
-        clearInterval(pollingIntervalRef.current)
-        pollingIntervalRef.current = null
+    if (taskId && (taskResult?.status === 'pending' || taskResult?.status === 'processing')) {
+      if (!isGlobalPollingActive('neighbor_planning')) {
+        startGlobalPolling('neighbor_planning')
       }
     }
+  }, [taskId, taskResult?.status])
 
-    if (!taskId || taskResult?.status === 'completed' || taskResult?.status === 'failed') {
-      clearPolling()
+  // 从 taskStore 同步进度到 localTaskResult（但不要覆盖用户通过"查看"按钮加载的结果）
+  useEffect(() => {
+    if (taskId && viewedTaskIdRef.current === taskId) {
       return
     }
-
-    clearPolling()
-
-    pollingIntervalRef.current = setInterval(async () => {
-      try {
-        const response: ApiResponse<any> = await neighborApi.getProgress(taskId)
-        errorCountRef.current = 0
-
-        if (response.success && response.data) {
-          const data = response.data
-          const updatedResult = {
-            ...data,
-            startTime: data.created_at || localTaskResult?.startTime || new Date().toISOString()
-          }
-          setLocalTaskResult(updatedResult)
-
-          // 更新全局任务状态
-          updateTaskProgress(taskId, data.progress, data.status)
-
-          if (data.status === 'completed') {
-            clearPolling()
-            setTimeout(async () => {
-              try {
-                const resultResponse: ApiResponse<any> = await neighborApi.getResult(taskId)
-                if (resultResponse.success && resultResponse.data) {
-                  setLocalTaskResult(resultResponse.data)
-                  // 将完成的任务结果保存到全局状态
-                  completeTask(taskId, resultResponse.data)
-                } else {
-                  setError(resultResponse.message || i18n.getResultFailed)
-                  failTask(taskId, resultResponse.message || i18n.getResultFailed)
-                }
-              } catch (err: any) {
-                const errorMsg = i18n.getResultFailed + ': ' + (err.message || err.toString?.() || '未知错误')
-                setError(errorMsg)
-                failTask(taskId, errorMsg)
-              }
-            }, 100)
-          } else if (data.status === 'failed') {
-            clearPolling()
-            const errorMsg = data.message || data.error || i18n.taskFailed2
-            setError(errorMsg)
-            failTask(taskId, errorMsg)
-          }
-        } else {
-          setError(response.message || i18n.getProgressFailed)
+    if (taskId) {
+      const t = useTaskStore.getState().tasks[taskId]
+      if (t) {
+        if (t.result && Object.keys(t.result).length > 0) {
+          setLocalTaskResult(t.result as NeighborResultData)
         }
-      } catch (err: any) {
-        console.error('Failed to get progress:', err)
-
-        if (err?.code === 404) {
-          clearPolling()
-          console.log('[NeighborPage] Task not found (404), clearing invalid taskId:', taskId)
-          useTaskStore.getState().setActiveTaskId('neighbor_planning', null)
-          setLocalTaskResult(null)
-          setError(null)
-          return
-        }
-
-        errorCountRef.current++
-
-        if (errorCountRef.current >= MAX_ERRORS) {
-          clearPolling()
-          const errorMsg = i18n.cannotConnect
-          setError(errorMsg)
-          failTask(taskId, errorMsg)
-        } else {
-          setError(i18n.retrying.replace('{{count}}', String(errorCountRef.current)).replace('{{max}}', String(MAX_ERRORS)))
+        if (t.status === 'completed' || t.status === 'failed') {
+          stopGlobalPolling('neighbor_planning')
         }
       }
-    }, 1000)
-
-    return clearPolling
-  }, [taskId, localTaskResult, updateTaskProgress, completeTask, failTask])
+    }
+  }, [taskId])
 
   // 加载小区列表数据（根据规划类型加载对应网络类型的扇区）
   const loadCellList = useCallback(async () => {
@@ -679,7 +690,7 @@ export function NeighborPage() {
 
   // 切换单个小区选中状态
   const toggleCellSelection = (cellId: string) => {
-    setSelectedCellIds(prev => {
+    setSelectedCellIdsSet(prev => {
       const next = new Set(prev)
       if (next.has(cellId)) {
         next.delete(cellId)
@@ -695,17 +706,17 @@ export function NeighborPage() {
     const sourceType = config.planningType.split('-')[0] as 'LTE' | 'NR'
     const sectors = sourceType === 'LTE' ? cellListData.lte : cellListData.nr
     const allIds = sectors.map(s => s.id)
-    const allSelected = allIds.every(id => selectedCellIds.has(id))
+    const allSelected = allIds.every(id => selectedCellIdsSet.has(id))
     if (allSelected) {
       // 取消全选：从选中集合中移除当前网络类型的所有小区
-      setSelectedCellIds(prev => {
+      setSelectedCellIdsSet(prev => {
         const next = new Set(prev)
         allIds.forEach(id => next.delete(id))
         return next
       })
     } else {
       // 全选：添加所有当前网络类型的小区
-      setSelectedCellIds(prev => {
+      setSelectedCellIdsSet(prev => {
         const next = new Set(prev)
         allIds.forEach(id => next.add(id))
         return next
@@ -715,57 +726,200 @@ export function NeighborPage() {
 
   // 清空所有选中
   const clearSelections = () => {
-    setSelectedCellIds(new Set())
+    setSelectedCellIdsSet(new Set())
   }
 
-  const handleRunNeighbor = async () => {
-    // 前端验证配置参数
-    const validationError = validateNeighborConfig(config)
-    if (validationError) {
-      setError(validationError)
+  // 上传待规划小区文件
+  const handleUploadCellFile = () => {
+    cellFileInputRef.current?.click()
+  }
+
+  const handleCellFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    if (!file) return
+
+    if (!file.name.toLowerCase().startsWith('cell-tree')) {
+      setError(i18n.cellFilePrefixError || '文件名必须以"cell-tree"开头')
+      e.target.value = ''
       return
     }
 
+    setCellFileUploading(true)
     setError(null)
-    setLocalTaskResult(null)
-    setLoading(true)
-    errorCountRef.current = 0
+    try {
+      // 1. 本地解析文件，提取小区ID
+      const extractedIds = await extractCellIdsFromFile(file)
+      if (extractedIds.length === 0) {
+        setError(i18n.noCellIdsExtracted || '未能从文件中提取到小区ID，请检查文件格式')
+        return
+      }
 
-    // 解析规划类型
-    // const [sourceType, targetType] = config.planningType.split('-') as ['LTE' | 'NR', 'LTE' | 'NR']
+      // 2. 获取并刷新小区选择列表（匹配优先于上传）
+      clearCellListCache()
+      setCellListLoading(true)
+      const data = await getCellList()
+      setCellListData({ lte: data.lte || [], nr: data.nr || [] })
+      setCellListLoading(false)
 
+      // 3. 匹配小区ID并自动勾选
+      const allAvailableIds = [...data.lte, ...data.nr].map(item => item.id)
+      const matchedIds = matchCellIds(extractedIds, allAvailableIds)
+
+      if (matchedIds.length > 0) {
+        setSelectedCellIdsSet(new Set(matchedIds))
+      } else {
+        setError(i18n.noMatchingCells || '未匹配到任何小区，请检查文件内容与当前工参数据是否一致')
+      }
+    } catch (err: any) {
+      console.error('[NeighborPage] 处理待规划小区文件失败:', err)
+      setError(err.message || (i18n.cellFileUploadFailed || '待规划小区文件处理失败'))
+    } finally {
+      setCellFileUploading(false)
+      e.target.value = ''
+    }
+  }
+
+  // 下载待规划小区模板（根据当前规划类型的源网络类型动态生成）
+  const handleDownloadCellTemplate = () => {
+    try {
+      const sourceType = (config.planningType.split('-')[0] as 'LTE' | 'NR') || 'LTE'
+      downloadCellTreeTemplate(sourceType)
+    } catch (err: any) {
+      console.error('[NeighborPage] 下载模板失败:', err)
+      alert(`下载模板失败: ${err.message || ''}`)
+    }
+  }
+
+  // 监听任务完成/失败，自动推进向导步骤
+  useEffect(() => {
+    if (wizardStep === 'executing') {
+      if (localTaskResult?.status === 'completed') {
+        setWizardStep('completed')
+        setError(null)
+      } else if (localTaskResult?.status === 'failed') {
+        setWizardStep('cells_selected')
+      }
+    }
+  }, [localTaskResult?.status, wizardStep])
+
+  // === 向导步骤处理函数 ===
+
+  const validateTaskName = (name: string): string | null => {
+    if (!name.trim()) return '请输入任务名称'
+    if (name.length > 25) return '任务名称不能超过25个字符'
+    return null
+  }
+
+  const handleTaskNameChange = (value: string) => {
+    if (value.length > 25) return
+    setTaskName(value)
+    setTaskNameError(null)
+  }
+
+  const handleCancel = () => {
+    setWizardStep('idle')
+    setTaskName(''); setTaskNameError(null); setNextTaskError(null)
+    setSelectedCellIdsSet(new Set()); setError(null)
+    setConfig({ planningType: 'LTE-LTE', maxNeighbors: 64, coverageDistanceFactor: 1.0, coverageRadiusFactor: 1.0 })
+  }
+
+  // ===== 上一步逻辑 =====
+  const handleBack = useCallback(() => {
+    if (wizardStep === 'task_created') {
+      setWizardStep('idle'); setTaskName(''); setTaskNameError(null); setError(null)
+    } else if (wizardStep === 'params_set') {
+      setWizardStep('task_created'); setNextTaskError(null); setError(null)
+    } else if (wizardStep === 'cells_selected') {
+      setWizardStep('params_set'); setSelectedCellIdsSet(new Set()); setError(null)
+    }
+  }, [wizardStep])
+
+  // ===== 统一的"下一步"逻辑 =====
+  const handleNext = useCallback(() => {
+    if (wizardStep === 'idle') {
+      setWizardStep('task_created'); setTaskNameError(null); setError(null)
+    } else if (wizardStep === 'task_created') {
+      const nameError = validateTaskName(taskName)
+      if (nameError) { setTaskNameError(nameError); return }
+      setTaskNameError(null); setWizardStep('params_set'); setError(null)
+    } else if (wizardStep === 'params_set') {
+      const validationError = validateNeighborConfig(config)
+      if (validationError) { setNextTaskError(validationError); return }
+      setNextTaskError(null); setWizardStep('cells_selected'); setSelectedCellIdsSet(new Set()); setError(null)
+    } else if (wizardStep === 'cells_selected') {
+      if (selectedCellIdsSet.size === 0) {
+        setError(i18n.noCellsSelected || '请在小区选择列表中至少选择一个小区后再执行邻区规划')
+        return
+      }
+      handleExecute()
+    } else if (wizardStep === 'completed') {
+      setActiveLeftTab('planning-result'); setShowMap(true)
+    }
+  }, [wizardStep, taskName, config, selectedCellIdsSet])
+
+  const handleNewTask = () => { setWizardStep('task_created'); setTaskNameError(null); setError(null) }
+
+  const handleParamsSetup = () => {
+    const nameError = validateTaskName(taskName)
+    if (nameError) { setTaskNameError(nameError); return }
+    setTaskNameError(null); setWizardStep('params_set'); setError(null)
+  }
+
+  const handleSelectCells = () => {
+    const validationError = validateNeighborConfig(config)
+    if (validationError) { setNextTaskError(validationError); return }
+    setNextTaskError(null); setWizardStep('cells_selected'); setSelectedCellIdsSet(new Set()); setError(null)
+  }
+
+  const handleExecute = async () => {
+    if (selectedCellIdsSet.size === 0) {
+      setError(i18n.noCellsSelected || '请在小区选择列表中至少选择一个小区后再执行邻区规划')
+      return
+    }
+    const validationError = validateNeighborConfig(config)
+    if (validationError) { setError(validationError); return }
+    setError(null); setLocalTaskResult(null); setLoading(true)
+    setWizardStep('executing'); errorCountRef.current = 0
     try {
       const response: ApiResponse<{ taskId: string; message: string }> = await neighborApi.plan({
+        taskName: taskName,
         planningType: config.planningType as 'LTE-LTE' | 'NR-NR' | 'NR-LTE',
         maxNeighbors: config.maxNeighbors,
         coverageDistanceFactor: config.coverageDistanceFactor,
         coverageRadiusFactor: config.coverageRadiusFactor,
-        selectedCellIds: selectedCellIds.size > 0 ? Array.from(selectedCellIds) : undefined
+        selectedCellIds: Array.from(selectedCellIdsSet)
       })
-
       if (response.success && response.data) {
         const newTaskId = response.data.taskId
         setActiveTaskId('neighbor_planning', newTaskId)
-        const initialResult = {
-          taskId: newTaskId,
-          status: 'pending' as const,
-          progress: 0,
-          totalSites: 0,
-          totalSectors: 0,
-          totalNeighbors: 0,
-          avgNeighbors: 0,
-          startTime: new Date().toISOString()
-        }
-        setLocalTaskResult(initialResult)
-        // 在全局任务状态中开始新任务
-        startTask(newTaskId, 'neighbor_planning', i18n.startTaskMsg)
+        setLocalTaskResult({ taskId: newTaskId, status: 'pending' as const, progress: 0, totalSites: 0, totalSectors: 0, totalNeighbors: 0, avgNeighbors: 0, startTime: new Date().toISOString() })
+        startTask(newTaskId, 'neighbor_planning', i18n.startTaskMsg, taskName, user?.username)
       } else {
-        setError(response.message || i18n.startTaskFailed)
+        setError(response.message || i18n.startTaskFailed); setWizardStep('cells_selected')
       }
     } catch (err: any) {
-      setError(err.message || i18n.startTaskFailed)
-    } finally {
-      setLoading(false)
+      setError(err.message || i18n.startTaskFailed); setWizardStep('cells_selected')
+    } finally { setLoading(false) }
+  }
+
+  // 从历史任务查看 - 跳转到结果页并自动打开地图
+  const handleViewTask = async (task: any) => {
+    try {
+      const response = await neighborApi.getResult(task.id)
+      if (response?.success && response?.data) {
+        const result = response.data as NeighborResultData
+        viewedTaskIdRef.current = task.id // 必须在 setActiveTaskId 之前设置！
+        setLocalTaskResult(result)
+        setActiveTaskId('neighbor_planning', task.id)
+        setActiveLeftTab('planning-result')
+        setShowMap(true)
+        if (result.results) {
+          neighborDataSyncService.setNeighborResults({ results: result.results })
+        }
+      }
+    } catch (err: any) {
+      console.error('加载邻区规划结果失败:', err)
+      setError('加载规划结果失败: ' + (err.message || '未知错误'))
     }
   }
 
@@ -1093,161 +1247,220 @@ export function NeighborPage() {
       <div className="flex flex-col lg:flex-row gap-4 min-h-0 flex-1 overflow-hidden">
         {/* 左列：规划参数 + 规划结果 */}
         <div className="flex flex-col gap-4 min-h-0 flex-1 min-w-0">
-          {/* 规划参数面板 - 单行布局 */}
-          <div className="bg-card p-3 rounded-lg border border-border shrink-0">
-            <div className="flex items-center gap-2 mb-2">
-              <h2 className="text-base font-semibold">{i18n.planningParams}</h2>
-            </div>
-
-            <div className="grid grid-cols-5 gap-x-3 gap-y-1 items-end">
-              {/* 邻区规划类型 */}
-              <ConfigSelect
-                label={i18n.planningType}
-                value={config.planningType}
-                options={['LTE-LTE', 'NR-NR', 'NR-LTE']}
-                onChange={(value) => {
-                  setSelectedCellIds(new Set())
-                  setConfig({ ...config, planningType: value })
-                }}
-                disabled={isRunning}
-              />
-
-              {/* 最大邻区数 */}
-              <ConfigInput
-                label={i18n.maxNeighbors}
-                type="number"
-                value={config.maxNeighbors}
-                onChange={(value) => setConfig({ ...config, maxNeighbors: parseInt(value) || 32 })}
-                disabled={isRunning}
-                min={1}
-                max={MAX_NEIGHBORS_LIMIT[config.planningType] || 512}
-              />
-
-              {/* 覆盖圆距离系数 */}
-              <ConfigInput
-                label={i18n.distanceFactor}
-                type="number"
-                value={config.coverageDistanceFactor}
-                onChange={(value) => setConfig({ ...config, coverageDistanceFactor: parseFloat(value) || 0.56 })}
-                disabled={isRunning}
-                min={0.1}
-                max={2.0}
-                step={0.01}
-                tooltip={i18n.distanceFactorTooltip}
-              />
-
-              {/* 覆盖圆半径系数 */}
-              <ConfigInput
-                label={i18n.radiusFactor}
-                type="number"
-                value={config.coverageRadiusFactor}
-                onChange={(value) => setConfig({ ...config, coverageRadiusFactor: parseFloat(value) || 0.56 })}
-                disabled={isRunning}
-                min={0.1}
-                max={2.0}
-                step={0.01}
-                tooltip={i18n.radiusFactorTooltip}
-              />
-
-              {/* 开始规划按钮 */}
-              <button
-                onClick={handleRunNeighbor}
-                disabled={loading || isRunning || validateNeighborConfig(config) !== null}
-                className="w-full flex items-center justify-center gap-2 px-3 py-2 bg-blue-400 text-white rounded-lg hover:bg-blue-500 disabled:opacity-50 disabled:cursor-not-allowed text-sm font-medium transition-colors"
-                title={validateNeighborConfig(config) || undefined}
-              >
-                {loading ? (
-                  <>
-                    <Loader2 className="animate-spin" size={16} />
-                    {i18n.starting}
-                  </>
-                ) : isRunning ? (
-                  <>
-                    <Loader2 className="animate-spin" size={16} />
-                    {i18n.planning}
-                  </>
-                ) : (
-                  <>
-                    <Play size={16} />
-                    {i18n.startPlan}
-                  </>
-                )}
-              </button>
-            </div>
-
-            {/* 验证提示 */}
-            {validateNeighborConfig(config) && (
-              <p className="text-xs text-orange-600 mt-2">{validateNeighborConfig(config)}</p>
-            )}
-          </div>
-
           {/* 小区选择与结果面板（页签切换） */}
           <div className="bg-card p-3 rounded-lg border border-border flex flex-col flex-1 min-h-0 overflow-hidden">
             {/* 页签切换栏 */}
             <div className="flex items-center gap-1 mb-3 border-b border-border">
+              {/* 历史任务 tab */}
               <button
-                onClick={() => setActiveLeftTab('cell-selection')}
-                className={`px-4 py-2 text-sm font-medium transition-colors border-b-2 ${
-                  activeLeftTab === 'cell-selection'
-                    ? 'border-blue-500 text-blue-600'
-                    : 'border-transparent text-muted-foreground hover:text-foreground'
-                }`}
+                onClick={() => !isRunning && setActiveLeftTab('history')}
+                className={activeLeftTab === 'history' ? btn.activeTab : btn.ghost}
+                disabled={isRunning}
               >
-                {i18n.cellSelection}
-                {selectedCellIds.size > 0 && (
-                  <span className="ml-2 px-1.5 py-0.5 text-xs bg-blue-100 text-blue-700 rounded-full">
-                    {selectedCellIds.size}
-                  </span>
-                )}
+                {t('common.historyTask') || '历史任务'}
+                <span className={btn.badgeCount}>{neighborHistoryCount}</span>
               </button>
+
+              {/* 新建任务 tab */}
+              <button
+                onClick={() => !isRunning && setActiveLeftTab('task-config')}
+                className={activeLeftTab === 'task-config' ? btn.activeTab : btn.ghost}
+                disabled={isRunning}
+              >
+                {t('common.newTask') || '新建任务'}
+              </button>
+
+              {/* 规划结果 tab */}
               <button
                 onClick={() => setActiveLeftTab('planning-result')}
-                className={`px-4 py-2 text-sm font-medium transition-colors border-b-2 ${
-                  activeLeftTab === 'planning-result'
-                    ? 'border-blue-500 text-blue-600'
-                    : 'border-transparent text-muted-foreground hover:text-foreground'
-                }`}
+                className={activeLeftTab === 'planning-result' ? btn.activeTab : btn.ghost}
               >
                 {i18n.result}
                 {taskResult?.status === 'completed' && (
-                  <span className="ml-2 px-1.5 py-0.5 text-xs bg-green-100 text-green-700 rounded-full">
-                    ✓
-                  </span>
+                  <span className={btn.badgeSuccess}>✓</span>
                 )}
                 {taskResult?.status === 'failed' && (
-                  <span className="ml-2 inline-flex items-center justify-center w-5 h-5 rounded-full bg-red-500 text-white text-[10px] font-bold">!</span>
+                  <span className={btn.badgeError}>!</span>
+                )}
+                {isRunning && (
+                  <span className="ml-2 inline-flex items-center">
+                    <Loader2 size={12} className="animate-spin text-blue-500" />
+                  </span>
                 )}
               </button>
             </div>
 
             {/* 页签内容 */}
             <div className="flex-1 min-h-0 overflow-hidden">
-              {activeLeftTab === 'cell-selection' ? (
-                /* 小区选择面板 */
+              {activeLeftTab === 'task-config' && (
                 <div className="flex flex-col h-full overflow-hidden">
-                  <CellSelectionTable
-                    sectors={(() => {
-                      const sourceType = config.planningType.split('-')[0] as 'LTE' | 'NR'
-                      return sourceType === 'LTE' ? cellListData.lte : cellListData.nr
-                    })()}
-                    selectedCellIds={selectedCellIds}
-                    onToggleCell={toggleCellSelection}
-                    onSelectAll={toggleSelectAll}
-                    onClearSelections={clearSelections}
-                    selectedCountText={i18n.selectedCount.replace('{{count}}', String(selectedCellIds.size))}
-                    dataSourceText={i18n.cellListSource.replace('{{type}}', config.planningType.split('-')[0])}
-                    searchPlaceholder={i18n.cellSearchPlaceholder}
-                    loading={cellListLoading}
-                    columnLabels={{
-                      siteId: i18n.sourceSiteId,
-                      cellId: i18n.sourceCellId,
-                      cellName: i18n.sourceCellName,
-                      selectAll: i18n.selectAll,
-                      clearSelections: i18n.clearSelections
+                  {/* 步骤指示器（执行步骤显示进度百分比） */}
+                  <StepIndicator
+                    currentStep={
+                      wizardStep === 'idle' || wizardStep === 'task_created' ? 0
+                      : wizardStep === 'params_set' ? 1
+                      : wizardStep === 'cells_selected' ? 2
+                      : wizardStep === 'executing' ? 3
+                      : 4
+                    }
+                    executingProgress={wizardStep === 'executing' ? (taskResult?.progress ?? 0) : undefined}
+                  />
+                  <div className="flex flex-row gap-4 flex-1 min-h-0 overflow-hidden">
+                  {/* 左侧：任务名称 + 参数设置 */}
+                  <div className="flex flex-col overflow-y-auto flex-1 min-w-0">
+                    <div className="bg-card border border-border rounded-xl p-6 w-full">
+                      {nextTaskError && (
+                        <div className="mb-4 p-3 bg-red-50 border border-red-200 rounded-lg flex items-center gap-3 text-red-700">
+                          <AlertCircle size={18} />
+                          <span className="text-sm">{nextTaskError}</span>
+                          <button onClick={() => setNextTaskError(null)} className="ml-auto text-sm underline">{i18n.close}</button>
+                        </div>
+                      )}
+                      {/* 任务名称 */}
+                      <div className="mb-6">
+                        <label className="block text-sm font-semibold mb-2">{t('common.taskName') || '任务名称'}</label>
+                        <input
+                          type="text"
+                          value={taskName}
+                          onChange={(e) => handleTaskNameChange(e.target.value)}
+                          disabled={wizardStep !== 'idle' && wizardStep !== 'task_created'}
+                          placeholder={t('common.taskNamePlaceholder') || '请输入任务名称'}
+                          maxLength={25}
+                          className={`w-full px-3 py-2 text-sm bg-background border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary disabled:opacity-60 disabled:cursor-not-allowed ${taskNameError ? 'border-red-400 focus:ring-red-400' : wizardStep === 'task_created' && !taskName.trim() ? 'input-pulse' : 'border-border'}`}
+                        />
+                        {taskNameError && <p className="mt-1 text-xs text-red-500">{taskNameError}</p>}
+                        <p className="mt-1 text-xs text-muted-foreground">{taskName.length}/25</p>
+                      </div>
+
+                      {/* 邻区规划参数 */}
+                      <div className="space-y-4">
+                        <div className="grid grid-cols-2 gap-x-4 gap-y-3">
+                          <div>
+                            <label className="block text-xs font-medium mb-0.5">{i18n.planningType}</label>
+                            <select
+                              value={config.planningType}
+                              onChange={(e) => setConfig({ planningType: e.target.value })}
+                              disabled={wizardStep !== 'params_set'}
+                              className="w-full px-2 py-1.5 text-sm bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary disabled:opacity-60 disabled:cursor-not-allowed"
+                            >
+                              <option value="LTE-LTE">LTE-LTE</option>
+                              <option value="NR-NR">NR-NR</option>
+                              <option value="NR-LTE">NR-LTE</option>
+                            </select>
+                          </div>
+                          <div>
+                            <label className="block text-xs font-medium mb-0.5">{i18n.maxNeighbors}</label>
+                            <NumberInput
+                              value={config.maxNeighbors}
+                              onChange={(v) => setConfig({ maxNeighbors: v })}
+                              disabled={wizardStep !== 'params_set'}
+                              min={1}
+                              max={MAX_NEIGHBORS_LIMIT[config.planningType] || 512}
+                              className="w-full"
+                            />
+                          </div>
+                          <div>
+                            <label className="block text-xs font-medium mb-0.5" title={i18n.distanceFactorTooltip}>{i18n.distanceFactor}</label>
+                            <NumberInput
+                              value={config.coverageDistanceFactor}
+                              onChange={(v) => setConfig({ coverageDistanceFactor: v })}
+                              disabled={wizardStep !== 'params_set'}
+                              min={0.1}
+                              max={2.0}
+                              className="w-full"
+                            />
+                          </div>
+                          <div>
+                            <label className="block text-xs font-medium mb-0.5" title={i18n.radiusFactorTooltip}>{i18n.radiusFactor}</label>
+                            <NumberInput
+                              value={config.coverageRadiusFactor}
+                              onChange={(v) => setConfig({ coverageRadiusFactor: v })}
+                              disabled={wizardStep !== 'params_set'}
+                              min={0.1}
+                              max={2.0}
+                              className="w-full"
+                            />
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* 右侧：小区选择 */}
+                  <div className="flex flex-col flex-1 min-w-0 border-l border-border pl-4 overflow-hidden">
+                    <div className="flex flex-col h-full overflow-hidden">
+                      <input type="file" ref={cellFileInputRef} onChange={handleCellFileChange} accept=".xlsx,.xls" className="hidden" />
+                      <CellSelectionTable
+                        sectors={(() => { const sourceType = config.planningType.split('-')[0] as 'LTE' | 'NR'; return sourceType === 'LTE' ? cellListData.lte : cellListData.nr })()}
+                        selectedCellIds={selectedCellIdsSet}
+                        onToggleCell={wizardStep === 'cells_selected' && !isRunning ? toggleCellSelection : () => {}}
+                        onSelectAll={wizardStep === 'cells_selected' && !isRunning ? toggleSelectAll : () => {}}
+                        onClearSelections={wizardStep === 'cells_selected' && !isRunning ? clearSelections : () => {}}
+                        selectedCountText={i18n.selectedCount.replace('{{count}}', String(selectedCellIdsSet.size))}
+                        searchPlaceholder={i18n.cellSearchPlaceholder}
+                        loading={cellListLoading}
+                        onUploadCellFile={wizardStep === 'cells_selected' ? handleUploadCellFile : undefined}
+                        onDownloadCellTemplate={wizardStep === 'cells_selected' ? handleDownloadCellTemplate : undefined}
+                        uploading={cellFileUploading}
+                        disabled={wizardStep !== 'cells_selected' || isRunning}
+                        columnLabels={{ siteId: i18n.sourceSiteId, cellId: i18n.sourceCellId, cellName: i18n.sourceCellName, selectAll: i18n.selectAll, clearSelections: i18n.clearSelections, uploadCellFile: i18n.uploadCellFile, downloadCellTemplate: i18n.downloadCellTemplate }}
+                      />
+                    </div>
+                  </div>
+                </div>
+
+                {/* === 向导流程底部导航 === */}
+                <WizardFooter
+                  currentStep={
+                    wizardStep === 'idle' || wizardStep === 'task_created' ? 0
+                    : wizardStep === 'params_set' ? 1
+                    : wizardStep === 'cells_selected' ? 2
+                    : wizardStep === 'executing' ? 3
+                    : 4
+                  }
+                  isExecuting={loading || isRunning}
+                  canProceed={
+                    wizardStep === 'idle' ? true
+                    : wizardStep === 'task_created' ? taskName.trim().length > 0
+                    : wizardStep === 'params_set' ? true
+                    : wizardStep === 'cells_selected' ? selectedCellIdsSet.size > 0
+                    : wizardStep === 'completed' ? true
+                    : false
+                  }
+                  onNext={handleNext}
+                  onCancel={handleCancel}
+                  onBack={handleBack}
+                  isTaskNameStep={wizardStep === 'task_created'}
+                />
+              </div>
+              )}
+
+              {activeLeftTab === 'history' && (
+                /* 历史任务面板 */
+                <div className="flex flex-col h-full overflow-hidden">
+                  <HistoryTable
+                    taskType="neighbor_planning"
+                    typeLabel="邻区规划"
+                    onSelectTask={(task) => {
+                      if (task.result) {
+                        const result = task.result as NeighborResultData
+                        setLocalTaskResult(result)
+                        setActiveTaskId('neighbor_planning', task.id)
+                        setActiveLeftTab('planning-result')
+                        if (result.results) {
+                          neighborDataSyncService.setNeighborResults(result.results)
+                        }
+                        setSelectedSourceSector(null)
+                      }
                     }}
+                    onViewTask={handleViewTask}
+                    getCellCount={getCellCount}
                   />
                 </div>
-              ) : (
+              )}
+
+              {activeLeftTab === 'planning-result' && (
+
                 /* 规划结果面板（原内容） */
                 <div className="flex flex-col h-full overflow-hidden">
                   {/* 标题行 + 统计卡片 */}
@@ -1262,7 +1475,17 @@ export function NeighborPage() {
                         </div>
                         <div className="flex items-center gap-3 ml-auto">
                           <button
-                            onClick={() => setResultSearchEnabled(!resultSearchEnabled)}
+                            onClick={() => {
+                              if (resultSearchEnabled) {
+                                setResultSearchFilters({
+                                  relationType: '', sourceSiteId: '', sourceCellId: '', sourceCellName: '',
+                                  sourceFrequency: '', sourcePci: '', targetSiteId: '', targetCellId: '',
+                                  targetCellName: '', targetFrequency: '', targetPci: '', distance: ''
+                                })
+                                setFilteredResults([])
+                              }
+                              setResultSearchEnabled(!resultSearchEnabled)
+                            }}
                             className={`flex items-center gap-2 px-3 py-1.5 rounded-lg transition-colors text-xs font-medium ${
                               resultSearchEnabled
                                 ? 'bg-blue-400 text-white hover:bg-blue-500'
@@ -1299,7 +1522,11 @@ export function NeighborPage() {
                     <div className="flex-1 flex items-center justify-center text-muted-foreground">
                       <Settings size={48} className="mx-auto mb-4 opacity-50" />
                       <div className="text-center">
-                        <p>{i18n.configTip}</p>
+                        {wizardStep === 'idle' ? (
+                          <p>{t('common.configureFirst') || '请先点击"新建"按钮创建任务'}</p>
+                        ) : (
+                          <p>{t('common.selectCellsThenExecute') || '按向导完成参数设置 → 选择小区 → 执行'}</p>
+                        )}
                         <p className="text-xs mt-2">{i18n.needUpload}</p>
                       </div>
                     </div>
@@ -1308,7 +1535,12 @@ export function NeighborPage() {
                       <AlertCircle size={48} className="mx-auto mb-4" />
                       <p className="font-semibold">{i18n.taskFailed}</p>
                     </div>
-                  ) : taskResult.status === 'completed' ? (
+                  ) : taskResult.status === 'completed' && !(taskResult as any).results ? (
+                    <div className="flex-1 flex items-center justify-center text-muted-foreground">
+                      <AlertCircle size={48} className="mx-auto mb-4 opacity-50" />
+                      <p>{t('common.resultUnavailable') || '结果数据不可用，请重新执行规划任务'}</p>
+                    </div>
+                  ) : hasFullResult ? (
                     <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
                       {taskResult.results && taskResult.results.length > 0 ? (
                         <NeighborTable
@@ -1626,7 +1858,7 @@ function NeighborTable({
                     value={searchFilters?.[column.key] || ''}
                     onChange={(e) => onSearchChange(column.key, e.target.value)}
                     placeholder={tableI18n.searchColPlaceholder}
-                    className="mt-1 w-full p-1 border border-border rounded text-[10px] bg-white dark:bg-slate-800"
+                    className="mt-1 w-full p-1 border border-border rounded text-[10px] text-gray-900 bg-gray-100 placeholder:text-gray-400"
                   />
                 )}
                 {/* 拖拽手柄 */}
@@ -1749,100 +1981,6 @@ function NeighborTable({
           )}
         </tbody>
       </table>
-    </div>
-  )
-}
-
-function ConfigSelect({
-  label,
-  value,
-  options,
-  onChange,
-  disabled = false
-}: {
-  label: string
-  value: string
-  options: string[]
-  onChange: (value: string) => void
-  disabled?: boolean
-}) {
-  return (
-    <div>
-      <label className="block text-xs font-medium mb-0.5">{label}</label>
-      <select
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-        disabled={disabled}
-        className="w-full px-2 py-1.5 text-sm bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary disabled:opacity-50 disabled:cursor-not-allowed"
-      >
-        {options.map((option) => (
-          <option key={option} value={option}>
-            {option}
-          </option>
-        ))}
-      </select>
-    </div>
-  )
-}
-
-function ConfigInput({
-  label,
-  type,
-  value,
-  onChange,
-  disabled = false,
-  min,
-  max,
-  step = 1,
-  tooltip
-}: {
-  label: string
-  type: string
-  value: number | string
-  onChange: (value: string) => void
-  disabled?: boolean
-  min?: number
-  max?: number
-  step?: number
-  tooltip?: string
-}) {
-  const [showTooltip, setShowTooltip] = useState(false)
-
-  return (
-    <div className="relative">
-      <div className="flex items-center gap-1 mb-0.5">
-        <label className="text-xs font-medium">{label}</label>
-        {tooltip && (
-          <div
-            className="relative flex items-center"
-            onMouseEnter={() => setShowTooltip(true)}
-            onMouseLeave={() => setShowTooltip(false)}
-            onClick={() => setShowTooltip(!showTooltip)}
-          >
-            <HelpCircle size={14} className="text-muted-foreground cursor-help hover:text-primary transition-colors" />
-
-            {showTooltip && (
-              <div className="absolute left-full ml-2 top-0 z-50 w-72 p-3 bg-white text-black rounded-lg shadow-xl border border-border animate-in fade-in zoom-in duration-200">
-                <div className="text-xs space-y-1 whitespace-pre-wrap leading-relaxed font-normal">
-                  {tooltip}
-                </div>
-                {/* 小箭头 */}
-                <div className="absolute top-2 -left-1 w-2 h-2 bg-white border-l border-b border-border rotate-45 transform -translate-x-1/2" />
-              </div>
-            )}
-          </div>
-        )}
-      </div>
-      <input
-        type={type}
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-        disabled={disabled}
-        min={min}
-        max={max}
-        step={step}
-        className="w-full px-2 py-1.5 text-sm bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary disabled:opacity-50 disabled:cursor-not-allowed transition-all"
-      />
     </div>
   )
 }
