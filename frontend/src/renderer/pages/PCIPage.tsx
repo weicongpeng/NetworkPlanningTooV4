@@ -132,6 +132,7 @@ export function PCIPage() {
     wizardStep, setWizardStep,
     config, setConfig,
     selectedCellIds: storeSelectedCellIds,
+    setSelectedCellIds: setStoreSelectedCellIds,
     activeLeftTab, setActiveLeftTab,
     taskName, setTaskName,
     resetConfig: storeResetConfig
@@ -142,7 +143,16 @@ export function PCIPage() {
 
   // Bridge: store uses string[], local uses Set<string> for toggle operations
   const [selectedCellIdsSet, setSelectedCellIdsSet] = useState<Set<string>>(new Set(storeSelectedCellIds))
+  // 初始同步 store → local Set
   useEffect(() => { setSelectedCellIdsSet(new Set(storeSelectedCellIds)) }, [storeSelectedCellIds])
+  // 选中小区的辅助函数：同时更新 local Set 和 store
+  const updateCellSelection = useCallback((fn: (prev: Set<string>) => Set<string>) => {
+    setSelectedCellIdsSet(prev => {
+      const next = fn(prev)
+      setStoreSelectedCellIds(Array.from(next))
+      return next
+    })
+  }, [setStoreSelectedCellIds])
   const {
     updateTaskProgress, completeTask, failTask, activeTaskIds, setActiveTaskId, startTask,
     getLatestPCITask,
@@ -200,7 +210,7 @@ export function PCIPage() {
   // ===== 状态重置：切换到"新建任务"时重置表单 =====
   const resetConfig = useCallback(() => {
     storeResetConfig()
-    setSelectedCellIdsSet(new Set())
+    updateCellSelection(() => new Set())
     setDistanceInputValue('10')
     setTaskNameError(null)
     setNextTaskError(null)
@@ -591,7 +601,7 @@ export function PCIPage() {
 
   const handleCancel = () => {
     storeResetConfig()
-    setSelectedCellIdsSet(new Set())
+    updateCellSelection(() => new Set())
     setTaskNameError(null)
     setNextTaskError(null)
     setError(null)
@@ -612,7 +622,7 @@ export function PCIPage() {
       setError(null)
     } else if (wizardStep === 'cells_selected') {
       setWizardStep('params_set')
-      setSelectedCellIdsSet(new Set())
+      updateCellSelection(() => new Set())
       setError(null)
     }
   }, [wizardStep])
@@ -644,7 +654,7 @@ export function PCIPage() {
       }
       setNextTaskError(null)
       setWizardStep('cells_selected')
-      setSelectedCellIdsSet(new Set())
+      updateCellSelection(() => new Set())
       setError(null)
     } else if (wizardStep === 'cells_selected') {
       // 执行
@@ -658,7 +668,7 @@ export function PCIPage() {
       setActiveLeftTab('planning-result')
       setShowMap(true)
     }
-  }, [wizardStep, taskName, config, storeSelectedCellIds, t, setActiveLeftTab, setShowMap])
+  }, [wizardStep, taskName, config, selectedCellIdsSet, t, setActiveLeftTab, setShowMap])
 
   const handleNewTask = () => {
     setWizardStep('task_created')
@@ -686,7 +696,7 @@ export function PCIPage() {
     }
     setNextTaskError(null)
     setWizardStep('cells_selected')
-    setSelectedCellIdsSet(new Set())
+    updateCellSelection(() => new Set())
     setError(null)
   }
 
@@ -1045,7 +1055,7 @@ export function PCIPage() {
   useEffect(() => { loadCellList() }, [loadCellList])
 
   const toggleCellSelection = (cellId: string) => {
-    setSelectedCellIdsSet(prev => {
+    updateCellSelection(prev => {
       const next = new Set(prev)
       if (next.has(cellId)) next.delete(cellId)
       else next.add(cellId)
@@ -1059,13 +1069,13 @@ export function PCIPage() {
     const allIds = sectors.map(s => s.id)
     const allSelected = allIds.length > 0 && allIds.every(id => selectedCellIdsSet.has(id))
     if (allSelected) {
-      setSelectedCellIdsSet(prev => { const next = new Set(prev); allIds.forEach(id => next.delete(id)); return next })
+      updateCellSelection(prev => { const next = new Set(prev); allIds.forEach(id => next.delete(id)); return next })
     } else {
-      setSelectedCellIdsSet(prev => { const next = new Set(prev); allIds.forEach(id => next.add(id)); return next })
+      updateCellSelection(prev => { const next = new Set(prev); allIds.forEach(id => next.add(id)); return next })
     }
   }
 
-  const clearSelections = () => { setSelectedCellIdsSet(new Set()) }
+  const clearSelections = () => { updateCellSelection(() => new Set()) }
 
   const handleUploadCellFile = () => {
     cellFileInputRef.current?.click()
