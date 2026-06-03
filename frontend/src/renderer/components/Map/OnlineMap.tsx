@@ -607,10 +607,10 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
       // 添加新的搜索标记
       if (marker) {
         const icon = L.divIcon({
-          html: `<div style="background-color: #ef4444; width: 16px; height: 16px; border-radius: 50%; border: 2px solid white; box-shadow: 0 2px 6px rgba(0,0,0,0.3);"></div>`,
+          html: `<div style="background-color: #ef4444; width: 8px; height: 8px; border-radius: 50%; border: 1.5px solid white; box-shadow: 0 1px 3px rgba(0,0,0,0.3);"></div>`,
           className: 'search-marker-icon',
-          iconSize: [16, 16],
-          iconAnchor: [8, 8]
+          iconSize: [8, 8],
+          iconAnchor: [4, 4]
         })
 
         const mapMarker = L.marker([marker.lat, marker.lng], { icon })

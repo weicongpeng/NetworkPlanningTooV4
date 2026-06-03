@@ -14,6 +14,7 @@ import { mapDataService, getCellList, clearCellListCache } from '../services/map
 import { CoordinateTransformer } from '../utils/coordinate'
 import type { RenderSectorData, CellListItem } from '../services/mapDataService'
 import { triggerDataRefresh, DATA_REFRESH_EVENT } from '../store/dataStore'
+import { usePCIStore } from '../store/pciStore'
 import { useTranslation } from 'react-i18next'
 import { CellSelectionTable } from '../components/CellSelectionTable'
 import { HistoryTable } from '../components/HistoryTable'
@@ -127,20 +128,21 @@ const validateConfig = (config: any, t: (key: string) => string): string | null 
 export function PCIPage() {
   const { t } = useTranslation()
   const user = useAuthStore((s) => s.user)
-  const [config, setConfig] = useState({
-    networkType: 'LTE',
-    distanceThreshold: 10.0,
-    inheritModulus: false,
-    useMod3: true,
-    useMod30: false,
-    pciRange: '0-503',
-    enableTACPlanning: true
-  })
-  const [taskName, setTaskName] = useState('')
+  const {
+    wizardStep, setWizardStep,
+    config, setConfig,
+    selectedCellIds: storeSelectedCellIds,
+    activeLeftTab, setActiveLeftTab,
+    taskName, setTaskName,
+    resetConfig: storeResetConfig
+  } = usePCIStore()
   const [taskNameError, setTaskNameError] = useState<string | null>(null)
   const [nextTaskError, setNextTaskError] = useState<string | null>(null)
-  const [wizardStep, setWizardStep] = useState<WizardStep>('idle')
   const [distanceInputValue, setDistanceInputValue] = useState('10')
+
+  // Bridge: store uses string[], local uses Set<string> for toggle operations
+  const [selectedCellIdsSet, setSelectedCellIdsSet] = useState<Set<string>>(new Set(storeSelectedCellIds))
+  useEffect(() => { setSelectedCellIdsSet(new Set(storeSelectedCellIds)) }, [storeSelectedCellIds])
   const {
     updateTaskProgress, completeTask, failTask, activeTaskIds, setActiveTaskId, startTask,
     getLatestPCITask,
@@ -187,8 +189,6 @@ export function PCIPage() {
   })
   const [filteredResults, setFilteredResults] = useState<any[]>([])
 
-  const [activeLeftTab, setActiveLeftTab] = useState<'task-config' | 'history' | 'planning-result'>('history')
-  const [selectedCellIds, setSelectedCellIds] = useState<Set<string>>(new Set())
   const [cellListData, setCellListData] = useState<{ lte: CellListItem[]; nr: CellListItem[] }>({ lte: [], nr: [] })
   const [cellListLoading, setCellListLoading] = useState(false)
   const [cellFileUploading, setCellFileUploading] = useState(false)
@@ -199,25 +199,16 @@ export function PCIPage() {
 
   // ===== 状态重置：切换到"新建任务"时重置表单 =====
   const resetConfig = useCallback(() => {
-    setConfig({
-      networkType: 'LTE',
-      distanceThreshold: 10.0,
-      inheritModulus: false,
-      useMod3: true,
-      useMod30: false,
-      pciRange: '0-503',
-      enableTACPlanning: true
-    })
+    storeResetConfig()
+    setSelectedCellIdsSet(new Set())
     setDistanceInputValue('10')
-    setTaskName('')
     setTaskNameError(null)
-    setWizardStep('idle')
-    setSelectedCellIds(new Set())
+    setNextTaskError(null)
     setActiveTaskId('pci_planning', null)
     setLocalTaskResult(null)
     setError(null)
     completionHandledRef.current = false
-  }, [setActiveTaskId])
+  }, [storeResetConfig, setActiveTaskId])
 
   useEffect(() => {
     if (activeLeftTab === 'task-config') {
@@ -599,21 +590,11 @@ export function PCIPage() {
   }
 
   const handleCancel = () => {
-    setWizardStep('idle')
-    setTaskName('')
+    storeResetConfig()
+    setSelectedCellIdsSet(new Set())
     setTaskNameError(null)
     setNextTaskError(null)
-    setSelectedCellIds(new Set())
     setError(null)
-    setConfig({
-      networkType: 'LTE',
-      distanceThreshold: 10.0,
-      inheritModulus: false,
-      useMod3: true,
-      useMod30: false,
-      pciRange: '0-503',
-      enableTACPlanning: true
-    })
     setDistanceInputValue('10')
   }
 
@@ -667,7 +648,7 @@ export function PCIPage() {
       setError(null)
     } else if (wizardStep === 'cells_selected') {
       // 执行
-      if (selectedCellIds.size === 0) {
+      if (selectedCellIdsSet.size === 0) {
         setError(t('pci.noCellsSelected') || '请在小区选择列表中至少选择一个小区后再执行PCI规划')
         return
       }
@@ -677,7 +658,7 @@ export function PCIPage() {
       setActiveLeftTab('planning-result')
       setShowMap(true)
     }
-  }, [wizardStep, taskName, config, selectedCellIds, t, setActiveLeftTab, setShowMap])
+  }, [wizardStep, taskName, config, storeSelectedCellIds, t, setActiveLeftTab, setShowMap])
 
   const handleNewTask = () => {
     setWizardStep('task_created')
@@ -710,7 +691,7 @@ export function PCIPage() {
   }
 
   const handleExecute = async () => {
-    if (selectedCellIds.size === 0) {
+    if (selectedCellIdsSet.size === 0) {
       setError(t('pci.noCellsSelected') || '请在小区选择列表中至少选择一个小区后再执行PCI规划')
       return
     }
@@ -743,7 +724,7 @@ export function PCIPage() {
         inheritModulus: config.inheritModulus,
         pciRange: { min: pciMin, max: pciMax },
         enableTACPlanning: config.enableTACPlanning,
-        selectedCellIds: selectedCellIds.size > 0 ? Array.from(selectedCellIds) : undefined
+        selectedCellIds: selectedCellIdsSet.size > 0 ? Array.from(storeSelectedCellIds) : undefined
       })
       if (response.success && response.data) {
         const newTaskId = response.data.taskId
@@ -1076,7 +1057,7 @@ export function PCIPage() {
     const networkType = config.networkType as 'LTE' | 'NR'
     const sectors = networkType === 'LTE' ? cellListData.lte : cellListData.nr
     const allIds = sectors.map(s => s.id)
-    const allSelected = allIds.length > 0 && allIds.every(id => selectedCellIds.has(id))
+    const allSelected = allIds.length > 0 && allIds.every(id => selectedCellIdsSet.has(id))
     if (allSelected) {
       setSelectedCellIds(prev => { const next = new Set(prev); allIds.forEach(id => next.delete(id)); return next })
     } else {
@@ -1239,7 +1220,7 @@ export function PCIPage() {
                                 value={config.networkType}
                                 onChange={(e) => {
                                   const nt = e.target.value as 'LTE' | 'NR'
-                                  setConfig(prev => ({ ...prev, networkType: nt, pciRange: nt === 'LTE' ? '0-503' : '0-1007' }))
+                                  setConfig({ networkType: nt, pciRange: nt === 'LTE' ? '0-503' : '0-1007' })
                                 }}
                                 disabled={wizardStep !== 'params_set'}
                                 className="w-full px-2 py-1.5 text-sm bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary disabled:opacity-60 disabled:cursor-not-allowed"
@@ -1258,9 +1239,9 @@ export function PCIPage() {
                                   setDistanceInputValue(raw)
                                   const num = parseFloat(raw)
                                   if (!isNaN(num)) {
-                                    setConfig(prev => ({ ...prev, distanceThreshold: num }))
+                                    setConfig({ distanceThreshold: num })
                                   } else if (raw === '' || raw === '-') {
-                                    setConfig(prev => ({ ...prev, distanceThreshold: 0 }))
+                                    setConfig({ distanceThreshold: 0 })
                                   }
                                 }}
                                 disabled={wizardStep !== 'params_set'}
@@ -1274,7 +1255,7 @@ export function PCIPage() {
                               <input
                                 type="text"
                                 value={config.pciRange}
-                                onChange={(e) => setConfig(prev => ({ ...prev, pciRange: e.target.value }))}
+                                onChange={(e) => setConfig({ pciRange: e.target.value })}
                                 disabled={wizardStep !== 'params_set'}
                                 className="w-full px-2 py-1.5 text-sm bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary disabled:opacity-60 disabled:cursor-not-allowed"
                               />
@@ -1285,7 +1266,7 @@ export function PCIPage() {
                               <input
                                 type="checkbox"
                                 checked={config.inheritModulus}
-                                onChange={(e) => setConfig(prev => ({ ...prev, inheritModulus: e.target.checked }))}
+                                onChange={(e) => setConfig({ inheritModulus: e.target.checked })}
                                 disabled={wizardStep !== 'params_set'}
                                 className="w-3.5 h-3.5 disabled:opacity-60"
                               />
@@ -1295,7 +1276,7 @@ export function PCIPage() {
                               <input
                                 type="checkbox"
                                 checked={config.enableTACPlanning}
-                                onChange={(e) => setConfig(prev => ({ ...prev, enableTACPlanning: e.target.checked }))}
+                                onChange={(e) => setConfig({ enableTACPlanning: e.target.checked })}
                                 disabled={wizardStep !== 'params_set'}
                                 className="w-3.5 h-3.5 disabled:opacity-60"
                               />
@@ -1321,11 +1302,11 @@ export function PCIPage() {
                             const networkType = config.networkType as 'LTE' | 'NR'
                             return networkType === 'LTE' ? cellListData.lte : cellListData.nr
                           })()}
-                          selectedCellIds={selectedCellIds}
+                          selectedCellIds={storeSelectedCellIds}
                           onToggleCell={wizardStep === 'cells_selected' && !isRunning ? toggleCellSelection : () => {}}
                           onSelectAll={wizardStep === 'cells_selected' && !isRunning ? toggleSelectAll : () => {}}
                           onClearSelections={wizardStep === 'cells_selected' && !isRunning ? clearSelections : () => {}}
-                          selectedCountText={(t('pci.selectedCount') || '已选中 {{count}} 个小区').replace('{{count}}', String(selectedCellIds.size))}
+                          selectedCountText={(t('pci.selectedCount') || '已选中 {{count}} 个小区').replace('{{count}}', String(selectedCellIdsSet.size))}
                           searchPlaceholder={t('pci.cellSearchPlaceholder') || '搜索基站ID、小区ID或名称...'}
                           loading={cellListLoading}
                           onUploadCellFile={wizardStep === 'cells_selected' ? handleUploadCellFile : undefined}
@@ -1360,7 +1341,7 @@ export function PCIPage() {
                       wizardStep === 'idle' ? true
                       : wizardStep === 'task_created' ? taskName.trim().length > 0
                       : wizardStep === 'params_set' ? true
-                      : wizardStep === 'cells_selected' ? selectedCellIds.size > 0
+                      : wizardStep === 'cells_selected' ? selectedCellIdsSet.size > 0
                       : wizardStep === 'completed' ? true
                       : false
                     }
