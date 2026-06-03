@@ -1,4 +1,5 @@
 /**
+ * @deprecated 请使用 tacCheckStore.ts 替代。保留以保持向后兼容。
  * TAC核查配置存储（仅持久化网络类型偏好）
  *
  * taskId 和 result 改用 taskStore 管理（与 PCI/邻区规划统一）
@@ -17,7 +18,7 @@ interface TACState {
 export const useTACStore = create<TACState>()(
   persist(
     (set) => ({
-      config: null,
+      config: { networkType: 'LTE' },
       setConfig: (config) => set({ config }),
     }),
     {
