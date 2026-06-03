@@ -564,7 +564,8 @@
     "cellFileUploadFailed": "Failed to process cell-tree file",
     "noCellsSelected": "Please select at least one cell in the cell list before running TAC planning",
     "noCellIdsExtracted": "No cell IDs could be extracted from the file, please check file format",
-    "noMatchingCells": "No matching cells found, please verify the file content matches current parameters"
+    "noMatchingCells": "No matching cells found, please verify the file content matches current parameters",
+    "applyConfirm": "Planning results will be applied to parameters"
   },
   "map": {
     "title": "Map Tool",
@@ -723,7 +724,6 @@
     "collapseSidebar": "Collapse Sidebar",
     "expandSidebar": "Expand Sidebar",
     "version": "Version",
-    "newTask": "New Task",
     "historyTask": "History",
     "confirmConfig": "Next: Select Cells",
     "taskType": "Task Type",
@@ -748,11 +748,8 @@
     "noTaskHistory": "No history records",
     "taskSuccess": "Success",
     "taskFailed": "Failed",
-    "nextStep": "Next",
     "prevStep": "Previous",
     "view": "View",
-    "viewResult": "View",
-    "executing": "Executing...",
     "actions": "Actions",
     "siteCount": "Site Count",
     "cellCount": "Cell Count",

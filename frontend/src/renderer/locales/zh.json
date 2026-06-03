@@ -340,7 +340,8 @@
     "cellFileUploadFailed": "待规划小区文件处理失败",
     "noCellsSelected": "请在小区选择列表中至少选择一个小区后再执行PCI规划",
     "noCellIdsExtracted": "未能从文件中提取到小区ID，请检查文件格式",
-    "noMatchingCells": "未匹配到任何小区，请检查文件内容与当前工参数据是否一致"
+    "noMatchingCells": "未匹配到任何小区，请检查文件内容与当前工参数据是否一致",
+    "applyConfirm": "规划结果将应用到工参"
   },
   "neighbor": {
     "title": "邻区规划",
@@ -575,7 +576,8 @@
     "cellFileUploadFailed": "待规划小区文件处理失败",
     "noCellsSelected": "请在小区选择列表中至少选择一个小区后再执行TAC规划",
     "noCellIdsExtracted": "未能从文件中提取到小区ID，请检查文件格式",
-    "noMatchingCells": "未匹配到任何小区，请检查文件内容与当前工参数据是否一致"
+    "noMatchingCells": "未匹配到任何小区，请检查文件内容与当前工参数据是否一致",
+    "applyConfirm": "规划结果将应用到工参"
   },
   "map": {
     "title": "地图工具",
@@ -712,7 +714,6 @@
     "applying": "应用中...",
     "applied": "已应用",
     "applyToParams": "应用",
-    "applyConfirm": "规划结果将应用到工参",
     "reset": "重置",
     "search": "搜索",
     "filter": "筛选",
