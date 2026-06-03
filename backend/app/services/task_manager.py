@@ -2130,13 +2130,9 @@ class TaskManager:
             "metadata": metadata,
         }
 
-        # 删除旧工参
+        # 标记旧工参为已弃用（后台Excel更新后清理）
         if full_params_id in data_service.index:
-            try:
-                data_service.delete_data(full_params_id)
-                _logger.info(f"[SyncApplyTAC-Fast] 已删除旧工参: {full_params_id}")
-            except Exception as e:
-                _logger.warning(f"[SyncApplyTAC-Fast] 删除旧工参失败: {full_params_id}, 错误: {e}")
+            data_service.index[full_params_id]["fileType"] = "full_params_deprecated" 
 
         progress_holder[0] = 95
 
@@ -2147,7 +2143,7 @@ class TaskManager:
             "newFileId": new_data_id,
             "newFileName": new_filename,
             "savedToOriginal": saved_to_original,
-            "deletedCount": deleted_count,
+            
         }
 
     def _sync_update_excel_tac_background(self, new_data_id: str, planning_result: Dict, full_params_info: Dict, _logger: logging.Logger) -> None:

@@ -929,7 +929,7 @@ export function TACPlanningPage() {
                                 <>
                                     {/* 标题行 + 统计卡片 + 进度条 */}
                                     <div className="mb-3 shrink-0">
-                                        <div className="flex items-center gap-4 mb-3 flex-wrap">
+                                        <div className="flex items-center justify-between gap-4 mb-3 flex-wrap">
                                             <div className="flex items-center gap-2">
                                                 {taskResult.status === 'completed' ? (
                                                     <CheckCircle2 size={18} className="text-green-500" />
@@ -938,23 +938,22 @@ export function TACPlanningPage() {
                                                 ) : (
                                                     <Loader2 size={18} className="animate-spin text-primary" />
                                                 )}
-                                            </div>
-                                            <div className="flex items-center gap-2">
                                                 <div className="flex items-center gap-1 px-2 py-1.5 bg-muted/50 rounded-lg">
-                                                    <span className="text-[10px] text-muted-foreground">{t('tacPlanning.total') || '总'}</span>
-                                                    <span className="text-sm font-bold">{taskResult.totalCells || 0}</span>
+                                                    <span className="text-xs text-muted-foreground">{t('tacPlanning.total') || '总'}</span>
+                                                    <span className="text-xs font-bold">{taskResult.totalCells || 0}</span>
                                                 </div>
                                                 <div className="flex items-center gap-1 px-2 py-1.5 bg-green-500/10 border border-green-500/20 rounded-lg">
-                                                    <span className="text-[10px] text-green-600">{t('tacPlanning.success') || '成功'}</span>
-                                                    <span className="text-sm font-bold text-green-500">{taskResult.matchedCells || 0}</span>
+                                                    <span className="text-xs text-green-600">{t('tacPlanning.success') || '成功'}</span>
+                                                    <span className="text-xs font-bold text-green-500">{taskResult.matchedCells || 0}</span>
                                                 </div>
                                                 <div className="flex items-center gap-1 px-2 py-1.5 bg-blue-500/10 border border-blue-500/20 rounded-lg">
-                                                    <span className="text-[10px] text-blue-600">{t('tacPlanning.matchRate') || '匹配率'}</span>
-                                                    <span className="text-sm font-bold text-blue-500">
+                                                    <span className="text-xs text-blue-600">{t('tacPlanning.matchRate') || '匹配率'}</span>
+                                                    <span className="text-xs font-bold text-blue-500">
                                                         {taskResult.totalCells > 0 ? ((taskResult.matchedCells / taskResult.totalCells) * 100).toFixed(1) : 0}%
                                                     </span>
                                                 </div>
                                             </div>
+                                            <div className="flex items-center gap-2">
                                             {taskResult.status === 'completed' && taskResult.results && (
                                                 <button
                                                     onClick={() => {
@@ -1043,6 +1042,7 @@ export function TACPlanningPage() {
                                                     <span>{t('tacPlanning.export') || '导出'}</span>
                                                 </button>
                                             )}
+                                        </div>
                                         </div>
 
                                         {/* 进度条 */}
