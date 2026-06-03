@@ -612,7 +612,7 @@ export function PCIPage() {
       setError(null)
     } else if (wizardStep === 'cells_selected') {
       setWizardStep('params_set')
-      setSelectedCellIds(new Set())
+      setSelectedCellIdsSet(new Set())
       setError(null)
     }
   }, [wizardStep])
@@ -644,7 +644,7 @@ export function PCIPage() {
       }
       setNextTaskError(null)
       setWizardStep('cells_selected')
-      setSelectedCellIds(new Set())
+      setSelectedCellIdsSet(new Set())
       setError(null)
     } else if (wizardStep === 'cells_selected') {
       // 执行
@@ -686,7 +686,7 @@ export function PCIPage() {
     }
     setNextTaskError(null)
     setWizardStep('cells_selected')
-    setSelectedCellIds(new Set())
+    setSelectedCellIdsSet(new Set())
     setError(null)
   }
 
@@ -1045,7 +1045,7 @@ export function PCIPage() {
   useEffect(() => { loadCellList() }, [loadCellList])
 
   const toggleCellSelection = (cellId: string) => {
-    setSelectedCellIds(prev => {
+    setSelectedCellIdsSet(prev => {
       const next = new Set(prev)
       if (next.has(cellId)) next.delete(cellId)
       else next.add(cellId)
@@ -1059,13 +1059,13 @@ export function PCIPage() {
     const allIds = sectors.map(s => s.id)
     const allSelected = allIds.length > 0 && allIds.every(id => selectedCellIdsSet.has(id))
     if (allSelected) {
-      setSelectedCellIds(prev => { const next = new Set(prev); allIds.forEach(id => next.delete(id)); return next })
+      setSelectedCellIdsSet(prev => { const next = new Set(prev); allIds.forEach(id => next.delete(id)); return next })
     } else {
-      setSelectedCellIds(prev => { const next = new Set(prev); allIds.forEach(id => next.add(id)); return next })
+      setSelectedCellIdsSet(prev => { const next = new Set(prev); allIds.forEach(id => next.add(id)); return next })
     }
   }
 
-  const clearSelections = () => { setSelectedCellIds(new Set()) }
+  const clearSelections = () => { setSelectedCellIdsSet(new Set()) }
 
   const handleUploadCellFile = () => {
     cellFileInputRef.current?.click()
@@ -1100,7 +1100,7 @@ export function PCIPage() {
       const matchedIds = matchCellIds(extractedIds, allAvailableIds)
 
       if (matchedIds.length > 0) {
-        setSelectedCellIds(new Set(matchedIds))
+        setSelectedCellIdsSet(new Set(matchedIds))
       } else {
         setError(t('pci.noMatchingCells') || '未匹配到任何小区，请检查文件内容与当前工参数据是否一致')
       }
