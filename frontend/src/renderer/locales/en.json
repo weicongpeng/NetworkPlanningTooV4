@@ -257,6 +257,7 @@
     "newMod": "New Mod",
     "planningResult": "Result",
     "apply": "Apply to Parameters",
+    "applyConfirm": "Planning results will be applied to parameters",
     "collision": "Collision",
     "confusion": "Confusion",
     "noCollision": "No Collision",

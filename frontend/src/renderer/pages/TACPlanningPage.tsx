@@ -177,6 +177,7 @@ export function TACPlanningPage() {
     }, [])
 
     const handleApplyTask = useCallback(async (task: Task): Promise<boolean> => {
+      if (!window.confirm(t('tacPlanning.applyConfirm') || '规划结果将应用到工参')) return false
       setApplyingToParams(true)
       setApplySuccess(false)
       try {
@@ -979,6 +980,7 @@ export function TACPlanningPage() {
                                             {taskResult.status === 'completed' && (
                                                 <button
                                                     onClick={async () => {
+                                                        if (!window.confirm(t('tacPlanning.applyConfirm') || '规划结果将应用到工参')) return
                                                         const applyTaskId = taskId
                                                         if (!applyTaskId) return
                                                         setApplyingToParams(true)
@@ -1022,7 +1024,7 @@ export function TACPlanningPage() {
                                                         }
                                                     }}
                                                     disabled={applyingToParams}
-                                                    className={`flex items-center gap-1.5 px-4 py-2 rounded-lg transition-all text-sm font-medium ${applySuccess ? 'bg-green-500/20 border border-green-500/50 text-green-600 cursor-default' : applyingToParams ? 'bg-blue-500/20 border border-blue-500/50 text-blue-600' : 'bg-card border border-border hover:bg-muted/80'}`}
+                                                    className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg transition-all text-xs ${applySuccess ? 'bg-green-500/20 border border-green-500/50 text-green-600 cursor-default' : applyingToParams ? 'bg-blue-500/20 border border-blue-500/50 text-blue-600' : 'bg-card border border-border hover:bg-muted/80'}`}
                                                 >
                                                     {applyingToParams ? (
                                                         <><Loader2 size={16} className="animate-spin" /><span>{t('common.applying') || '应用中...'}</span></>

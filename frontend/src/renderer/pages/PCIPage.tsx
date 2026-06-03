@@ -312,6 +312,7 @@ export function PCIPage() {
   }, [])
 
   const handleApplyTask = useCallback(async (task: Task): Promise<boolean> => {
+    if (!window.confirm(t('pci.applyConfirm') || '规划结果将应用到工参')) return false
     setApplyingToParams(true)
     setApplySuccess(false)
     try {
@@ -816,6 +817,7 @@ export function PCIPage() {
   }
 
   const handleApplyToParams = async () => {
+    if (!window.confirm(t('pci.applyConfirm') || '规划结果将应用到工参')) return
     const applyTaskId = taskId || currentTaskResult?.taskId
     if (!applyTaskId) return
     try {

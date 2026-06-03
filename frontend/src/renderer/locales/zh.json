@@ -47,6 +47,7 @@
     "orange": "橙色",
     "pink": "粉色",
     "apply": "应用",
+    "applyConfirm": "规划结果将应用到工参",
     "cancel": "取消"
   },
   "language": {
@@ -711,6 +712,7 @@
     "applying": "应用中...",
     "applied": "已应用",
     "applyToParams": "应用",
+    "applyConfirm": "规划结果将应用到工参",
     "reset": "重置",
     "search": "搜索",
     "filter": "筛选",
