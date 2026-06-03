@@ -607,10 +607,10 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
       // 添加新的搜索标记
       if (marker) {
         const icon = L.divIcon({
-          html: `<div style="background-color: #ef4444; width: 24px; height: 24px; border-radius: 50% 50% 50% 0; transform: rotate(-45deg); border: 3px solid white; box-shadow: 0 2px 6px rgba(0,0,0,0.3);"></div>`,
+          html: `<div style="background-color: #ef4444; width: 16px; height: 16px; border-radius: 50%; border: 2px solid white; box-shadow: 0 2px 6px rgba(0,0,0,0.3);"></div>`,
           className: 'search-marker-icon',
-          iconSize: [24, 24],
-          iconAnchor: [12, 24]
+          iconSize: [16, 16],
+          iconAnchor: [8, 8]
         })
 
         const mapMarker = L.marker([marker.lat, marker.lng], { icon })
@@ -1438,6 +1438,22 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
    */
   const loadSectorData = useCallback(async (forceRefresh = false) => {
     try {
+      // 邻区规划模式：如果同步服务中有过滤后的数据，优先使用过滤数据
+      if (mode === 'neighbor-planning') {
+        const neighborData = neighborDataSyncService.getFullParamsData()
+        if (neighborData) {
+          setSectorData({
+            lte: neighborData.lte,
+            nr: neighborData.nr
+          })
+          console.log('[OnlineMap] 邻区规划模式使用过滤后的扇区数据:', {
+            lte: neighborData.lte.length,
+            nr: neighborData.nr.length
+          })
+          return
+        }
+      }
+
       const zoom = mapInstanceRef.current?.getZoom() ?? mapStateService.getState().zoom
       const data = await mapDataService.getMapData(zoom, forceRefresh)
 
@@ -1446,24 +1462,14 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
         nr: data.nrSectors
       })
 
-      // 统计覆盖类型
-      const lteCoverType1 = data.lteSectors.filter(s => s.cell_cover_type === 1).length
-      const lteCoverType4 = data.lteSectors.filter(s => s.cell_cover_type === 4).length
-      const nrCoverType1 = data.nrSectors.filter(s => s.cell_cover_type === 1).length
-      const nrCoverType4 = data.nrSectors.filter(s => s.cell_cover_type === 4).length
-
       console.log('[OnlineMap] 扇区数据加载完成:', {
         lte: data.lteSectors.length,
-        nr: data.nrSectors.length,
-        coverType: {
-          lte: { type1: lteCoverType1, type4: lteCoverType4 },
-          nr: { type1: nrCoverType1, type4: nrCoverType4 }
-        }
+        nr: data.nrSectors.length
       })
     } catch (error) {
       console.error('[OnlineMap] 加载扇区数据失败:', error)
     }
-  }, [])
+  }, [mode])
 
   /**
    * 处理扇区点击事件 - 支持重叠扇区选择
