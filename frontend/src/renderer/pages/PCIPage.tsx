@@ -1170,7 +1170,7 @@ export function PCIPage() {
                 onClick={() => setActiveLeftTab('planning-result')}
                 className={activeLeftTab === 'planning-result' ? btn.activeTab : btn.ghost}
               >
-                {t('pci.planningResult') || '规划结果'}
+                {t('pci.planningResult') || '结果'}
                 {currentTaskResult?.status === 'completed' && <span className={btn.badgeSuccess}>✓</span>}
                 {currentTaskResult?.status === 'failed' && <span className={btn.badgeError}>!</span>}
                 {isRunning && <span className="ml-2 inline-flex items-center"><Loader2 size={12} className="animate-spin text-blue-500" /></span>}
@@ -1406,7 +1406,7 @@ export function PCIPage() {
                         </button>
                         <button onClick={handleExport} className="flex items-center justify-center gap-2 px-4 py-2 bg-card border border-border rounded-lg hover:bg-muted/80 transition-colors disabled:opacity-50 disabled:cursor-not-allowed text-xs font-medium whitespace-nowrap">
                           <Download size={14} />
-                          {t('pci.export') || '导出结果'}
+                          {t('pci.export') || '导出'}
                         </button>
                         <button
                           onClick={handleApplyToParams}

@@ -915,7 +915,7 @@ export function TACPage() {
             onClick={() => setActiveLeftTab('planning-result')}
             className={activeLeftTab === 'planning-result' ? btn.activeTab : btn.ghost}
           >
-            {t('tac.checkResult') || '核查结果'}
+            {t('tac.checkResult') || '结果'}
             {taskResult?.status === 'completed' && (
               <span className={btn.badgeSuccess}>✓</span>
             )}

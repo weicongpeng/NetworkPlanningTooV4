@@ -779,7 +779,7 @@ export function TACPlanningPage() {
                         onClick={() => setActiveLeftTab('planning-result')}
                         className={activeLeftTab === 'planning-result' ? btn.activeTab : btn.ghost}
                     >
-                        {t('tacPlanning.result') || '规划结果'}
+                        {t('tacPlanning.result') || '结果'}
                         {taskResult?.status === 'completed' && (
                             <span className={btn.badgeSuccess}>✓</span>
                         )}
@@ -967,10 +967,10 @@ export function TACPlanningPage() {
                                                         }
                                                         setSearchEnabled(!searchEnabled)
                                                     }}
-                                                    className={`flex items-center gap-1.5 px-2 py-1 rounded-lg transition-colors text-xs ${
+                                                    className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg transition-colors text-xs ${
                                                         searchEnabled
                                                             ? 'bg-blue-400 text-white hover:bg-blue-500'
-                                                            : 'bg-muted hover:bg-muted/80'
+                                                            : 'bg-card border border-border hover:bg-muted/80'
                                                     }`}
                                                 >
                                                     <Search size={12} />
@@ -1037,10 +1037,10 @@ export function TACPlanningPage() {
                                             {taskResult.status === 'completed' && (
                                                 <button
                                                     onClick={() => handleExport('xlsx')}
-                                                    className="flex items-center gap-1.5 px-4 py-2 bg-blue-400 text-white rounded-lg hover:bg-blue-500 text-sm font-medium ml-auto"
+                                                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg transition-colors text-xs bg-card border border-border hover:bg-muted/80"
                                                 >
-                                                    <Download size={16} />
-                                                    <span>{t('tacPlanning.export') || '导出结果'}</span>
+                                                    <Download size={12} />
+                                                    <span>{t('tacPlanning.export') || '导出'}</span>
                                                 </button>
                                             )}
                                         </div>

@@ -9,9 +9,9 @@ const TASK_ROUTES: Record<string, string> = {
   pci_planning: '/pci',
   neighbor_planning: '/neighbor',
   tac_check: '/tac',
-  tac_planning: '/tac/planning',
+  tac_planning: '/tac-planning',
   apply_pci: '/pci',
-  apply_tac: '/tac/planning',
+  apply_tac: '/tac-planning',
 }
 
 /** 任务类型 → 显示标签 */

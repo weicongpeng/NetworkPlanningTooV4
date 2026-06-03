@@ -63,11 +63,11 @@ export function NeighborPage() {
   const i18n = {
     title: t('neighbor.title') || '邻区规划',
     planningParams: t('neighbor.planningParams') || '规划参数',
-    result: t('neighbor.result') || '规划结果',
+    result: t('neighbor.result') || '结果',
     startPlan: t('neighbor.startPlan') || '开始规划',
     planning: t('neighbor.planning') || '规划中...',
     starting: t('neighbor.starting') || '启动中...',
-    export: t('neighbor.export') || '导出结果',
+    export: t('neighbor.export') || '导出',
     search: t('neighbor.search') || '搜索',
     clear: t('neighbor.clear') || '清除',
     clearAll: t('neighbor.clearAll') || '清除全部',
