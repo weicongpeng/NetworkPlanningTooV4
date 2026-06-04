@@ -11,6 +11,9 @@ from datetime import datetime
 from typing import Dict, Optional, Any, Callable, List
 from enum import Enum
 import logging
+from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
+import pickle
 
 logger = logging.getLogger(__name__)
 
@@ -127,6 +130,9 @@ class TaskManager:
         self._tasks_index_file = settings.OUTPUT_DIR / "tasks_index.json"
         # 启动时从磁盘恢复已完成的任务（支持后端重启后导出历史结果）
         self._load_tasks_index()
+
+        # 进程池引用（由 app lifespan 注入）
+        self._process_pool: Optional[ProcessPoolExecutor] = None
 
     async def _acquire_slot(self):
         """获取信号量槽位"""
@@ -301,6 +307,51 @@ class TaskManager:
 
         logger.info(f"[TaskManager] 从磁盘恢复任务: 成功={recovered}, 跳过={skipped}, 总计={len(index_data)}")
 
+    def set_process_pool(self, pool: Optional[ProcessPoolExecutor]) -> None:
+        """设置进程池引用（供 CPU 密集型任务使用）"""
+        self._process_pool = pool
+
+    async def _run_in_process_pool(self, fn, *args, **kwargs):
+        """在进程池中执行 CPU 密集型函数（降级到线程池作为 fallback）"""
+        if self._process_pool is not None:
+            try:
+                loop = asyncio.get_event_loop()
+                return await loop.run_in_executor(self._process_pool, fn, *args, **kwargs)
+            except (BrokenProcessPool, pickle.PicklingError, AttributeError) as e:
+                logger.warning(f"[TaskManager] 进程池执行失败 ({type(e).__name__})，降级到线程: {e}")
+                return await asyncio.to_thread(fn, *args, **kwargs)
+        else:
+            return await asyncio.to_thread(fn, *args, **kwargs)
+
+    @staticmethod
+    def _run_pci_sync(config_dict: dict, sites_data: list, bg_sites: Optional[list]) -> dict:
+        """同步执行 PCI 规划（可在进程池中运行，可 pickle）"""
+        import asyncio
+        # 重建必要的 import 和对象
+        from app.algorithms.pci_planning_service_v2 import PlanningConfig, run_pci_planning
+        from app.models.schemas import NetworkType
+
+        # 重建 config
+        nt = NetworkType(config_dict.get("network_type", "LTE"))
+        config = PlanningConfig(
+            network_type=nt,
+            distance_threshold=config_dict.get("distance_threshold", 3.0),
+            pci_modulus=config_dict.get("pci_modulus", 3),
+            inherit_modulus=config_dict.get("inherit_modulus", False),
+            pci_range=config_dict.get("pci_range"),
+        )
+
+        # 使用独立的 event loop 运行异步函数
+        loop = asyncio.new_event_loop()
+        try:
+            asyncio.set_event_loop(loop)
+            result = loop.run_until_complete(
+                run_pci_planning(config, sites_data, None, bg_sites)
+            )
+            return result
+        finally:
+            loop.close()
+            asyncio.set_event_loop(None)
 
     # 数据准备优化辅助方法 (P1-2)
     # ============================================================

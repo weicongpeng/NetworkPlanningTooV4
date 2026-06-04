@@ -12,6 +12,7 @@ from fastapi.responses import Response
 from contextlib import asynccontextmanager
 import logging
 import socket
+from concurrent.futures import ProcessPoolExecutor
 
 from app.core.config import settings
 from app.api.v1 import api_router
@@ -79,11 +80,34 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"❌ 用户数据库初始化失败: {e}")
 
+    # 初始化进程池（用于 CPU 密集型任务）
+    pool = None
+    try:
+        if hasattr(settings, 'MAX_WORKERS') and settings.MAX_WORKERS > 1:
+            pool = ProcessPoolExecutor(
+                max_workers=settings.MAX_WORKERS,
+                mp_context="fork"
+            )
+            logger.info(f"✅ ProcessPoolExecutor 已创建: {settings.MAX_WORKERS} workers (fork)")
+
+            # 注入到 TaskManager
+            from app.services.task_manager import task_manager
+            task_manager.set_process_pool(pool)
+    except Exception as e:
+        logger.warning(f"⚠️ ProcessPoolExecutor 创建失败: {e}，将使用线程池")
+        pool = None
+
     logger.info("应用启动完成")
     yield
 
     # 关闭时执行
     logger.info("应用关闭中...")
+    if pool is not None:
+        try:
+            pool.shutdown(wait=False)
+            logger.info("ProcessPoolExecutor 已关闭")
+        except Exception as e:
+            logger.warning(f"ProcessPoolExecutor 关闭异常: {e}")
     logger.info("应用关闭完成")
 
 
