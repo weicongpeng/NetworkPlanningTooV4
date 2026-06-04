@@ -56,6 +56,7 @@ class Settings(BaseSettings):
     # 任务配置 - 从环境变量读取
     NPT_MAX_TASKS: int = 10
     NPT_TASK_TIMEOUT: int = 3600
+    NPT_MAX_WORKERS: int = 3  # 进程池 Worker 数（4 核 ARM 留 1 核给系统）
 
     # 高德地图配置 - 从环境变量读取
     NPT_AMAP_API_KEY: str = ""
@@ -117,6 +118,10 @@ class Settings(BaseSettings):
     @property
     def TASK_TIMEOUT(self) -> int:
         return self.NPT_TASK_TIMEOUT
+
+    @property
+    def MAX_WORKERS(self) -> int:
+        return self.NPT_MAX_WORKERS
 
     @property
     def AMAP_API_KEY(self) -> str:
