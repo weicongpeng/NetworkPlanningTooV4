@@ -4,6 +4,8 @@ PCI规划服务 - 基于NetworkPlanningTool_V1.py的逻辑重构
 
 import math
 from typing import List, Dict, Optional, Tuple, Callable, Awaitable
+
+import numpy as np
 from dataclasses import dataclass, field
 from enum import Enum
 import asyncio
@@ -137,6 +139,30 @@ class PCIPlanningService:
         self.assigned_pcis = []  # List of (pci, longitude, latitude, earfcn)
         # 存储背景PCI（全量工参中的其他小区）
         self.background_assigned_pcis = []  # List of (pci, longitude, latitude, earfcn)
+
+        # NumPy 结构数组（用于向量化距离计算）
+        self._assigned_np: Optional[np.ndarray] = None
+        self._bg_assigned_np: Optional[np.ndarray] = None
+        self._assigned_np_dirty = True
+        self._bg_assigned_np_dirty = True
+
+    def _rebuild_assigned_np(self) -> None:
+        """从 Python 列表重建 NumPy 结构数组（dirty flag 控制，避免重复重建）"""
+        if self._assigned_np_dirty:
+            self._assigned_np = None
+            if self.assigned_pcis:
+                arr = np.array(self.assigned_pcis, dtype=np.float64)
+                if arr.ndim == 2 and arr.shape[1] == 4:
+                    self._assigned_np = arr
+            self._assigned_np_dirty = False
+
+        if self._bg_assigned_np_dirty:
+            self._bg_assigned_np = None
+            if self.background_assigned_pcis:
+                arr = np.array(self.background_assigned_pcis, dtype=np.float64)
+                if arr.ndim == 2 and arr.shape[1] == 4:
+                    self._bg_assigned_np = arr
+            self._bg_assigned_np_dirty = False
 
     def _get_pci_range(self) -> Tuple[int, int]:
         """获取PCI范围"""
@@ -434,29 +460,48 @@ class PCIPlanningService:
         """
         min_distance = float("inf")
 
-        # 1. 检查已分配的PCI
-        for assigned in self.assigned_pcis:
-            pci, lat, lon, earfcn = assigned
-            if pci != candidate_pci:
-                continue
-            # 只检查同频小区
-            if not self._is_same_frequency(target_earfcn, earfcn):
-                continue
-            dist = self.calculate_distance(target_lat, target_lon, lat, lon)
-            if dist < min_distance:
-                min_distance = dist
+        # 同步 NumPy 数组
+        self._rebuild_assigned_np()
 
-        # 2. 检查背景小区（存量干扰）
-        for bg in self.background_assigned_pcis:
-            pci, lat, lon, earfcn = bg
-            if pci != candidate_pci:
-                continue
-            # 只检查同频小区
-            if not self._is_same_frequency(target_earfcn, earfcn):
-                continue
-            dist = self.calculate_distance(target_lat, target_lon, lat, lon)
-            if dist < min_distance:
-                min_distance = dist
+        # 1. 向量化检查已分配的PCI
+        if self._assigned_np is not None and len(self._assigned_np) > 0:
+            same_pci_mask = self._assigned_np[:, 0] == candidate_pci
+            if np.any(same_pci_mask):
+                filtered = self._assigned_np[same_pci_mask]
+                if target_earfcn is not None:
+                    same_freq_mask = np.abs(filtered[:, 3] - target_earfcn) <= 0.1
+                    filtered = filtered[same_freq_mask & ~np.isnan(filtered[:, 3])]
+                else:
+                    # target_earfcn unknown: exclude all (matches _is_same_frequency where None+anything=False)
+                    filtered = filtered[:0]
+                if len(filtered) > 0:
+                    dists = DistanceCalculator.batch_haversine(
+                        np.array([target_lat]), np.array([target_lon]),
+                        filtered[:, 1], filtered[:, 2]
+                    )[0]
+                    min_dist = np.min(dists)
+                    if min_dist < min_distance:
+                        min_distance = min_dist
+
+        # 2. 向量化检查背景小区（存量干扰）
+        if self._bg_assigned_np is not None and len(self._bg_assigned_np) > 0:
+            same_pci_mask = self._bg_assigned_np[:, 0] == candidate_pci
+            if np.any(same_pci_mask):
+                filtered = self._bg_assigned_np[same_pci_mask]
+                if target_earfcn is not None:
+                    same_freq_mask = np.abs(filtered[:, 3] - target_earfcn) <= 0.1
+                    filtered = filtered[same_freq_mask & ~np.isnan(filtered[:, 3])]
+                else:
+                    # target_earfcn unknown: exclude all (matches _is_same_frequency where None+anything=False)
+                    filtered = filtered[:0]
+                if len(filtered) > 0:
+                    dists = DistanceCalculator.batch_haversine(
+                        np.array([target_lat]), np.array([target_lon]),
+                        filtered[:, 2], filtered[:, 1]
+                    )[0]
+                    min_dist = np.min(dists)
+                    if min_dist < min_distance:
+                        min_distance = min_dist
 
         # 3. 检查原始工参数据中的PCI（包括本站PCI）
         for sector in all_sectors:
@@ -639,6 +684,7 @@ class PCIPlanningService:
                     self.assigned_pcis.append(
                         (assigned_pci, sector.latitude, sector.longitude, sector.earfcn)
                     )
+                    self._assigned_np_dirty = True
 
                     # 生成透明的返回信息（注明这是"分配时"的距离）
                     if threshold_idx == 0:
@@ -680,6 +726,7 @@ class PCIPlanningService:
                                         sector.earfcn,
                                     )
                                 )
+                                self._assigned_np_dirty = True
 
                                 # 生成透明的返回信息（注明这是"分配时"的距离）
                                 if threshold_idx == 0:
@@ -705,6 +752,7 @@ class PCIPlanningService:
                     self.assigned_pcis.append(
                         (assigned_pci, sector.latitude, sector.longitude, sector.earfcn)
                     )
+                    self._assigned_np_dirty = True
 
                     # 生成透明的返回信息（注明这是"分配时"的距离）
                     if threshold_idx == 0:
@@ -784,6 +832,7 @@ class PCIPlanningService:
             self.assigned_pcis.append(
                 (best_compromise_pci, sector.latitude, sector.longitude, sector.earfcn)
             )
+            self._assigned_np_dirty = True
 
             # 生成透明的返回信息（注明这是"分配时"的距离）
             constraint_status = (
@@ -819,6 +868,7 @@ class PCIPlanningService:
         self.assigned_pcis.append(
             (fallback_pci, sector.latitude, sector.longitude, sector.earfcn)
         )
+        self._assigned_np_dirty = True
         # 生成透明的返回信息（注明这是"分配时"的距离）
         constraint_status = "✅" if min_distance >= original_threshold else "❌"
         if min_distance >= original_threshold:
@@ -969,6 +1019,7 @@ class PCIPlanningService:
                             bg_frequency,
                         )
                     )
+                    self._bg_assigned_np_dirty = True
             print(f"[PCI规划] 加载背景小区: {bg_count} 个 (已剔除待规划小区)")
 
         total_sites = len(sites_data)
