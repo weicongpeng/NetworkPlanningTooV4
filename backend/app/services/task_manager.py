@@ -136,6 +136,29 @@ class TaskManager:
         """释放信号量槽位"""
         self._semaphore.release()
 
+    async def _run_task_with_slot(self, task: Task, run_method):
+        """获取信号量槽位，以超时方式运行任务，释放槽位，持久化结果。"""
+        acquired = False
+        try:
+            await self._acquire_slot()
+            acquired = True
+            await asyncio.wait_for(run_method(task), timeout=self.task_timeout)
+        except asyncio.TimeoutError:
+            task.status = TaskStatus.FAILED
+            task.error = f"任务执行超时（{self.task_timeout}s）"
+            task.completed_at = datetime.now()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            if task.status != TaskStatus.FAILED:
+                task.status = TaskStatus.FAILED
+                task.error = str(e)
+                task.completed_at = datetime.now()
+        finally:
+            if acquired:
+                self._release_slot()
+            self._persist_task(task.task_id)
+
     # ============================================================
     # ============================================================
     # 任务持久化方法 - 支持后端重启后恢复历史任务
@@ -665,27 +688,7 @@ class TaskManager:
         logger.info(f"[TaskManager] 任务创建成功, task_id: {task.task_id}")
 
         # 启动任务（含信号量准入和超时保护）
-        async def _run_with_slot():
-            acquired = False
-            try:
-                await self._acquire_slot()
-                acquired = True
-                await asyncio.wait_for(self._run_pci_task(task), timeout=self.task_timeout)
-            except asyncio.TimeoutError:
-                task.status = TaskStatus.FAILED
-                task.error = f"任务执行超时（{self.task_timeout}s）"
-                task.completed_at = datetime.now()
-            except Exception as e:
-                if task.status != TaskStatus.FAILED:
-                    task.status = TaskStatus.FAILED
-                    task.error = str(e)
-                    task.completed_at = datetime.now()
-            finally:
-                if acquired:
-                    self._release_slot()
-                self._persist_task(task.task_id)
-
-        task.task = asyncio.create_task(_run_with_slot())
+        task.task = asyncio.create_task(self._run_task_with_slot(task, self._run_pci_task))
         logger.info(f"[TaskManager] 异步任务已启动")
 
         return task.task_id
@@ -700,27 +703,7 @@ class TaskManager:
         self._persist_task(task.task_id)
 
         # 启动任务（含信号量准入和超时保护）
-        async def _run_with_slot():
-            acquired = False
-            try:
-                await self._acquire_slot()
-                acquired = True
-                await asyncio.wait_for(self._run_neighbor_task(task), timeout=self.task_timeout)
-            except asyncio.TimeoutError:
-                task.status = TaskStatus.FAILED
-                task.error = f"任务执行超时（{self.task_timeout}s）"
-                task.completed_at = datetime.now()
-            except Exception as e:
-                if task.status != TaskStatus.FAILED:
-                    task.status = TaskStatus.FAILED
-                    task.error = str(e)
-                    task.completed_at = datetime.now()
-            finally:
-                if acquired:
-                    self._release_slot()
-                self._persist_task(task.task_id)
-
-        task.task = asyncio.create_task(_run_with_slot())
+        task.task = asyncio.create_task(self._run_task_with_slot(task, self._run_neighbor_task))
 
         return task.task_id
 
@@ -734,27 +717,7 @@ class TaskManager:
         self._persist_task(task.task_id)
 
         # 启动任务（含信号量准入和超时保护）
-        async def _run_with_slot():
-            acquired = False
-            try:
-                await self._acquire_slot()
-                acquired = True
-                await asyncio.wait_for(self._run_tac_task(task), timeout=self.task_timeout)
-            except asyncio.TimeoutError:
-                task.status = TaskStatus.FAILED
-                task.error = f"任务执行超时（{self.task_timeout}s）"
-                task.completed_at = datetime.now()
-            except Exception as e:
-                if task.status != TaskStatus.FAILED:
-                    task.status = TaskStatus.FAILED
-                    task.error = str(e)
-                    task.completed_at = datetime.now()
-            finally:
-                if acquired:
-                    self._release_slot()
-                self._persist_task(task.task_id)
-
-        task.task = asyncio.create_task(_run_with_slot())
+        task.task = asyncio.create_task(self._run_task_with_slot(task, self._run_tac_task))
         logger.info(f"[TaskManager] TAC核查任务已启动, task_id: {task.task_id}")
 
         return task.task_id
@@ -768,27 +731,7 @@ class TaskManager:
         self.tasks[task.task_id] = task
 
         # 启动任务（含信号量准入和超时保护）
-        async def _run_with_slot():
-            acquired = False
-            try:
-                await self._acquire_slot()
-                acquired = True
-                await asyncio.wait_for(self._run_tac_planning_task(task), timeout=self.task_timeout)
-            except asyncio.TimeoutError:
-                task.status = TaskStatus.FAILED
-                task.error = f"任务执行超时（{self.task_timeout}s）"
-                task.completed_at = datetime.now()
-            except Exception as e:
-                if task.status != TaskStatus.FAILED:
-                    task.status = TaskStatus.FAILED
-                    task.error = str(e)
-                    task.completed_at = datetime.now()
-            finally:
-                if acquired:
-                    self._release_slot()
-                self._persist_task(task.task_id)
-
-        task.task = asyncio.create_task(_run_with_slot())
+        task.task = asyncio.create_task(self._run_task_with_slot(task, self._run_tac_planning_task))
 
         return task.task_id
 
@@ -1407,27 +1350,7 @@ class TaskManager:
         logger.info(f"[TaskManager] 工参更新任务已创建: {task.task_id}")
 
         # 启动后台任务（含信号量准入和超时保护）
-        async def _run_with_slot():
-            acquired = False
-            try:
-                await self._acquire_slot()
-                acquired = True
-                await asyncio.wait_for(self._run_update_params_task(task), timeout=self.task_timeout)
-            except asyncio.TimeoutError:
-                task.status = TaskStatus.FAILED
-                task.error = f"任务执行超时（{self.task_timeout}s）"
-                task.completed_at = datetime.now()
-            except Exception as e:
-                if task.status != TaskStatus.FAILED:
-                    task.status = TaskStatus.FAILED
-                    task.error = str(e)
-                    task.completed_at = datetime.now()
-            finally:
-                if acquired:
-                    self._release_slot()
-                self._persist_task(task.task_id)
-
-        task.task = asyncio.create_task(_run_with_slot())
+        task.task = asyncio.create_task(self._run_task_with_slot(task, self._run_update_params_task))
         return task.task_id
 
     async def _run_update_params_task(self, task: Task):
@@ -1500,27 +1423,7 @@ class TaskManager:
         logger.info(f"[TaskManager] PCI应用到工参任务已创建: {task.task_id}")
 
         # 启动后台任务（含信号量准入和超时保护）
-        async def _run_with_slot():
-            acquired = False
-            try:
-                await self._acquire_slot()
-                acquired = True
-                await asyncio.wait_for(self._run_apply_pci_to_params_task(task), timeout=self.task_timeout)
-            except asyncio.TimeoutError:
-                task.status = TaskStatus.FAILED
-                task.error = f"任务执行超时（{self.task_timeout}s）"
-                task.completed_at = datetime.now()
-            except Exception as e:
-                if task.status != TaskStatus.FAILED:
-                    task.status = TaskStatus.FAILED
-                    task.error = str(e)
-                    task.completed_at = datetime.now()
-            finally:
-                if acquired:
-                    self._release_slot()
-                self._persist_task(task.task_id)
-
-        task.task = asyncio.create_task(_run_with_slot())
+        task.task = asyncio.create_task(self._run_task_with_slot(task, self._run_apply_pci_to_params_task))
         return task.task_id
 
     async def _run_apply_pci_to_params_task(self, task: Task):
@@ -1942,27 +1845,7 @@ class TaskManager:
         logger.info(f"[TaskManager] TAC规划应用到工参任务已创建: {task.task_id}")
 
         # 启动后台任务（含信号量准入和超时保护）
-        async def _run_with_slot():
-            acquired = False
-            try:
-                await self._acquire_slot()
-                acquired = True
-                await asyncio.wait_for(self._run_apply_tac_planning_to_params_task(task), timeout=self.task_timeout)
-            except asyncio.TimeoutError:
-                task.status = TaskStatus.FAILED
-                task.error = f"任务执行超时（{self.task_timeout}s）"
-                task.completed_at = datetime.now()
-            except Exception as e:
-                if task.status != TaskStatus.FAILED:
-                    task.status = TaskStatus.FAILED
-                    task.error = str(e)
-                    task.completed_at = datetime.now()
-            finally:
-                if acquired:
-                    self._release_slot()
-                self._persist_task(task.task_id)
-
-        task.task = asyncio.create_task(_run_with_slot())
+        task.task = asyncio.create_task(self._run_task_with_slot(task, self._run_apply_tac_planning_to_params_task))
         return task.task_id
 
     async def _run_apply_tac_planning_to_params_task(self, task: Task):
