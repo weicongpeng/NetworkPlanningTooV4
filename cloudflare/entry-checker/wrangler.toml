@@ -1,0 +1,12 @@
+name = "entry-checker"
+main = "src/index.js"
+compatibility_date = "2026-06-01"
+
+# 绑定的生产域名
+[env.production]
+routes = [{ pattern = "go.pengwc.asia", zone_name = "pengwc.asia" }]
+
+# Pages 模式（无需 Worker 路由配置）
+[pages]
+build_command = ""
+build_output_dir = "src"
