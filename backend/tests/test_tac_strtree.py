@@ -11,7 +11,7 @@ import pytest
 import time
 from pathlib import Path
 from shapely.geometry import Point, Polygon
-from app.services.tac_planning_service import TACPlanningService, STRTREE_AVAILABLE
+from app.services.tac_planning_service import TACPlanningService
 
 
 class TestTACPlanningServiceSTRtree:
@@ -57,7 +57,6 @@ class TestTACPlanningServiceSTRtree:
         result = service.match_cell_to_tac(sample_cells[3], sample_tac_zones)
         assert result is None
 
-    @pytest.mark.skipif(not STRTREE_AVAILABLE, reason="STRtree not available")
     def test_match_cell_to_tac_with_strtree(self, sample_tac_zones, sample_cells):
         """测试使用 STRtree 的点面匹配功能"""
         service = TACPlanningService(data_dir=Path("."))
@@ -96,19 +95,17 @@ class TestTACPlanningServiceSTRtree:
 
         print(f"Linear search {num_cells} cells: {linear_time:.4f}s")
 
-        # 测试 STRtree（如果可用）
-        if STRTREE_AVAILABLE:
-            service._build_strtree_index("LTE", sample_tac_zones)
+        # 测试 STRtree
+        service._build_strtree_index("LTE", sample_tac_zones)
 
-            start = time.perf_counter()
-            for cell in test_cells:
-                service.match_cell_to_tac(cell, sample_tac_zones, network_type="LTE")
-            strtree_time = time.perf_counter() - start
+        start = time.perf_counter()
+        for cell in test_cells:
+            service.match_cell_to_tac(cell, sample_tac_zones, network_type="LTE")
+        strtree_time = time.perf_counter() - start
 
-            print(f"STRtree search {num_cells} cells: {strtree_time:.4f}s")
-            print(f"Speedup: {linear_time / strtree_time:.2f}x")
+        print(f"STRtree search {num_cells} cells: {strtree_time:.4f}s")
+        print(f"Speedup: {linear_time / strtree_time:.2f}x")
 
-    @pytest.mark.skipif(not STRTREE_AVAILABLE, reason="STRtree not available")
     def test_strtree_query_method(self):
         """测试 STRtree 查询方法"""
         from shapely.strtree import STRtree

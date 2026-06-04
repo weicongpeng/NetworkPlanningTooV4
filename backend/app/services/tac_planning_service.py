@@ -15,13 +15,7 @@ import numpy as np
 from shapely.geometry import Point, Polygon, MultiPolygon
 from shapely.wkt import loads as wkt_loads
 
-# 尝试导入 STRtree，如果不可用则使用线性搜索
-try:
-    from shapely.strtree import STRtree
-    STRTREE_AVAILABLE = True
-except ImportError:
-    STRTREE_AVAILABLE = False
-    logger.warning("STRtree 不可用，将使用线性搜索（性能较慢）")
+from shapely.strtree import STRtree
 
 logger = logging.getLogger(__name__)
 
@@ -408,9 +402,8 @@ class TACPlanningService:
 
             logger.info(f"成功加载 {len(tac_zones)} 个{network_type} TAC区域")
 
-            # 构建 STRtree 空间索引（如果可用）
-            if STRTREE_AVAILABLE:
-                self._build_strtree_index(network_type, tac_zones)
+            # 构建 STRtree 空间索引
+            self._build_strtree_index(network_type, tac_zones)
 
             return tac_zones
 
@@ -566,25 +559,36 @@ class TACPlanningService:
             network_type: 网络类型 ('LTE' 或 'NR')
             tac_zones: TAC区域字典 {tac_id: (geometry, area_name)}
         """
-        try:
-            geometries = []
-            tac_id_map = []  # 将几何对象索引映射到 TAC ID
+        geometries = []
+        tac_id_map = []  # 将几何对象索引映射到 (TAC ID, area_name)
 
-            for tac_id, (geometry, area_name) in tac_zones.items():
+        for tac_id, (geometry, area_name) in tac_zones.items():
+            if isinstance(geometry, Polygon):
                 geometries.append(geometry)
-                tac_id_map.append(tac_id)
+                tac_id_map.append((tac_id, area_name))
+            elif isinstance(geometry, MultiPolygon):
+                # 对于 MultiPolygon，使用最大的多边形
+                max_area = 0
+                main_poly = None
+                for poly in geometry.geoms:
+                    if poly.area > max_area:
+                        max_area = poly.area
+                        main_poly = poly
+                if main_poly:
+                    geometries.append(main_poly)
+                    tac_id_map.append((tac_id, area_name))
 
-            # 创建 STRtree
-            tree = STRtree(geometries)
-            self._strtree_cache[network_type] = (tree, tac_id_map, tac_zones)
+        if not geometries:
+            logger.warning(f"没有有效的多边形用于构建 STRtree 索引（{network_type}）")
+            return
 
-            logger.info(
-                f"成功构建 {network_type} TAC 空间索引，包含 {len(geometries)} 个多边形"
-            )
+        # 创建 STRtree
+        tree = STRtree(geometries)
+        self._strtree_cache[network_type] = (tree, geometries, tac_id_map, tac_zones)
 
-        except Exception as e:
-            logger.warning(f"构建 STRtree 索引失败: {e}，将使用线性搜索")
-            self._strtree_cache.pop(network_type, None)
+        logger.info(
+            f"构建 STRtree 索引成功（{network_type}）: {len(geometries)} 个多边形"
+        )
 
     def match_cell_to_tac(
         self, cell: Dict, tac_zones: Dict[str, Tuple[Polygon, str]], network_type: Optional[str] = None
@@ -592,68 +596,56 @@ class TACPlanningService:
         """
         将小区匹配到TAC区域
 
-        使用 STRtree 空间索引优化查询性能（如果可用且提供了 network_type）。
+        使用 STRtree 空间索引优化查询性能。当提供了 network_type 时使用 STRtree，
+        否则使用线性扫描（仅当未提供 network_type 时使用线性扫描）。
 
         Args:
             cell: 小区数据
             tac_zones: TAC区域字典 {tac_id: (geometry, area_name)}
-            network_type: 网络类型 ('LTE' 或 'NR')，可选。提供时使用STRtree索引。
+            network_type: 网络类型 ('LTE' 或 'NR')，可选。
 
         Returns:
             TAC ID，如果不匹配则返回None
         """
-        try:
-            point = Point(cell["longitude"], cell["latitude"])
+        point = Point(cell["longitude"], cell["latitude"])
 
-            # 如果提供了 network_type 且有 STRtree 索引，使用索引查询
-            if network_type and STRTREE_AVAILABLE and network_type in self._strtree_cache:
-                return self._match_with_strtree(cell, point, network_type)
+        # 如果提供了 network_type 且有 STRtree 索引，使用索引查询
+        if network_type and network_type in self._strtree_cache:
+            return self._match_with_strtree(cell, point, network_type)
 
-            # 否则使用线性搜索（向后兼容）
-            return self._match_linear(cell, point, tac_zones)
-
-        except Exception as e:
-            logger.error(f"匹配小区 {cell.get('sectorId')} 到TAC失败: {e}")
-            return None
+        # 否则使用线性搜索（仅当未提供 network_type 时）
+        return self._match_with_tac_zones(cell, point, tac_zones)
 
     def _match_with_strtree(self, cell: Dict, point: Point, network_type: str) -> Optional[str]:
         """使用 STRtree 索引进行匹配"""
-        try:
-            tree, tac_id_map, tac_zones = self._strtree_cache[network_type]
-
-            # 使用 STRtree 查询候选多边形
-            # query 返回的是 numpy 数组，包含与查询几何相交的几何对象的索引
-            candidate_indices = tree.query(point)
-
-            # 处理返回的索引数组
-            for idx in candidate_indices:
-                # 将索引转换为整数（numpy.int64 -> int）
-                idx = int(idx)
-
-                # 使用索引获取 TAC ID 和几何对象
-                if 0 <= idx < len(tac_id_map):
-                    tac_id = tac_id_map[idx]
-                    geometry, area_name = tac_zones[tac_id]
-
-                    # 精确检查：点是否在多边形内或接触边界
-                    if geometry.contains(point) or geometry.touches(point):
-                        logger.debug(
-                            f"小区 {cell['sectorId']} 匹配到TAC: {tac_id} ({area_name}) [STRtree]"
-                        )
-                        return tac_id
-
+        if network_type not in self._strtree_cache:
             return None
 
-        except Exception as e:
-            logger.warning(f"STRtree 匹配失败，回退到线性搜索: {e}")
-            return None
+        tree, geometries, tac_id_map, tac_zones = self._strtree_cache[network_type]
 
-    def _match_linear(self, cell: Dict, point: Point, tac_zones: Dict[str, Tuple[Polygon, str]]) -> Optional[str]:
-        """使用线性搜索进行匹配（原始方法）"""
+        # STRtree query returns indices
+        candidate_indices = tree.query(point)
+
+        for idx in candidate_indices:
+            idx = int(idx)
+            if 0 <= idx < len(geometries):
+                geometry = geometries[idx]
+                if geometry.contains(point) or geometry.touches(point):
+                    tac_id, area_name = tac_id_map[idx]
+                    logger.debug(
+                        f"小区 {cell['sectorId']} 匹配到TAC: {tac_id} ({area_name}) [STRtree]"
+                    )
+                    return tac_id
+
+        # 未通过 STRtree 找到 — 再通过 tac_zones 直接检查一次
+        return self._match_with_tac_zones(cell, point, tac_zones)
+
+    def _match_with_tac_zones(self, cell: Dict, point: Point, tac_zones: Dict[str, Tuple[Polygon, str]]) -> Optional[str]:
+        """线性扫描 tac_zones 作为 STRtree 的补充或当 network_type 未提供时使用"""
         for tac_id, (geometry, area_name) in tac_zones.items():
-            if geometry.contains(point) or geometry.touches(point):
+            if isinstance(geometry, Polygon) and (geometry.contains(point) or geometry.touches(point)):
                 logger.debug(
-                    f"小区 {cell['sectorId']} 匹配到TAC: {tac_id} ({area_name}) [线性]"
+                    f"小区 {cell['sectorId']} 匹配到TAC: {tac_id} ({area_name}) [Linear]"
                 )
                 return tac_id
         return None
@@ -729,7 +721,7 @@ class TACPlanningService:
             mismatched_count = 0
 
             for i, cell in enumerate(cells):
-                tac_id = self.match_cell_to_tac(cell, tac_zones)
+                tac_id = self.match_cell_to_tac(cell, tac_zones, network_type)
 
                 # 获取TAC区域名称
                 area_name = None
@@ -1018,7 +1010,7 @@ class TACPlanningService:
             unplanned_count = 0
 
             for i, cell in enumerate(cells):
-                tac_id = self.match_cell_to_tac(cell, tac_zones)
+                tac_id = self.match_cell_to_tac(cell, tac_zones, network_type)
 
                 # 获取TAC区域名称
                 area_name = None
