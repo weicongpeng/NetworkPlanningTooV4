@@ -53,6 +53,8 @@ class DistanceCalculator:
              math.cos(lat1_rad) * math.cos(lat2_rad) *
              math.sin(dlon / 2) ** 2)
 
+        # 浮点舍入防护（与 batch_haversine 的 np.clip 保持一致）
+        a = max(0.0, min(1.0, a))
         c = 2 * math.asin(math.sqrt(a))
 
         return DistanceCalculator.EARTH_RADIUS * c
