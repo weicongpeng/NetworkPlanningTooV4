@@ -118,13 +118,23 @@ class TaskManager:
 
     def __init__(self):
         self.tasks: Dict[str, Task] = {}
-        self.max_tasks = 10
+        self.max_tasks = settings.MAX_TASKS
+        self.task_timeout = settings.TASK_TIMEOUT
+        self._semaphore = asyncio.Semaphore(self.max_tasks)
         # 数据准备缓存，避免同一任务重复读取
         self._data_prep_cache: Dict[str, Any] = {}
         # 持久化索引文件路径
         self._tasks_index_file = settings.OUTPUT_DIR / "tasks_index.json"
         # 启动时从磁盘恢复已完成的任务（支持后端重启后导出历史结果）
         self._load_tasks_index()
+
+    async def _acquire_slot(self):
+        """获取信号量槽位"""
+        await self._semaphore.acquire()
+
+    def _release_slot(self):
+        """释放信号量槽位"""
+        self._semaphore.release()
 
     # ============================================================
     # ============================================================
@@ -648,23 +658,34 @@ class TaskManager:
             logger.error(f"[TaskManager] 数据文件验证失败: {str(e)}")
             raise
 
-        # 检查任务数量
-        running_tasks = sum(
-            1
-            for t in self.tasks.values()
-            if t.status in [TaskStatus.PENDING, TaskStatus.PROCESSING]
-        )
-        if running_tasks >= self.max_tasks:
-            raise ValueError("任务数量过多，请等待当前任务完成")
-
         # 创建任务（携带任务名称和用户名）
         task = Task(TaskType.PCI, config, task_name=task_name, user_name=user_name)
         self.tasks[task.task_id] = task
         self._persist_task(task.task_id)
         logger.info(f"[TaskManager] 任务创建成功, task_id: {task.task_id}")
 
-        # 启动任务
-        task.task = asyncio.create_task(self._run_pci_task(task))
+        # 启动任务（含信号量准入和超时保护）
+        async def _run_with_slot():
+            acquired = False
+            try:
+                await self._acquire_slot()
+                acquired = True
+                await asyncio.wait_for(self._run_pci_task(task), timeout=self.task_timeout)
+            except asyncio.TimeoutError:
+                task.status = TaskStatus.FAILED
+                task.error = f"任务执行超时（{self.task_timeout}s）"
+                task.completed_at = datetime.now()
+            except Exception as e:
+                if task.status != TaskStatus.FAILED:
+                    task.status = TaskStatus.FAILED
+                    task.error = str(e)
+                    task.completed_at = datetime.now()
+            finally:
+                if acquired:
+                    self._release_slot()
+                self._persist_task(task.task_id)
+
+        task.task = asyncio.create_task(_run_with_slot())
         logger.info(f"[TaskManager] 异步任务已启动")
 
         return task.task_id
@@ -673,22 +694,33 @@ class TaskManager:
         """创建邻区规划任务"""
         logger.info(f"[TaskManager] 创建邻区任务, task_name: {task_name}, user_name: {user_name}")
 
-        # 检查任务数量
-        running_tasks = sum(
-            1
-            for t in self.tasks.values()
-            if t.status in [TaskStatus.PENDING, TaskStatus.PROCESSING]
-        )
-        if running_tasks >= self.max_tasks:
-            raise ValueError("任务数量过多，请等待当前任务完成")
-
         # 创建任务（携带任务名称和用户名）
         task = Task(TaskType.NEIGHBOR, config, task_name=task_name, user_name=user_name)
         self.tasks[task.task_id] = task
         self._persist_task(task.task_id)
 
-        # 启动任务
-        task.task = asyncio.create_task(self._run_neighbor_task(task))
+        # 启动任务（含信号量准入和超时保护）
+        async def _run_with_slot():
+            acquired = False
+            try:
+                await self._acquire_slot()
+                acquired = True
+                await asyncio.wait_for(self._run_neighbor_task(task), timeout=self.task_timeout)
+            except asyncio.TimeoutError:
+                task.status = TaskStatus.FAILED
+                task.error = f"任务执行超时（{self.task_timeout}s）"
+                task.completed_at = datetime.now()
+            except Exception as e:
+                if task.status != TaskStatus.FAILED:
+                    task.status = TaskStatus.FAILED
+                    task.error = str(e)
+                    task.completed_at = datetime.now()
+            finally:
+                if acquired:
+                    self._release_slot()
+                self._persist_task(task.task_id)
+
+        task.task = asyncio.create_task(_run_with_slot())
 
         return task.task_id
 
@@ -696,22 +728,33 @@ class TaskManager:
         """创建TAC核查任务"""
         logger.info(f"[TaskManager] 创建TAC核查任务, task_name: {task_name}, user_name: {user_name}")
 
-        # 检查任务数量
-        running_tasks = sum(
-            1
-            for t in self.tasks.values()
-            if t.status in [TaskStatus.PENDING, TaskStatus.PROCESSING]
-        )
-        if running_tasks >= self.max_tasks:
-            raise ValueError("任务数量过多，请等待当前任务完成")
-
         # 创建任务（携带任务名称和用户名）
         task = Task(TaskType.TAC, config, task_name=task_name, user_name=user_name)
         self.tasks[task.task_id] = task
         self._persist_task(task.task_id)
 
-        # 启动任务
-        task.task = asyncio.create_task(self._run_tac_task(task))
+        # 启动任务（含信号量准入和超时保护）
+        async def _run_with_slot():
+            acquired = False
+            try:
+                await self._acquire_slot()
+                acquired = True
+                await asyncio.wait_for(self._run_tac_task(task), timeout=self.task_timeout)
+            except asyncio.TimeoutError:
+                task.status = TaskStatus.FAILED
+                task.error = f"任务执行超时（{self.task_timeout}s）"
+                task.completed_at = datetime.now()
+            except Exception as e:
+                if task.status != TaskStatus.FAILED:
+                    task.status = TaskStatus.FAILED
+                    task.error = str(e)
+                    task.completed_at = datetime.now()
+            finally:
+                if acquired:
+                    self._release_slot()
+                self._persist_task(task.task_id)
+
+        task.task = asyncio.create_task(_run_with_slot())
         logger.info(f"[TaskManager] TAC核查任务已启动, task_id: {task.task_id}")
 
         return task.task_id
@@ -720,22 +763,33 @@ class TaskManager:
         """创建TAC规划任务（数据型）"""
         logger.info(f"[TaskManager] 创建TAC规划任务, task_name: {task_name}, user_name: {user_name}")
 
-        # 检查任务数量
-        running_tasks = sum(
-            1
-            for t in self.tasks.values()
-            if t.status in [TaskStatus.PENDING, TaskStatus.PROCESSING]
-        )
-        if running_tasks >= self.max_tasks:
-            raise ValueError("任务数量过多，请等待当前任务完成")
-
         # 创建任务（携带任务名称和用户名）
         task = Task(TaskType.TAC_PLANNING, config, task_name=task_name, user_name=user_name)
         self.tasks[task.task_id] = task
- 
-        # 启动任务
-        task.task = asyncio.create_task(self._run_tac_planning_task(task))
- 
+
+        # 启动任务（含信号量准入和超时保护）
+        async def _run_with_slot():
+            acquired = False
+            try:
+                await self._acquire_slot()
+                acquired = True
+                await asyncio.wait_for(self._run_tac_planning_task(task), timeout=self.task_timeout)
+            except asyncio.TimeoutError:
+                task.status = TaskStatus.FAILED
+                task.error = f"任务执行超时（{self.task_timeout}s）"
+                task.completed_at = datetime.now()
+            except Exception as e:
+                if task.status != TaskStatus.FAILED:
+                    task.status = TaskStatus.FAILED
+                    task.error = str(e)
+                    task.completed_at = datetime.now()
+            finally:
+                if acquired:
+                    self._release_slot()
+                self._persist_task(task.task_id)
+
+        task.task = asyncio.create_task(_run_with_slot())
+
         return task.task_id
 
     async def _run_pci_task(self, task: Task):
@@ -1341,15 +1395,6 @@ class TaskManager:
         """创建工参更新任务"""
         logger.info(f"[TaskManager] 创建工参更新任务: full={full_param_id[:8]}..., current={current_param_id[:8]}...")
 
-        # 检查任务数量
-        running_tasks = sum(
-            1
-            for t in self.tasks.values()
-            if t.status in [TaskStatus.PENDING, TaskStatus.PROCESSING]
-        )
-        if running_tasks >= self.max_tasks:
-            raise ValueError("任务数量过多，请等待当前任务完成")
-
         # 创建任务
         task = Task(TaskType.UPDATE_PARAMS, {
             "fullParamId": full_param_id,
@@ -1361,8 +1406,28 @@ class TaskManager:
         self._persist_task(task.task_id)
         logger.info(f"[TaskManager] 工参更新任务已创建: {task.task_id}")
 
-        # 启动后台任务
-        task.task = asyncio.create_task(self._run_update_params_task(task))
+        # 启动后台任务（含信号量准入和超时保护）
+        async def _run_with_slot():
+            acquired = False
+            try:
+                await self._acquire_slot()
+                acquired = True
+                await asyncio.wait_for(self._run_update_params_task(task), timeout=self.task_timeout)
+            except asyncio.TimeoutError:
+                task.status = TaskStatus.FAILED
+                task.error = f"任务执行超时（{self.task_timeout}s）"
+                task.completed_at = datetime.now()
+            except Exception as e:
+                if task.status != TaskStatus.FAILED:
+                    task.status = TaskStatus.FAILED
+                    task.error = str(e)
+                    task.completed_at = datetime.now()
+            finally:
+                if acquired:
+                    self._release_slot()
+                self._persist_task(task.task_id)
+
+        task.task = asyncio.create_task(_run_with_slot())
         return task.task_id
 
     async def _run_update_params_task(self, task: Task):
@@ -1426,15 +1491,6 @@ class TaskManager:
         if planning_result.get("status") != "completed":
             raise ValueError("PCI规划任务尚未完成")
 
-        # 检查任务数量
-        running_tasks = sum(
-            1
-            for t in self.tasks.values()
-            if t.status in [TaskStatus.PENDING, TaskStatus.PROCESSING]
-        )
-        if running_tasks >= self.max_tasks:
-            raise ValueError("任务数量过多，请等待当前任务完成")
-
         # 创建任务
         task = Task(TaskType.APPLY_PCI, {
             "planningTaskId": planning_task_id,
@@ -1443,8 +1499,28 @@ class TaskManager:
         self._persist_task(task.task_id)
         logger.info(f"[TaskManager] PCI应用到工参任务已创建: {task.task_id}")
 
-        # 启动后台任务
-        task.task = asyncio.create_task(self._run_apply_pci_to_params_task(task))
+        # 启动后台任务（含信号量准入和超时保护）
+        async def _run_with_slot():
+            acquired = False
+            try:
+                await self._acquire_slot()
+                acquired = True
+                await asyncio.wait_for(self._run_apply_pci_to_params_task(task), timeout=self.task_timeout)
+            except asyncio.TimeoutError:
+                task.status = TaskStatus.FAILED
+                task.error = f"任务执行超时（{self.task_timeout}s）"
+                task.completed_at = datetime.now()
+            except Exception as e:
+                if task.status != TaskStatus.FAILED:
+                    task.status = TaskStatus.FAILED
+                    task.error = str(e)
+                    task.completed_at = datetime.now()
+            finally:
+                if acquired:
+                    self._release_slot()
+                self._persist_task(task.task_id)
+
+        task.task = asyncio.create_task(_run_with_slot())
         return task.task_id
 
     async def _run_apply_pci_to_params_task(self, task: Task):
@@ -1858,15 +1934,6 @@ class TaskManager:
         if planning_result.get("status") != "completed":
             raise ValueError("TAC规划任务尚未完成")
 
-        # 检查任务数量
-        running_tasks = sum(
-            1
-            for t in self.tasks.values()
-            if t.status in [TaskStatus.PENDING, TaskStatus.PROCESSING]
-        )
-        if running_tasks >= self.max_tasks:
-            raise ValueError("任务数量过多，请等待当前任务完成")
-
         task = Task(TaskType.APPLY_TAC_PLANNING, {
             "planningTaskId": planning_task_id,
         })
@@ -1874,7 +1941,28 @@ class TaskManager:
         self._persist_task(task.task_id)
         logger.info(f"[TaskManager] TAC规划应用到工参任务已创建: {task.task_id}")
 
-        task.task = asyncio.create_task(self._run_apply_tac_planning_to_params_task(task))
+        # 启动后台任务（含信号量准入和超时保护）
+        async def _run_with_slot():
+            acquired = False
+            try:
+                await self._acquire_slot()
+                acquired = True
+                await asyncio.wait_for(self._run_apply_tac_planning_to_params_task(task), timeout=self.task_timeout)
+            except asyncio.TimeoutError:
+                task.status = TaskStatus.FAILED
+                task.error = f"任务执行超时（{self.task_timeout}s）"
+                task.completed_at = datetime.now()
+            except Exception as e:
+                if task.status != TaskStatus.FAILED:
+                    task.status = TaskStatus.FAILED
+                    task.error = str(e)
+                    task.completed_at = datetime.now()
+            finally:
+                if acquired:
+                    self._release_slot()
+                self._persist_task(task.task_id)
+
+        task.task = asyncio.create_task(_run_with_slot())
         return task.task_id
 
     async def _run_apply_tac_planning_to_params_task(self, task: Task):
