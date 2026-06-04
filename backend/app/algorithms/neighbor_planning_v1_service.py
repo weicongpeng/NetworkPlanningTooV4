@@ -763,22 +763,83 @@ class NeighborPlanner:
         total_cells = len(self.source_cells_df)
         all_neighbors = []
         results_by_site = {}
-        
-        # 为每个源小区规划邻区
-        for idx, source_row in self.source_cells_df.iterrows():
-            neighbors = self.plan_neighbors_for_cell(source_row)
-            
+
+        # 预收集源小区数据为 dict，确保跨线程序列化安全
+        source_rows_dicts: List[Dict] = []
+        for _idx, row in self.source_cells_df.iterrows():
+            source_rows_dicts.append(row.to_dict())
+
+        # 从配置读取工作线程数，或根据 CPU 核数计算
+        try:
+            from app.core.config import settings
+            max_workers = settings.MAX_WORKERS
+        except Exception:
+            max_workers = min(3, os.cpu_count() or 4)
+
+        total_cells_int = len(source_rows_dicts)
+
+        # 预分配结果列表以保持原始顺序
+        neighbor_results: List[Optional[Tuple[Dict, List[NeighborRelation]]]] = [None] * total_cells_int
+
+        def process_one_cell(source_row_dict: Dict) -> Tuple[Dict, List[NeighborRelation]]:
+            """处理单个源小区的邻区规划（在 ThreadPoolExecutor 工作线程中执行）
+
+            每线程使用独立的 NeighborPlanner 实例和 _site_spacing_cache，
+            确保线程安全。只读数据（numpy 数组、DataFrame、config）共享访问。
+            """
+            planner = NeighborPlanner.__new__(NeighborPlanner)
+            planner.config = self.config
+            planner.max_neighbors = self.max_neighbors
+            planner.coverage_distance_factor = self.coverage_distance_factor
+            planner.coverage_radius_factor = self.coverage_radius_factor
+            planner.default_coverage_distance = self.default_coverage_distance
+            planner.target_cells_df = self.target_cells_df
+            planner._target_lats_arr = self._target_lats_arr
+            planner._target_lons_arr = self._target_lons_arr
+            planner._target_valid_mask = self._target_valid_mask
+            planner._target_center_lats = self._target_center_lats
+            planner._target_center_lons = self._target_center_lons
+            planner._target_radii = self._target_radii
+            planner._site_spacing_cache = {}  # 每线程独立缓存
+
+            source_row = pd.Series(source_row_dict)
+            neighbors = planner.plan_neighbors_for_cell(source_row)
+            return source_row_dict, neighbors
+
+        # 并行执行：ThreadPoolExecutor 优于 ProcessPoolExecutor，
+        # 因为 numpy 运算会释放 GIL，且零数据拷贝开销
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(process_one_cell, row_dict): idx
+                for idx, row_dict in enumerate(source_rows_dicts)
+            }
+
+            total_completed = 0
+            for future in as_completed(futures):
+                idx = futures[future]
+                source_row_dict, neighbors = future.result()
+                neighbor_results[idx] = (source_row_dict, neighbors)
+
+                total_completed += 1
+                if progress_callback:
+                    progress_callback(total_completed / total_cells_int * 100)
+
+        # 按原始顺序汇总结果
+        for source_row_dict, neighbors in neighbor_results:
+            source_row = pd.Series(source_row_dict)
             site_id = str(source_row['enodeb_id'])
             sector_id = str(source_row['cell_id'])
             cell_name = str(source_row.get('cell_name', ''))
-            
+
             if site_id not in results_by_site:
                 results_by_site[site_id] = {
                     "siteId": site_id,
                     "siteName": f"Site_{site_id}",
                     "sectors": []
                 }
-            
+
             sector_neighbors = []
             for n in neighbors:
                 sector_neighbors.append({
@@ -791,18 +852,13 @@ class NeighborPlanner:
                     "relationType": f"{self.config.source_type}-{self.config.target_type}"
                 })
                 all_neighbors.append(n)
-            
+
             results_by_site[site_id]["sectors"].append({
                 "sectorId": sector_id,
                 "sectorName": cell_name,
                 "neighbors": sector_neighbors,
                 "neighborCount": len(sector_neighbors)
             })
-            
-            # 更新进度
-            if progress_callback:
-                progress = (idx + 1) / total_cells * 100
-                progress_callback(progress)
 
         total_neighbors = len(all_neighbors)
         avg_neighbors = total_neighbors / total_cells if total_cells > 0 else 0.0
