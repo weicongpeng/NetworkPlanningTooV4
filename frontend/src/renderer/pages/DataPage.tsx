@@ -6,6 +6,7 @@ import type { DataItem } from '@shared/types'
 import { DATA_REFRESH_EVENT, triggerDataRefresh } from '../store/dataStore'
 import { mapDataService } from '../services/mapDataService'
 import { indexedDBService } from '../services/indexedDBService'
+import { useDownloadStore } from '../store/downloadStore'
 import { useTranslation } from 'react-i18next'
 
 export function DataPage() {
@@ -33,7 +34,7 @@ export function DataPage() {
   })
 
   // 下载状态跟踪
-  const [downloadingIds, setDownloadingIds] = useState<Set<string>>(new Set())
+  const downloadStore = useDownloadStore()
 
   const {
     items,
@@ -261,72 +262,88 @@ export function DataPage() {
   }
 
   const handleDownload = async (item: DataItem) => {
-    setDownloadingIds(prev => new Set(prev).add(item.id))
+    const store = useDownloadStore.getState()
+    if (store.isDownloading(item.id)) return
+    store.startDownload(item.id, item.name || item.id)
+
     try {
-        console.log('[Download] Requesting:', item.id);
-        const url = `/api/v1/data/${item.id}/download`;
+        console.log('[Download] Requesting:', item.id)
+        const url = `/api/v1/data/${item.id}/download`
+        const filename = item.name || 'download'
 
-        const response = await fetch(url);
-        if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+        // 使用 fetch + stream reader 追踪下载进度
+        const response = await fetch(url)
+        if (!response.ok) throw new Error(`HTTP ${response.status}`)
 
-        const blob = await response.blob();
-        if (blob.size === 0) throw new Error(t('data.emptyFile') || '文件内容为空');
+        const contentLength = response.headers.get('content-length')
+        const total = contentLength ? parseInt(contentLength, 10) : 0
+        let loaded = 0
 
-        const filename = item.name || 'download';
+        const reader = response.body!.getReader()
+        const chunks: Uint8Array[] = []
 
-        // 优先使用 File System Access API 弹出保存对话框
-        if ('showSaveFilePicker' in window) {
-            try {
-                const opts = {
-                    suggestedName: filename,
-                    types: [{
-                        description: 'Excel File',
-                        accept: { 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': ['.xlsx'] }
-                    }]
-                };
-                // 根据扩展名调整 types
-                if (filename.endsWith('.zip')) {
-                    opts.types = [{ description: 'ZIP Archive', accept: { 'application/zip': ['.zip'] } }];
-                }
-                const handle = await (window as any).showSaveFilePicker(opts);
-                const writable = await handle.createWritable();
-                await writable.write(blob);
-                await writable.close();
-                console.log('[Download] Saved via File Picker:', filename);
-                return;
-            } catch (pickerErr: any) {
-                // 用户取消或 API 不可用，回退到 a.click
-                if (pickerErr.name === 'AbortError') {
-                    console.log('[Download] User cancelled save dialog');
-                    return;
-                }
-                console.warn('[Download] showSaveFilePicker failed, falling back:', pickerErr);
-            }
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
+          chunks.push(value)
+          loaded += value.length
+          if (total > 0) {
+            const pct = Math.round((loaded / total) * 100)
+            store.updateProgress(item.id, pct,
+              `下载中 ${pct}% (${(loaded/1024/1024).toFixed(1)}MB / ${(total/1024/1024).toFixed(1)}MB)`)
+          } else {
+            store.updateProgress(item.id, -1, `下载中 ${(loaded/1024/1024).toFixed(1)}MB...`)
+          }
         }
 
-        // 后备方案：a.click() 触发下载
-        const blobUrl = window.URL.createObjectURL(blob);
-        const link = document.createElement('a');
-        link.href = blobUrl;
-        link.setAttribute('download', filename);
-        document.body.appendChild(link);
-        link.click();
+        const blob = new Blob(chunks)
+        if (blob.size === 0) throw new Error(t('data.emptyFile') || '文件内容为空')
 
+        store.updateProgress(item.id, 100, '正在保存...')
+
+        // 弹出保存对话框 (File System Access API, Electron/Chromium 支持)
+        if ('showSaveFilePicker' in window) {
+          try {
+            const opts: any = {
+              suggestedName: filename,
+              types: filename.endsWith('.zip')
+                ? [{ description: 'ZIP Archive', accept: { 'application/zip': ['.zip'] } }]
+                : [{ description: 'Excel File', accept: { 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': ['.xlsx'] } }],
+            }
+            const handle = await (window as any).showSaveFilePicker(opts)
+            const writable = await handle.createWritable()
+            await writable.write(blob)
+            await writable.close()
+            console.log('[Download] Saved via File Picker:', filename)
+            store.finishDownload(item.id)
+            return
+          } catch (pickerErr: any) {
+            if (pickerErr.name === 'AbortError') {
+              console.log('[Download] User cancelled save dialog')
+              store.finishDownload(item.id)
+              return
+            }
+            console.warn('[Download] showSaveFilePicker failed, falling back:', pickerErr)
+          }
+        }
+
+        // 后备：a.click() 触发浏览器下载
+        const blobUrl = window.URL.createObjectURL(blob)
+        const link = document.createElement('a')
+        link.href = blobUrl
+        link.setAttribute('download', filename)
+        document.body.appendChild(link)
+        link.click()
         setTimeout(() => {
-            document.body.removeChild(link);
-            window.URL.revokeObjectURL(blobUrl);
-        }, 100);
-
-        console.log('[Download] Success (fallback)');
+          document.body.removeChild(link)
+          window.URL.revokeObjectURL(blobUrl)
+        }, 100)
+        console.log('[Download] Success (fallback)')
+        store.finishDownload(item.id)
     } catch (err: any) {
-        console.error('[Download] Failed:', err);
+        console.error('[Download] Failed:', err)
+        store.failDownload(item.id, err.message)
         alert(`${t('data.downloadFailed') || '下载失败'}: ${err.message || (t('data.unknownError') || '未知错误')}`)
-    } finally {
-        setDownloadingIds(prev => {
-            const next = new Set(prev)
-            next.delete(item.id)
-            return next
-        })
     }
   }
 
@@ -525,7 +542,7 @@ export function DataPage() {
   return (
     <div className="p-8">
       <div className="flex justify-between items-center mb-8">
-        <h1 className="text-3xl font-bold">{t('data.title')}</h1>
+        <h1 className="text-base font-bold">{t('data.title')}</h1>
       </div>
 
       {/* 错误提示 */}
@@ -571,7 +588,7 @@ export function DataPage() {
         <div className="space-y-8">
             {/* 文件上传 */}
             <div className="bg-card p-3 rounded-lg border border-border">
-            <h2 className="text-xl font-semibold mb-2">{t('data.importData') || '导入数据'}</h2>
+            <h2 className="text-base font-semibold mb-2">{t('data.importData') || '导入数据'}</h2>
 
              <div className="space-y-2">
                 <div className="flex items-center gap-2">
@@ -662,7 +679,7 @@ export function DataPage() {
 
             {/* 工参更新 */}
             <div className="bg-card p-3 rounded-lg border border-border -mt-6">
-                <h2 className="text-xl font-semibold mb-2">{t('data.updateParameters') || '工参更新'}</h2>
+                <h2 className="text-base font-semibold mb-2">{t('data.updateParameters') || '工参更新'}</h2>
                 <div className="space-y-4">
                     <div>
                         <select
@@ -707,7 +724,7 @@ export function DataPage() {
         {/* 数据列表 */}
         <div className="bg-card p-6 rounded-lg border border-border h-full">
           <div className="flex items-center justify-between mb-4">
-            <h2 className="text-xl font-semibold">{t('data.importedData') || '已导入数据'}</h2>
+            <h2 className="text-base font-semibold">{t('data.importedData') || '已导入数据'}</h2>
             <div className="flex items-center gap-2">
               {items.length > 0 && (
                 <>
@@ -899,11 +916,22 @@ export function DataPage() {
                         e.stopPropagation()
                         handleDownload(item)
                       }}
-                      disabled={downloadingIds.has(item.id)}
-                      className="p-2 hover:bg-background rounded text-primary disabled:opacity-50 disabled:cursor-wait"
-                      title={downloadingIds.has(item.id) ? (t('data.downloading') || '下载中...') : (t('data.download') || '下载')}
+                      disabled={downloadStore.downloadingIds.has(item.id)}
+                      className="p-2 hover:bg-background rounded text-primary disabled:opacity-50 disabled:cursor-wait relative group"
+                      title={downloadStore.downloadingIds.has(item.id)
+                        ? (downloadStore.statusText[item.id] || (t('data.downloading') || '下载中...'))
+                        : (t('data.download') || '下载')}
                     >
-                      {downloadingIds.has(item.id) ? <Loader2 size={16} className="animate-spin" /> : <Download size={16} />}
+                      {downloadStore.downloadingIds.has(item.id) ? (
+                        <div className="flex flex-col items-center gap-0.5">
+                          <Loader2 size={16} className="animate-spin text-blue-500" />
+                          {downloadStore.progress[item.id] > 0 && (
+                            <span className="text-[9px] font-mono text-blue-600 leading-none">
+                              {downloadStore.progress[item.id]}%
+                            </span>
+                          )}
+                        </div>
+                      ) : <Download size={16} />}
                     </button>
                     <button
                       onClick={(e) => {
@@ -925,7 +953,7 @@ export function DataPage() {
 
       {/* 数据预览 */}
       <div className="mt-8 bg-card p-6 rounded-lg border border-border">
-        <h2 className="text-xl font-semibold mb-4">{t('data.preview') || '数据预览'}</h2>
+        <h2 className="text-base font-semibold mb-4">{t('data.preview') || '数据预览'}</h2>
         {!selectedId ? (
           <p className="text-muted-foreground text-center py-8">
             {t('data.selectToPreview') || '请选择数据查看预览'}

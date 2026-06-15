@@ -10,7 +10,7 @@ import { PCILegend } from '../components/Map/PCILegend'
 import { MapTypeSwitch } from '../components/Map/MapTypeSwitch'
 import { useAuthStore } from '../store/authStore'
 import { pciDataSyncService } from '../services/pciDataSyncService'
-import { mapDataService, getCellList, clearCellListCache } from '../services/mapDataService'
+import { mapDataService, getCellList, clearCellListCache, bumpDataVersion } from '../services/mapDataService'
 import { CoordinateTransformer } from '../utils/coordinate'
 import type { RenderSectorData, CellListItem } from '../services/mapDataService'
 import { triggerDataRefresh, DATA_REFRESH_EVENT } from '../store/dataStore'
@@ -246,6 +246,12 @@ export function PCIPage() {
         await syncHistoryFromBackend('pci_planning')
         const latest = getLatestPCITask()
         if (latest && latest.result) {
+          // 恢复应用状态（跨页面同步）
+          if (latest.isApplied) {
+            setApplySuccess(true)
+          } else {
+            setApplySuccess(false)
+          }
           // 如果 store 中的结果没有完整 results（来自 resultSummary），尝试从 API 重新获取
           if (!latest.result.results && latest.id) {
             try {
@@ -291,20 +297,27 @@ export function PCIPage() {
   }, [])
 
   // ===== 应用 PCI 结果到全量工参 =====
-  const pollApplyResult = useCallback(async (applyTaskId: string, timeout = 30000): Promise<any> => {
+  const pollApplyResult = useCallback(async (applyTaskId: string, timeout = 60000): Promise<any> => {
     const startTime = Date.now()
     while (Date.now() - startTime < timeout) {
       await new Promise(r => setTimeout(r, 1000))
       try {
         const result = await pciApi.getApplyResult(applyTaskId)
-        if (result?.data?.status === 'completed') {
+        // getApplyResult 返回 200 = 任务已完成（status 字段在 result.data 中不存在）
+        // 只要返回了数据就表示任务执行完毕
+        if (result?.data) {
+          if (result.data.updatedCount !== undefined) {
+            return result.data
+          }
+          // 有数据但缺少 updatedCount，也可能是失败结果
+          if (result.data.success === false) {
+            throw new Error(result.data.message || result.data.error || '应用失败')
+          }
+          // 兜底：有数据就认为成功
           return result.data
         }
-        if (result?.data?.status === 'failed') {
-          throw new Error(result?.data?.error || '应用失败')
-        }
       } catch (pollErr: any) {
-        if (pollErr?.response?.status === 404) continue
+        if (pollErr?.code === 404) continue
         throw pollErr
       }
     }
@@ -328,14 +341,15 @@ export function PCIPage() {
       }
 
       if (updatedCount !== undefined) {
-        // 标记任务为已应用（跨用户共享）
-        pciApi.markApplied(task.id).catch(e =>
+        // 标记任务为已应用（跨用户共享），等待完成后 HistoryTable 才会 syncHistoryFromBackend
+        try {
+          await pciApi.markApplied(task.id)
+        } catch (e: any) {
           console.warn('[PCIPage] 标记已应用失败:', e?.message)
-        )
-        // 清除地图缓存，确保扇区属性显示更新后的PCI
-        mapDataService.clearCache().catch(e =>
-          console.warn('[PCIPage] 清理地图缓存失败:', e?.message)
-        )
+        }
+        useTaskStore.getState().markTaskApplied(task.id)
+        await mapDataService.clearCache()
+        bumpDataVersion()
         setApplySuccess(true)
         triggerDataRefresh()
         return true
@@ -767,6 +781,15 @@ export function PCIPage() {
   // 从历史任务查看 - 跳转到结果页并自动打开地图
   const handleViewTask = async (task: any) => {
     try {
+      // 从 taskStore 或后端恢复应用状态（跨页面同步）
+      const storeTask = useTaskStore.getState().tasks[task.id]
+      const isApplied = storeTask?.isApplied || task?.isApplied || false
+      if (isApplied) {
+        setApplySuccess(true)
+      } else {
+        setApplySuccess(false)
+      }
+
       const response = await pciApi.getResult(task.id)
       if (response?.success && response?.data) {
         const result = response.data as PCIResultData
@@ -842,6 +865,7 @@ export function PCIPage() {
         let successMsg = `已成功将PCI规划结果应用到工参，更新了${updatedCount}个小区的PCI`
         setError(successMsg)
         mapDataService.clearCache()
+        bumpDataVersion()
         try {
           const listResponse = await dataApi.list(1, 50, true)
         } catch (listErr) { }
@@ -852,10 +876,18 @@ export function PCIPage() {
         if (mapRef.current) {
           await mapRef.current.refreshData()
         }
-        setTimeout(() => {
-          setError(null)
-          setApplySuccess(false)
-        }, 5000)
+        // 标记任务为已应用（持久化到历史记录 + 跨页面状态同步）
+        if (taskId || currentTaskResult?.taskId) {
+          const markId = taskId || currentTaskResult!.taskId
+          pciApi.markApplied(markId).catch(e =>
+            console.warn('[PCIPage] 标记已应用失败:', e?.message)
+          )
+          useTaskStore.getState().markTaskApplied(markId)
+          // 刷新历史列表以同步所有页面的应用状态
+          syncHistoryFromBackend('pci_planning').catch(e =>
+            console.warn('[PCIPage] 同步历史失败:', e?.message)
+          )
+        }
       } else {
         setError('应用到工参失败: ' + (response.message || '未知错误'))
       }
@@ -1137,7 +1169,7 @@ export function PCIPage() {
 
   return (
     <div className="h-full flex flex-col p-4 min-h-0">
-      <h1 className="text-3xl font-bold mb-6 shrink-0">{t('pci.title') || 'PCI规划'}</h1>
+      <h1 className="text-base font-bold mb-6 shrink-0">{t('pci.title') || 'PCI规划'}</h1>
 
       {error && (
         <div className="mb-4 p-3 bg-red-50 border border-red-200 rounded-lg flex items-center gap-3 text-red-700 shrink-0">
@@ -1329,6 +1361,8 @@ export function PCIPage() {
                             siteId: t('pci.siteId') || '基站ID',
                             cellId: t('pci.sectorId') || '小区ID',
                             cellName: t('pci.sectorName') || '小区名称',
+                            cellFreq: t('pci.cellFreq') || '频点',
+                            cellPci: t('pci.cellPci') || 'PCI',
                             selectAll: t('pci.selectAll') || '全选',
                             clearSelections: t('pci.clearSelections') || '清空选择',
                             uploadCellFile: t('pci.uploadCellFile') || '上传待规划小区文件',

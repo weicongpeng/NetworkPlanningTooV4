@@ -202,7 +202,7 @@ export function AdminUsersPage() {
         <div className="p-2 bg-primary/10 rounded-lg">
           <Users size={24} className="text-primary" />
         </div>
-        <h1 className="text-2xl font-bold text-foreground">{t('admin.title', '用户管理')}</h1>
+        <h1 className="text-base font-bold text-foreground">{t('admin.title', '用户管理')}</h1>
       </div>
 
       {/* Search & Refresh & Add User */}

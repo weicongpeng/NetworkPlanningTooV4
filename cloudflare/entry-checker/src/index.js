@@ -1,99 +1,96 @@
 /**
  * go.pengwc.asia — 多域名入口检测跳板
  *
- * 当用户访问该 Worker 时，并发检测两个后端域名的健康状态，
- * 自动 302 跳转到可用的域名。两个都挂了则显示降级页面。
- *
- * 部署方式:
- *   方式 A: 复制代码到 Cloudflare Dashboard → Workers & Pages → 创建 Worker
- *   方式 B: npx wrangler deploy（需 API Token）
+ * 并发检测两个后端域名的健康状态，自动 302 跳转到可用域名。
+ * 都挂了则显示降级页面。
  */
 
-// ====== 配置区（按需修改）======
-
+// ====== 配置区 ======
 const DOMAINS = [
-  {
-    name: 'app.pengwc.asia',
-    protocol: 'https',
-    priority: 1, // 数字越小优先级越高
-  },
-  {
-    name: 'armbian.tail362392.ts.net',
-    protocol: 'https',
-    priority: 2,
-  },
+  { name: 'app.pengwc.asia', protocol: 'https', priority: 1 },
+  { name: 'armbian.tail362392.ts.net', protocol: 'https', priority: 2 },
 ];
 
 const HEALTH_PATH = '/api/v1/system/status';
-const CHECK_TIMEOUT_MS = 3000; // 单个健康检查超时
+const CHECK_TIMEOUT_MS = 3000;
 const COOKIE_NAME = 'preferred_domain';
+const COOKIE_MAX_AGE = 604800; // 7 天
 
-// ====== 主逻辑 ======
-
+// ====== 入口 ======
 export default {
   async fetch(request) {
-    // 1. 检查 URL 参数 ?domain=xxx 手动指定
-    const url = new URL(request.url);
-    const manualDomain = url.searchParams.get('domain');
-    if (manualDomain) {
-      const matched = DOMAINS.find((d) => d.name === manualDomain);
-      if (matched) {
-        return redirectTo(`${matched.protocol}://${matched.name}`);
-      }
-    }
-
-    // 2. 检查 Cookie 中的首选域名
-    const cookie = request.headers.get('Cookie') || '';
-    const preferredMatch = cookie.match(
-      new RegExp(`${COOKIE_NAME}=([^;]+)`)
-    );
-    if (preferredMatch) {
-      const cached = DOMAINS.find((d) => d.name === preferredMatch[1]);
-      if (cached && (await healthCheck(cached))) {
-        return redirectTo(`${cached.protocol}://${cached.name}`);
-      }
-    }
-
-    // 3. 并发检测所有域名
-    const results = await checkAllDomains();
-
-    // 4. 选择最佳可用域名
-    const available = results
-      .filter((r) => r.ok)
-      .sort((a, b) => a.priority - b.priority);
-
-    if (available.length > 0) {
-      const best = available[0];
-      const response = redirectTo(
-        `${best.protocol}://${best.name}`
+    try {
+      return await handleRequest(request);
+    } catch (err) {
+      // 兜底：代码异常时返回降级页面，不暴露错误详情
+      return new Response(
+        renderFallbackPage(null, err),
+        {
+          status: 503,
+          headers: {
+            'Content-Type': 'text/html; charset=utf-8',
+            'Cache-Control': 'no-store',
+          },
+        }
       );
-      // 种 cookie 记住（有效期 7 天）
-      response.headers.set(
-        'Set-Cookie',
-        `${COOKIE_NAME}=${best.name}; Path=/; Max-Age=604800; SameSite=Lax`
-      );
-      return response;
     }
-
-    // 5. 全部不可用 → 降级页面
-    return new Response(
-      renderFallbackPage(results),
-      {
-        status: 503,
-        headers: {
-          'Content-Type': 'text/html; charset=utf-8',
-          'Cache-Control': 'no-store',
-        },
-      }
-    );
   },
 };
 
+// ====== 主逻辑 ======
+async function handleRequest(request) {
+  const url = new URL(request.url);
+
+  // 1. 手动指定 ?domain=xxx
+  const manualDomain = url.searchParams.get('domain');
+  if (manualDomain) {
+    const matched = DOMAINS.find((d) => d.name === manualDomain);
+    if (matched) {
+      return doRedirect(`${matched.protocol}://${matched.name}`);
+    }
+  }
+
+  // 2. Cookie 缓存命中验证
+  const cookie = request.headers.get('Cookie') || '';
+  const preferredMatch = cookie.match(
+    new RegExp(`${COOKIE_NAME}=([^;]+)`)
+  );
+  if (preferredMatch) {
+    const cached = DOMAINS.find((d) => d.name === preferredMatch[1]);
+    if (cached) {
+      const ok = await healthCheck(cached);
+      if (ok) return doRedirect(`${cached.protocol}://${cached.name}`);
+    }
+  }
+
+  // 3. 并发检测所有域名
+  const results = await checkAllDomains();
+
+  // 4. 选最佳可用域名
+  const available = results
+    .filter((r) => r.ok)
+    .sort((a, b) => a.priority - b.priority);
+
+  if (available.length > 0) {
+    const best = available[0];
+    return doRedirect(`${best.protocol}://${best.name}`, best.name);
+  }
+
+  // 5. 全部不可用 → 降级页面
+  return new Response(
+    renderFallbackPage(results, null),
+    {
+      status: 503,
+      headers: {
+        'Content-Type': 'text/html; charset=utf-8',
+        'Cache-Control': 'no-store',
+      },
+    }
+  );
+}
+
 // ====== 工具函数 ======
 
-/**
- * 向一个域名发起健康检查
- */
 async function healthCheck(domain) {
   const url = `${domain.protocol}://${domain.name}${HEALTH_PATH}`;
   const controller = new AbortController();
@@ -104,6 +101,8 @@ async function healthCheck(domain) {
       method: 'GET',
       signal: controller.signal,
       headers: { 'User-Agent': 'go.pengwc.asia-health-checker/1.0' },
+      // 避免 Worker 重复走 Cloudflare 代理导致的回环问题
+      redirect: 'manual',
     });
     return resp.ok;
   } catch {
@@ -113,9 +112,6 @@ async function healthCheck(domain) {
   }
 }
 
-/**
- * 并发检测所有域名，返回结果数组
- */
 async function checkAllDomains() {
   const tasks = DOMAINS.map(async (d) => {
     const ok = await healthCheck(d);
@@ -126,33 +122,52 @@ async function checkAllDomains() {
       ok,
     };
   });
-
   return Promise.all(tasks);
 }
 
 /**
- * 生成 302 跳转响应
+ * 使用 302 + Location 头手动跳转（避免 Response.redirect 在 CF Worker 中的潜在兼容问题）
+ * 同时通过 Set-Cookie 记录首选域名
  */
-function redirectTo(target) {
-  return Response.redirect(target, 302);
+function doRedirect(target, preferredName) {
+  const headers = new Headers();
+  headers.set('Location', target);
+  headers.set('Cache-Control', 'no-store');
+
+  if (preferredName) {
+    headers.set(
+      'Set-Cookie',
+      `${COOKIE_NAME}=${preferredName}; Path=/; Max-Age=${COOKIE_MAX_AGE}; SameSite=Lax`
+    );
+  }
+
+  return new Response(null, {
+    status: 302,
+    headers,
+  });
 }
 
 /**
- * 所有域名都挂了时显示的降级页面
+ * 降级页面 / 错误页面
  */
-function renderFallbackPage(results) {
-  const rows = results
-    .map(
-      (r) => `
+function renderFallbackPage(results, error) {
+  let rows = '';
+  if (results && results.length > 0) {
+    rows = results
+      .map(
+        (r) => `
     <tr>
       <td>${r.protocol}://${r.name}</td>
-      <td style="color:${r.ok ? 'green' : 'red'}">
-        ${r.ok ? '✅ 正常' : '❌ 不可达'}
-      </td>
-      <td><a href="${r.protocol}://${r.name}" target="_blank">手动访问</a></td>
+      <td style="color:${r.ok ? 'green' : 'red'}">${r.ok ? '✅ 正常' : '❌ 不可达'}</td>
+      <td><a href="${r.protocol}://${r.name}" target="_blank" rel="noopener">手动访问</a></td>
     </tr>`
-    )
-    .join('');
+      )
+      .join('');
+  }
+
+  const errorHint = error
+    ? '（检测过程出现异常，请稍后重试）'
+    : '';
 
   return `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -161,57 +176,43 @@ function renderFallbackPage(results) {
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>网络规划工具 — 入口检测</title>
   <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
       font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-      max-width: 640px;
-      margin: 60px auto;
-      padding: 20px;
-      text-align: center;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
       background: #f5f5f5;
+      padding: 20px;
     }
     .card {
-      background: white;
+      background: #fff;
       border-radius: 12px;
       padding: 40px 32px;
       box-shadow: 0 2px 8px rgba(0,0,0,0.08);
-    }
-    h1 { font-size: 22px; margin: 0 0 8px; }
-    p { color: #666; font-size: 14px; }
-    table {
+      max-width: 520px;
       width: 100%;
-      margin: 24px 0;
-      border-collapse: collapse;
-      text-align: left;
-      font-size: 14px;
+      text-align: center;
     }
+    h1 { font-size: 22px; margin-bottom: 8px; }
+    p.sub { color: #666; font-size: 14px; margin-bottom: 24px; }
+    table { width: 100%; border-collapse: collapse; font-size: 14px; text-align: left; }
     th, td { padding: 10px 12px; border-bottom: 1px solid #eee; }
     th { font-weight: 600; color: #333; }
-    .retry-msg { font-size: 13px; color: #999; margin-top: 16px; }
-    .retry-msg a { color: #1a73e8; text-decoration: none; }
+    .retry { margin-top: 20px; font-size: 13px; color: #999; }
+    .retry a { color: #1a73e8; text-decoration: none; }
+    .error-hint { color: #999; font-size: 12px; margin-top: 8px; }
   </style>
 </head>
 <body>
   <div class="card">
     <h1>⚠️ 服务暂时不可用</h1>
-    <p>所有后端服务均无法连接，请稍后再试</p>
-
-    <table>
-      <thead>
-        <tr><th>域名</th><th>状态</th><th></th></tr>
-      </thead>
-      <tbody>
-        ${rows}
-      </tbody>
-    </table>
-
-    <div class="retry-msg">
-      5 秒后将自动重试 · <a href="javascript:location.reload()">立即重试</a>
-    </div>
+    <p class="sub">所有后端服务均无法连接${errorHint}，请稍后再试</p>
+    ${rows ? `<table><thead><tr><th>域名</th><th>状态</th><th></th></tr></thead><tbody>${rows}</tbody></table>` : ''}
+    <div class="retry">5 秒后将自动重试 · <a href="javascript:location.reload()">立即重试</a></div>
   </div>
-
-  <script>
-    setTimeout(() => location.reload(), 5000);
-  </script>
+  <script>setTimeout(() => location.reload(), 5000);</script>
 </body>
 </html>`;
 }

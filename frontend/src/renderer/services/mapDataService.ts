@@ -18,6 +18,15 @@ import { indexedDBService } from './indexedDBService'
 const CACHE_KEY = 'map_data_cache'
 const CACHE_TTL = 24 * 60 * 60 * 1000 // 24小时缓存（持久化，仅在数据更新时失效）
 
+// 数据版本键名 — 应用结果后递增版本号，地图强制重新加载
+const DATA_VERSION_KEY = 'map_data_version'
+function getDataVersion(): number {
+  try { return Number(sessionStorage.getItem(DATA_VERSION_KEY)) || 0 } catch { return 0 }
+}
+function bumpDataVersion(): void {
+  try { sessionStorage.setItem(DATA_VERSION_KEY, String(Date.now())) } catch { /* noop */ }
+}
+
 /**
  * 扇区数据接口
  */
@@ -97,6 +106,7 @@ export interface ValidationResult {
 export class MapDataService {
   private cachedData: MapDataResponse | null = null
   private cacheExpiry: number = 0
+  private _cacheVersion: number = 0 // 配合 sessionStorage 数据版本，版本号变更时强制重新加载
   private readonly CACHE_DURATION = 60 * 60 * 1000 // 1小时缓存（持久化，仅在数据更新时失效）
 
   /**
@@ -392,6 +402,13 @@ export class MapDataService {
    * 优先从 IndexedDB 读取，未命中则从后端获取
    */
   async getMapData(zoom?: number, forceRefresh = false): Promise<MapDataResponse> {
+    // 数据版本检查：如果 sessionStorage 记录了更新版本，强制刷新
+    const latestVersion = getDataVersion()
+    if (!forceRefresh && latestVersion > this._cacheVersion) {
+      console.log('[MapDataService] 检测到数据版本已更新，强制刷新')
+      forceRefresh = true
+    }
+
     // 检查内存缓存
     if (!forceRefresh && this.cachedData && Date.now() < this.cacheExpiry) {
       console.log('[MapDataService] 使用内存缓存')
@@ -407,6 +424,7 @@ export class MapDataService {
           // 同步到内存缓存
           this.cachedData = cachedData
           this.cacheExpiry = Date.now() + this.CACHE_DURATION
+          this._cacheVersion = getDataVersion()
           return cachedData
         }
       } catch (error) {
@@ -451,6 +469,7 @@ export class MapDataService {
       // 缓存到内存
       this.cachedData = result
       this.cacheExpiry = Date.now() + this.CACHE_DURATION
+      this._cacheVersion = getDataVersion()
 
       // 缓存到 IndexedDB
       try {
@@ -508,6 +527,7 @@ export class MapDataService {
 
 // 单例导出
 export const mapDataService = new MapDataService()
+export { bumpDataVersion }
 
 // ============================================================
 // 轻量级小区列表服务（独立于地图数据，用于小区选择表格）
@@ -519,16 +539,21 @@ export interface CellListItem {
   name: string
   siteId: string
   networkType: 'LTE' | 'NR'
+  frequency?: number
+  pci?: number
 }
 
 /** 小区列表响应 */
 interface CellListResponse {
   lte: CellListItem[]
   nr: CellListItem[]
+  cacheVersion?: number
 }
 
 const _CELL_LIST_CACHE_KEY = 'cell_list_cache'
 const _CELL_LIST_CACHE_TTL = 24 * 60 * 60 * 1000 // 24小时缓存
+/** 缓存版本，递增以强制刷新缓存（接口数据格式变更时） */
+const _CELL_LIST_CACHE_VERSION = 2
 
 // 内存缓存（持久化，仅在数据更新时失效）
 let _cellListCache: { data: CellListResponse | null; time: number } = {
@@ -550,13 +575,18 @@ export async function getCellList(): Promise<CellListResponse> {
     return _cellListCache.data
   }
 
-  // 2. 检查 IndexedDB 缓存
+  // 2. 检查 IndexedDB 缓存（仅版本匹配时使用）
   try {
     const cached = await indexedDBService.get<CellListResponse>(_CELL_LIST_CACHE_KEY)
-    if (cached) {
+    if (cached && cached.cacheVersion === _CELL_LIST_CACHE_VERSION) {
       console.log('[CellList] 使用 IndexedDB 缓存')
       _cellListCache = { data: cached, time: Date.now() }
       return cached
+    }
+    // 版本不匹配时清除旧缓存
+    if (cached && cached.cacheVersion !== _CELL_LIST_CACHE_VERSION) {
+      console.log('[CellList] 缓存版本不匹配，清除旧缓存')
+      indexedDBService.delete(_CELL_LIST_CACHE_KEY).catch(() => {})
     }
   } catch (err) {
     // IndexedDB 读取失败，回退到网络请求
@@ -583,7 +613,8 @@ export async function getCellList(): Promise<CellListResponse> {
 
     const data: CellListResponse = {
       lte: dedupLte,
-      nr: dedupNr
+      nr: dedupNr,
+      cacheVersion: _CELL_LIST_CACHE_VERSION
     }
 
     // 写入双缓存

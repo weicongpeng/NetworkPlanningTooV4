@@ -102,6 +102,9 @@ interface TaskState {
   // 从后端同步历史任务到本地 store
   syncHistoryFromBackend: (type: TaskType) => Promise<void>
 
+  // 标记任务为已应用（本地状态同步，不依赖后端刷新）
+  markTaskApplied: (taskId: string) => void
+
   // 删除历史任务（后端 + 本地）
   deleteHistoryTask: (taskId: string, type: TaskType) => Promise<boolean>
 
@@ -271,7 +274,14 @@ export const useTaskStore = create<TaskState>()(
         set(state => {
           const newTasks = { ...state.tasks }
           delete newTasks[id]
-          return { tasks: newTasks }
+          // WebSocket 删除事件也需清除 activeTaskIds 中的引用
+          const newActiveTaskIds = { ...state.activeTaskIds }
+          for (const [type, activeId] of Object.entries(state.activeTaskIds)) {
+            if (activeId === id) {
+              newActiveTaskIds[type as TaskType] = null
+            }
+          }
+          return { tasks: newTasks, activeTaskIds: newActiveTaskIds }
         })
       },
 
@@ -415,6 +425,22 @@ export const useTaskStore = create<TaskState>()(
         }
       },
 
+      markTaskApplied: (taskId) => {
+        set(state => {
+          const task = state.tasks[taskId]
+          if (!task) {
+            console.warn(`[taskStore] 标记已应用失败：任务 ${taskId.slice(0, 8)}... 不存在`)
+            return state
+          }
+          return {
+            tasks: {
+              ...state.tasks,
+              [taskId]: { ...task, isApplied: true }
+            }
+          }
+        })
+      },
+
       deleteHistoryTask: async (taskId, type) => {
         try {
           let response: any
@@ -440,7 +466,13 @@ export const useTaskStore = create<TaskState>()(
             set(state => {
               const newTasks = { ...state.tasks }
               delete newTasks[taskId]
-              return { tasks: newTasks }
+              // 删除任务时同步清除 activeTaskIds 中的引用，
+              // 避免 GlobalTaskIndicator 显示已删除任务的进度通知
+              const newActiveTaskIds = { ...state.activeTaskIds }
+              if (state.activeTaskIds[type] === taskId) {
+                newActiveTaskIds[type] = null
+              }
+              return { tasks: newTasks, activeTaskIds: newActiveTaskIds }
             })
             return true
           }

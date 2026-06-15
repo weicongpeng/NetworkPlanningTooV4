@@ -1559,15 +1559,12 @@ class TaskManager:
             logger.error(f"[TaskManager] PCI应用到工参任务失败: {task.task_id}, error: {e}", exc_info=True)
 
     def _apply_pci_fast_sqlite_only(self, planning_result: Dict, progress_holder: list, _logger: logging.Logger) -> Dict:
-        """Phase 1: SQLite-only fast path for PCI apply. No Excel I/O."""
-        import json
-        import os
-        import uuid
-        import re
+        """Phase 1: Direct SQL UPDATE on Sector rows (optimized, no full copy)."""
         from datetime import datetime
-        from pathlib import Path
+        from app.core.database import SessionLocal
+        from app.models.database import Sector, Site, Workbook
 
-        _logger.info(f"[ApplyPCI-Phase1] 开始执行PCI应用到工参（SQLite-only快路径）")
+        _logger.info(f"[ApplyPCI-Phase1] 开始执行PCI应用到工参（直接UPDATE优化模式）")
 
         # 获取规划结果
         results = planning_result.get("results", [])
@@ -1580,11 +1577,9 @@ class TaskManager:
 
         # 找到当前的全量工参
         full_params_id = None
-        full_params_info = None
         for data_id, data_info in data_service.index.items():
             if data_info.get("fileType") == "full_params":
                 full_params_id = data_id
-                full_params_info = data_info
                 break
 
         if not full_params_id:
@@ -1593,124 +1588,111 @@ class TaskManager:
 
         progress_holder[0] = 20
 
-        # 创建PCI更新映射
+        # 构建 PCI + TAC 更新映射: {siteId: {sectorId: {pci, tac}}}
         pci_updates = {}
+        tac_updates = {}
+        has_tac = False
         for site_result in results:
             result_site_id = str(site_result.get("siteId", ""))
             sectors = site_result.get("sectors", [])
             for sector in sectors:
+                result_sector_id = str(sector.get("sectorId", ""))
+                uid = f"{result_site_id}_{result_sector_id}"
                 new_pci = sector.get("newPCI")
                 if new_pci is not None:
-                    result_sector_id = str(sector.get("sectorId", ""))
-                    unique_key = f"{result_site_id}_{result_sector_id}"
-                    pci_updates[unique_key] = new_pci
+                    pci_updates[uid] = new_pci
+                new_tac = sector.get("tac")
+                if new_tac is not None:
+                    tac_updates[uid] = str(new_tac)
+                    has_tac = True
 
-        _logger.info(f"[ApplyPCI-Phase1] 创建了 {len(pci_updates)} 个PCI更新映射")
+        _logger.info(f"[ApplyPCI-Phase1] 创建了 {len(pci_updates)} 个PCI更新映射, {len(tac_updates)} 个TAC更新映射")
 
         progress_holder[0] = 35
 
-        # ====== 核心：更新 PCI 到 SQLite（快路径，不需操作 Excel）======
-        parsed_data = {}
-        updated_count = 0
+        # ====== 核心优化：直接 UPDATE Sector 表（避免全量复制）======
+        db = SessionLocal()
         try:
-            # 优先从 SQLite 读取
-            parsed_data = data_service.get_data_from_db(full_params_id)
-            if parsed_data is None:
-                _logger.warning("[ApplyPCI-Phase1] SQLite 无数据, 回退到 data.json")
-                src_data_json = settings.DATA_DIR / full_params_id / "data.json"
-                if src_data_json.exists():
-                    with open(src_data_json, "r", encoding="utf-8") as f:
-                        parsed_data = json.load(f)
-                else:
-                    raise ValueError("SQLite 和 data.json 均无数据，无法更新")
+            # 建立 site_id → 主键 映射
+            site_pk_map = {}
+            for row in db.query(Site).filter(Site.workbook_id == full_params_id).all():
+                site_pk_map[row.site_id] = row.id
 
-            # 应用 PCI 更新到内存中的 parsed_data
-            for net_key in list(parsed_data.keys()):
-                sites = parsed_data.get(net_key, [])
-                if not isinstance(sites, list):
+            updated_pci_count = 0
+            updated_tac_count = 0
+            not_found = []
+            for site_result in results:
+                result_site_id = str(site_result.get("siteId", ""))
+                site_pk = site_pk_map.get(result_site_id)
+                if site_pk is None:
+                    _logger.warning(f"[ApplyPCI-Phase1] 未找到站点 {result_site_id}，跳过")
                     continue
-                for site in sites:
-                    sectors = site.get("sectors", [])
-                    for sector in sectors:
-                        sid = str(sector.get("siteId", ""))
-                        sec_id = str(sector.get("sectorId") or sector.get("id", ""))
-                        key = f"{sid}_{sec_id}"
-                        if key in pci_updates:
-                            sector["pci"] = pci_updates[key]
-                            updated_count += 1
 
-            _logger.info(f"[ApplyPCI-Phase1] 已更新 {updated_count} 个小区PCI")
+                sectors = site_result.get("sectors", [])
+                for sector in sectors:
+                    result_sector_id = str(sector.get("sectorId", ""))
+                    uid = f"{result_site_id}_{result_sector_id}"
 
-            # 生成带时间戳和"已更新PCI"后缀的新文件名
-            timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-            original_name = full_params_info.get("name", "ProjectParameter_mongoose.xlsx")
-            name_part, ext_part = os.path.splitext(original_name)
-            new_name = re.sub(r"_已更新PCI$", "", name_part)
-            new_name = re.sub(r"_?\d{14}$", "", new_name)
-            new_filename = f"{new_name}_{timestamp}_已更新PCI{ext_part}"
+                    # 构建更新字典
+                    update_vals = {}
+                    new_pci = sector.get("newPCI")
+                    new_tac = sector.get("tac")
 
-            # 创建新的数据ID和目录
-            new_data_id = str(uuid.uuid4())
-            new_data_dir = settings.DATA_DIR / new_data_id
-            new_data_dir.mkdir(parents=True, exist_ok=True)
+                    if new_pci is not None:
+                        update_vals["pci"] = new_pci
+                    if new_tac is not None:
+                        update_vals["tac"] = str(new_tac)
 
-            # 写入 SQLite（无须 Excel 文件存在，size 字段留空）
-            data_service._save_to_sqlite(
-                data_id=new_data_id,
-                filename=new_filename,
-                file_type="full_params",
-                user_id=full_params_info.get("user_id", 1),
-                parsed_data=parsed_data,
-                metadata={},
-                file_path=new_data_dir / "original.xlsx",
-                original_path=full_params_info.get("originalPath"),
-            )
-            _logger.info(f"[ApplyPCI-Phase1] SQLite 数据已写入: {new_data_id}")
-        except Exception as e:
-            _logger.error(f"[ApplyPCI-Phase1] PCI 更新失败: {e}")
-            raise
+                    if not update_vals:
+                        continue
 
-        progress_holder[0] = 85
+                    # UPDATE Sector 表
+                    rows = db.query(Sector).filter(
+                        Sector.workbook_id == full_params_id,
+                        Sector.site_id_fk == site_pk,
+                        Sector.sector_id.like(f"%{result_sector_id}")
+                    ).update(update_vals)
+                    if rows:
+                        if new_pci is not None:
+                            updated_pci_count += rows
+                        if new_tac is not None:
+                            updated_tac_count += rows
+                    else:
+                        not_found.append(uid)
 
-        # 更新数据索引（新条目）
-        metadata = {}
-        for net in ["LTE", "NR"]:
-            if net in parsed_data:
-                metadata[f"{net}SiteCount"] = len(parsed_data[net])
-                metadata[f"{net}SectorCount"] = sum(len(s.get("sectors", [])) for s in parsed_data[net])
+            # 更新 workbook 的 created_at 使其排在最前
+            db.query(Workbook).filter(Workbook.id == full_params_id).update({
+                "created_at": datetime.now().isoformat()
+            })
 
-        data_service.index[new_data_id] = {
-            "id": new_data_id,
-            "name": new_filename,
-            "type": "excel",
-            "fileType": "full_params",
-            "size": 0,
-            "uploadDate": datetime.now().isoformat(),
-            "status": "ready",
-            "originalPath": full_params_info.get("originalPath"),
-            "metadata": metadata,
-        }
-
-        # 标记旧的全量工参为 deprecated（不删除，Phase 2 清理）
-        if full_params_id in data_service.index:
-            old_info = data_service.index[full_params_id]
-            old_info["fileType"] = "full_params_deprecated"
-            old_info["deprecated"] = True
-            old_info["deprecatedAt"] = datetime.now().isoformat()
-            old_info["replacedBy"] = new_data_id
-            data_service._save_index()
-            _logger.info(f"[ApplyPCI-Phase1] 已标记旧工参为 deprecated: {full_params_id}")
+            db.commit()
+            _logger.info(f"[ApplyPCI-Phase1] 更新了 {updated_pci_count} 个PCI, {updated_tac_count} 个TAC")
+            if not_found:
+                _logger.warning(f"[ApplyPCI-Phase1] {len(not_found)} 个小区未匹配到: {not_found[:10]}...")
+        finally:
+            db.close()
 
         progress_holder[0] = 95
 
+        # 标记数据已被原地更新
+        if full_params_id in data_service.index:
+            data_service.index[full_params_id]['inplace_updated'] = True
+            data_service.index[full_params_id]['applied_pci'] = True
+            if has_tac and updated_tac_count > 0:
+                data_service.index[full_params_id]['applied_tac'] = True
+                _logger.info(f"[ApplyPCI-Phase1] PCI+TAC联合更新: 同时标记 applied_tac")
+            data_service.index[full_params_id]['uploadDate'] = datetime.now().isoformat()
+            data_service._save_index()
+
         return {
             "success": True,
-            "message": f"成功应用PCI规划结果到全量工参，更新了{updated_count}个小区的PCI",
-            "updatedCount": updated_count,
-            "newFileId": new_data_id,
-            "newFileName": new_filename,
+            "message": f"成功应用PCI规划结果到全量工参，更新了{updated_pci_count}个小区的PCI"
+                       + (f"，同时更新了{updated_tac_count}个小区的TAC" if updated_tac_count > 0 else ""),
+            "updatedCount": updated_pci_count + updated_tac_count,
+            "newFileId": full_params_id,
             "oldEntryId": full_params_id,
         }
+
 
     async def _apply_pci_background_excel_update(self, new_data_id: str, old_entry_id: str,
                                                    planning_result: Dict, full_params_info: Dict,
@@ -1979,68 +1961,32 @@ class TaskManager:
             logger.error(f"[TaskManager] TAC规划应用到工参任务失败: {task.task_id}, error: {e}", exc_info=True)
 
     def _sync_apply_tac_planning_fast(self, planning_result: Dict, progress_holder: list, _logger: logging.Logger) -> Dict:
-        """
-        快路径：将TAC规划结果中的TAC值更新到SQLite（在后台线程中运行）
-        """
-        import json
-        import os
-        import uuid
-        import shutil
-        import re
+        """Direct SQL UPDATE on Sector.tac (optimized, no full copy)."""
         from datetime import datetime
-        from pathlib import Path
+        from app.core.database import SessionLocal
+        from app.models.database import Sector, Site, Workbook
 
-        _logger.info(f"[SyncApplyTAC-Fast] 开始执行TAC规划应用到工参（快路径）")
+        _logger.info(f"[TA-Apply] 开始执行TAC应用到工参（直接UPDATE优化模式）")
 
-        # 获取规划结果
         results = planning_result.get("results", [])
         if not results:
             raise ValueError("TAC规划结果为空")
-        network_type = planning_result.get("networkType", "LTE")
-        _logger.info(f"[SyncApplyTAC-Fast] 规划结果包含 {len(results)} 个小区, 网络类型: {network_type}")
 
         progress_holder[0] = 15
 
         # 找到当前的全量工参
         full_params_id = None
-        full_params_info = None
         for data_id, data_info in data_service.index.items():
             if data_info.get("fileType") == "full_params":
                 full_params_id = data_id
-                full_params_info = data_info
                 break
 
         if not full_params_id:
             raise ValueError("未找到全量工参数据")
 
-        # 获取原始Excel文件路径
-        original_excel_path = settings.DATA_DIR / full_params_id / "original.xlsx"
-        if not original_excel_path.exists():
-            raise ValueError("全量工参原始Excel文件不存在")
-
         progress_holder[0] = 20
 
-        # 删除其他旧工参
-        deleted_count = 0
-        for old_id, old_info in list(data_service.index.items()):
-            if old_id != full_params_id and (old_info.get("fileType") in ("full_params", "full_params_backup")):
-                try:
-                    data_service.delete_data(old_id)
-                    deleted_count += 1
-                except Exception as e:
-                    _logger.warning(f"[SyncApplyTAC-Fast] 删除旧工参失败: {old_id}, 错误: {e}")
-
-        # 创建新的数据ID和目录
-        new_data_id = str(uuid.uuid4())
-        new_data_dir = settings.DATA_DIR / new_data_id
-        new_data_dir.mkdir(parents=True, exist_ok=True)
-
-        new_excel_path = new_data_dir / "original.xlsx"
-        shutil.copy2(original_excel_path, new_excel_path)
-
-        progress_holder[0] = 25
-
-        # 从结果中提取匹配小区并创建TAC更新映射
+        # 构建TAC更新映射
         tac_updates = {}
         for item in results:
             if not item.get("matched"):
@@ -2049,124 +1995,66 @@ class TaskManager:
             sector_id = str(item.get("sectorId", ""))
             new_tac = item.get("tac")
             if new_tac is not None and site_id and sector_id:
-                unique_key = f"{site_id}_{sector_id}"
-                tac_updates[unique_key] = new_tac
+                tac_updates[f"{site_id}_{sector_id}"] = new_tac
 
-        _logger.info(f"[SyncApplyTAC-Fast] 创建了 {len(tac_updates)} 个TAC更新映射")
+        _logger.info(f"[TA-Apply] 创建了 {len(tac_updates)} 个TAC更新映射")
 
         progress_holder[0] = 35
 
-        # 更新 SQLite
-        parsed_data = {}
-        updated_count = 0
+        # ====== 直接 UPDATE Sector 表的 tac 字段 ======
+        db = SessionLocal()
         try:
-            parsed_data = data_service.get_data_from_db(full_params_id)
-            if parsed_data is None:
-                _logger.warning("[SyncApplyTAC-Fast] SQLite 无数据, 回退到 data.json 解析")
-                src_data_json = settings.DATA_DIR / full_params_id / "data.json"
-                if src_data_json.exists():
-                    with open(src_data_json, "r", encoding="utf-8") as f:
-                        parsed_data = json.load(f)
-                else:
-                    import pandas as pd
-                    xls = pd.ExcelFile(new_excel_path, engine='calamine')
-                    for net in ["LTE", "NR"]:
-                        sheet_name = f"{net} Project Parameters"
-                        if sheet_name in xls.sheet_names:
-                            sites = data_service._parse_sheet_data(xls, sheet_name, net)
-                            parsed_data[net] = sites
+            site_pk_map = {}
+            for row in db.query(Site).filter(Site.workbook_id == full_params_id).all():
+                site_pk_map[row.site_id] = row.id
 
-            # 应用 TAC 更新
-            for net_key in list(parsed_data.keys()):
-                sites = parsed_data.get(net_key, [])
-                if not isinstance(sites, list):
+            updated_count = 0
+            for item in results:
+                if not item.get("matched"):
                     continue
-                for site in sites:
-                    sid = str(site.get("id", ""))
-                    sectors = site.get("sectors", [])
-                    for sector in sectors:
-                        sec_id = str(sector.get("id", ""))
-                        key = f"{sid}_{sec_id}"
-                        if key in tac_updates:
-                            sector["tac"] = tac_updates[key]
-                            updated_count += 1
+                site_id = str(item.get("siteId", ""))
+                sector_id = str(item.get("sectorId", ""))
+                new_tac = item.get("tac")
+                if new_tac is None:
+                    continue
 
-            _logger.info(f"[SyncApplyTAC-Fast] 已更新 {updated_count} 个小区TAC")
+                site_pk = site_pk_map.get(site_id)
+                if site_pk is None:
+                    continue
 
-            # 生成新文件名
-            timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-            original_name = full_params_info.get("name", "ProjectParameter_mongoose.xlsx")
-            name_part, ext_part = os.path.splitext(original_name)
-            new_name = re.sub(r"_已更新TAC$", "", name_part)
-            new_name = re.sub(r"_?\d{14}$", "", new_name)
-            new_filename = f"{new_name}_{timestamp}_已更新TAC{ext_part}"
+                rows = db.query(Sector).filter(
+                    Sector.workbook_id == full_params_id,
+                    Sector.site_id_fk == site_pk,
+                    Sector.sector_id.like(f"%{sector_id}")
+                ).update({"tac": new_tac})
+                updated_count += rows
 
-            # 写入 SQLite
-            data_service._save_to_sqlite(
-                data_id=new_data_id,
-                filename=new_filename,
-                file_type="full_params",
-                user_id=full_params_info.get("user_id", 1),
-                parsed_data=parsed_data,
-                metadata={},
-                file_path=new_excel_path,
-                original_path=full_params_info.get("originalPath"),
-            )
-        except Exception as e:
-            _logger.error(f"[SyncApplyTAC-Fast] TAC更新失败: {e}")
-            raise
+            db.query(Workbook).filter(Workbook.id == full_params_id).update({
+                "created_at": datetime.now().isoformat()
+            })
 
-        progress_holder[0] = 85
-
-        # 保存到原始目录
-        saved_to_original = False
-        original_path = full_params_info.get("originalPath")
-        if original_path and original_path.strip():
-            try:
-                original_file_path = os.path.abspath(original_path.strip())
-                original_dir = os.path.dirname(original_file_path)
-                if os.path.exists(original_dir):
-                    target_path = os.path.join(original_dir, new_filename)
-                    shutil.copy2(new_excel_path, target_path)
-                    if os.path.exists(target_path):
-                        saved_to_original = True
-            except Exception as e:
-                _logger.warning(f"[SyncApplyTAC-Fast] 保存到原始目录失败: {e}")
-
-        # 更新数据索引
-        metadata = {}
-        for net in ["LTE", "NR"]:
-            if net in parsed_data:
-                metadata[f"{net}SiteCount"] = len(parsed_data[net])
-                metadata[f"{net}SectorCount"] = sum(len(s.get("sectors", [])) for s in parsed_data[net])
-
-        data_service.index[new_data_id] = {
-            "id": new_data_id,
-            "name": new_filename,
-            "type": "excel",
-            "fileType": "full_params",
-            "size": new_excel_path.stat().st_size,
-            "uploadDate": datetime.now().isoformat(),
-            "status": "ready",
-            "originalPath": original_path,
-            "metadata": metadata,
-        }
-
-        # 标记旧工参为已弃用（后台Excel更新后清理）
-        if full_params_id in data_service.index:
-            data_service.index[full_params_id]["fileType"] = "full_params_deprecated" 
+            db.commit()
+            _logger.info(f"[TA-Apply] 直接更新了 {updated_count} 个小区TAC")
+        finally:
+            db.close()
 
         progress_holder[0] = 95
+
+        # 标记数据已被原地更新，导出时使用原始格式仅更新TAC值
+        if full_params_id in data_service.index:
+            data_service.index[full_params_id]['inplace_updated'] = True
+            data_service.index[full_params_id]['applied_tac'] = True
+            data_service.index[full_params_id]['uploadDate'] = datetime.now().isoformat()
+            data_service._save_index()
 
         return {
             "success": True,
             "message": f"成功应用TAC规划结果到全量工参，更新了{updated_count}个小区的TAC",
             "updatedCount": updated_count,
-            "newFileId": new_data_id,
-            "newFileName": new_filename,
-            "savedToOriginal": saved_to_original,
-            
+            "newFileId": full_params_id,
+            "oldEntryId": full_params_id,
         }
+
 
     def _sync_update_excel_tac_background(self, new_data_id: str, planning_result: Dict, full_params_info: Dict, _logger: logging.Logger) -> None:
         """

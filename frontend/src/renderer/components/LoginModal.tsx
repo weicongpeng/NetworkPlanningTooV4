@@ -75,7 +75,6 @@ export function LoginModal({ isOpen, forceChangePassword = false, onClose }: Log
     setWarning('')
     setCity('')
     setOperator('')
-    setEquipmentVendor('')
     setMode(mode === 'login' ? 'register' : 'login')
   }
 

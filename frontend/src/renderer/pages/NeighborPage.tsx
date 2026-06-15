@@ -135,6 +135,8 @@ export function NeighborPage() {
     noCellsSelected: t('neighbor.noCellsSelected') || '请在小区选择列表中至少选择一个小区后再执行邻区规划',
     noCellIdsExtracted: t('neighbor.noCellIdsExtracted') || '未能从文件中提取到小区ID，请检查文件格式',
     noMatchingCells: t('neighbor.noMatchingCells') || '未匹配到任何小区，请检查文件内容与当前工参数据是否一致',
+    cellFreq: t('neighbor.cellFreq') || '频点',
+    cellPci: t('neighbor.cellPci') || 'PCI',
     // 工具提示
     distanceFactorTooltip: t('neighbor.distanceFactorTooltip') || '覆盖圆距离系数：站点到覆盖圆心的距离系数，默认5/9(≈0.556)',
     radiusFactorTooltip: t('neighbor.radiusFactorTooltip') || '覆盖圆半径系数：覆盖半径系数，默认5/9(≈0.556)',
@@ -1232,7 +1234,7 @@ export function NeighborPage() {
 
   return (
     <div className="h-full flex flex-col p-4 min-h-0">
-      <h1 className="text-3xl font-bold mb-6 shrink-0">{i18n.title}</h1>
+      <h1 className="text-base font-bold mb-6 shrink-0">{i18n.title}</h1>
 
       {/* 错误提示 */}
       {error && (
@@ -1403,7 +1405,7 @@ export function NeighborPage() {
                         onDownloadCellTemplate={wizardStep === 'cells_selected' ? handleDownloadCellTemplate : undefined}
                         uploading={cellFileUploading}
                         disabled={wizardStep !== 'cells_selected' || isRunning}
-                        columnLabels={{ siteId: i18n.sourceSiteId, cellId: i18n.sourceCellId, cellName: i18n.sourceCellName, selectAll: i18n.selectAll, clearSelections: i18n.clearSelections, uploadCellFile: i18n.uploadCellFile, downloadCellTemplate: i18n.downloadCellTemplate }}
+                        columnLabels={{ siteId: i18n.sourceSiteId, cellId: i18n.sourceCellId, cellName: i18n.sourceCellName, cellFreq: i18n.cellFreq, cellPci: i18n.cellPci, selectAll: i18n.selectAll, clearSelections: i18n.clearSelections, uploadCellFile: i18n.uploadCellFile, downloadCellTemplate: i18n.downloadCellTemplate }}
                       />
                     </div>
                   </div>

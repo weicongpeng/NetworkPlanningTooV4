@@ -45,7 +45,7 @@ async def import_points(request: ImportPointsRequest) -> Dict[str, Any]:
 
 @router.get("/{data_id}/download")
 async def download_file(data_id: str):
-    """下载原始文件"""
+    """下载文件（原地更新后返回原始格式的 Excel，仅更新 PCI/TAC 值）"""
     try:
         data_dir = settings.DATA_DIR / data_id
 
@@ -104,6 +104,133 @@ async def download_file(data_id: str):
             filename = stored_name
         else:
             filename = default_name
+
+        # ===== 原地更新后的处理：保持原始格式，只更新 PCI/TAC 值，添加后缀 =====
+        if data_id in data_service.index and data_service.index[data_id].get('inplace_updated'):
+            info = data_service.index[data_id]
+            # 构建后缀
+            suffixes = []
+            if info.get('applied_pci'):
+                suffixes.append("PCI已更新")
+            if info.get('applied_tac'):
+                suffixes.append("TAC已更新")
+
+            # 尝试从 SQLite 同步更新 Excel 中的 PCI/TAC 值（安全兜底）
+            if suffixes and file_path.suffix.lower() in ('.xlsx', '.xls') and file_path.exists():
+                try:
+                    import openpyxl
+                    from app.core.database import SessionLocal
+                    from app.models.database import Sector, Site
+
+                    wb = openpyxl.load_workbook(file_path)
+                    db = SessionLocal()
+                    try:
+                        # 读取 SQLite 中该工参的所有 PCI/TAC 值
+                        sites = db.query(Site).filter(Site.workbook_id == data_id).all()
+                        site_pk_map = {s.id: s.site_id for s in sites}
+
+                        updates = {}  # { "siteId_sectorId": {"pci": ..., "tac": ...} }
+                        for spk, sid in site_pk_map.items():
+                            sectors = db.query(Sector).filter(
+                                Sector.workbook_id == data_id,
+                                Sector.site_id_fk == spk
+                            ).all()
+                            for sec in sectors:
+                                key = f"{sid}_{sec.sector_id}"
+                                updates[key] = {"pci": sec.pci, "tac": sec.tac}
+                    finally:
+                        db.close()
+
+                    print(f"[Download] SQLite 中共读取 {len(updates)} 个小区数据用于同步")
+
+                    excel_updated = 0
+                    for sheet_name in wb.sheetnames:
+                        ws = wb[sheet_name]
+                        if ws.max_row < 2:
+                            continue
+                        # 读取第一行作为表头
+                        headers = [str(c.value or "").strip() for c in ws[1]]
+
+                        # 查找列索引（兼容中英文列名）
+                        site_id_col = sector_id_col = pci_col = tac_col = None
+                        for i, h in enumerate(headers):
+                            hl = h.lower()
+                            # 站点ID列（必须包含"标识/ID"语义，排除名称/经度/纬度等列）
+                            if site_id_col is None and any(kw in hl for kw in
+                                ["enodeb标识", "enodeb id", "gnodeb标识", "gnodeb id",
+                                 "enb id", "gnb id", "site_id", "siteid",
+                                 "基站id", "基站标识"]):
+                                site_id_col = i
+                            # 小区ID列（排除名称/name相关列）
+                            if sector_id_col is None and any(kw in hl for kw in
+                                ["celllocalid", "sectorid", "localcellid", "sector_id",
+                                 "小区标识", "小区id"]):
+                                if not any(x in hl for x in ["名称", "name"]):
+                                    sector_id_col = i
+                            # PCI 列（子串匹配，兼容多行表头如 "物理小区识别码\nPCI\nlong:[0..503]"）
+                            if pci_col is None and any(kw in hl for kw in
+                                ("pci", "物理小区识别码", "物理小区id", "physicalcellid")):
+                                pci_col = i
+                            # TAC 列（子串匹配，兼容多行表头和 NR "跟踪区码" 不带TAC英文的情况）
+                            if tac_col is None and any(kw in hl for kw in
+                                ("tac", "跟踪区码", "跟踪区域码", "trackingareacode")):
+                                tac_col = i
+
+                        if site_id_col is None or sector_id_col is None:
+                            print(f"[Download] 工作表 '{sheet_name}' 未找到必要列: siteId={site_id_col}, sectorId={sector_id_col}，跳过")
+                            continue
+
+                        sheet_updated = 0
+                        # 逐行更新 PCI/TAC
+                        for row in ws.iter_rows(min_row=2, values_only=False):
+                            site_id_val = str(row[site_id_col].value or "").strip()
+                            sector_id_val = str(row[sector_id_col].value or "").strip()
+                            if "." in sector_id_val:
+                                try:
+                                    sector_id_val = str(int(float(sector_id_val)))
+                                except ValueError:
+                                    pass
+
+                            key = f"{site_id_val}_{sector_id_val}"
+                            if key in updates:
+                                u = updates[key]
+                                if pci_col is not None and u.get("pci") is not None:
+                                    try:
+                                        current_val = row[pci_col].value
+                                        if current_val != u["pci"]:
+                                            row[pci_col].value = u["pci"]
+                                            sheet_updated += 1
+                                    except:
+                                        pass
+                                if tac_col is not None and u.get("tac") is not None:
+                                    try:
+                                        current_val = row[tac_col].value
+                                        if current_val != u["tac"]:
+                                            row[tac_col].value = u["tac"]
+                                            sheet_updated += 1
+                                    except:
+                                        pass
+
+                        print(f"[Download] 工作表 '{sheet_name}': 更新了 {sheet_updated} 个单元格")
+                        excel_updated += sheet_updated
+
+                    if excel_updated > 0:
+                        wb.save(file_path)
+                        print(f"[Download] 已从 SQLite 同步更新 Excel，共 {excel_updated} 处变更: {data_id}")
+                    else:
+                        print(f"[Download] Excel 数据已与 SQLite 一致，无需更新: {data_id}")
+                    wb.close()
+                except Exception as e:
+                    import traceback
+                    print(f"[Download] 同步更新 Excel 失败（非致命，使用原文件）: {e}")
+                    traceback.print_exc()
+
+            # 始终添加后缀到下载文件名（与 Excel 同步成功与否无关）
+            if suffixes:
+                name_part, ext_part = os.path.splitext(filename)
+                import re as _re
+                clean_name = _re.sub(r"_(PCI已更新|TAC已更新)+$", "", name_part)
+                filename = f"{clean_name}_{'_'.join(suffixes)}{ext_part}"
 
         # 处理中文文件名编码 (RFC 5987)
         import urllib.parse

@@ -73,6 +73,14 @@
   background: #f0f2f5;
 }
 
+/* 手形拖拽工具激活 - 使用 !important 覆盖 Leaflet 内部光标管理 */
+.leaflet-container.map-drag-active {
+  cursor: grab !important;
+}
+.leaflet-container.map-drag-active.leaflet-dragging {
+  cursor: grabbing !important;
+}
+
 /* 瓦片缩放渲染优化 - 防止 zoom 过程中出现黑色块状拖影 */
 .leaflet-tile {
   image-rendering: auto;

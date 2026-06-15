@@ -420,20 +420,29 @@ export function MapPage() {
   const [mapDragTool, setMapDragTool] = useState(false)
 
   /**
-   * 获取当前可见图层数量
+   * 获取当前可见图层所属的类型集合
+   * 圈选时只能对同一类型的图层操作，不能跨类型
+   * 4 种类型：基站(扇区)、图层文件(MapInfo)、地理化数据(Excel)、装饰图层
    */
-  const getVisibleLayerCount = useCallback(() => {
-    let count = 0
-    // 扇区图层
-    if (layers.find(l => l.id === 'lte-sectors')?.visible) count++
-    if (layers.find(l => l.id === 'nr-sectors')?.visible) count++
-    // 图层文件
-    count += layerFiles.filter(lf => lf.visible).length
-    // 点文件/地理化数据
-    count += pointFiles.filter(pf => pf.visible).length
+  const getVisibleLayerCategories = useCallback((): string[] => {
+    const categories: string[] = []
+    // 基站（扇区图层）
+    if (layers.find(l => l.id === 'lte-sectors')?.visible || layers.find(l => l.id === 'nr-sectors')?.visible) {
+      categories.push('sector')
+    }
+    // 图层文件（MapInfo）
+    if (layerFiles.filter(lf => lf.visible).length > 0) {
+      categories.push('mapinfo')
+    }
+    // 地理化数据（Excel点文件/扇区/多边形）
+    if (pointFiles.filter(pf => pf.visible).length > 0) {
+      categories.push('geo')
+    }
     // 装饰图层
-    if (decorationLayer.visible) count++
-    return count
+    if (decorationLayer.visible) {
+      categories.push('decoration')
+    }
+    return categories
   }, [layers, layerFiles, pointFiles, decorationLayer.visible])
 
   /**
@@ -447,17 +456,24 @@ export function MapPage() {
       return
     }
 
-    const visibleCount = getVisibleLayerCount()
+    const visibleCategories = getVisibleLayerCategories()
 
     // 圆形和多边形框选需要检查可见图层
-    if (mode === 'circle' || mode === 'polygon') {
-      if (visibleCount === 0) {
+    if (mode === 'point' || mode === 'circle' || mode === 'polygon') {
+      if (visibleCategories.length === 0) {
         alert(t('map.enableLayerFirst') || '请先在图层控制面板开启需要圈选的图层')
         return
       }
 
-      if (visibleCount > 1) {
-        alert(t('map.onlyOneLayerAtATime') || '当前显示图层多于1个，请先在图层控制面板关闭冗余图层，确保只显示一个目标图层再进行圈选')
+      if (visibleCategories.length > 1) {
+        const categoryNames: Record<string, string> = {
+          sector: t('map.categorySector') || '基站(扇区)',
+          mapinfo: t('map.categoryMapInfo') || '图层文件',
+          geo: t('map.categoryGeo') || '地理化数据',
+          decoration: t('map.categoryDecoration') || '装饰图层'
+        }
+        const visibleNames = visibleCategories.map(c => categoryNames[c] || c).join('、')
+        alert(`${t('map.crossCategoryNotAllowed') || '圈选不能跨类型操作'}：${visibleNames}。${t('map.onlyOneCategoryAtATime') || '请先关闭其他类型的图层，只保留一个类型的图层可见'}`)
         return
       }
     }
@@ -487,9 +503,7 @@ export function MapPage() {
       setCaptureMode(false)
       setCaptureCoord(null)
       setSelectionMode('none')
-      if (onlineMapRef.current) {
-        onlineMapRef.current.clearSelectionHighlight()
-      }
+      // 注意：不调用 clearSelectionHighlight()，拖拽工具仅负责地图拖拽，不影响已绘制的框选图形和选中高亮
     }
   }
   const [totalDistance, setTotalDistance] = useState<number | null>(null)

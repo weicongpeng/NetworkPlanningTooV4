@@ -124,14 +124,14 @@ export function LicensePage() {
 
   return (
     <div className="p-6">
-      <h1 className="text-2xl font-bold mb-6">{t('license.title')}</h1>
+      <h1 className="text-base font-bold mb-6">{t('license.title')}</h1>
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 max-w-5xl">
         {/* 语言设置 */}
         <div className="bg-card p-5 rounded-lg border border-border">
           <div className="flex items-center gap-2 mb-4">
             <Globe size={20} className="text-primary" />
-            <h2 className="text-lg font-semibold">{t('language.title')}</h2>
+            <h2 className="text-base font-semibold">{t('language.title')}</h2>
           </div>
 
           <div className="space-y-3">
@@ -166,7 +166,7 @@ export function LicensePage() {
           <div className="flex items-center justify-between mb-4">
             <div className="flex items-center gap-2">
               <Key size={20} className="text-primary" />
-              <h2 className="text-lg font-semibold">
+              <h2 className="text-base font-semibold">
                 {isAdmin ? t('license.adminTitle') : t('license.userTitle')}
               </h2>
             </div>
@@ -301,7 +301,7 @@ export function LicensePage() {
         <div className="bg-card p-5 rounded-lg border border-border">
           <div className="flex items-center gap-2 mb-4">
             <Palette size={20} className="text-primary" />
-            <h2 className="text-lg font-semibold">{t('theme.title')}</h2>
+            <h2 className="text-base font-semibold">{t('theme.title')}</h2>
           </div>
 
           <div className="space-y-4">

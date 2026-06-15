@@ -2081,6 +2081,24 @@ class DataService:
                     safe_print(f"[DataService] 文件类型: {file_type}")
 
                     if file_type in ["full_params", "target_cells"]:
+                        # 新工参上传时，清除所有已有的应用标记（数据已替换，旧的已应用状态失效）
+                        if file_type == "full_params":
+                            try:
+                                from app.core.database import SessionLocal
+                                from app.models.database import TaskResult
+                                _db_reset = SessionLocal()
+                                try:
+                                    _count = _db_reset.query(TaskResult).filter(
+                                        TaskResult.is_applied == 1
+                                    ).update({"is_applied": 0})
+                                    _db_reset.commit()
+                                    if _count > 0:
+                                        safe_print(f"[DataService] 新工参上传，重置了 {_count} 个任务的已应用标记")
+                                finally:
+                                    _db_reset.close()
+                            except Exception as _reset_err:
+                                safe_print(f"[DataService] 重置已应用标记失败（非致命）: {_reset_err}")
+
                         files_to_delete = []
                         for existing_id, existing_data in self.index.items():
                             if existing_data.get("fileType") == file_type and existing_id != data_id:
@@ -4016,6 +4034,19 @@ class DataService:
                     data_copy["size"] = 0
                 if "uploadDate" not in data_copy:
                     data_copy["uploadDate"] = datetime.now().isoformat()
+                # 如果数据已被应用 PCI/TAC，在文件名后添加后缀（保持原始格式）
+                if data_copy.get("inplace_updated"):
+                    suffixes = []
+                    if data_copy.get("applied_pci"):
+                        suffixes.append("PCI已更新")
+                    if data_copy.get("applied_tac"):
+                        suffixes.append("TAC已更新")
+                    if suffixes:
+                        import re as _re
+                        name = data_copy.get("name", "")
+                        name_part, ext_part = os.path.splitext(name) if "." in name else (name, "")
+                        clean_name = _re.sub(r"_(PCI已更新|TAC已更新)+$", "", name_part)
+                        data_copy["name"] = f"{clean_name}_{'_'.join(suffixes)}{ext_part}"
                 # 创建DataItem实例
                 item = DataItem(**data_copy)
                 items.append(item)

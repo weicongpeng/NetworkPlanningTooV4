@@ -6,7 +6,7 @@ import { useTaskStore, type Task } from '../store/taskStore'
 import { useAuthStore } from '../store/authStore'
 import { btn } from '../utils/buttonStyles'
 import type { RenderSectorData, CellListItem } from '../services/mapDataService'
-import { mapDataService, getCellList, clearCellListCache } from '../services/mapDataService'
+import { mapDataService, getCellList, clearCellListCache, bumpDataVersion } from '../services/mapDataService'
 import { useTranslation } from 'react-i18next'
 import { CellSelectionTable } from '../components/CellSelectionTable'
 import { HistoryTable } from '../components/HistoryTable'
@@ -115,6 +115,12 @@ export function TACPlanningPage() {
             })
           if (tacPlanTasks.length > 0) {
             const latest = tacPlanTasks[0]
+            // 恢复应用状态（跨页面同步）
+            if (latest.isApplied) {
+              setApplySuccess(true)
+            } else {
+              setApplySuccess(false)
+            }
             // 如果缺少完整 results（来自 resultSummary），尝试从 API 重新获取
             if (latest.result && !latest.result.results && latest.id) {
               try {
@@ -169,7 +175,7 @@ export function TACPlanningPage() {
             throw new Error(progress?.data?.error || '应用失败')
           }
         } catch (pollErr: any) {
-          if (pollErr?.response?.status === 404) continue
+          if (pollErr?.code === 404) continue
           throw pollErr
         }
       }
@@ -192,13 +198,16 @@ export function TACPlanningPage() {
         }
 
         if (updatedCount !== undefined) {
-          // 标记任务为已应用
-          tacPlanningApi.markApplied(task.id).catch(e =>
+          // 标记任务为已应用（等待完成后 HistoryTable 才会 syncHistoryFromBackend）
+          try {
+            await tacPlanningApi.markApplied(task.id)
+          } catch (e: any) {
             console.warn('[TACPlanningPage] 标记已应用失败:', e?.message)
-          )
-          mapDataService.clearCache().catch(e =>
-            console.warn('[TACPlanningPage] 清理地图缓存失败:', e?.message)
-          )
+          }
+          useTaskStore.getState().markTaskApplied(task.id)
+          await mapDataService.clearCache()
+          bumpDataVersion()
+          // 刷新地图扇区数据
           setApplySuccess(true)
           triggerDataRefresh()
           return true
@@ -458,6 +467,15 @@ export function TACPlanningPage() {
     // 从历史任务查看 - 跳转到结果页
     const handleViewTask = async (task: any) => {
         try {
+            // 从 taskStore 或后端恢复应用状态（跨页面同步）
+            const storeTask = useTaskStore.getState().tasks[task.id]
+            const isApplied = storeTask?.isApplied || task?.isApplied || false
+            if (isApplied) {
+                setApplySuccess(true)
+            } else {
+                setApplySuccess(false)
+            }
+
             const response = await tacPlanningApi.getResult(task.id)
             if (response?.success && response?.data) {
                 const resultData = response.data as TACResultData
@@ -740,7 +758,7 @@ export function TACPlanningPage() {
 
     return (
         <div className="h-full flex flex-col p-4 min-h-0">
-            <h1 className="text-xl font-bold mb-4 shrink-0">{t('tacPlanning.title') || 'TAC规划'}</h1>
+            <h1 className="text-base font-bold mb-4 shrink-0">{t('tacPlanning.title') || 'TAC规划'}</h1>
 
             {error && (
                 <div className="mb-3 p-2.5 bg-red-500/10 border border-red-500/20 rounded-lg flex items-start gap-2 shrink-0">
@@ -869,7 +887,7 @@ export function TACPlanningPage() {
                                         onDownloadCellTemplate={wizardStep === 'cells_selected' ? handleDownloadCellTemplate : undefined}
                                         uploading={cellFileUploading}
                                         disabled={wizardStep !== 'cells_selected' || isRunning}
-                                        columnLabels={{ siteId: t('tacPlanning.siteId') || '基站ID', cellId: t('tacPlanning.cellId') || '小区ID', cellName: t('tacPlanning.cellName') || '小区名称', selectAll: t('tacPlanning.selectAll') || '全选', clearSelections: t('tacPlanning.clearSelections') || '清空选择', uploadCellFile: t('tacPlanning.uploadCellFile') || '上传待规划小区文件', downloadCellTemplate: t('tacPlanning.downloadCellTemplate') || '下载待规划小区模板' }}
+                                        columnLabels={{ siteId: t('tacPlanning.siteId') || '基站ID', cellId: t('tacPlanning.cellId') || '小区ID', cellName: t('tacPlanning.cellName') || '小区名称', cellFreq: t('tacPlanning.cellFreq') || '频点', cellPci: t('tacPlanning.cellPci') || 'PCI', selectAll: t('tacPlanning.selectAll') || '全选', clearSelections: t('tacPlanning.clearSelections') || '清空选择', uploadCellFile: t('tacPlanning.uploadCellFile') || '上传待规划小区文件', downloadCellTemplate: t('tacPlanning.downloadCellTemplate') || '下载待规划小区模板' }}
                                     />
                                 </div>
                             </div>
@@ -991,28 +1009,48 @@ export function TACPlanningPage() {
                                                             if (!atId) throw new Error('应用失败')
                                                             // Phase 1 可能已内联返回
                                                             if (response?.data?.result?.updatedCount !== undefined) {
+                                                                await mapDataService.clearCache()
+                                                                bumpDataVersion()
+                                                                try {
+                                                                    await tacPlanningApi.markApplied(applyTaskId)
+                                                                } catch (e: any) {
+                                                                    console.warn('[TACPlanningPage] 标记已应用失败:', e?.message)
+                                                                }
+                                                                useTaskStore.getState().markTaskApplied(applyTaskId)
+                                                                // 刷新历史列表以同步所有页面的应用状态
+                                                                syncHistoryFromBackend('tac_planning').catch(e =>
+                                                                    console.warn('[TACPlanningPage] 同步历史失败:', e?.message)
+                                                                )
                                                                 setApplySuccess(true)
                                                                 triggerDataRefresh()
-                                                                setTimeout(() => setApplySuccess(false), 5000)
                                                             } else {
-                                                                // 短轮询进度（避免 getApplyResult 返回 404）
+                                                                // 短轮询进度
                                                                 const startTime = Date.now()
-                                                                const timeout = 30000
+                                                                const timeout = 60000
                                                                 while (Date.now() - startTime < timeout) {
                                                                     await new Promise(r => setTimeout(r, 1000))
                                                                     try {
                                                                         const progress = await tacPlanningApi.getApplyProgress(atId)
                                                                         if (progress?.data?.status === 'completed') {
+                                                                            await mapDataService.clearCache()
+                                                                            bumpDataVersion()
+                                                                            tacPlanningApi.markApplied(applyTaskId).catch(e =>
+                                                                                console.warn('[TACPlanningPage] 标记已应用失败:', e?.message)
+                                                                            )
+                                                                            useTaskStore.getState().markTaskApplied(applyTaskId)
+                                                                            // 刷新历史列表以同步所有页面的应用状态
+                                                                            syncHistoryFromBackend('tac_planning').catch(e =>
+                                                                                console.warn('[TACPlanningPage] 同步历史失败:', e?.message)
+                                                                            )
                                                                             setApplySuccess(true)
                                                                             triggerDataRefresh()
-                                                                            setTimeout(() => setApplySuccess(false), 5000)
                                                                             break
                                                                         }
                                                                         if (progress?.data?.status === 'failed') {
                                                                             throw new Error(progress?.data?.error || '应用失败')
                                                                         }
                                                                     } catch (pollErr: any) {
-                                                                        if (pollErr?.response?.status === 404) continue
+                                                                        if (pollErr?.code === 404) continue
                                                                         throw pollErr
                                                                     }
                                                                 }

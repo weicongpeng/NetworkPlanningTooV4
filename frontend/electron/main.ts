@@ -46,6 +46,9 @@ try {
   devLog('app.isPackaged: not available')
 }
 
+// 应用图标路径
+const appIconPath = path.join(__dirname, '../public/app-icon.png')
+
 // 创建浏览器窗口
 function createWindow() {
   devLog('Creating browser window...')
@@ -70,11 +73,15 @@ function createWindow() {
     console.error('ERROR: preload.js not found at:', preloadPath)
   }
 
+  // 检查图标是否存在
+  const iconPath = fs.existsSync(appIconPath) ? appIconPath : undefined
+
   mainWindow = new BW({
     width: 1400,
     height: 900,
     minWidth: 1000,
     minHeight: 600,
+    icon: iconPath,
     autoHideMenuBar: true,
     webPreferences: {
       preload: preloadPath,

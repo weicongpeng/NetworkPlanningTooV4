@@ -249,7 +249,9 @@ async def get_cell_list(limit: int = 50000) -> Dict[str, Any]:
                     "id": unique_key,
                     "name": sector_name,
                     "siteId": site_id,
-                    "networkType": network_type
+                    "networkType": network_type,
+                    "frequency": sector.get("frequency"),
+                    "pci": sector.get("pci")
                 }
 
                 if network_type == "LTE":

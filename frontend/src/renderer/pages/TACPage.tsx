@@ -874,7 +874,7 @@ export function TACPage() {
   return (
     <div className="h-full flex flex-col p-4 min-h-0">
       {/* 页面标题 */}
-      <h1 className="text-3xl font-bold mb-6 shrink-0">{t('tac.title') || 'TAC核查'}</h1>
+      <h1 className="text-base font-bold mb-6 shrink-0">{t('tac.title') || 'TAC核查'}</h1>
 
       {/* 错误提示 */}
       {error && (
@@ -1014,7 +1014,7 @@ export function TACPage() {
                         onDownloadCellTemplate={wizardStep === 'cells_selected' ? handleDownloadCellTemplate : undefined}
                         uploading={cellFileUploading}
                         disabled={wizardStep !== 'cells_selected' || isRunning}
-                        columnLabels={{ siteId: t('tac.siteId') || '基站ID', cellId: t('tac.cellId') || '小区ID', cellName: t('tac.cellName') || '小区名称', selectAll: t('tac.selectAll') || '全选', clearSelections: t('tac.clearSelections') || '清空选择', uploadCellFile: t('tac.uploadCellFile') || '上传待规划小区文件', downloadCellTemplate: t('tac.downloadCellTemplate') || '下载待规划小区模板' }}
+                        columnLabels={{ siteId: t('tac.siteId') || '基站ID', cellId: t('tac.cellId') || '小区ID', cellName: t('tac.cellName') || '小区名称', cellFreq: t('tac.cellFreq') || '频点', cellPci: t('tac.cellPci') || 'PCI', selectAll: t('tac.selectAll') || '全选', clearSelections: t('tac.clearSelections') || '清空选择', uploadCellFile: t('tac.uploadCellFile') || '上传待规划小区文件', downloadCellTemplate: t('tac.downloadCellTemplate') || '下载待规划小区模板' }}
                       />
                     </div>
                   </div>

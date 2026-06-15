@@ -304,6 +304,8 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
   const selectedFeaturesRef = useRef<any[]>([]) // 选中的要素属性数据
   const selectedIdsRef = useRef<Set<string>>(new Set()) // 选中的要素ID集合
   const polygonTempLayerRef = useRef<L.Polyline | null>(null) // 多边形绘制临时线
+  const dragPreviewRectRef = useRef<L.Rectangle | null>(null) // 矩形拖拽预览（独立于已保存的矩形轨迹）
+  const dragPreviewCircleRef = useRef<L.Circle | null>(null) // 圆形拖拽预览（独立于已保存的圆形轨迹）
   const [selectionTip, setSelectionTip] = useState<string>('') // 框选提示信息
   const preserveSelectionRef = useRef<boolean>(false) // 同步跟踪保留状态，避免 state 异步更新问题
   const [customLayerVisibility, setCustomLayerVisibilityState] = useState<Record<string, boolean>>({})
@@ -449,7 +451,7 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
         }
         // 更新提示
         if (selectedIdsRef.current.size > 0) {
-          setSelectionTip(`${t('map.featuresSelected', { count: selectedIdsRef.current.size })}，${t('map.pressEscClear')}`)
+          setSelectionTip(`${t('map.featuresSelected', { count: selectedIdsRef.current.size })}，${t('map.copyTip') || '按 Ctrl+C 复制'}`)
         } else {
           setSelectionTip('')
         }
@@ -1329,19 +1331,13 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
       if (map) {
         // 清除圆形/多边形选择形状（包括FeatureGroup中的多个形状）
         if (selectionShapeRef.current) {
-          // 如果是FeatureGroup，需要清除其中的所有图层
-          if (selectionShapeRef.current instanceof L.FeatureGroup) {
-            selectionShapeRef.current.clearLayers()
-          }
+          // 修复: map.removeLayer(FeatureGroup) 会自动移除其所有子图层
+          // clearLayers() 会将子图层从Group移除但不会从Map移除，导致"清除"后轨迹残留
           map.removeLayer(selectionShapeRef.current)
           selectionShapeRef.current = null
         }
         // 清除矩形选择框（包括FeatureGroup中的多个矩形）
         if (selectionRectRef.current) {
-          // 如果是FeatureGroup，需要清除其中的所有图层
-          if (selectionRectRef.current instanceof L.FeatureGroup) {
-            selectionRectRef.current.clearLayers()
-          }
           map.removeLayer(selectionRectRef.current)
           selectionRectRef.current = null
         }
@@ -1349,6 +1345,14 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
         if (polygonTempLayerRef.current) {
           map.removeLayer(polygonTempLayerRef.current)
           polygonTempLayerRef.current = null
+        }
+        if (dragPreviewRectRef.current) {
+          map.removeLayer(dragPreviewRectRef.current)
+          dragPreviewRectRef.current = null
+        }
+        if (dragPreviewCircleRef.current) {
+          map.removeLayer(dragPreviewCircleRef.current)
+          dragPreviewCircleRef.current = null
         }
       }
       setSelectionTip('')
@@ -2156,8 +2160,27 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
           undoLastPointRef.current()
         }
       } else if (selectionModeRef.current !== 'none') {
-        if (e.key === 'Escape') {
-          // 按Escape键时，清除选中状态
+        if (e.key === 'Escape' && selectionModeRef.current === 'polygon' && selectionPointsRef.current.length > 0) {
+          // 多边形绘制中: 按Esc删除上一个顶点（同Backspace），删除完所有点后才退出多边形模式
+          e.preventDefault()
+          const map = mapInstanceRef.current
+          if (!map) return
+          selectionPointsRef.current.pop()
+          if (polygonTempLayerRef.current) {
+            map.removeLayer(polygonTempLayerRef.current)
+            polygonTempLayerRef.current = null
+          }
+          if (selectionPointsRef.current.length >= 2) {
+            const points = selectionPointsRef.current.map(p => [p.lat, p.lng])
+            const L = window.L
+            polygonTempLayerRef.current = L.polyline(points as L.LatLngExpression[], {
+              color: '#00ffff',
+              weight: 2,
+              dashArray: '5, 5'
+            }).addTo(map)
+          }
+        } else if (e.key === 'Escape') {
+          // 非多边形绘制中 或 多边形已无顶点: 按Escape退出选择模式并清除选中状态
           preserveSelectionRef.current = false
           onSelectionModeEnd?.()
         } else if (e.key === 'Backspace' && selectionModeRef.current === 'polygon') {
@@ -2187,11 +2210,9 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
               }).addTo(map)
             }
 
-            // 更新提示信息
+            // 删除点后保持初始提示，不显示动态点计数
             if (selectionPointsRef.current.length === 0) {
-              setSelectionTip(`${t('map.clickToAddPolygon')}，${t('map.backspaceDelete')}`)
-            } else {
-              setSelectionTip(`${t('map.pointsAdded', { count: selectionPointsRef.current.length })}，${t('map.doubleClickFinish')}，${t('map.backspaceDelete')}`)
+              setSelectionTip(`${t('map.clickToAddPolygon') || '点击添加多边形顶点'}，${t('map.backspaceDelete') || '按 Backspace 删除上一个点'}`)
             }
           }
         } else if (e.key === 'c' && (e.ctrlKey || e.metaKey)) {
@@ -3268,8 +3289,8 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
           nrSectorLayerRef.current.setMeasureMode(true)
         }
       } else {
-        // 非测距模式：根据 mapDragTool 设置光标
-        map.getContainer().style.cursor = mapDragTool ? 'grab' : ''
+        // 非测距模式：恢复默认光标（mapDragTool 为 true 时由单独 useEffect 的 CSS class 接管）
+        map.getContainer().style.cursor = ''
         map.dragging.enable()
         map.doubleClickZoom.enable()
 
@@ -3286,27 +3307,20 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
 
   /**
    * 监听地图拖拽工具状态
-   * 激活时：始终保持手型光标，禁用双击缩放，只允许拖拽地图
+   * 激活时：始终保持手型光标（CSS !important 覆盖 Leaflet 内部光标管理），禁用双击缩放，只允许拖拽地图
    * 同时禁用所有图层交互（悬停提示、点击事件等）
    */
   useEffect(() => {
     if (mapInstanceRef.current) {
       const map = mapInstanceRef.current
+      const container = map.getContainer()
       if (mapDragTool) {
         map.dragging.enable()
         map.doubleClickZoom.disable()
-        // 强制设置容器 cursor 为 grab（不被测距等其他效果覆盖）
-        map.getContainer().style.cursor = 'grab'
-        // 监听鼠标按下/抬起时的光标状态
-        const onMouseDown = () => { map.getContainer().style.cursor = 'grabbing' }
-        const onMouseUp = () => { map.getContainer().style.cursor = 'grab' }
-        // 监听鼠标离开/进入地图容器，确保光标状态正确
-        const onMouseLeave = () => { map.getContainer().style.cursor = 'grab' }
-        const onMouseEnter = () => { map.getContainer().style.cursor = 'grab' }
-        map.getContainer().addEventListener('mousedown', onMouseDown)
-        map.getContainer().addEventListener('mouseup', onMouseUp)
-        map.getContainer().addEventListener('mouseleave', onMouseLeave)
-        map.getContainer().addEventListener('mouseenter', onMouseEnter)
+        // 使用 CSS class + !important 覆盖 Leaflet 内部光标重置，确保始终显示手形
+        container.classList.add('map-drag-active')
+        // 清除可能残留的 inline cursor（CSS class 的 !important 会接管）
+        container.style.cursor = ''
 
         // 禁用扇区图层的悬停提示和点击交互
         if (lteSectorLayerRef.current) lteSectorLayerRef.current.updateSelectionMode(true)
@@ -3321,24 +3335,13 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
         if (geoDataLayerManagerRef.current) {
           geoDataLayerManagerRef.current.setInteractive(false)
         }
-
-        // 返回清理函数（存储在 ref 中，在 mapDragTool 变为 false 时调用）
-        ;(map as any)._dragToolCleanup = () => {
-          map.getContainer().removeEventListener('mousedown', onMouseDown)
-          map.getContainer().removeEventListener('mouseup', onMouseUp)
-          map.getContainer().removeEventListener('mouseleave', onMouseLeave)
-          map.getContainer().removeEventListener('mouseenter', onMouseEnter)
-        }
       } else {
         // 关闭拖拽工具：恢复正常状态
-        if ((map as any)._dragToolCleanup) {
-          ;(map as any)._dragToolCleanup()
-          delete (map as any)._dragToolCleanup
-        }
+        container.classList.remove('map-drag-active')
+        container.style.cursor = ''
         map.dragging.enable()
         if (!measureMode) {
           map.doubleClickZoom.enable()
-          map.getContainer().style.cursor = ''
         }
 
         // 恢复扇区图层的悬停提示和点击交互
@@ -3599,7 +3602,7 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
 
     // 更新提示信息
     if (selectedIds.size > 0) {
-      setSelectionTip(`${t('map.featuresSelected', { count: selectedIds.size })}，${t('map.pressEscClear')}`)
+      setSelectionTip(`${t('map.featuresSelected', { count: selectedIds.size })}，${t('map.copyTip') || '按 Ctrl+C 复制'}`)
     } else {
       setSelectionTip(t('map.clickToSelectFeatures') || '点击选择要素（再次点击取消），Shift+点击多选，按 Ctrl+C 复制')
     }
@@ -3760,7 +3763,7 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
 
     if (selectedIds.size > 0) {
       console.log('[OnlineMap] 圆形框选选中要素总数:', selectedIds.size)
-      setSelectionTip(`${t('map.featuresSelected', { count: selectedIds.size })}，${t('map.pressEscClear')}`)
+      setSelectionTip(`${t('map.featuresSelected', { count: selectedIds.size })}，${t('map.copyTip') || '按 Ctrl+C 复制'}`)
     } else {
       setSelectionTip(t('map.noFeatureSelected'))
     }
@@ -3929,7 +3932,7 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
 
     if (selectedIds.size > 0) {
       console.log('[OnlineMap] 多边形框选选中要素总数:', selectedIds.size)
-      setSelectionTip(`${t('map.featuresSelected', { count: selectedIds.size })}，${t('map.pressEscClear')}`)
+      setSelectionTip(`${t('map.featuresSelected', { count: selectedIds.size })}，${t('map.copyTip') || '按 Ctrl+C 复制'}`)
     } else {
       setSelectionTip(t('map.noFeatureSelected'))
     }
@@ -3987,16 +3990,20 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
     if (geoDataLayerManagerRef.current) {
       geoDataLayerManagerRef.current.getAllLayers().forEach(geoLayer => {
         if (!geoLayer.isVisible()) return
-        const features = geoLayer.getFeaturesInPolygon(polygon)
-        console.log('[OnlineMap] GeoDataLayer矩形框选返回要素数量:', features.length)
-        features.forEach(item => {
-          const id = item.name || item.properties?.id || ''
-          if (id) {
-            newIds.add(String(id))
-            newProperties.push({ ...item.properties, _layerType: 'GeoData', _geoDataName: item.name })
-            console.log('[OnlineMap] 矩形框选选中GeoData要素:', item.name || id)
-          }
-        })
+        try {
+          const features = geoLayer.getFeaturesInPolygon(polygon)
+          console.log('[OnlineMap] GeoDataLayer矩形框选返回要素数量:', features.length)
+          features.forEach(item => {
+            const id = item.name || item.properties?.id || ''
+            if (id) {
+              newIds.add(String(id))
+              newProperties.push({ ...item.properties, _layerType: 'GeoData', _geoDataName: item.name })
+              console.log('[OnlineMap] 矩形框选选中GeoData要素:', item.name || id)
+            }
+          })
+        } catch (e) {
+          console.error('[OnlineMap] GeoDataLayer矩形框选失败:', e)
+        }
       })
     }
 
@@ -4090,7 +4097,7 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
     selectedIdsRef.current = selectedIds
 
     if (selectedIds.size > 0) {
-      setSelectionTip(`${t('map.featuresSelected', { count: selectedIds.size })}，${t('map.pressEscClear')}`)
+      setSelectionTip(`${t('map.featuresSelected', { count: selectedIds.size })}，${t('map.copyTip') || '按 Ctrl+C 复制'}`)
     } else {
       setSelectionTip(t('map.noFeatureSelected'))
     }
@@ -4170,6 +4177,7 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
         // 但保留滚轮缩放功能，方便用户在选择时调整地图视角
         map.dragging.disable()
         map.doubleClickZoom.disable() // 圈选时禁用双击放大
+        map.boxZoom.disable() // 禁用Shift+拖拽框选缩放，防止与多边形/框选Shift多选冲突
         // 根据模式设置提示
         if (selectionMode === 'point') {
           setSelectionTip('点击选择要素，或按住鼠标拖拽绘制矩形批量选择，按 Ctrl+C 复制')
@@ -4185,9 +4193,10 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
         // 注意：选中状态和图形的清除逻辑在另一个useEffect中处理
         map.dragging.enable()
         map.doubleClickZoom.enable()
+        map.boxZoom.enable()
         map.scrollWheelZoom.enable()
-        // 恢复光标样式（根据mapDragTool状态）
-        map.getContainer().style.cursor = mapDragTool ? 'grab' : ''
+        // 恢复光标样式（mapDragTool 为 true 时由单独 useEffect 的 CSS class 接管）
+        map.getContainer().style.cursor = ''
       }
     }
   }, [selectionMode, measureMode])
@@ -4202,24 +4211,24 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
     // 清除之前的框选形状
     const clearSelectionShape = () => {
       if (selectionShapeRef.current) {
-        // 如果是FeatureGroup，需要清除其中的所有图层
-        if (selectionShapeRef.current instanceof L.FeatureGroup) {
-          selectionShapeRef.current.clearLayers()
-        }
         map.removeLayer(selectionShapeRef.current)
         selectionShapeRef.current = null
       }
       if (selectionRectRef.current) {
-        // 如果是FeatureGroup，需要清除其中的所有图层
-        if (selectionRectRef.current instanceof L.FeatureGroup) {
-          selectionRectRef.current.clearLayers()
-        }
         map.removeLayer(selectionRectRef.current)
         selectionRectRef.current = null
       }
       if (polygonTempLayerRef.current) {
         map.removeLayer(polygonTempLayerRef.current)
         polygonTempLayerRef.current = null
+      }
+      if (dragPreviewRectRef.current) {
+        map.removeLayer(dragPreviewRectRef.current)
+        dragPreviewRectRef.current = null
+      }
+      if (dragPreviewCircleRef.current) {
+        map.removeLayer(dragPreviewCircleRef.current)
+        dragPreviewCircleRef.current = null
       }
       selectionStartPointRef.current = null
       selectionDrawingRef.current = false
@@ -4258,7 +4267,10 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
         L.DomEvent.preventDefault(e)
       } else if (selectionModeRef.current === 'circle') {
         // 圆形模式：开始绘制
-        clearSelectionShape()
+        const isShift = originalEvent.shiftKey
+        if (!isShift) {
+          clearSelectionShape()
+        }
         selectionStartPointRef.current = latLng
         selectionDrawingRef.current = true
         // 禁用地图拖拽，避免地图随鼠标移动
@@ -4285,7 +4297,7 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
           }
         }
 
-        setSelectionTip(`${t('map.pointsAdded', { count: selectionPointsRef.current.length })}，${t('map.doubleClickFinish')}`)
+        // 多边形绘制过程中不再显示动态点计数提示，保持进入框选时的初始提示即可
         L.DomEvent.stopPropagation(e)
         L.DomEvent.preventDefault(e)
       }
@@ -4309,13 +4321,13 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
         }
 
         if (pointModeIsDragging.current) {
-          // 更新矩形预览
-          if (selectionRectRef.current) {
-            map.removeLayer(selectionRectRef.current)
+          // 更新矩形预览 —— 使用独立预览 ref，不覆盖已保存的选中矩形轨迹
+          if (dragPreviewRectRef.current) {
+            map.removeLayer(dragPreviewRectRef.current)
           }
           const L = window.L
           const bounds = L.latLngBounds(startPoint, latLng)
-          selectionRectRef.current = L.rectangle(bounds, {
+          dragPreviewRectRef.current = L.rectangle(bounds, {
             color: '#00ffff',
             weight: 2,
             fillColor: '#00ffff',
@@ -4328,14 +4340,14 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
         L.DomEvent.stopPropagation(e)
         L.DomEvent.preventDefault(e)
       } else if (selectionModeRef.current === 'circle' && selectionDrawingRef.current && startPoint) {
-        // 清除之前的预览形状
-        if (selectionShapeRef.current) {
-          map.removeLayer(selectionShapeRef.current)
+        // 清除之前的预览形状 —— 使用独立预览 ref，不覆盖已保存的选中圆形轨迹
+        if (dragPreviewCircleRef.current) {
+          map.removeLayer(dragPreviewCircleRef.current)
         }
 
         const L = window.L
         const radius = startPoint.distanceTo(latLng)
-        selectionShapeRef.current = L.circle(startPoint, {
+        dragPreviewCircleRef.current = L.circle(startPoint, {
           radius: radius,
           color: '#00ffff',
           weight: 2,
@@ -4372,8 +4384,7 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
 
       if (selectionModeRef.current === 'point' && startPoint) {
         const originalEvent = e.originalEvent
-        // 删除Shift多选功能，isMultiSelect固定为false
-        const isMultiSelect = false
+        const isMultiSelect = originalEvent.shiftKey
 
         if (pointModeIsDragging.current) {
           // 拖拽结束：执行矩形框选
@@ -4386,8 +4397,8 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
           const heightM = sw.distanceTo(L.latLng(ne.lat, sw.lng))
 
           if (widthM > 5 || heightM > 5) {
-            // 清除之前的矩形
-            if (selectionRectRef.current) {
+            // 非多选模式（非Shift）：清除之前的矩形
+            if (!isMultiSelect && selectionRectRef.current) {
               map.removeLayer(selectionRectRef.current)
               selectionRectRef.current = null
             }
@@ -4401,12 +4412,35 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
               fillColor: '#00ffff',
               fillOpacity: 0.1,
               interactive: false
-            }).addTo(map)
-            
-            selectionRectRef.current = newRect
+            })
+
+            if (isMultiSelect && selectionRectRef.current) {
+              // Shift多选：将新矩形与已有矩形组合为FeatureGroup统一管理
+              if (selectionRectRef.current instanceof L.FeatureGroup) {
+                selectionRectRef.current.addLayer(newRect)
+              } else {
+                const fg = L.featureGroup([selectionRectRef.current, newRect])
+                fg.addTo(map)
+                selectionRectRef.current = fg as any
+              }
+            } else {
+              newRect.addTo(map)
+              selectionRectRef.current = newRect
+            }
+
+            // 清除拖拽预览
+            if (dragPreviewRectRef.current) {
+              map.removeLayer(dragPreviewRectRef.current)
+              dragPreviewRectRef.current = null
+            }
           } else {
+            // 清除拖拽预览（矩形太小，未完成选择）
+            if (dragPreviewRectRef.current) {
+              map.removeLayer(dragPreviewRectRef.current)
+              dragPreviewRectRef.current = null
+            }
             const tip = selectedIdsRef.current.size > 0
-              ? `${t('map.featuresSelected', { count: selectedIdsRef.current.size })}，${t('map.pressEscClear')}`
+              ? `${t('map.featuresSelected', { count: selectedIdsRef.current.size })}，${t('map.copyTip') || '按 Ctrl+C 复制'}`
               : '点击选择要素，或按住鼠标拖拽绘制矩形批量选择'
             setSelectionTip(tip)
           }
@@ -4425,27 +4459,48 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
       } else if (selectionModeRef.current === 'circle' && selectionDrawingRef.current && startPoint) {
         // 圆形模式：完成选择
         const radius = startPoint.distanceTo(latLng)
-        // 删除Shift多选功能，isMultiSelect固定为false
-        const isMultiSelect = false
+        const isMultiSelect = e.originalEvent.shiftKey
         if (radius > 10) { // 最小半径10米
-          // 清除之前的形状
-          if (selectionShapeRef.current) {
+          // 非多选模式（非Shift）：清除之前的形状
+          if (!isMultiSelect && selectionShapeRef.current) {
             map.removeLayer(selectionShapeRef.current)
             selectionShapeRef.current = null
           }
-          
+
           selectFeaturesInCircle(startPoint, radius, isMultiSelect)
-          
+
           // 绘制最终圆形形状
           const L = window.L
           const newCircle = L.circle(startPoint, {
             radius: radius, color: '#00ffff', weight: 2, fillColor: '#00ffff', fillOpacity: 0.1,
             interactive: false // 禁止交互，避免拦截鼠标事件
-          }).addTo(map)
-          
-          selectionShapeRef.current = newCircle
+          })
+
+          if (isMultiSelect && selectionShapeRef.current) {
+            // Shift多选：将新圆形与已有形状组合为FeatureGroup统一管理
+            if (selectionShapeRef.current instanceof L.FeatureGroup) {
+              selectionShapeRef.current.addLayer(newCircle)
+            } else {
+              const fg = L.featureGroup([selectionShapeRef.current, newCircle])
+              fg.addTo(map)
+              selectionShapeRef.current = fg as any
+            }
+          } else {
+            selectionShapeRef.current = newCircle
+            selectionShapeRef.current.addTo(map)
+          }
+
+          // 清除拖拽预览
+          if (dragPreviewCircleRef.current) {
+            map.removeLayer(dragPreviewCircleRef.current)
+            dragPreviewCircleRef.current = null
+          }
         } else {
           setSelectionTip('半径太小，请重新绘制')
+          if (dragPreviewCircleRef.current) {
+            map.removeLayer(dragPreviewCircleRef.current)
+            dragPreviewCircleRef.current = null
+          }
         }
           selectionDrawingRef.current = false
         selectionStartPointRef.current = null
@@ -4459,11 +4514,10 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
     const handleDoubleClick = (e: L.LeafletMouseEvent) => {
       if (selectionModeRef.current !== 'polygon') return
       
-      // 移除双击添加的多余点（双击会触发两次 mousedown，添加两个点）
-      if (selectionPointsRef.current.length >= 2) {
-        selectionPointsRef.current.pop() // 移除最后一个点
-        selectionPointsRef.current.pop() // 移除倒数第二个点
-      } else if (selectionPointsRef.current.length === 1) {
+      // 双击会触发两次 mousedown，额外添加了 2 个顶点
+      // 只弹出 1 个点，保留双击位置的顶点作为多边形的最后一个闭合顶点
+      // 这样点击 A → 点击 B → 双击 C 即可完成三角形（3 个点）
+      if (selectionPointsRef.current.length >= 1) {
         selectionPointsRef.current.pop()
       }
 
@@ -4493,6 +4547,7 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
             selectionShapeRef.current.addLayer(newPolygon)
           } else {
             const featureGroup = L.featureGroup([selectionShapeRef.current, newPolygon])
+            featureGroup.addTo(map)
             selectionShapeRef.current = featureGroup as any
           }
         } else {
@@ -4520,8 +4575,23 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
       map.off('mousemove', handleMouseMove)
       map.off('mouseup', handleMouseUp)
       map.off('dblclick', handleDoubleClick)
-      // 清理框选形状
-      clearSelectionShape()
+      // 清除未完成的绘制痕迹（临时线段、拖拽预览、多边形待定顶点等），但保留已完成的框选图形
+      if (polygonTempLayerRef.current) {
+        map.removeLayer(polygonTempLayerRef.current)
+        polygonTempLayerRef.current = null
+      }
+      if (dragPreviewRectRef.current) {
+        map.removeLayer(dragPreviewRectRef.current)
+        dragPreviewRectRef.current = null
+      }
+      if (dragPreviewCircleRef.current) {
+        map.removeLayer(dragPreviewCircleRef.current)
+        dragPreviewCircleRef.current = null
+      }
+      selectionPointsRef.current = []
+      selectionStartPointRef.current = null
+      selectionDrawingRef.current = false
+      pointModeIsDragging.current = false
       // 恢复地图拖拽（防止切换模式时遗留禁用状态）
       map.dragging.enable()
     }
