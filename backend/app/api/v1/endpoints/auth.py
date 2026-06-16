@@ -18,20 +18,6 @@ from app.services.auth_service import auth_service
 router = APIRouter()
 
 
-def _get_client_ip(request: Request) -> str:
-    """获取客户端真实IP，优先从 Cloudflare / X-Forwarded-For 头获取"""
-    # Cloudflare Tunnel 传递的客户端真实 IP（Cloudflare 专用，始终包含原始客户端 IP）
-    cf_ip = request.headers.get("CF-Connecting-IP")
-    if cf_ip:
-        return cf_ip.strip()
-    # 通用代理头（Nginx、Caddy 等）
-    forwarded = request.headers.get("X-Forwarded-For")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    # 直连 IP（在 Tunnel 下可能是网关地址）
-    return request.client.host if request.client else "unknown"
-
-
 @router.post("/register")
 async def register(data: UserCreate, request: Request, db: Session = Depends(get_db)):
     """注册新用户并自动登录"""
@@ -48,8 +34,8 @@ async def register(data: UserCreate, request: Request, db: Session = Depends(get
         raise HTTPException(status_code=400, detail=error)
 
     token, jti = auth_service.create_access_token(user.id, user.username, user.is_admin)
-    auth_service.record_session(db, user.id, jti, _get_client_ip(request))
-    auth_service.update_last_login(db, user, _get_client_ip(request))
+    auth_service.record_session(db, user.id, jti, auth_service.get_client_ip(request))
+    auth_service.update_last_login(db, user, auth_service.get_client_ip(request))
 
     return {
         "success": True,
@@ -68,7 +54,7 @@ async def login(data: UserLogin, request: Request, db: Session = Depends(get_db)
     if error:
         raise HTTPException(status_code=401, detail=error)
 
-    client_ip = _get_client_ip(request)
+    client_ip = auth_service.get_client_ip(request)
 
     # 结束其他IP的旧会话（确保一个账号只在一个IP登录）
     ended_count = auth_service.end_other_ip_sessions(db, user.id, client_ip)

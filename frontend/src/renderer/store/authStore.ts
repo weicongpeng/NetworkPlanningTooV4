@@ -9,7 +9,7 @@ interface AuthState {
   isAuthenticated: boolean
   isLoading: boolean
 
-  login: (username: string, password: string) => Promise<void>
+  login: (username: string, password: string) => Promise<string | null>
   register: (username: string, password: string, confirmPassword: string, city?: string, operator?: string, equipmentVendor?: string) => Promise<void>
   logout: () => Promise<void>
   fetchUser: () => Promise<void>

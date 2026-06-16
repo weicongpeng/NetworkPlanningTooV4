@@ -72,6 +72,17 @@ class AuthService:
                 return None, "授权已过期，请联系管理员"
         return user, None
 
+    @staticmethod
+    def get_client_ip(request) -> str:
+        """获取客户端真实IP，优先从 Cloudflare / X-Forwarded-For 头获取"""
+        cf_ip = request.headers.get("CF-Connecting-IP")
+        if cf_ip:
+            return cf_ip.strip()
+        forwarded = request.headers.get("X-Forwarded-For")
+        if forwarded:
+            return forwarded.split(",")[0].strip()
+        return request.client.host if request.client else "unknown"
+
     def update_last_login(self, db: Session, user: User, ip_address: Optional[str] = None):
         """更新最后登录时间和IP"""
         user.last_login = datetime.now(timezone.utc)
