@@ -53,8 +53,8 @@ export function WizardFooter({
 
   // 上一步按钮可见：参数设置(1)、小区选择(2) 时显示
   const showBack = onBack && currentStep >= 1 && currentStep <= 2
-  // 取消按钮可见：idle ~ cells_selected (0~2) 或执行中时
-  const canCancel = showCancel ?? (currentStep >= 0 && currentStep <= 2 && !isExecuting)
+  // 取消按钮可见：task_created ~ cells_selected (含) 时显示，idle 时不显示
+  const canCancel = showCancel ?? (currentStep >= 0 && currentStep <= 2 && !isExecuting && !isIdle)
 
   // 执行完成后：只显示"查看"按钮
   if (isCompleted) {
@@ -93,14 +93,14 @@ export function WizardFooter({
           </button>
         )}
 
-        {/* 上一步按钮：参数设置和小区选择步骤时显示 */}
+        {/* 上一步按钮：参数设置和小区选择步骤时显示，高亮样式 */}
         {showBack && (
           <button
             onClick={onBack}
             disabled={isExecuting}
             className="inline-flex items-center gap-2 px-6 py-2.5 text-sm font-medium
-              bg-muted text-muted-foreground rounded-lg
-              hover:bg-muted/80 active:scale-[0.98]
+              border border-primary text-primary rounded-lg
+              hover:bg-primary/10 active:scale-[0.98]
               transition-all duration-150
               disabled:opacity-50 disabled:cursor-not-allowed"
           >
