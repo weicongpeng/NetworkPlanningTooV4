@@ -107,6 +107,7 @@ class AuthService:
         license_expiry: Optional[datetime] = None,
         city: Optional[str] = None,
         operator: Optional[str] = None,
+        user_type: str = 'pc',
     ) -> Tuple[Optional[User], Optional[str]]:
         """创建用户，返回 (user, error_message)"""
         existing = self.get_user_by_username(db, username)
@@ -121,6 +122,7 @@ class AuthService:
             license_expiry=license_expiry,
             city=city,
             operator=operator,
+            user_type=user_type,
         )
         db.add(user)
         db.commit()
@@ -129,7 +131,7 @@ class AuthService:
 
     def update_user(self, db: Session, user_id: int, updates: dict) -> Optional[User]:
         """更新用户字段（不含密码）"""
-        allowed_fields = {"is_active", "is_admin", "license_expiry", "must_change_password", "total_usage_seconds", "city", "operator"}
+        allowed_fields = {"is_active", "is_admin", "license_expiry", "must_change_password", "total_usage_seconds", "city", "operator", "user_type"}
         user = self.get_user_by_id(db, user_id)
         if not user:
             return None
@@ -171,6 +173,7 @@ class AuthService:
         page_size: int = 20,
         search: Optional[str] = None,
         is_active: Optional[bool] = None,
+        user_type: Optional[str] = None,
     ) -> Tuple[List[User], int]:
         """获取用户列表（分页+搜索+筛选），返回 (users, total_count)"""
         query = db.query(User)
@@ -178,6 +181,8 @@ class AuthService:
             query = query.filter(User.username.ilike(f"%{search}%"))
         if is_active is not None:
             query = query.filter(User.is_active == is_active)
+        if user_type:
+            query = query.filter(User.user_type == user_type)
         total = query.count()
         users = query.order_by(User.created_at.desc()).offset((page - 1) * page_size).limit(page_size).all()
         return users, total
