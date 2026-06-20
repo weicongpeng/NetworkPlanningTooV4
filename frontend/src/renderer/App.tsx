@@ -11,7 +11,6 @@ import { TACPlanningPage } from './pages/TACPlanningPage'
 import { LicensePage } from './pages/LicensePage'
 import { MapPage } from './pages/MapPage'
 import { AdminUsersPage } from './pages/AdminUsersPage'
-import { AppUsersPage } from './pages/AppUsersPage'
 import { useEffect } from 'react'
 import { startHealthCheck, stopHealthCheck } from '@/renderer/services/api'
 
@@ -94,14 +93,6 @@ function App() {
               element={
                 <ProtectedRoute requireAdmin>
                   <AdminUsersPage />
-                </ProtectedRoute>
-              }
-            />
-            <Route
-              path="/admin/app-users"
-              element={
-                <ProtectedRoute requireAdmin>
-                  <AppUsersPage />
                 </ProtectedRoute>
               }
             />
