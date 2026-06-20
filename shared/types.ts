@@ -354,7 +354,7 @@ export interface UserInfo {
   created_at: string | null
   city: string | null
   operator: string | null
-  user_type: 'pc' | 'app'
+  user_type?: 'pc' | 'app'
 }
 
 export interface TokenResponse {
@@ -405,6 +405,7 @@ export interface UserSessionInfo {
   user_id: number
   token_jti: string
   ip_address: string | null
+  client_type: 'pc' | 'app'
   login_time: string | null
   logout_time: string | null
   last_activity: string | null

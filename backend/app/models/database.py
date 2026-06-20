@@ -73,6 +73,7 @@ class UserSession(Base):
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
     token_jti = Column(String(255), unique=True, nullable=False, index=True)
     ip_address = Column(String(45), nullable=True)
+    client_type = Column(String(10), default='pc', nullable=False)
     login_time = Column(DateTime, default=_utcnow, nullable=False)
     logout_time = Column(DateTime, nullable=True)
     last_activity = Column(DateTime, default=_utcnow, nullable=False)
@@ -88,6 +89,7 @@ class UserSession(Base):
             "logout_time": _serialize_dt(self.logout_time),
             "last_activity": _serialize_dt(self.last_activity),
             "ip_address": self.ip_address,
+            "client_type": self.client_type,
         }
 
 

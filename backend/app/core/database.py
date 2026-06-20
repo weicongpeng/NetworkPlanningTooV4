@@ -82,6 +82,11 @@ def init_db():
         us_cols = [row[1] for row in conn.exec_driver_sql("PRAGMA table_info(user_settings)").fetchall() if row[0] >= 0]
         if us_cols and "created_at" not in us_cols:
             conn.exec_driver_sql("ALTER TABLE user_settings ADD COLUMN created_at VARCHAR(30)")
+
+        # 迁移：user_sessions 表添加 client_type 列
+        usess_cols = [row[1] for row in conn.exec_driver_sql("PRAGMA table_info(user_sessions)").fetchall()]
+        if "client_type" not in usess_cols:
+            conn.exec_driver_sql("ALTER TABLE user_sessions ADD COLUMN client_type VARCHAR(10) NOT NULL DEFAULT 'pc'")
         conn.commit()
 
 
