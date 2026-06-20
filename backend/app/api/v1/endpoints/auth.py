@@ -29,6 +29,7 @@ async def register(data: UserCreate, request: Request, db: Session = Depends(get
         license_expiry=datetime.fromisoformat(data.license_expiry) if data.license_expiry else None,
         city=data.city,
         operator=data.operator,
+        user_type=data.user_type,
     )
     if error:
         raise HTTPException(status_code=400, detail=error)
