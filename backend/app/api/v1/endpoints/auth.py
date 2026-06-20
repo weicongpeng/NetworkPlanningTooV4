@@ -41,6 +41,7 @@ async def register(data: UserCreate, request: Request, db: Session = Depends(get
     return {
         "success": True,
         "data": {
+            "token": token,
             "access_token": token,
             "token_type": "bearer",
             "user": user.to_dict(),
@@ -68,6 +69,7 @@ async def login(data: UserLogin, request: Request, db: Session = Depends(get_db)
     result = {
         "success": True,
         "data": {
+            "token": token,
             "access_token": token,
             "token_type": "bearer",
             "user": user.to_dict(),
