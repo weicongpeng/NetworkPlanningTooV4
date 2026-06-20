@@ -58,8 +58,8 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
         name: t('admin.title', '用户管理'),
         icon: Users,
         children: [
-          { type: 'link', name: t('admin.pcUser', 'PC用户'), href: '/admin/users' },
-          { type: 'link', name: t('admin.appUser', 'APP用户'), href: '/admin/app-users' },
+          { type: 'link' as const, name: t('admin.pcUser', 'PC用户'), href: '/admin/users' },
+          { type: 'link' as const, name: t('admin.appUser', 'APP用户'), href: '/admin/app-users' },
         ],
       },
     ] : []),

@@ -18,7 +18,7 @@ function formatDate(dateStr: string | null): string {
 }
 
 export function AppUsersPage() {
-  const { t, i18n } = useTranslation()
+  const { t } = useTranslation()
 
   const [users, setUsers] = useState<UserInfo[]>([])
   const [total, setTotal] = useState(0)
@@ -295,7 +295,7 @@ export function AppUsersPage() {
 
           {/* Pagination */}
           <div className="flex items-center justify-between">
-            <span className="text-sm text-muted-foreground">{t('admin.sessionCount', { count: total })}</span>
+            <span className="text-sm text-muted-foreground">{t('admin.totalUsers', { count: total })}</span>
             <div className="flex items-center gap-2">
               <button
                 onClick={() => setPage(p => Math.max(1, p - 1))}
