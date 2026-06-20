@@ -871,18 +871,12 @@
     "totalUsers": "共 {{count}} 个用户",
     "cannotDeleteAdmin": "不能删除管理员",
     "usernameTooShort": "用户名至少3个字符",
-    "appUser": "APP用户",
-    "pcUser": "PC用户",
-    "appUserManagement": "APP用户管理",
-    "addAppUser": "添加APP用户",
-    "createAppUserSuccess": "APP用户创建成功",
-    "viewSessions": "查看登录记录",
-    "sessionHistory": "登录历史",
-    "sessionCount": "共 {{count}} 条登录记录",
-    "sessionTime": "登录时间",
-    "sessionIp": "登录IP",
-    "onlineCount": "在线用户",
-    "noAppUsers": "暂无APP用户",
-    "appUserDeleteConfirm": "确定要删除APP用户 \"{{username}}\" 吗？"
+    "clientType": "客户端",
+    "pcClient": "PC端",
+    "appClient": "APP端",
+    "viewLoginRecords": "查看登录记录",
+    "loginRecordTime": "登录时间",
+    "loginRecordIp": "IP地址",
+    "loginRecordClient": "客户端"
   }
 }

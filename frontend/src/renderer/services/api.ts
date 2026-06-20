@@ -988,16 +988,6 @@ export const adminUserApi = {
   resetPassword: async (userId: number, data: ResetPasswordRequest): Promise<ApiResponse<any>> => {
     return apiClient.post(`/admin/users/${userId}/reset-password`, data) as any
   },
-
-  listAppUsers: async (page: number = 1, pageSize: number = 20, search?: string): Promise<ApiResponse<UserListResponse>> => {
-    const params: any = { page, page_size: pageSize, user_type: 'app' }
-    if (search) params.search = search
-    return apiClient.get('/admin/users/', { params }) as any
-  },
-
-  createAppUser: async (data: { username: string; password: string; confirm_password: string }): Promise<ApiResponse<UserInfo>> => {
-    return apiClient.post('/admin/users/', { ...data, user_type: 'app', is_admin: false }) as any
-  },
 }
 
 // ============== 用户个性化设置 API ==============

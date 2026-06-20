@@ -366,6 +366,7 @@ export interface TokenResponse {
 export interface LoginRequest {
   username: string
   password: string
+  client_type?: 'pc' | 'app'
 }
 
 export interface RegisterRequest {
