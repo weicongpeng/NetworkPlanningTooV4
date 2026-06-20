@@ -27,12 +27,11 @@ async def list_users(
     page_size: int = Query(default=20, ge=1, le=100),
     search: str | None = Query(default=None),
     is_active: bool | None = Query(default=None),
-    user_type: str | None = Query(default=None),
     admin_user: User = Depends(get_current_admin_user),
     db: Session = Depends(get_db),
 ):
     """获取用户列表"""
-    users, total = auth_service.get_all_users(db, page, page_size, search, is_active, user_type)
+    users, total = auth_service.get_all_users(db, page, page_size, search, is_active)
     user_list = []
     for u in users:
         user_dict = u.to_dict()
@@ -69,7 +68,6 @@ async def create_user(
         license_expiry=license_expiry,
         city=data.city,
         operator=data.operator,
-        user_type=data.user_type,
     )
     if error:
         raise HTTPException(status_code=400, detail=error)

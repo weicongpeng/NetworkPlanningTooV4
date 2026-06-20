@@ -29,7 +29,6 @@ async def register(data: UserCreate, request: Request, db: Session = Depends(get
         license_expiry=datetime.fromisoformat(data.license_expiry) if data.license_expiry else None,
         city=data.city,
         operator=data.operator,
-        user_type=data.user_type,
     )
     if error:
         raise HTTPException(status_code=400, detail=error)
@@ -58,13 +57,13 @@ async def login(data: UserLogin, request: Request, db: Session = Depends(get_db)
 
     client_ip = auth_service.get_client_ip(request)
 
-    # 结束其他IP的旧会话（确保一个账号只在一个IP登录）
-    ended_count = auth_service.end_other_ip_sessions(db, user.id, client_ip)
+    # 仅同类型客户端互踢（APP端不踢任何会话）
+    ended_count = auth_service.end_other_ip_sessions(db, user.id, client_ip, data.client_type)
 
     auth_service.update_last_login(db, user, client_ip)
 
     token, jti = auth_service.create_access_token(user.id, user.username, user.is_admin)
-    auth_service.record_session(db, user.id, jti, client_ip)
+    auth_service.record_session(db, user.id, jti, client_ip, data.client_type)
 
     result = {
         "success": True,
