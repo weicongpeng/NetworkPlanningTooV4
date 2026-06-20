@@ -354,6 +354,7 @@ export interface UserInfo {
   created_at: string | null
   city: string | null
   operator: string | null
+  user_type: 'pc' | 'app'
 }
 
 export interface TokenResponse {

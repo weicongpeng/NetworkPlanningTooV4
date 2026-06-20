@@ -60,6 +60,7 @@ def init_db():
             ("operator", "ALTER TABLE users ADD COLUMN operator VARCHAR(50)"),
             ("last_login_ip", "ALTER TABLE users ADD COLUMN last_login_ip VARCHAR(45)"),
             ("ip_address", "ALTER TABLE user_sessions ADD COLUMN ip_address VARCHAR(45)"),
+            ("user_type", "ALTER TABLE users ADD COLUMN user_type VARCHAR(10) NOT NULL DEFAULT 'pc'"),
         ]
         for col_name, sql in migrations:
             table_name = "user_sessions" if "user_sessions" in sql else "users"

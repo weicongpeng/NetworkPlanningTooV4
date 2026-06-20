@@ -44,6 +44,7 @@ class User(Base):
     created_at = Column(DateTime, default=_utcnow, nullable=False)
     city = Column(String(100), nullable=True)
     operator = Column(String(50), nullable=True)
+    user_type = Column(String(10), default='pc', nullable=False)
 
     sessions = relationship("UserSession", back_populates="user", lazy="dynamic")
 
@@ -61,6 +62,7 @@ class User(Base):
             "created_at": _serialize_dt(self.created_at),
             "city": self.city,
             "operator": self.operator,
+            "user_type": self.user_type,
         }
 
 
