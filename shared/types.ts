@@ -346,6 +346,8 @@ export interface UserInfo {
   is_admin: boolean
   is_active: boolean
   is_online?: boolean
+  is_online_pc?: boolean
+  is_online_app?: boolean
   must_change_password: boolean
   license_expiry: string | null
   total_usage_seconds: number

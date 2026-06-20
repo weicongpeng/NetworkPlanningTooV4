@@ -361,9 +361,9 @@ export function AdminUsersPage() {
                         <td className="px-4 py-3 text-xs text-muted-foreground">{t('admin.pcClient', 'PC端')}</td>
                         <td className="px-4 py-3">
                           <div className="flex items-center gap-1.5">
-                            <span className={`inline-block w-2 h-2 rounded-full ${u.is_online ? 'bg-green-400' : 'bg-muted-foreground/40'}`} />
-                            <span className={`text-xs ${u.is_online ? 'text-green-400' : 'text-muted-foreground'}`}>
-                              {u.is_online ? t('admin.online', '在线') : t('admin.offline', '离线')}
+                            <span className={`inline-block w-2 h-2 rounded-full ${(u.is_online_pc ?? u.is_online) ? 'bg-green-400' : 'bg-muted-foreground/40'}`} />
+                            <span className={`text-xs ${(u.is_online_pc ?? u.is_online) ? 'text-green-400' : 'text-muted-foreground'}`}>
+                              {(u.is_online_pc ?? u.is_online) ? t('admin.online', '在线') : t('admin.offline', '离线')}
                             </span>
                           </div>
                         </td>
@@ -396,9 +396,9 @@ export function AdminUsersPage() {
                         <td className="px-4 py-3 text-xs text-muted-foreground">{t('admin.appClient', 'APP端')}</td>
                         <td className="px-4 py-3">
                           <div className="flex items-center gap-1.5">
-                            <span className={`inline-block w-2 h-2 rounded-full ${u.is_active ? 'bg-green-400' : 'bg-muted-foreground/40'}`} />
-                            <span className={`text-xs ${u.is_active ? 'text-green-400' : 'text-muted-foreground'}`}>
-                              {u.is_active ? t('admin.online', '在线') : t('admin.offline', '离线')}
+                            <span className={`inline-block w-2 h-2 rounded-full ${u.is_online_app ? 'bg-green-400' : 'bg-muted-foreground/40'}`} />
+                            <span className={`text-xs ${u.is_online_app ? 'text-green-400' : 'text-muted-foreground'}`}>
+                              {u.is_online_app ? t('admin.online', '在线') : t('admin.offline', '离线')}
                             </span>
                           </div>
                         </td>

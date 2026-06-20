@@ -291,6 +291,17 @@ class AuthService:
         ).first()
         return session is not None
 
+    def is_user_online_by_client_type(self, db: Session, user_id: int, client_type: str) -> bool:
+        """按客户端类型检查用户在线状态"""
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=5)
+        session = db.query(UserSession).filter(
+            UserSession.user_id == user_id,
+            UserSession.client_type == client_type,
+            UserSession.logout_time.is_(None),
+            UserSession.last_activity >= cutoff,
+        ).first()
+        return session is not None
+
     def delete_user(self, db: Session, user_id: int) -> bool:
         """硬删除用户及其会话记录"""
         user = self.get_user_by_id(db, user_id)
