@@ -204,12 +204,6 @@ export function AdminUsersPage() {
     }
   }
 
-  // --- Get APP latest session info ---
-  const getAppSessionInfo = (userId: number) => {
-    const appSession = sessions.find(s => s.client_type === 'app' && s.user_id === userId)
-    return appSession || null
-  }
-
   const resetForm = () => {
     setFormUsername('')
     setFormPassword('')
@@ -342,90 +336,77 @@ export function AdminUsersPage() {
                 {users.map((u) => {
                   const appInfo = appSessionsCache[u.id]
                   return (
-                    <tr key={u.id} className="border-t border-border hover:bg-muted/30 transition-colors">
-                      <td className="px-4 py-3 text-foreground font-medium" rowSpan={2}>{u.username}</td>
-                      <td className="px-4 py-3" rowSpan={2}>
-                        <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs ${u.is_admin ? 'bg-purple-500/10 text-purple-400' : 'bg-blue-500/10 text-blue-400'}`}>
-                          {u.is_admin ? <Shield size={12} /> : <User size={12} />}
-                          {u.is_admin ? t('admin.admin', '管理员') : t('admin.user', '普通用户')}
-                        </span>
-                      </td>
-                      <td className="px-4 py-3 text-muted-foreground text-xs" rowSpan={2}>{u.city || '-'}</td>
-                      <td className="px-4 py-3 text-muted-foreground text-xs" rowSpan={2}>{u.operator || '-'}</td>
-                      <td className="px-4 py-3" rowSpan={2}>
-                        {u.license_expiry ? (
-                          <span className={`text-xs ${new Date(u.license_expiry) < new Date() ? 'text-red-400' : 'text-muted-foreground'}`}>
-                            {u.license_expiry.slice(0, 10)}
+                    <>
+                      {/* PC 行 */}
+                      <tr key={`${u.id}-pc`} className="border-t border-border hover:bg-muted/30 transition-colors">
+                        <td className="px-4 py-3 text-foreground font-medium" rowSpan={2}>{u.username}</td>
+                        <td className="px-4 py-3" rowSpan={2}>
+                          <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs ${u.is_admin ? 'bg-purple-500/10 text-purple-400' : 'bg-blue-500/10 text-blue-400'}`}>
+                            {u.is_admin ? <Shield size={12} /> : <User size={12} />}
+                            {u.is_admin ? t('admin.admin', '管理员') : t('admin.user', '普通用户')}
                           </span>
-                        ) : (
-                          <span className="text-xs text-muted-foreground">{t('admin.unlimited', '无限期')}</span>
-                        )}
-                      </td>
-                      {/* PC row */}
-                      <td className="px-4 py-3 text-xs text-muted-foreground">{t('admin.pcClient', 'PC端')}</td>
-                      <td className="px-4 py-3">
-                        <div className="flex items-center gap-1.5">
-                          <span className={`inline-block w-2 h-2 rounded-full ${
-                            u.is_online ? 'bg-green-400' : 'bg-muted-foreground/40'
-                          }`} />
-                          <span className={`text-xs ${u.is_online ? 'text-green-400' : 'text-muted-foreground'}`}>
-                            {u.is_online ? t('admin.online', '在线') : t('admin.offline', '离线')}
-                          </span>
-                        </div>
-                      </td>
-                      <td className="px-4 py-3 text-muted-foreground font-mono text-xs">{u.last_login_ip || '-'}</td>
-                      <td className="px-4 py-3 text-muted-foreground text-xs" rowSpan={2}>{formatDate(u.created_at)}</td>
-                      <td className="px-4 py-3 text-muted-foreground text-xs">{formatDate(u.last_login)}</td>
-                      <td className="px-4 py-3 text-muted-foreground text-xs">{formatDuration(u.total_usage_seconds)}</td>
-                      <td className="px-4 py-3" rowSpan={2}>
-                        <div className="flex items-center gap-1">
-                          <button
-                            onClick={() => openEdit(u)}
-                            className="p-1.5 rounded hover:bg-muted text-muted-foreground hover:text-foreground transition-colors"
-                            title={t('admin.edit', '编辑')}
-                          >
-                            <Pencil size={14} />
-                          </button>
-                          <button
-                            onClick={() => openResetPwd(u)}
-                            className="p-1.5 rounded hover:bg-muted text-muted-foreground hover:text-foreground transition-colors"
-                            title={t('admin.resetPassword', '重置密码')}
-                          >
-                            <Key size={14} />
-                          </button>
-                          <button
-                            onClick={() => openSessions(u)}
-                            className="p-1.5 rounded hover:bg-muted text-muted-foreground hover:text-foreground transition-colors"
-                            title={t('admin.viewLoginRecords', '查看登录记录')}
-                          >
-                            <History size={14} />
-                          </button>
-                          <button
-                            onClick={() => handleToggleActive(u)}
-                            className={`p-1.5 rounded transition-colors ${
-                              u.is_active
-                                ? 'text-green-400 hover:bg-green-500/10'
-                                : 'text-red-400 hover:bg-red-500/10'
-                            }`}
-                            title={u.is_active ? t('admin.active', '已启用') : t('admin.disabled', '已禁用')}
-                          >
-                            {u.is_active ? <Circle size={14} className="fill-current" /> : <Ban size={14} />}
-                          </button>
-                          <button
-                            onClick={() => handleDelete(u)}
-                            disabled={u.is_admin}
-                            className={`p-1.5 rounded transition-colors ${
-                              u.is_admin
-                                ? 'text-muted-foreground/30 cursor-not-allowed'
-                                : 'hover:bg-red-500/10 text-muted-foreground hover:text-red-400'
-                            }`}
-                            title={u.is_admin ? t('admin.cannotDeleteAdmin', '不能删除管理员') : t('admin.delete', '删除')}
-                          >
-                            <Trash2 size={14} />
-                          </button>
-                        </div>
-                      </td>
-                    </tr>
+                        </td>
+                        <td className="px-4 py-3 text-muted-foreground text-xs" rowSpan={2}>{u.city || '-'}</td>
+                        <td className="px-4 py-3 text-muted-foreground text-xs" rowSpan={2}>{u.operator || '-'}</td>
+                        <td className="px-4 py-3" rowSpan={2}>
+                          {u.license_expiry ? (
+                            <span className={`text-xs ${new Date(u.license_expiry) < new Date() ? 'text-red-400' : 'text-muted-foreground'}`}>
+                              {u.license_expiry.slice(0, 10)}
+                            </span>
+                          ) : (
+                            <span className="text-xs text-muted-foreground">{t('admin.unlimited', '无限期')}</span>
+                          )}
+                        </td>
+                        {/* PC 行 */}
+                        <td className="px-4 py-3 text-xs text-muted-foreground">{t('admin.pcClient', 'PC端')}</td>
+                        <td className="px-4 py-3">
+                          <div className="flex items-center gap-1.5">
+                            <span className={`inline-block w-2 h-2 rounded-full ${u.is_online ? 'bg-green-400' : 'bg-muted-foreground/40'}`} />
+                            <span className={`text-xs ${u.is_online ? 'text-green-400' : 'text-muted-foreground'}`}>
+                              {u.is_online ? t('admin.online', '在线') : t('admin.offline', '离线')}
+                            </span>
+                          </div>
+                        </td>
+                        <td className="px-4 py-3 text-muted-foreground font-mono text-xs">{u.last_login_ip || '-'}</td>
+                        <td className="px-4 py-3 text-muted-foreground text-xs" rowSpan={2}>{formatDate(u.created_at)}</td>
+                        <td className="px-4 py-3 text-muted-foreground text-xs">{formatDate(u.last_login)}</td>
+                        <td className="px-4 py-3 text-muted-foreground text-xs">{formatDuration(u.total_usage_seconds)}</td>
+                        <td className="px-4 py-3" rowSpan={2}>
+                          <div className="flex items-center gap-1">
+                            <button onClick={() => openEdit(u)} className="p-1.5 rounded hover:bg-muted text-muted-foreground hover:text-foreground transition-colors" title={t('admin.edit', '编辑')}>
+                              <Pencil size={14} />
+                            </button>
+                            <button onClick={() => openResetPwd(u)} className="p-1.5 rounded hover:bg-muted text-muted-foreground hover:text-foreground transition-colors" title={t('admin.resetPassword', '重置密码')}>
+                              <Key size={14} />
+                            </button>
+                            <button onClick={() => openSessions(u)} className="p-1.5 rounded hover:bg-muted text-muted-foreground hover:text-foreground transition-colors" title={t('admin.viewLoginRecords', '查看登录记录')}>
+                              <History size={14} />
+                            </button>
+                            <button onClick={() => handleToggleActive(u)} className={`p-1.5 rounded transition-colors ${u.is_active ? 'text-green-400 hover:bg-green-500/10' : 'text-red-400 hover:bg-red-500/10'}`} title={u.is_active ? t('admin.active', '已启用') : t('admin.disabled', '已禁用')}>
+                              {u.is_active ? <Circle size={14} className="fill-current" /> : <Ban size={14} />}
+                            </button>
+                            <button onClick={() => handleDelete(u)} disabled={u.is_admin} className={`p-1.5 rounded transition-colors ${u.is_admin ? 'text-muted-foreground/30 cursor-not-allowed' : 'hover:bg-red-500/10 text-muted-foreground hover:text-red-400'}`} title={u.is_admin ? t('admin.cannotDeleteAdmin', '不能删除管理员') : t('admin.delete', '删除')}>
+                              <Trash2 size={14} />
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                      {/* APP 行 */}
+                      <tr key={`${u.id}-app`} className="border-t border-border hover:bg-muted/30 transition-colors">
+                        <td className="px-4 py-3 text-xs text-muted-foreground">{t('admin.appClient', 'APP端')}</td>
+                        <td className="px-4 py-3">
+                          <div className="flex items-center gap-1.5">
+                            <span className={`inline-block w-2 h-2 rounded-full ${u.is_active ? 'bg-green-400' : 'bg-muted-foreground/40'}`} />
+                            <span className={`text-xs ${u.is_active ? 'text-green-400' : 'text-muted-foreground'}`}>
+                              {u.is_active ? t('admin.online', '在线') : t('admin.offline', '离线')}
+                            </span>
+                          </div>
+                        </td>
+                        <td className="px-4 py-3 text-muted-foreground font-mono text-xs">{appInfo?.ip_address || '-'}</td>
+                        <td className="px-4 py-3 text-muted-foreground text-xs">{appInfo ? formatDate(appInfo.last_activity) : '-'}</td>
+                        <td className="px-4 py-3 text-muted-foreground text-xs">-</td>
+                      </tr>
+                    </>
                   )
                 })}
               </tbody>
