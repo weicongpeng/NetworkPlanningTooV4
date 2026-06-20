@@ -247,6 +247,8 @@ export function AdminUsersPage() {
   }, [users])
 
   const onlineCount = users.filter(u => u.is_online).length
+  const onlinePcCount = users.filter(u => u.is_online_pc).length
+  const onlineAppCount = users.filter(u => u.is_online_app).length
 
   return (
     <div className="p-6 space-y-6">
@@ -258,19 +260,7 @@ export function AdminUsersPage() {
         <h1 className="text-base font-bold text-foreground">{t('admin.title', '用户管理')}</h1>
       </div>
 
-      {/* Stats */}
-      <div className="flex gap-4 text-sm">
-        <div className="px-3 py-2 bg-muted/30 rounded-lg border border-border">
-          <span className="text-muted-foreground">{t('admin.totalUsers', '总用户数')}: </span>
-          <span className="text-foreground font-medium">{total}</span>
-        </div>
-        <div className="px-3 py-2 bg-muted/30 rounded-lg border border-border">
-          <span className="text-muted-foreground">PC在线: </span>
-          <span className="text-green-400 font-medium">{onlineCount}</span>
-        </div>
-      </div>
-
-      {/* Search & Refresh & Add User */}
+      {/* Search & Refresh & Stats & Add User */}
       <div className="flex gap-3 items-center">
         <div className="relative flex-1 max-w-sm">
           <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground" />
@@ -290,6 +280,13 @@ export function AdminUsersPage() {
         >
           <RefreshCw size={16} />
         </button>
+        <div className="text-sm text-muted-foreground whitespace-nowrap">
+          共<span className="text-foreground font-medium mx-0.5">{total}</span>个用户
+          <span className="mx-2 text-border">|</span>
+          在线用户<span className="text-foreground font-medium mx-0.5">{onlineCount}</span>
+          <span className="ml-1.5">PC<span className="text-green-400 font-medium mx-0.5">{onlinePcCount}</span></span>
+          <span className="ml-1.5">APP<span className="text-green-400 font-medium mx-0.5">{onlineAppCount}</span></span>
+        </div>
         <button
           onClick={() => { resetForm(); setShowAddModal(true) }}
           className="ml-auto px-4 py-2 bg-primary text-primary-foreground rounded-lg hover:opacity-90 transition-opacity flex items-center gap-2"
@@ -418,8 +415,7 @@ export function AdminUsersPage() {
           </div>
 
           {/* Pagination */}
-          <div className="flex items-center justify-between">
-            <span className="text-sm text-muted-foreground">{t('admin.totalUsers', { count: total })}</span>
+          <div className="flex items-center justify-end">
             <div className="flex items-center gap-2">
               <button
                 onClick={() => setPage(p => Math.max(1, p - 1))}
