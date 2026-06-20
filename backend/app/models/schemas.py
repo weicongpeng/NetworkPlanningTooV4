@@ -575,7 +575,6 @@ class UserCreate(BaseModel):
     license_expiry: Optional[str] = Field(default=None, description="授权截止日期 (ISO格式)")
     city: Optional[str] = Field(default=None, max_length=100, description="地市")
     operator: Optional[str] = Field(default=None, max_length=50, description="运营商")
-    user_type: str = Field(default='pc', description="用户类型: pc/app")
     @model_validator(mode="after")
     def passwords_match(self) -> "UserCreate":
         if self.password != self.confirm_password:
@@ -588,6 +587,7 @@ class UserLogin(BaseModel):
 
     username: str = Field(min_length=1, description="用户名")
     password: str = Field(min_length=1, description="密码")
+    client_type: str = Field(default='pc', description="客户端类型: pc/app")
 
 
 class ChangePasswordRequest(BaseModel):
