@@ -182,9 +182,13 @@ export function AdminUsersPage() {
   const handleDelete = async (user: UserInfo) => {
     if (!confirm(t('admin.deleteConfirm', { username: user.username }))) return
     try {
-      await adminUserApi.deleteUser(user.id)
-      fetchUsers()
-    } catch { /* ignore */ }
+      const result = await adminUserApi.deleteUser(user.id)
+      if (result.success) {
+        fetchUsers()
+      }
+    } catch (err: any) {
+      setError(err?.message || t('admin.deleteFailed'))
+    }
   }
 
   // --- View Sessions ---

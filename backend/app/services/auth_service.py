@@ -11,7 +11,7 @@ from jose import jwt, JWTError
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
-from app.models.database import User, UserSession
+from app.models.database import User, UserSession, UserSettings, TaskResult, Workbook, Site, Sector, GeoFile, Layer
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
@@ -303,11 +303,22 @@ class AuthService:
         return session is not None
 
     def delete_user(self, db: Session, user_id: int) -> bool:
-        """硬删除用户及其会话记录"""
+        """硬删除用户及其所有关联数据"""
         user = self.get_user_by_id(db, user_id)
         if not user:
             return False
+        # 级联删除所有关联数据（按外键依赖顺序）
         db.query(UserSession).filter(UserSession.user_id == user_id).delete()
+        db.query(UserSettings).filter(UserSettings.user_id == user_id).delete()
+        db.query(TaskResult).filter(TaskResult.user_name == user.username).delete()
+        # 获取该用户的所有 workbook_id
+        workbook_ids = [w.id for w in db.query(Workbook).filter(Workbook.user_id == user_id).all()]
+        for wid in workbook_ids:
+            db.query(Sector).filter(Sector.workbook_id == wid).delete()
+            db.query(Site).filter(Site.workbook_id == wid).delete()
+        db.query(Workbook).filter(Workbook.user_id == user_id).delete()
+        db.query(GeoFile).filter(GeoFile.user_id == user_id).delete()
+        db.query(Layer).filter(Layer.user_id == user_id).delete()
         db.delete(user)
         db.commit()
         return True
