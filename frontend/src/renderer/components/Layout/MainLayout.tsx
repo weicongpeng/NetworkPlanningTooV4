@@ -53,7 +53,15 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
     { type: 'link', name: t('nav.map'), href: '/map', icon: Map },
     { type: 'link', name: t('nav.config'), href: '/license', icon: Shield },
     ...(isAuthenticated && user?.is_admin ? [
-      { type: 'link' as const, name: t('admin.title', '用户管理'), href: '/admin/users', icon: Users }
+      {
+        type: 'group' as const,
+        name: t('admin.title', '用户管理'),
+        icon: Users,
+        children: [
+          { type: 'link', name: t('admin.pcUser', 'PC用户'), href: '/admin/users' },
+          { type: 'link', name: t('admin.appUser', 'APP用户'), href: '/admin/app-users' },
+        ],
+      },
     ] : []),
   ]
 
