@@ -221,29 +221,29 @@ export function AdminUsersPage() {
     setEditUser(null)
   }
 
-  // APP session info map: store latest app session info per user from the list
-  const [appSessionsCache, setAppSessionsCache] = useState<Record<number, UserSessionInfo | null>>({})
+  // Per-user session cache: latest PC and APP session
+  const [userSessionsCache, setUserSessionsCache] = useState<Record<number, { pc: UserSessionInfo | null; app: UserSessionInfo | null }>>({})
 
-  // Fetch APP sessions for all users in current page
+  // Fetch latest PC and APP session for each user in current page
   useEffect(() => {
-    const fetchAppSessions = async () => {
-      const cache: Record<number, UserSessionInfo | null> = {}
+    const fetchUserSessions = async () => {
+      const cache: Record<number, { pc: UserSessionInfo | null; app: UserSessionInfo | null }> = {}
       for (const u of users) {
         try {
           const result = await adminUserApi.getUser(u.id)
           if (result.success && result.data?.sessions) {
-            const appSessions = result.data.sessions.filter(s => s.client_type === 'app')
-            cache[u.id] = appSessions.length > 0 ? appSessions[0] : null
+            cache[u.id] = {
+              pc: result.data.sessions.find((s: UserSessionInfo) => s.client_type === 'pc') || null,
+              app: result.data.sessions.find((s: UserSessionInfo) => s.client_type === 'app') || null,
+            }
           }
         } catch {
-          cache[u.id] = null
+          cache[u.id] = { pc: null, app: null }
         }
       }
-      setAppSessionsCache(cache)
+      setUserSessionsCache(cache)
     }
-    if (users.length > 0) {
-      fetchAppSessions()
-    }
+    if (users.length > 0) fetchUserSessions()
   }, [users])
 
   const onlineCount = users.filter(u => u.is_online).length
@@ -335,7 +335,7 @@ export function AdminUsersPage() {
               </thead>
               <tbody>
                 {users.map((u) => {
-                  const appInfo = appSessionsCache[u.id]
+                  const sessionInfo = userSessionsCache[u.id] || { pc: null, app: null }
                   return (
                     <>
                       {/* PC 行 */}
@@ -358,7 +358,6 @@ export function AdminUsersPage() {
                             <span className="text-xs text-muted-foreground">{t('admin.unlimited', '无限期')}</span>
                           )}
                         </td>
-                        {/* PC 行 */}
                         <td className="px-4 py-3 text-xs text-muted-foreground">{t('admin.pcClient', 'PC端')}</td>
                         <td className="px-4 py-3">
                           <div className="flex items-center gap-1.5">
@@ -368,9 +367,9 @@ export function AdminUsersPage() {
                             </span>
                           </div>
                         </td>
-                        <td className="px-4 py-3 text-muted-foreground font-mono text-xs">{u.last_login_ip || '-'}</td>
+                        <td className="px-4 py-3 text-muted-foreground font-mono text-xs">{sessionInfo.pc?.ip_address || u.last_login_ip || '-'}</td>
                         <td className="px-4 py-3 text-muted-foreground text-xs" rowSpan={2}>{formatDate(u.created_at)}</td>
-                        <td className="px-4 py-3 text-muted-foreground text-xs">{formatDate(u.last_login)}</td>
+                        <td className="px-4 py-3 text-muted-foreground text-xs">{sessionInfo.pc ? formatDate(sessionInfo.pc.login_time) : formatDate(u.last_login)}</td>
                         <td className="px-4 py-3 text-muted-foreground text-xs">{formatDuration(u.total_usage_seconds)}</td>
                         <td className="px-4 py-3" rowSpan={2}>
                           <div className="flex items-center gap-1">
@@ -403,8 +402,8 @@ export function AdminUsersPage() {
                             </span>
                           </div>
                         </td>
-                        <td className="px-4 py-3 text-muted-foreground font-mono text-xs">{appInfo?.ip_address || '-'}</td>
-                        <td className="px-4 py-3 text-muted-foreground text-xs">{appInfo ? formatDate(appInfo.last_activity) : '-'}</td>
+                        <td className="px-4 py-3 text-muted-foreground font-mono text-xs">{sessionInfo.app?.ip_address || '-'}</td>
+                        <td className="px-4 py-3 text-muted-foreground text-xs">{sessionInfo.app ? formatDate(sessionInfo.app.login_time) : '-'}</td>
                         <td className="px-4 py-3 text-muted-foreground text-xs">-</td>
                       </tr>
                     </>
