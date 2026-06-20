@@ -13,8 +13,11 @@ import { MapPage } from './pages/MapPage'
 import { AdminUsersPage } from './pages/AdminUsersPage'
 import { useEffect } from 'react'
 import { startHealthCheck, stopHealthCheck } from '@/renderer/services/api'
+import { useHeartbeat } from './hooks/useHeartbeat'
 
 function App() {
+  useHeartbeat()
+
   // 启动时开始后端健康检查轮询
   useEffect(() => {
     startHealthCheck(15000)

@@ -89,6 +89,24 @@ async def get_me(current_user: User = Depends(get_current_user)):
     }
 
 
+@router.post("/ping")
+async def ping(
+    current_user: User = Depends(get_current_user),
+    jti: str | None = Depends(get_token_jti),
+    db: Session = Depends(get_db),
+):
+    """
+    心跳检测：更新当前会话的 last_activity，延长在线状态。
+    APP 和 PC 端应定时（4-5分钟）调用此接口。
+    """
+    if jti:
+        auth_service.update_session_activity(db, jti)
+    return {
+        "success": True,
+        "last_activity": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 @router.post("/logout")
 async def logout(
     current_user: User = Depends(get_current_user),

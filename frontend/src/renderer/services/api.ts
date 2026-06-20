@@ -951,6 +951,10 @@ export const authApi = {
     return apiClient.get('/auth/me') as any
   },
 
+  ping: async (): Promise<ApiResponse<{ last_activity: string }>> => {
+    return apiClient.post('/auth/ping') as any
+  },
+
   logout: async (): Promise<ApiResponse<any>> => {
     return apiClient.post('/auth/logout') as any
   },
