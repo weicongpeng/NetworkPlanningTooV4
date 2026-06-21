@@ -55,6 +55,12 @@ async def lifespan(app: FastAPI):
     settings.DATA_DIR.mkdir(parents=True, exist_ok=True)
     settings.TEMPLATE_DIR.mkdir(parents=True, exist_ok=True)
 
+    # 创建 APK 文件存储目录
+    BASE_DIR = Path(__file__).parent.parent
+    apks_dir = BASE_DIR / "apks"
+    apks_dir.mkdir(parents=True, exist_ok=True)
+    logger.info(f"✅ APK 存储目录已创建: {apks_dir}")
+
     # 🔥 启动时自动清理无效数据索引
     # 清理文件已删除但索引中仍存在的无效项
     try:

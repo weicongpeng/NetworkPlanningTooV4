@@ -732,3 +732,30 @@ class LayerOut(BaseModel):
     bbox: Optional[List[float]] = None
     file_size: Optional[int] = None
     created_at: str
+
+
+# ============== APP 版本管理 ==============
+class AppVersionCreate(BaseModel):
+    """创建 APP 版本请求"""
+    version: str = Field(min_length=1, max_length=20, description="版本号，如 1.2.0")
+    changelog: Optional[str] = Field(default=None, description="更新说明")
+    is_latest: bool = Field(default=False, description="是否标记为最新版本")
+
+
+class AppVersionUpdate(BaseModel):
+    """更新 APP 版本请求"""
+    version: Optional[str] = Field(default=None, max_length=20)
+    changelog: Optional[str] = None
+    is_latest: Optional[bool] = None
+
+
+class AppVersionOut(BaseModel):
+    """APP 版本响应"""
+    id: int
+    version: str
+    changelog: Optional[str] = None
+    apk_filename: str
+    file_size: Optional[int] = None
+    is_latest: bool
+    created_at: str
+    updated_at: Optional[str] = None

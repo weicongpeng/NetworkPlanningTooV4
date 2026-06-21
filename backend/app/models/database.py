@@ -251,3 +251,31 @@ class TaskResult(Base):
         Index("idx_task_results_type", "task_type"),
         Index("idx_task_results_created", "created_at"),
     )
+
+
+class AppVersion(Base):
+    """APP 版本记录"""
+    __tablename__ = "app_versions"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    version = Column(String(20), nullable=False, index=True)
+    changelog = Column(Text, nullable=True)
+    apk_filename = Column(String(255), nullable=False)
+    apk_path = Column(Text, nullable=False)
+    file_size = Column(Integer, nullable=True)
+    is_latest = Column(Boolean, default=False, nullable=False)
+    created_at = Column(String(30), nullable=False)
+    updated_at = Column(String(30), nullable=True)
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "version": self.version,
+            "changelog": self.changelog,
+            "apk_filename": self.apk_filename,
+            "apk_path": self.apk_path,
+            "file_size": self.file_size,
+            "is_latest": self.is_latest,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+        }
