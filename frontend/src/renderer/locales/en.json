@@ -55,6 +55,9 @@
     "zh": "中文",
     "en": "English"
   },
+  "sidebar": {
+    "appVersions": "App Versions"
+  },
   "nav": {
     "home": "Home",
     "data": "Data",
@@ -810,6 +813,29 @@
     "registerSuccess": "Registration successful",
     "logoutSuccess": "Logged out",
     "licenseExpired": "License expired, please contact administrator"
+  },
+  "appVersions": {
+    "title": "App Version Management",
+    "upload": "Upload APK",
+    "version": "Version",
+    "changelog": "Changelog",
+    "changelogPlaceholder": "Enter changelog, one per line...",
+    "fileSize": "File Size",
+    "status": "Status",
+    "latest": "Latest",
+    "old": "Old",
+    "createdAt": "Upload Time",
+    "markAsLatest": "Mark as latest version",
+    "selectFile": "Select APK file",
+    "versionRequired": "Please enter version number",
+    "uploadSuccess": "Upload successful",
+    "uploadFailed": "Upload failed",
+    "editTitle": "Edit Version",
+    "editSuccess": "Update successful",
+    "editFailed": "Update failed",
+    "deleteConfirm": "Are you sure you want to delete version {{version}}?",
+    "deleteSuccess": "Delete successful",
+    "deleteFailed": "Delete failed"
   },
   "admin": {
     "title": "User Management",

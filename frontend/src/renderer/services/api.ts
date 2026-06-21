@@ -1007,3 +1007,36 @@ export const userSettingsApi = {
     return apiClient.put('/user/settings', { settings }) as any
   },
 }
+
+// ============== APP 版本管理 API ==============
+export const appVersionsApi = {
+  /** 获取版本列表（管理员） */
+  list: async (page = 1, pageSize = 20) => {
+    const res = await apiClient.get('/app-versions', { params: { page, page_size: pageSize } })
+    return res.data
+  },
+
+  /** 获取最新版本（公开） */
+  getLatest: async () => {
+    const res = await apiClient.get('/app-versions/latest')
+    return res.data
+  },
+
+  /** 上传新版本（管理员） */
+  upload: async (formData: FormData) => {
+    const res = await uploadClient.post('/app-versions', formData)
+    return res.data
+  },
+
+  /** 编辑版本（管理员） */
+  update: async (id: number, data: { version?: string; changelog?: string; is_latest?: boolean }) => {
+    const res = await apiClient.put(`/app-versions/${id}`, data)
+    return res.data
+  },
+
+  /** 删除版本（管理员） */
+  delete: async (id: number) => {
+    const res = await apiClient.delete(`/app-versions/${id}`)
+    return res.data
+  },
+}

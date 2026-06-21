@@ -56,6 +56,9 @@
     "zh": "中文",
     "en": "English"
   },
+  "sidebar": {
+    "appVersions": "APP 版本管理"
+  },
   "nav": {
     "home": "首页",
     "data": "数据管理",
@@ -823,6 +826,29 @@
     "registerSuccess": "注册成功",
     "logoutSuccess": "已退出登录",
     "licenseExpired": "许可证已过期，请联系管理员"
+  },
+  "appVersions": {
+    "title": "APP 版本管理",
+    "upload": "上传 APK",
+    "version": "版本号",
+    "changelog": "更新说明",
+    "changelogPlaceholder": "请输入更新说明，每行一条...",
+    "fileSize": "文件大小",
+    "status": "状态",
+    "latest": "最新",
+    "old": "旧版",
+    "createdAt": "上传时间",
+    "markAsLatest": "标记为最新版本",
+    "selectFile": "选择 APK 文件",
+    "versionRequired": "请输入版本号",
+    "uploadSuccess": "上传成功",
+    "uploadFailed": "上传失败",
+    "editTitle": "编辑版本信息",
+    "editSuccess": "修改成功",
+    "editFailed": "修改失败",
+    "deleteConfirm": "确定要删除版本 {{version}} 吗？",
+    "deleteSuccess": "删除成功",
+    "deleteFailed": "删除失败"
   },
   "admin": {
     "title": "用户管理",
