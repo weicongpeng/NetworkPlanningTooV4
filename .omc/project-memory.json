@@ -18,8 +18,8 @@
     "runtime": null
   },
   "build": {
-    "buildCommand": null,
-    "testCommand": null,
+    "buildCommand": "cd /home/pwc/NetworkPlanningTooV3/frontend && npx tsc --noEmit 2>&1 | grep -c \"error TS\"",
+    "testCommand": "cd /home/pwc/NetworkPlanningTooV3/backend && .venv/bin/python -m pytest tests/ -q 2>&1 | tail -3",
     "lintCommand": null,
     "devCommand": null,
     "scripts": {}
@@ -247,21 +247,21 @@
       "type": "file"
     },
     {
+      "path": "frontend/src/renderer/pages/DataPage.tsx",
+      "accessCount": 59,
+      "lastAccessed": 1785481064371,
+      "type": "file"
+    },
+    {
       "path": "backend/app/services/task_manager.py",
       "accessCount": 41,
       "lastAccessed": 1785252725860,
       "type": "file"
     },
     {
-      "path": "frontend/src/renderer/pages/DataPage.tsx",
-      "accessCount": 41,
-      "lastAccessed": 1785476879737,
-      "type": "file"
-    },
-    {
       "path": "backend/app/api/v1/endpoints/data.py",
-      "accessCount": 27,
-      "lastAccessed": 1785476797215,
+      "accessCount": 38,
+      "lastAccessed": 1785479513899,
       "type": "file"
     },
     {
@@ -271,15 +271,15 @@
       "type": "file"
     },
     {
-      "path": "frontend/src/renderer/pages/PCIPage.tsx",
-      "accessCount": 18,
-      "lastAccessed": 1785387891193,
+      "path": "frontend/src/renderer/services/api.ts",
+      "accessCount": 19,
+      "lastAccessed": 1785480251507,
       "type": "file"
     },
     {
-      "path": "frontend/src/renderer/services/api.ts",
+      "path": "frontend/src/renderer/pages/PCIPage.tsx",
       "accessCount": 18,
-      "lastAccessed": 1785476811050,
+      "lastAccessed": 1785387891193,
       "type": "file"
     },
     {
@@ -349,6 +349,12 @@
       "type": "file"
     },
     {
+      "path": "shared/types.ts",
+      "accessCount": 5,
+      "lastAccessed": 1785480737975,
+      "type": "file"
+    },
+    {
       "path": "frontend/src/renderer/pages/TACPlanningPage.tsx",
       "accessCount": 4,
       "lastAccessed": 1785222317450,
@@ -370,12 +376,6 @@
       "path": "backend/app/api/v1/endpoints/tac.py",
       "accessCount": 3,
       "lastAccessed": 1785211724657,
-      "type": "file"
-    },
-    {
-      "path": "shared/types.ts",
-      "accessCount": 3,
-      "lastAccessed": 1785252725748,
       "type": "file"
     },
     {
