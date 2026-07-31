@@ -90,3 +90,23 @@ async def get_token_jti(
     if payload is None:
         return None
     return payload.get("jti")
+
+
+def require_permission(perm: str):
+    """权限校验依赖工厂：管理员自动通过，普通用户需对应权限位为 True"""
+    async def checker(current_user=Depends(get_current_user)):
+        if current_user.is_admin:
+            return current_user
+        if not getattr(current_user, perm, False):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="无此操作权限，请联系管理员",
+            )
+        return current_user
+    return checker
+
+
+require_data_import = require_permission("can_data_import")
+require_data_delete = require_permission("can_data_delete")
+require_data_update = require_permission("can_data_update")
+require_cell_entry = require_permission("can_cell_entry")
