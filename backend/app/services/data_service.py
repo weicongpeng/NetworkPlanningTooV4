@@ -1416,7 +1416,8 @@ class DataService:
                 Sector.sector_id.in_([str(cell_id), f"{str(site_id)}_{str(cell_id)}"]),
             ).first()
             return str(row[0]).upper() if row and row[0] else None
-        except Exception:
+        except Exception as e:
+            safe_print(f"[DataService] _get_sector_network_type 查询失败: {e}")
             return None
         finally:
             db.close()

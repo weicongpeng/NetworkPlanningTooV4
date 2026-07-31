@@ -96,6 +96,43 @@ def test_get_sector_network_type(dup_env):
     assert data_service._get_sector_network_type(dup_env, "111", "1") == "LTE"
     assert data_service._get_sector_network_type(dup_env, "222", "1") == "NR"
     assert data_service._get_sector_network_type(dup_env, "999", "9") is None
+    # 空 siteId/cellId → 早返回 None，不触发 DB 查询
+    assert data_service._get_sector_network_type(dup_env, "", "1") is None
+    assert data_service._get_sector_network_type(dup_env, "111", "") is None
+
+
+def test_get_sector_network_type_pure_cell_id(dup_env):
+    """纯 cellId 存储格式（如 sector_id='9'）也能被制式查询匹配到"""
+    from app.core.database import SessionLocal
+    from app.models.database import Site, Sector
+
+    db = SessionLocal()
+    site = None
+    sector = None
+    try:
+        site = Site(
+            workbook_id=dup_env, user_id=1, site_id="333", name="纯格式站",
+            network_type="NR", longitude=3.0, latitude=3.0,
+        )
+        db.add(site)
+        db.flush()
+        # 纯小区标识，不带 "siteId_" 前缀（全量工参解析写入的存储格式）
+        sector = Sector(
+            site_id_fk=site.id, workbook_id=dup_env, user_id=1,
+            sector_id="9", name="纯格式小区", longitude=3.0, latitude=3.0, azimuth=0,
+        )
+        db.add(sector)
+        db.commit()
+
+        # 纯格式 cellId 也能通过 sector_id.in_(["9", "333_9"]) 匹配到
+        assert data_service._get_sector_network_type(dup_env, "333", "9") == "NR"
+    finally:
+        if sector is not None:
+            db.delete(sector)
+        if site is not None:
+            db.delete(site)
+        db.commit()
+        db.close()
 
 
 def test_batch_duplicate_message_same_and_cross(dup_env, tmp_path, monkeypatch):
