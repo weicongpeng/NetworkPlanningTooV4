@@ -46,6 +46,12 @@ class User(Base):
     operator = Column(String(50), nullable=True)
     user_type = Column(String(10), default='pc', nullable=False)
 
+    # 细粒度权限（PC 端数据管理页面操作权限，默认全部关闭，管理员自动拥有全部权限）
+    can_data_import = Column(Boolean, default=False, nullable=False)
+    can_data_delete = Column(Boolean, default=False, nullable=False)
+    can_data_update = Column(Boolean, default=False, nullable=False)
+    can_cell_entry = Column(Boolean, default=False, nullable=False)
+
     sessions = relationship("UserSession", back_populates="user", lazy="dynamic")
 
     def to_dict(self):
@@ -63,6 +69,10 @@ class User(Base):
             "city": self.city,
             "operator": self.operator,
             "user_type": self.user_type,
+            "can_data_import": self.can_data_import,
+            "can_data_delete": self.can_data_delete,
+            "can_data_update": self.can_data_update,
+            "can_cell_entry": self.can_cell_entry,
         }
 
 
