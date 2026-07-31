@@ -118,11 +118,11 @@ def test_check_duplicates_endpoint_smoke(dup_env):
     # 确保 users 表存在（不依赖 app lifespan）
     init_db()
 
-    # 构造具备 can_cell_entry 权限的测试用户 + 合法 token。
-    # 该 token 未创建 UserSession 记录 → is_token_revoked 与 verify_session_ip 均放行。
     username = "dup_smoke_user"
     db = SessionLocal()
     try:
+        # 构造具备 can_cell_entry 权限的测试用户 + 合法 token。
+        # 该 token 未创建 UserSession 记录 → is_token_revoked 与 verify_session_ip 均放行。
         existing = auth_service.get_user_by_username(db, username)
         if existing:
             db.delete(existing)
@@ -138,35 +138,36 @@ def test_check_duplicates_endpoint_smoke(dup_env):
 
     # 不使用 with 语句创建 TestClient：跳过 lifespan，避免 cleanup_index()
     # 清掉 dup_env fixture 注入的全量工参 index 条目，导致查重找不到目标文件。
-    client = TestClient(create_app())
-    resp = client.post(
-        "/api/v1/data/full-params/cells/check-duplicates",
-        headers={"Authorization": f"Bearer {token}"},
-        json={
-            "cells": [
-                {"siteId": "111", "cellId": "1", "networkType": "NR"},   # 库中 LTE → lte=True
-                {"siteId": "222", "cellId": "1", "networkType": "NR"},   # 库中 NR → nr=True
-                {"siteId": "999", "cellId": "9", "networkType": "NR"},   # 不存在
-            ]
-        },
-    )
-    assert resp.status_code == 200, f"HTTP {resp.status_code}: {resp.text}"
-    body = resp.json()
-    assert body["success"] is True
-    data = body["data"]
-    assert data["exists"]["111_1"] == {"lte": True, "nr": False}
-    assert data["exists"]["222_1"] == {"lte": False, "nr": True}
-    assert data["exists"]["999_9"] == {"lte": False, "nr": False}
-    assert "111_1" in data["duplicates"]
-    assert "222_1" in data["duplicates"]
-    assert "999_9" not in data["duplicates"]
-
-    # 清理测试用户
-    db = SessionLocal()
     try:
-        user = auth_service.get_user_by_username(db, username)
-        if user:
-            db.delete(user)
-            db.commit()
+        client = TestClient(create_app())
+        resp = client.post(
+            "/api/v1/data/full-params/cells/check-duplicates",
+            headers={"Authorization": f"Bearer {token}"},
+            json={
+                "cells": [
+                    {"siteId": "111", "cellId": "1", "networkType": "NR"},   # 库中 LTE → lte=True
+                    {"siteId": "222", "cellId": "1", "networkType": "NR"},   # 库中 NR → nr=True
+                    {"siteId": "999", "cellId": "9", "networkType": "NR"},   # 不存在
+                ]
+            },
+        )
+        assert resp.status_code == 200, f"HTTP {resp.status_code}: {resp.text}"
+        body = resp.json()
+        assert body["success"] is True
+        data = body["data"]
+        assert data["exists"]["111_1"] == {"lte": True, "nr": False}
+        assert data["exists"]["222_1"] == {"lte": False, "nr": True}
+        assert data["exists"]["999_9"] == {"lte": False, "nr": False}
+        assert "111_1" in data["duplicates"]
+        assert "222_1" in data["duplicates"]
+        assert "999_9" not in data["duplicates"]
     finally:
-        db.close()
+        # 无论断言是否通过，都清理测试用户，避免泄漏用户行
+        db = SessionLocal()
+        try:
+            user = auth_service.get_user_by_username(db, username)
+            if user:
+                db.delete(user)
+                db.commit()
+        finally:
+            db.close()

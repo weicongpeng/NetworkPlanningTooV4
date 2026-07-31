@@ -93,7 +93,10 @@ class CellBatchCreateRequest(BaseModel):
 
 
 class CellDupCheckItem(BaseModel):
-    """批量查重单项：siteId + cellId + 面板制式"""
+    """批量查重单项：siteId + cellId + 面板制式
+
+    networkType 当前为信息字段（默认 LTE 避免旧请求 422），Task 4 起按制式消费。
+    """
 
     siteId: str
     cellId: str

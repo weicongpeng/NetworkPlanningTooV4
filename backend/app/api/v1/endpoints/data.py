@@ -268,7 +268,6 @@ async def check_cell_duplicates(
         return {"success": True, "data": {"duplicates": [], "exists": {}}}
 
     try:
-        from app.services.data_service import data_service
         cells = [
             {
                 "siteId": c.siteId,
@@ -284,7 +283,9 @@ async def check_cell_duplicates(
     except Exception as e:
         import traceback
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        error_msg = str(e).replace("✗", "x")
+        safe_detail = error_msg.encode("utf-8", "replace").decode("utf-8")
+        raise HTTPException(status_code=500, detail=safe_detail)
 
 
 @router.post("/update-parameters", response_model=Dict[str, Any])
