@@ -1408,15 +1408,19 @@ class DataService:
             return f"[{panel_type}]小区 {cell_name} 已重复，信息已更新覆盖"
         return f"[{panel_type}]小区 {cell_name} 已在[{existing_type}]工参中存在，请检查"
 
-    def check_cell_duplicates(self, cgi_list: List[str]) -> Dict[str, Any]:
-        """批量检查 CGI (siteId_cellId) 是否已存在于数据库
+    def check_cell_duplicates(self, cells: List[Dict]) -> Dict[str, Any]:
+        """按制式检查 CGI (siteId_cellId) 是否已存在于数据库
 
         通过 join sites 表按 site_id + cell_id 匹配 Sector.sector_id，
-        兼容纯 cellId 与 siteId_cellId 两种存储格式。
+        兼容纯 cellId 与 siteId_cellId 两种存储格式，并带出该小区的制式。
 
-        返回: { duplicates: ["siteId_cellId", ...], exists: {"key": True, ...} }
+        cells: [{ siteId, cellId, networkType }]
+        返回: {
+            "duplicates": ["siteId_cellId", ...],
+            "exists": { "siteId_cellId": {"lte": bool, "nr": bool}, ... },
+        }
         """
-        if not cgi_list:
+        if not cells:
             return {"duplicates": [], "exists": {}}
 
         # 定位全量工参文件
@@ -1429,32 +1433,31 @@ class DataService:
             safe_print("[DataService] 查重失败: 未找到全量工参文件")
             return {"duplicates": [], "exists": {}}
 
-        # 解析 cgi_list（siteId_cellId）为 (site_id, cell_id) 对
-        pairs = []
-        for cgi in cgi_list:
-            if "_" not in str(cgi):
-                continue
-            parts = str(cgi).split("_", 1)
-            pairs.append((parts[0], parts[1]))
-
         db = SessionLocal()
         try:
-            duplicate_set = set()
-            exists = {k: False for k in cgi_list}
-            for site_id, cell_id in pairs:
-                row = db.query(Sector.id).join(
-                    Site, Sector.site_id_fk == Site.id
+            exists: Dict[str, Dict[str, bool]] = {}
+            for cell in cells:
+                site_id = str(cell.get("siteId", "")).strip()
+                cell_id = str(cell.get("cellId", "")).strip()
+                if not site_id or not cell_id:
+                    continue
+                key = f"{site_id}_{cell_id}"
+                flags = {"lte": False, "nr": False}
+                row = db.query(Site.network_type).join(
+                    Sector, Sector.site_id_fk == Site.id
                 ).filter(
                     Site.workbook_id == full_params_id,
                     Site.site_id == str(site_id),
                     Sector.sector_id.in_([str(cell_id), f"{str(site_id)}_{str(cell_id)}"]),
                 ).first()
-                cgi = f"{site_id}_{cell_id}"
-                if row is not None:
-                    duplicate_set.add(cgi)
-                    exists[cgi] = True
+                if row and row[0]:
+                    nt = str(row[0]).upper()
+                    if nt in ("LTE", "NR"):
+                        flags[nt.lower()] = True
+                exists[key] = flags
+            duplicates = [k for k, v in exists.items() if v["lte"] or v["nr"]]
             return {
-                "duplicates": list(duplicate_set),
+                "duplicates": duplicates,
                 "exists": exists,
             }
         except Exception as e:
