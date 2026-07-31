@@ -1394,6 +1394,7 @@ function NewCellEntryCard({
   const [batchResults, setBatchResults] = useState<Array<{ index: number; networkType: string; cellName: string; siteId: string; cellId: string; success: boolean; message: string }> | null>(null)
   const [batchError, setBatchError] = useState<string | null>(null)
   const [expanded, setExpanded] = useState(false)
+  const [importing, setImporting] = useState(false) // 一键导入进行中（覆盖预查重阶段，保证即时反馈）
   const [duplicateMap, setDuplicateMap] = useState<Record<string, 'same' | 'cross'>>({})
 
   const hasFullParams = fullParamFiles.length > 0
@@ -1621,9 +1622,11 @@ function NewCellEntryCard({
   }
 
   const handleBatchImport = async () => {
-    if (!hasFullParams) return
+    if (!hasFullParams || importing) return
 
-    setBatchResults(null)
+    setImporting(true)
+    try {
+      setBatchResults(null)
     setBatchError(null)
     setDuplicateMap({})
 
@@ -1721,6 +1724,9 @@ function NewCellEntryCard({
       setBatchError(errMsg)
       addLog('upload', `批量新站录入失败: ${errMsg}`, 'error', undefined, batchOpKey)
       setTimeout(() => setBatchError(null), 5000)
+    }
+    } finally {
+      setImporting(false)
     }
   }
 
@@ -1939,12 +1945,12 @@ function NewCellEntryCard({
           </button>
           <button
             onClick={handleBatchImport}
-            disabled={totalRows === 0 || isAddingCell || !hasFullParams}
+            disabled={totalRows === 0 || importing || !hasFullParams}
             className="px-4 py-1.5 text-xs font-medium rounded-md bg-blue-500 text-white hover:bg-blue-600 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1.5 transition-colors"
           >
-            {isAddingCell ? <Loader2 size={14} className="animate-spin" /> : <CheckCircle2 size={14} />}
-            {isAddingCell ? (t('data.saving') || '录入中...') : (t('newCellEntry.batchImport') || '一键导入')}
-            {totalRows > 0 && !isAddingCell && <span className="text-blue-100">({totalRows})</span>}
+            {importing ? <Loader2 size={14} className="animate-spin" /> : <CheckCircle2 size={14} />}
+            {importing ? (t('data.saving') || '录入中...') : (t('newCellEntry.batchImport') || '一键导入')}
+            {totalRows > 0 && !importing && <span className="text-blue-100">({totalRows})</span>}
           </button>
         </div>
       </div>
