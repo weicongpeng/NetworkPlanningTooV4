@@ -129,7 +129,8 @@ class AuthService:
 
     def update_user(self, db: Session, user_id: int, updates: dict) -> Optional[User]:
         """更新用户字段（不含密码）"""
-        allowed_fields = {"is_active", "is_admin", "license_expiry", "must_change_password", "total_usage_seconds", "city", "operator"}
+        allowed_fields = {"is_active", "is_admin", "license_expiry", "must_change_password", "total_usage_seconds", "city", "operator",
+                          "can_data_import", "can_data_delete", "can_data_update", "can_cell_entry"}
         user = self.get_user_by_id(db, user_id)
         if not user:
             return None

@@ -626,6 +626,10 @@ class UserResponse(BaseModel):
     created_at: Optional[str] = None
     city: Optional[str] = None
     operator: Optional[str] = None
+    can_data_import: bool = False
+    can_data_delete: bool = False
+    can_data_update: bool = False
+    can_cell_entry: bool = False
 
 
 class TokenResponse(BaseModel):
@@ -645,6 +649,10 @@ class UserUpdate(BaseModel):
     must_change_password: Optional[bool] = None
     city: Optional[str] = None
     operator: Optional[str] = None
+    can_data_import: Optional[bool] = None
+    can_data_delete: Optional[bool] = None
+    can_data_update: Optional[bool] = None
+    can_cell_entry: Optional[bool] = None
 
 
 class UserSessionResponse(BaseModel):
