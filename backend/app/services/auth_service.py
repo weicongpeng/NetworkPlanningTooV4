@@ -190,6 +190,8 @@ class AuthService:
         db.add(session)
         db.commit()
         db.refresh(session)
+        # 清理其他过期会话，自动累加使用时长
+        self.cleanup_stale_sessions(db, idle_minutes=6)
         return session
 
     def get_active_session_from_other_ip(self, db: Session, user_id: int, current_ip: str) -> Optional[UserSession]:
@@ -228,6 +230,41 @@ class AuthService:
             db.commit()
         return count
 
+    def _accumulate_session_duration(self, db: Session, session: UserSession, end_time: Optional[datetime] = None):
+        """累加指定会话的使用时长到用户记录"""
+        if end_time is None:
+            end_time = datetime.now(timezone.utc)
+        login_time = session.login_time
+        if login_time.tzinfo is None:
+            login_time = login_time.replace(tzinfo=timezone.utc)
+        duration = (end_time - login_time).total_seconds()
+        if duration > 0:
+            user = db.query(User).filter(User.id == session.user_id).first()
+            if user:
+                user.total_usage_seconds += int(duration)
+
+    def cleanup_stale_sessions(self, db: Session, idle_minutes: int = 5) -> int:
+        """清理超过 N 分钟无活动的过期会话，以最后活动时间作为离线时间点累加使用时长。
+
+        解决直接关闭浏览器/APP 不调登出接口导致使用时长统计为 0 的问题。
+        返回清理的会话数量。
+        """
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=idle_minutes)
+        stale_sessions = db.query(UserSession).filter(
+            UserSession.logout_time.is_(None),
+            UserSession.last_activity < cutoff,
+        ).all()
+        now = datetime.now(timezone.utc)
+        for s in stale_sessions:
+            end_time = s.last_activity
+            if end_time.tzinfo is None:
+                end_time = end_time.replace(tzinfo=timezone.utc)
+            self._accumulate_session_duration(db, s, end_time)
+            s.logout_time = s.last_activity  # 以最后活动时间作为离线时间
+        if stale_sessions:
+            db.commit()
+        return len(stale_sessions)
+
     def end_session(self, db: Session, token_jti: str) -> bool:
         """结束会话，累加使用时长"""
         session = db.query(UserSession).filter(UserSession.token_jti == token_jti).first()
@@ -237,14 +274,7 @@ class AuthService:
         session.logout_time = now
         session.last_activity = now
 
-        # 累加使用时长 (SQLite 可能丢失时区信息, 确保比较时类型一致)
-        login_time = session.login_time
-        if login_time.tzinfo is None:
-            login_time = login_time.replace(tzinfo=timezone.utc)
-        duration = (now - login_time).total_seconds()
-        user = db.query(User).filter(User.id == session.user_id).first()
-        if user:
-            user.total_usage_seconds += int(duration)
+        self._accumulate_session_duration(db, session, now)
 
         db.commit()
         return True

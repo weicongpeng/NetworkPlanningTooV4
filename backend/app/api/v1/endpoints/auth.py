@@ -98,9 +98,13 @@ async def ping(
     """
     心跳检测：更新当前会话的 last_activity，延长在线状态。
     APP 和 PC 端应定时（4-5分钟）调用此接口。
+    同时清理过期会话，自动累加使用时长。
     """
     if jti:
         auth_service.update_session_activity(db, jti)
+    # 定期清理过期会话，以 last_activity 作为离线时间累加使用时长
+    if jti:
+        auth_service.cleanup_stale_sessions(db, idle_minutes=6)
     return {
         "success": True,
         "last_activity": datetime.now(timezone.utc).isoformat(),

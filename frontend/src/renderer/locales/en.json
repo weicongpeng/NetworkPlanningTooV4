@@ -26,6 +26,8 @@
     "uploadSuccess": "Upload successful",
     "uploadError": "Upload failed, please try again",
     "loading": "Loading...",
+    "loadingHistory": "Loading history tasks...",
+    "loadingResult": "Loading planning results...",
     "adminHint": "As admin, you can set the global authorization period here",
     "expiryDateInput": "Expiry Date",
     "updateButton": "Update Authorization",
@@ -57,6 +59,16 @@
   },
   "sidebar": {
     "appVersions": "App Versions"
+  },
+  "app": {
+    "download": "Mobile APP",
+    "downloadTitle": "Download Mobile APP",
+    "installHint": "Scan QR code to download and install",
+    "noVersionAvailable": "No versions available",
+    "uploadApkHint": "Please upload APK in APP Version Management first",
+    "loadingVersion": "Loading version info...",
+    "downloadApk": "Download APK",
+    "latestVersion": "Latest Version"
   },
   "nav": {
     "home": "Home",
@@ -121,6 +133,7 @@
     "cleanIndex": "Clean Index",
     "retry": "Retry",
     "close": "Close",
+    "saving": "Saving...",
     "importData": "Import Data",
     "fullParams": "Full Parameters",
     "clickToUpload": "Click to upload",
@@ -226,11 +239,64 @@
     "batchDelete": "Delete",
     "batchDeleteConfirm": "Are you sure you want to delete {{count}} selected files?",
     "batchDeleteResult": "Deletion complete: {{success}} succeeded, {{fail}} failed",
+    "batchApply": "Batch Apply",
+    "batchApplyConfirm": "Apply {{count}} selected tasks?",
+    "batchApplyResult": "Apply complete: {{success}} succeeded, {{fail}} failed",
+    "batchApplyProgress": "Batch Apply ({{current}}/{{total}})",
     "selectItem": "Select",
     "deselectItem": "Deselect",
     "failed": "Processing Failed",
     "processingFailed": "File processing failed",
-    "deleteAndRetry": "Please delete and re-upload"
+    "deleteAndRetry": "Please delete and re-upload",
+    "syncing": "Syncing",
+    "excelSyncing": "Excel syncing...",
+    "syncingDisabled": "Unavailable during sync",
+    "syncingWait": "Writing data in background, operations locked",
+    "operationLog": "Operation Log",
+    "noLogs": "No operation records yet",
+    "noLogsHint": "Records will appear here after performing upload, download, delete, etc.",
+    "clearLog": "Clear"
+  },
+  "newCellEntry": {
+    "title": "New Station Entry",
+    "networkType": "Network Type",
+    "cellEntry": "Enter New Cell",
+    "submitCell": "Submit",
+    "reset": "Reset",
+    "cellEntrySuccess": "Cell added successfully",
+    "cellEntryFailed": "Failed to add cell",
+    "noFullParams": "Please upload full params file first",
+    "fieldManagedElementId": "NetElem ID",
+    "fieldSiteIdLTE": "eNB ID",
+    "fieldSiteIdNR": "gNB ID",
+    "fieldCellId": "Cell ID",
+    "fieldCellName": "Cell Name",
+    "fieldMCC": "MCC",
+    "fieldMNC": "MNC",
+    "fieldLongitude": "Lng",
+    "fieldLatitude": "Lat",
+    "fieldAzimuth": "Azimuth",
+    "fieldFrequency": "DL Freq",
+    "fieldSsbFrequency": "SSB Freq",
+    "fieldCellCoverType": "Cover Type",
+    "cellCoverTypeOutdoor": "Outdoor",
+    "cellCoverTypeIndoor": "Indoor",
+    "cellCoverTypeDesc": "For bulk data entry, please download the parameter file from \"Imported Data\" and upload after editing",
+    "addRow": "Copy Row",
+    "deleteRow": "Delete",
+    "batchImport": "Import All",
+    "importResults": "Import Results",
+    "importSuccessRow": "Row {{row}} OK",
+    "importFailRow": "Row {{row}} failed: {{msg}}",
+    "importSummary": "{{total}} total, {{success}} succeeded, {{fail}} failed",
+    "noDataToImport": "No data to import. Please fill in at least one row's required fields",
+    "cellEntryRequired": "Required",
+    "azimuthRangeError": "Azimuth must be 0-360",
+    "mncLengthError": "MNC must be 2 digits",
+    "numericError": "Numbers only",
+    "expand": "Expand",
+    "collapse": "Collapse",
+    "copyRowDisabled": "Please check the rows that have been fully filled"
   },
   "pci": {
     "title": "PCI Planning",
@@ -331,7 +397,8 @@
     "cellFileUploadFailed": "Failed to process cell-tree file",
     "noCellsSelected": "Please select at least one cell in the cell list before running PCI planning",
     "noCellIdsExtracted": "No cell IDs could be extracted from the file, please check file format",
-    "noMatchingCells": "No matching cells found, please verify the file content matches current parameters"
+    "noMatchingCells": "No matching cells found, please verify the file content matches current parameters",
+    "applyTip": "Click «Apply» to write PCI results to DB. Recommended to apply before next planning"
   },
   "neighbor": {
     "title": "Neighbor Planning",
@@ -700,9 +767,13 @@
     "copy": "Copy",
     "copyAll": "Copy All",
     "copied": "Copied",
-    "delete": "Delete"
+    "delete": "Delete",
+    "fullscreen": "Fullscreen",
+    "exitFullscreen": "Exit Fullscreen"
   },
   "common": {
+    "total": "Total",
+    "count": "version(s)",
     "confirmDeleteTitle": "Confirm Delete",
     "confirmDeleteTaskMsg": "Confirm to delete this task?",
     "executing": "Executing...",
@@ -821,6 +892,7 @@
     "changelog": "Changelog",
     "changelogPlaceholder": "Enter changelog, one per line...",
     "fileSize": "File Size",
+    "downloadCount": "Downloads",
     "status": "Status",
     "latest": "Latest",
     "old": "Old",
@@ -835,7 +907,10 @@
     "editFailed": "Update failed",
     "deleteConfirm": "Are you sure you want to delete version {{version}}?",
     "deleteSuccess": "Delete successful",
-    "deleteFailed": "Delete failed"
+    "deleteFailed": "Delete failed",
+    "importLocal": "Scan Local APKs",
+    "importResult": "Scan complete: {{imported}} imported, {{skipped}} skipped",
+    "importFailed": "Scan import failed"
   },
   "admin": {
     "title": "User Management",
@@ -892,6 +967,8 @@
     "loginRecordIp": "IP Address",
     "loginRecordClient": "Client",
     "onlineCount": "Online",
+    "pcCount": "PC",
+    "appCount": "APP",
     "noAppUsers": "No APP users yet",
     "appUserDeleteConfirm": "Are you sure to delete APP user \"{{username}}\"?"
   }

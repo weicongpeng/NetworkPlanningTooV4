@@ -1,10 +1,11 @@
 import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
 import { dataApi } from '../services/api'
+import { mapApi } from '../services/api'
 import { indexedDBService } from '../services/indexedDBService'
 import type { DataItem, ApiResponse } from '@shared/types'
 import { useTaskStore } from './taskStore'
-import { clearCellListCache } from '../services/mapDataService'
+import { clearCellListCache, bumpDataVersion } from '../services/mapDataService'
 
 const CACHE_TTL_5MIN = 5 * 60 * 1000
 
@@ -41,6 +42,7 @@ interface DataState {
   loading: boolean
   uploadingType: string | null
   isUpdating: boolean  // 工参更新专用 loading 状态
+  isAddingCell: boolean  // 新站录入专用 loading 状态
   error: string | null
   fetchList: (page?: number, pageSize?: number, forceRefresh?: boolean) => Promise<void>
   uploadExcel: (file: File, context?: string) => Promise<boolean>
@@ -49,6 +51,32 @@ interface DataState {
   deleteItem: (id: string) => Promise<boolean>
   updateParameters: (fullParamId: string, currentParamId: string) => Promise<ApiResponse<{ newFileId: string; newFileName: string; savedToOriginal: boolean } | null>>
   downloadTemplate: (templateType: 'full_params' | 'target_cells') => Promise<void>
+  addCell: (data: {
+    networkType: 'LTE' | 'NR'
+    managedElementId: string
+    siteId: string
+    cellId: string
+    cellName: string
+    longitude: number
+    latitude: number
+    azimuth: number
+    frequency?: string
+    ssbFrequency?: string
+    cellCoverType: number
+  }) => Promise<{ success: boolean; message?: string; data?: any }>
+  batchAddCells: (cells: Array<{
+    networkType: 'LTE' | 'NR'
+    managedElementId: string
+    siteId: string
+    cellId: string
+    cellName: string
+    longitude: number
+    latitude: number
+    azimuth: number
+    frequency?: string
+    ssbFrequency?: string
+    cellCoverType: number
+  }>) => Promise<{ success: boolean; message?: string; data?: any }>
 }
 
 export const useDataStore = create<DataState>((set, get) => ({
@@ -59,6 +87,7 @@ export const useDataStore = create<DataState>((set, get) => ({
   loading: false,
   uploadingType: null,
   isUpdating: false,
+  isAddingCell: false,
   error: null,
 
   fetchList: async (page: number = 1, pageSize: number = 50, forceRefresh: boolean = false) => {
@@ -347,5 +376,56 @@ export const useDataStore = create<DataState>((set, get) => ({
     const runningTasks = useTaskStore.getState().getRunningTasks()
     const hasUpdateTask = runningTasks.some(task => task.type === 'parameter_update')
     return hasUpdateTask ? 'running' : 'idle'
+  },
+
+  // 新站录入
+  addCell: async (data) => {
+    set({ isAddingCell: true, error: null })
+    try {
+      const result = await dataApi.addCell(data)
+      if (result?.success) {
+        // 录入成功后刷新列表 + 清除缓存
+        await get().fetchList(1, 50, true)
+        await clearCellListCache()
+        bumpDataVersion()
+        try { await mapApi.clearCache() } catch (_) {}
+        set({ isAddingCell: false })
+        return { success: true, message: result.message, data: result.data }
+      }
+      set({ isAddingCell: false })
+      return { success: false, message: result?.message || '录入失败' }
+    } catch (error: any) {
+      set({
+        error: error.message || '录入失败',
+        isAddingCell: false,
+      })
+      return { success: false, message: error.message || '录入失败' }
+    }
+  },
+
+  // 批量新站录入
+  batchAddCells: async (cells) => {
+    set({ isAddingCell: true, error: null })
+    try {
+      const result = await dataApi.batchAddCells(cells)
+      if (result?.success) {
+        // 成功后刷新数据列表
+        await get().fetchList(1, 50, true)
+        // 清除所有缓存层，确保小区选择列表能立即看到新数据
+        await clearCellListCache()                         // ① 前端 getCellList 缓存（内存 + IndexedDB）
+        bumpDataVersion()                                  // ② sessionStorage 版本号（mapDataService 强制刷新）
+        try { await mapApi.clearCache() } catch (_) {}    // ③ 后端 30min 内存缓存
+        set({ isAddingCell: false })
+        return { success: true, message: result.message, data: result.data }
+      }
+      set({ isAddingCell: false })
+      return { success: false, message: result?.message || '批量录入失败', data: result?.data }
+    } catch (error: any) {
+      set({
+        error: error.message || '批量录入失败',
+        isAddingCell: false,
+      })
+      return { success: false, message: error.message || '批量录入失败' }
+    }
   }
 }))

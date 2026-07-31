@@ -2,9 +2,10 @@ import { useState, useEffect, useCallback } from 'react'
 import { useTranslation } from 'react-i18next'
 import {
   Package, Upload, Download, Pencil, Trash2, RefreshCw,
-  Loader2, X, Check, Circle
+  Loader2, X, Check, Circle, FolderOpen
 } from 'lucide-react'
 import { appVersionsApi } from '../services/api'
+import { parallelDownload } from '../utils/parallelDownload'
 
 interface AppVersionItem {
   id: number
@@ -14,6 +15,7 @@ interface AppVersionItem {
   file_size?: number
   file_size_display?: string
   is_latest: boolean
+  download_count: number
   created_at: string
   updated_at?: string
 }
@@ -54,6 +56,14 @@ export function AppVersionsPage() {
   const [editIsLatest, setEditIsLatest] = useState(false)
   const [editing, setEditing] = useState(false)
   const [editError, setEditError] = useState('')
+
+  // Import local
+  const [importing, setImporting] = useState(false)
+  const [importResult, setImportResult] = useState<{ imported: number; skipped: number } | null>(null)
+
+  // Download progress
+  const [downloadingId, setDownloadingId] = useState<number | null>(null)
+  const [downloadProgress, setDownloadProgress] = useState(0) // 0-100
 
   const fetchVersions = useCallback(async () => {
     setLoading(true)
@@ -157,6 +167,48 @@ export function AppVersionsPage() {
     }
   }
 
+  // --- Download (并行分块加速) ---
+  const handleDownload = async (item: AppVersionItem) => {
+    const url = `/api/v1/app-versions/download/${item.id}`
+    setDownloadingId(item.id)
+    setDownloadProgress(0)
+    try {
+      await parallelDownload(url, {
+        filename: item.apk_filename,
+        chunks: 4,
+        onProgress: (loaded, total) => {
+          const pct = Math.round((loaded / total) * 100)
+          setDownloadProgress(pct)
+        },
+      })
+    } catch (err: any) {
+      console.error('下载失败', err)
+    } finally {
+      setDownloadingId(null)
+      setDownloadProgress(0)
+    }
+  }
+
+  // --- Import local APK files ---
+  const handleImportLocal = async () => {
+    setImporting(true)
+    setImportResult(null)
+    setError('')
+    try {
+      const result = await appVersionsApi.importLocal({})
+      if (result.success && result.data) {
+        const imported = result.data.total_imported || 0
+        const skipped = result.data.total_skipped || 0
+        setImportResult({ imported, skipped })
+        fetchVersions()
+      }
+    } catch (err: any) {
+      setError(err?.message || t('appVersions.importFailed', '扫描导入失败'))
+    } finally {
+      setImporting(false)
+    }
+  }
+
   return (
     <div className="p-6 space-y-6">
       {/* Header */}
@@ -180,6 +232,15 @@ export function AppVersionsPage() {
           <RefreshCw size={16} />
         </button>
         <button
+          onClick={handleImportLocal}
+          disabled={importing}
+          className="px-3 py-2 border border-border rounded-lg text-muted-foreground hover:text-foreground hover:bg-muted transition-colors flex items-center gap-1.5"
+          title={t('appVersions.importLocal')}
+        >
+          {importing ? <Loader2 size={16} className="animate-spin" /> : <FolderOpen size={16} />}
+          {t('appVersions.importLocal')}
+        </button>
+        <button
           onClick={() => { resetUpload(); setShowUpload(true) }}
           className="ml-auto px-4 py-2 bg-primary text-primary-foreground rounded-lg hover:opacity-90 transition-opacity flex items-center gap-2"
         >
@@ -195,6 +256,23 @@ export function AppVersionsPage() {
         </div>
       )}
 
+      {/* Import result */}
+      {importResult && (
+        <div className="p-3 bg-green-500/10 border border-green-500/20 rounded-lg text-green-500 text-sm flex items-center gap-2">
+          <Check size={16} />
+          {t('appVersions.importResult', '扫描完成：导入 {{imported}} 个，跳过 {{skipped}} 个', {
+            imported: importResult.imported,
+            skipped: importResult.skipped,
+          })}
+          <button
+            onClick={() => setImportResult(null)}
+            className="ml-auto p-0.5 rounded hover:bg-green-500/20"
+          >
+            <X size={14} />
+          </button>
+        </div>
+      )}
+
       {/* Table */}
       <div className="bg-card border border-border rounded-lg overflow-hidden">
         <div className="overflow-x-auto">
@@ -204,6 +282,7 @@ export function AppVersionsPage() {
                 <th className="text-left py-3 px-4 font-medium text-muted-foreground">{t('appVersions.version')}</th>
                 <th className="text-left py-3 px-4 font-medium text-muted-foreground">{t('appVersions.changelog')}</th>
                 <th className="text-left py-3 px-4 font-medium text-muted-foreground">{t('appVersions.fileSize')}</th>
+                <th className="text-left py-3 px-4 font-medium text-muted-foreground">{t('appVersions.downloadCount')}</th>
                 <th className="text-left py-3 px-4 font-medium text-muted-foreground">{t('appVersions.status')}</th>
                 <th className="text-left py-3 px-4 font-medium text-muted-foreground">{t('appVersions.createdAt')}</th>
                 <th className="text-left py-3 px-4 font-medium text-muted-foreground">{t('common.actions')}</th>
@@ -212,14 +291,14 @@ export function AppVersionsPage() {
             <tbody>
               {loading ? (
                 <tr>
-                  <td colSpan={6} className="py-8 text-center text-muted-foreground">
+                  <td colSpan={7} className="py-8 text-center text-muted-foreground">
                     <Loader2 size={20} className="animate-spin inline-block mr-2" />
                     {t('common.loading')}
                   </td>
                 </tr>
               ) : versions.length === 0 ? (
                 <tr>
-                  <td colSpan={6} className="py-8 text-center text-muted-foreground">
+                  <td colSpan={7} className="py-8 text-center text-muted-foreground">
                     {t('common.noData')}
                   </td>
                 </tr>
@@ -230,6 +309,7 @@ export function AppVersionsPage() {
                     {v.changelog || '-'}
                   </td>
                   <td className="py-3 px-4 text-muted-foreground">{v.file_size_display || '-'}</td>
+                  <td className="py-3 px-4 text-muted-foreground">{v.download_count ?? 0}</td>
                   <td className="py-3 px-4">
                     {v.is_latest ? (
                       <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs bg-green-500/10 text-green-500 border border-green-500/20">
@@ -247,11 +327,21 @@ export function AppVersionsPage() {
                   <td className="py-3 px-4">
                     <div className="flex items-center gap-2">
                       <button
-                        onClick={() => window.open(`/api/v1/app-versions/download/${v.id}`, '_blank')}
-                        className="p-1.5 rounded-md hover:bg-muted text-muted-foreground hover:text-foreground transition-colors"
-                        title={t('common.download')}
+                        onClick={() => handleDownload(v)}
+                        disabled={downloadingId === v.id}
+                        className="p-1.5 rounded-md hover:bg-muted text-muted-foreground hover:text-foreground transition-colors disabled:opacity-50 disabled:cursor-wait"
+                        title={downloadingId === v.id ? `${t('common.downloading')} ${downloadProgress}%` : t('common.download')}
                       >
-                        <Download size={14} />
+                        {downloadingId === v.id ? (
+                          <span className="relative flex items-center justify-center">
+                            <Loader2 size={14} className="animate-spin text-primary" />
+                            <span className="absolute -top-3 -right-3 text-[10px] text-primary font-medium">
+                              {downloadProgress}%
+                            </span>
+                          </span>
+                        ) : (
+                          <Download size={14} />
+                        )}
                       </button>
                       <button
                         onClick={() => openEdit(v)}

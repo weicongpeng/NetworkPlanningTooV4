@@ -281,11 +281,11 @@ export function AdminUsersPage() {
           <RefreshCw size={16} />
         </button>
         <div className="text-sm text-muted-foreground whitespace-nowrap">
-          共<span className="text-foreground font-medium mx-0.5">{total}</span>个用户
+          {t('admin.totalUsers', { count: total })}
           <span className="mx-2 text-border">|</span>
-          在线用户<span className="text-foreground font-medium mx-0.5">{onlineCount}</span>
-          <span className="ml-1.5">PC<span className="text-green-400 font-medium mx-0.5">{onlinePcCount}</span></span>
-          <span className="ml-1.5">APP<span className="text-green-400 font-medium mx-0.5">{onlineAppCount}</span></span>
+          {t('admin.onlineCount')}<span className="text-foreground font-medium mx-0.5">{onlineCount}</span>
+          <span className="ml-1.5">{t('admin.pcCount')}<span className="text-green-400 font-medium mx-0.5">{onlinePcCount}</span></span>
+          <span className="ml-1.5">{t('admin.appCount')}<span className="text-green-400 font-medium mx-0.5">{onlineAppCount}</span></span>
         </div>
         <button
           onClick={() => { resetForm(); setShowAddModal(true) }}

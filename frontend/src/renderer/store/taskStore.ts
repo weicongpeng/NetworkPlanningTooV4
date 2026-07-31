@@ -393,19 +393,24 @@ export const useTaskStore = create<TaskState>()(
             for (const ht of historyTasks) {
               const id = ht.taskId
               if (!id) continue
-              // ⚠️ result 严格区分：
-              //   - 运行中的任务或已有完整 results 的任务 → 保留原有 result
-              //   - 其他历史任务 → 只使用后端返回的 resultSummary（不含 results 数组）
+              // 🔥 优化：后端历史列表现在直接返回完整 result（含 results 数组），
+              // 优先使用后端返回的完整 result，其次保留已有的完整结果，最后回退到 resultSummary
               const preserved = merged[id]
-              // 如果已有完整的 results，优先保留（不被 resultSummary 覆盖）
-              const taskResult = (preserved?.result?.results ? preserved.result : (ht.resultSummary || undefined))
+              let taskResult
+              if (ht.result?.results) {
+                taskResult = ht.result       // 后端直接返回了完整结果
+              } else if (preserved?.result?.results) {
+                taskResult = preserved.result // 已有完整结果，保留
+              } else {
+                taskResult = ht.resultSummary || undefined  // 回退到摘要
+              }
               merged[id] = {
                 id,
                 type,
                 status: ht.status === 'completed' ? 'completed' as const : 'failed' as const,
                 taskName: ht.taskName || preserved?.taskName || id.slice(0, 24),
                 userName: ht.userName || preserved?.userName,
-                isApplied: ht.isApplied === true || preserved?.isApplied === true,
+                isApplied: ht.isApplied === true,
                 progress: preserved?.progress ?? (ht.progress ?? (ht.status === 'completed' ? 100 : 0)),
                 startTime: preserved?.startTime || (ht.createdAt ? new Date(ht.createdAt).getTime() : undefined),
                 endTime: preserved?.endTime || (ht.completedAt ? new Date(ht.completedAt).getTime() : undefined),

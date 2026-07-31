@@ -68,6 +68,30 @@ class LicenseResponse(BaseModel):
     message: Optional[str] = None
 
 
+class CellCreateRequest(BaseModel):
+    """新站录入请求"""
+
+    networkType: NetworkType
+    managedElementId: str = Field(..., description="管理网元ID")
+    siteId: str = Field(..., description="eNodeB标识(LTE) 或 gNodeB标识(NR)")
+    cellId: str = Field(..., description="小区标识")
+    cellName: str = Field(..., description="小区名称")
+    longitude: float = Field(..., description="小区经度")
+    latitude: float = Field(..., description="小区纬度")
+    azimuth: float = Field(..., description="天线方向角")
+    frequency: Optional[str] = Field(default=None, description="LTE下行链路的中心载频")
+    ssbFrequency: Optional[str] = Field(default=None, description="NR填写SSB频点")
+    cellCoverType: int = Field(default=1, ge=1, le=4, description="小区覆盖类型: 1=室外, 4=室内")
+    mcc: Optional[str] = Field(default=None, description="移动国家码")
+    mnc: Optional[str] = Field(default=None, description="移动网络码")
+
+
+class CellBatchCreateRequest(BaseModel):
+    """批量新站录入请求"""
+
+    cells: List[CellCreateRequest]
+
+
 class UpdateParametersRequest(BaseModel):
     """工参更新请求"""
 
@@ -103,6 +127,8 @@ class DataItem(BaseModel):
     status: DataStatus
     metadata: Optional[Dict[str, Any]] = None
     geometryType: Optional[str] = None  # 几何类型：point, sector, polygon
+    excelSynced: Optional[bool] = None  # Excel 是否已从 SQLite 同步更新
+    inplaceUpdated: Optional[bool] = None  # 文件是否已原地更新（PCI/TAC应用）
 
 
 class SectorData(BaseModel):
@@ -765,5 +791,6 @@ class AppVersionOut(BaseModel):
     apk_filename: str
     file_size: Optional[int] = None
     is_latest: bool
+    download_count: int = 0
     created_at: str
     updated_at: Optional[str] = None

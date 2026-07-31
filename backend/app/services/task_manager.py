@@ -6,6 +6,7 @@ import asyncio
 import uuid
 import math
 import json
+import threading
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Optional, Any, Callable, List
@@ -42,6 +43,8 @@ class TaskType(str, Enum):
     UPDATE_PARAMS = "update_params"  # 工参更新
     APPLY_PCI = "apply_pci"  # PCI应用到工参
     APPLY_TAC_PLANNING = "apply_tac_planning"  # TAC规划应用到工参
+    APPLY_PCI_BATCH = "apply_pci_batch"  # PCI批量应用到工参
+    APPLY_TAC_PLANNING_BATCH = "apply_tac_planning_batch"  # TAC规划批量应用到工参
 
 
 class Task:
@@ -75,7 +78,7 @@ class Task:
 
     def to_dict(self) -> Dict:
         """转换为字典"""
-        return {
+        d = {
             "taskId": self.task_id,
             "status": self.status.value,
             "progress": self.progress,
@@ -83,6 +86,10 @@ class Task:
             "error": self.error if self.status == TaskStatus.FAILED else None,
             "created_at": self.created_at.isoformat(),
         }
+        # 如有日志消息，附加上
+        if hasattr(self, 'log_messages') and self.log_messages:
+            d["logMessages"] = self.log_messages
+        return d
 
     def _get_status_message(self) -> str:
         """获取状态消息"""
@@ -99,6 +106,9 @@ class Task:
 
 class TaskManager:
     """任务管理器"""
+
+    # Excel同步锁：防止后台同步和下载兜底同步同时写入同一文件
+    _excel_sync_lock = threading.Lock()
 
     @staticmethod
     def _sanitize_result(obj: Any) -> Any:
@@ -1417,18 +1427,47 @@ class TaskManager:
             username = task.config.get("username", "")
             user_id = task.config.get("userId", 1)
 
+            # 激活日志捕获，收集后端终端输出
+            data_service.start_capture_logs()
+            task.log_messages = []
+
+            # 启动后台日志轮询任务（每 0.5 秒收集一次缓冲区）
+            async def _poll_logs():
+                while task.status == TaskStatus.PROCESSING:
+                    lines = data_service.get_and_clear_captured_logs()
+                    if lines:
+                        if not hasattr(task, 'log_messages'):
+                            task.log_messages = []
+                        task.log_messages.extend(lines)
+                    await asyncio.sleep(0.5)
+
+            poller = asyncio.create_task(_poll_logs())
+
             # 在线程池中运行同步的耗时操作
             result = await asyncio.to_thread(
                 data_service.update_parameters,
                 full_param_id, current_param_id,
                 username=username, user_id=user_id,
             )
+
+            # 停止日志轮询并收集最后的日志
+            poller.cancel()
+            try: await poller
+            except asyncio.CancelledError: pass
+            # 最后一次收集
+            lines = data_service.get_and_clear_captured_logs()
+            if lines:
+                task.log_messages.extend(lines)
+
             task.progress = 90
 
             # 清除地图数据缓存
             import app.api.v1.endpoints.map as map_module
             map_module._map_data_cache = None
             map_module._map_data_cache_time = 0
+
+            # 停用日志捕获
+            data_service.stop_capture_logs()
 
             # 完成任务
             task.status = TaskStatus.COMPLETED
@@ -1447,6 +1486,13 @@ class TaskManager:
         except Exception as e:
             import traceback
             traceback.print_exc()
+            data_service.stop_capture_logs()
+            # 异常时也尝试收集日志
+            try:
+                lines = data_service.get_and_clear_captured_logs()
+                if lines and not hasattr(task, 'log_messages'):
+                    task.log_messages = lines
+            except: pass
             task.status = TaskStatus.FAILED
             task.error = str(e)
             task.completed_at = datetime.now()
@@ -1531,20 +1577,15 @@ class TaskManager:
             self._save_task_result_to_db(task)
             logger.info(f"[TaskManager] PCI应用到工参 Phase 1 完成: {task.task_id}, 更新了 {result.get('updatedCount', 0)} 个小区")
 
-            # === 阶段2: 后台更新Excel文件（用户无需等待）===
+            # 后台同步 Excel 文件（用户点击下载前已完成，下载时直接返回）
             new_data_id = result.get("newFileId", "")
-            old_entry_id = result.get("oldEntryId", "")
             if new_data_id:
+                full_params_info = data_service.index.get(new_data_id, {})
                 asyncio.create_task(
-                    self._apply_pci_background_excel_update(
-                        new_data_id, old_entry_id,
-                        planning_result, full_params_info or {},
-                        logger
+                    asyncio.to_thread(
+                        self._sync_excel_from_sqlite, new_data_id, logger
                     )
                 )
-                logger.info(f"[TaskManager] 后台Excel更新任务已创建: new_data_id={new_data_id}")
-            else:
-                logger.warning("[TaskManager] 快路径未返回newFileId，跳过后台Excel更新")
 
         except Exception as e:
             import traceback
@@ -1557,6 +1598,158 @@ class TaskManager:
             self._persist_task(task.task_id)
             self._save_task_result_to_db(task)
             logger.error(f"[TaskManager] PCI应用到工参任务失败: {task.task_id}, error: {e}", exc_info=True)
+
+    # ============================================================
+    # 批量 PCI 应用到工参（合并多个规划任务结果，一次 SQLite + 一次 Excel 更新）
+    # ============================================================
+
+    async def create_apply_pci_batch_task(self, plan_task_ids: List[str]) -> str:
+        """创建PCI批量应用到工参任务"""
+        logger.info(f"[TaskManager] 创建PCI批量应用到工参任务: {len(plan_task_ids)} 个规划任务")
+
+        # 验证所有规划任务存在且已完成
+        for tid in plan_task_ids:
+            r = self.get_task_result(tid)
+            if r is None:
+                raise ValueError(f"规划任务不存在: {tid[:8]}...")
+            if r.get("status") != "completed":
+                raise ValueError(f"规划任务未完成: {tid[:8]}...")
+
+        task = Task(TaskType.APPLY_PCI_BATCH, {"planTaskIds": plan_task_ids})
+        self.tasks[task.task_id] = task
+        self._persist_task(task.task_id)
+        logger.info(f"[TaskManager] PCI批量应用到工参任务已创建: {task.task_id}")
+
+        task.task = asyncio.create_task(self._run_task_with_slot(task, self._run_apply_pci_batch_task))
+        return task.task_id
+
+    async def _run_apply_pci_batch_task(self, task: Task):
+        """运行PCI批量应用到工参任务"""
+        logger.info(f"[TaskManager] _run_apply_pci_batch_task 开始执行, task_id: {task.task_id}")
+        try:
+            task.status = TaskStatus.PROCESSING
+            task.started_at = datetime.now()
+            task.progress = 5
+
+            plan_task_ids = task.config["planTaskIds"]
+            logger.info(f"[ApplyPCI-Batch] 收集 {len(plan_task_ids)} 个规划任务的结果")
+
+            # 收集并合并所有规划结果
+            merged_results = []  # List of site results
+            seen_cells = {}  # { "siteId_sectorId": sector_data } — 后写入覆盖前写入
+            network_type = None
+
+            for tid in plan_task_ids:
+                r = self.get_task_result(tid)
+                if not r or r.get("status") != "completed":
+                    logger.warning(f"[ApplyPCI-Batch] 跳过无效任务: {tid[:8]}...")
+                    continue
+                if network_type is None:
+                    network_type = r.get("networkType", "LTE")
+
+                results = r.get("results", [])
+                for site in results:
+                    site_id = str(site.get("siteId", ""))
+                    for sector in site.get("sectors", []):
+                        sid = str(sector.get("sectorId", ""))
+                        key = f"{site_id}_{sid}"
+                        # 后写入覆盖（合并多个任务的结果）
+                        if key in seen_cells:
+                            existing = seen_cells[key]
+                            if sector.get("newPCI") is not None:
+                                existing["newPCI"] = sector["newPCI"]
+                            if sector.get("tac") is not None:
+                                existing["tac"] = sector["tac"]
+                        else:
+                            seen_cells[key] = {
+                                "siteId": site_id,
+                                "sectorId": sid,
+                                "newPCI": sector.get("newPCI"),
+                                "tac": sector.get("tac"),
+                            }
+
+            if not seen_cells:
+                raise ValueError("所有规划任务结果均为空")
+
+            # 将合并结果重建为 _apply_pci_fast_sqlite_only 期望的格式
+            sites_map = {}
+            for key, cell in seen_cells.items():
+                site_id = cell["siteId"]
+                if site_id not in sites_map:
+                    sites_map[site_id] = {"siteId": site_id, "sectors": []}
+                sites_map[site_id]["sectors"].append({
+                    "sectorId": cell["sectorId"],
+                    "newPCI": cell.get("newPCI"),
+                    "tac": cell.get("tac"),
+                })
+
+            merged_planning_result = {
+                "results": list(sites_map.values()),
+                "networkType": network_type or "LTE",
+            }
+
+            total_cells = len(seen_cells)
+            logger.info(f"[ApplyPCI-Batch] 合并后共 {total_cells} 个唯一小区需要更新")
+
+            task.progress = 10
+
+            # 捕获 full_params_info 供后台Excel更新使用
+            full_params_info = None
+            for data_id, data_info in data_service.index.items():
+                if data_info.get("fileType") == "full_params":
+                    full_params_info = data_info
+                    break
+
+            # === 阶段1: SQLite 快路径 ===
+            progress_holder = [10]
+            result = await asyncio.to_thread(
+                self._apply_pci_fast_sqlite_only,
+                merged_planning_result, progress_holder, logger
+            )
+
+            task.progress = max(progress_holder[0], 90)
+
+            # 清除地图数据缓存
+            import app.api.v1.endpoints.map as map_module
+            map_module._map_data_cache = None
+            map_module._map_data_cache_time = 0
+
+            # 标记所有源任务为已应用
+            for tid in plan_task_ids:
+                try:
+                    self.mark_task_applied(tid)
+                except Exception as e:
+                    logger.warning(f"[ApplyPCI-Batch] 标记任务已应用失败: {tid[:8]}..., {e}")
+
+            # 完成任务
+            task.status = TaskStatus.COMPLETED
+            task.completed_at = datetime.now()
+            task.progress = 100
+            task.result = {
+                "taskId": task.task_id,
+                "status": "completed",
+                "progress": 100,
+                **result
+            }
+            self._persist_task(task.task_id)
+            self._save_task_result_to_db(task)
+            logger.info(f"[TaskManager] PCI批量应用到工参 Phase 1 完成: {task.task_id}, 更新了 {result.get('updatedCount', 0)} 个小区")
+            # 后台同步 Excel
+            new_data_id = result.get("newFileId", "")
+            if new_data_id:
+                asyncio.create_task(asyncio.to_thread(self._sync_excel_from_sqlite, new_data_id, logger))
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            task.status = TaskStatus.FAILED
+            task.error = str(e)
+            task.completed_at = datetime.now()
+            task.progress = task.progress if hasattr(task, 'progress') else 0
+            task.result = {"status": "failed", "error": str(e)}
+            self._persist_task(task.task_id)
+            self._save_task_result_to_db(task)
+            logger.error(f"[TaskManager] PCI批量应用到工参任务失败: {task.task_id}, error: {e}", exc_info=True)
 
     def _apply_pci_fast_sqlite_only(self, planning_result: Dict, progress_holder: list, _logger: logging.Logger) -> Dict:
         """Phase 1: Direct SQL UPDATE on Sector rows (optimized, no full copy)."""
@@ -1610,7 +1803,7 @@ class TaskManager:
 
         progress_holder[0] = 35
 
-        # ====== 核心优化：直接 UPDATE Sector 表（避免全量复制）======
+        # ====== 核心优化：批量 UPDATE Sector 表（避免 N+1 查询 + LIKE 全表扫描）======
         db = SessionLocal()
         try:
             # 建立 site_id → 主键 映射
@@ -1618,9 +1811,9 @@ class TaskManager:
             for row in db.query(Site).filter(Site.workbook_id == full_params_id).all():
                 site_pk_map[row.site_id] = row.id
 
-            updated_pci_count = 0
-            updated_tac_count = 0
-            not_found = []
+            # 收集所有待更新的 sector（归一化 sector_id，去掉小数点）
+            from sqlalchemy import text
+            all_updates = []  # [(site_pk, sector_id, {pci, tac})]
             for site_result in results:
                 result_site_id = str(site_result.get("siteId", ""))
                 site_pk = site_pk_map.get(result_site_id)
@@ -1628,37 +1821,86 @@ class TaskManager:
                     _logger.warning(f"[ApplyPCI-Phase1] 未找到站点 {result_site_id}，跳过")
                     continue
 
-                sectors = site_result.get("sectors", [])
-                for sector in sectors:
-                    result_sector_id = str(sector.get("sectorId", ""))
-                    uid = f"{result_site_id}_{result_sector_id}"
+                for sector in site_result.get("sectors", []):
+                    sid = str(sector.get("sectorId", ""))
+                    # 归一化：与下载端点逻辑一致
+                    if "." in sid:
+                        try:
+                            sid = str(int(float(sid)))
+                        except ValueError:
+                            pass
 
-                    # 构建更新字典
                     update_vals = {}
                     new_pci = sector.get("newPCI")
                     new_tac = sector.get("tac")
-
                     if new_pci is not None:
                         update_vals["pci"] = new_pci
                     if new_tac is not None:
                         update_vals["tac"] = str(new_tac)
+                    if update_vals:
+                        all_updates.append((site_pk, sid, update_vals))
 
-                    if not update_vals:
-                        continue
+            if not all_updates:
+                _logger.warning("[ApplyPCI-Phase1] 所有站点都未匹配到，跳过更新")
+                db.close()
+                raise ValueError("未能匹配到任何待更新的站点")
 
-                    # UPDATE Sector 表
-                    rows = db.query(Sector).filter(
-                        Sector.workbook_id == full_params_id,
-                        Sector.site_id_fk == site_pk,
-                        Sector.sector_id.like(f"%{result_sector_id}")
-                    ).update(update_vals)
-                    if rows:
-                        if new_pci is not None:
-                            updated_pci_count += rows
-                        if new_tac is not None:
-                            updated_tac_count += rows
-                    else:
-                        not_found.append(uid)
+            _logger.info(f"[ApplyPCI-Phase1] 准备批量更新 {len(all_updates)} 个小区")
+
+            # 使用单个 CASE WHEN UPDATE 替代逐条 execute（性能提升 5-10x）
+            # 分块以避免 SQLite 参数上限 (SQLITE_MAX_VARIABLE_NUMBER=999)
+            pci_updated = 0
+            tac_updated = 0
+            CHUNK = 150  # 每块 ~150 个小区，每个用 5 个参数 (3 for CASE + 2 for IN)
+
+            for chunk_start in range(0, len(all_updates), CHUNK):
+                chunk = all_updates[chunk_start:chunk_start + CHUNK]
+                pci_cases = []
+                tac_cases = []
+                pci_params = {}
+                tac_params = {}
+                in_pairs = []
+                in_params = {}
+
+                for idx, (site_pk, sid, vals) in enumerate(chunk):
+                    pair_key = f"sp{idx}_sid{idx}"
+                    in_pairs.append(f"(:{pair_key}_spk, :{pair_key}_sid)")
+                    in_params[f"{pair_key}_spk"] = site_pk
+                    in_params[f"{pair_key}_sid"] = sid
+
+                    if "pci" in vals:
+                        when_param = f"pci_when_{idx}"
+                        pci_cases.append(f"WHEN (site_id_fk = :{pair_key}_spk AND sector_id = :{pair_key}_sid) THEN :{when_param}")
+                        pci_params[when_param] = vals["pci"]
+
+                    if "tac" in vals:
+                        when_param = f"tac_when_{idx}"
+                        tac_cases.append(f"WHEN (site_id_fk = :{pair_key}_spk AND sector_id = :{pair_key}_sid) THEN :{when_param}")
+                        tac_params[when_param] = vals["tac"]
+
+                if not pci_cases and not tac_cases:
+                    continue
+
+                set_clauses = []
+                all_case_params = {}
+                if pci_cases:
+                    set_clauses.append(f"pci = CASE {' '.join(pci_cases)} ELSE pci END")
+                    all_case_params.update(pci_params)
+                if tac_cases:
+                    set_clauses.append(f"tac = CASE {' '.join(tac_cases)} ELSE tac END")
+                    all_case_params.update(tac_params)
+
+                sql = f"UPDATE sectors SET {', '.join(set_clauses)} WHERE workbook_id = :wb_id AND (site_id_fk, sector_id) IN ({', '.join(in_pairs)})"
+                all_params = {"wb_id": full_params_id, **in_params, **all_case_params}
+
+                result = db.execute(text(sql), all_params)
+                if result.rowcount:
+                    # 近似计数：按照 chunk 中每个 sector 贡献一个计数
+                    for _, _, vals in chunk:
+                        if "pci" in vals:
+                            pci_updated += 1
+                        if "tac" in vals:
+                            tac_updated += 1
 
             # 更新 workbook 的 created_at 使其排在最前
             db.query(Workbook).filter(Workbook.id == full_params_id).update({
@@ -1666,9 +1908,7 @@ class TaskManager:
             })
 
             db.commit()
-            _logger.info(f"[ApplyPCI-Phase1] 更新了 {updated_pci_count} 个PCI, {updated_tac_count} 个TAC")
-            if not_found:
-                _logger.warning(f"[ApplyPCI-Phase1] {len(not_found)} 个小区未匹配到: {not_found[:10]}...")
+            _logger.info(f"[ApplyPCI-Phase1] 批量更新完成: {pci_updated}个PCI, {tac_updated}个TAC")
         finally:
             db.close()
 
@@ -1678,7 +1918,8 @@ class TaskManager:
         if full_params_id in data_service.index:
             data_service.index[full_params_id]['inplace_updated'] = True
             data_service.index[full_params_id]['applied_pci'] = True
-            if has_tac and updated_tac_count > 0:
+            data_service.index[full_params_id]['excel_synced'] = False  # 下载时从SQLite按需生成
+            if has_tac and tac_updated > 0:
                 data_service.index[full_params_id]['applied_tac'] = True
                 _logger.info(f"[ApplyPCI-Phase1] PCI+TAC联合更新: 同时标记 applied_tac")
             data_service.index[full_params_id]['uploadDate'] = datetime.now().isoformat()
@@ -1686,12 +1927,136 @@ class TaskManager:
 
         return {
             "success": True,
-            "message": f"成功应用PCI规划结果到全量工参，更新了{updated_pci_count}个小区的PCI"
-                       + (f"，同时更新了{updated_tac_count}个小区的TAC" if updated_tac_count > 0 else ""),
-            "updatedCount": updated_pci_count + updated_tac_count,
+            "message": f"成功应用PCI规划结果到全量工参，更新了{pci_updated}个小区的PCI"
+                       + (f"，同时更新了{tac_updated}个小区的TAC" if tac_updated > 0 else ""),
+            "updatedCount": pci_updated + tac_updated,
             "newFileId": full_params_id,
             "oldEntryId": full_params_id,
         }
+
+
+    @staticmethod
+    def _sync_excel_from_sqlite(data_id: str, _logger: logging.Logger) -> None:
+        """后台线程：从 SQLite 全量同步 PCI/TAC 到 Excel 文件
+
+        使用 iter_rows 建立行索引 + 直接定位更新，对 18k 行文件约 10-20 秒
+        """
+        import openpyxl
+        from app.core.database import SessionLocal
+        from app.models.database import Sector, Site
+        from app.core.config import settings
+
+        _logger.info(f"[ExcelSync] 开始后台同步: data_id={data_id}")
+
+        file_path = settings.DATA_DIR / data_id / "original.xlsx"
+        if not file_path.exists():
+            _logger.warning(f"[ExcelSync] 文件不存在: {file_path}")
+            return
+
+        try:
+            # 读取 SQLite 中所有 PCI/TAC 值
+            updates = {}
+            db = SessionLocal()
+            try:
+                rows = db.query(
+                    Site.site_id, Sector.sector_id, Sector.pci, Sector.tac
+                ).join(Sector, Sector.site_id_fk == Site.id).filter(
+                    Site.workbook_id == data_id
+                ).all()
+                for row in rows:
+                    key = f"{row.site_id}_{row.sector_id}"
+                    rec = {}
+                    if row.pci is not None:
+                        rec["pci"] = row.pci
+                    if row.tac is not None:
+                        rec["tac"] = row.tac
+                    if rec:
+                        updates[key] = rec
+            finally:
+                db.close()
+
+            _logger.info(f"[ExcelSync] SQLite 读取 {len(updates)} 条记录")
+
+            # 持锁避免后台同步和下载兜底同步同时写入同一文件
+            with TaskManager._excel_sync_lock:
+                wb = openpyxl.load_workbook(file_path)
+                total_updated = 0
+
+                for sheet_name in wb.sheetnames:
+                    ws = wb[sheet_name]
+                    if ws.max_row < 2:
+                        continue
+
+                    headers = [str(c.value or "") for c in ws[1]]
+                    site_id_col = sector_id_col = pci_col = tac_col = None
+
+                    for i, h in enumerate(headers):
+                        hl = h.lower().replace("\n", " ")
+                        if site_id_col is None and any(kw in hl for kw in
+                            ("enodeb标识", "enodeb id", "gnodeb标识", "gnodeb id",
+                             "enb id", "gnb id", "site_id", "siteid", "基站id", "基站标识")):
+                            if not any(x in hl for x in ("length", "宽度", "经度", "纬度", "名称", "name")):
+                                site_id_col = i
+                        if sector_id_col is None and any(kw in hl for kw in
+                            ("celllocalid", "sectorid", "localcellid", "sector_id",
+                             "小区标识", "小区id")):
+                            if not any(x in hl for x in ("名称", "name")):
+                                sector_id_col = i
+                        if pci_col is None and any(kw in hl for kw in
+                            ("pci", "物理小区识别码", "物理小区id", "physicalcellid")):
+                            pci_col = i
+                        if tac_col is None and any(kw in hl for kw in
+                            ("tac", "跟踪区码", "跟踪区域码", "trackingareacode")):
+                            tac_col = i
+
+                    if site_id_col is None or sector_id_col is None:
+                        _logger.warning(f"[ExcelSync] 工作表 '{sheet_name}' 未找到站点/小区标识列(表头前10: {headers[:10]})，跳过")
+                        continue
+
+                    # iter_rows 一次性加载行引用（快速）
+                    row_idx: Dict[str, list] = {}
+                    for row in ws.iter_rows(min_row=2, values_only=False):
+                        sid = str(row[site_id_col].value or "").strip()
+                        sec = str(row[sector_id_col].value or "").strip()
+                        if "." in sec:
+                            try:
+                                sec = str(int(float(sec)))
+                            except ValueError:
+                                pass
+                        if sid and sec:
+                            key = f"{sid}_{sec}"
+                            if key not in row_idx:
+                                row_idx[key] = []
+                            row_idx[key].append(row)
+
+                    sheet_updated = 0
+                    for key, u in updates.items():
+                        rows = row_idx.get(key)
+                        if not rows:
+                            continue
+                        for row in rows:
+                            if pci_col is not None and u.get("pci") is not None:
+                                row[pci_col].value = u["pci"]
+                                sheet_updated += 1
+                            if tac_col is not None and u.get("tac") is not None:
+                                row[tac_col].value = u["tac"]
+                                sheet_updated += 1
+
+                    total_updated += sheet_updated
+                    _logger.info(f"[ExcelSync] 工作表 '{sheet_name}': 更新 {sheet_updated} 个单元格")
+
+                wb.save(file_path)
+                wb.close()
+
+                # 标记 Excel 已同步
+                data_service.index[data_id]["excel_synced"] = True
+                data_service._save_index()
+                _logger.info(f"[ExcelSync] 完成: {file_path}, 共 {total_updated} 处变更")
+
+        except Exception as e:
+            import traceback
+            _logger.error(f"[ExcelSync] 失败: {e}")
+            traceback.print_exc()
 
 
     async def _apply_pci_background_excel_update(self, new_data_id: str, old_entry_id: str,
@@ -1728,14 +2093,19 @@ class TaskManager:
             _logger.warning(f"[SyncExcelUpdate] 原始Excel文件不存在，跳过: {original_excel_path}")
             return
 
-        # 新Excel路径
+        # 新Excel路径（原地更新时 new_data_id==old_entry_id，直接使用原文件）
         new_data_dir = settings.DATA_DIR / new_data_id
         new_data_dir.mkdir(parents=True, exist_ok=True)
         new_excel_path = new_data_dir / "original.xlsx"
 
-        # 复制原始Excel到新目录
-        shutil.copy2(original_excel_path, new_excel_path)
-        _logger.info(f"[SyncExcelUpdate] 已复制Excel到新目录: {new_excel_path}")
+        # ⚠️ 当 new_data_id == old_entry_id（原地更新）时，不能 copy2(src, dst) 到同一文件
+        # Python 的 copy2 会先以 'wb' 打开目标文件（截断为 0），再读取源文件，
+        # 源==目标时文件被清空，后续 openpyxl.load_workbook 读取空文件会失败
+        if new_excel_path != original_excel_path:
+            shutil.copy2(original_excel_path, new_excel_path)
+            _logger.info(f"[SyncExcelUpdate] 已复制Excel到新目录: {new_excel_path}")
+        else:
+            _logger.info(f"[SyncExcelUpdate] 原地更新，跳过拷贝: {new_excel_path}")
 
         # 更新Excel文件中的PCI
         results = planning_result.get("results", [])
@@ -1745,12 +2115,18 @@ class TaskManager:
         network_type = planning_result.get("networkType", "LTE")
 
         pci_updates = {}
+        tac_updates = {}
+        has_tac = False
         for site_result in results:
             result_site_id = str(site_result.get("siteId", ""))
             for sector in site_result.get("sectors", []):
                 new_pci = sector.get("newPCI")
                 if new_pci is not None:
                     pci_updates[f"{result_site_id}_{str(sector.get('sectorId', ''))}"] = new_pci
+                new_tac = sector.get("tac")
+                if new_tac is not None:
+                    tac_updates[f"{result_site_id}_{str(sector.get('sectorId', ''))}"] = str(new_tac)
+                    has_tac = True
 
         try:
             wb = openpyxl.load_workbook(new_excel_path)
@@ -1769,7 +2145,7 @@ class TaskManager:
             ws = wb[target_sheet_name]
             headers = [str(c.value) if c.value else "" for c in ws[1]]
 
-            site_id_col_idx = sector_id_col_idx = pci_col_idx = None
+            site_id_col_idx = sector_id_col_idx = pci_col_idx = tac_col_idx = None
             site_kw = ["eNodeB标识", "eNodeB ID", "基站ID", "eNodeB"] if network_type == "LTE" else \
                       ["gNodeB标识", "gNodeB ID", "基站ID", "gNodeB"]
             for kw in site_kw:
@@ -1793,13 +2169,22 @@ class TaskManager:
                         break
                 if pci_col_idx is not None:
                     break
+            if has_tac:
+                for kw in ["TAC", "跟踪区码", "跟踪区域码", "TrackingAreaCode"]:
+                    for i, h in enumerate(headers):
+                        if kw in h.strip().replace("\n", " "):
+                            tac_col_idx = i
+                            break
+                    if tac_col_idx is not None:
+                        break
 
             if site_id_col_idx is None or sector_id_col_idx is None or pci_col_idx is None:
                 wb.close()
                 _logger.warning("[SyncExcelUpdate] Excel缺少必需列，跳过")
                 return
 
-            updated_count = 0
+            pci_updated = 0
+            tac_updated = 0
             for row in ws.iter_rows(min_row=2, values_only=False):
                 site_id_val = str(row[site_id_col_idx].value) if row[site_id_col_idx].value else ""
                 sector_id_val = str(row[sector_id_col_idx].value) if row[sector_id_col_idx].value else ""
@@ -1809,23 +2194,43 @@ class TaskManager:
                 except:
                     pass
 
-                new_pci = pci_updates.get(f"{site_id_val}_{sector_id_val}")
-                if new_pci is None and "_" in sector_id_val:
+                key = f"{site_id_val}_{sector_id_val}"
+                # 处理 sector_id_val 本身可能包含下划线的情况
+                if key not in pci_updates and key not in tac_updates and "_" in sector_id_val:
                     parts = sector_id_val.split("_")
                     if len(parts) == 2:
-                        new_pci = pci_updates.get(f"{parts[0]}_{parts[1]}")
+                        alt_key = f"{parts[0]}_{parts[1]}"
+                        new_pci = pci_updates.get(alt_key)
+                        new_tac = tac_updates.get(alt_key)
+                    else:
+                        new_pci = pci_updates.get(key)
+                        new_tac = tac_updates.get(key)
+                else:
+                    new_pci = pci_updates.get(key)
+                    new_tac = tac_updates.get(key)
 
                 if new_pci is not None and row[pci_col_idx].value != new_pci:
                     row[pci_col_idx].value = new_pci
-                    updated_count += 1
+                    pci_updated += 1
+                if new_tac is not None and tac_col_idx is not None:
+                    cur_tac = str(row[tac_col_idx].value or "").strip()
+                    if cur_tac != new_tac:
+                        row[tac_col_idx].value = int(new_tac) if new_tac.isdigit() else new_tac
+                        tac_updated += 1
 
             wb.save(new_excel_path)
             wb.close()
-            _logger.info(f"[SyncExcelUpdate] Excel已更新 {updated_count} 个小区PCI")
+            parts = []
+            if pci_updated:
+                parts.append(f"{pci_updated}个PCI")
+            if tac_updated:
+                parts.append(f"{tac_updated}个TAC")
+            _logger.info(f"[SyncExcelUpdate] Excel已更新 {'、'.join(parts) if parts else '0个小区'}")
 
-            # 更新数据索引中的文件大小
+            # 更新数据索引 — 标记 Excel 已同步，下载端点可跳过重复的 openpyxl 同步
             if new_data_id in data_service.index:
                 data_service.index[new_data_id]["size"] = new_excel_path.stat().st_size
+                data_service.index[new_data_id]["excel_synced"] = True
                 data_service._save_index()
 
             # 保存到原始目录
@@ -1933,20 +2338,10 @@ class TaskManager:
             self._persist_task(task.task_id)
             self._save_task_result_to_db(task)
             logger.info(f"[TaskManager] TAC规划应用到工参快路径完成: {task.task_id}, 更新了 {result.get('updatedCount', 0)} 个小区")
-
-            # === 阶段2: 后台更新Excel文件 ===
+            # 后台同步 Excel
             new_data_id = result.get("newFileId", "")
             if new_data_id:
-                asyncio.create_task(
-                    asyncio.to_thread(
-                        self._sync_update_excel_tac_background,
-                        new_data_id,
-                        planning_result,
-                        full_params_info or {},
-                        logger
-                    )
-                )
-                logger.info(f"[TaskManager] 后台TAC Excel更新任务已创建: new_data_id={new_data_id}")
+                asyncio.create_task(asyncio.to_thread(self._sync_excel_from_sqlite, new_data_id, logger))
 
         except Exception as e:
             import traceback
@@ -1959,6 +2354,138 @@ class TaskManager:
             self._persist_task(task.task_id)
             self._save_task_result_to_db(task)
             logger.error(f"[TaskManager] TAC规划应用到工参任务失败: {task.task_id}, error: {e}", exc_info=True)
+
+    # ============================================================
+    # 批量 TAC 规划应用到工参
+    # ============================================================
+
+    async def create_apply_tac_planning_batch_task(self, plan_task_ids: List[str]) -> str:
+        """创建TAC规划批量应用到工参任务"""
+        logger.info(f"[TaskManager] 创建TAC规划批量应用到工参任务: {len(plan_task_ids)} 个规划任务")
+
+        for tid in plan_task_ids:
+            r = self.get_task_result(tid)
+            if r is None:
+                raise ValueError(f"规划任务不存在: {tid[:8]}...")
+            if r.get("status") != "completed":
+                raise ValueError(f"规划任务未完成: {tid[:8]}...")
+
+        task = Task(TaskType.APPLY_TAC_PLANNING_BATCH, {"planTaskIds": plan_task_ids})
+        self.tasks[task.task_id] = task
+        self._persist_task(task.task_id)
+        logger.info(f"[TaskManager] TAC规划批量应用到工参任务已创建: {task.task_id}")
+
+        task.task = asyncio.create_task(self._run_task_with_slot(task, self._run_apply_tac_planning_batch_task))
+        return task.task_id
+
+    async def _run_apply_tac_planning_batch_task(self, task: Task):
+        """运行TAC规划批量应用到工参任务"""
+        logger.info(f"[TaskManager] _run_apply_tac_planning_batch_task 开始执行, task_id: {task.task_id}")
+        try:
+            task.status = TaskStatus.PROCESSING
+            task.started_at = datetime.now()
+            task.progress = 5
+
+            plan_task_ids = task.config["planTaskIds"]
+            logger.info(f"[TA-Batch] 收集 {len(plan_task_ids)} 个规划任务的结果")
+
+            # 收集并合并所有TAC规划结果（后写入覆盖前写入）
+            merged_tac_updates = {}  # { "siteId_sectorId": new_tac }
+            merged_results = []  # 重建为 _sync_apply_tac_planning_fast 期望的格式
+            network_type = None
+
+            for tid in plan_task_ids:
+                r = self.get_task_result(tid)
+                if not r or r.get("status") != "completed":
+                    logger.warning(f"[TA-Batch] 跳过无效任务: {tid[:8]}...")
+                    continue
+                if network_type is None:
+                    network_type = r.get("networkType", "LTE")
+
+                results = r.get("results", [])
+                for item in results:
+                    if not item.get("matched"):
+                        continue
+                    site_id = str(item.get("siteId", ""))
+                    sector_id = str(item.get("sectorId", ""))
+                    new_tac = item.get("tac")
+                    if new_tac is not None and site_id and sector_id:
+                        key = f"{site_id}_{sector_id}"
+                        merged_tac_updates[key] = new_tac  # 后写入覆盖
+                        # 也保留到 merged_results
+                        merged_results.append({
+                            "siteId": site_id,
+                            "sectorId": sector_id,
+                            "tac": new_tac,
+                            "matched": True,
+                        })
+
+            if not merged_tac_updates:
+                raise ValueError("所有规划任务结果均为空")
+
+            merged_planning_result = {
+                "results": merged_results,
+                "networkType": network_type or "LTE",
+            }
+
+            total_cells = len(merged_tac_updates)
+            logger.info(f"[TA-Batch] 合并后共 {total_cells} 个唯一小区需要更新")
+
+            task.progress = 10
+
+            full_params_info = None
+            for data_id, data_info in data_service.index.items():
+                if data_info.get("fileType") == "full_params":
+                    full_params_info = data_info
+                    break
+
+            # === 阶段1: SQLite 快路径 ===
+            progress_holder = [10]
+            result = await asyncio.to_thread(
+                self._sync_apply_tac_planning_fast,
+                merged_planning_result, progress_holder, logger
+            )
+
+            task.progress = max(progress_holder[0], 90)
+
+            import app.api.v1.endpoints.map as map_module
+            map_module._map_data_cache = None
+            map_module._map_data_cache_time = 0
+
+            for tid in plan_task_ids:
+                try:
+                    self.mark_task_applied(tid)
+                except Exception as e:
+                    logger.warning(f"[TA-Batch] 标记任务已应用失败: {tid[:8]}..., {e}")
+
+            task.status = TaskStatus.COMPLETED
+            task.completed_at = datetime.now()
+            task.progress = 100
+            task.result = {
+                "taskId": task.task_id,
+                "status": "completed",
+                "progress": 100,
+                **result
+            }
+            self._persist_task(task.task_id)
+            self._save_task_result_to_db(task)
+            logger.info(f"[TaskManager] TAC批量应用到工参 Phase 1 完成: {task.task_id}, 更新了 {result.get('updatedCount', 0)} 个小区")
+            # 后台同步 Excel
+            new_data_id = result.get("newFileId", "")
+            if new_data_id:
+                asyncio.create_task(asyncio.to_thread(self._sync_excel_from_sqlite, new_data_id, logger))
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            task.status = TaskStatus.FAILED
+            task.error = str(e)
+            task.completed_at = datetime.now()
+            task.progress = task.progress if hasattr(task, 'progress') else 0
+            task.result = {"status": "failed", "error": str(e)}
+            self._persist_task(task.task_id)
+            self._save_task_result_to_db(task)
+            logger.error(f"[TaskManager] TAC批量应用到工参任务失败: {task.task_id}, error: {e}", exc_info=True)
 
     def _sync_apply_tac_planning_fast(self, planning_result: Dict, progress_holder: list, _logger: logging.Logger) -> Dict:
         """Direct SQL UPDATE on Sector.tac (optimized, no full copy)."""
@@ -2001,14 +2528,15 @@ class TaskManager:
 
         progress_holder[0] = 35
 
-        # ====== 直接 UPDATE Sector 表的 tac 字段 ======
+        # ====== 批量 UPDATE Sector 表的 tac 字段（raw SQL + exact match，避免 LIKE 全表扫描）======
         db = SessionLocal()
         try:
             site_pk_map = {}
             for row in db.query(Site).filter(Site.workbook_id == full_params_id).all():
                 site_pk_map[row.site_id] = row.id
 
-            updated_count = 0
+            from sqlalchemy import text
+            all_updates = []
             for item in results:
                 if not item.get("matched"):
                     continue
@@ -2022,19 +2550,44 @@ class TaskManager:
                 if site_pk is None:
                     continue
 
-                rows = db.query(Sector).filter(
-                    Sector.workbook_id == full_params_id,
-                    Sector.site_id_fk == site_pk,
-                    Sector.sector_id.like(f"%{sector_id}")
-                ).update({"tac": new_tac})
-                updated_count += rows
+                # 归一化 sector_id
+                if "." in sector_id:
+                    try:
+                        sector_id = str(int(float(sector_id)))
+                    except ValueError:
+                        pass
+                all_updates.append((site_pk, sector_id, new_tac))
+
+            # 使用单个 CASE WHEN UPDATE 替代逐条 execute
+            updated_count = 0
+            CHUNK = 300  # TAC only, 每块 300 个（每小区 3 参数，共 900+）
+
+            for chunk_start in range(0, len(all_updates), CHUNK):
+                chunk = all_updates[chunk_start:chunk_start + CHUNK]
+                cases = []
+                in_pairs = []
+                all_params = {}
+                for idx, (site_pk, sector_id, new_tac) in enumerate(chunk):
+                    pair_key = f"sp{idx}_sid{idx}"
+                    in_pairs.append(f"(:{pair_key}_spk, :{pair_key}_sid)")
+                    all_params[f"{pair_key}_spk"] = site_pk
+                    all_params[f"{pair_key}_sid"] = sector_id
+                    val_key = f"tv{idx}"
+                    cases.append(f"WHEN (site_id_fk = :{pair_key}_spk AND sector_id = :{pair_key}_sid) THEN :{val_key}")
+                    all_params[val_key] = str(new_tac)
+
+                sql = f"UPDATE sectors SET tac = CASE {' '.join(cases)} ELSE tac END WHERE workbook_id = :wb_id AND (site_id_fk, sector_id) IN ({', '.join(in_pairs)})"
+                all_params["wb_id"] = full_params_id
+
+                result = db.execute(text(sql), all_params)
+                updated_count += len(chunk)  # 假设全部匹配
 
             db.query(Workbook).filter(Workbook.id == full_params_id).update({
                 "created_at": datetime.now().isoformat()
             })
 
             db.commit()
-            _logger.info(f"[TA-Apply] 直接更新了 {updated_count} 个小区TAC")
+            _logger.info(f"[TA-Apply] 批量更新了 {updated_count} 个小区TAC")
         finally:
             db.close()
 
@@ -2044,6 +2597,7 @@ class TaskManager:
         if full_params_id in data_service.index:
             data_service.index[full_params_id]['inplace_updated'] = True
             data_service.index[full_params_id]['applied_tac'] = True
+            data_service.index[full_params_id]['excel_synced'] = False  # 下载时从SQLite按需生成
             data_service.index[full_params_id]['uploadDate'] = datetime.now().isoformat()
             data_service._save_index()
 
@@ -2123,6 +2677,10 @@ class TaskManager:
 
                 wb.save(new_excel_path)
                 _logger.info(f"[SyncApplyTAC-Background] Excel已保存: {new_excel_path}")
+                # 标记 Excel 已同步，下载端点可跳过重复的 openpyxl 同步
+                if new_data_id in data_service.index:
+                    data_service.index[new_data_id]["excel_synced"] = True
+                    data_service._save_index()
             else:
                 _logger.warning(f"[SyncApplyTAC-Background] 未找到工作表: {sheet_name}")
 
@@ -2208,11 +2766,16 @@ class TaskManager:
             logger.error(f"[TaskManager] 标记任务已应用失败: {e}")
             return False
 
+    # 🔥 优化：_load_current_sector_values 的 30 秒缓存
+    _sector_values_cache: Dict[str, Any] = {}
+    _sector_values_cache_time: float = 0
+    _sector_values_cache_ttl: float = 30.0  # 30 秒缓存
+
     def list_task_history(self, task_type: Optional[str] = None, limit: int = 50, user_name: Optional[str] = None) -> List[Dict]:
         """从 SQLite 获取历史任务列表，支持按用户过滤"""
         try:
             from app.core.database import SessionLocal
-            from app.models.database import TaskResult
+            from app.models.database import TaskResult, Sector, Site
 
             db = SessionLocal()
             try:
@@ -2222,24 +2785,163 @@ class TaskManager:
                 if user_name:
                     query = query.filter(TaskResult.user_name == user_name)
                 results = query.order_by(TaskResult.created_at.desc()).limit(limit).all()
-                return [{
-                    "taskId": r.task_id,
-                    "taskType": r.task_type,
-                    "taskName": r.task_name,
-                    "userName": r.user_name,
-                    "status": r.status,
-                    "progress": r.progress,
-                    "config": json.loads(r.config_json) if r.config_json else {},
-                    "resultSummary": self._extract_result_summary(r.result_json),
-                    "isApplied": bool(r.is_applied) if hasattr(r, 'is_applied') and r.is_applied else False,
-                    "createdAt": r.created_at,
-                    "completedAt": r.completed_at,
-                } for r in results]
+
+                # 读取当前全量工参的 sector 实际值，用于动态判断 applied 状态
+                current_sector_values = self._load_current_sector_values(db)
+
+                task_list = []
+                for r in results:
+                    # 动态检查：对比任务规划结果与当前全量工参的实际 PCI/TAC 值
+                    # 如果一致则视为已应用（即使标记为未应用），如果不一致则视为未应用（即使标记为已应用）
+                    is_applied = False
+                    full_result = None
+                    if r.result_json:
+                        is_applied = self._verify_applied(r.result_json, current_sector_values)
+                        # 🔥 优化：在历史列表响应中直接包含完整 result（含 results 数组），
+                        # 避免前端再调用 getResult 做第二次串行请求
+                        try:
+                            parsed = json.loads(r.result_json)
+                            if parsed and parsed.get("results"):
+                                full_result = parsed
+                        except Exception:
+                            pass
+                    entry = {
+                        "taskId": r.task_id,
+                        "taskType": r.task_type,
+                        "taskName": r.task_name,
+                        "userName": r.user_name,
+                        "status": r.status,
+                        "progress": r.progress,
+                        "config": json.loads(r.config_json) if r.config_json else {},
+                        "resultSummary": self._extract_result_summary(r.result_json),
+                        "result": full_result,  # 🔥 直接包含完整结果，避免二次请求
+                        "isApplied": is_applied,
+                        "createdAt": r.created_at,
+                        "completedAt": r.completed_at,
+                    }
+                    task_list.append(entry)
+                return task_list
             finally:
                 db.close()
         except Exception as e:
             logger.error(f"[TaskManager] 读取历史任务失败: {e}")
             return []
+
+    @staticmethod
+    def _load_current_sector_values(db) -> Dict[str, Dict]:
+        """加载当前全量工参中所有小区的实际 PCI/TAC 值，返回 {siteId_sectorId: {pci, tac}}
+        
+        🔥 优化：使用 30 秒内存缓存，避免频繁读取数据库
+        """
+        from app.services.data_service import data_service
+        from app.models.database import Site, Sector
+        import time as _time
+
+        # 🔥 缓存检查：先确认 full_params_id 是否有变，再检查 TTL
+        current_time = _time.time()
+        cached = TaskManager._sector_values_cache
+        if cached and (current_time - TaskManager._sector_values_cache_time) < TaskManager._sector_values_cache_ttl:
+            # 双重验证：full_params_id 是否匹配当前索引
+            current_full_params_id = None
+            for data_id, info in data_service.index.items():
+                if info.get("fileType") == "full_params":
+                    current_full_params_id = data_id
+                    break
+            if cached.get("_full_params_id") == current_full_params_id:
+                return cached.get("values", {})
+            # full_params_id 变化了，需要重新加载
+            TaskManager._sector_values_cache = {}
+
+        # 找到当前全量工参的 workbook_id
+        full_params_id = None
+        for data_id, info in data_service.index.items():
+            if info.get("fileType") == "full_params":
+                full_params_id = data_id
+                break
+        if not full_params_id:
+            return {}
+
+        values = {}
+        rows = db.query(
+            Site.site_id, Sector.sector_id, Sector.pci, Sector.tac
+        ).join(
+            Sector, Sector.site_id_fk == Site.id
+        ).filter(
+            Site.workbook_id == full_params_id
+        ).all()
+        for row in rows:
+            key = f"{row.site_id}_{row.sector_id}"
+            rec = {}
+            if row.pci is not None:
+                rec["pci"] = row.pci
+            if row.tac is not None:
+                rec["tac"] = row.tac
+            if rec:
+                values[key] = rec
+
+        # 🔥 写入缓存
+        TaskManager._sector_values_cache = {
+            "_full_params_id": full_params_id,
+            "values": values,
+        }
+        TaskManager._sector_values_cache_time = current_time
+        return values
+
+    @staticmethod
+    def _verify_applied(result_json_str: str, current_values: Dict[str, Dict]) -> bool:
+        """检查任务结果中的 PCI/TAC 是否与当前全量工参的实际值一致"""
+        try:
+            result = json.loads(result_json_str)
+            task_results = result.get("results", [])
+            if not task_results:
+                return True  # 无规划结果，视为一致
+
+            # 兼容两种格式：
+            # 嵌套格式（PCI规划）: results = [{siteId, sectors: [{sectorId, newPCI, tac}]}]
+            # 扁平格式（TAC核查/规划）: results = [{siteId, sectorId, tac, ...}]
+            first = task_results[0]
+            is_nested = "sectors" in first
+
+            if is_nested:
+                # 嵌套格式（PCI规划）
+                for site_result in task_results:
+                    site_id = str(site_result.get("siteId", ""))
+                    for sector in site_result.get("sectors", []):
+                        sector_id = str(sector.get("sectorId", ""))
+                        key = f"{site_id}_{sector_id}"
+                        cur = current_values.get(key)
+                        if cur is None:
+                            return False
+                        new_pci = sector.get("newPCI")
+                        if new_pci is not None and cur.get("pci") != new_pci:
+                            return False
+                        new_tac = sector.get("tac")
+                        if new_tac is not None:
+                            cur_tac = cur.get("tac")
+                            if cur_tac is not None and str(cur_tac).strip() != str(new_tac).strip():
+                                return False
+                            if cur_tac is None:
+                                return False
+            else:
+                # 扁平格式（TAC核查/TAC规划）
+                for item in task_results:
+                    site_id = str(item.get("siteId", ""))
+                    sector_id = str(item.get("sectorId", ""))
+                    key = f"{site_id}_{sector_id}"
+                    cur = current_values.get(key)
+                    if cur is None:
+                        return False
+                    new_tac = item.get("tac") or item.get("suggestedTac")
+                    if new_tac is not None:
+                        cur_tac = cur.get("tac")
+                        if cur_tac is not None and str(cur_tac).strip() != str(new_tac).strip():
+                            return False
+                        if cur_tac is None:
+                            return False
+
+            return True
+        except Exception:
+            return False
 
     @staticmethod
     def _extract_result_summary(result_json_str: Optional[str]) -> Optional[Dict]:

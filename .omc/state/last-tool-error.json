@@ -1,7 +1,0 @@
-{
-  "tool_name": "Agent",
-  "tool_input_preview": "{\"description\":\"Code review Task 1.1 implementation\",\"prompt\":\"Review the PCI apply refactoring in `backend/app/services/task_manager.py`. The changes split `_run_apply_pci_to_params_task` into:\\n\\n1....",
-  "error": "Agent type 'everything-claude-code:python-review' not found. Available agents: Accessibility Auditor, Account Strategist, Accounts Payable Agent, Ad Creative Strategist, Agentic Identity & Trust Architect, Agents Orchestrator, AI Engineer, Analytics Reporter, API Tester, App Store Optimizer, Autonomous Optimization Architect, Backend Architect, Baidu SEO Specialist, Behavioral Nudge Engine, Bilibili Content Strategist, Blockchain Security Auditor, Brand Guardian, Carousel Growth Engine, China E-...",
-  "timestamp": "2026-06-03T07:30:09.244Z",
-  "retry_count": 1
-}

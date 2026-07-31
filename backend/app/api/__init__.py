@@ -10,12 +10,34 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.responses import Response
 from contextlib import asynccontextmanager
+from starlette.types import ASGIApp, Scope, Receive, Send
 import logging
 import socket
 from concurrent.futures import ProcessPoolExecutor
 
 from app.core.config import settings
 from app.api.v1 import api_router
+
+
+class SelectiveGZipMiddleware(GZipMiddleware):
+    """GZip 中间件——跳过已压缩二进制文件（APK）的二次压缩
+
+    APK 本身已是 ZIP 压缩格式，二次 GZip 在 ARM 芯片上消耗大量 CPU
+    且破坏流式响应，导致下载变慢。此中间件对指定路径跳过压缩。
+    """
+    EXCLUDE_PATHS = (
+        "/api/v1/app-versions/download/",
+        "/apks/",
+    )
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "http":
+            path = scope.get("path", "")
+            if any(path.startswith(excluded) for excluded in self.EXCLUDE_PATHS):
+                # 直接透传，不做任何压缩
+                await self.app(scope, receive, send)
+                return
+        await super().__call__(scope, receive, send)
 
 # 前端构建产物目录
 FRONTEND_DIST = Path(__file__).parent.parent.parent.parent / "frontend" / "dist-renderer"
@@ -190,8 +212,8 @@ def create_app() -> FastAPI:
         expose_headers=["Content-Disposition", "Content-Length", "Content-Type"],
     )
 
-    # GZip 压缩（对大响应启用，移动端受益明显：9MB → ~1.5MB）
-    app.add_middleware(GZipMiddleware, minimum_size=1024)
+    # GZip 压缩（排除 APK 等已压缩二进制文件——二次压缩在 ARM 上 CPU 开销极高）
+    app.add_middleware(SelectiveGZipMiddleware, minimum_size=1024)
 
     # 添加 Cache-Control 中间件：防止 HTML 被浏览器缓存
     @app.middleware("http")

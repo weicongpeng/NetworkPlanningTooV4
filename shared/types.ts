@@ -37,6 +37,8 @@ export interface DataItem {
   geometryType?: 'point' | 'sector' | 'polygon'
   sourceType?: 'excel' | 'mapinfo'
   subType?: string
+  excelSynced?: boolean  // 应用PCI/TAC后 Excel 是否已同步
+  inplaceUpdated?: boolean  // 是否已原地更新（PCI/TAC应用）
 }
 
 export interface UploadResponse {

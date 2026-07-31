@@ -176,6 +176,53 @@ async def apply_pci_to_params(task_id: str) -> Dict[str, Any]:
         raise HTTPException(status_code=500, detail=safe_detail)
 
 
+@router.post("/apply-batch", response_model=Dict[str, Any])
+async def apply_pci_batch(request: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    批量将多个PCI规划结果应用到全量工参
+
+    收集所有指定任务的规划结果，合并后一次性更新SQLite和Excel。
+    相比逐个应用，避免了重复的文件IO和DB操作，大幅提升效率。
+    """
+    try:
+        task_ids = request.get("taskIds", [])
+        if not task_ids or not isinstance(task_ids, list):
+            raise HTTPException(status_code=400, detail="请提供有效的taskIds列表")
+
+        apply_task_id = await task_manager.create_apply_pci_batch_task(task_ids)
+
+        # 短轮询 Phase 1（SQLite 快路径），最大等待 10 秒
+        for _ in range(50):  # 50 * 0.2s = 10s
+            await asyncio.sleep(0.2)
+            progress = task_manager.get_task_progress(apply_task_id)
+            if progress and progress.get("status") in ("completed", "failed"):
+                result = task_manager.get_task_result(apply_task_id)
+                return {
+                    "success": True,
+                    "data": {
+                        "taskId": apply_task_id,
+                        "result": result,
+                        "message": result.get("message", "PCI批量应用完成") if result else "PCI批量应用完成"
+                    }
+                }
+
+        return {
+            "success": True,
+            "data": {
+                "taskId": apply_task_id,
+                "message": "PCI批量应用到工参任务已启动..."
+            }
+        }
+    except ValueError as e:
+        safe_detail = str(e).encode("gbk", "replace").decode("gbk")
+        raise HTTPException(status_code=400, detail=safe_detail)
+    except HTTPException:
+        raise
+    except Exception as e:
+        safe_detail = str(e).encode("gbk", "replace").decode("gbk")
+        raise HTTPException(status_code=500, detail=safe_detail)
+
+
 @router.get("/apply-to-params/progress/{apply_task_id}", response_model=Dict[str, Any])
 async def get_apply_pci_progress(apply_task_id: str) -> Dict[str, Any]:
     """获取PCI应用到工参任务进度"""

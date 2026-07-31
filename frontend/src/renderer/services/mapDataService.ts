@@ -16,7 +16,7 @@ import { SECTOR_VALIDATION, getLODLevel } from '../config/sector-config'
 import { indexedDBService } from './indexedDBService'
 
 const CACHE_KEY = 'map_data_cache'
-const CACHE_TTL = 24 * 60 * 60 * 1000 // 24小时缓存（持久化，仅在数据更新时失效）
+const CACHE_TTL = 2 * 60 * 60 * 1000 // 2小时缓存（持久化，数据更新时通过版本号强制刷新）
 
 // 数据版本键名 — 应用结果后递增版本号，地图强制重新加载
 const DATA_VERSION_KEY = 'map_data_version'
@@ -50,6 +50,7 @@ export interface SectorData {
   mcc?: string  // 移动国家码
   mnc?: string  // 移动网络码
   is_shared?: string  // 是否共享
+  first_group?: string  // 第一分组（厂家信息）
   attributes?: Record<string, string>  // 撒点文件的额外属性（用于标签显示）
 }
 
@@ -224,17 +225,24 @@ export class MapDataService {
   /**
    * 应用LOD策略筛选数据
    *
-   * 修复：移除 maxSectors 限制，依赖 Leaflet 的视口剔除优化
-   * SectorRendererSVG 已实现高效的视口剔除逻辑 (lines 116-129)
-   * 视口外的扇区不会被渲染，保证性能
-   *
-   * 仅在极低缩放级别（< 10）应用采样优化，避免 DOM 元素过多
+   * 仅在极低缩放级别（< 8）且扇区数量极大时，按比例均匀采样。
+   * SectorRendererSVG 已实现高效的视口剔除优化，视口外的扇区不会被渲染。
+   * 均匀采样确保不同区域的扇区都能在地图上展示，避免 slice(0,N) 导致只显示名称排序靠前的扇区。
    */
   private applyLOD(sectors: RenderSectorData[], zoom: number): RenderSectorData[] {
-    // 极低缩放级别时，限制返回数量以避免性能问题
-    if (zoom < 10 && sectors.length > 5000) {
-      // 使用数组截取而非随机抽样，保证数据一致性
-      return sectors.slice(0, 5000)
+    // 极低缩放级别时，限制返回数量以避免 DOM 元素过多
+    if (zoom < 8 && sectors.length > 30000) {
+      // 按步长均匀采样，保证各区域扇区都能在地图上展示
+      const maxSectors = 30000
+      const step = sectors.length / maxSectors
+      const sampled: RenderSectorData[] = []
+      for (let i = 0; i < sectors.length; i++) {
+        const targetIdx = Math.floor(i / step)
+        if (targetIdx === sampled.length) {
+          sampled.push(sectors[i])
+        }
+      }
+      return sampled
     }
 
     // 其他情况返回全部扇区，依赖 SectorRendererSVG 的视口剔除优化
@@ -323,7 +331,8 @@ export class MapDataService {
           cell_cover_type: cellCoverType,
           mcc: sector.mcc,
           mnc: sector.mnc,
-          is_shared: sector.is_shared
+          is_shared: sector.is_shared,
+          first_group: sector.first_group,
         })
 
         // 统计坐标来源
@@ -397,6 +406,9 @@ export class MapDataService {
     }
   }
 
+  // 缓存有效性的最小扇区数 — 低于此值的缓存视为无效数据（后端错误/未就绪状态）
+  private static readonly MIN_CACHED_SECTORS = 100
+
   /**
    * 获取地图数据（带缓存）
    * 优先从 IndexedDB 读取，未命中则从后端获取
@@ -415,17 +427,25 @@ export class MapDataService {
       return this.cachedData
     }
 
-    // 尝试从 IndexedDB 读取
+    // 尝试从 IndexedDB 读取（仅当未强制刷新时）
     if (!forceRefresh) {
       try {
         const cachedData = await indexedDBService.get<MapDataResponse>(CACHE_KEY)
+        // 验证缓存数据有效性：扇区数量至少达到最小阈值
         if (cachedData) {
-          console.log('[MapDataService] 使用 IndexedDB 缓存')
-          // 同步到内存缓存
-          this.cachedData = cachedData
-          this.cacheExpiry = Date.now() + this.CACHE_DURATION
-          this._cacheVersion = getDataVersion()
-          return cachedData
+          const cachedTotal = (cachedData.lteSectors?.length || 0) + (cachedData.nrSectors?.length || 0)
+          if (cachedTotal >= MapDataService.MIN_CACHED_SECTORS) {
+            console.log('[MapDataService] 使用 IndexedDB 缓存')
+            // 同步到内存缓存
+            this.cachedData = cachedData
+            this.cacheExpiry = Date.now() + this.CACHE_DURATION
+            this._cacheVersion = getDataVersion()
+            return cachedData
+          } else {
+            // 缓存数据量过少，视为无效，删除后重新获取
+            console.warn(`[MapDataService] IndexedDB 缓存数据量异常（${cachedTotal} < ${MapDataService.MIN_CACHED_SECTORS}），丢弃并重新获取`)
+            indexedDBService.delete(CACHE_KEY).catch(() => {})
+          }
         }
       } catch (error) {
         console.warn('[MapDataService] 读取 IndexedDB 缓存失败:', error)
@@ -471,11 +491,15 @@ export class MapDataService {
       this.cacheExpiry = Date.now() + this.CACHE_DURATION
       this._cacheVersion = getDataVersion()
 
-      // 缓存到 IndexedDB
-      try {
-        await indexedDBService.set(CACHE_KEY, result, CACHE_TTL)
-      } catch (error) {
-        console.warn('[MapDataService] 写入 IndexedDB 缓存失败:', error)
+      // 仅在数据量正常时才写入 IndexedDB 持久缓存
+      // 避免后端短暂异常时缓存空/部分数据导致地图长时间空白
+      const totalSectors = result.lteSectors.length + result.nrSectors.length
+      if (totalSectors >= MapDataService.MIN_CACHED_SECTORS) {
+        try {
+          await indexedDBService.set(CACHE_KEY, result, CACHE_TTL)
+        } catch (error) {
+          console.warn('[MapDataService] 写入 IndexedDB 缓存失败:', error)
+        }
       }
 
       return result
@@ -503,6 +527,7 @@ export class MapDataService {
   async clearCache(): Promise<void> {
     this.cachedData = null
     this.cacheExpiry = 0
+    this._cacheVersion = 0 // 重置版本号，下次 getMapData 时 version > 0 必强制刷新
     // 清除后端 _map_data_cache，确保下次请求重新读取最新 data.json
     try {
       await mapApi.clearCache()
@@ -553,7 +578,7 @@ interface CellListResponse {
 const _CELL_LIST_CACHE_KEY = 'cell_list_cache'
 const _CELL_LIST_CACHE_TTL = 24 * 60 * 60 * 1000 // 24小时缓存
 /** 缓存版本，递增以强制刷新缓存（接口数据格式变更时） */
-const _CELL_LIST_CACHE_VERSION = 2
+const _CELL_LIST_CACHE_VERSION = 3
 
 // 内存缓存（持久化，仅在数据更新时失效）
 let _cellListCache: { data: CellListResponse | null; time: number } = {

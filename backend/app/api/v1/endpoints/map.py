@@ -7,6 +7,7 @@ from typing import Dict, Any, Optional, List
 from app.models.schemas import OnlineMapConfig, OfflineMapConfig, MapData
 from app.core.config import settings
 from app.core.security import get_current_user
+import asyncio
 import logging
 import json
 import time
@@ -19,6 +20,7 @@ router = APIRouter()
 _map_data_cache: Optional[Dict[str, Any]] = None
 _map_data_cache_time: float = 0
 _map_data_cache_ttl: int = 1800  # 缓存30分钟（数据变更时主动失效）
+_map_data_cache_lock: asyncio.Lock = asyncio.Lock()  # 防止并发重建缓存
 
 
 def _filter_sites_by_bbox(sites: List[Dict], min_lat: float, max_lat: float, min_lon: float, max_lon: float) -> List[Dict]:
@@ -55,12 +57,14 @@ async def get_map_data(
         from app.services.data_service import data_service
         global _map_data_cache, _map_data_cache_time
 
-        # 检查缓存是否有效
+        # 检查缓存是否有效（加锁防止并发重建）
         current_time = time.time()
         if _map_data_cache is None or (current_time - _map_data_cache_time) > _map_data_cache_ttl:
-            # 缓存失效，重新加载数据
-            _map_data_cache = await run_in_threadpool(_load_map_data_from_files, data_service)
-            _map_data_cache_time = current_time
+            async with _map_data_cache_lock:
+                # 二次检查：获取锁后再次确认缓存确实需要重建
+                if _map_data_cache is None or (time.time() - _map_data_cache_time) > _map_data_cache_ttl:
+                    _map_data_cache = await run_in_threadpool(_load_map_data_from_files, data_service)
+                    _map_data_cache_time = time.time()
 
         all_sites = _map_data_cache.get("sites", [])
         bounds = _map_data_cache.get("bounds", {})
@@ -138,6 +142,7 @@ def _load_map_data_from_files(data_service) -> Dict[str, Any]:
                     "mcc": s.mcc,
                     "mnc": s.mnc,
                     "is_shared": s.is_shared,
+                    "first_group": s.first_group,
                 }
                 sectors_by_site.setdefault(s.site_id_fk, []).append(sec_dict)
 
@@ -220,8 +225,10 @@ async def get_cell_list(limit: int = 50000) -> Dict[str, Any]:
         # 复用地图数据的文件缓存
         current_time = time.time()
         if _map_data_cache is None or (current_time - _map_data_cache_time) > _map_data_cache_ttl:
-            _map_data_cache = await run_in_threadpool(_load_map_data_from_files, data_service)
-            _map_data_cache_time = current_time
+            async with _map_data_cache_lock:
+                if _map_data_cache is None or (time.time() - _map_data_cache_time) > _map_data_cache_ttl:
+                    _map_data_cache = await run_in_threadpool(_load_map_data_from_files, data_service)
+                    _map_data_cache_time = time.time()
 
         all_sites = _map_data_cache.get("sites", [])
         cells_lte: List[Dict[str, Any]] = []
@@ -292,8 +299,10 @@ async def get_sectors_mobile(
 
         current_time = time.time()
         if _map_data_cache is None or (current_time - _map_data_cache_time) > _map_data_cache_ttl:
-            _map_data_cache = await run_in_threadpool(_load_map_data_from_files, data_service)
-            _map_data_cache_time = current_time
+            async with _map_data_cache_lock:
+                if _map_data_cache is None or (time.time() - _map_data_cache_time) > _map_data_cache_ttl:
+                    _map_data_cache = await run_in_threadpool(_load_map_data_from_files, data_service)
+                    _map_data_cache_time = time.time()
 
         all_sites = _map_data_cache.get("sites", [])
 
@@ -351,6 +360,7 @@ async def get_sectors_mobile(
                     "mcc": sector.get("mcc"),
                     "mnc": sector.get("mnc"),
                     "is_shared": sector.get("is_shared"),
+                    "first_group": sector.get("first_group"),
                 }
                 if site_network == "NR":
                     nr_sectors.append(item)

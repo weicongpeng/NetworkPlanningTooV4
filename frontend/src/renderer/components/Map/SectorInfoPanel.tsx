@@ -320,6 +320,10 @@ export function SectorInfoPanel({ sector, visible, position, onClose, onMouseEnt
             {/* 是否共享 */}
             <AttributeLabel label="是否共享" />
             <AttributeValue value={sector.is_shared || '-'} />
+
+            {/* 厂家（第一分组） */}
+            <AttributeLabel label="厂家" />
+            <AttributeValue value={sector.first_group || '-'} />
           </div>
 
 

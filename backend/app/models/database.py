@@ -274,6 +274,7 @@ class AppVersion(Base):
     apk_path = Column(Text, nullable=False)
     file_size = Column(Integer, nullable=True)
     is_latest = Column(Boolean, default=False, nullable=False)
+    download_count = Column(Integer, default=0, nullable=True)
     created_at = Column(String(30), nullable=False)
     updated_at = Column(String(30), nullable=True)
 
@@ -286,6 +287,7 @@ class AppVersion(Base):
             "apk_path": self.apk_path,
             "file_size": self.file_size,
             "is_latest": self.is_latest,
+            "download_count": self.download_count or 0,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }

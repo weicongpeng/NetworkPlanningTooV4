@@ -91,6 +91,11 @@ def init_db():
         usess_cols = [row[1] for row in conn.exec_driver_sql("PRAGMA table_info(user_sessions)").fetchall()]
         if "client_type" not in usess_cols:
             conn.exec_driver_sql("ALTER TABLE user_sessions ADD COLUMN client_type VARCHAR(10) NOT NULL DEFAULT 'pc'")
+
+        # 迁移：app_versions 表添加 download_count 列
+        av_cols = [row[1] for row in conn.exec_driver_sql("PRAGMA table_info(app_versions)").fetchall()]
+        if av_cols and "download_count" not in av_cols:
+            conn.exec_driver_sql("ALTER TABLE app_versions ADD COLUMN download_count INTEGER DEFAULT 0")
         conn.commit()
 
 

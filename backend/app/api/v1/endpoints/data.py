@@ -7,6 +7,7 @@ import os
 import shutil
 import time
 import uuid
+import logging
 from pathlib import Path
 from fastapi import APIRouter, Depends, UploadFile, File, HTTPException, Body, Form
 from fastapi.concurrency import run_in_threadpool
@@ -16,6 +17,8 @@ from app.core.config import settings
 from app.models.schemas import (
     UploadResponse,
     DataItem,
+    CellCreateRequest,
+    CellBatchCreateRequest,
     UpdateParametersRequest,
     ImportPointsRequest,
 )
@@ -105,139 +108,37 @@ async def download_file(data_id: str):
         else:
             filename = default_name
 
-        # ===== 原地更新后的处理：保持原始格式，只更新 PCI/TAC 值，添加后缀 =====
+        # ===== 原地更新后：等待后台同步完成（替代旧版兜底同步，避免竞态条件） =====
         if data_id in data_service.index and data_service.index[data_id].get('inplace_updated'):
             info = data_service.index[data_id]
-            # 构建后缀
-            suffixes = []
-            if info.get('applied_pci'):
-                suffixes.append("PCI已更新")
-            if info.get('applied_tac'):
-                suffixes.append("TAC已更新")
 
-            # 尝试从 SQLite 同步更新 Excel 中的 PCI/TAC 值（安全兜底）
-            if suffixes and file_path.suffix.lower() in ('.xlsx', '.xls') and file_path.exists():
-                try:
-                    import openpyxl
-                    from app.core.database import SessionLocal
-                    from app.models.database import Sector, Site
-
-                    wb = openpyxl.load_workbook(file_path)
-                    db = SessionLocal()
-                    try:
-                        # 读取 SQLite 中该工参的所有 PCI/TAC 值
-                        sites = db.query(Site).filter(Site.workbook_id == data_id).all()
-                        site_pk_map = {s.id: s.site_id for s in sites}
-
-                        updates = {}  # { "siteId_sectorId": {"pci": ..., "tac": ...} }
-                        for spk, sid in site_pk_map.items():
-                            sectors = db.query(Sector).filter(
-                                Sector.workbook_id == data_id,
-                                Sector.site_id_fk == spk
-                            ).all()
-                            for sec in sectors:
-                                key = f"{sid}_{sec.sector_id}"
-                                updates[key] = {"pci": sec.pci, "tac": sec.tac}
-                    finally:
-                        db.close()
-
-                    print(f"[Download] SQLite 中共读取 {len(updates)} 个小区数据用于同步")
-
-                    excel_updated = 0
-                    for sheet_name in wb.sheetnames:
-                        ws = wb[sheet_name]
-                        if ws.max_row < 2:
-                            continue
-                        # 读取第一行作为表头
-                        headers = [str(c.value or "").strip() for c in ws[1]]
-
-                        # 查找列索引（兼容中英文列名）
-                        site_id_col = sector_id_col = pci_col = tac_col = None
-                        for i, h in enumerate(headers):
-                            hl = h.lower()
-                            # 站点ID列（必须包含"标识/ID"语义，排除名称/经度/纬度等列）
-                            if site_id_col is None and any(kw in hl for kw in
-                                ["enodeb标识", "enodeb id", "gnodeb标识", "gnodeb id",
-                                 "enb id", "gnb id", "site_id", "siteid",
-                                 "基站id", "基站标识"]):
-                                site_id_col = i
-                            # 小区ID列（排除名称/name相关列）
-                            if sector_id_col is None and any(kw in hl for kw in
-                                ["celllocalid", "sectorid", "localcellid", "sector_id",
-                                 "小区标识", "小区id"]):
-                                if not any(x in hl for x in ["名称", "name"]):
-                                    sector_id_col = i
-                            # PCI 列（子串匹配，兼容多行表头如 "物理小区识别码\nPCI\nlong:[0..503]"）
-                            if pci_col is None and any(kw in hl for kw in
-                                ("pci", "物理小区识别码", "物理小区id", "physicalcellid")):
-                                pci_col = i
-                            # TAC 列（子串匹配，兼容多行表头和 NR "跟踪区码" 不带TAC英文的情况）
-                            if tac_col is None and any(kw in hl for kw in
-                                ("tac", "跟踪区码", "跟踪区域码", "trackingareacode")):
-                                tac_col = i
-
-                        if site_id_col is None or sector_id_col is None:
-                            print(f"[Download] 工作表 '{sheet_name}' 未找到必要列: siteId={site_id_col}, sectorId={sector_id_col}，跳过")
-                            continue
-
-                        sheet_updated = 0
-                        # 逐行更新 PCI/TAC
-                        for row in ws.iter_rows(min_row=2, values_only=False):
-                            site_id_val = str(row[site_id_col].value or "").strip()
-                            sector_id_val = str(row[sector_id_col].value or "").strip()
-                            if "." in sector_id_val:
-                                try:
-                                    sector_id_val = str(int(float(sector_id_val)))
-                                except ValueError:
-                                    pass
-
-                            key = f"{site_id_val}_{sector_id_val}"
-                            if key in updates:
-                                u = updates[key]
-                                if pci_col is not None and u.get("pci") is not None:
-                                    try:
-                                        current_val = row[pci_col].value
-                                        if current_val != u["pci"]:
-                                            row[pci_col].value = u["pci"]
-                                            sheet_updated += 1
-                                    except:
-                                        pass
-                                if tac_col is not None and u.get("tac") is not None:
-                                    try:
-                                        current_val = row[tac_col].value
-                                        if current_val != u["tac"]:
-                                            row[tac_col].value = u["tac"]
-                                            sheet_updated += 1
-                                    except:
-                                        pass
-
-                        print(f"[Download] 工作表 '{sheet_name}': 更新了 {sheet_updated} 个单元格")
-                        excel_updated += sheet_updated
-
-                    if excel_updated > 0:
-                        wb.save(file_path)
-                        print(f"[Download] 已从 SQLite 同步更新 Excel，共 {excel_updated} 处变更: {data_id}")
-                    else:
-                        print(f"[Download] Excel 数据已与 SQLite 一致，无需更新: {data_id}")
-                    wb.close()
-                except Exception as e:
-                    import traceback
-                    print(f"[Download] 同步更新 Excel 失败（非致命，使用原文件）: {e}")
-                    traceback.print_exc()
-
-            # 始终添加后缀到下载文件名（与 Excel 同步成功与否无关）
-            if suffixes:
-                name_part, ext_part = os.path.splitext(filename)
-                import re as _re
-                clean_name = _re.sub(r"_(PCI已更新|TAC已更新)+$", "", name_part)
-                filename = f"{clean_name}_{'_'.join(suffixes)}{ext_part}"
+            if (
+                file_path.suffix.lower() in ('.xlsx', '.xls')
+                and file_path.exists()
+                and not info.get('excel_synced')
+            ):
+                # 后台同步正在执行，等待其完成（后台线程直接更新 data_service.index）
+                # 最多等待 30 秒（0.5 秒 × 60）
+                print(f"[Download] 等待后台Excel同步完成: {data_id}")
+                for _ in range(60):
+                    time.sleep(0.5)
+                    info = data_service.index.get(data_id, {})
+                    if info and info.get('excel_synced'):
+                        print(f"[Download] 后台Excel同步已完成: {data_id}")
+                        break
+                else:
+                    print(f"[Download] 等待后台Excel同步超时（30s），继续使用当前文件: {data_id}")
 
         # 处理中文文件名编码 (RFC 5987)
         import urllib.parse
 
         encoded_filename = urllib.parse.quote(filename)
         headers = {
-            "Content-Disposition": f"attachment; filename*=utf-8''{encoded_filename}"
+            "Content-Disposition": f"attachment; filename*=utf-8''{encoded_filename}",
+            # 禁止浏览器缓存下载响应，确保应用 PCI/TAC 后下载的是最新版本
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0",
         }
 
         # 根据文件类型设置正确的媒体类型
@@ -257,6 +158,119 @@ async def download_file(data_id: str):
     except Exception as e:
         import traceback
 
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/full-params/cells", response_model=Dict[str, Any])
+async def add_cell(
+    request: CellCreateRequest,
+    current_user=Depends(get_current_user),
+) -> Dict[str, Any]:
+    """新站录入：向全量工参追加小区"""
+    try:
+        # 在线程池中运行同步的耗时操作（openpyxl 文件操作）
+        result = await run_in_threadpool(
+            data_service.add_cell_to_full_params,
+            request.networkType.value,
+            request.managedElementId,
+            request.siteId,
+            request.cellId,
+            request.cellName,
+            request.longitude,
+            request.latitude,
+            request.azimuth,
+            request.frequency,
+            request.ssbFrequency,
+            request.cellCoverType,
+            current_user.id,
+        )
+        return {"success": True, "message": result.get("message", ""), "data": result}
+    except ValueError as e:
+        error_msg = str(e).replace("✗", "x")
+        safe_detail = error_msg.encode("utf-8", "replace").decode("utf-8")
+        raise HTTPException(status_code=400, detail=safe_detail)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        error_msg = str(e).replace("✗", "x")
+        safe_detail = error_msg.encode("utf-8", "replace").decode("utf-8")
+        raise HTTPException(status_code=500, detail=safe_detail)
+
+
+@router.post("/full-params/cells/batch", response_model=Dict[str, Any])
+async def batch_add_cells(
+    request: CellBatchCreateRequest,
+    current_user=Depends(get_current_user),
+) -> Dict[str, Any]:
+    """批量新站录入：向全量工参一次追加多个小区（支持 LTE/NR 混合）
+
+    一次性 Excel 打开/保存 + 单事务 SQLite 批量写入，高性能。
+    """
+    if not request.cells:
+        raise HTTPException(status_code=400, detail="没有待录入的小区数据")
+
+    try:
+        result = await run_in_threadpool(
+            data_service.batch_add_cells_to_full_params,
+            [
+                {
+                    "networkType": c.networkType.value,
+                    "managedElementId": c.managedElementId,
+                    "siteId": c.siteId,
+                    "cellId": c.cellId,
+                    "cellName": c.cellName,
+                    "longitude": c.longitude,
+                    "latitude": c.latitude,
+                    "azimuth": c.azimuth,
+                    "frequency": c.frequency,
+                    "ssbFrequency": c.ssbFrequency,
+                    "cellCoverType": c.cellCoverType,
+                    "mcc": c.mcc,
+                    "mnc": c.mnc,
+                    "userId": current_user.id,
+                }
+                for c in request.cells
+            ],
+        )
+        return {
+            "success": result.get("success", False),
+            "message": result.get("message", ""),
+            "data": {
+                "results": result.get("results", []),
+                "total": result.get("total", 0),
+                "successCount": result.get("successCount", 0),
+            },
+        }
+    except ValueError as e:
+        error_msg = str(e).replace("✗", "x")
+        safe_detail = error_msg.encode("utf-8", "replace").decode("utf-8")
+        raise HTTPException(status_code=400, detail=safe_detail)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        error_msg = str(e).replace("✗", "x")
+        safe_detail = error_msg.encode("utf-8", "replace").decode("utf-8")
+        raise HTTPException(status_code=500, detail=safe_detail)
+
+
+@router.post("/full-params/cells/check-duplicates", response_model=Dict[str, Any])
+async def check_cell_duplicates(
+    request: CellBatchCreateRequest,
+) -> Dict[str, Any]:
+    """检查小区是否重复：根据 siteId_cellId (CGI) 匹配数据库已有记录"""
+    if not request.cells:
+        return {"success": True, "data": {"duplicates": []}}
+
+    try:
+        from app.services.data_service import data_service
+        cgi_list = [f"{c.siteId}_{c.cellId}" for c in request.cells]
+        result = await run_in_threadpool(
+            data_service.check_cell_duplicates, cgi_list
+        )
+        return {"success": True, "data": result}
+    except Exception as e:
+        import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 

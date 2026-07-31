@@ -1,5 +1,6 @@
 import axios, { AxiosInstance } from 'axios';
 import { getEffectiveApiUrl, getEffectiveApiBaseUrl, setCustomApiUrl, resetCustomApiUrl, testApiConnection } from '../utils/config';
+import { getToken } from './auth';
 
 class ApiService {
   private client: AxiosInstance;
@@ -13,12 +14,19 @@ class ApiService {
         'Accept': 'application/json, text/plain, */*',
         'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
         'Cache-Control': 'no-cache',
+        'X-Client': 'app',  // 标识为移动 APP 端，便于后端 /admin/app-users 区分
       },
     });
 
-    // 请求拦截器：每次请求前动态获取当前生效的 API 地址
+    // 请求拦截器：每次请求前动态获取当前生效的 API 地址 + 附加登录 token
     this.client.interceptors.request.use(async (config) => {
       config.baseURL = await getEffectiveApiUrl();
+      // 若用户已登录，自动附带 JWT，后续受保护接口无需手动加 header
+      const token = await getToken();
+      if (token) {
+        config.headers = config.headers || ({} as any);
+        (config.headers as any).Authorization = `Bearer ${token}`;
+      }
       return config;
     });
   }
@@ -150,25 +158,23 @@ class ApiService {
     return response.json();
   }
 
-  // ==================== APP 版本检查 ====================
+  // ==================== 应用版本 API ====================
 
   /**
-   * 检查最新 APP 版本（无需认证）
+   * 检查最新 APP 版本
+   * 后端端点: GET /api/v1/system/app-version
+   * 返回: { version, download_url, file_size_display, changelog }
    */
   async checkAppVersion(): Promise<{
-    id: number;
-    version: string;
-    changelog?: string;
-    apk_filename: string;
-    file_size?: number;
+    version?: string;
     download_url?: string;
-    created_at: string;
+    file_size_display?: string;
+    changelog?: string;
   } | null> {
     try {
-      const response = await this.client.get('/app-versions/latest');
-      return response.data?.data || null;
-    } catch (e) {
-      console.warn('[API] checkAppVersion failed:', e);
+      const response = await this.client.get('/system/app-version', { timeout: 10000 });
+      return response.data?.data ?? response.data ?? null;
+    } catch {
       return null;
     }
   }

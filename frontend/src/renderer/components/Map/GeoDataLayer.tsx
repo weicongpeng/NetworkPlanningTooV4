@@ -912,9 +912,15 @@ export class GeoDataLayer {
       return dataItem.name || this._getDefaultLabel(index)
     }
 
-    // 从 properties 中获取字段值
+    // 从 properties 中获取字段值（根级：OnlineMap 将整条 item 存入 properties，所以此处查 item 根字段）
     if (dataItem.properties && dataItem.properties[field] !== undefined && dataItem.properties[field] !== null) {
       return String(dataItem.properties[field])
+    }
+
+    // 从嵌套 properties 中获取字段值（geo_data_service 将原始列全部存入 item.properties[key]）
+    if (dataItem.properties && dataItem.properties.properties &&
+        dataItem.properties.properties[field] !== undefined && dataItem.properties.properties[field] !== null) {
+      return String(dataItem.properties.properties[field])
     }
 
     // 回退到 name

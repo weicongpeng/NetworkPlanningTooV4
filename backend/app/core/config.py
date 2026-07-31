@@ -78,6 +78,11 @@ class Settings(BaseSettings):
     DEFAULT_NEIGHBOR_MAX_DISTANCE: float = 10.0
     DEFAULT_NEIGHBOR_MAX_COUNT: int = 32
 
+    # APK 下载缓存配置（秒）
+    # 默认 3600（1 小时），Cloudflare 边缘节点缓存后同区域下载秒级完成
+    # APK 版本很少更新，可以设置较长缓存时间
+    APK_CACHE_MAX_AGE: int = 3600
+
     # 计算属性
     @property
     def BACKEND_CORS_ORIGINS(self) -> List[str]:

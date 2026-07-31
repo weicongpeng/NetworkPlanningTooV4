@@ -982,9 +982,17 @@ export class SectorSVGLayer extends L.Layer {
         // 小区名称
         return sector.name || ''
 
+      case 'networkType':
+        // 网络类型
+        return sector.networkType || ''
+
       case 'siteId':
         // 基站ID - 直接使用siteId字段
         return sector.siteId || ''
+
+      case 'sectorId':
+        // 小区ID
+        return sector.sectorId || ''
 
       case 'frequency':
         // 下行频点 - 直接使用frequency字段
@@ -1016,9 +1024,29 @@ export class SectorSVGLayer extends L.Layer {
         // TAC - 直接使用tac字段
         return sector.tac !== undefined ? String(sector.tac) : ''
 
+      case 'longitude':
+        // 经度
+        return sector.longitude !== undefined ? sector.longitude.toFixed(6) : ''
+
+      case 'latitude':
+        // 纬度
+        return sector.latitude !== undefined ? sector.latitude.toFixed(6) : ''
+
+      case 'azimuth':
+        // 方向角
+        return sector.azimuth !== undefined ? `${sector.azimuth}°` : ''
+
+      case 'height':
+        // 天线挂高
+        return sector.height !== undefined ? `${sector.height}m` : ''
+
       case 'isShared':
         // 是否共享 - 直接使用is_shared字段
         return sector.is_shared || ''
+
+      case 'firstGroup':
+        // 厂家（第一分组）
+        return sector.first_group || ''
 
       case 'coverageType':
         // 覆盖类型 - 直接使用cell_cover_type字段
@@ -2589,6 +2617,7 @@ export class SectorSVGLayer extends L.Layer {
         background-color: transparent;
         padding: 0;
         margin: 0;
+        margin-top: -20px;
         pointer-events: none;
         position: absolute;
         left: 50%;

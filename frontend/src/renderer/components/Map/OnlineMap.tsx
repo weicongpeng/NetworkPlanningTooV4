@@ -159,6 +159,8 @@ interface OnlineMapProps {
   onCaptureCoord?: (lng: number, lat: number) => void
   /** 装饰图层可见性 */
   decorationLayerVisible?: boolean
+  /** 装饰图层标签可见性 */
+  decorationLabelVisible?: boolean
   /** 打点功能被阻止时的回调（装饰图层未勾选） */
   onCaptureBlocked?: () => void
 }
@@ -204,6 +206,8 @@ export interface OnlineMapRef {
   setCustomLayerVisibility: (layerId: string, visible: boolean) => void
   /** 设置装饰图层可见性 */
   setDecorationLayerVisibility: (visible: boolean) => void
+  /** 设置装饰图层标签可见性 */
+  setDecorationLabelVisibility: (visible: boolean) => void
   /** 设置底图可见性 */
   setBaseMapVisibility: (visible: boolean) => void
   /** 刷新地图数据 */
@@ -260,7 +264,8 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
   captureMode = false,
   onCaptureCoord,
   onCaptureBlocked,
-  decorationLayerVisible = true
+  decorationLayerVisible = true,
+  decorationLabelVisible,
 }, ref) => {
   // Refs
   const customLayerRefs = useRef<Record<string, L.LayerGroup | L.FeatureGroup>>({})
@@ -304,6 +309,7 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
   const selectedFeaturesRef = useRef<any[]>([]) // 选中的要素属性数据
   const selectedIdsRef = useRef<Set<string>>(new Set()) // 选中的要素ID集合
   const polygonTempLayerRef = useRef<L.Polyline | null>(null) // 多边形绘制临时线
+  const snapIndicatorRef = useRef<L.CircleMarker | null>(null) // 多边形起点吸附指示器
   const dragPreviewRectRef = useRef<L.Rectangle | null>(null) // 矩形拖拽预览（独立于已保存的矩形轨迹）
   const dragPreviewCircleRef = useRef<L.Circle | null>(null) // 圆形拖拽预览（独立于已保存的圆形轨迹）
   const [selectionTip, setSelectionTip] = useState<string>('') // 框选提示信息
@@ -311,6 +317,7 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
   const [customLayerVisibility, setCustomLayerVisibilityState] = useState<Record<string, boolean>>({})
   const [decorationLayerVisibility, setDecorationLayerVisibility] = useState<boolean>(decorationLayerVisible)
   const decorationLayerRef = useRef<L.LayerGroup | null>(null) // 装饰图层引用
+  const decorationLabelVisibleRef = useRef<boolean>(decorationLabelVisible ?? false)
 
   // 标记点自定义标签存储
   const markerLabelsRef = useRef<Map<string, MarkerLabelData>>(new Map())
@@ -324,6 +331,9 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
   useEffect(() => { selectionModeRef.current = selectionMode }, [selectionMode])
   useEffect(() => { captureModeRef.current = captureMode }, [captureMode])
   useEffect(() => { setDecorationLayerVisibility(decorationLayerVisible) }, [decorationLayerVisible])
+  useEffect(() => {
+    decorationLabelVisibleRef.current = decorationLabelVisible ?? false
+  }, [decorationLabelVisible])
 
   // 使用Ref跟踪上一次的mapDragTool值，用于检测变化
   const prevMapDragToolRef = useRef<boolean>(mapDragTool)
@@ -767,6 +777,27 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
 
     setDecorationLayerVisibility: (visible: boolean) => {
       setDecorationLayerVisibility(visible)
+    },
+
+    setDecorationLabelVisibility: (visible: boolean) => {
+      console.log('[OnlineMap] setDecorationLabelVisibility called:', visible)
+      decorationLabelVisibleRef.current = visible
+
+      // Show/hide all decoration label markers
+      const map = mapInstanceRef.current
+      if (!map || !decorationLayerRef.current) return
+
+      markerLabelElementsRef.current.forEach((labelMarker) => {
+        if (visible) {
+          if (!decorationLayerRef.current?.hasLayer(labelMarker)) {
+            decorationLayerRef.current?.addLayer(labelMarker)
+          }
+        } else {
+          if (decorationLayerRef.current?.hasLayer(labelMarker)) {
+            decorationLayerRef.current?.removeLayer(labelMarker)
+          }
+        }
+      })
     },
 
     setBaseMapVisibility: (visible: boolean) => {
@@ -1559,10 +1590,16 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
       zIndexOffset: -100
     })
 
-    if (decorationLayerRef.current) {
-      labelMarker.addTo(decorationLayerRef.current)
+    // 根据标签可见性决定是否添加到装饰图层
+    if (decorationLabelVisibleRef.current) {
+      if (decorationLayerRef.current) {
+        labelMarker.addTo(decorationLayerRef.current)
+      } else {
+        labelMarker.addTo(map)
+      }
     } else {
-      labelMarker.addTo(map)
+      // 标签不可见时，只存储引用但不添加到图层
+      // 当 setDecorationLabelVisibility(true) 时再添加到图层
     }
 
     markerLabelElementsRef.current.set(captureId, labelMarker)
@@ -4184,7 +4221,7 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
         } else if (selectionMode === 'circle') {
           setSelectionTip('按住鼠标左键拖动绘制圆形，按 Ctrl+C 复制')
         } else if (selectionMode === 'polygon') {
-          setSelectionTip('点击添加多边形顶点，双击完成绘制，按 Backspace 删除上一个点，按 Ctrl+C 复制')
+          setSelectionTip('点击添加多边形顶点，至少3个点后可移近起点单击闭合（或双击闭合），按 Backspace 删除上一个点，按 Ctrl+C 复制')
         }
         // 进入框选模式时，重置临时标志（不清除已有选中）
         preserveSelectionRef.current = false
@@ -4279,25 +4316,77 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
         L.DomEvent.stopPropagation(e)
         L.DomEvent.preventDefault(e)
       } else if (selectionModeRef.current === 'polygon') {
-        // 多边形模式：单击添加点
+        // 多边形模式：先检查鼠标是否靠近起点（吸附闭合）
+        const SNAP_THRESHOLD_PX = 15
+        if (selectionPointsRef.current.length >= 3) {
+          const firstPt = selectionPointsRef.current[0]
+          const mousePt = map.latLngToContainerPoint(latLng)
+          const startPt = map.latLngToContainerPoint(firstPt)
+          const distToStart = mousePt.distanceTo(startPt)
+          
+          if (distToStart < SNAP_THRESHOLD_PX) {
+            // 靠近起点，单击闭合多边形
+            hideSnapIndicator()
+            clearPolygonTempLine()
+            const isMultiSelect = e.originalEvent.shiftKey
+            
+            if (!isMultiSelect && selectionShapeRef.current) {
+              map.removeLayer(selectionShapeRef.current)
+              selectionShapeRef.current = null
+            }
+            
+            selectFeaturesInPolygon(selectionPointsRef.current, isMultiSelect)
+            
+            const Lx = window.L
+            const newPoly = Lx.polygon(selectionPointsRef.current, {
+              color: '#00ffff', weight: 2, fillColor: '#00ffff', fillOpacity: 0.1,
+              interactive: false
+            }).addTo(map)
+            
+            if (isMultiSelect && selectionShapeRef.current) {
+              if (selectionShapeRef.current instanceof Lx.FeatureGroup) {
+                selectionShapeRef.current.addLayer(newPoly)
+              } else {
+                const fg = Lx.featureGroup([selectionShapeRef.current, newPoly])
+                fg.addTo(map)
+                selectionShapeRef.current = fg as any
+              }
+            } else {
+              selectionShapeRef.current = newPoly
+            }
+            
+            selectionPointsRef.current = []
+            setSelectionTip('多边形已闭合，可继续绘制下一个（Shift+单击起点叠加）或按 Ctrl+C 复制')
+            L.DomEvent.stopPropagation(e)
+            L.DomEvent.preventDefault(e)
+            return
+          }
+        }
+        
+        // 不靠近起点：正常添加顶点
         selectionPointsRef.current.push(latLng)
         clearPolygonTempLine()
-
+        
         // 绘制临时线段
-        const L = window.L
+        const Lx = window.L
         if (selectionPointsRef.current.length >= 1) {
-          const points = selectionPointsRef.current.map(p => [p.lat, p.lng])
-          // 如果有多个点，绘制线段
-          if (points.length >= 2) {
-            polygonTempLayerRef.current = L.polyline(points as L.LatLngExpression[], {
+          const pts = selectionPointsRef.current.map(p => [p.lat, p.lng])
+          if (pts.length >= 2) {
+            polygonTempLayerRef.current = Lx.polyline(pts as L.LatLngExpression[], {
               color: '#00ffff',
               weight: 2,
               dashArray: '5, 5'
             }).addTo(map)
           }
         }
-
-        // 多边形绘制过程中不再显示动态点计数提示，保持进入框选时的初始提示即可
+        
+        // 更新提示信息：显示当前顶点数，并提示靠近起点闭合
+        const count = selectionPointsRef.current.length
+        if (count >= 3) {
+          setSelectionTip(`已添加 ${count} 个顶点，将鼠标移到起点附近单击闭合`)
+        } else {
+          setSelectionTip(`已添加 ${count} 个顶点（至少需要 3 个），点击继续添加顶点`)
+        }
         L.DomEvent.stopPropagation(e)
         L.DomEvent.preventDefault(e)
       }
@@ -4363,18 +4452,62 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
         // 多边形模式：更新临时线段到鼠标位置
         clearPolygonTempLine()
         
-        const L = window.L
+        const Lx = window.L
         const points = selectionPointsRef.current.map(p => [p.lat, p.lng])
-        points.push([latLng.lat, latLng.lng]) // 添加鼠标当前位置
         
-        polygonTempLayerRef.current = L.polyline(points as L.LatLngExpression[], {
-          color: '#00ffff',
-          weight: 2,
-          dashArray: '5, 5'
-        }).addTo(map)
+        // 检查鼠标是否靠近起点（>=3个点时启用吸附）
+        let isNearStart = false
+        if (selectionPointsRef.current.length >= 3) {
+          const firstPt = selectionPointsRef.current[0]
+          const mousePt = map.latLngToContainerPoint(latLng)
+          const startPt = map.latLngToContainerPoint(firstPt)
+          isNearStart = mousePt.distanceTo(startPt) < 15
+        }
+        
+        if (isNearStart) {
+          // 靠近起点：显示闭合预览（实线 + 起点高亮）
+          const closedPoints = [...points, [selectionPointsRef.current[0].lat, selectionPointsRef.current[0].lng]]
+          polygonTempLayerRef.current = Lx.polyline(closedPoints as L.LatLngExpression[], {
+            color: '#00ffff',
+            weight: 3,
+            dashArray: null  // 实线表示闭合
+          }).addTo(map)
+          
+          // 起点吸附指示器
+          if (!snapIndicatorRef.current) {
+            snapIndicatorRef.current = Lx.circleMarker(selectionPointsRef.current[0], {
+              radius: 10,
+              color: '#00ffff',
+              weight: 3,
+              fillColor: '#00ffff',
+              fillOpacity: 0.3,
+              interactive: false
+            }).addTo(map)
+          } else {
+            snapIndicatorRef.current.setLatLng(selectionPointsRef.current[0])
+            if (!map.hasLayer(snapIndicatorRef.current)) {
+              map.addLayer(snapIndicatorRef.current)
+            }
+          }
+          map.getContainer().style.cursor = 'pointer'
+        } else {
+          // 不靠近起点：虚线预览到鼠标位置
+          points.push([latLng.lat, latLng.lng]) // 添加鼠标当前位置
+          polygonTempLayerRef.current = Lx.polyline(points as L.LatLngExpression[], {
+            color: '#00ffff',
+            weight: 2,
+            dashArray: '5, 5'
+          }).addTo(map)
+          
+          // 隐藏吸附指示器
+          if (snapIndicatorRef.current) {
+            map.removeLayer(snapIndicatorRef.current)
+          }
+          map.getContainer().style.cursor = ''
+        }
       }
-    }
 
+    }
     // 处理鼠标释放
     const handleMouseUp = (e: L.LeafletMouseEvent) => {
       if (selectionModeRef.current === 'none') return
@@ -4510,43 +4643,34 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
       L.DomEvent.stopPropagation(e)
     }
 
-    // 处理双击
+    // 处理双击完成多边形绘制（备用方案，主用起点吸附闭合）
     const handleDoubleClick = (e: L.LeafletMouseEvent) => {
       if (selectionModeRef.current !== 'polygon') return
       
-      // 双击会触发两次 mousedown，额外添加了 2 个顶点
-      // 只弹出 1 个点，保留双击位置的顶点作为多边形的最后一个闭合顶点
-      // 这样点击 A → 点击 B → 双击 C 即可完成三角形（3 个点）
-      if (selectionPointsRef.current.length >= 1) {
-        selectionPointsRef.current.pop()
-      }
-
+      // 如果有足够的顶点，直接闭合多边形
       if (selectionPointsRef.current.length >= 3) {
+        hideSnapIndicator()
+        clearPolygonTempLine()
         const isMultiSelect = e.originalEvent.shiftKey
         
-        // 非Shift模式下清除之前的形状；Shift模式下保留（多区域叠加）
         if (!isMultiSelect && selectionShapeRef.current) {
           map.removeLayer(selectionShapeRef.current)
           selectionShapeRef.current = null
         }
         
-        clearPolygonTempLine()
         selectFeaturesInPolygon(selectionPointsRef.current, isMultiSelect)
         
-        // 绘制最终多边形形状
-        const L = window.L
-        const newPolygon = L.polygon(selectionPointsRef.current, {
+        const Lx = window.L
+        const newPolygon = Lx.polygon(selectionPointsRef.current, {
           color: '#00ffff', weight: 2, fillColor: '#00ffff', fillOpacity: 0.1,
-          interactive: false // 禁止交互，避免拦截鼠标事件
+          interactive: false
         }).addTo(map)
         
-        // Shift模式下：将新多边形添加到选择形状中（使用FeatureGroup管理多个形状）
         if (isMultiSelect && selectionShapeRef.current) {
-          // 如果已有选择形状，创建FeatureGroup来管理多个形状
-          if (selectionShapeRef.current instanceof L.FeatureGroup) {
+          if (selectionShapeRef.current instanceof Lx.FeatureGroup) {
             selectionShapeRef.current.addLayer(newPolygon)
           } else {
-            const featureGroup = L.featureGroup([selectionShapeRef.current, newPolygon])
+            const featureGroup = Lx.featureGroup([selectionShapeRef.current, newPolygon])
             featureGroup.addTo(map)
             selectionShapeRef.current = featureGroup as any
           }
@@ -4555,15 +4679,21 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
         }
         
         selectionPointsRef.current = []
-        // 注意：不要在这里恢复地图拖拽，因为用户仍在多边形圈选模式下
-        // 地图拖拽状态由 selectionMode 变化的 useEffect 控制
+        setSelectionTip('多边形已闭合，可继续绘制下一个（Shift+双击叠加）或按 Ctrl+C 复制')
       } else {
-        setSelectionTip('多边形至少需要3个点')
+        setSelectionTip(`多边形至少需要 3 个顶点，当前只有 ${selectionPointsRef.current.length} 个，请继续点击添加`)
       }
       L.DomEvent.stopPropagation(e)
       L.DomEvent.preventDefault(e)
     }
-
+    // 隐藏多边形起点吸附指示器
+    const hideSnapIndicator = () => {
+      if (snapIndicatorRef.current) {
+        try { map.removeLayer(snapIndicatorRef.current) } catch(e) {/* ignore */}
+        snapIndicatorRef.current = null
+      }
+      map.getContainer().style.cursor = ''
+    }
     // 注册事件监听器
     map.on('mousedown', handleMouseDown)
     map.on('mousemove', handleMouseMove)
@@ -4579,6 +4709,10 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
       if (polygonTempLayerRef.current) {
         map.removeLayer(polygonTempLayerRef.current)
         polygonTempLayerRef.current = null
+      }
+      if (snapIndicatorRef.current) {
+        map.removeLayer(snapIndicatorRef.current)
+        snapIndicatorRef.current = null
       }
       if (dragPreviewRectRef.current) {
         map.removeLayer(dragPreviewRectRef.current)
@@ -5096,8 +5230,8 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
         {/* 加载提示 */}
         {loading && (
           <div className="absolute top-4 left-4 z-[1000] bg-white/90 backdrop-blur px-4 py-2 rounded-lg shadow flex items-center gap-2">
-            <Loader2 className="animate-spin" size={16} />
-            <span className="text-sm">加载地图中...</span>
+            <Loader2 className="animate-spin text-blue-600" size={16} />
+            <span className="text-sm text-blue-600">加载地图中...</span>
           </div>
         )}
 

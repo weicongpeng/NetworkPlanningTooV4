@@ -1,7 +1,8 @@
-import { useMemo, useEffect, useState } from 'react'
-import { Clock, CheckCircle2, AlertCircle, Eye, Trash2, Check, Loader2 } from 'lucide-react'
+import { useMemo, useEffect, useState, useCallback } from 'react'
+import { Clock, Eye, Trash2, Check, Loader2 } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { useTaskStore, type TaskType, type Task } from '../store/taskStore'
+import { LoadingSpinner } from './LoadingSpinner'
 
 function formatTime(ts?: number): string {
   if (!ts) return '-'
@@ -9,6 +10,17 @@ function formatTime(ts?: number): string {
   const pad = (n: number) => String(n).padStart(2, '0')
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
 }
+
+// 模块级批量操作句柄（替代 forwardRef，避免 Vite production build TDZ 问题）
+type BatchHandler = () => Promise<void>
+let _batchApplyHandler: BatchHandler | null = null
+let _batchDeleteHandler: BatchHandler | null = null
+function setBatchHandlers(apply: BatchHandler | null, del: BatchHandler | null) {
+  _batchApplyHandler = apply
+  _batchDeleteHandler = del
+}
+export function triggerBatchApply() { return _batchApplyHandler?.() }
+export function triggerBatchDelete() { return _batchDeleteHandler?.() }
 
 interface HistoryTableProps {
   taskType: TaskType
@@ -18,13 +30,31 @@ interface HistoryTableProps {
   onViewTask?: (task: Task) => void
   /** 从 task.result 中提取小区数量 */
   getCellCount?: (task: Task) => number | string
-  /** 应用任务结果到全量工参的回调，返回 true 表示成功 */
-  onApplyTask?: (task: Task) => Promise<boolean>
+  /** 应用任务结果到全量工参的回调，返回 true 表示成功。skipConfirm=true 时跳过确认弹窗（批量调用） */
+  onApplyTask?: (task: Task, skipConfirm?: boolean) => Promise<boolean>
+  /** 批量应用回调：一次性处理所有选中任务，返回 {success, updatedCount}。优先于 onApplyTask 逐条循环 */
+  onBatchApplyTasks?: (tasks: Task[]) => Promise<{ success: boolean; updatedCount?: number }>
+  /** 选中数量变化回调：返回 total（总选中数）和 unappliable（可应用数） */
+  onSelectedChange?: (counts: { total: number; unappliable: number }) => void
+  /** 批量操作状态变化回调 */
+  onBatchStatusChange?: (applying: boolean, deleting: boolean) => void
+  /** 是否正在加载历史数据 */
+  loading?: boolean
 }
 
-/** 从 task.isApplied 判断是否已应用（后端跨用户共享） */
+export interface HistoryTableRef {
+  triggerBatchApply: () => Promise<void>
+  triggerBatchDelete: () => Promise<void>
+}
 
-export function HistoryTable({ taskType, typeLabel, onSelectTask: _onSelectTask, onViewTask, getCellCount, onApplyTask }: HistoryTableProps) {
+/** 判断任务是否可以勾选（已完成即可勾选，不区分已应用状态） */
+function isTaskSelectable(task: Task): boolean {
+  return task.status === 'completed'
+}
+
+export function HistoryTable({
+  taskType, typeLabel, onSelectTask: _onSelectTask, onViewTask, getCellCount, onApplyTask, onBatchApplyTasks, onSelectedChange, onBatchStatusChange
+}: HistoryTableProps) {
   const { t } = useTranslation()
   const tasks = useTaskStore((s) => s.tasks)
   const syncHistoryFromBackend = useTaskStore((s) => s.syncHistoryFromBackend)
@@ -36,6 +66,42 @@ export function HistoryTable({ taskType, typeLabel, onSelectTask: _onSelectTask,
 
   // 跟踪正在应用的任务ID
   const [applyingTaskId, setApplyingTaskId] = useState<string | null>(null)
+
+  // ===== 批量选择/应用状态 =====
+  const [selectedTaskIds, setSelectedTaskIds] = useState<Set<string>>(new Set())
+  const [batchApplying, setBatchApplying] = useState(false)
+  const [batchDeleting, setBatchDeleting] = useState(false)
+  const [batchApplyProgress, setBatchApplyProgress] = useState({ current: 0, total: 0 })
+  const [batchDeleteConfirm, setBatchDeleteConfirm] = useState(false)
+
+  // 首次加载动画：后端同步期间显示 LoadingSpinner
+  const [isLoading, setIsLoading] = useState(true)
+
+  // ===== 派生数据（必须在使用前定义，避免 Rollup 生产构建 TDZ 问题） =====
+  const filteredTasks = useMemo(() => {
+    return Object.values(tasks)
+      .filter((task) => task.type === taskType)
+      .sort((a, b) => {
+        const timeA = a.endTime || a.startTime || 0
+        const timeB = b.endTime || b.startTime || 0
+        return timeB - timeA
+      })
+  }, [tasks, taskType])
+
+  // ===== 全选逻辑 =====
+  const allSelectable = useMemo(() => {
+    return filteredTasks.filter(isTaskSelectable)
+  }, [filteredTasks])
+
+  const allSelectableIds = useMemo(() => allSelectable.map(t => t.id), [allSelectable])
+
+  const isAllSelected = allSelectableIds.length > 0 && allSelectableIds.every(id => selectedTaskIds.has(id))
+
+  // 选中数量变化时通知父组件（区分总选中数和可应用数）
+  useEffect(() => {
+    const unappliableCount = filteredTasks.filter(t => selectedTaskIds.has(t.id) && t.status === 'completed' && !t.isApplied).length
+    onSelectedChange?.({ total: selectedTaskIds.size, unappliable: unappliableCount })
+  }, [selectedTaskIds, filteredTasks, onSelectedChange])
 
   const handleDelete = async (taskId: string) => {
     setConfirmDelete(taskId)
@@ -54,27 +120,162 @@ export function HistoryTable({ taskType, typeLabel, onSelectTask: _onSelectTask,
   }
 
   // 组件挂载时从后端同步历史任务（解决清理浏览器缓存后历史丢失的问题）
+  // 仅当没有已有数据时才显示加载动画；已有数据时静默刷新
   useEffect(() => {
-    syncHistoryFromBackend(taskType)
+    if (Object.values(tasks).filter(t => t.type === taskType).length === 0) {
+      setIsLoading(true)
+    }
+    const doSync = async () => {
+      try {
+        await syncHistoryFromBackend(taskType)
+      } finally {
+        setIsLoading(false)
+      }
+    }
+    doSync()
+    // 🔥 兜底：5秒后无论是否同步完成都关闭loading，避免卡死在加载状态
+    const safetyTimer = setTimeout(() => setIsLoading(false), 5000)
+    return () => clearTimeout(safetyTimer)
   }, [taskType, syncHistoryFromBackend])
 
-  // 定期轮询同步（其他用户操作后实时更新）
+  // 🔥 优化：移除 5 秒轮询，改为页面可见时刷新（页面切换回来时自动同步）
+  // + 操作完成后（删除/应用）已由调用方显式触发 syncHistoryFromBackend
   useEffect(() => {
-    const interval = setInterval(() => {
-      syncHistoryFromBackend(taskType)
-    }, 5000)
-    return () => clearInterval(interval)
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        syncHistoryFromBackend(taskType)
+      }
+    }
+    document.addEventListener('visibilitychange', handleVisibility)
+    return () => document.removeEventListener('visibilitychange', handleVisibility)
   }, [taskType, syncHistoryFromBackend])
 
-  const filteredTasks = useMemo(() => {
-    return Object.values(tasks)
-      .filter((task) => task.type === taskType)
-      .sort((a, b) => {
-        const timeA = a.endTime || a.startTime || 0
-        const timeB = b.endTime || b.startTime || 0
-        return timeB - timeA
-      })
-  }, [tasks, taskType])
+  const handleToggleSelectAll = useCallback(() => {
+    if (isAllSelected) {
+      setSelectedTaskIds(new Set())
+    } else {
+      setSelectedTaskIds(new Set(allSelectableIds))
+    }
+  }, [isAllSelected, allSelectableIds])
+
+  const handleToggleSelect = useCallback((taskId: string) => {
+    setSelectedTaskIds(prev => {
+      const next = new Set(prev)
+      if (next.has(taskId)) {
+        next.delete(taskId)
+      } else {
+        next.add(taskId)
+      }
+      return next
+    })
+  }, [])
+
+  // ===== 批量应用逻辑 =====
+  const handleBatchApply = useCallback(async () => {
+    const applyTasks = filteredTasks.filter(t => selectedTaskIds.has(t.id) && t.status === 'completed' && !t.isApplied)
+    if (applyTasks.length === 0) return
+
+    if (!window.confirm(
+      t('common.batchApplyConfirm', { defaultValue: '确定要应用选中的 {{count}} 个任务吗？' }).replace('{{count}}', String(applyTasks.length))
+    )) return
+
+    setBatchApplying(true)
+    onBatchStatusChange?.(true, false)
+
+    // 优先使用批量回调（一次性处理所有任务，效率最高）
+    if (onBatchApplyTasks) {
+      try {
+        const result = await onBatchApplyTasks(applyTasks)
+        if (result.success) {
+          // 批量应用成功，所有任务已标记为已应用
+          setBatchApplyProgress({ current: applyTasks.length, total: applyTasks.length })
+        } else {
+          // 批量应用失败
+          const msg = t('common.batchApplyResult', { defaultValue: '应用完成：成功 {{success}} 个，失败 {{fail}} 个' })
+            .replace('{{success}}', '0')
+            .replace('{{fail}}', String(applyTasks.length))
+          alert(msg)
+        }
+      } catch (err: any) {
+        alert(err?.message || '批量应用失败')
+      }
+    } else if (onApplyTask) {
+      // 回退：逐条应用（兼容旧逻辑）
+      setBatchApplyProgress({ current: 0, total: applyTasks.length })
+      let successCount = 0
+      let failCount = 0
+
+      for (let i = 0; i < applyTasks.length; i++) {
+        const task = applyTasks[i]
+        setBatchApplyProgress({ current: i + 1, total: applyTasks.length })
+        try {
+          const result = await onApplyTask(task, true)
+          if (result) successCount++
+          else failCount++
+        } catch {
+          failCount++
+        }
+      }
+
+      if (failCount > 0) {
+        const msg = t('common.batchApplyResult', { defaultValue: '应用完成：成功 {{success}} 个，失败 {{fail}} 个' })
+          .replace('{{success}}', String(successCount))
+          .replace('{{fail}}', String(failCount))
+        alert(msg)
+      }
+    }
+
+    setBatchApplying(false)
+    onBatchStatusChange?.(false, false)
+    setSelectedTaskIds(new Set())
+    setBatchApplyProgress({ current: 0, total: 0 })
+
+    await syncHistoryFromBackend(taskType)
+  }, [filteredTasks, selectedTaskIds, onApplyTask, onBatchApplyTasks, syncHistoryFromBackend, t])
+
+  // ===== 批量删除逻辑 =====
+  const handleBatchDelete = useCallback(async () => {
+    const deleteTasks = filteredTasks.filter(t => selectedTaskIds.has(t.id))
+    if (deleteTasks.length === 0) return
+
+    if (!window.confirm(
+      t('common.batchDeleteConfirm', { defaultValue: '确定要删除选中的 {{count}} 个任务吗？' }).replace('{{count}}', String(deleteTasks.length))
+    )) return
+
+    setBatchDeleting(true)
+    onBatchStatusChange?.(false, true)
+    let successCount = 0
+    let failCount = 0
+
+    for (const task of deleteTasks) {
+      try {
+        const result = await deleteHistoryTask(task.id, taskType)
+        if (result) successCount++
+        else failCount++
+      } catch {
+        failCount++
+      }
+    }
+
+    setBatchDeleting(false)
+    onBatchStatusChange?.(false, false)
+    setSelectedTaskIds(new Set())
+    // deleteHistoryTask 内部已通过 setState 更新 tasks，此处同步到 store
+    await syncHistoryFromBackend(taskType)
+
+    if (failCount > 0) {
+      const msg = t('common.batchDeleteResult', { defaultValue: '删除完成：成功 {{success}} 个，失败 {{fail}} 个' })
+        .replace('{{success}}', String(successCount))
+        .replace('{{fail}}', String(failCount))
+      alert(msg)
+    }
+  }, [filteredTasks, selectedTaskIds, deleteHistoryTask, taskType, syncHistoryFromBackend, t])
+
+  // ===== 将批量处理方法注册到模块级变量（供父组件 tab 栏按钮调用） =====
+  useEffect(() => {
+    setBatchHandlers(handleBatchApply, handleBatchDelete)
+    return () => setBatchHandlers(null, null)
+  }, [handleBatchApply, handleBatchDelete])
 
   // 确认删除对话框
   const confirmDialog = confirmDelete ? (
@@ -85,22 +286,25 @@ export function HistoryTable({ taskType, typeLabel, onSelectTask: _onSelectTask,
           {t('common.confirmDeleteTaskMsg', { defaultValue: '确认删除该任务？' })}
         </p>
         <div className="flex justify-end gap-3">
-          <button
-            onClick={cancelDelete}
-            className="px-4 py-2 text-sm bg-muted text-foreground rounded-lg hover:opacity-80 transition-opacity"
-          >
+          <button onClick={cancelDelete} className="px-4 py-2 text-sm bg-muted text-foreground rounded-lg hover:opacity-80 transition-opacity">
             {t('common.cancel') || '取消'}
           </button>
-          <button
-            onClick={confirmDeleteTask}
-            className="px-4 py-2 text-sm bg-red-500 text-white rounded-lg hover:bg-red-600 transition-colors"
-          >
+          <button onClick={confirmDeleteTask} className="px-4 py-2 text-sm bg-red-500 text-white rounded-lg hover:bg-red-600 transition-colors">
             {t('common.confirmDelete') || '确认删除'}
           </button>
         </div>
       </div>
     </div>
   ) : null
+
+  if (isLoading) {
+    return (
+      <>
+        {confirmDialog}
+        <LoadingSpinner variant="spinner" text={t('common.loadingHistory') || '正在加载历史任务...'} />
+      </>
+    )
+  }
 
   if (filteredTasks.length === 0) {
     return (
@@ -121,6 +325,19 @@ export function HistoryTable({ taskType, typeLabel, onSelectTask: _onSelectTask,
         <table className="w-full text-sm">
           <thead className="sticky top-0 bg-muted/50 z-10">
             <tr className="border-b border-border">
+              {/* 复选框列 */}
+              <th className="px-3 py-3 w-10">
+                {allSelectableIds.length > 0 && (
+                  <input
+                    type="checkbox"
+                    checked={isAllSelected}
+                    onChange={handleToggleSelectAll}
+                    disabled={batchApplying || batchDeleting}
+                    className="w-4 h-4 cursor-pointer disabled:opacity-50"
+                    title={t('common.selectAll') || '全选'}
+                  />
+                )}
+              </th>
               <th className="text-left px-4 py-3 font-semibold text-xs">{t('common.userName') || '用户名称'}</th>
               <th className="text-left px-4 py-3 font-semibold text-xs">{t('common.taskName') || '任务名称'}</th>
               <th className="text-left px-4 py-3 font-semibold text-xs">{t('common.taskType') || '任务类型'}</th>
@@ -131,117 +348,126 @@ export function HistoryTable({ taskType, typeLabel, onSelectTask: _onSelectTask,
               <th className="text-left px-4 py-3 font-semibold text-xs">{t('common.taskEndTime') || '任务完成时间'}</th>
               <th className="text-center px-4 py-3 font-semibold text-xs">{t('common.status') || '状态'}</th>
               {onViewTask && (
-                <th className="text-center px-4 py-3 font-semibold text-xs">{t('common.actions')}</th>
+                <th className="text-center px-4 py-3 font-semibold text-xs min-w-[120px]">{t('common.actions')}</th>
               )}
             </tr>
           </thead>
         <tbody className="divide-y divide-border">
-          {filteredTasks.map((task) => (
-            <tr
-              key={task.id}
-              className="hover:bg-muted/30 transition-colors"
-            >
-              <td className="px-4 py-3 text-xs text-muted-foreground">
-                {task.userName || '-'}
-              </td>
-              <td className="px-4 py-3 text-xs font-medium max-w-[200px] truncate" title={task.taskName || task.id}>
-                {task.taskName || task.id.slice(0, 24)}
-              </td>
-              <td className="px-4 py-3">
-                <span className="px-2 py-0.5 text-[10px] bg-muted rounded-full text-muted-foreground">
-                  {typeLabel}
-                </span>
-              </td>
-              {getCellCount && (
-                <td className="px-3 py-3 text-xs text-center text-muted-foreground">
-                  {getCellCount ? getCellCount(task) : '-'}
+          {filteredTasks.map((task) => {
+            const isApplicable = isTaskSelectable(task)
+            const isSelected = selectedTaskIds.has(task.id)
+            return (
+              <tr
+                key={task.id}
+                className={`transition-colors ${isSelected ? 'bg-accent/30' : 'hover:bg-muted/30'}`}
+              >
+                {/* 复选框列 */}
+                <td className="px-3 py-3">
+                  <input
+                    type="checkbox"
+                    checked={isSelected}
+                    onChange={() => {
+                      if (isApplicable) {
+                        handleToggleSelect(task.id)
+                      }
+                    }}
+                    disabled={!isApplicable || batchApplying || batchDeleting}
+                    className="w-4 h-4 cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed"
+                    title={
+                      !isApplicable
+                        ? (task.status !== 'completed' ? (t('common.taskFailed') || '任务未完成') : (t('common.applied') || '已应用'))
+                        : (t('common.selectItem') || '选择')
+                    }
+                  />
                 </td>
-              )}
-              <td className="px-4 py-3 text-xs text-muted-foreground">
-                {formatTime(task.startTime)}
-              </td>
-              <td className="px-4 py-3 text-xs text-muted-foreground">
-                {formatTime(task.endTime)}
-              </td>
-              <td className="px-4 py-3 text-center">
-                {task.status === 'completed' ? (
-                  <span className="inline-flex items-center gap-1 px-2 py-0.5 text-[10px] bg-green-100 text-green-700 rounded-full font-medium">
-                    <CheckCircle2 size={10} />
-                    {t('common.taskSuccess') || '成功'}
+                <td className="px-4 py-3 text-xs text-muted-foreground">
+                  {task.userName || '-'}
+                </td>
+                <td className="px-4 py-3 text-xs font-medium max-w-[200px] truncate" title={task.taskName || task.id}>
+                  {task.taskName || task.id.slice(0, 24)}
+                </td>
+                <td className="px-4 py-3">
+                  <span className="px-2 py-0.5 text-[10px] bg-muted rounded-full text-muted-foreground">
+                    {typeLabel}
                   </span>
-                ) : task.status === 'failed' ? (
-                  <span className="inline-flex items-center gap-1 px-2 py-0.5 text-[10px] bg-red-100 text-red-700 rounded-full font-medium">
-                    <AlertCircle size={10} />
-                    {t('common.taskFailed') || '失败'}
-                  </span>
-                ) : null}
-              </td>
-              {onViewTask && (
-                <td className="px-4 py-3 text-center">
-                  <div className="flex items-center justify-center gap-1.5">
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation()
-                        onViewTask(task)
-                      }}
-                      className="inline-flex items-center gap-1 px-3 py-1.5 text-xs bg-blue-500 text-white rounded-lg hover:bg-blue-600 transition-colors font-medium"
-                    >
-                      <Eye size={12} />
-                      {t('common.view')}
-                    </button>
-                    {onApplyTask && task.status === 'completed' && (
-                      task.isApplied ? (
-                        <span className="inline-flex items-center gap-1 px-3 py-1.5 text-xs bg-gray-200 dark:bg-gray-700 text-gray-500 dark:text-gray-400 rounded-lg font-medium cursor-default">
-                          <Check size={12} />
-                          {t('common.applied') || '已应用'}
-                        </span>
-                      ) : (
-                        <button
-                          onClick={async (e) => {
-                            e.stopPropagation()
-                            if (applyingTaskId) return
-                            setApplyingTaskId(task.id)
-                            try {
-                              const success = await onApplyTask(task)
-                              if (success) {
-                                // 应用成功后刷新历史列表（后端已更新 is_applied）
-                                await syncHistoryFromBackend(taskType)
+                </td>
+                {getCellCount && (
+                  <td className="px-3 py-3 text-xs text-center text-muted-foreground">
+                    {getCellCount ? getCellCount(task) : '-'}
+                  </td>
+                )}
+                <td className="px-4 py-3 text-xs text-muted-foreground">
+                  {formatTime(task.startTime)}
+                </td>
+                <td className="px-4 py-3 text-xs text-muted-foreground">
+                  {formatTime(task.endTime)}
+                </td>
+                {/* 状态列：纯文字，无背景/颜色/图标 */}
+                <td className="px-4 py-3 text-center text-xs text-muted-foreground">
+                  {task.status === 'completed' ? (t('common.taskSuccess') || '成功') : task.status === 'failed' ? (t('common.taskFailed') || '失败') : ''}
+                </td>
+                {/* 操作列：只有图标，无文字标签 */}
+                {onViewTask && (
+                  <td className="px-4 py-3 text-center">
+                    <div className="flex items-center justify-center gap-1">
+                      <button
+                        onClick={(e) => { e.stopPropagation(); onViewTask(task) }}
+                        className="p-1.5 bg-blue-500 text-white rounded-lg hover:bg-blue-600 transition-colors"
+                        title={t('common.view') || '查看'}
+                      >
+                        <Eye size={14} />
+                      </button>
+                      {onApplyTask && task.status === 'completed' && (
+                        task.isApplied ? (
+                          <span className="p-1.5 text-muted-foreground cursor-default" title={t('common.applied') || '已应用'}>
+                            <Check size={14} />
+                          </span>
+                        ) : (
+                          <button
+                            onClick={async (e) => {
+                              e.stopPropagation()
+                              if (applyingTaskId) return
+                              setApplyingTaskId(task.id)
+                              try {
+                                const success = await onApplyTask(task)
+                                if (success) {
+                                  await syncHistoryFromBackend(taskType)
+                                  setSelectedTaskIds(prev => {
+                                    const next = new Set(prev)
+                                    next.delete(task.id)
+                                    return next
+                                  })
+                                }
+                              } finally {
+                                setApplyingTaskId(null)
                               }
-                            } finally {
-                              setApplyingTaskId(null)
-                            }
-                          }}
-                          disabled={applyingTaskId === task.id}
-                          className={`inline-flex items-center gap-1 px-3 py-1.5 text-xs rounded-lg transition-colors font-medium ${
-                            applyingTaskId === task.id
-                              ? 'bg-blue-400 text-white cursor-wait'
-                              : 'bg-green-500 text-white hover:bg-green-600'
-                          } disabled:opacity-50`}
-                        >
-                          {applyingTaskId === task.id ? (
-                            <><Loader2 size={12} className="animate-spin" />{t('common.applying') || '应用中...'}</>
-                          ) : (
-                            <><Check size={12} />{t('common.apply')}</>
-                          )}
-                        </button>
-                      )
-                    )}
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation()
-                        handleDelete(task.id)
-                      }}
-                      disabled={deletingId === task.id}
-                      className="inline-flex items-center gap-1 px-3 py-1.5 text-xs bg-red-500 text-white rounded-lg hover:bg-red-600 transition-colors font-medium disabled:opacity-50"
-                    >
-                      <Trash2 size={12} />
-                      {deletingId === task.id ? '...' : (t('common.delete') || '删除')}
-                    </button>
-                  </div>
-                </td>
-              )}
-            </tr>
-          ))}
+                            }}
+                            disabled={applyingTaskId === task.id}
+                            className={`p-1.5 rounded-lg transition-colors ${
+                              applyingTaskId === task.id
+                                ? 'bg-blue-400 text-white cursor-wait'
+                                : 'bg-green-500 text-white hover:bg-green-600'
+                            } disabled:opacity-50`}
+                            title={t('common.apply') || '应用'}
+                          >
+                            {applyingTaskId === task.id ? <Loader2 size={14} className="animate-spin" /> : <Check size={14} />}
+                          </button>
+                        )
+                      )}
+                      <button
+                        onClick={(e) => { e.stopPropagation(); handleDelete(task.id) }}
+                        disabled={deletingId === task.id}
+                        className="p-1.5 bg-red-500 text-white rounded-lg hover:bg-red-600 transition-colors disabled:opacity-50"
+                        title={t('common.delete') || '删除'}
+                      >
+                        {deletingId === task.id ? <Loader2 size={14} className="animate-spin" /> : <Trash2 size={14} />}
+                      </button>
+                    </div>
+                  </td>
+                )}
+              </tr>
+            )
+          })}
         </tbody>
       </table>
     </div>
