@@ -255,7 +255,8 @@
     "operationLog": "Operation Log",
     "noLogs": "No operation records yet",
     "noLogsHint": "Records will appear here after performing upload, download, delete, etc.",
-    "clearLog": "Clear"
+    "clearLog": "Clear",
+    "noPermission": "No permission, please contact administrator"
   },
   "newCellEntry": {
     "title": "New Station Entry",
@@ -970,6 +971,13 @@
     "pcCount": "PC",
     "appCount": "APP",
     "noAppUsers": "No APP users yet",
-    "appUserDeleteConfirm": "Are you sure to delete APP user \"{{username}}\"?"
+    "appUserDeleteConfirm": "Are you sure to delete APP user \"{{username}}\"?",
+    "pcDataPermissions": "PC Data Permissions",
+    "permissionsApplyToDataPage": "Controls this user's operation permissions on the Data Management page",
+    "adminNotRestricted": "Admins are not restricted by these toggles",
+    "permDataImport": "Import Data",
+    "permDataDelete": "Delete Data",
+    "permDataUpdate": "Update Parameters",
+    "permCellEntry": "New Cell Entry"
   }
 }

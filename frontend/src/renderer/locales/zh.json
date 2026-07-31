@@ -262,7 +262,8 @@
     "operationLog": "运行结果",
     "noLogs": "暂无运行记录",
     "noLogsHint": "执行上传、下载、删除等操作后，记录将出现在这里",
-    "clearLog": "清除"
+    "clearLog": "清除",
+    "noPermission": "无权限，请联系管理员"
   },
   "newCellEntry": {
     "title": "新站录入",
@@ -981,6 +982,13 @@
     "viewLoginRecords": "查看登录记录",
     "loginRecordTime": "登录时间",
     "loginRecordIp": "IP地址",
-    "loginRecordClient": "客户端"
+    "loginRecordClient": "客户端",
+    "pcDataPermissions": "PC端数据权限",
+    "permissionsApplyToDataPage": "控制该用户在数据管理页面的操作权限",
+    "adminNotRestricted": "管理员不受此限制，开关不生效",
+    "permDataImport": "数据导入",
+    "permDataDelete": "数据删除",
+    "permDataUpdate": "工参更新",
+    "permCellEntry": "新站录入"
   }
 }
