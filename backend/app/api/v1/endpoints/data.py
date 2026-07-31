@@ -23,7 +23,7 @@ from app.models.schemas import (
     ImportPointsRequest,
 )
 from app.services.data_service import data_service
-from app.core.security import get_current_user
+from app.core.security import get_current_user, require_data_import, require_data_delete, require_data_update, require_cell_entry
 
 router = APIRouter()
 
@@ -165,7 +165,7 @@ async def download_file(data_id: str):
 @router.post("/full-params/cells", response_model=Dict[str, Any])
 async def add_cell(
     request: CellCreateRequest,
-    current_user=Depends(get_current_user),
+    current_user=Depends(require_cell_entry),
 ) -> Dict[str, Any]:
     """新站录入：向全量工参追加小区"""
     try:
@@ -201,7 +201,7 @@ async def add_cell(
 @router.post("/full-params/cells/batch", response_model=Dict[str, Any])
 async def batch_add_cells(
     request: CellBatchCreateRequest,
-    current_user=Depends(get_current_user),
+    current_user=Depends(require_cell_entry),
 ) -> Dict[str, Any]:
     """批量新站录入：向全量工参一次追加多个小区（支持 LTE/NR 混合）
 
@@ -257,6 +257,7 @@ async def batch_add_cells(
 @router.post("/full-params/cells/check-duplicates", response_model=Dict[str, Any])
 async def check_cell_duplicates(
     request: CellBatchCreateRequest,
+    current_user=Depends(require_cell_entry),
 ) -> Dict[str, Any]:
     """检查小区是否重复：根据 siteId_cellId (CGI) 匹配数据库已有记录"""
     if not request.cells:
@@ -278,7 +279,7 @@ async def check_cell_duplicates(
 @router.post("/update-parameters", response_model=Dict[str, Any])
 async def update_parameters(
     request: UpdateParametersRequest,
-    current_user=Depends(get_current_user),
+    current_user=Depends(require_data_update),
 ) -> Dict[str, Any]:
     """更新工参"""
     try:
@@ -354,7 +355,7 @@ async def get_update_params_result(task_id: str) -> Dict[str, Any]:
 async def upload_excel(
     file: Optional[UploadFile] = File(None), file_path: Optional[str] = Form(None),
     overwrite: bool = Form(False),
-    current_user=Depends(get_current_user),
+    current_user=Depends(require_data_import),
 ) -> Dict[str, Any]:
     """上传Excel工参文件"""
     try:
@@ -495,7 +496,7 @@ async def get_data(data_id: str) -> Dict[str, Any]:
 
 
 @router.delete("/{data_id}", response_model=Dict[str, Any])
-async def delete_data(data_id: str, force: bool = False) -> Dict[str, Any]:
+async def delete_data(data_id: str, force: bool = False, current_user=Depends(require_data_delete)) -> Dict[str, Any]:
     """删除数据
 
     Args:
@@ -926,6 +927,7 @@ async def start_chunked_upload(
     filename: str = Form(...),
     total_chunks: int = Form(...),
     total_size: int = Form(...),
+    current_user=Depends(require_data_import),
 ) -> Dict[str, Any]:
     """初始化分块上传会话"""
     data_id = str(uuid.uuid4())
@@ -964,6 +966,7 @@ async def upload_chunk(
     data_id: str,
     chunk_index: int = Form(...),
     file: UploadFile = File(...),
+    current_user=Depends(require_data_import),
 ) -> Dict[str, Any]:
     """上传单个分块"""
     session = _chunked_sessions.get(data_id)
@@ -988,6 +991,7 @@ async def complete_chunked_upload(
     data_id: str,
     filename: str = Form(...),
     file_type: str = Form("excel"),
+    current_user=Depends(require_data_import),
 ) -> Dict[str, Any]:
     """完成分块上传：重组文件、创建索引、启动后台处理"""
     session = _chunked_sessions.get(data_id)
