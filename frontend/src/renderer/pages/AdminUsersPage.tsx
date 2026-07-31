@@ -59,6 +59,10 @@ export function AdminUsersPage() {
   const [formOperator, setFormOperator] = useState('')
   const [formSubmitting, setFormSubmitting] = useState(false)
   const [formError, setFormError] = useState('')
+  const [formCanDataImport, setFormCanDataImport] = useState(false)
+  const [formCanDataDelete, setFormCanDataDelete] = useState(false)
+  const [formCanDataUpdate, setFormCanDataUpdate] = useState(false)
+  const [formCanCellEntry, setFormCanCellEntry] = useState(false)
 
   const fetchUsers = useCallback(async () => {
     setLoading(true)
@@ -116,6 +120,10 @@ export function AdminUsersPage() {
     setFormLicenseExpiry(user.license_expiry ? user.license_expiry.slice(0, 10) : '')
     setFormCity(user.city || '')
     setFormOperator(user.operator || '')
+    setFormCanDataImport(!!user.can_data_import)
+    setFormCanDataDelete(!!user.can_data_delete)
+    setFormCanDataUpdate(!!user.can_data_update)
+    setFormCanCellEntry(!!user.can_cell_entry)
     setFormError('')
     setShowEditModal(true)
   }
@@ -131,6 +139,10 @@ export function AdminUsersPage() {
         license_expiry: formLicenseExpiry || null,
         city: formCity || null,
         operator: formOperator || null,
+        can_data_import: formCanDataImport,
+        can_data_delete: formCanDataDelete,
+        can_data_update: formCanDataUpdate,
+        can_cell_entry: formCanCellEntry,
       })
       if (result.success) {
         setShowEditModal(false)
@@ -217,6 +229,10 @@ export function AdminUsersPage() {
     setFormNewPassword('')
     setFormCity('')
     setFormOperator('')
+    setFormCanDataImport(false)
+    setFormCanDataDelete(false)
+    setFormCanDataUpdate(false)
+    setFormCanCellEntry(false)
     setFormError('')
     setEditUser(null)
   }
@@ -504,6 +520,34 @@ export function AdminUsersPage() {
                 <span className="text-muted-foreground">：{formIsActive ? '已启用' : '已禁用'}</span>
               </div>
               <p className="text-xs text-muted-foreground mt-1">APP权限由账号启用状态统一控制</p>
+            </div>
+            <div className="p-3 bg-blue-500/5 border border-blue-500/20 rounded-lg">
+              <div className="flex items-center gap-2 text-sm text-blue-400 mb-2">
+                <span>🖥️ {t('admin.pcDataPermissions', 'PC端数据权限')}</span>
+              </div>
+              <p className="text-xs text-muted-foreground mb-2">{t('admin.permissionsApplyToDataPage', '控制该用户在数据管理页面的操作权限')}</p>
+              {editUser?.is_admin && (
+                <p className="text-xs text-amber-500 mb-2">{t('admin.adminNotRestricted', '管理员不受此限制，开关不生效')}</p>
+              )}
+              <div className="space-y-1.5">
+                {[
+                  { key: 'can_data_import', label: t('admin.permDataImport', '数据导入'), value: formCanDataImport, setter: setFormCanDataImport },
+                  { key: 'can_data_delete', label: t('admin.permDataDelete', '数据删除'), value: formCanDataDelete, setter: setFormCanDataDelete },
+                  { key: 'can_data_update', label: t('admin.permDataUpdate', '工参更新'), value: formCanDataUpdate, setter: setFormCanDataUpdate },
+                  { key: 'can_cell_entry', label: t('admin.permCellEntry', '新站录入'), value: formCanCellEntry, setter: setFormCanCellEntry },
+                ].map((p) => (
+                  <label key={p.key} className={`flex items-center gap-2 cursor-pointer ${editUser?.is_admin ? 'opacity-50 pointer-events-none' : ''}`}>
+                    <input
+                      type="checkbox"
+                      checked={p.value}
+                      onChange={(e) => p.setter(e.target.checked)}
+                      disabled={!!editUser?.is_admin}
+                      className="rounded"
+                    />
+                    <span className="text-sm text-foreground">{p.label}</span>
+                  </label>
+                ))}
+              </div>
             </div>
             <div>
               <label className="block text-sm text-muted-foreground mb-1">{t('auth.city')}</label>
