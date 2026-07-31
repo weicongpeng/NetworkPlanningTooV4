@@ -90,6 +90,64 @@ def dup_env():
         data_service.index.update(saved_index)
 
 
+def test_batch_duplicate_message_same_and_cross(dup_env, tmp_path, monkeypatch):
+    """批量查重:同制式→已重复覆盖,跨制式→已在[其他制式]工参中存在,请检查"""
+    # 纯消息层验证（不依赖文件系统）
+    assert data_service._duplicate_message("LTE", "LTE", "LTE小区") == "[LTE]小区 LTE小区 已重复，信息已更新覆盖"
+    assert data_service._duplicate_message("LTE", "NR", "NR小区") == "[LTE]小区 NR小区 已在[NR]工参中存在，请检查"
+
+    # 集成层：构造内存 Excel + 隔离 DATA_DIR，走 batch_add_cells_to_full_params 全流程
+    from openpyxl import Workbook
+    from app.core.config import settings
+    from app.core.database import SessionLocal
+    from app.models.database import Site, Sector
+
+    wb_id = dup_env  # 库中已有 LTE 111_1 + NR 222_1
+
+    # 隔离文件系统：Excel 原始文件与 index 落到 tmp_path，不污染真实 data/ 目录
+    monkeypatch.setattr(settings, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(data_service, "data_index_file", tmp_path / "index.json")
+
+    excel_path = tmp_path / wb_id / "original.xlsx"
+    excel_path.parent.mkdir(parents=True, exist_ok=True)
+    wb = Workbook()
+    lte_ws = wb.active
+    lte_ws.title = "LTE Project Parameters"
+    lte_ws.append(["小区经度", "小区纬度", "小区名称", "系统制式"])
+    nr_ws = wb.create_sheet("NR Project Parameters")
+    nr_ws.append(["小区经度", "小区纬度", "小区名称", "系统制式"])
+    wb.save(excel_path)
+    wb.close()
+
+    cells = [
+        {"networkType": "LTE", "siteId": "111", "cellId": "1", "cellName": "LTE小区"},  # 同制式(LTE)重复
+        {"networkType": "LTE", "siteId": "222", "cellId": "1", "cellName": "NR小区"},  # 跨制式(NR)重复
+        {"networkType": "NR", "siteId": "999", "cellId": "9", "cellName": "新小区", "userId": 1},  # 新小区
+    ]
+    result = data_service.batch_add_cells_to_full_params(cells)
+
+    r0, r1, r2 = result["results"]
+    assert r0["message"] == "[LTE]小区 LTE小区 已重复，信息已更新覆盖"
+    assert r1["message"] == "[LTE]小区 NR小区 已在[NR]工参中存在，请检查"
+    assert r2["message"] == "新增小区 新小区 成功"
+    assert r0["success"] and r1["success"] and r2["success"]
+
+    # 重复行不导入：DB 中 111_1 / 222_1 各保持 1 条（库里原有），新小区 999_9 落库
+    db = SessionLocal()
+    try:
+        def _count(site_id, sector_id):
+            return db.query(Sector).join(Site, Sector.site_id_fk == Site.id).filter(
+                Site.workbook_id == wb_id,
+                Site.site_id == site_id,
+                Sector.sector_id == sector_id,
+            ).count()
+        assert _count("111", "111_1") == 1  # 同制式重复未重复导入
+        assert _count("222", "222_1") == 1  # 跨制式重复未导入
+        assert _count("999", "999_9") == 1  # 新小区成功落库
+    finally:
+        db.close()
+
+
 def test_check_duplicates_returns_network_type_flags(dup_env):
     """同一 CGI 返回 {lte, nr} 双制式标记"""
     result = data_service.check_cell_duplicates([

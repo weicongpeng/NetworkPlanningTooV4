@@ -1047,30 +1047,32 @@ class DataService:
 
         results = [None] * len(cells)  # pre-allocate to preserve original order
 
-        # 预加载数据库中已有小区 key（site_id + cell_id），用于在 Excel 追加前查重
+        # 预加载数据库中已有小区 key（site_id + cell_id）→ 制式，用于 Excel 追加前查重
         # 兼容两种 Sector.sector_id 存储格式：纯 cellId 与 siteId_cellId
-        existing_cell_keys = set()
+        existing_cell_keys: Dict[str, str] = {}
         try:
             db = SessionLocal()
             try:
-                rows = db.query(Site.site_id, Sector.sector_id).join(
+                rows = db.query(Site.site_id, Sector.sector_id, Site.network_type).join(
                     Sector, Sector.site_id_fk == Site.id
                 ).filter(Site.workbook_id == full_params_id).all()
-                for site_id_val, sector_id_val in rows:
+                for site_id_val, sector_id_val, net_type in rows:
                     sid = str(sector_id_val)
                     if "_" not in sid:
                         # 纯 cellId 格式（如 '61'）：key = siteId_cellId
-                        existing_cell_keys.add(f"{site_id_val}_{sid}")
+                        key = f"{site_id_val}_{sid}"
                     else:
                         # 组合格式（如 '541379_61'）：取最后一段作为 cellId
                         cell_part = sid.rsplit("_", 1)[-1]
-                        existing_cell_keys.add(f"{site_id_val}_{cell_part}")
+                        key = f"{site_id_val}_{cell_part}"
+                    existing_cell_keys[key] = str(net_type or "").upper()
             finally:
                 db.close()
         except Exception as e:
             safe_print(f"[DataService] 预加载已有小区失败 (非致命): {e}")
 
         # 过滤重复行：与数据库中已有 (site_id, cell_id) 相同的小区跳过
+        # 同制式重复 → "已重复，信息已更新覆盖"；跨制式重复 → "已在[其他制式]工参中存在，请检查"（均不导入）
         filtered_cells = []
         skip_map = {}  # orig_idx -> 原因
         for idx, cell in enumerate(cells):
@@ -1078,19 +1080,21 @@ class DataService:
             cell_id_val = str(cell.get("cellId", "")).strip()
             key = f"{site_id_val}_{cell_id_val}"
             if key in existing_cell_keys:
+                panel_type = str(cell.get("networkType", "")).upper()
+                db_type = existing_cell_keys[key]
                 skip_map[idx] = "已存在"
                 results[idx] = {
                     "index": idx,
-                    "networkType": cell.get("networkType", "").upper(),
+                    "networkType": panel_type,
                     "cellName": cell.get("cellName", ""),
                     "siteId": site_id_val,
                     "cellId": cell_id_val,
                     "success": True,
-                    "message": f"小区 {cell.get('cellName', '')} 已存在，已在 Excel 中更新覆盖",
+                    "message": self._duplicate_message(panel_type, db_type, cell.get("cellName", "")),
                 }
             else:
                 filtered_cells.append((idx, cell))
-                existing_cell_keys.add(key)  # 批内后续行查重
+                existing_cell_keys[key] = str(cell.get("networkType", "")).upper()  # 批内后续行查重
 
         # 按网络类型分组（基于过滤后的行）
         lte_cells = [(i, c) for i, c in filtered_cells if c.get("networkType", "").upper() == "LTE"]
