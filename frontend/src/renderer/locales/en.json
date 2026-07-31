@@ -297,7 +297,10 @@
     "numericError": "Numbers only",
     "expand": "Expand",
     "collapse": "Collapse",
-    "copyRowDisabled": "Please check the rows that have been fully filled"
+    "copyRowDisabled": "Please check the rows that have been fully filled",
+    "pasteHint": "Copy rows from Excel and paste directly — rows auto-extend",
+    "crossTypeDuplicate": "Cross-type duplicate, skipped — please check: {{names}}",
+    "sameTypeDuplicate": "Same-type duplicate, skipped: {{names}}"
   },
   "pci": {
     "title": "PCI Planning",

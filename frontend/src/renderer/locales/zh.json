@@ -304,7 +304,10 @@
     "numericError": "此字段只能输入数字",
     "expand": "展开",
     "collapse": "缩回",
-    "copyRowDisabled": "请勾选已填满的行的复选框"
+    "copyRowDisabled": "请勾选已填满的行的复选框",
+    "pasteHint": "支持从 Excel 复制多行多列直接粘贴，行数不足自动扩充",
+    "crossTypeDuplicate": "跨制式重复，已跳过请检查：{{names}}",
+    "sameTypeDuplicate": "同制式重复，已跳过：{{names}}"
   },
   "pci": {
     "title": "PCI规划",

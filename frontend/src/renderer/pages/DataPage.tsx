@@ -1672,8 +1672,8 @@ function NewCellEntryCard({
             .map(r => r.cellName)
             .join('、')
           const dupMsgs = [
-            crossNames ? `跨制式重复，已跳过请检查：${crossNames}` : '',
-            sameNames ? `同制式重复，已跳过：${sameNames}` : '',
+            crossNames ? t('newCellEntry.crossTypeDuplicate', { names: crossNames }) : '',
+            sameNames ? t('newCellEntry.sameTypeDuplicate', { names: sameNames }) : '',
           ].filter(Boolean).join('；')
           if (dupMsgs) {
             setBatchError(dupMsgs)
