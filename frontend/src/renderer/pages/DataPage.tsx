@@ -1501,7 +1501,7 @@ function NewCellEntryCard({
 
   // 多行多列粘贴：从 Excel/文本复制 tab 分隔内容，按列顺序填充并自动扩充行数
   const handlePaste = (e: React.ClipboardEvent) => {
-    if (!hasFullParams || isAddingCell) return
+    if (!hasFullParams || isAddingCell || importing) return
     const text = e.clipboardData.getData('text/plain')
     if (!text.includes('\t') && !text.includes('\n')) return // 单格粘贴交给浏览器默认
     e.preventDefault()
@@ -1801,6 +1801,9 @@ function NewCellEntryCard({
       </div>
 
       {/* Multi-row table */}
+      <div className="text-[10px] text-muted-foreground/70 mb-1">
+        {t('newCellEntry.pasteHint')}
+      </div>
       <div className={expanded ? 'overflow-x-auto' : 'overflow-x-auto'} onPaste={handlePaste}>
         <table className="w-full border-collapse">
           <thead>
