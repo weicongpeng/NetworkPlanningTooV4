@@ -29,7 +29,10 @@ router = APIRouter()
 
 
 @router.post("/import-points", response_model=Dict[str, Any])
-async def import_points(request: ImportPointsRequest) -> Dict[str, Any]:
+async def import_points(
+    request: ImportPointsRequest,
+    current_user=Depends(require_data_import),
+) -> Dict[str, Any]:
     """解析点数据"""
     try:
         points = await run_in_threadpool(data_service.parse_points, request.file_path)
