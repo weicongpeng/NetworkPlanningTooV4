@@ -1651,7 +1651,7 @@ function NewCellEntryCard({
           const key = `${r.siteId}_${r.cellId}`
           const hit = exists[key]
           if (!hit) continue
-          const panel = r.networkType.toLowerCase() as 'lte' | 'nr'
+          const panel = r.networkType === 'LTE' ? 'lte' : 'nr'
           const other = r.networkType === 'LTE' ? 'nr' : 'lte'
           if (hit[panel]) dupMap[key] = 'same'
           else if (hit[other]) dupMap[key] = 'cross'
@@ -1664,8 +1664,16 @@ function NewCellEntryCard({
             .filter(r => dupMap[`${r.siteId}_${r.cellId}`] === 'cross')
             .map(r => r.cellName)
             .join('、')
-          if (crossNames) {
-            setBatchError(`跨制式重复，已跳过请检查：${crossNames}`)
+          const sameNames = validRows
+            .filter(r => dupMap[`${r.siteId}_${r.cellId}`] === 'same')
+            .map(r => r.cellName)
+            .join('、')
+          const dupMsgs = [
+            crossNames ? `跨制式重复，已跳过请检查：${crossNames}` : '',
+            sameNames ? `同制式重复，已跳过：${sameNames}` : '',
+          ].filter(Boolean).join('；')
+          if (dupMsgs) {
+            setBatchError(dupMsgs)
             setTimeout(() => setBatchError(null), 8000)
           }
           // 过滤掉重复行（同制式 + 跨制式），只导入不重复的
