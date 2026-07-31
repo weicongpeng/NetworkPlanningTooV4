@@ -105,3 +105,68 @@ def test_check_duplicates_returns_network_type_flags(dup_env):
     assert "222_1" in result["duplicates"]
     assert "999_9" not in result["duplicates"]
     assert "" not in result["exists"]
+
+
+def test_check_duplicates_endpoint_smoke(dup_env):
+    """check-duplicates 端点用新 schema 返回双制式结构（端到端冒烟）"""
+    from fastapi.testclient import TestClient
+    from app.api import create_app
+    from app.core.database import SessionLocal, init_db
+    from app.models.database import User
+    from app.services.auth_service import auth_service
+
+    # 确保 users 表存在（不依赖 app lifespan）
+    init_db()
+
+    # 构造具备 can_cell_entry 权限的测试用户 + 合法 token。
+    # 该 token 未创建 UserSession 记录 → is_token_revoked 与 verify_session_ip 均放行。
+    username = "dup_smoke_user"
+    db = SessionLocal()
+    try:
+        existing = auth_service.get_user_by_username(db, username)
+        if existing:
+            db.delete(existing)
+            db.commit()
+        user, err = auth_service.create_user(db, username, "Test@12345")
+        assert err is None, f"创建测试用户失败: {err}"
+        user.can_cell_entry = True
+        db.commit()
+        db.refresh(user)
+        token, _ = auth_service.create_access_token(user.id, user.username, False)
+    finally:
+        db.close()
+
+    # 不使用 with 语句创建 TestClient：跳过 lifespan，避免 cleanup_index()
+    # 清掉 dup_env fixture 注入的全量工参 index 条目，导致查重找不到目标文件。
+    client = TestClient(create_app())
+    resp = client.post(
+        "/api/v1/data/full-params/cells/check-duplicates",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "cells": [
+                {"siteId": "111", "cellId": "1", "networkType": "NR"},   # 库中 LTE → lte=True
+                {"siteId": "222", "cellId": "1", "networkType": "NR"},   # 库中 NR → nr=True
+                {"siteId": "999", "cellId": "9", "networkType": "NR"},   # 不存在
+            ]
+        },
+    )
+    assert resp.status_code == 200, f"HTTP {resp.status_code}: {resp.text}"
+    body = resp.json()
+    assert body["success"] is True
+    data = body["data"]
+    assert data["exists"]["111_1"] == {"lte": True, "nr": False}
+    assert data["exists"]["222_1"] == {"lte": False, "nr": True}
+    assert data["exists"]["999_9"] == {"lte": False, "nr": False}
+    assert "111_1" in data["duplicates"]
+    assert "222_1" in data["duplicates"]
+    assert "999_9" not in data["duplicates"]
+
+    # 清理测试用户
+    db = SessionLocal()
+    try:
+        user = auth_service.get_user_by_username(db, username)
+        if user:
+            db.delete(user)
+            db.commit()
+    finally:
+        db.close()

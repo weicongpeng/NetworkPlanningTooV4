@@ -19,6 +19,7 @@ from app.models.schemas import (
     DataItem,
     CellCreateRequest,
     CellBatchCreateRequest,
+    CellDupCheckRequest,
     UpdateParametersRequest,
     ImportPointsRequest,
 )
@@ -259,18 +260,25 @@ async def batch_add_cells(
 
 @router.post("/full-params/cells/check-duplicates", response_model=Dict[str, Any])
 async def check_cell_duplicates(
-    request: CellBatchCreateRequest,
+    request: CellDupCheckRequest,
     current_user=Depends(require_cell_entry),
 ) -> Dict[str, Any]:
-    """检查小区是否重复：根据 siteId_cellId (CGI) 匹配数据库已有记录"""
+    """检查小区是否重复：按制式区分（siteId_cellId 匹配数据库已有记录）"""
     if not request.cells:
-        return {"success": True, "data": {"duplicates": []}}
+        return {"success": True, "data": {"duplicates": [], "exists": {}}}
 
     try:
         from app.services.data_service import data_service
-        cgi_list = [f"{c.siteId}_{c.cellId}" for c in request.cells]
+        cells = [
+            {
+                "siteId": c.siteId,
+                "cellId": c.cellId,
+                "networkType": c.networkType.value,
+            }
+            for c in request.cells
+        ]
         result = await run_in_threadpool(
-            data_service.check_cell_duplicates, cgi_list
+            data_service.check_cell_duplicates, cells
         )
         return {"success": True, "data": result}
     except Exception as e:

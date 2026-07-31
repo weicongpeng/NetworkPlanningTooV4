@@ -92,6 +92,20 @@ class CellBatchCreateRequest(BaseModel):
     cells: List[CellCreateRequest]
 
 
+class CellDupCheckItem(BaseModel):
+    """批量查重单项：siteId + cellId + 面板制式"""
+
+    siteId: str
+    cellId: str
+    networkType: NetworkType = NetworkType.LTE
+
+
+class CellDupCheckRequest(BaseModel):
+    """批量查重请求"""
+
+    cells: List[CellDupCheckItem]
+
+
 class UpdateParametersRequest(BaseModel):
     """工参更新请求"""
 
