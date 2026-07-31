@@ -683,8 +683,8 @@ export const dataApi = {
     return apiClient.post('/data/full-params/cells/batch', { cells })
   },
 
-  // 批量查重：检查 CGI (siteId_cellId) 是否已存在于数据库
-  checkCellDuplicates: async (cells: Array<{ siteId: string; cellId: string }>): Promise<ApiResponse<{ duplicates: string[]; exists: Record<string, boolean> }>> => {
+  // 批量查重：按制式检查 CGI (siteId_cellId) 是否已存在于数据库
+  checkCellDuplicates: async (cells: Array<{ siteId: string; cellId: string; networkType?: 'LTE' | 'NR' }>): Promise<ApiResponse<{ duplicates: string[]; exists: Record<string, { lte: boolean; nr: boolean }> }>> => {
     return apiClient.post('/data/full-params/cells/check-duplicates', { cells })
   },
 
