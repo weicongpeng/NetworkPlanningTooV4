@@ -8,9 +8,18 @@ import { mapDataService } from '../services/mapDataService'
 import { indexedDBService } from '../services/indexedDBService'
 import { useDownloadStore } from '../store/downloadStore'
 import { useTranslation } from 'react-i18next'
+import { useAuthStore } from '../store/authStore'
 
 export function DataPage() {
   const { t } = useTranslation()
+  // 细粒度权限：管理员自动拥有全部权限
+  const currentUser = useAuthStore((s) => s.user)
+  const isAdmin = !!currentUser?.is_admin
+  const permImport = isAdmin || !!currentUser?.can_data_import
+  const permDelete = isAdmin || !!currentUser?.can_data_delete
+  const permUpdate = isAdmin || !!currentUser?.can_data_update
+  const permCellEntry = isAdmin || !!currentUser?.can_cell_entry
+
   const [selectedId, setSelectedId] = useState<string | null>(null)
 
   // 批量选择状态
@@ -112,6 +121,11 @@ export function DataPage() {
     deleteItem,
     updateParameters,
   } = useDataStore()
+
+  // 打开数据页时刷新用户权限（感知管理员的最新权限配置）
+  useEffect(() => {
+    useAuthStore.getState().fetchUser()
+  }, [])
 
   // 初始化数据列表 + 监听跨页面刷新事件
   useEffect(() => {
@@ -717,8 +731,13 @@ export function DataPage() {
             {/* 文件上传 */}
             <div className="bg-card p-3 rounded-lg border border-border">
             <h2 className="text-base font-semibold mb-2">{t('data.importData') || '导入数据'}</h2>
+            {!permImport && (
+              <p className="text-xs text-muted-foreground mb-2 bg-muted/40 px-2 py-1 rounded">
+                {t('data.noPermission', '无权限，请联系管理员')}
+              </p>
+            )}
 
-             <div className="space-y-2">
+             <div className={`space-y-2 ${permImport ? '' : 'opacity-50 pointer-events-none'}`}>
                 <div className="flex items-center gap-2">
                     <div className="flex-1">
                         <UploadArea
@@ -806,8 +825,13 @@ export function DataPage() {
             </div>
 
             {/* 工参更新 */}
-            <div className="bg-card p-3 rounded-lg border border-border -mt-6">
+            <div className={`bg-card p-3 rounded-lg border border-border -mt-6 ${permUpdate ? '' : 'opacity-50 pointer-events-none'}`}>
                 <h2 className="text-base font-semibold mb-2">{t('data.updateParameters') || '工参更新'}</h2>
+                {!permUpdate && (
+                  <p className="text-xs text-muted-foreground mb-2 bg-muted/40 px-2 py-1 rounded">
+                    {t('data.noPermission', '无权限，请联系管理员')}
+                  </p>
+                )}
                 <div className="flex items-end gap-2">
                   <div className="flex-1 min-w-0">
                     <select
@@ -850,6 +874,7 @@ export function DataPage() {
             <NewCellEntryCard
                 fullParamFiles={fullParamFiles}
                 addLog={addLog}
+                disabled={!permCellEntry}
             />
         </div>
 
@@ -871,10 +896,10 @@ export function DataPage() {
                     {allSelected ? (t('data.deselectAll') || '取消全选') : (t('data.selectAll') || '全选')}
                   </button>
                   <button
-                    onClick={handleBatchDelete}
-                    disabled={selectedIds.size === 0 || batchDeleting || hasSyncingItems}
+                    onClick={() => { if (!permDelete) return; handleBatchDelete() }}
+                    disabled={!permDelete || selectedIds.size === 0 || batchDeleting || hasSyncingItems}
                     className="text-xs px-2.5 py-1 rounded border bg-background border-border text-red-500 hover:bg-red-50 hover:border-red-200 disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-background disabled:hover:border-border transition-colors flex items-center gap-1"
-                    title={hasSyncingItems ? (t('data.syncingDisabled') || '同步中不可操作') : ''}
+                    title={!permDelete ? (t('data.noPermission', '无权限，请联系管理员')) : (hasSyncingItems ? (t('data.syncingDisabled') || '同步中不可操作') : '')}
                   >
                     {batchDeleting ? (
                       <Loader2 size={12} className="animate-spin" />
@@ -1096,13 +1121,13 @@ export function DataPage() {
                     )}
                     <button
                       onClick={(e) => {
-                        if (loading || item.excelSynced === false || (item.inplaceUpdated && item.excelSynced === undefined)) return
+                        if (!permDelete || loading || item.excelSynced === false || (item.inplaceUpdated && item.excelSynced === undefined)) return
                         e.stopPropagation()
                         handleDelete(item)
                       }}
-                      className={`p-2 rounded ${loading || item.excelSynced === false || (item.inplaceUpdated && item.excelSynced === undefined) ? 'text-red-500/30 cursor-not-allowed' : 'hover:bg-background text-red-500'}`}
-                      disabled={loading || item.excelSynced === false || (item.inplaceUpdated && item.excelSynced === undefined)}
-                      title={loading ? (t('data.loading') || '加载中...') : (item.excelSynced === false || (item.inplaceUpdated && item.excelSynced === undefined) ? (t('data.syncingDisabled') || '同步中不可删除') : (t('data.delete') || '删除'))}
+                      className={`p-2 rounded ${!permDelete || loading || item.excelSynced === false || (item.inplaceUpdated && item.excelSynced === undefined) ? 'text-red-500/30 cursor-not-allowed' : 'hover:bg-background text-red-500'}`}
+                      disabled={!permDelete || loading || item.excelSynced === false || (item.inplaceUpdated && item.excelSynced === undefined)}
+                      title={!permDelete ? (t('data.noPermission', '无权限，请联系管理员')) : (loading ? (t('data.loading') || '加载中...') : (item.excelSynced === false || (item.inplaceUpdated && item.excelSynced === undefined) ? (t('data.syncingDisabled') || '同步中不可删除') : (t('data.delete') || '删除')))}
                     >
                       <Trash2 size={16} />
                     </button>
@@ -1351,9 +1376,11 @@ function UploadArea({
 function NewCellEntryCard({
   fullParamFiles,
   addLog,
+  disabled,
 }: {
   fullParamFiles: DataItem[]
   addLog: (type: any, message: string, status?: any, detail?: string, opKey?: string) => void
+  disabled?: boolean
 }) {
   const { t } = useTranslation()
   const { batchAddCells, isAddingCell } = useDataStore()
@@ -1654,6 +1681,12 @@ function NewCellEntryCard({
         </button>
       </div>
 
+      {disabled && (
+        <div className="px-3 py-2 bg-muted/40 border border-border rounded-lg text-xs text-muted-foreground mb-3">
+          {t('data.noPermission', '无权限，请联系管理员')}
+        </div>
+      )}
+
       {!hasFullParams && (
         <div className={`px-3 py-2 bg-amber-50 border border-amber-200 rounded-lg ${expanded ? 'text-sm mb-4' : 'text-xs mb-3'} text-amber-700`}>
           {t('newCellEntry.noFullParams') || '请先上传全量工参文件'}
@@ -1874,7 +1907,7 @@ function NewCellEntryCard({
   if (expanded) {
     return (
       <div className="fixed inset-0 z-[9999] bg-black/40 backdrop-blur-sm flex items-start justify-center pt-8 overflow-y-auto" style={{ paddingLeft: '280px' }}>
-        <div className="bg-card rounded-xl shadow-2xl border border-border w-full mx-6 overflow-hidden" style={{ maxWidth: 'min(90vw, 1400px)' }}>
+        <div className={`bg-card rounded-xl shadow-2xl border border-border w-full mx-6 overflow-hidden ${disabled ? 'opacity-50 pointer-events-none' : ''}`} style={{ maxWidth: 'min(90vw, 1400px)' }}>
           <div className="p-5">
             {renderCardContent()}
           </div>
@@ -1885,7 +1918,7 @@ function NewCellEntryCard({
 
   // ---- Normal inline mode ----
   return (
-    <div className="bg-card p-3 rounded-lg border border-border -mt-6">
+    <div className={`bg-card p-3 rounded-lg border border-border -mt-6 ${disabled ? 'opacity-50 pointer-events-none' : ''}`}>
       {renderCardContent()}
     </div>
   )
