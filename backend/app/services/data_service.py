@@ -1395,6 +1395,19 @@ class DataService:
         finally:
             db.close()
 
+    @staticmethod
+    def _duplicate_message(panel_type: str, existing_type: Optional[str], cell_name: str) -> str:
+        """生成重复小区逐行提示。
+
+        panel_type: 录入面板制式（LTE/NR）
+        existing_type: 库中已有小区的制式（None/未知视为同制式）
+        同制式 → "[LTE]小区 X 已重复，信息已更新覆盖"
+        跨制式 → "[LTE]小区 X 已在[NR]工参中存在，请检查"
+        """
+        if existing_type is None or existing_type == panel_type:
+            return f"[{panel_type}]小区 {cell_name} 已重复，信息已更新覆盖"
+        return f"[{panel_type}]小区 {cell_name} 已在[{existing_type}]工参中存在，请检查"
+
     def check_cell_duplicates(self, cgi_list: List[str]) -> Dict[str, Any]:
         """批量检查 CGI (siteId_cellId) 是否已存在于数据库
 
