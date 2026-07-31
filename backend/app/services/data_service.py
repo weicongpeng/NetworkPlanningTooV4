@@ -813,9 +813,12 @@ class DataService:
         # 查重：在追加 Excel 之前检查该小区是否已存在，避免重复导入
         if self._sector_exists(full_params_id, site_id, cell_id):
             safe_print(f"[DataService] 小区已存在，跳过导入: {site_id}_{cell_id}")
+            db_type = self._get_sector_network_type(full_params_id, site_id, cell_id)
             return {
                 "success": True,
-                "message": f"小区 {cell_name} 已存在，已在 Excel 中更新覆盖",
+                "message": self._duplicate_message(
+                    str(network_type).upper(), db_type, cell_name
+                ),
                 "cellId": f"{site_id}_{cell_id}",
             }
 
@@ -1396,6 +1399,25 @@ class DataService:
         except Exception as e:
             safe_print(f"[DataService] _sector_exists 查询失败: {e}")
             return False
+        finally:
+            db.close()
+
+    def _get_sector_network_type(self, workbook_id: str, site_id: Any, cell_id: Any) -> Optional[str]:
+        """查询指定 (site_id, cell_id) 已有小区的制式（无则 None）"""
+        if not site_id or not cell_id:
+            return None
+        db = SessionLocal()
+        try:
+            row = db.query(Site.network_type).join(
+                Sector, Sector.site_id_fk == Site.id
+            ).filter(
+                Site.workbook_id == workbook_id,
+                Site.site_id == str(site_id),
+                Sector.sector_id.in_([str(cell_id), f"{str(site_id)}_{str(cell_id)}"]),
+            ).first()
+            return str(row[0]).upper() if row and row[0] else None
+        except Exception:
+            return None
         finally:
             db.close()
 

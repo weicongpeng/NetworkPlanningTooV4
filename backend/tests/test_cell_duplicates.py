@@ -91,6 +91,13 @@ def dup_env():
         data_service.index.update(saved_index)
 
 
+def test_get_sector_network_type(dup_env):
+    """按 (site_id, cell_id) 查询已有小区制式"""
+    assert data_service._get_sector_network_type(dup_env, "111", "1") == "LTE"
+    assert data_service._get_sector_network_type(dup_env, "222", "1") == "NR"
+    assert data_service._get_sector_network_type(dup_env, "999", "9") is None
+
+
 def test_batch_duplicate_message_same_and_cross(dup_env, tmp_path, monkeypatch):
     """批量查重:同制式→已重复覆盖,跨制式→已在[其他制式]工参中存在,请检查"""
     # 纯消息层验证（不依赖文件系统）
