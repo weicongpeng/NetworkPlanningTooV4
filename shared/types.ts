@@ -359,6 +359,10 @@ export interface UserInfo {
   city: string | null
   operator: string | null
   user_type?: 'pc' | 'app'
+  can_data_import?: boolean
+  can_data_delete?: boolean
+  can_data_update?: boolean
+  can_cell_entry?: boolean
 }
 
 export interface TokenResponse {
@@ -399,6 +403,10 @@ export interface UserUpdateRequest {
   must_change_password?: boolean
   city?: string | null
   operator?: string | null
+  can_data_import?: boolean
+  can_data_delete?: boolean
+  can_data_update?: boolean
+  can_cell_entry?: boolean
 }
 
 export interface ResetPasswordRequest {
