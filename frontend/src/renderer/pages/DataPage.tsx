@@ -1394,7 +1394,7 @@ function NewCellEntryCard({
   const [batchResults, setBatchResults] = useState<Array<{ index: number; networkType: string; cellName: string; siteId: string; cellId: string; success: boolean; message: string }> | null>(null)
   const [batchError, setBatchError] = useState<string | null>(null)
   const [expanded, setExpanded] = useState(false)
-  const [duplicateCgiSet, setDuplicateCgiSet] = useState<Set<string>>(new Set())
+  const [duplicateMap, setDuplicateMap] = useState<Record<string, 'same' | 'cross'>>({})
 
   const hasFullParams = fullParamFiles.length > 0
 
@@ -1570,7 +1570,7 @@ function NewCellEntryCard({
     setSelectedRowIds(new Set())
     setBatchResults(null)
     setBatchError(null)
-    setDuplicateCgiSet(new Set())
+    setDuplicateMap({})
   }
 
   // Collect all non-empty rows from both tabs
@@ -1625,7 +1625,7 @@ function NewCellEntryCard({
 
     setBatchResults(null)
     setBatchError(null)
-    setDuplicateCgiSet(new Set())
+    setDuplicateMap({})
 
     // 本次批量录入全程复用的日志 opKey，确保 "running" 条目被完成/失败条目覆盖
     const batchOpKey = `batchCellEntry:${Date.now()}`
@@ -1638,38 +1638,54 @@ function NewCellEntryCard({
       return
     }
 
-    // 查重：检查 CGI (siteId_cellId) 是否已存在于数据库
+    // 查重：按制式检查 CGI (siteId_cellId) 是否已存在于数据库
     try {
       const dupCheck = await dataApi.checkCellDuplicates(
-        validRows.map(r => ({ siteId: r.siteId, cellId: r.cellId }))
+        validRows.map(r => ({ siteId: r.siteId, cellId: r.cellId, networkType: r.networkType }))
       )
-      if (dupCheck?.data?.duplicates?.length > 0) {
-        const dupSet = new Set<string>(dupCheck.data.duplicates)
-        setDuplicateCgiSet(dupSet)
-        // 弹窗提示重复
-        const dupNames = validRows
-          .filter(r => dupSet.has(`${r.siteId}_${r.cellId}`))
-          .map(r => `${r.cellName}(${r.siteId}_${r.cellId})`)
-          .join('、')
-        setBatchError(`以下小区已在数据库中，已自动跳过：${dupNames}`)
-        setTimeout(() => setBatchError(null), 8000)
-        // 过滤掉重复行，只导入不重复的
-        const uniqueRows = validRows.filter(r => !dupSet.has(`${r.siteId}_${r.cellId}`))
-        if (uniqueRows.length === 0) {
-          return // 全部重复
+      const exists = dupCheck?.data?.exists
+      if (exists && Object.keys(exists).length > 0) {
+        // 分类：same=同制式重复(红)，cross=跨制式重复(橙)
+        const dupMap: Record<string, 'same' | 'cross'> = {}
+        for (const r of validRows) {
+          const key = `${r.siteId}_${r.cellId}`
+          const hit = exists[key]
+          if (!hit) continue
+          const panel = r.networkType.toLowerCase() as 'lte' | 'nr'
+          const other = r.networkType === 'LTE' ? 'nr' : 'lte'
+          if (hit[panel]) dupMap[key] = 'same'
+          else if (hit[other]) dupMap[key] = 'cross'
         }
-        addLog('upload', `批量新站录入: ${uniqueRows.length} 条（跳过 ${validRows.length - uniqueRows.length} 条重复）`, 'running', undefined, batchOpKey)
-        const result = await batchAddCells(uniqueRows)
-        if (result?.success && result?.data?.results) {
-          const results = result.data.results as Array<{ index: number; networkType: string; cellName: string; siteId: string; cellId: string; success: boolean; message: string }>
-          setBatchResults(results)
-          const successCount = results.filter(r => r.success).length
-          addLog('upload', `批量新站录入完成: 成功 ${successCount}/${results.length}`, successCount === results.length ? 'success' : 'warning', undefined, batchOpKey)
-          setRows({ LTE: createEmptyRows(), NR: createEmptyRows() })
-          setSelectedRowIds(new Set())
-          setDuplicateCgiSet(new Set())
+        setDuplicateMap(dupMap)
+        const dupKeys = Object.keys(dupMap)
+
+        if (dupKeys.length > 0) {
+          const crossNames = validRows
+            .filter(r => dupMap[`${r.siteId}_${r.cellId}`] === 'cross')
+            .map(r => r.cellName)
+            .join('、')
+          if (crossNames) {
+            setBatchError(`跨制式重复，已跳过请检查：${crossNames}`)
+            setTimeout(() => setBatchError(null), 8000)
+          }
+          // 过滤掉重复行（同制式 + 跨制式），只导入不重复的
+          const uniqueRows = validRows.filter(r => !dupMap[`${r.siteId}_${r.cellId}`])
+          if (uniqueRows.length === 0) {
+            return // 全部重复
+          }
+          addLog('upload', `批量新站录入: ${uniqueRows.length} 条（跳过 ${validRows.length - uniqueRows.length} 条重复）`, 'running', undefined, batchOpKey)
+          const result = await batchAddCells(uniqueRows)
+          if (result?.success && result?.data?.results) {
+            const results = result.data.results as Array<{ index: number; networkType: string; cellName: string; siteId: string; cellId: string; success: boolean; message: string }>
+            setBatchResults(results)
+            const successCount = results.filter(r => r.success).length
+            addLog('upload', `批量新站录入完成: 成功 ${successCount}/${results.length}`, successCount === results.length ? 'success' : 'warning', undefined, batchOpKey)
+            setRows({ LTE: createEmptyRows(), NR: createEmptyRows() })
+            setSelectedRowIds(new Set())
+            setDuplicateMap({})
+          }
+          return
         }
-        return
       }
     } catch (_) {
       // 查重失败不影响导入
@@ -1753,7 +1769,7 @@ function NewCellEntryCard({
           {(['LTE', 'NR'] as const).map(nt => (
             <button
               key={nt}
-              onClick={() => { setActiveTab(nt); setBatchResults(null); setBatchError(null); setSelectedRowIds(new Set()); setDuplicateCgiSet(new Set()) }}
+              onClick={() => { setActiveTab(nt); setBatchResults(null); setBatchError(null); setSelectedRowIds(new Set()); setDuplicateMap({}) }}
               className={`px-3 py-1 rounded-md text-xs border transition-colors ${
                 activeTab === nt
                   ? 'bg-primary/10 border-primary text-primary font-medium'
@@ -1802,7 +1818,10 @@ function NewCellEntryCard({
             {rows[activeTab].map((row) => {
               const complete = isRowComplete(row, activeTab)
               return (
-                <tr key={row.id} data-row-id={row.id} className={`${selectedRowIds.has(row.id) ? 'bg-blue-50/50' : ''} ${duplicateCgiSet.has(`${row.siteId}_${row.cellId}`) ? 'bg-red-50' : ''}`}>
+                <tr key={row.id} data-row-id={row.id} className={`${selectedRowIds.has(row.id) ? 'bg-blue-50/50' : ''} ${
+                  duplicateMap[`${row.siteId}_${row.cellId}`] === 'same' ? 'bg-red-50' :
+                  duplicateMap[`${row.siteId}_${row.cellId}`] === 'cross' ? 'bg-amber-50' : ''
+                }`}>
                   <td className="border border-border px-1 py-1 text-center">
                     <input
                       type="checkbox"
