@@ -44,6 +44,13 @@ class User(Base):
     created_at = Column(DateTime, default=_utcnow, nullable=False)
     city = Column(String(100), nullable=True)
     operator = Column(String(50), nullable=True)
+    user_type = Column(String(10), default='pc', nullable=False)
+
+    # 细粒度权限（PC 端数据管理页面操作权限，默认全部关闭，管理员自动拥有全部权限）
+    can_data_import = Column(Boolean, default=False, nullable=False)
+    can_data_delete = Column(Boolean, default=False, nullable=False)
+    can_data_update = Column(Boolean, default=False, nullable=False)
+    can_cell_entry = Column(Boolean, default=False, nullable=False)
 
     sessions = relationship("UserSession", back_populates="user", lazy="dynamic")
 
@@ -61,6 +68,11 @@ class User(Base):
             "created_at": _serialize_dt(self.created_at),
             "city": self.city,
             "operator": self.operator,
+            "user_type": self.user_type,
+            "can_data_import": self.can_data_import,
+            "can_data_delete": self.can_data_delete,
+            "can_data_update": self.can_data_update,
+            "can_cell_entry": self.can_cell_entry,
         }
 
 
@@ -71,6 +83,7 @@ class UserSession(Base):
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
     token_jti = Column(String(255), unique=True, nullable=False, index=True)
     ip_address = Column(String(45), nullable=True)
+    client_type = Column(String(10), default='pc', nullable=False)
     login_time = Column(DateTime, default=_utcnow, nullable=False)
     logout_time = Column(DateTime, nullable=True)
     last_activity = Column(DateTime, default=_utcnow, nullable=False)
@@ -86,6 +99,7 @@ class UserSession(Base):
             "logout_time": _serialize_dt(self.logout_time),
             "last_activity": _serialize_dt(self.last_activity),
             "ip_address": self.ip_address,
+            "client_type": self.client_type,
         }
 
 
@@ -247,3 +261,33 @@ class TaskResult(Base):
         Index("idx_task_results_type", "task_type"),
         Index("idx_task_results_created", "created_at"),
     )
+
+
+class AppVersion(Base):
+    """APP 版本记录"""
+    __tablename__ = "app_versions"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    version = Column(String(20), nullable=False, index=True)
+    changelog = Column(Text, nullable=True)
+    apk_filename = Column(String(255), nullable=False)
+    apk_path = Column(Text, nullable=False)
+    file_size = Column(Integer, nullable=True)
+    is_latest = Column(Boolean, default=False, nullable=False)
+    download_count = Column(Integer, default=0, nullable=True)
+    created_at = Column(String(30), nullable=False)
+    updated_at = Column(String(30), nullable=True)
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "version": self.version,
+            "changelog": self.changelog,
+            "apk_filename": self.apk_filename,
+            "apk_path": self.apk_path,
+            "file_size": self.file_size,
+            "is_latest": self.is_latest,
+            "download_count": self.download_count or 0,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+        }

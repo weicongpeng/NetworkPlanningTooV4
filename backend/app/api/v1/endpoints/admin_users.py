@@ -36,6 +36,8 @@ async def list_users(
     for u in users:
         user_dict = u.to_dict()
         user_dict["is_online"] = auth_service.is_user_online(db, u.id)
+        user_dict["is_online_pc"] = auth_service.is_user_online_by_client_type(db, u.id, 'pc')
+        user_dict["is_online_app"] = auth_service.is_user_online_by_client_type(db, u.id, 'app')
         user_list.append(user_dict)
     return {
         "success": True,

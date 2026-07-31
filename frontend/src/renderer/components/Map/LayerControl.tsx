@@ -14,7 +14,7 @@ import { ChevronDown, ChevronRight, Map, Folder, File, X, Satellite, Radio } fro
 import { useTranslation } from 'react-i18next'
 import { NetworkType } from '../../config/sector-config'
 import { LabelSettingsModal, LabelSettings, FieldOption } from './LabelSettingsModal'
-import { layerApi } from '../../services/api'
+import { dataApi, layerApi } from '../../services/api'
 import { useMapStore } from '../../store/mapStore'
 
 /**
@@ -23,12 +23,19 @@ import { useMapStore } from '../../store/mapStore'
  */
 const PREDEFINED_LABEL_FIELDS: FieldOption[] = [
   { value: 'name', label: '小区名称' },
+  { value: 'networkType', label: '网络类型' },
   { value: 'siteId', label: '基站ID' },
-  { value: 'frequency', label: '下行频点' },
+  { value: 'sectorId', label: '小区ID' },
+  { value: 'coverageType', label: '覆盖类型' },
+  { value: 'frequency', label: '下行频点（MHz）' },
   { value: 'pci', label: 'PCI' },
   { value: 'tac', label: 'TAC' },
+  { value: 'longitude', label: '经度' },
+  { value: 'latitude', label: '纬度' },
+  { value: 'azimuth', label: '方向角' },
+  { value: 'height', label: '天线挂高' },
   { value: 'isShared', label: '是否共享' },
-  { value: 'coverageType', label: '覆盖类型' }
+  { value: 'firstGroup', label: '厂家' }
 ]
 
 // 预定义字段的翻译map - 用于动态获取翻译
@@ -220,6 +227,10 @@ export interface LayerControlProps {
   decorationLayer?: DecorationLayerOption
   /** 装饰图层可见性变化回调 */
   onDecorationLayerToggle?: (visible: boolean) => void
+  /** 装饰图层标签可见性 */
+  decorationLabelVisible?: boolean
+  /** 装饰图层标签可见性变化回调 */
+  onDecorationLabelToggle?: (visible: boolean) => void
 }
 
 /**
@@ -248,7 +259,9 @@ export function LayerControl({
   onCustomLayerRemove,
   onLabelSettingsChange,
   decorationLayer,
-  onDecorationLayerToggle
+  onDecorationLayerToggle,
+  decorationLabelVisible,
+  onDecorationLabelToggle
 }: LayerControlProps) {
   const { t } = useTranslation()
 
@@ -344,83 +357,6 @@ export function LayerControl({
       setLoadingFields(false)
     }
   }, [getCache])
-
-  /**
-   * 从 API 获取地理化数据并提取列名
-   */
-  const fetchLayerFileDataFromAPI = async (dataId: string, layerId: string) => {
-    setLoadingFields(true)
-    try {
-      console.log('[LayerControl] 从 API 获取数据:', dataId, 'layerId:', layerId)
-
-      const response = await layerApi.getLayerData(dataId, layerId)
-      if (response.success && response.data) {
-        const rawData = response.data
-
-        // ✅ 改进：处理多种数据格式 (GeoJSON 或 普通列表)
-        const allColumns = new Set<string>()
-
-        // 如果是 GeoJSON 格式 (包含 features 数组)
-        const features = rawData.features || (Array.isArray(rawData) ? rawData : [])
-
-        for (const item of features) {
-          // 1. 只有当 props 是要素根级时，才排除内部字段
-          const isGeoJSONRoot = !!item.properties
-          const props = item.properties || item
-
-          // 收集当前对象的所有字段
-          for (const key of Object.keys(props)) {
-            // 排除 GeoJSON 结构性字段和核心坐标字段
-            if (key === 'attributes' || key === 'properties' ||
-              key === 'longitude' || key === 'latitude' ||
-              key === 'displayLng' || key === 'displayLat' ||
-              key === 'type' || key === 'geometry') {
-              continue
-            }
-
-            // 只有当它不是嵌套的 properties 时，才排除内部预定义名 (防止在根级出现 name/azimuth)
-            // 如果是在 properties 内部，我们应该保留原始列名，即使它叫 name
-            if (!isGeoJSONRoot && (key === 'name' || key === 'azimuth')) {
-              continue
-            }
-
-            allColumns.add(key)
-          }
-
-          // 2. 如果有嵌套的 properties 或 attributes，深入一层收集（不排除任何原始字段）
-          const nested = props.properties || props.attributes
-          if (nested && typeof nested === 'object') {
-            for (const key of Object.keys(nested)) {
-              allColumns.add(key)
-            }
-          }
-        }
-
-        // 转换为数组并排序
-        const columns = Array.from(allColumns).sort()
-
-        console.log('[LayerControl] 从 API 提取到的列名:', columns)
-        console.log('[LayerControl] 列名数量:', columns.length)
-
-        // 生成字段选项（直接使用原始列名）
-        const fieldOptions: FieldOption[] = columns.map(col => ({
-          value: col,
-          label: col
-        }))
-
-        console.log('[LayerControl] 生成的字段选项数量:', fieldOptions.length)
-        setFieldOptions(fieldOptions)
-      } else {
-        console.warn('[LayerControl] API 获取数据失败')
-        setFieldOptions([])
-      }
-    } catch (error) {
-      console.error('[LayerControl] 从 API 获取数据失败:', error)
-      setFieldOptions([])
-    } finally {
-      setLoadingFields(false)
-    }
-  }
 
   /**
    * 预取图层文件字段选项（不阻塞UI）
@@ -726,79 +662,101 @@ export function LayerControl({
       } else if (node.type === 'layer-file' && node.layerFile) {
         // 图层文件：检查是否为 Excel 点文件（地理化数据）
         if (node.layerFile.sourceType === 'excel') {
-          // ✅ Excel 点文件：不要使用预定义字段，从实际数据中动态提取列名
-          console.log('[LayerControl] 检测到 Excel 点文件，从数据中提取列名:', node.layerFile.id)
-          console.log('[LayerControl] 当前 pointFileData:', Object.keys(pointFileData))
+          // ✅ Excel 点文件：使用 getColumns API 获取完整的字段列表
+          // 注意：pointFileData 依赖 ref 快照可能已过时，因此不依赖它
+          console.log('[LayerControl] 检测到 Excel 点文件，通过 API 获取字段:', node.layerFile.id)
 
+          // 先设置为空，显示加载状态
+          setFieldOptions([])
+          setLoadingFields(true)
+
+          // 同步尝试从 pointFileData 获取字段作为快速显示（如果有数据）
           const fileData = pointFileData[node.layerFile.id]
-          const features = (fileData as any)?.features || (Array.isArray(fileData) ? fileData : [])
-
-          if (features && features.length > 0) {
-            console.log('[LayerControl] 数据记录数量:', features.length)
-
-            // ✅ 改进：遍历所有记录，收集所有可能的字段
-            const allColumns = new Set<string>()
-
-            for (const item of features) {
-              // 1. 只有当 props 是要素根级时，才排除内部字段
-              const isGeoJSONRoot = !!item.properties
+          if (fileData && Array.isArray(fileData) && fileData.length > 0) {
+            const columns = new Set<string>()
+            for (const item of fileData) {
               const props = item.properties || item
-
-              // 收集当前对象的所有字段
               for (const key of Object.keys(props)) {
-                // 排除 GeoJSON 结构性字段和核心坐标字段
                 if (key === 'attributes' || key === 'properties' ||
-                  key === 'longitude' || key === 'latitude' ||
-                  key === 'displayLng' || key === 'displayLat' ||
-                  key === 'type' || key === 'geometry') {
+                    key === 'longitude' || key === 'latitude' ||
+                    key === 'displayLng' || key === 'displayLat' ||
+                    key === 'type' || key === 'geometry') {
                   continue
                 }
-
-                // 只有当它不是嵌套的 properties 时，才排除内部预定义名 (防止在根级出现 name/azimuth)
-                // 如果是在 properties 内部，我们应该保留原始列名，即使它叫 name
-                if (!isGeoJSONRoot && (key === 'name' || key === 'azimuth')) {
-                  continue
-                }
-
-                allColumns.add(key)
+                columns.add(key)
               }
-
-              // 2. 如果有嵌套的 properties 或 attributes，深入一层收集（不排除任何原始字段）
+              // 检查嵌套 properties
               const nested = props.properties || props.attributes
               if (nested && typeof nested === 'object') {
                 for (const key of Object.keys(nested)) {
-                  allColumns.add(key)
+                  columns.add(key)
                 }
               }
             }
-
-            // 转换为数组并排序
-            const columns = Array.from(allColumns).sort()
-
-            console.log('[LayerControl] 从所有记录提取到的列名:', columns)
-            console.log('[LayerControl] 列名数量:', columns.length)
-
-            // 生成字段选项（直接使用原始列名）
-            const excelFieldOptions: FieldOption[] = columns.map(col => ({
-              value: col,
-              label: col  // 直接使用原始列名
-            }))
-
-            console.log('[LayerControl] 生成的字段选项数量:', excelFieldOptions.length)
-            setFieldOptions(excelFieldOptions)
-          } else {
-            console.warn('[LayerControl] 未找到文件数据，数据ID:', node.layerFile.dataId)
-            console.warn('[LayerControl] 可用的数据文件ID:', Object.keys(pointFileData))
-
-            // ✅ 如果内存中没有数据，先显示空字段列表并启动加载状态
-            setFieldOptions([])
-            setLoadingFields(true)
-
-            // 尝试从 API 获取
-            if (node.layerFile.dataId) {
-              console.log('[LayerControl] 尝试从 API 获取数据...')
-              fetchLayerFileDataFromAPI(node.layerFile.dataId, node.layerFile.id)
+            if (columns.size > 0) {
+              const syncOptions: FieldOption[] = Array.from(columns).sort().map(col => ({
+                value: col, label: col
+              }))
+              console.log('[LayerControl] 从 pointFileData 同步提取字段:', syncOptions.length)
+              setFieldOptions(syncOptions)
+              setLoadingFields(false)
             }
+          }
+
+          // 通过 API 获取完整数据并提取字段
+          // 注意：getColumns API 不覆盖 geo data (default.json)，因此直接加载数据来提取列名
+          if (node.layerFile.dataId) {
+            console.log('[LayerControl] 通过 dataApi.get 获取字段:', node.layerFile.dataId)
+            dataApi.get(node.layerFile.dataId).then(response => {
+              if (response.success && response.data) {
+                // 处理多种数据格式
+                let rawArray: any[] | null = null
+                if (Array.isArray(response.data)) {
+                  rawArray = response.data
+                } else if (response.data.data && Array.isArray(response.data.data)) {
+                  rawArray = response.data.data
+                } else if (response.data.lte) {
+                  rawArray = response.data.lte
+                } else if (response.data.nr) {
+                  rawArray = response.data.nr
+                }
+
+                if (rawArray && rawArray.length > 0) {
+                  const firstItem = rawArray[0]
+                  const props = firstItem.properties || firstItem
+                  const allKeys = new Set<string>()
+                  for (const key of Object.keys(props)) {
+                    if (key === 'attributes' || key === 'properties' ||
+                        key === 'longitude' || key === 'latitude' ||
+                        key === 'displayLng' || key === 'displayLat' ||
+                        key === 'type' || key === 'geometry') {
+                      continue
+                    }
+                    allKeys.add(key)
+                  }
+                  // 检查嵌套 properties
+                  const nested = props.properties || props.attributes
+                  if (nested && typeof nested === 'object') {
+                    for (const key of Object.keys(nested)) {
+                      allKeys.add(key)
+                    }
+                  }
+                  if (allKeys.size > 0) {
+                    const apiOptions: FieldOption[] = Array.from(allKeys).sort().map(col => ({
+                      value: col, label: col
+                    }))
+                    console.log('[LayerControl] dataApi.get 提取字段数量:', apiOptions.length, '字段:', apiOptions.map(o => o.value))
+                    setFieldOptions(apiOptions)
+                  }
+                }
+              }
+            }).catch(error => {
+              console.error('[LayerControl] dataApi.get API 失败:', error)
+            }).finally(() => {
+              setLoadingFields(false)
+            })
+          } else {
+            setLoadingFields(false)
           }
         } else {
           // MapInfo 图层文件：先显示预定义字段，然后异步获取实际字段
@@ -1087,6 +1045,8 @@ export function LayerControl({
               onPointFileLabelToggle={onPointFileLabelToggle}
               onLayerFileLabelToggle={onLayerFileLabelToggle}
               onDecorationLayerToggle={onDecorationLayerToggle}
+              onDecorationLabelToggle={onDecorationLabelToggle}
+              decorationLabelVisible={decorationLabelVisible}
               onContextMenu={handleContextMenu}
               mapType={mapType}
               pointFileLabelVisibility={pointFileLabelVisibility}
@@ -1179,6 +1139,8 @@ interface TreeNodeComponentProps {
   onPointFileLabelToggle?: (fileId: string, visible: boolean) => void;
   onLayerFileLabelToggle?: (fileId: string, visible: boolean) => void;
   onDecorationLayerToggle?: (visible: boolean) => void;
+  onDecorationLabelToggle?: (visible: boolean) => void;
+  decorationLabelVisible?: boolean;
   onContextMenu: (e: React.MouseEvent, node: TreeNode) => void;
   mapType: 'roadmap' | 'satellite';
   pointFileLabelVisibility: Record<string, boolean>;
@@ -1203,6 +1165,8 @@ function TreeNodeComponent({
   onPointFileLabelToggle,
   onLayerFileLabelToggle,
   onDecorationLayerToggle,
+  onDecorationLabelToggle,
+  decorationLabelVisible,
   onContextMenu,
   mapType,
   pointFileLabelVisibility,
@@ -1684,9 +1648,68 @@ function TreeNodeComponent({
           />
         )}
 
-        {/* 装饰图层 - 占位符（与上面图层的标签按钮对齐） */}
+        {/* 装饰图层 - 标签开关 */}
         {node.type === 'decoration-layer' && node.decorationLayer && (
-          <div style={{ width: '20px', height: '20px' }} />
+          <div
+            onClick={(e) => {
+              e.stopPropagation()
+              const newVisible = !decorationLabelVisible
+              onDecorationLabelToggle?.(newVisible)
+            }}
+            style={{
+              width: '20px',
+              height: '20px',
+              cursor: 'pointer',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center'
+            }}
+          >
+            {/* 标签图标 - 与其他图层的标签按钮风格一致 */}
+            <svg
+              width="20"
+              height="20"
+              viewBox="0 0 20 20"
+              fill="none"
+              xmlns="http://www.w3.org/2000/svg"
+            >
+              {/* 标签形状 */}
+              <path
+                d="M10 3L17 5V15L10 17L3 15V5L10 3Z"
+                fill={decorationLabelVisible ? '#3b82f6' : '#e0e0e0'}
+                stroke={decorationLabelVisible ? '#2563eb' : '#bdbdbd'}
+                strokeWidth="1.5"
+              />
+              {/* 标签孔 */}
+              <circle
+                cx="10"
+                cy="4.5"
+                r="1.5"
+                fill={decorationLabelVisible ? '#ffffff' : '#f5f5f5'}
+                stroke={decorationLabelVisible ? '#2563eb' : '#bdbdbd'}
+                strokeWidth="1.5"
+              />
+              {/* 标签上的线条 */}
+              <line
+                x1="7"
+                y1="9"
+                x2="13"
+                y2="9"
+                stroke={decorationLabelVisible ? '#ffffff' : '#bdbdbd'}
+                strokeWidth="2"
+                strokeLinecap="round"
+              />
+              <line
+                x1="7"
+                y1="12"
+                x2="13"
+                y2="12"
+                stroke={decorationLabelVisible ? '#ffffff' : '#bdbdbd'}
+                strokeWidth="2"
+                strokeLinecap="round"
+              />
+            </svg>
+          </div>
         )}
       </div>
 
@@ -1710,6 +1733,8 @@ function TreeNodeComponent({
               onPointFileLabelToggle={onPointFileLabelToggle}
               onLayerFileLabelToggle={onLayerFileLabelToggle}
               onDecorationLayerToggle={onDecorationLayerToggle}
+              onDecorationLabelToggle={onDecorationLabelToggle}
+              decorationLabelVisible={decorationLabelVisible}
               onContextMenu={onContextMenu}
               mapType={mapType}
               pointFileLabelVisibility={pointFileLabelVisibility}

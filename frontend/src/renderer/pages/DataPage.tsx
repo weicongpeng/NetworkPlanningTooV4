@@ -1,15 +1,25 @@
-import { useState, useEffect, useCallback } from 'react'
-import { Upload, FileSpreadsheet, Trash2, Download, Loader2, AlertCircle, RefreshCw, CheckCircle2, Layers, FileDown, MapPin, Navigation, CheckSquare, Square } from 'lucide-react'
+import { useState, useEffect, useCallback, useRef } from 'react'
+import { Upload, FileSpreadsheet, Trash2, Download, Loader2, AlertCircle, RefreshCw, CheckCircle2, Layers, FileDown, MapPin, Navigation, CheckSquare, Square, ScrollText, Maximize2, Minimize2 } from 'lucide-react'
 import { useDataStore } from '../store/dataStore'
 import { dataApi } from '../services/api'
 import type { DataItem } from '@shared/types'
 import { DATA_REFRESH_EVENT, triggerDataRefresh } from '../store/dataStore'
 import { mapDataService } from '../services/mapDataService'
 import { indexedDBService } from '../services/indexedDBService'
+import { useDownloadStore } from '../store/downloadStore'
 import { useTranslation } from 'react-i18next'
+import { useAuthStore } from '../store/authStore'
 
 export function DataPage() {
   const { t } = useTranslation()
+  // 细粒度权限：管理员自动拥有全部权限
+  const currentUser = useAuthStore((s) => s.user)
+  const isAdmin = !!currentUser?.is_admin
+  const permImport = isAdmin || !!currentUser?.can_data_import
+  const permDelete = isAdmin || !!currentUser?.can_data_delete
+  const permUpdate = isAdmin || !!currentUser?.can_data_update
+  const permCellEntry = isAdmin || !!currentUser?.can_cell_entry
+
   const [selectedId, setSelectedId] = useState<string | null>(null)
 
   // 批量选择状态
@@ -33,7 +43,70 @@ export function DataPage() {
   })
 
   // 下载状态跟踪
-  const [downloadingIds, setDownloadingIds] = useState<Set<string>>(new Set())
+  const downloadStore = useDownloadStore()
+
+  // 操作日志（持久化到 sessionStorage，退出登录/刷新页面时清除）
+  interface LogEntry {
+    id: number
+    time: string
+    type: 'upload' | 'download' | 'delete' | 'update' | 'terminal' | 'info' | 'error'
+    message: string
+    detail?: string
+    status?: 'running' | 'success' | 'error'
+    // 用于去重覆盖的 key（同一操作的多次状态变更共用同一 key）
+    opKey?: string
+  }
+  // 模块级持久化存储（页面切换保留，刷新页面后自然消失）
+  const _store: { entries: LogEntry[]; id: number } = (window as any).__nptLog || ((window as any).__nptLog = { entries: [], id: 0 })
+
+  const [logs, setLogs] = useState<LogEntry[]>(_store.entries)
+  const LOG_STORAGE_KEY = 'npt_operation_logs'
+  const logEndRef = useRef<HTMLDivElement>(null)
+
+  // 退出登录时清除日志
+  useEffect(() => {
+    const handleLogout = () => {
+      _store.entries = []
+      setLogs([])
+      try { sessionStorage.removeItem(LOG_STORAGE_KEY) } catch {}
+    }
+    window.addEventListener('auth:logout', handleLogout)
+    return () => window.removeEventListener('auth:logout', handleLogout)
+  }, [])
+
+  const addLog = useCallback((
+    type: LogEntry['type'],
+    message: string,
+    status?: LogEntry['status'],
+    detail?: string,
+    opKey?: string,
+  ) => {
+    const now = new Date()
+    const pad = (n: number) => String(n).padStart(2, '0')
+    const time = `${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`
+    _store.id += 1
+    const entry: LogEntry = { id: _store.id, time, type, message, status, detail, opKey }
+
+    // 直接在模块级数组上操作，避免 React 闭包问题
+    const arr = _store.entries
+    let replaced = false
+    if (opKey && arr.length > 0) {
+      for (let i = arr.length - 1; i >= 0; i--) {
+        if (arr[i].opKey === opKey) { arr[i] = entry; replaced = true; break }
+      }
+    }
+    if (!replaced) {
+      if (arr.length >= 200) arr.shift()
+      arr.push(entry)
+    }
+    // 用新数组引用触发 React 重渲染
+    setLogs([...arr])
+  }, [])
+
+  // 自动滚动到最新日志
+  useEffect(() => {
+    logEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+  }, [logs.length])
 
   const {
     items,
@@ -49,14 +122,19 @@ export function DataPage() {
     updateParameters,
   } = useDataStore()
 
+  // 打开数据页时刷新用户权限（感知管理员的最新权限配置）
+  useEffect(() => {
+    useAuthStore.getState().fetchUser()
+  }, [])
+
   // 初始化数据列表 + 监听跨页面刷新事件
   useEffect(() => {
-    fetchList(1, 50)
+    fetchList(1, 50, true)  // forceRefresh=true 跳过 IndexedDB 缓存，确保同步状态最新
 
     // 监听数据刷新事件（从其他页面触发，如PCI应用后）
     const handleDataRefresh = () => {
       console.log('[DataPage] 收到数据刷新事件，正在刷新列表...')
-      fetchList(1, 50, true)  // 强制刷新，忽略缓存
+      fetchList(1, 50, true)
     }
 
     window.addEventListener(DATA_REFRESH_EVENT, handleDataRefresh)
@@ -64,7 +142,21 @@ export function DataPage() {
     return () => {
       window.removeEventListener(DATA_REFRESH_EVENT, handleDataRefresh)
     }
-  }, []) // 修复：移除 fetchList 依赖，使用空依赖数组，避免事件监听器被反复移除/添加导致事件丢失
+  }, [])
+
+  // 定时轮询：挂载后始终运行，每 5 秒检查是否有需要同步的文件
+  // 只有检测到 excelSynced===false 时才发起带 forceRefresh 的 API 请求
+  // 从不自终止（避免缓存导致误判），组件卸载时自动清理
+  useEffect(() => {
+    const timer = setInterval(() => {
+      const current = useDataStore.getState().items
+      if (current.some(item => item.excelSynced === false || (item.inplaceUpdated && item.excelSynced === undefined))) {
+        fetchList(1, 50, true)  // forceRefresh=true 跳过 IndexedDB 缓存
+      }
+    }, 5000)
+
+    return () => clearInterval(timer)
+  }, [fetchList])
 
   const isDesktop = !!(window as any).electronAPI
 
@@ -148,6 +240,9 @@ export function DataPage() {
     console.log('[Upload] Files:', files.map(f => f.name).join(', '))
     console.log('[Upload] Type:', type, 'Context:', context)
 
+    const fileNames = files.map(f => f.name).join(', ')
+    addLog('upload', `开始${context === 'geo_data' ? '地理化' : context === 'full_params' ? '全量工参' : context === 'current_params' ? '现网工参' : context === 'map_layer' ? '图层' : ''}上传: ${fileNames}`, 'running', undefined, `upload:${fileNames}`)
+
     // 根据类型选择上传函数
     let uploadFn
     if (context === 'geo_data') {
@@ -197,8 +292,10 @@ export function DataPage() {
         // 触发数据刷新事件，通知其他页面（PCI、邻区、TAC）重新加载数据
         triggerDataRefresh()
         console.log('[DataPage] 已触发数据刷新事件')
+        addLog('upload', `上传成功: ${fileNames}`, 'success', undefined, `upload:${fileNames}`)
       } else {
         setUploadStatus(prev => ({ ...prev, [context]: 'error' }))
+        addLog('upload', `上传失败: ${fileNames}`, 'error', undefined, `upload:${fileNames}`)
         setTimeout(() => setUploadStatus(prev => ({ ...prev, [context]: 'idle' })), 3000)
       }
     } else {
@@ -253,80 +350,104 @@ export function DataPage() {
         // 触发数据刷新事件，通知其他页面（PCI、邻区、TAC）重新加载数据
         triggerDataRefresh()
         console.log('[DataPage] 已触发数据刷新事件')
+        addLog('upload', `上传成功: ${file.name}`, 'success', undefined, `upload:${file.name}`)
       } else {
         setUploadStatus(prev => ({ ...prev, [context]: 'error' }))
+        addLog('upload', `上传失败: ${file.name}`, 'error', undefined, `upload:${file.name}`)
         setTimeout(() => setUploadStatus(prev => ({ ...prev, [context]: 'idle' })), 3000)
       }
     }
   }
 
   const handleDownload = async (item: DataItem) => {
-    setDownloadingIds(prev => new Set(prev).add(item.id))
+    const store = useDownloadStore.getState()
+    if (store.isDownloading(item.id)) return
+    store.startDownload(item.id, item.name || item.id)
+
     try {
-        console.log('[Download] Requesting:', item.id);
-        const url = `/api/v1/data/${item.id}/download`;
+        console.log('[Download] Requesting:', item.id)
+        const url = `/api/v1/data/${item.id}/download`
+        const filename = item.name || 'download'
 
-        const response = await fetch(url);
-        if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+        // 使用 fetch + stream reader 追踪下载进度
+        const response = await fetch(url)
+        if (!response.ok) throw new Error(`HTTP ${response.status}`)
 
-        const blob = await response.blob();
-        if (blob.size === 0) throw new Error(t('data.emptyFile') || '文件内容为空');
+        const contentLength = response.headers.get('content-length')
+        const total = contentLength ? parseInt(contentLength, 10) : 0
+        let loaded = 0
 
-        const filename = item.name || 'download';
+        const reader = response.body!.getReader()
+        const chunks: Uint8Array[] = []
 
-        // 优先使用 File System Access API 弹出保存对话框
-        if ('showSaveFilePicker' in window) {
-            try {
-                const opts = {
-                    suggestedName: filename,
-                    types: [{
-                        description: 'Excel File',
-                        accept: { 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': ['.xlsx'] }
-                    }]
-                };
-                // 根据扩展名调整 types
-                if (filename.endsWith('.zip')) {
-                    opts.types = [{ description: 'ZIP Archive', accept: { 'application/zip': ['.zip'] } }];
-                }
-                const handle = await (window as any).showSaveFilePicker(opts);
-                const writable = await handle.createWritable();
-                await writable.write(blob);
-                await writable.close();
-                console.log('[Download] Saved via File Picker:', filename);
-                return;
-            } catch (pickerErr: any) {
-                // 用户取消或 API 不可用，回退到 a.click
-                if (pickerErr.name === 'AbortError') {
-                    console.log('[Download] User cancelled save dialog');
-                    return;
-                }
-                console.warn('[Download] showSaveFilePicker failed, falling back:', pickerErr);
-            }
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
+          chunks.push(value)
+          loaded += value.length
+          if (total > 0) {
+            const pct = Math.round((loaded / total) * 100)
+            store.updateProgress(item.id, pct,
+              `下载中 ${pct}% (${(loaded/1024/1024).toFixed(1)}MB / ${(total/1024/1024).toFixed(1)}MB)`)
+          } else {
+            store.updateProgress(item.id, -1, `下载中 ${(loaded/1024/1024).toFixed(1)}MB...`)
+          }
         }
 
-        // 后备方案：a.click() 触发下载
-        const blobUrl = window.URL.createObjectURL(blob);
-        const link = document.createElement('a');
-        link.href = blobUrl;
-        link.setAttribute('download', filename);
-        document.body.appendChild(link);
-        link.click();
+        const blob = new Blob(chunks)
+        if (blob.size === 0) throw new Error(t('data.emptyFile') || '文件内容为空')
 
+        store.updateProgress(item.id, 100, '正在保存...')
+
+        // 弹出保存对话框 (File System Access API, Electron/Chromium 支持)
+        if ('showSaveFilePicker' in window) {
+          try {
+            const opts: any = {
+              suggestedName: filename,
+              types: filename.endsWith('.zip')
+                ? [{ description: 'ZIP Archive', accept: { 'application/zip': ['.zip'] } }]
+                : [{ description: 'Excel File', accept: { 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': ['.xlsx'] } }],
+            }
+            const handle = await (window as any).showSaveFilePicker(opts)
+            // 用户确认保存对话框后才记录日志（取消不记录）
+            addLog('download', `开始下载: ${item.name}`, 'running', undefined, `download:${item.id}`)
+            const writable = await handle.createWritable()
+            await writable.write(blob)
+            await writable.close()
+            console.log('[Download] Saved via File Picker:', filename)
+            addLog('download', `下载成功: ${item.name}`, 'success', undefined, `download:${item.id}`)
+            store.finishDownload(item.id)
+            return
+          } catch (pickerErr: any) {
+            if (pickerErr.name === 'AbortError') {
+              console.log('[Download] User cancelled save dialog')
+              store.finishDownload(item.id)
+              return
+            }
+            console.warn('[Download] showSaveFilePicker failed, falling back:', pickerErr)
+          }
+        }
+
+        // 后备：a.click() 触发浏览器下载（无取消对话框，直接记录）
+        addLog('download', `开始下载: ${item.name}`, 'running', undefined, `download:${item.id}`)
+        const blobUrl = window.URL.createObjectURL(blob)
+        const link = document.createElement('a')
+        link.href = blobUrl
+        link.setAttribute('download', filename)
+        document.body.appendChild(link)
+        link.click()
         setTimeout(() => {
-            document.body.removeChild(link);
-            window.URL.revokeObjectURL(blobUrl);
-        }, 100);
-
-        console.log('[Download] Success (fallback)');
+          document.body.removeChild(link)
+          window.URL.revokeObjectURL(blobUrl)
+        }, 100)
+        console.log('[Download] Success (fallback)')
+        addLog('download', `下载成功: ${item.name}`, 'success', undefined, `download:${item.id}`)
+        store.finishDownload(item.id)
     } catch (err: any) {
-        console.error('[Download] Failed:', err);
+        console.error('[Download] Failed:', err)
+        addLog('download', `下载失败: ${item.name}`, 'error', err.message, `download:${item.id}`)
+        store.failDownload(item.id, err.message)
         alert(`${t('data.downloadFailed') || '下载失败'}: ${err.message || (t('data.unknownError') || '未知错误')}`)
-    } finally {
-        setDownloadingIds(prev => {
-            const next = new Set(prev)
-            next.delete(item.id)
-            return next
-        })
     }
   }
 
@@ -356,21 +477,25 @@ export function DataPage() {
           result = await dataApi.delete(item.id, true)
           if (result?.success) {
             alert(t('data.indexRemoved') || '已从索引中移除。如果后续遇到问题，请刷新页面或重新导入数据。')
+            addLog('delete', `强制删除成功: ${itemName}`, 'success', undefined, `delete:${item.id}`)
             await fetchList(1, 50, true)
             await mapDataService.clearCache()
             triggerDataRefresh()
           } else {
+            addLog('delete', `强制删除失败: ${itemName}`, 'error', undefined, `delete:${item.id}`)
             alert(`${t('data.forceDeleteFailed') || '强制删除失败。请尝试：'}\n1. ${t('data.forceDeleteCloseExcel') || '关闭所有 Excel 文件'}\n2. ${t('data.forceDeleteRestartApp') || '重启应用后再试'}\n3. ${t('data.forceDeleteManually') || '手动删除 data 目录下的对应文件夹'}`)
           }
         } else {
           alert(t('data.deleteCancelled') || '删除已取消。')
         }
       } else {
+        addLog('delete', `删除成功: ${itemName}`, 'success', undefined, `delete:${item.id}`)
         await fetchList(1, 50, true)
         await mapDataService.clearCache()
         triggerDataRefresh()
       }
     } catch (err: any) {
+      addLog('delete', `删除失败: ${itemName}`, 'error', err.message, `delete:${item.id}`)
       console.error('[Delete] Failed:', err)
       alert(`${t('data.deleteFailed') || '删除失败'}: ${err.message || (t('data.unknownError') || '未知错误')}\n\n${t('data.deleteFailedReason') || '可能原因：'}\n• ${t('data.deleteFailedInUse') || '文件正在被其他程序使用'}\n• ${t('data.deleteFailedPermission') || '磁盘权限不足'}\n• ${t('data.deleteFailedIndex') || '索引文件损坏'}`)
     }
@@ -403,6 +528,7 @@ export function DataPage() {
 
     setBatchDeleting(false)
     setSelectedIds(new Set())
+    addLog('delete', `批量删除完成: 成功 ${successCount} 个, 失败 ${failCount} 个`, failCount > 0 ? 'error' : 'success')
     // 批量删除完成后统一刷新一次（deleteItem 已不内部刷新，避免 IndexedDB 缓存竞争）
     await indexedDBService.delete('data_list_cache')
     await fetchList(1, 50, true)
@@ -436,14 +562,45 @@ export function DataPage() {
   }, [])
 
   const allSelected = items.length > 0 && selectedIds.size === items.length
+  const hasSyncingItems = items.some(item => item.excelSynced === false || (item.inplaceUpdated && item.excelSynced === undefined))
 
   const handleUpdateParameters = async () => {
      if (!selectedFullParamId || !selectedCurrentParamId) return
 
      setUpdateSuccess(null)
+     addLog('update', '开始工参更新...', 'running', undefined, 'update:params')
+
+     // 记录上一次接收到的日志行数，避免重复
+     let lastLogCount = 0
+
      try {
          const result = await updateParameters(selectedFullParamId, selectedCurrentParamId)
          console.log('Update parameters result:', result);
+
+         // 获取 taskId 用于轮询后端终端日志
+         const taskId = result?.data?.taskId;
+         if (taskId) {
+             const pollInterval = setInterval(async () => {
+                 try {
+                     const resp = await fetch(`/api/v1/data/update-parameters/progress/${taskId}`)
+                     const json = await resp.json()
+                     if (json?.success && json?.data?.logMessages) {
+                         const msgs = json.data.logMessages as string[]
+                         // 只添加新增的行
+                         for (let i = lastLogCount; i < msgs.length; i++) {
+                             addLog('terminal', msgs[i], undefined, undefined, `terminal:update:${i}`)
+                         }
+                         lastLogCount = msgs.length
+                     }
+                     // 任务完成或失败时停止轮询
+                     if (json?.data?.status === 'completed' || json?.data?.status === 'failed') {
+                         clearInterval(pollInterval)
+                     }
+                 } catch { /* 轮询失败不阻塞主流程 */ }
+             }, 1000)
+             // 30 秒后自动停止轮询，防止泄漏
+             setTimeout(() => clearInterval(pollInterval), 30000)
+         }
 
          // 根据后端返回的 newFileId 检查新文件是否出现在列表中
          const newFileId = result?.data?.newFileId;
@@ -483,11 +640,13 @@ export function DataPage() {
 
              setSelectedFullParamId('')
              setSelectedCurrentParamId('')
+             addLog('update', '工参更新完成', 'success', newFileName || '', 'update:params')
          } else {
              // 更新失败（后端返回错误状态且列表中也未找到新文件）
              throw new Error(result?.message || t('data.updateFailed') || '工参更新失败')
          }
      } catch (err: any) {
+         addLog('update', '工参更新失败', 'error', err.message, 'update:params')
          console.error('Update failed:', err);
          // 从多种可能的错误结构中提取消息
          const errorMsg = err?.message || err?.data?.message || (typeof err === 'object' ? JSON.stringify(err) : String(err));
@@ -525,7 +684,7 @@ export function DataPage() {
   return (
     <div className="p-8">
       <div className="flex justify-between items-center mb-8">
-        <h1 className="text-3xl font-bold">{t('data.title')}</h1>
+        <h1 className="text-base font-bold">{t('data.title')}</h1>
       </div>
 
       {/* 错误提示 */}
@@ -571,9 +730,14 @@ export function DataPage() {
         <div className="space-y-8">
             {/* 文件上传 */}
             <div className="bg-card p-3 rounded-lg border border-border">
-            <h2 className="text-xl font-semibold mb-2">{t('data.importData') || '导入数据'}</h2>
+            <h2 className="text-base font-semibold mb-2">{t('data.importData') || '导入数据'}</h2>
+            {!permImport && (
+              <p className="text-xs text-muted-foreground mb-2 bg-muted/40 px-2 py-1 rounded">
+                {t('data.noPermission', '无权限，请联系管理员')}
+              </p>
+            )}
 
-             <div className="space-y-2">
+             <div className={`space-y-2 ${permImport ? '' : 'opacity-50 pointer-events-none'}`}>
                 <div className="flex items-center gap-2">
                     <div className="flex-1">
                         <UploadArea
@@ -661,53 +825,63 @@ export function DataPage() {
             </div>
 
             {/* 工参更新 */}
-            <div className="bg-card p-3 rounded-lg border border-border -mt-6">
-                <h2 className="text-xl font-semibold mb-2">{t('data.updateParameters') || '工参更新'}</h2>
-                <div className="space-y-4">
-                    <div>
-                        <select
-                            className="w-full p-2 border rounded-md bg-background text-sm"
-                            value={selectedFullParamId}
-                            onChange={(e) => setSelectedFullParamId(e.target.value)}
-                            title={t('data.selectFullParams') || '选择全量工参'}
-                        >
-                            <option value="" disabled>{t('data.selectFullParams') || '选择全量工参'}</option>
-                            {fullParamFiles.map(f => (
-                                <option key={f.id} value={f.id}>
-                                    {f.name} {f.originalPath ? '✓' : `(${t('data.noPath') || '无路径'})`}
-                                </option>
-                            ))}
-                        </select>
-                    </div>
-                    <div>
-                        <select
-                            className="w-full p-2 border rounded-md bg-background text-sm"
-                            value={selectedCurrentParamId}
-                            onChange={(e) => setSelectedCurrentParamId(e.target.value)}
-                            title={t('data.selectCurrentParams') || '选择现网工参 (ZIP)'}
-                        >
-                            <option value="" disabled>{t('data.selectCurrentParams') || '选择现网工参 (ZIP)'}</option>
-                            {currentParamFiles.map(f => (
-                                <option key={f.id} value={f.id}>{f.name}</option>
-                            ))}
-                        </select>
-                    </div>
-                    <button
-                        onClick={handleUpdateParameters}
-                        disabled={isUpdating || !selectedFullParamId || !selectedCurrentParamId}
-                        className="w-full py-2 px-4 bg-blue-400 text-white rounded-md hover:bg-blue-500 disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
+            <div className={`bg-card p-3 rounded-lg border border-border -mt-6 ${permUpdate ? '' : 'opacity-50 pointer-events-none'}`}>
+                <h2 className="text-base font-semibold mb-2">{t('data.updateParameters') || '工参更新'}</h2>
+                {!permUpdate && (
+                  <p className="text-xs text-muted-foreground mb-2 bg-muted/40 px-2 py-1 rounded">
+                    {t('data.noPermission', '无权限，请联系管理员')}
+                  </p>
+                )}
+                <div className="flex items-end gap-2">
+                  <div className="flex-1 min-w-0">
+                    <select
+                        className="w-full p-2 border rounded-md bg-background text-sm mb-2"
+                        value={selectedFullParamId}
+                        onChange={(e) => setSelectedFullParamId(e.target.value)}
+                        title={t('data.selectFullParams') || '选择全量工参'}
                     >
-                        {isUpdating ? <Loader2 className="animate-spin" size={16} /> : <RefreshCw size={16} />}
-                        {isUpdating ? (t('data.updating') || '更新中...') : (t('data.startUpdate') || '开始更新')}
-                    </button>
+                        <option value="" disabled>{t('data.selectFullParams') || '选择全量工参'}</option>
+                        {fullParamFiles.map(f => (
+                            <option key={f.id} value={f.id}>
+                                {f.name} {f.originalPath ? '✓' : `(${t('data.noPath') || '无路径'})`}
+                            </option>
+                        ))}
+                    </select>
+                    <select
+                        className="w-full p-2 border rounded-md bg-background text-sm"
+                        value={selectedCurrentParamId}
+                        onChange={(e) => setSelectedCurrentParamId(e.target.value)}
+                        title={t('data.selectCurrentParams') || '选择现网工参 (ZIP)'}
+                    >
+                        <option value="" disabled>{t('data.selectCurrentParams') || '选择现网工参 (ZIP)'}</option>
+                        {currentParamFiles.map(f => (
+                            <option key={f.id} value={f.id}>{f.name}</option>
+                        ))}
+                    </select>
+                  </div>
+                  <button
+                      onClick={handleUpdateParameters}
+                      disabled={isUpdating || !selectedFullParamId || !selectedCurrentParamId}
+                      className="shrink-0 h-[calc(2.25rem*2+0.5rem)] px-3 bg-blue-400 text-white rounded-md hover:bg-blue-500 disabled:opacity-50 disabled:cursor-not-allowed flex flex-col items-center justify-center gap-0.5 text-xs font-medium transition-colors"
+                  >
+                      {isUpdating ? <Loader2 className="animate-spin" size={16} /> : <RefreshCw size={16} />}
+                      {isUpdating ? (t('data.updating') || '更新中') : (t('data.startUpdate') || '开始更新')}
+                  </button>
                 </div>
             </div>
+
+            {/* 新站录入 */}
+            <NewCellEntryCard
+                fullParamFiles={fullParamFiles}
+                addLog={addLog}
+                disabled={!permCellEntry}
+            />
         </div>
 
         {/* 数据列表 */}
         <div className="bg-card p-6 rounded-lg border border-border h-full">
           <div className="flex items-center justify-between mb-4">
-            <h2 className="text-xl font-semibold">{t('data.importedData') || '已导入数据'}</h2>
+            <h2 className="text-base font-semibold">{t('data.importedData') || '已导入数据'}</h2>
             <div className="flex items-center gap-2">
               {items.length > 0 && (
                 <>
@@ -722,9 +896,10 @@ export function DataPage() {
                     {allSelected ? (t('data.deselectAll') || '取消全选') : (t('data.selectAll') || '全选')}
                   </button>
                   <button
-                    onClick={handleBatchDelete}
-                    disabled={selectedIds.size === 0 || batchDeleting}
+                    onClick={() => { if (!permDelete) return; handleBatchDelete() }}
+                    disabled={!permDelete || selectedIds.size === 0 || batchDeleting || hasSyncingItems}
                     className="text-xs px-2.5 py-1 rounded border bg-background border-border text-red-500 hover:bg-red-50 hover:border-red-200 disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-background disabled:hover:border-border transition-colors flex items-center gap-1"
+                    title={!permDelete ? (t('data.noPermission', '无权限，请联系管理员')) : (hasSyncingItems ? (t('data.syncingDisabled') || '同步中不可操作') : '')}
                   >
                     {batchDeleting ? (
                       <Loader2 size={12} className="animate-spin" />
@@ -746,6 +921,19 @@ export function DataPage() {
               </button>
             </div>
           </div>
+
+          {/* 全量工参同步中提醒横幅 */}
+          {hasSyncingItems && (
+            <div className="mb-3 px-4 py-2.5 bg-amber-50 border border-amber-200 rounded-lg flex items-center gap-2.5">
+              <Loader2 size={16} className="animate-spin text-amber-500" />
+              <span className="text-sm text-amber-700 font-medium">
+                {t('data.excelSyncing') || 'Excel同步中...'}
+              </span>
+              <span className="text-xs text-amber-500 ml-auto">
+                {t('data.syncingWait') || '后台正在写入数据，操作暂时锁定'}
+              </span>
+            </div>
+          )}
 
           {items.length === 0 ? (
             <p className="text-muted-foreground text-center py-8">
@@ -884,9 +1072,13 @@ export function DataPage() {
                   </div>
                   <div className="flex gap-1 items-center">
                     <button
-                      onClick={(e) => toggleSelectItem(item.id, e)}
-                      className="p-1.5 hover:bg-background rounded text-muted-foreground hover:text-primary transition-colors"
-                      title={selectedIds.has(item.id) ? (t('data.deselectItem') || '取消选择') : (t('data.selectItem') || '选择')}
+                      onClick={(e) => {
+                        if (loading || item.excelSynced === false || (item.inplaceUpdated && item.excelSynced === undefined)) return
+                        toggleSelectItem(item.id, e)
+                      }}
+                      className={`p-1.5 rounded transition-colors ${loading || item.excelSynced === false || (item.inplaceUpdated && item.excelSynced === undefined) ? 'text-muted-foreground/30 cursor-not-allowed' : 'hover:bg-background text-muted-foreground hover:text-primary'}`}
+                      disabled={loading || item.excelSynced === false || (item.inplaceUpdated && item.excelSynced === undefined)}
+                      title={loading ? (t('data.loading') || '加载中...') : (item.excelSynced === false || (item.inplaceUpdated && item.excelSynced === undefined) ? (t('data.syncingDisabled') || '同步中不可操作') : (selectedIds.has(item.id) ? (t('data.deselectItem') || '取消选择') : (t('data.selectItem') || '选择')))}
                     >
                       {selectedIds.has(item.id) ? (
                         <CheckSquare size={16} className="text-primary" />
@@ -894,24 +1086,48 @@ export function DataPage() {
                         <Square size={16} />
                       )}
                     </button>
+                    {loading ? (
+                      <div className="p-2 text-muted-foreground/50" title={t('data.loading') || '加载中...'}>
+                        <Loader2 size={14} className="animate-spin text-muted-foreground" />
+                      </div>
+                    ) : item.excelSynced === false || (item.inplaceUpdated && item.excelSynced === undefined) ? (
+                      <div className="p-2 text-muted-foreground flex items-center gap-1.5" title={t('data.excelSyncing') || 'Excel同步中...'}>
+                        <Loader2 size={14} className="animate-spin text-amber-500" />
+                        <span className="text-[10px] text-amber-600">{t('data.syncing') || '同步中'}</span>
+                      </div>
+                    ) : (
                     <button
                       onClick={(e) => {
                         e.stopPropagation()
                         handleDownload(item)
                       }}
-                      disabled={downloadingIds.has(item.id)}
-                      className="p-2 hover:bg-background rounded text-primary disabled:opacity-50 disabled:cursor-wait"
-                      title={downloadingIds.has(item.id) ? (t('data.downloading') || '下载中...') : (t('data.download') || '下载')}
+                      disabled={downloadStore.downloadingIds.has(item.id)}
+                      className="p-2 hover:bg-background rounded text-primary disabled:opacity-50 disabled:cursor-wait relative group"
+                      title={downloadStore.downloadingIds.has(item.id)
+                        ? (downloadStore.statusText[item.id] || (t('data.downloading') || '下载中...'))
+                        : (t('data.download') || '下载')}
                     >
-                      {downloadingIds.has(item.id) ? <Loader2 size={16} className="animate-spin" /> : <Download size={16} />}
+                      {downloadStore.downloadingIds.has(item.id) ? (
+                        <div className="flex flex-col items-center gap-0.5">
+                          <Loader2 size={16} className="animate-spin text-blue-500" />
+                          {downloadStore.progress[item.id] > 0 && (
+                            <span className="text-[9px] font-mono text-blue-600 leading-none">
+                              {downloadStore.progress[item.id]}%
+                            </span>
+                          )}
+                        </div>
+                      ) : <Download size={16} />}
                     </button>
+                    )}
                     <button
                       onClick={(e) => {
+                        if (!permDelete || loading || item.excelSynced === false || (item.inplaceUpdated && item.excelSynced === undefined)) return
                         e.stopPropagation()
                         handleDelete(item)
                       }}
-                      className="p-2 hover:bg-background rounded text-red-500"
-                      title={t('data.delete') || '删除'}
+                      className={`p-2 rounded ${!permDelete || loading || item.excelSynced === false || (item.inplaceUpdated && item.excelSynced === undefined) ? 'text-red-500/30 cursor-not-allowed' : 'hover:bg-background text-red-500'}`}
+                      disabled={!permDelete || loading || item.excelSynced === false || (item.inplaceUpdated && item.excelSynced === undefined)}
+                      title={!permDelete ? (t('data.noPermission', '无权限，请联系管理员')) : (loading ? (t('data.loading') || '加载中...') : (item.excelSynced === false || (item.inplaceUpdated && item.excelSynced === undefined) ? (t('data.syncingDisabled') || '同步中不可删除') : (t('data.delete') || '删除')))}
                     >
                       <Trash2 size={16} />
                     </button>
@@ -923,138 +1139,112 @@ export function DataPage() {
         </div>
       </div>
 
-      {/* 数据预览 */}
-      <div className="mt-8 bg-card p-6 rounded-lg border border-border">
-        <h2 className="text-xl font-semibold mb-4">{t('data.preview') || '数据预览'}</h2>
-        {!selectedId ? (
-          <p className="text-muted-foreground text-center py-8">
-            {t('data.selectToPreview') || '请选择数据查看预览'}
-          </p>
-        ) : (
-          <DataPreview dataId={selectedId} />
-        )}
-      </div>
-    </div>
-  )
-}
-
-function DataPreview({ dataId }: { dataId: string }) {
-  const { t: tPreview } = useTranslation()
-  const [data, setData] = useState<any>(null)
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState<string | null>(null)
-
-  useEffect(() => {
-    async function fetchData() {
-      setLoading(true)
-      setError(null)
-      try {
-        const response = await fetch(`/api/v1/data/${dataId}`)
-        const result = await response.json()
-        // 后端返回 { success: true, data: ... }
-        setData(result.success ? result.data : null)
-      } catch (err) {
-        console.error('Failed to fetch data:', err)
-        setError(tPreview('data.loadFailed') || '加载数据失败')
-      } finally {
-        setLoading(false)
-      }
-    }
-    fetchData()
-  }, [dataId])
-
-  if (loading) {
-    return (
-      <div className="flex items-center justify-center py-16">
-        <Loader2 className="animate-spin" />
-        <span className="ml-2 text-muted-foreground">{tPreview('data.loading') || '加载中...'}</span>
-      </div>
-    )
-  }
-
-  if (error) {
-    return (
-      <div className="flex items-center justify-center py-16 text-red-500">
-        <AlertCircle size={20} className="mr-2" />
-        <span>{error}</span>
-      </div>
-    )
-  }
-
-  if (!data) {
-    return <p className="text-muted-foreground text-center py-8">{tPreview('data.cannotLoadData') || '无法加载数据'}</p>
-  }
-
-  // 处理失败状态
-  if (data.status === 'error') {
-    return (
-      <div className="flex flex-col items-center justify-center py-16 text-red-500">
-        <AlertCircle size={24} className="mb-3" />
-        <p className="text-sm font-medium text-center mb-1">
-          {tPreview('data.processingFailed') || '文件处理失败'}
-        </p>
-        {data.errorMessage && (
-          <p className="text-xs text-muted-foreground text-center max-w-md mt-1 px-4">
-            {data.errorMessage}
-          </p>
-        )}
-        <p className="text-xs text-muted-foreground mt-3">
-          {tPreview('data.deleteAndRetry') || '请删除后重新上传'}
-        </p>
-      </div>
-    )
-  }
-
-  // 如果是文件列表（ZIP文件）
-  if (data.files) {
-      return (
-          <div>
-              <p className="text-sm text-muted-foreground mb-4">
-                  {tPreview('data.containsFiles', { count: data.files.length }) || `包含 ${data.files.length} 个文件`}
-              </p>
-              <div className="max-h-60 overflow-y-auto border rounded-md">
-                  <ul className="divide-y">
-                      {data.files.map((file: string, index: number) => (
-                          <li key={index} className="p-2 text-sm hover:bg-muted/50">
-                              {file}
-                          </li>
-                      ))}
-                  </ul>
-              </div>
+      {/* 运行结果 */}
+      <div className="mt-8 bg-card rounded-lg border border-border overflow-hidden">
+        <div className="flex items-center justify-between px-5 py-3 border-b border-border bg-muted/30">
+          <div className="flex items-center gap-2">
+            <ScrollText size={16} className="text-muted-foreground" />
+            <h2 className="text-sm font-semibold">{t('data.operationLog') || '运行结果'}</h2>
+            {logs.length > 0 && (
+              <span className="text-[10px] text-muted-foreground bg-muted px-1.5 py-0.5 rounded-full">
+                {logs.length}
+              </span>
+            )}
           </div>
-      )
-  }
-
-  return (
-    <div>
-      <p className="text-sm text-muted-foreground mb-4">
-        {tPreview('data.siteCount', { count: Array.isArray(data) ? data.length : 0 }) || `共 ${Array.isArray(data) ? data.length : 0} 个基站`}
-      </p>
-      <div className="overflow-x-auto">
-        <table className="w-full text-sm">
-          <thead>
-            <tr className="border-b">
-              <th className="text-left p-2">{tPreview('data.siteId') || '基站ID'}</th>
-              <th className="text-left p-2">{tPreview('data.siteName') || '基站名称'}</th>
-              <th className="text-left p-2">{tPreview('data.networkType') || '网络类型'}</th>
-              <th className="text-left p-2">{tPreview('data.longitude') || '经度'}</th>
-              <th className="text-left p-2">{tPreview('data.latitude') || '纬度'}</th>
-              <th className="text-left p-2">{tPreview('data.sectorCount') || '小区数'}</th>
-            </tr>
-          </thead>
-          <tbody>
-            {Array.isArray(data) && data.slice(0, 50).map((site: any) => (
-              <tr key={site.id} className="border-b hover:bg-muted/50">
-                <td className="p-2">{site.id}</td>
-                <td className="p-2">{site.name}</td>
-                <td className="p-2">{site.networkType}</td>
-                <td className="p-2">{site.longitude?.toFixed(6)}</td>
-                <td className="p-2">{site.latitude?.toFixed(6)}</td>
-                <td className="p-2">{site.sectors?.length || 0}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+          <div className="flex items-center gap-1">
+            {logs.length > 0 && (
+              <button
+                onClick={() => {
+              _store.entries = []
+              setLogs([])
+            }}
+                className="text-[11px] px-2 py-1 rounded text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
+              >
+                {t('data.clearLog') || '清除'}
+              </button>
+            )}
+          </div>
+        </div>
+        <div className="max-h-[280px] overflow-y-auto p-0">
+          {logs.length === 0 ? (
+            <div className="flex flex-col items-center justify-center py-12 text-muted-foreground">
+              <ScrollText size={28} className="opacity-30 mb-3" />
+              <p className="text-xs">{t('data.noLogs') || '暂无运行记录'}</p>
+              <p className="text-[10px] opacity-60 mt-1">{t('data.noLogsHint') || '执行上传、下载、删除等操作后，记录将出现在这里'}</p>
+            </div>
+          ) : (
+            <div className="divide-y divide-border/40">
+              {logs.map((entry) => (
+                <div
+                  key={entry.id}
+                  className="px-5 py-2.5 hover:bg-muted/20 transition-colors animate-in fade-in slide-in-from-bottom-1 duration-200"
+                >
+                  <div className="flex items-start gap-3">
+                    <span className="text-[10px] font-mono text-muted-foreground/60 mt-0.5 shrink-0 w-14 text-right">
+                      {entry.time}
+                    </span>
+                    <span className={`shrink-0 mt-0.5 ${
+                      entry.type === 'upload' ? 'text-blue-500' :
+                      entry.type === 'download' ? 'text-green-500' :
+                      entry.type === 'delete' ? 'text-red-500' :
+                      entry.type === 'update' ? 'text-amber-500' :
+                      entry.type === 'terminal' ? 'text-zinc-400' :
+                      entry.type === 'error' ? 'text-red-500' :
+                      'text-muted-foreground'
+                    }`}>
+                      {entry.type === 'terminal' ? (
+                        <span className="text-[9px] font-mono font-bold opacity-70">&gt;</span>
+                      ) : entry.status === 'running' ? (
+                        <Loader2 size={12} className="animate-spin" />
+                      ) : entry.status === 'success' ? (
+                        <CheckCircle2 size={12} />
+                      ) : entry.status === 'error' ? (
+                        <AlertCircle size={12} />
+                      ) : (
+                        <div className="w-3 h-3 rounded-full bg-current opacity-40" />
+                      )}
+                    </span>
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-2">
+                        <span className={`text-xs font-medium font-mono ${
+                          entry.type === 'terminal' ? 'text-emerald-600' :
+                          entry.status === 'running' ? 'text-foreground' :
+                          entry.status === 'success' ? 'text-green-700' :
+                          entry.status === 'error' ? 'text-red-600' :
+                          'text-foreground'
+                        }`}>
+                          {entry.message}
+                        </span>
+                        <span className={`text-[9px] px-1.5 py-0.5 rounded-full font-medium ${
+                          entry.type === 'upload' ? 'bg-blue-100 text-blue-700' :
+                          entry.type === 'download' ? 'bg-green-100 text-green-700' :
+                          entry.type === 'delete' ? 'bg-red-100 text-red-700' :
+                          entry.type === 'update' ? 'bg-amber-100 text-amber-700' :
+                          entry.type === 'terminal' ? 'bg-zinc-100 text-zinc-600' :
+                          entry.type === 'error' ? 'bg-red-100 text-red-700' :
+                          'bg-gray-100 text-gray-600'
+                        }`}>
+                          {entry.type === 'upload' ? '上传' :
+                           entry.type === 'download' ? '下载' :
+                           entry.type === 'delete' ? '删除' :
+                           entry.type === 'update' ? '更新' :
+                           entry.type === 'terminal' ? '终端' :
+                           entry.type === 'error' ? '错误' : '信息'}
+                        </span>
+                      </div>
+                      {entry.detail && (
+                        <p className="text-[10px] text-muted-foreground/70 mt-0.5 truncate">
+                          {entry.detail}
+                        </p>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              ))}
+              <div ref={logEndRef} />
+            </div>
+          )}
+        </div>
       </div>
     </div>
   )
@@ -1181,4 +1371,571 @@ function UploadArea({
       </label>
     </div>
   )
+}
+
+function NewCellEntryCard({
+  fullParamFiles,
+  addLog,
+  disabled,
+}: {
+  fullParamFiles: DataItem[]
+  addLog: (type: any, message: string, status?: any, detail?: string, opKey?: string) => void
+  disabled?: boolean
+}) {
+  const { t } = useTranslation()
+  const { batchAddCells, isAddingCell } = useDataStore()
+
+  const [activeTab, setActiveTab] = useState<'LTE' | 'NR'>('LTE')
+  const [rows, setRows] = useState<{ LTE: CellRow[]; NR: CellRow[] }>({
+    LTE: [createEmptyRow()],
+    NR: [createEmptyRow()],
+  })
+  const [selectedRowIds, setSelectedRowIds] = useState<Set<string>>(new Set())
+  const [batchResults, setBatchResults] = useState<Array<{ index: number; networkType: string; cellName: string; siteId: string; cellId: string; success: boolean; message: string }> | null>(null)
+  const [batchError, setBatchError] = useState<string | null>(null)
+  const [expanded, setExpanded] = useState(false)
+  const [duplicateCgiSet, setDuplicateCgiSet] = useState<Set<string>>(new Set())
+
+  const hasFullParams = fullParamFiles.length > 0
+
+  function createEmptyRow(): CellRow {
+    return {
+      id: `row_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+      managedElementId: '',
+      siteId: '',
+      cellId: '',
+      cellName: '',
+      mcc: '460',
+      mnc: '11',
+      longitude: '',
+      latitude: '',
+      azimuth: '',
+      frequency: '',
+      ssbFrequency: '',
+      cellCoverType: 1,
+    }
+  }
+
+  // ---- Validation helpers ----
+  const isNumeric = (v: string) => /^-?\d+(\.\d+)?$/.test(v.trim())
+  const isInteger = (v: string) => /^-?\d+$/.test(v.trim())
+  /** Check if string is a float or integer (positive) */
+  const isFloat = (v: string) => /^-?\d+(\.\d+)?$/.test(v.trim())
+
+  /** Filter: keep only digits for integer fields */
+  const filterDigits = (v: string) => v.replace(/\D/g, '')
+  /** Filter: keep digits, dot, minus for numeric fields */
+  const filterNumeric = (v: string) => v.replace(/[^\d.\-]/g, '')
+
+  const isRowComplete = (row: CellRow, nt: 'LTE' | 'NR') => {
+    const freqOk = nt === 'LTE' ? isFloat(row.frequency) : isFloat(row.ssbFrequency)
+    const azi = parseInt(row.azimuth)
+    const aziValid = isInteger(row.azimuth) && !isNaN(azi) && azi >= 0 && azi <= 360
+    return isInteger(row.managedElementId)
+      && isInteger(row.siteId)
+      && isInteger(row.cellId)
+      && row.cellName.trim() !== ''
+      && isNumeric(row.longitude)
+      && isNumeric(row.latitude)
+      && aziValid
+      && freqOk
+      && (!row.mcc.trim() || isInteger(row.mcc))
+      && row.mnc.trim().length === 2 && isInteger(row.mnc)
+  }
+
+  // Copy rows from selected checkboxes
+  const copyRows = () => {
+    const selected = rows[activeTab].filter(r => selectedRowIds.has(r.id))
+    if (selected.length === 0) return
+    const copies = selected.map(r => ({
+      ...createEmptyRow(),
+      managedElementId: r.managedElementId,
+      siteId: r.siteId,
+      cellId: r.cellId,
+      cellName: r.cellName,
+      mcc: r.mcc,
+      mnc: r.mnc,
+      longitude: r.longitude,
+      latitude: r.latitude,
+      azimuth: r.azimuth,
+      frequency: r.frequency,
+      ssbFrequency: r.ssbFrequency,
+      cellCoverType: r.cellCoverType,
+    }))
+    setRows(prev => ({
+      ...prev,
+      [activeTab]: [...prev[activeTab], ...copies],
+    }))
+    setSelectedRowIds(new Set())
+  }
+
+  const copyButtonEnabled = selectedRowIds.size > 0
+    && rows[activeTab].filter(r => selectedRowIds.has(r.id)).every(r => isRowComplete(r, activeTab))
+
+  const deleteRow = (rowId: string) => {
+    setRows(prev => {
+      const tabRows = prev[activeTab]
+      if (tabRows.length <= 1) return prev
+      return {
+        ...prev,
+        [activeTab]: tabRows.filter(r => r.id !== rowId),
+      }
+    })
+    setSelectedRowIds(prev => { const next = new Set(prev); next.delete(rowId); return next })
+  }
+
+  const updateRow = (rowId: string, field: string, value: string | number) => {
+    setRows(prev => ({
+      ...prev,
+      [activeTab]: prev[activeTab].map(r =>
+        r.id === rowId ? { ...r, [field]: value } : r
+      ),
+    }))
+  }
+
+  const toggleRowSelection = (rowId: string) => {
+    setSelectedRowIds(prev => {
+      const next = new Set(prev)
+      if (next.has(rowId)) next.delete(rowId)
+      else next.add(rowId)
+      return next
+    })
+  }
+
+  const toggleSelectAll = () => {
+    const tabRows = rows[activeTab]
+    const completeRows = tabRows.filter(r => isRowComplete(r, activeTab))
+    const allCompleteSelected = completeRows.every(r => selectedRowIds.has(r.id))
+    if (allCompleteSelected) {
+      setSelectedRowIds(new Set())
+    } else {
+      setSelectedRowIds(new Set(completeRows.map(r => r.id)))
+    }
+  }
+
+  const resetAll = () => {
+    setRows({
+      LTE: [createEmptyRow()],
+      NR: [createEmptyRow()],
+    })
+    setSelectedRowIds(new Set())
+    setBatchResults(null)
+    setBatchError(null)
+  }
+
+  // Collect all non-empty rows from both tabs
+  const collectValidRows = () => {
+    const all: Array<{
+      networkType: 'LTE' | 'NR'
+      managedElementId: string
+      siteId: string
+      cellId: string
+      cellName: string
+      mcc?: string
+      mnc?: string
+      longitude: number
+      latitude: number
+      azimuth: number
+      frequency?: string
+      ssbFrequency?: string
+      cellCoverType: number
+    }> = []
+
+    for (const nt of ['LTE', 'NR'] as const) {
+      for (const r of rows[nt]) {
+        const hasData = r.managedElementId.trim() || r.siteId.trim() || r.cellId.trim() || r.cellName.trim()
+        if (!hasData) continue
+
+        // Validate all fields
+        const ntValid = isRowComplete(r, nt)
+        if (!ntValid) continue
+
+        all.push({
+          networkType: nt,
+          managedElementId: r.managedElementId.trim(),
+          siteId: r.siteId.trim(),
+          cellId: r.cellId.trim(),
+          cellName: r.cellName.trim(),
+          mcc: r.mcc.trim() || undefined,
+          mnc: r.mnc.trim() || undefined,
+          longitude: parseFloat(r.longitude),
+          latitude: parseFloat(r.latitude),
+          azimuth: parseFloat(r.azimuth),
+          frequency: nt === 'LTE' ? r.frequency.trim() : undefined,
+          ssbFrequency: nt === 'NR' ? r.ssbFrequency.trim() : undefined,
+          cellCoverType: r.cellCoverType,
+        })
+      }
+    }
+    return all
+  }
+
+  const handleBatchImport = async () => {
+    if (!hasFullParams) return
+
+    setBatchResults(null)
+    setBatchError(null)
+    setDuplicateCgiSet(new Set())
+
+    const validRows = collectValidRows()
+
+    if (validRows.length === 0) {
+      setBatchError(t('newCellEntry.noDataToImport') || '没有待导入的数据，请至少填写一行的必填字段')
+      setTimeout(() => setBatchError(null), 5000)
+      return
+    }
+
+    // 查重：检查 CGI (siteId_cellId) 是否已存在于数据库
+    try {
+      const dupCheck = await dataApi.checkCellDuplicates(
+        validRows.map(r => ({ siteId: r.siteId, cellId: r.cellId }))
+      )
+      if (dupCheck?.data?.duplicates?.length > 0) {
+        const dupSet = new Set<string>(dupCheck.data.duplicates)
+        setDuplicateCgiSet(dupSet)
+        // 弹窗提示重复
+        const dupNames = validRows
+          .filter(r => dupSet.has(`${r.siteId}_${r.cellId}`))
+          .map(r => `${r.cellName}(${r.siteId}_${r.cellId})`)
+          .join('、')
+        setBatchError(`以下小区已在数据库中，已自动跳过：${dupNames}`)
+        setTimeout(() => setBatchError(null), 8000)
+        // 过滤掉重复行，只导入不重复的
+        const uniqueRows = validRows.filter(r => !dupSet.has(`${r.siteId}_${r.cellId}`))
+        if (uniqueRows.length === 0) {
+          return // 全部重复
+        }
+        addLog('upload', `批量新站录入: ${uniqueRows.length} 条（跳过 ${validRows.length - uniqueRows.length} 条重复）`, 'running', undefined, `batchCellEntry:${Date.now()}`)
+        const result = await batchAddCells(uniqueRows)
+        if (result?.success && result?.data?.results) {
+          const results = result.data.results as Array<{ index: number; networkType: string; cellName: string; siteId: string; cellId: string; success: boolean; message: string }>
+          setBatchResults(results)
+          const successCount = results.filter(r => r.success).length
+          addLog('upload', `批量新站录入完成: 成功 ${successCount}/${results.length}`, successCount === results.length ? 'success' : 'warning', undefined, `batchCellEntry:${Date.now()}`)
+          setRows({
+            LTE: [createEmptyRow()],
+            NR: [createEmptyRow()],
+          })
+          setSelectedRowIds(new Set())
+          setDuplicateCgiSet(new Set())
+        }
+        return
+      }
+    } catch (_) {
+      // 查重失败不影响导入
+    }
+
+    addLog('upload', `批量新站录入: ${validRows.length} 条`, 'running', undefined, `batchCellEntry:${Date.now()}`)
+
+    try {
+      const result = await batchAddCells(validRows)
+      if (result?.success && result?.data?.results) {
+        const results = result.data.results as Array<{ index: number; networkType: string; cellName: string; siteId: string; cellId: string; success: boolean; message: string }>
+        setBatchResults(results)
+        const successCount = results.filter(r => r.success).length
+        addLog('upload', `批量新站录入完成: 成功 ${successCount}/${results.length}`, successCount === results.length ? 'success' : 'warning', undefined, `batchCellEntry:${Date.now()}`)
+        setRows({
+          LTE: [createEmptyRow()],
+          NR: [createEmptyRow()],
+        })
+        setSelectedRowIds(new Set())
+      } else {
+        const errMsg = result?.message || (t('newCellEntry.cellEntryFailed') || '批量录入失败')
+        setBatchError(errMsg)
+        addLog('upload', `批量新站录入失败: ${errMsg}`, 'error', undefined, `batchCellEntry:${Date.now()}`)
+        setTimeout(() => setBatchError(null), 5000)
+      }
+    } catch (err: any) {
+      const errMsg = err.message || (t('newCellEntry.cellEntryFailed') || '批量录入失败')
+      setBatchError(errMsg)
+      addLog('upload', `批量新站录入失败: ${errMsg}`, 'error', undefined, `batchCellEntry:${Date.now()}`)
+      setTimeout(() => setBatchError(null), 5000)
+    }
+  }
+
+  const isLte = activeTab === 'LTE'
+  const inputCls = 'w-full min-w-[70px] px-1.5 py-1 text-xs bg-background border border-border rounded focus:outline-none focus:ring-1 focus:ring-primary disabled:opacity-50 disabled:cursor-not-allowed'
+  const inputClsExp = 'w-full min-w-[100px] px-2 py-1.5 text-sm bg-background border border-border rounded focus:outline-none focus:ring-1 focus:ring-primary disabled:opacity-50 disabled:cursor-not-allowed'
+  const labelCls = 'text-xs text-muted-foreground text-center leading-tight px-0.5 whitespace-nowrap'
+  const curInputCls = expanded ? inputClsExp : inputCls
+
+  // Count total valid rows across both tabs
+  const totalRows = rows.LTE.filter(r => r.managedElementId.trim() || r.siteId.trim() || r.cellId.trim() || r.cellName.trim()).length
+    + rows.NR.filter(r => r.managedElementId.trim() || r.siteId.trim() || r.cellId.trim() || r.cellName.trim()).length
+
+  // Check if all complete rows in active tab are selected
+  const completeInTab = rows[activeTab].filter(r => isRowComplete(r, activeTab))
+  const allSelected = completeInTab.length > 0 && completeInTab.every(r => selectedRowIds.has(r.id))
+
+  // ---- Render the main card (used both inline and in overlay) ----
+  const renderCardContent = () => (
+    <>
+      <div className={`flex items-center justify-between ${expanded ? 'mb-4' : 'mb-2'}`}>
+        <h2 className={`font-semibold ${expanded ? 'text-lg' : 'text-base'}`}>{t('newCellEntry.title') || '新站录入'}</h2>
+        <button
+          onClick={() => setExpanded(!expanded)}
+          className="text-muted-foreground hover:text-foreground transition-colors p-1 rounded hover:bg-muted"
+          title={expanded ? (t('newCellEntry.collapse') || '缩回') : (t('newCellEntry.expand') || '展开')}
+        >
+          {expanded ? <Minimize2 size={16} /> : <Maximize2 size={14} />}
+        </button>
+      </div>
+
+      {disabled && (
+        <div className="px-3 py-2 bg-muted/40 border border-border rounded-lg text-xs text-muted-foreground mb-3">
+          {t('data.noPermission', '无权限，请联系管理员')}
+        </div>
+      )}
+
+      {!hasFullParams && (
+        <div className={`px-3 py-2 bg-amber-50 border border-amber-200 rounded-lg ${expanded ? 'text-sm mb-4' : 'text-xs mb-3'} text-amber-700`}>
+          {t('newCellEntry.noFullParams') || '请先上传全量工参文件'}
+        </div>
+      )}
+
+      {batchError && (
+        <div className={`px-3 py-2 bg-red-50 border border-red-200 rounded-lg flex items-center gap-2 ${expanded ? 'text-sm mb-4' : 'text-xs mb-3'} text-red-700`}>
+          <AlertCircle size={14} />
+          <span>{batchError}</span>
+          <button onClick={() => setBatchError(null)} className="ml-auto text-red-500 hover:text-red-700">✕</button>
+        </div>
+      )}
+
+      <div className="flex items-center gap-3 mb-3">
+        <div className="flex gap-2">
+          {(['LTE', 'NR'] as const).map(nt => (
+            <button
+              key={nt}
+              onClick={() => { setActiveTab(nt); setBatchResults(null); setBatchError(null); setSelectedRowIds(new Set()); setDuplicateCgiSet(new Set()) }}
+              className={`px-3 py-1 rounded-md text-xs border transition-colors ${
+                activeTab === nt
+                  ? 'bg-primary/10 border-primary text-primary font-medium'
+                  : 'bg-background border-border text-muted-foreground hover:bg-muted'
+              }`}
+            >
+              {nt}
+            </button>
+          ))}
+        </div>
+        <span className="text-xs text-muted-foreground ml-auto">
+          LTE: {rows.LTE.filter(r => r.managedElementId.trim() || r.siteId.trim() || r.cellId.trim() || r.cellName.trim()).length}
+          &nbsp; NR: {rows.NR.filter(r => r.managedElementId.trim() || r.siteId.trim() || r.cellId.trim() || r.cellName.trim()).length}
+        </span>
+      </div>
+
+      {/* Multi-row table */}
+      <div className={expanded ? 'overflow-x-auto' : 'overflow-x-auto'}>
+        <table className="w-full border-collapse">
+          <thead>
+            <tr>
+              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30 w-0'}>
+                <input
+                  type="checkbox"
+                  checked={allSelected}
+                  onChange={toggleSelectAll}
+                  disabled={isAddingCell || !hasFullParams}
+                  className="cursor-pointer"
+                />
+              </th>
+              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30 w-0'}>{/* 操作列 */}</th>
+              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30'}>{t('newCellEntry.fieldManagedElementId') || '网元ID'}</th>
+              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30'}>{t('newCellEntry.fieldSiteIdLTE') || '基站ID'}</th>
+              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30'}>{t('newCellEntry.fieldCellId') || '小区ID'}</th>
+              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30'}>{t('newCellEntry.fieldCellName') || '小区名称'}</th>
+              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30'}>{t('newCellEntry.fieldMCC') || 'MCC'}</th>
+              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30'}>{t('newCellEntry.fieldMNC') || 'MNC'}</th>
+              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30'}>{t('newCellEntry.fieldLongitude') || '经度'}</th>
+              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30'}>{t('newCellEntry.fieldLatitude') || '纬度'}</th>
+              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30'}>{t('newCellEntry.fieldAzimuth') || '方向角'}</th>
+              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30'}>{isLte ? (t('newCellEntry.fieldFrequency') || '下行频点') : (t('newCellEntry.fieldSsbFrequency') || 'SSB频点')}</th>
+              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30'}>{t('newCellEntry.fieldCellCoverType') || '覆盖类型'}</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows[activeTab].map((row) => {
+              const complete = isRowComplete(row, activeTab)
+              return (
+                <tr key={row.id} className={`${selectedRowIds.has(row.id) ? 'bg-blue-50/50' : ''} ${duplicateCgiSet.has(`${row.siteId}_${row.cellId}`) ? 'bg-red-50' : ''}`}>
+                  <td className="border border-border px-1 py-1 text-center">
+                    <input
+                      type="checkbox"
+                      checked={selectedRowIds.has(row.id)}
+                      onChange={() => toggleRowSelection(row.id)}
+                      disabled={!complete || isAddingCell || !hasFullParams}
+                      className="cursor-pointer"
+                    />
+                  </td>
+                  <td className="border border-border px-1 py-1 text-center">
+                    <button
+                      onClick={() => deleteRow(row.id)}
+                      disabled={isAddingCell || rows[activeTab].length <= 1}
+                      className="text-muted-foreground hover:text-red-500 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+                      title={t('newCellEntry.deleteRow') || '删除'}
+                    >
+                      <span className="text-xs">✕</span>
+                    </button>
+                  </td>
+                  <td className="border border-border px-1 py-1">
+                    <input className={curInputCls} type="text" inputMode="numeric" value={row.managedElementId} onChange={e => updateRow(row.id, 'managedElementId', filterDigits(e.target.value))} disabled={!hasFullParams || isAddingCell} placeholder="" />
+                  </td>
+                  <td className="border border-border px-1 py-1">
+                    <input className={curInputCls} type="text" inputMode="numeric" value={row.siteId} onChange={e => updateRow(row.id, 'siteId', filterDigits(e.target.value))} disabled={!hasFullParams || isAddingCell} placeholder="" />
+                  </td>
+                  <td className="border border-border px-1 py-1">
+                    <input className={curInputCls} type="text" inputMode="numeric" value={row.cellId} onChange={e => updateRow(row.id, 'cellId', filterDigits(e.target.value))} disabled={!hasFullParams || isAddingCell} placeholder="" />
+                  </td>
+                  <td className="border border-border px-1 py-1">
+                    <input className={curInputCls} value={row.cellName} onChange={e => updateRow(row.id, 'cellName', e.target.value)} disabled={!hasFullParams || isAddingCell} placeholder="" />
+                  </td>
+                  <td className="border border-border px-1 py-1">
+                    <input className={curInputCls} type="text" inputMode="numeric" value={row.mcc} onChange={e => updateRow(row.id, 'mcc', filterDigits(e.target.value))} disabled={!hasFullParams || isAddingCell} placeholder="460" />
+                  </td>
+                  <td className="border border-border px-1 py-1">
+                    <input
+                      className={curInputCls}
+                      list="mnc-options"
+                      value={row.mnc}
+                      onChange={e => updateRow(row.id, 'mnc', filterDigits(e.target.value).slice(0, 2))}
+                      disabled={!hasFullParams || isAddingCell}
+                      placeholder="11"
+                    />
+                    <datalist id="mnc-options">
+                      <option value="11" />
+                      <option value="01" />
+                    </datalist>
+                  </td>
+                  <td className="border border-border px-1 py-1">
+                    <input className={curInputCls} type="text" inputMode="decimal" value={row.longitude} onChange={e => updateRow(row.id, 'longitude', filterNumeric(e.target.value))} disabled={!hasFullParams || isAddingCell} placeholder="114.0" />
+                  </td>
+                  <td className="border border-border px-1 py-1">
+                    <input className={curInputCls} type="text" inputMode="decimal" value={row.latitude} onChange={e => updateRow(row.id, 'latitude', filterNumeric(e.target.value))} disabled={!hasFullParams || isAddingCell} placeholder="23.0" />
+                  </td>
+                  <td className="border border-border px-1 py-1">
+                    <input className={curInputCls} type="text" inputMode="numeric" value={row.azimuth} onChange={e => updateRow(row.id, 'azimuth', filterDigits(e.target.value))} disabled={!hasFullParams || isAddingCell} placeholder="0-360" />
+                  </td>
+                  <td className="border border-border px-1 py-1">
+                    {isLte ? (
+                      <input className={curInputCls} type="text" inputMode="decimal" value={row.frequency} onChange={e => updateRow(row.id, 'frequency', filterNumeric(e.target.value))} disabled={!hasFullParams || isAddingCell} placeholder="" />
+                    ) : (
+                      <input className={curInputCls} type="text" inputMode="decimal" value={row.ssbFrequency} onChange={e => updateRow(row.id, 'ssbFrequency', filterNumeric(e.target.value))} disabled={!hasFullParams || isAddingCell} placeholder="" />
+                    )}
+                  </td>
+                  <td className="border border-border px-1 py-1">
+                    <select
+                      className={curInputCls}
+                      value={row.cellCoverType}
+                      onChange={e => updateRow(row.id, 'cellCoverType', parseInt(e.target.value))}
+                      disabled={!hasFullParams || isAddingCell}
+                    >
+                      <option value={1}>{t('newCellEntry.cellCoverTypeOutdoor') || '室外站'}</option>
+                      <option value={4}>{t('newCellEntry.cellCoverTypeIndoor') || '室分站'}</option>
+                    </select>
+                  </td>
+                </tr>
+              )
+            })}
+          </tbody>
+        </table>
+      </div>
+
+      {/* Copy Row button */}
+      <div className="mt-2">
+        <button
+          onClick={copyRows}
+          disabled={!copyButtonEnabled || isAddingCell || !hasFullParams}
+          className={`px-3 py-1 text-xs rounded-md border border-dashed border-border bg-muted/20 ${copyButtonEnabled ? 'text-blue-500 hover:bg-blue-50 hover:border-blue-300' : 'text-muted-foreground'} disabled:opacity-50 disabled:cursor-not-allowed transition-colors flex items-center gap-1`}
+        >
+          + {t('newCellEntry.addRow') || '复制行'}
+          {selectedRowIds.size > 0 && <span className="text-xs">({selectedRowIds.size})</span>}
+        </button>
+      </div>
+
+      {/* Action buttons */}
+      <div className="flex items-center justify-between mt-3">
+        <span className="text-xs text-muted-foreground leading-relaxed max-w-[50%]">
+          {t('newCellEntry.cellCoverTypeDesc') || '涉及大量数据录入建议在"已导入数据"下载工参文件录入后导入'}
+        </span>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={resetAll}
+            disabled={isAddingCell}
+            className="px-3 py-1.5 text-xs rounded-md border border-border bg-background text-muted-foreground hover:bg-muted disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+          >
+            {t('newCellEntry.reset') || '重置'}
+          </button>
+          <button
+            onClick={handleBatchImport}
+            disabled={totalRows === 0 || isAddingCell || !hasFullParams}
+            className="px-4 py-1.5 text-xs font-medium rounded-md bg-blue-500 text-white hover:bg-blue-600 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1.5 transition-colors"
+          >
+            {isAddingCell ? <Loader2 size={14} className="animate-spin" /> : <CheckCircle2 size={14} />}
+            {isAddingCell ? (t('data.saving') || '录入中...') : (t('newCellEntry.batchImport') || '一键导入')}
+            {totalRows > 0 && !isAddingCell && <span className="text-blue-100">({totalRows})</span>}
+          </button>
+        </div>
+      </div>
+
+      {/* Import results — at bottom of card */}
+      {batchResults && batchResults.length > 0 && (
+        <div className="mt-3 px-3 py-2 bg-muted/50 border border-border rounded-lg text-xs">
+          <div className="flex items-center gap-2 mb-1.5 font-medium text-foreground">
+            <CheckCircle2 size={14} />
+            <span>{t('newCellEntry.importResults') || '导入结果'}</span>
+            <button onClick={() => setBatchResults(null)} className="ml-auto text-muted-foreground hover:text-foreground">✕</button>
+          </div>
+          {batchResults.map((r, i) => (
+            <div key={i} className={`flex items-center gap-1.5 py-0.5 ${r.success ? 'text-green-600' : 'text-red-600'}`}>
+              <span className="font-medium">#{r.index + 1}</span>
+              <span>[{r.networkType}]</span>
+              <span>{r.cellName}({r.siteId}_{r.cellId})</span>
+              <span className="ml-auto">{r.success ? '✓' : '✗'} {r.message}</span>
+            </div>
+          ))}
+          <div className="mt-1.5 pt-1.5 border-t border-border text-muted-foreground">
+            {t('newCellEntry.importSummary', {
+              total: batchResults.length,
+              success: batchResults.filter(r => r.success).length,
+              fail: batchResults.filter(r => !r.success).length,
+            }) || `共 ${batchResults.length} 条，成功 ${batchResults.filter(r => r.success).length} 条，失败 ${batchResults.filter(r => !r.success).length} 条`}
+          </div>
+        </div>
+      )}
+    </>
+  )
+
+  // ---- If expanded, render as fixed overlay ----
+  if (expanded) {
+    return (
+      <div className="fixed inset-0 z-[9999] bg-black/40 backdrop-blur-sm flex items-start justify-center pt-8 overflow-y-auto" style={{ paddingLeft: '280px' }}>
+        <div className={`bg-card rounded-xl shadow-2xl border border-border w-full mx-6 overflow-hidden ${disabled ? 'opacity-50 pointer-events-none' : ''}`} style={{ maxWidth: 'min(90vw, 1400px)' }}>
+          <div className="p-5">
+            {renderCardContent()}
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  // ---- Normal inline mode ----
+  return (
+    <div className={`bg-card p-3 rounded-lg border border-border -mt-6 ${disabled ? 'opacity-50 pointer-events-none' : ''}`}>
+      {renderCardContent()}
+    </div>
+  )
+}
+
+interface CellRow {
+  id: string
+  managedElementId: string
+  siteId: string
+  cellId: string
+  cellName: string
+  mcc: string
+  mnc: string
+  longitude: string
+  latitude: string
+  azimuth: string
+  frequency: string
+  ssbFrequency: string
+  cellCoverType: number
 }

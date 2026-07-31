@@ -29,8 +29,16 @@ if sys.platform == "win32":
         pass  # 如果无法配置，忽略错误
 
 
+# 日志捕获缓冲区（用于工参更新时实时推送后端输出到前端）
+_print_buffer: List[str] = []
+_print_buffer_active = False
+
 def safe_print(msg: str):
     """安全打印函数，处理可能的编码错误"""
+    # 如果日志捕获激活，同时写入缓冲区
+    global _print_buffer, _print_buffer_active
+    if _print_buffer_active:
+        _print_buffer.append(msg)
     try:
         print(msg)
     except UnicodeEncodeError:
@@ -64,6 +72,24 @@ class DataService:
             # 异步扫描，不阻塞启动
             import threading
             threading.Thread(target=self._scan_uploads_directory, daemon=True).start()
+
+    def start_capture_logs(self):
+        """激活日志捕获，开始收集 safe_print 输出到缓冲区"""
+        global _print_buffer, _print_buffer_active
+        _print_buffer = []
+        _print_buffer_active = True
+
+    def get_and_clear_captured_logs(self) -> List[str]:
+        """获取并清空捕获的日志"""
+        global _print_buffer, _print_buffer_active
+        logs = list(_print_buffer)
+        _print_buffer = []
+        return logs
+
+    def stop_capture_logs(self):
+        """停用日志捕获"""
+        global _print_buffer_active
+        _print_buffer_active = False
 
     def _ensure_directories(self):
         """确保必要的目录存在"""
@@ -746,6 +772,684 @@ class DataService:
             "savedToOriginal": saved_to_original,
         }
 
+    def add_cell_to_full_params(
+        self,
+        network_type: str,
+        managed_element_id: str,
+        site_id: str,
+        cell_id: str,
+        cell_name: str,
+        longitude: float,
+        latitude: float,
+        azimuth: float,
+        frequency: Optional[str] = None,
+        ssb_frequency: Optional[str] = None,
+        cell_cover_type: int = 1,
+        user_id: int = 1,
+    ) -> Dict[str, Any]:
+        """向全量工参文件追加一个新小区（新站录入）
+
+        同时写入 Excel 文件（LTE/NR Project Parameters sheet）和 SQLite 数据库。
+        """
+        # 1. 定位全量工参文件
+        full_params_id = None
+        full_params_info = None
+        for _id, _info in self.index.items():
+            if _info.get("fileType") == "full_params":
+                full_params_id = _id
+                full_params_info = _info
+                break
+
+        if not full_params_id or not full_params_info:
+            raise ValueError("未找到全量工参文件，请先上传全量工参")
+
+        safe_print(f"[DataService] 新站录入: 定位到全量工参 {full_params_id}")
+
+        data_dir = settings.DATA_DIR / full_params_id
+        excel_path = data_dir / "original.xlsx"
+        if not excel_path.exists():
+            raise ValueError(f"全量工参原始文件不存在: {excel_path}")
+
+        # 查重：在追加 Excel 之前检查该小区是否已存在，避免重复导入
+        if self._sector_exists(full_params_id, site_id, cell_id):
+            safe_print(f"[DataService] 小区已存在，跳过导入: {site_id}_{cell_id}")
+            return {
+                "success": True,
+                "message": f"小区 {cell_name} 已存在，已在 Excel 中更新覆盖",
+                "cellId": f"{site_id}_{cell_id}",
+            }
+
+        # 2. 确定 sheet 名
+        sheet_name = f"{network_type.upper()} Project Parameters"
+
+        # 3. 加载 Excel 并构建 col_map
+        try:
+            wb = openpyxl.load_workbook(excel_path)
+        except Exception as e:
+            raise ValueError(f"无法打开 Excel 文件: {e}")
+
+        if sheet_name not in wb.sheetnames:
+            wb.close()
+            raise ValueError(f"Sheet 不存在: {sheet_name}，可用 Sheets: {wb.sheetnames}")
+
+        ws = wb[sheet_name]
+        header_row = list(ws.iter_rows(min_row=1, max_row=1, values_only=True))[0]
+
+        col_map = {}
+        for idx, col_val in enumerate(header_row):
+            if col_val:
+                clean_name = str(col_val).strip().split("\n")[0].strip()
+                col_map[clean_name] = idx + 1
+
+        safe_print(f"[DataService] col_map: {col_map}")
+
+        # 4. 准备新行数据
+        max_col = max(col_map.values()) if col_map else 0
+        new_row = [None] * max_col
+
+        # 字段映射：用户输入 → Excel 列名
+        if network_type.upper() == "LTE":
+            field_map = {
+                "管理网元ID": managed_element_id,
+                "eNodeB标识": site_id,
+                "小区标识": cell_id,
+                "小区名称": cell_name,
+                "天线方向角": azimuth,
+                "下行链路的中心载频": frequency or "",
+                "小区覆盖类型": cell_cover_type,
+            }
+        else:  # NR
+            field_map = {
+                "管理网元ID": managed_element_id,
+                "gNodeB标识": site_id,
+                "小区标识": cell_id,
+                "小区名称": cell_name,
+                "天线方向角": azimuth,
+                "填写SSB频点": ssb_frequency or "",
+                "小区覆盖类型": cell_cover_type,
+            }
+
+        # 经纬度写入多种可能列名（值保持一致）
+        lon_candidates = ["小区经度", "基站经度", "经度"]
+        lat_candidates = ["小区纬度", "基站纬度", "纬度"]
+        for lon_col in lon_candidates:
+            if lon_col in col_map:
+                new_row[col_map[lon_col] - 1] = longitude
+        for lat_col in lat_candidates:
+            if lat_col in col_map:
+                new_row[col_map[lat_col] - 1] = latitude
+
+        # 写入映射字段
+        for excel_col, val in field_map.items():
+            if excel_col in col_map:
+                new_row[col_map[excel_col] - 1] = val
+
+        # 5. 固定字段设置（遵循 _append_new_row 的模式）
+        if "系统制式" in col_map:
+            new_row[col_map["系统制式"] - 1] = 1
+        if "第一分组" in col_map:
+            new_row[col_map["第一分组"] - 1] = "电信中兴"
+        if "是否现网" in col_map:
+            new_row[col_map["是否现网"] - 1] = "是"
+        if "第二分组" in col_map:
+            second_group = self._determine_second_group(cell_name)
+            if second_group:
+                new_row[col_map["第二分组"] - 1] = second_group
+
+        # 生成 CGI 列
+        if "CGI" in col_map:
+            try:
+                _site_int = str(int(float(str(site_id)))) if site_id else ""
+                _cell_int = str(int(float(str(cell_id)))) if cell_id else ""
+                cgi = f"{_site_int}-{_cell_int}"
+                new_row[col_map["CGI"] - 1] = cgi
+            except (ValueError, TypeError):
+                pass
+
+        # 6. 追加行并保存 Excel
+        ws.append(new_row)
+        wb.save(excel_path)
+        wb.close()
+        safe_print(f"[DataService] Excel 已保存: {excel_path}")
+
+        # 7. 同步保存到 uploads 目录的副本
+        upload_path = settings.UPLOAD_DIR / f"{full_params_id}.xlsx"
+        if upload_path.exists():
+            try:
+                import shutil
+                shutil.copy2(excel_path, upload_path)
+                safe_print(f"[DataService] 已同步更新 uploads 副本")
+            except Exception as e:
+                safe_print(f"[DataService] 同步 uploads 副本失败 (非致命): {e}")
+
+        # 8. 写入 SQLite
+        sector_id_str = f"{site_id}_{cell_id}"
+        full_name = full_params_info.get("name", "unknown")
+        network_type_val = network_type.upper()
+        try:
+            db = SessionLocal()
+            try:
+                # 查重：按 workbook_id + sector_id 检查是否已存在
+                existing_sector = db.query(Sector).filter(
+                    Sector.workbook_id == full_params_id,
+                    Sector.sector_id == sector_id_str,
+                ).first()
+                if existing_sector:
+                    safe_print(f"[DataService] 小区已存在于 SQLite，跳过写入: {sector_id_str}")
+                    db.close()
+                    return {
+                        "success": True,
+                        "message": f"小区 {cell_name} 已存在，已在 Excel 中更新覆盖",
+                        "cellId": sector_id_str,
+                    }
+
+                # 查询或创建 Site
+                site = db.query(Site).filter(
+                    Site.workbook_id == full_params_id,
+                    Site.site_id == str(site_id),
+                ).first()
+
+                if not site:
+                    site = Site(
+                        workbook_id=full_params_id,
+                        user_id=user_id,
+                        site_id=str(site_id),
+                        name=cell_name,
+                        longitude=longitude,
+                        latitude=latitude,
+                        network_type=network_type_val,
+                        managed_element_id=managed_element_id,
+                    )
+                    db.add(site)
+                    db.flush()
+                    safe_print(f"[DataService] 新建 Site: {site_id}")
+
+                # 写入 Sector
+                freq_val = frequency or ssb_frequency or None
+                if freq_val is not None:
+                    try:
+                        freq_val = float(freq_val)
+                    except (ValueError, TypeError):
+                        pass
+
+                sector = Sector(
+                    site_id_fk=site.id,
+                    workbook_id=full_params_id,
+                    user_id=user_id,
+                    sector_id=sector_id_str,
+                    name=cell_name,
+                    longitude=longitude,
+                    latitude=latitude,
+                    azimuth=azimuth,
+                    frequency=freq_val,
+                    cell_cover_type=cell_cover_type,
+                    first_group="电信中兴",
+                )
+                db.add(sector)
+                db.commit()
+                safe_print(f"[DataService] SQLite 写入成功: Site={site_id}, Sector={sector_id_str}")
+            except Exception as e:
+                db.rollback()
+                safe_print(f"[DataService] SQLite 写入失败 (非致命): {e}")
+            finally:
+                db.close()
+        except Exception as e:
+            safe_print(f"[DataService] SQLite 连接失败 (非致命): {e}")
+
+        # 9. 更新 index.json 中的文件大小
+        excel_size = excel_path.stat().st_size
+        if full_params_id in self.index:
+            self.index[full_params_id]["size"] = excel_size
+        self._save_index()
+
+        safe_print(f"[DataService] 新站录入完成: {cell_name} ({network_type_val})")
+
+        return {
+            "success": True,
+            "message": f"新增小区 {cell_name} 成功",
+            "cellId": sector_id_str,
+        }
+
+    def batch_add_cells_to_full_params(self, cells: List[Dict]) -> Dict[str, Any]:
+        """高性能批量向全量工参追加多个小区（一次性文件操作 + 单事务 SQLite）
+
+        Excel 文件只打开/保存各 1 次，SQLite 使用单事务批量写入。
+        cells: [{ networkType, managedElementId, siteId, cellId, cellName, longitude, latitude,
+                  azimuth, frequency, ssbFrequency, cellCoverType, userId }]
+        返回: { results: [...], total: N, successCount: N }
+        """
+        # 1. 定位全量工参文件（只需定位一次）
+        full_params_id = None
+        full_params_info = None
+        for _id, _info in self.index.items():
+            if _info.get("fileType") == "full_params":
+                full_params_id = _id
+                full_params_info = _info
+                break
+
+        if not full_params_id or not full_params_info:
+            raise ValueError("未找到全量工参文件，请先上传全量工参")
+
+        data_dir = settings.DATA_DIR / full_params_id
+        excel_path = data_dir / "original.xlsx"
+        if not excel_path.exists():
+            raise ValueError(f"全量工参原始文件不存在: {excel_path}")
+
+        upload_path = settings.UPLOAD_DIR / f"{full_params_id}.xlsx"
+
+        safe_print(f"[DataService] 批量新站录入: {len(cells)} 条, 文件 {full_params_id}")
+
+        # 2. 一次性加载 Excel，获取 LTE/NR 两个 sheet
+        try:
+            wb = openpyxl.load_workbook(excel_path)
+        except Exception as e:
+            raise ValueError(f"无法打开 Excel 文件: {e}")
+
+        results = [None] * len(cells)  # pre-allocate to preserve original order
+
+        # 预加载数据库中已有小区 key（site_id + cell_id），用于在 Excel 追加前查重
+        # 兼容两种 Sector.sector_id 存储格式：纯 cellId 与 siteId_cellId
+        existing_cell_keys = set()
+        try:
+            db = SessionLocal()
+            try:
+                rows = db.query(Site.site_id, Sector.sector_id).join(
+                    Sector, Sector.site_id_fk == Site.id
+                ).filter(Site.workbook_id == full_params_id).all()
+                for site_id_val, sector_id_val in rows:
+                    sid = str(sector_id_val)
+                    if "_" not in sid:
+                        # 纯 cellId 格式（如 '61'）：key = siteId_cellId
+                        existing_cell_keys.add(f"{site_id_val}_{sid}")
+                    else:
+                        # 组合格式（如 '541379_61'）：取最后一段作为 cellId
+                        cell_part = sid.rsplit("_", 1)[-1]
+                        existing_cell_keys.add(f"{site_id_val}_{cell_part}")
+            finally:
+                db.close()
+        except Exception as e:
+            safe_print(f"[DataService] 预加载已有小区失败 (非致命): {e}")
+
+        # 过滤重复行：与数据库中已有 (site_id, cell_id) 相同的小区跳过
+        filtered_cells = []
+        skip_map = {}  # orig_idx -> 原因
+        for idx, cell in enumerate(cells):
+            site_id_val = str(cell.get("siteId", "")).strip()
+            cell_id_val = str(cell.get("cellId", "")).strip()
+            key = f"{site_id_val}_{cell_id_val}"
+            if key in existing_cell_keys:
+                skip_map[idx] = "已存在"
+                results[idx] = {
+                    "index": idx,
+                    "networkType": cell.get("networkType", "").upper(),
+                    "cellName": cell.get("cellName", ""),
+                    "siteId": site_id_val,
+                    "cellId": cell_id_val,
+                    "success": True,
+                    "message": f"小区 {cell.get('cellName', '')} 已存在，已在 Excel 中更新覆盖",
+                }
+            else:
+                filtered_cells.append((idx, cell))
+                existing_cell_keys.add(key)  # 批内后续行查重
+
+        # 按网络类型分组（基于过滤后的行）
+        lte_cells = [(i, c) for i, c in filtered_cells if c.get("networkType", "").upper() == "LTE"]
+        nr_cells = [(i, c) for i, c in filtered_cells if c.get("networkType", "").upper() == "NR"]
+        skipped_count = len(skip_map)
+        if skipped_count:
+            safe_print(f"[DataService] 批量新站录入: 跳过 {skipped_count} 条已存在小区")
+
+        def _build_row_data(cell: Dict, ws) -> tuple:
+            """构建单行数据并写入 ws，返回 (row_data_list, col_map)"""
+            header_row = list(ws.iter_rows(min_row=1, max_row=1, values_only=True))[0]
+            col_map = {}
+            for idx, col_val in enumerate(header_row):
+                if col_val:
+                    clean_name = str(col_val).strip().split("\n")[0].strip()
+                    col_map[clean_name] = idx + 1
+
+            max_col = max(col_map.values()) if col_map else 0
+            new_row = [None] * max_col
+
+            network_type = cell.get("networkType", "").upper()
+            managed_element_id = cell.get("managedElementId", "")
+            site_id = cell.get("siteId", "")
+            cell_id = cell.get("cellId", "")
+            cell_name = cell.get("cellName", "")
+            longitude = cell.get("longitude", 0)
+            latitude = cell.get("latitude", 0)
+            azimuth = cell.get("azimuth", 0)
+            frequency = cell.get("frequency") or ""
+            ssb_frequency = cell.get("ssbFrequency") or ""
+            cell_cover_type = cell.get("cellCoverType", 1)
+            mcc = cell.get("mcc") or ""
+            mnc = cell.get("mnc") or ""
+
+            # 字段映射
+            if network_type == "LTE":
+                field_map = {
+                    "管理网元ID": managed_element_id,
+                    "eNodeB标识": site_id,
+                    "小区标识": cell_id,
+                    "小区名称": cell_name,
+                    "天线方向角": azimuth,
+                    "下行链路的中心载频": frequency,
+                    "小区覆盖类型": cell_cover_type,
+                }
+            else:
+                field_map = {
+                    "管理网元ID": managed_element_id,
+                    "gNodeB标识": site_id,
+                    "小区标识": cell_id,
+                    "小区名称": cell_name,
+                    "天线方向角": azimuth,
+                    "填写SSB频点": ssb_frequency,
+                    "小区覆盖类型": cell_cover_type,
+                }
+
+            # 经纬度
+            lon_candidates = ["小区经度", "基站经度", "经度"]
+            lat_candidates = ["小区纬度", "基站纬度", "纬度"]
+            for lon_col in lon_candidates:
+                if lon_col in col_map:
+                    new_row[col_map[lon_col] - 1] = longitude
+            for lat_col in lat_candidates:
+                if lat_col in col_map:
+                    new_row[col_map[lat_col] - 1] = latitude
+
+            for excel_col, val in field_map.items():
+                if excel_col in col_map:
+                    new_row[col_map[excel_col] - 1] = val
+
+            # MCC
+            if mcc and "移动国家码" in col_map:
+                new_row[col_map["移动国家码"] - 1] = mcc
+            # MNC
+            if mnc and "移动网络码" in col_map:
+                new_row[col_map["移动网络码"] - 1] = mnc
+
+            # 固定字段
+            if "系统制式" in col_map:
+                new_row[col_map["系统制式"] - 1] = 1
+            if "第一分组" in col_map:
+                new_row[col_map["第一分组"] - 1] = "电信中兴"
+            if "是否现网" in col_map:
+                new_row[col_map["是否现网"] - 1] = "是"
+            if "第二分组" in col_map:
+                second_group = self._determine_second_group(cell_name)
+                if second_group:
+                    new_row[col_map["第二分组"] - 1] = second_group
+            if "CGI" in col_map:
+                try:
+                    _site_int = str(int(float(str(site_id)))) if site_id else ""
+                    _cell_int = str(int(float(str(cell_id)))) if cell_id else ""
+                    new_row[col_map["CGI"] - 1] = f"{_site_int}-{_cell_int}"
+                except (ValueError, TypeError):
+                    pass
+
+            return new_row
+
+        # 3. 逐行准备数据，写入 sheet 缓存
+        try:
+            # 处理 LTE
+            if lte_cells:
+                sheet_name = "LTE Project Parameters"
+                if sheet_name not in wb.sheetnames:
+                    raise ValueError(f"Sheet 不存在: {sheet_name}")
+                lte_ws = wb[sheet_name]
+                for orig_idx, cell in lte_cells:
+                    row_data = _build_row_data(cell, lte_ws)
+                    lte_ws.append(row_data)
+                    results[orig_idx] = {
+                        "index": orig_idx,
+                        "networkType": "LTE",
+                        "cellName": cell.get("cellName", ""),
+                        "siteId": cell.get("siteId", ""),
+                        "cellId": cell.get("cellId", ""),
+                        "success": True,
+                        "message": "Excel 行已准备",
+                    }
+
+            # 处理 NR
+            if nr_cells:
+                sheet_name = "NR Project Parameters"
+                if sheet_name not in wb.sheetnames:
+                    raise ValueError(f"Sheet 不存在: {sheet_name}")
+                nr_ws = wb[sheet_name]
+                for orig_idx, cell in nr_cells:
+                    row_data = _build_row_data(cell, nr_ws)
+                    nr_ws.append(row_data)
+                    results[orig_idx] = {
+                        "index": orig_idx,
+                        "networkType": "NR",
+                        "cellName": cell.get("cellName", ""),
+                        "siteId": cell.get("siteId", ""),
+                        "cellId": cell.get("cellId", ""),
+                        "success": True,
+                        "message": "Excel 行已准备",
+                    }
+        except Exception as e:
+            wb.close()
+            raise
+
+        # 4. 一次性保存 Excel
+        try:
+            wb.save(excel_path)
+            safe_print(f"[DataService] 批量 Excel 已保存: {excel_path}")
+        except Exception as e:
+            wb.close()
+            raise ValueError(f"保存 Excel 失败: {e}")
+        wb.close()
+
+        # 5. 同步到 uploads 副本（一次性）
+        if upload_path.exists():
+            try:
+                shutil.copy2(excel_path, upload_path)
+                safe_print(f"[DataService] 已同步更新 uploads 副本")
+            except Exception as e:
+                safe_print(f"[DataService] 同步 uploads 副本失败 (非致命): {e}")
+
+        # 6. 批量写入 SQLite（单事务，仅写入过滤后的非重复行）
+        sqlite_success = True
+        sqlite_error_msg = ""
+        try:
+            db = SessionLocal()
+            try:
+                for idx, cell in filtered_cells:
+                    network_type = cell.get("networkType", "").upper()
+                    site_id = cell.get("siteId", "")
+                    cell_id = cell.get("cellId", "")
+                    cell_name = cell.get("cellName", "")
+                    longitude = cell.get("longitude", 0)
+                    latitude = cell.get("latitude", 0)
+                    azimuth = cell.get("azimuth", 0)
+                    frequency = cell.get("frequency") or cell.get("ssbFrequency")
+                    cell_cover_type = cell.get("cellCoverType", 1)
+                    managed_element_id = cell.get("managedElementId", "")
+                    user_id = cell.get("userId", 1)
+
+                    sector_id_str = f"{site_id}_{cell_id}"
+
+                    mcc = cell.get("mcc") or ""
+                    mnc = cell.get("mnc") or ""
+
+                    # 查找或创建 Site
+                    site = db.query(Site).filter(
+                        Site.workbook_id == full_params_id,
+                        Site.site_id == str(site_id),
+                    ).first()
+                    if not site:
+                        site = Site(
+                            workbook_id=full_params_id,
+                            user_id=user_id,
+                            site_id=str(site_id),
+                            name=cell_name,
+                            longitude=longitude,
+                            latitude=latitude,
+                            network_type=network_type,
+                            managed_element_id=managed_element_id,
+                            mcc=mcc or None,
+                            mnc=mnc or None,
+                        )
+                        db.add(site)
+                        db.flush()
+
+                    # 写入 Sector
+                    freq_val = frequency
+                    if freq_val is not None:
+                        try:
+                            freq_val = float(freq_val)
+                        except (ValueError, TypeError):
+                            pass
+
+                    sector = Sector(
+                        site_id_fk=site.id,
+                        workbook_id=full_params_id,
+                        user_id=user_id,
+                        sector_id=sector_id_str,
+                        name=cell_name,
+                        longitude=longitude,
+                        latitude=latitude,
+                        azimuth=azimuth,
+                        frequency=freq_val,
+                        cell_cover_type=cell_cover_type,
+                        first_group="电信中兴",
+                        mcc=mcc or None,
+                        mnc=mnc or None,
+                    )
+                    db.add(sector)
+                    db.flush()
+                    results[idx]["message"] = f"新增小区 {cell_name} 成功"
+
+                # 单事务提交
+                db.commit()
+                safe_print(f"[DataService] SQLite 批量写入完毕: {len(filtered_cells)} 条")
+            except Exception as e:
+                db.rollback()
+                import traceback
+                traceback.print_exc()
+                safe_print(f"[DataService] SQLite 批量写入失败: {e}")
+                sqlite_success = False
+                sqlite_error_msg = str(e)[:200]
+            finally:
+                db.close()
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            safe_print(f"[DataService] SQLite 连接失败: {e}")
+            sqlite_success = False
+            sqlite_error_msg = str(e)[:200]
+
+        if not sqlite_success:
+            # SQLite 失败但 Excel 已写入 —— 仍可报告具体错误
+            for r in results:
+                r["success"] = False
+                if "数据库写入失败" not in r.get("message", ""):
+                    r["message"] = f"数据库写入失败: {sqlite_error_msg}"
+            success_count = 0
+            safe_print(f"[DataService] 批量新站录入 SQLite 失败: {sqlite_error_msg}")
+        else:
+            success_count = sum(1 for r in results if r.get("success"))
+            safe_print(f"[DataService] 批量新站录入完成: {success_count}/{len(results)} 成功")
+
+        # 7. 更新 index
+        try:
+            excel_size = excel_path.stat().st_size
+            if full_params_id in self.index:
+                self.index[full_params_id]["size"] = excel_size
+            self._save_index()
+        except Exception as e:
+            safe_print(f"[DataService] 更新索引失败 (非致命): {e}")
+
+        return {
+            "success": sqlite_success,
+            "message": f"共 {len(results)} 条，成功 {success_count} 条，失败 {len(results) - success_count} 条",
+            "results": results,
+            "total": len(results),
+            "successCount": success_count,
+        }
+
+    def _sector_exists(self, workbook_id: str, site_id: Any, cell_id: Any) -> bool:
+        """检查指定工参文件下 (site_id, cell_id) 的小区是否已存在
+
+        兼容两种 Sector.sector_id 存储格式：
+        - 全量工参解析写入的纯小区标识（如 '61'）
+        - 新站录入写入的组合格式（如 '541379_61'）
+        通过 join sites 表按真实 site_id 匹配，避免纯 cellId 跨站碰撞。
+        """
+        if not site_id or not cell_id:
+            return False
+        db = SessionLocal()
+        try:
+            row = db.query(Sector.id).join(
+                Site, Sector.site_id_fk == Site.id
+            ).filter(
+                Site.workbook_id == workbook_id,
+                Site.site_id == str(site_id),
+                Sector.sector_id.in_([str(cell_id), f"{str(site_id)}_{str(cell_id)}"]),
+            ).first()
+            return row is not None
+        except Exception as e:
+            safe_print(f"[DataService] _sector_exists 查询失败: {e}")
+            return False
+        finally:
+            db.close()
+
+    def check_cell_duplicates(self, cgi_list: List[str]) -> Dict[str, Any]:
+        """批量检查 CGI (siteId_cellId) 是否已存在于数据库
+
+        通过 join sites 表按 site_id + cell_id 匹配 Sector.sector_id，
+        兼容纯 cellId 与 siteId_cellId 两种存储格式。
+
+        返回: { duplicates: ["siteId_cellId", ...], exists: {"key": True, ...} }
+        """
+        if not cgi_list:
+            return {"duplicates": [], "exists": {}}
+
+        # 定位全量工参文件
+        full_params_id = None
+        for _id, _info in self.index.items():
+            if _info.get("fileType") == "full_params":
+                full_params_id = _id
+                break
+        if not full_params_id:
+            safe_print("[DataService] 查重失败: 未找到全量工参文件")
+            return {"duplicates": [], "exists": {}}
+
+        # 解析 cgi_list（siteId_cellId）为 (site_id, cell_id) 对
+        pairs = []
+        for cgi in cgi_list:
+            if "_" not in str(cgi):
+                continue
+            parts = str(cgi).split("_", 1)
+            pairs.append((parts[0], parts[1]))
+
+        db = SessionLocal()
+        try:
+            duplicate_set = set()
+            exists = {k: False for k in cgi_list}
+            for site_id, cell_id in pairs:
+                row = db.query(Sector.id).join(
+                    Site, Sector.site_id_fk == Site.id
+                ).filter(
+                    Site.workbook_id == full_params_id,
+                    Site.site_id == str(site_id),
+                    Sector.sector_id.in_([str(cell_id), f"{str(site_id)}_{str(cell_id)}"]),
+                ).first()
+                cgi = f"{site_id}_{cell_id}"
+                if row is not None:
+                    duplicate_set.add(cgi)
+                    exists[cgi] = True
+            return {
+                "duplicates": list(duplicate_set),
+                "exists": exists,
+            }
+        except Exception as e:
+            safe_print(f"[DataService] 查重失败: {e}")
+            return {"duplicates": [], "exists": {}}
+        finally:
+            db.close()
+
     def _update_sheet(self, ws, current_dir: Path, network_type: str):
         """更新单个Sheet"""
         # 1. 确定列索引映射
@@ -798,6 +1502,8 @@ class DataService:
                 "eNBId": "eNodeB标识",
                 "mcc": "移动国家码",
                 "mnc": "移动网络码",
+                "longitude": "经度",
+                "latitude": "纬度",
             }
         else:  # NR
             key_cols = ["移动国家码", "移动网络码", "gNodeB标识", "小区标识"]
@@ -818,6 +1524,8 @@ class DataService:
                 "gNBId": "gNodeB标识",
                 "mcc": "移动国家码",
                 "mnc": "移动网络码",
+                "longitude": "经度",
+                "latitude": "纬度",
                 # 注意：coverageType 不在 field_map 中，而是单独处理
             }
 
@@ -829,54 +1537,58 @@ class DataService:
             )
             return
 
-        # 遍历数据行（从第4行开始）
-        # 注意：openpyxl的row是1-based
-        for row in ws.iter_rows(min_row=4):
-            # 获取Key值
+        # 遍历数据行（从第4行开始）—— 一次性读取，避免多次 iter_rows
+        all_rows = list(ws.iter_rows(min_row=4))
+        cgi_list = [None] * len(all_rows)
+        mnc_list = [None] * len(all_rows)  # NR共享小区判断：记录每行的MNC值
+
+        for row_idx, row in enumerate(all_rows):
             try:
                 if network_type == "LTE":
                     enb_id = self._get_cell_val(row, col_map, "eNodeB标识")
                     cell_id = self._get_cell_val(row, col_map, "小区标识")
                     if enb_id is not None and cell_id is not None:
-                        key = f"{enb_id}_{cell_id}"
+                        def _sheet_norm_int(v):
+                            try:
+                                return str(int(float(v)))
+                            except (ValueError, OverflowError):
+                                return v
+                        key = f"{_sheet_norm_int(enb_id)}_{_sheet_norm_int(cell_id)}"
                         existing_keys.add(key)
 
-                        # 检查是否有更新
                         if key in updates:
-                            # 获取当前基站名称（更新前）
-                            current_bs_name = None
-                            if "基站名称" in col_map:
-                                current_bs_name = self._get_cell_val(row, col_map, "基站名称")
-
-                            self._apply_row_update(
-                                row, col_map, updates[key], field_map, network_type
-                            )
-                            # 标记为已处理（以便后续追加未处理的）
+                            self._apply_row_update(row, col_map, updates[key], field_map, network_type)
                             updates[key]["_processed"] = True
-
-                            # 设置"是否现网"列：能匹配到现网工参，填"是"
-                            if "是否现网" in col_map:
-                                row[col_map["是否现网"] - 1].value = "是"
-
-                            # 检查基站名称是否被更新
-                            new_bs_name = None
-                            if "基站名称" in col_map:
-                                new_bs_name = self._get_cell_val(row, col_map, "基站名称")
-
-                            if current_bs_name != new_bs_name:
-                                safe_print(f"[LTE UPDATE] 基站名称已更新: Key={key}, 原值={current_bs_name}, 新值={new_bs_name}")
                         else:
-                            # 设置"是否现网"列：未匹配到现网工参，填"否"
-                            if "是否现网" in col_map:
-                                row[col_map["是否现网"] - 1].value = "否"
-
-                            # LTE Key未找到的调试日志（只记录前几条，避免日志过多）
                             missing_count = getattr(self, '_lte_missing_key_count', 0) + 1
                             self._lte_missing_key_count = missing_count
                             if missing_count <= 10:
                                 safe_print(f"[LTE DEBUG] Key未在现网工参中找到: {key}")
                             elif missing_count == 11:
                                 safe_print(f"[LTE DEBUG] ...（后续未匹配的Key将不再打印）")
+
+                        # 同一遍历内完成 LTE 后处理
+                        if "CGI" in col_map:
+                            row[col_map["CGI"] - 1].value = f"{enb_id}-{cell_id}"
+                        if "是否共享" in col_map and key in updates:
+                            plmn = updates[key].get("plmnIdList")
+                            row[col_map["是否共享"] - 1].value = "是" if (plmn and isinstance(plmn, str) and ";" in plmn) else "否"
+                        if "第一分组" in col_map and key in updates:
+                            row[col_map["第一分组"] - 1].value = "电信中兴"
+                        # "是否现网"在"第一分组"设置之后处理，确保"第一分组"已更新
+                        first_group = self._get_cell_val(row, col_map, "第一分组")
+                        if first_group == "电信中兴" and key in updates:
+                            if "是否现网" in col_map:
+                                row[col_map["是否现网"] - 1].value = "是"
+                        if "第二分组" in col_map:
+                            # 只有当前为空值时才更新
+                            current_second = row[col_map["第二分组"] - 1].value
+                            if not current_second or (isinstance(current_second, str) and not current_second.strip()):
+                                cell_name = self._get_cell_val(row, col_map, "小区名称")
+                                if cell_name:
+                                    second_group = self._determine_second_group(cell_name)
+                                    if second_group:
+                                        row[col_map["第二分组"] - 1].value = second_group
 
                 else:  # NR
                     mcc = self._get_cell_val(row, col_map, "移动国家码")
@@ -885,205 +1597,261 @@ class DataService:
                     cell_id = self._get_cell_val(row, col_map, "小区标识")
 
                     if all(v is not None for v in [mcc, mnc, gnb_id, cell_id]):
-                        key = f"{mcc}_{mnc}_{gnb_id}_{cell_id}"
+                        # 与 _load_current_params 中 _safe_int_str 保持一致的归一化
+                        def _sheet_norm(v):
+                            try:
+                                return str(int(float(v)))
+                            except (ValueError, OverflowError):
+                                return v
+                        key = f"{_sheet_norm(mcc)}_{_sheet_norm(mnc)}_{_sheet_norm(gnb_id)}_{_sheet_norm(cell_id)}"
                         existing_keys.add(key)
 
                         if key in updates:
                             try:
-                                # 获取当前基站名称（更新前）
-                                current_bs_name = None
-                                if "基站名称" in col_map:
-                                    current_bs_name = self._get_cell_val(row, col_map, "基站名称")
-
-                                self._apply_row_update(
-                                    row, col_map, updates[key], field_map, network_type
-                                )
+                                self._apply_row_update(row, col_map, updates[key], field_map, network_type)
                                 updates[key]["_processed"] = True
-
-                                # 设置"是否现网"列：能匹配到现网工参，填"是"
-                                if "是否现网" in col_map:
-                                    row[col_map["是否现网"] - 1].value = "是"
-
-                                # 检查基站名称是否被更新
-                                new_bs_name = None
-                                if "基站名称" in col_map:
-                                    new_bs_name = self._get_cell_val(row, col_map, "基站名称")
-
-                                if current_bs_name != new_bs_name:
-                                    safe_print(f"[UPDATE] 基站名称已更新: Key={key}, 原值={current_bs_name}, 新值={new_bs_name}")
                             except Exception as e:
                                 import traceback
-
                                 safe_print(f"[DataService] 更新行失败 (Key={key}): {e}")
                                 traceback.print_exc()
                         else:
-                            # 设置"是否现网"列：未匹配到现网工参，填"否"
-                            if "是否现网" in col_map:
-                                row[col_map["是否现网"] - 1].value = "否"
-
-                            # Key未找到的调试日志（采样打印，避免日志过多）
                             safe_print(f"[DEBUG] Key未在现网工参中找到: {key}")
+
+                        # 同一遍历内完成 NR 后处理
+                        # 规范化 CGI：确保 gNBId-cellLocalId 用整数表示，避免浮点数问题
+                        def _norm_id_str(v):
+                            v = v.strip()
+                            try:
+                                return str(int(float(v)))
+                            except (ValueError, OverflowError):
+                                return v
+                        cgi = f"{_norm_id_str(gnb_id)}-{_norm_id_str(cell_id)}"
+                        cgi_list[row_idx] = cgi
+                        mnc_list[row_idx] = mnc  # 记录MNC，用于后续"是否共享"判断
+                        if "CGI" in col_map:
+                            row[col_map["CGI"] - 1].value = cgi
+                        if "跟踪区码" in col_map and key in updates:
+                            tac = updates[key].get("tac")
+                            if tac is not None and not pd.isna(tac):
+                                row[col_map["跟踪区码"] - 1].value = tac
+                        if "第一分组" in col_map and key in updates:
+                            row[col_map["第一分组"] - 1].value = "电信中兴"
+                        # "是否现网"在"第一分组"设置之后处理，确保"第一分组"已更新
+                        first_group = self._get_cell_val(row, col_map, "第一分组")
+                        if first_group == "电信中兴" and key in updates:
+                            if "是否现网" in col_map:
+                                row[col_map["是否现网"] - 1].value = "是"
+                        if "第二分组" in col_map:
+                            # 只有当前为空值时才更新
+                            current_second = row[col_map["第二分组"] - 1].value
+                            if not current_second or (isinstance(current_second, str) and not current_second.strip()):
+                                cell_name = self._get_cell_val(row, col_map, "小区名称")
+                                if cell_name:
+                                    second_group = self._determine_second_group(cell_name)
+                                    if second_group:
+                                        row[col_map["第二分组"] - 1].value = second_group
+                        if key not in updates and "gNodeBLength" in col_map:
+                            ssb = self._get_cell_val(row, col_map, "填写SSB频点")
+                            if ssb:
+                                try:
+                                    if 900 <= float(ssb) <= 955:
+                                        row[col_map["gNodeBLength"] - 1].value = 8
+                                except ValueError:
+                                    if "-" in ssb:
+                                        try:
+                                            parts = ssb.split("-")
+                                            if float(parts[0].strip()) <= 955 and float(parts[1].strip()) >= 900:
+                                                row[col_map["gNodeBLength"] - 1].value = 8
+                                        except ValueError:
+                                            pass
+                                    elif ssb == "900-955":
+                                        row[col_map["gNodeBLength"] - 1].value = 8
+
             except Exception as e:
                 import traceback
-
                 safe_print(f"[DataService] 处理行时发生错误: {e}")
                 traceback.print_exc()
                 continue
 
-        # 5. 追加新行
+        # 5. 追加新行（安全守卫: key 已存在于 Excel 中的不追加）
         new_rows_count = 0
         for key, data in updates.items():
             if not data.get("_processed"):
-                # 准备新行数据
-                self._append_new_row(ws, col_map, data, field_map, network_type)
-                new_rows_count += 1
-
-        # 4. 处理特殊列：CGI、跟踪区码、是否共享、第一分组、gNodeBLength
-        # 收集所有行数据用于处理（包括新追加的行）
-        all_rows = list(ws.iter_rows(min_row=4))
-
-        if network_type == "NR":
-            # NR网络处理
-            # 4.1 生成CGI列
-            cgi_list = []
-            for row in all_rows:
-                gnb_id = self._get_cell_val(row, col_map, "gNodeB标识")
-                cell_id = self._get_cell_val(row, col_map, "小区标识")
-                if gnb_id and cell_id:
-                    cgi = f"{gnb_id}-{cell_id}"
-                    cgi_list.append(cgi)
-                    # 更新CGI列
-                    if "CGI" in col_map:
-                        row[col_map["CGI"] - 1].value = cgi
+                if key not in existing_keys:
+                    self._append_new_row(ws, col_map, data, field_map, network_type)
+                    new_rows_count += 1
                 else:
-                    cgi_list.append(None)
+                    safe_print(f"[DataService] 安全守卫: 防止重复追加 key={key}")
 
-            # 4.2 更新跟踪区码（从现网工参获取）
-            for i, row in enumerate(all_rows):
-                mcc = self._get_cell_val(row, col_map, "移动国家码")
-                mnc = self._get_cell_val(row, col_map, "移动网络码")
-                gnb_id = self._get_cell_val(row, col_map, "gNodeB标识")
-                cell_id = self._get_cell_val(row, col_map, "小区标识")
-                if all([mcc, mnc, gnb_id, cell_id]):
-                    key = f"{mcc}_{mnc}_{gnb_id}_{cell_id}"
-                    if key in updates and "tac" in updates[key]:
-                        tac = updates[key]["tac"]
-                        if (
-                            "跟踪区码" in col_map
-                            and tac is not None
-                            and not pd.isna(tac)
-                        ):
-                            row[col_map["跟踪区码"] - 1].value = tac
+        # NR 是否共享列：暂不处理，等追加行和去重完成后统一计算
 
-            # 4.3 计算是否共享列
-            if "是否共享" in col_map:
-                # 统计CGI出现次数
-                cgi_counts = {}
-                for cgi in cgi_list:
-                    if cgi:
-                        cgi_counts[cgi] = cgi_counts.get(cgi, 0) + 1
-                # 更新是否共享列
-                for i, row in enumerate(all_rows):
-                    cgi = cgi_list[i]
-                    if cgi:
-                        count = cgi_counts.get(cgi, 0)
-                        row[col_map["是否共享"] - 1].value = (
-                            "是" if count == 2 else "否"
-                        )
+        # CGI 后处理：同 CGI 的小区拉齐关键字段
+        # 对于"CGI"列相同的行，如果某行指定字段为空的，则从同 CGI 的非空行中复制
+        # 适用于 LTE 和 NR，覆盖：基站经度、基站纬度、小区经度、小区纬度、天线方向角、天线挂高、小区覆盖类型
+        if "CGI" in col_map:
+            cgi_idx = col_map["CGI"] - 1
 
-            # 4.4 更新第一分组列：在现网工参能找到的小区都填为"电信中兴"
-            for i, row in enumerate(all_rows):
-                mcc = self._get_cell_val(row, col_map, "移动国家码")
-                mnc = self._get_cell_val(row, col_map, "移动网络码")
-                gnb_id = self._get_cell_val(row, col_map, "gNodeB标识")
-                cell_id = self._get_cell_val(row, col_map, "小区标识")
-                if all([mcc, mnc, gnb_id, cell_id]):
-                    key = f"{mcc}_{mnc}_{gnb_id}_{cell_id}"
-                    if key in updates:
-                        if "第一分组" in col_map:
-                            row[col_map["第一分组"] - 1].value = "电信中兴"
+            # 确定需要继承的字段列名（仅匹配自身列名，不跨列模糊匹配）
+            field_column_names = {
+                "基站经度": ["基站经度"],
+                "基站纬度": ["基站纬度"],
+                "小区经度": ["小区经度"],
+                "小区纬度": ["小区纬度"],
+                "天线方向角": ["天线方向角", "方位角"],
+                "天线挂高": ["天线挂高", "挂高"],
+                "小区覆盖类型": ["小区覆盖类型"],
+            }
 
-            # 4.5 处理gNodeBLength：未找到的小区根据填写SSB频点判断
-            for i, row in enumerate(all_rows):
-                mcc = self._get_cell_val(row, col_map, "移动国家码")
-                mnc = self._get_cell_val(row, col_map, "移动网络码")
-                gnb_id = self._get_cell_val(row, col_map, "gNodeB标识")
-                cell_id = self._get_cell_val(row, col_map, "小区标识")
-                if all([mcc, mnc, gnb_id, cell_id]):
-                    key = f"{mcc}_{mnc}_{gnb_id}_{cell_id}"
-                    if key not in updates:
-                        # 未找到的小区，根据填写SSB频点判断
-                        ssb_frequency = self._get_cell_val(row, col_map, "填写SSB频点")
-                        if ssb_frequency:
-                            try:
-                                # 尝试将SSB频点转换为数值，处理范围判断
-                                # 情况1: 直接是数值，如 "925"
-                                ssb_num = float(ssb_frequency)
-                                if 900 <= ssb_num <= 955:
-                                    if "gNodeBLength" in col_map:
-                                        row[col_map["gNodeBLength"] - 1].value = 8
-                                # 情况2: 范围字符串，如 "900-955"
-                            except ValueError:
-                                # 如果转换失败，检查是否是范围字符串
-                                if "-" in ssb_frequency:
-                                    try:
-                                        # 提取范围的上下限
-                                        lower, upper = ssb_frequency.split("-")
-                                        lower_num = float(lower.strip())
-                                        upper_num = float(upper.strip())
-                                        # 检查范围是否与900-955有重叠
-                                        if lower_num <= 955 and upper_num >= 900:
-                                            if "gNodeBLength" in col_map:
-                                                row[
-                                                    col_map["gNodeBLength"] - 1
-                                                ].value = 8
-                                    except ValueError:
-                                        # 如果范围解析失败，跳过
-                                        pass
-                                # 检查是否完全匹配 "900-955"
-                                elif ssb_frequency == "900-955":
-                                    if "gNodeBLength" in col_map:
-                                        row[col_map["gNodeBLength"] - 1].value = 8
+            # 字段回填时的备用来源（如 小区经度/小区纬度 可从对应基站列取值）
+            field_fallbacks = {
+                "小区经度": "基站经度",
+                "小区纬度": "基站纬度",
+            }
 
-        else:  # LTE网络
-            # LTE网络处理
-            # 4.1 生成CGI列
-            for row in all_rows:
-                enb_id = self._get_cell_val(row, col_map, "eNodeB标识")
-                cell_id = self._get_cell_val(row, col_map, "小区标识")
-                if enb_id and cell_id:
-                    cgi = f"{enb_id}-{cell_id}"
-                    # 更新CGI列
-                    if "CGI" in col_map:
-                        row[col_map["CGI"] - 1].value = cgi
+            # 同时获取备用来源的列索引（用于构建 CGI 映射时收集数据）
+            all_field_names = list(field_column_names.keys()) + [v for v in field_fallbacks.values() if v not in field_column_names]
 
-            # 4.2 更新是否共享列（基于plmnIdList）
-            for i, row in enumerate(all_rows):
-                enb_id = self._get_cell_val(row, col_map, "eNodeB标识")
-                cell_id = self._get_cell_val(row, col_map, "小区标识")
-                if enb_id and cell_id:
-                    key = f"{enb_id}_{cell_id}"
-                    if key in updates and "plmnIdList" in updates[key]:
-                        plmn_id_list = updates[key]["plmnIdList"]
-                        if "是否共享" in col_map:
-                            if (
-                                plmn_id_list
-                                and isinstance(plmn_id_list, str)
-                                and ";" in plmn_id_list
-                            ):
-                                row[col_map["是否共享"] - 1].value = "是"
-                            else:
-                                row[col_map["是否共享"] - 1].value = "否"
+            # 解析实际列名
+            field_indices = {}  # display_name -> column index
+            for display_name, candidates in field_column_names.items():
+                for candidate in candidates:
+                    if candidate in col_map:
+                        field_indices[display_name] = col_map[candidate] - 1
+                        break
 
-            # 4.3 更新第一分组列：在现网工参能找到的小区都填为"电信中兴"
-            for i, row in enumerate(all_rows):
-                enb_id = self._get_cell_val(row, col_map, "eNodeB标识")
-                cell_id = self._get_cell_val(row, col_map, "小区标识")
-                if enb_id and cell_id:
-                    key = f"{enb_id}_{cell_id}"
-                    if key in updates:
-                        if "第一分组" in col_map:
-                            row[col_map["第一分组"] - 1].value = "电信中兴"
+            # 备用来源的列索引
+            fallback_indices = {}
+            for fb_name in field_fallbacks.values():
+                if fb_name in col_map:
+                    fallback_indices[fb_name] = col_map[fb_name] - 1
+
+            if field_indices:
+                # 重新读取所有行（包括追加的新行，ws.append 后需要重新读）
+                all_rows_final = list(ws.iter_rows(min_row=4))
+
+                # 构建 CGI -> 已知字段值映射（包含备用来源字段）
+                cgi_field_map = {}
+                for row in all_rows_final:
+                    cgi_val = row[cgi_idx].value
+                    if cgi_val is not None:
+                        cgi_str = str(cgi_val).strip()
+                        if cgi_str:
+                            if cgi_str not in cgi_field_map:
+                                cgi_field_map[cgi_str] = {}
+                            # 收集主字段值
+                            for display_name, col_idx in field_indices.items():
+                                if display_name not in cgi_field_map[cgi_str] or cgi_field_map[cgi_str][display_name] is None:
+                                    val = row[col_idx].value
+                                    if val is not None:
+                                        try:
+                                            if not (isinstance(val, float) and np.isnan(val)):
+                                                if not pd.isna(val):
+                                                    cgi_field_map[cgi_str][display_name] = val
+                                        except (TypeError, ValueError):
+                                            cgi_field_map[cgi_str][display_name] = val
+                            # 收集备用来源字段值
+                            for fb_name, fb_idx in fallback_indices.items():
+                                if fb_name not in cgi_field_map[cgi_str] or cgi_field_map[cgi_str][fb_name] is None:
+                                    val = row[fb_idx].value
+                                    if val is not None:
+                                        try:
+                                            if not (isinstance(val, float) and np.isnan(val)):
+                                                if not pd.isna(val):
+                                                    cgi_field_map[cgi_str][fb_name] = val
+                                        except (TypeError, ValueError):
+                                            cgi_field_map[cgi_str][fb_name] = val
+
+                # 回填空字段（含备用来源回退）
+                fill_counts = {dn: 0 for dn in field_indices}
+                for row in all_rows_final:
+                    cgi_val = row[cgi_idx].value
+                    if cgi_val is not None:
+                        cgi_str = str(cgi_val).strip()
+                        if cgi_str and cgi_str in cgi_field_map:
+                            known_vals = cgi_field_map[cgi_str]
+                            for display_name, col_idx in field_indices.items():
+                                known_val = known_vals.get(display_name)
+                                # 如果主字段无已知值，尝试备用来源
+                                if known_val is None and display_name in field_fallbacks:
+                                    fb_name = field_fallbacks[display_name]
+                                    known_val = known_vals.get(fb_name)
+                                if known_val is not None:
+                                    cur_val = row[col_idx].value
+                                    if cur_val is None or (isinstance(cur_val, float) and np.isnan(cur_val)):
+                                        try:
+                                            if pd.isna(cur_val):
+                                                row[col_idx].value = known_val
+                                                fill_counts[display_name] += 1
+                                        except (TypeError, ValueError):
+                                            row[col_idx].value = known_val
+                                            fill_counts[display_name] += 1
+
+                # 打印统计
+                total_filled = sum(fill_counts.values())
+                if total_filled > 0:
+                    detail = ", ".join(f"{k}={v}" for k, v in fill_counts.items() if v > 0)
+                    safe_print(f"[DataService] CGI字段回填: {detail} (总计 {total_filled} 行)")
+
+        # 最终去重：按 NR/LTE 唯一键移除工作表中重复的行
+        # 从后往前遍历，保留最早出现的行（即原始Excel中的数据优先）
+        dedup_count = 0
+        all_rows_final = list(ws.iter_rows(min_row=4))
+        seen_keys = set()
+        for ri in range(len(all_rows_final) - 1, -1, -1):
+            row = all_rows_final[ri]
+            if network_type == "NR":
+                mcc_v = self._get_cell_val(row, col_map, "移动国家码")
+                mnc_v = self._get_cell_val(row, col_map, "移动网络码")
+                gnb_v = self._get_cell_val(row, col_map, "gNodeB标识")
+                cell_v = self._get_cell_val(row, col_map, "小区标识")
+                if all(v is not None for v in [mcc_v, mnc_v, gnb_v, cell_v]):
+                    def _norm_key(v):
+                        try: return str(int(float(v)))
+                        except: return v
+                    k = f"{_norm_key(mcc_v)}_{_norm_key(mnc_v)}_{_norm_key(gnb_v)}_{_norm_key(cell_v)}"
+                else:
+                    continue
+            else:  # LTE
+                enb_v = self._get_cell_val(row, col_map, "eNodeB标识")
+                cell_v = self._get_cell_val(row, col_map, "小区标识")
+                if enb_v is not None and cell_v is not None:
+                    try: k = f"{str(int(float(enb_v)))}_{str(int(float(cell_v)))}"
+                    except: continue
+                else:
+                    continue
+            if k in seen_keys:
+                ws.delete_rows(4 + ri)  # min_row=4, will auto shift
+                dedup_count += 1
+            else:
+                seen_keys.add(k)
+
+        if dedup_count > 0:
+            safe_print(f"[DataService] 最终去重完成: 移除了 {dedup_count} 条重复行")
+
+        # NR 是否共享列：按 CGI 分组，同 CGI 内 MNC 同时存在"01"和"11"为共享小区
+        # 必须在所有字段更新、追加行和去重之后最后执行
+        if network_type == "NR" and "是否共享" in col_map and "CGI" in col_map and "移动网络码" in col_map:
+            # 去重后重新读取所有行，确保索引正确
+            all_rows_final = list(ws.iter_rows(min_row=4))
+            cgi_mnc_map = {}
+            cgi_idx = col_map["CGI"] - 1
+            mnc_col_idx = col_map["移动网络码"] - 1
+            shared_col_idx = col_map["是否共享"] - 1
+            for row in all_rows_final:
+                cgi_val = row[cgi_idx].value
+                mnc_val = row[mnc_col_idx].value
+                if cgi_val is not None and mnc_val is not None:
+                    cgi_str = str(cgi_val).strip()
+                    mnc_str = str(mnc_val).strip()
+                    if cgi_str not in cgi_mnc_map:
+                        cgi_mnc_map[cgi_str] = set()
+                    cgi_mnc_map[cgi_str].add(mnc_str)
+            for row in all_rows_final:
+                cgi_val = row[cgi_idx].value
+                if cgi_val is not None:
+                    cgi_str = str(cgi_val).strip()
+                    mnc_set = cgi_mnc_map.get(cgi_str, set())
+                    row[shared_col_idx].value = "是" if ("01" in mnc_set and "11" in mnc_set) else "否"
 
         safe_print(
             f"[DataService] 更新完成: 现有匹配 {len(existing_keys)} 行, 追加新行 {new_rows_count} 行"
@@ -1353,16 +2121,26 @@ class DataService:
                 # LTE CGI: eNodeB标识-小区标识
                 enb_id = data.get("eNBId")
                 cell_id = data.get("cellLocalId")
-                if enb_id and cell_id:
-                    cgi = f"{enb_id}-{cell_id}"
-                    new_row[col_map["CGI"] - 1] = cgi
+                if enb_id is not None and cell_id is not None:
+                    try:
+                        if not pd.isna(enb_id) and not pd.isna(cell_id):
+                            cgi = f"{enb_id}-{cell_id}"
+                            new_row[col_map["CGI"] - 1] = cgi
+                    except (TypeError, ValueError):
+                        pass
             else:  # NR
-                # NR CGI: gNodeB标识-小区标识
+                # NR CGI: gNodeB标识-小区标识（安全转换浮点数为整数）
                 gnb_id = data.get("gNBId")
                 cell_id = data.get("cellLocalId")
-                if gnb_id and cell_id:
-                    cgi = f"{gnb_id}-{cell_id}"
-                    new_row[col_map["CGI"] - 1] = cgi
+                if gnb_id is not None and cell_id is not None:
+                    try:
+                        if not pd.isna(gnb_id) and not pd.isna(cell_id):
+                            gnb_id_int = str(int(float(gnb_id))) if isinstance(gnb_id, (float, int, np.floating, np.integer)) else str(gnb_id).strip()
+                            cell_id_int = str(int(float(cell_id))) if isinstance(cell_id, (float, int, np.floating, np.integer)) else str(cell_id).strip()
+                            cgi = f"{gnb_id_int}-{cell_id_int}"
+                            new_row[col_map["CGI"] - 1] = cgi
+                    except (TypeError, ValueError):
+                        pass
 
         # 更新跟踪区码
         if "跟踪区码" in col_map:
@@ -1389,15 +2167,50 @@ class DataService:
                 else:
                     new_row[col_map["是否共享"] - 1] = "否"
             else:  # NR
-                # NR: 先设置默认值，后续会根据CGI出现次数更新
-                new_row[col_map["是否共享"] - 1] = "否"
+                # NR: 暂不设置，待去重完成后按CGI分组统一判断
+                pass
 
         # 设置"是否现网"列：追加的新行来自现网工参，填"是"
         if "是否现网" in col_map:
             new_row[col_map["是否现网"] - 1] = "是"
 
+        # 设置第一分组：追加的行都填"电信中兴"
+        if "第一分组" in col_map:
+            new_row[col_map["第一分组"] - 1] = "电信中兴"
+
+        # 设置第二分组：根据小区名称模糊匹配地区关键字
+        if "第二分组" in col_map:
+            # 只有当前为空值时才更新（追加的新行默认 None）
+            current_second = new_row[col_map["第二分组"] - 1]
+            if not current_second or (isinstance(current_second, str) and not current_second.strip()):
+                cell_name = data.get("cellName") or data.get("CellName", "")
+                if cell_name:
+                    second_group = self._determine_second_group(str(cell_name))
+                    if second_group:
+                        new_row[col_map["第二分组"] - 1] = second_group
+
         # 将新行添加到工作表
         ws.append(new_row)
+
+    def _determine_second_group(self, cell_name: str) -> Optional[str]:
+        """根据小区名称模糊匹配地区关键字，确定第二分组
+
+        匹配规则：
+        - 在小区名称中依次查找：市区、东源、龙川、紫金、连平、和平
+        - 返回在字符串中出现位置最左边（index 最小）的关键字
+        - 若无匹配返回 None
+        """
+        keywords = ["市区", "东源", "龙川", "紫金", "连平", "和平"]
+        best_match = None
+        best_pos = len(cell_name)
+
+        for kw in keywords:
+            pos = cell_name.find(kw)
+            if pos != -1 and pos < best_pos:
+                best_pos = pos
+                best_match = kw
+
+        return best_match
 
     def _load_current_params(
         self, current_dir: Path, network_type: str
@@ -1496,56 +2309,172 @@ class DataService:
                         f"[DataService] CSV文件 {file_path.name} 中没有 coverageType 列"
                     )
 
-                for _, row in df.iterrows():
-                    item = row.to_dict()
+                # ===== 向量化处理 PLMN =====
+                # 注意：部分CSV（如LTE_ITBBU）自带 mcc/mnc 列且为 int64 类型，
+                # 直接赋值字符串会崩溃，需先转为 object 类型
+                if "plmn" in df.columns:
+                    plmn_mask = df["plmn"].notna()
+                    if plmn_mask.any():
+                        # 确保 mcc/mnc 列可接受字符串赋值
+                        for col in ["mcc", "mnc"]:
+                            if col in df.columns and df[col].dtype in ("int64", "float64"):
+                                df[col] = df[col].astype(object)
+                        plmn_split = df.loc[plmn_mask, "plmn"].astype(str).str.split(
+                            "-", n=1, expand=True
+                        )
+                        df.loc[plmn_mask, "mcc"] = plmn_split[0].str.strip()
+                        df.loc[plmn_mask, "mnc"] = (
+                            plmn_split[1].str.strip()
+                            if plmn_split.shape[1] > 1
+                            else ""
+                        )
+                if "mcc" not in df.columns:
+                    df["mcc"] = ""
+                if "mnc" not in df.columns:
+                    df["mnc"] = ""
 
-                    # 处理PLMN分解
-                    if "plmn" in item and pd.notna(item["plmn"]):
-                        plmn_parts = str(item["plmn"]).split("-")
-                        if len(plmn_parts) >= 2:
-                            item["mcc"] = plmn_parts[0]
-                            item["mnc"] = plmn_parts[1]
-                        else:
-                            item["mcc"] = ""
-                            item["mnc"] = ""
-                    else:
-                        item["mcc"] = ""
-                        item["mnc"] = ""
+                # ===== 向量化 Key 生成 & 列名归一化 =====
+                if network_type == "LTE":
+                    # 列名归一化：尝试多种可能的列名变体（ITBBU 与 SDR 可能不同）
+                    enb_id_col = None
+                    for col in ["eNBId", "eNodeBId", "ENBId"]:
+                        if col in df.columns:
+                            enb_id_col = col
+                            break
+                    cell_local_id_col = None
+                    for col in ["cellLocalId", "CellId", "cellId"]:
+                        if col in df.columns:
+                            cell_local_id_col = col
+                            break
+                    if not enb_id_col or not cell_local_id_col:
+                        safe_print(f"[DataService] LTE CSV 缺少必要的 eNBId/cellLocalId 列，可用列: {list(df.columns)}，跳过此文件")
+                        continue
+                    # 归一化列名到标准名称，确保后续 data.get("eNBId") / field_map 能正确匹配
+                    col_rename = {}
+                    if enb_id_col != "eNBId":
+                        col_rename[enb_id_col] = "eNBId"
+                    if cell_local_id_col != "cellLocalId":
+                        col_rename[cell_local_id_col] = "cellLocalId"
+                    if col_rename:
+                        safe_print(f"[DataService] LTE 列名归一化: {col_rename}")
+                        df.rename(columns=col_rename, inplace=True)
+                    # 安全转为整数再转 str，避免 float64 → "12345.0" 与 Excel 的 "12345" 不匹配
+                    df["_key"] = (
+                        df["eNBId"].fillna("").astype(str).apply(lambda v: str(int(float(v))) if v.strip() else "")
+                        + "_" + df["cellLocalId"].fillna("").astype(str).apply(lambda v: str(int(float(v))) if v.strip() else "")
+                    )
+                else:
+                    # NR 列名归一化：尝试多种可能的列名变体
+                    gnb_id_col = None
+                    for col in ["gNBId", "gNodeBId", "GNBId"]:
+                        if col in df.columns:
+                            gnb_id_col = col
+                            break
+                    cell_local_id_col = None
+                    for col in ["cellLocalId", "CellId", "cellId"]:
+                        if col in df.columns:
+                            cell_local_id_col = col
+                            break
+                    if not gnb_id_col or not cell_local_id_col:
+                        safe_print(f"[DataService] NR CSV 缺少必要的 gNBId/cellLocalId 列，可用列: {list(df.columns)}，跳过此文件")
+                        continue
+                    # 归一化列名到标准名称
+                    col_rename = {}
+                    if gnb_id_col != "gNBId":
+                        col_rename[gnb_id_col] = "gNBId"
+                    if cell_local_id_col != "cellLocalId":
+                        col_rename[cell_local_id_col] = "cellLocalId"
+                    if col_rename:
+                        safe_print(f"[DataService] NR 列名归一化: {col_rename}")
+                        df.rename(columns=col_rename, inplace=True)
+                    # 安全转为整数再转 str，避免 float64 → "12345.0" 与 Excel 的 "12345" 不匹配
+                    def _safe_int_str(v):
+                        if v.strip():
+                            try:
+                                return str(int(float(v)))
+                            except (ValueError, OverflowError):
+                                pass
+                        return v
+                    df["_key"] = (
+                        df["mcc"].fillna("").astype(str).apply(_safe_int_str)
+                        + "_" + df["mnc"].fillna("").astype(str).apply(_safe_int_str)
+                        + "_" + df["gNBId"].fillna("").astype(str).apply(_safe_int_str)
+                        + "_" + df["cellLocalId"].fillna("").astype(str).apply(_safe_int_str)
+                    )
 
-                    # 生成Key
-                    key = None
-                    if network_type == "LTE":
-                        if "eNBId" in item and "cellLocalId" in item:
-                            key = f"{item['eNBId']}_{item['cellLocalId']}"
-                    else:
-                        if all(
-                            k in item for k in ["mcc", "mnc", "gNBId", "cellLocalId"]
-                        ):
-                            key = f"{item['mcc']}_{item['mnc']}_{item['gNBId']}_{item['cellLocalId']}"
+                # 过滤无效Key
+                df = df[df["_key"].str.strip() != ""].copy()
+                df = df[~df["_key"].str.match(r'^[_]+$')].copy()
+                if df.empty:
+                    continue
 
-                    if key:
-                        updates[key] = item
-                        # LTE 专用：检查基站名称字段（仅打印调试日志，不写入updates）
-                        if network_type == "LTE":
-                            bs_name_fields = ["eNBName", "UserLabel"]
-                        else:
-                            bs_name_fields = ["eNBName", "gNBName", "UserLabel", "dra_GNBName"]
+                # NR 重复小区处理：
+                # 1) "CGI"列（gNBId-cellLocalId）相同的小区，如果经度/纬度为空的，
+                #    则填充该CGI下已有非空的经度/纬度值
+                # 2) 按NR小区唯一键（mcc_mnc_gNBId_cellLocalId）去重
+                if network_type == "NR":
+                    # 确定经度/纬度列名
+                    lon_col_name = None
+                    lat_col_name = None
+                    for col in ["longitude", "Longitude", "LONGITUDE", "lon", "Lon"]:
+                        if col in df.columns:
+                            lon_col_name = col
+                            break
+                    for col in ["latitude", "Latitude", "LATITUDE", "lat", "Lat"]:
+                        if col in df.columns:
+                            lat_col_name = col
+                            break
 
-                        bs_values = {}
-                        has_bs_name = False
-                        for field in bs_name_fields:
-                            if field in item and pd.notna(item[field]) and str(item[field]).strip():
-                                bs_values[field] = item[field]
-                                has_bs_name = True
+                    if lon_col_name and lat_col_name:
+                        # 使用 CGI 列（gNBId-cellLocalId）分组填充空经纬度
+                        df["_cgi"] = df["gNBId"].fillna("").astype(str).apply(_safe_int_str) + "_" + df["cellLocalId"].fillna("").astype(str).apply(_safe_int_str)
+                        cgi_dup_mask = df.duplicated(subset=["_cgi"], keep=False)
+                        if cgi_dup_mask.any():
+                            for _cgi_val in df.loc[cgi_dup_mask, "_cgi"].unique():
+                                _mask = df["_cgi"] == _cgi_val
+                                _group = df.loc[_mask]
+                                # 找到该CGI组中非空的经纬度
+                                _lon_val = _group[lon_col_name].dropna()
+                                _lat_val = _group[lat_col_name].dropna()
+                                if not _lon_val.empty:
+                                    _known_lon = _lon_val.iloc[0]
+                                    df.loc[_mask & df[lon_col_name].isna(), lon_col_name] = _known_lon
+                                if not _lat_val.empty:
+                                    _known_lat = _lat_val.iloc[0]
+                                    df.loc[_mask & df[lat_col_name].isna(), lat_col_name] = _known_lat
+                        df.drop(columns=["_cgi"], inplace=True)
 
-                        if has_bs_name:
-                            # 只记录前3条有基站名称的数据作为样本（纯日志，不污染updates）
-                            if len(updates) <= 3:
-                                safe_print(f"[DEBUG] Key={key}, 基站名称字段: {bs_values}")
-                        elif network_type == "LTE":
-                            # LTE 专用：记录没有基站名称的数据（仅前5条，纯日志）
-                            if len(updates) <= 5:
-                                safe_print(f"[LTE WARN] Key={key} 没有任何基站名称字段")
+                    # 去重：相同 _key（NR唯一键）只保留第一条
+                    before = len(df)
+                    df = df.drop_duplicates(subset=["_key"], keep="first")
+                    after = len(df)
+                    if before != after:
+                        safe_print(f"[DataService] NR 去重: {before} -> {after} 行 (移除了 {before - after} 条重复)")
+
+                # ===== 一次性转 dict + 构建索引 =====
+                keys = df["_key"].tolist()
+                records = df.to_dict("records")
+                file_updates = dict(zip(keys, records))
+                updates.update(file_updates)
+
+                # 调试日志（采样前3条）
+                sample_keys = list(file_updates.keys())[:3]
+                for k in sample_keys:
+                    rec = file_updates[k]
+                    bs_fields = (
+                        ["eNBName", "UserLabel"]
+                        if network_type == "LTE"
+                        else ["eNBName", "gNBName", "UserLabel", "dra_GNBName"]
+                    )
+                    bs_vals = {
+                        f: rec[f]
+                        for f in bs_fields
+                        if f in rec and pd.notna(rec[f]) and str(rec[f]).strip()
+                    }
+                    if bs_vals:
+                        safe_print(f"[DEBUG] Key={k}, 基站名称字段: {bs_vals}")
+                    elif network_type == "LTE":
+                        safe_print(f"[LTE WARN] Key={k} 没有任何基站名称字段")
 
             except Exception as e:
                 import traceback
@@ -1554,6 +2483,78 @@ class DataService:
                 traceback.print_exc()
 
         safe_print(f"[DataService] 总共加载 {len(updates)} 条 {network_type} 现网数据")
+
+        # 跨文件 CGI 经纬度填充：NR 相同 CGI 的记录，如果经度/纬度为空的，
+        # 则从同 CGI 的非空记录中获取
+        if network_type == "NR" and updates:
+            def _norm_id(v):
+                if v is None:
+                    return ""
+                try:
+                    return str(int(float(v)))
+                except (ValueError, OverflowError, TypeError):
+                    return str(v).strip()
+
+            cgi_groups = {}
+            for key, data in updates.items():
+                gnb_id = _norm_id(data.get("gNBId"))
+                cell_local_id = _norm_id(data.get("cellLocalId"))
+                if gnb_id and cell_local_id:
+                    cgi = f"{gnb_id}_{cell_local_id}"
+                    if cgi not in cgi_groups:
+                        cgi_groups[cgi] = []
+                    cgi_groups[cgi].append(key)
+
+            filled_count = 0
+            for cgi, keys in cgi_groups.items():
+                if len(keys) <= 1:
+                    continue
+                # 找到该CGI组中非空的经纬度
+                known_lon = None
+                known_lat = None
+                for key in keys:
+                    data = updates[key]
+                    lon_val = data.get("longitude")
+                    lat_val = data.get("latitude")
+                    if known_lon is None and lon_val is not None and not (isinstance(lon_val, float) and np.isnan(lon_val)):
+                        try:
+                            if not pd.isna(lon_val):
+                                known_lon = lon_val
+                        except (TypeError, ValueError):
+                            pass
+                    if known_lat is None and lat_val is not None and not (isinstance(lat_val, float) and np.isnan(lat_val)):
+                        try:
+                            if not pd.isna(lat_val):
+                                known_lat = lat_val
+                        except (TypeError, ValueError):
+                            pass
+                # 填充同CGI内经纬度为空的记录
+                for key in keys:
+                    data = updates[key]
+                    if known_lon is not None:
+                        cur_lon = data.get("longitude")
+                        if cur_lon is None or (isinstance(cur_lon, float) and np.isnan(cur_lon)):
+                            try:
+                                if pd.isna(cur_lon):
+                                    updates[key]["longitude"] = known_lon
+                                    filled_count += 1
+                            except (TypeError, ValueError):
+                                updates[key]["longitude"] = known_lon
+                                filled_count += 1
+                    if known_lat is not None:
+                        cur_lat = data.get("latitude")
+                        if cur_lat is None or (isinstance(cur_lat, float) and np.isnan(cur_lat)):
+                            try:
+                                if pd.isna(cur_lat):
+                                    updates[key]["latitude"] = known_lat
+                                    filled_count += 1
+                            except (TypeError, ValueError):
+                                updates[key]["latitude"] = known_lat
+                                filled_count += 1
+
+            if filled_count > 0:
+                safe_print(f"[DataService] CGI经纬度填充: 总计填充了 {filled_count} 条记录的经纬度")
+
         return updates
 
     def _parse_current_params_dataframe(
@@ -2081,6 +3082,24 @@ class DataService:
                     safe_print(f"[DataService] 文件类型: {file_type}")
 
                     if file_type in ["full_params", "target_cells"]:
+                        # 新工参上传时，清除所有已有的应用标记（数据已替换，旧的已应用状态失效）
+                        if file_type == "full_params":
+                            try:
+                                from app.core.database import SessionLocal
+                                from app.models.database import TaskResult
+                                _db_reset = SessionLocal()
+                                try:
+                                    _count = _db_reset.query(TaskResult).filter(
+                                        TaskResult.is_applied == 1
+                                    ).update({"is_applied": 0})
+                                    _db_reset.commit()
+                                    if _count > 0:
+                                        safe_print(f"[DataService] 新工参上传，重置了 {_count} 个任务的已应用标记")
+                                finally:
+                                    _db_reset.close()
+                            except Exception as _reset_err:
+                                safe_print(f"[DataService] 重置已应用标记失败（非致命）: {_reset_err}")
+
                         files_to_delete = []
                         for existing_id, existing_data in self.index.items():
                             if existing_data.get("fileType") == file_type and existing_id != data_id:
@@ -2733,37 +3752,76 @@ class DataService:
 
         df = df.copy()
 
+        # 数值字段预清洗函数：去除不可见字符
+        # 涵盖：普通空格、\xa0、全角空格、零宽空格/连接符、LRM/RLM、BOM 等
+        def _clean_num_str(col_series):
+            """将列转为字符串并清理所有不可见空白/零宽字符"""
+            return col_series.astype(str).str.replace(
+                r'[\s\xa0　​-‏﻿]', '', regex=True
+            ).str.strip()
+
         # 1) 数值字段向量化转换
-        df['_lon'] = pd.to_numeric(df[mapped_columns["longitude"]], errors='coerce').fillna(0.0)
-        df['_lat'] = pd.to_numeric(df[mapped_columns["latitude"]], errors='coerce').fillna(0.0)
+        df['_lon'] = pd.to_numeric(
+            _clean_num_str(df[mapped_columns["longitude"]]), errors='coerce'
+        ).fillna(0.0)
+        df['_lat'] = pd.to_numeric(
+            _clean_num_str(df[mapped_columns["latitude"]]), errors='coerce'
+        ).fillna(0.0)
 
         if "azimuth" in mapped_columns:
-            df['_azimuth'] = pd.to_numeric(df[mapped_columns["azimuth"]], errors='coerce').fillna(0.0)
+            df['_azimuth'] = pd.to_numeric(
+                _clean_num_str(df[mapped_columns["azimuth"]]), errors='coerce'
+            ).fillna(0.0)
         else:
             df['_azimuth'] = 0.0
 
         if "height" in mapped_columns:
-            df['_height'] = pd.to_numeric(df[mapped_columns["height"]], errors='coerce').fillna(30.0)
+            df['_height'] = pd.to_numeric(
+                _clean_num_str(df[mapped_columns["height"]]), errors='coerce'
+            ).fillna(30.0)
         else:
             df['_height'] = 30.0
 
         if "pci" in mapped_columns:
-            df['_pci'] = pd.to_numeric(df[mapped_columns["pci"]], errors='coerce')
+            df['_pci'] = pd.to_numeric(
+                _clean_num_str(df[mapped_columns["pci"]]), errors='coerce'
+            )
 
         if network_type == "LTE" and "earfcn" in mapped_columns:
-            df['_earfcn'] = pd.to_numeric(df[mapped_columns["earfcn"]], errors='coerce')
+            df['_earfcn'] = pd.to_numeric(
+                _clean_num_str(df[mapped_columns["earfcn"]]), errors='coerce'
+            )
         elif network_type == "NR" and "ssb_frequency" in mapped_columns:
-            df['_ssb_frequency'] = pd.to_numeric(df[mapped_columns["ssb_frequency"]], errors='coerce')
+            df['_ssb_frequency'] = pd.to_numeric(
+                _clean_num_str(df[mapped_columns["ssb_frequency"]]), errors='coerce'
+            )
 
         _t_vecconv = _time.perf_counter()
+
+        # 零宽/不可见字符正则（.strip() 无法处理的）
+        _ZW = r'[​‌‍‎‏﻿]'
 
         # 2) 字符串字段清理
         site_id_col = mapped_columns["site_id"]
         df['_site_id_raw'] = df[site_id_col]
-        df['_site_id'] = df[site_id_col].astype(str).str.strip()
+
+        # 规范化 site_id：处理 Excel 中文本格式数字引起的混合类型问题
+        _site_raw = df[site_id_col]
+        df['_site_id'] = _site_raw.astype(str).str.strip().str.replace(_ZW, '', regex=True)
+        _site_num = pd.to_numeric(_site_raw, errors='coerce')
+        _num_valid = _site_num.notna()
+        _int_valued = pd.Series(False, index=_site_num.index)
+        if _num_valid.any():
+            _valid_series = _site_num[_num_valid]
+            _is_int_val = (_valid_series == _valid_series.astype(int))
+            _in_series = _site_raw[_num_valid]
+            _is_float_orig = _in_series.apply(lambda x: isinstance(x, float))
+            _int_valued[_num_valid] = _is_int_val.values & _is_float_orig.values
+        if _int_valued.any():
+            df.loc[_int_valued, '_site_id'] = _site_num[_int_valued].astype(int).astype(str)
 
         if "site_name" in mapped_columns:
-            df['_site_name'] = df[mapped_columns["site_name"]].astype(str).str.strip()
+            df['_site_name'] = df[mapped_columns["site_name"]].astype(str).str.strip().str.replace(_ZW, '', regex=True)
         else:
             df['_site_name'] = "Unknown"
 
@@ -2788,7 +3846,7 @@ class DataService:
             try:
                 return str(int(float(val)))
             except (ValueError, TypeError):
-                return str(val).strip()
+                return re.sub(_ZW, '', str(val).strip())
 
         df['_sector_id'] = df[mapped_columns["sector_id"]].apply(_convert_sector_id)
         _t_sectorid = _time.perf_counter()
@@ -2802,11 +3860,12 @@ class DataService:
         # 5) 从列中提取有效的小区名称（仅当列存在且值有效时）
         if "sector_name" in mapped_columns:
             sname_col = mapped_columns["sector_name"]
+            _sname_clean = df[sname_col].astype(str).str.strip().str.replace(_ZW, '', regex=True)
             valid_mask = (
                 df[sname_col].notna()
-                & ~df[sname_col].astype(str).str.strip().isin(['', '非必填', 'nan', 'None'])
+                & ~_sname_clean.isin(['', '非必填', 'nan', 'None'])
             )
-            df['_sector_name_col'] = df[sname_col].astype(str).str.strip().where(valid_mask)
+            df['_sector_name_col'] = _sname_clean.where(valid_mask)
         else:
             df['_sector_name_col'] = pd.NA
 
@@ -2815,11 +3874,35 @@ class DataService:
             df['_unique_key'] = df['_site_id'] + '_' + df['_sector_id']
         else:
             if "mcc" in mapped_columns:
-                df['_mcc'] = df[mapped_columns["mcc"]].astype(str).str.strip()
+                _mcc_raw = df[mapped_columns["mcc"]]
+                df['_mcc'] = _mcc_raw.astype(str).str.strip().str.replace(_ZW, '', regex=True)
+                _mcc_num = pd.to_numeric(_mcc_raw, errors='coerce')
+                _mcc_valid = _mcc_num.notna()
+                _mcc_int = pd.Series(False, index=_mcc_num.index)
+                if _mcc_valid.any():
+                    _mcc_nums = _mcc_num[_mcc_valid]
+                    _mcc_int_val = (_mcc_nums == _mcc_nums.astype(int))
+                    _mcc_orig = _mcc_raw[_mcc_valid]
+                    _mcc_is_float = _mcc_orig.apply(lambda x: isinstance(x, float))
+                    _mcc_int[_mcc_valid] = _mcc_int_val.values & _mcc_is_float.values
+                if _mcc_int.any():
+                    df.loc[_mcc_int, '_mcc'] = _mcc_num[_mcc_int].astype(int).astype(str)
             else:
                 df['_mcc'] = ''
             if "mnc" in mapped_columns:
-                df['_mnc'] = df[mapped_columns["mnc"]].astype(str).str.strip()
+                _mnc_raw = df[mapped_columns["mnc"]]
+                df['_mnc'] = _mnc_raw.astype(str).str.strip().str.replace(_ZW, '', regex=True)
+                _mnc_num = pd.to_numeric(_mnc_raw, errors='coerce')
+                _mnc_valid = _mnc_num.notna()
+                _mnc_int = pd.Series(False, index=_mnc_num.index)
+                if _mnc_valid.any():
+                    _mnc_nums = _mnc_num[_mnc_valid]
+                    _mnc_int_val = (_mnc_nums == _mnc_nums.astype(int))
+                    _mnc_orig = _mnc_raw[_mnc_valid]
+                    _mnc_is_float = _mnc_orig.apply(lambda x: isinstance(x, float))
+                    _mnc_int[_mnc_valid] = _mnc_int_val.values & _mnc_is_float.values
+                if _mnc_int.any():
+                    df.loc[_mnc_int, '_mnc'] = _mnc_num[_mnc_int].astype(int).astype(str)
             else:
                 df['_mnc'] = ''
             df['_unique_key'] = df['_mcc'] + '_' + df['_mnc'] + '_' + df['_site_id'] + '_' + df['_sector_id']
@@ -2851,24 +3934,26 @@ class DataService:
         df['_is_shared'] = None
         if "is_shared" in mapped_columns:
             col = mapped_columns["is_shared"]
-            valid = df[col].notna() & ~df[col].astype(str).str.strip().isin(['', 'nan', 'None'])
-            df.loc[valid, '_is_shared'] = df.loc[valid, col].astype(str).str.strip()
+            _is_clean = df[col].astype(str).str.strip().str.replace(_ZW, '', regex=True)
+            valid = df[col].notna() & ~_is_clean.isin(['', 'nan', 'None'])
+            df.loc[valid, '_is_shared'] = _is_clean[valid]
 
         df['_first_group'] = None
         if "first_group" in mapped_columns:
             col = mapped_columns["first_group"]
-            valid = df[col].notna() & ~df[col].astype(str).str.strip().isin(['', 'nan', 'None'])
-            df.loc[valid, '_first_group'] = df.loc[valid, col].astype(str).str.strip()
+            _fg_clean = df[col].astype(str).str.strip().str.replace(_ZW, '', regex=True)
+            valid = df[col].notna() & ~_fg_clean.isin(['', 'nan', 'None'])
+            df.loc[valid, '_first_group'] = _fg_clean[valid]
 
         # 9) TAC字段处理（数值转换）
         df['_tac'] = None
         if "tac" in mapped_columns:
             tac_col = mapped_columns["tac"]
-            tac_num = pd.to_numeric(df[tac_col], errors='coerce')
+            tac_num = pd.to_numeric(_clean_num_str(df[tac_col]), errors='coerce')
             numeric_mask = tac_num.notna()
             df.loc[numeric_mask, '_tac'] = tac_num.loc[numeric_mask].astype(int)
             non_num_non_null = df[tac_col].notna() & ~numeric_mask
-            df.loc[non_num_non_null, '_tac'] = df.loc[non_num_non_null, tac_col].astype(str).str.strip()
+            df.loc[non_num_non_null, '_tac'] = df.loc[non_num_non_null, tac_col].astype(str).str.strip().str.replace(_ZW, '', regex=True)
 
         # 10) 小区覆盖类型
         df['_cct'] = 1
@@ -4016,6 +5101,11 @@ class DataService:
                     data_copy["size"] = 0
                 if "uploadDate" not in data_copy:
                     data_copy["uploadDate"] = datetime.now().isoformat()
+                # 映射 index 字段到 Pydantic 模型字段
+                if "excel_synced" in data_copy:
+                    data_copy["excelSynced"] = data_copy.pop("excel_synced")
+                if "inplace_updated" in data_copy:
+                    data_copy["inplaceUpdated"] = data_copy.pop("inplace_updated")
                 # 创建DataItem实例
                 item = DataItem(**data_copy)
                 items.append(item)
@@ -4084,6 +5174,15 @@ class DataService:
 
         data_info = self.index[data_id]
 
+        # 处理中：直接返回索引中的基本信息（用于上传后轮询）
+        if data_info.get("status") in ("processing", "pending"):
+            return {
+                "id": data_id,
+                "name": data_info.get("name", ""),
+                "fileType": data_info.get("fileType"),
+                "status": data_info.get("status"),
+            }
+
         # 如果处理失败，返回错误信息而非 404
         if data_info.get("status") == "error":
             return {
@@ -4113,6 +5212,16 @@ class DataService:
             result = self.get_data_from_db(data_id)
             if result is not None:
                 return result
+
+            # 兜底：索引中状态为 ready 但 data.json 不存在（分块上传场景）
+            # 直接返回索引中的基本信息供前端轮询使用
+            if data_info.get("status") == "ready":
+                return {
+                    "id": data_id,
+                    "name": data_info.get("name", ""),
+                    "fileType": data_info.get("fileType"),
+                    "status": "ready",
+                }
 
             return None
         else:

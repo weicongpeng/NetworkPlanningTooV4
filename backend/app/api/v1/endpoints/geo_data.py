@@ -4,7 +4,7 @@
 
 import json
 from typing import Optional
-from fastapi import APIRouter, HTTPException, UploadFile, Form
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, Form
 from fastapi.concurrency import run_in_threadpool
 from pathlib import Path
 from datetime import datetime
@@ -12,6 +12,7 @@ from datetime import datetime
 from app.services.data_service import data_service
 from app.services.geo_data_service import GeoDataService
 from app.core.config import settings
+from app.core.security import require_data_import
 
 
 router = APIRouter()
@@ -21,7 +22,8 @@ geo_data_service = GeoDataService()
 @router.post("/upload/geo")
 async def upload_geo_data(
     file: Optional[UploadFile] = None,
-    file_path: Optional[str] = Form(None)
+    file_path: Optional[str] = Form(None),
+    current_user=Depends(require_data_import),
 ):
     """
     上传地理化数据文件

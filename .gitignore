@@ -1,5 +1,12 @@
 # 项目级 gitignore
 
+# AI 辅助工具元数据
+.omc/
+.claude/
+
+# 导出产物
+/exports/
+
 # 前端
 /frontend/node_modules/
 /frontend/dist/

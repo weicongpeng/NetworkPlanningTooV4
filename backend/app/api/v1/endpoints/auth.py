@@ -18,20 +18,6 @@ from app.services.auth_service import auth_service
 router = APIRouter()
 
 
-def _get_client_ip(request: Request) -> str:
-    """获取客户端真实IP，优先从 Cloudflare / X-Forwarded-For 头获取"""
-    # Cloudflare Tunnel 传递的客户端真实 IP（Cloudflare 专用，始终包含原始客户端 IP）
-    cf_ip = request.headers.get("CF-Connecting-IP")
-    if cf_ip:
-        return cf_ip.strip()
-    # 通用代理头（Nginx、Caddy 等）
-    forwarded = request.headers.get("X-Forwarded-For")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    # 直连 IP（在 Tunnel 下可能是网关地址）
-    return request.client.host if request.client else "unknown"
-
-
 @router.post("/register")
 async def register(data: UserCreate, request: Request, db: Session = Depends(get_db)):
     """注册新用户并自动登录"""
@@ -39,7 +25,7 @@ async def register(data: UserCreate, request: Request, db: Session = Depends(get
         db=db,
         username=data.username,
         password=data.password,
-        is_admin=data.is_admin,
+        is_admin=False,  # 安全：注册不允许自封管理员，管理员只能由管理员创建
         license_expiry=datetime.fromisoformat(data.license_expiry) if data.license_expiry else None,
         city=data.city,
         operator=data.operator,
@@ -48,12 +34,13 @@ async def register(data: UserCreate, request: Request, db: Session = Depends(get
         raise HTTPException(status_code=400, detail=error)
 
     token, jti = auth_service.create_access_token(user.id, user.username, user.is_admin)
-    auth_service.record_session(db, user.id, jti, _get_client_ip(request))
-    auth_service.update_last_login(db, user, _get_client_ip(request))
+    auth_service.record_session(db, user.id, jti, auth_service.get_client_ip(request))
+    auth_service.update_last_login(db, user, auth_service.get_client_ip(request))
 
     return {
         "success": True,
         "data": {
+            "token": token,
             "access_token": token,
             "token_type": "bearer",
             "user": user.to_dict(),
@@ -68,19 +55,20 @@ async def login(data: UserLogin, request: Request, db: Session = Depends(get_db)
     if error:
         raise HTTPException(status_code=401, detail=error)
 
-    client_ip = _get_client_ip(request)
+    client_ip = auth_service.get_client_ip(request)
 
-    # 结束其他IP的旧会话（确保一个账号只在一个IP登录）
-    ended_count = auth_service.end_other_ip_sessions(db, user.id, client_ip)
+    # 仅同类型客户端互踢（APP端不踢任何会话）
+    ended_count = auth_service.end_other_ip_sessions(db, user.id, client_ip, data.client_type)
 
     auth_service.update_last_login(db, user, client_ip)
 
     token, jti = auth_service.create_access_token(user.id, user.username, user.is_admin)
-    auth_service.record_session(db, user.id, jti, client_ip)
+    auth_service.record_session(db, user.id, jti, client_ip, data.client_type)
 
     result = {
         "success": True,
         "data": {
+            "token": token,
             "access_token": token,
             "token_type": "bearer",
             "user": user.to_dict(),
@@ -98,6 +86,28 @@ async def get_me(current_user: User = Depends(get_current_user)):
     return {
         "success": True,
         "data": current_user.to_dict(),
+    }
+
+
+@router.post("/ping")
+async def ping(
+    current_user: User = Depends(get_current_user),
+    jti: str | None = Depends(get_token_jti),
+    db: Session = Depends(get_db),
+):
+    """
+    心跳检测：更新当前会话的 last_activity，延长在线状态。
+    APP 和 PC 端应定时（4-5分钟）调用此接口。
+    同时清理过期会话，自动累加使用时长。
+    """
+    if jti:
+        auth_service.update_session_activity(db, jti)
+    # 定期清理过期会话，以 last_activity 作为离线时间累加使用时长
+    if jti:
+        auth_service.cleanup_stale_sessions(db, idle_minutes=6)
+    return {
+        "success": True,
+        "last_activity": datetime.now(timezone.utc).isoformat(),
     }
 
 

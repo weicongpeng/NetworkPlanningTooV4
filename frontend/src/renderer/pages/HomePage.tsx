@@ -15,7 +15,7 @@ export function HomePage() {
 
   return (
     <div className="p-8">
-      <h1 className="text-3xl font-bold mb-8">{t('home.title')} v2.0</h1>
+      <h1 className="text-base font-bold mb-8">{t('home.title')} v2.0</h1>
 
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
         {/* 功能卡片 */}
@@ -72,7 +72,7 @@ export function HomePage() {
 
       {/* 系统状态 */}
       <div className="mt-8 p-6 bg-card rounded-lg border border-border">
-        <h2 className="text-xl font-semibold mb-4">{t('home.systemStatus')}</h2>
+        <h2 className="text-base font-semibold mb-4">{t('home.systemStatus')}</h2>
         <div className="space-y-2">
           <StatusItem label={t('home.backendService') || '后端服务'} status="online" />
           <StatusItem label={t('home.database') || '数据库'} status="online" />
@@ -104,7 +104,7 @@ function FeatureCard({
       <div className={`mb-4 p-3 rounded-lg bg-muted w-fit group-hover:scale-110 transition-transform ${iconColor}`}>
         <Icon size={32} />
       </div>
-      <h3 className="text-lg font-semibold mb-2 group-hover:text-primary transition-colors">{title}</h3>
+      <h3 className="text-base font-semibold mb-2 group-hover:text-primary transition-colors">{title}</h3>
       <p className="text-muted-foreground text-sm">{description}</p>
     </a>
   )

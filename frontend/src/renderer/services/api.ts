@@ -297,25 +297,49 @@ export const licenseApi = {
   },
 }
 
-// ===== 分块上传辅助函数（解决 Cloudflare Tunnel 524 超时） =====
-// 大文件通过 Cloudflare 隧道上传速度约 37KB/s，120s 超时限制下只能上传 ~4.5MB
-// 分块上传将文件切分为 500KB 的小块，每块可在 15s 内完成上传
-const CHUNK_SIZE = 500 * 1024  // 500KB 每块（Cloudflare 隧道上传约 35KB/s，需确保每块在 15s 内完成）
-const MAX_CHUNK_RETRIES = 3    // 每块最多重试 3 次
+// ===== 优化后的分块上传（动态分块 + 串行 + 指数退避） =====
+//
+// 场景：大文件通过 Cloudflare Tunnel（约 37KB/s，120s 超时限制）上传
+// 生产环境后端单 worker（NPT_WORKERS=1），并行上传会导致请求排队超时（502），
+// 因此保持串行上传，配合动态分块大小和指数退避重试。
+// 优化策略：
+//   1. 动态分块大小：小文件(2MB) / 中等文件(1MB) / 大文件(512KB)
+//   2. 串行上传：避免单 worker 排队超时
+//   3. 指数退避重试：失败后 2s → 4s → 8s 等待
+//   4. 专用状态查询：从 /data/{id} 查询状态，替代全量列表轮询
+//
+const MAX_CHUNK_RETRIES = 3      // 每块最多重试 3 次
+
+/** 根据文件大小动态计算分块大小 */
+function calcChunkSize(fileSize: number): number {
+  if (fileSize < 3 * 1024 * 1024) {
+    return 2 * 1024 * 1024       // < 3MB → 2MB 分块（极小文件直接 1-2 块传完）
+  } else if (fileSize < 50 * 1024 * 1024) {
+    return 1024 * 1024            // 3-50MB → 1MB 分块（~27s/块，避免健康检测超时）
+  }
+  return 512 * 1024               // > 50MB → 512KB 分块（确保每块在 15s 内完成）
+}
+
+/** 指数退避延时 */
+function backoffDelay(retries: number): number {
+  return Math.pow(2, retries + 1) * 1000  // 2s → 4s → 8s
+}
 
 /**
- * 执行分块上传：start → chunk×N → complete → polling
+ * 执行串行分块上传：start → chunk×N（串行）→ complete → polling
+ * 串行避免后端单 worker（NPT_WORKERS=1）下并行请求排队导致 Cloudflare 502
  * @param file 要上传的文件
  * @param basePath 上传端点的基础路径（如 '/data/upload'）
- * @returns 与普通上传相同的完整响应
+ * @param fileType 可选的文件类型：'excel' | 'geo_data'
  */
 async function chunkedUpload(
   file: File,
   basePath: string,
-  fileType?: string  // 可选的文件类型：'excel' | 'geo_data'
+  fileType?: string
 ): Promise<any> {
-  const totalChunks = Math.ceil(file.size / CHUNK_SIZE)
-  console.log(`[chunkedUpload] 开始分块上传: ${file.name}, 大小: ${file.size}, 分块数: ${totalChunks}`)
+  const chunkSize = calcChunkSize(file.size)
+  const totalChunks = Math.ceil(file.size / chunkSize)
+  console.log(`[chunkedUpload] 开始分块上传: ${file.name}, 大小: ${file.size}, 分块大小: ${(chunkSize/1024).toFixed(0)}KB, 分块数: ${totalChunks}`)
 
   // 阶段1: 初始化上传会话
   const startForm = new FormData()
@@ -330,10 +354,10 @@ async function chunkedUpload(
   }
   console.log(`[chunkedUpload] 会话已创建: ${dataId}`)
 
-  // 阶段2: 逐块上传
+  // 阶段2: 串行上传分块（单 worker 后端 + Cloudflare Tunnel 需避免排队超时）
   for (let i = 0; i < totalChunks; i++) {
-    const start = i * CHUNK_SIZE
-    const end = Math.min(start + CHUNK_SIZE, file.size)
+    const start = i * chunkSize
+    const end = Math.min(start + chunkSize, file.size)
     const chunk = file.slice(start, end)
 
     let retries = 0
@@ -347,17 +371,17 @@ async function chunkedUpload(
 
         await uploadClient.post(`${basePath}/${dataId}/chunk`, chunkForm)
         success = true
-        console.log(`[chunkedUpload] 分块 ${i + 1}/${totalChunks} 上传完成 (${end - start} 字节)`)
+        console.log(`[chunkedUpload] 分块 ${i + 1}/${totalChunks} 完成 (${end - start} 字节)`)
       } catch (err) {
         retries++
-        console.warn(`[chunkedUpload] 分块 ${i + 1}/${totalChunks} 上传失败 (重试 ${retries}/${MAX_CHUNK_RETRIES}):`, err)
+        console.warn(`[chunkedUpload] 分块 ${i + 1}/${totalChunks} 失败 (重试 ${retries}/${MAX_CHUNK_RETRIES}):`, (err as any)?.message || err)
         if (retries >= MAX_CHUNK_RETRIES) {
           // 取消上传会话
           try { await uploadClient.post(`${basePath}/${dataId}/cancel`) } catch { /* ignore */ }
           throw new Error(`分块 ${i + 1}/${totalChunks} 上传失败，已重试 ${MAX_CHUNK_RETRIES} 次`)
         }
-        // 等待 1 秒后重试
-        await new Promise(r => setTimeout(r, 1000))
+        const delay = backoffDelay(retries)
+        await new Promise(r => setTimeout(r, delay))
       }
     }
   }
@@ -372,10 +396,9 @@ async function chunkedUpload(
   const completeResp = await uploadClient.post(`${basePath}/${dataId}/complete`, completeForm)
   console.log('[chunkedUpload] 文件重组完成，开始后台处理')
 
-  // completeResp 已经是 axios 响应（拦截器返回 data），结构为 {success, data: {id, name, status, fileType}}
   const result = completeResp
 
-  // 阶段4: 轮询等待后台处理完成
+  // 阶段4: 轮询等待后台处理完成（使用 /data/list 查询，比单 ID 查询在 Cloudflare Tunnel 下更稳定）
   if (result?.data?.status === 'processing' && result?.data?.id) {
     const pollDataId = result.data.id
     console.log('[chunkedUpload] 后台处理中 (id=' + pollDataId + ')，开始轮询等待...')
@@ -388,7 +411,9 @@ async function chunkedUpload(
       await new Promise(r => setTimeout(r, pollInterval))
 
       try {
-        const listResult: any = await apiClient.get('/data/list?page=1&page_size=100')
+        // 使用 /data/list 轮询（Cloudflare Tunnel 下比 /data/{id} 更稳定）
+        // 传入 cacheBust=true 避免浏览器缓存
+        const listResult: any = await apiClient.get('/data/list?page=1&page_size=100&_t=' + Date.now())
         const items = listResult?.data || listResult || []
         const found = Array.isArray(items) ? items.find((item: any) => item.id === pollDataId) : null
 
@@ -403,8 +428,10 @@ async function chunkedUpload(
             throw new Error(found.errorMessage || '文件处理失败')
           }
         }
-      } catch (pollErr) {
-        console.warn('[chunkedUpload] 轮询出错:', pollErr)
+      } catch (pollErr: any) {
+        // 502 等错误时等待稍长再重试，避免频繁请求压垮后端
+        console.warn('[chunkedUpload] 轮询出错（2s后重试）:', pollErr?.message || pollErr)
+        await new Promise(r => setTimeout(r, 2000))
       }
     }
 
@@ -620,6 +647,47 @@ export const dataApi = {
     return apiClient.get(`/data/${dataId}/columns${params}`)
   },
 
+  // 新站录入：向全量工参追加小区
+  addCell: async (data: {
+    networkType: 'LTE' | 'NR'
+    managedElementId: string
+    siteId: string
+    cellId: string
+    cellName: string
+    longitude: number
+    latitude: number
+    azimuth: number
+    frequency?: string
+    ssbFrequency?: string
+    cellCoverType: number
+  }): Promise<ApiResponse<any>> => {
+    return apiClient.post('/data/full-params/cells', data)
+  },
+
+  // 批量新站录入：一次提交多个小区（支持 LTE/NR 混合）
+  batchAddCells: async (cells: Array<{
+    networkType: 'LTE' | 'NR'
+    managedElementId: string
+    siteId: string
+    cellId: string
+    cellName: string
+    mcc?: string
+    mnc?: string
+    longitude: number
+    latitude: number
+    azimuth: number
+    frequency?: string
+    ssbFrequency?: string
+    cellCoverType: number
+  }>): Promise<ApiResponse<{ results: Array<{ index: number; networkType: string; cellName: string; siteId: string; cellId: string; success: boolean; message: string }>; total: number; successCount: number }>> => {
+    return apiClient.post('/data/full-params/cells/batch', { cells })
+  },
+
+  // 批量查重：检查 CGI (siteId_cellId) 是否已存在于数据库
+  checkCellDuplicates: async (cells: Array<{ siteId: string; cellId: string }>): Promise<ApiResponse<{ duplicates: string[]; exists: Record<string, boolean> }>> => {
+    return apiClient.post('/data/full-params/cells/check-duplicates', { cells })
+  },
+
   // 清理无效索引
   cleanupIndex: async (): Promise<ApiResponse<{ removed: number; items: Array<{ id: string; name: string; reason: string }> }>> => {
     return apiClient.post('/data/cleanup/index')
@@ -657,6 +725,11 @@ export const pciApi = {
   // 应用到工参（异步任务模式）
   applyToParams: async (taskId: string): Promise<ApiResponse<{ taskId: string; message: string }>> => {
     return apiClient.post(`/pci/apply-to-params/${taskId}`)
+  },
+
+  // 批量应用到工参（合并多个任务结果，一次更新）
+  applyBatch: async (taskIds: string[]): Promise<ApiResponse<any>> => {
+    return apiClient.post('/pci/apply-batch', { taskIds })
   },
 
   // 获取应用到工参进度
@@ -761,6 +834,11 @@ export const tacPlanningApi = {
   // 应用到工参（异步任务模式）
   applyToParams: async (taskId: string): Promise<ApiResponse<{ taskId: string; message: string }>> => {
     return apiClient.post(`/tac/planning/apply-to-params/${taskId}`)
+  },
+
+  // 批量应用到工参
+  applyBatch: async (taskIds: string[]): Promise<ApiResponse<any>> => {
+    return apiClient.post('/tac/planning/apply-batch', { taskIds })
   },
 
   // 获取应用到工参进度
@@ -951,6 +1029,10 @@ export const authApi = {
     return apiClient.get('/auth/me') as any
   },
 
+  ping: async (): Promise<ApiResponse<{ last_activity: string }>> => {
+    return apiClient.post('/auth/ping') as any
+  },
+
   logout: async (): Promise<ApiResponse<any>> => {
     return apiClient.post('/auth/logout') as any
   },
@@ -1001,5 +1083,130 @@ export const userSettingsApi = {
   /** 更新当前用户的个性化设置（全量替换） */
   updateSettings: async (settings: Record<string, any>): Promise<ApiResponse<{ user_id: number; settings: Record<string, any>; updated_at: string }>> => {
     return apiClient.put('/user/settings', { settings }) as any
+  },
+}
+
+// ============== APP 版本管理 API ==============
+export const appVersionsApi = {
+  /** 获取版本列表（管理员） */
+  list: async (page = 1, pageSize = 20) => {
+    const res = await apiClient.get('/app-versions', { params: { page, page_size: pageSize } })
+    return res  // apiClient 拦截器已返回 response.data
+  },
+
+  /** 获取最新版本（公开） */
+  getLatest: async () => {
+    const res = await apiClient.get('/app-versions/latest')
+    return res  // apiClient 拦截器已返回 response.data
+  },
+
+  /**
+   * 上传新版本（管理员）- 使用分块上传避免 Cloudflare 413 限制
+   * APK 文件通常 >100MB，Cloudflare 默认限制 100MB。
+   * 使用 1MB 分块（比数据文件 500KB 更大，减少分块数）和指数退避重试。
+   */
+  upload: async (formData: FormData) => {
+    const file = formData.get('file') as File
+    const version = formData.get('version') as string
+    const changelog = (formData.get('changelog') as string) || ''
+    const isLatest = formData.get('is_latest') === 'true'
+
+    if (!file) throw new Error('请选择 APK 文件')
+    if (!version) throw new Error('请输入版本号')
+
+    const basePath = '/app-versions/chunked'
+    // APK 分块使用 1MB（比数据文件的 500KB 更大），减少分块数量降低出错概率
+    const APK_CHUNK_SIZE = 1024 * 1024
+    const APK_MAX_RETRIES = 5
+    const totalChunks = Math.ceil(file.size / APK_CHUNK_SIZE)
+    console.log(`[AppVersions] 分块上传 APK: ${file.name}, 大小: ${file.size}, 分块数: ${totalChunks} (${APK_CHUNK_SIZE / 1024}KB/块)`)
+
+    // 阶段1: 初始化上传会话
+    const startForm = new FormData()
+    startForm.append('filename', file.name)
+    startForm.append('total_chunks', String(totalChunks))
+    startForm.append('total_size', String(file.size))
+    const startResp = await uploadClient.post(`${basePath}/start`, startForm)
+    const uploadId = startResp.data?.id || startResp.data?.data?.id
+    if (!uploadId) throw new Error('无法创建上传会话')
+
+    // 阶段2: 逐块上传（指数退避重试）
+    for (let i = 0; i < totalChunks; i++) {
+      const start = i * APK_CHUNK_SIZE
+      const end = Math.min(start + APK_CHUNK_SIZE, file.size)
+      const chunk = file.slice(start, end)
+
+      let retries = 0
+      let success = false
+      while (!success && retries < APK_MAX_RETRIES) {
+        try {
+          const chunkForm = new FormData()
+          chunkForm.append('file', chunk)
+          chunkForm.append('chunk_index', String(i))
+          await uploadClient.post(`${basePath}/${uploadId}/chunk`, chunkForm)
+          success = true
+          console.log(`[AppVersions] 分块 ${i + 1}/${totalChunks} 上传完成`)
+        } catch {
+          retries++
+          if (retries >= APK_MAX_RETRIES) {
+            try { await uploadClient.post(`${basePath}/${uploadId}/cancel`) } catch { /* ignore */ }
+            throw new Error(`分块 ${i + 1}/${totalChunks} 上传失败，已重试 ${APK_MAX_RETRIES} 次`)
+          }
+          // 指数退避：1s → 2s → 4s → 8s
+          const backoff = Math.pow(2, retries - 1) * 1000
+          console.warn(`[AppVersions] 分块 ${i + 1}/${totalChunks} 重试 ${retries}/${APK_MAX_RETRIES} (等待 ${backoff}ms)`)
+          await new Promise(r => setTimeout(r, backoff))
+        }
+      }
+    }
+
+    // 阶段3: 完成上传（传递版本信息）- 需要管理员 token
+    const completeForm = new FormData()
+    completeForm.append('version', version)
+    completeForm.append('changelog', changelog)
+    if (isLatest) completeForm.append('is_latest', 'true')
+
+    // 手动从 localStorage 获取 auth token（uploadClient 无自动拦截器）
+    let authToken = ''
+    try {
+      const stored = localStorage.getItem('auth-storage')
+      if (stored) {
+        const parsed = JSON.parse(stored)
+        authToken = parsed?.state?.token || ''
+      }
+    } catch { /* ignore */ }
+
+    const completeHeaders = {}
+    if (authToken) {
+      completeHeaders['Authorization'] = `Bearer ${authToken}`
+    }
+
+    const result = await uploadClient.post(`${basePath}/${uploadId}/complete`, completeForm, {
+      headers: completeHeaders,
+    })
+    return result
+  },
+
+  /** 编辑版本（管理员） */
+  update: async (id: number, data: { version?: string; changelog?: string; is_latest?: boolean }) => {
+    const res = await apiClient.put(`/app-versions/${id}`, data)
+    return res
+  },
+
+  /** 删除版本（管理员） */
+  delete: async (id: number) => {
+    const res = await apiClient.delete(`/app-versions/${id}`)
+    return res
+  },
+
+  /** 扫描导入本地 APK 文件（管理员）
+   *  将 apks/ 目录下未注册的 .apk 文件导入数据库 */
+  importLocal: async (params?: { mark_latest?: boolean; changelog?: string }) => {
+    const formData = new FormData()
+    // 必须至少发送一个字段，避免空 FormData 导致 FastAPI 解析失败
+    formData.append('mark_latest', params?.mark_latest !== undefined ? String(params.mark_latest) : 'true')
+    if (params?.changelog) formData.append('changelog', params.changelog)
+    const res = await apiClient.post('/app-versions/import-local', formData)
+    return res
   },
 }

@@ -102,6 +102,9 @@ interface TaskState {
   // 从后端同步历史任务到本地 store
   syncHistoryFromBackend: (type: TaskType) => Promise<void>
 
+  // 标记任务为已应用（本地状态同步，不依赖后端刷新）
+  markTaskApplied: (taskId: string) => void
+
   // 删除历史任务（后端 + 本地）
   deleteHistoryTask: (taskId: string, type: TaskType) => Promise<boolean>
 
@@ -271,7 +274,14 @@ export const useTaskStore = create<TaskState>()(
         set(state => {
           const newTasks = { ...state.tasks }
           delete newTasks[id]
-          return { tasks: newTasks }
+          // WebSocket 删除事件也需清除 activeTaskIds 中的引用
+          const newActiveTaskIds = { ...state.activeTaskIds }
+          for (const [type, activeId] of Object.entries(state.activeTaskIds)) {
+            if (activeId === id) {
+              newActiveTaskIds[type as TaskType] = null
+            }
+          }
+          return { tasks: newTasks, activeTaskIds: newActiveTaskIds }
         })
       },
 
@@ -383,19 +393,24 @@ export const useTaskStore = create<TaskState>()(
             for (const ht of historyTasks) {
               const id = ht.taskId
               if (!id) continue
-              // ⚠️ result 严格区分：
-              //   - 运行中的任务或已有完整 results 的任务 → 保留原有 result
-              //   - 其他历史任务 → 只使用后端返回的 resultSummary（不含 results 数组）
+              // 🔥 优化：后端历史列表现在直接返回完整 result（含 results 数组），
+              // 优先使用后端返回的完整 result，其次保留已有的完整结果，最后回退到 resultSummary
               const preserved = merged[id]
-              // 如果已有完整的 results，优先保留（不被 resultSummary 覆盖）
-              const taskResult = (preserved?.result?.results ? preserved.result : (ht.resultSummary || undefined))
+              let taskResult
+              if (ht.result?.results) {
+                taskResult = ht.result       // 后端直接返回了完整结果
+              } else if (preserved?.result?.results) {
+                taskResult = preserved.result // 已有完整结果，保留
+              } else {
+                taskResult = ht.resultSummary || undefined  // 回退到摘要
+              }
               merged[id] = {
                 id,
                 type,
                 status: ht.status === 'completed' ? 'completed' as const : 'failed' as const,
                 taskName: ht.taskName || preserved?.taskName || id.slice(0, 24),
                 userName: ht.userName || preserved?.userName,
-                isApplied: ht.isApplied === true || preserved?.isApplied === true,
+                isApplied: ht.isApplied === true,
                 progress: preserved?.progress ?? (ht.progress ?? (ht.status === 'completed' ? 100 : 0)),
                 startTime: preserved?.startTime || (ht.createdAt ? new Date(ht.createdAt).getTime() : undefined),
                 endTime: preserved?.endTime || (ht.completedAt ? new Date(ht.completedAt).getTime() : undefined),
@@ -413,6 +428,22 @@ export const useTaskStore = create<TaskState>()(
         } catch (err) {
           console.warn(`[taskStore] 同步 ${type} 历史任务失败:`, err)
         }
+      },
+
+      markTaskApplied: (taskId) => {
+        set(state => {
+          const task = state.tasks[taskId]
+          if (!task) {
+            console.warn(`[taskStore] 标记已应用失败：任务 ${taskId.slice(0, 8)}... 不存在`)
+            return state
+          }
+          return {
+            tasks: {
+              ...state.tasks,
+              [taskId]: { ...task, isApplied: true }
+            }
+          }
+        })
       },
 
       deleteHistoryTask: async (taskId, type) => {
@@ -440,7 +471,13 @@ export const useTaskStore = create<TaskState>()(
             set(state => {
               const newTasks = { ...state.tasks }
               delete newTasks[taskId]
-              return { tasks: newTasks }
+              // 删除任务时同步清除 activeTaskIds 中的引用，
+              // 避免 GlobalTaskIndicator 显示已删除任务的进度通知
+              const newActiveTaskIds = { ...state.activeTaskIds }
+              if (state.activeTaskIds[type] === taskId) {
+                newActiveTaskIds[type] = null
+              }
+              return { tasks: newTasks, activeTaskIds: newActiveTaskIds }
             })
             return true
           }

@@ -1,19 +1,21 @@
 import { useState, useEffect, useRef, useMemo, useCallback } from 'react'
-import { Download, Loader2, AlertCircle, CheckCircle2, Search, GripVertical, Check, List, Save } from 'lucide-react'
+import { Download, Loader2, AlertCircle, CheckCircle2, Search, GripVertical, Check, List, Save, Trash2 } from 'lucide-react'
 import { tacPlanningApi, dataApi } from '../services/api'
 import { useTACPlanningStore } from '../store/tacPlanningStore'
 import { useTaskStore, type Task } from '../store/taskStore'
 import { useAuthStore } from '../store/authStore'
 import { btn } from '../utils/buttonStyles'
 import type { RenderSectorData, CellListItem } from '../services/mapDataService'
-import { mapDataService, getCellList, clearCellListCache } from '../services/mapDataService'
+import { mapDataService, getCellList, clearCellListCache, bumpDataVersion } from '../services/mapDataService'
 import { useTranslation } from 'react-i18next'
 import { CellSelectionTable } from '../components/CellSelectionTable'
-import { HistoryTable } from '../components/HistoryTable'
+import { HistoryTable, triggerBatchApply, triggerBatchDelete } from '../components/HistoryTable'
 import { StepIndicator } from '../components/StepIndicator'
 import { WizardFooter } from '../components/WizardFooter'
 import { extractCellIdsFromFile, matchCellIds, downloadCellTreeTemplate } from '../utils/cellFileHelper'
 import { triggerDataRefresh, DATA_REFRESH_EVENT } from '../store/dataStore'
+import { generateFullTaskName } from '../utils/taskNameUtils'
+import { LoadingSpinner } from '../components/LoadingSpinner'
 import type { ApiResponse } from '@shared/types'
 
 // 虚拟滚动配置
@@ -75,10 +77,21 @@ export function TACPlanningPage() {
     // 小区列表数据（从轻量API获取）
     const [cellListData, setCellListData] = useState<{ lte: CellListItem[]; nr: CellListItem[] }>({ lte: [], nr: [] })
     const [cellListLoading, setCellListLoading] = useState(false)
+    // 🔥 页面加载动画
+    const [pageLoading, setPageLoading] = useState(true)
+    const pageLoadingRef = useRef(true)
     const [cellFileUploading, setCellFileUploading] = useState(false)
     const cellFileInputRef = useRef<HTMLInputElement>(null)
     const viewedTaskIdRef = useRef<string | null>(null)
+    const isLoadingResultRef = useRef(false) // 标记结果加载是否有效，防止竞态
+    const [resultLoading, setResultLoading] = useState(false) // 结果页加载动画
     const errorCountRef = useRef(0)
+    const [selectedCount, setSelectedCount] = useState(0)
+    const [unappliedCount, setUnappliedCount] = useState(0)
+    const [batchApplying, setBatchApplying] = useState(false)
+    const [batchDeleting, setBatchDeleting] = useState(false)
+    const showBatchApply = unappliedCount > 0
+    const showBatchDelete = selectedCount > 0
 
     // ===== 状态重置 =====
     const resetConfig = useCallback(() => {
@@ -103,8 +116,14 @@ export function TACPlanningPage() {
         if (viewedTaskIdRef.current) {
           return
         }
+        isLoadingResultRef.current = true
+        // 仅当没有已有结果时才显示加载动画
+        if (!result) {
+          setResultLoading(true)
+        }
         const loadLatest = async () => {
           await syncHistoryFromBackend('tac_planning')
+          if (!isLoadingResultRef.current) return
           const tasks = useTaskStore.getState().tasks
           const tacPlanTasks = Object.values(tasks)
             .filter(t => t.type === 'tac_planning')
@@ -115,14 +134,21 @@ export function TACPlanningPage() {
             })
           if (tacPlanTasks.length > 0) {
             const latest = tacPlanTasks[0]
+            // 恢复应用状态（跨页面同步）
+            if (latest.isApplied) {
+              setApplySuccess(true)
+            } else {
+              setApplySuccess(false)
+            }
             // 如果缺少完整 results（来自 resultSummary），尝试从 API 重新获取
             if (latest.result && !latest.result.results && latest.id) {
               try {
                 const response = await tacPlanningApi.getResult(latest.id)
+                if (!isLoadingResultRef.current) return
                 if (response?.success && response?.data?.results) {
                   setResult(response.data as TACResultData)
                   setTaskId(latest.id)
-                  setWizardStep('completed')
+                  if (isLoadingResultRef.current) setWizardStep('completed')
                   return
                 }
               } catch (fetchErr: any) {
@@ -132,11 +158,14 @@ export function TACPlanningPage() {
             if (latest.result) {
               setResult(latest.result as TACResultData)
               setTaskId(latest.id)
-              setWizardStep('completed')
+              if (isLoadingResultRef.current) setWizardStep('completed')
             }
           }
         }
-        loadLatest()
+        loadLatest().finally(() => {
+          if (isLoadingResultRef.current) setResultLoading(false)
+        })
+        return () => { isLoadingResultRef.current = false; setResultLoading(false) }
       } else {
         // 离开结果页时清除 viewedTaskIdRef
         viewedTaskIdRef.current = null
@@ -169,15 +198,15 @@ export function TACPlanningPage() {
             throw new Error(progress?.data?.error || '应用失败')
           }
         } catch (pollErr: any) {
-          if (pollErr?.response?.status === 404) continue
+          if (pollErr?.code === 404) continue
           throw pollErr
         }
       }
       throw new Error('应用超时')
     }, [])
 
-    const handleApplyTask = useCallback(async (task: Task): Promise<boolean> => {
-      if (!window.confirm(t('tacPlanning.applyConfirm') || '规划结果将应用到工参')) return false
+    const handleApplyTask = useCallback(async (task: Task, skipConfirm?: boolean): Promise<boolean> => {
+      if (!skipConfirm && !window.confirm(t('tacPlanning.applyConfirm') || '规划结果将应用到工参')) return false
       setApplyingToParams(true)
       setApplySuccess(false)
       try {
@@ -192,13 +221,16 @@ export function TACPlanningPage() {
         }
 
         if (updatedCount !== undefined) {
-          // 标记任务为已应用
-          tacPlanningApi.markApplied(task.id).catch(e =>
+          // 标记任务为已应用（等待完成后 HistoryTable 才会 syncHistoryFromBackend）
+          try {
+            await tacPlanningApi.markApplied(task.id)
+          } catch (e: any) {
             console.warn('[TACPlanningPage] 标记已应用失败:', e?.message)
-          )
-          mapDataService.clearCache().catch(e =>
-            console.warn('[TACPlanningPage] 清理地图缓存失败:', e?.message)
-          )
+          }
+          useTaskStore.getState().markTaskApplied(task.id)
+          await mapDataService.clearCache()
+          bumpDataVersion()
+          // 刷新地图扇区数据
           setApplySuccess(true)
           triggerDataRefresh()
           return true
@@ -212,6 +244,67 @@ export function TACPlanningPage() {
         setApplyingToParams(false)
       }
     }, [pollApplyTACResult])
+
+    // ===== 批量应用回调 =====
+    const handleBatchApplyTasks = useCallback(async (tasks: Task[]): Promise<{ success: boolean; updatedCount?: number }> => {
+      setApplyingToParams(true)
+      setApplySuccess(false)
+      try {
+        const taskIds = tasks.map(t => t.id)
+        const response: ApiResponse<any> = await tacPlanningApi.applyBatch(taskIds)
+        const data = response?.data
+
+        let resultData = data?.result
+        if (!resultData && data?.taskId) {
+          const startTime = Date.now()
+          while (Date.now() - startTime < 15000) {
+            await new Promise(r => setTimeout(r, 1000))
+            try {
+              const progress = await tacPlanningApi.getApplyProgress(data.taskId)
+              if (progress?.data?.status === 'completed') {
+                const res = await tacPlanningApi.getApplyResult(data.taskId)
+                resultData = res?.data
+                break
+              }
+              if (progress?.data?.status === 'failed') {
+                throw new Error(progress?.data?.error || '批量应用失败')
+              }
+            } catch (pollErr: any) {
+              if (pollErr?.code === 404) continue
+              throw pollErr
+            }
+          }
+        }
+
+        if (!resultData) {
+          throw new Error('批量应用超时，请稍后刷新查看结果')
+        }
+
+        const updatedCount = resultData?.updatedCount ?? 0
+
+        for (const task of tasks) {
+          try {
+            await tacPlanningApi.markApplied(task.id)
+            useTaskStore.getState().markTaskApplied(task.id)
+          } catch (e: any) {
+            console.warn('[TACPlanningPage] 批量标记已应用失败:', task.id, e?.message)
+          }
+        }
+
+        await mapDataService.clearCache()
+        bumpDataVersion()
+        setApplySuccess(true)
+        triggerDataRefresh()
+
+        console.log(`[TACPlanningPage] 批量应用完成: 更新了 ${updatedCount} 个小区, ${tasks.length} 个任务`)
+        return { success: true, updatedCount }
+      } catch (err: any) {
+        console.error('批量应用TAC结果失败:', err)
+        throw err
+      } finally {
+        setApplyingToParams(false)
+      }
+    }, [])
 
     // 页面加载时检查任务是否仍然存在
     useEffect(() => {
@@ -392,8 +485,9 @@ export function TACPlanningPage() {
                 console.warn('检查数据文件列表失败，将继续尝试规划:', listErr)
             }
 
+            const fullTaskName = generateFullTaskName(taskName)
             const planConfig = {
-                taskName: taskName,
+                taskName: fullTaskName,
                 ...config!,
                 selectedCellIds: Array.from(selectedCellIds)
             }
@@ -402,7 +496,7 @@ export function TACPlanningPage() {
                 const newTaskId = response.data.taskId
                 setTaskId(newTaskId)
                 setActiveTaskId('tac_planning', newTaskId)
-                startTask(newTaskId, 'tac_planning', 'TAC规划开始', taskName, user?.username)
+                startTask(newTaskId, 'tac_planning', 'TAC规划开始', fullTaskName, user?.username)
 
                 const progressResponse = await tacPlanningApi.getProgress(newTaskId)
                 if (progressResponse.success && progressResponse.data) {
@@ -458,6 +552,15 @@ export function TACPlanningPage() {
     // 从历史任务查看 - 跳转到结果页
     const handleViewTask = async (task: any) => {
         try {
+            // 从 taskStore 或后端恢复应用状态（跨页面同步）
+            const storeTask = useTaskStore.getState().tasks[task.id]
+            const isApplied = storeTask?.isApplied || task?.isApplied || false
+            if (isApplied) {
+                setApplySuccess(true)
+            } else {
+                setApplySuccess(false)
+            }
+
             const response = await tacPlanningApi.getResult(task.id)
             if (response?.success && response?.data) {
                 const resultData = response.data as TACResultData
@@ -617,6 +720,11 @@ export function TACPlanningPage() {
             console.error('[TACPlanningPage] 加载小区列表失败:', err)
         } finally {
             setCellListLoading(false)
+            // 🔥 首次加载完成，关闭页面加载动画
+            if (pageLoadingRef.current) {
+                pageLoadingRef.current = false
+                setPageLoading(false)
+            }
         }
     }, [])
 
@@ -739,8 +847,18 @@ export function TACPlanningPage() {
     const isRunning = loading || taskResult?.status === 'processing'
 
     return (
-        <div className="h-full flex flex-col p-4 min-h-0">
-            <h1 className="text-xl font-bold mb-4 shrink-0">{t('tacPlanning.title') || 'TAC规划'}</h1>
+        <div className="h-full flex flex-col p-4 min-h-0 relative">
+            {/* 🔥 页面加载动画 */}
+            {pageLoading && (
+                <div className="absolute inset-0 flex items-center justify-center bg-background/60 z-50 rounded-xl">
+                    <div className="flex flex-col items-center gap-3">
+                        <Loader2 size={36} className="animate-spin text-primary" />
+                        <span className="text-sm text-muted-foreground">{t('common.loading') || '加载中...'}</span>
+                    </div>
+                </div>
+            )}
+
+            <h1 className="text-base font-bold mb-4 shrink-0">{t('tacPlanning.title') || 'TAC规划'}</h1>
 
             {error && (
                 <div className="mb-3 p-2.5 bg-red-500/10 border border-red-500/20 rounded-lg flex items-start gap-2 shrink-0">
@@ -793,6 +911,41 @@ export function TACPlanningPage() {
                             </span>
                         )}
                     </button>
+                    {/* 批量操作按钮 */}
+                    <div className="ml-auto flex items-center gap-1 mr-8">
+                        {showBatchApply && (
+                            batchApplying ? (
+                                <span className="inline-flex items-center px-2 py-1 bg-blue-400 text-white rounded-lg">
+                                    <Loader2 size={14} className="animate-spin" />
+                                </span>
+                            ) : (
+                                <button
+                                    onClick={() => triggerBatchApply()}
+                                    disabled={batchDeleting}
+                                    className="p-1.5 bg-green-500 text-white rounded-lg hover:bg-green-600 transition-colors disabled:opacity-50"
+                                    title={t('common.batchApply') || '批量应用'}
+                                >
+                                    <Check size={14} />
+                                </button>
+                            )
+                        )}
+                        {showBatchDelete && (
+                            batchDeleting ? (
+                                <span className="inline-flex items-center px-2 py-1 bg-red-400 text-white rounded-lg">
+                                    <Loader2 size={14} className="animate-spin" />
+                                </span>
+                            ) : (
+                                <button
+                                    onClick={() => triggerBatchDelete()}
+                                    disabled={batchApplying}
+                                    className="p-1.5 bg-red-500 text-white rounded-lg hover:bg-red-600 transition-colors disabled:opacity-50"
+                                    title={t('common.batchDelete') || '批量删除'}
+                                >
+                                    <Trash2 size={14} />
+                                </button>
+                            )
+                        )}
+                    </div>
                 </div>
 
                 {/* 页签内容 */}
@@ -869,7 +1022,7 @@ export function TACPlanningPage() {
                                         onDownloadCellTemplate={wizardStep === 'cells_selected' ? handleDownloadCellTemplate : undefined}
                                         uploading={cellFileUploading}
                                         disabled={wizardStep !== 'cells_selected' || isRunning}
-                                        columnLabels={{ siteId: t('tacPlanning.siteId') || '基站ID', cellId: t('tacPlanning.cellId') || '小区ID', cellName: t('tacPlanning.cellName') || '小区名称', selectAll: t('tacPlanning.selectAll') || '全选', clearSelections: t('tacPlanning.clearSelections') || '清空选择', uploadCellFile: t('tacPlanning.uploadCellFile') || '上传待规划小区文件', downloadCellTemplate: t('tacPlanning.downloadCellTemplate') || '下载待规划小区模板' }}
+                                        columnLabels={{ siteId: t('tacPlanning.siteId') || '基站ID', cellId: t('tacPlanning.cellId') || '小区ID', cellName: t('tacPlanning.cellName') || '小区名称', cellFreq: t('tacPlanning.cellFreq') || '频点', cellPci: t('tacPlanning.cellPci') || 'PCI', selectAll: t('tacPlanning.selectAll') || '全选', clearSelections: t('tacPlanning.clearSelections') || '清空选择', uploadCellFile: t('tacPlanning.uploadCellFile') || '上传待规划小区文件', downloadCellTemplate: t('tacPlanning.downloadCellTemplate') || '下载待规划小区模板' }}
                                     />
                                 </div>
                             </div>
@@ -918,11 +1071,24 @@ export function TACPlanningPage() {
                                 onViewTask={handleViewTask}
                                 getCellCount={getCellCount}
                                 onApplyTask={handleApplyTask}
+                                onBatchApplyTasks={handleBatchApplyTasks}
+                                onSelectedChange={(counts) => {
+                                    setSelectedCount(counts.total)
+                                    setUnappliedCount(counts.unappliable)
+                                }}
+                                onBatchStatusChange={(applying, deleting) => {
+                                    setBatchApplying(applying)
+                                    setBatchDeleting(deleting)
+                                }}
                             />
                         </div>
                     )}
 
                     {activeLeftTab === 'planning-result' && (
+                        <>
+                        {resultLoading ? (
+                            <LoadingSpinner variant="spinner" text={t('common.loadingResult') || '正在加载规划结果...'} />
+                        ) : (
 
                         /* 规划结果面板 */
                         <div className="flex flex-col h-full min-h-0 overflow-hidden">
@@ -991,28 +1157,48 @@ export function TACPlanningPage() {
                                                             if (!atId) throw new Error('应用失败')
                                                             // Phase 1 可能已内联返回
                                                             if (response?.data?.result?.updatedCount !== undefined) {
+                                                                await mapDataService.clearCache()
+                                                                bumpDataVersion()
+                                                                try {
+                                                                    await tacPlanningApi.markApplied(applyTaskId)
+                                                                } catch (e: any) {
+                                                                    console.warn('[TACPlanningPage] 标记已应用失败:', e?.message)
+                                                                }
+                                                                useTaskStore.getState().markTaskApplied(applyTaskId)
+                                                                // 刷新历史列表以同步所有页面的应用状态
+                                                                syncHistoryFromBackend('tac_planning').catch(e =>
+                                                                    console.warn('[TACPlanningPage] 同步历史失败:', e?.message)
+                                                                )
                                                                 setApplySuccess(true)
                                                                 triggerDataRefresh()
-                                                                setTimeout(() => setApplySuccess(false), 5000)
                                                             } else {
-                                                                // 短轮询进度（避免 getApplyResult 返回 404）
+                                                                // 短轮询进度
                                                                 const startTime = Date.now()
-                                                                const timeout = 30000
+                                                                const timeout = 60000
                                                                 while (Date.now() - startTime < timeout) {
                                                                     await new Promise(r => setTimeout(r, 1000))
                                                                     try {
                                                                         const progress = await tacPlanningApi.getApplyProgress(atId)
                                                                         if (progress?.data?.status === 'completed') {
+                                                                            await mapDataService.clearCache()
+                                                                            bumpDataVersion()
+                                                                            tacPlanningApi.markApplied(applyTaskId).catch(e =>
+                                                                                console.warn('[TACPlanningPage] 标记已应用失败:', e?.message)
+                                                                            )
+                                                                            useTaskStore.getState().markTaskApplied(applyTaskId)
+                                                                            // 刷新历史列表以同步所有页面的应用状态
+                                                                            syncHistoryFromBackend('tac_planning').catch(e =>
+                                                                                console.warn('[TACPlanningPage] 同步历史失败:', e?.message)
+                                                                            )
                                                                             setApplySuccess(true)
                                                                             triggerDataRefresh()
-                                                                            setTimeout(() => setApplySuccess(false), 5000)
                                                                             break
                                                                         }
                                                                         if (progress?.data?.status === 'failed') {
                                                                             throw new Error(progress?.data?.error || '应用失败')
                                                                         }
                                                                     } catch (pollErr: any) {
-                                                                        if (pollErr?.response?.status === 404) continue
+                                                                        if (pollErr?.code === 404) continue
                                                                         throw pollErr
                                                                     }
                                                                 }
@@ -1202,6 +1388,8 @@ export function TACPlanningPage() {
                                 </div>
                             )}
                         </div>
+                        )}
+                        </>
                     )}
                 </div>
             </div>

@@ -60,6 +60,11 @@ def init_db():
             ("operator", "ALTER TABLE users ADD COLUMN operator VARCHAR(50)"),
             ("last_login_ip", "ALTER TABLE users ADD COLUMN last_login_ip VARCHAR(45)"),
             ("ip_address", "ALTER TABLE user_sessions ADD COLUMN ip_address VARCHAR(45)"),
+            ("user_type", "ALTER TABLE users ADD COLUMN user_type VARCHAR(10) NOT NULL DEFAULT 'pc'"),
+            ("can_data_import", "ALTER TABLE users ADD COLUMN can_data_import BOOLEAN NOT NULL DEFAULT 0"),
+            ("can_data_delete", "ALTER TABLE users ADD COLUMN can_data_delete BOOLEAN NOT NULL DEFAULT 0"),
+            ("can_data_update", "ALTER TABLE users ADD COLUMN can_data_update BOOLEAN NOT NULL DEFAULT 0"),
+            ("can_cell_entry", "ALTER TABLE users ADD COLUMN can_cell_entry BOOLEAN NOT NULL DEFAULT 0"),
         ]
         for col_name, sql in migrations:
             table_name = "user_sessions" if "user_sessions" in sql else "users"
@@ -81,6 +86,16 @@ def init_db():
         us_cols = [row[1] for row in conn.exec_driver_sql("PRAGMA table_info(user_settings)").fetchall() if row[0] >= 0]
         if us_cols and "created_at" not in us_cols:
             conn.exec_driver_sql("ALTER TABLE user_settings ADD COLUMN created_at VARCHAR(30)")
+
+        # 迁移：user_sessions 表添加 client_type 列
+        usess_cols = [row[1] for row in conn.exec_driver_sql("PRAGMA table_info(user_sessions)").fetchall()]
+        if "client_type" not in usess_cols:
+            conn.exec_driver_sql("ALTER TABLE user_sessions ADD COLUMN client_type VARCHAR(10) NOT NULL DEFAULT 'pc'")
+
+        # 迁移：app_versions 表添加 download_count 列
+        av_cols = [row[1] for row in conn.exec_driver_sql("PRAGMA table_info(app_versions)").fetchall()]
+        if av_cols and "download_count" not in av_cols:
+            conn.exec_driver_sql("ALTER TABLE app_versions ADD COLUMN download_count INTEGER DEFAULT 0")
         conn.commit()
 
 

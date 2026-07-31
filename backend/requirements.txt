@@ -6,8 +6,9 @@ websockets==14.0
 
 # 数据处理
 pandas>=2.2.0
-openpyxl==3.1.2
-numpy>=1.26.3,<2.0
+openpyxl>=3.1.5
+python-calamine>=0.3.0
+numpy>=1.26.3
 
 # 数据验证
 pydantic==2.9.0
@@ -29,6 +30,9 @@ python-dotenv==1.0.0
 # gdal==3.8.4
 geopandas>=1.0.1
 shapely>=2.0.6
+
+# 空间索引（TAC插花检测 BallTree）
+scikit-learn>=1.5.0
 
 # 工具库
 cryptography==43.0.1

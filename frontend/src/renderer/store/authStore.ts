@@ -9,7 +9,7 @@ interface AuthState {
   isAuthenticated: boolean
   isLoading: boolean
 
-  login: (username: string, password: string) => Promise<void>
+  login: (username: string, password: string) => Promise<string | null>
   register: (username: string, password: string, confirmPassword: string, city?: string, operator?: string, equipmentVendor?: string) => Promise<void>
   logout: () => Promise<void>
   fetchUser: () => Promise<void>
@@ -24,10 +24,10 @@ export const useAuthStore = create<AuthState>()(
       isAuthenticated: false,
       isLoading: false,
 
-      login: async (username: string, password: string) => {
+      login: async (username: string, password: string, clientType?: 'pc' | 'app') => {
         set({ isLoading: true })
         try {
-          const result: any = await authApi.login({ username, password })
+          const result: any = await authApi.login({ username, password, client_type: clientType || 'pc' })
           if (result.success && result.data) {
             set({
               token: result.data.access_token,

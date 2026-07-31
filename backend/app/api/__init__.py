@@ -10,11 +10,34 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.responses import Response
 from contextlib import asynccontextmanager
+from starlette.types import ASGIApp, Scope, Receive, Send
 import logging
 import socket
+from concurrent.futures import ProcessPoolExecutor
 
 from app.core.config import settings
 from app.api.v1 import api_router
+
+
+class SelectiveGZipMiddleware(GZipMiddleware):
+    """GZip 中间件——跳过已压缩二进制文件（APK）的二次压缩
+
+    APK 本身已是 ZIP 压缩格式，二次 GZip 在 ARM 芯片上消耗大量 CPU
+    且破坏流式响应，导致下载变慢。此中间件对指定路径跳过压缩。
+    """
+    EXCLUDE_PATHS = (
+        "/api/v1/app-versions/download/",
+        "/apks/",
+    )
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "http":
+            path = scope.get("path", "")
+            if any(path.startswith(excluded) for excluded in self.EXCLUDE_PATHS):
+                # 直接透传，不做任何压缩
+                await self.app(scope, receive, send)
+                return
+        await super().__call__(scope, receive, send)
 
 # 前端构建产物目录
 FRONTEND_DIST = Path(__file__).parent.parent.parent.parent / "frontend" / "dist-renderer"
@@ -54,6 +77,12 @@ async def lifespan(app: FastAPI):
     settings.DATA_DIR.mkdir(parents=True, exist_ok=True)
     settings.TEMPLATE_DIR.mkdir(parents=True, exist_ok=True)
 
+    # 创建 APK 文件存储目录
+    BASE_DIR = Path(__file__).parent.parent
+    apks_dir = BASE_DIR / "apks"
+    apks_dir.mkdir(parents=True, exist_ok=True)
+    logger.info(f"✅ APK 存储目录已创建: {apks_dir}")
+
     # 🔥 启动时自动清理无效数据索引
     # 清理文件已删除但索引中仍存在的无效项
     try:
@@ -79,11 +108,34 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"❌ 用户数据库初始化失败: {e}")
 
+    # 初始化进程池（用于 CPU 密集型任务）
+    pool = None
+    try:
+        if hasattr(settings, 'MAX_WORKERS') and settings.MAX_WORKERS > 1:
+            pool = ProcessPoolExecutor(
+                max_workers=settings.MAX_WORKERS,
+                mp_context="fork"
+            )
+            logger.info(f"✅ ProcessPoolExecutor 已创建: {settings.MAX_WORKERS} workers (fork)")
+
+            # 注入到 TaskManager
+            from app.services.task_manager import task_manager
+            task_manager.set_process_pool(pool)
+    except Exception as e:
+        logger.warning(f"⚠️ ProcessPoolExecutor 创建失败: {e}，将使用线程池")
+        pool = None
+
     logger.info("应用启动完成")
     yield
 
     # 关闭时执行
     logger.info("应用关闭中...")
+    if pool is not None:
+        try:
+            pool.shutdown(wait=False)
+            logger.info("ProcessPoolExecutor 已关闭")
+        except Exception as e:
+            logger.warning(f"ProcessPoolExecutor 关闭异常: {e}")
     logger.info("应用关闭完成")
 
 
@@ -160,8 +212,8 @@ def create_app() -> FastAPI:
         expose_headers=["Content-Disposition", "Content-Length", "Content-Type"],
     )
 
-    # GZip 压缩（对大响应启用，移动端受益明显：9MB → ~1.5MB）
-    app.add_middleware(GZipMiddleware, minimum_size=1024)
+    # GZip 压缩（排除 APK 等已压缩二进制文件——二次压缩在 ARM 上 CPU 开销极高）
+    app.add_middleware(SelectiveGZipMiddleware, minimum_size=1024)
 
     # 添加 Cache-Control 中间件：防止 HTML 被浏览器缓存
     @app.middleware("http")

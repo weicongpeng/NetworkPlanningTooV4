@@ -22,6 +22,8 @@ export interface UserMapSettings {
   pointFileVisibility: Record<string, boolean>
   // 装饰图层
   decorationLayerVisible: boolean
+  // 装饰图层标签可见性
+  decorationLabelVisible: boolean
   // 底图可见性
   baseMapVisible: boolean
   // 扇区标签可见性
@@ -47,6 +49,7 @@ const DEFAULT_MAP_SETTINGS: UserMapSettings = {
   layerFileVisibility: {},
   pointFileVisibility: {},
   decorationLayerVisible: false,
+  decorationLabelVisible: false,
   baseMapVisible: true,
   sectorLabelVisibility: { 'lte-sectors': false, 'nr-sectors': false },
   pointFileLabelVisibility: {},
@@ -75,6 +78,7 @@ interface MapState {
   setLayerFileVisibility: (fileId: string, visible: boolean) => void
   setPointFileVisibility: (fileId: string, visible: boolean) => void
   setDecorationLayerVisible: (visible: boolean) => void
+  setDecorationLabelVisible: (visible: boolean) => void
   setBaseMapVisible: (visible: boolean) => void
   setSectorLabelVisibility: (layer: string, visible: boolean) => void
   setPointFileLabelVisibility: (fileId: string, visible: boolean) => void
@@ -176,6 +180,13 @@ export const useMapStore = create<MapState>()(
       setDecorationLayerVisible: (visible) => {
         set((state) => ({
           mapSettings: { ...state.mapSettings, decorationLayerVisible: visible },
+        }))
+        scheduleBackendSync(get())
+      },
+
+      setDecorationLabelVisible: (visible) => {
+        set((state) => ({
+          mapSettings: { ...state.mapSettings, decorationLabelVisible: visible },
         }))
         scheduleBackendSync(get())
       },

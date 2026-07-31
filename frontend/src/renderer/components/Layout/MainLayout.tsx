@@ -10,12 +10,18 @@ import {
   Users,
   LogOut,
   ChevronRight,
+  Package,
+  Smartphone,
+  Download,
+  X,
+  Loader2,
 } from 'lucide-react'
 import { useState, useEffect } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useAuthStore } from '../../store/authStore'
 import { reloadUserMapSettings } from '../../store/mapStore'
 import { GlobalTaskIndicator } from './GlobalTaskIndicator'
+import { appVersionsApi } from '../../services/api'
 
 // --- 导航项类型定义 ---
 type NavLink = { type: 'link'; name: string; href: string; icon?: LucideIcon }
@@ -53,20 +59,74 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
     { type: 'link', name: t('nav.map'), href: '/map', icon: Map },
     { type: 'link', name: t('nav.config'), href: '/license', icon: Shield },
     ...(isAuthenticated && user?.is_admin ? [
-      { type: 'link' as const, name: t('admin.title', '用户管理'), href: '/admin/users', icon: Users }
+      { type: 'link' as const, name: t('admin.title', '用户管理'), href: '/admin/users', icon: Users },
+      { type: 'link' as const, name: t('sidebar.appVersions', 'APP 版本管理'), href: '/app-versions', icon: Package },
     ] : []),
   ]
 
-  /** 判断分组是否展开：仅由用户手动切换控制，默认收起 */
+  /** 判断分组是否展开：用户手动切换或当前路径匹配子项时自动展开 */
   const isGroupExpanded = (group: NavGroup) => {
+    // 当前路径匹配子项时自动展开
+    if (group.children.some(child => location.pathname === child.href)) {
+      return true
+    }
     return expandedGroups.has(group.name)
   }
+
+  // 路由变化时自动展开匹配的分组（刷新页面也用）
+  useEffect(() => {
+    const groupsToExpand = navigation
+      .filter((item): item is NavGroup =>
+        item.type === 'group' &&
+        item.children.some(child => location.pathname === child.href)
+      )
+      .map(g => g.name)
+
+    if (groupsToExpand.length > 0) {
+      setExpandedGroups(prev => {
+        const next = new Set(prev)
+        groupsToExpand.forEach(name => next.add(name))
+        if (groupsToExpand.every(name => prev.has(name))) return prev
+        return next
+      })
+    }
+  }, [location.pathname])
 
   const toggleGroup = (groupName: string) => {
     const next = new Set(expandedGroups)
     if (next.has(groupName)) next.delete(groupName)
     else next.add(groupName)
     setExpandedGroups(next)
+  }
+
+  // ===== 手机APP下载弹窗 =====
+  const [showAppDownload, setShowAppDownload] = useState(false)
+  const [latestVersion, setLatestVersion] = useState<any>(null)
+  const [versionLoading, setVersionLoading] = useState(false)
+
+  useEffect(() => {
+    if (!showAppDownload) return
+    setVersionLoading(true)
+    appVersionsApi.getLatest()
+      .then((res: any) => {
+        if (res?.success && res?.data) setLatestVersion(res.data)
+        else setLatestVersion(null)
+      })
+      .catch(() => setLatestVersion(null))
+      .finally(() => setVersionLoading(false))
+  }, [showAppDownload])
+
+  const getFullDownloadUrl = (downloadUrl: string) => {
+    if (!downloadUrl) return ''
+    if (downloadUrl.startsWith('http')) return downloadUrl
+    const base = window.location.origin
+    return `${base}${downloadUrl}`
+  }
+
+  const formatSize = (size: number) => {
+    if (!size) return ''
+    const mb = size / (1024 * 1024)
+    return `${mb.toFixed(1)} MB`
   }
 
   const handleLogout = async () => {
@@ -332,30 +392,126 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
             }}
             title={sidebarOpen ? t('common.collapseSidebar') : t('common.expandSidebar')}
           >
-            {/* >>> 样式箭头 */}
+            {/* > 样式箭头 */}
             <span
               style={{
-                fontSize: '12px',
+                fontSize: '16px',
                 fontWeight: 'bold',
                 color: 'hsl(var(--muted-foreground))',
-                letterSpacing: '-1px',
                 transition: 'transform 0.35s cubic-bezier(0.25, 0.1, 0.25, 1)',
                 transform: sidebarOpen ? 'rotate(0deg)' : 'rotate(180deg)',
-                display: 'flex',
-                gap: '2px',
               }}
             >
-              {'>>>'}
+              {'>'}
             </span>
           </button>
+
         </aside>
       </div>
 
+      {/* 手机APP按钮 - fixed 固定定位，避免与页面内容层叠 */}
+      <button
+        onClick={() => setShowAppDownload(true)}
+        className="fixed top-3 right-6 z-50 flex items-center gap-1.5 px-3 py-1.5 text-sm text-muted-foreground hover:text-foreground hover:bg-muted rounded-lg transition-colors"
+        title={t('app.downloadTitle')}
+      >
+        <Smartphone size={16} />
+        <span>{t('app.download')}</span>
+      </button>
       {/* 主内容区域 */}
       <main className="flex-1 overflow-auto flex flex-col relative z-10">
+
         <GlobalTaskIndicator />
         {children}
       </main>
+
+      {/* 手机APP下载弹窗 - 放在 main 外部避免地图组件层叠上下文遮挡 */}
+      {showAppDownload && (
+        <div
+          className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/50"
+          onClick={() => setShowAppDownload(false)}
+        >
+          <div
+            className="bg-card border border-border rounded-xl w-full max-w-sm mx-4 shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+              {/* 弹窗头部 */}
+              <div className="flex items-center justify-between px-5 py-4 border-b border-border">
+                <h2 className="font-semibold text-foreground flex items-center gap-2">
+                  <Smartphone size={18} />
+                  {t('app.downloadTitle')}
+                </h2>
+                <button
+                  onClick={() => setShowAppDownload(false)}
+                  className="p-1 rounded-md hover:bg-muted text-muted-foreground"
+                >
+                  <X size={18} />
+                </button>
+              </div>
+
+              {/* 弹窗内容 */}
+              <div className="p-5 flex flex-col items-center space-y-4">
+                {versionLoading ? (
+                  <div className="py-8 text-muted-foreground flex flex-col items-center gap-2">
+                    <Loader2 size={24} className="animate-spin" />
+                    <span className="text-sm">{t('app.loadingVersion')}</span>
+                  </div>
+                ) : latestVersion ? (
+                  <>
+                    {/* 二维码 */}
+                    {(() => {
+                      const downloadUrl = getFullDownloadUrl(latestVersion.download_url)
+                      const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(downloadUrl)}`
+                      return (
+                        <div className="bg-white p-3 rounded-lg shadow-sm border border-border">
+                          <img
+                            src={qrUrl}
+                            alt={t('app.downloadTitle')}
+                            className="w-[200px] h-[200px]"
+                            crossOrigin="anonymous"
+                          />
+                        </div>
+                      )
+                    })()}
+
+                    {/* 版本信息 */}
+                    <div className="text-center">
+                      <p className="text-sm font-semibold text-foreground">
+                        {t('app.latestVersion')} V{latestVersion.version}
+                        {latestVersion.file_size_display ? ` · ${latestVersion.file_size_display}` : ''}
+                      </p>
+                      {latestVersion.changelog && (
+                        <p className="text-xs text-muted-foreground mt-1 max-w-xs whitespace-pre-line">
+                          {latestVersion.changelog}
+                        </p>
+                      )}
+                    </div>
+
+                    {/* 扫码提示 */}
+                    <p className="text-xs text-muted-foreground">
+                      {t('app.installHint')}
+                    </p>
+
+                    {/* 下载按钮 */}
+                    <a
+                      href={getFullDownloadUrl(latestVersion.download_url)}
+                      download
+                      className="inline-flex items-center gap-2 px-6 py-2.5 bg-primary text-primary-foreground rounded-lg hover:opacity-90 transition-opacity text-sm font-medium"
+                    >
+                      <Download size={16} />
+                      <span>{t('app.downloadApk')}</span>
+                    </a>
+                  </>
+                ) : (
+                  <div className="py-8 text-muted-foreground text-center">
+                    <p className="text-sm">{t('app.noVersionAvailable')}</p>
+                    <p className="text-xs mt-1">{t('app.uploadApkHint')}</p>
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
     </div>
   )
 }

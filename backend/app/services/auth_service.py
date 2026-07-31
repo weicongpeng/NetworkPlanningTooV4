@@ -11,7 +11,7 @@ from jose import jwt, JWTError
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
-from app.models.database import User, UserSession
+from app.models.database import User, UserSession, UserSettings, TaskResult, Workbook, Site, Sector, GeoFile, Layer
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
@@ -72,6 +72,17 @@ class AuthService:
                 return None, "授权已过期，请联系管理员"
         return user, None
 
+    @staticmethod
+    def get_client_ip(request) -> str:
+        """获取客户端真实IP，优先从 Cloudflare / X-Forwarded-For 头获取"""
+        cf_ip = request.headers.get("CF-Connecting-IP")
+        if cf_ip:
+            return cf_ip.strip()
+        forwarded = request.headers.get("X-Forwarded-For")
+        if forwarded:
+            return forwarded.split(",")[0].strip()
+        return request.client.host if request.client else "unknown"
+
     def update_last_login(self, db: Session, user: User, ip_address: Optional[str] = None):
         """更新最后登录时间和IP"""
         user.last_login = datetime.now(timezone.utc)
@@ -118,7 +129,8 @@ class AuthService:
 
     def update_user(self, db: Session, user_id: int, updates: dict) -> Optional[User]:
         """更新用户字段（不含密码）"""
-        allowed_fields = {"is_active", "is_admin", "license_expiry", "must_change_password", "total_usage_seconds", "city", "operator"}
+        allowed_fields = {"is_active", "is_admin", "license_expiry", "must_change_password", "total_usage_seconds", "city", "operator",
+                          "can_data_import", "can_data_delete", "can_data_update", "can_cell_entry"}
         user = self.get_user_by_id(db, user_id)
         if not user:
             return None
@@ -173,11 +185,13 @@ class AuthService:
 
     # ---- 会话管理 ----
 
-    def record_session(self, db: Session, user_id: int, token_jti: str, ip_address: Optional[str] = None) -> UserSession:
-        session = UserSession(user_id=user_id, token_jti=token_jti, ip_address=ip_address)
+    def record_session(self, db: Session, user_id: int, token_jti: str, ip_address: Optional[str] = None, client_type: str = 'pc') -> UserSession:
+        session = UserSession(user_id=user_id, token_jti=token_jti, ip_address=ip_address, client_type=client_type)
         db.add(session)
         db.commit()
         db.refresh(session)
+        # 清理其他过期会话，自动累加使用时长
+        self.cleanup_stale_sessions(db, idle_minutes=6)
         return session
 
     def get_active_session_from_other_ip(self, db: Session, user_id: int, current_ip: str) -> Optional[UserSession]:
@@ -193,15 +207,16 @@ class AuthService:
             UserSession.last_activity >= cutoff,
         ).first()
 
-    def end_other_ip_sessions(self, db: Session, user_id: int, current_ip: str) -> int:
-        """结束用户来自其他IP的所有活跃会话，返回结束数量"""
-        if not current_ip:
+    def end_other_ip_sessions(self, db: Session, user_id: int, current_ip: str, client_type: str = 'pc') -> int:
+        """结束用户来自其他IP的同类型活跃会话，返回结束数量。APP端不踢出任何会话。"""
+        if not current_ip or client_type != 'pc':
             return 0
         now = datetime.now(timezone.utc)
         cutoff = now - timedelta(minutes=settings.JWT_ACCESS_TOKEN_EXPIRE_MINUTES)
         sessions = db.query(UserSession).filter(
             UserSession.user_id == user_id,
             UserSession.logout_time.is_(None),
+            UserSession.client_type == client_type,
             UserSession.ip_address.isnot(None),
             UserSession.ip_address != current_ip,
             UserSession.last_activity >= cutoff,
@@ -215,6 +230,41 @@ class AuthService:
             db.commit()
         return count
 
+    def _accumulate_session_duration(self, db: Session, session: UserSession, end_time: Optional[datetime] = None):
+        """累加指定会话的使用时长到用户记录"""
+        if end_time is None:
+            end_time = datetime.now(timezone.utc)
+        login_time = session.login_time
+        if login_time.tzinfo is None:
+            login_time = login_time.replace(tzinfo=timezone.utc)
+        duration = (end_time - login_time).total_seconds()
+        if duration > 0:
+            user = db.query(User).filter(User.id == session.user_id).first()
+            if user:
+                user.total_usage_seconds += int(duration)
+
+    def cleanup_stale_sessions(self, db: Session, idle_minutes: int = 5) -> int:
+        """清理超过 N 分钟无活动的过期会话，以最后活动时间作为离线时间点累加使用时长。
+
+        解决直接关闭浏览器/APP 不调登出接口导致使用时长统计为 0 的问题。
+        返回清理的会话数量。
+        """
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=idle_minutes)
+        stale_sessions = db.query(UserSession).filter(
+            UserSession.logout_time.is_(None),
+            UserSession.last_activity < cutoff,
+        ).all()
+        now = datetime.now(timezone.utc)
+        for s in stale_sessions:
+            end_time = s.last_activity
+            if end_time.tzinfo is None:
+                end_time = end_time.replace(tzinfo=timezone.utc)
+            self._accumulate_session_duration(db, s, end_time)
+            s.logout_time = s.last_activity  # 以最后活动时间作为离线时间
+        if stale_sessions:
+            db.commit()
+        return len(stale_sessions)
+
     def end_session(self, db: Session, token_jti: str) -> bool:
         """结束会话，累加使用时长"""
         session = db.query(UserSession).filter(UserSession.token_jti == token_jti).first()
@@ -224,14 +274,7 @@ class AuthService:
         session.logout_time = now
         session.last_activity = now
 
-        # 累加使用时长 (SQLite 可能丢失时区信息, 确保比较时类型一致)
-        login_time = session.login_time
-        if login_time.tzinfo is None:
-            login_time = login_time.replace(tzinfo=timezone.utc)
-        duration = (now - login_time).total_seconds()
-        user = db.query(User).filter(User.id == session.user_id).first()
-        if user:
-            user.total_usage_seconds += int(duration)
+        self._accumulate_session_duration(db, session, now)
 
         db.commit()
         return True
@@ -254,7 +297,7 @@ class AuthService:
         return session is not None
 
     def verify_session_ip(self, db: Session, token_jti: str, current_ip: str) -> bool:
-        """验证请求IP是否与会话记录IP一致"""
+        """验证请求IP是否与会话记录IP一致。APP会话跳过IP校验。"""
         if not current_ip or current_ip == "unknown":
             return True  # 无法获取IP时放行
         session = db.query(UserSession).filter(UserSession.token_jti == token_jti).first()
@@ -262,6 +305,8 @@ class AuthService:
             return True  # 会话不存在时放行（由其他逻辑处理）
         if not session.ip_address:
             return True  # 旧会话没有IP记录，放行
+        if session.client_type == 'app':
+            return True  # APP会话不校验IP，允许多设备同时登录
         return session.ip_address == current_ip
 
     def get_user_sessions(self, db: Session, user_id: int) -> list:
@@ -277,12 +322,34 @@ class AuthService:
         ).first()
         return session is not None
 
+    def is_user_online_by_client_type(self, db: Session, user_id: int, client_type: str) -> bool:
+        """按客户端类型检查用户在线状态"""
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=5)
+        session = db.query(UserSession).filter(
+            UserSession.user_id == user_id,
+            UserSession.client_type == client_type,
+            UserSession.logout_time.is_(None),
+            UserSession.last_activity >= cutoff,
+        ).first()
+        return session is not None
+
     def delete_user(self, db: Session, user_id: int) -> bool:
-        """硬删除用户及其会话记录"""
+        """硬删除用户及其所有关联数据"""
         user = self.get_user_by_id(db, user_id)
         if not user:
             return False
+        # 级联删除所有关联数据（按外键依赖顺序）
         db.query(UserSession).filter(UserSession.user_id == user_id).delete()
+        db.query(UserSettings).filter(UserSettings.user_id == user_id).delete()
+        db.query(TaskResult).filter(TaskResult.user_name == user.username).delete()
+        # 获取该用户的所有 workbook_id
+        workbook_ids = [w.id for w in db.query(Workbook).filter(Workbook.user_id == user_id).all()]
+        for wid in workbook_ids:
+            db.query(Sector).filter(Sector.workbook_id == wid).delete()
+            db.query(Site).filter(Site.workbook_id == wid).delete()
+        db.query(Workbook).filter(Workbook.user_id == user_id).delete()
+        db.query(GeoFile).filter(GeoFile.user_id == user_id).delete()
+        db.query(Layer).filter(Layer.user_id == user_id).delete()
         db.delete(user)
         db.commit()
         return True

@@ -689,16 +689,19 @@ export class MapInfoLayer {
           // 恢复默认样式 (重新触发 GeoJSON 的 style 函数)
           this.geoJSONLayer?.resetStyle(layer)
         }
-      } else if (layer instanceof L.CircleMarker) {
-        if (isSelected) {
-          layer.setStyle({
-            color: '#ef4444',
-            weight: 3,
-            opacity: 1
-          })
-          if (layer.bringToFront) layer.bringToFront()
-        } else {
-          this.geoJSONLayer?.resetStyle(layer)
+      } else if (layer instanceof L.Marker) {
+        // Marker（点要素）高亮：修改图标添加高亮框
+        const markerEl = layer.getElement()
+        if (markerEl) {
+          if (isSelected) {
+            markerEl.style.outline = '2px solid #ef4444'
+            markerEl.style.outlineOffset = '2px'
+            markerEl.style.borderRadius = '2px'
+          } else {
+            markerEl.style.outline = ''
+            markerEl.style.outlineOffset = ''
+            markerEl.style.borderRadius = ''
+          }
         }
       }
     })

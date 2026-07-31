@@ -245,6 +245,49 @@ async def apply_tac_planning_to_params(task_id: str) -> Dict[str, Any]:
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.post("/planning/apply-batch", response_model=Dict[str, Any])
+async def apply_tac_planning_batch(request: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    批量将多个TAC规划结果应用到全量工参
+
+    收集所有指定任务的规划结果，合并后一次性更新SQLite和Excel。
+    """
+    try:
+        task_ids = request.get("taskIds", [])
+        if not task_ids or not isinstance(task_ids, list):
+            raise HTTPException(status_code=400, detail="请提供有效的taskIds列表")
+
+        apply_task_id = await task_manager.create_apply_tac_planning_batch_task(task_ids)
+
+        for _ in range(50):
+            await asyncio.sleep(0.2)
+            progress = task_manager.get_task_progress(apply_task_id)
+            if progress and progress.get("status") in ("completed", "failed"):
+                result = task_manager.get_task_result(apply_task_id)
+                return {
+                    "success": True,
+                    "data": {
+                        "taskId": apply_task_id,
+                        "result": result,
+                        "message": result.get("message", "TAC批量应用完成") if result else "TAC批量应用完成"
+                    }
+                }
+
+        return {
+            "success": True,
+            "data": {
+                "taskId": apply_task_id,
+                "message": "TAC批量应用到工参任务已启动..."
+            }
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get("/planning/apply-to-params/progress/{apply_task_id}", response_model=Dict[str, Any])
 async def get_apply_tac_planning_progress(apply_task_id: str) -> Dict[str, Any]:
     """获取TAC规划应用到工参任务进度"""

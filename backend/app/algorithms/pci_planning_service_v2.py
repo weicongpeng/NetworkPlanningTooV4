@@ -4,6 +4,8 @@ PCI规划服务 - 基于NetworkPlanningTool_V1.py的逻辑重构
 
 import math
 from typing import List, Dict, Optional, Tuple, Callable, Awaitable
+
+import numpy as np
 from dataclasses import dataclass, field
 from enum import Enum
 import asyncio
@@ -137,6 +139,30 @@ class PCIPlanningService:
         self.assigned_pcis = []  # List of (pci, longitude, latitude, earfcn)
         # 存储背景PCI（全量工参中的其他小区）
         self.background_assigned_pcis = []  # List of (pci, longitude, latitude, earfcn)
+
+        # NumPy 结构数组（用于向量化距离计算）
+        self._assigned_np: Optional[np.ndarray] = None
+        self._bg_assigned_np: Optional[np.ndarray] = None
+        self._assigned_np_dirty = True
+        self._bg_assigned_np_dirty = True
+
+    def _rebuild_assigned_np(self) -> None:
+        """从 Python 列表重建 NumPy 结构数组（dirty flag 控制，避免重复重建）"""
+        if self._assigned_np_dirty:
+            self._assigned_np = None
+            if self.assigned_pcis:
+                arr = np.array(self.assigned_pcis, dtype=np.float64)
+                if arr.ndim == 2 and arr.shape[1] == 4:
+                    self._assigned_np = arr
+            self._assigned_np_dirty = False
+
+        if self._bg_assigned_np_dirty:
+            self._bg_assigned_np = None
+            if self.background_assigned_pcis:
+                arr = np.array(self.background_assigned_pcis, dtype=np.float64)
+                if arr.ndim == 2 and arr.shape[1] == 4:
+                    self._bg_assigned_np = arr
+            self._bg_assigned_np_dirty = False
 
     def _get_pci_range(self) -> Tuple[int, int]:
         """获取PCI范围"""
@@ -434,29 +460,48 @@ class PCIPlanningService:
         """
         min_distance = float("inf")
 
-        # 1. 检查已分配的PCI
-        for assigned in self.assigned_pcis:
-            pci, lat, lon, earfcn = assigned
-            if pci != candidate_pci:
-                continue
-            # 只检查同频小区
-            if not self._is_same_frequency(target_earfcn, earfcn):
-                continue
-            dist = self.calculate_distance(target_lat, target_lon, lat, lon)
-            if dist < min_distance:
-                min_distance = dist
+        # 同步 NumPy 数组
+        self._rebuild_assigned_np()
 
-        # 2. 检查背景小区（存量干扰）
-        for bg in self.background_assigned_pcis:
-            pci, lat, lon, earfcn = bg
-            if pci != candidate_pci:
-                continue
-            # 只检查同频小区
-            if not self._is_same_frequency(target_earfcn, earfcn):
-                continue
-            dist = self.calculate_distance(target_lat, target_lon, lat, lon)
-            if dist < min_distance:
-                min_distance = dist
+        # 1. 向量化检查已分配的PCI
+        if self._assigned_np is not None and len(self._assigned_np) > 0:
+            same_pci_mask = self._assigned_np[:, 0] == candidate_pci
+            if np.any(same_pci_mask):
+                filtered = self._assigned_np[same_pci_mask]
+                if target_earfcn is not None:
+                    same_freq_mask = np.abs(filtered[:, 3] - target_earfcn) <= 0.1
+                    filtered = filtered[same_freq_mask & ~np.isnan(filtered[:, 3])]
+                else:
+                    # target_earfcn unknown: exclude all (matches _is_same_frequency where None+anything=False)
+                    filtered = filtered[:0]
+                if len(filtered) > 0:
+                    dists = DistanceCalculator.batch_haversine(
+                        np.array([target_lat]), np.array([target_lon]),
+                        filtered[:, 1], filtered[:, 2]
+                    )[0]
+                    min_dist = np.min(dists)
+                    if min_dist < min_distance:
+                        min_distance = min_dist
+
+        # 2. 向量化检查背景小区（存量干扰）
+        if self._bg_assigned_np is not None and len(self._bg_assigned_np) > 0:
+            same_pci_mask = self._bg_assigned_np[:, 0] == candidate_pci
+            if np.any(same_pci_mask):
+                filtered = self._bg_assigned_np[same_pci_mask]
+                if target_earfcn is not None:
+                    same_freq_mask = np.abs(filtered[:, 3] - target_earfcn) <= 0.1
+                    filtered = filtered[same_freq_mask & ~np.isnan(filtered[:, 3])]
+                else:
+                    # target_earfcn unknown: exclude all (matches _is_same_frequency where None+anything=False)
+                    filtered = filtered[:0]
+                if len(filtered) > 0:
+                    dists = DistanceCalculator.batch_haversine(
+                        np.array([target_lat]), np.array([target_lon]),
+                        filtered[:, 2], filtered[:, 1]
+                    )[0]
+                    min_dist = np.min(dists)
+                    if min_dist < min_distance:
+                        min_distance = min_dist
 
         # 3. 检查原始工参数据中的PCI（包括本站PCI）
         for sector in all_sectors:
@@ -639,6 +684,7 @@ class PCIPlanningService:
                     self.assigned_pcis.append(
                         (assigned_pci, sector.latitude, sector.longitude, sector.earfcn)
                     )
+                    self._assigned_np_dirty = True
 
                     # 生成透明的返回信息（注明这是"分配时"的距离）
                     if threshold_idx == 0:
@@ -680,6 +726,7 @@ class PCIPlanningService:
                                         sector.earfcn,
                                     )
                                 )
+                                self._assigned_np_dirty = True
 
                                 # 生成透明的返回信息（注明这是"分配时"的距离）
                                 if threshold_idx == 0:
@@ -705,6 +752,7 @@ class PCIPlanningService:
                     self.assigned_pcis.append(
                         (assigned_pci, sector.latitude, sector.longitude, sector.earfcn)
                     )
+                    self._assigned_np_dirty = True
 
                     # 生成透明的返回信息（注明这是"分配时"的距离）
                     if threshold_idx == 0:
@@ -784,6 +832,7 @@ class PCIPlanningService:
             self.assigned_pcis.append(
                 (best_compromise_pci, sector.latitude, sector.longitude, sector.earfcn)
             )
+            self._assigned_np_dirty = True
 
             # 生成透明的返回信息（注明这是"分配时"的距离）
             constraint_status = (
@@ -819,6 +868,7 @@ class PCIPlanningService:
         self.assigned_pcis.append(
             (fallback_pci, sector.latitude, sector.longitude, sector.earfcn)
         )
+        self._assigned_np_dirty = True
         # 生成透明的返回信息（注明这是"分配时"的距离）
         constraint_status = "✅" if min_distance >= original_threshold else "❌"
         if min_distance >= original_threshold:
@@ -969,6 +1019,7 @@ class PCIPlanningService:
                             bg_frequency,
                         )
                     )
+                    self._bg_assigned_np_dirty = True
             print(f"[PCI规划] 加载背景小区: {bg_count} 个 (已剔除待规划小区)")
 
         total_sites = len(sites_data)
@@ -1229,6 +1280,29 @@ class PCIPlanningService:
                     )
 
                     # 计算每个小区的最小复用距离
+                    # 向量化：预先提取 NumPy 数组用于批量距离计算
+                    planned_lats = np.array(
+                        [c["latitude"] for c in planned_cells], dtype=np.float64
+                    )
+                    planned_lons = np.array(
+                        [c["longitude"] for c in planned_cells], dtype=np.float64
+                    )
+                    planned_pcis = np.array(
+                        [c["new_pci"] for c in planned_cells], dtype=np.int32
+                    )
+                    planned_earfcns = np.array(
+                        [
+                            c["earfcn"] if c["earfcn"] is not None else np.nan
+                            for c in planned_cells
+                        ],
+                        dtype=np.float64,
+                    )
+
+                    # 全量距离矩阵 (N×N) — 一次性计算
+                    planned_dist_matrix = DistanceCalculator.batch_distance_matrix(
+                        planned_lats, planned_lons
+                    )
+
                     for i, cell in enumerate(planned_cells):
                         min_distance = float("inf")
 
@@ -1236,164 +1310,121 @@ class PCIPlanningService:
                         cell_lon = cell["longitude"]
                         cell_lat = cell["latitude"]
                         if cell["cell_key"] in full_params_cells:
-                            cell_lon = full_params_cells[cell["cell_key"]]["longitude"]
-                            cell_lat = full_params_cells[cell["cell_key"]]["latitude"]
+                            cell_lon = full_params_cells[cell["cell_key"]][
+                                "longitude"
+                            ]
+                            cell_lat = full_params_cells[cell["cell_key"]][
+                                "latitude"
+                            ]
 
                         # 用于记录最小复用距离的对端小区名称
                         min_distance_sector_name = None
 
-                        # 1. 查找规划结果中同频同PCI的其他小区
-                        for j, other_cell in enumerate(planned_cells):
-                            if i == j:  # 跳过自身
-                                continue
+                        target_pci = cell["new_pci"]
+                        target_earfcn = cell.get("earfcn")
 
-                            # 检查是否同PCI
-                            if cell["new_pci"] != other_cell["new_pci"]:
-                                continue
+                        # 1. 向量化：在规划结果中查找同频同PCI的其他小区
+                        same_pci_mask = planned_pcis == target_pci
+                        same_pci_mask[i] = False  # 排除自身
 
-                            # 检查是否同频(使用改进的频点判断逻辑)
-                            cell_earfcn = cell.get("earfcn")
-                            other_earfcn = other_cell.get("earfcn")
-
-                            # 使用改进的频点判断逻辑
-                            if not self._is_same_frequency(cell_earfcn, other_earfcn):
-                                continue  # 不同频，跳过
-
-                            # 获取其他小区的经纬度（优先使用全量工参中的经纬度）
-                            other_lon = other_cell["longitude"]
-                            other_lat = other_cell["latitude"]
-                            if other_cell["cell_key"] in full_params_cells:
-                                other_lon = full_params_cells[other_cell["cell_key"]][
-                                    "longitude"
-                                ]
-                                other_lat = full_params_cells[other_cell["cell_key"]][
-                                    "latitude"
-                                ]
-
-                            # 计算距离
-                            distance = self.calculate_distance(
-                                cell_lat, cell_lon, other_lat, other_lon
+                        # 向量化频点判断（复制 _is_same_frequency 语义）
+                        if target_earfcn is not None:
+                            same_freq_mask = np.isclose(
+                                planned_earfcns, target_earfcn, rtol=0, atol=0.1
                             )
-                            if distance < min_distance:
-                                min_distance = distance
-                                # 记录对端小区名称
-                                min_distance_sector_name = other_cell.get(
-                                    "sector_obj"
-                                ).sector_name
+                        else:
+                            same_freq_mask = np.isnan(planned_earfcns)
 
-                        # 2. 查找全量工参中同频同PCI的存量小区
-                        # 构建同频同PCI的存量小区列表（用于距离计算）
-                        same_pci_same_freq_cells = []
+                        combined_mask = same_pci_mask & same_freq_mask
+                        if np.any(combined_mask):
+                            min_distance = np.min(
+                                planned_dist_matrix[i, combined_mask]
+                            )
+                            # 记录对端小区名称
+                            nearest_idx = np.argmin(
+                                planned_dist_matrix[i, combined_mask]
+                            )
+                            actual_idx = np.where(combined_mask)[0][nearest_idx]
+                            min_distance_sector_name = planned_cells[
+                                actual_idx
+                            ].get("sector_obj").sector_name
 
-                        # 先从planned_cells中收集同频同PCI的小区
-                        for j, other_cell in enumerate(planned_cells):
-                            if i == j:
-                                continue  # 跳过自身
+                        # 2. 向量化：在全量工参中查找同频同PCI的存量小区
+                        if target_pci in full_params_by_pci:
+                            fp_cells = full_params_by_pci[target_pci]
+                            fp_lats = np.array(
+                                [c.get("latitude", np.nan) for c in fp_cells],
+                                dtype=np.float64,
+                            )
+                            fp_lons = np.array(
+                                [c.get("longitude", np.nan) for c in fp_cells],
+                                dtype=np.float64,
+                            )
+                            fp_earfcns = np.array(
+                                [
+                                    (
+                                        c.get("earfcn")
+                                        if c.get("earfcn") is not None
+                                        else np.nan
+                                    )
+                                    for c in fp_cells
+                                ],
+                                dtype=np.float64,
+                            )
 
-                            # 只考虑同PCI的小区（使用规划后的新PCI）
-                            if cell["new_pci"] != other_cell["new_pci"]:
-                                continue
+                            # 过滤同频
+                            if target_earfcn is not None:
+                                fp_freq_mask = np.isclose(
+                                    fp_earfcns, target_earfcn, rtol=0, atol=0.1
+                                )
+                            else:
+                                fp_freq_mask = np.isnan(fp_earfcns)
 
-                            # 检查是否同频
-                            cell_earfcn = cell.get("earfcn")
-                            other_earfcn = other_cell.get("earfcn")
-
-                            if self._is_same_frequency(cell_earfcn, other_earfcn):
-                                same_pci_same_freq_cells.append(
-                                    {
-                                        "cell": other_cell,
-                                        "longitude": other_cell.get("longitude"),
-                                        "latitude": other_cell.get("latitude"),
-                                        "earfcn": other_cell.get("earfcn"),
-                                    }
+                            if np.any(fp_freq_mask):
+                                fp_distances = (
+                                    DistanceCalculator.batch_haversine(
+                                        np.array([cell_lat]),
+                                        np.array([cell_lon]),
+                                        fp_lats[fp_freq_mask],
+                                        fp_lons[fp_freq_mask],
+                                    )[0]
                                 )
 
-                        # 再从full_params_cells中查找同频同PCI的存量小区
-                        if cell["new_pci"] in full_params_by_pci:
-                            for other_cell_info in full_params_by_pci[cell["new_pci"]]:
-                                # 注意：full_params_by_pci已经排除了本次规划的小区，所以不需要检查key
-
-                                # 检查是否同频
-                                cell_earfcn = cell.get("earfcn")
-                                other_earfcn = other_cell_info.get("earfcn")
-
-                                if self._is_same_frequency(cell_earfcn, other_earfcn):
-                                    # 添加到列表，同时查找sector_name
-                                    sector_name = None
-                                    cell_key = other_cell_info.get("cell_key")
-                                    for site in sites_list:
-                                        for sector in site.get("sectors", []):
-                                            if (
-                                                sector.get("id")
-                                                == cell_key.split("_")[-1]
+                                # 过滤自身（距离非常小的情况）
+                                valid_mask = fp_distances >= 0.001
+                                if np.any(valid_mask):
+                                    fp_min = np.min(fp_distances[valid_mask])
+                                    if fp_min < min_distance:
+                                        min_distance = fp_min
+                                        # 查找对端小区名称
+                                        fp_idx = np.argmin(
+                                            fp_distances[valid_mask]
+                                        )
+                                        actual_fp_idx = np.where(fp_freq_mask)[
+                                            0
+                                        ][valid_mask][fp_idx]
+                                        fp_cell = fp_cells[actual_fp_idx]
+                                        cell_key = fp_cell.get("cell_key")
+                                        sector_name = None
+                                        for site in sites_list:
+                                            for sector in site.get(
+                                                "sectors", []
                                             ):
-                                                sector_name = sector.get(
-                                                    "name", f"小区_{cell_key}"
-                                                )
+                                                if (
+                                                    sector.get("id")
+                                                    == cell_key.split("_")[-1]
+                                                ):
+                                                    sector_name = sector.get(
+                                                        "name",
+                                                        f"小区_{cell_key}",
+                                                    )
+                                                    break
+                                            if sector_name:
                                                 break
                                         if sector_name:
-                                            break
-
-                                    same_pci_same_freq_cells.append(
-                                        {
-                                            "cell": other_cell_info,
-                                            "longitude": other_cell_info.get(
-                                                "longitude"
-                                            ),
-                                            "latitude": other_cell_info.get("latitude"),
-                                            "earfcn": other_cell_info.get("earfcn"),
-                                            "sector_name": sector_name,
-                                        }
-                                    )
-
-                        # 现在从所有同频同PCI的小区中找到距离最近的
-                        min_distance = float("inf")
-                        min_distance_sector_name = None
-
-                        for same_freq_cell in same_pci_same_freq_cells:
-                            # 计算距离
-                            if (
-                                same_freq_cell["longitude"] is not None
-                                and same_freq_cell["latitude"] is not None
-                            ):
-                                if (
-                                    same_freq_cell["longitude"] == cell_lon
-                                    and same_freq_cell["latitude"] == cell_lat
-                                ):
-                                    # 同一小区，跳过
-                                    continue
-
-                                distance = self.calculate_distance(
-                                    cell_lat,
-                                    cell_lon,
-                                    same_freq_cell["latitude"],
-                                    same_freq_cell["longitude"],
-                                )
-
-                                # 过滤自身(距离非常小的情况)
-                                if distance < 0.001:
-                                    continue
-
-                                if distance < min_distance:
-                                    min_distance = distance
-                                    # 记录对端小区名称
-                                    if "sector_name" in same_freq_cell:
-                                        min_distance_sector_name = same_freq_cell[
-                                            "sector_name"
-                                        ]
-                                    else:
-                                        # 从映射中查找
-                                        if (
-                                            "cell" in same_freq_cell
-                                            and "cell_key" in same_freq_cell["cell"]
-                                        ):
-                                            cell_key = same_freq_cell["cell"][
-                                                "cell_key"
-                                            ]
-                                            if cell_key in cell_key_to_name:
-                                                min_distance_sector_name = (
-                                                    cell_key_to_name[cell_key]
-                                                )
+                                            min_distance_sector_name = (
+                                                sector_name
+                                            )
 
                         # 更新规划结果中的最小复用距离、对端小区名称和分配原因
                         # 无论是否找到同频同PCI的小区，都更新分配原因

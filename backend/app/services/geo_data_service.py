@@ -296,7 +296,7 @@ class GeoDataService:
             # 名称
             name_val = rec.get(name_col) if name_col else None
             if name_val is not None and not (isinstance(name_val, float) and math.isnan(name_val)):
-                point["name"] = str(name_val)
+                point["name"] = str(name_val).strip()
             else:
                 point["name"] = "点_" + str(df_idx + 1)
 

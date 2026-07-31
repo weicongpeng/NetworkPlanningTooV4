@@ -3,8 +3,10 @@ import react from '@vitejs/plugin-react'
 import path from 'path'
 
 export default defineConfig({
-  // 使用相对路径，确保 Electron 中能正确加载资源
-  base: './',
+  // 使用绝对路径，确保 SPA 子路由刷新时资源能正确加载
+  // 生产环境由 FastAPI 提供静态文件服务，支持 /assets/ 路径
+  // Electron 构建时需单独处理（使用 base: './' 或自定义协议）
+  base: '/',
   plugins: [react()],
   resolve: {
     alias: {

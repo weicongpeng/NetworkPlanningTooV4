@@ -23,7 +23,6 @@ const TASK_LABELS: Record<string, string> = {
   apply_pci: 'PCI应用',
   apply_tac: 'TAC应用',
   upload: '数据上传',
-  parameter_update: '参数更新',
 }
 
 /** 根据 task.type/type 推断路由（兜底） */

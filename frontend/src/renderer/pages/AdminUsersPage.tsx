@@ -2,10 +2,10 @@ import { useState, useEffect, useCallback } from 'react'
 import { useTranslation } from 'react-i18next'
 import {
   Users, UserPlus, Search, Loader2, Shield, User, Pencil, Trash2,
-  RefreshCw, ChevronLeft, ChevronRight, Key, X, Circle, Ban
+  RefreshCw, ChevronLeft, ChevronRight, Key, X, Circle, Ban, History
 } from 'lucide-react'
 import { adminUserApi } from '../services/api'
-import type { UserInfo } from '@shared/types'
+import type { UserInfo, UserSessionInfo } from '@shared/types'
 
 function formatDuration(seconds: number): string {
   if (seconds < 60) return `${seconds}秒`
@@ -20,7 +20,6 @@ function formatDate(dateStr: string | null): string {
   if (!dateStr) return '-'
   try {
     const d = new Date(dateStr)
-    // 强制显示北京时区（Asia/Shanghai，UTC+8）
     return d.toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })
   } catch {
     return dateStr
@@ -43,6 +42,12 @@ export function AdminUsersPage() {
   const [showResetPwdModal, setShowResetPwdModal] = useState(false)
   const [editUser, setEditUser] = useState<UserInfo | null>(null)
 
+  // Session modal
+  const [sessionUser, setSessionUser] = useState<UserInfo | null>(null)
+  const [sessions, setSessions] = useState<UserSessionInfo[]>([])
+  const [showSessionModal, setShowSessionModal] = useState(false)
+  const [sessionLoading, setSessionLoading] = useState(false)
+
   // Form state
   const [formUsername, setFormUsername] = useState('')
   const [formPassword, setFormPassword] = useState('')
@@ -54,6 +59,10 @@ export function AdminUsersPage() {
   const [formOperator, setFormOperator] = useState('')
   const [formSubmitting, setFormSubmitting] = useState(false)
   const [formError, setFormError] = useState('')
+  const [formCanDataImport, setFormCanDataImport] = useState(false)
+  const [formCanDataDelete, setFormCanDataDelete] = useState(false)
+  const [formCanDataUpdate, setFormCanDataUpdate] = useState(false)
+  const [formCanCellEntry, setFormCanCellEntry] = useState(false)
 
   const fetchUsers = useCallback(async () => {
     setLoading(true)
@@ -69,7 +78,7 @@ export function AdminUsersPage() {
     } finally {
       setLoading(false)
     }
-  }, [page, pageSize, search])
+  }, [page, pageSize, search, t])
 
   useEffect(() => { fetchUsers() }, [fetchUsers])
 
@@ -111,6 +120,10 @@ export function AdminUsersPage() {
     setFormLicenseExpiry(user.license_expiry ? user.license_expiry.slice(0, 10) : '')
     setFormCity(user.city || '')
     setFormOperator(user.operator || '')
+    setFormCanDataImport(!!user.can_data_import)
+    setFormCanDataDelete(!!user.can_data_delete)
+    setFormCanDataUpdate(!!user.can_data_update)
+    setFormCanCellEntry(!!user.can_cell_entry)
     setFormError('')
     setShowEditModal(true)
   }
@@ -126,6 +139,10 @@ export function AdminUsersPage() {
         license_expiry: formLicenseExpiry || null,
         city: formCity || null,
         operator: formOperator || null,
+        can_data_import: formCanDataImport,
+        can_data_delete: formCanDataDelete,
+        can_data_update: formCanDataUpdate,
+        can_cell_entry: formCanCellEntry,
       })
       if (result.success) {
         setShowEditModal(false)
@@ -177,9 +194,30 @@ export function AdminUsersPage() {
   const handleDelete = async (user: UserInfo) => {
     if (!confirm(t('admin.deleteConfirm', { username: user.username }))) return
     try {
-      await adminUserApi.deleteUser(user.id)
-      fetchUsers()
-    } catch { /* ignore */ }
+      const result = await adminUserApi.deleteUser(user.id)
+      if (result.success) {
+        fetchUsers()
+      }
+    } catch (err: any) {
+      setError(err?.message || t('admin.deleteFailed'))
+    }
+  }
+
+  // --- View Sessions ---
+  const openSessions = async (user: UserInfo) => {
+    setSessionUser(user)
+    setSessionLoading(true)
+    setShowSessionModal(true)
+    try {
+      const result = await adminUserApi.getUser(user.id)
+      if (result.success && result.data) {
+        setSessions(result.data.sessions || [])
+      }
+    } catch {
+      setSessions([])
+    } finally {
+      setSessionLoading(false)
+    }
   }
 
   const resetForm = () => {
@@ -191,9 +229,42 @@ export function AdminUsersPage() {
     setFormNewPassword('')
     setFormCity('')
     setFormOperator('')
+    setFormCanDataImport(false)
+    setFormCanDataDelete(false)
+    setFormCanDataUpdate(false)
+    setFormCanCellEntry(false)
     setFormError('')
     setEditUser(null)
   }
+
+  // Per-user session cache: latest PC and APP session
+  const [userSessionsCache, setUserSessionsCache] = useState<Record<number, { pc: UserSessionInfo | null; app: UserSessionInfo | null }>>({})
+
+  // Fetch latest PC and APP session for each user in current page
+  useEffect(() => {
+    const fetchUserSessions = async () => {
+      const cache: Record<number, { pc: UserSessionInfo | null; app: UserSessionInfo | null }> = {}
+      for (const u of users) {
+        try {
+          const result = await adminUserApi.getUser(u.id)
+          if (result.success && result.data?.sessions) {
+            cache[u.id] = {
+              pc: result.data.sessions.find((s: UserSessionInfo) => s.client_type === 'pc') || null,
+              app: result.data.sessions.find((s: UserSessionInfo) => s.client_type === 'app') || null,
+            }
+          }
+        } catch {
+          cache[u.id] = { pc: null, app: null }
+        }
+      }
+      setUserSessionsCache(cache)
+    }
+    if (users.length > 0) fetchUserSessions()
+  }, [users])
+
+  const onlineCount = users.filter(u => u.is_online).length
+  const onlinePcCount = users.filter(u => u.is_online_pc).length
+  const onlineAppCount = users.filter(u => u.is_online_app).length
 
   return (
     <div className="p-6 space-y-6">
@@ -202,10 +273,10 @@ export function AdminUsersPage() {
         <div className="p-2 bg-primary/10 rounded-lg">
           <Users size={24} className="text-primary" />
         </div>
-        <h1 className="text-2xl font-bold text-foreground">{t('admin.title', '用户管理')}</h1>
+        <h1 className="text-base font-bold text-foreground">{t('admin.title', '用户管理')}</h1>
       </div>
 
-      {/* Search & Refresh & Add User */}
+      {/* Search & Refresh & Stats & Add User */}
       <div className="flex gap-3 items-center">
         <div className="relative flex-1 max-w-sm">
           <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground" />
@@ -221,9 +292,17 @@ export function AdminUsersPage() {
         <button
           onClick={fetchUsers}
           className="px-3 py-2 border border-border rounded-lg text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
+          title={t('admin.retry', '刷新')}
         >
           <RefreshCw size={16} />
         </button>
+        <div className="text-sm text-muted-foreground whitespace-nowrap">
+          {t('admin.totalUsers', { count: total })}
+          <span className="mx-2 text-border">|</span>
+          {t('admin.onlineCount')}<span className="text-foreground font-medium mx-0.5">{onlineCount}</span>
+          <span className="ml-1.5">{t('admin.pcCount')}<span className="text-green-400 font-medium mx-0.5">{onlinePcCount}</span></span>
+          <span className="ml-1.5">{t('admin.appCount')}<span className="text-green-400 font-medium mx-0.5">{onlineAppCount}</span></span>
+        </div>
         <button
           onClick={() => { resetForm(); setShowAddModal(true) }}
           className="ml-auto px-4 py-2 bg-primary text-primary-foreground rounded-lg hover:opacity-90 transition-opacity flex items-center gap-2"
@@ -258,102 +337,100 @@ export function AdminUsersPage() {
                 <tr>
                   <th className="px-4 py-3 text-left text-muted-foreground font-medium">{t('auth.username', '用户名')}</th>
                   <th className="px-4 py-3 text-left text-muted-foreground font-medium">{t('admin.role', '角色')}</th>
-                  <th className="px-4 py-3 text-left text-muted-foreground font-medium">{t('admin.status', '状态')}</th>
                   <th className="px-4 py-3 text-left text-muted-foreground font-medium">{t('auth.city', '地市')}</th>
                   <th className="px-4 py-3 text-left text-muted-foreground font-medium">{t('auth.operator', '运营商')}</th>
-                  <th className="px-4 py-3 text-left text-muted-foreground font-medium">{t('auth.equipmentVendor', 'IP地址')}</th>
+                  <th className="px-4 py-3 text-left text-muted-foreground font-medium">{t('admin.licenseExpiry', '许可证到期')}</th>
+                  <th className="px-4 py-3 text-left text-muted-foreground font-medium">{t('admin.clientType', '客户端')}</th>
+                  <th className="px-4 py-3 text-left text-muted-foreground font-medium">{t('admin.status', '状态')}</th>
+                  <th className="px-4 py-3 text-left text-muted-foreground font-medium">{t('admin.loginRecordIp', 'IP地址')}</th>
                   <th className="px-4 py-3 text-left text-muted-foreground font-medium">{t('admin.registrationTime', '注册时间')}</th>
                   <th className="px-4 py-3 text-left text-muted-foreground font-medium">{t('admin.lastLogin', '最后登录')}</th>
                   <th className="px-4 py-3 text-left text-muted-foreground font-medium">{t('admin.usageDuration', '使用时长')}</th>
-                  <th className="px-4 py-3 text-left text-muted-foreground font-medium">{t('admin.licenseExpiry', '许可证到期')}</th>
                   <th className="px-4 py-3 text-left text-muted-foreground font-medium">{t('admin.actions', '操作')}</th>
                 </tr>
               </thead>
               <tbody>
-                {users.map((u) => (
-                  <tr key={u.id} className="border-t border-border hover:bg-muted/30 transition-colors">
-                    <td className="px-4 py-3 text-foreground font-medium">{u.username}</td>
-                    <td className="px-4 py-3">
-                      <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs ${u.is_admin ? 'bg-purple-500/10 text-purple-400' : 'bg-blue-500/10 text-blue-400'}`}>
-                        {u.is_admin ? <Shield size={12} /> : <User size={12} />}
-                        {u.is_admin ? t('admin.admin', '管理员') : t('admin.user', '普通用户')}
-                      </span>
-                    </td>
-                    <td className="px-4 py-3">
-                      <div className="flex items-center gap-1.5">
-                        <span className={`inline-block w-2 h-2 rounded-full ${
-                          u.is_online ? 'bg-green-400' : 'bg-muted-foreground/40'
-                        }`} />
-                        <span className={`text-xs ${u.is_online ? 'text-green-400' : 'text-muted-foreground'}`}>
-                          {u.is_online ? t('admin.online', '在线') : t('admin.offline', '离线')}
-                        </span>
-                      </div>
-                    </td>
-                    <td className="px-4 py-3 text-muted-foreground text-xs">{u.city || '-'}</td>
-                    <td className="px-4 py-3 text-muted-foreground text-xs">{u.operator || '-'}</td>
-                    <td className="px-4 py-3 text-muted-foreground font-mono text-xs">{u.last_login_ip || '-'}</td>
-                    <td className="px-4 py-3 text-muted-foreground text-xs">{formatDate(u.created_at)}</td>
-                    <td className="px-4 py-3 text-muted-foreground text-xs">{formatDate(u.last_login)}</td>
-                    <td className="px-4 py-3 text-muted-foreground text-xs">{formatDuration(u.total_usage_seconds)}</td>
-                    <td className="px-4 py-3">
-                      {u.license_expiry ? (
-                        <span className={`text-xs ${new Date(u.license_expiry) < new Date() ? 'text-red-400' : 'text-muted-foreground'}`}>
-                          {u.license_expiry.slice(0, 10)}
-                        </span>
-                      ) : (
-                        <span className="text-xs text-muted-foreground">{t('admin.unlimited', '无限期')}</span>
-                      )}
-                    </td>
-                    <td className="px-4 py-3">
-                      <div className="flex items-center gap-1">
-                        <button
-                          onClick={() => handleToggleActive(u)}
-                          className={`p-1.5 rounded transition-colors ${
-                            u.is_active
-                              ? 'text-green-400 hover:bg-green-500/10'
-                              : 'text-red-400 hover:bg-red-500/10'
-                          }`}
-                          title={u.is_active ? t('admin.active', '已启用') : t('admin.disabled', '已禁用')}
-                        >
-                          {u.is_active ? <Circle size={14} className="fill-current" /> : <Ban size={14} />}
-                        </button>
-                        <button
-                          onClick={() => openEdit(u)}
-                          className="p-1.5 rounded hover:bg-muted text-muted-foreground hover:text-foreground transition-colors"
-                          title={t('admin.edit', '编辑')}
-                        >
-                          <Pencil size={14} />
-                        </button>
-                        <button
-                          onClick={() => openResetPwd(u)}
-                          className="p-1.5 rounded hover:bg-muted text-muted-foreground hover:text-foreground transition-colors"
-                          title={t('admin.resetPassword', '重置密码')}
-                        >
-                          <Key size={14} />
-                        </button>
-                        <button
-                          onClick={() => handleDelete(u)}
-                          disabled={u.is_admin}
-                          className={`p-1.5 rounded transition-colors ${
-                            u.is_admin
-                              ? 'text-muted-foreground/30 cursor-not-allowed'
-                              : 'hover:bg-red-500/10 text-muted-foreground hover:text-red-400'
-                          }`}
-                          title={u.is_admin ? t('admin.cannotDeleteAdmin', '不能删除管理员') : t('admin.delete', '删除')}
-                        >
-                          <Trash2 size={14} />
-                        </button>
-                      </div>
-                    </td>
-                  </tr>
-                ))}
+                {users.map((u) => {
+                  const sessionInfo = userSessionsCache[u.id] || { pc: null, app: null }
+                  return (
+                    <>
+                      {/* PC 行 */}
+                      <tr key={`${u.id}-pc`} className="border-t border-border hover:bg-muted/30 transition-colors">
+                        <td className="px-4 py-3 text-foreground font-medium" rowSpan={2}>{u.username}</td>
+                        <td className="px-4 py-3" rowSpan={2}>
+                          <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs ${u.is_admin ? 'bg-purple-500/10 text-purple-400' : 'bg-blue-500/10 text-blue-400'}`}>
+                            {u.is_admin ? <Shield size={12} /> : <User size={12} />}
+                            {u.is_admin ? t('admin.admin', '管理员') : t('admin.user', '普通用户')}
+                          </span>
+                        </td>
+                        <td className="px-4 py-3 text-muted-foreground text-xs" rowSpan={2}>{u.city || '-'}</td>
+                        <td className="px-4 py-3 text-muted-foreground text-xs" rowSpan={2}>{u.operator || '-'}</td>
+                        <td className="px-4 py-3" rowSpan={2}>
+                          {u.license_expiry ? (
+                            <span className={`text-xs ${new Date(u.license_expiry) < new Date() ? 'text-red-400' : 'text-muted-foreground'}`}>
+                              {u.license_expiry.slice(0, 10)}
+                            </span>
+                          ) : (
+                            <span className="text-xs text-muted-foreground">{t('admin.unlimited', '无限期')}</span>
+                          )}
+                        </td>
+                        <td className="px-4 py-3 text-xs text-muted-foreground">{t('admin.pcClient', 'PC端')}</td>
+                        <td className="px-4 py-3">
+                          <div className="flex items-center gap-1.5">
+                            <span className={`inline-block w-2 h-2 rounded-full ${(u.is_online_pc ?? u.is_online) ? 'bg-green-400' : 'bg-muted-foreground/40'}`} />
+                            <span className={`text-xs ${(u.is_online_pc ?? u.is_online) ? 'text-green-400' : 'text-muted-foreground'}`}>
+                              {(u.is_online_pc ?? u.is_online) ? t('admin.online', '在线') : t('admin.offline', '离线')}
+                            </span>
+                          </div>
+                        </td>
+                        <td className="px-4 py-3 text-muted-foreground font-mono text-xs">{sessionInfo.pc?.ip_address || u.last_login_ip || '-'}</td>
+                        <td className="px-4 py-3 text-muted-foreground text-xs" rowSpan={2}>{formatDate(u.created_at)}</td>
+                        <td className="px-4 py-3 text-muted-foreground text-xs">{sessionInfo.pc ? formatDate(sessionInfo.pc.login_time) : formatDate(u.last_login)}</td>
+                        <td className="px-4 py-3 text-muted-foreground text-xs">{formatDuration(u.total_usage_seconds)}</td>
+                        <td className="px-4 py-3" rowSpan={2}>
+                          <div className="flex items-center gap-1">
+                            <button onClick={() => openEdit(u)} className="p-1.5 rounded hover:bg-muted text-muted-foreground hover:text-foreground transition-colors" title={t('admin.edit', '编辑')}>
+                              <Pencil size={14} />
+                            </button>
+                            <button onClick={() => openResetPwd(u)} className="p-1.5 rounded hover:bg-muted text-muted-foreground hover:text-foreground transition-colors" title={t('admin.resetPassword', '重置密码')}>
+                              <Key size={14} />
+                            </button>
+                            <button onClick={() => openSessions(u)} className="p-1.5 rounded hover:bg-muted text-muted-foreground hover:text-foreground transition-colors" title={t('admin.viewLoginRecords', '查看登录记录')}>
+                              <History size={14} />
+                            </button>
+                            <button onClick={() => handleToggleActive(u)} className={`p-1.5 rounded transition-colors ${u.is_active ? 'text-green-400 hover:bg-green-500/10' : 'text-red-400 hover:bg-red-500/10'}`} title={u.is_active ? t('admin.active', '已启用') : t('admin.disabled', '已禁用')}>
+                              {u.is_active ? <Circle size={14} className="fill-current" /> : <Ban size={14} />}
+                            </button>
+                            <button onClick={() => handleDelete(u)} disabled={u.is_admin} className={`p-1.5 rounded transition-colors ${u.is_admin ? 'text-muted-foreground/30 cursor-not-allowed' : 'hover:bg-red-500/10 text-muted-foreground hover:text-red-400'}`} title={u.is_admin ? t('admin.cannotDeleteAdmin', '不能删除管理员') : t('admin.delete', '删除')}>
+                              <Trash2 size={14} />
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                      {/* APP 行 */}
+                      <tr key={`${u.id}-app`} className="border-t border-border hover:bg-muted/30 transition-colors">
+                        <td className="px-4 py-3 text-xs text-muted-foreground">{t('admin.appClient', 'APP端')}</td>
+                        <td className="px-4 py-3">
+                          <div className="flex items-center gap-1.5">
+                            <span className={`inline-block w-2 h-2 rounded-full ${u.is_online_app ? 'bg-green-400' : 'bg-muted-foreground/40'}`} />
+                            <span className={`text-xs ${u.is_online_app ? 'text-green-400' : 'text-muted-foreground'}`}>
+                              {u.is_online_app ? t('admin.online', '在线') : t('admin.offline', '离线')}
+                            </span>
+                          </div>
+                        </td>
+                        <td className="px-4 py-3 text-muted-foreground font-mono text-xs">{sessionInfo.app?.ip_address || '-'}</td>
+                        <td className="px-4 py-3 text-muted-foreground text-xs">{sessionInfo.app ? formatDate(sessionInfo.app.login_time) : '-'}</td>
+                        <td className="px-4 py-3 text-muted-foreground text-xs">-</td>
+                      </tr>
+                    </>
+                  )
+                })}
               </tbody>
             </table>
           </div>
 
           {/* Pagination */}
-          <div className="flex items-center justify-between">
-            <span className="text-sm text-muted-foreground">{t('admin.totalUsers', { count: total })}</span>
+          <div className="flex items-center justify-end">
             <div className="flex items-center gap-2">
               <button
                 onClick={() => setPage(p => Math.max(1, p - 1))}
@@ -437,6 +514,41 @@ export function AdminUsersPage() {
                 <span className="text-sm text-foreground">{t('admin.enableAccount')}</span>
               </label>
             </div>
+            <div className="p-3 bg-blue-500/5 border border-blue-500/20 rounded-lg">
+              <div className="flex items-center gap-2 text-sm text-blue-400">
+                <span>📱 APP权限</span>
+                <span className="text-muted-foreground">：{formIsActive ? '已启用' : '已禁用'}</span>
+              </div>
+              <p className="text-xs text-muted-foreground mt-1">APP权限由账号启用状态统一控制</p>
+            </div>
+            <div className="p-3 bg-blue-500/5 border border-blue-500/20 rounded-lg">
+              <div className="flex items-center gap-2 text-sm text-blue-400 mb-2">
+                <span>🖥️ {t('admin.pcDataPermissions', 'PC端数据权限')}</span>
+              </div>
+              <p className="text-xs text-muted-foreground mb-2">{t('admin.permissionsApplyToDataPage', '控制该用户在数据管理页面的操作权限')}</p>
+              {editUser?.is_admin && (
+                <p className="text-xs text-amber-500 mb-2">{t('admin.adminNotRestricted', '管理员不受此限制，开关不生效')}</p>
+              )}
+              <div className="space-y-1.5">
+                {[
+                  { key: 'can_data_import', label: t('admin.permDataImport', '数据导入'), value: formCanDataImport, setter: setFormCanDataImport },
+                  { key: 'can_data_delete', label: t('admin.permDataDelete', '数据删除'), value: formCanDataDelete, setter: setFormCanDataDelete },
+                  { key: 'can_data_update', label: t('admin.permDataUpdate', '工参更新'), value: formCanDataUpdate, setter: setFormCanDataUpdate },
+                  { key: 'can_cell_entry', label: t('admin.permCellEntry', '新站录入'), value: formCanCellEntry, setter: setFormCanCellEntry },
+                ].map((p) => (
+                  <label key={p.key} className={`flex items-center gap-2 cursor-pointer ${editUser?.is_admin ? 'opacity-50 pointer-events-none' : ''}`}>
+                    <input
+                      type="checkbox"
+                      checked={p.value}
+                      onChange={(e) => p.setter(e.target.checked)}
+                      disabled={!!editUser?.is_admin}
+                      className="rounded"
+                    />
+                    <span className="text-sm text-foreground">{p.label}</span>
+                  </label>
+                ))}
+              </div>
+            </div>
             <div>
               <label className="block text-sm text-muted-foreground mb-1">{t('auth.city')}</label>
               <input value={formCity} onChange={(e) => setFormCity(e.target.value)} className="w-full px-3 py-2 bg-background border border-border rounded-lg text-foreground focus:outline-none focus:ring-2 focus:ring-primary/50" placeholder={t('auth.cityPlaceholder')} />
@@ -479,11 +591,52 @@ export function AdminUsersPage() {
           </div>
         </Modal>
       )}
+
+      {/* Session History Modal */}
+      {showSessionModal && sessionUser && (
+        <Modal title={`${t('admin.viewLoginRecords', '查看登录记录')} - ${sessionUser.username}`} onClose={() => setShowSessionModal(false)}>
+          <div className="space-y-3 max-h-80 overflow-y-auto">
+            {sessionLoading ? (
+              <div className="flex justify-center py-8">
+                <Loader2 size={24} className="animate-spin text-muted-foreground" />
+              </div>
+            ) : sessions.length === 0 ? (
+              <div className="text-center py-8 text-muted-foreground text-sm">
+                {t('admin.noUsers', '暂无记录')}
+              </div>
+            ) : (
+              sessions.map((s) => (
+                <div key={s.id} className="p-3 bg-muted/30 rounded-lg border border-border text-sm space-y-1">
+                  <div className="flex items-center gap-2">
+                    <span className="text-muted-foreground">{t('admin.loginRecordTime', '登录时间')}:</span>
+                    <span className="text-foreground">{formatDate(s.login_time)}</span>
+                    <span className={`ml-auto px-1.5 py-0.5 rounded text-xs ${
+                      s.client_type === 'app' ? 'bg-green-500/10 text-green-400' : 'bg-blue-500/10 text-blue-400'
+                    }`}>
+                      {s.client_type === 'app' ? t('admin.appClient', 'APP端') : t('admin.pcClient', 'PC端')}
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <span className="text-muted-foreground">{t('admin.loginRecordIp', 'IP地址')}:</span>
+                    <span className="font-mono">{s.ip_address || '-'}</span>
+                  </div>
+                  {s.logout_time && (
+                    <div className="flex items-center gap-2">
+                      <span className="text-muted-foreground">登出时间:</span>
+                      <span>{formatDate(s.logout_time)}</span>
+                    </div>
+                  )}
+                </div>
+              ))
+            )}
+          </div>
+        </Modal>
+      )}
     </div>
   )
 }
 
-// 内联 Modal 组件（与 LoginModal 保持一致的模式）
+// 内联 Modal 组件
 function Modal({ title, children, onClose }: { title: string; children: React.ReactNode; onClose: () => void }) {
   return (
     <div className="fixed inset-0 z-[6000] flex items-center justify-center bg-black/50 backdrop-blur-sm" onClick={onClose}>

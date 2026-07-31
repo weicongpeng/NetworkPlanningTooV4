@@ -18,6 +18,8 @@ export interface CellSector {
   id: string
   siteId?: string
   name?: string
+  frequency?: number
+  pci?: number
 }
 
 export interface CellSelectionTableProps {
@@ -42,6 +44,8 @@ export interface CellSelectionTableProps {
     siteId: string
     cellId: string
     cellName: string
+    cellFreq: string
+    cellPci: string
     selectAll: string
     clearSelections: string
     uploadCellFile?: string
@@ -137,6 +141,8 @@ export const CellSelectionTable = ({
     siteId: '基站ID',
     cellId: '小区ID',
     cellName: '小区名称',
+    cellFreq: '频点',
+    cellPci: 'PCI',
     selectAll: '全选',
     clearSelections: '清空选择'
   }
@@ -254,6 +260,8 @@ export const CellSelectionTable = ({
                 </div>
                 <div className="p-2 bg-muted border-r border-border w-[80px] shrink-0">{colLabels.siteId}</div>
                 <div className="p-2 bg-muted border-r border-border w-[80px] shrink-0">{colLabels.cellId}</div>
+                <div className="p-2 bg-muted border-r border-border w-[90px] shrink-0">{colLabels.cellFreq}</div>
+                <div className="p-2 bg-muted border-r border-border w-[70px] shrink-0">{colLabels.cellPci}</div>
                 <div className="p-2 bg-muted flex-1 min-w-0">{colLabels.cellName}</div>
               </div>
             </div>
@@ -302,6 +310,20 @@ export const CellSelectionTable = ({
                     style={{ lineHeight: `${ITEM_HEIGHT - 16}px` }}
                   >
                     {sector.id.split('_').pop() || sector.id}
+                  </div>
+                  <div
+                    className="p-2 font-mono truncate border-r border-border w-[90px] shrink-0"
+                    title={sector.frequency != null ? String(sector.frequency) : '-'}
+                    style={{ lineHeight: `${ITEM_HEIGHT - 16}px` }}
+                  >
+                    {sector.frequency != null ? sector.frequency : '-'}
+                  </div>
+                  <div
+                    className="p-2 font-mono truncate border-r border-border w-[70px] shrink-0"
+                    title={sector.pci != null ? String(sector.pci) : '-'}
+                    style={{ lineHeight: `${ITEM_HEIGHT - 16}px` }}
+                  >
+                    {sector.pci != null ? sector.pci : '-'}
                   </div>
                   <div
                     className="p-2 truncate flex-1 min-w-0"

@@ -7,6 +7,7 @@ import os
 import shutil
 import time
 import uuid
+import logging
 from pathlib import Path
 from fastapi import APIRouter, Depends, UploadFile, File, HTTPException, Body, Form
 from fastapi.concurrency import run_in_threadpool
@@ -16,17 +17,22 @@ from app.core.config import settings
 from app.models.schemas import (
     UploadResponse,
     DataItem,
+    CellCreateRequest,
+    CellBatchCreateRequest,
     UpdateParametersRequest,
     ImportPointsRequest,
 )
 from app.services.data_service import data_service
-from app.core.security import get_current_user
+from app.core.security import get_current_user, require_data_import, require_data_delete, require_data_update, require_cell_entry
 
 router = APIRouter()
 
 
 @router.post("/import-points", response_model=Dict[str, Any])
-async def import_points(request: ImportPointsRequest) -> Dict[str, Any]:
+async def import_points(
+    request: ImportPointsRequest,
+    current_user=Depends(require_data_import),
+) -> Dict[str, Any]:
     """解析点数据"""
     try:
         points = await run_in_threadpool(data_service.parse_points, request.file_path)
@@ -45,7 +51,7 @@ async def import_points(request: ImportPointsRequest) -> Dict[str, Any]:
 
 @router.get("/{data_id}/download")
 async def download_file(data_id: str):
-    """下载原始文件"""
+    """下载文件（原地更新后返回原始格式的 Excel，仅更新 PCI/TAC 值）"""
     try:
         data_dir = settings.DATA_DIR / data_id
 
@@ -105,12 +111,37 @@ async def download_file(data_id: str):
         else:
             filename = default_name
 
+        # ===== 原地更新后：等待后台同步完成（替代旧版兜底同步，避免竞态条件） =====
+        if data_id in data_service.index and data_service.index[data_id].get('inplace_updated'):
+            info = data_service.index[data_id]
+
+            if (
+                file_path.suffix.lower() in ('.xlsx', '.xls')
+                and file_path.exists()
+                and not info.get('excel_synced')
+            ):
+                # 后台同步正在执行，等待其完成（后台线程直接更新 data_service.index）
+                # 最多等待 30 秒（0.5 秒 × 60）
+                print(f"[Download] 等待后台Excel同步完成: {data_id}")
+                for _ in range(60):
+                    time.sleep(0.5)
+                    info = data_service.index.get(data_id, {})
+                    if info and info.get('excel_synced'):
+                        print(f"[Download] 后台Excel同步已完成: {data_id}")
+                        break
+                else:
+                    print(f"[Download] 等待后台Excel同步超时（30s），继续使用当前文件: {data_id}")
+
         # 处理中文文件名编码 (RFC 5987)
         import urllib.parse
 
         encoded_filename = urllib.parse.quote(filename)
         headers = {
-            "Content-Disposition": f"attachment; filename*=utf-8''{encoded_filename}"
+            "Content-Disposition": f"attachment; filename*=utf-8''{encoded_filename}",
+            # 禁止浏览器缓存下载响应，确保应用 PCI/TAC 后下载的是最新版本
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0",
         }
 
         # 根据文件类型设置正确的媒体类型
@@ -134,10 +165,124 @@ async def download_file(data_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.post("/full-params/cells", response_model=Dict[str, Any])
+async def add_cell(
+    request: CellCreateRequest,
+    current_user=Depends(require_cell_entry),
+) -> Dict[str, Any]:
+    """新站录入：向全量工参追加小区"""
+    try:
+        # 在线程池中运行同步的耗时操作（openpyxl 文件操作）
+        result = await run_in_threadpool(
+            data_service.add_cell_to_full_params,
+            request.networkType.value,
+            request.managedElementId,
+            request.siteId,
+            request.cellId,
+            request.cellName,
+            request.longitude,
+            request.latitude,
+            request.azimuth,
+            request.frequency,
+            request.ssbFrequency,
+            request.cellCoverType,
+            current_user.id,
+        )
+        return {"success": True, "message": result.get("message", ""), "data": result}
+    except ValueError as e:
+        error_msg = str(e).replace("✗", "x")
+        safe_detail = error_msg.encode("utf-8", "replace").decode("utf-8")
+        raise HTTPException(status_code=400, detail=safe_detail)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        error_msg = str(e).replace("✗", "x")
+        safe_detail = error_msg.encode("utf-8", "replace").decode("utf-8")
+        raise HTTPException(status_code=500, detail=safe_detail)
+
+
+@router.post("/full-params/cells/batch", response_model=Dict[str, Any])
+async def batch_add_cells(
+    request: CellBatchCreateRequest,
+    current_user=Depends(require_cell_entry),
+) -> Dict[str, Any]:
+    """批量新站录入：向全量工参一次追加多个小区（支持 LTE/NR 混合）
+
+    一次性 Excel 打开/保存 + 单事务 SQLite 批量写入，高性能。
+    """
+    if not request.cells:
+        raise HTTPException(status_code=400, detail="没有待录入的小区数据")
+
+    try:
+        result = await run_in_threadpool(
+            data_service.batch_add_cells_to_full_params,
+            [
+                {
+                    "networkType": c.networkType.value,
+                    "managedElementId": c.managedElementId,
+                    "siteId": c.siteId,
+                    "cellId": c.cellId,
+                    "cellName": c.cellName,
+                    "longitude": c.longitude,
+                    "latitude": c.latitude,
+                    "azimuth": c.azimuth,
+                    "frequency": c.frequency,
+                    "ssbFrequency": c.ssbFrequency,
+                    "cellCoverType": c.cellCoverType,
+                    "mcc": c.mcc,
+                    "mnc": c.mnc,
+                    "userId": current_user.id,
+                }
+                for c in request.cells
+            ],
+        )
+        return {
+            "success": result.get("success", False),
+            "message": result.get("message", ""),
+            "data": {
+                "results": result.get("results", []),
+                "total": result.get("total", 0),
+                "successCount": result.get("successCount", 0),
+            },
+        }
+    except ValueError as e:
+        error_msg = str(e).replace("✗", "x")
+        safe_detail = error_msg.encode("utf-8", "replace").decode("utf-8")
+        raise HTTPException(status_code=400, detail=safe_detail)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        error_msg = str(e).replace("✗", "x")
+        safe_detail = error_msg.encode("utf-8", "replace").decode("utf-8")
+        raise HTTPException(status_code=500, detail=safe_detail)
+
+
+@router.post("/full-params/cells/check-duplicates", response_model=Dict[str, Any])
+async def check_cell_duplicates(
+    request: CellBatchCreateRequest,
+    current_user=Depends(require_cell_entry),
+) -> Dict[str, Any]:
+    """检查小区是否重复：根据 siteId_cellId (CGI) 匹配数据库已有记录"""
+    if not request.cells:
+        return {"success": True, "data": {"duplicates": []}}
+
+    try:
+        from app.services.data_service import data_service
+        cgi_list = [f"{c.siteId}_{c.cellId}" for c in request.cells]
+        result = await run_in_threadpool(
+            data_service.check_cell_duplicates, cgi_list
+        )
+        return {"success": True, "data": result}
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.post("/update-parameters", response_model=Dict[str, Any])
 async def update_parameters(
     request: UpdateParametersRequest,
-    current_user=Depends(get_current_user),
+    current_user=Depends(require_data_update),
 ) -> Dict[str, Any]:
     """更新工参"""
     try:
@@ -213,7 +358,7 @@ async def get_update_params_result(task_id: str) -> Dict[str, Any]:
 async def upload_excel(
     file: Optional[UploadFile] = File(None), file_path: Optional[str] = Form(None),
     overwrite: bool = Form(False),
-    current_user=Depends(get_current_user),
+    current_user=Depends(require_data_import),
 ) -> Dict[str, Any]:
     """上传Excel工参文件"""
     try:
@@ -354,7 +499,7 @@ async def get_data(data_id: str) -> Dict[str, Any]:
 
 
 @router.delete("/{data_id}", response_model=Dict[str, Any])
-async def delete_data(data_id: str, force: bool = False) -> Dict[str, Any]:
+async def delete_data(data_id: str, force: bool = False, current_user=Depends(require_data_delete)) -> Dict[str, Any]:
     """删除数据
 
     Args:
@@ -785,6 +930,7 @@ async def start_chunked_upload(
     filename: str = Form(...),
     total_chunks: int = Form(...),
     total_size: int = Form(...),
+    current_user=Depends(require_data_import),
 ) -> Dict[str, Any]:
     """初始化分块上传会话"""
     data_id = str(uuid.uuid4())
@@ -823,6 +969,7 @@ async def upload_chunk(
     data_id: str,
     chunk_index: int = Form(...),
     file: UploadFile = File(...),
+    current_user=Depends(require_data_import),
 ) -> Dict[str, Any]:
     """上传单个分块"""
     session = _chunked_sessions.get(data_id)
@@ -847,6 +994,7 @@ async def complete_chunked_upload(
     data_id: str,
     filename: str = Form(...),
     file_type: str = Form("excel"),
+    current_user=Depends(require_data_import),
 ) -> Dict[str, Any]:
     """完成分块上传：重组文件、创建索引、启动后台处理"""
     session = _chunked_sessions.get(data_id)

@@ -372,7 +372,7 @@ export class GeoDataCanvasLabelLayer extends L.Layer {
     ctx.fillStyle = this.fontColor
     ctx.textAlign = 'center'
     ctx.textBaseline = 'middle'
-    ctx.fillText(label.content, label.x, label.y)
+    ctx.fillText(label.content, label.x, label.y - 17)
   }
 
   /**

@@ -338,13 +338,16 @@ export class SectorSVGLayer extends L.Layer {
     const sectors: RenderSectorData[] = []
     const elements = document.elementsFromPoint(clientX, clientY)
 
-    // 遍历所有元素，寻找属于本图层的扇区多边形
+    // 遍历所有元素，寻找属于本图层的扇区多边形或标记
     for (const el of elements) {
-      if (el.classList.contains('sector-polygon')) {
+      if (el.classList.contains('sector-polygon') || el.classList.contains('sector-marker')) {
         // 通过寻找 FeatureGroup 中的对应 Layer 获取数据
         if (this.featureGroup) {
           this.featureGroup.eachLayer((layer: any) => {
-            if (layer.getElement?.() === el && layer.sectorData) {
+            const layerEl = layer.getElement?.()
+            // CircleMarker 的 getElement() 返回 SVG 元素
+            // 多边形也是 SVG 元素，两者都通过 element 匹配
+            if (layerEl === el && layer.sectorData) {
               sectors.push(layer.sectorData)
             }
           })
@@ -463,13 +466,7 @@ export class SectorSVGLayer extends L.Layer {
   setPCIHighlightMode(config: PCIHighlightConfig | null): void {
     this.pciHighlightConfig = config
     // 使用requestAnimationFrame批处理样式更新，提升性能
-    if (this._styleUpdateRequestId !== null) {
-      L.Util.cancelAnimFrame(this._styleUpdateRequestId)
-    }
-    this._styleUpdateRequestId = L.Util.requestAnimFrame(() => {
-      this._updateSectorStyles()
-      this._styleUpdateRequestId = null
-    }, this)
+    this._updateSectorStyles()
   }
 
   /**
@@ -480,13 +477,7 @@ export class SectorSVGLayer extends L.Layer {
     this.neighborHighlightConfig = config
     console.log('[SectorRenderer] 设置邻区高亮模式', config)
     // 使用requestAnimationFrame批处理样式更新，提升性能
-    if (this._styleUpdateRequestId !== null) {
-      L.Util.cancelAnimFrame(this._styleUpdateRequestId)
-    }
-    this._styleUpdateRequestId = L.Util.requestAnimFrame(() => {
-      this._updateSectorStyles()
-      this._styleUpdateRequestId = null
-    }, this)
+    this._updateSectorStyles()
   }
 
   /**
@@ -497,13 +488,7 @@ export class SectorSVGLayer extends L.Layer {
     this.tacHighlightConfig = config
     console.log('[SectorRenderer] 设置TAC插花高亮模式', config)
     // 使用requestAnimationFrame批处理样式更新，提升性能
-    if (this._styleUpdateRequestId !== null) {
-      L.Util.cancelAnimFrame(this._styleUpdateRequestId)
-    }
-    this._styleUpdateRequestId = L.Util.requestAnimFrame(() => {
-      this._updateSectorStyles()
-      this._styleUpdateRequestId = null
-    }, this)
+    this._updateSectorStyles()
   }
 
   /**
@@ -607,8 +592,9 @@ export class SectorSVGLayer extends L.Layer {
         if (existingPolygon) {
           // 扇区已存在，更新其样式以应用高亮
           existingPolygon.polygon.setStyle({
+            fillColor: '#ff4444',
             color: '#ff0000',
-            weight: 3,
+            weight: 4,
             fillOpacity: 0.6
           })
           existingPolygon.polygon.bringToFront()
@@ -661,13 +647,64 @@ export class SectorSVGLayer extends L.Layer {
       })
     }
 
-    if (this._styleUpdateRequestId !== null) {
-      L.Util.cancelAnimFrame(this._styleUpdateRequestId)
+    // 遍历所有已缓存的扇区图形，直接应用/恢复高亮样式
+    // 与 GeoDataLayer 的 setSelectionHighlight 逻辑一致
+    this._applySelectionHighlightToCaches()
+  }
+
+  /**
+   * 遍历 sectorPolygons 和 siteMarkers 缓存，直接应用或恢复高亮样式
+   * 与 GeoDataLayer 的 setSelectionHighlight 各层遍历方式一致
+   */
+  private _applySelectionHighlightToCaches(): void {
+    // 处理扇区多边形缓存
+    for (const [sectorId, cached] of this.sectorPolygons) {
+      const layer = cached.polygon
+      const sector = (layer as any).sectorData as RenderSectorData
+      if (!sector) continue
+      const isSelected = this._isSectorSelected(sectorId, sector)
+      if (isSelected) {
+        layer.setStyle({
+          fillColor: '#ff4444',
+          color: '#ff0000',
+          weight: 4,
+          fillOpacity: 0.6
+        })
+        if (layer.bringToFront) layer.bringToFront()
+      } else {
+        const config = SECTOR_CONFIG[sector.networkType]
+        const colors = getSectorColor(sector)
+        layer.setStyle({
+          fillColor: colors.fillColor,
+          color: config.strokeColor || '#000000',
+          weight: config.strokeWidth || 0.5,
+          fillOpacity: config.opacity
+        })
+      }
     }
-    this._styleUpdateRequestId = L.Util.requestAnimFrame(() => {
-      this._updateSectorStyles()
-      this._styleUpdateRequestId = null
-    }, this)
+    // 处理站点标记缓存
+    for (const [siteKey, cached] of this.siteMarkers) {
+      const layer = cached.marker
+      const sector = (layer as any).sectorData as RenderSectorData
+      if (!sector) continue
+      const isSelected = this._isSectorSelected(siteKey, sector)
+      if (isSelected) {
+        layer.setStyle({
+          color: '#ff0000',
+          weight: 3,
+          fillOpacity: 0.6
+        })
+        if (layer.bringToFront) layer.bringToFront()
+      } else {
+        const colors = getSectorColor(sector)
+        layer.setStyle({
+          fillColor: colors.fillColor,
+          color: colors.strokeColor,
+          weight: 1,
+          fillOpacity: 0.8
+        })
+      }
+    }
   }
 
   /**
@@ -874,6 +911,12 @@ export class SectorSVGLayer extends L.Layer {
       }
     }
 
+    console.log('[SectorRenderer] getSectorsInPolygon 结果', {
+      totalSectors: this.sectors.length,
+      foundSectors: results.length,
+      sampleIds: results.slice(0, 5).map(s => s.id)
+    })
+
     return results
   }
 
@@ -939,9 +982,17 @@ export class SectorSVGLayer extends L.Layer {
         // 小区名称
         return sector.name || ''
 
+      case 'networkType':
+        // 网络类型
+        return sector.networkType || ''
+
       case 'siteId':
         // 基站ID - 直接使用siteId字段
         return sector.siteId || ''
+
+      case 'sectorId':
+        // 小区ID
+        return sector.sectorId || ''
 
       case 'frequency':
         // 下行频点 - 直接使用frequency字段
@@ -973,9 +1024,29 @@ export class SectorSVGLayer extends L.Layer {
         // TAC - 直接使用tac字段
         return sector.tac !== undefined ? String(sector.tac) : ''
 
+      case 'longitude':
+        // 经度
+        return sector.longitude !== undefined ? sector.longitude.toFixed(6) : ''
+
+      case 'latitude':
+        // 纬度
+        return sector.latitude !== undefined ? sector.latitude.toFixed(6) : ''
+
+      case 'azimuth':
+        // 方向角
+        return sector.azimuth !== undefined ? `${sector.azimuth}°` : ''
+
+      case 'height':
+        // 天线挂高
+        return sector.height !== undefined ? `${sector.height}m` : ''
+
       case 'isShared':
         // 是否共享 - 直接使用is_shared字段
         return sector.is_shared || ''
+
+      case 'firstGroup':
+        // 厂家（第一分组）
+        return sector.first_group || ''
 
       case 'coverageType':
         // 覆盖类型 - 直接使用cell_cover_type字段
@@ -1018,76 +1089,9 @@ export class SectorSVGLayer extends L.Layer {
    */
   private _updateSectorStyles(): void {
     if (this.selectionHighlightIds && this.selectionHighlightIds.size > 0) {
-      console.log('[SectorRenderer] _updateSectorStyles - 框选高亮模式', {
-        selectionIdsCount: this.selectionHighlightIds.size,
-        sectorPolygonsCount: this.sectorPolygons.size,
-        siteMarkersCount: this.siteMarkers.size
-      })
-
-      const highlightPolygons: L.Polygon[] = []
-      const highlightMarkers: L.CircleMarker[] = []
-
-      for (const [sectorId, cached] of this.sectorPolygons) {
-        const sector = (cached.polygon as any).sectorData as RenderSectorData
-        const isSelected = this._isSectorSelected(sectorId, sector)
-
-        console.log('[SectorRenderer] _updateSectorStyles - 检查扇区', {
-          sectorId,
-          isSelected
-        })
-
-        if (isSelected) {
-          const colors = getSectorColor(sector)
-          cached.polygon.setStyle({
-            fillColor: colors.fillColor,
-            color: '#ff0000',
-            weight: 3,
-            fillOpacity: 0.6
-          })
-          highlightPolygons.push(cached.polygon)
-        } else {
-          const colors = getSectorColor(sector)
-          const config = SECTOR_CONFIG[sector.networkType]
-          cached.polygon.setStyle({
-            fillColor: colors.fillColor,
-            color: config.strokeColor || '#000000',
-            weight: config.strokeWidth || 0.5,
-            fillOpacity: config.opacity
-          })
-        }
-      }
-
-      for (const [siteKey, cached] of this.siteMarkers) {
-        const sector = (cached.marker as any).sectorData as RenderSectorData
-        const isSelected = this._isSectorSelected(siteKey, sector)
-
-        if (isSelected) {
-          const colors = getSectorColor(sector)
-          cached.marker.setStyle({
-            fillColor: colors.fillColor,
-            color: '#ff0000',
-            weight: 3,
-            fillOpacity: 0.6
-          })
-          highlightMarkers.push(cached.marker)
-        } else {
-          const colors = getSectorColor(sector)
-          cached.marker.setStyle({
-            fillColor: colors.fillColor,
-            color: colors.strokeColor,
-            weight: 1,
-            fillOpacity: 0.8
-          })
-        }
-      }
-
-      for (const polygon of highlightPolygons) {
-        polygon.bringToFront()
-      }
-      for (const marker of highlightMarkers) {
-        marker.bringToFront()
-      }
-
+      // 通过 sectorPolygons / siteMarkers 缓存直接应用高亮
+      // 与 setSelectionHighlight 中的 _applySelectionHighlightToCaches 使用相同的缓存遍历策略
+      this._applySelectionHighlightToCaches()
       return
     }
 
@@ -1945,13 +1949,7 @@ export class SectorSVGLayer extends L.Layer {
 
     if (this.pciHighlightConfig || this.neighborHighlightConfig ||
       (this.selectionHighlightIds && this.selectionHighlightIds.size > 0)) {
-      if (this._styleUpdateRequestId !== null) {
-        L.Util.cancelAnimFrame(this._styleUpdateRequestId)
-      }
-      this._styleUpdateRequestId = L.Util.requestAnimFrame(() => {
-        this._updateSectorStyles()
-        this._styleUpdateRequestId = null
-      }, this)
+      this._updateSectorStyles()
     }
   }
 
@@ -2619,6 +2617,7 @@ export class SectorSVGLayer extends L.Layer {
         background-color: transparent;
         padding: 0;
         margin: 0;
+        margin-top: -20px;
         pointer-events: none;
         position: absolute;
         left: 50%;
@@ -2771,8 +2770,9 @@ export class SectorSVGLayer extends L.Layer {
         const colors = getSectorColor(sector)
         fillColor = colors.fillColor
         strokeColor = '#ff0000'
-        strokeWidth = 3
+        strokeWidth = 4
         fillOpacity = 0.6
+        fillColor = '#ff4444'
       } else {
         // 默认模式：彩色（基于频点或网络类型）
         const colors = getSectorColor(sector)

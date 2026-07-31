@@ -24,6 +24,17 @@ def get_local_ip() -> str:
     except Exception:
         return "127.0.0.1"
 
+@router.get("/status")
+async def health_check():
+    """
+    健康检查端点（轻量级，用于入口检测 / 负载均衡）
+
+    返回 200 表示服务正常运行，无额外负载。
+    专为 go.pengwc.asia 入口检测跳板设计。
+    """
+    return {"status": "ok"}
+
+
 @router.get("/info", response_model=SystemInfo)
 async def get_system_info():
     """

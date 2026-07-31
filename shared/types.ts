@@ -37,6 +37,8 @@ export interface DataItem {
   geometryType?: 'point' | 'sector' | 'polygon'
   sourceType?: 'excel' | 'mapinfo'
   subType?: string
+  excelSynced?: boolean  // 应用PCI/TAC后 Excel 是否已同步
+  inplaceUpdated?: boolean  // 是否已原地更新（PCI/TAC应用）
 }
 
 export interface UploadResponse {
@@ -346,6 +348,8 @@ export interface UserInfo {
   is_admin: boolean
   is_active: boolean
   is_online?: boolean
+  is_online_pc?: boolean
+  is_online_app?: boolean
   must_change_password: boolean
   license_expiry: string | null
   total_usage_seconds: number
@@ -354,6 +358,11 @@ export interface UserInfo {
   created_at: string | null
   city: string | null
   operator: string | null
+  user_type?: 'pc' | 'app'
+  can_data_import?: boolean
+  can_data_delete?: boolean
+  can_data_update?: boolean
+  can_cell_entry?: boolean
 }
 
 export interface TokenResponse {
@@ -365,6 +374,7 @@ export interface TokenResponse {
 export interface LoginRequest {
   username: string
   password: string
+  client_type?: 'pc' | 'app'
 }
 
 export interface RegisterRequest {
@@ -393,6 +403,10 @@ export interface UserUpdateRequest {
   must_change_password?: boolean
   city?: string | null
   operator?: string | null
+  can_data_import?: boolean
+  can_data_delete?: boolean
+  can_data_update?: boolean
+  can_cell_entry?: boolean
 }
 
 export interface ResetPasswordRequest {
@@ -404,6 +418,7 @@ export interface UserSessionInfo {
   user_id: number
   token_jti: string
   ip_address: string | null
+  client_type: 'pc' | 'app'
   login_time: string | null
   logout_time: string | null
   last_activity: string | null

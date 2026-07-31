@@ -166,6 +166,7 @@ export class GeoDataLayer {
   private isInteractive: boolean = true
   // 框选高亮状态
   private selectionHighlightIds: Set<string> | null = null
+  private _originalMarkerStyles: Map<L.Marker, string> = new Map() // Marker高亮前保存原始outline
   // 存储原始样式以便恢复
   private originalStyles: Map<L.Layer, any> = new Map()
 
@@ -285,6 +286,11 @@ export class GeoDataLayer {
     console.log('[GeoDataLayer] 将 leafletLayer 添加到地图，已渲染', this.leafletLayer.getLayers().length, '个图层')
     this.leafletLayer.addTo(map)
 
+    // 重新渲染后恢复选中高亮
+    if (this.selectionHighlightIds) {
+      this.setSelectionHighlight(this.selectionHighlightIds)
+    }
+
     console.log('[GeoDataLayer] ========== addTo 完成 ==========')
     return this
   }
@@ -330,7 +336,9 @@ export class GeoDataLayer {
 
       const marker = L.circleMarker([displayLat, displayLng], {
         ...DEFAULT_POINT_STYLE,
-        radius: pixelRadius
+        radius: pixelRadius,
+        properties: item.properties,
+        name: item.name
       })
 
       if (this.onFeatureClick && this.isInteractive) {
@@ -401,7 +409,11 @@ export class GeoDataLayer {
 
       if (is360Degree || coverType === 4 || this.currentZoom <= LOD_THRESHOLD) {
         // 渲染为圆点
-        const marker = L.circleMarker([displayLat, displayLng], DEFAULT_POINT_STYLE)
+        const marker = L.circleMarker([displayLat, displayLng], {
+          ...DEFAULT_POINT_STYLE,
+          properties: item.properties,
+          name: item.name
+        })
         if (this.onFeatureClick && this.isInteractive) {
           marker.on('click', (e) => {
             L.DomEvent.stopPropagation(e)
@@ -421,7 +433,11 @@ export class GeoDataLayer {
         const SECTOR_RADIUS = 80 // 米
 
         const points = createSectorPolygon(displayLat, displayLng, azimuth, beamwidth, SECTOR_RADIUS)
-        const polygon = L.polygon(points, DEFAULT_SECTOR_STYLE)
+        const polygon = L.polygon(points, {
+          ...DEFAULT_SECTOR_STYLE,
+          properties: item.properties,
+          name: item.name
+        })
 
         if (this.onFeatureClick && this.isInteractive) {
           polygon.on('click', (e) => {
@@ -491,7 +507,11 @@ export class GeoDataLayer {
 
       try {
         // 直接使用 L.polygon，path 已经是正确的 [lat, lng] 格式（GCJ02）
-        const polygon = L.polygon(item.path as L.LatLngExpression[], DEFAULT_POLYGON_STYLE)
+        const polygon = L.polygon(item.path as L.LatLngExpression[], {
+          ...DEFAULT_POLYGON_STYLE,
+          properties: item.properties,
+          name: item.name
+        })
 
         if (this.onFeatureClick && this.isInteractive) {
           polygon.on('click', (e) => {
@@ -892,9 +912,15 @@ export class GeoDataLayer {
       return dataItem.name || this._getDefaultLabel(index)
     }
 
-    // 从 properties 中获取字段值
+    // 从 properties 中获取字段值（根级：OnlineMap 将整条 item 存入 properties，所以此处查 item 根字段）
     if (dataItem.properties && dataItem.properties[field] !== undefined && dataItem.properties[field] !== null) {
       return String(dataItem.properties[field])
+    }
+
+    // 从嵌套 properties 中获取字段值（geo_data_service 将原始列全部存入 item.properties[key]）
+    if (dataItem.properties && dataItem.properties.properties &&
+        dataItem.properties.properties[field] !== undefined && dataItem.properties.properties[field] !== null) {
+      return String(dataItem.properties.properties[field])
     }
 
     // 回退到 name
@@ -973,7 +999,7 @@ export class GeoDataLayer {
 
     this.leafletLayer.eachLayer((layer: any) => {
       // 获取要素的ID（从options或feature中）
-      const featureId = layer.options?.properties?.name || layer.options?.properties?.id || ''
+      const featureId = layer.options?.name || layer.options?.properties?.name || layer.options?.properties?.id || ''
       const isSelected = ids?.has(String(featureId))
 
       if (layer instanceof L.CircleMarker || layer instanceof L.Polygon) {
@@ -1006,6 +1032,23 @@ export class GeoDataLayer {
             layer.setStyle(this._getDefaultStyle())
           }
         }
+      } else if (layer instanceof L.Marker) {
+        // Marker（点要素）高亮：修改DOM元素添加高亮边框
+        const markerEl = layer.getElement()
+        if (markerEl) {
+          if (isSelected) {
+            this._originalMarkerStyles.set(layer, markerEl.style.outline || '')
+            markerEl.style.outline = '2px solid #ef4444'
+            markerEl.style.outlineOffset = '2px'
+            markerEl.style.borderRadius = '2px'
+          } else {
+            const origOutline = this._originalMarkerStyles.get(layer)
+            markerEl.style.outline = origOutline || ''
+            markerEl.style.outlineOffset = ''
+            markerEl.style.borderRadius = ''
+            this._originalMarkerStyles.delete(layer)
+          }
+        }
       }
     })
   }
@@ -1027,6 +1070,21 @@ export class GeoDataLayer {
   }
 
   /**
+   * 射线法判断点是否在多边形内（替代 Leaflet L.Polygon.contains，该方法在 Leaflet 1.x 中不存在）
+   */
+  private static _isPointInPolygon(point: number[], polygon: number[][]): boolean {
+    let inside = false
+    for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+      const xi = polygon[i][0], yi = polygon[i][1]
+      const xj = polygon[j][0], yj = polygon[j][1]
+      const intersect = ((yi > point[1]) !== (yj > point[1]))
+        && (point[0] < (xj - xi) * (point[1] - yi) / (yj - yi) + xi)
+      if (intersect) inside = !inside
+    }
+    return inside
+  }
+
+  /**
    * 获取多边形内的要素（用于框选）
    * @param polygon Leaflet多边形对象
    */
@@ -1034,6 +1092,8 @@ export class GeoDataLayer {
     if (!this.leafletLayer) return []
     const results: GeoDataItem[] = []
     const bounds = polygon.getBounds()
+    // 将多边形顶点转为 [lat, lng] 二维数组用于射线法判断
+    const polygonPoints: number[][] = (polygon.getLatLngs()[0] as L.LatLng[]).map(p => [p.lat, p.lng])
 
     this.leafletLayer.eachLayer((layer: any) => {
       let isInside = false
@@ -1043,20 +1103,20 @@ export class GeoDataLayer {
         // 点要素（CircleMarker）
         layerLatLng = layer.getLatLng()
         if (bounds.contains(layerLatLng)) {
-          isInside = polygon.contains(layerLatLng)
+          isInside = GeoDataLayer._isPointInPolygon([layerLatLng.lat, layerLatLng.lng], polygonPoints)
         }
       } else if (layer.getBounds) {
         // 线/面要素：检查中心点
         const layerBounds = layer.getBounds()
         layerLatLng = layerBounds.getCenter()
         if (bounds.contains(layerLatLng)) {
-          isInside = polygon.contains(layerLatLng)
+          isInside = GeoDataLayer._isPointInPolygon([layerLatLng.lat, layerLatLng.lng], polygonPoints)
         }
       }
 
       if (isInside && layer.options?.properties) {
         results.push({
-          name: layer.options.properties.name,
+          name: layer.options.name || layer.options.properties?.name,
           properties: layer.options.properties
         })
       }
@@ -1092,7 +1152,7 @@ export class GeoDataLayer {
 
       if (isInside && layer.options?.properties) {
         results.push({
-          name: layer.options.properties.name,
+          name: layer.options.name || layer.options.properties?.name,
           properties: layer.options.properties
         })
       }
@@ -1225,6 +1285,12 @@ export class GeoDataLayer {
     }
 
     console.log(`[GeoDataLayer] _reRenderGeometries 完成，当前视口内有 ${this.leafletLayer.getLayers().length} 个几何图形`)
+
+    // 重新渲染后，如果存在未清除的选中状态，重新应用高亮
+    // 这样拖拽、缩放、移动地图后选中高亮不会消失
+    if (this.selectionHighlightIds) {
+      this.setSelectionHighlight(this.selectionHighlightIds)
+    }
   }
 }
 

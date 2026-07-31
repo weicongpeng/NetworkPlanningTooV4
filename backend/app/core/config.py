@@ -56,6 +56,7 @@ class Settings(BaseSettings):
     # 任务配置 - 从环境变量读取
     NPT_MAX_TASKS: int = 10
     NPT_TASK_TIMEOUT: int = 3600
+    NPT_MAX_WORKERS: int = 3  # 进程池 Worker 数（4 核 ARM 留 1 核给系统）
 
     # 高德地图配置 - 从环境变量读取
     NPT_AMAP_API_KEY: str = ""
@@ -76,6 +77,11 @@ class Settings(BaseSettings):
     # 邻区规划默认配置
     DEFAULT_NEIGHBOR_MAX_DISTANCE: float = 10.0
     DEFAULT_NEIGHBOR_MAX_COUNT: int = 32
+
+    # APK 下载缓存配置（秒）
+    # 默认 3600（1 小时），Cloudflare 边缘节点缓存后同区域下载秒级完成
+    # APK 版本很少更新，可以设置较长缓存时间
+    APK_CACHE_MAX_AGE: int = 3600
 
     # 计算属性
     @property
@@ -117,6 +123,10 @@ class Settings(BaseSettings):
     @property
     def TASK_TIMEOUT(self) -> int:
         return self.NPT_TASK_TIMEOUT
+
+    @property
+    def MAX_WORKERS(self) -> int:
+        return self.NPT_MAX_WORKERS
 
     @property
     def AMAP_API_KEY(self) -> str:

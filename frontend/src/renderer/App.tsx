@@ -11,10 +11,14 @@ import { TACPlanningPage } from './pages/TACPlanningPage'
 import { LicensePage } from './pages/LicensePage'
 import { MapPage } from './pages/MapPage'
 import { AdminUsersPage } from './pages/AdminUsersPage'
+import { AppVersionsPage } from './pages/AppVersionsPage'
 import { useEffect } from 'react'
 import { startHealthCheck, stopHealthCheck } from '@/renderer/services/api'
+import { useHeartbeat } from './hooks/useHeartbeat'
 
 function App() {
+  useHeartbeat()
+
   // 启动时开始后端健康检查轮询
   useEffect(() => {
     startHealthCheck(15000)
@@ -93,6 +97,14 @@ function App() {
               element={
                 <ProtectedRoute requireAdmin>
                   <AdminUsersPage />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/app-versions"
+              element={
+                <ProtectedRoute requireAdmin>
+                  <AppVersionsPage />
                 </ProtectedRoute>
               }
             />

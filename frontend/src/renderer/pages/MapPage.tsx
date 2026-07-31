@@ -11,7 +11,7 @@
  */
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
-import { Loader2, Search, X, MapPin, AlertTriangle, Database, Trash2, MousePointer2, Circle as CircleIcon, Pentagon, Hand, Map as MapIcon, Satellite } from 'lucide-react'
+import { Loader2, Search, X, MapPin, AlertTriangle, Database, Trash2, MousePointer2, Circle as CircleIcon, Pentagon, Hand, Map as MapIcon, Satellite, Maximize2, Minimize2 } from 'lucide-react'
 import { OnlineMap, OnlineMapRef, CustomLayerOption } from '../components/Map/OnlineMap'
 import { LayerControl, SectorLayerOption, LayerFileOption, DecorationLayerOption } from '../components/Map/LayerControl'
 import { OfflineMap, createDefaultLayers } from '../components/Map'
@@ -85,6 +85,7 @@ export function MapPage() {
     setMapType: storeSetMapType,
     setLabelSettings: storeSetLabelSettings,
     setBaseMapVisible: storeSetBaseMapVisible,
+    setDecorationLabelVisible: storeSetDecorationLabelVisible,
   } = useMapStore()
 
   // 视图模式
@@ -195,6 +196,47 @@ export function MapPage() {
     visible: mapSettings.decorationLayerVisible,
     count: 0
   })
+
+  // 装饰图层标签可见性 - 从持久化 store 初始化
+  const [decorationLabelVisible, setDecorationLabelVisible] = useState<boolean>(
+    mapSettings.decorationLabelVisible
+  )
+
+  // 全屏模式
+  const [isFullscreen, setIsFullscreen] = useState(false)
+  const mapPageRef = useRef<HTMLDivElement>(null)
+
+  // 切换全屏
+  const toggleFullscreen = useCallback(() => {
+    if (!document.fullscreenElement) {
+      document.documentElement.requestFullscreen().catch(err => {
+        console.error('[MapPage] Fullscreen request failed:', err)
+      })
+    } else {
+      document.exitFullscreen().catch(err => {
+        console.error('[MapPage] Exit fullscreen failed:', err)
+      })
+    }
+  }, [])
+
+  // 监听 fullscreenchange 事件
+  useEffect(() => {
+    const handleFullscreenChange = () => {
+      setIsFullscreen(!!document.fullscreenElement)
+    }
+    document.addEventListener('fullscreenchange', handleFullscreenChange)
+    return () => document.removeEventListener('fullscreenchange', handleFullscreenChange)
+  }, [])
+
+  // 全屏时添加/移除 body class 用于 CSS 隐藏侧边栏
+  useEffect(() => {
+    if (isFullscreen) {
+      document.body.classList.add('map-fullscreen-mode')
+    } else {
+      document.body.classList.remove('map-fullscreen-mode')
+    }
+    return () => document.body.classList.remove('map-fullscreen-mode')
+  }, [isFullscreen])
 
   // 当语言变化时更新装饰图层名称
   useEffect(() => {
@@ -420,20 +462,29 @@ export function MapPage() {
   const [mapDragTool, setMapDragTool] = useState(false)
 
   /**
-   * 获取当前可见图层数量
+   * 获取当前可见图层所属的类型集合
+   * 圈选时只能对同一类型的图层操作，不能跨类型
+   * 4 种类型：基站(扇区)、图层文件(MapInfo)、地理化数据(Excel)、装饰图层
    */
-  const getVisibleLayerCount = useCallback(() => {
-    let count = 0
-    // 扇区图层
-    if (layers.find(l => l.id === 'lte-sectors')?.visible) count++
-    if (layers.find(l => l.id === 'nr-sectors')?.visible) count++
-    // 图层文件
-    count += layerFiles.filter(lf => lf.visible).length
-    // 点文件/地理化数据
-    count += pointFiles.filter(pf => pf.visible).length
+  const getVisibleLayerCategories = useCallback((): string[] => {
+    const categories: string[] = []
+    // 基站（扇区图层）
+    if (layers.find(l => l.id === 'lte-sectors')?.visible || layers.find(l => l.id === 'nr-sectors')?.visible) {
+      categories.push('sector')
+    }
+    // 图层文件（MapInfo）
+    if (layerFiles.filter(lf => lf.visible).length > 0) {
+      categories.push('mapinfo')
+    }
+    // 地理化数据（Excel点文件/扇区/多边形）
+    if (pointFiles.filter(pf => pf.visible).length > 0) {
+      categories.push('geo')
+    }
     // 装饰图层
-    if (decorationLayer.visible) count++
-    return count
+    if (decorationLayer.visible) {
+      categories.push('decoration')
+    }
+    return categories
   }, [layers, layerFiles, pointFiles, decorationLayer.visible])
 
   /**
@@ -447,17 +498,24 @@ export function MapPage() {
       return
     }
 
-    const visibleCount = getVisibleLayerCount()
+    const visibleCategories = getVisibleLayerCategories()
 
     // 圆形和多边形框选需要检查可见图层
-    if (mode === 'circle' || mode === 'polygon') {
-      if (visibleCount === 0) {
+    if (mode === 'point' || mode === 'circle' || mode === 'polygon') {
+      if (visibleCategories.length === 0) {
         alert(t('map.enableLayerFirst') || '请先在图层控制面板开启需要圈选的图层')
         return
       }
 
-      if (visibleCount > 1) {
-        alert(t('map.onlyOneLayerAtATime') || '当前显示图层多于1个，请先在图层控制面板关闭冗余图层，确保只显示一个目标图层再进行圈选')
+      if (visibleCategories.length > 1) {
+        const categoryNames: Record<string, string> = {
+          sector: t('map.categorySector') || '基站(扇区)',
+          mapinfo: t('map.categoryMapInfo') || '图层文件',
+          geo: t('map.categoryGeo') || '地理化数据',
+          decoration: t('map.categoryDecoration') || '装饰图层'
+        }
+        const visibleNames = visibleCategories.map(c => categoryNames[c] || c).join('、')
+        alert(`${t('map.crossCategoryNotAllowed') || '圈选不能跨类型操作'}：${visibleNames}。${t('map.onlyOneCategoryAtATime') || '请先关闭其他类型的图层，只保留一个类型的图层可见'}`)
         return
       }
     }
@@ -487,9 +545,7 @@ export function MapPage() {
       setCaptureMode(false)
       setCaptureCoord(null)
       setSelectionMode('none')
-      if (onlineMapRef.current) {
-        onlineMapRef.current.clearSelectionHighlight()
-      }
+      // 注意：不调用 clearSelectionHighlight()，拖拽工具仅负责地图拖拽，不影响已绘制的框选图形和选中高亮
     }
   }
   const [totalDistance, setTotalDistance] = useState<number | null>(null)
@@ -669,6 +725,18 @@ export function MapPage() {
       onlineMapRef.current.setDecorationLayerVisibility(visible)
     }
   }, [storeSetDecorationLayerVisible])
+
+  /**
+   * 处理装饰图层标签可见性切换
+   */
+  const handleDecorationLabelToggle = useCallback((visible: boolean) => {
+    console.log('[MapPage] 装饰图层标签切换:', visible)
+    setDecorationLabelVisible(visible)
+    storeSetDecorationLabelVisible(visible)
+    if (onlineMapRef.current) {
+      onlineMapRef.current.setDecorationLabelVisibility(visible)
+    }
+  }, [storeSetDecorationLabelVisible])
 
   /**
    * 加载工参数据用于搜索
@@ -1284,27 +1352,17 @@ export function MapPage() {
   }, [pointFileLabelVisibility])
 
   return (
-    <div className="flex flex-col h-full min-h-0">
+    <div ref={mapPageRef} className="flex flex-col h-full min-h-0">
       {/* 地图工具栏 */}
       <div className="h-14 bg-card border-b border-border flex items-center justify-start px-4 flex-shrink-0 gap-4">
         <div className="flex items-center gap-4">
 
-          {/* 数据源文件名显示 */}
-          {currentDataSourceFile ? (
-            <div className="px-3 py-1.5 bg-muted/50 rounded-md">
-              <div className="flex items-center gap-2">
-                <Database size={14} className="text-foreground" />
-                <span className="text-xs text-foreground">{t('map.engineerParam') || '工参'}: {currentDataSourceFile}</span>
-              </div>
+          {/* 数据源状态指示 - 绿色已加载/红色未加载 */}
+          <div className="px-3 py-1.5 bg-muted/50 rounded-md">
+            <div className="flex items-center gap-2">
+              <Database size={14} className={currentDataSourceFile ? 'text-green-500' : 'text-red-500'} />
             </div>
-          ) : (
-            <div className="px-3 py-1.5 bg-muted/50 rounded-md">
-              <div className="flex items-center gap-2">
-                <Database size={14} className="text-foreground" />
-                <span className="text-xs text-foreground">{t('map.noImportFile') || '未导入工参文件'}</span>
-              </div>
-            </div>
-          )}
+          </div>
         </div>
 
         {/* 搜索框 */}
@@ -1641,6 +1699,15 @@ export function MapPage() {
             )}
           </button>
 
+          {/* 全屏按钮 */}
+          <button
+            onClick={toggleFullscreen}
+            className="flex items-center gap-1 px-2 py-1.5 text-xs rounded transition-colors text-foreground hover:bg-muted hover:text-primary"
+            title={isFullscreen ? (t('map.exitFullscreen') || '退出全屏') : (t('map.fullscreen') || '全屏')}
+          >
+            {isFullscreen ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
+            <span>{isFullscreen ? (t('map.exitFullscreen') || '退出全屏') : (t('map.fullscreen') || '全屏')}</span>
+          </button>
 
         </div>
 
@@ -1681,6 +1748,7 @@ export function MapPage() {
               onCaptureCoord={(lng, lat) => setCaptureCoord({ lng, lat })}
               onCaptureBlocked={handleCaptureBlocked}
               decorationLayerVisible={decorationLayer.visible}
+              decorationLabelVisible={decorationLabelVisible}
             />
 
             {/* 图层控制面板 */}
@@ -1709,6 +1777,8 @@ export function MapPage() {
               labelSettingsMap={labelSettingsMap}
               decorationLayer={decorationLayer}
               onDecorationLayerToggle={handleDecorationLayerToggle}
+              decorationLabelVisible={decorationLabelVisible}
+              onDecorationLabelToggle={handleDecorationLabelToggle}
             />
 
           </>
@@ -1716,6 +1786,24 @@ export function MapPage() {
           <OfflineMap data={offlineData} offlinePath={offlinePath} />
         )}
       </div>
+
+      {/* 全屏模式全局样式 */}
+      {isFullscreen && (
+        <style>{`
+          body.map-fullscreen-mode aside {
+            display: none !important;
+          }
+          body.map-fullscreen-mode > div#root > div > div:first-child {
+            display: none !important;
+          }
+        `}</style>
+      )}
     </div>
   )
 }
+
+/**
+ * 获取完整下载URL
+ * @param downloadUrl 下载路径（相对或绝对）
+ * @returns 完整下载URL
+ */

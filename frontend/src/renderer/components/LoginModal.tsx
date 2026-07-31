@@ -11,7 +11,7 @@ interface LoginModalProps {
 
 export function LoginModal({ isOpen, forceChangePassword = false, onClose }: LoginModalProps) {
   const { t } = useTranslation()
-  const { login, register, changePassword, isLoading } = useAuthStore()
+  const { login, register, changePassword } = useAuthStore()
 
   const [mode, setMode] = useState<'login' | 'register'>('login')
   const [username, setUsername] = useState('')
@@ -75,7 +75,6 @@ export function LoginModal({ isOpen, forceChangePassword = false, onClose }: Log
     setWarning('')
     setCity('')
     setOperator('')
-    setEquipmentVendor('')
     setMode(mode === 'login' ? 'register' : 'login')
   }
 

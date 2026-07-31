@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react'
-import { Play, Download, Settings, Loader2, AlertCircle, Search, X, Ruler, GripVertical, Check, Eye } from 'lucide-react'
+import { Play, Download, Settings, Loader2, AlertCircle, Search, X, Ruler, GripVertical, Check, Eye, Trash2 } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 
 
@@ -22,10 +22,12 @@ import type { RenderSectorData, CellListItem } from '../services/mapDataService'
 import { mapDataService, getCellList, clearCellListCache } from '../services/mapDataService'
 import { DATA_REFRESH_EVENT } from '../store/dataStore'
 import { CellSelectionTable } from '../components/CellSelectionTable'
-import { HistoryTable } from '../components/HistoryTable'
+import { HistoryTable, triggerBatchDelete } from '../components/HistoryTable'
+import { generateFullTaskName } from '../utils/taskNameUtils'
 import { StepIndicator } from '../components/StepIndicator'
 import { WizardFooter } from '../components/WizardFooter'
 import { NumberInput } from '../components/NumberInput'
+import { LoadingSpinner } from '../components/LoadingSpinner'
 import { extractCellIdsFromFile, matchCellIds, downloadCellTreeTemplate } from '../utils/cellFileHelper'
 
 interface NeighborResultData {
@@ -135,6 +137,8 @@ export function NeighborPage() {
     noCellsSelected: t('neighbor.noCellsSelected') || '请在小区选择列表中至少选择一个小区后再执行邻区规划',
     noCellIdsExtracted: t('neighbor.noCellIdsExtracted') || '未能从文件中提取到小区ID，请检查文件格式',
     noMatchingCells: t('neighbor.noMatchingCells') || '未匹配到任何小区，请检查文件内容与当前工参数据是否一致',
+    cellFreq: t('neighbor.cellFreq') || '频点',
+    cellPci: t('neighbor.cellPci') || 'PCI',
     // 工具提示
     distanceFactorTooltip: t('neighbor.distanceFactorTooltip') || '覆盖圆距离系数：站点到覆盖圆心的距离系数，默认5/9(≈0.556)',
     radiusFactorTooltip: t('neighbor.radiusFactorTooltip') || '覆盖圆半径系数：覆盖半径系数，默认5/9(≈0.556)',
@@ -152,6 +156,7 @@ export function NeighborPage() {
     targetFrequency: t('neighbor.targetFrequency') || '目标频点',
     distance: t('neighbor.distance') || '距离',
     showMap: t('neighbor.showMap') || '地图展示',
+    loadingResult: t('common.loadingResult') || '正在加载规划结果...',
   }
 
   // 配置验证函数
@@ -205,6 +210,11 @@ export function NeighborPage() {
 
   const [localTaskResult, setLocalTaskResult] = useState<NeighborResultData | null>(null)
   const viewedTaskIdRef = useRef<string | null>(null) // 防止 useEffect 覆盖 API 获取的结果
+  const isLoadingResultRef = useRef(false) // 标记结果加载是否有效，防止竞态
+  const [resultLoading, setResultLoading] = useState(false) // 结果页加载动画
+  const [selectedCount, setSelectedCount] = useState(0)
+  const [batchDeleting, setBatchDeleting] = useState(false)
+  const showBatchDelete = selectedCount > 0
   const {
     updateTaskProgress, completeTask, failTask, activeTaskIds, setActiveTaskId, startTask,
     getLatestNeighborTask,
@@ -225,6 +235,9 @@ export function NeighborPage() {
   // 小区列表数据（从轻量API获取）
   const [cellListData, setCellListData] = useState<{ lte: CellListItem[]; nr: CellListItem[] }>({ lte: [], nr: [] })
   const [cellListLoading, setCellListLoading] = useState(false)
+  // 🔥 页面加载动画
+  const [pageLoading, setPageLoading] = useState(true)
+  const pageLoadingRef = useRef(true)
   const [cellFileUploading, setCellFileUploading] = useState(false)
   const cellFileInputRef = useRef<HTMLInputElement>(null)
 
@@ -238,8 +251,9 @@ export function NeighborPage() {
     setTaskNameError(null)
     setActiveTaskId('neighbor_planning', null)
     setLocalTaskResult(null)
+    setWizardStep('idle')
     setError(null)
-  }, [storeResetConfig, setActiveTaskId])
+  }, [storeResetConfig, setActiveTaskId, setWizardStep])
 
   useEffect(() => {
     if (activeLeftTab === 'task-config') { resetConfig() }
@@ -261,34 +275,48 @@ export function NeighborPage() {
       if (viewedTaskIdRef.current) {
         return
       }
+      isLoadingResultRef.current = true
+      // 仅当没有已有结果时才显示加载动画
+      if (!localTaskResult && !latestNeighborTask?.result) {
+        setResultLoading(true)
+      }
       const loadLatest = async () => {
         await syncHistoryFromBackend('neighbor_planning')
+        if (!isLoadingResultRef.current) return
         const latest = getLatestNeighborTask()
         if (latest && latest.result) {
           // 如果缺少完整 results（来自 resultSummary），尝试从 API 重新获取
           if (!latest.result.results && latest.id) {
             try {
               const response = await neighborApi.getResult(latest.id)
+              if (!isLoadingResultRef.current) return
               if (response?.success && response?.data?.results) {
                 const fullResult = response.data as NeighborResultData
                 setLocalTaskResult(fullResult)
                 neighborDataSyncService.setNeighborResults({ results: fullResult.results })
-                setWizardStep('completed')
+                if (isLoadingResultRef.current) setWizardStep('completed')
                 return
               }
             } catch (fetchErr: any) {
               console.warn('[NeighborPage] 获取完整规划结果失败，使用缓存摘要:', fetchErr?.message)
             }
           }
+          if (!isLoadingResultRef.current) return
           // 有完整 results 或 API 获取失败时使用已有结果
           setLocalTaskResult(latest.result as NeighborResultData)
           if (latest.result.results) {
             neighborDataSyncService.setNeighborResults({ results: latest.result.results })
           }
-          setWizardStep('completed')
+          if (isLoadingResultRef.current) setWizardStep('completed')
         }
       }
-      loadLatest()
+      loadLatest().finally(() => {
+        if (isLoadingResultRef.current) setResultLoading(false)
+      })
+      return () => {
+        isLoadingResultRef.current = false
+        setResultLoading(false)
+      }
     } else {
       // 离开结果页时清除 viewedTaskIdRef
       viewedTaskIdRef.current = null
@@ -446,22 +474,25 @@ export function NeighborPage() {
     }
   }, [taskResult?.status, taskResult?.results, buildFlatResults])
 
-  // 初始化邻区数据同步服务（异步执行，不阻塞页面渲染）
+  // 🔥 优化：延迟初始化邻区数据同步服务（页面挂载时不自动加载全量工参数据）
+  const lazyNeighborInitRef = useRef<Promise<void> | null>(null)
+  const ensureNeighborSyncService = useCallback(async () => {
+    if (!lazyNeighborInitRef.current) {
+      lazyNeighborInitRef.current = neighborDataSyncService.initialize().then(() => {
+        setSyncServiceInitialized(true)
+      }).catch(err => {
+        lazyNeighborInitRef.current = null
+        setSyncServiceInitialized(false)
+        throw err
+      })
+    }
+    return lazyNeighborInitRef.current
+  }, [])
+
   useEffect(() => {
     let mounted = true
 
-    // 使用 setTimeout 将初始化放到事件循环末尾，避免阻塞页面渲染
-    const initSyncService = async () => {
-      try {
-        await neighborDataSyncService.initialize()
-        if (mounted) {
-          console.log('[NeighborPage] 邻区数据同步服务初始化完成')
-          setSyncServiceInitialized(true)
-        }
-      } catch (error) {
-        console.error('[NeighborPage] 邻区数据同步服务初始化失败:', error)
-      }
-    }
+    // 🔥 优化：移除了 initSyncService 调用，页面挂载时不再自动加载全量工参
 
     // 监听数据刷新事件（当在其他页面上传新工参时）
     const handleDataRefresh = async () => {
@@ -470,6 +501,8 @@ export function NeighborPage() {
         // 清除地图数据和小区列表缓存
         await mapDataService.clearCache()
         clearCellListCache()
+        lazyNeighborInitRef.current = null // 数据刷新后清除懒加载缓存
+        setSyncServiceInitialized(false)
         // 重新加载小区列表，确保新建任务页面使用最新数据
         loadCellList()
         console.log('[NeighborPage] 已清除缓存并重载小区列表')
@@ -480,24 +513,19 @@ export function NeighborPage() {
 
     window.addEventListener(DATA_REFRESH_EVENT, handleDataRefresh)
 
-    // 延迟初始化，优先保证页面渲染
-    const timeoutId = setTimeout(() => {
-      initSyncService()
-    }, 0)
-
     return () => {
       mounted = false
       window.removeEventListener(DATA_REFRESH_EVENT, handleDataRefresh)
-      clearTimeout(timeoutId)
     }
   }, [])
 
   // 邻区规划模式：仅在规划结果完成时加载全量扇区数据
   // 根据规划结果的关系类型决定加载哪些网络类型的扇区
   useEffect(() => {
-    // 确保同步服务已初始化
+    // 🔥 优化：懒加载同步服务（需要时才初始化）
     if (!syncServiceInitialized) {
-      console.log('[NeighborPage] 等待同步服务初始化完成')
+      console.log('[NeighborPage] 同步服务未初始化，延迟加载...')
+      ensureNeighborSyncService().catch(() => {})
       return
     }
 
@@ -508,8 +536,7 @@ export function NeighborPage() {
 
     const loadFullParamsData = async () => {
       try {
-        // 直接从mapDataService获取全量工参数据
-        const { mapDataService } = await import('../services/mapDataService')
+        // 直接从mapDataService获取全量工参数据（🔥 已静态导入，无需动态 import）
 
         // 根据规划结果的关系类型决定加载策略
         let shouldLoadLTE = false
@@ -680,6 +707,11 @@ export function NeighborPage() {
       console.error('[NeighborPage] 加载小区列表失败:', err)
     } finally {
       setCellListLoading(false)
+      // 🔥 首次加载完成，关闭页面加载动画
+      if (pageLoadingRef.current) {
+        pageLoadingRef.current = false
+        setPageLoading(false)
+      }
     }
   }, [config.planningType])
 
@@ -881,8 +913,9 @@ export function NeighborPage() {
     setError(null); setLocalTaskResult(null); setLoading(true)
     setWizardStep('executing'); errorCountRef.current = 0
     try {
+      const fullTaskName = generateFullTaskName(taskName)
       const response: ApiResponse<{ taskId: string; message: string }> = await neighborApi.plan({
-        taskName: taskName,
+        taskName: fullTaskName,
         planningType: config.planningType as 'LTE-LTE' | 'NR-NR' | 'NR-LTE',
         maxNeighbors: config.maxNeighbors,
         coverageDistanceFactor: config.coverageDistanceFactor,
@@ -893,7 +926,7 @@ export function NeighborPage() {
         const newTaskId = response.data.taskId
         setActiveTaskId('neighbor_planning', newTaskId)
         setLocalTaskResult({ taskId: newTaskId, status: 'pending' as const, progress: 0, totalSites: 0, totalSectors: 0, totalNeighbors: 0, avgNeighbors: 0, startTime: new Date().toISOString() })
-        startTask(newTaskId, 'neighbor_planning', i18n.startTaskMsg, taskName, user?.username)
+        startTask(newTaskId, 'neighbor_planning', i18n.startTaskMsg, fullTaskName, user?.username)
       } else {
         setError(response.message || i18n.startTaskFailed); setWizardStep('cells_selected')
       }
@@ -1231,8 +1264,18 @@ export function NeighborPage() {
   const isRunning = localTaskResult?.status === 'pending' || localTaskResult?.status === 'processing'
 
   return (
-    <div className="h-full flex flex-col p-4 min-h-0">
-      <h1 className="text-3xl font-bold mb-6 shrink-0">{i18n.title}</h1>
+    <div className="h-full flex flex-col p-4 min-h-0 relative">
+      {/* 🔥 页面加载动画 */}
+      {pageLoading && (
+        <div className="absolute inset-0 flex items-center justify-center bg-background/60 z-50 rounded-xl">
+          <div className="flex flex-col items-center gap-3">
+            <Loader2 size={36} className="animate-spin text-primary" />
+            <span className="text-sm text-muted-foreground">{i18n.loading || '加载中...'}</span>
+          </div>
+        </div>
+      )}
+
+      <h1 className="text-base font-bold mb-6 shrink-0">{i18n.title}</h1>
 
       {/* 错误提示 */}
       {error && (
@@ -1288,6 +1331,25 @@ export function NeighborPage() {
                   </span>
                 )}
               </button>
+              {/* 批量操作按钮 */}
+              <div className="ml-auto flex items-center gap-1 mr-8">
+                {showBatchDelete && (
+                  batchDeleting ? (
+                    <span className="inline-flex items-center px-2 py-1 bg-red-400 text-white rounded-lg">
+                      <Loader2 size={14} className="animate-spin" />
+                    </span>
+                  ) : (
+                    <button
+                      onClick={() => triggerBatchDelete()}
+                      disabled={batchDeleting}
+                      className="p-1.5 bg-red-500 text-white rounded-lg hover:bg-red-600 transition-colors disabled:opacity-50"
+                      title={t('common.batchDelete') || '批量删除'}
+                    >
+                      <Trash2 size={14} />
+                    </button>
+                  )
+                )}
+              </div>
             </div>
 
             {/* 页签内容 */}
@@ -1403,7 +1465,7 @@ export function NeighborPage() {
                         onDownloadCellTemplate={wizardStep === 'cells_selected' ? handleDownloadCellTemplate : undefined}
                         uploading={cellFileUploading}
                         disabled={wizardStep !== 'cells_selected' || isRunning}
-                        columnLabels={{ siteId: i18n.sourceSiteId, cellId: i18n.sourceCellId, cellName: i18n.sourceCellName, selectAll: i18n.selectAll, clearSelections: i18n.clearSelections, uploadCellFile: i18n.uploadCellFile, downloadCellTemplate: i18n.downloadCellTemplate }}
+                        columnLabels={{ siteId: i18n.sourceSiteId, cellId: i18n.sourceCellId, cellName: i18n.sourceCellName, cellFreq: i18n.cellFreq, cellPci: i18n.cellPci, selectAll: i18n.selectAll, clearSelections: i18n.clearSelections, uploadCellFile: i18n.uploadCellFile, downloadCellTemplate: i18n.downloadCellTemplate }}
                       />
                     </div>
                   </div>
@@ -1455,11 +1517,17 @@ export function NeighborPage() {
                     }}
                     onViewTask={handleViewTask}
                     getCellCount={getCellCount}
+                    onSelectedChange={(counts) => setSelectedCount(counts.total)}
+                    onBatchStatusChange={(_applying, deleting) => setBatchDeleting(deleting)}
                   />
                 </div>
               )}
 
               {activeLeftTab === 'planning-result' && (
+                <>
+                {resultLoading ? (
+                  <LoadingSpinner variant="spinner" text={i18n.loadingResult || '正在加载规划结果...'} />
+                ) : (
 
                 /* 规划结果面板（原内容） */
                 <div className="flex flex-col h-full overflow-hidden">
@@ -1568,7 +1636,9 @@ export function NeighborPage() {
                   )}
                 </div>
               )}
-            </div>
+            </>
+          )}
+        </div>
           </div>
         </div>
 

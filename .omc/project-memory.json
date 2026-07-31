@@ -1,11 +1,20 @@
 {
   "version": "1.0.0",
-  "lastScanned": 1780416322118,
-  "projectRoot": "/DATA/AppData/NetworkPlanningTooV3",
+  "lastScanned": 1785459456281,
+  "projectRoot": "/home/pwc/NetworkPlanningTooV3",
   "techStack": {
-    "languages": [],
+    "languages": [
+      {
+        "name": "JavaScript/TypeScript",
+        "version": null,
+        "confidence": "high",
+        "markers": [
+          "package.json"
+        ]
+      }
+    ],
     "frameworks": [],
-    "packageManager": null,
+    "packageManager": "npm",
     "runtime": null
   },
   "build": {
@@ -36,7 +45,7 @@
       "path": "backend",
       "purpose": null,
       "fileCount": 33,
-      "lastAccessed": 1780416322024,
+      "lastAccessed": 1785459456268,
       "keyFiles": [
         "ADD_MIN_DISTANCE_SECTOR_NAME_SUMMARY.md",
         "Dockerfile",
@@ -45,11 +54,18 @@
         "analyze_neighbor_case.py"
       ]
     },
+    "cloudflare": {
+      "path": "cloudflare",
+      "purpose": null,
+      "fileCount": 0,
+      "lastAccessed": 1785459456268,
+      "keyFiles": []
+    },
     "data": {
       "path": "data",
       "purpose": "Data files",
       "fileCount": 12,
-      "lastAccessed": 1780416322029,
+      "lastAccessed": 1785459456273,
       "keyFiles": [
         "data.db",
         "data.db-shm",
@@ -62,7 +78,7 @@
       "path": "docs",
       "purpose": "Documentation",
       "fileCount": 4,
-      "lastAccessed": 1780416322049,
+      "lastAccessed": 1785459456276,
       "keyFiles": [
         "LICENSE_GUIDE.md",
         "LICENSE_REFACTOR_SUMMARY.md",
@@ -73,34 +89,30 @@
     "exports": {
       "path": "exports",
       "purpose": null,
-      "fileCount": 6,
-      "lastAccessed": 1780416322052,
+      "fileCount": 1,
+      "lastAccessed": 1785459456277,
       "keyFiles": [
-        "tac_export_24f5970e-2419-4ce4-9760-2e2defe70a1f.xlsx",
-        "tac_export_2da8ea3f-2998-4091-9b15-96c295543f16.xlsx",
-        "tac_export_82fee821-7a1e-4e41-89f0-dbda96753793.xlsx",
-        "tac_export_e55d3c5f-f66f-4ad1-a62d-977714738d0b.xlsx",
-        "tac_planning_export_0fa85710-1556-42f7-8e82-e6263f6c6355.xlsx"
+        "tac_export_1ec5eaf1-5850-46d7-915e-81a33c41c0d4.xlsx"
       ]
     },
     "frontend": {
       "path": "frontend",
       "purpose": null,
       "fileCount": 28,
-      "lastAccessed": 1780416322056,
+      "lastAccessed": 1785459456277,
       "keyFiles": [
         "Dockerfile",
         "_nul",
         "capacitor.config.ts",
         "copy_backend.bat",
-        "electron-builder.json"
+        "env.example"
       ]
     },
     "licenses": {
       "path": "licenses",
       "purpose": null,
       "fileCount": 2,
-      "lastAccessed": 1780416322059,
+      "lastAccessed": 1785459456277,
       "keyFiles": [
         "license.dat"
       ]
@@ -108,37 +120,41 @@
     "mobile-app": {
       "path": "mobile-app",
       "purpose": null,
-      "fileCount": 9,
-      "lastAccessed": 1780416322061,
+      "fileCount": 25,
+      "lastAccessed": 1785459456277,
       "keyFiles": [
+        "AGENTS.md",
+        "APP图标.png",
         "App.tsx",
-        "app.json",
-        "eas.json",
-        "package-lock.json",
-        "package.json"
+        "CLAUDE.md",
+        "Development_Guidelines_CN.md"
       ]
     },
     "outputs": {
       "path": "outputs",
       "purpose": null,
-      "fileCount": 1,
-      "lastAccessed": 1780416322064,
+      "fileCount": 7,
+      "lastAccessed": 1785459456277,
       "keyFiles": [
-        "tasks_index.json"
+        "034e8c3b-9799-4ced-9e60-79086a022c9a.xlsx",
+        "29b93d3f-131d-48be-b069-26b5886bf2f7.xlsx",
+        "58562788-8c77-4340-a66e-4da5c253f2dc.xlsx",
+        "66803ffc-8f73-46ce-bf77-4b29ea03d060.xlsx",
+        "c06f4a40-d7e2-4c0f-ae80-ca2c1ffd96a8.xlsx"
       ]
     },
     "refactored": {
       "path": "refactored",
       "purpose": null,
       "fileCount": 0,
-      "lastAccessed": 1780416322067,
+      "lastAccessed": 1785459456277,
       "keyFiles": []
     },
     "scripts": {
       "path": "scripts",
       "purpose": "Build/utility scripts",
       "fileCount": 7,
-      "lastAccessed": 1780416322069,
+      "lastAccessed": 1785459456278,
       "keyFiles": [
         "build-backend.sh",
         "build-exe.bat",
@@ -151,7 +167,7 @@
       "path": "shared",
       "purpose": null,
       "fileCount": 1,
-      "lastAccessed": 1780416322072,
+      "lastAccessed": 1785459456278,
       "keyFiles": [
         "types.ts"
       ]
@@ -160,7 +176,7 @@
       "path": "team-backup",
       "purpose": null,
       "fileCount": 2,
-      "lastAccessed": 1780416322074,
+      "lastAccessed": 1785459456278,
       "keyFiles": [
         "worker1_backend_task.md",
         "worker2_frontend_task.md"
@@ -170,7 +186,7 @@
       "path": "template",
       "purpose": null,
       "fileCount": 10,
-      "lastAccessed": 1780416322076,
+      "lastAccessed": 1785459456278,
       "keyFiles": [
         "GeoDataTemplate - 扇形.xlsx",
         "GeoDataTemplate -多边形 -百度.xlsx",
@@ -183,40 +199,34 @@
       "path": "tmp",
       "purpose": null,
       "fileCount": 0,
-      "lastAccessed": 1780416322078,
+      "lastAccessed": 1785459456279,
       "keyFiles": []
     },
     "uploads": {
       "path": "uploads",
       "purpose": null,
-      "fileCount": 98,
-      "lastAccessed": 1780416322082,
+      "fileCount": 123,
+      "lastAccessed": 1785459456279,
       "keyFiles": [
         "041f1ad0-0499-4c8e-ac52-b6cb9efd3902.zip",
+        "049286ae-128f-4d02-99bb-54ad6cf20fa0.TAB",
         "08c51a3c-09ed-47f2-b124-d6e69fa75744.zip",
         "0b6bed36-94a1-4342-a48e-2c3f2bd3f1ba.zip",
-        "0d0ee6cc-e724-428d-967f-35d469b7ad94.zip",
-        "0d329487-9ab7-4dfa-99aa-4f5874d4d152.zip"
+        "0b837738-dccb-41f1-99bd-3cab29b828fd.xlsx"
       ]
     },
     "全量工参": {
       "path": "全量工参",
       "purpose": null,
-      "fileCount": 23,
-      "lastAccessed": 1780416322085,
-      "keyFiles": [
-        "4G_TAC.DAT",
-        "4G_TAC.ID",
-        "4G_TAC.MAP",
-        "4G_TAC.TAB",
-        "4G_TAC.zip"
-      ]
+      "fileCount": 0,
+      "lastAccessed": 1785459456279,
+      "keyFiles": []
     },
     "待规划小区": {
       "path": "待规划小区",
       "purpose": null,
       "fileCount": 1,
-      "lastAccessed": 1780416322088,
+      "lastAccessed": 1785459456280,
       "keyFiles": [
         "cell-tree-export.xlsx"
       ]
@@ -225,278 +235,309 @@
       "path": "输出文件",
       "purpose": null,
       "fileCount": 0,
-      "lastAccessed": 1780416322091,
+      "lastAccessed": 1785459456280,
       "keyFiles": []
-    },
-    "frontend/build": {
-      "path": "frontend/build",
-      "purpose": "Build output",
-      "fileCount": 0,
-      "lastAccessed": 1780416322102,
-      "keyFiles": []
-    },
-    "mobile-app/app": {
-      "path": "mobile-app/app",
-      "purpose": "Application code",
-      "fileCount": 2,
-      "lastAccessed": 1780416322106,
-      "keyFiles": [
-        "+html.tsx",
-        "_layout.tsx"
-      ]
     }
   },
   "hotPaths": [
     {
-      "path": "frontend/src/renderer/pages/TACPage.tsx",
-      "accessCount": 39,
-      "lastAccessed": 1780488241415,
+      "path": "backend/app/services/data_service.py",
+      "accessCount": 210,
+      "lastAccessed": 1785475483480,
       "type": "file"
     },
     {
       "path": "backend/app/services/task_manager.py",
-      "accessCount": 35,
-      "lastAccessed": 1780472202674,
+      "accessCount": 41,
+      "lastAccessed": 1785252725860,
       "type": "file"
     },
     {
-      "path": "frontend/src/renderer/pages/NeighborPage.tsx",
-      "accessCount": 35,
-      "lastAccessed": 1780488240242,
-      "type": "file"
-    },
-    {
-      "path": "frontend/src/renderer/pages/PCIPage.tsx",
-      "accessCount": 35,
-      "lastAccessed": 1780496539869,
-      "type": "file"
-    },
-    {
-      "path": "backend/app/services/data_service.py",
-      "accessCount": 28,
-      "lastAccessed": 1780472233902,
-      "type": "file"
-    },
-    {
-      "path": "frontend/src/renderer/pages/MapPage.tsx",
-      "accessCount": 24,
-      "lastAccessed": 1780463326498,
-      "type": "file"
-    },
-    {
-      "path": "frontend/src/renderer/pages/TACPlanningPage.tsx",
-      "accessCount": 17,
-      "lastAccessed": 1780473339066,
-      "type": "file"
-    },
-    {
-      "path": "frontend/src/renderer/components/Map/OnlineMap.tsx",
-      "accessCount": 11,
-      "lastAccessed": 1780472618318,
-      "type": "file"
-    },
-    {
-      "path": "frontend/src/renderer/components/Layout/MainLayout.tsx",
-      "accessCount": 11,
-      "lastAccessed": 1780473020192,
-      "type": "file"
-    },
-    {
-      "path": "frontend/src/renderer/services/api.ts",
-      "accessCount": 10,
-      "lastAccessed": 1780472434082,
-      "type": "file"
-    },
-    {
-      "path": "frontend/src/renderer/store/mapStore.ts",
-      "accessCount": 9,
-      "lastAccessed": 1780463330769,
+      "path": "frontend/src/renderer/pages/DataPage.tsx",
+      "accessCount": 41,
+      "lastAccessed": 1785476879737,
       "type": "file"
     },
     {
       "path": "backend/app/api/v1/endpoints/data.py",
-      "accessCount": 6,
-      "lastAccessed": 1780443422527,
+      "accessCount": 27,
+      "lastAccessed": 1785476797215,
+      "type": "file"
+    },
+    {
+      "path": "frontend/src/renderer/pages/TACPage.tsx",
+      "accessCount": 22,
+      "lastAccessed": 1785329845118,
+      "type": "file"
+    },
+    {
+      "path": "frontend/src/renderer/pages/PCIPage.tsx",
+      "accessCount": 18,
+      "lastAccessed": 1785387891193,
+      "type": "file"
+    },
+    {
+      "path": "frontend/src/renderer/services/api.ts",
+      "accessCount": 18,
+      "lastAccessed": 1785476811050,
+      "type": "file"
+    },
+    {
+      "path": "backend/app/models/database.py",
+      "accessCount": 17,
+      "lastAccessed": 1785477708741,
+      "type": "file"
+    },
+    {
+      "path": "frontend/src/renderer/store/dataStore.ts",
+      "accessCount": 16,
+      "lastAccessed": 1785389066066,
+      "type": "file"
+    },
+    {
+      "path": "backend/app/models/schemas.py",
+      "accessCount": 12,
+      "lastAccessed": 1785477875652,
+      "type": "file"
+    },
+    {
+      "path": "backend/app/core/database.py",
+      "accessCount": 11,
+      "lastAccessed": 1785477708793,
+      "type": "file"
+    },
+    {
+      "path": "backend/app/services/auth_service.py",
+      "accessCount": 11,
+      "lastAccessed": 1785477878871,
+      "type": "file"
+    },
+    {
+      "path": "frontend/src/renderer/store/taskStore.ts",
+      "accessCount": 10,
+      "lastAccessed": 1785252688484,
+      "type": "file"
+    },
+    {
+      "path": "frontend/src/renderer/locales/zh.json",
+      "accessCount": 7,
+      "lastAccessed": 1785342039702,
+      "type": "file"
+    },
+    {
+      "path": "frontend/src/renderer/locales/en.json",
+      "accessCount": 7,
+      "lastAccessed": 1785342041219,
       "type": "file"
     },
     {
       "path": "backend/app/api/v1/endpoints/pci.py",
       "accessCount": 6,
-      "lastAccessed": 1780472304847,
+      "lastAccessed": 1785329647890,
       "type": "file"
     },
     {
-      "path": "frontend/src/renderer/store/tacStore.ts",
+      "path": "frontend/src/renderer/pages/NeighborPage.tsx",
       "accessCount": 6,
-      "lastAccessed": 1780485554530,
+      "lastAccessed": 1785329699505,
       "type": "file"
     },
     {
-      "path": "frontend/src/renderer/store/tacPlanningStore.ts",
+      "path": "frontend/src/renderer/services/mapDataService.ts",
       "accessCount": 5,
-      "lastAccessed": 1780473199548,
+      "lastAccessed": 1785388921300,
       "type": "file"
     },
     {
-      "path": "frontend/src/renderer/store/taskStore.ts",
+      "path": "frontend/src/renderer/pages/TACPlanningPage.tsx",
       "accessCount": 4,
-      "lastAccessed": 1780468642757,
+      "lastAccessed": 1785222317450,
       "type": "file"
     },
     {
-      "path": "backend/app/services/geo_data_service.py",
-      "accessCount": 3,
-      "lastAccessed": 1780420892672,
+      "path": "frontend/src/renderer/components/HistoryTable.tsx",
+      "accessCount": 4,
+      "lastAccessed": 1785252676510,
       "type": "file"
     },
     {
-      "path": "frontend/src/renderer/store/neighborStore.ts",
+      "path": "backend/app/services/export_service.py",
       "accessCount": 3,
-      "lastAccessed": 1780485522696,
-      "type": "file"
-    },
-    {
-      "path": "frontend/src/renderer/store/tacCheckStore.ts",
-      "accessCount": 3,
-      "lastAccessed": 1780485523217,
+      "lastAccessed": 1784989427985,
       "type": "file"
     },
     {
       "path": "backend/app/api/v1/endpoints/tac.py",
       "accessCount": 3,
-      "lastAccessed": 1780496503380,
+      "lastAccessed": 1785211724657,
       "type": "file"
     },
     {
-      "path": "frontend/src/renderer/components/Map/SectorRendererSVG.tsx",
-      "accessCount": 2,
-      "lastAccessed": 1780463408721,
+      "path": "shared/types.ts",
+      "accessCount": 3,
+      "lastAccessed": 1785252725748,
       "type": "file"
     },
     {
-      "path": "docs/plans/2026-06-03-task-persistence-pci-apply-map-marker-design.md",
-      "accessCount": 2,
-      "lastAccessed": 1780468592541,
+      "path": "frontend/src/renderer/utils/taskNameUtils.ts",
+      "accessCount": 3,
+      "lastAccessed": 1785329676800,
       "type": "file"
     },
     {
-      "path": "docs/plans/2026-06-03-task-persistence-pci-apply-map-marker-plan.md",
+      "path": "frontend/src/renderer/services/tacDataSyncService.ts",
       "accessCount": 2,
-      "lastAccessed": 1780470399520,
+      "lastAccessed": 1784595148314,
+      "type": "file"
+    },
+    {
+      "path": "frontend/src/renderer/store/tacCheckStore.ts",
+      "accessCount": 2,
+      "lastAccessed": 1784595149135,
+      "type": "file"
+    },
+    {
+      "path": "frontend/src/renderer/components/WizardFooter.tsx",
+      "accessCount": 2,
+      "lastAccessed": 1784595179869,
+      "type": "file"
+    },
+    {
+      "path": "backend/requirements.txt",
+      "accessCount": 2,
+      "lastAccessed": 1784600446261,
+      "type": "file"
+    },
+    {
+      "path": "data_service.py",
+      "accessCount": 2,
+      "lastAccessed": 1784989442045,
       "type": "file"
     },
     {
       "path": "frontend/src/renderer/store/pciStore.ts",
       "accessCount": 2,
-      "lastAccessed": 1780473181507,
+      "lastAccessed": 1785252677953,
+      "type": "file"
+    },
+    {
+      "path": "frontend/src/renderer/utils/buttonStyles.ts",
+      "accessCount": 2,
+      "lastAccessed": 1785252688168,
+      "type": "file"
+    },
+    {
+      "path": "frontend/src/renderer/store/mapStore.ts",
+      "accessCount": 2,
+      "lastAccessed": 1785252695702,
+      "type": "file"
+    },
+    {
+      "path": "frontend/src/renderer/components/CellSelectionTable.tsx",
+      "accessCount": 2,
+      "lastAccessed": 1785388350732,
+      "type": "file"
+    },
+    {
+      "path": "frontend/src/renderer/services/pciDataSyncService.ts",
+      "accessCount": 2,
+      "lastAccessed": 1785388623694,
+      "type": "file"
+    },
+    {
+      "path": "frontend/src/renderer/store/authStore.ts",
+      "accessCount": 2,
+      "lastAccessed": 1785476789905,
+      "type": "file"
+    },
+    {
+      "path": "frontend/src/renderer/store/tacStore.ts",
+      "accessCount": 1,
+      "lastAccessed": 1784595148686,
+      "type": "file"
+    },
+    {
+      "path": "frontend/src/renderer/store/tacPlanningStore.ts",
+      "accessCount": 1,
+      "lastAccessed": 1784595149584,
+      "type": "file"
+    },
+    {
+      "path": "frontend/src/renderer/components/StepIndicator.tsx",
+      "accessCount": 1,
+      "lastAccessed": 1784595180025,
       "type": "file"
     },
     {
       "path": "frontend/src/renderer/components/Layout/GlobalTaskIndicator.tsx",
-      "accessCount": 2,
-      "lastAccessed": 1780496606581,
+      "accessCount": 1,
+      "lastAccessed": 1785161666587,
       "type": "file"
     },
     {
-      "path": "backend/app/api/v1/endpoints/geo_data.py",
+      "path": "frontend/src/renderer/services/neighborDataSyncService.ts",
       "accessCount": 1,
-      "lastAccessed": 1780419646989,
+      "lastAccessed": 1785161666646,
+      "type": "file"
+    },
+    {
+      "path": "backend/app/services/geo_data_service.py",
+      "accessCount": 1,
+      "lastAccessed": 1785211721208,
+      "type": "file"
+    },
+    {
+      "path": "backend/app/services/tac_planning_service.py",
+      "accessCount": 1,
+      "lastAccessed": 1785211725048,
+      "type": "file"
+    },
+    {
+      "path": "backend/app/algorithms/pci_planning_service_v2.py",
+      "accessCount": 1,
+      "lastAccessed": 1785212179925,
+      "type": "file"
+    },
+    {
+      "path": "frontend/src/renderer/components/TaskConfigModal.tsx",
+      "accessCount": 1,
+      "lastAccessed": 1785252675860,
+      "type": "file"
+    },
+    {
+      "path": "frontend/src/renderer/components/NumberInput.tsx",
+      "accessCount": 1,
+      "lastAccessed": 1785252676466,
+      "type": "file"
+    },
+    {
+      "path": "frontend/src/renderer/pages/TaskConfigPage.tsx",
+      "accessCount": 1,
+      "lastAccessed": 1785252689371,
+      "type": "file"
+    },
+    {
+      "path": "frontend/src/renderer/store/neighborStore.ts",
+      "accessCount": 1,
+      "lastAccessed": 1785252695146,
+      "type": "file"
+    },
+    {
+      "path": "frontend/src/renderer/components/LoadingSpinner.tsx",
+      "accessCount": 1,
+      "lastAccessed": 1785252696801,
+      "type": "file"
+    },
+    {
+      "path": "backend/app/core/config.py",
+      "accessCount": 1,
+      "lastAccessed": 1785252711649,
       "type": "file"
     },
     {
       "path": "backend/app/api/v1/endpoints/neighbor.py",
       "accessCount": 1,
-      "lastAccessed": 1780419755755,
-      "type": "file"
-    },
-    {
-      "path": "backend/app/models/database.py",
-      "accessCount": 1,
-      "lastAccessed": 1780420126388,
-      "type": "file"
-    },
-    {
-      "path": "frontend/src/renderer/services/indexedDBService.ts",
-      "accessCount": 1,
-      "lastAccessed": 1780420130237,
-      "type": "file"
-    },
-    {
-      "path": "backend/app/models/schemas.py",
-      "accessCount": 1,
-      "lastAccessed": 1780420323058,
-      "type": "file"
-    },
-    {
-      "path": "frontend/src/renderer/components/Map/index.ts",
-      "accessCount": 1,
-      "lastAccessed": 1780463329831,
-      "type": "file"
-    },
-    {
-      "path": "frontend/src/renderer/components/Map/OfflineMap.tsx",
-      "accessCount": 1,
-      "lastAccessed": 1780463331189,
-      "type": "file"
-    },
-    {
-      "path": "backend/app/services/websocket_manager.py",
-      "accessCount": 1,
-      "lastAccessed": 1780463332308,
-      "type": "file"
-    },
-    {
-      "path": "frontend/src/renderer/components/Map/MapTypeSwitch.tsx",
-      "accessCount": 1,
-      "lastAccessed": 1780463375617,
-      "type": "file"
-    },
-    {
-      "path": "frontend/src/renderer/App.tsx",
-      "accessCount": 1,
-      "lastAccessed": 1780463399277,
-      "type": "file"
-    },
-    {
-      "path": "frontend/src/renderer/services/websocketService.ts",
-      "accessCount": 1,
-      "lastAccessed": 1780463399397,
-      "type": "file"
-    },
-    {
-      "path": "frontend/src/renderer/components/Map/MapInfoLayer.tsx",
-      "accessCount": 1,
-      "lastAccessed": 1780463406579,
-      "type": "file"
-    },
-    {
-      "path": "frontend/src/renderer/components/Map/GeoDataLayer.tsx",
-      "accessCount": 1,
-      "lastAccessed": 1780463409693,
-      "type": "file"
-    },
-    {
-      "path": "frontend/src/renderer/components/Map/LabelSettingsModal.tsx",
-      "accessCount": 1,
-      "lastAccessed": 1780463435078,
-      "type": "file"
-    },
-    {
-      "path": "frontend/src/renderer/utils/frequencyColors.ts",
-      "accessCount": 1,
-      "lastAccessed": 1780463436560,
-      "type": "file"
-    },
-    {
-      "path": "frontend/src/renderer/index.css",
-      "accessCount": 1,
-      "lastAccessed": 1780463477501,
-      "type": "file"
-    },
-    {
-      "path": "frontend/src/renderer/config/sector-config.ts",
-      "accessCount": 1,
-      "lastAccessed": 1780463479627,
+      "lastAccessed": 1785329657257,
       "type": "file"
     }
   ],

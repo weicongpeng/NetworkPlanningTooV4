@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
-import { Download, Loader2, AlertCircle, Search, X, Ruler, Save, Check, GripVertical, List, Eye } from 'lucide-react'
+import { Download, Loader2, AlertCircle, Search, X, Ruler, Save, Check, GripVertical, List, Eye, Trash2 } from 'lucide-react'
 import { pciApi, dataApi } from '../services/api'
 import type { ApiResponse } from '@shared/types'
 import { useTaskStore, type Task } from '../store/taskStore'
@@ -8,19 +8,21 @@ import { btn } from '../utils/buttonStyles'
 import { OnlineMap, type OnlineMapRef } from '../components/Map/OnlineMap'
 import { PCILegend } from '../components/Map/PCILegend'
 import { MapTypeSwitch } from '../components/Map/MapTypeSwitch'
+import { LoadingSpinner } from '../components/LoadingSpinner'
 import { useAuthStore } from '../store/authStore'
 import { pciDataSyncService } from '../services/pciDataSyncService'
-import { mapDataService, getCellList, clearCellListCache } from '../services/mapDataService'
+import { mapDataService, getCellList, clearCellListCache, bumpDataVersion } from '../services/mapDataService'
 import { CoordinateTransformer } from '../utils/coordinate'
 import type { RenderSectorData, CellListItem } from '../services/mapDataService'
 import { triggerDataRefresh, DATA_REFRESH_EVENT } from '../store/dataStore'
 import { usePCIStore } from '../store/pciStore'
 import { useTranslation } from 'react-i18next'
 import { CellSelectionTable } from '../components/CellSelectionTable'
-import { HistoryTable } from '../components/HistoryTable'
+import { HistoryTable, triggerBatchApply, triggerBatchDelete } from '../components/HistoryTable'
 import { StepIndicator } from '../components/StepIndicator'
 import { WizardFooter } from '../components/WizardFooter'
 import { extractCellIdsFromFile, matchCellIds, downloadCellTreeTemplate } from '../utils/cellFileHelper'
+import { generateFullTaskName } from '../utils/taskNameUtils'
 
 const PCI_COLUMNS_STATIC = [
   { key: 'networkType', label: '网元类型', defaultWidth: 80 },
@@ -164,6 +166,8 @@ export function PCIPage() {
 
   const [localTaskResult, setLocalTaskResult] = useState<PCIResultData | null>(null)
   const viewedTaskResultRef = useRef<PCIResultData | null>(null) // 🔒 用户点击"查看"的结果，永不覆盖
+  const isLoadingResultRef = useRef(false)
+  const [resultLoading, setResultLoading] = useState(false)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [isWhitelistEnabled, setIsWhitelistEnabled] = useState(true)
@@ -171,6 +175,14 @@ export function PCIPage() {
 
   const [applyingToParams, setApplyingToParams] = useState(false)
   const [applySuccess, setApplySuccess] = useState(false)
+
+  // 批量操作状态
+  const [selectedCount, setSelectedCount] = useState(0)
+  const [unappliedCount, setUnappliedCount] = useState(0)
+  const [batchApplying, setBatchApplying] = useState(false)
+  const [batchDeleting, setBatchDeleting] = useState(false)
+  const showBatchApply = unappliedCount > 0
+  const showBatchDelete = selectedCount > 0
 
   const [selectedSectorKey, setSelectedSectorKey] = useState<string | null>(null)
 
@@ -242,36 +254,56 @@ export function PCIPage() {
       if (viewedTaskResultRef.current) {
         return
       }
+      isLoadingResultRef.current = true
+      // 仅当没有已有结果时才显示加载动画
+      if (!currentTaskResult) {
+        setResultLoading(true)
+      }
       const loadLatest = async () => {
         await syncHistoryFromBackend('pci_planning')
+        if (!isLoadingResultRef.current) return
         const latest = getLatestPCITask()
         if (latest && latest.result) {
+          // 恢复应用状态（跨页面同步）
+          if (latest.isApplied) {
+            setApplySuccess(true)
+          } else {
+            setApplySuccess(false)
+          }
           // 如果 store 中的结果没有完整 results（来自 resultSummary），尝试从 API 重新获取
           if (!latest.result.results && latest.id) {
             try {
               const response = await pciApi.getResult(latest.id)
+              if (!isLoadingResultRef.current) return
               if (response?.success && response?.data?.results) {
                 const fullResult = response.data as PCIResultData
                 setLocalTaskResult(fullResult)
                 if (fullResult.results) {
                   pciDataSyncService.setPCIResults({ results: fullResult.results })
                 }
-                setWizardStep('completed')
+                if (isLoadingResultRef.current) setWizardStep('completed')
                 return
               }
             } catch (fetchErr: any) {
               console.warn('[PCIPage] 获取完整规划结果失败，使用缓存摘要:', fetchErr?.message)
             }
           }
+          if (!isLoadingResultRef.current) return
           // 有完整 results 或 API 获取失败时使用已有结果
           setLocalTaskResult(latest.result as PCIResultData)
           if (latest.result.results) {
             pciDataSyncService.setPCIResults({ results: latest.result.results })
           }
-          setWizardStep('completed')
+          if (isLoadingResultRef.current) setWizardStep('completed')
         }
       }
-      loadLatest()
+      loadLatest().finally(() => {
+        if (isLoadingResultRef.current) setResultLoading(false)
+      })
+      return () => {
+        isLoadingResultRef.current = false
+        setResultLoading(false)
+      }
     } else {
       // 离开结果页时清除用户显式查看的结果
       viewedTaskResultRef.current = null
@@ -291,28 +323,35 @@ export function PCIPage() {
   }, [])
 
   // ===== 应用 PCI 结果到全量工参 =====
-  const pollApplyResult = useCallback(async (applyTaskId: string, timeout = 30000): Promise<any> => {
+  const pollApplyResult = useCallback(async (applyTaskId: string, timeout = 60000): Promise<any> => {
     const startTime = Date.now()
     while (Date.now() - startTime < timeout) {
       await new Promise(r => setTimeout(r, 1000))
       try {
         const result = await pciApi.getApplyResult(applyTaskId)
-        if (result?.data?.status === 'completed') {
+        // getApplyResult 返回 200 = 任务已完成（status 字段在 result.data 中不存在）
+        // 只要返回了数据就表示任务执行完毕
+        if (result?.data) {
+          if (result.data.updatedCount !== undefined) {
+            return result.data
+          }
+          // 有数据但缺少 updatedCount，也可能是失败结果
+          if (result.data.success === false) {
+            throw new Error(result.data.message || result.data.error || '应用失败')
+          }
+          // 兜底：有数据就认为成功
           return result.data
         }
-        if (result?.data?.status === 'failed') {
-          throw new Error(result?.data?.error || '应用失败')
-        }
       } catch (pollErr: any) {
-        if (pollErr?.response?.status === 404) continue
+        if (pollErr?.code === 404) continue
         throw pollErr
       }
     }
     throw new Error('应用超时')
   }, [])
 
-  const handleApplyTask = useCallback(async (task: Task): Promise<boolean> => {
-    if (!window.confirm(t('pci.applyConfirm') || '规划结果将应用到工参')) return false
+  const handleApplyTask = useCallback(async (task: Task, skipConfirm?: boolean): Promise<boolean> => {
+    if (!skipConfirm && !window.confirm(t('pci.applyConfirm') || '规划结果将应用到工参')) return false
     setApplyingToParams(true)
     setApplySuccess(false)
     try {
@@ -328,14 +367,15 @@ export function PCIPage() {
       }
 
       if (updatedCount !== undefined) {
-        // 标记任务为已应用（跨用户共享）
-        pciApi.markApplied(task.id).catch(e =>
+        // 标记任务为已应用（跨用户共享），等待完成后 HistoryTable 才会 syncHistoryFromBackend
+        try {
+          await pciApi.markApplied(task.id)
+        } catch (e: any) {
           console.warn('[PCIPage] 标记已应用失败:', e?.message)
-        )
-        // 清除地图缓存，确保扇区属性显示更新后的PCI
-        mapDataService.clearCache().catch(e =>
-          console.warn('[PCIPage] 清理地图缓存失败:', e?.message)
-        )
+        }
+        useTaskStore.getState().markTaskApplied(task.id)
+        await mapDataService.clearCache()
+        bumpDataVersion()
         setApplySuccess(true)
         triggerDataRefresh()
         return true
@@ -424,34 +464,47 @@ export function PCIPage() {
   const hasFullResult = currentTaskResult && !!(currentTaskResult as any).results
   const isRunning = localTaskResult?.status === 'pending' || localTaskResult?.status === 'processing'
 
+  // 🔥 优化：页面挂载时不初始化 pciDataSyncService（延迟到需要时再加载），
+  // 避免刚登录/切换页面时立即加载全量工参数据
+  // ⚠️ ensureSyncService 和 lazyInitSyncServiceRef 必须定义在引用它们的 useEffect 之前，
+  //    避免 Rollup 生产构建中的 Temporal Dead Zone (TDZ) 问题导致页面空白
+  const lazyInitSyncServiceRef = useRef<Promise<void> | null>(null)
+  const ensureSyncService = useCallback(async () => {
+    if (!lazyInitSyncServiceRef.current) {
+      lazyInitSyncServiceRef.current = pciDataSyncService.initialize().catch(err => {
+        lazyInitSyncServiceRef.current = null // 失败后允许重试
+        throw err
+      })
+    }
+    return lazyInitSyncServiceRef.current
+  }, [])
+
   useEffect(() => {
     // latestPCITask 变化时自动加载结果（不影响用户显式查看的 viewedTaskResultRef）
     if (latestPCITask && latestPCITask.result && latestPCITask.result.results) {
       setLocalTaskResult(latestPCITask.result as PCIResultData)
-      pciDataSyncService.setPCIResults({ results: latestPCITask.result.results })
+      // 🔥 优化：需要渲染 PCI 结果时，延迟初始化 sync service
+      ensureSyncService().then(() => {
+        pciDataSyncService.setPCIResults({ results: latestPCITask.result.results })
+      }).catch(() => {})
     }
-  }, [latestPCITask])
+  }, [latestPCITask, ensureSyncService])
 
   useEffect(() => {
     let mounted = true
-    const initSyncService = async () => {
-      try {
-        await pciDataSyncService.initialize()
-        if (mapRef.current && mounted) {
-          await mapRef.current.refreshData()
-        }
-      } catch (error: any) {
-        if (error?.message?.includes('未找到全量工参') || error?.message?.includes('全量工参')) {
-          setLocalTaskResult(null)
-        }
+    // 🔥 优化：移除了调用 initSyncService()，页面挂载时不再自动加载全量工参
+    // 🔥 兜底：5秒后无论加载是否完成都关闭loading，避免卡死在加载状态
+    const safetyTimer = setTimeout(() => {
+      if (pageLoadingRef.current) {
+        pageLoadingRef.current = false
+        setPageLoading(false)
       }
-    }
-    initSyncService()
+    }, 5000)
     const handleDataRefresh = async () => {
       try {
         mapDataService.clearCache()
         clearCellListCache()
-        await initSyncService()
+        lazyInitSyncServiceRef.current = null // 数据刷新后清除懒加载缓存，下次需要时重新加载
         // 重新加载小区列表，确保新建任务页面使用最新数据
         loadCellList()
       } catch (error) {
@@ -462,8 +515,13 @@ export function PCIPage() {
     return () => {
       mounted = false
       window.removeEventListener(DATA_REFRESH_EVENT, handleDataRefresh)
+      clearTimeout(safetyTimer)
     }
   }, [])
+
+  // 🔥 优化：页面加载动画
+  const [pageLoading, setPageLoading] = useState(true)
+  const pageLoadingRef = useRef(true)
 
   const completionHandledRef = useRef(false)
   useEffect(() => {
@@ -726,9 +784,10 @@ export function PCIPage() {
     }
     const pciMin = parseInt(pciRangeMatch[1])
     const pciMax = parseInt(pciRangeMatch[2])
+    const fullTaskName = generateFullTaskName(taskName)
     try {
       const response: ApiResponse<{ taskId: string; message: string }> = await pciApi.plan({
-        taskName: taskName,
+        taskName: fullTaskName,
         networkType: config.networkType as 'LTE' | 'NR',
         distanceThreshold: config.distanceThreshold,
         pciModulus: pciModulus,
@@ -751,7 +810,7 @@ export function PCIPage() {
           startTime: new Date().toISOString()
         }
         setLocalTaskResult(initialResult)
-        startTask(newTaskId, 'pci_planning', 'PCI规划开始', taskName, user?.username)
+        startTask(newTaskId, 'pci_planning', 'PCI规划开始', fullTaskName, user?.username)
       } else {
         setError(response.message || (t('pci.startPlanFailed') || '启动规划任务失败'))
         setWizardStep('cells_selected')
@@ -767,6 +826,15 @@ export function PCIPage() {
   // 从历史任务查看 - 跳转到结果页并自动打开地图
   const handleViewTask = async (task: any) => {
     try {
+      // 从 taskStore 或后端恢复应用状态（跨页面同步）
+      const storeTask = useTaskStore.getState().tasks[task.id]
+      const isApplied = storeTask?.isApplied || task?.isApplied || false
+      if (isApplied) {
+        setApplySuccess(true)
+      } else {
+        setApplySuccess(false)
+      }
+
       const response = await pciApi.getResult(task.id)
       if (response?.success && response?.data) {
         const result = response.data as PCIResultData
@@ -839,9 +907,10 @@ export function PCIPage() {
         const updatedCount = resultData?.updatedCount ?? 0
         triggerDataRefresh()
         setApplySuccess(true)
-        let successMsg = `已成功将PCI规划结果应用到工参，更新了${updatedCount}个小区的PCI`
+        let successMsg = `已成功将PCI规划结果应用到工参，更新了${updatedCount}个小区的PCI。后台正在同步Excel文件，同步完成前下载工参文件将自动等待`
         setError(successMsg)
         mapDataService.clearCache()
+        bumpDataVersion()
         try {
           const listResponse = await dataApi.list(1, 50, true)
         } catch (listErr) { }
@@ -852,10 +921,18 @@ export function PCIPage() {
         if (mapRef.current) {
           await mapRef.current.refreshData()
         }
-        setTimeout(() => {
-          setError(null)
-          setApplySuccess(false)
-        }, 5000)
+        // 标记任务为已应用（持久化到历史记录 + 跨页面状态同步）
+        if (taskId || currentTaskResult?.taskId) {
+          const markId = taskId || currentTaskResult!.taskId
+          pciApi.markApplied(markId).catch(e =>
+            console.warn('[PCIPage] 标记已应用失败:', e?.message)
+          )
+          useTaskStore.getState().markTaskApplied(markId)
+          // 刷新历史列表以同步所有页面的应用状态
+          syncHistoryFromBackend('pci_planning').catch(e =>
+            console.warn('[PCIPage] 同步历史失败:', e?.message)
+          )
+        }
       } else {
         setError('应用到工参失败: ' + (response.message || '未知错误'))
       }
@@ -1137,7 +1214,7 @@ export function PCIPage() {
 
   return (
     <div className="h-full flex flex-col p-4 min-h-0">
-      <h1 className="text-3xl font-bold mb-6 shrink-0">{t('pci.title') || 'PCI规划'}</h1>
+      <h1 className="text-base font-bold mb-6 shrink-0">{t('pci.title') || 'PCI规划'}</h1>
 
       {error && (
         <div className="mb-4 p-3 bg-red-50 border border-red-200 rounded-lg flex items-center gap-3 text-red-700 shrink-0">
@@ -1177,6 +1254,41 @@ export function PCIPage() {
                 {currentTaskResult?.status === 'failed' && <span className={btn.badgeError}>!</span>}
                 {isRunning && <span className="ml-2 inline-flex items-center"><Loader2 size={12} className="animate-spin text-blue-500" /></span>}
               </button>
+              {/* 批量操作按钮 */}
+              <div className="ml-auto flex items-center gap-1 mr-8">
+                {showBatchApply && (
+                  batchApplying ? (
+                    <span className="inline-flex items-center px-2 py-1 bg-blue-400 text-white rounded-lg">
+                      <Loader2 size={14} className="animate-spin" />
+                    </span>
+                  ) : (
+                    <button
+                      onClick={() => triggerBatchApply()}
+                      disabled={batchDeleting}
+                      className="p-1.5 bg-green-500 text-white rounded-lg hover:bg-green-600 transition-colors disabled:opacity-50"
+                      title={t('common.batchApply') || '批量应用'}
+                    >
+                      <Check size={14} />
+                    </button>
+                  )
+                )}
+                {showBatchDelete && (
+                  batchDeleting ? (
+                    <span className="inline-flex items-center px-2 py-1 bg-red-400 text-white rounded-lg">
+                      <Loader2 size={14} className="animate-spin" />
+                    </span>
+                  ) : (
+                    <button
+                      onClick={() => triggerBatchDelete()}
+                      disabled={batchApplying}
+                      className="p-1.5 bg-red-500 text-white rounded-lg hover:bg-red-600 transition-colors disabled:opacity-50"
+                      title={t('common.batchDelete') || '批量删除'}
+                    >
+                      <Trash2 size={14} />
+                    </button>
+                  )
+                )}
+              </div>
             </div>
 
             {/* 页签内容 */}
@@ -1329,6 +1441,8 @@ export function PCIPage() {
                             siteId: t('pci.siteId') || '基站ID',
                             cellId: t('pci.sectorId') || '小区ID',
                             cellName: t('pci.sectorName') || '小区名称',
+                            cellFreq: t('pci.cellFreq') || '频点',
+                            cellPci: t('pci.cellPci') || 'PCI',
                             selectAll: t('pci.selectAll') || '全选',
                             clearSelections: t('pci.clearSelections') || '清空选择',
                             uploadCellFile: t('pci.uploadCellFile') || '上传待规划小区文件',
@@ -1384,13 +1498,26 @@ export function PCIPage() {
                     onViewTask={handleViewTask}
                     getCellCount={getCellCount}
                     onApplyTask={handleApplyTask}
+                    onSelectedChange={(counts) => {
+                      setSelectedCount(counts.total)
+                      setUnappliedCount(counts.unappliable)
+                    }}
+                    onBatchStatusChange={(applying, deleting) => {
+                      setBatchApplying(applying)
+                      setBatchDeleting(deleting)
+                    }}
                   />
                 </div>
               )}
 
               {activeLeftTab === 'planning-result' && (
                 <div className="flex flex-col h-full min-h-0 overflow-hidden">
-                  {currentTaskResult?.status === 'completed' && (
+                  {/* 结果加载动画 */}
+                  {resultLoading && (
+                    <LoadingSpinner variant="spinner" text={t('common.loadingResult') || '正在加载规划结果...'} />
+                  )}
+
+                  {!resultLoading && currentTaskResult?.status === 'completed' && (
                     <div className="flex items-center justify-between mb-3 shrink-0">
                       <div className="flex items-center gap-6">
                         <div className="flex items-center gap-4 text-sm">
@@ -1428,7 +1555,7 @@ export function PCIPage() {
                     </div>
                   )}
 
-                  {!currentTaskResult ? (
+                  {!resultLoading && !currentTaskResult ? (
                     <div className="flex-1 flex items-center justify-center text-muted-foreground flex-col">
                       <List size={48} className="mb-4 opacity-30" />
                       {wizardStep === 'idle' ? (
@@ -1438,18 +1565,18 @@ export function PCIPage() {
                       )}
                       <p className="text-xs mt-2">{t('pci.uploadRequired') || '需要先上传「全量工参」和「待规划小区」文件'}</p>
                     </div>
-                  ) : currentTaskResult.status === 'failed' ? (
+                  ) : !resultLoading && currentTaskResult?.status === 'failed' ? (
                     <div className="flex-1 flex items-center justify-center text-red-500">
                       <AlertCircle size={48} className="mb-4" />
                       <p className="font-semibold">{t('pci.planFailed') || '规划任务失败'}</p>
                     </div>
-                  ) : currentTaskResult.status === 'completed' && !(currentTaskResult as any).results ? (
+                  ) : !resultLoading && currentTaskResult?.status === 'completed' && !(currentTaskResult as any).results ? (
                     <div className="flex-1 flex items-center justify-center text-muted-foreground flex-col">
                       <AlertCircle size={48} className="mb-4 opacity-50" />
                       <p>{t('common.resultUnavailable') || '结果数据不可用，请重新执行规划任务'}</p>
                     </div>
-                  ) : hasFullResult ? (
-                    <>
+                  ) : !resultLoading && hasFullResult ? (
+                    <div className="flex flex-col h-full min-h-0">
                       {currentTaskResult.results && currentTaskResult.results.length > 0 ? (
                         <div className="overflow-x-auto overflow-y-auto rounded-lg border border-border flex-1 min-h-0">
                           <table className="w-full text-xs text-left border-collapse table-fixed">
@@ -1513,13 +1640,8 @@ export function PCIPage() {
                       ) : (
                         <div className="flex-1 flex items-center justify-center text-muted-foreground"><p>{t('pci.noResult') || '暂无匹配结果'}</p></div>
                       )}
-                    </>
-                  ) : (
-                    <div className="flex-1 flex items-center justify-center text-muted-foreground">
-                      <Loader2 className="animate-spin mb-4" size={48} />
-                      <p>{t('pci.planning') || '规划进行中，请稍候...'}</p>
                     </div>
-                  )}
+                  ) : null}
                 </div>
               )}
             </div>

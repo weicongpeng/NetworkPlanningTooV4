@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useMemo, useCallback } from 'react'
 import { Download, Loader2, AlertCircle, Search, GripVertical, List, Eye } from 'lucide-react'
+import { LoadingSpinner } from '../components/LoadingSpinner'
 import { tacApi } from '../services/api'
 import { useTACCheckStore } from '../store/tacCheckStore'
 import { useTaskStore, type Task } from '../store/taskStore'
@@ -20,6 +21,7 @@ import { HistoryTable } from '../components/HistoryTable'
 import { StepIndicator } from '../components/StepIndicator'
 import { WizardFooter } from '../components/WizardFooter'
 import { extractCellIdsFromFile, matchCellIds, downloadCellTreeTemplate } from '../utils/cellFileHelper'
+import { generateFullTaskName } from '../utils/taskNameUtils'
 
 // 虚拟滚动配置
 const ITEM_HEIGHT = 48 // 每行高度
@@ -88,6 +90,8 @@ export function TACPage() {
   const [error, setError] = useState<string | null>(null)
   const [localTaskResult, setLocalTaskResult] = useState<TACResultData | null>(null)
   const viewedTaskIdRef = useRef<string | null>(null) // 防止 useEffect 覆盖 API 获取的结果
+  const isLoadingResultRef = useRef(false) // 标记结果加载是否有效，防止竞态
+  const [resultLoading, setResultLoading] = useState(false) // 结果页加载动画
 
   // 从 taskStore 恢复最近的任务结果，行为与 PCI/邻区规划一致
   const t0 = performance.now()
@@ -154,34 +158,45 @@ export function TACPage() {
       if (viewedTaskIdRef.current) {
         return
       }
+      isLoadingResultRef.current = true
+      // 仅当没有已有结果时才显示加载动画
+      if (!taskResult) {
+        setResultLoading(true)
+      }
       const loadLatest = async () => {
         await syncHistoryFromBackend('tac_check')
+        if (!isLoadingResultRef.current) return
         const latest = getLatestTACCheckTask()
         if (latest && latest.result) {
           // 如果缺少完整 results（来自 resultSummary），尝试从 API 重新获取
           if (!latest.result.results && latest.id) {
             try {
               const response = await tacApi.getResult(latest.id)
+              if (!isLoadingResultRef.current) return
               if (response?.success && response?.data?.results) {
                 const fullResult = response.data as TACResultData
                 setLocalTaskResult(fullResult)
                 tacDataSyncService.setTACResults({ results: fullResult.results })
-                setWizardStep('completed')
+                if (isLoadingResultRef.current) setWizardStep('completed')
                 return
               }
             } catch (fetchErr: any) {
               console.warn('[TACPage] 获取完整核查结果失败，使用缓存摘要:', fetchErr?.message)
             }
           }
+          if (!isLoadingResultRef.current) return
           // 有完整 results 或 API 获取失败时使用已有结果
           setLocalTaskResult(latest.result as TACResultData)
           if (latest.result.results) {
             tacDataSyncService.setTACResults({ results: latest.result.results })
           }
-          setWizardStep('completed')
+          if (isLoadingResultRef.current) setWizardStep('completed')
         }
       }
-      loadLatest()
+      loadLatest().finally(() => {
+        if (isLoadingResultRef.current) setResultLoading(false)
+      })
+      return () => { isLoadingResultRef.current = false; setResultLoading(false) }
     } else {
       // 离开结果页时清除 viewedTaskIdRef
       viewedTaskIdRef.current = null
@@ -493,12 +508,13 @@ export function TACPage() {
     setLoading(true); setError(null); setLocalTaskResult(null)
     setActiveTaskId('tac_check', null); setWizardStep('executing'); errorCountRef.current = 0
     try {
-      const fullConfig: any = { taskName: taskName, networkType: config!.networkType, enableSingularityCheck: true, singularityConfig: singularityConfig, selectedCellIds: Array.from(selectedCellIdsSet) }
+      const fullTaskName = generateFullTaskName(taskName)
+      const fullConfig: any = { taskName: fullTaskName, networkType: config!.networkType, enableSingularityCheck: true, singularityConfig: singularityConfig, selectedCellIds: Array.from(selectedCellIdsSet) }
       const response = await tacApi.plan(fullConfig)
       if (response.success && response.data) {
         const newTaskId = response.data.taskId
         setActiveTaskId('tac_check', newTaskId)
-        startTask(newTaskId, 'tac_check', 'TAC核查开始', taskName, user?.username)
+        startTask(newTaskId, 'tac_check', 'TAC核查开始', fullTaskName, user?.username)
         const progressResponse = await tacApi.getProgress(newTaskId)
         if (progressResponse.success && progressResponse.data) { setLocalTaskResult(progressResponse.data as TACResultData) }
       } else { setError(response.message || (t('tac.startFailed') || '启动TAC核查任务失败')); setWizardStep('cells_selected') }
@@ -874,7 +890,7 @@ export function TACPage() {
   return (
     <div className="h-full flex flex-col p-4 min-h-0">
       {/* 页面标题 */}
-      <h1 className="text-3xl font-bold mb-6 shrink-0">{t('tac.title') || 'TAC核查'}</h1>
+      <h1 className="text-base font-bold mb-6 shrink-0">{t('tac.title') || 'TAC核查'}</h1>
 
       {/* 错误提示 */}
       {error && (
@@ -1014,7 +1030,7 @@ export function TACPage() {
                         onDownloadCellTemplate={wizardStep === 'cells_selected' ? handleDownloadCellTemplate : undefined}
                         uploading={cellFileUploading}
                         disabled={wizardStep !== 'cells_selected' || isRunning}
-                        columnLabels={{ siteId: t('tac.siteId') || '基站ID', cellId: t('tac.cellId') || '小区ID', cellName: t('tac.cellName') || '小区名称', selectAll: t('tac.selectAll') || '全选', clearSelections: t('tac.clearSelections') || '清空选择', uploadCellFile: t('tac.uploadCellFile') || '上传待规划小区文件', downloadCellTemplate: t('tac.downloadCellTemplate') || '下载待规划小区模板' }}
+                        columnLabels={{ siteId: t('tac.siteId') || '基站ID', cellId: t('tac.cellId') || '小区ID', cellName: t('tac.cellName') || '小区名称', cellFreq: t('tac.cellFreq') || '频点', cellPci: t('tac.cellPci') || 'PCI', selectAll: t('tac.selectAll') || '全选', clearSelections: t('tac.clearSelections') || '清空选择', uploadCellFile: t('tac.uploadCellFile') || '上传待规划小区文件', downloadCellTemplate: t('tac.downloadCellTemplate') || '下载待规划小区模板' }}
                       />
                     </div>
                   </div>
@@ -1088,7 +1104,10 @@ export function TACPage() {
 
             /* 规划结果面板 */
             <div className="flex flex-col h-full min-h-0 overflow-hidden">
-              {taskResult ? (
+              {resultLoading && (
+                <LoadingSpinner variant="spinner" text={t('common.loadingResult') || '正在加载规划结果...'} />
+              )}
+              {!resultLoading && taskResult ? (
                 <>
                   {/* 统计卡片 */}
                   <div className="mb-3 shrink-0">
@@ -1456,7 +1475,7 @@ export function TACPage() {
             </div>
           </div>
         </>
-      ) : (
+      ) : !resultLoading ? (
         <div className="flex-1 flex items-center justify-center text-muted-foreground flex-col">
           <List size={48} className="mb-4 opacity-30" />
           {wizardStep === 'idle' ? (
@@ -1465,7 +1484,7 @@ export function TACPage() {
             <p>选择网络类型后点击「开始核查」查看结果</p>
           )}
         </div>
-      )}
+      ) : null}
             </div>
           )}
         </div>
