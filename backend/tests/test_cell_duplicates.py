@@ -44,6 +44,16 @@ def dup_env():
         site_id_fk=site_lte.id, workbook_id=wb_id, user_id=1,
         sector_id="111_1", name="LTE小区", longitude=1.0, latitude=1.0, azimuth=0,
     ))
+    site_nr = Site(
+        workbook_id=wb_id, user_id=1, site_id="222", name="NR站",
+        network_type="NR", longitude=2.0, latitude=2.0,
+    )
+    db.add(site_nr)
+    db.flush()
+    db.add(Sector(
+        site_id_fk=site_nr.id, workbook_id=wb_id, user_id=1,
+        sector_id="222_1", name="NR小区", longitude=2.0, latitude=2.0, azimuth=0,
+    ))
     db.commit()
 
     # 注入 index，让 data_service 能定位 full_params 文件。
@@ -74,17 +84,24 @@ def dup_env():
         db.commit()
     finally:
         db.close()
-    data_service.index.clear()
-    data_service.index.update(saved_index)
+        # 无论 DB 清理是否成功，都必须恢复共享单例 index，
+        # 否则 fixture 的 wb_id 会永久残留在 index 中污染后续测试。
+        data_service.index.clear()
+        data_service.index.update(saved_index)
 
 
 def test_check_duplicates_returns_network_type_flags(dup_env):
     """同一 CGI 返回 {lte, nr} 双制式标记"""
     result = data_service.check_cell_duplicates([
         {"siteId": "111", "cellId": "1", "networkType": "NR"},   # 库中为 LTE → lte=True
+        {"siteId": "222", "cellId": "1", "networkType": "NR"},   # 库中为 NR → nr=True
         {"siteId": "999", "cellId": "9", "networkType": "NR"},   # 不存在
+        {"siteId": "", "cellId": "", "networkType": "NR"},       # 空 siteId/cellId → 跳过，不产生 key
     ])
     assert result["exists"]["111_1"] == {"lte": True, "nr": False}
+    assert result["exists"]["222_1"] == {"lte": False, "nr": True}
     assert result["exists"]["999_9"] == {"lte": False, "nr": False}
     assert "111_1" in result["duplicates"]
+    assert "222_1" in result["duplicates"]
     assert "999_9" not in result["duplicates"]
+    assert "" not in result["exists"]
