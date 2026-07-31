@@ -1500,7 +1500,7 @@ function NewCellEntryCard({
 
   // 多行多列粘贴：从 Excel/文本复制 tab 分隔内容，按列顺序填充并自动扩充行数
   const handlePaste = (e: React.ClipboardEvent) => {
-    if (!hasFullParams) return
+    if (!hasFullParams || isAddingCell) return
     const text = e.clipboardData.getData('text/plain')
     if (!text.includes('\t') && !text.includes('\n')) return // 单格粘贴交给浏览器默认
     e.preventDefault()
@@ -1508,14 +1508,12 @@ function NewCellEntryCard({
     const lines = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n').filter(l => l.trim() !== '')
     if (lines.length === 0) return
 
-    // 粘贴锚点：优先取当前聚焦输入所在行，否则从第 0 行开始
-    let anchor = 0
+    // 粘贴锚点：只接管聚焦在表格行内的粘贴
     const activeTr = (document.activeElement as HTMLElement | null)?.closest?.('tr') as HTMLTableRowElement | null
     const anchorId = activeTr?.dataset?.rowId
-    if (anchorId) {
-      const idx = rows[activeTab].findIndex(r => r.id === anchorId)
-      if (idx >= 0) anchor = idx
-    }
+    if (!anchorId) return // 聚焦不在表格行内,不接管粘贴
+    const idx = rows[activeTab].findIndex(r => r.id === anchorId)
+    const anchor = idx >= 0 ? idx : 0
 
     const isLteTab = activeTab === 'LTE'
     // 列顺序：网元ID、基站ID、小区ID、小区名称、MCC、MNC、经度、纬度、方向角、频点、覆盖类型
@@ -1531,8 +1529,8 @@ function NewCellEntryCard({
         siteId: get(1) ? filterDigits(get(1)) : base.siteId,
         cellId: get(2) ? filterDigits(get(2)) : base.cellId,
         cellName: get(3) || base.cellName,
-        mcc: get(4) || base.mcc || '460',
-        mnc: get(5) || base.mnc || '11',
+        mcc: get(4) ? filterDigits(get(4)) : base.mcc,
+        mnc: get(5) ? filterDigits(get(5)).slice(0, 2) : base.mnc,
         longitude: get(6) ? filterNumeric(get(6)) : base.longitude,
         latitude: get(7) ? filterNumeric(get(7)) : base.latitude,
         azimuth: get(8) ? filterDigits(get(8)) : base.azimuth,
