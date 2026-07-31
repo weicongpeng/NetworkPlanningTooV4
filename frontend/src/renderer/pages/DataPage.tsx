@@ -1387,8 +1387,8 @@ function NewCellEntryCard({
 
   const [activeTab, setActiveTab] = useState<'LTE' | 'NR'>('LTE')
   const [rows, setRows] = useState<{ LTE: CellRow[]; NR: CellRow[] }>({
-    LTE: [createEmptyRow()],
-    NR: [createEmptyRow()],
+    LTE: Array.from({ length: 3 }, () => createEmptyRow()),
+    NR: Array.from({ length: 3 }, () => createEmptyRow()),
   })
   const [selectedRowIds, setSelectedRowIds] = useState<Set<string>>(new Set())
   const [batchResults, setBatchResults] = useState<Array<{ index: number; networkType: string; cellName: string; siteId: string; cellId: string; success: boolean; message: string }> | null>(null)
@@ -1414,6 +1414,11 @@ function NewCellEntryCard({
       ssbFrequency: '',
       cellCoverType: 1,
     }
+  }
+
+  /** 创建 n 行空行（默认 3 行） */
+  function createEmptyRows(n = 3): CellRow[] {
+    return Array.from({ length: n }, () => createEmptyRow())
   }
 
   // ---- Validation helpers ----
@@ -1514,13 +1519,11 @@ function NewCellEntryCard({
   }
 
   const resetAll = () => {
-    setRows({
-      LTE: [createEmptyRow()],
-      NR: [createEmptyRow()],
-    })
+    setRows({ LTE: createEmptyRows(), NR: createEmptyRows() })
     setSelectedRowIds(new Set())
     setBatchResults(null)
     setBatchError(null)
+    setDuplicateCgiSet(new Set())
   }
 
   // Collect all non-empty rows from both tabs
@@ -1577,6 +1580,9 @@ function NewCellEntryCard({
     setBatchError(null)
     setDuplicateCgiSet(new Set())
 
+    // 本次批量录入全程复用的日志 opKey，确保 "running" 条目被完成/失败条目覆盖
+    const batchOpKey = `batchCellEntry:${Date.now()}`
+
     const validRows = collectValidRows()
 
     if (validRows.length === 0) {
@@ -1605,17 +1611,14 @@ function NewCellEntryCard({
         if (uniqueRows.length === 0) {
           return // 全部重复
         }
-        addLog('upload', `批量新站录入: ${uniqueRows.length} 条（跳过 ${validRows.length - uniqueRows.length} 条重复）`, 'running', undefined, `batchCellEntry:${Date.now()}`)
+        addLog('upload', `批量新站录入: ${uniqueRows.length} 条（跳过 ${validRows.length - uniqueRows.length} 条重复）`, 'running', undefined, batchOpKey)
         const result = await batchAddCells(uniqueRows)
         if (result?.success && result?.data?.results) {
           const results = result.data.results as Array<{ index: number; networkType: string; cellName: string; siteId: string; cellId: string; success: boolean; message: string }>
           setBatchResults(results)
           const successCount = results.filter(r => r.success).length
-          addLog('upload', `批量新站录入完成: 成功 ${successCount}/${results.length}`, successCount === results.length ? 'success' : 'warning', undefined, `batchCellEntry:${Date.now()}`)
-          setRows({
-            LTE: [createEmptyRow()],
-            NR: [createEmptyRow()],
-          })
+          addLog('upload', `批量新站录入完成: 成功 ${successCount}/${results.length}`, successCount === results.length ? 'success' : 'warning', undefined, batchOpKey)
+          setRows({ LTE: createEmptyRows(), NR: createEmptyRows() })
           setSelectedRowIds(new Set())
           setDuplicateCgiSet(new Set())
         }
@@ -1625,7 +1628,7 @@ function NewCellEntryCard({
       // 查重失败不影响导入
     }
 
-    addLog('upload', `批量新站录入: ${validRows.length} 条`, 'running', undefined, `batchCellEntry:${Date.now()}`)
+    addLog('upload', `批量新站录入: ${validRows.length} 条`, 'running', undefined, batchOpKey)
 
     try {
       const result = await batchAddCells(validRows)
@@ -1633,22 +1636,19 @@ function NewCellEntryCard({
         const results = result.data.results as Array<{ index: number; networkType: string; cellName: string; siteId: string; cellId: string; success: boolean; message: string }>
         setBatchResults(results)
         const successCount = results.filter(r => r.success).length
-        addLog('upload', `批量新站录入完成: 成功 ${successCount}/${results.length}`, successCount === results.length ? 'success' : 'warning', undefined, `batchCellEntry:${Date.now()}`)
-        setRows({
-          LTE: [createEmptyRow()],
-          NR: [createEmptyRow()],
-        })
+        addLog('upload', `批量新站录入完成: 成功 ${successCount}/${results.length}`, successCount === results.length ? 'success' : 'warning', undefined, batchOpKey)
+        setRows({ LTE: createEmptyRows(), NR: createEmptyRows() })
         setSelectedRowIds(new Set())
       } else {
         const errMsg = result?.message || (t('newCellEntry.cellEntryFailed') || '批量录入失败')
         setBatchError(errMsg)
-        addLog('upload', `批量新站录入失败: ${errMsg}`, 'error', undefined, `batchCellEntry:${Date.now()}`)
+        addLog('upload', `批量新站录入失败: ${errMsg}`, 'error', undefined, batchOpKey)
         setTimeout(() => setBatchError(null), 5000)
       }
     } catch (err: any) {
       const errMsg = err.message || (t('newCellEntry.cellEntryFailed') || '批量录入失败')
       setBatchError(errMsg)
-      addLog('upload', `批量新站录入失败: ${errMsg}`, 'error', undefined, `batchCellEntry:${Date.now()}`)
+      addLog('upload', `批量新站录入失败: ${errMsg}`, 'error', undefined, batchOpKey)
       setTimeout(() => setBatchError(null), 5000)
     }
   }
