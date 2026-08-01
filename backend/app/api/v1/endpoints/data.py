@@ -1053,11 +1053,7 @@ async def complete_chunked_upload(
         layer_tmp = settings.UPLOAD_DIR / "layer_tmp"
         layer_tmp.mkdir(parents=True, exist_ok=True)
         dest = layer_tmp / f"src_{data_id[:8]}{ext}"
-        shutil.copy(file_path, dest)
-        try:
-            file_path.unlink(missing_ok=True)  # 清理 uploads 根目录的重组临时文件
-        except Exception:
-            pass
+        shutil.move(str(file_path), str(dest))  # 同文件系统原子重命名，避免 uploads 根目录残留被 scan 迁入索引
         print(f"[ChunkedUpload] 图层文件已保存: {dest}")
         return {
             "success": True,

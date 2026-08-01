@@ -330,5 +330,8 @@ def test_chunked_upload_layer_file_type():
 
         # 断言没有创建 data 索引
         assert data_id not in data_service.index
+
+        # 断言 uploads 根目录的重组文件已被移走（不残留，避免被 scan 迁入索引）
+        assert not (settings.UPLOAD_DIR / f"{data_id}.xlsx").exists()
     finally:
         os.remove(path)
