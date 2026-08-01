@@ -2,7 +2,6 @@
 图层制作 API 端点
 """
 import json
-import shutil
 import uuid
 import zipfile
 from pathlib import Path
@@ -42,32 +41,34 @@ def _finalize_output(out: Path, output_format: str) -> dict:
 
 
 def _save_upload(file: Optional[UploadFile], file_path: Optional[str]) -> Path:
-    """保存上传文件到临时目录，返回本地路径
+    """返回 Excel 文件的本地路径。
 
-    临时目录为 `uploads/layer_tmp`（layers 的兄弟目录，不在 /layer-files 挂载树内），
-    避免原始工参文件被未认证下载。调用方负责在 finally 中删除返回的临时文件。
+    优先用 file_path（分块上传已保存到 layer_tmp）——直接使用该路径，由调用方 finally 删除，
+    不重新复制，避免 layer_tmp 残留孤立文件。
+    否则从 file 写入临时文件。返回的路径位于挂载树之外，调用方负责在 finally 中删除。
     """
     if not file and not file_path:
         raise HTTPException(status_code=400, detail="未提供文件")
     tmp_dir = settings.UPLOAD_DIR / "layer_tmp"
     tmp_dir.mkdir(parents=True, exist_ok=True)
-    if file:
-        suffix = Path(file.filename or "src.xlsx").suffix.lower()
-        if suffix not in ALLOWED_EXTS:
+
+    # 分块上传模式：file_path 指向 layer_tmp 中已重组文件，直接使用（不复制，避免孤立文件）
+    if file_path:
+        src = Path(str(file_path).strip("\"'"))
+        if not src.is_file():
+            raise HTTPException(status_code=400, detail=f"文件不存在: {src.name}")
+        if src.suffix.lower() not in ALLOWED_EXTS:
             raise HTTPException(status_code=400, detail="仅支持 Excel 文件（.xlsx/.xls）")
-        name = f"src_{uuid.uuid4().hex[:8]}{suffix}"
-        dest = tmp_dir / name
-        with open(dest, "wb") as f:
-            f.write(file.file.read())
-        return dest
-    # file_path 模式（Electron 本地路径）
-    src = Path(str(file_path).strip("\"'"))
-    if not src.is_file():
-        raise HTTPException(status_code=400, detail=f"文件不存在: {src.name}")
-    if src.suffix.lower() not in ALLOWED_EXTS:
+        return src
+
+    # 直接上传模式（兼容旧调用）
+    suffix = Path(file.filename or "src.xlsx").suffix.lower()
+    if suffix not in ALLOWED_EXTS:
         raise HTTPException(status_code=400, detail="仅支持 Excel 文件（.xlsx/.xls）")
-    dest = tmp_dir / f"src_{uuid.uuid4().hex[:8]}{src.suffix.lower()}"
-    shutil.copy2(src, dest)
+    name = f"src_{uuid.uuid4().hex[:8]}{suffix}"
+    dest = tmp_dir / name
+    with open(dest, "wb") as f:
+        f.write(file.file.read())
     return dest
 
 
