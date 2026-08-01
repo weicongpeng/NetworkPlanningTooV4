@@ -126,6 +126,9 @@ export default function LayerPointPage() {
               <option value="mif">MIF</option>
               <option value="kml">KML</option>
             </select>
+            {format === 'tab' && (
+              <p className="text-[10px] text-muted-foreground mt-1">{t('layer.colorTabHint')}</p>
+            )}
           </div>
         </div>
       )}

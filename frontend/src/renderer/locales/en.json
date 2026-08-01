@@ -1008,6 +1008,7 @@
     "download": "Download Layer",
     "errMissingFields": "Please ensure label name, longitude, latitude, azimuth are matched",
     "errMissingFieldsPoint": "Please ensure label name, longitude, latitude are matched",
-    "errSheet": "Please select a Sheet first"
+    "errSheet": "Please select a Sheet first",
+    "colorTabHint": "TAB format does not support fill color; color applies to MIF/KML only"
   }
 }

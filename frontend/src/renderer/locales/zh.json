@@ -1019,6 +1019,7 @@
     "download": "下载图层",
     "errMissingFields": "请确保标签名称、经度、纬度、方向角均已正确匹配",
     "errMissingFieldsPoint": "请确保标签名称、经度、纬度均已正确匹配",
-    "errSheet": "请先选择 Sheet"
+    "errSheet": "请先选择 Sheet",
+    "colorTabHint": "TAB 格式不支持填充颜色，颜色仅 MIF/KML 生效"
   }
 }
