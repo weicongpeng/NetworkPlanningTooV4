@@ -6,7 +6,7 @@ export interface LayerFieldMatch {
 }
 
 export const LAYER_FIELD_MATCHES: LayerFieldMatch[] = [
-  { type: 'name', labelKey: 'layer.fieldName', patterns: ['名称', 'name', '小区名', '站名', 'cell_name', 'site_name', 'NAME'] },
+  { type: 'name', labelKey: 'layer.fieldName', patterns: ['名称', 'name', '小区名', '站名', 'cell_name', 'site_name'] },
   { type: 'longitude', labelKey: 'layer.fieldLongitude', patterns: ['经度', 'longitude', 'lng', 'lon', 'long', 'x'] },
   { type: 'latitude', labelKey: 'layer.fieldLatitude', patterns: ['纬度', 'latitude', 'lat', 'y'] },
   { type: 'azimuth', labelKey: 'layer.fieldAzimuth', patterns: ['方位角', '方向角', 'azimuth', 'azi', 'azim', 'bearing'] },
@@ -19,14 +19,15 @@ export function autoMatchFields(columns: string[], includeAzimuth: boolean): Rec
   for (const match of LAYER_FIELD_MATCHES) {
     if (match.type === 'azimuth' && !includeAzimuth) continue
     let found: string | null = null
-    // 精确匹配优先
+    // 精确匹配优先（含单字符 x/y 仅精确）
     for (let i = 0; i < columns.length; i++) {
       if (match.patterns.some(p => p.toLowerCase() === lowerCols[i])) { found = columns[i]; break }
     }
-    // 否则模糊匹配
+    // 模糊匹配仅用多字符 pattern（长度>1），避免单字符误报（如 year 含 y 被误判为纬度）
     if (!found) {
+      const fuzzyPatterns = match.patterns.filter(p => p.length > 1)
       for (let i = 0; i < columns.length; i++) {
-        if (match.patterns.some(p => lowerCols[i].includes(p.toLowerCase()))) { found = columns[i]; break }
+        if (fuzzyPatterns.some(p => lowerCols[i].includes(p.toLowerCase()))) { found = columns[i]; break }
       }
     }
     if (found) result[match.type] = found
