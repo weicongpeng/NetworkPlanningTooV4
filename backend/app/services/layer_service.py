@@ -141,11 +141,16 @@ class LayerService:
             return gdf
         return gdf.rename(columns={name_col: "Name"})
 
-    def _write(self, gdf: gpd.GeoDataFrame, output_format: str) -> Path:
-        """写入文件，返回路径"""
+    def _write(self, gdf: gpd.GeoDataFrame, output_format: str,
+               source_filename: str, sheet_name: str) -> Path:
+        """写入文件，返回路径。文件名 = 源文件名 + sheet名 + 短uuid"""
         if output_format not in DRIVER_MAP:
             raise ValueError(f"不支持的输出格式: {output_format}")
-        fname = f"layer_{uuid.uuid4().hex[:12]}{EXT_MAP[output_format]}"
+        base = Path(source_filename).stem
+        if len(base) > 80:
+            base = base[:60]  # 超长源文件名截断，避免文件系统文件名过长
+        safe_sheet = re.sub(r'[<>:"/\\|?*]', "_", sheet_name)
+        fname = f"{base}_{safe_sheet}_{uuid.uuid4().hex[:8]}{EXT_MAP[output_format]}"
         out_path = self.output_dir / fname
         gdf.to_file(out_path, driver=DRIVER_MAP[output_format])
         return out_path
@@ -206,7 +211,7 @@ class LayerService:
         gdf = self._build_gdf(df, lon, lat, valid, attributes, geoms, keep_cols_extra=[name_col])
         if output_format == "kml":
             gdf = self._ensure_kml_name(gdf, name_col)
-        out = self._write(gdf, output_format)
+        out = self._write(gdf, output_format, source_filename=Path(file_path).name, sheet_name=sheet_name)
         return self._apply_color(out, output_format, color, is_point=True)
 
     def generate_sector_layer(self, file_path: str, sheet_name: str,
@@ -233,7 +238,7 @@ class LayerService:
         gdf = self._build_gdf(df, lon, lat, valid, attributes, geoms, keep_cols_extra=[name_col])
         if output_format == "kml":
             gdf = self._ensure_kml_name(gdf, name_col)
-        out = self._write(gdf, output_format)
+        out = self._write(gdf, output_format, source_filename=Path(file_path).name, sheet_name=sheet_name)
         return self._apply_color(out, output_format, color, is_point=False)
 
     def get_sheet_info(self, file_path: str) -> dict:

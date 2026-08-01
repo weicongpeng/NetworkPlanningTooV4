@@ -304,3 +304,22 @@ def test_kml_color_inline_xml_valid(service, sample_excel):
         color_el = poly_style.find("kml:color", ns)
         assert color_el is not None
         assert color_el.text == "ffd9904a"
+
+
+def test_output_filename_uses_source_and_sheet(tmp_path):
+    """导出文件名 = 源文件名 + sheet 名 + 短 uuid + 扩展名"""
+    path = tmp_path / "工参2026.xlsx"
+    df = pd.DataFrame({
+        "NAME": ["A"], "LONGITUDE": [116.3], "LATITUDE": [39.9],
+    })
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name="LTE", index=False)
+    svc = LayerService(output_dir=tmp_path)
+    out = svc.generate_point_layer(
+        file_path=str(path), sheet_name="LTE",
+        name_col="NAME", lon_col="LONGITUDE", lat_col="LATITUDE",
+        attributes=["NAME"], output_format="tab",
+    )
+    # 命名 = 源文件名(stem) + sheet 名 + 短uuid
+    assert out.stem.startswith("工参2026_LTE_")
+    assert out.suffix == ".tab"
