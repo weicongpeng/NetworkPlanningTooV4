@@ -998,11 +998,11 @@ export const layerToolsApi = {
     const result = await chunkedUpload(file, '/data/upload', 'layer', (p) => {
       onProgress?.({ percent: p, step: 'uploading' })
     })
-    onProgress?.({ percent: 100, step: 'assembling' })
     const data = result?.data
     if (!data?.file_path) {
       throw new Error('文件上传失败，未获取到文件路径')
     }
+    onProgress?.({ percent: 100, step: 'done' })
     return {
       file_path: data.file_path,
       source_filename: data.source_filename || file.name,
