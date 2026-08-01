@@ -314,21 +314,16 @@ export const licenseApi = {
 // 生产环境后端单 worker（NPT_WORKERS=1），并行上传会导致请求排队超时（502），
 // 因此保持串行上传，配合动态分块大小和指数退避重试。
 // 优化策略：
-//   1. 动态分块大小：小文件(2MB) / 中等文件(1MB) / 大文件(512KB)
+//   1. 统一 512KB 分块：Cloudflare Tunnel 下最稳，单块 ~0.3-0.5s 完成
 //   2. 串行上传：避免单 worker 排队超时
 //   3. 指数退避重试：失败后 2s → 4s → 8s 等待
 //   4. 专用状态查询：从 /data/{id} 查询状态，替代全量列表轮询
 //
 const MAX_CHUNK_RETRIES = 3      // 每块最多重试 3 次
 
-/** 根据文件大小动态计算分块大小 */
-function calcChunkSize(fileSize: number): number {
-  if (fileSize < 3 * 1024 * 1024) {
-    return 2 * 1024 * 1024       // < 3MB → 2MB 分块（极小文件直接 1-2 块传完）
-  } else if (fileSize < 50 * 1024 * 1024) {
-    return 1024 * 1024            // 3-50MB → 1MB 分块（~27s/块，避免健康检测超时）
-  }
-  return 512 * 1024               // > 50MB → 512KB 分块（确保每块在 15s 内完成）
+/** 统一 512KB 分块（Cloudflare Tunnel 下最稳，单块 ~0.3-0.5s 完成） */
+function calcChunkSize(_fileSize: number): number {
+  return 512 * 1024               // 统一 512KB
 }
 
 /** 指数退避延时 */
@@ -342,7 +337,7 @@ function backoffDelay(retries: number): number {
  * @param file 要上传的文件
  * @param basePath 上传端点的基础路径（如 '/data/upload'）
  * @param fileType 可选的文件类型：'excel' | 'geo_data' | 'layer'
- * @param onProgress 可选的分块进度回调（0-99 封顶，100 由 complete 后触发）
+ * @param onProgress 可选的分块进度回调（1 立即反馈, 2 start 前, 3-99 分块进度, 100 complete 后）
  */
 async function chunkedUpload(
   file: File,
@@ -350,6 +345,7 @@ async function chunkedUpload(
   fileType?: string,
   onProgress?: (percent: number) => void,
 ): Promise<any> {
+  onProgress?.(1)                     // 立即显示 1%，start 请求前就有反馈
   const chunkSize = calcChunkSize(file.size)
   const totalChunks = Math.ceil(file.size / chunkSize)
   console.log(`[chunkedUpload] 开始分块上传: ${file.name}, 大小: ${file.size}, 分块大小: ${(chunkSize/1024).toFixed(0)}KB, 分块数: ${totalChunks}`)
@@ -360,6 +356,7 @@ async function chunkedUpload(
   startForm.append('total_chunks', String(totalChunks))
   startForm.append('total_size', String(file.size))
 
+  onProgress?.(2)                     // start 请求发起前
   const startResp = await uploadClient.post(`${basePath}/start`, startForm)
   const dataId = startResp.data?.id || startResp.data?.data?.id
   if (!dataId) {
@@ -382,7 +379,9 @@ async function chunkedUpload(
         chunkForm.append('file', chunk)
         chunkForm.append('chunk_index', String(i))
 
-        await uploadClient.post(`${basePath}/${dataId}/chunk`, chunkForm)
+        await uploadClient.post(`${basePath}/${dataId}/chunk`, chunkForm, {
+          timeout: 60000,          // 单块 60s，超时即触发重试
+        })
         success = true
         onProgress?.(Math.round(((i + 1) / totalChunks) * 99))  // 99% 封顶，留给 complete
         console.log(`[chunkedUpload] 分块 ${i + 1}/${totalChunks} 完成 (${end - start} 字节)`)
@@ -1241,7 +1240,8 @@ export const appVersionsApi = {
     startForm.append('filename', file.name)
     startForm.append('total_chunks', String(totalChunks))
     startForm.append('total_size', String(file.size))
-    const startResp = await uploadClient.post(`${basePath}/start`, startForm)
+    onProgress?.(2)                     // start 请求发起前
+  const startResp = await uploadClient.post(`${basePath}/start`, startForm)
     const uploadId = startResp.data?.id || startResp.data?.data?.id
     if (!uploadId) throw new Error('无法创建上传会话')
 
