@@ -1013,6 +1013,14 @@
     "errMissingFields": "Please ensure label name, longitude, latitude, azimuth are matched",
     "errMissingFieldsPoint": "Please ensure label name, longitude, latitude are matched",
     "errSheet": "Please select a Sheet first",
-    "colorTabHint": "TAB format does not support fill color; color applies to MIF/KML only"
+    "colorTabHint": "TAB format does not support fill color; color applies to MIF/KML only",
+    "uploading": "Uploading {percent}%",
+    "done": "Upload complete",
+    "reading": "Reading columns...",
+    "importHint": "Please import an Excel file first",
+    "noFile": "No file selected",
+    "uploadBtn": "Click to upload",
+    "params": "Parameters",
+    "uploadDone": "Layer generated"
   }
 }

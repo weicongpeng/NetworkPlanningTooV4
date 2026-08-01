@@ -1024,6 +1024,14 @@
     "errMissingFields": "请确保标签名称、经度、纬度、方向角均已正确匹配",
     "errMissingFieldsPoint": "请确保标签名称、经度、纬度均已正确匹配",
     "errSheet": "请先选择 Sheet",
-    "colorTabHint": "TAB 格式不支持填充颜色，颜色仅 MIF/KML 生效"
+    "colorTabHint": "TAB 格式不支持填充颜色，颜色仅 MIF/KML 生效",
+    "uploading": "上传中 {percent}%",
+    "done": "文件上传完成",
+    "reading": "读取列名中...",
+    "importHint": "请先导入 Excel 文件",
+    "noFile": "未选择文件",
+    "uploadBtn": "点击上传",
+    "params": "参数设置",
+    "uploadDone": "图层生成完成"
   }
 }
