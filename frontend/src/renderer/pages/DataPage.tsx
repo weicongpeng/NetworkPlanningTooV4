@@ -2006,19 +2006,17 @@ function NewCellEntryCard({
                     <input className={curInputCls} data-field="mcc" type="text" inputMode="numeric" value={row.mcc} onChange={e => updateRow(row.id, 'mcc', filterDigits(e.target.value))} disabled={!hasFullParams || isAddingCell} placeholder="460" />
                   </td>
                   <td className="border border-border px-1 py-1">
-                    <input
+                    <select
                       className={curInputCls}
                       data-field="mnc"
-                      list="mnc-options"
                       value={row.mnc}
-                      onChange={e => updateRow(row.id, 'mnc', filterDigits(e.target.value).slice(0, 2))}
+                      onChange={e => updateRow(row.id, 'mnc', e.target.value)}
                       disabled={!hasFullParams || isAddingCell}
-                      placeholder="11"
-                    />
-                    <datalist id="mnc-options">
-                      <option value="11" />
-                      <option value="01" />
-                    </datalist>
+                    >
+                      <option value="11">11</option>
+                      <option value="01">01</option>
+                      <option value="00">00</option>
+                    </select>
                   </td>
                   <td className="border border-border px-1 py-1">
                     <input className={curInputCls} data-field="longitude" type="text" inputMode="decimal" value={row.longitude} onChange={e => updateRow(row.id, 'longitude', filterNumeric(e.target.value))} disabled={!hasFullParams || isAddingCell} placeholder="114.0" />
