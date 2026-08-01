@@ -9,6 +9,8 @@ import { NeighborPage } from './pages/NeighborPage'
 import { TACPage } from './pages/TACPage'
 import { TACPlanningPage } from './pages/TACPlanningPage'
 import { LicensePage } from './pages/LicensePage'
+import LayerSectorPage from './pages/LayerSectorPage'
+import LayerPointPage from './pages/LayerPointPage'
 import { MapPage } from './pages/MapPage'
 import { AdminUsersPage } from './pages/AdminUsersPage'
 import { AppVersionsPage } from './pages/AppVersionsPage'
@@ -87,6 +89,22 @@ function App() {
               element={
                 <ProtectedRoute>
                   <MapPage />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/layer/sector"
+              element={
+                <ProtectedRoute>
+                  <LayerSectorPage />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/layer/point"
+              element={
+                <ProtectedRoute>
+                  <LayerPointPage />
                 </ProtectedRoute>
               }
             />

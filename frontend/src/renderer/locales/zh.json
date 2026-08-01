@@ -996,5 +996,28 @@
     "permDataDelete": "数据删除",
     "permDataUpdate": "工参更新",
     "permCellEntry": "新站录入"
+  },
+  "layer": {
+    "sectorLayer": "扇区图层",
+    "pointLayer": "点图层",
+    "uploadExcel": "点击或拖拽导入 Excel 工参文件",
+    "acceptExcel": "支持 .xlsx / .xls",
+    "selectSheet": "数据来源 (Sheet)",
+    "selectAttributes": "图层属性 (勾选列)",
+    "keywordMatch": "关键字匹配",
+    "fieldName": "标签名称",
+    "fieldLongitude": "经度",
+    "fieldLatitude": "纬度",
+    "fieldAzimuth": "方向角",
+    "selectColumn": "请选择列",
+    "radius": "扇区半径",
+    "beamwidth": "波瓣夹角",
+    "fillColor": "填充颜色",
+    "pointSize": "点大小",
+    "outputFormat": "输出格式",
+    "generate": "生成图层",
+    "download": "下载图层",
+    "errMissingFields": "请确保标签名称、经度、纬度、方向角均已正确匹配",
+    "errSheet": "请先选择 Sheet"
   }
 }

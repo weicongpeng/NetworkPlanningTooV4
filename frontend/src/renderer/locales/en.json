@@ -985,5 +985,28 @@
     "permDataDelete": "Delete Data",
     "permDataUpdate": "Update Parameters",
     "permCellEntry": "New Cell Entry"
+  },
+  "layer": {
+    "sectorLayer": "Sector Layer",
+    "pointLayer": "Point Layer",
+    "uploadExcel": "Click or drag to import Excel params",
+    "acceptExcel": "Supports .xlsx / .xls",
+    "selectSheet": "Data Source (Sheet)",
+    "selectAttributes": "Layer Attributes (check columns)",
+    "keywordMatch": "Keyword Match",
+    "fieldName": "Label Name",
+    "fieldLongitude": "Longitude",
+    "fieldLatitude": "Latitude",
+    "fieldAzimuth": "Azimuth",
+    "selectColumn": "Select column",
+    "radius": "Sector Radius",
+    "beamwidth": "Beamwidth",
+    "fillColor": "Fill Color",
+    "pointSize": "Point Size",
+    "outputFormat": "Output Format",
+    "generate": "Generate Layer",
+    "download": "Download Layer",
+    "errMissingFields": "Please ensure label name, longitude, latitude, azimuth are matched",
+    "errSheet": "Please select a Sheet first"
   }
 }
