@@ -81,7 +81,9 @@
     "paramCheck": "参数核查",
     "tac": "TAC核查",
     "map": "地图工具",
-    "config": "配置管理"
+    "config": "配置管理",
+    "tools": "实用工具",
+    "layerTools": "图层制作"
   },
   "home": {
     "title": "网络规划工具",
@@ -102,6 +104,7 @@
     "tacPlanningDesc": "数据驱动的新站小区TAC分配",
     "mapDesc": "查看基站分布和覆盖",
     "configDesc": "管理系统配置",
+    "layerToolsDesc": "根据工参文件制作扇区/点图层 (tab/mif/kml)",
     "backendService": "后端服务",
     "database": "数据库",
     "license": "许可证",

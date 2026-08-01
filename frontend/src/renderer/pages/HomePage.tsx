@@ -6,6 +6,7 @@ import {
   MapPin,
   Map,
   Shield,
+  Wrench,
   LucideIcon
 } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
@@ -60,6 +61,13 @@ export function HomePage() {
           icon={Map}
           link="/map"
           iconColor="text-cyan-500"
+        />
+        <FeatureCard
+          title={t('nav.layerTools')}
+          description={t('home.layerToolsDesc') || '根据工参文件制作扇区/点图层'}
+          icon={Wrench}
+          link="/layer/sector"
+          iconColor="text-blue-600"
         />
         <FeatureCard
           title={t('nav.config')}

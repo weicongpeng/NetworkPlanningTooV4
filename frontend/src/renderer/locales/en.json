@@ -80,7 +80,9 @@
     "paramCheck": "Parameter Check",
     "tac": "TAC Check",
     "map": "Map",
-    "config": "Config"
+    "config": "Config",
+    "tools": "Utilities",
+    "layerTools": "Layer Tools"
   },
   "home": {
     "title": "Network Planning Tool",
@@ -101,6 +103,7 @@
     "tacPlanningDesc": "Data-driven new cell TAC allocation",
     "mapDesc": "View base station distribution",
     "configDesc": "Manage system configuration",
+    "layerToolsDesc": "Create sector/point layers (tab/mif/kml) from params",
     "backendService": "Backend Service",
     "database": "Database",
     "license": "License",
