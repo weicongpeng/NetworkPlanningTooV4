@@ -63,11 +63,18 @@ export function HomePage() {
           iconColor="text-cyan-500"
         />
         <FeatureCard
-          title={t('nav.layerTools')}
-          description={t('home.layerToolsDesc') || '根据工参文件制作扇区/点图层'}
+          title={t('nav.layerSector')}
+          description={t('home.layerSectorDesc') || '根据工参制作扇区图层 (tab/mif/kml)'}
           icon={Wrench}
           link="/layer/sector"
           iconColor="text-blue-600"
+        />
+        <FeatureCard
+          title={t('nav.layerPoint')}
+          description={t('home.layerPointDesc') || '根据工参制作点图层 (tab/mif/kml)'}
+          icon={MapPin}
+          link="/layer/point"
+          iconColor="text-teal-500"
         />
         <FeatureCard
           title={t('nav.config')}

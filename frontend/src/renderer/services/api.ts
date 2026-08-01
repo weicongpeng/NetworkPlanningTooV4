@@ -985,7 +985,7 @@ export const layerToolsApi = {
     const res = await uploadClient.post('/layer/excel-info', formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
     })
-    return res.data?.data
+    return res.data
   },
 
   // 生成扇区图层
@@ -1005,7 +1005,7 @@ export const layerToolsApi = {
     const res = await uploadClient.post('/layer/sector', formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
     })
-    return res.data?.data
+    return res.data
   },
 
   // 生成点图层
@@ -1022,7 +1022,7 @@ export const layerToolsApi = {
     const res = await uploadClient.post('/layer/point', formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
     })
-    return res.data?.data
+    return res.data
   },
 }
 

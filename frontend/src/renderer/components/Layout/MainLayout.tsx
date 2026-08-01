@@ -63,7 +63,8 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
       name: t('nav.tools'),
       icon: Wrench,
       children: [
-        { type: 'link', name: t('nav.layerTools'), href: '/layer/sector' },
+        { type: 'link', name: t('nav.layerSector'), href: '/layer/sector' },
+        { type: 'link', name: t('nav.layerPoint'), href: '/layer/point' },
       ],
     },
     { type: 'link', name: t('nav.config'), href: '/license', icon: Shield },

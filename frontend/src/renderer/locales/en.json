@@ -82,7 +82,9 @@
     "map": "Map",
     "config": "Config",
     "tools": "Utilities",
-    "layerTools": "Layer Tools"
+    "layerTools": "Layer Tools",
+    "layerSector": "Sector Layer Tools",
+    "layerPoint": "Point Layer Tools"
   },
   "home": {
     "title": "Network Planning Tool",
@@ -110,7 +112,9 @@
     "online": "Online",
     "offline": "Offline",
     "valid": "Activated",
-    "invalid": "Not Activated"
+    "invalid": "Not Activated",
+    "layerSectorDesc": "Create sector layer from params (tab/mif/kml)",
+    "layerPointDesc": "Create point layer from params (tab/mif/kml)"
   },
   "data": {
     "title": "Data Management",
