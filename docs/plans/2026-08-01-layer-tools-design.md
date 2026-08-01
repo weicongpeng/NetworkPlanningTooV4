@@ -111,7 +111,11 @@ generate_point_layer(file, config) -> {file_url}
 ```
 
 - **WGS84**：直接 `crs='EPSG:4326'`。
-- **样式**：MapInfo 图层样式由用户在 MapInfo/QGIS 中设置，后端不嵌入颜色（简化）；KML 用 `Icon`/`Style` 支持颜色点标记（可选增强）。
+- **样式/颜色**（2026-08-01 实现决策）：
+  - **MIF**：pyogrio 生成后文本后处理，替换 `Symbol`/`Brush` 行注入颜色（`R*65536+G*256+B` 十进制，已验证可被 GDAL 读回）。
+  - **KML**：pyogrio 生成后后处理，在每个 `<Placemark>` 前注入 `<PolyStyle>`/`<IconStyle>`（`aabbggrr` 颜色格式，已验证可读回）。
+  - **TAB**：**不支持颜色**——TAB 的样式存储在 `.map` 二进制（RLE 压缩，无公开字节规范），pyogrio 无法写样式，环境无 GDAL 二进制工具。前端在 TAB 格式时提示"颜色仅 MIF/KML 生效"。
+  - 用户选择 MIF/KML 时颜色真正生效；TAB 时颜色选择器仍可用但输出无颜色并提示。
 - **性能**：10 万行以内秒级完成；大文件用 `run_in_threadpool` 包裹（与现有模式一致）。
 - **错误处理**：GBK 安全处理（项目规范）、坐标无效返回 400 含示例数据。
 
@@ -171,6 +175,6 @@ def sector_polygon(lat, lng, azimuth, beamwidth, radius_m, arc_points=30):
 ## 8. 范围外（YAGNI）
 
 - 多 sheet 批量生成（当前单选 sheet，可重复操作分别生成）
-- 图层样式内嵌颜色到 MapInfo 格式（由用户后续在 MapInfo/QGIS 中设置）
-- MIF 与 TAB 差异样式处理
+- TAB 格式颜色内嵌（需逆向 .map 二进制 RLE 格式或安装 GDAL 二进制，当前折衷为 TAB 无颜色 + 前端提示）
+- 其他 MapInfo 样式（线宽、填充图案等）内嵌
 - Electron 本地路径直接写入（生产为网页应用）
