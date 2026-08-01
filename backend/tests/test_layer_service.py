@@ -266,3 +266,41 @@ def test_invalid_color_ignored(service, sample_excel):
     text = result.read_text(encoding="utf-8", errors="replace")
     assert "Symbol (35,0,12)" in text  # 保持默认颜色
     assert "4886745" not in text
+
+
+def test_kml_name_col_uses_cell_id(service, sample_excel):
+    """KML name_col 生效：name_col=CELL_ID 时 <name> 取该列值"""
+    result = service.generate_point_layer(
+        file_path=str(sample_excel), sheet_name="LTE",
+        name_col="NAME", lon_col="LONGITUDE", lat_col="LATITUDE",
+        attributes=["NAME", "PCI"], output_format="kml",
+    )
+    text = result.read_text(encoding="utf-8", errors="replace")
+    assert "<name>CellA</name>" in text
+    assert "<name>CellB</name>" in text
+
+
+def test_kml_color_inline_xml_valid(service, sample_excel):
+    """KML 颜色注入后 XML 合法，且 Style 在 Placemark 内（严格查看器可渲染）"""
+    import xml.etree.ElementTree as ET
+    result = service.generate_sector_layer(
+        file_path=str(sample_excel), sheet_name="LTE",
+        name_col="NAME", lon_col="LONGITUDE", lat_col="LATITUDE",
+        azimuth_col="AZIMUTH", radius_m=3000, beamwidth=40.0,
+        attributes=["NAME"], output_format="kml", color="#4A90D9",
+    )
+    text = result.read_text(encoding="utf-8", errors="replace")
+    # XML 可解析
+    root = ET.fromstring(text)
+    ns = {"kml": "http://www.opengis.net/kml/2.2"}
+    placemarks = root.findall(".//kml:Placemark", ns)
+    assert len(placemarks) == 2
+    for pm in placemarks:
+        # Style 必须是 Placemark 的直接子元素
+        style = pm.find("kml:Style", ns)
+        assert style is not None, "Style 必须在 Placemark 内"
+        poly_style = style.find("kml:PolyStyle", ns)
+        assert poly_style is not None
+        color_el = poly_style.find("kml:color", ns)
+        assert color_el is not None
+        assert color_el.text == "ffd9904a"

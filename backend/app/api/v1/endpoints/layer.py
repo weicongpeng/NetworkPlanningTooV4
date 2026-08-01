@@ -4,6 +4,7 @@
 import json
 import shutil
 import uuid
+import zipfile
 from pathlib import Path
 from typing import Optional
 
@@ -19,6 +20,25 @@ layer_service = LayerService()
 
 # 允许的输入文件扩展名（工参 Excel）
 ALLOWED_EXTS = {".xlsx", ".xls"}
+
+
+def _zip_layer(out_path: Path) -> Path:
+    """把同名图层文件打包成 zip（TAB 含 .tab/.dat/.id/.map，MIF 含 .mif/.mid），返回 zip 路径"""
+    base = out_path.stem
+    zip_path = out_path.parent / f"{base}.zip"
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for f in out_path.parent.glob(f"{base}.*"):
+            zf.write(f, arcname=f.name)
+    return zip_path
+
+
+def _finalize_output(out: Path, output_format: str) -> dict:
+    """根据输出格式确定下载文件名/URL：TAB/MIF 多文件打包成 zip，KML 单文件直接返回"""
+    if output_format in ("tab", "mif"):
+        zip_path = _zip_layer(out)
+        return {"filename": zip_path.name, "download_url": f"/layer-files/{zip_path.name}"}
+    # KML 单文件
+    return {"filename": out.name, "download_url": f"/layer-files/{out.name}"}
 
 
 def _save_upload(file: Optional[UploadFile], file_path: Optional[str]) -> Path:
@@ -99,7 +119,7 @@ async def generate_point(
             str(src), sheet_name, name_col, lon_col, lat_col, attr_list, output_format,
             color or None,
         )
-        return {"success": True, "data": {"filename": out.name, "download_url": f"/layer-files/{out.name}"}}
+        return {"success": True, "data": _finalize_output(out, output_format)}
     except HTTPException:
         raise
     except ValueError as e:
@@ -140,7 +160,7 @@ async def generate_sector(
             radius_m, beamwidth, attr_list, output_format,
             color or None,
         )
-        return {"success": True, "data": {"filename": out.name, "download_url": f"/layer-files/{out.name}"}}
+        return {"success": True, "data": _finalize_output(out, output_format)}
     except HTTPException:
         raise
     except ValueError as e:

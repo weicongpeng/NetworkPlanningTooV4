@@ -112,17 +112,34 @@ class LayerService:
         return lon, lat, valid
 
     def _build_gdf(self, df: pd.DataFrame, lon: pd.Series, lat: pd.Series,
-                   valid: pd.Series, attributes: List[str], geometry_cols) -> gpd.GeoDataFrame:
-        """构建 GeoDataFrame，仅保留有效坐标行和勾选属性列"""
+                   valid: pd.Series, attributes: List[str], geometry_cols,
+                   keep_cols_extra: Optional[List[str]] = None) -> gpd.GeoDataFrame:
+        """构建 GeoDataFrame，仅保留有效坐标行和勾选属性列
+        keep_cols_extra: 额外保留的列（如 name_col，即使不在 attributes 中也保留）。
+        """
         if not attributes:
             raise ValueError("请至少选择一个图层属性列")
         sub = df.loc[valid].copy()
         keep = [c for c in sub.columns if c in attributes]
         if not keep:
             raise ValueError("所选属性列在数据中不存在，请检查属性列选择")
+        if keep_cols_extra:
+            for c in keep_cols_extra:
+                if c and c in sub.columns and c not in keep:
+                    keep.append(c)
         sub = sub[keep]
         gdf = gpd.GeoDataFrame(sub, geometry=geometry_cols, crs="EPSG:4326")
         return gdf
+
+    def _ensure_kml_name(self, gdf: gpd.GeoDataFrame, name_col: str) -> gpd.GeoDataFrame:
+        """KML 写入前把 name_col 列重命名为 'Name'（GDAL KML 驱动约定），使标签名生效。
+        若 name_col 已名为 'Name'，或 gdf 中已存在 'Name' 列则跳过，避免覆盖。
+        """
+        if not name_col or name_col not in gdf.columns or name_col == "Name":
+            return gdf
+        if "Name" in gdf.columns:
+            return gdf
+        return gdf.rename(columns={name_col: "Name"})
 
     def _write(self, gdf: gpd.GeoDataFrame, output_format: str) -> Path:
         """写入文件，返回路径"""
@@ -136,7 +153,7 @@ class LayerService:
     def _apply_color(self, out_path: Path, output_format: str,
                      color: Optional[str], is_point: bool) -> Path:
         """后处理注入颜色（仅 MIF/KML，TAB 无颜色支持）
-        MIF 替换 Symbol/Brush 样式行；KML 在每个 Placemark 前注入 Style。
+        MIF 替换 Symbol/Brush 样式行；KML 在每个 Placemark 内注入内联 Style。
         非法颜色或 TAB 直接返回原文件。
         """
         if output_format not in ("mif", "kml") or not color:
@@ -169,7 +186,12 @@ class LayerService:
                 style = f'<Style><IconStyle><color>{kml_color}</color></IconStyle></Style>'
             else:
                 style = f'<Style><PolyStyle><color>{kml_color}</color></PolyStyle></Style>'
-            text = text.replace('<Placemark id=', style + '<Placemark id=')
+            # 内联注入到 <Placemark ...> 之后作为其第一个子元素（严格查看器才能渲染）
+            text = re.sub(
+                r'(<Placemark[^>]*>)',
+                lambda m: m.group(1) + '\n' + style,
+                text,
+            )
         out_path.write_text(text, encoding="utf-8")
         return out_path
 
@@ -181,7 +203,9 @@ class LayerService:
         df = self._read_sheet(file_path, sheet_name)
         lon, lat, valid = self._coerce_coords(df, lon_col, lat_col)
         geoms = [Point(x, y) for x, y in zip(lon[valid], lat[valid])]
-        gdf = self._build_gdf(df, lon, lat, valid, attributes, geoms)
+        gdf = self._build_gdf(df, lon, lat, valid, attributes, geoms, keep_cols_extra=[name_col])
+        if output_format == "kml":
+            gdf = self._ensure_kml_name(gdf, name_col)
         out = self._write(gdf, output_format)
         return self._apply_color(out, output_format, color, is_point=True)
 
@@ -206,7 +230,9 @@ class LayerService:
             sector_polygon(y, x, a, beamwidth, radius_m)
             for x, y, a in zip(lon[valid], lat[valid], azi[valid])
         ]
-        gdf = self._build_gdf(df, lon, lat, valid, attributes, geoms)
+        gdf = self._build_gdf(df, lon, lat, valid, attributes, geoms, keep_cols_extra=[name_col])
+        if output_format == "kml":
+            gdf = self._ensure_kml_name(gdf, name_col)
         out = self._write(gdf, output_format)
         return self._apply_color(out, output_format, color, is_point=False)
 

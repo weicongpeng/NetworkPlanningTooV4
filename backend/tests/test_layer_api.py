@@ -64,7 +64,7 @@ def test_excel_info_endpoint():
 
 
 def test_point_endpoint_returns_download_url():
-    """生成点图层返回下载 URL，且文件可通过 /layer-files/ 下载"""
+    """生成点图层返回下载 URL（TAB 打包 zip 含 .tab/.dat/.id/.map），且可通过 /layer-files/ 下载"""
     path = _make_excel()
     client = _make_client()
     try:
@@ -86,16 +86,21 @@ def test_point_endpoint_returns_download_url():
         assert body["success"] is True
         download_url = body["data"]["download_url"]
         assert download_url.startswith("/layer-files/")
-        # 验证静态挂载可下载生成的文件
+        assert download_url.endswith(".zip")
+        # 验证 zip 包含 TAB 的 4 个配套文件
         dl = client.get(download_url)
         assert dl.status_code == 200
         assert dl.content
+        import zipfile, io
+        with zipfile.ZipFile(io.BytesIO(dl.content)) as zf:
+            suffixes = {Path(n).suffix for n in zf.namelist()}
+        assert {".tab", ".dat", ".id", ".map"}.issubset(suffixes)
     finally:
         os.remove(path)
 
 
 def test_sector_endpoint():
-    """生成扇区图层"""
+    """生成扇区图层（MIF 打包 zip 含 .mif/.mid）"""
     path = _make_excel()
     client = _make_client()
     try:
@@ -118,7 +123,45 @@ def test_sector_endpoint():
         assert resp.status_code == 200
         body = resp.json()
         assert body["success"] is True
-        assert body["data"]["filename"].endswith(".mif")
+        filename = body["data"]["filename"]
+        assert filename.endswith(".zip")
+        dl = client.get(body["data"]["download_url"])
+        assert dl.status_code == 200
+        import zipfile, io
+        with zipfile.ZipFile(io.BytesIO(dl.content)) as zf:
+            names = zf.namelist()
+        assert any(n.endswith(".mif") for n in names)
+        assert any(n.endswith(".mid") for n in names)
+    finally:
+        os.remove(path)
+
+
+def test_point_endpoint_kml_no_zip():
+    """KML 单文件不打包 zip"""
+    path = _make_excel()
+    client = _make_client()
+    try:
+        with open(path, "rb") as f:
+            resp = client.post(
+                "/api/v1/layer/point",
+                files={"file": ("sample.xlsx", f, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+                data={
+                    "sheet_name": "LTE",
+                    "name_col": "NAME",
+                    "lon_col": "LONGITUDE",
+                    "lat_col": "LATITUDE",
+                    "attributes": '["NAME"]',
+                    "output_format": "kml",
+                },
+            )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["success"] is True
+        filename = body["data"]["filename"]
+        assert filename.endswith(".kml")
+        assert not filename.endswith(".zip")
+        dl = client.get(body["data"]["download_url"])
+        assert dl.status_code == 200
     finally:
         os.remove(path)
 
@@ -149,10 +192,14 @@ def test_sector_endpoint_with_color():
         body = resp.json()
         assert body["success"] is True
         filename = body["data"]["filename"]
-        assert filename.endswith(".mif")
+        assert filename.endswith(".zip")
         dl = client.get(body["data"]["download_url"])
         assert dl.status_code == 200
-        text = dl.content.decode("utf-8", errors="replace")
+        import zipfile, io
+        with zipfile.ZipFile(io.BytesIO(dl.content)) as zf:
+            mif_names = [n for n in zf.namelist() if n.endswith(".mif")]
+            assert mif_names
+            text = zf.read(mif_names[0]).decode("utf-8", errors="replace")
         assert "Brush (" in text
         assert "4886745" in text
     finally:
