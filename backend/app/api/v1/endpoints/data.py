@@ -1047,7 +1047,26 @@ async def complete_chunked_upload(
 
     print(f"[ChunkedUpload] 文件重组完成: {file_path}, 大小: {file_path.stat().st_size:,} 字节")
 
-    if file_type == "geo_data":
+    if file_type == "layer":
+        # 图层制作：只重组文件到 layer_tmp，不建 data 索引，返回 file_path
+        # 前端后续用 file_path 调 /layer/excel-info 和 /layer/point|sector（上传只发生一次）
+        layer_tmp = settings.UPLOAD_DIR / "layer_tmp"
+        layer_tmp.mkdir(parents=True, exist_ok=True)
+        dest = layer_tmp / f"src_{data_id[:8]}{ext}"
+        shutil.copy(file_path, dest)
+        try:
+            file_path.unlink(missing_ok=True)  # 清理 uploads 根目录的重组临时文件
+        except Exception:
+            pass
+        print(f"[ChunkedUpload] 图层文件已保存: {dest}")
+        return {
+            "success": True,
+            "data": {
+                "file_path": str(dest),
+                "name": safe_filename,
+            },
+        }
+    elif file_type == "geo_data":
         # 地理化数据：创建索引后异步处理（避免解析耗时阻塞请求）
         data_dir = settings.DATA_DIR / data_id
         data_dir.mkdir(parents=True, exist_ok=True)

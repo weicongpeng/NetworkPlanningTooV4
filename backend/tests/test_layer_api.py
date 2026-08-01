@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 from app.api import create_app
 from app.core.config import settings
 from app.core.security import require_data_import
+from app.services.data_service import data_service
 
 
 def _make_excel() -> str:
@@ -290,5 +291,44 @@ def test_non_excel_extension_rejected():
             )
         assert resp.status_code == 400
         assert "Excel" in resp.json()["detail"]
+    finally:
+        os.remove(path)
+
+
+def test_chunked_upload_layer_file_type():
+    """分块上传 + file_type='layer' 应重组文件返回 file_path，不建 data 索引"""
+    path = tempfile.mktemp(suffix=".xlsx")
+    pd.DataFrame({"NAME": ["A"], "LONGITUDE": [116.3], "LATITUDE": [39.9]}).to_excel(path, sheet_name="S", index=False)
+    file_size = os.path.getsize(path)
+
+    client = _make_client()
+
+    try:
+        # start
+        r = client.post("/api/v1/data/upload/start",
+            data={"filename": "test.xlsx", "total_chunks": "1", "total_size": str(file_size)})
+        assert r.status_code == 200
+        data_id = r.json()["data"]["id"]
+
+        # chunk
+        with open(path, "rb") as f:
+            r2 = client.post(f"/api/v1/data/upload/{data_id}/chunk",
+                data={"chunk_index": "0"},
+                files={"file": ("chunk", f, "application/octet-stream")})
+        assert r2.status_code == 200
+
+        # complete with file_type='layer'
+        r3 = client.post(f"/api/v1/data/upload/{data_id}/complete",
+            data={"filename": "test.xlsx", "file_type": "layer"})
+        assert r3.status_code == 200
+        body = r3.json()
+        assert body["success"] is True
+        assert "file_path" in body["data"]
+        fp = body["data"]["file_path"]
+        assert "layer_tmp" in fp
+        assert Path(fp).exists()
+
+        # 断言没有创建 data 索引
+        assert data_id not in data_service.index
     finally:
         os.remove(path)
