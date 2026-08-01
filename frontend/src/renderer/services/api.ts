@@ -973,6 +973,7 @@ export interface GenerateLayerParams {
   outputFormat: 'tab' | 'mif' | 'kml'
   radiusM?: number
   beamwidth?: number
+  color?: string
 }
 
 // 图层制作 API（生成新图层，区别于读取已有图层的 layerApi）
@@ -1000,6 +1001,7 @@ export const layerToolsApi = {
     formData.append('output_format', params.outputFormat)
     if (params.radiusM) formData.append('radius_m', String(params.radiusM))
     if (params.beamwidth) formData.append('beamwidth', String(params.beamwidth))
+    if (params.color) formData.append('color', params.color)
     const res = await uploadClient.post('/layer/sector', formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
     })
@@ -1016,6 +1018,7 @@ export const layerToolsApi = {
     formData.append('lat_col', params.latCol)
     formData.append('attributes', JSON.stringify(params.attributes))
     formData.append('output_format', params.outputFormat)
+    if (params.color) formData.append('color', params.color)
     const res = await uploadClient.post('/layer/point', formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
     })

@@ -58,6 +58,7 @@ export default function LayerPointPage() {
         latCol: fieldMappings.latitude,
         attributes: Object.values(selectedFields),
         outputFormat: format,
+        color,
       })
       setResult(data)
     } catch (err: any) {

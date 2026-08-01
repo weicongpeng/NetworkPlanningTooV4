@@ -62,6 +62,7 @@ export default function LayerSectorPage() {
         outputFormat: format,
         radiusM,
         beamwidth,
+        color,
       })
       setResult(data)
     } catch (err: any) {
