@@ -1499,6 +1499,22 @@ function NewCellEntryCard({
     }))
   }
 
+  // 列字段顺序表（与表头一致），标注每列粘贴过滤类型
+  const FIELD_ORDER: Array<{ key: keyof CellRow; kind: 'digits' | 'numeric' | 'text' | 'cover' }> = [
+    { key: 'managedElementId', kind: 'digits' },
+    { key: 'siteId', kind: 'digits' },
+    { key: 'cellId', kind: 'digits' },
+    { key: 'cellName', kind: 'text' },
+    { key: 'mcc', kind: 'digits' },
+    { key: 'mnc', kind: 'digits' },
+    { key: 'longitude', kind: 'numeric' },
+    { key: 'latitude', kind: 'numeric' },
+    { key: 'azimuth', kind: 'digits' },
+    { key: 'frequency', kind: 'numeric' },   // LTE 面板
+    { key: 'ssbFrequency', kind: 'numeric' }, // NR 面板
+    { key: 'cellCoverType', kind: 'cover' },
+  ]
+
   // 多行多列粘贴：从 Excel/文本复制 tab 分隔内容，按列顺序填充并自动扩充行数
   const handlePaste = (e: React.ClipboardEvent) => {
     if (!hasFullParams || isAddingCell || importing) return
@@ -1859,23 +1875,24 @@ function NewCellEntryCard({
                     </button>
                   </td>
                   <td className="border border-border px-1 py-1">
-                    <input className={curInputCls} type="text" inputMode="numeric" value={row.managedElementId} onChange={e => updateRow(row.id, 'managedElementId', filterDigits(e.target.value))} disabled={!hasFullParams || isAddingCell} placeholder="" />
+                    <input className={curInputCls} data-field="managedElementId" type="text" inputMode="numeric" value={row.managedElementId} onChange={e => updateRow(row.id, 'managedElementId', filterDigits(e.target.value))} disabled={!hasFullParams || isAddingCell} placeholder="" />
                   </td>
                   <td className="border border-border px-1 py-1">
-                    <input className={curInputCls} type="text" inputMode="numeric" value={row.siteId} onChange={e => updateRow(row.id, 'siteId', filterDigits(e.target.value))} disabled={!hasFullParams || isAddingCell} placeholder="" />
+                    <input className={curInputCls} data-field="siteId" type="text" inputMode="numeric" value={row.siteId} onChange={e => updateRow(row.id, 'siteId', filterDigits(e.target.value))} disabled={!hasFullParams || isAddingCell} placeholder="" />
                   </td>
                   <td className="border border-border px-1 py-1">
-                    <input className={curInputCls} type="text" inputMode="numeric" value={row.cellId} onChange={e => updateRow(row.id, 'cellId', filterDigits(e.target.value))} disabled={!hasFullParams || isAddingCell} placeholder="" />
+                    <input className={curInputCls} data-field="cellId" type="text" inputMode="numeric" value={row.cellId} onChange={e => updateRow(row.id, 'cellId', filterDigits(e.target.value))} disabled={!hasFullParams || isAddingCell} placeholder="" />
                   </td>
                   <td className="border border-border px-1 py-1">
-                    <input className={curInputCls} value={row.cellName} onChange={e => updateRow(row.id, 'cellName', e.target.value)} disabled={!hasFullParams || isAddingCell} placeholder="" />
+                    <input className={curInputCls} data-field="cellName" value={row.cellName} onChange={e => updateRow(row.id, 'cellName', e.target.value)} disabled={!hasFullParams || isAddingCell} placeholder="" />
                   </td>
                   <td className="border border-border px-1 py-1">
-                    <input className={curInputCls} type="text" inputMode="numeric" value={row.mcc} onChange={e => updateRow(row.id, 'mcc', filterDigits(e.target.value))} disabled={!hasFullParams || isAddingCell} placeholder="460" />
+                    <input className={curInputCls} data-field="mcc" type="text" inputMode="numeric" value={row.mcc} onChange={e => updateRow(row.id, 'mcc', filterDigits(e.target.value))} disabled={!hasFullParams || isAddingCell} placeholder="460" />
                   </td>
                   <td className="border border-border px-1 py-1">
                     <input
                       className={curInputCls}
+                      data-field="mnc"
                       list="mnc-options"
                       value={row.mnc}
                       onChange={e => updateRow(row.id, 'mnc', filterDigits(e.target.value).slice(0, 2))}
@@ -1888,24 +1905,25 @@ function NewCellEntryCard({
                     </datalist>
                   </td>
                   <td className="border border-border px-1 py-1">
-                    <input className={curInputCls} type="text" inputMode="decimal" value={row.longitude} onChange={e => updateRow(row.id, 'longitude', filterNumeric(e.target.value))} disabled={!hasFullParams || isAddingCell} placeholder="114.0" />
+                    <input className={curInputCls} data-field="longitude" type="text" inputMode="decimal" value={row.longitude} onChange={e => updateRow(row.id, 'longitude', filterNumeric(e.target.value))} disabled={!hasFullParams || isAddingCell} placeholder="114.0" />
                   </td>
                   <td className="border border-border px-1 py-1">
-                    <input className={curInputCls} type="text" inputMode="decimal" value={row.latitude} onChange={e => updateRow(row.id, 'latitude', filterNumeric(e.target.value))} disabled={!hasFullParams || isAddingCell} placeholder="23.0" />
+                    <input className={curInputCls} data-field="latitude" type="text" inputMode="decimal" value={row.latitude} onChange={e => updateRow(row.id, 'latitude', filterNumeric(e.target.value))} disabled={!hasFullParams || isAddingCell} placeholder="23.0" />
                   </td>
                   <td className="border border-border px-1 py-1">
-                    <input className={curInputCls} type="text" inputMode="numeric" value={row.azimuth} onChange={e => updateRow(row.id, 'azimuth', filterDigits(e.target.value))} disabled={!hasFullParams || isAddingCell} placeholder="0-360" />
+                    <input className={curInputCls} data-field="azimuth" type="text" inputMode="numeric" value={row.azimuth} onChange={e => updateRow(row.id, 'azimuth', filterDigits(e.target.value))} disabled={!hasFullParams || isAddingCell} placeholder="0-360" />
                   </td>
                   <td className="border border-border px-1 py-1">
                     {isLte ? (
-                      <input className={curInputCls} type="text" inputMode="decimal" value={row.frequency} onChange={e => updateRow(row.id, 'frequency', filterNumeric(e.target.value))} disabled={!hasFullParams || isAddingCell} placeholder="" />
+                      <input className={curInputCls} data-field="frequency" type="text" inputMode="decimal" value={row.frequency} onChange={e => updateRow(row.id, 'frequency', filterNumeric(e.target.value))} disabled={!hasFullParams || isAddingCell} placeholder="" />
                     ) : (
-                      <input className={curInputCls} type="text" inputMode="decimal" value={row.ssbFrequency} onChange={e => updateRow(row.id, 'ssbFrequency', filterNumeric(e.target.value))} disabled={!hasFullParams || isAddingCell} placeholder="" />
+                      <input className={curInputCls} data-field="ssbFrequency" type="text" inputMode="decimal" value={row.ssbFrequency} onChange={e => updateRow(row.id, 'ssbFrequency', filterNumeric(e.target.value))} disabled={!hasFullParams || isAddingCell} placeholder="" />
                     )}
                   </td>
                   <td className="border border-border px-1 py-1">
                     <select
                       className={curInputCls}
+                      data-field="cellCoverType"
                       value={row.cellCoverType}
                       onChange={e => updateRow(row.id, 'cellCoverType', parseInt(e.target.value))}
                       disabled={!hasFullParams || isAddingCell}
