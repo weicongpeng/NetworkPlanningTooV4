@@ -123,6 +123,74 @@ def test_sector_endpoint():
         os.remove(path)
 
 
+def test_sector_endpoint_with_color():
+    """扇区图层 + color 参数 → 生成成功且 MIF 颜色已注入"""
+    path = _make_excel()
+    client = _make_client()
+    try:
+        with open(path, "rb") as f:
+            resp = client.post(
+                "/api/v1/layer/sector",
+                files={"file": ("sample.xlsx", f, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+                data={
+                    "sheet_name": "LTE",
+                    "name_col": "NAME",
+                    "lon_col": "LONGITUDE",
+                    "lat_col": "LATITUDE",
+                    "azimuth_col": "AZIMUTH",
+                    "radius_m": "3000",
+                    "beamwidth": "40",
+                    "attributes": '["NAME"]',
+                    "output_format": "mif",
+                    "color": "#4A90D9",
+                },
+            )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["success"] is True
+        filename = body["data"]["filename"]
+        assert filename.endswith(".mif")
+        dl = client.get(body["data"]["download_url"])
+        assert dl.status_code == 200
+        text = dl.content.decode("utf-8", errors="replace")
+        assert "Brush (" in text
+        assert "4886745" in text
+    finally:
+        os.remove(path)
+
+
+def test_point_endpoint_with_color_kml():
+    """点图层 KML + color 参数 → IconStyle color 已注入"""
+    path = _make_excel()
+    client = _make_client()
+    try:
+        with open(path, "rb") as f:
+            resp = client.post(
+                "/api/v1/layer/point",
+                files={"file": ("sample.xlsx", f, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+                data={
+                    "sheet_name": "LTE",
+                    "name_col": "NAME",
+                    "lon_col": "LONGITUDE",
+                    "lat_col": "LATITUDE",
+                    "attributes": '["NAME"]',
+                    "output_format": "kml",
+                    "color": "#4A90D9",
+                },
+            )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["success"] is True
+        filename = body["data"]["filename"]
+        assert filename.endswith(".kml")
+        dl = client.get(body["data"]["download_url"])
+        assert dl.status_code == 200
+        text = dl.content.decode("utf-8", errors="replace")
+        assert "<color>ffd9904a</color>" in text
+    finally:
+        os.remove(path)
+
+
 def test_no_temp_file_leak_after_generation():
     """生成成功后 layer_tmp 无残留临时文件（原始工参不落盘在挂载目录）"""
     before = set(_tmp_leaks())

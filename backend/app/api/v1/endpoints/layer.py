@@ -86,6 +86,7 @@ async def generate_point(
     lat_col: str = Form(...),
     attributes: str = Form("[]"),  # JSON 数组字符串
     output_format: str = Form("tab"),
+    color: Optional[str] = Form(None),
     current_user=Depends(require_data_import),
 ):
     """生成点图层，返回下载 URL"""
@@ -96,6 +97,7 @@ async def generate_point(
         out = await run_in_threadpool(
             layer_service.generate_point_layer,
             str(src), sheet_name, name_col, lon_col, lat_col, attr_list, output_format,
+            color or None,
         )
         return {"success": True, "data": {"filename": out.name, "download_url": f"/layer-files/{out.name}"}}
     except HTTPException:
@@ -124,6 +126,7 @@ async def generate_sector(
     beamwidth: float = Form(40.0),
     attributes: str = Form("[]"),
     output_format: str = Form("tab"),
+    color: Optional[str] = Form(None),
     current_user=Depends(require_data_import),
 ):
     """生成扇区图层，返回下载 URL"""
@@ -135,6 +138,7 @@ async def generate_sector(
             layer_service.generate_sector_layer,
             str(src), sheet_name, name_col, lon_col, lat_col, azimuth_col,
             radius_m, beamwidth, attr_list, output_format,
+            color or None,
         )
         return {"success": True, "data": {"filename": out.name, "download_url": f"/layer-files/{out.name}"}}
     except HTTPException:

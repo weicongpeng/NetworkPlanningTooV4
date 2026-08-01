@@ -6,6 +6,7 @@
 扇区几何使用 Flat-Earth 近似算法（与前端 SectorRendererSVG 一致）。
 """
 import math
+import re
 import uuid
 from pathlib import Path
 from typing import List, Optional
@@ -52,6 +53,34 @@ def sector_polygon(lat: float, lng: float, azimuth: float, beamwidth: float,
     pts.append((lng2, lat2))
     pts.append((lng, lat))
     return Polygon(pts)
+
+
+def hex_to_mapinfo_color(color: Optional[str]) -> Optional[int]:
+    """#RRGGBB → MapInfo 十进制 RGB (R*65536+G*256+B)。非法/None 返回 None"""
+    if not color:
+        return None
+    c = color.strip().lstrip('#')
+    if len(c) != 6:
+        return None
+    try:
+        r = int(c[0:2], 16); g = int(c[2:4], 16); b = int(c[4:6], 16)
+        return r * 65536 + g * 256 + b
+    except ValueError:
+        return None
+
+
+def hex_to_kml_color(color: Optional[str]) -> Optional[str]:
+    """#RRGGBB → KML aabbggrr (alpha=ff)。非法/None 返回 None"""
+    if not color:
+        return None
+    c = color.strip().lstrip('#')
+    if len(c) != 6:
+        return None
+    try:
+        r = c[0:2]; g = c[2:4]; b = c[4:6]
+        return f'ff{b}{g}{r}'.lower()
+    except ValueError:
+        return None
 
 
 class LayerService:
@@ -104,20 +133,63 @@ class LayerService:
         gdf.to_file(out_path, driver=DRIVER_MAP[output_format])
         return out_path
 
+    def _apply_color(self, out_path: Path, output_format: str,
+                     color: Optional[str], is_point: bool) -> Path:
+        """后处理注入颜色（仅 MIF/KML，TAB 无颜色支持）
+        MIF 替换 Symbol/Brush 样式行；KML 在每个 Placemark 前注入 Style。
+        非法颜色或 TAB 直接返回原文件。
+        """
+        if output_format not in ("mif", "kml") or not color:
+            return out_path
+        text = out_path.read_text(encoding="utf-8", errors="replace")
+        if output_format == "mif":
+            mif_color = hex_to_mapinfo_color(color)
+            if mif_color is None:
+                return out_path
+            if is_point:
+                # 替换点 Symbol 颜色: Symbol (35,0,12) → Symbol (35,<color>,<size>) 保留原 size
+                text = re.sub(
+                    r'Symbol \((\d+),(\d+),(\d+)\)',
+                    lambda m: f'Symbol ({m.group(1)},{mif_color},{m.group(3)})', text,
+                )
+            else:
+                # 替换扇区 Brush: Brush (1,0,16777215) → Brush (2,<color>,16777215) 保留背景
+                text = re.sub(
+                    r'Brush \((\d+),(\d+),(\d+)\)',
+                    lambda m: f'Brush ({m.group(1)},{mif_color},{m.group(3)})', text,
+                )
+        elif output_format == "kml":
+            kml_color = hex_to_kml_color(color)
+            if kml_color is None:
+                return out_path
+            # 防御：已注入过 Style 则跳过，避免重复注入
+            if "<PolyStyle><color>" in text or "<IconStyle><color>" in text:
+                return out_path
+            if is_point:
+                style = f'<Style><IconStyle><color>{kml_color}</color></IconStyle></Style>'
+            else:
+                style = f'<Style><PolyStyle><color>{kml_color}</color></PolyStyle></Style>'
+            text = text.replace('<Placemark id=', style + '<Placemark id=')
+        out_path.write_text(text, encoding="utf-8")
+        return out_path
+
     def generate_point_layer(self, file_path: str, sheet_name: str,
                              name_col: str, lon_col: str, lat_col: str,
-                             attributes: List[str], output_format: str) -> Path:
+                             attributes: List[str], output_format: str,
+                             color: Optional[str] = None) -> Path:
         """生成点图层，返回输出文件路径"""
         df = self._read_sheet(file_path, sheet_name)
         lon, lat, valid = self._coerce_coords(df, lon_col, lat_col)
         geoms = [Point(x, y) for x, y in zip(lon[valid], lat[valid])]
         gdf = self._build_gdf(df, lon, lat, valid, attributes, geoms)
-        return self._write(gdf, output_format)
+        out = self._write(gdf, output_format)
+        return self._apply_color(out, output_format, color, is_point=True)
 
     def generate_sector_layer(self, file_path: str, sheet_name: str,
                               name_col: str, lon_col: str, lat_col: str,
                               azimuth_col: str, radius_m: float, beamwidth: float,
-                              attributes: List[str], output_format: str) -> Path:
+                              attributes: List[str], output_format: str,
+                              color: Optional[str] = None) -> Path:
         """生成扇区图层，返回输出文件路径"""
         df = self._read_sheet(file_path, sheet_name)
         lon, lat, valid = self._coerce_coords(df, lon_col, lat_col)
@@ -135,7 +207,8 @@ class LayerService:
             for x, y, a in zip(lon[valid], lat[valid], azi[valid])
         ]
         gdf = self._build_gdf(df, lon, lat, valid, attributes, geoms)
-        return self._write(gdf, output_format)
+        out = self._write(gdf, output_format)
+        return self._apply_color(out, output_format, color, is_point=False)
 
     def get_sheet_info(self, file_path: str) -> dict:
         """读取 Excel 的 sheet 列表和各 sheet 列名"""

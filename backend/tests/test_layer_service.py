@@ -181,3 +181,88 @@ def test_all_zero_azimuth_raises(service, tmp_path):
             azimuth_col="AZIMUTH", radius_m=3000, beamwidth=40.0,
             attributes=["NAME"], output_format="mif",
         )
+
+
+def test_mif_point_color_injected(service, sample_excel):
+    """点 MIF + 颜色 → Symbol 颜色替换为 MapInfo 十进制 RGB，且可读回"""
+    result = service.generate_point_layer(
+        file_path=str(sample_excel), sheet_name="LTE",
+        name_col="NAME", lon_col="LONGITUDE", lat_col="LATITUDE",
+        attributes=["NAME"], output_format="mif", color="#4A90D9",
+    )
+    assert result.suffix == ".mif"
+    text = result.read_text(encoding="utf-8", errors="replace")
+    assert "Symbol (35,4886745," in text
+    import geopandas as gpd
+    gdf = gpd.read_file(result)
+    assert len(gdf) == 2
+
+
+def test_mif_sector_color_injected(service, sample_excel):
+    """扇区 MIF + 颜色 → Brush 颜色替换，且可读回"""
+    result = service.generate_sector_layer(
+        file_path=str(sample_excel), sheet_name="LTE",
+        name_col="NAME", lon_col="LONGITUDE", lat_col="LATITUDE",
+        azimuth_col="AZIMUTH", radius_m=3000, beamwidth=40.0,
+        attributes=["NAME"], output_format="mif", color="#4A90D9",
+    )
+    text = result.read_text(encoding="utf-8", errors="replace")
+    assert "Brush (" in text
+    assert "4886745" in text
+    import geopandas as gpd
+    gdf = gpd.read_file(result)
+    assert len(gdf) == 2
+    assert all(g.geom_type == "Polygon" for g in gdf.geometry)
+
+
+def test_kml_point_color_injected(service, sample_excel):
+    """点 KML + 颜色 → IconStyle color 为 aabbggrr，且可读回"""
+    result = service.generate_point_layer(
+        file_path=str(sample_excel), sheet_name="LTE",
+        name_col="NAME", lon_col="LONGITUDE", lat_col="LATITUDE",
+        attributes=["NAME"], output_format="kml", color="#4A90D9",
+    )
+    assert result.suffix == ".kml"
+    text = result.read_text(encoding="utf-8", errors="replace")
+    assert "<color>ffd9904a</color>" in text
+    import geopandas as gpd
+    gdf = gpd.read_file(result)
+    assert len(gdf) == 2
+
+
+def test_kml_sector_color_injected(service, sample_excel):
+    """扇区 KML + 颜色 → PolyStyle color，且可读回"""
+    result = service.generate_sector_layer(
+        file_path=str(sample_excel), sheet_name="LTE",
+        name_col="NAME", lon_col="LONGITUDE", lat_col="LATITUDE",
+        azimuth_col="AZIMUTH", radius_m=3000, beamwidth=40.0,
+        attributes=["NAME"], output_format="kml", color="#4A90D9",
+    )
+    text = result.read_text(encoding="utf-8", errors="replace")
+    assert "<PolyStyle><color>ffd9904a" in text
+    import geopandas as gpd
+    gdf = gpd.read_file(result)
+    assert len(gdf) == 2
+
+
+def test_tab_color_ignored(service, sample_excel):
+    """TAB + 颜色 → 正常生成（不注入，不报错）"""
+    result = service.generate_point_layer(
+        file_path=str(sample_excel), sheet_name="LTE",
+        name_col="NAME", lon_col="LONGITUDE", lat_col="LATITUDE",
+        attributes=["NAME"], output_format="tab", color="#4A90D9",
+    )
+    assert result.exists()
+    assert result.suffix == ".tab"
+
+
+def test_invalid_color_ignored(service, sample_excel):
+    """非法颜色 → 不注入，文件正常生成"""
+    result = service.generate_point_layer(
+        file_path=str(sample_excel), sheet_name="LTE",
+        name_col="NAME", lon_col="LONGITUDE", lat_col="LATITUDE",
+        attributes=["NAME"], output_format="mif", color="zzz",
+    )
+    text = result.read_text(encoding="utf-8", errors="replace")
+    assert "Symbol (35,0,12)" in text  # 保持默认颜色
+    assert "4886745" not in text
