@@ -951,6 +951,78 @@ export const layerApi = {
   }
 }
 
+// ===== 图层制作（生成 tab/mif/kml）=====
+export interface LayerExcelInfo {
+  sheets: string[]
+  columns: Record<string, string[]>
+}
+
+export interface GenerateLayerResult {
+  filename: string
+  download_url: string
+}
+
+export interface GenerateLayerParams {
+  file: File
+  sheetName: string
+  nameCol: string
+  lonCol: string
+  latCol: string
+  azimuthCol?: string
+  attributes: string[]
+  outputFormat: 'tab' | 'mif' | 'kml'
+  radiusM?: number
+  beamwidth?: number
+}
+
+// 图层制作 API（生成新图层，区别于读取已有图层的 layerApi）
+export const layerToolsApi = {
+  // 读取 Excel 的 sheet 和列信息
+  getExcelInfo: async (file: File): Promise<LayerExcelInfo> => {
+    const formData = new FormData()
+    formData.append('file', file)
+    const res = await uploadClient.post('/layer/excel-info', formData, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+    })
+    return res.data?.data
+  },
+
+  // 生成扇区图层
+  generateSector: async (params: GenerateLayerParams): Promise<GenerateLayerResult> => {
+    const formData = new FormData()
+    formData.append('file', params.file)
+    formData.append('sheet_name', params.sheetName)
+    formData.append('name_col', params.nameCol)
+    formData.append('lon_col', params.lonCol)
+    formData.append('lat_col', params.latCol)
+    formData.append('azimuth_col', params.azimuthCol || '')
+    formData.append('attributes', JSON.stringify(params.attributes))
+    formData.append('output_format', params.outputFormat)
+    if (params.radiusM) formData.append('radius_m', String(params.radiusM))
+    if (params.beamwidth) formData.append('beamwidth', String(params.beamwidth))
+    const res = await uploadClient.post('/layer/sector', formData, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+    })
+    return res.data?.data
+  },
+
+  // 生成点图层
+  generatePoint: async (params: GenerateLayerParams): Promise<GenerateLayerResult> => {
+    const formData = new FormData()
+    formData.append('file', params.file)
+    formData.append('sheet_name', params.sheetName)
+    formData.append('name_col', params.nameCol)
+    formData.append('lon_col', params.lonCol)
+    formData.append('lat_col', params.latCol)
+    formData.append('attributes', JSON.stringify(params.attributes))
+    formData.append('output_format', params.outputFormat)
+    const res = await uploadClient.post('/layer/point', formData, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+    })
+    return res.data?.data
+  },
+}
+
 /**
  * 🔥 后端连接状态管理
  * 提供健康检查轮询和连接状态通知，以便前端组件可以响应后端掉线

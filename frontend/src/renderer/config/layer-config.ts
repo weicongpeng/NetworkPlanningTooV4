@@ -1,0 +1,41 @@
+// 图层制作关键字匹配规则（与后端 GeoFieldDetector 保持一致）
+export interface LayerFieldMatch {
+  type: 'name' | 'longitude' | 'latitude' | 'azimuth'
+  labelKey: string
+  patterns: string[]
+}
+
+export const LAYER_FIELD_MATCHES: LayerFieldMatch[] = [
+  { type: 'name', labelKey: 'layer.fieldName', patterns: ['名称', 'name', '小区名', '站名', 'cell_name', 'site_name', 'NAME'] },
+  { type: 'longitude', labelKey: 'layer.fieldLongitude', patterns: ['经度', 'longitude', 'lng', 'lon', 'long', 'x'] },
+  { type: 'latitude', labelKey: 'layer.fieldLatitude', patterns: ['纬度', 'latitude', 'lat', 'y'] },
+  { type: 'azimuth', labelKey: 'layer.fieldAzimuth', patterns: ['方位角', '方向角', 'azimuth', 'azi', 'azim', 'bearing'] },
+]
+
+// 自动匹配：对给定列名列表，找出每个字段最匹配的列
+export function autoMatchFields(columns: string[], includeAzimuth: boolean): Record<string, string> {
+  const result: Record<string, string> = {}
+  const lowerCols = columns.map(c => c.toLowerCase())
+  for (const match of LAYER_FIELD_MATCHES) {
+    if (match.type === 'azimuth' && !includeAzimuth) continue
+    let found: string | null = null
+    // 精确匹配优先
+    for (let i = 0; i < columns.length; i++) {
+      if (match.patterns.some(p => p.toLowerCase() === lowerCols[i])) { found = columns[i]; break }
+    }
+    // 否则模糊匹配
+    if (!found) {
+      for (let i = 0; i < columns.length; i++) {
+        if (match.patterns.some(p => lowerCols[i].includes(p.toLowerCase()))) { found = columns[i]; break }
+      }
+    }
+    if (found) result[match.type] = found
+  }
+  return result
+}
+
+// 默认参数
+export const LAYER_DEFAULT_PARAMS = {
+  sector: { radiusM: 3000, beamwidth: 40, color: '#4A90D9' },
+  point: { pointSize: 8, color: '#FF0000' },
+}
