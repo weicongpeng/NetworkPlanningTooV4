@@ -63,9 +63,11 @@ class LayerService:
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
     def _read_sheet(self, file_path: str, sheet_name: str) -> pd.DataFrame:
-        """读取指定 sheet，返回 DataFrame"""
+        """读取指定 sheet，返回 DataFrame
+        显式指定 calamine engine，保证 .xls 与 .xlsx 均可读取（无需 xlrd/xlwt）。
+        """
         try:
-            return pd.read_excel(file_path, sheet_name=sheet_name)
+            return pd.read_excel(file_path, sheet_name=sheet_name, engine="calamine")
         except ValueError as e:
             raise ValueError(f"Sheet 不存在: {sheet_name}") from e
 
@@ -83,10 +85,13 @@ class LayerService:
     def _build_gdf(self, df: pd.DataFrame, lon: pd.Series, lat: pd.Series,
                    valid: pd.Series, attributes: List[str], geometry_cols) -> gpd.GeoDataFrame:
         """构建 GeoDataFrame，仅保留有效坐标行和勾选属性列"""
+        if not attributes:
+            raise ValueError("请至少选择一个图层属性列")
         sub = df.loc[valid].copy()
-        for col in list(sub.columns):
-            if col not in attributes:
-                sub = sub.drop(columns=[col])
+        keep = [c for c in sub.columns if c in attributes]
+        if not keep:
+            raise ValueError("所选属性列在数据中不存在，请检查属性列选择")
+        sub = sub[keep]
         gdf = gpd.GeoDataFrame(sub, geometry=geometry_cols, crs="EPSG:4326")
         return gdf
 
@@ -121,6 +126,10 @@ class LayerService:
         valid = valid & azi_ok
         if valid.sum() == 0:
             raise ValueError("方位角数据无效，请检查方位角列选择（0-360度）")
+        # 全零/全空方位角列会被 between(0,360) 静默接受，导致所有扇区退化为朝北楔形
+        nonzero = azi_ok & (azi > 0)
+        if nonzero.sum() == 0:
+            raise ValueError("方位角列全为 0 或空值，无法生成有效扇区，请检查方位角列选择")
         geoms = [
             sector_polygon(y, x, a, beamwidth, radius_m)
             for x, y, a in zip(lon[valid], lat[valid], azi[valid])

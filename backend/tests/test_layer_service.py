@@ -125,3 +125,59 @@ def test_invalid_coordinates_raises(service, tmp_path):
             name_col="NAME", lon_col="LONGITUDE", lat_col="LATITUDE",
             attributes=["NAME"], output_format="tab",
         )
+
+
+def test_read_sheet_uses_calamine_engine(service, sample_excel, monkeypatch):
+    """断言 _read_sheet 显式使用 calamine engine（支持 .xls 无 xlrd）"""
+    captured = {}
+
+    def fake_read_excel(*args, **kwargs):
+        captured["engine"] = kwargs.get("engine")
+        captured["sheet_name"] = kwargs.get("sheet_name")
+        return pd.DataFrame(SAMPLE_DATA)
+
+    monkeypatch.setattr("app.services.layer_service.pd.read_excel", fake_read_excel)
+    df = service._read_sheet(str(sample_excel), "LTE")
+    assert captured["engine"] == "calamine"
+    assert captured["sheet_name"] == "LTE"
+    assert len(df) == 2
+
+
+def test_empty_attributes_raises(service, sample_excel):
+    """空属性列表应抛 ValueError（避免仅 FID+geometry 的无意义输出）"""
+    with pytest.raises(ValueError, match="属性列"):
+        service.generate_point_layer(
+            file_path=str(sample_excel), sheet_name="LTE",
+            name_col="NAME", lon_col="LONGITUDE", lat_col="LATITUDE",
+            attributes=[], output_format="tab",
+        )
+
+
+def test_non_existent_attribute_raises(service, sample_excel):
+    """属性列在数据中不存在应抛 ValueError"""
+    with pytest.raises(ValueError, match="属性列"):
+        service.generate_point_layer(
+            file_path=str(sample_excel), sheet_name="LTE",
+            name_col="NAME", lon_col="LONGITUDE", lat_col="LATITUDE",
+            attributes=["NOT_A_COLUMN"], output_format="tab",
+        )
+
+
+def test_all_zero_azimuth_raises(service, tmp_path):
+    """全零方位角列应抛 ValueError（避免扇区退化为朝北楔形）"""
+    path = tmp_path / "zero_azi.xlsx"
+    df = pd.DataFrame({
+        "NAME": ["A", "B"],
+        "LONGITUDE": [116.3, 116.4],
+        "LATITUDE": [39.9, 40.0],
+        "AZIMUTH": [0.0, 0.0],
+    })
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name="LTE", index=False)
+    with pytest.raises(ValueError, match="方位角"):
+        service.generate_sector_layer(
+            file_path=str(path), sheet_name="LTE",
+            name_col="NAME", lon_col="LONGITUDE", lat_col="LATITUDE",
+            azimuth_col="AZIMUTH", radius_m=3000, beamwidth=40.0,
+            attributes=["NAME"], output_format="mif",
+        )
