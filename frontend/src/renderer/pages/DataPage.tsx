@@ -1396,6 +1396,20 @@ function NewCellEntryCard({
   const [expanded, setExpanded] = useState(false)
   const [importing, setImporting] = useState(false) // 一键导入进行中（覆盖预查重阶段，保证即时反馈）
   const [duplicateMap, setDuplicateMap] = useState<Record<string, 'same' | 'cross'>>({})
+  // 列宽：默认宽度表（基准 70px）+ localStorage 持久化
+  const DEFAULT_COL_WIDTHS: Record<string, number> = {
+    managedElementId: 52, siteId: 52, cellId: 52, cellName: 175,
+    mcc: 52, mnc: 52, longitude: 70, latitude: 70,
+    azimuth: 52, frequency: 52, ssbFrequency: 52, cellCoverType: 70,
+  }
+  const COL_WIDTHS_KEY = 'npt_cell_entry_col_widths'
+  const [colWidths] = useState<Record<string, number>>(() => {
+    try {
+      const saved = localStorage.getItem(COL_WIDTHS_KEY)
+      return saved ? { ...DEFAULT_COL_WIDTHS, ...JSON.parse(saved) } : DEFAULT_COL_WIDTHS
+    } catch { return DEFAULT_COL_WIDTHS }
+  })
+  // 说明：setColWidths 由 useState 提供（未解构），Task 2 表头拖拽手柄使用
 
   const hasFullParams = fullParamFiles.length > 0
 
@@ -1758,8 +1772,8 @@ function NewCellEntryCard({
   }
 
   const isLte = activeTab === 'LTE'
-  const inputCls = 'w-full min-w-[70px] px-1.5 py-1 text-xs bg-background border border-border rounded focus:outline-none focus:ring-1 focus:ring-primary disabled:opacity-50 disabled:cursor-not-allowed'
-  const inputClsExp = 'w-full min-w-[100px] px-2 py-1.5 text-sm bg-background border border-border rounded focus:outline-none focus:ring-1 focus:ring-primary disabled:opacity-50 disabled:cursor-not-allowed'
+  const inputCls = 'w-full min-w-[40px] px-1.5 py-1 text-xs bg-background border border-border rounded focus:outline-none focus:ring-1 focus:ring-primary disabled:opacity-50 disabled:cursor-not-allowed'
+  const inputClsExp = 'w-full min-w-[40px] px-2 py-1.5 text-sm bg-background border border-border rounded focus:outline-none focus:ring-1 focus:ring-primary disabled:opacity-50 disabled:cursor-not-allowed'
   const labelCls = 'text-xs text-muted-foreground text-center leading-tight px-0.5 whitespace-nowrap'
   const curInputCls = expanded ? inputClsExp : inputCls
 
@@ -1845,17 +1859,17 @@ function NewCellEntryCard({
                 />
               </th>
               <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30 w-0'}>{/* 操作列 */}</th>
-              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30'}>{t('newCellEntry.fieldManagedElementId') || '网元ID'}</th>
-              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30'}>{t('newCellEntry.fieldSiteIdLTE') || '基站ID'}</th>
-              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30'}>{t('newCellEntry.fieldCellId') || '小区ID'}</th>
-              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30'}>{t('newCellEntry.fieldCellName') || '小区名称'}</th>
-              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30'}>{t('newCellEntry.fieldMCC') || 'MCC'}</th>
-              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30'}>{t('newCellEntry.fieldMNC') || 'MNC'}</th>
-              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30'}>{t('newCellEntry.fieldLongitude') || '经度'}</th>
-              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30'}>{t('newCellEntry.fieldLatitude') || '纬度'}</th>
-              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30'}>{t('newCellEntry.fieldAzimuth') || '方向角'}</th>
-              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30'}>{isLte ? (t('newCellEntry.fieldFrequency') || '下行频点') : (t('newCellEntry.fieldSsbFrequency') || 'SSB频点')}</th>
-              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30'}>{t('newCellEntry.fieldCellCoverType') || '覆盖类型'}</th>
+              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30'} style={{ width: colWidths.managedElementId }}>{t('newCellEntry.fieldManagedElementId') || '网元ID'}</th>
+              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30'} style={{ width: colWidths.siteId }}>{t('newCellEntry.fieldSiteIdLTE') || '基站ID'}</th>
+              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30'} style={{ width: colWidths.cellId }}>{t('newCellEntry.fieldCellId') || '小区ID'}</th>
+              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30'} style={{ width: colWidths.cellName }}>{t('newCellEntry.fieldCellName') || '小区名称'}</th>
+              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30'} style={{ width: colWidths.mcc }}>{t('newCellEntry.fieldMCC') || 'MCC'}</th>
+              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30'} style={{ width: colWidths.mnc }}>{t('newCellEntry.fieldMNC') || 'MNC'}</th>
+              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30'} style={{ width: colWidths.longitude }}>{t('newCellEntry.fieldLongitude') || '经度'}</th>
+              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30'} style={{ width: colWidths.latitude }}>{t('newCellEntry.fieldLatitude') || '纬度'}</th>
+              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30'} style={{ width: colWidths.azimuth }}>{t('newCellEntry.fieldAzimuth') || '方向角'}</th>
+              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30'} style={{ width: isLte ? colWidths.frequency : colWidths.ssbFrequency }}>{isLte ? (t('newCellEntry.fieldFrequency') || '下行频点') : (t('newCellEntry.fieldSsbFrequency') || 'SSB频点')}</th>
+              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30'} style={{ width: colWidths.cellCoverType }}>{t('newCellEntry.fieldCellCoverType') || '覆盖类型'}</th>
             </tr>
           </thead>
           <tbody>
