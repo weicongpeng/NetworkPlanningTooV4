@@ -1512,6 +1512,19 @@ function NewCellEntryCard({
     }))
   }
 
+  // 方向角输入：过滤数字后若超范围(>360)则提示并拒绝写入,否则正常更新
+  const handleAzimuthChange = (rowId: string, value: string) => {
+    const cleaned = filterDigits(value)
+    if (cleaned === '') { updateRow(rowId, 'azimuth', ''); return } // 允许清空
+    const num = parseInt(cleaned, 10)
+    if (!isNaN(num) && num > 360) {
+      setBatchError(t('newCellEntry.azimuthRangeError') || '方向角必须在 0-360 之间')
+      setTimeout(() => setBatchError(null), 3000)
+      return // 拒绝输入，保留原值
+    }
+    updateRow(rowId, 'azimuth', cleaned)
+  }
+
   // 列字段顺序表（与表头一致），标注每列粘贴过滤类型
   const FIELD_ORDER: Array<{ key: keyof CellRow; kind: 'digits' | 'numeric' | 'text' | 'cover' }> = [
     { key: 'managedElementId', kind: 'digits' },
@@ -2025,7 +2038,7 @@ function NewCellEntryCard({
                     <input className={curInputCls} data-field="latitude" type="text" inputMode="decimal" value={row.latitude} onChange={e => updateRow(row.id, 'latitude', filterNumeric(e.target.value))} disabled={!hasFullParams || isAddingCell} placeholder="23.0" />
                   </td>
                   <td className="border border-border px-1 py-1">
-                    <input className={curInputCls} data-field="azimuth" type="text" inputMode="numeric" value={row.azimuth} onChange={e => updateRow(row.id, 'azimuth', filterDigits(e.target.value))} disabled={!hasFullParams || isAddingCell} placeholder="0-360" />
+                    <input className={curInputCls} data-field="azimuth" type="text" inputMode="numeric" value={row.azimuth} onChange={e => handleAzimuthChange(row.id, e.target.value)} disabled={!hasFullParams || isAddingCell} placeholder="0-360" />
                   </td>
                   <td className="border border-border px-1 py-1">
                     {isLte ? (
