@@ -1060,6 +1060,7 @@ async def complete_chunked_upload(
             "data": {
                 "file_path": str(dest),
                 "name": safe_filename,
+                "source_filename": safe_filename,  # 原始文件名（未重命名），供 /layer/* 命名输出
             },
         }
     elif file_type == "geo_data":

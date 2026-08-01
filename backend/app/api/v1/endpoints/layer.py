@@ -41,12 +41,17 @@ def _finalize_output(out: Path, output_format: str) -> dict:
     return {"filename": out.name, "download_url": f"/layer-files/{out.name}"}
 
 
-def _save_upload(file: Optional[UploadFile], file_path: Optional[str]) -> Path:
-    """返回 Excel 文件的本地路径（副本，调用方 finally 删除）。
+def _save_upload(file: Optional[UploadFile], file_path: Optional[str],
+                 source_filename: Optional[str] = None) -> tuple:
+    """返回 (Excel 本地路径副本, 原始文件名)。调用方 finally 删除副本。
 
     file_path 模式复制到新的 src_{uuid}.xlsx（不改动原分块文件，可多次复用；端点永不对
     客户端传入的原路径 unlink，避免任意文件删除）。原分块文件由 layer_tmp TTL 清扫统一管理。
     file 模式写入临时文件。
+
+    source_filename: 客户端显式携带的原始文件名（分块上传时由 complete 端点提供，
+    避免 _save_upload 重命名 src_{uuid}.xlsx 导致输出文件名丢失原始名）。不提供时
+    file 模式用 file.filename，file_path 模式用 file_path 的文件名。
     """
     if not file and not file_path:
         raise HTTPException(status_code=400, detail="未提供文件")
@@ -61,7 +66,8 @@ def _save_upload(file: Optional[UploadFile], file_path: Optional[str]) -> Path:
             raise HTTPException(status_code=400, detail="仅支持 Excel 文件（.xlsx/.xls）")
         dest = tmp_dir / f"src_{uuid.uuid4().hex[:8]}{src.suffix.lower()}"
         shutil.copy2(src, dest)  # 复制到独立临时文件，finally 删副本
-        return dest
+        original_name = source_filename or Path(file_path).name
+        return dest, original_name
 
     suffix = Path(file.filename or "src.xlsx").suffix.lower()
     if suffix not in ALLOWED_EXTS:
@@ -70,19 +76,21 @@ def _save_upload(file: Optional[UploadFile], file_path: Optional[str]) -> Path:
     dest = tmp_dir / name
     with open(dest, "wb") as f:
         f.write(file.file.read())
-    return dest
+    original_name = source_filename or (file.filename or "src.xlsx")
+    return dest, original_name
 
 
 @router.post("/excel-info")
 async def excel_info(
     file: Optional[UploadFile] = None,
     file_path: Optional[str] = Form(None),
+    source_filename: Optional[str] = Form(None),
     current_user=Depends(require_data_import),
 ):
     """读取 Excel 的 sheet 列表和各 sheet 列名"""
     src = None
     try:
-        src = _save_upload(file, file_path)
+        src, _ = _save_upload(file, file_path, source_filename)
         result = await run_in_threadpool(layer_service.get_sheet_info, str(src))
         return {"success": True, "data": result}
     except HTTPException:
@@ -109,17 +117,18 @@ async def generate_point(
     attributes: str = Form("[]"),  # JSON 数组字符串
     output_format: str = Form("tab"),
     color: Optional[str] = Form(None),
+    source_filename: Optional[str] = Form(None),
     current_user=Depends(require_data_import),
 ):
     """生成点图层，返回下载 URL"""
     src = None
     try:
-        src = _save_upload(file, file_path)
+        src, original_name = _save_upload(file, file_path, source_filename)
         attr_list = json.loads(attributes) if attributes else []
         out = await run_in_threadpool(
             layer_service.generate_point_layer,
             str(src), sheet_name, name_col, lon_col, lat_col, attr_list, output_format,
-            color or None,
+            color or None, original_name,
         )
         return {"success": True, "data": _finalize_output(out, output_format)}
     except HTTPException:
@@ -149,18 +158,19 @@ async def generate_sector(
     attributes: str = Form("[]"),
     output_format: str = Form("tab"),
     color: Optional[str] = Form(None),
+    source_filename: Optional[str] = Form(None),
     current_user=Depends(require_data_import),
 ):
     """生成扇区图层，返回下载 URL"""
     src = None
     try:
-        src = _save_upload(file, file_path)
+        src, original_name = _save_upload(file, file_path, source_filename)
         attr_list = json.loads(attributes) if attributes else []
         out = await run_in_threadpool(
             layer_service.generate_sector_layer,
             str(src), sheet_name, name_col, lon_col, lat_col, azimuth_col,
             radius_m, beamwidth, attr_list, output_format,
-            color or None,
+            color or None, original_name,
         )
         return {"success": True, "data": _finalize_output(out, output_format)}
     except HTTPException:

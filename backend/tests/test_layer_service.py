@@ -323,3 +323,59 @@ def test_output_filename_uses_source_and_sheet(tmp_path):
     # 命名 = 源文件名(stem) + sheet 名 + 短uuid
     assert out.stem.startswith("工参2026_LTE_")
     assert out.suffix == ".tab"
+
+
+def test_source_filename_param_honored(tmp_path):
+    """显式传 source_filename → 输出文件名以它开头（覆盖从 file_path 推导，应对 _save_upload 重命名）"""
+    path = tmp_path / "src_abcd1234.xlsx"
+    pd.DataFrame({
+        "NAME": ["A"], "LONGITUDE": [116.3], "LATITUDE": [39.9],
+    }).to_excel(path, sheet_name="LTE", index=False)
+    svc = LayerService(output_dir=tmp_path)
+    out = svc.generate_point_layer(
+        file_path=str(path), sheet_name="LTE",
+        name_col="NAME", lon_col="LONGITUDE", lat_col="LATITUDE",
+        attributes=["NAME"], output_format="tab",
+        source_filename="工参2026.xlsx",
+    )
+    assert out.stem.startswith("工参2026_LTE_")
+    assert not out.stem.startswith("src_abcd1234")
+
+
+def test_long_chinese_filename_truncated(tmp_path):
+    """超长中文文件名（80 字=240 字节）+ 长 sheet → 旧 char 截断产出的 >255 字节文件名会 OSError。
+    修复后按字节截断，不崩溃，输出文件名在 ext4 255 字节内。"""
+    long_name = "工" * 80  # 240 字节 stem；+ .xlsx 扩展名 = 245 字节，文件可创建（NAME_MAX=255）
+    path = tmp_path / f"{long_name}.xlsx"
+    pd.DataFrame({
+        "NAME": ["A"], "LONGITUDE": [116.3], "LATITUDE": [39.9],
+    }).to_excel(path, sheet_name="长" * 10, index=False)  # sheet 名 30 字节
+    svc = LayerService(output_dir=tmp_path)
+    out = svc.generate_point_layer(
+        file_path=str(path), sheet_name="长" * 10,
+        name_col="NAME", lon_col="LONGITUDE", lat_col="LATITUDE",
+        attributes=["NAME"], output_format="tab",
+    )
+    assert out.exists()
+    # ext4 255 字节限制
+    assert len(out.name.encode("utf-8")) < 255
+    # 输出文件名以被截断的源文件名前缀开头，并保留完整 sheet 名
+    assert out.stem.startswith("工")
+    assert "长" * 10 in out.stem
+
+
+def test_sheet_name_illegal_chars_sanitized(tmp_path):
+    """sheet 名含非法字符（Excel 允许的 <>）→ 输出文件名中替换为 _"""
+    path = tmp_path / "源数据.xlsx"
+    pd.DataFrame({
+        "NAME": ["A"], "LONGITUDE": [116.3], "LATITUDE": [39.9],
+    }).to_excel(path, sheet_name="LTE<NR>", index=False)
+    svc = LayerService(output_dir=tmp_path)
+    out = svc.generate_point_layer(
+        file_path=str(path), sheet_name="LTE<NR>",
+        name_col="NAME", lon_col="LONGITUDE", lat_col="LATITUDE",
+        attributes=["NAME"], output_format="tab",
+    )
+    assert out.stem.startswith("源数据_LTE_")
+    assert "LTE" in out.stem and "NR" in out.stem
+    assert "<" not in out.stem and ">" not in out.stem

@@ -337,6 +337,68 @@ def test_chunked_upload_layer_file_type():
         os.remove(path)
 
 
+def test_chunked_upload_layer_returns_source_filename():
+    """分块上传 + file_type='layer' 应返回 source_filename（原始文件名，非 src_ 重命名）"""
+    path = tempfile.mktemp(suffix=".xlsx")
+    pd.DataFrame({"NAME": ["A"], "LONGITUDE": [116.3], "LATITUDE": [39.9]}).to_excel(path, sheet_name="S", index=False)
+    file_size = os.path.getsize(path)
+
+    client = _make_client()
+
+    try:
+        # start（文件名带中文，验证 safe_filename 原样返回）
+        r = client.post("/api/v1/data/upload/start",
+            data={"filename": "工参2026.xlsx", "total_chunks": "1", "total_size": str(file_size)})
+        assert r.status_code == 200
+        data_id = r.json()["data"]["id"]
+
+        with open(path, "rb") as f:
+            r2 = client.post(f"/api/v1/data/upload/{data_id}/chunk",
+                data={"chunk_index": "0"},
+                files={"file": ("chunk", f, "application/octet-stream")})
+        assert r2.status_code == 200
+
+        r3 = client.post(f"/api/v1/data/upload/{data_id}/complete",
+            data={"filename": "工参2026.xlsx", "file_type": "layer"})
+        assert r3.status_code == 200
+        body = r3.json()
+        assert body["success"] is True
+        assert body["data"]["source_filename"] == "工参2026.xlsx"
+        # 路径仍是重命名后的 src_ 副本，但原始名单独携带
+        assert "src_" in Path(body["data"]["file_path"]).name
+    finally:
+        os.remove(path)
+
+
+def test_layer_point_endpoint_uses_source_filename_in_download_name():
+    """端点传 source_filename → 下载文件名以原始源文件名开头（而非 src_ 副本名）"""
+    path = _make_excel()
+    client = _make_client()
+    try:
+        with open(path, "rb") as f:
+            resp = client.post(
+                "/api/v1/layer/point",
+                files={"file": ("sample.xlsx", f, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+                data={
+                    "sheet_name": "LTE",
+                    "name_col": "NAME",
+                    "lon_col": "LONGITUDE",
+                    "lat_col": "LATITUDE",
+                    "attributes": '["NAME"]',
+                    "output_format": "tab",
+                    "source_filename": "工参2026.xlsx",
+                },
+            )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["success"] is True
+        filename = body["data"]["filename"]
+        assert filename.startswith("工参2026_LTE_")
+        assert filename.endswith(".zip")
+    finally:
+        os.remove(path)
+
+
 def test_layer_endpoints_accept_file_path():
     """图层端点应接受 file_path（分块上传后的本地路径）而非必须 multipart file。
 

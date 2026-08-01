@@ -83,6 +83,14 @@ def hex_to_kml_color(color: Optional[str]) -> Optional[str]:
         return None
 
 
+def _truncate_bytes(s: str, max_bytes: int) -> str:
+    """按 UTF-8 字节截断，避免截断中文字符中间（ext4 NAME_MAX=255 字节）"""
+    b = s.encode('utf-8')
+    if len(b) <= max_bytes:
+        return s
+    return b[:max_bytes].decode('utf-8', errors='ignore')
+
+
 class LayerService:
     """图层制作服务"""
 
@@ -143,13 +151,13 @@ class LayerService:
 
     def _write(self, gdf: gpd.GeoDataFrame, output_format: str,
                source_filename: str, sheet_name: str) -> Path:
-        """写入文件，返回路径。文件名 = 源文件名 + sheet名 + 短uuid"""
+        """写入文件，返回路径。文件名 = 源文件名 + sheet名 + 短uuid。
+        base 按 100 字节、sheet 按 50 字节截断，总长 ~165 字节 < ext4 NAME_MAX 255。
+        """
         if output_format not in DRIVER_MAP:
             raise ValueError(f"不支持的输出格式: {output_format}")
-        base = Path(source_filename).stem
-        if len(base) > 80:
-            base = base[:60]  # 超长源文件名截断，避免文件系统文件名过长
-        safe_sheet = re.sub(r'[<>:"/\\|?*]', "_", sheet_name)
+        base = _truncate_bytes(Path(source_filename).stem, 100)
+        safe_sheet = _truncate_bytes(re.sub(r'[<>:"/\\|?*]', "_", sheet_name), 50)
         fname = f"{base}_{safe_sheet}_{uuid.uuid4().hex[:8]}{EXT_MAP[output_format]}"
         out_path = self.output_dir / fname
         gdf.to_file(out_path, driver=DRIVER_MAP[output_format])
@@ -203,23 +211,33 @@ class LayerService:
     def generate_point_layer(self, file_path: str, sheet_name: str,
                              name_col: str, lon_col: str, lat_col: str,
                              attributes: List[str], output_format: str,
-                             color: Optional[str] = None) -> Path:
-        """生成点图层，返回输出文件路径"""
+                             color: Optional[str] = None,
+                             source_filename: Optional[str] = None) -> Path:
+        """生成点图层，返回输出文件路径。
+        source_filename: 原始源文件名（未被 _save_upload 重命名），用于输出文件命名。
+        不提供时回退到 file_path 的文件名。
+        """
         df = self._read_sheet(file_path, sheet_name)
         lon, lat, valid = self._coerce_coords(df, lon_col, lat_col)
         geoms = [Point(x, y) for x, y in zip(lon[valid], lat[valid])]
         gdf = self._build_gdf(df, lon, lat, valid, attributes, geoms, keep_cols_extra=[name_col])
         if output_format == "kml":
             gdf = self._ensure_kml_name(gdf, name_col)
-        out = self._write(gdf, output_format, source_filename=Path(file_path).name, sheet_name=sheet_name)
+        out = self._write(gdf, output_format,
+                          source_filename=source_filename or Path(file_path).name,
+                          sheet_name=sheet_name)
         return self._apply_color(out, output_format, color, is_point=True)
 
     def generate_sector_layer(self, file_path: str, sheet_name: str,
                               name_col: str, lon_col: str, lat_col: str,
                               azimuth_col: str, radius_m: float, beamwidth: float,
                               attributes: List[str], output_format: str,
-                              color: Optional[str] = None) -> Path:
-        """生成扇区图层，返回输出文件路径"""
+                              color: Optional[str] = None,
+                              source_filename: Optional[str] = None) -> Path:
+        """生成扇区图层，返回输出文件路径。
+        source_filename: 原始源文件名（未被 _save_upload 重命名），用于输出文件命名。
+        不提供时回退到 file_path 的文件名。
+        """
         df = self._read_sheet(file_path, sheet_name)
         lon, lat, valid = self._coerce_coords(df, lon_col, lat_col)
         azi = pd.to_numeric(df[azimuth_col], errors="coerce")
@@ -238,7 +256,9 @@ class LayerService:
         gdf = self._build_gdf(df, lon, lat, valid, attributes, geoms, keep_cols_extra=[name_col])
         if output_format == "kml":
             gdf = self._ensure_kml_name(gdf, name_col)
-        out = self._write(gdf, output_format, source_filename=Path(file_path).name, sheet_name=sheet_name)
+        out = self._write(gdf, output_format,
+                          source_filename=source_filename or Path(file_path).name,
+                          sheet_name=sheet_name)
         return self._apply_color(out, output_format, color, is_point=False)
 
     def get_sheet_info(self, file_path: str) -> dict:
