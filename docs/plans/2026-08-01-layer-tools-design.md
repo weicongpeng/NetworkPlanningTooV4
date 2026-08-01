@@ -110,6 +110,8 @@ generate_point_layer(file, config) -> {file_url}
   1-2 同上；3. 点 = Point(lng, lat)；4-5 同上（driver 同扇区）
 ```
 
+- **下载打包**（2026-08-01 实现决策）：TAB 生成 4 个文件（.tab/.dat/.id/.map）、MIF 生成 2 个（.mif/.mid），端点将整套同名文件打包成 `.zip` 返回下载；KML 单文件直接下载。
+- **标签名称**（2026-08-01 实现决策）：`name_col` 列在 KML 写入前改名为 `Name`（GDAL KML 驱动约定），确保标签名真正写入 `<name>`；TAB/MIF 中作为属性列保留。
 - **WGS84**：直接 `crs='EPSG:4326'`。
 - **样式/颜色**（2026-08-01 实现决策）：
   - **MIF**：pyogrio 生成后文本后处理，替换 `Symbol`/`Brush` 行注入颜色（`R*65536+G*256+B` 十进制，已验证可被 GDAL 读回）。
