@@ -63,6 +63,17 @@ uploadClient.interceptors.request.use(
           ])
         : 'N/A'
     })
+    // 附加认证 token（与 apiClient 拦截器一致，分块上传端点已挂权限校验）
+    const stored = localStorage.getItem('auth-storage')
+    if (stored) {
+      try {
+        const parsed = JSON.parse(stored)
+        const token = parsed?.state?.token
+        if (token) {
+          config.headers.Authorization = `Bearer ${token}`
+        }
+      } catch { /* ignore parse errors */ }
+    }
     // 不要修改 Content-Type，让 axios 自动处理 FormData
     return config
   },
