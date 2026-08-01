@@ -1515,7 +1515,7 @@ function NewCellEntryCard({
     { key: 'cellCoverType', kind: 'cover' },
   ]
 
-  // 多行多列粘贴：从 Excel/文本复制 tab 分隔内容，按列顺序填充并自动扩充行数
+  // 多行多列粘贴：从光标所在字段列开始，按剪贴板内容顺序逐列填充（逐列校验过滤，不符保留原值）
   const handlePaste = (e: React.ClipboardEvent) => {
     if (!hasFullParams || isAddingCell || importing) return
     const text = e.clipboardData.getData('text/plain')
@@ -1525,35 +1525,46 @@ function NewCellEntryCard({
     const lines = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n').filter(l => l.trim() !== '')
     if (lines.length === 0) return
 
-    // 粘贴锚点：只接管聚焦在表格行内的粘贴
+    // 行锚点：只接管聚焦在表格行内的粘贴
     const activeTr = (document.activeElement as HTMLElement | null)?.closest?.('tr') as HTMLTableRowElement | null
     const anchorId = activeTr?.dataset?.rowId
     if (!anchorId) return // 聚焦不在表格行内,不接管粘贴
     const idx = rows[activeTab].findIndex(r => r.id === anchorId)
     const anchor = idx >= 0 ? idx : 0
 
+    // 列锚点：光标所在输入框/下拉框的字段列 → 剪贴板第 1 列
+    const activeInput = (document.activeElement as HTMLElement | null)?.closest?.('input, select') as HTMLInputElement | HTMLSelectElement | null
+    const focusField = activeInput?.dataset?.field as keyof CellRow | undefined
+    if (!focusField) return // 聚焦不在输入框内
+    const startCol = FIELD_ORDER.findIndex(f => f.key === focusField)
+    if (startCol < 0) return
+
     const isLteTab = activeTab === 'LTE'
-    // 列顺序：网元ID、基站ID、小区ID、小区名称、MCC、MNC、经度、纬度、方向角、频点、覆盖类型
     const nextRows = rows[activeTab].map(r => ({ ...r }))
     let rowIdx = anchor
     for (const line of lines) {
       const cols = line.split('\t')
-      const get = (i: number) => (cols[i] ?? '').trim()
       const base = nextRows[rowIdx] ?? createEmptyRow()
-      const next: CellRow = {
-        ...base,
-        managedElementId: get(0) ? filterDigits(get(0)) : base.managedElementId,
-        siteId: get(1) ? filterDigits(get(1)) : base.siteId,
-        cellId: get(2) ? filterDigits(get(2)) : base.cellId,
-        cellName: get(3) || base.cellName,
-        mcc: get(4) ? filterDigits(get(4)) : base.mcc,
-        mnc: get(5) ? filterDigits(get(5)).slice(0, 2) : base.mnc,
-        longitude: get(6) ? filterNumeric(get(6)) : base.longitude,
-        latitude: get(7) ? filterNumeric(get(7)) : base.latitude,
-        azimuth: get(8) ? filterDigits(get(8)) : base.azimuth,
-        frequency: isLteTab && get(9) ? filterNumeric(get(9)) : base.frequency,
-        ssbFrequency: !isLteTab && get(9) ? filterNumeric(get(9)) : base.ssbFrequency,
-        cellCoverType: get(10) ? (parseInt(get(10), 10) === 4 ? 4 : 1) : base.cellCoverType,
+      const next: CellRow = { ...base }
+      // 动态键赋值：keyof CellRow 联合键直接赋值会退化为 never，需经 Record 视图写入
+      const target = next as unknown as Record<string, string | number>
+      // 从 startCol 开始映射：剪贴板第 j 列 → 表列 startCol+j
+      for (let j = 0; startCol + j < FIELD_ORDER.length; j++) {
+        const field = FIELD_ORDER[startCol + j]
+        if (field.key === 'frequency' && !isLteTab) continue
+        if (field.key === 'ssbFrequency' && isLteTab) continue
+        const raw = (cols[j] ?? '').trim()
+        if (raw === '') continue // 空单元格不填充
+        // 按 kind 校验过滤：不符则跳过该列（保留 base 原值）
+        if (field.kind === 'digits' && /^\d+$/.test(raw)) {
+          target[field.key] = field.key === 'mnc' ? raw.slice(0, 2) : raw
+        } else if (field.kind === 'numeric' && /^-?\d+(\.\d+)?$/.test(raw)) {
+          target[field.key] = raw
+        } else if (field.kind === 'text') {
+          target[field.key] = raw
+        } else if (field.kind === 'cover' && (raw === '1' || raw === '4')) {
+          target[field.key] = parseInt(raw, 10)
+        }
       }
       if (rowIdx < nextRows.length) nextRows[rowIdx] = next
       else nextRows.push(next)
