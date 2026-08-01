@@ -1592,19 +1592,21 @@ function NewCellEntryCard({
     e.stopPropagation()
     const startX = e.clientX
     const startWidth = colWidths[colKey] ?? DEFAULT_COL_WIDTHS[colKey] ?? 70
+    let lastWidth = startWidth
     const onMove = (ev: MouseEvent) => {
+      if (ev.buttons === 0) { onUp(); return } // 丢失 mouseup 时兜底
       const delta = ev.clientX - startX
       const next = Math.max(40, startWidth + delta)
+      lastWidth = next
       setColWidths(prev => ({ ...prev, [colKey]: next }))
     }
     const onUp = () => {
       window.removeEventListener('mousemove', onMove)
       window.removeEventListener('mouseup', onUp)
-      // 结束时持久化（从最新 state 读）
-      setColWidths(prev => {
-        try { localStorage.setItem(COL_WIDTHS_KEY, JSON.stringify(prev)) } catch { /* ignore */ }
-        return prev
-      })
+      try {
+        const merged = { ...DEFAULT_COL_WIDTHS, ...colWidths, [colKey]: lastWidth }
+        localStorage.setItem(COL_WIDTHS_KEY, JSON.stringify(merged))
+      } catch { /* ignore */ }
     }
     window.addEventListener('mousemove', onMove)
     window.addEventListener('mouseup', onUp)
