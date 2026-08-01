@@ -231,6 +231,11 @@ def create_app() -> FastAPI:
     settings.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     app.mount("/static", StaticFiles(directory=str(settings.OUTPUT_DIR)), name="static")
 
+    # 图层制作输出文件（下载）
+    layers_dir = settings.UPLOAD_DIR / "layers"
+    layers_dir.mkdir(parents=True, exist_ok=True)
+    app.mount("/layer-files", StaticFiles(directory=str(layers_dir)), name="layer-files")
+
     def _serve_index():
         """读取 index.html 并返回 HTML 响应（禁用缓存）"""
         index_path = FRONTEND_DIST / "index.html"
