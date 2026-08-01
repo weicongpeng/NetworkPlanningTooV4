@@ -28,6 +28,8 @@ def _zip_layer(out_path: Path) -> Path:
     zip_path = out_path.parent / f"{base}.zip"
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
         for f in out_path.parent.glob(f"{base}.*"):
+            if f.name == zip_path.name:
+                continue  # 跳过 zip 自身，避免嵌套损坏的自入口
             zf.write(f, arcname=f.name)
     return zip_path
 
