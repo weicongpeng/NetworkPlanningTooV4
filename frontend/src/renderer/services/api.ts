@@ -341,12 +341,14 @@ function backoffDelay(retries: number): number {
  * 串行避免后端单 worker（NPT_WORKERS=1）下并行请求排队导致 Cloudflare 502
  * @param file 要上传的文件
  * @param basePath 上传端点的基础路径（如 '/data/upload'）
- * @param fileType 可选的文件类型：'excel' | 'geo_data'
+ * @param fileType 可选的文件类型：'excel' | 'geo_data' | 'layer'
+ * @param onProgress 可选的分块进度回调（0-99 封顶，100 由 complete 后触发）
  */
 async function chunkedUpload(
   file: File,
   basePath: string,
-  fileType?: string
+  fileType?: string,
+  onProgress?: (percent: number) => void,
 ): Promise<any> {
   const chunkSize = calcChunkSize(file.size)
   const totalChunks = Math.ceil(file.size / chunkSize)
@@ -382,6 +384,7 @@ async function chunkedUpload(
 
         await uploadClient.post(`${basePath}/${dataId}/chunk`, chunkForm)
         success = true
+        onProgress?.(Math.round(((i + 1) / totalChunks) * 99))  // 99% 封顶，留给 complete
         console.log(`[chunkedUpload] 分块 ${i + 1}/${totalChunks} 完成 (${end - start} 字节)`)
       } catch (err) {
         retries++
@@ -405,6 +408,7 @@ async function chunkedUpload(
   }
 
   const completeResp = await uploadClient.post(`${basePath}/${dataId}/complete`, completeForm)
+  onProgress?.(100)
   console.log('[chunkedUpload] 文件重组完成，开始后台处理')
 
   const result = completeResp
@@ -963,7 +967,8 @@ export interface GenerateLayerResult {
 }
 
 export interface GenerateLayerParams {
-  file: File
+  filePath: string        // 分块上传后的服务器路径
+  sourceFilename?: string // 原始源文件名（用于输出命名）
   sheetName: string
   nameCol: string
   lonCol: string
@@ -976,22 +981,49 @@ export interface GenerateLayerParams {
   color?: string
 }
 
+export interface LayerUploadResult {
+  file_path: string
+  source_filename: string
+  name: string
+}
+
 // 图层制作 API（生成新图层，区别于读取已有图层的 layerApi）
 export const layerToolsApi = {
-  // 读取 Excel 的 sheet 和列信息
-  getExcelInfo: async (file: File): Promise<LayerExcelInfo> => {
-    const formData = new FormData()
-    formData.append('file', file)
-    const res = await uploadClient.post('/layer/excel-info', formData, {
-      headers: { 'Content-Type': 'multipart/form-data' },
+  // 分块上传 Excel 文件，返回 file_path + source_filename（进度回调）
+  uploadLayerFile: async (
+    file: File,
+    onProgress?: (p: { percent: number; step: 'uploading' | 'assembling' | 'done' }) => void,
+  ): Promise<LayerUploadResult> => {
+    onProgress?.({ percent: 0, step: 'uploading' })
+    const result = await chunkedUpload(file, '/data/upload', 'layer', (p) => {
+      onProgress?.({ percent: p, step: 'uploading' })
     })
+    onProgress?.({ percent: 100, step: 'assembling' })
+    const data = result?.data
+    if (!data?.file_path) {
+      throw new Error('文件上传失败，未获取到文件路径')
+    }
+    return {
+      file_path: data.file_path,
+      source_filename: data.source_filename || file.name,
+      name: data.name || file.name,
+    }
+  },
+
+  // 读取 Excel 的 sheet 和列信息（用 file_path）
+  getExcelInfo: async (filePath: string, sourceFilename?: string): Promise<LayerExcelInfo> => {
+    const formData = new FormData()
+    formData.append('file_path', filePath)
+    if (sourceFilename) formData.append('source_filename', sourceFilename)
+    const res = await uploadClient.post('/layer/excel-info', formData)
     return res.data
   },
 
-  // 生成扇区图层
+  // 生成扇区图层（用 file_path）
   generateSector: async (params: GenerateLayerParams): Promise<GenerateLayerResult> => {
     const formData = new FormData()
-    formData.append('file', params.file)
+    formData.append('file_path', params.filePath)
+    if (params.sourceFilename) formData.append('source_filename', params.sourceFilename)
     formData.append('sheet_name', params.sheetName)
     formData.append('name_col', params.nameCol)
     formData.append('lon_col', params.lonCol)
@@ -1002,16 +1034,15 @@ export const layerToolsApi = {
     if (params.radiusM) formData.append('radius_m', String(params.radiusM))
     if (params.beamwidth) formData.append('beamwidth', String(params.beamwidth))
     if (params.color) formData.append('color', params.color)
-    const res = await uploadClient.post('/layer/sector', formData, {
-      headers: { 'Content-Type': 'multipart/form-data' },
-    })
+    const res = await uploadClient.post('/layer/sector', formData)
     return res.data
   },
 
-  // 生成点图层
+  // 生成点图层（用 file_path）
   generatePoint: async (params: GenerateLayerParams): Promise<GenerateLayerResult> => {
     const formData = new FormData()
-    formData.append('file', params.file)
+    formData.append('file_path', params.filePath)
+    if (params.sourceFilename) formData.append('source_filename', params.sourceFilename)
     formData.append('sheet_name', params.sheetName)
     formData.append('name_col', params.nameCol)
     formData.append('lon_col', params.lonCol)
@@ -1019,9 +1050,7 @@ export const layerToolsApi = {
     formData.append('attributes', JSON.stringify(params.attributes))
     formData.append('output_format', params.outputFormat)
     if (params.color) formData.append('color', params.color)
-    const res = await uploadClient.post('/layer/point', formData, {
-      headers: { 'Content-Type': 'multipart/form-data' },
-    })
+    const res = await uploadClient.post('/layer/point', formData)
     return res.data
   },
 }
