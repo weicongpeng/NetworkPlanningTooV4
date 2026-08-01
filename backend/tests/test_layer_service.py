@@ -55,7 +55,7 @@ def test_sector_polygon_geometry():
 
 def test_generate_point_layer(service, sample_excel):
     """生成点图层并断言可读回"""
-    result = service.generate_point_layer(
+    result, _ = service.generate_point_layer(
         file_path=str(sample_excel),
         sheet_name="LTE",
         name_col="NAME",
@@ -74,7 +74,7 @@ def test_generate_point_layer(service, sample_excel):
 
 def test_generate_sector_layer(service, sample_excel):
     """生成扇区图层并断言几何为多边形"""
-    result = service.generate_sector_layer(
+    result, _ = service.generate_sector_layer(
         file_path=str(sample_excel),
         sheet_name="LTE",
         name_col="NAME",
@@ -95,7 +95,7 @@ def test_generate_sector_layer(service, sample_excel):
 
 def test_generate_sector_layer_kml(service, sample_excel):
     """扇区图层输出 KML 格式"""
-    result = service.generate_sector_layer(
+    result, _ = service.generate_sector_layer(
         file_path=str(sample_excel),
         sheet_name="LTE",
         name_col="NAME",
@@ -113,13 +113,13 @@ def test_generate_sector_layer_kml(service, sample_excel):
     assert "<kml" in content.lower()
 
 
-def test_invalid_coordinates_raises(service, tmp_path):
-    """非法经纬度（如 999）应抛异常"""
+def test_all_rows_invalid_raises(service, tmp_path):
+    """所有行坐标无效 → 仍抛 ValueError（success=0）"""
     path = tmp_path / "bad.xlsx"
     df = pd.DataFrame({"NAME": ["X"], "LONGITUDE": [999], "LATITUDE": [999]})
     with pd.ExcelWriter(path, engine="openpyxl") as writer:
         df.to_excel(writer, sheet_name="S", index=False)
-    with pytest.raises(ValueError, match="经纬度"):
+    with pytest.raises(ValueError, match="校验失败"):
         service.generate_point_layer(
             file_path=str(path), sheet_name="S",
             name_col="NAME", lon_col="LONGITUDE", lat_col="LATITUDE",
@@ -185,7 +185,7 @@ def test_all_zero_azimuth_raises(service, tmp_path):
 
 def test_mif_point_color_injected(service, sample_excel):
     """点 MIF + 颜色 → Symbol 颜色替换为 MapInfo 十进制 RGB，且可读回"""
-    result = service.generate_point_layer(
+    result, _ = service.generate_point_layer(
         file_path=str(sample_excel), sheet_name="LTE",
         name_col="NAME", lon_col="LONGITUDE", lat_col="LATITUDE",
         attributes=["NAME"], output_format="mif", color="#4A90D9",
@@ -200,7 +200,7 @@ def test_mif_point_color_injected(service, sample_excel):
 
 def test_mif_sector_color_injected(service, sample_excel):
     """扇区 MIF + 颜色 → Brush 颜色替换，且可读回"""
-    result = service.generate_sector_layer(
+    result, _ = service.generate_sector_layer(
         file_path=str(sample_excel), sheet_name="LTE",
         name_col="NAME", lon_col="LONGITUDE", lat_col="LATITUDE",
         azimuth_col="AZIMUTH", radius_m=3000, beamwidth=40.0,
@@ -217,7 +217,7 @@ def test_mif_sector_color_injected(service, sample_excel):
 
 def test_kml_point_color_injected(service, sample_excel):
     """点 KML + 颜色 → IconStyle color 为 aabbggrr，且可读回"""
-    result = service.generate_point_layer(
+    result, _ = service.generate_point_layer(
         file_path=str(sample_excel), sheet_name="LTE",
         name_col="NAME", lon_col="LONGITUDE", lat_col="LATITUDE",
         attributes=["NAME"], output_format="kml", color="#4A90D9",
@@ -232,7 +232,7 @@ def test_kml_point_color_injected(service, sample_excel):
 
 def test_kml_sector_color_injected(service, sample_excel):
     """扇区 KML + 颜色 → PolyStyle color，且可读回"""
-    result = service.generate_sector_layer(
+    result, _ = service.generate_sector_layer(
         file_path=str(sample_excel), sheet_name="LTE",
         name_col="NAME", lon_col="LONGITUDE", lat_col="LATITUDE",
         azimuth_col="AZIMUTH", radius_m=3000, beamwidth=40.0,
@@ -247,7 +247,7 @@ def test_kml_sector_color_injected(service, sample_excel):
 
 def test_tab_color_ignored(service, sample_excel):
     """TAB + 颜色 → 正常生成（不注入，不报错）"""
-    result = service.generate_point_layer(
+    result, _ = service.generate_point_layer(
         file_path=str(sample_excel), sheet_name="LTE",
         name_col="NAME", lon_col="LONGITUDE", lat_col="LATITUDE",
         attributes=["NAME"], output_format="tab", color="#4A90D9",
@@ -258,7 +258,7 @@ def test_tab_color_ignored(service, sample_excel):
 
 def test_invalid_color_ignored(service, sample_excel):
     """非法颜色 → 不注入，文件正常生成"""
-    result = service.generate_point_layer(
+    result, _ = service.generate_point_layer(
         file_path=str(sample_excel), sheet_name="LTE",
         name_col="NAME", lon_col="LONGITUDE", lat_col="LATITUDE",
         attributes=["NAME"], output_format="mif", color="zzz",
@@ -270,7 +270,7 @@ def test_invalid_color_ignored(service, sample_excel):
 
 def test_kml_name_col_uses_cell_id(service, sample_excel):
     """KML name_col 生效：name_col=CELL_ID 时 <name> 取该列值"""
-    result = service.generate_point_layer(
+    result, _ = service.generate_point_layer(
         file_path=str(sample_excel), sheet_name="LTE",
         name_col="NAME", lon_col="LONGITUDE", lat_col="LATITUDE",
         attributes=["NAME", "PCI"], output_format="kml",
@@ -283,7 +283,7 @@ def test_kml_name_col_uses_cell_id(service, sample_excel):
 def test_kml_color_inline_xml_valid(service, sample_excel):
     """KML 颜色注入后 XML 合法，且 Style 在 Placemark 内（严格查看器可渲染）"""
     import xml.etree.ElementTree as ET
-    result = service.generate_sector_layer(
+    result, _ = service.generate_sector_layer(
         file_path=str(sample_excel), sheet_name="LTE",
         name_col="NAME", lon_col="LONGITUDE", lat_col="LATITUDE",
         azimuth_col="AZIMUTH", radius_m=3000, beamwidth=40.0,
@@ -315,7 +315,7 @@ def test_output_filename_uses_source_and_sheet(tmp_path):
     with pd.ExcelWriter(path, engine="openpyxl") as writer:
         df.to_excel(writer, sheet_name="LTE", index=False)
     svc = LayerService(output_dir=tmp_path)
-    out = svc.generate_point_layer(
+    out, _ = svc.generate_point_layer(
         file_path=str(path), sheet_name="LTE",
         name_col="NAME", lon_col="LONGITUDE", lat_col="LATITUDE",
         attributes=["NAME"], output_format="tab",
@@ -332,7 +332,7 @@ def test_source_filename_param_honored(tmp_path):
         "NAME": ["A"], "LONGITUDE": [116.3], "LATITUDE": [39.9],
     }).to_excel(path, sheet_name="LTE", index=False)
     svc = LayerService(output_dir=tmp_path)
-    out = svc.generate_point_layer(
+    out, _ = svc.generate_point_layer(
         file_path=str(path), sheet_name="LTE",
         name_col="NAME", lon_col="LONGITUDE", lat_col="LATITUDE",
         attributes=["NAME"], output_format="tab",
@@ -351,7 +351,7 @@ def test_long_chinese_filename_truncated(tmp_path):
         "NAME": ["A"], "LONGITUDE": [116.3], "LATITUDE": [39.9],
     }).to_excel(path, sheet_name="长" * 10, index=False)  # sheet 名 30 字节
     svc = LayerService(output_dir=tmp_path)
-    out = svc.generate_point_layer(
+    out, _ = svc.generate_point_layer(
         file_path=str(path), sheet_name="长" * 10,
         name_col="NAME", lon_col="LONGITUDE", lat_col="LATITUDE",
         attributes=["NAME"], output_format="tab",
@@ -371,7 +371,7 @@ def test_sheet_name_illegal_chars_sanitized(tmp_path):
         "NAME": ["A"], "LONGITUDE": [116.3], "LATITUDE": [39.9],
     }).to_excel(path, sheet_name="LTE<NR>", index=False)
     svc = LayerService(output_dir=tmp_path)
-    out = svc.generate_point_layer(
+    out, _ = svc.generate_point_layer(
         file_path=str(path), sheet_name="LTE<NR>",
         name_col="NAME", lon_col="LONGITUDE", lat_col="LATITUDE",
         attributes=["NAME"], output_format="tab",
@@ -379,3 +379,52 @@ def test_sheet_name_illegal_chars_sanitized(tmp_path):
     assert out.stem.startswith("源数据_LTE_")
     assert "LTE" in out.stem and "NR" in out.stem
     assert "<" not in out.stem and ">" not in out.stem
+
+
+def test_row_validation_skips_invalid_rows_and_reports_stats(service, tmp_path):
+    """部分无效行 → 跳过无效行不阻断，返回 stats 统计"""
+    path = tmp_path / "mixed.xlsx"
+    df = pd.DataFrame({
+        "NAME": ["A", "B", "C", "D", "E"],
+        "LONGITUDE": [116.3, None, 999, 116.4, 116.5],   # B缺坐标 C超范围
+        "LATITUDE": [39.9, 39.8, 39.7, 40.0, 40.1],
+        "PCI": [1, 2, 3, 4, None],
+    })
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name="LTE", index=False)
+    out, stats = service.generate_point_layer(
+        file_path=str(path), sheet_name="LTE",
+        name_col="NAME", lon_col="LONGITUDE", lat_col="LATITUDE",
+        attributes=["NAME", "PCI"], output_format="tab",
+    )
+    assert stats["total"] == 5
+    assert stats["success"] == 3        # A, D, E 通过
+    assert stats["failed"] == 2
+    assert stats["failures"]["missing_coord"] == 1   # B
+    assert stats["failures"]["invalid_coord"] == 1   # C
+    import geopandas as gpd
+    gdf = gpd.read_file(out)
+    assert len(gdf) == 3
+
+
+def test_sector_azimuth_validation_stats(service, tmp_path):
+    """扇区方位角无效行被跳过并计入 invalid_azimuth"""
+    path = tmp_path / "azi.xlsx"
+    df = pd.DataFrame({
+        "NAME": ["A", "B"],
+        "LONGITUDE": [116.3, 116.4],
+        "LATITUDE": [39.9, 40.0],
+        "AZIMUTH": [120.0, 500.0],     # B 方位角无效
+    })
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name="LTE", index=False)
+    out, stats = service.generate_sector_layer(
+        file_path=str(path), sheet_name="LTE",
+        name_col="NAME", lon_col="LONGITUDE", lat_col="LATITUDE",
+        azimuth_col="AZIMUTH", radius_m=50, beamwidth=50,
+        attributes=["NAME"], output_format="tab",
+    )
+    assert stats["total"] == 2
+    assert stats["success"] == 1
+    assert stats["failed"] == 1
+    assert stats["failures"]["invalid_azimuth"] == 1

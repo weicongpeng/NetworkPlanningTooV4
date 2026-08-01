@@ -109,15 +109,19 @@ class LayerService:
             raise ValueError(f"Sheet 不存在: {sheet_name}") from e
 
     def _coerce_coords(self, df: pd.DataFrame, lon_col: str, lat_col: str):
-        """校验经纬度合法，非法抛异常"""
+        """逐行校验经纬度，返回 (lon, lat, valid_mask, failures)
+        failures: dict 分类计数（missing_coord / invalid_coord）
+        不再整列报错，改为跳过无效行。
+        """
+        failures = {"missing_coord": 0, "invalid_coord": 0}
         lon = pd.to_numeric(df[lon_col], errors="coerce")
         lat = pd.to_numeric(df[lat_col], errors="coerce")
-        valid = lon.between(-180, 180) & lat.between(-90, 90) & lon.notna() & lat.notna()
-        if valid.sum() == 0:
-            raise ValueError("经纬度数据无效，请检查经纬度列选择")
-        if valid.sum() < len(df) * 0.5:
-            raise ValueError(f"有效坐标少于50%（{valid.sum()}/{len(df)}），请检查数据质量")
-        return lon, lat, valid
+        missing = lon.isna() | lat.isna()
+        failures["missing_coord"] += int(missing.sum())
+        invalid = ~missing & (~lon.between(-180, 180) | ~lat.between(-90, 90))
+        failures["invalid_coord"] += int(invalid.sum())
+        valid = ~missing & ~invalid
+        return lon, lat, valid, failures
 
     def _build_gdf(self, df: pd.DataFrame, lon: pd.Series, lat: pd.Series,
                    valid: pd.Series, attributes: List[str], geometry_cols,
@@ -212,13 +216,30 @@ class LayerService:
                              name_col: str, lon_col: str, lat_col: str,
                              attributes: List[str], output_format: str,
                              color: Optional[str] = None,
-                             source_filename: Optional[str] = None) -> Path:
-        """生成点图层，返回输出文件路径。
+                             source_filename: Optional[str] = None):
+        """生成点图层，返回 (输出文件路径, stats_dict)。
+        stats 包含 total/success/failed/failures 分类计数。
         source_filename: 原始源文件名（未被 _save_upload 重命名），用于输出文件命名。
         不提供时回退到 file_path 的文件名。
         """
         df = self._read_sheet(file_path, sheet_name)
-        lon, lat, valid = self._coerce_coords(df, lon_col, lat_col)
+        lon, lat, coord_valid, failures = self._coerce_coords(df, lon_col, lat_col)
+
+        # 标签名缺失校验
+        if name_col and name_col in df.columns:
+            name_missing = df[name_col].isna() | (df[name_col].astype(str).str.strip() == "")
+            failures["missing_name"] = int(name_missing.sum())
+        else:
+            failures["missing_name"] = 0
+            name_missing = pd.Series([False] * len(df), index=df.index)
+
+        valid = coord_valid & ~name_missing
+
+        if valid.sum() == 0:
+            raise ValueError(
+                f"全部行校验失败（成功 0/{len(df)}），请检查数据"
+            )
+
         geoms = [Point(x, y) for x, y in zip(lon[valid], lat[valid])]
         gdf = self._build_gdf(df, lon, lat, valid, attributes, geoms, keep_cols_extra=[name_col])
         if output_format == "kml":
@@ -226,25 +247,49 @@ class LayerService:
         out = self._write(gdf, output_format,
                           source_filename=source_filename or Path(file_path).name,
                           sheet_name=sheet_name)
-        return self._apply_color(out, output_format, color, is_point=True)
+        out = self._apply_color(out, output_format, color, is_point=True)
+
+        stats = {
+            "total": int(len(df)),
+            "success": int(valid.sum()),
+            "failed": int(len(df) - valid.sum()),
+            "failures": {k: int(v) for k, v in failures.items()},
+        }
+        return out, stats
 
     def generate_sector_layer(self, file_path: str, sheet_name: str,
                               name_col: str, lon_col: str, lat_col: str,
                               azimuth_col: str, radius_m: float, beamwidth: float,
                               attributes: List[str], output_format: str,
                               color: Optional[str] = None,
-                              source_filename: Optional[str] = None) -> Path:
-        """生成扇区图层，返回输出文件路径。
+                              source_filename: Optional[str] = None):
+        """生成扇区图层，返回 (输出文件路径, stats_dict)。
+        stats 包含 total/success/failed/failures 分类计数。
         source_filename: 原始源文件名（未被 _save_upload 重命名），用于输出文件命名。
         不提供时回退到 file_path 的文件名。
         """
         df = self._read_sheet(file_path, sheet_name)
-        lon, lat, valid = self._coerce_coords(df, lon_col, lat_col)
+        lon, lat, coord_valid, failures = self._coerce_coords(df, lon_col, lat_col)
+
+        # 方位角校验
+        failures["invalid_azimuth"] = 0
         azi = pd.to_numeric(df[azimuth_col], errors="coerce")
         azi_ok = azi.between(0, 360) & azi.notna()
-        valid = valid & azi_ok
+        failures["invalid_azimuth"] += int((~azi_ok).sum())
+
+        # 标签名缺失校验
+        if name_col and name_col in df.columns:
+            name_missing = df[name_col].isna() | (df[name_col].astype(str).str.strip() == "")
+            failures["missing_name"] = int(name_missing.sum())
+        else:
+            failures["missing_name"] = 0
+            name_missing = pd.Series([False] * len(df), index=df.index)
+
+        valid = coord_valid & azi_ok & ~name_missing
         if valid.sum() == 0:
-            raise ValueError("方位角数据无效，请检查方位角列选择（0-360度）")
+            raise ValueError(
+                f"全部行校验失败（成功 0/{len(df)}），请检查数据"
+            )
         # 全零/全空方位角列会被 between(0,360) 静默接受，导致所有扇区退化为朝北楔形
         nonzero = azi_ok & (azi > 0)
         if nonzero.sum() == 0:
@@ -259,7 +304,15 @@ class LayerService:
         out = self._write(gdf, output_format,
                           source_filename=source_filename or Path(file_path).name,
                           sheet_name=sheet_name)
-        return self._apply_color(out, output_format, color, is_point=False)
+        out = self._apply_color(out, output_format, color, is_point=False)
+
+        stats = {
+            "total": int(len(df)),
+            "success": int(valid.sum()),
+            "failed": int(len(df) - valid.sum()),
+            "failures": {k: int(v) for k, v in failures.items()},
+        }
+        return out, stats
 
     def get_sheet_info(self, file_path: str) -> dict:
         """读取 Excel 的 sheet 列表和各 sheet 列名"""
