@@ -98,6 +98,25 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"❌ 清理无效数据索引失败: {e}")
 
+    # 🧹 清理 layer_tmp 中超过 24h 的临时文件
+    # 分块上传后未消费/失败的残留（src_*），以及端点处理产生的临时副本
+    import time
+    _layer_tmp = settings.UPLOAD_DIR / "layer_tmp"
+    if _layer_tmp.exists():
+        now = time.time()
+        removed = 0
+        for f in _layer_tmp.glob("src_*"):
+            try:
+                if now - f.stat().st_mtime > 86400:  # 24h
+                    f.unlink(missing_ok=True)
+                    removed += 1
+            except Exception:
+                pass
+        if removed:
+            logger.info(f"✅ 已清理 {removed} 个过期 layer_tmp 临时文件")
+        else:
+            logger.info("✅ layer_tmp 临时文件检查完成，无过期文件")
+
     # 初始化用户数据库
     try:
         from app.core.database import init_db, create_default_admin

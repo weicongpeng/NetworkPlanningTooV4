@@ -2,6 +2,7 @@
 图层制作 API 端点
 """
 import json
+import shutil
 import uuid
 import zipfile
 from pathlib import Path
@@ -41,27 +42,27 @@ def _finalize_output(out: Path, output_format: str) -> dict:
 
 
 def _save_upload(file: Optional[UploadFile], file_path: Optional[str]) -> Path:
-    """返回 Excel 文件的本地路径。
+    """返回 Excel 文件的本地路径（副本，调用方 finally 删除）。
 
-    优先用 file_path（分块上传已保存到 layer_tmp）——直接使用该路径，由调用方 finally 删除，
-    不重新复制，避免 layer_tmp 残留孤立文件。
-    否则从 file 写入临时文件。返回的路径位于挂载树之外，调用方负责在 finally 中删除。
+    file_path 模式复制到新的 src_{uuid}.xlsx（不改动原分块文件，可多次复用；端点永不对
+    客户端传入的原路径 unlink，避免任意文件删除）。原分块文件由 layer_tmp TTL 清扫统一管理。
+    file 模式写入临时文件。
     """
     if not file and not file_path:
         raise HTTPException(status_code=400, detail="未提供文件")
     tmp_dir = settings.UPLOAD_DIR / "layer_tmp"
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
-    # 分块上传模式：file_path 指向 layer_tmp 中已重组文件，直接使用（不复制，避免孤立文件）
     if file_path:
         src = Path(str(file_path).strip("\"'"))
         if not src.is_file():
             raise HTTPException(status_code=400, detail=f"文件不存在: {src.name}")
         if src.suffix.lower() not in ALLOWED_EXTS:
             raise HTTPException(status_code=400, detail="仅支持 Excel 文件（.xlsx/.xls）")
-        return src
+        dest = tmp_dir / f"src_{uuid.uuid4().hex[:8]}{src.suffix.lower()}"
+        shutil.copy2(src, dest)  # 复制到独立临时文件，finally 删副本
+        return dest
 
-    # 直接上传模式（兼容旧调用）
     suffix = Path(file.filename or "src.xlsx").suffix.lower()
     if suffix not in ALLOWED_EXTS:
         raise HTTPException(status_code=400, detail="仅支持 Excel 文件（.xlsx/.xls）")

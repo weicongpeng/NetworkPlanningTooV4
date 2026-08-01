@@ -338,32 +338,29 @@ def test_chunked_upload_layer_file_type():
 
 
 def test_layer_endpoints_accept_file_path():
-    """图层端点应接受 file_path（分块上传后的本地路径）而非必须 multipart file，
-    且 file_path 指向的 layer_tmp 文件被消费后由 finally 删除（无泄漏）"""
+    """图层端点应接受 file_path（分块上传后的本地路径）而非必须 multipart file。
+
+    - 同一 file_path 可被 excel-info 和 sector 连续复用（上传一次复用 N 次）
+    - 端点只复制副本，不删除客户端传入的原始 file_path（原文件仍存在）
+    """
     tmp_dir = _tmp_dir()
     tmp_dir.mkdir(parents=True, exist_ok=True)
     path = tmp_dir / f"chunked_{os.getpid()}.xlsx"
-
-    def _write():
-        # 含方位角（非零）供 sector 测试
-        pd.DataFrame({
-            "NAME": ["A"], "LONGITUDE": [116.3], "LATITUDE": [39.9], "AZIMUTH": [120.0],
-        }).to_excel(path, sheet_name="S", index=False)
+    # 含方位角（非零）供 sector 测试
+    pd.DataFrame({
+        "NAME": ["A"], "LONGITUDE": [116.3], "LATITUDE": [39.9], "AZIMUTH": [120.0],
+    }).to_excel(path, sheet_name="S", index=False)
 
     client = _make_client()
     try:
         # excel-info 传 file_path
-        _write()
         r = client.post("/api/v1/layer/excel-info", data={"file_path": str(path)})
         assert r.status_code == 200, r.text
         body = r.json()
         assert body["success"] is True
         assert "S" in body["data"]["sheets"]
-        # 消费后应删除 layer_tmp 中的原始文件（泄漏修复）
-        assert not path.exists(), f"excel-info 后 layer_tmp 文件泄漏: {path}"
 
-        # sector 传 file_path（模拟分块上传每个端点独立文件，重新写入）
-        _write()
+        # sector 复用同一 file_path（上传只发生一次，可多次消费）
         r2 = client.post("/api/v1/layer/sector",
             data={"file_path": str(path), "sheet_name": "S", "name_col": "NAME",
                   "lon_col": "LONGITUDE", "lat_col": "LATITUDE",
@@ -373,7 +370,34 @@ def test_layer_endpoints_accept_file_path():
         body2 = r2.json()
         assert body2["success"] is True
         assert body2["data"]["filename"].endswith(".kml")
-        assert not path.exists(), f"sector 后 layer_tmp 文件泄漏: {path}"
+
+        # 端点不应删除客户端传入的原始 file_path（由 TTL 清扫统一管理）
+        assert path.exists(), f"端点误删原始 file_path: {path}"
+    finally:
+        if path.exists():
+            os.remove(path)
+
+
+def test_layer_file_path_reuse_generates_no_leak():
+    """同一 file_path 多次复用后，layer_tmp 不残留端点生成的 src_* 副本（副本由 finally 删除），
+    且原始 file_path 仍保留供复用"""
+    tmp_dir = _tmp_dir()
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    before = set(_tmp_leaks())
+    path = tmp_dir / f"reuse_{os.getpid()}.xlsx"
+    pd.DataFrame({
+        "NAME": ["A"], "LONGITUDE": [116.3], "LATITUDE": [39.9], "AZIMUTH": [120.0],
+    }).to_excel(path, sheet_name="S", index=False)
+
+    client = _make_client()
+    try:
+        for _ in range(3):
+            r = client.post("/api/v1/layer/excel-info", data={"file_path": str(path)})
+            assert r.status_code == 200, r.text
+        # 端点生成的副本应被 finally 删除，不留残留
+        assert set(_tmp_leaks()) == before, f"副本残留: {set(_tmp_leaks()) - before}"
+        # 原始 file_path 仍存在
+        assert path.exists()
     finally:
         if path.exists():
             os.remove(path)
