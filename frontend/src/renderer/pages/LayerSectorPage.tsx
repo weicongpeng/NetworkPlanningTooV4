@@ -33,7 +33,7 @@ export default function LayerSectorPage() {
       setSheetName(data.sheets[0] || '')
       setColumns(data.columns[data.sheets[0]] || [])
     } catch (err: any) {
-      setError(err?.message || err?.response?.data?.detail || String(err))
+      setError(err?.message || String(err))
     }
   }
 
@@ -65,7 +65,7 @@ export default function LayerSectorPage() {
       })
       setResult(data)
     } catch (err: any) {
-      setError(err?.message || err?.response?.data?.detail || String(err))
+      setError(err?.message || String(err))
     } finally {
       setLoading(false)
     }
@@ -86,8 +86,8 @@ export default function LayerSectorPage() {
       {/* ② Sheet 选择 */}
       {info && info.sheets.length > 0 && (
         <div className="mt-6 space-y-2">
-          <p className="text-xs font-medium">{t('layer.selectSheet')}</p>
-          <select value={sheetName} onChange={e => handleSheetChange(e.target.value)}
+          <label htmlFor="layer-sheet" className="block text-xs font-medium">{t('layer.selectSheet')}</label>
+          <select id="layer-sheet" value={sheetName} onChange={e => handleSheetChange(e.target.value)}
             className="w-full h-9 px-2 text-sm border border-border rounded bg-card">
             {info.sheets.map(s => <option key={s} value={s}>{s}</option>)}
           </select>

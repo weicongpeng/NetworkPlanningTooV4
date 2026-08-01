@@ -27,6 +27,12 @@ export default defineConfig({
         // 工参更新操作（如应用到工参）对大文件处理可能超过120s
         timeout: 600000, // 10分钟超时，避免 Proxy Read Timeout
       },
+      // 图层制作生成的文件（tab/mif/kml）下载，dev 模式由 FastAPI 静态服务提供
+      '/layer-files': {
+        target: 'http://localhost:8000',
+        changeOrigin: true,
+        rewrite: (path) => path
+      },
       '/ws': {
         target: 'ws://localhost:8000',
         ws: true

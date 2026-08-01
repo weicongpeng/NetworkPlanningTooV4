@@ -1018,6 +1018,7 @@
     "generate": "生成图层",
     "download": "下载图层",
     "errMissingFields": "请确保标签名称、经度、纬度、方向角均已正确匹配",
+    "errMissingFieldsPoint": "请确保标签名称、经度、纬度均已正确匹配",
     "errSheet": "请先选择 Sheet"
   }
 }

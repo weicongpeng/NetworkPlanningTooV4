@@ -67,8 +67,9 @@ export function LayerAttributeConfig({
         <p className="text-xs font-medium">{t('layer.keywordMatch')}</p>
         {fieldTypes.map(f => (
           <div key={f.type} className="flex items-center gap-2">
-            <span className="text-xs text-muted-foreground w-20">{t(f.labelKey)}</span>
+            <label htmlFor={`layer-field-${f.type}`} className="text-xs text-muted-foreground w-20">{t(f.labelKey)}</label>
             <select
+              id={`layer-field-${f.type}`}
               value={fieldMappings[f.type] || ''}
               onChange={e => onFieldMappingsChange({ ...fieldMappings, [f.type]: e.target.value })}
               className="flex-1 h-8 px-2 text-xs border border-border rounded bg-card"
