@@ -1403,13 +1403,12 @@ function NewCellEntryCard({
     azimuth: 52, frequency: 52, ssbFrequency: 52, cellCoverType: 70,
   }
   const COL_WIDTHS_KEY = 'npt_cell_entry_col_widths'
-  const [colWidths] = useState<Record<string, number>>(() => {
+  const [colWidths, setColWidths] = useState<Record<string, number>>(() => {
     try {
       const saved = localStorage.getItem(COL_WIDTHS_KEY)
       return saved ? { ...DEFAULT_COL_WIDTHS, ...JSON.parse(saved) } : DEFAULT_COL_WIDTHS
     } catch { return DEFAULT_COL_WIDTHS }
   })
-  // 说明：setColWidths 由 useState 提供（未解构），Task 2 表头拖拽手柄使用
 
   const hasFullParams = fullParamFiles.length > 0
 
@@ -1585,6 +1584,30 @@ function NewCellEntryCard({
       rowIdx++
     }
     setRows(prev => ({ ...prev, [activeTab]: nextRows }))
+  }
+
+  // 列宽拖拽：记录起始位置与目标列，window 级 mousemove/mouseup 调整
+  const startColResize = (e: React.MouseEvent, colKey: string) => {
+    e.preventDefault()
+    e.stopPropagation()
+    const startX = e.clientX
+    const startWidth = colWidths[colKey] ?? DEFAULT_COL_WIDTHS[colKey] ?? 70
+    const onMove = (ev: MouseEvent) => {
+      const delta = ev.clientX - startX
+      const next = Math.max(40, startWidth + delta)
+      setColWidths(prev => ({ ...prev, [colKey]: next }))
+    }
+    const onUp = () => {
+      window.removeEventListener('mousemove', onMove)
+      window.removeEventListener('mouseup', onUp)
+      // 结束时持久化（从最新 state 读）
+      setColWidths(prev => {
+        try { localStorage.setItem(COL_WIDTHS_KEY, JSON.stringify(prev)) } catch { /* ignore */ }
+        return prev
+      })
+    }
+    window.addEventListener('mousemove', onMove)
+    window.addEventListener('mouseup', onUp)
   }
 
   const toggleRowSelection = (rowId: string) => {
@@ -1859,17 +1882,83 @@ function NewCellEntryCard({
                 />
               </th>
               <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30 w-0'}>{/* 操作列 */}</th>
-              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30'} style={{ width: colWidths.managedElementId }}>{t('newCellEntry.fieldManagedElementId') || '网元ID'}</th>
-              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30'} style={{ width: colWidths.siteId }}>{t('newCellEntry.fieldSiteIdLTE') || '基站ID'}</th>
-              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30'} style={{ width: colWidths.cellId }}>{t('newCellEntry.fieldCellId') || '小区ID'}</th>
-              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30'} style={{ width: colWidths.cellName }}>{t('newCellEntry.fieldCellName') || '小区名称'}</th>
-              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30'} style={{ width: colWidths.mcc }}>{t('newCellEntry.fieldMCC') || 'MCC'}</th>
-              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30'} style={{ width: colWidths.mnc }}>{t('newCellEntry.fieldMNC') || 'MNC'}</th>
-              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30'} style={{ width: colWidths.longitude }}>{t('newCellEntry.fieldLongitude') || '经度'}</th>
-              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30'} style={{ width: colWidths.latitude }}>{t('newCellEntry.fieldLatitude') || '纬度'}</th>
-              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30'} style={{ width: colWidths.azimuth }}>{t('newCellEntry.fieldAzimuth') || '方向角'}</th>
-              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30'} style={{ width: isLte ? colWidths.frequency : colWidths.ssbFrequency }}>{isLte ? (t('newCellEntry.fieldFrequency') || '下行频点') : (t('newCellEntry.fieldSsbFrequency') || 'SSB频点')}</th>
-              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30'} style={{ width: colWidths.cellCoverType }}>{t('newCellEntry.fieldCellCoverType') || '覆盖类型'}</th>
+              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30 relative'} style={{ width: colWidths.managedElementId }}>
+                {t('newCellEntry.fieldManagedElementId') || '网元ID'}
+                <div
+                  className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-blue-400/60"
+                  onMouseDown={e => startColResize(e, 'managedElementId')}
+                />
+              </th>
+              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30 relative'} style={{ width: colWidths.siteId }}>
+                {t('newCellEntry.fieldSiteIdLTE') || '基站ID'}
+                <div
+                  className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-blue-400/60"
+                  onMouseDown={e => startColResize(e, 'siteId')}
+                />
+              </th>
+              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30 relative'} style={{ width: colWidths.cellId }}>
+                {t('newCellEntry.fieldCellId') || '小区ID'}
+                <div
+                  className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-blue-400/60"
+                  onMouseDown={e => startColResize(e, 'cellId')}
+                />
+              </th>
+              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30 relative'} style={{ width: colWidths.cellName }}>
+                {t('newCellEntry.fieldCellName') || '小区名称'}
+                <div
+                  className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-blue-400/60"
+                  onMouseDown={e => startColResize(e, 'cellName')}
+                />
+              </th>
+              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30 relative'} style={{ width: colWidths.mcc }}>
+                {t('newCellEntry.fieldMCC') || 'MCC'}
+                <div
+                  className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-blue-400/60"
+                  onMouseDown={e => startColResize(e, 'mcc')}
+                />
+              </th>
+              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30 relative'} style={{ width: colWidths.mnc }}>
+                {t('newCellEntry.fieldMNC') || 'MNC'}
+                <div
+                  className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-blue-400/60"
+                  onMouseDown={e => startColResize(e, 'mnc')}
+                />
+              </th>
+              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30 relative'} style={{ width: colWidths.longitude }}>
+                {t('newCellEntry.fieldLongitude') || '经度'}
+                <div
+                  className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-blue-400/60"
+                  onMouseDown={e => startColResize(e, 'longitude')}
+                />
+              </th>
+              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30 relative'} style={{ width: colWidths.latitude }}>
+                {t('newCellEntry.fieldLatitude') || '纬度'}
+                <div
+                  className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-blue-400/60"
+                  onMouseDown={e => startColResize(e, 'latitude')}
+                />
+              </th>
+              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30 relative'} style={{ width: colWidths.azimuth }}>
+                {t('newCellEntry.fieldAzimuth') || '方向角'}
+                <div
+                  className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-blue-400/60"
+                  onMouseDown={e => startColResize(e, 'azimuth')}
+                />
+              </th>
+              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30 relative'} style={{ width: isLte ? colWidths.frequency : colWidths.ssbFrequency }}>
+                {isLte ? (t('newCellEntry.fieldFrequency') || '下行频点') : (t('newCellEntry.fieldSsbFrequency') || 'SSB频点')}
+                <div
+                  className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-blue-400/60"
+                  onMouseDown={e => startColResize(e, isLte ? 'frequency' : 'ssbFrequency')}
+                />
+              </th>
+              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30 relative'} style={{ width: colWidths.cellCoverType }}>
+                {t('newCellEntry.fieldCellCoverType') || '覆盖类型'}
+                <div
+                  className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-blue-400/60"
+                  onMouseDown={e => startColResize(e, 'cellCoverType')}
+                />
+              </th>
             </tr>
           </thead>
           <tbody>
