@@ -207,6 +207,7 @@ async def generate_sector(
     border_color: Optional[str] = Form(None),
     fill_color: Optional[str] = Form(None),
     opacity: Optional[float] = Form(None),        # 0-1
+    line_width: Optional[float] = Form(None),     # 描边线宽（像素，clamp 1-7）
     source_filename: Optional[str] = Form(None),
     current_user=Depends(require_data_import),
 ):
@@ -231,6 +232,7 @@ async def generate_sector(
                 radius_m, beamwidth, attr_list, fmt,
                 color or None, original_name,
                 border_color or color, fill_color or color, opacity,
+                line_width,
             )
             outs.append(out)
         return {"success": True, "data": {**_finalize_outputs(outs, fmt_list), "stats": stats}}

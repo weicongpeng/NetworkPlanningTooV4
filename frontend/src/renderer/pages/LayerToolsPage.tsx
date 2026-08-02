@@ -243,7 +243,7 @@ export default function LayerToolsPage() {
         return (
           <button key={c} type="button"
             onClick={() => onChange(c)}
-            aria-label={`颜色 ${c}`}
+            aria-label={t('layer.colorSwatch', { color: c })}
             aria-pressed={selected}
             title={c}
             className={`w-5 h-5 rounded-sm border ${selected ? 'border-primary ring-1 ring-primary' : 'border-border'}`}

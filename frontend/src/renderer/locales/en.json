@@ -1007,6 +1007,7 @@
     "radius": "Sector Radius",
     "beamwidth": "Beamwidth",
     "lineWidth": "Line Width",
+    "colorSwatch": "Color {{color}}",
     "borderColor": "Border Color",
     "fillColor": "Fill Color",
     "opacity": "Opacity",

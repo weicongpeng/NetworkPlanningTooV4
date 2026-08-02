@@ -1018,6 +1018,7 @@
     "radius": "扇区半径",
     "beamwidth": "波瓣夹角",
     "lineWidth": "线宽",
+    "colorSwatch": "颜色 {{color}}",
     "borderColor": "边框颜色",
     "fillColor": "填充颜色",
     "opacity": "透明度",

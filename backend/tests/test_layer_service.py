@@ -759,3 +759,29 @@ def test_failed_details_in_sector_stats(service, tmp_path):
     assert stats["failed"] == 1
     assert stats["failedDetails"][0]["name"] == "B"
     assert stats["failedDetails"][0]["reason"] == "invalid_azimuth"
+
+
+def test_kml_sector_line_width(service, sample_excel):
+    """扇区 KML + line_width → LineStyle width"""
+    result, _ = service.generate_sector_layer(
+        file_path=str(sample_excel), sheet_name="LTE",
+        name_col="NAME", lon_col="LONGITUDE", lat_col="LATITUDE",
+        azimuth_col="AZIMUTH", radius_m=3000, beamwidth=40.0,
+        attributes=["NAME"], output_format="kml",
+        border_color="#4A90D9", fill_color="#4A90D9", line_width=4,
+    )
+    text = result.read_text(encoding="utf-8")
+    assert "<width>4</width>" in text
+
+
+def test_mif_sector_line_width(service, sample_excel):
+    """扇区 MIF + line_width → Pen 第3参数"""
+    result, _ = service.generate_sector_layer(
+        file_path=str(sample_excel), sheet_name="LTE",
+        name_col="NAME", lon_col="LONGITUDE", lat_col="LATITUDE",
+        azimuth_col="AZIMUTH", radius_m=3000, beamwidth=40.0,
+        attributes=["NAME"], output_format="mif",
+        border_color="#4A90D9", fill_color="#4A90D9", line_width=4,
+    )
+    text = result.read_text(encoding="gbk", errors="replace")
+    assert "Pen (1,4886745,4)" in text

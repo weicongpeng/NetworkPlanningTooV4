@@ -337,8 +337,9 @@ class LayerService:
 
     def _apply_style(self, out_path: Path, output_format: str,
                      border_color: Optional[str], fill_color: Optional[str],
-                     opacity: Optional[float], is_point: bool) -> Path:
-        """后处理注入样式：边框颜色/填充颜色/透明度（仅 MIF/KML，TAB 无颜色支持）。
+                     opacity: Optional[float], is_point: bool,
+                     line_width: Optional[int] = None) -> Path:
+        """后处理注入样式：边框颜色/填充颜色/透明度/线宽（仅 MIF/KML，TAB 无颜色支持）。
 
         MIF 扇区: Pen 颜色 = 边框色，Brush 前景 = 填充色（背景保留白色）。
         MIF 点:   Symbol 颜色 = 边框色（点无填充概念，颜色按边框语义应用）。
@@ -363,11 +364,12 @@ class LayerService:
                     )
             else:
                 mif_fill = hex_to_mapinfo_color(fill_color)
-                # 扇区 Pen 颜色 = 边框色；Brush 前景 = 填充色
+                # 扇区 Pen 颜色 = 边框色、线宽 = pen_width；Brush 前景 = 填充色
+                pen_width = max(1, min(7, int(line_width or 2)))
                 if mif_border is not None:
                     text = re.sub(
                         r'Pen \((\d+),(\d+),(\d+)\)',
-                        lambda m: f'Pen ({m.group(1)},{mif_border},{m.group(3)})', text,
+                        lambda m: f'Pen ({m.group(1)},{mif_border},{pen_width})', text,
                     )
                 if mif_fill is not None:
                     text = re.sub(
@@ -407,10 +409,12 @@ class LayerService:
                     return out_path
                 parts = []
                 if kml_border is not None:
+                    width = int(line_width or 2)
+                    width = max(1, min(7, width))
                     parts.append(
                         f'<LineStyle>'
                         f'<color>{_kml_color_with_alpha(border_color, kml_opacity)}</color>'
-                        f'<width>2</width>'
+                        f'<width>{width}</width>'
                         f'</LineStyle>'
                     )
                 if kml_fill is not None:
@@ -525,13 +529,15 @@ class LayerService:
                               source_filename: Optional[str] = None,
                               border_color: Optional[str] = None,
                               fill_color: Optional[str] = None,
-                              opacity: Optional[float] = None):
+                              opacity: Optional[float] = None,
+                              line_width: Optional[float] = None):
         """生成扇区图层，返回 (输出文件路径, stats_dict)。
         stats 包含 total/success/failed/failures 分类计数。
         source_filename: 原始源文件名（未被 _save_upload 重命名），用于输出文件命名。
         不提供时回退到 file_path 的文件名。
         border_color/fill_color/opacity: 样式参数。扇区边框色=border_color、填充=fill_color、
-        透明度=opacity（作用于填充/边框/点的整体透明度）。TAB 不支持颜色。
+        透明度=opacity（作用于填充/边框/点的整体透明度）。line_width: 描边线宽（像素，clamp 1-7）。
+        TAB 不支持颜色。
         """
         df = self._read_sheet(file_path, sheet_name)
         lon, lat, coord_valid, failures = self._coerce_coords(df, lon_col, lat_col)
@@ -574,6 +580,7 @@ class LayerService:
             border_color=border_color or color,
             fill_color=fill_color or color,
             opacity=opacity, is_point=False,
+            line_width=line_width,
         )
         self._verify_readable(out, int(valid.sum()), output_format)
 
