@@ -185,6 +185,7 @@ export default function LayerToolsPage() {
         color: state.borderColor,
         borderColor: state.borderColor,
         fillColor: state.fillColor,
+        lineWidth: parseInt(state.lineWidth) || 2,
         opacity: parseFloat(state.opacity),
       }
       const data = isSector
@@ -237,12 +238,18 @@ export default function LayerToolsPage() {
   // 常用色块快捷选择
   const colorSwatches = (value: string, onChange: (v: string) => void) => (
     <div className="flex flex-wrap gap-1 mt-1">
-      {PRESET_COLORS.map(c => (
-        <button key={c} type="button"
-          onClick={() => onChange(c)}
-          className={`w-5 h-5 rounded-sm border ${value.toLowerCase() === c.toLowerCase() ? 'border-primary ring-1 ring-primary' : 'border-border'}`}
-          style={{ backgroundColor: c }} />
-      ))}
+      {PRESET_COLORS.map(c => {
+        const selected = value.toLowerCase() === c.toLowerCase()
+        return (
+          <button key={c} type="button"
+            onClick={() => onChange(c)}
+            aria-label={`颜色 ${c}`}
+            aria-pressed={selected}
+            title={c}
+            className={`w-5 h-5 rounded-sm border ${selected ? 'border-primary ring-1 ring-primary' : 'border-border'}`}
+            style={{ backgroundColor: c }} />
+        )
+      })}
     </div>
   )
 
@@ -260,7 +267,7 @@ export default function LayerToolsPage() {
             <input {...numberInput(ts.beamwidth, (v) => setTab(s => ({ ...s, beamwidth: v })))}
               className="w-full h-9 px-2 text-sm border border-border rounded bg-card" />
           </div>
-          <div>
+          <div className="col-span-2">
             <label className="block text-xs font-medium mb-1">{t('layer.lineWidth')}</label>
             <input {...numberInput(ts.lineWidth, (v) => setTab(s => ({ ...s, lineWidth: v })))}
               placeholder="2" className="w-full h-9 px-2 text-sm border border-border rounded bg-card" />

@@ -985,6 +985,7 @@ export interface GenerateLayerParams {
   outputFormat?: 'tab' | 'mif' | 'kml'          // 旧单值，兼容
   radiusM?: number
   beamwidth?: number
+  lineWidth?: number
   pointSize?: number
   color?: string
   // 样式：边框颜色/填充颜色/透明度（0-1）
@@ -1046,6 +1047,7 @@ export const layerToolsApi = {
     formData.append('output_formats', (params.outputFormats || [params.outputFormat!]).join(','))
     if (params.radiusM) formData.append('radius_m', String(params.radiusM))
     if (params.beamwidth) formData.append('beamwidth', String(params.beamwidth))
+    if (params.lineWidth) formData.append('line_width', String(params.lineWidth))
     if (params.color) formData.append('color', params.color)
     if (params.borderColor) formData.append('border_color', params.borderColor)
     if (params.fillColor) formData.append('fill_color', params.fillColor)
