@@ -987,6 +987,7 @@ export interface GenerateLayerParams {
   beamwidth?: number
   lineWidth?: number
   pointSize?: number
+  pointShape?: string
   color?: string
   // 样式：边框颜色/填充颜色/透明度（0-1）
   borderColor?: string
@@ -1071,6 +1072,8 @@ export const layerToolsApi = {
     if (params.color) formData.append('color', params.color)
     if (params.borderColor) formData.append('border_color', params.borderColor)
     if (params.opacity != null) formData.append('opacity', String(params.opacity))
+    if (params.pointSize) formData.append('point_size', String(params.pointSize))
+    if (params.pointShape) formData.append('point_shape', params.pointShape)
     const res = await uploadClient.post('/layer/point', formData)
     return res.data
   },

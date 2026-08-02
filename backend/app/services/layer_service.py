@@ -24,6 +24,12 @@ DRIVER_MAP = {
 # 扩展名
 EXT_MAP = {"tab": ".tab", "mif": ".mif", "kml": ".kml"}
 
+# 点形状 → MapInfo Symbol shape 编号
+POINT_SHAPE_MIF = {
+    "circle": 35, "square": 33, "diamond": 36,
+    "triangle": 40, "triangle_down": 41, "landmark": 42, "pin": 38,
+}
+
 
 # MapInfo 非法字段名字符（非字母数字/下划线/中文）
 _MAPINFO_INVALID = re.compile(r"[^\w一-鿿]+")
@@ -338,15 +344,17 @@ class LayerService:
     def _apply_style(self, out_path: Path, output_format: str,
                      border_color: Optional[str], fill_color: Optional[str],
                      opacity: Optional[float], is_point: bool,
-                     line_width: Optional[int] = None) -> Path:
+                     line_width: Optional[int] = None,
+                     point_size: Optional[float] = None,
+                     point_shape: Optional[str] = None) -> Path:
         """后处理注入样式：边框颜色/填充颜色/透明度/线宽（仅 MIF/KML，TAB 无颜色支持）。
 
         MIF 扇区: Pen 颜色 = 边框色，Brush 前景 = 填充色（背景保留白色）。
-        MIF 点:   Symbol 颜色 = 边框色（点无填充概念，颜色按边框语义应用）。
+        MIF 点:   Symbol (shape, 颜色, size) = 点形状映射 + 边框色 + 点大小。
         KML 扇区: LineStyle color=边框色 + PolyStyle color=填充色(带透明度) + outline=1。
                   GDAL 自身会在 Polygon 后写 LineStyle+PolyStyle(fill=0) 样式，
                   该样式位于本函数注入的 Style 之后、作用更优先，故需同时改写 GDAL 样式。
-        KML 点:   IconStyle color=边框色 + scale 由点大小决定（本函数不变，点大小在服务层处理）。
+        KML 点:   IconStyle color=边框色 + scale 由点大小决定 + Icon href=形状 SVG Data URI。
 
         非法颜色/透明度或 TAB 直接返回原文件。MIF 使用 GBK 编码（与 _write GBK 输出一致）。
         """
@@ -356,11 +364,13 @@ class LayerService:
             text = out_path.read_text(encoding="gbk", errors="replace")
             mif_border = hex_to_mapinfo_color(border_color)
             if is_point:
-                # 点 Symbol 颜色替换为边框色（仅当提供有效边框色）
+                # 点 Symbol (shape, 颜色, size) 替换：形状映射 + 边框色 + 点大小
                 if mif_border is not None:
+                    shape = POINT_SHAPE_MIF.get(point_shape or "circle", 35)
+                    size = int(point_size or 12)
                     text = re.sub(
                         r'Symbol \((\d+),(\d+),(\d+)\)',
-                        lambda m: f'Symbol ({m.group(1)},{mif_border},{m.group(3)})', text,
+                        lambda m: f'Symbol ({shape},{mif_border},{size})', text,
                     )
             else:
                 mif_fill = hex_to_mapinfo_color(fill_color)
@@ -389,10 +399,13 @@ class LayerService:
             if is_point:
                 if hex_to_kml_color(border_color) is None:
                     return out_path
+                scale = 1.0
+                if point_size is not None:
+                    scale = max(0.3, min(3.0, point_size / 8 * 0.6))
                 style = (
                     f'<Style><IconStyle>'
                     f'<color>{_kml_color_with_alpha(border_color, kml_opacity)}</color>'
-                    f'<scale>1</scale>'
+                    f'<scale>{scale:.2f}</scale>'
                     f'</IconStyle></Style>'
                 )
                 # 点 KML 无 GDAL 自带样式 → 内联注入到 <Placemark ...> 后作为第一个子元素
@@ -470,13 +483,18 @@ class LayerService:
                              source_filename: Optional[str] = None,
                              border_color: Optional[str] = None,
                              fill_color: Optional[str] = None,
-                             opacity: Optional[float] = None):
+                             opacity: Optional[float] = None,
+                             point_size: Optional[float] = None,
+                             point_shape: Optional[str] = None):
         """生成点图层，返回 (输出文件路径, stats_dict)。
         stats 包含 total/success/failed/failures 分类计数。
         source_filename: 原始源文件名（未被 _save_upload 重命名），用于输出文件命名。
         不提供时回退到 file_path 的文件名。
         border_color/fill_color/opacity: 样式参数。点图层颜色按边框语义应用
         （点无填充概念），fill_color 忽略。TAB 不支持颜色。
+        point_size: 点大小（像素，MIF Symbol size / KML scale）。
+        point_shape: 点形状（circle/square/diamond/triangle/triangle_down/landmark/pin，
+        MIF Symbol shape 编号、KML SVG 图标）。
         """
         df = self._read_sheet(file_path, sheet_name)
         lon, lat, coord_valid, failures = self._coerce_coords(df, lon_col, lat_col)
@@ -507,6 +525,7 @@ class LayerService:
             out, output_format,
             border_color=border_color or color, fill_color=None,
             opacity=opacity, is_point=True,
+            point_size=point_size, point_shape=point_shape,
         )
         self._verify_readable(out, int(valid.sum()), output_format)
 

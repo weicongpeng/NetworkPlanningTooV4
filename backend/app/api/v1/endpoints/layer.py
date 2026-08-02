@@ -150,6 +150,8 @@ async def generate_point(
     border_color: Optional[str] = Form(None),
     fill_color: Optional[str] = Form(None),
     opacity: Optional[float] = Form(None),        # 0-1
+    point_size: Optional[float] = Form(None),     # 点大小（像素，MIF Symbol size / KML scale）
+    point_shape: Optional[str] = Form(None),      # 点形状（circle/square/diamond/triangle/triangle_down/landmark/pin）
     source_filename: Optional[str] = Form(None),
     current_user=Depends(require_data_import),
 ):
@@ -173,6 +175,7 @@ async def generate_point(
                 str(src), sheet_name, name_col, lon_col, lat_col,
                 attr_list, fmt, color or None, original_name,
                 border_color or color, None, opacity,
+                point_size, point_shape,
             )
             outs.append(out)
         return {"success": True, "data": {**_finalize_outputs(outs, fmt_list), "stats": stats}}

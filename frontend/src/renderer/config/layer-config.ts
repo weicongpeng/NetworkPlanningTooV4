@@ -53,6 +53,7 @@ export const LAYER_DEFAULT_PARAMS = {
   },
   point: {
     pointSize: 8,
+    pointShape: 'circle',
     borderColor: '#FF0000',
     opacity: 1,
   },

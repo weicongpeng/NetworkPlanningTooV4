@@ -40,6 +40,7 @@ interface TabState {
   beamwidth: string
   lineWidth: string
   pointSize: string
+  pointShape: string
   borderColor: string      // 边框颜色
   fillColor: string        // 填充颜色（扇区内部；点图忽略）
   opacity: string          // 透明度 0-1（字符串受控，允许 0.6 等）
@@ -60,6 +61,7 @@ function emptyTabState(type: 'sector' | 'point'): TabState {
     beamwidth: type === 'sector' ? String(LAYER_DEFAULT_PARAMS.sector.beamwidth) : '',
     lineWidth: type === 'sector' ? String(LAYER_DEFAULT_PARAMS.sector.lineWidth) : '',
     pointSize: type === 'point' ? String(LAYER_DEFAULT_PARAMS.point.pointSize) : '',
+    pointShape: type === 'point' ? LAYER_DEFAULT_PARAMS.point.pointShape : '',
     borderColor: dp.borderColor,
     fillColor: type === 'sector' ? LAYER_DEFAULT_PARAMS.sector.fillColor : '',
     opacity: String(dp.opacity),
@@ -113,6 +115,17 @@ export default function LayerToolsPage() {
   }
 
   const isSector = activeTab === 'sector'
+
+  // 点形状选项（KML SVG / MIF Symbol shape 编号一致）
+  const POINT_SHAPES = [
+    { value: 'circle', label: t('layer.shapeCircle') },
+    { value: 'square', label: t('layer.shapeSquare') },
+    { value: 'diamond', label: t('layer.shapeDiamond') },
+    { value: 'triangle', label: t('layer.shapeTriangle') },
+    { value: 'triangle_down', label: t('layer.shapeTriangleDown') },
+    { value: 'landmark', label: t('layer.shapeLandmark') },
+    { value: 'pin', label: t('layer.shapePin') },
+  ]
 
   const handleFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const f = e.target.files?.[0]
@@ -186,6 +199,8 @@ export default function LayerToolsPage() {
         borderColor: state.borderColor,
         fillColor: state.fillColor,
         lineWidth: parseInt(state.lineWidth) || 2,
+        pointSize: parseFloat(state.pointSize) || LAYER_DEFAULT_PARAMS.point.pointSize,
+        pointShape: state.pointShape,
         opacity: parseFloat(state.opacity),
       }
       const data = isSector
@@ -274,11 +289,20 @@ export default function LayerToolsPage() {
           </div>
         </>
       ) : (
-        <div>
-          <label className="block text-xs font-medium mb-1">{t('layer.pointSize')}</label>
-          <input {...numberInput(ts.pointSize, (v) => setTab(s => ({ ...s, pointSize: v })))}
-            className="w-full h-9 px-2 text-sm border border-border rounded bg-card" />
-        </div>
+        <>
+          <div>
+            <label className="block text-xs font-medium mb-1">{t('layer.pointSize')}</label>
+            <input {...numberInput(ts.pointSize, (v) => setTab(s => ({ ...s, pointSize: v })))}
+              className="w-full h-9 px-2 text-sm border border-border rounded bg-card" />
+          </div>
+          <div className="col-span-2">
+            <label className="block text-xs font-medium mb-1">{t('layer.pointShape')}</label>
+            <select value={ts.pointShape} onChange={e => setTab(s => ({ ...s, pointShape: e.target.value }))}
+              className="w-full h-9 px-2 text-sm border border-border rounded bg-card">
+              {POINT_SHAPES.map(s => <option key={s.value} value={s.value}>{s.label}</option>)}
+            </select>
+          </div>
+        </>
       )}
       {/* 边框颜色 */}
       <div>
