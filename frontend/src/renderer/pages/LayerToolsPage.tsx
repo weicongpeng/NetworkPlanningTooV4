@@ -105,6 +105,8 @@ export default function LayerToolsPage() {
   const handleFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const f = e.target.files?.[0]
     if (!f) return
+    // 重新导入：清空激活 Tab 的旧结果/错误，避免上一轮下载按钮+统计残留
+    setState(s => ({ ...s, result: null, error: '' }))
     // 导入区是页面级共享的：上传前清空共享文件（只作用于共享状态，两个 Tab 的配置各自保留）
     setSharedFile(() => emptySharedFile())
     setUploading(true)
