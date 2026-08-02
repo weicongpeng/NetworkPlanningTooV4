@@ -250,6 +250,16 @@ export default function LayerToolsPage() {
     </div>
   )
 
+  const reasonLabel = (reason: string): string => {
+    const map: Record<string, string> = {
+      missing_coord: t('layer.statsMissingCoord'),
+      invalid_coord: t('layer.statsInvalidCoord'),
+      invalid_azimuth: t('layer.statsInvalidAzimuth'),
+      missing_name: t('layer.statsMissingName'),
+    }
+    return map[reason] || reason
+  }
+
   const renderResult = (ts: TabState) => ts.result && (
     <div className="mt-3">
       <a href={ts.result.download_url} download
@@ -273,6 +283,40 @@ export default function LayerToolsPage() {
               })}
             </p>
           )}
+
+          {/* 失败小区明细列表（可展开） */}
+          {ts.result.stats.failed > 0 && ts.result.stats.failedDetails && ts.result.stats.failedDetails.length > 0 && (
+            <details className="mt-2">
+              <summary className="text-amber-600 cursor-pointer text-xs flex items-center gap-1">
+                {t('layer.statsFailures')} ({ts.result.stats.failed})
+              </summary>
+              <div className="max-h-40 overflow-y-auto mt-1 border border-border rounded-lg text-xs">
+                <table className="w-full text-left">
+                  <thead className="sticky top-0 bg-card">
+                    <tr className="border-b border-border">
+                      <th className="px-2 py-1 font-medium">{t('layer.statsRow')}</th>
+                      <th className="px-2 py-1 font-medium">{t('layer.statsName')}</th>
+                      <th className="px-2 py-1 font-medium">{t('layer.statsReason')}</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {ts.result.stats.failedDetails.slice(0, 100).map((d, i) => (
+                      <tr key={i} className="border-b border-border/50">
+                        <td className="px-2 py-1">{d.row}</td>
+                        <td className="px-2 py-1 truncate max-w-[8rem]">{d.name || '-'}</td>
+                        <td className="px-2 py-1">{reasonLabel(d.reason)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+                {ts.result.stats.failedDetails.length > 100 && (
+                  <p className="px-2 py-1 text-muted-foreground">
+                    {t('layer.statsMore').replace('{count}', String(ts.result.stats.failedDetails.length - 100))}
+                  </p>
+                )}
+              </div>
+            </details>
+          )}
         </div>
       )}
     </div>
@@ -288,7 +332,7 @@ export default function LayerToolsPage() {
           <label htmlFor={`layer-sheet-${activeTab}`} className="block text-xs font-medium mb-2">{t('layer.selectSheet')}</label>
           <select id={`layer-sheet-${activeTab}`} value={ts.sheetName}
             onChange={e => setTab(s => ({ ...s, sheetName: e.target.value, columns: s.info?.columns[e.target.value] || [] }))}
-            disabled={!ts.info || ts.info.sheets.length === 0}
+            disabled={!ts.info || ts.info.sheets.length <= 1}
             className="w-full h-9 px-2 text-sm border border-border rounded bg-card disabled:opacity-50">
             {ts.info && ts.info.sheets.length > 0
               ? ts.info.sheets.map(s => <option key={s} value={s}>{s}</option>)
@@ -298,18 +342,14 @@ export default function LayerToolsPage() {
 
         {/* ③ 属性配置 */}
         <div className="p-4 bg-card border border-border rounded-lg">
-          {ts.columns.length > 0 ? (
-            <LayerAttributeConfig
-              columns={ts.columns}
-              includeAzimuth={includeAzimuth}
-              selectedFields={ts.selectedFields}
-              onSelectedFieldsChange={(v) => setTab(s => ({ ...s, selectedFields: v }))}
-              fieldMappings={ts.fieldMappings}
-              onFieldMappingsChange={(v) => setTab(s => ({ ...s, fieldMappings: v }))}
-            />
-          ) : (
-            <p className="text-xs text-muted-foreground py-8 text-center">{t('layer.importHint')}</p>
-          )}
+          <LayerAttributeConfig
+            columns={ts.columns}
+            includeAzimuth={includeAzimuth}
+            selectedFields={ts.selectedFields}
+            onSelectedFieldsChange={(v) => setTab(s => ({ ...s, selectedFields: v }))}
+            fieldMappings={ts.fieldMappings}
+            onFieldMappingsChange={(v) => setTab(s => ({ ...s, fieldMappings: v }))}
+          />
         </div>
       </div>
 
@@ -350,23 +390,30 @@ export default function LayerToolsPage() {
           </Tabs.Trigger>
         </Tabs.List>
 
-        {/* ① 导入区（横跨，共用） */}
-        <label className="block p-6 border-2 border-dashed border-border rounded-lg cursor-pointer hover:border-primary transition-colors text-center">
-          <FileUp className="mx-auto mb-2 text-muted-foreground" size={24} />
-          <p className="text-sm">{state.fileName || t('layer.uploadExcel')}</p>
-          <p className="text-xs text-muted-foreground mt-1">{t('layer.acceptExcel')}</p>
-          <input type="file" className="hidden" accept=".xlsx,.xls" onChange={handleFile} disabled={uploading} />
-        </label>
+        {/* ① 导入区（与左栏对齐，高度减半，文字横向） */}
+        <div className="grid grid-cols-5 gap-6 mb-6">
+          <div className="col-span-3">
+            <label className="block flex items-center gap-3 px-6 py-3 border-2 border-dashed border-border rounded-lg cursor-pointer hover:border-primary transition-colors">
+              <FileUp className="text-muted-foreground shrink-0" size={20} />
+              <div className="flex-1 min-w-0">
+                <p className="text-sm truncate">{state.fileName || t('layer.uploadExcel')}</p>
+                <p className="text-xs text-muted-foreground">{t('layer.acceptExcel')}</p>
+              </div>
+              <input type="file" className="hidden" accept=".xlsx,.xls,.txt,.csv" onChange={handleFile} disabled={uploading} />
+            </label>
 
-        {/* 进度条 + 状态 */}
-        {uploading && progress && (
-          <div className="mt-3">
-            <div className="h-2 bg-muted rounded-full overflow-hidden">
-              <div className="h-full bg-primary transition-all duration-300" style={{ width: `${progress.percent}%` }} />
-            </div>
-            <p className="text-xs text-muted-foreground mt-1">{progressText()}</p>
+            {/* 进度条 + 状态 */}
+            {uploading && progress && (
+              <div className="mt-2">
+                <div className="h-2 bg-muted rounded-full overflow-hidden">
+                  <div className="h-full bg-primary transition-all duration-300" style={{ width: `${progress.percent}%` }} />
+                </div>
+                <p className="text-xs text-muted-foreground mt-1">{progressText()}</p>
+              </div>
+            )}
           </div>
-        )}
+          <div className="col-span-2" />
+        </div>
 
         {/* 扇区 Tab */}
         <Tabs.Content value="sector" className="mt-6 data-[state=inactive]:hidden">

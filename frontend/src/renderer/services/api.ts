@@ -968,6 +968,7 @@ export interface GenerateLayerResult {
     success: number
     failed: number
     failures: Record<string, number>
+    failedDetails?: Array<{ row: number; name: string; reason: string }>
   }
 }
 

@@ -1031,6 +1031,10 @@
     "statsInvalidCoord": "Invalid coordinates",
     "statsInvalidAzimuth": "Invalid azimuth",
     "statsMissingName": "Missing label name",
+    "statsRow": "Row",
+    "statsName": "Name",
+    "statsReason": "Reason",
+    "statsMore": "... and {count} more",
     "fileExpired": "File has expired, please re-import",
     "errNoFormat": "Please select at least one output format"
   }

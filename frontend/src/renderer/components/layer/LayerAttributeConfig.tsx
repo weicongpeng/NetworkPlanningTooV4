@@ -49,7 +49,7 @@ export function LayerAttributeConfig({
       <div>
         <p className="text-xs font-medium mb-2">{t('layer.selectAttributes')}</p>
         <div className="grid grid-cols-2 gap-2 max-h-48 overflow-y-auto border border-border rounded-lg p-3">
-          {columns.map(col => (
+          {columns.length > 0 ? columns.map(col => (
             <label key={col} className="flex items-center gap-2 text-xs cursor-pointer">
               <input
                 type="checkbox"
@@ -58,11 +58,13 @@ export function LayerAttributeConfig({
               />
               <span className="truncate">{col}</span>
             </label>
-          ))}
+          )) : (
+            <p className="text-xs text-muted-foreground col-span-2 py-4 text-center">{t('layer.importHint')}</p>
+          )}
         </div>
       </div>
 
-      {/* 关键字匹配 */}
+      {/* 关键字匹配（标签常驻，值空时禁用） */}
       <div className="space-y-2">
         <p className="text-xs font-medium">{t('layer.keywordMatch')}</p>
         {fieldTypes.map(f => (
@@ -72,7 +74,8 @@ export function LayerAttributeConfig({
               id={`layer-field-${f.type}`}
               value={fieldMappings[f.type] || ''}
               onChange={e => onFieldMappingsChange({ ...fieldMappings, [f.type]: e.target.value })}
-              className="flex-1 h-8 px-2 text-xs border border-border rounded bg-card"
+              disabled={columns.length === 0}
+              className="flex-1 h-8 px-2 text-xs border border-border rounded bg-card disabled:opacity-50"
             >
               <option value="">{t('layer.selectColumn')}</option>
               {columns.map(c => <option key={c} value={c}>{c}</option>)}

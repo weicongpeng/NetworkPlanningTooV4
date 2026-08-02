@@ -1042,6 +1042,10 @@
     "statsInvalidCoord": "经纬度格式错误",
     "statsInvalidAzimuth": "方位角无效",
     "statsMissingName": "标签名称缺失",
+    "statsRow": "行号",
+    "statsName": "标签名",
+    "statsReason": "失败原因",
+    "statsMore": "等共 {count} 条",
     "fileExpired": "文件已过期，请重新导入",
     "errNoFormat": "请至少选择一种输出格式"
   }
