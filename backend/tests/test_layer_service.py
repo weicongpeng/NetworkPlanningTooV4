@@ -80,6 +80,47 @@ def test_verify_readable_rejects_corrupt(service, tmp_path):
         service._verify_readable(out, 1, "tab")
 
 
+def test_verify_readable_rejects_wrong_count(service, sample_excel):
+    """读回验证：行数与期望不一致 → 抛「读回行数不一致」ValueError"""
+    out, stats = service.generate_point_layer(
+        file_path=str(sample_excel), sheet_name="LTE",
+        name_col="NAME", lon_col="LONGITUDE", lat_col="LATITUDE",
+        attributes=["NAME", "PCI"], output_format="tab",
+    )
+    assert stats["success"] == 2
+    # 正确行数 → 不抛错
+    service._verify_readable(out, 2, "tab")
+    # 错误行数 → 抛「读回行数不一致」
+    with pytest.raises(ValueError, match="读回行数不一致"):
+        service._verify_readable(out, 99, "tab")
+
+
+def test_verify_readable_mif_fallback_ok(service, sample_excel):
+    """读回验证：MIF 驱动 read_info 返回 -1 → 回退实际读取统计行数，正确行数通过"""
+    out, stats = service.generate_point_layer(
+        file_path=str(sample_excel), sheet_name="LTE",
+        name_col="NAME", lon_col="LONGITUDE", lat_col="LATITUDE",
+        attributes=["NAME", "PCI"], output_format="mif",
+    )
+    assert stats["success"] == 2
+    service._verify_readable(out, 2, "mif")   # -1 回退成功路径
+    with pytest.raises(ValueError, match="读回行数不一致"):
+        service._verify_readable(out, 99, "mif")
+
+
+def test_verify_readable_kml_counts_placemarks(service, sample_excel):
+    """读回验证：KML 解析后统计 Placemark 数量与期望行数比对"""
+    out, stats = service.generate_point_layer(
+        file_path=str(sample_excel), sheet_name="LTE",
+        name_col="NAME", lon_col="LONGITUDE", lat_col="LATITUDE",
+        attributes=["NAME", "PCI"], output_format="kml",
+    )
+    assert stats["success"] == 2
+    service._verify_readable(out, 2, "kml")
+    with pytest.raises(ValueError, match="读回行数不一致"):
+        service._verify_readable(out, 99, "kml")
+
+
 def test_generate_point_layer_readback_ok(service, sample_excel):
     """生成后读回验证通过：行数 = 成功数"""
     out, stats = service.generate_point_layer(

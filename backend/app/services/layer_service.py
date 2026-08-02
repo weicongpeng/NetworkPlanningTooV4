@@ -373,7 +373,13 @@ class LayerService:
         try:
             if output_format == "kml":
                 import xml.etree.ElementTree as ET
-                ET.fromstring(out_path.read_text(encoding="utf-8", errors="replace"))
+                root = ET.fromstring(out_path.read_text(encoding="utf-8", errors="replace"))
+                # 通配命名空间匹配（兼容带/不带 kml 命名空间）
+                count = len(root.findall(".//{*}Placemark"))
+                if count != expected_rows:
+                    raise ValueError(
+                        f"读回行数不一致（期望 {expected_rows}，实际 {count}）"
+                    )
                 return
             import pyogrio
             info = pyogrio.read_info(str(out_path))
