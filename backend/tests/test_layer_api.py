@@ -280,14 +280,14 @@ def test_file_path_nonexistent_returns_400():
 
 
 def test_non_excel_extension_rejected():
-    """非 Excel 扩展名上传 → 400"""
+    """不支持的文件扩展名上传 → 400（txt/csv 已支持，用 pdf 测试）"""
     path = _make_excel()
     client = _make_client()
     try:
         with open(path, "rb") as f:
             resp = client.post(
                 "/api/v1/layer/excel-info",
-                files={"file": ("sample.txt", f, "text/plain")},
+                files={"file": ("sample.pdf", f, "application/pdf")},
             )
         assert resp.status_code == 400
         assert "Excel" in resp.json()["detail"]
