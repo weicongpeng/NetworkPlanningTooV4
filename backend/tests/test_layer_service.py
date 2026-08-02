@@ -72,6 +72,26 @@ def test_generate_point_layer(service, sample_excel):
     assert gdf.crs.to_epsg() == 4326
 
 
+def test_verify_readable_rejects_corrupt(service, tmp_path):
+    """读回验证：损坏文件 → 抛 ValueError"""
+    out = tmp_path / "bad.tab"
+    out.write_text("!table\n!version 300\n", encoding="gbk")  # 缺字段定义
+    with pytest.raises(ValueError, match="校验失败"):
+        service._verify_readable(out, 1, "tab")
+
+
+def test_generate_point_layer_readback_ok(service, sample_excel):
+    """生成后读回验证通过：行数 = 成功数"""
+    out, stats = service.generate_point_layer(
+        file_path=str(sample_excel), sheet_name="LTE",
+        name_col="NAME", lon_col="LONGITUDE", lat_col="LATITUDE",
+        attributes=["NAME", "PCI"], output_format="tab",
+    )
+    assert stats["success"] == 2
+    # 生成流程内部已调用 _verify_readable，未抛错即通过
+    assert out.exists()
+
+
 def test_generate_sector_layer(service, sample_excel):
     """生成扇区图层并断言几何为多边形"""
     result, _ = service.generate_sector_layer(

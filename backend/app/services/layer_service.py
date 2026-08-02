@@ -368,6 +368,28 @@ class LayerService:
             out_path.write_text(text, encoding="utf-8")
         return out_path
 
+    def _verify_readable(self, out_path: Path, expected_rows: int, output_format: str):
+        """生成后读回验证：文件可解析且行数一致，否则抛 ValueError。"""
+        try:
+            if output_format == "kml":
+                import xml.etree.ElementTree as ET
+                ET.fromstring(out_path.read_text(encoding="utf-8", errors="replace"))
+                return
+            import pyogrio
+            info = pyogrio.read_info(str(out_path))
+            count = info["features"]
+            if count == -1:
+                # MIF 等驱动不报告特征数（需全量扫描），改用实际读取统计行数
+                count = len(pyogrio.read_dataframe(str(out_path)))
+            if count != expected_rows:
+                raise ValueError(
+                    f"读回行数不一致（期望 {expected_rows}，实际 {count}）"
+                )
+        except ValueError:
+            raise
+        except Exception as e:
+            raise ValueError(f"生成文件校验失败（{output_format} 不可读）: {str(e)}") from e
+
     def generate_point_layer(self, file_path: str, sheet_name: str,
                              name_col: str, lon_col: str, lat_col: str,
                              attributes: List[str], output_format: str,
@@ -404,6 +426,7 @@ class LayerService:
                           source_filename=source_filename or Path(file_path).name,
                           sheet_name=sheet_name)
         out = self._apply_color(out, output_format, color, is_point=True)
+        self._verify_readable(out, int(valid.sum()), output_format)
 
         stats = {
             "total": int(len(df)),
@@ -464,6 +487,7 @@ class LayerService:
                           source_filename=source_filename or Path(file_path).name,
                           sheet_name=sheet_name)
         out = self._apply_color(out, output_format, color, is_point=False)
+        self._verify_readable(out, int(valid.sum()), output_format)
 
         stats = {
             "total": int(len(df)),
