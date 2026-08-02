@@ -1032,6 +1032,17 @@
     "noFile": "未选择文件",
     "uploadBtn": "点击上传",
     "params": "参数设置",
-    "uploadDone": "图层生成完成"
+    "uploadDone": "图层生成完成",
+    "formats": "输出格式",
+    "statsTotal": "总量",
+    "statsSuccess": "成功",
+    "statsFailed": "失败",
+    "statsFailures": "失败原因",
+    "statsMissingCoord": "经纬度缺失",
+    "statsInvalidCoord": "经纬度格式错误",
+    "statsInvalidAzimuth": "方位角无效",
+    "statsMissingName": "标签名称缺失",
+    "fileExpired": "文件已过期，请重新导入",
+    "errNoFormat": "请至少选择一种输出格式"
   }
 }

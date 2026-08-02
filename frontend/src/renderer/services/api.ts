@@ -963,6 +963,12 @@ export interface LayerExcelInfo {
 export interface GenerateLayerResult {
   filename: string
   download_url: string
+  stats?: {
+    total: number
+    success: number
+    failed: number
+    failures: Record<string, number>
+  }
 }
 
 export interface GenerateLayerParams {
@@ -974,9 +980,11 @@ export interface GenerateLayerParams {
   latCol: string
   azimuthCol?: string
   attributes: string[]
-  outputFormat: 'tab' | 'mif' | 'kml'
+  outputFormats: Array<'tab' | 'mif' | 'kml'>  // 多格式
+  outputFormat?: 'tab' | 'mif' | 'kml'          // 旧单值，兼容
   radiusM?: number
   beamwidth?: number
+  pointSize?: number
   color?: string
 }
 
@@ -1029,7 +1037,8 @@ export const layerToolsApi = {
     formData.append('lat_col', params.latCol)
     formData.append('azimuth_col', params.azimuthCol || '')
     formData.append('attributes', JSON.stringify(params.attributes))
-    formData.append('output_format', params.outputFormat)
+    // 多格式优先，兼容旧单值
+    formData.append('output_formats', (params.outputFormats || [params.outputFormat!]).join(','))
     if (params.radiusM) formData.append('radius_m', String(params.radiusM))
     if (params.beamwidth) formData.append('beamwidth', String(params.beamwidth))
     if (params.color) formData.append('color', params.color)
@@ -1047,7 +1056,8 @@ export const layerToolsApi = {
     formData.append('lon_col', params.lonCol)
     formData.append('lat_col', params.latCol)
     formData.append('attributes', JSON.stringify(params.attributes))
-    formData.append('output_format', params.outputFormat)
+    // 多格式优先，兼容旧单值
+    formData.append('output_formats', (params.outputFormats || [params.outputFormat!]).join(','))
     if (params.color) formData.append('color', params.color)
     const res = await uploadClient.post('/layer/point', formData)
     return res.data

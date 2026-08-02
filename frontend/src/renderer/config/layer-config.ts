@@ -35,8 +35,8 @@ export function autoMatchFields(columns: string[], includeAzimuth: boolean): Rec
   return result
 }
 
-// 默认参数
+// 默认参数（扇区半径 50m、波瓣夹角 50°）
 export const LAYER_DEFAULT_PARAMS = {
-  sector: { radiusM: 3000, beamwidth: 40, color: '#4A90D9' },
+  sector: { radiusM: 50, beamwidth: 50, color: '#4A90D9' },
   point: { pointSize: 8, color: '#FF0000' },
 }

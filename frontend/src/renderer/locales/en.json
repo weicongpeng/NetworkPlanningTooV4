@@ -1021,6 +1021,17 @@
     "noFile": "No file selected",
     "uploadBtn": "Click to upload",
     "params": "Parameters",
-    "uploadDone": "Layer generated"
+    "uploadDone": "Layer generated",
+    "formats": "Output Format",
+    "statsTotal": "Total",
+    "statsSuccess": "Success",
+    "statsFailed": "Failed",
+    "statsFailures": "Failures",
+    "statsMissingCoord": "Missing coordinates",
+    "statsInvalidCoord": "Invalid coordinates",
+    "statsInvalidAzimuth": "Invalid azimuth",
+    "statsMissingName": "Missing label name",
+    "fileExpired": "File has expired, please re-import",
+    "errNoFormat": "Please select at least one output format"
   }
 }

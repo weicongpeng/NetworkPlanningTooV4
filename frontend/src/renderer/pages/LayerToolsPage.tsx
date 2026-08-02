@@ -1,10 +1,13 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { useTranslation } from 'react-i18next'
 import * as Tabs from '@radix-ui/react-tabs'
 import { FileUp, Loader2, Download, CheckCircle2 } from 'lucide-react'
 import { layerToolsApi, type LayerExcelInfo, type GenerateLayerResult } from '../services/api'
 import { LayerAttributeConfig } from '../components/layer/LayerAttributeConfig'
 import { LAYER_DEFAULT_PARAMS } from '../config/layer-config'
+
+type LayerFormat = 'tab' | 'mif' | 'kml'
+const ALL_FORMATS: LayerFormat[] = ['tab', 'mif', 'kml']
 
 interface TabState {
   filePath: string
@@ -15,14 +18,16 @@ interface TabState {
   columns: string[]
   selectedFields: Record<string, string>
   fieldMappings: Record<string, string>
-  radiusM: number
-  beamwidth: number
-  pointSize: number
+  radiusM: string          // 字符串受控，避免删空变 0 / 前导 0
+  beamwidth: string
+  pointSize: string
   color: string
-  format: 'tab' | 'mif' | 'kml'
+  formats: LayerFormat[]   // 多格式勾选
   result: GenerateLayerResult | null
   error: string
 }
+
+const STORAGE_KEYS = { sector: 'layerTools.sector', point: 'layerTools.point' }
 
 function emptyTabState(type: 'sector' | 'point'): TabState {
   return {
@@ -34,24 +39,44 @@ function emptyTabState(type: 'sector' | 'point'): TabState {
     columns: [],
     selectedFields: {},
     fieldMappings: {},
-    radiusM: type === 'sector' ? LAYER_DEFAULT_PARAMS.sector.radiusM : 0,
-    beamwidth: type === 'sector' ? LAYER_DEFAULT_PARAMS.sector.beamwidth : 0,
-    pointSize: type === 'point' ? LAYER_DEFAULT_PARAMS.point.pointSize : 0,
+    radiusM: type === 'sector' ? String(LAYER_DEFAULT_PARAMS.sector.radiusM) : '',
+    beamwidth: type === 'sector' ? String(LAYER_DEFAULT_PARAMS.sector.beamwidth) : '',
+    pointSize: type === 'point' ? String(LAYER_DEFAULT_PARAMS.point.pointSize) : '',
     color: type === 'sector' ? LAYER_DEFAULT_PARAMS.sector.color : LAYER_DEFAULT_PARAMS.point.color,
-    format: 'tab',
+    formats: ['tab'],
     result: null,
     error: '',
   }
 }
 
+// 从 sessionStorage 恢复状态（页面内保留：切换路由切回后不丢失）
+function loadState(key: string, type: 'sector' | 'point'): TabState {
+  try {
+    const raw = sessionStorage.getItem(key)
+    if (raw) {
+      const saved = JSON.parse(raw)
+      return { ...emptyTabState(type), ...saved }
+    }
+  } catch { /* ignore */ }
+  return emptyTabState(type)
+}
+
+function saveState(key: string, s: TabState) {
+  try { sessionStorage.setItem(key, JSON.stringify(s)) } catch { /* ignore */ }
+}
+
 export default function LayerToolsPage() {
   const { t } = useTranslation()
   const [activeTab, setActiveTab] = useState<'sector' | 'point'>('sector')
-  const [sectorState, setSectorState] = useState<TabState>(emptyTabState('sector'))
-  const [pointState, setPointState] = useState<TabState>(emptyTabState('point'))
+  const [sectorState, setSectorState] = useState<TabState>(() => loadState(STORAGE_KEYS.sector, 'sector'))
+  const [pointState, setPointState] = useState<TabState>(() => loadState(STORAGE_KEYS.point, 'point'))
   const [uploading, setUploading] = useState(false)
   const [generating, setGenerating] = useState(false)
   const [progress, setProgress] = useState<{ percent: number; step: string } | null>(null)
+
+  // 持久化：state 变化写 sessionStorage
+  useEffect(() => saveState(STORAGE_KEYS.sector, sectorState), [sectorState])
+  useEffect(() => saveState(STORAGE_KEYS.point, pointState), [pointState])
 
   // 当前激活 Tab 的 state
   const state = activeTab === 'sector' ? sectorState : pointState
@@ -60,12 +85,14 @@ export default function LayerToolsPage() {
     else setPointState(s => updater(s))
   }
 
+  const isSector = activeTab === 'sector'
+
   const handleFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const f = e.target.files?.[0]
     if (!f) return
     setState(s => ({ ...s, result: null, error: '', info: null, columns: [], sheetName: '' }))
     setUploading(true)
-    setProgress({ percent: 0, step: 'uploading' })
+    setProgress({ percent: 1, step: 'uploading' })
     try {
       const up = await layerToolsApi.uploadLayerFile(f, (p) => {
         setProgress({ percent: p.percent, step: p.step })
@@ -94,7 +121,11 @@ export default function LayerToolsPage() {
       setState(s => ({ ...s, error: t('layer.errSheet') }))
       return
     }
-    if (activeTab === 'sector') {
+    if (state.formats.length === 0) {
+      setState(s => ({ ...s, error: t('layer.errNoFormat') }))
+      return
+    }
+    if (isSector) {
       if (!state.fieldMappings.name || !state.fieldMappings.longitude || !state.fieldMappings.latitude || !state.fieldMappings.azimuth) {
         setState(s => ({ ...s, error: t('layer.errMissingFields') }))
         return
@@ -106,40 +137,36 @@ export default function LayerToolsPage() {
       }
     }
     setGenerating(true)
-    setState(s => ({ ...s, error: '' }))
+    setState(s => ({ ...s, error: '', result: null }))
     try {
-      let data: GenerateLayerResult
-      if (activeTab === 'sector') {
-        data = await layerToolsApi.generateSector({
-          filePath: state.filePath,
-          sourceFilename: state.sourceFilename,
-          sheetName: state.sheetName,
-          nameCol: state.fieldMappings.name,
-          lonCol: state.fieldMappings.longitude,
-          latCol: state.fieldMappings.latitude,
-          azimuthCol: state.fieldMappings.azimuth,
-          attributes: Object.values(state.selectedFields),
-          outputFormat: state.format,
-          radiusM: state.radiusM,
-          beamwidth: state.beamwidth,
-          color: state.color,
-        })
-      } else {
-        data = await layerToolsApi.generatePoint({
-          filePath: state.filePath,
-          sourceFilename: state.sourceFilename,
-          sheetName: state.sheetName,
-          nameCol: state.fieldMappings.name,
-          lonCol: state.fieldMappings.longitude,
-          latCol: state.fieldMappings.latitude,
-          attributes: Object.values(state.selectedFields),
-          outputFormat: state.format,
-          color: state.color,
-        })
+      const base = {
+        filePath: state.filePath,
+        sourceFilename: state.sourceFilename,
+        sheetName: state.sheetName,
+        nameCol: state.fieldMappings.name,
+        lonCol: state.fieldMappings.longitude,
+        latCol: state.fieldMappings.latitude,
+        attributes: Object.values(state.selectedFields),
+        outputFormats: state.formats,
+        color: state.color,
       }
+      const data = isSector
+        ? await layerToolsApi.generateSector({
+            ...base,
+            azimuthCol: state.fieldMappings.azimuth,
+            radiusM: parseFloat(state.radiusM) || LAYER_DEFAULT_PARAMS.sector.radiusM,
+            beamwidth: parseFloat(state.beamwidth) || LAYER_DEFAULT_PARAMS.sector.beamwidth,
+          })
+        : await layerToolsApi.generatePoint(base)
       setState(s => ({ ...s, result: data }))
     } catch (err: any) {
-      setState(s => ({ ...s, error: err?.message || String(err) }))
+      // 文件过期（后端 TTL 清理后 file_path 失效）→ 清空状态提示重新导入
+      const msg = err?.message || String(err)
+      if (/文件不存在|文件已过期/.test(msg)) {
+        setState(s => ({ ...s, error: t('layer.fileExpired'), filePath: '', fileName: '', info: null, columns: [] }))
+      } else {
+        setState(s => ({ ...s, error: msg }))
+      }
     } finally {
       setGenerating(false)
     }
@@ -151,6 +178,161 @@ export default function LayerToolsPage() {
     if (progress.step === 'reading') return t('layer.reading')
     return t('layer.done')
   }
+
+  const formatFailures = (failures: Record<string, number>, labels: Record<string, string>) => {
+    return Object.entries(failures)
+      .filter(([, v]) => v > 0)
+      .map(([k, v]) => `${labels[k] || k} ${v}`)
+      .join(' · ')
+  }
+
+  // 参数输入框（字符串受控，只允许数字/小数点）
+  const numberInput = (value: string, onChange: (v: string) => void) => ({
+    type: 'text' as const,
+    inputMode: 'numeric' as const,
+    value,
+    onChange: (e: React.ChangeEvent<HTMLInputElement>) => {
+      if (/^\d*\.?\d*$/.test(e.target.value)) onChange(e.target.value)
+    },
+  })
+
+  const renderParams = (ts: TabState, setTab: (u: (s: TabState) => TabState) => void) => (
+    <div className="grid grid-cols-2 gap-4">
+      {isSector ? (
+        <>
+          <div>
+            <label className="block text-xs font-medium mb-1">{t('layer.radius')} (m)</label>
+            <input {...numberInput(ts.radiusM, (v) => setTab(s => ({ ...s, radiusM: v })))}
+              className="w-full h-9 px-2 text-sm border border-border rounded bg-card" />
+          </div>
+          <div>
+            <label className="block text-xs font-medium mb-1">{t('layer.beamwidth')} (°)</label>
+            <input {...numberInput(ts.beamwidth, (v) => setTab(s => ({ ...s, beamwidth: v })))}
+              className="w-full h-9 px-2 text-sm border border-border rounded bg-card" />
+          </div>
+        </>
+      ) : (
+        <div>
+          <label className="block text-xs font-medium mb-1">{t('layer.pointSize')}</label>
+          <input {...numberInput(ts.pointSize, (v) => setTab(s => ({ ...s, pointSize: v })))}
+            className="w-full h-9 px-2 text-sm border border-border rounded bg-card" />
+        </div>
+      )}
+      <div>
+        <label className="block text-xs font-medium mb-1">{t('layer.fillColor')}</label>
+        <input type="color" value={ts.color} onChange={e => setTab(s => ({ ...s, color: e.target.value }))}
+          className="w-full h-9 cursor-pointer" />
+      </div>
+      {/* 输出格式多选勾选 */}
+      <div className="col-span-2">
+        <label className="block text-xs font-medium mb-1">{t('layer.formats')}</label>
+        <div className="flex gap-4">
+          {ALL_FORMATS.map(fmt => (
+            <label key={fmt} className="flex items-center gap-1.5 text-xs cursor-pointer">
+              <input
+                type="checkbox"
+                checked={ts.formats.includes(fmt)}
+                onChange={e => {
+                  const formats = e.target.checked
+                    ? [...ts.formats, fmt]
+                    : ts.formats.filter(f => f !== fmt)
+                  if (formats.length > 0) setTab(s => ({ ...s, formats }))
+                }}
+              />
+              {fmt.toUpperCase()}
+            </label>
+          ))}
+        </div>
+        {ts.formats.includes('tab') && !ts.formats.some(f => f !== 'tab') && (
+          <p className="text-[10px] text-muted-foreground mt-1">{t('layer.colorTabHint')}</p>
+        )}
+      </div>
+    </div>
+  )
+
+  const renderResult = (ts: TabState) => ts.result && (
+    <div className="mt-3">
+      <a href={ts.result.download_url} download
+        className="w-full inline-flex items-center justify-center gap-2 px-6 py-2.5 bg-green-600 text-white rounded-lg hover:opacity-90 text-sm">
+        <Download size={16} /> {t('layer.download')} ({ts.result.filename})
+      </a>
+      {ts.result.stats && (
+        <div className="mt-2 text-xs space-y-1">
+          <p className="text-green-600 flex items-center gap-1">
+            <CheckCircle2 size={14} />
+            {t('layer.statsTotal')} {ts.result.stats.total} | {t('layer.statsSuccess')} {ts.result.stats.success}
+            {ts.result.stats.failed > 0 && ` | ${t('layer.statsFailed')} ${ts.result.stats.failed}`}
+          </p>
+          {ts.result.stats.failed > 0 && (
+            <p className="text-amber-600">
+              {t('layer.statsFailures')}: {formatFailures(ts.result.stats.failures, {
+                missing_coord: t('layer.statsMissingCoord'),
+                invalid_coord: t('layer.statsInvalidCoord'),
+                invalid_azimuth: t('layer.statsInvalidAzimuth'),
+                missing_name: t('layer.statsMissingName'),
+              })}
+            </p>
+          )}
+        </div>
+      )}
+    </div>
+  )
+
+  // 渲染 Tab 内容（扇区/点图共用骨架，参数和校验差异）
+  const renderTabContent = (ts: TabState, setTab: (u: (s: TabState) => TabState) => void, includeAzimuth: boolean) => (
+    <div className="grid grid-cols-5 gap-6">
+      {/* 左栏（3/5） */}
+      <div className="col-span-3 space-y-6">
+        {/* ② Sheet 选择 */}
+        <div className="p-4 bg-card border border-border rounded-lg">
+          <label htmlFor={`layer-sheet-${activeTab}`} className="block text-xs font-medium mb-2">{t('layer.selectSheet')}</label>
+          <select id={`layer-sheet-${activeTab}`} value={ts.sheetName}
+            onChange={e => setTab(s => ({ ...s, sheetName: e.target.value, columns: s.info?.columns[e.target.value] || [] }))}
+            disabled={!ts.info || ts.info.sheets.length === 0}
+            className="w-full h-9 px-2 text-sm border border-border rounded bg-card disabled:opacity-50">
+            {ts.info && ts.info.sheets.length > 0
+              ? ts.info.sheets.map(s => <option key={s} value={s}>{s}</option>)
+              : <option value="">{t('layer.importHint')}</option>}
+          </select>
+        </div>
+
+        {/* ③ 属性配置 */}
+        <div className="p-4 bg-card border border-border rounded-lg">
+          {ts.columns.length > 0 ? (
+            <LayerAttributeConfig
+              columns={ts.columns}
+              includeAzimuth={includeAzimuth}
+              selectedFields={ts.selectedFields}
+              onSelectedFieldsChange={(v) => setTab(s => ({ ...s, selectedFields: v }))}
+              fieldMappings={ts.fieldMappings}
+              onFieldMappingsChange={(v) => setTab(s => ({ ...s, fieldMappings: v }))}
+            />
+          ) : (
+            <p className="text-xs text-muted-foreground py-8 text-center">{t('layer.importHint')}</p>
+          )}
+        </div>
+      </div>
+
+      {/* 右栏（2/5） */}
+      <div className="col-span-2 space-y-6">
+        {/* ④ 参数设置 */}
+        <div className="p-4 bg-card border border-border rounded-lg">
+          <p className="text-xs font-medium mb-3">{t('layer.params')}</p>
+          {renderParams(ts, setTab)}
+        </div>
+
+        {/* ⑤ 生成 + 下载 */}
+        <div className="p-4 bg-card border border-border rounded-lg">
+          <button onClick={handleGenerate} disabled={generating || !ts.filePath || !ts.sheetName}
+            className="w-full px-6 py-2.5 bg-primary text-primary-foreground rounded-lg hover:opacity-90 disabled:opacity-50 text-sm font-medium">
+            {generating ? <Loader2 size={16} className="animate-spin inline mr-2" /> : null}
+            {t('layer.generate')}
+          </button>
+          {renderResult(ts)}
+        </div>
+      </div>
+    </div>
+  )
 
   return (
     <div className="p-8 max-w-6xl">
@@ -188,184 +370,13 @@ export default function LayerToolsPage() {
 
         {/* 扇区 Tab */}
         <Tabs.Content value="sector" className="mt-6 data-[state=inactive]:hidden">
-          <div className="grid grid-cols-5 gap-6">
-            {/* 左栏（3/5） */}
-            <div className="col-span-3 space-y-6">
-              {/* ② Sheet 选择 */}
-              <div className="p-4 bg-card border border-border rounded-lg">
-                <label htmlFor="layer-sheet-sector" className="block text-xs font-medium mb-2">{t('layer.selectSheet')}</label>
-                <select id="layer-sheet-sector" value={sectorState.sheetName}
-                  onChange={e => {
-                    setSectorState(s => ({ ...s, sheetName: e.target.value, columns: s.info?.columns[e.target.value] || [] }))
-                  }}
-                  disabled={!sectorState.info || sectorState.info.sheets.length === 0}
-                  className="w-full h-9 px-2 text-sm border border-border rounded bg-card disabled:opacity-50">
-                  {sectorState.info && sectorState.info.sheets.length > 0
-                    ? sectorState.info.sheets.map(s => <option key={s} value={s}>{s}</option>)
-                    : <option value="">{t('layer.importHint')}</option>}
-                </select>
-              </div>
-
-              {/* ③ 属性配置（含方位角） */}
-              <div className="p-4 bg-card border border-border rounded-lg">
-                {sectorState.columns.length > 0 ? (
-                  <LayerAttributeConfig
-                    columns={sectorState.columns}
-                    includeAzimuth
-                    selectedFields={sectorState.selectedFields}
-                    onSelectedFieldsChange={(v) => setSectorState(s => ({ ...s, selectedFields: v }))}
-                    fieldMappings={sectorState.fieldMappings}
-                    onFieldMappingsChange={(v) => setSectorState(s => ({ ...s, fieldMappings: v }))}
-                  />
-                ) : (
-                  <p className="text-xs text-muted-foreground py-8 text-center">{t('layer.importHint')}</p>
-                )}
-              </div>
-            </div>
-
-            {/* 右栏（2/5） */}
-            <div className="col-span-2 space-y-6">
-              {/* ④ 参数设置（扇区） */}
-              <div className="p-4 bg-card border border-border rounded-lg">
-                <p className="text-xs font-medium mb-3">{t('layer.params')}</p>
-                <div className="grid grid-cols-2 gap-4">
-                  <div>
-                    <label className="block text-xs font-medium mb-1">{t('layer.radius')} (m)</label>
-                    <input type="number" value={sectorState.radiusM} onChange={e => setSectorState(s => ({ ...s, radiusM: Number(e.target.value) }))}
-                      className="w-full h-9 px-2 text-sm border border-border rounded bg-card" />
-                  </div>
-                  <div>
-                    <label className="block text-xs font-medium mb-1">{t('layer.beamwidth')} (°)</label>
-                    <input type="number" value={sectorState.beamwidth} onChange={e => setSectorState(s => ({ ...s, beamwidth: Number(e.target.value) }))}
-                      className="w-full h-9 px-2 text-sm border border-border rounded bg-card" />
-                  </div>
-                  <div>
-                    <label className="block text-xs font-medium mb-1">{t('layer.fillColor')}</label>
-                    <input type="color" value={sectorState.color} onChange={e => setSectorState(s => ({ ...s, color: e.target.value }))}
-                      className="w-full h-9 cursor-pointer" />
-                  </div>
-                  <div>
-                    <label className="block text-xs font-medium mb-1">{t('layer.outputFormat')}</label>
-                    <select value={sectorState.format} onChange={e => setSectorState(s => ({ ...s, format: e.target.value as any }))}
-                      className="w-full h-9 px-2 text-sm border border-border rounded bg-card">
-                      <option value="tab">TAB</option>
-                      <option value="mif">MIF</option>
-                      <option value="kml">KML</option>
-                    </select>
-                    {sectorState.format === 'tab' && (
-                      <p className="text-[10px] text-muted-foreground mt-1">{t('layer.colorTabHint')}</p>
-                    )}
-                  </div>
-                </div>
-              </div>
-
-              {/* ⑤ 生成 + 下载 */}
-              <div className="p-4 bg-card border border-border rounded-lg">
-                <button onClick={handleGenerate} disabled={generating || !sectorState.filePath || !sectorState.sheetName}
-                  className="w-full px-6 py-2.5 bg-primary text-primary-foreground rounded-lg hover:opacity-90 disabled:opacity-50 text-sm font-medium">
-                  {generating ? <Loader2 size={16} className="animate-spin inline mr-2" /> : null}
-                  {t('layer.generate')}
-                </button>
-                {sectorState.result && (
-                  <a href={sectorState.result.download_url} download
-                    className="mt-3 w-full inline-flex items-center justify-center gap-2 px-6 py-2.5 bg-green-600 text-white rounded-lg hover:opacity-90 text-sm">
-                    <Download size={16} /> {t('layer.download')} ({sectorState.result.filename})
-                  </a>
-                )}
-                {sectorState.result && <p className="mt-2 text-xs text-green-500 flex items-center gap-1"><CheckCircle2 size={14} /> {t('layer.uploadDone')}</p>}
-              </div>
-            </div>
-          </div>
-
+          {renderTabContent(sectorState, (u) => setSectorState(s => u(s)), true)}
           {sectorState.error && <p className="mt-4 text-xs text-red-500">{sectorState.error}</p>}
         </Tabs.Content>
 
         {/* 点图 Tab */}
         <Tabs.Content value="point" className="mt-6 data-[state=inactive]:hidden">
-          <div className="grid grid-cols-5 gap-6">
-            {/* 左栏（3/5） */}
-            <div className="col-span-3 space-y-6">
-              {/* ② Sheet 选择 */}
-              <div className="p-4 bg-card border border-border rounded-lg">
-                <label htmlFor="layer-sheet-point" className="block text-xs font-medium mb-2">{t('layer.selectSheet')}</label>
-                <select id="layer-sheet-point" value={pointState.sheetName}
-                  onChange={e => {
-                    setPointState(s => ({ ...s, sheetName: e.target.value, columns: s.info?.columns[e.target.value] || [] }))
-                  }}
-                  disabled={!pointState.info || pointState.info.sheets.length === 0}
-                  className="w-full h-9 px-2 text-sm border border-border rounded bg-card disabled:opacity-50">
-                  {pointState.info && pointState.info.sheets.length > 0
-                    ? pointState.info.sheets.map(s => <option key={s} value={s}>{s}</option>)
-                    : <option value="">{t('layer.importHint')}</option>}
-                </select>
-              </div>
-
-              {/* ③ 属性配置（无方位角） */}
-              <div className="p-4 bg-card border border-border rounded-lg">
-                {pointState.columns.length > 0 ? (
-                  <LayerAttributeConfig
-                    columns={pointState.columns}
-                    includeAzimuth={false}
-                    selectedFields={pointState.selectedFields}
-                    onSelectedFieldsChange={(v) => setPointState(s => ({ ...s, selectedFields: v }))}
-                    fieldMappings={pointState.fieldMappings}
-                    onFieldMappingsChange={(v) => setPointState(s => ({ ...s, fieldMappings: v }))}
-                  />
-                ) : (
-                  <p className="text-xs text-muted-foreground py-8 text-center">{t('layer.importHint')}</p>
-                )}
-              </div>
-            </div>
-
-            {/* 右栏（2/5） */}
-            <div className="col-span-2 space-y-6">
-              {/* ④ 参数设置（点图） */}
-              <div className="p-4 bg-card border border-border rounded-lg">
-                <p className="text-xs font-medium mb-3">{t('layer.params')}</p>
-                <div className="grid grid-cols-2 gap-4">
-                  <div>
-                    <label className="block text-xs font-medium mb-1">{t('layer.pointSize')}</label>
-                    <input type="number" value={pointState.pointSize} onChange={e => setPointState(s => ({ ...s, pointSize: Number(e.target.value) }))}
-                      className="w-full h-9 px-2 text-sm border border-border rounded bg-card" />
-                  </div>
-                  <div>
-                    <label className="block text-xs font-medium mb-1">{t('layer.fillColor')}</label>
-                    <input type="color" value={pointState.color} onChange={e => setPointState(s => ({ ...s, color: e.target.value }))}
-                      className="w-full h-9 cursor-pointer" />
-                  </div>
-                  <div>
-                    <label className="block text-xs font-medium mb-1">{t('layer.outputFormat')}</label>
-                    <select value={pointState.format} onChange={e => setPointState(s => ({ ...s, format: e.target.value as any }))}
-                      className="w-full h-9 px-2 text-sm border border-border rounded bg-card">
-                      <option value="tab">TAB</option>
-                      <option value="mif">MIF</option>
-                      <option value="kml">KML</option>
-                    </select>
-                    {pointState.format === 'tab' && (
-                      <p className="text-[10px] text-muted-foreground mt-1">{t('layer.colorTabHint')}</p>
-                    )}
-                  </div>
-                </div>
-              </div>
-
-              {/* ⑤ 生成 + 下载 */}
-              <div className="p-4 bg-card border border-border rounded-lg">
-                <button onClick={handleGenerate} disabled={generating || !pointState.filePath || !pointState.sheetName}
-                  className="w-full px-6 py-2.5 bg-primary text-primary-foreground rounded-lg hover:opacity-90 disabled:opacity-50 text-sm font-medium">
-                  {generating ? <Loader2 size={16} className="animate-spin inline mr-2" /> : null}
-                  {t('layer.generate')}
-                </button>
-                {pointState.result && (
-                  <a href={pointState.result.download_url} download
-                    className="mt-3 w-full inline-flex items-center justify-center gap-2 px-6 py-2.5 bg-green-600 text-white rounded-lg hover:opacity-90 text-sm">
-                    <Download size={16} /> {t('layer.download')} ({pointState.result.filename})
-                  </a>
-                )}
-                {pointState.result && <p className="mt-2 text-xs text-green-500 flex items-center gap-1"><CheckCircle2 size={14} /> {t('layer.uploadDone')}</p>}
-              </div>
-            </div>
-          </div>
-
+          {renderTabContent(pointState, (u) => setPointState(s => u(s)), false)}
           {pointState.error && <p className="mt-4 text-xs text-red-500">{pointState.error}</p>}
         </Tabs.Content>
       </Tabs.Root>
