@@ -139,11 +139,17 @@ def svg_point_icon(shape: str, color: str) -> str:
 
 
 def _kml_color_with_alpha(color: Optional[str], opacity: float) -> Optional[str]:
-    """KML aabbggrr + 指定透明度 opacity(0-1)。非法颜色返回 None"""
+    """KML aabbggrr + 指定透明度 opacity(0-1)。非法颜色/透明度返回 None"""
     c = hex_to_kml_color(color)
     if c is None:
         return None
-    a = max(0.0, min(1.0, float(opacity)))
+    try:
+        a = float(opacity)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(a):
+        return None  # NaN/Inf → 视为非法透明度
+    a = max(0.0, min(1.0, a))
     return f"{int(round(a * 255)):02x}{c[2:]}"
 
 

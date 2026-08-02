@@ -825,3 +825,19 @@ def test_kml_point_scale_default(service, sample_excel):
     )
     text = result.read_text(encoding="utf-8")
     assert "<scale>1.00</scale>" in text
+
+
+def test_kml_opacity_nan_safe(service, sample_excel):
+    """透明度 NaN/非法 → 不抛错，KML 正常生成（回退不注入该样式颜色或跳过）"""
+    # NaN opacity 不应使 round() 抛 ValueError
+    out, _ = service.generate_point_layer(
+        file_path=str(sample_excel), sheet_name="LTE",
+        name_col="NAME", lon_col="LONGITUDE", lat_col="LATITUDE",
+        attributes=["NAME"], output_format="kml",
+        border_color="#4A90D9", opacity=float("nan"),
+    )
+    assert out.exists()
+    text = out.read_text(encoding="utf-8")
+    assert "<kml" in text.lower()
+    import xml.etree.ElementTree as ET
+    ET.fromstring(text)  # XML 合法

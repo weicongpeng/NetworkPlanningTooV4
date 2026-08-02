@@ -201,7 +201,7 @@ export default function LayerToolsPage() {
         lineWidth: parseInt(state.lineWidth) || 2,
         pointSize: parseFloat(state.pointSize) || LAYER_DEFAULT_PARAMS.point.pointSize,
         pointShape: state.pointShape,
-        opacity: parseFloat(state.opacity),
+        opacity: Number.isFinite(parseFloat(state.opacity)) ? parseFloat(state.opacity) : 1
       }
       const data = isSector
         ? await layerToolsApi.generateSector({
