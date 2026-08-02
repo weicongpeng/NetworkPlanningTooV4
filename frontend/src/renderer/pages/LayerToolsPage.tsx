@@ -435,11 +435,18 @@ export default function LayerToolsPage() {
     setSharedFile(f => ({ ...f, sheetName: sheet, columns: f.info?.columns[sheet] || [] }))
   }
 
+  // 切换 Tab：清空非激活 Tab 的旧下载结果（按钮+统计），避免交叉显示；配置各自保留
+  const handleTabChange = (v: 'sector' | 'point') => {
+    setActiveTab(v)
+    if (v === 'point') setSectorState(s => ({ ...s, result: null }))
+    else setPointState(s => ({ ...s, result: null }))
+  }
+
   return (
     <div className="p-8 max-w-6xl">
       <h1 className="text-base font-bold mb-6">{t('nav.layerTools')}</h1>
 
-      <Tabs.Root value={activeTab} onValueChange={(v) => setActiveTab(v as 'sector' | 'point')}>
+      <Tabs.Root value={activeTab} onValueChange={(v) => handleTabChange(v as 'sector' | 'point')}>
         {/* ① 文件导入（共享，最上层，宽度与下方左栏卡片对齐：grid-cols-5 中占 col-span-3） */}
         <div className="mb-6 grid grid-cols-5 gap-6">
           <div className="col-span-3 p-4 bg-card border border-border rounded-lg">
