@@ -508,3 +508,50 @@ def test_get_sheet_info_txt_returns_default(service, tmp_path):
     info = service.get_sheet_info(str(path))
     assert info["sheets"] == ["默认"]
     assert "小区名称" in info["columns"]["默认"]
+
+
+def test_failed_details_in_stats(service, tmp_path):
+    """stats.failedDetails 含失败行（row/name/reason）"""
+    path = tmp_path / "mixed.xlsx"
+    df = pd.DataFrame({
+        "NAME": ["A", "B", "C"],
+        "LONGITUDE": [116.3, None, 999],
+        "LATITUDE": [39.9, 39.8, 39.7],
+    })
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name="LTE", index=False)
+    out, stats = service.generate_point_layer(
+        file_path=str(path), sheet_name="LTE",
+        name_col="NAME", lon_col="LONGITUDE", lat_col="LATITUDE",
+        attributes=["NAME"], output_format="tab",
+    )
+    assert stats["failed"] == 2
+    details = stats["failedDetails"]
+    assert len(details) == 2
+    reasons = {d["name"]: d["reason"] for d in details}
+    assert reasons["B"] == "missing_coord"
+    assert reasons["C"] == "invalid_coord"
+    for d in details:
+        assert d["row"] in (3, 4)   # 表头 1 + 数据行索引 + 1
+
+
+def test_failed_details_in_sector_stats(service, tmp_path):
+    """扇区失败明细含方位角无效"""
+    path = tmp_path / "azi.xlsx"
+    df = pd.DataFrame({
+        "NAME": ["A", "B"],
+        "LONGITUDE": [116.3, 116.4],
+        "LATITUDE": [39.9, 40.0],
+        "AZIMUTH": [120.0, 500.0],
+    })
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name="LTE", index=False)
+    out, stats = service.generate_sector_layer(
+        file_path=str(path), sheet_name="LTE",
+        name_col="NAME", lon_col="LONGITUDE", lat_col="LATITUDE",
+        azimuth_col="AZIMUTH", radius_m=50, beamwidth=50,
+        attributes=["NAME"], output_format="tab",
+    )
+    assert stats["failed"] == 1
+    assert stats["failedDetails"][0]["name"] == "B"
+    assert stats["failedDetails"][0]["reason"] == "invalid_azimuth"

@@ -137,6 +137,49 @@ class LayerService:
         valid = ~missing & ~invalid
         return lon, lat, valid, failures
 
+    def _collect_failed_details(self, df: pd.DataFrame, valid: pd.Series,
+                                lon_col: str, lat_col: str,
+                                azimuth_col: Optional[str] = None,
+                                name_col: Optional[str] = None) -> list:
+        """收集失败行明细（row/name/reason）。预计算数值数组避免逐行 pd.to_numeric。
+        row = Excel 行号（表头 1 行 + 数据索引 + 1）。"""
+        # 预计算数值数组（向量化，性能好）
+        lon_arr = pd.to_numeric(df[lon_col], errors="coerce").to_numpy() if lon_col in df.columns else None
+        lat_arr = pd.to_numeric(df[lat_col], errors="coerce").to_numpy() if lat_col in df.columns else None
+        azi_arr = None
+        if azimuth_col and azimuth_col in df.columns:
+            azi_arr = pd.to_numeric(df[azimuth_col], errors="coerce").to_numpy()
+        name_arr = df[name_col].astype(str) if (name_col and name_col in df.columns) else None
+
+        details = []
+        for pos, i in enumerate(df.index):
+            if valid.iloc[pos]:
+                continue
+            reason = None
+            lon = None if lon_arr is None else lon_arr[pos]
+            lat = None if lat_arr is None else lat_arr[pos]
+            # 坐标缺失
+            if lon_arr is None or lat_arr is None or pd.isna(lon) or pd.isna(lat):
+                reason = "missing_coord"
+            # 坐标格式错（超出范围）
+            elif not (-180 <= lon <= 180) or not (-90 <= lat <= 90):
+                reason = "invalid_coord"
+            # 方位角无效（扇区）
+            elif azi_arr is not None and (pd.isna(azi_arr[pos]) or not (0 <= azi_arr[pos] <= 360)):
+                reason = "invalid_azimuth"
+            # 标签名缺失
+            elif name_arr is not None and str(name_arr.iloc[pos]).strip() in ("", "nan"):
+                reason = "missing_name"
+            # 兜底（理论上不会到这）
+            reason = reason or "unknown"
+            nm = "" if name_arr is None else str(name_arr.iloc[pos])
+            details.append({
+                "row": int(i) + 2,   # Excel 行号 = 数据索引 + 表头 + 1
+                "name": "" if nm.strip() in ("", "nan") else nm,
+                "reason": reason,
+            })
+        return details
+
     def _build_gdf(self, df: pd.DataFrame, lon: pd.Series, lat: pd.Series,
                    valid: pd.Series, attributes: List[str], geometry_cols,
                    keep_cols_extra: Optional[List[str]] = None) -> gpd.GeoDataFrame:
@@ -329,6 +372,9 @@ class LayerService:
             "success": int(valid.sum()),
             "failed": int(len(df) - valid.sum()),
             "failures": {k: int(v) for k, v in failures.items()},
+            "failedDetails": self._collect_failed_details(
+                df, valid, lon_col, lat_col, name_col=name_col,
+            ),
         }
         return out, stats
 
@@ -386,6 +432,10 @@ class LayerService:
             "success": int(valid.sum()),
             "failed": int(len(df) - valid.sum()),
             "failures": {k: int(v) for k, v in failures.items()},
+            "failedDetails": self._collect_failed_details(
+                df, valid, lon_col, lat_col,
+                azimuth_col=azimuth_col, name_col=name_col,
+            ),
         }
         return out, stats
 
