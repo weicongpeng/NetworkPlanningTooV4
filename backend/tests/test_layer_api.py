@@ -649,6 +649,41 @@ def test_multi_format_zip_excludes_historical_suffixed_files():
             hist.unlink()
 
 
+def test_repeat_generate_kml_no_suffixed_duplicate():
+    """同一源文件二次生成 tab+kml → 第二次 zip 不含 -1 序号 kml，且磁盘无 -1 残留（真正的根因场景）"""
+    path = _make_excel()
+    client = _make_client()
+    try:
+        for _ in range(2):
+            with open(path, "rb") as f:
+                resp = client.post(
+                    "/api/v1/layer/point",
+                    files={"file": ("重复.xlsx", f, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+                    data={
+                        "sheet_name": "LTE", "name_col": "NAME",
+                        "lon_col": "LONGITUDE", "lat_col": "LATITUDE",
+                        "attributes": '["NAME"]', "output_formats": "tab,kml",
+                        "source_filename": "重复.xlsx",
+                    },
+                )
+            assert resp.status_code == 200
+        # 第二次生成的 zip
+        dl = client.get(resp.json()["data"]["download_url"])
+        import zipfile, io
+        with zipfile.ZipFile(io.BytesIO(dl.content)) as zf:
+            names = zf.namelist()
+        kmls = [n for n in names if n.endswith(".kml")]
+        # 只能有 1 份 kml，无 -1 序号
+        assert len(kmls) == 1, f"kml 重复: {kmls}"
+        assert not any("-1." in n for n in names), f"序号残留进zip: {names}"
+        # 磁盘无 -1 残留
+        layers_dir = settings.UPLOAD_DIR / "layers"
+        suffixed = [p.name for p in layers_dir.glob("重复_LTE*") if "-1." in p.name]
+        assert not suffixed, f"磁盘残留: {suffixed}"
+    finally:
+        os.remove(path)
+
+
 def test_companion_files_collects_exact_stem_only(tmp_path):
     """_companion_files 精确配套收集：TAB 收 .tab/.dat/.id/.map，KML 单文件，-1/-2 历史序号文件不入"""
     from app.api.v1.endpoints.layer import _companion_files
