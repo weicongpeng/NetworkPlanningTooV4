@@ -2,6 +2,7 @@
 图层制作 API 端点
 """
 import json
+import re
 import shutil
 import uuid
 import zipfile
@@ -13,7 +14,7 @@ from fastapi.concurrency import run_in_threadpool
 
 from app.core.config import settings
 from app.core.security import require_data_import
-from app.services.layer_service import LayerService
+from app.services.layer_service import LayerService, _truncate_bytes
 
 router = APIRouter()
 layer_service = LayerService()
@@ -46,21 +47,25 @@ def _finalize_output(out: Path, output_format: str) -> dict:
 def _finalize_outputs(outs: list, formats: list) -> dict:
     """单格式：TAB/MIF 打包 zip，KML 单文件；多格式：统一打包 zip。
     TAB 输出是 .tab 文件（配套 .dat/.id/.map 在同父目录），MIF 同理（.mif/.mid）。
-    用 out.stem glob 父目录收集全部配套文件，保证 zip 完整。"""
+    tab/mif 共享 stem 时各自 glob 会匹配对方，用 written set 去重。"""
     if len(outs) == 1:
         return _finalize_output(outs[0], formats[0])
     # 多格式 → 统一打包 zip
     base = outs[0].stem
     zip_path = outs[0].parent / f"{base}.zip"
+    written = set()  # 已写入的文件名，去重
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
         for out in outs:
             # TAB/MIF 是多文件格式：收集同 base 的所有配套文件
             if out.suffix in (".tab", ".mif") or out.is_dir():
                 for f in out.parent.glob(f"{out.stem}.*"):
-                    if f.name != zip_path.name:
+                    if f.name != zip_path.name and f.name not in written:
                         zf.write(f, arcname=f.name)
+                        written.add(f.name)
             else:
-                zf.write(out, arcname=out.name)
+                if out.name not in written:
+                    zf.write(out, arcname=out.name)
+                    written.add(out.name)
     return {"filename": zip_path.name, "download_url": f"/layer-files/{zip_path.name}"}
 
 
@@ -151,6 +156,11 @@ async def generate_point(
         attr_list = json.loads(attributes) if attributes else []
         fmt_list = [f.strip() for f in (output_formats or output_format).split(",") if f.strip()] or ["tab"]
 
+        # 生成前清理同 base 历史输出（base = 源文件名stem + sheet 名），只清一次
+        _base = _truncate_bytes(Path(original_name).stem, 100)
+        _safe_sheet = re.sub(r'[<>:"/\\|?*]', "_", sheet_name)
+        layer_service._cleanup_old_outputs(f"{_base}_{_safe_sheet}")
+
         outs, stats = [], None
         for fmt in fmt_list:
             out, stats = await run_in_threadpool(
@@ -197,6 +207,11 @@ async def generate_sector(
         src, original_name = _save_upload(file, file_path, source_filename)
         attr_list = json.loads(attributes) if attributes else []
         fmt_list = [f.strip() for f in (output_formats or output_format).split(",") if f.strip()] or ["tab"]
+
+        # 生成前清理同 base 历史输出（base = 源文件名stem + sheet 名），只清一次
+        _base = _truncate_bytes(Path(original_name).stem, 100)
+        _safe_sheet = re.sub(r'[<>:"/\\|?*]', "_", sheet_name)
+        layer_service._cleanup_old_outputs(f"{_base}_{_safe_sheet}")
 
         outs, stats = [], None
         for fmt in fmt_list:

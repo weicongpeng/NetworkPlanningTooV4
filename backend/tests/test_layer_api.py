@@ -551,3 +551,62 @@ def test_point_endpoint_multi_format_zip_includes_tab_companions():
         assert {".tab", ".dat", ".id", ".map", ".mif", ".mid"}.issubset(suffixes)
     finally:
         os.remove(path)
+
+
+def test_multi_format_zip_no_duplicate_names():
+    """多格式 zip 无重复文件名（tab/mif 共享 stem 时去重）"""
+    path = _make_excel()
+    client = _make_client()
+    try:
+        with open(path, "rb") as f:
+            resp = client.post(
+                "/api/v1/layer/point",
+                files={"file": ("sample.xlsx", f, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+                data={
+                    "sheet_name": "LTE", "name_col": "NAME",
+                    "lon_col": "LONGITUDE", "lat_col": "LATITUDE",
+                    "attributes": '["NAME"]', "output_formats": "tab,mif",
+                },
+            )
+        assert resp.status_code == 200
+        dl = client.get(resp.json()["data"]["download_url"])
+        assert dl.status_code == 200
+        import zipfile, io
+        with zipfile.ZipFile(io.BytesIO(dl.content)) as zf:
+            names = zf.namelist()
+        # 无重复文件名
+        assert len(names) == len(set(names)), f"zip 内容重复: {names}"
+        # 仍含全部配套文件
+        suffixes = {Path(n).suffix for n in names}
+        assert {".tab", ".dat", ".id", ".map", ".mif", ".mid"}.issubset(suffixes)
+    finally:
+        os.remove(path)
+
+
+def test_repeat_generate_via_endpoint_keeps_latest_only():
+    """端点二次生成同源文件 → 产出同名（不追加 -1），历史文件被清理"""
+    path = _make_excel()
+    client = _make_client()
+    try:
+        for _ in range(2):
+            with open(path, "rb") as f:
+                resp = client.post(
+                    "/api/v1/layer/point",
+                    files={"file": ("工参.xlsx", f, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+                    data={
+                        "sheet_name": "LTE", "name_col": "NAME",
+                        "lon_col": "LONGITUDE", "lat_col": "LATITUDE",
+                        "attributes": '["NAME"]', "output_formats": "tab",
+                        "source_filename": "工参.xlsx",
+                    },
+                )
+            assert resp.status_code == 200
+            filename = resp.json()["data"]["filename"]
+            # 两次都应是同名（无 -1 后缀）
+            assert filename == "工参_LTE.zip"
+        # 输出目录只含最新同名文件，无 -1 历史
+        layers_dir = settings.UPLOAD_DIR / "layers"
+        names = [p.name for p in layers_dir.glob("工参_LTE*")]
+        assert not any("-1" in n for n in names), f"存在历史残留: {names}"
+    finally:
+        os.remove(path)

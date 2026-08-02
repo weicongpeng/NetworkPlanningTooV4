@@ -348,11 +348,6 @@ class LayerService:
         不提供时回退到 file_path 的文件名。
         """
         df = self._read_sheet(file_path, sheet_name)
-        # 生成前清理同 base 历史输出（base = 源文件名stem + sheet 名）
-        base = _truncate_bytes(Path(source_filename or Path(file_path).name).stem, 100)
-        safe_sheet = _truncate_bytes(re.sub(r'[<>:"/\\|?*]', "_", sheet_name), 50)
-        self._cleanup_old_outputs(f"{base}_{safe_sheet}")
-
         lon, lat, coord_valid, failures = self._coerce_coords(df, lon_col, lat_col)
 
         # 标签名缺失校验
@@ -402,11 +397,6 @@ class LayerService:
         不提供时回退到 file_path 的文件名。
         """
         df = self._read_sheet(file_path, sheet_name)
-        # 生成前清理同 base 历史输出（base = 源文件名stem + sheet 名）
-        base = _truncate_bytes(Path(source_filename or Path(file_path).name).stem, 100)
-        safe_sheet = _truncate_bytes(re.sub(r'[<>:"/\\|?*]', "_", sheet_name), 50)
-        self._cleanup_old_outputs(f"{base}_{safe_sheet}")
-
         lon, lat, coord_valid, failures = self._coerce_coords(df, lon_col, lat_col)
 
         # 方位角校验
