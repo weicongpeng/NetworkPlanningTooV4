@@ -4,7 +4,7 @@ import * as Tabs from '@radix-ui/react-tabs'
 import { FileUp, Loader2, Download, CheckCircle2 } from 'lucide-react'
 import { layerToolsApi, type LayerExcelInfo, type GenerateLayerResult } from '../services/api'
 import { LayerAttributeConfig } from '../components/layer/LayerAttributeConfig'
-import { LAYER_DEFAULT_PARAMS } from '../config/layer-config'
+import { LAYER_DEFAULT_PARAMS, PRESET_COLORS } from '../config/layer-config'
 
 type LayerFormat = 'tab' | 'mif' | 'kml'
 const ALL_FORMATS: LayerFormat[] = ['tab', 'mif', 'kml']
@@ -38,6 +38,7 @@ interface TabState {
   fieldMappings: Record<string, string>
   radiusM: string          // 字符串受控，避免删空变 0 / 前导 0
   beamwidth: string
+  lineWidth: string
   pointSize: string
   borderColor: string      // 边框颜色
   fillColor: string        // 填充颜色（扇区内部；点图忽略）
@@ -57,6 +58,7 @@ function emptyTabState(type: 'sector' | 'point'): TabState {
     fieldMappings: {},
     radiusM: type === 'sector' ? String(LAYER_DEFAULT_PARAMS.sector.radiusM) : '',
     beamwidth: type === 'sector' ? String(LAYER_DEFAULT_PARAMS.sector.beamwidth) : '',
+    lineWidth: type === 'sector' ? String(LAYER_DEFAULT_PARAMS.sector.lineWidth) : '',
     pointSize: type === 'point' ? String(LAYER_DEFAULT_PARAMS.point.pointSize) : '',
     borderColor: dp.borderColor,
     fillColor: type === 'sector' ? LAYER_DEFAULT_PARAMS.sector.fillColor : '',
@@ -232,6 +234,18 @@ export default function LayerToolsPage() {
     },
   })
 
+  // 常用色块快捷选择
+  const colorSwatches = (value: string, onChange: (v: string) => void) => (
+    <div className="flex flex-wrap gap-1 mt-1">
+      {PRESET_COLORS.map(c => (
+        <button key={c} type="button"
+          onClick={() => onChange(c)}
+          className={`w-5 h-5 rounded-sm border ${value.toLowerCase() === c.toLowerCase() ? 'border-primary ring-1 ring-primary' : 'border-border'}`}
+          style={{ backgroundColor: c }} />
+      ))}
+    </div>
+  )
+
   const renderParams = (ts: TabState, setTab: (u: (s: TabState) => TabState) => void) => (
     <div className="grid grid-cols-2 gap-4">
       {isSector ? (
@@ -246,6 +260,11 @@ export default function LayerToolsPage() {
             <input {...numberInput(ts.beamwidth, (v) => setTab(s => ({ ...s, beamwidth: v })))}
               className="w-full h-9 px-2 text-sm border border-border rounded bg-card" />
           </div>
+          <div>
+            <label className="block text-xs font-medium mb-1">{t('layer.lineWidth')}</label>
+            <input {...numberInput(ts.lineWidth, (v) => setTab(s => ({ ...s, lineWidth: v })))}
+              placeholder="2" className="w-full h-9 px-2 text-sm border border-border rounded bg-card" />
+          </div>
         </>
       ) : (
         <div>
@@ -259,6 +278,7 @@ export default function LayerToolsPage() {
         <label className="block text-xs font-medium mb-1">{t('layer.borderColor')}</label>
         <input type="color" value={ts.borderColor} onChange={e => setTab(s => ({ ...s, borderColor: e.target.value, color: e.target.value }))}
           className="w-full h-9 cursor-pointer" />
+        {colorSwatches(ts.borderColor, (v) => setTab(s => ({ ...s, borderColor: v, color: v })))}
       </div>
       {/* 填充颜色（扇区内部；点图无填充概念，隐藏） */}
       {isSector && (
@@ -266,6 +286,7 @@ export default function LayerToolsPage() {
           <label className="block text-xs font-medium mb-1">{t('layer.fillColor')}</label>
           <input type="color" value={ts.fillColor} onChange={e => setTab(s => ({ ...s, fillColor: e.target.value }))}
             className="w-full h-9 cursor-pointer" />
+          {colorSwatches(ts.fillColor, (v) => setTab(s => ({ ...s, fillColor: v })))}
         </div>
       )}
       {/* 透明度 0-1 */}

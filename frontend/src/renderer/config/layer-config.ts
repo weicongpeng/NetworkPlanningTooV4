@@ -1,3 +1,9 @@
+// 常用色块预设
+export const PRESET_COLORS = [
+  '#FF0000', '#00FF00', '#0000FF', '#FFFF00',
+  '#FF00FF', '#00FFFF', '#000000', '#FFFFFF',
+]
+
 // 图层制作关键字匹配规则（与后端 GeoFieldDetector 保持一致）
 export interface LayerFieldMatch {
   type: 'name' | 'longitude' | 'latitude' | 'azimuth'
@@ -40,6 +46,7 @@ export const LAYER_DEFAULT_PARAMS = {
   sector: {
     radiusM: 50,
     beamwidth: 50,
+    lineWidth: 2,
     borderColor: '#4A90D9',
     fillColor: '#4A90D9',
     opacity: 0.6,

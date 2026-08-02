@@ -1006,6 +1006,7 @@
     "selectColumn": "Select column",
     "radius": "Sector Radius",
     "beamwidth": "Beamwidth",
+    "lineWidth": "Line Width",
     "borderColor": "Border Color",
     "fillColor": "Fill Color",
     "opacity": "Opacity",
