@@ -23,15 +23,24 @@ layer_service = LayerService()
 ALLOWED_EXTS = {".xlsx", ".xls", ".txt", ".csv"}
 
 
+def _companion_files(out: Path) -> list:
+    """TAB/MIF 的精确配套文件（不含历史序号残留）。TAB: .tab/.dat/.id/.map；MIF: .mif/.mid；KML: .kml 单文件。"""
+    stem = out.stem
+    if out.suffix == ".tab":
+        return [out.parent / f"{stem}{s}" for s in (".tab", ".dat", ".id", ".map") if (out.parent / f"{stem}{s}").exists()]
+    if out.suffix == ".mif":
+        return [out.parent / f"{stem}{s}" for s in (".mif", ".mid") if (out.parent / f"{stem}{s}").exists()]
+    return [out]
+
+
 def _zip_layer(out_path: Path) -> Path:
     """把同名图层文件打包成 zip（TAB 含 .tab/.dat/.id/.map，MIF 含 .mif/.mid），返回 zip 路径"""
     base = out_path.stem
     zip_path = out_path.parent / f"{base}.zip"
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        for f in out_path.parent.glob(f"{base}.*"):
-            if f.name == zip_path.name:
-                continue  # 跳过 zip 自身，避免嵌套损坏的自入口
-            zf.write(f, arcname=f.name)
+        for f in _companion_files(out_path):
+            if f.name != zip_path.name:
+                zf.write(f, arcname=f.name)
     return zip_path
 
 
@@ -44,32 +53,20 @@ def _finalize_output(out: Path, output_format: str) -> dict:
     return {"filename": out.name, "download_url": f"/layer-files/{out.name}"}
 
 
-def _companion_files(out: Path) -> list:
-    """TAB/MIF 的精确配套文件（不含历史序号残留）。TAB: .tab/.dat/.id/.map；MIF: .mif/.mid；KML: .kml 单文件。"""
-    stem = out.stem
-    if out.suffix == ".tab":
-        return [out.parent / f"{stem}{s}" for s in (".tab", ".dat", ".id", ".map") if (out.parent / f"{stem}{s}").exists()]
-    if out.suffix == ".mif":
-        return [out.parent / f"{stem}{s}" for s in (".mif", ".mid") if (out.parent / f"{stem}{s}").exists()]
-    return [out]
-
-
 def _finalize_outputs(outs: list, formats: list) -> dict:
     """单格式：TAB/MIF 打包 zip，KML 单文件；多格式：统一打包 zip。
     TAB 输出是 .tab 文件（配套 .dat/.id/.map 在同父目录），MIF 同理（.mif/.mid）。
-    tab/mif 共享 stem 时各自 glob 会匹配对方，用 written set 去重。"""
+    _companion_files 按精确 stem 收集配套，不同格式配套集合互不相交（无需去重）。"""
     if len(outs) == 1:
         return _finalize_output(outs[0], formats[0])
     # 多格式 → 统一打包 zip
     base = outs[0].stem
     zip_path = outs[0].parent / f"{base}.zip"
-    written = set()
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
         for out in outs:
             for f in _companion_files(out):
-                if f.name != zip_path.name and f.name not in written:
+                if f.name != zip_path.name:
                     zf.write(f, arcname=f.name)
-                    written.add(f.name)
     return {"filename": zip_path.name, "download_url": f"/layer-files/{zip_path.name}"}
 
 
