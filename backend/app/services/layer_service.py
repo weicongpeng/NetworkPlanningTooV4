@@ -7,7 +7,6 @@
 """
 import math
 import re
-import uuid
 from pathlib import Path
 from typing import List, Optional
 
@@ -153,18 +152,76 @@ class LayerService:
             return gdf
         return gdf.rename(columns={name_col: "Name"})
 
+    def _unique_path(self, path: Path) -> Path:
+        """同名文件已存在 → 追加 -1/-2 序号"""
+        if not path.exists():
+            return path
+        stem, ext = path.stem, path.suffix
+        i = 1
+        while (self.output_dir / f"{stem}-{i}{ext}").exists():
+            i += 1
+        return self.output_dir / f"{stem}-{i}{ext}"
+
+    def _mapinfo_postprocess(self, out_path: Path, output_format: str,
+                             original_columns: list) -> Path:
+        """MapInfo TAB/MIF 后处理：修正 charset 声明为 WindowsSimpChinese + 恢复中文列名。
+        写入前 GDAL 要求字段名仅 ASCII（中文会被打成 '_' 并可能引发 GBK 解码问题），
+        故 _write 先重命名为 f0/f1... 占位名 + encoding='GBK' 写入，此处按字段顺序恢复原名，
+        并把 charset 从 Neutral 改为 WindowsSimpChinese（MapInfo Pro 正确解析 GBK）。
+        """
+        enc = "gbk"
+        text = out_path.read_text(encoding=enc, errors="replace")
+        text = text.replace("!charset Neutral", "!charset WindowsSimpChinese")
+        text = text.replace('Charset "Neutral"', 'Charset "WindowsSimpChinese"')
+        if output_format == "tab":
+            idx = {"n": 0}
+            def _restore(m):
+                i = idx["n"]; idx["n"] += 1
+                if i < len(original_columns):
+                    return f"  {original_columns[i]} {m.group(1)}"
+                return m.group(0)
+            # 匹配字段定义行: '  f0 Char (254) ;' / '  f1 Float ;' / '  f2 LargeInt ;' 等
+            text = re.sub(
+                r"  f\d+ ((?:Char|Character) \(\d+\) ;|Float ;|Integer ;|Smallint ;|LargeInt ;|Decimal ;|Date ;|DateTime ;)",
+                _restore, text,
+            )
+        elif output_format == "mif":
+            lines = text.splitlines()
+            out_lines, in_cols, ci = [], False, 0
+            for ln in lines:
+                m = re.match(r"^  f\d+( Char\(\d+\)| Float| Integer| Smallint| LargeInt| Character| Decimal| Date| DateTime)", ln)
+                if m and in_cols and ci < len(original_columns):
+                    ln = f"  {original_columns[ci]}{m.group(1)}"; ci += 1
+                if ln.startswith("Columns"):
+                    in_cols = True
+                elif in_cols and ln.strip() == "Data":
+                    in_cols = False
+                out_lines.append(ln)
+            text = "\n".join(out_lines)
+        out_path.write_text(text, encoding=enc)
+        return out_path
+
     def _write(self, gdf: gpd.GeoDataFrame, output_format: str,
                source_filename: str, sheet_name: str) -> Path:
-        """写入文件，返回路径。文件名 = 源文件名 + sheet名 + 短uuid。
-        base 按 100 字节、sheet 按 50 字节截断，总长 ~165 字节 < ext4 NAME_MAX 255。
+        """写入文件，返回路径。文件名 = 源文件名 + sheet名（去uuid，冲突加序号）。
+        中文编码：TAB/MIF 写前重命名列名为 ASCII 占位 + encoding='GBK' + 写后恢复列名。
+        base 按 100 字节、sheet 按 50 字节截断，总长 < ext4 NAME_MAX 255。
         """
         if output_format not in DRIVER_MAP:
             raise ValueError(f"不支持的输出格式: {output_format}")
         base = _truncate_bytes(Path(source_filename).stem, 100)
         safe_sheet = _truncate_bytes(re.sub(r'[<>:"/\\|?*]', "_", sheet_name), 50)
-        fname = f"{base}_{safe_sheet}_{uuid.uuid4().hex[:8]}{EXT_MAP[output_format]}"
-        out_path = self.output_dir / fname
-        gdf.to_file(out_path, driver=DRIVER_MAP[output_format])
+        fname = f"{base}_{safe_sheet}{EXT_MAP[output_format]}"
+        out_path = self._unique_path(self.output_dir / fname)
+        if output_format in ("tab", "mif"):
+            # 重命名中文列为 ASCII 占位名 → GBK 写入 → 恢复
+            orig_cols = list(gdf.columns)
+            rename = {c: f"f{i}" for i, c in enumerate(orig_cols)}
+            gdf_ascii = gdf.rename(columns=rename)
+            gdf_ascii.to_file(out_path, driver=DRIVER_MAP[output_format], encoding="GBK")
+            self._mapinfo_postprocess(out_path, output_format, orig_cols)
+        else:
+            gdf.to_file(out_path, driver=DRIVER_MAP[output_format])
         return out_path
 
     def _apply_color(self, out_path: Path, output_format: str,
@@ -172,11 +229,12 @@ class LayerService:
         """后处理注入颜色（仅 MIF/KML，TAB 无颜色支持）
         MIF 替换 Symbol/Brush 样式行；KML 在每个 Placemark 内注入内联 Style。
         非法颜色或 TAB 直接返回原文件。
+        MIF 使用 GBK 编码（与 _write GBK 输出一致）。
         """
         if output_format not in ("mif", "kml") or not color:
             return out_path
-        text = out_path.read_text(encoding="utf-8", errors="replace")
         if output_format == "mif":
+            text = out_path.read_text(encoding="gbk", errors="replace")
             mif_color = hex_to_mapinfo_color(color)
             if mif_color is None:
                 return out_path
@@ -192,7 +250,9 @@ class LayerService:
                     r'Brush \((\d+),(\d+),(\d+)\)',
                     lambda m: f'Brush ({m.group(1)},{mif_color},{m.group(3)})', text,
                 )
+            out_path.write_text(text, encoding="gbk")
         elif output_format == "kml":
+            text = out_path.read_text(encoding="utf-8", errors="replace")
             kml_color = hex_to_kml_color(color)
             if kml_color is None:
                 return out_path
@@ -209,7 +269,7 @@ class LayerService:
                 lambda m: m.group(1) + '\n' + style,
                 text,
             )
-        out_path.write_text(text, encoding="utf-8")
+            out_path.write_text(text, encoding="utf-8")
         return out_path
 
     def generate_point_layer(self, file_path: str, sheet_name: str,

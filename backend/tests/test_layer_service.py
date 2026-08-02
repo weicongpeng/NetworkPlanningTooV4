@@ -307,7 +307,7 @@ def test_kml_color_inline_xml_valid(service, sample_excel):
 
 
 def test_output_filename_uses_source_and_sheet(tmp_path):
-    """导出文件名 = 源文件名 + sheet 名 + 短 uuid + 扩展名"""
+    """导出文件名 = 源文件名 + sheet 名（去 uuid）"""
     path = tmp_path / "工参2026.xlsx"
     df = pd.DataFrame({
         "NAME": ["A"], "LONGITUDE": [116.3], "LATITUDE": [39.9],
@@ -320,8 +320,7 @@ def test_output_filename_uses_source_and_sheet(tmp_path):
         name_col="NAME", lon_col="LONGITUDE", lat_col="LATITUDE",
         attributes=["NAME"], output_format="tab",
     )
-    # 命名 = 源文件名(stem) + sheet 名 + 短uuid
-    assert out.stem.startswith("工参2026_LTE_")
+    assert out.stem == "工参2026_LTE"
     assert out.suffix == ".tab"
 
 
@@ -338,8 +337,7 @@ def test_source_filename_param_honored(tmp_path):
         attributes=["NAME"], output_format="tab",
         source_filename="工参2026.xlsx",
     )
-    assert out.stem.startswith("工参2026_LTE_")
-    assert not out.stem.startswith("src_abcd1234")
+    assert out.stem == "工参2026_LTE"
 
 
 def test_long_chinese_filename_truncated(tmp_path):
@@ -428,3 +426,55 @@ def test_sector_azimuth_validation_stats(service, tmp_path):
     assert stats["success"] == 1
     assert stats["failed"] == 1
     assert stats["failures"]["invalid_azimuth"] == 1
+
+
+def test_tab_chinese_fields_readable(service, tmp_path):
+    """中文列名+中文值 → TAB 输出回读完整（字段名与值均中文）"""
+    path = tmp_path / "工参.xlsx"
+    df = pd.DataFrame({"小区名称": ["基站A"], "经度": [116.4], "纬度": [39.9]})
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name="LTE", index=False)
+    out, _ = service.generate_point_layer(
+        file_path=str(path), sheet_name="LTE",
+        name_col="小区名称", lon_col="经度", lat_col="纬度",
+        attributes=["小区名称"], output_format="tab",
+    )
+    import geopandas as gpd
+    gdf = gpd.read_file(out)
+    assert "小区名称" in gdf.columns
+    assert gdf["小区名称"].tolist() == ["基站A"]
+    tab = out.read_text(encoding="gbk", errors="replace")
+    assert "WindowsSimpChinese" in tab
+
+
+def test_mif_chinese_fields_readable(service, tmp_path):
+    """中文列名+值 → MIF 输出回读完整"""
+    path = tmp_path / "工参.xlsx"
+    df = pd.DataFrame({"小区名称": ["基站A"], "经度": [116.4], "纬度": [39.9]})
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name="LTE", index=False)
+    out, _ = service.generate_point_layer(
+        file_path=str(path), sheet_name="LTE",
+        name_col="小区名称", lon_col="经度", lat_col="纬度",
+        attributes=["小区名称"], output_format="mif",
+    )
+    import geopandas as gpd
+    gdf = gpd.read_file(out)
+    assert "小区名称" in gdf.columns
+    assert gdf["小区名称"].tolist() == ["基站A"]
+    mif = out.read_text(encoding="gbk", errors="replace")
+    assert "WindowsSimpChinese" in mif
+
+
+def test_output_filename_conflict_appends_suffix(tmp_path):
+    """同名文件已存在 → 追加 -1/-2 序号"""
+    path = tmp_path / "源.xlsx"
+    df = pd.DataFrame({"NAME": ["A"], "LONGITUDE": [116.3], "LATITUDE": [39.9]})
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name="LTE", index=False)
+    svc = LayerService(output_dir=tmp_path)
+    (tmp_path / "源_LTE.tab").write_text("x")   # 预置冲突
+    out1, _ = svc.generate_point_layer(str(path), "LTE", "NAME", "LONGITUDE", "LATITUDE", ["NAME"], "tab")
+    out2, _ = svc.generate_point_layer(str(path), "LTE", "NAME", "LONGITUDE", "LATITUDE", ["NAME"], "tab")
+    assert out1.name == "源_LTE-1.tab"
+    assert out2.name == "源_LTE-2.tab"
