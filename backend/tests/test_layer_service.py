@@ -785,3 +785,43 @@ def test_mif_sector_line_width(service, sample_excel):
     )
     text = result.read_text(encoding="gbk", errors="replace")
     assert "Pen (1,4886745,4)" in text
+
+
+def test_kml_point_icon_injected(service, sample_excel):
+    """点 KML + 形状/大小 → IconStyle 含 Icon/href(SVG Data URI) 和 scale"""
+    result, _ = service.generate_point_layer(
+        file_path=str(sample_excel), sheet_name="LTE",
+        name_col="NAME", lon_col="LONGITUDE", lat_col="LATITUDE",
+        attributes=["NAME"], output_format="kml",
+        border_color="#FF0000", point_shape="square", point_size=12,
+    )
+    text = result.read_text(encoding="utf-8")
+    assert "data:image/svg+xml," in text
+    assert "<Icon><href>" in text
+    assert "<scale>0.90</scale>" in text  # 12/8*0.6=0.9
+    import xml.etree.ElementTree as ET
+    root = ET.fromstring(text)  # XML 合法
+
+
+def test_mif_point_shape_applied(service, sample_excel):
+    """点 MIF + 形状/大小 → Symbol (shape, color, size)"""
+    result, _ = service.generate_point_layer(
+        file_path=str(sample_excel), sheet_name="LTE",
+        name_col="NAME", lon_col="LONGITUDE", lat_col="LATITUDE",
+        attributes=["NAME"], output_format="mif",
+        border_color="#FF0000", point_shape="square", point_size=10,
+    )
+    text = result.read_text(encoding="gbk", errors="replace")
+    assert "Symbol (33,16711680,10)" in text  # square=33, 红色, size=10
+
+
+def test_kml_point_scale_default(service, sample_excel):
+    """点 KML 无 point_size → scale 默认 1.00"""
+    result, _ = service.generate_point_layer(
+        file_path=str(sample_excel), sheet_name="LTE",
+        name_col="NAME", lon_col="LONGITUDE", lat_col="LATITUDE",
+        attributes=["NAME"], output_format="kml",
+        border_color="#4A90D9",
+    )
+    text = result.read_text(encoding="utf-8")
+    assert "<scale>1.00</scale>" in text

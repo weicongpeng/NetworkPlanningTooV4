@@ -307,6 +307,33 @@ def test_sector_endpoint_with_color():
         os.remove(path)
 
 
+def test_point_endpoint_with_shape_and_size():
+    """点图层 + point_shape/point_size → KML 含 SVG 图标和 scale"""
+    path = _make_excel()
+    client = _make_client()
+    try:
+        with open(path, "rb") as f:
+            resp = client.post(
+                "/api/v1/layer/point",
+                files={"file": ("sample.xlsx", f, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+                data={
+                    "sheet_name": "LTE", "name_col": "NAME",
+                    "lon_col": "LONGITUDE", "lat_col": "LATITUDE",
+                    "attributes": '["NAME"]', "output_format": "kml",
+                    "border_color": "#FF0000",
+                    "point_shape": "square", "point_size": "12",
+                },
+            )
+        assert resp.status_code == 200
+        dl = client.get(resp.json()["data"]["download_url"])
+        text = dl.content.decode("utf-8", errors="replace")
+        assert "data:image/svg+xml," in text
+        assert "<Icon><href>" in text
+        assert "<scale>0.90</scale>" in text  # 12/8*0.6=0.9
+    finally:
+        os.remove(path)
+
+
 def test_point_endpoint_with_color_kml():
     """点图层 KML + color 参数 → IconStyle color 已注入"""
     path = _make_excel()

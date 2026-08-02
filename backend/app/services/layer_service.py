@@ -121,6 +121,23 @@ def hex_to_kml_color(color: Optional[str]) -> Optional[str]:
         return None
 
 
+def svg_point_icon(shape: str, color: str, size_px: int = 32) -> str:
+    """生成点形状的 SVG Data URI（KML Icon href，完全离线可用）。"""
+    from urllib.parse import quote
+    fill = color or "#FF0000"
+    svgs = {
+        "circle": f'<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><circle cx="16" cy="16" r="12" fill="{fill}" stroke="#fff" stroke-width="2"/></svg>',
+        "square": f'<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><rect x="4" y="4" width="24" height="24" rx="2" fill="{fill}" stroke="#fff" stroke-width="2"/></svg>',
+        "diamond": f'<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><polygon points="16,3 29,16 16,29 3,16" fill="{fill}" stroke="#fff" stroke-width="2"/></svg>',
+        "triangle": f'<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><polygon points="16,3 29,29 3,29" fill="{fill}" stroke="#fff" stroke-width="2"/></svg>',
+        "triangle_down": f'<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><polygon points="3,3 29,3 16,29" fill="{fill}" stroke="#fff" stroke-width="2"/></svg>',
+        "landmark": f'<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><path d="M16 3 L28 10 L16 17 L4 10 Z" fill="{fill}" stroke="#fff" stroke-width="2"/><rect x="4" y="12" width="24" height="4" fill="{fill}" stroke="#fff" stroke-width="1"/><rect x="12" y="16" width="8" height="10" fill="{fill}" stroke="#fff" stroke-width="1"/></svg>',
+        "pin": f'<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><path d="M16 2 C9 2 4 7 4 14 C4 23 16 30 16 30 C16 30 28 23 28 14 C28 7 23 2 16 2 Z" fill="{fill}" stroke="#fff" stroke-width="2"/><circle cx="16" cy="13" r="4" fill="#fff"/></svg>',
+    }
+    svg = svgs.get(shape, svgs["circle"])
+    return "data:image/svg+xml," + quote(svg, safe='')
+
+
 def _kml_color_with_alpha(color: Optional[str], opacity: float) -> Optional[str]:
     """KML aabbggrr + 指定透明度 opacity(0-1)。非法颜色返回 None"""
     c = hex_to_kml_color(color)
@@ -399,6 +416,7 @@ class LayerService:
             if is_point:
                 if hex_to_kml_color(border_color) is None:
                     return out_path
+                href = svg_point_icon(point_shape or "circle", border_color)
                 scale = 1.0
                 if point_size is not None:
                     scale = max(0.3, min(3.0, point_size / 8 * 0.6))
@@ -406,6 +424,7 @@ class LayerService:
                     f'<Style><IconStyle>'
                     f'<color>{_kml_color_with_alpha(border_color, kml_opacity)}</color>'
                     f'<scale>{scale:.2f}</scale>'
+                    f'<Icon><href>{href}</href></Icon>'
                     f'</IconStyle></Style>'
                 )
                 # 点 KML 无 GDAL 自带样式 → 内联注入到 <Placemark ...> 后作为第一个子元素
