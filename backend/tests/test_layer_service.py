@@ -478,3 +478,33 @@ def test_output_filename_conflict_appends_suffix(tmp_path):
     out2, _ = svc.generate_point_layer(str(path), "LTE", "NAME", "LONGITUDE", "LATITUDE", ["NAME"], "tab")
     assert out1.name == "源_LTE-1.tab"
     assert out2.name == "源_LTE-2.tab"
+
+
+def test_read_text_csv_gbk(service, tmp_path):
+    """GBK 编码 csv → 自动编码回退读取，列名/值完整"""
+    path = tmp_path / "工参.csv"
+    raw = "小区名称,经度,纬度\n基站A,116.4,39.9\n".encode("gbk")
+    path.write_bytes(raw)
+    df = service._read_sheet(str(path), "默认")
+    assert "小区名称" in df.columns
+    assert df["小区名称"].tolist() == ["基站A"]
+
+
+def test_read_text_txt_tab(service, tmp_path):
+    """制表符分隔 txt → 自动探测分隔符读取"""
+    path = tmp_path / "工参.txt"
+    raw = "小区名称\t经度\t纬度\n基站B\t116.5\t40.0\n".encode("utf-8")
+    path.write_bytes(raw)
+    df = service._read_sheet(str(path), "默认")
+    assert "小区名称" in df.columns
+    assert df["小区名称"].tolist() == ["基站B"]
+
+
+def test_get_sheet_info_txt_returns_default(service, tmp_path):
+    """txt/csv 的 get_sheet_info 返回 sheets=['默认']"""
+    path = tmp_path / "工参.csv"
+    raw = "小区名称,经度,纬度\n基站A,116.4,39.9\n".encode("utf-8")
+    path.write_bytes(raw)
+    info = service.get_sheet_info(str(path))
+    assert info["sheets"] == ["默认"]
+    assert "小区名称" in info["columns"]["默认"]

@@ -5,6 +5,7 @@
 使用 pyogrio + geopandas 写入（内置 GDAL/OGR 绑定，无需安装 GDAL）。
 扇区几何使用 Flat-Earth 近似算法（与前端 SectorRendererSVG 一致）。
 """
+import io
 import math
 import re
 from pathlib import Path
@@ -98,10 +99,24 @@ class LayerService:
         self.output_dir = output_dir or (settings.UPLOAD_DIR / "layers")
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
+    def _read_text(self, file_path: str) -> pd.DataFrame:
+        """读取 CSV/TXT：自动探测分隔符，UTF-8 → GBK 编码回退。
+        返回 DataFrame，列名为首行。"""
+        raw = Path(file_path).read_bytes()
+        try:
+            text = raw.decode("utf-8-sig")   # 兼容 BOM
+        except UnicodeDecodeError:
+            text = raw.decode("gbk", errors="replace")
+        return pd.read_csv(io.StringIO(text), sep=None, engine="python")
+
     def _read_sheet(self, file_path: str, sheet_name: str) -> pd.DataFrame:
-        """读取指定 sheet，返回 DataFrame
+        """读取指定 sheet，返回 DataFrame。
         显式指定 calamine engine，保证 .xls 与 .xlsx 均可读取（无需 xlrd/xlwt）。
+        txt/csv 无 sheet 概念，忽略 sheet_name。
         """
+        ext = Path(file_path).suffix.lower()
+        if ext in (".csv", ".txt"):
+            return self._read_text(file_path)
         try:
             return pd.read_excel(file_path, sheet_name=sheet_name, engine="calamine")
         except ValueError as e:
@@ -375,7 +390,11 @@ class LayerService:
         return out, stats
 
     def get_sheet_info(self, file_path: str) -> dict:
-        """读取 Excel 的 sheet 列表和各 sheet 列名"""
+        """读取文件的 sheet 列表和各 sheet 列名。txt/csv 返回 ['默认']。"""
+        ext = Path(file_path).suffix.lower()
+        if ext in (".csv", ".txt"):
+            df = self._read_text(file_path)
+            return {"sheets": ["默认"], "columns": {"默认": [str(c) for c in df.columns]}}
         xls = pd.ExcelFile(file_path, engine="calamine")
         sheets = xls.sheet_names
         columns = {}

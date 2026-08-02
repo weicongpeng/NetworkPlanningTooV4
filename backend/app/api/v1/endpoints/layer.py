@@ -18,8 +18,8 @@ from app.services.layer_service import LayerService
 router = APIRouter()
 layer_service = LayerService()
 
-# 允许的输入文件扩展名（工参 Excel）
-ALLOWED_EXTS = {".xlsx", ".xls"}
+# 允许的输入文件扩展名（工参 Excel/文本）
+ALLOWED_EXTS = {".xlsx", ".xls", ".txt", ".csv"}
 
 
 def _zip_layer(out_path: Path) -> Path:
