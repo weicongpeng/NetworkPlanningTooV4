@@ -585,6 +585,16 @@ def test_cleanup_old_outputs_removes_history(tmp_path):
     assert (tmp_path / "其他_LTE.tab").exists()    # 不同 base 保留
 
 
+def test_cleanup_old_outputs_removes_kml_history(tmp_path):
+    """_cleanup_old_outputs 补删 .kml 历史（-1/-2 后缀）"""
+    svc = LayerService(output_dir=tmp_path)
+    (tmp_path / "源_LTE-1.kml").write_text("x")
+    (tmp_path / "源_LTE-2.kml").write_text("x")
+    svc._cleanup_old_outputs("源_LTE")
+    assert not (tmp_path / "源_LTE-1.kml").exists()
+    assert not (tmp_path / "源_LTE-2.kml").exists()
+
+
 def test_read_text_csv_gbk(service, tmp_path):
     """GBK 编码 csv → 自动编码回退读取，列名/值完整"""
     path = tmp_path / "工参.csv"

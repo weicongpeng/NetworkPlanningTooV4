@@ -44,6 +44,16 @@ def _finalize_output(out: Path, output_format: str) -> dict:
     return {"filename": out.name, "download_url": f"/layer-files/{out.name}"}
 
 
+def _companion_files(out: Path) -> list:
+    """TAB/MIF 的精确配套文件（不含历史序号残留）。TAB: .tab/.dat/.id/.map；MIF: .mif/.mid；KML: .kml 单文件。"""
+    stem = out.stem
+    if out.suffix == ".tab":
+        return [out.parent / f"{stem}{s}" for s in (".tab", ".dat", ".id", ".map") if (out.parent / f"{stem}{s}").exists()]
+    if out.suffix == ".mif":
+        return [out.parent / f"{stem}{s}" for s in (".mif", ".mid") if (out.parent / f"{stem}{s}").exists()]
+    return [out]
+
+
 def _finalize_outputs(outs: list, formats: list) -> dict:
     """单格式：TAB/MIF 打包 zip，KML 单文件；多格式：统一打包 zip。
     TAB 输出是 .tab 文件（配套 .dat/.id/.map 在同父目录），MIF 同理（.mif/.mid）。
@@ -53,19 +63,13 @@ def _finalize_outputs(outs: list, formats: list) -> dict:
     # 多格式 → 统一打包 zip
     base = outs[0].stem
     zip_path = outs[0].parent / f"{base}.zip"
-    written = set()  # 已写入的文件名，去重
+    written = set()
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
         for out in outs:
-            # TAB/MIF 是多文件格式：收集同 base 的所有配套文件
-            if out.suffix in (".tab", ".mif") or out.is_dir():
-                for f in out.parent.glob(f"{out.stem}.*"):
-                    if f.name != zip_path.name and f.name not in written:
-                        zf.write(f, arcname=f.name)
-                        written.add(f.name)
-            else:
-                if out.name not in written:
-                    zf.write(out, arcname=out.name)
-                    written.add(out.name)
+            for f in _companion_files(out):
+                if f.name != zip_path.name and f.name not in written:
+                    zf.write(f, arcname=f.name)
+                    written.add(f.name)
     return {"filename": zip_path.name, "download_url": f"/layer-files/{zip_path.name}"}
 
 

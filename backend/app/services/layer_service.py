@@ -28,6 +28,9 @@ EXT_MAP = {"tab": ".tab", "mif": ".mif", "kml": ".kml"}
 # MapInfo 非法字段名字符（非字母数字/下划线/中文）
 _MAPINFO_INVALID = re.compile(r"[^\w一-鿿]+")
 
+# 生成前清理的历史输出后缀（含 -1/-2 序号残留）
+_CLEANUP_SUFFIXES = (".tab", ".dat", ".id", ".map", ".mif", ".mid", ".zip", ".kml")
+
 
 def _sanitize_field_name(name: str) -> str:
     """MapInfo 字段名清洗：非法字符（空格等）→ 下划线，合并相邻下划线，去首尾。"""
@@ -250,10 +253,10 @@ class LayerService:
         return self.output_dir / f"{stem}-{i}{ext}"
 
     def _cleanup_old_outputs(self, base: str):
-        """生成前删除同 base 的历史输出（.tab/.dat/.id/.map/.mif/.mid/.zip）。
+        """生成前删除同 base 的历史输出（.tab/.dat/.id/.map/.mif/.mid/.zip/.kml）。
         保证同一源文件+sheet 只保留最新一次生成结果。"""
         for f in self.output_dir.glob(f"{base}*"):
-            if f.suffix in (".tab", ".dat", ".id", ".map", ".mif", ".mid", ".zip"):
+            if f.suffix in _CLEANUP_SUFFIXES:
                 f.unlink(missing_ok=True)
 
     def _mapinfo_postprocess(self, out_path: Path, output_format: str,

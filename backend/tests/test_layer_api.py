@@ -610,3 +610,66 @@ def test_repeat_generate_via_endpoint_keeps_latest_only():
         assert not any("-1" in n for n in names), f"存在历史残留: {names}"
     finally:
         os.remove(path)
+
+
+def test_multi_format_zip_excludes_historical_suffixed_files():
+    """预置 -1.kml/-2.kml 历史残留 → 新生成多格式 zip 不含它们（精确配套收集）"""
+    layers_dir = settings.UPLOAD_DIR / "layers"
+    layers_dir.mkdir(parents=True, exist_ok=True)
+    # 预置历史残留（模拟之前清理失败留下的）
+    hist = layers_dir / "残留_LTE-1.kml"
+    hist.write_text("x")
+    path = _make_excel()
+    client = _make_client()
+    try:
+        with open(path, "rb") as f:
+            resp = client.post(
+                "/api/v1/layer/point",
+                files={"file": ("残留.xlsx", f, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+                data={
+                    "sheet_name": "LTE", "name_col": "NAME",
+                    "lon_col": "LONGITUDE", "lat_col": "LATITUDE",
+                    "attributes": '["NAME"]', "output_formats": "tab,kml",
+                    "source_filename": "残留.xlsx",
+                },
+            )
+        assert resp.status_code == 200
+        dl = client.get(resp.json()["data"]["download_url"])
+        import zipfile, io
+        with zipfile.ZipFile(io.BytesIO(dl.content)) as zf:
+            names = zf.namelist()
+        # 不含历史序号文件
+        assert not any("-1." in n or "-2." in n for n in names), f"历史残留进zip: {names}"
+        # 含本次 tab+kml
+        suffixes = {Path(n).suffix for n in names}
+        assert {".tab", ".kml"}.issubset(suffixes)
+    finally:
+        os.remove(path)
+        if hist.exists():
+            hist.unlink()
+
+
+def test_companion_files_collects_exact_stem_only(tmp_path):
+    """_companion_files 精确配套收集：TAB 收 .tab/.dat/.id/.map，KML 单文件，-1/-2 历史序号文件不入"""
+    from app.api.v1.endpoints.layer import _companion_files
+    # TAB 配套 + 历史序号残留（不同 stem）
+    (tmp_path / "源_LTE.tab").write_text("x")
+    (tmp_path / "源_LTE.dat").write_text("x")
+    (tmp_path / "源_LTE.id").write_text("x")
+    (tmp_path / "源_LTE.map").write_text("x")
+    (tmp_path / "源_LTE-1.kml").write_text("x")   # 历史残留，非配套
+    files = _companion_files(tmp_path / "源_LTE.tab")
+    assert {f.name for f in files} == {"源_LTE.tab", "源_LTE.dat", "源_LTE.id", "源_LTE.map"}
+    # KML 单文件
+    (tmp_path / "源_LTE.kml").write_text("x")
+    files = _companion_files(tmp_path / "源_LTE.kml")
+    assert [f.name for f in files] == ["源_LTE.kml"]
+    # MIF 收 .mif/.mid
+    (tmp_path / "源_LTE.mif").write_text("x")
+    (tmp_path / "源_LTE.mid").write_text("x")
+    files = _companion_files(tmp_path / "源_LTE.mif")
+    assert {f.name for f in files} == {"源_LTE.mif", "源_LTE.mid"}
+    # 缺失的配套不收集（.map 不存在时）
+    (tmp_path / "只tab.tab").write_text("x")
+    files = _companion_files(tmp_path / "只tab.tab")
+    assert {f.name for f in files} == {"只tab.tab"}
