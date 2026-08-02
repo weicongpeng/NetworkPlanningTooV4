@@ -25,6 +25,31 @@ DRIVER_MAP = {
 EXT_MAP = {"tab": ".tab", "mif": ".mif", "kml": ".kml"}
 
 
+# MapInfo 非法字段名字符（非字母数字/下划线/中文）
+_MAPINFO_INVALID = re.compile(r"[^\w一-鿿]+")
+
+
+def _sanitize_field_name(name: str) -> str:
+    """MapInfo 字段名清洗：非法字符（空格等）→ 下划线，合并相邻下划线，去首尾。"""
+    cleaned = _MAPINFO_INVALID.sub("_", name)
+    cleaned = re.sub(r"_+", "_", cleaned).strip("_")
+    return cleaned
+
+
+def _dedupe_field_names(names: list) -> list:
+    """清洗后字段名去重：重名追加 _2/_3 序号，保持相对顺序。"""
+    seen = {}
+    result = []
+    for n in names:
+        if n not in seen:
+            seen[n] = 1
+            result.append(n)
+        else:
+            seen[n] += 1
+            result.append(f"{n}_{seen[n]}")
+    return result
+
+
 def fast_destination(lat: float, lng: float, azimuth_deg: float, distance_m: float) -> tuple:
     """快速计算终点坐标 (Flat-Earth Approximation)
     移植自前端 SectorRendererSVG._fastDestination
@@ -228,10 +253,11 @@ class LayerService:
                 f.unlink(missing_ok=True)
 
     def _mapinfo_postprocess(self, out_path: Path, output_format: str,
-                             original_columns: list) -> Path:
-        """MapInfo TAB/MIF 后处理：修正 charset 声明为 WindowsSimpChinese + 恢复中文列名。
+                             sanitized_cols: list) -> Path:
+        """MapInfo TAB/MIF 后处理：修正 charset 声明为 WindowsSimpChinese + 恢复列名。
         写入前 GDAL 要求字段名仅 ASCII（中文会被打成 '_' 并可能引发 GBK 解码问题），
-        故 _write 先重命名为 f0/f1... 占位名 + encoding='GBK' 写入，此处按字段顺序恢复原名，
+        故 _write 先重命名为 f0/f1... 占位名 + encoding='GBK' 写入，此处按字段顺序恢复清洗后的
+        列名（已由 _write 经 _sanitize_field_name/_dedupe_field_names 处理），
         并把 charset 从 Neutral 改为 WindowsSimpChinese（MapInfo Pro 正确解析 GBK）。
         """
         enc = "gbk"
@@ -242,8 +268,8 @@ class LayerService:
             idx = {"n": 0}
             def _restore(m):
                 i = idx["n"]; idx["n"] += 1
-                if i < len(original_columns):
-                    return f"  {original_columns[i]} {m.group(1)}"
+                if i < len(sanitized_cols):
+                    return f"  {sanitized_cols[i]} {m.group(1)}"
                 return m.group(0)
             # 匹配字段定义行: '  f0 Char (254) ;' / '  f1 Float ;' / '  f2 LargeInt ;' 等
             text = re.sub(
@@ -255,8 +281,8 @@ class LayerService:
             out_lines, in_cols, ci = [], False, 0
             for ln in lines:
                 m = re.match(r"^  f\d+( Char\(\d+\)| Float| Integer| Smallint| LargeInt| Character| Decimal| Date| DateTime)", ln)
-                if m and in_cols and ci < len(original_columns):
-                    ln = f"  {original_columns[ci]}{m.group(1)}"; ci += 1
+                if m and in_cols and ci < len(sanitized_cols):
+                    ln = f"  {sanitized_cols[ci]}{m.group(1)}"; ci += 1
                 if ln.startswith("Columns"):
                     in_cols = True
                 elif in_cols and ln.strip() == "Data":
@@ -279,12 +305,13 @@ class LayerService:
         fname = f"{base}_{safe_sheet}{EXT_MAP[output_format]}"
         out_path = self._unique_path(self.output_dir / fname)
         if output_format in ("tab", "mif"):
-            # 重命名中文列为 ASCII 占位名 → GBK 写入 → 恢复
+            # 重命名中文列为 ASCII 占位名 → GBK 写入 → 恢复（清洗字段名：空格→下划线，去重）
             orig_cols = list(gdf.columns)
+            sanitized_cols = _dedupe_field_names([_sanitize_field_name(c) for c in orig_cols])
             rename = {c: f"f{i}" for i, c in enumerate(orig_cols)}
             gdf_ascii = gdf.rename(columns=rename)
             gdf_ascii.to_file(out_path, driver=DRIVER_MAP[output_format], encoding="GBK")
-            self._mapinfo_postprocess(out_path, output_format, orig_cols)
+            self._mapinfo_postprocess(out_path, output_format, sanitized_cols)
         else:
             gdf.to_file(out_path, driver=DRIVER_MAP[output_format])
         return out_path

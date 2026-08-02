@@ -466,6 +466,39 @@ def test_mif_chinese_fields_readable(service, tmp_path):
     assert "WindowsSimpChinese" in mif
 
 
+def test_mapinfo_field_name_sanitized(service, tmp_path):
+    """含空格列名（SITE ID/CELL ID）→ TAB 生成后可读，字段名转下划线"""
+    path = tmp_path / "工参.xlsx"
+    df = pd.DataFrame({"SITE ID": ["A"], "CELL ID": ["B"], "经度": [116.4], "纬度": [39.9]})
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name="LTE", index=False)
+    out, _ = service.generate_point_layer(
+        file_path=str(path), sheet_name="LTE",
+        name_col="SITE ID", lon_col="经度", lat_col="纬度",
+        attributes=["SITE ID", "CELL ID"], output_format="tab",
+    )
+    import geopandas as gpd
+    gdf = gpd.read_file(out)  # 修复前：Failed to parse field definition
+    assert "SITE_ID" in gdf.columns
+    assert "CELL_ID" in gdf.columns
+
+
+def test_mapinfo_field_name_dedupe(service, tmp_path):
+    """清洗后重名（SITE ID 与 SITE_ID）→ 自动加序号去重，不崩溃"""
+    path = tmp_path / "d.xlsx"
+    df = pd.DataFrame({"SITE ID": ["A"], "SITE_ID": ["B"], "经度": [116.4], "纬度": [39.9]})
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name="LTE", index=False)
+    out, _ = service.generate_point_layer(
+        file_path=str(path), sheet_name="LTE",
+        name_col="SITE ID", lon_col="经度", lat_col="纬度",
+        attributes=["SITE ID", "SITE_ID"], output_format="tab",
+    )
+    import geopandas as gpd
+    gdf = gpd.read_file(out)
+    assert len(gdf.columns) == 3  # 两个字段 + geometry
+
+
 def test_cleanup_old_outputs_removes_history(tmp_path):
     """_cleanup_old_outputs 删除同 base 历史输出（含 -1/-2 后缀），保留其它 base"""
     svc = LayerService(output_dir=tmp_path)
