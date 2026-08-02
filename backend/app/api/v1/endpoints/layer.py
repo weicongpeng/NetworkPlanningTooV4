@@ -45,8 +45,8 @@ def _finalize_output(out: Path, output_format: str) -> dict:
 
 def _finalize_outputs(outs: list, formats: list) -> dict:
     """单格式：TAB/MIF 打包 zip，KML 单文件；多格式：统一打包 zip。
-    outs 元素是 Path（文件或目录）。TAB 的 to_file 输出可能是目录（含 .tab/.dat/.id/.map），
-    需用 is_dir() 判断并 glob 收集子文件。"""
+    TAB 输出是 .tab 文件（配套 .dat/.id/.map 在同父目录），MIF 同理（.mif/.mid）。
+    用 out.stem glob 父目录收集全部配套文件，保证 zip 完整。"""
     if len(outs) == 1:
         return _finalize_output(outs[0], formats[0])
     # 多格式 → 统一打包 zip
@@ -54,9 +54,11 @@ def _finalize_outputs(outs: list, formats: list) -> dict:
     zip_path = outs[0].parent / f"{base}.zip"
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
         for out in outs:
-            if out.is_dir():
-                for f in out.glob(f"{out.name}.*"):
-                    zf.write(f, arcname=f.name)
+            # TAB/MIF 是多文件格式：收集同 base 的所有配套文件
+            if out.suffix in (".tab", ".mif") or out.is_dir():
+                for f in out.parent.glob(f"{out.stem}.*"):
+                    if f.name != zip_path.name:
+                        zf.write(f, arcname=f.name)
             else:
                 zf.write(out, arcname=out.name)
     return {"filename": zip_path.name, "download_url": f"/layer-files/{zip_path.name}"}

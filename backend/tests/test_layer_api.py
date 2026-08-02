@@ -523,3 +523,31 @@ def test_layer_file_path_reuse_generates_no_leak():
     finally:
         if path.exists():
             os.remove(path)
+
+
+def test_point_endpoint_multi_format_zip_includes_tab_companions():
+    """output_formats=tab,mif → zip 含 TAB 全部配套文件（.tab/.dat/.id/.map）和 MIF（.mif/.mid）"""
+    path = _make_excel()
+    client = _make_client()
+    try:
+        with open(path, "rb") as f:
+            resp = client.post(
+                "/api/v1/layer/point",
+                files={"file": ("sample.xlsx", f, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+                data={
+                    "sheet_name": "LTE", "name_col": "NAME",
+                    "lon_col": "LONGITUDE", "lat_col": "LATITUDE",
+                    "attributes": '["NAME"]', "output_formats": "tab,mif",
+                },
+            )
+        assert resp.status_code == 200
+        dl = client.get(resp.json()["data"]["download_url"])
+        assert dl.status_code == 200
+        import zipfile, io
+        with zipfile.ZipFile(io.BytesIO(dl.content)) as zf:
+            names = zf.namelist()
+        suffixes = {Path(n).suffix for n in names}
+        # TAB 4 文件 + MIF 2 文件
+        assert {".tab", ".dat", ".id", ".map", ".mif", ".mid"}.issubset(suffixes)
+    finally:
+        os.remove(path)
