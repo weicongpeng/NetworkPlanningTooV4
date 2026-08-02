@@ -43,6 +43,25 @@ def _finalize_output(out: Path, output_format: str) -> dict:
     return {"filename": out.name, "download_url": f"/layer-files/{out.name}"}
 
 
+def _finalize_outputs(outs: list, formats: list) -> dict:
+    """单格式：TAB/MIF 打包 zip，KML 单文件；多格式：统一打包 zip。
+    outs 元素是 Path（文件或目录）。TAB 的 to_file 输出可能是目录（含 .tab/.dat/.id/.map），
+    需用 is_dir() 判断并 glob 收集子文件。"""
+    if len(outs) == 1:
+        return _finalize_output(outs[0], formats[0])
+    # 多格式 → 统一打包 zip
+    base = outs[0].stem
+    zip_path = outs[0].parent / f"{base}.zip"
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for out in outs:
+            if out.is_dir():
+                for f in out.glob(f"{out.name}.*"):
+                    zf.write(f, arcname=f.name)
+            else:
+                zf.write(out, arcname=out.name)
+    return {"filename": zip_path.name, "download_url": f"/layer-files/{zip_path.name}"}
+
+
 def _save_upload(file: Optional[UploadFile], file_path: Optional[str],
                  source_filename: Optional[str] = None) -> tuple:
     """返回 (Excel 本地路径副本, 原始文件名)。调用方 finally 删除副本。
@@ -117,22 +136,28 @@ async def generate_point(
     lon_col: str = Form(...),
     lat_col: str = Form(...),
     attributes: str = Form("[]"),  # JSON 数组字符串
-    output_format: str = Form("tab"),
+    output_formats: Optional[str] = Form(None),   # 逗号分隔多选，优先
+    output_format: str = Form("tab"),             # 旧单值，兼容
     color: Optional[str] = Form(None),
     source_filename: Optional[str] = Form(None),
     current_user=Depends(require_data_import),
 ):
-    """生成点图层，返回下载 URL"""
+    """生成点图层，返回下载 URL + stats"""
     src = None
     try:
         src, original_name = _save_upload(file, file_path, source_filename)
         attr_list = json.loads(attributes) if attributes else []
-        out = await run_in_threadpool(
-            layer_service.generate_point_layer,
-            str(src), sheet_name, name_col, lon_col, lat_col, attr_list, output_format,
-            color or None, original_name,
-        )
-        return {"success": True, "data": _finalize_output(out, output_format)}
+        fmt_list = [f.strip() for f in (output_formats or output_format).split(",") if f.strip()] or ["tab"]
+
+        outs, stats = [], None
+        for fmt in fmt_list:
+            out, stats = await run_in_threadpool(
+                layer_service.generate_point_layer,
+                str(src), sheet_name, name_col, lon_col, lat_col,
+                attr_list, fmt, color or None, original_name,
+            )
+            outs.append(out)
+        return {"success": True, "data": {**_finalize_outputs(outs, fmt_list), "stats": stats}}
     except HTTPException:
         raise
     except ValueError as e:
@@ -158,23 +183,29 @@ async def generate_sector(
     radius_m: float = Form(3000.0),
     beamwidth: float = Form(40.0),
     attributes: str = Form("[]"),
-    output_format: str = Form("tab"),
+    output_formats: Optional[str] = Form(None),   # 逗号分隔多选，优先
+    output_format: str = Form("tab"),             # 旧单值，兼容
     color: Optional[str] = Form(None),
     source_filename: Optional[str] = Form(None),
     current_user=Depends(require_data_import),
 ):
-    """生成扇区图层，返回下载 URL"""
+    """生成扇区图层，返回下载 URL + stats"""
     src = None
     try:
         src, original_name = _save_upload(file, file_path, source_filename)
         attr_list = json.loads(attributes) if attributes else []
-        out = await run_in_threadpool(
-            layer_service.generate_sector_layer,
-            str(src), sheet_name, name_col, lon_col, lat_col, azimuth_col,
-            radius_m, beamwidth, attr_list, output_format,
-            color or None, original_name,
-        )
-        return {"success": True, "data": _finalize_output(out, output_format)}
+        fmt_list = [f.strip() for f in (output_formats or output_format).split(",") if f.strip()] or ["tab"]
+
+        outs, stats = [], None
+        for fmt in fmt_list:
+            out, stats = await run_in_threadpool(
+                layer_service.generate_sector_layer,
+                str(src), sheet_name, name_col, lon_col, lat_col, azimuth_col,
+                radius_m, beamwidth, attr_list, fmt,
+                color or None, original_name,
+            )
+            outs.append(out)
+        return {"success": True, "data": {**_finalize_outputs(outs, fmt_list), "stats": stats}}
     except HTTPException:
         raise
     except ValueError as e:

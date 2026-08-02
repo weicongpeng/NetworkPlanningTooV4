@@ -393,7 +393,8 @@ def test_layer_point_endpoint_uses_source_filename_in_download_name():
         body = resp.json()
         assert body["success"] is True
         filename = body["data"]["filename"]
-        assert filename.startswith("工参2026_LTE_")
+        # 命名 = 源文件名 + sheet 名（去 uuid，冲突加序号）
+        assert filename.startswith("工参2026_LTE")
         assert filename.endswith(".zip")
     finally:
         os.remove(path)
@@ -438,6 +439,65 @@ def test_layer_endpoints_accept_file_path():
     finally:
         if path.exists():
             os.remove(path)
+
+
+def test_point_endpoint_multi_format_zip():
+    """output_formats=tab,mif → 一次生成两格式打包 zip，返回 stats"""
+    path = _make_excel()
+    client = _make_client()
+    try:
+        with open(path, "rb") as f:
+            resp = client.post(
+                "/api/v1/layer/point",
+                files={"file": ("sample.xlsx", f, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+                data={
+                    "sheet_name": "LTE", "name_col": "NAME",
+                    "lon_col": "LONGITUDE", "lat_col": "LATITUDE",
+                    "attributes": '["NAME"]', "output_formats": "tab,mif",
+                },
+            )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["success"] is True
+        assert body["data"]["filename"].endswith(".zip")
+        assert "stats" in body["data"]
+        assert body["data"]["stats"]["total"] == 2
+        assert body["data"]["stats"]["success"] == 2
+        dl = client.get(body["data"]["download_url"])
+        import zipfile, io
+        with zipfile.ZipFile(io.BytesIO(dl.content)) as zf:
+            names = zf.namelist()
+        assert any(n.endswith(".tab") for n in names)
+        assert any(n.endswith(".mif") for n in names)
+    finally:
+        os.remove(path)
+
+
+def test_point_endpoint_stats_with_failures():
+    """含无效行 → 端点返回 stats.failed>0，文件仍生成"""
+    import tempfile
+    path = tempfile.mktemp(suffix=".xlsx")
+    pd.DataFrame({
+        "NAME": ["A", "B"], "LONGITUDE": [116.3, None], "LATITUDE": [39.9, 40.0],
+    }).to_excel(path, sheet_name="S", index=False)
+    client = _make_client()
+    try:
+        with open(path, "rb") as f:
+            resp = client.post(
+                "/api/v1/layer/point",
+                files={"file": ("s.xlsx", f, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+                data={"sheet_name": "S", "name_col": "NAME",
+                      "lon_col": "LONGITUDE", "lat_col": "LATITUDE",
+                      "attributes": '["NAME"]', "output_formats": "kml"},
+            )
+        assert resp.status_code == 200
+        stats = resp.json()["data"]["stats"]
+        assert stats["total"] == 2
+        assert stats["success"] == 1
+        assert stats["failed"] == 1
+        assert stats["failures"]["missing_coord"] == 1
+    finally:
+        os.remove(path)
 
 
 def test_layer_file_path_reuse_generates_no_leak():
