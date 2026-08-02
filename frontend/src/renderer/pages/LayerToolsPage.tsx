@@ -379,6 +379,35 @@ export default function LayerToolsPage() {
       <h1 className="text-base font-bold mb-6">{t('nav.layerTools')}</h1>
 
       <Tabs.Root value={activeTab} onValueChange={(v) => setActiveTab(v as 'sector' | 'point')}>
+        {/* ① 文件导入（共享，最上层） */}
+        <div className="mb-6">
+          <p className="text-sm font-bold mb-2">{t('layer.fileImport')}</p>
+          <div className="grid grid-cols-5 gap-6">
+            <div className="col-span-3">
+              <label className="block flex items-center gap-3 px-6 py-3 border-2 border-dashed border-border rounded-lg cursor-pointer hover:border-primary transition-colors">
+                <FileUp className="text-muted-foreground shrink-0" size={20} />
+                <div className="flex-1 min-w-0">
+                  <p className="text-sm truncate">{state.fileName || t('layer.uploadExcel')}</p>
+                  <p className="text-xs text-muted-foreground">{t('layer.acceptExcel')}</p>
+                </div>
+                <input type="file" className="hidden" accept=".xlsx,.xls,.txt,.csv" onChange={handleFile} disabled={uploading} />
+              </label>
+
+              {/* 进度条 + 状态 */}
+              {uploading && progress && (
+                <div className="mt-2">
+                  <div className="h-2 bg-muted rounded-full overflow-hidden">
+                    <div className="h-full bg-primary transition-all duration-300" style={{ width: `${progress.percent}%` }} />
+                  </div>
+                  <p className="text-xs text-muted-foreground mt-1">{progressText()}</p>
+                </div>
+              )}
+            </div>
+            <div className="col-span-2" />
+          </div>
+        </div>
+
+        {/* ② 扇区/点图 Tab（下移） */}
         <Tabs.List className="flex gap-2 mb-6 border-b border-border" aria-label={t('nav.layerTools')}>
           <Tabs.Trigger value="sector"
             className="px-4 py-2 text-sm font-medium rounded-t-lg transition-colors data-[state=active]:bg-card data-[state=active]:text-primary data-[state=active]:border-b-2 data-[state=active]:border-primary data-[state=inactive]:text-muted-foreground data-[state=inactive]:hover:text-foreground">
@@ -389,31 +418,6 @@ export default function LayerToolsPage() {
             {t('layer.pointLayer')}
           </Tabs.Trigger>
         </Tabs.List>
-
-        {/* ① 导入区（与左栏对齐，高度减半，文字横向） */}
-        <div className="grid grid-cols-5 gap-6 mb-6">
-          <div className="col-span-3">
-            <label className="block flex items-center gap-3 px-6 py-3 border-2 border-dashed border-border rounded-lg cursor-pointer hover:border-primary transition-colors">
-              <FileUp className="text-muted-foreground shrink-0" size={20} />
-              <div className="flex-1 min-w-0">
-                <p className="text-sm truncate">{state.fileName || t('layer.uploadExcel')}</p>
-                <p className="text-xs text-muted-foreground">{t('layer.acceptExcel')}</p>
-              </div>
-              <input type="file" className="hidden" accept=".xlsx,.xls,.txt,.csv" onChange={handleFile} disabled={uploading} />
-            </label>
-
-            {/* 进度条 + 状态 */}
-            {uploading && progress && (
-              <div className="mt-2">
-                <div className="h-2 bg-muted rounded-full overflow-hidden">
-                  <div className="h-full bg-primary transition-all duration-300" style={{ width: `${progress.percent}%` }} />
-                </div>
-                <p className="text-xs text-muted-foreground mt-1">{progressText()}</p>
-              </div>
-            )}
-          </div>
-          <div className="col-span-2" />
-        </div>
 
         {/* 扇区 Tab */}
         <Tabs.Content value="sector" className="mt-6 data-[state=inactive]:hidden">

@@ -993,8 +993,9 @@
   "layer": {
     "sectorLayer": "Sector Layer",
     "pointLayer": "Point Layer",
+    "fileImport": "File Import",
     "uploadExcel": "Click or drag to import Excel params",
-    "acceptExcel": "Supports .xlsx / .xls",
+    "acceptExcel": "Supports .xlsx / .xls / .txt / .csv",
     "selectSheet": "Data Source (Sheet)",
     "selectAttributes": "Layer Attributes (check columns)",
     "keywordMatch": "Keyword Match",

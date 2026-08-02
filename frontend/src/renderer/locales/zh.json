@@ -1004,8 +1004,9 @@
   "layer": {
     "sectorLayer": "扇区图层",
     "pointLayer": "点图层",
+    "fileImport": "文件导入",
     "uploadExcel": "点击或拖拽导入 Excel 工参文件",
-    "acceptExcel": "支持 .xlsx / .xls",
+    "acceptExcel": "支持 .xlsx / .xls / .txt / .csv",
     "selectSheet": "数据来源 (Sheet)",
     "selectAttributes": "图层属性 (勾选列)",
     "keywordMatch": "关键字匹配",
