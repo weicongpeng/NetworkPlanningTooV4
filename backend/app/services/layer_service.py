@@ -121,7 +121,7 @@ def hex_to_kml_color(color: Optional[str]) -> Optional[str]:
         return None
 
 
-def svg_point_icon(shape: str, color: str, size_px: int = 32) -> str:
+def svg_point_icon(shape: str, color: str) -> str:
     """生成点形状的 SVG Data URI（KML Icon href，完全离线可用）。"""
     from urllib.parse import quote
     fill = color or "#FF0000"
