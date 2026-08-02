@@ -1240,7 +1240,6 @@ export const appVersionsApi = {
     startForm.append('filename', file.name)
     startForm.append('total_chunks', String(totalChunks))
     startForm.append('total_size', String(file.size))
-    onProgress?.(2)                     // start 请求发起前
   const startResp = await uploadClient.post(`${basePath}/start`, startForm)
     const uploadId = startResp.data?.id || startResp.data?.data?.id
     if (!uploadId) throw new Error('无法创建上传会话')
