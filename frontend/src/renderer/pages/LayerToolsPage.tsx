@@ -9,13 +9,31 @@ import { LAYER_DEFAULT_PARAMS } from '../config/layer-config'
 type LayerFormat = 'tab' | 'mif' | 'kml'
 const ALL_FORMATS: LayerFormat[] = ['tab', 'mif', 'kml']
 
-interface TabState {
+// 页面级共享文件状态：一份文件同时作用于扇区/点图两个 Tab
+interface SharedFile {
   filePath: string
   sourceFilename: string
   fileName: string
   sheetName: string
   info: LayerExcelInfo | null
   columns: string[]
+}
+
+const SHARED_STORAGE_KEY = 'layerTools.shared'
+
+function emptySharedFile(): SharedFile {
+  return { filePath: '', sourceFilename: '', fileName: '', sheetName: '', info: null, columns: [] }
+}
+
+function loadSharedFile(): SharedFile {
+  try {
+    const raw = sessionStorage.getItem(SHARED_STORAGE_KEY)
+    if (raw) return { ...emptySharedFile(), ...JSON.parse(raw) }
+  } catch { /* ignore */ }
+  return emptySharedFile()
+}
+
+interface TabState {
   selectedFields: Record<string, string>
   fieldMappings: Record<string, string>
   radiusM: string          // 字符串受控，避免删空变 0 / 前导 0
@@ -31,12 +49,6 @@ const STORAGE_KEYS = { sector: 'layerTools.sector', point: 'layerTools.point' }
 
 function emptyTabState(type: 'sector' | 'point'): TabState {
   return {
-    filePath: '',
-    sourceFilename: '',
-    fileName: '',
-    sheetName: '',
-    info: null,
-    columns: [],
     selectedFields: {},
     fieldMappings: {},
     radiusM: type === 'sector' ? String(LAYER_DEFAULT_PARAMS.sector.radiusM) : '',
@@ -61,7 +73,7 @@ function loadState(key: string, type: 'sector' | 'point'): TabState {
   return emptyTabState(type)
 }
 
-function saveState(key: string, s: TabState) {
+function saveState(key: string, s: unknown) {
   try { sessionStorage.setItem(key, JSON.stringify(s)) } catch { /* ignore */ }
 }
 
@@ -70,6 +82,8 @@ export default function LayerToolsPage() {
   const [activeTab, setActiveTab] = useState<'sector' | 'point'>('sector')
   const [sectorState, setSectorState] = useState<TabState>(() => loadState(STORAGE_KEYS.sector, 'sector'))
   const [pointState, setPointState] = useState<TabState>(() => loadState(STORAGE_KEYS.point, 'point'))
+  // 页面级共享文件（一份文件同时作用于扇区/点图两个 Tab）
+  const [sharedFile, setSharedFile] = useState<SharedFile>(() => loadSharedFile())
   const [uploading, setUploading] = useState(false)
   const [generating, setGenerating] = useState(false)
   const [progress, setProgress] = useState<{ percent: number; step: string } | null>(null)
@@ -77,6 +91,7 @@ export default function LayerToolsPage() {
   // 持久化：state 变化写 sessionStorage
   useEffect(() => saveState(STORAGE_KEYS.sector, sectorState), [sectorState])
   useEffect(() => saveState(STORAGE_KEYS.point, pointState), [pointState])
+  useEffect(() => saveState(SHARED_STORAGE_KEY, sharedFile), [sharedFile])
 
   // 当前激活 Tab 的 state
   const state = activeTab === 'sector' ? sectorState : pointState
@@ -90,7 +105,8 @@ export default function LayerToolsPage() {
   const handleFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const f = e.target.files?.[0]
     if (!f) return
-    setState(s => ({ ...s, result: null, error: '', info: null, columns: [], sheetName: '' }))
+    // 导入区是页面级共享的：上传前清空共享文件（只作用于共享状态，两个 Tab 的配置各自保留）
+    setSharedFile(() => emptySharedFile())
     setUploading(true)
     setProgress({ percent: 1, step: 'uploading' })
     try {
@@ -99,8 +115,7 @@ export default function LayerToolsPage() {
       })
       setProgress({ percent: 100, step: 'reading' })
       const data = await layerToolsApi.getExcelInfo(up.file_path, up.source_filename)
-      setState(s => ({
-        ...s,
+      setSharedFile(() => ({
         filePath: up.file_path,
         sourceFilename: up.source_filename,
         fileName: f.name,
@@ -109,7 +124,10 @@ export default function LayerToolsPage() {
         columns: data.columns[data.sheets[0]] || [],
       }))
     } catch (err: any) {
-      setState(s => ({ ...s, error: err?.message || String(err) }))
+      // 上传失败：共享文件已清空，错误提示到两个 Tab 各自的 error 上
+      const msg = err?.message || String(err)
+      setSectorState(s => ({ ...s, error: msg }))
+      setPointState(s => ({ ...s, error: msg }))
     } finally {
       setUploading(false)
       setProgress(null)
@@ -117,7 +135,7 @@ export default function LayerToolsPage() {
   }
 
   const handleGenerate = async () => {
-    if (!state.filePath || !state.sheetName) {
+    if (!sharedFile.filePath || !sharedFile.sheetName) {
       setState(s => ({ ...s, error: t('layer.errSheet') }))
       return
     }
@@ -140,9 +158,9 @@ export default function LayerToolsPage() {
     setState(s => ({ ...s, error: '', result: null }))
     try {
       const base = {
-        filePath: state.filePath,
-        sourceFilename: state.sourceFilename,
-        sheetName: state.sheetName,
+        filePath: sharedFile.filePath,
+        sourceFilename: sharedFile.sourceFilename,
+        sheetName: sharedFile.sheetName,
         nameCol: state.fieldMappings.name,
         lonCol: state.fieldMappings.longitude,
         latCol: state.fieldMappings.latitude,
@@ -160,10 +178,11 @@ export default function LayerToolsPage() {
         : await layerToolsApi.generatePoint(base)
       setState(s => ({ ...s, result: data }))
     } catch (err: any) {
-      // 文件过期（后端 TTL 清理后 file_path 失效）→ 清空状态提示重新导入
+      // 文件过期（后端 TTL 清理后 file_path 失效）→ 清空共享文件提示重新导入
       const msg = err?.message || String(err)
       if (/文件不存在|文件已过期/.test(msg)) {
-        setState(s => ({ ...s, error: t('layer.fileExpired'), filePath: '', fileName: '', info: null, columns: [] }))
+        setSharedFile(() => ({ ...emptySharedFile() }))
+        setState(s => ({ ...s, error: t('layer.fileExpired') }))
       } else {
         setState(s => ({ ...s, error: msg }))
       }
@@ -322,20 +341,26 @@ export default function LayerToolsPage() {
     </div>
   )
 
-  // 渲染 Tab 内容（扇区/点图共用骨架，参数和校验差异）
-  const renderTabContent = (ts: TabState, setTab: (u: (s: TabState) => TabState) => void, includeAzimuth: boolean) => (
+  // 渲染 Tab 内容（扇区/点图共用骨架，参数和校验差异；文件共享，读 sharedFile）
+  const renderTabContent = (
+    ts: TabState,
+    setTab: (u: (s: TabState) => TabState) => void,
+    file: SharedFile,
+    onSheetChange: (sheet: string) => void,
+    includeAzimuth: boolean,
+  ) => (
     <div className="grid grid-cols-5 gap-6">
       {/* 左栏（3/5） */}
       <div className="col-span-3 space-y-6">
         {/* ② Sheet 选择 */}
         <div className="p-4 bg-card border border-border rounded-lg">
           <label htmlFor={`layer-sheet-${activeTab}`} className="block text-xs font-medium mb-2">{t('layer.selectSheet')}</label>
-          <select id={`layer-sheet-${activeTab}`} value={ts.sheetName}
-            onChange={e => setTab(s => ({ ...s, sheetName: e.target.value, columns: s.info?.columns[e.target.value] || [] }))}
-            disabled={!ts.info || ts.info.sheets.length <= 1}
+          <select id={`layer-sheet-${activeTab}`} value={file.sheetName}
+            onChange={e => onSheetChange(e.target.value)}
+            disabled={!file.info || file.info.sheets.length <= 1}
             className="w-full h-9 px-2 text-sm border border-border rounded bg-card disabled:opacity-50">
-            {ts.info && ts.info.sheets.length > 0
-              ? ts.info.sheets.map(s => <option key={s} value={s}>{s}</option>)
+            {file.info && file.info.sheets.length > 0
+              ? file.info.sheets.map(s => <option key={s} value={s}>{s}</option>)
               : <option value="">{t('layer.importHint')}</option>}
           </select>
         </div>
@@ -343,7 +368,7 @@ export default function LayerToolsPage() {
         {/* ③ 属性配置 */}
         <div className="p-4 bg-card border border-border rounded-lg">
           <LayerAttributeConfig
-            columns={ts.columns}
+            columns={file.columns}
             includeAzimuth={includeAzimuth}
             selectedFields={ts.selectedFields}
             onSelectedFieldsChange={(v) => setTab(s => ({ ...s, selectedFields: v }))}
@@ -363,7 +388,7 @@ export default function LayerToolsPage() {
 
         {/* ⑤ 生成 + 下载 */}
         <div className="p-4 bg-card border border-border rounded-lg">
-          <button onClick={handleGenerate} disabled={generating || !ts.filePath || !ts.sheetName}
+          <button onClick={handleGenerate} disabled={generating || !file.filePath || !file.sheetName}
             className="w-full px-6 py-2.5 bg-primary text-primary-foreground rounded-lg hover:opacity-90 disabled:opacity-50 text-sm font-medium">
             {generating ? <Loader2 size={16} className="animate-spin inline mr-2" /> : null}
             {t('layer.generate')}
@@ -373,6 +398,11 @@ export default function LayerToolsPage() {
       </div>
     </div>
   )
+
+  // 共享文件 Sheet 切换：只改 sharedFile（两个 Tab 的配置各自保留）
+  const handleSheetChange = (sheet: string) => {
+    setSharedFile(f => ({ ...f, sheetName: sheet, columns: f.info?.columns[sheet] || [] }))
+  }
 
   return (
     <div className="p-8 max-w-6xl">
@@ -387,7 +417,7 @@ export default function LayerToolsPage() {
               <label className="block flex items-center gap-3 px-6 py-3 border-2 border-dashed border-border rounded-lg cursor-pointer hover:border-primary transition-colors">
                 <FileUp className="text-muted-foreground shrink-0" size={20} />
                 <div className="flex-1 min-w-0">
-                  <p className="text-sm truncate">{state.fileName || t('layer.uploadExcel')}</p>
+                  <p className="text-sm truncate">{sharedFile.fileName || t('layer.uploadExcel')}</p>
                   <p className="text-xs text-muted-foreground">{t('layer.acceptExcel')}</p>
                 </div>
                 <input type="file" className="hidden" accept=".xlsx,.xls,.txt,.csv" onChange={handleFile} disabled={uploading} />
@@ -421,13 +451,13 @@ export default function LayerToolsPage() {
 
         {/* 扇区 Tab */}
         <Tabs.Content value="sector" className="mt-6 data-[state=inactive]:hidden">
-          {renderTabContent(sectorState, (u) => setSectorState(s => u(s)), true)}
+          {renderTabContent(sectorState, (u) => setSectorState(s => u(s)), sharedFile, handleSheetChange, true)}
           {sectorState.error && <p className="mt-4 text-xs text-red-500">{sectorState.error}</p>}
         </Tabs.Content>
 
         {/* 点图 Tab */}
         <Tabs.Content value="point" className="mt-6 data-[state=inactive]:hidden">
-          {renderTabContent(pointState, (u) => setPointState(s => u(s)), false)}
+          {renderTabContent(pointState, (u) => setPointState(s => u(s)), sharedFile, handleSheetChange, false)}
           {pointState.error && <p className="mt-4 text-xs text-red-500">{pointState.error}</p>}
         </Tabs.Content>
       </Tabs.Root>
