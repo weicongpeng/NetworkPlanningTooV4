@@ -55,7 +55,7 @@ function emptyTabState(type: 'sector' | 'point'): TabState {
     beamwidth: type === 'sector' ? String(LAYER_DEFAULT_PARAMS.sector.beamwidth) : '',
     pointSize: type === 'point' ? String(LAYER_DEFAULT_PARAMS.point.pointSize) : '',
     color: type === 'sector' ? LAYER_DEFAULT_PARAMS.sector.color : LAYER_DEFAULT_PARAMS.point.color,
-    formats: ['tab'],
+    formats: ['tab', 'mif', 'kml'],
     result: null,
     error: '',
   }
@@ -412,11 +412,11 @@ export default function LayerToolsPage() {
 
       <Tabs.Root value={activeTab} onValueChange={(v) => setActiveTab(v as 'sector' | 'point')}>
         {/* ① 文件导入（共享，最上层） */}
-        <div className="mb-6">
-          <p className="text-sm font-bold mb-2">{t('layer.fileImport')}</p>
+        <div className="mb-6 p-4 bg-card border border-border rounded-lg">
+          <p className="text-xs font-medium mb-3">{t('layer.fileImport')}</p>
           <div className="grid grid-cols-5 gap-6">
             <div className="col-span-3">
-              <label className="block flex items-center gap-3 px-6 py-3 border-2 border-dashed border-border rounded-lg cursor-pointer hover:border-primary transition-colors">
+              <label className="block flex items-center gap-3 px-4 py-3 border-2 border-dashed border-border rounded-lg cursor-pointer hover:border-primary transition-colors">
                 <FileUp className="text-muted-foreground shrink-0" size={20} />
                 <div className="flex-1 min-w-0">
                   <p className="text-sm truncate">{sharedFile.fileName || t('layer.uploadExcel')}</p>
