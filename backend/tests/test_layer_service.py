@@ -484,19 +484,27 @@ def test_mapinfo_field_name_sanitized(service, tmp_path):
 
 
 def test_mapinfo_field_name_dedupe(service, tmp_path):
-    """清洗后重名（SITE ID 与 SITE_ID）→ 自动加序号去重，不崩溃"""
+    """清洗后重名（SITE ID 与 SITE_ID）且与合成名 SITE_ID_2 碰撞
+    → 自动加序号去重（SITE_ID_2_2），不崩溃、无重复字段名"""
     path = tmp_path / "d.xlsx"
-    df = pd.DataFrame({"SITE ID": ["A"], "SITE_ID": ["B"], "经度": [116.4], "纬度": [39.9]})
+    df = pd.DataFrame({
+        "SITE ID": ["A"], "SITE_ID": ["B"], "SITE_ID_2": ["C"],
+        "经度": [116.4], "纬度": [39.9],
+    })
     with pd.ExcelWriter(path, engine="openpyxl") as writer:
         df.to_excel(writer, sheet_name="LTE", index=False)
     out, _ = service.generate_point_layer(
         file_path=str(path), sheet_name="LTE",
         name_col="SITE ID", lon_col="经度", lat_col="纬度",
-        attributes=["SITE ID", "SITE_ID"], output_format="tab",
+        attributes=["SITE ID", "SITE_ID", "SITE_ID_2"], output_format="tab",
     )
     import geopandas as gpd
     gdf = gpd.read_file(out)
-    assert len(gdf.columns) == 3  # 两个字段 + geometry
+    # 精确断言：第三个字段避开已占用的 SITE_ID_2，改为 SITE_ID_2_2
+    assert list(gdf.columns) == ["SITE_ID", "SITE_ID_2", "SITE_ID_2_2", "geometry"]
+    # 无重复字段名（MapInfo Pro 拒绝重复字段名）
+    fields = [c for c in gdf.columns if c != "geometry"]
+    assert len(fields) == len(set(fields)) == 3
 
 
 def test_cleanup_old_outputs_removes_history(tmp_path):

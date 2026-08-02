@@ -37,16 +37,20 @@ def _sanitize_field_name(name: str) -> str:
 
 
 def _dedupe_field_names(names: list) -> list:
-    """清洗后字段名去重：重名追加 _2/_3 序号，保持相对顺序。"""
-    seen = {}
+    """清洗后字段名去重：重名追加 _2/_3 序号，保持相对顺序。合成名也占用，避免二次碰撞。"""
+    used = set()
     result = []
     for n in names:
-        if n not in seen:
-            seen[n] = 1
+        if n not in used:
+            used.add(n)
             result.append(n)
         else:
-            seen[n] += 1
-            result.append(f"{n}_{seen[n]}")
+            i = 2
+            while f"{n}_{i}" in used:
+                i += 1
+            unique = f"{n}_{i}"
+            used.add(unique)
+            result.append(unique)
     return result
 
 
