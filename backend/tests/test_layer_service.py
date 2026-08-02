@@ -467,17 +467,19 @@ def test_mif_chinese_fields_readable(service, tmp_path):
 
 
 def test_output_filename_conflict_appends_suffix(tmp_path):
-    """同名文件已存在 → 追加 -1/-2 序号"""
+    """预置同名文件 → 生成前清理后产出同名（不追加 -1/-2，历史不保留）"""
     path = tmp_path / "源.xlsx"
     df = pd.DataFrame({"NAME": ["A"], "LONGITUDE": [116.3], "LATITUDE": [39.9]})
     with pd.ExcelWriter(path, engine="openpyxl") as writer:
         df.to_excel(writer, sheet_name="LTE", index=False)
     svc = LayerService(output_dir=tmp_path)
-    (tmp_path / "源_LTE.tab").write_text("x")   # 预置冲突
+    (tmp_path / "源_LTE.tab").write_text("x")   # 预置冲突（模拟历史）
     out1, _ = svc.generate_point_layer(str(path), "LTE", "NAME", "LONGITUDE", "LATITUDE", ["NAME"], "tab")
     out2, _ = svc.generate_point_layer(str(path), "LTE", "NAME", "LONGITUDE", "LATITUDE", ["NAME"], "tab")
-    assert out1.name == "源_LTE-1.tab"
-    assert out2.name == "源_LTE-2.tab"
+    # 生成前清理历史，产出同名；不保留 -1 历史
+    assert out1.name == "源_LTE.tab"
+    assert out2.name == "源_LTE.tab"
+    assert not (tmp_path / "源_LTE-1.tab").exists()
 
 
 def test_read_text_csv_gbk(service, tmp_path):
@@ -555,3 +557,27 @@ def test_failed_details_in_sector_stats(service, tmp_path):
     assert stats["failed"] == 1
     assert stats["failedDetails"][0]["name"] == "B"
     assert stats["failedDetails"][0]["reason"] == "invalid_azimuth"
+
+
+def test_repeat_generate_cleans_old_outputs(service, tmp_path):
+    """二次生成后 output_dir 只保留最新 base 文件（无 -1 后缀历史残留）"""
+    path = tmp_path / "工参.xlsx"
+    df = pd.DataFrame({"NAME": ["A"], "LONGITUDE": [116.3], "LATITUDE": [39.9]})
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name="LTE", index=False)
+
+    # 第一次生成
+    out1, _ = service.generate_point_layer(
+        str(path), "LTE", "NAME", "LONGITUDE", "LATITUDE", ["NAME"], "tab",
+        source_filename="工参.xlsx",
+    )
+    assert out1.name == "工参_LTE.tab"
+
+    # 第二次生成（应清理旧的，产出同名而非 -1）
+    out2, _ = service.generate_point_layer(
+        str(path), "LTE", "NAME", "LONGITUDE", "LATITUDE", ["NAME"], "tab",
+        source_filename="工参.xlsx",
+    )
+    assert out2.name == "工参_LTE.tab"
+    # 无 -1 历史残留
+    assert not (tmp_path / "工参_LTE-1.tab").exists()

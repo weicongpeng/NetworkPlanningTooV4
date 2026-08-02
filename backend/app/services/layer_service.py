@@ -220,6 +220,13 @@ class LayerService:
             i += 1
         return self.output_dir / f"{stem}-{i}{ext}"
 
+    def _cleanup_old_outputs(self, base: str):
+        """生成前删除同 base 的历史输出（.tab/.dat/.id/.map/.mif/.mid/.zip）。
+        保证同一源文件+sheet 只保留最新一次生成结果。"""
+        for f in self.output_dir.glob(f"{base}*"):
+            if f.suffix in (".tab", ".dat", ".id", ".map", ".mif", ".mid", ".zip"):
+                f.unlink(missing_ok=True)
+
     def _mapinfo_postprocess(self, out_path: Path, output_format: str,
                              original_columns: list) -> Path:
         """MapInfo TAB/MIF 后处理：修正 charset 声明为 WindowsSimpChinese + 恢复中文列名。
@@ -341,6 +348,11 @@ class LayerService:
         不提供时回退到 file_path 的文件名。
         """
         df = self._read_sheet(file_path, sheet_name)
+        # 生成前清理同 base 历史输出（base = 源文件名stem + sheet 名）
+        base = _truncate_bytes(Path(source_filename or Path(file_path).name).stem, 100)
+        safe_sheet = _truncate_bytes(re.sub(r'[<>:"/\\|?*]', "_", sheet_name), 50)
+        self._cleanup_old_outputs(f"{base}_{safe_sheet}")
+
         lon, lat, coord_valid, failures = self._coerce_coords(df, lon_col, lat_col)
 
         # 标签名缺失校验
@@ -390,6 +402,11 @@ class LayerService:
         不提供时回退到 file_path 的文件名。
         """
         df = self._read_sheet(file_path, sheet_name)
+        # 生成前清理同 base 历史输出（base = 源文件名stem + sheet 名）
+        base = _truncate_bytes(Path(source_filename or Path(file_path).name).stem, 100)
+        safe_sheet = _truncate_bytes(re.sub(r'[<>:"/\\|?*]', "_", sheet_name), 50)
+        self._cleanup_old_outputs(f"{base}_{safe_sheet}")
+
         lon, lat, coord_valid, failures = self._coerce_coords(df, lon_col, lat_col)
 
         # 方位角校验
