@@ -39,7 +39,10 @@ interface TabState {
   radiusM: string          // 字符串受控，避免删空变 0 / 前导 0
   beamwidth: string
   pointSize: string
-  color: string
+  borderColor: string      // 边框颜色
+  fillColor: string        // 填充颜色（扇区内部；点图忽略）
+  opacity: string          // 透明度 0-1（字符串受控，允许 0.6 等）
+  color: string            // 旧字段兼容（保留读写，避免旧 sessionStorage 数据丢失）
   formats: LayerFormat[]   // 多格式勾选
   result: GenerateLayerResult | null
   error: string
@@ -48,13 +51,17 @@ interface TabState {
 const STORAGE_KEYS = { sector: 'layerTools.sector', point: 'layerTools.point' }
 
 function emptyTabState(type: 'sector' | 'point'): TabState {
+  const dp = type === 'sector' ? LAYER_DEFAULT_PARAMS.sector : LAYER_DEFAULT_PARAMS.point
   return {
     selectedFields: {},
     fieldMappings: {},
     radiusM: type === 'sector' ? String(LAYER_DEFAULT_PARAMS.sector.radiusM) : '',
     beamwidth: type === 'sector' ? String(LAYER_DEFAULT_PARAMS.sector.beamwidth) : '',
     pointSize: type === 'point' ? String(LAYER_DEFAULT_PARAMS.point.pointSize) : '',
-    color: type === 'sector' ? LAYER_DEFAULT_PARAMS.sector.color : LAYER_DEFAULT_PARAMS.point.color,
+    borderColor: dp.borderColor,
+    fillColor: type === 'sector' ? LAYER_DEFAULT_PARAMS.sector.fillColor : '',
+    opacity: String(dp.opacity),
+    color: dp.borderColor,   // 旧字段兼容
     formats: ['tab', 'mif', 'kml'],
     result: null,
     error: '',
@@ -67,6 +74,9 @@ function loadState(key: string, type: 'sector' | 'point'): TabState {
     const raw = sessionStorage.getItem(key)
     if (raw) {
       const saved = JSON.parse(raw)
+      // 迁移：旧版只有 color（原"填充颜色"实为边框色），新版拆分为 borderColor/fillColor/opacity
+      if (saved.color && !saved.borderColor) saved.borderColor = saved.color
+      if (saved.color && !saved.fillColor && type === 'sector') saved.fillColor = saved.color
       return { ...emptyTabState(type), ...saved }
     }
   } catch { /* ignore */ }
@@ -168,7 +178,10 @@ export default function LayerToolsPage() {
         latCol: state.fieldMappings.latitude,
         attributes: Object.values(state.selectedFields),
         outputFormats: state.formats,
-        color: state.color,
+        color: state.borderColor,
+        borderColor: state.borderColor,
+        fillColor: state.fillColor,
+        opacity: parseFloat(state.opacity),
       }
       const data = isSector
         ? await layerToolsApi.generateSector({
@@ -239,10 +252,26 @@ export default function LayerToolsPage() {
             className="w-full h-9 px-2 text-sm border border-border rounded bg-card" />
         </div>
       )}
+      {/* 边框颜色 */}
       <div>
-        <label className="block text-xs font-medium mb-1">{t('layer.fillColor')}</label>
-        <input type="color" value={ts.color} onChange={e => setTab(s => ({ ...s, color: e.target.value }))}
+        <label className="block text-xs font-medium mb-1">{t('layer.borderColor')}</label>
+        <input type="color" value={ts.borderColor} onChange={e => setTab(s => ({ ...s, borderColor: e.target.value, color: e.target.value }))}
           className="w-full h-9 cursor-pointer" />
+      </div>
+      {/* 填充颜色（扇区内部；点图无填充概念，隐藏） */}
+      {isSector && (
+        <div>
+          <label className="block text-xs font-medium mb-1">{t('layer.fillColor')}</label>
+          <input type="color" value={ts.fillColor} onChange={e => setTab(s => ({ ...s, fillColor: e.target.value }))}
+            className="w-full h-9 cursor-pointer" />
+        </div>
+      )}
+      {/* 透明度 0-1 */}
+      <div className="col-span-2">
+        <label className="block text-xs font-medium mb-1">{t('layer.opacity')}</label>
+        <input {...numberInput(ts.opacity, (v) => setTab(s => ({ ...s, opacity: v })))}
+          placeholder="0.6"
+          className="w-full h-9 px-2 text-sm border border-border rounded bg-card" />
       </div>
       {/* 输出格式多选勾选 */}
       <div className="col-span-2">
@@ -411,31 +440,28 @@ export default function LayerToolsPage() {
       <h1 className="text-base font-bold mb-6">{t('nav.layerTools')}</h1>
 
       <Tabs.Root value={activeTab} onValueChange={(v) => setActiveTab(v as 'sector' | 'point')}>
-        {/* ① 文件导入（共享，最上层） */}
-        <div className="mb-6 p-4 bg-card border border-border rounded-lg">
-          <p className="text-xs font-medium mb-3">{t('layer.fileImport')}</p>
-          <div className="grid grid-cols-5 gap-6">
-            <div className="col-span-3">
-              <label className="block flex items-center gap-3 px-4 py-3 border-2 border-dashed border-border rounded-lg cursor-pointer hover:border-primary transition-colors">
-                <FileUp className="text-muted-foreground shrink-0" size={20} />
-                <div className="flex-1 min-w-0">
-                  <p className="text-sm truncate">{sharedFile.fileName || t('layer.uploadExcel')}</p>
-                  <p className="text-xs text-muted-foreground">{t('layer.acceptExcel')}</p>
-                </div>
-                <input type="file" className="hidden" accept=".xlsx,.xls,.txt,.csv" onChange={handleFile} disabled={uploading} />
-              </label>
+        {/* ① 文件导入（共享，最上层，宽度与下方左栏卡片对齐：grid-cols-5 中占 col-span-3） */}
+        <div className="mb-6 grid grid-cols-5 gap-6">
+          <div className="col-span-3 p-4 bg-card border border-border rounded-lg">
+            <p className="text-xs font-medium mb-3">{t('layer.fileImport')}</p>
+            <label className="block flex items-center gap-3 px-4 py-3 border-2 border-dashed border-border rounded-lg cursor-pointer hover:border-primary transition-colors">
+              <FileUp className="text-muted-foreground shrink-0" size={20} />
+              <div className="flex-1 min-w-0">
+                <p className="text-sm truncate">{sharedFile.fileName || t('layer.uploadExcel')}</p>
+                <p className="text-xs text-muted-foreground">{t('layer.acceptExcel')}</p>
+              </div>
+              <input type="file" className="hidden" accept=".xlsx,.xls,.txt,.csv" onChange={handleFile} disabled={uploading} />
+            </label>
 
-              {/* 进度条 + 状态 */}
-              {uploading && progress && (
-                <div className="mt-2">
-                  <div className="h-2 bg-muted rounded-full overflow-hidden">
-                    <div className="h-full bg-primary transition-all duration-300" style={{ width: `${progress.percent}%` }} />
-                  </div>
-                  <p className="text-xs text-muted-foreground mt-1">{progressText()}</p>
+            {/* 进度条 + 状态 */}
+            {uploading && progress && (
+              <div className="mt-2">
+                <div className="h-2 bg-muted rounded-full overflow-hidden">
+                  <div className="h-full bg-primary transition-all duration-300" style={{ width: `${progress.percent}%` }} />
                 </div>
-              )}
-            </div>
-            <div className="col-span-2" />
+                <p className="text-xs text-muted-foreground mt-1">{progressText()}</p>
+              </div>
+            )}
           </div>
         </div>
 

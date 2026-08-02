@@ -167,6 +167,106 @@ def test_point_endpoint_kml_no_zip():
         os.remove(path)
 
 
+def test_sector_point_distinct_output_names():
+    """同源文件分别生成扇区/点图 → 输出文件名不同（_sector/_point），互不覆盖"""
+    path = _make_excel()
+    client = _make_client()
+    try:
+        with open(path, "rb") as f:
+            r_s = client.post(
+                "/api/v1/layer/sector",
+                files={"file": ("sample.xlsx", f, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+                data={
+                    "sheet_name": "LTE", "name_col": "NAME",
+                    "lon_col": "LONGITUDE", "lat_col": "LATITUDE",
+                    "azimuth_col": "AZIMUTH", "radius_m": "3000", "beamwidth": "40",
+                    "attributes": '["NAME"]', "output_formats": "kml",
+                },
+            )
+        assert r_s.status_code == 200
+        fname_s = r_s.json()["data"]["filename"]
+        assert fname_s.endswith(".kml")
+        assert "_sector.kml" in fname_s
+
+        with open(path, "rb") as f:
+            r_p = client.post(
+                "/api/v1/layer/point",
+                files={"file": ("sample.xlsx", f, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+                data={
+                    "sheet_name": "LTE", "name_col": "NAME",
+                    "lon_col": "LONGITUDE", "lat_col": "LATITUDE",
+                    "attributes": '["NAME"]', "output_formats": "kml",
+                },
+            )
+        assert r_p.status_code == 200
+        fname_p = r_p.json()["data"]["filename"]
+        assert fname_p.endswith(".kml")
+        assert "_point.kml" in fname_p
+
+        assert fname_s != fname_p
+        # 两个文件都各自存在且内容不同（一个 Polygon，一个 Point）
+        s = client.get(r_s.json()["data"]["download_url"]).content.decode("utf-8", errors="replace")
+        p = client.get(r_p.json()["data"]["download_url"]).content.decode("utf-8", errors="replace")
+        assert "<Polygon>" in s
+        assert "<Point>" in p
+    finally:
+        os.remove(path)
+
+
+def test_sector_endpoint_with_border_fill_opacity():
+    """扇区图层 + border_color/fill_color/opacity → MIF Pen=边框色、Brush=填充色"""
+    path = _make_excel()
+    client = _make_client()
+    try:
+        with open(path, "rb") as f:
+            resp = client.post(
+                "/api/v1/layer/sector",
+                files={"file": ("sample.xlsx", f, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+                data={
+                    "sheet_name": "LTE", "name_col": "NAME",
+                    "lon_col": "LONGITUDE", "lat_col": "LATITUDE",
+                    "azimuth_col": "AZIMUTH", "radius_m": "3000", "beamwidth": "40",
+                    "attributes": '["NAME"]', "output_format": "mif",
+                    "border_color": "#000000", "fill_color": "#FF0000", "opacity": "0.5",
+                },
+            )
+        assert resp.status_code == 200
+        dl = client.get(resp.json()["data"]["download_url"])
+        import zipfile, io
+        with zipfile.ZipFile(io.BytesIO(dl.content)) as zf:
+            mif_names = [n for n in zf.namelist() if n.endswith(".mif")]
+            assert mif_names
+            text = zf.read(mif_names[0]).decode("gbk", errors="replace")
+        assert "Pen (1,0," in text        # 黑色边框
+        assert "Brush (1,16711680," in text  # 红色填充
+    finally:
+        os.remove(path)
+
+
+def test_point_endpoint_with_border_opacity_kml():
+    """点图层 KML + border_color/opacity → IconStyle color 带 alpha"""
+    path = _make_excel()
+    client = _make_client()
+    try:
+        with open(path, "rb") as f:
+            resp = client.post(
+                "/api/v1/layer/point",
+                files={"file": ("sample.xlsx", f, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+                data={
+                    "sheet_name": "LTE", "name_col": "NAME",
+                    "lon_col": "LONGITUDE", "lat_col": "LATITUDE",
+                    "attributes": '["NAME"]', "output_format": "kml",
+                    "border_color": "#FF0000", "opacity": "0.5",
+                },
+            )
+        assert resp.status_code == 200
+        dl = client.get(resp.json()["data"]["download_url"])
+        text = dl.content.decode("utf-8", errors="replace")
+        assert "<IconStyle><color>800000ff</color>" in text
+    finally:
+        os.remove(path)
+
+
 def test_sector_endpoint_with_color():
     """扇区图层 + color 参数 → 生成成功且 MIF 颜色已注入"""
     path = _make_excel()
@@ -603,10 +703,10 @@ def test_repeat_generate_via_endpoint_keeps_latest_only():
             assert resp.status_code == 200
             filename = resp.json()["data"]["filename"]
             # 两次都应是同名（无 -1 后缀）
-            assert filename == "工参_LTE.zip"
+            assert filename == "工参_LTE_point.zip"
         # 输出目录只含最新同名文件，无 -1 历史
         layers_dir = settings.UPLOAD_DIR / "layers"
-        names = [p.name for p in layers_dir.glob("工参_LTE*")]
+        names = [p.name for p in layers_dir.glob("工参_LTE_point*")]
         assert not any("-1" in n for n in names), f"存在历史残留: {names}"
     finally:
         os.remove(path)
@@ -617,7 +717,7 @@ def test_multi_format_zip_excludes_historical_suffixed_files():
     layers_dir = settings.UPLOAD_DIR / "layers"
     layers_dir.mkdir(parents=True, exist_ok=True)
     # 预置历史残留（模拟之前清理失败留下的）
-    hist = layers_dir / "残留_LTE-1.kml"
+    hist = layers_dir / "残留_LTE_point-1.kml"
     hist.write_text("x")
     path = _make_excel()
     client = _make_client()
@@ -678,7 +778,7 @@ def test_repeat_generate_kml_no_suffixed_duplicate():
         assert not any("-1." in n for n in names), f"序号残留进zip: {names}"
         # 磁盘无 -1 残留
         layers_dir = settings.UPLOAD_DIR / "layers"
-        suffixed = [p.name for p in layers_dir.glob("重复_LTE*") if "-1." in p.name]
+        suffixed = [p.name for p in layers_dir.glob("重复_LTE_point*") if "-1." in p.name]
         assert not suffixed, f"磁盘残留: {suffixed}"
     finally:
         os.remove(path)

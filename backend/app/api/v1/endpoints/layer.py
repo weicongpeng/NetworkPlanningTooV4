@@ -146,7 +146,10 @@ async def generate_point(
     attributes: str = Form("[]"),  # JSON 数组字符串
     output_formats: Optional[str] = Form(None),   # 逗号分隔多选，优先
     output_format: str = Form("tab"),             # 旧单值，兼容
-    color: Optional[str] = Form(None),
+    color: Optional[str] = Form(None),            # 旧单值：点图按边框语义应用
+    border_color: Optional[str] = Form(None),
+    fill_color: Optional[str] = Form(None),
+    opacity: Optional[float] = Form(None),        # 0-1
     source_filename: Optional[str] = Form(None),
     current_user=Depends(require_data_import),
 ):
@@ -157,10 +160,11 @@ async def generate_point(
         attr_list = json.loads(attributes) if attributes else []
         fmt_list = [f.strip() for f in (output_formats or output_format).split(",") if f.strip()] or ["tab"]
 
-        # 生成前清理同 base 历史输出（base = 源文件名stem + sheet 名），只清一次
+        # 生成前清理同 base 历史输出（base = 源文件名stem + sheet 名 + 图层类型），只清一次
+        # 类型标记保证扇区/点图各自独立清理，互不删除对方的输出
         _base = _truncate_bytes(Path(original_name).stem, 100)
         _safe_sheet = re.sub(r'[<>:"/\\|?*]', "_", sheet_name)
-        layer_service._cleanup_old_outputs(f"{_base}_{_safe_sheet}")
+        layer_service._cleanup_old_outputs(f"{_base}_{_safe_sheet}_point")
 
         outs, stats = [], None
         for fmt in fmt_list:
@@ -168,6 +172,7 @@ async def generate_point(
                 layer_service.generate_point_layer,
                 str(src), sheet_name, name_col, lon_col, lat_col,
                 attr_list, fmt, color or None, original_name,
+                border_color or color, None, opacity,
             )
             outs.append(out)
         return {"success": True, "data": {**_finalize_outputs(outs, fmt_list), "stats": stats}}
@@ -198,7 +203,10 @@ async def generate_sector(
     attributes: str = Form("[]"),
     output_formats: Optional[str] = Form(None),   # 逗号分隔多选，优先
     output_format: str = Form("tab"),             # 旧单值，兼容
-    color: Optional[str] = Form(None),
+    color: Optional[str] = Form(None),            # 旧单值：边框/填充缺省时同时应用
+    border_color: Optional[str] = Form(None),
+    fill_color: Optional[str] = Form(None),
+    opacity: Optional[float] = Form(None),        # 0-1
     source_filename: Optional[str] = Form(None),
     current_user=Depends(require_data_import),
 ):
@@ -209,10 +217,11 @@ async def generate_sector(
         attr_list = json.loads(attributes) if attributes else []
         fmt_list = [f.strip() for f in (output_formats or output_format).split(",") if f.strip()] or ["tab"]
 
-        # 生成前清理同 base 历史输出（base = 源文件名stem + sheet 名），只清一次
+        # 生成前清理同 base 历史输出（base = 源文件名stem + sheet 名 + 图层类型），只清一次
+        # 类型标记保证扇区/点图各自独立清理，互不删除对方的输出
         _base = _truncate_bytes(Path(original_name).stem, 100)
         _safe_sheet = re.sub(r'[<>:"/\\|?*]', "_", sheet_name)
-        layer_service._cleanup_old_outputs(f"{_base}_{_safe_sheet}")
+        layer_service._cleanup_old_outputs(f"{_base}_{_safe_sheet}_sector")
 
         outs, stats = [], None
         for fmt in fmt_list:
@@ -221,6 +230,7 @@ async def generate_sector(
                 str(src), sheet_name, name_col, lon_col, lat_col, azimuth_col,
                 radius_m, beamwidth, attr_list, fmt,
                 color or None, original_name,
+                border_color or color, fill_color or color, opacity,
             )
             outs.append(out)
         return {"success": True, "data": {**_finalize_outputs(outs, fmt_list), "stats": stats}}

@@ -115,6 +115,15 @@ def hex_to_kml_color(color: Optional[str]) -> Optional[str]:
         return None
 
 
+def _kml_color_with_alpha(color: Optional[str], opacity: float) -> Optional[str]:
+    """KML aabbggrr + 指定透明度 opacity(0-1)。非法颜色返回 None"""
+    c = hex_to_kml_color(color)
+    if c is None:
+        return None
+    a = max(0.0, min(1.0, float(opacity)))
+    return f"{int(round(a * 255)):02x}{c[2:]}"
+
+
 def _truncate_bytes(s: str, max_bytes: int) -> str:
     """按 UTF-8 字节截断，避免截断中文字符中间（ext4 NAME_MAX=255 字节）"""
     b = s.encode('utf-8')
@@ -300,16 +309,19 @@ class LayerService:
         return out_path
 
     def _write(self, gdf: gpd.GeoDataFrame, output_format: str,
-               source_filename: str, sheet_name: str) -> Path:
-        """写入文件，返回路径。文件名 = 源文件名 + sheet名（去uuid，冲突加序号）。
+               source_filename: str, sheet_name: str,
+               layer_type: str = "") -> Path:
+        """写入文件，返回路径。文件名 = 源文件名 + sheet名 + 图层类型标记（去uuid，冲突加序号）。
         中文编码：TAB/MIF 写前重命名列名为 ASCII 占位 + encoding='GBK' + 写后恢复列名。
         base 按 100 字节、sheet 按 50 字节截断，总长 < ext4 NAME_MAX 255。
+        layer_type: 'sector'/'point' 追加到文件名，保证扇区与点图不同文件（不互相覆盖）。
         """
         if output_format not in DRIVER_MAP:
             raise ValueError(f"不支持的输出格式: {output_format}")
         base = _truncate_bytes(Path(source_filename).stem, 100)
         safe_sheet = _truncate_bytes(re.sub(r'[<>:"/\\|?*]', "_", sheet_name), 50)
-        fname = f"{base}_{safe_sheet}{EXT_MAP[output_format]}"
+        type_tag = "_sector" if layer_type == "sector" else "_point"
+        fname = f"{base}_{safe_sheet}{type_tag}{EXT_MAP[output_format]}"
         out_path = self._unique_path(self.output_dir / fname)
         if output_format in ("tab", "mif"):
             # 重命名中文列为 ASCII 占位名 → GBK 写入 → 恢复（清洗字段名：空格→下划线，去重）
@@ -323,51 +335,99 @@ class LayerService:
             gdf.to_file(out_path, driver=DRIVER_MAP[output_format])
         return out_path
 
-    def _apply_color(self, out_path: Path, output_format: str,
-                     color: Optional[str], is_point: bool) -> Path:
-        """后处理注入颜色（仅 MIF/KML，TAB 无颜色支持）
-        MIF 替换 Symbol/Brush 样式行；KML 在每个 Placemark 内注入内联 Style。
-        非法颜色或 TAB 直接返回原文件。
-        MIF 使用 GBK 编码（与 _write GBK 输出一致）。
+    def _apply_style(self, out_path: Path, output_format: str,
+                     border_color: Optional[str], fill_color: Optional[str],
+                     opacity: Optional[float], is_point: bool) -> Path:
+        """后处理注入样式：边框颜色/填充颜色/透明度（仅 MIF/KML，TAB 无颜色支持）。
+
+        MIF 扇区: Pen 颜色 = 边框色，Brush 前景 = 填充色（背景保留白色）。
+        MIF 点:   Symbol 颜色 = 边框色（点无填充概念，颜色按边框语义应用）。
+        KML 扇区: LineStyle color=边框色 + PolyStyle color=填充色(带透明度) + outline=1。
+                  GDAL 自身会在 Polygon 后写 LineStyle+PolyStyle(fill=0) 样式，
+                  该样式位于本函数注入的 Style 之后、作用更优先，故需同时改写 GDAL 样式。
+        KML 点:   IconStyle color=边框色 + scale 由点大小决定（本函数不变，点大小在服务层处理）。
+
+        非法颜色/透明度或 TAB 直接返回原文件。MIF 使用 GBK 编码（与 _write GBK 输出一致）。
         """
-        if output_format not in ("mif", "kml") or not color:
+        if output_format not in ("mif", "kml"):
             return out_path
         if output_format == "mif":
             text = out_path.read_text(encoding="gbk", errors="replace")
-            mif_color = hex_to_mapinfo_color(color)
-            if mif_color is None:
-                return out_path
+            mif_border = hex_to_mapinfo_color(border_color)
             if is_point:
-                # 替换点 Symbol 颜色: Symbol (35,0,12) → Symbol (35,<color>,<size>) 保留原 size
-                text = re.sub(
-                    r'Symbol \((\d+),(\d+),(\d+)\)',
-                    lambda m: f'Symbol ({m.group(1)},{mif_color},{m.group(3)})', text,
-                )
+                # 点 Symbol 颜色替换为边框色（仅当提供有效边框色）
+                if mif_border is not None:
+                    text = re.sub(
+                        r'Symbol \((\d+),(\d+),(\d+)\)',
+                        lambda m: f'Symbol ({m.group(1)},{mif_border},{m.group(3)})', text,
+                    )
             else:
-                # 替换扇区 Brush: Brush (1,0,16777215) → Brush (2,<color>,16777215) 保留背景
-                text = re.sub(
-                    r'Brush \((\d+),(\d+),(\d+)\)',
-                    lambda m: f'Brush ({m.group(1)},{mif_color},{m.group(3)})', text,
-                )
+                mif_fill = hex_to_mapinfo_color(fill_color)
+                # 扇区 Pen 颜色 = 边框色；Brush 前景 = 填充色
+                if mif_border is not None:
+                    text = re.sub(
+                        r'Pen \((\d+),(\d+),(\d+)\)',
+                        lambda m: f'Pen ({m.group(1)},{mif_border},{m.group(3)})', text,
+                    )
+                if mif_fill is not None:
+                    text = re.sub(
+                        r'Brush \((\d+),(\d+),(\d+)\)',
+                        lambda m: f'Brush ({m.group(1)},{mif_fill},{m.group(3)})', text,
+                    )
             out_path.write_text(text, encoding="gbk")
         elif output_format == "kml":
             text = out_path.read_text(encoding="utf-8", errors="replace")
-            kml_color = hex_to_kml_color(color)
-            if kml_color is None:
+            # 防御：已注入过样式则跳过（用我们注入的独特标记判断）。
+            # 注意：GDAL 扇区 KML 自带 <Style><LineStyle>...<fill>0</fill> 样式，
+            # 不能以 "<Style>" 是否存在作判断；扇区以 <outline> 为标记（GDAL 不写 outline），
+            # 点以 <IconStyle> 为标记（GDAL 点 KML 不写 IconStyle）。
+            if (is_point and "<IconStyle><color>" in text) or (not is_point and "<outline>" in text):
                 return out_path
-            # 防御：已注入过 Style 则跳过，避免重复注入
-            if "<PolyStyle><color>" in text or "<IconStyle><color>" in text:
-                return out_path
+            kml_opacity = opacity if opacity is not None else 1.0
             if is_point:
-                style = f'<Style><IconStyle><color>{kml_color}</color></IconStyle></Style>'
+                if hex_to_kml_color(border_color) is None:
+                    return out_path
+                style = (
+                    f'<Style><IconStyle>'
+                    f'<color>{_kml_color_with_alpha(border_color, kml_opacity)}</color>'
+                    f'<scale>1</scale>'
+                    f'</IconStyle></Style>'
+                )
+                # 点 KML 无 GDAL 自带样式 → 内联注入到 <Placemark ...> 后作为第一个子元素
+                text = re.sub(
+                    r'(<Placemark[^>]*>)',
+                    lambda m: m.group(1) + '\n' + style,
+                    text,
+                )
             else:
-                style = f'<Style><PolyStyle><color>{kml_color}</color></PolyStyle></Style>'
-            # 内联注入到 <Placemark ...> 之后作为其第一个子元素（严格查看器才能渲染）
-            text = re.sub(
-                r'(<Placemark[^>]*>)',
-                lambda m: m.group(1) + '\n' + style,
-                text,
-            )
+                kml_border = hex_to_kml_color(border_color)
+                kml_fill = _kml_color_with_alpha(fill_color, kml_opacity)
+                # 至少一个颜色有效才改写
+                if kml_border is None and kml_fill is None:
+                    return out_path
+                parts = []
+                if kml_border is not None:
+                    parts.append(
+                        f'<LineStyle>'
+                        f'<color>{_kml_color_with_alpha(border_color, kml_opacity)}</color>'
+                        f'<width>2</width>'
+                        f'</LineStyle>'
+                    )
+                if kml_fill is not None:
+                    parts.append(
+                        f'<PolyStyle>'
+                        f'<color>{kml_fill}</color>'
+                        f'<fill>1</fill><outline>1</outline>'
+                        f'</PolyStyle>'
+                    )
+                style = f'<Style>{"".join(parts)}</Style>'
+                # 改写 GDAL 自身写入的样式（fill=0 会覆盖我们的填充），
+                # 替换后每个 Placemark 恰好一个 Style（KML schema 只允许一个）
+                text = re.sub(
+                    r'<Style><LineStyle><color>[0-9a-fA-F]{8}</color></LineStyle><PolyStyle><fill>0</fill></PolyStyle></Style>',
+                    lambda m: style,
+                    text,
+                )
             out_path.write_text(text, encoding="utf-8")
         return out_path
 
@@ -403,11 +463,16 @@ class LayerService:
                              name_col: str, lon_col: str, lat_col: str,
                              attributes: List[str], output_format: str,
                              color: Optional[str] = None,
-                             source_filename: Optional[str] = None):
+                             source_filename: Optional[str] = None,
+                             border_color: Optional[str] = None,
+                             fill_color: Optional[str] = None,
+                             opacity: Optional[float] = None):
         """生成点图层，返回 (输出文件路径, stats_dict)。
         stats 包含 total/success/failed/failures 分类计数。
         source_filename: 原始源文件名（未被 _save_upload 重命名），用于输出文件命名。
         不提供时回退到 file_path 的文件名。
+        border_color/fill_color/opacity: 样式参数。点图层颜色按边框语义应用
+        （点无填充概念），fill_color 忽略。TAB 不支持颜色。
         """
         df = self._read_sheet(file_path, sheet_name)
         lon, lat, coord_valid, failures = self._coerce_coords(df, lon_col, lat_col)
@@ -433,8 +498,12 @@ class LayerService:
             gdf = self._ensure_kml_name(gdf, name_col)
         out = self._write(gdf, output_format,
                           source_filename=source_filename or Path(file_path).name,
-                          sheet_name=sheet_name)
-        out = self._apply_color(out, output_format, color, is_point=True)
+                          sheet_name=sheet_name, layer_type="point")
+        out = self._apply_style(
+            out, output_format,
+            border_color=border_color or color, fill_color=None,
+            opacity=opacity, is_point=True,
+        )
         self._verify_readable(out, int(valid.sum()), output_format)
 
         stats = {
@@ -453,11 +522,16 @@ class LayerService:
                               azimuth_col: str, radius_m: float, beamwidth: float,
                               attributes: List[str], output_format: str,
                               color: Optional[str] = None,
-                              source_filename: Optional[str] = None):
+                              source_filename: Optional[str] = None,
+                              border_color: Optional[str] = None,
+                              fill_color: Optional[str] = None,
+                              opacity: Optional[float] = None):
         """生成扇区图层，返回 (输出文件路径, stats_dict)。
         stats 包含 total/success/failed/failures 分类计数。
         source_filename: 原始源文件名（未被 _save_upload 重命名），用于输出文件命名。
         不提供时回退到 file_path 的文件名。
+        border_color/fill_color/opacity: 样式参数。扇区边框色=border_color、填充=fill_color、
+        透明度=opacity（作用于填充/边框/点的整体透明度）。TAB 不支持颜色。
         """
         df = self._read_sheet(file_path, sheet_name)
         lon, lat, coord_valid, failures = self._coerce_coords(df, lon_col, lat_col)
@@ -494,8 +568,13 @@ class LayerService:
             gdf = self._ensure_kml_name(gdf, name_col)
         out = self._write(gdf, output_format,
                           source_filename=source_filename or Path(file_path).name,
-                          sheet_name=sheet_name)
-        out = self._apply_color(out, output_format, color, is_point=False)
+                          sheet_name=sheet_name, layer_type="sector")
+        out = self._apply_style(
+            out, output_format,
+            border_color=border_color or color,
+            fill_color=fill_color or color,
+            opacity=opacity, is_point=False,
+        )
         self._verify_readable(out, int(valid.sum()), output_format)
 
         stats = {

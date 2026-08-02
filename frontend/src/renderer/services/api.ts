@@ -987,6 +987,10 @@ export interface GenerateLayerParams {
   beamwidth?: number
   pointSize?: number
   color?: string
+  // 样式：边框颜色/填充颜色/透明度（0-1）
+  borderColor?: string
+  fillColor?: string
+  opacity?: number
 }
 
 export interface LayerUploadResult {
@@ -1043,6 +1047,9 @@ export const layerToolsApi = {
     if (params.radiusM) formData.append('radius_m', String(params.radiusM))
     if (params.beamwidth) formData.append('beamwidth', String(params.beamwidth))
     if (params.color) formData.append('color', params.color)
+    if (params.borderColor) formData.append('border_color', params.borderColor)
+    if (params.fillColor) formData.append('fill_color', params.fillColor)
+    if (params.opacity != null) formData.append('opacity', String(params.opacity))
     const res = await uploadClient.post('/layer/sector', formData)
     return res.data
   },
@@ -1060,6 +1067,8 @@ export const layerToolsApi = {
     // 多格式优先，兼容旧单值
     formData.append('output_formats', (params.outputFormats || [params.outputFormat!]).join(','))
     if (params.color) formData.append('color', params.color)
+    if (params.borderColor) formData.append('border_color', params.borderColor)
+    if (params.opacity != null) formData.append('opacity', String(params.opacity))
     const res = await uploadClient.post('/layer/point', formData)
     return res.data
   },
