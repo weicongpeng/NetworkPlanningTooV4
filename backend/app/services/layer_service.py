@@ -413,11 +413,28 @@ class LayerService:
                     )
                 if mif_fill is not None:
                     # MapInfo Brush (pattern, forecolor, backcolor)。GDAL 默认 pattern=1（无填充/透明），
-                    # 保留会导致设置填充色仍显示空白 → 固定 pattern=2（实心填充）使填充色生效
-                    text = re.sub(
-                        r'Brush \((\d+),(\d+),(\d+)\)',
-                        lambda m: f'Brush (2,{mif_fill},{m.group(3)})', text,
-                    )
+                    # 保留会导致设置填充色仍显示空白 → 实心 pattern=2 使填充色生效。
+                    # MIF 无 alpha 通道，透明度通过 Brush pattern 模拟：opacity=0 → 实心(2)；
+                    # opacity>0 → pattern 3-8（纹理逐档稀疏更透明）+ 省略 backcolor（透明背景）。
+                    # pattern = 2 + round(opacity*6)，opacity(0-1) → pattern 2-8
+                    t = opacity if opacity is not None else 0.0
+                    try:
+                        t = max(0.0, min(1.0, float(t)))
+                    except (TypeError, ValueError):
+                        t = 0.0
+                    if t <= 0:
+                        # 不透明：实心 + 保留 backcolor
+                        text = re.sub(
+                            r'Brush \((\d+),(\d+),(\d+)\)',
+                            lambda m: f'Brush (2,{mif_fill},{m.group(3)})', text,
+                        )
+                    else:
+                        pattern = 2 + round(t * 6)   # 2-8
+                        # 省略 backcolor → 透明填充（MapInfo 规范：pattern>=3 且无 backcolor 即透明）
+                        text = re.sub(
+                            r'Brush \((\d+),(\d+),(\d+)\)',
+                            lambda m: f'Brush ({pattern},{mif_fill})', text,
+                        )
             out_path.write_text(text, encoding="gbk")
         elif output_format == "kml":
             text = out_path.read_text(encoding="utf-8", errors="replace")

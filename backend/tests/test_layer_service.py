@@ -366,6 +366,44 @@ def test_mif_sector_fill_pattern_is_solid(service, sample_excel):
     assert "Brush (1," not in text   # 绝不再出现无填充 pattern=1
 
 
+def test_mif_sector_opacity_uses_transparent_brush_pattern(service, sample_excel):
+    """扇区 MIF 透明度：opacity>0 → Brush 用半透明 pattern(3-8) 且省略 backcolor 实现透明填充。
+    MIF 无 alpha 通道，MapInfo 用 Brush pattern 模拟透明度。opacity=0 → 实心 pattern=2。"""
+    # opacity=0 → 实心不透明（pattern=2，保留 backcolor）
+    r0, _ = service.generate_sector_layer(
+        file_path=str(sample_excel), sheet_name="LTE",
+        name_col="NAME", lon_col="LONGITUDE", lat_col="LATITUDE",
+        azimuth_col="AZIMUTH", radius_m=3000, beamwidth=40.0,
+        attributes=["NAME"], output_format="mif",
+        border_color="#000000", fill_color="#FF0000", opacity=0.0,
+    )
+    t0 = r0.read_text(encoding="gbk", errors="replace")
+    assert "Brush (2,16711680,16777215)" in t0   # 实心 + backcolor
+
+    # opacity=0.5 → 半透明 pattern（>2），省略 backcolor（透明填充）
+    r5, _ = service.generate_sector_layer(
+        file_path=str(sample_excel), sheet_name="LTE",
+        name_col="NAME", lon_col="LONGITUDE", lat_col="LATITUDE",
+        azimuth_col="AZIMUTH", radius_m=3000, beamwidth=40.0,
+        attributes=["NAME"], output_format="mif",
+        border_color="#000000", fill_color="#FF0000", opacity=0.5,
+    )
+    t5 = r5.read_text(encoding="gbk", errors="replace")
+    # pattern 2+round(0.5*6)=2+3=5；省略 backcolor → "Brush (5,16711680)"
+    assert "Brush (5,16711680)" in t5
+
+    # opacity=1 → 最透明 pattern（2+6=8）
+    r1, _ = service.generate_sector_layer(
+        file_path=str(sample_excel), sheet_name="LTE",
+        name_col="NAME", lon_col="LONGITUDE", lat_col="LATITUDE",
+        azimuth_col="AZIMUTH", radius_m=3000, beamwidth=40.0,
+        attributes=["NAME"], output_format="mif",
+        border_color="#000000", fill_color="#FF0000", opacity=1.0,
+    )
+    t1 = r1.read_text(encoding="gbk", errors="replace")
+    assert "Brush (8,16711680)" in t1
+
+
 def test_kml_sector_opacity_applied(service, sample_excel):
     """扇区 KML：透明度语义（0=不透明、1=全透明）下 transparency=0.5 → alpha=80 (128)"""
     result, _ = service.generate_sector_layer(
