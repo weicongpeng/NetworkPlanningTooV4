@@ -410,9 +410,11 @@ class LayerService:
                         lambda m: f'Pen ({pen_width},{m.group(2)},{mif_border})', text,
                     )
                 if mif_fill is not None:
+                    # MapInfo Brush (pattern, forecolor, backcolor)。GDAL 默认 pattern=1（无填充/透明），
+                    # 保留会导致设置填充色仍显示空白 → 固定 pattern=2（实心填充）使填充色生效
                     text = re.sub(
                         r'Brush \((\d+),(\d+),(\d+)\)',
-                        lambda m: f'Brush ({m.group(1)},{mif_fill},{m.group(3)})', text,
+                        lambda m: f'Brush (2,{mif_fill},{m.group(3)})', text,
                     )
             out_path.write_text(text, encoding="gbk")
         elif output_format == "kml":

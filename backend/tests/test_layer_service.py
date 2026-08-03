@@ -345,10 +345,25 @@ def test_mif_sector_border_and_fill_colors(service, sample_excel):
     )
     text = result.read_text(encoding="utf-8", errors="replace")
     assert "Pen (2,2,0)" in text        # 黑色边框 = MapInfo 十进制 0，线宽默认 2 进 width 位、pattern 保留 GDAL 2
-    assert "Brush (1,16711680," in text  # 红色填充 = 65536*255
+    assert "Brush (2,16711680," in text  # 红色填充 = 65536*255，pattern=2 实心填充（pattern=1 无填充会空白）
     import geopandas as gpd
     gdf = gpd.read_file(result)
     assert len(gdf) == 2
+
+
+def test_mif_sector_fill_pattern_is_solid(service, sample_excel):
+    """扇区 MIF 填充必须用实心 pattern=2（GDAL 默认 pattern=1 无填充，
+    设置填充色仍空白；pattern=2 才显示填充色）"""
+    result, _ = service.generate_sector_layer(
+        file_path=str(sample_excel), sheet_name="LTE",
+        name_col="NAME", lon_col="LONGITUDE", lat_col="LATITUDE",
+        azimuth_col="AZIMUTH", radius_m=3000, beamwidth=40.0,
+        attributes=["NAME"], output_format="mif",
+        border_color="#000000", fill_color="#FF0000",
+    )
+    text = result.read_text(encoding="gbk", errors="replace")
+    assert "Brush (2,16711680," in text
+    assert "Brush (1," not in text   # 绝不再出现无填充 pattern=1
 
 
 def test_kml_sector_opacity_applied(service, sample_excel):

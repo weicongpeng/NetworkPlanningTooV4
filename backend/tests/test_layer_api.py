@@ -239,7 +239,7 @@ def test_sector_endpoint_with_border_fill_opacity():
             assert mif_names
             text = zf.read(mif_names[0]).decode("gbk", errors="replace")
         assert "Pen (2,2,0)" in text        # 黑色边框：线宽默认 2 进 width 位、pattern 保留 GDAL 2、颜色进 color 位
-        assert "Brush (1,16711680," in text  # 红色填充
+        assert "Brush (2,16711680," in text  # 红色填充（pattern=2 实心）
     finally:
         os.remove(path)
 
