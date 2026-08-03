@@ -77,9 +77,11 @@ def fast_destination(lat: float, lng: float, azimuth_deg: float, distance_m: flo
 
 
 def sector_polygon(lat: float, lng: float, azimuth: float, beamwidth: float,
-                   radius_m: float, arc_points: int = 30) -> Polygon:
+                   radius_m: float, arc_points: int = 16) -> Polygon:
     """生成扇形（楔形）多边形
     角度以正北为 0，顺时针。azimuth ± beamwidth/2 构成扇区两边界，弧线 arc_points 段。
+    默认 16 段（每扇区 18 顶点）：相比原 30 段（32 顶点）MIF 文件体积降 ~44%，
+    MapInfo 拖拽更流畅，弧线在制图比例下仍平滑。
     """
     half = beamwidth / 2
     start, end = azimuth - half, azimuth + half
