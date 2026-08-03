@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { useTranslation } from 'react-i18next'
 import * as Tabs from '@radix-ui/react-tabs'
 import * as Select from '@radix-ui/react-select'
@@ -116,13 +116,17 @@ export default function LayerToolsPage() {
   // 页面级共享文件（一份文件同时作用于扇区/点图两个 Tab）——模块级 store，
   // 切页不丢失：上传/解析完成后写入模块级 + sessionStorage，组件卸载后成功结果仍保留
   const [sharedFile, setSharedFile] = useState<SharedFile>(() => loadSharedFile())
-  // setSharedFile 同步写 sessionStorage（不依赖组件生命周期；切页卸载后成功结果仍持久化）
+  // 模块级 ref：persistSharedFile 里读取最新 sharedFile（避免闭包过期）
+  const sharedFileRef = useRef(sharedFile)
+  // 保持 ref 与 state 同步
+  useEffect(() => { sharedFileRef.current = sharedFile }, [sharedFile])
+  // persistSharedFile：直接计算新值并写 sessionStorage（不依赖 React setState 执行，
+  // 否则 getExcelInfo 完成时组件已卸载 → updater 不执行 → sessionStorage 未写入 → 切回空文件）
   const persistSharedFile = (f: SharedFile | ((prev: SharedFile) => SharedFile)) => {
-    setSharedFile(prev => {
-      const next = typeof f === 'function' ? (f as (p: SharedFile) => SharedFile)(prev) : f
-      saveState(SHARED_STORAGE_KEY, next)
-      return next
-    })
+    const next = typeof f === 'function' ? f(sharedFileRef.current) : f
+    sharedFileRef.current = next
+    saveState(SHARED_STORAGE_KEY, next)
+    setSharedFile(next)
   }
   const [generating, setGenerating] = useState(false)
   const [dragActive, setDragActive] = useState(false)
