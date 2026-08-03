@@ -138,19 +138,20 @@ def svg_point_icon(shape: str, color: str) -> str:
     return "data:image/svg+xml," + quote(svg, safe='')
 
 
-def _kml_color_with_alpha(color: Optional[str], opacity: float) -> Optional[str]:
-    """KML aabbggrr + 指定透明度 opacity(0-1)。非法颜色/透明度返回 None"""
+def _kml_color_with_alpha(color: Optional[str], transparency: float) -> Optional[str]:
+    """KML aabbggrr + 指定透明度 transparency(0=不透明, 1=全透明)。非法颜色/透明度返回 None"""
     c = hex_to_kml_color(color)
     if c is None:
         return None
     try:
-        a = float(opacity)
+        t = float(transparency)
     except (TypeError, ValueError):
         return None
-    if not math.isfinite(a):
+    if not math.isfinite(t):
         return None  # NaN/Inf → 视为非法透明度
-    a = max(0.0, min(1.0, a))
-    return f"{int(round(a * 255)):02x}{c[2:]}"
+    t = max(0.0, min(1.0, t))
+    alpha = round((1 - t) * 255)
+    return f"{alpha:02x}{c[2:]}"
 
 
 def _truncate_bytes(s: str, max_bytes: int) -> str:
@@ -418,7 +419,8 @@ class LayerService:
             # 点以 <IconStyle> 为标记（GDAL 点 KML 不写 IconStyle）。
             if (is_point and "<IconStyle><color>" in text) or (not is_point and "<outline>" in text):
                 return out_path
-            kml_opacity = opacity if opacity is not None else 1.0
+            # 透明度语义：0=不透明、1=全透明；未显式传透明度 → 完全不透明（transparency=0）
+            kml_transparency = opacity if opacity is not None else 0.0
             if is_point:
                 if hex_to_kml_color(border_color) is None:
                     return out_path
@@ -428,7 +430,7 @@ class LayerService:
                     scale = max(0.3, min(3.0, point_size / 8 * 0.6))
                 style = (
                     f'<Style><IconStyle>'
-                    f'<color>{_kml_color_with_alpha(border_color, kml_opacity)}</color>'
+                    f'<color>{_kml_color_with_alpha(border_color, kml_transparency)}</color>'
                     f'<scale>{scale:.2f}</scale>'
                     f'<Icon><href>{href}</href></Icon>'
                     f'</IconStyle></Style>'
@@ -441,7 +443,7 @@ class LayerService:
                 )
             else:
                 kml_border = hex_to_kml_color(border_color)
-                kml_fill = _kml_color_with_alpha(fill_color, kml_opacity)
+                kml_fill = _kml_color_with_alpha(fill_color, kml_transparency)
                 # 至少一个颜色有效才改写
                 if kml_border is None and kml_fill is None:
                     return out_path
@@ -451,7 +453,7 @@ class LayerService:
                     width = max(1, min(7, width))
                     parts.append(
                         f'<LineStyle>'
-                        f'<color>{_kml_color_with_alpha(border_color, kml_opacity)}</color>'
+                        f'<color>{_kml_color_with_alpha(border_color, kml_transparency)}</color>'
                         f'<width>{width}</width>'
                         f'</LineStyle>'
                     )

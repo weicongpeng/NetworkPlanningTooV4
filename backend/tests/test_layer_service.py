@@ -352,7 +352,7 @@ def test_mif_sector_border_and_fill_colors(service, sample_excel):
 
 
 def test_kml_sector_opacity_applied(service, sample_excel):
-    """扇区 KML：透明度 opacity=0.5 → PolyStyle color 首字节 alpha=80 (128)"""
+    """扇区 KML：透明度语义（0=不透明、1=全透明）下 transparency=0.5 → alpha=80 (128)"""
     result, _ = service.generate_sector_layer(
         file_path=str(sample_excel), sheet_name="LTE",
         name_col="NAME", lon_col="LONGITUDE", lat_col="LATITUDE",
@@ -361,7 +361,7 @@ def test_kml_sector_opacity_applied(service, sample_excel):
         border_color="#FF0000", fill_color="#00FF00", opacity=0.5,
     )
     text = result.read_text(encoding="utf-8", errors="replace")
-    # 红色 #FF0000 → KML 边框 800000ff；绿色 #00FF00 → 填充 8000ff00
+    # 红色 #FF0000 → KML 边框 800000ff；绿色 #00FF00 → 填充 8000ff00（alpha=(1-0.5)*255=128）
     assert "<LineStyle><color>800000ff</color>" in text
     assert "<PolyStyle><color>8000ff00</color>" in text
     import xml.etree.ElementTree as ET
@@ -369,7 +369,7 @@ def test_kml_sector_opacity_applied(service, sample_excel):
 
 
 def test_kml_point_opacity_applied(service, sample_excel):
-    """点 KML：透明度 opacity=0.5 → IconStyle color 首字节 alpha=80"""
+    """点 KML：透明度语义（0=不透明、1=全透明）下 transparency=0.5 → alpha=80"""
     result, _ = service.generate_point_layer(
         file_path=str(sample_excel), sheet_name="LTE",
         name_col="NAME", lon_col="LONGITUDE", lat_col="LATITUDE",
@@ -380,6 +380,32 @@ def test_kml_point_opacity_applied(service, sample_excel):
     assert "<IconStyle><color>800000ff</color>" in text
     import xml.etree.ElementTree as ET
     root = ET.fromstring(text)  # XML 仍合法
+
+
+def test_kml_sector_opacity_semantics(service, sample_excel):
+    """透明度语义：0=不透明(alpha=ff)、1=全透明(alpha=00)"""
+    # opacity=0 → transparency=0 → alpha=255=ff（不透明）
+    result, _ = service.generate_sector_layer(
+        file_path=str(sample_excel), sheet_name="LTE",
+        name_col="NAME", lon_col="LONGITUDE", lat_col="LATITUDE",
+        azimuth_col="AZIMUTH", radius_m=3000, beamwidth=40.0,
+        attributes=["NAME"], output_format="kml",
+        border_color="#FF0000", fill_color="#00FF00", opacity=0.0,
+    )
+    text = result.read_text(encoding="utf-8", errors="replace")
+    assert "<LineStyle><color>ff0000ff</color>" in text   # alpha=ff
+    assert "<PolyStyle><color>ff00ff00</color>" in text
+    # opacity=1 → transparency=1 → alpha=0=00（全透明）
+    result, _ = service.generate_sector_layer(
+        file_path=str(sample_excel), sheet_name="LTE",
+        name_col="NAME", lon_col="LONGITUDE", lat_col="LATITUDE",
+        azimuth_col="AZIMUTH", radius_m=3000, beamwidth=40.0,
+        attributes=["NAME"], output_format="kml",
+        border_color="#FF0000", fill_color="#00FF00", opacity=1.0,
+    )
+    text = result.read_text(encoding="utf-8", errors="replace")
+    assert "<LineStyle><color>000000ff</color>" in text   # alpha=00
+    assert "<PolyStyle><color>0000ff00</color>" in text
 
 
 def test_kml_name_col_uses_cell_id(service, sample_excel):
