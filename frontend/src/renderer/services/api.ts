@@ -19,6 +19,7 @@ import type {
   UserUpdateRequest,
   UserDetailResponse,
 } from '@shared/types'
+import { uploadStore } from '../store/uploadStore'
 
 const API_BASE_URL = '/api/v1'
 
@@ -338,17 +339,22 @@ function backoffDelay(retries: number): number {
  * @param basePath 上传端点的基础路径（如 '/data/upload'）
  * @param fileType 可选的文件类型：'excel' | 'geo_data' | 'layer'
  * @param onProgress 可选的分块进度回调（1 立即反馈, 2 start 前, 3-99 分块进度, 100 complete 后）
+ * @param trackProgress 是否写入模块级 uploadStore（跨页恢复进度 + 取消按钮），仅图层制作上传启用
  */
 async function chunkedUpload(
   file: File,
   basePath: string,
   fileType?: string,
   onProgress?: (percent: number) => void,
+  trackProgress?: boolean,
 ): Promise<any> {
   onProgress?.(1)                     // 立即显示 1%，start 请求前就有反馈
   const chunkSize = calcChunkSize(file.size)
   const totalChunks = Math.ceil(file.size / chunkSize)
   console.log(`[chunkedUpload] 开始分块上传: ${file.name}, 大小: ${file.size}, 分块大小: ${(chunkSize/1024).toFixed(0)}KB, 分块数: ${totalChunks}`)
+
+  // 取消标志：取消后中止后续分块，complete 阶段抛错
+  let cancelled = false
 
   // 阶段1: 初始化上传会话
   const startForm = new FormData()
@@ -364,8 +370,19 @@ async function chunkedUpload(
   }
   console.log(`[chunkedUpload] 会话已创建: ${dataId}`)
 
+  if (trackProgress) {
+    // 模块级进度：记录会话 id + 文件名，暴露取消句柄
+    uploadStore._set({ active: true, percent: 2, step: 'uploading', sessionId: dataId, fileName: file.name })
+    uploadStore._setCancel(() => {
+      cancelled = true
+      uploadStore._set({ active: false })
+      try { uploadClient.post(`${basePath}/${dataId}/cancel`) } catch { /* ignore */ }
+    })
+  }
+
   // 阶段2: 串行上传分块（单 worker 后端 + Cloudflare Tunnel 需避免排队超时）
   for (let i = 0; i < totalChunks; i++) {
+    if (cancelled) break            // 用户取消：中止后续分块
     const start = i * chunkSize
     const end = Math.min(start + chunkSize, file.size)
     const chunk = file.slice(start, end)
@@ -384,6 +401,7 @@ async function chunkedUpload(
         })
         success = true
         onProgress?.(Math.round(((i + 1) / totalChunks) * 99))  // 99% 封顶，留给 complete
+        if (trackProgress) uploadStore._set({ percent: Math.round(((i + 1) / totalChunks) * 99) })
         console.log(`[chunkedUpload] 分块 ${i + 1}/${totalChunks} 完成 (${end - start} 字节)`)
       } catch (err) {
         retries++
@@ -391,12 +409,19 @@ async function chunkedUpload(
         if (retries >= MAX_CHUNK_RETRIES) {
           // 取消上传会话
           try { await uploadClient.post(`${basePath}/${dataId}/cancel`) } catch { /* ignore */ }
+          if (trackProgress) uploadStore._set({ active: false })
           throw new Error(`分块 ${i + 1}/${totalChunks} 上传失败，已重试 ${MAX_CHUNK_RETRIES} 次`)
         }
         const delay = backoffDelay(retries)
         await new Promise(r => setTimeout(r, delay))
       }
     }
+  }
+
+  // 用户取消：中止上传（不调用 complete），报告已取消
+  if (cancelled) {
+    if (trackProgress) uploadStore._set({ active: false })
+    throw new Error('已取消')
   }
 
   // 阶段3: 完成上传（触发后台处理）
@@ -408,6 +433,7 @@ async function chunkedUpload(
 
   const completeResp = await uploadClient.post(`${basePath}/${dataId}/complete`, completeForm)
   onProgress?.(100)
+  if (trackProgress) uploadStore._set({ percent: 100, step: 'reading' })
   console.log('[chunkedUpload] 文件重组完成，开始后台处理')
 
   const result = completeResp
@@ -454,6 +480,8 @@ async function chunkedUpload(
     }
   }
 
+  // 上传完成：清理模块级进度（cancel 句柄由组件/下次上传重置）
+  if (trackProgress) uploadStore._set({ active: false, step: 'done' })
   return result
 }
 
@@ -1011,7 +1039,7 @@ export const layerToolsApi = {
     onProgress?.({ percent: 0, step: 'uploading' })
     const result = await chunkedUpload(file, '/data/upload', 'layer', (p) => {
       onProgress?.({ percent: p, step: 'uploading' })
-    })
+    }, true)   // trackProgress：写入模块级 uploadStore（跨页恢复 + 取消按钮）
     const data = result?.data
     if (!data?.file_path) {
       throw new Error('文件上传失败，未获取到文件路径')

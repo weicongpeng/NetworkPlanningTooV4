@@ -1032,6 +1032,7 @@
     "uploading": "Uploading {percent}%",
     "done": "Upload complete",
     "reading": "Reading columns...",
+    "cancelUpload": "Cancel",
     "importHint": "Please import an Excel file first",
     "noFile": "No file selected",
     "uploadBtn": "Click to upload",

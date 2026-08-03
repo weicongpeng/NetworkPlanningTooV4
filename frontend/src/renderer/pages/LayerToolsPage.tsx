@@ -4,6 +4,7 @@ import * as Tabs from '@radix-ui/react-tabs'
 import * as Select from '@radix-ui/react-select'
 import { FileUp, Loader2, Download, CheckCircle2, ChevronDown } from 'lucide-react'
 import { layerToolsApi, type LayerExcelInfo, type GenerateLayerResult } from '../services/api'
+import { uploadStore } from '../store/uploadStore'
 import { LayerAttributeConfig } from '../components/layer/LayerAttributeConfig'
 import { LAYER_DEFAULT_PARAMS, PRESET_COLORS } from '../config/layer-config'
 
@@ -114,10 +115,12 @@ export default function LayerToolsPage() {
   const [pointState, setPointState] = useState<TabState>(() => loadState(STORAGE_KEYS.point, 'point'))
   // 页面级共享文件（一份文件同时作用于扇区/点图两个 Tab）
   const [sharedFile, setSharedFile] = useState<SharedFile>(() => loadSharedFile())
-  const [uploading, setUploading] = useState(false)
   const [generating, setGenerating] = useState(false)
-  const [progress, setProgress] = useState<{ percent: number; step: string } | null>(null)
   const [dragActive, setDragActive] = useState(false)
+  // 模块级上传进度：chunkedUpload 后台更新，切页不丢失，本组件订阅实时渲染
+  const [uploadProgress, setUploadProgress] = useState(uploadStore.get())
+  useEffect(() => uploadStore.subscribe(setUploadProgress), [])
+  const uploading = uploadProgress.active
 
   // 持久化：state 变化写 sessionStorage
   useEffect(() => saveState(STORAGE_KEYS.sector, sectorState), [sectorState])
@@ -167,13 +170,14 @@ export default function LayerToolsPage() {
     setPointState(s => ({ ...s, result: null, error: '' }))
     // 导入区是页面级共享的：上传前清空共享文件（只作用于共享状态，两个 Tab 的配置各自保留）
     setSharedFile(() => emptySharedFile())
-    setUploading(true)
-    setProgress({ percent: 1, step: 'uploading' })
+    // 模块级进度：chunkedUpload 内部 trackProgress 会写入并暴露取消句柄
+    uploadStore._set({ active: true, percent: 1, step: 'uploading', sessionId: '', fileName: f.name })
     try {
       const up = await layerToolsApi.uploadLayerFile(f, (p) => {
-        setProgress({ percent: p.percent, step: p.step })
+        // 进度回调同步模块级（chunkedUpload 已写 percent，此处补 step）
+        uploadStore._set({ percent: p.percent, step: p.step })
       })
-      setProgress({ percent: 100, step: 'reading' })
+      uploadStore._set({ percent: 100, step: 'reading' })
       const data = await layerToolsApi.getExcelInfo(up.file_path, up.source_filename)
       setSharedFile(() => ({
         filePath: up.file_path,
@@ -184,13 +188,12 @@ export default function LayerToolsPage() {
         columns: data.columns[data.sheets[0]] || [],
       }))
     } catch (err: any) {
-      // 上传失败：共享文件已清空，错误提示到两个 Tab 各自的 error 上
+      // 上传失败/取消：共享文件已清空，错误提示到两个 Tab 各自的 error 上
       const msg = err?.message || String(err)
       setSectorState(s => ({ ...s, error: msg }))
       setPointState(s => ({ ...s, error: msg }))
     } finally {
-      setUploading(false)
-      setProgress(null)
+      uploadStore._set({ active: false })
     }
   }
 
@@ -261,9 +264,9 @@ export default function LayerToolsPage() {
   }
 
   const progressText = () => {
-    if (!progress) return ''
-    if (progress.step === 'uploading') return t('layer.uploading').replace('{percent}', String(progress.percent))
-    if (progress.step === 'reading') return t('layer.reading')
+    if (!uploadProgress.active) return ''
+    if (uploadProgress.step === 'uploading') return t('layer.uploading').replace('{percent}', String(uploadProgress.percent))
+    if (uploadProgress.step === 'reading') return t('layer.reading')
     return t('layer.done')
   }
 
@@ -566,13 +569,19 @@ export default function LayerToolsPage() {
               <input type="file" className="hidden" accept=".xlsx,.xls,.txt,.csv" onChange={handleFile} disabled={uploading} />
             </label>
 
-            {/* 进度条 + 状态 */}
-            {uploading && progress && (
+            {/* 进度条 + 状态（模块级进度：切页不丢失，回来实时恢复）+ 取消按钮 */}
+            {uploading && uploadProgress.percent > 0 && (
               <div className="mt-2">
                 <div className="h-2 bg-muted rounded-full overflow-hidden">
-                  <div className="h-full bg-primary transition-all duration-300" style={{ width: `${progress.percent}%` }} />
+                  <div className="h-full bg-primary transition-all duration-300" style={{ width: `${uploadProgress.percent}%` }} />
                 </div>
-                <p className="text-xs text-muted-foreground mt-1">{progressText()}</p>
+                <div className="flex items-center justify-between mt-1">
+                  <p className="text-xs text-muted-foreground">{progressText()}</p>
+                  <button type="button" onClick={() => uploadStore.cancel()}
+                    className="text-xs text-muted-foreground hover:text-red-500 underline underline-offset-2 transition-colors">
+                    {t('layer.cancelUpload')}
+                  </button>
+                </div>
               </div>
             )}
           </div>

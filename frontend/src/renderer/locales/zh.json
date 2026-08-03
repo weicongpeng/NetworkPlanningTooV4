@@ -1043,6 +1043,7 @@
     "uploading": "上传中 {percent}%",
     "done": "文件上传完成",
     "reading": "读取列名中...",
+    "cancelUpload": "取消",
     "importHint": "请先导入 Excel 文件",
     "noFile": "未选择文件",
     "uploadBtn": "点击上传",
