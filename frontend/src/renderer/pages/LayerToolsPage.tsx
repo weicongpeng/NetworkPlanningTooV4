@@ -148,7 +148,10 @@ export default function LayerToolsPage() {
 
   const isSector = activeTab === 'sector'
 
-  // 点形状选项（KML SVG / MIF Symbol shape 编号一致；icon 为形状预览 SVG）
+  // 点形状选项：图标/标签与实际生成图形严格匹配（用户实测 MapInfo 输出）：
+  // circle=圆形、square=正方形、diamond=菱形（MIF Symbol 34/32/33 正确）
+  // triangle→空心圆(40)、triangle_down→空心五角星(41)、landmark→空心正三角(42)、pin→空心正方形(38)
+  // 空心系列用 stroke-only 图标区分
   const POINT_SHAPES = [
     { value: 'circle', label: t('layer.shapeCircle'),
       icon: <svg viewBox="0 0 16 16" className="w-3.5 h-3.5 shrink-0"><circle cx="8" cy="8" r="6" fill="currentColor" /></svg> },
@@ -157,13 +160,13 @@ export default function LayerToolsPage() {
     { value: 'diamond', label: t('layer.shapeDiamond'),
       icon: <svg viewBox="0 0 16 16" className="w-3.5 h-3.5 shrink-0"><polygon points="8,2 14,8 8,14 2,8" fill="currentColor" /></svg> },
     { value: 'triangle', label: t('layer.shapeTriangle'),
-      icon: <svg viewBox="0 0 16 16" className="w-3.5 h-3.5 shrink-0"><polygon points="8,2 14,14 2,14" fill="currentColor" /></svg> },
+      icon: <svg viewBox="0 0 16 16" className="w-3.5 h-3.5 shrink-0"><circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" strokeWidth="1.5" /></svg> },
     { value: 'triangle_down', label: t('layer.shapeTriangleDown'),
-      icon: <svg viewBox="0 0 16 16" className="w-3.5 h-3.5 shrink-0"><polygon points="2,2 14,2 8,14" fill="currentColor" /></svg> },
+      icon: <svg viewBox="0 0 16 16" className="w-3.5 h-3.5 shrink-0"><path d="M8 2 L13.5 13 L2.5 13 Z" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round" /></svg> },
     { value: 'landmark', label: t('layer.shapeLandmark'),
-      icon: <svg viewBox="0 0 16 16" className="w-3.5 h-3.5 shrink-0"><rect x="3" y="6" width="10" height="8" fill="currentColor" /><rect x="4" y="2" width="8" height="2" fill="currentColor" /></svg> },
+      icon: <svg viewBox="0 0 16 16" className="w-3.5 h-3.5 shrink-0"><polygon points="8,2 14,14 2,14" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round" /></svg> },
     { value: 'pin', label: t('layer.shapePin'),
-      icon: <svg viewBox="0 0 16 16" className="w-3.5 h-3.5 shrink-0"><path d="M8 1c-3 0-5 2-5 5 0 3 5 9 5 9s5-6 5-9c0-3-2-5-5-5z" fill="currentColor" /></svg> },
+      icon: <svg viewBox="0 0 16 16" className="w-3.5 h-3.5 shrink-0"><rect x="2" y="2" width="12" height="12" fill="none" stroke="currentColor" strokeWidth="1.5" /></svg> },
   ]
 
   const handleFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -661,11 +664,9 @@ function ShapeSelect({ value, shapes, onValueChange }: {
           className="z-50 min-w-[var(--radix-select-trigger-width)] max-h-72 overflow-y-auto bg-card border border-border rounded-lg shadow-lg">
           <Select.Viewport className="p-1">
             {shapes.map(s => (
+              // 选中行高亮（data-[highlighted] 悬停高亮 + data-[selected] 选中高亮），不显示勾选标记
               <Select.Item key={s.value} value={s.value}
-                className="flex items-center gap-2 px-2 py-1.5 text-sm rounded cursor-pointer outline-none data-[highlighted]:bg-primary/10 data-[selected]:text-primary">
-                <Select.ItemIndicator className="absolute left-1.5">
-                  <CheckCircle2 size={14} />
-                </Select.ItemIndicator>
+                className="flex items-center gap-2 px-2 py-1.5 text-sm rounded cursor-pointer outline-none data-[highlighted]:bg-primary/10 data-[selected]:bg-primary/10 data-[selected]:text-primary">
                 {s.icon}
                 <Select.ItemText>{s.label}</Select.ItemText>
               </Select.Item>
