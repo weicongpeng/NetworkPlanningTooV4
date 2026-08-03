@@ -1,7 +1,8 @@
 import { useState, useEffect } from 'react'
 import { useTranslation } from 'react-i18next'
 import * as Tabs from '@radix-ui/react-tabs'
-import { FileUp, Loader2, Download, CheckCircle2 } from 'lucide-react'
+import * as Select from '@radix-ui/react-select'
+import { FileUp, Loader2, Download, CheckCircle2, ChevronDown } from 'lucide-react'
 import { layerToolsApi, type LayerExcelInfo, type GenerateLayerResult } from '../services/api'
 import { LayerAttributeConfig } from '../components/layer/LayerAttributeConfig'
 import { LAYER_DEFAULT_PARAMS, PRESET_COLORS } from '../config/layer-config'
@@ -132,15 +133,22 @@ export default function LayerToolsPage() {
 
   const isSector = activeTab === 'sector'
 
-  // 点形状选项（KML SVG / MIF Symbol shape 编号一致）
+  // 点形状选项（KML SVG / MIF Symbol shape 编号一致；icon 为形状预览 SVG）
   const POINT_SHAPES = [
-    { value: 'circle', label: t('layer.shapeCircle') },
-    { value: 'square', label: t('layer.shapeSquare') },
-    { value: 'diamond', label: t('layer.shapeDiamond') },
-    { value: 'triangle', label: t('layer.shapeTriangle') },
-    { value: 'triangle_down', label: t('layer.shapeTriangleDown') },
-    { value: 'landmark', label: t('layer.shapeLandmark') },
-    { value: 'pin', label: t('layer.shapePin') },
+    { value: 'circle', label: t('layer.shapeCircle'),
+      icon: <svg viewBox="0 0 16 16" className="w-3.5 h-3.5 shrink-0"><circle cx="8" cy="8" r="6" fill="currentColor" /></svg> },
+    { value: 'square', label: t('layer.shapeSquare'),
+      icon: <svg viewBox="0 0 16 16" className="w-3.5 h-3.5 shrink-0"><rect x="2" y="2" width="12" height="12" fill="currentColor" /></svg> },
+    { value: 'diamond', label: t('layer.shapeDiamond'),
+      icon: <svg viewBox="0 0 16 16" className="w-3.5 h-3.5 shrink-0"><polygon points="8,2 14,8 8,14 2,8" fill="currentColor" /></svg> },
+    { value: 'triangle', label: t('layer.shapeTriangle'),
+      icon: <svg viewBox="0 0 16 16" className="w-3.5 h-3.5 shrink-0"><polygon points="8,2 14,14 2,14" fill="currentColor" /></svg> },
+    { value: 'triangle_down', label: t('layer.shapeTriangleDown'),
+      icon: <svg viewBox="0 0 16 16" className="w-3.5 h-3.5 shrink-0"><polygon points="2,2 14,2 8,14" fill="currentColor" /></svg> },
+    { value: 'landmark', label: t('layer.shapeLandmark'),
+      icon: <svg viewBox="0 0 16 16" className="w-3.5 h-3.5 shrink-0"><rect x="3" y="6" width="10" height="8" fill="currentColor" /><rect x="4" y="2" width="8" height="2" fill="currentColor" /></svg> },
+    { value: 'pin', label: t('layer.shapePin'),
+      icon: <svg viewBox="0 0 16 16" className="w-3.5 h-3.5 shrink-0"><path d="M8 1c-3 0-5 2-5 5 0 3 5 9 5 9s5-6 5-9c0-3-2-5-5-5z" fill="currentColor" /></svg> },
   ]
 
   const handleFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -323,10 +331,11 @@ export default function LayerToolsPage() {
           </div>
           <div className="col-span-2">
             <label className="block text-xs font-medium mb-1">{t('layer.pointShape')}</label>
-            <select value={ts.pointShape} onChange={e => setTab(s => ({ ...s, pointShape: e.target.value }))}
-              className="w-full h-9 px-2 text-sm border border-border rounded bg-card">
-              {POINT_SHAPES.map(s => <option key={s.value} value={s.value}>{s.label}</option>)}
-            </select>
+            <ShapeSelect
+              value={ts.pointShape}
+              shapes={POINT_SHAPES}
+              onValueChange={(v) => setTab(s => ({ ...s, pointShape: v }))}
+            />
           </div>
         </>
       )}
@@ -353,14 +362,16 @@ export default function LayerToolsPage() {
           {colorSwatches(ts.fillColor, (v) => setTab(s => ({ ...s, fillColor: v })))}
         </div>
       )}
-      {/* 透明度 0-100：0=不透明，100=全透明 */}
-      <div className="col-span-2">
-        <label className="block text-xs font-medium mb-1">{t('layer.opacity')}</label>
-        <input {...numberInput(ts.opacity, (v) => setTab(s => ({ ...s, opacity: v })))}
-          placeholder="0"
-          className="w-full h-9 px-2 text-sm border border-border rounded bg-card" />
-        <p className="text-[10px] text-muted-foreground mt-1">{t('layer.opacityHint')}</p>
-      </div>
+      {/* 透明度 0-100：0=不透明，100=全透明（仅扇区；点图无透明度概念） */}
+      {isSector && (
+        <div className="col-span-2">
+          <label className="block text-xs font-medium mb-1">{t('layer.opacity')}</label>
+          <input {...numberInput(ts.opacity, (v) => setTab(s => ({ ...s, opacity: v })))}
+            placeholder="0"
+            className="w-full h-9 px-2 text-sm border border-border rounded bg-card" />
+          <p className="text-[10px] text-muted-foreground mt-1">{t('layer.opacityHint')}</p>
+        </div>
+      )}
       {/* 输出格式多选勾选 */}
       <div className="col-span-2">
         <label className="block text-xs font-medium mb-1">{t('layer.formats')}</label>
@@ -592,5 +603,47 @@ export default function LayerToolsPage() {
         </Tabs.Content>
       </Tabs.Root>
     </div>
+  )
+}
+
+// 点形状下拉（Radix Select，支持选项内嵌 SVG 图标 —— 原生 <option> 不渲染 HTML/SVG）
+interface ShapeOption {
+  value: string
+  label: string
+  icon: React.ReactNode
+}
+
+function ShapeSelect({ value, shapes, onValueChange }: {
+  value: string
+  shapes: ShapeOption[]
+  onValueChange: (v: string) => void
+}) {
+  return (
+    <Select.Root value={value} onValueChange={onValueChange}>
+      <Select.Trigger asChild>
+        <button type="button"
+          className="inline-flex items-center justify-between gap-2 w-full h-9 px-2 text-sm border border-border rounded bg-card hover:border-primary transition-colors">
+          <Select.Value placeholder="..." />
+          <Select.Icon><ChevronDown size={16} className="text-muted-foreground" /></Select.Icon>
+        </button>
+      </Select.Trigger>
+      <Select.Portal>
+        <Select.Content position="popper" sideOffset={4}
+          className="z-50 min-w-[var(--radix-select-trigger-width)] max-h-72 overflow-y-auto bg-card border border-border rounded-lg shadow-lg">
+          <Select.Viewport className="p-1">
+            {shapes.map(s => (
+              <Select.Item key={s.value} value={s.value}
+                className="flex items-center gap-2 px-2 py-1.5 text-sm rounded cursor-pointer outline-none data-[highlighted]:bg-primary/10 data-[selected]:text-primary">
+                <Select.ItemIndicator className="absolute left-1.5">
+                  <CheckCircle2 size={14} />
+                </Select.ItemIndicator>
+                {s.icon}
+                <Select.ItemText>{s.label}</Select.ItemText>
+              </Select.Item>
+            ))}
+          </Select.Viewport>
+        </Select.Content>
+      </Select.Portal>
+    </Select.Root>
   )
 }
