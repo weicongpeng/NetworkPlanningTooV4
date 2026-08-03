@@ -989,7 +989,7 @@ export interface GenerateLayerParams {
   pointSize?: number
   pointShape?: string
   color?: string
-  // 样式：边框颜色/填充颜色/透明度（0-1）
+  // 样式：边框颜色/填充颜色/透明度（0-1，0=不透明 1=全透明，前端 0-100 映射到 0-1）
   borderColor?: string
   fillColor?: string
   opacity?: number
