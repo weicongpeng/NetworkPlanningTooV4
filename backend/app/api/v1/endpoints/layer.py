@@ -33,10 +33,18 @@ def _companion_files(out: Path) -> list:
     return [out]
 
 
-def _zip_layer(out_path: Path) -> Path:
-    """把同名图层文件打包成 zip（TAB 含 .tab/.dat/.id/.map，MIF 含 .mif/.mid），返回 zip 路径"""
+def _fmt_tag(formats: list) -> str:
+    """格式组合后缀：['tab']→'_tab'，['tab','mif']→'_tab-mif'，['kml']→'_kml'；空列表→''"""
+    if not formats:
+        return ""
+    return "_" + "-".join(f for f in formats if f)
+
+
+def _zip_layer(out_path: Path, fmt_tag: str = "") -> Path:
+    """把同名图层文件打包成 zip（TAB 含 .tab/.dat/.id/.map，MIF 含 .mif/.mid），返回 zip 路径。
+    zip 文件名含格式组合后缀（fmt_tag），不同格式组合 URL 不同，隔离浏览器缓存。"""
     base = out_path.stem
-    zip_path = out_path.parent / f"{base}.zip"
+    zip_path = out_path.parent / f"{base}{fmt_tag}.zip"
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
         for f in _companion_files(out_path):
             if f.name != zip_path.name:
@@ -44,24 +52,25 @@ def _zip_layer(out_path: Path) -> Path:
     return zip_path
 
 
-def _finalize_output(out: Path, output_format: str) -> dict:
-    """根据输出格式确定下载文件名/URL：TAB/MIF 多文件打包成 zip，KML 单文件直接返回"""
+def _finalize_output(out: Path, output_format: str, fmt_tag: str = "") -> dict:
+    """根据输出格式确定下载文件名/URL：TAB/MIF 多文件打包成 zip（含格式后缀），KML 单文件直接返回"""
     if output_format in ("tab", "mif"):
-        zip_path = _zip_layer(out)
+        zip_path = _zip_layer(out, fmt_tag)
         return {"filename": zip_path.name, "download_url": f"/layer-files/{zip_path.name}"}
     # KML 单文件
     return {"filename": out.name, "download_url": f"/layer-files/{out.name}"}
 
 
-def _finalize_outputs(outs: list, formats: list) -> dict:
-    """单格式：TAB/MIF 打包 zip，KML 单文件；多格式：统一打包 zip。
+def _finalize_outputs(outs: list, formats: list, fmt_tag: str = "") -> dict:
+    """单格式：TAB/MIF 打包 zip（含格式后缀），KML 单文件；多格式：统一打包 zip（含格式组合后缀）。
     TAB 输出是 .tab 文件（配套 .dat/.id/.map 在同父目录），MIF 同理（.mif/.mid）。
-    _companion_files 按精确 stem 收集配套，不同格式配套集合互不相交（无需去重）。"""
+    _companion_files 按精确 stem 收集配套，不同格式配套集合互不相交（无需去重）。
+    zip 文件名含格式组合后缀，不同格式组合 URL 不同，隔离浏览器缓存。"""
     if len(outs) == 1:
-        return _finalize_output(outs[0], formats[0])
+        return _finalize_output(outs[0], formats[0], fmt_tag)
     # 多格式 → 统一打包 zip
     base = outs[0].stem
-    zip_path = outs[0].parent / f"{base}.zip"
+    zip_path = outs[0].parent / f"{base}{fmt_tag}.zip"
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
         for out in outs:
             for f in _companion_files(out):
@@ -178,7 +187,7 @@ async def generate_point(
                 point_size, point_shape,
             )
             outs.append(out)
-        return {"success": True, "data": {**_finalize_outputs(outs, fmt_list), "stats": stats}}
+        return {"success": True, "data": {**_finalize_outputs(outs, fmt_list, _fmt_tag(fmt_list)), "stats": stats}}
     except HTTPException:
         raise
     except ValueError as e:
@@ -238,7 +247,7 @@ async def generate_sector(
                 line_width,
             )
             outs.append(out)
-        return {"success": True, "data": {**_finalize_outputs(outs, fmt_list), "stats": stats}}
+        return {"success": True, "data": {**_finalize_outputs(outs, fmt_list, _fmt_tag(fmt_list)), "stats": stats}}
     except HTTPException:
         raise
     except ValueError as e:

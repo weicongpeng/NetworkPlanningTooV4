@@ -85,9 +85,10 @@ def test_point_endpoint_returns_download_url():
         assert resp.status_code == 200
         body = resp.json()
         assert body["success"] is True
+        filename = body["data"]["filename"]
+        assert filename == "sample_LTE_point_tab.zip"
         download_url = body["data"]["download_url"]
-        assert download_url.startswith("/layer-files/")
-        assert download_url.endswith(".zip")
+        assert download_url == "/layer-files/sample_LTE_point_tab.zip"
         # 验证 zip 包含 TAB 的 4 个配套文件
         dl = client.get(download_url)
         assert dl.status_code == 200
@@ -125,7 +126,7 @@ def test_sector_endpoint():
         body = resp.json()
         assert body["success"] is True
         filename = body["data"]["filename"]
-        assert filename.endswith(".zip")
+        assert filename == "sample_LTE_sector_mif.zip"
         dl = client.get(body["data"]["download_url"])
         assert dl.status_code == 200
         import zipfile, io
@@ -520,9 +521,8 @@ def test_layer_point_endpoint_uses_source_filename_in_download_name():
         body = resp.json()
         assert body["success"] is True
         filename = body["data"]["filename"]
-        # 命名 = 源文件名 + sheet 名（去 uuid，冲突加序号）
-        assert filename.startswith("工参2026_LTE")
-        assert filename.endswith(".zip")
+        # 命名 = 源文件名 + sheet 名 + 格式后缀（去 uuid，冲突加序号）
+        assert filename == "工参2026_LTE_point_tab.zip"
     finally:
         os.remove(path)
 
@@ -710,6 +710,39 @@ def test_multi_format_zip_no_duplicate_names():
         os.remove(path)
 
 
+def test_multi_format_zip_name_includes_formats():
+    """output_formats=tab,mif,kml → zip 文件名含格式组合后缀 _tab-mif-kml（隔离浏览器缓存）"""
+    path = _make_excel()
+    client = _make_client()
+    try:
+        with open(path, "rb") as f:
+            resp = client.post(
+                "/api/v1/layer/point",
+                files={"file": ("sample.xlsx", f, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+                data={
+                    "sheet_name": "LTE", "name_col": "NAME",
+                    "lon_col": "LONGITUDE", "lat_col": "LATITUDE",
+                    "attributes": '["NAME"]', "output_formats": "tab,mif,kml",
+                },
+            )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["success"] is True
+        filename = body["data"]["filename"]
+        assert filename == "sample_LTE_point_tab-mif-kml.zip"
+        assert body["data"]["download_url"] == "/layer-files/sample_LTE_point_tab-mif-kml.zip"
+        # zip 内含 tab/kml 两格式（kml 也打包进多格式 zip）
+        import zipfile, io
+        dl = client.get(body["data"]["download_url"])
+        assert dl.status_code == 200
+        with zipfile.ZipFile(io.BytesIO(dl.content)) as zf:
+            names = zf.namelist()
+        suffixes = {Path(n).suffix for n in names}
+        assert {".tab", ".mif", ".kml"}.issubset(suffixes)
+    finally:
+        os.remove(path)
+
+
 def test_repeat_generate_via_endpoint_keeps_latest_only():
     """端点二次生成同源文件 → 产出同名（不追加 -1），历史文件被清理"""
     path = _make_excel()
@@ -729,8 +762,8 @@ def test_repeat_generate_via_endpoint_keeps_latest_only():
                 )
             assert resp.status_code == 200
             filename = resp.json()["data"]["filename"]
-            # 两次都应是同名（无 -1 后缀）
-            assert filename == "工参_LTE_point.zip"
+            # 两次都应是同名（无 -1 后缀，含格式后缀）
+            assert filename == "工参_LTE_point_tab.zip"
         # 输出目录只含最新同名文件，无 -1 历史
         layers_dir = settings.UPLOAD_DIR / "layers"
         names = [p.name for p in layers_dir.glob("工参_LTE_point*")]
