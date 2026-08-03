@@ -355,6 +355,7 @@ async function chunkedUpload(
 
   // 取消标志：取消后中止后续分块，complete 阶段抛错
   let cancelled = false
+  const abortCtrl = new AbortController()   // 取消时立即中止进行中的分块请求
 
   // 阶段1: 初始化上传会话
   const startForm = new FormData()
@@ -375,7 +376,10 @@ async function chunkedUpload(
     uploadStore._set({ active: true, percent: 2, step: 'uploading', sessionId: dataId, fileName: file.name })
     uploadStore._setCancel(() => {
       cancelled = true
-      uploadStore._set({ active: false })
+      // 立即中止进行中的请求（避免等待 60s 超时）+ 调后端取消清理分块
+      abortCtrl.abort()
+      uploadStore._set({ active: false, step: '', sessionId: '', fileName: '' })
+      uploadStore._setCancel(null)   // 释放取消句柄，避免下轮误触发
       try { uploadClient.post(`${basePath}/${dataId}/cancel`) } catch { /* ignore */ }
     })
   }
@@ -398,18 +402,23 @@ async function chunkedUpload(
 
         await uploadClient.post(`${basePath}/${dataId}/chunk`, chunkForm, {
           timeout: 60000,          // 单块 60s，超时即触发重试
+          signal: abortCtrl.signal, // 取消时立即中止请求
         })
         success = true
         onProgress?.(Math.round(((i + 1) / totalChunks) * 99))  // 99% 封顶，留给 complete
         if (trackProgress) uploadStore._set({ percent: Math.round(((i + 1) / totalChunks) * 99) })
         console.log(`[chunkedUpload] 分块 ${i + 1}/${totalChunks} 完成 (${end - start} 字节)`)
       } catch (err) {
+        if (cancelled) break        // 用户取消：不重试、不报分块失败
         retries++
         console.warn(`[chunkedUpload] 分块 ${i + 1}/${totalChunks} 失败 (重试 ${retries}/${MAX_CHUNK_RETRIES}):`, (err as any)?.message || err)
         if (retries >= MAX_CHUNK_RETRIES) {
           // 取消上传会话
           try { await uploadClient.post(`${basePath}/${dataId}/cancel`) } catch { /* ignore */ }
-          if (trackProgress) uploadStore._set({ active: false })
+          if (trackProgress) {
+            uploadStore._set({ active: false, step: '', sessionId: '', fileName: '' })
+            uploadStore._setCancel(null)
+          }
           throw new Error(`分块 ${i + 1}/${totalChunks} 上传失败，已重试 ${MAX_CHUNK_RETRIES} 次`)
         }
         const delay = backoffDelay(retries)
@@ -420,7 +429,6 @@ async function chunkedUpload(
 
   // 用户取消：中止上传（不调用 complete），报告已取消
   if (cancelled) {
-    if (trackProgress) uploadStore._set({ active: false })
     throw new Error('已取消')
   }
 

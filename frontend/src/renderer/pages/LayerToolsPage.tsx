@@ -113,8 +113,17 @@ export default function LayerToolsPage() {
   const [activeTab, setActiveTab] = useState<'sector' | 'point'>('sector')
   const [sectorState, setSectorState] = useState<TabState>(() => loadState(STORAGE_KEYS.sector, 'sector'))
   const [pointState, setPointState] = useState<TabState>(() => loadState(STORAGE_KEYS.point, 'point'))
-  // 页面级共享文件（一份文件同时作用于扇区/点图两个 Tab）
+  // 页面级共享文件（一份文件同时作用于扇区/点图两个 Tab）——模块级 store，
+  // 切页不丢失：上传/解析完成后写入模块级 + sessionStorage，组件卸载后成功结果仍保留
   const [sharedFile, setSharedFile] = useState<SharedFile>(() => loadSharedFile())
+  // setSharedFile 同步写 sessionStorage（不依赖组件生命周期；切页卸载后成功结果仍持久化）
+  const persistSharedFile = (f: SharedFile | ((prev: SharedFile) => SharedFile)) => {
+    setSharedFile(prev => {
+      const next = typeof f === 'function' ? (f as (p: SharedFile) => SharedFile)(prev) : f
+      saveState(SHARED_STORAGE_KEY, next)
+      return next
+    })
+  }
   const [generating, setGenerating] = useState(false)
   const [dragActive, setDragActive] = useState(false)
   // 模块级上传进度：chunkedUpload 后台更新，切页不丢失，本组件订阅实时渲染
@@ -125,7 +134,6 @@ export default function LayerToolsPage() {
   // 持久化：state 变化写 sessionStorage
   useEffect(() => saveState(STORAGE_KEYS.sector, sectorState), [sectorState])
   useEffect(() => saveState(STORAGE_KEYS.point, pointState), [pointState])
-  useEffect(() => saveState(SHARED_STORAGE_KEY, sharedFile), [sharedFile])
 
   // 当前激活 Tab 的 state
   const state = activeTab === 'sector' ? sectorState : pointState
@@ -169,7 +177,7 @@ export default function LayerToolsPage() {
     setSectorState(s => ({ ...s, result: null, error: '' }))
     setPointState(s => ({ ...s, result: null, error: '' }))
     // 导入区是页面级共享的：上传前清空共享文件（只作用于共享状态，两个 Tab 的配置各自保留）
-    setSharedFile(() => emptySharedFile())
+    persistSharedFile(() => emptySharedFile())
     // 模块级进度：chunkedUpload 内部 trackProgress 会写入并暴露取消句柄
     uploadStore._set({ active: true, percent: 1, step: 'uploading', sessionId: '', fileName: f.name })
     try {
@@ -179,7 +187,7 @@ export default function LayerToolsPage() {
       })
       uploadStore._set({ percent: 100, step: 'reading' })
       const data = await layerToolsApi.getExcelInfo(up.file_path, up.source_filename)
-      setSharedFile(() => ({
+      persistSharedFile(() => ({
         filePath: up.file_path,
         sourceFilename: up.source_filename,
         fileName: f.name,
@@ -188,7 +196,13 @@ export default function LayerToolsPage() {
         columns: data.columns[data.sheets[0]] || [],
       }))
     } catch (err: any) {
-      // 上传失败/取消：共享文件已清空，错误提示到两个 Tab 各自的 error 上
+      // 用户主动取消：不提示错误（chunkedUpload 抛'已取消'），静默复位
+      if (err?.message === '已取消') {
+        uploadStore._set({ active: false, step: '', sessionId: '', fileName: '' })
+        uploadStore._setCancel(null)
+        return
+      }
+      // 上传失败：共享文件已清空，错误提示到两个 Tab 各自的 error 上
       const msg = err?.message || String(err)
       setSectorState(s => ({ ...s, error: msg }))
       setPointState(s => ({ ...s, error: msg }))
@@ -253,7 +267,7 @@ export default function LayerToolsPage() {
       // 文件过期（后端 TTL 清理后 file_path 失效）→ 清空共享文件提示重新导入
       const msg = err?.message || String(err)
       if (/文件不存在|文件已过期/.test(msg)) {
-        setSharedFile(() => ({ ...emptySharedFile() }))
+        persistSharedFile(() => ({ ...emptySharedFile() }))
         setState(s => ({ ...s, error: t('layer.fileExpired') }))
       } else {
         setState(s => ({ ...s, error: msg }))
@@ -534,7 +548,7 @@ export default function LayerToolsPage() {
 
   // 共享文件 Sheet 切换：只改 sharedFile（两个 Tab 的配置各自保留）
   const handleSheetChange = (sheet: string) => {
-    setSharedFile(f => ({ ...f, sheetName: sheet, columns: f.info?.columns[sheet] || [] }))
+    persistSharedFile(f => ({ ...f, sheetName: sheet, columns: f.info?.columns[sheet] || [] }))
   }
 
   // 切换 Tab：清空非激活 Tab 的旧下载结果（按钮+统计），避免交叉显示；配置各自保留
