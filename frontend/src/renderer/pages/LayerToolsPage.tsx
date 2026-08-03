@@ -57,15 +57,17 @@ const STORAGE_KEYS = { sector: 'layerTools.sector', point: 'layerTools.point' }
 
 // 旧默认值（v2 时代）——用于迁移：仅当用户字段仍等于旧默认值时才更新为新默认值，
 // 避免覆盖用户自定义值。仅迁移默认相关的字段（颜色/点大小/透明度/线宽）。
+// 字段值为数组：当前字段等于任一旧默认值即迁移到新默认（支持多代默认链）。
 const OLD_DEFAULTS_V2: Record<'sector' | 'point', {
-  borderColor: string
-  fillColor?: string
-  opacity: number
-  pointSize?: number
-  lineWidth?: number
+  borderColor: string[]
+  fillColor?: string[]
+  opacity: number[]
+  pointSize?: number[]
+  lineWidth?: number[]
 }> = {
-  sector: { lineWidth: 2, borderColor: '#4A90D9', fillColor: '#4A90D9', opacity: 0 },
-  point: { pointSize: 8, borderColor: '#FF0000', opacity: 0 },
+  sector: { lineWidth: [2], borderColor: ['#4A90D9'], fillColor: ['#4A90D9'], opacity: [0] },
+  // pointSize 历史默认链：8(原始) → 15(上轮) → 12(本轮)
+  point: { pointSize: [8, 15], borderColor: ['#FF0000'], opacity: [0] },
 }
 
 function emptyTabState(type: 'sector' | 'point'): TabState {
@@ -100,23 +102,23 @@ function loadState(key: string, type: 'sector' | 'point'): TabState {
       if (saved._v === 2) {
         const oldD = OLD_DEFAULTS_V2[type]
         const merged = { ...emptyTabState(type), ...saved }
-        // 线宽（扇区）：旧默认 2 → 新默认 2（不变，跳过）；opacity 0→50 需迁移
-        if (saved.opacity !== undefined && String(saved.opacity) === String(oldD.opacity)) {
+        // 迁移判断：当前字段值等于任一旧默认值（数组 includes）才更新为新默认
+        if (saved.opacity !== undefined && oldD.opacity.includes(Number(saved.opacity))) {
           merged.opacity = String(LAYER_DEFAULT_PARAMS[type].opacity)
         }
-        if (saved.borderColor === oldD.borderColor) {
+        if (oldD.borderColor.includes(saved.borderColor)) {
           merged.borderColor = LAYER_DEFAULT_PARAMS[type].borderColor
         }
         if (type === 'point') {
           // 点图颜色存在 fillColor（存颜色用），且空Tab 时 fillColor = dp.borderColor
-          if (saved.fillColor === oldD.borderColor) {
+          if (oldD.borderColor.includes(saved.fillColor)) {
             merged.fillColor = LAYER_DEFAULT_PARAMS.point.borderColor
           }
-          if (oldD.pointSize !== undefined && String(saved.pointSize) === String(oldD.pointSize)) {
+          if (oldD.pointSize !== undefined && oldD.pointSize.includes(Number(saved.pointSize))) {
             merged.pointSize = String(LAYER_DEFAULT_PARAMS.point.pointSize)
           }
         } else {
-          if (oldD.fillColor !== undefined && saved.fillColor === oldD.fillColor) {
+          if (oldD.fillColor !== undefined && oldD.fillColor.includes(saved.fillColor)) {
             merged.fillColor = LAYER_DEFAULT_PARAMS.sector.fillColor
           }
         }
@@ -199,7 +201,7 @@ export default function LayerToolsPage() {
     { value: 'triangle', label: t('layer.shapeTriangle'),
       icon: <svg viewBox="0 0 16 16" className="w-3.5 h-3.5 shrink-0"><circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" strokeWidth="1.5" /></svg> },
     { value: 'triangle_down', label: t('layer.shapeTriangleDown'),
-      icon: <svg viewBox="0 0 16 16" className="w-3.5 h-3.5 shrink-0"><path d="M8 2 L13.5 13 L2.5 13 Z" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round" /></svg> },
+      icon: <svg viewBox="0 0 16 16" className="w-3.5 h-3.5 shrink-0"><path d="M8 1 L9.65 5.73 L14.66 5.84 L10.66 8.87 L12.11 13.66 L8 10.8 L3.89 13.66 L5.34 8.87 L1.34 5.84 L6.35 5.73 Z" fill="none" stroke="currentColor" strokeWidth="1.2" strokeLinejoin="round" /></svg> },
     { value: 'landmark', label: t('layer.shapeLandmark'),
       icon: <svg viewBox="0 0 16 16" className="w-3.5 h-3.5 shrink-0"><polygon points="8,2 14,14 2,14" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round" /></svg> },
     { value: 'pin', label: t('layer.shapePin'),

@@ -52,7 +52,7 @@ export const LAYER_DEFAULT_PARAMS = {
     opacity: 50,              // 0-100：0=完全不透明，100=全透明
   },
   point: {
-    pointSize: 15,            // 点大小默认 15
+    pointSize: 12,            // 点大小默认 12
     pointShape: 'circle',
     borderColor: '#0000FF',   // 默认蓝色
     opacity: 0,               // 0-100：0=完全不透明，100=全透明
