@@ -110,6 +110,28 @@ def hex_to_mapinfo_color(color: Optional[str]) -> Optional[int]:
         return None
 
 
+def preblend_mapinfo_color(color: Optional[str], opacity: Optional[float]) -> Optional[int]:
+    """颜色预混合（模拟连续透明度）：blended = fill*alpha + white*(1-alpha)，alpha = 1-opacity。
+    MIF 无 alpha 通道，用与白色混合的实心色模拟半透明观感（主流做法，连续平滑）。
+    opacity=0 → 原色；opacity=1 → 纯白。非法颜色/透明度返回 None。"""
+    base = hex_to_mapinfo_color(color)
+    if base is None:
+        return None
+    try:
+        t = float(opacity)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(t):
+        return None
+    t = max(0.0, min(1.0, t))
+    alpha = 1.0 - t            # 不透明度
+    r = (base >> 16) & 0xFF
+    g = (base >> 8) & 0xFF
+    b = base & 0xFF
+    blend = lambda c: round(c * alpha + 255 * (1.0 - alpha))
+    return blend(r) * 65536 + blend(g) * 256 + blend(b)
+
+
 def hex_to_kml_color(color: Optional[str]) -> Optional[str]:
     """#RRGGBB → KML aabbggrr (alpha=ff)。非法/None 返回 None"""
     if not color:
@@ -414,27 +436,16 @@ class LayerService:
                 if mif_fill is not None:
                     # MapInfo Brush (pattern, forecolor, backcolor)。GDAL 默认 pattern=1（无填充/透明），
                     # 保留会导致设置填充色仍显示空白 → 实心 pattern=2 使填充色生效。
-                    # MIF 无 alpha 通道，透明度通过 Brush pattern 模拟：opacity=0 → 实心(2)；
-                    # opacity>0 → pattern 3-8（纹理逐档稀疏更透明）+ 省略 backcolor（透明背景）。
-                    # pattern = 2 + round(opacity*6)，opacity(0-1) → pattern 2-8
-                    t = opacity if opacity is not None else 0.0
-                    try:
-                        t = max(0.0, min(1.0, float(t)))
-                    except (TypeError, ValueError):
-                        t = 0.0
-                    if t <= 0:
-                        # 不透明：实心 + 保留 backcolor
-                        text = re.sub(
-                            r'Brush \((\d+),(\d+),(\d+)\)',
-                            lambda m: f'Brush (2,{mif_fill},{m.group(3)})', text,
-                        )
-                    else:
-                        pattern = 2 + round(t * 6)   # 2-8
-                        # 省略 backcolor → 透明填充（MapInfo 规范：pattern>=3 且无 backcolor 即透明）
-                        text = re.sub(
-                            r'Brush \((\d+),(\d+),(\d+)\)',
-                            lambda m: f'Brush ({pattern},{mif_fill})', text,
-                        )
+                    # MIF 无 alpha 通道，透明度用【颜色预混合】模拟（主流做法，连续平滑透明）：
+                    # blended = fill*alpha + white*(1-alpha)，alpha=1-opacity。
+                    # 始终实心 Brush(2, blended, backcolor)，透明度通过颜色变浅呈现，非纹理粒度。
+                    blended = preblend_mapinfo_color(fill_color, opacity)
+                    if blended is None:
+                        blended = mif_fill
+                    text = re.sub(
+                        r'Brush \((\d+),(\d+),(\d+)\)',
+                        lambda m: f'Brush (2,{blended},{m.group(3)})', text,
+                    )
             out_path.write_text(text, encoding="gbk")
         elif output_format == "kml":
             text = out_path.read_text(encoding="utf-8", errors="replace")

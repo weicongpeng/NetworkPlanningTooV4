@@ -366,10 +366,11 @@ def test_mif_sector_fill_pattern_is_solid(service, sample_excel):
     assert "Brush (1," not in text   # 绝不再出现无填充 pattern=1
 
 
-def test_mif_sector_opacity_uses_transparent_brush_pattern(service, sample_excel):
-    """扇区 MIF 透明度：opacity>0 → Brush 用半透明 pattern(3-8) 且省略 backcolor 实现透明填充。
-    MIF 无 alpha 通道，MapInfo 用 Brush pattern 模拟透明度。opacity=0 → 实心 pattern=2。"""
-    # opacity=0 → 实心不透明（pattern=2，保留 backcolor）
+def test_mif_sector_opacity_preblends_fill_color(service, sample_excel):
+    """扇区 MIF 透明度：主流做法=颜色预混合（无 alpha 通道的矢量格式用混合色模拟连续透明）。
+    blended = fill*alpha + white*(1-alpha)，alpha=1-opacity。始终实心 Brush(2, blended, backcolor)。
+    opacity=0 → 原填充色；opacity=0.5 → 与白各半；opacity=1 → 纯白（不可见）。"""
+    # opacity=0 → alpha=1 → 原填充色 #FF0000=16711680
     r0, _ = service.generate_sector_layer(
         file_path=str(sample_excel), sheet_name="LTE",
         name_col="NAME", lon_col="LONGITUDE", lat_col="LATITUDE",
@@ -378,9 +379,9 @@ def test_mif_sector_opacity_uses_transparent_brush_pattern(service, sample_excel
         border_color="#000000", fill_color="#FF0000", opacity=0.0,
     )
     t0 = r0.read_text(encoding="gbk", errors="replace")
-    assert "Brush (2,16711680,16777215)" in t0   # 实心 + backcolor
+    assert "Brush (2,16711680,16777215)" in t0   # 实心 + 原色 + backcolor
 
-    # opacity=0.5 → 半透明 pattern（>2），省略 backcolor（透明填充）
+    # opacity=0.5 → alpha=0.5 → (255,128,128)=16744576（红与白各半，浅红）
     r5, _ = service.generate_sector_layer(
         file_path=str(sample_excel), sheet_name="LTE",
         name_col="NAME", lon_col="LONGITUDE", lat_col="LATITUDE",
@@ -389,10 +390,9 @@ def test_mif_sector_opacity_uses_transparent_brush_pattern(service, sample_excel
         border_color="#000000", fill_color="#FF0000", opacity=0.5,
     )
     t5 = r5.read_text(encoding="gbk", errors="replace")
-    # pattern 2+round(0.5*6)=2+3=5；省略 backcolor → "Brush (5,16711680)"
-    assert "Brush (5,16711680)" in t5
+    assert "Brush (2,16744576,16777215)" in t5   # 浅红 16744576
 
-    # opacity=1 → 最透明 pattern（2+6=8）
+    # opacity=1 → alpha=0 → 纯白 16777215（完全透明观感）
     r1, _ = service.generate_sector_layer(
         file_path=str(sample_excel), sheet_name="LTE",
         name_col="NAME", lon_col="LONGITUDE", lat_col="LATITUDE",
@@ -401,7 +401,7 @@ def test_mif_sector_opacity_uses_transparent_brush_pattern(service, sample_excel
         border_color="#000000", fill_color="#FF0000", opacity=1.0,
     )
     t1 = r1.read_text(encoding="gbk", errors="replace")
-    assert "Brush (8,16711680)" in t1
+    assert "Brush (2,16777215,16777215)" in t1   # 纯白
 
 
 def test_kml_sector_opacity_applied(service, sample_excel):
