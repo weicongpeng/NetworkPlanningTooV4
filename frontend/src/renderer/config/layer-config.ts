@@ -41,20 +41,20 @@ export function autoMatchFields(columns: string[], includeAzimuth: boolean): Rec
   return result
 }
 
-// 默认参数（扇区半径 50m、波瓣夹角 50°）
+// 默认参数（扇区半径 50m、波瓣夹角 50°、边框黄/填充红/线宽2/透明度50）
 export const LAYER_DEFAULT_PARAMS = {
   sector: {
     radiusM: 50,
     beamwidth: 50,
     lineWidth: 2,
-    borderColor: '#4A90D9',
-    fillColor: '#4A90D9',
-    opacity: 0,  // 0-100：0=完全不透明，100=全透明
+    borderColor: '#FFFF00',   // 边框黄色
+    fillColor: '#FF0000',     // 填充红色
+    opacity: 50,              // 0-100：0=完全不透明，100=全透明
   },
   point: {
-    pointSize: 8,
+    pointSize: 15,            // 点大小默认 15
     pointShape: 'circle',
-    borderColor: '#FF0000',
-    opacity: 0,  // 0-100：0=完全不透明，100=全透明
+    borderColor: '#0000FF',   // 默认蓝色
+    opacity: 0,               // 0-100：0=完全不透明，100=全透明
   },
 }

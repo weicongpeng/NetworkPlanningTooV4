@@ -55,6 +55,19 @@ interface TabState {
 
 const STORAGE_KEYS = { sector: 'layerTools.sector', point: 'layerTools.point' }
 
+// 旧默认值（v2 时代）——用于迁移：仅当用户字段仍等于旧默认值时才更新为新默认值，
+// 避免覆盖用户自定义值。仅迁移默认相关的字段（颜色/点大小/透明度/线宽）。
+const OLD_DEFAULTS_V2: Record<'sector' | 'point', {
+  borderColor: string
+  fillColor?: string
+  opacity: number
+  pointSize?: number
+  lineWidth?: number
+}> = {
+  sector: { lineWidth: 2, borderColor: '#4A90D9', fillColor: '#4A90D9', opacity: 0 },
+  point: { pointSize: 8, borderColor: '#FF0000', opacity: 0 },
+}
+
 function emptyTabState(type: 'sector' | 'point'): TabState {
   const dp = type === 'sector' ? LAYER_DEFAULT_PARAMS.sector : LAYER_DEFAULT_PARAMS.point
   return {
@@ -83,8 +96,32 @@ function loadState(key: string, type: 'sector' | 'point'): TabState {
     const raw = sessionStorage.getItem(key)
     if (raw) {
       const saved = JSON.parse(raw)
-      // 已带版本标记（_v === 2）→ 已迁移过，直接采用，不再跑启发式迁移（避免每次刷新改掉用户重输的值）
-      if (saved._v === 2) return { ...emptyTabState(type), ...saved }
+      // 已带版本标记（_v === 2）→ 采用，但迁移默认字段：仅当字段仍等于旧默认值时才更新为新默认
+      if (saved._v === 2) {
+        const oldD = OLD_DEFAULTS_V2[type]
+        const merged = { ...emptyTabState(type), ...saved }
+        // 线宽（扇区）：旧默认 2 → 新默认 2（不变，跳过）；opacity 0→50 需迁移
+        if (saved.opacity !== undefined && String(saved.opacity) === String(oldD.opacity)) {
+          merged.opacity = String(LAYER_DEFAULT_PARAMS[type].opacity)
+        }
+        if (saved.borderColor === oldD.borderColor) {
+          merged.borderColor = LAYER_DEFAULT_PARAMS[type].borderColor
+        }
+        if (type === 'point') {
+          // 点图颜色存在 fillColor（存颜色用），且空Tab 时 fillColor = dp.borderColor
+          if (saved.fillColor === oldD.borderColor) {
+            merged.fillColor = LAYER_DEFAULT_PARAMS.point.borderColor
+          }
+          if (oldD.pointSize !== undefined && String(saved.pointSize) === String(oldD.pointSize)) {
+            merged.pointSize = String(LAYER_DEFAULT_PARAMS.point.pointSize)
+          }
+        } else {
+          if (oldD.fillColor !== undefined && saved.fillColor === oldD.fillColor) {
+            merged.fillColor = LAYER_DEFAULT_PARAMS.sector.fillColor
+          }
+        }
+        return merged
+      }
       // 旧版（v1）payload 迁移，仅执行一次：
       // 迁移1：旧版只有 color（原"填充颜色"实为边框色），新版拆分为 borderColor/fillColor/opacity
       if (saved.color && !saved.borderColor) saved.borderColor = saved.color
