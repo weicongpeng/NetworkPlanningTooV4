@@ -322,7 +322,8 @@ export default function LayerToolsPage() {
   const renderParams = (ts: TabState, setTab: (u: (s: TabState) => TabState) => void) => (
     <div className="grid grid-cols-2 gap-4">
       {isSector ? (
-        <>
+        // 扇区：半径 / 波瓣夹角 / 线宽 同一行（3 列）
+        <div className="col-span-2 grid grid-cols-3 gap-4">
           <div>
             <label className="block text-xs font-medium mb-1">{t('layer.radius')} (m)</label>
             <input {...numberInput(ts.radiusM, (v) => setTab(s => ({ ...s, radiusM: v })))}
@@ -333,20 +334,21 @@ export default function LayerToolsPage() {
             <input {...numberInput(ts.beamwidth, (v) => setTab(s => ({ ...s, beamwidth: v })))}
               className="w-full h-9 px-2 text-sm border border-border rounded bg-card" />
           </div>
-          <div className="col-span-2">
+          <div>
             <label className="block text-xs font-medium mb-1">{t('layer.lineWidth')}</label>
             <input {...numberInput(ts.lineWidth, (v) => setTab(s => ({ ...s, lineWidth: v })))}
               placeholder="2" className="w-full h-9 px-2 text-sm border border-border rounded bg-card" />
           </div>
-        </>
+        </div>
       ) : (
-        <>
+        // 点图：点大小 / 点形状 同一行（2 列）
+        <div className="col-span-2 grid grid-cols-2 gap-4">
           <div>
             <label className="block text-xs font-medium mb-1">{t('layer.pointSize')}</label>
             <input {...numberInput(ts.pointSize, (v) => setTab(s => ({ ...s, pointSize: v })))}
               className="w-full h-9 px-2 text-sm border border-border rounded bg-card" />
           </div>
-          <div className="col-span-2">
+          <div>
             <label className="block text-xs font-medium mb-1">{t('layer.pointShape')}</label>
             <ShapeSelect
               value={ts.pointShape}
@@ -354,7 +356,7 @@ export default function LayerToolsPage() {
               onValueChange={(v) => setTab(s => ({ ...s, pointShape: v }))}
             />
           </div>
-        </>
+        </div>
       )}
       {/* 颜色：扇区显示"边框颜色"（borderColor state）；点图显示"填充颜色"（fillColor state） */}
       <div>
