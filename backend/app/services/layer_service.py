@@ -24,9 +24,10 @@ DRIVER_MAP = {
 # 扩展名
 EXT_MAP = {"tab": ".tab", "mif": ".mif", "kml": ".kml"}
 
-# 点形状 → MapInfo Symbol shape 编号
+# 点形状 → MapInfo Symbol shape 编号（MapInfo 3.0 Symbols：34=Circle 32=Square 33=Diamond 35=Star）
+# 修正：原 circle=35(Star)/square=33(Diamond)/diamond=36 全部错位 → 34/32/33
 POINT_SHAPE_MIF = {
-    "circle": 35, "square": 33, "diamond": 36,
+    "circle": 34, "square": 32, "diamond": 33,
     "triangle": 40, "triangle_down": 41, "landmark": 42, "pin": 38,
 }
 
@@ -390,7 +391,7 @@ class LayerService:
             if is_point:
                 # 点 Symbol (shape, 颜色, size) 替换：形状映射 + 边框色 + 点大小
                 if mif_border is not None:
-                    shape = POINT_SHAPE_MIF.get(point_shape or "circle", 35)
+                    shape = POINT_SHAPE_MIF.get(point_shape or "circle", 34)
                     size = int(point_size or 12)
                     text = re.sub(
                         r'Symbol \((\d+),(\d+),(\d+)\)',
@@ -401,9 +402,12 @@ class LayerService:
                 # 扇区 Pen 颜色 = 边框色、线宽 = pen_width；Brush 前景 = 填充色
                 pen_width = max(1, min(7, int(line_width or 2)))
                 if mif_border is not None:
+                    # MapInfo Pen (width, pattern, color)：线宽进 width、保留原 pattern、颜色进 color
+                    # 修复前错误写为 (1, mif_border, pen_width) → 颜色进 pattern 位（0-71）
+                    # 导致白色边框 16777215 报 Invalid stylevalue，线宽也从未生效
                     text = re.sub(
                         r'Pen \((\d+),(\d+),(\d+)\)',
-                        lambda m: f'Pen ({m.group(1)},{mif_border},{pen_width})', text,
+                        lambda m: f'Pen ({pen_width},{m.group(2)},{mif_border})', text,
                     )
                 if mif_fill is not None:
                     text = re.sub(

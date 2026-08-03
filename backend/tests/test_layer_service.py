@@ -253,7 +253,7 @@ def test_mif_point_color_injected(service, sample_excel):
     )
     assert result.suffix == ".mif"
     text = result.read_text(encoding="utf-8", errors="replace")
-    assert "Symbol (35,4886745," in text
+    assert "Symbol (34,4886745," in text
     import geopandas as gpd
     gdf = gpd.read_file(result)
     assert len(gdf) == 2
@@ -344,7 +344,7 @@ def test_mif_sector_border_and_fill_colors(service, sample_excel):
         border_color="#000000", fill_color="#FF0000",
     )
     text = result.read_text(encoding="utf-8", errors="replace")
-    assert "Pen (1,0," in text        # 黑色边框 = MapInfo 十进制 0
+    assert "Pen (2,2,0)" in text        # 黑色边框 = MapInfo 十进制 0，线宽默认 2 进 width 位、pattern 保留 GDAL 2
     assert "Brush (1,16711680," in text  # 红色填充 = 65536*255
     import geopandas as gpd
     gdf = gpd.read_file(result)
@@ -810,7 +810,7 @@ def test_mif_sector_line_width(service, sample_excel):
         border_color="#4A90D9", fill_color="#4A90D9", line_width=4,
     )
     text = result.read_text(encoding="gbk", errors="replace")
-    assert "Pen (1,4886745,4)" in text
+    assert "Pen (4,2,4886745)" in text
 
 
 def test_kml_point_icon_injected(service, sample_excel):
@@ -838,7 +838,7 @@ def test_mif_point_shape_applied(service, sample_excel):
         border_color="#FF0000", point_shape="square", point_size=10,
     )
     text = result.read_text(encoding="gbk", errors="replace")
-    assert "Symbol (33,16711680,10)" in text  # square=33, 红色, size=10
+    assert "Symbol (32,16711680,10)" in text  # square=32, 红色, size=10
 
 
 def test_kml_point_scale_default(service, sample_excel):
@@ -867,3 +867,50 @@ def test_kml_opacity_nan_safe(service, sample_excel):
     assert "<kml" in text.lower()
     import xml.etree.ElementTree as ET
     ET.fromstring(text)  # XML 合法
+
+
+def test_mif_sector_pen_parameter_order(service, sample_excel):
+    """扇区 MIF Pen 参数顺序：(width, pattern, color)，颜色进 color 位、线宽进 width 位。
+    白色边框 #FFFFFF=16777215 不应进入 pattern 位（0-71），否则 MapInfo 报 Invalid stylevalue"""
+    result, _ = service.generate_sector_layer(
+        file_path=str(sample_excel), sheet_name="LTE",
+        name_col="NAME", lon_col="LONGITUDE", lat_col="LATITUDE",
+        azimuth_col="AZIMUTH", radius_m=3000, beamwidth=40.0,
+        attributes=["NAME"], output_format="mif",
+        border_color="#FFFFFF", fill_color="#4A90D9", line_width=4,
+    )
+    text = result.read_text(encoding="gbk", errors="replace")
+    # Pen (width=4, pattern=2(GDAL默认), color=16777215) —— 颜色在第三位
+    assert "Pen (4,2,16777215)" in text
+    # pattern 位绝不出现颜色值（<=71）
+    import re
+    for m in re.finditer(r'Pen \((\d+),(\d+),(\d+)\)', text):
+        assert int(m.group(2)) <= 71, f"pattern 位越界: {m.group(0)}"
+
+
+def test_mif_point_shape_codes_corrected(service, sample_excel):
+    """点形状符号编号纠正：circle=34、square=32、diamond=33"""
+    # circle
+    r1, _ = service.generate_point_layer(
+        file_path=str(sample_excel), sheet_name="LTE",
+        name_col="NAME", lon_col="LONGITUDE", lat_col="LATITUDE",
+        attributes=["NAME"], output_format="mif",
+        border_color="#FF0000", point_shape="circle", point_size=10,
+    )
+    assert "Symbol (34,16711680,10)" in r1.read_text(encoding="gbk", errors="replace")
+    # square
+    r2, _ = service.generate_point_layer(
+        file_path=str(sample_excel), sheet_name="LTE",
+        name_col="NAME", lon_col="LONGITUDE", lat_col="LATITUDE",
+        attributes=["NAME"], output_format="mif",
+        border_color="#FF0000", point_shape="square", point_size=10,
+    )
+    assert "Symbol (32,16711680,10)" in r2.read_text(encoding="gbk", errors="replace")
+    # diamond
+    r3, _ = service.generate_point_layer(
+        file_path=str(sample_excel), sheet_name="LTE",
+        name_col="NAME", lon_col="LONGITUDE", lat_col="LATITUDE",
+        attributes=["NAME"], output_format="mif",
+        border_color="#FF0000", point_shape="diamond", point_size=10,
+    )
+    assert "Symbol (33,16711680,10)" in r3.read_text(encoding="gbk", errors="replace")
