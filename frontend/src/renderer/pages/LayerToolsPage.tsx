@@ -34,6 +34,7 @@ function loadSharedFile(): SharedFile {
 }
 
 interface TabState {
+  _v: number              // 状态版本标记：2=已迁移到 0-100 透明度语义；迁移只对旧版 payload 执行一次
   selectedFields: Record<string, string>
   fieldMappings: Record<string, string>
   radiusM: string          // 字符串受控，避免删空变 0 / 前导 0
@@ -41,9 +42,9 @@ interface TabState {
   lineWidth: string
   pointSize: string
   pointShape: string
-  borderColor: string      // 边框颜色
-  fillColor: string        // 填充颜色（扇区内部；点图忽略）
-  opacity: string          // 透明度 0-1（字符串受控，允许 0.6 等）
+  borderColor: string      // 边框颜色（扇区）
+  fillColor: string        // 填充颜色（扇区内部；点图存颜色用）
+  opacity: string          // 透明度 0-100（字符串受控；0=不透明，100=全透明）
   color: string            // 旧字段兼容（保留读写，避免旧 sessionStorage 数据丢失）
   formats: LayerFormat[]   // 多格式勾选
   result: GenerateLayerResult | null
@@ -55,6 +56,7 @@ const STORAGE_KEYS = { sector: 'layerTools.sector', point: 'layerTools.point' }
 function emptyTabState(type: 'sector' | 'point'): TabState {
   const dp = type === 'sector' ? LAYER_DEFAULT_PARAMS.sector : LAYER_DEFAULT_PARAMS.point
   return {
+    _v: 2,                 // 当前版本：0-100 透明度语义
     selectedFields: {},
     fieldMappings: {},
     radiusM: type === 'sector' ? String(LAYER_DEFAULT_PARAMS.sector.radiusM) : '',
@@ -63,7 +65,8 @@ function emptyTabState(type: 'sector' | 'point'): TabState {
     pointSize: type === 'point' ? String(LAYER_DEFAULT_PARAMS.point.pointSize) : '',
     pointShape: type === 'point' ? LAYER_DEFAULT_PARAMS.point.pointShape : '',
     borderColor: dp.borderColor,
-    fillColor: type === 'sector' ? LAYER_DEFAULT_PARAMS.sector.fillColor : '',
+    // 点图 Tab 用 fillColor 存颜色（后端点图颜色按边框语义应用，border_color 接收 fillColor）
+    fillColor: type === 'sector' ? LAYER_DEFAULT_PARAMS.sector.fillColor : dp.borderColor,
     opacity: String(dp.opacity),
     color: dp.borderColor,   // 旧字段兼容
     formats: ['tab', 'mif', 'kml'],
@@ -78,10 +81,22 @@ function loadState(key: string, type: 'sector' | 'point'): TabState {
     const raw = sessionStorage.getItem(key)
     if (raw) {
       const saved = JSON.parse(raw)
-      // 迁移：旧版只有 color（原"填充颜色"实为边框色），新版拆分为 borderColor/fillColor/opacity
+      // 已带版本标记（_v === 2）→ 已迁移过，直接采用，不再跑启发式迁移（避免每次刷新改掉用户重输的值）
+      if (saved._v === 2) return { ...emptyTabState(type), ...saved }
+      // 旧版（v1）payload 迁移，仅执行一次：
+      // 迁移1：旧版只有 color（原"填充颜色"实为边框色），新版拆分为 borderColor/fillColor/opacity
       if (saved.color && !saved.borderColor) saved.borderColor = saved.color
       if (saved.color && !saved.fillColor && type === 'sector') saved.fillColor = saved.color
-      return { ...emptyTabState(type), ...saved }
+      // 迁移2：点图旧 borderColor（存着颜色值）→ 新 fillColor（点图 Tab 用 fillColor 存颜色）
+      if (type === 'point' && saved.borderColor && !saved.fillColor) saved.fillColor = saved.borderColor
+      // 迁移3：透明度语义从 0-1（不透明度）反转为 0-100（透明度）。旧 0.6（不透明度 60%）→ 新 40
+      // 检测旧语义：数值在 (0,1] 区间（旧值范围）。排除 0：新默认 0（完全不透明）会在挂载后立即写入
+      // sessionStorage，若把 0 也当旧值迁移，页面刷新会把默认值 0 错迁为 100（全透明）
+      const savedOpacity = Number(saved.opacity)
+      if (saved.opacity !== undefined && saved.opacity !== '' && savedOpacity > 0 && savedOpacity <= 1) {
+        saved.opacity = String(Math.round((1 - savedOpacity) * 100))
+      }
+      return { ...emptyTabState(type), ...saved, _v: 2 }
     }
   } catch { /* ignore */ }
   return emptyTabState(type)
@@ -101,6 +116,7 @@ export default function LayerToolsPage() {
   const [uploading, setUploading] = useState(false)
   const [generating, setGenerating] = useState(false)
   const [progress, setProgress] = useState<{ percent: number; step: string } | null>(null)
+  const [dragActive, setDragActive] = useState(false)
 
   // 持久化：state 变化写 sessionStorage
   useEffect(() => saveState(STORAGE_KEYS.sector, sectorState), [sectorState])
@@ -130,6 +146,13 @@ export default function LayerToolsPage() {
   const handleFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const f = e.target.files?.[0]
     if (!f) return
+    await processFile(f)
+  }
+
+  // 处理单个文件（点击选择 / 拖拽导入共用）
+  const processFile = async (f: File) => {
+    // 上传中忽略新的 drop/点击，避免并发重复上传
+    if (uploading) return
     // 重新导入：文件变化 → 清空两个 Tab 的旧结果/错误（result 绑定 sharedFile，
     // 保证切换 Tab 后不会显示指向旧文件的失效下载按钮）
     setSectorState(s => ({ ...s, result: null, error: '' }))
@@ -186,6 +209,9 @@ export default function LayerToolsPage() {
     setGenerating(true)
     setState(s => ({ ...s, error: '', result: null }))
     try {
+      // 透明度：前端 0-100 滑块值 → 后端 opacity(0-1，语义为透明度)
+      // v=0 → opacity=0 → 不透明；v=100 → opacity=1 → 全透明。注意不是 (100-v)/100！
+      const v = Number.isFinite(parseFloat(state.opacity)) ? parseFloat(state.opacity) : 0
       const base = {
         filePath: sharedFile.filePath,
         sourceFilename: sharedFile.sourceFilename,
@@ -195,13 +221,13 @@ export default function LayerToolsPage() {
         latCol: state.fieldMappings.latitude,
         attributes: Object.values(state.selectedFields),
         outputFormats: state.formats,
-        color: state.borderColor,
-        borderColor: state.borderColor,
+        color: isSector ? state.borderColor : state.fillColor,
+        borderColor: isSector ? state.borderColor : state.fillColor,
         fillColor: state.fillColor,
         lineWidth: parseInt(state.lineWidth) || 2,
         pointSize: parseFloat(state.pointSize) || LAYER_DEFAULT_PARAMS.point.pointSize,
         pointShape: state.pointShape,
-        opacity: Number.isFinite(parseFloat(state.opacity)) ? parseFloat(state.opacity) : 1
+        opacity: v / 100
       }
       const data = isSector
         ? await layerToolsApi.generateSector({
@@ -304,14 +330,21 @@ export default function LayerToolsPage() {
           </div>
         </>
       )}
-      {/* 边框颜色 */}
+      {/* 颜色：扇区显示"边框颜色"（borderColor state）；点图显示"填充颜色"（fillColor state） */}
       <div>
-        <label className="block text-xs font-medium mb-1">{t('layer.borderColor')}</label>
-        <input type="color" value={ts.borderColor} onChange={e => setTab(s => ({ ...s, borderColor: e.target.value, color: e.target.value }))}
+        <label className="block text-xs font-medium mb-1">
+          {isSector ? t('layer.borderColor') : t('layer.fillColor')}
+        </label>
+        <input type="color" value={isSector ? ts.borderColor : ts.fillColor}
+          onChange={e => isSector
+            ? setTab(s => ({ ...s, borderColor: e.target.value, color: e.target.value }))
+            : setTab(s => ({ ...s, fillColor: e.target.value, color: e.target.value }))}
           className="w-full h-9 cursor-pointer" />
-        {colorSwatches(ts.borderColor, (v) => setTab(s => ({ ...s, borderColor: v, color: v })))}
+        {colorSwatches(isSector ? ts.borderColor : ts.fillColor, (v) => isSector
+          ? setTab(s => ({ ...s, borderColor: v, color: v }))
+          : setTab(s => ({ ...s, fillColor: v, color: v })))}
       </div>
-      {/* 填充颜色（扇区内部；点图无填充概念，隐藏） */}
+      {/* 填充颜色（仅扇区；点图颜色已由上面"填充颜色"块承载） */}
       {isSector && (
         <div>
           <label className="block text-xs font-medium mb-1">{t('layer.fillColor')}</label>
@@ -320,12 +353,13 @@ export default function LayerToolsPage() {
           {colorSwatches(ts.fillColor, (v) => setTab(s => ({ ...s, fillColor: v })))}
         </div>
       )}
-      {/* 透明度 0-1 */}
+      {/* 透明度 0-100：0=不透明，100=全透明 */}
       <div className="col-span-2">
         <label className="block text-xs font-medium mb-1">{t('layer.opacity')}</label>
         <input {...numberInput(ts.opacity, (v) => setTab(s => ({ ...s, opacity: v })))}
-          placeholder="0.6"
+          placeholder="0"
           className="w-full h-9 px-2 text-sm border border-border rounded bg-card" />
+        <p className="text-[10px] text-muted-foreground mt-1">{t('layer.opacityHint')}</p>
       </div>
       {/* 输出格式多选勾选 */}
       <div className="col-span-2">
@@ -366,7 +400,7 @@ export default function LayerToolsPage() {
 
   const renderResult = (ts: TabState) => ts.result && (
     <div className="mt-3">
-      <a href={ts.result.download_url} download
+      <a href={ts.result.download_url + '?_t=' + Date.now()} download
         className="w-full inline-flex items-center justify-center gap-2 px-6 py-2.5 bg-green-600 text-white rounded-lg hover:opacity-90 text-sm">
         <Download size={16} /> {t('layer.download')} ({ts.result.filename})
       </a>
@@ -505,10 +539,17 @@ export default function LayerToolsPage() {
         <div className="mb-6 grid grid-cols-5 gap-6">
           <div className="col-span-3 p-4 bg-card border border-border rounded-lg">
             <p className="text-xs font-medium mb-3">{t('layer.fileImport')}</p>
-            <label className="block flex items-center gap-3 px-4 py-3 border-2 border-dashed border-border rounded-lg cursor-pointer hover:border-primary transition-colors">
+            <label
+              onDragOver={(e) => { e.preventDefault(); setDragActive(true) }}
+              onDragLeave={(e) => {
+                // 仅在真正离开 label（而非移到内部子元素）时取消高亮，避免拖拽高亮闪烁
+                if (!e.currentTarget.contains(e.relatedTarget as Node)) setDragActive(false)
+              }}
+              onDrop={(e) => { e.preventDefault(); setDragActive(false); const f = e.dataTransfer.files?.[0]; if (f) processFile(f) }}
+              className={`block flex items-center gap-3 px-4 py-3 border-2 border-dashed rounded-lg cursor-pointer transition-colors ${dragActive ? 'border-primary bg-primary/5' : 'border-border hover:border-primary'}`}>
               <FileUp className="text-muted-foreground shrink-0" size={20} />
               <div className="flex-1 min-w-0">
-                <p className="text-sm truncate">{sharedFile.fileName || t('layer.uploadExcel')}</p>
+                <p className="text-sm truncate">{sharedFile.fileName || (dragActive ? t('layer.dropHere') : t('layer.uploadExcel'))}</p>
                 <p className="text-xs text-muted-foreground">{t('layer.acceptExcel')}</p>
               </div>
               <input type="file" className="hidden" accept=".xlsx,.xls,.txt,.csv" onChange={handleFile} disabled={uploading} />

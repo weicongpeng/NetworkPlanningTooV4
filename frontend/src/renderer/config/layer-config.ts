@@ -49,12 +49,12 @@ export const LAYER_DEFAULT_PARAMS = {
     lineWidth: 2,
     borderColor: '#4A90D9',
     fillColor: '#4A90D9',
-    opacity: 0.6,
+    opacity: 0,  // 0-100：0=完全不透明，100=全透明
   },
   point: {
     pointSize: 8,
     pointShape: 'circle',
     borderColor: '#FF0000',
-    opacity: 1,
+    opacity: 0,  // 0-100：0=完全不透明，100=全透明
   },
 }
