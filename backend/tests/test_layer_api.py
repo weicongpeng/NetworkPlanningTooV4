@@ -4,6 +4,7 @@
 import pandas as pd
 import tempfile
 import os
+import re
 from pathlib import Path
 from fastapi.testclient import TestClient
 
@@ -239,8 +240,8 @@ def test_sector_endpoint_with_border_fill_opacity():
             assert mif_names
             text = zf.read(mif_names[0]).decode("gbk", errors="replace")
         assert "Pen (2,2,0)" in text        # 黑色边框：线宽默认 2 进 width 位、pattern 保留 GDAL 2、颜色进 color 位
-        # opacity=0.5 → 颜色预混合（红#FF0000 与白各半 → 浅红 16744576）
-        assert "Brush (2,16744576,16777215)" in text
+        # opacity=0.5 → 稀疏 pattern 省略 backcolor（官方规范透明填充：Brush(pattern, fg)）
+        assert re.search(r'Brush \((\d+),16711680\)', text), f"应省略 backcolor，实际: {text[-200:]}"
     finally:
         os.remove(path)
 

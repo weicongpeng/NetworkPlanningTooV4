@@ -366,11 +366,12 @@ def test_mif_sector_fill_pattern_is_solid(service, sample_excel):
     assert "Brush (1," not in text   # 绝不再出现无填充 pattern=1
 
 
-def test_mif_sector_opacity_preblends_fill_color(service, sample_excel):
-    """扇区 MIF 透明度：主流做法=颜色预混合（无 alpha 通道的矢量格式用混合色模拟连续透明）。
-    blended = fill*alpha + white*(1-alpha)，alpha=1-opacity。始终实心 Brush(2, blended, backcolor)。
-    opacity=0 → 原填充色；opacity=0.5 → 与白各半；opacity=1 → 纯白（不可见）。"""
-    # opacity=0 → alpha=1 → 原填充色 #FF0000=16711680
+def test_mif_sector_opacity_uses_sparse_pattern(service, sample_excel):
+    """扇区 MIF 透明度：官方规范认可方式 = pattern≥3 且省略 backcolor（透明填充）。
+    MIF 无 alpha 通道，用稀疏大颗粒 pattern（12-14）+ 省略 backcolor 实现半透明，
+    视觉是透过稀疏点阵看到底下内容（非颜色变浅、非密集网格）。
+    opacity=0 → 实心 pattern=2 保留 backcolor；opacity>0 → 稀疏 pattern 省略 backcolor。"""
+    # opacity=0 → 实心不透明（pattern=2，保留 backcolor）
     r0, _ = service.generate_sector_layer(
         file_path=str(sample_excel), sheet_name="LTE",
         name_col="NAME", lon_col="LONGITUDE", lat_col="LATITUDE",
@@ -379,9 +380,9 @@ def test_mif_sector_opacity_preblends_fill_color(service, sample_excel):
         border_color="#000000", fill_color="#FF0000", opacity=0.0,
     )
     t0 = r0.read_text(encoding="gbk", errors="replace")
-    assert "Brush (2,16711680,16777215)" in t0   # 实心 + 原色 + backcolor
+    assert "Brush (2,16711680,16777215)" in t0   # 实心 + 原色 + backcolor（不透明）
 
-    # opacity=0.5 → alpha=0.5 → (255,128,128)=16744576（红与白各半，浅红）
+    # opacity=0.5 → 稀疏 pattern（>2）且省略 backcolor → "Brush (<pattern>,16711680)"
     r5, _ = service.generate_sector_layer(
         file_path=str(sample_excel), sheet_name="LTE",
         name_col="NAME", lon_col="LONGITUDE", lat_col="LATITUDE",
@@ -390,9 +391,15 @@ def test_mif_sector_opacity_preblends_fill_color(service, sample_excel):
         border_color="#000000", fill_color="#FF0000", opacity=0.5,
     )
     t5 = r5.read_text(encoding="gbk", errors="replace")
-    assert "Brush (2,16744576,16777215)" in t5   # 浅红 16744576
+    import re
+    brush5 = re.search(r'Brush \((\d+),(\d+)(?:,(\d+))?\)', t5)
+    assert brush5, f"未找到 Brush: {t5[:200]}"
+    pat5 = int(brush5.group(1))
+    assert pat5 > 2 and pat5 != 1, f"半透明应使用非实心稀疏 pattern>2，实际 {pat5}"
+    assert brush5.group(3) is None, f"透明填充应省略 backcolor，实际 {brush5.group(0)}"
+    assert int(brush5.group(2)) == 16711680   # 填充色不变（#FF0000）
 
-    # opacity=1 → alpha=0 → 纯白 16777215（完全透明观感）
+    # opacity=1 → 更稀疏 pattern（透明度越高，颗粒越稀）
     r1, _ = service.generate_sector_layer(
         file_path=str(sample_excel), sheet_name="LTE",
         name_col="NAME", lon_col="LONGITUDE", lat_col="LATITUDE",
@@ -401,7 +408,11 @@ def test_mif_sector_opacity_preblends_fill_color(service, sample_excel):
         border_color="#000000", fill_color="#FF0000", opacity=1.0,
     )
     t1 = r1.read_text(encoding="gbk", errors="replace")
-    assert "Brush (2,16777215,16777215)" in t1   # 纯白
+    brush1 = re.search(r'Brush \((\d+),(\d+)(?:,(\d+))?\)', t1)
+    assert brush1 and int(brush1.group(1)) > 2
+    assert brush1.group(3) is None
+    # 透明度 1.0 的 pattern 应比 0.5 更稀疏（pattern 编号更靠近稀疏端）
+    assert int(brush1.group(1)) < pat5, f"透明度越高应越稀疏，实际 {brush1.group(1)} > {pat5}"
 
 
 def test_kml_sector_opacity_applied(service, sample_excel):

@@ -110,26 +110,28 @@ def hex_to_mapinfo_color(color: Optional[str]) -> Optional[int]:
         return None
 
 
-def preblend_mapinfo_color(color: Optional[str], opacity: Optional[float]) -> Optional[int]:
-    """颜色预混合（模拟连续透明度）：blended = fill*alpha + white*(1-alpha)，alpha = 1-opacity。
-    MIF 无 alpha 通道，用与白色混合的实心色模拟半透明观感（主流做法，连续平滑）。
-    opacity=0 → 原色；opacity=1 → 纯白。非法颜色/透明度返回 None。"""
-    base = hex_to_mapinfo_color(color)
-    if base is None:
-        return None
+def mif_opacity_brush_pattern(opacity: Optional[float]) -> int:
+    """MIF 透明度 → Brush pattern 档位（官方规范：pattern≥3 且省略 backcolor 即透明填充）。
+    MIF 无 alpha 通道，用【稀疏大颗粒】pattern 模拟半透明（透过点阵看到底下内容）：
+      透明度越高 → pattern 越稀疏（颗粒越稀，越透明）。
+    pattern 2=实心（不透明）；12/13/14=稀疏点阵（密度 0.06/0.12/0.25）；15=细斜线。
+    非法/NaN → 0（不透明）。"""
     try:
         t = float(opacity)
     except (TypeError, ValueError):
-        return None
+        return 2
     if not math.isfinite(t):
-        return None
+        return 2
     t = max(0.0, min(1.0, t))
-    alpha = 1.0 - t            # 不透明度
-    r = (base >> 16) & 0xFF
-    g = (base >> 8) & 0xFF
-    b = base & 0xFF
-    blend = lambda c: round(c * alpha + 255 * (1.0 - alpha))
-    return blend(r) * 65536 + blend(g) * 256 + blend(b)
+    if t <= 0:
+        return 2                       # 实心不透明
+    if t <= 0.33:
+        return 15                      # 细斜线（低透明）
+    if t <= 0.66:
+        return 14                      # 对角点阵
+    if t <= 0.9:
+        return 13                      # 稀疏网格点
+    return 12                          # 稀疏大颗粒点（最透明）
 
 
 def hex_to_kml_color(color: Optional[str]) -> Optional[str]:
@@ -436,16 +438,21 @@ class LayerService:
                 if mif_fill is not None:
                     # MapInfo Brush (pattern, forecolor, backcolor)。GDAL 默认 pattern=1（无填充/透明），
                     # 保留会导致设置填充色仍显示空白 → 实心 pattern=2 使填充色生效。
-                    # MIF 无 alpha 通道，透明度用【颜色预混合】模拟（主流做法，连续平滑透明）：
-                    # blended = fill*alpha + white*(1-alpha)，alpha=1-opacity。
-                    # 始终实心 Brush(2, blended, backcolor)，透明度通过颜色变浅呈现，非纹理粒度。
-                    blended = preblend_mapinfo_color(fill_color, opacity)
-                    if blended is None:
-                        blended = mif_fill
-                    text = re.sub(
-                        r'Brush \((\d+),(\d+),(\d+)\)',
-                        lambda m: f'Brush (2,{blended},{m.group(3)})', text,
-                    )
+                    # MIF 无 alpha 通道，透明度用【稀疏大颗粒 pattern】模拟（官方规范：
+                    # pattern≥3 且省略 backcolor = 透明填充）。透明度越高颗粒越稀。
+                    pattern = mif_opacity_brush_pattern(opacity)
+                    if pattern == 2:
+                        # 不透明：实心 + 保留 backcolor
+                        text = re.sub(
+                            r'Brush \((\d+),(\d+),(\d+)\)',
+                            lambda m: f'Brush (2,{mif_fill},{m.group(3)})', text,
+                        )
+                    else:
+                        # 透明填充：稀疏 pattern + 省略 backcolor（Brush(pattern, fg)）
+                        text = re.sub(
+                            r'Brush \((\d+),(\d+),(\d+)\)',
+                            lambda m: f'Brush ({pattern},{mif_fill})', text,
+                        )
             out_path.write_text(text, encoding="gbk")
         elif output_format == "kml":
             text = out_path.read_text(encoding="utf-8", errors="replace")
