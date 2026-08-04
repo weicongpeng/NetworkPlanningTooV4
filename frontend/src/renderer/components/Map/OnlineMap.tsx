@@ -297,6 +297,7 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
   const captureMarkersRef = useRef<Array<any>>([]) // 抓取坐标标记数组
   const shadowLineRef = useRef<any>(null) // 测量预览虚线
   const shadowLabelRef = useRef<any>(null) // 测量预览标签
+  const measurementFinishTimeRef = useRef<number>(0) // 双击结束测量时间戳防抖（500ms 内重复触发忽略）
 
   // 框选功能状态
   const selectionShapeRef = useRef<L.Circle | L.Polygon | L.FeatureGroup | null>(null) // 框选形状（支持多选时使用FeatureGroup）
@@ -1903,6 +1904,12 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
       const newPoint = { lng: latLng.lng, lat: latLng.lat }
       // 使用 ref 获取最新的点数据，避免双击时闭包值过期
       const currentMeasurePoints = measurePointsRef.current
+      // 源头去抖：双击时 Leaflet 触发两次 click，第二次 click 与上一次坐标几乎一致，
+      // 丢弃重复点，避免生成含重复顶点的测量线和重复测量结果
+      const lastPt = currentMeasurePoints[currentMeasurePoints.length - 1]
+      if (lastPt && Math.abs(lastPt.lat - latLng.lat) < 0.00001 && Math.abs(lastPt.lng - latLng.lng) < 0.00001) {
+        return
+      }
       const updatedPoints = [...currentMeasurePoints, newPoint]
       setMeasurePoints(updatedPoints)
       measurePointsRef.current = updatedPoints // 立即更新 ref 供 mousemove 使用
@@ -1974,6 +1981,11 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
    * 结束当前测距
    */
   const finishMeasurement = useCallback(() => {
+    // 时间戳防抖：双击结束测量后 500ms 内的重复触发（误触/连续双击）忽略，避免生成重复测量结果
+    const now = Date.now()
+    if (now - measurementFinishTimeRef.current < 500) return
+    measurementFinishTimeRef.current = now
+
     // 使用 ref 获取最新的点数据，避免双击时闭包值过期
     const currentPoints = measurePointsRef.current
     if (!mapInstanceRef.current || currentPoints.length < 2) return
@@ -1995,6 +2007,9 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
         if (redundantLabel) map.removeLayer(redundantLabel)
         const redundantMarker = measurementMarkersRef.current.pop()
         if (redundantMarker) map.removeLayer(redundantMarker)
+        // 移除最后一条含重复点的测量线（它包含重复顶点，否则结束点附近残留轨迹）
+        const redundantLine = measurementLinesRef.current.pop()
+        if (redundantLine) map.removeLayer(redundantLine)
       }
     }
 
@@ -3220,6 +3235,16 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
           try { map.removeLayer(marker) } catch (e) { /* ignore */ }
         })
         searchMarkerRef.current = []
+
+        // 5. 清理框选图形（圆形/多边形/矩形框选、拖拽预览），避免跨页面残留且切回后无法清除
+        ;[selectionShapeRef, selectionRectRef, polygonTempLayerRef, dragPreviewRectRef, dragPreviewCircleRef].forEach(ref => {
+          try { if (ref.current) map.removeLayer(ref.current) } catch (e) { /* ignore */ }
+          ref.current = null
+        })
+        selectionStartPointRef.current = null
+        selectionPointsRef.current = []
+        selectionDrawingRef.current = false
+        pointModeIsDragging.current = false
 
         // === 步骤二：缓存地图实例（瓦片图层保持存活，仅移除数据图层） ===
         if (tileLayerRef.current) {
