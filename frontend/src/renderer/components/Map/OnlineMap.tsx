@@ -1904,11 +1904,16 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
       const newPoint = { lng: latLng.lng, lat: latLng.lat }
       // 使用 ref 获取最新的点数据，避免双击时闭包值过期
       const currentMeasurePoints = measurePointsRef.current
-      // 源头去抖：双击时 Leaflet 触发两次 click，第二次 click 与上一次坐标几乎一致，
-      // 丢弃重复点，避免生成含重复顶点的测量线和重复测量结果
+      // 源头去抖：双击时 Leaflet 触发两次 click，第二次 click 与上一次坐标几乎一致。
+      // 使用像素距离判断（而非坐标绝对值）：双击两次 click 落在同一像素位置，
+      // 但坐标转换可能因鼠标微抖有微小差异，像素距离能可靠识别重复点击
       const lastPt = currentMeasurePoints[currentMeasurePoints.length - 1]
-      if (lastPt && Math.abs(lastPt.lat - latLng.lat) < 0.00001 && Math.abs(lastPt.lng - latLng.lng) < 0.00001) {
-        return
+      if (lastPt) {
+        const lastPoint = map.latLngToContainerPoint([lastPt.lat, lastPt.lng])
+        const newPointPx = map.latLngToContainerPoint([latLng.lat, latLng.lng])
+        if (lastPoint.distanceTo(newPointPx) < 8) {
+          return // 8 像素内的重复点击（双击第二次 click），丢弃
+        }
       }
       const updatedPoints = [...currentMeasurePoints, newPoint]
       setMeasurePoints(updatedPoints)
