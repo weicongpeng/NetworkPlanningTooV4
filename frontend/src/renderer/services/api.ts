@@ -1115,6 +1115,70 @@ export const layerToolsApi = {
   },
 }
 
+// ===== 批量距离匹配 =====
+export interface DistanceMatchParseError {
+  sheet: string
+  row: number
+  reason: string
+}
+
+export interface DistanceMatchParseResult {
+  success: boolean
+  data: {
+    match_total: number
+    full_total: number
+    errors: DistanceMatchParseError[]
+  }
+}
+
+export interface DistanceMatchResult {
+  success: boolean
+  data: {
+    filename: string
+    download_url: string
+    errors?: DistanceMatchParseError[]
+  }
+}
+
+export const distanceMatchApi = {
+  // 解析 + 校验清单
+  parse: async (filePath: string): Promise<DistanceMatchParseResult> => {
+    const formData = new FormData()
+    formData.append('file_path', filePath)
+    const res = await uploadClient.post('/distance-match/parse', formData)
+    return res.data
+  },
+
+  // 执行匹配（全量站点：上传文件 或 数据管理工参，二选一）
+  match: async (params: {
+    matchFilePath: string
+    maxDistanceKm: number
+    fullFilePath?: string
+    fullDataId?: string
+    fullNetworkType?: 'LTE' | 'NR'
+    fullNameCol?: string
+    fullLonCol?: string
+    fullLatCol?: string
+  }): Promise<DistanceMatchResult> => {
+    const formData = new FormData()
+    formData.append('match_file_path', params.matchFilePath)
+    formData.append('max_distance_km', String(params.maxDistanceKm))
+    if (params.fullFilePath) formData.append('full_file_path', params.fullFilePath)
+    if (params.fullDataId) {
+      formData.append('full_data_id', params.fullDataId)
+      formData.append('full_network_type', params.fullNetworkType || 'LTE')
+      formData.append('full_name_col', params.fullNameCol || '')
+      formData.append('full_lon_col', params.fullLonCol || '')
+      formData.append('full_lat_col', params.fullLatCol || '')
+    }
+    const res = await uploadClient.post('/distance-match/match', formData)
+    return res.data
+  },
+
+  // 模板下载 URL
+  templateUrl: '/api/v1/distance-match/template',
+}
+
 /**
  * 🔥 后端连接状态管理
  * 提供健康检查轮询和连接状态通知，以便前端组件可以响应后端掉线
