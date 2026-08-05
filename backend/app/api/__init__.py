@@ -117,6 +117,23 @@ async def lifespan(app: FastAPI):
         else:
             logger.info("✅ layer_tmp 临时文件检查完成，无过期文件")
 
+    # 🧹 清理 distance_tmp 中超过 24h 的临时文件（批量距离匹配上传的清单残留）
+    _distance_tmp = settings.UPLOAD_DIR / "distance_tmp"
+    if _distance_tmp.exists():
+        now = time.time()
+        removed = 0
+        for f in _distance_tmp.glob("src_*"):
+            try:
+                if now - f.stat().st_mtime > 86400:  # 24h
+                    f.unlink(missing_ok=True)
+                    removed += 1
+            except Exception:
+                pass
+        if removed:
+            logger.info(f"✅ 已清理 {removed} 个过期 distance_tmp 临时文件")
+        else:
+            logger.info("✅ distance_tmp 临时文件检查完成，无过期文件")
+
     # 初始化用户数据库
     try:
         from app.core.database import init_db, create_default_admin

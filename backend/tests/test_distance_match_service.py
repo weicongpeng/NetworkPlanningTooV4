@@ -259,7 +259,7 @@ def test_normalize_columns_missing_required():
 def test_build_output_filename_format():
     import re
     name = build_output_filename()
-    assert re.match(r"^匹配结果\d{8}_\d{6}\.xlsx$", name), f"实际 {name}"
+    assert re.match(r"^匹配结果\d{8}_\d{12}\.xlsx$", name), f"实际 {name}"
 
 
 def test_load_full_params_from_data_invalid_id(monkeypatch):

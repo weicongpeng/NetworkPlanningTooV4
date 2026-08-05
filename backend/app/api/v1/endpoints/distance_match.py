@@ -14,34 +14,24 @@ from app.services.distance_match_service import (
     build_output_filename,
     load_full_params_from_data,
     match_sites,
+    read_full_sheet_only,
     read_match_file,
     validate_all,
 )
 
 router = APIRouter()
 
-ALLOWED_EXTS = {".xlsx", ".xls", ".csv", ".txt"}
+# 仅支持 Excel 多 sheet 格式（calamine 引擎不支持 CSV/TXT）
+ALLOWED_EXTS = {".xlsx", ".xls"}
 
 TEMPLATE_FILENAME = "站点匹配清单-模板.xlsx"
-
-
-def _resolve_template_path() -> Path:
-    """定位模板文件：优先 settings.TEMPLATE_DIR，兼容 Task 0 提交到 backend/template 的位置。"""
-    candidates = [
-        settings.TEMPLATE_DIR / TEMPLATE_FILENAME,
-        Path(settings.TEMPLATE_DIR).parent / "backend" / "template" / TEMPLATE_FILENAME,
-    ]
-    for p in candidates:
-        if p.is_file():
-            return p
-    raise HTTPException(status_code=404, detail="模板文件不存在")
 
 
 def _save_upload_file(file: UploadFile) -> str:
     """保存上传文件到临时目录，返回路径。调用方 finally 删除。"""
     suffix = Path(file.filename or "list.xlsx").suffix.lower()
     if suffix not in ALLOWED_EXTS:
-        raise HTTPException(status_code=400, detail="仅支持 Excel/CSV/TXT 文件")
+        raise HTTPException(status_code=400, detail="仅支持 Excel 文件（.xlsx/.xls）")
     tmp_dir = settings.UPLOAD_DIR / "distance_tmp"
     tmp_dir.mkdir(parents=True, exist_ok=True)
     dest = tmp_dir / f"src_{datetime.now().strftime('%Y%m%d%H%M%S%f')}{suffix}"
@@ -128,8 +118,8 @@ async def match(
             full_path = full_file_path.strip("\"'")
             if not Path(full_path).is_file():
                 raise HTTPException(status_code=400, detail=f"全量站点文件不存在: {Path(full_path).name}")
-            full_sheets = await run_in_threadpool(read_match_file, full_path)
-            full_df = full_sheets["全量站点"]
+            # 全量站点工参只要求「全量站点」sheet（不要求「匹配站点」sheet）
+            full_df = await run_in_threadpool(read_full_sheet_only, full_path)
         elif full_data_id:
             if not (full_name_col and full_lon_col and full_lat_col):
                 raise HTTPException(status_code=400, detail="从数据管理读取全量站点需提供列映射")
@@ -169,7 +159,9 @@ async def match(
 @router.get("/template")
 async def template(current_user=Depends(require_data_import)):
     """下载站点匹配清单模板"""
-    template_path = _resolve_template_path()
+    template_path = settings.TEMPLATE_DIR / TEMPLATE_FILENAME
+    if not template_path.is_file():
+        raise HTTPException(status_code=404, detail="模板文件不存在")
     return FileResponse(
         path=str(template_path),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",

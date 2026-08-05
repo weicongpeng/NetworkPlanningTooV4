@@ -64,6 +64,22 @@ def read_match_file(file_path: str) -> Dict[str, pd.DataFrame]:
     return result
 
 
+def read_full_sheet_only(file_path: str) -> pd.DataFrame:
+    """读取仅含「全量站点」sheet 的全量站点 Excel，归一化列名。
+    用于 full_file_path 分支（合法的全量站点工参可能不含「匹配站点」sheet）。
+    缺 sheet 或缺列抛 ValueError。"""
+    try:
+        xls = pd.ExcelFile(file_path, engine="calamine")
+    except ImportError:
+        # calamine 未安装时回退到默认引擎（openpyxl，仅支持 .xlsx）
+        xls = pd.ExcelFile(file_path)
+    sheets = {s.strip(): s for s in xls.sheet_names}
+    if "全量站点" not in sheets:
+        raise ValueError("缺少工作表: 全量站点")
+    df = pd.read_excel(xls, sheet_name=sheets["全量站点"])
+    return _normalize_columns(df)
+
+
 def validate_sheet(df: pd.DataFrame, sheet_name: str) -> List[Dict[str, object]]:
     """校验经纬度格式/有效性/CELL 非空，返回 [{sheet,row,reason}]"""
     errors: List[Dict[str, object]] = []
@@ -201,9 +217,9 @@ def build_output_excel(
 
 
 def build_output_filename() -> str:
-    """返回 匹配结果{YYYYMMDD_HHMMSS}.xlsx"""
+    """返回 匹配结果{YYYYMMDD_HHMMSSffffff}.xlsx（含微秒，避免同秒并发碰撞）"""
     from datetime import datetime
-    return f"匹配结果{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    return f"匹配结果{datetime.now().strftime('%Y%m%d_%H%M%S%f')}.xlsx"
 
 
 def load_full_params_from_data(
