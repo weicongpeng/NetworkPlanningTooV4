@@ -1,7 +1,8 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { useTranslation } from 'react-i18next'
 import { FileUp, Loader2, Download, CheckCircle2, AlertCircle, Ruler, UploadCloud } from 'lucide-react'
 import { distanceMatchApi, dataApi, layerToolsApi } from '../services/api'
+import { uploadStore } from '../store/uploadStore'
 
 type FullSource = 'upload' | 'data'
 
@@ -30,11 +31,41 @@ export default function DistanceMatchPage() {
   const [maxDistanceKm, setMaxDistanceKm] = useState('')
 
   // ===== 状态 =====
-  const [uploading, setUploading] = useState(false)
   const [matching, setMatching] = useState(false)
   const [parseErrors, setParseErrors] = useState<ParseError[]>([])
   const [result, setResult] = useState<{ filename: string; download_url: string } | null>(null)
   const [error, setError] = useState('')
+
+  // ===== 模块级上传进度（chunkedUpload 后台更新，切页不丢失）=====
+  const [uploadProgress, setUploadProgress] = useState(uploadStore.get())
+  useEffect(() => uploadStore.subscribe(setUploadProgress), [])
+  const uploading = uploadProgress.active
+
+  // 列加载请求序号（防过期响应）：切换数据文件时旧请求返回后丢弃
+  const colReqRef = useRef(0)
+  // 记录上次自动预选的数据文件 id：切换网络类型（文件未变）时保留用户手动映射
+  const autoPickFileRef = useRef('')
+
+  const resetMapping = () => { setNameCol(''); setLonCol(''); setLatCol('') }
+
+  // 按 GeoFieldDetector 同源规则自动预选列映射
+  const autoPick = (cols: string[]) => {
+    const pick = (patterns: string[]) => {
+      const lower = cols.map(c => c.toLowerCase())
+      for (const p of patterns) {
+        const idx = lower.indexOf(p.toLowerCase())
+        if (idx >= 0) return cols[idx]
+      }
+      for (const p of patterns) {
+        const idx = lower.findIndex(c => c.includes(p.toLowerCase()))
+        if (idx >= 0) return cols[idx]
+      }
+      return ''
+    }
+    setNameCol(pick(['cell_name', 'sector_name', 'name', 'cellname', '小区名称', '小区名']) || cols[0] || '')
+    setLonCol(pick(['longitude', 'lon', 'long', '经度']) || '')
+    setLatCol(pick(['latitude', 'lat', '纬度']) || '')
+  }
 
   // 数据管理下拉加载（excel + ready，默认高亮全量工参）
   useEffect(() => {
@@ -49,51 +80,83 @@ export default function DistanceMatchPage() {
     }).catch(() => setError(t('distanceMatch.loadDataErr') || '加载数据列表失败'))
   }, [])
 
-  // 数据文件 → 列加载 + 自动预选
+  // 数据文件 → 列加载 + 自动预选（防竞态 + 网络类型切换不清空手动映射）
   useEffect(() => {
-    if (!fullDataId) { setColumns([]); return }
+    if (!fullDataId) {
+      setColumns([]); resetMapping(); autoPickFileRef.current = ''
+      return
+    }
+    const reqId = ++colReqRef.current
+    const fileChanged = autoPickFileRef.current !== fullDataId
     dataApi.getColumns(fullDataId, networkType).then(res => {
+      if (reqId !== colReqRef.current) return // 过期响应，忽略
       if (res.success && res.data?.columns) {
         const cols = res.data.columns
         setColumns(cols)
-        const pick = (patterns: string[]) => {
-          const lower = cols.map(c => c.toLowerCase())
-          for (const p of patterns) {
-            const idx = lower.indexOf(p.toLowerCase())
-            if (idx >= 0) return cols[idx]
+        if (fileChanged) {
+          // 数据文件切换：全量自动预选
+          autoPick(cols)
+          autoPickFileRef.current = fullDataId
+        } else {
+          // 网络类型切换（数据文件未变）：保留用户手动映射，仅清理已不存在的列
+          const nextName = nameCol && cols.includes(nameCol) ? nameCol : ''
+          const nextLon = lonCol && cols.includes(lonCol) ? lonCol : ''
+          const nextLat = latCol && cols.includes(latCol) ? latCol : ''
+          if (!nextName && !nextLon && !nextLat) {
+            autoPick(cols)
+            autoPickFileRef.current = fullDataId
+          } else {
+            setNameCol(nextName); setLonCol(nextLon); setLatCol(nextLat)
           }
-          for (const p of patterns) {
-            const idx = lower.findIndex(c => c.includes(p.toLowerCase()))
-            if (idx >= 0) return cols[idx]
-          }
-          return ''
         }
-        setNameCol(pick(['cell_name', 'sector_name', 'name', 'cellname', '小区名称', '小区名']) || cols[0] || '')
-        setLonCol(pick(['longitude', 'lon', 'long', '经度']) || '')
-        setLatCol(pick(['latitude', 'lat', '纬度']) || '')
+      } else {
+        setColumns([]); resetMapping()
       }
-    }).catch(() => setColumns([]))
+    }).catch(() => {
+      if (reqId === colReqRef.current) { setColumns([]); resetMapping() }
+    })
   }, [fullDataId, networkType])
 
   const handleMatchFile = async (f: File) => {
-    setUploading(true); setParseErrors([]); setError(''); setResult(null)
+    setParseErrors([]); setError(''); setResult(null)
+    uploadStore._set({ active: true, percent: 1, step: 'uploading', sessionId: '', fileName: f.name })
     try {
       const up = await layerToolsApi.uploadLayerFile(f)
       setMatchFilePath(up.file_path)
       setMatchFileName(f.name)
+      // 导入时校验（设计 §4）：/parse 校验失败 → 错误明细立即展示
+      uploadStore._set({ active: true, percent: 100, step: 'reading', sessionId: '', fileName: f.name })
+      try {
+        const parseRes = await distanceMatchApi.parse(up.file_path)
+        if (parseRes.data?.errors?.length) {
+          setParseErrors(parseRes.data.errors)
+        }
+      } catch (parseErr: any) {
+        setError(parseErr?.message || String(parseErr))
+      }
     } catch (e: any) {
+      if (e?.message === '已取消') {
+        uploadStore._set({ active: false, step: '', sessionId: '', fileName: '' })
+        return
+      }
       setError(e?.message || String(e))
-    } finally { setUploading(false) }
+    } finally { uploadStore._set({ active: false }) }
   }
 
   const handleFullFile = async (f: File) => {
-    setUploading(true); setError('')
+    setParseErrors([]); setError(''); setResult(null)
+    uploadStore._set({ active: true, percent: 1, step: 'uploading', sessionId: '', fileName: f.name })
     try {
       const up = await layerToolsApi.uploadLayerFile(f)
       setFullFilePath(up.file_path)
       setFullFileName(f.name)
-    } catch (e: any) { setError(e?.message || String(e)) }
-    finally { setUploading(false) }
+    } catch (e: any) {
+      if (e?.message === '已取消') {
+        uploadStore._set({ active: false, step: '', sessionId: '', fileName: '' })
+        return
+      }
+      setError(e?.message || String(e))
+    } finally { uploadStore._set({ active: false }) }
   }
 
   const handleMatch = async () => {
@@ -123,9 +186,15 @@ export default function DistanceMatchPage() {
         setError(t('distanceMatch.errUnknown') || '匹配失败，请重试')
       }
     } catch (e: any) {
-      const detail = e?.response?.data?.detail
-      setError(typeof detail === 'string' ? detail : (e?.message || String(e)))
+      setError(e?.message || String(e))
     } finally { setMatching(false) }
+  }
+
+  const progressText = () => {
+    if (!uploadProgress.active) return ''
+    if (uploadProgress.step === 'uploading') return t('layer.uploading').replace('{percent}', String(uploadProgress.percent))
+    if (uploadProgress.step === 'reading') return t('layer.reading')
+    return t('layer.done')
   }
 
   return (
@@ -152,6 +221,22 @@ export default function DistanceMatchPage() {
             onChange={e => { const f = e.target.files?.[0]; if (f) handleMatchFile(f) }} disabled={uploading} />
         </label>
 
+        {/* 上传进度条 + 状态 + 取消（模块级 uploadStore：切页不丢失） */}
+        {uploading && uploadProgress.percent > 0 && (
+          <div className="mt-2">
+            <div className="h-2 bg-muted rounded-full overflow-hidden">
+              <div className="h-full bg-primary transition-all duration-300" style={{ width: `${uploadProgress.percent}%` }} />
+            </div>
+            <div className="flex items-center justify-between mt-1">
+              <p className="text-xs text-muted-foreground">{progressText()}</p>
+              <button type="button" onClick={() => uploadStore.cancel()}
+                className="text-xs text-muted-foreground hover:text-red-500 underline underline-offset-2 transition-colors">
+                {t('layer.cancelUpload')}
+              </button>
+            </div>
+          </div>
+        )}
+
         <div className="mt-4">
           <p className="text-xs font-medium mb-2">{t('distanceMatch.fullSource')}</p>
           <div className="flex gap-4">
@@ -175,37 +260,37 @@ export default function DistanceMatchPage() {
           ) : (
             <div className="mt-2 grid grid-cols-2 gap-4">
               <div>
-                <label className="block text-xs font-medium mb-1">{t('distanceMatch.dataFile')}</label>
-                <select value={fullDataId} onChange={e => setFullDataId(e.target.value)}
+                <label htmlFor="dm-data-file" className="block text-xs font-medium mb-1">{t('distanceMatch.dataFile')}</label>
+                <select id="dm-data-file" value={fullDataId} onChange={e => setFullDataId(e.target.value)}
                   className="w-full h-9 px-2 text-sm border border-border rounded bg-card">
                   {dataItems.map(d => <option key={d.id} value={d.id}>{d.name}</option>)}
                 </select>
               </div>
               <div>
-                <label className="block text-xs font-medium mb-1">{t('distanceMatch.networkType')}</label>
-                <select value={networkType} onChange={e => setNetworkType(e.target.value as 'LTE' | 'NR')}
+                <label htmlFor="dm-network-type" className="block text-xs font-medium mb-1">{t('distanceMatch.networkType')}</label>
+                <select id="dm-network-type" value={networkType} onChange={e => setNetworkType(e.target.value as 'LTE' | 'NR')}
                   className="w-full h-9 px-2 text-sm border border-border rounded bg-card">
                   <option value="LTE">LTE</option>
                   <option value="NR">NR</option>
                 </select>
               </div>
               <div>
-                <label className="block text-xs font-medium mb-1">{t('distanceMatch.nameCol')}</label>
-                <select value={nameCol} onChange={e => setNameCol(e.target.value)}
+                <label htmlFor="dm-name-col" className="block text-xs font-medium mb-1">{t('distanceMatch.nameCol')}</label>
+                <select id="dm-name-col" value={nameCol} onChange={e => setNameCol(e.target.value)}
                   className="w-full h-9 px-2 text-sm border border-border rounded bg-card">
                   {columns.map(c => <option key={c} value={c}>{c}</option>)}
                 </select>
               </div>
               <div>
-                <label className="block text-xs font-medium mb-1">{t('distanceMatch.lonCol')}</label>
-                <select value={lonCol} onChange={e => setLonCol(e.target.value)}
+                <label htmlFor="dm-lon-col" className="block text-xs font-medium mb-1">{t('distanceMatch.lonCol')}</label>
+                <select id="dm-lon-col" value={lonCol} onChange={e => setLonCol(e.target.value)}
                   className="w-full h-9 px-2 text-sm border border-border rounded bg-card">
                   {columns.map(c => <option key={c} value={c}>{c}</option>)}
                 </select>
               </div>
               <div>
-                <label className="block text-xs font-medium mb-1">{t('distanceMatch.latCol')}</label>
-                <select value={latCol} onChange={e => setLatCol(e.target.value)}
+                <label htmlFor="dm-lat-col" className="block text-xs font-medium mb-1">{t('distanceMatch.latCol')}</label>
+                <select id="dm-lat-col" value={latCol} onChange={e => setLatCol(e.target.value)}
                   className="w-full h-9 px-2 text-sm border border-border rounded bg-card">
                   {columns.map(c => <option key={c} value={c}>{c}</option>)}
                 </select>
@@ -219,8 +304,8 @@ export default function DistanceMatchPage() {
       <div className="mb-6 p-4 bg-card border border-border rounded-lg">
         <p className="text-xs font-medium mb-3">{t('distanceMatch.params')}</p>
         <div className="max-w-xs">
-          <label className="block text-xs font-medium mb-1">{t('distanceMatch.maxDistance')} (km)</label>
-          <input value={maxDistanceKm} inputMode="decimal"
+          <label htmlFor="dm-max-distance" className="block text-xs font-medium mb-1">{t('distanceMatch.maxDistance')} (km)</label>
+          <input id="dm-max-distance" value={maxDistanceKm} inputMode="decimal"
             onChange={e => { if (/^\d*\.?\d*$/.test(e.target.value)) setMaxDistanceKm(e.target.value) }}
             placeholder="1.0" className="w-full h-9 px-2 text-sm border border-border rounded bg-card" />
         </div>
