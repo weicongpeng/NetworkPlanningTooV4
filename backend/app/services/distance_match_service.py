@@ -195,22 +195,29 @@ def build_output_excel(
     results: List[tuple],
     unmatched: List[str],
 ) -> str:
-    """生成输出 xlsx（8 列），返回 out_path。匹配站点全部保留，无命中行备注。"""
+    """生成输出 xlsx（8 列），返回 out_path。匹配站点全部保留，无命中行备注。
+    输出按 match_df 行序交错排列：每行先输出命中结果，无命中则输出备注行。"""
     wb = Workbook()
     ws = wb.active
     ws.title = "匹配结果"
     ws.append(OUTPUT_COLUMNS)
 
-    # unmatched 与 match_sites 返回的顺序一一对应（每行一个 CELL 追加），
-    # 因此可用 CELL 作 set 键判断哪些匹配站点未命中。若未来出现 CELL 重名，
-    # 需改为按行号/顺序对齐，而非依赖 CELL 唯一。
     unmatched_set = set(unmatched)
+    r_idx = 0  # results 中顺序指针（match_sites 按 match_df 行序产出，同行的命中连续）
     for _, row in match_df.iterrows():
         cell = row["CELL"]
+        # 输出该匹配站点的全部命中行（results 中连续属于它的行）
+        while r_idx < len(results) and results[r_idx][0] == cell:
+            ws.append(results[r_idx])
+            r_idx += 1
+        # 若无任何命中 → 备注行
         if cell in unmatched_set:
             ws.append([cell, row["LON"], row["LAT"], None, None, None, None, UNMATCHED_NOTE])
-    for (c1, lon1, lat1, c2, lon2, lat2, d) in results:
-        ws.append([c1, lon1, lat1, c2, lon2, lat2, d, None])
+
+    # 防御：results 末尾剩余（正常不会发生，保留以确保完整性）
+    while r_idx < len(results):
+        ws.append(results[r_idx])
+        r_idx += 1
 
     wb.save(out_path)
     return out_path

@@ -256,6 +256,62 @@ def test_normalize_columns_missing_required():
         _normalize_columns(raw)
 
 
+def test_build_output_excel_preserves_row_order():
+    """输出应按 match_df 行序交错：M1 命中 → M2 无命中 → M3 命中"""
+    match = _df([
+        {"CELL": "M1", "LON": 116.0, "LAT": 39.0},
+        {"CELL": "M2", "LON": 117.0, "LAT": 40.0},
+        {"CELL": "M3", "LON": 118.0, "LAT": 41.0},
+    ])
+    full = _df([
+        {"CELL": "F1", "LON": 116.001, "LAT": 39.0},   # M1 命中
+        {"CELL": "F2", "LON": 118.001, "LAT": 41.0},   # M3 命中
+    ])
+    results, unmatched = match_sites(match, full, max_distance_km=1.0)
+    assert unmatched == ["M2"]
+    assert len(results) == 2  # M1→F1, M3→F2
+
+    out = tempfile.mktemp(suffix=".xlsx")
+    build_output_excel(out, match, results, unmatched)
+    wb = load_workbook(out)
+    ws = wb["匹配结果"]
+    rows = [list(c.value for c in row) for row in ws.iter_rows(min_row=2, values_only=False)]
+    # 期望顺序：M1命中, M2无命中, M3命中
+    assert rows[0][0] == "M1" and rows[0][3] == "F1"  # M1→F1 命中
+    assert rows[1][0] == "M2" and rows[1][7] == "无匹站点匹配"  # M2 无命中
+    assert rows[2][0] == "M3" and rows[2][3] == "F2"  # M3→F2 命中
+    assert len(rows) == 3
+    os.unlink(out)
+
+
+def test_build_output_excel_multi_hit_one_row():
+    """同一匹配站点命中多个全量站点时，多行连续输出"""
+    match = _df([
+        {"CELL": "M1", "LON": 116.0, "LAT": 39.0},
+        {"CELL": "M2", "LON": 117.0, "LAT": 40.0},
+    ])
+    full = _df([
+        {"CELL": "F1", "LON": 116.0005, "LAT": 39.0},
+        {"CELL": "F2", "LON": 116.001, "LAT": 39.0},
+    ])
+    results, unmatched = match_sites(match, full, max_distance_km=1.0)
+    # M1 命中 F1+F2, M2 无命中
+    assert len(results) == 2
+    assert unmatched == ["M2"]
+
+    out = tempfile.mktemp(suffix=".xlsx")
+    build_output_excel(out, match, results, unmatched)
+    wb = load_workbook(out)
+    ws = wb["匹配结果"]
+    rows = [list(c.value for c in row) for row in ws.iter_rows(min_row=2, values_only=False)]
+    # 顺序：M1→F1, M1→F2, M2无命中
+    assert rows[0][0] == "M1" and rows[0][3] == "F1"
+    assert rows[1][0] == "M1" and rows[1][3] == "F2"
+    assert rows[2][0] == "M2" and rows[2][7] == "无匹站点匹配"
+    assert len(rows) == 3
+    os.unlink(out)
+
+
 def test_build_output_filename_format():
     import re
     name = build_output_filename()
