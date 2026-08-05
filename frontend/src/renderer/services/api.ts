@@ -1175,8 +1175,21 @@ export const distanceMatchApi = {
     return res.data
   },
 
-  // 模板下载 URL
-  templateUrl: '/api/v1/distance-match/template',
+  // 模板下载（带认证，blob 方式）
+  downloadTemplate: async (): Promise<void> => {
+    const res = await uploadClient.get('/distance-match/template', { responseType: 'blob' })
+    const blob = res.data
+    const url = window.URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = '站点匹配清单-模板.xlsx'
+    document.body.appendChild(link)
+    link.click()
+    setTimeout(() => {
+      document.body.removeChild(link)
+      window.URL.revokeObjectURL(url)
+    }, 100)
+  },
 }
 
 /**
