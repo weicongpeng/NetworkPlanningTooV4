@@ -3,7 +3,7 @@ API v1 路由
 """
 
 from fastapi import APIRouter
-from app.api.v1.endpoints import license, data, pci, neighbor, tac, map, geo_data, system, auth, admin_users, user_settings, websocket, app_versions, layer
+from app.api.v1.endpoints import license, data, pci, neighbor, tac, map, geo_data, system, auth, admin_users, user_settings, websocket, app_versions, layer, distance_match
 
 api_router = APIRouter()
 
@@ -22,3 +22,4 @@ api_router.include_router(admin_users.router, prefix="/admin/users", tags=["用�
 api_router.include_router(websocket.router, tags=["WebSocket实时通信"])
 api_router.include_router(app_versions.router, prefix="/app-versions", tags=["APP版本管理"])
 api_router.include_router(layer.router, prefix="/layer", tags=["图层制作"])
+api_router.include_router(distance_match.router, prefix="/distance-match", tags=["批量距离匹配"])
