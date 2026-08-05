@@ -90,13 +90,28 @@ def validate_all(match_df: pd.DataFrame, full_df: pd.DataFrame) -> List[Dict[str
 
 
 def haversine_km(lon1: float, lat1: float, lon2: float, lat2: float) -> float:
-    """Haversine 球面距离，返回 km"""
+    """Haversine 球面距离，返回 km（arctan2 形式，数值稳定）"""
     r = 6371.0
     phi1, phi2 = math.radians(lat1), math.radians(lat2)
     dphi = math.radians(lat2 - lat1)
     dlambda = math.radians(lon2 - lon1)
     a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
-    return 2 * r * math.asin(math.sqrt(a))
+    return 2 * r * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+def _haversine_np(
+    lon1: float, lat1: float,
+    lon2: np.ndarray, lat2: np.ndarray,
+) -> np.ndarray:
+    """numpy 向量化 haversine（arctan2 形式，数值稳定），返回 km 数组"""
+    r = 6371.0
+    lon1_r, lat1_r = math.radians(lon1), math.radians(lat1)
+    lon2_r = np.radians(lon2)
+    lat2_r = np.radians(lat2)
+    dphi = lat2_r - lat1_r
+    dlambda = lon2_r - lon1_r
+    a = np.sin(dphi / 2) ** 2 + np.cos(lat1_r) * np.cos(lat2_r) * np.sin(dlambda / 2) ** 2
+    return 2 * r * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
 
 
 def match_sites(
@@ -107,7 +122,7 @@ def match_sites(
     """返回 (results, unmatched)。
     results: [(匹配CELL, 匹配LON, 匹配LAT, 全量CELL, 全量LON, 全量LAT, 距离km), ...]
     unmatched: [匹配CELL, ...]（无命中）"""
-    if max_distance_km <= 0:
+    if not math.isfinite(max_distance_km) or max_distance_km <= 0:
         raise ValueError("相邻距离门限必须大于 0")
     match_df = match_df.copy()
     full_df = full_df.copy()
@@ -116,32 +131,45 @@ def match_sites(
     full_df["LON"] = pd.to_numeric(full_df["LON"], errors="coerce")
     full_df["LAT"] = pd.to_numeric(full_df["LAT"], errors="coerce")
 
-    full_lon = full_df["LON"].to_numpy()
-    full_lat = full_df["LAT"].to_numpy()
+    # 预筛候选数组 hoisting：避免每行标量访问 full_df
+    full_lon = full_df["LON"].to_numpy(dtype=float)
+    full_lat = full_df["LAT"].to_numpy(dtype=float)
     full_cell = full_df["CELL"].to_numpy()
+
+    dlat_deg = max_distance_km / 110.574  # 纬度跨度恒定
 
     results: List[tuple] = []
     unmatched: List[str] = []
     for _, row in match_df.iterrows():
         lon, lat, cell = row["LON"], row["LAT"], row["CELL"]
         if pd.isna(lon) or pd.isna(lat):
-            continue  # 校验已拦截，防御
-        dlat = max_distance_km / 110.574
-        dlon = max_distance_km / (111.320 * math.cos(math.radians(lat)))
+            # 校验应在上游拦截；此处不静默丢弃，违反“匹配站点全部出现”
+            raise ValueError("存在经纬度无效的匹配站点，请先校验数据")
+        # 经度跨度依赖 cos(lat)，clamp 到 epsilon 避免 |lat|=90 除零；仅扩大预筛超集
+        cos_lat = max(math.cos(math.radians(lat)), 1e-6)
+        dlon_deg = max_distance_km / (111.320 * cos_lat)
         mask = (
-            (full_lon >= lon - dlon) & (full_lon <= lon + dlon) &
-            (full_lat >= lat - dlat) & (full_lat <= lat + dlat)
+            (full_lon >= lon - dlon_deg) & (full_lon <= lon + dlon_deg) &
+            (full_lat >= lat - dlat_deg) & (full_lat <= lat + dlat_deg)
         )
         idxs = np.where(mask)[0]
-        hits = []
-        for j in idxs:
-            d = haversine_km(lon, lat, full_lon[j], full_lat[j])
-            if d <= max_distance_km:
-                hits.append((cell, lon, lat, full_cell[j], full_lon[j], full_lat[j], round(d, 4)))
-        if hits:
-            results.extend(hits)
-        else:
+        if idxs.size == 0:
             unmatched.append(cell)
+            continue
+        # 向量化 haversine：对全部候选一次算出距离，无 Python 内层循环
+        dists = _haversine_np(lon, lat, full_lon[idxs], full_lat[idxs])
+        keep = dists <= max_distance_km
+        if not np.any(keep):
+            unmatched.append(cell)
+            continue
+        sel_lon = full_lon[idxs[keep]]
+        sel_lat = full_lat[idxs[keep]]
+        sel_cell = full_cell[idxs[keep]]
+        sel_dist = np.round(dists[keep], 4)
+        results.extend(
+            (cell, lon, lat, c2, lo2, la2, float(d))
+            for c2, lo2, la2, d in zip(sel_cell, sel_lon, sel_lat, sel_dist)
+        )
     return results, unmatched
 
 
@@ -157,6 +185,9 @@ def build_output_excel(
     ws.title = "匹配结果"
     ws.append(OUTPUT_COLUMNS)
 
+    # unmatched 与 match_sites 返回的顺序一一对应（每行一个 CELL 追加），
+    # 因此可用 CELL 作 set 键判断哪些匹配站点未命中。若未来出现 CELL 重名，
+    # 需改为按行号/顺序对齐，而非依赖 CELL 唯一。
     unmatched_set = set(unmatched)
     for _, row in match_df.iterrows():
         cell = row["CELL"]

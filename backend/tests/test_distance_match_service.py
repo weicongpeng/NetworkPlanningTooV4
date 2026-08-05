@@ -3,13 +3,20 @@ import math
 import os
 import pandas as pd
 import tempfile
+import numpy as np
+import pytest
 from openpyxl import load_workbook
 
 from app.services.distance_match_service import (
     haversine_km,
     match_sites,
     validate_sheet,
+    validate_all,
     build_output_excel,
+    build_output_filename,
+    read_match_file,
+    _normalize_columns,
+    load_full_params_from_data,
 )
 
 
@@ -136,3 +143,160 @@ def test_build_output_excel_unmatched_row():
     assert row2[3] is None and row2[6] is None
     assert row2[7] == "无匹站点匹配"
     os.unlink(out)
+
+
+# ---------------------------------------------------------------------------
+# Minor 9 补充的边界 / 错误路径测试
+# ---------------------------------------------------------------------------
+
+
+def _write_match_xlsx(sheets: dict) -> str:
+    """把 {sheet名: DataFrame} 写入临时 .xlsx，返回路径"""
+    path = tempfile.mktemp(suffix=".xlsx")
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        for name, df in sheets.items():
+            df.to_excel(writer, sheet_name=name, index=False)
+    return path
+
+
+def test_validate_sheet_empty_lat():
+    df = _df([{"CELL": "A", "LON": 116.0, "LAT": None}])
+    errors = validate_sheet(df, "匹配站点")
+    assert len(errors) == 1
+    assert "纬度" in errors[0]["reason"]
+
+
+def test_validate_sheet_empty_lat_nan():
+    df = _df([{"CELL": "A", "LON": 116.0, "LAT": float("nan")}])
+    errors = validate_sheet(df, "匹配站点")
+    assert len(errors) == 1
+    assert "纬度" in errors[0]["reason"]
+
+
+def test_validate_all_covers_both_sheets():
+    match = _df([{"CELL": "M1", "LON": 116.0, "LAT": 39.0}])
+    full = _df([{"CELL": "F1", "LON": 999.0, "LAT": 39.0}])  # 经度越界
+    errors = validate_all(match, full)
+    assert len(errors) == 1
+    assert errors[0]["sheet"] == "全量站点"
+    assert "经度" in errors[0]["reason"]
+
+
+def test_match_sites_raises_on_nan_coordinate():
+    match = _df([{"CELL": "M1", "LON": float("nan"), "LAT": 39.0}])
+    full = _df([{"CELL": "F1", "LON": 116.0, "LAT": 39.0}])
+    with pytest.raises(ValueError, match="经纬度无效"):
+        match_sites(match, full, max_distance_km=1.0)
+
+
+def test_match_sites_raises_on_non_finite_threshold():
+    match = _df([{"CELL": "M1", "LON": 116.0, "LAT": 39.0}])
+    full = _df([{"CELL": "F1", "LON": 116.0, "LAT": 39.0}])
+    with pytest.raises(ValueError, match="大于 0"):
+        match_sites(match, full, max_distance_km=float("nan"))
+    with pytest.raises(ValueError, match="大于 0"):
+        match_sites(match, full, max_distance_km=0.0)
+
+
+def test_match_sites_lat90_boundary():
+    """lat=±90 不应除零崩溃；门限很小则应无命中（或正常命中）"""
+    match = _df([{"CELL": "M1", "LON": 0.0, "LAT": 90.0}])
+    full = _df([{"CELL": "F1", "LON": 0.5, "LAT": 89.999}])
+    results, unmatched = match_sites(match, full, max_distance_km=0.1)
+    # cos(90)=0 被 clamp 到 1e-6 → dlon 极大，但 dlat 门限仅 0.1km 极小，
+    # 候选先按纬度跨度（0.1/110.574 deg）预筛 → 89.999 与 90 差 0.001 deg ≈ 0.11km > 0.1km 门限
+    assert results == []
+    assert unmatched == ["M1"]
+    # 大范围门限则应命中且不崩溃
+    results2, unmatched2 = match_sites(match, full, max_distance_km=5.0)
+    assert len(results2) == 1
+    assert unmatched2 == []
+
+
+def test_read_match_file_missing_sheet():
+    path = _write_match_xlsx({"匹配站点": _df([{"CELL": "A", "LON": 116.0, "LAT": 39.0}])})
+    with pytest.raises(ValueError, match="全量站点"):
+        read_match_file(path)
+    os.unlink(path)
+
+
+def test_read_match_file_missing_column():
+    bad = pd.DataFrame([{"FOO": "A", "LON": 116.0, "LAT": 39.0}])  # 缺名称列（FOO 不在别名表）
+    path = _write_match_xlsx({
+        "匹配站点": _df([{"CELL": "A", "LON": 116.0, "LAT": 39.0}]),
+        "全量站点": bad,
+    })
+    with pytest.raises(ValueError, match="缺少必需列"):
+        read_match_file(path)
+    os.unlink(path)
+
+
+def test_read_match_file_ok():
+    path = _write_match_xlsx({
+        "匹配站点": _df([{"CELL": "M1", "LON": 116.0, "LAT": 39.0}]),
+        "全量站点": _df([{"CELL": "F1", "LON": 116.0, "LAT": 39.0}]),
+    })
+    result = read_match_file(path)
+    assert set(result.keys()) == {"匹配站点", "全量站点"}
+    assert list(result["匹配站点"].columns) == ["CELL", "LON", "LAT"]
+    os.unlink(path)
+
+
+def test_normalize_columns_alias_handling():
+    """小写/带空格/别名列名都能归一化到 CELL/LON/LAT"""
+    raw = pd.DataFrame([{" 经度 ": 116.0, " 纬度 ": 39.0, " 站点名称 ": "A"}])
+    out = _normalize_columns(raw)
+    assert list(out.columns) == ["CELL", "LON", "LAT"]
+    assert out.iloc[0].tolist() == ["A", 116.0, 39.0]
+
+
+def test_normalize_columns_missing_required():
+    raw = pd.DataFrame([{"LON": 116.0, "LAT": 39.0}])  # 缺名称列
+    with pytest.raises(ValueError, match="缺少必需列"):
+        _normalize_columns(raw)
+
+
+def test_build_output_filename_format():
+    import re
+    name = build_output_filename()
+    assert re.match(r"^匹配结果\d{8}_\d{6}\.xlsx$", name), f"实际 {name}"
+
+
+def test_load_full_params_from_data_invalid_id(monkeypatch):
+    """data_service.get_data 返回 None → ValueError"""
+    from app.services import data_service as ds_mod
+    monkeypatch.setattr(ds_mod.data_service, "get_data", lambda data_id: None)
+    with pytest.raises(ValueError, match="数据不存在"):
+        load_full_params_from_data("nope", "LTE", "CELL", "LON", "LAT")
+
+
+def test_load_full_params_from_data_non_dict(monkeypatch):
+    """get_data 返回非 dict → ValueError"""
+    from app.services import data_service as ds_mod
+    monkeypatch.setattr(ds_mod.data_service, "get_data", lambda data_id: ["not", "dict"])
+    with pytest.raises(ValueError, match="数据不存在"):
+        load_full_params_from_data("x", "LTE", "CELL", "LON", "LAT")
+
+
+def test_load_full_params_from_data_missing_network(monkeypatch):
+    from app.services import data_service as ds_mod
+    monkeypatch.setattr(ds_mod.data_service, "get_data", lambda data_id: {"NR": []})
+    with pytest.raises(ValueError, match="LTE"):
+        load_full_params_from_data("x", "LTE", "CELL", "LON", "LAT")
+
+
+def test_load_full_params_from_data_missing_column(monkeypatch):
+    from app.services import data_service as ds_mod
+    rows = [{"CELL": "A", "LON": 116.0, "LAT": 39.0}]
+    monkeypatch.setattr(ds_mod.data_service, "get_data", lambda data_id: {"LTE": rows})
+    with pytest.raises(ValueError, match="LATITUDE"):
+        load_full_params_from_data("x", "LTE", "CELL", "LON", "LATITUDE")
+
+
+def test_load_full_params_from_data_ok(monkeypatch):
+    from app.services import data_service as ds_mod
+    rows = [{"CELL": "A", "LON": 116.0, "LAT": 39.0}]
+    monkeypatch.setattr(ds_mod.data_service, "get_data", lambda data_id: {"LTE": rows})
+    df = load_full_params_from_data("x", "LTE", "CELL", "LON", "LAT")
+    assert list(df.columns) == ["CELL", "LON", "LAT"]
+    assert df.iloc[0].tolist() == ["A", 116.0, 39.0]
