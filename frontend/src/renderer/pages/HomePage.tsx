@@ -7,6 +7,7 @@ import {
   Map,
   Shield,
   Wrench,
+  Ruler,
   LucideIcon
 } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
@@ -68,6 +69,13 @@ export function HomePage() {
           icon={Wrench}
           link="/layer"
           iconColor="text-blue-600"
+        />
+        <FeatureCard
+          title={t('nav.distanceMatch')}
+          description={t('home.distanceMatchDesc')}
+          icon={Ruler}
+          link="/distance-match"
+          iconColor="text-emerald-600"
         />
         <FeatureCard
           title={t('nav.config')}

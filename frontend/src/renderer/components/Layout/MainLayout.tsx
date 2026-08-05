@@ -16,6 +16,7 @@ import {
   X,
   Loader2,
   Wrench,
+  Ruler,
 } from 'lucide-react'
 import { useState, useEffect } from 'react'
 import { useTranslation } from 'react-i18next'
@@ -59,6 +60,7 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
     },
     { type: 'link', name: t('nav.map'), href: '/map', icon: Map },
     { type: 'link', name: t('nav.layerTools'), href: '/layer', icon: Wrench },
+    { type: 'link', name: t('nav.distanceMatch'), href: '/distance-match', icon: Ruler },
     { type: 'link', name: t('nav.config'), href: '/license', icon: Shield },
     ...(isAuthenticated && user?.is_admin ? [
       { type: 'link' as const, name: t('admin.title', '用户管理'), href: '/admin/users', icon: Users },

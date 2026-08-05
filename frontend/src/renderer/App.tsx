@@ -10,6 +10,7 @@ import { TACPage } from './pages/TACPage'
 import { TACPlanningPage } from './pages/TACPlanningPage'
 import { LicensePage } from './pages/LicensePage'
 import LayerToolsPage from './pages/LayerToolsPage'
+import DistanceMatchPage from './pages/DistanceMatchPage'
 import { MapPage } from './pages/MapPage'
 import { AdminUsersPage } from './pages/AdminUsersPage'
 import { AppVersionsPage } from './pages/AppVersionsPage'
@@ -96,6 +97,14 @@ function App() {
               element={
                 <ProtectedRoute>
                   <LayerToolsPage />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/distance-match"
+              element={
+                <ProtectedRoute>
+                  <DistanceMatchPage />
                 </ProtectedRoute>
               }
             />

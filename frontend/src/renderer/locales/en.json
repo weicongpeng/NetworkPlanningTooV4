@@ -84,7 +84,8 @@
     "tools": "Utilities",
     "layerTools": "Layer Tools",
     "layerSector": "Sector Layer Tools",
-    "layerPoint": "Point Layer Tools"
+    "layerPoint": "Point Layer Tools",
+    "distanceMatch": "Batch Distance Match"
   },
   "home": {
     "title": "Network Planning Tool",
@@ -106,6 +107,7 @@
     "mapDesc": "View base station distribution",
     "configDesc": "Manage system configuration",
     "layerToolsDesc": "Create sector/point layers (tab/mif/kml) from params",
+    "distanceMatchDesc": "Batch-match sites by distance threshold",
     "backendService": "Backend Service",
     "database": "Database",
     "license": "License",
@@ -1053,5 +1055,34 @@
     "statsMore": "... and {count} more",
     "fileExpired": "File has expired, please re-import",
     "errNoFormat": "Please select at least one output format"
+  },
+  "distanceMatch": {
+    "fileImport": "File Import",
+    "templateDownload": "Download Template",
+    "matchFile": "Match Site List",
+    "fullSource": "Full Site Source",
+    "fullUpload": "Upload List File",
+    "fullData": "From Data Management",
+    "dataFile": "Data File",
+    "networkType": "Network Type",
+    "nameCol": "Site Name Column",
+    "lonCol": "Longitude Column",
+    "latCol": "Latitude Column",
+    "uploadHint": "Click or drag a file to upload",
+    "params": "Parameters",
+    "maxDistance": "Max Distance Threshold",
+    "start": "Start Matching",
+    "download": "Download Result",
+    "matchDone": "Matching complete, result ready to download",
+    "invalidData": "Invalid data detected, please fix and re-import:",
+    "sheet": "Sheet",
+    "row": "Row",
+    "reason": "Reason",
+    "more": "({count} more)",
+    "loadDataErr": "Failed to load data list",
+    "errNoFile": "Please import the match site list first",
+    "errThreshold": "Please enter a distance threshold greater than 0",
+    "errMapping": "Please select a data file and configure full column mapping",
+    "errUnknown": "Matching failed, please retry"
   }
 }

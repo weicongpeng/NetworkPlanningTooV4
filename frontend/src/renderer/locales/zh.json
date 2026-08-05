@@ -85,7 +85,8 @@
     "tools": "实用工具",
     "layerTools": "图层制作",
     "layerSector": "图层制作（扇区）",
-    "layerPoint": "图层制作（点）"
+    "layerPoint": "图层制作（点）",
+    "distanceMatch": "批量距离匹配"
   },
   "home": {
     "title": "网络规划工具",
@@ -107,6 +108,7 @@
     "mapDesc": "查看基站分布和覆盖",
     "configDesc": "管理系统配置",
     "layerToolsDesc": "根据工参文件制作扇区/点图层 (tab/mif/kml)",
+    "distanceMatchDesc": "按距离门限批量匹配站点",
     "backendService": "后端服务",
     "database": "数据库",
     "license": "许可证",
@@ -1064,5 +1066,34 @@
     "statsMore": "等共 {count} 条",
     "fileExpired": "文件已过期，请重新导入",
     "errNoFormat": "请至少选择一种输出格式"
+  },
+  "distanceMatch": {
+    "fileImport": "文件导入",
+    "templateDownload": "模版下载",
+    "matchFile": "匹配站点清单",
+    "fullSource": "全量站点来源",
+    "fullUpload": "上传清单文件",
+    "fullData": "从数据管理选择",
+    "dataFile": "数据文件",
+    "networkType": "网络类型",
+    "nameCol": "站点名称列",
+    "lonCol": "经度列",
+    "latCol": "纬度列",
+    "uploadHint": "点击或拖拽文件到此处上传",
+    "params": "参数设置",
+    "maxDistance": "相邻距离门限",
+    "start": "开始匹配",
+    "download": "下载匹配结果",
+    "matchDone": "匹配完成，可下载结果文件",
+    "invalidData": "导入数据存在异常，请调整后重新导入：",
+    "sheet": "工作表",
+    "row": "行号",
+    "reason": "原因",
+    "more": "（还有 {count} 条）",
+    "loadDataErr": "加载数据列表失败",
+    "errNoFile": "请先导入匹配站点清单",
+    "errThreshold": "请输入大于 0 的距离门限",
+    "errMapping": "请选择数据文件并配置完整列映射",
+    "errUnknown": "匹配失败，请重试"
   }
 }
