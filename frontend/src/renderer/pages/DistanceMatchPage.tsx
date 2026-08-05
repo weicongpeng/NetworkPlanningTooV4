@@ -160,7 +160,13 @@ export default function DistanceMatchPage() {
   }
 
   const handleMatch = async () => {
-    setError(''); setResult(null); setParseErrors([])
+    setError(''); setResult(null)
+    // 导入校验未通过时阻止匹配，提示用户修复后重新导入
+    if (parseErrors.length > 0) {
+      setError(t('distanceMatch.errFixImport') || '请先修复导入数据的异常后重新导入')
+      return
+    }
+    setParseErrors([])
     const km = parseFloat(maxDistanceKm)
     if (!matchFilePath) { setError(t('distanceMatch.errNoFile') || '请先导入匹配站点清单'); return }
     if (!(km > 0)) { setError(t('distanceMatch.errThreshold') || '请输入大于 0 的距离门限'); return }

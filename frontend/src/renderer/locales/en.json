@@ -1083,6 +1083,7 @@
     "errNoFile": "Please import the match site list first",
     "errThreshold": "Please enter a distance threshold greater than 0",
     "errMapping": "Please select a data file and configure full column mapping",
+    "errFixImport": "Please fix the import data issues and re-import first",
     "errUnknown": "Matching failed, please retry"
   }
 }
