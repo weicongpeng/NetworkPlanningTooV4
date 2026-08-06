@@ -241,3 +241,24 @@ def test_data_sheets_endpoint_excel(tmp_path, monkeypatch):
     assert body["success"] is True
     assert body["data"]["source"] == "excel"
     assert "LTE Project Parameters" in body["data"]["sheets"]
+
+
+def test_data_sheets_endpoint_not_found(monkeypatch):
+    """data-sheets 对不存在的 data_id 返回 400"""
+    client = _make_client()
+    from app.services import data_service as ds_mod
+    monkeypatch.setattr(ds_mod.data_service, "get_data", lambda data_id: None)
+    resp = client.post("/api/v1/distance-match/data-sheets", data={"data_id": "ghost"})
+    assert resp.status_code == 400
+
+
+def test_data_sheets_endpoint_metadata_only(monkeypatch):
+    """data-sheets 对 processing 元数据 dict 兜底返回默认网络分表"""
+    client = _make_client()
+    from app.services import data_service as ds_mod
+    monkeypatch.setattr(ds_mod.data_service, "get_data", lambda data_id: {"id": "x", "name": "y", "fileType": "full_params", "status": "processing"})
+    resp = client.post("/api/v1/distance-match/data-sheets", data={"data_id": "d1"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["data"]["source"] == "network"
+    assert set(body["data"]["sheets"]) == {"LTE", "NR"}

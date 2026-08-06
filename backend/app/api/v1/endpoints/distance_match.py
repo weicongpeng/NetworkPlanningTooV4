@@ -87,33 +87,24 @@ async def parse(
             Path(tmp).unlink(missing_ok=True)
 
 
-# 数据管理工参 dict 中的元数据键（网络分表键除外）
-METADATA_KEYS = {"id", "name", "fileType", "status", "errorMessage", "message"}
-
-
 @router.post("/data-sheets")
 async def data_sheets(
     data_id: str = Form(...),
     current_user=Depends(require_data_import),
 ):
-    """读取数据管理工参的 sheet 列表（数据管理来源的全量站点 sheet 下拉）"""
+    """返回数据管理工参原始 Excel 的真实 sheet 列表（缺失时兜底网络分表）"""
     try:
-        data_dir = settings.DATA_DIR / data_id
-        original = data_dir / "original.xlsx"
-        if original.is_file():
-            sheets, _ = await run_in_threadpool(read_data_sheets, str(original))
-            return {"success": True, "data": {"sheets": sheets, "source": "excel"}}
-        # 兜底：原始 Excel 缺失 → 网络分表键（data.json 已解析成 LTE/NR 分表）
-        from app.services.data_service import data_service
-        data = data_service.get_data(data_id)
-        if isinstance(data, dict):
-            keys = [k for k in data.keys() if isinstance(k, str) and k not in METADATA_KEYS]
-            if keys:
-                return {"success": True, "data": {"sheets": keys, "source": "network"}}
-        return {"success": True, "data": {"sheets": ["LTE", "NR"], "source": "network"}}
+        sheets, source = await run_in_threadpool(
+            read_data_sheets, str(settings.DATA_DIR / data_id / "original.xlsx")
+        )
+        return {"success": True, "data": {"sheets": sheets, "source": source}}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except HTTPException:
         raise
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"读取数据工作表失败: {str(e)}")
 
 

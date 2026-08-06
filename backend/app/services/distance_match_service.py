@@ -171,12 +171,15 @@ def read_data_sheets(excel_path: str) -> Tuple[List[str], str]:
     # 兜底：网络分表键（get_data 的 dict key）
     from app.services.data_service import data_service
     data = data_service.get_data(p.parent.name)
+    if data is None:
+        raise ValueError(f"数据不存在: {p.parent.name}")
     if isinstance(data, dict):
         keys = [k for k in data.keys() if isinstance(k, str) and k not in (
             "id", "name", "fileType", "status", "errorMessage", "message",
         )]
         if keys:
             return keys, "network"
+    # 数据存在但无网络分表键（如 processing/error 元数据），返回默认网络类型
     return ["LTE", "NR"], "network"
 
 
