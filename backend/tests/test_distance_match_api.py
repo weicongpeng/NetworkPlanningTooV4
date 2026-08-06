@@ -292,7 +292,7 @@ def test_match_by_sheet_upload():
         assert len(out_df) == 1
         assert out_df.iloc[0]["匹配站点名称"] == "M1"
         assert out_df.iloc[0]["全量站点名称"] == "F1"
-        assert "无匹站点匹配" not in str(out_df.iloc[0]["备注"])
+        assert "1.0km内无站点匹配" not in str(out_df.iloc[0]["备注"])
     finally:
         if os.path.exists(tmp):
             os.unlink(tmp)
@@ -353,6 +353,52 @@ def test_match_by_sheet_data_source(monkeypatch):
         )
         assert resp.status_code == 200
         assert resp.json()["success"] is True
+    finally:
+        for p in (tmp, dest, d1_dir):
+            if os.path.exists(p):
+                try:
+                    os.unlink(p)
+                except IsADirectoryError:
+                    os.rmdir(p)
+
+
+def test_match_by_sheet_data_source_fixed_cell_columns(monkeypatch):
+    """full_source=data 且不传列：工参文件固定索引 小区名称/小区经度/小区纬度（Req3）"""
+    import pathlib
+    tmp = tempfile.mktemp(suffix=".xlsx")
+    with pd.ExcelWriter(tmp) as w:
+        pd.DataFrame([{"CELL": "M1", "LON": 116.0, "LAT": 39.0}]).to_excel(w, sheet_name="匹配站点", index=False)
+    client = _make_client()
+    from app.services import distance_match_service as dms
+    original = tempfile.mktemp(suffix=".xlsx")
+    d1_dir = pathlib.Path(original).parent / "d1"
+    d1_dir.mkdir(exist_ok=True)
+    dest = d1_dir / "original.xlsx"
+    # 全量工参 sheet 用固定列：小区名称/小区经度/小区纬度
+    with pd.ExcelWriter(dest) as w:
+        pd.DataFrame([{"小区名称": "F1", "小区经度": 116.001, "小区纬度": 39.0}]).to_excel(
+            w, sheet_name="LTE Project Parameters", index=False)
+    monkeypatch.setattr(dms.settings, "DATA_DIR", pathlib.Path(original).parent)
+    try:
+        resp = client.post(
+            "/api/v1/distance-match/match",
+            data={
+                "max_distance_km": "1.0",
+                "file_path": tmp,
+                "match_sheet_name": "匹配站点",
+                "full_source": "data",
+                "full_data_id": "d1",
+                "full_sheet_name": "LTE Project Parameters",
+            },
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["success"] is True
+        # 输出应包含固定索引到的 F1 命中行
+        out_file = settings.OUTPUT_DIR / body["data"]["filename"]
+        out_df = pd.read_excel(out_file)
+        assert out_df.iloc[0]["匹配站点名称"] == "M1"
+        assert out_df.iloc[0]["全量站点名称"] == "F1"
     finally:
         for p in (tmp, dest, d1_dir):
             if os.path.exists(p):

@@ -166,7 +166,7 @@ async def match(
         settings.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         filename = build_output_filename()
         out_path = settings.OUTPUT_DIR / filename
-        await run_in_threadpool(build_output_excel, str(out_path), match_df, results, unmatched)
+        await run_in_threadpool(build_output_excel, str(out_path), match_df, results, unmatched, max_distance_km)
 
         return {"success": True, "data": {"filename": filename, "download_url": f"/static/{filename}"}}
     except HTTPException:

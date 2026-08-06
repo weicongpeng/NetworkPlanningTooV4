@@ -16,6 +16,7 @@ from app.services.distance_match_service import (
     build_output_filename,
     read_match_file,
     _normalize_columns,
+    _normalize_columns_prefer_cell,
     load_full_params_from_data,
 )
 
@@ -117,7 +118,7 @@ def test_build_output_excel_columns_and_unmatched():
     full = _df([{"CELL": "F1", "LON": 116.001, "LAT": 39.0}])
     results, unmatched = match_sites(match, full, max_distance_km=1.0)
     out = tempfile.mktemp(suffix=".xlsx")
-    build_output_excel(out, match, results, unmatched)
+    build_output_excel(out, match, results, unmatched, 1.0)
     wb = load_workbook(out)
     ws = wb["匹配结果"]
     headers = [c.value for c in ws[1]]
@@ -135,13 +136,26 @@ def test_build_output_excel_unmatched_row():
     full = _df([{"CELL": "F1", "LON": 116.5, "LAT": 39.5}])
     results, unmatched = match_sites(match, full, max_distance_km=1.0)
     out = tempfile.mktemp(suffix=".xlsx")
-    build_output_excel(out, match, results, unmatched)
+    build_output_excel(out, match, results, unmatched, 1.0)
     wb = load_workbook(out)
     ws = wb["匹配结果"]
     row2 = [c.value for c in ws[2]]
     assert row2[0] == "M1"
     assert row2[3] is None and row2[6] is None
-    assert row2[7] == "无匹站点匹配"
+    assert row2[7] == "1.0km内无站点匹配"
+    os.unlink(out)
+
+
+def test_build_output_excel_unmatched_note_shows_threshold():
+    """备注显示门限实际值：门限 2.0 → '2.0km内无站点匹配'"""
+    match = _df([{"CELL": "M1", "LON": 116.0, "LAT": 39.0}])
+    full = _df([{"CELL": "F1", "LON": 116.5, "LAT": 39.5}])
+    results, unmatched = match_sites(match, full, max_distance_km=2.0)
+    out = tempfile.mktemp(suffix=".xlsx")
+    build_output_excel(out, match, results, unmatched, 2.0)
+    wb = load_workbook(out)
+    ws = wb["匹配结果"]
+    assert ws[2][7].value == "2.0km内无站点匹配"
     os.unlink(out)
 
 
@@ -272,13 +286,13 @@ def test_build_output_excel_preserves_row_order():
     assert len(results) == 2  # M1→F1, M3→F2
 
     out = tempfile.mktemp(suffix=".xlsx")
-    build_output_excel(out, match, results, unmatched)
+    build_output_excel(out, match, results, unmatched, 1.0)
     wb = load_workbook(out)
     ws = wb["匹配结果"]
     rows = [list(c.value for c in row) for row in ws.iter_rows(min_row=2, values_only=False)]
     # 期望顺序：M1命中, M2无命中, M3命中
     assert rows[0][0] == "M1" and rows[0][3] == "F1"  # M1→F1 命中
-    assert rows[1][0] == "M2" and rows[1][7] == "无匹站点匹配"  # M2 无命中
+    assert rows[1][0] == "M2" and rows[1][7] == "1.0km内无站点匹配"  # M2 无命中
     assert rows[2][0] == "M3" and rows[2][3] == "F2"  # M3→F2 命中
     assert len(rows) == 3
     os.unlink(out)
@@ -300,14 +314,14 @@ def test_build_output_excel_multi_hit_one_row():
     assert unmatched == ["M2"]
 
     out = tempfile.mktemp(suffix=".xlsx")
-    build_output_excel(out, match, results, unmatched)
+    build_output_excel(out, match, results, unmatched, 1.0)
     wb = load_workbook(out)
     ws = wb["匹配结果"]
     rows = [list(c.value for c in row) for row in ws.iter_rows(min_row=2, values_only=False)]
     # 顺序：M1→F1, M1→F2, M2无命中
     assert rows[0][0] == "M1" and rows[0][3] == "F1"
     assert rows[1][0] == "M1" and rows[1][3] == "F2"
-    assert rows[2][0] == "M2" and rows[2][7] == "无匹站点匹配"
+    assert rows[2][0] == "M2" and rows[2][7] == "1.0km内无站点匹配"
     assert len(rows) == 3
     os.unlink(out)
 
@@ -392,7 +406,7 @@ def test_load_full_sites_from_data_sheet_fallback(monkeypatch, tmp_path):
     import pandas as pd
     monkeypatch.setattr(
         "app.services.distance_match_service.load_full_sites_from_data",
-        lambda data_id, net, nc, loc, lac: pd.DataFrame([{"CELL": "F1", "LON": 1.0, "LAT": 1.0}]),
+        lambda data_id, net, nc, loc, lac, prefer_cell=False: pd.DataFrame([{"CELL": "F1", "LON": 1.0, "LAT": 1.0}]),
     )
     df = load_full_sites_from_data_sheet("d1", "LTE", "CELL", "LON", "LAT")
     assert list(df.columns) == ["CELL", "LON", "LAT"]
@@ -428,3 +442,52 @@ def test_read_arbitrary_sheet_dedup(tmp_path):
     df = read_arbitrary_sheet(str(excel), "全量")
     assert len(df) == 1
     assert df.iloc[0]["LON"] == 1.0  # keep first
+
+
+# ---------------------------------------------------------------------------
+# 工参文件固定索引：_normalize_columns_prefer_cell（Req3）
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_columns_prefer_cell_prefers_cell_cols():
+    """同时含 基站经度/小区经度 → 优先小区经度"""
+    raw = pd.DataFrame([{"小区名称": "A", "基站经度": 116.0, "小区经度": 117.0,
+                         "基站纬度": 39.0, "小区纬度": 40.0}])
+    out = _normalize_columns_prefer_cell(raw)
+    assert list(out.columns) == ["CELL", "LON", "LAT"]
+    assert out.iloc[0].tolist() == ["A", 117.0, 40.0]
+
+
+def test_normalize_columns_prefer_cell_fallback_alias():
+    """无小区列 → 回退别名表"""
+    raw = pd.DataFrame([{"站点名称": "A", "基站经度": 116.0, "基站纬度": 39.0}])
+    out = _normalize_columns_prefer_cell(raw)
+    assert list(out.columns) == ["CELL", "LON", "LAT"]
+    assert out.iloc[0].tolist() == ["A", 116.0, 39.0]
+
+
+def test_normalize_columns_prefer_cell_missing():
+    """缺列抛 ValueError"""
+    raw = pd.DataFrame([{"LON": 116.0, "LAT": 39.0}])
+    with pytest.raises(ValueError, match="缺少必需列"):
+        _normalize_columns_prefer_cell(raw)
+
+
+def test_load_full_sites_from_data_sheet_prefers_cell(monkeypatch, tmp_path):
+    """工参文件路径强制 prefer_cell=True（透传到 read_arbitrary_sheet）"""
+    from app.services.distance_match_service import load_full_sites_from_data_sheet, settings as dms_settings
+    import app.services.distance_match_service as dms
+    data_dir = tmp_path / "d1"
+    data_dir.mkdir()
+    excel = data_dir / "original.xlsx"
+    with pd.ExcelWriter(excel) as w:
+        pd.DataFrame([{"小区名称": "F1", "小区经度": 116.0, "小区纬度": 39.0}]).to_excel(
+            w, sheet_name="LTE Project Parameters", index=False)
+    monkeypatch.setattr(dms_settings, "DATA_DIR", tmp_path)
+    kwargs_capture = {}
+    def _fake(*a, **kw):
+        kwargs_capture.update(kw)
+        return pd.DataFrame([{"CELL": "F1", "LON": 116.0, "LAT": 39.0}])
+    monkeypatch.setattr(dms, "read_arbitrary_sheet", _fake)
+    load_full_sites_from_data_sheet("d1", "LTE Project Parameters")
+    assert kwargs_capture.get("prefer_cell") is True

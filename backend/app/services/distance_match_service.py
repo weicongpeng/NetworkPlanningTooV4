@@ -16,8 +16,6 @@ OUTPUT_COLUMNS = [
     "全量站点名称", "全量站点经度", "全量站点纬度",
     "距离（km）", "备注",
 ]
-UNMATCHED_NOTE = "无匹站点匹配"
-
 # 校验常量
 LON_MIN, LON_MAX = -180.0, 180.0
 LAT_MIN, LAT_MAX = -90.0, 90.0
@@ -33,6 +31,39 @@ def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     name_col = next((cols.get(a.upper()) for a in NAME_ALIASES if a.upper() in cols), None)
     lon_col = next((cols.get(a.upper()) for a in LON_ALIASES if a.upper() in cols), None)
     lat_col = next((cols.get(a.upper()) for a in LAT_ALIASES if a.upper() in cols), None)
+    missing = []
+    if name_col is None:
+        missing.append("CELL")
+    if lon_col is None:
+        missing.append("LON")
+    if lat_col is None:
+        missing.append("LAT")
+    if missing:
+        raise ValueError(f"缺少必需列: {', '.join(missing)}")
+    out = df[[name_col, lon_col, lat_col]].copy()
+    out.columns = ["CELL", "LON", "LAT"]
+    return out
+
+
+# 工参文件固定索引列（优先精确匹配，缺失回退别名表）
+CELL_PREFERRED = "小区名称"
+LON_PREFERRED = "小区经度"
+LAT_PREFERRED = "小区纬度"
+
+
+def _normalize_columns_prefer_cell(df: pd.DataFrame) -> pd.DataFrame:
+    """列名归一化（工参文件路径）：优先精确匹配 小区名称/小区经度/小区纬度，
+    缺失时逐列回退别名表，仍缺列抛 ValueError。"""
+    cols = {str(c).strip().upper(): c for c in df.columns}
+    name_col = cols.get(CELL_PREFERRED.upper())
+    lon_col = cols.get(LON_PREFERRED.upper())
+    lat_col = cols.get(LAT_PREFERRED.upper())
+    if name_col is None:
+        name_col = next((cols.get(a.upper()) for a in NAME_ALIASES if a.upper() in cols), None)
+    if lon_col is None:
+        lon_col = next((cols.get(a.upper()) for a in LON_ALIASES if a.upper() in cols), None)
+    if lat_col is None:
+        lat_col = next((cols.get(a.upper()) for a in LAT_ALIASES if a.upper() in cols), None)
     missing = []
     if name_col is None:
         missing.append("CELL")
@@ -73,8 +104,11 @@ def read_arbitrary_sheet(
     name_col: str = None,
     lon_col: str = None,
     lat_col: str = None,
+    prefer_cell: bool = False,
 ) -> pd.DataFrame:
     """读取任意 sheet（匹配站点/全量站点通用）：按指定列映射或自动识别 CELL/LON/LAT。
+
+    prefer_cell=True 时（工参文件路径）优先精确匹配 小区名称/小区经度/小区纬度。
 
     支持数据管理全量工参的复杂表头：第 1 行为「中文名 + \\n 分隔元数据」（如
     '基站经度\\neNodeB Longitude double:[-180..180]'），第 2-3 行为描述文本
@@ -126,7 +160,7 @@ def read_arbitrary_sheet(
         out = df[[name_col, lon_col, lat_col]].copy()
         out.columns = ["CELL", "LON", "LAT"]
     else:
-        out = _normalize_columns(df)
+        out = _normalize_columns_prefer_cell(df) if prefer_cell else _normalize_columns(df)
 
     # 过滤无效行（CELL 空 / 经纬度非数值）+ 按 CELL 去重
     out["LON"] = pd.to_numeric(out["LON"], errors="coerce")
@@ -276,19 +310,27 @@ def match_sites(
     return results, unmatched
 
 
+def _format_unmatched_note(max_distance_km: float) -> str:
+    """无命中备注：显示门限实际值。如 1.0 → '1.0km内无站点匹配'"""
+    return f"{max_distance_km}km内无站点匹配"
+
+
 def build_output_excel(
     out_path: str,
     match_df: pd.DataFrame,
     results: List[tuple],
     unmatched: List[str],
+    max_distance_km: float,
 ) -> str:
-    """生成输出 xlsx（8 列），返回 out_path。匹配站点全部保留，无命中行备注。
+    """生成输出 xlsx（8 列），返回 out_path。匹配站点全部保留，无命中行备注
+    显示门限实际值（如 '1.0km内无站点匹配'）。
     输出按 match_df 行序交错排列：每行先输出命中结果，无命中则输出备注行。"""
     wb = Workbook()
     ws = wb.active
     ws.title = "匹配结果"
     ws.append(OUTPUT_COLUMNS)
 
+    note = _format_unmatched_note(max_distance_km)
     unmatched_set = set(unmatched)
     r_idx = 0  # results 中顺序指针（match_sites 按 match_df 行序产出，同行的命中连续）
     for _, row in match_df.iterrows():
@@ -299,7 +341,7 @@ def build_output_excel(
             r_idx += 1
         # 若无任何命中 → 备注行
         if cell in unmatched_set:
-            ws.append([cell, row["LON"], row["LAT"], None, None, None, None, UNMATCHED_NOTE])
+            ws.append([cell, row["LON"], row["LAT"], None, None, None, None, note])
 
     # 防御：results 末尾剩余（正常不会发生，保留以确保完整性）
     while r_idx < len(results):
@@ -348,10 +390,12 @@ def load_full_sites_from_data(
     name_col: str = None,
     lon_col: str = None,
     lat_col: str = None,
+    prefer_cell: bool = False,
 ) -> pd.DataFrame:
     """从数据管理已导入工参读取全量站点（LTE/NR 分表）。
 
-    列映射显式指定优先，缺省自动识别（_normalize_columns）。返回 df 列 = [CELL, LON, LAT]。"""
+    列映射显式指定优先，缺省自动识别（_normalize_columns / prefer_cell 时
+    _normalize_columns_prefer_cell 优先小区列）。返回 df 列 = [CELL, LON, LAT]。"""
     from app.services.data_service import data_service
     data = data_service.get_data(data_id)
     if not isinstance(data, dict):
@@ -368,7 +412,7 @@ def load_full_sites_from_data(
         out = df[[name_col, lon_col, lat_col]].copy()
         out.columns = ["CELL", "LON", "LAT"]
         return out
-    return _normalize_columns(df)
+    return _normalize_columns_prefer_cell(df) if prefer_cell else _normalize_columns(df)
 
 
 def load_full_sites_from_data_sheet(
@@ -382,11 +426,12 @@ def load_full_sites_from_data_sheet(
 
     优先 data/{data_id}/original.xlsx 的真实 sheet；文件缺失时回退
     load_full_sites_from_data（JSON 分表 + 列映射，sheet_name 即网络类型）。
+    工参文件路径固定索引 小区名称/小区经度/小区纬度（prefer_cell=True）。
     返回 df 列 = [CELL, LON, LAT]。"""
     data_dir = settings.DATA_DIR / data_id
     original = data_dir / "original.xlsx"
     if original.is_file():
-        # 列名以所选 sheet 的列名为准（覆盖 load_full_sites 的自动识别）
-        return read_arbitrary_sheet(str(original), sheet_name, name_col, lon_col, lat_col)
+        # 列名以所选 sheet 的列名为准（覆盖 load_full_sites 的自动识别），工参文件优先小区列
+        return read_arbitrary_sheet(str(original), sheet_name, name_col, lon_col, lat_col, prefer_cell=True)
     # 回退：网络类型分表（sheet_name 即网络类型，如 LTE/NR）
-    return load_full_sites_from_data(data_id, sheet_name, name_col, lon_col, lat_col)
+    return load_full_sites_from_data(data_id, sheet_name, name_col, lon_col, lat_col, prefer_cell=True)
