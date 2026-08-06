@@ -67,22 +67,6 @@ def read_match_file(file_path: str) -> Dict[str, pd.DataFrame]:
     return result
 
 
-def read_full_sheet_only(file_path: str) -> pd.DataFrame:
-    """读取仅含「全量站点」sheet 的全量站点 Excel，归一化列名。
-    用于 full_file_path 分支（合法的全量站点工参可能不含「匹配站点」sheet）。
-    缺 sheet 或缺列抛 ValueError。"""
-    try:
-        xls = pd.ExcelFile(file_path, engine="calamine")
-    except ImportError:
-        # calamine 未安装时回退到默认引擎（openpyxl，仅支持 .xlsx）
-        xls = pd.ExcelFile(file_path)
-    sheets = {s.strip(): s for s in xls.sheet_names}
-    if "全量站点" not in sheets:
-        raise ValueError("缺少工作表: 全量站点")
-    df = pd.read_excel(xls, sheet_name=sheets["全量站点"])
-    return _normalize_columns(df)
-
-
 def read_arbitrary_sheet(
     file_path: str,
     sheet_name: str,

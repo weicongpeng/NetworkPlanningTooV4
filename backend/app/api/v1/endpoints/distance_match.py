@@ -112,10 +112,10 @@ async def data_sheets(
 async def match(
     file: Optional[UploadFile] = File(None),
     file_path: Optional[str] = Form(None),
-    match_sheet_name: Optional[str] = Form(None),
+    match_sheet_name: str = Form(...),
     max_distance_km: float = Form(...),
-    full_source: Optional[str] = Form(None),
-    full_sheet_name: Optional[str] = Form(None),
+    full_source: str = Form(...),
+    full_sheet_name: str = Form(...),
     full_data_id: Optional[str] = Form(None),
     full_name_col: Optional[str] = Form(None),
     full_lon_col: Optional[str] = Form(None),

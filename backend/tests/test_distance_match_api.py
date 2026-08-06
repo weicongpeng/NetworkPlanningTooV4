@@ -64,64 +64,51 @@ def test_parse_missing_sheet():
 def test_match_valid():
     path = _make_list_excel()
     client = _make_client()
-    with open(path, "rb") as f:
-        resp = client.post(
-            "/api/v1/distance-match/match",
-            data={"max_distance_km": "1.0"},
-            files={"file": ("list.xlsx", f, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
-        )
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body["success"] is True
-    assert body["data"]["filename"].startswith("匹配结果")
-    assert body["data"]["filename"].endswith(".xlsx")
-    assert body["data"]["download_url"].startswith("/static/")
-
-
-def test_match_invalid_threshold():
-    path = _make_list_excel()
-    client = _make_client()
-    with open(path, "rb") as f:
-        resp = client.post(
-            "/api/v1/distance-match/match",
-            data={"max_distance_km": "0"},
-            files={"file": ("list.xlsx", f, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
-        )
-    assert resp.status_code == 400
-
-
-def _make_full_sheet_excel() -> str:
-    """创建仅含「全量站点」sheet 的全量站点工参文件"""
-    tmp = tempfile.mktemp(suffix=".xlsx")
-    with pd.ExcelWriter(tmp) as w:
-        pd.DataFrame([{"CELL": "F1", "LON": 116.001, "LAT": 39.0}]).to_excel(w, sheet_name="全量站点", index=False)
-    return tmp
-
-
-def test_match_full_file_path():
-    """full_file_path 模式：全量站点文件仅含「全量站点」sheet 也应成功"""
-    path = _make_list_excel()
-    full_path = _make_full_sheet_excel()
-    client = _make_client()
     try:
-        with open(path, "rb") as f, open(full_path, "rb") as ff:
-            resp = client.post(
-                "/api/v1/distance-match/match",
-                data={"max_distance_km": "1.0", "full_file_path": full_path},
-                files={"file": ("list.xlsx", f, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
-            )
+        resp = client.post(
+            "/api/v1/distance-match/match",
+            data={
+                "max_distance_km": "1.0",
+                "file_path": path,
+                "match_sheet_name": "匹配站点",
+                "full_source": "file",
+                "full_sheet_name": "全量站点",
+            },
+        )
         assert resp.status_code == 200
         body = resp.json()
         assert body["success"] is True
         assert body["data"]["filename"].startswith("匹配结果")
+        assert body["data"]["filename"].endswith(".xlsx")
+        assert body["data"]["download_url"].startswith("/static/")
     finally:
-        for p in (path, full_path):
-            if os.path.exists(p):
-                os.unlink(p)
+        if os.path.exists(path):
+            os.unlink(path)
+
+
+def test_match_invalid_threshold():
+    """门限为 0 时返回 400"""
+    path = _make_list_excel()
+    client = _make_client()
+    try:
+        resp = client.post(
+            "/api/v1/distance-match/match",
+            data={
+                "max_distance_km": "0",
+                "file_path": path,
+                "match_sheet_name": "匹配站点",
+                "full_source": "file",
+                "full_sheet_name": "全量站点",
+            },
+        )
+        assert resp.status_code == 400
+    finally:
+        if os.path.exists(path):
+            os.unlink(path)
 
 
 def test_match_full_data_id(monkeypatch):
-    """full_data_id 模式：从数据管理工参读取全量站点"""
+    """full_source=data：从数据管理工参读取全量站点（mock get_data，无 original 文件）"""
     path = _make_list_excel()
     client = _make_client()
     from app.services import data_service as ds_mod
@@ -131,19 +118,20 @@ def test_match_full_data_id(monkeypatch):
         lambda data_id: {"LTE": [{"CELL": "F1", "LON": 116.001, "LAT": 39.0}]},
     )
     try:
-        with open(path, "rb") as f:
-            resp = client.post(
-                "/api/v1/distance-match/match",
-                data={
-                    "max_distance_km": "1.0",
-                    "full_data_id": "d1",
-                    "full_network_type": "LTE",
-                    "full_name_col": "CELL",
-                    "full_lon_col": "LON",
-                    "full_lat_col": "LAT",
-                },
-                files={"file": ("list.xlsx", f, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
-            )
+        resp = client.post(
+            "/api/v1/distance-match/match",
+            data={
+                "max_distance_km": "1.0",
+                "file_path": path,
+                "match_sheet_name": "匹配站点",
+                "full_source": "data",
+                "full_sheet_name": "LTE",
+                "full_data_id": "d1",
+                "full_name_col": "CELL",
+                "full_lon_col": "LON",
+                "full_lat_col": "LAT",
+            },
+        )
         assert resp.status_code == 200
         body = resp.json()
         assert body["success"] is True
@@ -154,13 +142,19 @@ def test_match_full_data_id(monkeypatch):
 
 
 def test_match_file_path_non_upload():
-    """file_path 模式：通过 match_file_path 直接指定清单路径（非上传）"""
+    """file_path 模式：通过 file_path 直接指定清单路径（非上传）"""
     path = _make_list_excel()
     client = _make_client()
     try:
         resp = client.post(
             "/api/v1/distance-match/match",
-            data={"max_distance_km": "1.0", "match_file_path": path},
+            data={
+                "max_distance_km": "1.0",
+                "file_path": path,
+                "match_sheet_name": "匹配站点",
+                "full_source": "file",
+                "full_sheet_name": "全量站点",
+            },
         )
         assert resp.status_code == 200
         body = resp.json()
@@ -175,12 +169,16 @@ def test_match_output_file_written():
     path = _make_list_excel()
     client = _make_client()
     try:
-        with open(path, "rb") as f:
-            resp = client.post(
-                "/api/v1/distance-match/match",
-                data={"max_distance_km": "1.0"},
-                files={"file": ("list.xlsx", f, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
-            )
+        resp = client.post(
+            "/api/v1/distance-match/match",
+            data={
+                "max_distance_km": "1.0",
+                "file_path": path,
+                "match_sheet_name": "匹配站点",
+                "full_source": "file",
+                "full_sheet_name": "全量站点",
+            },
+        )
         assert resp.status_code == 200
         body = resp.json()
         out_file = settings.OUTPUT_DIR / body["data"]["filename"]
@@ -265,7 +263,7 @@ def test_data_sheets_endpoint_metadata_only(monkeypatch):
 
 
 def test_match_by_sheet_upload():
-    """full_source=file：匹配站点与全量站点从同一导入文件各选 sheet"""
+    """full_source=file：匹配站点与全量站点从同一导入文件各选 sheet，输出含匹配行"""
     tmp = tempfile.mktemp(suffix=".xlsx")
     with pd.ExcelWriter(tmp) as w:
         pd.DataFrame([{"CELL": "M1", "LON": 116.0, "LAT": 39.0}]).to_excel(w, sheet_name="匹配站点", index=False)
@@ -286,6 +284,13 @@ def test_match_by_sheet_upload():
         body = resp.json()
         assert body["success"] is True
         assert body["data"]["filename"].startswith("匹配结果")
+        # 验证输出工作簿确实包含 M1→F1 匹配行（根因修复的真实证据）
+        out_file = settings.OUTPUT_DIR / body["data"]["filename"]
+        out_df = pd.read_excel(out_file)
+        assert len(out_df) == 1
+        assert out_df.iloc[0]["匹配站点名称"] == "M1"
+        assert out_df.iloc[0]["全量站点名称"] == "F1"
+        assert "无匹站点匹配" not in out_df.iloc[0]["备注"] if pd.notna(out_df.iloc[0]["备注"]) else True
     finally:
         if os.path.exists(tmp):
             os.unlink(tmp)
@@ -348,8 +353,6 @@ def test_match_by_sheet_data_source(monkeypatch):
         assert resp.json()["success"] is True
     finally:
         for p in (tmp, dest, d1_dir):
-            if hasattr(p, "is_dir") and p.is_dir():
-                pass
             if os.path.exists(p):
                 try:
                     os.unlink(p)
