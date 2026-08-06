@@ -1,11 +1,14 @@
 # backend/app/services/distance_match_service.py
 """批量距离匹配服务：网格预筛 + haversine + xlsx 输出"""
 import math
+from pathlib import Path
 from typing import List, Dict, Tuple
 
 import numpy as np
 import pandas as pd
 from openpyxl import Workbook
+
+from app.core.config import settings
 
 # 输出列名（固定，含备注）
 OUTPUT_COLUMNS = [
@@ -78,6 +81,62 @@ def read_full_sheet_only(file_path: str) -> pd.DataFrame:
         raise ValueError("缺少工作表: 全量站点")
     df = pd.read_excel(xls, sheet_name=sheets["全量站点"])
     return _normalize_columns(df)
+
+
+def read_arbitrary_sheet(
+    file_path: str,
+    sheet_name: str,
+    name_col: str = None,
+    lon_col: str = None,
+    lat_col: str = None,
+) -> pd.DataFrame:
+    """读取任意 sheet（匹配站点/全量站点通用）：按指定列映射或自动识别 CELL/LON/LAT。
+    缺 sheet 或缺列抛 ValueError。"""
+    try:
+        xls = pd.ExcelFile(file_path, engine="calamine")
+    except ImportError:
+        # calamine 未安装时回退到默认引擎（openpyxl，仅支持 .xlsx）
+        xls = pd.ExcelFile(file_path)
+    sheets = {s.strip(): s for s in xls.sheet_names}
+    key = sheets.get(sheet_name) or sheets.get(sheet_name.strip())
+    if key is None:
+        raise ValueError(f"缺少工作表: {sheet_name}")
+    df = pd.read_excel(xls, sheet_name=key)
+    if name_col and lon_col and lat_col:
+        for col in (name_col, lon_col, lat_col):
+            if col not in df.columns:
+                raise ValueError(f"列 {col} 不存在于工作表 {sheet_name}")
+        out = df[[name_col, lon_col, lat_col]].copy()
+        out.columns = ["CELL", "LON", "LAT"]
+        return out
+    return _normalize_columns(df)
+
+
+def read_data_sheets(excel_path: str) -> Tuple[List[str], str]:
+    """读取数据管理工参原始 Excel 的真实 sheet 列表。
+
+    返回 (sheets, source)：
+    - original.xlsx 存在 → (真实 sheet 名列表, "excel")
+    - 否则 → (网络分表键列表, "network")  # 兜底：data.json 已解析成 LTE/NR 分表
+    """
+    p = Path(excel_path)
+    if p.is_file() and p.suffix.lower() in (".xlsx", ".xls"):
+        try:
+            xls = pd.ExcelFile(p, engine="calamine")
+        except ImportError:
+            # calamine 未安装时回退到默认引擎（openpyxl，仅支持 .xlsx）
+            xls = pd.ExcelFile(p)
+        return list(xls.sheet_names), "excel"
+    # 兜底：网络分表键（get_data 的 dict key）
+    from app.services.data_service import data_service
+    data = data_service.get_data(p.parent.name)
+    if isinstance(data, dict):
+        keys = [k for k in data.keys() if isinstance(k, str) and k not in (
+            "id", "name", "fileType", "status", "errorMessage", "message",
+        )]
+        if keys:
+            return keys, "network"
+    return ["LTE", "NR"], "network"
 
 
 def validate_sheet(df: pd.DataFrame, sheet_name: str) -> List[Dict[str, object]]:
@@ -253,3 +312,53 @@ def load_full_params_from_data(
     out = df[[name_col, lon_col, lat_col]].copy()
     out.columns = ["CELL", "LON", "LAT"]
     return out
+
+
+def load_full_sites_from_data(
+    data_id: str,
+    network_type: str,
+    name_col: str = None,
+    lon_col: str = None,
+    lat_col: str = None,
+) -> pd.DataFrame:
+    """从数据管理已导入工参读取全量站点（LTE/NR 分表）。
+
+    列映射显式指定优先，缺省自动识别（_normalize_columns）。返回 df 列 = [CELL, LON, LAT]。"""
+    from app.services.data_service import data_service
+    data = data_service.get_data(data_id)
+    if not isinstance(data, dict):
+        raise ValueError("数据不存在或无法读取")
+    key = network_type.upper()
+    rows = data.get(key, [])
+    if not rows:
+        raise ValueError(f"数据中不存在网络类型 {key} 的数据")
+    df = pd.DataFrame(rows)
+    if name_col and lon_col and lat_col:
+        for col in (name_col, lon_col, lat_col):
+            if col not in df.columns:
+                raise ValueError(f"列 {col} 不存在于该工参数据")
+        out = df[[name_col, lon_col, lat_col]].copy()
+        out.columns = ["CELL", "LON", "LAT"]
+        return out
+    return _normalize_columns(df)
+
+
+def load_full_sites_from_data_sheet(
+    data_id: str,
+    sheet_name: str,
+    name_col: str = None,
+    lon_col: str = None,
+    lat_col: str = None,
+) -> pd.DataFrame:
+    """从数据管理工参的原始 Excel 读取指定 sheet 作为全量站点。
+
+    优先 data/{data_id}/original.xlsx 的真实 sheet；文件缺失时回退
+    load_full_sites_from_data（JSON 分表 + 列映射，sheet_name 即网络类型）。
+    返回 df 列 = [CELL, LON, LAT]。"""
+    data_dir = settings.DATA_DIR / data_id
+    original = data_dir / "original.xlsx"
+    if original.is_file():
+        # 列名以所选 sheet 的列名为准（覆盖 load_full_sites 的自动识别）
+        return read_arbitrary_sheet(str(original), sheet_name, name_col, lon_col, lat_col)
+    # 回退：网络类型分表（sheet_name 即网络类型，如 LTE/NR）
+    return load_full_sites_from_data(data_id, sheet_name, name_col, lon_col, lat_col)

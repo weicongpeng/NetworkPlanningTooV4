@@ -356,3 +356,44 @@ def test_load_full_params_from_data_ok(monkeypatch):
     df = load_full_params_from_data("x", "LTE", "CELL", "LON", "LAT")
     assert list(df.columns) == ["CELL", "LON", "LAT"]
     assert df.iloc[0].tolist() == ["A", 116.0, 39.0]
+
+
+# ---------------------------------------------------------------------------
+# 数据管理原始 Excel sheet 读取（UI 重构 Task 1）
+# ---------------------------------------------------------------------------
+
+
+def test_read_data_sheets_from_original_excel(tmp_path):
+    """original.xlsx 存在时返回真实 sheet 列表"""
+    from app.services.distance_match_service import read_data_sheets
+    excel = tmp_path / "original.xlsx"
+    with pd.ExcelWriter(excel) as w:
+        pd.DataFrame({"CELL": ["A"], "LON": [1.0], "LAT": [1.0]}).to_excel(w, sheet_name="LTE Project Parameters", index=False)
+        pd.DataFrame({"CELL": ["B"], "LON": [1.0], "LAT": [1.0]}).to_excel(w, sheet_name="NR Project Parameters", index=False)
+    sheets, source = read_data_sheets(str(excel))
+    assert source == "excel"
+    assert "LTE Project Parameters" in sheets
+    assert "NR Project Parameters" in sheets
+
+
+def test_read_data_sheets_fallback_network(monkeypatch, tmp_path):
+    """original.xlsx 缺失时兜底返回网络分表键 (LTE/NR)"""
+    from app.services.distance_match_service import read_data_sheets
+    from app.services import data_service as ds_mod
+    monkeypatch.setattr(ds_mod.data_service, "get_data", lambda data_id: {"LTE": [{"CELL": "A"}], "NR": [{"CELL": "B"}]})
+    sheets, source = read_data_sheets(str(tmp_path / "nonexistent" / "original.xlsx"))
+    assert source == "network"
+    assert sheets == ["LTE", "NR"]
+
+
+def test_load_full_sites_from_data_sheet_fallback(monkeypatch, tmp_path):
+    """original.xlsx 缺失时回退 load_full_sites_from_data"""
+    from app.services.distance_match_service import load_full_sites_from_data_sheet
+    import pandas as pd
+    monkeypatch.setattr(
+        "app.services.distance_match_service.load_full_sites_from_data",
+        lambda data_id, net, nc, loc, lac: pd.DataFrame([{"CELL": "F1", "LON": 1.0, "LAT": 1.0}]),
+    )
+    df = load_full_sites_from_data_sheet("d1", "LTE", "CELL", "LON", "LAT")
+    assert list(df.columns) == ["CELL", "LON", "LAT"]
+    assert len(df) == 1
