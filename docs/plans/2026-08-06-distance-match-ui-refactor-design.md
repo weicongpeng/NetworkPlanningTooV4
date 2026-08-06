@@ -8,7 +8,7 @@
 
 批量距离匹配功能存在以下问题，需修复并重构 UI：
 
-1. **模板下载无反应**：端点 `GET /distance-match/template` 读取 `settings.TEMPLATE_DIR / 站点匹配清单-模板.xlsx`（=`backend/template/`），但文件实际被 git 跟踪在仓库根 `template/`，导致 404 → 前端「无反应」。
+1. **模板下载无反应**：`GET /distance-match/template` 后端路径**正确**（`TEMPLATE_DIR`=仓库根 `template/`，文件存在，后端测试通过）。「无反应」根因在前端 blob 下载触发链路（`uploadClient` 响应拦截器 + `downloadTemplate` 的 blob 处理），需实测验证并加固。
 2. **匹配失败提示**：`/match` 强制读取「匹配站点」「全量站点」两个固定 sheet 名。用户选择非固定名的 sheet 后报「缺少工作表」→ 前端显示「匹配失败，请重试」。
 3. **UI 层级混乱**：当前「匹配站点」「全量站点」各自独立上传框，全量站点来源下方还有一个多余的文件导入框，与需求不符。
 
@@ -74,7 +74,7 @@
 
 ### 5.1 模板下载修复
 
-端点 `GET /distance-match/template` 当前读 `settings.TEMPLATE_DIR / 站点匹配清单-模板.xlsx`。修复：读取仓库根 `template/站点匹配清单-模板.xlsx`（git 跟踪的实际路径），文件不存在时 404 提示。
+`GET /distance-match/template` 后端路径已正确（`TEMPLATE_DIR`=仓库根 `template/`，文件存在，后端测试通过）。「无反应」根因疑似前端 blob 下载链路：`uploadClient` 响应拦截器对 blob 响应返回 `response.data`（即 Blob），`downloadTemplate` 用 `res as unknown as Blob` 直接触发下载。需在实施阶段**实测验证**，若仍无反应则排查 blob URL 生成 / 下载触发，必要时改为 apiClient 直连（其 blob 拦截器返回完整 response）或手动 `response.blob()`。
 
 ### 5.2 新增 `/data-sheets` 接口
 
@@ -233,7 +233,7 @@ getDataSheets: async (dataId: string) → POST /distance-match/data-sheets → {
 
 ## 9. 部署注意事项
 
-- 模板文件位于仓库根 `template/站点匹配清单-模板.xlsx`，端点路径需与该位置一致
+- 模板文件位于仓库根 `template/站点匹配清单-模板.xlsx`（`TEMPLATE_DIR` 已正确指向此处，无需改动）
 - 修改后端 → `systemctl restart npt-backend`；修改前端 → `npm run build:vite` + 重启后端
 
 ## 10. 参考脚本差异说明
