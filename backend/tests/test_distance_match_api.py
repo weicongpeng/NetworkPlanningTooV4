@@ -62,19 +62,21 @@ def test_parse_missing_sheet():
 
 
 def test_match_valid():
+    """file 上传分支：匹配站点与全量站点从同一上传文件各选 sheet"""
     path = _make_list_excel()
     client = _make_client()
     try:
-        resp = client.post(
-            "/api/v1/distance-match/match",
-            data={
-                "max_distance_km": "1.0",
-                "file_path": path,
-                "match_sheet_name": "匹配站点",
-                "full_source": "file",
-                "full_sheet_name": "全量站点",
-            },
-        )
+        with open(path, "rb") as f:
+            resp = client.post(
+                "/api/v1/distance-match/match",
+                data={
+                    "max_distance_km": "1.0",
+                    "match_sheet_name": "匹配站点",
+                    "full_source": "file",
+                    "full_sheet_name": "全量站点",
+                },
+                files={"file": ("list.xlsx", f, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+            )
         assert resp.status_code == 200
         body = resp.json()
         assert body["success"] is True
@@ -290,7 +292,7 @@ def test_match_by_sheet_upload():
         assert len(out_df) == 1
         assert out_df.iloc[0]["匹配站点名称"] == "M1"
         assert out_df.iloc[0]["全量站点名称"] == "F1"
-        assert "无匹站点匹配" not in out_df.iloc[0]["备注"] if pd.notna(out_df.iloc[0]["备注"]) else True
+        assert "无匹站点匹配" not in str(out_df.iloc[0]["备注"])
     finally:
         if os.path.exists(tmp):
             os.unlink(tmp)
