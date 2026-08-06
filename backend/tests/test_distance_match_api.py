@@ -207,3 +207,37 @@ def test_parse_csv_rejected():
     finally:
         if os.path.exists(tmp):
             os.unlink(tmp)
+
+
+def test_data_sheets_endpoint_fallback(monkeypatch):
+    """data-sheets 在 original 缺失时兜底返回网络分表"""
+    client = _make_client()
+    from app.services import data_service as ds_mod
+    monkeypatch.setattr(ds_mod.data_service, "get_data", lambda data_id: {"LTE": [{"CELL": "A"}], "NR": [{"CELL": "B"}]})
+    resp = client.post("/api/v1/distance-match/data-sheets", data={"data_id": "d1"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["success"] is True
+    assert body["data"]["source"] == "network"
+    assert set(body["data"]["sheets"]) == {"LTE", "NR"}
+
+
+def test_data_sheets_endpoint_excel(tmp_path, monkeypatch):
+    """data-sheets 返回原始 Excel 真实 sheet"""
+    client = _make_client()
+    import pandas as pd
+    from app.services import distance_match_service as dms
+    # 构造 data/{d1}/original.xlsx
+    d1 = tmp_path / "d1"
+    d1.mkdir()
+    original = d1 / "original.xlsx"
+    with pd.ExcelWriter(original) as w:
+        pd.DataFrame({"CELL": ["A"], "LON": [1.0], "LAT": [1.0]}).to_excel(w, sheet_name="LTE Project Parameters", index=False)
+        pd.DataFrame({"CELL": ["B"], "LON": [1.0], "LAT": [1.0]}).to_excel(w, sheet_name="NR Project Parameters", index=False)
+    monkeypatch.setattr(dms.settings, "DATA_DIR", tmp_path)
+    resp = client.post("/api/v1/distance-match/data-sheets", data={"data_id": "d1"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["success"] is True
+    assert body["data"]["source"] == "excel"
+    assert "LTE Project Parameters" in body["data"]["sheets"]
