@@ -1145,16 +1145,14 @@ export const distanceMatchApi = {
   parse: async (filePath: string): Promise<DistanceMatchParseResult> => {
     const formData = new FormData()
     formData.append('file_path', filePath)
-    const res = await uploadClient.post('/distance-match/parse', formData)
-    return res.data
+    return uploadClient.post('/distance-match/parse', formData)
   },
 
   // 读取数据管理工参原始 Excel 的真实 sheet 列表（缺失时兜底网络分表）
   getDataSheets: async (dataId: string): Promise<ApiResponse<{ sheets: string[]; source: 'excel' | 'network' }>> => {
     const formData = new FormData()
     formData.append('data_id', dataId)
-    const res = await uploadClient.post('/distance-match/data-sheets', formData)
-    return res.data
+    return uploadClient.post('/distance-match/data-sheets', formData)
   },
 
   // 执行匹配（全量站点：上传文件 或 数据管理工参，二选一）
@@ -1181,8 +1179,7 @@ export const distanceMatchApi = {
       formData.append('full_lon_col', params.fullLonCol || '')
       formData.append('full_lat_col', params.fullLatCol || '')
     }
-    const res = await uploadClient.post('/distance-match/match', formData)
-    return res.data
+    return uploadClient.post('/distance-match/match', formData)
   },
 
   // 模板下载（带认证，blob 方式）
