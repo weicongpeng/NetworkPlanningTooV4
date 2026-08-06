@@ -22,9 +22,9 @@ UNMATCHED_NOTE = "无匹站点匹配"
 LON_MIN, LON_MAX = -180.0, 180.0
 LAT_MIN, LAT_MAX = -90.0, 90.0
 # 名称列识别（模板固定列名，含必要容错）
-NAME_ALIASES = ["CELL", "小区名称", "小区名", "NAME", "站点名称"]
-LON_ALIASES = ["LON", "经度", "LONGITUDE"]
-LAT_ALIASES = ["LAT", "纬度", "LATITUDE"]
+NAME_ALIASES = ["CELL", "小区名称", "小区名", "NAME", "站点名称", "基站名称", "CGI"]
+LON_ALIASES = ["LON", "经度", "LONGITUDE", "基站经度", "小区经度"]
+LAT_ALIASES = ["LAT", "纬度", "LATITUDE", "基站纬度", "小区纬度"]
 
 
 def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -91,6 +91,13 @@ def read_arbitrary_sheet(
     lat_col: str = None,
 ) -> pd.DataFrame:
     """读取任意 sheet（匹配站点/全量站点通用）：按指定列映射或自动识别 CELL/LON/LAT。
+
+    支持数据管理全量工参的复杂表头：第 1 行为「中文名 + \\n 分隔元数据」（如
+    '基站经度\\neNodeB Longitude double:[-180..180]'），第 2-3 行为描述文本
+    （如 '非必填'），第 4 行起为数据。检测到含 \\n 时清理列名为中文名并按
+    skiprows=3 读取；否则按常规 header=0 读取。
+
+    返回 [CELL, LON, LAT]，过滤无效行（CELL 空 / 经纬度非数值）并按 CELL 去重。
     缺 sheet 或缺列抛 ValueError。"""
     try:
         xls = pd.ExcelFile(file_path, engine="calamine")
@@ -101,15 +108,49 @@ def read_arbitrary_sheet(
     key = sheets.get(sheet_name) or sheets.get(sheet_name.strip())
     if key is None:
         raise ValueError(f"缺少工作表: {sheet_name}")
-    df = pd.read_excel(xls, sheet_name=key)
+
+    # 探测复杂表头：第 1 行含 \n 分隔的元数据
+    header_row = pd.read_excel(xls, sheet_name=key, header=None, nrows=1).iloc[0]
+    clean_columns: List[str] = []
+    is_complex = False
+    for col in header_row:
+        col_str = str(col).strip() if pd.notna(col) else ""
+        if "\n" in col_str:
+            is_complex = True
+            # 提取第一个 \n 之前的中文名称（与 data_service._parse_full_params_sheet 一致）
+            clean_columns.append(col_str.split("\n")[0].strip())
+        else:
+            clean_columns.append(col_str)
+
+    if is_complex:
+        # 复杂表头通常占 3 行（第 4 行起是数据）
+        df = pd.read_excel(xls, sheet_name=key, header=None, skiprows=3)
+        if df.shape[1] != len(clean_columns):
+            # 兜底：列数不匹配时退化为 1 行表头重读
+            df = pd.read_excel(xls, sheet_name=key, header=None, skiprows=1)
+            if df.shape[1] != len(clean_columns):
+                raise ValueError(f"工作表 {sheet_name} 列数与表头不匹配")
+        df.columns = clean_columns
+    else:
+        df = pd.read_excel(xls, sheet_name=key)
+
+    # 列映射：显式指定优先，缺省自动识别
     if name_col and lon_col and lat_col:
         for col in (name_col, lon_col, lat_col):
             if col not in df.columns:
                 raise ValueError(f"列 {col} 不存在于工作表 {sheet_name}")
         out = df[[name_col, lon_col, lat_col]].copy()
         out.columns = ["CELL", "LON", "LAT"]
-        return out
-    return _normalize_columns(df)
+    else:
+        out = _normalize_columns(df)
+
+    # 过滤无效行（CELL 空 / 经纬度非数值）+ 按 CELL 去重
+    out["LON"] = pd.to_numeric(out["LON"], errors="coerce")
+    out["LAT"] = pd.to_numeric(out["LAT"], errors="coerce")
+    cell = out["CELL"]
+    valid = cell.notna() & ~(cell.astype(str).str.strip().eq("")) & out["LON"].notna() & out["LAT"].notna()
+    out = out.loc[valid].copy()
+    return out.drop_duplicates(subset=["CELL"], keep="first").reset_index(drop=True)
 
 
 def read_data_sheets(excel_path: str) -> Tuple[List[str], str]:

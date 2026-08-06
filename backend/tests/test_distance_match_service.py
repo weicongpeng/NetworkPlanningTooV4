@@ -397,3 +397,34 @@ def test_load_full_sites_from_data_sheet_fallback(monkeypatch, tmp_path):
     df = load_full_sites_from_data_sheet("d1", "LTE", "CELL", "LON", "LAT")
     assert list(df.columns) == ["CELL", "LON", "LAT"]
     assert len(df) == 1
+
+
+def test_read_arbitrary_sheet_complex_header(tmp_path):
+    """复杂表头（3行，\\n分隔元数据）的工参 sheet 应正确读取"""
+    from app.services.distance_match_service import read_arbitrary_sheet
+    excel = tmp_path / "params.xlsx"
+    with pd.ExcelWriter(excel, engine="openpyxl") as w:
+        # 模拟复杂表头：第1行中文名+元数据，第2-3行描述，第4行起数据
+        raw = pd.DataFrame([
+            ["CGI", "基站经度\neNodeB Longitude double:[-180..180]", "基站纬度\neNodeB Latitude\ndouble:[-90..90]"],
+            ["非必填", "非必填", "非必填"],
+            ["非必填", "非必填", "非必填"],
+            ["F1", "116.001", "39.0"],
+        ])
+        raw.to_excel(w, sheet_name="LTE Project Parameters", index=False, header=False)
+    df = read_arbitrary_sheet(str(excel), "LTE Project Parameters")
+    assert list(df.columns) == ["CELL", "LON", "LAT"]
+    assert len(df) == 1
+    assert df.iloc[0]["CELL"] == "F1"
+
+
+def test_read_arbitrary_sheet_dedup(tmp_path):
+    """按 CELL 去重"""
+    from app.services.distance_match_service import read_arbitrary_sheet
+    excel = tmp_path / "dup.xlsx"
+    with pd.ExcelWriter(excel, engine="openpyxl") as w:
+        pd.DataFrame([{"CELL": "A", "LON": 1.0, "LAT": 1.0},
+                      {"CELL": "A", "LON": 2.0, "LAT": 2.0}]).to_excel(w, sheet_name="全量", index=False)
+    df = read_arbitrary_sheet(str(excel), "全量")
+    assert len(df) == 1
+    assert df.iloc[0]["LON"] == 1.0  # keep first
