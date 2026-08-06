@@ -109,7 +109,7 @@ export default function DistanceMatchPage() {
       if (!cancelled) { setDataSheets([]); setFullSheet('') }
     })
     return () => { cancelled = true }
-  }, [fullSource, fullDataId])
+  }, [fullSource, fullDataId, networkType])
 
   // 数据管理来源 → 列加载 + 自动预选（仅 data 来源；切换 fullDataId 重新 autoPick，切换 networkType 保留手动映射）
   useEffect(() => {
@@ -187,6 +187,7 @@ export default function DistanceMatchPage() {
   }
 
   const handleFullSourceChange = (v: FullSource) => {
+    if (v === fullSource) return // 重复点击当前来源不重置
     setFullSource(v)
     setFullSheet('') // 切换来源后重新选择对应 sheet
   }
@@ -318,7 +319,8 @@ export default function DistanceMatchPage() {
             <div className="grid grid-cols-2 gap-4">
               <div>
                 <label htmlFor="dm-data-file" className="block text-xs font-medium mb-1">{t('distanceMatch.dataFile')}</label>
-                <select id="dm-data-file" value={fullDataId} onChange={e => setFullDataId(e.target.value)}
+                <select id="dm-data-file" value={fullDataId}
+                  onChange={e => { setFullDataId(e.target.value); setDataSheets([]); setFullSheet('') }}
                   className={sheetSelectCls}>
                   {dataItems.length === 0 && <option value="">{t('distanceMatch.loadDataErr')}</option>}
                   {dataItems.map(d => <option key={d.id} value={d.id}>{d.name}</option>)}
