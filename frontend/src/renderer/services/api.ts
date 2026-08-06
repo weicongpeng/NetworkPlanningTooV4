@@ -1149,24 +1149,34 @@ export const distanceMatchApi = {
     return res.data
   },
 
+  // 读取数据管理工参原始 Excel 的真实 sheet 列表（缺失时兜底网络分表）
+  getDataSheets: async (dataId: string): Promise<ApiResponse<{ sheets: string[]; source: 'excel' | 'network' }>> => {
+    const formData = new FormData()
+    formData.append('data_id', dataId)
+    const res = await uploadClient.post('/distance-match/data-sheets', formData)
+    return res.data
+  },
+
   // 执行匹配（全量站点：上传文件 或 数据管理工参，二选一）
   match: async (params: {
-    matchFilePath: string
+    filePath: string
+    matchSheetName: string
     maxDistanceKm: number
-    fullFilePath?: string
+    fullSource: 'file' | 'data'
+    fullSheetName: string
     fullDataId?: string
-    fullNetworkType?: 'LTE' | 'NR'
     fullNameCol?: string
     fullLonCol?: string
     fullLatCol?: string
   }): Promise<DistanceMatchResult> => {
     const formData = new FormData()
-    formData.append('match_file_path', params.matchFilePath)
+    formData.append('file_path', params.filePath)
+    formData.append('match_sheet_name', params.matchSheetName)
     formData.append('max_distance_km', String(params.maxDistanceKm))
-    if (params.fullFilePath) formData.append('full_file_path', params.fullFilePath)
+    formData.append('full_source', params.fullSource)
+    formData.append('full_sheet_name', params.fullSheetName)
     if (params.fullDataId) {
       formData.append('full_data_id', params.fullDataId)
-      formData.append('full_network_type', params.fullNetworkType || 'LTE')
       formData.append('full_name_col', params.fullNameCol || '')
       formData.append('full_lon_col', params.fullLonCol || '')
       formData.append('full_lat_col', params.fullLatCol || '')
@@ -1178,7 +1188,9 @@ export const distanceMatchApi = {
   // 模板下载（带认证，blob 方式）
   downloadTemplate: async (): Promise<void> => {
     const res = await uploadClient.get('/distance-match/template', { responseType: 'blob' })
-    const blob = res.data
+    // uploadClient 拦截器对 blob 响应已解包为 Blob（直接返回 response.data）
+    const blob = res as unknown as Blob
+    if (!(blob instanceof Blob) || blob.size === 0) throw new Error('模板下载失败：文件内容为空')
     const url = window.URL.createObjectURL(blob)
     const link = document.createElement('a')
     link.href = url
