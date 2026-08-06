@@ -1070,11 +1070,13 @@
   "distanceMatch": {
     "fileImport": "文件导入",
     "templateDownload": "模版下载",
-    "matchFile": "匹配站点清单",
-    "fullSource": "全量站点来源",
-    "fullUpload": "上传清单文件",
-    "fullData": "从数据管理选择",
+    "dataSelect": "数据选择",
+    "matchSite": "匹配站点",
+    "fullSite": "全量站点",
+    "fullSourceFile": "导入文件",
+    "fullSourceData": "数据管理",
     "dataFile": "数据文件",
+    "sheetName": "工作表",
     "networkType": "网络类型",
     "nameCol": "站点名称列",
     "lonCol": "经度列",
@@ -1091,10 +1093,12 @@
     "reason": "原因",
     "more": "（还有 {count} 条）",
     "loadDataErr": "加载数据列表失败",
-    "errNoFile": "请先导入匹配站点清单",
+    "errNoFile": "请先导入文件",
     "errThreshold": "请输入大于 0 的距离门限",
-    "errMapping": "请选择数据文件并配置完整列映射",
+    "errMapping": "请选择数据文件并选择工作表",
     "errFixImport": "请先修复导入数据的异常后重新导入",
-    "errUnknown": "匹配失败，请重试"
+    "errUnknown": "匹配失败，请重试",
+    "templateDownloadErr": "模板下载失败，请重试",
+    "errSheet": "请选择工作表"
   }
 }
