@@ -262,3 +262,96 @@ def test_data_sheets_endpoint_metadata_only(monkeypatch):
     body = resp.json()
     assert body["data"]["source"] == "network"
     assert set(body["data"]["sheets"]) == {"LTE", "NR"}
+
+
+def test_match_by_sheet_upload():
+    """full_source=file：匹配站点与全量站点从同一导入文件各选 sheet"""
+    tmp = tempfile.mktemp(suffix=".xlsx")
+    with pd.ExcelWriter(tmp) as w:
+        pd.DataFrame([{"CELL": "M1", "LON": 116.0, "LAT": 39.0}]).to_excel(w, sheet_name="匹配站点", index=False)
+        pd.DataFrame([{"CELL": "F1", "LON": 116.001, "LAT": 39.0}]).to_excel(w, sheet_name="全量站点", index=False)
+    client = _make_client()
+    try:
+        resp = client.post(
+            "/api/v1/distance-match/match",
+            data={
+                "max_distance_km": "1.0",
+                "file_path": tmp,
+                "match_sheet_name": "匹配站点",
+                "full_source": "file",
+                "full_sheet_name": "全量站点",
+            },
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["success"] is True
+        assert body["data"]["filename"].startswith("匹配结果")
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def test_match_by_sheet_single_sheet():
+    """单 sheet 文件：匹配站点与全量站点指向同一 sheet（匹配清单即全量池）"""
+    tmp = tempfile.mktemp(suffix=".xlsx")
+    with pd.ExcelWriter(tmp) as w:
+        pd.DataFrame([{"CELL": "A", "LON": 116.0, "LAT": 39.0},
+                      {"CELL": "B", "LON": 116.001, "LAT": 39.0}]).to_excel(w, sheet_name="工参", index=False)
+    client = _make_client()
+    try:
+        resp = client.post(
+            "/api/v1/distance-match/match",
+            data={
+                "max_distance_km": "1.0",
+                "file_path": tmp,
+                "match_sheet_name": "工参",
+                "full_source": "file",
+                "full_sheet_name": "工参",
+            },
+        )
+        assert resp.status_code == 200
+        assert resp.json()["success"] is True
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def test_match_by_sheet_data_source(monkeypatch):
+    """full_source=data：从数据管理原始Excel读指定 sheet（mock original.xlsx 存在）"""
+    tmp = tempfile.mktemp(suffix=".xlsx")
+    with pd.ExcelWriter(tmp) as w:
+        pd.DataFrame([{"CELL": "M1", "LON": 116.0, "LAT": 39.0}]).to_excel(w, sheet_name="匹配站点", index=False)
+    client = _make_client()
+    import pathlib
+    from app.services import distance_match_service as dms
+    original = tempfile.mktemp(suffix=".xlsx")
+    # 构造 data/{d1}/original.xlsx，让数据源路径真实走 original.xlsx 分支
+    d1_dir = pathlib.Path(original).parent / "d1"
+    d1_dir.mkdir(exist_ok=True)
+    dest = d1_dir / "original.xlsx"
+    with pd.ExcelWriter(dest) as w:
+        pd.DataFrame([{"CELL": "F1", "LON": 116.001, "LAT": 39.0}]).to_excel(w, sheet_name="LTE工参", index=False)
+    monkeypatch.setattr(dms.settings, "DATA_DIR", pathlib.Path(original).parent)
+    try:
+        resp = client.post(
+            "/api/v1/distance-match/match",
+            data={
+                "max_distance_km": "1.0",
+                "file_path": tmp,
+                "match_sheet_name": "匹配站点",
+                "full_source": "data",
+                "full_data_id": "d1",
+                "full_sheet_name": "LTE工参",
+            },
+        )
+        assert resp.status_code == 200
+        assert resp.json()["success"] is True
+    finally:
+        for p in (tmp, dest, d1_dir):
+            if hasattr(p, "is_dir") and p.is_dir():
+                pass
+            if os.path.exists(p):
+                try:
+                    os.unlink(p)
+                except IsADirectoryError:
+                    os.rmdir(p)

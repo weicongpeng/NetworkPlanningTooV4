@@ -12,10 +12,10 @@ from app.core.security import require_data_import
 from app.services.distance_match_service import (
     build_output_excel,
     build_output_filename,
-    load_full_params_from_data,
+    load_full_sites_from_data_sheet,
     match_sites,
+    read_arbitrary_sheet,
     read_data_sheets,
-    read_full_sheet_only,
     read_match_file,
     validate_all,
 )
@@ -111,46 +111,50 @@ async def data_sheets(
 @router.post("/match")
 async def match(
     file: Optional[UploadFile] = File(None),
-    match_file_path: Optional[str] = Form(None),
+    file_path: Optional[str] = Form(None),
+    match_sheet_name: Optional[str] = Form(None),
     max_distance_km: float = Form(...),
-    full_file_path: Optional[str] = Form(None),
+    full_source: Optional[str] = Form(None),
+    full_sheet_name: Optional[str] = Form(None),
     full_data_id: Optional[str] = Form(None),
-    full_network_type: Optional[str] = Form(None),
     full_name_col: Optional[str] = Form(None),
     full_lon_col: Optional[str] = Form(None),
     full_lat_col: Optional[str] = Form(None),
     current_user=Depends(require_data_import),
 ):
-    """执行批量距离匹配，返回下载 URL"""
+    """执行批量距离匹配：按所选 sheet 读取匹配/全量站点，返回下载 URL"""
     tmp, is_tmp = None, False
     try:
         if max_distance_km <= 0:
             raise HTTPException(status_code=400, detail="相邻距离门限必须大于 0")
+        if not match_sheet_name or not match_sheet_name.strip():
+            raise HTTPException(status_code=400, detail="匹配站点工作表名称不能为空")
+        if not full_sheet_name or not full_sheet_name.strip():
+            raise HTTPException(status_code=400, detail="全量站点工作表名称不能为空")
+        if full_source not in ("file", "data"):
+            raise HTTPException(status_code=400, detail="full_source 必须为 file 或 data")
 
-        # 匹配站点清单（上传文件）
-        tmp, is_tmp = _resolve_list_file(file, match_file_path)
+        # 解析清单文件（上传或 file_path）
+        tmp, is_tmp = _resolve_list_file(file, file_path)
 
-        # 读取清单：包含「匹配站点」「全量站点」两个 sheet
-        sheets = await run_in_threadpool(read_match_file, tmp)
-        match_df = sheets["匹配站点"]
-        full_df = sheets["全量站点"]
+        # 匹配站点：从导入文件所选 sheet 读取
+        match_df = await run_in_threadpool(
+            read_arbitrary_sheet, tmp, match_sheet_name,
+        )
 
-        # 全量站点来源二选一：上传文件 或 数据管理工参
-        if full_file_path:
-            full_path = full_file_path.strip("\"'")
-            if not Path(full_path).is_file():
-                raise HTTPException(status_code=400, detail=f"全量站点文件不存在: {Path(full_path).name}")
-            # 全量站点工参只要求「全量站点」sheet（不要求「匹配站点」sheet）
-            full_df = await run_in_threadpool(read_full_sheet_only, full_path)
-        elif full_data_id:
-            if not (full_name_col and full_lon_col and full_lat_col):
-                raise HTTPException(status_code=400, detail="从数据管理读取全量站点需提供列映射")
+        # 全量站点：数据管理原始 Excel 的指定 sheet，或同一导入文件的指定 sheet
+        if full_source == "data":
+            if not full_data_id:
+                raise HTTPException(status_code=400, detail="从数据管理读取全量站点需提供 full_data_id")
             full_df = await run_in_threadpool(
-                load_full_params_from_data,
-                full_data_id, full_network_type or "LTE",
+                load_full_sites_from_data_sheet,
+                full_data_id, full_sheet_name,
                 full_name_col, full_lon_col, full_lat_col,
             )
-        # 否则用清单内的「全量站点」sheet
+        else:
+            full_df = await run_in_threadpool(
+                read_arbitrary_sheet, tmp, full_sheet_name,
+            )
 
         # 校验（两种来源统一）
         errors = validate_all(match_df, full_df)
