@@ -142,6 +142,10 @@ export class GeoDataLayer {
   // Canvas 标签层（替代 DOM 标签）
   private canvasLabelLayer: GeoDataCanvasLabelLayer | null = null
 
+  // 共享 Canvas renderer：几万个 circleMarker/polygon 用 SVG 渲染会 DOM 爆炸卡顿，
+  // Canvas 大幅减少 DOM 节点（circleMarker/polygon 均支持 Canvas + 点击 + tooltip）
+  private canvasRenderer: L.Renderer | null = null
+
   // 标签配置
   private labelConfig: {
     content: string
@@ -181,6 +185,9 @@ export class GeoDataLayer {
 
     // 创建聚合图层
     this.featureGroup = L.featureGroup()
+
+    // 共享 Canvas renderer（大点/扇区/多边形数据集渲染加速）
+    this.canvasRenderer = L.canvas()
   }
 
   /**
@@ -337,6 +344,7 @@ export class GeoDataLayer {
       const marker = L.circleMarker([displayLat, displayLng], {
         ...DEFAULT_POINT_STYLE,
         radius: pixelRadius,
+        renderer: this.canvasRenderer || undefined,
         properties: item.properties,
         name: item.name
       })
@@ -411,6 +419,7 @@ export class GeoDataLayer {
         // 渲染为圆点
         const marker = L.circleMarker([displayLat, displayLng], {
           ...DEFAULT_POINT_STYLE,
+          renderer: this.canvasRenderer || undefined,
           properties: item.properties,
           name: item.name
         })
@@ -435,6 +444,7 @@ export class GeoDataLayer {
         const points = createSectorPolygon(displayLat, displayLng, azimuth, beamwidth, SECTOR_RADIUS)
         const polygon = L.polygon(points, {
           ...DEFAULT_SECTOR_STYLE,
+          renderer: this.canvasRenderer || undefined,
           properties: item.properties,
           name: item.name
         })
@@ -509,6 +519,7 @@ export class GeoDataLayer {
         // 直接使用 L.polygon，path 已经是正确的 [lat, lng] 格式（GCJ02）
         const polygon = L.polygon(item.path as L.LatLngExpression[], {
           ...DEFAULT_POLYGON_STYLE,
+          renderer: this.canvasRenderer || undefined,
           properties: item.properties,
           name: item.name
         })
