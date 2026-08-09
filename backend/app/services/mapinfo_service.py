@@ -1033,7 +1033,7 @@ def _convert_to_geojson(layer: MapInfoLayer, transform_coords: bool = True) -> D
         coordinates = feature.coordinates
 
         if transform_coords:
-            coordinates = CoordinateTransformer.transform_geojson_coordinates(coordinates)
+            coordinates = CoordinateTransformer.transform_geojson_coordinates_batch(coordinates)
 
         if feature.type == GeometryType.POINT:
             geometry = {

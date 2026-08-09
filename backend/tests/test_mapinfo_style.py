@@ -129,3 +129,55 @@ def test_infer_style_from_properties_returns_none():
     row = pd.Series({"name": "某水域公园绿地建筑", "geometry": None})
     style = MapInfoParser._infer_style_from_properties(row, GeometryType.POLYGON)
     assert style is None  # 不再按 '水'/'绿地'/'建筑' 分色
+
+
+# ---------------------------------------------------------------------------
+# 第二轮：tuple 坐标转换 + 批量转换一致性
+# parse_file 用 shapely 产出 tuple 坐标（Line→[(x,y)], Polygon→[[(x,y)]]），
+# 转换后必须输出 GeoJSON 标准 list 结构。
+# ---------------------------------------------------------------------------
+
+
+def test_transform_coordinates_tuple_line():
+    """tuple 结构 LineString 被转换且输出为 list"""
+    from app.utils.coordinate_transformer import CoordinateTransformer
+    line = [(116.397, 39.908), (116.398, 39.909)]
+    out = CoordinateTransformer.transform_geojson_coordinates(line)
+    assert out != line
+    assert isinstance(out[0], list)
+    assert out[0][0] != 116.397  # 经度已偏移
+
+
+def test_transform_coordinates_tuple_polygon():
+    """tuple 结构 Polygon 被转换且输出为 list"""
+    from app.utils.coordinate_transformer import CoordinateTransformer
+    poly = [[(116.397, 39.908), (116.398, 39.908), (116.398, 39.909), (116.397, 39.908)]]
+    out = CoordinateTransformer.transform_geojson_coordinates(poly)
+    assert out != poly
+    assert isinstance(out[0], list)
+    assert isinstance(out[0][0], list)
+    assert out[0][0][0] != 116.397
+
+
+def test_transform_coordinates_keeps_z():
+    """含 z 值坐标转换后保留 z"""
+    from app.utils.coordinate_transformer import CoordinateTransformer
+    line3d = [(116.397, 39.908, 100), (116.398, 39.909, 200)]
+    out = CoordinateTransformer.transform_geojson_coordinates(line3d)
+    assert out[0][2] == 100
+    assert out[1][2] == 200
+
+
+def test_transform_coordinates_batch_matches_scalar():
+    """批量转换与标量转换对 Point/Line/Polygon 输出一致"""
+    from app.utils.coordinate_transformer import CoordinateTransformer
+    cases = [
+        [116.397, 39.908],
+        [(116.397, 39.908), (116.398, 39.909)],
+        [[(116.397, 39.908), (116.398, 39.908), (116.398, 39.909), (116.397, 39.908)]],
+        [(116.397, 39.908, 100), (116.398, 39.909, 200)],
+    ]
+    for coords in cases:
+        scalar = CoordinateTransformer.transform_geojson_coordinates(coords)
+        batch = CoordinateTransformer.transform_geojson_coordinates_batch(coords)
+        assert scalar == batch, f"batch 与 scalar 不一致: {coords}"
