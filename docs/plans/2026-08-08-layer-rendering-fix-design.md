@@ -86,6 +86,9 @@
 
 3. **与 2.1 协同**：2.1 已决定后端做转换（`transform_coords=True`），前端不转。2.3 的诊断结果决定后端转换的输入是否需要先 `to_crs(4326)` 归一。
 
+**诊断实测结论（2026-08-08，`test_mapinfo_style.py`）**：
+`_convert_to_geojson` 的 `transform_coords` 参数存在但**未接线**——函数内坐标直接透传，`test_convert_to_geojson_transform_coords_true` 与 `test_convert_to_geojson_transforms_all_geometry_types` 均 FAIL（Point 坐标 116.397/39.908 原样返回）。断点即转换未生效，而非 CRS 读入问题；修复方案 = 接线 `CoordinateTransformer.transform_geojson_coordinates`（已递归覆盖 Point/Line/Polygon 嵌套环）。Task 2 修复后两个测试转绿。若后续实测仍偏，再确认 `parse_file` 的 `gpd.read_file` 读入 CRS。
+
 ---
 
 ## 3. 影响文件
