@@ -4971,8 +4971,6 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
           if (geoDataLayerManagerRef.current && mapInstanceRef.current) {
             const geoLayer = geoDataLayerManagerRef.current.getLayer(layerFile.id)
             if (geoLayer) {
-              geoLayer.setVisible(mapInstance, layerFile.visible)
-
               try {
                 const result = geoLayer.setVisible(mapInstanceRef.current, layerFile.visible)
                 console.log('[OnlineMap] ✅ geoLayer.setVisible 成功完成，返回值:', result)
