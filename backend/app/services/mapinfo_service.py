@@ -60,6 +60,20 @@ class MapInfoLayer:
     metadata: Dict[str, Any]
 
 
+def _is_large_color(parts: List[str], idx: int) -> bool:
+    """判断 parts[idx] 是否为 24-bit 单整数颜色（>255）。
+
+    单整数颜色格式（GDAL/MIF）中颜色为 24-bit BGR 整数（R 最低字节），
+    数值通常远大于 255；多段 RGB 格式每分量 0-255。用 >255 区分两种格式。
+    """
+    if idx >= len(parts):
+        return False
+    try:
+        return int(parts[idx]) > 255
+    except (ValueError, TypeError):
+        return False
+
+
 class MapInfoParser:
     """MapInfo 文件解析器"""
 
@@ -147,66 +161,115 @@ class MapInfoParser:
             if isinstance(value, dict):
                 return value
 
+            # 剥离 GDAL 输出前缀：'Pen (2, 2, 16711680)' → '2, 2, 16711680'
+            # GDAL 读外部 MIF 时样式列值形如 'Pen (width, pattern, color)'
+            _stripped = value_str
+            for _kw in ('pen', 'brush', 'symbol', 'font'):
+                _low = _stripped.lower()
+                if _low.startswith(_kw + '(') or _low.startswith(_kw + ' ('):
+                    _stripped = _stripped[len(_kw):].strip()
+                    _stripped = _stripped.strip('()').strip()
+                    break
+
+            # 统一拆分（去除 GDAL 逗号后空格）
+            parts = [p.strip() for p in _stripped.split(',')]
+
             # 解析 PEN (线样式)
             if 'pen' in style_type_lower:
-                parts = value_str.split(',')
                 if len(parts) >= 2:
                     try:
                         result['stroke'] = True
                         result['strokeWidth'] = float(parts[0]) if parts[0] else 1
-                        # MapInfo 颜色通常是 RGB 或 BGR
-                        if len(parts) >= 4:
+                        # MapInfo 颜色规范: Color = R + G*256 + B*65536（R 最低字节）
+                        # 两种格式：
+                        #  1) width,pattern,color_int  (GDAL/MIF 三段，color 为 24-bit 整数)
+                        #  2) width,r,g,b,pattern      (多段 RGB)
+                        if len(parts) == 3:
+                            color_int = int(parts[2])
+                            r = color_int & 255
+                            g = (color_int >> 8) & 255
+                            b = (color_int >> 16) & 255
+                            result['strokeColor'] = f'#{r:02x}{g:02x}{b:02x}'
+                            # 三段格式的 pattern 在 parts[1]
+                            if parts[1].isdigit():
+                                result['strokeDasharray'] = MapInfoParser._get_dash_pattern(int(parts[1]))
+                        elif len(parts) >= 4:
                             r = int(parts[1])
                             g = int(parts[2])
                             b = int(parts[3])
                             result['strokeColor'] = f'#{r:02x}{g:02x}{b:02x}'
-                        # 线型模式
-                        if len(parts) >= 5:
-                            result['strokeDasharray'] = MapInfoParser._get_dash_pattern(int(parts[4]) if parts[4].isdigit() else 1)
+                            # 线型模式
+                            if len(parts) >= 5:
+                                result['strokeDasharray'] = MapInfoParser._get_dash_pattern(int(parts[4]) if parts[4].isdigit() else 1)
                     except (ValueError, IndexError):
                         pass
 
             # 解析 BRUSH (填充样式)
             elif 'brush' in style_type_lower:
-                parts = value_str.split(',')
                 if len(parts) >= 2:
                     try:
-                        result['fill'] = True
-                        # 前景色
-                        if len(parts) >= 3:
-                            r = int(parts[0])
-                            g = int(parts[1])
-                            b = int(parts[2])
+                        # 单整数格式: pattern,forecolor,[backcolor]（颜色为 24-bit 整数，>255 判定）
+                        if len(parts) <= 3 and _is_large_color(parts, 1):
+                            result['fill'] = True
+                            result['fillPattern'] = int(parts[0]) if parts[0].isdigit() else 1
+                            color_int = int(parts[1])
+                            r = color_int & 255
+                            g = (color_int >> 8) & 255
+                            b = (color_int >> 16) & 255
                             result['fillColor'] = f'#{r:02x}{g:02x}{b:02x}'
-                        # 背景色
-                        if len(parts) >= 6:
-                            r = int(parts[3])
-                            g = int(parts[4])
-                            b = int(parts[5])
-                            result['fillBgColor'] = f'#{r:02x}{g:02x}{b:02x}'
-                        # 填充模式
-                        if len(parts) >= 7 and parts[6].isdigit():
-                            pattern = int(parts[6])
-                            result['fillPattern'] = pattern
-                            result['fillOpacity'] = 0.5 if pattern > 1 else 0.8
+                            if len(parts) >= 3 and parts[2] and parts[2] != '0':
+                                bg_int = int(parts[2])
+                                r2 = bg_int & 255
+                                g2 = (bg_int >> 8) & 255
+                                b2 = (bg_int >> 16) & 255
+                                result['fillBgColor'] = f'#{r2:02x}{g2:02x}{b2:02x}'
+                        else:
+                            result['fill'] = True
+                            # 前景色
+                            if len(parts) >= 3:
+                                r = int(parts[0])
+                                g = int(parts[1])
+                                b = int(parts[2])
+                                result['fillColor'] = f'#{r:02x}{g:02x}{b:02x}'
+                            # 背景色
+                            if len(parts) >= 6:
+                                r = int(parts[3])
+                                g = int(parts[4])
+                                b = int(parts[5])
+                                result['fillBgColor'] = f'#{r:02x}{g:02x}{b:02x}'
+                            # 填充模式
+                            if len(parts) >= 7 and parts[6].isdigit():
+                                pattern = int(parts[6])
+                                result['fillPattern'] = pattern
+                                result['fillOpacity'] = 0.5 if pattern > 1 else 0.8
                     except (ValueError, IndexError):
                         result['fillColor'] = '#10b981'
                         result['fillOpacity'] = 0.3
 
             # 解析 SYMBOL (点符号)
             elif 'symbol' in style_type_lower:
-                parts = value_str.split(',')
                 if len(parts) >= 1:
                     try:
                         result['markerType'] = 'symbol'
-                        result['markerSymbol'] = int(parts[0]) if parts[0].isdigit() else 'circle'
-                        if len(parts) >= 2:
-                            result['markerSize'] = float(parts[1])
-                        if len(parts) >= 5:
-                            r = int(parts[2])
-                            g = int(parts[3])
-                            b = int(parts[4])
+                        # 单整数格式: shape,color,[size]（颜色为 24-bit 整数，>255 判定）
+                        if len(parts) >= 2 and _is_large_color(parts, 1):
+                            result['markerSymbol'] = int(parts[0]) if parts[0].isdigit() else 'circle'
+                            color_int = int(parts[1])
+                            r = color_int & 255
+                            g = (color_int >> 8) & 255
+                            b = (color_int >> 16) & 255
                             result['markerColor'] = f'#{r:02x}{g:02x}{b:02x}'
+                            if len(parts) >= 3 and parts[2].replace('.', '').isdigit():
+                                result['markerSize'] = float(parts[2])
+                        else:
+                            result['markerSymbol'] = int(parts[0]) if parts[0].isdigit() else 'circle'
+                            if len(parts) >= 2:
+                                result['markerSize'] = float(parts[1])
+                            if len(parts) >= 5:
+                                r = int(parts[2])
+                                g = int(parts[3])
+                                b = int(parts[4])
+                                result['markerColor'] = f'#{r:02x}{g:02x}{b:02x}'
                     except (ValueError, IndexError):
                         result['markerColor'] = '#f59e0b'
                         result['markerSize'] = 8
