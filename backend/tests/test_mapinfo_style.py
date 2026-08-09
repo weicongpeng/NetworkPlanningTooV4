@@ -113,3 +113,11 @@ def test_parse_symbol_single_integer_color():
     style = MapInfoParser._parse_style_value("Symbol", "34,16711680,12")
     assert style is not None
     assert style["markerColor"] == "#0000ff"
+
+
+def test_infer_style_from_properties_returns_none():
+    """按属性关键词分色已废弃，无显式样式时返回 None（统一默认色）"""
+    import pandas as pd
+    row = pd.Series({"name": "某水域公园绿地建筑", "geometry": None})
+    style = MapInfoParser._infer_style_from_properties(row, GeometryType.POLYGON)
+    assert style is None  # 不再按 '水'/'绿地'/'建筑' 分色
