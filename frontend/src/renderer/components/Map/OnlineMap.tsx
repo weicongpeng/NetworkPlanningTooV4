@@ -2791,16 +2791,19 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
     const allFiles = [...layerFiles, ...pointFiles]
     console.log('[OnlineMap] 加载图层数据（懒加载，不阻塞主线程）:', allFiles.length)
 
+    // 只预取已勾选的图层：不可见图层等用户勾选时再懒加载，
+    // 避免首屏对几十个图层发起请求（尤其是大图层，首次解析 +20s 会阻塞勾选渲染）
+    const visibleFiles = allFiles.filter(f => f.visible)
+    console.log('[OnlineMap] 预取已勾选图层数量:', visibleFiles.length)
+
     // 并发拉取数据并缓存（限流，避免一次几十个请求）
     const CHUNK = 5
-    for (let i = 0; i < allFiles.length; i += CHUNK) {
-      const chunk = allFiles.slice(i, i + CHUNK)
+    for (let i = 0; i < visibleFiles.length; i += CHUNK) {
+      const chunk = visibleFiles.slice(i, i + CHUNK)
       await Promise.all(chunk.map(layerFile => prefetchLayerData(layerFile)))
     }
 
     // 挂载完成后，对已勾选图层触发构建（从缓存取 geojson 构建并 addTo），保证进入地图即显示
-    const visibleFiles = allFiles.filter(f => f.visible)
-    console.log('[OnlineMap] 构建已勾选图层数量:', visibleFiles.length)
     for (const layerFile of visibleFiles) {
       await loadMapInfoLayer(layerFile)
     }
