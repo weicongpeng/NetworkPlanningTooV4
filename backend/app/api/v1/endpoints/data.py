@@ -604,7 +604,9 @@ async def get_layer_data(data_id: str, layer_id: str) -> Dict[str, Any]:
         if not data_dir.exists():
             raise HTTPException(status_code=404, detail="数据不存在")
 
-        geojson = get_layer_data(data_id, layer_id, data_dir)
+        # 首次解析为 CPU 密集型（gpd.read_file + 坐标转换），用线程池避免阻塞事件循环
+        from fastapi.concurrency import run_in_threadpool
+        geojson = await run_in_threadpool(get_layer_data, data_id, layer_id, data_dir)
         if geojson is None:
             raise HTTPException(status_code=404, detail="图层不存在")
 

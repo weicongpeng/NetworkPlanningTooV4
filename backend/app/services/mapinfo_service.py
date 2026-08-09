@@ -86,7 +86,8 @@ class MapInfoParser:
         return None
 
     @staticmethod
-    def _extract_mapinfo_style(row: Any, columns: Any, geom_type: GeometryType) -> Optional[Dict[str, Any]]:
+    def _extract_mapinfo_style(row: Any, columns: Any, geom_type: GeometryType,
+                               style_cols: Optional[set] = None) -> Optional[Dict[str, Any]]:
         """
         提取 MapInfo 样式信息
 
@@ -96,43 +97,44 @@ class MapInfoParser:
         - MAPINFO_symbol, SYMBOL: 点符号
         - MAPINFO_font, FONT: 字体样式
         - MI_Style, MI_Styles: MapInfo 内部样式
+
+        Args:
+            row: 单行属性（dict 或 pandas Series）
+            columns: 全部列名
+            geom_type: 几何类型
+            style_cols: 预计算的样式列集合（列名固定，只判断一次，避免逐行 re.search）
         """
-        import re
         style = {}
 
-        # 样式相关的列名模式（更全面的匹配）
-        style_patterns = [
-            r'MAPINFO_pen', r'MAPINFO_brush', r'MAPINFO_symbol', r'MAPINFO_font',
-            r'MAPINFO_Pen', r'MAPINFO_Brush', r'MAPINFO_Symbol', r'MAPINFO_Font',
-            r'^pen$', r'^brush$', r'^symbol$', r'^font$',
-            r'_pen$', r'_brush$', r'_symbol$', r'_font$',
-            r' Pen$', r' Brush$', r' Symbol$', r' Font$',
-            r'MI_Style', r'MI_Styles', r'MI_StyleDef',
-            r'style', r'styles', r'Style', r'Styles',
-            r'linewidth', r'linetype', r'linecolor',
-            r'fillcolor', r'fillpattern', r'filltype',
-            r'markertype', r'markersize', r'markercolor',
-        ]
+        # 若未预计算，则现算一次（列名固定，正则只需执行一遍）
+        if style_cols is None:
+            import re
+            style_patterns = [
+                r'MAPINFO_pen', r'MAPINFO_brush', r'MAPINFO_symbol', r'MAPINFO_font',
+                r'MAPINFO_Pen', r'MAPINFO_Brush', r'MAPINFO_Symbol', r'MAPINFO_Font',
+                r'^pen$', r'^brush$', r'^symbol$', r'^font$',
+                r'_pen$', r'_brush$', r'_symbol$', r'_font$',
+                r' Pen$', r' Brush$', r' Symbol$', r' Font$',
+                r'MI_Style', r'MI_Styles', r'MI_StyleDef',
+                r'style', r'styles', r'Style', r'Styles',
+                r'linewidth', r'linetype', r'linecolor',
+                r'fillcolor', r'fillpattern', r'filltype',
+                r'markertype', r'markersize', r'markercolor',
+            ]
+            style_cols = {
+                str(col) for col in columns
+                if col != 'geometry' and any(re.search(p, str(col), re.IGNORECASE) for p in style_patterns)
+            }
 
-        # 首先检查常见的样式列
-        for col in columns:
-            if col == 'geometry':
-                continue
+        # 检查样式列
+        for col in style_cols:
+            value = row.get(col) if isinstance(row, dict) else row[col]
+            if value is not None and value != '' and value != 0:
+                parsed_style = MapInfoParser._parse_style_value(col, value)
+                if parsed_style:
+                    style.update(parsed_style)
 
-            col_lower = str(col).lower()
-            # 检查是否是样式列
-            is_style_col = any(re.search(pattern, col, re.IGNORECASE) for pattern in style_patterns)
-
-            if is_style_col and col in row.index:
-                value = row[col]
-                if value is not None and value != '' and value != 0:
-                    # 提取样式值的各个部分
-                    parsed_style = MapInfoParser._parse_style_value(str(col), value)
-                    if parsed_style:
-                        style.update(parsed_style)
-
-        # 如果没有找到样式，尝试从属性中推断样式
-        # 例如：道路类型、区域类型等
+        # 如果没有找到样式，尝试从属性中推断样式（已废弃，返回 None）
         if not style:
             style = MapInfoParser._infer_style_from_properties(row, geom_type)
 
@@ -635,20 +637,45 @@ class MapInfoParser:
             # 调试：输出所有列名
 
             # 遍历要素
-            for idx, row in gdf.iterrows():
-                geom = row.geometry
+            # 用 to_dict('records') 一次取出所有属性，替代 iterrows 逐行构造 Series——
+            # iterrows 18000 行时开销 ~2.4s，to_dict 仅 ~0.01s
+            records = gdf.to_dict('records')
+            geoms = gdf.geometry
+            columns = gdf.columns
+
+            # 预计算样式列集合（列名固定，正则只执行一遍，避免逐 feature re.search）
+            import re as _re
+            _style_patterns = [
+                r'MAPINFO_pen', r'MAPINFO_brush', r'MAPINFO_symbol', r'MAPINFO_font',
+                r'MAPINFO_Pen', r'MAPINFO_Brush', r'MAPINFO_Symbol', r'MAPINFO_Font',
+                r'^pen$', r'^brush$', r'^symbol$', r'^font$',
+                r'_pen$', r'_brush$', r'_symbol$', r'_font$',
+                r' Pen$', r' Brush$', r' Symbol$', r' Font$',
+                r'MI_Style', r'MI_Styles', r'MI_StyleDef',
+                r'style', r'styles', r'Style', r'Styles',
+                r'linewidth', r'linetype', r'linecolor',
+                r'fillcolor', r'fillpattern', r'filltype',
+                r'markertype', r'markersize', r'markercolor',
+            ]
+            style_cols = {
+                str(col) for col in columns
+                if col != 'geometry' and any(_re.search(p, str(col), _re.IGNORECASE) for p in _style_patterns)
+            }
+
+            for idx, geom in enumerate(geoms):
                 if geom is None:
                     continue
 
                 # 提取属性 (排除 geometry 列)
-                properties = row.drop('geometry').to_dict()
+                properties = records[idx]
+                properties.pop('geometry', None)
                 # 处理可能的时间戳等非JSON序列化类型
                 for k, v in properties.items():
                     if hasattr(v, 'isoformat'):
                         properties[k] = v.isoformat()
 
-                # 提取 MapInfo 样式信息
-                style_info = MapInfoParser._extract_mapinfo_style(row, gdf.columns, layer_type)
+                # 提取 MapInfo 样式信息（传入预计算样式列）
+                style_info = MapInfoParser._extract_mapinfo_style(properties, columns, layer_type, style_cols)
 
                 # 如果没有样式信息，使用图层默认样式
                 if not style_info and layer_default_style:
@@ -978,6 +1005,31 @@ def get_layer_data(data_id: str, layer_id: str, data_dir: Path) -> Optional[Dict
         except Exception:
             pass
 
+    # 3.5 落盘 GeoJSON 缓存（data_dir/.cache/{layer_id}.geojson）
+    # 避免每次请求都重新 parse+convert（18000 polygon 需 ~20s，会触发 Cloudflare 524 / axios 超时）
+    disk_cache = None
+    if source_path:
+        disk_cache_path = data_dir / ".cache" / f"{layer_id}.geojson"
+        try:
+            current_mtime = source_path.stat().st_mtime
+            if disk_cache_path.exists():
+                cache_mtime = disk_cache_path.stat().st_mtime
+                # 源文件 mtime 和缓存 mtime 都记录在文件名后缀：{layer_id}.geojson.{mtime}
+                disk_cache_mtime_file = data_dir / ".cache" / f"{layer_id}.mtime"
+                if disk_cache_mtime_file.exists():
+                    saved_mtime = float(disk_cache_mtime_file.read_text().strip())
+                    if saved_mtime == current_mtime:
+                        with open(disk_cache_path, 'r', encoding='utf-8') as f:
+                            disk_cache = json.load(f)
+                        print(f"[MapInfo] 使用落盘缓存: {disk_cache_path}")
+        except Exception as e:
+            print(f"[MapInfo] 读落盘缓存失败 {disk_cache_path}: {e}")
+
+    if disk_cache is not None:
+        _layer_cache[cache_key] = disk_cache
+        _layer_cache_mtime[cache_key] = source_path.stat().st_mtime
+        return disk_cache
+
     # 4. 缓存未命中，解析文件
     result = None
 
@@ -1001,15 +1053,83 @@ def get_layer_data(data_id: str, layer_id: str, data_dir: Path) -> Optional[Dict
                 print(f"[MapInfo] 解析失败 {file_path}: {e}")
                 continue
 
-    # 6. 写入缓存
+    # 6. 写入缓存（内存 + 落盘）
     if result is not None and source_path:
         try:
             _layer_cache[cache_key] = result
             _layer_cache_mtime[cache_key] = source_path.stat().st_mtime
+
+            # 落盘缓存：后续请求直接读文件，避免重复 parse+convert
+            try:
+                cache_dir = data_dir / ".cache"
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                disk_cache_path = cache_dir / f"{layer_id}.geojson"
+                with open(disk_cache_path, 'w', encoding='utf-8') as f:
+                    json.dump(result, f, ensure_ascii=False)
+                with open(cache_dir / f"{layer_id}.mtime", 'w', encoding='utf-8') as f:
+                    f.write(str(source_path.stat().st_mtime))
+            except Exception as e:
+                print(f"[MapInfo] 写落盘缓存失败: {e}")
         except Exception:
             pass
 
     return result
+
+
+def _transform_layer_coordinates(features: List[MapInfoFeature]) -> None:
+    """
+    图层级整体 WGS84→GCJ02 坐标转换（numpy 向量化，原地修改 feature.coordinates）。
+
+    收集所有 feature 的所有坐标点一次批量转换，比逐 feature 调用
+    transform_geojson_coordinates_batch 快 ~280x（大量小数组的 numpy 固定开销被摊平）。
+    转换后坐标统一为 GeoJSON 标准 [lng, lat] list（保留 z 值）。
+    """
+    import numpy as np
+
+    lngs: List[float] = []
+    lats: List[float] = []
+    z_values: List[Any] = []
+
+    def _collect_struct(node: Any) -> Any:
+        """返回占位结构：叶子为 None（将填转换值），嵌套为 list，兼容 tuple 输入"""
+        if isinstance(node, (list, tuple)) and len(node) > 0:
+            first = node[0]
+            if isinstance(first, (int, float)) and len(node) >= 2:
+                lngs.append(float(node[0]))
+                lats.append(float(node[1]))
+                z_values.append(node[2] if len(node) > 2 else None)
+                return None  # 叶子占位
+            return [_collect_struct(child) for child in node]
+        return node  # 空容器/标量
+
+    placeholder_structure = [_collect_struct(feat.coordinates) for feat in features]
+
+    if not lngs:
+        return
+
+    # 一次性 numpy 批量转换
+    gcj_lats, gcj_lngs = CoordinateTransformer.wgs84_to_gcj02_batch(
+        np.array(lats), np.array(lngs)
+    )
+
+    # 按收集顺序把转换值填入占位结构，并写回 feature.coordinates
+    idx = 0
+
+    def _fill(node: Any) -> Any:
+        nonlocal idx
+        if isinstance(node, list):
+            return [_fill(child) for child in node]
+        if node is None:  # 叶子占位 → 取下一个转换值
+            z = z_values[idx]
+            glat, glng = gcj_lats[idx], gcj_lngs[idx]
+            idx += 1
+            if z is not None:
+                return [float(glng), float(glat), z]
+            return [float(glng), float(glat)]
+        return node
+
+    for i, feat in enumerate(features):
+        feat.coordinates = _fill(placeholder_structure[i])
 
 
 def _convert_to_geojson(layer: MapInfoLayer, transform_coords: bool = True) -> Dict:
@@ -1028,12 +1148,14 @@ def _convert_to_geojson(layer: MapInfoLayer, transform_coords: bool = True) -> D
     """
     features = []
 
+    # 图层级整体坐标转换：一次收集所有 feature 的坐标点 → 一次 numpy batch → 写回。
+    # 比逐 feature 调 batch 快 ~280x（18000 个 15 顶点 polygon：15.9s → 0.06s）
+    if transform_coords and layer.features:
+        _transform_layer_coordinates(layer.features)
+
     for feature in layer.features:
         geometry = {}
         coordinates = feature.coordinates
-
-        if transform_coords:
-            coordinates = CoordinateTransformer.transform_geojson_coordinates_batch(coordinates)
 
         if feature.type == GeometryType.POINT:
             geometry = {
