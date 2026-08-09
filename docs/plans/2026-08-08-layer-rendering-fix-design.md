@@ -106,23 +106,28 @@
 ## 4. 验证
 
 ### 4.1 问题1 -- 渲染效率
-- 导入一个含大量要素（>1000）的图层压缩包，勾选图层后**秒级出图**（目标 <1s）。
-- 切换到其他页面再切回地图，已勾选图层立即显示（命中缓存，不重新拉取/转换）。
-- 地图挂载时 UI 不卡顿（未勾选图层不阻塞主线程）。
+- [✅ 代码验证] 导入一个含大量要素（>1000）的图层压缩包，勾选图层后**秒级出图**（目标 <1s）。
+  - 后端 `_convert_to_geojson` 预转换 + 前端懒加载 + `mapDataCacheStore` 缓存 GeoJSON。
+  - `loadMapInfoLayers` 改为先并发预取数据（限流 CHUNK=5），再构建已勾选图层；未勾选图层不阻塞主线程。
+  - `loadMapInfoLayer` 优先读缓存，命中时跳过 `getLayerData`。
+- [⏳ 待手工] 切换到其他页面再切回地图，已勾选图层立即显示（命中缓存，不重新拉取/转换）。
+- [⏳ 待手工] 地图挂载时 UI 不卡顿（未勾选图层不阻塞主线程）。
 
 ### 4.2 问题2 -- 颜色一致
-- 同一图层内所有无样式要素颜色**完全一致**（点全橙、线全紫、面全绿）。
-- 文件自带样式的要素显示文件原色（Pen 单整数颜色正确还原）。
-- 不同图层无样式要素都用同一默认色（按确认：全部统一默认色）。
+- [✅ 测试] 同一图层内所有无样式要素颜色**完全一致**：`_infer_style_from_properties` 废弃（Task 4），统一前端默认色。
+- [✅ 测试] 文件自带样式的要素显示文件原色：`test_parse_pen_single_integer_color` / `test_parse_brush_*` / `test_parse_symbol_*`（Pen/Brush/Symbol 单整数 BGR 还原，含 GDAL `Pen (...)` 前缀格式）。
+- [✅ 代码] 不同图层无样式要素都用同一默认色（按确认：全部统一默认色）。
 
 ### 4.3 问题3 -- 坐标准确
-- 外部 WGS84 图层要素在高德底图上位置准确，与工参扇区图、底图道路对齐，无偏移。
-- 诊断报告记录断点位置与修复依据。
+- [✅ 端到端] 外部 WGS84 图层要素经 `get_layer_data` 已统一转 GCJ02：
+  - 实测 `/tmp/test_style.mif`（WGS84 [116.397, 39.908]）→ `_convert_to_geojson` 输出 [116.40324, 39.90940]，偏移 ~550m 符合北京 GCJ02 纠偏预期。
+- [✅ 修复] 诊断断点 = `_convert_to_geojson` 的 `transform_coords` 参数未接线（Task 1 诊断 FAIL 转绿）；另修复 `transform_geojson_coordinates` 单环 Polygon `len>=2` 透传 bug。
+- [✅ 双重转换防护] 移除 `render_mobile` 二次转换（data.py），移除前端 `MapInfoLayer.fromGeoJSON` 坐标转换（Task 5）。
 
 ### 4.4 回归
-- 后端测试全绿（新增转换、颜色解析断言）。
-- 前端 `npx tsc --noEmit` 无新错误、`npm run build:vite` 成功。
-- 既有图层（数据管理导入的点/扇区/多边形，走 `geo_data_service` 路径）渲染不受影响。
+- [✅ 后端] 全量 `pytest` 241 passed（新增 `test_mapinfo_style.py` 坐标转换 + 颜色解析 + 属性分色废弃断言）。
+- [✅ 前端] `npx tsc --noEmit` 无 MapInfoLayer/OnlineMap/mapDataCacheStore 新错误（256 错误全部预先存在）；`npm run build:vite` 成功。
+- [⏳ 待手工] 既有图层（数据管理导入的点/扇区/多边形，走 `geo_data_service` 路径）渲染不受影响；外部 WGS84 图层要素在高德底图上位置准确无偏移。
 
 ---
 
