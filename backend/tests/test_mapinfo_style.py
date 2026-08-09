@@ -35,30 +35,38 @@ def test_convert_to_geojson_transform_coords_true():
 
 
 def test_convert_to_geojson_transforms_all_geometry_types():
-    """Point/LineString/Polygon 坐标全部被 WGS84→GCJ02 转换"""
+    """Point/LineString/Polygon 坐标全部被 WGS84→GCJ02 转换
+
+    使用 parse_file 真实产出的 tuple 坐标结构（shapely coords）：
+    - Point   → [x, y]（list 套数字）
+    - Line    → [(x,y), (x,y), ...]（list 套 tuple）
+    - Polygon → [[(x,y), ...]]（list 套 ring，ring 内是 tuple）
+    """
     layer = _make_layer([
         MapInfoFeature(id="p", type=GeometryType.POINT, coordinates=[116.397, 39.908], properties={}),
         MapInfoFeature(id="l", type=GeometryType.LINE,
-                       coordinates=[[116.397, 39.908], [116.398, 39.909]], properties={}),
+                       coordinates=[(116.397, 39.908), (116.398, 39.909)], properties={}),
         MapInfoFeature(id="poly", type=GeometryType.POLYGON,
-                       coordinates=[[[116.397, 39.908], [116.398, 39.908],
-                                     [116.398, 39.909], [116.397, 39.908]]], properties={}),
+                       coordinates=[[(116.397, 39.908), (116.398, 39.908),
+                                     (116.398, 39.909), (116.397, 39.908)]], properties={}),
     ])
     out = _convert_to_geojson(layer, transform_coords=True)
     for f in out["features"]:
         geojson = f["geometry"]["coordinates"]
-        # 递归取第一个坐标对
+        # 递归取第一个坐标对（list 或 tuple 都可能）
         stack = [geojson]
         first = None
         while stack:
             c = stack.pop()
-            if isinstance(c, list) and c and isinstance(c[0], (int, float)):
+            if isinstance(c, (list, tuple)) and c and isinstance(c[0], (int, float)):
                 first = c
                 break
-            if isinstance(c, list):
+            if isinstance(c, (list, tuple)):
                 stack.extend(c)
         assert first is not None
         assert first[0] != 116.397 or first[1] != 39.908, f"geometry {f['geometry']['type']} 未转换"
+        # 输出应为 GeoJSON 标准 list（不是 tuple）
+        assert isinstance(first, list), f"geometry {f['geometry']['type']} 输出应为 list，实际 {type(first)}"
 
 
 # ---------------------------------------------------------------------------

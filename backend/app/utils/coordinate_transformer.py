@@ -225,15 +225,18 @@ class CoordinateTransformer:
             transform_func = CoordinateTransformer.gcj02_to_wgs84
 
         # Point: [longitude, latitude]
-        if isinstance(coordinates, list) and len(coordinates) > 0:
+        # 兼容 list 与 tuple：parse_file 用 shapely 生成的坐标为 tuple 结构
+        # （Line → [(x,y),...]，Polygon → [[(x,y),...]]），但 GeoJSON 标准应为 [lng, lat] list。
+        if isinstance(coordinates, (list, tuple)) and len(coordinates) > 0:
             first_item = coordinates[0]
             # 检查是否是数字（坐标点）
             if isinstance(first_item, (int, float)):
                 if len(coordinates) >= 2:
                     lng, lat = coordinates[0], coordinates[1]
                     new_lat, new_lng = transform_func(lat, lng)
-                    return [new_lng, new_lat] + coordinates[2:]
-                return coordinates
+                    # 统一输出为 GeoJSON 标准 list；坐标可能含 z 值，保留 coordinates[2:]
+                    return [new_lng, new_lat] + list(coordinates[2:])
+                return list(coordinates)
             # 递归处理嵌套坐标（Line 的点列、Polygon 环、MultiGeometry）
             else:
                 return [CoordinateTransformer.transform_geojson_coordinates(coord, from_wgs84)
