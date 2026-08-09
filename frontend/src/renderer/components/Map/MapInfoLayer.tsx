@@ -6,10 +6,9 @@
  * - 渲染线要素（LineString）
  * - 渲染面要素（Polygon）
  * - 使用 Leaflet GeoJSON 图层
- * - 自动应用 WGS84 → GCJ-02 坐标纠偏（与扇区图一致）
+ * - 坐标转换已由后端统一完成（WGS84 → GCJ-02）
  */
 import L from 'leaflet'
-import { CoordinateTransformer } from '../../utils/coordinate'
 
 const IS_DEV = import.meta.env.DEV
 
@@ -95,138 +94,6 @@ const DEFAULT_STYLES: Record<LayerGeometryType, any> = {
     fillColor: '#10b981',
     fillOpacity: 0.3
   }
-}
-
-/**
- * 🔥 性能优化：批量收集需要转换的坐标点
- * @param coordinates GeoJSON 坐标
- * @param coordsToFill 收集到的坐标数组 [lat, lng, 原始坐标引用]
- * @returns 是否找到了坐标点
- */
-function collectCoordinates(coordinates: any, coordsToFill: Array<[number, number, any]>): boolean {
-  if (!Array.isArray(coordinates) || coordinates.length < 2) return false
-
-  const firstItem = coordinates[0]
-  // 检查是否是数字（坐标点）
-  if (typeof firstItem === 'number') {
-    const lng = coordinates[0]
-    const lat = coordinates[1]
-    coordsToFill.push([lat, lng, coordinates])
-    return true
-  }
-  // 递归处理嵌套坐标
-  else {
-    for (const coord of coordinates) {
-      collectCoordinates(coord, coordsToFill)
-    }
-    return true
-  }
-}
-
-/**
- * 转换 GeoJSON 坐标（WGS84 → GCJ-02）
- *
- * @param coordinates GeoJSON 坐标（可能是单个点、线、或面）
- * @returns 转换后的坐标
- */
-function transformGeoJSONCoordinates(coordinates: any): any {
-  // Point: [longitude, latitude]
-  if (Array.isArray(coordinates) && coordinates.length >= 2) {
-    const firstItem = coordinates[0]
-    // 检查是否是数字（坐标点）
-    if (typeof firstItem === 'number') {
-      const lng = coordinates[0]
-      const lat = coordinates[1]
-      const [gcjLat, gcjLng] = CoordinateTransformer.wgs84ToGcj02(lat, lng)
-      return [gcjLng, gcjLat, ...coordinates.slice(2)]
-    }
-    // 递归处理嵌套坐标（LineString 或 Polygon 的环）
-    else {
-      return coordinates.map((coord: any) => transformGeoJSONCoordinates(coord))
-    }
-  }
-  return coordinates
-}
-
-/**
- * 🔥 性能优化版：批量转换 GeoJSON Feature 的坐标
- *
- * 优化策略：
- * 1. 先收集所有需要转换的坐标点
- * 2. 使用批量转换函数一次性处理
- * 3. 将转换结果写回原坐标数组
- *
- * 性能提升：约 40-60%（取决于坐标数量）
- */
-function transformFeatureCoordinatesOptimized(feature: GeoJSON.Feature): GeoJSON.Feature {
-  if (!feature.geometry) return feature
-
-  const geometry = feature.geometry
-
-  // 🔥 步骤1：收集所有需要转换的坐标点
-  const coordsToTransform: Array<[number, number, any]> = []
-  collectCoordinates(geometry.coordinates, coordsToTransform)
-
-  // 如果没有坐标需要转换，直接返回
-  if (coordsToTransform.length === 0) return feature
-
-  // 🔥 步骤2：批量转换坐标
-  const coordsOnly = coordsToTransform.map(([lat, lng]) => [lat, lng])
-  const transformedCoords = CoordinateTransformer.batchWgs84ToGcj02Optimized(coordsOnly)
-
-  // 🔥 步骤3：将转换结果写回原坐标数组
-  for (let i = 0; i < coordsToTransform.length; i++) {
-    const [gcjLat, gcjLng] = transformedCoords[i]
-    const originalCoords = coordsToTransform[i][2]
-    originalCoords[0] = gcjLng
-    originalCoords[1] = gcjLat
-  }
-
-  return feature
-}
-
-/**
- * 转换整个 GeoJSON Feature 的坐标
- */
-function transformFeatureCoordinates(feature: GeoJSON.Feature): GeoJSON.Feature {
-  if (!feature.geometry) return feature
-
-  const geometry = feature.geometry
-
-  // Point
-  if (geometry.type === 'Point') {
-    geometry.coordinates = transformGeoJSONCoordinates(geometry.coordinates)
-  }
-  // LineString
-  else if (geometry.type === 'LineString') {
-    geometry.coordinates = transformGeoJSONCoordinates(geometry.coordinates)
-  }
-  // Polygon
-  else if (geometry.type === 'Polygon') {
-    geometry.coordinates = geometry.coordinates.map((ring: any) =>
-      transformGeoJSONCoordinates(ring)
-    )
-  }
-  // MultiPoint
-  else if (geometry.type === 'MultiPoint') {
-    geometry.coordinates = geometry.coordinates.map((coord: any) =>
-      transformGeoJSONCoordinates(coord)
-    )
-  }
-  // MultiLineString
-  else if (geometry.type === 'MultiLineString') {
-    geometry.coordinates = geometry.coordinates.map((line: any) =>
-      transformGeoJSONCoordinates(line)
-    )
-  }
-  // MultiPolygon
-  else if (geometry.type === 'MultiPolygon') {
-    geometry.coordinates = geometry.coordinates.map((polygon: any) =>
-      polygon.map((ring: any) => transformGeoJSONCoordinates(ring))
-    )
-  }
-
-  return feature
 }
 
 /**
@@ -498,16 +365,13 @@ export class MapInfoLayer {
   static async fromGeoJSON(options: MapInfoLayerOptions): Promise<MapInfoLayer> {
     const mapInfoLayer = new MapInfoLayer(options)
 
-    // 🔥 性能优化：使用批量转换版本的坐标转换
-    // 对于包含大量要素的图层，性能提升 40-60%
-    const transformedData: GeoJSON.FeatureCollection = {
-      type: 'FeatureCollection',
-      features: options.data.features.map(feature => transformFeatureCoordinatesOptimized(feature))
-    }
+    // 后端 get_layer_data 已统一做 WGS84→GCJ02 转换（transform_coords=True）
+    // 前端不再转换，避免双重转换导致位置偏移
+    const transformedData = options.data
 
-    if (IS_DEV) console.log('[MapInfoLayer] Applied optimized coordinate transformation to', transformedData.features.length, 'features')
+    if (IS_DEV) console.log('[MapInfoLayer] 使用后端已转换数据，要素数:', transformedData.features.length)
 
-    // 创建 GeoJSON 图层（使用转换后的数据）
+    // 创建 GeoJSON 图层（使用后端已转换数据）
     mapInfoLayer.geoJSONLayer = L.geoJSON(transformedData, {
       // 点要素样式
       pointToLayer: (feature, latLng) => {
