@@ -371,10 +371,17 @@ export class MapInfoLayer {
 
     if (IS_DEV) console.log('[MapInfoLayer] 使用后端已转换数据，要素数:', transformedData.features.length)
 
+    // Canvas renderer：大幅减少 DOM 节点（18,903 个 SVG path → 单个 canvas）
+    // 图层常含数万个 polygon/line，SVG 渲染会导致 DOM 爆炸、勾选后长时间卡顿。
+    const canvasRenderer = L.canvas()
+
     // 创建 GeoJSON 图层（使用后端已转换数据）
-    mapInfoLayer.geoJSONLayer = L.geoJSON(transformedData, {
+    // renderer 是合法 Leaflet 运行时选项（PathOptions），但 @types/leaflet 的
+    // GeoJSONOptions 未声明该字段，需类型断言
+    const geoJsonOptions: L.GeoJSONOptions & { renderer: any } = {
+      renderer: canvasRenderer,
       // 点要素样式
-      pointToLayer: (feature, latLng) => {
+      pointToLayer: (feature: any, latLng: L.LatLng) => {
         // 获取 feature 级别的样式（如果存在）
         const featureStyle = (feature.properties as any)?._style?.point || {}
         const pointStyle = { ...DEFAULT_STYLES.point, ...mapInfoLayer.style.point, ...featureStyle }
@@ -383,6 +390,8 @@ export class MapInfoLayer {
         if (featureStyle.markerSymbol && featureStyle.markerSymbol !== 'circle') {
           // MapInfo 符号编号转 Leaflet 图标
           return L.circleMarker(latLng, {
+            // pointToLayer 不继承 GeoJSON 的 renderer，需显式传入以使用 Canvas
+            renderer: canvasRenderer,
             radius: pointStyle.markerSize || pointStyle.radius || 6,
             fillColor: pointStyle.markerColor || pointStyle.fillColor || '#f59e0b',
             color: pointStyle.color || '#fff',
@@ -393,6 +402,7 @@ export class MapInfoLayer {
         }
 
         return L.circleMarker(latLng, {
+          renderer: canvasRenderer,
           radius: pointStyle.markerSize || pointStyle.radius || 6,
           fillColor: pointStyle.markerColor || pointStyle.fillColor || '#f59e0b',
           color: pointStyle.color || '#fff',
@@ -489,7 +499,9 @@ export class MapInfoLayer {
           }
         })
       }
-    })
+    }
+
+    mapInfoLayer.geoJSONLayer = L.geoJSON(transformedData, geoJsonOptions as any)
 
     return mapInfoLayer
   }
