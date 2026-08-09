@@ -54,6 +54,7 @@ import { SectorSVGLayer, PCIHighlightConfig, TACHighlightConfig, NeighborHighlig
 import { pciDataSyncService } from '../../services/pciDataSyncService'
 import { neighborDataSyncService } from '../../services/neighborDataSyncService'
 import { tacDataSyncService } from '../../services/tacDataSyncService'
+import { useMapDataCacheStore } from '../../store/mapDataCacheStore'
 // TACLegend 已移除，各个页面自己管理对应的图例组件
 
 type MapLayerType = 'satellite' | 'roadmap'
@@ -2685,19 +2686,31 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
         }
       } else {
         // 默认 MapInfo 图层
-        console.log('[OnlineMap] 从MapInfo文件加载图层, dataId:', layerFile.dataId)
-        const response = await layerApi.getLayerData(layerFile.dataId, layerFile.id)
-        console.log('[OnlineMap] MapInfo API响应:', response.success, '有数据:', !!response.data)
-        if (response.success && response.data) {
-          geojsonData = response.data as GeoJSON.FeatureCollection
+        // 优先使用缓存的后端已转换 GeoJSON（懒加载时已 prefetch）
+        const cachedGeojson = useMapDataCacheStore.getState().layers[layerFile.id]?.geojson
+        if (cachedGeojson) {
+          geojsonData = cachedGeojson as GeoJSON.FeatureCollection
+          console.log('[OnlineMap] 使用缓存的MapInfo数据, layerId:', layerFile.id, '要素数:', geojsonData.features?.length)
         } else {
-          // 数据不存在或加载失败，跳过此图层
-          console.log('[OnlineMap] 图层数据不存在，跳过:', layerFile.id, layerFile.name)
-          return
+          console.log('[OnlineMap] 从MapInfo文件加载图层, dataId:', layerFile.dataId)
+          const response = await layerApi.getLayerData(layerFile.dataId, layerFile.id)
+          console.log('[OnlineMap] MapInfo API响应:', response.success, '有数据:', !!response.data)
+          if (response.success && response.data) {
+            geojsonData = response.data as GeoJSON.FeatureCollection
+          } else {
+            // 数据不存在或加载失败，跳过此图层
+            console.log('[OnlineMap] 图层数据不存在，跳过:', layerFile.id, layerFile.name)
+            return
+          }
         }
       }
 
       if (geojsonData) {
+        // 缓存后端已转换 GeoJSON，避免下次重复拉取（仅 MapInfo 源）
+        if (layerFile.sourceType !== 'excel') {
+          useMapDataCacheStore.getState().cacheLayerGeoJSON(layerFile.id, geojsonData)
+        }
+
         // 创建图层选项
         const options: MapInfoLayerOptions = {
           id: layerFile.id,
@@ -2750,18 +2763,48 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
   }, [pointFileLabelVisibility, labelSettingsMap, showFeatureInfo])
 
   /**
-   * 加载所有MapInfo图层
+   * 懒加载：只拉取 MapInfo 图层数据并缓存，不构建图层
+   */
+  const prefetchLayerData = useCallback(async (layerFile: LayerFileOption) => {
+    // Excel 点数据走 GeoDataLayer 分支，不在此预取
+    if (layerFile.sourceType === 'excel') return
+
+    // 已缓存则跳过
+    if (useMapDataCacheStore.getState().layers[layerFile.id]?.geojson) return
+
+    try {
+      const response = await layerApi.getLayerData(layerFile.dataId, layerFile.id)
+      if (response.success && response.data) {
+        useMapDataCacheStore.getState().cacheLayerGeoJSON(layerFile.id, response.data)
+      }
+    } catch (error) {
+      console.error('[OnlineMap] 预取图层数据失败:', layerFile.id, error)
+    }
+  }, [])
+
+  /**
+   * 加载所有MapInfo图层（懒加载：先并发预取数据，再构建已勾选图层）
    */
   const loadMapInfoLayers = useCallback(async () => {
     if (!mapInfoLayerManagerRef.current || !mapInstanceRef.current) return
 
     const allFiles = [...layerFiles, ...pointFiles]
-    console.log('[OnlineMap] Loading all layers, count:', allFiles.length)
+    console.log('[OnlineMap] 加载图层数据（懒加载，不阻塞主线程）:', allFiles.length)
 
-    for (const layerFile of allFiles) {
+    // 并发拉取数据并缓存（限流，避免一次几十个请求）
+    const CHUNK = 5
+    for (let i = 0; i < allFiles.length; i += CHUNK) {
+      const chunk = allFiles.slice(i, i + CHUNK)
+      await Promise.all(chunk.map(layerFile => prefetchLayerData(layerFile)))
+    }
+
+    // 挂载完成后，对已勾选图层触发构建（从缓存取 geojson 构建并 addTo），保证进入地图即显示
+    const visibleFiles = allFiles.filter(f => f.visible)
+    console.log('[OnlineMap] 构建已勾选图层数量:', visibleFiles.length)
+    for (const layerFile of visibleFiles) {
       await loadMapInfoLayer(layerFile)
     }
-  }, [layerFiles, pointFiles, loadMapInfoLayer])
+  }, [layerFiles, pointFiles, loadMapInfoLayer, prefetchLayerData])
 
   /**
    * 切换地图类型

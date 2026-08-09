@@ -16,6 +16,7 @@ interface SectorCacheEntry {
 interface LayerCacheEntry {
   layerId: string
   bounds: any
+  geojson?: any          // 后端已转 GCJ02 的 GeoJSON，缓存避免重新拉取/重建
   loadedAt: number
 }
 
@@ -42,6 +43,7 @@ interface MapDataCacheState {
   cacheSectors: (workbookId: string, data: any[]) => void
   getCachedSectors: (workbookId: string) => any[] | null
   cacheLayer: (layerId: string, bounds: any) => void
+  cacheLayerGeoJSON: (layerId: string, geojson: any) => void
   cacheGeoData: (dataId: string, data: any) => void
 
   // 标记脏数据（工参更新后调用）
@@ -100,6 +102,23 @@ export const useMapDataCacheStore = create<MapDataCacheState>()((set, get) => ({
         [layerId]: { layerId, bounds, loadedAt: Date.now() }
       }
     }))
+  },
+
+  cacheLayerGeoJSON: (layerId, geojson) => {
+    set(state => {
+      const existing = state.layers[layerId]
+      return {
+        layers: {
+          ...state.layers,
+          [layerId]: {
+            layerId,
+            bounds: existing?.bounds ?? null,
+            geojson,
+            loadedAt: Date.now()
+          }
+        }
+      }
+    })
   },
 
   cacheGeoData: (dataId, data) => {
