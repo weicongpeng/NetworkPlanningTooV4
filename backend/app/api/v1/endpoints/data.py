@@ -835,26 +835,19 @@ async def render_mobile_data(data_id: str) -> Dict[str, Any]:
         data_type = data_info.get("type", "")
         
         if data_type == "map":
-            # MapInfo 文件：获取所有图层的 GeoJSON 数据（坐标转换 GCJ02）
+            # MapInfo 文件：获取所有图层的 GeoJSON 数据
+            # 坐标转换统一由 get_layer_data 内部完成（transform_coords=True，WGS84→GCJ02）
             from app.services.mapinfo_service import get_layer_data as get_mapinfo_layer_data
-            from app.utils.coordinate_transformer import CoordinateTransformer
-            
+
             layers_meta = data_info.get("metadata", {}).get("layers", [])
             data_dir = settings.DATA_DIR / data_id
-            
+
             layers_result = []
             for layer_meta in layers_meta:
                 try:
                     layer_id = layer_meta.get("id", "")
                     geojson = get_mapinfo_layer_data(data_id, layer_id, data_dir)
                     if geojson and "features" in geojson:
-                        # 转换坐标 WGS84 → GCJ02
-                        for feature in geojson["features"]:
-                            if feature.get("geometry") and feature["geometry"].get("coordinates"):
-                                feature["geometry"]["coordinates"] = \
-                                    CoordinateTransformer.transform_geojson_coordinates(
-                                        feature["geometry"]["coordinates"], from_wgs84=True
-                                    )
                         layers_result.append({
                             "id": layer_id,
                             "name": layer_meta.get("name", layer_id),

@@ -225,14 +225,16 @@ class CoordinateTransformer:
             transform_func = CoordinateTransformer.gcj02_to_wgs84
 
         # Point: [longitude, latitude]
-        if isinstance(coordinates, list) and len(coordinates) >= 2:
+        if isinstance(coordinates, list) and len(coordinates) > 0:
             first_item = coordinates[0]
-            # 检查是否是数字（坐标）
+            # 检查是否是数字（坐标点）
             if isinstance(first_item, (int, float)):
-                lng, lat = coordinates[0], coordinates[1]
-                new_lat, new_lng = transform_func(lat, lng)
-                return [new_lng, new_lat] + coordinates[2:]
-            # 递归处理嵌套坐标
+                if len(coordinates) >= 2:
+                    lng, lat = coordinates[0], coordinates[1]
+                    new_lat, new_lng = transform_func(lat, lng)
+                    return [new_lng, new_lat] + coordinates[2:]
+                return coordinates
+            # 递归处理嵌套坐标（Line 的点列、Polygon 环、MultiGeometry）
             else:
                 return [CoordinateTransformer.transform_geojson_coordinates(coord, from_wgs84)
                         for coord in coordinates]

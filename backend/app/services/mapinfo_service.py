@@ -7,6 +7,7 @@ MapInfo 文件解析服务
 - .dat: 数据文件
 """
 import os
+import re
 import time
 import uuid
 import json
@@ -24,6 +25,12 @@ from app.models.database import Layer
 _layer_cache: Dict[str, Dict] = {}
 _layer_cache_mtime: Dict[str, float] = {}
 _layer_cache_ttl: int = 600  # 缓存10分钟
+
+# 当前进程最后一次 parse_mapinfo_files 调用的解析错误清单
+# 每次调用入口处清空，parse_directory 内部 append。
+# 供 data_service 把每个失败文件的具体原因写入 index.json metadata，
+# 避免 len(layers)==0 静默返回上层。
+_LAST_PARSE_ERRORS: List[Dict[str, str]] = []
 
 
 class GeometryType(Enum):
@@ -412,6 +419,44 @@ class MapInfoParser:
         return style if style else None
 
     @staticmethod
+    def _normalize_tab_charset(tab_file: Optional[Path]) -> None:
+        """规范化 .tab 文件的 charset 声明为 WindowsSimpChinese。
+
+        外部上传的 MapInfo TAB 文件 charset 可能为 Neutral（MapInfo Pro 7.0 之前的
+        常见默认值），但 .dat 实际数据为 GBK 编码。fiona 打开 TAB 时优先使用
+        .tab 中声明的 charset（不信任 encoding 参数），Neutral 会被解释为
+        WindowsANSI/Latin1，导致：
+          - 中文字段名/属性值被错位解码
+          - gpd.read_file 抛异常，layer 被静默丢弃
+
+        关键约束：必须做**字节级替换**，不能 read_text() 重新编码。
+        .tab 的字段名部分通常是 GBK 编码（如 "是否共享"、"厂家"、"站高"），
+        read_text(encoding="utf-8") 会把部分 GBK 字节误读为拉丁/西里尔字符，
+        errors="ignore" 会把非合法 UTF-8 的 GBK 字节直接丢弃，
+        导致字段名变空、Definition Table 结构被破坏、fiona 报
+        "Failed to parse field definition"。
+
+        因为 "Neutral" / "WindowsSimpChinese" / "!charset" / "Charset" / 引号
+        等关键字都是纯 ASCII，所以直接做 b"Neutral" → b"WindowsSimpChinese"
+        字节替换即可，不动其他字节。
+        """
+        if not tab_file or not tab_file.exists():
+            return
+        try:
+            raw = tab_file.read_bytes()
+        except Exception:
+            return
+        # 已是 WindowsSimpChinese 且无 Neutral 残留 → 跳过（幂等）
+        if b"WindowsSimpChinese" in raw and b"Neutral" not in raw:
+            return
+        if b"Neutral" not in raw:
+            return
+        new_raw = raw.replace(b"Neutral", b"WindowsSimpChinese")
+        if new_raw != raw:
+            tab_file.write_bytes(new_raw)
+            print(f"[MapInfoParser] 规范化 {tab_file.name} charset: Neutral → WindowsSimpChinese")
+
+    @staticmethod
     def _read_tab_metadata(tab_file: Path) -> Dict[str, Any]:
         """
         读取 .TAB 文件的元数据信息
@@ -651,6 +696,10 @@ class MapInfoParser:
             tab_metadata = MapInfoParser._read_tab_metadata(tab_file) if tab_file and tab_file.exists() else {}
             layer_name = tab_metadata.get('name', file_path.stem)
 
+            # 读取前规范化 .tab charset（外部上传的 TAB 可能是 Neutral 声明）
+            if tab_file and tab_file.exists():
+                MapInfoParser._normalize_tab_charset(tab_file)
+
             # 使用 Geopandas 读取文件
             try:
                 gdf = gpd.read_file(path_str, encoding='gbk')
@@ -796,11 +845,20 @@ class MapInfoParser:
                 print(f"[MapInfoParser] ❌ 缺少必要的库: {e}")
                 print(f"[MapInfoParser] 提示: 请运行 'pip install geopandas shapely' 安装依赖")
                 # 不继续解析其他文件，因为都会失败
+                _LAST_PARSE_ERRORS.append({
+                    "file": tab_file.name,
+                    "error": f"缺少依赖: {str(e)[:200]}",
+                })
                 break
             except Exception as e:
                 print(f"[MapInfoParser] 解析 TAB 文件失败 {tab_file.name}: {e}")
                 import traceback
                 traceback.print_exc()
+                # 把失败原因暴露到模块级列表，data_service 可读取并写入 index.json metadata
+                _LAST_PARSE_ERRORS.append({
+                    "file": tab_file.name,
+                    "error": f"{type(e).__name__}: {str(e)[:300]}",
+                })
 
         # 然后查找 .mif 文件（不区分大小写，递归搜索子目录，只处理没有对应 .tab 文件的）
         mif_files = sorted([f for f in dir_path.rglob("*") if f.suffix.lower() == '.mif' and f.is_file()])
@@ -818,14 +876,31 @@ class MapInfoParser:
                 # ImportError 表示缺少 geopandas 库
                 print(f"[MapInfoParser] ❌ 缺少必要的库: {e}")
                 print(f"[MapInfoParser] 提示: 请运行 'pip install geopandas shapely' 安装依赖")
+                _LAST_PARSE_ERRORS.append({
+                    "file": mif_file.name,
+                    "error": f"缺少依赖: {str(e)[:200]}",
+                })
                 break
             except Exception as e:
                 print(f"[MapInfoParser] 解析 MIF 文件失败 {mif_file.name}: {e}")
                 import traceback
                 traceback.print_exc()
+                _LAST_PARSE_ERRORS.append({
+                    "file": mif_file.name,
+                    "error": f"{type(e).__name__}: {str(e)[:300]}",
+                })
 
         print(f"[MapInfoParser] 目录解析完成，共解析 {len(layers)} 个图层")
         return layers
+
+
+def get_last_parse_errors() -> List[Dict[str, str]]:
+    """获取最近一次 parse_mapinfo_files 调用的解析错误列表（深拷贝）。
+
+    返回值形如 [{"file": "xxx.tab", "error": "ValueError: ..."}, ...]
+    供 data_service 写入 index.json metadata，便于前端诊断。
+    """
+    return list(_LAST_PARSE_ERRORS)
 
 
 def parse_mapinfo_files(upload_path: Path, user_id: int = 1, parent_id: str = None) -> List[Dict[str, Any]]:
@@ -837,8 +912,12 @@ def parse_mapinfo_files(upload_path: Path, user_id: int = 1, parent_id: str = No
         user_id: 用户ID
         parent_id: 可选的父级 data_id（与 API 层 data_id 一致，避免写入时生成新 UUID）
 
-    返回图层元数据列表
+    返回图层元数据列表。每个文件失败原因记录在模块级 _LAST_PARSE_ERRORS，
+    调用方可通过 get_last_parse_errors() 读取并写入 index.json metadata。
     """
+    # 每次新调用入口清空错误列表，避免跨调用累积
+    _LAST_PARSE_ERRORS.clear()
+
     layers = []
 
     if upload_path.is_file():
@@ -1035,15 +1114,16 @@ def get_layer_data(data_id: str, layer_id: str, data_dir: Path) -> Optional[Dict
     return result
 
 
-def _convert_to_geojson(layer: MapInfoLayer, transform_coords: bool = False) -> Dict:
+def _convert_to_geojson(layer: MapInfoLayer, transform_coords: bool = True) -> Dict:
     """
     将 MapInfo 图层转换为 GeoJSON 格式
 
-    注意：坐标转换在前端进行，以保证与扇区图的纠偏算法一致
+    坐标转换统一在后端进行（transform_coords=True 默认），
+    前端不再做 WGS84→GCJ02，避免双重转换导致偏移。
 
     Args:
         layer: MapInfo 图层
-        transform_coords: 是否转换坐标（默认false，由前端处理）
+        transform_coords: 是否转换坐标（默认True，后端统一转换）
 
     Returns:
         GeoJSON FeatureCollection
@@ -1053,6 +1133,9 @@ def _convert_to_geojson(layer: MapInfoLayer, transform_coords: bool = False) -> 
     for feature in layer.features:
         geometry = {}
         coordinates = feature.coordinates
+
+        if transform_coords:
+            coordinates = CoordinateTransformer.transform_geojson_coordinates(coordinates)
 
         if feature.type == GeometryType.POINT:
             geometry = {
