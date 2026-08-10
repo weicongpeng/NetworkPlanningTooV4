@@ -19,6 +19,7 @@ import { NetworkStatusAlert } from './NetworkStatusIndicator'
 import { frequencyColorMapper } from '../../utils/frequencyColors'
 import { mapDataService, RenderSectorData } from '../../services/mapDataService'
 import { CoordinateTransformer } from '../../utils/coordinate'
+import { extractFeatureId } from '../../utils/featureId'
 import { SectorInfoPanel, useSectorInfoPanel } from './SectorInfoPanel'
 import { FeatureInfoPanel, useFeatureInfoPanel } from './FeatureInfoPanel'
 import { MapInfoLayerManager, MapInfoLayer, MapInfoLayerOptions, LayerGeometryType } from './MapInfoLayer'
@@ -47,6 +48,9 @@ const __sharedMeasureModeRef: { current: boolean } = { current: false }
 const __sharedMeasurePointsRef: { current: Array<{ lng: number; lat: number }> } = { current: [] }
 const __sharedFinishMeasurementRef: { current: (() => void) | null } = { current: null }
 const __sharedHandleMapClickRef: { current: ((event: any) => void) | null } = { current: null }
+// 模块级：跨页面共享，跟踪已创建的数据图层实例（MapInfoLayer / GeoDataLayer）
+// 用途：页面切换卸载清理意外失败时，重新挂载时从缓存地图上强制移除残留图层，避免"取消勾选后扇区不消失/叠加"
+const __mapDataLayerInstances: Set<{ remove: (map: any) => any }> = new Set()
 // =====================================
 
 import { mapStateService } from '../../services/mapStateService'
@@ -528,6 +532,10 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
   // State
   const [loading, setLoading] = useState(true)
   const [isMapInitialized, setIsMapInitialized] = useState(false)
+  // 图层加载中状态（勾选图层时地图中央转圈提示）
+  // 用计数器支持并发：连续勾选多个图层时，所有加载都完成才隐藏
+  const [layerLoading, setLayerLoading] = useState(false)
+  const layerLoadCountRef = useRef(0)
   const [mapLayerType, setMapLayerType] = useState<MapLayerType>(() => mapStateService.getState().mapLayerType)
   const [layerVisibility, setLayerVisibility] = useState<LayerVisibility>(initialLayerVisibility)
 
@@ -2458,8 +2466,9 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
 
     console.log('[OnlineMap] loadMapInfoLayer 开始加载:', layerFile.id, layerFile.name, 'sourceType:', layerFile.sourceType, 'visible:', layerFile.visible)
 
-    // 对于 GeoDataLayer（点、扇区或多边形），检查是否已存在，如果存在则直接更新可见性
-    if ((layerFile.geometryType === 'point' || layerFile.geometryType === 'sector' || layerFile.geometryType === 'polygon') && geoDataLayerManagerRef.current) {
+    // 检查是否已存在于 GeoDataLayer 管理器（以实际创建为准，不依赖 geometryType 判断，
+    // 避免 geometryType 未定义时取消勾选无法移除 / 重新勾选叠加）
+    if (geoDataLayerManagerRef.current) {
       const existingLayer = geoDataLayerManagerRef.current.getLayer(layerFile.id)
       if (existingLayer) {
         console.log('[OnlineMap] GeoDataLayer 已存在，直接更新可见性:', layerFile.visible)
@@ -2639,6 +2648,8 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
 
               console.log('[OnlineMap] ✅ addLayer 返回成功:', geoLayer)
               loadedMapInfoLayersRef.current.add(layerFile.id)
+              // 注册到模块级数据图层集合（页面切换清理兜底）
+              __mapDataLayerInstances.add(geoLayer)
 
               // 同步标签可见性状态
               const labelVisible = pointFileLabelVisibility[layerFile.id] || false
@@ -2729,9 +2740,18 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
         console.log('[OnlineMap] MapInfoLayer创建完成, leafletLayer存在:', !!leafletLayer)
 
         if (leafletLayer) {
+          // 防御：若该 id 已有旧 MapInfoLayer 仍在地图上，先移除，避免重复加载叠加
+          const oldRef = mapInfoLayerRefsRef.current.get(layerFile.id)
+          if (oldRef && mapInstanceRef.current && mapInstanceRef.current.hasLayer(oldRef.leafletLayer)) {
+            console.log('[OnlineMap] 存在同 id 旧 MapInfoLayer，先移除:', layerFile.id)
+            mapInstanceRef.current.removeLayer(oldRef.leafletLayer)
+          }
+
           // 存储图层实例和 Leaflet 图层以便控制
           mapInfoLayerRefsRef.current.set(layerFile.id, { mapInfoLayer, leafletLayer })
           loadedMapInfoLayersRef.current.add(layerFile.id)
+          // 注册到模块级数据图层集合（页面切换清理兜底）
+          __mapDataLayerInstances.add(mapInfoLayer)
           console.log('[OnlineMap] 图层已存储到refs, loaded状态:', loadedMapInfoLayersRef.current.has(layerFile.id))
 
           // 同步标签可见性
@@ -2783,31 +2803,69 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
   }, [])
 
   /**
+   * 图层加载开始/结束（计数器支持并发，全部完成才隐藏转圈）
+   */
+  const beginLayerLoad = useCallback(() => {
+    layerLoadCountRef.current++
+    setLayerLoading(true)
+  }, [])
+
+  const endLayerLoad = useCallback(() => {
+    layerLoadCountRef.current = Math.max(0, layerLoadCountRef.current - 1)
+    if (layerLoadCountRef.current === 0) {
+      setLayerLoading(false)
+    }
+  }, [])
+
+  /**
    * 加载所有MapInfo图层（懒加载：先并发预取数据，再构建已勾选图层）
    */
   const loadMapInfoLayers = useCallback(async () => {
     if (!mapInfoLayerManagerRef.current || !mapInstanceRef.current) return
 
     const allFiles = [...layerFiles, ...pointFiles]
-    console.log('[OnlineMap] 加载图层数据（懒加载，不阻塞主线程）:', allFiles.length)
-
-    // 只预取已勾选的图层：不可见图层等用户勾选时再懒加载，
-    // 避免首屏对几十个图层发起请求（尤其是大图层，首次解析 +20s 会阻塞勾选渲染）
     const visibleFiles = allFiles.filter(f => f.visible)
-    console.log('[OnlineMap] 预取已勾选图层数量:', visibleFiles.length)
 
-    // 并发拉取数据并缓存（限流，避免一次几十个请求）
-    const CHUNK = 5
-    for (let i = 0; i < visibleFiles.length; i += CHUNK) {
-      const chunk = visibleFiles.slice(i, i + CHUNK)
-      await Promise.all(chunk.map(layerFile => prefetchLayerData(layerFile)))
-    }
+    // 无可见图层需要加载时，不显示加载转圈
+    if (visibleFiles.length === 0) return
 
-    // 挂载完成后，对已勾选图层触发构建（从缓存取 geojson 构建并 addTo），保证进入地图即显示
-    for (const layerFile of visibleFiles) {
-      await loadMapInfoLayer(layerFile)
+    beginLayerLoad()
+    try {
+      console.log('[OnlineMap] 加载图层数据（懒加载，不阻塞主线程）:', allFiles.length)
+
+      // 只预取已勾选的图层：不可见图层等用户勾选时再懒加载，
+      // 避免首屏对几十个图层发起请求（尤其是大图层，首次解析 +20s 会阻塞勾选渲染）
+      console.log('[OnlineMap] 预取已勾选图层数量:', visibleFiles.length)
+
+      // 并发拉取数据并缓存（限流，避免一次几十个请求）
+      const CHUNK = 5
+      for (let i = 0; i < visibleFiles.length; i += CHUNK) {
+        const chunk = visibleFiles.slice(i, i + CHUNK)
+        await Promise.all(chunk.map(layerFile => prefetchLayerData(layerFile)))
+      }
+
+      // 挂载完成后，对已勾选图层触发构建（从缓存取 geojson 构建并 addTo），保证进入地图即显示
+      // 并行构建（带并发上限）：首次加载涉及 API 拉取（I/O），并行可显著减少多图层总耗时；
+      // 已加载图层由 loadedMapInfoLayersRef / geoDataLayerManager.getLayer 守卫，不会重复构建
+      const CONCURRENCY = 3
+      let buildIdx = 0
+      const worker = async () => {
+        while (buildIdx < visibleFiles.length) {
+          const layerFile = visibleFiles[buildIdx++]
+          try {
+            await loadMapInfoLayer(layerFile)
+          } catch (e) {
+            console.error('[OnlineMap] 构建图层失败:', layerFile.id, e)
+          }
+        }
+      }
+      await Promise.all(
+        Array.from({ length: Math.min(CONCURRENCY, visibleFiles.length) }, () => worker())
+      )
+    } finally {
+      endLayerLoad()
     }
-  }, [layerFiles, pointFiles, loadMapInfoLayer, prefetchLayerData])
+  }, [layerFiles, pointFiles, loadMapInfoLayer, prefetchLayerData, beginLayerLoad, endLayerLoad])
 
   /**
    * 切换地图类型
@@ -2919,6 +2977,15 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
           tileLayerRef.current = cached.tileLayer
           initializedRef.current = true
           isInitializingRef.current = false
+
+          // 兜底：清理上次挂载残留的数据图层（若上次卸载清理失败，图层仍挂在缓存地图上）
+          if (__mapDataLayerInstances.size > 0) {
+            console.log('[OnlineMap] 清理上次挂载残留的数据图层:', __mapDataLayerInstances.size)
+            __mapDataLayerInstances.forEach(layer => {
+              try { layer.remove(cached.map) } catch (e) { /* ignore */ }
+            })
+            __mapDataLayerInstances.clear()
+          }
 
           // 恢复地图状态
           const savedState = mapStateService.getState()
@@ -3235,6 +3302,12 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
         loadedMapInfoLayersRef.current.clear()
         mapInfoLayerRefsRef.current.clear()
 
+        // 兜底：确保所有数据图层实例从地图移除（即使 manager.clear 有遗漏/抛错）
+        __mapDataLayerInstances.forEach(layer => {
+          try { layer.remove(map) } catch (e) { /* ignore */ }
+        })
+        __mapDataLayerInstances.clear()
+
         // 3. 清理打点标记和装饰图层（MapPage 专用，需跨页面清除以免污染）
         // 打点标记 (capture markers)
         captureMarkersRef.current.forEach(marker => {
@@ -3544,7 +3617,7 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
         if (isNear) {
           const props = layer.feature.properties
           // 尝试多种可能的ID字段
-          const id = props.id || props.name || props.小区名称 || props.OBJECTID || ''
+          const id = extractFeatureId(props)
           if (id) {
             clickedFeatures.push({ id: String(id), props: { ...props, _layerType: 'MapInfo' }, layerType: 'MapInfo' })
           }
@@ -3643,7 +3716,7 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
           // 已选中，取消选择
           selectedIds.delete(feature.id)
           selectedProperties = selectedProperties.filter(p => {
-            const pid = p.id || p.name || p.小区名称 || p.OBJECTID || ''
+            const pid = extractFeatureId(p)
             return String(pid) !== feature.id
           })
           console.log('[OnlineMap] Shift+点选取消要素:', feature.props.name || feature.id, 'from', feature.layerType)
@@ -3667,7 +3740,7 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
           selectedProperties = [...selectedFeaturesRef.current]
           selectedIds.delete(feature.id)
           selectedProperties = selectedProperties.filter(p => {
-            const pid = p.id || p.name || p.小区名称 || p.OBJECTID || ''
+            const pid = extractFeatureId(p)
             return String(pid) !== feature.id
           })
           console.log('[OnlineMap] 点选取消要素:', feature.props.name || feature.id)
@@ -3754,7 +3827,7 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
 
       // 收集要素ID和属性
       features.forEach(props => {
-        const id = props.id || props.name || props.小区名称 || props.OBJECTID || ''
+        const id = extractFeatureId(props)
         console.log('[OnlineMap] 处理要素:', { id, props })
         if (id) {
           newIds.add(String(id))
@@ -3838,7 +3911,7 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
         if (!selectedIds.has(id)) {
           selectedIds.add(id)
           const prop = newProperties.find(p => {
-            const pid = p.id || p.name || p.小区名称 || p.OBJECTID || ''
+            const pid = extractFeatureId(p)
             return String(pid) === id
           })
           if (prop) selectedProperties.push(prop)
@@ -3916,7 +3989,7 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
 
       // 收集要素ID和属性
       features.forEach(props => {
-        const id = props.id || props.name || props.小区名称 || props.OBJECTID || ''
+        const id = extractFeatureId(props)
         if (id) {
           newIds.add(String(id))
           newProperties.push({ ...props, _layerType: 'MapInfo' })
@@ -4007,7 +4080,7 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
         if (!selectedIds.has(id)) {
           selectedIds.add(id)
           const prop = newProperties.find(p => {
-            const pid = p.id || p.name || p.小区名称 || p.OBJECTID || ''
+            const pid = extractFeatureId(p)
             return String(pid) === id
           })
           if (prop) selectedProperties.push(prop)
@@ -4090,7 +4163,7 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
       const features = mapInfoLayer.getFeaturesInPolygon(polygon)
       console.log('[OnlineMap] MapInfo图层矩形框选返回要素数量:', features.length)
       features.forEach(props => {
-        const id = props.id || props.name || props.小区名称 || props.OBJECTID || ''
+        const id = extractFeatureId(props)
         if (id) {
           newIds.add(String(id))
           newProperties.push({ ...props, _layerType: 'MapInfo' })
@@ -4182,7 +4255,7 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
         if (!selectedIds.has(id)) {
           selectedIds.add(id)
           const prop = newProperties.find(p => {
-            const pid = p.id || p.name || p.小区名称 || p.OBJECTID || ''
+            const pid = extractFeatureId(p)
             return String(pid) === id
           })
           if (prop) selectedProperties.push(prop)
@@ -4962,30 +5035,16 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
           willEnterGeoDataLayerBranch: layerFile.geometryType === 'point' || layerFile.geometryType === 'sector' || layerFile.geometryType === 'polygon'
         })
 
-        // 处理 GeoDataLayer（点状、扇区或多边形类型）
-        if (layerFile.geometryType === 'point' || layerFile.geometryType === 'sector' || layerFile.geometryType === 'polygon') {
-          console.log('[OnlineMap] ========== 处理GeoDataLayer可见性 ==========')
-          console.log('[OnlineMap] layerFile.id:', layerFile.id)
-          console.log('[OnlineMap] layerFile.name:', layerFile.name)
-          console.log('[OnlineMap] layerFile.visible:', layerFile.visible)
-          console.log('[OnlineMap] geoDataLayerManagerRef.current 存在:', !!geoDataLayerManagerRef.current)
-          console.log('[OnlineMap] mapInstanceRef.current 存在:', !!mapInstanceRef.current)
-
-          if (geoDataLayerManagerRef.current && mapInstanceRef.current) {
-            const geoLayer = geoDataLayerManagerRef.current.getLayer(layerFile.id)
-            if (geoLayer) {
-              try {
-                const result = geoLayer.setVisible(mapInstanceRef.current, layerFile.visible)
-                console.log('[OnlineMap] ✅ geoLayer.setVisible 成功完成，返回值:', result)
-              } catch (error) {
-                console.error('[OnlineMap] ❌ geoLayer.setVisible 出错:', error)
-                console.error('[OnlineMap] 错误堆栈:', error instanceof Error ? error.stack : 'No stack')
-              }
-            } else {
-              console.log('[OnlineMap] ⚠️ GeoDataLayer不存在，需要先创建')
-            }
+        // 处理 GeoDataLayer 可见性：以管理器实际是否持有为准（不依赖 geometryType 判断，
+        // 否则 geometryType 未定义的图层取消勾选无法移除、重新勾选会叠加）
+        const geoLayer = geoDataLayerManagerRef.current?.getLayer(layerFile.id)
+        if (geoLayer) {
+          console.log('[OnlineMap] GeoDataLayer 可见性:', layerFile.id, layerFile.name, 'visible:', layerFile.visible)
+          try {
+            geoLayer.setVisible(mapInstanceRef.current, layerFile.visible)
+          } catch (error) {
+            console.error('[OnlineMap] ❌ geoLayer.setVisible 出错:', error)
           }
-          console.log('[OnlineMap] ========================================')
           continue
         }
 
@@ -5019,6 +5078,40 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
         } else {
           console.log('[OnlineMap]   - 跳过: layerRef或mapInstance不存在')
         }
+      }
+
+      // ===== 兜底同步：确保地图实际显示与勾选状态一致（处理任何状态不同步/残留）=====
+      // 遍历管理器中的全部图层，按当前文件列表的 visible 强制校正，
+      // 避免"取消勾选后旧内容残留"或"页面切换后状态不同步"。
+      const mapForSync = mapInstanceRef.current
+      if (mapForSync) {
+        const fileMap = new Map(allFiles.map(f => [f.id, f]))
+        // GeoDataLayer
+        geoDataLayerManagerRef.current?.getAllLayers().forEach(layer => {
+          const file = fileMap.get(layer.getId())
+          const shouldShow = !!file?.visible
+          if (layer.isVisible() !== shouldShow) {
+            console.log('[OnlineMap] 兜底同步 GeoDataLayer 可见性:', layer.getId(), '->', shouldShow)
+            try {
+              layer.setVisible(mapForSync, shouldShow)
+            } catch (error) {
+              console.error('[OnlineMap] 兜底同步 GeoDataLayer 出错:', layer.getId(), error)
+            }
+          }
+        })
+        // MapInfoLayer
+        mapInfoLayerRefsRef.current.forEach(({ mapInfoLayer }, id) => {
+          const file = fileMap.get(id)
+          const shouldShow = !!file?.visible
+          if (mapInfoLayer.isVisible() !== shouldShow) {
+            console.log('[OnlineMap] 兜底同步 MapInfoLayer 可见性:', id, '->', shouldShow)
+            try {
+              mapInfoLayer.setVisible(mapForSync, shouldShow)
+            } catch (error) {
+              console.error('[OnlineMap] 兜底同步 MapInfoLayer 出错:', id, error)
+            }
+          }
+        })
       }
     })();
   }, [layerFiles, pointFiles, loadMapInfoLayers]);
@@ -5306,6 +5399,16 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
           <div className="absolute top-4 left-4 z-[1000] bg-white/90 backdrop-blur px-4 py-2 rounded-lg shadow flex items-center gap-2">
             <Loader2 className="animate-spin text-blue-600" size={16} />
             <span className="text-sm text-blue-600">加载地图中...</span>
+          </div>
+        )}
+
+        {/* 图层加载中 - 地图中央转圈提示（勾选图层后让用户明确当前状态） */}
+        {layerLoading && (
+          <div className="absolute inset-0 z-[1001] flex items-center justify-center pointer-events-none">
+            <div className="bg-white/95 backdrop-blur rounded-xl shadow-lg px-5 py-3 flex items-center gap-3">
+              <Loader2 className="animate-spin text-blue-600" size={20} />
+              <span className="text-sm text-blue-600">{t('map.loading')}</span>
+            </div>
           </div>
         )}
 

@@ -161,6 +161,9 @@ export class GeoDataLayer {
   private _mapMoveTimer: number | null = null
   // 几何图形重新渲染定时器
   private _geometryRenderTimer: number | null = null
+  // 初始分块渲染定时器 + 令牌（令牌递增用于取消过期批次）
+  private _chunkTimer: number | null = null
+  private _renderToken: number = 0
   // 缩放事件处理函数引用（用于取消注册）
   private _onZoomBound: (() => void) | null = null
   private _onZoomEndBound: (() => void) | null = null
@@ -273,22 +276,9 @@ export class GeoDataLayer {
       this.currentZoom = currentMapZoom
     }
 
-    switch (this.geometryType) {
-      case 'point':
-        console.log('[GeoDataLayer] 调用 _renderPoints(false)')
-        this._renderPoints(false)  // 初始渲染不使用裁剪
-        break
-      case 'sector':
-        console.log('[GeoDataLayer] 调用 _renderSectors(false)')
-        this._renderSectors(false)  // 初始渲染不使用裁剪
-        break
-      case 'polygon':
-        console.log('[GeoDataLayer] 调用 _renderPolygons(false)')
-        this._renderPolygons(false)  // 初始渲染不使用裁剪
-        break
-      default:
-        console.warn('[GeoDataLayer] ❌ 未知的 geometryType:', this.geometryType)
-    }
+    // 🔧 分块渲染：视口裁剪 + 批次让步，避免一次性创建全量要素阻塞主线程
+    // 大数据集渐进显示；小数据集因分块粒度小，耗时差异可忽略
+    this._renderChunked()
 
     console.log('[GeoDataLayer] 将 leafletLayer 添加到地图，已渲染', this.leafletLayer.getLayers().length, '个图层')
     this.leafletLayer.addTo(map)
@@ -303,6 +293,89 @@ export class GeoDataLayer {
   }
 
   /**
+   * 过滤当前视口（含缓冲）内的要素
+   * 点/扇区按中心点判断；多边形按任一顶点是否在视口内判断
+   */
+  private _filterVisible(pad: L.LatLngBounds): GeoDataItem[] {
+    const out: GeoDataItem[] = []
+    for (const item of this.data) {
+      if (this.geometryType === 'polygon') {
+        if (item.path && item.path.some(p => pad.contains([p[0], p[1]]))) out.push(item)
+        continue
+      }
+      if (item.longitude === undefined || item.latitude === undefined) continue
+      const [dlat, dlng] = item.displayLat !== undefined && item.displayLng !== undefined
+        ? [item.displayLat, item.displayLng]
+        : CoordinateTransformer.wgs84ToGcj02(item.latitude, item.longitude)
+      if (pad.contains([dlat, dlng])) out.push(item)
+    }
+    return out
+  }
+
+  /**
+   * 分块渲染（初始渲染 / 视口裁剪 + 批次让步）
+   *
+   * 大数据集一次性创建数万个 Leaflet 图层会阻塞主线程，导致勾选后长时间无响应。
+   * 这里按批次（每帧一批）用 setTimeout 让步渲染，UI 保持响应、要素渐进显示。
+   * 新渲染会递增令牌使旧的未完成批次失效；移动/缩放过时由 _reRenderGeometries 接管。
+   */
+  private _renderChunked(): void {
+    if (!this.leafletLayer || !this.map) return
+
+    // 取消旧的分块渲染
+    this._renderToken++
+    const token = this._renderToken
+    if (this._chunkTimer !== null) {
+      clearTimeout(this._chunkTimer)
+      this._chunkTimer = null
+    }
+
+    this.leafletLayer.clearLayers()
+
+    const pad = this._padBounds(this.map.getBounds(), 0.2)
+    const visible = this._filterVisible(pad)
+
+    const BATCH = 300
+    let i = 0
+    const self = this
+
+    const step = () => {
+      if (token !== self._renderToken || !self.leafletLayer) {
+        self._chunkTimer = null
+        return
+      }
+      const end = Math.min(i + BATCH, visible.length)
+      const slice = visible.slice(i, end)
+      i = end
+      if (slice.length > 0) {
+        switch (self.geometryType) {
+          case 'point':
+            self._renderPoints(false, slice, self.leafletLayer)
+            break
+          case 'sector':
+            self._renderSectors(false, slice, self.leafletLayer)
+            break
+          case 'polygon':
+            self._renderPolygons(false, slice, self.leafletLayer)
+            break
+        }
+      }
+      if (i < visible.length) {
+        self._chunkTimer = window.setTimeout(step, 0)
+      } else {
+        self._chunkTimer = null
+        console.log(`[GeoDataLayer] 分块渲染完成: 视口内 ${visible.length}/${self.data.length} 个要素`)
+        // 重新渲染后恢复选中高亮
+        if (self.selectionHighlightIds) {
+          self.setSelectionHighlight(self.selectionHighlightIds)
+        }
+      }
+    }
+
+    this._chunkTimer = window.setTimeout(step, 0)
+  }
+
+  /**
    * 渲染点状数据
    *
    * 🔧 使用 L.circleMarker（像素半径）+ 动态半径计算替代 L.circle（米半径）。
@@ -310,10 +383,14 @@ export class GeoDataLayer {
    * 可以在每次缩放时精确控制显示大小。
    *
    * @param useCulling 是否使用视口裁剪（默认false显示全部，地图移动后设为true）
+   * @param dataSlice 可选：只渲染数据切片（分块渲染用）
+   * @param destLayer 可选：渲染目标图层（分块渲染用，默认 this.leafletLayer）
    */
-  private _renderPoints(useCulling: boolean = false): void {
+  private _renderPoints(useCulling: boolean = false, dataSlice?: GeoDataItem[], destLayer?: L.LayerGroup): void {
     if (!this.leafletLayer || !this.map) return
 
+    const source = dataSlice || this.data
+    const target = destLayer || this.leafletLayer
     const bounds = this.map.getBounds()
     const paddedBounds = bounds ? this._padBounds(bounds, 0.1) : null
     const zoom = this.map.getZoom()
@@ -322,8 +399,8 @@ export class GeoDataLayer {
     let renderedCount = 0
     let skippedNoCoords = 0
 
-    for (let i = 0; i < this.data.length; i++) {
-      const item = this.data[i]
+    for (let i = 0; i < source.length; i++) {
+      const item = source[i]
       if (item.longitude === undefined || item.latitude === undefined) {
         skippedNoCoords++
         continue
@@ -352,7 +429,7 @@ export class GeoDataLayer {
       if (this.onFeatureClick && this.isInteractive) {
         marker.on('click', (e) => {
           L.DomEvent.stopPropagation(e)
-          this.onFeatureClick!(item.properties, e as L.LeafletMouseEvent, item.name)
+          console.log('[GeoDataLayer] 🔍 要素点击触发:', item.name, { hasProps: !!item.properties }); this.onFeatureClick!(item.properties, e as L.LeafletMouseEvent, item.name)
         })
       }
 
@@ -360,20 +437,25 @@ export class GeoDataLayer {
       if (this.isInteractive) {
         marker.bindTooltip(item.name || `点${i+1}`, { permanent: false, direction: 'top' })
       }
-      marker.addTo(this.leafletLayer!)
+      marker.addTo(target!)
       renderedCount++
     }
 
-    console.log(`[GeoDataLayer] _renderPoints 完成: 总数据=${this.data.length}, 无坐标=${skippedNoCoords}, 过滤=${filteredCount}, 渲染=${renderedCount}`)
+    console.log(`[GeoDataLayer] _renderPoints 完成: 总数据=${source.length}, 无坐标=${skippedNoCoords}, 过滤=${filteredCount}, 渲染=${renderedCount}`)
   }
 
   /**
    * 渲染扇区数据
    * LOD策略: zoom <= 9 用圆点, zoom > 9 用扇形
    * @param useCulling 是否使用视口裁剪（默认false显示全部，地图移动后设为true）
+   * @param dataSlice 可选：只渲染数据切片（分块渲染用）
+   * @param destLayer 可选：渲染目标图层（分块渲染用，默认 this.leafletLayer）
    */
-  private _renderSectors(useCulling: boolean = false): void {
+  private _renderSectors(useCulling: boolean = false, dataSlice?: GeoDataItem[], destLayer?: L.LayerGroup): void {
     if (!this.leafletLayer) return
+
+    const source = dataSlice || this.data
+    const target = destLayer || this.leafletLayer
 
     // 🔧 视口裁剪优化：获取当前视口边界
     const bounds = this.map?.getBounds()
@@ -388,8 +470,8 @@ export class GeoDataLayer {
     let renderedCount = 0
     let skippedNoCoords = 0
 
-    for (let i = 0; i < this.data.length; i++) {
-      const item = this.data[i]
+    for (let i = 0; i < source.length; i++) {
+      const item = source[i]
       if (item.longitude === undefined || item.latitude === undefined) {
         skippedNoCoords++
         continue
@@ -426,14 +508,14 @@ export class GeoDataLayer {
         if (this.onFeatureClick && this.isInteractive) {
           marker.on('click', (e) => {
             L.DomEvent.stopPropagation(e)
-            this.onFeatureClick!(item.properties, e as L.LeafletMouseEvent, item.name)
+            console.log('[GeoDataLayer] 🔍 要素点击触发:', item.name, { hasProps: !!item.properties }); this.onFeatureClick!(item.properties, e as L.LeafletMouseEvent, item.name)
           })
         }
         // 只在交互启用时绑定 tooltip
         if (this.isInteractive) {
           marker.bindTooltip(item.name || `扇区${i+1}`, { permanent: false, direction: 'top' })
         }
-        marker.addTo(this.leafletLayer!)
+        marker.addTo(target!)
         renderedCount++
       } else {
         // 渲染为扇形
@@ -452,19 +534,19 @@ export class GeoDataLayer {
         if (this.onFeatureClick && this.isInteractive) {
           polygon.on('click', (e) => {
             L.DomEvent.stopPropagation(e)
-            this.onFeatureClick!(item.properties, e as L.LeafletMouseEvent, item.name)
+            console.log('[GeoDataLayer] 🔍 要素点击触发:', item.name, { hasProps: !!item.properties }); this.onFeatureClick!(item.properties, e as L.LeafletMouseEvent, item.name)
           })
         }
         // 只在交互启用时绑定 tooltip
         if (this.isInteractive) {
           polygon.bindTooltip(item.name || `扇区${i+1}`, { permanent: false, direction: 'top' })
         }
-        polygon.addTo(this.leafletLayer!)
+        polygon.addTo(target!)
         renderedCount++
       }
     }
 
-    console.log(`[GeoDataLayer] _renderSectors 完成: 总数据=${this.data.length}, 无坐标=${skippedNoCoords}, 过滤=${filteredCount}, 渲染=${renderedCount}`)
+    console.log(`[GeoDataLayer] _renderSectors 完成: 总数据=${source.length}, 无坐标=${skippedNoCoords}, 过滤=${filteredCount}, 渲染=${renderedCount}`)
   }
 
   /**
@@ -473,15 +555,20 @@ export class GeoDataLayer {
    * 坐标说明：item.path 已在后端转换为 GCJ02 坐标，格式为 [[lat, lng], ...]
    * 直接传给 L.polygon 即可，Leaflet 不会进行额外的坐标转换
    * @param useCulling 是否使用视口裁剪（默认false显示全部，地图移动后设为true）
+   * @param dataSlice 可选：只渲染数据切片（分块渲染用）
+   * @param destLayer 可选：渲染目标图层（分块渲染用，默认 this.leafletLayer）
    */
-  private _renderPolygons(useCulling: boolean = false): void {
+  private _renderPolygons(useCulling: boolean = false, dataSlice?: GeoDataItem[], destLayer?: L.LayerGroup): void {
     if (!this.leafletLayer) return
+
+    const source = dataSlice || this.data
+    const target = destLayer || this.leafletLayer
 
     // 🔧 视口裁剪优化：获取当前视口边界
     const bounds = this.map?.getBounds()
     const paddedBounds = bounds ? this._padBounds(bounds, 0.3) : null  // 30% 缓冲（多边形需要更大缓冲）
 
-    console.log('[GeoDataLayer] _renderPolygons 开始，数据量:', this.data.length)
+    console.log('[GeoDataLayer] _renderPolygons 开始，数据量:', source.length)
     console.log('[GeoDataLayer] _renderPolygons this.geometryType:', this.geometryType)
     console.log('[GeoDataLayer] _renderPolygons: useCulling=', useCulling, 'bounds=', bounds, 'paddedBounds=', paddedBounds)
 
@@ -489,8 +576,8 @@ export class GeoDataLayer {
     let renderedCount = 0
     let skippedInvalidPath = 0
 
-    for (let i = 0; i < this.data.length; i++) {
-      const item = this.data[i]
+    for (let i = 0; i < source.length; i++) {
+      const item = source[i]
 
       if (!item.path || item.path.length < 3) {
         skippedInvalidPath++
@@ -527,7 +614,7 @@ export class GeoDataLayer {
         if (this.onFeatureClick && this.isInteractive) {
           polygon.on('click', (e) => {
             L.DomEvent.stopPropagation(e)
-            this.onFeatureClick!(item.properties, e as L.LeafletMouseEvent, item.name)
+            console.log('[GeoDataLayer] 🔍 要素点击触发:', item.name, { hasProps: !!item.properties }); this.onFeatureClick!(item.properties, e as L.LeafletMouseEvent, item.name)
           })
         }
 
@@ -535,14 +622,14 @@ export class GeoDataLayer {
         if (this.isInteractive) {
           polygon.bindTooltip(item.name || `多边形${i+1}`, { permanent: false, direction: 'top' })
         }
-        polygon.addTo(this.leafletLayer!)
+        polygon.addTo(target!)
         renderedCount++
       } catch (error) {
         console.error(`[GeoDataLayer] ❌ 第 ${i} 个多边形渲染失败:`, error)
       }
     }
 
-    console.log(`[GeoDataLayer] _renderPolygons 完成: 总数据=${this.data.length}, 无效路径=${skippedInvalidPath}, 过滤=${filteredCount}, 渲染=${renderedCount}`)
+    console.log(`[GeoDataLayer] _renderPolygons 完成: 总数据=${source.length}, 无效路径=${skippedInvalidPath}, 过滤=${filteredCount}, 渲染=${renderedCount}`)
   }
 
   /**
@@ -575,6 +662,13 @@ export class GeoDataLayer {
       clearTimeout(this._geometryRenderTimer)
       this._geometryRenderTimer = null
       console.log('[GeoDataLayer] remove: 已取消待处理的 _geometryRenderTimer')
+    }
+
+    // 取消分块渲染（递增令牌使未完成批次失效）
+    this._renderToken++
+    if (this._chunkTimer !== null) {
+      clearTimeout(this._chunkTimer)
+      this._chunkTimer = null
     }
 
     // 移除 Canvas 标签层
@@ -1279,6 +1373,13 @@ export class GeoDataLayer {
 
     console.log('[GeoDataLayer] _reRenderGeometries: 重新渲染几何图形（启用视口裁剪）')
 
+    // 取消分块渲染（移动/缩放过时，改由本方法同步渲染当前视口）
+    this._renderToken++
+    if (this._chunkTimer !== null) {
+      clearTimeout(this._chunkTimer)
+      this._chunkTimer = null
+    }
+
     // 清空现有图层
     this.leafletLayer.clearLayers()
 
@@ -1330,6 +1431,13 @@ export class GeoDataLayerManager {
     console.log('[GeoDataLayerManager] visible:', options.visible)
     console.log('[GeoDataLayerManager] data.length:', options.data.length)
     console.log('[GeoDataLayerManager] map 已初始化:', !!this.map)
+
+    // 若已存在同 id 图层，先移除旧实例（避免切换/重复加载导致地图叠加）
+    const existing = this.layers.get(options.id)
+    if (existing && this.map) {
+      console.log('[GeoDataLayerManager] 存在同 id 旧图层，先移除:', options.id)
+      existing.remove(this.map)
+    }
 
     const layer = new GeoDataLayer(options)
     this.layers.set(options.id, layer)

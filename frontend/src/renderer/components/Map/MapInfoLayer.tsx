@@ -9,6 +9,7 @@
  * - 坐标转换已由后端统一完成（WGS84 → GCJ-02）
  */
 import L from 'leaflet'
+import { extractFeatureId } from '../../utils/featureId'
 
 const IS_DEV = import.meta.env.DEV
 
@@ -494,16 +495,43 @@ export class MapInfoLayer {
           L.DomEvent.stopPropagation(e as any)
 
           if (mapInfoLayer.onFeatureClickCallback) {
-            if (IS_DEV) console.log('[MapInfoLayer] Feature clicked:', feature.properties)
+            console.log('[MapInfoLayer] 🔍 要素点击触发:', mapInfoLayer.id, {
+              hasProperties: !!feature.properties,
+              propCount: feature.properties ? Object.keys(feature.properties).length : 0
+            })
             mapInfoLayer.onFeatureClickCallback(feature.properties, e)
           }
         })
       }
     }
 
-    mapInfoLayer.geoJSONLayer = L.geoJSON(transformedData, geoJsonOptions as any)
+    // 🔧 分块构建：避免一次性同步创建数万要素阻塞主线程（大数据集渐进显示）
+    // 先建空 GeoJSON 图层（继承 renderer/pointToLayer/style/onEachFeature 配置），再分块 addData
+    mapInfoLayer.geoJSONLayer = L.geoJSON([], geoJsonOptions as any)
+    await mapInfoLayer._addGeoJSONChunks(transformedData)
 
     return mapInfoLayer
+  }
+
+  /**
+   * 分块向 GeoJSON 图层添加要素
+   * 每次添加一个批次后让步（setTimeout 0），保持 UI 响应、要素渐进显示
+   */
+  private async _addGeoJSONChunks(featureCollection: GeoJSON.FeatureCollection): Promise<void> {
+    if (!this.geoJSONLayer) return
+    const features = featureCollection.features || []
+    const BATCH = 500
+    for (let i = 0; i < features.length; i += BATCH) {
+      const chunk: GeoJSON.FeatureCollection = {
+        type: 'FeatureCollection',
+        features: features.slice(i, i + BATCH)
+      }
+      this.geoJSONLayer.addData(chunk as any)
+      // 让步：让浏览器处理已添加的要素并保持 UI 响应
+      if (i + BATCH < features.length) {
+        await new Promise(resolve => setTimeout(resolve, 0))
+      }
+    }
   }
 
   /**
@@ -548,7 +576,7 @@ export class MapInfoLayer {
       if (!feature || !feature.properties) return
 
       // 获取标识符 - 与 selectFeaturesAtPoint 保持一致的ID获取逻辑
-      const val = feature.properties[idField] || feature.properties['id'] || feature.properties['name'] || feature.properties['小区名称'] || feature.properties['OBJECTID'] || ''
+      const val = feature.properties[idField] || extractFeatureId(feature.properties)
       const isSelected = ids?.has(String(val))
 
       // 更新样式
@@ -754,7 +782,7 @@ export class MapInfoLayer {
     let priority = 0
 
     // 1. 名称前缀优先级（"A"开头最优先）
-    const name = properties.name || properties.小区名称 || properties.CellName || ''
+    const name = properties.name || properties.小区名称 || properties.CellName || properties.CELLNAME || ''
     if (name) {
       const firstChar = name.charAt(0).toUpperCase()
       if (firstChar === 'A') priority += 100
@@ -816,7 +844,7 @@ export class MapInfoLayer {
     // 1. 尝试直接获取请求的字段
     // 预定义字段的映射
     const fieldMapping: Record<string, string[]> = {
-      'name': ['小区名称', 'Cell Name', 'Name', 'name', 'cellName', 'NAME', 'Name', '站点名称', 'zhLabel'],
+      'name': ['小区名称', 'CELLNAME', 'CELL_NAME', 'CELL NAME', 'Cell Name', 'Name', 'name', 'cellName', 'NAME', '站点名称', 'zhLabel'],
       'siteId': ['基站ID', 'Site ID', 'eNodeB ID', 'siteId', 'enbId', 'ENBID', 'site_id'],
       'frequency': ['下行频点', 'DL Frequency', 'Frequency', 'frequency', 'dlFreq', 'freq'],
       'pci': ['PCI', 'physicalCellId', 'pci', 'Pci'],
@@ -886,6 +914,13 @@ export class MapInfoLayerManager {
    * 添加图层
    */
   async addLayer(options: MapInfoLayerOptions, visible: boolean = false): Promise<void> {
+    // 若已存在同 id 图层，先移除旧实例（避免切换/重复加载导致地图叠加）
+    const existing = this.layers.get(options.id)
+    if (existing && this.map) {
+      if (IS_DEV) console.log('[MapInfoLayerManager] 存在同 id 旧图层，先移除:', options.id)
+      existing.remove(this.map)
+    }
+
     const layer = await MapInfoLayer.fromGeoJSON(options)
     if (IS_DEV) console.log('[MapInfoLayerManager] Adding layer:', layer.getId(), 'visible:', visible)
     this.layers.set(layer.getId(), layer)
