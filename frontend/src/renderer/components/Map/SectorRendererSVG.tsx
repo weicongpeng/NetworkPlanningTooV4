@@ -321,6 +321,19 @@ export class SectorSVGLayer extends L.Layer {
   }
 
   /**
+   * 把扇区 svg 渲染层移到 pane 顶部，使其成为点击命中目标。
+   * featureGroup 无 getContainer()；扇区路径共用地图默认 SVG renderer 的容器
+   * （<svg>），将其 appendChild 到 overlayPane 顶部即可让基站层高于各 canvas 层。
+   */
+  bringToFrontForZOrder(): void {
+    const renderer = this.mapInstance?.getRenderer?.() as any
+    const container = renderer?._container as HTMLElement | undefined
+    if (container && container.parentNode) {
+      container.parentNode.appendChild(container)
+    }
+  }
+
+  /**
    * 设置频点可见性
    * @param frequency 频点值
    * @param visible 是否可见

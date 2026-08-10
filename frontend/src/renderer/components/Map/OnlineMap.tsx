@@ -24,6 +24,7 @@ import { SectorInfoPanel, useSectorInfoPanel } from './SectorInfoPanel'
 import { FeatureInfoPanel, useFeatureInfoPanel } from './FeatureInfoPanel'
 import { MapInfoLayerManager, MapInfoLayer, MapInfoLayerOptions, LayerGeometryType } from './MapInfoLayer'
 import { GeoDataLayerManager, GeoDataItem } from './GeoDataLayer'
+import { reconcileZOrder, ZOrderLayer } from './layerZOrder'
 import { layerApi, dataApi } from '../../services/api'
 
 console.log('🔥🔥🔥 OnlineMap.tsx 已加载 (2025-01-27-v3) 🔥🔥🔥')
@@ -597,6 +598,55 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
   const [overlappingSectors, setOverlappingSectors] = useState<RenderSectorData[]>([])
   const [overlapPosition, setOverlapPosition] = useState<{ x: number, y: number } | null>(null)
 
+  /**
+   * 装饰图层：把其 marker 移到 markerPane 顶部（装饰为最低优先级，仅独立勾选时自身可点）
+   */
+  const bringDecorationToFront = useCallback(() => {
+    const fg = decorationLayerRef.current
+    if (!fg) return
+    fg.eachLayer((layer: any) => {
+      const el = layer?.getElement?.()
+      if (el && el.parentNode) el.parentNode.appendChild(el)
+    })
+  }, [])
+
+  /**
+   * 汇总所有勾选可见图层并按优先级重排渲染层。
+   * 优先级：基站 > 图层文件 > 地理化数据 > 装饰图层；同类型内面板顶部最高。
+   * 可见性直接查询各图层管理器，避免依赖可能过期的 props。
+   */
+  const reconcileLayerZOrder = useCallback(() => {
+    const visible: ZOrderLayer[] = []
+
+    // 装饰图层（最低优先级，typeRank=0）：marker 在 markerPane(600)，天然在 overlayPane 之上
+    if (decorationLayerVisibility) {
+      visible.push({ type: 'decoration', panelRank: 1, bringToFront: bringDecorationToFront })
+    }
+
+    // 地理化数据（typeRank=1）
+    const geoLayers = geoDataLayerManagerRef.current?.getAllLayers?.() ?? []
+    geoLayers.forEach(gl => {
+      if (!gl.isVisible()) return
+      visible.push({ type: 'geodata', panelRank: 1, bringToFront: () => gl.bringToFrontForZOrder() })
+    })
+
+    // 图层文件（typeRank=2）
+    mapInfoLayerRefsRef.current.forEach(({ mapInfoLayer }) => {
+      if (!mapInfoLayer.isVisible()) return
+      visible.push({ type: 'mapinfo', panelRank: 1, bringToFront: () => mapInfoLayer.bringToFrontForZOrder() })
+    })
+
+    // 基站（typeRank=3）：优先级最高
+    if (layerVisibility.lte && lteSectorLayerRef.current) {
+      visible.push({ type: 'sector', panelRank: 2, bringToFront: () => lteSectorLayerRef.current!.bringToFrontForZOrder() })
+    }
+    if (layerVisibility.nr && nrSectorLayerRef.current) {
+      visible.push({ type: 'sector', panelRank: 1, bringToFront: () => nrSectorLayerRef.current!.bringToFrontForZOrder() })
+    }
+
+    reconcileZOrder(visible)
+  }, [decorationLayerVisibility, layerVisibility, bringDecorationToFront, geoDataLayerManagerRef, mapInfoLayerRefsRef, lteSectorLayerRef, nrSectorLayerRef])
+
 
   /**
    * 暴露方法给父组件
@@ -708,6 +758,7 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
           if (mapInstanceRef.current) {
             geoLayer.setVisible(mapInstanceRef.current, visible)
           }
+          reconcileLayerZOrder()
           return
         }
       }
@@ -724,6 +775,7 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
           // 这样可以正确清理标签和其他资源
           layerRef.mapInfoLayer.remove(mapInstanceRef.current)
         }
+        reconcileLayerZOrder()
       }
     },
 
@@ -787,6 +839,7 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
 
     setDecorationLayerVisibility: (visible: boolean) => {
       setDecorationLayerVisibility(visible)
+      reconcileLayerZOrder()
     },
 
     setDecorationLabelVisibility: (visible: boolean) => {
@@ -2456,7 +2509,10 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
       frequencies.nr.forEach(f => visibilityMap.set(f.frequency, f.visible))
       nrSectorLayerRef.current.setFrequenciesVisibility(visibilityMap)
     }
-  }, [sectorData, layerVisibility, labelVisibility, sectorLabelVisibility, labelSettingsMap, handleSectorClick, mode, frequencies, createSectorLayer, measureMode])
+
+    // 扇区图层已就绪，重排图层顺序
+    reconcileLayerZOrder()
+  }, [sectorData, layerVisibility, labelVisibility, sectorLabelVisibility, labelSettingsMap, handleSectorClick, mode, frequencies, createSectorLayer, measureMode, reconcileLayerZOrder])
 
   /**
    * 加载单个MapInfo图层或Excel点图层
@@ -5113,8 +5169,11 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
           }
         })
       }
+
+      // 图层加载就绪后重排一次，确保初始点击命中正确目标
+      reconcileLayerZOrder()
     })();
-  }, [layerFiles, pointFiles, loadMapInfoLayers]);
+  }, [layerFiles, pointFiles, loadMapInfoLayers, reconcileLayerZOrder]);
 
   /**
    * 当扇区数据变化时更新图层
@@ -5256,7 +5315,9 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
         mapInstanceRef.current.removeLayer(nrSectorLayerRef.current)
       }
     }
-  }, [layerVisibility])
+
+    reconcileLayerZOrder()
+  }, [layerVisibility, reconcileLayerZOrder])
 
 
   /**

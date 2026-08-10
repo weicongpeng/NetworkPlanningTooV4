@@ -1095,6 +1095,18 @@ export class GeoDataLayer {
   }
 
   /**
+   * 把 canvas 渲染层移到 pane 顶部，使其成为点击命中目标。
+   * 对 Canvas，路径 bringToFront 只重绘不移动 DOM，必须直接操作 canvas 元素。
+   */
+  bringToFrontForZOrder(): void {
+    const renderer = this.canvasRenderer as any
+    const container = renderer?._container as HTMLElement | undefined
+    if (container && container.parentNode) {
+      container.parentNode.appendChild(container)
+    }
+  }
+
+  /**
    * 设置框选高亮
    * @param ids 选中的要素ID集合，null表示清除
    */

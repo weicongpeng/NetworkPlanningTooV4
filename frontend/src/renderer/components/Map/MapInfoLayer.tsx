@@ -105,6 +105,7 @@ export class MapInfoLayer {
   private name: string
   private type: LayerGeometryType
   private geoJSONLayer: L.GeoJSON | null = null
+  private canvasRenderer: L.Canvas | null = null // 独立 Canvas renderer（用于 z-order 置顶）
   private style: MapInfoLayerStyle
   private static _debugPrinted: boolean = false
 
@@ -374,7 +375,8 @@ export class MapInfoLayer {
 
     // Canvas renderer：大幅减少 DOM 节点（18,903 个 SVG path → 单个 canvas）
     // 图层常含数万个 polygon/line，SVG 渲染会导致 DOM 爆炸、勾选后长时间卡顿。
-    const canvasRenderer = L.canvas()
+    mapInfoLayer.canvasRenderer = L.canvas()
+    const canvasRenderer = mapInfoLayer.canvasRenderer
 
     // 创建 GeoJSON 图层（使用后端已转换数据）
     // renderer 是合法 Leaflet 运行时选项（PathOptions），但 @types/leaflet 的
@@ -560,6 +562,19 @@ export class MapInfoLayer {
    */
   setInteractive(interactive: boolean): void {
     this.isInteractive = interactive
+  }
+
+  /**
+   * 把该图层的 canvas 渲染层移到 pane 顶部，使其成为点击命中目标。
+   * 对 Canvas，路径 bringToFront 只重绘不移动 DOM，必须直接操作 canvas 元素。
+   * 注意：Leaflet Renderer 无公共 getContainer()，实际容器元素是私有 _container。
+   */
+  bringToFrontForZOrder(): void {
+    const renderer = this.canvasRenderer as any
+    const container = renderer?._container as HTMLElement | undefined
+    if (container && container.parentNode) {
+      container.parentNode.appendChild(container)
+    }
   }
 
   /**
