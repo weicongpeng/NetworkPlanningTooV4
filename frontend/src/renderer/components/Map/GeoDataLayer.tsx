@@ -157,6 +157,9 @@ export class GeoDataLayer {
     fontSize: 12
   }
 
+  // 图层颜色覆盖（图形颜色 / 透明度 / 边框宽度 / 边框颜色）
+  private styleOverrides: { fillColor: string; fillOpacity: number; borderWidth: number; borderColor: string } | null = null
+
   // 地图移动节流定时器
   private _mapMoveTimer: number | null = null
   // 几何图形重新渲染定时器
@@ -286,6 +289,12 @@ export class GeoDataLayer {
     // 重新渲染后恢复选中高亮
     if (this.selectionHighlightIds) {
       this.setSelectionHighlight(this.selectionHighlightIds)
+    }
+
+    // 🔧 修复：remove() 清空了 canvasLabelLayer，重新勾选图层时需重建标签层
+    // （labelsEnabled 持久，但 Canvas 标签层被销毁，addTo 不再重建导致标签不恢复）
+    if (this.labelsEnabled && !this.canvasLabelLayer && this.visible) {
+      this._createLabels(map)
     }
 
     console.log('[GeoDataLayer] ========== addTo 完成 ==========')
@@ -419,7 +428,7 @@ export class GeoDataLayer {
       const pixelRadius = this._metersToPixels(10, displayLat, zoom)
 
       const marker = L.circleMarker([displayLat, displayLng], {
-        ...DEFAULT_POINT_STYLE,
+        ...this._mergeStyleOverrides(DEFAULT_POINT_STYLE),
         radius: pixelRadius,
         renderer: this.canvasRenderer || undefined,
         properties: item.properties,
@@ -500,7 +509,7 @@ export class GeoDataLayer {
       if (is360Degree || coverType === 4 || this.currentZoom <= LOD_THRESHOLD) {
         // 渲染为圆点
         const marker = L.circleMarker([displayLat, displayLng], {
-          ...DEFAULT_POINT_STYLE,
+          ...this._mergeStyleOverrides(DEFAULT_POINT_STYLE),
           renderer: this.canvasRenderer || undefined,
           properties: item.properties,
           name: item.name
@@ -525,7 +534,7 @@ export class GeoDataLayer {
 
         const points = createSectorPolygon(displayLat, displayLng, azimuth, beamwidth, SECTOR_RADIUS)
         const polygon = L.polygon(points, {
-          ...DEFAULT_SECTOR_STYLE,
+          ...this._mergeStyleOverrides(DEFAULT_SECTOR_STYLE),
           renderer: this.canvasRenderer || undefined,
           properties: item.properties,
           name: item.name
@@ -605,7 +614,7 @@ export class GeoDataLayer {
       try {
         // 直接使用 L.polygon，path 已经是正确的 [lat, lng] 格式（GCJ02）
         const polygon = L.polygon(item.path as L.LatLngExpression[], {
-          ...DEFAULT_POLYGON_STYLE,
+          ...this._mergeStyleOverrides(DEFAULT_POLYGON_STYLE),
           renderer: this.canvasRenderer || undefined,
           properties: item.properties,
           name: item.name
@@ -1171,19 +1180,53 @@ export class GeoDataLayer {
   }
 
   /**
-   * 获取默认样式
+   * 获取默认样式（合并图层颜色覆盖）
    */
   private _getDefaultStyle(): any {
     switch (this.geometryType) {
       case 'point':
-        return DEFAULT_POINT_STYLE
+        return this._mergeStyleOverrides(DEFAULT_POINT_STYLE)
       case 'sector':
-        return DEFAULT_SECTOR_STYLE
+        return this._mergeStyleOverrides(DEFAULT_SECTOR_STYLE)
       case 'polygon':
-        return DEFAULT_POLYGON_STYLE
+        return this._mergeStyleOverrides(DEFAULT_POLYGON_STYLE)
       default:
-        return DEFAULT_POINT_STYLE
+        return this._mergeStyleOverrides(DEFAULT_POINT_STYLE)
     }
+  }
+
+  /**
+   * 将颜色覆盖合并到基础样式
+   * 映射：fillColor→fillColor，fillOpacity→fillOpacity，borderColor→color，borderWidth→weight
+   */
+  private _mergeStyleOverrides(baseStyle: any): any {
+    if (!this.styleOverrides) return baseStyle
+    return {
+      ...baseStyle,
+      fillColor: this.styleOverrides.fillColor,
+      fillOpacity: this.styleOverrides.fillOpacity,
+      color: this.styleOverrides.borderColor,
+      weight: this.styleOverrides.borderWidth,
+      opacity: 1
+    }
+  }
+
+  /**
+   * 设置图层颜色覆盖（图形颜色 / 透明度 / 边框宽度 / 边框颜色）
+   * 立即应用到已渲染的几何，后续重渲染也会沿用覆盖。
+   *
+   * 采用「全量重渲染」而非逐要素 setStyle：
+   * - 所有渲染函数在创建几何时都会调 _mergeStyleOverrides 读取 styleOverrides，
+   *   因此重建图层必然带上新颜色，避免不同要素类型（circleMarker/polygon）与
+   *   Canvas 渲染器在 setStyle 重绘上的细微差异导致不生效。
+   */
+  setStyleOverrides(settings: { fillColor: string; fillOpacity: number; borderWidth: number; borderColor: string }): void {
+    this.styleOverrides = settings
+
+    // 未渲染/不可见时仅保存覆盖，几何由后续 addTo/_reRenderGeometries 统一按新覆盖渲染
+    if (!this.map || !this.leafletLayer || !this.visible) return
+
+    this._reRenderGeometries()
   }
 
   /**
