@@ -1030,6 +1030,15 @@ def get_layer_data(data_id: str, layer_id: str, data_dir: Path) -> Optional[Dict
     if disk_cache is not None:
         _layer_cache[cache_key] = disk_cache
         _layer_cache_mtime[cache_key] = source_path.stat().st_mtime
+        # 🔧 幂等补齐 gz 预压缩缓存：磁盘缓存命中路径不重建 gz 的话，
+        # 一次 gz 写失败会永久回退常规路径（性能优化失效），这里检测缺失即生成
+        try:
+            gz_path = data_dir / ".cache" / f"{layer_id}.geojson.gz"
+            if not gz_path.exists():
+                with gzip.open(gz_path, 'wt', encoding='utf-8', compresslevel=9) as f:
+                    json.dump({"success": True, "data": disk_cache}, f, ensure_ascii=False)
+        except Exception as e:
+            print(f"[MapInfo] 补写 gz 缓存失败: {e}")
         return disk_cache
 
     # 4. 缓存未命中，解析文件
@@ -1073,11 +1082,13 @@ def get_layer_data(data_id: str, layer_id: str, data_dir: Path) -> Optional[Dict
                 with open(cache_dir / f"{layer_id}.mtime", 'w', encoding='utf-8') as f:
                     f.write(str(source_path.stat().st_mtime))
                 # 🔧 预压缩缓存：同时写 .geojson.gz，端点命中时直接返回 gz 字节，
-                # 跳过每请求的 json.dumps + gzip（大数据层可省 ~5s）
+                # 跳过每请求的 json.dumps + gzip（大数据层可省 ~5s）。
+                # 必须压缩【包装后的 dict】{"success": True, "data": geojson}，
+                # 与常规路径响应同形状，否则前端 response.success 判定失败导致图层无法加载。
                 try:
                     gz_path = cache_dir / f"{layer_id}.geojson.gz"
                     with gzip.open(gz_path, 'wt', encoding='utf-8', compresslevel=9) as f:
-                        json.dump(result, f, ensure_ascii=False)
+                        json.dump({"success": True, "data": result}, f, ensure_ascii=False)
                 except Exception as e:
                     print(f"[MapInfo] 写 gz 缓存失败: {e}")
             except Exception as e:

@@ -622,6 +622,13 @@ async def get_layer_data(data_id: str, layer_id: str, request: Request, response
         from fastapi.concurrency import run_in_threadpool
         gz_bytes = await run_in_threadpool(get_layer_data_gz_bytes, data_id, layer_id, data_dir)
         if gz_bytes is not None:
+            # 🔧 重算 etag：首次请求在 get_layer_data_gz_bytes 内生成了 .mtime 文件
+            if etag is None:
+                try:
+                    if mtime_file.exists():
+                        etag = f'"{layer_id}-{mtime_file.read_text().strip()}"'
+                except Exception:
+                    pass
             gz_response = Response(
                 content=gz_bytes,
                 media_type="application/json",
