@@ -310,14 +310,15 @@ export class MapInfoLayer {
       map.removeLayer(this.geoJSONLayer)
       // 移除 zoomend 事件监听器，防止事件泄漏
       map.off('zoomend', this._onZoomEnd)
-      // 清除标签
-      this._removeLabels()
     } else {
       if (IS_DEV) console.log('[MapInfoLayer] Layer not on map, skipping remove:', this.id, {
         hasGeoJSONLayer: !!this.geoJSONLayer,
         hasLayerInMap: this.geoJSONLayer ? map.hasLayer(this.geoJSONLayer) : false
       })
     }
+    // 🔧 修复：无条件清理标签层（即使几何层不在 map.hasLayer 判定内，
+    // 标签 canvas 也可能残留在地图上，必须显式移除，避免"关闭标签后仍显示"）
+    this._removeLabels(map)
     if (this.currentMap === map) {
       this.currentMap = null
     }
@@ -803,9 +804,11 @@ export class MapInfoLayer {
   /**
    * 移除所有标签
    */
-  private _removeLabels(): void {
+  private _removeLabels(targetMap?: L.Map): void {
     if (this.canvasLabelLayer) {
-      const map = this.currentMap
+      // 🔧 优先使用调用方传入的 map（remove() 场景 currentMap 可能已被置空/不匹配），
+      // 兜底用 currentMap，确保标签 canvas 总能从地图移除
+      const map = targetMap || this.currentMap
       if (map && map.hasLayer(this.canvasLabelLayer)) {
         map.removeLayer(this.canvasLabelLayer)
       }

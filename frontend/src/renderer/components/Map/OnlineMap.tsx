@@ -509,6 +509,10 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
   // 预取的 Excel 原始数据缓存（挂载时并发预取，避免构建阶段 3 并发 worker 串行等待网络）
   const prefetchedExcelDataRef = useRef<Map<string, any>>(new Map())
 
+  // 组件卸载标记：异步图层构建（loadMapInfoLayer）在页面切换后仍在飞行时，
+  // 用此标记阻止旧实例把几何/标签挂到复用后的共享地图上（避免"关闭标签后仍显示"的孤儿实例）
+  const unmountedRef = useRef(false)
+
   // 扇区信息面板
   const {
     selectedSector,
@@ -590,6 +594,10 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
     const s = useMapStore.getState().mapSettings
     return { ...s.pointFileLabelVisibility, ...s.layerFileLabelVisibility }
   })
+  // 🔧 最新标签状态 ref：异步图层构建（loadMapInfoLayer）读取时用它而非闭包，
+  // 避免构建期间用户切换标签开关读到旧值（RC3：构建完成后强制恢复旧标签状态）
+  const pointFileLabelVisibilityRef = useRef(pointFileLabelVisibility)
+  pointFileLabelVisibilityRef.current = pointFileLabelVisibility
   const [sectorData, setSectorData] = useState<{
     lte: RenderSectorData[]
     nr: RenderSectorData[]
@@ -2789,7 +2797,7 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
               __mapDataLayerInstances.add(geoLayer)
 
               // 同步标签可见性状态
-              const labelVisible = pointFileLabelVisibility[layerFile.id] || false
+              const labelVisible = pointFileLabelVisibilityRef.current[layerFile.id] || false
               console.log('[OnlineMap] 同步 GeoDataLayer 标签可见性:', layerFile.id, labelVisible)
               geoLayer.setLabelVisibility(labelVisible)
 
@@ -2883,11 +2891,32 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
         console.log('[OnlineMap] MapInfoLayer创建完成, leafletLayer存在:', !!leafletLayer)
 
         if (leafletLayer) {
+          // 🔧 过期守卫：页面已卸载（跨页竞态）时，旧实例不得挂到共享地图，直接清理自身
+          if (unmountedRef.current) {
+            console.warn('[OnlineMap] 组件已卸载，跳过已过期图层构建:', layerFile.id)
+            try {
+              const fallbackMap = mapInstanceRef.current || __sharedMapCache.map
+              if (fallbackMap) mapInfoLayer.remove(fallbackMap)
+            } catch (e) { /* ignore */ }
+            return
+          }
+
+          // 🔧 去重：移除共享地图上同 id 的残留旧实例（跨挂载竞态/历史缓存产生的孤儿实例，
+          // 其标签 canvas 会残留导致"关闭标签后仍显示"）
+          for (const inst of __mapDataLayerInstances) {
+            if (inst instanceof MapInfoLayer && inst.getId() === layerFile.id) {
+              try {
+                if (mapInstanceRef.current) inst.remove(mapInstanceRef.current)
+              } catch (e) { /* ignore */ }
+              __mapDataLayerInstances.delete(inst)
+            }
+          }
+
           // 防御：若该 id 已有旧 MapInfoLayer 仍在地图上，先移除，避免重复加载叠加
           const oldRef = mapInfoLayerRefsRef.current.get(layerFile.id)
           if (oldRef && mapInstanceRef.current && mapInstanceRef.current.hasLayer(oldRef.leafletLayer)) {
             console.log('[OnlineMap] 存在同 id 旧 MapInfoLayer，先移除:', layerFile.id)
-            mapInstanceRef.current.removeLayer(oldRef.leafletLayer)
+            oldRef.mapInfoLayer.remove(mapInstanceRef.current)
           }
 
           // 存储图层实例和 Leaflet 图层以便控制
@@ -2898,7 +2927,7 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
           console.log('[OnlineMap] 图层已存储到refs, loaded状态:', loadedMapInfoLayersRef.current.has(layerFile.id))
 
           // 同步标签可见性
-          const labelVisible = pointFileLabelVisibility[layerFile.id] || false
+          const labelVisible = pointFileLabelVisibilityRef.current[layerFile.id] || false
           mapInfoLayer.setLabelVisibility(labelVisible)
           if (labelSettingsMap[layerFile.id]) {
             mapInfoLayer.setLabelConfig(labelSettingsMap[layerFile.id])
@@ -3434,6 +3463,9 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
     initMap()
 
     return () => {
+      // 🔧 标记组件已卸载：阻止仍在飞行的异步图层构建（loadMapInfoLayer）
+      // 把图层挂到复用后的共享地图上（跨页竞态产生的孤儿实例/标签）
+      unmountedRef.current = true
       // === 步骤一：优先清理各页面特有的数据图层（必须使用 map.removeLayer） ===
       // 必须在 mapInstanceRef 置空前完成，否则无法从 Leaflet 地图上移除图层
       // 解决：页面切换时旧扇区图层残留导致的 ① 图层污染 ② 性能累积退化
@@ -5171,10 +5203,13 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
 
       // 清理不再存在的图层
       const currentLayerIds = new Set(allFiles.map(f => f.id));
-      for (const [id, { leafletLayer }] of mapInfoLayerRefsRef.current.entries()) {
+      for (const [id, ref] of mapInfoLayerRefsRef.current.entries()) {
         if (!currentLayerIds.has(id)) {
-          if (mapInstanceRef.current.hasLayer(leafletLayer)) {
-            mapInstanceRef.current.removeLayer(leafletLayer);
+          // 🔧 用 mapInfoLayer.remove() 而非裸 removeLayer：确保标签 canvas 一并清理
+          if (mapInstanceRef.current && ref.mapInfoLayer) {
+            try {
+              ref.mapInfoLayer.remove(mapInstanceRef.current);
+            } catch (e) { /* ignore */ }
           }
           mapInfoLayerRefsRef.current.delete(id);
           loadedMapInfoLayersRef.current.delete(id);
@@ -5205,6 +5240,9 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
             // 勾选图层复选框时，按当前标签开关状态同步标签（保证立即显示，无需再点开关）
             if (layerFile.visible && pointFileLabelVisibility[layerFile.id]) {
               geoLayer.setLabelVisibility(true)
+            } else if (pointFileLabelVisibility[layerFile.id] === false) {
+              // 🔧 兜底：开关明确关闭时主动移除标签（防异步构建残留/状态不同步）
+              geoLayer.setLabelVisibility(false)
             }
           } catch (error) {
             console.error('[OnlineMap] ❌ geoLayer.setVisible 出错:', error)
@@ -5232,6 +5270,9 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
             // 勾选图层复选框时，按当前标签开关状态同步标签（保证立即显示，无需再点开关）
             if (pointFileLabelVisibility[layerFile.id]) {
               layerRef.mapInfoLayer.setLabelVisibility(true)
+            } else if (pointFileLabelVisibility[layerFile.id] === false) {
+              // 🔧 兜底：开关明确关闭时主动移除标签（防异步构建残留/状态不同步）
+              layerRef.mapInfoLayer.setLabelVisibility(false)
             }
           } else {
             // 使用 MapInfoLayer 的 remove 方法而不是直接移除 Leaflet 图层
