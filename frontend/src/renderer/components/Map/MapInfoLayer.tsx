@@ -524,8 +524,9 @@ export class MapInfoLayer {
   private async _addGeoJSONChunks(featureCollection: GeoJSON.FeatureCollection): Promise<void> {
     if (!this.geoJSONLayer) return
     const features = featureCollection.features || []
-    // 🔧 性能：批次 500→1000 减半 setTimeout 空闲间隙（桌面端单批阻塞可接受，加快首屏出图）
-    const BATCH = 1000
+    // 🔧 性能：批次提到 4000（实测逐要素构建仅 ~26µs，4000 个单批 ~0.1s，桌面端可接受），
+    // 19000 要素从 19 批压到 5 批，大幅减少 setTimeout 空闲间隙
+    const BATCH = 4000
     for (let i = 0; i < features.length; i += BATCH) {
       const chunk: GeoJSON.FeatureCollection = {
         type: 'FeatureCollection',

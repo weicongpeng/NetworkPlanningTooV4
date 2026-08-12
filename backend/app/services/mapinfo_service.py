@@ -11,6 +11,7 @@ import re
 import time
 import uuid
 import json
+import gzip
 from typing import List, Dict, Any, Optional
 from pathlib import Path
 from datetime import datetime
@@ -1019,9 +1020,10 @@ def get_layer_data(data_id: str, layer_id: str, data_dir: Path) -> Optional[Dict
                 if disk_cache_mtime_file.exists():
                     saved_mtime = float(disk_cache_mtime_file.read_text().strip())
                     if saved_mtime == current_mtime:
+                        _t_disk = time.time()
                         with open(disk_cache_path, 'r', encoding='utf-8') as f:
                             disk_cache = json.load(f)
-                        print(f"[MapInfo] 使用落盘缓存: {disk_cache_path}")
+                        print(f"[MapInfo] 使用落盘缓存: {disk_cache_path} (读取耗时 {time.time()-_t_disk:.2f}s)")
         except Exception as e:
             print(f"[MapInfo] 读落盘缓存失败 {disk_cache_path}: {e}")
 
@@ -1032,12 +1034,14 @@ def get_layer_data(data_id: str, layer_id: str, data_dir: Path) -> Optional[Dict
 
     # 4. 缓存未命中，解析文件
     result = None
+    _t_parse = time.time()
 
     if target_layer_info and source_path:
         try:
             layer = MapInfoParser.parse_file(source_path)
             layer.id = layer_id
             result = _convert_to_geojson(layer)
+            print(f"[MapInfo] 图层 {cache_key} parse+convert 耗时 {time.time()-_t_parse:.1f}s")
         except Exception as e:
             print(f"[MapInfo] 解析源文件失败 {source_path}: {e}")
 
@@ -1068,12 +1072,110 @@ def get_layer_data(data_id: str, layer_id: str, data_dir: Path) -> Optional[Dict
                     json.dump(result, f, ensure_ascii=False)
                 with open(cache_dir / f"{layer_id}.mtime", 'w', encoding='utf-8') as f:
                     f.write(str(source_path.stat().st_mtime))
+                # 🔧 预压缩缓存：同时写 .geojson.gz，端点命中时直接返回 gz 字节，
+                # 跳过每请求的 json.dumps + gzip（大数据层可省 ~5s）
+                try:
+                    gz_path = cache_dir / f"{layer_id}.geojson.gz"
+                    with gzip.open(gz_path, 'wt', encoding='utf-8', compresslevel=9) as f:
+                        json.dump(result, f, ensure_ascii=False)
+                except Exception as e:
+                    print(f"[MapInfo] 写 gz 缓存失败: {e}")
             except Exception as e:
                 print(f"[MapInfo] 写落盘缓存失败: {e}")
         except Exception:
             pass
 
     return result
+
+
+def get_layer_data_gz_bytes(data_id: str, layer_id: str, data_dir: Path) -> Optional[bytes]:
+    """获取图层数据的预压缩 gzip 字节（供端点直出，跳过每请求 json.dumps + gzip）。
+
+    基于源文件 mtime 校验 gz 缓存有效性；无效时回退调用 get_layer_data 重建
+    （其内部会重写 .geojson/.geojson.gz 缓存），再读取 gz 返回。若数据不存在返回 None。
+
+    Returns:
+        预压缩的 gzip 字节；数据不存在或 gz 生成失败时返回 None。
+    """
+    # 解析源文件路径（与 get_layer_data 逻辑一致，用于 mtime 校验）
+    source_path = None
+    layers_file = data_dir / "layers.json"
+    if layers_file.exists():
+        try:
+            import json as _json
+            with open(layers_file, 'r', encoding='utf-8') as f:
+                for layer in _json.load(f):
+                    if layer.get('id') == layer_id:
+                        source_file = layer.get('metadata', {}).get('source_file')
+                        if source_file:
+                            candidate = Path(source_file)
+                            if candidate.exists():
+                                source_path = candidate
+                        if source_path is None:
+                            name = layer.get('name')
+                            if name:
+                                for ext in ['.tab', '.mif']:
+                                    candidate = data_dir / f"{name}{ext}"
+                                    if candidate.exists():
+                                        source_path = candidate
+                                        break
+                        break
+        except Exception:
+            pass
+
+    cache_dir = data_dir / ".cache"
+    gz_path = cache_dir / f"{layer_id}.geojson.gz"
+    mtime_file = cache_dir / f"{layer_id}.mtime"
+
+    # gz 缓存有效（mtime 匹配）则直接读取
+    if source_path and gz_path.exists():
+        try:
+            if mtime_file.exists() and float(mtime_file.read_text().strip()) == source_path.stat().st_mtime:
+                with open(gz_path, 'rb') as f:
+                    return f.read()
+        except Exception:
+            pass
+
+    # gz 缓存缺失/失效：重建（get_layer_data 会重写 .geojson/.gz），再读 gz
+    result = get_layer_data(data_id, layer_id, data_dir)
+    if result is None:
+        return None
+    try:
+        if gz_path.exists():
+            with open(gz_path, 'rb') as f:
+                return f.read()
+    except Exception:
+        pass
+    return None
+
+
+def prebuild_layer_geojson_cache(data_id: str, data_dir: Path, layers: List[Dict]) -> None:
+    """上传后预热图层 GeoJSON 缓存，避免首次勾选时等待 parse + 坐标转换。
+
+    复用 get_layer_data 的缓存写入逻辑（内存 _layer_cache + 磁盘 .cache/{layer_id}.geojson），
+    只做幂等预热：任一层失败仅记录日志，不影响上传主流程。
+
+    Args:
+        data_id: 数据ID（缓存 key 前缀）
+        data_dir: 该数据的目录（settings.DATA_DIR / data_id）
+        layers: layers.json 中的图层元数据列表（含 "id" 字段）
+    """
+    layers = layers or []
+    if not layers:
+        return
+    started = time.time()
+    warmed = 0
+    for layer in layers:
+        layer_id = layer.get("id")
+        if not layer_id:
+            continue
+        try:
+            data = get_layer_data(data_id, layer_id, data_dir)
+            if data is not None:
+                warmed += 1
+        except Exception as e:
+            print(f"[MapInfo] 预热图层缓存失败 {data_id}:{layer_id}: {e}")
+    print(f"[MapInfo] 图层缓存预热完成: {warmed}/{len(layers)} 图层, 耗时 {time.time()-started:.1f}s")
 
 
 def _transform_layer_coordinates(features: List[MapInfoFeature]) -> None:

@@ -616,8 +616,25 @@ async def get_layer_data(data_id: str, layer_id: str, request: Request, response
         if etag and request.headers.get("if-none-match") == etag:
             return Response(status_code=304)
 
-        # 首次解析为 CPU 密集型（gpd.read_file + 坐标转换），用线程池避免阻塞事件循环
+        # 🔧 预压缩 gzip 直出：命中 .geojson.gz 缓存时直接返回字节，跳过 json.dumps + gzip
+        # （大数据层每请求省 ~5s；响应已带 Content-Encoding，中间件不会二次压缩）
+        from app.services.mapinfo_service import get_layer_data_gz_bytes
         from fastapi.concurrency import run_in_threadpool
+        gz_bytes = await run_in_threadpool(get_layer_data_gz_bytes, data_id, layer_id, data_dir)
+        if gz_bytes is not None:
+            gz_response = Response(
+                content=gz_bytes,
+                media_type="application/json",
+                headers={
+                    "Content-Encoding": "gzip",
+                    "Cache-Control": "private, max-age=0, must-revalidate",
+                },
+            )
+            if etag:
+                gz_response.headers["ETag"] = etag
+            return gz_response
+
+        # 回退：常规路径（gz 缓存生成失败时）
         geojson = await run_in_threadpool(get_layer_data, data_id, layer_id, data_dir)
         if geojson is None:
             raise HTTPException(status_code=404, detail="图层不存在")

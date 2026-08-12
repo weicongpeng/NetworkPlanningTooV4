@@ -3026,25 +3026,19 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
       // 避免首屏对几十个图层发起请求（尤其是大图层，首次解析 +20s 会阻塞勾选渲染）
       console.log('[OnlineMap] 预取已勾选图层数量:', visibleFiles.length)
 
-      // 并发拉取数据并缓存（限流，避免一次几十个请求）
-      const CHUNK = 10
-      for (let i = 0; i < visibleFiles.length; i += CHUNK) {
-        const chunk = visibleFiles.slice(i, i + CHUNK)
-        await Promise.all(chunk.map(layerFile => prefetchLayerData(layerFile)))
-      }
-
-      // 挂载完成后，对已勾选图层触发构建（从缓存取 geojson 构建并 addTo），保证进入地图即显示
-      // 并行构建（带并发上限）：首次加载涉及 API 拉取（I/O），并行可显著减少多图层总耗时；
+      // 🔧 流水线化：每个 worker 内 "预取数据 → 立即构建"，勾选图层数据一到就出图，
+      // 不再"先全部预取再构建"（避免单图层被其他图层的预取拖后）
       // 已加载图层由 loadedMapInfoLayersRef / geoDataLayerManager.getLayer 守卫，不会重复构建
-      const CONCURRENCY = 3
+      const CONCURRENCY = 4
       let buildIdx = 0
       const worker = async () => {
         while (buildIdx < visibleFiles.length) {
           const layerFile = visibleFiles[buildIdx++]
           try {
-            await loadMapInfoLayer(layerFile)
+            await prefetchLayerData(layerFile)   // 数据先到（网络/缓存）
+            await loadMapInfoLayer(layerFile)     // 立即构建
           } catch (e) {
-            console.error('[OnlineMap] 构建图层失败:', layerFile.id, e)
+            console.error('[OnlineMap] 加载图层失败:', layerFile.id, e)
           }
         }
       }
@@ -3055,6 +3049,78 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
       endLayerLoad()
     }
   }, [layerFiles, pointFiles, loadMapInfoLayer, prefetchLayerData, beginLayerLoad, endLayerLoad])
+
+  // ============ 未勾选图层空闲静默预加载（仅地图工具页）============
+  // 勾选图层加载完成后，利用浏览器空闲时段（requestIdleCallback）顺序预取未勾选图层的**数据**（只拉不构建），
+  // 用户勾选时缓存命中 → 仅剩构建，秒级出图。PCI/Neighbor/TAC 页不传 layerFiles/pointFiles，天然隔离；
+  // 卸载时取消，不抢占其他功能页资源。
+  const idlePrefetchStateRef = useRef<{
+    handle: number | null
+    inFlight: number
+    cancelled: boolean
+  }>({ handle: null, inFlight: 0, cancelled: false })
+
+  const scheduleIdlePrefetch = useCallback(() => {
+    const state = idlePrefetchStateRef.current
+    if (state.handle !== null) return  // 已有排程
+    if (state.cancelled) return
+
+    // 收集未勾选且未缓存的图层；容量控制：只预取前 MAX 个（全仓大 GeoJSON 可能上百 MB，避免全量进内存）
+    const allFiles = [...layerFiles, ...pointFiles]
+    const unchecked = allFiles.filter(f => !f.visible)
+    const targets = unchecked.filter(f => {
+      if (f.sourceType === 'excel') return !prefetchedExcelDataRef.current.has(f.id)
+      return !useMapDataCacheStore.getState().layers[f.id]?.geojson
+    })
+    const MAX_IDLE_PREFETCH = 5
+    const limited = targets.slice(0, MAX_IDLE_PREFETCH)
+    if (limited.length === 0) return
+
+    let idx = 0
+    const runStep = () => {
+      if (state.cancelled) return
+      while (idx < limited.length && state.inFlight < 2) {  // 并发上限 2
+        const file = limited[idx++]
+        state.inFlight++
+        prefetchLayerData(file).finally(() => {
+          state.inFlight--
+          if (state.cancelled) return
+          if (idx >= limited.length && state.inFlight === 0) {
+            state.handle = null
+            return
+          }
+          if (typeof requestIdleCallback === 'function') {
+            state.handle = requestIdleCallback(runStep, { timeout: 3000 })
+          } else {
+            runStep()
+          }
+        })
+      }
+    }
+    if (typeof requestIdleCallback === 'function') {
+      state.handle = requestIdleCallback(runStep, { timeout: 3000 })
+    } else {
+      runStep()  // 降级：直接按序预取
+    }
+  }, [layerFiles, pointFiles, prefetchLayerData])
+
+  // 图层列表变化后调度空闲预取（延迟到勾选图层加载基本完成，避免抢占其网络）；卸载时取消
+  useEffect(() => {
+    if (!mapInstanceRef.current) return
+    const state = idlePrefetchStateRef.current
+    state.cancelled = false
+    const t = window.setTimeout(() => {
+      scheduleIdlePrefetch()
+    }, 1500)
+    return () => {
+      window.clearTimeout(t)
+      state.cancelled = true
+      if (state.handle !== null && typeof cancelIdleCallback === 'function') {
+        cancelIdleCallback(state.handle)
+        state.handle = null
+      }
+    }
+  }, [scheduleIdlePrefetch])
 
   /**
    * 切换地图类型
