@@ -582,7 +582,12 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
     nr: false
   })
   // 点文件标签可见性（撒点文件的属性标签）
-  const [pointFileLabelVisibility, setPointFileLabelVisibilityState] = useState<Record<string, boolean>>({})
+  // 🔧 挂载时从持久化 store 恢复（合并 pointFileLabelVisibility 与 layerFileLabelVisibility），
+  // 保证页面切换后文件标签开关与显示状态保持
+  const [pointFileLabelVisibility, setPointFileLabelVisibilityState] = useState<Record<string, boolean>>(() => {
+    const s = useMapStore.getState().mapSettings
+    return { ...s.pointFileLabelVisibility, ...s.layerFileLabelVisibility }
+  })
   const [sectorData, setSectorData] = useState<{
     lte: RenderSectorData[]
     nr: RenderSectorData[]

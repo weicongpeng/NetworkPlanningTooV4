@@ -301,9 +301,12 @@ export class GeoDataLayer {
       this.setSelectionHighlight(this.selectionHighlightIds)
     }
 
-    // 🔧 修复：remove() 清空了 canvasLabelLayer，重新勾选图层时需重建标签层
-    // （labelsEnabled 持久，但 Canvas 标签层被销毁，addTo 不再重建导致标签不恢复）
-    if (this.labelsEnabled && !this.canvasLabelLayer && this.visible) {
+    // 🔧 修复：勾选图层时始终填充/重建标签层
+    // 场景1：remove() 清空了 canvasLabelLayer，重新勾选需重建；
+    // 场景2：标签开关在图层不可见时打开会创建"空"标签层（_createLabels 因 !visible 跳过填充），
+    //        若因 canvasLabelLayer 已存在而跳过重建，标签永远为空 → 每次勾选都 _createLabels 填充。
+    // _createLabels 幂等：不存在则创建并 addTo，已存在则仅 setLabels 填充。
+    if (this.labelsEnabled && this.visible) {
       this._createLabels(map)
     }
 

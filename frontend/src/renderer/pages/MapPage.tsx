@@ -23,7 +23,7 @@ import { useMapStore } from '../store/mapStore'
 import { useMapDataCacheStore } from '../store/mapDataCacheStore'
 import { mapDataService, type RenderSectorData } from '../services/mapDataService'
 import { frequencyColorMapper } from '../config/sector-config'
-import { LabelSettings } from '../components/Map/LabelSettingsModal'
+import { LabelSettings, LayerColorSettings } from '../components/Map/LabelSettingsModal'
 import { TreeNode } from '../components/Map/LayerControl'
 import { selectionManager } from '../services/selectionManager'
 
@@ -84,6 +84,7 @@ export function MapPage() {
     setLayerFileLabelVisibility: storeSetLayerFileLabelVisibility,
     setMapType: storeSetMapType,
     setLabelSettings: storeSetLabelSettings,
+    setColorSettings: storeSetColorSettings,
     setBaseMapVisible: storeSetBaseMapVisible,
     setDecorationLabelVisible: storeSetDecorationLabelVisible,
   } = useMapStore()
@@ -171,8 +172,10 @@ export function MapPage() {
   const [pointFileLabelVisibility, setPointFileLabelVisibility] = useState<Record<string, boolean>>(
     mapSettings.pointFileLabelVisibility
   )
-  // 图层文件标签可见性
-  const [layerFileLabelVisibility, setLayerFileLabelVisibility] = useState<Record<string, boolean>>({})
+  // 图层文件标签可见性（从持久化 store 初始化，页面切换后状态保持）
+  const [layerFileLabelVisibility, setLayerFileLabelVisibility] = useState<Record<string, boolean>>(
+    mapSettings.layerFileLabelVisibility
+  )
   const [layerFiles, setLayerFiles] = useState<LayerFileOption[]>([])
   const [pointFiles, setPointFiles] = useState<LayerFileOption[]>([])
 
@@ -252,6 +255,12 @@ export function MapPage() {
     : { 'lte-sectors': { content: 'name' as const, color: '#000000', fontSize: 12 }, 'nr-sectors': { content: 'name' as const, color: '#000000', fontSize: 12 } }
   const [labelSettingsMap, setLabelSettingsMap] = useState<Record<string, LabelSettings>>(initialLabelSettings)
 
+  // 图层颜色配置状态（按图层ID存储）- 从持久化 store 初始化
+  const initialColorSettings = Object.keys(mapSettings.colorSettingsMap ?? {}).length > 0
+    ? mapSettings.colorSettingsMap
+    : {}
+  const [colorSettingsMap, setColorSettingsMap] = useState<Record<string, LayerColorSettings>>(initialColorSettings)
+
 
 
 
@@ -282,6 +291,9 @@ export function MapPage() {
       // 并行获取所有MapInfo图层（带缓存）
       const mapInfoPromises = mapItems.map(async (mapItem) => {
         try {
+          // 勾选状态持久化：从 store 恢复该图层上次的可见性（无记录则默认 false）
+          const layerFileVisibility = useMapStore.getState().mapSettings.layerFileVisibility
+
           // 检查缓存
           const cached = _layerListCache.get(mapItem.id)
           if (cached && Date.now() - cached.time < _LAYER_LIST_CACHE_TTL) {
@@ -290,7 +302,7 @@ export function MapPage() {
               id: layer.id,
               name: layer.name,
               type: layer.type as 'point' | 'line' | 'polygon',
-              visible: false,
+              visible: layerFileVisibility[layer.id] ?? false,
               dataId: mapItem.id,
               sourceType: 'mapinfo' as const
             }))
@@ -307,7 +319,7 @@ export function MapPage() {
               id: layer.id,
               name: layer.name,
               type: layer.type as 'point' | 'line' | 'polygon',
-              visible: false,
+              visible: layerFileVisibility[layer.id] ?? false,
               dataId: mapItem.id,
               sourceType: 'mapinfo' as const
             }))
@@ -353,11 +365,14 @@ export function MapPage() {
           type = 'polygon'
         }
 
+        // 勾选状态持久化：从 store 恢复该地理化数据上次的可见性（无记录则默认 false）
+        const pointFileVisibility = useMapStore.getState().mapSettings.pointFileVisibility
+
         return {
           id: item.id,
           name: item.name,
           type: type,
-          visible: false,
+          visible: pointFileVisibility[item.id] ?? false,
           dataId: item.id,
           sourceType: 'excel',
           geometryType: item.geometryType
@@ -1036,9 +1051,10 @@ export function MapPage() {
     addLocationPoint(newPoint)
     if (onlineMapRef.current) {
       onlineMapRef.current.flyTo([correctedLat, correctedLng], 15)
-      onlineMapRef.current.addLocationMarker(newPoint, locationPoints.length + 1)
     }
-  }, [addLocationPoint, locationPoints.length])
+    // 定位点标记由 locationPoints 驱动的 useEffect 统一添加，
+    // 此处不再重复调用 addLocationMarker，避免与 effect 产生重复标记/标签
+  }, [addLocationPoint])
 
   /**
    * 处理搜索或定位动作（点击放大镜按钮或回车）
@@ -1340,8 +1356,18 @@ export function MapPage() {
       // 用户既然在配置标签，肯定希望看到效果，所以强制显示标签
       setPointFileLabelVisibility(prev => ({
         ...prev,
-        [layerId]: true  // 强制启用标签显示
+        [layerId]: true  // 强制启用标签显示（地理化数据开关读此状态）
       }))
+      storeSetPointFileLabelVisibility(layerId, true)
+      // 🔧 修复：图层文件（非 excel）的标签开关读 layerFileLabelVisibility，需同步置 true 并持久化
+      // （否则设置保存后地图显示标签但控制面板开关仍关闭，状态不一致；参考地理化数据已有行为）
+      if (node.layerFile && node.layerFile.sourceType !== 'excel') {
+        setLayerFileLabelVisibility(prev => ({
+          ...prev,
+          [layerId]: true
+        }))
+        storeSetLayerFileLabelVisibility(layerId, true)
+      }
 
       // 应用标签设置到地图
       if (onlineMapRef.current) {
@@ -1349,7 +1375,45 @@ export function MapPage() {
         onlineMapRef.current.setLayerFileLabelVisibility(layerId, true, settings)
       }
     }
-  }, [pointFileLabelVisibility])
+  }, [pointFileLabelVisibility, storeSetPointFileLabelVisibility, storeSetLayerFileLabelVisibility])
+
+  /**
+   * 处理图层颜色设置变化
+   */
+  const handleColorSettingsChange = useCallback((node: TreeNode, settings: LayerColorSettings) => {
+    console.log('[MapPage] Color settings change:', node, settings)
+
+    // 确定图层ID
+    let layerId: string | undefined
+    if (node.type === 'sector-layer' && node.sectorLayer) {
+      layerId = node.sectorLayer.id
+    } else if (node.type === 'layer-file' && node.layerFile) {
+      layerId = node.layerFile.id
+    } else if (node.type === 'decoration-layer') {
+      layerId = 'decoration-layer'
+    }
+
+    if (!layerId) {
+      console.warn('[MapPage] Cannot determine layer ID for color settings')
+      return
+    }
+
+    // 更新本地状态 + 持久化 store
+    setColorSettingsMap(prev => ({ ...prev, [layerId as string]: settings }))
+    storeSetColorSettings(layerId, settings)
+
+    if (!onlineMapRef.current) return
+
+    // 强制显示目标图层，便于看到改色效果
+    if (node.type === 'layer-file' && node.layerFile) {
+      storeSetLayerFileVisibility(layerId, true)
+    } else if (node.type === 'decoration-layer') {
+      storeSetDecorationLayerVisible(true)
+    }
+
+    // 应用颜色到地图
+    onlineMapRef.current.setLayerColorSettings(layerId, settings)
+  }, [storeSetColorSettings, storeSetLayerFileVisibility, storeSetDecorationLayerVisible])
 
   return (
     <div ref={mapPageRef} className="flex flex-col h-full min-h-0">
@@ -1775,6 +1839,8 @@ export function MapPage() {
               onCustomLayerRemove={handleRemoveCustomLayer}
               onLabelSettingsChange={handleLabelSettingsChange}
               labelSettingsMap={labelSettingsMap}
+              onColorSettingsChange={handleColorSettingsChange}
+              colorSettingsMap={colorSettingsMap}
               decorationLayer={decorationLayer}
               onDecorationLayerToggle={handleDecorationLayerToggle}
               decorationLabelVisible={decorationLabelVisible}
