@@ -506,6 +506,8 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
 
   // 点文件数据存储（用于属性标签渲染）
   const pointFileDataRef = useRef<Map<string, any[]>>(new Map())
+  // 预取的 Excel 原始数据缓存（挂载时并发预取，避免构建阶段 3 并发 worker 串行等待网络）
+  const prefetchedExcelDataRef = useRef<Map<string, any>>(new Map())
 
   // 扇区信息面板
   const {
@@ -2619,7 +2621,11 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
 
       if (layerFile.sourceType === 'excel') {
         console.log('[OnlineMap] 从Excel加载点数据, dataId:', layerFile.dataId)
-        const response = await dataApi.get(layerFile.dataId)
+        // 🔧 优先复用预取缓存（loadMapInfoLayers 挂载时已并发预取），避免 3 并发 worker 串行等待网络
+        const cachedExcel = prefetchedExcelDataRef.current.get(layerFile.id)
+        const response = cachedExcel !== undefined
+          ? { success: true, data: cachedExcel }
+          : await dataApi.get(layerFile.dataId)
         console.log('[OnlineMap] Excel API响应:', response.success, '有数据:', !!response.data)
         console.log('[OnlineMap] response.data type:', Array.isArray(response.data) ? 'array' : typeof response.data)
         console.log('[OnlineMap] response.data keys:', response.data ? Object.keys(response.data) : 'no data')
@@ -2929,10 +2935,21 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
    * 懒加载：只拉取 MapInfo 图层数据并缓存，不构建图层
    */
   const prefetchLayerData = useCallback(async (layerFile: LayerFileOption) => {
-    // Excel 点数据走 GeoDataLayer 分支，不在此预取
-    if (layerFile.sourceType === 'excel') return
+    // Excel 数据：预取到内存 ref，构建阶段直接复用，避免 3 并发 worker 串行等待网络
+    if (layerFile.sourceType === 'excel') {
+      if (prefetchedExcelDataRef.current.has(layerFile.id)) return
+      try {
+        const response = await dataApi.get(layerFile.dataId)
+        if (response.success && response.data) {
+          prefetchedExcelDataRef.current.set(layerFile.id, response.data)
+        }
+      } catch (error) {
+        console.error('[OnlineMap] 预取 Excel 数据失败:', layerFile.id, error)
+      }
+      return
+    }
 
-    // 已缓存则跳过
+    // MapInfo 图层：已缓存则跳过
     if (useMapDataCacheStore.getState().layers[layerFile.id]?.geojson) return
 
     try {
@@ -2981,7 +2998,7 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
       console.log('[OnlineMap] 预取已勾选图层数量:', visibleFiles.length)
 
       // 并发拉取数据并缓存（限流，避免一次几十个请求）
-      const CHUNK = 5
+      const CHUNK = 10
       for (let i = 0; i < visibleFiles.length; i += CHUNK) {
         const chunk = visibleFiles.slice(i, i + CHUNK)
         await Promise.all(chunk.map(layerFile => prefetchLayerData(layerFile)))

@@ -9,9 +9,9 @@ import time
 import uuid
 import logging
 from pathlib import Path
-from fastapi import APIRouter, Depends, UploadFile, File, HTTPException, Body, Form
+from fastapi import APIRouter, Depends, UploadFile, File, HTTPException, Body, Form, Request
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from typing import Dict, Any, List, Optional
 from app.core.config import settings
 from app.models.schemas import (
@@ -594,7 +594,7 @@ async def get_layer_files(data_id: str) -> Dict[str, Any]:
 
 
 @router.get("/{data_id}/layers/{layer_id}/data", response_model=Dict[str, Any])
-async def get_layer_data(data_id: str, layer_id: str) -> Dict[str, Any]:
+async def get_layer_data(data_id: str, layer_id: str, request: Request, response: Response) -> Dict[str, Any]:
     """获取图层要素数据（GeoJSON格式）"""
     try:
         from app.services.mapinfo_service import get_layer_data
@@ -604,11 +604,28 @@ async def get_layer_data(data_id: str, layer_id: str) -> Dict[str, Any]:
         if not data_dir.exists():
             raise HTTPException(status_code=404, detail="数据不存在")
 
+        # 🔧 ETag 基于源文件 mtime（与 mapinfo_service 落盘缓存失效逻辑一致），
+        # 浏览器刷新后文件未变则 304 复用，避免大 GeoJSON 重传（前端内存缓存刷新即失）
+        etag = None
+        mtime_file = data_dir / ".cache" / f"{layer_id}.mtime"
+        try:
+            if mtime_file.exists():
+                etag = f'"{layer_id}-{mtime_file.read_text().strip()}"'
+        except Exception:
+            pass
+        if etag and request.headers.get("if-none-match") == etag:
+            return Response(status_code=304)
+
         # 首次解析为 CPU 密集型（gpd.read_file + 坐标转换），用线程池避免阻塞事件循环
         from fastapi.concurrency import run_in_threadpool
         geojson = await run_in_threadpool(get_layer_data, data_id, layer_id, data_dir)
         if geojson is None:
             raise HTTPException(status_code=404, detail="图层不存在")
+
+        # 设置缓存头：ETag 命中时浏览器可 304 复用，避免大 GeoJSON 重传
+        if etag:
+            response.headers["ETag"] = etag
+            response.headers["Cache-Control"] = "private, max-age=0, must-revalidate"
 
         return {"success": True, "data": geojson}
     except HTTPException:
@@ -782,13 +799,14 @@ async def get_layer_columns(data_id: str, layer_id: str) -> Dict[str, Any]:
     try:
         from app.services.mapinfo_service import get_layer_data
         from app.core.config import settings
+        from fastapi.concurrency import run_in_threadpool
 
         data_dir = settings.DATA_DIR / data_id
         if not data_dir.exists():
             raise HTTPException(status_code=404, detail="数据不存在")
 
-        # 获取图层数据
-        layer_data = get_layer_data(data_id, layer_id, data_dir)
+        # 获取图层数据（缓存未命中时 gpd 解析为 CPU 密集型，用线程池避免阻塞事件循环）
+        layer_data = await run_in_threadpool(get_layer_data, data_id, layer_id, data_dir)
         if not layer_data or "features" not in layer_data:
             raise HTTPException(status_code=404, detail="图层数据不存在")
 

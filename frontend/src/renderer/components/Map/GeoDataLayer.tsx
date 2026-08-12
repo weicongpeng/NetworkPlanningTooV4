@@ -357,7 +357,8 @@ export class GeoDataLayer {
     const pad = this._padBounds(this.map.getBounds(), 0.2)
     const visible = this._filterVisible(pad)
 
-    const BATCH = 300
+    // 🔧 性能：批次 300→600 减半 setTimeout 空闲间隙（加快首屏出图，桌面端可接受）
+    const BATCH = 600
     let i = 0
     const self = this
 

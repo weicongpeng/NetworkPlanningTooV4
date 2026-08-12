@@ -523,7 +523,8 @@ export class MapInfoLayer {
   private async _addGeoJSONChunks(featureCollection: GeoJSON.FeatureCollection): Promise<void> {
     if (!this.geoJSONLayer) return
     const features = featureCollection.features || []
-    const BATCH = 500
+    // 🔧 性能：批次 500→1000 减半 setTimeout 空闲间隙（桌面端单批阻塞可接受，加快首屏出图）
+    const BATCH = 1000
     for (let i = 0; i < features.length; i += BATCH) {
       const chunk: GeoJSON.FeatureCollection = {
         type: 'FeatureCollection',
