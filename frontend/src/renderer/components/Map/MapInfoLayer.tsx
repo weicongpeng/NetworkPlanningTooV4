@@ -10,6 +10,7 @@
  */
 import L from 'leaflet'
 import { extractFeatureId } from '../../utils/featureId'
+import { GeoDataCanvasLabelLayer, CanvasLabelData } from './GeoDataCanvasLabelLayer'
 
 const IS_DEV = import.meta.env.DEV
 
@@ -111,7 +112,7 @@ export class MapInfoLayer {
 
   // 标签相关属性
   private labelsEnabled: boolean = false
-  private labelMarkers: Map<string, L.Marker> = new Map()
+  private canvasLabelLayer: GeoDataCanvasLabelLayer | null = null  // Canvas 标签层（替代 DOM marker）
   private labelConfig: {
     content: string
     color: string
@@ -386,8 +387,9 @@ export class MapInfoLayer {
       // 点要素样式
       pointToLayer: (feature: any, latLng: L.LatLng) => {
         // 获取 feature 级别的样式（如果存在）
+        // 合并优先级：默认样式 < 要素样式(_style.point) < 图层级用户设置(style.point)
         const featureStyle = (feature.properties as any)?._style?.point || {}
-        const pointStyle = { ...DEFAULT_STYLES.point, ...mapInfoLayer.style.point, ...featureStyle }
+        const pointStyle = { ...DEFAULT_STYLES.point, ...featureStyle, ...mapInfoLayer.style.point }
 
         // 如果有符号类型，可以使用自定义图标
         if (featureStyle.markerSymbol && featureStyle.markerSymbol !== 'circle') {
@@ -434,16 +436,15 @@ export class MapInfoLayer {
         }
 
         if (geometry === 'LineString' || geometry === 'MultiLineString') {
-          // 合并样式：默认样式 -> 图层样式 -> 要素样式
+          // 合并优先级：默认样式 < 要素样式(_style) < 图层级用户设置(style.line)
+          // 后端注入的 feature._style 是 MapInfo 文件自带的默认样式，用户通过
+          // "图层颜色设置" 配置的颜色/透明度必须优先于它，否则保存后不生效。
+          const userLine = mapInfoLayer.style.line || {}
           const mergedStyle = {
-            ...DEFAULT_STYLES.line,
-            ...mapInfoLayer.style.line
+            color: userLine.color ?? featureStyle.strokeColor ?? DEFAULT_STYLES.line.color,
+            weight: userLine.weight ?? featureStyle.strokeWidth ?? DEFAULT_STYLES.line.weight,
+            opacity: userLine.opacity ?? featureStyle.strokeOpacity ?? DEFAULT_STYLES.line.opacity,
           }
-
-          if (featureStyle.strokeColor) mergedStyle.color = featureStyle.strokeColor
-          if (featureStyle.strokeWidth !== undefined) mergedStyle.weight = featureStyle.strokeWidth
-          if (featureStyle.strokeDasharray) mergedStyle.dashArray = featureStyle.strokeDasharray
-          if (featureStyle.strokeOpacity !== undefined) mergedStyle.opacity = featureStyle.strokeOpacity
 
           const result: any = {
             color: mergedStyle.color || '#8b5cf6',
@@ -452,22 +453,21 @@ export class MapInfoLayer {
             lineCap: 'round',
             lineJoin: 'round'
           }
-          if (mergedStyle.dashArray) {
-            result.dashArray = mergedStyle.dashArray
+          const lineDashArray = userLine.dashArray ?? featureStyle.strokeDasharray
+          if (lineDashArray) {
+            result.dashArray = lineDashArray
           }
           return result
         } else if (geometry === 'Polygon' || geometry === 'MultiPolygon') {
+          // 合并优先级：默认样式 < 要素样式(_style) < 图层级用户设置(style.polygon)
+          const userPolygon = mapInfoLayer.style.polygon || {}
           const mergedStyle = {
-            ...DEFAULT_STYLES.polygon,
-            ...mapInfoLayer.style.polygon
+            color: userPolygon.color ?? featureStyle.strokeColor ?? DEFAULT_STYLES.polygon.color,
+            weight: userPolygon.weight ?? featureStyle.strokeWidth ?? DEFAULT_STYLES.polygon.weight,
+            opacity: userPolygon.opacity ?? featureStyle.strokeOpacity ?? DEFAULT_STYLES.polygon.opacity,
+            fillColor: userPolygon.fillColor ?? featureStyle.fillColor ?? DEFAULT_STYLES.polygon.fillColor,
+            fillOpacity: userPolygon.fillOpacity ?? featureStyle.fillOpacity ?? DEFAULT_STYLES.polygon.fillOpacity,
           }
-
-          if (featureStyle.strokeColor) mergedStyle.color = featureStyle.strokeColor
-          if (featureStyle.strokeWidth !== undefined) mergedStyle.weight = featureStyle.strokeWidth
-          if (featureStyle.strokeOpacity !== undefined) mergedStyle.opacity = featureStyle.strokeOpacity
-          if (featureStyle.strokeDasharray) mergedStyle.dashArray = featureStyle.strokeDasharray
-          if (featureStyle.fillColor) mergedStyle.fillColor = featureStyle.fillColor
-          if (featureStyle.fillOpacity !== undefined) mergedStyle.fillOpacity = featureStyle.fillOpacity
 
           const result: any = {
             color: mergedStyle.color || '#10b981',
@@ -476,8 +476,9 @@ export class MapInfoLayer {
             fillColor: mergedStyle.fillColor || '#10b981',
             fillOpacity: mergedStyle.fillOpacity || 0.3
           }
-          if (mergedStyle.dashArray) {
-            result.dashArray = mergedStyle.dashArray
+          const polygonDashArray = userPolygon.dashArray ?? featureStyle.strokeDasharray
+          if (polygonDashArray) {
+            result.dashArray = polygonDashArray
           }
           return result
         }
@@ -555,6 +556,63 @@ export class MapInfoLayer {
    */
   getType(): LayerGeometryType {
     return this.type
+  }
+
+  /**
+   * 设置图层颜色覆盖（图形颜色 / 透明度 / 边框宽度 / 边框颜色）
+   * 写入 style 配置后重新执行 GeoJSON 的 style 函数，使已渲染要素即时生效。
+   */
+  setStyleOverrides(settings: { fillColor: string; fillOpacity: number; borderWidth: number; borderColor: string }): void {
+    // 点样式：填充 + 边框
+    this.style.point = {
+      ...this.style.point,
+      fillColor: settings.fillColor,
+      fillOpacity: settings.fillOpacity,
+      color: settings.borderColor,
+      weight: settings.borderWidth,
+      opacity: 1
+    }
+
+    // 线样式：无填充，透明度作用于描边
+    this.style.line = {
+      ...this.style.line,
+      color: settings.borderColor,
+      weight: settings.borderWidth,
+      opacity: settings.fillOpacity
+    }
+
+    // 面样式：填充 + 边框
+    this.style.polygon = {
+      ...this.style.polygon,
+      fillColor: settings.fillColor,
+      fillOpacity: settings.fillOpacity,
+      color: settings.borderColor,
+      weight: settings.borderWidth,
+      opacity: 1
+    }
+
+    // 重新应用样式
+    // 注：点要素由 pointToLayer 创建（style 函数对 Point 返回 {}，resetStyle 对其无效），
+    // 必须对点要素直接 setStyle；线/面走 style 函数 resetStyle 即可。
+    if (this.geoJSONLayer) {
+      this.geoJSONLayer.eachLayer((layer: any) => {
+        if (layer instanceof L.CircleMarker) {
+          layer.setStyle({
+            fillColor: settings.fillColor,
+            fillOpacity: settings.fillOpacity,
+            color: settings.borderColor,
+            weight: settings.borderWidth,
+            opacity: 1
+          })
+        } else {
+          this.geoJSONLayer?.resetStyle(layer)
+        }
+      })
+      // 兜底：强制所有要素重绘，确保 Canvas 渲染器必然刷新（避免个别 setStyle 未触发重绘）
+      this.geoJSONLayer.eachLayer((layer: any) => {
+        if (typeof layer.redraw === 'function') layer.redraw()
+      })
+    }
   }
 
   /**
@@ -680,36 +738,18 @@ export class MapInfoLayer {
   /**
    * 创建标签
    *
-   * 🔥 性能优化：基于缩放级别和优先级的智能标签限制
-   * - 缩放级别 > 12: 最多显示 5000 个标签
-   * - 缩放级别 <= 12: 最多显示 1000 个标签
-   * - 按优先级排序，优先显示重要要素
+   * 🔧 Canvas 化：复用 GeoDataCanvasLabelLayer（单 Canvas + 网格防重叠 + 视口裁剪 + rAF + move 自刷新）
+   * 移除 MAX_LABELS 上限与 DOM 全量重建，全部要素交给 Canvas 层处理防重叠与视口裁剪
    */
   private _createLabels(map: L.Map): void {
     if (!this.geoJSONLayer) return
 
-    // 清除现有标签
+    // 移除旧标签
     this._removeLabels()
 
-    // 🔥 性能优化：根据缩放级别设置最大标签数量
-    const MAX_LABELS = this.currentZoom > 12 ? 5000 : 1000
-
-    // 🔥 如果现有标签数量超过阈值，先清理（防止内存泄漏）
-    if (this.labelMarkers.size > MAX_LABELS * 1.5) {
-      console.warn(`[MapInfoLayer] 标签数量过多 (${this.labelMarkers.size})，强制清理`)
-      this._removeLabels()
-    }
-
-    console.log(`[MapInfoLayer] 🚀 智能标签模式: 最大 ${MAX_LABELS} 个标签 (缩放级别: ${this.currentZoom})`)
-
-    // 🔥 收集所有要素及其优先级
-    const featuresToLabel: Array<{
-      layer: any
-      feature: GeoJSON.Feature
-      latLng: L.LatLng
-      labelContent: string
-      priority: number
-    }> = []
+    // 收集全部要素标签（无数量上限，Canvas 层负责防重叠与视口裁剪）
+    const labelItems: CanvasLabelData[] = []
+    let index = 0
 
     this.geoJSONLayer.eachLayer((layer: any) => {
       try {
@@ -725,127 +765,49 @@ export class MapInfoLayer {
         } else if (layer instanceof L.Polygon) {
           latLng = layer.getBounds().getCenter()
         }
-
         if (!latLng) return
 
-        // 获取标签内容
+        // 获取标签内容（保留现有 _getLabelContent 逻辑，字段回退在 Task 2 加）
         const labelContent = this._getLabelContent(properties)
         if (!labelContent) return
 
-        // 计算优先级
-        const priority = this._calculateLabelPriority(properties, feature)
-
-        featuresToLabel.push({
-          layer,
-          feature,
-          latLng,
-          labelContent,
-          priority
-        })
+        labelItems.push({ index: index++, position: latLng, content: labelContent })
       } catch (err) {
         // 静默忽略单个要素的错误
       }
     })
 
-    // 🔥 按优先级排序（降序），优先显示重要要素
-    featuresToLabel.sort((a, b) => b.priority - a.priority)
-
-    // 🔥 只为高优先级的要素创建标签
-    const limitedFeatures = featuresToLabel.slice(0, MAX_LABELS)
-    const skippedCount = featuresToLabel.length - MAX_LABELS
-
-    limitedFeatures.forEach(({ layer, latLng, labelContent }) => {
-      try {
-        // 创建标签图标
-        const labelIcon = L.divIcon({
-          className: 'mapinfo-label',
-          html: `<div style="
-              font-size: ${this.labelConfig.fontSize}px;
-              color: ${this.labelConfig.color};
-              font-weight: 500;
-              white-space: nowrap;
-              background-color: transparent;
-              padding: 0;
-              pointer-events: none;
-              text-shadow: 0 1px 2px rgba(0,0,0,0.3);
-            ">${labelContent}</div>`,
-          iconSize: L.point(0, 0),
-          iconAnchor: L.point(0, -5)
-        })
-
-        const labelMarker = L.marker(latLng, {
-          icon: labelIcon,
-          interactive: false
-        } as any)
-
-        labelMarker.addTo(map)
-        const layerId = (layer as any)._leaflet_id || String(latLng.lat)
-        this.labelMarkers.set(layerId, labelMarker)
-      } catch (err) {
-        console.warn('[MapInfoLayer] Failed to create label:', err)
-      }
-    })
-
-    console.log(`[MapInfoLayer] ✅ 已创建 ${this.labelMarkers.size} 个标签${skippedCount > 0 ? ` (跳过 ${skippedCount} 个低优先级标签)` : ''}`)
-  }
-
-  /**
-   * 计算标签优先级
-   * P1-3 优化: 返回优先级分数（数值越大越优先）
-   */
-  private _calculateLabelPriority(properties: any, feature: GeoJSON.Feature): number {
-    let priority = 0
-
-    // 1. 名称前缀优先级（"A"开头最优先）
-    const name = properties.name || properties.小区名称 || properties.CellName || properties.CELLNAME || ''
-    if (name) {
-      const firstChar = name.charAt(0).toUpperCase()
-      if (firstChar === 'A') priority += 100
-      else if (firstChar === 'B') priority += 80
-      else if (firstChar === 'C') priority += 60
-      else if (firstChar >= 'D' && firstChar <= 'F') priority += 40
-      else if (firstChar >= 'G' && firstChar <= 'L') priority += 20
+    // 创建/复用 Canvas 标签层
+    if (!this.canvasLabelLayer) {
+      this.canvasLabelLayer = new GeoDataCanvasLabelLayer({
+        fontSize: this.labelConfig.fontSize,
+        fontColor: this.labelConfig.color
+      })
+    } else {
+      this.canvasLabelLayer.updateConfig({
+        fontSize: this.labelConfig.fontSize,
+        fontColor: this.labelConfig.color
+      })
     }
 
-    // 2. 点要素优先级略高于线面（因为通常更重要）
-    if (feature.geometry?.type === 'Point') {
-      priority += 10
+    this.canvasLabelLayer.setLabels(labelItems)
+    if (!map.hasLayer(this.canvasLabelLayer)) {
+      this.canvasLabelLayer.addTo(map)
     }
-
-    // 3. 面积/长度优先级（较大的要素优先）
-    if (properties.area) {
-      priority += Math.min(Math.log(properties.area + 1) / 10, 20)
-    }
-    if (properties.length) {
-      priority += Math.min(Math.log(properties.length + 1) / 10, 15)
-    }
-
-    // 4. 特殊标识优先级
-    if (properties.isImportant || properties.重要性 === '高') {
-      priority += 50
-    }
-    if (properties.isShared === '是' || properties.isShared === true) {
-      priority += 5
-    }
-
-    return priority
+    console.log(`[MapInfoLayer] ✅ 已创建 ${labelItems.length} 个 Canvas 标签`)
   }
 
   /**
    * 移除所有标签
    */
   private _removeLabels(): void {
-    this.labelMarkers.forEach((marker: any) => {
-      try {
-        const map = marker._map || this.currentMap
-        if (map) {
-          map.removeLayer(marker)
-        }
-      } catch (err) {
-        console.warn('[MapInfoLayer] Failed to remove label:', err)
+    if (this.canvasLabelLayer) {
+      const map = this.currentMap
+      if (map && map.hasLayer(this.canvasLabelLayer)) {
+        map.removeLayer(this.canvasLabelLayer)
       }
-    })
-    this.labelMarkers.clear()
+      this.canvasLabelLayer = null
+    }
   }
 
   /**
