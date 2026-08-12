@@ -878,16 +878,18 @@ export class GeoDataLayer {
     }
 
     // 纯平移时直接重新渲染几何图形（视口裁剪需要更新）
-    // 说明：move 已由 _handleMove 节流刷新；此处为 moveend 兜底，
-    // 不再因 zoomChanged 跳过 —— zoom 场景由 _handleZoomEnd 全量重渲染，重复执行无害（幂等）
-    if (this._geometryRenderTimer) {
-      clearTimeout(this._geometryRenderTimer)
+    // 说明：move 已由 _handleMove 节流实时刷新，此处为 moveend 兜底；
+    // 缩放场景由 _handleZoomEnd 全量重渲染，此处按 zoomChanged 跳过避免重复全量重建
+    if (!zoomChanged) {
+      if (this._geometryRenderTimer) {
+        clearTimeout(this._geometryRenderTimer)
+      }
+      // 使用短延迟合并连续 move 事件，但不再与 zoom 处理共享定时器变量
+      this._geometryRenderTimer = window.setTimeout(() => {
+        this._reRenderGeometries()
+        this._geometryRenderTimer = null
+      }, 150) as unknown as number
     }
-    // 使用短延迟合并连续 move 事件，但不再与 zoom 处理共享定时器变量
-    this._geometryRenderTimer = window.setTimeout(() => {
-      this._reRenderGeometries()
-      this._geometryRenderTimer = null
-    }, 150) as unknown as number
   }
 
   /**

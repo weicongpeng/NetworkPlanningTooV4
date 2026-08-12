@@ -790,10 +790,12 @@ export class MapInfoLayer {
       })
     }
 
-    this.canvasLabelLayer.setLabels(labelItems)
+    // 🔧 必须先 addTo 再 setLabels：GeoDataCanvasLabelLayer.setLabels 在 this.map 为空时直接早退
+    // （this.map 由 addTo → onAdd 赋值），先 setLabels 会把标签全部丢弃
     if (!map.hasLayer(this.canvasLabelLayer)) {
       this.canvasLabelLayer.addTo(map)
     }
+    this.canvasLabelLayer.setLabels(labelItems)
     console.log(`[MapInfoLayer] ✅ 已创建 ${labelItems.length} 个 Canvas 标签`)
   }
 
@@ -848,9 +850,10 @@ export class MapInfoLayer {
 
     // 2. 字段回退：配置字段（含映射）均缺失时，回退到第一个可用的字符串属性，
     // 避免 MIF/MAP 图层字段名不匹配（如 OBJECTID/NAME_1/LABEL）导致大量标签不显示
-    const SKIP_FIELDS = new Set(['id', 'type', 'geometry', 'path', 'color', 'style', 'longitude', 'latitude', 'azimuth', 'beamwidth', 'properties'])
+    // SKIP_FIELDS 按小写匹配，覆盖大小写变体与坐标类字段，避免把坐标/元数据当标签
+    const SKIP_FIELDS = new Set(['id', 'type', 'geometry', 'path', 'color', 'style', 'longitude', 'latitude', 'lng', 'lat', 'lon', 'x', 'y', 'azimuth', 'beamwidth', 'properties', '经度', '纬度'])
     for (const [key, value] of Object.entries(properties)) {
-      if (SKIP_FIELDS.has(key)) continue
+      if (SKIP_FIELDS.has(key.toLowerCase())) continue
       if (typeof value !== 'string') continue
       const v = value.trim()
       if (!v) continue

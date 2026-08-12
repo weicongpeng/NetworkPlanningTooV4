@@ -268,7 +268,8 @@ export class GeoDataCanvasLabelLayer extends L.Layer {
     this.canvas.style.width = `${size.x}px`
     this.canvas.style.height = `${size.y}px`
 
-    this.ctx.scale(pixelRatio, pixelRatio)
+    // 用 setTransform 重置并设置缩放，避免多次 resize 时 scale 累积导致标签被过度放大
+    this.ctx.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0)
   }
 
   /**
