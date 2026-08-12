@@ -846,9 +846,16 @@ export class MapInfoLayer {
       }
     }
 
-    // 2. 只返回配置的字段，不使用智能回退
-    // 如果配置的字段没找到，返回空字符串，不显示默认标签
-    // 这样可以避免标签重复显示，只显示用户配置的标签内容
+    // 2. 字段回退：配置字段（含映射）均缺失时，回退到第一个可用的字符串属性，
+    // 避免 MIF/MAP 图层字段名不匹配（如 OBJECTID/NAME_1/LABEL）导致大量标签不显示
+    const SKIP_FIELDS = new Set(['id', 'type', 'geometry', 'path', 'color', 'style', 'longitude', 'latitude', 'azimuth', 'beamwidth', 'properties'])
+    for (const [key, value] of Object.entries(properties)) {
+      if (SKIP_FIELDS.has(key)) continue
+      if (typeof value !== 'string') continue
+      const v = value.trim()
+      if (!v) continue
+      return v
+    }
 
     return ''
   }
