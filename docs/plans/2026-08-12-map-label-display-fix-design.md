@@ -110,22 +110,24 @@
 ## 4. 验证
 
 ### 4.1 问题1 — 勾选立即显示标签
-- [ ] 地理化数据：标签开关打开 → 取消勾选图层 → 重新勾选 → 标签立即显示（无需再拨开关）。
-- [ ] 图层文件：标签开关打开 → 勾选图层复选框 → 标签立即显示。
+- [⏳ 待手工] 地理化数据：标签开关打开 → 取消勾选图层 → 重新勾选 → 标签立即显示（无需再拨开关）。（代码：`GeoDataLayer.addTo` 重建标签层 81cf2c3 + OnlineMap 可见性补调 setLabelVisibility a38af55）
+- [⏳ 待手工] 图层文件：标签开关打开 → 勾选图层复选框 → 标签立即显示。（代码：MapInfoLayer Canvas 标签 + OnlineMap 补调）
 
 ### 4.2 问题2 — 标签全量显示
-- [ ] 图层文件标签全量显示（移除 1000/5000 上限）；低缩放级别下相邻标签不重叠（网格防重叠生效）。
-- [ ] 配置字段缺失的要素标签通过字段回退显示。
+- [⏳ 待手工] 图层文件标签全量显示（移除 1000/5000 上限）；低缩放级别下相邻标签不重叠（网格防重叠生效）。（代码：57b972d 移除 MAX_LABELS/优先级裁剪，复用 GeoDataCanvasLabelLayer 防重叠）
+- [⏳ 待手工] 配置字段缺失的要素标签通过字段回退显示。（代码：eab8a77）
 
 ### 4.3 问题3 — 图层文件标签流畅
-- [ ] 图层文件标签打开后，地图拖拽、缩放流畅度与地理化数据标签打开时相当（无 DOM 逐要素卡顿）。
+- [⏳ 待手工] 图层文件标签打开后，地图拖拽、缩放流畅度与地理化数据标签打开时相当（无 DOM 逐要素卡顿）。（代码：57b972d DOM→Canvas）
 
 ### 4.4 问题4 — 拖拽实时刷新
-- [ ] 地理化数据拖拽地图时，移入可视区域的要素实时出现（move 触发裁剪重建）；缩放路径保持原有行为。
+- [⏳ 待手工] 地理化数据拖拽地图时，移入可视区域的要素实时出现（move 触发裁剪重建）；缩放路径保持原有行为。（代码：490f280 move 事件 + 150ms 节流 + onMapMove 修复）
 
 ### 4.5 回归
-- [ ] `npx tsc --noEmit` 无新增错误；`npm run lint` 通过；`npm run build:vite` 成功。
-- [ ] 扇区标签、Excel 点文件标签、图层颜色设置、z-order 层级不受影响。
+- [✅] `npx tsc --noEmit` 全仓 248 个预存错误，无新增（涉及文件基线：MapInfoLayer/GeoDataCanvasLabelLayer 0、GeoDataLayer 7 预存、OnlineMap 多预存，均未增加）。
+- [✅] `npm run lint` 改动文件仅 3 个预存 error（MapInfoLayer:359 no-this-alias、OnlineMap:2134 prefer-const、OnlineMap:3772 tempCircle unused），与本次改动无关。
+- [✅] `npm run build:vite` 生产构建成功（仅存量 chunk size/browserslist 告警）。
+- [⏳ 待手工] 扇区标签、Excel 点文件标签、图层颜色设置、z-order 层级不受影响。
 
 ---
 
