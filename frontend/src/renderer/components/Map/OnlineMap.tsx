@@ -60,6 +60,7 @@ import { pciDataSyncService } from '../../services/pciDataSyncService'
 import { neighborDataSyncService } from '../../services/neighborDataSyncService'
 import { tacDataSyncService } from '../../services/tacDataSyncService'
 import { useMapDataCacheStore } from '../../store/mapDataCacheStore'
+import { useMapStore } from '../../store/mapStore'
 // TACLegend 已移除，各个页面自己管理对应的图例组件
 
 type MapLayerType = 'satellite' | 'roadmap'
@@ -204,6 +205,8 @@ export interface OnlineMapRef {
   setMapType: (type: 'roadmap' | 'satellite') => void
   /** 设置点文件标签可见性并更新设置 (MapPage用) */
   setLayerFileLabelVisibility: (fileId: string, visible: boolean, settings: any) => void
+  /** 设置图层颜色（图形颜色/透明度/边框宽度/边框颜色） */
+  setLayerColorSettings: (fileId: string, settings: { fillColor: string; fillOpacity: number; borderWidth: number; borderColor: string }, geometryType?: string) => void
   /** 设置地图类型切换 */
   toggleMapType: () => void
   /** 设置频点可见性 */
@@ -504,9 +507,6 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
   // 点文件数据存储（用于属性标签渲染）
   const pointFileDataRef = useRef<Map<string, any[]>>(new Map())
 
-  // 点文件标签标记映射
-  const pointFileLabelMarkersRef = useRef<Map<string, L.Marker[]>>(new Map())
-
   // 扇区信息面板
   const {
     selectedSector,
@@ -647,6 +647,28 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
     reconcileZOrder(visible)
   }, [decorationLayerVisibility, layerVisibility, bringDecorationToFront, geoDataLayerManagerRef, mapInfoLayerRefsRef, lteSectorLayerRef, nrSectorLayerRef])
 
+
+  /**
+   * 应用装饰图层颜色（marker 填充色 / 边框 / 边框宽度 / 透明度）
+   */
+  const applyDecorationColor = useCallback((settings: { fillColor: string; fillOpacity: number; borderWidth: number; borderColor: string }) => {
+    const fg = decorationLayerRef.current
+    if (!fg || !window.L) return
+    const L = window.L
+    fg.eachLayer((layer: any) => {
+      if (!(layer instanceof L.Marker)) return
+      const iconOpts = layer.options?.icon?.options
+      if (iconOpts?.className !== 'location-marker-icon') return
+      const newIcon = L.divIcon({
+        // 定位点圆点始终不透明：fillOpacity 只影响面填充，不应让定位点标记消失
+        html: `<div style="background:${settings.fillColor};width:16px;height:16px;border-radius:50%;border:${settings.borderWidth}px solid ${settings.borderColor};box-shadow:0 1px 4px rgba(0,0,0,0.3);opacity:1;"></div>`,
+        className: 'location-marker-icon',
+        iconSize: [16, 16] as [number, number],
+        iconAnchor: [8, 8] as [number, number]
+      })
+      layer.setIcon(newIcon)
+    })
+  }, [])
 
   /**
    * 暴露方法给父组件
@@ -846,11 +868,12 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
       console.log('[OnlineMap] setDecorationLabelVisibility called:', visible)
       decorationLabelVisibleRef.current = visible
 
-      // Show/hide all decoration label markers
+      // Show/hide decoration label markers（定位点标签直接在地图上，不受此开关控制）
       const map = mapInstanceRef.current
       if (!map || !decorationLayerRef.current) return
 
-      markerLabelElementsRef.current.forEach((labelMarker) => {
+      markerLabelElementsRef.current.forEach((labelMarker, captureId) => {
+        if (captureId.startsWith('location-')) return
         if (visible) {
           if (!decorationLayerRef.current?.hasLayer(labelMarker)) {
             decorationLayerRef.current?.addLayer(labelMarker)
@@ -861,6 +884,37 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
           }
         }
       })
+    },
+
+    setLayerColorSettings: (fileId, settings, geometryType) => {
+      console.log('[OnlineMap] setLayerColorSettings:', fileId, settings, geometryType)
+
+      // 装饰图层
+      if (fileId === 'decoration-layer') {
+        applyDecorationColor(settings)
+        return
+      }
+
+      // 地理化数据 / MapInfo 图层
+      // 1. 优先处理 GeoDataLayer（地理化数据）
+      if (geoDataLayerManagerRef.current) {
+        const geoLayer = geoDataLayerManagerRef.current.getLayer(fileId)
+        if (geoLayer) {
+          console.log('[OnlineMap] setLayerColorSettings -> GeoDataLayer:', fileId)
+          geoLayer.setStyleOverrides(settings)
+          return
+        }
+      }
+
+      // 2. 处理 MapInfoLayer（图层文件）
+      const layerRef = mapInfoLayerRefsRef.current.get(fileId)
+      if (layerRef) {
+        console.log('[OnlineMap] setLayerColorSettings -> MapInfoLayer:', fileId)
+        layerRef.mapInfoLayer.setStyleOverrides(settings)
+        return
+      }
+
+      console.warn('[OnlineMap] setLayerColorSettings: 未找到目标图层', fileId)
     },
 
     setBaseMapVisibility: (visible: boolean) => {
@@ -898,10 +952,22 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
       // 生成默认标签名（如"定位1"、"定位2"）
       const defaultLabel = `${t('map.locationPoint') || '定位'}${index}`
 
-      // 创建定位标记图标 - 与抓取坐标小圆点样式一致：纯色红圆点
+      // 幂等：同一 locationId 已存在时仅更新位置与标签，不重复创建圆点，
+      // 保证"一个定位点 = 一个标记 + 一个标签"，避免重复添加导致标记/标签不一致
+      const existing = locationMarkersRef.current.find(
+        m => (m as any).captureProperties?.id === locationId
+      )
+      if (existing) {
+        existing.setLatLng([marker.lat, marker.lng])
+        updateMarkerLabel(locationId, index, defaultLabel, marker.lat, marker.lng)
+        return
+      }
+
+      // 定位点标记采用固定样式（与打点标记一致：纯色红圆点 + 白边框），
+      // 不随装饰图层颜色/透明度变化，也不依赖"装饰图层"复选框可见性
       const icon = L.divIcon({
-        html: `<div style="background:#ef4444;width:16px;height:16px;border-radius:50%;border:2px solid #fff;box-shadow:0 1px 4px rgba(0,0,0,0.3);"></div>`,
-        className: 'location-marker-icon',
+        html: `<div style="background:#ef4444;width:16px;height:16px;border-radius:50%;display:flex;align-items:center;justify-content:center;border:2px solid #fff;box-shadow:0 1px 4px rgba(0,0,0,0.3);"></div>`,
+        className: 'capture-marker',
         iconSize: [16, 16],
         iconAnchor: [8, 8]
       })
@@ -909,15 +975,19 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
       // 创建标记
       const mapMarker = L.marker([marker.lat, marker.lng], { icon })
 
-      // 存储属性数据到 marker 上，供圈选工具读取
+      // 弹出属性框显示/存储的经纬度统一使用 WGS84（与打点标记一致），
+      // GCJ02 仅用于地图定位显示（marker.lng/marker.lat）
+      const [wgsLat, wgsLng] = CoordinateTransformer.gcj02ToWgs84(marker.lat, marker.lng)
+
+      // 存储属性数据到 marker 上，供圈选工具读取（经纬度为 WGS84）
       ;(mapMarker as any).captureProperties = {
         id: locationId,
         name: defaultLabel,  // 使用默认标签名作为名称
         标签: defaultLabel,  // 添加标签字段
-        longitude: marker.lng.toFixed(6),
-        latitude: marker.lat.toFixed(6),
-        lng: marker.lng.toFixed(6),
-        lat: marker.lat.toFixed(6),
+        longitude: wgsLng.toFixed(6),
+        latitude: wgsLat.toFixed(6),
+        lng: wgsLng.toFixed(6),
+        lat: wgsLat.toFixed(6),
         _layerType: 'LocationPoint'
       }
 
@@ -928,12 +998,8 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
         label: defaultLabel
       })
 
-      // 始终添加到装饰图层（装饰图层会自动处理可见性）
-      if (decorationLayerRef.current) {
-        mapMarker.addTo(decorationLayerRef.current)
-      } else {
-        mapMarker.addTo(map)
-      }
+      // 直接添加到地图，不依赖"装饰图层"复选框勾选状态（定位点始终显示）
+      mapMarker.addTo(map)
 
       // 立即显示默认标签
       updateMarkerLabel(locationId, index, defaultLabel, marker.lat, marker.lng)
@@ -963,10 +1029,10 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
               <input id="${inputId}" type="text" value="${currentLabel.replace(/"/g, '&quot;')}"
                 style="${inputStyle}" ${inputFocus} />
               <span style="color:#888;font-size:11px;">${longitudeText}</span>
-              <input id="${lngInputId}" type="text" value="${marker.lng.toFixed(6)}"
+              <input id="${lngInputId}" type="text" value="${wgsLng.toFixed(6)}"
                 style="${inputStyle}" ${inputFocus} />
               <span style="color:#888;font-size:11px;">${latitudeText}</span>
-              <input id="${latInputId}" type="text" value="${marker.lat.toFixed(6)}"
+              <input id="${latInputId}" type="text" value="${wgsLat.toFixed(6)}"
                 style="${inputStyle}" ${inputFocus} />
             </div>
             <div style="margin-top:10px;padding-top:8px;border-top:1px solid #e5e7eb;display:flex;justify-content:flex-end;gap:8px;">
@@ -995,8 +1061,8 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
               const lngInput = document.getElementById(lngInputId) as HTMLInputElement
               const latInput = document.getElementById(latInputId) as HTMLInputElement
               const labelVal = labelInput?.value.trim() || currentLabel
-              const lngVal = lngInput?.value.trim() || marker.lng.toFixed(6)
-              const latVal = latInput?.value.trim() || marker.lat.toFixed(6)
+              const lngVal = lngInput?.value.trim() || wgsLng.toFixed(6)
+              const latVal = latInput?.value.trim() || wgsLat.toFixed(6)
               const allText = `${labelVal}\t${lngVal}\t${latVal}`
               navigator.clipboard.writeText(allText).then(() => {
                 this.textContent = (window as any).__gsdT?.('map.copied') || '已复制'
@@ -1027,9 +1093,9 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
               // 清除数据
               markerLabelsRef.current.delete(locationId)
               // 从数组中移除引用
-              const idx = mapMarkersRef.current.findIndex(m => m === mapMarker)
+              const idx = locationMarkersRef.current.findIndex(m => m === mapMarker)
               if (idx > -1) {
-                mapMarkersRef.current.splice(idx, 1)
+                locationMarkersRef.current.splice(idx, 1)
               }
             })
           })
@@ -1653,8 +1719,12 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
       zIndexOffset: -100
     })
 
-    // 根据标签可见性决定是否添加到装饰图层
-    if (decorationLabelVisibleRef.current) {
+    // 定位点标签（captureId 以 location- 开头）直接添加到地图，始终显示，
+    // 不依赖"装饰图层"勾选/标签可见性开关
+    if (captureId.startsWith('location-')) {
+      labelMarker.addTo(map)
+    } else if (decorationLabelVisibleRef.current) {
+      // 打点标签：根据标签可见性决定是否添加到装饰图层
       if (decorationLayerRef.current) {
         labelMarker.addTo(decorationLayerRef.current)
       } else {
@@ -2712,6 +2782,12 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
               console.log('[OnlineMap] 同步 GeoDataLayer 标签可见性:', layerFile.id, labelVisible)
               geoLayer.setLabelVisibility(labelVisible)
 
+              // 🔧 重新应用已保存的颜色设置（否则刷新/切换页面后图层会回到默认色）
+              const savedColor = useMapStore.getState().mapSettings.colorSettingsMap?.[layerFile.id]
+              if (savedColor) {
+                geoLayer.setStyleOverrides(savedColor)
+              }
+
               console.log('[OnlineMap] ✅ GeoDataLayer 创建完成:', layerFile.id, 'geometryType:', geometryType)
               return
             } catch (error) {
@@ -2815,6 +2891,12 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
           mapInfoLayer.setLabelVisibility(labelVisible)
           if (labelSettingsMap[layerFile.id]) {
             mapInfoLayer.setLabelConfig(labelSettingsMap[layerFile.id])
+          }
+
+          // 🔧 重新应用已保存的颜色设置（否则刷新/切换页面后图层会回到默认色）
+          const savedColor = useMapStore.getState().mapSettings.colorSettingsMap?.[layerFile.id]
+          if (savedColor) {
+            mapInfoLayer.setStyleOverrides(savedColor)
           }
 
           console.log('[OnlineMap] Layer created:', layerFile.id, 'visible:', layerFile.visible)
@@ -5098,6 +5180,10 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
           console.log('[OnlineMap] GeoDataLayer 可见性:', layerFile.id, layerFile.name, 'visible:', layerFile.visible)
           try {
             geoLayer.setVisible(mapInstanceRef.current, layerFile.visible)
+            // 勾选图层复选框时，按当前标签开关状态同步标签（保证立即显示，无需再点开关）
+            if (layerFile.visible && pointFileLabelVisibility[layerFile.id]) {
+              geoLayer.setLabelVisibility(true)
+            }
           } catch (error) {
             console.error('[OnlineMap] ❌ geoLayer.setVisible 出错:', error)
           }
@@ -5120,6 +5206,10 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
               layerRef.mapInfoLayer.addTo(mapInstanceRef.current)
             } else {
               console.log('[OnlineMap]   - 图层已在地图上，跳过')
+            }
+            // 勾选图层复选框时，按当前标签开关状态同步标签（保证立即显示，无需再点开关）
+            if (pointFileLabelVisibility[layerFile.id]) {
+              layerRef.mapInfoLayer.setLabelVisibility(true)
             }
           } else {
             // 使用 MapInfoLayer 的 remove 方法而不是直接移除 Leaflet 图层
@@ -5272,12 +5362,7 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
         }
       })
 
-      // 将已有的定位标记添加到装饰图层
-      locationMarkersRef.current.forEach(marker => {
-        if (!decorationLayerRef.current?.hasLayer(marker)) {
-          marker.addTo(decorationLayerRef.current!)
-        }
-      })
+      // 定位标记直接添加在地图上（不依赖装饰图层），无需加入装饰图层
     }
 
     // 根据可见性控制图层
@@ -5329,101 +5414,6 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
       createSectorLayers()
     }
   }, [labelVisibility])
-
-  /**
-   * 当点文件标签可见性变化时更新标签标记
-   */
-  useEffect(() => {
-    if (!mapInstanceRef.current || !window.L) return
-
-    const map = mapInstanceRef.current
-    const L = window.L
-
-    // 清理所有现有的点文件标签标记
-    for (const [_, markers] of pointFileLabelMarkersRef.current.entries()) {
-      for (const marker of markers) {
-        map.removeLayer(marker)
-      }
-    }
-    pointFileLabelMarkersRef.current.clear()
-
-    // 遍历所有点文件，为启用标签的文件创建标记
-    for (const [fileId, pointData] of pointFileDataRef.current.entries()) {
-      const shouldShowLabels = pointFileLabelVisibility[fileId] === true
-
-      if (shouldShowLabels && pointData && pointData.length > 0) {
-        // 获取用户配置的标签设置
-        const labelConfig = labelSettingsMap?.[fileId]
-
-        // 如果没有配置标签内容，跳过（不显示默认标签）
-        if (!labelConfig || !labelConfig.content) {
-          console.log('[OnlineMap] 点文件未配置标签内容，跳过:', fileId)
-          continue
-        }
-
-        const markers: L.Marker[] = []
-
-        for (const point of pointData) {
-          if (!point.longitude || !point.latitude) continue
-
-          // 与扇区数据处理方式一致：在前端进行坐标转换
-          const [displayLat, displayLng] = CoordinateTransformer.wgs84ToGcj02(point.latitude || 0, point.longitude || 0)
-          const gcjLat = displayLat
-          const gcjLng = displayLng
-
-          // 获取标签字段值
-          const attributes = point.attributes || {}
-          let labelText = ''
-
-          // 按优先级查找配置的字段值
-          const targetField = labelConfig.content
-
-          // 依次检查: point 对象的直接属性 -> attributes 对象
-          if (point[targetField] !== undefined && point[targetField] !== null) {
-            labelText = String(point[targetField]).trim()
-          } else if (attributes[targetField] !== undefined && attributes[targetField] !== null) {
-            labelText = String(attributes[targetField]).trim()
-          }
-
-          // 如果没有找到字段值，跳过此点
-          if (!labelText) continue
-
-          // 使用用户配置的颜色和字体大小
-          const labelHtml = `
-            <div style="
-              background: transparent;
-              padding: 0;
-              font-size: ${labelConfig.fontSize || 12}px;
-              color: ${labelConfig.color || '#000000'};
-              white-space: nowrap;
-              text-shadow: 0 1px 2px rgba(0,0,0,0.5);
-              font-weight: 500;
-            ">
-              ${labelText}
-            </div>
-          `
-
-          // 动态计算图标大小基于文本长度和字体大小
-          const estimatedWidth = Math.min(200, Math.max(60, labelText.length * (labelConfig.fontSize || 12) * 0.6))
-          const estimatedHeight = (labelConfig.fontSize || 12) + 8
-
-          const icon = L.divIcon({
-            html: labelHtml,
-            className: 'point-file-label',
-            iconSize: [estimatedWidth, estimatedHeight],
-            iconAnchor: [estimatedWidth / 2, estimatedHeight / 2]
-          })
-
-          const marker = L.marker([gcjLat, gcjLng], { icon })
-          marker.addTo(map)
-          markers.push(marker)
-        }
-
-        pointFileLabelMarkersRef.current.set(fileId, markers)
-        console.log('[OnlineMap] Point file labels added:', fileId, markers.length, 'config:', labelConfig)
-      }
-    }
-  }, [pointFileLabelVisibility, pointFiles, labelSettingsMap])
 
   return (
     <>
