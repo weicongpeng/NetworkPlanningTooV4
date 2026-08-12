@@ -170,6 +170,9 @@ export class GeoDataLayer {
   // 缩放事件处理函数引用（用于取消注册）
   private _onZoomBound: (() => void) | null = null
   private _onZoomEndBound: (() => void) | null = null
+  // 拖拽（move）节流字段
+  private _onMoveBound: (() => void) | null = null
+  private _lastMoveRenderTime: number = 0
   // 缩放动画帧 ID
   private _zoomAnimFrameId: number | null = null
   // 交互状态标志
@@ -220,6 +223,13 @@ export class GeoDataLayer {
     this._onZoomEndBound = this._handleZoomEnd.bind(this)
     map.on('zoom', this._onZoomBound)
     map.on('zoomend', this._onZoomEndBound)
+
+    // 🔧 拖拽（纯平移）实时刷新可视区域：move 高频触发，_handleMove 内做固定间隔节流
+    if (this._onMoveBound) {
+      map.off('move', this._onMoveBound)
+    }
+    this._onMoveBound = () => this._handleMove()
+    map.on('move', this._onMoveBound)
 
     // 🔧 修复：添加到地图时，清理可能存在的旧定时器
     // 防止之前的 _reRenderGeometries 定时器在新图层创建后触发并清空它
@@ -657,6 +667,10 @@ export class GeoDataLayer {
         targetMap.off('zoomend', this._onZoomEndBound)
         this._onZoomEndBound = null
       }
+      if (this._onMoveBound) {
+        targetMap.off('move', this._onMoveBound)
+        this._onMoveBound = null
+      }
     }
 
     // 取消待处理的缩放动画帧
@@ -744,6 +758,28 @@ export class GeoDataLayer {
     if (this.labelsEnabled) {
       this._updateLabelsThrottled()
     }
+  }
+
+  /**
+   * 拖拽（纯平移）时按固定间隔节流刷新视口裁剪
+   *
+   * 🔧 修复：原实现只在 moveend 才刷新，拖拽过程中移入视口的要素不出现。
+   * 这里在 move 事件上做固定间隔节流（throttle），拖拽过程中每 150ms 重建一次
+   * 视口裁剪，保证"拖拽实时刷新可视区域"；缩放动画期间的 move 由 _handleZoom 处理。
+   */
+  private _handleMove(): void {
+    if (!this.map || !this.visible) return
+
+    // 固定间隔节流：避免每次 move 都全量重建（move 高频触发）
+    const now = performance.now()
+    if (now - this._lastMoveRenderTime < 150) return
+    this._lastMoveRenderTime = now
+
+    // 缩放动画也触发 move，几何已由 _handleZoom 实时处理，这里跳过
+    if (this.map.getZoom() !== this.currentZoom) return
+
+    // 视口裁剪重建：移入视口的要素实时出现
+    this._reRenderGeometries()
   }
 
   /**
@@ -842,18 +878,16 @@ export class GeoDataLayer {
     }
 
     // 纯平移时直接重新渲染几何图形（视口裁剪需要更新）
-    // 缩放引起的 moveend 不需要在此处理，_handleZoomEnd 已负责
-    if (!zoomChanged) {
-      // 取消之前的定时器
-      if (this._geometryRenderTimer) {
-        clearTimeout(this._geometryRenderTimer)
-      }
-      // 使用短延迟合并连续 move 事件，但不再与 zoom 处理共享定时器变量
-      this._geometryRenderTimer = window.setTimeout(() => {
-        this._reRenderGeometries()
-        this._geometryRenderTimer = null
-      }, 150) as unknown as number
+    // 说明：move 已由 _handleMove 节流刷新；此处为 moveend 兜底，
+    // 不再因 zoomChanged 跳过 —— zoom 场景由 _handleZoomEnd 全量重渲染，重复执行无害（幂等）
+    if (this._geometryRenderTimer) {
+      clearTimeout(this._geometryRenderTimer)
     }
+    // 使用短延迟合并连续 move 事件，但不再与 zoom 处理共享定时器变量
+    this._geometryRenderTimer = window.setTimeout(() => {
+      this._reRenderGeometries()
+      this._geometryRenderTimer = null
+    }, 150) as unknown as number
   }
 
   /**
