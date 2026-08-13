@@ -11,6 +11,8 @@ import { TACPlanningPage } from './pages/TACPlanningPage'
 import { LicensePage } from './pages/LicensePage'
 import LayerToolsPage from './pages/LayerToolsPage'
 import DistanceMatchPage from './pages/DistanceMatchPage'
+import SiteSpacingPage from './pages/SiteSpacingPage'
+import FrequencyConversionPage from './pages/FrequencyConversionPage'
 import { MapPage } from './pages/MapPage'
 import { AdminUsersPage } from './pages/AdminUsersPage'
 import { AppVersionsPage } from './pages/AppVersionsPage'
@@ -105,6 +107,22 @@ function App() {
               element={
                 <ProtectedRoute>
                   <DistanceMatchPage />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/site-spacing"
+              element={
+                <ProtectedRoute>
+                  <SiteSpacingPage />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/frequency-conversion"
+              element={
+                <ProtectedRoute>
+                  <FrequencyConversionPage />
                 </ProtectedRoute>
               }
             />
