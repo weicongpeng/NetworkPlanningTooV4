@@ -141,8 +141,8 @@ export function gsnGscnToFreq(gscn: number): { freqMhz: number } | null {
   if (!Number.isInteger(gscn) || gscn < 0) return null
   let n: number, offset: number, base: number, step: number
   if (gscn <= 7497) { offset = 0; base = 0; step = 1.2; n = gscn / 3 }
-  else if (gscn <= 22255) { offset = 7498; base = 3000; step = 1.44; n = (gscn - 7498) / 3 }
-  else { offset = 22256; base = 24250.08; step = 17.28; n = (gscn - 22256) / 3 }
+  else if (gscn <= 22255) { offset = 7498; base = 3000; step = 1.44; n = (gscn - offset) / 3 }
+  else { offset = 22256; base = 24250.08; step = 17.28; n = (gscn - offset) / 3 }
   if (!Number.isInteger(n)) return null
   return { freqMhz: base + n * step }
 }
