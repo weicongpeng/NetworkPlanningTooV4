@@ -16,7 +16,6 @@ import {
   X,
   Loader2,
   Wrench,
-  RadioTower,
 } from 'lucide-react'
 import { useState, useEffect } from 'react'
 import { useTranslation } from 'react-i18next'
@@ -67,7 +66,7 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
         { type: 'link', name: t('nav.layerTools'), href: '/layer' },
         { type: 'link', name: t('nav.distanceMatch'), href: '/distance-match' },
         { type: 'link', name: t('nav.siteSpacing'), href: '/site-spacing' },
-        { type: 'link', name: t('nav.freqConversion'), href: '/frequency-conversion', icon: RadioTower },
+        { type: 'link', name: t('nav.freqConversion'), href: '/frequency-conversion' },
       ],
     },
     { type: 'link', name: t('nav.config'), href: '/license', icon: Shield },
