@@ -16,7 +16,7 @@ import {
   X,
   Loader2,
   Wrench,
-  Ruler,
+  RadioTower,
 } from 'lucide-react'
 import { useState, useEffect } from 'react'
 import { useTranslation } from 'react-i18next'
@@ -59,8 +59,17 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
       ],
     },
     { type: 'link', name: t('nav.map'), href: '/map', icon: Map },
-    { type: 'link', name: t('nav.layerTools'), href: '/layer', icon: Wrench },
-    { type: 'link', name: t('nav.distanceMatch'), href: '/distance-match', icon: Ruler },
+    {
+      type: 'group',
+      name: t('nav.tools'),
+      icon: Wrench,
+      children: [
+        { type: 'link', name: t('nav.layerTools'), href: '/layer' },
+        { type: 'link', name: t('nav.distanceMatch'), href: '/distance-match' },
+        { type: 'link', name: t('nav.siteSpacing'), href: '/site-spacing' },
+        { type: 'link', name: t('nav.freqConversion'), href: '/frequency-conversion', icon: RadioTower },
+      ],
+    },
     { type: 'link', name: t('nav.config'), href: '/license', icon: Shield },
     ...(isAuthenticated && user?.is_admin ? [
       { type: 'link' as const, name: t('admin.title', '用户管理'), href: '/admin/users', icon: Users },
@@ -141,6 +150,17 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     reloadUserMapSettings()
   }, [isAuthenticated, user?.id])
+
+  // ===== 地图工具页面自动折叠侧边栏 =====
+  // 进入 /map（地图工具）页面 3 秒后自动隐藏左侧边栏，为地图留出更多可视空间；
+  // 离开页面时清理定时器，用户手动展开后不会再被强制折叠（除非再次进入该页面）
+  useEffect(() => {
+    if (location.pathname !== '/map') return
+    const timer = setTimeout(() => {
+      setSidebarOpen(false)
+    }, 3000)
+    return () => clearTimeout(timer)
+  }, [location.pathname])
 
   return (
     <div className="flex h-screen bg-background overflow-hidden">

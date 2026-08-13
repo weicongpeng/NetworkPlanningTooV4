@@ -8,6 +8,8 @@ import {
   Shield,
   Wrench,
   Ruler,
+  MoveHorizontal,
+  RadioTower,
   LucideIcon
 } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
@@ -76,6 +78,20 @@ export function HomePage() {
           icon={Ruler}
           link="/distance-match"
           iconColor="text-emerald-600"
+        />
+        <FeatureCard
+          title={t('nav.siteSpacing')}
+          description={t('home.siteSpacingDesc')}
+          icon={MoveHorizontal}
+          link="/site-spacing"
+          iconColor="text-teal-600"
+        />
+        <FeatureCard
+          title={t('nav.freqConversion')}
+          description={t('home.freqConversionDesc')}
+          icon={RadioTower}
+          link="/frequency-conversion"
+          iconColor="text-indigo-600"
         />
         <FeatureCard
           title={t('nav.config')}
