@@ -16,18 +16,20 @@ export interface LteBand {
   dlOffset: number
   ulLow: number
   ulOffset: number
+  /** 下行频点号上界 N_DL_max（3GPP TS 36.101 Table 5.7.3-1） */
+  nDlMax: number
 }
 
 export const LTE_BANDS: LteBand[] = [
-  { band: 1, type: 'FDD', dlLow: 2110, dlOffset: 0, ulLow: 1920, ulOffset: 18000 },
-  { band: 3, type: 'FDD', dlLow: 1805, dlOffset: 1200, ulLow: 1710, ulOffset: 19200 },
-  { band: 5, type: 'FDD', dlLow: 869, dlOffset: 2400, ulLow: 824, ulOffset: 20400 },
-  { band: 8, type: 'FDD', dlLow: 925, dlOffset: 3450, ulLow: 880, ulOffset: 21450 },
-  { band: 34, type: 'TDD', dlLow: 2010, dlOffset: 36200, ulLow: 2010, ulOffset: 36200 },
-  { band: 38, type: 'TDD', dlLow: 2570, dlOffset: 37750, ulLow: 2570, ulOffset: 37750 },
-  { band: 39, type: 'TDD', dlLow: 1880, dlOffset: 38250, ulLow: 1880, ulOffset: 38250 },
-  { band: 40, type: 'TDD', dlLow: 2300, dlOffset: 38650, ulLow: 2300, ulOffset: 38650 },
-  { band: 41, type: 'TDD', dlLow: 2496, dlOffset: 39650, ulLow: 2496, ulOffset: 39650 },
+  { band: 1, type: 'FDD', dlLow: 2110, dlOffset: 0, ulLow: 1920, ulOffset: 18000, nDlMax: 599 },
+  { band: 3, type: 'FDD', dlLow: 1805, dlOffset: 1200, ulLow: 1710, ulOffset: 19200, nDlMax: 1949 },
+  { band: 5, type: 'FDD', dlLow: 869, dlOffset: 2400, ulLow: 824, ulOffset: 20400, nDlMax: 2649 },
+  { band: 8, type: 'FDD', dlLow: 925, dlOffset: 3450, ulLow: 880, ulOffset: 21450, nDlMax: 3799 },
+  { band: 34, type: 'TDD', dlLow: 2010, dlOffset: 36200, ulLow: 2010, ulOffset: 36200, nDlMax: 36349 },
+  { band: 38, type: 'TDD', dlLow: 2570, dlOffset: 37750, ulLow: 2570, ulOffset: 37750, nDlMax: 38249 },
+  { band: 39, type: 'TDD', dlLow: 1880, dlOffset: 38250, ulLow: 1880, ulOffset: 38250, nDlMax: 38649 },
+  { band: 40, type: 'TDD', dlLow: 2300, dlOffset: 38650, ulLow: 2300, ulOffset: 38650, nDlMax: 39649 },
+  { band: 41, type: 'TDD', dlLow: 2496, dlOffset: 39650, ulLow: 2496, ulOffset: 39650, nDlMax: 41589 },
 ]
 
 export type LteDirection = 'DL' | 'UL'
@@ -67,6 +69,64 @@ export function lteEarfcnToFreq(band: number, earfcn: number, direction: LteDire
 
 export function getLteBandTable(): LteBand[] {
   return LTE_BANDS
+}
+
+/** LTE 一键换算结果：上行/下行频率 + 下行/上行频点号 */
+export interface LteConvertResult {
+  fUl: number // 上行频率 MHz
+  fDl: number // 下行频率 MHz
+  nDl: number // 下行频点号 EARFCN
+  nUl: number // 上行频点号 EARFCN
+}
+
+/** 输入类型：上行频率 / 下行频率 / 下行频点号，三选一 */
+export type LteConvertInput =
+  | { fUl: number }
+  | { fDl: number }
+  | { nDl: number }
+
+/**
+ * LTE 一键换算（参照「频点换算方法.pdf」推导，基于 3GPP TS 36.101）：
+ *   N_DL = (F_DL − F_DL_low)×10 + N_Offs_DL
+ *   N_UL = (F_UL − F_UL_low)×10 + N_Offs_UL
+ *   F_DL = F_DL_low + 0.1×(N_DL − N_Offs_DL)
+ *   F_UL = F_DL − 双工间隔（F_DL_low − F_UL_low；TDD 为 0）
+ *   N_UL = N_DL + (N_Offs_UL − N_Offs_DL)（FDD 统一为 18000，TDD 为 0）
+ * 输入上行频率 / 下行频率 / 下行频点号任一，校验范围后返回其余三个量；非法或超范围返回 null。
+ */
+export function lteConvert(band: number, input: LteConvertInput): LteConvertResult | null {
+  const b = findLteBand(band)
+  if (!b) return null
+  // 双工间隔（FDD: F_DL_low − F_UL_low；TDD: 0）
+  const duplex = b.dlLow - b.ulLow
+  // 有效带宽：频率上界 = F_low + (N_DL_max − N_Offs_DL)×0.1
+  const dlHigh = b.dlLow + (b.nDlMax - b.dlOffset) * 0.1
+  const ulHigh = b.ulLow + (b.nDlMax - b.dlOffset) * 0.1
+
+  let nDl: number
+  if ('fUl' in input) {
+    if (!Number.isFinite(input.fUl)) return null
+    // F_UL 必须落在 UL 有效范围内
+    if (input.fUl < b.ulLow || input.fUl > ulHigh) return null
+    const fDl = input.fUl + duplex
+    // 上行→下行（0.1MHz 栅格对齐）
+    if (Math.abs(fDl - Math.round(fDl * 10) / 10) > 1e-6) return null
+    nDl = Math.round((fDl - b.dlLow) * 10 + b.dlOffset)
+  } else if ('fDl' in input) {
+    if (!Number.isFinite(input.fDl)) return null
+    if (input.fDl < b.dlLow || input.fDl > dlHigh) return null
+    nDl = Math.round((input.fDl - b.dlLow) * 10 + b.dlOffset)
+  } else {
+    if (!Number.isInteger(input.nDl)) return null
+    if (input.nDl < b.dlOffset || input.nDl > b.nDlMax) return null
+    nDl = input.nDl
+  }
+
+  // 反推下行频率
+  const fDl = b.dlLow + 0.1 * (nDl - b.dlOffset)
+  const fUl = fDl - duplex
+  const nUl = nDl + (b.ulOffset - b.dlOffset)
+  return { fUl, fDl, nDl, nUl }
 }
 
 // ==================== NR-ARFCN ====================

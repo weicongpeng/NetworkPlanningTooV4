@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import {
-  lteFreqToEarfcn, lteEarfcnToFreq,
+  lteFreqToEarfcn, lteEarfcnToFreq, lteConvert,
   nrFreqToArfcn, nrArfcnToFreq, gsnFreqToGscn, gsnGscnToFreq, getNrBandTable,
   gscnToArfcn, arfcnToGscn, matchNrBand,
 } from '../frequencyConversion'
@@ -40,6 +40,66 @@ describe('LTE EARFCN 换算', () => {
   })
   it('负数 EARFCN 返回 null', () => {
     expect(lteEarfcnToFreq(1, -5, 'DL')).toBeNull()
+  })
+})
+
+describe('LTE 一键换算 lteConvert（上行/下行频率 ↔ 下行频点号）', () => {
+  // 用户推导验证数据：B3 输入上行 1755MHz → 下行 1850MHz → N_DL 1650 → N_UL 19650
+  it('B3 输入上行频率 1755MHz → 四量全出', () => {
+    const r = lteConvert(3, { fUl: 1755 })!
+    expect(r.fDl).toBeCloseTo(1850, 5)
+    expect(r.fUl).toBeCloseTo(1755, 5)
+    expect(r.nDl).toBe(1650)
+    expect(r.nUl).toBe(19650)
+  })
+  it('B3 输入下行频率 1850MHz → 四量全出', () => {
+    const r = lteConvert(3, { fDl: 1850 })!
+    expect(r.fUl).toBeCloseTo(1755, 5)
+    expect(r.fDl).toBeCloseTo(1850, 5)
+    expect(r.nDl).toBe(1650)
+    expect(r.nUl).toBe(19650)
+  })
+  it('B3 输入下行频点号 1650 → 四量全出', () => {
+    const r = lteConvert(3, { nDl: 1650 })!
+    expect(r.fDl).toBeCloseTo(1850, 5)
+    expect(r.fUl).toBeCloseTo(1755, 5)
+    expect(r.nDl).toBe(1650)
+    expect(r.nUl).toBe(19650)
+  })
+  // B1 验证：输入下行 2120 → N_DL 100；输入上行 1930 → N_UL 18100
+  it('B1 输入下行频率 2120MHz → N_DL 100, N_UL 18100', () => {
+    const r = lteConvert(1, { fDl: 2120 })!
+    expect(r.nDl).toBe(100)
+    expect(r.nUl).toBe(18100)
+    expect(r.fUl).toBeCloseTo(1930, 5)
+  })
+  it('B1 输入上行频率 1930MHz → N_UL 18100, N_DL 100', () => {
+    const r = lteConvert(1, { fUl: 1930 })!
+    expect(r.nUl).toBe(18100)
+    expect(r.nDl).toBe(100)
+    expect(r.fDl).toBeCloseTo(2120, 5)
+  })
+  // TDD：双工间隔为 0，上下行同频同点
+  it('B41 TDD 输入下行 2580MHz → 上下行频率相等', () => {
+    const r = lteConvert(41, { fDl: 2580 })!
+    expect(r.fUl).toBeCloseTo(2580, 5)
+    expect(r.nUl).toBe(r.nDl)
+  })
+  // 非法/超范围
+  it('B3 上行频率越界（超出 UL 范围）→ null', () => {
+    expect(lteConvert(3, { fUl: 1600 })).toBeNull() // B3 UL 1710-1785
+  })
+  it('B1 下行频率越界（>2170）→ null', () => {
+    expect(lteConvert(1, { fDl: 2200 })).toBeNull()
+  })
+  it('下行频点号越界（>N_DL_max）→ null', () => {
+    expect(lteConvert(3, { nDl: 2000 })).toBeNull() // B3 N_DL max 1949
+  })
+  it('非法频段 → null', () => {
+    expect(lteConvert(99, { nDl: 100 })).toBeNull()
+  })
+  it('非 0.1MHz 栅格的频率输入 → null', () => {
+    expect(lteConvert(3, { fUl: 1755.55 })).toBeNull()
   })
 })
 
