@@ -195,8 +195,8 @@ describe('GSCN 换算（3GPP TS 38.104 全局同步栅格）', () => {
     // GSCN = 3N, N = F/1.2 → F=3000 时 N=2500 → 7500
     expect(gsnFreqToGscn(3000)!.gscn).toBe(7500)
   })
-  it('3000MHz 边界 GSCN 7500 → 3000MHz', () => {
-    expect(gsnGscnToFreq(7500)!.freqMhz).toBe(3000)
+  it('3000MHz 边界 GSCN 7498 → 3000MHz（第二段 n=0）', () => {
+    expect(gsnGscnToFreq(7498)!.freqMhz).toBe(3000)
   })
   it('3000-24250MHz: 1.44MHz 栅格 3300MHz → 最近栅格', () => {
     // N = round((3300-3000)/1.44) = round(208.33) = 208, GSCN = 3*208+7498 = 8122, F = 3000+208*1.44 = 3299.52
