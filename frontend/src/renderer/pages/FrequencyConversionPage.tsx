@@ -3,7 +3,7 @@ import { useTranslation } from 'react-i18next'
 import { RadioTower } from 'lucide-react'
 import {
   getLteBandTable, lteFreqToEarfcn, lteEarfcnToFreq, matchNrBand,
-  nrFreqToArfcn, nrArfcnToFreq, gsnFreqToGscn, gsnGscnToFreq,
+  nrFreqToArfcn, nrArfcnToFreq, gsnFreqToGscn, gsnGscnToFreq, arfcnToGscn,
 } from '../utils/frequencyConversion'
 import type { LteDirection } from '../utils/frequencyConversion'
 
@@ -41,6 +41,7 @@ export default function FrequencyConversionPage() {
   const [nrArfcnInput, setNrArfcnInput] = useState('')
   const [gsnFreqInput, setGsnFreqInput] = useState('')
   const [gsnInput, setGsnInput] = useState('')
+  const [gsnArfcnInput, setGsnArfcnInput] = useState('')
 
   const nrResult = useMemo(() => {
     const freq = parseFloat(nrFreqInput)
@@ -58,23 +59,36 @@ export default function FrequencyConversionPage() {
 
   type GsnResult =
     | { kind: 'error'; error: string }
-    | { kind: 'freqToGscn'; gscn: number; actualFreq: number; deviationKHz: number }
-    | { kind: 'gscnToFreq'; actualFreq: number }
+    | { kind: 'freqToGscn'; gscn: number; actualFreq: number; deviationKHz: number; arfcn: number }
+    | { kind: 'gscnToFreq'; actualFreq: number; arfcn: number }
+    | { kind: 'arfcnToGscn'; gscn: number; actualFreq: number }
     | { kind: 'empty' }
 
   const gsnResult = useMemo<GsnResult>(() => {
+    // 输入 SSB 频率 → GSCN（最近栅格 + 偏差）+ ARFCN
     const freq = parseFloat(gsnFreqInput)
     if (gsnFreqInput.trim() !== '' && Number.isFinite(freq)) {
       const r = gsnFreqToGscn(freq)
-      return r === null ? { kind: 'error', error: t('freqConversion.invalid') } : { kind: 'freqToGscn', ...r }
+      if (r === null) return { kind: 'error', error: t('freqConversion.invalid') }
+      return { kind: 'freqToGscn', ...r, arfcn: nrFreqToArfcn(r.actualFreq) ?? NaN }
     }
+    // 输入 GSCN → SS_REF 频率 + ARFCN
     const gscn = parseInt(gsnInput, 10)
     if (gsnInput.trim() !== '' && Number.isInteger(gscn)) {
       const r = gsnGscnToFreq(gscn)
-      return r === null ? { kind: 'error', error: t('freqConversion.invalid') } : { kind: 'gscnToFreq', actualFreq: r.freqMhz }
+      if (r === null) return { kind: 'error', error: t('freqConversion.invalid') }
+      return { kind: 'gscnToFreq', actualFreq: r.freqMhz, arfcn: nrFreqToArfcn(r.freqMhz) ?? NaN }
+    }
+    // 输入 ARFCN → SS_REF 频率 + 最近 GSCN
+    const arfcn = parseInt(gsnArfcnInput, 10)
+    if (gsnArfcnInput.trim() !== '' && Number.isInteger(arfcn)) {
+      const g = arfcnToGscn(arfcn)
+      if (g === null) return { kind: 'error', error: t('freqConversion.invalid') }
+      const freqRes = gsnGscnToFreq(g)!
+      return { kind: 'arfcnToGscn', gscn: g, actualFreq: freqRes.freqMhz }
     }
     return { kind: 'empty' }
-  }, [gsnFreqInput, gsnInput, t])
+  }, [gsnFreqInput, gsnInput, gsnArfcnInput, t])
 
   // ===== 渲染 =====
   const inputCls = 'w-full px-3 py-2 rounded-lg border border-border bg-background text-sm focus:outline-none focus:ring-2 focus:ring-primary/40'
@@ -86,7 +100,6 @@ export default function FrequencyConversionPage() {
           <RadioTower size={20} className="text-indigo-500" />
           {t('freqConversion.title')}
         </h1>
-        <p className="text-sm text-muted-foreground mt-1">{t('freqConversion.subtitle')}</p>
       </div>
 
       {/* ===== LTE 卡片 ===== */}
@@ -204,13 +217,13 @@ export default function FrequencyConversionPage() {
         {/* GSCN 子区 */}
         <div className="border-t border-border pt-4 space-y-4">
           <h3 className="text-xs font-semibold text-muted-foreground">{t('freqConversion.gsnSub')}</h3>
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
             <label className="block text-sm">
               <span className="text-muted-foreground">{t('freqConversion.gsnFreq')}</span>
               <input
                 type="number"
                 value={gsnFreqInput}
-                onChange={e => { setGsnFreqInput(e.target.value); setGsnInput('') }}
+                onChange={e => { setGsnFreqInput(e.target.value); setGsnInput(''); setGsnArfcnInput('') }}
                 placeholder={t('freqConversion.placeholderGsnFreq')}
                 className={inputCls + ' mt-1'}
               />
@@ -220,8 +233,18 @@ export default function FrequencyConversionPage() {
               <input
                 type="number"
                 value={gsnInput}
-                onChange={e => { setGsnInput(e.target.value); setGsnFreqInput('') }}
+                onChange={e => { setGsnInput(e.target.value); setGsnFreqInput(''); setGsnArfcnInput('') }}
                 placeholder={t('freqConversion.placeholderGscn')}
+                className={inputCls + ' mt-1'}
+              />
+            </label>
+            <label className="block text-sm">
+              <span className="text-muted-foreground">{t('freqConversion.arfcn')}</span>
+              <input
+                type="number"
+                value={gsnArfcnInput}
+                onChange={e => { setGsnArfcnInput(e.target.value); setGsnFreqInput(''); setGsnInput('') }}
+                placeholder={t('freqConversion.placeholderArfcn')}
                 className={inputCls + ' mt-1'}
               />
             </label>
@@ -237,11 +260,28 @@ export default function FrequencyConversionPage() {
                 <div className="text-muted-foreground">
                   {t('freqConversion.actualFreq')}: {gsnResult.actualFreq} MHz · {t('freqConversion.deviation')}: {gsnResult.deviationKHz} kHz
                 </div>
+                <div className="text-muted-foreground">
+                  {t('freqConversion.resultArfcn')} = {gsnResult.arfcn}
+                </div>
               </>
             ) : gsnResult.kind === 'gscnToFreq' ? (
-              <div>
-                {t('freqConversion.resultFreq')} = <b className="text-primary">{gsnResult.actualFreq}</b> MHz
-              </div>
+              <>
+                <div>
+                  {t('freqConversion.resultFreq')} = <b className="text-primary">{gsnResult.actualFreq}</b> MHz
+                </div>
+                <div className="text-muted-foreground">
+                  {t('freqConversion.resultArfcn')} = {gsnResult.arfcn}
+                </div>
+              </>
+            ) : gsnResult.kind === 'arfcnToGscn' ? (
+              <>
+                <div>
+                  {t('freqConversion.resultFreq')} = <b className="text-primary">{gsnResult.actualFreq}</b> MHz
+                </div>
+                <div>
+                  {t('freqConversion.resultGscn')} = <b className="text-primary">{gsnResult.gscn}</b>
+                </div>
+              </>
             ) : (
               <span className="text-muted-foreground">—</span>
             )}

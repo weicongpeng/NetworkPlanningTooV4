@@ -114,35 +114,118 @@ export function getNrBandTable(): NrBand[] {
   return NR_BANDS
 }
 
-/** 校验频率落在哪个常用 NR 频段 */
+/**
+ * 校验频率落在哪个常用 NR 频段。
+ * 交叠区（如 n77 3300-4200 与 n78 3300-3800 的重叠部分）优先匹配带宽最窄的频段——
+ * 即频率同时落在多个频段时返回最精确（带宽最小）的那个，如 3408.96MHz 返回 n78 而非 n77。
+ */
 export function matchNrBand(freqMhz: number): NrBand | null {
-  return NR_BANDS.find(b => freqMhz >= b.dlLow && freqMhz <= b.dlHigh) ?? null
+  const matched = NR_BANDS.filter(b => freqMhz >= b.dlLow && freqMhz <= b.dlHigh)
+  if (matched.length === 0) return null
+  return matched.reduce((a, b) => (b.dlHigh - b.dlLow) < (a.dlHigh - a.dlLow) ? b : a)
 }
 
 // ==================== GSCN ====================
 
 /**
- * GSCN 三段全局同步栅格（3GPP TS 38.104 Table 5.4.3.1-1）
- * 0-3000MHz: GSCN=3N, F=N×1.2；3000-24250MHz: GSCN=3N+7498, F=3000+N×1.44；
- * 24250-100000MHz: GSCN=3N+22256, F=24250.08+N×17.28
+ * GSCN 三段全局同步栅格（参照「GSCN和频点换算方法.docx」，基于 3GPP TS 38.104）
+ *
+ * 区间1（0-3000MHz，非均匀栅格）：
+ *   SS_REF = N×1200kHz + M×50kHz，N=1..2499，M∈{1,3,5}
+ *   GSCN = 3(N-1) + (M-3)/2 + 1，范围 1~7497
+ * 区间2（3000-24250MHz，连续整数 GSCN，步长 1.44MHz）：
+ *   SS_REF = 3000 + (GSCN-7499)×1.44，GSCN 范围 7499~22255
+ *   GSCN = 7499 + int((F-3000)/1.44)
+ * 区间3（24250-100000MHz，连续整数 GSCN，步长 17.28MHz）：
+ *   SS_REF = 24250.08 + (GSCN-22256)×17.28，GSCN 范围 22256~26639
+ *   GSCN = 22256 + int((F-24250.08)/17.28)
  */
+
+/** 区间1 反推：GSCN(1~7497) → { N, M }。GSCN 对 3 取余决定 M 分支。 */
+function gsnRange1ToNM(gscn: number): { n: number; m: number } | null {
+  // GSCN = 3(N-1) + (M-3)/2 + 1，M∈{1,3,5}
+  // 设 x=(M-3)/2 ∈ {-1,0,1} → GSCN = 3N + x - 2 → N = (GSCN - x + 2)/3
+  // 由 GSCN mod 3 定 x：GSCN≡0→x=-1(M=1)，GSCN≡1→x=0(M=3)，GSCN≡2→x=1(M=5)
+  const r = gscn % 3
+  let x: number, m: number
+  if (r === 0) { x = -1; m = 1 }
+  else if (r === 1) { x = 0; m = 3 }
+  else { x = 1; m = 5 }
+  const n = (gscn - x + 2) / 3
+  if (!Number.isInteger(n) || n < 1 || n > 2499) return null
+  return { n, m }
+}
+
+/** 频率 → 最近 GSCN（区间1 非均匀栅格，遍历附近 N 的三个 M 点取最小偏差） */
+function gsnFreqToGscnRange1(freqMhz: number): { gscn: number; actualFreq: number; deviationKHz: number } | null {
+  const fKhz = freqMhz * 1000
+  const n0 = Math.round(fKhz / 1200)
+  let best: { gscn: number; actualFreq: number; deviationKHz: number } | null = null
+  for (let n = Math.max(1, n0 - 1); n <= Math.min(2499, n0 + 1); n++) {
+    for (const m of [1, 3, 5]) {
+      const ssRefKhz = n * 1200 + m * 50
+      const actualFreq = ssRefKhz / 1000
+      const deviationKHz = Math.round(Math.abs(actualFreq - freqMhz) * 1000)
+      if (!best || deviationKHz < best.deviationKHz) {
+        best = { gscn: 3 * (n - 1) + (m - 3) / 2 + 1, actualFreq, deviationKHz }
+      }
+    }
+  }
+  return best
+}
+
+/** 频率 → GSCN（三段自动路由），返回 GSCN、实际 SS_REF 频率与偏差。区间2/3 用整数 kHz 运算避免浮点误差 */
 export function gsnFreqToGscn(freqMhz: number): { gscn: number; actualFreq: number; deviationKHz: number } | null {
   if (!Number.isFinite(freqMhz) || freqMhz < 0 || freqMhz > 100000) return null
-  let n: number, offset: number, base: number, step: number
-  if (freqMhz <= 3000) { offset = 0; base = 0; step = 1.2; n = Math.round(freqMhz / 1.2) }
-  else if (freqMhz <= 24250) { offset = 7498; base = 3000; step = 1.44; n = Math.round((freqMhz - 3000) / 1.44) }
-  else { offset = 22256; base = 24250.08; step = 17.28; n = Math.round((freqMhz - 24250.08) / 17.28) }
-  const gscn = 3 * n + offset
-  const actualFreq = base + n * step
+  const freqKhz = Math.round(freqMhz * 1000)
+  if (freqMhz <= 3000) return gsnFreqToGscnRange1(freqMhz)
+  if (freqMhz <= 24250) {
+    // 步长 1.44MHz = 1440kHz
+    const gscn = 7499 + Math.floor((freqKhz - 3000000) / 1440)
+    if (gscn < 7499 || gscn > 22255) return null
+    const actualFreq = (3000000 + (gscn - 7499) * 1440) / 1000
+    return { gscn, actualFreq, deviationKHz: Math.round(Math.abs(actualFreq - freqMhz) * 1000) }
+  }
+  // 步长 17.28MHz = 17280kHz
+  const gscn = 22256 + Math.floor((freqKhz - 24250080) / 17280)
+  if (gscn < 22256 || gscn > 26639) return null
+  const actualFreq = (24250080 + (gscn - 22256) * 17280) / 1000
   return { gscn, actualFreq, deviationKHz: Math.round(Math.abs(actualFreq - freqMhz) * 1000) }
 }
 
+/** GSCN → SS_REF 频率（三段自动路由）；非法 GSCN 或区间空洞(7498)返回 null。区间2/3 用整数 kHz 运算 */
 export function gsnGscnToFreq(gscn: number): { freqMhz: number } | null {
-  if (!Number.isInteger(gscn) || gscn < 0) return null
-  let n: number, offset: number, base: number, step: number
-  if (gscn <= 7497) { offset = 0; base = 0; step = 1.2; n = gscn / 3 }
-  else if (gscn <= 22255) { offset = 7498; base = 3000; step = 1.44; n = (gscn - offset) / 3 }
-  else { offset = 22256; base = 24250.08; step = 17.28; n = (gscn - offset) / 3 }
-  if (!Number.isInteger(n)) return null
-  return { freqMhz: base + n * step }
+  if (!Number.isInteger(gscn) || gscn < 1) return null
+  if (gscn <= 7497) {
+    const nm = gsnRange1ToNM(gscn)
+    if (!nm) return null
+    return { freqMhz: (nm.n * 1200 + nm.m * 50) / 1000 }
+  }
+  if (gscn === 7498) return null // 区间1 与区间2 之间的空洞
+  if (gscn <= 22255) return { freqMhz: (3000000 + (gscn - 7499) * 1440) / 1000 }
+  if (gscn <= 26639) return { freqMhz: (24250080 + (gscn - 22256) * 17280) / 1000 }
+  return null
+}
+
+// ==================== GSCN ↔ ARFCN ====================
+
+/**
+ * GSCN → NR-ARFCN：GSCN 标识 SS_REF（SSB 频域位置），换算为该频率对应的全局栅格频点。
+ * SS_REF → F_REF(MHz) → N_REF = N_REF_Offs + (F_REF - F_REF_Offs)/ΔF_Global
+ */
+export function gscnToArfcn(gscn: number): number | null {
+  const r = gsnGscnToFreq(gscn)
+  if (!r) return null
+  return nrFreqToArfcn(r.freqMhz)
+}
+
+/**
+ * NR-ARFCN → 最近 GSCN：先转频率，再取最近同步栅格点。
+ * 注意：ARFCN 频率不一定恰好落在同步栅格上，结果取最近 GSCN（有偏差提示需求时用 gsnFreqToGscn）。
+ */
+export function arfcnToGscn(arfcn: number): number | null {
+  const freq = nrArfcnToFreq(arfcn)
+  if (freq === null) return null
+  const r = gsnFreqToGscn(freq)
+  return r ? r.gscn : null
 }

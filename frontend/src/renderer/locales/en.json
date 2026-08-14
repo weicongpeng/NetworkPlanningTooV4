@@ -1136,7 +1136,6 @@
   },
   "freqConversion": {
     "title": "Frequency Conversion",
-    "subtitle": "Bidirectional LTE/NR frequency & channel number conversion, incl. GSCN",
     "lteCard": "LTE Conversion (EARFCN)",
     "nrCard": "NR Conversion (NR-ARFCN / GSCN)",
     "direction": "Direction",

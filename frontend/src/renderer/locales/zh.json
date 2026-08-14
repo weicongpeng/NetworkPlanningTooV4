@@ -1147,7 +1147,6 @@
   },
   "freqConversion": {
     "title": "频点换算",
-    "subtitle": "LTE/NR 频点与频率双向实时换算，含 GSCN",
     "lteCard": "LTE 频点换算 (EARFCN)",
     "nrCard": "NR 频点换算 (NR-ARFCN / GSCN)",
     "direction": "方向",
