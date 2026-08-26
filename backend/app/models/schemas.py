@@ -110,6 +110,65 @@ class CellDupCheckRequest(BaseModel):
     cells: List[CellDupCheckItem]
 
 
+class CellSearchRequest(BaseModel):
+    """查询/更新：智能搜索请求"""
+
+    query: str = Field(..., min_length=1, max_length=100, description="搜索词")
+    networkType: Optional[NetworkType] = Field(default=None, description="限定制式；None=全部")
+    limit: int = Field(default=20, ge=1, le=100, description="返回条数上限")
+
+
+class CellSearchItem(BaseModel):
+    """查询/更新：搜索命中结果（含 rowKey 供批量更新定位）"""
+
+    rowKey: str = Field(..., description="库内定位键: '{site_id}:{sector_id}'（DB 主键）")
+    networkType: str
+    siteId: str
+    cellId: str
+    cellName: str
+    siteName: Optional[str] = None
+    managedElementId: Optional[str] = None
+    mcc: Optional[str] = None
+    mnc: Optional[str] = None
+    longitude: Optional[float] = None
+    latitude: Optional[float] = None
+    azimuth: Optional[float] = None
+    frequency: Optional[float] = None
+    ssbFrequency: Optional[float] = None
+    cellCoverType: int = 1
+
+
+class CellUpdateItem(BaseModel):
+    """查询/更新：单行更新（fields 为可选字段，未提供的字段保持不变）"""
+
+    rowKey: str
+    networkType: NetworkType
+    fields: Dict[str, Any] = Field(default_factory=dict, description="待更新字段键值")
+
+
+class CellDeleteItem(BaseModel):
+    """查询/更新：单行删除"""
+
+    rowKey: str
+    networkType: NetworkType
+
+
+class CellBulkUpdateRequest(BaseModel):
+    """查询/更新：批量更新 + 删除请求（一次事务执行）"""
+
+    updates: List[CellUpdateItem] = Field(default_factory=list)
+    deletes: List[CellDeleteItem] = Field(default_factory=list)
+
+
+class CellBulkUpdateResultItem(BaseModel):
+    """查询/更新：逐行执行结果"""
+
+    rowKey: str
+    type: str = Field(..., description="'update' | 'delete'")
+    success: bool
+    message: str = ""
+
+
 class UpdateParametersRequest(BaseModel):
     """工参更新请求"""
 
