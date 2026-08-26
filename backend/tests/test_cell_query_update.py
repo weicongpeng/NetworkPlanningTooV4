@@ -97,3 +97,60 @@ def test_search_empty_result_and_limit(query_env):
     assert data_service.search_cells("不存在", workbook_id=query_env) == []
     r = data_service.search_cells("天", limit=1, workbook_id=query_env)
     assert len(r) == 1  # 只返回 1 条
+
+
+def test_search_endpoint_smoke(query_env):
+    """search 端点端到端冒烟：注入 index + 鉴权用户 + token"""
+    from fastapi.testclient import TestClient
+    from app.core.database import SessionLocal, init_db
+    from app.models.database import User
+    from app.services.auth_service import auth_service
+    from app.api import create_app
+    from app.services.data_service import data_service
+
+    # 注入 index（同 dup_env 模式：临时移除既有 full_params 条目）
+    saved_index = dict(data_service.index)
+    for k in [k for k, v in saved_index.items()
+              if isinstance(v, dict) and v.get("fileType") == "full_params"]:
+        data_service.index.pop(k)
+    data_service.index[query_env] = {"fileType": "full_params"}
+
+    init_db()
+    username = "q_search_user"
+    db = SessionLocal()
+    try:
+        existing = auth_service.get_user_by_username(db, username)
+        if existing:
+            db.delete(existing)
+            db.commit()
+        user, err = auth_service.create_user(db, username, "Test@12345")
+        assert err is None
+        user.can_cell_entry = True
+        db.commit()
+        db.refresh(user)
+        token, _ = auth_service.create_access_token(user.id, user.username, False)
+    finally:
+        db.close()
+
+    try:
+        client = TestClient(create_app())
+        resp = client.post(
+            "/api/v1/data/full-params/cells/search",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"query": "天河", "limit": 20},
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()["data"]
+        assert len(data) == 3
+        assert {i["siteName"] for i in data} == {"天河一号站", "天河二号站"}
+    finally:
+        db = SessionLocal()
+        try:
+            user = auth_service.get_user_by_username(db, username)
+            if user:
+                db.delete(user)
+                db.commit()
+        finally:
+            db.close()
+        data_service.index.clear()
+        data_service.index.update(saved_index)

@@ -20,6 +20,7 @@ from app.models.schemas import (
     CellCreateRequest,
     CellBatchCreateRequest,
     CellDupCheckRequest,
+    CellSearchRequest,
     UpdateParametersRequest,
     ImportPointsRequest,
 )
@@ -278,6 +279,28 @@ async def check_cell_duplicates(
         ]
         result = await run_in_threadpool(
             data_service.check_cell_duplicates, cells
+        )
+        return {"success": True, "data": result}
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        error_msg = str(e).replace("✗", "x")
+        safe_detail = error_msg.encode("utf-8", "replace").decode("utf-8")
+        raise HTTPException(status_code=500, detail=safe_detail)
+
+
+@router.post("/full-params/cells/search", response_model=Dict[str, Any])
+async def search_cells(
+    request: CellSearchRequest,
+    current_user=Depends(require_cell_entry),
+) -> Dict[str, Any]:
+    """查询/更新：智能搜索小区（小区名/网元ID/基站ID/站点名模糊匹配）"""
+    try:
+        result = await run_in_threadpool(
+            data_service.search_cells,
+            request.query,
+            request.networkType.value if request.networkType else None,
+            request.limit,
         )
         return {"success": True, "data": result}
     except Exception as e:
