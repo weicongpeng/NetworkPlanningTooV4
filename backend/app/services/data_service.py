@@ -1583,6 +1583,415 @@ class DataService:
         finally:
             db.close()
 
+    def validate_cell_fields(self, fields: Dict, network_type: str) -> tuple:
+        """校验小区字段（库内校验）：返回 (ok: bool, errors: List[str])
+
+        规则与前端 isRowComplete 一致：必填、数字格式、范围。
+        """
+        errors = []
+        nt = str(network_type or "").upper()
+
+        def _num(v):
+            try:
+                return float(str(v).strip())
+            except (ValueError, TypeError):
+                return None
+
+        def _int(v):
+            try:
+                return int(float(str(v).strip()))
+            except (ValueError, TypeError):
+                return None
+
+        if not str(fields.get("managedElementId", "") or "").strip():
+            errors.append("网元ID必填")
+        if not str(fields.get("siteId", "") or "").strip():
+            errors.append("基站ID必填")
+        if not str(fields.get("cellId", "") or "").strip():
+            errors.append("小区ID必填")
+        if not str(fields.get("cellName", "") or "").strip():
+            errors.append("小区名称必填")
+
+        lon = _num(fields.get("longitude"))
+        if lon is not None and not (-180 <= lon <= 180):
+            errors.append("经度超出范围 [-180, 180]")
+        lat = _num(fields.get("latitude"))
+        if lat is not None and not (-90 <= lat <= 90):
+            errors.append("纬度超出范围 [-90, 90]")
+
+        azi = _int(fields.get("azimuth"))
+        if azi is not None and not (0 <= azi <= 360):
+            errors.append("方向角超出范围 [0, 360]")
+
+        mnc = str(fields.get("mnc", "") or "").strip()
+        if mnc and (len(mnc) != 2 or not mnc.isdigit()):
+            errors.append("MNC 必须为 2 位数字")
+
+        freq_key = "frequency" if nt == "LTE" else "ssbFrequency"
+        freq = str(fields.get(freq_key, "") or "").strip()
+        if freq and _num(freq) is None:
+            errors.append("频点必须为数字")
+
+        ct = fields.get("cellCoverType")
+        if ct is not None and int(ct) not in (1, 4):
+            errors.append("覆盖类型仅支持 1/4")
+
+        return (len(errors) == 0), errors
+
+    def bulk_update_cells(self, updates: List[Dict], deletes: List[Dict],
+                          user_id: int = 1, workbook_id: Optional[str] = None) -> Dict[str, Any]:
+        """查询/更新：批量更新 + 删除（SQLite 单事务 + Excel 单次 load/save）
+
+        updates: [{rowKey, networkType, fields}]
+        deletes: [{rowKey, networkType}]
+        返回: { results: [...], updated: N, deleted: M }
+        校验失败的行不落库（部分成功语义）。
+        """
+        if not workbook_id:
+            workbook_id = self._find_full_params_id()
+        if not workbook_id:
+            raise ValueError("未找到全量工参文件，请先上传全量工参")
+
+        data_dir = settings.DATA_DIR / workbook_id
+        excel_path = data_dir / "original.xlsx"
+        if not excel_path.exists():
+            raise ValueError(f"全量工参原始文件不存在: {excel_path}")
+        upload_path = settings.UPLOAD_DIR / f"{workbook_id}.xlsx"
+
+        db = SessionLocal()
+        results = []
+        updated = 0
+        deleted = 0
+
+        try:
+            # 1. 预加载库内 (siteId, cellId) → {networkType, sectorPk, sitePk} 冲突表
+            conflict_map: Dict[str, dict] = {}
+            sector_pk_to_row: Dict[int, tuple] = {}
+            rows = db.query(Site, Sector).join(Sector, Sector.site_id_fk == Site.id).filter(
+                Site.workbook_id == workbook_id
+            ).all()
+            for site, sector in rows:
+                sector_pk_to_row[sector.id] = (site, sector)
+                sid = str(sector.sector_id)
+                cell_id = sid.rsplit("_", 1)[-1] if "_" in sid else sid
+                conflict_map[f"{site.site_id}_{cell_id}"] = {
+                    "networkType": str(site.network_type or "").upper(),
+                    "sectorPk": sector.id,
+                    "sitePk": site.id,
+                }
+
+            # 2. 处理删除（先删，避免与更新冲突表互相干扰）
+            for d in deletes:
+                row_key = d.get("rowKey", "")
+                try:
+                    _site_pk, _sector_pk = (int(x) for x in row_key.split(":"))
+                except (ValueError, TypeError):
+                    results.append({"rowKey": row_key, "type": "delete", "success": False,
+                                    "message": "无效的 rowKey"})
+                    continue
+                sector = db.query(Sector).filter(Sector.id == _sector_pk,
+                                                 Sector.workbook_id == workbook_id).first()
+                if not sector:
+                    results.append({"rowKey": row_key, "type": "delete", "success": False,
+                                    "message": "记录不存在"})
+                    continue
+                site = db.query(Site).filter(Site.id == _site_pk).first()
+                sid = str(sector.sector_id)
+                # 捕获删除前键（供 Excel 行删除定位：删除后 DB 已无此记录）
+                d["_site_id"] = str(site.site_id) if site is not None else None
+                d["_cell_id"] = sid.rsplit("_", 1)[-1] if "_" in sid else sid
+                db.delete(sector)
+                db.flush()
+                remaining = db.query(Sector).filter(Sector.site_id_fk == _site_pk).count()
+                if remaining == 0 and site is not None:
+                    db.delete(site)
+                    db.flush()
+                deleted += 1
+                results.append({"rowKey": row_key, "type": "delete", "success": True,
+                                "message": "小区已删除"})
+
+            # 3. 处理更新（逐行校验；同批次内新键互斥检查）
+            for u in updates:
+                row_key = u.get("rowKey", "")
+                nt = str(u.get("networkType", "")).upper()
+                fields = u.get("fields", {}) or {}
+                try:
+                    _site_pk, _sector_pk = (int(x) for x in row_key.split(":"))
+                except (ValueError, TypeError):
+                    results.append({"rowKey": row_key, "type": "update", "success": False,
+                                    "message": "无效的 rowKey"})
+                    continue
+
+                cur = sector_pk_to_row.get(_sector_pk)
+                if not cur:
+                    results.append({"rowKey": row_key, "type": "update", "success": False,
+                                    "message": "记录不存在"})
+                    continue
+                site, sector = cur
+                # 捕获更新前键（供 Excel 行定位：Excel 尚未修改仍为旧键）
+                _sid = str(sector.sector_id)
+                u["_old_site_id"] = str(site.site_id)
+                u["_old_cell_id"] = _sid.rsplit("_", 1)[-1] if "_" in _sid else _sid
+
+                full = {
+                    "managedElementId": site.managed_element_id,
+                    "siteId": str(site.site_id),
+                    "cellId": str(sector.sector_id).rsplit("_", 1)[-1],
+                    "cellName": sector.name,
+                    "mcc": sector.mcc or "",
+                    "mnc": sector.mnc or "",
+                    "longitude": sector.longitude,
+                    "latitude": sector.latitude,
+                    "azimuth": sector.azimuth,
+                    "frequency": sector.frequency if nt == "LTE" else None,
+                    "ssbFrequency": sector.frequency if nt == "NR" else None,
+                    "cellCoverType": sector.cell_cover_type or 1,
+                }
+                full.update({k: v for k, v in fields.items() if v is not None and v != ""})
+
+                ok, errs = self.validate_cell_fields(full, nt)
+                if not ok:
+                    results.append({"rowKey": row_key, "type": "update", "success": False,
+                                    "message": "；".join(errs)})
+                    continue
+
+                new_key = f"{str(full['siteId'])}.{str(full['cellId'])}"
+                old_key = f"{str(site.site_id)}.{str(sector.sector_id).rsplit('_', 1)[-1]}"
+                if new_key != old_key:
+                    holder = conflict_map.get(f"{full['siteId']}_{full['cellId']}")
+                    if holder and holder["sectorPk"] != _sector_pk:
+                        msg = self._duplicate_message(
+                            nt, holder["networkType"], str(full["cellName"]))
+                        results.append({"rowKey": row_key, "type": "update", "success": False,
+                                        "message": msg})
+                        continue
+                    in_batch = any(
+                        o.get("rowKey") != row_key
+                        and o.get("fields", {}).get("siteId") == str(full["siteId"])
+                        and o.get("fields", {}).get("cellId") == str(full["cellId"])
+                        for o in updates
+                    )
+                    if in_batch:
+                        results.append({"rowKey": row_key, "type": "update", "success": False,
+                                        "message": f"批内重复: {full['siteId']}_{full['cellId']}"})
+                        continue
+
+                new_site_id = str(full["siteId"])
+                if new_site_id != str(site.site_id):
+                    new_site = db.query(Site).filter(
+                        Site.workbook_id == workbook_id, Site.site_id == new_site_id).first()
+                    if not new_site:
+                        new_site = Site(workbook_id=workbook_id, user_id=user_id,
+                                        site_id=new_site_id, name=str(full["cellName"]),
+                                        longitude=full["longitude"], latitude=full["latitude"],
+                                        network_type=nt,
+                                        managed_element_id=str(full["managedElementId"] or ""),
+                                        mcc=full["mcc"] or None, mnc=full["mnc"] or None)
+                        db.add(new_site)
+                        db.flush()
+                    sector.site_id_fk = new_site.id
+                    site = new_site
+                site.managed_element_id = str(full["managedElementId"] or "")
+                site.longitude = full["longitude"]
+                site.latitude = full["latitude"]
+                site.mcc = full["mcc"] or None
+                site.mnc = full["mnc"] or None
+                sector.sector_id = f"{new_site_id}_{full['cellId']}"
+                sector.name = str(full["cellName"])
+                sector.longitude = full["longitude"]
+                sector.latitude = full["latitude"]
+                sector.azimuth = full["azimuth"]
+                sector.cell_cover_type = int(full["cellCoverType"] or 1)
+                freq = full.get("frequency") or full.get("ssbFrequency")
+                try:
+                    sector.frequency = float(freq) if freq else None
+                except (ValueError, TypeError):
+                    sector.frequency = None
+                db.flush()
+
+                updated += 1
+                results.append({"rowKey": row_key, "type": "update", "success": True,
+                                "message": "小区更新成功"})
+
+            db.commit()
+        except Exception as e:
+            db.rollback()
+            import traceback
+            traceback.print_exc()
+            for r in results:
+                r["success"] = False
+                r["message"] = f"数据库写入失败: {str(e)[:200]}"
+            db.close()
+            return {"success": False, "message": "数据库写入失败", "results": results,
+                    "updated": 0, "deleted": 0}
+        finally:
+            db.close()
+
+        # 5. Excel 单次 load/save（先 DB 成功后再写；失败则告警，DB 已提交不回滚）
+        excel_error = ""
+        try:
+            wb = openpyxl.load_workbook(excel_path)
+            try:
+                self._apply_excel_updates(wb, updates, deletes, results)
+                wb.save(excel_path)
+            except Exception as e:
+                excel_error = str(e)[:200]
+                raise
+            finally:
+                wb.close()
+        except Exception as e:
+            safe_print(f"[DataService] 查询/更新 Excel 写入失败: {e}")
+            excel_error = excel_error or str(e)[:200]
+        if not excel_error:
+            try:
+                if upload_path.exists():
+                    shutil.copy2(excel_path, upload_path)
+            except Exception as e:
+                safe_print(f"[DataService] 同步 uploads 副本失败 (非致命): {e}")
+            try:
+                excel_size = excel_path.stat().st_size
+                if workbook_id in self.index:
+                    self.index[workbook_id]["size"] = excel_size
+                self._save_index()
+            except Exception as e:
+                safe_print(f"[DataService] 更新索引失败 (非致命): {e}")
+
+        self._invalidate_cell_search_index()
+        return {"success": True, "message": f"更新 {updated} 条，删除 {deleted} 条",
+                "results": results, "updated": updated, "deleted": deleted}
+
+    def _apply_excel_updates(self, wb, updates, deletes, results):
+        """按 rowKey 在 Excel 中定位数据行并更新/删除（DB 提交成功后调用，尽力保持双写一致）。
+
+        - updates: 用更新前捕获的 (siteId, cellId) 定位（Excel 尚未修改，仍是旧键），
+          通过 _apply_row_update 写入 fields 全部非空字段（含改键）。
+        - deletes: 用删除前捕获的 (siteId, cellId) 定位，自下而上删除行。
+        - 仅处理 results 中 success 的行（校验失败/冲突拒绝的行不动 Excel）。
+        """
+        def _sheet_col_map(ws):
+            header = list(ws.iter_rows(min_row=1, max_row=1, values_only=True))[0]
+            cm = {}
+            for i, v in enumerate(header):
+                if v:
+                    cm[str(v).strip().split("\n")[0].strip()] = i + 1
+            return cm
+
+        def _norm_cell_val(v):
+            """Excel 单元格值归一化为纯数字字符串（int/float/str）"""
+            if v is None:
+                return ""
+            try:
+                f = float(str(v).strip())
+                if f == int(f):
+                    return str(int(f))
+                return str(f)
+            except (ValueError, TypeError):
+                return str(v).strip()
+
+        def _find_rows(ws, cm, site_key_col, cell_key_col, site_val, cell_val):
+            out = []
+            for r in range(2, ws.max_row + 1):
+                s = _norm_cell_val(ws.cell(row=r, column=cm[site_key_col]).value)
+                c = _norm_cell_val(ws.cell(row=r, column=cm[cell_key_col]).value)
+                if s == site_val and c == cell_val:
+                    out.append(r)
+            return out
+
+        sheet_defs = {
+            "LTE": ("LTE Project Parameters", "eNodeB标识", "小区标识"),
+            "NR": ("NR Project Parameters", "gNodeB标识", "小区标识"),
+        }
+
+        ok_keys = {r.get("rowKey") for r in results if r.get("success")}
+        lon_cols = ("小区经度", "基站经度", "经度")
+        lat_cols = ("小区纬度", "基站纬度", "纬度")
+
+        # 更新：Excel 行仍为更新前键，用 _old_* 定位后写入全部 fields
+        for u in updates:
+            row_key = u.get("rowKey", "")
+            if row_key not in ok_keys:
+                continue
+            nt = str(u.get("networkType", "")).upper()
+            if nt not in sheet_defs:
+                continue
+            sheet_name, site_col, cell_col = sheet_defs[nt]
+            if sheet_name not in wb.sheetnames:
+                continue
+            ws = wb[sheet_name]
+            cm = _sheet_col_map(ws)
+            if site_col not in cm or cell_col not in cm:
+                continue
+            site_val = u.get("_old_site_id")
+            cell_val = u.get("_old_cell_id")
+            if site_val is None or cell_val is None:
+                continue
+            fields = u.get("fields", {}) or {}
+            field_map = self._build_update_field_map(fields, nt)
+            for r in _find_rows(ws, cm, site_col, cell_col, site_val, cell_val):
+                self._apply_row_update(ws[r], cm, fields, field_map, nt)
+                # 经度/纬度多目标列直接写入（_apply_row_update 单列映射可能漏列）
+                for c in lon_cols:
+                    if c in cm and fields.get("longitude") not in (None, ""):
+                        ws.cell(row=r, column=cm[c]).value = fields["longitude"]
+                for c in lat_cols:
+                    if c in cm and fields.get("latitude") not in (None, ""):
+                        ws.cell(row=r, column=cm[c]).value = fields["latitude"]
+
+        # 删除：自下而上删行
+        for d in deletes:
+            row_key = d.get("rowKey", "")
+            if row_key not in ok_keys:
+                continue
+            nt = str(d.get("networkType", "")).upper()
+            if nt not in sheet_defs:
+                continue
+            sheet_name, site_col, cell_col = sheet_defs[nt]
+            if sheet_name not in wb.sheetnames:
+                continue
+            ws = wb[sheet_name]
+            cm = _sheet_col_map(ws)
+            if site_col not in cm or cell_col not in cm:
+                continue
+            site_val = d.get("_site_id")
+            cell_val = d.get("_cell_id")
+            if site_val is None or cell_val is None:
+                continue
+            for r in _find_rows(ws, cm, site_col, cell_col, site_val, cell_val):
+                ws.delete_rows(r)
+
+    def _build_update_field_map(self, fields: Dict, network_type: str) -> Dict:
+        """构建 Excel 更新字段映射：源字段(camelCase) → Excel 列名
+
+        与 _apply_row_update 契约一致（field_map 的 key 必须是 update_data 中的字段名）。
+        经度/纬度的多目标列（小区经度/基站经度/经度 等）由 _apply_excel_updates 直接写入。
+        """
+        nt = str(network_type or "").upper()
+        if nt == "LTE":
+            pairs = [
+                ("managedElementId", "管理网元ID"),
+                ("siteId", "eNodeB标识"),
+                ("cellId", "小区标识"),
+                ("cellName", "小区名称"),
+                ("azimuth", "天线方向角"),
+                ("frequency", "下行链路的中心载频"),
+                ("cellCoverType", "小区覆盖类型"),
+                ("mcc", "移动国家码"),
+                ("mnc", "移动网络码"),
+            ]
+        else:
+            pairs = [
+                ("managedElementId", "管理网元ID"),
+                ("siteId", "gNodeB标识"),
+                ("cellId", "小区标识"),
+                ("cellName", "小区名称"),
+                ("azimuth", "天线方向角"),
+                ("ssbFrequency", "填写SSB频点"),
+                ("cellCoverType", "小区覆盖类型"),
+                ("mcc", "移动国家码"),
+                ("mnc", "移动网络码"),
+            ]
+        return {src: col for src, col in pairs if fields.get(src) not in (None, "")}
+
     def _update_sheet(self, ws, current_dir: Path, network_type: str):
         """更新单个Sheet"""
         # 1. 确定列索引映射

@@ -99,6 +99,138 @@ def test_search_empty_result_and_limit(query_env):
     assert len(r) == 1  # 只返回 1 条
 
 
+@pytest.fixture()
+def excel_env(query_env, tmp_path, monkeypatch):
+    """query_env 之上叠加隔离文件系统 + 最小全量工参 Excel"""
+    from openpyxl import Workbook
+    from app.core.config import settings
+    from app.services.data_service import data_service
+
+    monkeypatch.setattr(settings, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(data_service, "data_index_file", tmp_path / "index.json")
+
+    excel_path = tmp_path / query_env / "original.xlsx"
+    excel_path.parent.mkdir(parents=True, exist_ok=True)
+    wb = Workbook()
+    lte_ws = wb.active
+    lte_ws.title = "LTE Project Parameters"
+    lte_ws.append(["管理网元ID", "eNodeB标识", "小区标识", "小区名称",
+                   "小区经度", "小区纬度", "天线方向角", "下行链路的中心载频", "小区覆盖类型"])
+    lte_ws.append(["2001", 111, 1, "TH-1", 113.0, 23.0, 0, 1825.0, 1])
+    lte_ws.append(["2001", 111, 2, "TH-2", 113.0, 23.0, 120, 1825.0, 1])
+    nr_ws = wb.create_sheet("NR Project Parameters")
+    nr_ws.append(["管理网元ID", "gNodeB标识", "小区标识", "小区名称",
+                  "小区经度", "小区纬度", "天线方向角", "填写SSB频点", "小区覆盖类型"])
+    nr_ws.append(["2002", 222, 1, "NR-1", 113.1, 23.1, 0, 327040.0, 4])
+    wb.save(excel_path)
+    wb.close()
+
+    data_service.index[query_env] = {"fileType": "full_params", "id": query_env}
+    yield query_env
+    data_service.index.pop(query_env, None)
+
+
+def test_validate_cell_fields(query_env):
+    ok, errs = data_service.validate_cell_fields({
+        "managedElementId": "2001", "siteId": "111", "cellId": "1",
+        "cellName": "X", "mnc": "11", "longitude": 113, "latitude": 23,
+        "azimuth": 120, "frequency": "1825", "cellCoverType": 1,
+    }, "LTE")
+    assert ok and not errs
+
+
+def test_validate_cell_fields_out_of_range(query_env):
+    ok, errs = data_service.validate_cell_fields({
+        "managedElementId": "2001", "siteId": "111", "cellId": "1",
+        "cellName": "X", "mnc": "1", "longitude": 999, "latitude": 999,
+        "azimuth": 999, "frequency": "abc", "cellCoverType": 4,
+    }, "LTE")
+    assert not ok
+    joined = "；".join(errs)
+    assert "经度" in joined and "纬度" in joined and "方向角" in joined
+    assert "MNC" in joined and "频点" in joined
+
+
+def test_bulk_update_cell(excel_env):
+    from app.core.database import SessionLocal
+    from app.models.database import Sector
+
+    data_service._invalidate_cell_search_index()
+    hit = data_service.search_cells("TH-1", workbook_id=excel_env)[0]
+    row_key = hit["rowKey"]
+
+    res = data_service.bulk_update_cells(
+        [{"rowKey": row_key, "networkType": "LTE", "fields": {"cellName": "TH-1-改", "azimuth": 90}}],
+        [], user_id=1, workbook_id=excel_env,
+    )
+    assert res["updated"] == 1 and res["deleted"] == 0
+    item = res["results"][0]
+    assert item["success"] and item["type"] == "update"
+
+    db = SessionLocal()
+    try:
+        s = db.query(Sector).filter(Sector.id == int(row_key.split(":")[1])).first()
+        assert s.name == "TH-1-改" and s.azimuth == 90
+    finally:
+        db.close()
+    names = {i["cellName"] for i in data_service.search_cells("TH-1-改", workbook_id=excel_env)}
+    assert "TH-1-改" in names
+
+
+def test_bulk_update_rekey_and_conflict(excel_env):
+    data_service._invalidate_cell_search_index()
+    hit = data_service.search_cells("TH-2", workbook_id=excel_env)[0]
+
+    # 改键到已占用 (111_1) → 冲突拒绝
+    res = data_service.bulk_update_cells(
+        [{"rowKey": hit["rowKey"], "networkType": "LTE", "fields": {"cellId": "1"}}],
+        [], user_id=1, workbook_id=excel_env,
+    )
+    assert res["results"][0]["success"] is False
+    assert "占用" in res["results"][0]["message"] or "重复" in res["results"][0]["message"]
+
+    # 改键到新站 999（原地改键）
+    res = data_service.bulk_update_cells(
+        [{"rowKey": hit["rowKey"], "networkType": "LTE",
+          "fields": {"siteId": "999", "cellId": "9", "cellName": "TH-2-新"}}],
+        [], user_id=1, workbook_id=excel_env,
+    )
+    assert res["results"][0]["success"]
+    names = {i["cellName"] for i in data_service.search_cells("999", workbook_id=excel_env)}
+    assert "TH-2-新" in names
+
+
+def test_bulk_update_cross_type_occupied(excel_env):
+    data_service._invalidate_cell_search_index()
+    hit = data_service.search_cells("TH-2", network_type="LTE", workbook_id=excel_env)[0]
+    res = data_service.bulk_update_cells(
+        [{"rowKey": hit["rowKey"], "networkType": "LTE", "fields": {"siteId": "222", "cellId": "1"}}],
+        [], user_id=1, workbook_id=excel_env,
+    )
+    assert res["results"][0]["success"] is False
+    assert "NR" in res["results"][0]["message"]
+
+
+def test_bulk_delete_cascades_site(excel_env):
+    from app.core.database import SessionLocal
+    from app.models.database import Site
+
+    data_service._invalidate_cell_search_index()
+    hits = data_service.search_cells("TH-", workbook_id=excel_env)  # TH-1 + TH-2
+    res = data_service.bulk_update_cells(
+        [],
+        [{"rowKey": h["rowKey"], "networkType": "LTE"} for h in hits],
+        user_id=1, workbook_id=excel_env,
+    )
+    assert res["deleted"] == 2
+    db = SessionLocal()
+    try:
+        assert db.query(Site).filter(Site.workbook_id == excel_env, Site.site_id == "111").first() is None
+        assert db.query(Site).filter(Site.workbook_id == excel_env, Site.site_id == "222").first() is not None
+    finally:
+        db.close()
+
+
 def test_search_endpoint_smoke(query_env):
     """search 端点端到端冒烟：注入 index + 鉴权用户 + token"""
     from fastapi.testclient import TestClient
