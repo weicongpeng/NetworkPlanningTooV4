@@ -309,7 +309,20 @@ class NeighborPlanner:
             angle_score = 5  # 无方向角信息时给中等分
 
         return distance_score + angle_score
-    
+
+    @staticmethod
+    def _is_same_frequency(src_earfcn, tgt_earfcn) -> bool:
+        """判断源/目标小区是否同频（EARFCN/SSB 频点相同）。
+
+        任一侧频点缺失时按异频处理（更保守，避免同频类别超限）。
+        """
+        if src_earfcn is None or tgt_earfcn is None:
+            return False
+        try:
+            return int(src_earfcn) == int(tgt_earfcn)
+        except (ValueError, TypeError):
+            return False
+
     def get_cell_key(self, row: pd.Series) -> str:
         """获取小区唯一标识"""
         return f"{row['enodeb_id']}_{row['cell_id']}"
@@ -682,11 +695,8 @@ class NeighborPlanner:
             )
             candidate_neighbors.append(neighbor)
 
-        # 候选邻区按评分排序并限制数量
-        candidate_neighbors.sort(key=lambda x: x.score, reverse=True)
-        # 候选邻区数量 = 最大邻区数 - 强制邻区数 - 兜底邻区数
-        remaining_slots = max(0, self.max_neighbors - len(forced_neighbors) - len(step4_fallback_neighbors))
-        selected_candidates = candidate_neighbors[:remaining_slots]
+        # 候选邻区不在本层截断：最终在合并后按 同频/异频 各自限制 max_neighbors
+        selected_candidates = candidate_neighbors
 
         # 构建兜底邻区列表
         fallback_neighbors = []
@@ -733,10 +743,37 @@ class NeighborPlanner:
             fallback_neighbors.append(neighbor)
             fallback_keys.add(target_key)
 
-        # 最终结果 = 强制邻区 + 兜底邻区 + 选中的候选邻区
-        final_neighbors = forced_neighbors + fallback_neighbors + selected_candidates
+        # ========== 合并 + 同频/异频分类 + 各自上限截断 ==========
+        # "最大邻区数(max_neighbors)" 指 同频 与 异频 各自的上限：
+        # 每小区最终邻区 = 同频前 max_neighbors + 异频前 max_neighbors。
+        # 强制邻区(第一步)/兜底邻区(第四步)也纳入各自频率类别的上限，不再无条件保留。
+        # 合并前先去重（候选与兜底可能来自同一批候选，避免同一目标重复出现）。
+        combined_neighbors = forced_neighbors + fallback_neighbors + selected_candidates
+        seen_keys = set()
+        unique_neighbors = []
+        for n in combined_neighbors:
+            if n.target_key not in seen_keys:
+                seen_keys.add(n.target_key)
+                unique_neighbors.append(n)
 
-        logger.debug(f"最终结果: 强制邻区={len(forced_neighbors)}, 兜底邻区={len(fallback_neighbors)}, 候选邻区={len(selected_candidates)}, 总计={len(final_neighbors)}")
+        same_freq_neighbors = []
+        inter_freq_neighbors = []
+        for n in unique_neighbors:
+            if self._is_same_frequency(n.source_earfcn, n.target_earfcn):
+                same_freq_neighbors.append(n)
+            else:
+                inter_freq_neighbors.append(n)
+
+        same_freq_neighbors.sort(key=lambda x: x.score, reverse=True)
+        inter_freq_neighbors.sort(key=lambda x: x.score, reverse=True)
+
+        final_neighbors = same_freq_neighbors[:self.max_neighbors] + inter_freq_neighbors[:self.max_neighbors]
+
+        logger.debug(
+            f"最终结果: 同频={len(same_freq_neighbors[:self.max_neighbors])}, "
+            f"异频={len(inter_freq_neighbors[:self.max_neighbors])}, "
+            f"总计={len(final_neighbors)}, 上限={self.max_neighbors}(同频/异频各限)"
+        )
 
         return final_neighbors
     

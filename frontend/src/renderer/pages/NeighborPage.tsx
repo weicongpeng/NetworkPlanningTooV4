@@ -142,6 +142,7 @@ export function NeighborPage() {
     // 工具提示
     distanceFactorTooltip: t('neighbor.distanceFactorTooltip') || '覆盖圆距离系数：站点到覆盖圆心的距离系数，默认5/9(≈0.556)',
     radiusFactorTooltip: t('neighbor.radiusFactorTooltip') || '覆盖圆半径系数：覆盖半径系数，默认5/9(≈0.556)',
+    maxNeighborsTooltip: t('neighbor.maxNeighborsTooltip') || '同频与异频邻区各自的上限：每小区同频邻区最多 N 个，异频邻区再单独最多 N 个',
     // 规划类型描述
     startTaskMsg: t('neighbor.startTaskMsg') || '邻区规划开始',
     // 表格列
@@ -222,7 +223,8 @@ export function NeighborPage() {
   } = useTaskStore()
   const taskId = activeTaskIds.neighbor_planning
   const latestNeighborTask = getLatestNeighborTask()
-  const neighborHistoryCount = useTaskStore(s => Object.values(s.tasks).filter(t => t.type === 'neighbor_planning').length)
+  // 🔥 修复：改用后端返回的真实任务总数（historyCounts），避免本地 store 缓存截断导致计数不准
+  const neighborHistoryCount = useTaskStore(s => s.historyCounts.neighbor_planning)
 
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -269,6 +271,10 @@ export function NeighborPage() {
 
   // ===== 结果自动加载 =====
   const { syncHistoryFromBackend } = useTaskStore()
+  // 🔥 页面挂载时同步一次历史计数（badge 显示后端真实任务总数）
+  useEffect(() => {
+    syncHistoryFromBackend('neighbor_planning').catch(() => {})
+  }, [syncHistoryFromBackend])
   useEffect(() => {
     if (activeLeftTab === 'planning-result') {
       // 如果用户通过"查看"按钮加载了特定任务的结果，不要自动加载最新的
@@ -733,21 +739,19 @@ export function NeighborPage() {
     })
   }
 
-  // 全选/取消全选当前网络类型的小区
-  const toggleSelectAll = () => {
-    const sourceType = config.planningType.split('-')[0] as 'LTE' | 'NR'
-    const sectors = sourceType === 'LTE' ? cellListData.lte : cellListData.nr
-    const allIds = sectors.map(s => s.id)
-    const allSelected = allIds.every(id => selectedCellIdsSet.has(id))
+  // 全选/取消全选当前搜索过滤后的小区
+  const toggleSelectAll = (filteredIds: string[]) => {
+    const allIds = filteredIds
+    const allSelected = allIds.length > 0 && allIds.every(id => selectedCellIdsSet.has(id))
     if (allSelected) {
-      // 取消全选：从选中集合中移除当前网络类型的所有小区
+      // 取消全选：从选中集合中移除当前过滤后的小区
       setSelectedCellIdsSet(prev => {
         const next = new Set(prev)
         allIds.forEach(id => next.delete(id))
         return next
       })
     } else {
-      // 全选：添加所有当前网络类型的小区
+      // 全选：添加所有当前过滤后的小区
       setSelectedCellIdsSet(prev => {
         const next = new Set(prev)
         allIds.forEach(id => next.add(id))
@@ -947,6 +951,10 @@ export function NeighborPage() {
         setActiveLeftTab('planning-result')
         setShowMap(true)
         if (result.results) {
+          // 🔥 修复：历史任务从后端只拿 resultSummary（无 results 数组），
+          // 自动初始化不再触发，必须主动初始化 sync service，
+          // 否则点击结果行时 findSector 无数据可查，地图不渲染
+          await ensureNeighborSyncService().catch(() => {})
           neighborDataSyncService.setNeighborResults({ results: result.results })
         }
       }
@@ -1411,7 +1419,7 @@ export function NeighborPage() {
                             </select>
                           </div>
                           <div>
-                            <label className="block text-xs font-medium mb-0.5">{i18n.maxNeighbors}</label>
+                            <label className="block text-xs font-medium mb-0.5" title={i18n.maxNeighborsTooltip}>{i18n.maxNeighbors}</label>
                             <NumberInput
                               value={config.maxNeighbors}
                               onChange={(v) => setConfig({ maxNeighbors: v })}
