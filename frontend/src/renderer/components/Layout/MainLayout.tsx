@@ -23,6 +23,7 @@ import { useAuthStore } from '../../store/authStore'
 import { reloadUserMapSettings } from '../../store/mapStore'
 import { GlobalTaskIndicator } from './GlobalTaskIndicator'
 import { appVersionsApi } from '../../services/api'
+import { prefetchPage } from '../../pageLoaders'
 
 // --- 导航项类型定义 ---
 type NavLink = { type: 'link'; name: string; href: string; icon?: LucideIcon }
@@ -135,12 +136,6 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
     return `${base}${downloadUrl}`
   }
 
-  const formatSize = (size: number) => {
-    if (!size) return ''
-    const mb = size / (1024 * 1024)
-    return `${mb.toFixed(1)} MB`
-  }
-
   const handleLogout = async () => {
     await logout()
   }
@@ -167,6 +162,12 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
       <div className="relative">
         {/* 侧边栏 - 使用主题变量，跟随系统主题设置 */}
         <aside
+          onClick={(e) => {
+            // 点击侧边栏空白处（非导航项/按钮）时切换展开/收起，保留右下角按钮原有行为
+            if (!(e.target as HTMLElement).closest('a, button')) {
+              setSidebarOpen((v) => !v)
+            }
+          }}
           style={{
             width: sidebarOpen ? '180px' : '42px',
             height: '100vh',
@@ -259,6 +260,7 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
                               color: isChildActive ? 'hsl(var(--primary-foreground))' : 'hsl(var(--foreground))',
                             }}
                             onMouseEnter={(e) => {
+                              prefetchPage(child.href)
                               if (!isChildActive) {
                                 e.currentTarget.style.backgroundColor = 'hsl(var(--muted))'
                                 e.currentTarget.style.color = 'hsl(var(--foreground))'
@@ -310,6 +312,7 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
                     color: isActive ? 'hsl(var(--primary-foreground))' : 'hsl(var(--foreground))',
                   }}
                   onMouseEnter={(e) => {
+                    prefetchPage(item.href)
                     if (!isActive) {
                       e.currentTarget.style.backgroundColor = 'hsl(var(--muted))'
                       e.currentTarget.style.color = 'hsl(var(--foreground))'

@@ -5,9 +5,56 @@
     <link rel="icon" type="image/png" href="/app-icon.png" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>网络规划工具 v2.0</title>
+    <style>
+      /* 首屏骨架屏：JS 加载期间占位，React 挂载后自动替换 */
+      html, body { margin: 0; padding: 0; }
+      body { background: hsl(0 0% 20%); }
+      .npt-skeleton { display: flex; height: 100vh; background: hsl(0 0% 20%); color: hsl(0 0% 95%); }
+      .npt-skeleton-sidebar {
+        width: 180px; flex-shrink: 0;
+        background: hsl(0 0% 23%);
+        border-right: 1px solid hsl(0 0% 16%);
+        padding: 16px 12px;
+        box-sizing: border-box;
+      }
+      .npt-skeleton-logo { height: 30px; width: 70%; border-radius: 6px; margin-bottom: 26px; }
+      .npt-skeleton-nav { height: 20px; border-radius: 4px; margin-bottom: 14px; }
+      .npt-skeleton-main { flex: 1; padding: 32px; box-sizing: border-box; overflow: hidden; }
+      .npt-skeleton-title { height: 24px; width: 32%; border-radius: 6px; margin-bottom: 34px; }
+      .npt-skeleton-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 24px; }
+      .npt-skeleton-card { height: 140px; border-radius: 10px; }
+      .npt-skeleton-logo, .npt-skeleton-nav, .npt-skeleton-title, .npt-skeleton-card {
+        background: hsl(0 0% 30%);
+        animation: npt-pulse 1.6s ease-in-out infinite;
+      }
+      @keyframes npt-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.45; } }
+    </style>
   </head>
   <body>
-    <div id="root"></div>
+    <div id="root">
+      <div class="npt-skeleton" aria-hidden="true">
+        <div class="npt-skeleton-sidebar">
+          <div class="npt-skeleton-logo"></div>
+          <div class="npt-skeleton-nav"></div>
+          <div class="npt-skeleton-nav"></div>
+          <div class="npt-skeleton-nav"></div>
+          <div class="npt-skeleton-nav" style="width: 55%"></div>
+          <div class="npt-skeleton-nav" style="width: 70%"></div>
+          <div class="npt-skeleton-nav" style="width: 45%"></div>
+        </div>
+        <div class="npt-skeleton-main">
+          <div class="npt-skeleton-title"></div>
+          <div class="npt-skeleton-grid">
+            <div class="npt-skeleton-card"></div>
+            <div class="npt-skeleton-card"></div>
+            <div class="npt-skeleton-card"></div>
+            <div class="npt-skeleton-card"></div>
+            <div class="npt-skeleton-card"></div>
+            <div class="npt-skeleton-card"></div>
+          </div>
+        </div>
+      </div>
+    </div>
     <script type="module" src="/src/renderer/main.tsx"></script>
   </body>
 </html>

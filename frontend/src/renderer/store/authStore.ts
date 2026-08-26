@@ -71,6 +71,8 @@ export const useAuthStore = create<AuthState>()(
         } catch {
           // 即使服务端登出失败也清除本地状态
         }
+        // 重新登录清除批量距离匹配持久化状态（初始登录语义）
+        try { sessionStorage.removeItem('distanceMatch.shared') } catch { /* ignore */ }
         set({
           token: null,
           user: null,

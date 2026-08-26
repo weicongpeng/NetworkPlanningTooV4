@@ -1,4 +1,4 @@
-import { useEffect, useState, useRef } from 'react'
+import { useEffect, useRef } from 'react'
 import { useAuthStore } from '../store/authStore'
 import { LoginModal } from './LoginModal'
 
@@ -6,20 +6,15 @@ interface AuthGuardProps {
   children: React.ReactNode
 }
 
-const IDLE_TIMEOUT_MS = 35 * 60 * 1000  // 35 分钟无操作才退出
+const IDLE_TIMEOUT_MS = 60 * 60 * 1000  // 1 小时无操作才退出
 const IDLE_CHECK_INTERVAL_MS = 60 * 1000  // 每 1 分钟检查一次空闲状态
 
 export function AuthGuard({ children }: AuthGuardProps) {
-  const { isAuthenticated, user, fetchUser } = useAuthStore()
-  const [initialized, setInitialized] = useState(false)
+  const { isAuthenticated, user } = useAuthStore()
   const lastActivityRef = useRef(Date.now())
 
-  // 初始化：从 localStorage 恢复后验证 token
-  useEffect(() => {
-    fetchUser().finally(() => setInitialized(true))
-  }, [fetchUser])
-
   // 监听 401 事件（API 拦截器触发）→ 主动验证 token 并同步 store 状态
+  // 后台 token 校验由 authStore persist 的 onRehydrateStorage 触发（fire-and-forget）
   useEffect(() => {
     const handler = () => {
       if (useAuthStore.getState().isAuthenticated) {
@@ -31,9 +26,9 @@ export function AuthGuard({ children }: AuthGuardProps) {
   }, [])
 
   // 空闲检测：用户交互时仅更新时间戳，不检查 token
-  // 仅当无操作超过 IDLE_TIMEOUT_MS（35 分钟）时才验证 token 是否过期
+  // 仅当无操作超过 IDLE_TIMEOUT_MS（1 小时）时才验证 token 是否过期
   useEffect(() => {
-    if (!initialized) return
+    if (!isAuthenticated) return
     const handleInteraction = () => {
       lastActivityRef.current = Date.now()
     }
@@ -47,11 +42,11 @@ export function AuthGuard({ children }: AuthGuardProps) {
       window.removeEventListener('mousemove', handleInteraction, { capture: true })
       window.removeEventListener('wheel', handleInteraction, { capture: true })
     }
-  }, [initialized])
+  }, [isAuthenticated])
 
-  // 空闲检测定时器：每分钟检查一次，如果无操作超过 35 分钟才验证 token
+  // 空闲检测定时器：每分钟检查一次，如果无操作超过 1 小时才验证 token
   useEffect(() => {
-    if (!initialized || !isAuthenticated) return
+    if (!isAuthenticated) return
     const interval = setInterval(() => {
       const idleTime = Date.now() - lastActivityRef.current
       if (idleTime >= IDLE_TIMEOUT_MS) {
@@ -59,21 +54,9 @@ export function AuthGuard({ children }: AuthGuardProps) {
       }
     }, IDLE_CHECK_INTERVAL_MS)
     return () => clearInterval(interval)
-  }, [initialized, isAuthenticated])
+  }, [isAuthenticated])
 
-  // 加载中
-  if (!initialized) {
-    return (
-      <div className="flex items-center justify-center min-h-screen bg-background">
-        <div className="text-center">
-          <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-primary mx-auto mb-4"></div>
-          <p className="text-muted-foreground">加载中...</p>
-        </div>
-      </div>
-    )
-  }
-
-  // 未认证 → 只显示登录界面，不渲染应用内容（用户看不到旧缓存页面）
+  // 未认证 → 只显示登录界面，不渲染应用内容（persist 同步恢复，无需等待网络验证）
   if (!isAuthenticated) {
     return <LoginModal isOpen={true} />
   }
@@ -88,6 +71,6 @@ export function AuthGuard({ children }: AuthGuardProps) {
     )
   }
 
-  // 正常应用内容
+  // 正常应用内容（已认证 → 立即渲染，后台静默验证）
   return <>{children}</>
 }
