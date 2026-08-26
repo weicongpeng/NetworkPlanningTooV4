@@ -8,85 +8,160 @@ type FullSource = 'file' | 'data'
 
 interface ParseError { sheet: string; row: number; reason: string }
 
+// ===== sessionStorage 持久化（镜像 LayerToolsPage 模式：切页不丢失，刷新/新开/登录清除） =====
+const STORAGE_KEY = 'distanceMatch.shared'
+// 模块级：整页首次加载生成一次；路由切换不重估（状态保留），F5 重估（旧状态视为过期清除）
+const PAGE_LOAD_ID = Math.random().toString(36).slice(2)
+
+interface SharedState {
+  filePath: string
+  fileName: string
+  sheetList: string[]
+  matchSheet: string
+  fullSource: FullSource
+  fullSheet: string
+  fullDataId: string
+  dataSheets: string[]
+  maxDistanceKm: string
+  matching: boolean
+  result: { filename: string; download_url: string } | null
+  parseErrors: ParseError[]
+  error: string
+}
+
+function emptyShared(): SharedState {
+  return {
+    filePath: '', fileName: '', sheetList: [], matchSheet: '',
+    fullSource: 'file', fullSheet: '', fullDataId: '', dataSheets: [],
+    maxDistanceKm: '', matching: false, result: null, parseErrors: [], error: '',
+  }
+}
+
+function loadShared(): SharedState {
+  try {
+    const raw = sessionStorage.getItem(STORAGE_KEY)
+    if (raw) {
+      const saved = JSON.parse(raw)
+      if (saved && saved.pageLoadId === PAGE_LOAD_ID) {
+        const { pageLoadId, ...rest } = saved
+        return { ...emptyShared(), ...rest }
+      }
+    }
+  } catch { /* ignore */ }
+  return emptyShared()
+}
+
+function saveShared(s: SharedState) {
+  try { sessionStorage.setItem(STORAGE_KEY, JSON.stringify({ pageLoadId: PAGE_LOAD_ID, ...s })) } catch { /* ignore */ }
+}
+
 export default function DistanceMatchPage() {
   const { t } = useTranslation()
 
+  // 持久化状态一次性初始化（切页切回恢复；F5/新开 tab 由 pageLoadId 判定为过期 → 空）
+  const initialShared = useRef(loadShared()).current
+
   // ===== 导入文件（顶层单一） =====
-  const [filePath, setFilePath] = useState('')
-  const [fileName, setFileName] = useState('')
-  const [sheetList, setSheetList] = useState<string[]>([])
+  const [filePath, setFilePath] = useState(initialShared.filePath)
+  const [fileName, setFileName] = useState(initialShared.fileName)
+  const [sheetList, setSheetList] = useState<string[]>(initialShared.sheetList)
 
   // ===== 匹配站点（来源固定为导入文件） =====
-  const [matchSheet, setMatchSheet] = useState('')
+  const [matchSheet, setMatchSheet] = useState(initialShared.matchSheet)
 
-  // ===== 全量站点来源 =====
-  const [fullSource, setFullSource] = useState<FullSource>('file')
-  const [fullSheet, setFullSheet] = useState('')   // file: 导入文件 sheet；data: 数据管理 sheet
+  // ===== 相邻站点来源 =====
+  const [fullSource, setFullSource] = useState<FullSource>(initialShared.fullSource)
+  const [fullSheet, setFullSheet] = useState(initialShared.fullSheet)   // file: 导入文件 sheet；data: 工参文件 sheet
 
-  // ===== 数据管理来源 =====
+  // ===== 工参文件来源 =====
   const [dataItems, setDataItems] = useState<any[]>([])
-  const [fullDataId, setFullDataId] = useState('')
-  const [dataSheets, setDataSheets] = useState<string[]>([])
-  const [networkType, setNetworkType] = useState<'LTE' | 'NR'>('LTE')
-  const [columns, setColumns] = useState<string[]>([])
-  const [nameCol, setNameCol] = useState('')
-  const [lonCol, setLonCol] = useState('')
-  const [latCol, setLatCol] = useState('')
+  const [fullDataId, setFullDataId] = useState(initialShared.fullDataId)
+  const [dataSheets, setDataSheets] = useState<string[]>(initialShared.dataSheets)
 
   // ===== 参数 =====
-  const [maxDistanceKm, setMaxDistanceKm] = useState('')
+  const [maxDistanceKm, setMaxDistanceKm] = useState(initialShared.maxDistanceKm)
 
   // ===== 状态 =====
-  const [matching, setMatching] = useState(false)
-  const [parseErrors, setParseErrors] = useState<ParseError[]>([])
-  const [result, setResult] = useState<{ filename: string; download_url: string } | null>(null)
-  const [error, setError] = useState('')
+  const [matching, setMatching] = useState(initialShared.matching)
+  const [parseErrors, setParseErrors] = useState<ParseError[]>(initialShared.parseErrors)
+  const [result, setResult] = useState<{ filename: string; download_url: string } | null>(initialShared.result)
+  const [error, setError] = useState(initialShared.error)
 
   // ===== 模块级上传进度（chunkedUpload 后台更新，切页不丢失） =====
   const [uploadProgress, setUploadProgress] = useState(uploadStore.get())
   useEffect(() => uploadStore.subscribe(setUploadProgress), [])
   const uploading = uploadProgress.active
 
-  // 列加载请求序号（防过期响应）：切换数据文件时旧请求返回后丢弃
-  const colReqRef = useRef(0)
-  // 记录上次自动预选的数据文件 id：切换网络类型（文件未变）时保留用户手动映射
-  const autoPickFileRef = useRef('')
-
-  const resetMapping = () => { setNameCol(''); setLonCol(''); setLatCol('') }
-
-  // 按 GeoFieldDetector 同源规则自动预选列映射
-  const autoPick = (cols: string[]) => {
-    const pick = (patterns: string[]) => {
-      const lower = cols.map(c => c.toLowerCase())
-      for (const p of patterns) {
-        const idx = lower.indexOf(p.toLowerCase())
-        if (idx >= 0) return cols[idx]
-      }
-      for (const p of patterns) {
-        const idx = lower.findIndex(c => c.includes(p.toLowerCase()))
-        if (idx >= 0) return cols[idx]
-      }
-      return ''
+  // ===== sessionStorage 持久化 ref + 统一写回 =====
+  const sharedRef = useRef<SharedState>({
+    filePath, fileName, sheetList, matchSheet, fullSource, fullSheet,
+    fullDataId, dataSheets, maxDistanceKm, matching, result, parseErrors, error,
+  })
+  useEffect(() => {
+    sharedRef.current = {
+      filePath, fileName, sheetList, matchSheet, fullSource, fullSheet,
+      fullDataId, dataSheets, maxDistanceKm, matching, result, parseErrors, error,
     }
-    setNameCol(pick(['cell_name', 'sector_name', 'name', 'cellname', '小区名称', '小区名']) || cols[0] || '')
-    setLonCol(pick(['longitude', 'lon', 'long', '经度']) || '')
-    setLatCol(pick(['latitude', 'lat', '纬度']) || '')
+  })
+  // 同步写 sessionStorage（不依赖 setState 执行，防止组件卸载丢写）
+  const persistShared = (updater: (prev: SharedState) => SharedState) => {
+    const next = updater(sharedRef.current)
+    sharedRef.current = next
+    saveShared(next)
   }
+  useEffect(() => {
+    saveShared({
+      filePath, fileName, sheetList, matchSheet, fullSource, fullSheet,
+      fullDataId, dataSheets, maxDistanceKm, matching, result, parseErrors, error,
+    })
+  }, [filePath, fileName, sheetList, matchSheet, fullSource, fullSheet, fullDataId, dataSheets, maxDistanceKm, matching, result, parseErrors, error])
 
-  // 数据管理下拉加载（excel + ready，过滤全量工参 full_params）
+  // 数据管理下拉加载（excel + ready，过滤全量工参 full_params）；恢复的 fullDataId 仍存在才保留
   useEffect(() => {
     dataApi.list(1, 100, true).then(res => {
       if (res.success && res.data) {
         const items = res.data.filter((d: any) => d.type === 'excel' && d.status === 'ready' && d.fileType === 'full_params')
         setDataItems(items)
-        const full = items.find((d: any) => (d.name || '').toLowerCase().includes('projectparameter_mongoose'))
-        if (full) setFullDataId(full.id)
-        else if (items[0]) setFullDataId(items[0].id)
+        if (initialShared.fullDataId && items.some((d: any) => d.id === initialShared.fullDataId)) {
+          setFullDataId(initialShared.fullDataId)
+        } else {
+          const full = items.find((d: any) => (d.name || '').toLowerCase().includes('projectparameter_mongoose'))
+          setFullDataId(full?.id || items[0]?.id || '')
+        }
       }
     }).catch(() => setError(t('distanceMatch.loadDataErr') || '加载数据列表失败'))
   }, [])
 
-  // 数据管理来源 → 读取原始 Excel 真实 sheet 列表 + 默认预选
+  // 恢复的文件校验：filePath 存在 → getExcelInfo 刷新 sheetList 并纠正失效选择；文件被 TTL 清扫 → 清空导入提示重导
+  useEffect(() => {
+    if (!filePath) return
+    let cancelled = false
+    layerToolsApi.getExcelInfo(filePath, fileName).then(info => {
+      if (cancelled) return
+      if (info?.sheets?.length) {
+        setSheetList(info.sheets)
+        if (!info.sheets.includes(matchSheet)) {
+          const next = info.sheets.find((s: string) => s.includes('匹配站点')) || info.sheets[0]
+          setMatchSheet(next || '')
+          persistShared(s => ({ ...s, matchSheet: next || '' }))
+        }
+        if (fullSource === 'file' && !info.sheets.includes(fullSheet)) {
+          const next = info.sheets.find((s: string) => s.includes('相邻站点')) || info.sheets[1] || info.sheets[0]
+          setFullSheet(next || '')
+          persistShared(s => ({ ...s, fullSheet: next || '' }))
+        }
+      }
+    }).catch(() => {
+      if (cancelled) return
+      setFilePath(''); setFileName(''); setSheetList([]); setMatchSheet('')
+      persistShared(s => ({ ...s, filePath: '', fileName: '', sheetList: [], matchSheet: '' }))
+      setError(t('distanceMatch.fileExpired') || '文件已过期，请重新导入')
+    })
+    return () => { cancelled = true }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // 工参文件来源 → 读取原始 Excel 真实 sheet 列表 + 默认预选（保留有效的恢复 fullSheet）
   useEffect(() => {
     if (fullSource !== 'data' || !fullDataId) {
       setDataSheets([]); setFullSheet('')
@@ -97,11 +172,8 @@ export default function DistanceMatchPage() {
       if (cancelled) return
       if (res.success && res.data?.sheets?.length) {
         setDataSheets(res.data.sheets)
-        // 默认预选：网络分表时匹配当前网络类型；原始 Excel 时选第一个
-        const pre = res.data.source === 'network'
-          ? res.data.sheets.find((s: string) => s.toUpperCase() === networkType.toUpperCase()) || res.data.sheets[0]
-          : res.data.sheets[0]
-        setFullSheet(pre || '')
+        // source==='network' 时 sheet 值即 LTE/NR（网络类型）；保留有效恢复值否则选第一个
+        setFullSheet(s => (s && res.data!.sheets.includes(s)) ? s : (res.data!.sheets[0] || ''))
       } else {
         setDataSheets([]); setFullSheet('')
       }
@@ -109,44 +181,7 @@ export default function DistanceMatchPage() {
       if (!cancelled) { setDataSheets([]); setFullSheet('') }
     })
     return () => { cancelled = true }
-  }, [fullSource, fullDataId, networkType])
-
-  // 数据管理来源 → 列加载 + 自动预选（仅 data 来源；切换 fullDataId 重新 autoPick，切换 networkType 保留手动映射）
-  useEffect(() => {
-    if (fullSource !== 'data' || !fullDataId) {
-      setColumns([]); resetMapping(); autoPickFileRef.current = ''
-      return
-    }
-    const reqId = ++colReqRef.current
-    const fileChanged = autoPickFileRef.current !== fullDataId
-    dataApi.getColumns(fullDataId, networkType).then(res => {
-      if (reqId !== colReqRef.current) return // 过期响应，忽略
-      if (res.success && res.data?.columns) {
-        const cols = res.data.columns
-        setColumns(cols)
-        if (fileChanged) {
-          // 数据文件切换：全量自动预选
-          autoPick(cols)
-          autoPickFileRef.current = fullDataId
-        } else {
-          // 网络类型切换（数据文件未变）：保留用户手动映射，仅清理已不存在的列
-          const nextName = nameCol && cols.includes(nameCol) ? nameCol : ''
-          const nextLon = lonCol && cols.includes(lonCol) ? lonCol : ''
-          const nextLat = latCol && cols.includes(latCol) ? latCol : ''
-          if (!nextName && !nextLon && !nextLat) {
-            autoPick(cols)
-            autoPickFileRef.current = fullDataId
-          } else {
-            setNameCol(nextName); setLonCol(nextLon); setLatCol(nextLat)
-          }
-        }
-      } else {
-        setColumns([]); resetMapping()
-      }
-    }).catch(() => {
-      if (reqId === colReqRef.current) { setColumns([]); resetMapping() }
-    })
-  }, [fullSource, fullDataId, networkType])
+  }, [fullSource, fullDataId])
 
   const handleDownloadTemplate = async () => {
     try {
@@ -156,26 +191,30 @@ export default function DistanceMatchPage() {
     }
   }
 
-  // 顶层单一导入框：上传 → 读 sheet 列表 → 自动预选匹配站点/全量站点
+  // 顶层单一导入框：上传 → 读 sheet 列表 → 自动预选匹配站点/相邻站点
   const handleFile = async (f: File) => {
     setParseErrors([]); setError(''); setResult(null)
     setSheetList([]); setMatchSheet('')
-    // 仅 file 来源清空/预选全量 sheet（data 来源由数据管理 sheet effect 管理，避免覆盖）
-    if (fullSource === 'file') setFullSheet('')
+    persistShared(s => ({ ...s, parseErrors: [], error: '', result: null, sheetList: [], matchSheet: '' }))
+    // 仅 file 来源清空/预选全量 sheet（data 来源由工参文件 sheet effect 管理，避免覆盖）
+    if (fullSource === 'file') { setFullSheet(''); persistShared(s => ({ ...s, fullSheet: '' })) }
     uploadStore._set({ active: true, percent: 1, step: 'uploading', sessionId: '', fileName: f.name })
     try {
       const up = await layerToolsApi.uploadLayerFile(f)
       setFilePath(up.file_path)
       setFileName(f.name)
+      persistShared(s => ({ ...s, filePath: up.file_path, fileName: f.name }))
       uploadStore._set({ active: true, percent: 100, step: 'reading', sessionId: '', fileName: f.name })
       const info = await layerToolsApi.getExcelInfo(up.file_path, f.name)
       if (info?.sheets?.length) {
         setSheetList(info.sheets)
-        // 默认预选：匹配站点←含「匹配站点」的 sheet；全量站点←含「全量站点」或 sheets[1]||sheets[0]
+        // 默认预选：匹配站点←含「匹配站点」的 sheet；相邻站点←含「相邻站点」或 sheets[1]||sheets[0]
         const find = (kw: string, fallbackIdx: number) =>
           info.sheets.find((s: string) => s.includes(kw)) || info.sheets[fallbackIdx] || info.sheets[0] || ''
-        setMatchSheet(find('匹配站点', 0))
-        if (fullSource === 'file') setFullSheet(find('全量站点', 1))
+        const m = find('匹配站点', 0)
+        setMatchSheet(m)
+        if (fullSource === 'file') setFullSheet(find('相邻站点', 1))
+        persistShared(s => ({ ...s, sheetList: info.sheets, matchSheet: m, fullSheet: s.fullSource === 'file' ? find('相邻站点', 1) : s.fullSheet }))
       }
     } catch (e: any) {
       if (e?.message === '已取消') {
@@ -198,12 +237,14 @@ export default function DistanceMatchPage() {
     if (!filePath) { setError(t('distanceMatch.errNoFile') || '请先导入文件'); return }
     if (!matchSheet) { setError(t('distanceMatch.errSheet') || '请选择匹配站点工作表'); return }
     if (!(km > 0)) { setError(t('distanceMatch.errThreshold') || '请输入大于 0 的距离门限'); return }
-    if (fullSource === 'file' && !fullSheet) { setError(t('distanceMatch.errSheet') || '请选择全量站点工作表'); return }
+    if (fullSource === 'file' && !fullSheet) { setError(t('distanceMatch.errSheet') || '请选择相邻站点工作表'); return }
     if (fullSource === 'data' && (!fullDataId || !fullSheet)) {
       setError(t('distanceMatch.errMapping') || '请选择数据文件并选择工作表'); return
     }
 
     setMatching(true)
+    // 持久化 matching 状态（切页不丢失，F5 刷新重置）
+    persistShared(s => ({ ...s, matching: true, result: null, error: '' }))
     try {
       const res = await distanceMatchApi.match({
         filePath,
@@ -212,18 +253,20 @@ export default function DistanceMatchPage() {
         fullSource,
         fullSheetName: fullSheet,
         fullDataId: fullSource === 'data' ? fullDataId : undefined,
-        fullNameCol: fullSource === 'data' ? nameCol : undefined,
-        fullLonCol: fullSource === 'data' ? lonCol : undefined,
-        fullLatCol: fullSource === 'data' ? latCol : undefined,
       })
       if (res.success && res.data?.download_url) {
-        setResult({ filename: res.data.filename, download_url: res.data.download_url })
+        const newResult = { filename: res.data.filename, download_url: res.data.download_url }
+        persistShared(s => ({ ...s, matching: false, result: newResult, error: '' }))
+        setResult(newResult)
       } else if (res.data?.errors?.length) {
+        persistShared(s => ({ ...s, matching: false, error: '' }))
         setParseErrors(res.data.errors)
       } else {
+        persistShared(s => ({ ...s, matching: false, result: null, error: t('distanceMatch.errUnknown') || '匹配失败，请重试' }))
         setError(t('distanceMatch.errUnknown') || '匹配失败，请重试')
       }
     } catch (e: any) {
+      persistShared(s => ({ ...s, matching: false, result: null, error: e?.message || String(e) }))
       setError(e?.message || String(e))
     } finally { setMatching(false) }
   }
@@ -293,7 +336,7 @@ export default function DistanceMatchPage() {
           </div>
         </div>
 
-        {/* 全量站点（来源：导入文件 / 数据管理） */}
+        {/* 相邻站点（来源：导入文件 / 数据管理） */}
         <div>
           <p className="text-xs font-medium mb-1">{t('distanceMatch.fullSite')}</p>
           <div className="flex gap-4 mb-2">
@@ -332,35 +375,6 @@ export default function DistanceMatchPage() {
                   disabled={!dataSheets.length} className={sheetSelectCls}>
                   {!dataSheets.length && <option value="">{t('distanceMatch.uploadHint')}</option>}
                   {dataSheets.map(s => <option key={s} value={s}>{s}</option>)}
-                </select>
-              </div>
-              <div>
-                <label htmlFor="dm-network-type" className="block text-xs font-medium mb-1">{t('distanceMatch.networkType')}</label>
-                <select id="dm-network-type" value={networkType} onChange={e => setNetworkType(e.target.value as 'LTE' | 'NR')}
-                  className={sheetSelectCls}>
-                  <option value="LTE">LTE</option>
-                  <option value="NR">NR</option>
-                </select>
-              </div>
-              <div>
-                <label htmlFor="dm-name-col" className="block text-xs font-medium mb-1">{t('distanceMatch.nameCol')}</label>
-                <select id="dm-name-col" value={nameCol} onChange={e => setNameCol(e.target.value)}
-                  disabled={!columns.length} className={sheetSelectCls}>
-                  {columns.map(c => <option key={c} value={c}>{c}</option>)}
-                </select>
-              </div>
-              <div>
-                <label htmlFor="dm-lon-col" className="block text-xs font-medium mb-1">{t('distanceMatch.lonCol')}</label>
-                <select id="dm-lon-col" value={lonCol} onChange={e => setLonCol(e.target.value)}
-                  disabled={!columns.length} className={sheetSelectCls}>
-                  {columns.map(c => <option key={c} value={c}>{c}</option>)}
-                </select>
-              </div>
-              <div>
-                <label htmlFor="dm-lat-col" className="block text-xs font-medium mb-1">{t('distanceMatch.latCol')}</label>
-                <select id="dm-lat-col" value={latCol} onChange={e => setLatCol(e.target.value)}
-                  disabled={!columns.length} className={sheetSelectCls}>
-                  {columns.map(c => <option key={c} value={c}>{c}</option>)}
                 </select>
               </div>
             </div>

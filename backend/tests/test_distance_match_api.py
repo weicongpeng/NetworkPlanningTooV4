@@ -16,11 +16,11 @@ def _make_client():
 
 
 def _make_list_excel() -> str:
-    """创建含「匹配站点」「全量站点」两个 sheet 的清单文件"""
+    """创建含「匹配站点」「相邻站点」两个 sheet 的清单文件"""
     tmp = tempfile.mktemp(suffix=".xlsx")
     with pd.ExcelWriter(tmp) as w:
         pd.DataFrame([{"CELL": "M1", "LON": 116.0, "LAT": 39.0}]).to_excel(w, sheet_name="匹配站点", index=False)
-        pd.DataFrame([{"CELL": "F1", "LON": 116.001, "LAT": 39.0}]).to_excel(w, sheet_name="全量站点", index=False)
+        pd.DataFrame([{"CELL": "F1", "LON": 116.001, "LAT": 39.0}]).to_excel(w, sheet_name="相邻站点", index=False)
     return tmp
 
 
@@ -58,11 +58,11 @@ def test_parse_missing_sheet():
             files={"file": ("list.xlsx", f, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
         )
     assert resp.status_code == 400
-    assert "全量站点" in str(resp.json()["detail"])
+    assert "相邻站点" in str(resp.json()["detail"])
 
 
 def test_match_valid():
-    """file 上传分支：匹配站点与全量站点从同一上传文件各选 sheet"""
+    """file 上传分支：匹配站点与相邻站点从同一上传文件各选 sheet"""
     path = _make_list_excel()
     client = _make_client()
     try:
@@ -73,7 +73,7 @@ def test_match_valid():
                     "max_distance_km": "1.0",
                     "match_sheet_name": "匹配站点",
                     "full_source": "file",
-                    "full_sheet_name": "全量站点",
+                    "full_sheet_name": "相邻站点",
                 },
                 files={"file": ("list.xlsx", f, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
             )
@@ -100,7 +100,7 @@ def test_match_invalid_threshold():
                 "file_path": path,
                 "match_sheet_name": "匹配站点",
                 "full_source": "file",
-                "full_sheet_name": "全量站点",
+                "full_sheet_name": "相邻站点",
             },
         )
         assert resp.status_code == 400
@@ -110,7 +110,7 @@ def test_match_invalid_threshold():
 
 
 def test_match_full_data_id(monkeypatch):
-    """full_source=data：从数据管理工参读取全量站点（mock get_data，无 original 文件）"""
+    """full_source=data：从数据管理工参读取相邻站点（mock get_data，无 original 文件）"""
     path = _make_list_excel()
     client = _make_client()
     from app.services import data_service as ds_mod
@@ -155,7 +155,7 @@ def test_match_file_path_non_upload():
                 "file_path": path,
                 "match_sheet_name": "匹配站点",
                 "full_source": "file",
-                "full_sheet_name": "全量站点",
+                "full_sheet_name": "相邻站点",
             },
         )
         assert resp.status_code == 200
@@ -178,7 +178,7 @@ def test_match_output_file_written():
                 "file_path": path,
                 "match_sheet_name": "匹配站点",
                 "full_source": "file",
-                "full_sheet_name": "全量站点",
+                "full_sheet_name": "相邻站点",
             },
         )
         assert resp.status_code == 200
@@ -265,11 +265,11 @@ def test_data_sheets_endpoint_metadata_only(monkeypatch):
 
 
 def test_match_by_sheet_upload():
-    """full_source=file：匹配站点与全量站点从同一导入文件各选 sheet，输出含匹配行"""
+    """full_source=file：匹配站点与相邻站点从同一导入文件各选 sheet，输出含匹配行"""
     tmp = tempfile.mktemp(suffix=".xlsx")
     with pd.ExcelWriter(tmp) as w:
         pd.DataFrame([{"CELL": "M1", "LON": 116.0, "LAT": 39.0}]).to_excel(w, sheet_name="匹配站点", index=False)
-        pd.DataFrame([{"CELL": "F1", "LON": 116.001, "LAT": 39.0}]).to_excel(w, sheet_name="全量站点", index=False)
+        pd.DataFrame([{"CELL": "F1", "LON": 116.001, "LAT": 39.0}]).to_excel(w, sheet_name="相邻站点", index=False)
     client = _make_client()
     try:
         resp = client.post(
@@ -279,7 +279,7 @@ def test_match_by_sheet_upload():
                 "file_path": tmp,
                 "match_sheet_name": "匹配站点",
                 "full_source": "file",
-                "full_sheet_name": "全量站点",
+                "full_sheet_name": "相邻站点",
             },
         )
         assert resp.status_code == 200
@@ -291,7 +291,7 @@ def test_match_by_sheet_upload():
         out_df = pd.read_excel(out_file)
         assert len(out_df) == 1
         assert out_df.iloc[0]["匹配站点名称"] == "M1"
-        assert out_df.iloc[0]["全量站点名称"] == "F1"
+        assert out_df.iloc[0]["相邻站点名称"] == "F1"
         assert "1.0km内无站点匹配" not in str(out_df.iloc[0]["备注"])
     finally:
         if os.path.exists(tmp):
@@ -299,7 +299,7 @@ def test_match_by_sheet_upload():
 
 
 def test_match_by_sheet_single_sheet():
-    """单 sheet 文件：匹配站点与全量站点指向同一 sheet（匹配清单即全量池）"""
+    """单 sheet 文件：匹配站点与相邻站点指向同一 sheet（匹配清单即相邻池）"""
     tmp = tempfile.mktemp(suffix=".xlsx")
     with pd.ExcelWriter(tmp) as w:
         pd.DataFrame([{"CELL": "A", "LON": 116.0, "LAT": 39.0},
@@ -398,7 +398,7 @@ def test_match_by_sheet_data_source_fixed_cell_columns(monkeypatch):
         out_file = settings.OUTPUT_DIR / body["data"]["filename"]
         out_df = pd.read_excel(out_file)
         assert out_df.iloc[0]["匹配站点名称"] == "M1"
-        assert out_df.iloc[0]["全量站点名称"] == "F1"
+        assert out_df.iloc[0]["相邻站点名称"] == "F1"
     finally:
         for p in (tmp, dest, d1_dir):
             if os.path.exists(p):

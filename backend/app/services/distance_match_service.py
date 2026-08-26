@@ -13,7 +13,7 @@ from app.core.config import settings
 # 输出列名（固定，含备注）
 OUTPUT_COLUMNS = [
     "匹配站点名称", "匹配站点经度", "匹配站点纬度",
-    "全量站点名称", "全量站点经度", "全量站点纬度",
+    "相邻站点名称", "相邻站点经度", "相邻站点纬度",
     "距离（km）", "备注",
 ]
 # 校验常量
@@ -79,7 +79,7 @@ def _normalize_columns_prefer_cell(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def read_match_file(file_path: str) -> Dict[str, pd.DataFrame]:
-    """读取清单 Excel 的两个 sheet，返回 {'匹配站点': df, '全量站点': df}（已归一化列名）。
+    """读取清单 Excel 的两个 sheet，返回 {'匹配站点': df, '相邻站点': df}（已归一化列名）。
     缺 sheet 抛 ValueError。"""
     try:
         xls = pd.ExcelFile(file_path, engine="calamine")
@@ -87,7 +87,7 @@ def read_match_file(file_path: str) -> Dict[str, pd.DataFrame]:
         # calamine 未安装时回退到默认引擎（openpyxl，仅支持 .xlsx）
         xls = pd.ExcelFile(file_path)
     sheets = {s.strip(): s for s in xls.sheet_names}
-    required = {"匹配站点", "全量站点"}
+    required = {"匹配站点", "相邻站点"}
     missing_sheets = [s for s in required if s not in sheets]
     if missing_sheets:
         raise ValueError(f"缺少工作表: {', '.join(missing_sheets)}")
@@ -106,7 +106,7 @@ def read_arbitrary_sheet(
     lat_col: str = None,
     prefer_cell: bool = False,
 ) -> pd.DataFrame:
-    """读取任意 sheet（匹配站点/全量站点通用）：按指定列映射或自动识别 CELL/LON/LAT。
+    """读取任意 sheet（匹配站点/相邻站点通用）：按指定列映射或自动识别 CELL/LON/LAT。
 
     prefer_cell=True 时（工参文件路径）优先精确匹配 小区名称/小区经度/小区纬度。
 
@@ -223,7 +223,7 @@ def validate_sheet(df: pd.DataFrame, sheet_name: str) -> List[Dict[str, object]]
 
 
 def validate_all(match_df: pd.DataFrame, full_df: pd.DataFrame) -> List[Dict[str, object]]:
-    return validate_sheet(match_df, "匹配站点") + validate_sheet(full_df, "全量站点")
+    return validate_sheet(match_df, "匹配站点") + validate_sheet(full_df, "相邻站点")
 
 
 def haversine_km(lon1: float, lat1: float, lon2: float, lat2: float) -> float:
@@ -365,7 +365,7 @@ def load_full_params_from_data(
     lon_col: str,
     lat_col: str,
 ) -> pd.DataFrame:
-    """从数据管理已导入工参读取全量站点（LTE/NR 分表），归一化列名。
+    """从数据管理已导入工参读取相邻站点（LTE/NR 分表），归一化列名。
     返回 df 列 = [CELL, LON, LAT]。"""
     from app.services.data_service import data_service
     data = data_service.get_data(data_id)
@@ -392,7 +392,7 @@ def load_full_sites_from_data(
     lat_col: str = None,
     prefer_cell: bool = False,
 ) -> pd.DataFrame:
-    """从数据管理已导入工参读取全量站点（LTE/NR 分表）。
+    """从数据管理已导入工参读取相邻站点（LTE/NR 分表）。
 
     列映射显式指定优先，缺省自动识别（_normalize_columns / prefer_cell 时
     _normalize_columns_prefer_cell 优先小区列）。返回 df 列 = [CELL, LON, LAT]。"""
@@ -422,7 +422,7 @@ def load_full_sites_from_data_sheet(
     lon_col: str = None,
     lat_col: str = None,
 ) -> pd.DataFrame:
-    """从数据管理工参的原始 Excel 读取指定 sheet 作为全量站点。
+    """从数据管理工参的原始 Excel 读取指定 sheet 作为相邻站点。
 
     优先 data/{data_id}/original.xlsx 的真实 sheet；文件缺失时回退
     load_full_sites_from_data（JSON 分表 + 列映射，sheet_name 即网络类型）。

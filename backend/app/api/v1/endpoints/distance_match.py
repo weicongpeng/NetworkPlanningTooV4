@@ -60,17 +60,17 @@ async def parse(
     file_path: Optional[str] = Form(None),
     current_user=Depends(require_data_import),
 ):
-    """解析并校验上传的清单（含「匹配站点」「全量站点」两个 sheet）"""
+    """解析并校验上传的清单（含「匹配站点」「相邻站点」两个 sheet）"""
     tmp, is_tmp = None, False
     try:
         tmp, is_tmp = _resolve_list_file(file, file_path)
         sheets = await run_in_threadpool(read_match_file, tmp)
-        errors = validate_all(sheets["匹配站点"], sheets["全量站点"])
+        errors = validate_all(sheets["匹配站点"], sheets["相邻站点"])
         return {
             "success": len(errors) == 0,
             "data": {
                 "match_total": len(sheets["匹配站点"]),
-                "full_total": len(sheets["全量站点"]),
+                "full_total": len(sheets["相邻站点"]),
                 "errors": errors,
             },
         }
@@ -122,7 +122,7 @@ async def match(
     full_lat_col: Optional[str] = Form(None),
     current_user=Depends(require_data_import),
 ):
-    """执行批量距离匹配：按所选 sheet 读取匹配/全量站点，返回下载 URL"""
+    """执行批量距离匹配：按所选 sheet 读取匹配/相邻站点，返回下载 URL"""
     tmp, is_tmp = None, False
     try:
         if max_distance_km <= 0:
@@ -130,7 +130,7 @@ async def match(
         if not match_sheet_name or not match_sheet_name.strip():
             raise HTTPException(status_code=400, detail="匹配站点工作表名称不能为空")
         if not full_sheet_name or not full_sheet_name.strip():
-            raise HTTPException(status_code=400, detail="全量站点工作表名称不能为空")
+            raise HTTPException(status_code=400, detail="相邻站点工作表名称不能为空")
         if full_source not in ("file", "data"):
             raise HTTPException(status_code=400, detail="full_source 必须为 file 或 data")
 
@@ -142,10 +142,10 @@ async def match(
             read_arbitrary_sheet, tmp, match_sheet_name,
         )
 
-        # 全量站点：数据管理原始 Excel 的指定 sheet，或同一导入文件的指定 sheet
+        # 相邻站点：数据管理原始 Excel 的指定 sheet，或同一导入文件的指定 sheet
         if full_source == "data":
             if not full_data_id:
-                raise HTTPException(status_code=400, detail="从数据管理读取全量站点需提供 full_data_id")
+                raise HTTPException(status_code=400, detail="从数据管理读取相邻站点需提供 full_data_id")
             full_df = await run_in_threadpool(
                 load_full_sites_from_data_sheet,
                 full_data_id, full_sheet_name,

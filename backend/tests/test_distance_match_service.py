@@ -124,7 +124,7 @@ def test_build_output_excel_columns_and_unmatched():
     headers = [c.value for c in ws[1]]
     assert headers == [
         "匹配站点名称", "匹配站点经度", "匹配站点纬度",
-        "全量站点名称", "全量站点经度", "全量站点纬度",
+        "相邻站点名称", "相邻站点经度", "相邻站点纬度",
         "距离（km）", "备注",
     ]
     assert ws.max_row == 2  # 1 头 + 1 命中
@@ -192,7 +192,7 @@ def test_validate_all_covers_both_sheets():
     full = _df([{"CELL": "F1", "LON": 999.0, "LAT": 39.0}])  # 经度越界
     errors = validate_all(match, full)
     assert len(errors) == 1
-    assert errors[0]["sheet"] == "全量站点"
+    assert errors[0]["sheet"] == "相邻站点"
     assert "经度" in errors[0]["reason"]
 
 
@@ -229,7 +229,7 @@ def test_match_sites_lat90_boundary():
 
 def test_read_match_file_missing_sheet():
     path = _write_match_xlsx({"匹配站点": _df([{"CELL": "A", "LON": 116.0, "LAT": 39.0}])})
-    with pytest.raises(ValueError, match="全量站点"):
+    with pytest.raises(ValueError, match="相邻站点"):
         read_match_file(path)
     os.unlink(path)
 
@@ -238,7 +238,7 @@ def test_read_match_file_missing_column():
     bad = pd.DataFrame([{"FOO": "A", "LON": 116.0, "LAT": 39.0}])  # 缺名称列（FOO 不在别名表）
     path = _write_match_xlsx({
         "匹配站点": _df([{"CELL": "A", "LON": 116.0, "LAT": 39.0}]),
-        "全量站点": bad,
+        "相邻站点": bad,
     })
     with pytest.raises(ValueError, match="缺少必需列"):
         read_match_file(path)
@@ -248,10 +248,10 @@ def test_read_match_file_missing_column():
 def test_read_match_file_ok():
     path = _write_match_xlsx({
         "匹配站点": _df([{"CELL": "M1", "LON": 116.0, "LAT": 39.0}]),
-        "全量站点": _df([{"CELL": "F1", "LON": 116.0, "LAT": 39.0}]),
+        "相邻站点": _df([{"CELL": "F1", "LON": 116.0, "LAT": 39.0}]),
     })
     result = read_match_file(path)
-    assert set(result.keys()) == {"匹配站点", "全量站点"}
+    assert set(result.keys()) == {"匹配站点", "相邻站点"}
     assert list(result["匹配站点"].columns) == ["CELL", "LON", "LAT"]
     os.unlink(path)
 
@@ -299,7 +299,7 @@ def test_build_output_excel_preserves_row_order():
 
 
 def test_build_output_excel_multi_hit_one_row():
-    """同一匹配站点命中多个全量站点时，多行连续输出"""
+    """同一匹配站点命中多个相邻站点时，多行连续输出"""
     match = _df([
         {"CELL": "M1", "LON": 116.0, "LAT": 39.0},
         {"CELL": "M2", "LON": 117.0, "LAT": 40.0},
