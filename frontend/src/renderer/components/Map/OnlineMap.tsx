@@ -24,6 +24,7 @@ import { SectorInfoPanel, useSectorInfoPanel } from './SectorInfoPanel'
 import { FeatureInfoPanel, useFeatureInfoPanel } from './FeatureInfoPanel'
 import { MapInfoLayerManager, MapInfoLayer, MapInfoLayerOptions, LayerGeometryType } from './MapInfoLayer'
 import { GeoDataLayerManager, GeoDataItem } from './GeoDataLayer'
+import type { ThematicSettings } from './LabelSettingsModal'
 import { reconcileZOrder, ZOrderLayer } from './layerZOrder'
 import { layerApi, dataApi } from '../../services/api'
 
@@ -207,6 +208,20 @@ export interface OnlineMapRef {
   setLayerFileLabelVisibility: (fileId: string, visible: boolean, settings: any) => void
   /** 设置图层颜色（图形颜色/透明度/边框宽度/边框颜色） */
   setLayerColorSettings: (fileId: string, settings: { fillColor: string; fillOpacity: number; borderWidth: number; borderColor: string }, geometryType?: string) => void
+  /** 设置扇区默认设置（图形透明度/边框宽度；null 恢复默认，仅默认频点配色模式生效） */
+  setSectorColorSettings: (layerId: string, settings: { fillOpacity: number; borderWidth: number } | null) => void
+  /** 刷新扇区图层颜色（频点自定义配色变化后调用） */
+  refreshSectorColors: () => void
+  /** 设置专题图层（按属性字段分段配色；null 关闭专题恢复基础配置） */
+  setLayerThematicSettings: (fileId: string, settings: ThematicSettings | null) => void
+  /** 设置扇区专题图层（与图层文件一致；null 关闭专题回退频点配色） */
+  setSectorThematicSettings: (layerId: string, settings: ThematicSettings | null) => void
+  /** 获取扇区专题区间统计（图例展示用） */
+  getSectorThematicStats: (layerId: string) => { counts: number[]; total: number; other: number } | null
+  /** 聚焦图层：居中并最大化显示该图层全部要素（图层预览） */
+  focusLayer: (fileId: string) => void
+  /** 获取专题区间统计（每个区间的要素数与总数，图例展示用） */
+  getLayerThematicStats: (fileId: string) => { counts: number[]; total: number; other: number } | null
   /** 设置地图类型切换 */
   toggleMapType: () => void
   /** 设置频点可见性 */
@@ -930,6 +945,112 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
       }
 
       console.warn('[OnlineMap] setLayerColorSettings: 未找到目标图层', fileId)
+    },
+
+    setLayerThematicSettings: (fileId, settings) => {
+      console.log('[OnlineMap] setLayerThematicSettings:', fileId, settings)
+
+      // 1. 优先处理 GeoDataLayer（地理化数据）
+      if (geoDataLayerManagerRef.current) {
+        const geoLayer = geoDataLayerManagerRef.current.getLayer(fileId)
+        if (geoLayer) {
+          geoLayer.setThematicOverrides(settings)
+          return
+        }
+      }
+
+      // 2. 处理 MapInfoLayer（图层文件）
+      const layerRef = mapInfoLayerRefsRef.current.get(fileId)
+      if (layerRef) {
+        layerRef.mapInfoLayer.setThematicOverrides(settings)
+        return
+      }
+
+      console.warn('[OnlineMap] setLayerThematicSettings: 未找到目标图层', fileId)
+    },
+
+    setSectorColorSettings: (layerId, settings) => {
+      console.log('[OnlineMap] setSectorColorSettings:', layerId, settings)
+      if (layerId === 'lte-sectors' && lteSectorLayerRef.current) {
+        lteSectorLayerRef.current.setColorOverrides(settings)
+      } else if (layerId === 'nr-sectors' && nrSectorLayerRef.current) {
+        nrSectorLayerRef.current.setColorOverrides(settings)
+      }
+    },
+
+    setSectorThematicSettings: (layerId, settings) => {
+      console.log('[OnlineMap] setSectorThematicSettings:', layerId, settings)
+      if (layerId === 'lte-sectors' && lteSectorLayerRef.current) {
+        lteSectorLayerRef.current.setThematicOverrides(settings)
+      } else if (layerId === 'nr-sectors' && nrSectorLayerRef.current) {
+        nrSectorLayerRef.current.setThematicOverrides(settings)
+      }
+    },
+
+    refreshSectorColors: () => {
+      lteSectorLayerRef.current?.redraw()
+      nrSectorLayerRef.current?.redraw()
+    },
+
+    focusLayer: (fileId) => {
+      console.log('[OnlineMap] focusLayer:', fileId)
+      if (!mapInstanceRef.current) return
+
+      // 0. 处理扇区图层（基站 LTE/NR）
+      let bounds: L.LatLngBounds | null = null
+      if (fileId === 'lte-sectors') {
+        bounds = lteSectorLayerRef.current?.getSectorBounds() ?? null
+      } else if (fileId === 'nr-sectors') {
+        bounds = nrSectorLayerRef.current?.getSectorBounds() ?? null
+      }
+
+      // 1. 处理 GeoDataLayer（地理化数据）
+      if (!bounds && geoDataLayerManagerRef.current) {
+        const geoLayer = geoDataLayerManagerRef.current.getLayer(fileId)
+        if (geoLayer) bounds = geoLayer.getFeaturesBounds()
+      }
+
+      // 2. 处理 MapInfoLayer（图层文件）
+      if (!bounds) {
+        const layerRef = mapInfoLayerRefsRef.current.get(fileId)
+        if (layerRef) bounds = layerRef.mapInfoLayer.getFeaturesBounds()
+      }
+
+      if (bounds && bounds.isValid()) {
+        mapInstanceRef.current.fitBounds(bounds, { padding: [60, 60] })
+      } else {
+        console.warn('[OnlineMap] focusLayer: 图层无可见要素或未加载', fileId)
+      }
+    },
+
+    getLayerThematicStats: (fileId) => {
+      // 0. 处理扇区图层（基站 LTE/NR）
+      if (fileId === 'lte-sectors') {
+        return lteSectorLayerRef.current?.getThematicStats() ?? null
+      } else if (fileId === 'nr-sectors') {
+        return nrSectorLayerRef.current?.getThematicStats() ?? null
+      }
+
+      // 1. 处理 GeoDataLayer（地理化数据）
+      if (geoDataLayerManagerRef.current) {
+        const geoLayer = geoDataLayerManagerRef.current.getLayer(fileId)
+        if (geoLayer) return geoLayer.getThematicStats()
+      }
+
+      // 2. 处理 MapInfoLayer（图层文件）
+      const layerRef = mapInfoLayerRefsRef.current.get(fileId)
+      if (layerRef) return layerRef.mapInfoLayer.getThematicStats()
+
+      return null
+    },
+
+    getSectorThematicStats: (layerId) => {
+      if (layerId === 'lte-sectors') {
+        return lteSectorLayerRef.current?.getThematicStats() ?? null
+      } else if (layerId === 'nr-sectors') {
+        return nrSectorLayerRef.current?.getThematicStats() ?? null
+      }
+      return null
     },
 
     setBaseMapVisibility: (visible: boolean) => {
@@ -2508,6 +2629,19 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
 
     const currentZoom = mapInstanceRef.current.getZoom()
 
+    // 从持久化 store 恢复扇区图层的默认设置（透明度/边框宽度）与专题图层配置
+    const applySectorPersistedSettings = (layerId: 'lte-sectors' | 'nr-sectors', layer: SectorSVGLayer) => {
+      const ms = useMapStore.getState().mapSettings
+      const color = ms.colorSettingsMap?.[layerId]
+      if (color) {
+        layer.setColorOverrides({ fillOpacity: color.fillOpacity, borderWidth: color.borderWidth })
+      }
+      const thematic = ms.thematicSettingsMap?.[layerId]
+      if (thematic) {
+        layer.setThematicOverrides(thematic)
+      }
+    }
+
     // 移除旧图层
     if (lteSectorLayerRef.current) {
       mapInstanceRef.current.removeLayer(lteSectorLayerRef.current)
@@ -2563,6 +2697,9 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
       const visibilityMap = new Map<number, boolean>()
       frequencies.lte.forEach(f => visibilityMap.set(f.frequency, f.visible))
       lteSectorLayerRef.current.setFrequenciesVisibility(visibilityMap)
+
+      // 应用持久化的扇区默认设置（透明度/边框宽度）与专题图层配置
+      applySectorPersistedSettings('lte-sectors', lteSectorLayerRef.current)
     }
 
     // 创建NR扇区图层
@@ -2593,6 +2730,9 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
       const visibilityMap = new Map<number, boolean>()
       frequencies.nr.forEach(f => visibilityMap.set(f.frequency, f.visible))
       nrSectorLayerRef.current.setFrequenciesVisibility(visibilityMap)
+
+      // 应用持久化的扇区默认设置（透明度/边框宽度）与专题图层配置
+      applySectorPersistedSettings('nr-sectors', nrSectorLayerRef.current)
     }
 
     // 扇区图层已就绪，重排图层顺序
@@ -2807,6 +2947,12 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
                 geoLayer.setStyleOverrides(savedColor)
               }
 
+              // 🔧 重新应用已保存的专题图层设置（必须在基础色之后，专题优先）
+              const savedThematic = useMapStore.getState().mapSettings.thematicSettingsMap?.[layerFile.id]
+              if (savedThematic?.enabled) {
+                geoLayer.setThematicOverrides(savedThematic)
+              }
+
               console.log('[OnlineMap] ✅ GeoDataLayer 创建完成:', layerFile.id, 'geometryType:', geometryType)
               return
             } catch (error) {
@@ -2937,6 +3083,12 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
           const savedColor = useMapStore.getState().mapSettings.colorSettingsMap?.[layerFile.id]
           if (savedColor) {
             mapInfoLayer.setStyleOverrides(savedColor)
+          }
+
+          // 🔧 重新应用已保存的专题图层设置（必须在基础色之后，专题优先）
+          const savedThematic = useMapStore.getState().mapSettings.thematicSettingsMap?.[layerFile.id]
+          if (savedThematic?.enabled) {
+            mapInfoLayer.setThematicOverrides(savedThematic)
           }
 
           console.log('[OnlineMap] Layer created:', layerFile.id, 'visible:', layerFile.visible)
@@ -3874,8 +4026,9 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
 
         if (isNear) {
           const props = layer.feature.properties
-          // 尝试多种可能的ID字段
-          const id = extractFeatureId(props)
+          // 优先用构建时分配的稳定选择 ID（_nptSelectionId，含「图层ID#序号」兜底），
+          // 否则回退到属性字段提取；与 getFeaturesInCircle/InPolygon 返回的 id 保持一致
+          const id = (layer as any)._nptSelectionId || extractFeatureId(props)
           if (id) {
             clickedFeatures.push({ id: String(id), props: { ...props, _layerType: 'MapInfo' }, layerType: 'MapInfo' })
           }
@@ -3887,9 +4040,6 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
     if (geoDataLayerManagerRef.current) {
       geoDataLayerManagerRef.current.getAllLayers().forEach(geoLayer => {
         if (!geoLayer.isVisible()) return
-        // 创建一个临时的小圆来查询（模拟点选）
-        const L = window.L
-        const tempCircle = L.circle(latLng, { radius: 30 }) // 30米容差
         const features = geoLayer.getFeaturesInCircle(latLng, 30)
         features.forEach(item => {
           const id = item.name || item.properties?.id || ''
@@ -4079,17 +4229,17 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
       })
       if (!isVisible) return
 
-      // 使用MapInfoLayer的getFeaturesInCircle方法
+      // 使用MapInfoLayer的getFeaturesInCircle方法（返回 { id, properties }）
       const features = mapInfoLayer.getFeaturesInCircle(center, radius)
       console.log('[OnlineMap] MapInfo图层返回的要素数量:', features.length)
 
       // 收集要素ID和属性
-      features.forEach(props => {
-        const id = extractFeatureId(props)
-        console.log('[OnlineMap] 处理要素:', { id, props })
+      features.forEach(item => {
+        const id = item.id
+        console.log('[OnlineMap] 处理要素:', { id, properties: item.properties })
         if (id) {
           newIds.add(String(id))
-          newProperties.push({ ...props, _layerType: 'MapInfo' })
+          newProperties.push({ ...item.properties, _layerType: 'MapInfo' })
         }
       })
     })
@@ -4242,15 +4392,15 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
       // 检查图层是否可见
       if (!mapInfoLayer.isVisible()) return
 
-      // 使用MapInfoLayer的getFeaturesInPolygon方法
+      // 使用MapInfoLayer的getFeaturesInPolygon方法（返回 { id, properties }）
       const features = mapInfoLayer.getFeaturesInPolygon(polygon)
 
       // 收集要素ID和属性
-      features.forEach(props => {
-        const id = extractFeatureId(props)
+      features.forEach(item => {
+        const id = item.id
         if (id) {
           newIds.add(String(id))
-          newProperties.push({ ...props, _layerType: 'MapInfo' })
+          newProperties.push({ ...item.properties, _layerType: 'MapInfo' })
         }
       })
     })
@@ -4420,12 +4570,12 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
       if (!isVisible) return
       const features = mapInfoLayer.getFeaturesInPolygon(polygon)
       console.log('[OnlineMap] MapInfo图层矩形框选返回要素数量:', features.length)
-      features.forEach(props => {
-        const id = extractFeatureId(props)
+      features.forEach(item => {
+        const id = item.id
         if (id) {
           newIds.add(String(id))
-          newProperties.push({ ...props, _layerType: 'MapInfo' })
-          console.log('[OnlineMap] 矩形框选选中MapInfo要素:', props.name || id)
+          newProperties.push({ ...item.properties, _layerType: 'MapInfo' })
+          console.log('[OnlineMap] 矩形框选选中MapInfo要素:', item.properties?.name || id)
         }
       })
     })

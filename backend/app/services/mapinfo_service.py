@@ -12,6 +12,7 @@ import time
 import uuid
 import json
 import gzip
+import zlib
 from typing import List, Dict, Any, Optional
 from pathlib import Path
 from datetime import datetime
@@ -32,6 +33,56 @@ _layer_cache_ttl: int = 600  # 缓存10分钟
 # 供 data_service 把每个失败文件的具体原因写入 index.json metadata，
 # 避免 len(layers)==0 静默返回上层。
 _LAST_PARSE_ERRORS: List[Dict[str, str]] = []
+
+# 图层默认配色板：文件无自带样式（MIF/TAB 无 Pen/Brush/Symbol、KML 无 <Style>）时，
+# 按图层名哈希取色，保证不同图层初次导入即有不同的默认颜色（同名图层颜色稳定）。
+_LAYER_PALETTE = [
+    '#e6194b', '#3cb44b', '#ffe119', '#4363d8', '#f58231', '#911eb4',
+    '#42d4f4', '#f032e6', '#bfef45', '#fabed4', '#469990', '#dcbeff',
+    '#9a6324', '#800000', '#aaffc3', '#808000', '#ffd8b1', '#000075',
+    '#008080', '#a9a9a9',
+]
+
+
+def _palette_color(layer_name: str) -> str:
+    """按图层名稳定取色（crc32 与进程/PYTHONHASHSEED 无关，跨重启一致）。
+    正反两次 crc32 异或提高相邻名称（layer_0/layer_1...）的取色分布。"""
+    n = (layer_name or '').encode('utf-8')
+    h = zlib.crc32(n) ^ zlib.crc32(n[::-1])
+    return _LAYER_PALETTE[h % len(_LAYER_PALETTE)]
+
+# 信号强度分级着色（还原 MapInfo 按 RSRP 主题渲染的默认效果）：
+# 图层含 SSRSRP/RSRP/电平/信号强度 字段且无文件自带样式时，按标准 RSRP 色阶
+# （绿→黄绿→黄→橙→红）逐要素分级上色。
+_RSRP_COLOR_RANGES = [
+    (-90, '#00c853'),      # ≥-90  优良 绿
+    (-100, '#aeea00'),     # ≥-100 良好 黄绿
+    (-110, '#ffd600'),     # ≥-110 一般 黄
+    (-120, '#ff6d00'),     # ≥-120 较差 橙
+    (float('-inf'), '#d50000'),  # <-120 差 红
+]
+
+_RSRP_FIELD_KEYWORDS = ('ssrsrp', 'ss_rsrp', 'ss-rsrp', 'rsrp', '电平', '信号强度')
+
+
+def _rsrp_color(value: float) -> str:
+    for threshold, color in _RSRP_COLOR_RANGES:
+        if value >= threshold:
+            return color
+    return '#d50000'
+
+
+def _detect_rsrp_column(columns) -> Optional[str]:
+    """从列名中检测 RSRP 类信号强度字段（排除 RSRQ/SINR，值域不适用 RSRP 色阶）。"""
+    for col in columns:
+        if col == 'geometry':
+            continue
+        name = str(col).lower()
+        if any(kw in name for kw in _RSRP_FIELD_KEYWORDS):
+            if 'rsrq' in name or 'sinr' in name:
+                continue
+            return col
+    return None
 
 
 class GeometryType(Enum):
@@ -61,20 +112,6 @@ class MapInfoLayer:
     metadata: Dict[str, Any]
 
 
-def _is_large_color(parts: List[str], idx: int) -> bool:
-    """判断 parts[idx] 是否为 24-bit 单整数颜色（>255）。
-
-    单整数颜色格式（GDAL/MIF）中颜色为 24-bit BGR 整数（R 最低字节），
-    数值通常远大于 255；多段 RGB 格式每分量 0-255。用 >255 区分两种格式。
-    """
-    if idx >= len(parts):
-        return False
-    try:
-        return int(parts[idx]) > 255
-    except (ValueError, TypeError):
-        return False
-
-
 class MapInfoParser:
     """MapInfo 文件解析器"""
 
@@ -82,7 +119,7 @@ class MapInfoParser:
     def detect_file_type(filename: str) -> Optional[str]:
         """检测文件类型"""
         ext = os.path.splitext(filename)[1].lower()
-        if ext in ['.tab', '.mif', '.dat']:
+        if ext in ['.tab', '.mif', '.dat', '.kml']:
             return ext[1:]  # 返回不带点的扩展名
         return None
 
@@ -211,8 +248,9 @@ class MapInfoParser:
             elif 'brush' in style_type_lower:
                 if len(parts) >= 2:
                     try:
-                        # 单整数格式: pattern,forecolor,[backcolor]（颜色为 24-bit 整数，>255 判定）
-                        if len(parts) <= 3 and _is_large_color(parts, 1):
+                        # 单整数格式: pattern,forecolor,[backcolor]（2-3 段，颜色为 24-bit 整数，
+                        # 可为 0=黑色——不能靠 >255 判定，否则 Brush (2,0,16777215) 被误判为 RGB）
+                        if len(parts) <= 3:
                             result['fill'] = True
                             result['fillPattern'] = int(parts[0]) if parts[0].isdigit() else 1
                             color_int = int(parts[1])
@@ -254,8 +292,10 @@ class MapInfoParser:
                 if len(parts) >= 1:
                     try:
                         result['markerType'] = 'symbol'
-                        # 单整数格式: shape,color,[size]（颜色为 24-bit 整数，>255 判定）
-                        if len(parts) >= 2 and _is_large_color(parts, 1):
+                        # 单整数格式: shape,color,[size,[rotation]]（颜色为 24-bit 整数）
+                        # 2-4 段一律按单整数颜色解析——颜色可为 0（黑色），不能靠 >255 判定，
+                        # 否则 Symbol (34,0,12) 会被误判为多段 RGB 导致 markerSize=0/颜色缺失
+                        if 2 <= len(parts) <= 4:
                             result['markerSymbol'] = int(parts[0]) if parts[0].isdigit() else 'circle'
                             color_int = int(parts[1])
                             r = color_int & 255
@@ -265,6 +305,7 @@ class MapInfoParser:
                             if len(parts) >= 3 and parts[2].replace('.', '').isdigit():
                                 result['markerSize'] = float(parts[2])
                         else:
+                            # >=5 段多段 RGB 变体: shape,size,r,g,b
                             result['markerSymbol'] = int(parts[0]) if parts[0].isdigit() else 'circle'
                             if len(parts) >= 2:
                                 result['markerSize'] = float(parts[1])
@@ -318,6 +359,338 @@ class MapInfoParser:
         保留函数签名以兼容调用方，直接返回 None。
         """
         return None
+
+    @staticmethod
+    def _kml_abgr_to_hex(kml_color: str) -> Optional[str]:
+        """KML aabbggrr → '#rrggbb'（忽略 alpha），非法输入返回 None。"""
+        if not kml_color or len(kml_color) != 8:
+            return None
+        try:
+            int(kml_color, 16)
+        except ValueError:
+            return None
+        return f"#{kml_color[6:8]}{kml_color[4:6]}{kml_color[2:4]}"
+
+    @staticmethod
+    def _kml_style_element_to_dict(style_el: Any) -> Dict[str, Any]:
+        """把 KML <Style> 元素转换为 _style dict（LineStyle/PolyStyle/IconStyle）。"""
+        sd: Dict[str, Any] = {}
+        ls = style_el.find("{*}LineStyle")
+        if ls is not None:
+            color = ls.findtext("{*}color", default="")
+            hexc = MapInfoParser._kml_abgr_to_hex(color)
+            if hexc:
+                sd["strokeColor"] = hexc
+                try:
+                    sd["strokeOpacity"] = round(int(color[0:2], 16) / 255, 2)
+                except ValueError:
+                    pass
+            width = ls.findtext("{*}width", default="")
+            if width:
+                try:
+                    sd["strokeWidth"] = float(width)
+                except ValueError:
+                    pass
+        ps = style_el.find("{*}PolyStyle")
+        if ps is not None:
+            color = ps.findtext("{*}color", default="")
+            hexc = MapInfoParser._kml_abgr_to_hex(color)
+            if hexc:
+                sd["fillColor"] = hexc
+                try:
+                    sd["fillOpacity"] = round(int(color[0:2], 16) / 255, 2)
+                except ValueError:
+                    pass
+            if ps.findtext("{*}fill", default="1").strip() == "0":
+                sd["fill"] = False
+        ic = style_el.find("{*}IconStyle")
+        if ic is not None:
+            color = ic.findtext("{*}color", default="")
+            hexc = MapInfoParser._kml_abgr_to_hex(color)
+            if hexc:
+                sd["markerColor"] = hexc
+            scale = ic.findtext("{*}scale", default="")
+            if scale:
+                try:
+                    # scale 为图标缩放倍数（基准图标约 32px），换算为像素半径
+                    sd["markerSize"] = max(4, min(24, round(float(scale) * 8, 1)))
+                except ValueError:
+                    pass
+        return sd
+
+    @staticmethod
+    def _parse_kml_styles(kml_file: Path) -> Optional[List[Optional[Dict[str, Any]]]]:
+        """解析 KML 每个 Placemark 的默认样式，返回按文档顺序的样式列表（与 gpd 行序一致）。
+
+        覆盖：LineStyle(color/width)、PolyStyle(color/fill/outline)、IconStyle(color/scale)。
+        支持内联 <Style> 与 <styleUrl>（Document 级共享 <Style id>，含 StyleMap 的 normal 映射）。
+        解析失败返回 None（调用方回退默认样式）。
+        """
+        import xml.etree.ElementTree as ET
+
+        try:
+            text = kml_file.read_text(encoding="utf-8", errors="replace")
+            root = ET.fromstring(text)
+        except Exception:
+            return None
+
+        # 收集 Document 级共享样式
+        shared: Dict[str, Any] = {}
+        for style in root.findall(".//{*}Style"):
+            sid = style.get("id")
+            if sid:
+                shared[sid] = style
+        # StyleMap → normal 样式引用
+        stylemap_normal: Dict[str, str] = {}
+        for sm in root.findall(".//{*}StyleMap"):
+            sid = sm.get("id")
+            if not sid:
+                continue
+            for pair in sm.findall("{*}Pair"):
+                key = pair.findtext("{*}key", default="")
+                url = pair.findtext("{*}styleUrl", default="")
+                if key == "normal" and url.startswith("#"):
+                    stylemap_normal[sid] = url[1:]
+
+        results: List[Optional[Dict[str, Any]]] = []
+        for pm in root.findall(".//{*}Placemark"):
+            style_el = pm.find("{*}Style")
+            if style_el is None:
+                url = pm.findtext("{*}styleUrl", default="")
+                ref = url[1:] if url.startswith("#") else ""
+                if ref and ref in stylemap_normal:
+                    ref = stylemap_normal[ref]
+                style_el = shared.get(ref)
+            sd = MapInfoParser._kml_style_element_to_dict(style_el) if style_el is not None else {}
+            results.append(sd if sd else None)
+        return results
+
+    @staticmethod
+    def _parse_kml_direct(kml_file: Path) -> Optional["MapInfoLayer"]:
+        """自研 KML 解析（ElementTree），完整保留混合几何类型与样式。
+
+        GDAL KML 驱动默认只读取首个几何类型的图层，混合几何（点+线+面）会丢要素，
+        且对大数据量解析慢。故对 .kml 直接 XML 解析：
+          - 遍历全部 <Placemark>（含 MultiGeometry 子级），提取 Point/LineString/Polygon
+          - 提取属性（name/description/ExtendedData）
+          - 提取样式（内联 <Style> 或 <styleUrl> → 共享 <Style>/<StyleMap>）
+        解析失败返回 None（调用方回退 gpd.read_file）。
+        """
+        import xml.etree.ElementTree as ET
+
+        if not kml_file or not kml_file.exists():
+            return None
+        try:
+            text = kml_file.read_text(encoding="utf-8", errors="replace")
+            root = ET.fromstring(text)
+        except Exception:
+            return None
+
+        # 共享样式
+        shared: Dict[str, Any] = {}
+        for style in root.findall(".//{*}Style"):
+            sid = style.get("id")
+            if sid:
+                shared[sid] = style
+        stylemap_normal: Dict[str, str] = {}
+        for sm in root.findall(".//{*}StyleMap"):
+            sid = sm.get("id")
+            if not sid:
+                continue
+            for pair in sm.findall("{*}Pair"):
+                if pair.findtext("{*}key", default="") == "normal":
+                    url = pair.findtext("{*}styleUrl", default="")
+                    if url.startswith("#"):
+                        stylemap_normal[sid] = url[1:]
+
+        def _resolve_style(pm: Any) -> Dict[str, Any]:
+            el = pm.find("{*}Style")
+            if el is None:
+                url = pm.findtext("{*}styleUrl", default="")
+                ref = url[1:] if url.startswith("#") else ""
+                if ref in stylemap_normal:
+                    ref = stylemap_normal[ref]
+                el = shared.get(ref)
+            return MapInfoParser._kml_style_element_to_dict(el) if el is not None else {}
+
+        def _coords_list(coords_el: Any) -> List[Any]:
+            """<coordinates>lng,lat[,alt] lng,lat[,alt]</coordinates> → [[x, y], ...]"""
+            if coords_el is None or not coords_el.text:
+                return []
+            pts = []
+            for tok in coords_el.text.strip().split():
+                parts = tok.split(",")
+                if len(parts) >= 2:
+                    try:
+                        pts.append([float(parts[0]), float(parts[1])])
+                    except ValueError:
+                        continue
+            return pts
+
+        def _build_features(geom_el: Any, properties: Dict[str, Any]) -> List["MapInfoFeature"]:
+            """从几何元素提取要素（Point/LineString/Polygon 及 MultiGeometry 子级）。"""
+            out: List[MapInfoFeature] = []
+            tag = geom_el.tag.rsplit("}", 1)[-1] if "}" in geom_el.tag else geom_el.tag
+            if tag == "Point":
+                coords = _coords_list(geom_el.find("{*}coordinates"))
+                if coords:
+                    out.append(MapInfoFeature(str(uuid.uuid4()), GeometryType.POINT,
+                                              [coords[0][0], coords[0][1]], dict(properties)))
+            elif tag == "LineString":
+                coords = _coords_list(geom_el.find("{*}coordinates"))
+                if coords:
+                    out.append(MapInfoFeature(str(uuid.uuid4()), GeometryType.LINE,
+                                              coords, dict(properties)))
+            elif tag == "Polygon":
+                rings = []
+                ob = geom_el.find("{*}outerBoundaryIs")
+                if ob is not None:
+                    ring = _coords_list(ob.find(".//{*}coordinates"))
+                    if ring:
+                        rings.append(ring)
+                for ib in geom_el.findall("{*}innerBoundaryIs"):
+                    ring = _coords_list(ib.find(".//{*}coordinates"))
+                    if ring:
+                        rings.append(ring)
+                if rings:
+                    out.append(MapInfoFeature(str(uuid.uuid4()), GeometryType.POLYGON,
+                                              rings, dict(properties)))
+            elif tag == "MultiGeometry":
+                for child in list(geom_el):
+                    out.extend(_build_features(child, properties))
+            return out
+
+        features: List[MapInfoFeature] = []
+        for pm in root.findall(".//{*}Placemark"):
+            style_dict = _resolve_style(pm)
+            name = (pm.findtext("{*}name", default="") or "").strip()
+            desc = (pm.findtext("{*}description", default="") or "").strip()
+            props: Dict[str, Any] = {}
+            if name:
+                props["name"] = name
+            if desc:
+                props["description"] = desc
+            for data_el in pm.findall(".//{*}ExtendedData/{*}Data"):
+                key = data_el.get("name")
+                val = (data_el.findtext("{*}value", default="") or "").strip()
+                if key:
+                    props[key] = val
+            if style_dict:
+                props["_style"] = style_dict
+            geom_el = (pm.find("{*}Point") or pm.find("{*}LineString")
+                       or pm.find("{*}Polygon") or pm.find("{*}MultiGeometry"))
+            if geom_el is not None:
+                for _f in _build_features(geom_el, props):
+                    # KML 无 <Style>/<styleUrl> 的要素：按要素几何类型注入图层默认样式，
+                    # 避免无样式 KML 统一回退前端 DEFAULT_STYLES（各图层颜色不同）
+                    if "_style" not in _f.properties:
+                        _d = MapInfoParser._get_layer_default_style(kml_file.stem, _f.type)
+                        if _d:
+                            _f.properties["_style"] = _d
+                    features.append(_f)
+
+        if not features:
+            return None
+
+        return MapInfoLayer(
+            id=str(uuid.uuid4()),
+            name=kml_file.stem,
+            type=features[0].type,
+            features=features,
+            metadata={'source_file': str(kml_file), 'feature_count': len(features)},
+        )
+
+    @staticmethod
+    def _extract_tab_map_styles(map_file: Path) -> Optional[List[Optional[Dict[str, Any]]]]:
+        """解析 MapInfo .map 文件的每要素样式（Pen/Brush/Symbol），返回按要素顺序的样式列表。
+
+        .map 中每个对象恰好一组样式行（Pen/Brush/Symbol/Line/Region/Text…），
+        与 .dat 数据行一一对应。复杂对象（Line/Region）样式行后跟缩进坐标续行（忽略）。
+        以 Pen/Symbol/Line/Region/Text 等对象定义行作为新要素边界，Brush 行并入当前要素。
+        解析失败返回 None（调用方回退图层默认样式）。
+        """
+        if not map_file or not map_file.exists():
+            return None
+        try:
+            text = map_file.read_text(encoding="gbk", errors="replace")
+        except Exception:
+            return None
+
+        object_kw = ("pen", "symbol", "line", "region", "arc", "rect", "ellipse",
+                     "text", "roundedrect", "shape", "multiline", "point")
+        object_re = re.compile(r"^\s*([A-Za-z]+)\s*\(")
+
+        styles: List[Optional[Dict[str, Any]]] = []
+        cur: Optional[Dict[str, Any]] = None  # None = 尚未开始要素；空 dict = 无样式占位
+        for line in text.splitlines():
+            m = object_re.match(line)
+            if m:
+                kw = m.group(1).lower()
+                if kw in object_kw:
+                    # 新要素开始：push 上一组（空样式也占位，保证与 .dat 行序对齐）
+                    if cur is not None:
+                        styles.append(cur)
+                    parsed = MapInfoParser._parse_style_value(kw, line)
+                    cur = parsed if parsed else {}
+                elif kw == "brush" and cur is not None:
+                    parsed = MapInfoParser._parse_style_value("brush", line)
+                    if parsed:
+                        cur.update(parsed)
+                continue
+            # 非样式行（坐标续行/元数据）忽略
+        if cur is not None:
+            styles.append(cur)
+        return [s if s else None for s in styles] if styles else None
+
+    @staticmethod
+    def _extract_mif_styles(mif_file: Path) -> Optional[List[Optional[Dict[str, Any]]]]:
+        """解析 MIF 文件每要素的 Pen/Brush/Symbol 样式，返回按要素顺序的样式列表。
+
+        GDAL MIF 驱动默认不把样式暴露为属性列，因此需主动解析 .mif 文本：
+        样式行（Pen/Brush/Symbol/Rotation）出现在几何对象行（Point/Line/…）之前，
+        同一要素的样式先解析到 pending，遇到几何行时绑定为当前要素并开启下一要素。
+        解析失败返回 None（调用方回退图层默认样式）。
+        """
+        if not mif_file or not mif_file.exists():
+            return None
+        try:
+            text = mif_file.read_text(encoding="gbk", errors="replace")
+        except Exception:
+            return None
+
+        geom_kw = re.compile(
+            r"^\s*(Point|Line|Polyline|Region|Arc|Ellipse|Rect|RoundedRect|Text|MultiPoint|MultiLine|Font)\s*",
+            re.IGNORECASE,
+        )
+        style_re = re.compile(r"^\s*(Pen|Brush|Symbol)\s*\(", re.IGNORECASE)
+
+        styles: List[Optional[Dict[str, Any]]] = []
+        pending: Optional[Dict[str, Any]] = None
+        in_data = False
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not in_data:
+                if stripped.upper().startswith("DATA"):
+                    in_data = True
+                continue
+            sm = style_re.match(line)
+            if sm:
+                kw = sm.group(1).lower()
+                parsed = MapInfoParser._parse_style_value(kw, line)
+                if pending is None:
+                    pending = {}
+                if parsed:
+                    pending.update(parsed)
+                continue
+            if geom_kw.match(line):
+                # 几何对象行：绑定当前样式为要素，开启下一要素
+                styles.append(pending if pending else None)
+                pending = None
+                continue
+            # 坐标续行/注释忽略
+        if pending is not None:
+            styles.append(pending if pending else None)
+        return styles if styles else None
 
     @staticmethod
     def _normalize_tab_charset(tab_file: Optional[Path]) -> None:
@@ -551,13 +924,15 @@ class MapInfoParser:
                 }
 
         if not style:
-            # 根据几何类型返回默认样式
+            # 无命名规则命中：按图层名取稳定配色，不同图层初次导入即有各自的
+            # 默认颜色/透明度/大小（不再全部回退同一组颜色）
+            c = _palette_color(layer_name)
             if geom_type == GeometryType.POINT:
-                style = {'type': 'circle', 'color': '#3b82f6', 'radius': 6}
+                style = {'markerColor': c, 'color': c, 'markerSize': 8}
             elif geom_type == GeometryType.LINE:
-                style = {'type': 'polyline', 'color': '#10b981', 'weight': 2}
+                style = {'strokeColor': c, 'strokeWidth': 2, 'opacity': 0.9}
             elif geom_type == GeometryType.POLYGON:
-                style = {'type': 'polygon', 'color': '#f59e0b', 'fillColor': '#f59e0b', 'fillOpacity': 0.3}
+                style = {'fillColor': c, 'strokeColor': c, 'strokeWidth': 1.5, 'fillOpacity': 0.35}
 
         return style
 
@@ -610,6 +985,23 @@ class MapInfoParser:
                 except Exception as e2:
                     raise e2
 
+            # 解析文件自带的默认样式（按 gdf 行序对齐）：
+            #   TAB → 同名 .map 文件；KML → <Style>/<styleUrl>；MIF → GDAL MAPINFO_* 列或 .mif 文本
+            ext_lower = file_path.suffix.lower()
+            # KML：优先自研 XML 解析（完整保留混合几何 + 样式，比 GDAL 驱动快且不丢要素）
+            if ext_lower == '.kml':
+                direct = MapInfoParser._parse_kml_direct(file_path)
+                if direct is not None:
+                    return direct
+            file_styles = None  # List[Optional[Dict]]，索引 = gdf 行号
+            if ext_lower == '.kml':
+                file_styles = MapInfoParser._parse_kml_styles(file_path)
+            elif ext_lower == '.tab' and tab_file and tab_file.exists():
+                map_file = tab_file.with_suffix('.map')
+                file_styles = MapInfoParser._extract_tab_map_styles(map_file)
+            elif ext_lower == '.mif':
+                file_styles = MapInfoParser._extract_mif_styles(file_path)
+
             features = []
             layer_type = GeometryType.UNKNOWN
 
@@ -635,6 +1027,9 @@ class MapInfoParser:
             # 获取图层级别的默认样式
             layer_default_style = MapInfoParser._get_layer_default_style(layer_name, layer_type)
 
+            # 检测 RSRP 类信号强度字段（SSRSRP/RSRP/电平/信号强度）：无文件自带样式时
+            # 按标准 RSRP 色阶逐要素分级上色（还原 MapInfo 按字段值主题渲染的效果）
+
             # 调试：输出所有列名
 
             # 遍历要素
@@ -643,6 +1038,7 @@ class MapInfoParser:
             records = gdf.to_dict('records')
             geoms = gdf.geometry
             columns = gdf.columns
+            signal_col = _detect_rsrp_column(columns)
 
             # 预计算样式列集合（列名固定，正则只执行一遍，避免逐 feature re.search）
             import re as _re
@@ -675,8 +1071,28 @@ class MapInfoParser:
                     if hasattr(v, 'isoformat'):
                         properties[k] = v.isoformat()
 
-                # 提取 MapInfo 样式信息（传入预计算样式列）
+                # 提取 MapInfo 样式信息（传入预计算样式列，MIF 的 GDAL MAPINFO_* 列走这里）
                 style_info = MapInfoParser._extract_mapinfo_style(properties, columns, layer_type, style_cols)
+
+                # 文件自带样式（TAB .map / KML <Style>）优先于 GDAL 列推断，按 gdf 行序对齐
+                if not style_info and file_styles and idx < len(file_styles) and file_styles[idx]:
+                    style_info = dict(file_styles[idx])
+
+                # 信号强度分级着色（无文件自带样式时）：按 SSRSRP/RSRP 值取色
+                if not style_info and signal_col is not None:
+                    _sv = properties.get(signal_col)
+                    try:
+                        _sv_f = float(_sv)
+                    except (TypeError, ValueError):
+                        _sv_f = None
+                    if _sv_f is not None:
+                        _c = _rsrp_color(_sv_f)
+                        if layer_type == GeometryType.POINT:
+                            style_info = {'markerColor': _c, 'color': _c}
+                        elif layer_type == GeometryType.LINE:
+                            style_info = {'strokeColor': _c}
+                        else:
+                            style_info = {'fillColor': _c, 'strokeColor': _c, 'fillOpacity': 0.5}
 
                 # 如果没有样式信息，使用图层默认样式
                 if not style_info and layer_default_style:
@@ -752,6 +1168,7 @@ class MapInfoParser:
         支持的文件格式：
         - .tab 文件（MapInfo TAB 格式）
         - .mif 文件（MapInfo MIF 格式）
+        - .kml 文件（Keyhole Markup Language，自包含无需配套）
 
         使用 geopandas 统一解析所有格式
         """
@@ -816,6 +1233,33 @@ class MapInfoParser:
                     "error": f"{type(e).__name__}: {str(e)[:300]}",
                 })
 
+        # 最后查找 .kml 文件（自包含，无需去重/配套检查）
+        kml_files = sorted([f for f in dir_path.rglob("*") if f.suffix.lower() == '.kml' and f.is_file()])
+        for kml_file in kml_files:
+            if kml_file.stem.lower() in processed_files:
+                continue
+            try:
+                print(f"[MapInfoParser] 解析 KML 文件: {kml_file.name}")
+                layer = MapInfoParser.parse_file(kml_file)
+                layers.append(layer)
+                processed_files.add(kml_file.stem.lower())
+            except ImportError as e:
+                print(f"[MapInfoParser] ❌ 缺少必要的库: {e}")
+                print(f"[MapInfoParser] 提示: 请运行 'pip install geopandas shapely' 安装依赖")
+                _LAST_PARSE_ERRORS.append({
+                    "file": kml_file.name,
+                    "error": f"缺少依赖: {str(e)[:200]}",
+                })
+                break
+            except Exception as e:
+                print(f"[MapInfoParser] 解析 KML 文件失败 {kml_file.name}: {e}")
+                import traceback
+                traceback.print_exc()
+                _LAST_PARSE_ERRORS.append({
+                    "file": kml_file.name,
+                    "error": f"{type(e).__name__}: {str(e)[:300]}",
+                })
+
         print(f"[MapInfoParser] 目录解析完成，共解析 {len(layers)} 个图层")
         return layers
 
@@ -846,6 +1290,14 @@ def parse_mapinfo_files(upload_path: Path, user_id: int = 1, parent_id: str = No
 
     layers = []
 
+    def _default_style(layer: MapInfoLayer) -> Optional[Dict[str, Any]]:
+        """图层默认样式：取首要素的文件自带样式（_style），否则按图层名+几何类型推断。"""
+        for f in layer.features:
+            st = f.properties.get('_style')
+            if st:
+                return dict(st)
+        return MapInfoParser._get_layer_default_style(layer.name, layer.type)
+
     if upload_path.is_file():
         # 单个文件
         try:
@@ -855,7 +1307,8 @@ def parse_mapinfo_files(upload_path: Path, user_id: int = 1, parent_id: str = No
                 "name": layer.name,
                 "type": layer.type.value,
                 "feature_count": len(layer.features),
-                "metadata": layer.metadata
+                "metadata": layer.metadata,
+                "defaultStyle": _default_style(layer),
             })
             _save_layer_metadata(
                 user_id=user_id,
@@ -879,7 +1332,8 @@ def parse_mapinfo_files(upload_path: Path, user_id: int = 1, parent_id: str = No
                 "name": layer.name,
                 "type": layer.type.value,
                 "feature_count": len(layer.features),
-                "metadata": layer.metadata
+                "metadata": layer.metadata,
+                "defaultStyle": _default_style(layer),
             })
             # 使用 parent_id；多个图层时追加序号
             _layer_id = parent_id if idx == 0 and parent_id else (f"{parent_id}_{idx}" if parent_id else None)
@@ -990,7 +1444,7 @@ def get_layer_data(data_id: str, layer_id: str, data_dir: Path) -> Optional[Dict
         if source_path is None:
             name = target_layer_info.get('name')
             if name:
-                for ext in ['.tab', '.mif']:
+                for ext in ['.tab', '.mif', '.kml']:
                     candidate = data_dir / f"{name}{ext}"
                     if candidate.exists():
                         source_path = candidate
@@ -1010,13 +1464,13 @@ def get_layer_data(data_id: str, layer_id: str, data_dir: Path) -> Optional[Dict
     # 避免每次请求都重新 parse+convert（18000 polygon 需 ~20s，会触发 Cloudflare 524 / axios 超时）
     disk_cache = None
     if source_path:
-        disk_cache_path = data_dir / ".cache" / f"{layer_id}.geojson"
+        disk_cache_path = data_dir / ".cache" / "v2" / f"{layer_id}.geojson"
         try:
             current_mtime = source_path.stat().st_mtime
             if disk_cache_path.exists():
                 cache_mtime = disk_cache_path.stat().st_mtime
                 # 源文件 mtime 和缓存 mtime 都记录在文件名后缀：{layer_id}.geojson.{mtime}
-                disk_cache_mtime_file = data_dir / ".cache" / f"{layer_id}.mtime"
+                disk_cache_mtime_file = data_dir / ".cache" / "v2" / f"{layer_id}.mtime"
                 if disk_cache_mtime_file.exists():
                     saved_mtime = float(disk_cache_mtime_file.read_text().strip())
                     if saved_mtime == current_mtime:
@@ -1033,10 +1487,12 @@ def get_layer_data(data_id: str, layer_id: str, data_dir: Path) -> Optional[Dict
         # 🔧 幂等补齐 gz 预压缩缓存：磁盘缓存命中路径不重建 gz 的话，
         # 一次 gz 写失败会永久回退常规路径（性能优化失效），这里检测缺失即生成
         try:
-            gz_path = data_dir / ".cache" / f"{layer_id}.geojson.gz"
+            gz_path = data_dir / ".cache" / "v2" / f"{layer_id}.geojson.gz"
             if not gz_path.exists():
-                with gzip.open(gz_path, 'wt', encoding='utf-8', compresslevel=9) as f:
+                gz_tmp = data_dir / ".cache" / "v2" / f"{layer_id}.geojson.gz.tmp"
+                with gzip.open(gz_tmp, 'wt', encoding='utf-8', compresslevel=9) as f:
                     json.dump({"success": True, "data": disk_cache}, f, ensure_ascii=False)
+                gz_tmp.replace(gz_path)  # 原子替换，读者不会读到半成品
         except Exception as e:
             print(f"[MapInfo] 补写 gz 缓存失败: {e}")
         return disk_cache
@@ -1057,7 +1513,7 @@ def get_layer_data(data_id: str, layer_id: str, data_dir: Path) -> Optional[Dict
     # 5. 回退：遍历目录
     if result is None:
         print(f"[MapInfo] 未在 layers.json 中找到图层 {layer_id}，尝试遍历目录")
-        for file_path in list(data_dir.rglob('*.tab')) + list(data_dir.rglob('*.mif')):
+        for file_path in list(data_dir.rglob('*.tab')) + list(data_dir.rglob('*.mif')) + list(data_dir.rglob('*.kml')):
             try:
                 layer = MapInfoParser.parse_file(file_path)
                 result = _convert_to_geojson(layer)
@@ -1074,23 +1530,25 @@ def get_layer_data(data_id: str, layer_id: str, data_dir: Path) -> Optional[Dict
 
             # 落盘缓存：后续请求直接读文件，避免重复 parse+convert
             try:
-                cache_dir = data_dir / ".cache"
+                cache_dir = data_dir / ".cache" / "v2"
                 cache_dir.mkdir(parents=True, exist_ok=True)
                 disk_cache_path = cache_dir / f"{layer_id}.geojson"
                 with open(disk_cache_path, 'w', encoding='utf-8') as f:
                     json.dump(result, f, ensure_ascii=False)
-                with open(cache_dir / f"{layer_id}.mtime", 'w', encoding='utf-8') as f:
-                    f.write(str(source_path.stat().st_mtime))
-                # 🔧 预压缩缓存：同时写 .geojson.gz，端点命中时直接返回 gz 字节，
-                # 跳过每请求的 json.dumps + gzip（大数据层可省 ~5s）。
-                # 必须压缩【包装后的 dict】{"success": True, "data": geojson}，
+                # 🔧 预压缩缓存：先原子写完 .geojson.gz，最后才写 .mtime（mtime 是
+                # "提交标记"——并发请求只有看到 mtime 才会用 gz，先写 gz 保证不会
+                # 读到半成品；且必须压缩【包装后的 dict】{"success": True, "data": geojson}，
                 # 与常规路径响应同形状，否则前端 response.success 判定失败导致图层无法加载。
                 try:
                     gz_path = cache_dir / f"{layer_id}.geojson.gz"
-                    with gzip.open(gz_path, 'wt', encoding='utf-8', compresslevel=9) as f:
+                    gz_tmp = cache_dir / f"{layer_id}.geojson.gz.tmp"
+                    with gzip.open(gz_tmp, 'wt', encoding='utf-8', compresslevel=9) as f:
                         json.dump({"success": True, "data": result}, f, ensure_ascii=False)
+                    gz_tmp.replace(gz_path)  # 原子替换
                 except Exception as e:
                     print(f"[MapInfo] 写 gz 缓存失败: {e}")
+                with open(cache_dir / f"{layer_id}.mtime", 'w', encoding='utf-8') as f:
+                    f.write(str(source_path.stat().st_mtime))
             except Exception as e:
                 print(f"[MapInfo] 写落盘缓存失败: {e}")
         except Exception:
@@ -1125,7 +1583,7 @@ def get_layer_data_gz_bytes(data_id: str, layer_id: str, data_dir: Path) -> Opti
                         if source_path is None:
                             name = layer.get('name')
                             if name:
-                                for ext in ['.tab', '.mif']:
+                                for ext in ['.tab', '.mif', '.kml']:
                                     candidate = data_dir / f"{name}{ext}"
                                     if candidate.exists():
                                         source_path = candidate
@@ -1134,7 +1592,7 @@ def get_layer_data_gz_bytes(data_id: str, layer_id: str, data_dir: Path) -> Opti
         except Exception:
             pass
 
-    cache_dir = data_dir / ".cache"
+    cache_dir = data_dir / ".cache" / "v2"
     gz_path = cache_dir / f"{layer_id}.geojson.gz"
     mtime_file = cache_dir / f"{layer_id}.mtime"
 
@@ -1151,6 +1609,17 @@ def get_layer_data_gz_bytes(data_id: str, layer_id: str, data_dir: Path) -> Opti
     result = get_layer_data(data_id, layer_id, data_dir)
     if result is None:
         return None
+    # 数据已就绪但 gz 文件仍缺失（并发请求抢在预热写 gz 完成前命中内存缓存时，
+    # get_layer_data 内存命中早退不会落盘）：现场压缩补写，避免回退到 42.8MB
+    # 原始 JSON 走 Cloudflare 慢速链路导致前端 600s 超时。
+    if not gz_path.exists():
+        try:
+            gz_tmp = cache_dir / f"{layer_id}.geojson.gz.tmp"
+            with gzip.open(gz_tmp, 'wt', encoding='utf-8', compresslevel=6) as f:
+                json.dump({"success": True, "data": result}, f, ensure_ascii=False)
+            gz_tmp.replace(gz_path)  # 原子替换，读者不会读到半成品
+        except Exception as e:
+            print(f"[MapInfo] 现场补写 gz 缓存失败: {e}")
     try:
         if gz_path.exists():
             with open(gz_path, 'rb') as f:

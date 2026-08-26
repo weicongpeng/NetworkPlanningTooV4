@@ -295,7 +295,8 @@ export function useFeatureInfoPanel() {
         setFeatureTitle(title || '要素属性')
         setFeatureProperties(properties)
         setFeaturePanelVisible(true)
-        if (event) {
+        // 防御：Canvas 渲染的点击事件 originalEvent 可能缺失，缺失时使用默认位置，避免抛错导致面板不显示
+        if (event && event.originalEvent) {
             setFeatureClickPosition({ x: event.originalEvent.clientX, y: event.originalEvent.clientY })
         }
     }, [])

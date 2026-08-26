@@ -11,8 +11,11 @@ import re
 from pathlib import Path
 from typing import List, Optional
 
+import numpy as np
 import pandas as pd
 import geopandas as gpd
+import pyogrio
+from shapely import wkb
 from shapely.geometry import Point, Polygon
 
 # 输出格式 → pyogrio driver 名
@@ -381,16 +384,65 @@ class LayerService:
         fname = f"{base}_{safe_sheet}{type_tag}{EXT_MAP[output_format]}"
         out_path = self._unique_path(self.output_dir / fname)
         if output_format in ("tab", "mif"):
-            # 重命名中文列为 ASCII 占位名 → GBK 写入 → 恢复（清洗字段名：空格→下划线，去重）
+            # 中文字段名 GDAL MapInfo 驱动会打成 '_'，故写前用 f0..fN ASCII 占位名，写后恢复。
+            # 关键：字符串列按实际 GBK 字节长度转 U{width} 再写，否则 GDAL 把每个字符串列
+            # 都写成 Char(254)（MapInfo 最大宽度），导致 .dat/.mid 体积放大 20-70 倍。
             orig_cols = list(gdf.columns)
             sanitized_cols = _dedupe_field_names([_sanitize_field_name(c) for c in orig_cols])
-            rename = {c: f"f{i}" for i, c in enumerate(orig_cols)}
-            gdf_ascii = gdf.rename(columns=rename)
-            gdf_ascii.to_file(out_path, driver=DRIVER_MAP[output_format], encoding="GBK")
+            geom_name = gdf.geometry.name
+            attr_cols = [c for c in orig_cols if c != geom_name]
+            field_names = [f"f{i}" for i in range(len(attr_cols))]
+            field_data = self._build_field_data(gdf, attr_cols)
+            geoms_wkb = [wkb.dumps(g) for g in gdf.geometry]
+            geom_type = gdf.geometry.geom_type.iloc[0]
+            pyogrio.raw.write(
+                str(out_path),
+                geometry=geoms_wkb,
+                field_data=field_data,
+                fields=field_names,
+                geometry_type=geom_type,
+                crs="EPSG:4326",
+                driver=DRIVER_MAP[output_format],
+                encoding="GBK",
+            )
             self._mapinfo_postprocess(out_path, output_format, sanitized_cols)
         else:
             gdf.to_file(out_path, driver=DRIVER_MAP[output_format])
         return out_path
+
+    def _build_field_data(self, gdf: gpd.GeoDataFrame, attr_cols: List[str]) -> list:
+        """属性列 → pyogrio.raw.write 的 field_data。
+
+        字符串/日期/布尔列转定宽 U{GBK字节长}（GDAL 据此写 Char(字节宽)，而非 Char(254)）；
+        数值列保持 int64/float64（→ LargeInt/Float，无宽度膨胀）。
+        """
+        field_data = []
+        for col in attr_cols:
+            s = gdf[col]
+            if pd.api.types.is_datetime64_any_dtype(s.dtype):
+                vals = s.dt.strftime("%Y-%m-%d %H:%M:%S").fillna("")
+                field_data.append(self._to_u_array(vals))
+            elif pd.api.types.is_bool_dtype(s.dtype):
+                field_data.append(self._to_u_array(s.astype(str)))
+            elif pd.api.types.is_integer_dtype(s.dtype):
+                field_data.append(s.fillna(0).astype("int64").to_numpy())
+            elif pd.api.types.is_float_dtype(s.dtype):
+                field_data.append(s.to_numpy(dtype="float64"))
+            else:
+                field_data.append(self._to_u_array(s.fillna("").astype(str)))
+        return field_data
+
+    @staticmethod
+    def _to_u_array(vals: pd.Series) -> np.ndarray:
+        """字符串列 → numpy U{width}，width = 最大 GBK 字节长度（上限 254，至少 1）。
+
+        U{width} 为字符宽、MapInfo Char(width) 为字节宽；因字节宽 ≥ 字符宽，
+        取字节长作 U 宽度可保证中文不截断且字段宽恰好容纳实际内容。
+        """
+        lst = vals.astype(str).tolist()
+        maxbytes = max((len(v.encode("gbk")) for v in lst), default=1)
+        width = max(1, min(254, maxbytes))
+        return np.array(lst, dtype=f"U{width}")
 
     def _apply_style(self, out_path: Path, output_format: str,
                      border_color: Optional[str], fill_color: Optional[str],

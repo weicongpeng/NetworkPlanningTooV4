@@ -161,6 +161,15 @@ async def lifespan(app: FastAPI):
         logger.warning(f"⚠️ ProcessPoolExecutor 创建失败: {e}，将使用线程池")
         pool = None
 
+    # 🔥 启动时后台预热所有 MapInfo 图层的 GeoJSON 缓存
+    # 解决"首次勾选图层时后端 parse+转换耗时过长导致前端 300s 超时"：
+    # 现有数据在启动时即预热磁盘缓存，后续勾选图层请求直接命中缓存
+    try:
+        from app.services.data_service import data_service
+        data_service.prewarm_all_map_caches()
+    except Exception as e:
+        logger.error(f"❌ 启动预热图层缓存失败: {e}")
+
     logger.info("应用启动完成")
     yield
 

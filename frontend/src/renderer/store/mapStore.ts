@@ -1,6 +1,6 @@
 import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
-import { LabelSettings } from '../components/Map/LabelSettingsModal'
+import { LabelSettings, LayerColorSettings, ThematicSettings, ThematicTemplate } from '../components/Map/LabelSettingsModal'
 import { userSettingsApi } from '../services/api'
 
 /**
@@ -36,6 +36,14 @@ export interface UserMapSettings {
   mapType: 'roadmap' | 'satellite'
   // 标签设置（按图层ID）
   labelSettingsMap: Record<string, LabelSettings>
+  // 图层颜色设置（按图层ID）
+  colorSettingsMap: Record<string, LayerColorSettings>
+  // 专题图层设置（按图层ID）
+  thematicSettingsMap: Record<string, ThematicSettings>
+  // 专题区间配色模板列表
+  thematicTemplates: ThematicTemplate[]
+  // 频点自定义配色（key: `${networkType}:${frequency}`）
+  frequencyCustomColors: Record<string, { color: string; strokeColor: string }>
   // 已加载的数据源ID列表
   loadedWorkbookIds: string[]
   loadedGeoDataIds: string[]
@@ -56,6 +64,10 @@ const DEFAULT_MAP_SETTINGS: UserMapSettings = {
   layerFileLabelVisibility: {},
   mapType: 'roadmap',
   labelSettingsMap: {},
+  colorSettingsMap: {},
+  thematicSettingsMap: {},
+  thematicTemplates: [],
+  frequencyCustomColors: {},
   loadedWorkbookIds: [],
   loadedGeoDataIds: [],
   loadedLayerIds: [],
@@ -85,6 +97,10 @@ interface MapState {
   setLayerFileLabelVisibility: (fileId: string, visible: boolean) => void
   setMapType: (type: 'roadmap' | 'satellite') => void
   setLabelSettings: (layerId: string, settings: LabelSettings) => void
+  setColorSettings: (layerId: string, settings: LayerColorSettings | null) => void
+  setThematicSettings: (layerId: string, settings: ThematicSettings | null) => void
+  setThematicTemplates: (templates: ThematicTemplate[]) => void
+  setFrequencyCustomColors: (colors: Record<string, { color: string; strokeColor: string }>) => void
   setLoadedWorkbookIds: (ids: string[]) => void
   setLoadedGeoDataIds: (ids: string[]) => void
   setLoadedLayerIds: (ids: string[]) => void
@@ -245,6 +261,50 @@ export const useMapStore = create<MapState>()(
         scheduleBackendSync(get())
       },
 
+      setColorSettings: (layerId, settings) => {
+        set((state) => {
+          const next = { ...state.mapSettings.colorSettingsMap }
+          if (settings === null) {
+            delete next[layerId]
+          } else {
+            next[layerId] = settings
+          }
+          return {
+            mapSettings: { ...state.mapSettings, colorSettingsMap: next },
+          }
+        })
+        scheduleBackendSync(get())
+      },
+
+      setThematicSettings: (layerId, settings) => {
+        set((state) => {
+          const next = { ...state.mapSettings.thematicSettingsMap }
+          if (settings === null) {
+            delete next[layerId]
+          } else {
+            next[layerId] = settings
+          }
+          return {
+            mapSettings: { ...state.mapSettings, thematicSettingsMap: next },
+          }
+        })
+        scheduleBackendSync(get())
+      },
+
+      setThematicTemplates: (templates) => {
+        set((state) => ({
+          mapSettings: { ...state.mapSettings, thematicTemplates: templates },
+        }))
+        scheduleBackendSync(get())
+      },
+
+      setFrequencyCustomColors: (colors) => {
+        set((state) => ({
+          mapSettings: { ...state.mapSettings, frequencyCustomColors: colors },
+        }))
+        scheduleBackendSync(get())
+      },
+
       setLoadedWorkbookIds: (ids) => {
         set((state) => ({
           mapSettings: { ...state.mapSettings, loadedWorkbookIds: ids },
@@ -320,8 +380,31 @@ export const useMapStore = create<MapState>()(
           loadedGeoDataIds: state.mapSettings.loadedGeoDataIds,
           loadedLayerIds: state.mapSettings.loadedLayerIds,
           labelSettingsMap: state.mapSettings.labelSettingsMap,
+          colorSettingsMap: state.mapSettings.colorSettingsMap,
+          thematicSettingsMap: state.mapSettings.thematicSettingsMap,
+          thematicTemplates: state.mapSettings.thematicTemplates,
+          frequencyCustomColors: state.mapSettings.frequencyCustomColors,
         },
       }),
+      // 兼容旧版本持久化数据：rehydrate 时保证新增字段始终存在，
+      // 否则旧 localStorage 中缺 key 的 mapSettings 会整体覆盖默认值，导致 colorSettingsMap 为 undefined
+      merge: (persistedState, currentState) => {
+        const persisted = persistedState as Partial<MapState> | undefined
+        const persistedSettings = persisted?.mapSettings
+        return {
+          ...currentState,
+          ...persisted,
+          mapSettings: {
+            ...currentState.mapSettings,
+            ...persistedSettings,
+            colorSettingsMap: persistedSettings?.colorSettingsMap ?? {},
+            labelSettingsMap: persistedSettings?.labelSettingsMap ?? {},
+            thematicSettingsMap: persistedSettings?.thematicSettingsMap ?? {},
+            thematicTemplates: persistedSettings?.thematicTemplates ?? [],
+            frequencyCustomColors: persistedSettings?.frequencyCustomColors ?? {},
+          },
+        }
+      },
     }
   )
 )
@@ -354,8 +437,20 @@ export async function reloadUserMapSettings(): Promise<void> {
   const loaded = await state._syncFromBackend()
 
   if (!loaded) {
-    // 后端没有设置，重置为默认（新用户）
-    state.resetMapSettings()
+    // 后端无该用户设置。仅当 localStorage 也无该用户数据时才重置为默认，
+    // 否则保留本地已持久化的设置，避免刷新/后端同步尚未完成时误清空用户配置。
+    const key = getStorageKey()
+    let hasLocalSettings = false
+    try {
+      const raw = localStorage.getItem(key)
+      if (raw) {
+        const parsed = JSON.parse(raw)
+        hasLocalSettings = !!parsed?.state?.mapSettings
+      }
+    } catch { /* ignore */ }
+    if (!hasLocalSettings) {
+      state.resetMapSettings()
+    }
   }
 }
 

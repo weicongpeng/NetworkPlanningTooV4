@@ -14,6 +14,8 @@ import L from 'leaflet'
 import { RenderSectorData } from '../../services/mapDataService'
 import { SECTOR_CONFIG, getCellCoverStyle, getSectorColor } from '../../config/sector-config'
 import { tacColorMapper } from '../../utils/tacColors'
+import { matchThematicColor, matchRangeIndex, getFieldValue } from '../../utils/fieldValue'
+import type { ThematicSettings } from './LabelSettingsModal'
 import type { NetworkType } from '../../config/sector-config'
 
 /**
@@ -142,6 +144,15 @@ export class SectorSVGLayer extends L.Layer {
     color: '#000000',
     fontSize: 12
   }
+
+  // 默认设置覆盖（图形透明度/边框宽度；仅默认频点配色模式生效）
+  private colorOverrides: { fillOpacity: number; borderWidth: number } | null = null
+
+  // 专题图层设置（启用时优先于频点配色）
+  private thematicSettings: ThematicSettings | null = null
+
+  // 专题图例统计（区间/属性值/文本的要素数与总数）
+  private thematicStats: { counts: number[]; total: number; other: number } | null = null
 
   // 扇区多边形映射（带缓存时间戳）
   private sectorPolygons = new Map<string, {
@@ -691,13 +702,12 @@ export class SectorSVGLayer extends L.Layer {
         })
         if (layer.bringToFront) layer.bringToFront()
       } else {
-        const config = SECTOR_CONFIG[sector.networkType]
-        const colors = getSectorColor(sector)
+        const base = this._sectorBaseStyle(sector)
         layer.setStyle({
-          fillColor: colors.fillColor,
-          color: config.strokeColor || '#000000',
-          weight: config.strokeWidth || 0.5,
-          fillOpacity: config.opacity
+          fillColor: base.fillColor,
+          color: base.strokeColor,
+          weight: base.strokeWidth,
+          fillOpacity: base.fillOpacity
         })
       }
     }
@@ -715,12 +725,12 @@ export class SectorSVGLayer extends L.Layer {
         })
         if (layer.bringToFront) layer.bringToFront()
       } else {
-        const colors = getSectorColor(sector)
+        const base = this._sectorBaseStyle(sector, 'marker')
         layer.setStyle({
-          fillColor: colors.fillColor,
-          color: colors.strokeColor,
-          weight: 1,
-          fillOpacity: 0.8
+          fillColor: base.fillColor,
+          color: base.strokeColor,
+          weight: base.strokeWidth,
+          fillOpacity: base.fillOpacity
         })
       }
     }
@@ -813,13 +823,12 @@ export class SectorSVGLayer extends L.Layer {
       sectorName: sector.name
     })
 
-    const colors = getSectorColor(sector)
-    const config = SECTOR_CONFIG[sector.networkType]
+    const base = this._sectorBaseStyle(sector)
 
     // 检查是否选中
-    let strokeColor = config.strokeColor || '#000000'
-    let strokeWidth = config.strokeWidth || 0.5
-    let fillOpacity = config.opacity
+    let strokeColor = base.strokeColor
+    let strokeWidth = base.strokeWidth
+    let fillOpacity = base.fillOpacity
 
     if (this.selectionHighlightIds && this.selectionHighlightIds.size > 0) {
       const sectorId = String(sector.id)
@@ -839,7 +848,7 @@ export class SectorSVGLayer extends L.Layer {
       color: strokeColor,
       weight: strokeWidth,
       opacity: 1,
-      fillColor: colors.fillColor,
+      fillColor: base.fillColor,
       fillOpacity: fillOpacity,
       className: 'sector-polygon',
       smoothFactor: 0.1,
@@ -850,6 +859,150 @@ export class SectorSVGLayer extends L.Layer {
       ; (polygon as any).sectorData = sector
 
     return polygon
+  }
+
+  /**
+   * 计算扇区基础样式（专题配色优先、默认频点配色次之，再叠加默认设置覆盖的透明度/边框宽度）
+   * @param sector 扇区数据
+   * @param kind 渲染形态：'polygon' 使用 SECTOR_CONFIG 默认边框/透明度；'marker' 使用站点圆点默认
+   * @returns 基础样式
+   */
+  private _sectorBaseStyle(
+    sector: RenderSectorData,
+    kind: 'polygon' | 'marker' = 'polygon'
+  ): { fillColor: string; strokeColor: string; strokeWidth: number; fillOpacity: number } {
+    const colors = getSectorColor(sector)
+    const config = SECTOR_CONFIG[sector.networkType]
+
+    // 专题配色优先（启用且字段有效时）
+    let fillColor = colors.fillColor
+    if (this.thematicSettings?.enabled && this.thematicSettings.field) {
+      const thematicColor = matchThematicColor(
+        this.thematicSettings,
+        getFieldValue(sector as unknown as Record<string, any>, this.thematicSettings.field)
+      )
+      if (thematicColor) fillColor = thematicColor
+    }
+
+    let strokeColor: string
+    let strokeWidth: number
+    let fillOpacity: number
+    if (kind === 'marker') {
+      strokeColor = colors.strokeColor
+      strokeWidth = 1
+      fillOpacity = 0.8
+    } else {
+      strokeColor = config.strokeColor || '#000000'
+      strokeWidth = config.strokeWidth || 0.5
+      fillOpacity = config.opacity
+    }
+
+    // 默认设置覆盖（图形透明度/边框宽度）
+    if (this.colorOverrides) {
+      if (typeof this.colorOverrides.fillOpacity === 'number') fillOpacity = this.colorOverrides.fillOpacity
+      if (typeof this.colorOverrides.borderWidth === 'number') strokeWidth = this.colorOverrides.borderWidth
+    }
+
+    return { fillColor, strokeColor, strokeWidth, fillOpacity }
+  }
+
+  /**
+   * 设置默认设置覆盖（图形透明度/边框宽度；null 恢复 SECTOR_CONFIG 默认）
+   * 仅默认频点配色模式生效；专题启用时透明度/边框宽仍叠加（与图层文件一致）
+   */
+  setColorOverrides(settings: { fillOpacity: number; borderWidth: number } | null): void {
+    this.colorOverrides = settings
+    // _render 负责新增视口内缺失的扇区，_updateSectorStyles 负责重绘已缓存的扇区
+    this._render()
+    this._updateSectorStyles()
+  }
+
+  /**
+   * 设置专题图层覆盖（启用时优先于频点配色；null 关闭专题后回退到频点配色）
+   */
+  setThematicOverrides(settings: ThematicSettings | null): void {
+    this.thematicSettings = settings
+    this.computeThematicStats()
+    // _render 负责新增视口内缺失的扇区，_updateSectorStyles 负责重绘已缓存的扇区
+    this._render()
+    this._updateSectorStyles()
+  }
+
+  /**
+   * 重新渲染全部已渲染扇区（频点自定义配色等颜色变化后调用）
+   */
+  redraw(): void {
+    this._render()
+    this._updateSectorStyles()
+  }
+
+  /**
+   * 计算专题图例统计（各配色模式的扇区数与总数，供图例展示）
+   */
+  private computeThematicStats(): void {
+    const ts = this.thematicSettings
+    if (!ts?.enabled || this.sectors.length === 0) {
+      this.thematicStats = null
+      return
+    }
+    const isRange = ts.fieldType === 'numeric' && ts.colorMode !== 'value' && ts.ranges.length > 0
+    const isValue = ts.fieldType === 'numeric' && ts.colorMode === 'value' && (ts.valueColors?.length ?? 0) > 0
+    const isText = ts.fieldType === 'text' && ts.categories.length > 0
+    if (!isRange && !isValue && !isText) {
+      this.thematicStats = null
+      return
+    }
+    const counts = new Array(
+      isRange ? ts.ranges.length : isValue ? ts.valueColors!.length : ts.categories.length
+    ).fill(0)
+    let total = 0
+    let other = 0
+    const valueIndex = isValue ? new Map(ts.valueColors!.map((c, i) => [c.value, i])) : null
+    const otherIdx = isText ? ts.categories.findIndex(c => c.value === '__other__') : -1
+    const categoryIndex = isText ? new Map(ts.categories.map((c, i) => [c.value, i])) : null
+    for (const sector of this.sectors) {
+      const raw = getFieldValue(sector as unknown as Record<string, any>, ts.field)
+      if (isRange) {
+        total++
+        const idx = matchRangeIndex(ts, raw)
+        if (idx >= 0) counts[idx]++; else other++
+      } else if (isValue) {
+        total++
+        if (raw === undefined || raw === null || raw === '') { other++; continue }
+        const idx = valueIndex!.get(String(raw))
+        if (idx !== undefined) counts[idx]++; else other++
+      } else {
+        total++
+        if (raw === undefined || raw === null || raw === '') { if (otherIdx >= 0) counts[otherIdx]++; else other++; continue }
+        const idx = categoryIndex!.get(String(raw))
+        if (idx !== undefined) counts[idx]++
+        else if (otherIdx >= 0) counts[otherIdx]++
+        else other++
+      }
+    }
+    this.thematicStats = { counts, total, other }
+  }
+
+  /**
+   * 获取专题图例统计（图例显示每个区间的个数与占比；other = 未匹配的扇区数）
+   */
+  getThematicStats(): { counts: number[]; total: number; other: number } | null {
+    return this.thematicStats
+  }
+
+  /**
+   * 获取该图层全部扇区的地理范围（图层预览：居中最大化显示）
+   * @returns LatLngBounds；无扇区/无有效坐标返回 null
+   */
+  getSectorBounds(): L.LatLngBounds | null {
+    const bounds = L.latLngBounds([])
+    let has = false
+    for (const sector of this.sectors) {
+      if (typeof sector.displayLat !== 'number' || typeof sector.displayLng !== 'number') continue
+      bounds.extend([sector.displayLat, sector.displayLng])
+      has = true
+    }
+    return has ? bounds : null
   }
 
   /**
@@ -1300,9 +1453,8 @@ export class SectorSVGLayer extends L.Layer {
           (sector.name && this.selectionHighlightIds?.has(sector.name))
 
         if (isSelected) {
-          const colors = getSectorColor(sector)
           cached.polygon.setStyle({
-            fillColor: colors.fillColor,
+            fillColor: this._sectorBaseStyle(sector).fillColor,
             color: '#ef4444', // 红色高亮边框
             weight: 3,
             fillOpacity: 0.9
@@ -1312,13 +1464,12 @@ export class SectorSVGLayer extends L.Layer {
           // PCI模式：检查是否在白名单中
           const isInWhitelist = this.sectorIdWhitelist ? this.sectorIdWhitelist.has(sectorId) : false
           if (isInWhitelist) {
-            const colors = getSectorColor(sector)
-            const config = SECTOR_CONFIG[sector.networkType]
+            const base = this._sectorBaseStyle(sector)
             cached.polygon.setStyle({
-              fillColor: colors.fillColor,
-              color: config.strokeColor || '#000000',
-              weight: config.strokeWidth || 0.5,
-              fillOpacity: config.opacity
+              fillColor: base.fillColor,
+              color: base.strokeColor,
+              weight: base.strokeWidth,
+              fillOpacity: base.fillOpacity
             })
           } else {
             cached.polygon.setStyle({
@@ -1331,13 +1482,12 @@ export class SectorSVGLayer extends L.Layer {
           })
         } else {
           // 默认模式
-          const colors = getSectorColor(sector)
-          const config = SECTOR_CONFIG[sector.networkType]
+          const base = this._sectorBaseStyle(sector)
           cached.polygon.setStyle({
-            fillColor: colors.fillColor,
-            color: config.strokeColor || '#000000',
-            weight: config.strokeWidth || 0.5,
-            fillOpacity: config.opacity
+            fillColor: base.fillColor,
+            color: base.strokeColor,
+            weight: base.strokeWidth,
+            fillOpacity: base.fillOpacity
           })
         }
       }
@@ -1349,9 +1499,8 @@ export class SectorSVGLayer extends L.Layer {
           (sector.name && this.selectionHighlightIds?.has(sector.name))
 
         if (isSelected) {
-          const colors = getSectorColor(sector)
           cached.marker.setStyle({
-            fillColor: colors.fillColor,
+            fillColor: this._sectorBaseStyle(sector, 'marker').fillColor,
             color: '#ef4444', // 红色高亮边框
             weight: 3,
             fillOpacity: 1
@@ -1360,12 +1509,12 @@ export class SectorSVGLayer extends L.Layer {
         } else if (this.renderMode === 'pci-planning') {
           const isInWhitelist = this.sectorIdWhitelist ? this.sectorIdWhitelist.has(sector.id) : false
           if (isInWhitelist) {
-            const colors = getSectorColor(sector)
+            const base = this._sectorBaseStyle(sector, 'marker')
             cached.marker.setStyle({
-              fillColor: colors.fillColor,
-              color: colors.strokeColor,
-              weight: 1,
-              fillOpacity: 0.8
+              fillColor: base.fillColor,
+              color: base.strokeColor,
+              weight: base.strokeWidth,
+              fillOpacity: base.fillOpacity
             })
           } else {
             cached.marker.setStyle({
@@ -1373,12 +1522,12 @@ export class SectorSVGLayer extends L.Layer {
             })
           }
         } else {
-          const colors = getSectorColor(sector)
+          const base = this._sectorBaseStyle(sector, 'marker')
           cached.marker.setStyle({
-            fillColor: colors.fillColor,
-            color: colors.strokeColor,
-            weight: 1,
-            fillOpacity: 0.8
+            fillColor: base.fillColor,
+            color: base.strokeColor,
+            weight: base.strokeWidth,
+            fillOpacity: base.fillOpacity
           })
         }
       }
@@ -1467,9 +1616,8 @@ export class SectorSVGLayer extends L.Layer {
         highlightPolygons.push(cached.polygon)
       } else if (isSelected) {
         // 仅被框选的高亮：保持原色但加红色边框
-        const colors = getSectorColor(sector)
         cached.polygon.setStyle({
-          fillColor: colors.fillColor,
+          fillColor: this._sectorBaseStyle(sector).fillColor,
           color: '#ef4444', // 红色高亮边框
           weight: 3,
           fillOpacity: 0.9
@@ -1487,13 +1635,12 @@ export class SectorSVGLayer extends L.Layer {
           })
         } else {
           // 默认模式：彩色
-          const colors = getSectorColor(sector)
-          const config = SECTOR_CONFIG[sector.networkType]
+          const base = this._sectorBaseStyle(sector)
           cached.polygon.setStyle({
-            fillColor: colors.fillColor,
-            color: config.strokeColor || '#000000',
-            weight: config.strokeWidth || 0.5,
-            fillOpacity: config.opacity
+            fillColor: base.fillColor,
+            color: base.strokeColor,
+            weight: base.strokeWidth,
+            fillOpacity: base.fillOpacity
           })
         }
       }
@@ -1539,9 +1686,8 @@ export class SectorSVGLayer extends L.Layer {
           fillOpacity: 1
         })
       } else if (isSelected) {
-        const colors = getSectorColor(sector)
         cached.marker.setStyle({
-          fillColor: colors.fillColor,
+          fillColor: this._sectorBaseStyle(sector, 'marker').fillColor,
           color: '#ef4444', // 红色高亮边框
           weight: 3,
           fillOpacity: 1
@@ -1558,12 +1704,12 @@ export class SectorSVGLayer extends L.Layer {
           })
         } else {
           // 默认模式：彩色
-          const colors = getSectorColor(sector)
+          const base = this._sectorBaseStyle(sector, 'marker')
           cached.marker.setStyle({
-            fillColor: colors.fillColor,
-            color: colors.strokeColor,
-            weight: 1,
-            fillOpacity: 0.8
+            fillColor: base.fillColor,
+            color: base.strokeColor,
+            weight: base.strokeWidth,
+            fillOpacity: base.fillOpacity
           })
         }
       }
@@ -2187,26 +2333,25 @@ export class SectorSVGLayer extends L.Layer {
 
       if (isSelected) {
         // 选中扇区：红色高亮
-        const colors = getSectorColor(sector)
-        fillColor = colors.fillColor
+        fillColor = this._sectorBaseStyle(sector, 'marker').fillColor
         color = '#ff0000'
         weight = 3
         fillOpacity = 0.6
       } else {
         // 默认模式：彩色（基于频点或网络类型）
-        const colors = getSectorColor(sector)
-        fillColor = colors.fillColor
-        color = colors.strokeColor
-        weight = 1
-        fillOpacity = 0.8
+        const base = this._sectorBaseStyle(sector, 'marker')
+        fillColor = base.fillColor
+        color = base.strokeColor
+        weight = base.strokeWidth
+        fillOpacity = base.fillOpacity
       }
     } else {
       // 默认模式：彩色（基于频点或网络类型）
-      const colors = getSectorColor(sector)
-      fillColor = colors.fillColor
-      color = colors.strokeColor
-      weight = 1
-      fillOpacity = 0.8
+      const base = this._sectorBaseStyle(sector, 'marker')
+      fillColor = base.fillColor
+      color = base.strokeColor
+      weight = base.strokeWidth
+      fillOpacity = base.fillOpacity
     }
 
     const marker = L.circleMarker(centerLatLng, {
@@ -2786,29 +2931,25 @@ export class SectorSVGLayer extends L.Layer {
 
       if (isSelected) {
         // 选中扇区：红色高亮
-        const colors = getSectorColor(sector)
-        fillColor = colors.fillColor
+        fillColor = '#ff4444'
         strokeColor = '#ff0000'
         strokeWidth = 4
         fillOpacity = 0.6
-        fillColor = '#ff4444'
       } else {
         // 默认模式：彩色（基于频点或网络类型）
-        const colors = getSectorColor(sector)
-        const config = SECTOR_CONFIG[sector.networkType]
-        fillColor = colors.fillColor
-        strokeColor = config.strokeColor || '#000000'
-        strokeWidth = config.strokeWidth || 0.5
-        fillOpacity = config.opacity
+        const base = this._sectorBaseStyle(sector)
+        fillColor = base.fillColor
+        strokeColor = base.strokeColor
+        strokeWidth = base.strokeWidth
+        fillOpacity = base.fillOpacity
       }
     } else {
       // 默认模式：彩色（基于频点或网络类型）
-      const colors = getSectorColor(sector)
-      const config = SECTOR_CONFIG[sector.networkType]
-      fillColor = colors.fillColor
-      strokeColor = config.strokeColor || '#000000'
-      strokeWidth = config.strokeWidth || 0.5
-      fillOpacity = config.opacity
+      const base = this._sectorBaseStyle(sector)
+      fillColor = base.fillColor
+      strokeColor = base.strokeColor
+      strokeWidth = base.strokeWidth
+      fillOpacity = base.fillOpacity
     }
 
     // 获取当前缩放级别用于动态调整渲染质量

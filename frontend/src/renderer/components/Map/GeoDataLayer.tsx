@@ -14,6 +14,8 @@
 import L from 'leaflet'
 import { CoordinateTransformer } from '../../utils/coordinate'
 import { GeoDataCanvasLabelLayer, CanvasLabelData } from './GeoDataCanvasLabelLayer'
+import { getFieldValue, matchThematicColor, matchRangeIndex, hasValue } from '../../utils/fieldValue'
+import type { ThematicSettings } from './LabelSettingsModal'
 
 console.log('🔥🔥🔥 GeoDataLayer.tsx 已加载 (2025-03-29-v3 Canvas优化版) 🔥🔥🔥')
 
@@ -159,6 +161,11 @@ export class GeoDataLayer {
 
   // 图层颜色覆盖（图形颜色 / 透明度 / 边框宽度 / 边框颜色）
   private styleOverrides: { fillColor: string; fillOpacity: number; borderWidth: number; borderColor: string } | null = null
+
+  // 专题图层设置（启用时优先于 styleOverrides；null 表示未启用）
+  private thematicSettings: ThematicSettings | null = null
+  // 专题区间统计（每个区间的要素数/总数，用于图例展示）
+  private thematicStats: { counts: number[]; total: number; other: number } | null = null
 
   // 地图移动节流定时器
   private _mapMoveTimer: number | null = null
@@ -440,10 +447,14 @@ export class GeoDataLayer {
 
       // 动态计算像素半径，模拟 10 米在当前缩放级别下的视觉大小
       const pixelRadius = this._metersToPixels(10, displayLat, zoom)
+      // 专题启用时用固定点大小（图形大小设置）
+      const radius = (this.thematicSettings?.enabled && this.thematicSettings.pointSize)
+        ? this.thematicSettings.pointSize
+        : pixelRadius
 
       const marker = L.circleMarker([displayLat, displayLng], {
-        ...this._mergeStyleOverrides(DEFAULT_POINT_STYLE),
-        radius: pixelRadius,
+        ...this._mergeStyleOverrides(DEFAULT_POINT_STYLE, item),
+        radius,
         renderer: this.canvasRenderer || undefined,
         properties: item.properties,
         name: item.name
@@ -523,7 +534,11 @@ export class GeoDataLayer {
       if (is360Degree || coverType === 4 || this.currentZoom <= LOD_THRESHOLD) {
         // 渲染为圆点
         const marker = L.circleMarker([displayLat, displayLng], {
-          ...this._mergeStyleOverrides(DEFAULT_POINT_STYLE),
+          ...this._mergeStyleOverrides(DEFAULT_POINT_STYLE, item),
+          // 扇区属面状图层：尺寸设置语义为边框宽度（描边），圆点半径保持默认
+          ...(this.thematicSettings?.enabled && this.thematicSettings.pointSize
+            ? { weight: this.thematicSettings.pointSize }
+            : {}),
           renderer: this.canvasRenderer || undefined,
           properties: item.properties,
           name: item.name
@@ -548,7 +563,11 @@ export class GeoDataLayer {
 
         const points = createSectorPolygon(displayLat, displayLng, azimuth, beamwidth, SECTOR_RADIUS)
         const polygon = L.polygon(points, {
-          ...this._mergeStyleOverrides(DEFAULT_SECTOR_STYLE),
+          ...this._mergeStyleOverrides(DEFAULT_SECTOR_STYLE, item),
+          // 扇区属面状图层：尺寸设置语义为边框宽度
+          ...(this.thematicSettings?.enabled && this.thematicSettings.pointSize
+            ? { weight: this.thematicSettings.pointSize }
+            : {}),
           renderer: this.canvasRenderer || undefined,
           properties: item.properties,
           name: item.name
@@ -628,7 +647,11 @@ export class GeoDataLayer {
       try {
         // 直接使用 L.polygon，path 已经是正确的 [lat, lng] 格式（GCJ02）
         const polygon = L.polygon(item.path as L.LatLngExpression[], {
-          ...this._mergeStyleOverrides(DEFAULT_POLYGON_STYLE),
+          ...this._mergeStyleOverrides(DEFAULT_POLYGON_STYLE, item),
+          // 面状图层：尺寸设置语义为边框宽度
+          ...(this.thematicSettings?.enabled && this.thematicSettings.pointSize
+            ? { weight: this.thematicSettings.pointSize }
+            : {}),
           renderer: this.canvasRenderer || undefined,
           properties: item.properties,
           name: item.name
@@ -1028,7 +1051,7 @@ export class GeoDataLayer {
       // 这样地图移动时新进入视窗的元素会自动显示标签
 
       // 获取标签内容
-      const content = this._getLabelContent(item, i)
+      const content = this._getLabelContent(item)
       if (!content) {
         skippedNoContent++
         continue
@@ -1055,7 +1078,7 @@ export class GeoDataLayer {
   /**
    * 获取标签内容
    */
-  private _getLabelContent(dataItem: GeoDataItem, index: number): string {
+  private _getLabelContent(dataItem: GeoDataItem): string {
     if (!dataItem) return ''
 
     // 根据 labelConfig.content 获取字段值
@@ -1063,7 +1086,7 @@ export class GeoDataLayer {
 
     // 如果是 'name' 或默认，使用 item.name
     if (field === 'name') {
-      return dataItem.name || this._getDefaultLabel(index)
+      return dataItem.name || ''
     }
 
     // 从 properties 中获取字段值（根级：OnlineMap 将整条 item 存入 properties，所以此处查 item 根字段）
@@ -1077,24 +1100,9 @@ export class GeoDataLayer {
       return String(dataItem.properties.properties[field])
     }
 
-    // 回退到 name
-    return dataItem.name || this._getDefaultLabel(index)
-  }
-
-  /**
-   * 获取默认标签文本
-   */
-  private _getDefaultLabel(index: number): string {
-    switch (this.geometryType) {
-      case 'point':
-        return `点${index + 1}`
-      case 'sector':
-        return `扇区${index + 1}`
-      case 'polygon':
-        return `多边形${index + 1}`
-      default:
-        return `要素${index + 1}`
-    }
+    // 严格按用户选择的标签字段显示：所选字段缺失时不回退到 name/默认标签，
+    // 直接返回空串（该要素不在地图显示标签）
+    return ''
   }
 
   /**
@@ -1193,10 +1201,11 @@ export class GeoDataLayer {
           if (originalStyle) {
             layer.setStyle(originalStyle)
             this.originalStyles.delete(layer)
-          } else {
-            // 如果没有保存的样式，使用默认样式
-            layer.setStyle(this._getDefaultStyle())
           }
+          // 无保存的原始样式说明该要素从未被高亮过，其样式本就是渲染时的正确状态
+          // （点半径为按缩放动态计算的像素半径、配色含专题/用户覆盖）。
+          // 不再 setStyle(_getDefaultStyle())：那会把半径强制改为固定 10px、
+          // 并把配色改回基础色，导致圈选时未选中的点突然变大且专题配色丢失。
         }
       } else if (layer instanceof L.Marker) {
         // Marker（点要素）高亮：修改DOM元素添加高亮边框
@@ -1220,35 +1229,39 @@ export class GeoDataLayer {
   }
 
   /**
-   * 获取默认样式（合并图层颜色覆盖）
+   * 计算要素的专题样式（按字段值匹配区间/文本配色）
+   * @returns { fillColor, color } 或 null（未启用专题）
    */
-  private _getDefaultStyle(): any {
-    switch (this.geometryType) {
-      case 'point':
-        return this._mergeStyleOverrides(DEFAULT_POINT_STYLE)
-      case 'sector':
-        return this._mergeStyleOverrides(DEFAULT_SECTOR_STYLE)
-      case 'polygon':
-        return this._mergeStyleOverrides(DEFAULT_POLYGON_STYLE)
-      default:
-        return this._mergeStyleOverrides(DEFAULT_POINT_STYLE)
-    }
+  private _thematicStyleFor(item: GeoDataItem): { fillColor: string; color: string } | null {
+    const ts = this.thematicSettings
+    if (!ts || !ts.enabled || !ts.field) return null
+    const color = matchThematicColor(ts, getFieldValue(item.properties, ts.field))
+    return { fillColor: color, color }
   }
 
   /**
-   * 将颜色覆盖合并到基础样式
+   * 将颜色覆盖合并到基础样式（专题启用时优先于基础覆盖）
    * 映射：fillColor→fillColor，fillOpacity→fillOpacity，borderColor→color，borderWidth→weight
    */
-  private _mergeStyleOverrides(baseStyle: any): any {
-    if (!this.styleOverrides) return baseStyle
-    return {
-      ...baseStyle,
-      fillColor: this.styleOverrides.fillColor,
-      fillOpacity: this.styleOverrides.fillOpacity,
-      color: this.styleOverrides.borderColor,
-      weight: this.styleOverrides.borderWidth,
-      opacity: 1
+  private _mergeStyleOverrides(baseStyle: any, item?: GeoDataItem): any {
+    let style = baseStyle
+    if (this.styleOverrides) {
+      style = {
+        ...baseStyle,
+        fillColor: this.styleOverrides.fillColor,
+        fillOpacity: this.styleOverrides.fillOpacity,
+        color: this.styleOverrides.borderColor,
+        weight: this.styleOverrides.borderWidth,
+        opacity: 1
+      }
     }
+    if (item && this.thematicSettings?.enabled) {
+      const t = this._thematicStyleFor(item)
+      if (t) {
+        style = { ...style, fillColor: t.fillColor, color: t.color }
+      }
+    }
+    return style
   }
 
   /**
@@ -1270,6 +1283,112 @@ export class GeoDataLayer {
   }
 
   /**
+   * 设置专题图层覆盖（与基础配置相互独立：专题启用时优先渲染；null 关闭专题后由渲染层回退到基础配置色）
+   */
+  setThematicOverrides(settings: ThematicSettings | null): void {
+    this.thematicSettings = settings
+    // 关闭专题时不清除基础配置：基础配置与专题图层相互独立，
+    // 专题关闭时由 _mergeStyleOverrides 自然回退到基础配置色（无基础配置则用导入默认色）。
+    this.computeThematicStats()
+
+    // 未渲染/不可见时仅保存覆盖，几何由后续 addTo/_reRenderGeometries 统一按新覆盖渲染
+    if (!this.map || !this.leafletLayer || !this.visible) return
+
+    this._reRenderGeometries()
+  }
+
+  /**
+   * 计算专题图例统计（各配色模式的要素数与总数，供图例展示）
+   * - 区间配色：counts[每区间] + other（未匹配）
+   * - 属性值配色：counts[每个值] + other（未配置值）
+   * - 文本配色：counts[每个类别，含 __other__] + other（无兜底时的未列出值）
+   */
+  private computeThematicStats(): void {
+    const ts = this.thematicSettings
+    if (!ts?.enabled || !this.data || this.data.length === 0) {
+      this.thematicStats = null
+      return
+    }
+    const isRange = ts.fieldType === 'numeric' && ts.colorMode !== 'value' && ts.ranges.length > 0
+    const isValue = ts.fieldType === 'numeric' && ts.colorMode === 'value' && (ts.valueColors?.length ?? 0) > 0
+    const isText = ts.fieldType === 'text' && ts.categories.length > 0
+    if (!isRange && !isValue && !isText) {
+      this.thematicStats = null
+      return
+    }
+    const counts = new Array(
+      isRange ? ts.ranges.length : isValue ? ts.valueColors!.length : ts.categories.length
+    ).fill(0)
+    let total = 0
+    let other = 0
+    if (isRange) {
+      for (const item of this.data) {
+        total++
+        const idx = matchRangeIndex(ts, getFieldValue(item.properties, ts.field))
+        if (idx >= 0) counts[idx]++; else other++
+      }
+    } else if (isValue) {
+      const valueIndex = new Map(ts.valueColors!.map((c, i) => [c.value, i]))
+      for (const item of this.data) {
+        total++
+        const raw = getFieldValue(item.properties, ts.field)
+        if (!hasValue(raw)) { other++; continue }
+        const idx = valueIndex.get(String(raw))
+        if (idx !== undefined) counts[idx]++; else other++
+      }
+    } else {
+      const otherIdx = ts.categories.findIndex(c => c.value === '__other__')
+      const categoryIndex = new Map(ts.categories.map((c, i) => [c.value, i]))
+      for (const item of this.data) {
+        total++
+        const raw = getFieldValue(item.properties, ts.field)
+        if (!hasValue(raw)) { if (otherIdx >= 0) counts[otherIdx]++; else other++; continue }
+        const idx = categoryIndex.get(String(raw))
+        if (idx !== undefined) counts[idx]++
+        else if (otherIdx >= 0) counts[otherIdx]++
+        else other++
+      }
+    }
+    this.thematicStats = { counts, total, other }
+  }
+
+  /**
+   * 获取专题区间统计（图例显示每个区间的个数与占比；other = 未匹配区间/无兜底分类的要素数）
+   */
+  getThematicStats(): { counts: number[]; total: number; other: number } | null {
+    return this.thematicStats
+  }
+
+  /**
+   * 获取图层全部要素的地理范围（图层预览：居中最大化显示）
+   * 注意：视口裁剪下已渲染几何可能为空，必须从数据源计算
+   * @returns LatLngBounds；无要素返回 null
+   */
+  getFeaturesBounds(): L.LatLngBounds | null {
+    if (!this.data || this.data.length === 0) return null
+    const bounds = L.latLngBounds([])
+    let has = false
+    for (const item of this.data) {
+      try {
+        if (Array.isArray(item.path) && item.path.length > 0) {
+          for (const p of item.path) {
+            bounds.extend([p[0], p[1]])
+            has = true
+          }
+        } else {
+          const lat = item.displayLat ?? item.latitude
+          const lng = item.displayLng ?? item.longitude
+          if (typeof lat === 'number' && typeof lng === 'number') {
+            bounds.extend([lat, lng])
+            has = true
+          }
+        }
+      } catch { /* 忽略单要素异常 */ }
+    }
+    return has ? bounds : null
+  }
+
+  /**
    * 射线法判断点是否在多边形内（替代 Leaflet L.Polygon.contains，该方法在 Leaflet 1.x 中不存在）
    */
   private static _isPointInPolygon(point: number[], polygon: number[][]): boolean {
@@ -1286,41 +1405,50 @@ export class GeoDataLayer {
 
   /**
    * 获取多边形内的要素（用于框选）
-   * @param polygon Leaflet多边形对象
+   *
+   * 🔧 遍历完整数据集（this.data）而非仅已渲染的 leafletLayer。
+   * 原先只遍历 leafletLayer，而 GeoDataLayer 在地图平移/缩放时会做视口裁剪
+   * （_reRenderGeometries 仅保留视口内要素），导致位于视口外的要素被物理移除，
+   * 框选（多边形/矩形）无法命中它们——表现为只有扇区图层可圈选、点/面图层无效。
+   * 改为直接使用原始坐标遍历全量数据，与 SectorRendererSVG.getSectorsInPolygon 保持一致。
+   *
+   * @param polygon Leaflet多边形对象（坐标为渲染坐标/GCJ02）
    */
   getFeaturesInPolygon(polygon: L.Polygon): GeoDataItem[] {
-    if (!this.leafletLayer) return []
     const results: GeoDataItem[] = []
+    if (!this.data || this.data.length === 0) return results
+
     const bounds = polygon.getBounds()
     // 将多边形顶点转为 [lat, lng] 二维数组用于射线法判断
     const polygonPoints: number[][] = (polygon.getLatLngs()[0] as L.LatLng[]).map(p => [p.lat, p.lng])
 
-    this.leafletLayer.eachLayer((layer: any) => {
-      let isInside = false
-      let layerLatLng: L.LatLng | null = null
-
-      if (layer.getLatLng) {
-        // 点要素（CircleMarker）
-        layerLatLng = layer.getLatLng()
-        if (bounds.contains(layerLatLng)) {
-          isInside = GeoDataLayer._isPointInPolygon([layerLatLng.lat, layerLatLng.lng], polygonPoints)
+    for (const item of this.data) {
+      // 面状要素：以其任一顶点是否落在框选范围内判定（覆盖整片区域被框住的情况）
+      if (this.geometryType === 'polygon' && item.path && item.path.length > 0) {
+        const inside = item.path.some(pt =>
+          bounds.contains([pt[ 0], pt[1]]) &&
+          GeoDataLayer._isPointInPolygon([pt[0], pt[1]], polygonPoints)
+        )
+        if (inside) {
+          results.push({ name: item.name, properties: item.properties })
         }
-      } else if (layer.getBounds) {
-        // 线/面要素：检查中心点
-        const layerBounds = layer.getBounds()
-        layerLatLng = layerBounds.getCenter()
-        if (bounds.contains(layerLatLng)) {
-          isInside = GeoDataLayer._isPointInPolygon([layerLatLng.lat, layerLatLng.lng], polygonPoints)
-        }
+        continue
       }
 
-      if (isInside && layer.options?.properties) {
-        results.push({
-          name: layer.options.name || layer.options.properties?.name,
-          properties: layer.options.properties
-        })
+      if (item.longitude === undefined || item.latitude === undefined) continue
+
+      // 与渲染逻辑保持一致：优先 display 坐标，否则由 GCJ02 转换
+      const [dLat, dLng] = (item.displayLat !== undefined && item.displayLng !== undefined)
+        ? [item.displayLat, item.displayLng]
+        : CoordinateTransformer.wgs84ToGcj02(item.latitude, item.longitude)
+
+      if (
+        bounds.contains([dLat, dLng]) &&
+        GeoDataLayer._isPointInPolygon([dLat, dLng], polygonPoints)
+      ) {
+        results.push({ name: item.name, properties: item.properties })
       }
-    })
+    }
 
     return results
   }

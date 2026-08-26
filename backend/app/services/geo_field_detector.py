@@ -25,7 +25,6 @@ class GeoFieldDetector:
             "LON",
             "LONG",
             "Coord_X",
-            "X",
             "经度x",
             "lngx",
             "longx",
@@ -37,9 +36,7 @@ class GeoFieldDetector:
             "LATITUDE",
             "LAT",
             "Coord_Y",
-            "Y",
             "纬度y",
-            "laty",
             "laty",
         ],
         "azimuth": [
@@ -172,18 +169,34 @@ class GeoFieldDetector:
             for idx, (field_name, patterns) in enumerate(self.FIELD_PATTERNS.items()):
                 print(f"[GeoFieldDetector] 🔍 [{idx}] 开始检测字段类型: {field_name}")
                 found_match = False
+
+                # 阶段1：精确匹配优先（列名 == pattern，忽略大小写）
+                # 避免模糊匹配误伤：例如单字母 X/Y 已移除，但 "ssbFrequency" 这类含 y 的
+                # 列仍可能被子串正则命中，因此精确的中文/英文标准列名必须优先选中。
                 for col in columns:
                     col_lower = col.lower()
-                    # 使用正则表达式进行模糊匹配
                     for p in patterns:
-                        match_result = re.search(p, col_lower, re.IGNORECASE)
-                        if match_result:
+                        if col_lower == p.lower():
                             detected[field_name] = col
                             found_match = True
-                            print(f"[GeoFieldDetector] ✅ [{idx}] {field_name} = '{col}'")
+                            print(f"[GeoFieldDetector] ✅ [{idx}] {field_name} = '{col}' (精确匹配)")
                             break
                     if found_match:
                         break
+
+                # 阶段2：模糊匹配（子串/正则），仅在精确匹配未命中时使用
+                if not found_match:
+                    for col in columns:
+                        col_lower = col.lower()
+                        for p in patterns:
+                            match_result = re.search(p, col_lower, re.IGNORECASE)
+                            if match_result:
+                                detected[field_name] = col
+                                found_match = True
+                                print(f"[GeoFieldDetector] ✅ [{idx}] {field_name} = '{col}'")
+                                break
+                        if found_match:
+                            break
 
                 # 如果没有找到匹配，设置为 None
                 if not found_match:

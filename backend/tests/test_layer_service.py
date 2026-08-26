@@ -978,3 +978,140 @@ def test_mif_point_shape_codes_corrected(service, sample_excel):
         border_color="#FF0000", point_shape="diamond", point_size=10,
     )
     assert "Symbol (33,16711680,10)" in r3.read_text(encoding="gbk", errors="replace")
+
+
+# ============================================================
+# MapInfo .tab charset 规范化（修复电联扇区图层 zip 无法显示问题）
+# ============================================================
+
+def _try_import_mapinfo_parser():
+    """延迟导入 MapInfoParser，依赖缺失时 pytest.skip。"""
+    try:
+        from app.services.mapinfo_service import MapInfoParser, get_last_parse_errors
+        return MapInfoParser, get_last_parse_errors
+    except Exception as e:
+        pytest.skip(f"mapinfo_service 依赖缺失，跳过: {type(e).__name__}: {str(e)[:100]}")
+
+
+def test_normalize_tab_charset_changes_neutral_to_windows_simp_chinese(tmp_path):
+    """覆盖电联扇区图层场景：!charset Neutral 应被规范化为 WindowsSimpChinese。
+    同时改 Definition Table 中 Type NATIVE Charset 行（GDAL 同时检查两处）。"""
+    MapInfoParser, _ = _try_import_mapinfo_parser()
+
+    tab = tmp_path / "河源电联_LTE.tab"
+    tab.write_text(
+        "!table\n"
+        "!version 300\n"
+        "!charset Neutral\n"
+        "\n"
+        "Definition Table\n"
+        '  Type NATIVE Charset "Neutral"\n'
+        "  Fields 19\n"
+        "    CGI Char (10) ;\n"
+        "    CellLongitude Float ;\n",
+        encoding="utf-8",
+    )
+
+    MapInfoParser._normalize_tab_charset(tab)
+    content = tab.read_text(encoding="utf-8")
+
+    assert "Neutral" not in content, f"❌ Neutral 残留: {content!r}"
+    assert "WindowsSimpChinese" in content
+    assert content.count("WindowsSimpChinese") == 2, (
+        f"❌ 应替换 2 处（顶头 + Type 行），实际 {content.count('WindowsSimpChinese')}: {content!r}"
+    )
+
+
+def test_normalize_tab_charset_idempotent_for_already_correct_file(tmp_path):
+    """已经是 WindowsSimpChinese 的文件不应被修改（幂等性，避免无谓写盘）。"""
+    MapInfoParser, _ = _try_import_mapinfo_parser()
+
+    tab = tmp_path / "河源5G-TAC.tab"
+    original = (
+        "!table\n"
+        "!version 300\n"
+        "!charset WindowsSimpChinese\n"
+        '  Type NATIVE Charset "WindowsSimpChinese"\n'
+    )
+    tab.write_text(original, encoding="utf-8")
+
+    MapInfoParser._normalize_tab_charset(tab)
+    assert tab.read_text(encoding="utf-8") == original, "❌ 已被修改的 WindowsSimpChinese 文件"
+
+
+def test_normalize_tab_charset_safe_for_nonexistent_and_none(tmp_path):
+    """不存在的文件 / None 输入应安全跳过，不抛异常。"""
+    MapInfoParser, _ = _try_import_mapinfo_parser()
+
+    # 不存在文件路径
+    MapInfoParser._normalize_tab_charset(tmp_path / "nonexistent.tab")  # 不抛
+    # None 输入
+    MapInfoParser._normalize_tab_charset(None)  # 不抛
+
+
+def test_normalize_tab_charset_preserves_gbk_field_names_bytewise(tmp_path):
+    """关键回归测试：GBK 编码的 .tab 文件，规范化后字段名字节必须保持原样。
+
+    历史 bug：之前实现用 read_text(encoding="utf-8", errors="ignore")，
+    导致：
+      - GBK 字节 0xC7 0xB7 ("是否") 被 UTF-8 误读为拉丁字符 Ƿ (U+01F7)
+      - 非合法 UTF-8 的 GBK 字节（如 0xB3 0xA7 = "厂"）被 errors="ignore" 丢弃
+      - 字段名变空、Definition Table 结构被破坏
+      - fiona 报 "Failed to parse field definition at line 11/12"
+
+    修复后：必须用字节级替换 b"Neutral" → b"WindowsSimpChinese"，
+    不重新编码整个文件。GBK 字节序列保持不变。
+    """
+    MapInfoParser, _ = _try_import_mapinfo_parser()
+
+    # 模拟电联扇区图层的真实 .tab：GBK 编码 + CRLF + 中文字段名
+    # 直接用 bytes([...]) 构造 GBK 字节，避免 Python 字符串字面量把 \xca 解读为 Unicode U+00CA
+    gbk_bytes = (
+        b"!table\r\n"
+        b"!version 300\r\n"
+        b"!charset Neutral\r\n"
+        b"\r\n"
+        b"Definition Table\r\n"
+        b'  Type NATIVE Charset "Neutral"\r\n'
+        b"  Fields 19\r\n"
+        # 是否共享
+        b"    " + bytes([0xCA, 0xC7, 0xB7, 0xF1, 0xB9, 0xB2, 0xCF, 0xED]) + b" Char (1) ;\r\n"
+        b"    CGI Char (10) ;\r\n"
+        # 厂家
+        b"    " + bytes([0xB3, 0xA7, 0xBC, 0xD2]) + b" Char (5) ;\r\n"
+        # 区域
+        b"    " + bytes([0xD5, 0xFE, 0xD3, 0xF2]) + b" Char (2) ;\r\n"
+        # 站高
+        b"    " + bytes([0xD4, 0xBE, 0xB8, 0xDF]) + b" Char (5) ;\r\n"
+        # 覆盖
+        b"    " + bytes([0xB7, 0xFE, 0xB7, 0xC6]) + b" Char (1) ;\r\n"
+    )
+    tab = tmp_path / "河源电联_LTE.tab"
+    tab.write_bytes(gbk_bytes)
+
+    # 记录原始 GBK 字节
+    original_bytes = tab.read_bytes()
+    assert bytes([0xCA, 0xC7]) in original_bytes  # 是否 GBK 起始字节
+    assert bytes([0xB3, 0xA7]) in original_bytes  # 厂家 GBK 起始字节
+
+    # 执行规范化
+    MapInfoParser._normalize_tab_charset(tab)
+
+    new_bytes = tab.read_bytes()
+    # 1. charset 已替换
+    assert b"WindowsSimpChinese" in new_bytes
+    assert b"Neutral" not in new_bytes
+    # 2. **GBK 字段名字节保持原样**（核心断言：bytewise preservation）
+    assert bytes([0xCA, 0xC7, 0xB7, 0xF1, 0xB9, 0xB2, 0xCF, 0xED]) in new_bytes, "GBK '是否共享' 字节必须保留"
+    assert bytes([0xB3, 0xA7, 0xBC, 0xD2]) in new_bytes, "GBK '厂家' 字节必须保留"
+    assert bytes([0xD5, 0xFE, 0xD3, 0xF2]) in new_bytes, "GBK '区域' 字节必须保留"
+    assert bytes([0xD4, 0xBE, 0xB8, 0xDF]) in new_bytes, "GBK '站高' 字节必须保留"
+    assert bytes([0xB7, 0xFE, 0xB7, 0xC6]) in new_bytes, "GBK '覆盖' 字节必须保留"
+    # 3. CRLF 行结束符保持不变
+    assert b"\r\n" in new_bytes
+    # 4. **关键**：除了 b"Neutral" → b"WindowsSimpChinese" 的替换，其他字节必须完全一致
+    expected_bytes = original_bytes.replace(b"Neutral", b"WindowsSimpChinese")
+    assert new_bytes == expected_bytes, (
+        "字节级替换必须仅替换 Neutral → WindowsSimpChinese，"
+        "其他字节（包括 GBK 字段名、CRLF）必须完全保留"
+    )

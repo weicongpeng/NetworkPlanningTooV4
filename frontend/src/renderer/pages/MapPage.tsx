@@ -23,8 +23,9 @@ import { useMapStore } from '../store/mapStore'
 import { useMapDataCacheStore } from '../store/mapDataCacheStore'
 import { mapDataService, type RenderSectorData } from '../services/mapDataService'
 import { frequencyColorMapper } from '../config/sector-config'
-import { LabelSettings, LayerColorSettings } from '../components/Map/LabelSettingsModal'
+import { LabelSettings, LayerColorSettings, ThematicSettings, ThematicRange } from '../components/Map/LabelSettingsModal'
 import { TreeNode } from '../components/Map/LayerControl'
+import { ThematicLegend } from '../components/Map/ThematicLegend'
 import { selectionManager } from '../services/selectionManager'
 
 // MapInfo 图层列表缓存（避免每次挂载都重新请求）
@@ -85,6 +86,9 @@ export function MapPage() {
     setMapType: storeSetMapType,
     setLabelSettings: storeSetLabelSettings,
     setColorSettings: storeSetColorSettings,
+    setThematicSettings: storeSetThematicSettings,
+    setThematicTemplates: storeSetThematicTemplates,
+    setFrequencyCustomColors: storeSetFrequencyCustomColors,
     setBaseMapVisible: storeSetBaseMapVisible,
     setDecorationLabelVisible: storeSetDecorationLabelVisible,
   } = useMapStore()
@@ -261,6 +265,12 @@ export function MapPage() {
     : {}
   const [colorSettingsMap, setColorSettingsMap] = useState<Record<string, LayerColorSettings>>(initialColorSettings)
 
+  // 专题图层配置状态（按图层ID存储）- 从持久化 store 初始化
+  const initialThematicSettings = Object.keys(mapSettings.thematicSettingsMap ?? {}).length > 0
+    ? mapSettings.thematicSettingsMap
+    : {}
+  const [thematicSettingsMap, setThematicSettingsMap] = useState<Record<string, ThematicSettings>>(initialThematicSettings)
+
 
 
 
@@ -304,7 +314,8 @@ export function MapPage() {
               type: layer.type as 'point' | 'line' | 'polygon',
               visible: layerFileVisibility[layer.id] ?? false,
               dataId: mapItem.id,
-              sourceType: 'mapinfo' as const
+              sourceType: 'mapinfo' as const,
+              defaultStyle: layer.defaultStyle
             }))
           }
 
@@ -321,7 +332,8 @@ export function MapPage() {
               type: layer.type as 'point' | 'line' | 'polygon',
               visible: layerFileVisibility[layer.id] ?? false,
               dataId: mapItem.id,
-              sourceType: 'mapinfo' as const
+              sourceType: 'mapinfo' as const,
+              defaultStyle: layer.defaultStyle
             }))
           }
           return []
@@ -847,6 +859,9 @@ export function MapPage() {
       // 清除旧的颜色映射
       frequencyColorMapper.clear()
 
+      // 恢复用户自定义频点配色（数据刷新后仍生效，从持久化 store 读取避免闭包过期）
+      frequencyColorMapper.loadCustomColors(useMapStore.getState().mapSettings.frequencyCustomColors)
+
       // 检查是否是首次初始化
       const isFirstInit = !frequenciesInitializedRef.current
 
@@ -1249,6 +1264,34 @@ export function MapPage() {
   }, [layers])
 
   /**
+   * 处理频点自定义配色变化（默认设置模式下点击频点色块）
+   * 更新颜色映射器 + 持久化 store + 色块显示，并刷新已渲染扇区
+   */
+  const handleFrequencyColorChange = useCallback((networkType: 'LTE' | 'NR', frequency: number, colors: { color: string; strokeColor: string }) => {
+    console.log('[MapPage] Frequency color change:', networkType, frequency, colors)
+
+    // 1. 更新颜色映射器（内存立即生效，getSectorColor 下次调用返回新色）
+    frequencyColorMapper.setCustomColor(frequency, networkType, colors.color, colors.strokeColor)
+
+    // 2. 持久化到 store
+    const key = `${networkType}:${frequency}`
+    storeSetFrequencyCustomColors({
+      ...useMapStore.getState().mapSettings.frequencyCustomColors,
+      [key]: { color: colors.color, strokeColor: colors.strokeColor }
+    })
+
+    // 3. 更新本地频点状态（色块颜色实时刷新）
+    const nt = networkType.toLowerCase() as 'lte' | 'nr'
+    setFrequencies(prev => ({
+      ...prev,
+      [nt]: prev[nt].map(f => f.frequency === frequency ? { ...f, color: colors.color, strokeColor: colors.strokeColor } : f)
+    }))
+
+    // 4. 刷新已渲染扇区（重新读取颜色）
+    onlineMapRef.current?.refreshSectorColors()
+  }, [storeSetFrequencyCustomColors])
+
+  /**
    * 处理扇区标签可见性切换
    */
   const handleSectorLabelToggle = useCallback((layerId: string, visible: boolean) => {
@@ -1411,9 +1454,166 @@ export function MapPage() {
       storeSetDecorationLayerVisible(true)
     }
 
+    // 应用颜色到地图：扇区图层仅应用透明度/边框宽度（默认按频点区分颜色）
+    if (node.type === 'sector-layer') {
+      onlineMapRef.current?.setSectorColorSettings(layerId, {
+        fillOpacity: settings.fillOpacity,
+        borderWidth: settings.borderWidth
+      })
+      return
+    }
+
     // 应用颜色到地图
     onlineMapRef.current.setLayerColorSettings(layerId, settings)
   }, [storeSetColorSettings, storeSetLayerFileVisibility, storeSetDecorationLayerVisible])
+
+  /**
+   * 处理专题图层设置变化（null 表示关闭专题）
+   * 支持图层文件/地理化数据与基站扇区图层
+   */
+  const handleThematicSettingsChange = useCallback((node: TreeNode, settings: ThematicSettings | null) => {
+    console.log('[MapPage] Thematic settings change:', node, settings)
+
+    // 确定图层ID
+    let layerId: string | undefined
+    if (node.type === 'layer-file' && node.layerFile) {
+      layerId = node.layerFile.id
+    } else if (node.type === 'sector-layer' && node.sectorLayer) {
+      layerId = node.sectorLayer.id
+    }
+
+    if (!layerId) {
+      console.warn('[MapPage] Cannot determine layer ID for thematic settings')
+      return
+    }
+
+    // 更新本地状态 + 持久化 store（null 删除条目）
+    setThematicSettingsMap(prev => {
+      const next = { ...prev }
+      if (settings === null) {
+        delete next[layerId as string]
+      } else {
+        next[layerId as string] = settings
+      }
+      return next
+    })
+    storeSetThematicSettings(layerId, settings)
+
+    // 基础配置与专题图层相互独立：关闭专题时不再清除基础配置，
+    // 刷新后由 colorSettingsMap / thematicSettingsMap 分别恢复，渲染层按专题是否启用决定优先级，
+    // 因此关闭专题后基础配置色自然生效，无需在此清除（避免把刚保存的基础配置误删）。
+
+    if (!onlineMapRef.current) return
+
+    // 强制显示目标图层
+    if (node.type === 'sector-layer') {
+      // 扇区图层：更新本地 layers 状态 + 通知 OnlineMap 显示
+      setLayers(prev => prev.map(l => l.id === layerId ? { ...l, visible: true } : l))
+      if (onlineMapRef.current) {
+        const layerType = layerId === 'lte-sectors' ? 'lte' : 'nr'
+        onlineMapRef.current.setLayerVisibility(layerType, true)
+      }
+    } else {
+      // 图层文件/地理化数据（更新本地 state，OnlineMap 监听 prop 自动显示；图例也随 visible 刷新）
+      setLayerFiles(prev => prev.map(f => f.id === layerId ? { ...f, visible: true } : f))
+      setPointFiles(prev => prev.map(f => f.id === layerId ? { ...f, visible: true } : f))
+
+      // 同步持久化可见性（刷新后保持显示）
+      const isInLayerFiles = layerFiles.some(f => f.id === layerId)
+      if (isInLayerFiles) {
+        storeSetLayerFileVisibility(layerId, true)
+      } else {
+        storeSetPointFileVisibility(layerId, true)
+      }
+    }
+
+    // 应用到地图（专题优先于基础配置，渲染层内部处理互斥）
+    if (node.type === 'sector-layer') {
+      onlineMapRef.current.setSectorThematicSettings(layerId, settings)
+      const st = onlineMapRef.current.getSectorThematicStats(layerId)
+      setThematicStats(prev => ({ ...prev, [layerId as string]: st }))
+    } else {
+      onlineMapRef.current.setLayerThematicSettings(layerId, settings)
+      // 立即拉取区间统计（图例展示个数与占比）
+      const st = onlineMapRef.current.getLayerThematicStats(layerId)
+      setThematicStats(prev => ({ ...prev, [layerId as string]: st }))
+    }
+  }, [storeSetThematicSettings, storeSetLayerFileVisibility, storeSetPointFileVisibility, storeSetColorSettings, layerFiles])
+
+  /**
+   * 图层预览（右键菜单）：居中并最大化显示该图层全部要素
+   */
+  const handleLayerPreview = useCallback((fileId: string) => {
+    onlineMapRef.current?.focusLayer(fileId)
+  }, [])
+
+  /**
+   * 保存区间配色模板
+   */
+  const handleSaveThematicTemplate = useCallback((name: string, ranges: ThematicRange[]) => {
+    const templates = mapSettings.thematicTemplates || []
+    const id = `tpl-${Date.now()}`
+    storeSetThematicTemplates([
+      ...templates,
+      { id, name, ranges: JSON.parse(JSON.stringify(ranges)) }
+    ])
+  }, [mapSettings.thematicTemplates, storeSetThematicTemplates])
+
+  /**
+   * 删除区间配色模板
+   */
+  const handleRemoveThematicTemplate = useCallback((id: string) => {
+    const templates = mapSettings.thematicTemplates || []
+    storeSetThematicTemplates(templates.filter(t => t.id !== id))
+  }, [mapSettings.thematicTemplates, storeSetThematicTemplates])
+
+  // 专题图例项：已勾选可见且启用专题的图层（含基站扇区图层）
+  const thematicLegendItems = useMemo(() => {
+    const tsMap = mapSettings.thematicSettingsMap || {}
+    const items: { id: string; name: string; settings: ThematicSettings }[] = []
+    for (const f of [...layerFiles, ...pointFiles]) {
+      const ts = tsMap[f.id]
+      if (f.visible && ts?.enabled) {
+        items.push({ id: f.id, name: f.name, settings: ts })
+      }
+    }
+    // 基站扇区图层（LTE/NR）
+    for (const s of sectorLayers) {
+      const ts = tsMap[s.id]
+      if (s.visible && ts?.enabled) {
+        items.push({ id: s.id, name: s.type === 'LTE' ? 'LTE' : 'NR', settings: ts })
+      }
+    }
+    return items
+  }, [layerFiles, pointFiles, sectorLayers, mapSettings.thematicSettingsMap])
+
+  // 图例双击跳转：打开对应图层的专题图层设置
+  const [openThematicFor, setOpenThematicFor] = useState<{ layerId: string; ts: number } | null>(null)
+  const handleLegendItemDoubleClick = useCallback((item: { id: string }) => {
+    setOpenThematicFor({ layerId: item.id, ts: Date.now() })
+  }, [])
+
+  // 专题图例统计（图例显示每个区间的个数与占比；other = 黑色“其他”要素数）
+  const [thematicStats, setThematicStats] = useState<Record<string, { counts: number[]; total: number; other: number } | null>>({})
+  const fetchThematicStats = useCallback((ids: string[]) => {
+    if (!onlineMapRef.current || ids.length === 0) return
+    const next: Record<string, { counts: number[]; total: number; other: number } | null> = {}
+    for (const id of ids) {
+      next[id] = onlineMapRef.current.getLayerThematicStats(id)
+    }
+    setThematicStats(prev => ({ ...prev, ...next }))
+  }, [])
+  // 图例项变化时拉取统计；图层可能仍在异步加载，延时重拉兜底
+  useEffect(() => {
+    const ids = thematicLegendItems.map(i => i.id)
+    if (ids.length === 0) {
+      setThematicStats({})
+      return
+    }
+    fetchThematicStats(ids)
+    const timer = setTimeout(() => fetchThematicStats(ids), 2000)
+    return () => clearTimeout(timer)
+  }, [thematicLegendItems, fetchThematicStats])
 
   return (
     <div ref={mapPageRef} className="flex flex-col h-full min-h-0">
@@ -1841,11 +2041,23 @@ export function MapPage() {
               labelSettingsMap={labelSettingsMap}
               onColorSettingsChange={handleColorSettingsChange}
               colorSettingsMap={colorSettingsMap}
+              onThematicSettingsChange={handleThematicSettingsChange}
+              thematicSettingsMap={thematicSettingsMap}
+              openThematicFor={openThematicFor}
+              onLayerPreview={handleLayerPreview}
+              thematicTemplates={mapSettings.thematicTemplates || []}
+              onSaveThematicTemplate={handleSaveThematicTemplate}
+              onRemoveThematicTemplate={handleRemoveThematicTemplate}
+              sectorData={sectorDataCache}
+              onFrequencyColorChange={handleFrequencyColorChange}
               decorationLayer={decorationLayer}
               onDecorationLayerToggle={handleDecorationLayerToggle}
               decorationLabelVisible={decorationLabelVisible}
               onDecorationLabelToggle={handleDecorationLabelToggle}
             />
+
+            {/* 专题图层图例（随图层勾选/配置实时刷新；双击图例跳转专题设置） */}
+            <ThematicLegend items={thematicLegendItems} stats={thematicStats} onItemDoubleClick={handleLegendItemDoubleClick} />
 
           </>
         ) : (

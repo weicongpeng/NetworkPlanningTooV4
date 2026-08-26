@@ -9,13 +9,16 @@
  * - 图层文件: 外部导入的MapInfo文件
  * - 右键菜单支持标签设置
  */
-import { useState, useEffect, useRef, useCallback } from 'react'
-import { ChevronDown, ChevronRight, Map, Folder, File, X, Satellite, Radio } from 'lucide-react'
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
+import { ChevronDown, ChevronRight, Map, Folder, File, X, Satellite, Radio, MapPin, Route, Hexagon, Settings, Maximize2 } from 'lucide-react'
+import { HexColorPicker } from 'react-colorful'
 import { useTranslation } from 'react-i18next'
 import { NetworkType } from '../../config/sector-config'
-import { LabelSettingsModal, LabelSettings, FieldOption } from './LabelSettingsModal'
+import { LabelSettingsModal, LabelSettings, LayerColorSettings, FieldOption, ThematicSettings, ThematicTemplate, ThematicRange } from './LabelSettingsModal'
 import { dataApi, layerApi } from '../../services/api'
 import { useMapStore } from '../../store/mapStore'
+import { useMapDataCacheStore } from '../../store/mapDataCacheStore'
+import { getFieldValue, hasValue, FieldValueSample } from '../../utils/fieldValue'
 
 /**
  * 预定义的标签字段列表
@@ -65,6 +68,24 @@ const SectorIcon = ({ color }: { color: string }) => (
 )
 
 /**
+ * 右键菜单项统一样式
+ */
+const menuItemStyle: React.CSSProperties = {
+  width: '100%',
+  display: 'flex',
+  alignItems: 'center',
+  gap: '8px',
+  padding: '8px 12px',
+  fontSize: '12px',
+  color: '#333',
+  cursor: 'pointer',
+  border: 'none',
+  backgroundColor: 'transparent',
+  textAlign: 'left',
+  borderRadius: '4px'
+}
+
+/**
  * 树节点类型
  */
 type TreeNodeType = 'root' | 'sector-group' | 'layer-files' | 'sector-layer' | 'sector-label' | 'layer-file' | 'layer-file-label' | 'map-type' | 'frequency' | 'custom-group' | 'custom-layer' | 'decoration-group' | 'decoration-layer'
@@ -92,6 +113,16 @@ export interface LayerFileOption {
   dataId: string
   sourceType?: 'mapinfo' | 'excel'
   geometryType?: 'point' | 'sector' | 'polygon'
+  /** 图层文件自带的默认样式（用于自定义设置弹窗初始化，还原 tab/mif/kml 默认配置） */
+  defaultStyle?: {
+    fillColor?: string
+    fillOpacity?: number
+    strokeColor?: string
+    strokeWidth?: number
+    markerColor?: string
+    markerSize?: number
+    [key: string]: any
+  }
 }
 
 /**
@@ -223,6 +254,28 @@ export interface LayerControlProps {
   onLabelSettingsChange?: (node: TreeNode, settings: LabelSettings) => void
   /** 标签设置映射 */
   labelSettingsMap?: Record<string, LabelSettings>
+  /** 图层颜色设置变化回调 */
+  onColorSettingsChange?: (node: TreeNode, settings: LayerColorSettings) => void
+  /** 图层颜色设置映射 */
+  colorSettingsMap?: Record<string, LayerColorSettings>
+  /** 专题图层设置变化回调（null 表示关闭专题） */
+  onThematicSettingsChange?: (node: TreeNode, settings: ThematicSettings | null) => void
+  /** 专题图层设置映射 */
+  thematicSettingsMap?: Record<string, ThematicSettings>
+  /** 外部跳转指令：打开指定图层的专题图层设置页（图例双击） */
+  openThematicFor?: { layerId: string; ts: number } | null
+  /** 图层预览回调（右键菜单：居中并最大化显示该图层全部要素） */
+  onLayerPreview?: (fileId: string) => void
+  /** 已保存的区间配色模板列表 */
+  thematicTemplates?: ThematicTemplate[]
+  /** 保存区间配色模板回调 */
+  onSaveThematicTemplate?: (name: string, ranges: ThematicRange[]) => void
+  /** 删除区间配色模板回调 */
+  onRemoveThematicTemplate?: (id: string) => void
+  /** 扇区数据（用于基站专题图层字段样本提取） */
+  sectorData?: { lte: any[]; nr: any[] }
+  /** 频点自定义配色变化回调（默认设置模式下点击频点色块） */
+  onFrequencyColorChange?: (networkType: NetworkType, frequency: number, colors: { color: string; strokeColor: string }) => void
   /** 装饰图层 */
   decorationLayer?: DecorationLayerOption
   /** 装饰图层可见性变化回调 */
@@ -258,16 +311,38 @@ export function LayerControl({
   onLayerFileRemove,
   onCustomLayerRemove,
   onLabelSettingsChange,
+  onColorSettingsChange,
+  colorSettingsMap,
+  onThematicSettingsChange,
+  thematicSettingsMap,
+  openThematicFor,
+  onLayerPreview,
+  thematicTemplates = [],
+  onSaveThematicTemplate,
+  onRemoveThematicTemplate,
   decorationLayer,
   onDecorationLayerToggle,
   decorationLabelVisible,
-  onDecorationLabelToggle
+  onDecorationLabelToggle,
+  sectorData,
+  onFrequencyColorChange
 }: LayerControlProps) {
   const { t } = useTranslation()
 
   // 从持久化 store 获取标签设置
-  const { mapSettings, setLabelSettings: storeUpdateLabelSettings } = useMapStore()
+  const { mapSettings, setLabelSettings: storeUpdateLabelSettings, setColorSettings: storeUpdateColorSettings, setThematicSettings: storeUpdateThematicSettings } = useMapStore()
   const persistedLabelSettings = mapSettings.labelSettingsMap
+  const persistedColorSettings = colorSettingsMap ?? mapSettings.colorSettingsMap ?? {}
+  const persistedThematicSettings = thematicSettingsMap ?? mapSettings.thematicSettingsMap ?? {}
+
+  // 各扇区图层是否已启用专题图层（专题激活时频点色块不可点击自定义配色）
+  const sectorThematicActive = useMemo(() => {
+    const map: Record<string, boolean> = {}
+    for (const s of sectors) {
+      map[s.id] = !!persistedThematicSettings[s.id]?.enabled
+    }
+    return map
+  }, [sectors, persistedThematicSettings])
 
   // 用户手动切换的展开节点ID集合
   const [expandedNodeIds, setExpandedNodeIds] = useState<Set<string>>(new Set(['root', 'sector-group', 'custom-group']))
@@ -280,6 +355,24 @@ export function LayerControl({
     color: '#000000',
     fontSize: 12
   })
+
+  // 图层颜色设置弹窗状态
+  const [activeTab, setActiveTab] = useState<'label' | 'color'>('label')
+  const [currentColorSettings, setCurrentColorSettings] = useState<LayerColorSettings>({
+    fillColor: '#3b82f6',
+    fillOpacity: 0.6,
+    borderWidth: 2,
+    borderColor: '#000000'
+  })
+
+  // 专题图层设置弹窗状态
+  const [currentThematicSettings, setCurrentThematicSettings] = useState<ThematicSettings | null>(null)
+  const [thematicFieldSamples, setThematicFieldSamples] = useState<Record<string, any[]>>({})
+  const [loadingThematicSamples, setLoadingThematicSamples] = useState(false)
+  // 颜色设置页初始子页（图例双击跳转时打开专题图层页）
+  const [modalInitialSubTab, setModalInitialSubTab] = useState<'basic' | 'thematic' | undefined>(undefined)
+  // 专题字段样本缓存（避免重复提取同一图层）
+  const thematicSamplesCacheRef = useRef<Record<string, Record<string, any[]>>>({})
 
   // 字段选项状态 - 初始化为预定义字段，避免右键时为空
   const [fieldOptions, setFieldOptions] = useState<FieldOption[]>(PREDEFINED_LABEL_FIELDS)
@@ -357,6 +450,145 @@ export function LayerControl({
       setLoadingFields(false)
     }
   }, [getCache])
+
+  /**
+   * 从记录数组中聚合字段值样本（去重，每字段限 N 个）
+   * 兼容两种数据形态：GeoJSON features（MapInfo）与 item 数组（Excel，properties 嵌套）
+   */
+  /**
+   * 从记录数组中聚合字段值样本（去重，每字段限 N 个；含质心坐标用于地理隔离配色）
+   * 兼容两种数据形态：GeoJSON features（MapInfo）与 item 数组（Excel，properties 嵌套）
+   */
+  const collectFieldSamples = useCallback((records: any[], maxValuesPerField = 1800): Record<string, FieldValueSample[]> => {
+    const EXCLUDE = new Set(['_style', 'properties', 'attributes', 'longitude', 'latitude', 'displayLng', 'displayLat', 'type', 'geometry', 'path', 'azimuth', 'beamwidth', 'cell_cover_type'])
+    const map: Record<string, FieldValueSample[]> = {}
+    const seen: Record<string, Set<string>> = {}
+    // 坐标累计（质心 = 平均值）
+    const acc: Record<string, Record<string, { latSum: number; lngSum: number; count: number }>> = {}
+    for (const rec of records) {
+      // 提取要素坐标（GeoJSON: geometry.coordinates [lng, lat]；Excel item: displayLat/displayLng 或 latitude/longitude）
+      let lat: number | undefined
+      let lng: number | undefined
+      if (rec?.geometry?.coordinates) {
+        const c = rec.geometry.coordinates
+        const flat = Array.isArray(c[0]) ? c[0] : c
+        lng = Number(flat[0])
+        lat = Number(flat[1])
+      } else if (rec?.path && Array.isArray(rec.path) && rec.path.length > 0) {
+        const mid = rec.path[Math.floor(rec.path.length / 2)]
+        lat = Number(mid[0])
+        lng = Number(mid[1])
+      } else {
+        lat = rec?.displayLat ?? rec?.latitude
+        lng = rec?.displayLng ?? rec?.longitude
+      }
+      const props = rec?.properties || rec
+      if (!props || typeof props !== 'object') continue
+      const keys = new Set<string>(Object.keys(props).filter(k => !EXCLUDE.has(k)))
+      const nested = props.properties || props.attributes
+      if (nested && typeof nested === 'object') {
+        for (const k of Object.keys(nested)) if (!EXCLUDE.has(k)) keys.add(k)
+      }
+      for (const k of keys) {
+        const v = getFieldValue(props, k)
+        if (!hasValue(v)) continue
+        if (!map[k]) { map[k] = []; seen[k] = new Set(); acc[k] = {} }
+        if (map[k].length >= maxValuesPerField) continue
+        const s = String(v)
+        if (seen[k].has(s)) continue
+        seen[k].add(s)
+        const a = acc[k][s] || (acc[k][s] = { latSum: 0, lngSum: 0, count: 0 })
+        if (typeof lat === 'number' && typeof lng === 'number') {
+          a.latSum += lat
+          a.lngSum += lng
+          a.count++
+        }
+        map[k].push({
+          v,
+          lat: a.count > 0 ? a.latSum / a.count : 0,
+          lng: a.count > 0 ? a.lngSum / a.count : 0
+        })
+      }
+    }
+    return map
+  }, [])
+
+  /**
+   * 提取专题图层字段值样本（cache-first：优先前端已有数据，冷缓存才请求后端）
+   */
+  const extractThematicSamples = useCallback(async (node: TreeNode) => {
+    // 扇区图层：直接使用传入的扇区数据（LTE/NR 各一份）
+    if (node.type === 'sector-layer') {
+      const sl = node.sectorLayer
+      if (!sl) return
+      const records = sectorData ? (sl.type === 'LTE' ? sectorData.lte : sectorData.nr) : []
+      const cacheKey = `samples-sector-${sl.id}`
+      const cache = thematicSamplesCacheRef.current
+      if (cache[cacheKey]) {
+        setThematicFieldSamples(cache[cacheKey])
+        return
+      }
+      setLoadingThematicSamples(true)
+      try {
+        const samples = collectFieldSamples(records || [])
+        cache[cacheKey] = samples
+        setThematicFieldSamples(samples)
+      } catch (error) {
+        console.error('[LayerControl] 提取扇区专题字段样本失败:', error)
+        setThematicFieldSamples({})
+      } finally {
+        setLoadingThematicSamples(false)
+      }
+      return
+    }
+
+    const lf = node.layerFile
+    if (!lf) return
+    // 采样逻辑变更时递增，使旧版本的不完整样本缓存失效
+    const cacheKey = `samples-v2-${lf.dataId}-${lf.id}`
+    const cache = thematicSamplesCacheRef.current
+    if (cache[cacheKey]) {
+      setThematicFieldSamples(cache[cacheKey])
+      return
+    }
+    setLoadingThematicSamples(true)
+    try {
+      let records: any[] | null = null
+      if (lf.sourceType === 'excel') {
+        // 1. pointFileData（MapPage 已传入的原始数据）
+        const fd = pointFileData[lf.id]
+        if (fd && Array.isArray(fd) && fd.length > 0) {
+          records = fd
+        } else {
+          // 2. dataApi.get 回退
+          const res = await dataApi.get(lf.dataId)
+          if (res.success && res.data) {
+            if (Array.isArray(res.data)) records = res.data
+            else if (res.data.data && Array.isArray(res.data.data)) records = res.data.data
+            else if (res.data.lte) records = res.data.lte
+            else if (res.data.nr) records = res.data.nr
+          }
+        }
+      } else {
+        // MapInfo：优先 useMapDataCacheStore（prefetchLayerData 已写入）
+        const cached = useMapDataCacheStore.getState().layers[lf.id]?.geojson
+        if (cached?.features?.length) {
+          records = cached.features
+        } else {
+          const res = await layerApi.getLayerData(lf.dataId, lf.id)
+          if (res.success && res.data?.features) records = res.data.features
+        }
+      }
+      const samples = collectFieldSamples(records || [])
+      cache[cacheKey] = samples
+      setThematicFieldSamples(samples)
+    } catch (error) {
+      console.error('[LayerControl] 提取专题字段样本失败:', error)
+      setThematicFieldSamples({})
+    } finally {
+      setLoadingThematicSamples(false)
+    }
+  }, [pointFileData, sectorData, collectFieldSamples])
 
   /**
    * 预取图层文件字段选项（不阻塞UI）
@@ -623,19 +855,38 @@ export function LayerControl({
     document.body.style.userSelect = ''
   }
 
-  // 全局右键菜单状态
+  // 全局右键菜单状态（type: 'layer-file' 自定义菜单 / 'custom-layer' 卸载菜单）
   const [contextMenu, setContextMenu] = useState<{ x: number, y: number, nodeId: string, type: string } | null>(null)
 
   // 处理右键点击
-  const handleContextMenu = (e: React.MouseEvent, node: TreeNode) => {
-    e.preventDefault()
-    e.stopPropagation()
+  /**
+   * 判断图层文件是否已勾选可见（图层预览菜单可用性）
+   */
+  const isFileVisible = (fileId: string): boolean => {
+    return [...layerFiles, ...pointFiles].some(f => f.id === fileId && f.visible)
+  }
 
+  /**
+   * 判断扇区图层是否已勾选可见（图层预览菜单可用性）
+   */
+  const isSectorVisible = (layerId: string): boolean => {
+    return sectors.some(s => s.id === layerId && s.visible)
+  }
+
+  /**
+   * 打开图层设置弹窗（右键 / 图例双击跳转共用）
+   * @param node 目标图层节点
+   * @param tab 初始标签页
+   * @param subTab 颜色设置页初始子页（'thematic' 表示专题图层页）
+   */
+  const openSettingsDialog = (node: TreeNode, tab: 'label' | 'color', subTab?: 'basic' | 'thematic') => {
     // 支持 sector-layer 和 layer-file 的标签设置
     if (node.type === 'sector-layer' || node.type === 'layer-file') {
       // 先立即显示对话框
       setShowLabelSettingsModal(true)
       setCurrentSettingsNode(node)
+      setActiveTab(tab)
+      setModalInitialSubTab(subTab)
 
       // 获取图层ID用于加载已保存的设置
       let layerId = ''
@@ -654,9 +905,27 @@ export function LayerControl({
         fontSize: 12
       })
 
+      // 载入已保存的颜色设置（无保存设置时，用图层文件自带的默认样式初始化，
+      // 还原 tab/mif/kml 的默认属性配置：填充色/边框色/线宽/透明度）
+      const savedColor = persistedColorSettings[layerId]
+      const ds = node.type === 'layer-file' ? node.layerFile?.defaultStyle : undefined
+      setCurrentColorSettings(savedColor || {
+        fillColor: ds?.fillColor || ds?.markerColor || '#3b82f6',
+        fillOpacity: ds?.fillOpacity ?? 0.6,
+        borderWidth: ds?.strokeWidth ?? 2,
+        borderColor: ds?.strokeColor || '#000000'
+      })
+
+      // 专题图层设置初始化（图层文件类与扇区类）+ 字段值样本提取（cache-first）
+      // 注意：扇区类也必须从持久化初始化（或置空），否则会残留上次打开图层文件时
+      // 的专题激活状态，导致"基站"图层颜色设置被错误禁用
+      if (node.type === 'layer-file' || node.type === 'sector-layer') {
+        setCurrentThematicSettings(persistedThematicSettings[layerId] ?? null)
+        extractThematicSamples(node)
+      }
+
       // 异步加载字段选项（不阻塞对话框显示）
       if (node.type === 'sector-layer' && node.sectorLayer) {
-        // LTE/NR扇区：从预定义字段列表加载（同步）
         setFieldOptions(PREDEFINED_LABEL_FIELDS)
         fetchSectorFieldOptions(node.sectorLayer.type)
       } else if (node.type === 'layer-file' && node.layerFile) {
@@ -764,6 +1033,33 @@ export function LayerControl({
           fetchLayerFileFieldOptions(node.layerFile.dataId, node.layerFile.id)
         }
       }
+    }
+  }
+
+  const handleContextMenu = (e: React.MouseEvent, node: TreeNode) => {
+    e.preventDefault()
+    e.stopPropagation()
+
+    // 图层文件/地理化数据/扇区图层：右键弹出冒泡菜单（自定义设置 / 图层预览）
+    if (node.type === 'layer-file' || node.type === 'sector-layer') {
+      setContextMenu({
+        x: e.clientX,
+        y: e.clientY,
+        nodeId: node.id,
+        type: node.type
+      })
+    } else if (node.type === 'decoration-layer') {
+      setShowLabelSettingsModal(true)
+      setCurrentSettingsNode(node)
+      setActiveTab('color')
+      setModalInitialSubTab(undefined)
+      const savedColor = persistedColorSettings['decoration-layer']
+      setCurrentColorSettings(savedColor || {
+        fillColor: '#ef4444',
+        fillOpacity: 1,
+        borderWidth: 2,
+        borderColor: '#ffffff'
+      })
     } else if (node.type === 'custom-layer') {
       // 自定义图层支持卸载
       setContextMenu({
@@ -783,6 +1079,31 @@ export function LayerControl({
     }
     return () => window.removeEventListener('click', handleGlobalClick)
   }, [contextMenu])
+
+  // 图例双击跳转：打开对应图层的专题图层设置页
+  useEffect(() => {
+    if (!openThematicFor) return
+    const layerId = openThematicFor.layerId
+    // 扇区图层（基站 LTE/NR）
+    const sector = sectors.find(s => s.id === layerId)
+    if (sector) {
+      const node: TreeNode = {
+        id: sector.id,
+        type: 'sector-layer',
+        label: sector.type === 'LTE' ? 'LTE' : 'NR',
+        sectorLayer: sector,
+        sectorLabel: { layerId: sector.id, visible: sectorLabelVisibility[sector.id] || false }
+      }
+      openSettingsDialog(node, 'color', 'thematic')
+      return
+    }
+    // 图层文件 / 地理化数据
+    const file = [...layerFiles, ...pointFiles].find(f => f.id === layerId)
+    if (!file) return
+    const node: TreeNode = { id: file.id, type: 'layer-file', label: file.name, layerFile: file }
+    openSettingsDialog(node, 'color', 'thematic')
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [openThematicFor])
 
   /**
    * 保存标签设置
@@ -810,6 +1131,64 @@ export function LayerControl({
 
     // 更新本地状态
     setCurrentLabelSettings(settings)
+    setShowLabelSettingsModal(false)
+  }
+
+  /**
+   * 保存图层颜色设置
+   */
+  const handleSaveColorSettings = (settings: LayerColorSettings) => {
+    const node = currentSettingsNode
+    if (!node) return
+
+    // 获取图层ID（装饰图层为固定 id）
+    let layerId = ''
+    if (node.type === 'sector-layer' && node.sectorLayer) {
+      layerId = node.sectorLayer.id
+    } else if (node.type === 'layer-file' && node.layerFile) {
+      layerId = node.layerFile.id
+    } else if (node.type === 'decoration-layer') {
+      layerId = 'decoration-layer'
+    }
+
+    if (layerId) {
+      // 保存到持久化 store
+      storeUpdateColorSettings(layerId, settings)
+    }
+
+    // 通知父组件应用到地图
+    onColorSettingsChange?.(node, settings)
+
+    // 更新本地状态
+    setCurrentColorSettings(settings)
+    setShowLabelSettingsModal(false)
+  }
+
+  /**
+   * 保存专题图层设置
+   */
+  const handleSaveThematicSettings = (settings: ThematicSettings | null) => {
+    const node = currentSettingsNode
+    if (!node) return
+
+    // 获取图层ID
+    let layerId = ''
+    if (node.type === 'layer-file' && node.layerFile) {
+      layerId = node.layerFile.id
+    } else if (node.type === 'sector-layer' && node.sectorLayer) {
+      layerId = node.sectorLayer.id
+    }
+
+    if (layerId) {
+      // 保存到持久化 store（null 表示关闭专题，删除条目）
+      storeUpdateThematicSettings(layerId, settings)
+    }
+
+    // 通知父组件应用到地图
+    onThematicSettingsChange?.(node, settings)
+
+    // 更新本地状态
+    setCurrentThematicSettings(settings)
     setShowLabelSettingsModal(false)
   }
 
@@ -1051,6 +1430,8 @@ export function LayerControl({
               mapType={mapType}
               pointFileLabelVisibility={pointFileLabelVisibility}
               layerFileLabelVisibility={layerFileLabelVisibility}
+              onFrequencyColorChange={onFrequencyColorChange}
+              sectorThematicActive={sectorThematicActive}
             />
           ))}
         </div>
@@ -1070,39 +1451,83 @@ export function LayerControl({
             boxShadow: '0 4px 12px rgba(0,0,0,0.15)',
             border: '1px solid #e2e8f0',
             padding: '4px',
-            minWidth: '100px'
+            minWidth: '140px'
           }}
           onClick={(e) => e.stopPropagation()}
         >
-          <button
-            onClick={() => {
-              if (contextMenu.type === 'layer-file') {
-                onLayerFileRemove?.(contextMenu.nodeId)
-              } else if (contextMenu.type === 'custom-layer') {
+          {(contextMenu.type === 'layer-file' || contextMenu.type === 'sector-layer') && (
+            <>
+              {/* 自定义设置 */}
+              <button
+                onClick={() => {
+                  if (contextMenu.type === 'sector-layer') {
+                    const sector = sectors.find(s => s.id === contextMenu.nodeId)
+                    if (sector) {
+                      const treeNode: TreeNode = {
+                        id: sector.id,
+                        type: 'sector-layer',
+                        label: sector.type === 'LTE' ? 'LTE' : 'NR',
+                        sectorLayer: sector,
+                        sectorLabel: { layerId: sector.id, visible: sectorLabelVisibility[sector.id] || false }
+                      }
+                      openSettingsDialog(treeNode, 'label')
+                    }
+                  } else {
+                    const node = [...layerFiles, ...pointFiles].find(f => f.id === contextMenu.nodeId)
+                    if (node) {
+                      const treeNode: TreeNode = { id: node.id, type: 'layer-file', label: node.name, layerFile: node }
+                      openSettingsDialog(treeNode, 'label')
+                    }
+                  }
+                  setContextMenu(null)
+                }}
+                style={menuItemStyle}
+                onMouseEnter={(e) => (e.currentTarget.style.backgroundColor = '#f1f5f9')}
+                onMouseLeave={(e) => (e.currentTarget.style.backgroundColor = 'transparent')}
+              >
+                <Settings size={14} />
+                <span>{t('map.customSettings')}</span>
+              </button>
+              {/* 图层预览：仅已勾选图层支持 */}
+              <button
+                onClick={() => {
+                  onLayerPreview?.(contextMenu.nodeId)
+                  setContextMenu(null)
+                }}
+                disabled={contextMenu.type === 'sector-layer' ? !isSectorVisible(contextMenu.nodeId) : !isFileVisible(contextMenu.nodeId)}
+                style={{
+                  ...menuItemStyle,
+                  opacity: contextMenu.type === 'sector-layer' ? (isSectorVisible(contextMenu.nodeId) ? 1 : 0.45) : (isFileVisible(contextMenu.nodeId) ? 1 : 0.45),
+                  cursor: contextMenu.type === 'sector-layer' ? (isSectorVisible(contextMenu.nodeId) ? 'pointer' : 'not-allowed') : (isFileVisible(contextMenu.nodeId) ? 'pointer' : 'not-allowed')
+                }}
+                onMouseEnter={(e) => {
+                  const enabled = contextMenu.type === 'sector-layer' ? isSectorVisible(contextMenu.nodeId) : isFileVisible(contextMenu.nodeId)
+                  if (enabled) e.currentTarget.style.backgroundColor = '#f1f5f9'
+                }}
+                onMouseLeave={(e) => (e.currentTarget.style.backgroundColor = 'transparent')}
+                title={contextMenu.type === 'sector-layer'
+                  ? (isSectorVisible(contextMenu.nodeId) ? t('map.layerPreviewHint') : t('map.layerPreviewDisabledHint'))
+                  : (isFileVisible(contextMenu.nodeId) ? t('map.layerPreviewHint') : t('map.layerPreviewDisabledHint'))}
+              >
+                <Maximize2 size={14} />
+                <span>{t('map.layerPreview')}</span>
+              </button>
+            </>
+          )}
+          {contextMenu.type === 'custom-layer' && (
+            <button
+              onClick={() => {
                 onCustomLayerRemove?.(contextMenu.nodeId)
-              }
-              setContextMenu(null)
-            }}
-            style={{
-              width: '100%',
-              display: 'flex',
-              alignItems: 'center',
-              gap: '8px',
-              padding: '8px 12px',
-              fontSize: '12px',
-              color: '#ef4444',
-              cursor: 'pointer',
-              border: 'none',
-              backgroundColor: 'transparent',
-              textAlign: 'left',
-              borderRadius: '4px'
-            }}
-            onMouseEnter={(e) => (e.currentTarget.style.backgroundColor = '#fff1f2')}
-            onMouseLeave={(e) => (e.currentTarget.style.backgroundColor = 'transparent')}
-          >
-            <X size={14} />
-            <span>{t('map.unloadLayer')}</span>
-          </button>
+                setContextMenu(null)
+              }}
+              style={{ ...menuItemStyle, color: '#ef4444' }}
+              onMouseEnter={(e) => (e.currentTarget.style.backgroundColor = '#fff1f2')}
+              onMouseLeave={(e) => (e.currentTarget.style.backgroundColor = 'transparent')}
+            >
+              <X size={14} />
+              <span>{t('map.unloadLayer')}</span>
+            </button>
+          )}
         </div>
       )}
 
@@ -1111,10 +1536,27 @@ export function LayerControl({
         isOpen={showLabelSettingsModal}
         onClose={() => setShowLabelSettingsModal(false)}
         onSave={handleSaveLabelSettings}
-        title={currentSettingsNode?.type === 'sector-layer' ? t('map.sectorLabelSettings') : t('map.layerFileLabelSettings')}
+        title={currentSettingsNode?.type === 'sector-layer' ? t('map.customSettings') : t('map.layerFileLabelSettings')}
         currentSettings={currentLabelSettings}
         fieldOptions={fieldOptions}
         loadingFields={loadingFields}
+        activeTab={activeTab}
+        onTabChange={setActiveTab}
+        currentColorSettings={currentColorSettings}
+        onSaveColor={handleSaveColorSettings}
+        showThematicTab={currentSettingsNode?.type === 'layer-file' || currentSettingsNode?.type === 'sector-layer'}
+        sectorColorMode={currentSettingsNode?.type === 'sector-layer'}
+        currentThematicSettings={currentThematicSettings}
+        onSaveThematic={handleSaveThematicSettings}
+        thematicFieldSamples={thematicFieldSamples}
+        loadingThematicSamples={loadingThematicSamples}
+        initialColorSubTab={modalInitialSubTab ?? 'basic'}
+        thematicGeometryType={currentSettingsNode?.type === 'sector-layer'
+          ? 'sector'
+          : currentSettingsNode?.layerFile?.type as 'point' | 'line' | 'polygon' | 'sector' | undefined}
+        thematicTemplates={thematicTemplates}
+        onSaveThematicTemplate={onSaveThematicTemplate}
+        onRemoveThematicTemplate={onRemoveThematicTemplate}
       />
     </>
   )
@@ -1145,6 +1587,10 @@ interface TreeNodeComponentProps {
   mapType: 'roadmap' | 'satellite';
   pointFileLabelVisibility: Record<string, boolean>;
   layerFileLabelVisibility: Record<string, boolean>;
+  /** 频点自定义配色回调（点击频点色块） */
+  onFrequencyColorChange?: (networkType: NetworkType, frequency: number, colors: { color: string; strokeColor: string }) => void;
+  /** 各扇区图层专题是否激活（激活时频点色块不可点击） */
+  sectorThematicActive?: Record<string, boolean>;
 }
 
 /**
@@ -1170,7 +1616,9 @@ function TreeNodeComponent({
   onContextMenu,
   mapType,
   pointFileLabelVisibility,
-  layerFileLabelVisibility
+  layerFileLabelVisibility,
+  onFrequencyColorChange,
+  sectorThematicActive
 }: TreeNodeComponentProps) {
   const getIndent = () => {
     // 根据层级添加缩进：每级 16px
@@ -1247,8 +1695,15 @@ function TreeNodeComponent({
         return <span style={{ fontSize: '14px' }}>📝</span>
       case 'layer-file-label':
         return <span style={{ fontSize: '14px' }}>🏷️</span>
-      case 'layer-file':
+      case 'layer-file': {
+        // 按图层类型显示点/线/面图标（复选框左侧的类型标识）
+        const lfType = node.layerFile?.type || node.layerFile?.geometryType
+        if (lfType === 'point') return <MapPin size={12} color="#2563eb" />
+        if (lfType === 'line') return <Route size={12} color="#16a34a" />
+        if (lfType === 'polygon') return <Hexagon size={12} color="#ea580c" />
+        if (lfType === 'sector') return <Radio size={12} color="#000" />
         return <File size={12} color="#000" />
+      }
       case 'custom-group':
         return <Folder size={14} color="#000" />
       case 'custom-layer':
@@ -1326,8 +1781,15 @@ function TreeNodeComponent({
           </>
         )}
 
-        {/* 节点图标 */}
-        <span style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', width: '16px' }}>
+        {/* 节点图标 - 图层文件类型图标（设置入口已移至右键菜单） */}
+        <span
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            width: '16px'
+          }}
+        >
           {getNodeIcon()}
         </span>
 
@@ -1629,6 +2091,10 @@ function TreeNodeComponent({
               visible
             )}
             networkType={node.frequency!.networkType}
+            onColorChange={onFrequencyColorChange
+              ? (color, strokeColor) => onFrequencyColorChange(node.frequency!.networkType, node.frequency!.frequency, { color, strokeColor })
+              : undefined}
+            colorPickDisabled={!!sectorThematicActive?.[node.frequency.networkType === 'LTE' ? 'lte-sectors' : 'nr-sectors']}
           />
         )}
 
@@ -1739,6 +2205,8 @@ function TreeNodeComponent({
               mapType={mapType}
               pointFileLabelVisibility={pointFileLabelVisibility}
               layerFileLabelVisibility={layerFileLabelVisibility}
+              onFrequencyColorChange={onFrequencyColorChange}
+              sectorThematicActive={sectorThematicActive}
             />
           ))}
         </div>
@@ -1865,24 +2333,49 @@ function LayerFileCheckbox({ file, onToggle }: LayerFileCheckboxProps) {
 }
 
 /**
+ * 使十六进制颜色变深（用于频点自定义配色的边框色）
+ */
+function darkenHex(hex: string, amount = 35): string {
+  const m = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex)
+  if (!m) return hex
+  const to = (n: number) => Math.max(0, n - amount)
+  const r = to(parseInt(m[1], 16))
+  const g = to(parseInt(m[2], 16))
+  const b = to(parseInt(m[3], 16))
+  return `#${[r, g, b].map(v => v.toString(16).padStart(2, '0')).join('')}`
+}
+
+/**
  * 频点复选框组件属性接口
  */
 interface FrequencyCheckboxProps {
   frequency: FrequencyOption;
   onToggle: (visible: boolean) => void;
   networkType: NetworkType;
+  /** 频点自定义配色回调（点击色块进入配色面板） */
+  onColorChange?: (color: string, strokeColor: string) => void;
+  /** 专题图层激活时禁用配色面板 */
+  colorPickDisabled?: boolean;
 }
 
 /**
  * 频点复选框组件
- * 显示频点颜色方块和复选框
+ * 显示频点颜色方块和复选框；默认设置模式下点击色块进入配色面板自定义配色并持久化
  */
-function FrequencyCheckbox({ frequency, onToggle, networkType }: FrequencyCheckboxProps) {
+function FrequencyCheckbox({ frequency, onToggle, networkType, onColorChange, colorPickDisabled = false }: FrequencyCheckboxProps) {
+  const { t } = useTranslation()
   const [isChecked, setIsChecked] = useState(frequency.visible);
+  const [showColorPicker, setShowColorPicker] = useState(false);
+  const [draftColor, setDraftColor] = useState(frequency.color);
 
   useEffect(() => {
     setIsChecked(frequency.visible);
   }, [frequency.visible]);
+
+  // 外部颜色变化（父组件持久化返回）时同步草稿色
+  useEffect(() => {
+    setDraftColor(frequency.color);
+  }, [frequency.color]);
 
   const handleToggle = (e: React.ChangeEvent<HTMLInputElement>) => {
     e.stopPropagation();
@@ -1891,17 +2384,31 @@ function FrequencyCheckbox({ frequency, onToggle, networkType }: FrequencyCheckb
     onToggle(newValue);
   };
 
+  const canPickColor = !!onColorChange && !colorPickDisabled;
+
+  const applyColor = (color: string) => {
+    setDraftColor(color);
+    onColorChange?.(color, darkenHex(color));
+  };
+
   return (
-    <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-      {/* 颜色方块 - 优化样式 */}
+    <div style={{ display: 'flex', alignItems: 'center', gap: '8px', position: 'relative' }}>
+      {/* 颜色方块 - 优化样式；默认设置模式下可点击进入配色面板 */}
       <div
+        onClick={(e) => {
+          if (!canPickColor) return
+          e.stopPropagation()
+          setShowColorPicker(prev => !prev)
+        }}
+        title={canPickColor ? t('map.frequencyColorEdit') : (colorPickDisabled ? t('map.frequencyColorDisabled') : undefined)}
         style={{
           width: '14px',
           height: '14px',
           backgroundColor: frequency.color,
           border: `1px solid ${frequency.strokeColor}`,
           borderRadius: '4px',
-          boxShadow: '0 1px 2px rgba(0, 0, 0, 0.1)'
+          boxShadow: '0 1px 2px rgba(0, 0, 0, 0.1)',
+          cursor: canPickColor ? 'pointer' : 'default'
         }}
       />
 
@@ -1914,6 +2421,49 @@ function FrequencyCheckbox({ frequency, onToggle, networkType }: FrequencyCheckb
         />
         <span className="checkmark"></span>
       </label>
+
+      {/* 频点配色面板（默认设置模式下点击色块弹出） */}
+      {showColorPicker && (
+        <div
+          className="frequency-color-picker"
+          style={{
+            position: 'absolute',
+            right: 0,
+            top: '24px',
+            zIndex: 1200,
+            backgroundColor: 'white',
+            borderRadius: '8px',
+            boxShadow: '0 4px 16px rgba(0,0,0,0.18)',
+            border: '1px solid #e2e8f0',
+            padding: '10px',
+            width: '200px'
+          }}
+          onClick={(e) => e.stopPropagation()}
+        >
+          <div style={{ fontSize: '11px', color: '#555', marginBottom: '6px', fontWeight: 500 }}>
+            {frequency.frequency} MHz
+          </div>
+          <HexColorPicker color={draftColor} onChange={applyColor} style={{ width: '100%', height: '150px' }} />
+          <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginTop: '8px' }}>
+            <input
+              type="text"
+              value={draftColor}
+              onChange={(e) => applyColor(e.target.value)}
+              className="flex-1 px-2 py-1 text-xs border border-border rounded bg-background focus:outline-none focus:ring-1 focus:ring-primary"
+              placeholder="#000000"
+            />
+            <button
+              onClick={(e) => {
+                e.stopPropagation()
+                setShowColorPicker(false)
+              }}
+              className="px-2 py-1 text-xs bg-primary text-primary-foreground rounded hover:bg-primary/90 transition-colors"
+            >
+              {t('map.frequencyColorDone')}
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
