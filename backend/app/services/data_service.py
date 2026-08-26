@@ -65,6 +65,8 @@ class DataService:
         self._data_cache: Dict[str, Dict[str, Any]] = {}
         # 索引缓存时间戳
         self._index_mtime: Optional[float] = None
+        # 小区搜索索引缓存: (workbook_id, normalized_items) 惰性搜索索引
+        self._cell_search_cache = None
         # 扫描uploads目录 - 默认延迟加载以加快启动
         if not lazy_load:
             self._scan_uploads_directory()
@@ -792,13 +794,8 @@ class DataService:
         同时写入 Excel 文件（LTE/NR Project Parameters sheet）和 SQLite 数据库。
         """
         # 1. 定位全量工参文件
-        full_params_id = None
-        full_params_info = None
-        for _id, _info in self.index.items():
-            if _info.get("fileType") == "full_params":
-                full_params_id = _id
-                full_params_info = _info
-                break
+        full_params_id = self._find_full_params_id()
+        full_params_info = self.index.get(full_params_id) if full_params_id else None
 
         if not full_params_id or not full_params_info:
             raise ValueError("未找到全量工参文件，请先上传全量工参")
@@ -1006,12 +1003,108 @@ class DataService:
         self._save_index()
 
         safe_print(f"[DataService] 新站录入完成: {cell_name} ({network_type_val})")
+        self._invalidate_cell_search_index()
 
         return {
             "success": True,
             "message": f"新增小区 {cell_name} 成功",
             "cellId": sector_id_str,
         }
+
+    def _find_full_params_id(self) -> Optional[str]:
+        """定位全量工参文件 id（约定全局唯一；多个时告警并取第一个）"""
+        found = [
+            (_id, _info) for _id, _info in self.index.items()
+            if isinstance(_info, dict) and _info.get("fileType") == "full_params"
+        ]
+        if len(found) > 1:
+            safe_print(f"[DataService] WARN: 检测到 {len(found)} 个全量工参文件，仅使用第一个: {found[0][0]}")
+        return found[0][0] if found else None
+
+    def _invalidate_cell_search_index(self):
+        """写入后使搜索索引失效，下次搜索重建"""
+        self._cell_search_cache = None
+
+    def _load_cell_search_index(self, workbook_id: str):
+        """惰性构建搜索索引：Site+Sector 一次连接读出，归一化后缓存。"""
+        if self._cell_search_cache is not None and self._cell_search_cache[0] == workbook_id:
+            return self._cell_search_cache[1]
+
+        db = SessionLocal()
+        items = []
+        try:
+            rows = db.query(Site, Sector).join(Sector, Sector.site_id_fk == Site.id).filter(
+                Site.workbook_id == workbook_id
+            ).all()
+            for site, sector in rows:
+                sid = str(sector.sector_id)
+                cell_id = sid.rsplit("_", 1)[-1] if "_" in sid else sid
+                def _norm(v):
+                    return (str(v or "").strip().lower())
+                hay = "|".join([
+                    _norm(sector.name),
+                    _norm(site.site_id),
+                    _norm(site.managed_element_id),
+                    _norm(site.name),
+                ])
+                items.append({
+                    "rowKey": f"{site.id}:{sector.id}",
+                    "networkType": str(site.network_type or "").upper(),
+                    "siteId": str(site.site_id),
+                    "cellId": cell_id,
+                    "cellName": sector.name or "",
+                    "siteName": site.name,
+                    "managedElementId": site.managed_element_id,
+                    "mcc": sector.mcc,
+                    "mnc": sector.mnc,
+                    "longitude": sector.longitude,
+                    "latitude": sector.latitude,
+                    "azimuth": sector.azimuth,
+                    "frequency": sector.frequency if str(site.network_type or "").upper() == "LTE" else None,
+                    "ssbFrequency": sector.frequency if str(site.network_type or "").upper() == "NR" else None,
+                    "cellCoverType": sector.cell_cover_type or 1,
+                    "_hay": hay,
+                })
+        finally:
+            db.close()
+        self._cell_search_cache = (workbook_id, items)
+        return items
+
+    def search_cells(self, query: str, network_type: Optional[str] = None,
+                     limit: int = 20, workbook_id: Optional[str] = None) -> List[Dict]:
+        """智能模糊搜索：小区名/网元ID/基站ID/站点名，返回 top-N。"""
+        if not workbook_id:
+            workbook_id = self._find_full_params_id()
+        if not workbook_id:
+            return []
+        q = query.strip().lower()
+        if not q:
+            return []
+        nt_filter = (network_type or "").upper() or None
+
+        items = self._load_cell_search_index(workbook_id)
+        matched = []
+        for it in items:
+            if nt_filter and it["networkType"] != nt_filter:
+                continue
+            if q in it["_hay"]:
+                score = 0
+                if it["cellName"] and it["cellName"].strip().lower().startswith(q):
+                    score += 100
+                if it["siteName"] and it["siteName"].strip().lower().startswith(q):
+                    score += 90
+                if it["managedElementId"] and str(it["managedElementId"]).strip().lower().startswith(q):
+                    score += 80
+                if it["siteId"] and str(it["siteId"]).strip().lower().startswith(q):
+                    score += 70
+                if it["cellName"] and q in it["cellName"].strip().lower():
+                    score += 20
+                if it["siteName"] and q in it["siteName"].strip().lower():
+                    score += 15
+                matched.append((score, it))
+
+        matched.sort(key=lambda x: (-x[0], x[1]["cellName"] or ""))
+        return [m[1] for m in matched[:limit]]
 
     def batch_add_cells_to_full_params(self, cells: List[Dict]) -> Dict[str, Any]:
         """高性能批量向全量工参追加多个小区（一次性文件操作 + 单事务 SQLite）
@@ -1022,13 +1115,8 @@ class DataService:
         返回: { results: [...], total: N, successCount: N }
         """
         # 1. 定位全量工参文件（只需定位一次）
-        full_params_id = None
-        full_params_info = None
-        for _id, _info in self.index.items():
-            if _info.get("fileType") == "full_params":
-                full_params_id = _id
-                full_params_info = _info
-                break
+        full_params_id = self._find_full_params_id()
+        full_params_info = self.index.get(full_params_id) if full_params_id else None
 
         if not full_params_id or not full_params_info:
             raise ValueError("未找到全量工参文件，请先上传全量工参")
@@ -1367,6 +1455,8 @@ class DataService:
             self._save_index()
         except Exception as e:
             safe_print(f"[DataService] 更新索引失败 (非致命): {e}")
+
+        self._invalidate_cell_search_index()
 
         return {
             "success": sqlite_success,
