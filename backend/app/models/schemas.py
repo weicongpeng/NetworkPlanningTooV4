@@ -39,6 +39,7 @@ class DataStatus(str, Enum):
     PROCESSING = "processing"
     READY = "ready"
     ERROR = "error"
+    PARTIAL = "partial"  # 部分图层解析成功/失败（MapInfo 多文件导入时）
 
 
 # ============== 许可证相关 ==============
@@ -144,6 +145,7 @@ class DataItem(BaseModel):
     status: DataStatus
     metadata: Optional[Dict[str, Any]] = None
     geometryType: Optional[str] = None  # 几何类型：point, sector, polygon
+    errorMessage: Optional[str] = None  # 处理失败时的错误详情（用于前端透传真实原因）
     excelSynced: Optional[bool] = None  # Excel 是否已从 SQLite 同步更新
     inplaceUpdated: Optional[bool] = None  # 文件是否已原地更新（PCI/TAC应用）
 

@@ -66,11 +66,16 @@ export function TACPlanningPage() {
     const { taskId, config, result, setTaskId, setConfig, setResult, clearTAC, activeLeftTab, setActiveLeftTab } = useTACPlanningStore()
     const { startTask, updateTaskProgress, completeTask, failTask, syncHistoryFromBackend, setActiveTaskId,
       startGlobalPolling, stopGlobalPolling, isGlobalPollingActive } = useTaskStore()
+    // 🔥 页面挂载时同步一次历史计数（badge 显示后端真实任务总数）
+    useEffect(() => {
+      syncHistoryFromBackend('tac_planning').catch(() => {})
+    }, [syncHistoryFromBackend])
     const [loading, setLoading] = useState(false)
     const storeTask = useTaskStore(s => taskId ? s.tasks[taskId] : undefined)
     const [error, setError] = useState<string | null>(null)
     const taskResult = result as TACResultData | null
-    const tacPlanningHistoryCount = useTaskStore(s => Object.values(s.tasks).filter(t => t.type === 'tac_planning').length)
+    // 🔥 修复：改用后端返回的真实任务总数（historyCounts），避免本地 store 缓存截断导致计数不准
+    const tacPlanningHistoryCount = useTaskStore(s => s.historyCounts.tac_planning)
 
     // 选中的小区ID集合（格式：sector.id，如 siteId_sectorId）
     const [selectedCellIds, setSelectedCellIds] = useState<Set<string>>(new Set())
@@ -757,11 +762,9 @@ export function TACPlanningPage() {
         })
     }
 
-    // 全选/取消全选当前网络类型的小区
-    const toggleSelectAll = () => {
-        const networkType = (config?.networkType || 'LTE') as 'LTE' | 'NR'
-        const sectors = networkType === 'LTE' ? cellListData.lte : cellListData.nr
-        const allIds = sectors.map(s => s.id)
+    // 全选/取消全选当前搜索过滤后的小区
+    const toggleSelectAll = (filteredIds: string[]) => {
+        const allIds = filteredIds
         const allSelected = allIds.length > 0 && allIds.every(id => selectedCellIds.has(id))
         if (allSelected) {
             setSelectedCellIds(prev => {

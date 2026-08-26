@@ -8,7 +8,7 @@ import shutil
 import re
 import asyncio
 from datetime import datetime
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Request
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Request, Query
 from pydantic import ValidationError
 from typing import Dict, Any, Optional
 from app.models.schemas import PCIConfig, PCIResult, NetworkType
@@ -238,10 +238,13 @@ async def get_apply_pci_progress(apply_task_id: str) -> Dict[str, Any]:
 
 
 @router.get("/history", response_model=Dict[str, Any])
-async def get_pci_history() -> Dict[str, Any]:
-    """获取所有用户的 PCI 规划历史任务列表"""
+async def get_pci_history(
+    page: int = Query(1, ge=1, description="页码（从 1 开始）"),
+    page_size: int = Query(20, ge=1, le=100, description="每页条数"),
+) -> Dict[str, Any]:
+    """获取所有用户的 PCI 规划历史任务列表（分页）"""
     try:
-        results = task_manager.list_task_history(task_type="pci")
+        results = task_manager.list_task_history(task_type="pci", page=page, page_size=page_size)
         return {"success": True, "data": results}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

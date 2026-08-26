@@ -2758,6 +2758,8 @@ class TaskManager:
                     return False
                 existing.is_applied = 1
                 db.commit()
+                # 清除该任务的验证缓存，保证下次读取反映最新状态
+                TaskManager._history_verify_cache.pop(task_id, None)
                 logger.info(f"[TaskManager] 任务已标记为已应用: {task_id[:8]}...")
                 return True
             finally:
@@ -2766,16 +2768,33 @@ class TaskManager:
             logger.error(f"[TaskManager] 标记任务已应用失败: {e}")
             return False
 
-    # 🔥 优化：_load_current_sector_values 的 30 秒缓存
+    # 🔥 优化：_load_current_sector_values 的缓存
     _sector_values_cache: Dict[str, Any] = {}
     _sector_values_cache_time: float = 0
-    _sector_values_cache_ttl: float = 30.0  # 30 秒缓存
+    # TTL 只作兜底（防止未标记的工参变更）；正常的应用操作会设置 inplace_updated 信号精准失效
+    _sector_values_cache_ttl: float = 300.0  # 300 秒兜底缓存
 
-    def list_task_history(self, task_type: Optional[str] = None, limit: int = 50, user_name: Optional[str] = None) -> List[Dict]:
-        """从 SQLite 获取历史任务列表，支持按用户过滤"""
+    # 🔥 优化：历史任务 isApplied/摘要验证结果缓存
+    # key: task_id -> (full_params_id, is_applied, result_summary)
+    # full_params_id 变化（全量工参切换）时缓存整体失效；应用/删除任务时按需清除
+    _history_verify_cache: Dict[str, tuple] = {}
+    _history_verify_cache_max = 300
+
+    def list_task_history(self, task_type: Optional[str] = None, page: int = 1, page_size: int = 20, user_name: Optional[str] = None) -> Dict:
+        """从 SQLite 获取历史任务列表（分页），返回 {"tasks": [...], "total": 总数, "page": 当前页, "page_size": 每页条数}
+
+        🔥 性能优化：
+        - total 单独 COUNT，不受分页截断影响，供前端 badge / 分页栏显示真实任务数
+        - 不再返回完整 result（含 results 数组）。单条任务结果可达数 MB，
+          一次加载会让响应膨胀到 10+ MB，是历史任务加载慢的根因。
+          前端"查看"时通过 /result/{taskId} 按需获取完整结果。
+        - result_json 只解析一次，供 isApplied 校验与摘要提取复用
+        - 同一任务在 sector 版本未变时缓存 isApplied/摘要，跳过大 result_json 的 json.loads
+        """
         try:
             from app.core.database import SessionLocal
             from app.models.database import TaskResult, Sector, Site
+            from sqlalchemy.orm import defer
 
             db = SessionLocal()
             try:
@@ -2784,27 +2803,63 @@ class TaskManager:
                     query = query.filter(TaskResult.task_type == task_type)
                 if user_name:
                     query = query.filter(TaskResult.user_name == user_name)
-                results = query.order_by(TaskResult.created_at.desc()).limit(limit).all()
+                # 真实总数（不受分页影响）
+                total = query.count()
+                # 分页：page 从 1 开始
+                safe_page = max(1, int(page))
+                safe_page_size = max(1, min(100, int(page_size)))
+                offset = (safe_page - 1) * safe_page_size
+                # 🔥 优化：defer 大 text 列（result_json/config_json 可达数 MB），
+                # 避免 ORM 将大列加载进内存拖慢查询。verify 缓存命中时不访问这两列，
+                # 仅缓存未命中需要解析结果时才懒加载单条
+                results = (
+                    query.options(defer(TaskResult.result_json), defer(TaskResult.config_json))
+                    .order_by(TaskResult.created_at.desc())
+                    .offset(offset).limit(safe_page_size).all()
+                )
 
                 # 读取当前全量工参的 sector 实际值，用于动态判断 applied 状态
                 current_sector_values = self._load_current_sector_values(db)
+                # 当前全量工参版本（用于 isApplied 验证缓存失效判断）
+                full_params_id = TaskManager._sector_values_cache.get("_full_params_id") if TaskManager._sector_values_cache else None
+
+                # 🔥 优化：批量预取缓存未命中的 result_json（一次查询），
+                # 避免 defer 懒加载在循环中逐条触发 SELECT
+                miss_ids = [
+                    r.task_id for r in results
+                    if not (TaskManager._history_verify_cache.get(r.task_id) and TaskManager._history_verify_cache[r.task_id][0] == full_params_id)
+                ]
+                miss_result_map: Dict[str, Optional[str]] = {}
+                if miss_ids:
+                    miss_rows = db.query(TaskResult.task_id, TaskResult.result_json).filter(TaskResult.task_id.in_(miss_ids)).all()
+                    miss_result_map = {rid: rj for rid, rj in miss_rows}
 
                 task_list = []
                 for r in results:
                     # 动态检查：对比任务规划结果与当前全量工参的实际 PCI/TAC 值
                     # 如果一致则视为已应用（即使标记为未应用），如果不一致则视为未应用（即使标记为已应用）
                     is_applied = False
-                    full_result = None
-                    if r.result_json:
-                        is_applied = self._verify_applied(r.result_json, current_sector_values)
-                        # 🔥 优化：在历史列表响应中直接包含完整 result（含 results 数组），
-                        # 避免前端再调用 getResult 做第二次串行请求
-                        try:
-                            parsed = json.loads(r.result_json)
-                            if parsed and parsed.get("results"):
-                                full_result = parsed
-                        except Exception:
-                            pass
+                    result_summary = None
+                    # 缓存命中（同任务 + 同工参版本）：跳过大 result_json 的 json.loads
+                    cached = TaskManager._history_verify_cache.get(r.task_id)
+                    if cached and cached[0] == full_params_id:
+                        is_applied = cached[1]
+                        result_summary = cached[2]
+                    else:
+                        parsed_result = None
+                        result_json_str = miss_result_map.get(r.task_id)
+                        if result_json_str:
+                            try:
+                                parsed_result = json.loads(result_json_str)
+                            except Exception:
+                                parsed_result = None
+                            if parsed_result is not None:
+                                is_applied = self._verify_applied(parsed_result, current_sector_values)
+                        result_summary = self._extract_result_summary(parsed_result)
+                        TaskManager._history_verify_cache[r.task_id] = (full_params_id, is_applied, result_summary)
+                        # 防止缓存无限增长
+                        if len(TaskManager._history_verify_cache) > TaskManager._history_verify_cache_max:
+                            TaskManager._history_verify_cache.clear()
                     entry = {
                         "taskId": r.task_id,
                         "taskType": r.task_type,
@@ -2812,52 +2867,55 @@ class TaskManager:
                         "userName": r.user_name,
                         "status": r.status,
                         "progress": r.progress,
-                        "config": json.loads(r.config_json) if r.config_json else {},
-                        "resultSummary": self._extract_result_summary(r.result_json),
-                        "result": full_result,  # 🔥 直接包含完整结果，避免二次请求
+                        # 🔥 不再返回完整 config（大任务可能含数百 KB 的小区列表，前端未消费该字段）
+                        "resultSummary": result_summary,
+                        # 不再返回完整 result：避免传输数 MB 的结果数组导致历史列表加载缓慢
                         "isApplied": is_applied,
                         "createdAt": r.created_at,
                         "completedAt": r.completed_at,
                     }
                     task_list.append(entry)
-                return task_list
+                return {"tasks": task_list, "total": total, "page": safe_page, "page_size": safe_page_size}
             finally:
                 db.close()
         except Exception as e:
             logger.error(f"[TaskManager] 读取历史任务失败: {e}")
-            return []
+            return {"tasks": [], "total": 0, "page": 1, "page_size": page_size}
 
     @staticmethod
     def _load_current_sector_values(db) -> Dict[str, Dict]:
         """加载当前全量工参中所有小区的实际 PCI/TAC 值，返回 {siteId_sectorId: {pci, tac}}
-        
-        🔥 优化：使用 30 秒内存缓存，避免频繁读取数据库
+
+        🔥 优化：缓存失效优先依赖 inplace_updated 信号（应用操作设置），
+        避免每次历史列表请求都全量查询 SQLite（生产环境几万行，ARM 芯片耗时数秒）。
+        只有以下任一情况才重新查询：
+        - 缓存不存在
+        - full_params_id 变化（切换了全量工参文件）
+        - 发生原地更新（inplace_updated=True，PCI/TAC 应用后设置）
+        - TTL 兜底过期（防止未标记的工参变更）
         """
         from app.services.data_service import data_service
         from app.models.database import Site, Sector
         import time as _time
 
-        # 🔥 缓存检查：先确认 full_params_id 是否有变，再检查 TTL
         current_time = _time.time()
-        cached = TaskManager._sector_values_cache
-        if cached and (current_time - TaskManager._sector_values_cache_time) < TaskManager._sector_values_cache_ttl:
-            # 双重验证：full_params_id 是否匹配当前索引
-            current_full_params_id = None
-            for data_id, info in data_service.index.items():
-                if info.get("fileType") == "full_params":
-                    current_full_params_id = data_id
-                    break
-            if cached.get("_full_params_id") == current_full_params_id:
-                return cached.get("values", {})
-            # full_params_id 变化了，需要重新加载
-            TaskManager._sector_values_cache = {}
-
-        # 找到当前全量工参的 workbook_id
-        full_params_id = None
+        # 当前全量工参 workbook_id
+        current_full_params_id = None
         for data_id, info in data_service.index.items():
             if info.get("fileType") == "full_params":
-                full_params_id = data_id
+                current_full_params_id = data_id
                 break
+
+        # 🔥 缓存命中条件：id 匹配 + 未发生原地更新 + TTL 兜底内
+        cached = TaskManager._sector_values_cache
+        if (cached
+                and cached.get("_full_params_id") == current_full_params_id
+                and not data_service.index.get(current_full_params_id, {}).get("inplace_updated")
+                and (current_time - TaskManager._sector_values_cache_time) < TaskManager._sector_values_cache_ttl):
+            return cached.get("values", {})
+
+        # 需要重新加载（full_params_id 变化 / 原地更新 / TTL 兜底）
+        full_params_id = current_full_params_id
         if not full_params_id:
             return {}
 
@@ -2879,7 +2937,9 @@ class TaskManager:
             if rec:
                 values[key] = rec
 
-        # 🔥 写入缓存
+        # 🔥 写入缓存，并清除原地更新信号（表示已消费该次变更）
+        if full_params_id in data_service.index:
+            data_service.index[full_params_id]['inplace_updated'] = False
         TaskManager._sector_values_cache = {
             "_full_params_id": full_params_id,
             "values": values,
@@ -2888,10 +2948,12 @@ class TaskManager:
         return values
 
     @staticmethod
-    def _verify_applied(result_json_str: str, current_values: Dict[str, Dict]) -> bool:
-        """检查任务结果中的 PCI/TAC 是否与当前全量工参的实际值一致"""
+    def _verify_applied(result: Dict, current_values: Dict[str, Dict]) -> bool:
+        """检查任务结果中的 PCI/TAC 是否与当前全量工参的实际值一致
+
+        🔥 优化：直接接收已解析的 result dict，避免在历史列表循环中重复 json.loads
+        """
         try:
-            result = json.loads(result_json_str)
             task_results = result.get("results", [])
             if not task_results:
                 return True  # 无规划结果，视为一致
@@ -2944,12 +3006,15 @@ class TaskManager:
             return False
 
     @staticmethod
-    def _extract_result_summary(result_json_str: Optional[str]) -> Optional[Dict]:
-        """从完整 result JSON 中提取轻量摘要字段（避免历史列表返回大数据）"""
-        if not result_json_str:
+    def _extract_result_summary(result: Optional[Dict]) -> Optional[Dict]:
+        """从完整 result dict 中提取轻量摘要字段（避免历史列表返回大数据）
+
+        🔥 优化：直接接收已解析的 result dict，避免在历史列表循环中重复 json.loads
+        """
+        if not result:
             return None
         try:
-            r = json.loads(result_json_str)
+            r = result
             return {
                 "status": r.get("status"),
                 "totalSites": r.get("totalSites", 0),
@@ -3060,6 +3125,8 @@ class TaskManager:
                     if row:
                         db.delete(row)
                         db.commit()
+                        # 清除该任务的验证缓存
+                        TaskManager._history_verify_cache.pop(task_id_str, None)
                         logger.info(f"[TaskManager] 已从 SQLite 删除任务: {task_id_str[:8]}...")
                 finally:
                     db.close()

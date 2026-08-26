@@ -1620,9 +1620,11 @@ class DataService:
                             row[col_map["第一分组"] - 1].value = "电信中兴"
                         # "是否现网"在"第一分组"设置之后处理，确保"第一分组"已更新
                         first_group = self._get_cell_val(row, col_map, "第一分组")
-                        if first_group == "电信中兴" and key in updates:
-                            if "是否现网" in col_map:
+                        if "是否现网" in col_map:
+                            if first_group == "电信中兴" and key in updates:
                                 row[col_map["是否现网"] - 1].value = "是"
+                            elif key not in updates:
+                                row[col_map["是否现网"] - 1].value = "否"
                         if "第二分组" in col_map:
                             # 只有当前为空值时才更新
                             current_second = row[col_map["第二分组"] - 1].value
@@ -1681,9 +1683,11 @@ class DataService:
                             row[col_map["第一分组"] - 1].value = "电信中兴"
                         # "是否现网"在"第一分组"设置之后处理，确保"第一分组"已更新
                         first_group = self._get_cell_val(row, col_map, "第一分组")
-                        if first_group == "电信中兴" and key in updates:
-                            if "是否现网" in col_map:
+                        if "是否现网" in col_map:
+                            if first_group == "电信中兴" and key in updates:
                                 row[col_map["是否现网"] - 1].value = "是"
+                            elif key not in updates:
+                                row[col_map["是否现网"] - 1].value = "否"
                         if "第二分组" in col_map:
                             # 只有当前为空值时才更新
                             current_second = row[col_map["第二分组"] - 1].value
@@ -2996,21 +3000,30 @@ class DataService:
                     # 设定 file_path 为第一个 TAB 文件，并标记为 mapinfo 类型
                     file_path = _found_mapinfo_tabs[0]
                     # 此 ZIP 将被视为 MapInfo 图层上传，直接解析图层并返回
-                    from app.services.mapinfo_service import parse_mapinfo_files
+                    from app.services.mapinfo_service import parse_mapinfo_files, get_last_parse_errors
                     _mapinfo_layers = parse_mapinfo_files(data_dir, parent_id=data_id)
+                    _mapinfo_errors = get_last_parse_errors()
                     layers_json_path = data_dir / "layers.json"
                     with open(layers_json_path, "w", encoding="utf-8") as _lf:
                         json.dump(_mapinfo_layers, _lf, ensure_ascii=False, indent=2)
+                    # 后台预热 GeoJSON 磁盘缓存，避免首次勾选时等待 parse + 坐标转换
+                    self._prewarm_mapinfo_cache(data_id)
                     # 更新索引为 map 类型
+                    _layer_status = (
+                        "ready" if _mapinfo_layers
+                        else "partial" if _mapinfo_errors
+                        else "error"
+                    )
                     self.index[data_id].update({
                         "type": "map",
                         "subType": "mapinfo",
                         "fileType": "tac_layer",
-                        "status": "ready",
+                        "status": _layer_status,
                         "metadata": {
                             "fileCount": len(list(data_dir.rglob('*'))),
                             "layerCount": len(_mapinfo_layers),
                             "layers": _mapinfo_layers,
+                            "errors": _mapinfo_errors,  # 每个失败文件的具体原因
                         },
                     })
                     safe_print(f"[DataService] MapInfo 图层已注册: {len(_mapinfo_layers)} 个图层")
@@ -4684,9 +4697,13 @@ class DataService:
         return result
 
     async def upload_map(
-        self, file: Optional[Any], original_path: Optional[str] = None
+        self, file: Optional[Any], original_path: Optional[str] = None,
+        files: Optional[list] = None,
     ) -> Dict[str, str]:
-        """上传地图文件（支持 MapInfo 图层文件）"""
+        """上传地图文件（支持 MapInfo 图层文件 / KML / ZIP / 离线地图）
+        files: 配套文件列表（与主文件同 stem 的 .dat/.mid/.map/.id 等，
+        浏览器模式无真实路径时用于补齐关联文件）"""
+        import asyncio
         data_id = str(uuid.uuid4())
 
         # 处理路径引号
@@ -4721,37 +4738,39 @@ class DataService:
         data_dir = settings.DATA_DIR / data_id
         data_dir.mkdir(parents=True, exist_ok=True)
 
-        # 检测文件类型
-        is_mapinfo = filename.lower().endswith((".mif", ".tab", ".dat"))
+        # 检测文件类型（KML 为自包含矢量图层）
+        is_mapinfo = filename.lower().endswith((".mif", ".tab", ".dat", ".kml"))
         is_zip = filename.lower().endswith(".zip")
 
         # 处理 ZIP 文件（离线地图或 MapInfo 包）
         if is_zip:
             import zipfile
-            import shutil
 
             # 保留原始 ZIP 文件以便下载
             original_zip = data_dir / "original.zip"
-            shutil.copy(file_path, original_zip)
+            # 解压/复制为同步 IO，放线程池避免阻塞单 worker 事件循环
+            await asyncio.to_thread(shutil.copy, file_path, original_zip)
 
             with zipfile.ZipFile(file_path, "r") as zip_ref:
-                zip_ref.extractall(data_dir)
+                await asyncio.to_thread(zip_ref.extractall, data_dir)
 
-            # 检查解压后的文件是否为 MapInfo（递归搜索子目录）
+            # 检查解压后的文件是否为 MapInfo/KML（递归搜索子目录）
             extracted_files = list(data_dir.rglob("*"))
             has_mapinfo = any(
-                f.suffix.lower() in [".mif", ".tab"]
+                f.suffix.lower() in [".mif", ".tab", ".kml"]
                 for f in extracted_files
                 if f.is_file()
             )
 
             if has_mapinfo:
                 # 解析 MapInfo 图层
-                from app.services.mapinfo_service import parse_mapinfo_files
+                from app.services.mapinfo_service import parse_mapinfo_files, get_last_parse_errors
                 import json
 
                 try:
-                    layers = parse_mapinfo_files(data_dir, parent_id=data_id)
+                    # 大 .dat 解析（gpd.read_file）可能耗时几十秒，放线程池避免阻塞事件循环
+                    layers = await asyncio.to_thread(parse_mapinfo_files, data_dir, parent_id=data_id)
+                    _mapinfo_errors = get_last_parse_errors()  # 每个失败文件的具体原因
                 except ImportError as e:
                     # 缺少 geopandas 库
                     print(f"[DataService] ❌ 缺少必要的地理数据处理库")
@@ -4821,6 +4840,8 @@ class DataService:
                 # 保存图层元数据
                 with open(data_dir / "layers.json", "w", encoding="utf-8") as f:
                     json.dump(layers, f, ensure_ascii=False, indent=2)
+                # 后台预热 GeoJSON 磁盘缓存，避免首次勾选时等待 parse + 坐标转换
+                self._prewarm_mapinfo_cache(data_id)
 
                 print(f"[DataService] 解析到 {len(layers)} 个 MapInfo 图层")
                 if len(layers) == 0:
@@ -4841,11 +4862,16 @@ class DataService:
                     "size": file_path.stat().st_size,
                     "originalPath": original_path,
                     "uploadDate": datetime.now().isoformat(),
-                    "status": "ready",
+                    "status": (
+                        "ready" if layers
+                        else "partial" if _mapinfo_errors
+                        else "error"
+                    ),
                     "metadata": {
                         "fileCount": len(extracted_files),
                         "layerCount": len(layers),
                         "layers": layers,
+                        "errors": _mapinfo_errors,  # 每个失败文件的具体原因
                     },
                 }
             else:
@@ -4866,7 +4892,24 @@ class DataService:
         elif is_mapinfo:
             # 复制文件到数据目录
             target_file = data_dir / filename
-            shutil.copy(file_path, target_file)
+            await asyncio.to_thread(shutil.copy, file_path, target_file)
+
+            # 多文件上传的配套文件（浏览器模式无真实路径时，前端把同 stem 的
+            # .dat/.mid/.map/.id 等一起上传，由这里写入同一 data_dir）
+            if files:
+                for _f in files:
+                    if not _f or not _f.filename:
+                        continue
+                    _fname = os.path.basename(_f.filename)
+                    if _fname.lower() == filename.lower():
+                        continue  # 主文件已复制
+                    try:
+                        _tgt = data_dir / _fname
+                        with open(_tgt, "wb") as _out:
+                            _out.write(await _f.read())
+                        safe_print(f"[DataService] ✅ 已写入上传的配套文件: {_fname}")
+                    except Exception as _e:
+                        safe_print(f"[DataService] ⚠️ 配套文件写入失败 {_fname}: {_e}")
 
             # 🔥 关键修复: MapInfo 文件需要配套文件才能正确解析
             # 获取文件基名（不含扩展名），支持大小写扩展名
@@ -4890,121 +4933,84 @@ class DataService:
                         return test_path
                 return None
 
-            # 检查 .tab 和 .dat 文件是否存在（忽略大小写）
-            tab_extensions = [".tab", ".TAB", ".Tab"]
-            dat_extensions = [".dat", ".DAT", ".Dat"]
+            # 配套文件按格式区分：MIF → .mid（几何在 .mif，属性在 .mid）；TAB → .dat（关键）+ .map/.id（可选）
+            is_mif = filename.lower().endswith(".mif")
+            is_kml = filename.lower().endswith(".kml")
+            if is_kml:
+                companion_required = []  # KML 自包含，无需配套
+            else:
+                companion_required = [".mid"] if is_mif else [".dat"]
 
-            tab_file = find_file_ignore_case(data_dir, stem, tab_extensions)
-            dat_file = find_file_ignore_case(data_dir, stem, dat_extensions)
+            missing_exts = set()
+            for ext in companion_required:
+                if not find_file_ignore_case(data_dir, stem, [ext, ext.upper(), ext.title()]):
+                    missing_exts.add(ext)
 
-            has_required_files = True
-            missing_files = []
+            # 🔧 自动复制关联文件（优先级：original_path > uploads/layers > uploads）
+            # uploads/layers 是图层制作模块的产物目录，单文件 MIF/TAB 导入时配套文件可能在这里
+            copy_sources = []
+            if original_path:
+                original_dir = os.path.dirname(original_path)
+                if original_dir:
+                    copy_sources.append(original_dir)
+            copy_sources.append(str(settings.UPLOAD_DIR / "layers"))
+            copy_sources.append(str(settings.UPLOAD_DIR))
 
-            # 检查 .tab 文件是否存在
-            if not tab_file:
-                has_required_files = False
-                missing_files.append(f"{stem}.tab")
-
-            # 检查 .dat 文件是否存在（关键文件！）
-            if not dat_file:
-                has_required_files = False
-                missing_files.append(f"{stem}.dat (关键文件)")
-
-            # 🔧 自动复制关联文件（优先级：original_path > uploads 目录）
-            if missing_files and original_path:
-                # 方式1: 从原始路径（Electron 桌面模式）
+            all_extensions = [".dat", ".map", ".id", ".ind", ".mid", ".mif", ".tab"]
+            for src_dir in copy_sources:
+                if not missing_exts:
+                    break
                 try:
-                    original_dir = os.path.dirname(original_path)
-                    print(f"[DataService] 🔍 检查关联文件: 目录={original_dir}, 基名={stem}")
-
-                    # 所有可能的 MapInfo 关联文件后缀
-                    all_extensions = [
-                        ".dat", ".DAT",
-                        ".map", ".MAP",
-                        ".id", ".ID",
-                        ".ind", ".IND",
-                        ".mid", ".MID"
-                    ]
-
-                    copied_count = 0
+                    print(f"[DataService] 🔍 检查关联文件: 目录={src_dir}, 基名={stem}")
                     for ext in all_extensions:
-                        # 尝试多种大小写组合
                         for ext_variant in [ext.lower(), ext.upper(), ext]:
-                            sibling_path = os.path.join(original_dir, f"{stem}{ext_variant}")
+                            sibling_path = os.path.join(src_dir, f"{stem}{ext_variant}")
                             if os.path.exists(sibling_path):
                                 target_sibling = data_dir / os.path.basename(sibling_path)
                                 if not target_sibling.exists():
                                     shutil.copy2(sibling_path, target_sibling)
-                                    print(f"[DataService] ✅ 已复制关联文件: {os.path.basename(sibling_path)}")
-                                    copied_count += 1
-
-                                    # 更新文件存在状态
-                                    if ext_variant.lower() == ".dat" and any(".dat" in f for f in missing_files):
-                                        missing_files = [f for f in missing_files if ".dat" not in f.lower()]
-                                    if ext_variant.lower() == ".tab" and any(".tab" in f for f in missing_files):
-                                        missing_files = [f for f in missing_files if ".tab" not in f.lower()]
+                                    print(f"[DataService] ✅ 已复制关联文件: {os.path.basename(sibling_path)} (来源 {src_dir})")
+                                if ext_variant.lower() in missing_exts:
+                                    missing_exts.discard(ext_variant.lower())
                                 break  # 找到一个就跳过其他大小写变体
-
-                    print(f"[DataService] 📊 共复制 {copied_count} 个关联文件")
-
                 except Exception as e:
-                    print(f"[DataService] ⚠️ 从原始路径复制关联文件失败: {e}")
-
-            # 如果仍然缺少文件，尝试从 uploads 目录查找
-            if missing_files:
-                try:
-                    uploads_dir = settings.UPLOAD_DIR
-                    print(f"[DataService] 🔍 尝试从 uploads 目录查找关联文件: {uploads_dir}")
-
-                    all_extensions = [
-                        ".dat", ".DAT",
-                        ".map", ".MAP",
-                        ".id", ".ID",
-                        ".ind", ".IND",
-                        ".mid", ".MID"
-                    ]
-
-                    for ext in all_extensions:
-                        for ext_variant in [ext.lower(), ext.upper(), ext]:
-                            sibling_path = uploads_dir / f"{stem}{ext_variant}"
-                            if sibling_path.exists():
-                                target_sibling = data_dir / sibling_path.name
-                                if not target_sibling.exists():
-                                    shutil.copy2(sibling_path, target_sibling)
-                                    print(f"[DataService] ✅ 从 uploads 复制: {sibling_path.name}")
-
-                                    # 更新文件存在状态
-                                    if ext_variant.lower() == ".dat":
-                                        missing_files = [f for f in missing_files if ".dat" not in f.lower()]
-                                    if ext_variant.lower() == ".tab":
-                                        missing_files = [f for f in missing_files if ".tab" not in f.lower()]
-
-                except Exception as e:
-                    print(f"[DataService] ⚠️ 从 uploads 目录复制关联文件失败: {e}")
+                    print(f"[DataService] ⚠️ 从 {src_dir} 复制关联文件失败: {e}")
 
             # 检查是否仍然缺少关键文件
-            if missing_files:
+            if missing_exts:
+                missing_files = [f"{stem}{e}" + ("" if is_mif else " (关键文件)") for e in sorted(missing_exts)]
                 print(f"[DataService] ❌ 缺少关键文件: {missing_files}")
                 raise ValueError(
                     f"MapInfo 文件缺少配套文件，无法正确解析。\n"
                     f"缺少文件: {', '.join(missing_files)}\n\n"
-                    f"MapInfo TAB 格式需要以下配套文件：\n"
-                    f"  • {stem}.tab - 表结构定义\n"
-                    f"  • {stem}.dat - 实际数据（必需！）\n"
-                    f"  • {stem}.map - 样式定义（可选）\n"
-                    f"  • {stem}.id - 索引文件（可选）\n\n"
-                    f"解决方案：\n"
-                    f"  1. 上传所有配套文件（推荐）\n"
-                    f"  2. 或打包成 ZIP 文件上传（最佳）"
+                    + (
+                        f"MapInfo MIF 格式需要以下配套文件：\n"
+                        f"  • {stem}.mif - 几何数据\n"
+                        f"  • {stem}.mid - 属性数据（必需！）\n\n"
+                        if is_mif else
+                        f"MapInfo TAB 格式需要以下配套文件：\n"
+                        f"  • {stem}.tab - 表结构定义\n"
+                        f"  • {stem}.dat - 实际数据（必需！）\n"
+                        f"  • {stem}.map - 样式定义（可选）\n"
+                        f"  • {stem}.id - 索引文件（可选）\n\n"
+                    )
+                    + f"解决方案：\n"
+                    + f"  1. 上传所有配套文件（推荐）\n"
+                    + f"  2. 或打包成 ZIP 文件上传（最佳）"
                 )
 
             # 重新检查文件是否都已复制成功
             tab_file = find_file_ignore_case(data_dir, stem, [".tab", ".TAB"])
             dat_file = find_file_ignore_case(data_dir, stem, [".dat", ".DAT"])
+            mid_file = find_file_ignore_case(data_dir, stem, [".mid", ".MID"])
 
             print(f"[DataService] 📁 文件检查结果:")
-            print(f"  - TAB 文件: {'✅ ' + str(tab_file) if tab_file else '❌ 缺失'}")
-            print(f"  - DAT 文件: {'✅ ' + str(dat_file) if dat_file else '❌ 缺失'}")
+            if is_mif:
+                print(f"  - MIF 文件: {'✅ ' + str(target_file) if target_file else '❌ 缺失'}")
+                print(f"  - MID 文件: {'✅ ' + str(mid_file) if mid_file else '❌ 缺失'}")
+            else:
+                print(f"  - TAB 文件: {'✅ ' + str(tab_file) if tab_file else '❌ 缺失'}")
+                print(f"  - DAT 文件: {'✅ ' + str(dat_file) if dat_file else '❌ 缺失'}")
 
             # 列出 data_dir 中的所有文件（用于调试）
             try:
@@ -5015,10 +5021,11 @@ class DataService:
 
             # 解析 MapInfo 图层
             import json
-            from app.services.mapinfo_service import parse_mapinfo_files
+            from app.services.mapinfo_service import parse_mapinfo_files, get_last_parse_errors
 
             try:
-                layers = parse_mapinfo_files(target_file, parent_id=data_id)
+                layers = await asyncio.to_thread(parse_mapinfo_files, target_file, parent_id=data_id)
+                _mapinfo_errors = get_last_parse_errors()  # 每个失败文件的具体原因
             except ImportError as e:
                 # 缺少 geopandas 库
                 print(f"[DataService] ❌ 缺少必要的地理数据处理库")
@@ -5076,6 +5083,8 @@ class DataService:
             # 保存图层元数据（即使为空也保存，便于调试）
             with open(data_dir / "layers.json", "w", encoding="utf-8") as f:
                 json.dump(layers, f, ensure_ascii=False, indent=2)
+            # 后台预热 GeoJSON 磁盘缓存，避免首次勾选时等待 parse + 坐标转换
+            self._prewarm_mapinfo_cache(data_id)
 
             print(f"[DataService] 解析到 {len(layers)} 个 MapInfo 图层")
             for layer in layers:
@@ -5092,11 +5101,16 @@ class DataService:
                 "size": file_path.stat().st_size,
                 "originalPath": original_path,
                 "uploadDate": datetime.now().isoformat(),
-                "status": "ready",
+                "status": (
+                    "ready" if layers
+                    else "partial" if _mapinfo_errors
+                    else "error"
+                ),
                 "metadata": {
                     "fileCount": 1,
                     "layerCount": len(layers),
                     "layers": layers,
+                    "errors": _mapinfo_errors,  # 每个失败文件的具体原因
                 },
             }
         else:
@@ -5139,6 +5153,8 @@ class DataService:
                         data_copy["status"] = DataStatus.PROCESSING
                     elif data_copy["status"] == "error":
                         data_copy["status"] = DataStatus.ERROR
+                    elif data_copy["status"] == "partial":
+                        data_copy["status"] = DataStatus.PARTIAL
                 # 确保必填字段存在
                 if "size" not in data_copy:
                     data_copy["size"] = 0
@@ -5272,6 +5288,55 @@ class DataService:
             data_dir = settings.DATA_DIR / data_id
             files = list(data_dir.rglob("*")) if data_dir.exists() else []
             return {"files": [str(f.relative_to(data_dir)) for f in files if f.is_file()]}
+
+    def _prewarm_mapinfo_cache(self, data_id: str):
+        """上传后后台预热 MapInfo 图层 GeoJSON 缓存（幂等，失败仅记日志）。
+
+        复用 mapinfo_service.prebuild_layer_geojson_cache（内部调用 get_layer_data 写入
+        磁盘 .cache 缓存），使首次勾选图层时无需等待 parse + 坐标转换。
+        后台线程执行，上传请求立即返回。
+        """
+        def _run():
+            import json
+            from app.services.mapinfo_service import prebuild_layer_geojson_cache
+            data_dir = settings.DATA_DIR / data_id
+            layers_file = data_dir / "layers.json"
+            if not layers_file.exists():
+                return
+            try:
+                with open(layers_file, "r", encoding="utf-8") as f:
+                    layers = json.load(f)
+                prebuild_layer_geojson_cache(data_id, data_dir, layers)
+            except Exception as e:
+                safe_print(f"[DataService] 预热图层缓存失败 (data_id={data_id}): {e}")
+
+        import threading
+        threading.Thread(target=_run, daemon=True).start()
+
+    def prewarm_all_map_caches(self):
+        """服务启动时后台预热所有 MapInfo 图层的 GeoJSON 缓存。
+
+        解决"首次勾选图层时后端 parse + 坐标转换耗时过长导致前端 300s 超时"：
+        扫描索引中所有 map 类型数据，逐个预热 .cache/*.geojson 磁盘缓存。
+        幂等、后台线程、失败仅记日志，不阻塞启动。
+        """
+        def _run():
+            map_ids = [
+                data_id for data_id, info in self.index.items()
+                if isinstance(info, dict) and info.get("type") == "map"
+            ]
+            if not map_ids:
+                return
+            safe_print(f"[DataService] 启动预热 {len(map_ids)} 个 MapInfo 数据集的图层缓存...")
+            for data_id in map_ids:
+                try:
+                    self._prewarm_mapinfo_cache(data_id)
+                except Exception as e:
+                    safe_print(f"[DataService] 预热 {data_id} 失败: {e}")
+            safe_print("[DataService] 图层缓存预热任务已全部提交（后台执行）")
+
+        import threading
+        threading.Thread(target=_run, daemon=True).start()
 
     def clear_cache(self, data_id: Optional[str] = None):
         """清除缓存"""

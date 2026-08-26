@@ -162,7 +162,9 @@ export function PCIPage() {
   } = useTaskStore()
   const taskId = activeTaskIds.pci_planning
   const latestPCITask = getLatestPCITask()
-  const pciHistoryCount = useTaskStore(s => Object.values(s.tasks).filter(t => t.type === 'pci_planning').length)
+  // 🔥 修复：改用后端返回的真实任务总数（historyCounts），避免本地 store 缓存
+  // 只保留最近 50 条导致的历史任务计数与实际不一致
+  const pciHistoryCount = useTaskStore(s => s.historyCounts.pci_planning)
 
   const [localTaskResult, setLocalTaskResult] = useState<PCIResultData | null>(null)
   const viewedTaskResultRef = useRef<PCIResultData | null>(null) // 🔒 用户点击"查看"的结果，永不覆盖
@@ -248,6 +250,10 @@ export function PCIPage() {
 
   // ===== 结果加载：点击"规划结果"时加载最近一次任务 =====
   const { syncHistoryFromBackend } = useTaskStore()
+  // 🔥 页面挂载时同步一次历史计数（badge 显示后端真实任务总数）
+  useEffect(() => {
+    syncHistoryFromBackend('pci_planning').catch(() => {})
+  }, [syncHistoryFromBackend])
   useEffect(() => {
     if (activeLeftTab === 'planning-result') {
       // 如果用户通过"查看"按钮加载了结果，不自动加载（viewedTaskResultRef 优先级最高）
@@ -844,6 +850,10 @@ export function PCIPage() {
         setActiveLeftTab('planning-result')
         setShowMap(true)
         if (result.results) {
+          // 🔥 修复：历史任务从后端只拿 resultSummary（无 results 数组），
+          // 自动初始化 useEffect 不再触发，必须在此处主动初始化 sync service，
+          // 否则点击结果行时 findSector/findSameFrequencyPCI 无数据可查，地图不渲染
+          await ensureSyncService().catch(() => {})
           pciDataSyncService.setPCIResults({ results: result.results })
         }
       }
@@ -1142,10 +1152,8 @@ export function PCIPage() {
     })
   }
 
-  const toggleSelectAll = () => {
-    const networkType = config.networkType as 'LTE' | 'NR'
-    const sectors = networkType === 'LTE' ? cellListData.lte : cellListData.nr
-    const allIds = sectors.map(s => s.id)
+  const toggleSelectAll = (filteredIds: string[]) => {
+    const allIds = filteredIds
     const allSelected = allIds.length > 0 && allIds.every(id => selectedCellIdsSet.has(id))
     if (allSelected) {
       updateCellSelection(prev => { const next = new Set(prev); allIds.forEach(id => next.delete(id)); return next })

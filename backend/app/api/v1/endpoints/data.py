@@ -434,18 +434,21 @@ async def upload_excel(
 
 @router.post("/upload/map", response_model=Dict[str, Any])
 async def upload_map(
-    file: Optional[UploadFile] = File(None), file_path: Optional[str] = Form(None)
+    file: Optional[UploadFile] = File(None),
+    files: Optional[List[UploadFile]] = File(None),
+    file_path: Optional[str] = Form(None),
 ) -> Dict[str, Any]:
-    """上传地图文件"""
+    """上传地图文件（支持 MapInfo TAB/MIF、KML、ZIP、离线地图）
+    files: 配套文件列表（与主文件同 stem 的 .dat/.mid/.map/.id 等，浏览器模式补齐关联文件）"""
     try:
         try:
-            print(f"[API] upload_map: file={file}, file_path={file_path}")
+            print(f"[API] upload_map: file={file}, files={[f.filename for f in files] if files else None}, file_path={file_path}")
         except:
             print(f"[API] upload_map: file_path encoding error")
     except:
         pass
     try:
-        result = await data_service.upload_map(file, file_path)
+        result = await data_service.upload_map(file, file_path, files=files)
         # 清除地图数据缓存
         import app.api.v1.endpoints.map as map_module
         map_module.invalidate_map_data_cache()

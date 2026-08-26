@@ -1,4 +1,4 @@
-import { useMemo, useEffect, useState, useCallback } from 'react'
+import { useMemo, useEffect, useState, useCallback, useRef } from 'react'
 import { Clock, Eye, Trash2, Check, Loader2 } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { useTaskStore, type TaskType, type Task } from '../store/taskStore'
@@ -77,6 +77,31 @@ export function HistoryTable({
   // 首次加载动画：后端同步期间显示 LoadingSpinner
   const [isLoading, setIsLoading] = useState(true)
 
+  // ===== 分页状态：每页固定 20 条，底部翻页浏览 =====
+  const pageSize = 20
+  // 🔥 外网优化：总数初始取 store 的 historyCounts（页面挂载时 badge 同步已拿到真实总数），
+  // 避免挂载不请求时分页栏显示"共 0 条"
+  const storeHistoryCount = useTaskStore(s => s.historyCounts[taskType] ?? 0)
+  const [currentPage, setCurrentPage] = useState(1)
+  const [totalCount, setTotalCount] = useState(storeHistoryCount)
+  const currentPageRef = useRef(1) // 供 visibilitychange / 批量操作等非渲染场景读取当前页
+  const totalPages = Math.max(1, Math.ceil(totalCount / pageSize))
+
+  // 挂载不请求时，若 badge 同步更新了 historyCounts，同步到分页总数
+  useEffect(() => {
+    setTotalCount(storeHistoryCount)
+  }, [storeHistoryCount])
+
+  // 加载指定页历史任务，并同步分页信息（总数 / 当前页）
+  const loadHistoryPage = useCallback(async (page: number) => {
+    const info = await syncHistoryFromBackend(taskType, page, pageSize)
+    const nextPage = info?.page ?? page
+    setCurrentPage(nextPage)
+    currentPageRef.current = nextPage
+    if (info) setTotalCount(info.total)
+    return info
+  }, [taskType, syncHistoryFromBackend])
+
   // ===== 派生数据（必须在使用前定义，避免 Rollup 生产构建 TDZ 问题） =====
   const filteredTasks = useMemo(() => {
     return Object.values(tasks)
@@ -120,14 +145,15 @@ export function HistoryTable({
   }
 
   // 组件挂载时从后端同步历史任务（解决清理浏览器缓存后历史丢失的问题）
-  // 仅当没有已有数据时才显示加载动画；已有数据时静默刷新
+  // 🔥 外网优化：已有数据时静默后台刷新（不显示 loading，秒开 + 数据保持新鲜），
+  // 避免高延迟下每次进入历史 tab 都白屏等待；无数据时才显示加载动画
   useEffect(() => {
-    if (Object.values(tasks).filter(t => t.type === taskType).length === 0) {
-      setIsLoading(true)
-    }
+    const hasExisting = Object.values(tasks).filter(t => t.type === taskType).length > 0
+    // 有数据时秒开（先显示缓存），后台静默刷新；无数据时显示加载动画
+    if (!hasExisting) setIsLoading(true)
     const doSync = async () => {
       try {
-        await syncHistoryFromBackend(taskType)
+        await loadHistoryPage(1)
       } finally {
         setIsLoading(false)
       }
@@ -136,19 +162,19 @@ export function HistoryTable({
     // 🔥 兜底：5秒后无论是否同步完成都关闭loading，避免卡死在加载状态
     const safetyTimer = setTimeout(() => setIsLoading(false), 5000)
     return () => clearTimeout(safetyTimer)
-  }, [taskType, syncHistoryFromBackend])
+  }, [taskType, loadHistoryPage])
 
   // 🔥 优化：移除 5 秒轮询，改为页面可见时刷新（页面切换回来时自动同步）
   // + 操作完成后（删除/应用）已由调用方显式触发 syncHistoryFromBackend
   useEffect(() => {
     const handleVisibility = () => {
       if (document.visibilityState === 'visible') {
-        syncHistoryFromBackend(taskType)
+        loadHistoryPage(currentPageRef.current)
       }
     }
     document.addEventListener('visibilitychange', handleVisibility)
     return () => document.removeEventListener('visibilitychange', handleVisibility)
-  }, [taskType, syncHistoryFromBackend])
+  }, [taskType, loadHistoryPage])
 
   const handleToggleSelectAll = useCallback(() => {
     if (isAllSelected) {
@@ -230,8 +256,8 @@ export function HistoryTable({
     setSelectedTaskIds(new Set())
     setBatchApplyProgress({ current: 0, total: 0 })
 
-    await syncHistoryFromBackend(taskType)
-  }, [filteredTasks, selectedTaskIds, onApplyTask, onBatchApplyTasks, syncHistoryFromBackend, t])
+    await loadHistoryPage(currentPageRef.current)
+  }, [filteredTasks, selectedTaskIds, onApplyTask, onBatchApplyTasks, loadHistoryPage, t])
 
   // ===== 批量删除逻辑 =====
   const handleBatchDelete = useCallback(async () => {
@@ -260,8 +286,8 @@ export function HistoryTable({
     setBatchDeleting(false)
     onBatchStatusChange?.(false, false)
     setSelectedTaskIds(new Set())
-    // deleteHistoryTask 内部已通过 setState 更新 tasks，此处同步到 store
-    await syncHistoryFromBackend(taskType)
+    // deleteHistoryTask 内部已通过 setState 更新 tasks，此处刷新当前页同步总数
+    await loadHistoryPage(currentPageRef.current)
 
     if (failCount > 0) {
       const msg = t('common.batchDeleteResult', { defaultValue: '删除完成：成功 {{success}} 个，失败 {{fail}} 个' })
@@ -269,7 +295,7 @@ export function HistoryTable({
         .replace('{{fail}}', String(failCount))
       alert(msg)
     }
-  }, [filteredTasks, selectedTaskIds, deleteHistoryTask, taskType, syncHistoryFromBackend, t])
+  }, [filteredTasks, selectedTaskIds, deleteHistoryTask, loadHistoryPage, t])
 
   // ===== 将批量处理方法注册到模块级变量（供父组件 tab 栏按钮调用） =====
   useEffect(() => {
@@ -431,7 +457,7 @@ export function HistoryTable({
                               try {
                                 const success = await onApplyTask(task)
                                 if (success) {
-                                  await syncHistoryFromBackend(taskType)
+                                  await loadHistoryPage(currentPageRef.current)
                                   setSelectedTaskIds(prev => {
                                     const next = new Set(prev)
                                     next.delete(task.id)
@@ -470,6 +496,35 @@ export function HistoryTable({
           })}
         </tbody>
       </table>
+    </div>
+    {/* ===== 底部翻页栏：每页固定 20 条，统计全部数量与每页数量 ===== */}
+    <div className="flex items-center justify-between px-4 py-2 border-t border-border bg-card rounded-b-xl">
+      <span className="text-xs text-muted-foreground">
+        {t('common.historyTotal', { defaultValue: '共 {{total}} 条' }).replace('{{total}}', String(totalCount))}
+        {' · '}
+        {t('common.perPage', { defaultValue: '每页 {{size}} 条' }).replace('{{size}}', String(pageSize))}
+      </span>
+      <div className="flex items-center gap-2">
+        <button
+          onClick={() => loadHistoryPage(currentPage - 1)}
+          disabled={currentPage <= 1}
+          className="px-2.5 py-1 text-xs rounded-md border border-border disabled:opacity-40 disabled:cursor-not-allowed hover:bg-muted/50 transition-colors"
+        >
+          {t('common.prevPage') || '上一页'}
+        </button>
+        <span className="text-xs text-muted-foreground whitespace-nowrap">
+          {t('common.pageInfo', { defaultValue: '第 {{page}} / {{totalPages}} 页' })
+            .replace('{{page}}', String(currentPage))
+            .replace('{{totalPages}}', String(totalPages))}
+        </span>
+        <button
+          onClick={() => loadHistoryPage(currentPage + 1)}
+          disabled={currentPage >= totalPages}
+          className="px-2.5 py-1 text-xs rounded-md border border-border disabled:opacity-40 disabled:cursor-not-allowed hover:bg-muted/50 transition-colors"
+        >
+          {t('common.nextPage') || '下一页'}
+        </button>
+      </div>
     </div>
     </>
   )

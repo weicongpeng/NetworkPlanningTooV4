@@ -29,8 +29,8 @@ export interface CellSelectionTableProps {
   selectedCellIds: Set<string>
   /** 切换小区选中状态 */
   onToggleCell: (cellId: string) => void
-  /** 全选回调 */
-  onSelectAll: () => void
+  /** 全选回调（传入当前搜索过滤后的小区ID列表） */
+  onSelectAll: (filteredIds: string[]) => void
   /** 清空选择回调 */
   onClearSelections: () => void
   /** 选中数量展示文本（可选） */
@@ -156,9 +156,9 @@ export const CellSelectionTable = ({
     )
   }
 
-  // 判断当前网络类型的所有小区是否都已选中
-  const allSelected = sectors.length > 0 && sectors.every(s => selectedCellIds.has(s.id))
-  const someSelected = sectors.some(s => selectedCellIds.has(s.id))
+  // 判断当前搜索过滤后的小区是否都已选中
+  const allSelected = filtered.length > 0 && filtered.every(s => selectedCellIds.has(s.id))
+  const someSelected = filtered.some(s => selectedCellIds.has(s.id))
   const noneSelected = !someSelected
 
   return (
@@ -242,7 +242,7 @@ export const CellSelectionTable = ({
               <div className="flex text-[10px] font-medium">
                 <div className="p-2 bg-muted border-r border-border w-10 shrink-0 flex items-center justify-center">
                   <button
-                    onClick={() => !disabled && onSelectAll()}
+                    onClick={() => !disabled && onSelectAll(filtered.map(s => s.id))}
                     disabled={disabled}
                     className="w-4 h-4 rounded-sm border flex items-center justify-center disabled:opacity-50 disabled:cursor-not-allowed"
                     style={{

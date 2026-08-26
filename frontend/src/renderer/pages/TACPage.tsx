@@ -86,6 +86,10 @@ export function TACPage() {
   const [nextTaskError, setNextTaskError] = useState<string | null>(null)
   const { activeTaskIds, setActiveTaskId, getLatestTACCheckTask, startTask, updateTaskProgress, completeTask, failTask, syncHistoryFromBackend,
     startGlobalPolling, stopGlobalPolling, isGlobalPollingActive } = useTaskStore()
+  // 🔥 页面挂载时同步一次历史计数（badge 显示后端真实任务总数）
+  useEffect(() => {
+    syncHistoryFromBackend('tac_check').catch(() => {})
+  }, [syncHistoryFromBackend])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [localTaskResult, setLocalTaskResult] = useState<TACResultData | null>(null)
@@ -97,7 +101,8 @@ export function TACPage() {
   const t0 = performance.now()
   const latestTACCheckTask = getLatestTACCheckTask()
   const taskId = activeTaskIds.tac_check
-  const tacCheckHistoryCount = useTaskStore(s => Object.values(s.tasks).filter(t => t.type === 'tac_check').length)
+  // 🔥 修复：改用后端返回的真实任务总数（historyCounts），避免本地 store 缓存截断导致计数不准
+  const tacCheckHistoryCount = useTaskStore(s => s.historyCounts.tac_check)
   const taskResult = localTaskResult || (latestTACCheckTask?.result as TACResultData | null)
   // 只有当有完整结果数据（含 results 数组）或由 handleViewTask 设置时才认为是有效结果
   const hasFullResult = taskResult && (!!(taskResult as any).results || viewedTaskIdRef.current)
@@ -282,6 +287,18 @@ export function TACPage() {
     }
   }, [taskId])
 
+  // 🔥 可复用的 TAC 同步服务初始化（消除查看历史任务时的竞态）
+  const tacInitPromiseRef = useRef<Promise<void> | null>(null)
+  const ensureTacSyncService = useCallback(async () => {
+    if (!tacInitPromiseRef.current) {
+      tacInitPromiseRef.current = tacDataSyncService.initialize().catch(err => {
+        tacInitPromiseRef.current = null // 失败后允许重试
+        throw err
+      })
+    }
+    return tacInitPromiseRef.current
+  }, [])
+
   // 初始化TAC数据同步服务（异步执行，不阻塞页面渲染）
   useEffect(() => {
     console.time('[TACPage] effect:init')
@@ -290,7 +307,7 @@ export function TACPage() {
     const initMapServices = async () => {
       console.time('[TACPage] init:tacDataSyncService')
       try {
-        await tacDataSyncService.initialize()
+        await ensureTacSyncService()
         // 初始化完成后刷新地图数据
         if (mapRef.current && mounted) {
           await mapRef.current.refreshData()
@@ -590,6 +607,9 @@ export function TACPage() {
         setActiveLeftTab('planning-result')
         setShowMap(true)
         if (result.results) {
+          // 🔥 修复：查看历史任务时确保 sync service 已初始化，
+          // 否则点击结果行时 findSector 无数据可查，地图不渲染
+          await ensureTacSyncService().catch(() => {})
           const taskNetworkType = result.networkType || config?.networkType || 'LTE'
           const uniqueTACs = new Set<string>()
           result.results.forEach((cell: any) => {
@@ -809,10 +829,8 @@ export function TACPage() {
     })
   }
 
-  const toggleSelectAll = () => {
-    const networkType = (config?.networkType || 'LTE') as 'LTE' | 'NR'
-    const sectors = networkType === 'LTE' ? cellListData.lte : cellListData.nr
-    const allIds = sectors.map(s => s.id)
+  const toggleSelectAll = (filteredIds: string[]) => {
+    const allIds = filteredIds
     const allSelected = allIds.length > 0 && allIds.every(id => selectedCellIdsSet.has(id))
     setSelectedCellIdsSet(prev => {
       const next = new Set(prev)

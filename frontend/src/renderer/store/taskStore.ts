@@ -60,6 +60,8 @@ export interface Task {
 interface TaskState {
   tasks: Record<string, Task>
   activeTaskIds: Record<TaskType, string | null> // 记录每个模块当前活跃的任务ID
+  /** 各模块历史任务真实总数（来自后端 COUNT，不受本地 store 缓存条数限制） */
+  historyCounts: Record<TaskType, number>
 
   // 获取所有运行中的任务
   getRunningTasks: () => Task[]
@@ -99,8 +101,8 @@ interface TaskState {
   // 设置模块活跃任务ID
   setActiveTaskId: (type: TaskType, id: string | null) => void
 
-  // 从后端同步历史任务到本地 store
-  syncHistoryFromBackend: (type: TaskType) => Promise<void>
+  // 从后端同步历史任务到本地 store（支持分页，返回分页信息）
+  syncHistoryFromBackend: (type: TaskType, page?: number, pageSize?: number) => Promise<{ total: number; page: number; page_size: number } | undefined>
 
   // 标记任务为已应用（本地状态同步，不依赖后端刷新）
   markTaskApplied: (taskId: string) => void
@@ -160,6 +162,14 @@ export const useTaskStore = create<TaskState>()(
         tac_check: null,
         tac_planning: null,
         upload: null
+      },
+      historyCounts: {
+        parameter_update: 0,
+        pci_planning: 0,
+        neighbor_planning: 0,
+        tac_check: 0,
+        tac_planning: 0,
+        upload: 0
       },
 
       getRunningTasks: () => {
@@ -350,34 +360,30 @@ export const useTaskStore = create<TaskState>()(
         }))
       },
 
-      syncHistoryFromBackend: async (type) => {
+      syncHistoryFromBackend: async (type, page = 1, pageSize = 20): Promise<{ total: number; page: number; page_size: number } | undefined> => {
         try {
           let response: any
           switch (type) {
             case 'pci_planning':
-              response = await pciApi.getHistory()
+              response = await pciApi.getHistory(page, pageSize)
               break
             case 'neighbor_planning':
-              response = await neighborApi.getHistory()
+              response = await neighborApi.getHistory(page, pageSize)
               break
             case 'tac_check':
-              response = await tacApi.getHistory()
+              response = await tacApi.getHistory(page, pageSize)
               break
             case 'tac_planning':
-              response = await tacPlanningApi.getHistory()
+              response = await tacPlanningApi.getHistory(page, pageSize)
               break
             default:
               return
           }
 
-          const historyTasks = response?.data
-          if (!Array.isArray(historyTasks)) return
-
-          // 🔍 诊断日志：打印从后端接收的原始数据
-          console.log(`[taskStore.syncHistoryFromBackend] type=${type} count=${historyTasks.length}`)
-          historyTasks.slice(0, 5).forEach((ht: any) => {
-            console.log(`  taskId=${ht.taskId?.slice(0,12)}... taskName=${ht.taskName} resultSummary=`, ht.resultSummary)
-          })
+          const data = response?.data
+          const historyTasks = data?.tasks
+          const historyTotal = typeof data?.total === 'number' ? data.total : (Array.isArray(historyTasks) ? historyTasks.length : 0)
+          if (!Array.isArray(historyTasks)) return { total: historyTotal, page, page_size: pageSize }
 
           set(state => {
             const merged: Record<string, any> = {}
@@ -393,13 +399,12 @@ export const useTaskStore = create<TaskState>()(
             for (const ht of historyTasks) {
               const id = ht.taskId
               if (!id) continue
-              // 🔥 优化：后端历史列表现在直接返回完整 result（含 results 数组），
-              // 优先使用后端返回的完整 result，其次保留已有的完整结果，最后回退到 resultSummary
+              // 🔥 性能优化：后端历史列表不再返回完整 result（含 results 数组），
+              // 只返回轻量 resultSummary。本地已有完整结果的任务保留完整结果，
+              // 否则回退到摘要；前端"查看"时通过 /result/{taskId} 按需获取完整结果
               const preserved = merged[id]
               let taskResult
-              if (ht.result?.results) {
-                taskResult = ht.result       // 后端直接返回了完整结果
-              } else if (preserved?.result?.results) {
+              if (preserved?.result?.results) {
                 taskResult = preserved.result // 已有完整结果，保留
               } else {
                 taskResult = ht.resultSummary || undefined  // 回退到摘要
@@ -417,16 +422,20 @@ export const useTaskStore = create<TaskState>()(
                 result: taskResult,
               }
             }
-            // 🔍 诊断日志：验证 merge 结果
-            console.log(`[taskStore.syncHistoryFromBackend] merge done, tasks count=${Object.keys(merged).length}`)
-            Object.entries(merged).slice(0, 5).forEach(([id, t]: [string, any]) => {
-              console.log(`  merged[${id.slice(0,12)}...] type=${t.type} name=${t.taskName} result.totalSites=${t.result?.totalSites} result.totalSectors=${t.result?.totalSectors}`)
-            })
 
-            return { tasks: merged }
+            return {
+              tasks: merged,
+              historyCounts: {
+                ...state.historyCounts,
+                [type]: historyTotal
+              }
+            }
           })
+          // 🔥 分页：返回后端的分页信息（供 HistoryTable 翻页栏显示）
+          return { total: historyTotal, page: data?.page ?? page, page_size: data?.page_size ?? pageSize }
         } catch (err) {
           console.warn(`[taskStore] 同步 ${type} 历史任务失败:`, err)
+          return { total: 0, page, page_size: pageSize }
         }
       },
 
@@ -477,7 +486,13 @@ export const useTaskStore = create<TaskState>()(
               if (state.activeTaskIds[type] === taskId) {
                 newActiveTaskIds[type] = null
               }
-              return { tasks: newTasks, activeTaskIds: newActiveTaskIds }
+              // 删除成功后同步递减历史任务计数（保持 badge 与后端一致）
+              const newCount = Math.max(0, (state.historyCounts[type] || 0) - 1)
+              return {
+                tasks: newTasks,
+                activeTaskIds: newActiveTaskIds,
+                historyCounts: { ...state.historyCounts, [type]: newCount }
+              }
             })
             return true
           }
@@ -573,7 +588,8 @@ export const useTaskStore = create<TaskState>()(
               { ...task, result: undefined }
             ])
           ),
-          activeTaskIds: state.activeTaskIds
+          activeTaskIds: state.activeTaskIds,
+          historyCounts: state.historyCounts
         }
       }
     }

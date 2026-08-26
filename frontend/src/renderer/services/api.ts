@@ -513,9 +513,13 @@ export const dataApi = {
     return await chunkedUpload(file, '/data/upload')
   },
 
-  /** 上传地图文件并保存到服务器 - 使用原生 fetch API */
-  uploadMap: async (file: File | null, filePath?: string): Promise<ApiResponse<any>> => {
-    console.log('[uploadMap] START - file:', file, 'filePath:', filePath)
+  /** 上传地图文件并保存到服务器 - 使用原生 fetch API
+   * @param file 主文件（.tab/.mif/.kml/.zip 等）
+   * @param filePath Electron 本地真实路径（后端据此在源文件夹查找关联文件）
+   * @param extraFiles 配套文件列表（浏览器模式无路径时，同 stem 的 .dat/.mid/.map/.id 一起上传）
+   */
+  uploadMap: async (file: File | null, filePath?: string, extraFiles?: File[]): Promise<ApiResponse<any>> => {
+    console.log('[uploadMap] START - file:', file, 'filePath:', filePath, 'extraFiles:', extraFiles?.map(f => f.name))
 
     // 验证输入
     if (!file) {
@@ -533,6 +537,14 @@ export const dataApi = {
       type: file.type
     })
 
+    // 配套文件（同 stem）作为 files 列表字段
+    if (extraFiles && extraFiles.length > 0) {
+      for (const extra of extraFiles) {
+        formData.append('files', extra)
+      }
+      console.log('[uploadMap] Added companion files:', extraFiles.map(f => f.name))
+    }
+
     if (filePath && filePath !== 'undefined' && filePath !== 'null') {
       formData.append('file_path', filePath)
       console.log('[uploadMap] Added file_path:', filePath)
@@ -549,24 +561,54 @@ export const dataApi = {
 
     // 使用原生 fetch API 发送请求
     const url = `${API_BASE_URL}/data/upload/map`
-    console.log('[uploadMap] Sending fetch request to:', url)
 
-    const response = await fetch(url, {
-      method: 'POST',
-      body: formData,
-    })
+    // Cloudflare Tunnel 会周期性断开（网关层 502/503/504，约数分钟一次），
+    // 上传请求撞上断开窗口会失败。网关层错误重试有意义：tunnel 断开后 1-10s 自动重连，重试大概率成功。
+    const MAX_RETRIES = 2
+    let lastError: string | null = null
 
-    console.log('[uploadMap] Response status:', response.status)
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      if (attempt > 0) {
+        const delay = attempt * 2500 // 2.5s / 5s
+        console.log(`[uploadMap] 网关错误，${delay / 1000}s 后重试 (第 ${attempt} 次)...`)
+        await new Promise(r => setTimeout(r, delay))
+      }
+      try {
+        console.log(`[uploadMap] Sending fetch request to: ${url} (attempt ${attempt + 1})`)
 
-    if (!response.ok) {
-      const errorText = await response.text()
-      console.error('[uploadMap] Error response:', errorText)
-      throw new Error(`上传失败: ${response.status} ${errorText}`)
+        const response = await fetch(url, {
+          method: 'POST',
+          body: formData,
+        })
+
+        console.log('[uploadMap] Response status:', response.status)
+
+        if (!response.ok) {
+          const errorText = await response.text()
+          const isGatewayErr = response.status === 502 || response.status === 503 || response.status === 504
+          if (isGatewayErr && attempt < MAX_RETRIES) {
+            lastError = `网关错误(${response.status})，准备重试`
+            console.warn(`[uploadMap] ${lastError}`)
+            continue
+          }
+          console.error('[uploadMap] Error response:', errorText)
+          throw new Error(`上传失败: ${response.status} ${errorText}`)
+        }
+
+        const result = await response.json()
+        console.log('[uploadMap] Success response:', result)
+        return result
+      } catch (err: any) {
+        // 网络层异常（连接重置/超时，fetch 自身抛错）同样重试
+        if (attempt < MAX_RETRIES) {
+          lastError = `网络错误: ${err?.message || err}`
+          console.warn(`[uploadMap] ${lastError}，准备重试`)
+          continue
+        }
+        throw err
+      }
     }
-
-    const result = await response.json()
-    console.log('[uploadMap] Success response:', result)
-    return result
+    throw new Error(`上传失败: ${lastError || '未知错误'}`)
   },
 
   /** 上传地理化数据文件 - 使用分块上传（解决 Cloudflare 524 超时） */
@@ -788,8 +830,8 @@ export const pciApi = {
   },
 
   // 获取历史任务列表
-  getHistory: async (): Promise<ApiResponse<any[]>> => {
-    return apiClient.get('/pci/history')
+  getHistory: async (page = 1, pageSize = 20): Promise<ApiResponse<any[]>> => {
+    return apiClient.get('/pci/history', { params: { page, page_size: pageSize } })
   },
 
   // 删除历史任务
@@ -826,8 +868,8 @@ export const tacApi = {
   },
 
   // 获取历史任务列表
-  getHistory: async (): Promise<ApiResponse<any[]>> => {
-    return apiClient.get('/tac/history')
+  getHistory: async (page = 1, pageSize = 20): Promise<ApiResponse<any[]>> => {
+    return apiClient.get('/tac/history', { params: { page, page_size: pageSize } })
   },
 
   // 删除历史任务
@@ -858,8 +900,8 @@ export const tacPlanningApi = {
   },
 
   // 获取历史任务列表
-  getHistory: async (): Promise<ApiResponse<any[]>> => {
-    return apiClient.get('/tac/planning/history')
+  getHistory: async (page = 1, pageSize = 20): Promise<ApiResponse<any[]>> => {
+    return apiClient.get('/tac/planning/history', { params: { page, page_size: pageSize } })
   },
 
   // 删除历史任务
@@ -925,8 +967,8 @@ export const neighborApi = {
   },
 
   // 获取历史任务列表
-  getHistory: async (): Promise<ApiResponse<any[]>> => {
-    return apiClient.get('/neighbor/history')
+  getHistory: async (page = 1, pageSize = 20): Promise<ApiResponse<any[]>> => {
+    return apiClient.get('/neighbor/history', { params: { page, page_size: pageSize } })
   },
 
   // 删除历史任务
@@ -980,13 +1022,14 @@ export const layerApi = {
   },
 
   // 获取图层要素数据
+  // 大图层首次请求（缓存未命中时后端 gpd 解析 + 坐标转换）可能较慢，单独放宽超时
   getLayerData: async (dataId: string, layerId: string): Promise<ApiResponse<any>> => {
-    return apiClient.get(`/data/${dataId}/layers/${layerId}/data`)
+    return apiClient.get(`/data/${dataId}/layers/${layerId}/data`, { timeout: 600000 })
   },
 
-  // 获取图层的字段名列表
+  // 获取图层的字段名列表（同样调用 get_layer_data，放宽超时）
   getLayerColumns: async (dataId: string, layerId: string): Promise<ApiResponse<{ fields: string[]; layerId: string; total: number }>> => {
-    return apiClient.get(`/data/${dataId}/layers/${layerId}/columns`)
+    return apiClient.get(`/data/${dataId}/layers/${layerId}/columns`, { timeout: 600000 })
   }
 }
 
@@ -1115,6 +1158,92 @@ export const layerToolsApi = {
   },
 }
 
+// ===== 平均站间距计算 =====
+export interface SiteSpacingParseError {
+  sheet: string
+  row: number
+  reason: string
+}
+
+export interface SiteSpacingParseResult {
+  success: boolean
+  data: {
+    total: number
+    errors: SiteSpacingParseError[]
+  }
+}
+
+export interface SiteSpacingResult {
+  success: boolean
+  data: {
+    filename: string
+    download_url: string
+    total: number
+    counted: number
+    overall_avg_km: number
+    k: number
+    errors?: SiteSpacingParseError[]
+  }
+}
+
+export const siteSpacingApi = {
+  // 解析 + 校验站点文件
+  parse: async (filePath: string): Promise<SiteSpacingParseResult> => {
+    const formData = new FormData()
+    formData.append('file_path', filePath)
+    return uploadClient.post('/site-spacing/parse', formData)
+  },
+
+  // 读取数据管理工参原始 Excel 的真实 sheet 列表（缺失时兜底网络分表）
+  getDataSheets: async (dataId: string): Promise<ApiResponse<{ sheets: string[]; source: 'excel' | 'network' }>> => {
+    const formData = new FormData()
+    formData.append('data_id', dataId)
+    return uploadClient.post('/site-spacing/data-sheets', formData)
+  },
+
+  // 执行平均站间距计算
+  calculate: async (params: {
+    filePath?: string
+    k: number
+    fullSource: 'file' | 'data'
+    fullSheetName: string
+    fullDataId?: string
+    fullNameCol?: string
+    fullLonCol?: string
+    fullLatCol?: string
+  }): Promise<SiteSpacingResult> => {
+    const formData = new FormData()
+    if (params.filePath) formData.append('file_path', params.filePath)
+    formData.append('k', String(params.k))
+    formData.append('full_source', params.fullSource)
+    formData.append('full_sheet_name', params.fullSheetName)
+    if (params.fullDataId) {
+      formData.append('full_data_id', params.fullDataId)
+      if (params.fullNameCol) formData.append('full_name_col', params.fullNameCol)
+      if (params.fullLonCol) formData.append('full_lon_col', params.fullLonCol)
+      if (params.fullLatCol) formData.append('full_lat_col', params.fullLatCol)
+    }
+    return uploadClient.post('/site-spacing/calculate', formData)
+  },
+
+  // 模板下载（带认证，blob 方式）
+  downloadTemplate: async (): Promise<void> => {
+    const res = await uploadClient.get('/site-spacing/template', { responseType: 'blob' })
+    const blob = res as unknown as Blob
+    if (!(blob instanceof Blob) || blob.size === 0) throw new Error('模板下载失败：文件内容为空')
+    const url = window.URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = '站间距计算-模板.xlsx'
+    document.body.appendChild(link)
+    link.click()
+    setTimeout(() => {
+      document.body.removeChild(link)
+      window.URL.revokeObjectURL(url)
+    }, 100)
+  },
+}
+
 // ===== 批量距离匹配 =====
 export interface DistanceMatchParseError {
   sheet: string
@@ -1155,7 +1284,7 @@ export const distanceMatchApi = {
     return uploadClient.post('/distance-match/data-sheets', formData)
   },
 
-  // 执行匹配（全量站点：上传文件 或 数据管理工参，二选一）
+  // 执行匹配（相邻站点：上传文件 或 数据管理工参，二选一）
   match: async (params: {
     filePath: string
     matchSheetName: string
@@ -1175,9 +1304,9 @@ export const distanceMatchApi = {
     formData.append('full_sheet_name', params.fullSheetName)
     if (params.fullDataId) {
       formData.append('full_data_id', params.fullDataId)
-      formData.append('full_name_col', params.fullNameCol || '')
-      formData.append('full_lon_col', params.fullLonCol || '')
-      formData.append('full_lat_col', params.fullLatCol || '')
+      if (params.fullNameCol) formData.append('full_name_col', params.fullNameCol)
+      if (params.fullLonCol) formData.append('full_lon_col', params.fullLonCol)
+      if (params.fullLatCol) formData.append('full_lat_col', params.fullLatCol)
     }
     return uploadClient.post('/distance-match/match', formData)
   },

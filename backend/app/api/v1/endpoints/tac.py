@@ -3,7 +3,7 @@ TAC规划API端点
 """
 
 import asyncio
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Request
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Request, Query
 from typing import Dict, Any
 from datetime import datetime
 from app.models.schemas import TACConfig, TACResult
@@ -101,10 +101,13 @@ async def delete_tac_history(task_id: str) -> Dict[str, Any]:
 
 
 @router.get("/history", response_model=Dict[str, Any])
-async def get_tac_history() -> Dict[str, Any]:
-    """获取所有用户的 TAC 核查历史任务列表"""
+async def get_tac_history(
+    page: int = Query(1, ge=1, description="页码（从 1 开始）"),
+    page_size: int = Query(20, ge=1, le=100, description="每页条数"),
+) -> Dict[str, Any]:
+    """获取所有用户的 TAC 核查历史任务列表（分页）"""
     try:
-        results = task_manager.list_task_history(task_type="tac")
+        results = task_manager.list_task_history(task_type="tac", page=page, page_size=page_size)
         return {"success": True, "data": results}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -196,10 +199,13 @@ async def delete_tac_planning_history(task_id: str) -> Dict[str, Any]:
 
 
 @router.get("/planning/history", response_model=Dict[str, Any])
-async def get_tac_planning_history() -> Dict[str, Any]:
-    """获取所有用户的 TAC 规划历史任务列表"""
+async def get_tac_planning_history(
+    page: int = Query(1, ge=1, description="页码（从 1 开始）"),
+    page_size: int = Query(20, ge=1, le=100, description="每页条数"),
+) -> Dict[str, Any]:
+    """获取所有用户的 TAC 规划历史任务列表（分页）"""
     try:
-        results = task_manager.list_task_history(task_type="tac_planning")
+        results = task_manager.list_task_history(task_type="tac_planning", page=page, page_size=page_size)
         return {"success": True, "data": results}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

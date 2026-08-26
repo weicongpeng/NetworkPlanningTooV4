@@ -34,6 +34,9 @@ export function DataPage() {
   // 上传成功消息
   const [uploadSuccess, setUploadSuccess] = useState<string | null>(null)
 
+  // 上传失败详细错误（透传后端真实原因，不再只显示"上传失败"）
+  const [uploadError, setUploadError] = useState<string | null>(null)
+
   // 各上传项的状态
   const [uploadStatus, setUploadStatus] = useState<Record<string, 'idle' | 'success' | 'error'>>({
     full_params: 'idle',
@@ -254,30 +257,79 @@ export function DataPage() {
     // 设置上传状态为进行中
     setUploadStatus(prev => ({ ...prev, [context]: 'idle' }))
 
-    // 多选文件上传逻辑（仅用于图层文件）
+    // 多选文件上传逻辑
     if (files.length > 1) {
-      console.log('[Upload] Multiple files detected, processing sequentially')
-      let allSuccess = true
+      console.log('[Upload] Multiple files detected')
 
-      for (const file of files) {
-        let filePath = (file as any).path
-
-        if (!filePath && (window as any).electronAPI?.getFilePath) {
+      // 辅助：获取文件的本地真实路径（Electron），后端据此在源文件夹查找关联文件
+      const resolvePath = async (f: File): Promise<string | undefined> => {
+        let p = (f as any).path
+        if (!p && (window as any).electronAPI?.getFilePath) {
           try {
-            filePath = await (window as any).electronAPI.getFilePath(file)
+            p = await (window as any).electronAPI.getFilePath(f)
           } catch (e) {
             console.error('[Upload] Error getting path:', e)
           }
         }
+        return p || undefined
+      }
 
-        console.log('[Upload] Path Captured:', filePath || 'NULL (Browser Restriction)')
+      // 图层文件（map_layer）：按 stem 分组，主文件 + 配套文件一次上传
+      // （浏览器模式无真实路径时，配套的 .dat/.mid/.map/.id 需与主文件一起选中上传）
+      const MAP_MAIN_RANK = ['.tab', '.kml', '.mif', '.dat', '.zip']
+      let allSuccess = true
 
-        // 修复：uploadExcel/uploadMap 的第二个参数是 context，不是 filePath
-        const success = context === 'geo_data'
-          ? await uploadFn(file, filePath || undefined)
-          : await uploadFn(file, context)
-        if (!success) {
-          allSuccess = false
+      if (context === 'map_layer') {
+        const groups = new Map<string, { main?: File; companions: File[] }>()
+        for (const f of files) {
+          const ext = ('.' + (f.name.split('.').pop() || '').toLowerCase())
+          const stem = f.name.replace(/\.\w+$/, '').toLowerCase()
+          if (!groups.has(stem)) groups.set(stem, { companions: [] })
+          const g = groups.get(stem)!
+          const rank = MAP_MAIN_RANK.indexOf(ext)
+          const curRank = g.main ? MAP_MAIN_RANK.indexOf('.' + (g.main.name.split('.').pop() || '').toLowerCase()) : -1
+          if (!g.main || (rank !== -1 && (curRank === -1 || rank < curRank))) {
+            if (g.main) g.companions.push(g.main)
+            g.main = f
+          } else {
+            g.companions.push(f)
+          }
+        }
+        for (const [, g] of groups) {
+          const main = g.main || g.companions[0]
+          if (!main) continue
+          const comps = g.companions.filter(c => c !== main)
+          const filePath = await resolvePath(main)
+          console.log('[Upload] Path Captured:', filePath || 'NULL (Browser Restriction)')
+          try {
+            const ok = await uploadMap(main, filePath, comps.length > 0 ? comps : undefined)
+            allSuccess = allSuccess && ok
+          } catch (err: any) {
+            allSuccess = false
+            const errMsg = err?.message || '上传失败'
+            console.error('[Upload] 上传异常:', err)
+            setUploadError(errMsg)
+            setTimeout(() => setUploadError(null), 8000)
+          }
+        }
+      } else {
+        // 其他上下文：逐个上传（传真实路径，后端用于查找关联文件）
+        for (const file of files) {
+          const filePath = await resolvePath(file)
+          console.log('[Upload] Path Captured:', filePath || 'NULL (Browser Restriction)')
+          let success: boolean
+          try {
+            success = await uploadFn(file, filePath || undefined)
+          } catch (err: any) {
+            success = false
+            const errMsg = err?.message || '上传失败'
+            console.error('[Upload] 上传异常:', err)
+            setUploadError(errMsg)
+            setTimeout(() => setUploadError(null), 8000)
+          }
+          if (!success) {
+            allSuccess = false
+          }
         }
       }
 
@@ -314,10 +366,19 @@ export function DataPage() {
 
       console.log('[Upload] Path Captured:', filePath || 'NULL (Browser Restriction)')
 
-      // 修复：uploadExcel/uploadMap 的第二个参数是 context，不是 filePath
-      const success = context === 'geo_data'
-        ? await uploadFn(file, filePath || undefined)
-        : await uploadFn(file, context)
+      // 传真实文件路径给后端（Electron 桌面模式可据此在源文件夹查找 tab/mif 的关联文件）；
+      // 浏览器模式 filePath 为 undefined，后端回退到仅上传的文件
+      // 捕获 chunkedUpload 抛出的具体错误（如"坐标验证失败"），透传到前端
+      let success: boolean
+      try {
+        success = await uploadFn(file, filePath || undefined)
+      } catch (err: any) {
+        success = false
+        const errMsg = err?.message || '上传失败'
+        console.error('[Upload] 上传异常:', err)
+        setUploadError(errMsg)
+        setTimeout(() => setUploadError(null), 8000)
+      }
       if (success) {
         event.target.value = ''
         setUploadStatus(prev => ({ ...prev, [context]: 'success' }))
@@ -726,6 +787,21 @@ export function DataPage() {
         </div>
       )}
 
+      {/* 上传失败详细错误提示（透传后端真实原因） */}
+      {uploadError && (
+        <div className="mb-6 p-4 bg-red-50 border border-red-200 rounded-lg flex items-center gap-3 text-red-700">
+          <AlertCircle size={20} className="shrink-0" />
+          <span className="flex-grow whitespace-pre-wrap">{uploadError}</span>
+          <button
+            onClick={() => setUploadError(null)}
+            className="text-red-700 hover:text-red-900 transition-colors duration-200 p-1 hover:bg-red-100 rounded-full"
+            aria-label={t('data.close') || '关闭'}
+          >
+            ✕
+          </button>
+        </div>
+      )}
+
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
         <div className="space-y-8">
             {/* 文件上传 */}
@@ -782,14 +858,14 @@ export function DataPage() {
                     <div className="flex-1">
                         <UploadArea
                             title={t('data.mapLayer') || '图层文件'}
-                            accept=".zip,.tab,.mif"
+                            accept=".zip,.tab,.mif,.kml"
                             onUpload={(e) => handleFileUpload(e, 'map', 'map_layer')}
                             loading={loading && uploadingType === 'map_layer'}
                             icon={<Layers size={20} />}
                             multiple={true}
                             inline={true}
                             status={uploadStatus.map_layer}
-                            description={t('data.mapLayerDesc') || '支持ZIP/TAB/MIF，TAB需配套DAT文件'}
+                            description={t('data.mapLayerDesc') || '支持ZIP/TAB/MIF/KML，TAB需配套DAT文件'}
                         />
                     </div>
                     <div className="w-24">
@@ -1001,6 +1077,9 @@ export function DataPage() {
                           ? <>
                               <AlertCircle size={10} />
                               {(t('data.failed') || '处理失败')}
+                              {item.errorMessage ? (
+                                <span className="max-w-[180px] truncate" title={item.errorMessage}>: {item.errorMessage}</span>
+                              ) : null}
                             </>
                           : item.fileType === 'geo_data'
                           ? (item.geometryType === 'sector' ? (t('data.sectorData') || '扇区数据') : (t('data.geo') || '地理化'))
