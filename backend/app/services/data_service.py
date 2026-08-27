@@ -1633,10 +1633,29 @@ class DataService:
             errors.append("频点必须为数字")
 
         ct = fields.get("cellCoverType")
-        if ct is not None and int(ct) not in (1, 4):
-            errors.append("覆盖类型仅支持 1/4")
+        if ct is not None:
+            try:
+                ct_int = int(ct)
+            except (ValueError, TypeError):
+                errors.append("覆盖类型必须为数字")
+            else:
+                if ct_int not in (1, 4):
+                    errors.append("覆盖类型仅支持 1/4")
 
         return (len(errors) == 0), errors
+
+    @staticmethod
+    def _parse_row_key(row_key: str) -> Optional[Tuple[int, int]]:
+        """解析 rowKey 'sitePk:sectorPk' → (sitePk, sectorPk)；非法返回 None"""
+        try:
+            site_pk, sector_pk = (int(x) for x in str(row_key).split(":"))
+            return site_pk, sector_pk
+        except (ValueError, TypeError):
+            return None
+
+    @staticmethod
+    def _row_result(row_key: str, rtype: str, success: bool, message: str) -> Dict:
+        return {"rowKey": row_key, "type": rtype, "success": success, "message": message}
 
     def bulk_update_cells(self, updates: List[Dict], deletes: List[Dict],
                           user_id: int = 1, workbook_id: Optional[str] = None) -> Dict[str, Any]:
@@ -1664,6 +1683,14 @@ class DataService:
         deleted = 0
 
         try:
+            # 0. 行级互斥：同一 rowKey 同时出现在 updates 与 deletes → 拒绝
+            conflict_keys = {u.get("rowKey") for u in updates} & {d.get("rowKey") for d in deletes}
+            if conflict_keys:
+                for k in conflict_keys:
+                    results.append(self._row_result(k, "conflict", False, "同一记录不能同时更新与删除"))
+                updates = [u for u in updates if u.get("rowKey") not in conflict_keys]
+                deletes = [d for d in deletes if d.get("rowKey") not in conflict_keys]
+
             # 1. 预加载库内 (siteId, cellId) → {networkType, sectorPk, sitePk} 冲突表
             conflict_map: Dict[str, dict] = {}
             sector_pk_to_row: Dict[int, tuple] = {}
@@ -1683,23 +1710,26 @@ class DataService:
             # 2. 处理删除（先删，避免与更新冲突表互相干扰）
             for d in deletes:
                 row_key = d.get("rowKey", "")
-                try:
-                    _site_pk, _sector_pk = (int(x) for x in row_key.split(":"))
-                except (ValueError, TypeError):
-                    results.append({"rowKey": row_key, "type": "delete", "success": False,
-                                    "message": "无效的 rowKey"})
+                parsed = self._parse_row_key(row_key)
+                if parsed is None:
+                    results.append(self._row_result(row_key, "delete", False, "无效的 rowKey"))
                     continue
+                _site_pk, _sector_pk = parsed
                 sector = db.query(Sector).filter(Sector.id == _sector_pk,
                                                  Sector.workbook_id == workbook_id).first()
                 if not sector:
-                    results.append({"rowKey": row_key, "type": "delete", "success": False,
-                                    "message": "记录不存在"})
+                    results.append(self._row_result(row_key, "delete", False, "记录不存在"))
                     continue
                 site = db.query(Site).filter(Site.id == _site_pk).first()
                 sid = str(sector.sector_id)
+                cell_id = sid.rsplit("_", 1)[-1] if "_" in sid else sid
                 # 捕获删除前键（供 Excel 行删除定位：删除后 DB 已无此记录）
                 d["_site_id"] = str(site.site_id) if site is not None else None
-                d["_cell_id"] = sid.rsplit("_", 1)[-1] if "_" in sid else sid
+                d["_cell_id"] = cell_id
+                # 释放该键：同批次后续更新可改键到被释放键
+                if site is not None:
+                    conflict_map.pop(f"{site.site_id}_{cell_id}", None)
+                sector_pk_to_row.pop(_sector_pk, None)
                 db.delete(sector)
                 db.flush()
                 remaining = db.query(Sector).filter(Sector.site_id_fk == _site_pk).count()
@@ -1707,25 +1737,22 @@ class DataService:
                     db.delete(site)
                     db.flush()
                 deleted += 1
-                results.append({"rowKey": row_key, "type": "delete", "success": True,
-                                "message": "小区已删除"})
+                results.append(self._row_result(row_key, "delete", True, "小区已删除"))
 
             # 3. 处理更新（逐行校验；同批次内新键互斥检查）
             for u in updates:
                 row_key = u.get("rowKey", "")
                 nt = str(u.get("networkType", "")).upper()
                 fields = u.get("fields", {}) or {}
-                try:
-                    _site_pk, _sector_pk = (int(x) for x in row_key.split(":"))
-                except (ValueError, TypeError):
-                    results.append({"rowKey": row_key, "type": "update", "success": False,
-                                    "message": "无效的 rowKey"})
+                parsed = self._parse_row_key(row_key)
+                if parsed is None:
+                    results.append(self._row_result(row_key, "update", False, "无效的 rowKey"))
                     continue
+                _site_pk, _sector_pk = parsed
 
                 cur = sector_pk_to_row.get(_sector_pk)
                 if not cur:
-                    results.append({"rowKey": row_key, "type": "update", "success": False,
-                                    "message": "记录不存在"})
+                    results.append(self._row_result(row_key, "update", False, "记录不存在"))
                     continue
                 site, sector = cur
                 # 捕获更新前键（供 Excel 行定位：Excel 尚未修改仍为旧键）
@@ -1751,8 +1778,7 @@ class DataService:
 
                 ok, errs = self.validate_cell_fields(full, nt)
                 if not ok:
-                    results.append({"rowKey": row_key, "type": "update", "success": False,
-                                    "message": "；".join(errs)})
+                    results.append(self._row_result(row_key, "update", False, "；".join(errs)))
                     continue
 
                 new_key = f"{str(full['siteId'])}.{str(full['cellId'])}"
@@ -1762,8 +1788,7 @@ class DataService:
                     if holder and holder["sectorPk"] != _sector_pk:
                         msg = self._duplicate_message(
                             nt, holder["networkType"], str(full["cellName"]))
-                        results.append({"rowKey": row_key, "type": "update", "success": False,
-                                        "message": msg})
+                        results.append(self._row_result(row_key, "update", False, msg))
                         continue
                     in_batch = any(
                         o.get("rowKey") != row_key
@@ -1772,8 +1797,8 @@ class DataService:
                         for o in updates
                     )
                     if in_batch:
-                        results.append({"rowKey": row_key, "type": "update", "success": False,
-                                        "message": f"批内重复: {full['siteId']}_{full['cellId']}"})
+                        results.append(self._row_result(
+                            row_key, "update", False, f"批内重复: {full['siteId']}_{full['cellId']}"))
                         continue
 
                 new_site_id = str(full["siteId"])
@@ -1956,7 +1981,8 @@ class DataService:
             cell_val = d.get("_cell_id")
             if site_val is None or cell_val is None:
                 continue
-            for r in _find_rows(ws, cm, site_col, cell_col, site_val, cell_val):
+            # 自下而上删行，避免行号上移导致错位
+            for r in reversed(_find_rows(ws, cm, site_col, cell_col, site_val, cell_val)):
                 ws.delete_rows(r)
 
     def _build_update_field_map(self, fields: Dict, network_type: str) -> Dict:

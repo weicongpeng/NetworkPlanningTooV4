@@ -176,6 +176,27 @@ def test_bulk_update_cell(excel_env):
     names = {i["cellName"] for i in data_service.search_cells("TH-1-改", workbook_id=excel_env)}
     assert "TH-1-改" in names
 
+    # Excel 双写断言：改名/方向角已写入 LTE sheet
+    # 归一化比较（Excel 单元格值可能是 int/float/str，如 '2001'/111/'1'）
+    from openpyxl import load_workbook
+    from pathlib import Path
+    from app.core.config import settings
+    wb = load_workbook(Path(settings.DATA_DIR) / excel_env / "original.xlsx")
+    lte_ws = wb["LTE Project Parameters"]
+    rows = list(lte_ws.iter_rows(min_row=2, values_only=True))
+
+    def _norm(v):
+        try:
+            f = float(str(v).strip())
+            return str(int(f)) if f == int(f) else str(f)
+        except (ValueError, TypeError):
+            return str(v).strip()
+
+    updated_row = [r for r in rows if _norm(r[0]) == "2001" and _norm(r[1]) == "111" and _norm(r[2]) == "1"]
+    assert updated_row, "Excel 中找不到 TH-1 数据行"
+    assert updated_row[0][3] == "TH-1-改" and _norm(updated_row[0][6]) == "90"
+    wb.close()
+
 
 def test_bulk_update_rekey_and_conflict(excel_env):
     data_service._invalidate_cell_search_index()
@@ -198,6 +219,28 @@ def test_bulk_update_rekey_and_conflict(excel_env):
     assert res["results"][0]["success"]
     names = {i["cellName"] for i in data_service.search_cells("999", workbook_id=excel_env)}
     assert "TH-2-新" in names
+
+    # Excel 双写断言：改键后新键 (999,9) 已写入 LTE sheet，旧键 (111,2) 行消失
+    # 归一化比较（Excel 单元格值可能是 int/float/str，如 '999'/'9'）
+    from openpyxl import load_workbook
+    from pathlib import Path
+    from app.core.config import settings
+    wb = load_workbook(Path(settings.DATA_DIR) / excel_env / "original.xlsx")
+    lte_ws = wb["LTE Project Parameters"]
+    rows = list(lte_ws.iter_rows(min_row=2, values_only=True))
+
+    def _norm(v):
+        try:
+            f = float(str(v).strip())
+            return str(int(f)) if f == int(f) else str(f)
+        except (ValueError, TypeError):
+            return str(v).strip()
+
+    new_key_rows = [r for r in rows if _norm(r[1]) == "999" and _norm(r[2]) == "9"]
+    assert new_key_rows, "Excel 中找不到改键后 (999,9) 行"
+    assert new_key_rows[0][3] == "TH-2-新"
+    assert not any(_norm(r[1]) == "111" and _norm(r[2]) == "2" for r in rows), "旧键 (111,2) 行应已改键"
+    wb.close()
 
 
 def test_bulk_update_cross_type_occupied(excel_env):
@@ -229,6 +272,54 @@ def test_bulk_delete_cascades_site(excel_env):
         assert db.query(Site).filter(Site.workbook_id == excel_env, Site.site_id == "222").first() is not None
     finally:
         db.close()
+
+    # Excel 双写断言：LTE sheet 中 (111,1)/(111,2) 行已删除
+    from openpyxl import load_workbook
+    from pathlib import Path
+    from app.core.config import settings
+    wb = load_workbook(Path(settings.DATA_DIR) / excel_env / "original.xlsx")
+    lte_ws = wb["LTE Project Parameters"]
+    rows = list(lte_ws.iter_rows(min_row=2, values_only=True))
+    lte_rows = [r for r in rows if r[0] == "2001"]
+    assert not any(r[1] == 111 for r in lte_rows), "Excel 中 (111,*) 行应已删除"
+    wb.close()
+
+
+def test_bulk_delete_multiple_same_key_rows(excel_env, tmp_path, monkeypatch):
+    """同键多行删除回归：Excel 中三行同 (111,1)，全删且保留其他行"""
+    from openpyxl import Workbook, load_workbook
+    from app.core.config import settings
+    from pathlib import Path
+
+    # 在 excel_env 基础上，向 LTE sheet 追加两行 (111,1) 副本（共 3 行同键）
+    ex_path = Path(settings.DATA_DIR) / excel_env / "original.xlsx"
+    # 先还原: bulk 前 Excel 目前含 TH-1(111,1)、TH-2(111,2)；追加 (111,1) 副本
+    wb = load_workbook(ex_path)
+    lte_ws = wb["LTE Project Parameters"]
+    base_row = [r for r in lte_ws.iter_rows(min_row=2, values_only=True)
+                if r[1] == 111 and r[2] == 1][0]
+    for _ in range(2):
+        lte_ws.append(base_row)
+    wb.save(ex_path)
+    wb.close()
+
+    data_service._invalidate_cell_search_index()
+    hit = data_service.search_cells("TH-1", workbook_id=excel_env)[0]
+
+    res = data_service.bulk_update_cells(
+        [],
+        [{"rowKey": hit["rowKey"], "networkType": "LTE"}],
+        user_id=1, workbook_id=excel_env,
+    )
+    assert res["deleted"] == 1  # DB 侧只删 1 条（主键唯一）
+
+    # Excel 侧：同键 (111,1) 的所有行都应删除（self 删除语义）
+    wb = load_workbook(ex_path)
+    lte_ws = wb["LTE Project Parameters"]
+    rows = list(lte_ws.iter_rows(min_row=2, values_only=True))
+    assert not any(r[1] == 111 and r[2] == 1 for r in rows), "Excel 中同键 (111,1) 行应全部删除"
+    assert any(r[1] == 111 and r[2] == 2 for r in rows), "TH-2 (111,2) 行应保留"
+    wb.close()
 
 
 def test_search_endpoint_smoke(query_env):
