@@ -164,7 +164,7 @@ class CellBulkUpdateResultItem(BaseModel):
     """查询/更新：逐行执行结果"""
 
     rowKey: str
-    type: str = Field(..., description="'update' | 'delete'")
+    type: str = Field(..., description="'update' | 'delete' | 'conflict'")
     success: bool
     message: str = ""
 

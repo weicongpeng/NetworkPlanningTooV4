@@ -1104,7 +1104,8 @@ class DataService:
                 matched.append((score, it))
 
         matched.sort(key=lambda x: (-x[0], x[1]["cellName"] or ""))
-        return [m[1] for m in matched[:limit]]
+        # 剔除内部字段 _hay，避免泄漏到 API 响应
+        return [{k: v for k, v in m[1].items() if k != "_hay"} for m in matched[:limit]]
 
     def batch_add_cells_to_full_params(self, cells: List[Dict]) -> Dict[str, Any]:
         """高性能批量向全量工参追加多个小区（一次性文件操作 + 单事务 SQLite）
@@ -1720,6 +1721,12 @@ class DataService:
                 if not sector:
                     results.append(self._row_result(row_key, "delete", False, "记录不存在"))
                     continue
+                # 以 sector 真实父站为准：rowKey 中 sitePk 可能与父站不一致（构造/过期 rowKey
+                # 若按 _site_pk 取站会级联误删无关站点），不一致时拒绝删除
+                if sector.site_id_fk != _site_pk:
+                    results.append(self._row_result(row_key, "delete", False,
+                                                    "rowKey 站点与小区父站不一致，已拒绝"))
+                    continue
                 site = db.query(Site).filter(Site.id == _site_pk).first()
                 sid = str(sector.sector_id)
                 cell_id = sid.rsplit("_", 1)[-1] if "_" in sid else sid
@@ -1732,7 +1739,7 @@ class DataService:
                 sector_pk_to_row.pop(_sector_pk, None)
                 db.delete(sector)
                 db.flush()
-                remaining = db.query(Sector).filter(Sector.site_id_fk == _site_pk).count()
+                remaining = db.query(Sector).filter(Sector.site_id_fk == sector.site_id_fk).count()
                 if remaining == 0 and site is not None:
                     db.delete(site)
                     db.flush()
@@ -1792,14 +1799,21 @@ class DataService:
                         continue
                     in_batch = any(
                         o.get("rowKey") != row_key
-                        and o.get("fields", {}).get("siteId") == str(full["siteId"])
-                        and o.get("fields", {}).get("cellId") == str(full["cellId"])
+                        and str(o.get("fields", {}).get("siteId")) == str(full["siteId"])
+                        and str(o.get("fields", {}).get("cellId")) == str(full["cellId"])
                         for o in updates
                     )
                     if in_batch:
                         results.append(self._row_result(
                             row_key, "update", False, f"批内重复: {full['siteId']}_{full['cellId']}"))
                         continue
+                    # 释放旧键、占用新键：批内后续行可改键到被本行释放的键（键交换）
+                    old_cell_id = (str(sector.sector_id).rsplit("_", 1)[-1]
+                                   if "_" in str(sector.sector_id) else str(sector.sector_id))
+                    conflict_map.pop(f"{str(site.site_id)}_{old_cell_id}", None)
+                    conflict_map[f"{str(full['siteId'])}_{str(full['cellId'])}"] = {
+                        "networkType": nt, "sectorPk": _sector_pk, "sitePk": site.id,
+                    }
 
                 new_site_id = str(full["siteId"])
                 if new_site_id != str(site.site_id):
@@ -1881,7 +1895,11 @@ class DataService:
                 safe_print(f"[DataService] 更新索引失败 (非致命): {e}")
 
         self._invalidate_cell_search_index()
-        return {"success": True, "message": f"更新 {updated} 条，删除 {deleted} 条",
+        _msg = f"更新 {updated} 条，删除 {deleted} 条"
+        if excel_error:
+            # DB 已提交但 Excel 写失败：用户需感知双写不一致（DB 为权威，可后续重导）
+            _msg += f"（警告：Excel 同步失败，仅数据库已更新）"
+        return {"success": True, "message": _msg,
                 "results": results, "updated": updated, "deleted": deleted}
 
     def _apply_excel_updates(self, wb, updates, deletes, results):
@@ -3909,6 +3927,8 @@ class DataService:
                         db.bulk_insert_mappings(Sector, sector_dicts)
 
             db.commit()
+            # 工参重新入库/更新后失效搜索索引，避免读到旧小区
+            self._invalidate_cell_search_index()
         except Exception as e:
             db.rollback()
             safe_print(f"[DataService] SQLite 写入失败 (非致命): {e}")
