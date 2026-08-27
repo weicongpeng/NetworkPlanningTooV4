@@ -1846,7 +1846,6 @@ class DataService:
             for r in results:
                 r["success"] = False
                 r["message"] = f"数据库写入失败: {str(e)[:200]}"
-            db.close()
             return {"success": False, "message": "数据库写入失败", "results": results,
                     "updated": 0, "deleted": 0}
         finally:
