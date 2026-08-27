@@ -21,6 +21,7 @@ from app.models.schemas import (
     CellBatchCreateRequest,
     CellDupCheckRequest,
     CellSearchRequest,
+    CellBulkUpdateRequest,
     UpdateParametersRequest,
     ImportPointsRequest,
 )
@@ -303,6 +304,46 @@ async def search_cells(
             request.limit,
         )
         return {"success": True, "data": result}
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        error_msg = str(e).replace("✗", "x")
+        safe_detail = error_msg.encode("utf-8", "replace").decode("utf-8")
+        raise HTTPException(status_code=500, detail=safe_detail)
+
+
+@router.post("/full-params/cells/bulk-update", response_model=Dict[str, Any])
+async def bulk_update_cells(
+    request: CellBulkUpdateRequest,
+    current_user=Depends(require_cell_entry),
+) -> Dict[str, Any]:
+    """查询/更新：批量更新 + 删除小区（一次事务，双写 DB + 全量工参 Excel）"""
+    try:
+        updates = [
+            {"rowKey": u.rowKey, "networkType": u.networkType.value, "fields": u.fields}
+            for u in request.updates
+        ]
+        deletes = [
+            {"rowKey": d.rowKey, "networkType": d.networkType.value}
+            for d in request.deletes
+        ]
+        result = await run_in_threadpool(
+            data_service.bulk_update_cells,
+            updates, deletes, current_user.id,
+        )
+        return {
+            "success": result.get("success", False),
+            "message": result.get("message", ""),
+            "data": {
+                "results": result.get("results", []),
+                "updated": result.get("updated", 0),
+                "deleted": result.get("deleted", 0),
+            },
+        }
+    except ValueError as e:
+        error_msg = str(e).replace("✗", "x")
+        safe_detail = error_msg.encode("utf-8", "replace").decode("utf-8")
+        raise HTTPException(status_code=400, detail=safe_detail)
     except Exception as e:
         import traceback
         traceback.print_exc()

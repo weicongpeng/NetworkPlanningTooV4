@@ -377,3 +377,68 @@ def test_search_endpoint_smoke(query_env):
             db.close()
         data_service.index.clear()
         data_service.index.update(saved_index)
+
+
+def test_bulk_update_endpoint_smoke(excel_env):
+    """bulk-update 端点端到端冒烟：搜索→改小区名→确认→落库"""
+    from fastapi.testclient import TestClient
+    from app.core.database import SessionLocal, init_db
+    from app.models.database import User, Sector
+    from app.services.auth_service import auth_service
+    from app.api import create_app
+    from app.services.data_service import data_service
+
+    init_db()
+    username = "q_update_user"
+    db = SessionLocal()
+    try:
+        existing = auth_service.get_user_by_username(db, username)
+        if existing:
+            db.delete(existing)
+            db.commit()
+        user, err = auth_service.create_user(db, username, "Test@12345")
+        assert err is None
+        user.can_cell_entry = True
+        db.commit()
+        db.refresh(user)
+        token, _ = auth_service.create_access_token(user.id, user.username, False)
+    finally:
+        db.close()
+
+    data_service._invalidate_cell_search_index()
+    hit = data_service.search_cells("NR-1", workbook_id=excel_env)[0]
+    row_key = hit["rowKey"]
+
+    # 端点内部通过 _find_full_params_id() 定位全量工参（不显式传 workbook_id）；
+    # 与 test_search_endpoint_smoke 同模式，临时移除历史残留的 full_params 条目，
+    # 确保定位到本用例注入的 excel_env（而非真实 index.json/SQLite 的历史条目）
+    saved_index = dict(data_service.index)
+    for k in [k for k, v in saved_index.items()
+              if isinstance(v, dict) and v.get("fileType") == "full_params"]:
+        data_service.index.pop(k)
+    data_service.index[excel_env] = {"fileType": "full_params", "id": excel_env}
+
+    try:
+        client = TestClient(create_app())
+        resp = client.post(
+            "/api/v1/data/full-params/cells/bulk-update",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"updates": [{"rowKey": row_key, "networkType": "NR",
+                               "fields": {"cellName": "NR-1-改"}}], "deletes": []},
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["success"] is True
+        assert body["data"]["updated"] == 1
+        assert body["data"]["results"][0]["success"] is True
+    finally:
+        db = SessionLocal()
+        try:
+            user = auth_service.get_user_by_username(db, username)
+            if user:
+                db.delete(user)
+                db.commit()
+        finally:
+            db.close()
+        data_service.index.clear()
+        data_service.index.update(saved_index)
