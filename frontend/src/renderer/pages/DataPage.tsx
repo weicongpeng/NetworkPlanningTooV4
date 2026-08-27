@@ -7,6 +7,7 @@ import { DATA_REFRESH_EVENT, triggerDataRefresh } from '../store/dataStore'
 import { mapDataService } from '../services/mapDataService'
 import { indexedDBService } from '../services/indexedDBService'
 import { CellParamsTable } from '../components/DataTable/CellParamsTable'
+import { CellQueryUpdateCard } from '../components/DataTable/CellQueryUpdateCard'
 import { useDownloadStore } from '../store/downloadStore'
 import { useTranslation } from 'react-i18next'
 import { useAuthStore } from '../store/authStore'
@@ -22,6 +23,9 @@ export function DataPage() {
   const permCellEntry = isAdmin || !!currentUser?.can_cell_entry
 
   const [selectedId, setSelectedId] = useState<string | null>(null)
+
+  // 数据管理工具页签：查询/更新 | 新站录入（默认新站录入，保持现有行为）
+  const [cellToolsTab, setCellToolsTab] = useState<'query' | 'entry'>('entry')
 
   // 批量选择状态
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
@@ -947,12 +951,37 @@ export function DataPage() {
                 </div>
             </div>
 
-            {/* 新站录入 */}
-            <NewCellEntryCard
+            {/* 数据管理工具：查询/更新 | 新站录入 */}
+            <div className="-mt-6 mb-3 flex gap-2">
+              {(['query', 'entry'] as const).map(mode => (
+                <button
+                  key={mode}
+                  onClick={() => setCellToolsTab(mode)}
+                  className={`px-3 py-1.5 rounded-md text-xs border transition-colors ${
+                    cellToolsTab === mode
+                      ? 'bg-primary/10 border-primary text-primary font-medium'
+                      : 'bg-background border-border text-muted-foreground hover:bg-muted'
+                  }`}
+                >
+                  {mode === 'query'
+                    ? (t('queryUpdate.title') || '查询/更新')
+                    : (t('newCellEntry.title') || '新站录入')}
+                </button>
+              ))}
+            </div>
+            {cellToolsTab === 'query' ? (
+              <CellQueryUpdateCard
                 fullParamFiles={fullParamFiles}
                 addLog={addLog}
                 disabled={!permCellEntry}
-            />
+              />
+            ) : (
+              <NewCellEntryCard
+                fullParamFiles={fullParamFiles}
+                addLog={addLog}
+                disabled={!permCellEntry}
+              />
+            )}
         </div>
 
         {/* 数据列表 */}
