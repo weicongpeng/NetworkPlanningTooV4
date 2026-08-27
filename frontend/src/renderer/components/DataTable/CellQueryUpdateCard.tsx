@@ -398,6 +398,7 @@ export function CellQueryUpdateCard({
               key={nt}
               onClick={() => {
                 if (searchTimer.current) clearTimeout(searchTimer.current)
+                searchSeq.current++ // 使 in-flight 搜索响应失效，避免过期结果追加到错误制式页签
                 setActiveTab(nt)
                 setSearchResults([])
                 setShowDropdown(false)
