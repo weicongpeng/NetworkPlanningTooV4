@@ -1,6 +1,8 @@
 import axios from 'axios'
 import type {
   ApiResponse,
+  CellBulkUpdateResultItem,
+  CellSearchItem,
   LicenseStatus,
   NeighborConfig,
   NeighborResult,
@@ -778,6 +780,19 @@ export const dataApi = {
   // 批量查重：按制式检查 CGI (siteId_cellId) 是否已存在于数据库
   checkCellDuplicates: async (cells: Array<{ siteId: string; cellId: string; networkType?: 'LTE' | 'NR' }>): Promise<ApiResponse<{ duplicates: string[]; exists: Record<string, { lte: boolean; nr: boolean }> }>> => {
     return apiClient.post('/data/full-params/cells/check-duplicates', { cells })
+  },
+
+  // 查询/更新：智能搜索小区
+  searchCells: async (query: string, networkType?: 'LTE' | 'NR', limit = 20): Promise<ApiResponse<CellSearchItem[]>> => {
+    return apiClient.post('/data/full-params/cells/search', { query, networkType, limit })
+  },
+
+  // 查询/更新：批量更新 + 删除小区
+  bulkUpdateCells: async (payload: {
+    updates: Array<{ rowKey: string; networkType: 'LTE' | 'NR'; fields: Record<string, string | number | undefined> }>
+    deletes: Array<{ rowKey: string; networkType: 'LTE' | 'NR' }>
+  }): Promise<ApiResponse<{ results: CellBulkUpdateResultItem[]; updated: number; deleted: number }>> => {
+    return apiClient.post('/data/full-params/cells/bulk-update', payload)
   },
 
   // 清理无效索引

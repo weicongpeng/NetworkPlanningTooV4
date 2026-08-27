@@ -428,3 +428,30 @@ export interface UserSessionInfo {
 export interface UserDetailResponse extends UserInfo {
   sessions: UserSessionInfo[]
 }
+
+// 查询/更新：搜索结果项
+export interface CellSearchItem {
+  rowKey: string
+  networkType: string
+  siteId: string
+  cellId: string
+  cellName: string
+  siteName?: string
+  managedElementId?: string
+  mcc?: string
+  mnc?: string
+  longitude?: number
+  latitude?: number
+  azimuth?: number
+  frequency?: number
+  ssbFrequency?: number
+  cellCoverType: number
+}
+
+// 查询/更新：批量更新结果项
+export interface CellBulkUpdateResultItem {
+  rowKey: string
+  type: 'update' | 'delete'
+  success: boolean
+  message: string
+}
