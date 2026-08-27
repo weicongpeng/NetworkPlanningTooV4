@@ -2,10 +2,11 @@ import { useState, useEffect, useCallback, useRef } from 'react'
 import { Upload, FileSpreadsheet, Trash2, Download, Loader2, AlertCircle, RefreshCw, CheckCircle2, Layers, FileDown, MapPin, Navigation, CheckSquare, Square, ScrollText, Maximize2, Minimize2 } from 'lucide-react'
 import { useDataStore } from '../store/dataStore'
 import { dataApi } from '../services/api'
-import type { DataItem } from '@shared/types'
+import type { CellRow, DataItem } from '@shared/types'
 import { DATA_REFRESH_EVENT, triggerDataRefresh } from '../store/dataStore'
 import { mapDataService } from '../services/mapDataService'
 import { indexedDBService } from '../services/indexedDBService'
+import { CellParamsTable } from '../components/DataTable/CellParamsTable'
 import { useDownloadStore } from '../store/downloadStore'
 import { useTranslation } from 'react-i18next'
 import { useAuthStore } from '../store/authStore'
@@ -1522,8 +1523,6 @@ function NewCellEntryCard({
 
   /** Filter: keep only digits for integer fields */
   const filterDigits = (v: string) => v.replace(/\D/g, '')
-  /** Filter: keep digits, dot, minus for numeric fields */
-  const filterNumeric = (v: string) => v.replace(/[^\d.\-]/g, '')
 
   const isRowComplete = (row: CellRow, nt: 'LTE' | 'NR') => {
     const freqOk = nt === 'LTE' ? isFloat(row.frequency) : isFloat(row.ssbFrequency)
@@ -1888,12 +1887,6 @@ function NewCellEntryCard({
     }
   }
 
-  const isLte = activeTab === 'LTE'
-  const inputCls = 'w-full min-w-[40px] px-1.5 py-1 text-xs bg-background border border-border rounded focus:outline-none focus:ring-1 focus:ring-primary disabled:opacity-50 disabled:cursor-not-allowed'
-  const inputClsExp = 'w-full min-w-[40px] px-2 py-1.5 text-sm bg-background border border-border rounded focus:outline-none focus:ring-1 focus:ring-primary disabled:opacity-50 disabled:cursor-not-allowed'
-  const labelCls = 'text-xs text-muted-foreground text-center leading-tight px-0.5 whitespace-nowrap'
-  const curInputCls = expanded ? inputClsExp : inputCls
-
   // Count total valid rows across both tabs
   const totalRows = rows.LTE.filter(r => r.managedElementId.trim() || r.siteId.trim() || r.cellId.trim() || r.cellName.trim()).length
     + rows.NR.filter(r => r.managedElementId.trim() || r.siteId.trim() || r.cellId.trim() || r.cellName.trim()).length
@@ -1962,187 +1955,26 @@ function NewCellEntryCard({
       <div className="text-[10px] text-muted-foreground/70 mb-1">
         {t('newCellEntry.pasteHint')}
       </div>
-      <div className={expanded ? 'overflow-x-auto' : 'overflow-x-auto'} onPaste={handlePaste}>
-        <table className="w-full border-collapse">
-          <thead>
-            <tr>
-              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30 w-0'}>
-                <input
-                  type="checkbox"
-                  checked={allSelected}
-                  onChange={toggleSelectAll}
-                  disabled={isAddingCell || !hasFullParams}
-                  className="cursor-pointer"
-                />
-              </th>
-              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30 w-0'}>{/* 操作列 */}</th>
-              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30 relative'} style={{ width: colWidths.managedElementId }}>
-                {t('newCellEntry.fieldManagedElementId') || '网元ID'}
-                <div
-                  className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-blue-400/60"
-                  onMouseDown={e => startColResize(e, 'managedElementId')}
-                />
-              </th>
-              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30 relative'} style={{ width: colWidths.siteId }}>
-                {t('newCellEntry.fieldSiteIdLTE') || '基站ID'}
-                <div
-                  className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-blue-400/60"
-                  onMouseDown={e => startColResize(e, 'siteId')}
-                />
-              </th>
-              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30 relative'} style={{ width: colWidths.cellId }}>
-                {t('newCellEntry.fieldCellId') || '小区ID'}
-                <div
-                  className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-blue-400/60"
-                  onMouseDown={e => startColResize(e, 'cellId')}
-                />
-              </th>
-              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30 relative'} style={{ width: colWidths.cellName }}>
-                {t('newCellEntry.fieldCellName') || '小区名称'}
-                <div
-                  className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-blue-400/60"
-                  onMouseDown={e => startColResize(e, 'cellName')}
-                />
-              </th>
-              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30 relative'} style={{ width: colWidths.mcc }}>
-                {t('newCellEntry.fieldMCC') || 'MCC'}
-                <div
-                  className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-blue-400/60"
-                  onMouseDown={e => startColResize(e, 'mcc')}
-                />
-              </th>
-              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30 relative'} style={{ width: colWidths.mnc }}>
-                {t('newCellEntry.fieldMNC') || 'MNC'}
-                <div
-                  className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-blue-400/60"
-                  onMouseDown={e => startColResize(e, 'mnc')}
-                />
-              </th>
-              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30 relative'} style={{ width: colWidths.longitude }}>
-                {t('newCellEntry.fieldLongitude') || '经度'}
-                <div
-                  className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-blue-400/60"
-                  onMouseDown={e => startColResize(e, 'longitude')}
-                />
-              </th>
-              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30 relative'} style={{ width: colWidths.latitude }}>
-                {t('newCellEntry.fieldLatitude') || '纬度'}
-                <div
-                  className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-blue-400/60"
-                  onMouseDown={e => startColResize(e, 'latitude')}
-                />
-              </th>
-              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30 relative'} style={{ width: colWidths.azimuth }}>
-                {t('newCellEntry.fieldAzimuth') || '方向角'}
-                <div
-                  className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-blue-400/60"
-                  onMouseDown={e => startColResize(e, 'azimuth')}
-                />
-              </th>
-              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30 relative'} style={{ width: isLte ? colWidths.frequency : colWidths.ssbFrequency }}>
-                {isLte ? (t('newCellEntry.fieldFrequency') || '下行频点') : (t('newCellEntry.fieldSsbFrequency') || 'SSB频点')}
-                <div
-                  className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-blue-400/60"
-                  onMouseDown={e => startColResize(e, isLte ? 'frequency' : 'ssbFrequency')}
-                />
-              </th>
-              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30 relative'} style={{ width: colWidths.cellCoverType }}>
-                {t('newCellEntry.fieldCellCoverType') || '覆盖类型'}
-                <div
-                  className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-blue-400/60"
-                  onMouseDown={e => startColResize(e, 'cellCoverType')}
-                />
-              </th>
-            </tr>
-          </thead>
-          <tbody>
-            {rows[activeTab].map((row) => {
-              const complete = isRowComplete(row, activeTab)
-              return (
-                <tr key={row.id} data-row-id={row.id} className={`${selectedRowIds.has(row.id) ? 'bg-blue-50/50' : ''} ${
-                  duplicateMap[`${row.siteId}_${row.cellId}`] === 'same' ? 'bg-red-50' :
-                  duplicateMap[`${row.siteId}_${row.cellId}`] === 'cross' ? 'bg-amber-50' : ''
-                }`}>
-                  <td className="border border-border px-1 py-1 text-center">
-                    <input
-                      type="checkbox"
-                      checked={selectedRowIds.has(row.id)}
-                      onChange={() => toggleRowSelection(row.id)}
-                      disabled={!complete || isAddingCell || !hasFullParams}
-                      className="cursor-pointer"
-                    />
-                  </td>
-                  <td className="border border-border px-1 py-1 text-center">
-                    <button
-                      onClick={() => deleteRow(row.id)}
-                      disabled={isAddingCell || rows[activeTab].length <= 1}
-                      className="text-muted-foreground hover:text-red-500 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
-                      title={t('newCellEntry.deleteRow') || '删除'}
-                    >
-                      <span className="text-xs">✕</span>
-                    </button>
-                  </td>
-                  <td className="border border-border px-1 py-1">
-                    <input className={curInputCls} data-field="managedElementId" type="text" inputMode="numeric" value={row.managedElementId} onChange={e => updateRow(row.id, 'managedElementId', filterDigits(e.target.value))} disabled={!hasFullParams || isAddingCell} placeholder="" />
-                  </td>
-                  <td className="border border-border px-1 py-1">
-                    <input className={curInputCls} data-field="siteId" type="text" inputMode="numeric" value={row.siteId} onChange={e => updateRow(row.id, 'siteId', filterDigits(e.target.value))} disabled={!hasFullParams || isAddingCell} placeholder="" />
-                  </td>
-                  <td className="border border-border px-1 py-1">
-                    <input className={curInputCls} data-field="cellId" type="text" inputMode="numeric" value={row.cellId} onChange={e => updateRow(row.id, 'cellId', filterDigits(e.target.value))} disabled={!hasFullParams || isAddingCell} placeholder="" />
-                  </td>
-                  <td className="border border-border px-1 py-1">
-                    <input className={curInputCls} data-field="cellName" value={row.cellName} onChange={e => updateRow(row.id, 'cellName', e.target.value)} disabled={!hasFullParams || isAddingCell} placeholder="" />
-                  </td>
-                  <td className="border border-border px-1 py-1">
-                    <input className={curInputCls} data-field="mcc" type="text" inputMode="numeric" value={row.mcc} onChange={e => updateRow(row.id, 'mcc', filterDigits(e.target.value))} disabled={!hasFullParams || isAddingCell} placeholder="460" />
-                  </td>
-                  <td className="border border-border px-1 py-1">
-                    <select
-                      className={curInputCls}
-                      data-field="mnc"
-                      value={row.mnc}
-                      onChange={e => updateRow(row.id, 'mnc', e.target.value)}
-                      disabled={!hasFullParams || isAddingCell}
-                    >
-                      <option value="11">11</option>
-                      <option value="01">01</option>
-                      <option value="00">00</option>
-                    </select>
-                  </td>
-                  <td className="border border-border px-1 py-1">
-                    <input className={curInputCls} data-field="longitude" type="text" inputMode="decimal" value={row.longitude} onChange={e => updateRow(row.id, 'longitude', filterNumeric(e.target.value))} disabled={!hasFullParams || isAddingCell} placeholder="114.0" />
-                  </td>
-                  <td className="border border-border px-1 py-1">
-                    <input className={curInputCls} data-field="latitude" type="text" inputMode="decimal" value={row.latitude} onChange={e => updateRow(row.id, 'latitude', filterNumeric(e.target.value))} disabled={!hasFullParams || isAddingCell} placeholder="23.0" />
-                  </td>
-                  <td className="border border-border px-1 py-1">
-                    <input className={curInputCls} data-field="azimuth" type="text" inputMode="numeric" value={row.azimuth} onChange={e => handleAzimuthChange(row.id, e.target.value)} disabled={!hasFullParams || isAddingCell} placeholder="0-360" />
-                  </td>
-                  <td className="border border-border px-1 py-1">
-                    {isLte ? (
-                      <input className={curInputCls} data-field="frequency" type="text" inputMode="decimal" value={row.frequency} onChange={e => updateRow(row.id, 'frequency', filterNumeric(e.target.value))} disabled={!hasFullParams || isAddingCell} placeholder="" />
-                    ) : (
-                      <input className={curInputCls} data-field="ssbFrequency" type="text" inputMode="decimal" value={row.ssbFrequency} onChange={e => updateRow(row.id, 'ssbFrequency', filterNumeric(e.target.value))} disabled={!hasFullParams || isAddingCell} placeholder="" />
-                    )}
-                  </td>
-                  <td className="border border-border px-1 py-1">
-                    <select
-                      className={curInputCls}
-                      data-field="cellCoverType"
-                      value={row.cellCoverType}
-                      onChange={e => updateRow(row.id, 'cellCoverType', parseInt(e.target.value))}
-                      disabled={!hasFullParams || isAddingCell}
-                    >
-                      <option value={1}>{t('newCellEntry.cellCoverTypeOutdoor') || '室外站'}</option>
-                      <option value={4}>{t('newCellEntry.cellCoverTypeIndoor') || '室分站'}</option>
-                    </select>
-                  </td>
-                </tr>
-              )
-            })}
-          </tbody>
-        </table>
+      <div className="overflow-x-auto" onPaste={handlePaste}>
+        <CellParamsTable
+          rows={rows[activeTab]}
+          activeTab={activeTab}
+          colWidths={colWidths}
+          onColResize={startColResize}
+          onFieldChange={updateRow}
+          onAzimuthChange={handleAzimuthChange}
+          disabled={!hasFullParams || isAddingCell}
+          selectedRowIds={selectedRowIds}
+          onToggleSelect={toggleRowSelection}
+          allSelected={allSelected}
+          onToggleSelectAll={toggleSelectAll}
+          onDeleteRow={deleteRow}
+          deleteDisabled={rows[activeTab].length <= 1}
+          isRowComplete={isRowComplete}
+          duplicateMap={duplicateMap}
+          expanded={expanded}
+          t={t}
+        />
       </div>
 
       {/* Copy Row button */}
@@ -2229,20 +2061,4 @@ function NewCellEntryCard({
       {renderCardContent()}
     </div>
   )
-}
-
-interface CellRow {
-  id: string
-  managedElementId: string
-  siteId: string
-  cellId: string
-  cellName: string
-  mcc: string
-  mnc: string
-  longitude: string
-  latitude: string
-  azimuth: string
-  frequency: string
-  ssbFrequency: string
-  cellCoverType: number
 }

@@ -455,3 +455,21 @@ export interface CellBulkUpdateResultItem {
   success: boolean
   message: string
 }
+
+// 小区参数行（新站录入 / 查询更新共用）
+export interface CellRow {
+  id: string
+  managedElementId: string
+  siteId: string
+  cellId: string
+  cellName: string
+  mcc: string
+  mnc: string
+  longitude: string
+  latitude: string
+  azimuth: string
+  frequency: string
+  ssbFrequency: string
+  cellCoverType: number
+  rowKey?: string   // 查询/更新：搜索结果定位键（新站录入不填）
+}
