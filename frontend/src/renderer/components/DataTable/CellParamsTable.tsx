@@ -1,5 +1,6 @@
 import { useTranslation } from 'react-i18next'
 import type { CellRow } from '@shared/types'
+import { cellDedupKey } from '../../utils/cellDedup'
 
 // 输入过滤（纯函数）：与新站录入行为一致
 const filterDigits = (v: string) => v.replace(/\D/g, '')
@@ -122,6 +123,10 @@ export function CellParamsTable({
             {t('newCellEntry.fieldLatitude') || '纬度'}
             <div className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-blue-400/60" onMouseDown={e => onColResize(e, 'latitude')} />
           </th>
+          <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30 relative'} style={{ width: colWidths.height }}>
+            {t('newCellEntry.fieldHeight') || '站高'}
+            <div className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-blue-400/60" onMouseDown={e => onColResize(e, 'height')} />
+          </th>
           <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30 relative'} style={{ width: colWidths.azimuth }}>
             {t('newCellEntry.fieldAzimuth') || '方向角'}
             <div className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-blue-400/60" onMouseDown={e => onColResize(e, 'azimuth')} />
@@ -140,10 +145,12 @@ export function CellParamsTable({
         {rows.map((row) => {
           const complete = isRowComplete ? isRowComplete(row, activeTab) : true
           const isMarked = deleteMarkedIds?.has(row.id) ?? false
+          // 查重标记键：LTE=基站_小区，NR=MCC_MNC_基站_小区（与 DataPage 写入端同口径）
+          const dupKind = duplicateMap?.[cellDedupKey(activeTab, row)]
           return (
-            <tr key={row.id} data-row-id={row.id} className={`${selectedRowIds?.has(row.id) ? 'bg-blue-50/50' : ''} ${
-              duplicateMap?.[`${row.siteId}_${row.cellId}`] === 'same' ? 'bg-red-50' :
-              duplicateMap?.[`${row.siteId}_${row.cellId}`] === 'cross' ? 'bg-amber-50' : ''
+            <tr key={row.id} data-row-id={row.id} className={`${selectedRowIds?.has(row.id) ? 'bg-blue-500/10' : ''} ${
+              dupKind === 'same' ? 'bg-red-500/10' :
+              dupKind === 'cross' ? 'bg-amber-500/10' : ''
             } ${isMarked ? 'opacity-40 line-through' : ''}`}>
               {!hideCheckbox && (
                 <td className="border border-border px-1 py-1 text-center">
@@ -199,6 +206,9 @@ export function CellParamsTable({
               </td>
               <td className="border border-border px-1 py-1">
                 <input className={curInputCls} data-field="latitude" type="text" inputMode="decimal" value={row.latitude} onChange={e => onFieldChange(row.id, 'latitude', filterNumeric(e.target.value))} disabled={disabled} placeholder="23.0" />
+              </td>
+              <td className="border border-border px-1 py-1">
+                <input className={curInputCls} data-field="height" type="text" inputMode="decimal" value={row.height} onChange={e => onFieldChange(row.id, 'height', filterNumeric(e.target.value))} disabled={disabled} placeholder="30" />
               </td>
               <td className="border border-border px-1 py-1">
                 <input className={curInputCls} data-field="azimuth" type="text" inputMode="numeric" value={row.azimuth} onChange={e => onAzimuthChange(row.id, e.target.value)} disabled={disabled} placeholder="0-360" />

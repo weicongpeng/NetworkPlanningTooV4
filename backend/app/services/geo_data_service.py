@@ -24,15 +24,17 @@ class GeoDataService:
     def __init__(self):
         self.detector = GeoFieldDetector()
 
-    def parse_geo_data(self, file_path: str, filename: str, user_id: int = 1, geo_id: str = None) -> Dict[str, Any]:
+    def parse_geo_data(self, file_path: str, filename: str, user_id: int = 1, geo_id: str = None,
+                       city: Optional[str] = None, operator: Optional[str] = None) -> Dict[str, Any]:
         """
         解析地理化数据文件
 
         Args:
             file_path: 文件路径
             filename: 文件名
-            user_id: 用户ID（用于数据隔离）
+            user_id: 用户ID（上传者印记）
             geo_id: 可选的 geo 数据 ID（与 API 层 data_id 一致，避免写入时生成新 UUID）
+            city/operator: 数据所属组（地市+运营商）归属快照，取自上传者
 
         Returns:
             解析结果字典：
@@ -158,6 +160,8 @@ class GeoDataService:
             bbox=_compute_bbox(geo_data) if geo_data else None,
             file_size=Path(file_path).stat().st_size if Path(file_path).exists() else None,
             geo_id=geo_id,
+            city=city,
+            operator=operator,
         )
 
         return {
@@ -479,6 +483,8 @@ def _save_geo_file_metadata(
     bbox: Optional[List[float]] = None,
     file_size: Optional[int] = None,
     geo_id: Optional[str] = None,
+    city: Optional[str] = None,
+    operator: Optional[str] = None,
 ):
     """保存地理化数据文件元数据到 SQLite"""
     db = SessionLocal()
@@ -486,6 +492,8 @@ def _save_geo_file_metadata(
         geo = GeoFile(
             id=geo_id or str(uuid.uuid4()),
             user_id=user_id,
+            city=city,
+            operator=operator,
             filename=filename,
             file_path=file_path,
             geometry_type=geometry_type,

@@ -4,8 +4,8 @@ import {
   Users, UserPlus, Search, Loader2, Shield, User, Pencil, Trash2,
   RefreshCw, ChevronLeft, ChevronRight, Key, X, Circle, Ban, History
 } from 'lucide-react'
-import { adminUserApi } from '../services/api'
-import type { UserInfo, UserSessionInfo } from '@shared/types'
+import { adminUserApi, authApi } from '../services/api'
+import type { UserInfo, UserSessionInfo, RegisterOptions } from '@shared/types'
 
 function formatDuration(seconds: number): string {
   if (seconds < 60) return `${seconds}秒`
@@ -31,8 +31,10 @@ export function AdminUsersPage() {
 
   const [users, setUsers] = useState<UserInfo[]>([])
   const [total, setTotal] = useState(0)
+  // 全量（跨所有页）在线统计，由后端返回
+  const [onlineStats, setOnlineStats] = useState({ online: 0, pc: 0, app: 0 })
   const [page, setPage] = useState(1)
-  const [pageSize] = useState(20)
+  const [pageSize] = useState(5)
   const [search, setSearch] = useState('')
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
@@ -40,6 +42,8 @@ export function AdminUsersPage() {
   const [showAddModal, setShowAddModal] = useState(false)
   const [showEditModal, setShowEditModal] = useState(false)
   const [showResetPwdModal, setShowResetPwdModal] = useState(false)
+  // 组（地市+运营商）变更时的历史数据迁移范围选择弹窗
+  const [showMigrateDialog, setShowMigrateDialog] = useState(false)
   const [editUser, setEditUser] = useState<UserInfo | null>(null)
 
   // Session modal
@@ -57,12 +61,15 @@ export function AdminUsersPage() {
   const [formNewPassword, setFormNewPassword] = useState('')
   const [formCity, setFormCity] = useState('')
   const [formOperator, setFormOperator] = useState('')
+  const [groupOptions, setGroupOptions] = useState<RegisterOptions | null>(null)
   const [formSubmitting, setFormSubmitting] = useState(false)
   const [formError, setFormError] = useState('')
   const [formCanDataImport, setFormCanDataImport] = useState(false)
   const [formCanDataDelete, setFormCanDataDelete] = useState(false)
   const [formCanDataUpdate, setFormCanDataUpdate] = useState(false)
   const [formCanCellEntry, setFormCanCellEntry] = useState(false)
+  const [formCanCellQueryUpdate, setFormCanCellQueryUpdate] = useState(false)
+  const [formCanAssistant, setFormCanAssistant] = useState(false)
 
   const fetchUsers = useCallback(async () => {
     setLoading(true)
@@ -72,6 +79,11 @@ export function AdminUsersPage() {
       if (result.success && result.data) {
         setUsers(result.data.users)
         setTotal(result.data.total)
+        setOnlineStats({
+          online: result.data.online_users ?? 0,
+          pc: result.data.online_pc ?? 0,
+          app: result.data.online_app ?? 0,
+        })
       }
     } catch (err: any) {
       setError(err?.message || t('admin.loadFailed', '加载失败'))
@@ -82,12 +94,20 @@ export function AdminUsersPage() {
 
   useEffect(() => { fetchUsers() }, [fetchUsers])
 
+  // 地市/运营商下拉数据源：注册选项接口（与登录页注册一致）
+  useEffect(() => {
+    authApi.getOptions()
+      .then(res => { if (res.success && res.data) setGroupOptions(res.data) })
+      .catch(() => { /* 加载失败时下拉为空，后端保存时兜底校验 */ })
+  }, [])
+
   const totalPages = Math.max(1, Math.ceil(total / pageSize))
 
   // --- Add User ---
   const handleAdd = async () => {
     if (formUsername.length < 3) { setFormError(t('admin.usernameTooShort')); return }
     if (formPassword.length < 6) { setFormError(t('auth.passwordTooShort')); return }
+    if (!formCity || !formOperator) { setFormError(t('auth.groupRequired', '请选择地市与运营商')); return }
     setFormSubmitting(true)
     setFormError('')
     try {
@@ -97,8 +117,8 @@ export function AdminUsersPage() {
         confirm_password: formPassword,
         is_admin: formIsAdmin,
         license_expiry: formLicenseExpiry || null,
-        city: formCity || undefined,
-        operator: formOperator || undefined,
+        city: formCity,
+        operator: formOperator,
       })
       if (result.success) {
         setShowAddModal(false)
@@ -124,11 +144,18 @@ export function AdminUsersPage() {
     setFormCanDataDelete(!!user.can_data_delete)
     setFormCanDataUpdate(!!user.can_data_update)
     setFormCanCellEntry(!!user.can_cell_entry)
+    setFormCanCellQueryUpdate(!!user.can_cell_query_update)
+    setFormCanAssistant(!!user.can_assistant)
     setFormError('')
     setShowEditModal(true)
   }
 
-  const handleEdit = async () => {
+  // 组是否发生变更（后端要求组变必须带迁移范围）
+  const editGroupChanged = !!editUser &&
+    ((formCity || null) !== (editUser.city || null) ||
+     (formOperator || null) !== (editUser.operator || null))
+
+  const submitEdit = async (migrateScope?: 'user' | 'group') => {
     if (!editUser) return
     setFormSubmitting(true)
     setFormError('')
@@ -139,21 +166,38 @@ export function AdminUsersPage() {
         license_expiry: formLicenseExpiry || null,
         city: formCity || null,
         operator: formOperator || null,
+        ...(migrateScope ? { migrate_scope: migrateScope } : {}),
         can_data_import: formCanDataImport,
         can_data_delete: formCanDataDelete,
         can_data_update: formCanDataUpdate,
         can_cell_entry: formCanCellEntry,
+        can_cell_query_update: formCanCellQueryUpdate,
+        can_assistant: formCanAssistant,
       })
       if (result.success) {
+        setShowMigrateDialog(false)
         setShowEditModal(false)
         resetForm()
         fetchUsers()
+        const message = (result as any).message
+        if (message) alert(message)
       }
     } catch (err: any) {
       setFormError(err?.message || t('admin.updateFailed'))
     } finally {
       setFormSubmitting(false)
     }
+  }
+
+  const handleEdit = () => {
+    if (!editUser) return
+    // 组变更且新组完整：先让管理员选择历史数据迁移范围
+    if (editGroupChanged && formCity && formOperator) {
+      setFormError('')
+      setShowMigrateDialog(true)
+      return
+    }
+    submitEdit()
   }
 
   // --- Reset Password ---
@@ -233,6 +277,8 @@ export function AdminUsersPage() {
     setFormCanDataDelete(false)
     setFormCanDataUpdate(false)
     setFormCanCellEntry(false)
+    setFormCanCellQueryUpdate(false)
+    setFormCanAssistant(false)
     setFormError('')
     setEditUser(null)
   }
@@ -262,9 +308,10 @@ export function AdminUsersPage() {
     if (users.length > 0) fetchUserSessions()
   }, [users])
 
-  const onlineCount = users.filter(u => u.is_online).length
-  const onlinePcCount = users.filter(u => u.is_online_pc).length
-  const onlineAppCount = users.filter(u => u.is_online_app).length
+  // 在线统计为全量（跨所有页），由后端基于全部用户计算
+  const onlineCount = onlineStats.online
+  const onlinePcCount = onlineStats.pc
+  const onlineAppCount = onlineStats.app
 
   return (
     <div className="p-6 space-y-6">
@@ -331,9 +378,9 @@ export function AdminUsersPage() {
         </div>
       ) : (
         <>
-          <div className="overflow-x-auto border border-border rounded-lg">
+          <div className="overflow-x-auto bg-card border border-border rounded-lg shadow-sm">
             <table className="w-full text-sm">
-              <thead className="bg-muted/50">
+              <thead className="bg-muted/70">
                 <tr>
                   <th className="px-4 py-3 text-left text-muted-foreground font-medium">{t('auth.username', '用户名')}</th>
                   <th className="px-4 py-3 text-left text-muted-foreground font-medium">{t('admin.role', '角色')}</th>
@@ -430,12 +477,14 @@ export function AdminUsersPage() {
           </div>
 
           {/* Pagination */}
-          <div className="flex items-center justify-end">
+          <div className="flex items-center justify-between pt-1">
+            <span className="text-sm text-muted-foreground">{t('admin.totalUsers', { count: total })}</span>
             <div className="flex items-center gap-2">
               <button
                 onClick={() => setPage(p => Math.max(1, p - 1))}
                 disabled={page <= 1}
                 className="p-1.5 rounded border border-border disabled:opacity-30 hover:bg-muted transition-colors"
+                title={t('common.prevPage', '上一页')}
               >
                 <ChevronLeft size={16} />
               </button>
@@ -444,6 +493,7 @@ export function AdminUsersPage() {
                 onClick={() => setPage(p => Math.min(totalPages, p + 1))}
                 disabled={page >= totalPages}
                 className="p-1.5 rounded border border-border disabled:opacity-30 hover:bg-muted transition-colors"
+                title={t('common.nextPage', '下一页')}
               >
                 <ChevronRight size={16} />
               </button>
@@ -473,16 +523,20 @@ export function AdminUsersPage() {
             </div>
             <div>
               <label className="block text-sm text-muted-foreground mb-1">{t('auth.city')}</label>
-              <input value={formCity} onChange={(e) => setFormCity(e.target.value)} className="w-full px-3 py-2 bg-background border border-border rounded-lg text-foreground focus:outline-none focus:ring-2 focus:ring-primary/50" placeholder={t('auth.cityPlaceholder')} />
+              <select value={formCity} onChange={(e) => setFormCity(e.target.value)} className="w-full px-3 py-2 bg-background border border-border rounded-lg text-foreground focus:outline-none focus:ring-2 focus:ring-primary/50">
+                <option value="">{t('auth.citySelectPlaceholder', '请选择地市')}</option>
+                {(groupOptions?.cities || []).map(c => (
+                  <option key={c} value={c}>{c}</option>
+                ))}
+              </select>
             </div>
             <div>
               <label className="block text-sm text-muted-foreground mb-1">{t('auth.operator')}</label>
               <select value={formOperator} onChange={(e) => setFormOperator(e.target.value)} className="w-full px-3 py-2 bg-background border border-border rounded-lg text-foreground focus:outline-none focus:ring-2 focus:ring-primary/50">
                 <option value="">{t('auth.operatorPlaceholder')}</option>
-                <option value="移动">{t('auth.operatorMobile')}</option>
-                <option value="电信">{t('auth.operatorTelecom')}</option>
-                <option value="联通">{t('auth.operatorUnicom')}</option>
-                <option value="广电">{t('auth.operatorBroadcast')}</option>
+                {(groupOptions?.operators || ['移动', '联通', '电信', '广电']).map(op => (
+                  <option key={op} value={op}>{op}</option>
+                ))}
               </select>
             </div>
             <div>
@@ -535,6 +589,7 @@ export function AdminUsersPage() {
                   { key: 'can_data_delete', label: t('admin.permDataDelete', '数据删除'), value: formCanDataDelete, setter: setFormCanDataDelete },
                   { key: 'can_data_update', label: t('admin.permDataUpdate', '工参更新'), value: formCanDataUpdate, setter: setFormCanDataUpdate },
                   { key: 'can_cell_entry', label: t('admin.permCellEntry', '新站录入'), value: formCanCellEntry, setter: setFormCanCellEntry },
+                  { key: 'can_cell_query_update', label: t('admin.permCellQueryUpdate', '查询/修改'), value: formCanCellQueryUpdate, setter: setFormCanCellQueryUpdate },
                 ].map((p) => (
                   <label key={p.key} className={`flex items-center gap-2 cursor-pointer ${editUser?.is_admin ? 'opacity-50 pointer-events-none' : ''}`}>
                     <input
@@ -549,18 +604,43 @@ export function AdminUsersPage() {
                 ))}
               </div>
             </div>
+            <div className="p-3 bg-blue-500/5 border border-blue-500/20 rounded-lg">
+              <div className="flex items-center gap-2 text-sm text-blue-400 mb-2">
+                <span>🧩 {t('admin.pcFeaturePermissions', 'PC端功能权限')}</span>
+              </div>
+              <p className="text-xs text-muted-foreground mb-2">{t('admin.featurePermissionsHint', '控制该用户可访问的功能页面')}</p>
+              {editUser?.is_admin && (
+                <p className="text-xs text-amber-500 mb-2">{t('admin.adminNotRestricted', '管理员不受此限制，开关不生效')}</p>
+              )}
+              <div className="space-y-1.5">
+                <label className={`flex items-center gap-2 cursor-pointer ${editUser?.is_admin ? 'opacity-50 pointer-events-none' : ''}`}>
+                  <input
+                    type="checkbox"
+                    checked={formCanAssistant}
+                    onChange={(e) => setFormCanAssistant(e.target.checked)}
+                    disabled={!!editUser?.is_admin}
+                    className="rounded"
+                  />
+                  <span className="text-sm text-foreground">{t('admin.permAssistant', '网优助手')}</span>
+                </label>
+              </div>
+            </div>
             <div>
               <label className="block text-sm text-muted-foreground mb-1">{t('auth.city')}</label>
-              <input value={formCity} onChange={(e) => setFormCity(e.target.value)} className="w-full px-3 py-2 bg-background border border-border rounded-lg text-foreground focus:outline-none focus:ring-2 focus:ring-primary/50" placeholder={t('auth.cityPlaceholder')} />
+              <select value={formCity} onChange={(e) => setFormCity(e.target.value)} className="w-full px-3 py-2 bg-background border border-border rounded-lg text-foreground focus:outline-none focus:ring-2 focus:ring-primary/50">
+                <option value="">{t('auth.citySelectPlaceholder', '请选择地市')}</option>
+                {(groupOptions?.cities || []).map(c => (
+                  <option key={c} value={c}>{c}</option>
+                ))}
+              </select>
             </div>
             <div>
               <label className="block text-sm text-muted-foreground mb-1">{t('auth.operator')}</label>
               <select value={formOperator} onChange={(e) => setFormOperator(e.target.value)} className="w-full px-3 py-2 bg-background border border-border rounded-lg text-foreground focus:outline-none focus:ring-2 focus:ring-primary/50">
                 <option value="">{t('auth.operatorPlaceholder')}</option>
-                <option value="移动">{t('auth.operatorMobile')}</option>
-                <option value="电信">{t('auth.operatorTelecom')}</option>
-                <option value="联通">{t('auth.operatorUnicom')}</option>
-                <option value="广电">{t('auth.operatorBroadcast')}</option>
+                {(groupOptions?.operators || ['移动', '联通', '电信', '广电']).map(op => (
+                  <option key={op} value={op}>{op}</option>
+                ))}
               </select>
             </div>
             <div>
@@ -629,6 +709,54 @@ export function AdminUsersPage() {
                 </div>
               ))
             )}
+          </div>
+        </Modal>
+      )}
+
+      {/* 组变更：历史数据迁移范围选择 */}
+      {showMigrateDialog && editUser && (
+        <Modal title={t('admin.migrateTitle', '数据组变更')} onClose={() => setShowMigrateDialog(false)}>
+          <div className="space-y-4">
+            {formError && <div className="p-2 bg-red-500/10 border border-red-500/20 rounded text-sm text-red-400">{formError}</div>}
+            <p className="text-sm text-muted-foreground leading-relaxed">
+              {t('admin.migrateDesc', '用户的数据组将从 {{from}} 变更为 {{to}}，请选择历史数据（工参、规划任务、地理化数据、图层等）的迁移范围：', {
+                from: `${editUser.city || '-'} / ${editUser.operator || '-'}`,
+                to: `${formCity} / ${formOperator}`,
+              })}
+            </p>
+            <button
+              onClick={() => submitEdit('user')}
+              disabled={formSubmitting}
+              className="w-full text-left p-3 rounded-lg border border-primary/40 bg-primary/5 hover:bg-primary/10 disabled:opacity-50 transition-colors"
+            >
+              <div className="text-sm font-medium text-foreground flex items-center gap-2">
+                {formSubmitting && <Loader2 size={14} className="animate-spin" />}
+                {t('admin.migrateScopeUser', '仅迁移该用户的历史数据（推荐）')}
+              </div>
+              <div className="text-xs text-muted-foreground mt-1">
+                {t('admin.migrateScopeUserHint', '只迁移该用户本人产生的数据；同组其他成员共享的数据保留在原组。')}
+              </div>
+            </button>
+            <button
+              onClick={() => submitEdit('group')}
+              disabled={formSubmitting}
+              className="w-full text-left p-3 rounded-lg border border-orange-500/40 bg-orange-500/5 hover:bg-orange-500/10 disabled:opacity-50 transition-colors"
+            >
+              <div className="text-sm font-medium text-foreground flex items-center gap-2">
+                {formSubmitting && <Loader2 size={14} className="animate-spin" />}
+                {t('admin.migrateScopeGroup', '迁移整个旧组（含其他成员，谨慎）')}
+              </div>
+              <div className="text-xs text-muted-foreground mt-1">
+                {t('admin.migrateScopeGroupHint', '旧组下所有用户的数据全部改到新组；若旧组还有其他用户，他们将看不到原数据。')}
+              </div>
+            </button>
+            <button
+              onClick={() => setShowMigrateDialog(false)}
+              disabled={formSubmitting}
+              className="w-full py-2 border border-border rounded-lg text-sm text-muted-foreground hover:bg-muted disabled:opacity-50"
+            >
+              {t('common.cancel', '取消')}
+            </button>
           </div>
         </Modal>
       )}

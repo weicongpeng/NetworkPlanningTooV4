@@ -8,6 +8,7 @@
  */
 import { useTranslation } from 'react-i18next'
 import type { ThematicSettings } from './LabelSettingsModal'
+import { LegendFrame } from './LegendFrame'
 
 export interface ThematicLegendItem {
   id: string
@@ -54,10 +55,10 @@ function OthersRow({ st, showCount }: { st?: ThematicLegendStats | null; showCou
           flexShrink: 0
         }}
       />
-      <span style={{ color: '#333' }}>
+      <span style={{ color: 'hsl(var(--foreground))' }}>
         {t('map.thematicOthers')}
         {showCount && pct !== null && (
-          <span style={{ color: '#888' }}> （{count}，{pct}%）</span>
+          <span style={{ color: 'hsl(var(--muted-foreground))' }}> （{count}，{pct}%）</span>
         )}
       </span>
     </div>
@@ -70,26 +71,16 @@ export function ThematicLegend({ items, stats = {}, onItemDoubleClick }: Themati
   if (!items || items.length === 0) return null
 
   return (
-    <div
+    <LegendFrame
+      layoutKey="thematic"
       className="thematic-legend"
-      style={{
-        position: 'absolute',
-        top: '10px',
-        right: '10px',
-        backgroundColor: 'rgba(255, 255, 255, 0.95)',
-        padding: '8px 10px',
-        borderRadius: '6px',
-        boxShadow: '0 2px 8px rgba(0, 0, 0, 0.15)',
-        zIndex: 1000,
-        fontSize: '11px',
-        maxWidth: '240px',
-        maxHeight: '70vh',
-        overflowY: 'auto'
-      }}
+      title={t('map.thematicLegendTitle')}
+      defaultAnchor={{ top: 10, right: 10 }}
+      defaultMaxWidth={240}
+      defaultMaxHeight="70vh"
+      dragHint={t('map.legendDragHint')}
+      resizeHint={t('map.legendResizeHint')}
     >
-      <div style={{ fontWeight: 600, color: '#333', marginBottom: '6px' }}>
-        {t('map.thematicLegendTitle')}
-      </div>
       {items.map(item => (
         <div
           key={item.id}
@@ -97,7 +88,7 @@ export function ThematicLegend({ items, stats = {}, onItemDoubleClick }: Themati
           title={onItemDoubleClick ? t('map.thematicLegendEditHint') : undefined}
           style={{ marginBottom: '8px', cursor: onItemDoubleClick ? 'pointer' : 'default' }}
         >
-          <div style={{ fontWeight: 500, color: '#555', marginBottom: '3px', wordBreak: 'break-all' }}>
+          <div style={{ fontWeight: 500, color: 'hsl(var(--foreground))', marginBottom: '3px', wordBreak: 'break-all' }}>
             {item.name}{item.settings.field ? ` - ${item.settings.field}` : ''}
           </div>
           {item.settings.fieldType === 'numeric' ? (
@@ -121,10 +112,10 @@ export function ThematicLegend({ items, stats = {}, onItemDoubleClick }: Themati
                           flexShrink: 0
                         }}
                       />
-                      <span style={{ color: '#333', wordBreak: 'break-all' }}>
+                      <span style={{ color: 'hsl(var(--foreground))', wordBreak: 'break-all' }}>
                         {c.value}
                         {showCount && pct !== null && (
-                          <span style={{ color: '#888' }}> （{count}，{pct}%）</span>
+                          <span style={{ color: 'hsl(var(--muted-foreground))' }}> （{count}，{pct}%）</span>
                         )}
                       </span>
                     </div>
@@ -153,10 +144,10 @@ export function ThematicLegend({ items, stats = {}, onItemDoubleClick }: Themati
                           flexShrink: 0
                         }}
                       />
-                      <span style={{ color: '#333' }}>
+                      <span style={{ color: 'hsl(var(--foreground))' }}>
                         {formatNum(r.min)} ~ {formatNum(r.max)}
                         {showCount && pct !== null && (
-                          <span style={{ color: '#888' }}> （{count}，{pct}%）</span>
+                          <span style={{ color: 'hsl(var(--muted-foreground))' }}> （{count}，{pct}%）</span>
                         )}
                       </span>
                     </div>
@@ -184,10 +175,10 @@ export function ThematicLegend({ items, stats = {}, onItemDoubleClick }: Themati
                       flexShrink: 0
                     }}
                   />
-                  <span style={{ color: '#333', wordBreak: 'break-all' }}>
+                  <span style={{ color: 'hsl(var(--foreground))', wordBreak: 'break-all' }}>
                     {c.value === '__other__' ? t('map.thematicOthers') : c.value}
                     {showCount && pct !== null && (
-                      <span style={{ color: '#888' }}> （{count}，{pct}%）</span>
+                      <span style={{ color: 'hsl(var(--muted-foreground))' }}> （{count}，{pct}%）</span>
                     )}
                   </span>
                 </div>
@@ -196,6 +187,6 @@ export function ThematicLegend({ items, stats = {}, onItemDoubleClick }: Themati
           )}
         </div>
       ))}
-    </div>
+    </LegendFrame>
   )
 }

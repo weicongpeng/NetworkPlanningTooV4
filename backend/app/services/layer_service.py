@@ -42,10 +42,20 @@ _MAPINFO_INVALID = re.compile(r"[^\w一-鿿]+")
 _CLEANUP_SUFFIXES = (".tab", ".dat", ".id", ".map", ".mif", ".mid", ".zip", ".kml")
 
 
-def _sanitize_field_name(name: str) -> str:
-    """MapInfo 字段名清洗：非法字符（空格等）→ 下划线，合并相邻下划线，去首尾。"""
+def _sanitize_field_name(name: str, index: int = 0) -> str:
+    """MapInfo 字段名清洗：非法字符（空格等）→ 下划线，合并相邻下划线，去首尾。
+
+    MapInfo 用表达式解析器读 .tab 字段定义行，以数字开头的名字会被当作数字字面量，
+    打开表时报 "Expression does not evaluate to a column or table name."（GDAL 严格
+    清洗同样会把首字符替换为 '_'）。故数字开头补 '_' 前缀；清洗后为空（如列名只有
+    符号"%"）时回退 Field{index+1}，否则会写出无名字段行。
+    """
     cleaned = _MAPINFO_INVALID.sub("_", name)
     cleaned = re.sub(r"_+", "_", cleaned).strip("_")
+    if not cleaned:
+        return f"Field{index + 1}"
+    if cleaned[0].isdigit():
+        cleaned = "_" + cleaned
     return cleaned
 
 
@@ -388,9 +398,12 @@ class LayerService:
             # 关键：字符串列按实际 GBK 字节长度转 U{width} 再写，否则 GDAL 把每个字符串列
             # 都写成 Char(254)（MapInfo 最大宽度），导致 .dat/.mid 体积放大 20-70 倍。
             orig_cols = list(gdf.columns)
-            sanitized_cols = _dedupe_field_names([_sanitize_field_name(c) for c in orig_cols])
             geom_name = gdf.geometry.name
             attr_cols = [c for c in orig_cols if c != geom_name]
+            # 占位符只覆盖属性列：几何列不写入 .tab 字段列表，算进来会让后置列名整体错位。
+            sanitized_cols = _dedupe_field_names(
+                [_sanitize_field_name(c, i) for i, c in enumerate(attr_cols)]
+            )
             field_names = [f"f{i}" for i in range(len(attr_cols))]
             field_data = self._build_field_data(gdf, attr_cols)
             geoms_wkb = [wkb.dumps(g) for g in gdf.geometry]

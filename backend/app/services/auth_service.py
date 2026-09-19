@@ -11,7 +11,7 @@ from jose import jwt, JWTError
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
-from app.models.database import User, UserSession, UserSettings, TaskResult, Workbook, Site, Sector, GeoFile, Layer
+from app.models.database import User, UserSession, UserSettings
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
@@ -130,7 +130,8 @@ class AuthService:
     def update_user(self, db: Session, user_id: int, updates: dict) -> Optional[User]:
         """更新用户字段（不含密码）"""
         allowed_fields = {"is_active", "is_admin", "license_expiry", "must_change_password", "total_usage_seconds", "city", "operator",
-                          "can_data_import", "can_data_delete", "can_data_update", "can_cell_entry"}
+                          "can_data_import", "can_data_delete", "can_data_update", "can_cell_entry", "can_cell_query_update",
+                          "can_assistant"}
         user = self.get_user_by_id(db, user_id)
         if not user:
             return None
@@ -172,16 +173,48 @@ class AuthService:
         page_size: int = 20,
         search: Optional[str] = None,
         is_active: Optional[bool] = None,
-    ) -> Tuple[List[User], int]:
-        """获取用户列表（分页+搜索+筛选），返回 (users, total_count)"""
+    ) -> Tuple[List[User], int, dict]:
+        """获取用户列表（分页+搜索+筛选），在线用户优先置顶。
+
+        返回 (page_users, total_count, online_stats)。
+        online_stats 为全量（跨所有页）在线统计：{online, online_pc, online_app}。
+        """
         query = db.query(User)
         if search:
             query = query.filter(User.username.ilike(f"%{search}%"))
         if is_active is not None:
             query = query.filter(User.is_active == is_active)
-        total = query.count()
-        users = query.order_by(User.created_at.desc()).offset((page - 1) * page_size).limit(page_size).all()
-        return users, total
+
+        all_users = query.order_by(User.created_at.desc()).all()
+        total = len(all_users)
+
+        # 最近 5 分钟内的活跃会话（一次性查出，避免逐用户查询）
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=5)
+        active_rows = db.query(UserSession.user_id, UserSession.client_type).filter(
+            UserSession.logout_time.is_(None),
+            UserSession.last_activity >= cutoff,
+        ).all()
+        online_pc_ids = {uid for uid, ct in active_rows if ct == 'pc'}
+        online_app_ids = {uid for uid, ct in active_rows if ct == 'app'}
+        online_any_ids = online_pc_ids | online_app_ids
+
+        online_stats = {
+            "online": len(online_any_ids),
+            "online_pc": len(online_pc_ids),
+            "online_app": len(online_app_ids),
+        }
+
+        # 在线用户优先置顶，其次按注册时间倒序
+        all_users.sort(
+            key=lambda u: (
+                0 if u.id in online_any_ids else 1,
+                -(u.created_at.timestamp() if u.created_at else 0),
+            )
+        )
+
+        start = (page - 1) * page_size
+        page_users = all_users[start:start + page_size]
+        return page_users, total, online_stats
 
     # ---- 会话管理 ----
 
@@ -334,22 +367,17 @@ class AuthService:
         return session is not None
 
     def delete_user(self, db: Session, user_id: int) -> bool:
-        """硬删除用户及其所有关联数据"""
+        """硬删除用户及其会话/设置。
+
+        注意：业务数据（Workbook/Site/Sector/GeoFile/Layer/TaskResult）不归用户所有，
+        而是归（地市+运营商）组所有，不随成员删除而级联删除。
+        """
         user = self.get_user_by_id(db, user_id)
         if not user:
             return False
-        # 级联删除所有关联数据（按外键依赖顺序）
+        # 仅级联删除用户私有数据（会话与个性化设置）
         db.query(UserSession).filter(UserSession.user_id == user_id).delete()
         db.query(UserSettings).filter(UserSettings.user_id == user_id).delete()
-        db.query(TaskResult).filter(TaskResult.user_name == user.username).delete()
-        # 获取该用户的所有 workbook_id
-        workbook_ids = [w.id for w in db.query(Workbook).filter(Workbook.user_id == user_id).all()]
-        for wid in workbook_ids:
-            db.query(Sector).filter(Sector.workbook_id == wid).delete()
-            db.query(Site).filter(Site.workbook_id == wid).delete()
-        db.query(Workbook).filter(Workbook.user_id == user_id).delete()
-        db.query(GeoFile).filter(GeoFile.user_id == user_id).delete()
-        db.query(Layer).filter(Layer.user_id == user_id).delete()
         db.delete(user)
         db.commit()
         return True

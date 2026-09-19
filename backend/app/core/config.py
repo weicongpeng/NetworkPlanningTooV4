@@ -78,6 +78,18 @@ class Settings(BaseSettings):
     DEFAULT_NEIGHBOR_MAX_DISTANCE: float = 10.0
     DEFAULT_NEIGHBOR_MAX_COUNT: int = 32
 
+    # 网优助手 LLM 配置（OpenAI 兼容协议，均可留空=未配置）=====
+    # 兼容 DeepSeek/通义千问/豆包/本地 vLLM·Ollama 等任意 OpenAI 协议端点
+    NPT_LLM_BASE_URL: str = ""       # 如 https://api.deepseek.com/v1
+    NPT_LLM_API_KEY: str = ""
+    NPT_LLM_MODEL: str = ""          # 如 deepseek-chat / qwen-plus
+    NPT_LLM_TIMEOUT: int = 60        # 单次对话超时（秒）
+
+    # 地市预设清单（逗号分隔）：注册/用户管理"地市"下拉的数据源。
+    # 生产必须在 .env 中配置（如 NPT_CITY_PRESETS=郑州,洛阳,开封）；
+    # 留空时注册/建号校验恒失败。
+    NPT_CITY_PRESETS: str = ""
+
     # APK 下载缓存配置（秒）
     # 默认 3600（1 小时），Cloudflare 边缘节点缓存后同区域下载秒级完成
     # APK 版本很少更新，可以设置较长缓存时间
@@ -135,6 +147,10 @@ class Settings(BaseSettings):
     @property
     def AMAP_SECURITY_CODE(self) -> str:
         return self.NPT_AMAP_SECURITY_CODE
+
+    @property
+    def CITY_PRESETS(self) -> List[str]:
+        return [c.strip() for c in (self.NPT_CITY_PRESETS or "").split(",") if c.strip()]
 
     @field_validator("NPT_CORS_ORIGINS", mode="before")
     @classmethod

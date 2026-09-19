@@ -45,3 +45,42 @@ export function reconcileZOrder(layers: ZOrderLayer[]): void {
     layer.bringToFront()
   }
 }
+
+/**
+ * 把持久化的类内顺序与当前实际图层 id 合并：
+ * 先按 stored 顺序保留仍存在的 id，再把新出现的 id 按自然顺序追加到底部。
+ * @param stored 持久化的 id 顺序（索引 0 = 面板最上），可能为 undefined
+ * @param currentIds 当前类别下实际存在的图层 id（自然顺序）
+ */
+export function orderWithIds(stored: string[] | undefined, currentIds: string[]): string[] {
+  const seen = new Set<string>()
+  const result: string[] = []
+  for (const id of stored ?? []) {
+    if (currentIds.includes(id) && !seen.has(id)) {
+      seen.add(id)
+      result.push(id)
+    }
+  }
+  for (const id of currentIds) {
+    if (!seen.has(id)) {
+      seen.add(id)
+      result.push(id)
+    }
+  }
+  return result
+}
+
+/**
+ * 类内面板顺序索引 → panelRank：索引 0（面板最上）rank 最大。
+ * 同类图层数量远小于 1000，panelRank 不会跨入相邻类型区间。
+ */
+export function panelRankFromIndex(index: number, total: number): number {
+  return total - 1 - index
+}
+
+/**
+ * 图层"可选"开关判定：selectableMap 未收录该 id 时默认可选（true）。
+ */
+export function isLayerSelectable(selectableMap: Record<string, boolean> | undefined, layerId: string): boolean {
+  return selectableMap?.[layerId] !== false
+}

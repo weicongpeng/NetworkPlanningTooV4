@@ -84,12 +84,19 @@ class TACPlanningService:
         # STRtree 空间索引缓存 {network_type: (tree, tac_id_map)}
         self._strtree_cache: Dict[str, tuple] = {}
 
-    def load_tac_layers(self, network_type: str) -> Dict[str, Tuple[Polygon, str]]:
+    def load_tac_layers(
+        self,
+        network_type: str,
+        city: Optional[str] = None,
+        operator: Optional[str] = None,
+    ) -> Dict[str, Tuple[Polygon, str]]:
         """
-        加载TAC图层文件
+        加载TAC图层文件（严格按（地市+运营商）组隔离）
 
         Args:
             network_type: 'LTE' 或 'NR'
+            city/operator: 任务组快照。必须提供；只在本组导入的数据目录中查找，
+                绝不全局递归 DATA_DIR，防止本组无图层时读到其他组的 TAC 面数据。
 
         Returns:
             {tac_id: (geometry, area_name)}
@@ -105,9 +112,24 @@ class TACPlanningService:
                 tac_id_field = "河源5GTAC"
                 area_name_field = None
 
-            # 直接从 data_service 获取图层文件路径
+            if not city or not operator:
+                raise ValueError(
+                    f"加载TAC图层失败: 缺少数据组（地市/运营商）信息，"
+                    f"无法在本组数据内查找 {tac_filename}"
+                )
+
+            # 仅列出同组数据条目（按 DataItem 的组快照属性过滤）
             from app.services.data_service import data_service
-            items = data_service.list_data()
+            all_items = data_service.list_data()
+            items = [
+                it for it in all_items
+                if getattr(it, "city", None) == city
+                and getattr(it, "operator", None) == operator
+            ]
+            logger.info(
+                f"[TAC图层搜索] 组({city}/{operator})内候选条目 {len(items)} 个"
+                f"（全部条目 {len(all_items)} 个）"
+            )
 
             tac_file = None
 
@@ -228,23 +250,23 @@ class TACPlanningService:
                         logger.info(f"[TAC图层搜索] 在子目录中找到: {candidate}")
                         break
 
-            # 方法5: 全局递归搜索（深度后备方案）
-            if tac_file is None:
-                logger.info(f"[TAC图层搜索] 在 DATA_DIR ({self.data_dir}) 中递归搜索 {tac_filename}...")
-                tac_file = _find_named_tab_file(self.data_dir, tac_filename)
-                if tac_file:
-                    logger.info(f"[TAC图层搜索] 在 DATA_DIR 中找到: {tac_file}")
+            # 不做 DATA_DIR 全局递归回退：那会跨组读到其他地市/运营商的 TAC 图层。
+            # 方法4 已覆盖本组所有导入条目（含 ZIP 内解压出的 TAB）。
 
             if tac_file is None or not tac_file.exists():
-                # 列出 data 目录中所有 .tab 文件以便调试
-                _all_tabs = list(self.data_dir.rglob("*.tab")) + list(self.data_dir.rglob("*.TAB"))
-                _tab_names = [str(t.relative_to(self.data_dir)) for t in _all_tabs[:20]]
-                if _tab_names:
-                    logger.warning(f"[TAC图层搜索] DATA_DIR 中存在以下 .tab 文件: {_tab_names}")
-                else:
-                    logger.warning(f"[TAC图层搜索] DATA_DIR 中未找到任何 .tab 文件")
+                # 仅列出本组数据目录下的 .tab 文件以便调试（不跨组扫描）
+                _group_tabs: List[str] = []
+                for subdir in _all_data_subdirs:
+                    for t in list(subdir.rglob("*.tab")) + list(subdir.rglob("*.TAB")):
+                        _group_tabs.append(str(t))
+                if _group_tabs:
+                    logger.warning(
+                        f"[TAC图层搜索] 组({city}/{operator})内存在以下 .tab 文件但未匹配: "
+                        f"{_group_tabs[:20]}"
+                    )
                 raise ValueError(
-                    f"加载TAC图层失败: 未找到TAC图层文件 {tac_filename}，请确保TAC图层在数据管理中导入"
+                    f"加载TAC图层失败: 本组（{city}/{operator}）未找到TAC图层文件 "
+                    f"{tac_filename}，请确保TAC图层已在数据管理中导入"
                 )
 
             logger.info(f"正在读取TAC图层文件: {tac_file}")
@@ -414,17 +436,21 @@ class TACPlanningService:
             traceback.print_exc()
             raise ValueError(f"加载TAC图层失败: {str(e)}")
 
-    def load_cells(self, network_type: str) -> List[Dict]:
+    def load_cells(self, network_type: str, city: Optional[str] = None, operator: Optional[str] = None) -> List[Dict]:
         """
         加载待规划的小区数据
         直接从全量工参文件中获取对应网络类型的所有小区
 
         Args:
             network_type: 'LTE' 或 'NR'
+            city/operator: (地市+运营商) 组快照。必须提供，仅在组内定位全量工参；
+                不完整时返回空列表（禁止回退全局，防止跨组串小区）。
 
         Returns:
             小区列表（包含经纬度）
         """
+        if not city or not operator:
+            return []
         try:
             cells = []
             # 清空去重字典（针对所有网络类型）
@@ -444,6 +470,9 @@ class TACPlanningService:
                 file_name = data_info.get("name", "")
 
                 if file_type == "excel" and data_info.get("fileType") == "full_params":
+                    # 严格组过滤：仅匹配同组条目（NULL 组/其他组均不匹配）
+                    if (data_info.get("city"), data_info.get("operator")) != (city, operator):
+                        continue
                     full_params_files.append({
                         "data_id": data_id,
                         "name": file_name,
@@ -656,6 +685,8 @@ class TACPlanningService:
         enable_singularity_check: bool = True,
         singularity_config: Optional[Dict[str, Any]] = None,
         progress_callback=None,
+        city: Optional[str] = None,
+        operator: Optional[str] = None,
     ) -> Tuple[List[Dict], int, int, int, int]:
         """
         执行TAC核查（含TAC插花检测）
@@ -667,6 +698,7 @@ class TACPlanningService:
                 - search_radius: 搜索半径（米），默认1500
                 - singularity_threshold: 异TAC占比阈值，默认0.7
             progress_callback: 进度回调函数
+            city/operator: (地市+运营商) 组快照，提供时仅在组内解析全量工参
 
         Returns:
             (results, matched_count, unmatched_count, mismatched_count, singularity_count)
@@ -679,7 +711,7 @@ class TACPlanningService:
             if progress_callback:
                 progress_callback(10, "加载TAC图层...")
 
-            tac_zones = self.load_tac_layers(network_type)
+            tac_zones = self.load_tac_layers(network_type, city=city, operator=operator)
             self.tac_zones = tac_zones
 
             # 调试：打印TAC区域边界
@@ -695,7 +727,7 @@ class TACPlanningService:
             if progress_callback:
                 progress_callback(30, f"加载{network_type}小区数据...")
 
-            cells = self.load_cells(network_type)
+            cells = self.load_cells(network_type, city=city, operator=operator)
             total_cells = len(cells)
 
             # 调试：打印小区经纬度范围
@@ -966,7 +998,12 @@ class TACPlanningService:
             self._seen_cells.clear()
 
     def plan_tac_for_list(
-        self, network_type: str, cells_to_plan: List[Dict], progress_callback=None
+        self,
+        network_type: str,
+        cells_to_plan: List[Dict],
+        progress_callback=None,
+        city: Optional[str] = None,
+        operator: Optional[str] = None,
     ) -> Tuple[List[Dict], int, int]:
         """
         执行TAC规划（对待规划小区清单进行规划）
@@ -976,6 +1013,7 @@ class TACPlanningService:
         Args:
             network_type: 网络类型 'LTE' 或 'NR'
             progress_callback: 进度回调函数
+            city/operator: 任务组快照，TAC 图层仅在本组数据内查找
 
         Returns:
             (results, planned_count, unplanned_count)
@@ -985,7 +1023,7 @@ class TACPlanningService:
             if progress_callback:
                 progress_callback(10, "加载TAC图层...")
 
-            tac_zones = self.load_tac_layers(network_type)
+            tac_zones = self.load_tac_layers(network_type, city=city, operator=operator)
             self.tac_zones = tac_zones
 
             logger.info(f"成功加载 {len(tac_zones)} 个{network_type} TAC区域")

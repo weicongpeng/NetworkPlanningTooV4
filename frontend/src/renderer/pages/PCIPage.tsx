@@ -23,6 +23,7 @@ import { StepIndicator } from '../components/StepIndicator'
 import { WizardFooter } from '../components/WizardFooter'
 import { extractCellIdsFromFile, matchCellIds, downloadCellTreeTemplate } from '../utils/cellFileHelper'
 import { generateFullTaskName } from '../utils/taskNameUtils'
+import { buildMissingCellsError } from '../utils/cellValidation'
 
 const PCI_COLUMNS_STATIC = [
   { key: 'networkType', label: '网元类型', defaultWidth: 80 },
@@ -128,7 +129,7 @@ const validateConfig = (config: any, t: (key: string) => string): string | null 
 }
 
 export function PCIPage() {
-  const { t } = useTranslation()
+  const { t, i18n } = useTranslation()
   const user = useAuthStore((s) => s.user)
   const {
     wizardStep, setWizardStep,
@@ -158,9 +159,11 @@ export function PCIPage() {
   const {
     updateTaskProgress, completeTask, failTask, activeTaskIds, setActiveTaskId, startTask,
     getLatestPCITask,
-    startGlobalPolling, stopGlobalPolling, isGlobalPollingActive
+    startGlobalPolling, isGlobalPollingActive
   } = useTaskStore()
   const taskId = activeTaskIds.pci_planning
+  // 响应式订阅当前活跃任务，跨页面切回时据此水合本地状态（修复进度停滞）
+  const activeStoreTask = useTaskStore((s: any) => (s.activeTaskIds.pci_planning ? s.tasks[s.activeTaskIds.pci_planning] : null))
   const latestPCITask = getLatestPCITask()
   // 🔥 修复：改用后端返回的真实任务总数（historyCounts），避免本地 store 缓存
   // 只保留最近 50 条导致的历史任务计数与实际不一致
@@ -596,30 +599,40 @@ export function PCIPage() {
     setResultSearchFilters(prev => ({ ...prev, [field]: value }))
   }
 
-  // === 全局轮询：页面切换不中断，切换回来继续展示执行过程 ===
+  // 响应式同步活跃任务 → 本地状态（修复：切换到其他页面再切回时进度停滞/不显示完成）。
+  // 全局轮询跨页面持续写 store，本 effect 在 progress/status 变化时回填本地并确保轮询运行。
   useEffect(() => {
-    if (taskId && (localTaskResult?.status === 'pending' || localTaskResult?.status === 'processing')) {
-      if (!isGlobalPollingActive('pci_planning')) {
-        startGlobalPolling('pci_planning')
-      }
-    }
-    // 不在此处停止轮询——组件卸载时轮询继续在后台运行
-  }, [taskId, localTaskResult?.status])
+    if (!taskId || !activeStoreTask) return
+    if (viewedTaskResultRef.current?.taskId === taskId) return
+    const st = activeStoreTask.status
+    const progress = activeStoreTask.progress ?? 0
 
-  // 从 taskStore 同步进度到 localTaskResult
-  useEffect(() => {
-    if (taskId) {
-      const t = useTaskStore.getState().tasks[taskId]
-      if (t) {
-        if (t.result && Object.keys(t.result).length > 0) {
-          setLocalTaskResult(t.result as PCIResultData)
+    if (st === 'completed' && activeStoreTask.result) {
+      setLocalTaskResult(activeStoreTask.result as PCIResultData)
+    } else if (st === 'failed') {
+      setLocalTaskResult((prev) =>
+        prev?.taskId === taskId && (prev.status === 'failed' || prev.status === 'completed') ? prev : {
+          taskId, status: 'failed' as const, progress,
+          totalSites: 0, totalSectors: 0, collisions: 0, confusions: 0,
+          startTime: new Date(activeStoreTask.startTime || Date.now()).toISOString(),
+        })
+    } else if (st === 'running' || st === 'processing' || st === 'pending') {
+      setWizardStep('executing')
+      setLocalTaskResult((prev) => {
+        if (prev?.taskId === taskId && (prev.status === 'processing' || prev.status === 'pending')) {
+          return prev.progress === progress ? prev : { ...prev, status: 'processing' as const, progress }
         }
-        if (t.status === 'completed' || t.status === 'failed') {
-          stopGlobalPolling('pci_planning')
+        if (prev?.taskId === taskId && prev.status === 'completed') return prev
+        return {
+          taskId, status: 'processing' as const, progress,
+          totalSites: 0, totalSectors: 0, collisions: 0, confusions: 0,
+          startTime: new Date(activeStoreTask.startTime || Date.now()).toISOString(),
         }
-      }
+      })
+      if (!isGlobalPollingActive('pci_planning')) startGlobalPolling('pci_planning')
     }
-  }, [taskId])
+    // 不在此处停止轮询——全局轮询在任务完成/失败时由 store 自行停止
+  }, [taskId, activeStoreTask, setWizardStep, isGlobalPollingActive, startGlobalPolling])
 
   // 监听任务完成/失败，自动推进向导步骤
   useEffect(() => {
@@ -695,9 +708,11 @@ export function PCIPage() {
   // ===== 统一的"下一步"逻辑 =====
   const handleNext = useCallback(() => {
     if (wizardStep === 'idle') {
-      // 新建任务：进入任务名称输入，指示器不跳转
-      setWizardStep('task_created')
+      // 名称输入完成后点击新建任务：校验名称并直接进入参数设置
+      const nameError = validateTaskName(taskName)
+      if (nameError) { setTaskNameError(nameError); return }
       setTaskNameError(null)
+      setWizardStep('params_set')
       setError(null)
     } else if (wizardStep === 'task_created') {
       // 验证任务名称 → 参数设置，指示器跳转到"2规划参数"
@@ -768,6 +783,24 @@ export function PCIPage() {
   const handleExecute = async () => {
     if (selectedCellIdsSet.size === 0) {
       setError(t('pci.noCellsSelected') || '请在小区选择列表中至少选择一个小区后再执行PCI规划')
+      return
+    }
+    // 校验选中小区的必要字段（经度/纬度/频点/基站ID/小区ID）
+    const sourceSectors = config.networkType === 'LTE' ? cellListData.lte : cellListData.nr
+    const missingCellsError = buildMissingCellsError(sourceSectors, selectedCellIdsSet, {
+      labels: {
+        siteId: t('pci.siteId') || '基站ID',
+        cellId: t('pci.sectorId') || '小区ID',
+        frequency: t('pci.cellFreq') || '频点',
+        longitude: t('pci.cellLng') || '经度',
+        latitude: t('pci.cellLat') || '纬度'
+      },
+      mainTemplate: t('pci.cellsMissingData') || '选中的小区中有 {{count}} 个缺少必要数据（经度/纬度/频点/基站ID/小区ID），请补充工参后再执行。缺失示例：{{examples}}',
+      missingTemplate: t('pci.missingFieldsLabel') || '缺少：{{fields}}',
+      lang: i18n.language === 'en' ? 'en' : 'zh'
+    })
+    if (missingCellsError) {
+      setError(missingCellsError)
       return
     }
     const validationError = validateConfig(config, t)
@@ -1225,7 +1258,7 @@ export function PCIPage() {
       <h1 className="text-base font-bold mb-6 shrink-0">{t('pci.title') || 'PCI规划'}</h1>
 
       {error && (
-        <div className="mb-4 p-3 bg-red-50 border border-red-200 rounded-lg flex items-center gap-3 text-red-700 shrink-0">
+        <div className="mb-4 p-3 bg-red-500/10 border border-red-500/20 rounded-lg flex items-center gap-3 text-red-400 shrink-0">
           <AlertCircle size={18} />
           <span className="text-sm">{error}</span>
           <button onClick={() => setError(null)} className="ml-auto text-sm underline">{t('pci.close') || '关闭'}</button>
@@ -1314,19 +1347,21 @@ export function PCIPage() {
                     }
                     executingProgress={wizardStep === 'executing' ? (currentTaskResult?.progress ?? 0) : undefined}
                   />
-                  <div className="flex flex-row gap-4 flex-1 min-h-0 overflow-hidden">
-                    {/* 左侧：任务名称 + 参数设置 */}
-                    <div className="flex flex-col overflow-y-auto flex-1 min-w-0">
+                  {/* 每步仅渲染当前操作卡片，居中显示 */}
+                  <div className="flex-1 min-h-0 overflow-y-auto flex justify-center px-4">
+                    <div className="w-full max-w-3xl py-2 flex flex-col gap-4 min-h-0">
+                      {/* 步骤1：任务名称卡片 */}
+                      {(wizardStep === 'idle' || wizardStep === 'task_created') && (
                       <div className="bg-card border border-border rounded-xl p-6 w-full">
                         {nextTaskError && (
-                          <div className="mb-4 p-3 bg-red-50 border border-red-200 rounded-lg flex items-center gap-3 text-red-700">
+                          <div className="mb-4 p-3 bg-red-500/10 border border-red-500/20 rounded-lg flex items-center gap-3 text-red-400">
                             <AlertCircle size={18} />
                             <span className="text-sm">{nextTaskError}</span>
                             <button onClick={() => setNextTaskError(null)} className="ml-auto text-sm underline">关闭</button>
                           </div>
                         )}
                         {/* 任务名称 */}
-                        <div className="mb-6">
+                        <div>
                           <label className="block text-sm font-semibold mb-2">{t('common.taskName') || '任务名称'}</label>
                           <input
                             type="text"
@@ -1342,7 +1377,13 @@ export function PCIPage() {
                           )}
                           <p className="mt-1 text-xs text-muted-foreground">{taskName.length}/25</p>
                         </div>
+                      </div>
+                      )}
 
+                      {/* 步骤2：规划参数卡片 */}
+                      {wizardStep === 'params_set' && (
+                      <div className="bg-card border border-border rounded-xl p-6 w-full">
+                        <h3 className="text-sm font-semibold mb-4">{t('pci.planningParams') || '规划参数'}</h3>
                         {/* PCI参数 */}
                         <div className="space-y-4">
                           <div className="grid grid-cols-2 gap-x-4 gap-y-3">
@@ -1417,11 +1458,12 @@ export function PCIPage() {
                           </div>
                         </div>
                       </div>
-                    </div>
+                      )}
 
-                    {/* 右侧：小区选择 */}
-                    <div className="flex flex-col flex-1 min-w-0 border-l border-border pl-4 overflow-hidden">
-                      <div className="flex flex-col h-full overflow-hidden">
+                      {/* 步骤3：小区选择卡片（含执行中/完成前展示） */}
+                      {(wizardStep === 'cells_selected' || wizardStep === 'executing' || wizardStep === 'completed') && (
+                      <div className="bg-card border border-border rounded-xl p-6 w-full h-[70vh] min-h-[420px] flex flex-col">
+                        <h3 className="text-sm font-semibold mb-4 shrink-0">{t('pci.cellSelection') || '小区选择'}</h3>
                         <input
                           type="file"
                           ref={cellFileInputRef}
@@ -1429,6 +1471,7 @@ export function PCIPage() {
                           accept=".xlsx,.xls"
                           className="hidden"
                         />
+                        <div className="flex-1 min-h-0 flex flex-col">
                         <CellSelectionTable
                           sectors={(() => {
                             const networkType = config.networkType as 'LTE' | 'NR'
@@ -1451,13 +1494,17 @@ export function PCIPage() {
                             cellName: t('pci.sectorName') || '小区名称',
                             cellFreq: t('pci.cellFreq') || '频点',
                             cellPci: t('pci.cellPci') || 'PCI',
+                            cellLng: t('pci.cellLng') || '经度',
+                            cellLat: t('pci.cellLat') || '纬度',
                             selectAll: t('pci.selectAll') || '全选',
                             clearSelections: t('pci.clearSelections') || '清空选择',
                             uploadCellFile: t('pci.uploadCellFile') || '上传待规划小区文件',
                             downloadCellTemplate: t('pci.downloadCellTemplate') || '下载待规划小区模板'
                           }}
                         />
+                        </div>
                       </div>
+                      )}
                     </div>
                   </div>
 
@@ -1472,7 +1519,7 @@ export function PCIPage() {
                     }
                     isExecuting={loading || isRunning}
                     canProceed={
-                      wizardStep === 'idle' ? true
+                      wizardStep === 'idle' ? taskName.trim().length > 0
                       : wizardStep === 'task_created' ? taskName.trim().length > 0
                       : wizardStep === 'params_set' ? true
                       : wizardStep === 'cells_selected' ? selectedCellIdsSet.size > 0
@@ -1594,7 +1641,7 @@ export function PCIPage() {
                                   <th key={column.key} className="p-2 bg-muted z-20 relative group border-r border-border" style={{ width: `${pciColumnWidths[column.key]}px`, minWidth: `${pciColumnWidths[column.key]}px` }}>
                                     <span className="block pr-3">{column.label}</span>
                                     {resultSearchEnabled && (
-                                      <input type="text" value={resultSearchFilters[column.key as keyof typeof resultSearchFilters]} onChange={(e) => handleResultSearchChange(column.key, e.target.value)} placeholder={t('pci.search') || '搜索'} className="mt-1 w-full p-1 border border-border rounded text-[10px] bg-white dark:bg-slate-800" />
+                                      <input type="text" value={resultSearchFilters[column.key as keyof typeof resultSearchFilters]} onChange={(e) => handleResultSearchChange(column.key, e.target.value)} placeholder={t('pci.search') || '搜索'} className="mt-1 w-full p-1 border border-border rounded text-[10px] bg-input text-foreground placeholder:text-muted-foreground" />
                                     )}
                                     <div className={`table-resize-handle ${pciResizingColumn === column.key ? 'resizing' : ''}`} onMouseDown={(e) => { e.preventDefault(); e.stopPropagation(); handlePciResizeStart(column.key, e.clientX) }}>
                                       <GripVertical size={12} className="opacity-0 group-hover:opacity-40 text-muted-foreground absolute right-0.5 top-1/2 -translate-y-1/2 pointer-events-none" />
@@ -1671,15 +1718,15 @@ export function PCIPage() {
               <MapTypeSwitch mapRef={mapRef} />
             </div>
             {searchMarkers.length > 0 && (
-              <div className="mb-3 p-2 bg-blue-50 dark:bg-blue-950 border border-blue-200 dark:border-blue-800 rounded-lg text-xs text-blue-700 dark:text-blue-300 flex items-center justify-between">
+              <div className="mb-3 p-2 bg-blue-500/10 border border-blue-500/30 rounded-lg text-xs text-blue-600 flex items-center justify-between">
                 <span className="flex items-center gap-2"><Search size={14} />{t('pci.searchMarkersAdded') || `已添加 ${searchMarkers.length} 个搜索标记`}</span>
-                <button onClick={handleClearMarkers} className="text-blue-700 dark:text-blue-300 hover:text-blue-900 dark:hover:text-blue-100 font-medium">{t('pci.clearAll') || '清除全部'}</button>
+                <button onClick={handleClearMarkers} className="text-blue-600 hover:text-blue-500 font-medium">{t('pci.clearAll') || '清除全部'}</button>
               </div>
             )}
             {searchError && (
-              <div className="mb-3 p-3 bg-orange-50 border border-orange-200 rounded-lg text-sm text-orange-700 flex items-center gap-2">
+              <div className="mb-3 p-3 bg-orange-500/10 border border-orange-500/30 rounded-lg text-sm text-orange-500 flex items-center gap-2">
                 <AlertCircle size={16} /><span>{searchError}</span>
-                <button onClick={() => setSearchError(null)} className="ml-auto text-orange-700 hover:text-orange-900"><X size={16} /></button>
+                <button onClick={() => setSearchError(null)} className="ml-auto text-orange-500 hover:text-orange-600"><X size={16} /></button>
               </div>
             )}
             <div className="flex-1 rounded-lg overflow-hidden relative min-h-[500px]">

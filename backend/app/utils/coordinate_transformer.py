@@ -208,6 +208,55 @@ class CoordinateTransformer:
         return gcj_lat * 2 - mg_lat, gcj_lng * 2 - mg_lng
 
     @staticmethod
+    def gcj02_to_wgs84_batch(gcj_lats: np.ndarray,
+                             gcj_lngs: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """批量 GCJ02 → WGS84（numpy 向量化，结果与逐点 gcj02_to_wgs84 一致）。
+
+        大图层保存（整层 GCJ02 逆转换）原先逐点调用标量函数，百万级节点需数秒；
+        向量化后降至亚秒级。
+        """
+        gcj_lats = np.asarray(gcj_lats, dtype=float)
+        gcj_lngs = np.asarray(gcj_lngs, dtype=float)
+
+        in_china = (
+            (gcj_lngs >= CoordinateTransformer._CHINA_BOUNDS['lng_min']) &
+            (gcj_lngs <= CoordinateTransformer._CHINA_BOUNDS['lng_max']) &
+            (gcj_lats >= CoordinateTransformer._CHINA_BOUNDS['lat_min']) &
+            (gcj_lats <= CoordinateTransformer._CHINA_BOUNDS['lat_max'])
+        )
+
+        wgs_lats = gcj_lats.copy()
+        wgs_lngs = gcj_lngs.copy()
+
+        if in_china.any():
+            x = gcj_lngs[in_china] - 105.0
+            y = gcj_lats[in_china] - 35.0
+
+            d_lat = CoordinateTransformer._transform_lat_batch(x, y)
+            d_lng = CoordinateTransformer._transform_lon_batch(x, y)
+
+            rad_lat = (gcj_lats[in_china] / 180.0) * np.pi
+            magic = np.sin(rad_lat)
+            magic = 1 - CoordinateTransformer._EE * magic * magic
+            sqrt_magic = np.sqrt(magic)
+            d_lat = (d_lat * 180.0) / (
+                (CoordinateTransformer._A * (1 - CoordinateTransformer._EE)) /
+                (magic * sqrt_magic) * np.pi
+            )
+            d_lng = (d_lng * 180.0) / (
+                CoordinateTransformer._A / sqrt_magic *
+                np.cos(rad_lat) * np.pi
+            )
+
+            mg_lat = gcj_lats[in_china] + d_lat
+            mg_lng = gcj_lngs[in_china] + d_lng
+            # 逆向转换: WGS84 = GCJ02 - 偏移
+            wgs_lats[in_china] = gcj_lats[in_china] * 2 - mg_lat
+            wgs_lngs[in_china] = gcj_lngs[in_china] * 2 - mg_lng
+
+        return wgs_lats, wgs_lngs
+
+    @staticmethod
     def transform_geojson_coordinates(coordinates: Any, from_wgs84: bool = True) -> Any:
         """
         转换 GeoJSON 坐标
@@ -290,11 +339,9 @@ class CoordinateTransformer:
                 np.array(lats), np.array(lngs)
             )
         else:
-            # 反向转换无 batch 版本，回退标量（仍走批量收集，避免函数分叉）
-            gcj_lats = np.array([CoordinateTransformer.gcj02_to_wgs84(la, lo)[0]
-                                 for la, lo in zip(lats, lngs)])
-            gcj_lngs = np.array([CoordinateTransformer.gcj02_to_wgs84(la, lo)[1]
-                                 for la, lo in zip(lats, lngs)])
+            gcj_lats, gcj_lngs = CoordinateTransformer.gcj02_to_wgs84_batch(
+                np.array(lats), np.array(lngs)
+            )
 
         # 递归重建结构：叶子按收集顺序取转换结果
         def _rebuild(node: Any) -> Any:

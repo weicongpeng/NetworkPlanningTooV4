@@ -51,6 +51,9 @@ class User(Base):
     can_data_delete = Column(Boolean, default=False, nullable=False)
     can_data_update = Column(Boolean, default=False, nullable=False)
     can_cell_entry = Column(Boolean, default=False, nullable=False)
+    can_cell_query_update = Column(Boolean, default=False, nullable=False)
+    # 网优助手功能权限（对话/基站参数·指标数据集/大模型配置），管理员自动拥有
+    can_assistant = Column(Boolean, default=False, nullable=False)
 
     sessions = relationship("UserSession", back_populates="user", lazy="dynamic")
 
@@ -73,6 +76,8 @@ class User(Base):
             "can_data_delete": self.can_data_delete,
             "can_data_update": self.can_data_update,
             "can_cell_entry": self.can_cell_entry,
+            "can_cell_query_update": self.can_cell_query_update,
+            "can_assistant": self.can_assistant,
         }
 
 
@@ -109,6 +114,9 @@ class Workbook(Base):
 
     id = Column(String(36), primary_key=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    # 数据所属组（地市+运营商）归属快照；NULL=存量数据，仅管理员可见
+    city = Column(String(100), nullable=True, index=True)
+    operator = Column(String(50), nullable=True)
     name = Column(String(255), nullable=False)
     file_type = Column(String(50), nullable=False)
     network_types = Column(Text, nullable=True)
@@ -133,6 +141,9 @@ class Site(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     workbook_id = Column(String(36), ForeignKey("workbooks.id"), nullable=False)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    # 数据所属组（地市+运营商）归属快照；NULL=存量数据，仅管理员可见
+    city = Column(String(100), nullable=True, index=True)
+    operator = Column(String(50), nullable=True)
     site_id = Column(String(100), nullable=False)
     name = Column(String(255), nullable=True)
     longitude = Column(Float, nullable=True)
@@ -156,6 +167,9 @@ class Sector(Base):
     site_id_fk = Column(Integer, ForeignKey("sites.id"), nullable=True)
     workbook_id = Column(String(36), ForeignKey("workbooks.id"), nullable=False)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    # 数据所属组（地市+运营商）归属快照；NULL=存量数据，仅管理员可见
+    city = Column(String(100), nullable=True, index=True)
+    operator = Column(String(50), nullable=True)
     sector_id = Column(String(100), nullable=False)
     name = Column(String(255), nullable=True)
     longitude = Column(Float, nullable=True)
@@ -186,6 +200,9 @@ class GeoFile(Base):
 
     id = Column(String(36), primary_key=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    # 数据所属组（地市+运营商）归属快照；NULL=存量数据，仅管理员可见
+    city = Column(String(100), nullable=True)
+    operator = Column(String(50), nullable=True)
     filename = Column(String(255), nullable=False)
     file_path = Column(Text, nullable=False)
     geometry_type = Column(String(20), nullable=False)
@@ -206,6 +223,9 @@ class Layer(Base):
 
     id = Column(String(36), primary_key=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    # 数据所属组（地市+运营商）归属快照；NULL=存量数据，仅管理员可见
+    city = Column(String(100), nullable=True)
+    operator = Column(String(50), nullable=True)
     name = Column(String(255), nullable=False)
     file_path = Column(Text, nullable=False)
     layer_type = Column(String(20), nullable=False)
@@ -248,6 +268,9 @@ class TaskResult(Base):
     task_type = Column(String(50), nullable=False)
     task_name = Column(String(255), nullable=True)
     user_name = Column(String(50), nullable=True)
+    # 任务发起时的组快照（执行线程不反查用户表）；NULL=存量任务
+    city = Column(String(100), nullable=True)
+    operator = Column(String(50), nullable=True)
     config_json = Column(Text, nullable=True)
     result_json = Column(Text, nullable=True)
     status = Column(String(20), nullable=False, default="completed")
@@ -291,3 +314,57 @@ class AppVersion(Base):
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
+
+
+class StationParamRow(Base):
+    """网优助手-基站无线参数（一行一个小区，参数为动态 KV）
+
+    全量工参(Site/Sector)是小区基础规划数据；本表存网管配置的无线参数
+    （功率、切换门限、重选参数等），列随网管版本变化，故动态参数存 params_json。
+    """
+    __tablename__ = "station_param_rows"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    workbook_id = Column(String(36), ForeignKey("workbooks.id"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    # 数据所属组（地市+运营商）归属快照；NULL=存量数据，仅管理员可见
+    city = Column(String(100), nullable=True)
+    operator = Column(String(50), nullable=True)
+    cell_name = Column(String(255), nullable=False, index=True)
+    site_id = Column(String(100), nullable=True)
+    cell_id = Column(String(100), nullable=True)
+    network_type = Column(String(10), nullable=True)
+    params_json = Column(Text, nullable=False, default="{}")
+    created_at = Column(String(30), nullable=False)
+
+    __table_args__ = (
+        Index("idx_param_rows_user_cell", "user_id", "cell_name"),
+    )
+
+
+class StationMetricRow(Base):
+    """网优助手-基站性能指标（长表：一行 = 小区 × 时间 × 指标）
+
+    长表而非宽表：指标列随网管/粒度（月/天/小时/忙时）变化，
+    宽表要频繁改表结构；长表 + 索引在 SQLite 百万级下查询足够快。
+    """
+    __tablename__ = "station_metric_rows"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    workbook_id = Column(String(36), ForeignKey("workbooks.id"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    # 数据所属组（地市+运营商）归属快照；NULL=存量数据，仅管理员可见
+    city = Column(String(100), nullable=True)
+    operator = Column(String(50), nullable=True)
+    cell_name = Column(String(255), nullable=False, index=True)
+    site_id = Column(String(100), nullable=True)
+    cell_id = Column(String(100), nullable=True)
+    granularity = Column(String(10), nullable=True)  # hour/day/month/busy_hour
+    metric_time = Column(DateTime, nullable=False, index=True)
+    metric_name = Column(String(100), nullable=False, index=True)
+    metric_value = Column(Float, nullable=True)
+    created_at = Column(String(30), nullable=False)
+
+    __table_args__ = (
+        Index("idx_metric_rows_query", "user_id", "cell_name", "metric_name", "metric_time"),
+    )

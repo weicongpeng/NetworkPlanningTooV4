@@ -24,11 +24,12 @@ import { DATA_REFRESH_EVENT } from '../store/dataStore'
 import { CellSelectionTable } from '../components/CellSelectionTable'
 import { HistoryTable, triggerBatchDelete } from '../components/HistoryTable'
 import { generateFullTaskName } from '../utils/taskNameUtils'
+import { buildMissingCellsError } from '../utils/cellValidation'
 import { StepIndicator } from '../components/StepIndicator'
 import { WizardFooter } from '../components/WizardFooter'
 import { NumberInput } from '../components/NumberInput'
 import { LoadingSpinner } from '../components/LoadingSpinner'
-import { extractCellIdsFromFile, matchCellIds, downloadCellTreeTemplate } from '../utils/cellFileHelper'
+import { extractCellIdsFromFileGrouped, matchCellIds, downloadCellTreeTemplate } from '../utils/cellFileHelper'
 
 interface NeighborResultData {
   taskId: string
@@ -55,7 +56,7 @@ const MAX_NEIGHBORS_LIMIT: Record<string, number> = {
 }
 
 export function NeighborPage() {
-  const { t } = useTranslation()
+  const { t, i18n: i18nInstance } = useTranslation()
   const user = useAuthStore((s) => s.user)
   const { wizardStep, setWizardStep, config, setConfig, selectedCellIds: storeSelectedCellIds, activeLeftTab, setActiveLeftTab, taskName, setTaskName, resetConfig: storeResetConfig } = useNeighborStore()
   const [taskNameError, setTaskNameError] = useState<string | null>(null)
@@ -139,6 +140,8 @@ export function NeighborPage() {
     noMatchingCells: t('neighbor.noMatchingCells') || '未匹配到任何小区，请检查文件内容与当前工参数据是否一致',
     cellFreq: t('neighbor.cellFreq') || '频点',
     cellPci: t('neighbor.cellPci') || 'PCI',
+    cellLng: t('neighbor.cellLng') || '经度',
+    cellLat: t('neighbor.cellLat') || '纬度',
     // 工具提示
     distanceFactorTooltip: t('neighbor.distanceFactorTooltip') || '覆盖圆距离系数：站点到覆盖圆心的距离系数，默认5/9(≈0.556)',
     radiusFactorTooltip: t('neighbor.radiusFactorTooltip') || '覆盖圆半径系数：覆盖半径系数，默认5/9(≈0.556)',
@@ -219,9 +222,11 @@ export function NeighborPage() {
   const {
     updateTaskProgress, completeTask, failTask, activeTaskIds, setActiveTaskId, startTask,
     getLatestNeighborTask,
-    startGlobalPolling, stopGlobalPolling, isGlobalPollingActive
+    startGlobalPolling, isGlobalPollingActive
   } = useTaskStore()
   const taskId = activeTaskIds.neighbor_planning
+  // 响应式订阅当前活跃任务（含处理中 progress/status/result），跨页面切回时据此水合本地状态
+  const activeStoreTask = useTaskStore((s: any) => (s.activeTaskIds.neighbor_planning ? s.tasks[s.activeTaskIds.neighbor_planning] : null))
   const latestNeighborTask = getLatestNeighborTask()
   // 🔥 修复：改用后端返回的真实任务总数（historyCounts），避免本地 store 缓存截断导致计数不准
   const neighborHistoryCount = useTaskStore(s => s.historyCounts.neighbor_planning)
@@ -673,31 +678,46 @@ export function NeighborPage() {
   }
 
   // === 全局轮询：页面切换不中断 ===
+  // 响应式同步活跃任务 → 本地状态（修复：切换到其他页面再切回时进度停滞/不显示完成）。
+  // 全局轮询跨页面持续写入 store，本 effect 在任务 progress/status 变化时回填本地：
+  //  - running/processing/pending：回填处理中状态+进度、确保全局轮询运行中、向导停在 executing
+  //  - completed + result：回填完整结果（向导 effect 会推进到完成页）
+  //  - failed：回填失败状态
+  // viewedTaskIdRef 标记用户通过"查看"按钮打开的历史结果，不覆盖。
   useEffect(() => {
-    if (taskId && (taskResult?.status === 'pending' || taskResult?.status === 'processing')) {
+    if (!taskId || !activeStoreTask) return
+    if (viewedTaskIdRef.current === taskId) return
+    const st = activeStoreTask.status
+    const progress = activeStoreTask.progress ?? 0
+
+    if (st === 'completed' && activeStoreTask.result) {
+      setLocalTaskResult(activeStoreTask.result as NeighborResultData)
+    } else if (st === 'failed') {
+      setLocalTaskResult((prev: NeighborResultData | null) =>
+        prev?.taskId === taskId && (prev.status === 'failed' || prev.status === 'completed') ? prev : {
+          taskId, status: 'failed' as const, progress,
+          totalSites: 0, totalSectors: 0, totalNeighbors: 0, avgNeighbors: 0,
+          startTime: new Date(activeStoreTask.startTime || Date.now()).toISOString(),
+        })
+    } else if (st === 'running' || st === 'processing' || st === 'pending') {
+      setWizardStep('executing')
+      setLocalTaskResult((prev: NeighborResultData | null) => {
+        if (prev?.taskId === taskId && (prev.status === 'processing' || prev.status === 'pending')) {
+          return prev.progress === progress ? prev : { ...prev, status: 'processing' as const, progress }
+        }
+        // remount 后本地无状态：从 store 水合（不覆盖已完成结果）
+        if (prev?.taskId === taskId && prev.status === 'completed') return prev
+        return {
+          taskId, status: 'processing' as const, progress,
+          totalSites: 0, totalSectors: 0, totalNeighbors: 0, avgNeighbors: 0,
+          startTime: new Date(activeStoreTask.startTime || Date.now()).toISOString(),
+        }
+      })
       if (!isGlobalPollingActive('neighbor_planning')) {
         startGlobalPolling('neighbor_planning')
       }
     }
-  }, [taskId, taskResult?.status])
-
-  // 从 taskStore 同步进度到 localTaskResult（但不要覆盖用户通过"查看"按钮加载的结果）
-  useEffect(() => {
-    if (taskId && viewedTaskIdRef.current === taskId) {
-      return
-    }
-    if (taskId) {
-      const t = useTaskStore.getState().tasks[taskId]
-      if (t) {
-        if (t.result && Object.keys(t.result).length > 0) {
-          setLocalTaskResult(t.result as NeighborResultData)
-        }
-        if (t.status === 'completed' || t.status === 'failed') {
-          stopGlobalPolling('neighbor_planning')
-        }
-      }
-    }
-  }, [taskId])
+  }, [taskId, activeStoreTask, setWizardStep, isGlobalPollingActive, startGlobalPolling])
 
   // 加载小区列表数据（根据规划类型加载对应网络类型的扇区）
   const loadCellList = useCallback(async () => {
@@ -783,10 +803,27 @@ export function NeighborPage() {
     setCellFileUploading(true)
     setError(null)
     try {
-      // 1. 本地解析文件，提取小区ID
-      const extractedIds = await extractCellIdsFromFile(file)
-      if (extractedIds.length === 0) {
-        setError(i18n.noCellIdsExtracted || '未能从文件中提取到小区ID，请检查文件格式')
+      // 1. 本地解析文件，按网络类型分组提取小区ID
+      const grouped = await extractCellIdsFromFileGrouped(file)
+
+      // 规划类型决定期望的小区清单类型：
+      // LTE-LTE 只能导入 LTE 小区；NR-NR / NR-LTE 只能导入 NR 小区
+      const expectNet: 'lte' | 'nr' = config.planningType === 'LTE-LTE' ? 'lte' : 'nr'
+      const expectLabel = expectNet === 'lte' ? 'LTE' : 'NR'
+      const expectIds = grouped[expectNet]
+      const otherIds = expectNet === 'lte' ? grouped.nr : grouped.lte
+
+      if (expectIds.length === 0) {
+        if (otherIds.length > 0) {
+          // 文件里有小区，但全是错误的网络类型
+          setError(
+            (i18n.cellTypeMismatch || '当前规划类型为 {{type}}，只能导入 {{expect}} 小区清单，请检查文件')
+              .replace('{{type}}', config.planningType)
+              .replace('{{expect}}', expectLabel)
+          )
+        } else {
+          setError(i18n.noCellIdsExtracted || '未能从文件中提取到小区ID，请检查文件格式')
+        }
         return
       }
 
@@ -797,9 +834,9 @@ export function NeighborPage() {
       setCellListData({ lte: data.lte || [], nr: data.nr || [] })
       setCellListLoading(false)
 
-      // 3. 匹配小区ID并自动勾选
-      const allAvailableIds = [...data.lte, ...data.nr].map(item => item.id)
-      const matchedIds = matchCellIds(extractedIds, allAvailableIds)
+      // 3. 仅在期望网络类型的小区列表中匹配并自动勾选
+      const availableIds = (expectNet === 'lte' ? data.lte || [] : data.nr || []).map(item => item.id)
+      const matchedIds = matchCellIds(expectIds, availableIds)
 
       if (matchedIds.length > 0) {
         setSelectedCellIdsSet(new Set(matchedIds))
@@ -856,7 +893,13 @@ export function NeighborPage() {
     setWizardStep('idle')
     setTaskName(''); setTaskNameError(null); setNextTaskError(null)
     setSelectedCellIdsSet(new Set()); setError(null)
-    setConfig({ planningType: 'LTE-LTE', maxNeighbors: 64, coverageDistanceFactor: 1.0, coverageRadiusFactor: 1.0 })
+    setConfig({
+      planningType: 'LTE-LTE', maxNeighbors: 64,
+      coverageDistanceFactor: 0.5, coverageRadiusFactor: 0.5,
+      denseSpacingThreshold: 1.0, denseMultiplier: 1.3,
+      outdoorToIndoorMaxDistance: 0.6, indoorToIndoorRadius: 0.35,
+      indoorToOutdoorMultiplier: 1.5, outdoorSpacingSiteCount: 9,
+    })
   }
 
   // ===== 上一步逻辑 =====
@@ -873,7 +916,9 @@ export function NeighborPage() {
   // ===== 统一的"下一步"逻辑 =====
   const handleNext = useCallback(() => {
     if (wizardStep === 'idle') {
-      setWizardStep('task_created'); setTaskNameError(null); setError(null)
+      const nameError = validateTaskName(taskName)
+      if (nameError) { setTaskNameError(nameError); return }
+      setTaskNameError(null); setWizardStep('params_set'); setError(null)
     } else if (wizardStep === 'task_created') {
       const nameError = validateTaskName(taskName)
       if (nameError) { setTaskNameError(nameError); return }
@@ -912,6 +957,24 @@ export function NeighborPage() {
       setError(i18n.noCellsSelected || '请在小区选择列表中至少选择一个小区后再执行邻区规划')
       return
     }
+    // 校验选中小区的必要字段（经度/纬度/频点/基站ID/小区ID）
+    const sourceSectors = config.planningType.split('-')[0] === 'LTE' ? cellListData.lte : cellListData.nr
+    const missingCellsError = buildMissingCellsError(sourceSectors, selectedCellIdsSet, {
+      labels: {
+        siteId: i18n.sourceSiteId,
+        cellId: i18n.sourceCellId,
+        frequency: i18n.cellFreq,
+        longitude: i18n.cellLng,
+        latitude: i18n.cellLat
+      },
+      mainTemplate: t('neighbor.cellsMissingData') || '选中的小区中有 {{count}} 个缺少必要数据（经度/纬度/频点/基站ID/小区ID），请补充工参后再执行。缺失示例：{{examples}}',
+      missingTemplate: t('neighbor.missingFieldsLabel') || '缺少：{{fields}}',
+      lang: i18nInstance.language === 'en' ? 'en' : 'zh'
+    })
+    if (missingCellsError) {
+      setError(missingCellsError)
+      return
+    }
     const validationError = validateNeighborConfig(config)
     if (validationError) { setError(validationError); return }
     setError(null); setLocalTaskResult(null); setLoading(true)
@@ -924,6 +987,12 @@ export function NeighborPage() {
         maxNeighbors: config.maxNeighbors,
         coverageDistanceFactor: config.coverageDistanceFactor,
         coverageRadiusFactor: config.coverageRadiusFactor,
+        denseSpacingThreshold: config.denseSpacingThreshold ?? 1.0,
+        denseMultiplier: config.denseMultiplier ?? 1.3,
+        outdoorToIndoorMaxDistance: config.outdoorToIndoorMaxDistance ?? 0.6,
+        indoorToIndoorRadius: config.indoorToIndoorRadius ?? 0.35,
+        indoorToOutdoorMultiplier: config.indoorToOutdoorMultiplier ?? 1.5,
+        outdoorSpacingSiteCount: config.outdoorSpacingSiteCount ?? 9,
         selectedCellIds: Array.from(selectedCellIdsSet)
       })
       if (response.success && response.data) {
@@ -1287,7 +1356,7 @@ export function NeighborPage() {
 
       {/* 错误提示 */}
       {error && (
-        <div className="mb-4 p-3 bg-red-50 border border-red-200 rounded-lg flex items-center gap-3 text-red-700 shrink-0">
+        <div className="mb-4 p-3 bg-red-500/10 border border-red-500/20 rounded-lg flex items-center gap-3 text-red-400 shrink-0">
           <AlertCircle size={18} />
           <span className="text-sm">{error}</span>
           <button onClick={() => setError(null)} className="ml-auto text-sm underline">{i18n.close}</button>
@@ -1375,19 +1444,21 @@ export function NeighborPage() {
                     }
                     executingProgress={wizardStep === 'executing' ? (taskResult?.progress ?? 0) : undefined}
                   />
-                  <div className="flex flex-row gap-4 flex-1 min-h-0 overflow-hidden">
-                  {/* 左侧：任务名称 + 参数设置 */}
-                  <div className="flex flex-col overflow-y-auto flex-1 min-w-0">
+                  {/* 每步仅渲染当前操作卡片，居中显示 */}
+                  <div className="flex-1 min-h-0 overflow-y-auto flex justify-center px-4">
+                  <div className="w-full max-w-3xl py-2 flex flex-col gap-4 min-h-0">
+                    {/* 步骤1：任务名称卡片 */}
+                    {(wizardStep === 'idle' || wizardStep === 'task_created') && (
                     <div className="bg-card border border-border rounded-xl p-6 w-full">
                       {nextTaskError && (
-                        <div className="mb-4 p-3 bg-red-50 border border-red-200 rounded-lg flex items-center gap-3 text-red-700">
+                        <div className="mb-4 p-3 bg-red-500/10 border border-red-500/20 rounded-lg flex items-center gap-3 text-red-400">
                           <AlertCircle size={18} />
                           <span className="text-sm">{nextTaskError}</span>
                           <button onClick={() => setNextTaskError(null)} className="ml-auto text-sm underline">{i18n.close}</button>
                         </div>
                       )}
                       {/* 任务名称 */}
-                      <div className="mb-6">
+                      <div>
                         <label className="block text-sm font-semibold mb-2">{t('common.taskName') || '任务名称'}</label>
                         <input
                           type="text"
@@ -1401,8 +1472,13 @@ export function NeighborPage() {
                         {taskNameError && <p className="mt-1 text-xs text-red-500">{taskNameError}</p>}
                         <p className="mt-1 text-xs text-muted-foreground">{taskName.length}/25</p>
                       </div>
+                    </div>
+                    )}
 
-                      {/* 邻区规划参数 */}
+                    {/* 步骤2：规划参数卡片 */}
+                    {wizardStep === 'params_set' && (
+                    <div className="bg-card border border-border rounded-xl p-6 w-full">
+                      <h3 className="text-sm font-semibold mb-4">{i18n.planningParams}</h3>
                       <div className="space-y-4">
                         <div className="grid grid-cols-2 gap-x-4 gap-y-3">
                           <div>
@@ -1452,14 +1528,97 @@ export function NeighborPage() {
                             />
                           </div>
                         </div>
+
+                        {/* 高级门限参数（可选，默认值即推荐值） */}
+                        <div className="border-t border-border pt-3 mt-1">
+                          <p className="text-xs font-semibold text-muted-foreground mb-2">
+                            {t('neighbor.advancedThresholds') || '高级门限（默认值即推荐值，一般无需修改）'}
+                          </p>
+                          <div className="grid grid-cols-2 gap-x-4 gap-y-3">
+                            <div>
+                              <label className="block text-xs font-medium mb-0.5" title={t('neighbor.denseThresholdTooltip') || '平均站间距小于该值按密集场景（全量添加），单位公里'}>
+                                {t('neighbor.denseSpacingThreshold') || '密集/稀疏门限(km)'}
+                              </label>
+                              <NumberInput
+                                value={config.denseSpacingThreshold ?? 1.0}
+                                onChange={(v) => setConfig({ denseSpacingThreshold: v })}
+                                disabled={wizardStep !== 'params_set'}
+                                min={0.1} max={10}
+                                className="w-full"
+                              />
+                            </div>
+                            <div>
+                              <label className="block text-xs font-medium mb-0.5" title={t('neighbor.denseMultiplierTooltip') || '密集场景按该倍数×站间距范围内全量添加'}>
+                                {t('neighbor.denseMultiplier') || '密集全量倍数'}
+                              </label>
+                              <NumberInput
+                                value={config.denseMultiplier ?? 1.3}
+                                onChange={(v) => setConfig({ denseMultiplier: v })}
+                                disabled={wizardStep !== 'params_set'}
+                                min={1.0} max={5}
+                                className="w-full"
+                              />
+                            </div>
+                            <div>
+                              <label className="block text-xs font-medium mb-0.5" title={t('neighbor.outdoorToIndoorMaxTooltip') || '室外→室分最大添加距离，单位公里（且需在天线前向）'}>
+                                {t('neighbor.outdoorToIndoorMax') || '室外→室分最远距离(km)'}
+                              </label>
+                              <NumberInput
+                                value={config.outdoorToIndoorMaxDistance ?? 0.6}
+                                onChange={(v) => setConfig({ outdoorToIndoorMaxDistance: v })}
+                                disabled={wizardStep !== 'params_set'}
+                                min={0.1} max={3}
+                                className="w-full"
+                              />
+                            </div>
+                            <div>
+                              <label className="block text-xs font-medium mb-0.5" title={t('neighbor.indoorToIndoorRadiusTooltip') || '室分→室分最大添加距离，单位公里'}>
+                                {t('neighbor.indoorToIndoorRadius') || '室分→室分距离(km)'}
+                              </label>
+                              <NumberInput
+                                value={config.indoorToIndoorRadius ?? 0.35}
+                                onChange={(v) => setConfig({ indoorToIndoorRadius: v })}
+                                disabled={wizardStep !== 'params_set'}
+                                min={0.05} max={2}
+                                className="w-full"
+                              />
+                            </div>
+                            <div>
+                              <label className="block text-xs font-medium mb-0.5" title={t('neighbor.indoorToOutdoorMultiplierTooltip') || '室分→室外按该倍数×站间距范围内全量添加'}>
+                                {t('neighbor.indoorToOutdoorMultiplier') || '室分→室外倍数'}
+                              </label>
+                              <NumberInput
+                                value={config.indoorToOutdoorMultiplier ?? 1.5}
+                                onChange={(v) => setConfig({ indoorToOutdoorMultiplier: v })}
+                                disabled={wizardStep !== 'params_set'}
+                                min={1.0} max={5}
+                                className="w-full"
+                              />
+                            </div>
+                            <div>
+                              <label className="block text-xs font-medium mb-0.5" title={t('neighbor.spacingSiteCountTooltip') || '室外源计算平均站间距时取最近N个室外站点'}>
+                                {t('neighbor.outdoorSpacingSiteCount') || '室外站间距站点数'}
+                              </label>
+                              <NumberInput
+                                value={config.outdoorSpacingSiteCount ?? 9}
+                                onChange={(v) => setConfig({ outdoorSpacingSiteCount: Math.round(v) })}
+                                disabled={wizardStep !== 'params_set'}
+                                min={1} max={30}
+                                className="w-full"
+                              />
+                            </div>
+                          </div>
+                        </div>
                       </div>
                     </div>
-                  </div>
+                    )}
 
-                  {/* 右侧：小区选择 */}
-                  <div className="flex flex-col flex-1 min-w-0 border-l border-border pl-4 overflow-hidden">
-                    <div className="flex flex-col h-full overflow-hidden">
+                    {/* 步骤3：小区选择卡片（含执行中/完成前展示） */}
+                    {(wizardStep === 'cells_selected' || wizardStep === 'executing' || wizardStep === 'completed') && (
+                    <div className="bg-card border border-border rounded-xl p-6 w-full h-[70vh] min-h-[420px] flex flex-col">
+                      <h3 className="text-sm font-semibold mb-4 shrink-0">{t('pci.cellSelection') || '小区选择'}</h3>
                       <input type="file" ref={cellFileInputRef} onChange={handleCellFileChange} accept=".xlsx,.xls" className="hidden" />
+                      <div className="flex-1 min-h-0 flex flex-col">
                       <CellSelectionTable
                         sectors={(() => { const sourceType = config.planningType.split('-')[0] as 'LTE' | 'NR'; return sourceType === 'LTE' ? cellListData.lte : cellListData.nr })()}
                         selectedCellIds={selectedCellIdsSet}
@@ -1473,9 +1632,11 @@ export function NeighborPage() {
                         onDownloadCellTemplate={wizardStep === 'cells_selected' ? handleDownloadCellTemplate : undefined}
                         uploading={cellFileUploading}
                         disabled={wizardStep !== 'cells_selected' || isRunning}
-                        columnLabels={{ siteId: i18n.sourceSiteId, cellId: i18n.sourceCellId, cellName: i18n.sourceCellName, cellFreq: i18n.cellFreq, cellPci: i18n.cellPci, selectAll: i18n.selectAll, clearSelections: i18n.clearSelections, uploadCellFile: i18n.uploadCellFile, downloadCellTemplate: i18n.downloadCellTemplate }}
+                        columnLabels={{ siteId: i18n.sourceSiteId, cellId: i18n.sourceCellId, cellName: i18n.sourceCellName, cellFreq: i18n.cellFreq, cellPci: i18n.cellPci, cellLng: i18n.cellLng, cellLat: i18n.cellLat, selectAll: i18n.selectAll, clearSelections: i18n.clearSelections, uploadCellFile: i18n.uploadCellFile, downloadCellTemplate: i18n.downloadCellTemplate }}
                       />
+                      </div>
                     </div>
+                    )}
                   </div>
                 </div>
 
@@ -1490,7 +1651,7 @@ export function NeighborPage() {
                   }
                   isExecuting={loading || isRunning}
                   canProceed={
-                    wizardStep === 'idle' ? true
+                    wizardStep === 'idle' ? taskName.trim().length > 0
                     : wizardStep === 'task_created' ? taskName.trim().length > 0
                     : wizardStep === 'params_set' ? true
                     : wizardStep === 'cells_selected' ? selectedCellIdsSet.size > 0
@@ -1716,14 +1877,14 @@ export function NeighborPage() {
 
             {/* 搜索标记计数 */}
             {searchMarkers.length > 0 && (
-              <div className="mb-2 p-2 bg-blue-50 dark:bg-blue-950 border border-blue-200 dark:border-blue-800 rounded-lg text-xs text-blue-700 dark:text-blue-300 flex items-center justify-between">
+              <div className="mb-2 p-2 bg-blue-500/10 border border-blue-500/30 rounded-lg text-xs text-blue-600 flex items-center justify-between">
                 <span className="flex items-center gap-2">
                   <Search size={14} />
                   {i18n.searchMarkerCount.replace('{{count}}', String(searchMarkers.length))}
                 </span>
                 <button
                   onClick={handleClearMarkers}
-                  className="text-blue-700 dark:text-blue-300 hover:text-blue-900 dark:hover:text-blue-100 font-medium"
+                  className="text-blue-600 hover:text-blue-500 font-medium"
                 >
                   {i18n.clearAll}
                 </button>
@@ -1732,12 +1893,12 @@ export function NeighborPage() {
 
             {/* 搜索错误提示 */}
             {searchError && (
-              <div className="mb-2 p-2 bg-orange-50 border border-orange-200 rounded-lg text-xs text-orange-700 flex items-center gap-2">
+              <div className="mb-2 p-2 bg-orange-500/10 border border-orange-500/20 rounded-lg text-xs text-orange-400 flex items-center gap-2">
                 <AlertCircle size={14} />
                 <span className="flex-1">{searchError}</span>
                 <button
                   onClick={() => setSearchError(null)}
-                  className="text-orange-700 hover:text-orange-900"
+                  className="text-orange-400 hover:text-orange-300"
                 >
                   <X size={14} />
                 </button>
@@ -1936,7 +2097,7 @@ function NeighborTable({
                     value={searchFilters?.[column.key] || ''}
                     onChange={(e) => onSearchChange(column.key, e.target.value)}
                     placeholder={tableI18n.searchColPlaceholder}
-                    className="mt-1 w-full p-1 border border-border rounded text-[10px] text-gray-900 bg-gray-100 placeholder:text-gray-400"
+                    className="mt-1 w-full p-1 border border-border rounded text-[10px] text-foreground bg-input placeholder:text-muted-foreground"
                   />
                 )}
                 {/* 拖拽手柄 */}
@@ -1992,9 +2153,9 @@ function NeighborTable({
                         case 'relationType':
                           cellContent = (
                             <span className={`px-1.5 py-0.5 rounded text-[10px] ${
-                              group.relationType === 'LTE-LTE' ? 'bg-blue-100 text-blue-700' :
-                              group.relationType === 'NR-NR' ? 'bg-purple-100 text-purple-700' :
-                                'bg-green-100 text-green-700'
+                              group.relationType === 'LTE-LTE' ? 'bg-blue-500/15 text-blue-400' :
+                              group.relationType === 'NR-NR' ? 'bg-purple-500/15 text-purple-400' :
+                                'bg-green-500/15 text-green-400'
                             }`}>
                               {group.relationType}
                             </span>

@@ -10,9 +10,11 @@
  */
 import L from 'leaflet'
 import { extractFeatureId } from '../../utils/featureId'
-import { GeoDataCanvasLabelLayer, CanvasLabelData } from './GeoDataCanvasLabelLayer'
-import { getFieldValue, matchThematicColor, matchRangeIndex, hasValue } from '../../utils/fieldValue'
+import type { LabelCandidate, LabelLayoutManager } from './LabelLayoutManager'
+import { getFieldValue, matchThematicColor, matchRangeIndex, hasValue, toNumber, NO_FILL_COLOR } from '../../utils/fieldValue'
 import type { ThematicSettings } from './LabelSettingsModal'
+import type { HeatPoint } from '../../utils/heatmap'
+import { layerContainsPoint, CLICK_HIT_TOLERANCE_PX, layerGeometry } from './mapHitTest'
 
 const IS_DEV = import.meta.env.DEV
 
@@ -39,8 +41,8 @@ export interface MapInfoLayerOptions {
   visible?: boolean
   /** 样式配置 */
   style?: MapInfoLayerStyle
-  /** 要素点击回调 */
-  onFeatureClick?: (properties: any, event: L.LeafletMouseEvent) => void
+  /** 共享标签布局引擎（统一防重叠） */
+  labelManager?: LabelLayoutManager
 }
 
 /**
@@ -101,6 +103,23 @@ const DEFAULT_STYLES: Record<LayerGeometryType, any> = {
 }
 
 /**
+ * 名称类标签字段候选（按优先级排列）
+ * 图层首次开启"标签"开关、尚无保存的自定义字段时，从这些字段中自动挑选一个作为
+ * 标签内容，使新导入的图层一开启标签即可显示要素名称（用户无需先进"自定义设置"保存）。
+ */
+const NAME_LABEL_CANDIDATES = [
+  '小区名称', 'CELLNAME', 'CELL_NAME', 'CELL NAME', 'Cell Name', 'cellName',
+  '站点名称', 'zhLabel', 'NAME_CN', '名称', '站点名', '小区名',
+  'Name', 'NAME', 'name', 'OBJNAM', 'OBJNAME', 'Label', 'LABEL', 'label'
+]
+
+/** 自动挑选标签字段时跳过的无关编号/几何类字段（避免误把 OBJECTID/GRID_ID 等当标签） */
+const NOISE_LABEL_KEYS = new Set([
+  'OBJECTID', 'OBJECTID_1', 'FID', 'GID', 'ID', 'id', '_nptSelectionId', 'layer',
+  'Shape_Length', 'Shape_Area', 'Shape_Area_1', 'GRID_ID', 'GEO_ID'
+])
+
+/**
  * MapInfo Symbol shape 编号 → 形状名（与后端 layer_service.POINT_SHAPE_MIF 一致）
  */
 const MAPINFO_SYMBOL_SHAPES: Record<number, string> = {
@@ -111,9 +130,10 @@ const MAPINFO_SYMBOL_SHAPES: Record<number, string> = {
 const POINT_SHAPE_NAMES = ['circle', 'square', 'diamond', 'triangle', 'triangle_down', 'star', 'landmark', 'pin']
 
 /**
- * 将后端 _style.markerSymbol（MapInfo Symbol 编号或形状名）解析为形状名；无形状信息返回 null
+ * 将后端 _style.markerSymbol（MapInfo Symbol 编号或形状名）解析为形状名；无形状信息返回 null。
+ * 导出供图层编辑会话（LayerEditSession）复用，保证进入编辑时点形状渲染一致。
  */
-function resolvePointShape(symbol: any): string | null {
+export function resolvePointShape(symbol: any): string | null {
   if (symbol === undefined || symbol === null || symbol === '') return null
   if (typeof symbol === 'string') {
     const s = symbol.toLowerCase()
@@ -122,6 +142,25 @@ function resolvePointShape(symbol: any): string | null {
   const num = Number(symbol)
   if (!Number.isFinite(num)) return null
   return MAPINFO_SYMBOL_SHAPES[num] || null
+}
+
+/**
+ * 读取要素自身持久化的编辑样式（properties._editStyle）。
+ * 保存到 TAB 的 NPT_FEATSYM 列经后端还原为 _editStyle 对象；无/类型不符返回 null。
+ * 支持整体存储与按点/线/面分段存储两种形态（与 LayerEditSession.styleFor 口径一致）。
+ */
+function editStyleForKind(props: any, kind: 'point' | 'line' | 'polygon'): any | null {
+  const own = props?._editStyle
+  if (!own || typeof own !== 'object') return null
+  const seg = (own as any)[kind]
+  if (seg && typeof seg === 'object') return seg
+  const kindOfStyle =
+    own.markerShape !== undefined || (own.markerSize !== undefined && own.markerColor !== undefined)
+      ? 'point'
+      : own.fillColor !== undefined
+        ? 'polygon'
+        : 'line'
+  return kindOfStyle === kind ? own : null
 }
 
 /**
@@ -161,16 +200,28 @@ export class MapInfoLayer {
 
   // 标签相关属性
   private labelsEnabled: boolean = false
-  private canvasLabelLayer: GeoDataCanvasLabelLayer | null = null  // Canvas 标签层（替代 DOM marker）
+  private labelManager: LabelLayoutManager | null
+  private labelSourceId: string
   private labelConfig: {
     content: string
     color: string
     fontSize: number
+    fontFamily?: string
+    bold?: boolean
+    italic?: boolean
+    shadow?: boolean
+    background?: 'none' | 'halo' | 'box'
+    backgroundColor?: string
   }
-  private currentZoom: number = 14
+  /** 标签配置是否已被用户显式保存过（true 后不再自动挑选默认标签字段） */
+  private labelConfigCustomized: boolean = false
+  /**
+   * 编辑态标签源覆盖：非空时标签候选改从编辑工作集要素构建。
+   * 打开"编辑"开关后原图层隐藏（remove 会清标签），标签改由工作集注册，
+   * 保证"标签开关打开后打开编辑开关"标签不消失；null 恢复从自身数据构建。
+   */
+  private editLabelFeatures: any[] | null = null
   private currentMap: L.Map | null = null  // 存储当前地图实例
-  private onFeatureClickCallback?: (properties: any, event: L.LeafletMouseEvent) => void
-  private isInteractive: boolean = true // 是否允许交互 (满足需求3)
 
   // 框选高亮配置
   private selectionHighlightIds: Set<string> | null = null
@@ -187,8 +238,9 @@ export class MapInfoLayer {
       color: '#000000',
       fontSize: 12
     }
-    this.onFeatureClickCallback = options.onFeatureClick
     this.currentMap = null
+    this.labelManager = options.labelManager || null
+    this.labelSourceId = `mapinfo-${options.id}`
   }
 
   /**
@@ -210,12 +262,12 @@ export class MapInfoLayer {
    * @param center 中心点 (渲染坐标/GCJ02)
    * @param radius 半径 (米)
    */
-  getFeaturesInCircle(center: L.LatLng, radius: number): Array<{ id: string, properties: any }> {
+  getFeaturesInCircle(center: L.LatLng, radius: number): Array<{ id: string, properties: any, geometry?: any }> {
     if (!this.geoJSONLayer) {
       if (IS_DEV) console.log('[MapInfoLayer] getFeaturesInCircle: geoJSONLayer不存在', this.id)
       return []
     }
-    const results: Array<{ id: string, properties: any }> = []
+    const results: Array<{ id: string, properties: any, geometry?: any }> = []
     let layerCount = 0
 
     this.geoJSONLayer.eachLayer((layer: any) => {
@@ -229,13 +281,13 @@ export class MapInfoLayer {
         const latlng = layer.getLatLng()
         const distance = center.distanceTo(latlng)
         if (distance <= radius) {
-          results.push({ id: String(id), properties: props })
+          results.push({ id: String(id), properties: props, geometry: layer.feature?.geometry })
         }
       } else if (layer.getBounds) {
         // 线/面要素：圆与要素包围盒相交即选中。
         // 此前仅判断包围盒中心，圆只压到面的一部分（中心在圆外）时会漏选。
         if (this._circleIntersectsBounds(center, radius, layer.getBounds())) {
-          results.push({ id: String(id), properties: props })
+          results.push({ id: String(id), properties: props, geometry: layer.feature?.geometry })
         }
       }
     })
@@ -247,6 +299,37 @@ export class MapInfoLayer {
       matchedFeatures: results.length,
       radius
     })
+    return results
+  }
+
+  /**
+   * 获取点击位置精确命中的要素（用于「点击查属性」）
+   *
+   * 与 getFeaturesInCircle（圆与包围盒相交即选中，供圈选/点选工具）不同：
+   * 面要素按点击点是否落在封闭区域内判定，仅包围盒/边框相交不算命中，
+   * 避免点击面内部时误弹重叠列表；点要素按像素距离、线要素按到折线段的
+   * 像素距离判定。需先 addTo 地图（依赖投影），未上图时返回空。
+   *
+   * @param latlng 点击位置（渲染坐标/GCJ02）
+   * @param tolerancePx 像素容差
+   */
+  getFeaturesAtPoint(
+    latlng: L.LatLng,
+    tolerancePx: number = CLICK_HIT_TOLERANCE_PX
+  ): Array<{ id: string, properties: any, geometry: any }> {
+    if (!this.geoJSONLayer || !this.currentMap) return []
+    const results: Array<{ id: string, properties: any, geometry: any }> = []
+
+    this.geoJSONLayer.eachLayer((layer: any) => {
+      const props = layer.feature?.properties
+      if (!props) return
+      const id = layer._nptSelectionId || extractFeatureId(props)
+      if (!id) return
+      if (layerContainsPoint(this.currentMap!, layer, latlng, tolerancePx)) {
+        results.push({ id: String(id), properties: props, geometry: layerGeometry(layer) })
+      }
+    })
+
     return results
   }
 
@@ -269,12 +352,12 @@ export class MapInfoLayer {
    * id 为构建时分配的 _nptSelectionId（自然 ID 或「图层ID#序号」兜底），
    * 保证 MIF/KML 任意属性列名下多边形/矩形框选也能命中。
    */
-  getFeaturesInPolygon(polygon: L.Polygon): Array<{ id: string, properties: any }> {
+  getFeaturesInPolygon(polygon: L.Polygon): Array<{ id: string, properties: any, geometry?: any }> {
     if (!this.geoJSONLayer) {
       console.log('[MapInfoLayer] getFeaturesInPolygon: geoJSONLayer不存在', this.id)
       return []
     }
-    const results: Array<{ id: string, properties: any }> = []
+    const results: Array<{ id: string, properties: any, geometry?: any }> = []
     const bounds = polygon.getBounds()
     const points = (polygon.getLatLngs()[0] as L.LatLng[]).map(p => [p.lat, p.lng])
     let layerCount = 0
@@ -297,7 +380,7 @@ export class MapInfoLayer {
         const inBounds = bounds.contains(latlng)
         const inPolygon = inBounds && this._isPointInPolygon([latlng.lat, latlng.lng], points)
         if (inPolygon) {
-          results.push({ id: String(id), properties: props })
+          results.push({ id: String(id), properties: props, geometry: layer.feature?.geometry })
           console.log('[MapInfoLayer] 点要素在多边形内:', props.name || props.id, latlng)
         }
       } else if (layer.getBounds) {
@@ -307,7 +390,7 @@ export class MapInfoLayer {
         const inBounds = bounds.contains(center)
         const inPolygon = inBounds && this._isPointInPolygon([center.lat, center.lng], points)
         if (inPolygon) {
-          results.push({ id: String(id), properties: props })
+          results.push({ id: String(id), properties: props, geometry: layer.feature?.geometry })
           console.log('[MapInfoLayer] 线/面要素中心在多边形内:', props.name || props.id, center)
         }
       }
@@ -473,6 +556,19 @@ export class MapInfoLayer {
         const featureStyle = (feature.properties as any)?._style || {}
         const pointStyle = { ...DEFAULT_STYLES.point, ...featureStyle, ...mapInfoLayer.style.point }
 
+        // 要素级编辑样式（用户绘制/配置的 _editStyle）优先于图层默认与图层级设置
+        const es = editStyleForKind(feature.properties, 'point')
+        if (es) {
+          if (es.markerColor) {
+            pointStyle.markerColor = es.markerColor
+            pointStyle.fillColor = es.markerColor
+          }
+          if (es.borderColor) pointStyle.color = es.borderColor
+          if (es.markerShape) pointStyle.markerSymbol = es.markerShape
+          // 编辑样式 markerSize 为图标直径；MapInfoLayer 约定 markerSize 为半径（iconPx = 半径×2）
+          if (es.markerSize !== undefined) pointStyle.markerSize = Number(es.markerSize) / 2
+        }
+
         // 专题启用：按字段值配色，点大小用图形大小设置
         const thematicColor = mapInfoLayer._thematicColor(feature)
         if (thematicColor) {
@@ -484,12 +580,36 @@ export class MapInfoLayer {
         const markerSize = (thematicColor && mapInfoLayer.thematicSettings?.pointSize)
           ? mapInfoLayer.thematicSettings.pointSize
           : (pointStyle.markerSize || pointStyle.radius || 6)
-        const markerColor = pointStyle.markerColor || pointStyle.fillColor || '#f59e0b'
+        const markerColorRaw = pointStyle.markerColor || pointStyle.fillColor || '#f59e0b'
+        // 无色（镂空）：fill:false 仅显示描边；形状图标无法表达镂空，统一回退 circleMarker
+        const noFill = markerColorRaw === NO_FILL_COLOR
+        const markerColor = noFill ? '#f59e0b' : markerColorRaw
+        // 边框色：专题边框色优先，'none'（无色）→ 不描边；专题填充无色且未设边框色时
+        // 回退基础边框色（镂空也要有边框）；非专题用基础边框色，'none' 同样不描边
+        let strokeColor: string
+        let noStroke = false
+        const thematicBorderColor = mapInfoLayer.thematicSettings?.borderColor
+        if (thematicColor) {
+          if (thematicBorderColor === NO_FILL_COLOR) {
+            noStroke = true
+            strokeColor = '#000000'
+          } else if (thematicBorderColor) {
+            strokeColor = thematicBorderColor
+          } else {
+            strokeColor = thematicColor === NO_FILL_COLOR
+              ? (pointStyle.color && pointStyle.color !== NO_FILL_COLOR ? pointStyle.color : '#fff')
+              : thematicColor
+          }
+        } else {
+          noStroke = pointStyle.color === NO_FILL_COLOR
+          strokeColor = noStroke ? '#000000' : (pointStyle.color || '#fff')
+        }
 
         // 还原点形状（MapInfo Symbol 编号 / 形状名）：有形状信息时用 L.marker + SVG 图标，
-        // 否则保持 circleMarker（Canvas 渲染、大数据量性能好）
-        const shapeName = resolvePointShape(featureStyle.markerSymbol)
-        if (shapeName) {
+        // 否则保持 circleMarker（Canvas 渲染、大数据量性能好）。
+        // 从 pointStyle 取（合并了 _editStyle 覆盖），保证编辑样式设置的形状（如方形）生效
+        const shapeName = resolvePointShape(pointStyle.markerSymbol)
+        if (shapeName && !noFill) {
           const iconPx = Math.max(12, Math.min(36, Math.round(markerSize * 2)))
           const icon = L.icon({
             iconUrl: pointShapeIconDataUri(shapeName, markerColor),
@@ -505,11 +625,17 @@ export class MapInfoLayer {
         return L.circleMarker(latLng, {
           renderer: canvasRenderer,
           radius: markerSize,
+          fill: !noFill,
           fillColor: markerColor,
-          color: pointStyle.color || '#fff',
+          // 边框颜色/填充透明度：专题启用时用专题设置（缺省回退专题色/基础样式）；
+          // 边框色为无色哨兵时 stroke:false 不描边
+          stroke: !noStroke,
+          color: strokeColor,
           weight: pointStyle.weight || 2,
           opacity: pointStyle.opacity || 1,
-          fillOpacity: pointStyle.fillOpacity || 0.8
+          fillOpacity: thematicColor
+            ? (mapInfoLayer.thematicSettings?.fillOpacity ?? pointStyle.fillOpacity ?? 0.8)
+            : (pointStyle.fillOpacity || 0.8)
         })
       },
 
@@ -541,6 +667,13 @@ export class MapInfoLayer {
             weight: userLine.weight ?? featureStyle.strokeWidth ?? DEFAULT_STYLES.line.weight,
             opacity: userLine.opacity ?? featureStyle.strokeOpacity ?? DEFAULT_STYLES.line.opacity,
           }
+          // 要素级编辑样式优先于图层默认与图层级用户设置
+          const es = editStyleForKind(feature.properties, 'line')
+          if (es) {
+            if (es.color) mergedStyle.color = es.color
+            if (es.weight !== undefined) mergedStyle.weight = Number(es.weight)
+            if (es.opacity !== undefined) mergedStyle.opacity = Number(es.opacity)
+          }
 
           const result: any = {
             color: mergedStyle.color || '#8b5cf6',
@@ -556,8 +689,17 @@ export class MapInfoLayer {
           const thematicColor = mapInfoLayer._thematicColor(feature)
           if (thematicColor) {
             result.color = thematicColor
+            // 线无填充：图形透明度作用于线条透明度（边框颜色对线不适用）
+            if (typeof mapInfoLayer.thematicSettings?.fillOpacity === 'number') {
+              result.opacity = mapInfoLayer.thematicSettings.fillOpacity
+            }
           }
-          const lineDashArray = userLine.dashArray ?? featureStyle.strokeDasharray
+          // 线色为无色哨兵（图形颜色选"无色"）：整条线不绘制，color 置占位色避免非法值
+          if (result.color === NO_FILL_COLOR) {
+            result.stroke = false
+            result.color = DEFAULT_STYLES.line.color
+          }
+          const lineDashArray = (es as any)?.dashArray ?? userLine.dashArray ?? featureStyle.strokeDasharray
           if (lineDashArray) {
             result.dashArray = lineDashArray
           }
@@ -571,6 +713,14 @@ export class MapInfoLayer {
             opacity: userPolygon.opacity ?? featureStyle.strokeOpacity ?? DEFAULT_STYLES.polygon.opacity,
             fillColor: userPolygon.fillColor ?? featureStyle.fillColor ?? DEFAULT_STYLES.polygon.fillColor,
             fillOpacity: userPolygon.fillOpacity ?? featureStyle.fillOpacity ?? DEFAULT_STYLES.polygon.fillOpacity,
+          }
+          // 要素级编辑样式优先于图层默认与图层级用户设置
+          const esPoly = editStyleForKind(feature.properties, 'polygon')
+          if (esPoly) {
+            if (esPoly.fillColor) mergedStyle.fillColor = esPoly.fillColor
+            if (esPoly.fillOpacity !== undefined) mergedStyle.fillOpacity = Number(esPoly.fillOpacity)
+            if (esPoly.borderColor) mergedStyle.color = esPoly.borderColor
+            if (esPoly.borderWidth !== undefined) mergedStyle.weight = Number(esPoly.borderWidth)
           }
 
           // KML <fill>0</fill>（无填充）：文件声明无填充且用户未自定义时透明（仅显示边框）
@@ -590,10 +740,27 @@ export class MapInfoLayer {
           }
           const thematicColor = mapInfoLayer._thematicColor(feature)
           if (thematicColor) {
-            result.color = thematicColor
+            // 边框色：专题边框色优先；专题无色（镂空）且未设边框色时保留基础边框色
+            if (mapInfoLayer.thematicSettings?.borderColor) {
+              result.color = mapInfoLayer.thematicSettings.borderColor
+            } else if (thematicColor !== NO_FILL_COLOR) {
+              result.color = thematicColor
+            }
             result.fillColor = thematicColor
+            if (typeof mapInfoLayer.thematicSettings?.fillOpacity === 'number') {
+              result.fillOpacity = mapInfoLayer.thematicSettings.fillOpacity
+            }
           }
-          const polygonDashArray = userPolygon.dashArray ?? featureStyle.strokeDasharray
+          // 无色（镂空）：面不填充，仅显示边框
+          if (result.fillColor === NO_FILL_COLOR) {
+            result.fill = false
+          }
+          // 边框颜色为无色哨兵（基础/专题边框色选"无色"）：不描边，color 置占位色避免非法值
+          if (result.color === NO_FILL_COLOR) {
+            result.stroke = false
+            result.color = DEFAULT_STYLES.polygon.color
+          }
+          const polygonDashArray = (esPoly as any)?.borderDash ?? userPolygon.dashArray ?? featureStyle.strokeDasharray
           if (polygonDashArray) {
             result.dashArray = polygonDashArray
           }
@@ -611,24 +778,9 @@ export class MapInfoLayer {
         const naturalId = extractFeatureId(props)
         ;(leafletLayer as any)._nptSelectionId = naturalId || `${mapInfoLayer.id}#${featureSeq++}`
 
-        leafletLayer.on('click', (e: L.LeafletMouseEvent) => {
-          // 如果交互被禁用（如框选模式下），不处理点击，也不阻止事件冒泡
-          // 让事件继续传递，以便框选工具可以处理
-          if (!mapInfoLayer.isInteractive) {
-            return
-          }
-
-          // 阻止事件冒泡到地图
-          L.DomEvent.stopPropagation(e as any)
-
-          if (mapInfoLayer.onFeatureClickCallback) {
-            console.log('[MapInfoLayer] 🔍 要素点击触发:', mapInfoLayer.id, {
-              hasProperties: !!feature.properties,
-              propCount: feature.properties ? Object.keys(feature.properties).length : 0
-            })
-            mapInfoLayer.onFeatureClickCallback(feature.properties, e)
-          }
-        })
+        // 要素点击属性弹窗统一由地图 click 穿透所有图层检测处理（OnlineMap.handleMapClick），
+        // 不再逐要素绑定 click + stopPropagation —— 否则最上层 Canvas 图层吞掉点击后，
+        // 下层图层要素无法点选，重叠检测退化为只响应最上层图层。
       }
     }
 
@@ -705,19 +857,34 @@ export class MapInfoLayer {
     const thematicColor = this._thematicColor(layer.feature)
     if (layer instanceof L.CircleMarker) {
       if (thematicColor) {
-        // 专题启用：按图形大小设置更新半径（否则已渲染的点大小不变）
+        // 专题启用：按图形大小设置更新半径（否则已渲染的点大小不变）；
+        // 边框颜色/填充透明度用专题设置（缺省回退专题色/不透明）
+        const noFill = thematicColor === NO_FILL_COLOR
+        // 专题边框色：'none'（无色）→ 不描边；未设置时镂空回退基础边框色，否则用专题色
+        const tb = this.thematicSettings?.borderColor
+        const noStroke = tb === NO_FILL_COLOR
         layer.setStyle({
-          fillColor: thematicColor,
-          fillOpacity: 1,
-          color: thematicColor,
+          fill: !noFill,
+          fillColor: noFill ? '#f59e0b' : thematicColor,
+          fillOpacity: this.thematicSettings?.fillOpacity ?? 1,
+          stroke: !noStroke,
+          color: noStroke
+            ? '#000000'
+            : (tb || (noFill ? (this.style.point?.color || '#fff') : thematicColor)),
           opacity: 1,
           ...(this.thematicSettings?.pointSize ? { radius: this.thematicSettings.pointSize } : {})
         })
       } else {
+        const fillColor = this.style.point?.fillColor || '#f59e0b'
+        const noFill = fillColor === NO_FILL_COLOR
+        // 基础边框色为无色哨兵 → 不描边
+        const noStroke = this.style.point?.color === NO_FILL_COLOR
         layer.setStyle({
-          fillColor: this.style.point?.fillColor || '#f59e0b',
+          fill: !noFill,
+          fillColor: noFill ? '#f59e0b' : fillColor,
           fillOpacity: this.style.point?.fillOpacity ?? 0.8,
-          color: this.style.point?.color || '#fff',
+          stroke: !noStroke,
+          color: noStroke ? '#000000' : (this.style.point?.color || '#fff'),
           weight: this.style.point?.weight ?? 2,
           opacity: this.style.point?.opacity ?? 1,
           // 半径保留当前已渲染值（要素级 markerSize/专题点大小），无则用基础配置或默认值，
@@ -726,15 +893,23 @@ export class MapInfoLayer {
         })
       }
     } else if (layer instanceof L.Marker) {
-      // 点形状（L.marker + SVG 图标）：用新填充色重新生成图标
+      // 点形状（L.marker + SVG 图标）：用新填充色重新生成图标（无色镂空不适用图标，回退兜底色）
       const shapeName = resolvePointShape(layer.feature?.properties?._style?.markerSymbol)
       if (shapeName) {
         const curIcon: any = layer.options.icon
         const iconPx = (curIcon?.options?.iconSize && curIcon.options.iconSize[0]) || 24
+        // 基础配置"图形大小"（radius=半径）→ 形状图标直径 = radius*2（与专题图形大小逻辑一致）
+        const baseIconPx = (!thematicColor && typeof this.style.point?.radius === 'number')
+          ? this.style.point.radius * 2
+          : null
         const iconSize = (thematicColor && this.thematicSettings?.pointSize)
           ? this.thematicSettings.pointSize * 2
-          : iconPx
-        const color = thematicColor || (this.style.point as any)?.markerColor || this.style.point?.fillColor || '#f59e0b'
+          : (baseIconPx ?? iconPx)
+        const rawColor = thematicColor
+          || (this.style.point as any)?.markerColor
+          || this.style.point?.fillColor
+          || '#f59e0b'
+        const color = rawColor === NO_FILL_COLOR ? '#f59e0b' : rawColor
         layer.setIcon(L.icon({
           iconUrl: pointShapeIconDataUri(shapeName, color),
           iconSize: [iconSize, iconSize],
@@ -764,21 +939,27 @@ export class MapInfoLayer {
    * 设置图层颜色覆盖（图形颜色 / 透明度 / 边框宽度 / 边框颜色）
    * 写入 style 配置后重新应用样式，使已渲染要素即时生效。
    */
-  setStyleOverrides(settings: { fillColor: string; fillOpacity: number; borderWidth: number; borderColor: string }): void {
-    // 点样式：填充 + 边框
+  setStyleOverrides(settings: { fillColor: string; fillOpacity: number; borderWidth: number; borderColor: string; pointSize?: number }): void {
+    // 点样式：填充 + 边框；图形大小（点要素半径）覆盖到 radius
     this.style.point = {
       ...this.style.point,
       fillColor: settings.fillColor,
       fillOpacity: settings.fillOpacity,
       color: settings.borderColor,
       weight: settings.borderWidth,
-      opacity: 1
+      opacity: 1,
+      ...(typeof settings.pointSize === 'number' ? { radius: settings.pointSize } : {})
     }
 
-    // 线样式：无填充，透明度作用于描边
+    // 线样式：无填充，透明度作用于描边。
+    // 线状图层设置页只有"图形颜色/线宽/透明度"，线色取图形颜色（fillColor）；
+    // 兼容旧版本设置（旧版线色保存在 borderColor）：borderColor 为有效颜色时优先使用
+    const lineColor = settings.borderColor && settings.borderColor !== NO_FILL_COLOR
+      ? settings.borderColor
+      : settings.fillColor
     this.style.line = {
       ...this.style.line,
-      color: settings.borderColor,
+      color: lineColor,
       weight: settings.borderWidth,
       opacity: settings.fillOpacity
     }
@@ -890,10 +1071,47 @@ export class MapInfoLayer {
   }
 
   /**
-   * 设置是否允许交互 (满足需求3)
+   * 收集热力图点（后端 GeoJSON 坐标已转 GCJ02）：
+   * 点用自身坐标；线/面（含 Multi*）取全部顶点算术平均质心；权重非数值的要素跳过。
+   */
+  getHeatPoints(field: string): HeatPoint[] {
+    if (!this.geoJSONLayer || !field) return []
+    const points: HeatPoint[] = []
+    this.geoJSONLayer.eachLayer((layer: any) => {
+      const feature = layer?.feature as GeoJSON.Feature | undefined
+      if (!feature?.geometry || !feature.properties) return
+      const weight = toNumber(getFieldValue(feature.properties as Record<string, any>, field))
+      if (weight === null) return
+      const c = geometryCentroid(feature.geometry)
+      if (c) points.push({ lat: c.lat, lng: c.lng, weight })
+    })
+    return points
+  }
+
+  /**
+   * 设置是否允许交互（框选/测距模式下关闭）：
+   * 直接切换各要素 options.interactive —— Canvas 渲染器命中检测实时读取该选项，
+   * 关闭后要素不拦截鼠标事件，点击穿透到地图（供框选/测量工具使用），悬停 tooltip 也不弹出。
    */
   setInteractive(interactive: boolean): void {
-    this.isInteractive = interactive
+    this.geoJSONLayer?.eachLayer((layer: any) => {
+      if (layer.options) {
+        layer.options.interactive = interactive
+      }
+      if (!interactive && layer.closeTooltip) {
+        layer.closeTooltip()
+      }
+    })
+  }
+
+  /**
+   * 设置测距模式
+   * 测距时所有要素不参与 Canvas 命中检测（options.interactive=false），点击穿透到地图供测量加点。
+   * Canvas 渲染器在命中检测时实时读取 options.interactive，无需重绘。
+   * @param enabled 是否启用测距模式
+   */
+  setMeasureMode(enabled: boolean): void {
+    this.setInteractive(!enabled)
   }
 
   /**
@@ -930,8 +1148,10 @@ export class MapInfoLayer {
       // 更新样式
       if (layer instanceof L.Path) {
         if (isSelected) {
-          // 高亮样式：红色边框（保留当前填充色/专题配色）
+          // 高亮样式：红色边框（保留当前填充色/专题配色）；
+          // stroke:false（无色边框）要素需临时恢复描边，否则高亮不可见
           layer.setStyle({
+            stroke: true,
             color: '#ef4444',
             weight: 3,
             opacity: 1
@@ -969,14 +1189,36 @@ export class MapInfoLayer {
     this.labelsEnabled = visible
     if (IS_DEV) console.log('[MapInfoLayer] setLabelVisibility:', this.id, visible)
 
-    if (!this.currentMap) {
-      console.warn('[MapInfoLayer] 图层未添加到地图，无法显示标签')
-      return
-    }
-
     if (visible) {
-      this._createLabels(this.currentMap)
+      // 🔧 首次开启标签且尚无用户自定义字段时，自动挑选一个合适的默认标签字段，
+      // 使新导入的图层一开启标签即可显示要素名称（无需先进"自定义设置"保存）
+      if (!this.labelConfigCustomized) {
+        this._resolveDefaultLabelField()
+      }
+      if (this.currentMap || this.editLabelFeatures) {
+        // 标签候选注册不依赖图层在地图上：编辑态原图层已移除（currentMap=null），
+        // 标签改从编辑工作集注册，保证"标签开关打开后打开编辑开关"标签不消失
+        this._createLabels(this.currentMap)
+      }
+      // 图层尚未添加到地图时，addTo() 会在挂载时自动创建标签
     } else {
+      this._removeLabels()
+    }
+  }
+
+  /**
+   * 编辑态标签源覆盖：传入工作集要素时，标签候选改从工作集构建（与编辑会话渲染一致，
+   * 删除/新增/拖动的要素标签随工作集同步）；传入 null 恢复从图层自身数据构建。
+   * 仅在标签开关已开启时立即生效，否则仅记录，待 setLabelVisibility(true) 时应用。
+   */
+  setEditLabelSource(features: any[] | null): void {
+    this.editLabelFeatures = features
+    if (!this.labelManager) return
+    if (this.labelsEnabled && (features || this.currentMap)) {
+      // features 非空时图层可能已从地图移除（编辑态 currentMap=null），仍需注册工作集标签
+      this._createLabels(this.currentMap)
+    } else if (!features) {
+      // 图层不在地图上（currentMap=null）且无编辑源时不注册全量标签，避免隐藏图层残留标签
       this._removeLabels()
     }
   }
@@ -986,6 +1228,8 @@ export class MapInfoLayer {
    * @param config 标签配置
    */
   setLabelConfig(config: { content: string; color: string; fontSize: number }): void {
+    // 标记为用户显式保存过配置，后续不再自动挑选默认字段
+    this.labelConfigCustomized = true
     // 更新配置
     this.labelConfig = { ...this.labelConfig, ...config }
     if (IS_DEV) console.log('[MapInfoLayer] setLabelConfig:', this.id, this.labelConfig)
@@ -999,33 +1243,78 @@ export class MapInfoLayer {
   }
 
   /**
-   * 更新缩放级别并重绘标签
+   * 首次开启标签且无自定义字段时，自动挑选默认标签字段。
+   * 优先级：名称类候选字段（name/NAME/小区名称/LABEL/OBJNAM…）→ 首个非噪音字段；
+   * 均无则保持原默认 'name'（该字段不匹配时要素不显示标签，等待用户进设置选择）。
    */
-  updateZoom(zoom: number): void {
-    const oldZoom = this.currentZoom
-    this.currentZoom = zoom
+  private _resolveDefaultLabelField(): void {
+    if (!this.geoJSONLayer) return
 
-    // 如果缩放级别改变较大或者标签已开启，重新创建标签以应用碰撞检测
-    if (this.labelsEnabled && this.currentMap && Math.abs(oldZoom - zoom) >= 1) {
-      if (IS_DEV) console.log('[MapInfoLayer] Zoom changed, re-creating labels:', this.id, zoom)
-      this._createLabels(this.currentMap)
+    const present = new Map<string, boolean>()   // 字段名 → 是否有非空值
+    const orderedKeys: string[] = []
+    this.geoJSONLayer.eachLayer((layer: any) => {
+      const feature = layer.feature
+      const props = feature?.properties || {}
+      const nested = props.properties || props.attributes
+      const sources = nested && typeof nested === 'object' ? [props, nested] : [props]
+      for (const src of sources) {
+        if (!src || typeof src !== 'object') continue
+        for (const key of Object.keys(src)) {
+          const v = src[key]
+          if (v === undefined || v === null) continue
+          const s = String(v).trim()
+          if (!s) continue
+          if (!present.has(key)) {
+            present.set(key, true)
+            orderedKeys.push(key)
+          }
+        }
+      }
+    })
+    if (orderedKeys.length === 0) return
+
+    // 1) 名称类候选字段
+    for (const cand of NAME_LABEL_CANDIDATES) {
+      if (present.has(cand)) {
+        this.labelConfig = { ...this.labelConfig, content: cand }
+        if (IS_DEV) console.log('[MapInfoLayer] 自动选用名称类标签字段:', this.id, cand)
+        return
+      }
+    }
+    // 2) 首个非噪音字段
+    const fallback = orderedKeys.find((k) => !NOISE_LABEL_KEYS.has(k))
+    if (fallback) {
+      this.labelConfig = { ...this.labelConfig, content: fallback }
+      if (IS_DEV) console.log('[MapInfoLayer] 自动选用首个可用标签字段:', this.id, fallback)
     }
   }
 
   /**
-   * 创建标签
-   *
-   * 🔧 Canvas 化：复用 GeoDataCanvasLabelLayer（单 Canvas + 网格防重叠 + 视口裁剪 + rAF + move 自刷新）
-   * 移除 MAX_LABELS 上限与 DOM 全量重建，全部要素交给 Canvas 层处理防重叠与视口裁剪
+   * 更新缩放级别
+   * 标签布局由 LabelLayoutManager 在 zoomend 统一重排，此处仅记录缩放级别
    */
-  private _createLabels(map: L.Map): void {
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  updateZoom(_zoom: number): void {
+    // 标签布局由 LabelLayoutManager 在 zoomend 统一重排，无需图层自身处理
+  }
+
+  /**
+   * 同步标签候选到共享标签布局引擎
+   *
+   * 所有要素的标签候选（地理坐标 + 文本 + 样式）注册到 LabelLayoutManager，
+   * 由引擎按屏幕空间统一做矩形碰撞检测与避让，跨图层全局不重叠；
+   * 视口裁剪、地图移动/缩放后的显隐均由引擎处理。
+   */
+  private _createLabels(_map: L.Map | null): void {
+    if (!this.labelManager) return
+    // 编辑态：原图层隐藏后标签改从编辑工作集要素构建（与编辑会话渲染一致）
+    if (this.editLabelFeatures) {
+      this._createLabelsFromEditFeatures()
+      return
+    }
     if (!this.geoJSONLayer) return
 
-    // 移除旧标签
-    this._removeLabels()
-
-    // 收集全部要素标签（无数量上限，Canvas 层负责防重叠与视口裁剪）
-    const labelItems: CanvasLabelData[] = []
+    const candidates: LabelCandidate[] = []
     let index = 0
 
     this.geoJSONLayer.eachLayer((layer: any) => {
@@ -1044,51 +1333,113 @@ export class MapInfoLayer {
         }
         if (!latLng) return
 
-        // 获取标签内容（保留现有 _getLabelContent 逻辑，字段回退在 Task 2 加）
         const labelContent = this._getLabelContent(properties)
         if (!labelContent) return
 
-        labelItems.push({ index: index++, position: latLng, content: labelContent })
+        candidates.push({
+          id: String(layer._nptSelectionId || index),
+          lat: latLng.lat,
+          lng: latLng.lng,
+          text: labelContent,
+          fontSize: this.labelConfig.fontSize,
+          fontFamily: this.labelConfig.fontFamily,
+          bold: this.labelConfig.bold,
+          italic: this.labelConfig.italic,
+          shadow: this.labelConfig.shadow,
+          background: this.labelConfig.background,
+          backgroundColor: this.labelConfig.backgroundColor,
+          color: this.labelConfig.color
+        })
+        index++
       } catch (err) {
         // 静默忽略单个要素的错误
       }
     })
 
-    // 创建/复用 Canvas 标签层
-    if (!this.canvasLabelLayer) {
-      this.canvasLabelLayer = new GeoDataCanvasLabelLayer({
-        fontSize: this.labelConfig.fontSize,
-        fontColor: this.labelConfig.color
-      })
-    } else {
-      this.canvasLabelLayer.updateConfig({
-        fontSize: this.labelConfig.fontSize,
-        fontColor: this.labelConfig.color
-      })
-    }
-
-    // 🔧 必须先 addTo 再 setLabels：GeoDataCanvasLabelLayer.setLabels 在 this.map 为空时直接早退
-    // （this.map 由 addTo → onAdd 赋值），先 setLabels 会把标签全部丢弃
-    if (!map.hasLayer(this.canvasLabelLayer)) {
-      this.canvasLabelLayer.addTo(map)
-    }
-    this.canvasLabelLayer.setLabels(labelItems)
-    console.log(`[MapInfoLayer] ✅ 已创建 ${labelItems.length} 个 Canvas 标签`)
+    this.labelManager.setCandidates(this.labelSourceId, candidates)
+    if (IS_DEV) console.log(`[MapInfoLayer] 已注册 ${candidates.length} 个标签候选:`, this.id)
   }
 
   /**
-   * 移除所有标签
+   * 编辑态：从编辑工作集要素构建标签候选（GeoJSON 直接计算锚点，不依赖渲染层）。
+   * 锚点：点=坐标本身；线/面=外接矩形中心（与渲染层 getBounds().getCenter() 一致）。
    */
-  private _removeLabels(targetMap?: L.Map): void {
-    if (this.canvasLabelLayer) {
-      // 🔧 优先使用调用方传入的 map（remove() 场景 currentMap 可能已被置空/不匹配），
-      // 兜底用 currentMap，确保标签 canvas 总能从地图移除
-      const map = targetMap || this.currentMap
-      if (map && map.hasLayer(this.canvasLabelLayer)) {
-        map.removeLayer(this.canvasLabelLayer)
+  private _createLabelsFromEditFeatures(): void {
+    if (!this.labelManager) return
+
+    const candidates: LabelCandidate[] = []
+    let index = 0
+
+    for (const feature of this.editLabelFeatures!) {
+      try {
+        const properties = feature?.properties || {}
+        const anchor = this._labelAnchorFromGeometry(feature?.geometry)
+        if (!anchor) continue
+        const labelContent = this._getLabelContent(properties)
+        if (!labelContent) continue
+
+        candidates.push({
+          // 用编辑要素的稳定 _editId，拖动/重建后标签候选不闪烁
+          id: String(properties._editId || `edit-${index}`),
+          lat: anchor.lat,
+          lng: anchor.lng,
+          text: labelContent,
+          fontSize: this.labelConfig.fontSize,
+          fontFamily: this.labelConfig.fontFamily,
+          bold: this.labelConfig.bold,
+          italic: this.labelConfig.italic,
+          shadow: this.labelConfig.shadow,
+          background: this.labelConfig.background,
+          backgroundColor: this.labelConfig.backgroundColor,
+          color: this.labelConfig.color
+        })
+        index++
+      } catch (err) {
+        // 静默忽略单个要素的错误
       }
-      this.canvasLabelLayer = null
     }
+
+    this.labelManager.setCandidates(this.labelSourceId, candidates)
+  }
+
+  /** 从 GeoJSON 几何计算标签锚点（点=坐标；线/面=外接矩形中心） */
+  private _labelAnchorFromGeometry(geometry: any): { lat: number; lng: number } | null {
+    if (!geometry) return null
+
+    const coords = (geometry as any).coordinates
+    const type = (geometry as any).type
+    if (!coords) return null
+
+    const walk = (c: any): [number, number, number, number] | null => {
+      if (Array.isArray(c) && typeof c[0] === 'number' && typeof c[1] === 'number') {
+        return [c[0] as number, c[1] as number, c[0] as number, c[1] as number]
+      }
+      if (!Array.isArray(c) || c.length === 0) return null
+      let bbox: [number, number, number, number] | null = null
+      for (const child of c) {
+        const b = walk(child)
+        if (!b) continue
+        bbox = bbox
+          ? [Math.min(bbox[0], b[0]), Math.min(bbox[1], b[1]), Math.max(bbox[2], b[2]), Math.max(bbox[3], b[3])]
+          : b
+      }
+      return bbox
+    }
+
+    const bbox = walk(coords)
+    if (!bbox) return null
+    // GeoJSON 坐标为 [lng, lat]
+    if (type === 'Point') {
+      return { lat: bbox[1], lng: bbox[0] }
+    }
+    return { lat: (bbox[1] + bbox[3]) / 2, lng: (bbox[0] + bbox[2]) / 2 }
+  }
+
+  /**
+   * 移除所有标签（从共享布局引擎注销本层候选）
+   */
+  private _removeLabels(_targetMap?: L.Map): void {
+    this.labelManager?.removeSource(this.labelSourceId)
   }
 
   /**
@@ -1140,6 +1491,8 @@ export class MapInfoLayer {
 export class MapInfoLayerManager {
   private layers: Map<string, MapInfoLayer> = new Map()
   private map: L.Map | null = null
+  /** 共享标签布局引擎（所有图层的标签统一防重叠） */
+  private labelManager: LabelLayoutManager | null = null
 
   constructor() { }
 
@@ -1161,10 +1514,11 @@ export class MapInfoLayerManager {
   }
 
   /**
-   * 设置地图实例
+   * 设置地图实例（可同时注入共享标签布局引擎）
    */
-  setMap(map: L.Map): void {
+  setMap(map: L.Map, labelManager?: LabelLayoutManager | null): void {
     this.map = map
+    if (labelManager !== undefined) this.labelManager = labelManager
   }
 
   /**
@@ -1178,7 +1532,9 @@ export class MapInfoLayerManager {
       existing.remove(this.map)
     }
 
-    const layer = await MapInfoLayer.fromGeoJSON(options)
+    const layer = await MapInfoLayer.fromGeoJSON(
+      this.labelManager ? { ...options, labelManager: this.labelManager } : options
+    )
     if (IS_DEV) console.log('[MapInfoLayerManager] Adding layer:', layer.getId(), 'visible:', visible)
     this.layers.set(layer.getId(), layer)
 
@@ -1253,4 +1609,33 @@ export class MapInfoLayerManager {
     }
     this.layers.clear()
   }
+}
+
+/**
+ * GeoJSON 几何质心（全部顶点算术平均，兼容 Point/Line/Polygon 及 Multi*）
+ * 坐标为 GeoJSON 序 [lng, lat]（后端已转 GCJ02）。
+ */
+function geometryCentroid(geometry: GeoJSON.Geometry): { lat: number; lng: number } | null {
+  const positions: [number, number][] = []
+  const walk = (node: any): void => {
+    if (!Array.isArray(node) || node.length === 0) return
+    if (typeof node[0] === 'number') {
+      positions.push([node[0], node[1]])
+      return
+    }
+    for (const child of node) walk(child)
+  }
+  // GeoJSON.Geometry 是含 GeometryCollection 的 union，坐标统一按 any 递归取值
+  walk((geometry as any).coordinates)
+  let lngSum = 0
+  let latSum = 0
+  let n = 0
+  for (const [lng, lat] of positions) {
+    if (!Number.isFinite(lng) || !Number.isFinite(lat)) continue
+    lngSum += lng
+    latSum += lat
+    n++
+  }
+  if (n === 0) return null
+  return { lat: latSum / n, lng: lngSum / n }
 }

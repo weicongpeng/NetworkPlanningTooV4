@@ -747,6 +747,54 @@ def test_mapinfo_field_name_dedupe(service, tmp_path):
     assert len(fields) == len(set(fields)) == 3
 
 
+def test_mapinfo_field_name_leading_digit_prefixed(service, tmp_path):
+    """数字开头列名（5G侧流量GB1/4G基站ID）→ 补 '_' 前缀后写 TAB。
+
+    根因：MapInfo 用表达式解析器读 .tab 字段定义行，数字开头的名字被当作数字字面量，
+    打开表时报 "Expression does not evaluate to a column or table name."。
+    """
+    path = tmp_path / "5gr.xlsx"
+    df = pd.DataFrame({
+        "DU物理小区名称": ["A"], "5G侧流量GB1": [1.5], "4G基站ID": ["1001"],
+        "经度": [116.4], "纬度": [39.9],
+    })
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name="小区指标", index=False)
+    out, _ = service.generate_point_layer(
+        file_path=str(path), sheet_name="小区指标",
+        name_col="DU物理小区名称", lon_col="经度", lat_col="纬度",
+        attributes=["DU物理小区名称", "5G侧流量GB1", "4G基站ID"], output_format="tab",
+    )
+    import geopandas as gpd
+    gdf = gpd.read_file(out)  # 修复前：MapInfo 打不开（GDAL 读回仍正常，故断言列名）
+    assert "_5G侧流量GB1" in gdf.columns
+    assert "_4G基站ID" in gdf.columns
+    tab = out.read_text(encoding="gbk", errors="replace")
+    assert "  _5G侧流量GB1 Float ;" in tab
+    assert "  _4G基站ID " in tab
+    assert "\n    5G侧流量GB1 " not in tab   # 绝不保留数字开头字段名
+
+
+def test_mapinfo_field_name_symbol_only_falls_back(service, tmp_path):
+    """清洗后为空（列名只有符号 %）→ 回退 Field{序号}，不写出无名字段行"""
+    path = tmp_path / "sym.xlsx"
+    df = pd.DataFrame({
+        "小区名": ["A"], "(%)": ["x"], "经度": [116.4], "纬度": [39.9],
+    })
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name="S", index=False)
+    out, _ = service.generate_point_layer(
+        file_path=str(path), sheet_name="S",
+        name_col="小区名", lon_col="经度", lat_col="纬度",
+        attributes=["小区名", "(%)"], output_format="tab",
+    )
+    import geopandas as gpd
+    gdf = gpd.read_file(out)
+    assert "Field2" in gdf.columns       # 第二个属性列，序号从 1 起
+    tab = out.read_text(encoding="gbk", errors="replace")
+    assert "   Float ;" not in tab       # 无空字段名行
+
+
 def test_cleanup_old_outputs_removes_history(tmp_path):
     """_cleanup_old_outputs 删除同 base 历史输出（含 -1/-2 后缀），保留其它 base"""
     svc = LayerService(output_dir=tmp_path)

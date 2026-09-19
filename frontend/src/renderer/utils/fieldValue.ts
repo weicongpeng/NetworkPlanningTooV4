@@ -60,6 +60,13 @@ export function toNumber(v: any): number | null {
 export const THEMATIC_FALLBACK_COLOR = '#000000'
 
 /**
+ * 无色哨兵：
+ * - 填充色为该值时，面/点要素不填充（fill:false），仅显示边框；
+ * - 边框色为该值时，要素不描边（stroke:false），点/面图层默认值。
+ */
+export const NO_FILL_COLOR = 'none'
+
+/**
  * 属性值配色极限（唯一值不多于该数量时全量配色；超过后其余未分配的值渲染为黑色）
  */
 export const THEMATIC_VALUE_LIMIT = 1800
@@ -71,6 +78,11 @@ export interface FieldValueSample {
   v: any      // 字段值
   lat: number // 该值要素的质心纬度
   lng: number // 该值要素的质心经度
+  /**
+   * 该取值在原始数据中的出现次数（样本按值去重，故需次数还原真实分布）。
+   * 热力图预览用它做加权分位，使预览与地图使用的全量点分布一致
+   */
+  count?: number
 }
 
 /**

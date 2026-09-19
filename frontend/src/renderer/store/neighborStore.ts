@@ -9,6 +9,12 @@ interface NeighborConfig {
   maxNeighbors: number
   coverageDistanceFactor: number
   coverageRadiusFactor: number
+  denseSpacingThreshold?: number
+  denseMultiplier?: number
+  outdoorToIndoorMaxDistance?: number
+  indoorToIndoorRadius?: number
+  indoorToOutdoorMultiplier?: number
+  outdoorSpacingSiteCount?: number
 }
 
 interface NeighborState {
@@ -29,8 +35,14 @@ interface NeighborState {
 const defaultConfig: NeighborConfig = {
   planningType: 'LTE-LTE',
   maxNeighbors: 64,
-  coverageDistanceFactor: 1.0,
-  coverageRadiusFactor: 1.0,
+  coverageDistanceFactor: 0.5,
+  coverageRadiusFactor: 0.5,
+  denseSpacingThreshold: 1.0,
+  denseMultiplier: 1.3,
+  outdoorToIndoorMaxDistance: 0.6,
+  indoorToIndoorRadius: 0.35,
+  indoorToOutdoorMultiplier: 1.5,
+  outdoorSpacingSiteCount: 9,
 }
 
 export const useNeighborStore = create<NeighborState>()(

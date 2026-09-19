@@ -1,15 +1,19 @@
 import { useEffect, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { AlertCircle, ShieldAlert } from 'lucide-react'
+import { AlertCircle, ShieldAlert, ShieldX } from 'lucide-react'
+import { useTranslation } from 'react-i18next'
 import { useLicenseStore } from '../store/licenseStore'
 import { useAuthStore } from '../store/authStore'
 
 interface ProtectedRouteProps {
   children: React.ReactNode
   requireAdmin?: boolean
+  /** 细粒度功能权限（管理员自动通过），如 'can_assistant' */
+  requirePermission?: 'can_assistant'
 }
 
-export function ProtectedRoute({ children, requireAdmin = false }: ProtectedRouteProps) {
+export function ProtectedRoute({ children, requireAdmin = false, requirePermission }: ProtectedRouteProps) {
+  const { t } = useTranslation()
   const perfRef = useRef(performance.now())
   const navigate = useNavigate()
   const { isAuthorized, isLoading, remainingDays, errorMessage, setFromUser } = useLicenseStore()
@@ -56,6 +60,33 @@ export function ProtectedRoute({ children, requireAdmin = false }: ProtectedRout
             className="w-full px-6 py-3 bg-primary text-primary-foreground rounded-lg hover:opacity-90 transition-opacity font-medium"
           >
             返回首页
+          </button>
+        </div>
+      </div>
+    )
+  }
+
+  // 功能权限检查（管理员自动拥有全部权限）
+  if (requirePermission && !user.is_admin && !user[requirePermission]) {
+    return (
+      <div className="flex items-center justify-center min-h-screen bg-background">
+        <div className="max-w-md w-full p-8 space-y-6">
+          <div className="flex justify-center">
+            <div className="p-4 bg-red-500/10 rounded-full">
+              <ShieldX size={48} className="text-red-500" />
+            </div>
+          </div>
+          <div className="text-center space-y-2">
+            <h1 className="text-2xl font-bold text-foreground">{t('auth.noPermissionTitle', '无访问权限')}</h1>
+            <p className="text-muted-foreground">
+              {t('auth.noPermissionDesc', '您没有该功能的访问权限，请联系管理员开通。')}
+            </p>
+          </div>
+          <button
+            onClick={() => navigate('/')}
+            className="w-full px-6 py-3 bg-primary text-primary-foreground rounded-lg hover:opacity-90 transition-opacity font-medium"
+          >
+            {t('auth.backHome', '返回首页')}
           </button>
         </div>
       </div>

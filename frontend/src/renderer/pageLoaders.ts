@@ -52,6 +52,9 @@ export function prefetchPage(href: string) {
     case '/map': loadMapPage(); break
     case '/admin/users': loadAdminUsersPage(); break
     case '/app-versions': loadAppVersionsPage(); break
+    case '/assistant': loadAssistantPage(); break
     default: break
   }
 }
+export const loadAssistantPage = () => import('./pages/AssistantPage').then(m => ({ default: m.AssistantPage }))
+export const AssistantPageLazy = lazy(loadAssistantPage)

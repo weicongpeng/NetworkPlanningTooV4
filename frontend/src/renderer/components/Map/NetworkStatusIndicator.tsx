@@ -8,6 +8,7 @@
  */
 import { useState, useEffect, useCallback } from 'react'
 import { Wifi, WifiOff, RefreshCw, X, ChevronDown, ChevronUp, AlertCircle, Activity } from 'lucide-react'
+import { getStoredAuthToken } from '../../services/api'
 
 /**
  * 网络状态类型
@@ -89,11 +90,15 @@ export const NetworkStatusIndicator = ({
       if (healthResponse?.ok) {
         newDiagnostics.backendAvailable = true
 
-        // 尝试检查地图数据API
+        // 尝试检查地图数据API（需携带登录 token）
         try {
+          const diagHeaders: Record<string, string> = {}
+          const diagToken = getStoredAuthToken()
+          if (diagToken) diagHeaders.Authorization = `Bearer ${diagToken}`
           const mapResponse = await fetch('/api/v1/map/data', {
             method: 'GET',
-            cache: 'no-store'
+            cache: 'no-store',
+            headers: diagHeaders
           }).catch(() => null)
           newDiagnostics.mapServiceAvailable = mapResponse?.ok || false
         } catch (e) {

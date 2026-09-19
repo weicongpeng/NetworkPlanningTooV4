@@ -125,8 +125,8 @@ export default function DistanceMatchPage() {
         if (initialShared.fullDataId && items.some((d: any) => d.id === initialShared.fullDataId)) {
           setFullDataId(initialShared.fullDataId)
         } else {
-          const full = items.find((d: any) => (d.name || '').toLowerCase().includes('projectparameter_mongoose'))
-          setFullDataId(full?.id || items[0]?.id || '')
+          // items 已按 fileType==='full_params' 过滤，直接取第一条即可
+          setFullDataId(items[0]?.id || '')
         }
       }
     }).catch(() => setError(t('distanceMatch.loadDataErr') || '加载数据列表失败'))
@@ -404,21 +404,21 @@ export default function DistanceMatchPage() {
 
       {/* 错误提示 */}
       {error && (
-        <div className="mb-6 p-4 bg-red-50 border border-red-200 rounded-lg text-xs text-red-600 flex items-start gap-2">
+        <div className="mb-6 p-4 bg-red-500/10 border border-red-500/20 rounded-lg text-xs text-red-600 flex items-start gap-2">
           <AlertCircle size={14} className="mt-0.5 shrink-0" /> {error}
         </div>
       )}
 
       {/* 校验错误明细 */}
       {parseErrors.length > 0 && (
-        <div className="mb-6 p-4 bg-amber-50 border border-amber-200 rounded-lg text-xs">
-          <p className="text-amber-700 font-medium mb-2 flex items-center gap-1">
+        <div className="mb-6 p-4 bg-amber-500/10 border border-amber-500/20 rounded-lg text-xs">
+          <p className="text-amber-400 font-medium mb-2 flex items-center gap-1">
             <AlertCircle size={14} /> {t('distanceMatch.invalidData')}
           </p>
           <div className="max-h-40 overflow-y-auto">
             <table className="w-full text-left">
-              <thead className="sticky top-0 bg-amber-50">
-                <tr className="border-b border-amber-200">
+              <thead className="sticky top-0 bg-amber-500/10">
+                <tr className="border-b border-amber-500/20">
                   <th className="px-2 py-1 font-medium">{t('distanceMatch.sheet')}</th>
                   <th className="px-2 py-1 font-medium">{t('distanceMatch.row')}</th>
                   <th className="px-2 py-1 font-medium">{t('distanceMatch.reason')}</th>

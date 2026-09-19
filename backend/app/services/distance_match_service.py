@@ -9,6 +9,7 @@ import pandas as pd
 from openpyxl import Workbook
 
 from app.core.config import settings
+from app.utils.excel_columns import dedupe_column_names
 
 # 输出列名（固定，含备注）
 OUTPUT_COLUMNS = [
@@ -135,10 +136,13 @@ def read_arbitrary_sheet(
         col_str = str(col).strip() if pd.notna(col) else ""
         if "\n" in col_str:
             is_complex = True
-            # 提取第一个 \n 之前的中文名称（与 data_service._parse_full_params_sheet 一致）
-            clean_columns.append(col_str.split("\n")[0].strip())
+            # 取第一个非空行作为列名（与 data_service._parse_full_params_sheet 一致）
+            first_line = next((line.strip() for line in col_str.split("\n") if line.strip()), "")
+            clean_columns.append(first_line)
         else:
             clean_columns.append(col_str)
+    # 去重：同名列（如 NR 表两列都叫「小区名称」）会让 df[[name_col, ...]] 选出多余列
+    clean_columns = dedupe_column_names(clean_columns)
 
     if is_complex:
         # 复杂表头通常占 3 行（第 4 行起是数据）

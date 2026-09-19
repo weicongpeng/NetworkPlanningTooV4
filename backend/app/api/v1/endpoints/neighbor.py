@@ -7,6 +7,7 @@ from datetime import datetime
 from app.models.schemas import NeighborConfig, NeighborResult
 from app.services.task_manager import task_manager
 from app.core.security import get_current_user
+from app.core.data_access import require_task_access
 
 router = APIRouter()
 
@@ -41,7 +42,7 @@ async def start_neighbor_planning(
 
 
 @router.get("/progress/{task_id}", response_model=Dict[str, Any])
-async def get_neighbor_progress(task_id: str) -> Dict[str, Any]:
+async def get_neighbor_progress(task_id: str, _group=Depends(require_task_access)) -> Dict[str, Any]:
     """获取邻区规划进度"""
     try:
         progress = task_manager.get_task_progress(task_id)
@@ -58,7 +59,7 @@ async def get_neighbor_progress(task_id: str) -> Dict[str, Any]:
 
 
 @router.get("/result/{task_id}", response_model=Dict[str, Any])
-async def get_neighbor_result(task_id: str) -> Dict[str, Any]:
+async def get_neighbor_result(task_id: str, _group=Depends(require_task_access)) -> Dict[str, Any]:
     """获取邻区规划结果"""
     try:
         result = task_manager.get_task_result(task_id)
@@ -75,7 +76,7 @@ async def get_neighbor_result(task_id: str) -> Dict[str, Any]:
 
 
 @router.delete("/history/{task_id}", response_model=Dict[str, Any])
-async def delete_neighbor_history(task_id: str) -> Dict[str, Any]:
+async def delete_neighbor_history(task_id: str, _group=Depends(require_task_access)) -> Dict[str, Any]:
     """删除指定的邻区规划历史任务"""
     try:
         success = task_manager.delete_task(task_id)
@@ -93,17 +94,18 @@ async def delete_neighbor_history(task_id: str) -> Dict[str, Any]:
 async def get_neighbor_history(
     page: int = Query(1, ge=1, description="页码（从 1 开始）"),
     page_size: int = Query(20, ge=1, le=100, description="每页条数"),
+    current_user=Depends(get_current_user),
 ) -> Dict[str, Any]:
-    """获取所有用户的邻区规划历史任务列表（分页）"""
+    """获取邻区规划历史任务列表（分页，按地市+运营商组隔离）"""
     try:
-        results = task_manager.list_task_history(task_type="neighbor", page=page, page_size=page_size)
+        results = task_manager.list_task_history(task_type="neighbor", page=page, page_size=page_size, user=current_user)
         return {"success": True, "data": results}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/export/{task_id}")
-async def export_neighbor_result(task_id: str, format: str = "xlsx"):
+async def export_neighbor_result(task_id: str, format: str = "xlsx", _group=Depends(require_task_access)):
     """导出邻区规划结果"""
     try:
         from fastapi.responses import FileResponse
@@ -125,7 +127,7 @@ async def export_neighbor_result(task_id: str, format: str = "xlsx"):
 
 
 @router.delete("/task/{task_id}", response_model=Dict[str, Any])
-async def cancel_neighbor_task(task_id: str) -> Dict[str, Any]:
+async def cancel_neighbor_task(task_id: str, _group=Depends(require_task_access)) -> Dict[str, Any]:
     """取消邻区规划任务"""
     try:
         result = task_manager.cancel_task(task_id)

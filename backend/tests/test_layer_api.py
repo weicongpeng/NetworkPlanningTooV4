@@ -1,6 +1,8 @@
 """
 图层制作 API 端点测试
 """
+from types import SimpleNamespace
+
 import pandas as pd
 import tempfile
 import os
@@ -40,9 +42,11 @@ def _tmp_leaks() -> list:
 
 
 def _make_client():
-    """创建 TestClient 并绕过权限校验（require_data_import → 通过）"""
+    """创建 TestClient 并绕过权限校验（require_data_import → 通过；组门禁同步跳过）"""
     app = create_app()
-    app.dependency_overrides[require_data_import] = lambda: None
+    app.dependency_overrides[require_data_import] = lambda: SimpleNamespace(id=1)
+    from app.core.data_access import require_data_group_access
+    app.dependency_overrides[require_data_group_access] = lambda: SimpleNamespace(id=1, city=None, operator=None, is_admin=True)
     return TestClient(app)
 
 

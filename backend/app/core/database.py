@@ -65,6 +65,8 @@ def init_db():
             ("can_data_delete", "ALTER TABLE users ADD COLUMN can_data_delete BOOLEAN NOT NULL DEFAULT 0"),
             ("can_data_update", "ALTER TABLE users ADD COLUMN can_data_update BOOLEAN NOT NULL DEFAULT 0"),
             ("can_cell_entry", "ALTER TABLE users ADD COLUMN can_cell_entry BOOLEAN NOT NULL DEFAULT 0"),
+            ("can_cell_query_update", "ALTER TABLE users ADD COLUMN can_cell_query_update BOOLEAN NOT NULL DEFAULT 0"),
+            ("can_assistant", "ALTER TABLE users ADD COLUMN can_assistant BOOLEAN NOT NULL DEFAULT 0"),
         ]
         for col_name, sql in migrations:
             table_name = "user_sessions" if "user_sessions" in sql else "users"
@@ -96,7 +98,142 @@ def init_db():
         av_cols = [row[1] for row in conn.exec_driver_sql("PRAGMA table_info(app_versions)").fetchall()]
         if av_cols and "download_count" not in av_cols:
             conn.exec_driver_sql("ALTER TABLE app_versions ADD COLUMN download_count INTEGER DEFAULT 0")
+
+        # 迁移：数据按（地市+运营商）分组隔离 —— 各业务表添加组归属列
+        # 存量行保持 NULL = 仅管理员可见；新数据写入时由上传者/工参所属组盖章
+        for table in (
+            "workbooks", "sites", "sectors", "geo_files", "layers",
+            "station_param_rows", "station_metric_rows", "task_results",
+        ):
+            table_cols = [row[1] for row in conn.exec_driver_sql(f"PRAGMA table_info({table})").fetchall()]
+            if not table_cols:
+                continue
+            if "city" not in table_cols:
+                conn.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN city VARCHAR(100)")
+            if "operator" not in table_cols:
+                conn.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN operator VARCHAR(50)")
         conn.commit()
+
+    # 存量无组数据一次性迁移：归入主管理员所在组（幂等，仅 city IS NULL 的行）
+    _migrate_legacy_data_groups()
+
+    # 误归组任务一次性纠正（幂等）：任务创建未盖章期间产生的 NULL 组任务被上一步
+    # 误归主管理员组，此处按创建人（user_name）的归属组重盖章，恢复组隔离
+    _fix_misattributed_task_groups()
+
+
+def _migrate_legacy_data_groups():
+    """存量无组数据一次性迁移：归入主管理员（id 最小、组齐全的管理员）所在组。
+
+    背景：可见性规则已改为「所有用户（含管理员）一律按组隔离」，NULL 组数据
+    将对所有人不可见，因此启动时把存量 NULL 组数据盖章为主管理员组（幂等）。
+    """
+    import logging
+    _logger = logging.getLogger(__name__)
+    try:
+        from app.models.database import User
+
+        db = SessionLocal()
+        try:
+            admin = (db.query(User)
+                     .filter(User.is_admin == True,  # noqa: E712
+                             User.city.isnot(None), User.city != "",
+                             User.operator.isnot(None), User.operator != "")
+                     .order_by(User.id.asc())
+                     .first())
+        finally:
+            db.close()
+        if admin is None:
+            _logger.warning("[组迁移] 未找到组信息齐全的管理员，跳过存量数据组迁移")
+            return {"migrated": 0}
+
+        city, operator = admin.city, admin.operator
+        total = 0
+        with engine.begin() as conn:
+            for table in (
+                "workbooks", "sites", "sectors", "geo_files", "layers",
+                "station_param_rows", "station_metric_rows", "task_results",
+            ):
+                result = conn.exec_driver_sql(
+                    f"UPDATE {table} SET city = ?, operator = ? WHERE city IS NULL",
+                    (city, operator),
+                )
+                total += result.rowcount
+
+        # 内存索引条目同步盖章（index.json 中缺组键/空组的存量条目）
+        stamped = 0
+        try:
+            from app.services.data_service import data_service
+            for entry in data_service.index.values():
+                if not entry.get("city") or not entry.get("operator"):
+                    entry["city"] = city
+                    entry["operator"] = operator
+                    stamped += 1
+            if stamped:
+                data_service._save_index()
+        except Exception as e:
+            _logger.warning(f"[组迁移] 索引条目盖章失败（不影响 SQLite 迁移）: {e}")
+
+        if total or stamped:
+            _logger.info(f"[组迁移] 存量无组数据已归入 ({city}, {operator}) 组: "
+                         f"SQLite {total} 行, 索引条目 {stamped} 个")
+        return {"migrated": total, "stamped": stamped}
+    except Exception as e:
+        _logger.warning(f"[组迁移] 执行失败（不影响启动）: {e}")
+        return {"migrated": 0}
+
+
+def _fix_misattributed_task_groups():
+    """纠正误归组的任务结果行（幂等）。
+
+    背景：任务创建端点曾长期不盖（地市+运营商）章，TaskResult 行组为 NULL，
+    被 _migrate_legacy_data_groups 误归主管理员组，表现为：
+    - 任务创建人刷新后历史任务"清空"（组过滤查不到自己的任务）
+    - 主管理员组能看到其他组用户的任务（跨组串数据）
+    纠正规则：task_results 中行组 == 主管理员组、且 user_name 对应用户组齐全、
+    且用户组 ≠ 行组的行，按创建人组重盖章。主管理员本人创建的行组一致不受影响。
+    """
+    import logging
+    _logger = logging.getLogger(__name__)
+    try:
+        from app.models.database import User, TaskResult
+
+        db = SessionLocal()
+        try:
+            admin = (db.query(User)
+                     .filter(User.is_admin == True,  # noqa: E712
+                             User.city.isnot(None), User.city != "",
+                             User.operator.isnot(None), User.operator != "")
+                     .order_by(User.id.asc())
+                     .first())
+            if admin is None:
+                return {"fixed": 0}
+
+            # 行组 == 主管理员组，但创建人属于其他（齐全）组的任务行
+            rows = (db.query(TaskResult, User)
+                    .join(User, TaskResult.user_name == User.username)
+                    .filter(
+                        TaskResult.city == admin.city,
+                        TaskResult.operator == admin.operator,
+                        User.city.isnot(None), User.city != "",
+                        User.operator.isnot(None), User.operator != "",
+                        ((User.city != admin.city) | (User.operator != admin.operator)),
+                    )
+                    .all())
+            fixed = 0
+            for tr, u in rows:
+                tr.city = u.city
+                tr.operator = u.operator
+                fixed += 1
+            if fixed:
+                db.commit()
+                _logger.info(f"[组迁移] 误归组任务已按创建人重盖章 {fixed} 行")
+            return {"fixed": fixed}
+        finally:
+            db.close()
+    except Exception as e:
+        _logger.warning(f"[组迁移] 误归组任务纠正失败（不影响启动）: {e}")
+        return {"fixed": 0}
 
 
 def _migrate_users_db():

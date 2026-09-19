@@ -225,7 +225,7 @@ export function TaskConfigPage() {
 
       {/* Error */}
       {error && (
-        <div className="mb-4 p-3 bg-red-50 border border-red-200 rounded-lg flex items-center gap-3 text-red-700 shrink-0">
+        <div className="mb-4 p-3 bg-red-500/10 border border-red-500/20 rounded-lg flex items-center gap-3 text-red-400 shrink-0">
           <AlertCircle size={18} />
           <span className="text-sm">{error}</span>
           <button onClick={() => setError(null)} className="ml-auto text-sm underline">关闭</button>
@@ -359,7 +359,7 @@ export function TaskConfigPage() {
             </div>
             <div className="px-3 py-2 bg-blue-500/5 border border-blue-500/20 rounded-lg">
               <p className="text-[10px] leading-relaxed">• 需导入TAC图层(4G_TAC.zip/5G_TAC.zip)</p>
-              <p className="text-[10px] leading-relaxed">• 需导入全量工参(ProjectParameter_mongoose)</p>
+              <p className="text-[10px] leading-relaxed">• 需导入全量工参(ProjectParameter)</p>
             </div>
           </div>
         )}

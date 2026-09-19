@@ -16,6 +16,7 @@ import type {
   ChangePasswordRequest,
   ResetPasswordRequest,
   TokenResponse,
+  RegisterOptions,
   UserInfo,
   UserListResponse,
   UserUpdateRequest,
@@ -33,6 +34,21 @@ const DEV_BACKEND_URL = import.meta.env.VITE_API_URL || `${window.location.proto
 const isDev = import.meta.env.DEV
 
 console.log('[API] Environment:', { isDev, API_BASE_URL, DEV_BACKEND_URL })
+
+/**
+ * 从 auth-storage 读取当前登录 token（axios 拦截器之外的原生 fetch 请求用）。
+ * 上传/下载类请求走原生 fetch，必须显式携带，否则后端要求登录的端点返回 401。
+ */
+export function getStoredAuthToken(): string | null {
+  try {
+    const stored = localStorage.getItem('auth-storage')
+    if (!stored) return null
+    const parsed = JSON.parse(stored)
+    return parsed?.state?.token || null
+  } catch {
+    return null
+  }
+}
 
 // 创建axios实例
 const apiClient = axios.create({
@@ -113,6 +129,10 @@ apiClient.interceptors.response.use(
     // 对于二进制响应类型，直接返回完整的响应对象
     // 因为此时response.data已经是Blob或ArrayBuffer对象，不需要再解包
     if (response.request.responseType === 'blob' || response.request.responseType === 'arraybuffer') {
+      return response
+    }
+    // 显式声明 _returnFullResponse 的请求同样返回完整响应（用于读取 ETag 等响应头，如图层版本指纹）
+    if ((response.config as any)?._returnFullResponse) {
       return response
     }
     // 对于其他响应类型，返回response.data
@@ -460,28 +480,30 @@ async function chunkedUpload(
     while (Date.now() - startTime < maxWait) {
       await new Promise(r => setTimeout(r, pollInterval))
 
+      let found: any = null
       try {
         // 使用 /data/list 轮询（Cloudflare Tunnel 下比 /data/{id} 更稳定）
         // 传入 cacheBust=true 避免浏览器缓存
         const listResult: any = await apiClient.get('/data/list?page=1&page_size=100&_t=' + Date.now())
         const items = listResult?.data || listResult || []
-        const found = Array.isArray(items) ? items.find((item: any) => item.id === pollDataId) : null
-
-        if (found) {
-          if (found.status === 'ready') {
-            console.log('[chunkedUpload] 后台处理完成:', pollDataId)
-            result.data.status = 'ready'
-            result.data.fileType = found.fileType
-            break
-          } else if (found.status === 'error') {
-            console.error('[chunkedUpload] 后台处理失败:', pollDataId)
-            throw new Error(found.errorMessage || '文件处理失败')
-          }
-        }
+        found = Array.isArray(items) ? items.find((item: any) => item.id === pollDataId) : null
       } catch (pollErr: any) {
         // 502 等错误时等待稍长再重试，避免频繁请求压垮后端
         console.warn('[chunkedUpload] 轮询出错（2s后重试）:', pollErr?.message || pollErr)
         await new Promise(r => setTimeout(r, 2000))
+        continue
+      }
+
+      // 后台处理结果必须在 try 之外判断：失败要抛出真实原因，不能被上面的 catch 当成网络错误吞掉重试
+      if (found?.status === 'ready') {
+        console.log('[chunkedUpload] 后台处理完成:', pollDataId)
+        result.data.status = 'ready'
+        result.data.fileType = found.fileType
+        break
+      }
+      if (found?.status === 'error') {
+        console.error('[chunkedUpload] 后台处理失败:', pollDataId, found.errorMessage)
+        throw new Error(found.errorMessage || '文件处理失败')
       }
     }
 
@@ -578,9 +600,13 @@ export const dataApi = {
       try {
         console.log(`[uploadMap] Sending fetch request to: ${url} (attempt ${attempt + 1})`)
 
+        const uploadHeaders: Record<string, string> = {}
+        const uploadToken = getStoredAuthToken()
+        if (uploadToken) uploadHeaders.Authorization = `Bearer ${uploadToken}`
         const response = await fetch(url, {
           method: 'POST',
           body: formData,
+          headers: uploadHeaders,
         })
 
         console.log('[uploadMap] Response status:', response.status)
@@ -691,7 +717,7 @@ export const dataApi = {
     // 直接根据templateType设置文件名
     let filename = 'template.xlsx'
     if (templateType === 'full_params') {
-      filename = 'ProjectParameter_mongoose.xlsx'
+      filename = 'ProjectParameter.xlsx'
     } else if (templateType === 'target_cells') {
       filename = 'cell-tree-export.xlsx'
     }
@@ -769,6 +795,7 @@ export const dataApi = {
     mnc?: string
     longitude: number
     latitude: number
+    height?: number
     azimuth: number
     frequency?: string
     ssbFrequency?: string
@@ -777,8 +804,8 @@ export const dataApi = {
     return apiClient.post('/data/full-params/cells/batch', { cells })
   },
 
-  // 批量查重：按制式检查 CGI (siteId_cellId) 是否已存在于数据库
-  checkCellDuplicates: async (cells: Array<{ siteId: string; cellId: string; networkType?: 'LTE' | 'NR' }>): Promise<ApiResponse<{ duplicates: string[]; exists: Record<string, { lte: boolean; nr: boolean }> }>> => {
+  // 批量查重：LTE 按 基站_小区、NR 按 MCC_MNC_基站_小区 检查是否已存在于数据库
+  checkCellDuplicates: async (cells: Array<{ siteId: string; cellId: string; networkType?: 'LTE' | 'NR'; mcc?: string; mnc?: string }>): Promise<ApiResponse<{ duplicates: string[]; exists: Record<string, { lte: boolean; nr: boolean }> }>> => {
     return apiClient.post('/data/full-params/cells/check-duplicates', { cells })
   },
 
@@ -1029,6 +1056,20 @@ export const mapApi = {
   }
 }
 
+/**
+ * 文本 gzip 压缩（浏览器 CompressionStream，无需第三方库）。
+ * 用于大图层保存请求体压缩；环境不支持或压缩失败时返回 null（调用方回退明文请求）。
+ */
+async function gzipText(text: string): Promise<Uint8Array | null> {
+  if (typeof CompressionStream === 'undefined') return null
+  try {
+    const stream = new Blob([text]).stream().pipeThrough(new CompressionStream('gzip'))
+    return new Uint8Array(await new Response(stream).arrayBuffer())
+  } catch {
+    return null
+  }
+}
+
 // 图层文件API
 export const layerApi = {
   // 获取数据集的图层文件列表
@@ -1045,6 +1086,111 @@ export const layerApi = {
   // 获取图层的字段名列表（同样调用 get_layer_data，放宽超时）
   getLayerColumns: async (dataId: string, layerId: string): Promise<ApiResponse<{ fields: string[]; layerId: string; total: number }>> => {
     return apiClient.get(`/data/${dataId}/layers/${layerId}/columns`, { timeout: 600000 })
+  },
+
+  // 新建空 TAB 图层（默认混合图层，可绘制点/线/面；geometryType 可选）
+  createLayer: async (payload: { name: string; geometryType?: string }): Promise<ApiResponse<{ data_id: string; layer_id: string; name: string }>> => {
+    return apiClient.post('/data/map/layers/create', payload)
+  },
+
+  // 保存图层编辑结果（整层重写 TAB；geojson 坐标为 GCJ02）
+  // payload 二选一：
+  //   { geojson }  整层保存（大图层首次保存 / 无版本指纹时）
+  //   { patch }    增量保存（只回传变更要素，base 携带基底要素数与版本指纹；服务端冲突返回 409）
+  // 请求体 gzip 压缩（大图层 40MB → ~13MB，上传耗时大幅缩短）；不支持 CompressionStream 时回退明文
+  saveLayerData: async (
+    dataId: string,
+    layerId: string,
+    payload: { geojson?: any; patch?: any },
+  ): Promise<ApiResponse<{ success: boolean; feature_count: number; mode?: 'full' | 'patch'; version?: string }>> => {
+    const url = `/data/${dataId}/layers/${layerId}/data`
+    const gz = await gzipText(JSON.stringify(payload))
+    if (gz) {
+      return apiClient.put(url, gz, {
+        timeout: 600000,
+        headers: { 'Content-Type': 'application/json', 'Content-Encoding': 'gzip' },
+      })
+    }
+    return apiClient.put(url, payload, { timeout: 600000 })
+  },
+
+  // 获取图层要素数据 + 版本指纹（ETag = "<layerId>-<源文件 mtime>"）
+  // 版本指纹用于增量保存的基底校验：与服务端不一致时回退整层保存，避免按错行覆盖
+  getLayerDataWithVersion: async (
+    dataId: string,
+    layerId: string,
+  ): Promise<{ data: any; version: string | null }> => {
+    const response = await apiClient.get(`/data/${dataId}/layers/${layerId}/data`, {
+      timeout: 600000,
+      headers: { 'Content-Type': 'application/json' },
+      _returnFullResponse: true,
+    } as any)
+    const payload = response.data || {}
+    return { data: payload?.data ?? payload, version: response.headers?.etag ?? null }
+  },
+
+  // 下载图层的 MapInfo 全套文件（.tab/.dat/.id/.map）zip（"另存为"）
+  downloadLayerZip: async (dataId: string, layerId: string, layerName: string): Promise<void> => {
+    const { blob, filename } = await layerApi.fetchLayerZip(dataId, layerId, layerName)
+    const blobUrl = window.URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = blobUrl
+    link.download = filename
+    document.body.appendChild(link)
+    link.click()
+    document.body.removeChild(link)
+    window.URL.revokeObjectURL(blobUrl)
+  },
+
+  // 仅取回 zip 内容（供"另存为"先弹系统路径选择框再写入，不直接触发浏览器下载）
+  fetchLayerZip: async (
+    dataId: string,
+    layerId: string,
+    layerName: string,
+  ): Promise<{ blob: Blob; filename: string }> => {
+    // 用 apiClient（baseURL /api/v1 + 自动附带鉴权头）而非裸 fetch，
+    // 否则缺 /api/v1 前缀会 404 或命中 SPA 回退，导致只得到损坏的单文件而非 zip
+    const response = await apiClient.get(`/data/${dataId}/layers/${layerId}/download`, {
+      responseType: 'blob',
+    })
+    const blob = response.data as Blob
+    if (!blob || blob.size === 0) throw new Error('文件内容为空')
+
+    // 解析文件名：优先 filename*=（RFC5987，UTF-8），回退 filename=，再回退图层名
+    let filename = `${layerName || 'layer'}.tab.zip`
+    const cd = response.headers?.['content-disposition']
+    if (cd) {
+      const star = cd.match(/filename\*=(?:UTF-8'')?([^;]+)/i)
+      if (star) {
+        filename = decodeURIComponent(star[1].replace(/"/g, ''))
+      } else {
+        const plain = cd.match(/filename="([^"]+)"/i) || cd.match(/filename=([^;]+)/i)
+        if (plain) filename = plain[1].trim().replace(/"/g, '')
+      }
+    }
+    return { blob, filename }
+  },
+
+  // 数据管理导入文件的原始文件下载（与数据管理页"下载"同源端点，返回上传时的原文件）
+  fetchDataFile: async (dataId: string, fallbackName: string): Promise<{ blob: Blob; filename: string }> => {
+    const response = await apiClient.get(`/data/${dataId}/download`, {
+      responseType: 'blob',
+    })
+    const blob = response.data as Blob
+    if (!blob || blob.size === 0) throw new Error('文件内容为空')
+    // 解析文件名：优先 filename*=（RFC5987，UTF-8），回退 filename=
+    let filename = fallbackName || 'file'
+    const cd = response.headers?.['content-disposition']
+    if (cd) {
+      const star = cd.match(/filename\*=(?:UTF-8'')?([^;]+)/i)
+      if (star) {
+        filename = decodeURIComponent(star[1].replace(/"/g, ''))
+      } else {
+        const plain = cd.match(/filename="([^"]+)"/i) || cd.match(/filename=([^;]+)/i)
+        if (plain) filename = plain[1].trim().replace(/"/g, '')
+      }
+    }
+    return { blob, filename }
   }
 }
 
@@ -1426,6 +1572,10 @@ export const authApi = {
     return apiClient.post('/auth/login', data) as any
   },
 
+  getOptions: async (): Promise<ApiResponse<RegisterOptions>> => {
+    return apiClient.get('/auth/options') as any
+  },
+
   register: async (data: RegisterRequest): Promise<ApiResponse<TokenResponse>> => {
     return apiClient.post('/auth/register', data) as any
   },
@@ -1581,7 +1731,7 @@ export const appVersionsApi = {
       }
     } catch { /* ignore */ }
 
-    const completeHeaders = {}
+    const completeHeaders: Record<string, string> = {}
     if (authToken) {
       completeHeaders['Authorization'] = `Bearer ${authToken}`
     }
@@ -1614,4 +1764,75 @@ export const appVersionsApi = {
     const res = await apiClient.post('/app-versions/import-local', formData)
     return res
   },
+}
+
+// ==================== 网优助手 ====================
+export interface AssistantChart {
+  type: 'line' | 'bar' | 'scatter' | string
+  title?: string
+  xAxis?: any[]
+  yAxis?: any[]
+  series?: any[]
+  points?: any[]
+  center?: [number, number]
+}
+export interface AssistantDataset {
+  id: string
+  name: string
+  fileType: 'station_params' | 'station_metrics'
+  status?: string
+  size?: number
+  createdAt?: string
+  fields?: string[]
+  rowCount?: number
+  granularity?: string
+  timeRange?: [string, string]
+}
+export interface LLMConfig {
+  protocol?: string
+  base_url?: string
+  model?: string
+  timeout?: number
+  has_api_key?: boolean
+  api_key_masked?: string
+  configured?: boolean
+}
+export const assistantApi = {
+  /** 读取大模型配置（密钥脱敏） */
+  getLlmConfig: async (): Promise<LLMConfig> => apiClient.get('/assistant/config'),
+
+  /** 保存大模型配置（api_key 传空串表示不修改） */
+  saveLlmConfig: async (cfg: {
+    protocol?: string; base_url?: string; api_key?: string; model?: string; timeout?: number
+  }): Promise<{ success: boolean; configured: boolean }> => apiClient.put('/assistant/config', cfg),
+
+  /** 测试连接 */
+  testLlmConfig: async (): Promise<{ success: boolean; reply?: string; error?: string }> =>
+    apiClient.post('/assistant/config/test'),
+
+  /** 对话 */
+  chat: async (messages: { role: string; content: string }[]): Promise<{
+    success: boolean; configured: boolean; reply: string;
+    charts: AssistantChart[]; message?: string
+  }> => apiClient.post('/assistant/chat', { messages }),
+
+  /** 数据集列表 */
+  listDatasets: async (): Promise<{ success: boolean; data: AssistantDataset[]; total: number }> =>
+    apiClient.get('/assistant/datasets'),
+
+  /** 上传基站参数/指标文件（后台解析，返回 pollKey） */
+  uploadDataset: async (file: File, dataType: 'station_params' | 'station_metrics') => {
+    const fd = new FormData()
+    fd.append('file', file)
+    fd.append('data_type', dataType)
+    return uploadClient.post('/assistant/datasets/upload', fd)
+  },
+
+  /** 轮询上传解析状态 */
+  uploadStatus: async (pollKey: string): Promise<{ status: string; result?: AssistantDataset; error?: string }> =>
+    apiClient.get(`/assistant/datasets/upload-status?poll_key=${encodeURIComponent(pollKey)}`),
+
+  /** 删除数据集 */
+  deleteDataset: async (id: string): Promise<{ success: boolean }> =>
+    apiClient.delete(`/assistant/datasets/${id}`),
 }

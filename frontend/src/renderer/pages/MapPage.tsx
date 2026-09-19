@@ -9,23 +9,34 @@
  * - 显示当前工参文件名
  * - 坐标缺失警告
  */
-import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
+import { useState, useEffect, useRef, useCallback, useMemo, type ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
-import { Loader2, Search, X, MapPin, AlertTriangle, Database, Trash2, MousePointer2, Circle as CircleIcon, Pentagon, Hand, Map as MapIcon, Satellite, Maximize2, Minimize2 } from 'lucide-react'
+import { Loader2, Search, X, MapPin, AlertTriangle, Database, Trash2, MousePointer2, Circle as CircleIcon, Pentagon, Hand, Map as MapIcon, Satellite, Maximize2, Minimize2, FilePlus2, Save, Download, Hexagon, Spline, Palette, PenLine, Undo2, BoxSelect, ClipboardPaste } from 'lucide-react'
 import { OnlineMap, OnlineMapRef, CustomLayerOption } from '../components/Map/OnlineMap'
+import { MapSearchDialog } from '../components/Map/MapSearchDialog'
 import { LayerControl, SectorLayerOption, LayerFileOption, DecorationLayerOption } from '../components/Map/LayerControl'
 import { OfflineMap, createDefaultLayers } from '../components/Map'
 import type { LayerOption, FrequencyOption } from '../components/Map'
 import { CoordinateTransformer } from '../utils/coordinate'
 import { mapApi, layerApi } from '../services/api'
-import { useDataStore, DATA_REFRESH_EVENT } from '../store/dataStore'
+import { useDataStore, DATA_REFRESH_EVENT, triggerDataRefresh } from '../store/dataStore'
 import { useMapStore } from '../store/mapStore'
+import type { LayerCategory } from '../store/mapStore'
 import { useMapDataCacheStore } from '../store/mapDataCacheStore'
+import { useLayerEditStore, selectDirtyLayerIds, buildSavePlan } from '../store/layerEditStore'
+import NewLayerDialog from '../components/Map/NewLayerDialog'
+import SaveLayersDialog, { type DirtyLayerItem } from '../components/Map/SaveLayersDialog'
+import MapExportDialog from '../components/Map/MapExportDialog'
+import DrawStyleModal from '../components/Map/DrawStyleModal'
+import FeatureStyleDialog from '../components/Map/FeatureStyleDialog'
+import type { DrawGeometryType } from '@shared/types'
 import { mapDataService, type RenderSectorData } from '../services/mapDataService'
 import { frequencyColorMapper } from '../config/sector-config'
-import { LabelSettings, LayerColorSettings, ThematicSettings, ThematicRange } from '../components/Map/LabelSettingsModal'
+import { LabelSettings, LayerColorSettings, ThematicSettings, ThematicRange, HeatmapSettings, HeatmapTemplate } from '../components/Map/LabelSettingsModal'
 import { TreeNode } from '../components/Map/LayerControl'
 import { ThematicLegend } from '../components/Map/ThematicLegend'
+import { HeatmapLegend } from '../components/Map/HeatmapLegend'
+import type { HeatmapStats } from '../components/Map/HeatmapLayerManager'
 import { selectionManager } from '../services/selectionManager'
 
 // MapInfo 图层列表缓存（避免每次挂载都重新请求）
@@ -33,8 +44,111 @@ interface LayerListCacheEntry {
   data: any[]
   time: number
 }
+
+/**
+ * 另存为的保存目标：
+ * - fsa：File System Access API 拿到的文件句柄（用户已在路径选择框中指定位置）
+ * - download：浏览器不支持路径选择，回退为默认下载
+ */
+type SaveTarget = { kind: 'fsa'; handle: any } | { kind: 'download' }
+
+/** 弹出系统路径选择框（需用户手势，故在发起网络请求前调用）。用户取消返回 null。 */
+async function pickSaveTarget(filename: string): Promise<SaveTarget | null> {
+  const w = window as any
+  try {
+    if (typeof w.showSaveFilePicker === 'function') {
+      const handle = await w.showSaveFilePicker({
+        suggestedName: filename,
+        types: [{ description: 'ZIP', accept: { 'application/zip': ['.zip'] } }],
+      })
+      return { kind: 'fsa', handle }
+    }
+    if (typeof w.showDirectoryPicker === 'function') {
+      const dir = await w.showDirectoryPicker({ mode: 'readwrite' })
+      const handle = await dir.getFileHandle(filename, { create: true })
+      return { kind: 'fsa', handle }
+    }
+  } catch (e: any) {
+    // 用户在路径选择框点了取消
+    if (e?.name === 'AbortError') return null
+    // 其它错误（非安全上下文等）回退为默认下载
+  }
+  return { kind: 'download' }
+}
+
+/** 把内容写入已选中的保存目标。 */
+async function writeSaveTarget(target: SaveTarget, blob: Blob, filename: string): Promise<void> {
+  if (target.kind === 'fsa') {
+    const writable = await target.handle.createWritable()
+    try {
+      await writable.write(blob)
+    } finally {
+      await writable.close()
+    }
+    return
+  }
+  const url = URL.createObjectURL(blob)
+  const link = document.createElement('a')
+  link.href = url
+  link.download = filename
+  document.body.appendChild(link)
+  link.click()
+  document.body.removeChild(link)
+  URL.revokeObjectURL(url)
+}
 const _layerListCache = new Map<string, LayerListCacheEntry>()
 const _LAYER_LIST_CACHE_TTL = 10 * 60 * 1000 // 10分钟
+
+// ===== 工具栏个性化（右键设置）：按钮排序 + 标签文字显隐，按登录用户持久化 =====
+
+/** 可拖动排序的工具栏按钮 id（数据源指示/搜索区固定不参与）；默认顺序按使用频率排列 */
+const TOOLBAR_ITEM_IDS = [
+  'save', 'export', 'new', 'undo', 'capture', 'paste', 'measure',
+  'drag', 'select', 'marquee', 'draw', 'style', 'maptype', 'fullscreen',
+] as const
+type ToolbarItemId = (typeof TOOLBAR_ITEM_IDS)[number]
+
+interface ToolbarPrefs {
+  order: ToolbarItemId[]
+  showLabels: boolean
+  /** 快照格式版本（v2 = 标签默认隐藏 + 新默认顺序；旧快照一次性迁移） */
+  __v?: number
+}
+
+/** 按登录用户区分的 localStorage key（与 mapStore.getStorageKey 同源） */
+function toolbarPrefsKey(): string {
+  try {
+    const stored = localStorage.getItem('auth-storage')
+    if (stored) {
+      const user = JSON.parse(stored)?.state?.user
+      if (user?.id) return `map-toolbar-user-${user.id}`
+    }
+  } catch { /* ignore */ }
+  return 'map-toolbar-anonymous'
+}
+
+function loadToolbarPrefs(): ToolbarPrefs {
+  // v2 默认：标签文字隐藏（图标态）+ 新默认按钮顺序
+  const defaults: ToolbarPrefs = { order: [...TOOLBAR_ITEM_IDS], showLabels: false, __v: 2 }
+  try {
+    const raw = localStorage.getItem(toolbarPrefsKey())
+    if (!raw) return defaults
+    const p = JSON.parse(raw)
+    // 旧版快照（v1）：一次性迁移为新的默认外观（旧"显示标签"与新默认冲突，按未定制处理）
+    if (p.__v !== 2) return defaults
+    // v2 快照：尊重用户显式设置，仅补齐新增按钮
+    const known = TOOLBAR_ITEM_IDS as readonly string[]
+    const order: ToolbarItemId[] = Array.isArray(p.order)
+      ? (p.order.filter((id: string) => known.includes(id)) as ToolbarItemId[])
+      : [...TOOLBAR_ITEM_IDS]
+    for (const id of TOOLBAR_ITEM_IDS) {
+      if (!order.includes(id)) order.push(id)
+    }
+    return { order, showLabels: p.showLabels === true, __v: 2 }
+  } catch {
+    return defaults
+  }
+}
 
 /**
  * 搜索模式
@@ -87,10 +201,14 @@ export function MapPage() {
     setLabelSettings: storeSetLabelSettings,
     setColorSettings: storeSetColorSettings,
     setThematicSettings: storeSetThematicSettings,
+    setHeatmapSettings: storeSetHeatmapSettings,
     setThematicTemplates: storeSetThematicTemplates,
+    setHeatmapTemplates: storeSetHeatmapTemplates,
     setFrequencyCustomColors: storeSetFrequencyCustomColors,
     setBaseMapVisible: storeSetBaseMapVisible,
     setDecorationLabelVisible: storeSetDecorationLabelVisible,
+    setLayerOrder: storeSetLayerOrder,
+    setLayerSelectable: storeSetLayerSelectable,
   } = useMapStore()
 
   // 视图模式
@@ -120,8 +238,9 @@ export function MapPage() {
 
   // 获取当前工参文件名
   const currentDataSourceFile = useMemo(() => {
+    // 按后端分类标识判断全量工参（不能按文件名前缀：存量 mongoose 命名/用户改名都会漏判导致图标误红）
     const excelFiles = items
-      .filter(item => item.type === 'excel' && item.status === 'ready' && item.name.startsWith('ProjectParameter_mongoose'))
+      .filter(item => item.type === 'excel' && item.status === 'ready' && item.fileType === 'full_params')
       .sort((a, b) => new Date(b.uploadDate).getTime() - new Date(a.uploadDate).getTime())
     return excelFiles.length > 0 ? excelFiles[0].name : null
   }, [items])
@@ -271,8 +390,87 @@ export function MapPage() {
     : {}
   const [thematicSettingsMap, setThematicSettingsMap] = useState<Record<string, ThematicSettings>>(initialThematicSettings)
 
+  // 热力图配置状态（按图层ID存储）- 从持久化 store 初始化
+  const initialHeatmapSettings = Object.keys(mapSettings.heatmapSettingsMap ?? {}).length > 0
+    ? mapSettings.heatmapSettingsMap
+    : {}
+  const [heatmapSettingsMap, setHeatmapSettingsMap] = useState<Record<string, HeatmapSettings>>(initialHeatmapSettings)
 
+  // ===== store → 本地状态回填 =====
+  // 登录后地图设置是异步恢复的（本地 localStorage / 后端 GET），MapPage 可能先挂载，
+  // 此时本地镜像会停在默认值：表现为自定义设置弹窗参数回到默认、图例/勾选开关与已保存状态不一致。
+  // store 为唯一真源（各 setter 均同步写 store），因此在 store 变化时统一回填本地镜像。
+  useEffect(() => {
+    setThematicSettingsMap(mapSettings.thematicSettingsMap ?? {})
+  }, [mapSettings.thematicSettingsMap])
 
+  useEffect(() => {
+    setHeatmapSettingsMap(mapSettings.heatmapSettingsMap ?? {})
+  }, [mapSettings.heatmapSettingsMap])
+
+  useEffect(() => {
+    setColorSettingsMap(mapSettings.colorSettingsMap ?? {})
+  }, [mapSettings.colorSettingsMap])
+
+  // 标签设置仅在 store 有数据时回填（空 store 时保留基站默认标签配置）
+  useEffect(() => {
+    const m = mapSettings.labelSettingsMap
+    if (m && Object.keys(m).length > 0) setLabelSettingsMap(m)
+  }, [mapSettings.labelSettingsMap])
+
+  // 基站图层（LTE/NR 总开关）勾选状态恢复
+  useEffect(() => {
+    const v = mapSettings.layerVisibility
+    if (!v) return
+    setLayers(prev => {
+      let changed = false
+      const next = prev.map(l => {
+        const want = l.id === 'lte-sectors' ? v.lte : l.id === 'nr-sectors' ? v.nr : l.visible
+        if (want === l.visible) return l
+        changed = true
+        return { ...l, visible: want }
+      })
+      return changed ? next : prev
+    })
+  }, [mapSettings.layerVisibility])
+
+  // 图层文件 / 地理化数据勾选状态恢复
+  useEffect(() => {
+    const lv = mapSettings.layerFileVisibility ?? {}
+    const pv = mapSettings.pointFileVisibility ?? {}
+    setLayerFiles(prev => {
+      let changed = false
+      const next = prev.map(f => {
+        const want = lv[f.id] ?? false
+        if (want === f.visible) return f
+        changed = true
+        return { ...f, visible: want }
+      })
+      return changed ? next : prev
+    })
+    setPointFiles(prev => {
+      let changed = false
+      const next = prev.map(f => {
+        const want = pv[f.id] ?? false
+        if (want === f.visible) return f
+        changed = true
+        return { ...f, visible: want }
+      })
+      return changed ? next : prev
+    })
+  }, [mapSettings.layerFileVisibility, mapSettings.pointFileVisibility])
+
+  // 标签开关恢复（与本地状态合并：保存标签设置时会本地强制置 true 但未必写入 store，
+  // 直接整体替换会把这类本地状态冲掉）
+  useEffect(() => {
+    setSectorLabelVisibility(prev => ({ ...prev, ...(mapSettings.sectorLabelVisibility ?? {}) }))
+  }, [mapSettings.sectorLabelVisibility])
+  useEffect(() => {
+    setPointFileLabelVisibility(prev => ({ ...prev, ...(mapSettings.pointFileLabelVisibility ?? {}) }))
+  }, [mapSettings.pointFileLabelVisibility])
+  useEffect(() => {
+    setLayerFileLabelVisibility(prev => ({ ...prev, ...(mapSettings.layerFileLabelVisibility ?? {}) }))
+  }, [mapSettings.layerFileLabelVisibility])
 
   const sectorLayers = useMemo((): SectorLayerOption[] => layers.map(layer => ({
     id: layer.id,
@@ -311,11 +509,13 @@ export function MapPage() {
             return cached.data.map((layer: any) => ({
               id: layer.id,
               name: layer.name,
-              type: layer.type as 'point' | 'line' | 'polygon',
+              type: layer.type as 'point' | 'line' | 'polygon' | 'mixed',
               visible: layerFileVisibility[layer.id] ?? false,
               dataId: mapItem.id,
               sourceType: 'mapinfo' as const,
-              defaultStyle: layer.defaultStyle
+              defaultStyle: layer.defaultStyle,
+              editable: (layer.metadata?.source_file || '').toLowerCase().endsWith('.tab'),
+              toolCreated: layer.metadata?.editable === true
             }))
           }
 
@@ -329,11 +529,13 @@ export function MapPage() {
             return response.data.layers.map((layer: any) => ({
               id: layer.id,
               name: layer.name,
-              type: layer.type as 'point' | 'line' | 'polygon',
+              type: layer.type as 'point' | 'line' | 'polygon' | 'mixed',
               visible: layerFileVisibility[layer.id] ?? false,
               dataId: mapItem.id,
               sourceType: 'mapinfo' as const,
-              defaultStyle: layer.defaultStyle
+              defaultStyle: layer.defaultStyle,
+              editable: (layer.metadata?.source_file || '').toLowerCase().endsWith('.tab'),
+              toolCreated: layer.metadata?.editable === true
             }))
           }
           return []
@@ -440,15 +642,21 @@ export function MapPage() {
 
   // 监听数据刷新事件（数据被删除或上传时重新加载扇区数据和图层文件）
   useEffect(() => {
-    const handleDataRefresh = () => {
-      console.log('[MapPage] 数据已变更，重新加载扇区数据')
-      // 清除图层列表缓存
+    const handleDataRefresh = (e: Event) => {
+      const scope = (e as CustomEvent)?.detail?.scope
+      // 清除图层列表缓存（图层保存后源文件时间戳变化，列表需重取）
       _layerListCache.clear()
+      loadLayerFiles()
+      if (scope === 'layer') {
+        // 仅图层内容变化（保存链路）：扇区/工参数据未变，跳过重载与重绘，避免保存后卡顿
+        console.log('[MapPage] 图层内容已更新，跳过扇区数据重载')
+        return
+      }
+      console.log('[MapPage] 数据已变更，重新加载扇区数据')
       // 重载扇区数据缓存（用于频点提取和工参搜索）
       loadSectorDataForSearch()
       // 刷新在线地图（sectorData state + 图层重绘）
       onlineMapRef.current?.refreshData()
-      loadLayerFiles()
     }
     window.addEventListener(DATA_REFRESH_EVENT, handleDataRefresh)
     return () => window.removeEventListener(DATA_REFRESH_EVENT, handleDataRefresh)
@@ -464,6 +672,36 @@ export function MapPage() {
   const [searching, setSearching] = useState(false)
   const [missingCoordCount, setMissingCoordCount] = useState(0)
   const searchInputRef = useRef<HTMLInputElement>(null)
+
+  // Ctrl+F 地图搜索弹窗
+  const [searchDialogOpen, setSearchDialogOpen] = useState(false)
+
+  // Ctrl/Cmd+F 调出地图搜索弹窗（preventDefault 屏蔽浏览器原生查找；离线模式无定位能力，不拦截）
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (viewMode !== 'online') return
+      // 输入框内聚焦时不拦截（允许在弹窗/搜索框内正常编辑文本）
+      const target = e.target as HTMLElement | null
+      if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable)) return
+      const key = e.key.toLowerCase()
+      if ((e.ctrlKey || e.metaKey) && key === 'f') {
+        e.preventDefault()
+        setSearchDialogOpen(true)
+      } else if ((e.ctrlKey || e.metaKey) && key === 'n') {
+        // 新建图层（Electron 可拦截；纯浏览器可能被浏览器拦截）
+        e.preventDefault()
+        setNewLayerDialogOpen(true)
+      } else if ((e.ctrlKey || e.metaKey) && key === 's') {
+        // 保存（仅当存在未保存编辑时拦截）
+        if (selectDirtyLayerIds(useLayerEditStore.getState().workspaces).length > 0) {
+          e.preventDefault()
+          setSaveDialogOpen(true)
+        }
+      }
+    }
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [viewMode])
 
   // 工具控件状态
   const [measureMode, setMeasureMode] = useState(false)
@@ -485,72 +723,53 @@ export function MapPage() {
     return () => document.removeEventListener('mousedown', handleClickOutside)
   }, [])
 
-  // 地图拖拽工具状态 - 独立于框选模式
-  const [mapDragTool, setMapDragTool] = useState(false)
+  // 地图拖拽工具状态：刷新页面后默认激活手形；若"选择"工具在上次使用中处于激活
+  //（selectMode 存于全局 store，跨页面切换持久），则保持选择激活、手形不激活（互斥）
+  const [mapDragTool, setMapDragTool] = useState(() => !useLayerEditStore.getState().selectMode)
 
   /**
-   * 获取当前可见图层所属的类型集合
-   * 圈选时只能对同一类型的图层操作，不能跨类型
-   * 4 种类型：基站(扇区)、图层文件(MapInfo)、地理化数据(Excel)、装饰图层
+   * 是否存在"可见且可选开关打开"的图层。
+   * 圈选不再限制可见图层数量/类别；实际圈选目标由 OnlineMap.getSelectionTarget
+   * 按 z-order（基站 > 图层文件 > 地理化数据 > 装饰图层，类内按面板顺序）取最高者。
    */
-  const getVisibleLayerCategories = useCallback((): string[] => {
-    const categories: string[] = []
-    // 基站（扇区图层）
-    if (layers.find(l => l.id === 'lte-sectors')?.visible || layers.find(l => l.id === 'nr-sectors')?.visible) {
-      categories.push('sector')
-    }
+  const hasSelectableLayer = useCallback((): boolean => {
+    const selectable = mapSettings.selectableMap ?? {}
+    const isOn = (id: string) => selectable[id] !== false
+    // 基站（LTE/NR 扇区）
+    if (layers.some(l => l.visible && isOn(l.id))) return true
     // 图层文件（MapInfo）
-    if (layerFiles.filter(lf => lf.visible).length > 0) {
-      categories.push('mapinfo')
-    }
-    // 地理化数据（Excel点文件/扇区/多边形）
-    if (pointFiles.filter(pf => pf.visible).length > 0) {
-      categories.push('geo')
-    }
-    // 装饰图层
-    if (decorationLayer.visible) {
-      categories.push('decoration')
-    }
-    return categories
-  }, [layers, layerFiles, pointFiles, decorationLayer.visible])
+    if (layerFiles.some(f => f.visible && isOn(f.id))) return true
+    // 地理化数据（Excel 点/扇区/面文件；自定义图层不参与圈选）
+    if (pointFiles.some(f => f.visible && isOn(f.id))) return true
+    // 装饰图层（打点/定位标记）
+    if (decorationLayer.visible && isOn('decoration-layer')) return true
+    return false
+  }, [mapSettings.selectableMap, layers, layerFiles, pointFiles, decorationLayer.visible])
 
   /**
    * 处理框选模式切换
    * 框选功能和拖拽工具互斥：激活框选时禁用拖拽工具
    */
   const handleSelectionModeChange = (mode: 'circle' | 'polygon' | 'point') => {
-    // 如果点击当前已激活的模式，则退出框选模式（保留选中状态，只有"清除"按钮才清除）
+    // 工具"粘滞"：再次点击已激活的模式不再退出，只能通过切换到其他工具退出
     if (selectionMode === mode) {
-      setSelectionMode('none')
+      setShowSelectionMenu(false)
       return
     }
 
-    const visibleCategories = getVisibleLayerCategories()
-
-    // 圆形和多边形框选需要检查可见图层
-    if (mode === 'point' || mode === 'circle' || mode === 'polygon') {
-      if (visibleCategories.length === 0) {
-        alert(t('map.enableLayerFirst') || '请先在图层控制面板开启需要圈选的图层')
-        return
-      }
-
-      if (visibleCategories.length > 1) {
-        const categoryNames: Record<string, string> = {
-          sector: t('map.categorySector') || '基站(扇区)',
-          mapinfo: t('map.categoryMapInfo') || '图层文件',
-          geo: t('map.categoryGeo') || '地理化数据',
-          decoration: t('map.categoryDecoration') || '装饰图层'
-        }
-        const visibleNames = visibleCategories.map(c => categoryNames[c] || c).join('、')
-        alert(`${t('map.crossCategoryNotAllowed') || '圈选不能跨类型操作'}：${visibleNames}。${t('map.onlyOneCategoryAtATime') || '请先关闭其他类型的图层，只保留一个类型的图层可见'}`)
-        return
-      }
+    // 圆形/多边形/框选都需要至少一个"可见且可选"的图层作为圈选目标
+    if (!hasSelectableLayer()) {
+      alert(t('map.enableSelectableFirst') || '请先在图层控制面板打开需要圈选图层的"可选"开关（鼠标箭头按钮）')
+      return
     }
 
     setSelectionMode(mode)
     setMeasureMode(false)
     setCaptureMode(false)
     setCaptureCoord(null)
+    // 与绘制/选择工具互斥：激活圈选时退出绘制与选择
+    useLayerEditStore.getState().setDrawTool('none')
+    useLayerEditStore.getState().setSelectMode(false)
     if (mapDragTool) {
       setMapDragTool(false)
     }
@@ -560,21 +779,40 @@ export function MapPage() {
 
   /**
    * 处理地图拖拽工具切换
-   * 拖拽工具与其他所有操作模式互斥：激活拖拽时退出所有其他模式
+   * 拖拽工具与其他所有操作模式互斥：激活拖拽时退出所有其他模式。
+   * 手形工具保持激活：再次点击不去激活（避免误触失去拖拽），仅可通过点击其他工具切换出去。
    */
   const handleMapDragToolToggle = () => {
-    const newState = !mapDragTool
-    setMapDragTool(newState)
-    
-    if (newState) {
-      // 激活拖拽：关闭所有其他互斥模式
-      setMeasureMode(false)
-      setCaptureMode(false)
-      setCaptureCoord(null)
-      setSelectionMode('none')
-      // 注意：不调用 clearSelectionHighlight()，拖拽工具仅负责地图拖拽，不影响已绘制的框选图形和选中高亮
-    }
+    if (mapDragTool) return
+    setMapDragTool(true)
+
+    // 激活拖拽：关闭所有其他互斥模式
+    setMeasureMode(false)
+    setCaptureMode(false)
+    setCaptureCoord(null)
+    setSelectionMode('none')
+    // 与绘制工具互斥：激活拖拽时退出绘制
+    useLayerEditStore.getState().setDrawTool('none')
+    // 拖拽与"选择"工具互斥
+    useLayerEditStore.getState().setSelectMode(false)
+    // 注意：不调用 clearSelectionHighlight()，拖拽工具仅负责地图拖拽，不影响已绘制的框选图形和选中高亮
   }
+
+  /**
+   * 处理"选择"工具切换：点击要素选中（可编辑图层显示顶点），双击要素弹属性/风格配置。
+   * 与圈选/测距/打点/拖拽/绘制全部互斥。
+   */
+  const handleSelectToolToggle = useCallback(() => {
+    const store = useLayerEditStore.getState()
+    // 工具"粘滞"：已激活时再次点击不取消，只能通过切换到其他工具退出
+    if (store.selectMode) return
+    store.setSelectMode(true)
+    setMeasureMode(false)
+    setCaptureMode(false)
+    setCaptureCoord(null)
+    setSelectionMode('none')
+    setMapDragTool(false)
+  }, [])
   const [totalDistance, setTotalDistance] = useState<number | null>(null)
   const [captureMode, setCaptureMode] = useState(false)
   const [captureCoord, setCaptureCoord] = useState<{ lng: number; lat: number } | null>(null)
@@ -585,6 +823,300 @@ export function MapPage() {
   const handleCaptureBlocked = useCallback(() => {
     alert(t('map.captureRequiresDecorationLayer') || '请先勾选装饰图层后再进行打点操作')
   }, [t])
+
+  // ===== 新建 TAB 图层 / 编辑 / 保存 =====
+  const [newLayerDialogOpen, setNewLayerDialogOpen] = useState(false)
+  const [saveDialogOpen, setSaveDialogOpen] = useState(false)
+  const [exportDialogOpen, setExportDialogOpen] = useState(false)
+  const [styleModalTab, setStyleModalTab] = useState<DrawGeometryType | null>(null)
+  // 工具栏下拉菜单：'new' 新建 / 'draw' 绘制 / null 关闭
+  const [openMenu, setOpenMenu] = useState<'new' | 'draw' | null>(null)
+  const [savingLayers, setSavingLayers] = useState(false)
+  const newMenuRef = useRef<HTMLDivElement>(null)
+  const drawMenuRef = useRef<HTMLDivElement>(null)
+
+  // ===== 工具栏个性化：右键菜单设置标签显隐、拖动调整按钮顺序（按用户持久化） =====
+  const [toolbarPrefs, setToolbarPrefs] = useState<ToolbarPrefs>(loadToolbarPrefs)
+  const [toolbarMenu, setToolbarMenu] = useState<{ x: number; y: number } | null>(null)
+  const toolbarDragIdRef = useRef<string | null>(null)
+
+  // 持久化到 localStorage（key 按登录用户区分）
+  useEffect(() => {
+    try {
+      localStorage.setItem(toolbarPrefsKey(), JSON.stringify(toolbarPrefs))
+    } catch { /* ignore */ }
+  }, [toolbarPrefs])
+
+  // 右键菜单：点击其他处收起
+  useEffect(() => {
+    if (!toolbarMenu) return
+    const close = () => setToolbarMenu(null)
+    document.addEventListener('mousedown', close)
+    return () => document.removeEventListener('mousedown', close)
+  }, [toolbarMenu])
+
+  // 拖拽排序：把拖动按钮移动到目标按钮所在位置
+  const handleToolbarDrop = useCallback((targetId: string) => {
+    const dragId = toolbarDragIdRef.current
+    toolbarDragIdRef.current = null
+    if (!dragId || dragId === targetId) return
+    setToolbarPrefs((p) => {
+      const order = [...p.order]
+      const from = order.indexOf(dragId as ToolbarItemId)
+      const to = order.indexOf(targetId as ToolbarItemId)
+      if (from < 0 || to < 0) return p
+      order.splice(from, 1)
+      order.splice(to, 0, dragId as ToolbarItemId)
+      return { ...p, order }
+    })
+  }, [])
+
+  const editableLayerId = useLayerEditStore((s) => s.editableLayerId)
+  const drawTool = useLayerEditStore((s) => s.drawTool)
+  const selectMode = useLayerEditStore((s) => s.selectMode)
+  const inspectFeature = useLayerEditStore((s) => s.inspectFeature)
+  const editWorkspaces = useLayerEditStore((s) => s.workspaces)
+  const clipboardItems = useLayerEditStore((s) => s.clipboard)
+  const dirtyLayerIds = selectDirtyLayerIds(editWorkspaces)
+  // 粘贴就绪：编辑图层存在、剪贴板非空、且编辑图层处于勾选（可见）状态
+  //（去勾选只是隐藏编辑会话渲染，但不允许向看不见的图层粘贴内容）
+  const pasteTargetReady = !!editableLayerId
+    && clipboardItems.length > 0
+    && !!layerFiles.find((f) => f.id === editableLayerId)?.visible
+
+  // 点击外部收起所有工具栏下拉菜单
+  useEffect(() => {
+    const onClickOutside = (e: MouseEvent) => {
+      const t = e.target as Node
+      if (
+        !newMenuRef.current?.contains(t) &&
+        !drawMenuRef.current?.contains(t)
+      ) {
+        setOpenMenu(null)
+      }
+    }
+    document.addEventListener('mousedown', onClickOutside)
+    return () => document.removeEventListener('mousedown', onClickOutside)
+  }, [])
+
+  // 新建图层成功：刷新列表后自动进入该图层编辑（默认可编辑）
+  const handleLayerCreated = useCallback(async (r: { data_id: string; layer_id: string; name: string }) => {
+    triggerDataRefresh()
+    // 新建图层已注册到 index，须强制重新拉取数据列表；否则 items 仍是旧快照，新图层不会立即出现在图层面板
+    await useDataStore.getState().fetchList(1, 50, true)
+    try {
+      await loadLayerFiles()
+    } catch (e) {
+      console.error('[MapPage] 新建后刷新图层列表失败', e)
+    }
+    // 直接建立编辑工作集（beginEdit 同时设 editableLayerId），避免 ensureWorkspace
+    // 用旧 layerFiles 闭包找不到刚创建的新图层而跳过初始化，导致绘制要素无处落地。
+    useLayerEditStore.getState().beginEdit(r.layer_id, r.data_id, 'mixed', [], null)
+    // 新图层默认可视 + 可选（可编辑图层一定可选择），便于立即绘制并在地图可见
+    useMapStore.getState().setLayerFileVisibility(r.layer_id, true)
+    useMapStore.getState().setLayerSelectable(r.layer_id, true)
+    setLayerFiles(prev => prev.map(f => f.id === r.layer_id ? { ...f, visible: true } : f))
+  }, [loadLayerFiles])
+
+  // 图层面板"可编辑"开关：全局互斥（store 只维护一个 editableLayerId）
+  const handleEditableToggle = useCallback((layerId: string, active: boolean) => {
+    useLayerEditStore.getState().setEditableLayerId(active ? layerId : null)
+    if (active) {
+      // 可编辑图层一定可选择：编辑开启时自动打开"可选"开关（若关闭）
+      useMapStore.getState().setLayerSelectable(layerId, true)
+    }
+    // 控制面板"编辑"开关与菜单栏工具（选择/圈选/测距/打点/手形）完全互不影响：
+    // 开/关编辑均不改变任何工具状态（工具只能通过切换其他工具退出）
+  }, [])
+
+  // 粘贴：把剪贴板中圈选复制的要素（几何+完整属性）插入当前编辑图层
+  const handlePasteFeatures = useCallback(() => {
+    const store = useLayerEditStore.getState()
+    const targetId = store.editableLayerId
+    if (!targetId) {
+      alert(t('map.enableEditFirst') || '请先在图层控制面板打开一个 TAB 图层的"编辑"开关（铅笔按钮）')
+      return
+    }
+    if (store.clipboard.length === 0) return
+    // 目标图层必须处于勾选（可见）状态：去勾选只是隐藏显示、编辑会话保留（未保存更改不丢），
+    // 但不允许向看不见的图层写入内容
+    const targetFile = layerFiles.find(f => f.id === targetId)
+    if (!targetFile?.visible) {
+      alert(t('map.pasteTargetHidden')
+        || '目标图层当前未勾选（隐藏状态），请先在图层控制面板重新勾选该图层后再粘贴')
+      return
+    }
+    // 执行前弹窗确认（粘贴会直接写入当前编辑图层，避免误粘）
+    const targetName = targetFile?.name || ''
+    const ok = window.confirm(
+      t('map.pasteConfirm', { count: store.clipboard.length, name: targetName })
+      || `确认把剪贴板中的 ${store.clipboard.length} 个要素粘贴到图层「${targetName}」？`
+    )
+    if (!ok) return
+    for (const item of store.clipboard) {
+      const { _editId: _dropId, _isNew: _dropNew, ...props } = (item.properties || {}) as any
+      store.addFeature(targetId, item.geometry as any, { ...props, _keepStyle: true })
+    }
+    console.log('[MapPage] 粘贴要素到图层:', targetName, '数量:', store.clipboard.length)
+    alert(t('map.pasteDone', { count: store.clipboard.length, name: targetName })
+      || `已粘贴 ${store.clipboard.length} 个要素到图层「${targetName}」`)
+  }, [t, layerFiles])
+
+  // 绘制工具切换（与测量/圈选/拖拽/打点互斥）
+  const handleDrawTool = useCallback((tool: DrawGeometryType) => {
+    const store = useLayerEditStore.getState()
+    if (!store.editableLayerId) {
+      alert(t('map.enableEditFirst') || '请先在图层控制面板打开一个 TAB 图层的"编辑"开关（铅笔按钮）')
+      return
+    }
+    // 绘制工具"粘滞"：再次点击同一工具不取消，只能通过切换到其他工具退出
+    if (store.drawTool === tool) return
+    store.setDrawTool(tool)
+    setMeasureMode(false)
+    setSelectionMode('none')
+    setMapDragTool(false)
+    setCaptureMode(false)
+    setCaptureCoord(null)
+  }, [t])
+
+  // 保存勾选的未保存图层
+  // 把勾选图层的工作集保存落盘（返回 {name, ok, error}[]；成功图层清脏）
+  const saveSelectedToStore = useCallback(async (selectedIds: string[]) => {
+    const results: Array<{ name: string; ok: boolean; layerId?: string; dataId?: string; error?: string; mode?: string }> = []
+    for (const layerId of selectedIds) {
+      const ws = useLayerEditStore.getState().getWorkspace(layerId)
+      const lf = layerFiles.find((f) => f.id === layerId)
+      if (!ws || !lf) continue
+      // 保存计划：有基底版本指纹时只回传变更要素（大图层省掉整层上传/解析），否则整层保存
+      const plan = buildSavePlan(ws)
+      if (plan.mode === 'none') {
+        // 无有效变更（如新增后又删除）：不写盘，仅清脏并保持基底版本
+        useLayerEditStore.getState().markSaved(layerId, { remapRows: true, version: ws.version })
+        results.push({ name: lf.name, ok: true, layerId, dataId: ws.dataId, mode: 'none' })
+        continue
+      }
+      const save = async (payload: { geojson?: any; patch?: any }) =>
+        layerApi.saveLayerData(ws.dataId, layerId, payload)
+      try {
+        let mode: string = plan.mode
+        let resp: any
+        try {
+          resp = await save(plan.payload)
+        } catch (e: any) {
+          // 409：基底已被其它会话改写（axios 非 2xx 走 reject）→ 回退整层保存，本次改动不丢
+          if (e?.response?.status === 409 && plan.mode === 'patch') {
+            console.warn('[MapPage] 增量保存基底冲突，回退整层保存:', lf.name)
+            mode = 'full'
+            resp = await save({ geojson: { type: 'FeatureCollection', features: ws.features } })
+          } else {
+            throw e
+          }
+        }
+        const data: any = (resp as any)?.data ?? {}
+        if (resp.success) {
+          // 服务端要素数与工作集一致时才重排基底行号，否则清空基底（下次自动整层保存）
+          const remapRows = Number(data.feature_count) === ws.features.length
+          useLayerEditStore.getState().markSaved(layerId, { remapRows, version: data.version ?? null })
+          results.push({ name: lf.name, ok: true, layerId, dataId: ws.dataId, mode: data.mode ?? mode })
+          // 先丢弃保存前的旧缓存，再用编辑工作集（刚写入的内容）重建地图上的原始图层：
+          // 既避免保存后再下载整层（40MB 级图层重新拉取 + 解析额外卡顿数秒），也保证不残留旧数据
+          useMapDataCacheStore.getState().invalidateLayer(layerId)
+          const fresh = useLayerEditStore.getState().getWorkspace(layerId)
+          void onlineMapRef.current?.refreshLayerData(layerId, {
+            data: fresh
+              ? { type: 'FeatureCollection', features: fresh.features }
+              : undefined,
+            version: data.version ?? null,
+          })
+        } else {
+          results.push({ name: lf.name, ok: false, error: (resp as any)?.message })
+        }
+      } catch (e: any) {
+        const detail = e?.response?.data?.detail || e?.message
+        results.push({ name: lf.name, ok: false, error: detail })
+      }
+    }
+    // 以 layer 范围刷新数据列表：数据条目本身未变，地图页无需重载扇区数据/重绘
+    // （图层缓存已在保存成功处精确失效并按工作集重建，扇区/其它图层数据未变）
+    triggerDataRefresh('layer')
+    return results
+  }, [layerFiles])
+
+  // 保存：仅把编辑结果写回库（MapInfo TAB），不触发任何下载
+  const handleSaveLayers = useCallback(async (selectedIds: string[]) => {
+    if (selectedIds.length === 0) return
+    setSavingLayers(true)
+    const results = await saveSelectedToStore(selectedIds)
+    setSavingLayers(false)
+    setSaveDialogOpen(false)
+    const failed = results.filter((r) => !r.ok)
+    if (failed.length > 0) {
+      alert(`${t('map.saveLayerFailed') || '部分图层保存失败'}:\n` + failed.map((f) => `${f.name}: ${f.error || ''}`).join('\n'))
+    }
+  }, [saveSelectedToStore, t])
+
+  // 另存为：保存落盘后弹出路径选择框，把 MapInfo 全套文件（.tab/.dat/.id/.map）zip 写到用户指定位置
+  const handleSaveLayersAs = useCallback(async (selectedIds: string[]) => {
+    if (selectedIds.length === 0) return
+    setSavingLayers(true)
+    const results = await saveSelectedToStore(selectedIds)
+    const okLayers = results.filter((r) => r.ok && r.layerId && r.dataId)
+    for (const r of okLayers) {
+      // 先弹路径选择框（依赖用户手势），再取数据写入
+      let target: SaveTarget | null
+      try {
+        target = await pickSaveTarget(`${r.name}.tab.zip`)
+      } catch (e: any) {
+        target = { kind: 'download' }
+      }
+      if (!target) continue // 用户取消路径选择
+      try {
+        const { blob, filename } = await layerApi.fetchLayerZip(r.dataId!, r.layerId!, r.name)
+        await writeSaveTarget(target, blob, filename)
+      } catch (e: any) {
+        console.error('[MapPage] 另存为失败', r.name, e)
+        results.push({ name: r.name, ok: false, error: e?.message || '导出失败' })
+      }
+    }
+    setSavingLayers(false)
+    setSaveDialogOpen(false)
+    const failed = results.filter((r) => !r.ok)
+    if (failed.length > 0) {
+      alert(`${t('map.saveLayerFailed') || '部分图层保存失败'}:\n` + failed.map((f) => `${f.name}: ${f.error || ''}`).join('\n'))
+    }
+  }, [saveSelectedToStore, t])
+
+  const dirtyLayerItems: DirtyLayerItem[] = dirtyLayerIds
+    .map((layerId) => ({
+      layerId,
+      name: layerFiles.find((f) => f.id === layerId)?.name || layerId,
+      changeCount: editWorkspaces[layerId]?.changeCount ?? 0,
+    }))
+
+  // 撤销（当前编辑图层）：工具栏按钮 / Ctrl+Z
+  const canUndoNow = !!editableLayerId && useLayerEditStore.getState().canUndo(editableLayerId)
+  const handleUndo = useCallback(() => {
+    const id = useLayerEditStore.getState().editableLayerId
+    if (id) useLayerEditStore.getState().undo(id)
+  }, [])
+
+  // Ctrl/Cmd+Z 撤销（先让 OnlineMap 的绘制态键优先处理 Backspace/Esc）
+  useEffect(() => {
+    const onUndoKey = (e: KeyboardEvent) => {
+      if (viewMode !== 'online') return
+      const target = e.target as HTMLElement | null
+      if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable)) return
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
+        const st = useLayerEditStore.getState()
+        if (st.editableLayerId) {
+          e.preventDefault()
+          st.undo(st.editableLayerId)
+        }
+      }
+    }
+    window.addEventListener('keydown', onUndoKey)
+    return () => window.removeEventListener('keydown', onUndoKey)
+  }, [viewMode])
 
   // 从mapStore获取定位点数据
   const { locationPoints, addLocationPoint, clearLocationPoints } = useMapStore()
@@ -614,6 +1146,46 @@ export function MapPage() {
   // 地图组件引用
   const onlineMapRef = useRef<OnlineMapRef>(null)
 
+  // 基站图层"默认设置"（图形透明度/边框宽度）恢复：store 变化时下发到渲染器。
+  // 扇区图层若在设置恢复前已构建完成（createSectorLayers 只读一次 store），
+  // 不补发会一直按 SECTOR_CONFIG 默认渲染。
+  useEffect(() => {
+    const colorMap = mapSettings.colorSettingsMap ?? {}
+    for (const layerId of ['lte-sectors', 'nr-sectors']) {
+      const c = colorMap[layerId]
+      if (c && onlineMapRef.current) {
+        onlineMapRef.current.setSectorColorSettings(layerId, {
+          fillOpacity: c.fillOpacity,
+          borderWidth: c.borderWidth
+        })
+      }
+    }
+  }, [mapSettings.colorSettingsMap])
+
+  /**
+   * 工参搜索定位前确保目标制式扇区图层可见（总开关+频点全可见+持久化）。
+   * 图层未勾选时扇区图形不渲染，红框高亮会无目标，与图层文件搜索自动开启图层行为对齐。
+   */
+  const ensureSectorLayerVisible = useCallback((networkType?: string) => {
+    const net: 'lte' | 'nr' = networkType === 'NR' ? 'nr' : 'lte'
+    const layerId = net === 'lte' ? 'lte-sectors' : 'nr-sectors'
+    const layer = layers.find(l => l.id === layerId)
+    if (layer?.visible) return
+
+    setLayers(prev => prev.map(l => (l.id === layerId ? { ...l, visible: true } : l)))
+    const currentVis = useMapStore.getState().mapSettings.layerVisibility
+    storeSetLayerVisibility(
+      net === 'lte' ? true : currentVis.lte,
+      net === 'nr' ? true : currentVis.nr
+    )
+    // 勾选总开关时该制式所有频点设为可见
+    setFrequencies(prev => ({
+      ...prev,
+      [net]: prev[net].map(f => ({ ...f, visible: true }))
+    }))
+    onlineMapRef.current?.setLayerVisibility(net, true)
+  }, [layers, storeSetLayerVisibility])
+
   /**
    * 选择搜索结果并定位
    */
@@ -631,25 +1203,88 @@ export function MapPage() {
         onlineMapRef.current.setSearchMarker({ lng: gcjLng, lat: gcjLat, name: result.name })
       }
     } else {
-      // 工参搜索
-      if (result.hasLocation && result.latitude !== undefined && result.longitude !== undefined) {
-        const gcjLat = result.latitude
-        const gcjLng = result.longitude
-
-        if (onlineMapRef.current) {
-          onlineMapRef.current.flyTo([gcjLat, gcjLng], 16)
-          onlineMapRef.current.setSearchMarker({
-            lng: gcjLng,
-            lat: gcjLat,
-            name: `${result.name} (${result.networkType})`
-          })
-        }
+      // 工参搜索：红色边框高亮目标扇区图形本身并飞行定位（与图层文件搜索一致，不再放中心标记点）
+      if (result.hasLocation && result.latitude !== undefined && result.longitude !== undefined && onlineMapRef.current) {
+        // 目标制式图层未勾选时自动开启（总开关+频点全可见），否则扇区图形不渲染、红框高亮无目标
+        ensureSectorLayerVisible(result.networkType)
+        onlineMapRef.current.locateSector({
+          id: result.id,
+          lat: result.latitude,
+          lng: result.longitude
+        })
       }
     }
 
     setSearchKeyword(result.name)
     setShowSearchResults(false)
+  }, [ensureSectorLayerVisible])
+
+  /**
+   * 搜索弹窗：工参搜索，直接复用原"搜索定位"工参模式逻辑
+   * （当前数据源 LTE/NR 小区缓存，匹配小区名/基站ID/小区ID，坐标为已转换的 displayLat/displayLng）
+   */
+  const handleDialogSearchWorkbook = useCallback((keyword: string) => {
+    const kw = keyword.trim().toLowerCase()
+    if (!kw) return []
+    const all = [...sectorDataCacheRef.current.lte, ...sectorDataCacheRef.current.nr]
+    return all
+      .filter(s => {
+        const nameMatch = s.name && s.name.toLowerCase().includes(kw)
+        const siteIdMatch = s.siteId && s.siteId.toLowerCase().includes(kw)
+        const sectorIdMatch = s.sectorId && s.sectorId.toLowerCase().includes(kw)
+        return nameMatch || siteIdMatch || sectorIdMatch
+      })
+      .slice(0, 50)
+      .map(s => ({
+        id: String(s.id),
+        name: s.name || '未命名',
+        networkType: s.networkType,
+        siteId: s.siteId,
+        sectorId: s.sectorId,
+        lat: s.displayLat,
+        lng: s.displayLng
+      }))
   }, [])
+
+  /**
+   * 搜索弹窗：工参结果定位（红色边框高亮扇区图形本身 + 飞行定位，与原搜索框工参定位一致）
+   * 目标制式图层未勾选时自动开启，否则扇区不渲染、红框无目标
+   */
+  const handleDialogLocateSector = useCallback((r: { id: string; lat: number; lng: number; networkType?: string }) => {
+    if (!onlineMapRef.current) return
+    ensureSectorLayerVisible(r.networkType)
+    onlineMapRef.current.locateSector({
+      id: r.id,
+      lat: r.lat,
+      lng: r.lng
+    })
+  }, [ensureSectorLayerVisible])
+
+  /**
+   * 搜索弹窗：图层文件/地理化要素定位
+   * 图层未勾选时自动开启（搜索定位不受框选互斥限制），OnlineMap 监听 props 变化后懒加载，
+   * 再由 locateLayerFeature 等待图层可见 → 红色边框高亮 → 飞行定位
+   */
+  const handleDialogLocateLayerFeature = useCallback(async (opts: {
+    layerId: string
+    featureId: string
+    center?: [number, number]
+    bounds?: [[number, number], [number, number]]
+  }) => {
+    const inLayerFiles = layerFiles.some(f => f.id === opts.layerId)
+    const target = (inLayerFiles ? layerFiles : pointFiles).find(f => f.id === opts.layerId)
+    if (target && !target.visible) {
+      if (inLayerFiles) {
+        setLayerFiles(prev => prev.map(f => (f.id === opts.layerId ? { ...f, visible: true } : f)))
+        storeSetLayerFileVisibility(opts.layerId, true)
+      } else {
+        setPointFiles(prev => prev.map(f => (f.id === opts.layerId ? { ...f, visible: true } : f)))
+        storeSetPointFileVisibility(opts.layerId, true)
+      }
+    }
+    if (!onlineMapRef.current) return false
+    return onlineMapRef.current.locateLayerFeature(opts)
+  }, [layerFiles, pointFiles, storeSetLayerFileVisibility, storeSetPointFileVisibility])
 
 
 
@@ -672,27 +1307,11 @@ export function MapPage() {
   const handleLayerFileToggle = useCallback((fileId: string, visible: boolean) => {
     console.log('[MapPage] handleLayerFileToggle:', fileId, 'visible:', visible)
 
-    if (visible && selectionMode !== 'none') {
-      // 计算当前可见的图层数量（包括扇区图层和其他图层文件）
-      let currentVisibleCount = 0
+    // 勾选/去勾选图层只改可见性，不影响"编辑"等其他开关状态
+    // （去勾选当前编辑图层时编辑会话保持激活，重新勾选后可继续编辑，未保存更改不丢）
 
-      // 统计可见的扇区图层数量（从layers状态获取）
-      const lteLayer = layers.find(l => l.id === 'lte-sectors')
-      const nrLayer = layers.find(l => l.id === 'nr-sectors')
-      if (lteLayer && lteLayer.visible) currentVisibleCount++
-      if (nrLayer && nrLayer.visible) currentVisibleCount++
-
-      // 统计可见的其他图层文件（MapInfo 和 Excel）
-      const otherFiles = [...layerFiles, ...pointFiles].filter(f => f.id !== fileId)
-      const otherVisibleFiles = otherFiles.filter(f => f.visible)
-      currentVisibleCount += otherVisibleFiles.length
-
-      // 如果已经有一个图层可见，则阻止启用新图层
-      if (currentVisibleCount >= 1) {
-        alert(t('map.onlyOneLayerInSelectMode') || '框选模式下只能圈选一个图层')
-        return
-      }
-    }
+    // 圈选模式下不再限制勾选图层数量：圈选目标由"可选"开关 + 图层层级决定
+    // （z-order 最高且可选开关打开的图层被圈选，其余可见图层仅展示）
 
     setLayerFiles(prev => prev.map(f =>
       f.id === fileId ? { ...f, visible } : f
@@ -712,7 +1331,25 @@ export function MapPage() {
 
     // 注意：不需要调用 onlineMapRef.current.setMapInfoLayerVisibility
     // 因为 OnlineMap 组件会通过 useEffect 监听 layerFiles prop 的变化自动处理
-  }, [selectionMode, layers, layerFiles, pointFiles, storeSetLayerFileVisibility, storeSetPointFileVisibility])
+  }, [layerFiles, storeSetLayerFileVisibility, storeSetPointFileVisibility])
+
+  /**
+   * 切换图层"可选"开关（控制面板鼠标箭头按钮）
+   * 仅 z-order 最高（跨类固定 基站>图层文件>地理化数据>装饰，类内按面板顺序）且开关打开的图层被圈选
+   */
+  const handleSelectableToggle = useCallback((layerId: string, selectable: boolean) => {
+    // 可编辑图层一定可选择：编辑开启时不可关闭该图层的"可选"开关
+    const editableId = useLayerEditStore.getState().editableLayerId
+    if (!selectable && editableId === layerId) return
+    storeSetLayerSelectable(layerId, selectable)
+  }, [storeSetLayerSelectable])
+
+  /**
+   * 类别内图层拖拽排序：newOrder 为该类别完整的图层 id 顺序（索引 0 = 面板最上）
+   */
+  const handleReorderLayers = useCallback((category: LayerCategory, newOrder: string[]) => {
+    storeSetLayerOrder(category, newOrder)
+  }, [storeSetLayerOrder])
 
   /**
    * 移除图层文件 (MapInfo)
@@ -1128,12 +1765,16 @@ export function MapPage() {
       onlineMapRef.current.clearSearchMarker()
       onlineMapRef.current.clearLocationMarkers()
       onlineMapRef.current.clearMeasurements()
+      // 同步清除搜索定位产生的红色高亮（图层文件/地理化要素 + 工参扇区）
+      onlineMapRef.current.clearLayerFeatureHighlight()
+      onlineMapRef.current.clearSectorHighlight()
     }
     // 清空定位点和测量点
     clearLocationPoints() // 使用全局store清除定位点
     setMeasurePoints([])
     setTotalDistance(null)
-    setMeasureMode(false)
+    // 注意：此处不退出测量工具（clearMeasurements 已清地图轨迹），
+    // 工具"粘滞"语义 —— 清除≠退出，退出需切换其他工具
     if (searchInputRef.current) {
       searchInputRef.current.focus()
     }
@@ -1541,6 +2182,53 @@ export function MapPage() {
   }, [storeSetThematicSettings, storeSetLayerFileVisibility, storeSetPointFileVisibility, storeSetColorSettings, layerFiles])
 
   /**
+   * 处理热力图设置变化（null 表示关闭）。
+   * 与专题图层同链路：本地 state + store 持久化 + 强制显示目标图层 + 下发 OnlineMap。
+   * 替换模式下原图形/标签的隐藏由 OnlineMap 内部处理。
+   */
+  const handleHeatmapSettingsChange = useCallback((node: TreeNode, settings: HeatmapSettings | null) => {
+    console.log('[MapPage] Heatmap settings change:', node, settings)
+
+    let layerId: string | undefined
+    if (node.type === 'layer-file' && node.layerFile) {
+      layerId = node.layerFile.id
+    } else if (node.type === 'sector-layer' && node.sectorLayer) {
+      layerId = node.sectorLayer.id
+    }
+    if (!layerId) return
+
+    setHeatmapSettingsMap(prev => {
+      const next = { ...prev }
+      if (settings === null) {
+        delete next[layerId as string]
+      } else {
+        next[layerId as string] = settings
+      }
+      return next
+    })
+    storeSetHeatmapSettings(layerId, settings)
+
+    if (!onlineMapRef.current) return
+
+    // 强制显示目标图层（与专题保存一致；替换模式下 OnlineMap 会再隐藏原图形）
+    if (node.type === 'sector-layer') {
+      setLayers(prev => prev.map(l => l.id === layerId ? { ...l, visible: true } : l))
+      onlineMapRef.current.setLayerVisibility(layerId === 'lte-sectors' ? 'lte' : 'nr', true)
+      onlineMapRef.current.setSectorHeatmapSettings(layerId, settings)
+    } else {
+      setLayerFiles(prev => prev.map(f => f.id === layerId ? { ...f, visible: true } : f))
+      setPointFiles(prev => prev.map(f => f.id === layerId ? { ...f, visible: true } : f))
+      const isInLayerFiles = layerFiles.some(f => f.id === layerId)
+      if (isInLayerFiles) {
+        storeSetLayerFileVisibility(layerId, true)
+      } else {
+        storeSetPointFileVisibility(layerId, true)
+      }
+      onlineMapRef.current.setLayerHeatmapSettings(layerId, settings)
+    }
+  }, [storeSetHeatmapSettings, storeSetLayerFileVisibility, storeSetPointFileVisibility, layerFiles])
+
+  /**
    * 图层预览（右键菜单）：居中并最大化显示该图层全部要素
    */
   const handleLayerPreview = useCallback((fileId: string) => {
@@ -1567,6 +2255,25 @@ export function MapPage() {
     storeSetThematicTemplates(templates.filter(t => t.id !== id))
   }, [mapSettings.thematicTemplates, storeSetThematicTemplates])
 
+  /**
+   * 保存热力图设置模板
+   */
+  const handleSaveHeatmapTemplate = useCallback((name: string, settings: HeatmapTemplate['settings']) => {
+    const templates = mapSettings.heatmapTemplates || []
+    storeSetHeatmapTemplates([
+      ...templates,
+      { id: `htpl-${Date.now()}`, name, settings: JSON.parse(JSON.stringify(settings)) }
+    ])
+  }, [mapSettings.heatmapTemplates, storeSetHeatmapTemplates])
+
+  /**
+   * 删除热力图设置模板
+   */
+  const handleRemoveHeatmapTemplate = useCallback((id: string) => {
+    const templates = mapSettings.heatmapTemplates || []
+    storeSetHeatmapTemplates(templates.filter(t => t.id !== id))
+  }, [mapSettings.heatmapTemplates, storeSetHeatmapTemplates])
+
   // 专题图例项：已勾选可见且启用专题的图层（含基站扇区图层）
   const thematicLegendItems = useMemo(() => {
     const tsMap = mapSettings.thematicSettingsMap || {}
@@ -1587,10 +2294,13 @@ export function MapPage() {
     return items
   }, [layerFiles, pointFiles, sectorLayers, mapSettings.thematicSettingsMap])
 
-  // 图例双击跳转：打开对应图层的专题图层设置
-  const [openThematicFor, setOpenThematicFor] = useState<{ layerId: string; ts: number } | null>(null)
+  // 图例双击跳转：打开对应图层的专题/热力图设置页
+  const [openThematicFor, setOpenThematicFor] = useState<{ layerId: string; ts: number; subTab?: 'thematic' | 'heatmap' } | null>(null)
   const handleLegendItemDoubleClick = useCallback((item: { id: string }) => {
-    setOpenThematicFor({ layerId: item.id, ts: Date.now() })
+    setOpenThematicFor({ layerId: item.id, ts: Date.now(), subTab: 'thematic' })
+  }, [])
+  const handleHeatmapLegendItemDoubleClick = useCallback((item: { id: string }) => {
+    setOpenThematicFor({ layerId: item.id, ts: Date.now(), subTab: 'heatmap' })
   }, [])
 
   // 专题图例统计（图例显示每个区间的个数与占比；other = 黑色“其他”要素数）
@@ -1615,10 +2325,429 @@ export function MapPage() {
     return () => clearTimeout(timer)
   }, [thematicLegendItems, fetchThematicStats])
 
+  // 热力图例项：已勾选可见且启用热力图的图层（含基站扇区图层）
+  const heatmapLegendItems = useMemo(() => {
+    const hsMap = mapSettings.heatmapSettingsMap || {}
+    const items: { id: string; name: string; settings: HeatmapSettings }[] = []
+    for (const f of [...layerFiles, ...pointFiles]) {
+      const hs = hsMap[f.id]
+      if (f.visible && hs?.enabled) {
+        items.push({ id: f.id, name: f.name, settings: hs })
+      }
+    }
+    for (const s of sectorLayers) {
+      const hs = hsMap[s.id]
+      if (s.visible && hs?.enabled) {
+        items.push({ id: s.id, name: s.type === 'LTE' ? 'LTE' : 'NR', settings: hs })
+      }
+    }
+    return items
+  }, [layerFiles, pointFiles, sectorLayers, mapSettings.heatmapSettingsMap])
+
+  // 热力图例统计（权重 min/max/点数/抽样）；图层可能仍在异步加载，延时重拉兜底
+  const [heatmapStats, setHeatmapStats] = useState<Record<string, HeatmapStats | null>>({})
+  useEffect(() => {
+    const ids = heatmapLegendItems.map(i => i.id)
+    if (ids.length === 0) {
+      setHeatmapStats({})
+      return
+    }
+    const fetchStats = () => {
+      if (!onlineMapRef.current) return
+      const next: Record<string, HeatmapStats | null> = {}
+      for (const id of ids) {
+        next[id] = onlineMapRef.current.getHeatmapStats(id)
+      }
+      setHeatmapStats(prev => ({ ...prev, ...next }))
+    }
+    fetchStats()
+    const timer = setTimeout(fetchStats, 2000)
+    return () => clearTimeout(timer)
+  }, [heatmapLegendItems])
+
+  // 热力图挂载/重挂载重放兜底：地图实例跨页面缓存复用、大图层异步构建晚于设置恢复时，
+  // 延时幂等重放一次已保存的热力设置（OnlineMap 内部按 layerId 复用，不产生重复图层）
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      onlineMapRef.current?.replayHeatmapSettings()
+    }, 2000)
+    return () => clearTimeout(timer)
+  }, [])
+
+  // ===== 工具栏按钮（id → JSX）：渲染顺序由 toolbarPrefs.order 决定（右键菜单/拖拽可调） =====
+  const toolbarButtons: Record<string, ReactNode> = {
+    /* 保存按钮：有未保存编辑时可点击，弹窗选择保存哪些图层 */
+    save: (
+      <button
+        className={`px-2 py-1.5 text-xs rounded transition-colors flex items-center gap-1 ${
+          dirtyLayerIds.length > 0
+            ? 'text-foreground hover:bg-muted hover:text-primary'
+            : 'text-muted-foreground/40 cursor-not-allowed'
+        }`}
+        disabled={dirtyLayerIds.length === 0}
+        onClick={() => setSaveDialogOpen(true)}
+        title={t('map.saveLayersHint') || '保存有未保存编辑的图层（Ctrl+S）'}
+      >
+        <Save size={14} />
+        <span className="toolbar-label">{t('common.save') || '保存'}</span>
+        {dirtyLayerIds.length > 0 && (
+          <span className="ml-0.5 min-w-[16px] h-4 px-1 rounded-full bg-amber-500 text-white text-[10px] flex items-center justify-center">
+            {dirtyLayerIds.length}
+          </span>
+        )}
+      </button>
+    ),
+
+    /* 导出按钮：弹框列出所有导入的文件，勾选后导出到本地（TAB 套装 zip / 表格 xlsx） */
+    export: (
+      <button
+        className="px-2 py-1.5 text-xs rounded transition-colors flex items-center gap-1 text-foreground hover:bg-muted hover:text-primary"
+        onClick={() => setExportDialogOpen(true)}
+        title={t('map.exportFilesHint') || '导出已导入的文件到本地'}
+      >
+        <Download size={14} />
+        <span className="toolbar-label">{t('map.exportAction') || '导出'}</span>
+      </button>
+    ),
+
+    /* 撤销按钮：撤销当前编辑图层的最近一次操作（Ctrl+Z） */
+    undo: (
+      <button
+        className={`px-2 py-1.5 text-xs rounded transition-colors flex items-center gap-1 ${
+          canUndoNow
+            ? 'text-foreground hover:bg-muted hover:text-primary'
+            : 'text-muted-foreground/40 cursor-not-allowed'
+        }`}
+        disabled={!canUndoNow}
+        onClick={handleUndo}
+        title={t('map.undoHint') || '撤销当前编辑图层的操作（Ctrl+Z）'}
+      >
+        <Undo2 size={14} />
+        <span className="toolbar-label">{t('map.undo') || '撤销'}</span>
+      </button>
+    ),
+
+    /* 提取坐标按钮 */
+    capture: (
+      <button
+        className={`px-2 py-1.5 text-xs rounded transition-colors flex items-center gap-1 ${captureMode ? 'bg-blue-400 text-white hover:bg-blue-500' : 'text-foreground hover:bg-muted hover:text-primary'}`}
+        onClick={() => {
+          // 打点工具"粘滞"：已激活时再次点击不关闭，只能通过切换到其他工具退出
+          if (captureMode) return
+          setCaptureMode(true)
+          setMeasureMode(false)
+          setSelectionMode('none')
+          setMapDragTool(false)
+          // 与绘制工具互斥：激活打点时退出绘制与选择
+          useLayerEditStore.getState().setDrawTool('none')
+          useLayerEditStore.getState().setSelectMode(false)
+        }}
+        title={captureMode ? (t('map.exitCaptureMode') || '退出打点') : (t('map.captureModeHint') || '点击地图任意位置抓取WGS84坐标')}
+      >
+        <div className="w-4 h-4 flex items-center justify-center">
+          <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/><circle cx="12" cy="10" r="3"/></svg>
+        </div>
+        <span className="toolbar-label">{captureMode ? (t('map.exitCaptureMode') || '退出打点') : (t('map.extractCoord') || '打点')}</span>
+      </button>
+    ),
+
+    /* 测距按钮 */
+    measure: (
+      <button
+        className={`px-2 py-1.5 text-xs rounded transition-colors flex items-center gap-1 ${measureMode ? 'bg-blue-400 text-white hover:bg-blue-500' : 'text-foreground hover:bg-muted hover:text-primary'
+          }`}
+        onClick={() => {
+          // 测距工具"粘滞"：已激活时再次点击不关闭，只能通过切换到其他工具退出
+          if (measureMode) return
+          setMeasureMode(true)
+          setCaptureMode(false)
+          setCaptureCoord(null)
+          setSelectionMode('none')
+          setMapDragTool(false)
+          // 与绘制工具互斥：激活测距时退出绘制与选择
+          useLayerEditStore.getState().setDrawTool('none')
+          useLayerEditStore.getState().setSelectMode(false)
+        }}
+        title={measureMode ? (t('map.exitDistanceMode') || '退出测距模式') : (t('map.distanceMode') || '测距工具')}
+      >
+        <div className="w-4 h-4 flex items-center justify-center">
+          <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M8 2h8v20H8V2z"></path><path d="M13 6h3"></path><path d="M13 10h3"></path><path d="M13 14h3"></path><path d="M13 18h3"></path></svg>
+        </div>
+        <span className="toolbar-label">{t('map.measure') || '测距'}</span>
+      </button>
+    ),
+
+    /* 地图拖拽（手形）工具按钮：保持激活，再次点击不去激活，点击其他工具切换出去 */
+    drag: (
+      <button
+        className={`px-2 py-1.5 text-xs rounded transition-colors flex items-center gap-1 ${mapDragTool ? 'bg-blue-400 text-white hover:bg-blue-500' : 'text-foreground hover:bg-muted hover:text-primary'
+          }`}
+        onClick={handleMapDragToolToggle}
+        title={mapDragTool ? (t('map.dragActiveHint') || '手形工具已激活（点击其他工具切换出去）') : (t('map.enableDrag') || '启用地图拖拽')}
+      >
+        <Hand size={14} />
+        <span className="toolbar-label">{t('map.drag') || '拖拽'}</span>
+      </button>
+    ),
+
+    /* 选择按钮：点击要素选中（可编辑图层显示可拖拽顶点），双击要素弹属性与风格配置。
+       标签始终显示"选择"并保持高亮，不再切换为"退出选择" */
+    select: (
+      <button
+        className={`px-2 py-1.5 text-xs rounded transition-colors flex items-center gap-1 ${selectMode ? 'bg-blue-400 text-white hover:bg-blue-500' : 'text-foreground hover:bg-muted hover:text-primary'}`}
+        onClick={handleSelectToolToggle}
+        title={t('map.selectToolHint') || '点击地图要素选中，双击要素查看属性并配置风格'}
+      >
+        <MousePointer2 size={14} />
+        <span className="toolbar-label">{t('map.selectTool') || '选择'}</span>
+      </button>
+    ),
+
+    /* 圈选按钮（框选/圆形/多边形） */
+    marquee: (
+      <div className="relative" ref={selectionMenuRef}>
+        <button
+          className={`px-2 py-1.5 text-xs rounded transition-colors flex items-center gap-1 ${selectionMode !== 'none' ? 'bg-blue-400 text-white hover:bg-blue-500' : 'text-foreground hover:bg-muted hover:text-primary'
+            }`}
+          onClick={() => {
+            if (selectionMode !== 'none') {
+              // 圈选工具"粘滞"：已激活时再次点击不退出，只收起菜单（切换到其他工具才退出）
+              setShowSelectionMenu(false)
+            } else {
+              // 否则显示框选菜单
+              setShowSelectionMenu(!showSelectionMenu)
+            }
+          }}
+          title={selectionMode !== 'none' ? (t('map.exitSelectMode') || '退出框选模式（按ESC也可退出）') : (t('map.mapSelectTool') || '地图圈选工具')}
+        >
+          {selectionMode === 'point' && <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/></svg>}
+          {selectionMode === 'circle' && <CircleIcon size={14} />}
+          {selectionMode === 'polygon' && <Pentagon size={14} />}
+          {selectionMode === 'none' && <BoxSelect size={14} />}
+          <span className="toolbar-label">
+            {selectionMode === 'point'
+              ? (t('map.pointSelect') || '框选')
+              : selectionMode === 'circle'
+                ? (t('map.circleSelect') || '圆形')
+                : selectionMode === 'polygon'
+                  ? (t('map.polygonSelect') || '多边形')
+                  : (t('map.marqueeSelect') || '圈选')}
+          </span>
+          {selectionMode === 'none' && (
+            <svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" className="ml-0.5 opacity-60">
+              <path d="m6 9 6 6 6-6"/>
+            </svg>
+          )}
+        </button>
+        {showSelectionMenu && (
+          <div className="absolute top-full left-0 mt-1 z-[3000] bg-card border border-border rounded-lg shadow-lg w-32 overflow-hidden">
+            <button
+              onClick={() => handleSelectionModeChange('point')}
+              className="w-full text-left px-2 py-1.5 text-xs text-foreground hover:bg-muted hover:text-primary transition-colors flex items-center gap-1"
+            >
+              <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/></svg>
+              {t('map.pointSelect') || '框选'}
+            </button>
+            <button
+              onClick={() => handleSelectionModeChange('circle')}
+              className="w-full text-left px-2 py-1.5 text-xs text-foreground hover:bg-muted hover:text-primary transition-colors flex items-center gap-1"
+            >
+              <CircleIcon size={12} />
+              {t('map.circleSelect') || '圆形'}
+            </button>
+            <button
+              onClick={() => handleSelectionModeChange('polygon')}
+              className="w-full text-left px-2 py-1.5 text-xs text-foreground hover:bg-muted hover:text-primary transition-colors flex items-center gap-1"
+            >
+              <Pentagon size={12} />
+              {t('map.polygonSelect') || '多边形'}
+            </button>
+          </div>
+        )}
+      </div>
+    ),
+
+    /* 新建图层菜单 */
+    new: (
+      <div className="relative" ref={newMenuRef}>
+        <button
+          className={`px-2 py-1.5 text-xs rounded transition-colors flex items-center gap-1 ${openMenu === 'new' ? 'bg-muted text-primary' : 'text-foreground hover:bg-muted hover:text-primary'}`}
+          onClick={() => setOpenMenu(openMenu === 'new' ? null : 'new')}
+          title={t('map.newLayer') || '新建图层（Ctrl+N）'}
+        >
+          <FilePlus2 size={14} />
+          <span className="toolbar-label">{t('map.newLayer') || '新建'}</span>
+          <svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" className="ml-0.5 opacity-60">
+            <path d="m6 9 6 6 6-6"/>
+          </svg>
+        </button>
+        {openMenu === 'new' && (
+          <div className="absolute top-full left-0 mt-1 z-[3000] bg-card border border-border rounded-lg shadow-lg w-36 overflow-hidden">
+            <button
+              onClick={() => { setOpenMenu(null); setNewLayerDialogOpen(true) }}
+              className="w-full text-left px-2 py-1.5 text-xs text-foreground hover:bg-muted hover:text-primary transition-colors flex items-center gap-1.5"
+            >
+              <FilePlus2 size={12} />
+              {t('map.tabLayer') || 'TAB图层'}
+            </button>
+          </div>
+        )}
+      </div>
+    ),
+
+    /* 绘制工具下拉：点 / 线 / 面（互斥，需先打开图层编辑开关） */
+    draw: (
+      <div className="relative" ref={drawMenuRef}>
+        <button
+          className={`px-2 py-1.5 text-xs rounded transition-colors flex items-center gap-1 ${drawTool !== 'none' ? 'bg-blue-400 text-white hover:bg-blue-500' : 'text-foreground hover:bg-muted hover:text-primary'}`}
+          onClick={() => setOpenMenu(openMenu === 'draw' ? null : 'draw')}
+          title={t('map.drawHint') || '在可编辑图层绘制点/线/面'}
+        >
+          {drawTool === 'point' && <MapPin size={14} />}
+          {drawTool === 'line' && <Spline size={14} />}
+          {drawTool === 'polygon' && <Hexagon size={14} />}
+          {drawTool === 'none' && <PenLine size={14} />}
+          <span className="toolbar-label">
+            {drawTool === 'point' ? (t('map.point') || '点')
+              : drawTool === 'line' ? (t('map.line') || '线')
+                : drawTool === 'polygon' ? (t('map.polygon') || '面')
+                  : (t('map.draw') || '绘制')}
+          </span>
+          <svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" className="ml-0.5 opacity-60">
+            <path d="m6 9 6 6 6-6"/>
+          </svg>
+        </button>
+        {openMenu === 'draw' && (
+          <div className="absolute top-full left-0 mt-1 z-[3000] bg-card border border-border rounded-lg shadow-lg w-32 overflow-hidden">
+            <button
+              onClick={() => { setOpenMenu(null); handleDrawTool('point') }}
+              className="w-full text-left px-2 py-1.5 text-xs text-foreground hover:bg-muted hover:text-primary transition-colors flex items-center gap-1.5"
+            >
+              <MapPin size={13} />
+              {t('map.drawPoint') || '绘制点'}
+            </button>
+            <button
+              onClick={() => { setOpenMenu(null); handleDrawTool('line') }}
+              className="w-full text-left px-2 py-1.5 text-xs text-foreground hover:bg-muted hover:text-primary transition-colors flex items-center gap-1.5"
+            >
+              <Spline size={13} />
+              {t('map.drawLine') || '绘制线'}
+            </button>
+            <button
+              onClick={() => { setOpenMenu(null); handleDrawTool('polygon') }}
+              className="w-full text-left px-2 py-1.5 text-xs text-foreground hover:bg-muted hover:text-primary transition-colors flex items-center gap-1.5"
+            >
+              <Hexagon size={13} />
+              {t('map.drawPolygon') || '绘制面'}
+            </button>
+          </div>
+        )}
+      </div>
+    ),
+
+    /* 样式按钮：直接打开点/线/面样式弹框（弹框内切换页签），不再走下拉菜单 */
+    style: (
+      <button
+        className="px-2 py-1.5 text-xs rounded transition-colors flex items-center gap-1 text-foreground hover:bg-muted hover:text-primary"
+        onClick={() => setStyleModalTab('point')}
+        title={t('map.styleHint') || '点/线/面样式设置'}
+      >
+        <Palette size={14} />
+        <span className="toolbar-label">{t('map.style') || '样式'}</span>
+      </button>
+    ),
+
+    /* 粘贴按钮：把圈选复制的要素粘贴到当前编辑图层（目标图层需勾选可见） */
+    paste: (
+      <button
+        className={`px-2 py-1.5 text-xs rounded transition-colors flex items-center gap-1 ${
+          pasteTargetReady
+            ? 'text-foreground hover:bg-muted hover:text-primary'
+            : 'text-muted-foreground/40 cursor-not-allowed'
+        }`}
+        disabled={!pasteTargetReady}
+        onClick={handlePasteFeatures}
+        title={t('map.pasteSelectionHint') || '把圈选复制的要素粘贴到当前编辑图层（需先在图层控制打开"编辑"开关，且图层处于勾选状态）'}
+      >
+        <ClipboardPaste size={14} />
+        <span className="toolbar-label">{t('map.pasteSelection') || '粘贴'}</span>
+        {clipboardItems.length > 0 && (
+          <span className="ml-0.5 min-w-[16px] h-4 px-1 rounded-full bg-blue-500 text-white text-[10px] flex items-center justify-center">
+            {clipboardItems.length}
+          </span>
+        )}
+      </button>
+    ),
+
+    /* 地图类型切换按钮：平面图 → 卫星图 → 关闭底图 三态循环 */
+    maptype: (
+      <button
+        onClick={() => {
+          if (!onlineMapVisible) {
+            // 关闭状态 → 恢复平面图
+            handleOnlineMapToggle(true)
+            handleMapTypeChange('roadmap')
+          } else if (mapType === 'roadmap') {
+            // 平面图 → 卫星图
+            handleMapTypeChange('satellite')
+          } else {
+            // 卫星图 → 关闭底图
+            handleOnlineMapToggle(false)
+          }
+        }}
+        className={`flex items-center gap-1 px-2 py-1.5 text-xs rounded transition-colors ${
+          onlineMapVisible
+            ? 'text-foreground hover:bg-muted hover:text-primary'
+            : 'text-foreground hover:bg-muted hover:text-primary'
+        }`}
+        title={!onlineMapVisible
+          ? (t('map.switchToRoadmap') || '切换到平面图')
+          : mapType === 'roadmap'
+            ? (t('map.switchToSatellite') || '切换到卫星图')
+            : (t('map.emptyMap') || '空地图')}
+      >
+        {!onlineMapVisible ? (
+          <>
+            <MapIcon size={14} />
+            <span className="toolbar-label">{t('map.emptyMap') || '空地图'}</span>
+          </>
+        ) : mapType === 'roadmap' ? (
+          <>
+            <MapIcon size={14} />
+            <span className="toolbar-label">{t('map.vector') || '平面图'}</span>
+          </>
+        ) : (
+          <>
+            <Satellite size={14} />
+            <span className="toolbar-label">{t('map.satellite') || '卫星图'}</span>
+          </>
+        )}
+      </button>
+    ),
+
+    /* 全屏按钮 */
+    fullscreen: (
+      <button
+        onClick={toggleFullscreen}
+        className="flex items-center gap-1 px-2 py-1.5 text-xs rounded transition-colors text-foreground hover:bg-muted hover:text-primary"
+        title={isFullscreen ? (t('map.exitFullscreen') || '退出全屏') : (t('map.fullscreen') || '全屏')}
+      >
+        {isFullscreen ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
+        <span className="toolbar-label">{isFullscreen ? (t('map.exitFullscreen') || '退出全屏') : (t('map.fullscreen') || '全屏')}</span>
+      </button>
+    ),
+  }
+
   return (
     <div ref={mapPageRef} className="flex flex-col h-full min-h-0">
-      {/* 地图工具栏 */}
-      <div className="h-14 bg-card border-b border-border flex items-center justify-start px-4 flex-shrink-0 gap-4">
+      {/* 地图工具栏（右键可设置标签显隐/按钮顺序） */}
+      <div
+        className={`h-14 bg-background border-b border-border/60 flex items-center justify-start px-4 flex-shrink-0 gap-4 ${toolbarPrefs.showLabels ? '' : 'npt-hide-toolbar-labels'}`}
+        onContextMenu={(e) => {
+          e.preventDefault()
+          setToolbarMenu({ x: e.clientX, y: e.clientY })
+        }}
+      >
         <div className="flex items-center gap-4">
 
           {/* 数据源状态指示 - 绿色已加载/红色未加载 */}
@@ -1668,7 +2797,7 @@ export function MapPage() {
                 setTimeout(() => setShowSearchResults(false), 200)
               }}
               placeholder={searchMode === 'map' ? (t('map.inputPlaceHint') || '输入地名、道路名称等') : (t('map.inputLocationHint') || '输入小区名、基站ID或经纬度(经度,纬度)')}
-              className="w-full pl-3 pr-16 py-1.5 text-xs border border-border rounded-lg bg-background focus:outline-none focus:ring-2 focus:ring-primary placeholder:text-muted-foreground"
+              className="w-full pl-3 pr-16 py-1.5 text-xs border border-border rounded-lg bg-card focus:outline-none focus:ring-2 focus:ring-primary placeholder:text-muted-foreground"
             />
 
             {/* 右侧按钮组：搜索/清除 */}
@@ -1737,7 +2866,7 @@ export function MapPage() {
                             <div className="flex-1 min-w-0">
                               <div className="flex items-center gap-2">
                                 <span className="font-medium truncate">{result.name}</span>
-                                <span className={`text-xs px-1.5 py-0.5 rounded ${result.networkType === 'LTE' ? 'bg-blue-100 text-blue-700' : 'bg-green-100 text-green-700'}`}>
+                                <span className={`text-xs px-1.5 py-0.5 rounded ${result.networkType === 'LTE' ? 'bg-blue-500/15 text-blue-400' : 'bg-green-500/15 text-green-400'}`}>
                                   {result.networkType}
                                 </span>
                               </div>
@@ -1780,9 +2909,8 @@ export function MapPage() {
           {/* 独立的清除搜索标记按钮，使用文字标签 */}
           <button
             onClick={() => {
+              // 只清除各工具的轨迹/标记/选中状态，不退出已激活工具（打点/测量/圈选保持激活）
               clearAllSearch()
-              setSelectionMode('none')
-              setCaptureMode(false)
               setCaptureCoord(null)
               selectionManager.clearSelection()
               if (onlineMapRef.current) {
@@ -1790,188 +2918,43 @@ export function MapPage() {
                 onlineMapRef.current.clearNeighborHighlight()
                 onlineMapRef.current.clearSelectionHighlight()
                 onlineMapRef.current.clearCaptureMarkers()
+                onlineMapRef.current.clearMeasurements()
+                onlineMapRef.current.clearShapeSelection()
               }
             }}
             className="px-2 py-1.5 text-xs rounded hover:bg-muted transition-colors text-foreground hover:text-primary flex items-center gap-1"
             title={t('map.clearAllMarkers') || '清除所有搜索标记和圈选状态'}
           >
             <Trash2 size={14} />
-            {t('map.clear') || '清除'}
+            <span className="toolbar-label">{t('map.clear') || '清除'}</span>
           </button>
 
-          {/* 提取坐标按钮 */}
-          <button
-            className={`px-2 py-1.5 text-xs rounded transition-colors flex items-center gap-1 ${captureMode ? 'bg-blue-400 text-white hover:bg-blue-500' : 'text-foreground hover:bg-muted hover:text-primary'}`}
-            onClick={() => {
-              // 激活/关闭提取坐标：激活时关闭所有其他互斥模式
-              const newMode = !captureMode
-              if (newMode) {
-                setMeasureMode(false)
-                setSelectionMode('none')
-                setMapDragTool(false)
-              } else {
-                setCaptureCoord(null)
-              }
-              setCaptureMode(newMode)
-            }}
-            title={captureMode ? (t('map.exitCaptureMode') || '退出打点') : (t('map.captureModeHint') || '点击地图任意位置抓取WGS84坐标')}
-          >
-            <div className="w-4 h-4 flex items-center justify-center">
-              <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/><circle cx="12" cy="10" r="3"/></svg>
-            </div>
-            <span>{captureMode ? (t('map.exitCaptureMode') || '退出打点') : (t('map.extractCoord') || '打点')}</span>
-          </button>
-
-          {/* 测距按钮 */}
-          <button
-            className={`px-2 py-1.5 text-xs rounded transition-colors flex items-center gap-1 ${measureMode ? 'bg-blue-400 text-white hover:bg-blue-500' : 'text-foreground hover:bg-muted hover:text-primary'
-              }`}
-            onClick={() => {
-              const newState = !measureMode
-              setMeasureMode(newState)
-              if (newState) {
-                // 激活测距：关闭所有其他互斥模式
-                setCaptureMode(false)
-                setCaptureCoord(null)
-                setSelectionMode('none')
-                setMapDragTool(false)
-              }
-            }}
-            title={measureMode ? (t('map.exitDistanceMode') || '退出测距模式') : (t('map.distanceMode') || '测距工具')}
-          >
-            <div className="w-4 h-4 flex items-center justify-center">
-              <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M8 2h8v20H8V2z"></path><path d="M13 6h3"></path><path d="M13 10h3"></path><path d="M13 14h3"></path><path d="M13 18h3"></path></svg>
-            </div>
-            <span>{t('map.measure') || '测距'}</span>
-          </button>
-
-          {/* 地图拖拽工具按钮 - 始终显示 */}
-          <button
-            className={`px-2 py-1.5 text-xs rounded transition-colors flex items-center gap-1 ${mapDragTool ? 'bg-blue-400 text-white hover:bg-blue-500' : 'text-foreground hover:bg-muted hover:text-primary'
-              }`}
-            onClick={handleMapDragToolToggle}
-            title={mapDragTool ? (t('map.disableDrag') || '禁用地图拖拽') : (t('map.enableDrag') || '启用地图拖拽')}
-          >
-            <Hand size={14} />
-            <span>{t('map.drag') || '拖拽'}</span>
-          </button>
-
-          {/* 圈选按钮 */}
-          <div className="relative" ref={selectionMenuRef}>
-            <button
-              className={`px-2 py-1.5 text-xs rounded transition-colors flex items-center gap-1 ${selectionMode !== 'none' ? 'bg-blue-400 text-white hover:bg-blue-500' : 'text-foreground hover:bg-muted hover:text-primary'
-                }`}
-              onClick={() => {
-                if (selectionMode !== 'none') {
-                  // 退出框选模式，但保留已选中的要素高亮（持久化）
-                  // 只有"清除"按钮才清除选中状态
-                  setSelectionMode('none')
-                } else {
-                  // 否则显示框选菜单
-                  setShowSelectionMenu(!showSelectionMenu)
-                }
+          {/* 工具栏按钮：渲染顺序由用户设置决定（右键工具栏可配置），按钮可拖拽调整位置 */}
+          {toolbarPrefs.order.map((id) => (
+            <div
+              key={id}
+              className="flex items-center"
+              draggable
+              onDragStart={(e) => {
+                toolbarDragIdRef.current = id
+                e.dataTransfer.effectAllowed = 'move'
+                e.dataTransfer.setData('text/plain', id)
+                // 拖动过程中显示"移动中"光标（与图层面板拖动排序一致）
+                ;(e.currentTarget as HTMLElement).style.cursor = 'grabbing'
               }}
-              title={selectionMode !== 'none' ? (t('map.exitSelectMode') || '退出框选模式（按ESC也可退出）') : (t('map.mapSelectTool') || '地图圈选工具')}
+              onDragOver={(e) => e.preventDefault()}
+              onDrop={(e) => {
+                e.preventDefault()
+                handleToolbarDrop(id)
+              }}
+              onDragEnd={(e) => {
+                const el = e.currentTarget as HTMLElement
+                el.style.cursor = ''
+              }}
             >
-              {selectionMode === 'point' && <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/></svg>}
-              {selectionMode === 'circle' && <CircleIcon size={14} />}
-              {selectionMode === 'polygon' && <Pentagon size={14} />}
-              {selectionMode === 'none' && <MousePointer2 size={14} />}
-              <span>
-                {selectionMode === 'point'
-                  ? (t('map.pointSelect') || '框选')
-                  : selectionMode === 'circle'
-                    ? (t('map.circleSelect') || '圆形')
-                    : selectionMode === 'polygon'
-                      ? (t('map.polygonSelect') || '多边形')
-                      : (t('map.select') || '选择')}
-              </span>
-              {selectionMode === 'none' && (
-                <svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" className="ml-0.5 opacity-60">
-                  <path d="m6 9 6 6 6-6"/>
-                </svg>
-              )}
-            </button>
-            {showSelectionMenu && (
-              <div className="absolute top-full left-0 mt-1 z-[3000] bg-card border border-border rounded-lg shadow-lg w-32 overflow-hidden">
-                <button
-                  onClick={() => handleSelectionModeChange('point')}
-                  className="w-full text-left px-2 py-1.5 text-xs text-foreground hover:bg-muted hover:text-primary transition-colors flex items-center gap-1"
-                >
-                  <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/></svg>
-                  {t('map.pointSelect') || '框选'}
-                </button>
-                <button
-                  onClick={() => handleSelectionModeChange('circle')}
-                  className="w-full text-left px-2 py-1.5 text-xs text-foreground hover:bg-muted hover:text-primary transition-colors flex items-center gap-1"
-                >
-                  <CircleIcon size={12} />
-                  {t('map.circleSelect') || '圆形'}
-                </button>
-                <button
-                  onClick={() => handleSelectionModeChange('polygon')}
-                  className="w-full text-left px-2 py-1.5 text-xs text-foreground hover:bg-muted hover:text-primary transition-colors flex items-center gap-1"
-                >
-                  <Pentagon size={12} />
-                  {t('map.polygonSelect') || '多边形'}
-                </button>
-              </div>
-            )}
-          </div>
-
-          {/* 地图类型切换按钮：平面图 → 卫星图 → 关闭底图 三态循环 */}
-          <button
-            onClick={() => {
-              if (!onlineMapVisible) {
-                // 关闭状态 → 恢复平面图
-                handleOnlineMapToggle(true)
-                handleMapTypeChange('roadmap')
-              } else if (mapType === 'roadmap') {
-                // 平面图 → 卫星图
-                handleMapTypeChange('satellite')
-              } else {
-                // 卫星图 → 关闭底图
-                handleOnlineMapToggle(false)
-              }
-            }}
-            className={`flex items-center gap-1 px-2 py-1.5 text-xs rounded transition-colors ${
-              onlineMapVisible
-                ? 'text-foreground hover:bg-muted hover:text-primary'
-                : 'text-foreground hover:bg-muted hover:text-primary'
-            }`}
-            title={!onlineMapVisible
-              ? (t('map.switchToRoadmap') || '切换到平面图')
-              : mapType === 'roadmap'
-                ? (t('map.switchToSatellite') || '切换到卫星图')
-                : (t('map.emptyMap') || '空地图')}
-          >
-            {!onlineMapVisible ? (
-              <>
-                <MapIcon size={14} />
-                <span>{t('map.emptyMap') || '空地图'}</span>
-              </>
-            ) : mapType === 'roadmap' ? (
-              <>
-                <MapIcon size={14} />
-                <span>{t('map.vector') || '平面图'}</span>
-              </>
-            ) : (
-              <>
-                <Satellite size={14} />
-                <span>{t('map.satellite') || '卫星图'}</span>
-              </>
-            )}
-          </button>
-
-          {/* 全屏按钮 */}
-          <button
-            onClick={toggleFullscreen}
-            className="flex items-center gap-1 px-2 py-1.5 text-xs rounded transition-colors text-foreground hover:bg-muted hover:text-primary"
-            title={isFullscreen ? (t('map.exitFullscreen') || '退出全屏') : (t('map.fullscreen') || '全屏')}
-          >
-            {isFullscreen ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
-            <span>{isFullscreen ? (t('map.exitFullscreen') || '退出全屏') : (t('map.fullscreen') || '全屏')}</span>
-          </button>
+              {toolbarButtons[id]}
+            </div>
+          ))}
 
         </div>
 
@@ -2013,6 +2996,8 @@ export function MapPage() {
               onCaptureBlocked={handleCaptureBlocked}
               decorationLayerVisible={decorationLayer.visible}
               decorationLabelVisible={decorationLabelVisible}
+              layerOrder={mapSettings.layerOrder}
+              selectableMap={mapSettings.selectableMap}
             />
 
             {/* 图层控制面板 */}
@@ -2043,27 +3028,144 @@ export function MapPage() {
               colorSettingsMap={colorSettingsMap}
               onThematicSettingsChange={handleThematicSettingsChange}
               thematicSettingsMap={thematicSettingsMap}
+              onHeatmapSettingsChange={handleHeatmapSettingsChange}
+              heatmapSettingsMap={heatmapSettingsMap}
+              heatmapStats={heatmapStats}
               openThematicFor={openThematicFor}
               onLayerPreview={handleLayerPreview}
               thematicTemplates={mapSettings.thematicTemplates || []}
               onSaveThematicTemplate={handleSaveThematicTemplate}
               onRemoveThematicTemplate={handleRemoveThematicTemplate}
+              heatmapTemplates={mapSettings.heatmapTemplates || []}
+              onSaveHeatmapTemplate={handleSaveHeatmapTemplate}
+              onRemoveHeatmapTemplate={handleRemoveHeatmapTemplate}
               sectorData={sectorDataCache}
               onFrequencyColorChange={handleFrequencyColorChange}
               decorationLayer={decorationLayer}
               onDecorationLayerToggle={handleDecorationLayerToggle}
               decorationLabelVisible={decorationLabelVisible}
               onDecorationLabelToggle={handleDecorationLabelToggle}
+              layerOrder={mapSettings.layerOrder}
+              selectableMap={mapSettings.selectableMap}
+              onSelectableToggle={handleSelectableToggle}
+              editableLayerId={editableLayerId}
+              onEditableToggle={handleEditableToggle}
+              onReorderLayers={handleReorderLayers}
             />
 
             {/* 专题图层图例（随图层勾选/配置实时刷新；双击图例跳转专题设置） */}
             <ThematicLegend items={thematicLegendItems} stats={thematicStats} onItemDoubleClick={handleLegendItemDoubleClick} />
+            {/* 热力图图例（连续渐变色带 + 权重 min/max + 点数） */}
+            <HeatmapLegend items={heatmapLegendItems} stats={heatmapStats} onItemDoubleClick={handleHeatmapLegendItemDoubleClick} />
 
           </>
         ) : (
           <OfflineMap data={offlineData} offlinePath={offlinePath} />
         )}
       </div>
+
+      {/* Ctrl+F 地图搜索弹窗（仅在线模式：数据源搜索 + 定位高亮） */}
+      {viewMode === 'online' && (
+        <MapSearchDialog
+          open={searchDialogOpen}
+          onOpenChange={setSearchDialogOpen}
+          searchWorkbook={handleDialogSearchWorkbook}
+          workbookSourceName={currentDataSourceFile || undefined}
+          onLocateSector={handleDialogLocateSector}
+          onLocateLayerFeature={handleDialogLocateLayerFeature}
+        />
+      )}
+
+      {/* 新建 TAB 图层弹窗（Ctrl+N） */}
+      {viewMode === 'online' && (
+        <NewLayerDialog
+          open={newLayerDialogOpen}
+          onClose={() => setNewLayerDialogOpen(false)}
+          onCreated={handleLayerCreated}
+        />
+      )}
+
+      {/* 保存图层弹窗（Ctrl+S）：列出未保存编辑的图层供勾选 */}
+      {viewMode === 'online' && (
+        <SaveLayersDialog
+          open={saveDialogOpen}
+          dirtyLayers={dirtyLayerItems}
+          saving={savingLayers}
+          onClose={() => setSaveDialogOpen(false)}
+          onSave={handleSaveLayers}
+          onSaveAs={handleSaveLayersAs}
+        />
+      )}
+
+      {/* 文件导出弹窗：列出所有导入的文件，勾选后导出（TAB 套装 zip / 表格 xlsx） */}
+      {viewMode === 'online' && (
+        <MapExportDialog
+          open={exportDialogOpen}
+          onClose={() => setExportDialogOpen(false)}
+          layerFiles={layerFiles}
+        />
+      )}
+
+      {/* 点/线/面绘制样式弹窗 */}
+      {viewMode === 'online' && styleModalTab && (
+        <DrawStyleModal
+          open={!!styleModalTab}
+          tab={styleModalTab}
+          onClose={() => setStyleModalTab(null)}
+        />
+      )}
+
+      {/* 要素属性与风格配置弹窗（"选择"工具下双击要素） */}
+      {viewMode === 'online' && inspectFeature && (
+        <FeatureStyleDialog
+          open={!!inspectFeature}
+          data={inspectFeature}
+          layerName={layerFiles.find((f) => f.id === inspectFeature.layerId)?.name}
+          onClose={() => useLayerEditStore.getState().setInspectFeature(null)}
+        />
+      )}
+
+      {/* 工具栏右键设置菜单：标签文字显隐 + 提示拖拽排序 + 恢复默认 */}
+      {toolbarMenu && (
+        <div
+          className="fixed z-[6000] bg-card border border-border rounded-lg shadow-lg py-1 w-48"
+          style={{ left: toolbarMenu.x, top: toolbarMenu.y }}
+          onContextMenu={(e) => e.preventDefault()}
+          onMouseDown={(e) => e.stopPropagation()}
+        >
+          <div className="px-3 py-1 text-[10px] text-muted-foreground border-b border-border/60 mb-0.5">
+            {t('map.toolbarSettings') || '工具栏设置'}
+          </div>
+          <button
+            onClick={() => {
+              setToolbarPrefs((p) => ({ ...p, showLabels: !p.showLabels }))
+              setToolbarMenu(null)
+            }}
+            className="w-full text-left px-3 py-1.5 text-xs text-foreground hover:bg-muted hover:text-primary transition-colors"
+          >
+            {toolbarPrefs.showLabels
+              ? (t('map.toolbarHideLabels') || '隐藏标签文字')
+              : (t('map.toolbarShowLabels') || '显示标签文字')}
+          </button>
+          <div className="px-3 py-1 text-[10px] text-muted-foreground">
+            {t('map.toolbarDragHint') || '拖动按钮可调整位置'}
+          </div>
+          <button
+            onClick={() => {
+              setToolbarPrefs({ order: [...TOOLBAR_ITEM_IDS], showLabels: false, __v: 2 })
+              setToolbarMenu(null)
+            }}
+            className="w-full text-left px-3 py-1.5 text-xs text-foreground hover:bg-muted hover:text-primary transition-colors border-t border-border/60"
+          >
+            {t('map.toolbarResetLayout') || '恢复默认布局'}
+          </button>
+        </div>
+      )}
+
+      {/* 工具栏标签隐藏样式（右键菜单设置） */}
+      {!toolbarPrefs.showLabels && (
+        <style>{`.npt-hide-toolbar-labels .toolbar-label{display:none !important;}`}</style>
+      )}
 
       {/* 全屏模式全局样式 */}
       {isFullscreen && (

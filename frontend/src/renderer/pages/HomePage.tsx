@@ -10,6 +10,7 @@ import {
   Ruler,
   MoveHorizontal,
   RadioTower,
+  Bot,
   LucideIcon
 } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
@@ -29,6 +30,13 @@ export function HomePage() {
           icon={Database}
           link="/data"
           iconColor="text-blue-500"
+        />
+        <FeatureCard
+          title={t('nav.assistant', '网优助手')}
+          description={t('home.assistantDesc', '对话查询基站参数与小区指标，自动生成趋势图/柱状图/周边站点')}
+          icon={Bot}
+          link="/assistant"
+          iconColor="text-pink-500"
         />
         <FeatureCard
           title={t('nav.pci')}

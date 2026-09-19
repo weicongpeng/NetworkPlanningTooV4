@@ -6,8 +6,12 @@ import { indexedDBService } from '../services/indexedDBService'
 import type { DataItem, ApiResponse } from '@shared/types'
 import { useTaskStore } from './taskStore'
 import { clearCellListCache, bumpDataVersion } from '../services/mapDataService'
+import { userCacheSuffix } from '../utils/cacheKey'
 
 const CACHE_TTL_5MIN = 5 * 60 * 1000
+
+// 数据列表缓存按登录用户隔离（同浏览器切换账号时不得读到他账号的数据）
+const dataListCacheKey = () => `data_list_cache${userCacheSuffix()}`
 
 // 全局数据更新事件名称
 export const DATA_REFRESH_EVENT = 'data-list-refresh'
@@ -16,14 +20,19 @@ export const DATA_REFRESH_EVENT = 'data-list-refresh'
 let _lastRefreshTime = 0
 const REFRESH_DEBOUNCE_MS = 2000
 
+/** 刷新范围：full=数据增删/上传（各页面全量刷新）；layer=仅图层内容变化（地图页跳过扇区数据重载） */
+export type DataRefreshScope = 'full' | 'layer'
+
 // 触发数据刷新事件（用于跨页面通信）
-export function triggerDataRefresh() {
+// scope='layer' 由"图层保存"触发：数据条目本身未变（仅图层内容与上传时间），
+// 地图页无需重载扇区数据/重绘，避免保存后地图卡顿数秒。
+export function triggerDataRefresh(scope: DataRefreshScope = 'full') {
   const now = Date.now()
   if (now - _lastRefreshTime < REFRESH_DEBOUNCE_MS) return
   _lastRefreshTime = now
   // 清除小区列表缓存，确保各页面新建任务时获取最新数据
   clearCellListCache()
-  window.dispatchEvent(new CustomEvent(DATA_REFRESH_EVENT))
+  window.dispatchEvent(new CustomEvent(DATA_REFRESH_EVENT, { detail: { scope } }))
 }
 
 interface DataListCache {
@@ -70,8 +79,11 @@ interface DataState {
     siteId: string
     cellId: string
     cellName: string
+    mcc?: string
+    mnc?: string
     longitude: number
     latitude: number
+    height?: number
     azimuth: number
     frequency?: string
     ssbFrequency?: string
@@ -96,7 +108,7 @@ export const useDataStore = create<DataState>((set, get) => ({
     // 尝试从缓存读取
     if (!forceRefresh) {
       try {
-        const cached = await indexedDBService.get<DataListCache>('data_list_cache')
+        const cached = await indexedDBService.get<DataListCache>(dataListCacheKey())
         if (cached && cached.page === page && cached.pageSize === pageSize) {
           // 检查缓存是否过期
           const now = Date.now()
@@ -140,7 +152,7 @@ export const useDataStore = create<DataState>((set, get) => ({
           pageSize,
           timestamp: Date.now()
         }
-        await indexedDBService.set('data_list_cache', cacheData, CACHE_TTL_5MIN)
+        await indexedDBService.set(dataListCacheKey(), cacheData, CACHE_TTL_5MIN)
       } catch (error) {
         console.warn('[DataStore] 写入缓存失败:', error)
       }
@@ -232,7 +244,7 @@ export const useDataStore = create<DataState>((set, get) => ({
     try {
       await dataApi.delete(id)
       // 删除后清除 IndexedDB 缓存（不内部刷新列表，由调用方统一处理刷新）
-      await indexedDBService.delete('data_list_cache')
+      await indexedDBService.delete(dataListCacheKey())
       set({ loading: false })
       return true
     } catch (error: any) {

@@ -80,6 +80,7 @@ class CellCreateRequest(BaseModel):
     longitude: float = Field(..., description="小区经度")
     latitude: float = Field(..., description="小区纬度")
     azimuth: float = Field(..., description="天线方向角")
+    height: Optional[float] = Field(default=None, description="天线挂高(站高)")
     frequency: Optional[str] = Field(default=None, description="LTE下行链路的中心载频")
     ssbFrequency: Optional[str] = Field(default=None, description="NR填写SSB频点")
     cellCoverType: int = Field(default=1, ge=1, le=4, description="小区覆盖类型: 1=室外, 4=室内")
@@ -94,14 +95,17 @@ class CellBatchCreateRequest(BaseModel):
 
 
 class CellDupCheckItem(BaseModel):
-    """批量查重单项：siteId + cellId + 面板制式
+    """批量查重单项：siteId + cellId + 面板制式（NR 额外带 mcc/mnc 构成 PLMN 唯一键）
 
-    networkType 当前为信息字段（默认 LTE 避免旧请求 422），Task 4 起按制式消费。
+    networkType 决定唯一键口径：LTE = 基站_小区；NR = MCC_MNC_基站_小区（共享小区区分）。
+    networkType 默认 LTE 以避免旧请求 422。
     """
 
     siteId: str
     cellId: str
     networkType: NetworkType = NetworkType.LTE
+    mcc: Optional[str] = None
+    mnc: Optional[str] = None
 
 
 class CellDupCheckRequest(BaseModel):
@@ -133,6 +137,7 @@ class CellSearchItem(BaseModel):
     longitude: Optional[float] = None
     latitude: Optional[float] = None
     azimuth: Optional[float] = None
+    height: Optional[float] = None
     frequency: Optional[float] = None
     ssbFrequency: Optional[float] = None
     cellCoverType: int = 1
@@ -207,6 +212,8 @@ class DataItem(BaseModel):
     errorMessage: Optional[str] = None  # 处理失败时的错误详情（用于前端透传真实原因）
     excelSynced: Optional[bool] = None  # Excel 是否已从 SQLite 同步更新
     inplaceUpdated: Optional[bool] = None  # 文件是否已原地更新（PCI/TAC应用）
+    city: Optional[str] = None  # 数据所属组：地市（归属快照）
+    operator: Optional[str] = None  # 数据所属组：运营商（归属快照）
 
 
 class SectorData(BaseModel):
@@ -420,16 +427,52 @@ class NeighborConfig(BaseModel):
         description="每小区最大邻区数，受规划类型限制"
     )
     coverageDistanceFactor: float = Field(
-        default=0.56,
+        default=0.5,
         ge=0.1,
         le=2.0,
-        description="覆盖圆距离系数(k)，范围0.1-2.0，默认5/9≈0.556"
+        description="覆盖圆距离系数(k)，范围0.1-2.0，默认0.5"
     )
     coverageRadiusFactor: float = Field(
-        default=0.56,
+        default=0.5,
         ge=0.1,
         le=2.0,
-        description="覆盖圆半径系数(m)，范围0.1-2.0，默认5/9≈0.556"
+        description="覆盖圆半径系数(m)，范围0.1-2.0，默认0.5"
+    )
+    denseSpacingThreshold: float = Field(
+        default=1.0,
+        ge=0.1,
+        le=10.0,
+        description="密集/稀疏门限(公里)：平均站间距<该值按密集场景，默认1.0"
+    )
+    denseMultiplier: float = Field(
+        default=1.3,
+        ge=1.0,
+        le=5.0,
+        description="密集场景全量添加半径倍数（×站间距），默认1.3"
+    )
+    outdoorToIndoorMaxDistance: float = Field(
+        default=0.6,
+        ge=0.1,
+        le=3.0,
+        description="室外→室分最大距离(公里)，默认0.6（600米）"
+    )
+    indoorToIndoorRadius: float = Field(
+        default=0.35,
+        ge=0.05,
+        le=2.0,
+        description="室分→室分添加距离(公里)，默认0.35（350米）"
+    )
+    indoorToOutdoorMultiplier: float = Field(
+        default=1.5,
+        ge=1.0,
+        le=5.0,
+        description="室分→室外全量半径倍数（×站间距），默认1.5"
+    )
+    outdoorSpacingSiteCount: int = Field(
+        default=9,
+        ge=1,
+        le=30,
+        description="室外源站间距取最近N个室外站点，默认9"
     )
     customRules: Optional[List[Dict[str, Any]]] = None
     selectedCellIds: Optional[List[str]] = Field(
@@ -677,8 +720,8 @@ class UserCreate(BaseModel):
     confirm_password: str = Field(min_length=6, max_length=128, description="确认密码")
     is_admin: bool = Field(default=False, description="是否设置为管理员")
     license_expiry: Optional[str] = Field(default=None, description="授权截止日期 (ISO格式)")
-    city: Optional[str] = Field(default=None, max_length=100, description="地市")
-    operator: Optional[str] = Field(default=None, max_length=50, description="运营商")
+    city: str = Field(min_length=1, max_length=100, description="地市（必填，须在后端预设清单中）")
+    operator: str = Field(min_length=1, max_length=50, description="运营商（必填）")
     @model_validator(mode="after")
     def passwords_match(self) -> "UserCreate":
         if self.password != self.confirm_password:
@@ -734,6 +777,8 @@ class UserResponse(BaseModel):
     can_data_delete: bool = False
     can_data_update: bool = False
     can_cell_entry: bool = False
+    can_cell_query_update: bool = False
+    can_assistant: bool = False
 
 
 class TokenResponse(BaseModel):
@@ -753,10 +798,14 @@ class UserUpdate(BaseModel):
     must_change_password: Optional[bool] = None
     city: Optional[str] = None
     operator: Optional[str] = None
+    # 组（地市+运营商）变更时的历史数据迁移范围：user=仅本人数据，group=整个旧组
+    migrate_scope: Optional[str] = None
     can_data_import: Optional[bool] = None
     can_data_delete: Optional[bool] = None
     can_data_update: Optional[bool] = None
     can_cell_entry: Optional[bool] = None
+    can_cell_query_update: Optional[bool] = None
+    can_assistant: Optional[bool] = None
 
 
 class UserSessionResponse(BaseModel):

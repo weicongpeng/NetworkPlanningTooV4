@@ -4,33 +4,122 @@
  * 功能:
  * - 显示地图要素（MapInfo/地理化数据）的所有属性
  * - 两栏布局：左边是属性名，右边是属性值
+ * - 编辑态（editable）下字段值可直接修改，失焦/回车提交到编辑工作集，保存工具写入文件
  * - 支持内容复制
  * - 固定默认尺寸，支持滚动浏览
  */
 import { useState, useEffect, useRef, useCallback } from 'react'
-import { X } from 'lucide-react'
+import { X, ArrowLeft } from 'lucide-react'
+import { useTranslation } from 'react-i18next'
 import L from 'leaflet'
+import { clampPopupPosition, type MapViewportBounds } from './popupPosition'
+
+/** 弹窗固定尺寸（内容超出时正文区域纵向滚动） */
+const PANEL_WIDTH = 460
+const PANEL_HEIGHT = 520
 
 export interface FeatureInfoPanelProps {
-    /** 标题（通常是图层名称或要素ID） */
+    /** 标题（要素名称/标识） */
     title?: string
+    /** 副标题（所属图层名称） */
+    subtitle?: string
     /** 属性数据对象 */
     properties: Record<string, any> | null
     /** 是否显示 */
     visible: boolean
     /** 关闭回调 */
     onClose: () => void
+    /** 返回回调（从重叠要素列表进入属性框时提供，显示返回按钮回到列表） */
+    onBack?: () => void
     /** 弹窗位置 */
     position?: { x: number; y: number }
+    /** 地图视口矩形（弹窗始终完整落在该区域内） */
+    viewportBounds?: MapViewportBounds | null
+    /** 是否为可编辑要素（编辑开关图层 + 编辑会话要素）：字段值可修改 */
+    editable?: boolean
+    /** 字段提交回调（失焦/回车触发；由调用方写回编辑工作集，保存工具落盘） */
+    onPropertyChange?: (key: string, value: string) => void
 }
 
-export function FeatureInfoPanel({ title, properties, visible, onClose, position }: FeatureInfoPanelProps) {
+export function FeatureInfoPanel({ title, subtitle, properties, visible, onClose, onBack, position, viewportBounds, editable, onPropertyChange }: FeatureInfoPanelProps) {
+    const { t } = useTranslation()
     const panelRef = useRef<HTMLDivElement>(null)
+    // 右键复制菜单（面板附属交互，点击它不应触发"点击外部关闭"）
+    const contextMenuRef = useRef<HTMLDivElement>(null)
 
     // 右键菜单状态
     const [contextMenu, setContextMenu] = useState<{ x: number, y: number } | null>(null)
     // 待复制的文本内容
     const [pendingSelectedText, setPendingSelectedText] = useState<string>('')
+
+    // ===== 编辑态字段编辑 =====
+    // 本地草稿（key → 输入中的值）：失焦/回车提交，面板关闭前兜底提交未失焦的修改。
+    // committedRef 记录各字段最近一次已提交的值，避免 blur 与关闭兜底重复提交。
+    const [draft, setDraft] = useState<Record<string, string>>({})
+    const draftRef = useRef<Record<string, string>>({})
+    const committedRef = useRef<Record<string, string>>({})
+
+    // 切换 / 重新打开要素时清空草稿
+    useEffect(() => {
+        if (!visible) return
+        draftRef.current = {}
+        committedRef.current = {}
+        setDraft({})
+    }, [visible, properties])
+
+    const updateDraft = (key: string, value: string) => {
+        const next = { ...draftRef.current, [key]: value }
+        draftRef.current = next
+        setDraft(next)
+    }
+
+    const revertDraft = (key: string) => {
+        const next = { ...draftRef.current }
+        const sent = committedRef.current[key]
+        if (sent !== undefined) next[key] = sent
+        else delete next[key]
+        draftRef.current = next
+        setDraft(next)
+    }
+
+    /** 提交草稿字段（省略 keys 时提交全部；未修改的字段不写回） */
+    const commitDraft = useCallback((keys?: string[]) => {
+        if (!editable || !onPropertyChange || !properties) return
+        const pending = { ...draftRef.current }
+        const targets = keys ?? Object.keys(pending)
+        for (const key of targets) {
+            if (!(key in pending)) continue
+            const value = pending[key]
+            const orig = properties[key]
+            const baseline = committedRef.current[key] ?? (orig === null || orig === undefined ? '' : String(orig))
+            if (value !== baseline) {
+                onPropertyChange(key, value)
+                committedRef.current[key] = value
+            }
+        }
+        // 草稿保留已提交值：面板继续打开时输入框仍显示新值（props.properties 仍是点击时的快照）
+        draftRef.current = pending
+        setDraft(pending)
+    }, [editable, onPropertyChange, properties])
+
+    // 点击面板外部区域时关闭面板（与扇区属性框行为一致）：
+    // 覆盖"手形工具拖动地图"（mousedown 起手即关闭）以及点击工具栏/控制面板/扇区等其他区域。
+    useEffect(() => {
+        if (!visible) return
+        const handleClickOutside = (e: MouseEvent) => {
+            const target = e.target as Node
+            if (panelRef.current?.contains(target)) return
+            if (contextMenuRef.current?.contains(target)) return
+            // 关闭前兜底提交未失焦的字段修改（capture mousedown 早于 blur，此处草稿仍是最新值）
+            commitDraft()
+            onClose()
+        }
+        // 使用 mousedown：拖动地图/点击其他区域按下即关闭，避免与 Leaflet click 处理冲突
+        document.addEventListener('mousedown', handleClickOutside, true)
+        return () => {
+            document.removeEventListener('mousedown', handleClickOutside, true)
+        }
+    }, [visible, onClose, commitDraft])
 
     // 处理全局点击以关闭右键菜单
     useEffect(() => {
@@ -63,50 +152,35 @@ export function FeatureInfoPanel({ title, properties, visible, onClose, position
 
     if (!properties) return null
 
-    // 计算位置逻辑（参考 SectorInfoPanel）
-    const calculatePosition = () => {
-        const panelWidth = 320
-        const viewportWidth = window.innerWidth
-        const viewportHeight = window.innerHeight
+    // 固定宽高：地图视口过小时按视口收缩，正文区域纵向滚动
+    const availW = viewportBounds ? viewportBounds.right - viewportBounds.left - 16 : window.innerWidth
+    const availH = viewportBounds ? viewportBounds.bottom - viewportBounds.top - 16 : window.innerHeight
+    const panelW = Math.min(PANEL_WIDTH, Math.max(280, availW))
+    const panelH = Math.min(PANEL_HEIGHT, Math.max(240, availH))
 
-        let left = position ? position.x + 10 : 20
-        let right = position ? 'auto' : 20
-        let top: number | 'auto' = position ? position.y : 80
-        let bottom: number | 'auto' = 'auto'
-
-        if (position) {
-            if (viewportHeight - position.y < 350) {
-                bottom = viewportHeight - position.y + 10
-                top = 'auto'
-            }
-            if (left + panelWidth > viewportWidth) {
-                left = position.x - panelWidth - 10
-                if (left < 0) left = 20
-            }
-        }
-
-        return { top, left, right, bottom }
-    }
-
-    const { top, left, right, bottom } = calculatePosition()
+    // 点击位置在地图视口内时按视口钳制；无点击位置时停靠地图视口右上角
+    const anchor = position ?? (viewportBounds
+        ? { x: viewportBounds.right - 20, y: viewportBounds.top + 60 }
+        : { x: window.innerWidth - 40, y: 80 })
+    const { left, top } = clampPopupPosition(anchor, { width: panelW, height: panelH }, viewportBounds)
 
     const style: React.CSSProperties = {
         position: 'fixed',
         top,
-        bottom,
-        left: `${left}px`,
-        right,
-        width: '320px',
-        maxHeight: '40vh',
+        left,
+        width: `${panelW}px`,
+        height: `${panelH}px`,
+        maxWidth: '96vw',
+        maxHeight: '96vh',
         overflow: 'hidden',
         zIndex: 10000,
         opacity: visible ? 1 : 0,
         visibility: visible ? 'visible' : 'hidden',
-        background: 'white',
-        color: '#000000',
-        boxShadow: '0 4px 20px rgba(0, 0, 0, 0.15)',
-        borderRadius: '8px',
-        border: '1px solid #e2e8f0',
+        background: 'hsl(var(--popover) / 0.98)',
+        color: 'hsl(var(--foreground))',
+        boxShadow: '0 8px 28px rgba(0, 0, 0, 0.22)',
+        borderRadius: '12px',
+        border: '1px solid hsl(var(--border))',
         display: 'flex',
         flexDirection: 'column'
     }
@@ -189,25 +263,45 @@ export function FeatureInfoPanel({ title, properties, visible, onClose, position
                 }}
             >
                 {/* 头部 */}
-                <div className="flex items-center justify-between px-4 py-2 bg-gray-50 border-b border-gray-200 rounded-t-lg">
-                    <span className="text-xs font-semibold text-gray-700 truncate mr-4">
-                        {title || '要素属性'}
+                <div className="flex items-center justify-between px-5 py-3 bg-muted border-b border-border rounded-t-lg">
+                    {onBack && (
+                        <button
+                            onClick={(e) => {
+                                e.stopPropagation()
+                                onBack()
+                            }}
+                            className="p-1.5 hover:bg-accent rounded-full transition-colors flex-shrink-0 mr-1"
+                            title={t('map.backToOverlapList')}
+                            aria-label={t('map.backToOverlapList')}
+                        >
+                            <ArrowLeft size={17} />
+                        </button>
+                    )}
+                    <span className="flex flex-col min-w-0 mr-4 flex-1">
+                        <span className="text-sm font-semibold text-foreground truncate" title={title || ''}>
+                            {title || '要素属性'}
+                        </span>
+                        {subtitle && (
+                            <span className="text-xs text-muted-foreground truncate mt-0.5" title={subtitle}>
+                                {subtitle}
+                            </span>
+                        )}
                     </span>
                     <button
-                        onClick={onClose}
-                        className="p-1 hover:bg-gray-200 rounded-full transition-colors"
+                        onClick={() => { commitDraft(); onClose() }}
+                        className="p-1.5 hover:bg-accent rounded-full transition-colors flex-shrink-0"
                     >
-                        <X size={14} />
+                        <X size={17} />
                     </button>
                 </div>
 
                 {/* 属性列表正文 - 两栏布局 */}
                 <div className="flex-1 overflow-y-auto p-0 scrollbar-thin">
-                    <table className="w-full text-xs border-collapse">
-                        <tbody className="divide-y divide-gray-100">
+                    <table className="w-full text-sm border-collapse">
+                        <tbody className="divide-y divide-border/60">
                             {displayProperties.length === 0 ? (
                                 <tr>
-                                    <td className="px-4 py-4 text-center text-gray-400 italic">暂无属性信息</td>
+                                    <td className="px-5 py-6 text-center text-muted-foreground italic">暂无属性信息</td>
                                 </tr>
                             ) : (
                                 displayProperties.map(({ key, value }) => {
@@ -216,14 +310,38 @@ export function FeatureInfoPanel({ title, properties, visible, onClose, position
                                     if (displayValue && typeof displayValue === 'object') {
                                         displayValue = JSON.stringify(displayValue)
                                     }
+                                    // 编辑态：仅标量字段可修改（对象值保持只读展示）
+                                    const editableRow = !!editable && !!onPropertyChange
+                                        && value !== null && value !== undefined && typeof value !== 'object'
 
                                     return (
-                                        <tr key={key} className="hover:bg-gray-50 transition-colors">
-                                            <td className="px-4 py-2 font-medium text-gray-500 w-1/3 break-all border-r border-gray-50 bg-gray-50/50">
+                                        <tr key={key} className="hover:bg-muted/50 transition-colors">
+                                            <td className="px-5 py-2.5 font-medium text-muted-foreground w-1/3 break-all border-r border-border/60 bg-muted/30 leading-relaxed">
                                                 {key}
                                             </td>
-                                            <td className="px-4 py-2 text-gray-900 break-all select-text cursor-text">
-                                                {displayValue !== null && displayValue !== undefined ? String(displayValue) : '-'}
+                                            <td className={`px-5 py-2.5 text-foreground break-all leading-relaxed ${editableRow ? '' : 'select-text cursor-text'}`}>
+                                                {editableRow ? (
+                                                    <input
+                                                        type="text"
+                                                        value={draft[key] ?? (displayValue !== null && displayValue !== undefined ? String(displayValue) : '')}
+                                                        onChange={(e) => updateDraft(key, e.target.value)}
+                                                        onBlur={() => commitDraft([key])}
+                                                        onKeyDown={(e) => {
+                                                            if (e.key === 'Enter') {
+                                                                e.preventDefault()
+                                                                e.currentTarget.blur()
+                                                            } else if (e.key === 'Escape') {
+                                                                revertDraft(key)
+                                                                e.currentTarget.blur()
+                                                            }
+                                                        }}
+                                                        /* 阻止冒泡：避免触发面板根节点 onClick 的 focus() 抢走输入框焦点 */
+                                                        onClick={(e) => e.stopPropagation()}
+                                                        className="w-full px-2 py-1 text-sm rounded border border-border bg-background text-foreground outline-none focus:border-primary"
+                                                    />
+                                                ) : (
+                                                    displayValue !== null && displayValue !== undefined ? String(displayValue) : '-'
+                                                )}
                                             </td>
                                         </tr>
                                     )
@@ -234,8 +352,11 @@ export function FeatureInfoPanel({ title, properties, visible, onClose, position
                 </div>
 
                 {/* 底部装饰或提示 */}
-                <div className="px-4 py-1.5 bg-gray-50 border-t border-gray-100 text-[10px] text-gray-400 text-right">
-                    共 {displayProperties.length} 项属性
+                <div className="px-5 py-2.5 bg-muted border-t border-border/60 text-xs text-muted-foreground flex items-center justify-between gap-3">
+                    <span className="text-amber-600 leading-relaxed">
+                        {editable ? (t('map.featureEditHint') || '编辑态：字段值可直接修改，修改后使用保存工具写入文件') : ''}
+                    </span>
+                    <span className="text-right shrink-0">共 {displayProperties.length} 项属性</span>
                 </div>
 
                 <style>{`
@@ -243,14 +364,14 @@ export function FeatureInfoPanel({ title, properties, visible, onClose, position
                   width: 6px;
                 }
                 .feature-info-panel .scrollbar-thin::-webkit-scrollbar-track {
-                  background: #f8fafc;
+                  background: hsl(var(--muted) / 0.5);
                 }
                 .feature-info-panel .scrollbar-thin::-webkit-scrollbar-thumb {
-                  background: #cbd5e1;
+                  background: hsl(var(--muted-foreground) / 0.35);
                   border-radius: 3px;
                 }
                 .feature-info-panel .scrollbar-thin::-webkit-scrollbar-thumb:hover {
-                  background: #94a3b8;
+                  background: hsl(var(--muted-foreground) / 0.5);
                 }
             `}</style>
             </div>
@@ -258,23 +379,25 @@ export function FeatureInfoPanel({ title, properties, visible, onClose, position
             {/* 自定义右键复制菜单 */}
             {contextMenu && (
                 <div
+                    ref={contextMenuRef}
                     style={{
                         position: 'fixed',
                         top: contextMenu.y,
                         left: contextMenu.x,
                         zIndex: 11000,
-                        background: 'white',
-                        border: '1px solid #e2e8f0',
+                        background: 'hsl(var(--popover))',
+                        border: '1px solid hsl(var(--border))',
                         borderRadius: '4px',
-                        boxShadow: '0 2px 10px rgba(0,0,0,0.1)',
+                        boxShadow: '0 4px 12px rgba(0,0,0,0.15)',
                         padding: '4px 0',
-                        minWidth: '80px'
+                        minWidth: '80px',
+                        color: 'hsl(var(--popover-foreground))'
                     }}
                     onClick={handleCopy}
                 >
-                    <div className="px-4 py-2 hover:bg-blue-50 cursor-pointer text-sm flex items-center">
+                    <div className="px-4 py-2 hover:bg-accent cursor-pointer text-sm flex items-center">
                         <span className="mr-2">复制</span>
-                        <span className="text-gray-400 text-xs">Ctrl+C</span>
+                        <span className="text-muted-foreground text-xs">Ctrl+C</span>
                     </div>
                 </div>
             )}
@@ -289,10 +412,12 @@ export function useFeatureInfoPanel() {
     const [featureProperties, setFeatureProperties] = useState<Record<string, any> | null>(null)
     const [featurePanelVisible, setFeaturePanelVisible] = useState(false)
     const [featureTitle, setFeatureTitle] = useState<string>('')
+    const [featureSubtitle, setFeatureSubtitle] = useState<string>('')
     const [featureClickPosition, setFeatureClickPosition] = useState<{ x: number; y: number } | undefined>(undefined)
 
-    const showFeatureInfo = useCallback((properties: Record<string, any>, event?: L.LeafletMouseEvent, title?: string) => {
+    const showFeatureInfo = useCallback((properties: Record<string, any>, event?: L.LeafletMouseEvent, title?: string, subtitle?: string) => {
         setFeatureTitle(title || '要素属性')
+        setFeatureSubtitle(subtitle || '')
         setFeatureProperties(properties)
         setFeaturePanelVisible(true)
         // 防御：Canvas 渲染的点击事件 originalEvent 可能缺失，缺失时使用默认位置，避免抛错导致面板不显示
@@ -309,6 +434,7 @@ export function useFeatureInfoPanel() {
         featureProperties,
         featurePanelVisible,
         featureTitle,
+        featureSubtitle,
         featureClickPosition,
         showFeatureInfo,
         hideFeatureInfo

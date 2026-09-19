@@ -1,7 +1,7 @@
 {
   "tool_name": "Bash",
-  "tool_input_preview": "{\"command\":\"grep -n \\\"latestDownloadUrl\\\\|download_url\\\\|下载\\\\|Linking.openURL\\\\|handleUpdate\\\\|下载新版本\\\\|更新\\\" /mnt/disk1/NetworkPlanningTooV3/mobile-app/app/(tabs)/profile.tsx | head -30\",\"description\":...",
-  "error": "Exit code 2\n/usr/bin/bash: eval: line 1: syntax error near unexpected token `('\n/usr/bin/bash: eval: line 1: `grep -n \"latestDownloadUrl\\|download_url\\|下载\\|Linking.openURL\\|handleUpdate\\|下载新版本\\|更新\" /mnt/disk1/NetworkPlanningTooV3/mobile-app/app/(tabs)/profile.tsx | head -30'",
-  "timestamp": "2026-07-05T05:44:22.792Z",
+  "tool_input_preview": "{\"command\":\"pip install -q py-spy 2>&1 | tail -1; which py-spy && py-spy dump --pid 1043644 2>&1 | head -80\",\"timeout\":180000,\"description\":\"Install py-spy via pip and dump stacks\"}",
+  "error": "Exit code 1\nERROR: No matching distribution found for py-spy",
+  "timestamp": "2026-09-18T10:10:56.448Z",
   "retry_count": 1
 }

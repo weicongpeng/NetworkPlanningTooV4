@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 from app.utils.coordinate_transformer import CoordinateTransformer
+from app.utils.geojson_geometry import transform_coordinate_lists
 from app.core.database import SessionLocal
 from app.models.database import Layer
 
@@ -1101,6 +1102,29 @@ class MapInfoParser:
                 if style_info:
                     properties['_style'] = style_info
 
+                # 前端编辑样式持久化列（save_layer_geojson 写入）：
+                # 还原为内部字段（_editStyle / _shape / _ellipse）并从属性表中剔除，
+                # 保证"方形点/自定义样式/圆"等保存刷新后不回退为默认渲染。
+                _sym = properties.pop('NPT_FEATSYM', None)
+                if isinstance(_sym, str) and _sym:
+                    try:
+                        _es = json.loads(_sym)
+                        if isinstance(_es, dict):
+                            properties['_editStyle'] = _es
+                    except Exception:
+                        pass
+                _meta = properties.pop('NPT_FEATMETA', None)
+                if isinstance(_meta, str) and _meta:
+                    try:
+                        _m = json.loads(_meta)
+                        if isinstance(_m, dict):
+                            if _m.get('_shape') is not None:
+                                properties['_shape'] = _m['_shape']
+                            if _m.get('_ellipse') is not None:
+                                properties['_ellipse'] = _m['_ellipse']
+                    except Exception:
+                        pass
+
                 # 提取坐标
                 coords = []
                 geom_type = GeometryType.UNKNOWN
@@ -1273,7 +1297,8 @@ def get_last_parse_errors() -> List[Dict[str, str]]:
     return list(_LAST_PARSE_ERRORS)
 
 
-def parse_mapinfo_files(upload_path: Path, user_id: int = 1, parent_id: str = None) -> List[Dict[str, Any]]:
+def parse_mapinfo_files(upload_path: Path, user_id: int = 1, parent_id: str = None,
+                        city: Optional[str] = None, operator: Optional[str] = None) -> List[Dict[str, Any]]:
     """
     解析上传的 MapInfo 文件
 
@@ -1281,6 +1306,7 @@ def parse_mapinfo_files(upload_path: Path, user_id: int = 1, parent_id: str = No
         upload_path: 文件或目录路径
         user_id: 用户ID
         parent_id: 可选的父级 data_id（与 API 层 data_id 一致，避免写入时生成新 UUID）
+        city/operator: 数据所属组（地市+运营商）归属快照
 
     返回图层元数据列表。每个文件失败原因记录在模块级 _LAST_PARSE_ERRORS，
     调用方可通过 get_last_parse_errors() 读取并写入 index.json metadata。
@@ -1312,6 +1338,8 @@ def parse_mapinfo_files(upload_path: Path, user_id: int = 1, parent_id: str = No
             })
             _save_layer_metadata(
                 user_id=user_id,
+                city=city,
+                operator=operator,
                 name=layer.name,
                 file_path=str(upload_path),
                 layer_type=layer.type.value,
@@ -1339,6 +1367,8 @@ def parse_mapinfo_files(upload_path: Path, user_id: int = 1, parent_id: str = No
             _layer_id = parent_id if idx == 0 and parent_id else (f"{parent_id}_{idx}" if parent_id else None)
             _save_layer_metadata(
                 user_id=user_id,
+                city=city,
+                operator=operator,
                 name=layer.name,
                 file_path=str(upload_path / layer.name) if hasattr(layer, 'name') else str(upload_path),
                 layer_type=layer.type.value,
@@ -1361,6 +1391,8 @@ def _save_layer_metadata(
     bbox: Optional[List[float]] = None,
     file_size: Optional[int] = None,
     layer_id: Optional[str] = None,
+    city: Optional[str] = None,
+    operator: Optional[str] = None,
 ):
     """保存图层文件元数据到 SQLite"""
     db = SessionLocal()
@@ -1368,6 +1400,8 @@ def _save_layer_metadata(
         layer = Layer(
             id=layer_id or str(uuid.uuid4()),
             user_id=user_id,
+            city=city,
+            operator=operator,
             name=name,
             file_path=file_path,
             layer_type=layer_type,
@@ -1406,6 +1440,27 @@ def clear_layer_cache(data_id: Optional[str] = None):
         _layer_cache.clear()
         _layer_cache_mtime.clear()
         print(f"[MapInfo] 已清除全部 {count} 个图层缓存")
+
+
+def _dump_geojson_bytes(result: Dict[str, Any]) -> bytes:
+    """GeoJSON 响应体编码为 UTF-8 字节。
+
+    必须用 json.dumps（而非 json.dump）：json.dump 传 ensure_ascii=False 时会回退到
+    纯 Python 编码器，40MB 图层由 ~30s 降到 ~2s（C 编码器）。
+    """
+    return json.dumps(result, ensure_ascii=False).encode("utf-8")
+
+
+def _write_gz_cache(gz_path: Path, geojson_bytes: bytes) -> None:
+    """原子写预压缩缓存（内容为包装后的响应体，与常规路径同形状）。
+
+    直接字节拼接包裹层，避免为压缩再序列化一份 40MB JSON；gzip 一次调用比流式
+    多次 compress 快一个量级。
+    """
+    gz_tmp = gz_path.with_suffix(gz_path.suffix + ".tmp")
+    gz_tmp.write_bytes(gzip.compress(b'{"success":true,"data":' + geojson_bytes + b'}',
+                                      compresslevel=6))
+    gz_tmp.replace(gz_path)  # 原子替换，读者不会读到半成品
 
 
 def get_layer_data(data_id: str, layer_id: str, data_dir: Path) -> Optional[Dict]:
@@ -1464,13 +1519,13 @@ def get_layer_data(data_id: str, layer_id: str, data_dir: Path) -> Optional[Dict
     # 避免每次请求都重新 parse+convert（18000 polygon 需 ~20s，会触发 Cloudflare 524 / axios 超时）
     disk_cache = None
     if source_path:
-        disk_cache_path = data_dir / ".cache" / "v2" / f"{layer_id}.geojson"
+        disk_cache_path = layer_cache_dir(data_dir) / f"{layer_id}.geojson"
         try:
             current_mtime = source_path.stat().st_mtime
             if disk_cache_path.exists():
                 cache_mtime = disk_cache_path.stat().st_mtime
                 # 源文件 mtime 和缓存 mtime 都记录在文件名后缀：{layer_id}.geojson.{mtime}
-                disk_cache_mtime_file = data_dir / ".cache" / "v2" / f"{layer_id}.mtime"
+                disk_cache_mtime_file = layer_cache_dir(data_dir) / f"{layer_id}.mtime"
                 if disk_cache_mtime_file.exists():
                     saved_mtime = float(disk_cache_mtime_file.read_text().strip())
                     if saved_mtime == current_mtime:
@@ -1487,12 +1542,11 @@ def get_layer_data(data_id: str, layer_id: str, data_dir: Path) -> Optional[Dict
         # 🔧 幂等补齐 gz 预压缩缓存：磁盘缓存命中路径不重建 gz 的话，
         # 一次 gz 写失败会永久回退常规路径（性能优化失效），这里检测缺失即生成
         try:
-            gz_path = data_dir / ".cache" / "v2" / f"{layer_id}.geojson.gz"
+            gz_path = layer_cache_dir(data_dir) / f"{layer_id}.geojson.gz"
             if not gz_path.exists():
-                gz_tmp = data_dir / ".cache" / "v2" / f"{layer_id}.geojson.gz.tmp"
-                with gzip.open(gz_tmp, 'wt', encoding='utf-8', compresslevel=9) as f:
-                    json.dump({"success": True, "data": disk_cache}, f, ensure_ascii=False)
-                gz_tmp.replace(gz_path)  # 原子替换，读者不会读到半成品
+                _write_gz_cache(gz_path, _dump_geojson_bytes(disk_cache))
+        except Exception as e:
+            print(f"[MapInfo] 补写 gz 缓存失败: {e}")
         except Exception as e:
             print(f"[MapInfo] 补写 gz 缓存失败: {e}")
         return disk_cache
@@ -1530,21 +1584,17 @@ def get_layer_data(data_id: str, layer_id: str, data_dir: Path) -> Optional[Dict
 
             # 落盘缓存：后续请求直接读文件，避免重复 parse+convert
             try:
-                cache_dir = data_dir / ".cache" / "v2"
+                cache_dir = layer_cache_dir(data_dir)
                 cache_dir.mkdir(parents=True, exist_ok=True)
                 disk_cache_path = cache_dir / f"{layer_id}.geojson"
-                with open(disk_cache_path, 'w', encoding='utf-8') as f:
-                    json.dump(result, f, ensure_ascii=False)
+                geojson_bytes = _dump_geojson_bytes(result)
+                disk_cache_path.write_bytes(geojson_bytes)
                 # 🔧 预压缩缓存：先原子写完 .geojson.gz，最后才写 .mtime（mtime 是
                 # "提交标记"——并发请求只有看到 mtime 才会用 gz，先写 gz 保证不会
                 # 读到半成品；且必须压缩【包装后的 dict】{"success": True, "data": geojson}，
                 # 与常规路径响应同形状，否则前端 response.success 判定失败导致图层无法加载。
                 try:
-                    gz_path = cache_dir / f"{layer_id}.geojson.gz"
-                    gz_tmp = cache_dir / f"{layer_id}.geojson.gz.tmp"
-                    with gzip.open(gz_tmp, 'wt', encoding='utf-8', compresslevel=9) as f:
-                        json.dump({"success": True, "data": result}, f, ensure_ascii=False)
-                    gz_tmp.replace(gz_path)  # 原子替换
+                    _write_gz_cache(cache_dir / f"{layer_id}.geojson.gz", geojson_bytes)
                 except Exception as e:
                     print(f"[MapInfo] 写 gz 缓存失败: {e}")
                 with open(cache_dir / f"{layer_id}.mtime", 'w', encoding='utf-8') as f:
@@ -1592,7 +1642,7 @@ def get_layer_data_gz_bytes(data_id: str, layer_id: str, data_dir: Path) -> Opti
         except Exception:
             pass
 
-    cache_dir = data_dir / ".cache" / "v2"
+    cache_dir = layer_cache_dir(data_dir)
     gz_path = cache_dir / f"{layer_id}.geojson.gz"
     mtime_file = cache_dir / f"{layer_id}.mtime"
 
@@ -1614,10 +1664,7 @@ def get_layer_data_gz_bytes(data_id: str, layer_id: str, data_dir: Path) -> Opti
     # 原始 JSON 走 Cloudflare 慢速链路导致前端 600s 超时。
     if not gz_path.exists():
         try:
-            gz_tmp = cache_dir / f"{layer_id}.geojson.gz.tmp"
-            with gzip.open(gz_tmp, 'wt', encoding='utf-8', compresslevel=6) as f:
-                json.dump({"success": True, "data": result}, f, ensure_ascii=False)
-            gz_tmp.replace(gz_path)  # 原子替换，读者不会读到半成品
+            _write_gz_cache(gz_path, _dump_geojson_bytes(result))
         except Exception as e:
             print(f"[MapInfo] 现场补写 gz 缓存失败: {e}")
     try:
@@ -1658,60 +1705,43 @@ def prebuild_layer_geojson_cache(data_id: str, data_dir: Path, layers: List[Dict
     print(f"[MapInfo] 图层缓存预热完成: {warmed}/{len(layers)} 图层, 耗时 {time.time()-started:.1f}s")
 
 
+def layer_cache_dir(data_dir: Path) -> Path:
+    """图层 GeoJSON 落盘缓存目录（v2：明文 + 预压缩 gz + mtime 标记）。"""
+    return data_dir / ".cache" / "v2"
+
+
+def layer_version_etag(data_dir: Path, layer_id: str) -> Optional[str]:
+    """图层版本指纹 ETag（"<layer_id>-<源文件 mtime>"，与保存接口返回的 version 同构）。
+
+    以缓存目录中的 .mtime 标记为基准；标记不存在（尚未生成缓存）时返回 None，
+    调用方应视为"无版本信息"（前端据此回退整层保存）。
+    """
+    if layer_id is None:
+        return None
+    try:
+        mtime_file = layer_cache_dir(data_dir) / f"{layer_id}.mtime"
+        if mtime_file.exists():
+            return f'"{layer_id}-{mtime_file.read_text().strip()}"'
+    except Exception:
+        pass
+    return None
+
+
 def _transform_layer_coordinates(features: List[MapInfoFeature]) -> None:
     """
-    图层级整体 WGS84→GCJ02 坐标转换（numpy 向量化，原地修改 feature.coordinates）。
+    图层级整体 WGS84→GCJ02 坐标转换（原地修改 feature.coordinates）。
 
-    收集所有 feature 的所有坐标点一次批量转换，比逐 feature 调用
-    transform_geojson_coordinates_batch 快 ~280x（大量小数组的 numpy 固定开销被摊平）。
-    转换后坐标统一为 GeoJSON 标准 [lng, lat] list（保留 z 值）。
+    数值路径走 utils.geojson_geometry.transform_coordinate_lists：numpy 数组化 +
+    整层一次向量化转换 + tolist()，没有逐点 Python 递归，也没有逐要素 numpy 固定开销。
+    转换后坐标仍为 GeoJSON 标准 [lng, lat] list（保留 z 值）。
     """
-    import numpy as np
-
-    lngs: List[float] = []
-    lats: List[float] = []
-    z_values: List[Any] = []
-
-    def _collect_struct(node: Any) -> Any:
-        """返回占位结构：叶子为 None（将填转换值），嵌套为 list，兼容 tuple 输入"""
-        if isinstance(node, (list, tuple)) and len(node) > 0:
-            first = node[0]
-            if isinstance(first, (int, float)) and len(node) >= 2:
-                lngs.append(float(node[0]))
-                lats.append(float(node[1]))
-                z_values.append(node[2] if len(node) > 2 else None)
-                return None  # 叶子占位
-            return [_collect_struct(child) for child in node]
-        return node  # 空容器/标量
-
-    placeholder_structure = [_collect_struct(feat.coordinates) for feat in features]
-
-    if not lngs:
+    if not features:
         return
-
-    # 一次性 numpy 批量转换
-    gcj_lats, gcj_lngs = CoordinateTransformer.wgs84_to_gcj02_batch(
-        np.array(lats), np.array(lngs)
+    transformed = transform_coordinate_lists(
+        [feat.coordinates for feat in features], from_wgs84=True
     )
-
-    # 按收集顺序把转换值填入占位结构，并写回 feature.coordinates
-    idx = 0
-
-    def _fill(node: Any) -> Any:
-        nonlocal idx
-        if isinstance(node, list):
-            return [_fill(child) for child in node]
-        if node is None:  # 叶子占位 → 取下一个转换值
-            z = z_values[idx]
-            glat, glng = gcj_lats[idx], gcj_lngs[idx]
-            idx += 1
-            if z is not None:
-                return [float(glng), float(glat), z]
-            return [float(glng), float(glat)]
-        return node
-
-    for i, feat in enumerate(features):
-        feat.coordinates = _fill(placeholder_structure[i])
+    for feat, coords in zip(features, transformed):
+        feat.coordinates = coords
 
 
 def _convert_to_geojson(layer: MapInfoLayer, transform_coords: bool = True) -> Dict:

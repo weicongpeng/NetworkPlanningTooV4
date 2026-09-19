@@ -122,10 +122,10 @@ export const GlobalTaskIndicator: React.FC = () => {
               if (entry.route) navigate(entry.route)
             }}
             className="pointer-events-auto group
-                       bg-white/95 dark:bg-gray-800/95 backdrop-blur-md
-                       rounded-xl shadow-2xl border border-gray-200/80 dark:border-gray-700/80
-                       hover:bg-white dark:hover:bg-gray-800
-                       hover:shadow-2xl hover:border-primary/30 dark:hover:border-primary/30
+                       bg-card/95 backdrop-blur-md
+                       rounded-xl shadow-2xl border border-border
+                       hover:bg-card
+                       hover:shadow-2xl hover:border-primary/30
                        hover:scale-[1.02] active:scale-[0.98]
                        transition-all duration-200 ease-out cursor-pointer
                        min-w-[220px] max-w-[300px] overflow-hidden"
@@ -133,20 +133,20 @@ export const GlobalTaskIndicator: React.FC = () => {
           >
             <div className="flex items-center gap-2 px-3.5 pt-2.5 pb-1.5">
               <Loader2 className="w-4 h-4 text-primary animate-spin flex-shrink-0" />
-              <span className="text-sm font-semibold text-gray-800 dark:text-gray-100 truncate flex-1 text-left">
+              <span className="text-sm font-semibold text-foreground truncate flex-1 text-left">
                 {entry.label}
               </span>
               <div className="flex items-center gap-2 flex-shrink-0">
                 <span className="text-xs font-bold text-primary tabular-nums">{progress}%</span>
                 {username && (
-                  <span className="text-[10px] text-gray-400 dark:text-gray-500 hidden group-hover:inline transition-opacity">
+                  <span className="text-[10px] text-muted-foreground hidden group-hover:inline transition-opacity">
                     {username}
                   </span>
                 )}
               </div>
             </div>
             <div className="px-3.5 pb-2.5">
-              <div className="h-1.5 bg-gray-100 dark:bg-gray-700/80 rounded-full overflow-hidden">
+              <div className="h-1.5 bg-muted rounded-full overflow-hidden">
                 <div
                   className="h-full bg-gradient-to-r from-primary/80 to-primary rounded-full transition-all duration-500 ease-out"
                   style={{ width: `${progress}%` }}

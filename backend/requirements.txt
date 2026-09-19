@@ -42,3 +42,4 @@ aiofiles==24.1.0
 pytest==8.3.0
 pytest-asyncio==0.24.0
 httpx==0.28.0
+openai>=1.0.0  # 网优助手 LLM（OpenAI兼容协议）

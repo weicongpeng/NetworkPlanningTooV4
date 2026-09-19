@@ -7,11 +7,25 @@
  * - 图层颜色设置页：图形颜色、图形透明度、边框宽度、边框颜色
  * - 保存/取消按钮
  */
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useMemo } from 'react'
 import { X, ChevronDown, Plus, Trash2, Sparkles } from 'lucide-react'
 import { HexColorPicker } from 'react-colorful'
 import { useTranslation } from 'react-i18next'
-import { hasValue, isNumericValue, toNumber, generateGeoIsolatedColors, THEMATIC_VALUE_LIMIT, FieldValueSample } from '../../utils/fieldValue'
+import { hasValue, isNumericValue, toNumber, generateGeoIsolatedColors, THEMATIC_VALUE_LIMIT, NO_FILL_COLOR, FieldValueSample } from '../../utils/fieldValue'
+import {
+  buildAnchoredMapper,
+  buildHeatLegend,
+  formatLegendValue,
+  gradientColorAt,
+  quantileRefValue,
+  quantileValueAt,
+  resolveHeatGradient,
+  resolveLevelGradient,
+  type HeatLegendOverride,
+} from '../../utils/heatmap'
+import { buildValueMapper, quantizeLevel } from '../../utils/heatSurface'
+import { resolveSectorField } from '../../config/sector-config'
+import type { HeatmapStats } from './HeatmapLayerManager'
 
 /**
  * 标签字段类型 - 现在支持任意字符串
@@ -33,20 +47,54 @@ export interface LabelSettings {
   content: LabelField
   color: string
   fontSize: number
+  /**
+   * 字体族（CSS font-family 栈），默认 'sans-serif'（跟随系统默认字体）。
+   * 复用系统自带字体：Windows 下 SimHei/微软雅黑等由 Electron/浏览器直接解析，
+   * 无需打包字体文件；缺字平台自动回退到栈中的后备字体
+   */
+  fontFamily?: string
+  /** 字体效果：加粗 */
+  bold?: boolean
+  /** 字体效果：斜体 */
+  italic?: boolean
+  /** 字体效果：阴影（深色柔影，提升复杂底图上的可读性） */
+  shadow?: boolean
+  /**
+   * 字体背景：none=无 / halo=光晕（文字描边，浅色字配浅底图时提升对比）/
+   * box=框形（文字后的圆角矩形底色），三态互斥
+   */
+  background?: 'none' | 'halo' | 'box'
+  /** 字体背景颜色（background 为 halo/box 时生效） */
+  backgroundColor?: string
 }
 
 /**
+ * 标签字体预设（复用系统自带字体，值=CSS font-family 栈，缺字时逐级回退）
+ */
+export const FONT_FAMILY_OPTIONS: { value: string; label: string }[] = [
+  { value: 'sans-serif', label: '默认' },
+  { value: '"Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC", sans-serif', label: '微软雅黑' },
+  { value: 'SimHei, "Heiti SC", "Noto Sans CJK SC", sans-serif', label: '黑体' },
+  { value: 'SimSun, "Songti SC", "Noto Serif CJK SC", serif', label: '宋体' },
+  { value: 'KaiTi, "Kaiti SC", STKaiti, "Noto Serif CJK SC", serif', label: '楷体' },
+  { value: 'LiSu, SimLi, "Noto Serif CJK SC", serif', label: '隶书' },
+  { value: 'DengXian, "Microsoft YaHei", sans-serif', label: '等线' },
+]
+
+/**
  * 图层颜色设置接口
- * - fillColor: 图形颜色（填充色）
- * - fillOpacity: 图形透明度 0~1
- * - borderWidth: 边框宽度 px
- * - borderColor: 边框颜色
+ * - fillColor: 图形颜色（填充色；线状图层为线条颜色）
+ * - fillOpacity: 图形透明度 0~1（线要素作用于线条透明度）
+ * - borderWidth: 边框宽度 px（线状图层为线宽）
+ * - borderColor: 边框颜色（点/面 'none'=无色不描边且为默认值；线状图层不使用，旧版本可能存线色）
+ * - pointSize: 图形大小 px（点要素半径；仅点图层的基础配置提供该设置项）
  */
 export interface LayerColorSettings {
   fillColor: string
   fillOpacity: number
   borderWidth: number
   borderColor: string
+  pointSize?: number
 }
 
 /**
@@ -88,6 +136,8 @@ export interface ThematicCategory {
  * - fieldType: 字段类型（自动检测）
  * - colorMode: 数值字段配色模式（'range' 区间配色 / 'value' 属性值配色）
  * - pointSize: 图形大小（点要素半径，仅点图层生效）
+ * - fillOpacity: 图形透明度 0~1（专题填充透明度；线要素作用于线条透明度；缺省回退基础配置/默认样式）
+ * - borderColor: 边框颜色（点/面专题描边色，'none'=无色不描边且为点/面默认值；线要素不适用；缺省回退专题配色）
  * - ranges: 数值类连续区间（重叠取首个匹配，未匹配落黑）
  * - valueColors: 数值类属性值配色（colorMode='value' 时使用，未分配的值黑色）
  * - categories: 文本类配色
@@ -98,6 +148,8 @@ export interface ThematicSettings {
   fieldType: ThematicFieldType
   colorMode?: ThematicColorMode
   pointSize: number
+  fillOpacity?: number
+  borderColor?: string
   ranges: ThematicRange[]
   valueColors?: ThematicCategory[]
   categories: ThematicCategory[]
@@ -112,6 +164,132 @@ export interface ThematicTemplate {
   id: string
   name: string
   ranges: ThematicRange[]
+}
+
+/**
+ * 热力图设置模板：保存各设置项的当前值（不含图层相关的字段选择/边界裁剪），
+ * 供同类图层一键套用。整个模板列表随 mapSettings 持久化。
+ */
+export interface HeatmapTemplate {
+  id: string
+  name: string
+  settings: Omit<HeatmapSettings, 'enabled' | 'field' | 'boundaryLayerId' | 'boundaryDataId' | 'boundarySource'>
+}
+
+/**
+ * 热力图配色方案（色带 stops 定义见 utils/heatmap.ts）
+ */
+export type HeatmapColorScheme = 'default' | 'warm' | 'cool' | 'viridis'
+
+/**
+ * 热力图颜色方向：数值变化与色带的方向关系
+ * - normal: 值越大越偏暖（色带右端颜色）
+ * - reverse: 值越大越偏冷（色带镜像）
+ */
+export type HeatmapColorDirection = 'normal' | 'reverse'
+
+/**
+ * 分级方法（参考 Surfer 网格外观 Grid Appearance 的 Method）
+ * - cellCount: 等效细胞计数（Equal Cell Count），色带按采样点占比分级，
+ *   每级承载等量采样点——重尾数据（流量类）必须用此法，线性映射会把
+ *   绝大多数像元压在色带最低端
+ * - valueRange: 等效范围（Equal Value Ranges），色带按数值区间等分
+ */
+export type HeatmapLegendMethod = 'cellCount' | 'valueRange'
+
+/**
+ * 热力图（连续加权值热力面）图层设置
+ * - enabled: 是否启用（独立于专题图层，可共存）
+ * - field: 权重数值字段名
+ * - smooth: 平滑强度（覆盖半径 = 最近邻间距 × 该值，1~10）；
+ *   小于点间距时各采样点圆斑互不相接会出现空白与颗粒，故以点间距为基准而非绝对半径
+ * - method: 分级方法（旧设置无此字段时按 cellCount 处理）
+ * - inflections: 分级数（3~15，默认 5），决定图例级数与色带分段密度
+ * - round: 图例数值取整精度（0.01/0.1/1/10/100），仅影响显示
+ * - contrast: 颜色映射对比度（0.5~3，1=线性）：>1 高低端更快饱和、中间过渡更陡
+ * - opacity: 半透明度（0~1，1=完全不透明）
+ * - detail: 细节增强（0~100，默认 95，0=纯平滑）：整体趋势场与站点级细节场的
+ *   **凸组合比例**——按比例栅格化融合，端点都不超数据界（无光晕超界）
+ * - sampling: 栅格采样粒度 1~30（默认 4）：细节网格边长相对点间距的倍数，
+ *   越大细节斑点越大、与整体色块融合越柔；1=站点级最细
+ * - discrete: 分级着色（默认关=连续渐变）：开启后地图按图例 N 级离散着色
+ *   （等值线感）；连续渲染下细节增强的局部对比也才不会被量化抹平
+ * - levels: 手工编辑过的分级（颜色/区间/占比）。存在时地图着色与图例都按它走
+ *   （锚点分段映射），为空则按 method 自动分级
+ * - colorScheme: 渐变色带方案
+ * - colorDirection: 颜色变化方向（旧设置无此字段时按 normal 处理）
+ * - boundaryLayerId / boundaryDataId / boundarySource: 边界裁剪的面图层
+ *   （source='mapinfo' 取自图层文件，'excel' 取自地理化数据；空=不裁剪）
+ * - showOriginal: 热力启用时是否同时显示原图层图形（false=替换模式，原图形与标签隐藏）
+ *
+ * 注：原「模糊度 / 清晰度 / 数值上下限 / 颜色分布」参数已删除——
+ * 值域与颜色分布统一由图例分级（method/inflections/round/levels）承担。
+ */
+export interface HeatmapSettings {
+  enabled: boolean
+  field: string
+  smooth: number
+  method?: HeatmapLegendMethod
+  inflections?: number
+  round?: number
+  contrast?: number
+  opacity?: number
+  /** 细节增强 0~100（默认 95，0=纯平滑）：整体趋势场 ↔ 细节场凸组合比例 */
+  detail?: number
+  /** 栅格采样粒度 1~30（默认 4）：细节网格边长相对点间距的倍数，越大越粗越融合 */
+  sampling?: number
+  /** 分级着色：按图例 N 级离散着色（默认关=连续渐变） */
+  discrete?: boolean
+  /** 手工分级（颜色/区间/占比），空=按 method 自动分级 */
+  levels?: HeatLegendOverride[]
+  colorScheme: HeatmapColorScheme
+  colorDirection?: HeatmapColorDirection
+  /** 图例标签顺序：desc=高值在上（默认），asc=低值在上 */
+  legendOrder?: 'asc' | 'desc'
+  boundaryLayerId?: string
+  boundaryDataId?: string
+  boundarySource?: 'mapinfo' | 'excel'
+  showOriginal: boolean
+}
+
+/** 热力图默认设置（未选择字段时） */
+export const DEFAULT_HEATMAP_SETTINGS: Omit<HeatmapSettings, 'field'> = {
+  enabled: false,
+  smooth: 9,
+  method: 'cellCount',
+  inflections: 5,
+  round: 0.1,
+  contrast: 0.5,
+  opacity: 0.8,
+  detail: 95,
+  sampling: 4,
+  discrete: false,
+  colorScheme: 'default',
+  colorDirection: 'normal',
+  showOriginal: false,
+  legendOrder: 'desc',
+}
+
+/** 分级色块的基础色板（红、黄、青、绿、蓝） */
+export const HEATMAP_BASE_COLORS = ['#ff0000', '#ffff00', '#00ffff', '#00ff00', '#0000ff']
+
+/** 分级数可选项 */
+export const HEATMAP_INFLECTION_OPTIONS = [3, 5, 7, 9, 11, 15]
+/** 取整精度可选项（图例数值显示） */
+export const HEATMAP_ROUND_OPTIONS = [0.01, 0.1, 1, 10, 100]
+/** 对比度滑杆区间（百分数） */
+export const HEATMAP_CONTRAST_RANGE = { min: 50, max: 300 }
+/** 半透明度滑杆区间（百分数，0=完全不显示） */
+export const HEATMAP_OPACITY_RANGE = { min: 0, max: 100 }
+/** 百分比滑杆区间（0~100 设置项共用） */
+export const HEATMAP_PCT_RANGE = { min: 0, max: 100 }
+/** 栅格采样粒度滑杆区间（细节网格边长 / 点间距 倍数） */
+export const HEATMAP_SAMPLING_RANGE = { min: 1, max: 30 }
+
+/** 把持久化读回的百分数钳到滑杆区间，避免"滑块位置与状态值脱节" */
+function clampPct(v: number, min: number, max: number): number {
+  if (!Number.isFinite(v)) return max
+  return Math.min(max, Math.max(min, Math.round(v)))
 }
 
 /**
@@ -160,12 +338,23 @@ interface LabelSettingsModalProps {
   currentThematicSettings?: ThematicSettings | null
   /** 保存专题图层设置回调（null 表示关闭专题） */
   onSaveThematic?: (settings: ThematicSettings | null) => void
+  /** 当前热力图设置 */
+  currentHeatmapSettings?: HeatmapSettings | null
+  /** 保存热力图设置回调（null 表示关闭热力图） */
+  onSaveHeatmap?: (settings: HeatmapSettings | null) => void
+  /**
+   * 该图层在地图上的热力统计（含渲染场分布）。
+   * 分级预览用它做分位基准，才能与地图着色同源；缺省时退化为按样本点分布估算
+   */
+  mapHeatmapStats?: HeatmapStats | null
+  /** 可选作边界裁剪的面图层（来自图层文件与地理化数据） */
+  polygonLayers?: { id: string; dataId: string; name: string; source: 'mapinfo' | 'excel' }[]
   /** 字段值样本（字段 → 样本值数组，用于类型检测/推荐区间/唯一值列表） */
   thematicFieldSamples?: Record<string, FieldValueSample[]>
   /** 是否正在加载字段样本 */
   loadingThematicSamples?: boolean
   /** 打开弹窗时颜色设置页的初始子页（默认基础配置） */
-  initialColorSubTab?: 'basic' | 'thematic'
+  initialColorSubTab?: 'basic' | 'thematic' | 'heatmap'
   /** 图层几何类型（决定"图形大小"设置的语义：点→图形大小 / 面→边框宽度 / 线→线宽） */
   thematicGeometryType?: 'point' | 'line' | 'polygon' | 'sector'
   /** 扇区图层颜色模式：默认设置按频点区分颜色，不提供图形颜色/边框颜色设置项，仅保留透明度/边框宽度 */
@@ -176,6 +365,12 @@ interface LabelSettingsModalProps {
   onSaveThematicTemplate?: (name: string, ranges: ThematicRange[]) => void
   /** 删除区间配色模板回调 */
   onRemoveThematicTemplate?: (id: string) => void
+  /** 已保存的热力图设置模板列表 */
+  heatmapTemplates?: HeatmapTemplate[]
+  /** 保存热力图设置模板回调（以当前设置项的值为模板内容） */
+  onSaveHeatmapTemplate?: (name: string, settings: HeatmapTemplate['settings']) => void
+  /** 删除热力图设置模板回调 */
+  onRemoveHeatmapTemplate?: (id: string) => void
 }
 
 /**
@@ -289,22 +484,93 @@ function IntInput({ value, onChange, className }: { value: number; onChange: (v:
 }
 
 /**
- * 专题色块选择器 - 单色块 + 点击弹出面板（预设 5 色 + 自定义色板）
+ * 无色（镂空）色块：浅色底 + 红色斜线，表示要素不填充仅显示边框
  */
+function NoFillSwatch({ selected, onSelect, title, wide }: { selected: boolean; onSelect: () => void; title: string; wide?: boolean }) {
+  return (
+    <button
+      type="button"
+      onClick={onSelect}
+      className={`relative ${wide ? 'w-7 h-7' : 'w-6 h-6'} rounded border-2 transition-all overflow-hidden bg-background flex-shrink-0 ${selected
+        ? 'border-primary ring-1 ring-primary ring-offset-1'
+        : 'border-border hover:border-muted-foreground/50'
+        }`}
+      title={title}
+      aria-label={title}
+    >
+      <svg className="absolute inset-0 w-full h-full" viewBox="0 0 24 24" preserveAspectRatio="none">
+        <line x1="3" y1="21" x2="21" y2="3" stroke="#ef4444" strokeWidth="2.5" />
+      </svg>
+    </button>
+  )
+}
+
+/**
+ * 专题色块选择器 - 单色块 + 点击弹出面板（无色 + 预设 5 色 + 自定义色板）
+ */
+/**
+ * 热力图分级取色器：基础五色（红/黄/青/绿/蓝）快捷选择 + 自定义色盘。
+ * 内联展开在对应分级行下方（不用浮层，避免弹窗内 overflow 裁剪）。
+ */
+function HeatLevelColorPicker({
+  value,
+  onChange,
+  onAuto,
+}: {
+  value?: string
+  onChange: (color: string) => void
+  onAuto: () => void
+}) {
+  const { t } = useTranslation()
+  return (
+    <div className="mt-1 mb-2 p-2 border border-border rounded bg-muted/30">
+      <div className="flex items-center gap-1.5 mb-2">
+        {HEATMAP_BASE_COLORS.map((c) => (
+          <button
+            key={c}
+            type="button"
+            onClick={() => onChange(c)}
+            className={`w-6 h-6 rounded border-2 transition-all ${value?.toLowerCase() === c ? 'border-primary' : 'border-border'}`}
+            style={{ backgroundColor: c }}
+            title={c}
+          />
+        ))}
+        <button
+          type="button"
+          onClick={onAuto}
+          className="ml-auto text-[11px] text-muted-foreground hover:text-foreground"
+        >
+          {t('map.heatmapLevelColorAuto')}
+        </button>
+      </div>
+      <HexColorPicker
+        color={value ?? '#ff0000'}
+        onChange={onChange}
+        style={{ width: '100%', height: '110px' }}
+      />
+    </div>
+  )
+}
+
 function ColorSwatch({ value, onChange }: { value: string; onChange: (color: string) => void }) {
   const { t } = useTranslation()
   const [open, setOpen] = useState(false)
+  const noFill = value === NO_FILL_COLOR
 
   return (
     <div className="relative">
       <button
         type="button"
         onClick={() => setOpen(!open)}
-        className="w-7 h-7 rounded border-2 border-gray-300 hover:border-gray-400 transition-all flex items-center justify-center"
-        style={{ backgroundColor: value }}
-        title={value}
+        className="relative w-7 h-7 rounded border-2 border-border hover:border-muted-foreground/50 transition-all flex items-center justify-center overflow-hidden bg-background"
+        style={{ backgroundColor: noFill ? 'hsl(var(--background))' : value }}
+        title={noFill ? t('map.noFillColor') : value}
       >
-        {open && (
+        {noFill ? (
+          <svg className="absolute inset-0 w-full h-full" viewBox="0 0 24 24" preserveAspectRatio="none">
+            <line x1="3" y1="21" x2="21" y2="3" stroke="#ef4444" strokeWidth="2.5" />
+          </svg>
+        ) : open && (
           <span className="w-3 h-3 rounded-full border border-white/60 shadow" />
         )}
       </button>
@@ -313,23 +579,29 @@ function ColorSwatch({ value, onChange }: { value: string; onChange: (color: str
           className="absolute right-0 z-30 mt-1 p-2 bg-background border border-border rounded-lg shadow-lg w-52"
           onClick={(e) => e.stopPropagation()}
         >
-          {/* 预设色块 */}
+          {/* 无色（镂空）+ 预设色块 */}
           <div className="flex flex-wrap gap-1.5 mb-2">
+            <NoFillSwatch
+              wide
+              selected={noFill}
+              title={t('map.noFillColor')}
+              onSelect={() => { onChange(NO_FILL_COLOR); setOpen(false) }}
+            />
             {THEMATIC_PALETTE.map((presetColor) => (
               <button
                 key={presetColor}
                 onClick={() => { onChange(presetColor); setOpen(false) }}
-                className={`w-6 h-6 rounded border-2 transition-all ${value.toLowerCase() === presetColor.toLowerCase()
+                className={`w-6 h-6 rounded border-2 transition-all ${!noFill && value.toLowerCase() === presetColor.toLowerCase()
                   ? 'border-primary ring-1 ring-primary ring-offset-1'
-                  : 'border-gray-300 hover:border-gray-400'
+                  : 'border-border hover:border-muted-foreground/50'
                   }`}
                 style={{ backgroundColor: presetColor }}
                 title={presetColor}
               />
             ))}
           </div>
-          {/* 自定义色板 */}
-          <HexColorPicker color={value} onChange={onChange} />
+          {/* 自定义色板（无色时值非法，以白色展示供重新选色） */}
+          <HexColorPicker color={noFill ? '#ffffff' : value} onChange={onChange} />
           <input
             type="text"
             value={value}
@@ -346,22 +618,32 @@ function ColorSwatch({ value, onChange }: { value: string; onChange: (color: str
 
 /**
  * 颜色选择器组件 - 预设颜色 + 自定义色板（复用，保证两处颜色设置风格一致）
+ * allowNoFill：提供「无色」选项（填充色=要素镂空仅显示边框；边框色=不描边）
+ * noColorTitle：无色色块的提示文案（边框色与填充色语义不同）
  */
-function ColorField({ value, onChange }: { value: string; onChange: (color: string) => void }) {
+function ColorField({ value, onChange, allowNoFill = false, noColorTitle }: { value: string; onChange: (color: string) => void; allowNoFill?: boolean; noColorTitle?: string }) {
   const { t } = useTranslation()
   const [showCustomColor, setShowCustomColor] = useState(false)
+  const noFill = value === NO_FILL_COLOR
 
   return (
     <div className="space-y-2">
       {/* 预设颜色 */}
       <div className="flex flex-wrap gap-1.5">
+        {allowNoFill && (
+          <NoFillSwatch
+            selected={noFill}
+            title={noColorTitle || t('map.noFillColor')}
+            onSelect={() => { onChange(NO_FILL_COLOR); setShowCustomColor(false) }}
+          />
+        )}
         {PRESET_COLORS.map((presetColor) => (
           <button
             key={presetColor}
             onClick={() => { onChange(presetColor); setShowCustomColor(false) }}
-            className={`w-6 h-6 rounded border-2 transition-all ${value === presetColor
+            className={`w-6 h-6 rounded border-2 transition-all ${!noFill && value === presetColor
               ? 'border-primary ring-1 ring-primary ring-offset-1'
-              : 'border-gray-300 hover:border-gray-400'
+              : 'border-border hover:border-muted-foreground/50'
               }`}
             style={{ backgroundColor: presetColor }}
             title={presetColor}
@@ -370,7 +652,7 @@ function ColorField({ value, onChange }: { value: string; onChange: (color: stri
         {/* 自定义颜色按钮 */}
         <button
           onClick={() => setShowCustomColor(true)}
-          className={`w-6 h-6 rounded border-2 border-gray-300 hover:border-gray-400 flex items-center justify-center transition-all bg-gradient-to-br from-red-500 via-green-500 to-blue-500 ${showCustomColor ? 'ring-1 ring-primary ring-offset-1' : ''
+          className={`w-6 h-6 rounded border-2 border-border hover:border-muted-foreground/50 flex items-center justify-center transition-all bg-gradient-to-br from-red-500 via-green-500 to-blue-500 ${showCustomColor && !noFill ? 'ring-1 ring-primary ring-offset-1' : ''
             }`}
           title={t('map.customColor')}
         >
@@ -378,10 +660,10 @@ function ColorField({ value, onChange }: { value: string; onChange: (color: stri
         </button>
       </div>
 
-      {/* 自定义颜色选择器 */}
+      {/* 自定义颜色选择器（无色时值非法，以白色展示供重新选色） */}
       {showCustomColor && (
         <div className="flex items-center gap-2 pt-1">
-          <HexColorPicker color={value} onChange={onChange} />
+          <HexColorPicker color={noFill ? '#ffffff' : value} onChange={onChange} />
           <input
             type="text"
             value={value}
@@ -466,6 +748,10 @@ export function LabelSettingsModal({
   showThematicTab = false,
   currentThematicSettings,
   onSaveThematic,
+  currentHeatmapSettings,
+  onSaveHeatmap,
+  mapHeatmapStats = null,
+  polygonLayers = [],
   thematicFieldSamples = {},
   loadingThematicSamples = false,
   initialColorSubTab = 'basic',
@@ -473,7 +759,10 @@ export function LabelSettingsModal({
   sectorColorMode = false,
   thematicTemplates = [],
   onSaveThematicTemplate,
-  onRemoveThematicTemplate
+  onRemoveThematicTemplate,
+  heatmapTemplates = [],
+  onSaveHeatmapTemplate,
+  onRemoveHeatmapTemplate
 }: LabelSettingsModalProps) {
   // i18n translation
   const { t } = useTranslation()
@@ -482,16 +771,25 @@ export function LabelSettingsModal({
   const [content, setContent] = useState<LabelField>(currentSettings?.content || fieldOptions[0]?.value || 'name')
   const [color, setColor] = useState(currentSettings?.color || '#000000')
   const [fontSize, setFontSize] = useState(currentSettings?.fontSize || 12)
+  const [fontFamily, setFontFamily] = useState(currentSettings?.fontFamily || 'sans-serif')
+  const [bold, setBold] = useState(currentSettings?.bold ?? false)
+  const [italic, setItalic] = useState(currentSettings?.italic ?? false)
+  const [shadow, setShadow] = useState(currentSettings?.shadow ?? false)
+  const [background, setBackground] = useState<'none' | 'halo' | 'box'>(currentSettings?.background || 'none')
+  const [backgroundColor, setBackgroundColor] = useState(currentSettings?.backgroundColor || '#ffffff')
   const [showDropdown, setShowDropdown] = useState(false)
 
   // 内部状态 - 图层颜色设置
   const [fillColor, setFillColor] = useState(currentColorSettings?.fillColor || '#3b82f6')
   const [fillOpacityPct, setFillOpacityPct] = useState(Math.round((currentColorSettings?.fillOpacity ?? 0.6) * 100))
   const [borderWidth, setBorderWidth] = useState(currentColorSettings?.borderWidth || 2)
-  const [borderColor, setBorderColor] = useState(currentColorSettings?.borderColor || '#000000')
+  // 边框颜色默认无色（点/面图层不描边）；线状图层无边框色项（线色由图形颜色控制）
+  const [borderColor, setBorderColor] = useState(NO_FILL_COLOR)
+  // 点图层"图形大小"（基础配置新增：点要素半径 px）
+  const [pointSize, setPointSize] = useState(currentColorSettings?.pointSize ?? 6)
 
   // 内部状态 - 专题图层设置
-  const [colorSubTab, setColorSubTab] = useState<'basic' | 'thematic'>('basic')
+  const [colorSubTab, setColorSubTab] = useState<'basic' | 'thematic' | 'heatmap'>('basic')
   const [thematicEnabled, setThematicEnabled] = useState(false)
   const [thematicField, setThematicField] = useState('')
   const [thematicFieldType, setThematicFieldType] = useState<ThematicFieldType | null>(null)
@@ -500,16 +798,257 @@ export function LabelSettingsModal({
   const [thematicValueColors, setThematicValueColors] = useState<ThematicCategory[]>([])
   const [thematicCategories, setThematicCategories] = useState<ThematicCategory[]>([])
   const [thematicPointSize, setThematicPointSize] = useState(8)
+  // 专题图形透明度（百分比，0~100）与边框颜色（点/面默认无色）
+  const [thematicFillOpacityPct, setThematicFillOpacityPct] = useState(80)
+  const [thematicBorderColor, setThematicBorderColor] = useState(NO_FILL_COLOR)
   // 图例是否显示元素个数与占比统计
   const [thematicShowStats, setThematicShowStats] = useState(true)
   // 模板 UI 状态
   const [templateName, setTemplateName] = useState('')
   const [templateDropdownOpen, setTemplateDropdownOpen] = useState(false)
+  /** 热力图模板：保存名称输入与下拉展开态 */
+  const [heatTemplateName, setHeatTemplateName] = useState('')
+  const [heatTemplateDropdownOpen, setHeatTemplateDropdownOpen] = useState(false)
+
+  // 内部状态 - 热力图设置
+  const [heatEnabled, setHeatEnabled] = useState(false)
+  const [heatField, setHeatField] = useState('')
+  const [heatSmooth, setHeatSmooth] = useState(DEFAULT_HEATMAP_SETTINGS.smooth)
+  const [heatMethod, setHeatMethod] = useState<HeatmapLegendMethod>(DEFAULT_HEATMAP_SETTINGS.method ?? 'cellCount')
+  const [heatInflections, setHeatInflections] = useState(DEFAULT_HEATMAP_SETTINGS.inflections ?? 7)
+  const [heatRound, setHeatRound] = useState(DEFAULT_HEATMAP_SETTINGS.round ?? 0.1)
+  const [heatContrastPct, setHeatContrastPct] = useState(DEFAULT_HEATMAP_SETTINGS.contrast! * 100)
+  const [heatOpacityPct, setHeatOpacityPct] = useState(DEFAULT_HEATMAP_SETTINGS.opacity! * 100)
+  /** 细节增强（0=纯平滑趋势场，100=桶粒度细节场最强）与分级着色开关 */
+  const [heatDetail, setHeatDetail] = useState(DEFAULT_HEATMAP_SETTINGS.detail!)
+  const [heatSampling, setHeatSampling] = useState(DEFAULT_HEATMAP_SETTINGS.sampling!)
+  const [heatDiscrete, setHeatDiscrete] = useState(DEFAULT_HEATMAP_SETTINGS.discrete ?? false)
+  /** 手工分级（颜色/区间/占比）；null=未编辑，按 method 自动分级 */
+  const [heatLevelOverrides, setHeatLevelOverrides] = useState<HeatLegendOverride[] | null>(null)
+  /** 展开中的取色器行号（同一时刻只开一个） */
+  const [heatColorPickerRow, setHeatColorPickerRow] = useState<number | null>(null)
+  /**
+   * 分级输入框的草稿文本（key=分级下标）。
+   * 受控输入若直接用派生数值，用户键入 "51." 会被 Number() 解析成 51 并立刻回写，
+   * 小数点被抹掉 → 继续输入变成 514。故草稿只在文本为"完整数字"时才提交。
+   */
+  const [heatLevelDrafts, setHeatLevelDrafts] = useState<Record<number, string>>({})
+  const [heatColorScheme, setHeatColorScheme] = useState<HeatmapColorScheme>('default')
+
+  const [heatLegendOrder, setHeatLegendOrder] = useState<'asc' | 'desc'>(DEFAULT_HEATMAP_SETTINGS.legendOrder!)
+  const [heatBoundaryLayerId, setHeatBoundaryLayerId] = useState('')
+  const [heatShowOriginal, setHeatShowOriginal] = useState(true)
+  // 保存校验错误（启用但未选到数值字段）
+  const [heatError, setHeatError] = useState('')
+
+  /**
+   * 分级基准数据 + 自动分级：与地图图例同源——同一 buildHeatLegend + 同一"值→色带"映射函数，
+   * 并用样本的出现次数（count）还原真实分布（样本本身按值去重，不还原会得出相反的分位结论）。
+   * 随方法/级数/取整精度/对比度实时刷新；无样本时退化为占位值域，仅展示分级结构。
+   *
+   * 若地图上该图层已渲染热力（mapHeatmapStats），则优先用地图侧的**渲染场分布**做分位基准：
+   * 插值会把邻域值平均掉，渲染场分布与样本点分布差别很大，用后者算出的分级值与地图对不上。
+   */
+  const heatPreview = useMemo(() => {
+    const mapDist = mapHeatmapStats && mapHeatmapStats.field === heatField
+      ? mapHeatmapStats.fieldDistribution
+      : null
+    const distribution = mapDist && mapDist.length >= 2 ? mapDist : null
+    const samples = thematicFieldSamples[heatField] ?? []
+    const points: { lat: number; lng: number; weight: number }[] = []
+    const counts: number[] = []
+    let min = Infinity
+    let max = -Infinity
+    for (const s of samples) {
+      const v = toNumber(s.v)
+      if (v === null) continue
+      points.push({ lat: s.lat, lng: s.lng, weight: v })
+      counts.push(Math.max(1, Math.round(s.count ?? 1)))
+      if (v < min) min = v
+      if (v > max) max = v
+    }
+    // 值域也取地图侧的全量数据极值（样本按值去重，极值可能缺失）
+    if (distribution) {
+      min = mapHeatmapStats!.min
+      max = mapHeatmapStats!.max
+    } else if (points.length === 0) {
+      min = 0
+      max = 1
+    }
+    const rawMapper = buildValueMapper(points, min, max, heatMethod, heatContrastPct / 100, 512, distribution)
+    // 分级着色与地图侧同规则：量化到分级数（图例色块与地图实际颜色保持一致）
+    const mapValue = heatDiscrete
+      ? (v: number) => quantizeLevel(rawMapper(v), Math.max(2, heatInflections))
+      : rawMapper
+    const autoLevels = buildHeatLegend(points, min, max, heatMethod, heatInflections, heatRound, { counts, mapValue, distribution: distribution ?? undefined })
+    return { points, counts, min, max, distribution, autoLevels }
+  }, [thematicFieldSamples, heatField, mapHeatmapStats, heatMethod, heatInflections, heatRound, heatContrastPct, heatDiscrete])
+
+  /**
+   * 展示用分级：手工编辑优先。编辑态下映射也换成锚点映射（与地图侧一致），
+   * 保证面板里看到的颜色就是地图上的颜色。
+   */
+  const previewLevels = useMemo(() => {
+    if (!heatLevelOverrides) return heatPreview.autoLevels
+    const anchoredRaw = buildAnchoredMapper(
+      heatLevelOverrides.map(l => ({ value: l.value, t: l.t })),
+      heatContrastPct / 100
+    )
+    const anchored = heatDiscrete
+      ? (v: number) => quantizeLevel(anchoredRaw(v), Math.max(2, heatInflections))
+      : anchoredRaw
+    return buildHeatLegend(
+      heatPreview.points,
+      heatPreview.min,
+      heatPreview.max,
+      heatMethod,
+      heatLevelOverrides.length,
+      heatRound,
+      { overrides: heatLevelOverrides, mapValue: anchored }
+    )
+  }, [heatPreview, heatLevelOverrides, heatMethod, heatRound, heatContrastPct, heatDiscrete, heatInflections])
+
+  /**
+   * 颜色方向由「图例标签顺序」派生（保留原「颜色方向」能力）：
+   * 升序 = 反向色带（低值在图例顶部 → 地图上低值显暖端色），降序 = 正向
+   */
+  const heatColorDirection: HeatmapColorDirection = heatLegendOrder === 'asc' ? 'reverse' : 'normal'
+
+  /**
+   * 图例色带（自定义色按分级占比位注册）：图例取色与对比度**解耦**——
+   * 色块按分级的原始占比位置（t）从色带取色，对比度只作用于地图着色
+   */
+  const previewStops = useMemo(
+    () => resolveLevelGradient(
+      resolveHeatGradient(heatColorScheme, heatColorDirection),
+      previewLevels.map(l => ({ t: l.t, color: l.color })),
+      heatColorDirection
+    ),
+    [heatColorScheme, heatColorDirection, previewLevels]
+  )
+
+  /** 进入编辑态：以当前自动分级为初值（用户改动第一项即落为手工分级） */
+  const ensureOverrides = (): HeatLegendOverride[] =>
+    heatLevelOverrides ?? heatPreview.autoLevels.map(l => ({ t: l.t, value: l.value }))
+
+  /** 清空手工分级（连同取色器展开态与输入草稿），回到当前设置的自动分级。
+   *  注意：不得改动分级数/配色方案——分级数、分级方法下拉的 onChange 也调用它 */
+  const clearLevelOverrides = () => {
+    setHeatLevelOverrides(null)
+    setHeatColorPickerRow(null)
+    setHeatLevelDrafts({})
+  }
+
+  /** 恢复自动分级按钮：回到标准 5 级（红100%/黄75%/绿50%/青25%/蓝0%，默认色带），
+   *  分级数与配色方案一并复位 */
+  const resetLevelsToDefault = () => {
+    setHeatInflections(5)
+    setHeatColorScheme('default')
+    clearLevelOverrides()
+  }
+
+  /** 分级输入的展示文本：编辑中的草稿优先，否则用派生数值 */
+  const levelInputText = (index: number, lv: { t: number; value: number }) =>
+    heatLevelDrafts[index] ?? String(heatMethod === 'cellCount' ? Math.round(lv.t * 100) : Math.round(lv.value * 1000) / 1000)
+
+  /**
+   * 分级输入变更：草稿照单全收，只有文本构成完整数字时才落到分级里。
+   * 这样 "51."、"-"、"" 等中间态不会被打断，也不会把 51.4 误存成 514。
+   */
+  const handleLevelInput = (index: number, text: string) => {
+    setHeatLevelDrafts(prev => ({ ...prev, [index]: text }))
+    const trimmed = text.trim()
+    if (!/^-?\d+(\.\d+)?$/.test(trimmed)) return
+    const n = Number(trimmed)
+    if (!Number.isFinite(n)) return
+    updateLevel(index, heatMethod === 'cellCount' ? { pct: n } : { value: n })
+  }
+
+  /** 失焦时清掉草稿：下一次显示回到已生效的数值（非法输入自然被丢弃） */
+  const handleLevelBlur = (index: number) => {
+    setHeatLevelDrafts(prev => {
+      if (!(index in prev)) return prev
+      const next = { ...prev }
+      delete next[index]
+      return next
+    })
+  }
+
+  /** 改占比（等效细胞计数）/ 改区间值（等效范围）：另一字段随之换算 */
+  const updateLevel = (index: number, patch: { pct?: number; value?: number; color?: string | null }) => {
+    const next = [...ensureOverrides()]
+    const cur = next[index]
+    if (!cur) return
+    let t = cur.t
+    let value = cur.value
+    if (patch.pct !== undefined) {
+      t = Math.max(0, Math.min(1, patch.pct / 100))
+      if (heatMethod === 'cellCount') {
+        value = heatPreview.distribution
+          ? quantileRefValue(heatPreview.distribution, t)
+          : quantileValueAt(heatPreview.points, t, heatPreview.counts, cur.value)
+      }
+    }
+    if (patch.value !== undefined) {
+      value = patch.value
+      const span = heatPreview.max - heatPreview.min
+      t = span > 0 ? Math.max(0, Math.min(1, (value - heatPreview.min) / span)) : cur.t
+    }
+    const color = patch.color === null ? undefined : (patch.color ?? cur.color)
+    next[index] = { t, value, color }
+    setHeatLevelOverrides(next)
+  }
+
+  /**
+   * 套用热力图模板：把模板保存的各项设置填回表单（不含字段选择/边界/启用开关/
+   * 手工分级——那些是图层相关的）。
+   */
+  const applyHeatmapTemplate = (tmpl: HeatmapTemplate) => {
+    const s = tmpl.settings
+    setHeatSmooth(Math.min(10, Math.max(1, s.smooth)))
+    setHeatMethod(s.method ?? 'cellCount')
+    const inflections = s.inflections ?? DEFAULT_HEATMAP_SETTINGS.inflections!
+    setHeatInflections(HEATMAP_INFLECTION_OPTIONS.includes(inflections) ? inflections : DEFAULT_HEATMAP_SETTINGS.inflections!)
+    const round = s.round ?? DEFAULT_HEATMAP_SETTINGS.round!
+    setHeatRound(HEATMAP_ROUND_OPTIONS.includes(round) ? round : DEFAULT_HEATMAP_SETTINGS.round!)
+    setHeatContrastPct(clampPct((s.contrast ?? 1) * 100, HEATMAP_CONTRAST_RANGE.min, HEATMAP_CONTRAST_RANGE.max))
+    setHeatOpacityPct(clampPct((s.opacity ?? 1) * 100, HEATMAP_OPACITY_RANGE.min, HEATMAP_OPACITY_RANGE.max))
+    setHeatDetail(clampPct(s.detail ?? DEFAULT_HEATMAP_SETTINGS.detail!, HEATMAP_PCT_RANGE.min, HEATMAP_PCT_RANGE.max))
+    setHeatSampling(Math.min(HEATMAP_SAMPLING_RANGE.max, Math.max(HEATMAP_SAMPLING_RANGE.min, Math.round(s.sampling ?? DEFAULT_HEATMAP_SETTINGS.sampling!))))
+    setHeatDiscrete(s.discrete ?? false)
+    setHeatColorScheme(s.colorScheme || 'default')
+    // 旧设置只有 colorDirection：反向迁移为升序，正向迁移为降序
+    setHeatLegendOrder(s.legendOrder ?? (s.colorDirection === 'reverse' ? 'asc' : DEFAULT_HEATMAP_SETTINGS.legendOrder!))
+    setHeatShowOriginal(s.showOriginal !== false)
+  }
+
+  /** 以当前表单值构造模板内容（不含字段选择/边界/启用开关/手工分级） */
+  const buildHeatmapTemplateSettings = (): HeatmapTemplate['settings'] => ({
+    smooth: heatSmooth,
+    method: heatMethod,
+    inflections: heatInflections,
+    round: heatRound,
+    contrast: heatContrastPct / 100,
+    opacity: heatOpacityPct / 100,
+    detail: heatDetail,
+    sampling: heatSampling,
+    discrete: heatDiscrete,
+    colorScheme: heatColorScheme,
+    colorDirection: heatColorDirection,
+    legendOrder: heatLegendOrder,
+    showOriginal: heatShowOriginal,
+  })
 
   // 几何类型 → 尺寸设置语义：点=图形大小(半径)，面/扇区=边框宽度，线=线宽
   const isPointType = thematicGeometryType === 'point'
+  const isLineType = thematicGeometryType === 'line'
+  // 点/面图层：边框颜色提供「无色」选项且默认无色（扇区图层按频点配色，不提供该项）
+  const borderColorSupportsNone = thematicGeometryType === 'point' || thematicGeometryType === 'polygon'
   const sizeMin = isPointType ? 3 : 1
   const sizeMax = isPointType ? 20 : 8
+  // "图形大小"（基础设置新增）仅对图层文件类点图层开放（可进入专题子页的 point 图层）；
+  // 装饰图层等非图层文件不显示该设置项
+  const isPointBasic = isPointType && showThematicTab
 
   // 当弹窗打开时，重置为当前设置（仅在打开瞬间初始化一次，
   // 依赖仅 isOpen：字段选项异步加载等 props 变化不会重置用户正在进行的操作）
@@ -525,13 +1064,33 @@ export function LabelSettingsModal({
       setContent(defaultContent)
       setColor(currentSettings?.color || '#000000')
       setFontSize(currentSettings?.fontSize || 12)
+      setFontFamily(currentSettings?.fontFamily || 'sans-serif')
+      setBold(currentSettings?.bold ?? false)
+      setItalic(currentSettings?.italic ?? false)
+      setShadow(currentSettings?.shadow ?? false)
+      setBackground(currentSettings?.background || 'none')
+      setBackgroundColor(currentSettings?.backgroundColor || '#ffffff')
       setShowDropdown(false)
 
       // 图层颜色设置
-      setFillColor(currentColorSettings?.fillColor || '#3b82f6')
       setFillOpacityPct(Math.round((currentColorSettings?.fillOpacity ?? 0.6) * 100))
       setBorderWidth(currentColorSettings?.borderWidth || 2)
-      setBorderColor(currentColorSettings?.borderColor || '#000000')
+      if (thematicGeometryType === 'line') {
+        // 线状图层：无"边框颜色"项，"图形颜色"即线条颜色。
+        // 兼容旧版本设置（旧版线色保存在 borderColor），优先用它回填图形颜色
+        const legacyLineColor = currentColorSettings?.borderColor
+        setFillColor(legacyLineColor && legacyLineColor !== NO_FILL_COLOR
+          ? legacyLineColor
+          : (currentColorSettings?.fillColor || '#8b5cf6'))
+        setBorderColor(NO_FILL_COLOR)
+      } else {
+        setFillColor(currentColorSettings?.fillColor || '#3b82f6')
+        // 点/面图层边框颜色默认无色；已保存值（含旧版黑色/自定义色）原样保留
+        setBorderColor(currentColorSettings?.borderColor
+          || (borderColorSupportsNone ? NO_FILL_COLOR : '#000000'))
+      }
+      // 点图层"图形大小"：已保存值原样保留，无则用默认 6px
+      setPointSize(currentColorSettings?.pointSize ?? (isPointType ? 6 : 1))
 
       // 专题图层设置
       setColorSubTab(initialColorSubTab)
@@ -545,6 +1104,10 @@ export function LabelSettingsModal({
         setThematicValueColors(ts.valueColors || [])
         setThematicCategories(ts.categories || [])
         setThematicPointSize(ts.pointSize || (isPointType ? 8 : 2))
+        setThematicFillOpacityPct(Math.round((ts.fillOpacity ?? 0.8) * 100))
+        // 点/面专题描边默认无色；已保存值原样保留；线要素不显示该项
+        setThematicBorderColor(ts.borderColor
+          || (borderColorSupportsNone ? NO_FILL_COLOR : '#000000'))
         setThematicShowStats(ts.showStats !== false)
       } else {
         setThematicEnabled(false)
@@ -555,8 +1118,56 @@ export function LabelSettingsModal({
         setThematicValueColors([])
         setThematicCategories([])
         setThematicPointSize(isPointType ? 8 : 2)
+        setThematicFillOpacityPct(80)
+        setThematicBorderColor(borderColorSupportsNone ? NO_FILL_COLOR : '#000000')
         setThematicShowStats(true)
       }
+      // 热力图设置回填
+      const hs = currentHeatmapSettings
+      if (hs && hs.enabled) {
+        setHeatEnabled(true)
+        setHeatField(hs.field || '')
+        setHeatSmooth(hs.smooth ?? DEFAULT_HEATMAP_SETTINGS.smooth)
+        // 旧持久化迁移：无 method 时按旧 colorScale 推断（'linear' 等值域 → 等效范围）
+        const legacyScale = (hs as HeatmapSettings & { colorScale?: string }).colorScale
+        setHeatMethod(hs.method ?? (legacyScale === 'linear' ? 'valueRange' : 'cellCount'))
+        // 回填归一化：越界值会让滑块位置与状态脱节、不在白名单的值会让下拉渲染为空选
+        const inflections = hs.inflections ?? DEFAULT_HEATMAP_SETTINGS.inflections!
+        const round = hs.round ?? DEFAULT_HEATMAP_SETTINGS.round!
+        setHeatInflections(HEATMAP_INFLECTION_OPTIONS.includes(inflections) ? inflections : DEFAULT_HEATMAP_SETTINGS.inflections!)
+        setHeatRound(HEATMAP_ROUND_OPTIONS.includes(round) ? round : DEFAULT_HEATMAP_SETTINGS.round!)
+        setHeatContrastPct(clampPct((hs.contrast ?? 1) * 100, HEATMAP_CONTRAST_RANGE.min, HEATMAP_CONTRAST_RANGE.max))
+        setHeatOpacityPct(clampPct((hs.opacity ?? 1) * 100, HEATMAP_OPACITY_RANGE.min, HEATMAP_OPACITY_RANGE.max))
+        setHeatDetail(clampPct(hs.detail ?? DEFAULT_HEATMAP_SETTINGS.detail!, HEATMAP_PCT_RANGE.min, HEATMAP_PCT_RANGE.max))
+        setHeatSampling(Math.min(HEATMAP_SAMPLING_RANGE.max, Math.max(HEATMAP_SAMPLING_RANGE.min, Math.round(hs.sampling ?? DEFAULT_HEATMAP_SETTINGS.sampling!))))
+        setHeatDiscrete(hs.discrete ?? false)
+        setHeatLevelOverrides(hs.levels && hs.levels.length >= 2 ? hs.levels : null)
+        setHeatColorPickerRow(null)
+        setHeatLevelDrafts({})
+        setHeatColorScheme(hs.colorScheme || 'default')
+        setHeatLegendOrder(hs.legendOrder ?? (hs.colorDirection === 'reverse' ? 'asc' : DEFAULT_HEATMAP_SETTINGS.legendOrder!))
+        setHeatBoundaryLayerId(hs.boundaryLayerId ?? '')
+        setHeatShowOriginal(hs.showOriginal !== false)
+      } else {
+        setHeatEnabled(false)
+        setHeatField('')
+        setHeatSmooth(DEFAULT_HEATMAP_SETTINGS.smooth)
+        setHeatMethod(DEFAULT_HEATMAP_SETTINGS.method ?? 'cellCount')
+        setHeatInflections(DEFAULT_HEATMAP_SETTINGS.inflections!)
+        setHeatRound(DEFAULT_HEATMAP_SETTINGS.round!)
+        setHeatContrastPct(DEFAULT_HEATMAP_SETTINGS.contrast! * 100)
+        setHeatOpacityPct(DEFAULT_HEATMAP_SETTINGS.opacity! * 100)
+        setHeatDetail(DEFAULT_HEATMAP_SETTINGS.detail!)
+        setHeatSampling(DEFAULT_HEATMAP_SETTINGS.sampling!)
+        setHeatDiscrete(DEFAULT_HEATMAP_SETTINGS.discrete ?? false)
+        setHeatLevelOverrides(null)
+        setHeatColorPickerRow(null)
+        setHeatColorScheme(DEFAULT_HEATMAP_SETTINGS.colorScheme)
+        setHeatLegendOrder(DEFAULT_HEATMAP_SETTINGS.legendOrder!)
+        setHeatBoundaryLayerId('')
+        setHeatShowOriginal(DEFAULT_HEATMAP_SETTINGS.showOriginal)
+      }
+      setHeatError('')
       setTemplateName('')
       setTemplateDropdownOpen(false)
   }, [isOpen])
@@ -572,6 +1183,45 @@ export function LabelSettingsModal({
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [fieldOptions, isOpen])
+
+  /** 样本是否已就绪（未就绪时字段类型无法判定） */
+  const hasFieldSamples = Object.keys(thematicFieldSamples).length > 0
+
+  /** 样本就绪后按类型判定为数值的字段（未就绪时为空） */
+  const sampledNumericFieldOptions = hasFieldSamples
+    ? fieldOptions.filter(opt => detectFieldType(thematicFieldSamples[opt.value]) === 'numeric')
+    : []
+
+  /** 数值字段候选：样本尚未到达时先返回全量，保存时再做一次数值校验，避免异步样本延迟导致下拉为空 */
+  const numericFieldOptions = hasFieldSamples ? sampledNumericFieldOptions : fieldOptions
+
+  /**
+   * 热力图"权重字段"下拉清单：
+   * - 基站（扇区）图层：与"专题图层"属性字段清单完全一致（同一份 fieldOptions）。
+   *   样本判定会漏掉仅用于几何渲染的数值字段（方位角/波瓣角等），逐字段数值过滤会让清单比专题少；
+   *   非数值字段无法生成热力，统一在保存时提示，不在此处隐藏；
+   * - 其他图层：仍按样本数值过滤（字段来自真实数据列，文本列不能作为权重）。
+   */
+  const heatFieldOptions = sectorColorMode
+    ? fieldOptions
+    : numericFieldOptions
+
+  /**
+   * 自动默认权重字段候选：只在"样本已验证为数值"的字段中挑，
+   * 避免样本到达前把文本字段（如小区名称）选成默认权重导致热力为空。
+   */
+  const heatAutoFieldOptions = sampledNumericFieldOptions
+
+  // 热力字段自动选择：启用状态下数值候选就绪且当前字段为空/已不在清单中时，选第一个数值字段
+  useEffect(() => {
+    if (!isOpen || !heatEnabled) return
+    if (heatAutoFieldOptions.length === 0) return
+    if (!heatField || !heatFieldOptions.some(o => o.value === heatField)) {
+      setHeatField(heatAutoFieldOptions[0].value)
+      setHeatError('')
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [heatAutoFieldOptions.length, heatFieldOptions.length, isOpen, heatEnabled])
 
   /**
    * 样本异步加载完成后：若已启用专题但字段类型尚未检测（用户操作早于样本到达），
@@ -675,11 +1325,35 @@ export function LabelSettingsModal({
   // 保存设置（根据当前标签页决定保存哪个）
   const handleSave = () => {
     if (activeTab === 'color') {
+      // 热力图校验前置：启用但无可用数值字段/未选字段/选中字段为文本类时，阻断本次全部保存并提示
+      if (showThematicTab && heatEnabled) {
+        if (!loadingThematicSamples && hasFieldSamples && numericFieldOptions.length === 0) {
+          setHeatError(t('map.heatmapNoNumericFields'))
+          setColorSubTab('heatmap')
+          return
+        }
+        if (!heatField) {
+          setHeatError(t('map.heatmapFieldRequired'))
+          setColorSubTab('heatmap')
+          return
+        }
+        // 样本就绪后所选字段被识别为文本类：阻断，避免存了文本字段导致渲染为空
+        // （基站图层清单与专题一致，含文本字段，因此这里必须逐字段校验；
+        //  覆盖类型/是否共享/厂家为展示别名，需映射回真实字段名后再查样本）
+        const heatSampleKey = sectorColorMode ? resolveSectorField(heatField) : heatField
+        if (!loadingThematicSamples && hasFieldSamples && detectFieldType(thematicFieldSamples[heatSampleKey]) === 'text') {
+          setHeatError(t('map.heatmapFieldNotNumeric'))
+          setColorSubTab('heatmap')
+          return
+        }
+      }
       const settings: LayerColorSettings = {
         fillColor,
         fillOpacity: fillOpacityPct / 100,
         borderWidth,
-        borderColor
+        borderColor,
+        // 点图层基础设置新增"图形大小"（点要素半径 px）
+        ...(isPointBasic ? { pointSize } : {})
       }
       // 总是同时保存基础配置与专题配置（两套独立存储，互不覆盖）
       onSaveColor?.(settings)
@@ -691,6 +1365,8 @@ export function LabelSettingsModal({
             fieldType: thematicFieldType,
             colorMode: thematicFieldType === 'numeric' ? thematicColorMode : undefined,
             pointSize: thematicPointSize,
+            fillOpacity: thematicFillOpacityPct / 100,
+            borderColor: thematicBorderColor,
             showStats: thematicShowStats,
             ranges: thematicRanges,
             valueColors: thematicFieldType === 'numeric' && thematicColorMode === 'value' ? thematicValueColors : [],
@@ -700,13 +1376,47 @@ export function LabelSettingsModal({
         } else {
           onSaveThematic?.(null)
         }
+
+        // 热力图独立于专题保存（两者可共存；启用校验已在保存前完成）
+        if (showThematicTab && onSaveHeatmap) {
+          if (heatEnabled) {
+            onSaveHeatmap({
+              enabled: true,
+              field: heatField,
+              smooth: heatSmooth,
+              method: heatMethod,
+              inflections: heatInflections,
+              round: heatRound,
+              contrast: heatContrastPct / 100,
+              opacity: heatOpacityPct / 100,
+              detail: heatDetail,
+              sampling: heatSampling,
+              discrete: heatDiscrete,
+              // 仅在用户确实手工编辑过分级时保存（否则保持自动分级）
+              levels: heatLevelOverrides ?? undefined,
+              colorScheme: heatColorScheme,
+              colorDirection: heatColorDirection,
+              legendOrder: heatLegendOrder,
+              boundaryLayerId: heatBoundaryLayerId || undefined,
+              boundaryDataId: heatBoundaryLayerId
+                ? polygonLayers.find(l => l.id === heatBoundaryLayerId)?.dataId
+                : undefined,
+              boundarySource: heatBoundaryLayerId
+                ? polygonLayers.find(l => l.id === heatBoundaryLayerId)?.source
+                : undefined,
+              showOriginal: heatShowOriginal,
+            })
+          } else {
+            onSaveHeatmap(null)
+          }
+        }
       }
     } else {
       // 修复：确保content不为空字符串，如果为空则使用默认值
       const validContent = (content && content !== '')
         ? content
         : (fieldOptions[0]?.value || 'name')
-      onSave({ content: validContent, color, fontSize })
+      onSave({ content: validContent, color, fontSize, fontFamily, bold, italic, shadow, background, backgroundColor })
     }
     onClose()
   }
@@ -726,7 +1436,7 @@ export function LabelSettingsModal({
       onClick={onClose}
     >
       <div
-        className="bg-card border border-border rounded-lg shadow-lg p-5 w-[420px] h-[640px] flex flex-col"
+        className="bg-card border border-border rounded-lg shadow-lg p-5 w-[700px] max-w-[92vw] h-[640px] max-h-[90vh] flex flex-col"
         onClick={(e) => e.stopPropagation()}
       >
         {/* 标题栏 */}
@@ -842,12 +1552,75 @@ export function LabelSettingsModal({
                 step="1"
                 value={fontSize}
                 onChange={(e) => setFontSize(Number(e.target.value))}
-                className="w-full h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer"
+                className="w-full h-2 bg-muted rounded-lg appearance-none cursor-pointer"
               />
-              <div className="flex justify-between text-xs text-muted-foreground mt-1">
-                <span>8px</span>
-                <span>20px</span>
+            </div>
+
+            {/* 字体（预设系统字体，按 CSS font-family 栈逐级回退） */}
+            <div className="mb-4">
+              <label className="block text-xs text-muted-foreground mb-2">{t('map.fontFamily')}</label>
+              <select
+                value={fontFamily}
+                onChange={(e) => setFontFamily(e.target.value)}
+                className="w-full px-3 py-2 text-xs border border-border rounded bg-background text-foreground"
+              >
+                {FONT_FAMILY_OPTIONS.map((opt) => (
+                  <option key={opt.label} value={opt.value}>
+                    {opt.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            {/* 字体效果：加粗 / 斜体 / 阴影 */}
+            <div className="mb-4">
+              <label className="block text-xs text-muted-foreground mb-2">{t('map.fontEffect')}</label>
+              <div className="flex gap-1.5">
+                {([
+                  { key: 'bold', label: t('map.fontEffectBold'), active: bold, onToggle: () => setBold(!bold) },
+                  { key: 'italic', label: t('map.fontEffectItalic'), active: italic, onToggle: () => setItalic(!italic) },
+                  { key: 'shadow', label: t('map.fontEffectShadow'), active: shadow, onToggle: () => setShadow(!shadow) },
+                ] as const).map((eff) => (
+                  <button
+                    key={eff.key}
+                    type="button"
+                    onClick={eff.onToggle}
+                    className={`flex-1 px-3 py-1.5 text-xs rounded-md border transition-colors font-medium ${eff.active
+                      ? 'bg-primary/10 text-primary border-primary/40'
+                      : 'bg-background text-muted-foreground border-border hover:text-foreground'
+                      }`}
+                  >
+                    {eff.label}
+                  </button>
+                ))}
               </div>
+            </div>
+
+            {/* 字体背景：无 / 光晕 / 框形（互斥），halo/box 时可选背景颜色 */}
+            <div className="mb-4">
+              <label className="block text-xs text-muted-foreground mb-2">{t('map.labelBackground')}</label>
+              <div className="flex gap-1.5 mb-2">
+                {([
+                  { key: 'none', label: t('map.labelBgNone') },
+                  { key: 'halo', label: t('map.labelBgHalo') },
+                  { key: 'box', label: t('map.labelBgBox') },
+                ] as const).map((opt) => (
+                  <button
+                    key={opt.key}
+                    type="button"
+                    onClick={() => setBackground(opt.key)}
+                    className={`flex-1 px-3 py-1.5 text-xs rounded-md border transition-colors font-medium ${background === opt.key
+                      ? 'bg-primary/10 text-primary border-primary/40'
+                      : 'bg-background text-muted-foreground border-border hover:text-foreground'
+                      }`}
+                  >
+                    {opt.label}
+                  </button>
+                ))}
+              </div>
+              {background !== 'none' && (
+                <ColorField value={backgroundColor} onChange={setBackgroundColor} />
+              )}
             </div>
           </>
         )}
@@ -878,6 +1651,16 @@ export function LabelSettingsModal({
                 >
                   {t('map.thematicLayer')}
                 </button>
+                <button
+                  type="button"
+                  onClick={() => setColorSubTab('heatmap')}
+                  className={`flex-1 px-3 py-1.5 text-xs rounded-md transition-colors font-medium ${colorSubTab === 'heatmap'
+                    ? 'bg-background text-primary shadow-sm border border-border'
+                    : 'text-muted-foreground hover:text-foreground'
+                    }`}
+                >
+                  {t('map.heatmapLayer')}
+                </button>
               </div>
             )}
 
@@ -885,15 +1668,33 @@ export function LabelSettingsModal({
             {colorSubTab === 'basic' && (
               <div className={thematicEnabled ? 'opacity-50 pointer-events-none select-none' : ''}>
                 {thematicEnabled && (
-                  <div className="mb-3 px-3 py-2 text-xs rounded bg-amber-50 border border-amber-200 text-amber-700">
+                  <div className="mb-3 px-3 py-2 text-xs rounded bg-amber-500/10 border border-amber-500/20 text-amber-400">
                     {t('map.thematicActiveHint')}
                   </div>
                 )}
+                {/* 图形大小（点图层基础配置新增：点要素半径设置） */}
+                {isPointBasic && (
+                  <div className="mb-4">
+                    <label className="block text-xs text-muted-foreground mb-2">
+                      {t('map.thematicPointSizeUnit', { size: pointSize })}
+                    </label>
+                    <input
+                      type="range"
+                      min={sizeMin}
+                      max={sizeMax}
+                      step="1"
+                      value={pointSize}
+                      onChange={(e) => setPointSize(Number(e.target.value))}
+                      className="w-full h-2 bg-muted rounded-lg appearance-none cursor-pointer"
+                    />
+                  </div>
+                )}
+
                 {/* 图形颜色（填充色）- 扇区图层默认按频点区分颜色，不提供图形颜色设置项 */}
                 {!sectorColorMode && (
                   <div className="mb-4">
                     <label className="block text-xs text-muted-foreground mb-2">{t('map.fillColor')}</label>
-                    <ColorField value={fillColor} onChange={setFillColor} />
+                    <ColorField value={fillColor} onChange={setFillColor} allowNoFill />
                   </div>
                 )}
 
@@ -909,18 +1710,16 @@ export function LabelSettingsModal({
                     step="1"
                     value={fillOpacityPct}
                     onChange={(e) => setFillOpacityPct(Number(e.target.value))}
-                    className="w-full h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer"
+                    className="w-full h-2 bg-muted rounded-lg appearance-none cursor-pointer"
                   />
-                  <div className="flex justify-between text-xs text-muted-foreground mt-1">
-                    <span>0%</span>
-                    <span>100%</span>
-                  </div>
                 </div>
 
-                {/* 边框宽度 */}
+                {/* 边框宽度（线状图层为"线宽"） */}
                 <div className="mb-4">
                   <label className="block text-xs text-muted-foreground mb-2">
-                    {t('map.borderWidthUnit', { size: borderWidth })}
+                    {isLineType
+                      ? t('map.lineWidthUnit', { size: borderWidth })
+                      : t('map.borderWidthUnit', { size: borderWidth })}
                   </label>
                   <input
                     type="range"
@@ -929,19 +1728,21 @@ export function LabelSettingsModal({
                     step="1"
                     value={borderWidth}
                     onChange={(e) => setBorderWidth(Number(e.target.value))}
-                    className="w-full h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer"
+                    className="w-full h-2 bg-muted rounded-lg appearance-none cursor-pointer"
                   />
-                  <div className="flex justify-between text-xs text-muted-foreground mt-1">
-                    <span>1px</span>
-                    <span>8px</span>
-                  </div>
                 </div>
 
-                {/* 边框颜色 - 扇区图层默认按频点区分颜色，不提供边框颜色设置项 */}
-                {!sectorColorMode && (
+                {/* 边框颜色 - 扇区图层按频点配色不提供；线状图层无描边项；
+                    点/面图层提供「无色」选项且默认无色（不描边） */}
+                {!sectorColorMode && !isLineType && (
                   <div className="mb-4">
                     <label className="block text-xs text-muted-foreground mb-2">{t('map.borderColor')}</label>
-                    <ColorField value={borderColor} onChange={setBorderColor} />
+                    <ColorField
+                      value={borderColor}
+                      onChange={setBorderColor}
+                      allowNoFill={borderColorSupportsNone}
+                      noColorTitle={t('map.noBorderColor')}
+                    />
                   </div>
                 )}
               </div>
@@ -963,7 +1764,7 @@ export function LabelSettingsModal({
                         handleThematicFieldChange(thematicField)
                       }
                     }}
-                    className={`relative w-9 h-5 rounded-full transition-colors ${thematicEnabled ? 'bg-primary' : 'bg-gray-300'}`}
+                    className={`relative w-9 h-5 rounded-full transition-colors ${thematicEnabled ? 'bg-primary' : 'bg-muted'}`}
                   >
                     <span
                       className={`absolute top-0.5 w-4 h-4 rounded-full bg-white shadow transition-all ${thematicEnabled ? 'left-[18px]' : 'left-0.5'}`}
@@ -1015,7 +1816,7 @@ export function LabelSettingsModal({
                       <button
                         type="button"
                         onClick={() => setThematicShowStats(!thematicShowStats)}
-                        className={`relative w-9 h-5 rounded-full transition-colors ${thematicShowStats ? 'bg-primary' : 'bg-gray-300'}`}
+                        className={`relative w-9 h-5 rounded-full transition-colors ${thematicShowStats ? 'bg-primary' : 'bg-muted'}`}
                       >
                         <span
                           className={`absolute top-0.5 w-4 h-4 rounded-full bg-white shadow transition-all ${thematicShowStats ? 'left-[18px]' : 'left-0.5'}`}
@@ -1111,7 +1912,7 @@ export function LabelSettingsModal({
                                   <button
                                     type="button"
                                     onClick={() => setThematicRanges(thematicRanges.filter((_, j) => j !== i))}
-                                    className="p-1 rounded hover:bg-red-50 text-red-400 hover:text-red-600 transition-colors"
+                                    className="p-1 rounded hover:bg-red-500/15 text-red-400 hover:text-red-600 transition-colors"
                                     title={t('map.thematicRemoveRange')}
                                   >
                                     <Trash2 size={12} />
@@ -1186,7 +1987,7 @@ export function LabelSettingsModal({
                                           <button
                                             type="button"
                                             onClick={() => onRemoveThematicTemplate?.(tmpl.id)}
-                                            className="p-1 rounded hover:bg-red-50 text-red-400 opacity-0 group-hover:opacity-100 transition-opacity"
+                                            className="p-1 rounded hover:bg-red-500/15 text-red-400 opacity-0 group-hover:opacity-100 transition-opacity"
                                             title={t('map.thematicTemplateDelete')}
                                           >
                                             <Trash2 size={12} />
@@ -1228,7 +2029,7 @@ export function LabelSettingsModal({
                                 <button
                                   type="button"
                                   onClick={() => setThematicValueColors(thematicValueColors.filter((_, j) => j !== i))}
-                                  className="p-1 rounded hover:bg-red-50 text-red-400 hover:text-red-600 transition-colors"
+                                  className="p-1 rounded hover:bg-red-500/15 text-red-400 hover:text-red-600 transition-colors"
                                   title={t('map.thematicRemoveRange')}
                                 >
                                   <Trash2 size={12} />
@@ -1244,7 +2045,7 @@ export function LabelSettingsModal({
                               const totalValues = new Set((samples || []).map(s => String(s.v))).size
                               if (totalValues > THEMATIC_VALUE_LIMIT) {
                                 return (
-                                  <div className="px-3 py-2 text-xs rounded bg-amber-50 border border-amber-200 text-amber-700">
+                                  <div className="px-3 py-2 text-xs rounded bg-amber-500/10 border border-amber-500/20 text-amber-400">
                                     {t('map.thematicValueOverLimitHint', {
                                       total: totalValues,
                                       limit: THEMATIC_VALUE_LIMIT,
@@ -1255,7 +2056,7 @@ export function LabelSettingsModal({
                                 )
                               }
                               return (
-                                <div className="px-3 py-2 text-xs rounded bg-amber-50 border border-amber-200 text-amber-700">
+                                <div className="px-3 py-2 text-xs rounded bg-amber-500/10 border border-amber-500/20 text-amber-400">
                                   {t('map.thematicUncoveredHint', {
                                     count: uncovered.length,
                                     values: uncovered.slice(0, 8).join('、')
@@ -1297,7 +2098,7 @@ export function LabelSettingsModal({
                               <button
                                 type="button"
                                 onClick={() => setThematicCategories(thematicCategories.filter((_, j) => j !== i))}
-                                className="p-1 rounded hover:bg-red-50 text-red-400 hover:text-red-600 transition-colors"
+                                className="p-1 rounded hover:bg-red-500/15 text-red-400 hover:text-red-600 transition-colors"
                                 title={t('map.thematicRemoveRange')}
                               >
                                 <Trash2 size={12} />
@@ -1307,7 +2108,7 @@ export function LabelSettingsModal({
                         ))}
                         {/* 未覆盖配色提示 */}
                         {thematicCategories.length > 0 && getUncoveredValues(thematicFieldSamples[thematicField], thematicCategories).length > 0 && (
-                          <div className="px-3 py-2 text-xs rounded bg-amber-50 border border-amber-200 text-amber-700">
+                          <div className="px-3 py-2 text-xs rounded bg-amber-500/10 border border-amber-500/20 text-amber-400">
                             {t('map.thematicUncoveredHint', {
                               count: getUncoveredValues(thematicFieldSamples[thematicField], thematicCategories).length,
                               values: getUncoveredValues(thematicFieldSamples[thematicField], thematicCategories).slice(0, 8).join('、')
@@ -1333,18 +2134,427 @@ export function LabelSettingsModal({
                             step="1"
                             value={thematicPointSize}
                             onChange={(e) => setThematicPointSize(Number(e.target.value))}
-                            className="w-full h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer"
+                            className="w-full h-2 bg-muted rounded-lg appearance-none cursor-pointer"
                           />
-                          <div className="flex justify-between text-xs text-muted-foreground mt-1">
-                            <span>{sizeMin}px</span>
-                            <span>{sizeMax}px</span>
-                          </div>
                         </div>
+
+                        {/* 图形透明度（线要素作用于线条透明度） */}
+                        <div>
+                          <label className="block text-xs text-muted-foreground mb-2">
+                            {t('map.fillOpacityUnit', { value: thematicFillOpacityPct })}
+                          </label>
+                          <input
+                            type="range"
+                            min="0"
+                            max="100"
+                            step="1"
+                            value={thematicFillOpacityPct}
+                            onChange={(e) => setThematicFillOpacityPct(Number(e.target.value))}
+                            className="w-full h-2 bg-muted rounded-lg appearance-none cursor-pointer"
+                          />
+                        </div>
+
+                        {/* 边框颜色（线要素无描边，不提供此项；点/面支持无色且默认无色） */}
+                        {thematicGeometryType !== 'line' && (
+                          <div>
+                            <label className="block text-xs text-muted-foreground mb-2">{t('map.borderColor')}</label>
+                            <ColorField
+                              value={thematicBorderColor}
+                              onChange={setThematicBorderColor}
+                              allowNoFill={borderColorSupportsNone}
+                              noColorTitle={t('map.noBorderColor')}
+                            />
+                          </div>
+                        )}
 
                     {/* 无样本提示 */}
                     {!loadingThematicSamples && thematicFieldType === null && (
-                      <div className="px-3 py-2 text-xs rounded bg-amber-50 border border-amber-200 text-amber-700">
+                      <div className="px-3 py-2 text-xs rounded bg-amber-500/10 border border-amber-500/20 text-amber-400">
                         {t('map.thematicNoDataHint')}
+                      </div>
+                    )}
+                  </>
+                )}
+              </div>
+            )}
+
+            {/* ===== 热力图子页 ===== */}
+            {showThematicTab && colorSubTab === 'heatmap' && (
+              <div className="space-y-4">
+                {/* 启用开关 */}
+                <div className="flex items-center justify-between">
+                  <label className="text-xs text-muted-foreground">{t('map.heatmapEnable')}</label>
+                  <button
+                    type="button"
+                    onClick={() => { setHeatEnabled(!heatEnabled); setHeatError('') }}
+                    className={`relative w-9 h-5 rounded-full transition-colors ${heatEnabled ? 'bg-primary' : 'bg-muted'}`}
+                  >
+                    <span
+                      className={`absolute top-0.5 w-4 h-4 rounded-full bg-white shadow transition-all ${heatEnabled ? 'left-[18px]' : 'left-0.5'}`}
+                    />
+                  </button>
+                </div>
+
+                {!heatEnabled && (
+                  <div className="px-3 py-2 text-xs rounded bg-muted/50 text-muted-foreground">
+                    {t('map.heatmapDisabledHint')}
+                  </div>
+                )}
+
+                {heatEnabled && (
+                  <>
+                    {/* 设置模板：保存当前各项设置 / 一键套用到同类图层 */}
+                    <div className="pt-1">
+                      <label className="block text-xs text-muted-foreground mb-2">{t('map.heatmapTemplate')}</label>
+                      <div className="flex items-center gap-1.5">
+                        <input
+                          type="text"
+                          value={heatTemplateName}
+                          onChange={(e) => setHeatTemplateName(e.target.value)}
+                          placeholder={t('map.heatmapTemplateName')}
+                          className="flex-1 min-w-0 px-2 py-1 text-xs border border-border rounded bg-background focus:outline-none focus:ring-1 focus:ring-primary"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const name = heatTemplateName.trim()
+                            if (!name) return
+                            onSaveHeatmapTemplate?.(name, buildHeatmapTemplateSettings())
+                            setHeatTemplateName('')
+                          }}
+                          className="flex items-center gap-1 px-2 py-1 text-xs rounded bg-primary/10 text-primary hover:bg-primary/20 transition-colors shrink-0"
+                        >
+                          <Plus size={12} />
+                          {t('map.heatmapTemplateSave')}
+                        </button>
+                      </div>
+                      {heatmapTemplates.length > 0 && (
+                        <div className="relative mt-1.5">
+                          <button
+                            type="button"
+                            onClick={() => setHeatTemplateDropdownOpen(!heatTemplateDropdownOpen)}
+                            className="w-full px-2 py-1.5 text-xs border border-border rounded bg-background text-left flex items-center justify-between hover:border-primary/50 transition-colors"
+                          >
+                            <span className="truncate">{t('map.heatmapTemplateApply')}</span>
+                            <ChevronDown size={14} className={`transition-transform ${heatTemplateDropdownOpen ? 'rotate-180' : ''}`} />
+                          </button>
+                          {heatTemplateDropdownOpen && (
+                            <div className="absolute z-20 w-full mt-1 bg-background border border-border rounded shadow-lg max-h-48 overflow-y-auto">
+                              {heatmapTemplates.map((tmpl) => (
+                                <div key={tmpl.id} className="flex items-center px-2 py-1.5 hover:bg-muted transition-colors group">
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      applyHeatmapTemplate(tmpl)
+                                      setHeatTemplateDropdownOpen(false)
+                                    }}
+                                    className="flex-1 text-left text-xs truncate"
+                                    title={tmpl.name}
+                                  >
+                                    {tmpl.name}
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => onRemoveHeatmapTemplate?.(tmpl.id)}
+                                    className="p-1 rounded hover:bg-red-500/15 text-red-400 opacity-0 group-hover:opacity-100 transition-opacity"
+                                    title={t('map.thematicTemplateDelete')}
+                                  >
+                                    <Trash2 size={12} />
+                                  </button>
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+
+                    {/* 权重数值字段 + 渲染边界（双列） */}
+                    <div className="grid grid-cols-2 gap-3">
+                    <div>
+                      <label className="block text-xs text-muted-foreground mb-2">{t('map.heatmapField')}</label>
+                      {/* 基站图层清单与专题一致（不依赖样本），无需等待样本加载 */}
+                      {loadingThematicSamples && !sectorColorMode ? (
+                        <div className="w-full px-3 py-2 text-xs border border-border rounded bg-background text-muted-foreground flex items-center gap-2">
+                          <svg className="animate-spin h-3 w-3" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 4.824 3 7.938l3-2.647z"></path>
+                          </svg>
+                          <span>{t('map.loadingFields')}</span>
+                        </div>
+                      ) : heatFieldOptions.length === 0 ? (
+                        <div className="px-3 py-2 text-xs rounded bg-amber-500/10 border border-amber-500/20 text-amber-400">
+                          {t('map.heatmapNoNumericFields')}
+                        </div>
+                      ) : (
+                        <ThematicFieldDropdown
+                          options={heatFieldOptions}
+                          value={heatField}
+                          onChange={(v) => { setHeatField(v); setHeatError('') }}
+                          emptyText={t('map.noAvailableFields')}
+                        />
+                      )}
+                    </div>
+
+                    {/* 渲染边界：按面图层裁剪，避免颜色漫出范围 */}
+                    <div>
+                      <label className="block text-xs text-muted-foreground mb-2">{t('map.heatmapBoundary')}</label>
+                      <select
+                        value={heatBoundaryLayerId}
+                        onChange={(e) => setHeatBoundaryLayerId(e.target.value)}
+                        className="w-full px-3 py-2 text-xs border border-border rounded bg-background text-foreground"
+                      >
+                        <option value="">{t('map.heatmapBoundaryNone')}</option>
+                        {polygonLayers.map(layer => (
+                          <option key={layer.id} value={layer.id}>{layer.name}</option>
+                        ))}
+                      </select>
+                    </div>
+                    </div>
+
+                    {/* 平滑强度+细节增强（一行）/ 栅格采样+对比度（一行） */}
+                    <div className="grid grid-cols-2 gap-3">
+                    {/* 平滑强度：搜索半径 = 平均点间距 × 该值 */}
+                    <div>
+                      <label className="block text-xs text-muted-foreground mb-2">
+                        {t('map.heatmapSmoothUnit', { value: heatSmooth })}
+                      </label>
+                      <input
+                        type="range" min="1" max="10" step="0.5" value={heatSmooth}
+                        onChange={(e) => setHeatSmooth(Number(e.target.value))}
+                        className="w-full h-2 bg-muted rounded-lg appearance-none cursor-pointer"
+                      />
+                    </div>
+
+
+                    {/* 细节增强：整体趋势场 ↔ 栅格细节场凸组合比例（0=纯平滑，融合不超界） */}
+                    <div>
+                      <label className="block text-xs text-muted-foreground mb-2">
+                        {t('map.heatmapDetailUnit', { value: heatDetail })}
+                      </label>
+                      <input
+                        type="range"
+                        min={HEATMAP_PCT_RANGE.min}
+                        max={HEATMAP_PCT_RANGE.max}
+                        step="5" value={heatDetail}
+                        onChange={(e) => setHeatDetail(Number(e.target.value))}
+                        className="w-full h-2 bg-muted rounded-lg appearance-none cursor-pointer"
+                      />
+                    </div>
+
+                    {/* 栅格采样：细节网格边长 / 点间距 倍数（越大越粗、与整体融合越柔） */}
+                    <div>
+                      <label className="block text-xs text-muted-foreground mb-2">
+                        {t('map.heatmapSamplingUnit', { value: heatSampling })}
+                      </label>
+                      <input
+                        type="range"
+                        min={HEATMAP_SAMPLING_RANGE.min}
+                        max={HEATMAP_SAMPLING_RANGE.max}
+                        step="1" value={heatSampling}
+                        onChange={(e) => setHeatSampling(Number(e.target.value))}
+                        className="w-full h-2 bg-muted rounded-lg appearance-none cursor-pointer"
+                      />
+                    </div>
+
+                    {/* 对比度：颜色映射对比度（只作用于地图着色，不影响图例颜色） */}
+                    <div>
+                      <label className="block text-xs text-muted-foreground mb-2">
+                        {t('map.heatmapContrastUnit', { value: (heatContrastPct / 100).toFixed(2) })}
+                      </label>
+                      <input
+                        type="range"
+                        min={HEATMAP_CONTRAST_RANGE.min}
+                        max={HEATMAP_CONTRAST_RANGE.max}
+                        step="5" value={heatContrastPct}
+                        onChange={(e) => setHeatContrastPct(Number(e.target.value))}
+                        className="w-full h-2 bg-muted rounded-lg appearance-none cursor-pointer"
+                      />
+                    </div>
+                    </div>
+
+                    {/* 分级方法 + 分级数/取整（双列） */}
+                    <div className="grid grid-cols-2 gap-3">
+                    {/* 分级方法（参考 Surfer Grid Appearance 的 Method） */}
+                    <div>
+                      <label className="block text-xs text-muted-foreground mb-2">{t('map.heatmapMethod')}</label>
+                      <select
+                        value={heatMethod}
+                        // 换分级方法即重新自动分级，丢弃此前的手工编辑
+                        onChange={(e) => { setHeatMethod(e.target.value as HeatmapLegendMethod); clearLevelOverrides() }}
+                        className="w-full px-3 py-2 text-xs border border-border rounded bg-background text-foreground"
+                      >
+                        <option value="cellCount">{t('map.heatmapMethodCellCount')}</option>
+                        <option value="valueRange">{t('map.heatmapMethodValueRange')}</option>
+                      </select>
+                    </div>
+
+                    {/* 分级数 + 取整精度（同级一行） */}
+                    <div className="grid grid-cols-2 gap-2">
+                      <div>
+                        <label className="block text-xs text-muted-foreground mb-2">{t('map.heatmapInflections')}</label>
+                        <select
+                          value={heatInflections}
+                          // 改级数即重新自动分级，丢弃此前的手工编辑
+                          onChange={(e) => { setHeatInflections(Number(e.target.value)); clearLevelOverrides() }}
+                          className="w-full px-3 py-2 text-xs border border-border rounded bg-background text-foreground"
+                        >
+                          {HEATMAP_INFLECTION_OPTIONS.map(n => (
+                            <option key={n} value={n}>{n}</option>
+                          ))}
+                        </select>
+                      </div>
+                      <div>
+                        <label className="block text-xs text-muted-foreground mb-2">{t('map.heatmapRound')}</label>
+                        <select
+                          value={heatRound}
+                          onChange={(e) => setHeatRound(Number(e.target.value))}
+                          className="w-full px-3 py-2 text-xs border border-border rounded bg-background text-foreground"
+                        >
+                          {HEATMAP_ROUND_OPTIONS.map(r => (
+                            <option key={r} value={r}>{r}</option>
+                          ))}
+                        </select>
+                      </div>
+                    </div>
+                    </div>
+
+                    {/* 分级列表（可编辑）：色块改颜色、输入框改占比/区间值，与地图图例同源 */}
+                    <div>
+                      <div className="flex items-center justify-between mb-2">
+                        <label className="text-xs text-muted-foreground">
+                          {heatMethod === 'cellCount' ? t('map.heatmapLegendPercentage') : t('map.heatmapLegendValue')}
+                        </label>
+                        <div className="flex items-center gap-2">
+                          <label className="text-[11px] text-muted-foreground">{t('map.heatmapLegendOrder')}</label>
+                          <select
+                            value={heatLegendOrder}
+                            onChange={(e) => setHeatLegendOrder(e.target.value as 'asc' | 'desc')}
+                            className="px-1.5 py-0.5 text-[11px] border border-border rounded bg-background text-foreground"
+                          >
+                            <option value="desc">{t('map.heatmapLegendOrderDesc')}</option>
+                            <option value="asc">{t('map.heatmapLegendOrderAsc')}</option>
+                          </select>
+                          {heatLevelOverrides && (
+                            <button
+                              type="button"
+                              onClick={resetLevelsToDefault}
+                              className="text-[11px] text-primary hover:underline"
+                            >
+                              {t('map.heatmapLevelsReset')}
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                      <div className="border border-border rounded bg-background p-2 space-y-1 max-h-56 overflow-y-auto">
+                        {previewLevels
+                          .map((lv, index) => ({ lv, index }))
+                          // 按色带位置排序后按「图例标签顺序」显示：用户可能把某级占比改到
+                          // 与相邻级交叉，数组原序不再单调，必须先排序（index 仍指向原分级）
+                          .sort((a, b) => a.lv.t - b.lv.t)
+                          .map((row, idx, arr) => heatLegendOrder === 'asc' ? row : arr[arr.length - 1 - idx])
+                          .map(({ lv, index }) => (
+                            <div key={index}>
+                              <div className="flex items-center gap-2 text-xs">
+                                <button
+                                  type="button"
+                                  onClick={() => setHeatColorPickerRow(heatColorPickerRow === index ? null : index)}
+                                  className="inline-block w-5 h-4 rounded-sm border border-border shrink-0"
+                                  style={{ backgroundColor: lv.color ?? gradientColorAt(previewStops, lv.t) }}
+                                  title={t('map.heatmapLevelColor')}
+                                />
+                                <input
+                                  type="text"
+                                  inputMode="decimal"
+                                  value={levelInputText(index, lv)}
+                                  onChange={(e) => handleLevelInput(index, e.target.value)}
+                                  onBlur={() => handleLevelBlur(index)}
+                                  className="w-16 px-1 py-0.5 text-xs border border-border rounded bg-background text-foreground text-right tabular-nums"
+                                />
+                                <span className="text-muted-foreground">
+                                  {heatMethod === 'cellCount' ? '%' : ''}
+                                </span>
+                                <span className="text-[11px] text-muted-foreground/70 tabular-nums ml-auto">
+                                  {formatLegendValue(lv.value, heatRound)}
+                                </span>
+                              </div>
+                              {heatColorPickerRow === index && (
+                                <HeatLevelColorPicker
+                                  value={lv.color}
+                                  onChange={(c) => updateLevel(index, { color: c })}
+                                  onAuto={() => updateLevel(index, { color: null })}
+                                />
+                              )}
+                            </div>
+                          ))}
+                      </div>
+                    </div>
+
+                    {/* 配色方案 */}
+                    <div>
+                      <label className="block text-xs text-muted-foreground mb-2">{t('map.heatmapColorScheme')}</label>
+                      <select
+                        value={heatColorScheme}
+                        onChange={(e) => setHeatColorScheme(e.target.value as HeatmapColorScheme)}
+                        className="w-full px-3 py-2 text-xs border border-border rounded bg-background text-foreground"
+                      >
+                        <option value="default">{t('map.heatmapSchemeDefault')}</option>
+                        <option value="warm">{t('map.heatmapSchemeWarm')}</option>
+                        <option value="cool">{t('map.heatmapSchemeCool')}</option>
+                        <option value="viridis">{t('map.heatmapSchemeViridis')}</option>
+                      </select>
+                    </div>
+
+                    {/* 分级着色 + 半透明度（双列） */}
+                    <div className="grid grid-cols-2 gap-3">
+                    {/* 分级着色：按图例 N 级离散着色，关闭为连续渐变 */}
+                    <div className="flex items-center justify-between">
+                      <label className="text-xs text-muted-foreground">{t('map.heatmapDiscrete')}</label>
+                      <button
+                        type="button"
+                        onClick={() => setHeatDiscrete(!heatDiscrete)}
+                        className={`relative w-9 h-5 rounded-full transition-colors ${heatDiscrete ? 'bg-primary' : 'bg-muted'}`}
+                      >
+                        <span
+                          className={`absolute top-0.5 w-4 h-4 rounded-full bg-white shadow transition-all ${heatDiscrete ? 'left-[18px]' : 'left-0.5'}`}
+                        />
+                      </button>
+                    </div>
+
+                    {/* 半透明度：插值层整体不透明度 */}
+                    <div>
+                      <label className="block text-xs text-muted-foreground mb-2">
+                        {t('map.heatmapOpacityUnit', { value: heatOpacityPct })}
+                      </label>
+                      <input
+                        type="range"
+                        min={HEATMAP_OPACITY_RANGE.min}
+                        max={HEATMAP_OPACITY_RANGE.max}
+                        step="5" value={heatOpacityPct}
+                        onChange={(e) => setHeatOpacityPct(Number(e.target.value))}
+                        className="w-full h-2 bg-muted rounded-lg appearance-none cursor-pointer"
+                      />
+                    </div>
+                    </div>
+
+                    {/* 显示原图层开关 */}
+                    <div className="flex items-center justify-between">
+                      <label className="text-xs text-muted-foreground">{t('map.heatmapShowOriginal')}</label>
+                      <button
+                        type="button"
+                        onClick={() => setHeatShowOriginal(!heatShowOriginal)}
+                        className={`relative w-9 h-5 rounded-full transition-colors ${heatShowOriginal ? 'bg-primary' : 'bg-muted'}`}
+                      >
+                        <span
+                          className={`absolute top-0.5 w-4 h-4 rounded-full bg-white shadow transition-all ${heatShowOriginal ? 'left-[18px]' : 'left-0.5'}`}
+                        />
+                      </button>
+                    </div>
+
+                    {/* 校验错误 */}
+                    {heatError && (
+                      <div className="px-3 py-2 text-xs rounded bg-destructive/10 border border-destructive/20 text-destructive">
+                        {heatError}
                       </div>
                     )}
                   </>

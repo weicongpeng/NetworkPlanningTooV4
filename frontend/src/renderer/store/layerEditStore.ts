@@ -1,0 +1,453 @@
+import { create } from 'zustand'
+import type { DrawGeometryType, DrawTool } from '@shared/types'
+
+/** 工作集几何类型：'mixed' = 混合图层（可同时含点/线/面） */
+export type WorkspaceGeometryType = DrawGeometryType | 'mixed'
+
+/**
+ * 图层编辑工作集要素（GeoJSON Feature）。
+ * 内部字段（保存时后端按旧表 schema 对齐、剔除，不写入 TAB）：
+ *  - _editId: 编辑期稳定标识
+ *  - _isNew: 用户绘制的新要素（样式取 drawStyleMap，而非图层原样式）
+ */
+export interface EditFeature {
+  type: 'Feature'
+  properties: Record<string, any>
+  geometry: { type: string; coordinates: any }
+}
+
+/** 编辑会话中"新建"要素使用的样式（非新建沿用图层原配色）。字段与 drawStyleMap 各几何一致。 */
+export interface EditBaseStyle {
+  point: Record<string, any>
+  line: Record<string, any>
+  polygon: Record<string, any>
+}
+
+export interface LayerWorkspace {
+  layerId: string
+  dataId: string
+  geometryType: WorkspaceGeometryType
+  /** 图层原始渲染样式（非新建要素沿用它，保证配色不变） */
+  baseStyle: EditBaseStyle | null
+  features: EditFeature[]
+  dirty: boolean
+  changeCount: number   // 未保存增删改计数（用于角标）
+  /** 撤销历史（要素快照栈；栈底为初始基线）。undo 弹栈恢复。 */
+  history: EditFeature[][]
+  /** 保存基底行号：editId → 要素在图层读取顺序中的下标；新增要素为 null */
+  baseRows: Record<string, number | null>
+  /** 本次保存前发生变化的要素（editId 集合，用于增量保存只回传变更部分） */
+  changedIds: Record<string, true>
+  /** 基底版本指纹（图层数据端点 ETag）；null 表示未知，只能整层保存 */
+  version: string | null
+  /** 基底要素数（服务端校验基底一致性用） */
+  baseCount: number
+}
+
+/** 保存计划：增量（patch）/ 整层（full）/ 无需保存（none，如新增后又删除），以及对应的请求 payload */
+export interface SavePlan {
+  mode: 'patch' | 'full' | 'none'
+  payload: { patch?: any; geojson?: any }
+  /** 本次计划回传的变更数量（诊断/日志用） */
+  changes: number
+}
+
+/** 单次增量保存允许的变更要素上限（与服务端 _MAX_CHANGES 对齐） */
+const MAX_PATCH_CHANGES = 20000
+
+const HISTORY_LIMIT = 100
+
+/** 双击要素后需要查看/配置风格的要素快照（编辑态用 editId，非编辑态直接带 geometry） */
+export interface InspectFeature {
+  layerId: string
+  layerName?: string
+  editId?: string
+  name?: string
+  /** GeoJSON 几何（GeoJSON.Geometry） */
+  geometry: any
+  properties?: Record<string, any>
+  /** 该图层是否处于编辑态（决定风格配置能否写回要素） */
+  editable: boolean
+}
+
+/** 复制粘贴剪贴板中的要素（圈选后复制；坐标为渲染坐标 GCJ02） */
+export interface CopiedFeature {
+  geometry: { type: string; coordinates: any }
+  properties: Record<string, any>
+  /** 来源图层名（粘贴提示用） */
+  sourceLayerName?: string
+}
+
+interface LayerEditState {
+  editableLayerId: string | null
+  drawTool: DrawTool
+  /** 工具栏"选择"工具激活态（与绘制/圈选/测距/打点/拖拽互斥） */
+  selectMode: boolean
+  /** 双击要素打开的属性/风格配置弹窗数据源 */
+  inspectFeature: InspectFeature | null
+  workspaces: Record<string, LayerWorkspace>
+  /** 跨图层复制粘贴剪贴板 */
+  clipboard: CopiedFeature[]
+
+  setEditableLayerId: (id: string | null) => void
+  setDrawTool: (tool: DrawTool) => void
+  setSelectMode: (on: boolean) => void
+  setInspectFeature: (f: InspectFeature | null) => void
+  copyToClipboard: (items: CopiedFeature[]) => void
+  clearClipboard: () => void
+  beginEdit: (
+    layerId: string,
+    dataId: string,
+    geometryType: WorkspaceGeometryType,
+    baseFeatures: EditFeature[],
+    baseStyle?: EditBaseStyle | null,
+    base?: { version?: string | null },
+  ) => void
+  addFeature: (layerId: string, geometry: EditFeature['geometry'], props?: Record<string, any>) => void
+  deleteFeature: (layerId: string, editId: string) => void
+  updateFeatureGeometry: (layerId: string, editId: string, geometry: EditFeature['geometry']) => void
+  /** 写入单个要素的风格（properties._editStyle，与 MapInfo 自带 _style 区分），仅编辑态要素可用 */
+  updateFeatureStyle: (layerId: string, editId: string, style: Record<string, any>) => void
+  /** 合并写入单个要素的属性（如圆/椭圆 _shape/_ellipse 元数据），仅编辑态要素可用 */
+  updateFeatureProperties: (layerId: string, editId: string, patch: Record<string, any>) => void
+  undo: (layerId: string) => boolean
+  canUndo: (layerId: string | null | undefined) => boolean
+  markSaved: (layerId: string, opts?: { remapRows?: boolean; version?: string | null }) => void
+  discardWorkspace: (layerId: string) => void
+  getWorkspace: (layerId: string | null | undefined) => LayerWorkspace | undefined
+  isDirty: (layerId: string) => boolean
+}
+
+function genEditId(): string {
+  return `edit-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+}
+
+/** 基底行号表：editId → 要素在图层读取顺序中的下标（与 TAB 行序一致）。 */
+function buildBaseRows(features: EditFeature[]): Record<string, number | null> {
+  const rows: Record<string, number | null> = {}
+  features.forEach((f, i) => {
+    const id = f.properties?._editId
+    if (id) rows[id] = i
+  })
+  return rows
+}
+
+/** 标记要素为已变更（增量保存只回传这些要素）。 */
+function markChanged(ws: LayerWorkspace, editId: string | undefined): Record<string, true> {
+  if (!editId || ws.changedIds[editId]) return ws.changedIds
+  return { ...ws.changedIds, [editId]: true }
+}
+
+/**
+ * 生成保存计划：
+ * - 能增量则增量（有基底版本指纹 + 存在变更集），只回传变更要素与删除行号
+ * - 否则整层保存（新建图层/无版本指纹/变更集缺失时，保证不丢改动）
+ */
+export function buildSavePlan(ws: LayerWorkspace): SavePlan {
+  const upserts: any[] = []
+  const present = new Set<string>()
+  for (const f of ws.features) {
+    const id = f.properties?._editId
+    if (!id) continue
+    present.add(id)
+    if (ws.changedIds[id] || ws.baseRows[id] === null || ws.baseRows[id] === undefined) {
+      upserts.push({ row: ws.baseRows[id] ?? null, geometry: f.geometry, properties: f.properties })
+    }
+  }
+  const deletes = Object.entries(ws.baseRows)
+    .filter(([id, row]) => row !== null && !present.has(id))
+    .map(([, row]) => row as number)
+
+  // 无任何有效变更（如绘制后立即删除）：无需写盘，避免为"空改动"整层上传
+  if (upserts.length + deletes.length === 0) {
+    return { mode: 'none', changes: 0, payload: {} }
+  }
+
+  const canPatch = !!ws.version
+    && Object.keys(ws.baseRows).length > 0
+    && upserts.length + deletes.length > 0
+    && upserts.length <= MAX_PATCH_CHANGES
+    && deletes.length <= MAX_PATCH_CHANGES
+
+  if (canPatch) {
+    return {
+      mode: 'patch',
+      changes: upserts.length + deletes.length,
+      payload: {
+        patch: {
+          base: { count: ws.baseCount, version: ws.version },
+          upserts,
+          deletes,
+        },
+      },
+    }
+  }
+  return {
+    mode: 'full',
+    changes: ws.changeCount,
+    payload: { geojson: { type: 'FeatureCollection', features: ws.features } },
+  }
+}
+
+/** 为基础要素补齐 _editId（已有的保持不变），不标 _isNew（保留图层原配色）。 */
+function withEditIds(features: EditFeature[]): EditFeature[] {
+  return features.map((f) => ({
+    ...f,
+    properties: { ...(f.properties || {}), _editId: f.properties?._editId || genEditId() },
+  }))
+}
+
+/** 变更前压入当前要素快照（限制栈深）。返回更新后的 history。 */
+function pushHistory(ws: LayerWorkspace): EditFeature[][] {
+  const h = [...ws.history]
+  h.push(ws.features.map((f) => JSON.parse(JSON.stringify(f))))
+  if (h.length > HISTORY_LIMIT) h.shift()
+  return h
+}
+
+export const useLayerEditStore = create<LayerEditState>((set, get) => ({
+  editableLayerId: null,
+  drawTool: 'none',
+  selectMode: false,
+  inspectFeature: null,
+  workspaces: {},
+  clipboard: [],
+
+  copyToClipboard: (items) => set({ clipboard: items }),
+  clearClipboard: () => set({ clipboard: [] }),
+
+  setEditableLayerId: (id) =>
+    set((s) => ({
+      editableLayerId: id,
+      // 关闭编辑时仅退出绘制；"选择"工具是工具栏状态，不受控制面板图层开关影响
+      drawTool: id ? s.drawTool : 'none',
+      selectMode: s.selectMode,
+      inspectFeature: id ? s.inspectFeature : null,
+    })),
+
+  // 绘制与"选择"互斥：任一方激活都会关闭另一方
+  setDrawTool: (tool) => set({ drawTool: tool, selectMode: false }),
+
+  setSelectMode: (on) => set((s) => ({
+    selectMode: on,
+    drawTool: on ? 'none' : s.drawTool,
+    inspectFeature: on ? s.inspectFeature : null,
+  })),
+
+  setInspectFeature: (f) => set({ inspectFeature: f }),
+
+  beginEdit: (layerId, dataId, geometryType, baseFeatures, baseStyle, base) =>
+    set((s) => {
+      const existing = s.workspaces[layerId]
+      const features = existing
+        ? existing.features // 已有工作集（切走后再切回）保留未保存更改
+        : withEditIds(baseFeatures || [])
+      return {
+        editableLayerId: layerId,
+        workspaces: {
+          ...s.workspaces,
+          [layerId]: {
+            layerId,
+            dataId,
+            geometryType,
+            baseStyle: baseStyle ?? existing?.baseStyle ?? null,
+            features,
+            dirty: existing?.dirty ?? false,
+            changeCount: existing?.changeCount ?? 0,
+            history: existing?.history ?? [],
+            baseRows: existing?.baseRows ?? buildBaseRows(features),
+            changedIds: existing?.changedIds ?? {},
+            version: existing ? existing.version : (base?.version ?? null),
+            baseCount: existing?.baseCount ?? features.length,
+          },
+        },
+      }
+    }),
+
+  addFeature: (layerId, geometry, props) =>
+    set((s) => {
+      const ws = s.workspaces[layerId]
+      if (!ws) return s
+      // props 可携带要素属性（如复制粘贴的原属性、圆/椭圆 _shape 元数据）；
+      // _keepStyle 为内部标记：粘贴时保留原要素配色（不标 _isNew，避免被绘制样式覆盖）
+      const { _keepStyle, ...userProps } = (props || {}) as any
+      const properties: Record<string, any> = { ...userProps, _editId: genEditId() }
+      if (!_keepStyle) properties._isNew = true
+      const feature: EditFeature = { type: 'Feature', properties, geometry }
+      const editId = properties._editId as string
+      return {
+        workspaces: {
+          ...s.workspaces,
+          [layerId]: {
+            ...ws,
+            features: [...ws.features, feature],
+            dirty: true,
+            changeCount: ws.changeCount + 1,
+            history: pushHistory(ws),
+            // 新增要素：基底无对应行，增量保存时按"新增"回传
+            baseRows: { ...ws.baseRows, [editId]: null },
+            changedIds: markChanged(ws, editId),
+          },
+        },
+      }
+    }),
+
+  deleteFeature: (layerId, editId) =>
+    set((s) => {
+      const ws = s.workspaces[layerId]
+      if (!ws) return s
+      return {
+        workspaces: {
+          ...s.workspaces,
+          [layerId]: {
+            ...ws,
+            features: ws.features.filter((f) => f.properties?._editId !== editId),
+            dirty: true,
+            changeCount: ws.changeCount + 1,
+            history: pushHistory(ws),
+          },
+        },
+      }
+    }),
+
+  updateFeatureGeometry: (layerId, editId, geometry) =>
+    set((s) => {
+      const ws = s.workspaces[layerId]
+      if (!ws) return s
+      return {
+        workspaces: {
+          ...s.workspaces,
+          [layerId]: {
+            ...ws,
+            features: ws.features.map((f) =>
+              f.properties?._editId === editId ? { ...f, geometry } : f,
+            ),
+            dirty: true,
+            changeCount: ws.changeCount + 1,
+            history: pushHistory(ws),
+            changedIds: markChanged(ws, editId),
+          },
+        },
+      }
+    }),
+
+  updateFeatureStyle: (layerId, editId, style) =>
+    set((s) => {
+      const ws = s.workspaces[layerId]
+      if (!ws) return s
+      return {
+        workspaces: {
+          ...s.workspaces,
+          [layerId]: {
+            ...ws,
+            features: ws.features.map((f) =>
+              f.properties?._editId === editId
+                ? { ...f, properties: { ...(f.properties || {}), _editStyle: style } }
+                : f,
+            ),
+            dirty: true,
+            changeCount: ws.changeCount + 1,
+            history: pushHistory(ws),
+            changedIds: markChanged(ws, editId),
+          },
+        },
+      }
+    }),
+
+  updateFeatureProperties: (layerId, editId, patch) =>
+    set((s) => {
+      const ws = s.workspaces[layerId]
+      if (!ws) return s
+      return {
+        workspaces: {
+          ...s.workspaces,
+          [layerId]: {
+            ...ws,
+            features: ws.features.map((f) =>
+              f.properties?._editId === editId
+                ? { ...f, properties: { ...(f.properties || {}), ...patch } }
+                : f,
+            ),
+            dirty: true,
+            changeCount: ws.changeCount + 1,
+            history: pushHistory(ws),
+            changedIds: markChanged(ws, editId),
+          },
+        },
+      }
+    }),
+
+  undo: (layerId) => {
+    const ws = get().workspaces[layerId]
+    if (!ws || ws.history.length === 0) return false
+    const restored = ws.history[ws.history.length - 1]
+    const nextHistory = ws.history.slice(0, -1)
+    const wasDirty = ws.dirty
+    set((s) => ({
+      workspaces: {
+        ...s.workspaces,
+        [layerId]: {
+          ...ws,
+          features: restored,
+          // 回到栈底(与初始基线相同)即不再脏
+          dirty: nextHistory.length > 0 ? wasDirty : false,
+          changeCount: Math.max(0, ws.changeCount - 1),
+          history: nextHistory,
+        },
+      },
+    }))
+    return true
+  },
+
+  canUndo: (layerId) => {
+    const ws = get().workspaces[layerId || '']
+    return !!ws && ws.history.length > 0
+  },
+
+  markSaved: (layerId, opts) =>
+    set((s) => {
+      const ws = s.workspaces[layerId]
+      if (!ws) return s
+      // 保存成功后重置历史基线（此后撤销基于已保存态）：
+      // - remapRows=false（服务端要素数与工作集不符，如几何不符被跳过）时清空基底，
+      //   下一次保存自动回退整层，避免按错行写增量
+      const remap = opts?.remapRows !== false
+      return {
+        workspaces: {
+          ...s.workspaces,
+          [layerId]: {
+            ...ws,
+            dirty: false,
+            changeCount: 0,
+            history: [],
+            changedIds: {},
+            baseRows: remap ? buildBaseRows(ws.features) : {},
+            baseCount: remap ? ws.features.length : 0,
+            version: remap ? (opts?.version ?? null) : null,
+          },
+        },
+      }
+    }),
+
+  discardWorkspace: (layerId) =>
+    set((s) => {
+      const next = { ...s.workspaces }
+      delete next[layerId]
+      return {
+        workspaces: next,
+        editableLayerId: s.editableLayerId === layerId ? null : s.editableLayerId,
+        drawTool: s.editableLayerId === layerId ? 'none' : s.drawTool,
+      }
+    }),
+
+  getWorkspace: (layerId) => (layerId ? get().workspaces[layerId] : undefined),
+
+  isDirty: (layerId) => !!get().workspaces[layerId]?.dirty,
+}))
+
+/** 选择器：所有有未保存更改的图层 id。 */
+export function selectDirtyLayerIds(workspaces: Record<string, LayerWorkspace>): string[] {
+  return Object.values(workspaces)
+    .filter((w) => w.dirty)
+    .map((w) => w.layerId)
+}

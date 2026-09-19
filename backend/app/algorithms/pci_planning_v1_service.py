@@ -816,9 +816,14 @@ def run_pci_planning(
     progress_callback: Optional[Callable[[float], Any]] = None,
     all_cells: Optional[List[Dict]] = None,
     enable_tac_planning: bool = False,
-    data_dir: Optional[str] = None
+    data_dir: Optional[str] = None,
+    city: Optional[str] = None,
+    operator: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """运行PCI规划入口"""
+    """运行PCI规划入口。
+
+    city/operator: 任务组快照，TAC 图层仅在本组数据内查找（防止跨组读到 TAC 值）。
+    """
     planner = LTENRPCIPlanner(config)
     result = planner.plan(cells_to_plan, all_cells or cells_to_plan, progress_callback)
     
@@ -854,7 +859,9 @@ def run_pci_planning(
             tac_results, planned_count, unplanned_count = tac_service.plan_tac_for_list(
                 network_type=config.network_type,
                 cells_to_plan=cells_to_plan_for_tac,
-                progress_callback=None
+                progress_callback=None,
+                city=city,
+                operator=operator,
             )
             
             # 将TAC规划结果合并到PCI规划结果中

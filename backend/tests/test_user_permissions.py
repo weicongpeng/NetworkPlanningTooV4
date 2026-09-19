@@ -7,17 +7,22 @@ from app.core.security import (
     require_data_delete,
     require_data_update,
     require_cell_entry,
+    require_cell_query_update,
+    require_assistant,
 )
 
 
 class FakeUser:
     def __init__(self, is_admin=False, can_data_import=False, can_data_delete=False,
-                 can_data_update=False, can_cell_entry=False):
+                 can_data_update=False, can_cell_entry=False, can_cell_query_update=False,
+                 can_assistant=False):
         self.is_admin = is_admin
         self.can_data_import = can_data_import
         self.can_data_delete = can_data_delete
         self.can_data_update = can_data_update
         self.can_cell_entry = can_cell_entry
+        self.can_cell_query_update = can_cell_query_update
+        self.can_assistant = can_assistant
 
 
 @pytest.mark.asyncio
@@ -26,6 +31,8 @@ class FakeUser:
     require_data_delete,
     require_data_update,
     require_cell_entry,
+    require_cell_query_update,
+    require_assistant,
 ])
 async def test_admin_bypasses_permissions(checker):
     """管理员调用任意权限校验均应通过"""
@@ -54,6 +61,8 @@ async def test_normal_user_with_import_permission_allowed():
     ("can_data_delete", require_data_delete),
     ("can_data_update", require_data_update),
     ("can_cell_entry", require_cell_entry),
+    ("can_cell_query_update", require_cell_query_update),
+    ("can_assistant", require_assistant),
 ])
 async def test_each_permission_required(attr, checker):
     """每项权限：无权限拒绝 403，有权限通过"""

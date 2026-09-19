@@ -2,6 +2,8 @@ import { useState, useEffect, useRef } from 'react'
 import { Loader2, CheckCircle2, AlertCircle, Search } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { dataApi } from '../../services/api'
+import { mapDataService, clearCellListCache } from '../../services/mapDataService'
+import { triggerDataRefresh } from '../../store/dataStore'
 import { CellParamsTable } from './CellParamsTable'
 import type { CellRow, CellSearchItem, CellBulkUpdateResultItem, DataItem } from '@shared/types'
 
@@ -11,6 +13,12 @@ export interface CellChangeUpdate {
   networkType: 'LTE' | 'NR'
   diff: Record<string, [string, string]>
   fields: Record<string, string | number>
+  // 小区身份（确认弹窗/结果展示用，避免名称未改时回退成数字 rowKey）
+  cellName: string
+  siteId: string
+  cellId: string
+  mcc: string
+  mnc: string
 }
 export interface CellChangeDelete {
   rowKey: string
@@ -18,6 +26,27 @@ export interface CellChangeDelete {
   cellName: string
   siteId: string
   cellId: string
+  mcc: string
+  mnc: string
+}
+
+/**
+ * 小区身份文本：LTE = 小区名称(基站ID_小区ID)；
+ * NR = 小区名称(MCC-MNC 基站ID_小区ID)——共享小区同 基站_小区、不同 MNC 是两条 PLMN，
+ * 确认弹窗/结果必须带 PLMN 才能精确区分。
+ */
+export function formatCellIdentity(c: {
+  networkType: 'LTE' | 'NR'
+  cellName: string
+  siteId: string
+  cellId: string
+  mcc?: string
+  mnc?: string
+}): string {
+  const plmn = c.networkType === 'NR' && (c.mcc || c.mnc)
+    ? `${c.mcc || ''}-${c.mnc ? String(c.mnc).padStart(2, '0') : ''} `
+    : ''
+  return `${c.cellName} (${plmn}${c.siteId}_${c.cellId})`
 }
 export function computeCellChanges(
   original: CellRow[],
@@ -32,12 +61,12 @@ export function computeCellChanges(
     const orig = byId.get(row.id)
     if (!orig) continue
     if (deleteMarked.has(row.id)) {
-      deletes.push({ rowKey: row.rowKey ?? row.id, networkType: activeTab, cellName: row.cellName, siteId: row.siteId, cellId: row.cellId })
+      deletes.push({ rowKey: row.rowKey ?? row.id, networkType: activeTab, cellName: row.cellName, siteId: row.siteId, cellId: row.cellId, mcc: row.mcc, mnc: row.mnc })
       continue
     }
     const diff: Record<string, [string, string]> = {}
     const fields: Record<string, string | number> = {}
-    const keys = ['managedElementId', 'siteId', 'cellId', 'cellName', 'mcc', 'mnc', 'longitude', 'latitude', 'azimuth', 'frequency', 'ssbFrequency', 'cellCoverType'] as const
+    const keys = ['managedElementId', 'siteId', 'cellId', 'cellName', 'mcc', 'mnc', 'longitude', 'latitude', 'height', 'azimuth', 'frequency', 'ssbFrequency', 'cellCoverType'] as const
     for (const k of keys) {
       const o = String(orig[k] ?? '').trim()
       const n = String(row[k] ?? '').trim()
@@ -47,7 +76,17 @@ export function computeCellChanges(
       }
     }
     if (Object.keys(diff).length > 0) {
-      updates.push({ rowKey: row.rowKey ?? row.id, networkType: activeTab, diff, fields })
+      updates.push({
+        rowKey: row.rowKey ?? row.id,
+        networkType: activeTab,
+        diff,
+        fields,
+        cellName: row.cellName,
+        siteId: row.siteId,
+        cellId: row.cellId,
+        mcc: row.mcc,
+        mnc: row.mnc,
+      })
     }
   }
   return { updates, deletes }
@@ -63,6 +102,7 @@ const FIELD_LABEL_KEYS: Record<string, string> = {
   mnc: 'fieldMNC',
   longitude: 'fieldLongitude',
   latitude: 'fieldLatitude',
+  height: 'fieldHeight',
   azimuth: 'fieldAzimuth',
   frequency: 'fieldFrequency',
   ssbFrequency: 'fieldSsbFrequency',
@@ -77,14 +117,16 @@ interface QueryResultRow {
   display: string
 }
 
-export function CellQueryUpdateCard({
+export function CellQueryUpdateContent({
   fullParamFiles,
   addLog,
   disabled,
+  expanded,
 }: {
   fullParamFiles: DataItem[]
   addLog: (type: any, message: string, status?: any, detail?: string, opKey?: string) => void
   disabled?: boolean
+  expanded?: boolean
 }) {
   const { t } = useTranslation()
 
@@ -102,6 +144,8 @@ export function CellQueryUpdateCard({
   const [updating, setUpdating] = useState(false)
   const [batchResults, setBatchResults] = useState<QueryResultRow[] | null>(null)
   const [batchError, setBatchError] = useState<string | null>(null)
+  // 搜索结果下拉中勾选待添加的小区（rowKey 集合）
+  const [checkedResults, setCheckedResults] = useState<Set<string>>(new Set())
 
   // 搜索防抖定时器 + 过期响应序号
   const searchTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -110,7 +154,7 @@ export function CellQueryUpdateCard({
   // 列宽：默认宽度表 + localStorage 持久化
   const DEFAULT_COL_WIDTHS: Record<string, number> = {
     managedElementId: 52, siteId: 52, cellId: 52, cellName: 175,
-    mcc: 52, mnc: 52, longitude: 70, latitude: 70,
+    mcc: 52, mnc: 52, longitude: 70, latitude: 70, height: 52,
     azimuth: 52, frequency: 52, ssbFrequency: 52, cellCoverType: 70,
   }
   const COL_WIDTHS_KEY = 'npt_cell_query_col_widths'
@@ -140,6 +184,7 @@ export function CellQueryUpdateCard({
       setSearchResults([])
       setShowDropdown(false)
       setHighlightIndex(-1)
+      setCheckedResults(new Set())
       setSearching(false)
       return
     }
@@ -149,10 +194,12 @@ export function CellQueryUpdateCard({
         const res = await dataApi.searchCells(q.trim(), activeTab)
         if (seq !== searchSeq.current) return // 过期响应丢弃
         setSearchResults(res?.data ?? [])
+        setCheckedResults(new Set()) // 新结果集到达，清空旧勾选
         setShowDropdown(true)
       } catch {
         if (seq !== searchSeq.current) return
         setSearchResults([])
+        setCheckedResults(new Set())
         setShowDropdown(false)
       } finally {
         if (seq === searchSeq.current) setSearching(false)
@@ -167,9 +214,13 @@ export function CellQueryUpdateCard({
     cellId: item.cellId,
     cellName: item.cellName,
     mcc: item.mcc ?? '',
-    mnc: item.mnc ?? '',
+    // MNC 规范为两位补零（电信 11 / 联通 01）：入库时数字 1 被归一化成 '1'，
+    // 而 MNC 下拉选项只有 '11'/'01'/'00'，不补零会匹配不到选项而错误显示成第一项 '11'，
+    // 且后端 validate_cell_fields 要求 MNC 为 2 位数字。空值保持空（LTE 无 MNC）。
+    mnc: item.mnc ? String(item.mnc).padStart(2, '0') : '',
     longitude: item.longitude != null ? String(item.longitude) : '',
     latitude: item.latitude != null ? String(item.latitude) : '',
+    height: item.height != null ? String(item.height) : '',
     azimuth: item.azimuth != null ? String(item.azimuth) : '',
     frequency: item.frequency != null ? String(item.frequency) : '',
     ssbFrequency: item.ssbFrequency != null ? String(item.ssbFrequency) : '',
@@ -177,19 +228,49 @@ export function CellQueryUpdateCard({
     rowKey: item.rowKey,
   })
 
-  // 选择搜索结果：rowKey 已存在则忽略（去重），否则追加到 rows + origRows
-  const selectSearchItem = (item: CellSearchItem) => {
-    if (rows[activeTab].some(r => r.rowKey === item.rowKey)) {
+  // ---- 搜索结果多选 ----
+  // 已在表格中的 rowKey（不可重复勾选）
+  const existingRowKeys = new Set(rows[activeTab].map(r => r.rowKey))
+  // 当前结果中可勾选（尚未添加）的条目
+  const selectableResults = searchResults.filter(it => !existingRowKeys.has(it.rowKey))
+  const allChecked = selectableResults.length > 0 && selectableResults.every(it => checkedResults.has(it.rowKey))
+  const someChecked = selectableResults.some(it => checkedResults.has(it.rowKey))
+
+  const toggleResultCheck = (rowKey: string) => {
+    setCheckedResults(prev => {
+      const next = new Set(prev)
+      if (next.has(rowKey)) next.delete(rowKey)
+      else next.add(rowKey)
+      return next
+    })
+  }
+
+  // 全选/取消全选（仅作用于可勾选条目）
+  const toggleCheckAll = () => {
+    setCheckedResults(prev => {
+      if (selectableResults.length > 0 && selectableResults.every(it => prev.has(it.rowKey))) {
+        return new Set()
+      }
+      return new Set(selectableResults.map(it => it.rowKey))
+    })
+  }
+
+  // 批量添加勾选项到表格（跳过已存在的 rowKey）
+  const addCheckedResults = () => {
+    const existing = new Set(rows[activeTab].map(r => r.rowKey))
+    const fresh = searchResults.filter(it => checkedResults.has(it.rowKey) && !existing.has(it.rowKey))
+    if (fresh.length === 0) {
       setShowDropdown(false)
       return
     }
-    const newRow = toCellRow(item)
-    setRows(prev => ({ ...prev, [activeTab]: [...prev[activeTab], newRow] }))
-    setOrigRows(prev => ({ ...prev, [activeTab]: [...prev[activeTab], { ...newRow }] }))
+    const newRows = fresh.map(toCellRow)
+    setRows(prev => ({ ...prev, [activeTab]: [...prev[activeTab], ...newRows] }))
+    setOrigRows(prev => ({ ...prev, [activeTab]: [...prev[activeTab], ...newRows.map(r => ({ ...r }))] }))
     setSearchQuery('')
     setSearchResults([])
     setShowDropdown(false)
     setHighlightIndex(-1)
+    setCheckedResults(new Set())
   }
 
   const handleSearchKeyDown = (e: React.KeyboardEvent) => {
@@ -200,9 +281,11 @@ export function CellQueryUpdateCard({
       e.preventDefault()
       setHighlightIndex(i => Math.max(i - 1, -1))
     } else if (e.key === 'Enter') {
+      // Enter 切换高亮条目的勾选状态（键盘多选），添加由"添加"按钮完成
       if (showDropdown && highlightIndex >= 0 && searchResults[highlightIndex]) {
         e.preventDefault()
-        selectSearchItem(searchResults[highlightIndex])
+        const it = searchResults[highlightIndex]
+        if (!existingRowKeys.has(it.rowKey)) toggleResultCheck(it.rowKey)
       }
     } else if (e.key === 'Escape') {
       setShowDropdown(false)
@@ -273,11 +356,11 @@ export function CellQueryUpdateCard({
     const opKey = `cellQueryUpdate:${Date.now()}`
     // 行显示名快照（成功后表格清空，结果仍可展示）
     const displayMap = new Map<string, string>()
-    for (const u of updates) displayMap.set(u.rowKey, u.diff.cellName?.[1] || u.rowKey)
-    for (const d of deletes) displayMap.set(d.rowKey, `${d.cellName} (${d.siteId}_${d.cellId})`)
+    for (const u of updates) displayMap.set(u.rowKey, formatCellIdentity(u))
+    for (const d of deletes) displayMap.set(d.rowKey, formatCellIdentity(d))
 
     setUpdating(true)
-    addLog('update', `查询/更新: 更新 ${updates.length} 条，删除 ${deletes.length} 条`, 'running', undefined, opKey)
+    addLog('update', `查询/修改: 更新 ${updates.length} 条，删除 ${deletes.length} 条`, 'running', undefined, opKey)
     try {
       const res = await dataApi.bulkUpdateCells({
         updates: updates.map(u => ({ rowKey: u.rowKey, networkType: u.networkType, fields: u.fields })),
@@ -299,33 +382,44 @@ export function CellQueryUpdateCard({
         setSearchResults([])
         setShowDropdown(false)
         setHighlightIndex(-1)
+        // 数据已变更：清小区选择列表缓存 + 地图缓存（前端内存/IndexedDB + 后端 30min 缓存），
+        // 并触发数据刷新事件让地图页重拉扇区（与上传/删除/新站录入路径一致）
+        try {
+          await clearCellListCache()
+          await mapDataService.clearCache()
+        } catch { /* 缓存清理非致命，不影响更新结果 */ }
+        triggerDataRefresh()
       } else {
         const errMsg = res?.message || (t('queryUpdate.updateFailed', { msg: '' }) || '更新失败')
         setBatchError(errMsg)
-        addLog('update', `查询/更新失败: ${errMsg}`, 'error', undefined, opKey)
+        addLog('update', `查询/修改失败: ${errMsg}`, 'error', undefined, opKey)
         setTimeout(() => setBatchError(null), 5000)
       }
     } catch (err: any) {
       const errMsg = err?.message || '更新失败'
       setBatchError(errMsg)
-      addLog('update', `查询/更新失败: ${errMsg}`, 'error', undefined, opKey)
+      addLog('update', `查询/修改失败: ${errMsg}`, 'error', undefined, opKey)
       setTimeout(() => setBatchError(null), 5000)
     } finally {
       setUpdating(false)
     }
   }
 
-  // ---- 清空 ----
+  // ---- 清空（仅当前 LTE/NR 页签；切换页签时另一页签数据保留）----
   const resetAll = () => {
-    setRows({ LTE: [], NR: [] })
-    setOrigRows({ LTE: [], NR: [] })
-    setDeleteMarked(new Set())
+    const tabIds = new Set(rows[activeTab].map(r => r.id))
+    setRows(prev => ({ ...prev, [activeTab]: [] }))
+    setOrigRows(prev => ({ ...prev, [activeTab]: [] }))
+    setDeleteMarked(prev => {
+      const next = new Set(prev)
+      for (const id of tabIds) next.delete(id)
+      return next
+    })
     setSearchQuery('')
     setSearchResults([])
     setShowDropdown(false)
     setHighlightIndex(-1)
-    setBatchResults(null)
-    setBatchError(null)
+    setCheckedResults(new Set())
   }
 
   // ---- 列宽拖拽 ----
@@ -363,13 +457,6 @@ export function CellQueryUpdateCard({
   // ---- 渲染 ----
   const renderContent = () => (
     <>
-      <div className="flex items-center justify-between mb-2">
-        <h2 className="text-base font-semibold">{t('queryUpdate.title') || '查询/更新'}</h2>
-        <span className="text-xs text-muted-foreground">
-          LTE: {rows.LTE.length}&nbsp; NR: {rows.NR.length}
-        </span>
-      </div>
-
       {disabled && (
         <div className="px-3 py-2 bg-muted/40 border border-border rounded-lg text-xs text-muted-foreground mb-3">
           {t('data.noPermission', '无权限，请联系管理员')}
@@ -377,20 +464,20 @@ export function CellQueryUpdateCard({
       )}
 
       {!hasFullParams && (
-        <div className="px-3 py-2 bg-amber-50 border border-amber-200 rounded-lg text-xs mb-3 text-amber-700">
+        <div className="px-3 py-2 bg-amber-500/10 border border-amber-500/20 rounded-lg text-xs mb-3 text-amber-400">
           {t('newCellEntry.noFullParams') || '请先上传全量工参文件'}
         </div>
       )}
 
       {batchError && (
-        <div className="px-3 py-2 bg-red-50 border border-red-200 rounded-lg flex items-center gap-2 text-xs mb-3 text-red-700">
+        <div className="px-3 py-2 bg-red-500/10 border border-red-500/20 rounded-lg flex items-center gap-2 text-xs mb-3 text-red-400">
           <AlertCircle size={14} />
           <span>{batchError}</span>
-          <button onClick={() => setBatchError(null)} className="ml-auto text-red-500 hover:text-red-700">✕</button>
+          <button onClick={() => setBatchError(null)} className="ml-auto text-red-500 hover:text-red-400">✕</button>
         </div>
       )}
 
-      {/* LTE/NR 页签 + 更新/清空 */}
+      {/* LTE/NR 页签 */}
       <div className="flex items-center gap-3 mb-3">
         <div className="flex gap-2">
           {(['LTE', 'NR'] as const).map(nt => (
@@ -403,6 +490,7 @@ export function CellQueryUpdateCard({
                 setSearchResults([])
                 setShowDropdown(false)
                 setHighlightIndex(-1)
+                setCheckedResults(new Set())
               }}
               className={`px-3 py-1 rounded-md text-xs border transition-colors ${
                 activeTab === nt
@@ -413,23 +501,6 @@ export function CellQueryUpdateCard({
               {nt}
             </button>
           ))}
-        </div>
-        <div className="ml-auto flex items-center gap-2">
-          <button
-            onClick={resetAll}
-            disabled={!hasFullParams || disabled || updating}
-            className="px-3 py-1.5 text-xs rounded-md border border-border bg-background text-muted-foreground hover:bg-muted disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-          >
-            {t('queryUpdate.clear') || '清空'}
-          </button>
-          <button
-            onClick={handleUpdateClick}
-            disabled={!hasFullParams || disabled || updating || totalRows === 0}
-            className="px-4 py-1.5 text-xs font-medium rounded-md bg-blue-500 text-white hover:bg-blue-600 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1.5 transition-colors"
-          >
-            {updating ? <Loader2 size={14} className="animate-spin" /> : <CheckCircle2 size={14} />}
-            {updating ? (t('queryUpdate.updateRunning') || '更新中...') : (t('queryUpdate.update') || '更新')}
-          </button>
         </div>
       </div>
 
@@ -447,23 +518,81 @@ export function CellQueryUpdateCard({
           placeholder={t('queryUpdate.searchPlaceholder') || '输入小区名称/网元ID/基站ID/基站名称搜索'}
           className="w-full pl-8 pr-8 py-2 text-sm bg-background border border-border rounded-md focus:outline-none focus:ring-1 focus:ring-primary disabled:opacity-50"
         />
-        {searching && <Loader2 size={14} className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground animate-spin" />}
+        {/* 定位与旋转分离：spin 关键帧的 transform 会覆盖 translate，
+            故 translate 放外层 span、animate-spin 放内层图标，保证居中且持续旋转 */}
+        {searching && (
+          <span className="absolute right-3 top-1/2 -translate-y-1/2 flex items-center text-muted-foreground">
+            <Loader2 size={15} className="animate-spin" />
+          </span>
+        )}
         {showDropdown && searchResults.length > 0 && (
-          <ul className="absolute z-20 mt-1 w-full bg-card border border-border rounded-md shadow-lg max-h-56 overflow-y-auto">
-            {searchResults.map((item, i) => (
-              <li
-                key={item.rowKey}
-                onMouseDown={e => { e.preventDefault(); selectSearchItem(item) }}
-                onMouseEnter={() => setHighlightIndex(i)}
-                className={`px-3 py-2 text-xs cursor-pointer flex items-center justify-between gap-2 ${i === highlightIndex ? 'bg-primary/10' : 'hover:bg-muted'}`}
+          // ul 上 mousedown preventDefault：保持搜索框焦点不丢失（click 仍正常触发勾选/按钮）
+          <ul
+            className="absolute z-20 mt-1 w-full bg-card border border-border rounded-md shadow-lg max-h-72 overflow-y-auto"
+            onMouseDown={e => e.preventDefault()}
+          >
+            {/* 全选 + 批量添加 */}
+            <li className="sticky top-0 z-10 bg-card border-b border-border px-3 py-2 flex items-center gap-2 text-xs">
+              <input
+                type="checkbox"
+                className="cursor-pointer"
+                checked={allChecked}
+                ref={el => { if (el) el.indeterminate = !allChecked && someChecked }}
+                onChange={toggleCheckAll}
+              />
+              <span className="font-medium text-foreground">{t('queryUpdate.selectAll') || '全选'}</span>
+              <span className="text-muted-foreground">({checkedResults.size})</span>
+              <button
+                onClick={addCheckedResults}
+                disabled={checkedResults.size === 0}
+                className="ml-auto px-2.5 py-1 rounded bg-blue-500 text-white hover:bg-blue-600 disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-1 transition-colors"
               >
-                <span className="font-medium text-foreground truncate">{item.cellName}</span>
-                <span className="text-muted-foreground shrink-0">
-                  {item.siteId}_{item.cellId}{item.siteName ? ` · ${item.siteName}` : ''} ({item.networkType})
-                </span>
-              </li>
-            ))}
+                <CheckCircle2 size={12} />
+                {t('queryUpdate.addSelected') || '添加'} ({checkedResults.size})
+              </button>
+            </li>
+            {searchResults.map((item, i) => {
+              const already = existingRowKeys.has(item.rowKey)
+              return (
+                <li
+                  key={item.rowKey}
+                  onMouseDown={(e) => {
+                    // 点击复选框本身时交给 onChange 处理；点击行其他位置才切换勾选
+                    if ((e.target as HTMLElement).tagName !== 'INPUT' && !already) toggleResultCheck(item.rowKey)
+                  }}
+                  onMouseEnter={() => setHighlightIndex(i)}
+                  className={`px-3 py-2 text-xs flex items-center justify-between gap-2 ${already ? 'opacity-50 cursor-default' : 'cursor-pointer ' + (i === highlightIndex ? 'bg-primary/10' : 'hover:bg-muted')}`}
+                >
+                  <span className="flex items-center gap-2 min-w-0">
+                    <input
+                      type="checkbox"
+                      className="cursor-pointer shrink-0"
+                      checked={already || checkedResults.has(item.rowKey)}
+                      disabled={already}
+                      onChange={() => { if (!already) toggleResultCheck(item.rowKey) }}
+                    />
+                    <span className="font-medium text-foreground truncate">{item.cellName}</span>
+                  </span>
+                  <span className="text-muted-foreground shrink-0 flex items-center gap-1">
+                    {item.siteId}_{item.cellId}
+                    {/* NR 共享小区同基站/同小区、不同 MNC 是两条工参记录（电信 460-11 / 联通 460-01），
+                        必须展示 PLMN 才能区分，避免显示成两条"一样"的数据；LTE 无此维度 */}
+                    {item.networkType === 'NR' && (item.mcc || item.mnc)
+                      ? ` · ${item.mcc || ''}-${item.mnc ? String(item.mnc).padStart(2, '0') : ''}`
+                      : ''}
+                    {item.siteName ? ` · ${item.siteName}` : ''} ({item.networkType})
+                    {already && <span className="text-green-600" title={t('queryUpdate.alreadyAdded') || '已添加'}>✓</span>}
+                  </span>
+                </li>
+              )
+            })}
           </ul>
+        )}
+        {searchQuery.trim() !== '' && searching && searchResults.length === 0 && (
+          <div className="absolute z-20 mt-1 w-full bg-card border border-border rounded-md shadow-lg px-3 py-5 flex items-center justify-center gap-2 text-xs text-muted-foreground">
+            <Loader2 size={16} className="animate-spin" />
+            {t('queryUpdate.searching') || '搜索中...'}
+          </div>
         )}
         {showDropdown && searchQuery.trim() !== '' && !searching && searchResults.length === 0 && (
           <div className="absolute z-20 mt-1 w-full bg-card border border-border rounded-md shadow-lg px-3 py-2 text-xs text-muted-foreground">
@@ -489,8 +618,33 @@ export function CellQueryUpdateCard({
           deleteMarkedIds={deleteMarked}
           onToggleDeleteMark={toggleDeleteMark}
           duplicateMap={{}}
+          expanded={expanded}
           t={t}
         />
+      </div>
+
+      {/* 底部操作按钮（与新站录入风格一致） */}
+      <div className="flex items-center justify-between mt-3">
+        <span className="text-xs text-muted-foreground">
+          LTE: {rows.LTE.length}&nbsp; NR: {rows.NR.length}
+        </span>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={resetAll}
+            disabled={!hasFullParams || disabled || updating}
+            className="px-3 py-1.5 text-xs rounded-md border border-border bg-background text-muted-foreground hover:bg-muted disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+          >
+            {t('queryUpdate.clear') || '清空'}
+          </button>
+          <button
+            onClick={handleUpdateClick}
+            disabled={!hasFullParams || disabled || updating || totalRows === 0}
+            className="px-4 py-1.5 text-xs font-medium rounded-md bg-blue-500 text-white hover:bg-blue-600 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1.5 transition-colors"
+          >
+            {updating ? <Loader2 size={14} className="animate-spin" /> : <CheckCircle2 size={14} />}
+            {updating ? (t('queryUpdate.updateRunning') || '更新中...') : (t('queryUpdate.update') || '更新')}
+          </button>
+        </div>
       </div>
 
       {/* 结果 */}
@@ -528,7 +682,7 @@ export function CellQueryUpdateCard({
                     {confirmData.updates.map((u, i) => (
                       <div key={i} className="px-2 py-1.5 text-xs">
                         <div className="font-medium text-foreground">
-                          [{u.networkType}] {u.diff.cellName?.[1] || u.rowKey}
+                          [{u.networkType}] {formatCellIdentity(u)}
                         </div>
                         <div className="text-muted-foreground space-y-0.5">
                           {Object.entries(u.diff).map(([k, [oldV, newV]]) => (
@@ -553,7 +707,7 @@ export function CellQueryUpdateCard({
                   <div className="max-h-40 overflow-y-auto border border-border rounded-md divide-y divide-border">
                     {confirmData.deletes.map((d, i) => (
                       <div key={i} className="px-2 py-1.5 text-xs text-red-600">
-                        [{d.networkType}] {d.cellName} ({d.siteId}_{d.cellId})
+                        [{d.networkType}] {formatCellIdentity(d)}
                       </div>
                     ))}
                   </div>
@@ -583,9 +737,5 @@ export function CellQueryUpdateCard({
     </>
   )
 
-  return (
-    <div className={`bg-card p-3 rounded-lg border border-border -mt-6 ${disabled ? 'opacity-50 pointer-events-none' : ''}`}>
-      {renderContent()}
-    </div>
-  )
+  return renderContent()
 }

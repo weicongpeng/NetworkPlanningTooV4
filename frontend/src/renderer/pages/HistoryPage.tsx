@@ -126,17 +126,17 @@ export function HistoryPage() {
                   </td>
                   <td className="px-4 py-3 text-center">
                     {task.status === 'completed' ? (
-                      <span className="inline-flex items-center gap-1 px-2 py-0.5 text-[10px] bg-green-100 text-green-700 rounded-full font-medium">
+                      <span className="inline-flex items-center gap-1 px-2 py-0.5 text-[10px] bg-green-500/15 text-green-400 rounded-full font-medium">
                         <CheckCircle2 size={10} />
                         {t('common.taskSuccess')}
                       </span>
                     ) : task.status === 'failed' ? (
-                      <span className="inline-flex items-center gap-1 px-2 py-0.5 text-[10px] bg-red-100 text-red-700 rounded-full font-medium">
+                      <span className="inline-flex items-center gap-1 px-2 py-0.5 text-[10px] bg-red-500/15 text-red-400 rounded-full font-medium">
                         <AlertCircle size={10} />
                         {t('common.taskFailed')}
                       </span>
                     ) : task.status === 'running' ? (
-                      <span className="inline-flex items-center gap-1 px-2 py-0.5 text-[10px] bg-blue-100 text-blue-700 rounded-full font-medium">
+                      <span className="inline-flex items-center gap-1 px-2 py-0.5 text-[10px] bg-blue-500/15 text-blue-400 rounded-full font-medium">
                         <span className="inline-block w-2 h-2 rounded-full bg-blue-500 animate-pulse" />
                         {task.progress || 0}%
                       </span>

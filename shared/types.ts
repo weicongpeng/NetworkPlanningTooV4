@@ -153,6 +153,12 @@ export interface NeighborConfig {
   maxNeighbors: number
   coverageDistanceFactor: number  // 覆盖圆距离系数
   coverageRadiusFactor: number    // 覆盖圆半径系数
+  denseSpacingThreshold?: number   // 密集/稀疏门限（公里），默认1.0
+  denseMultiplier?: number         // 密集场景全量半径倍数，默认1.3
+  outdoorToIndoorMaxDistance?: number  // 室外→室分最大距离（公里），默认0.6
+  indoorToIndoorRadius?: number    // 室分→室分距离（公里），默认0.35
+  indoorToOutdoorMultiplier?: number   // 室分→室外全量半径倍数，默认1.5
+  outdoorSpacingSiteCount?: number // 室外源站间距取最近N个室外站，默认9
   customRules?: NeighborRule[]
   selectedCellIds?: string[]  // 选中的小区ID列表（格式：siteId_sectorId）
 }
@@ -364,6 +370,8 @@ export interface UserInfo {
   can_data_delete?: boolean
   can_data_update?: boolean
   can_cell_entry?: boolean
+  can_cell_query_update?: boolean
+  can_assistant?: boolean
 }
 
 export interface TokenResponse {
@@ -382,8 +390,13 @@ export interface RegisterRequest {
   username: string
   password: string
   confirm_password: string
-  city?: string | null
-  operator?: string | null
+  city: string
+  operator: string
+}
+
+export interface RegisterOptions {
+  cities: string[]
+  operators: string[]
 }
 
 export interface ChangePasswordRequest {
@@ -404,10 +417,14 @@ export interface UserUpdateRequest {
   must_change_password?: boolean
   city?: string | null
   operator?: string | null
+  /** 组变更时历史数据迁移范围：user=仅本人 / group=整个旧组 */
+  migrate_scope?: 'user' | 'group'
   can_data_import?: boolean
   can_data_delete?: boolean
   can_data_update?: boolean
   can_cell_entry?: boolean
+  can_cell_query_update?: boolean
+  can_assistant?: boolean
 }
 
 export interface ResetPasswordRequest {
@@ -443,6 +460,7 @@ export interface CellSearchItem {
   longitude?: number
   latitude?: number
   azimuth?: number
+  height?: number
   frequency?: number
   ssbFrequency?: number
   cellCoverType: number
@@ -467,9 +485,54 @@ export interface CellRow {
   mnc: string
   longitude: string
   latitude: string
+  height: string
   azimuth: string
   frequency: string
   ssbFrequency: string
   cellCoverType: number
   rowKey?: string   // 查询/更新：搜索结果定位键（新站录入不填）
+}
+
+// ===== 地图图层编辑（新建 TAB / 绘制点线面 / 保存）=====
+export type DrawGeometryType = 'point' | 'line' | 'polygon'
+export type DrawTool = 'none' | DrawGeometryType
+
+// 绘制样式（点/线/面各一份，持久化到 mapSettings.drawStyleMap）
+export interface PointDrawStyle {
+  markerShape: 'circle' | 'square' | 'diamond' | 'triangle' | 'pin'
+  markerSize: number
+  markerColor: string
+  borderColor: string
+}
+export interface LineDrawStyle {
+  color: string
+  weight: number
+  opacity: number
+  dashArray: string   // '' 实线，'5,5' 等虚线
+}
+export interface PolygonDrawStyle {
+  fillColor: string   // 'none' = 无色（镂空）
+  fillOpacity: number
+  borderColor: string
+  borderWidth: number
+  /** 边框线型：'' 实线，'5,5' 等虚线 */
+  borderDash?: string
+  /**
+   * 图形样式（绘制预设）：
+   * - polygon 多边形（默认）：逐点单击加顶点，双击/右键完成
+   * - circle/square/triangle：绘制时两次点击（拖框）即生成对应规则图形
+   */
+  shape?: 'polygon' | 'circle' | 'square' | 'triangle'
+}
+export type DrawStyleSettings = PointDrawStyle | LineDrawStyle | PolygonDrawStyle
+
+// 新建图层请求/响应（geometryType 缺省为 mixed 混合图层，可绘制点/线/面）
+export interface CreateLayerRequest {
+  name: string
+  geometryType?: DrawGeometryType | 'mixed'
+}
+export interface CreateLayerResult {
+  data_id: string
+  layer_id: string
+  name: string
 }

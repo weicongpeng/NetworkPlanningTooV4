@@ -30,7 +30,7 @@ from app.algorithms.neighbor_planning_v1_service import (
     NeighborConfig as NeighborPlanningConfig,
     run_neighbor_planning,
 )
-from app.services.data_service import data_service
+from app.services.data_service import data_service, is_full_params_filename
 
 
 class TaskType(str, Enum):
@@ -61,12 +61,17 @@ class Task:
     completed_at: Optional[datetime]
     task: Optional[asyncio.Task]
 
-    def __init__(self, task_type: TaskType, config: Any, task_name: Optional[str] = None, user_name: Optional[str] = None):
+    def __init__(self, task_type: TaskType, config: Any, task_name: Optional[str] = None, user_name: Optional[str] = None,
+                 city: Optional[str] = None, operator: Optional[str] = None):
         self.task_id = str(uuid.uuid4())
         self.task_type = task_type
         self.config = config
         self.task_name = task_name
         self.user_name = user_name
+        # 任务发起时的（地市+运营商）组快照：执行线程不反查用户表，
+        # full_params 解析与任务历史隔离均以此为准
+        self.city = city
+        self.operator = operator
         self.status = TaskStatus.PENDING
         self.progress = 0.0
         self.result = None
@@ -206,6 +211,9 @@ class TaskManager:
             'error': task.error,
             'task_name': getattr(task, 'task_name', None),
             'user_name': getattr(task, 'user_name', None),
+            # （地市+运营商）组快照：恢复内存任务时保留组归属，避免重启后丢组
+            'city': getattr(task, 'city', None),
+            'operator': getattr(task, 'operator', None),
             'created_at': task.created_at.isoformat() if task.created_at else None,
             'started_at': task.started_at.isoformat() if task.started_at else None,
             'completed_at': task.completed_at.isoformat() if task.completed_at else None,
@@ -301,7 +309,9 @@ class TaskManager:
 
             task = Task(task_type, task_data.get("config", {}),
                         task_name=task_data.get("task_name"),
-                        user_name=task_data.get("user_name"))
+                        user_name=task_data.get("user_name"),
+                        city=task_data.get("city"),
+                        operator=task_data.get("operator"))
             task.task_id = task_id
             task.status = status
             task.progress = task_data.get("progress", 100.0)
@@ -367,24 +377,29 @@ class TaskManager:
     # ============================================================
 
     def _resolve_input_datasets(
-        self, network_type_str: str
+        self, network_type_str: str, city: Optional[str] = None, operator: Optional[str] = None
     ) -> Dict[str, Any]:
         """
-        一次性确定待规划小区和全量工参文件
+        一次性确定待规划小区和全量工参文件（严格按组隔离）
 
         优化点: 避免多次调用 list_data() 和重复扫描
 
         Args:
             network_type_str: 网络类型 ("LTE" 或 "NR")
+            city/operator: 数据组快照，不完整时本组视为无数据
 
         Returns:
             {"target_cells_item": DataItem, "full_params_item": DataItem}
         """
-        cache_key = f"datasets_{network_type_str}"
+        cache_key = f"datasets_{network_type_str}_{city or ''}_{operator or ''}"
         if cache_key in self._data_prep_cache:
             return self._data_prep_cache[cache_key]
 
         self._data_prep_cache.clear()
+        result = {"target_cells_item": None, "full_params_item": None}
+        if not city or not operator:
+            self._data_prep_cache[cache_key] = result
+            return result
         try:
             data_service.reload_index()
             data_items = data_service.list_data()
@@ -396,6 +411,9 @@ class TaskManager:
             for item in data_items:
                 if item.type.value == "excel":
                     data_info = data_service.index.get(item.id, {})
+                    # 仅扫描同组条目
+                    if (data_info.get("city"), data_info.get("operator")) != (city, operator):
+                        continue
                     file_type = data_info.get("fileType", "")
                     upload_date = data_info.get("uploadDate", "")
                     filename = item.name.lower()
@@ -413,7 +431,7 @@ class TaskManager:
                     elif file_type != "full_params_backup":
                         if filename.startswith("cell-tree-export"):
                             target_cells_item = item
-                        elif filename.startswith("projectparameter_mongoose"):
+                        elif is_full_params_filename(filename):
                             if full_params_item is None or (upload_date and (
                                 full_params_upload_time is None or upload_date > full_params_upload_time
                             )):
@@ -433,15 +451,80 @@ class TaskManager:
             logger.error(f"解析输入数据集失败: {e}")
             raise
 
-    def _find_full_params_item(self) -> Optional[Any]:
+    @staticmethod
+    def _resolve_full_params_id(city: Optional[str] = None, operator: Optional[str] = None) -> Optional[str]:
+        """在指定（地市+运营商）组内定位最新的 full_params 工参 id。
+
+        严格组隔离：city/operator 不完整时返回 None（绝不回退全局最新，
+        否则本组无数据时会读到其他组的工参 PCI/TAC 值）。
+        """
+        if not city or not operator:
+            return None
+        found = [
+            (_id, _info) for _id, _info in data_service.index.items()
+            if isinstance(_info, dict) and _info.get("fileType") == "full_params"
+            and (_info.get("city"), _info.get("operator")) == (city, operator)
+        ]
+        if not found:
+            return None
+        found.sort(key=lambda x: x[1].get("uploadDate", ""), reverse=True)
+        return found[0][0]
+
+    def _group_of_task_id(self, task_id: str) -> tuple:
+        """读取已有任务的组快照（用于应用类任务继承规划任务的组）；无则 (None, None)。
+
+        先查内存任务（运行中/本进程），未命中查 SQLite task_results（后端重启后场景）。
+        """
+        t = self.tasks.get(task_id)
+        if t is not None:
+            return (getattr(t, "city", None), getattr(t, "operator", None))
+        grp = self._group_from_db(task_id)
+        return grp if grp is not None else (None, None)
+
+    @staticmethod
+    def _group_from_db(task_id: str) -> Optional[tuple]:
+        """从 SQLite task_results 读组快照；任务不存在返回 None"""
+        try:
+            from app.core.database import SessionLocal
+            from app.models.database import TaskResult
+
+            db = SessionLocal()
+            try:
+                row = db.query(TaskResult.city, TaskResult.operator).filter(
+                    TaskResult.task_id == task_id
+                ).first()
+            finally:
+                db.close()
+            if row is not None:
+                return (row.city, row.operator)
+        except Exception as e:
+            logger.warning(f"[TaskManager] 查询任务组失败({task_id[:8] if task_id else '?'}...): {e}")
+        return None
+
+    def get_task_group(self, task_id: str) -> Optional[tuple]:
+        """任务组快照（内存任务或 SQLite 持久行）；任务不存在返回 None。
+
+        供端点做跨组访问校验；返回 (None, None) 表示任务存在但无组（旧任务），
+        对有组用户同样不可见。
+        """
+        if task_id in self.tasks:
+            t = self.tasks[task_id]
+            return (getattr(t, "city", None), getattr(t, "operator", None))
+        return self._group_from_db(task_id)
+
+    def _find_full_params_item(self, city: Optional[str] = None, operator: Optional[str] = None) -> Optional[Any]:
         """
         仅查找全量工参文件，不依赖待规划小区文件。
 
         用于当PCI规划使用前端选中小区时，避免对待规划小区文件的任何依赖。
+        city/operator 提供时仅在该组内查找。
 
         Returns:
             full_params_item: DataItem 或 None
         """
+        # 组隔离：必须提供完整组信息，否则直接视为本组无全量工参（禁止全局回退）
+        if not city or not operator:
+            return None
         try:
             data_service.reload_index()
             data_items = data_service.list_data()
@@ -456,6 +539,10 @@ class TaskManager:
                     upload_date = data_info.get("uploadDate", "")
                     filename = item.name.lower()
 
+                    # 仅匹配同组条目
+                    if (data_info.get("city"), data_info.get("operator")) != (city, operator):
+                        continue
+
                     if file_type == "full_params":
                         if full_params_item is None or (upload_date and (
                             full_params_upload_time is None or upload_date > full_params_upload_time
@@ -463,7 +550,7 @@ class TaskManager:
                             full_params_item = item
                             full_params_upload_time = upload_date
                     elif file_type not in ("target_cells", "full_params_backup"):
-                        if filename.startswith("projectparameter_mongoose"):
+                        if is_full_params_filename(filename):
                             if full_params_item is None or (upload_date and (
                                 full_params_upload_time is None or upload_date > full_params_upload_time
                             )):
@@ -609,29 +696,40 @@ class TaskManager:
     # 原有方法
     # ============================================================
 
-    def _validate_pci_data_files(self, network_type: NetworkType, skip_target_cells: bool = False) -> None:
+    def _validate_pci_data_files(
+        self,
+        network_type: NetworkType,
+        skip_target_cells: bool = False,
+        city: Optional[str] = None,
+        operator: Optional[str] = None,
+    ) -> None:
         """
-        验证PCI规划所需的数据文件
+        验证PCI规划所需的数据文件（严格按（地市+运营商）组隔离）
 
         Args:
             network_type: 网络类型(LTE或NR)
             skip_target_cells: 是否跳过待规划小区文件检查（当使用前端选中的小区时可跳过）
+            city/operator: 任务组快照，只在本组内查找数据文件
 
         Raises:
             ValueError: 当数据文件缺失或不符合要求时
         """
-        logger.info(f"[TaskManager] 开始验证PCI数据文件, network_type={network_type}, skip_target_cells={skip_target_cells}")
+        logger.info(f"[TaskManager] 开始验证PCI数据文件, network_type={network_type}, "
+                    f"skip_target_cells={skip_target_cells}, group=({city}/{operator})")
 
-        # 1. 检查文件存在性
+        # 1. 检查文件存在性（仅同组条目）
         data_items = data_service.list_data()
         target_cells_file = None
         full_params_file = None
 
         for item in data_items:
+            data_info = data_service.index.get(item.id, {})
+            if (data_info.get("city"), data_info.get("operator")) != (city, operator):
+                continue
             filename = item.name.lower()
             if filename.startswith("cell-tree-export"):
                 target_cells_file = item
-            elif filename.startswith("projectparameter_mongoose"):
+            elif is_full_params_filename(filename):
                 full_params_file = item
 
         # 2. 验证文件存在
@@ -641,7 +739,7 @@ class TaskManager:
             )
         if not full_params_file:
             raise ValueError(
-                "未找到全量工参文件。请上传文件名以'ProjectParameter_mongoose'开头的Excel文件。"
+                "未找到全量工参文件。请上传文件名以'ProjectParameter'开头的Excel文件。"
             )
 
         # 3. 验证数据完整性 - 当skip_target_cells=True时跳过待规划小区数据的验证
@@ -729,21 +827,60 @@ class TaskManager:
             if full_params_file:
                 logger.info(f"[TaskManager] 已跳过待规划小区文件验证（使用前端选中小区），仅验证全量工参: {full_params_file.name}")
 
-    async def create_pci_task(self, config: PCIConfig, task_name: Optional[str] = None, user_name: Optional[str] = None) -> str:
+    @staticmethod
+    def _resolve_group_by_user_name(user_name: Optional[str]) -> Optional[tuple]:
+        """按用户名查（地市+运营商）组；用户不存在或组信息缺失返回 None。
+
+        任务创建兜底盖章：端点未显式传组时，按发起人归属组落章，
+        避免任务结果行组为 NULL 被误归主管理员组（历史任务跨组串数据根因）。
+        """
+        if not user_name:
+            return None
+        try:
+            from app.core.database import SessionLocal
+            from app.models.database import User
+
+            db = SessionLocal()
+            try:
+                row = db.query(User.city, User.operator).filter(User.username == user_name).first()
+            finally:
+                db.close()
+            if row and row.city and row.operator:
+                return (row.city, row.operator)
+        except Exception as e:
+            logger.warning(f"[TaskManager] 按用户名解析组失败({user_name}): {e}")
+        return None
+
+    @staticmethod
+    def _task_group(city: Optional[str], operator: Optional[str], user_name: Optional[str]) -> tuple:
+        """确定任务组快照：显式传入优先，缺失时按发起人解析，最终可为 (None, None)"""
+        if city and operator:
+            return (city, operator)
+        resolved = TaskManager._resolve_group_by_user_name(user_name)
+        if resolved:
+            return resolved
+        return (city, operator)
+
+    async def create_pci_task(self, config: PCIConfig, task_name: Optional[str] = None, user_name: Optional[str] = None,
+                              city: Optional[str] = None, operator: Optional[str] = None) -> str:
         """创建PCI规划任务 - 增强数据验证"""
         logger.info(f"[TaskManager] 创建PCI任务, config: {config}, task_name: {task_name}, user_name: {user_name}")
+        city, operator = self._task_group(city, operator, user_name)
 
         # **新增**: 预验证数据文件
         try:
             # 如果提供了selectedCellIds，验证可以跳过待规划小区文件的检查
             has_selected_cells = config.selectedCellIds and len(config.selectedCellIds) > 0
-            self._validate_pci_data_files(config.networkType, skip_target_cells=has_selected_cells)
+            self._validate_pci_data_files(
+                config.networkType, skip_target_cells=has_selected_cells,
+                city=city, operator=operator,
+            )
         except ValueError as e:
             logger.error(f"[TaskManager] 数据文件验证失败: {str(e)}")
             raise
 
         # 创建任务（携带任务名称和用户名）
-        task = Task(TaskType.PCI, config, task_name=task_name, user_name=user_name)
+        task = Task(TaskType.PCI, config, task_name=task_name, user_name=user_name, city=city, operator=operator)
         self.tasks[task.task_id] = task
         self._persist_task(task.task_id)
         logger.info(f"[TaskManager] 任务创建成功, task_id: {task.task_id}")
@@ -754,12 +891,14 @@ class TaskManager:
 
         return task.task_id
 
-    async def create_neighbor_task(self, config: NeighborConfig, task_name: Optional[str] = None, user_name: Optional[str] = None) -> str:
+    async def create_neighbor_task(self, config: NeighborConfig, task_name: Optional[str] = None, user_name: Optional[str] = None,
+                                   city: Optional[str] = None, operator: Optional[str] = None) -> str:
         """创建邻区规划任务"""
         logger.info(f"[TaskManager] 创建邻区任务, task_name: {task_name}, user_name: {user_name}")
+        city, operator = self._task_group(city, operator, user_name)
 
         # 创建任务（携带任务名称和用户名）
-        task = Task(TaskType.NEIGHBOR, config, task_name=task_name, user_name=user_name)
+        task = Task(TaskType.NEIGHBOR, config, task_name=task_name, user_name=user_name, city=city, operator=operator)
         self.tasks[task.task_id] = task
         self._persist_task(task.task_id)
 
@@ -768,12 +907,14 @@ class TaskManager:
 
         return task.task_id
 
-    async def create_tac_task(self, config: TACConfig, task_name: Optional[str] = None, user_name: Optional[str] = None) -> str:
+    async def create_tac_task(self, config: TACConfig, task_name: Optional[str] = None, user_name: Optional[str] = None,
+                              city: Optional[str] = None, operator: Optional[str] = None) -> str:
         """创建TAC核查任务"""
         logger.info(f"[TaskManager] 创建TAC核查任务, task_name: {task_name}, user_name: {user_name}")
+        city, operator = self._task_group(city, operator, user_name)
 
         # 创建任务（携带任务名称和用户名）
-        task = Task(TaskType.TAC, config, task_name=task_name, user_name=user_name)
+        task = Task(TaskType.TAC, config, task_name=task_name, user_name=user_name, city=city, operator=operator)
         self.tasks[task.task_id] = task
         self._persist_task(task.task_id)
 
@@ -783,12 +924,14 @@ class TaskManager:
 
         return task.task_id
 
-    async def create_tac_planning_task(self, config: TACConfig, task_name: Optional[str] = None, user_name: Optional[str] = None) -> str:
+    async def create_tac_planning_task(self, config: TACConfig, task_name: Optional[str] = None, user_name: Optional[str] = None,
+                                       city: Optional[str] = None, operator: Optional[str] = None) -> str:
         """创建TAC规划任务（数据型）"""
         logger.info(f"[TaskManager] 创建TAC规划任务, task_name: {task_name}, user_name: {user_name}")
+        city, operator = self._task_group(city, operator, user_name)
 
         # 创建任务（携带任务名称和用户名）
-        task = Task(TaskType.TAC_PLANNING, config, task_name=task_name, user_name=user_name)
+        task = Task(TaskType.TAC_PLANNING, config, task_name=task_name, user_name=user_name, city=city, operator=operator)
         self.tasks[task.task_id] = task
 
         # 启动任务（含信号量准入和超时保护）
@@ -839,10 +982,10 @@ class TaskManager:
                 logger.info(f"[TaskManager] PCI规划: 使用前端选中的小区, 数量={len(config.selectedCellIds)}")
                 target_cell_keys = set(config.selectedCellIds)
 
-                # 只查找全量工参文件
-                full_params_item = self._find_full_params_item()
+                # 只查找全量工参文件（按任务组快照隔离）
+                full_params_item = self._find_full_params_item(task.city, task.operator)
                 if not full_params_item:
-                    raise ValueError("未找到全量工参文件（前缀为'ProjectParameter_mongoose'的Excel文件）")
+                    raise ValueError("未找到全量工参文件（前缀为'ProjectParameter'的Excel文件）")
 
                 full_params_data = data_service.get_data(full_params_item.id)
                 logger.info(f"[TaskManager] PCI规划: 使用全量工参文件: {full_params_item.name}")
@@ -911,7 +1054,9 @@ class TaskManager:
                 run_pci_planning,
                 planning_config, sites_data, progress_callback, full_sites,
                 enable_tac_planning=enable_tac_planning,
-                data_dir=data_dir
+                data_dir=data_dir,
+                city=task.city,
+                operator=task.operator,
             )
 
             # 完成任务
@@ -962,6 +1107,12 @@ class TaskManager:
                 max_neighbors=config.maxNeighbors,
                 coverage_distance_factor=config.coverageDistanceFactor,
                 coverage_radius_factor=config.coverageRadiusFactor,
+                dense_spacing_threshold_km=config.denseSpacingThreshold,
+                dense_multiplier=config.denseMultiplier,
+                outdoor_to_indoor_max_km=config.outdoorToIndoorMaxDistance,
+                indoor_to_indoor_radius_km=config.indoorToIndoorRadius,
+                indoor_to_outdoor_multiplier=config.indoorToOutdoorMultiplier,
+                outdoor_spacing_site_count=config.outdoorSpacingSiteCount,
             )
 
             source_network_str = source_type.value
@@ -976,15 +1127,18 @@ class TaskManager:
                 cell_tree_item = None
                 full_params_item = None
 
-                # 1. 查找全量工参文件（两种方式都需要）
+                # 1. 查找全量工参文件（严格组隔离：仅同组条目）
                 for item in data_items:
                     if item.type.value == "excel":
+                        _info = data_service.index.get(item.id, {})
+                        if (_info.get("city"), _info.get("operator")) != (task.city, task.operator):
+                            continue
                         fname = item.name.lower()
-                        if fname.startswith("projectparameter_mongoose"):
+                        if is_full_params_filename(fname):
                             full_params_item = item
 
                 if not full_params_item:
-                    raise ValueError("未找到全量工参文件 (文件名需以 ProjectParameter_mongoose 开头)")
+                    raise ValueError("未找到全量工参文件 (文件名需以 ProjectParameter 开头)")
 
                 # 2. 确定待规划小区来源
                 if not config.selectedCellIds or len(config.selectedCellIds) == 0:
@@ -1167,6 +1321,8 @@ class TaskManager:
                 enable_singularity,
                 singularity_config,
                 progress_callback,
+                city=task.city,
+                operator=task.operator,
             )
 
             # 必须提供selectedCellIds，否则报错
@@ -1262,19 +1418,14 @@ class TaskManager:
             logger.info(f"[TaskManager] TAC规划: 使用前端选中的小区, 数量={len(config.selectedCellIds)}")
             target_cell_keys = set(config.selectedCellIds)
 
-            # 查找全量工参文件
-            data_items = data_service.list_data()
+            # 查找全量工参文件（按任务组快照在组内定位；管理员/存量任务回退全局最新）
+            full_params_item = self._find_full_params_item(task.city, task.operator)
             full_params_data = None
-            for item in data_items:
-                if item.type.value == "excel":
-                    filename = item.name.lower()
-                    if filename.startswith("projectparameter_mongoose"):
-                        full_params_data = data_service.get_data(item.id)
-                        if full_params_data:
-                            break
+            if full_params_item is not None:
+                full_params_data = data_service.get_data(full_params_item.id)
 
             if not full_params_data:
-                raise ValueError("未找到全量工参文件（projectparameter_mongoose）")
+                raise ValueError("未找到全量工参文件（文件名需以 ProjectParameter 开头）")
 
             logger.info(f"[TaskManager] TAC规划: 待规划小区数量={len(target_cell_keys)}")
             
@@ -1331,7 +1482,9 @@ class TaskManager:
                 planned_count,
                 unplanned_count,
             ) = await asyncio.to_thread(
-                tac_service.plan_tac_for_list, network_type, matched_sites, progress_callback
+                tac_service.plan_tac_for_list,
+                network_type, matched_sites, progress_callback,
+                task.city, task.operator,
             )
  
             # 5. 完成任务
@@ -1395,9 +1548,11 @@ class TaskManager:
     async def create_update_params_task(
         self, full_param_id: str, current_param_id: str,
         username: str = "", user_id: int = 1,
+        city: Optional[str] = None, operator: Optional[str] = None,
     ) -> str:
         """创建工参更新任务"""
         logger.info(f"[TaskManager] 创建工参更新任务: full={full_param_id[:8]}..., current={current_param_id[:8]}...")
+        city, operator = self._task_group(city, operator, username or None)
 
         # 创建任务
         task = Task(TaskType.UPDATE_PARAMS, {
@@ -1405,7 +1560,7 @@ class TaskManager:
             "currentParamId": current_param_id,
             "username": username,
             "userId": user_id,
-        })
+        }, user_name=username or None, city=city, operator=operator)
         self.tasks[task.task_id] = task
         self._persist_task(task.task_id)
         logger.info(f"[TaskManager] 工参更新任务已创建: {task.task_id}")
@@ -1463,8 +1618,7 @@ class TaskManager:
 
             # 清除地图数据缓存
             import app.api.v1.endpoints.map as map_module
-            map_module._map_data_cache = None
-            map_module._map_data_cache_time = 0
+            map_module.invalidate_map_data_cache()
 
             # 停用日志捕获
             data_service.stop_capture_logs()
@@ -1539,11 +1693,9 @@ class TaskManager:
                 raise ValueError("PCI规划任务尚未完成")
 
             # 在快路径操作前，捕获 full_params_info 供后台Excel更新使用
-            full_params_info = None
-            for data_id, data_info in data_service.index.items():
-                if data_info.get("fileType") == "full_params":
-                    full_params_info = data_info
-                    break
+            # （按任务组快照在组内定位；管理员/存量任务回退全局最新）
+            full_params_item = self._find_full_params_item(task.city, task.operator)
+            full_params_info = data_service.index.get(full_params_item.id, {}) if full_params_item is not None else {}
 
             task.progress = 10
 
@@ -1553,15 +1705,15 @@ class TaskManager:
             # === 阶段1: SQLite-only 快路径（线程池，~1-2秒）===
             result = await asyncio.to_thread(
                 self._apply_pci_fast_sqlite_only,
-                planning_result, progress_holder, logger
+                planning_result, progress_holder, logger,
+                city=task.city, operator=task.operator
             )
 
             task.progress = max(progress_holder[0], 90)
 
             # 清除地图数据缓存
             import app.api.v1.endpoints.map as map_module
-            map_module._map_data_cache = None
-            map_module._map_data_cache_time = 0
+            map_module.invalidate_map_data_cache()
 
             # 完成任务 — 用户此时收到响应
             task.status = TaskStatus.COMPLETED
@@ -1693,26 +1845,23 @@ class TaskManager:
 
             task.progress = 10
 
-            # 捕获 full_params_info 供后台Excel更新使用
-            full_params_info = None
-            for data_id, data_info in data_service.index.items():
-                if data_info.get("fileType") == "full_params":
-                    full_params_info = data_info
-                    break
+            # 捕获 full_params_info 供后台Excel更新使用（按任务组快照定位）
+            full_params_item = self._find_full_params_item(task.city, task.operator)
+            full_params_info = data_service.index.get(full_params_item.id, {}) if full_params_item is not None else {}
 
             # === 阶段1: SQLite 快路径 ===
             progress_holder = [10]
             result = await asyncio.to_thread(
                 self._apply_pci_fast_sqlite_only,
-                merged_planning_result, progress_holder, logger
+                merged_planning_result, progress_holder, logger,
+                city=task.city, operator=task.operator
             )
 
             task.progress = max(progress_holder[0], 90)
 
             # 清除地图数据缓存
             import app.api.v1.endpoints.map as map_module
-            map_module._map_data_cache = None
-            map_module._map_data_cache_time = 0
+            map_module.invalidate_map_data_cache()
 
             # 标记所有源任务为已应用
             for tid in plan_task_ids:
@@ -1751,8 +1900,10 @@ class TaskManager:
             self._save_task_result_to_db(task)
             logger.error(f"[TaskManager] PCI批量应用到工参任务失败: {task.task_id}, error: {e}", exc_info=True)
 
-    def _apply_pci_fast_sqlite_only(self, planning_result: Dict, progress_holder: list, _logger: logging.Logger) -> Dict:
-        """Phase 1: Direct SQL UPDATE on Sector rows (optimized, no full copy)."""
+    def _apply_pci_fast_sqlite_only(self, planning_result: Dict, progress_holder: list, _logger: logging.Logger, city: Optional[str] = None, operator: Optional[str] = None) -> Dict:
+        """Phase 1: Direct SQL UPDATE on Sector rows (optimized, no full copy).
+
+        city/operator: 任务组快照，用于组内定位全量工参；None 保持全局行为。"""
         from datetime import datetime
         from app.core.database import SessionLocal
         from app.models.database import Sector, Site, Workbook
@@ -1768,12 +1919,9 @@ class TaskManager:
 
         progress_holder[0] = 15
 
-        # 找到当前的全量工参
-        full_params_id = None
-        for data_id, data_info in data_service.index.items():
-            if data_info.get("fileType") == "full_params":
-                full_params_id = data_id
-                break
+        # 找到当前的全量工参（按任务组快照组内定位）
+        full_params_item = self._find_full_params_item(city, operator)
+        full_params_id = full_params_item.id if full_params_item is not None else None
 
         if not full_params_id:
             raise ValueError("未找到全量工参数据")
@@ -2303,11 +2451,8 @@ class TaskManager:
 
             task.progress = 10
 
-            full_params_info = None
-            for data_id, data_info in data_service.index.items():
-                if data_info.get("fileType") == "full_params":
-                    full_params_info = data_info
-                    break
+            full_params_item = self._find_full_params_item(task.city, task.operator)
+            full_params_info = data_service.index.get(full_params_item.id, {}) if full_params_item is not None else {}
 
             # 用于线程内进度回传的容器
             progress_holder = [10]
@@ -2315,15 +2460,15 @@ class TaskManager:
             # === 阶段1: 快路径 — 更新 data.json/SQLite ===
             result = await asyncio.to_thread(
                 self._sync_apply_tac_planning_fast,
-                planning_result, progress_holder, logger
+                planning_result, progress_holder, logger,
+                city=task.city, operator=task.operator
             )
 
             task.progress = max(progress_holder[0], 90)
 
             # 清除地图数据缓存
             import app.api.v1.endpoints.map as map_module
-            map_module._map_data_cache = None
-            map_module._map_data_cache_time = 0
+            map_module.invalidate_map_data_cache()
 
             # 完成任务
             task.status = TaskStatus.COMPLETED
@@ -2433,24 +2578,21 @@ class TaskManager:
 
             task.progress = 10
 
-            full_params_info = None
-            for data_id, data_info in data_service.index.items():
-                if data_info.get("fileType") == "full_params":
-                    full_params_info = data_info
-                    break
+            full_params_item = self._find_full_params_item(task.city, task.operator)
+            full_params_info = data_service.index.get(full_params_item.id, {}) if full_params_item is not None else {}
 
             # === 阶段1: SQLite 快路径 ===
             progress_holder = [10]
             result = await asyncio.to_thread(
                 self._sync_apply_tac_planning_fast,
-                merged_planning_result, progress_holder, logger
+                merged_planning_result, progress_holder, logger,
+                city=task.city, operator=task.operator
             )
 
             task.progress = max(progress_holder[0], 90)
 
             import app.api.v1.endpoints.map as map_module
-            map_module._map_data_cache = None
-            map_module._map_data_cache_time = 0
+            map_module.invalidate_map_data_cache()
 
             for tid in plan_task_ids:
                 try:
@@ -2487,7 +2629,7 @@ class TaskManager:
             self._save_task_result_to_db(task)
             logger.error(f"[TaskManager] TAC批量应用到工参任务失败: {task.task_id}, error: {e}", exc_info=True)
 
-    def _sync_apply_tac_planning_fast(self, planning_result: Dict, progress_holder: list, _logger: logging.Logger) -> Dict:
+    def _sync_apply_tac_planning_fast(self, planning_result: Dict, progress_holder: list, _logger: logging.Logger, city: Optional[str] = None, operator: Optional[str] = None) -> Dict:
         """Direct SQL UPDATE on Sector.tac (optimized, no full copy)."""
         from datetime import datetime
         from app.core.database import SessionLocal
@@ -2502,11 +2644,8 @@ class TaskManager:
         progress_holder[0] = 15
 
         # 找到当前的全量工参
-        full_params_id = None
-        for data_id, data_info in data_service.index.items():
-            if data_info.get("fileType") == "full_params":
-                full_params_id = data_id
-                break
+        full_params_item = self._find_full_params_item(city, operator)
+        full_params_id = full_params_item.id if full_params_item is not None else None
 
         if not full_params_id:
             raise ValueError("未找到全量工参数据")
@@ -2724,6 +2863,10 @@ class TaskManager:
                     existing.task_name = getattr(task, 'task_name', None) or existing.task_name
                     existing.user_name = getattr(task, 'user_name', None) or existing.user_name
                     existing.completed_at = task.completed_at.isoformat() if task.completed_at else None
+                    # 组章补齐：行组为 NULL 且任务带组快照时补章（NULL 组行任何人都不可见）
+                    if existing.city is None and getattr(task, 'city', None):
+                        existing.city = task.city
+                        existing.operator = task.operator
                 else:
                     db.add(TaskResult(
                         task_id=task.task_id,
@@ -2737,6 +2880,9 @@ class TaskManager:
                         error_message=task.error,
                         created_at=task.created_at.isoformat() if task.created_at else datetime.now().isoformat(),
                         completed_at=task.completed_at.isoformat() if task.completed_at else None,
+                        # 任务发起时的组快照（地市+运营商），决定历史任务组可见性
+                        city=getattr(task, 'city', None),
+                        operator=getattr(task, 'operator', None),
                     ))
                 db.commit()
             finally:
@@ -2780,8 +2926,12 @@ class TaskManager:
     _history_verify_cache: Dict[str, tuple] = {}
     _history_verify_cache_max = 300
 
-    def list_task_history(self, task_type: Optional[str] = None, page: int = 1, page_size: int = 20, user_name: Optional[str] = None) -> Dict:
+    def list_task_history(self, task_type: Optional[str] = None, page: int = 1, page_size: int = 20, user_name: Optional[str] = None, user=None) -> Dict:
         """从 SQLite 获取历史任务列表（分页），返回 {"tasks": [...], "total": 总数, "page": 当前页, "page_size": 每页条数}
+
+        user 提供时按（地市+运营商）组过滤 TaskResult：所有用户（含管理员）
+        一律仅见本组任务，组信息缺失用户不可见任何任务。
+        user_name 参数保留兼容（按发起人过滤，通常不与 user 同用）。
 
         🔥 性能优化：
         - total 单独 COUNT，不受分页截断影响，供前端 badge / 分页栏显示真实任务数
@@ -2803,6 +2953,13 @@ class TaskManager:
                     query = query.filter(TaskResult.task_type == task_type)
                 if user_name:
                     query = query.filter(TaskResult.user_name == user_name)
+                # 按（地市+运营商）组隔离：所有用户（含管理员）一律仅见本组任务；
+                # 存量 NULL 组任务启动迁移后归主管理员组（与工参数据可见性规则一致）
+                if user is not None:
+                    from app.services.data_group import group_sql_filter
+                    group_filter = group_sql_filter(TaskResult.city, TaskResult.operator, user)
+                    if group_filter is not None:
+                        query = query.filter(group_filter)
                 # 真实总数（不受分页影响）
                 total = query.count()
                 # 分页：page 从 1 开始
@@ -2819,7 +2976,10 @@ class TaskManager:
                 )
 
                 # 读取当前全量工参的 sector 实际值，用于动态判断 applied 状态
-                current_sector_values = self._load_current_sector_values(db)
+                # （一律按请求用户的组定位工参；user=None 系统调用保持全局行为）
+                from app.services.data_group import user_group as _dg_user_group
+                _grp = _dg_user_group(user) or (None, None)
+                current_sector_values = self._load_current_sector_values(db, city=_grp[0], operator=_grp[1])
                 # 当前全量工参版本（用于 isApplied 验证缓存失效判断）
                 full_params_id = TaskManager._sector_values_cache.get("_full_params_id") if TaskManager._sector_values_cache else None
 
@@ -2883,8 +3043,11 @@ class TaskManager:
             return {"tasks": [], "total": 0, "page": 1, "page_size": page_size}
 
     @staticmethod
-    def _load_current_sector_values(db) -> Dict[str, Dict]:
+    def _load_current_sector_values(db, city: Optional[str] = None, operator: Optional[str] = None) -> Dict[str, Dict]:
         """加载当前全量工参中所有小区的实际 PCI/TAC 值，返回 {siteId_sectorId: {pci, tac}}
+
+        city/operator: (地市+运营商) 组快照，严格组内定位全量工参；组不完整返回空。
+        缓存按（组 + full_params_id）区分，避免跨组串值。
 
         🔥 优化：缓存失效优先依赖 inplace_updated 信号（应用操作设置），
         避免每次历史列表请求都全量查询 SQLite（生产环境几万行，ARM 芯片耗时数秒）。
@@ -2899,16 +3062,13 @@ class TaskManager:
         import time as _time
 
         current_time = _time.time()
-        # 当前全量工参 workbook_id
-        current_full_params_id = None
-        for data_id, info in data_service.index.items():
-            if info.get("fileType") == "full_params":
-                current_full_params_id = data_id
-                break
+        # 当前全量工参 workbook_id（严格组内定位；组不完整为 None → 返回空）
+        current_full_params_id = TaskManager._resolve_full_params_id(city, operator)
 
-        # 🔥 缓存命中条件：id 匹配 + 未发生原地更新 + TTL 兜底内
+        # 🔥 缓存命中条件：组+id 匹配 + 未发生原地更新 + TTL 兜底内
         cached = TaskManager._sector_values_cache
         if (cached
+                and cached.get("_group") == (city, operator)
                 and cached.get("_full_params_id") == current_full_params_id
                 and not data_service.index.get(current_full_params_id, {}).get("inplace_updated")
                 and (current_time - TaskManager._sector_values_cache_time) < TaskManager._sector_values_cache_ttl):
@@ -2941,6 +3101,7 @@ class TaskManager:
         if full_params_id in data_service.index:
             data_service.index[full_params_id]['inplace_updated'] = False
         TaskManager._sector_values_cache = {
+            "_group": (city, operator),
             "_full_params_id": full_params_id,
             "values": values,
         }

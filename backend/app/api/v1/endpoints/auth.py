@@ -18,9 +18,30 @@ from app.services.auth_service import auth_service
 router = APIRouter()
 
 
+@router.get("/options")
+async def get_register_options():
+    """注册选项（公开，登录前可达）：地市预设清单与运营商列表"""
+    from app.core.config import settings
+    from app.services.data_group import OPERATORS
+
+    return {
+        "success": True,
+        "data": {
+            "cities": settings.CITY_PRESETS,
+            "operators": list(OPERATORS),
+        },
+    }
+
+
 @router.post("/register")
 async def register(data: UserCreate, request: Request, db: Session = Depends(get_db)):
     """注册新用户并自动登录"""
+    from app.services.data_group import validate_group
+
+    group_error = validate_group(data.city, data.operator)
+    if group_error:
+        raise HTTPException(status_code=400, detail=group_error)
+
     user, error = auth_service.create_user(
         db=db,
         username=data.username,

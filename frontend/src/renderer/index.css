@@ -9,32 +9,33 @@
   :root {
     /* Default theme variables (dark mode with blue primary) */
     /* These are dynamically updated by themeStore.ts based on user selection */
-    --background: 0 0% 20%;
-    --foreground: 0 0% 95%;
+    /* 高级灰（淡雅、低饱和、微冷）：app 背景 < 卡片 < 嵌套面/表头 < 浮层(最亮) */
+    --background: 220 13% 15%;
+    --foreground: 210 24% 92%;
 
-    --card: 0 0% 23%;
-    --card-foreground: 0 0% 95%;
+    --card: 220 12% 18%;
+    --card-foreground: 210 24% 92%;
 
-    --popover: 0 0% 23%;
-    --popover-foreground: 0 0% 95%;
+    --popover: 220 11% 24%;
+    --popover-foreground: 210 24% 92%;
 
-    --primary: 217.2 91.2% 59.8%;
-    --primary-foreground: 222.2 47.4% 11.2%;
+    --primary: 207 90% 54%;
+    --primary-foreground: 0 0% 100%;
 
-    --secondary: 0 0% 16%;
-    --secondary-foreground: 0 0% 95%;
+    --secondary: 220 11% 22%;
+    --secondary-foreground: 210 24% 92%;
 
-    --muted: 0 0% 16%;
-    --muted-foreground: 0 0% 65%;
+    --muted: 220 10% 25%;
+    --muted-foreground: 220 12% 68%;
 
-    --accent: 0 0% 16%;
-    --accent-foreground: 0 0% 95%;
+    --accent: 220 11% 28%;
+    --accent-foreground: 210 24% 92%;
 
-    --destructive: 0 62.8% 30.6%;
-    --destructive-foreground: 0 0% 95%;
+    --destructive: 0 70% 62%;
+    --destructive-foreground: 0 0% 100%;
 
-    --border: 0 0% 16%;
-    --input: 0 0% 16%;
+    --border: 220 9% 31%;
+    --input: 220 11% 22%;
     --ring: 207 90% 54%;
 
     --radius: 0.5rem;
@@ -70,7 +71,7 @@
 
 /* Leaflet地图样式覆盖 */
 .leaflet-container {
-  background: #f0f2f5;
+  background: hsl(var(--muted));
 }
 
 /* 手形拖拽工具激活 - 使用 !important 覆盖 Leaflet 内部光标管理 */
@@ -113,35 +114,36 @@
 }
 
 
-/* 抓取坐标弹窗样式 - 白色背景带细边框 */
+/* 抓取坐标弹窗样式 - 跟随主题的卡片样式 */
 .leaflet-popup.capture-popup-white .leaflet-popup-content-wrapper {
-  background: #fff !important;
-  border: 1px solid #d1d5db !important;
+  background: hsl(var(--popover)) !important;
+  border: 1px solid hsl(var(--border)) !important;
   border-radius: 4px !important;
-  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.12) !important;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15) !important;
   padding: 0 !important;
 }
 
 .leaflet-popup.capture-popup-white .leaflet-popup-tip {
-  background: #fff !important;
-  border: 1px solid #d1d5db !important;
+  background: hsl(var(--popover)) !important;
+  border: 1px solid hsl(var(--border)) !important;
 }
 
 .leaflet-popup.capture-popup-white .leaflet-popup-content {
   margin: 0 !important;
-  color: #000 !important;
+  color: hsl(var(--popover-foreground)) !important;
 }
 
 /* 通用弹窗样式（非定位标记、非抓取弹窗） */
 .leaflet-popup-content-wrapper:not(.capture-popup-white) {
-  background: rgba(30, 41, 59, 0.95);
+  background: hsl(var(--popover) / 0.95);
   backdrop-filter: blur(8px);
   border: 1px solid hsl(var(--border));
   border-radius: var(--radius);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.2);
 }
 
 .leaflet-popup-tip:not(.capture-popup-white) {
-  background: rgba(30, 41, 59, 0.95);
+  background: hsl(var(--popover) / 0.95);
 }
 
 .leaflet-popup-content-wrapper:not(.capture-popup-white) .leaflet-popup-content {
@@ -160,8 +162,9 @@
 }
 
 .leaflet-control-attribution {
-  background-color: rgba(30, 41, 59, 0.8);
+  background-color: hsl(var(--card) / 0.8);
   color: hsl(var(--muted-foreground));
+  backdrop-filter: blur(4px);
 }
 
 
@@ -230,6 +233,12 @@
 .sector-marker-measure {
   pointer-events: none !important;
   cursor: crosshair !important;
+}
+
+/* 图层编辑会话模式下的扇区样式 - 禁用交互，点击穿透到地图供编辑会话绘制/选中 */
+.sector-polygon.sector-edit-passthrough,
+.sector-marker.sector-edit-passthrough {
+  pointer-events: none !important;
 }
 
 .sector-polygon-measure:hover,

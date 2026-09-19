@@ -19,6 +19,7 @@ import {
   MapPage,
   AdminUsersPage,
   AppVersionsPage,
+  AssistantPageLazy,
 } from './pageLoaders'
 import { startHealthCheck, stopHealthCheck } from '@/renderer/services/api'
 import { useHeartbeat } from './hooks/useHeartbeat'
@@ -146,6 +147,15 @@ function App() {
                 element={
                   <ProtectedRoute requireAdmin>
                     <AppVersionsPage />
+                  </ProtectedRoute>
+                }
+              />
+
+              <Route
+                path="/assistant"
+                element={
+                  <ProtectedRoute requirePermission="can_assistant">
+                    <AssistantPageLazy />
                   </ProtectedRoute>
                 }
               />

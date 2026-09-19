@@ -1,0 +1,667 @@
+"""
+图层编辑服务：新建空 TAB 图层 + 绘制要素保存（整层重写）
+
+- create_empty_tab_layer：创建带默认 name 列的 0 要素 TAB，注册到 layers.json / index.json / SQLite
+- save_layer_geojson：把前端编辑工作集（GCJ02）逆转换为 WGS84 后整层重写 TAB，
+  保留旧属性表 schema，并刷新元数据与缓存
+
+坐标约定：后端下发图层 GeoJSON 时已 WGS84→GCJ02；前端绘制/编辑坐标为 GCJ02，
+保存时必须整体逆转换回 WGS84（EPSG:4326）再写 TAB。
+"""
+import json
+import re
+import shutil
+import uuid
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import geopandas as gpd
+import pandas as pd
+
+from app.core.config import settings
+from app.services.tab_io import write_mapinfo_tab, verify_tab_readable, remove_tab_stem, _tab_stem_files
+from app.services.layer_service import _truncate_bytes
+from app.services.mapinfo_service import (
+    GeometryType,
+    MapInfoParser,
+    _save_layer_metadata,
+    clear_layer_cache,
+    layer_cache_dir,
+)
+from app.utils.geojson_geometry import build_geometries
+
+# 前端几何类型 → (pyogrio geometry_type, GeometryType 枚举)
+# mixed=混合图层（同一图层可同时绘制点/线/面），MapInfo TAB 用 GDAL "Unknown" 几何类型写入
+_GEOM_MAP = {
+    "point": ("Point", GeometryType.POINT),
+    "line": ("LineString", GeometryType.LINE),
+    "polygon": ("Polygon", GeometryType.POLYGON),
+    "mixed": ("Unknown", GeometryType.UNKNOWN),
+}
+
+# 文件名非法字符（Windows + MapInfo）
+_INVALID_FILENAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+# 新建空图层的默认属性列（MapInfo .dat 至少需 1 个字段，否则无法读回）
+_DEFAULT_ATTR_COLUMN = "name"
+
+
+def _sanitize_layer_name(name: str) -> str:
+    """清洗图层文件名：去非法字符、空白收敛、按 UTF-8 字节截断 ≤100。"""
+    name = (name or "").strip()
+    name = _INVALID_FILENAME.sub("_", name)
+    name = re.sub(r"\s+", " ", name).strip(" .")
+    if not name:
+        name = "新建图层"
+    return _truncate_bytes(name, 100)
+
+
+def _dir_size(path: Path) -> int:
+    return sum(f.stat().st_size for f in path.glob("*") if f.is_file())
+
+
+def create_empty_tab_layer(name: str, geometry_type: str = "mixed",
+                           user_id: int = 1, city: Optional[str] = None,
+                           operator: Optional[str] = None) -> Dict[str, Any]:
+    """创建一个 0 要素的 MapInfo TAB 图层并注册到索引。
+
+    geometry_type: 'mixed'（默认，同一图层可绘制点/线/面）或 'point'/'line'/'polygon'。
+    city/operator: 数据所属组（地市+运营商）归属快照，取自创建者。
+    Returns:
+        {"data_id", "layer_id", "name"}
+    """
+    safe_name = _sanitize_layer_name(name)
+    geom_key = (geometry_type or "mixed").lower().strip()
+    if geom_key not in _GEOM_MAP:
+        raise ValueError(f"不支持的几何类型: {geometry_type}（应为 mixed/point/line/polygon）")
+    ogr_geom_type, geom_enum = _GEOM_MAP[geom_key]
+
+    data_id = str(uuid.uuid4())
+    data_dir = settings.DATA_DIR / data_id
+    data_dir.mkdir(parents=True, exist_ok=True)
+    tab_path = data_dir / f"{safe_name}.tab"
+
+    # 0 要素 + 默认 name 属性列（U50），显式几何类型（mixed=Unknown，支持后续写入点/线/面）
+    empty_gdf = gpd.GeoDataFrame(
+        {_DEFAULT_ATTR_COLUMN: pd.Series([], dtype="object")},
+        geometry=gpd.GeoSeries([], crs="EPSG:4326"),
+    )
+    write_mapinfo_tab(empty_gdf, tab_path, geometry_type=ogr_geom_type)
+    verify_tab_readable(tab_path, 0)
+
+    layer_id = data_id  # 单图层约定：layer_id 与 data_id 一致（同 parse_mapinfo_files 单文件）
+    # 混合图层无单一几何默认样式（编辑绘制时按点/线/面分别取 drawStyle）；单一几何给推断样式
+    default_style = None if geom_key == "mixed" else MapInfoParser._get_layer_default_style(safe_name, geom_enum)
+    entry = {
+        "id": layer_id,
+        "name": safe_name,
+        "type": geom_key,  # 'mixed' / 'point' / 'line' / 'polygon'
+        "feature_count": 0,
+        "metadata": {
+            "source_file": str(tab_path),
+            "feature_count": 0,
+            "editable": True,  # 标记为工具内新建、可编辑的 TAB 图层
+        },
+        "defaultStyle": default_style,
+    }
+
+    with open(data_dir / "layers.json", "w", encoding="utf-8") as f:
+        json.dump([entry], f, ensure_ascii=False, indent=2)
+
+    total_size = _dir_size(data_dir)
+
+    # 注册到 data_service 内存索引 + index.json（延迟导入避免循环依赖）
+    from app.services.data_service import data_service
+    data_service.index[data_id] = {
+        "id": data_id,
+        "name": f"{safe_name}.tab",
+        "type": "map",
+        "subType": "mapinfo",
+        "user_id": user_id,
+        "city": city,
+        "operator": operator,
+        "size": total_size,
+        "uploadDate": pd.Timestamp.now().isoformat(),
+        "status": "ready",
+        "metadata": {
+            "fileCount": len([f for f in data_dir.glob("*") if f.is_file()]),
+            "layerCount": 1,
+            "layers": [entry],
+        },
+    }
+    data_service._save_index()
+
+    # SQLite Layer 行
+    _save_layer_metadata(
+        user_id=user_id,
+        city=city,
+        operator=operator,
+        name=safe_name,
+        file_path=str(tab_path),
+        layer_type=geom_key,
+        geometry_type=geom_key,
+        feature_count=0,
+        file_size=total_size,
+        layer_id=layer_id,
+    )
+
+    clear_layer_cache(data_id)
+    return {"data_id": data_id, "layer_id": layer_id, "name": safe_name}
+
+
+# 图层类型 → OGR geometry_type（保存重写用；mixed=混合几何用 Unknown）
+_OGR_GEOM_BY_ENTRY = {"point": "Point", "line": "LineString", "polygon": "Polygon", "mixed": "Unknown"}
+
+# MapInfo 全套关联文件（zip 打包用；.ind 可选）
+_TAB_BUNDLE_SUFFIXES = (".tab", ".dat", ".id", ".map", ".ind")
+
+
+# MapInfo 全套关联文件（zip 打包用；.ind 可选）+ MIF 配套
+_LAYER_BUNDLE_SUFFIXES = (".tab", ".dat", ".id", ".map", ".ind", ".mif", ".mid", ".kml")
+
+# 数据条目原始上传件在数据目录中的候选名
+_DATA_ORIGINAL_NAMES = ("original.xlsx", "original.zip")
+
+
+def build_data_layers_zip(data_id: str) -> tuple:
+    """把数据条目下所有图层的**当前文件**打包为 zip（方案B：数据管理"下载"返回最新图层）。
+
+    与 build_layer_zip（单图层）不同：一个 map 数据条目可能含多个图层
+    （zip 导入多文件），这里遍历 layers.json 逐图层收集同 stem 配套文件
+    （大小写不敏感）。编辑保存整层重写的就是这些源文件，故打包结果
+    始终是最新状态，替代 original.zip 上传快照。
+
+    Returns:
+        (zip_bytes, layer_count)；无图层或全部源文件缺失时返回 (b"", 0)
+    """
+    import io as _io
+    import zipfile as _zipfile
+
+    data_dir = settings.DATA_DIR / data_id
+    layers_file = data_dir / "layers.json"
+    if not layers_file.exists():
+        return b"", 0
+    try:
+        layers = json.loads(layers_file.read_text(encoding="utf-8"))
+    except Exception as e:
+        print(f"[LayerEdit] build_data_layers_zip 读取 layers.json 失败: {e}")
+        return b"", 0
+
+    buf = _io.BytesIO()
+    count = 0
+    used_names: set = set()
+    with _zipfile.ZipFile(buf, "w", _zipfile.ZIP_DEFLATED) as zf:
+        for entry in layers:
+            src = (entry.get("metadata", {}) or {}).get("source_file")
+            src_path = Path(src) if src else None
+            if src_path is None or not src_path.exists():
+                # 兜底：按图层名在数据目录找同名源文件
+                name = entry.get("name") or ""
+                src_path = None
+                for ext in (".tab", ".TAB", ".mif", ".kml"):
+                    cand = data_dir / f"{name}{ext}"
+                    if cand.exists():
+                        src_path = cand
+                        break
+            if src_path is None:
+                continue
+            stem = src_path.stem.lower()
+            # 同 stem 配套文件（大小写不敏感，避免用户上传大写 .TAB/.DAT 漏打包）
+            try:
+                it = data_dir.rglob("*")
+            except OSError:
+                it = []
+            for f in it:
+                if f.is_file() and f.stem.lower() == stem \
+                        and f.suffix.lower() in _LAYER_BUNDLE_SUFFIXES \
+                        and f.name not in used_names:
+                    zf.write(f, arcname=f.name)
+                    used_names.add(f.name)
+                    count += 1
+    if count == 0:
+        return b"", 0
+    return buf.getvalue(), count
+
+
+def build_layer_zip(data_id: str, layer_id: str) -> tuple:
+    """把图层的 MapInfo 全套文件（.tab/.dat/.id/.map）打包为 zip。
+
+    Returns:
+        (zip_bytes, download_filename)  # 下载名 {图层名}.tab.zip
+    """
+    import io as _io
+    import zipfile as _zipfile
+
+    data_dir = settings.DATA_DIR / data_id
+    if not data_dir.exists():
+        raise FileNotFoundError(f"数据目录不存在: {data_id}")
+    entry = _find_layer_entry(data_dir, layer_id)
+    if entry is None:
+        raise ValueError(f"未找到图层: {layer_id}")
+    source_file = entry.get("metadata", {}).get("source_file")
+    tab_path = Path(source_file) if source_file else None
+    if tab_path is None or tab_path.suffix.lower() != ".tab" or not tab_path.exists():
+        raise FileNotFoundError(f"TAB 源文件不存在: {tab_path}")
+
+    buf = _io.BytesIO()
+    with _zipfile.ZipFile(buf, "w", _zipfile.ZIP_DEFLATED) as zf:
+        # 大小写不敏感收集同 stem 配套文件（用户上传常见 .TAB/.DAT/.MAP 大写后缀）
+        for f in _tab_stem_files(tab_path):
+            if f.exists() and f.is_file():
+                zf.write(f, arcname=f.name)
+    safe_name = _sanitize_layer_name(entry.get("name") or tab_path.stem)
+    return buf.getvalue(), f"{safe_name}.tab.zip"
+
+
+def _resolve_effective_type(declared_type: str, geoms: List[Any]) -> str:
+    """根据实际要素几何推断保存类型：空/单类保留声明；多类或与声明不符升级为实际单类/mixed。"""
+    if not geoms:
+        return declared_type if declared_type in _OGR_GEOM_BY_ENTRY else "mixed"
+    from shapely.geometry import (Point, LineString, Polygon,
+                                  MultiPoint, MultiLineString, MultiPolygon)
+    kinds = set()
+    for g in geoms:
+        if isinstance(g, (Point, MultiPoint)):
+            kinds.add("point")
+        elif isinstance(g, (LineString, MultiLineString)):
+            kinds.add("line")
+        elif isinstance(g, (Polygon, MultiPolygon)):
+            kinds.add("polygon")
+    if len(kinds) > 1:
+        return "mixed"
+    actual = kinds.pop()
+    if actual == declared_type:
+        return declared_type
+    return actual
+
+# 不写入 TAB 的前端内部字段
+_INTERNAL_FIELDS = {"_editId", "_style", "_nptSelectionId"}
+
+# 前端编辑样式持久化列：整层重写时把 _editStyle / _shape / _ellipse 序列化为 JSON 字符串
+# 写入 TAB 属性表，刷新/重新加载后由 mapinfo_service 还原为内部字段。
+# 列名刻意避开样式列正则（*style*/*pen*/*brush* 等），否则读取时会被吞进 _style。
+_STYLE_PERSIST_COL = "NPT_FEATSYM"    # _editStyle（要素级绘制样式）
+_META_PERSIST_COL = "NPT_FEATMETA"    # {_shape, _ellipse}（圆/椭圆元数据）
+
+# 绘制样式输入键：这些键是前端绘制样式的载体（经 NPT_FEATSYM 持久化），
+# 不作为普通属性列扩展进 TAB schema
+_STYLE_INPUT_KEYS = {
+    "markerColor", "markerSize", "markerSymbol", "markerRadius", "markerIconPx",
+    "borderColor", "borderWidth", "borderDash",
+    "fillColor", "fillOpacity",
+    "color", "weight", "opacity", "dashArray", "shape",
+}
+
+
+def _read_tab_gdf(tab_path: Path, rows: Optional[int] = None) -> gpd.GeoDataFrame:
+    """读取 TAB 为 GeoDataFrame。
+
+    默认编码优先（GDAL 按 .tab 声明的 charset 解码）：项目写入的 TAB，.dat 实为 UTF-8
+    而 .tab 声明 WindowsSimpChinese，显式传 encoding='gbk' 会把 UTF-8 字节静默解成乱码
+    中文列名（如“等级”→‘绛夌骇’），保存时按乱码列名对齐会把属性写进垃圾列。
+    默认编码失败时（部分 Neutral/纯 GBK 上传件）才回退 GBK。
+    rows: 仅读取前 N 行（取 schema 用；不传则读全量）。
+    """
+    kwargs = {"rows": rows} if rows is not None else {}
+    try:
+        return gpd.read_file(tab_path, **kwargs)
+    except Exception:
+        return gpd.read_file(tab_path, encoding="gbk", **kwargs)
+
+
+def _find_layer_entry(data_dir: Path, layer_id: str) -> Optional[Dict[str, Any]]:
+    layers_file = data_dir / "layers.json"
+    if not layers_file.exists():
+        return None
+    try:
+        layers = json.loads(layers_file.read_text(encoding="utf-8"))
+        for entry in layers:
+            if entry.get("id") == layer_id:
+                return entry
+    except Exception as e:
+        print(f"[LayerEdit] 读取 layers.json 失败: {e}")
+    return None
+
+
+def _scalarize(v: Any) -> Any:
+    """属性值归一为可写入 TAB 的标量（基站扇区等来源含 attributes 等嵌套对象）。
+
+    非标量一律 JSON 序列化为字符串，避免 pyogrio/MapInfo 字段写入报错导致整层保存失败。
+    """
+    if v is None:
+        return None
+    if isinstance(v, (str, int, float, bool)):
+        return v
+    try:
+        return json.dumps(v, ensure_ascii=False)
+    except Exception:
+        return str(v)
+
+
+def _geom_kind(g: Any) -> str:
+    """单个几何 → point/line/polygon（无法识别返回空串）。"""
+    from shapely.geometry import (Point, LineString, Polygon,
+                                  MultiPoint, MultiLineString, MultiPolygon)
+    if isinstance(g, (Point, MultiPoint)):
+        return "point"
+    if isinstance(g, (LineString, MultiLineString)):
+        return "line"
+    if isinstance(g, (Polygon, MultiPolygon)):
+        return "polygon"
+    return ""
+
+
+def _dominant_kind(geoms: List[Any]) -> str:
+    """占比最高的几何类型（混合几何降级写入时用）。"""
+    counts: Dict[str, int] = {}
+    for g in geoms:
+        k = _geom_kind(g)
+        if k:
+            counts[k] = counts.get(k, 0) + 1
+    if not counts:
+        return ""
+    return max(counts.items(), key=lambda kv: kv[1])[0]
+
+
+def _backup_stem(tab_path: Path) -> Optional[Path]:
+    """备份 tab 同 stem 配套文件到临时目录，失败回滚用（大小写不敏感扫描）。"""
+    import tempfile
+    backup_dir = Path(tempfile.mkdtemp(prefix="tab_edit_"))
+    for f in _tab_stem_files(tab_path):
+        if f.exists():
+            shutil.copy2(f, backup_dir / f.name)
+    return backup_dir
+
+
+def _restore_stem(backup_dir: Optional[Path], tab_path: Path) -> None:
+    if not backup_dir or not backup_dir.exists():
+        return
+    remove_tab_stem(tab_path)
+    for f in backup_dir.iterdir():
+        shutil.copy2(f, tab_path.parent / f.name)
+    shutil.rmtree(backup_dir, ignore_errors=True)
+
+
+def _upsert_layer_metadata(layer_id: str, name: str, file_path: str,
+                           geom_value: str, feature_count: int,
+                           file_size: Optional[int], user_id: int,
+                           city: Optional[str] = None,
+                           operator: Optional[str] = None) -> None:
+    """更新（或插入）SQLite layers 表中该图层的元数据。"""
+    from app.core.database import SessionLocal
+    from app.models.database import Layer
+    from datetime import datetime
+    db = SessionLocal()
+    try:
+        row = db.query(Layer).filter(Layer.id == layer_id).first()
+        if row:
+            row.name = name
+            row.file_path = file_path
+            row.geometry_type = geom_value
+            row.layer_type = geom_value
+            row.feature_count = feature_count
+            row.file_size = file_size
+            db.commit()
+        else:
+            db.add(Layer(
+                id=layer_id, user_id=user_id, city=city, operator=operator,
+                name=name, file_path=file_path,
+                layer_type=geom_value, geometry_type=geom_value,
+                feature_count=feature_count, file_size=file_size,
+                created_at=datetime.now().isoformat(),
+            ))
+            db.commit()
+    except Exception as e:
+        db.rollback()
+        print(f"[LayerEdit] 图层元数据更新失败（非致命）: {e}")
+    finally:
+        db.close()
+
+
+def _remove_disk_cache(data_dir: Path, layer_id: str) -> None:
+    cache_dir = layer_cache_dir(data_dir)
+    for pat in (f"{layer_id}.geojson", f"{layer_id}.geojson.gz",
+                f"{layer_id}.geojson.gz.tmp", f"{layer_id}.mtime"):
+        p = cache_dir / pat
+        if p.exists():
+            p.unlink(missing_ok=True)
+
+
+def _resolve_layer_target(data_id: str, layer_id: str) -> tuple:
+    """解析图层保存目标：(data_dir, entry, tab_path, entry_type)。
+
+    只支持 MapInfo TAB（MIF/KML 不支持编辑保存）。校验失败抛 ValueError/FileNotFoundError。
+    """
+    data_dir = settings.DATA_DIR / data_id
+    if not data_dir.exists():
+        raise FileNotFoundError(f"数据目录不存在: {data_id}")
+
+    entry = _find_layer_entry(data_dir, layer_id)
+    if entry is None:
+        raise ValueError(f"未找到图层: {layer_id}")
+
+    source_file = entry.get("metadata", {}).get("source_file")
+    tab_path = Path(source_file) if source_file else None
+    if tab_path is None or tab_path.suffix.lower() != ".tab":
+        raise ValueError("仅支持保存 MapInfo TAB 图层（MIF/KML 暂不支持编辑保存）")
+    if not tab_path.exists():
+        raise FileNotFoundError(f"TAB 文件不存在: {tab_path}")
+
+    entry_type = entry.get("type", "point")
+    if not _OGR_GEOM_BY_ENTRY.get(entry_type):
+        raise ValueError(f"未知图层几何类型: {entry_type}")
+    return data_dir, entry, tab_path, entry_type
+
+
+def layer_version(tab_path: Path, layer_id: str) -> str:
+    """图层版本指纹（与图层数据端点 ETag 同构）："<layer_id>-<源文件 mtime>"。"""
+    return f'"{layer_id}-{tab_path.stat().st_mtime}"'
+
+
+def _coerce_column(series: pd.Series, old_dtype: Any) -> pd.Series:
+    """数值列按旧 dtype 收敛（旧列为整型→缺值填 0；浮点→NaN），其余列保持原样。"""
+    if pd.api.types.is_integer_dtype(old_dtype):
+        return pd.to_numeric(series, errors="coerce").fillna(0).astype("int64")
+    if pd.api.types.is_float_dtype(old_dtype):
+        return pd.to_numeric(series, errors="coerce").astype("float64")
+    return series
+
+
+def _write_layer_gdf(*, data_id: str, data_dir: Path, tab_path: Path, layer_id: str,
+                     entry: Dict[str, Any], entry_type: str,
+                     gdf: gpd.GeoDataFrame, geoms: List[Any],
+                     user_id: int) -> Dict[str, Any]:
+    """整层重写 TAB（原子写 + 混合几何降级）+ 校验 + 元数据刷新 + 缓存失效。
+
+    整层保存与增量保存共用此收尾：调用方负责把要素集成为 gdf。
+    """
+    # 实际几何类型：混合（含多种几何）或与图层声明类型不符时，用实际类型写并升级类型
+    entry_type = _resolve_effective_type(entry_type, geoms)
+    ogr_geom = _OGR_GEOM_BY_ENTRY.get(entry_type, "Unknown")
+    entry["type"] = entry_type
+
+    # 原子写（先备份，失败回滚）
+    # GDAL MapInfo 驱动按小写后缀落盘：源文件为大写 .TAB 时改写为小写路径，
+    # 避免"写到 .TAB / 读到 .tab"的路径漂移（保存后读回 404）。
+    if tab_path.suffix != '.tab':
+        tab_path = tab_path.with_suffix('.tab')
+    backup = _backup_stem(tab_path)
+    skipped = 0
+    total_in = len(geoms)
+    try:
+        try:
+            write_mapinfo_tab(gdf, tab_path, geometry_type=ogr_geom)
+            verify_tab_readable(tab_path, len(geoms))
+        except Exception as first_err:
+            # MapInfo TAB 不支持混合几何（如把基站点粘贴到面图层）。此时按占比最高的
+            # 几何类型重写并跳过不匹配的要素，避免整层保存失败导致粘贴结果丢失。
+            if entry_type != "mixed":
+                raise
+            dom = _dominant_kind(geoms)
+            if not dom:
+                raise
+            keep_idx = [i for i, g in enumerate(geoms) if _geom_kind(g) == dom]
+            if not keep_idx:
+                raise
+            print(f"[LayerEdit] 混合几何写入失败（{first_err}），降级为 {dom}，跳过 {len(geoms)-len(keep_idx)} 个不匹配要素")
+            gdf = gdf.iloc[keep_idx].copy()
+            geoms = [geoms[i] for i in keep_idx]
+            entry_type = dom
+            entry["type"] = dom
+            write_mapinfo_tab(gdf, tab_path, geometry_type=_OGR_GEOM_BY_ENTRY.get(dom, "Unknown"))
+            verify_tab_readable(tab_path, len(geoms))
+            skipped = total_in - len(geoms)
+    except Exception:
+        _restore_stem(backup, tab_path)
+        raise
+    finally:
+        if backup and backup.exists():
+            shutil.rmtree(backup, ignore_errors=True)
+
+    # 更新元数据（layers.json / index.json / SQLite）
+    feature_count = len(geoms)
+    total_size = sum(f.stat().st_size for f in data_dir.glob("*") if f.is_file())
+    entry["feature_count"] = feature_count
+    entry.setdefault("metadata", {})["feature_count"] = feature_count
+    entry["metadata"]["source_file"] = str(tab_path)
+
+    layers = []
+    layers_file = data_dir / "layers.json"
+    if layers_file.exists():
+        layers = json.loads(layers_file.read_text(encoding="utf-8"))
+    for i, lyr in enumerate(layers):
+        if lyr.get("id") == layer_id:
+            layers[i] = entry
+            break
+    else:
+        layers.append(entry)
+    layers_file.write_text(json.dumps(layers, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    from app.services.data_service import data_service
+    idx = data_service.index.get(data_id)
+    if idx is not None:
+        idx["size"] = total_size
+        # 图层已更新：同步刷新数据管理列表的"上传时间"时间戳（方案B 语义下
+        # 该条目下载返回的就是最新图层文件，时间戳应反映最后一次保存）
+        idx["uploadDate"] = pd.Timestamp.now().isoformat()
+        idx.setdefault("metadata", {})["layers"] = layers
+        idx["metadata"]["layerCount"] = len(layers)
+        data_service._save_index()
+
+    _upsert_layer_metadata(
+        layer_id=layer_id, name=entry.get("name", tab_path.stem),
+        file_path=str(tab_path), geom_value=entry_type,
+        feature_count=feature_count, file_size=total_size, user_id=user_id,
+        # 组归属继承所属数据条目（图层归数据所在的组所有）
+        city=(idx or {}).get("city"), operator=(idx or {}).get("operator"),
+    )
+
+    # 失效缓存（内存 + 落盘；落盘按源文件 mtime 也会自动失效）
+    clear_layer_cache(data_id)
+    _remove_disk_cache(data_dir, layer_id)
+
+    result = {"success": True, "feature_count": feature_count,
+              # 保存后新的版本指纹（源文件 mtime）：前端据此发起下一次增量保存，无需重新拉取图层数据
+              "version": layer_version(tab_path, layer_id)}
+    if skipped > 0:
+        result["skipped"] = skipped
+        result["warning"] = f"图层不支持混合几何，已跳过 {skipped} 个几何类型不符的要素"
+    return result
+
+
+def save_layer_geojson(data_id: str, layer_id: str, geojson: Dict[str, Any],
+                       user_id: int = 1) -> Dict[str, Any]:
+    """把前端编辑工作集整层重写回 TAB（GCJ02→WGS84，保留旧属性表 schema）。
+
+    Returns:
+        {"success": True, "feature_count": N}
+    """
+    data_dir, entry, tab_path, entry_type = _resolve_layer_target(data_id, layer_id)
+
+    # 1. 读旧 schema（权威）：属性列与 dtype（GBK 失败回退默认编码）。
+    # 只取首行即可（GDAL 按列类型给 dtype），避免大图层保存时整表读取的额外耗时。
+    old = _read_tab_gdf(tab_path, rows=1)
+    attr_cols: List[str] = [c for c in old.columns if c != "geometry"]
+    old_dtypes = {c: old[c].dtype for c in attr_cols}
+    for internal in _INTERNAL_FIELDS:
+        if internal in attr_cols:
+            attr_cols.remove(internal)
+    # 样式持久化列不走通用属性对齐（前端属性里是还原后的内部字段），单独序列化
+    for c in (_STYLE_PERSIST_COL, _META_PERSIST_COL):
+        if c in attr_cols:
+            attr_cols.remove(c)
+
+    # 1.5 扩展粘贴/新要素带来的新属性键（旧 schema 之外的列自动追加）：
+    # 使"基站圈选→粘贴到其他图层"等跨源粘贴的属性不丢失（否则扇区 pci/azimuth 等
+    # 在目标图层旧列中不存在，粘贴后属性全空）。
+    # 绘制样式键不扩展（绘制样式经 NPT_FEATSYM 持久化，写入属性列只会产生垃圾列）。
+    features = geojson.get("features", []) if isinstance(geojson, dict) else []
+    new_cols: List[str] = []
+    seen_cols = set(attr_cols)
+    reserved = set(_INTERNAL_FIELDS) | {_STYLE_PERSIST_COL, _META_PERSIST_COL} | _STYLE_INPUT_KEYS
+    for f in features:
+        props = f.get("properties") or {}
+        for k in props.keys():
+            if k in seen_cols or k in reserved or k.startswith("_"):
+                continue
+            if len(new_cols) >= 200:
+                break
+            seen_cols.add(k)
+            new_cols.append(k)
+    for c in new_cols:
+        attr_cols.append(c)
+        old_dtypes[c] = None
+
+    # 2. 解析要素：GCJ02 → WGS84，几何 + 按列对齐属性
+    # 坐标逆转换与几何构建整层一次批量完成（逐要素调用 numpy / shapely.shape 在大图层下
+    # 开销显著，慢 5-10 倍）；无法数组化的几何（z 值/未知类型）在内部回退通用递归路径，
+    # 解析失败的要素按原逻辑跳过。
+    geom_items: List[Any] = []
+    for f in features:
+        geom = f.get("geometry")
+        if geom and geom.get("coordinates"):
+            geom_items.append((f, geom))
+    built = build_geometries([g for _, g in geom_items], from_wgs84=False)
+
+    geoms = []
+    col_values: Dict[str, list] = {c: [] for c in attr_cols}
+    sym_vals: List[str] = []
+    meta_vals: List[str] = []
+    for (f, _), g in zip(geom_items, built):
+        if g is None or g.is_empty:
+            continue
+        props = f.get("properties") or {}
+        for c in attr_cols:
+            col_values[c].append(
+                _scalarize(props.get(c)) if (c in props and c not in _INTERNAL_FIELDS) else None
+            )
+        # 序列化编辑样式/圆元数据（无则空串占位）
+        es = props.get("_editStyle")
+        sym_vals.append(json.dumps(es, ensure_ascii=False) if isinstance(es, dict) else "")
+        meta = {k: props[k] for k in ("_shape", "_ellipse") if props.get(k) is not None}
+        meta_vals.append(json.dumps(meta, ensure_ascii=False) if meta else "")
+        geoms.append(g)
+
+    # 3. 建新 gdf（列序与旧表一致；数值列按旧 dtype 收敛）
+    data: Dict[str, Any] = {}
+    for c in attr_cols:
+        data[c] = _coerce_column(pd.Series(col_values[c]), old_dtypes.get(c))
+    if not attr_cols:  # 极端兜底：0 列时补默认列（.dat 至少 1 字段）
+        data[_DEFAULT_ATTR_COLUMN] = pd.Series([""] * len(geoms), dtype="object")
+        attr_cols = [_DEFAULT_ATTR_COLUMN]
+
+    # 编辑样式持久化列：任一要素携带时才新增列（旧图层无样式列不受影响）
+    if any(sym_vals):
+        data[_STYLE_PERSIST_COL] = pd.Series(sym_vals, dtype="object")
+    if any(meta_vals):
+        data[_META_PERSIST_COL] = pd.Series(meta_vals, dtype="object")
+
+    geometry = gpd.GeoSeries(geoms, crs="EPSG:4326") if geoms else gpd.GeoSeries([], crs="EPSG:4326")
+    gdf = gpd.GeoDataFrame(data, geometry=geometry, crs="EPSG:4326")
+
+    result = _write_layer_gdf(
+        data_id=data_id, data_dir=data_dir, tab_path=tab_path, layer_id=layer_id,
+        entry=entry, entry_type=entry_type, gdf=gdf, geoms=geoms, user_id=user_id,
+    )
+    result["mode"] = "full"
+    return result

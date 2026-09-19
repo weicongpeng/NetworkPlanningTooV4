@@ -1,13 +1,18 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { X, LogIn, UserPlus, Loader2 } from 'lucide-react'
+import { authApi } from '../services/api'
 import { useAuthStore } from '../store/authStore'
+import type { RegisterOptions } from '@shared/types'
 
 interface LoginModalProps {
   isOpen: boolean
   forceChangePassword?: boolean
   onClose?: () => void
 }
+
+// 运营商兜底清单：注册选项接口不可用时仍可注册
+const FALLBACK_OPERATORS = ['移动', '联通', '电信', '广电']
 
 export function LoginModal({ isOpen, forceChangePassword = false, onClose }: LoginModalProps) {
   const { t } = useTranslation()
@@ -23,6 +28,24 @@ export function LoginModal({ isOpen, forceChangePassword = false, onClose }: Log
   const [error, setError] = useState('')
   const [warning, setWarning] = useState('')
   const [isSubmitting, setIsSubmitting] = useState(false)
+  const [options, setOptions] = useState<RegisterOptions | null>(null)
+  const [optionsError, setOptionsError] = useState(false)
+
+  useEffect(() => {
+    if (!isOpen) return
+    let cancelled = false
+    authApi.getOptions()
+      .then(res => {
+        if (cancelled) return
+        if (res.success && res.data) {
+          setOptions(res.data)
+        } else {
+          setOptionsError(true)
+        }
+      })
+      .catch(() => { if (!cancelled) setOptionsError(true) })
+    return () => { cancelled = true }
+  }, [isOpen])
 
   if (!isOpen) return null
 
@@ -39,6 +62,8 @@ export function LoginModal({ isOpen, forceChangePassword = false, onClose }: Log
       if (username.length < 3) { setError(t('auth.usernameTooShort', '用户名长度至少3位')); return }
       if (password.length < 6) { setError(t('auth.passwordTooShort', '密码长度至少6位')); return }
       if (password !== confirmPassword) { setError(t('auth.passwordMismatch', '两次输入的密码不一致')); return }
+      if (!city) { setError(t('auth.groupRequired', '请选择地市与运营商')); return }
+      if (!operator) { setError(t('auth.groupRequired', '请选择地市与运营商')); return }
     } else {
       if (!username.trim()) { setError('请输入用户名'); return }
       if (!password) { setError('请输入密码'); return }
@@ -59,7 +84,7 @@ export function LoginModal({ isOpen, forceChangePassword = false, onClose }: Log
           onClose?.()
         }
       } else {
-        await register(username.trim(), password, confirmPassword, city || undefined, operator || undefined)
+        await register(username.trim(), password, confirmPassword, city, operator)
         onClose?.()
       }
     } catch (err: any) {
@@ -237,19 +262,22 @@ export function LoginModal({ isOpen, forceChangePassword = false, onClose }: Log
               </div>
               <div>
                 <label className="block text-sm text-muted-foreground mb-1">
-                  {t('auth.city', '地市')}
+                  {t('auth.city', '地市')} <span className="text-red-500">*</span>
                 </label>
-                <input
-                  type="text"
+                <select
                   value={city}
                   onChange={(e) => setCity(e.target.value)}
-                  className="w-full px-3 py-2 bg-background border border-border rounded-lg text-foreground placeholder:text-muted-foreground/50 focus:outline-none focus:ring-2 focus:ring-primary/50"
-                  placeholder={t('auth.cityPlaceholder', '请输入地市名称')}
-                />
+                  className="w-full px-3 py-2 bg-background border border-border rounded-lg text-foreground focus:outline-none focus:ring-2 focus:ring-primary/50"
+                >
+                  <option value="">{t('auth.citySelectPlaceholder', '请选择地市')}</option>
+                  {(options?.cities || []).map(c => (
+                    <option key={c} value={c}>{c}</option>
+                  ))}
+                </select>
               </div>
               <div>
                 <label className="block text-sm text-muted-foreground mb-1">
-                  {t('auth.operator', '运营商')}
+                  {t('auth.operator', '运营商')} <span className="text-red-500">*</span>
                 </label>
                 <select
                   value={operator}
@@ -257,11 +285,13 @@ export function LoginModal({ isOpen, forceChangePassword = false, onClose }: Log
                   className="w-full px-3 py-2 bg-background border border-border rounded-lg text-foreground focus:outline-none focus:ring-2 focus:ring-primary/50"
                 >
                   <option value="">{t('auth.operatorPlaceholder', '请选择运营商')}</option>
-                  <option value="移动">{t('auth.operatorMobile', '移动')}</option>
-                  <option value="电信">{t('auth.operatorTelecom', '电信')}</option>
-                  <option value="联通">{t('auth.operatorUnicom', '联通')}</option>
-                  <option value="广电">{t('auth.operatorBroadcast', '广电')}</option>
+                  {(options?.operators || FALLBACK_OPERATORS).map(op => (
+                    <option key={op} value={op}>{op}</option>
+                  ))}
                 </select>
+                {optionsError && (
+                  <p className="mt-1 text-xs text-amber-500">{t('auth.optionsLoadFailed', '注册选项加载失败，请刷新重试')}</p>
+                )}
               </div>
             </>
           )}
