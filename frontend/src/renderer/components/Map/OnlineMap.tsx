@@ -73,7 +73,8 @@ import { tacDataSyncService } from '../../services/tacDataSyncService'
 import { useMapDataCacheStore } from '../../store/mapDataCacheStore'
 import { useMapStore } from '../../store/mapStore'
 import { useLayerEditStore } from '../../store/layerEditStore'
-import { LayerEditSession } from './LayerEditSession'
+import type { AttributeErrorCode } from '../../store/layerEditStore'
+import { LayerEditSession, type MergeReferenceSource } from './LayerEditSession'
 // TACLegend 已移除，各个页面自己管理对应的图例组件
 
 type MapLayerType = 'satellite' | 'roadmap'
@@ -877,6 +878,25 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
     if (!target) return
     useLayerEditStore.getState().updateFeatureProperties(target.layerId, target.editId, { [key]: value })
   }, [])
+
+  // 属性框新增图层属性字段：写回工作集（字段对全图层生效）后重读要素刷新面板
+  const handleFeatureAddProperty = useCallback((key: string, value: string): AttributeErrorCode | null => {
+    const target = featureEditTargetRef.current
+    if (!target) return 'noWorkspace'
+    const code = useLayerEditStore.getState().addFeatureAttribute(target.layerId, target.editId, key, value)
+    if (code) return code
+    const f = useLayerEditStore.getState().getWorkspace(target.layerId)
+      ?.features.find((x) => x.properties?._editId === target.editId)
+    if (f) {
+      const clean: Record<string, any> = {}
+      for (const [k, v] of Object.entries(f.properties || {})) {
+        if (!k.startsWith('_')) clean[k] = v
+      }
+      // event 传 undefined：面板位置保持不变，只刷新内容
+      showFeatureInfo(clean, undefined, featureTitle, featureSubtitle)
+    }
+    return null
+  }, [showFeatureInfo, featureTitle, featureSubtitle])
 
   // 属性框关闭：同时清空重叠列表缓存（「返回」按钮不再可用）与编辑态要素标识
   const handleFeatureInfoClose = useCallback(() => {
@@ -7379,6 +7399,7 @@ function sectorPointGeometry(f: any): { type: 'Point'; coordinates: [number, num
         onBack={overlapListCacheRef.current ? handleBackToOverlapList : undefined}
         editable={!!featureEditTargetRef.current}
         onPropertyChange={handleFeaturePropertyChange}
+        onAddProperty={handleFeatureAddProperty}
       />
     </>
   )

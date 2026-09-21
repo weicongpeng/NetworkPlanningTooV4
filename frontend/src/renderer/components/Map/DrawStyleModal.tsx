@@ -38,7 +38,14 @@ interface DrawStyleModalProps {
   onClose: () => void
 }
 
-function ColorRow({ label, value, onChange }: { label: string; value: string; onChange: (v: string) => void }) {
+function ColorRow({ label, value, onChange, allowNoFill }: {
+  label: string
+  value: string
+  onChange: (v: string) => void
+  /** 提供"无色"选项（面填充色=镂空仅显示边框） */
+  allowNoFill?: boolean
+}) {
+  const { t } = useTranslation()
   return (
     <div className="flex items-center justify-between gap-2">
       <span className="text-xs text-muted-foreground">{label}</span>
@@ -49,6 +56,23 @@ function ColorRow({ label, value, onChange }: { label: string; value: string; on
           onChange={(e) => onChange(e.target.value)}
           className="w-[78px] px-1.5 py-1 text-xs rounded border border-border bg-background text-foreground outline-none focus:border-primary"
         />
+        {allowNoFill && (
+          <button
+            type="button"
+            onClick={() => onChange('none')}
+            title={t('map.noFillColor') || '无色'}
+            aria-label={t('map.noFillColor') || '无色'}
+            className={`relative w-7 h-7 rounded border-2 overflow-hidden bg-background flex-shrink-0 transition-all ${
+              value === 'none'
+                ? 'border-primary ring-1 ring-primary ring-offset-1'
+                : 'border-border hover:border-muted-foreground/50'
+            }`}
+          >
+            <svg className="absolute inset-0 w-full h-full" viewBox="0 0 24 24" preserveAspectRatio="none">
+              <line x1="3" y1="21" x2="21" y2="3" stroke="#ef4444" strokeWidth="2.5" />
+            </svg>
+          </button>
+        )}
         <input
           type="color"
           value={value && value !== 'none' ? value : '#000000'}
@@ -212,7 +236,7 @@ export default function DrawStyleModal({ open, tab, onClose }: DrawStyleModalPro
                 ))}
               </select>
             </div>
-            <ColorRow label={t('map.fillColor') || '填充色'} value={current.fillColor} onChange={(v) => update({ fillColor: v })} />
+            <ColorRow label={t('map.fillColor') || '填充色'} value={current.fillColor} allowNoFill onChange={(v) => update({ fillColor: v })} />
             <div className="flex items-center justify-between gap-2">
               <span className="text-xs text-muted-foreground">{t('map.fillOpacity') || '填充透明度'}</span>
               <input type="range" min={0} max={100} step={5} value={Math.round(current.fillOpacity * 100)}

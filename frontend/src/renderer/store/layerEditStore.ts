@@ -57,6 +57,38 @@ const MAX_PATCH_CHANGES = 20000
 
 const HISTORY_LIMIT = 100
 
+/**
+ * 用户属性字段名校验保留键（与后端 layer_edit/layer_patch 契约对齐）：
+ * 绘制样式输入键 + 样式持久化列，这些键由样式通道承载，不能作为普通属性列。
+ * 另：'_' 开头一律为内部字段，直接拒绝。
+ */
+const RESERVED_ATTR_KEYS = new Set([
+  'markerColor', 'markerSize', 'markerSymbol', 'markerRadius', 'markerIconPx',
+  'borderColor', 'borderWidth', 'borderDash',
+  'fillColor', 'fillOpacity',
+  'color', 'weight', 'opacity', 'dashArray', 'shape',
+  'NPT_FEATSYM', 'NPT_FEATMETA',
+  '_editId', '_style', '_nptSelectionId',
+])
+
+/** MapInfo TAB 字段名长度上限（传统限制 31 字符） */
+const MAX_ATTR_KEY_LEN = 31
+
+/** 单图层属性列上限（与服务端 _MAX_NEW_COLUMNS 对齐） */
+const MAX_ATTR_COLUMNS = 200
+
+/** addFeatureAttribute 的错误码（UI 层负责翻译） */
+export type AttributeErrorCode =
+  | 'noWorkspace' | 'empty' | 'invalidName' | 'internal' | 'reserved'
+  | 'exists' | 'tooLong' | 'tooMany' | 'noFeature'
+
+/**
+ * MapInfo TAB 合法字段名：字母/下划线/中文开头，后接字母/数字/下划线/中文。
+ * 与后端 layer_service._MAPINFO_INVALID + 数字开头规则对齐
+ * （真实列名原样写入 TAB，非法名会导致表无法打开）。
+ */
+const VALID_ATTR_KEY = /^[A-Za-z_一-鿿][\w一-鿿]*$/
+
 /** 双击要素后需要查看/配置风格的要素快照（编辑态用 editId，非编辑态直接带 geometry） */
 export interface InspectFeature {
   layerId: string
@@ -110,6 +142,13 @@ interface LayerEditState {
   updateFeatureStyle: (layerId: string, editId: string, style: Record<string, any>) => void
   /** 合并写入单个要素的属性（如圆/椭圆 _shape/_ellipse 元数据），仅编辑态要素可用 */
   updateFeatureProperties: (layerId: string, editId: string, patch: Record<string, any>) => void
+  /**
+   * 图层级新增属性字段：工作集所有要素补齐该字段（目标要素填 value，其余填 null），
+   * 仅目标要素标记变更（保存时后端追加表列，未回传要素列值默认空）。一次操作压一条历史。
+   * @returns 错误码（见 AttributeErrorCode）；null 表示成功
+   */
+  addFeatureAttribute: (layerId: string, editId: string, key: string, value: string) => AttributeErrorCode | null
+
   undo: (layerId: string) => boolean
   canUndo: (layerId: string | null | undefined) => boolean
   markSaved: (layerId: string, opts?: { remapRows?: boolean; version?: string | null }) => void
@@ -376,6 +415,52 @@ export const useLayerEditStore = create<LayerEditState>((set, get) => ({
         },
       }
     }),
+
+  addFeatureAttribute: (layerId, editId, key0, value) => {
+    const ws = get().workspaces[layerId]
+    if (!ws) return 'noWorkspace'
+    const key = (key0 || '').trim()
+    if (!key) return 'empty'
+    if (!VALID_ATTR_KEY.test(key)) return 'invalidName'
+    if (key.startsWith('_')) return 'internal'
+    if (RESERVED_ATTR_KEYS.has(key)) return 'reserved'
+    if (key.length > MAX_ATTR_KEY_LEN) return 'tooLong'
+
+    // 图层现有用户字段（任一要素上的非内部键）
+    const existingKeys = new Set<string>()
+    for (const f of ws.features) {
+      for (const k of Object.keys(f.properties || {})) {
+        if (!k.startsWith('_')) existingKeys.add(k)
+      }
+    }
+    if (existingKeys.has(key)) return 'exists'
+    if (existingKeys.size >= MAX_ATTR_COLUMNS) return 'tooMany'
+    // editId 必须命中工作集要素（防脏态/竞态产生幽灵变更）
+    if (!ws.features.some((f) => f.properties?._editId === editId)) return 'noFeature'
+
+    const features = ws.features.map((f) => {
+      const isTarget = f.properties?._editId === editId
+      return {
+        ...f,
+        properties: { ...(f.properties || {}), [key]: isTarget ? value : null },
+      }
+    })
+
+    set({
+      workspaces: {
+        ...get().workspaces,
+        [layerId]: {
+          ...ws,
+          features,
+          dirty: true,
+          changeCount: ws.changeCount + 1,
+          history: pushHistory(ws),
+          changedIds: markChanged(ws, editId),
+        },
+      },
+    })
+    return null
+  },
 
   undo: (layerId) => {
     const ws = get().workspaces[layerId]

@@ -9,10 +9,11 @@
  * - 固定默认尺寸，支持滚动浏览
  */
 import { useState, useEffect, useRef, useCallback } from 'react'
-import { X, ArrowLeft } from 'lucide-react'
+import { X, ArrowLeft, Plus, Check } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import L from 'leaflet'
 import { clampPopupPosition, type MapViewportBounds } from './popupPosition'
+import type { AttributeErrorCode } from '../../store/layerEditStore'
 
 /** 弹窗固定尺寸（内容超出时正文区域纵向滚动） */
 const PANEL_WIDTH = 460
@@ -39,11 +40,47 @@ export interface FeatureInfoPanelProps {
     editable?: boolean
     /** 字段提交回调（失焦/回车触发；由调用方写回编辑工作集，保存工具落盘） */
     onPropertyChange?: (key: string, value: string) => void
+    /**
+     * 新增图层属性字段（字段名 + 值）：字段对图层全部要素生效。
+     * @returns 错误码（调用方校验失败时）；null 表示成功
+     */
+    onAddProperty?: (key: string, value: string) => AttributeErrorCode | null
 }
 
-export function FeatureInfoPanel({ title, subtitle, properties, visible, onClose, onBack, position, viewportBounds, editable, onPropertyChange }: FeatureInfoPanelProps) {
+export function FeatureInfoPanel({ title, subtitle, properties, visible, onClose, onBack, position, viewportBounds, editable, onPropertyChange, onAddProperty }: FeatureInfoPanelProps) {
     const { t } = useTranslation()
     const panelRef = useRef<HTMLDivElement>(null)
+    // 添加属性表单（仅编辑态可用）
+    const [showAddForm, setShowAddForm] = useState(false)
+    const [newKey, setNewKey] = useState('')
+    const [newVal, setNewVal] = useState('')
+    const [addError, setAddError] = useState('')
+    const newKeyRef = useRef<HTMLInputElement>(null)
+
+    // 打开表单时聚焦字段名；切换/关闭要素时收起
+    useEffect(() => {
+        if (showAddForm) newKeyRef.current?.focus()
+    }, [showAddForm])
+    useEffect(() => {
+        if (!visible) return
+        setShowAddForm(false)
+        setNewKey(''); setNewVal(''); setAddError('')
+    }, [visible, properties])
+
+    const resetAddForm = () => {
+        setShowAddForm(false)
+        setNewKey(''); setNewVal(''); setAddError('')
+    }
+
+    const submitAddProperty = () => {
+        if (!onAddProperty) return
+        const code = onAddProperty(newKey, newVal)
+        if (code) {
+            setAddError(t(`map.attrError.${code}`) || code)
+            return
+        }
+        resetAddForm()
+    }
     // 右键复制菜单（面板附属交互，点击它不应触发"点击外部关闭"）
     const contextMenuRef = useRef<HTMLDivElement>(null)
 
@@ -349,6 +386,67 @@ export function FeatureInfoPanel({ title, subtitle, properties, visible, onClose
                             )}
                         </tbody>
                     </table>
+
+                    {/* 新增图层属性字段（编辑态）：字段对图层全部要素生效 */}
+                    {editable && onAddProperty && (
+                        <div className="border-t border-border/60 px-5 py-3">
+                            {showAddForm ? (
+                                <div className="flex flex-col gap-2">
+                                    <div className="flex gap-2">
+                                        <input
+                                            ref={newKeyRef}
+                                            type="text"
+                                            value={newKey}
+                                            onChange={(e) => { setNewKey(e.target.value); setAddError('') }}
+                                            onKeyDown={(e) => {
+                                                if (e.key === 'Enter') { e.preventDefault(); submitAddProperty() }
+                                                else if (e.key === 'Escape') resetAddForm()
+                                            }}
+                                            onClick={(e) => e.stopPropagation()}
+                                            placeholder={t('map.attrNamePlaceholder') || '字段名'}
+                                            className="w-2/5 px-2 py-1.5 text-xs rounded border border-border bg-background text-foreground outline-none focus:border-primary"
+                                        />
+                                        <input
+                                            type="text"
+                                            value={newVal}
+                                            onChange={(e) => { setNewVal(e.target.value); setAddError('') }}
+                                            onKeyDown={(e) => {
+                                                if (e.key === 'Enter') { e.preventDefault(); submitAddProperty() }
+                                                else if (e.key === 'Escape') resetAddForm()
+                                            }}
+                                            onClick={(e) => e.stopPropagation()}
+                                            placeholder={t('map.attrValuePlaceholder') || '值'}
+                                            className="flex-1 px-2 py-1.5 text-xs rounded border border-border bg-background text-foreground outline-none focus:border-primary"
+                                        />
+                                    </div>
+                                    {addError && <span className="text-xs text-red-500">{addError}</span>}
+                                    <div className="flex justify-end gap-2">
+                                        <button
+                                            onClick={(e) => { e.stopPropagation(); resetAddForm() }}
+                                            className="px-2.5 py-1 text-xs rounded border border-border text-muted-foreground hover:bg-muted transition-colors"
+                                        >
+                                            {t('common.cancel') || '取消'}
+                                        </button>
+                                        <button
+                                            onClick={(e) => { e.stopPropagation(); submitAddProperty() }}
+                                            className="px-2.5 py-1 text-xs rounded bg-primary text-primary-foreground hover:opacity-90 transition-opacity flex items-center gap-1"
+                                        >
+                                            <Check size={12} />
+                                            {t('common.confirm') || '确定'}
+                                        </button>
+                                    </div>
+                                </div>
+                            ) : (
+                                <button
+                                    onClick={(e) => { e.stopPropagation(); setShowAddForm(true) }}
+                                    className="w-full py-1.5 text-xs text-primary hover:bg-muted rounded transition-colors flex items-center justify-center gap-1"
+                                >
+                                    <Plus size={13} />
+                                    {t('map.addAttribute') || '添加属性'}
+                                </button>
+                            )}
+                        </div>
+                    )}
                 </div>
 
                 {/* 底部装饰或提示 */}
