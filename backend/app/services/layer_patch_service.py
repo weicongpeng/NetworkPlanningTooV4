@@ -25,11 +25,14 @@ from app.services.layer_edit_service import (
     _STYLE_INPUT_KEYS,
     _STYLE_PERSIST_COL,
     _coerce_column,
+    _geom_kind,
     _read_tab_gdf,
     _resolve_layer_target,
+    _resolve_feature_style,
     _scalarize,
     _write_layer_gdf,
     layer_version,
+    read_tab_native_styles,
 )
 from app.utils.geojson_geometry import build_geometries
 
@@ -97,7 +100,11 @@ def _resolve_delete_rows(deletes: Any, row_count: int) -> List[int]:
 
 
 def _apply_upserts(gdf, upserts: List[Dict[str, Any]], base_dtypes: Dict[str, Any]):
-    """按行写入属性 / 几何；row=None 追加新要素。返回新 gdf（行序：基底→追加）。"""
+    """按行写入属性 / 几何；row=None 追加新要素。
+
+    返回 (新 gdf, 追加行样式)；行序：基底→追加。追加行的 _style（如从其他图层
+    粘贴要素的原生配色）不入 TAB schema，由样式列表带出，避免追加行保存后变黑。
+    """
     update_items = [it for it in upserts if it.get("row") is not None]
     append_items = [it for it in upserts if it.get("row") is None]
 
@@ -134,6 +141,7 @@ def _apply_upserts(gdf, upserts: List[Dict[str, Any]], base_dtypes: Dict[str, An
         if valid:
             gdf.loc[[r for r, _ in valid], "geometry"] = [g for _, g in valid]
 
+    appended_styles: List[Optional[Dict[str, Any]]] = []
     if append_items:
         for col in (_STYLE_PERSIST_COL, _META_PERSIST_COL):
             if col not in gdf.columns:
@@ -143,6 +151,9 @@ def _apply_upserts(gdf, upserts: List[Dict[str, Any]], base_dtypes: Dict[str, An
             if geom is None or geom.is_empty:
                 continue
             props = it.get("properties") or {}
+            # 追加行样式：_editStyle 优先，粘贴要素携带的 _style 兜底
+            appended_styles.append(_resolve_feature_style(
+                _geom_kind(geom), es=props.get("_editStyle"), ns=props.get("_style")))
             style, meta = _style_meta_values(props)
             row: Dict[str, Any] = {col: None for col in gdf.columns if col != "geometry"}
             for col in list(row):
@@ -165,7 +176,7 @@ def _apply_upserts(gdf, upserts: List[Dict[str, Any]], base_dtypes: Dict[str, An
     for col in list(gdf.columns):
         if col != "geometry":
             gdf[col] = _coerce_column(gdf[col], base_dtypes.get(col))
-    return gdf
+    return gdf, appended_styles
 
 
 def _prune_empty_style_columns(gdf):
@@ -196,8 +207,13 @@ def apply_layer_patch(data_id: str, layer_id: str, patch: Dict[str, Any],
     _check_base_version(tab_path, layer_id, base)
 
     # 读取基底（WGS84）：属性列与 dtype 均以文件为准
-    gdf = _read_tab_gdf(tab_path)
-    gdf = gdf[gdf.geometry.notna() & ~gdf.geometry.is_empty].reset_index(drop=True)
+    raw_gdf = _read_tab_gdf(tab_path)
+    valid_mask = raw_gdf.geometry.notna() & ~raw_gdf.geometry.is_empty
+    gdf = raw_gdf[valid_mask].reset_index(drop=True)
+    # 旧 .map 逐要素原生样式（与过滤后的基底行序对齐），未变更要素重写时据此还原配色
+    old_native_styles = read_tab_native_styles(tab_path)
+    if len(old_native_styles) == len(raw_gdf):
+        old_native_styles = [s for s, keep in zip(old_native_styles, valid_mask) if keep]
     if len(gdf) != int(base["count"]):
         raise LayerVersionConflict(
             f"图层要素数已变化（工作集 {base['count']}，文件 {len(gdf)}），本次按整层保存"
@@ -215,9 +231,34 @@ def apply_layer_patch(data_id: str, layer_id: str, patch: Dict[str, Any],
     for col in new_cols:
         gdf[col] = None
 
-    gdf = _apply_upserts(gdf, upserts, base_dtypes)
+    gdf, appended_styles = _apply_upserts(gdf, upserts, base_dtypes)
+
+    # 逐要素样式：
+    # - 基底行：变更要素用 NPT_FEATSYM 中的 _editStyle，其余按旧行序用原生样式兜底
+    # - 追加行：直接用 _apply_upserts 带出的样式（粘贴要素的 _style 不入库，只能由此带出）
+    base_row_count = len(old_native_styles)
+    npt_series = gdf[_STYLE_PERSIST_COL] if _STYLE_PERSIST_COL in gdf.columns else None
+    feature_styles: List[Optional[Dict[str, Any]]] = []
+    for i in range(len(gdf)):
+        if i >= base_row_count:
+            feature_styles.append(appended_styles[i - base_row_count])
+            continue
+        es = None
+        if npt_series is not None:
+            raw = npt_series.iloc[i]
+            if isinstance(raw, str) and raw.strip():
+                try:
+                    parsed = json.loads(raw)
+                    if isinstance(parsed, dict):
+                        es = parsed
+                except Exception:
+                    es = None
+        feature_styles.append(_resolve_feature_style(
+            _geom_kind(gdf.geometry.iloc[i]), es=es, ns=old_native_styles[i]))
 
     if delete_rows:
+        delete_set = set(delete_rows)
+        feature_styles = [s for i, s in enumerate(feature_styles) if i not in delete_set]
         gdf = gdf.drop(index=delete_rows).reset_index(drop=True)
 
     gdf = _prune_empty_style_columns(gdf)
@@ -227,7 +268,7 @@ def apply_layer_patch(data_id: str, layer_id: str, patch: Dict[str, Any],
     result = _write_layer_gdf(
         data_id=data_id, data_dir=data_dir, tab_path=tab_path, layer_id=layer_id,
         entry=entry, entry_type=entry_type, gdf=gdf, geoms=list(gdf.geometry),
-        user_id=user_id,
+        user_id=user_id, feature_styles=feature_styles,
     )
     result["mode"] = "patch"
     result["applied"] = {"upserts": len(upserts), "deletes": len(delete_rows)}

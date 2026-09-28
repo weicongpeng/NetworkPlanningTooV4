@@ -11,16 +11,25 @@
 import json
 import re
 import shutil
+import tempfile
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import geopandas as gpd
 import pandas as pd
+import pyogrio
+from shapely import wkb
 
 from app.core.config import settings
-from app.services.tab_io import write_mapinfo_tab, verify_tab_readable, remove_tab_stem, _tab_stem_files
-from app.services.layer_service import _truncate_bytes
+from app.services.tab_io import (
+    write_mapinfo_tab, verify_tab_readable, remove_tab_stem, _tab_stem_files,
+    build_field_data, _postprocess_tab,
+)
+from app.services.layer_service import (
+    _truncate_bytes, _sanitize_field_name, _dedupe_field_names,
+    hex_to_mapinfo_color, is_no_color, tab_opacity_brush_pattern,
+)
 from app.services.mapinfo_service import (
     GeometryType,
     MapInfoParser,
@@ -28,6 +37,8 @@ from app.services.mapinfo_service import (
     clear_layer_cache,
     layer_cache_dir,
 )
+from app.services.ogr_style_reader import read_feature_style_strings
+from app.services.tab_style_writer import convert_mif_to_tab
 from app.utils.geojson_geometry import build_geometries
 
 # 前端几何类型 → (pyogrio geometry_type, GeometryType 枚举)
@@ -467,10 +478,261 @@ def _coerce_column(series: pd.Series, old_dtype: Any) -> pd.Series:
     return series
 
 
+# ---------------------------------------------------------------------------
+# 逐要素样式：_editStyle（要素样式弹窗/绘制样式）合并 _style（TAB 原生配色）
+# → 带样式 MIF → GDAL 转换为 TAB（样式进 .map 定义表）
+# ---------------------------------------------------------------------------
+
+def _first_not_none(*vals: Any) -> Any:
+    for v in vals:
+        if v is not None:
+            return v
+    return None
+
+
+def _g(d: Optional[Dict[str, Any]], key: str) -> Any:
+    """dict 安全取值：d 不是 dict（如 None/{} 短路场景）时返回 None。"""
+    return d.get(key) if isinstance(d, dict) else None
+
+
+def _dasharray_to_pen_pattern(dash: Any) -> int:
+    """strokeDasharray → MapInfo Pen pattern：2 实线 / 3 虚线 / 4 点线。"""
+    if not dash or not isinstance(dash, str) or dash.strip().lower() in ("", "none"):
+        return 2
+    nums = re.findall(r"[\d.]+", dash)
+    if not nums:
+        return 2
+    return 4 if float(nums[0]) <= 2 else 3
+
+
+def _resolve_feature_style(kind: str, es: Optional[Dict[str, Any]] = None,
+                           ns: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+    """合并要素的编辑样式（优先）与原生样式，输出统一结构；两者皆无返回 None。
+
+    es: properties._editStyle（可能按几何分段存储 {point/line/polygon: {...}}）
+    ns: properties._style（MapInfo/KML 原生样式，键 strokeColor/fillColor/markerColor 等）
+    输出键（按几何类型取用）：
+      point  → markerColor, markerSize
+      line   → strokeColor, strokeWidth, strokeDash, strokeOff
+      polygon → 上述 + fillColor, fillOpacity, fillOff
+    """
+    if isinstance(es, dict):
+        seg = es.get(kind)
+        if isinstance(seg, dict):
+            es = seg
+    else:
+        es = None
+    if not isinstance(ns, dict):
+        ns = None
+
+    out: Dict[str, Any] = {"kind": kind}
+    if kind == "point":
+        out["markerColor"] = _first_not_none(_g(es, "markerColor"),
+                                             _g(ns, "markerColor"),
+                                             _g(ns, "fillColor"))
+        out["markerSize"] = _first_not_none(_g(es, "markerSize"),
+                                            _g(ns, "markerSize"),
+                                            _g(ns, "radius"))
+    elif kind == "line":
+        out["strokeColor"] = _first_not_none(_g(es, "color"),
+                                             _g(ns, "strokeColor"),
+                                             _g(ns, "color"))
+        out["strokeWidth"] = _first_not_none(_g(es, "weight"),
+                                             _g(ns, "strokeWidth"))
+        out["strokeDash"] = _first_not_none(_g(es, "dashArray"),
+                                            _g(ns, "strokeDasharray"))
+        out["strokeOff"] = _g(ns, "stroke") is False or None
+    else:
+        out["strokeColor"] = _first_not_none(_g(es, "borderColor"),
+                                             _g(ns, "strokeColor"))
+        out["strokeWidth"] = _first_not_none(_g(es, "borderWidth"),
+                                             _g(ns, "strokeWidth"))
+        out["strokeDash"] = _first_not_none(_g(es, "borderDash"),
+                                            _g(ns, "strokeDasharray"))
+        out["strokeOff"] = _g(ns, "stroke") is False or None
+        out["fillColor"] = _first_not_none(_g(es, "fillColor"),
+                                           _g(ns, "fillColor"))
+        out["fillOpacity"] = _first_not_none(_g(es, "fillOpacity"),
+                                             _g(ns, "fillOpacity"))
+        # 原生 Brush 图案号（斜线/网格等，仅 _style 有；_editStyle 不表达图案）
+        out["fillPattern"] = _g(ns, "fillPattern")
+        out["fillOff"] = _g(ns, "fill") is False or None
+
+    # 去掉 None 值后判定（kind 不算有效样式信息）
+    if not any(v is not None for k, v in out.items() if k != "kind"):
+        return None
+    return out
+
+
+def _mif_pen_row(st: Dict[str, Any]) -> str:
+    """统一样式 → MIF Pen 行（边框/线）。"""
+    color = st.get("strokeColor")
+    if st.get("strokeOff") or is_no_color(color):
+        return "Pen (1,1,0)"  # pattern 1 = 无边框
+    width = st.get("strokeWidth")
+    try:
+        width = max(1, min(7, int(round(float(width))))) if width is not None else 1
+    except (TypeError, ValueError):
+        width = 1
+    pattern = _dasharray_to_pen_pattern(st.get("strokeDash"))
+    mif_color = hex_to_mapinfo_color(color) if color else None
+    # 非法 hex 返回 None → 回退黑色 0，避免把 "None" 写进 MIF
+    return f"Pen ({width},{pattern},{mif_color if mif_color is not None else 0})"
+
+
+def _feature_mif_rows(st: Dict[str, Any]) -> List[str]:
+    """统一样式 → MIF 样式行（点→Symbol；线→Pen；面→Pen+Brush）。"""
+    kind = st["kind"]
+    if kind == "point":
+        color = st.get("markerColor")
+        mif_color = hex_to_mapinfo_color(color) if color and not is_no_color(color) else None
+        if mif_color is None:
+            # 不写 Symbol；注意 GDAL 会对无 Symbol 的点补默认黑符号（TAB 无法表达"不绘制点"）
+            return []
+        size = st.get("markerSize")
+        try:
+            size = max(3, min(48, int(round(float(size))))) if size is not None else 12
+        except (TypeError, ValueError):
+            size = 12
+        return [f"Symbol (34,{mif_color},{size})"]  # 34 = 实心圆
+
+    rows = [_mif_pen_row(st)]
+    if kind == "polygon":
+        fill = st.get("fillColor")
+        if st.get("fillOff") or is_no_color(fill):
+            rows.append("Brush (1,0)")  # 无填充
+        else:
+            mif_fill = hex_to_mapinfo_color(fill)
+            if mif_fill is not None:
+                pattern = st.get("fillPattern")
+                if isinstance(pattern, int) and pattern > 2:
+                    # 原生图案填充（斜线/网格等）：原样写回图案号，GDAL 转换忠实保留
+                    rows.append(f"Brush ({pattern},{mif_fill})")
+                elif pattern == 2:
+                    rows.append(f"Brush (2,{mif_fill},16777215)")
+                else:
+                    # _editStyle 来源（无图案）：TAB 无 alpha，fillOpacity（CSS 语义，
+                    # 越大越不透明）→ 透明度两档
+                    opacity = st.get("fillOpacity")
+                    transparency = 1.0 - float(opacity) if opacity is not None else None
+                    two_level = tab_opacity_brush_pattern(transparency)
+                    if two_level == 2:
+                        rows.append(f"Brush (2,{mif_fill},16777215)")
+                    else:
+                        rows.append(f"Brush (1,{mif_fill})")
+    return rows
+
+
+# MIF 几何对象起始行（样式行紧跟其坐标数据之后）
+_MIF_GEOM_RE = re.compile(
+    r'^\s*(?:Multiple\s+)?'
+    r'(Point|Line|MultiPoint|MultiLineString|Pline|Region|Arc|Ellipse|Rect|RoundedRect|Collection)\b',
+    re.IGNORECASE,
+)
+_MIF_STYLE_LINE_RE = re.compile(r'^\s*(Pen|Brush|Symbol)\s*\(', re.IGNORECASE)
+
+
+def _inject_mif_styles(text: str, feature_styles: List[Optional[Dict[str, Any]]]) -> str:
+    """把 MIF 中逐要素的默认 Pen/Brush/Symbol 行替换为指定样式（按几何块顺序对应）。
+
+    feature_styles 元素为 None 的要素保留原行；几何块数与样式数不一致时按索引对齐。
+    """
+    lines = text.splitlines()
+    data_idx = next((i for i, ln in enumerate(lines) if ln.strip().lower() == "data"), -1)
+    if data_idx < 0:
+        return text
+    body = lines[data_idx + 1:]
+
+    # 几何块行范围 [start, end)
+    blocks: List[List[int]] = []
+    for i, ln in enumerate(body):
+        if _MIF_GEOM_RE.match(ln):
+            if blocks:
+                blocks[-1][1] = i
+            blocks.append([i, len(body)])
+
+    # MultiPoint / GeometryCollection 会被展开成多个几何块，按块对齐会整体错位：
+    # 显式抛异常让调用方回退普通写入，而不是写出错位文件再等行数校验拦截
+    if len(blocks) != len(feature_styles):
+        raise ValueError(
+            f"MIF 几何块数（{len(blocks)}）与要素样式数（{len(feature_styles)}）不一致，"
+            "疑似 MultiPoint/GeometryCollection 展开，跳过带样式写入")
+
+    # 从后向前替换避免位移
+    for bi in range(len(blocks) - 1, -1, -1):
+        st = feature_styles[bi] if bi < len(feature_styles) else None
+        if st is None:
+            continue
+        s, e = blocks[bi]
+        non_style = [ln for ln in body[s:e] if not _MIF_STYLE_LINE_RE.match(ln)]
+        body[s:e] = non_style + ["    " + r for r in _feature_mif_rows(st)]
+
+    return "\n".join(lines[:data_idx + 1] + body) + "\n"
+
+
+def _write_tmp_mapinfo_mif(gdf: gpd.GeoDataFrame, path: Path, ogr_geom: str) -> None:
+    """写临时 MIF（GBK、f0..fN 占位列名，不做列名恢复），供带样式转换用。"""
+    geom_name = gdf.geometry.name
+    attr_cols = [c for c in gdf.columns if c != geom_name]
+    field_names = [f"f{i}" for i in range(len(attr_cols))]
+    field_data = build_field_data(gdf, attr_cols)
+    geoms_wkb = [wkb.dumps(g) for g in gdf.geometry]
+    pyogrio.raw.write(
+        str(path),
+        geometry=geoms_wkb,
+        field_data=field_data,
+        fields=field_names,
+        geometry_type=ogr_geom,
+        crs="EPSG:4326",
+        driver="MapInfo File",
+        encoding="GBK",
+    )
+
+
+def _write_styled_layer_tab(gdf: gpd.GeoDataFrame, feature_styles: List[Optional[Dict[str, Any]]],
+                            tab_path: Path, ogr_geom: str) -> None:
+    """带逐要素样式写 TAB：临时 MIF（注入 Pen/Brush/Symbol）→ GDAL 转换 → 修 charset/列名。
+
+    任一步失败抛异常，调用方回退无样式普通写入。
+    """
+    tmp_dir = Path(tempfile.mkdtemp(prefix="npt_edit_style_"))
+    try:
+        tmp_mif = tmp_dir / f"{tab_path.stem}.mif"
+        _write_tmp_mapinfo_mif(gdf, tmp_mif, ogr_geom)
+        text = tmp_mif.read_text(encoding="gbk", errors="replace")
+        # pyogrio 写 MIF 固定声明 Charset "Neutral"（无视 encoding 参数），GDAL 会按
+        # UTF-8 解码实际的 GBK 字节，中文属性在转换时损坏 → 改声明为 WindowsSimpChinese。
+        text = re.sub(r'(?im)^Charset "Neutral"',
+                       'Charset "WindowsSimpChinese"', text, count=1)
+        text = _inject_mif_styles(text, feature_styles)
+        tmp_mif.write_text(text, encoding="gbk", errors="replace")
+
+        remove_tab_stem(tab_path)
+        convert_mif_to_tab(tmp_mif, tab_path)
+
+        geom_name = gdf.geometry.name
+        attr_cols = [c for c in gdf.columns if c != geom_name]
+        sanitized = _dedupe_field_names(
+            [_sanitize_field_name(str(c), i) for i, c in enumerate(attr_cols)]
+        )
+        _postprocess_tab(tab_path, sanitized)
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def read_tab_native_styles(tab_path: Path) -> List[Optional[Dict[str, Any]]]:
+    """读取 TAB 逐要素原生样式（旧行序，无样式要素为 None）；读取失败返回空列表。"""
+    raws = read_feature_style_strings(tab_path)
+    if not raws:
+        return []
+    return [MapInfoParser._parse_ogr_style_string(s) if s else None for s in raws]
+
+
 def _write_layer_gdf(*, data_id: str, data_dir: Path, tab_path: Path, layer_id: str,
                      entry: Dict[str, Any], entry_type: str,
                      gdf: gpd.GeoDataFrame, geoms: List[Any],
-                     user_id: int) -> Dict[str, Any]:
+                     user_id: int,
+                     feature_styles: Optional[List[Optional[Dict[str, Any]]]] = None) -> Dict[str, Any]:
     """整层重写 TAB（原子写 + 混合几何降级）+ 校验 + 元数据刷新 + 缓存失效。
 
     整层保存与增量保存共用此收尾：调用方负责把要素集成为 gdf。
@@ -488,9 +750,23 @@ def _write_layer_gdf(*, data_id: str, data_dir: Path, tab_path: Path, layer_id: 
     backup = _backup_stem(tab_path)
     skipped = 0
     total_in = len(geoms)
+    cur_styles = feature_styles
+
+    def _do_write(cur_gdf: gpd.GeoDataFrame, cur_ogr: str,
+                  styles: Optional[List[Optional[Dict[str, Any]]]]) -> None:
+        # 有任一样式信息时走带样式 MIF 中转；转换失败回退普通 pyogrio 写入（数据不丢）
+        if styles and any(s is not None for s in styles):
+            try:
+                _write_styled_layer_tab(cur_gdf, styles, tab_path, cur_ogr)
+                return
+            except Exception as style_err:  # noqa: BLE001 — 样式是增强项
+                print(f"[LayerEdit] 带样式写入失败，回退普通 TAB 写入: {style_err}")
+                remove_tab_stem(tab_path)
+        write_mapinfo_tab(cur_gdf, tab_path, geometry_type=cur_ogr)
+
     try:
         try:
-            write_mapinfo_tab(gdf, tab_path, geometry_type=ogr_geom)
+            _do_write(gdf, ogr_geom, cur_styles)
             verify_tab_readable(tab_path, len(geoms))
         except Exception as first_err:
             # MapInfo TAB 不支持混合几何（如把基站点粘贴到面图层）。此时按占比最高的
@@ -506,9 +782,10 @@ def _write_layer_gdf(*, data_id: str, data_dir: Path, tab_path: Path, layer_id: 
             print(f"[LayerEdit] 混合几何写入失败（{first_err}），降级为 {dom}，跳过 {len(geoms)-len(keep_idx)} 个不匹配要素")
             gdf = gdf.iloc[keep_idx].copy()
             geoms = [geoms[i] for i in keep_idx]
+            cur_styles = [cur_styles[i] if cur_styles else None for i in keep_idx]
             entry_type = dom
             entry["type"] = dom
-            write_mapinfo_tab(gdf, tab_path, geometry_type=_OGR_GEOM_BY_ENTRY.get(dom, "Unknown"))
+            _do_write(gdf, _OGR_GEOM_BY_ENTRY.get(dom, "Unknown"), cur_styles)
             verify_tab_readable(tab_path, len(geoms))
             skipped = total_in - len(geoms)
     except Exception:
@@ -624,6 +901,7 @@ def save_layer_geojson(data_id: str, layer_id: str, geojson: Dict[str, Any],
     built = build_geometries([g for _, g in geom_items], from_wgs84=False)
 
     geoms = []
+    feature_styles: List[Optional[Dict[str, Any]]] = []
     col_values: Dict[str, list] = {c: [] for c in attr_cols}
     sym_vals: List[str] = []
     meta_vals: List[str] = []
@@ -631,6 +909,9 @@ def save_layer_geojson(data_id: str, layer_id: str, geojson: Dict[str, Any],
         if g is None or g.is_empty:
             continue
         props = f.get("properties") or {}
+        # 逐要素样式：编辑样式（_editStyle）优先，原生配色（_style）兜底
+        feature_styles.append(_resolve_feature_style(
+            _geom_kind(g), es=props.get("_editStyle"), ns=props.get("_style")))
         for c in attr_cols:
             col_values[c].append(
                 _scalarize(props.get(c)) if (c in props and c not in _INTERNAL_FIELDS) else None
@@ -662,6 +943,7 @@ def save_layer_geojson(data_id: str, layer_id: str, geojson: Dict[str, Any],
     result = _write_layer_gdf(
         data_id=data_id, data_dir=data_dir, tab_path=tab_path, layer_id=layer_id,
         entry=entry, entry_type=entry_type, gdf=gdf, geoms=geoms, user_id=user_id,
+        feature_styles=feature_styles,
     )
     result["mode"] = "full"
     return result

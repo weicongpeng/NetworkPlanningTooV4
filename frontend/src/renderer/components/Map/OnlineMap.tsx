@@ -21,14 +21,19 @@ import { frequencyColorMapper } from '../../utils/frequencyColors'
 import { mapDataService, RenderSectorData } from '../../services/mapDataService'
 import { CoordinateTransformer } from '../../utils/coordinate'
 import { extractFeatureId } from '../../utils/featureId'
+import { NO_FILL_COLOR } from '../../utils/fieldValue'
+import { cleanUserProperties } from '../../utils/featureProps'
 import { SectorInfoPanel, useSectorInfoPanel } from './SectorInfoPanel'
 import { FeatureInfoPanel, useFeatureInfoPanel } from './FeatureInfoPanel'
+import ExportSelectionDialog from './ExportSelectionDialog'
 import { clampPopupPosition, type MapViewportBounds } from './popupPosition'
+import { resolveHits, type FeatureHitType } from './mapHitTest'
 import { MapInfoLayerManager, MapInfoLayer, MapInfoLayerOptions, LayerGeometryType } from './MapInfoLayer'
 import { GeoDataLayerManager, GeoDataLayer, GeoDataItem } from './GeoDataLayer'
 import type { ThematicSettings, HeatmapSettings } from './LabelSettingsModal'
-import { HeatmapLayerManager, type HeatmapStats } from './HeatmapLayerManager'
-import { reconcileZOrder, ZOrderLayer, orderWithIds, panelRankFromIndex, isLayerSelectable } from './layerZOrder'
+import type { PciRenderStats } from '../../utils/pciModColor'
+import { getSharedHeatmapManager, type HeatmapLayerManager, type HeatmapStats } from './HeatmapLayerManager'
+import { reconcileZOrder, ZOrderLayer, orderWithIds, panelRankFromIndex, topPanelRank, isLayerSelectable } from './layerZOrder'
 import type { LayerOrderMap } from '../../store/mapStore'
 import { layerApi, dataApi } from '../../services/api'
 
@@ -50,7 +55,6 @@ let __sharedMapCache: SharedMapCache = {
 let __sharedHiddenContainer: HTMLDivElement | null = null
 // 模块级共享 ref —— 地图缓存后，事件监听器闭包仍引用旧组件的 useRef 对象
 // 使用模块级对象确保所有组件实例读写同一个 ref，解决跨实例闭包问题
-const __sharedCaptureModeRef: { current: boolean } = { current: false }
 const __sharedMeasureModeRef: { current: boolean } = { current: false }
 const __sharedMeasurePointsRef: { current: Array<{ lng: number; lat: number }> } = { current: [] }
 const __sharedFinishMeasurementRef: { current: (() => void) | null } = { current: null }
@@ -216,6 +220,20 @@ type SelectionTarget =
   | { kind: 'geodata'; layerId: string }
   | { kind: 'decoration' }
 
+/** 装饰图层固定 id（控制面板「图层文件」组内最顶，恒定可见/可选） */
+const DECORATION_LAYER_ID = 'decoration-layer'
+/**
+ * 装饰图层工作集的数据集哨兵：装饰图层没有后端文件，
+ * 用非空哨兵值让各保存/刷新链路可显式识别并跳过（空串会被当 falsy 漏判）。
+ */
+const DECORATION_DATA_ID = '__decoration__'
+/**
+ * "点击/拖动"区分阈值（像素）：非手形工具下地图禁拖，但按住左键拖动后
+ * 浏览器仍会补发 click，按下点到抬起点位移超过该阈值即视为拖动
+ *（拖动不落点、不选中要素），与编辑会话的要素拖动阈值口径一致。
+ */
+const POINTER_DRAG_THRESHOLD_PX = 5
+
 /**
  * 暴露给父组件的方法
  */
@@ -245,8 +263,10 @@ export interface OnlineMapRef {
   setLayerFileLabelVisibility: (fileId: string, visible: boolean, settings: any) => void
   /** 设置图层颜色（图形颜色/透明度/边框宽度/边框颜色） */
   setLayerColorSettings: (fileId: string, settings: { fillColor: string; fillOpacity: number; borderWidth: number; borderColor: string; pointSize?: number }, geometryType?: string) => void
-  /** 设置扇区默认设置（图形透明度/边框宽度；null 恢复默认，仅默认频点配色模式生效） */
-  setSectorColorSettings: (layerId: string, settings: { fillOpacity: number; borderWidth: number } | null) => void
+  /** 设置扇区默认设置（图形透明度/边框宽度/小区PCI渲染；null 恢复默认，频点配色模式生效） */
+  setSectorColorSettings: (layerId: string, settings: { fillOpacity: number; borderWidth: number; pciRenderEnabled?: boolean; pciMod?: 3 | 30 } | null) => void
+  /** 获取扇区PCI模值图例统计（各模值小区数/总数/无PCI数） */
+  getPciRenderStats: (layerId: string) => PciRenderStats | null
   /** 刷新扇区图层颜色（频点自定义配色变化后调用） */
   refreshSectorColors: () => void
   /** 设置专题图层（按属性字段分段配色；null 关闭专题恢复基础配置） */
@@ -273,8 +293,6 @@ export interface OnlineMapRef {
   setFrequencyVisibility: (networkType: 'LTE' | 'NR', frequency: number, visible: boolean) => void
   /** 设置自定义图层可见性 */
   setCustomLayerVisibility: (layerId: string, visible: boolean) => void
-  /** 设置装饰图层可见性 */
-  setDecorationLayerVisibility: (visible: boolean) => void
   /** 设置装饰图层标签可见性 */
   setDecorationLabelVisibility: (visible: boolean) => void
   /** 设置底图可见性 */
@@ -385,6 +403,8 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
   const selectionModeRef = useRef(selectionMode) // 圈选模式Ref
   const captureModeRef = useRef(captureMode) // 抓取模式Ref
   const captureMarkersRef = useRef<Array<any>>([]) // 抓取坐标标记数组
+  // 最近一次左键按下的位置（容器像素）：用于区分"单击"与"按住拖动"（拖动不落点/不选中要素）
+  const pointerDownPointRef = useRef<L.Point | null>(null)
   // 测量预览虚线/标签使用模块级 __sharedShadowLineRef / __sharedShadowLabelRef（见文件顶部说明）
   const measurementFinishTimeRef = useRef<number>(0) // 结束测量时间戳防抖（右键结束后 500ms 内重复触发忽略）
 
@@ -406,10 +426,17 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
   // 编辑态圈选命中的要素数（底部提示条"删除"按钮的显隐与删除数量）
   const [shapeSelectedCount, setShapeSelectedCount] = useState(0)
   const [selectedFeatureCount, setSelectedFeatureCount] = useState(0) // 当前选中要素数（控制导出按钮）
+  // 选中要素导出：命名对话框（确认文件名后再下载）
+  const [exportDialogOpen, setExportDialogOpen] = useState(false)
+  const [exportDefaultName, setExportDefaultName] = useState('')
   const preserveSelectionRef = useRef<boolean>(false) // 同步跟踪保留状态，避免 state 异步更新问题
   const [customLayerVisibility, setCustomLayerVisibilityState] = useState<Record<string, boolean>>({})
   const [decorationLayerVisibility, setDecorationLayerVisibility] = useState<boolean>(decorationLayerVisible)
-  const decorationLayerRef = useRef<L.LayerGroup | null>(null) // 装饰图层引用
+  const decorationLayerRef = useRef<L.LayerGroup | null>(null) // 装饰图层引用（打点/定位标记）
+  // 装饰图层要素显示层（用户在装饰图层绘制的点/线/面；真源是 mapStore.decorationFeatures，
+  // 编辑态由 LayerEditSession 渲染可交互副本，此层摘除）
+  const decorationDisplayRef = useRef<MapInfoLayer | null>(null)
+  const decorationDisplayTokenRef = useRef(0)
   const decorationLabelVisibleRef = useRef<boolean>(decorationLabelVisible ?? false)
 
   // 标记点自定义标签存储
@@ -423,6 +450,9 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
   const editableLayerId = useLayerEditStore((s) => s.editableLayerId)
   const editDrawTool = useLayerEditStore((s) => s.drawTool)
   const editSelectMode = useLayerEditStore((s) => s.selectMode)
+  const editNodeMergeMode = useLayerEditStore((s) => s.nodeMergeMode)
+  // 装饰图层要素（本地持久化，绘制/打点结果）：显示层与圈选命中都读它
+  const decorationFeatures = useMapStore((s) => s.decorationFeatures)
 
   // 选择/拖拽规则（事件回调内读取最新值用 ref）：
   // - 要素选中（点击查属性/信息面板）需"可选"开关打开且激活"选择"工具
@@ -481,15 +511,70 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
         }
         return out
       })
+      // 节点合并参考源：可见 + 非当前编辑层即可（不看"可选"开关——
+      // 需求口径是"打开的不可编辑图层"都可作吸附基准）
+      session.setReferenceSourceProvider((): MergeReferenceSource[] => {
+        const editableId = useLayerEditStore.getState().editableLayerId
+        const out: MergeReferenceSource[] = []
+        // 装饰显示层（用户手绘点线面，恒显）：编辑其他图层时它是最自然的参考基准；
+        // 编辑装饰图层本身时其显示层已被摘除，且这里显式排除
+        const dd = decorationDisplayRef.current
+        if (dd && editableId !== DECORATION_LAYER_ID) {
+          try {
+            const hidden = typeof dd.isVisible === 'function' && !dd.isVisible()
+            const leaf = (dd as any).getLeafletLayer?.()
+            if (!hidden && leaf) {
+              out.push({ id: DECORATION_LAYER_ID, name: dd.getName?.() || DECORATION_LAYER_ID, layer: leaf })
+            }
+          } catch { /* ignore */ }
+        }
+        mapInfoLayerRefsRef.current.forEach(({ mapInfoLayer, leafletLayer }: any) => {
+          const id = (mapInfoLayer as any).id
+          if (!id || id === editableId || !leafletLayer) return
+          if (typeof mapInfoLayer.isVisible === 'function' && !mapInfoLayer.isVisible()) return
+          const file = layerFilesMirrorRef.current.find((f: any) => f.id === id)
+          out.push({ id, name: file?.name || id, layer: leafletLayer })
+        })
+        const geoLayers = geoDataLayerManagerRef.current?.getAllLayers?.() ?? []
+        for (const gl of geoLayers) {
+          try {
+            if (typeof gl.isVisible === 'function' && !gl.isVisible()) continue
+            const leaf = typeof (gl as any).getLeafletLayer === 'function' ? (gl as any).getLeafletLayer() : null
+            if (leaf) out.push({ id: gl.getId(), name: gl.getName?.() || gl.getId(), layer: leaf })
+          } catch { /* ignore */ }
+        }
+        return out
+      })
       ;(session as any).__snapProviderFor = mapInfoLayerRefsRef
     }
     return session
   }, [])
 
+  /**
+   * 节点捕获：把测量/打点等"由 OnlineMap 处理落点"的工具坐标吸附到附近节点。
+   * 未开启捕获或未命中节点时原样返回（命中会显示捕获标记）。
+   */
+  const snapToolLatLng = useCallback((ll: L.LatLng): L.LatLng => {
+    const session = getEditSession()
+    if (!session || !session.isSnapEnabled()) return ll
+    return session.snapLatLng(ll)
+  }, [getEditSession])
+
   // 加载某图层工作集（无则从缓存/接口拉取已转 GCJ02 的 GeoJSON 后 beginEdit）
   const ensureWorkspace = useCallback(async (layerId: string) => {
     const store = useLayerEditStore.getState()
     if (store.getWorkspace(layerId)) return
+    // 装饰图层：无后端文件，工作集从 localStorage 持久化要素播种（不请求接口、不打开编辑开关）
+    if (layerId === DECORATION_LAYER_ID) {
+      store.seedWorkspace(
+        DECORATION_LAYER_ID,
+        DECORATION_DATA_ID,
+        'mixed',
+        useMapStore.getState().decorationFeatures ?? [],
+        null,
+      )
+      return
+    }
     const lf = layerFiles.find((f) => f.id === layerId)
     if (!lf || lf.sourceType !== 'mapinfo') return
     // mixed=混合图层（可同时含点/线/面）；point/line/polygon=单一几何
@@ -513,29 +598,30 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
       }
     }
     const features = (geojson?.features || []).map((f: any) => ({ ...f }))
-    // 捕获图层原配色（defaultStyle + 用户颜色设置），供编辑副本上的原要素沿用。
-    // 未配置的键保持 undefined（不发明颜色），编辑会话据此回退到要素自带 _style /
-    // 渲染层默认值，保证打开编辑开关前后图形配色不变。
+    // baseStyle 只承载"用户在图层颜色设置里显式配置过的配色"（与 MapInfoLayer.setStyleOverrides 同口径）。
+    // 不并入图层 defaultStyle：它是"首要素样式/调色板单色"，而 MapInfoLayer 渲染时根本不使用它
+    // （逐要素按自带 _style 各自配色），并入后会无条件覆盖要素 _style，
+    // 表现为"一打开编辑开关整层变成同一种颜色"。
+    // 未配置的键保持 undefined（不发明颜色），编辑会话据此回退到要素自带 _style / 渲染默认值。
     const cs = useMapStore.getState().mapSettings.colorSettingsMap?.[layerId] as any
-    const ds = (lf as any).defaultStyle as any || {}
     const baseStyle = {
       point: {
-        markerColor: cs?.fillColor ?? ds.markerColor,
-        markerSize: ds.markerSize,
+        markerColor: cs?.fillColor,
+        markerRadius: cs?.pointSize,
+        fillOpacity: cs?.fillOpacity,
         borderColor: cs?.borderColor,
       },
       line: {
         // 线色与 setStyleOverrides 约定一致：用户边框色（有效时）优先，其次图形颜色
-        color: cs?.borderColor ?? cs?.fillColor ?? ds.strokeColor ?? ds.color,
-        weight: cs?.borderWidth ?? ds.strokeWidth,
-        opacity: ds.opacity,
-        dashArray: ds.strokeDasharray,
+        color: cs?.borderColor && cs.borderColor !== NO_FILL_COLOR ? cs.borderColor : cs?.fillColor,
+        weight: cs?.borderWidth,
+        opacity: cs?.fillOpacity,
       },
       polygon: {
-        fillColor: cs?.fillColor ?? ds.fillColor ?? ds.strokeColor,
-        fillOpacity: cs?.fillOpacity ?? ds.fillOpacity,
-        borderColor: cs?.borderColor ?? ds.strokeColor,
-        borderWidth: cs?.borderWidth ?? ds.strokeWidth,
+        fillColor: cs?.fillColor,
+        fillOpacity: cs?.fillOpacity,
+        borderColor: cs?.borderColor,
+        borderWidth: cs?.borderWidth,
       },
     }
     useLayerEditStore.getState().beginEdit(
@@ -561,7 +647,10 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
         } else {
           void ensureWorkspace(id).then(() => {
             const ws = useLayerEditStore.getState().getWorkspace(id)
-            if (ws) session.setWorkspace(id)
+            if (ws) {
+              // 装饰图层传显示名（属性框副标题）；其他图层传 null 复位，避免沿用上一个图层的名字
+              session.setWorkspace(id, id === DECORATION_LAYER_ID ? t('map.decorationLayer') : null)
+            }
           })
         }
       }
@@ -570,6 +659,9 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
         else session.startDraw(state.drawTool)
       }
       if (state.selectMode !== prev.selectMode) session.setSelectMode(state.selectMode)
+      // 节点捕获/节点合并：工具栏按钮与键盘共用 store 状态，变化时同步到会话
+      if (state.snapEnabled !== prev.snapEnabled) session.setSnapEnabled(state.snapEnabled)
+      if (state.nodeMergeMode !== prev.nodeMergeMode) session.setNodeMergeMode(state.nodeMergeMode)
       // 当前编辑层工作集要素变化（增删改/撤销/样式）→ 重建编辑层
       const active = state.editableLayerId
       if (active) {
@@ -592,11 +684,31 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
       }
     })
     return () => { unsubEdit(); unsubStyle() }
-  }, [getEditSession, ensureWorkspace])
+  }, [getEditSession, ensureWorkspace, t])
+
+  // 工具互斥：测距/打点/圈选/手形 任一激活时退出节点合并
+  //（store 变化经上方订阅联动会话清理矩形/高亮；反向已由 store.setDrawTool/setSelectMode 覆盖）
+  useEffect(() => {
+    if ((measureMode || captureMode || selectionMode !== 'none' || mapDragTool)
+      && useLayerEditStore.getState().nodeMergeMode) {
+      useLayerEditStore.getState().setNodeMergeMode(false)
+    }
+  }, [measureMode, captureMode, selectionMode, mapDragTool])
+
+  // 节点捕获反馈：测量/打点工具激活时同样显示捕获标记与十字光标（落点吸附在点击分支处理）
+  useEffect(() => {
+    const session = getEditSession()
+    session?.setExternalSnapFeedback(!!measureMode || !!captureMode)
+    // 卸载/切工具时关闭反馈：会话挂在跨页共享地图上，避免捕获标记残留在其他页面
+    return () => { session?.setExternalSnapFeedback(false) }
+  }, [measureMode, captureMode, getEditSession])
 
   // 编辑键盘：Esc 取消绘制 / Backspace 删末点 / Delete 删选中；S 切换节点捕获（不依赖编辑开关）
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      // 导出命名对话框中（输入文件名）不响应地图编辑快捷键，
+      // 否则 Backspace/Delete 会误删圈选选中的要素
+      if (exportDialogOpen) return
       const session = (mapInstanceRef.current as any)?.__nptEditSession as LayerEditSession | undefined
       if (!session) return
       // 键盘 Delete/Backspace 可能触发圈选批量删除，先记下删除前的选中数（供下方同步提示条）
@@ -617,17 +729,18 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
         }
         return
       }
-      // S 键：切换自动捕获节点（英文输入法、无组合键、非输入框聚焦时生效）
+      // S 键：切换自动捕获节点（英文输入法、无组合键、非输入框聚焦时生效）。
+      // 状态以 store 为单一真相源（工具栏"节点捕获"按钮共用），订阅同步到会话。
       if ((e.key === 's' || e.key === 'S') && !e.ctrlKey && !e.metaKey && !e.altKey) {
         const t2 = e.target as HTMLElement | null
         if (t2 && (t2.tagName === 'INPUT' || t2.tagName === 'TEXTAREA' || t2.isContentEditable)) return
-        session.toggleSnapEnabled()
+        useLayerEditStore.getState().toggleSnapEnabled()
         e.preventDefault()
       }
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [t])
+  }, [t, exportDialogOpen])
 
   // 编辑图层可见性联动：勾选/去勾选与地图显示同步（不受"编辑"开关影响）。
   // 去勾选 → 清除编辑会话渲染（工作集保留在 store，未保存更改不丢）；
@@ -636,13 +749,20 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
   const prevEditLayerVisibleRef = useRef<boolean | null>(null)
   useEffect(() => {
     const f = editableLayerId ? layerFiles.find((x) => x.id === editableLayerId) : undefined
-    const visible = editableLayerId ? !!f?.visible : null
+    // 装饰图层不在 layerFiles 中且恒定可见（复选框锁定），不得走"去勾选即清会话"分支
+    const visible = editableLayerId === DECORATION_LAYER_ID
+      ? true
+      : (editableLayerId ? !!f?.visible : null)
     const prev = prevEditLayerVisibleRef.current
     prevEditLayerVisibleRef.current = visible
     if (!editableLayerId || prev === null || prev === visible) return
     const session = getEditSession()
     if (!session) return
     if (!visible) {
+      // 编辑层隐藏时同步退出节点合并（否则 store 开关仍亮、地图交互停在合并态）
+      if (useLayerEditStore.getState().nodeMergeMode) {
+        useLayerEditStore.getState().setNodeMergeMode(false)
+      }
       session.clear()
     } else if (useLayerEditStore.getState().getWorkspace(editableLayerId)) {
       session.setWorkspace(editableLayerId)
@@ -815,12 +935,13 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
   // MapInfo图层对象映射 - 存储图层实例和Leaflet图层引用
   const mapInfoLayerRefsRef = useRef<Map<string, { mapInfoLayer: MapInfoLayer, leafletLayer: L.Layer }>>(new Map())
 
-  // 热力图层管理器（按字段值插值的值热力面），随缓存地图生命周期存在
-  const heatmapManagerRef = useRef<HeatmapLayerManager | null>(null)
-  const getHeatmapManager = (): HeatmapLayerManager => {
-    if (!heatmapManagerRef.current) heatmapManagerRef.current = new HeatmapLayerManager()
-    return heatmapManagerRef.current
-  }
+  // 热力图层管理器（按字段值插值的值热力面）：全局单例，跟随缓存地图存活。
+  // 页面切换时只把覆盖层摘下（detachAll），已渲染栅格/图例统计/边界缓存保留，
+  // 返回地图页可直接挂回，无需重新插值渲染（原来按组件实例创建，返回要完整重算）
+  const getHeatmapManager = (): HeatmapLayerManager => getSharedHeatmapManager()
+  // 以往出现过（并可能创建过热力层）的图层文件 id：
+  // 用于区分"图层被移除"与"页面切换后列表尚未加载"，避免误删跨页保留的热力栅格
+  const prevHeatFileIdsRef = useRef<Set<string>>(new Set())
   // 图层 props 镜像：命令式热力方法（handle 闭包固定）读取最新勾选可见性
   const layerFilesMirrorRef = useRef(layerFiles)
   layerFilesMirrorRef.current = layerFiles
@@ -888,12 +1009,8 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
     const f = useLayerEditStore.getState().getWorkspace(target.layerId)
       ?.features.find((x) => x.properties?._editId === target.editId)
     if (f) {
-      const clean: Record<string, any> = {}
-      for (const [k, v] of Object.entries(f.properties || {})) {
-        if (!k.startsWith('_')) clean[k] = v
-      }
       // event 传 undefined：面板位置保持不变，只刷新内容
-      showFeatureInfo(clean, undefined, featureTitle, featureSubtitle)
+      showFeatureInfo(cleanUserProperties(f.properties), undefined, featureTitle, featureSubtitle)
     }
     return null
   }, [showFeatureInfo, featureTitle, featureSubtitle])
@@ -905,20 +1022,22 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
     hideFeatureInfo()
   }, [hideFeatureInfo])
 
-  // 从属性框返回重叠要素选择列表
+  // 从属性框返回重叠要素选择列表（统一列表含基站与图层要素，两套属性面板共用本缓存）
   const handleBackToOverlapList = useCallback(() => {
     const cache = overlapListCacheRef.current
     if (!cache) return
     overlapListCacheRef.current = null
     featureEditTargetRef.current = null
     hideFeatureInfo()
+    hideSectorInfo()
     setOverlappingFeatures(cache.features)
     setOverlapPosition(cache.position)
-  }, [hideFeatureInfo])
+  }, [hideFeatureInfo, hideSectorInfo])
 
-  // 扇区属性框关闭：同时清空重叠扇区列表缓存（「返回」按钮不再可用）
+  // 扇区属性框关闭：同时清空重叠扇区/统一重叠列表缓存（「返回」按钮不再可用）
   const handleSectorInfoClose = useCallback(() => {
     overlapSectorsCacheRef.current = null
+    overlapListCacheRef.current = null
     hideSectorInfo()
   }, [hideSectorInfo])
 
@@ -1092,6 +1211,17 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
       visible.push({ type: 'mapinfo', panelRank: panelRankFromIndex(idx, mapInfoIds.length), bringToFront: () => entry.mapInfoLayer.bringToFrontForZOrder() })
     })
 
+    // 装饰图层要素显示层：固定在「图层文件」类内最顶（不参与拖拽排序），
+    // rank 仍小于 sector 最低 rank（typeRank 差 1000）
+    const displayLeaf = decorationDisplayRef.current?.getLeafletLayer()
+    if (displayLeaf && mapInstanceRef.current?.hasLayer(displayLeaf)) {
+      visible.push({
+        type: 'mapinfo',
+        panelRank: topPanelRank(mapInfoIds.length),
+        bringToFront: () => decorationDisplayRef.current?.bringToFrontForZOrder(),
+      })
+    }
+
     // 基站（typeRank=3）：优先级最高，类内 LTE/NR 按控制面板顺序
     const sectorIds = orderWithIds(order?.sector, ['lte-sectors', 'nr-sectors'])
     sectorIds.forEach((id, idx) => {
@@ -1106,7 +1236,7 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
     reconcileZOrder(visible)
 
     // 热力层始终压在所有数据图形之上
-    heatmapManagerRef.current?.bringAllToFront()
+    getHeatmapManager().bringAllToFront()
   }, [decorationLayerVisibility, layerVisibility, bringDecorationToFront, geoDataLayerManagerRef, mapInfoLayerRefsRef, lteSectorLayerRef, nrSectorLayerRef])
 
   /**
@@ -1437,11 +1567,6 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
       }))
     },
 
-    setDecorationLayerVisibility: (visible: boolean) => {
-      setDecorationLayerVisibility(visible)
-      reconcileLayerZOrder()
-    },
-
     setDecorationLabelVisibility: (visible: boolean) => {
       console.log('[OnlineMap] setDecorationLabelVisibility called:', visible)
       decorationLabelVisibleRef.current = visible
@@ -1545,7 +1670,7 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
       }
     },
 
-    getHeatmapStats: (layerId) => heatmapManagerRef.current?.getStats(layerId) ?? null,
+    getHeatmapStats: (layerId) => getHeatmapManager().getStats(layerId) ?? null,
 
     replayHeatmapSettings: () => {
       heatOpsRef.current?.replayHeatmaps()
@@ -1566,6 +1691,22 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
         bounds = lteSectorLayerRef.current?.getSectorBounds() ?? null
       } else if (fileId === 'nr-sectors') {
         bounds = nrSectorLayerRef.current?.getSectorBounds() ?? null
+      }
+
+      // 0.5 处理装饰图层：绘制要素（常显显示层；编辑态显示层被摘除，改取编辑会话）
+      // + 打点/定位标记（两者都渲染在装饰图层组内，一起纳入预览范围）
+      if (!bounds && fileId === DECORATION_LAYER_ID) {
+        const collected = L.latLngBounds([])
+        const featureBounds = decorationDisplayRef.current?.getFeaturesBounds()
+          ?? (useLayerEditStore.getState().editableLayerId === DECORATION_LAYER_ID
+            ? getEditSession()?.getFeaturesBounds()
+            : null)
+        if (featureBounds) collected.extend(featureBounds)
+        decorationLayerRef.current?.eachLayer((layer: any) => {
+          const ll = typeof layer.getLatLng === 'function' ? layer.getLatLng() : null
+          if (ll) collected.extend(ll)
+        })
+        if (collected.isValid()) bounds = collected
       }
 
       // 1. 处理 GeoDataLayer（地理化数据）
@@ -1708,6 +1849,15 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
         return lteSectorLayerRef.current?.getThematicStats() ?? null
       } else if (layerId === 'nr-sectors') {
         return nrSectorLayerRef.current?.getThematicStats() ?? null
+      }
+      return null
+    },
+
+    getPciRenderStats: (layerId) => {
+      if (layerId === 'lte-sectors') {
+        return lteSectorLayerRef.current?.getPciRenderStats() ?? null
+      } else if (layerId === 'nr-sectors') {
+        return nrSectorLayerRef.current?.getPciRenderStats() ?? null
       }
       return null
     },
@@ -2442,11 +2592,41 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
   }, [mode])
 
   /**
+   * 记录地图左键按下位置（容器像素）：把"按住拖动"与"单击"区分开
+   *（handleSectorClick / handleMapClick 均据此判断）。非手形工具下地图禁拖，
+   * 浏览器在按住拖动后仍补发 click，不记录按下点就会在拖动结束处误落点（打点）/误选中要素。
+   */
+  useEffect(() => {
+    const map = mapInstanceRef.current
+    if (!map || !isMapInitialized) return
+    const onMouseDown = (e: L.LeafletMouseEvent) => {
+      pointerDownPointRef.current = e.containerPoint
+    }
+    map.on('mousedown', onMouseDown)
+    return () => {
+      map.off('mousedown', onMouseDown)
+      pointerDownPointRef.current = null
+    }
+  }, [isMapInitialized])
+
+  /** 本次左键手势是否为拖动：按下点到 click 位置位移超过阈值（拖动不落点、不选中要素） */
+  const isDragGesture = useCallback((event: L.LeafletMouseEvent): boolean => {
+    const down = pointerDownPointRef.current
+    const up = event?.containerPoint
+    return !!down && !!up && down.distanceTo(up) > POINTER_DRAG_THRESHOLD_PX
+  }, [])
+
+  /**
    * 处理扇区点击事件 - 支持重叠扇区选择
    */
   const handleSectorClick = useCallback((sector: RenderSectorData, event: L.LeafletMouseEvent) => {
     // 测距模式、圈选模式或打点模式下不显示扇区属性
-    if (measureModeRef.current || selectionModeRef.current !== 'none' || captureModeRef.current) return;
+    if (measureModeRef.current || selectionModeRef.current !== 'none' || captureModeRef.current
+      || useLayerEditStore.getState().nodeMergeMode) return;
+
+    // 按住左键拖动不选中基站要素：扇区自身绑定 click 且 stopPropagation（不走地图 click），
+    // 拖动终点落在扇区上时浏览器仍补发 click，需在此同样按位移阈值剔除
+    if (isDragGesture(event)) return
 
     // 选中规则（地图工具页）：
     // - "选择"工具：基站要素仅高亮选中（不弹属性框），纳入统一选中状态（Ctrl+C 复制/清除可用）
@@ -2479,6 +2659,17 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
     const clientX = event.originalEvent.clientX
     const clientY = event.originalEvent.clientY
 
+    // 手形工具（地图工具页"点击查属性"）：统一走命中收集器 —— 基站与图层文件/
+    // 地理化数据/编辑会话要素合并成一个重叠列表，不再弹扇区专用列表。
+    // （经 ref 调用，避免 showHitsAtPoint 成为本回调依赖，触发扇区图层重建）
+    if (modeRef.current === 'default' && mapDragToolRef.current) {
+      if (event.latlng && showHitsAtPointRef.current(event.latlng, clientX, clientY, { ignoreSelectable: true, includeSectors: true })) {
+        if (onSectorClick) onSectorClick(sector)
+        return
+      }
+      // 未命中任何要素（理论上点击扇区必有命中）：继续走下方扇区兜底
+    }
+
     // 从所有可见图层中获取该位置的所有扇区
     const allOverlapping: RenderSectorData[] = []
 
@@ -2507,35 +2698,47 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
     if (onSectorClick) {
       onSectorClick(sector)
     }
-  }, [layerVisibility, onSectorClick, mode])
+  }, [layerVisibility, onSectorClick, mode, isDragGesture])
 
   /**
-   * 收集点击位置穿透命中的所有可见图层要素（地理化数据 + 图层文件）。
+   * 收集点击位置穿透命中的所有可见图层要素（地理化数据 + 图层文件 + 装饰 + 编辑会话；
+   * includeSectors 时含基站扇区）。
    *
    * 不再依赖 Leaflet 把 click 分发给最上层要素（Canvas 渲染器下最上层图层的
    * canvas 会整块吞掉点击，下层图层要素收不到事件——即"图层优先级"），
    * 而是在地图 click 中统一遍历所有可见图层做像素空间精确命中检测：
-   * 面要素只认封闭区域实际包含点击点，边框/包围盒相交不算命中。
+   * 面要素只认封闭区域实际包含点击点，边框/包围盒相交不算命中；
+   * 命中带 direct/border 分级，由 resolveHits 收敛（详见 mapHitTest）。
    * 圈选/点选工具仍使用 getFeaturesInCircle 的包围盒粗检，不受影响。
    */
-  const collectFeatureHits = useCallback((latlng: L.LatLng, ignoreSelectable: boolean = false): OverlappingFeature[] => {
+  const collectFeatureHits = useCallback((
+    latlng: L.LatLng,
+    ignoreSelectable: boolean = false,
+    includeSectors: boolean = false
+  ): OverlappingFeature[] => {
     const map = mapInstanceRef.current
-    const hits: Array<OverlappingFeature & { z: number }> = []
+    const hits: Array<OverlappingFeature & { z: number; hitType: FeatureHitType; distancePx: number }> = []
     const seenProps = new Set<object>()
     const selectable = selectableMapRef.current || {}
-    // 命中优先级 = 图层类别（图层文件 > 地理化数据；基站由 getSelectionTarget 另行处理）
-    // + 类内面板层级（拖拽排序，序号小 = 层级高）
+    // 命中优先级 = 图层类别（编辑会话 -1 > 基站 -0.75 > 装饰 -0.5 > 图层文件 0..n
+    // > 地理化数据 100000+，与视觉层叠一致）+ 类内面板层级（拖拽排序，序号小 = 层级高）
     const order = layerOrderRef.current
     const mapInfoRank = new Map<string, number>()
     orderWithIds(order?.mapinfo, Array.from(mapInfoLayerRefsRef.current.keys())).forEach((id, i) => mapInfoRank.set(id, i))
     const geoLayersAll = geoDataLayerManagerRef.current?.getAllLayers?.() ?? []
     const geoRank = new Map<string, number>()
     orderWithIds(order?.geodata, geoLayersAll.map(gl => gl.getId())).forEach((id, i) => geoRank.set(id, i))
-    const addHit = (ln: string, props: Record<string, any>, geometry: any, z: number, layerId?: string, editId?: string) => {
-      if (!props || seenProps.has(props)) return
-      seenProps.add(props)
+    const addHit = (
+      ln: string, propsRaw: Record<string, any>, geometry: any, z: number,
+      layerId?: string, editId?: string,
+      hitType: FeatureHitType = 'direct', distancePx: number = 0
+    ) => {
+      if (!propsRaw || seenProps.has(propsRaw)) return
+      seenProps.add(propsRaw)
+      // 统一剔除内部字段（_editId/_editStyle/_style 等）：非编辑态与编辑态弹窗内容一致
+      const props = cleanUserProperties(propsRaw)
       // 主行显示要素自身名称（属性内容），图层名仅作副标题/次行
-      hits.push({ layerName: ln, layerId, editId, name: extractFeatureName(props) || ln, properties: props, geometry, z })
+      hits.push({ layerName: ln, layerId, editId, name: extractFeatureName(props) || ln, properties: props, geometry, z, hitType, distancePx })
     }
 
     // 地理化数据图层（GeoDataLayer）—— 默认仅"可选"开关打开的图层参与选中
@@ -2545,7 +2748,7 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
       const ln = layer.getName()
       const z = 100000 + (geoRank.get(layer.getId()) ?? 9999)
       for (const item of layer.getFeaturesAtPoint(latlng)) {
-        addHit(ln, item.properties, (item as any).geometry, z, layer.getId())
+        addHit(ln, item.properties, item.geometry, z, layer.getId(), undefined, item.hitType, item.distancePx)
       }
     })
 
@@ -2558,9 +2761,25 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
         const layerId = (mapInfoLayer as any).id
         const z = (mapInfoRank.get(layerId) ?? 9999)
         for (const f of mapInfoLayer.getFeaturesAtPoint(latlng)) {
-          addHit(ln, f.properties, f.geometry, z, layerId)
+          addHit(ln, f.properties, f.geometry, z, layerId, undefined, f.hitType, f.distancePx)
         }
       })
+    }
+
+    // 装饰图层绘制要素（常显显示层）——视觉在图层文件类内最顶，
+    // z 取 -0.5：高于所有图层文件（0..n）与地理化数据（100000+），低于编辑会话（-1）
+    //（编辑态下显示层已摘除，由下方编辑会话分支收集）
+    if (map) {
+      const display = decorationDisplayRef.current
+      const displayLeaf = display?.getLeafletLayer()
+      if (display && displayLeaf && map.hasLayer(displayLeaf)) {
+        if (ignoreSelectable || isLayerSelectable(selectable, DECORATION_LAYER_ID)) {
+          for (const f of display.getFeaturesAtPoint(latlng)) {
+            // 图层名取显示层实例名（随语言重建），不在本回调里直接使用 t（依赖数组为空会拿到旧语言）
+            addHit(display.getName(), f.properties, f.geometry, -0.5, DECORATION_LAYER_ID, undefined, f.hitType, f.distancePx)
+          }
+        }
+      }
     }
 
     // 编辑会话图层（编辑开关图层：原始渲染层已隐藏，由会话 EDIT_PANE 层渲染）——
@@ -2573,39 +2792,67 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
         const editLn = mapInfoLayerRefsRef.current.get(editableId)?.mapInfoLayer.getName()
           || session.getLayerName()
           || editableId
-        // 属性框不展示编辑器内部字段（_editStyle/_shape/_ellipse 等）；_editId 单独取出供字段编辑写回
+        // _editId 单独取出供字段编辑写回；内部字段由 addHit 统一剔除
         for (const f of session.getFeaturesAtPoint(latlng)) {
-          const clean: Record<string, any> = {}
-          for (const [k, v] of Object.entries(f.properties || {})) {
-            if (k.startsWith('_')) continue
-            clean[k] = v
-          }
-          addHit(editLn, clean, f.geometry, -1, editableId, f.properties?._editId ? String(f.properties._editId) : undefined)
+          addHit(editLn, f.properties, f.geometry, -1, editableId, f.properties?._editId ? String(f.properties._editId) : undefined, f.hitType, f.distancePx)
         }
       }
     }
 
-    // 按图层类别 + 面板层级排序：hits[0] 即层级最高的命中要素
+    // 基站扇区（LTE/NR）—— 手形工具"点击查属性"与图层要素同列一个重叠列表；
+    // 用几何命中（非 DOM elementsFromPoint），编辑态扇区 pointer-events:none 时同样可命中。
+    // 可见性经 ref 读取（与其余来源一致），并叠加 map.hasLayer：热力图替换会摘除渲染层但开关状态仍为 true。
+    if (includeSectors && map) {
+      const visibility = layerVisibilityRef.current
+      const sectorLayers: Array<{ layer: SectorSVGLayer | null; on: boolean }> = [
+        { layer: lteSectorLayerRef.current, on: !!visibility.lte },
+        { layer: nrSectorLayerRef.current, on: !!visibility.nr },
+      ]
+      for (const { layer, on } of sectorLayers) {
+        if (!layer || !on || !map.hasLayer(layer)) continue
+        for (const hit of layer.getSectorsAtLatLng(latlng)) {
+          const s = hit.sector
+          if (!s || seenProps.has(s as any)) continue
+          seenProps.add(s as any)
+          // 扇区条目：主行显示小区 ID、次行显示 小区名 | 制式 | PCI（沿用原重叠扇区列表内容）
+          hits.push({
+            layerName: `${s.name} | ${s.networkType} | PCI: ${s.pci}`,
+            name: String(s.id),
+            properties: s as any,
+            z: -0.75,
+            hitType: hit.hitType,
+            distancePx: hit.distancePx,
+            sector: s,
+          })
+        }
+      }
+    }
+
+    // 穿透收敛：有面填充/点线直接命中时丢弃仅边框容差命中；全是边框命中只留最近的一个
+    const resolved = resolveHits(hits)
+    // 按图层类别 + 面板层级排序：resolved[0] 即层级最高的命中要素
     //（修复"大面积面图层盖过层级更高的小图层"——点击选中不再取决于面积）
-    hits.sort((a, b) => a.z - b.z)
-    return hits
+    resolved.sort((a, b) => a.z - b.z)
+    return resolved
   }, [])
 
   /**
-   * 处理地图点击位置的图层要素：命中多个弹重叠选择菜单，单个直接弹属性框。
-   * 由 handleMapClick 统一调用（要素自身不再绑定 click + stopPropagation）。
+   * 处理地图点击位置的命中要素（手形工具/编辑态"点击查属性"）：命中多个弹重叠
+   * 选择菜单（基站 + 图层文件 + 地理化数据 + 编辑会话要素统一列出），单个直接弹
+   * 对应属性框（扇区 → SectorInfoPanel；要素 → FeatureInfoPanel）。
+   * 由 handleMapClick 与 handleSectorClick 调用（要素自身不再绑定 click + stopPropagation）。
    * @returns 是否命中了要素（命中时调用方应中止后续地图点击处理）
    */
-  const handleFeatureLayersAtPoint = useCallback((
+  const showHitsAtPoint = useCallback((
     latlng: L.LatLng,
     clientX: number,
     clientY: number,
-    ignoreSelectable: boolean = false
+    options: { ignoreSelectable?: boolean; includeSectors?: boolean } = {}
   ): boolean => {
-    const hits = collectFeatureHits(latlng, ignoreSelectable)
+    const hits = collectFeatureHits(latlng, options.ignoreSelectable === true, options.includeSectors === true)
     if (hits.length === 0) return false
 
-    // 关闭可能还开着的扇区重叠选择菜单
+    // 关闭可能还开着的扇区重叠选择菜单（非 default 模式的扇区专用列表）
     setOverlappingSectors([])
 
     if (hits.length > 1) {
@@ -2615,13 +2862,26 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
       setOverlapPosition({ x: clientX, y: clientY })
     } else {
       const h = hits[0]
-      // 编辑会话要素 → 属性框字段可编辑（写回工作集）；其余图层只读
-      featureEditTargetRef.current = h.layerId && h.editId ? { layerId: h.layerId, editId: h.editId } : null
-      // 属性框标题显示要素自身名称，图层名作为副标题
-      showFeatureInfo(h.properties, { originalEvent: { clientX, clientY } } as any, h.name, h.layerName)
+      // 直接命中单个要素（非列表进入）：清除回退缓存，属性框不显示「返回」
+      overlapListCacheRef.current = null
+      if (h.sector) {
+        // 基站扇区 → 扇区属性面板（无字段编辑）
+        featureEditTargetRef.current = null
+        showSectorInfoRef.current(h.sector, { originalEvent: { clientX, clientY } } as any)
+      } else {
+        // 编辑会话要素 → 属性框字段可编辑（写回工作集）；其余图层只读
+        featureEditTargetRef.current = h.layerId && h.editId ? { layerId: h.layerId, editId: h.editId } : null
+        // 属性框标题显示要素自身名称，图层名作为副标题
+        showFeatureInfo(h.properties, { originalEvent: { clientX, clientY } } as any, h.name, h.layerName)
+      }
     }
     return true
   }, [collectFeatureHits, showFeatureInfo])
+
+  // showHitsAtPoint 供 handleSectorClick（定义在前，依赖数组立即求值不能直接引用）经 ref 调用，
+  // 保持 handleSectorClick 引用稳定 —— 它是 createSectorLayers 的依赖，不稳定会导致扇区图层反复重建。
+  const showHitsAtPointRef = useRef(showHitsAtPoint)
+  showHitsAtPointRef.current = showHitsAtPoint
 
   // ===== "选择"工具：点击要素高亮、双击要素弹属性/风格配置（非编辑图层路径）=====
   const selectHighlightRef = useRef<L.GeoJSON | null>(null)
@@ -2698,16 +2958,19 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
     return () => { map.off('dblclick', onDblClick) }
   }, [editSelectMode, collectFeatureHits, highlightFeature])
 
-  // 绘制 / "选择" 激活时禁用双击缩放，避免双击收尾/查属性时地图被放大
+  // 双击缩放与所有工具互斥（手形/选择/绘制/测距/圈选/打点/节点合并）。
+  // 统一在此管理：此前各工具 effect 分散设置，关闭手形时手形 effect 无条件
+  // enable() 并在选择 effect 之后执行，覆盖禁用 → 非编辑态选择工具双击仍放大。
   useEffect(() => {
     const map = mapInstanceRef.current
-    if (!map) return
-    if (editSelectMode || editDrawTool !== 'none') {
-      map.doubleClickZoom.disable()
-    } else if (!measureMode && !mapDragTool && selectionMode === 'none') {
-      map.doubleClickZoom.enable()
-    }
-  }, [editSelectMode, editDrawTool, measureMode, mapDragTool, selectionMode])
+    if (!map || !isMapInitialized) return
+    const blocked = !!mapDragTool || editSelectMode || editDrawTool !== 'none'
+      || !!measureMode || selectionMode !== 'none'
+      || !!captureMode || editNodeMergeMode
+    if (blocked) map.doubleClickZoom.disable()
+    else map.doubleClickZoom.enable()
+  }, [mapDragTool, editSelectMode, editDrawTool, measureMode,
+      selectionMode, captureMode, editNodeMergeMode, isMapInitialized])
 
   // 退出"选择"时清理高亮
   useEffect(() => {
@@ -2786,6 +3049,24 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
   }
 
   /**
+   * 打点标记拖拽开关：仅"选择"工具 + 装饰图层"可选"打开时可拖动（与左键点击弹属性框的
+   * 选中规则一致）。新建标记在创建时按同一规则设定 draggable；本 effect 负责工具/开关
+   * 切换后同步到已有标记（拖动中标签跟随、拖动结束写回 WGS84 见 handleMapClick 内绑定）。
+   */
+  useEffect(() => {
+    if (!isMapInitialized) return
+    const canDrag = editSelectMode && isLayerSelectable(selectableMap, DECORATION_LAYER_ID)
+    captureMarkersRef.current.forEach((marker) => {
+      const dragging = marker.dragging as L.Handler | undefined
+      if (!dragging) return
+      // 装饰图层隐藏时标记无图标元素，enable 会因拖拽目标为空报错
+      const rendered = !!marker._icon
+      if (canDrag && rendered && !dragging.enabled()) dragging.enable()
+      else if (!canDrag && dragging.enabled()) dragging.disable()
+    })
+  }, [editSelectMode, selectableMap, isMapInitialized, decorationLayerVisibility])
+
+  /**
    * 处理地图点击事件
    */
   const handleMapClick = useCallback((event: any) => {
@@ -2793,11 +3074,13 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
     // 平移地图结束后 Leaflet 不派发 click，不会误弹框；未命中要素（点击空白区域）时关闭已打开的弹窗。
     // （注意：此分支必须在最前 —— 手形工具下不进入选择/编辑/打点等任何其他点击逻辑）
     if (mapDragToolRef.current && !measureModeRef.current && selectionModeRef.current === 'none' && event.latlng) {
-      const hit = handleFeatureLayersAtPoint(
+      // includeSectors：编辑开关打开时扇区元素 pointer-events:none 穿透到地图 click，
+      // 这里统一收集基站 + 图层文件 + 地理化数据 + 编辑会话要素，共用一个重叠列表
+      const hit = showHitsAtPoint(
         event.latlng,
         event.originalEvent?.clientX ?? 0,
         event.originalEvent?.clientY ?? 0,
-        true,
+        { ignoreSelectable: true, includeSectors: true },
       )
       if (hit) return
       closeMapPopups()
@@ -2816,6 +3099,8 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
 
     // 抓取模式：获取点击坐标并转换为WGS84，在地图上添加持久化标记
     if (captureMode && onCaptureCoord && mapInstanceRef.current && window.L) {
+      // 按住左键拖动不落点（打点态地图禁拖，浏览器在 mouseup 后仍补发 click）
+      if (isDragGesture(event)) return
       // 检查装饰图层是否启用，未启用则阻止打点
       if (!decorationLayerVisibility) {
         onCaptureBlocked?.()
@@ -2823,8 +3108,10 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
       }
       const L = window.L
       const map = mapInstanceRef.current
-      const gcjLat = event.latlng.lat
-      const gcjLng = event.latlng.lng
+      // 节点捕获：打点落点吸附到附近节点（开启捕获且命中时；先吸附再转 WGS84 存属性）
+      const snapped = snapToolLatLng(event.latlng)
+      const gcjLat = snapped.lat
+      const gcjLng = snapped.lng
       const [wgsLat, wgsLng] = CoordinateTransformer.gcj02ToWgs84(gcjLat, gcjLng)
 
       // 序号：从1开始
@@ -2834,8 +3121,9 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
       // 生成默认标签名（如"打点1"、"打点2"）
       const defaultLabel = `${t('map.capturePoint') || '打点'}${seq}`
 
-      // 创建标记（纯色圆点，无序号）
+      // 创建标记（纯色圆点，无序号）；"选择"工具激活时可直接拖动移位（见下方 drag 事件）
       const marker = L.marker([gcjLat, gcjLng], {
+        draggable: selectModeRef.current && isLayerSelectable(selectableMapRef.current, DECORATION_LAYER_ID),
         icon: L.divIcon({
           html: `<div style="background:#ef4444;width:16px;height:16px;border-radius:50%;display:flex;align-items:center;justify-content:center;border:2px solid #fff;box-shadow:0 1px 4px rgba(0,0,0,0.3);"></div>`,
           className: 'capture-marker',
@@ -2875,6 +3163,11 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
         }
         const labelData = markerLabelsRef.current.get(captureId)
         const currentLabel = labelData?.label || defaultLabel
+        // 经纬度显示值：取属性中的 WGS84 原值（创建/编辑确认时写回），
+        // 保证编辑移动标记后重新打开弹窗显示最新坐标
+        const currentProps = (marker as any).captureProperties
+        const curWgsLng = parseFloat(currentProps?.longitude)
+        const curWgsLat = parseFloat(currentProps?.latitude)
         const inputId = `capture-label-input-${captureId}`
         const lngInputId = `capture-lng-input-${captureId}`
         const latInputId = `capture-lat-input-${captureId}`
@@ -2885,21 +3178,22 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
         const confirmBtnText = t('common.confirm') || '确定'
         const propertiesText = t('map.properties') || '属性'
         const labelNameText = t('map.labelName') || '标签'
-        const longitudeText = t('map.longitude') || '经度'
-        const latitudeText = t('map.latitude') || '纬度'
+        // 输入框值即为存储值：经纬度按 WGS84 标准（内部渲染坐标 GCJ02 在"确定"时换算）
+        const longitudeText = t('map.longitudeWgs84') || '经度(WGS84)'
+        const latitudeText = t('map.latitudeWgs84') || '纬度(WGS84)'
 
         const popupContent = `
           <div style="padding:10px 12px;min-width:280px;background:hsl(var(--popover));color:hsl(var(--popover-foreground));border:1px solid hsl(var(--border));border-radius:8px;font-size:12px;box-shadow:0 4px 12px rgba(0,0,0,0.15);" onclick="event.stopPropagation()">
             <div style="font-size:14px;font-weight:600;margin-bottom:10px;padding-bottom:8px;border-bottom:1px solid hsl(var(--border));color:hsl(var(--foreground));">${propertiesText}</div>
-            <div style="display:grid;grid-template-columns:50px 1fr;gap:8px 12px;align-items:center;line-height:1.6;">
+            <div style="display:grid;grid-template-columns:72px 1fr;gap:8px 12px;align-items:center;line-height:1.6;">
               <span style="color:hsl(var(--muted-foreground));font-size:11px;">${labelNameText}</span>
               <input id="${inputId}" type="text" value="${currentLabel.replace(/"/g, '&quot;')}"
                 style="${inputStyle}" ${inputFocus} />
               <span style="color:hsl(var(--muted-foreground));font-size:11px;">${longitudeText}</span>
-              <input id="${lngInputId}" type="text" value="${wgsLng.toFixed(6)}"
+              <input id="${lngInputId}" type="text" value="${curWgsLng.toFixed(6)}"
                 style="${inputStyle}" ${inputFocus} />
               <span style="color:hsl(var(--muted-foreground));font-size:11px;">${latitudeText}</span>
-              <input id="${latInputId}" type="text" value="${wgsLat.toFixed(6)}"
+              <input id="${latInputId}" type="text" value="${curWgsLat.toFixed(6)}"
                 style="${inputStyle}" ${inputFocus} />
             </div>
             <div style="margin-top:10px;padding-top:8px;border-top:1px solid hsl(var(--border));display:flex;justify-content:flex-end;gap:8px;">
@@ -2928,8 +3222,8 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
               const lngInput = document.getElementById(lngInputId) as HTMLInputElement
               const latInput = document.getElementById(latInputId) as HTMLInputElement
               const labelVal = labelInput?.value.trim() || currentLabel
-              const lngVal = lngInput?.value.trim() || wgsLng.toFixed(6)
-              const latVal = latInput?.value.trim() || wgsLat.toFixed(6)
+              const lngVal = lngInput?.value.trim() || curWgsLng.toFixed(6)
+              const latVal = latInput?.value.trim() || curWgsLat.toFixed(6)
               const allText = `${labelVal}\t${lngVal}\t${latVal}`
               navigator.clipboard.writeText(allText).then(() => {
                 this.textContent = (window as any).__gsdT?.('map.copied') || '已复制'
@@ -2967,25 +3261,14 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
             })
           })
 
-          // 确定按钮事件 — 触发输入保存并关闭弹窗
-          document.querySelectorAll('.capture-popup-white .confirm-btn').forEach(btn => {
-            btn.addEventListener('click', function() {
-              const labelInput = document.getElementById(inputId) as HTMLInputElement
-              labelInput?.focus()
-              labelInput?.blur()  // 触发 blur 事件 → saveLabel
-              const lngInput = document.getElementById(lngInputId) as HTMLInputElement
-              lngInput?.blur()
-              const latInput = document.getElementById(latInputId) as HTMLInputElement
-              latInput?.blur()
-              marker.closePopup()
-            })
-          })
-
-          // 标签输入框保存事件
+          // 输入框引用（每次打开弹窗重新绑定，状态干净）
           const input = document.getElementById(inputId) as HTMLInputElement
+          const lngInput = document.getElementById(lngInputId) as HTMLInputElement | null
+          const latInput = document.getElementById(latInputId) as HTMLInputElement | null
           if (!input) return
 
-          const saveLabel = () => {
+          // 标签应用：写回 markerLabelsRef 与 captureProperties，并刷新标签显示（跟随标记当前位置）
+          const applyLabel = () => {
             const newLabel = input.value.trim() || defaultLabel
             markerLabelsRef.current.set(captureId, {
               id: captureId,
@@ -2997,55 +3280,70 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
               props.name = newLabel
               props.标签 = newLabel
             }
-            updateMarkerLabel(captureId, seq, newLabel, gcjLat, gcjLng)
+            const ll = marker.getLatLng()
+            updateMarkerLabel(captureId, seq, newLabel, ll.lat, ll.lng)
           }
 
-          // 经度输入框保存事件
-          const lngInput = document.getElementById(lngInputId) as HTMLInputElement
-          if (lngInput) {
-            const saveLng = () => {
-              const val = parseFloat(lngInput.value.trim())
-              if (!isNaN(val)) {
-                const props = (marker as any).captureProperties
-                if (props) {
-                  props.longitude = val.toFixed(6)
-                  props.lng = val.toFixed(6)
-                }
-              }
+          /**
+           * 经纬度应用：输入按 WGS84 标准，内部换算 GCJ02 后移动标记与标签，
+           * WGS84 原值写回 captureProperties（圈选/复制读取属性与几何），
+           * 并把地图视图跳转到编辑后的位置（保持当前缩放级别）。
+           * @returns 输入为空/非数字/超范围时返回 false，不改动标记也不跳转
+           */
+          const applyPosition = (): boolean => {
+            const lngRaw = lngInput?.value.trim() ?? ''
+            const latRaw = latInput?.value.trim() ?? ''
+            const nextWgsLng = parseFloat(lngRaw)
+            const nextWgsLat = parseFloat(latRaw)
+            const valid = lngRaw !== '' && latRaw !== ''
+              && Number.isFinite(nextWgsLng) && nextWgsLng >= -180 && nextWgsLng <= 180
+              && Number.isFinite(nextWgsLat) && nextWgsLat >= -90 && nextWgsLat <= 90
+            if (!valid) return false
+
+            // WGS84 → GCJ02（地图渲染坐标系）；属性中始终保留 WGS84 原值
+            const [nextGcjLat, nextGcjLng] = CoordinateTransformer.wgs84ToGcj02(nextWgsLat, nextWgsLng)
+            const props = (marker as any).captureProperties
+            if (props) {
+              props.longitude = nextWgsLng.toFixed(6)
+              props.latitude = nextWgsLat.toFixed(6)
+              props.lng = nextWgsLng.toFixed(6)
+              props.lat = nextWgsLat.toFixed(6)
             }
-            lngInput.addEventListener('blur', saveLng)
-            lngInput.addEventListener('keydown', (e: KeyboardEvent) => {
-              if (e.key === 'Enter') { e.preventDefault(); saveLng(); lngInput.blur() }
-            })
+            marker.setLatLng([nextGcjLat, nextGcjLng])
+            const labelData = markerLabelsRef.current.get(captureId)
+            updateMarkerLabel(captureId, seq, labelData?.label || defaultLabel, nextGcjLat, nextGcjLng)
+            map.flyTo([nextGcjLat, nextGcjLng], map.getZoom(), { duration: 0.6 })
+            return true
           }
 
-          // 纬度输入框保存事件
-          const latInput = document.getElementById(latInputId) as HTMLInputElement
-          if (latInput) {
-            const saveLat = () => {
-              const val = parseFloat(latInput.value.trim())
-              if (!isNaN(val)) {
-                const props = (marker as any).captureProperties
-                if (props) {
-                  props.latitude = val.toFixed(6)
-                  props.lat = val.toFixed(6)
-                }
-              }
+          // 确定：应用标签与经纬度（WGS84→GCJ02），跳转到编辑后的位置并关闭弹窗
+          const confirmEdits = () => {
+            applyLabel()
+            if (!applyPosition()) {
+              alert(t('map.invalidCoordinate') || '经纬度不合法：经度 -180~180，纬度 -90~90')
+              return
             }
-            latInput.addEventListener('blur', saveLat)
-            latInput.addEventListener('keydown', (e: KeyboardEvent) => {
-              if (e.key === 'Enter') { e.preventDefault(); saveLat(); latInput.blur() }
-            })
+            marker.closePopup()
           }
 
-          input.addEventListener('blur', saveLabel)
-          input.addEventListener('keydown', (e: KeyboardEvent) => {
-            if (e.key === 'Enter') {
-              e.preventDefault()
-              saveLabel()
-              input.blur()
-            }
+          document.querySelectorAll('.capture-popup-white .confirm-btn').forEach(btn => {
+            btn.addEventListener('click', confirmEdits)
           })
+
+          // 标签输入框：失焦保存（经纬度仅在"确定"时生效，避免误改位置）
+          input.addEventListener('blur', applyLabel)
+
+          // 三个输入框：回车等同点击"确定"
+          const bindEnterToConfirm = (el: HTMLInputElement | null) => {
+            if (!el) return
+            el.addEventListener('keydown', (e: KeyboardEvent) => {
+              if (e.key === 'Enter') { e.preventDefault(); confirmEdits() }
+            })
+          }
+          bindEnterToConfirm(input)
+          bindEnterToConfirm(lngInput)
+          bindEnterToConfirm(latInput)
+
           input.focus()
           input.select()
         }, 100)
@@ -3055,6 +3353,29 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
       marker.on('contextmenu', (e: L.LeafletMouseEvent) => {
         L.DomEvent.stopPropagation(e)
         L.DomEvent.preventDefault(e)
+      })
+
+      // 拖动移位（仅"选择"工具 + 装饰图层"可选"打开时可用，开关见拖拽同步 effect）：
+      // 拖动中标签跟随圆点，拖动结束按新位置反算 WGS84 写回属性（圈选/复制读到新坐标）
+      marker.on('dragstart', () => {
+        // 关闭可能开着的属性弹窗：其经纬度输入框停留在拖动前的旧值
+        marker.closePopup()
+      })
+      marker.on('drag', () => {
+        markerLabelElementsRef.current.get(captureId)?.setLatLng(marker.getLatLng())
+      })
+      marker.on('dragend', () => {
+        const ll = marker.getLatLng()
+        const [dragWgsLat, dragWgsLng] = CoordinateTransformer.gcj02ToWgs84(ll.lat, ll.lng)
+        const props = (marker as any).captureProperties
+        if (props) {
+          props.longitude = dragWgsLng.toFixed(6)
+          props.latitude = dragWgsLat.toFixed(6)
+          props.lng = dragWgsLng.toFixed(6)
+          props.lat = dragWgsLat.toFixed(6)
+        }
+        const labelData = markerLabelsRef.current.get(captureId)
+        updateMarkerLabel(captureId, seq, labelData?.label || defaultLabel, ll.lat, ll.lng)
       })
 
       captureMarkersRef.current.push(marker)
@@ -3073,6 +3394,9 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
     // "选择"工具：点击要素仅高亮选中（不弹属性框），双击才弹属性/风格配置
     if (useLayerEditStore.getState().selectMode) {
       if (measureMode || !event.latlng) return
+      // 按住左键拖动不选中要素（地图非手形工具禁拖，浏览器在 mouseup 后仍补发 click，
+      // 若按 click 处理会在拖动终点误选中/误清除选中）
+      if (isDragGesture(event)) return
       const hits = collectFeatureHits(event.latlng)
       if (hits.length === 0) {
         clearSelectHighlight()
@@ -3083,15 +3407,15 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
       return
     }
 
-    // 框选模式下不处理地图点击事件
-    if (selectionModeRef.current !== 'none') return
+    // 框选/节点合并模式下不处理地图点击事件（合并模式由编辑会话接管左键）
+    if (selectionModeRef.current !== 'none' || useLayerEditStore.getState().nodeMergeMode) return
 
     // 图层要素点击：穿透所有可见图层（地理化数据 + 图层文件）做精确命中检测，
     // 命中即弹属性框/重叠列表 —— 取消图层堆叠优先级，多图层重叠时统一由重叠列表选择。
     // 测量模式下要素已设为不参与命中、点击穿透到地图，此处跳过以保证测量加点。
     // 选中规则（地图工具页）：需激活"选择"工具（图层"可选"开关在 collectFeatureHits 内过滤）
     if (!measureMode && event.latlng && selectModeRef.current) {
-      const hitFeature = handleFeatureLayersAtPoint(
+      const hitFeature = showHitsAtPoint(
         event.latlng,
         event.originalEvent?.clientX ?? 0,
         event.originalEvent?.clientY ?? 0
@@ -3105,7 +3429,8 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
     if (measureMode && mapInstanceRef.current && leafletRef.current) {
       const L = leafletRef.current
       const map = mapInstanceRef.current
-      const latLng = event.latlng
+      // 节点捕获：测量落点吸附到附近节点（开启捕获且命中时）
+      const latLng = snapToolLatLng(event.latlng)
 
       // 确保测量图层在顶层显示 - 使用overlay pane
       let measurementPane = map.getPane('measurement')
@@ -3186,7 +3511,7 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
         measurementLinesRef.current.push(polyline)
       }
     }
-  }, [measureMode, closeMapPopups, captureMode, onCaptureCoord, handleFeatureLayersAtPoint, collectFeatureHits, clearSelectHighlight, highlightFeature])
+  }, [measureMode, closeMapPopups, captureMode, onCaptureCoord, showHitsAtPoint, collectFeatureHits, clearSelectHighlight, highlightFeature, snapToolLatLng, isDragGesture])
 
   /**
    * 处理地图右键事件：阻止浏览器默认右键菜单；测距模式下单击右键结束当前测量
@@ -3425,6 +3750,9 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
    */
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
+      // 导出命名对话框中（输入文件名）不响应地图快捷键，
+      // 否则 Backspace/Delete 会误删测量点/圈选要素
+      if (exportDialogOpen) return
       if (measureModeRef.current) {
         if (e.key === 'Escape' || e.key === 'Delete') {
           // Esc / Delete：清除测量轨迹与打点标记，测量工具不退出（退出需切换其他工具）
@@ -3507,7 +3835,7 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
     }
     window.addEventListener('keydown', handleKeyDown)
     return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [onMeasureModeEnd, onSelectionModeEnd])
+  }, [onMeasureModeEnd, onSelectionModeEnd, exportDialogOpen])
 
   /**
    * 当测量模式改变时，清除历史数据
@@ -3617,15 +3945,25 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
     const manager = getHeatmapManager()
     const enabled = !!(settings?.enabled && settings.field)
 
-    // 用户勾选真值（props 镜像，避免固定闭包读到旧 state）
-    const userVisible = [...layerFilesMirrorRef.current, ...pointFilesMirrorRef.current]
-      .some(f => f.id === fileId && f.visible)
+    // 用户勾选真值（props 镜像，避免固定闭包读到旧 state）；
+    // 同时区分"在列表中但未勾选"与"列表尚未加载完成"（页面切换后图层列表异步加载，此间为空）
+    const files = [...layerFilesMirrorRef.current, ...pointFilesMirrorRef.current]
+    const inFileList = files.some(f => f.id === fileId)
+    const userVisible = files.some(f => f.id === fileId && f.visible)
     // 编辑态图层的原始渲染层由既有 effect 强制隐藏（编辑会话层渲染工作集），不可被此处恢复
     const editing = useLayerEditStore.getState().editableLayerId === fileId
     const suppress = !!(settings?.enabled && settings.field && !settings.showOriginal)
 
-    // 用户取消勾选 → 热力一并移除；勾选且启用 → 取点渲染
-    if (userVisible && enabled && settings) {
+    if (!enabled) {
+      // 关闭热力 → 移除栅格
+      manager.remove(fileId)
+    } else if (settings && inFileList && !userVisible) {
+      // 用户取消勾选该图层 → 热力一并移除
+      manager.remove(fileId)
+    } else if (settings && !inFileList) {
+      // 图层列表尚未加载完成：保持现状（既不删也不挂），避免误删跨页面保留的栅格；
+      // 图层被真正删除时由文件列表兜底清理回收，列表就绪后的重放会正常挂回
+    } else if (settings) {
       const layer = findDataLayerInstance(fileId)
       if (layer) {
         // 取点/渲染异常不得影响后续原图层显隐校正（替换模式必须保证原图形被隐藏）
@@ -3634,9 +3972,11 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
         } catch (e) {
           console.error('[OnlineMap] 热力渲染失败:', fileId, e)
         }
+      } else {
+        // 图层实例尚未构建完成（页面切换后异步重建中）：先用已保留的栅格挂回，
+        // 不等重算即可显示；实例就绪后的重放会按新数据校正/重算
+        manager.restore(fileId, settings)
       }
-    } else {
-      manager.remove(fileId)
     }
 
     // 原图形显隐 = 用户勾选 && 非替换模式 && 非编辑态
@@ -3663,14 +4003,20 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
       ? layerVisibilityRef.current.lte
       : layerVisibilityRef.current.nr
     const suppress = !!(settings?.enabled && settings.field && !settings.showOriginal)
+    const wantHeat = !!(userVisible && enabled && settings)
     // 用户取消制式总开关 → 热力一并移除
-    if (map && sectorLayer && userVisible && enabled && settings) {
-      try {
-        manager.apply(map, layerId, sectorLayer.getHeatPoints(settings.field), settings)
-      } catch (e) {
-        console.error('[OnlineMap] 扇区热力渲染失败:', layerId, e)
+    if (wantHeat && settings && map) {
+      if (sectorLayer) {
+        try {
+          manager.apply(map, layerId, sectorLayer.getHeatPoints(settings.field), settings)
+        } catch (e) {
+          console.error('[OnlineMap] 扇区热力渲染失败:', layerId, e)
+        }
+      } else {
+        // 扇区渲染器尚未重建完成（页面切换后异步重建中）：先用已保留的栅格挂回
+        manager.restore(layerId, settings)
       }
-    } else {
+    } else if (!wantHeat) {
       manager.remove(layerId)
     }
     if (map && sectorLayer) {
@@ -3711,7 +4057,11 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
       const ms = useMapStore.getState().mapSettings
       const color = ms.colorSettingsMap?.[layerId]
       if (color) {
-        layer.setColorOverrides({ fillOpacity: color.fillOpacity, borderWidth: color.borderWidth })
+        layer.setColorOverrides({
+          fillOpacity: color.fillOpacity,
+          borderWidth: color.borderWidth,
+          ...(color.pciRenderEnabled ? { pciRenderEnabled: true, pciMod: color.pciMod ?? 3 } : {})
+        })
       }
       const thematic = ms.thematicSettingsMap?.[layerId]
       if (thematic) {
@@ -4518,6 +4868,8 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
           // 重置光标为默认，避免上一页面遗留的手型/十字光标
           cached.map.getContainer().style.cursor = ''
           cached.map.dragging.enable()
+          // 安全：无条件恢复后，统一双击缩放 effect 会在 isMapInitialized
+          // 置真时重跑，按当前工具态重新断言 disable/enable
           cached.map.doubleClickZoom.enable()
 
           // 确保缓存的瓦片图层有 load 事件监听（首次初始化时通过 mapLayerType 变化添加）
@@ -4594,18 +4946,19 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
         map.getContainer().style.cursor = 'default'
 
         // 添加测量模式下的十字光标和预览线（使用模块级共享 ref）
+        // 打点模式不强制十字光标：保持传统箭头光标（命中节点时的吸附反馈十字由编辑会话负责）
         map.on('mousemove', (e: L.LeafletMouseEvent) => {
-          if (__sharedCaptureModeRef.current) {
-            map.getContainer().style.cursor = 'crosshair'
-            return
-          }
           if (__sharedMeasureModeRef.current) {
             map.getContainer().style.cursor = 'crosshair'
 
             // 如果已经有至少一个点，显示跟随鼠标的虚线
             if (__sharedMeasurePointsRef.current.length > 0) {
               const lastPoint = __sharedMeasurePointsRef.current[__sharedMeasurePointsRef.current.length - 1]
-              const mouseLatLng = e.latlng
+              // 节点捕获开启时：预览线端点与落点一致吸附到附近节点（与点击落点同口径）
+              const editSession = (map as any).__nptEditSession as LayerEditSession | undefined
+              const mouseLatLng = editSession?.isSnapEnabled?.() && editSession.snapLatLng
+                ? editSession.snapLatLng(e.latlng)
+                : e.latlng
 
               // 更新虚线
               if (__sharedShadowLineRef.current) {
@@ -4847,8 +5200,9 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
         }
         loadedMapInfoLayersRef.current.clear()
         mapInfoLayerRefsRef.current.clear()
-        // 热力 canvas 绑定当前地图实例，随地图清理一并移除（重放由各图层 effect 完成）
-        heatmapManagerRef.current?.removeAll(map)
+        // 热力覆盖层随地图实例被缓存复用：这里只把覆盖层摘下（保留栅格/统计/边界缓存），
+        // 返回地图页时由重放直接挂回，避免重新插值渲染（慢）与图例统计丢失
+        getHeatmapManager().detachAll(map)
 
         // 兜底：确保所有数据图层实例从地图移除（即使 manager.clear 有遗漏/抛错）
         __mapDataLayerInstances.forEach(layer => {
@@ -4877,6 +5231,11 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
         if (decorationLayerRef.current) {
           try { map.removeLayer(decorationLayerRef.current) } catch (e) { /* ignore */ }
           decorationLayerRef.current = null
+        }
+        // 装饰图层要素显示层（绘制要素，跨页共享地图需清除）
+        if (decorationDisplayRef.current) {
+          try { decorationDisplayRef.current.remove(map) } catch (e) { /* ignore */ }
+          decorationDisplayRef.current = null
         }
 
         // 4. 清理测距痕迹（线条、标记、预览线），避免跨页面残留
@@ -5038,20 +5397,18 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
     undoLastPointRef.current = undoLastPoint
     measureModeRef.current = measureMode
     // 同步模块级共享 ref（地图事件监听器通过它们访问最新状态）
-    __sharedCaptureModeRef.current = captureMode
     __sharedMeasureModeRef.current = measureMode
     __sharedMeasurePointsRef.current = measurePoints
     __sharedFinishMeasurementRef.current = finishMeasurement
     __sharedHandleMapClickRef.current = handleMapClick
-  }, [handleMapClick, measurePoints, finishMeasurement, measureMode, captureMode])
+  }, [handleMapClick, measurePoints, finishMeasurement, measureMode])
 
   useEffect(() => {
     if (mapInstanceRef.current) {
       const map = mapInstanceRef.current
       if (measureMode) {
         map.getContainer().style.cursor = 'crosshair'
-        // 拖拽规则：仅手形工具可拖动地图（测距态不再额外放开拖拽）
-        map.doubleClickZoom.disable() // 测距模式下禁用双击缩放（结束测量改用右键，避免双击误加点/缩放）
+        // 拖拽规则：仅手形工具可拖动地图（测距态不再额外放开拖拽；双击缩放由统一 effect 管理）
 
         // 通知扇区图层进入测距模式，禁用扇区点击
         if (lteSectorLayerRef.current) {
@@ -5067,11 +5424,12 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
         mapInfoLayerRefsRef.current.forEach(({ mapInfoLayer }) => {
           mapInfoLayer.setMeasureMode(true)
         })
+        // 装饰图层显示层（绘制要素）在测距时同样穿透，避免落在装饰图形上的点击无法加点
+        decorationDisplayRef.current?.setMeasureMode(true)
       } else {
         // 非测距模式：恢复默认光标（mapDragTool 为 true 时由单独 useEffect 的 CSS class 接管）
         map.getContainer().style.cursor = ''
-        // 拖拽规则由手形工具统一管理，此处不再放开
-        map.doubleClickZoom.enable()
+        // 拖拽规则由手形工具统一管理，此处不再放开；双击缩放由统一 effect 管理
 
         // 通知扇区图层退出测距模式，恢复扇区点击
         if (lteSectorLayerRef.current) {
@@ -5086,6 +5444,7 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
         mapInfoLayerRefsRef.current.forEach(({ mapInfoLayer }) => {
           mapInfoLayer.setMeasureMode(false)
         })
+        decorationDisplayRef.current?.setMeasureMode(false)
       }
     }
   }, [measureMode, mapDragTool])
@@ -5109,7 +5468,6 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
       const container = map.getContainer()
       if (mapDragTool) {
         map.dragging.enable()
-        map.doubleClickZoom.disable()
         // 使用 CSS class + !important 覆盖 Leaflet 内部光标重置，确保始终显示手形
         container.classList.add('map-drag-active')
         // 清除可能残留的 inline cursor（CSS class 的 !important 会接管）
@@ -5123,6 +5481,8 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
         mapInfoLayerRefsRef.current.forEach(({ mapInfoLayer }) => {
           mapInfoLayer.setInteractive(false)
         })
+        // 装饰图层显示层（绘制要素）同步禁用
+        decorationDisplayRef.current?.setInteractive(false)
 
         // 禁用 GeoDataLayer 的点击交互
         if (geoDataLayerManagerRef.current) {
@@ -5134,9 +5494,6 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
         container.style.cursor = ''
         // 拖拽规则：仅手形工具可拖动地图 —— 关闭手形工具后恢复禁拖（applyDraggingPolicy 统一处理）
         map.dragging.disable()
-        if (!measureMode) {
-          map.doubleClickZoom.enable()
-        }
 
         // 恢复扇区图层的悬停提示和点击交互
         if (lteSectorLayerRef.current) lteSectorLayerRef.current.updateSelectionMode(false)
@@ -5149,6 +5506,8 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
           mapInfoLayerRefsRef.current.forEach(({ mapInfoLayer }) => {
             mapInfoLayer.setInteractive(true)
           })
+          // 装饰图层显示层（绘制要素）同步恢复
+          decorationDisplayRef.current?.setInteractive(true)
 
           // 恢复 GeoDataLayer 的点击交互
           if (geoDataLayerManagerRef.current) {
@@ -5176,7 +5535,7 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
   }, [
     mapDragTool, mode, isMapInitialized,
     measureMode, captureMode, selectionMode,
-    editableLayerId, editSelectMode, editDrawTool,
+    editableLayerId, editSelectMode, editDrawTool, editNodeMergeMode,
   ])
 
   // 手形工具激活状态同步到编辑会话：手形工具激活时禁用"按住要素拖动移位"（拖动地图优先）
@@ -5449,6 +5808,30 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
   }, [])
 
   /**
+   * 装饰图层绘制要素参与圈选收集（仅装饰图层为圈选目标时）。
+   * 从常显显示层（MapInfoLayer）按圆/多边形命中取要素，附 _geometry 供复制→粘贴；
+   * 编辑态下装饰要素由 copyEditSessionInShape 另行收集，两条链路互不影响。
+   */
+  const collectDecorationDisplayFeatures = useCallback((
+    target: SelectionTarget | null,
+    query: { kind: 'circle'; center: L.LatLng; radius: number } | { kind: 'polygon'; polygon: L.Polygon },
+    newIds: Set<string>,
+    newProperties: any[],
+  ) => {
+    if (target?.kind !== 'decoration') return
+    const display = decorationDisplayRef.current
+    if (!display || !display.isVisible()) return
+    const items = query.kind === 'circle'
+      ? display.getFeaturesInCircle(query.center, query.radius)
+      : display.getFeaturesInPolygon(query.polygon)
+    items.forEach(item => {
+      if (!item.id) return
+      newIds.add(String(item.id))
+      newProperties.push({ ...item.properties, _layerType: 'Decoration', _geometry: (item as any).geometry })
+    })
+  }, [])
+
+  /**
    * 圆形选择：选择圆内的所有要素
    * @param center 圆心 (GCJ-02渲染坐标)
    * @param radius 半径 (米)
@@ -5557,6 +5940,9 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
       }
     })
 
+    // 6. 装饰图层绘制要素（点/线/面；带几何，供复制→粘贴到其他可编辑图层）
+    collectDecorationDisplayFeatures(target, { kind: 'circle', center, radius }, newIds, newProperties)
+
     // 合并选中状态（多选时叠加，单选时替换）
     let selectedIds: Set<string>
     let selectedProperties: any[]
@@ -5585,6 +5971,9 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
     mapInfoLayerRefsRef.current.forEach(({ mapInfoLayer }) => {
       mapInfoLayer.setSelectionHighlight(selectedIds)
     })
+
+    // 对装饰图层绘制要素应用高亮
+    decorationDisplayRef.current?.setSelectionHighlight(selectedIds)
 
     // 对GeoDataLayer应用高亮
     if (geoDataLayerManagerRef.current) {
@@ -5733,6 +6122,9 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
       }
     })
 
+    // 6. 装饰图层绘制要素（点/线/面；带几何，供复制→粘贴到其他可编辑图层）
+    collectDecorationDisplayFeatures(target, { kind: 'polygon', polygon }, newIds, newProperties)
+
     // 合并选中状态（多选时叠加，单选时替换）
     let selectedIds: Set<string>
     let selectedProperties: any[]
@@ -5761,6 +6153,9 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
     mapInfoLayerRefsRef.current.forEach(({ mapInfoLayer }) => {
       mapInfoLayer.setSelectionHighlight(selectedIds)
     })
+
+    // 对装饰图层绘制要素应用高亮
+    decorationDisplayRef.current?.setSelectionHighlight(selectedIds)
 
     // 对GeoDataLayer应用高亮
     if (geoDataLayerManagerRef.current) {
@@ -5915,6 +6310,9 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
       }
     })
 
+    // 6. 装饰图层绘制要素（点/线/面；带几何，供复制→粘贴到其他可编辑图层）
+    collectDecorationDisplayFeatures(target, { kind: 'polygon', polygon }, newIds, newProperties)
+
     // 合并选中状态（多选时叠加，单选时替换）
     let selectedIds: Set<string>
     let selectedProperties: any[]
@@ -5942,6 +6340,8 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
     mapInfoLayerRefsRef.current.forEach(({ mapInfoLayer }) => {
       mapInfoLayer.setSelectionHighlight(selectedIds)
     })
+    // 对装饰图层绘制要素应用高亮
+    decorationDisplayRef.current?.setSelectionHighlight(selectedIds)
     // 对GeoDataLayer应用高亮
     if (geoDataLayerManagerRef.current) {
       geoDataLayerManagerRef.current.getAllLayers().forEach(geoLayer => {
@@ -6010,20 +6410,39 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
   }
 
   /**
+   * 生成选中要素导出的默认文件名：选中要素_YYYYMMDD_HHmmss.xlsx
+   */
+  const buildSelectionExportName = () => {
+    const now = new Date()
+    const pad = (n: number) => String(n).padStart(2, '0')
+    const stamp = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`
+    return `${t('map.selectedFeatures') || '选中要素'}_${stamp}.xlsx`
+  }
+
+  /**
+   * 底部"导出"按钮：打开命名对话框，由用户确认文件名后再导出
+   */
+  const openSelectionExportDialog = () => {
+    if (selectedFeaturesRef.current.length === 0) return
+    setExportDefaultName(buildSelectionExportName())
+    setExportDialogOpen(true)
+  }
+
+  /**
    * 将选中要素导出为 Excel 文件（.xlsx）并触发浏览器下载
    * @param properties 属性列表
+   * @param fileName 用户在导出对话框中确认的文件名（含 .xlsx）
    */
-  const exportSelectionToExcel = (properties: any[]) => {
+  const exportSelectionToExcel = (properties: any[], fileName: string) => {
     const aoa = featuresToAoa(properties)
     if (aoa.length === 0) return
     const ws = XLSX.utils.aoa_to_sheet(aoa)
     const wb = XLSX.utils.book_new()
-    XLSX.utils.book_append_sheet(wb, ws, t('map.selectedFeatures') || '选中要素')
-    const now = new Date()
-    const pad = (n: number) => String(n).padStart(2, '0')
-    const stamp = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`
-    XLSX.writeFile(wb, `${t('map.selectedFeatures') || '选中要素'}_${stamp}.xlsx`)
-    console.log('[OnlineMap] 选中要素已导出 Excel，数量:', properties.length)
+    // sheet 名与文件名一致（去扩展名；去掉 Excel 非法字符，最长 31 字符）
+    const sheetName = fileName.replace(/\.[^.]+$/, '').replace(/[\\/?*[\]:]/g, '_').slice(0, 31) || 'Sheet1'
+    XLSX.utils.book_append_sheet(wb, ws, sheetName)
+    XLSX.writeFile(wb, fileName)
+    console.log('[OnlineMap] 选中要素已导出 Excel，数量:', properties.length, '文件名:', fileName)
   }
 
   /**
@@ -6108,8 +6527,9 @@ function sectorPointGeometry(f: any): { type: 'Point'; coordinates: [number, num
         // 净化属性：去掉内部字段，非标量（如扇区 attributes 嵌套对象）转字符串，
         // 保证粘贴后的要素可正常写入 TAB 属性表。
         // 例外：_editStyle/_shape/_ellipse 是编辑要素的样式/形态元数据（保存管线消费），
-        // 原样保留（对象不字符串化），否则粘贴后丢失配色与圆形态
-        const EDIT_META_KEYS = new Set(['_editStyle', '_shape', '_ellipse'])
+        // _style 是要素原生配色（TAB .map 样式），均原样保留（对象不字符串化），
+        // 否则粘贴后丢失配色与圆形态（粘贴要素保存后会变黑）
+        const EDIT_META_KEYS = new Set(['_editStyle', '_shape', '_ellipse', '_style'])
         const cleanProps: Record<string, any> = {}
         for (const [k, v] of Object.entries(props || {})) {
           if (v === undefined || typeof v === 'function') continue
@@ -6165,7 +6585,7 @@ function sectorPointGeometry(f: any): { type: 'Point'; coordinates: [number, num
     const items = session.selectInShape(shape)
     if (items.length === 0) return
     useLayerEditStore.getState().copyToClipboard(items)
-    // 同步到底部提示条的数据源：让"复制"/"导出 Excel"按钮与"删除"按钮一并显示
+    // 同步到底部提示条的数据源：让"复制"/"导出"按钮与"删除"按钮一并显示
     // 保留完整属性（含 _editStyle/_shape/_ellipse 等内部键，保证复制→粘贴后样式/圆形态不丢），
     // 内部键不会进入 Excel 表（featuresToAoa 排除 _ 前缀键）
     selectedFeaturesRef.current = items.map(it => ({
@@ -6204,7 +6624,8 @@ function sectorPointGeometry(f: any): { type: 'Point'; coordinates: [number, num
    * 监听圈选模式变化 - 控制地图拖拽和交互
    */
   useEffect(() => {
-    const isSelectionActive = selectionMode !== 'none'
+    // 节点合并模式与圈选模式同等门控：禁用底图平移/双击缩放/数据层点击（会话内部实现拖框）
+    const isSelectionActive = selectionMode !== 'none' || editNodeMergeMode
     if (lteSectorLayerRef.current) lteSectorLayerRef.current.updateSelectionMode(isSelectionActive)
     if (nrSectorLayerRef.current) nrSectorLayerRef.current.updateSelectionMode(isSelectionActive)
 
@@ -6218,6 +6639,8 @@ function sectorPointGeometry(f: any): { type: 'Point'; coordinates: [number, num
       if (geoDataLayerManagerRef.current) {
         geoDataLayerManagerRef.current.setInteractive(!isSelectionActive)
       }
+      // 装饰显示层与图层文件口径一致：圈选/节点合并激活时禁用 hover/点击交互
+      decorationDisplayRef.current?.setMeasureMode(isSelectionActive)
     }
 
     if (mapInstanceRef.current) {
@@ -6226,8 +6649,8 @@ function sectorPointGeometry(f: any): { type: 'Point'; coordinates: [number, num
         // 框选模式下禁用地图拖拽，确保鼠标操作仅服务于选择功能
         // 但保留滚轮缩放功能，方便用户在选择时调整地图视角
         map.dragging.disable()
-        map.doubleClickZoom.disable() // 圈选时禁用双击放大
         map.boxZoom.disable() // 禁用Shift+拖拽框选缩放，防止与多边形/框选Shift多选冲突
+        // 双击缩放由统一 effect 管理（圈选时禁用）
         // 根据模式设置提示
         if (selectionMode === 'point') {
           setSelectionTip('点击选择要素，或按住鼠标拖拽绘制矩形批量选择，按 Ctrl+C 复制')
@@ -6242,14 +6665,15 @@ function sectorPointGeometry(f: any): { type: 'Point'; coordinates: [number, num
         // 退出框选模式时，恢复地图交互
         // 注意：选中状态和图形的清除逻辑在另一个useEffect中处理
         // 拖拽规则：仅"手形"工具可拖动地图 —— 此处不得 enable（否则退出圈选后无需手形即可平移）
-        map.doubleClickZoom.enable()
+        // 双击缩放由统一 effect 管理
         map.boxZoom.enable()
         map.scrollWheelZoom.enable()
-        // 恢复光标样式（mapDragTool 为 true 时由单独 useEffect 的 CSS class 接管）
+        // 恢复光标样式（mapDragTool 为 true 时由单独 useEffect 的 CSS class 接管；
+        // 节点合并的十字光标由会话 setNodeMergeMode 自行管理）
         map.getContainer().style.cursor = ''
       }
     }
-  }, [selectionMode, measureMode])
+  }, [selectionMode, measureMode, editNodeMergeMode])
 
   /**
    * 监听框选模式的鼠标事件
@@ -6900,12 +7324,16 @@ function sectorPointGeometry(f: any): { type: 'Point'; coordinates: [number, num
       }
 
       // GeoDataLayer 不经过上面的 MapInfo 映射：按文件列表兜底清理已卸载图层的热力层
-      // （扇区图层 id 除外，其生命周期由 createSectorLayers 管理）
+      // （扇区图层 id 除外，其生命周期由 createSectorLayers 管理）。
+      // 注意不能用"当前列表不含即删除"：页面切换后首次挂载时图层列表尚未加载（为空），
+      // 会把跨页面保留的热力栅格误删；只清理由上一轮存在、本轮消失的图层。
       for (const heatId of getHeatmapManager().getLayerIds()) {
-        if (heatId !== 'lte-sectors' && heatId !== 'nr-sectors' && !currentLayerIds.has(heatId)) {
+        if (heatId === 'lte-sectors' || heatId === 'nr-sectors') continue
+        if (prevHeatFileIdsRef.current.has(heatId) && !currentLayerIds.has(heatId)) {
           getHeatmapManager().remove(heatId)
         }
       }
+      for (const id of currentLayerIds) prevHeatFileIdsRef.current.add(id)
 
       // 加载新图层（等待加载完成后再更新可见性）
       await loadMapInfoLayers();
@@ -7180,6 +7608,67 @@ function sectorPointGeometry(f: any): { type: 'Point'; coordinates: [number, num
   }, [decorationLayerVisibility])
 
   /**
+   * 装饰图层要素显示层：把 mapStore.decorationFeatures（用户绘制的点/线/面，GCJ02）
+   * 渲染为常显图层。复用 MapInfoLayer（混合几何 + 要素级 _editStyle + 标签 + canvas 置顶）。
+   * - 编辑态（editableLayerId === 装饰图层）：摘除显示层，由 LayerEditSession 渲染可交互副本；
+   * - 无要素：不建层（避免空实例参与点击命中）。
+   */
+  useEffect(() => {
+    const map = mapInstanceRef.current
+    if (!isMapInitialized || !map) return
+    const token = ++decorationDisplayTokenRef.current
+    const features = decorationFeatures ?? []
+
+    const removeDisplay = () => {
+      if (decorationDisplayRef.current) {
+        try { decorationDisplayRef.current.remove(map) } catch { /* ignore */ }
+        decorationDisplayRef.current = null
+      }
+    }
+
+    if (editableLayerId === DECORATION_LAYER_ID || features.length === 0) {
+      removeDisplay()
+      reconcileLayerZOrder()
+      return
+    }
+
+    void (async () => {
+      const collection: GeoJSON.FeatureCollection = {
+        type: 'FeatureCollection',
+        // 只取几何与属性（内部键 _editId/_editStyle 等原样保留：样式还原依赖 _editStyle）
+        features: features.map((f) => ({
+          type: 'Feature',
+          properties: f.properties || {},
+          geometry: f.geometry,
+        })) as any,
+      }
+      const layer = await MapInfoLayer.fromGeoJSON({
+        id: DECORATION_LAYER_ID,
+        name: t('map.decorationLayer'),
+        // 仅类型声明：渲染按要素几何（装饰图层为混合几何）
+        type: 'point',
+        data: collection,
+        dataId: DECORATION_DATA_ID,
+        visible: true,
+        labelManager: labelLayoutManagerRef.current || __sharedMapCache.labelManager || undefined,
+      })
+      // 过期构建（要素/编辑态已变化）→ 清理自身，避免挂在共享地图上
+      if (token !== decorationDisplayTokenRef.current || unmountedRef.current) {
+        try { layer.remove(map) } catch { /* ignore */ }
+        return
+      }
+      removeDisplay()
+      layer.addTo(map)
+      // 新建实例需按当前工具态对齐穿透/交互状态：测距/拖拽态下装饰要素不拦截地图点击
+      layer.setMeasureMode(measureModeRef.current)
+      layer.setInteractive(!mapDragToolRef.current && !measureModeRef.current)
+      layer.setLabelVisibility(!!decorationLabelVisible)
+      decorationDisplayRef.current = layer
+      reconcileLayerZOrder()
+    })()
+  }, [isMapInitialized, decorationFeatures, editableLayerId, decorationLabelVisible, t, reconcileLayerZOrder, unmountedRef])
+
+  /**
    * 当图层可见性变化时更新
    */
   useEffect(() => {
@@ -7243,12 +7732,15 @@ function sectorPointGeometry(f: any): { type: 'Point'; coordinates: [number, num
         onDismiss={() => setNetworkError({ ...networkError, visible: false })}
       />
 
-      {/* 扇区属性信息面板 - 渲染在地图容器之外，避免受地图事件影响 */}
+      {/* 扇区属性信息面板 - 渲染在地图容器之外，避免受地图事件影响。
+          「返回」回到重叠列表：统一列表（基站 + 图层要素）优先，其次非 default 模式的扇区专用列表 */}
       <SectorInfoPanel
         sector={selectedSector}
         visible={panelVisible}
         onClose={handleSectorInfoClose}
-        onBack={overlapSectorsCacheRef.current ? handleBackToOverlapSectors : undefined}
+        onBack={overlapListCacheRef.current ? handleBackToOverlapList
+          : overlapSectorsCacheRef.current ? handleBackToOverlapSectors
+            : undefined}
         position={clickPosition}
         viewportBounds={popupViewportBounds}
         onMouseEnter={onPanelMouseEnter}
@@ -7301,12 +7793,12 @@ function sectorPointGeometry(f: any): { type: 'Point'; coordinates: [number, num
             {selectedFeatureCount > 0 && (
               <button
                 type="button"
-                onClick={() => exportSelectionToExcel(selectedFeaturesRef.current)}
-                title={t('map.exportExcel') || '导出 Excel'}
+                onClick={openSelectionExportDialog}
+                title={t('map.exportAction') || '导出'}
                 className="flex items-center gap-1 bg-white text-blue-600 text-sm font-medium px-2.5 py-1 rounded-md hover:bg-blue-50 active:bg-blue-100 transition-colors"
               >
                 <FileSpreadsheet size={14} />
-                {t('map.exportExcel') || '导出 Excel'}
+                {t('map.exportAction') || '导出'}
               </button>
             )}
             {/* 编辑态圈选：删除选中要素（Delete/Backspace 同效） */}
@@ -7353,7 +7845,7 @@ function sectorPointGeometry(f: any): { type: 'Point'; coordinates: [number, num
         />
       )}
 
-      {/* 重叠要素（图层文件/地理化数据）选择菜单 */}
+      {/* 统一重叠要素选择菜单（基站 + 图层文件 + 地理化数据 + 编辑会话要素） */}
       {overlappingFeatures.length > 0 && overlapPosition && (
         <OverlappingFeaturesMenu
           features={overlappingFeatures}
@@ -7365,16 +7857,27 @@ function sectorPointGeometry(f: any): { type: 'Point'; coordinates: [number, num
               features: overlappingFeatures,
               position: overlapPosition
             }
-            // 选中的是编辑会话要素 → 属性框字段可编辑（写回工作集）
-            featureEditTargetRef.current = feature.layerId && feature.editId
-              ? { layerId: feature.layerId, editId: feature.editId }
-              : null
-            showFeatureInfo(feature.properties, {
-              originalEvent: {
-                clientX: overlapPosition.x,
-                clientY: overlapPosition.y
-              }
-            } as any, feature.name, feature.layerName)
+            if (feature.sector) {
+              // 基站扇区：弹扇区属性面板（字段只读）
+              featureEditTargetRef.current = null
+              showSectorInfo(feature.sector, {
+                originalEvent: {
+                  clientX: overlapPosition.x,
+                  clientY: overlapPosition.y
+                }
+              } as any)
+            } else {
+              // 选中的是编辑会话要素 → 属性框字段可编辑（写回工作集）
+              featureEditTargetRef.current = feature.layerId && feature.editId
+                ? { layerId: feature.layerId, editId: feature.editId }
+                : null
+              showFeatureInfo(feature.properties, {
+                originalEvent: {
+                  clientX: overlapPosition.x,
+                  clientY: overlapPosition.y
+                }
+              } as any, feature.name, feature.layerName)
+            }
             setOverlappingFeatures([])
             setOverlapPosition(null)
           }}
@@ -7400,6 +7903,14 @@ function sectorPointGeometry(f: any): { type: 'Point'; coordinates: [number, num
         editable={!!featureEditTargetRef.current}
         onPropertyChange={handleFeaturePropertyChange}
         onAddProperty={handleFeatureAddProperty}
+      />
+
+      {/* 选中要素导出：命名确认对话框（确认文件名后再下载） */}
+      <ExportSelectionDialog
+        open={exportDialogOpen}
+        defaultName={exportDefaultName}
+        onClose={() => setExportDialogOpen(false)}
+        onConfirm={(fileName) => exportSelectionToExcel(selectedFeaturesRef.current, fileName)}
       />
     </>
   )
@@ -7569,7 +8080,7 @@ function extractFeatureName(properties: Record<string, any> | null | undefined):
 }
 
 /**
- * 重叠要素（图层文件/地理化数据）
+ * 重叠要素（基站扇区 / 图层文件 / 地理化数据 / 编辑会话要素）
  */
 interface OverlappingFeature {
   /** 所属图层名称 */
@@ -7584,11 +8095,14 @@ interface OverlappingFeature {
   properties: Record<string, any>
   /** 要素几何（"选择"工具下用于面积/长度/节点数统计） */
   geometry?: { type: string; coordinates: any } | null
+  /** 基站扇区命中（统一重叠列表项判别：有值时选中后弹 SectorInfoPanel 而非要素面板） */
+  sector?: RenderSectorData
 }
 
 /**
  * 重叠要素选择菜单组件
- * 点击位置命中多个图层文件/地理化数据要素时弹出，供用户选择查看哪个要素
+ * 点击位置命中多个要素（基站扇区 / 图层文件 / 地理化数据 / 编辑会话要素）时弹出，
+ * 供用户选择查看哪个要素（扇区条目按频点色块 + 小区 ID + 小区名/制式/PCI 渲染）
  */
 function OverlappingFeaturesMenu({ features, position, viewportBounds, onSelect, onClose }: {
   features: OverlappingFeature[],
@@ -7672,7 +8186,7 @@ function OverlappingFeaturesMenu({ features, position, viewportBounds, onSelect,
       <div style={{ maxHeight: '300px', overflowY: 'auto' }}>
         {features.map((feature, idx) => (
           <div
-            key={`${feature.layerName}-${idx}`}
+            key={feature.sector ? `sector-${idx}-${feature.sector.id}` : `${feature.layerName}-${idx}`}
             style={{
               padding: '10px 12px',
               cursor: 'pointer',
@@ -7686,7 +8200,17 @@ function OverlappingFeaturesMenu({ features, position, viewportBounds, onSelect,
             onMouseLeave={(e) => (e.currentTarget.style.backgroundColor = 'transparent')}
             onClick={() => onSelect(feature)}
           >
-            <div style={{
+            <div style={feature.sector ? {
+              // 基站扇区：方块 + 频点配色（沿用原重叠扇区列表标识）
+              width: '10px',
+              height: '10px',
+              borderRadius: '2px',
+              backgroundColor: feature.sector.frequency
+                ? frequencyColorMapper.getColor(feature.sector.frequency, feature.sector.networkType).color || '#ccc'
+                : '#ccc',
+              border: '1px solid hsl(var(--border))',
+              flexShrink: 0
+            } : {
               width: '10px',
               height: '10px',
               borderRadius: '50%',

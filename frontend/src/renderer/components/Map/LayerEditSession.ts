@@ -20,15 +20,73 @@ import { useLayerEditStore, type CopiedFeature } from '../../store/layerEditStor
 import { useMapStore } from '../../store/mapStore'
 import type { DrawTool } from '@shared/types'
 import { resolvePointShape } from './MapInfoLayer'
+import { layerHitAt, CLICK_HIT_TOLERANCE_PX, type FeatureHitType } from './mapHitTest'
+import { buildLineArrows } from './lineArrows'
 import { getFieldValue, matchThematicColor, NO_FILL_COLOR } from '../../utils/fieldValue'
 import type { ThematicSettings } from './LabelSettingsModal'
+import {
+  analyzeRingInRect,
+  alignRingToReference,
+  insideSegmentPoints,
+  type MMPoint,
+  type MMRect,
+} from './nodeMergeGeometry'
 
 const EDIT_PANE = 'nptEditPane'
 const HANDLE_PANE = 'nptEditHandlePane'
 
 const SELECT_COLOR = '#f59e0b'
+/** 节点合并：可编辑命中边框颜色（橙，与选中体系一致） */
+const MERGE_EDIT_COLOR = '#f59e0b'
+/** 节点合并：不可编辑参考边框颜色（蓝） */
+const MERGE_REF_COLOR = '#38bdf8'
+/** 节点合并拖框判定为点击的最小位移（像素） */
+const MERGE_MIN_DRAG_PX = 4
 
 type GeomKind = 'point' | 'line' | 'polygon'
+
+/** 节点合并的不可编辑参考来源（OnlineMap 注入：可见且非当前编辑层的图层） */
+export interface MergeReferenceSource {
+  id: string
+  name: string
+  layer: L.Layer
+}
+
+/** 框内单段边框命中（环已去闭合点） */
+interface MergeRingHit {
+  ring: L.LatLng[]
+  closed: boolean
+  /** 框内段（入口交点→中间顶点→出口交点） */
+  seg: L.LatLng[]
+}
+
+interface MergeEditableHit extends MergeRingHit {
+  editId: string
+  leaf: any
+  geomType: string
+  /** Multi* 部件索引（Polygon 外环/LineString 恒为 0） */
+  partIndex: number
+  /** 原 LineString 首尾重合（用线表达闭合环）时，写回后补回闭合重复点 */
+  lineClosed: boolean
+}
+
+interface MergeRefHit extends MergeRingHit {
+  candidateKey: string
+  sourceName: string
+  leaf: any
+  geomType: string
+  partIndex: number
+}
+
+/** 一个可被点选的参考要素候选（同一 leaf 多环合并为一个候选） */
+interface MergeCandidate {
+  key: string
+  /** 来源图层 id（执行前复查可见性用） */
+  sourceId: string
+  name: string
+  leaf: any
+  hits: MergeRefHit[]
+}
 
 const DEFAULT_STYLES: Record<GeomKind, any> = {
   point: { markerShape: 'circle', markerSize: 8, markerColor: '#ff6b6b', borderColor: '#cc2b2b' },
@@ -38,7 +96,8 @@ const DEFAULT_STYLES: Record<GeomKind, any> = {
 
 /** 原始要素的兜底样式：与 MapInfoLayer 渲染默认值一致，保证进入编辑前后观感不变 */
 const ORIG_DEFAULT_STYLES: Record<GeomKind, any> = {
-  point: { markerColor: '#f59e0b', markerSize: 6, borderColor: '#ffffff' },
+  // 点：默认半径 6、填充 0.8 不透明、无描边（MapInfoLayer 默认边框色为无色哨兵，不画白边）
+  point: { markerColor: '#f59e0b', markerRadius: 6, fillOpacity: 0.8, borderColor: NO_FILL_COLOR },
   line: { color: '#8b5cf6', weight: 3, opacity: 1, dashArray: '' },
   polygon: { fillColor: '#10b981', fillOpacity: 0.3, borderColor: '#10b981', borderWidth: 2, borderDash: '' },
 }
@@ -50,6 +109,8 @@ const FEATURE_DRAG_THRESHOLD_PX = 5
 const SNAP_TOLERANCE_PX = 14
 /** 自动捕获节点容差（像素）：拖动节点时的吸附力（更大，便于靠近即吸附） */
 const SNAP_TOLERANCE_DRAG_PX = 34
+/** "跨元素双击"补判时间窗（ms）：点要素首次 click 落在图形、第二次落在新出现的把手 */
+const DOUBLE_CLICK_MS = 400
 
 /** 圆/椭圆参数（度坐标空间；rot 为绕中心旋转弧度） */
 interface EllipseMeta { cx: number; cy: number; rx: number; ry: number; rot: number }
@@ -69,8 +130,15 @@ export class LayerEditSession {
   private handleGroup: L.LayerGroup
   /** 线要素命中代理层：透明加粗线转发点击事件（原生 SVG 细线极难点中） */
   private hitGroup: L.LayerGroup
+  /** 线要素方向箭头装饰层（"带方向线段的线"样式；divIcon 标记，不参与命中） */
+  private lineArrowGroup: L.LayerGroup
+  /** 当前工作集中"带方向线段"的线要素渲染层（rebuild 时收集，选中态切换仅重画这些） */
+  private arrowLineLeaves: any[] = []
   private layerId: string | null = null
   private selectedEditId: string | null = null
+  /** 点要素首次点击（落在图形上、把手尚未创建）的时间与 editId：供把手 click 补判双击 */
+  private pointClickAt = 0
+  private pointClickEditId: string | null = null
   /** 当前选中要素中被点选的顶点下标集合（Delete 键批量删除） */
   private vertexSel: Set<number> = new Set()
 
@@ -88,6 +156,31 @@ export class LayerEditSession {
   private snapPx: Float64Array | null = null
   private snapPxDirty = true
   private boundSnapMapDirty: () => void = () => { this.snapPxDirty = true }
+  /**
+   * 外部工具（测量/打点）激活标志：由 OnlineMap 同步。
+   * 捕获开启时这些工具的悬停同样显示捕获标记与十字光标，落点吸附走 snapLatLng()。
+   */
+  private externalSnapFeedback = false
+
+  // ---------- 节点合并（拖框对齐到参考图层边框） ----------
+  private nodeMergeMode = false
+  private referenceSourceProvider: (() => MergeReferenceSource[]) | null = null
+  private mergeRect: L.Rectangle | null = null
+  private mergeEditableGroup: L.LayerGroup | null = null
+  private mergeRefGroup: L.LayerGroup | null = null
+  private mergeDrag: { startPx: L.Point; startLL: L.LatLng; moved: boolean } | null = null
+  /** 本次拖框命中的可编辑环（mouseup 执行用） */
+  private mergeEditableHits: MergeEditableHit[] = []
+  /** 松开后等待用户点击蓝色候选要素；null=未在等待 */
+  private mergePendingCandidates: MergeCandidate[] | null = null
+  /** 真实拖框后吞掉浏览器尾随的 click（mousedown→mouseup 手势后 click 仍会派发） */
+  private mergeSuppressNextClick = false
+  private mergeRaf = 0
+  private mergeLastBounds: L.LatLngBounds | null = null
+  /** document 级 mouseup 兜底清理（鼠标在容器外松开时复位拖框态） */
+  private boundMergeDocMouseUp: () => void
+  private boundMergeMouseDown: (e: L.LeafletMouseEvent) => void
+  private boundMergeMouseUp: (e: L.LeafletMouseEvent) => void
 
   // 绘制中间态
   private drawTool: DrawTool = 'none'
@@ -111,12 +204,21 @@ export class LayerEditSession {
     moved: boolean
   } | null = null
 
+  /**
+   * 最近一次按下左键的位置（像素）：用于区分"点击选中"与"拖动"。
+   * 按住→拖动的浏览器手势在抬起后仍会补发 click，位移超过阈值时视为拖动，
+   * 不选中要素、也不清空已有选中（"拖动不选中，点击才选中"）。
+   */
+  private pointerDownPt: L.Point | null = null
+
   private boundMapClick: (e: L.LeafletMouseEvent) => void
   private boundMouseMove: (e: L.LeafletMouseEvent) => void
   private boundDblClick: (e: L.LeafletMouseEvent) => void
   private boundContextMenu: (e: L.LeafletMouseEvent) => void
   private boundFeatureDragMove: (e: L.LeafletMouseEvent) => void
   private boundFeatureDragUp: () => void
+  /** 地图级按下记录（空白处按下也要记，供地图 click 判定是否拖动） */
+  private boundPointerDown: (e: L.LeafletMouseEvent) => void
 
   constructor(map: L.Map) {
     this.map = map
@@ -132,17 +234,37 @@ export class LayerEditSession {
     }
     this.handleGroup = L.layerGroup().addTo(map)
     this.hitGroup = L.layerGroup().addTo(map)
+    this.lineArrowGroup = L.layerGroup().addTo(map)
 
+    // 节点捕获/合并初始态跟随 store（工具栏按钮可能在会话创建前已切换）
+    this.snapEnabled = !!useLayerEditStore.getState().snapEnabled
+    // 容器外松开时 map 不派发 mouseup：已拖框则按最终 bounds 完成，否则清预览；
+    // 容器内松开时 map handler 先执行并置空 mergeDrag，此回调随后变为空操作
+    this.boundMergeDocMouseUp = () => {
+      const drag = this.mergeDrag
+      this.mergeDrag = null
+      if (this.mergeRaf) { cancelAnimationFrame(this.mergeRaf); this.mergeRaf = 0 }
+      if (!drag) return
+      if (drag.moved && this.mergeLastBounds) this.finalizeMerge(this.mergeLastBounds)
+      else this.clearMergeOverlay()
+    }
+    if (useLayerEditStore.getState().nodeMergeMode) this.setNodeMergeMode(true)
     this.boundMapClick = (e) => this.handleMapClick(e)
     this.boundMouseMove = (e) => this.handleMouseMove(e)
     this.boundDblClick = (e) => this.handleDblClick(e)
     this.boundContextMenu = (e) => this.handleContextMenu(e)
     this.boundFeatureDragMove = (e) => this.handleFeatureDragMove(e)
     this.boundFeatureDragUp = () => this.handleFeatureDragUp()
+    this.boundPointerDown = (e) => { this.pointerDownPt = e.containerPoint }
+    this.boundMergeMouseDown = (e) => this.handleMergeMouseDown(e)
+    this.boundMergeMouseUp = (e) => this.handleMergeMouseUp(e)
     map.on('click', this.boundMapClick)
     map.on('mousemove', this.boundMouseMove)
     map.on('dblclick', this.boundDblClick)
     map.on('contextmenu', this.boundContextMenu)
+    map.on('mousedown', this.boundPointerDown)
+    map.on('mousedown', this.boundMergeMouseDown)
+    map.on('mouseup', this.boundMergeMouseUp)
     // 捕获像素缓存失效：地图平移/缩放/resize 后需重投影（moveend 后首次 mousemove 重建一次）
     map.on('move zoom viewreset resize', this.boundSnapMapDirty)
   }
@@ -166,26 +288,48 @@ export class LayerEditSession {
   }
 
   /**
-   * 命中检测：返回编辑层渲染要素中与给定点相交的要素（手形工具点击弹属性框用）。
-   * 点要素按距离容差、线/面要素按包围盒，与图层点选口径一致。
+   * 命中检测：返回编辑层渲染要素中精确命中给定点的要素（手形工具点击弹属性框用）。
+   * 与数据图层口径一致（mapHitTest.layerHitAt）：面按填充包含判定，
+   * 仅边框容差命中记为 border（弱命中），点/线按像素距离 —— 避免包围盒覆盖
+   * 或边框线条交叠就误弹重叠列表。
    */
-  getFeaturesAtPoint(latLng: L.LatLng): Array<{ properties: Record<string, any>; geometry: any }> {
+  getFeaturesAtPoint(latLng: L.LatLng): Array<{ properties: Record<string, any>; geometry: any; hitType: FeatureHitType; distancePx: number }> {
     if (!this.editLayer) return []
-    const out: Array<{ properties: Record<string, any>; geometry: any }> = []
+    const out: Array<{ properties: Record<string, any>; geometry: any; hitType: FeatureHitType; distancePx: number }> = []
     this.editLayer.eachLayer((layer: any) => {
       const f = layer?.feature
       if (!f) return
-      let hit = false
+      let hit: ReturnType<typeof layerHitAt> = null
       try {
-        if (typeof layer.getLatLng === 'function') {
-          hit = latLng.distanceTo(layer.getLatLng()) < 30
-        } else if (typeof layer.getBounds === 'function') {
-          hit = layer.getBounds().contains(latLng)
-        }
+        hit = layerHitAt(this.map, layer, latLng, CLICK_HIT_TOLERANCE_PX)
       } catch { /* 忽略无位置信息的图层 */ }
-      if (hit) out.push({ properties: f.properties || {}, geometry: f.geometry })
+      if (hit) {
+        out.push({ properties: f.properties || {}, geometry: f.geometry, hitType: hit.type, distancePx: hit.distancePx })
+      }
     })
     return out
+  }
+
+  /**
+   * 编辑会话全部要素的地理范围（图层预览用：装饰图层编辑态由会话渲染，常显显示层已被摘除）
+   * @returns LatLngBounds；无要素/未渲染返回 null
+   */
+  getFeaturesBounds(): L.LatLngBounds | null {
+    if (!this.editLayer) return null
+    const bounds = L.latLngBounds([])
+    let has = false
+    this.editLayer.eachLayer((layer: any) => {
+      try {
+        if (typeof layer.getLatLng === 'function') {
+          bounds.extend(layer.getLatLng())
+          has = true
+        } else if (typeof layer.getBounds === 'function') {
+          bounds.extend(layer.getBounds())
+          has = true
+        }
+      } catch { /* 忽略单要素异常 */ }
+    })
+    return has ? bounds : null
   }
 
   // ---------- 工作集加载/清除 ----------
@@ -206,10 +350,13 @@ export class LayerEditSession {
 
   /** 退出编辑：移除编辑层与把手（store 工作集保留，未保存更改不丢）。 */
   clear() {
+    this.setNodeMergeMode(false)
     this.stopDraw()
     this.deselect()
     this.clearShapeSelection()
     this.hitGroup.clearLayers()
+    this.arrowLineLeaves = []
+    this.lineArrowGroup.clearLayers()
     if (this.editLayer) {
       this.map.removeLayer(this.editLayer)
       this.editLayer = null
@@ -223,11 +370,19 @@ export class LayerEditSession {
     this.map.off('mousemove', this.boundMouseMove)
     this.map.off('dblclick', this.boundDblClick)
     this.map.off('contextmenu', this.boundContextMenu)
+    this.map.off('mousedown', this.boundPointerDown)
     this.map.off('mousemove', this.boundFeatureDragMove)
     this.map.off('mouseup', this.boundFeatureDragUp)
+    this.map.off('mousedown', this.boundMergeMouseDown)
+    this.map.off('mouseup', this.boundMergeMouseUp)
+    document.removeEventListener('mouseup', this.boundMergeDocMouseUp)
     this.map.off('move zoom viewreset resize', this.boundSnapMapDirty)
+    if (this.mergeRaf) cancelAnimationFrame(this.mergeRaf)
+    if (this.mergeEditableGroup) { this.map.removeLayer(this.mergeEditableGroup); this.mergeEditableGroup = null }
+    if (this.mergeRefGroup) { this.map.removeLayer(this.mergeRefGroup); this.mergeRefGroup = null }
     this.map.removeLayer(this.handleGroup)
     this.map.removeLayer(this.hitGroup)
+    this.map.removeLayer(this.lineArrowGroup)
   }
 
   // ---------- 渲染 ----------
@@ -353,15 +508,21 @@ export class LayerEditSession {
   private pathOptions(kind: GeomKind, feature: any, selected: boolean): L.PathOptions {
     const st = this.styleFor(kind, feature)
     if (kind === 'point') {
+      // 图形颜色无色（markerColor='none'）：点镂空仅显示边框（与 MapInfoLayer 一致）
+      const noFill = st.markerColor === NO_FILL_COLOR
+      // 边框：未配置（undefined）或无色哨兵均不描边 —— MapInfoLayer 默认不画白边
+      const noStroke = !selected && (st.borderColor === undefined || st.borderColor === NO_FILL_COLOR)
       return {
         pane: EDIT_PANE,
         // 原始要素 markerRadius 与 MapInfoLayer 渲染一致（半径 = markerSize）；
         // 新绘制要素沿用绘制样式约定（markerSize 视为直径）
         radius: st.markerRadius ?? (st.markerSize ?? 8) / 2 + 1,
-        color: selected ? SELECT_COLOR : (st.borderColor || st.markerColor),
-        weight: selected ? 3 : 1.5,
-        fillColor: st.markerColor || '#ff6b6b',
-        fillOpacity: st.fillOpacity ?? 1,
+        color: selected ? SELECT_COLOR : (noStroke ? '#000000' : st.borderColor),
+        stroke: selected || !noStroke,
+        weight: selected ? 3 : 2,
+        fillColor: noFill ? 'transparent' : (st.markerColor || '#ff6b6b'),
+        fillOpacity: noFill ? 0 : (st.fillOpacity ?? 0.8),
+        fill: !noFill,
       } as L.PathOptions
     }
     if (kind === 'line') {
@@ -393,9 +554,12 @@ export class LayerEditSession {
     // 新绘制要素沿用绘制样式约定（markerSize 即图标尺寸）
     const size = Math.max(6, Number(st.markerIconPx ?? st.markerSize ?? 8))
     const s = size + 4
-    const fill = st.markerColor || '#ff6b6b'
-    const stroke = selected ? SELECT_COLOR : (st.borderColor || fill)
-    const sw = selected ? 2.5 : 1.5
+    // 图形颜色无色：SVG fill="none"（镂空仅描边）
+    const fill = st.markerColor === NO_FILL_COLOR ? 'none' : (st.markerColor || '#ff6b6b')
+    // 边框：未配置（undefined）或无色哨兵均不描边（与 MapInfoLayer 默认一致，不画白边）
+    const noStroke = !selected && (st.borderColor === undefined || st.borderColor === NO_FILL_COLOR)
+    const stroke = selected ? SELECT_COLOR : (noStroke ? 'none' : st.borderColor)
+    const sw = selected ? 2.5 : 2
     const paint = `fill="${fill}" stroke="${stroke}" stroke-width="${sw}"`
     let body: string
     switch (st.markerShape) {
@@ -512,29 +676,70 @@ export class LayerEditSession {
     this.editLayer.addTo(this.map)
 
     // 线要素命中代理：原生 SVG 路径命中区域 ≈ 线宽（默认 2.5px），细线极难点中。
-    // 叠加一条几乎透明、14px+ 加粗的同形折线转发 click/mousedown/dblclick。
+    // 叠加一条完全透明（opacity:0 不影响事件命中）、14px+ 加粗的同形折线转发事件；
+    // 不可用 0.01：道路中心线等密集线图层，半透明黑色粗边叠加会形成沿线阴影。
+    // 同时收集"带方向线段"的线要素，供下方方向箭头渲染（选中态切换只需重画这些）。
     this.hitGroup.clearLayers()
+    this.arrowLineLeaves = []
     this.editLayer.eachLayer((leaf: any) => {
       if (this.featureKind(leaf) !== 'line') return
       const st = this.styleFor('line', leaf.feature)
+      if (st.arrow) this.arrowLineLeaves.push(leaf)
       const proxy = L.polyline(leaf.getLatLngs(), {
         pane: EDIT_PANE,
         stroke: true,
         color: '#000000',
         weight: Math.max(14, (st.weight ?? 2.5) + 12),
-        opacity: 0.01,
+        opacity: 0,
         fill: false,
         interactive: true,
       } as any)
       this.bindFeatureEvents(proxy, leaf.feature, leaf)
       proxy.addTo(this.hitGroup as any)
     })
+    this.rebuildLineArrows()
 
     // 恢复选中把手
     if (this.selectedEditId) {
       const leaf = this.findLeafLayer(this.selectedEditId)
       if (leaf) this.showHandles(leaf)
     }
+  }
+
+  /**
+   * 重建"带方向线段的线"箭头装饰（候选要素由 rebuild 时的 arrowLineLeaves 提供）。
+   * 箭头用线色渲染，选中时随线条一起变为选中色。
+   */
+  private rebuildLineArrows() {
+    this.lineArrowGroup.clearLayers()
+    for (const leaf of this.arrowLineLeaves) {
+      const feature = leaf?.feature
+      if (!feature) continue
+      const st = this.styleFor('line', feature)
+      if (!st?.arrow) continue
+      const selected = feature.properties?._editId === this.selectedEditId
+      const color = selected ? SELECT_COLOR : st.color
+      // 线色为无色哨兵（不描边）时不画箭头
+      if (!color || color === NO_FILL_COLOR) continue
+      const markers = buildLineArrows(leaf.getLatLngs(), {
+        color,
+        opacity: st.opacity ?? 0.95,
+        pane: EDIT_PANE,
+      })
+      for (const m of markers) this.lineArrowGroup.addLayer(m)
+    }
+  }
+
+  /**
+   * 本次手势是否为"拖动"：按下点与抬起点（click 事件位置）的位移超过阈值。
+   * 浏览器在手势结束后仍会补发 click，拖动需据此与点击区分。
+   */
+  private isDragGesture(e: { containerPoint?: L.Point; latlng?: L.LatLng }): boolean {
+    const down = this.pointerDownPt
+    if (!down) return false
+    const up = e.containerPoint || (e.latlng ? this.map.latLngToContainerPoint(e.latlng) : null)
+    if (!up) return false
+    return down.distanceTo(up) > FEATURE_DRAG_THRESHOLD_PX
   }
 
   /** 要素交互事件绑定（真实渲染层与线命中代理共用；realLeaf 为真实渲染层）。 */
@@ -549,11 +754,20 @@ export class LayerEditSession {
       // （编辑开关关闭时由 OnlineMap 的"选择"工具路径处理：仅高亮、不可编辑）
       if (!this.selectMode) return
       L.DomEvent.stopPropagation(e)
+      // 拖动不选中：在图形上按住拖动（位移超阈值）后浏览器仍补发 click，
+      // 该手势视为拖动，不选中要素（选中只由"点击"触发）
+      if (this.isDragGesture(e)) return
       this.select(editId, realLeaf)
     })
-    // 按住左键拖动整体移位（编辑态 + "选择"工具激活 + 非绘制 + 非手形工具）
+    // 按住左键拖动整体移位（编辑态 + "选择"工具激活 + 非绘制 + 非手形工具）。
+    // 只有"已点选（选中）"的要素才能整体移动：未选中的要素按住左键不移动，
+    // 单击先选中、再按住拖动才位移（避免误拖与"拖走了别的图形"）。
     target.on('mousedown', (e: any) => {
+      // 记录按下位置（供 click 判定是否拖动）；未选中要素的按下不 stopPropagation，
+      // 由地图级记录兜底，值一致
+      this.pointerDownPt = e.containerPoint || this.map.latLngToContainerPoint(e.latlng)
       if (this.drawTool !== 'none' || !this.selectMode || this.isPanToolActive || this.featureDrag) return
+      if (!editId || editId !== this.selectedEditId) return
       L.DomEvent.stopPropagation(e)
       this.beginFeatureDrag(realLeaf, e.latlng, e.containerPoint)
     })
@@ -725,7 +939,25 @@ export class LayerEditSession {
       this.applySelectStyle(leaf, true)
       leaf.bringToFront?.()
       this.showHandles(leaf)
+      // 点要素：记录首次点击（落在图形、把手刚创建），供把手 click 补判"跨元素双击"
+      if (this.featureKind(leaf) === 'point') {
+        this.pointClickAt = Date.now()
+        this.pointClickEditId = editId
+      }
     }
+    this.rebuildLineArrows()
+  }
+
+  /** 打开点要素的图形属性弹窗（双击 / 跨元素双击补判共用）。 */
+  private openPointInspect(editId: string, leaf: any) {
+    useLayerEditStore.getState().setInspectFeature({
+      layerId: this.layerId!,
+      layerName: this.layerName || undefined,
+      editId,
+      geometry: leaf.feature.geometry,
+      properties: leaf.feature.properties,
+      editable: true,
+    })
   }
 
   private deselect() {
@@ -738,6 +970,7 @@ export class LayerEditSession {
     this.selectedEditId = null
     this.vertexSel.clear()
     this.clearHandles()
+    this.rebuildLineArrows()
   }
 
   private clearHandles() {
@@ -780,8 +1013,53 @@ export class LayerEditSession {
     return this.snapEnabled
   }
 
-  /** 地图容器顶部临时提示条（淡出） */
-  private showSnapHint(text: string) {
+  /**
+   * 外部工具（测量/打点）落点吸附：捕获开启且命中附近节点时返回节点坐标并显示捕获标记，
+   * 否则原样返回（不改变捕获开关状态）。
+   */
+  snapLatLng(ll: L.LatLng): L.LatLng {
+    return this.applySnap(ll)
+  }
+
+  /** 测量/打点等外部工具的悬停捕获反馈开关（由 OnlineMap 按工具态同步） */
+  setExternalSnapFeedback(on: boolean) {
+    if (this.externalSnapFeedback === on) return
+    this.externalSnapFeedback = on
+    if (!on) {
+      this.clearSnapMarker()
+      // 清除捕获留下的内联光标（绘制/选择工具各自管理光标，不在此清理，
+      // 否则会误删绘制态的十字光标）
+      if (!this.selectMode && this.drawTool === 'none') {
+        this.map.getContainer()?.style.removeProperty('cursor')
+      }
+    }
+  }
+
+  // ---------- 节点合并（拖框对齐边框） ----------
+
+  /** 注入不可编辑参考图层来源（OnlineMap 提供：可见且非当前编辑层） */
+  setReferenceSourceProvider(p: (() => MergeReferenceSource[]) | null) {
+    this.referenceSourceProvider = p
+  }
+
+  /** 节点合并开关：开启后左键拖框；关闭时清除矩形/高亮/候选等待态 */
+  setNodeMergeMode(on: boolean) {
+    if (this.nodeMergeMode === on) return
+    this.nodeMergeMode = on
+    this.mergeDrag = null
+    if (this.mergeRaf) { cancelAnimationFrame(this.mergeRaf); this.mergeRaf = 0 }
+    this.clearMergeOverlay()
+    const c = this.map.getContainer()
+    if (on) {
+      c.style.setProperty('cursor', 'crosshair', 'important')
+      this.showMapHint(i18n.t('map.mergeModeOn') || '节点合并：按住左键拖框选择相邻边框')
+    } else {
+      c.style.removeProperty('cursor')
+    }
+  }
+
+  /** 地图容器顶部临时提示条（1.8s 淡出；sticky 不淡出，由 clearMapHint 主动清除） */
+  private showMapHint(text: string, sticky = false) {
     const c = this.map.getContainer()
     let el = c.querySelector(':scope > .npt-snap-hint') as HTMLElement | null
     if (!el) {
@@ -795,7 +1073,19 @@ export class LayerEditSession {
     el.textContent = text
     el.style.opacity = '1'
     if (this.snapHintTimer) window.clearTimeout(this.snapHintTimer)
-    this.snapHintTimer = window.setTimeout(() => { if (el) el.style.opacity = '0' }, 1800)
+    if (!sticky) {
+      this.snapHintTimer = window.setTimeout(() => { if (el) el.style.opacity = '0' }, 1800)
+    }
+  }
+
+  private clearMapHint() {
+    if (this.snapHintTimer) window.clearTimeout(this.snapHintTimer)
+    const el = this.map.getContainer()?.querySelector(':scope > .npt-snap-hint') as HTMLElement | null
+    if (el) el.style.opacity = '0'
+  }
+
+  private showSnapHint(text: string) {
+    this.showMapHint(text)
   }
 
   /** 收集一个渲染层（L.GeoJSON）内所有可捕获节点 */
@@ -938,15 +1228,17 @@ export class LayerEditSession {
     if (!c) return
     // 绘制态本身已是十字光标，无需覆盖
     if (this.drawTool !== 'none') return
-    if (near && this.snapEnabled && this.selectMode) {
+    if (near && this.snapEnabled && (this.selectMode || this.externalSnapFeedback)) {
       // 内联 !important 优先于样式表 !important（手形工具的 .map-drag-active
       // 用 cursor: grab !important 接管光标，普通内联样式会被覆盖，导致
       // 切到手形后"捕获看起来退出"——这里用同级优先的内联声明强制十字）
       c.style.setProperty('cursor', 'crosshair', 'important')
-    } else {
+    } else if (this.selectMode) {
       // 移除内联声明，交还给当前工具的 CSS 光标（手形 grab / 默认箭头）
       c.style.removeProperty('cursor')
     }
+    // 外部工具（测量/打点）非命中时不触碰光标：工具自身的十字光标继续生效，
+    // 退出工具时由 setExternalSnapFeedback(false) 统一清理
   }
 
   /** 顶点把手图标：白底橙框；点选后红底（Delete 键可批量删除点选顶点） */
@@ -1042,20 +1334,24 @@ export class LayerEditSession {
         })
         this.rebuild()
       })
-      // 把手与点要素位置完全重合：首次点击选中后把手覆盖在要素上方，
-      // 第二次点击落在把手上，要素的 dblclick 永远不会触发（点图形无法双击
-      // 打开属性弹窗的根因）。这里把双击转发为属性弹窗。
+      // 把手与点要素位置重合：首次点击落在图形（把手尚未创建），选中后把手
+      // 覆盖上来，第二次点击落在把手——两次 click 分属两元素，两边都收不到
+      // dblclick（点图形双击打不开属性弹窗的根因）。
+      // 1) 把手 click：与图形首次点击间隔足够短时补判为双击
+      m.on('click', (e: any) => {
+        L.DomEvent.stopPropagation(e)
+        if (this.drawTool !== 'none' || !this.selectMode) return
+        if (this.pointClickEditId === editId && Date.now() - this.pointClickAt < DOUBLE_CLICK_MS) {
+          this.openPointInspect(editId, leaf)
+        }
+        this.pointClickAt = 0
+        this.pointClickEditId = null
+      })
+      // 2) 把手 dblclick：要素已选中（把手本就存在）时再双击
       m.on('dblclick', (e: any) => {
         L.DomEvent.stopPropagation(e)
         if (this.drawTool !== 'none' || !this.selectMode) return
-        useLayerEditStore.getState().setInspectFeature({
-          layerId: this.layerId!,
-          layerName: this.layerName || undefined,
-          editId,
-          geometry: leaf.feature.geometry,
-          properties: leaf.feature.properties,
-          editable: true,
-        })
+        this.openPointInspect(editId, leaf)
       })
       m.addTo(this.handleGroup)
       return
@@ -1654,8 +1950,20 @@ export class LayerEditSession {
 
   private handleMapClick(e: L.LeafletMouseEvent) {
     if (!this.layerId) return
+    // 节点合并：先消费拖框手势的尾随 click（C1），不做任何取消动作
+    if (this.mergeSuppressNextClick) {
+      this.mergeSuppressNextClick = false
+      return
+    }
+    // 节点合并：候选要素的 click 已 stopPropagation；落到地图空白 = 取消候选等待
+    if (this.nodeMergeMode) {
+      if (this.mergePendingCandidates) this.cancelMergePending()
+      return
+    }
     if (this.drawTool === 'none') {
-      // 点击空白处（要素 click 已 stopPropagation）→ 取消选中
+      // 点击空白处（要素 click 已 stopPropagation）→ 取消选中。
+      // 拖动（位移超阈值）不算点击：空白处拖动不清空已有选中（"只有点击才改变选中"）
+      if (this.isDragGesture(e)) return
       if (this.selectedEditId) this.deselect()
       return
     }
@@ -1765,10 +2073,28 @@ export class LayerEditSession {
   }
 
   private handleMouseMove(e: L.LeafletMouseEvent) {
+    // 节点合并模式：左键拖框更新矩形预览（高亮经 rAF 节流重建）；
+    // 未拖框时也直接返回，避免节点捕获的光标/标记干扰
+    if (this.nodeMergeMode) {
+      // 按键已松开（如容器外松开后回到地图）：复位拖框，不更新矩形
+      if (this.mergeDrag && (e.originalEvent as MouseEvent).buttons === 0) {
+        this.mergeDrag = null
+        if (this.mergeRaf) { cancelAnimationFrame(this.mergeRaf); this.mergeRaf = 0 }
+        return
+      }
+      if (this.mergeDrag) {
+        const px = this.map.mouseEventToContainerPoint(e.originalEvent)
+        if (!this.mergeDrag.moved && px.distanceTo(this.mergeDrag.startPx) >= MERGE_MIN_DRAG_PX) {
+          this.mergeDrag.moved = true
+        }
+        if (this.mergeDrag.moved) this.updateMergeRect(L.latLngBounds(this.mergeDrag.startLL, e.latlng))
+      }
+      return
+    }
     // 自动捕获：靠近节点光标变十字 + 显示捕获标记。
-    // 仅"选择"工具激活时生效（手形/其他工具下不显示捕获反馈）
+    // "选择"工具，或测量/打点等外部工具激活时生效（手形/其他工具下不显示捕获反馈）
     if (this.drawTool === 'none') {
-      if (this.snapEnabled && this.selectMode) {
+      if (this.snapEnabled && (this.selectMode || this.externalSnapFeedback)) {
         const hit = this.findSnapNode(e.latlng)
         if (hit) {
           this.showSnapMarker(hit.latlng)
@@ -1780,7 +2106,15 @@ export class LayerEditSession {
       }
       return
     }
-    if (this.drawTool === 'point') return
+    if (this.drawTool === 'point') {
+      // 点工具无预览图形，但同样显示捕获标记（落点已在 handleMapClick 吸附）
+      if (this.snapEnabled) {
+        const hit = this.findSnapNode(e.latlng)
+        if (hit) this.showSnapMarker(hit.latlng)
+        else this.clearSnapMarker()
+      }
+      return
+    }
     // 绘制中：吸附后用节点坐标实时预览
     if (this.snapEnabled) {
       const hit = this.findSnapNode(e.latlng)
@@ -1866,12 +2200,20 @@ export class LayerEditSession {
   /** 键盘：Esc 取消绘制（含点工具）/ Backspace 删末点 / Delete 删选中 / S 切换自动捕获节点。返回是否处理。 */
   handleKey(e: KeyboardEvent): boolean {
     if (!this.layerId) return false
-    // S 键：切换自动捕获节点（仅编辑态、无组合键、非输入框聚焦）
+    // S 键：切换自动捕获节点（仅编辑态、无组合键、非输入框聚焦）。
+    // 状态以 layerEditStore 为单一真相源（工具栏按钮共用），OnlineMap 监听后同步回会话。
     if ((e.key === 's' || e.key === 'S') && !e.ctrlKey && !e.metaKey && !e.altKey) {
       const t = e.target as HTMLElement | null
       if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return false
-      this.toggleSnapEnabled()
+      useLayerEditStore.getState().toggleSnapEnabled()
       return true
+    }
+    // Esc：节点合并中取消候选等待/框选预览（不退出模式）。
+    // 没有可取消的东西时放行，避免屏蔽其他 UI 的 Esc（弹窗/下拉等）。
+    if (e.key === 'Escape' && this.nodeMergeMode) {
+      if (this.mergePendingCandidates) { this.cancelMergePending(); return true }
+      if (this.mergeRect) { this.clearMergeOverlay(); return true }
+      return false
     }
     if (this.drawTool !== 'none') {
       if (e.key === 'Escape') {
@@ -1904,5 +2246,410 @@ export class LayerEditSession {
       }
     }
     return false
+  }
+
+  // ==================== 节点合并实现 ====================
+
+  private handleMergeMouseDown(e: L.LeafletMouseEvent) {
+    if (!this.nodeMergeMode || !this.layerId) return
+    if (e.originalEvent.button !== 0) return
+    // 候选点选阶段：拖框停用，点击交与候选 click（选中）/ map click（空白取消）
+    if (this.mergePendingCandidates) return
+    this.mergeDrag = {
+      startPx: this.map.mouseEventToContainerPoint(e.originalEvent),
+      startLL: e.latlng,
+      moved: false,
+    }
+    // 容器外松开时 map 不派发 mouseup：document 兜底复位，避免零按键移动继续拖矩形
+    document.addEventListener('mouseup', this.boundMergeDocMouseUp, { once: true })
+  }
+
+  private handleMergeMouseUp(e: L.LeafletMouseEvent) {
+    if (!this.nodeMergeMode || !this.mergeDrag) return
+    const drag = this.mergeDrag
+    this.mergeDrag = null
+    if (this.mergeRaf) { cancelAnimationFrame(this.mergeRaf); this.mergeRaf = 0 }
+    const endPx = this.map.mouseEventToContainerPoint(e.originalEvent)
+    // 位移过小视为点击：丢弃本次框选（不吞尾随 click，留给候选取消等语义）
+    if (!drag.moved || endPx.distanceTo(drag.startPx) < MERGE_MIN_DRAG_PX) {
+      this.clearMergeOverlay()
+      return
+    }
+    // 真实拖框：浏览器在 mouseup 后还会派发一个 click（dragging/boxZoom 已禁用，
+    // Leaflet 不抑制），吞掉它，避免多候选提示/候选层被"空白取消"立刻清掉。
+    this.mergeSuppressNextClick = true
+    window.setTimeout(() => { this.mergeSuppressNextClick = false }, 0)
+    this.finalizeMerge(L.latLngBounds(drag.startLL, e.latlng))
+  }
+
+  /** 拖拽中：更新虚线矩形，框内双色高亮经 rAF 节流重建 */
+  private updateMergeRect(bounds: L.LatLngBounds) {
+    if (!this.mergeRect) {
+      this.mergeRect = L.rectangle(bounds, {
+        color: MERGE_EDIT_COLOR,
+        weight: 1.5,
+        dashArray: '4,3',
+        fill: false,
+        interactive: false,
+        pane: HANDLE_PANE,
+      }).addTo(this.map)
+    } else {
+      this.mergeRect.setBounds(bounds)
+    }
+    this.mergeLastBounds = bounds
+    if (!this.mergeRaf) {
+      this.mergeRaf = requestAnimationFrame(() => {
+        this.mergeRaf = 0
+        if (this.mergeLastBounds) this.renderMergePreview(this.mergeLastBounds)
+      })
+    }
+  }
+
+  private ensureMergeGroups() {
+    if (!this.mergeEditableGroup) {
+      this.mergeEditableGroup = L.layerGroup().addTo(this.map)
+      this.mergeRefGroup = L.layerGroup().addTo(this.map)
+    }
+  }
+
+  /** 清除矩形/双色高亮/候选等待（保留模式开关与十字光标） */
+  private clearMergeOverlay() {
+    if (this.mergeRect) { this.map.removeLayer(this.mergeRect); this.mergeRect = null }
+    this.mergeEditableGroup?.clearLayers()
+    this.mergeRefGroup?.clearLayers()
+    this.mergeEditableHits = []
+    this.mergePendingCandidates = null
+    this.mergeLastBounds = null
+    this.clearMapHint()
+  }
+
+  private cancelMergePending() {
+    this.clearMergeOverlay()
+    this.showMapHint(i18n.t('map.mergeCanceled') || '已取消选择参考图形')
+  }
+
+  /** GeoJSON 几何 → 可参与合并的外环/线环（点要素、洞、圆/椭圆由调用方过滤） */
+  private enumGeomRings(geometry: any): Array<{
+    coords: Array<[number, number]>; closed: boolean; partIndex: number; geomType: string
+  }> {
+    if (!geometry) return []
+    const t = geometry.type
+    const c = geometry.coordinates
+    if (t === 'LineString') {
+      return Array.isArray(c) ? [{ coords: c, closed: false, partIndex: 0, geomType: t }] : []
+    }
+    if (t === 'MultiLineString') {
+      return Array.isArray(c) ? c.map((line: any, i: number) => ({ coords: line, closed: false, partIndex: i, geomType: t })) : []
+    }
+    if (t === 'Polygon') {
+      return Array.isArray(c?.[0]) ? [{ coords: c[0], closed: true, partIndex: 0, geomType: t }] : []
+    }
+    if (t === 'MultiPolygon') {
+      return Array.isArray(c) ? c.map((poly: any, i: number) => ({ coords: poly[0], closed: true, partIndex: i, geomType: t })) : []
+    }
+    return []
+  }
+
+  private coordsToRing(coords: Array<[number, number]>): L.LatLng[] {
+    return this.openRing(coords.map((c) => L.latLng(c[1], c[0])))
+  }
+
+  /** 要素包围盒与框选矩形粗筛（不相交直接跳过，大图层下避免逐边求交） */
+  private leafIntersectsRect(leaf: any, bounds: L.LatLngBounds): boolean {
+    const b = typeof leaf.getBounds === 'function' ? leaf.getBounds() : null
+    return b ? b.intersects(bounds) : true
+  }
+
+  /** 单段边框的框内段折线（纯算法实现，非 single 返回 null） */
+  private segOf(ring: L.LatLng[], closed: boolean, rect: MMRect): L.LatLng[] | null {
+    const pts = insideSegmentPoints(ring as MMPoint[], closed, rect)
+    return pts ? pts.map((p) => L.latLng(p.lat, p.lng)) : null
+  }
+
+  private isCircleFeature(f: any): boolean {
+    return !!f?.properties?._ellipse || f?.properties?._shape === 'circle'
+  }
+
+  /** LineString 原始坐标首尾重合（用线表达闭合环）标记 */
+  private lineOriginallyClosed(coords: Array<[number, number]>): boolean {
+    return coords.length > 1 && coords[0][0] === coords[coords.length - 1][0]
+      && coords[0][1] === coords[coords.length - 1][1]
+  }
+
+  /** 收集框内"单段进出"的可编辑边框 */
+  private collectEditableHits(rect: MMRect): { hits: MergeEditableHit[]; circles: number } {
+    const hits: MergeEditableHit[] = []
+    let circles = 0
+    const bounds = L.latLngBounds([rect.south, rect.west], [rect.north, rect.east])
+    this.editLayer?.eachLayer((leaf: any) => {
+      const f = leaf?.feature
+      const editId = f?.properties?._editId as string | undefined
+      if (!editId) return
+      if (this.isCircleFeature(f)) { circles++; return }
+      if (!this.leafIntersectsRect(leaf, bounds)) return
+      for (const r of this.enumGeomRings(f.geometry)) {
+        const ring = this.coordsToRing(r.coords)
+        const a = analyzeRingInRect(ring as MMPoint[], r.closed, rect)
+        if (a.status !== 'single') continue
+        const seg = this.segOf(ring, r.closed, rect)
+        if (!seg) continue
+        hits.push({
+          editId, leaf, geomType: r.geomType, partIndex: r.partIndex,
+          ring, closed: r.closed, seg,
+          lineClosed: r.geomType === 'LineString' && this.lineOriginallyClosed(r.coords),
+        })
+      }
+    })
+    return { hits, circles }
+  }
+
+  /** 收集框内"单段进出"的不可编辑参考边框（跨所有可见非编辑图层） */
+  private collectRefHits(rect: MMRect): MergeRefHit[] {
+    const out: MergeRefHit[] = []
+    const sources = this.referenceSourceProvider?.() ?? []
+    const bounds = L.latLngBounds([rect.south, rect.west], [rect.north, rect.east])
+    for (const src of sources) {
+      (src.layer as any).eachLayer?.((leaf: any) => {
+        const f = leaf?.feature
+        if (!f || this.isCircleFeature(f)) return
+        if (!this.leafIntersectsRect(leaf, bounds)) return
+        const key = `${src.id}#${leaf._leaflet_id ?? Math.random().toString(36).slice(2)}`
+        for (const r of this.enumGeomRings(f.geometry)) {
+          const ring = this.coordsToRing(r.coords)
+          const a = analyzeRingInRect(ring as MMPoint[], r.closed, rect)
+          if (a.status !== 'single') continue
+          const seg = this.segOf(ring, r.closed, rect)
+          if (!seg) continue
+          out.push({
+            candidateKey: key,
+            sourceName: src.name,
+            leaf,
+            geomType: r.geomType,
+            partIndex: r.partIndex,
+            ring,
+            closed: r.closed,
+            seg,
+          })
+        }
+      })
+    }
+    return out
+  }
+
+  /**
+   * 画一段高亮边框：可见虚线始终 pointer-events:none（C2：避免兄弟 path 遮挡
+   * 下方透明命中线）；interactive=true 时另叠一条 16px 透明 halo 接收点击，
+   * 有 onClick 则点选候选，无 onClick 则仅吞掉点击（点橙线不触发"空白取消"）。
+   * drawVertices=false 用于拖拽预览（省掉逐节点 circleMarker，减少每帧 SVG 增删）。
+   */
+  private drawSeg(
+    group: L.LayerGroup,
+    seg: L.LatLng[],
+    color: string,
+    interactive: boolean,
+    onClick?: () => void,
+    drawVertices = true,
+  ) {
+    if (interactive) {
+      const hit = L.polyline(seg, { pane: HANDLE_PANE, interactive: true, color, weight: 16, opacity: 0 } as any)
+      hit.on('click', (ev: any) => {
+        L.DomEvent.stopPropagation(ev)
+        onClick?.()
+      })
+      hit.addTo(group)
+    }
+    L.polyline(seg, {
+      pane: HANDLE_PANE, interactive: false,
+      color, weight: 3, dashArray: '5,3', fill: false,
+    } as any).addTo(group)
+    if (!drawVertices) return
+    for (const p of seg) {
+      L.circleMarker(p, {
+        pane: HANDLE_PANE,
+        radius: 4,
+        color: '#ffffff',
+        weight: 1.5,
+        fillColor: color,
+        fillOpacity: 1,
+        interactive: false,
+      }).addTo(group)
+    }
+  }
+
+  /** 拖拽中重绘双色高亮（非交互、省略节点 marker，由 rAF 节流） */
+  private renderMergePreview(bounds: L.LatLngBounds) {
+    this.ensureMergeGroups()
+    this.mergeEditableGroup!.clearLayers()
+    this.mergeRefGroup!.clearLayers()
+    const rect: MMRect = {
+      south: bounds.getSouth(), west: bounds.getWest(),
+      north: bounds.getNorth(), east: bounds.getEast(),
+    }
+    const { hits } = this.collectEditableHits(rect)
+    const refHits = this.collectRefHits(rect)
+    this.mergeEditableHits = hits
+    for (const h of hits) this.drawSeg(this.mergeEditableGroup!, h.seg, MERGE_EDIT_COLOR, false, undefined, false)
+    for (const h of refHits) this.drawSeg(this.mergeRefGroup!, h.seg, MERGE_REF_COLOR, false, undefined, false)
+  }
+
+  /** 松开鼠标：校验（编辑段+参考段）→ 单候选直接执行，多候选进入地图点选 */
+  private finalizeMerge(bounds: L.LatLngBounds) {
+    const rect: MMRect = {
+      south: bounds.getSouth(), west: bounds.getWest(),
+      north: bounds.getNorth(), east: bounds.getEast(),
+    }
+    const { hits: editableHits, circles } = this.collectEditableHits(rect)
+    const refHits = this.collectRefHits(rect)
+    this.mergeEditableHits = editableHits
+    this.ensureMergeGroups()
+    this.mergeEditableGroup!.clearLayers()
+    this.mergeRefGroup!.clearLayers()
+    for (const h of editableHits) this.drawSeg(this.mergeEditableGroup!, h.seg, MERGE_EDIT_COLOR, false)
+
+    if (editableHits.length === 0) {
+      // 矩形与高亮一并清除，仅保留提示
+      this.clearMergeOverlay()
+      this.showMapHint(
+        circles > 0
+          ? (i18n.t('map.mergeSkippedCircle') || '框内仅命中圆/椭圆要素，圆/椭圆不参与节点合并')
+          : (i18n.t('map.mergeNoEditableInBox') || '框内没有可编辑图形的边框：请打开一个图层的"编辑"开关后重画框选'),
+      )
+      return
+    }
+    if (refHits.length === 0) {
+      this.clearMergeOverlay()
+      this.showMapHint(i18n.t('map.mergeNoReferenceInBox') || '框内没有不可编辑图层的边框：请再打开至少一个参考图层')
+      return
+    }
+
+    // 参考要素按 leaf 归组（同一图形多环算一个候选），key 前缀即来源图层 id
+    const candMap = new Map<string, MergeCandidate>()
+    for (const h of refHits) {
+      let cand = candMap.get(h.candidateKey)
+      if (!cand) {
+        cand = {
+          key: h.candidateKey,
+          sourceId: h.candidateKey.split('#')[0],
+          name: h.sourceName,
+          leaf: h.leaf,
+          hits: [],
+        }
+        candMap.set(h.candidateKey, cand)
+      }
+      cand.hits.push(h)
+    }
+    const candidates = [...candMap.values()]
+    // 单候选：直接执行（executeMerge 完成后统一清高亮，无需先画蓝层）
+    if (candidates.length === 1) {
+      this.executeMerge(candidates[0], rect)
+      return
+    }
+    // 多候选：蓝色段可点选；橙色段改画为"仅吞点击"（点橙线不触发空白取消），等待用户选择
+    this.mergePendingCandidates = candidates
+    this.mergeEditableGroup!.clearLayers()
+    for (const h of editableHits) this.drawSeg(this.mergeEditableGroup!, h.seg, MERGE_EDIT_COLOR, true)
+    this.mergeRefGroup!.clearLayers()
+    for (const cand of candidates) {
+      for (const h of cand.hits) {
+        this.drawSeg(this.mergeRefGroup!, h.seg, MERGE_REF_COLOR, true, () => this.executeMerge(cand, rect))
+      }
+    }
+    this.showMapHint(
+      i18n.t('map.mergeClickTarget', { count: candidates.length })
+        || `框内有 ${candidates.length} 个参考图形，点击要吸附的蓝色边框（Esc 取消）`,
+      true,
+    )
+  }
+
+  /** 用候选图形的框内段节点替换全部可编辑命中段，少补多删，一次写入（一次撤销） */
+  private executeMerge(cand: MergeCandidate, rect: MMRect) {
+    if (!this.layerId) return
+    // 候选等待期间其来源图层可能已被隐藏：放弃执行，要求重新框选
+    const stillVisible = (this.referenceSourceProvider?.() ?? []).some((s) => s.id === cand.sourceId)
+    if (!stillVisible) {
+      this.clearMergeOverlay()
+      this.showMapHint(i18n.t('map.mergeReferenceHidden') || '参考图层已隐藏，请重新框选')
+      return
+    }
+    const updates = new Map<string, { editId: string; geometry: any }>()
+    let aligned = 0
+    let skipped = 0
+    // 端点平面距离平方（中纬度经度修正），用于在参考要素的多个框内段中选最近段
+    const segDist2 = (a: L.LatLng, b: L.LatLng) => {
+      const k = Math.cos(((a.lat + b.lat) * Math.PI) / 360)
+      const dl = (a.lng - b.lng) * k
+      return dl * dl + (a.lat - b.lat) ** 2
+    }
+    for (const h of this.mergeEditableHits) {
+      // 同类几何（线对线、面对面）中取框内段端点总距离最小的参考环；
+      // 环向（正反）由 alignRingToReference 内部按端点就近翻转
+      let refRing: L.LatLng[] | null = null
+      let bestD = Infinity
+      const hEn = h.seg[0]
+      const hEx = h.seg[h.seg.length - 1]
+      for (const rh of cand.hits) {
+        if (rh.closed !== h.closed) continue
+        const rEn = rh.seg[0]
+        const rEx = rh.seg[rh.seg.length - 1]
+        const d = Math.min(
+          segDist2(hEn, rEn) + segDist2(hEx, rEx),
+          segDist2(hEn, rEx) + segDist2(hEx, rEn),
+        )
+        if (d < bestD) { bestD = d; refRing = rh.ring }
+      }
+      if (!refRing) { skipped++; continue }
+      const res = alignRingToReference(h.ring as MMPoint[], refRing as MMPoint[], h.closed, rect)
+      if (!res.ok || !res.ring) { skipped++; continue }
+
+      // 替换 GeoJSON geometry 的对应部件（面闭合、洞保留、Multi* 只改命中部件）
+      const geom = JSON.parse(JSON.stringify(h.leaf.feature.geometry))
+      const nextCoords = res.ring.map((p) => [p.lng, p.lat] as [number, number])
+      if (h.geomType === 'LineString') {
+        // 原始为首尾重合的闭合线时补回闭合重复点
+        geom.coordinates = h.lineClosed ? this.closedRing(nextCoords) : nextCoords
+      } else if (h.geomType === 'Polygon') {
+        geom.coordinates = [this.closedRing(nextCoords), ...geom.coordinates.slice(1)]
+      } else if (h.geomType === 'MultiLineString') {
+        geom.coordinates[h.partIndex] = nextCoords
+      } else if (h.geomType === 'MultiPolygon') {
+        geom.coordinates[h.partIndex] = [this.closedRing(nextCoords), ...geom.coordinates[h.partIndex].slice(1)]
+      }
+      h.leaf.feature.geometry = geom
+      h.leaf.setLatLngs(this.geomToLeafletLatLngs(geom))
+      updates.set(h.editId, { editId: h.editId, geometry: geom })
+      aligned++
+    }
+    if (aligned > 0) {
+      // 只写 store：OnlineMap 订阅工作集变化后统一 setWorkspace→rebuild（避免重复全量重建）
+      useLayerEditStore.getState().applyMergeResult(this.layerId, [...updates.values()])
+    }
+    this.clearMergeOverlay()
+    // clearMergeOverlay 不恢复光标：开关保持开启（与圈选工具一致，便于连续合并）
+    if (aligned > 0) {
+      const key = skipped > 0 ? 'map.mergeAlignedSkipped' : 'map.mergeAligned'
+      this.showMapHint(
+        i18n.t(key, { aligned, skipped })
+          || `节点合并完成：已对齐 ${aligned} 个边框${skipped ? `，跳过 ${skipped} 个` : ''}（Ctrl+Z 撤销）`,
+      )
+    } else {
+      this.showMapHint(i18n.t('map.mergeNothingAligned') || '参考边框与可编辑边框类型不匹配（线/面需一致），未做对齐')
+    }
+  }
+
+  /** 替换后的 GeoJSON geometry → Leaflet setLatLngs 入参 */
+  private geomToLeafletLatLngs(geom: any): any {
+    const toRing = (coords: Array<[number, number]>) => coords.map((c) => L.latLng(c[1], c[0]))
+    switch (geom.type) {
+      case 'LineString':
+        return toRing(geom.coordinates)
+      case 'Polygon':
+        return geom.coordinates.map(toRing)
+      case 'MultiLineString':
+        return geom.coordinates.map((line: any) => toRing(line))
+      case 'MultiPolygon':
+        return geom.coordinates.map((poly: any) => poly.map(toRing))
+      default:
+        return []
+    }
   }
 }
