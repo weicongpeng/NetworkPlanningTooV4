@@ -5,7 +5,7 @@ import {
   Database,
   Settings,
   Map,
-  Layers,
+  GitCompare,
   Shield,
   Users,
   LogOut,
@@ -26,6 +26,7 @@ import { useAuthStore } from '../../store/authStore'
 import { useThemeStore } from '../../store/themeStore'
 import { reloadUserMapSettings } from '../../store/mapStore'
 import { GlobalTaskIndicator } from './GlobalTaskIndicator'
+import { Toaster } from './Toaster'
 import { appVersionsApi } from '../../services/api'
 import { prefetchPage } from '../../pageLoaders'
 
@@ -109,7 +110,7 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
     {
       type: 'group',
       name: t('nav.paramCheck'),
-      icon: Layers,
+      icon: GitCompare,
       children: [
         { type: 'link', name: t('nav.tac'), href: '/tac' },
       ],
@@ -720,6 +721,7 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
             </div>
           </div>
         )}
+      <Toaster />
     </div>
   )
 }

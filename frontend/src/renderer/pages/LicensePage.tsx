@@ -33,7 +33,8 @@ export function LicensePage() {
     const root = document.documentElement
     const themeVars = mode === 'dark' ? DARK_THEME_VARS : LIGHT_THEME_VARS
     Object.entries(themeVars).forEach(([key, value]) => {
-      root.style.setProperty(`--${key}`, value)
+      // kebab-case：与 applyTheme / CSS 变量名一致（驼峰名写不进 --muted-foreground 等）
+      root.style.setProperty(`--${kebabCase(key)}`, value)
     })
   }
 

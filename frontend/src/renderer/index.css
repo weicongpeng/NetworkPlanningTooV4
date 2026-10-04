@@ -38,6 +38,9 @@
     --input: 220 11% 22%;
     --ring: 207 90% 54%;
 
+    /* 黄色提示文字（与 themeStore 的 warningForeground 一致，浅色主题下会加深） */
+    --warning-foreground: 43 96% 56%;
+
     --radius: 0.5rem;
   }
 }
@@ -111,6 +114,11 @@
 /* 打点标记 - 确保可点击 */
 .leaflet-marker-icon.capture-marker {
   cursor: pointer !important;
+}
+
+/* 打点标记（"选择"工具下可拖动移位） - 光标提示可拖拽 */
+.leaflet-marker-icon.capture-marker.leaflet-marker-draggable {
+  cursor: move !important;
 }
 
 
@@ -359,4 +367,23 @@ body.resizing-column * {
 .input-pulse {
   animation: input-pulse 1.5s ease-in-out infinite;
   border-color: hsl(var(--primary)) !important;
+}
+
+/* 统一标准复选框：全应用图层相关复选框固定 14x14，accent 跟随主题。
+   （历史上裸 checkbox=13px、w-4 h-4=16px 混用，导致 RSRP 等行复选框大小不一） */
+.layer-standard-checkbox {
+  display: block;
+  width: 14px;
+  height: 14px;
+  min-width: 14px;
+  min-height: 14px;
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+  accent-color: hsl(var(--primary));
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.layer-standard-checkbox:disabled {
+  cursor: not-allowed;
 }

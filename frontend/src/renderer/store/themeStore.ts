@@ -50,7 +50,8 @@ export const DARK_THEME_VARS = {
   destructiveForeground: '0 0% 100%',
   border: '220 9% 31%',               // L~31% - 边框，比卡片高 13%，清晰可见
   input: '220 11% 22%',               // L~22% - 输入框填充
-  ring: '207 90% 54%'
+  ring: '207 90% 54%',
+  warningForeground: '43 96% 56%'     // amber-400 - 深色底下提亮确保黄色提示可读
 }
 
 export const LIGHT_THEME_VARS = {
@@ -71,7 +72,8 @@ export const LIGHT_THEME_VARS = {
   destructiveForeground: '0 0% 100%',
   border: '220 14% 88%',              // L~88% - 比现状深 3%，清晰可见
   input: '220 16% 95%',               // 输入框填充
-  ring: '207 90% 54%'
+  ring: '207 90% 54%',
+  warningForeground: '23 83% 31%'     // amber-800 - 浅色底下加深，保证黄色提示文字可辨认（对比度 ~7:1）
 }
 
 interface ThemeState {
@@ -104,9 +106,12 @@ export const useThemeStore = create<ThemeState>()(
           const root = document.documentElement
 
           // Apply theme mode variables
+          // 变量名统一 kebab-case（与 index.css / tailwind.config 的 var(--x-y) 一致）：
+          // 此前直接拼 `--${key}`，cardForeground/mutedForeground 等驼峰名写不进 CSS 变量，
+          // 浅色主题下这些 token 一直沿用 :root 的深色默认值（muted 文字过浅、warning 提示发亮）
           const themeVars = themeMode === 'dark' ? DARK_THEME_VARS : LIGHT_THEME_VARS
           Object.entries(themeVars).forEach(([key, value]) => {
-            root.style.setProperty(`--${key}`, value)
+            root.style.setProperty(`--${kebabCase(key)}`, value)
           })
 
           // Apply color scheme variables
