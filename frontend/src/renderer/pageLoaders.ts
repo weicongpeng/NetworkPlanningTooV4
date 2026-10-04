@@ -18,20 +18,56 @@ export const loadMapPage = () => import('./pages/MapPage').then(m => ({ default:
 export const loadAdminUsersPage = () => import('./pages/AdminUsersPage').then(m => ({ default: m.AdminUsersPage }))
 export const loadAppVersionsPage = () => import('./pages/AppVersionsPage').then(m => ({ default: m.AppVersionsPage }))
 
+/**
+ * chunk 加载失败自动恢复
+ *
+ * 生产部署后 Vite 清空旧产物（emptyOutDir），仍停留在旧版本页面的浏览器
+ * 动态 import 旧 hash chunk 时会拿到 SPA 回退的 index.html（MIME 错误）或网络失败。
+ * 此时自动刷新一次加载新版本；刷新后仍失败则抛出，避免刷新死循环。
+ */
+const CHUNK_RELOAD_KEY = 'chunk_reload_attempted'
+
+export function recoverable<T>(factory: () => Promise<T>): () => Promise<T> {
+  return () => factory().then((mod) => {
+    try { sessionStorage.removeItem(CHUNK_RELOAD_KEY) } catch { /* noop */ }
+    return mod
+  }).catch((error) => {
+    let alreadyTried = false
+    try {
+      alreadyTried = sessionStorage.getItem(CHUNK_RELOAD_KEY) === '1'
+    } catch {
+      // sessionStorage 不可用（如站点数据被禁用），无法防循环，直接抛出
+      throw error
+    }
+    if (alreadyTried) {
+      try { sessionStorage.removeItem(CHUNK_RELOAD_KEY) } catch { /* noop */ }
+      throw error
+    }
+    try {
+      sessionStorage.setItem(CHUNK_RELOAD_KEY, '1')
+    } catch {
+      throw error
+    }
+    window.location.reload()
+    // 刷新期间挂起 Promise，避免 Suspense 渲染异常
+    return new Promise<T>(() => {})
+  })
+}
+
 // 懒加载组件（App.tsx 路由使用）
-export const DataPage = lazy(loadDataPage)
-export const PCIPage = lazy(loadPCIPage)
-export const NeighborPage = lazy(loadNeighborPage)
-export const TACPage = lazy(loadTACPage)
-export const TACPlanningPage = lazy(loadTACPlanningPage)
-export const LicensePage = lazy(loadLicensePage)
-export const LayerToolsPage = lazy(loadLayerToolsPage)
-export const DistanceMatchPage = lazy(loadDistanceMatchPage)
-export const SiteSpacingPage = lazy(loadSiteSpacingPage)
-export const FrequencyConversionPage = lazy(loadFrequencyConversionPage)
-export const MapPage = lazy(loadMapPage)
-export const AdminUsersPage = lazy(loadAdminUsersPage)
-export const AppVersionsPage = lazy(loadAppVersionsPage)
+export const DataPage = lazy(recoverable(loadDataPage))
+export const PCIPage = lazy(recoverable(loadPCIPage))
+export const NeighborPage = lazy(recoverable(loadNeighborPage))
+export const TACPage = lazy(recoverable(loadTACPage))
+export const TACPlanningPage = lazy(recoverable(loadTACPlanningPage))
+export const LicensePage = lazy(recoverable(loadLicensePage))
+export const LayerToolsPage = lazy(recoverable(loadLayerToolsPage))
+export const DistanceMatchPage = lazy(recoverable(loadDistanceMatchPage))
+export const SiteSpacingPage = lazy(recoverable(loadSiteSpacingPage))
+export const FrequencyConversionPage = lazy(recoverable(loadFrequencyConversionPage))
+export const MapPage = lazy(recoverable(loadMapPage))
+export const AdminUsersPage = lazy(recoverable(loadAdminUsersPage))
+export const AppVersionsPage = lazy(recoverable(loadAppVersionsPage))
 
 /**
  * 导航预加载：导航项 hover 时提前拉取目标页面 chunk，
@@ -57,4 +93,4 @@ export function prefetchPage(href: string) {
   }
 }
 export const loadAssistantPage = () => import('./pages/AssistantPage').then(m => ({ default: m.AssistantPage }))
-export const AssistantPageLazy = lazy(loadAssistantPage)
+export const AssistantPageLazy = lazy(recoverable(loadAssistantPage))
