@@ -621,7 +621,8 @@ interface CellListResponse {
 const _CELL_LIST_CACHE_KEY = () => `cell_list_cache${userCacheSuffix()}`
 const _CELL_LIST_CACHE_TTL = 24 * 60 * 60 * 1000 // 24小时缓存
 /** 缓存版本，递增以强制刷新缓存（接口数据格式变更时） */
-const _CELL_LIST_CACHE_VERSION = 4
+// v5：小区经纬度改为只取小区自身值（不再回退站点坐标），旧缓存会残留错误坐标
+const _CELL_LIST_CACHE_VERSION = 5
 
 // 内存缓存（持久化，仅在数据更新时失效），按登录用户分键防止切账号串组
 const _cellListCacheByUser = new Map<string, { data: CellListResponse; time: number }>()

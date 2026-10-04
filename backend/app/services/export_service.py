@@ -99,13 +99,14 @@ async def export_tac_result(task_id: str, result: Dict[str, Any], format: str = 
             # 与统计卡片保持一致：直接根据isSingularity字段显示，现网TAC为空也显示"否"
             df["TAC是否插花"] = df["TAC是否插花"].map({True: "是", False: "否"})
 
-        # 转换TAC建议值：与统计卡片保持一致，根据isSingularity决定显示
+        # 转换TAC建议值：插花小区取图层TAC值；TAC不一致但非插花的小区给人工核查提示
         def get_suggested_tac_display(row):
-            is_singularity = row.get("TAC是否插花") == "是"
-            tac = row.get("图层TAC")
-            # 只有插花小区才显示建议值（取图层TAC值）
-            if is_singularity and pd.notna(tac):
-                return str(tac)
+            if row.get("TAC是否插花") == "是":
+                tac = row.get("图层TAC")
+                return str(tac) if pd.notna(tac) else ""
+            if row.get("TAC是否一致") == "否":
+                from app.services.tac_planning_service import SUGGEST_RECHECK_TEXT
+                return SUGGEST_RECHECK_TEXT
             return ""
         df["TAC建议值"] = df.apply(get_suggested_tac_display, axis=1)
 

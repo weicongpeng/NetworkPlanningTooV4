@@ -20,6 +20,31 @@ from shapely.strtree import STRtree
 logger = logging.getLogger(__name__)
 
 
+def _cell_identity(site_id: Any, sector_id: Any) -> str:
+    """小区复合标识 siteId_sectorId（与前端选中 id 格式一致）
+
+    sectorId 只在站点内唯一、跨站点会大量重复，不能用裸 sectorId 标识小区，
+    否则不同站点同 id 的小区会互相连坐/详情串号。
+    """
+    site = "" if site_id is None else str(site_id)
+    sector = "" if sector_id is None else str(sector_id)
+    return f"{site}_{sector}"
+
+
+def _location_key(longitude: Any, latitude: Any) -> Optional[Tuple[float, float]]:
+    """位置键：坐标按 6 位小数取整（与邻区同位置排除的 1e-6 容差口径一致）"""
+    if longitude is None or latitude is None:
+        return None
+    try:
+        return (round(float(longitude), 6), round(float(latitude), 6))
+    except (TypeError, ValueError):
+        return None
+
+
+# TAC不一致但非插花（现网TAC与周边一致、但与图层不符）小区的「TAC建议值」提示文案
+SUGGEST_RECHECK_TEXT = "需核查是否存在拉远小区、TAC边界、合并小区等"
+
+
 class LRUCache:
     """简单的LRU缓存实现，用于存储TAC区域"""
 
@@ -83,6 +108,34 @@ class TACPlanningService:
         self._seen_cells = {}  # 用于NR网络去重的字典
         # STRtree 空间索引缓存 {network_type: (tree, tac_id_map)}
         self._strtree_cache: Dict[str, tuple] = {}
+        # 最近一次加载小区时因工参数据不全被跳过的小区记录（供任务结果回传提示）
+        self.last_load_skipped: List[Dict] = []
+
+    @staticmethod
+    def _coerce_coord(value: Any) -> Optional[float]:
+        """把坐标值安全转为 float；None/空串/0/非数字/NaN/Inf 均返回 None（视为缺失）"""
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            coord = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(coord) or coord == 0:
+            return None
+        return coord
+
+    def _record_skipped(
+        self, site_id: Any, site_name: Any, sector_id: Any,
+        sector_name: Any, reason: str,
+    ) -> None:
+        """记录一个因工参数据不全被跳过的小区（reason: missing_ids / missing_coordinates）"""
+        self.last_load_skipped.append({
+            "siteId": "" if site_id is None else str(site_id),
+            "siteName": "" if site_name is None else str(site_name),
+            "sectorId": "" if sector_id is None else str(sector_id),
+            "sectorName": "" if sector_name is None else str(sector_name),
+            "reason": reason,
+        })
 
     def load_tac_layers(
         self,
@@ -449,6 +502,8 @@ class TACPlanningService:
         Returns:
             小区列表（包含经纬度）
         """
+        # 每次加载前重置跳过记录（含早退分支），避免沿用上一次的结果
+        self.last_load_skipped = []
         if not city or not operator:
             return []
         try:
@@ -516,16 +571,22 @@ class TACPlanningService:
                     sector_name = sector.get("name", "")
 
                     if not site_id or not sector_id:
+                        self._record_skipped(
+                            site_id, site_name, sector_id, sector_name, "missing_ids"
+                        )
                         continue
 
-                    # 获取经纬度
-                    longitude = sector.get("longitude", 0)
-                    latitude = sector.get("latitude", 0)
+                    # 获取经纬度（0/空/非数字/NaN 均视为缺失，统一转 float）
+                    longitude = self._coerce_coord(sector.get("longitude"))
+                    latitude = self._coerce_coord(sector.get("latitude"))
 
                     # 只保留有经纬度的小区
-                    if not longitude or not latitude:
+                    if longitude is None or latitude is None:
                         logger.debug(
                             f"跳过无经纬度的小区: site={site_id}, sector={sector_id}"
+                        )
+                        self._record_skipped(
+                            site_id, site_name, sector_id, sector_name, "missing_coordinates"
                         )
                         continue
 
@@ -562,8 +623,12 @@ class TACPlanningService:
                     cells.append(cell)
 
             if not cells:
+                skipped_note = (
+                    f"（其中 {len(self.last_load_skipped)} 个小区因工参数据不全被跳过）"
+                    if self.last_load_skipped else ""
+                )
                 raise ValueError(
-                    f"未找到{network_type}小区数据，请确保已导入包含经纬度的全量工参文件"
+                    f"未找到{network_type}小区数据，请确保已导入包含经纬度的全量工参文件{skipped_note}"
                 )
 
             logger.info(
@@ -695,8 +760,11 @@ class TACPlanningService:
             network_type: 网络类型 'LTE' 或 'NR'
             enable_singularity_check: 是否启用TAC插花检测，默认True
             singularity_config: 插花检测配置，包含：
-                - search_radius: 搜索半径（米），默认1500
-                - singularity_threshold: 异TAC占比阈值，默认0.7
+                - spacing_factor: 站间距系数（默认2.0），搜索半径 = 系数 × 该物理点平均站间距
+                  （物理点=100m内小区合并；平均站间距=最近4个站间距均值）
+                - search_radius: （可选，兼容/排障）显式固定搜索半径（米），给出时优先于系数
+                - singularity_threshold: 异TAC占比阈值（0~1），默认0.5。
+                  异TAC占比 = 周边TAC与本站不同的加权占比 = 1 - 本站TAC在周边的加权占比
             progress_callback: 进度回调函数
             city/operator: (地市+运营商) 组快照，提供时仅在组内解析全量工参
 
@@ -840,7 +908,10 @@ class TACPlanningService:
                     normalized = {}
                     for key, value in config.items():
                         # 处理驼峰命名转下划线命名
-                        if key == "searchRadius":
+                        if key == "spacingFactor":
+                            normalized["spacing_factor"] = value
+                        elif key == "searchRadius":
+                            # 兼容旧的固定搜索半径配置（显式给出时优先于站间距系数）
                             normalized["search_radius"] = value
                         elif key == "singularityThreshold":
                             normalized["singularity_threshold"] = value
@@ -850,12 +921,15 @@ class TACPlanningService:
 
                 normalized_config = normalize_config(singularity_config)
                 config = normalized_config if normalized_config else {
-                    "search_radius": 1500,
+                    "spacing_factor": 2.0,
                     "singularity_threshold": 0.5,
                 }
 
-                logger.info(f"[TAC插花检测配置] search_radius={config.get('search_radius')}, "
-                           f"singularity_threshold={config.get('singularity_threshold')}")
+                logger.info(
+                    f"[TAC插花检测配置] spacing_factor={config.get('spacing_factor')}, "
+                    f"search_radius={config.get('search_radius')}, "
+                    f"singularity_threshold={config.get('singularity_threshold')}"
+                )
 
                 # 1. 筛选出TAC不一致且现网TAC有效的小区（只对这些小区进行插花检测）
                 # 需要重新计算is_consistent来找出mismatched cells
@@ -900,26 +974,33 @@ class TACPlanningService:
 
                 # 2. 对TAC不一致的小区进行插花检测
                 # 关键修复：neighbor_pool使用全量小区（cells），确保TAC一致的正常小区也参与周边TAC分布统计
+                # 搜索半径：优先用显式 search_radius；否则按「系数 × 该物理点平均站间距」逐站点自适应
                 singularity_cells = self.check_tac_singularity(
                     cells=mismatched_cells,
                     neighbor_pool=cells,
-                    search_radius=config.get("search_radius", 1500),
-                    singularity_threshold=config.get("singularity_threshold", 0.7),
+                    search_radius=config.get("search_radius"),
+                    singularity_threshold=config.get("singularity_threshold", 0.5),
+                    spacing_factor=config.get("spacing_factor", 2.0),
                     progress_callback=progress_callback,
                 )
 
-                # 3. 创建插花小区的ID集合，用于快速查找
-                singularity_ids = set(cell["sectorId"] for cell in singularity_cells)
+                # 3. 创建插花小区的复合键集合，用于快速查找
+                # 【关键修复】必须用 siteId_sectorId 复合键：sectorId 跨站点大量重复，
+                # 用裸 sectorId 会把其他站点同 id 的小区连带标记为插花
+                singularity_keys = set(
+                    _cell_identity(cell.get("siteId"), cell.get("sectorId"))
+                    for cell in singularity_cells
+                )
 
                 # 【关键修复】创建插花位置的坐标集合（用于同位置小区同步标记）
                 # 同位置（相同经纬度）的任一小区被标记为插花时，该位置所有小区都应该被标记
                 singularity_locations = set()
                 for cell in singularity_cells:
-                    loc_key = (cell.get("longitude"), cell.get("latitude"))
-                    if loc_key[0] is not None and loc_key[1] is not None:
+                    loc_key = _location_key(cell.get("longitude"), cell.get("latitude"))
+                    if loc_key is not None:
                         singularity_locations.add(loc_key)
 
-                logger.info(f"[TAC插花标记] 发现 {len(singularity_ids)} 个插花小区，涉及 {len(singularity_locations)} 个不同位置")
+                logger.info(f"[TAC插花标记] 发现 {len(singularity_keys)} 个插花小区，涉及 {len(singularity_locations)} 个不同位置")
 
                 # 4. 在结果中标记插花小区
                 marked_singularity_count = 0
@@ -946,21 +1027,26 @@ class TACPlanningService:
                     # 【关键修复】只有TAC不一致且现网TAC有效的小区才会被标记为插花
                     # 现网TAC为空的小区永远不应该被标记为插花
                     # 【关键修复】同位置（相同经纬度）的任一小区被标记为插花时，该位置所有小区都应该被标记
-                    cell_location = (cell.get("longitude"), cell.get("latitude"))
-                    is_at_singularity_location = cell_location in singularity_locations
+                    # 【关键修复】自身命中用 siteId_sectorId 复合键判断，避免跨站点同 id 连坐
+                    cell_key = _cell_identity(result.get("siteId"), result.get("sectorId"))
+                    cell_location = _location_key(cell.get("longitude"), cell.get("latitude"))
+                    is_at_singularity_location = (
+                        cell_location is not None and cell_location in singularity_locations
+                    )
+                    is_self_singularity = cell_key in singularity_keys
 
                     is_singularity = (
                         existing_str is not None  # 现网TAC必须有效（非空）
                         and tac_str is not None
                         and not is_consistent
-                        and (result["sectorId"] in singularity_ids or is_at_singularity_location)
+                        and (is_self_singularity or is_at_singularity_location)
                     )
 
                     # 调试日志：记录同位置小区的插花标记情况
-                    if is_at_singularity_location and not (result["sectorId"] in singularity_ids):
+                    if is_at_singularity_location and not is_self_singularity:
                         logger.info(
                             f"[TAC插花标记-同位置同步] 小区={cell.get('sectorName')}, "
-                            f"sectorId={result['sectorId']}, 位置={cell_location}, "
+                            f"sectorId={result.get('sectorId')}, 位置={cell_location}, "
                             f"同位置其他小区被标记为插花，本小区同步标记"
                         )
 
@@ -968,9 +1054,13 @@ class TACPlanningService:
                     result["isSingularity"] = is_singularity
 
                     if is_singularity:
-                        # 获取插花详情
+                        # 获取插花详情（必须用 siteId_sectorId 复合键，避免取到其他站点同 id 小区的详情）
                         singularity_info = next(
-                            (s for s in singularity_cells if s["sectorId"] == result["sectorId"]),
+                            (
+                                s for s in singularity_cells
+                                if str(s.get("siteId", "")) == str(result.get("siteId", ""))
+                                and str(s.get("sectorId", "")) == str(result.get("sectorId", ""))
+                            ),
                             None,
                         )
                         if singularity_info:
@@ -979,8 +1069,8 @@ class TACPlanningService:
                         result["suggestedTac"] = tac_id
                         marked_singularity_count += 1
                     elif existing_str is not None and tac_str is not None and not is_consistent:
-                        # TAC不一致但不是插花，建议值取图层TAC
-                        result["suggestedTac"] = tac_id
+                        # TAC不一致且非插花（现网TAC与周边一致但与图层不符）：建议人工核查
+                        result["suggestedTac"] = SUGGEST_RECHECK_TEXT
                     else:
                         # TAC一致或现网TAC为空，建议值为空
                         result["suggestedTac"] = None
@@ -1036,8 +1126,12 @@ class TACPlanningService:
             total_cells = len(cells)
 
             if not cells:
+                skipped_note = (
+                    f"（其中 {len(self.last_load_skipped)} 个小区因工参数据不全被跳过）"
+                    if self.last_load_skipped else ""
+                )
                 raise ValueError(
-                    f"未找到{network_type}待规划小区或有效坐标"
+                    f"未找到{network_type}待规划小区或有效坐标{skipped_note}"
                 )
 
             logger.info(f"成功加载 {total_cells} 个{network_type}待规划小区")
@@ -1105,6 +1199,8 @@ class TACPlanningService:
         """
         加载待规划小区清单（直接接收并解析数据结构）
         """
+        # 每次加载前重置跳过记录，避免沿用上一次的结果
+        self.last_load_skipped = []
         try:
             cells = []
             # 添加去重字典，确保小区唯一性
@@ -1122,11 +1218,17 @@ class TACPlanningService:
                     sector_id = sector.get("id") or sector.get("sectorId", "")
                     sector_name = sector.get("name") or sector.get("sectorName", "")
 
-                    # 优先获取小区级别坐标，否则使用基站级别
-                    lon = sector.get("longitude") or site_lon
-                    lat = sector.get("latitude") or site_lat
+                    # 优先获取小区级别坐标，否则使用基站级别（0/空/非数字/NaN 均视为缺失）
+                    lon = self._coerce_coord(sector.get("longitude")) or self._coerce_coord(site_lon)
+                    lat = self._coerce_coord(sector.get("latitude")) or self._coerce_coord(site_lat)
 
-                    if not lon or not lat:
+                    if lon is None or lat is None:
+                        logger.debug(
+                            f"跳过无有效坐标的待规划小区: site={site_id}, sector={sector_id}"
+                        )
+                        self._record_skipped(
+                            site_id, site_name, sector_id, sector_name, "missing_coordinates"
+                        )
                         continue
 
                     # 构建唯一键进行去重（站点ID & 小区ID）
@@ -1184,12 +1286,129 @@ class TACPlanningService:
 
         return 6371000 * c  # 地球半径约6371km
 
+    def _build_search_radius_map(
+        self,
+        pool: List[Dict],
+        spacing_factor: float,
+        cluster_radius_m: float = 100.0,
+        nearest_count: int = 4,
+        fallback_radius_m: float = 1500.0,
+    ) -> Dict[str, float]:
+        """按物理点计算每个小区的搜索半径 = 站间距系数 × 该点平均站间距
+
+        - 物理点：100m 内的多个小区就近合并为一个物理点（同站多 RRU/室分只算一个点；
+          工参里一个 siteId 下挂多个相距数公里的 RRU 时不会被误当成同一个点）
+        - 平均站间距：该物理点到最近 nearest_count 个「其他物理点」的距离均值（不足则取可用数量的均值）
+        - 没有任何其他物理点时返回 fallback_radius_m（此时任何半径都取不到邻区）
+
+        Returns:
+            {f"{siteId}_{sectorId}": 搜索半径(米)}
+        """
+        pool_cells = [
+            c for c in pool
+            if c.get("longitude") is not None and c.get("latitude") is not None
+        ]
+        if not pool_cells:
+            return {}
+
+        try:
+            from sklearn.neighbors import BallTree
+        except ImportError:
+            logger.error("未安装sklearn库，无法按站间距计算搜索半径")
+            return {}
+
+        lons = np.array([float(c["longitude"]) for c in pool_cells])
+        lats = np.array([float(c["latitude"]) for c in pool_cells])
+
+        # 1. 100m 内就近合并为物理点（网格分桶 + 3×3 邻桶查找，不做链式连通）
+        # 桶步长取 2×合并半径，保证与某点均值相距≤100m 的小区必落在其 3×3 邻域内
+        deg_step = (cluster_radius_m * 2) / 111320.0
+        grid: Dict[Tuple[int, int], List[int]] = {}
+        sum_lon: List[float] = []
+        sum_lat: List[float] = []
+        counts: List[int] = []
+        point_bucket: List[Tuple[int, int]] = []
+        cell_point: List[int] = []
+
+        def _bucket(lon: float, lat: float) -> Tuple[int, int]:
+            return (math.floor(lon / deg_step), math.floor(lat / deg_step))
+
+        for i in range(len(pool_cells)):
+            lon_i, lat_i = float(lons[i]), float(lats[i])
+            gx, gy = _bucket(lon_i, lat_i)
+            best_pi = None
+            best_dist = None
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    for pi in grid.get((gx + dx, gy + dy), ()):
+                        plon = sum_lon[pi] / counts[pi]
+                        plat = sum_lat[pi] / counts[pi]
+                        d = self._calculate_distance(
+                            {"longitude": lon_i, "latitude": lat_i},
+                            {"longitude": plon, "latitude": plat},
+                        )
+                        if d <= cluster_radius_m and (best_dist is None or d < best_dist):
+                            best_dist, best_pi = d, pi
+            if best_pi is None:
+                best_pi = len(counts)
+                sum_lon.append(lon_i)
+                sum_lat.append(lat_i)
+                counts.append(1)
+                b = _bucket(lon_i, lat_i)
+                point_bucket.append(b)
+                grid.setdefault(b, []).append(best_pi)
+            else:
+                sum_lon[best_pi] += lon_i
+                sum_lat[best_pi] += lat_i
+                counts[best_pi] += 1
+                mean_lon = sum_lon[best_pi] / counts[best_pi]
+                mean_lat = sum_lat[best_pi] / counts[best_pi]
+                nb = _bucket(mean_lon, mean_lat)
+                if nb != point_bucket[best_pi]:
+                    point_bucket[best_pi] = nb
+                    grid.setdefault(nb, []).append(best_pi)
+            cell_point.append(best_pi)
+
+        n_points = len(counts)
+        point_lon = np.array([sum_lon[i] / counts[i] for i in range(n_points)])
+        point_lat = np.array([sum_lat[i] / counts[i] for i in range(n_points)])
+
+        # 2. 每个物理点到最近 nearest_count 个「其他物理点」的距离均值
+        point_coords = np.radians(np.column_stack([point_lat, point_lon]))
+        point_tree = BallTree(point_coords, metric="haversine")
+        k = min(nearest_count + 1, n_points)
+        dists, idxs = point_tree.query(point_coords, k=k)
+
+        radius_by_point: List[float] = []
+        for i in range(n_points):
+            others = [
+                float(d) * 6371000.0
+                for d, j in zip(dists[i], idxs[i]) if int(j) != i
+            ]  # 最近站点只算一个（每个物理点只取一次）
+            if not others:
+                radius_by_point.append(fallback_radius_m)
+            else:
+                radius_by_point.append(spacing_factor * (sum(others) / len(others)))
+
+        logger.info(
+            f"[站间距搜索半径] 物理点数={n_points}（由 {len(pool_cells)} 个小区合并，"
+            f"最近{nearest_count}个站间距均值）, 系数={spacing_factor}, "
+            f"半径范围={min(radius_by_point):.0f}~{max(radius_by_point):.0f}m"
+        )
+
+        # 3. 映射回每个小区
+        radius_map: Dict[str, float] = {}
+        for cell, pi in zip(pool_cells, cell_point):
+            radius_map[_cell_identity(cell.get("siteId"), cell.get("sectorId"))] = radius_by_point[pi]
+        return radius_map
+
     def check_tac_singularity(
         self,
         cells: List[Dict],
         neighbor_pool: Optional[List[Dict]] = None,
-        search_radius: float = 1500,
-        singularity_threshold: float = 0.7,
+        search_radius: Optional[float] = None,
+        singularity_threshold: float = 0.5,
+        spacing_factor: float = 2.0,
         progress_callback=None,
     ) -> List[Dict[str, Any]]:
         """
@@ -1203,8 +1422,12 @@ class TACPlanningService:
             neighbor_pool: 邻区搜索池（所有小区），用于构建空间索引和统计周边TAC分布。
                            若为None则默认使用cells本身（兼容旧行为）。
                            【关键】应传入全量小区列表，确保TAC一致的正常小区也参与邻区投票。
-            search_radius: 搜索半径（米），默认1500米
-            singularity_threshold: 异TAC占比阈值，默认70%
+            search_radius: 固定搜索半径（米）。显式给出时所有小区都用它（排障/测试用）；
+                为 None（默认）时按 spacing_factor × 该物理点平均站间距逐站点自适应
+            spacing_factor: 站间距系数（默认2.0），仅当 search_radius 为 None 时生效。
+                搜索半径 = 系数 × 最近4个站间距均值（见 _build_search_radius_map）
+            singularity_threshold: 异TAC占比阈值（0~1），默认0.5。
+                异TAC占比 = 周边TAC与本站不同的加权占比 = 1 - 本站TAC在周边的加权占比
             progress_callback: 进度回调函数
 
         Returns:
@@ -1230,8 +1453,12 @@ class TACPlanningService:
         # 确定邻区搜索池：优先使用传入的neighbor_pool，否则退化为cells自身
         pool = neighbor_pool if neighbor_pool is not None else cells
 
+        radius_desc = (
+            f"固定半径={search_radius:.0f}m" if search_radius is not None
+            else f"站间距系数={spacing_factor}（按站点自适应）"
+        )
         logger.info(
-            f"开始TAC插花检测: 搜索半径={search_radius}m, "
+            f"开始TAC插花检测: {radius_desc}, "
             f"阈值={singularity_threshold}, "
             f"目标小区数={len(cells)}, 邻区搜索池={len(pool)}（全量小区）"
         )
@@ -1258,8 +1485,10 @@ class TACPlanningService:
         # 构建BallTree空间索引（Haversine距离），基于全量小区
         ball_tree = BallTree(pool_coords_rad, metric="haversine")
 
-        # 为目标小区建立sectorId -> pool索引的映射，用于排除目标小区自身
-        target_sector_ids = set(cell["sectorId"] for cell in cells)
+        # 搜索半径：显式给出 search_radius 时用固定半径；否则按「系数 × 该物理点平均站间距」自适应
+        radius_map: Dict[str, float] = {}
+        if search_radius is None:
+            radius_map = self._build_search_radius_map(pool, spacing_factor)
 
         for i, target_cell in enumerate(cells):
             # 更新进度
@@ -1274,6 +1503,14 @@ class TACPlanningService:
             target_sector_id = target_cell["sectorId"]
             target_site_id = target_cell.get("siteId", "")
 
+            # 该小区的搜索半径
+            if search_radius is not None:
+                cell_radius = search_radius
+            else:
+                cell_radius = radius_map.get(
+                    _cell_identity(target_site_id, target_sector_id), 1500.0
+                )
+
             target_coord = np.array([[
                 math.radians(target_cell["latitude"]),
                 math.radians(target_cell["longitude"])
@@ -1284,14 +1521,15 @@ class TACPlanningService:
                 f"[TAC插花检测] 开始检测小区 {i+1}/{total_cells}: "
                 f"sectorId={target_sector_id}, sectorName={target_sector_name}, "
                 f"siteId={target_site_id}, 经纬度=({target_cell['latitude']:.6f}, {target_cell['longitude']:.6f}), "
-                f"现网TAC={target_existing_tac}, 图层TAC={target_layer_tac}"
+                f"现网TAC={target_existing_tac}, 图层TAC={target_layer_tac}, "
+                f"搜索半径={cell_radius:.0f}m"
             )
 
             # 查找半径范围内的邻区（在全量小区pool中搜索）
             # query_radius返回形状为(n_samples, [array_of_indices])，取[0]获得第一个查询点的邻居索引数组
             neighbor_indices = ball_tree.query_radius(
                 target_coord,
-                r=search_radius / 6371000  # 转换为弧度
+                r=cell_radius / 6371000  # 转换为弧度
             )[0]
 
             # 筛选有效邻区（仅基于空间距离，移除方向角过滤）
@@ -1305,9 +1543,13 @@ class TACPlanningService:
             for idx in neighbor_indices:
                 neighbor_cell = pool[idx]
 
-                # 跳过目标小区自身（通过sectorId判断）
-                if neighbor_cell["sectorId"] == target_sector_id:
-                    logger.debug(f"  排除自身: sectorId={target_sector_id}")
+                # 跳过目标小区自身（siteId_sectorId 复合键判断）
+                # 【关键修复】不能用裸 sectorId：会把其他站点同 id 的小区也误当"自身"排除，
+                # 导致邻区统计缺失正常邻区
+                if _cell_identity(
+                    neighbor_cell.get("siteId"), neighbor_cell.get("sectorId")
+                ) == _cell_identity(target_site_id, target_sector_id):
+                    logger.debug(f"  排除自身: siteId={target_site_id}, sectorId={target_sector_id}")
                     continue
 
                 # 【关键修复】跳过同位置（相同经纬度）的其他小区
@@ -1329,10 +1571,10 @@ class TACPlanningService:
                 distance = self._calculate_distance(target_cell, neighbor_cell)
 
                 # 只考虑半径范围内的邻区
-                if distance <= search_radius:
+                if distance <= cell_radius:
                     valid_neighbors.append(neighbor_cell)
                 else:
-                    logger.debug(f"  邻区{neighbor_cell.get('sectorId')}距离{distance:.0f}m超出半径{search_radius}m，跳过")
+                    logger.debug(f"  邻区{neighbor_cell.get('sectorId')}距离{distance:.0f}m超出半径{cell_radius:.0f}m，跳过")
 
             if not valid_neighbors:
                 continue
@@ -1405,7 +1647,7 @@ class TACPlanningService:
                 if len(valid_neighbors) > 10:
                     neighbors_str += f", ... (共{len(valid_neighbors)}个邻区)"
                 logger.info(
-                    f"[TAC分布] 小区={target_sector_name}(ID={target_cell.get('sectorId')}), "
+                    f"[TAC分布] 小区={target_sector_name}(siteId={target_cell.get('siteId')}/ID={target_cell.get('sectorId')}), "
                     f"现网TAC={target_existing_tac}, 图层TAC={target_layer_tac}, "
                     f"邻区小区数={len(valid_neighbors)}, TAC权重分布: {tac_distribution_str}"
                 )
@@ -1418,35 +1660,42 @@ class TACPlanningService:
                     f"现网TAC={target_existing_tac}, 没有有效邻区"
                 )
 
-            # 判断目标小区TAC是否与周边主流TAC不同且占比超过阈值
-            # 【关键修复】现网TAC为空时，不进行插花判断，直接跳过
+            # 判断目标小区是否为插花：
+            # ① 现网TAC有效；② 与周边主流TAC不同；③ 异TAC占比达到阈值。
+            # 异TAC占比 = 周边小区中TAC与本站不同的加权占比 = 1 - 本站TAC在周边的加权占比。
+            # 说明：早期实现误用「主流TAC占比≥阈值」判断，导致周边TAC碎片化（无多数派）时
+            #       即使本站TAC在周边几乎不存在也不会被判为插花，与参数「异TAC阈值」语义相反。
             target_tac_raw = target_cell.get("existingTac")
             target_tac = _normalize_tac(target_tac_raw)
+            cell_tac_weight = tac_weights.get(target_tac, 0.0) if target_tac else 0.0
+            cell_tac_ratio = cell_tac_weight / total_weight if total_weight > 0 else 0.0
+            diff_tac_ratio = 1.0 - cell_tac_ratio
             is_singularity = (
                 target_tac is not None  # 现网TAC必须有效（非空、非NaN）
                 and target_tac != dominant_tac
-                and dominant_ratio >= singularity_threshold
+                and diff_tac_ratio >= singularity_threshold
             )
 
             # 详细诊断日志
             logger.info(
                 f"[TAC插花判断] 小区={target_sector_name}(sectorId={target_sector_id}), "
                 f"现网TAC={target_existing_tac}({target_tac}), 图层TAC={target_layer_tac}, "
-                f"主流TAC={dominant_tac}, 主流TAC权重占比={dominant_ratio:.2%} (>=阈值={singularity_threshold:.2%}?{dominant_ratio >= singularity_threshold}), "
-                f"现网TAC是否有效={target_tac is not None}, "
+                f"主流TAC={dominant_tac}(占比{dominant_ratio:.2%}), "
+                f"本站TAC占比={cell_tac_ratio:.2%}, 异TAC占比={diff_tac_ratio:.2%} "
+                f"(>=阈值={singularity_threshold:.2%}?{diff_tac_ratio >= singularity_threshold}), "
                 f"是否与主流不同={target_tac is not None and target_tac != dominant_tac}, "
-                f"是否插花={is_singularity}, 有效邻区小区数={len(valid_neighbors)}, 主流TAC最近距离={tac_nearest_dist.get(dominant_tac, 0):.0f}m"
+                f"是否插花={is_singularity}, 有效邻区小区数={len(valid_neighbors)}, "
+                f"主流TAC最近距离={tac_nearest_dist.get(dominant_tac, 0):.0f}m"
             )
 
-            # 如果条件接近阈值但未达到，记录警告
-            if target_tac and target_tac != dominant_tac:
-                if dominant_ratio < singularity_threshold:
-                    logger.warning(
-                        f"[TAC插花检测-未达阈值] 小区={target_sector_name}, "
-                        f"现网TAC={target_existing_tac}({target_tac}), 主流TAC={dominant_tac}, "
-                        f"主流权重占比={dominant_ratio:.2%} < 阈值={singularity_threshold:.2%}, "
-                        f"邻区小区数={len(valid_neighbors)}"
-                    )
+            # 如果与主流TAC不同但异TAC占比未达阈值，记录警告
+            if target_tac and target_tac != dominant_tac and diff_tac_ratio < singularity_threshold:
+                logger.warning(
+                    f"[TAC插花检测-未达阈值] 小区={target_sector_name}, "
+                    f"现网TAC={target_existing_tac}({target_tac}), 主流TAC={dominant_tac}, "
+                    f"异TAC占比={diff_tac_ratio:.2%} < 阈值={singularity_threshold:.2%}, "
+                    f"邻区小区数={len(valid_neighbors)}"
+                )
 
             if is_singularity:
                 singularity_results.append({
@@ -1458,13 +1707,15 @@ class TACPlanningService:
                     "dominantTac": dominant_tac,
                     "validNeighborCount": len(valid_neighbors),
                     "dominantTacNearestDistance": round(tac_nearest_dist.get(dominant_tac, 0), 2),  # 主流TAC最近距离
-                    "异TAC占比": round((1 - dominant_ratio) * 100, 2),
+                    "cellTacRatio": round(cell_tac_ratio * 100, 2),  # 本站TAC在周边的加权占比
+                    "异TAC占比": round(diff_tac_ratio * 100, 2),  # 周边TAC与本站不同的加权占比
                     "dominantTacRatio": round(dominant_ratio * 100, 2),
                 })
                 logger.info(
                     f"[TAC插花检测-发现插花] 小区={target_sector_name}, "
                     f"现网TAC={target_existing_tac} != 主流TAC={dominant_tac}, "
-                    f"主流权重占比={dominant_ratio:.2%} (主流TAC最近距离={tac_nearest_dist.get(dominant_tac, 0):.0f}m)"
+                    f"异TAC占比={diff_tac_ratio:.2%} (本站TAC占比={cell_tac_ratio:.2%}, "
+                    f"主流TAC最近距离={tac_nearest_dist.get(dominant_tac, 0):.0f}m)"
                 )
 
         logger.info(f"TAC插花检测完成: 发现 {len(singularity_results)} 个插花小区")

@@ -610,11 +610,10 @@ class TACConfig(BaseModel):
     )
     singularityConfig: Optional[Dict[str, Any]] = Field(
         default={
-            "search_radius": 1500,
-            "azimuth_tolerance": 60,
+            "spacing_factor": 2.0,
             "singularity_threshold": 0.5,
         },
-        description="TAC插花检测配置",
+        description="TAC插花检测配置：spacing_factor=站间距系数（搜索半径=系数×该物理点平均站间距）",
     )
     selectedCellIds: Optional[List[str]] = Field(
         default=None,

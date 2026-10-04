@@ -276,8 +276,6 @@ async def get_cell_list(limit: int = 50000, current_user=Depends(get_current_use
             network_type = site.get("networkType", "")
             site_id = site.get("id") or site.get("siteId") or ""
             sectors = site.get("sectors") or []
-            site_lat = site.get("latitude") or 0.0
-            site_lng = site.get("longitude") or 0.0
 
             for sector in sectors:
                 cell_id = sector.get("id") or sector.get("cellId") or sector.get("sectorId") or ""
@@ -290,11 +288,14 @@ async def get_cell_list(limit: int = 50000, current_user=Depends(get_current_use
 
                 sector_name = sector.get("name") or site_name or unique_key
 
-                # 经纬度：扇区级优先，缺失/无效时回退到站点级，均无效为 None
+                # 经纬度只取小区（扇区）自身值，缺失/为 0 时返回 None。
+                # 不能回退到站点级：一个站点行下可能挂多个逻辑站点的小区（共 BBU/多站共站址），
+                # 站点级坐标取自该行第一条小区，回退会把别的小区坐标显示到本小区上，
+                # 与数据管理「查询/修改」口径不一致，也会让缺坐标的小区绕过执行前校验。
                 sector_lat = sector.get("latitude") or 0.0
                 sector_lng = sector.get("longitude") or 0.0
-                latitude = sector_lat if 0 < sector_lat < 90 else (site_lat if 0 < site_lat < 90 else None)
-                longitude = sector_lng if 0 < sector_lng < 180 else (site_lng if 0 < site_lng < 180 else None)
+                latitude = sector_lat if 0 < sector_lat < 90 else None
+                longitude = sector_lng if 0 < sector_lng < 180 else None
 
                 cell_item = {
                     "id": unique_key,

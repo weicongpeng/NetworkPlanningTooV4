@@ -22,7 +22,8 @@ import { StepIndicator } from '../components/StepIndicator'
 import { WizardFooter } from '../components/WizardFooter'
 import { extractCellIdsFromFile, matchCellIds, downloadCellTreeTemplate } from '../utils/cellFileHelper'
 import { generateFullTaskName } from '../utils/taskNameUtils'
-import { buildMissingCellsError } from '../utils/cellValidation'
+import { SkippedCellsNotice } from '../components/SkippedCellsNotice'
+import type { SkippedCellInfo } from '@shared/types'
 
 // 虚拟滚动配置
 const ITEM_HEIGHT = 48 // 每行高度
@@ -62,6 +63,8 @@ interface TACResultData {
   mismatchedCells: number
   mismatchedRate: number
   singularityCount?: number  // TAC插花数量
+  skippedCells?: SkippedCellInfo[]  // 因工参数据不全被跳过的小区
+  skippedCount?: number
   results: any[]
   startTime: string
   endTime?: string
@@ -80,7 +83,7 @@ export function TACPage() {
     console.log(`[TACPage] render #${perfRef.current.renderCount} at +${(now - perfRef.current.mountTime).toFixed(0)}ms`)
   }
 
-  const { t, i18n } = useTranslation()
+  const { t } = useTranslation()
   const user = useAuthStore((s) => s.user)
   const { wizardStep, setWizardStep, config, setConfig, selectedCellIds: storeSelectedCellIds, activeLeftTab, setActiveLeftTab, taskName, setTaskName, resetConfig: storeResetConfig } = useTACCheckStore()
   const [taskNameError, setTaskNameError] = useState<string | null>(null)
@@ -222,7 +225,7 @@ export function TACPage() {
 
   // 插花检测配置状态
   const [singularityConfig, setSingularityConfig] = useState({
-    searchRadius: 1500,
+    spacingFactor: 2,
     singularityThreshold: 0.5,
   })
 
@@ -478,7 +481,7 @@ export function TACPage() {
     setWizardStep('idle'); setTaskName(''); setTaskNameError(null); setNextTaskError(null)
     setSelectedCellIdsSet(new Set()); setError(null)
     setConfig({ networkType: 'LTE' })
-    setSingularityConfig({ searchRadius: 1500, singularityThreshold: 0.5 })
+    setSingularityConfig({ spacingFactor: 2, singularityThreshold: 0.5 })
   }
 
   // ===== 上一步逻辑 =====
@@ -537,24 +540,7 @@ export function TACPage() {
       setError(t('tac.noCellsSelected') || '请在小区选择列表中至少选择一个小区后再执行TAC核查')
       return
     }
-    // 校验选中小区的必要字段（经度/纬度/频点/基站ID/小区ID）
-    const sourceSectors = (config?.networkType || 'LTE') === 'LTE' ? cellListData.lte : cellListData.nr
-    const missingCellsError = buildMissingCellsError(sourceSectors, selectedCellIdsSet, {
-      labels: {
-        siteId: t('tac.siteId') || '基站ID',
-        cellId: t('tac.cellId') || '小区ID',
-        frequency: t('tac.cellFreq') || '频点',
-        longitude: t('tac.cellLng') || '经度',
-        latitude: t('tac.cellLat') || '纬度'
-      },
-      mainTemplate: t('tac.cellsMissingData') || '选中的小区中有 {{count}} 个缺少必要数据（经度/纬度/频点/基站ID/小区ID），请补充工参后再执行。缺失示例：{{examples}}',
-      missingTemplate: t('tac.missingFieldsLabel') || '缺少：{{fields}}',
-      lang: i18n.language === 'en' ? 'en' : 'zh'
-    })
-    if (missingCellsError) {
-      setError(missingCellsError)
-      return
-    }
+    // 工参数据不全（缺经纬度/缺基站ID/小区ID）的小区不阻断执行，由后端跳过并在结果中回传提示
     setLoading(true); setError(null); setLocalTaskResult(null)
     setActiveTaskId('tac_check', null); setWizardStep('executing'); errorCountRef.current = 0
     try {
@@ -954,6 +940,15 @@ export function TACPage() {
         </div>
       )}
 
+      {/* 工参数据不全被跳过的小区提示（非阻断） */}
+      {taskResult?.skippedCells && taskResult.skippedCells.length > 0 && (
+        <SkippedCellsNotice
+          group="tac"
+          skipped={taskResult.skippedCells}
+          checkedCount={taskResult.totalCells || 0}
+        />
+      )}
+
       {/* 小区选择与结果面板（页签切换） */}
       <div className="bg-card p-4 rounded-lg border border-border flex-1 min-h-0 flex flex-col overflow-hidden">
         {/* 页签切换栏 */}
@@ -1061,12 +1056,13 @@ export function TACPage() {
                         </div>
                         <div className="grid grid-cols-2 gap-x-4 gap-y-3">
                           <div>
-                            <label className="block text-xs font-medium mb-0.5">{t('tac.searchRadius') || '搜索半径(m)'}</label>
-                            <input type="number" value={singularityConfig.searchRadius} onChange={(e) => setSingularityConfig(prev => ({ ...prev, searchRadius: parseInt(e.target.value) || 0 }))} disabled={wizardStep !== 'params_set'} step={100} className="w-full px-2 py-1.5 text-sm bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary disabled:opacity-60 disabled:cursor-not-allowed" />
+                            <label className="block text-xs font-medium mb-0.5">{t('tac.spacingFactor') || '站间距系数'}</label>
+                            <input type="number" value={singularityConfig.spacingFactor} onChange={(e) => setSingularityConfig(prev => ({ ...prev, spacingFactor: parseFloat(e.target.value) || 0 }))} disabled={wizardStep !== 'params_set'} step={0.5} className="w-full px-2 py-1.5 text-sm bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary disabled:opacity-60 disabled:cursor-not-allowed" />
+                            <p className="mt-1 text-[10px] text-muted-foreground">{t('tac.spacingFactorHint') || '搜索半径 = 系数 × 平均站间距（最近4个站间距均值）'}</p>
                           </div>
                           <div>
-                            <label className="block text-xs font-medium mb-0.5">{t('tac.singularityThreshold') || '异TAC阈值'}</label>
-                            <input type="number" value={singularityConfig.singularityThreshold} onChange={(e) => setSingularityConfig(prev => ({ ...prev, singularityThreshold: parseFloat(e.target.value) || 0 }))} disabled={wizardStep !== 'params_set'} step={0.1} className="w-full px-2 py-1.5 text-sm bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary disabled:opacity-60 disabled:cursor-not-allowed" />
+                            <label className="block text-xs font-medium mb-0.5">{t('tac.singularityThreshold') || '异TAC占比阈值(%)'}</label>
+                            <input type="number" value={Math.round(singularityConfig.singularityThreshold * 100)} onChange={(e) => setSingularityConfig(prev => ({ ...prev, singularityThreshold: (parseFloat(e.target.value) || 0) / 100 }))} disabled={wizardStep !== 'params_set'} step={5} className="w-full px-2 py-1.5 text-sm bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary disabled:opacity-60 disabled:cursor-not-allowed" />
                           </div>
                         </div>
                       </div>
@@ -1198,7 +1194,7 @@ export function TACPage() {
                       <div className="px-2.5 py-1.5 bg-blue-500/10 border border-blue-500/20 rounded-md">
                         <p className="text-[10px] text-blue-600">{t('tac.mismatchRate') || '错配率'}</p>
                         <p className="text-sm font-semibold text-blue-600">
-                          {taskResult.matchedCells > 0 ? ((taskResult.mismatchedCells / taskResult.matchedCells) * 100).toFixed(1) : '0'}%
+                          {taskResult.matchedCells > 0 ? ((taskResult.mismatchedCells / taskResult.matchedCells) * 100).toFixed(2) : '0.00'}%
                         </p>
                       </div>
                       <div className="px-2.5 py-1.5 bg-purple-500/10 border border-purple-500/20 rounded-md">
@@ -1208,7 +1204,7 @@ export function TACPage() {
                       <div className="px-2.5 py-1.5 bg-muted/50 rounded-md">
                         <p className="text-[10px] text-muted-foreground">{t('tac.matchRate') || '匹配率'}</p>
                         <p className="text-sm font-semibold">
-                          {taskResult.totalCells > 0 ? ((taskResult.matchedCells / taskResult.totalCells) * 100).toFixed(1) : '0'}%
+                          {taskResult.totalCells > 0 ? ((taskResult.matchedCells / taskResult.totalCells) * 100).toFixed(2) : '0.00'}%
                         </p>
                       </div>
                     </div>
@@ -1460,10 +1456,13 @@ export function TACPage() {
                                     break
                                   case 'suggestedTac':
                                     cellContent = cell.existingTac && cell.existingTac !== '-' && cell.suggestedTac ? (
-                                      <span className={`px-1.5 py-0.5 rounded text-[10px] font-mono ${cell.isSingularity
-                                          ? 'bg-purple-500/10 text-purple-600'
+                                      <span
+                                        title={String(cell.suggestedTac)}
+                                        className={`inline-block max-w-full px-1.5 py-0.5 rounded text-[10px] truncate align-middle ${cell.isSingularity
+                                          ? 'bg-purple-500/10 text-purple-600 font-mono'
                                           : 'bg-blue-500/10 text-blue-600'
-                                        }`}>
+                                        }`}
+                                      >
                                         {cell.suggestedTac}
                                       </span>
                                     ) : (

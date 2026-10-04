@@ -15,9 +15,9 @@ import { WizardFooter } from '../components/WizardFooter'
 import { extractCellIdsFromFile, matchCellIds, downloadCellTreeTemplate } from '../utils/cellFileHelper'
 import { triggerDataRefresh, DATA_REFRESH_EVENT } from '../store/dataStore'
 import { generateFullTaskName } from '../utils/taskNameUtils'
-import { buildMissingCellsError } from '../utils/cellValidation'
 import { LoadingSpinner } from '../components/LoadingSpinner'
-import type { ApiResponse } from '@shared/types'
+import { SkippedCellsNotice } from '../components/SkippedCellsNotice'
+import type { ApiResponse, SkippedCellInfo } from '@shared/types'
 
 // 虚拟滚动配置
 const ITEM_HEIGHT = 48 // 每行高度
@@ -46,6 +46,8 @@ interface TACResultData {
     unmatchedCells: number
     mismatchedCells: number
     mismatchedRate: number
+    skippedCells?: SkippedCellInfo[]  // 因工参数据不全被跳过的小区
+    skippedCount?: number
     results: any[]
     startTime: string
     endTime?: string
@@ -58,7 +60,7 @@ const MAX_ERRORS = 5
 type WizardStep = 'idle' | 'task_created' | 'params_set' | 'cells_selected' | 'executing' | 'completed'
 
 export function TACPlanningPage() {
-    const { t, i18n } = useTranslation()
+    const { t } = useTranslation()
     const user = useAuthStore((s) => s.user)
     const [taskName, setTaskName] = useState('')
     const [taskNameError, setTaskNameError] = useState<string | null>(null)
@@ -455,25 +457,7 @@ export function TACPlanningPage() {
             return
         }
 
-        // 校验选中小区的必要字段（经度/纬度/频点/基站ID/小区ID）
-        const sourceSectors = (config?.networkType || 'LTE') === 'LTE' ? cellListData.lte : cellListData.nr
-        const missingCellsError = buildMissingCellsError(sourceSectors, selectedCellIds, {
-            labels: {
-                siteId: t('tacPlanning.siteId') || '基站ID',
-                cellId: t('tacPlanning.cellId') || '小区ID',
-                frequency: t('tacPlanning.cellFreq') || '频点',
-                longitude: t('tacPlanning.cellLng') || '经度',
-                latitude: t('tacPlanning.cellLat') || '纬度'
-            },
-            mainTemplate: t('tacPlanning.cellsMissingData') || '选中的小区中有 {{count}} 个缺少必要数据（经度/纬度/频点/基站ID/小区ID），请补充工参后再执行。缺失示例：{{examples}}',
-            missingTemplate: t('tacPlanning.missingFieldsLabel') || '缺少：{{fields}}',
-            lang: i18n.language === 'en' ? 'en' : 'zh'
-        })
-        if (missingCellsError) {
-            setError(missingCellsError)
-            return
-        }
-
+        // 工参数据不全（缺经纬度/缺基站ID/小区ID）的小区不阻断执行，由后端跳过并在结果中回传提示
         setLoading(true)
         setError(null)
         setResult(null)
@@ -908,6 +892,15 @@ export function TACPlanningPage() {
                         <p className="text-red-600 text-xs">{error}</p>
                     </div>
                 </div>
+            )}
+
+            {/* 工参数据不全被跳过的小区提示（非阻断） */}
+            {taskResult?.skippedCells && taskResult.skippedCells.length > 0 && (
+                <SkippedCellsNotice
+                    group="tacPlanning"
+                    skipped={taskResult.skippedCells}
+                    checkedCount={taskResult.totalCells || 0}
+                />
             )}
 
             {/* 小区选择与结果面板（页签切换） */}

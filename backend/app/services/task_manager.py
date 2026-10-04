@@ -45,6 +45,8 @@ class TaskType(str, Enum):
     APPLY_TAC_PLANNING = "apply_tac_planning"  # TAC规划应用到工参
     APPLY_PCI_BATCH = "apply_pci_batch"  # PCI批量应用到工参
     APPLY_TAC_PLANNING_BATCH = "apply_tac_planning_batch"  # TAC规划批量应用到工参
+    ATTRIBUTE_JOIN = "attribute_join"  # 条件选择（图层属性空间连接）
+    BUFFER = "buffer"  # 绘制缓冲区
 
 
 class Task:
@@ -1287,6 +1289,76 @@ class TaskManager:
             task.error = str(e)
             task.completed_at = datetime.now()
 
+    @staticmethod
+    def _collect_skipped_cells(
+        loaded_skipped: List[Dict],
+        used_keys: set,
+        selected_ids: set,
+    ) -> List[Dict]:
+        """汇总「因工参数据不全被跳过核查/规划」的小区，供结果回传前端提示。
+
+        Args:
+            loaded_skipped: 加载阶段（load_cells/load_planning_cells）记录的跳过项
+            used_keys: 本次实际进入执行链路的小区 key（两种形式：``siteId_sectorId``、``sectorId``）
+            selected_ids: 前端选中的小区 id 集合
+
+        Returns:
+            [{siteId, siteName, sectorId, sectorName, reason}]，按小区去重
+        """
+        def _keys_of(site_id, sector_id) -> set:
+            sid = "" if sector_id is None else str(sector_id)
+            site = "" if site_id is None else str(site_id)
+            # 与选中过滤所用的 key 生成方式保持一致
+            return {sid, f"{site}_{sid}"}
+
+        collected: List[Dict] = []
+        seen_keys: set = set()
+
+        # 1. 加载阶段已记录的跳过项（仅保留本次选中的小区）
+        for item in loaded_skipped or []:
+            item_keys = _keys_of(item.get("siteId"), item.get("sectorId"))
+            if not (item_keys & selected_ids) or (item_keys & seen_keys):
+                continue
+            seen_keys |= item_keys
+            collected.append({
+                "siteId": item.get("siteId", ""),
+                "siteName": item.get("siteName", ""),
+                "sectorId": item.get("sectorId", ""),
+                "sectorName": item.get("sectorName", ""),
+                "reason": item.get("reason", "missing_coordinates"),
+            })
+
+        # 2. 选中但在工参中完全找不到的小区
+        for selected_id in selected_ids:
+            sid = str(selected_id)
+            if sid in used_keys or sid in seen_keys:
+                continue
+            collected.append({
+                "siteId": "",
+                "siteName": "",
+                "sectorId": sid,
+                "sectorName": "",
+                "reason": "not_in_params",
+            })
+
+        return collected
+
+    @staticmethod
+    def _format_skipped_reason_summary(skipped_cells: List[Dict]) -> str:
+        """把跳过原因计数拼成可读文案，如「缺经纬度 2 个、工参中未找到 1 个」"""
+        counts: Dict[str, int] = {}
+        for item in skipped_cells:
+            reason = item.get("reason", "missing_coordinates")
+            counts[reason] = counts.get(reason, 0) + 1
+        labels = (
+            ("missing_coordinates", "缺经纬度"),
+            ("missing_ids", "缺基站/小区ID"),
+            ("not_in_params", "工参中未找到"),
+        )
+        return "、".join(
+            f"{label} {counts[reason]} 个" for reason, label in labels if counts.get(reason)
+        )
+
     async def _run_tac_task(self, task: Task):
         """运行TAC核查任务（基于现网工参）"""
         logger.info(f"[TaskManager] _run_tac_task 开始执行 (核查), task_id: {task.task_id}")
@@ -1330,21 +1402,43 @@ class TaskManager:
                 raise ValueError("请在小区选择列表中至少选择一个小区后再执行TAC核查")
 
             selected_set = set(config.selectedCellIds)
+
             filtered_results = []
+            matched_selected_keys = set()  # 实际命中所选小区并进入核查的 key（两种形式）
             for cell in results:
                 sector_id = cell.get("sectorId", "")
                 site_id = cell.get("siteId", "")
                 cell_key = f"{site_id}_{sector_id}"
                 if cell_key in selected_set or sector_id in selected_set:
                     filtered_results.append(cell)
+                    matched_selected_keys.add(cell_key)
+                    matched_selected_keys.add(str(sector_id))
             results = filtered_results
+
+            # 因工参数据不全（缺经纬度/缺ID）或工参中未找到而被跳过的小区
+            skipped_cells = self._collect_skipped_cells(
+                getattr(tac_service, "last_load_skipped", []) or [],
+                matched_selected_keys,
+                selected_set,
+            )
+
+            # 选中的小区全部异常时给出明确提示，避免静默产出 0 小区结果
+            if not results:
+                raise ValueError(
+                    f"选中的小区均因工参数据不全被跳过，无可核查小区"
+                    f"（共 {len(skipped_cells)} 个：{self._format_skipped_reason_summary(skipped_cells)}）"
+                )
+
             # 重新统计
             total_cells = len(results)
             matched_count = sum(1 for c in results if c.get("matched"))
             unmatched_count = sum(1 for c in results if not c.get("matched"))
             mismatched_count = sum(1 for c in results if c.get("tac") != c.get("existingTac") and c.get("existingTac") is not None)
             singularity_count = sum(1 for c in results if c.get("isSingularity"))
-            logger.info(f"[TaskManager] TAC核查: 已根据选中小区过滤, 保留{total_cells}个小区")
+            logger.info(
+                f"[TaskManager] TAC核查: 已根据选中小区过滤, 保留{total_cells}个小区, "
+                f"跳过{len(skipped_cells)}个工参数据不全的小区"
+            )
 
             # 完成任务
             task.status = TaskStatus.COMPLETED
@@ -1359,9 +1453,11 @@ class TaskManager:
                 "matchedCells": matched_count,
                 "unmatchedCells": unmatched_count,
                 "mismatchedCells": mismatched_count,
-                "mismatchedRate": (mismatched_count / matched_count * 100) if matched_count > 0 else 0,
-                "matchingRate": (matched_count / total_cells * 100) if total_cells > 0 else 0,
+                "mismatchedRate": round(mismatched_count / matched_count * 100, 2) if matched_count > 0 else 0,
+                "matchingRate": round(matched_count / total_cells * 100, 2) if total_cells > 0 else 0,
                 "singularityCount": singularity_count,
+                "skippedCells": skipped_cells,
+                "skippedCount": len(skipped_cells),
                 "results": results,
                 "startTime": task.started_at.isoformat() if task.started_at else None,
                 "endTime": task.completed_at.isoformat() if task.completed_at else None,
@@ -1431,6 +1527,7 @@ class TaskManager:
             
             # 从全量工参中提取匹配的小区信息（带坐标）
             matched_sites = []
+            matched_target_keys = set()  # 实际在工参中找到的选中小区 key
             if full_params_data and network_type in full_params_data:
                 combined_sites = {}
                 # 添加去重字典，防止同一小区被多次添加
@@ -1443,6 +1540,7 @@ class TaskManager:
 
                         matched_key = next((k for k in possible_keys if k in target_cell_keys), None)
                         if matched_key:
+                            matched_target_keys.add(matched_key)
                             # 检查是否已添加过该小区（去重）
                             unique_key = f"{site_id}&{sector_id}"
                             if unique_key in seen_sectors:
@@ -1463,7 +1561,10 @@ class TaskManager:
                 matched_sites = list(combined_sites.values())
 
             if not matched_sites:
-                raise ValueError("无法匹配待规划小区与工参坐标信息，请检查ID是否一致")
+                raise ValueError(
+                    f"无法匹配待规划小区与工参坐标信息，请检查ID是否一致"
+                    f"（选中的 {len(target_cell_keys)} 个小区均未在全量工参中找到）"
+                )
 
             total_sites = len(matched_sites)
             logger.info(f"[TaskManager] TAC规划: 匹配到带坐标的站点数={total_sites}")
@@ -1490,6 +1591,14 @@ class TaskManager:
             # 5. 完成任务
             task.status = TaskStatus.COMPLETED
             task.completed_at = datetime.now()
+
+            # 因工参数据不全（缺坐标）或工参中未找到而被跳过的小区
+            skipped_cells = self._collect_skipped_cells(
+                getattr(tac_service, "last_load_skipped", []) or [],
+                matched_target_keys,
+                target_cell_keys,
+            )
+
             # 计算TAC错配 (如果存在 existingTac)
             mismatched_count = 0
             for r in results:
@@ -1512,6 +1621,8 @@ class TaskManager:
                 "mismatchedCells": mismatched_count,
                 "mismatchedRate": (mismatched_count / planned_count * 100) if planned_count > 0 else 0,
                 "matchingRate": (planned_count / len(results) * 100) if results else 0,
+                "skippedCells": skipped_cells,
+                "skippedCount": len(skipped_cells),
                 "results": results,
                 "startTime": task.started_at.isoformat() if task.started_at else None,
                 "endTime": task.completed_at.isoformat() if task.completed_at else None,
@@ -1654,6 +1765,125 @@ class TaskManager:
             self._persist_task(task.task_id)
             logger.error(f"[TaskManager] 工参更新任务失败: {task.task_id}, error: {e}")
 
+    async def create_attribute_join_task(
+        self, cfg: Dict, username: str = "",
+        city: Optional[str] = None, operator: Optional[str] = None,
+    ) -> str:
+        """创建条件选择（图层属性空间连接）任务。data_id 的组访问权由端点在创建前校验。"""
+        logger.info(f"[TaskManager] 创建条件选择任务, l1={cfg.get('layer1', {}).get('kind')}, "
+                    f"l2={cfg.get('layer2', {}).get('kind')}")
+        city, operator = self._task_group(city, operator, username or None)
+
+        task = Task(TaskType.ATTRIBUTE_JOIN, cfg,
+                    user_name=username or None, city=city, operator=operator)
+        self.tasks[task.task_id] = task
+        self._persist_task(task.task_id)
+        logger.info(f"[TaskManager] 条件选择任务已创建: {task.task_id}")
+
+        task.task = asyncio.create_task(self._run_task_with_slot(task, self._run_attribute_join_task))
+        return task.task_id
+
+    async def _run_attribute_join_task(self, task: Task):
+        """运行条件选择任务（执行线程用任务组快照，保证扇区按组隔离）"""
+        logger.info(f"[TaskManager] _run_attribute_join_task 开始执行, task_id: {task.task_id}")
+        try:
+            from app.services.attribute_join_service import run_attribute_join
+
+            task.status = TaskStatus.PROCESSING
+            task.started_at = datetime.now()
+            task.progress = 2
+
+            group = (task.city, task.operator) if task.city else None
+
+            def _progress_cb(p: float, msg: str = ""):
+                task.progress = float(p)
+
+            stats = await asyncio.to_thread(run_attribute_join, task.config, group, _progress_cb)
+
+            task.status = TaskStatus.COMPLETED
+            task.completed_at = datetime.now()
+            task.progress = 100
+            task.result = {
+                "taskId": task.task_id,
+                "status": "completed",
+                "progress": 100,
+                **stats,
+            }
+            self._persist_task(task.task_id)
+            logger.info(f"[TaskManager] 条件选择任务完成: {task.task_id}")
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            task.status = TaskStatus.FAILED
+            # GBK 安全处理（Windows 终端兼容）
+            task.error = str(e).encode("gbk", "replace").decode("gbk")
+            task.completed_at = datetime.now()
+            self._persist_task(task.task_id)
+            logger.error(f"[TaskManager] 条件选择任务失败: {task.task_id}, error: {e}")
+
+    async def create_buffer_task(
+        self, cfg: Dict, username: str = "",
+        city: Optional[str] = None, operator: Optional[str] = None,
+    ) -> str:
+        """创建绘制缓冲区任务。data_id 的组访问权由端点在创建前校验。"""
+        logger.info(f"[TaskManager] 创建缓冲区任务, source={cfg.get('source', {}).get('kind')}, "
+                    f"target={cfg.get('target', {}).get('kind')}")
+        city, operator = self._task_group(city, operator, username or None)
+
+        task = Task(TaskType.BUFFER, cfg,
+                    user_name=username or None, city=city, operator=operator)
+        self.tasks[task.task_id] = task
+        self._persist_task(task.task_id)
+        logger.info(f"[TaskManager] 缓冲区任务已创建: {task.task_id}")
+
+        task.task = asyncio.create_task(self._run_task_with_slot(task, self._run_buffer_task))
+        return task.task_id
+
+    async def _run_buffer_task(self, task: Task):
+        """运行缓冲区任务（执行线程用任务组快照，保证参考图层按组隔离）"""
+        logger.info(f"[TaskManager] _run_buffer_task 开始执行, task_id: {task.task_id}")
+        try:
+            from app.services.buffer_service import run_buffer
+
+            task.status = TaskStatus.PROCESSING
+            task.started_at = datetime.now()
+            task.progress = 2
+
+            group = (task.city, task.operator) if task.city else None
+
+            def _progress_cb(p: float, msg: str = ""):
+                task.progress = float(p)
+
+            stats = await asyncio.to_thread(run_buffer, task.config, group, _progress_cb)
+
+            stats_full = {
+                "taskId": task.task_id,
+                "status": "completed",
+                "progress": 100,
+                **stats,
+            }
+            # features（装饰目标的全部几何）仅保留在内存结果，不写入历史库：
+            # 装饰要素当时已落 localStorage，历史任务重启后无需该字段
+            task.result = {
+                k: v for k, v in stats_full.items() if k != "features"
+            }
+            self._persist_task(task.task_id)
+            task.result = stats_full
+            task.status = TaskStatus.COMPLETED
+            task.completed_at = datetime.now()
+            task.progress = 100
+            task.result = stats_full
+            logger.info(f"[TaskManager] 缓冲区任务完成: {task.task_id}")
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            task.status = TaskStatus.FAILED
+            # GBK 安全处理（Windows 终端兼容）
+            task.error = str(e).encode("gbk", "replace").decode("gbk")
+            task.completed_at = datetime.now()
+            self._persist_task(task.task_id)
+            logger.error(f"[TaskManager] 缓冲区任务失败: {task.task_id}, error: {e}")
+
     async def create_apply_pci_to_params_task(self, planning_task_id: str) -> str:
         """创建PCI应用到工参任务"""
         logger.info(f"[TaskManager] 创建PCI应用到工参任务: planning_task={planning_task_id[:8]}...")
@@ -1665,10 +1895,16 @@ class TaskManager:
         if planning_result.get("status") != "completed":
             raise ValueError("PCI规划任务尚未完成")
 
+        # 从规划任务继承组快照（执行线程不反查用户表）
+        group = self.get_task_group(planning_task_id)
+        if not group:
+            raise ValueError("无法确定PCI规划任务的数据组")
+        city, operator = group
+
         # 创建任务
         task = Task(TaskType.APPLY_PCI, {
             "planningTaskId": planning_task_id,
-        })
+        }, city=city, operator=operator)
         self.tasks[task.task_id] = task
         self._persist_task(task.task_id)
         logger.info(f"[TaskManager] PCI应用到工参任务已创建: {task.task_id}")
@@ -1767,7 +2003,14 @@ class TaskManager:
             if r.get("status") != "completed":
                 raise ValueError(f"规划任务未完成: {tid[:8]}...")
 
-        task = Task(TaskType.APPLY_PCI_BATCH, {"planTaskIds": plan_task_ids})
+        # 所有规划任务必须属于同一数据组，应用任务继承该组快照
+        groups = {self.get_task_group(tid) for tid in plan_task_ids}
+        if len(groups) != 1 or None in groups:
+            raise ValueError("规划任务数据组不一致或缺失，无法批量应用")
+        city, operator = next(iter(groups))
+
+        task = Task(TaskType.APPLY_PCI_BATCH, {"planTaskIds": plan_task_ids},
+                    city=city, operator=operator)
         self.tasks[task.task_id] = task
         self._persist_task(task.task_id)
         logger.info(f"[TaskManager] PCI批量应用到工参任务已创建: {task.task_id}")
@@ -2057,6 +2300,9 @@ class TaskManager:
 
             db.commit()
             _logger.info(f"[ApplyPCI-Phase1] 批量更新完成: {pci_updated}个PCI, {tac_updated}个TAC")
+
+            if pci_updated + tac_updated == 0:
+                raise ValueError("规划结果未匹配到任何小区（0个小区更新），请检查规划小区与全量工参是否一致")
         finally:
             db.close()
 
@@ -2423,9 +2669,15 @@ class TaskManager:
         if planning_result.get("status") != "completed":
             raise ValueError("TAC规划任务尚未完成")
 
+        # 从规划任务继承组快照（执行线程不反查用户表）
+        group = self.get_task_group(planning_task_id)
+        if not group:
+            raise ValueError("无法确定TAC规划任务的数据组")
+        city, operator = group
+
         task = Task(TaskType.APPLY_TAC_PLANNING, {
             "planningTaskId": planning_task_id,
-        })
+        }, city=city, operator=operator)
         self.tasks[task.task_id] = task
         self._persist_task(task.task_id)
         logger.info(f"[TaskManager] TAC规划应用到工参任务已创建: {task.task_id}")
@@ -2515,7 +2767,14 @@ class TaskManager:
             if r.get("status") != "completed":
                 raise ValueError(f"规划任务未完成: {tid[:8]}...")
 
-        task = Task(TaskType.APPLY_TAC_PLANNING_BATCH, {"planTaskIds": plan_task_ids})
+        # 所有规划任务必须属于同一数据组，应用任务继承该组快照
+        groups = {self.get_task_group(tid) for tid in plan_task_ids}
+        if len(groups) != 1 or None in groups:
+            raise ValueError("规划任务数据组不一致或缺失，无法批量应用")
+        city, operator = next(iter(groups))
+
+        task = Task(TaskType.APPLY_TAC_PLANNING_BATCH, {"planTaskIds": plan_task_ids},
+                    city=city, operator=operator)
         self.tasks[task.task_id] = task
         self._persist_task(task.task_id)
         logger.info(f"[TaskManager] TAC规划批量应用到工参任务已创建: {task.task_id}")
@@ -2719,7 +2978,8 @@ class TaskManager:
                 all_params["wb_id"] = full_params_id
 
                 result = db.execute(text(sql), all_params)
-                updated_count += len(chunk)  # 假设全部匹配
+                if result.rowcount:
+                    updated_count += result.rowcount
 
             db.query(Workbook).filter(Workbook.id == full_params_id).update({
                 "created_at": datetime.now().isoformat()
@@ -2727,6 +2987,9 @@ class TaskManager:
 
             db.commit()
             _logger.info(f"[TA-Apply] 批量更新了 {updated_count} 个小区TAC")
+
+            if updated_count == 0:
+                raise ValueError("规划结果未匹配到任何小区（0个小区更新），请检查规划小区与全量工参是否一致")
         finally:
             db.close()
 
