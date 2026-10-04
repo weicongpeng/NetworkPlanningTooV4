@@ -309,6 +309,13 @@ def create_default_admin():
     try:
         existing_admin = db.query(User).filter(User.is_admin == True).first()
         if existing_admin is None:
+            # 桌面版：给默认管理员一个可用数据组（NULL 组看不到任何业务数据/上传后不可见）；
+            # 首个预设地市 + 默认运营商，管理员可在「用户管理」中修改（会触发存量数据迁移）。
+            city = operator = None
+            if settings.NPT_DESKTOP:
+                presets = settings.CITY_PRESETS
+                city = presets[0] if presets else None
+                operator = "移动"
             admin = User(
                 username="admin",
                 password_hash=auth_service.hash_password("admin123"),
@@ -316,6 +323,8 @@ def create_default_admin():
                 is_active=True,
                 must_change_password=True,
                 license_expiry=None,
+                city=city,
+                operator=operator,
             )
             db.add(admin)
             db.commit()
