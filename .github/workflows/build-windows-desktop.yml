@@ -107,7 +107,8 @@ jobs:
           if ("${{ github.ref }}" -like "refs/tags/desktop-v*") {
             $v = "${{ github.ref_name }}".Replace("desktop-v", "")
           } else {
-            $v = "0.0.0-dev.${{ github.run_number }}"
+            # dev 版本带短 SHA，便于对照 Actions 页面与问题排查
+            $v = "0.0.0-dev-" + $env:GITHUB_SHA.Substring(0, 7)
           }
           "NPT_DESKTOP_VERSION=$v" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           Write-Host "桌面版版本号: $v"
