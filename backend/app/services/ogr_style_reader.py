@@ -15,6 +15,7 @@ import ctypes
 import ctypes.util
 import glob
 import os
+import sys
 import threading
 from pathlib import Path
 from typing import List, Optional
@@ -44,17 +45,23 @@ def find_libgdal() -> Optional[str]:
     import importlib.util
 
     candidates: List[str] = []
+    search_dirs: List[Path] = []
     try:
         spec = importlib.util.find_spec("pyogrio")
     except Exception:
         spec = None
     if spec is not None and spec.origin:
         root = Path(spec.origin).resolve().parent
-        for directory in (root.parent / "pyogrio.libs", root, root.parent):
-            if not directory.is_dir():
-                continue
-            for pattern in ("libgdal*.so*", "libgdal*.dylib", "gdal*.dll"):
-                candidates.extend(sorted(glob.glob(str(directory / pattern))))
+        search_dirs.extend((root.parent / "pyogrio.libs", root, root.parent))
+    # PyInstaller 冻结后 DLL 会摊平到资源根（_MEIPASS）或其子目录
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        search_dirs.extend((Path(meipass), Path(meipass) / "pyogrio.libs"))
+    for directory in search_dirs:
+        if not directory.is_dir():
+            continue
+        for pattern in ("libgdal*.so*", "libgdal*.dylib", "gdal*.dll"):
+            candidates.extend(sorted(glob.glob(str(directory / pattern))))
     for candidate in candidates:
         if os.path.isfile(candidate):
             return candidate

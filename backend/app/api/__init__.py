@@ -12,7 +12,9 @@ from fastapi.responses import Response
 from contextlib import asynccontextmanager
 from starlette.types import ASGIApp, Scope, Receive, Send
 import logging
+import multiprocessing
 import socket
+import sys
 from concurrent.futures import ProcessPoolExecutor
 
 from app.core.config import settings
@@ -39,8 +41,8 @@ class SelectiveGZipMiddleware(GZipMiddleware):
                 return
         await super().__call__(scope, receive, send)
 
-# 前端构建产物目录
-FRONTEND_DIST = Path(__file__).parent.parent.parent.parent / "frontend" / "dist-renderer"
+# 前端构建产物目录（冻结时位于资源根 _MEIPASS 内，由 PyInstaller add-data 提供）
+FRONTEND_DIST = settings.BUNDLE_DIR / "frontend" / "dist-renderer"
 
 
 def get_local_ip():
@@ -77,9 +79,8 @@ async def lifespan(app: FastAPI):
     settings.DATA_DIR.mkdir(parents=True, exist_ok=True)
     settings.TEMPLATE_DIR.mkdir(parents=True, exist_ok=True)
 
-    # 创建 APK 文件存储目录
-    BASE_DIR = Path(__file__).parent.parent
-    apks_dir = BASE_DIR / "apks"
+    # 创建 APK 文件存储目录（可写数据根下）
+    apks_dir = settings.APKS_DIR
     apks_dir.mkdir(parents=True, exist_ok=True)
     logger.info(f"✅ APK 存储目录已创建: {apks_dir}")
 
@@ -148,11 +149,14 @@ async def lifespan(app: FastAPI):
     pool = None
     try:
         if hasattr(settings, 'MAX_WORKERS') and settings.MAX_WORKERS > 1:
+            # fork 仅 Linux 可用；Windows/macOS 必须 spawn。
+            # 冻结包（桌面版）默认 MAX_WORKERS=1，不会走到这里。
+            mp_ctx = "fork" if sys.platform.startswith("linux") else "spawn"
             pool = ProcessPoolExecutor(
                 max_workers=settings.MAX_WORKERS,
-                mp_context="fork"
+                mp_context=mp_ctx
             )
-            logger.info(f"✅ ProcessPoolExecutor 已创建: {settings.MAX_WORKERS} workers (fork)")
+            logger.info(f"✅ ProcessPoolExecutor 已创建: {settings.MAX_WORKERS} workers ({mp_ctx})")
 
             # 注入到 TaskManager
             from app.services.task_manager import task_manager

@@ -51,6 +51,8 @@ coverage/
 
 # 构建产物
 *.egg-info/
+__pycache__/
+*.pyc
 dist/
 
 # 项目级上传/输出/数据目录
@@ -78,3 +80,11 @@ mobile-app/ninja-win.zip
 mobile-app/android/ninja-fix/
 mobile-app/build_log.txt
 mobile-app/tsc_errors.txt
+
+# 桌面端打包产物与授权密钥（私钥永不入库）
+/build/
+/desktop/build/
+/desktop/dist/
+/desktop/tools/*.pem
+/desktop/tools/*.key
+*.nptlic

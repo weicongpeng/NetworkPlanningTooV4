@@ -3,6 +3,7 @@
 """
 
 import os
+import sys
 from typing import List, Optional
 from pathlib import Path
 from pydantic_settings import BaseSettings
@@ -16,6 +17,42 @@ def _parse_cors_origins(v: Optional[str]) -> List[str]:
     if isinstance(v, str):
         return [origin.strip() for origin in v.split(",")]
     return v
+
+
+def _bundle_dir() -> Path:
+    """只读资源根：PyInstaller 冻结时为解包目录（sys._MEIPASS），否则为仓库根。"""
+    if getattr(sys, "frozen", False):
+        return Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
+    return Path(__file__).parent.parent.parent.parent
+
+
+def _data_root() -> Path:
+    """可写数据根：NPT_DATA_ROOT 优先；桌面版（NPT_DESKTOP=1）默认
+    %APPDATA%/NetworkPlanningTool；其余（服务器/开发）保持仓库根，行为不变。"""
+    env_root = os.environ.get("NPT_DATA_ROOT")
+    if env_root:
+        return Path(env_root)
+    if os.environ.get("NPT_DESKTOP", "").strip().lower() in ("1", "true", "yes"):
+        appdata = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
+        return Path(appdata) / "NetworkPlanningTool"
+    return _bundle_dir()
+
+
+# 桌面版没有 .env：默认沿用生产部署的地市清单（广东 21 市），NPT_CITY_PRESETS 仍可覆盖
+_DESKTOP_DEFAULT_CITY_PRESETS = (
+    "广州,韶关,深圳,珠海,汕头,佛山,江门,湛江,茂名,肇庆,惠州,梅州,"
+    "汕尾,河源,阳江,清远,东莞,中山,潮州,揭阳,云浮"
+)
+
+
+def _city_presets_default() -> str:
+    if os.environ.get("NPT_DESKTOP", "").strip().lower() in ("1", "true", "yes"):
+        return _DESKTOP_DEFAULT_CITY_PRESETS
+    return ""
+
+
+_BUNDLE_DIR = _bundle_dir()
+_DATA_ROOT = _data_root()
 
 
 class Settings(BaseSettings):
@@ -35,14 +72,16 @@ class Settings(BaseSettings):
     NPT_HOST: str = "0.0.0.0"
     NPT_PORT: int = 8000
 
-    # 目录配置
-    BASE_DIR: Path = Path(__file__).parent.parent.parent.parent
-    UPLOAD_DIR: Path = BASE_DIR / "uploads"
-    OUTPUT_DIR: Path = BASE_DIR / "outputs"
-    EXPORT_DIR: Path = BASE_DIR / "exports"
-    LICENSE_DIR: Path = BASE_DIR / "licenses"
-    DATA_DIR: Path = BASE_DIR / "data"
-    TEMPLATE_DIR: Path = BASE_DIR / "template"
+    # 目录配置：BUNDLE_DIR 为只读资源根（冻结时 _MEIPASS），DATA_ROOT 为可写数据根
+    BUNDLE_DIR: Path = _BUNDLE_DIR
+    DATA_ROOT: Path = _DATA_ROOT
+    UPLOAD_DIR: Path = _DATA_ROOT / "uploads"
+    OUTPUT_DIR: Path = _DATA_ROOT / "outputs"
+    EXPORT_DIR: Path = _DATA_ROOT / "exports"
+    LICENSE_DIR: Path = _DATA_ROOT / "licenses"
+    DATA_DIR: Path = _DATA_ROOT / "data"
+    APKS_DIR: Path = _DATA_ROOT / "apks"
+    TEMPLATE_DIR: Path = _BUNDLE_DIR / "template"
 
     # 许可证配置 - 从环境变量读取
     NPT_LICENSE_SECRET_KEY: str = "network-planning-tool-secret-key-2024"
@@ -70,6 +109,9 @@ class Settings(BaseSettings):
     NPT_RELOAD: bool = False
     NPT_WORKERS: int = 1
 
+    # 运行形态：桌面离线版（desktop/launcher.py 注入 NPT_DESKTOP=1）
+    NPT_DESKTOP: bool = False
+
     # 地图默认配置
     DEFAULT_MAP_CENTER: tuple = (39.9042, 116.4074)  # 北京
     DEFAULT_MAP_ZOOM: int = 10
@@ -91,8 +133,8 @@ class Settings(BaseSettings):
 
     # 地市预设清单（逗号分隔）：注册/用户管理"地市"下拉的数据源。
     # 生产必须在 .env 中配置（如 NPT_CITY_PRESETS=郑州,洛阳,开封）；
-    # 留空时注册/建号校验恒失败。
-    NPT_CITY_PRESETS: str = ""
+    # 桌面版（NPT_DESKTOP=1）无 .env 时使用默认清单（见 _city_presets_default）。
+    NPT_CITY_PRESETS: str = _city_presets_default()
 
     # APK 下载缓存配置（秒）
     # 默认 3600（1 小时），Cloudflare 边缘节点缓存后同区域下载秒级完成

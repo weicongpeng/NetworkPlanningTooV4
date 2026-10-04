@@ -24,8 +24,8 @@ import logging
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["APP版本管理"])
 
-# APK 存储目录
-APKS_DIR = Path(__file__).parent.parent.parent.parent / "apks"
+# APK 存储目录（可写数据根下）
+APKS_DIR = settings.APKS_DIR
 
 
 def _read_range(path: str, start: int, end: int) -> bytes:

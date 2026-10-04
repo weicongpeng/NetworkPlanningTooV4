@@ -1,0 +1,7 @@
+# 桌面离线版打包专用依赖（与 backend/requirements.txt 一起安装）
+# 版本与 backend/.venv（Python 3.12）对齐，保证打包结果可复现
+pywebview==6.2.1
+pyinstaller==6.22.3
+pyinstaller-hooks-contrib==2026.8
+# GDAL 栈：pyogrio wheel 自带 libgdal/proj 等动态库（backend/requirements.txt 中 GDAL 被注释）
+pyogrio==0.13.0

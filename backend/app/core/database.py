@@ -6,9 +6,9 @@ from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker, Session, DeclarativeBase
 from app.core.config import settings
 
-# SQLite 数据库文件路径
-DATABASE_URL = f"sqlite:///{settings.DATA_DIR / 'data.db'}"
-OLD_DATABASE_URL = f"sqlite:///{settings.DATA_DIR / 'users.db'}"
+# SQLite 数据库文件路径（as_posix 避免 Windows 反斜杠路径解析异常）
+DATABASE_URL = f"sqlite:///{(settings.DATA_DIR / 'data.db').as_posix()}"
+OLD_DATABASE_URL = f"sqlite:///{(settings.DATA_DIR / 'users.db').as_posix()}"
 
 engine = create_engine(
     DATABASE_URL,
