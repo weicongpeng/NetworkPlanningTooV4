@@ -227,10 +227,21 @@ export interface TACResult {
   matchedCells: number
   unmatchedCells: number
   singularityCount?: number
+  skippedCells?: SkippedCellInfo[]
+  skippedCount?: number
   results: CellTACResult[]
   startTime: string
   endTime?: string
   error?: string
+}
+
+/** 因工参数据不全（缺经纬度/缺ID）或工参中未找到而被跳过核查/规划的小区 */
+export interface SkippedCellInfo {
+  siteId?: string
+  siteName?: string
+  sectorId?: string
+  sectorName?: string
+  reason: 'missing_coordinates' | 'missing_ids' | 'not_in_params'
 }
 
 export interface CellTACResult {
@@ -259,8 +270,9 @@ export interface TACSingularityDetails {
   cellTAC: string
   dominantTac: string
   validNeighborCount: number
-  异TAC占比: number
-  dominantTacRatio: number
+  异TAC占比: number         // 周边TAC与本站不同的加权占比（= 100 − cellTacRatio）
+  cellTacRatio?: number     // 本站TAC在周边的加权占比(%)
+  dominantTacRatio: number  // 周边主流TAC占比(%)
 }
 
 // 地图相关类型
@@ -509,6 +521,12 @@ export interface LineDrawStyle {
   weight: number
   opacity: number
   dashArray: string   // '' 实线，'5,5' 等虚线
+  /**
+   * 图形样式：'line' 直线 / 'curve' 曲线（绘制时按 Catmull-Rom 加密几何）
+   */
+  shape?: 'line' | 'curve'
+  /** 带方向线段的线：沿线渲染方向箭头（本软件渲染，TAB/MIF 内仍为普通线） */
+  arrow?: boolean
 }
 export interface PolygonDrawStyle {
   fillColor: string   // 'none' = 无色（镂空）
@@ -535,4 +553,99 @@ export interface CreateLayerResult {
   data_id: string
   layer_id: string
   name: string
+}
+
+// ===== 条件选择（图层属性空间连接）=====
+
+/** 图层引用：kind 决定来源与取数方式 */
+export interface AttributeJoinLayerRef {
+  kind: 'sector' | 'mapinfo' | 'geodata'
+  /** mapinfo / geodata 的数据集 id */
+  dataId?: string
+  /** mapinfo 的图层 id */
+  layerId?: string
+  /** sector: LTE / NR / all */
+  networkType?: string
+}
+
+export interface AttributeJoinRequest {
+  layer1: AttributeJoinLayerRef
+  condition: 'within'
+  layer2: AttributeJoinLayerRef
+}
+
+/** 图层1经纬度缺失被跳过的要素明细 */
+export interface AttributeJoinSkippedItem {
+  /** 要素标识（扇区/站点 ID） */
+  id: string
+  /** 要素名称 */
+  name: string
+  /** 缺失原因 key（展示时翻译） */
+  reason: string
+}
+
+/** 条件选择结果统计 */
+export interface AttributeJoinStats {
+  taskId: string
+  status: 'completed'
+  progress: number
+  /** 图层1有效要素总数（不含跳过） */
+  total1: number
+  /** 图层2面要素总数 */
+  total2: number
+  /** 匹配（在边界内）数量 */
+  matched: number
+  /** 图层1未匹配数量 */
+  unmatched: number
+  /** 图层2零归属边界数量 */
+  dangling2: number
+  /** 图层1经纬度缺失被跳过的要素数量 */
+  skipped1: number
+  /** 被跳过要素的明细 */
+  skipped1Details: AttributeJoinSkippedItem[]
+  /** 结果 xlsx 路径（后端） */
+  exportPath: string
+}
+
+// ===== 绘制缓冲区 =====
+
+/** 缓冲图形保存目标：装饰图层或已有 MapInfo TAB 图层 */
+export type BufferTargetRef =
+  | { kind: 'decoration' }
+  | { kind: 'mapinfo'; dataId: string; layerId: string }
+
+export interface BufferRequest {
+  /** 参考图层（点/线/面任意几何） */
+  source: AttributeJoinLayerRef
+  target: BufferTargetRef
+  /** 缓冲半径（米） */
+  radius: number
+  /** 平滑度：每圈段数，默认 12 */
+  segments: number
+  /** each=每要素单独缓冲；dissolve=所有要素合并缓冲 */
+  mode: 'each' | 'dissolve'
+}
+
+/** 参考图层几何/经纬度缺失被跳过的要素明细 */
+export type BufferSkippedItem = AttributeJoinSkippedItem
+
+/** 缓冲区结果统计 */
+export interface BufferStats {
+  taskId: string
+  status: 'completed'
+  progress: number
+  /** 图形保存去向 */
+  savedTo: 'decoration' | 'mapinfo'
+  /** 参考图层有效要素数（不含跳过） */
+  inputCount: number
+  /** 生成的缓冲多边形数 */
+  resultCount: number
+  /** 参考图层被跳过的要素数 */
+  skippedCount: number
+  skippedDetails: BufferSkippedItem[]
+  /** target=decoration 时携带待写入要素（GCJ02） */
+  features?: Array<{ type: 'Feature'; geometry: any; properties: Record<string, any> }>
+  /** target=mapinfo 时的目标定位 */
+  dataId?: string
+  layerId?: string
 }

@@ -21,6 +21,10 @@ import type {
   UserListResponse,
   UserUpdateRequest,
   UserDetailResponse,
+  AttributeJoinRequest,
+  AttributeJoinStats,
+  BufferRequest,
+  BufferStats,
 } from '@shared/types'
 import { uploadStore } from '../store/uploadStore'
 
@@ -1194,6 +1198,47 @@ export const layerApi = {
   }
 }
 
+// ===== 条件选择（图层属性空间连接）=====
+export const attributeJoinApi = {
+  // 创建并启动任务，返回 taskId
+  plan: async (body: AttributeJoinRequest): Promise<ApiResponse<{ taskId: string }>> => {
+    return apiClient.post('/attribute-join/plan', body)
+  },
+  // 查询进度（完成时 data 为结果统计）
+  getProgress: async (taskId: string): Promise<ApiResponse<any>> => {
+    return apiClient.get(`/attribute-join/progress/${taskId}`)
+  },
+  // 查询结果
+  getResult: async (taskId: string): Promise<ApiResponse<AttributeJoinStats>> => {
+    return apiClient.get(`/attribute-join/result/${taskId}`)
+  },
+  // 下载 xlsx（blob；文件名由调用方指定）
+  download: async (taskId: string): Promise<Blob> => {
+    const response = await apiClient.get(`/attribute-join/download/${taskId}`, {
+      responseType: 'blob',
+    })
+    const blob = response.data as Blob
+    if (!blob || blob.size === 0) throw new Error('文件内容为空')
+    return blob
+  },
+}
+
+// ===== 绘制缓冲区 =====
+export const bufferApi = {
+  // 创建并启动任务，返回 taskId
+  plan: async (body: BufferRequest): Promise<ApiResponse<{ taskId: string }>> => {
+    return apiClient.post('/buffer/plan', body)
+  },
+  // 查询进度（完成时 data 为结果统计）
+  getProgress: async (taskId: string): Promise<ApiResponse<any>> => {
+    return apiClient.get(`/buffer/progress/${taskId}`)
+  },
+  // 查询结果
+  getResult: async (taskId: string): Promise<ApiResponse<BufferStats>> => {
+    return apiClient.get(`/buffer/result/${taskId}`)
+  },
+}
+
 // ===== 图层制作（生成 tab/mif/kml）=====
 export interface LayerExcelInfo {
   sheets: string[]
@@ -1311,6 +1356,7 @@ export const layerToolsApi = {
     formData.append('output_formats', (params.outputFormats || [params.outputFormat!]).join(','))
     if (params.color) formData.append('color', params.color)
     if (params.borderColor) formData.append('border_color', params.borderColor)
+    if (params.fillColor) formData.append('fill_color', params.fillColor)
     if (params.opacity != null) formData.append('opacity', String(params.opacity))
     if (params.pointSize) formData.append('point_size', String(params.pointSize))
     if (params.pointShape) formData.append('point_shape', params.pointShape)

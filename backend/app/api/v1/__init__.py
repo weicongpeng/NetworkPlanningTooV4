@@ -3,7 +3,7 @@ API v1 路由
 """
 
 from fastapi import APIRouter
-from app.api.v1.endpoints import license, data, pci, neighbor, tac, map, geo_data, system, auth, admin_users, user_settings, websocket, app_versions, layer, distance_match, site_spacing, assistant
+from app.api.v1.endpoints import license, data, pci, neighbor, tac, map, geo_data, system, auth, admin_users, user_settings, websocket, app_versions, layer, distance_match, site_spacing, assistant, attribute_join, buffer
 
 api_router = APIRouter()
 
@@ -25,3 +25,5 @@ api_router.include_router(layer.router, prefix="/layer", tags=["图层制作"])
 api_router.include_router(distance_match.router, prefix="/distance-match", tags=["批量距离匹配"])
 api_router.include_router(site_spacing.router, prefix="/site-spacing", tags=["站间距计算"])
 api_router.include_router(assistant.router, prefix="/assistant", tags=["网优助手"])
+api_router.include_router(attribute_join.router, prefix="/attribute-join", tags=["条件选择"])
+api_router.include_router(buffer.router, prefix="/buffer", tags=["绘制缓冲区"])
