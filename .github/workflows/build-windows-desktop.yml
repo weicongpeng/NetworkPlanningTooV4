@@ -19,6 +19,9 @@ jobs:
     env:
       # CI 阶段保留控制台输出便于诊断；正式发行前改为 0（无控制台窗口）
       NPT_CONSOLE: "1"
+      # Windows 管道输出默认 cp1252，统一 UTF-8 避免中文 print 崩溃
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: utf-8
     steps:
       - uses: actions/checkout@v4
 

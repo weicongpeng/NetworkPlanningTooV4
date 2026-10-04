@@ -15,6 +15,13 @@ import os
 import sys
 from pathlib import Path
 
+# Windows 下重定向输出时 stdout 可能是 cp1252，避免中文 print 崩溃
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 

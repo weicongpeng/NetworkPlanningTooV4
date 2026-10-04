@@ -8,6 +8,13 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+# Windows CI/重定向输出时 stdout 可能是 cp1252，避免中文 print 崩溃
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 DESKTOP_DIR = Path(__file__).resolve().parents[1]
 ROOT_DIR = DESKTOP_DIR.parent
 SRC = ROOT_DIR / "frontend" / "public" / "app-icon.png"
