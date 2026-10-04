@@ -30,6 +30,7 @@ python-dotenv==1.0.0
 # gdal==3.8.4
 geopandas>=1.0.1
 shapely>=2.0.6
+pyproj>=3.6
 
 # 空间索引（TAC插花检测 BallTree）
 scikit-learn>=1.5.0

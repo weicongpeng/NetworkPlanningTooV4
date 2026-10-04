@@ -92,6 +92,8 @@ class UserSession(Base):
     login_time = Column(DateTime, default=_utcnow, nullable=False)
     logout_time = Column(DateTime, nullable=True)
     last_activity = Column(DateTime, default=_utcnow, nullable=False)
+    # 使用时长已结算到该时刻（增量结算标记，避免重复累加；与登录态无关）
+    usage_accounted_at = Column(DateTime, nullable=True)
 
     user = relationship("User", back_populates="sessions")
 

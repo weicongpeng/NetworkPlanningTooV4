@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback } from 'react'
 import { useTranslation } from 'react-i18next'
 import {
   Users, UserPlus, Search, Loader2, Shield, User, Pencil, Trash2,
-  RefreshCw, ChevronLeft, ChevronRight, Key, X, Circle, Ban, History
+  RefreshCw, Key, X, Circle, Ban, History
 } from 'lucide-react'
 import { adminUserApi, authApi } from '../services/api'
 import type { UserInfo, UserSessionInfo, RegisterOptions } from '@shared/types'
@@ -33,8 +33,6 @@ export function AdminUsersPage() {
   const [total, setTotal] = useState(0)
   // 全量（跨所有页）在线统计，由后端返回
   const [onlineStats, setOnlineStats] = useState({ online: 0, pc: 0, app: 0 })
-  const [page, setPage] = useState(1)
-  const [pageSize] = useState(5)
   const [search, setSearch] = useState('')
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
@@ -75,14 +73,23 @@ export function AdminUsersPage() {
     setLoading(true)
     setError('')
     try {
-      const result = await adminUserApi.listUsers(page, pageSize, search || undefined)
-      if (result.success && result.data) {
-        setUsers(result.data.users)
-        setTotal(result.data.total)
+      // 后端 page_size 上限 100，循环拉取全部用户（列表内部滚动，不再分页）
+      const PAGE_SIZE = 100
+      const first = await adminUserApi.listUsers(1, PAGE_SIZE, search || undefined)
+      if (first.success && first.data) {
+        let allUsers = first.data.users
+        const totalCount = first.data.total
+        const pageCount = Math.ceil(totalCount / PAGE_SIZE)
+        for (let p = 2; p <= pageCount; p++) {
+          const next = await adminUserApi.listUsers(p, PAGE_SIZE, search || undefined)
+          if (next.success && next.data) allUsers = allUsers.concat(next.data.users)
+        }
+        setUsers(allUsers)
+        setTotal(totalCount)
         setOnlineStats({
-          online: result.data.online_users ?? 0,
-          pc: result.data.online_pc ?? 0,
-          app: result.data.online_app ?? 0,
+          online: first.data.online_users ?? 0,
+          pc: first.data.online_pc ?? 0,
+          app: first.data.online_app ?? 0,
         })
       }
     } catch (err: any) {
@@ -90,7 +97,7 @@ export function AdminUsersPage() {
     } finally {
       setLoading(false)
     }
-  }, [page, pageSize, search, t])
+  }, [search, t])
 
   useEffect(() => { fetchUsers() }, [fetchUsers])
 
@@ -100,8 +107,6 @@ export function AdminUsersPage() {
       .then(res => { if (res.success && res.data) setGroupOptions(res.data) })
       .catch(() => { /* 加载失败时下拉为空，后端保存时兜底校验 */ })
   }, [])
-
-  const totalPages = Math.max(1, Math.ceil(total / pageSize))
 
   // --- Add User ---
   const handleAdd = async () => {
@@ -286,26 +291,31 @@ export function AdminUsersPage() {
   // Per-user session cache: latest PC and APP session
   const [userSessionsCache, setUserSessionsCache] = useState<Record<number, { pc: UserSessionInfo | null; app: UserSessionInfo | null }>>({})
 
-  // Fetch latest PC and APP session for each user in current page
+  // Fetch latest PC and APP session for each user in current list
   useEffect(() => {
+    if (users.length === 0) {
+      setUserSessionsCache({})
+      return
+    }
+    let cancelled = false
     const fetchUserSessions = async () => {
-      const cache: Record<number, { pc: UserSessionInfo | null; app: UserSessionInfo | null }> = {}
-      for (const u of users) {
+      // 全量列表下逐个串行太慢，并发拉取
+      const entries = await Promise.all(users.map(async (u) => {
         try {
           const result = await adminUserApi.getUser(u.id)
-          if (result.success && result.data?.sessions) {
-            cache[u.id] = {
-              pc: result.data.sessions.find((s: UserSessionInfo) => s.client_type === 'pc') || null,
-              app: result.data.sessions.find((s: UserSessionInfo) => s.client_type === 'app') || null,
-            }
-          }
+          const sessions = result.success ? result.data?.sessions : undefined
+          return [u.id, {
+            pc: sessions?.find((s: UserSessionInfo) => s.client_type === 'pc') || null,
+            app: sessions?.find((s: UserSessionInfo) => s.client_type === 'app') || null,
+          }] as const
         } catch {
-          cache[u.id] = { pc: null, app: null }
+          return [u.id, { pc: null, app: null }] as const
         }
-      }
-      setUserSessionsCache(cache)
+      }))
+      if (!cancelled) setUserSessionsCache(Object.fromEntries(entries))
     }
-    if (users.length > 0) fetchUserSessions()
+    fetchUserSessions()
+    return () => { cancelled = true }
   }, [users])
 
   // 在线统计为全量（跨所有页），由后端基于全部用户计算
@@ -314,9 +324,9 @@ export function AdminUsersPage() {
   const onlineAppCount = onlineStats.app
 
   return (
-    <div className="p-6 space-y-6">
+    <div className="p-6 h-full min-h-0 flex flex-col gap-6 overflow-hidden">
       {/* Header */}
-      <div className="flex items-center gap-3">
+      <div className="flex items-center gap-3 shrink-0">
         <div className="p-2 bg-primary/10 rounded-lg">
           <Users size={24} className="text-primary" />
         </div>
@@ -324,13 +334,13 @@ export function AdminUsersPage() {
       </div>
 
       {/* Search & Refresh & Stats & Add User */}
-      <div className="flex gap-3 items-center">
+      <div className="flex gap-3 items-center shrink-0">
         <div className="relative flex-1 max-w-sm">
           <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground" />
           <input
             type="text"
             value={search}
-            onChange={(e) => { setSearch(e.target.value); setPage(1) }}
+            onChange={(e) => setSearch(e.target.value)}
             onKeyDown={(e) => { if (e.key === 'Enter') fetchUsers() }}
             placeholder={t('admin.searchPlaceholder', '搜索用户名...')}
             className="w-full pl-9 pr-3 py-2 bg-background border border-border rounded-lg text-foreground placeholder:text-muted-foreground/50 focus:outline-none focus:ring-2 focus:ring-primary/50"
@@ -361,7 +371,7 @@ export function AdminUsersPage() {
 
       {/* Error */}
       {error && (
-        <div className="p-3 bg-red-500/10 border border-red-500/20 rounded-lg text-sm text-red-400 flex items-center gap-2">
+        <div className="p-3 bg-red-500/10 border border-red-500/20 rounded-lg text-sm text-red-400 flex items-center gap-2 shrink-0">
           <span>{error}</span>
           <button onClick={fetchUsers} className="text-primary hover:underline">{t('admin.retry', '重试')}</button>
         </div>
@@ -369,18 +379,17 @@ export function AdminUsersPage() {
 
       {/* Table */}
       {loading ? (
-        <div className="flex items-center justify-center py-20">
+        <div className="flex-1 min-h-0 flex items-center justify-center">
           <Loader2 size={32} className="animate-spin text-muted-foreground" />
         </div>
       ) : users.length === 0 ? (
-        <div className="text-center py-20 text-muted-foreground">
+        <div className="flex-1 min-h-0 flex items-center justify-center text-muted-foreground">
           {t('admin.noUsers', '暂无用户')}
         </div>
       ) : (
-        <>
-          <div className="overflow-x-auto bg-card border border-border rounded-lg shadow-sm">
+        <div className="flex-1 min-h-0 overflow-auto bg-card border border-border rounded-lg shadow-sm">
             <table className="w-full text-sm">
-              <thead className="bg-muted/70">
+              <thead className="bg-muted sticky top-0 z-10">
                 <tr>
                   <th className="px-4 py-3 text-left text-muted-foreground font-medium">{t('auth.username', '用户名')}</th>
                   <th className="px-4 py-3 text-left text-muted-foreground font-medium">{t('admin.role', '角色')}</th>
@@ -474,32 +483,7 @@ export function AdminUsersPage() {
                 })}
               </tbody>
             </table>
-          </div>
-
-          {/* Pagination */}
-          <div className="flex items-center justify-between pt-1">
-            <span className="text-sm text-muted-foreground">{t('admin.totalUsers', { count: total })}</span>
-            <div className="flex items-center gap-2">
-              <button
-                onClick={() => setPage(p => Math.max(1, p - 1))}
-                disabled={page <= 1}
-                className="p-1.5 rounded border border-border disabled:opacity-30 hover:bg-muted transition-colors"
-                title={t('common.prevPage', '上一页')}
-              >
-                <ChevronLeft size={16} />
-              </button>
-              <span className="text-sm text-muted-foreground px-2">{page} / {totalPages}</span>
-              <button
-                onClick={() => setPage(p => Math.min(totalPages, p + 1))}
-                disabled={page >= totalPages}
-                className="p-1.5 rounded border border-border disabled:opacity-30 hover:bg-muted transition-colors"
-                title={t('common.nextPage', '下一页')}
-              >
-                <ChevronRight size={16} />
-              </button>
-            </div>
-          </div>
-        </>
+        </div>
       )}
 
       {/* Add User Modal */}

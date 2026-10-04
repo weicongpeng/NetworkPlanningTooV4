@@ -1,5 +1,5 @@
-import { useState, useEffect, useCallback, useRef } from 'react'
-import { Upload, FileSpreadsheet, Trash2, Download, Loader2, AlertCircle, RefreshCw, CheckCircle2, Layers, FileDown, MapPin, Navigation, CheckSquare, Square, ScrollText, Maximize2, Minimize2, RadioTower, BarChart3 } from 'lucide-react'
+import { useState, useEffect, useCallback, useRef, useMemo } from 'react'
+import { Upload, FileSpreadsheet, Trash2, Download, Loader2, AlertCircle, RefreshCw, CheckCircle2, Layers, FileDown, MapPin, Navigation, CheckSquare, Square, ScrollText, Maximize2, Minimize2, RadioTower, BarChart3, Search } from 'lucide-react'
 import { useDataStore } from '../store/dataStore'
 import { dataApi, assistantApi, getStoredAuthToken } from '../services/api'
 import type { CellRow, DataItem } from '@shared/types'
@@ -665,13 +665,28 @@ export function DataPage() {
     }
   }
 
+  // 文件名模糊搜索（大小写不敏感）；无关键字时返回全部
+  const [fileSearch, setFileSearch] = useState('')
+  const filteredItems = useMemo(() => {
+    const kw = fileSearch.trim().toLowerCase()
+    if (!kw) return items
+    return items.filter(item => item.name?.toLowerCase().includes(kw))
+  }, [items, fileSearch])
+
+  // 全选作用于当前过滤结果（搜索后批量操作不会误删看不到的文件）
   const toggleSelectAll = useCallback(() => {
-    if (selectedIds.size === items.length) {
-      setSelectedIds(new Set())
-    } else {
-      setSelectedIds(new Set(items.map(item => item.id)))
-    }
-  }, [selectedIds.size, items])
+    const allFilteredSelected =
+      filteredItems.length > 0 && filteredItems.every(item => selectedIds.has(item.id))
+    setSelectedIds(prev => {
+      const next = new Set(prev)
+      if (allFilteredSelected) {
+        filteredItems.forEach(item => next.delete(item.id))
+      } else {
+        filteredItems.forEach(item => next.add(item.id))
+      }
+      return next
+    })
+  }, [filteredItems, selectedIds])
 
   const toggleSelectItem = useCallback((id: string, e: React.MouseEvent) => {
     e.stopPropagation()
@@ -686,7 +701,7 @@ export function DataPage() {
     })
   }, [])
 
-  const allSelected = items.length > 0 && selectedIds.size === items.length
+  const allSelected = filteredItems.length > 0 && filteredItems.every(item => selectedIds.has(item.id))
   const hasSyncingItems = items.some(item => item.excelSynced === false || (item.inplaceUpdated && item.excelSynced === undefined))
 
   const handleUpdateParameters = async () => {
@@ -1026,7 +1041,7 @@ export function DataPage() {
                 .flatMap(f => (f.metadata?.importWarnings || []) as ImportWarning[])
               if (warnings.length === 0) return null
               return (
-                <div className="mb-4 px-3 py-2 bg-amber-500/10 border border-amber-500/20 rounded-lg text-xs text-amber-400">
+                <div className="mb-4 px-3 py-2 bg-amber-500/10 border border-amber-500/20 rounded-lg text-xs text-warning-foreground">
                   <div className="flex items-center gap-2 font-medium">
                     <AlertCircle size={14} className="shrink-0" />
                     <span>{t('data.importWarnTitle') || '工参文件存在问题，数据已导入'}</span>
@@ -1055,7 +1070,7 @@ export function DataPage() {
                 .flatMap(([net, v]) => (v.samples || []).map(s => ({ net, ...s })))
                 .slice(0, 8)
               return (
-                <div className="mb-4 px-3 py-2 bg-amber-500/10 border border-amber-500/20 rounded-lg text-xs text-amber-400">
+                <div className="mb-4 px-3 py-2 bg-amber-500/10 border border-amber-500/20 rounded-lg text-xs text-warning-foreground">
                   <div className="flex items-center gap-2 font-medium">
                     <AlertCircle size={14} className="shrink-0" />
                     <span>{t('data.dupReportTitle') || '全量工参检测到重复小区行'}</span>
@@ -1105,6 +1120,18 @@ export function DataPage() {
             <div className="flex items-center gap-2">
               {items.length > 0 && (
                 <>
+                  {/* 文件名模糊搜索 */}
+                  <div className="relative">
+                    <Search size={13} className="absolute left-2 top-1/2 -translate-y-1/2 text-muted-foreground pointer-events-none" />
+                    <input
+                      type="text"
+                      value={fileSearch}
+                      onChange={(e) => setFileSearch(e.target.value)}
+                      placeholder={t('data.searchFiles') || '搜索文件'}
+                      className="w-40 pl-7 pr-2 py-1 text-xs border border-border rounded bg-background text-foreground
+                                 focus:outline-none focus:ring-1 focus:ring-primary"
+                    />
+                  </div>
                   <button
                     onClick={toggleSelectAll}
                     className={`text-xs px-2.5 py-1 rounded border transition-colors ${
@@ -1159,9 +1186,13 @@ export function DataPage() {
             <p className="text-muted-foreground text-center py-8">
               {t('data.noData') || '暂无数据，请先导入'}
             </p>
+          ) : filteredItems.length === 0 ? (
+            <p className="text-muted-foreground text-center py-8">
+              {t('data.noMatchingFiles') || '没有匹配的文件'}
+            </p>
           ) : (
             <div className="space-y-2 max-h-[600px] overflow-y-auto">
-              {items.map((item) => (
+              {filteredItems.map((item) => (
                 <div
                   key={item.id}
                   className={`flex items-center justify-between p-3 rounded-lg border cursor-pointer transition-colors ${

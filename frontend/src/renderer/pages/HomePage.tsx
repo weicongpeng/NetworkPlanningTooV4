@@ -2,7 +2,7 @@ import {
   Database,
   Settings,
   Network,
-  Layers,
+  GitCompare,
   MapPin,
   Map,
   Shield,
@@ -55,7 +55,7 @@ export function HomePage() {
         <FeatureCard
           title={t('nav.tac')}
           description={t('home.tacDesc') || '对比图层TAC与现网TAC，统计一致性'}
-          icon={Layers}
+          icon={GitCompare}
           link="/tac"
           iconColor="text-orange-500"
         />
