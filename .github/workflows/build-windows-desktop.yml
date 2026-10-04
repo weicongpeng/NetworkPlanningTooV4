@@ -1,18 +1,23 @@
 name: Build Windows Desktop
 
-# M0 阶段：分支推送即构建（便于快速迭代打包风险点）
-# TODO(M4)：发布流程收敛为 tag（desktop-v*）触发，并把 NPT_CONSOLE 改回 0
+# 触发：
+# - 手动 workflow_dispatch
+# - 分支推送（快速迭代反馈）
+# - tag desktop-v* （走发行流程：编译安装器并创建 Release）
 on:
   workflow_dispatch:
   push:
     branches: [feat/windows-desktop]
     tags: ["desktop-v*"]
 
+permissions:
+  contents: write
+
 jobs:
   build-windows:
     runs-on: windows-latest
     env:
-      # CI 阶段保留控制台输出便于诊断；正式发布构建应为 0（无控制台窗口）
+      # CI 阶段保留控制台输出便于诊断；正式发行前改为 0（无控制台窗口）
       NPT_CONSOLE: "1"
     steps:
       - uses: actions/checkout@v4
@@ -41,6 +46,13 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r backend/requirements.txt -r desktop/requirements-desktop.txt
+
+      - name: 生成桌面图标（app.ico，构建期产物）
+        run: python desktop/tools/make_icon.py
+
+      - name: 关键单元测试
+        working-directory: backend
+        run: python -m pytest tests/test_desktop_license.py tests/test_data_group_scope.py -q
 
       - name: GDAL 栈基线检查（源码环境）
         run: python desktop/tools/spike.py
@@ -77,8 +89,54 @@ jobs:
           Write-Host ("打包体积: {0:N1} MB" -f $size)
           if ($fail) { exit 1 }
 
+      - name: 下载 WebView2 引导安装器（随安装包分发，供离线机器使用）
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path desktop/webview2 | Out-Null
+          Invoke-WebRequest -Uri "https://go.microsoft.com/fwlink/?linkid=2124701" -OutFile "desktop/webview2/MicrosoftEdgeWebview2Setup.exe"
+          $size = (Get-Item "desktop/webview2/MicrosoftEdgeWebview2Setup.exe").Length / 1MB
+          Write-Host ("WebView2 安装器: {0:N1} MB" -f $size)
+          if ($size -lt 50) { Write-Error "WebView2 安装器体积异常，下载可能失败"; exit 1 }
+
+      - name: 计算版本号
+        shell: pwsh
+        run: |
+          if ("${{ github.ref }}" -like "refs/tags/desktop-v*") {
+            $v = "${{ github.ref_name }}".Replace("desktop-v", "")
+          } else {
+            $v = "0.0.0-dev.${{ github.run_number }}"
+          }
+          "NPT_DESKTOP_VERSION=$v" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "桌面版版本号: $v"
+
+      - name: 生成安装器（Inno Setup）
+        shell: pwsh
+        run: |
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            Write-Host "未找到 Inno Setup，尝试通过 Chocolatey 安装..."
+            choco install innosetup -y --no-progress
+          }
+          & $iscc "/DMyAppVersion=$env:NPT_DESKTOP_VERSION" "desktop\installer.iss"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-ChildItem installer-out | Format-Table Name, Length
+
       - uses: actions/upload-artifact@v4
         with:
           name: NPT-Windows-desktop-dev
           path: dist/NetworkPlanningTool/
           retention-days: 14
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NPT-Windows-installer
+          path: installer-out/NetworkPlanningTool-Setup-*.exe
+          retention-days: 30
+
+      - name: 发布 Release（tag desktop-v*）
+        if: startsWith(github.ref, 'refs/tags/desktop-v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: |
+          gh release create "${{ github.ref_name }}" (Get-ChildItem "installer-out/NetworkPlanningTool-Setup-*.exe" | ForEach-Object { $_.FullName }) --title "${{ github.ref_name }}" --generate-notes --verify-tag

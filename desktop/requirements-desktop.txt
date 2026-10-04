@@ -5,3 +5,5 @@ pyinstaller==6.22.3
 pyinstaller-hooks-contrib==2026.8
 # GDAL 栈：pyogrio wheel 自带 libgdal/proj 等动态库（backend/requirements.txt 中 GDAL 被注释）
 pyogrio==0.13.0
+# 构建期生成 desktop/app.ico（见 tools/make_icon.py）
+pillow>=10.0

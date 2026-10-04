@@ -85,6 +85,9 @@ mobile-app/tsc_errors.txt
 /build/
 /desktop/build/
 /desktop/dist/
+/desktop/app.ico
+/desktop/webview2/
+/installer-out/
 /desktop/tools/keys/
 /desktop/tools/*.pem
 /desktop/tools/*.key
