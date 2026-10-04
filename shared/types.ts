@@ -13,6 +13,15 @@ export interface LicenseStatus {
   licensee: string
   licenseKey?: string
   features?: string[]
+  version?: string
+  errorMessage?: string | null
+  remainingDays?: number
+}
+
+/** 桌面离线版机器码信息（厂商签发绑定本机的授权文件用） */
+export interface MachineInfo {
+  machineCode: string
+  desktopMode: boolean
 }
 
 export interface LicenseInfo {

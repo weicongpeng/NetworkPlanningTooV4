@@ -85,6 +85,7 @@ mobile-app/tsc_errors.txt
 /build/
 /desktop/build/
 /desktop/dist/
+/desktop/tools/keys/
 /desktop/tools/*.pem
 /desktop/tools/*.key
 *.nptlic

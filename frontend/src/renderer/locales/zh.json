@@ -1,5 +1,15 @@
 {
   "license": {
+    "desktopTitle": "桌面离线授权",
+    "machineCodeLabel": "本机机器码",
+    "copy": "复制",
+    "copied": "已复制",
+    "machineCodeHint": "将机器码发送给授权方，获取与本机绑定的 .nptlic 授权文件后在下方导入",
+    "importLabel": "导入授权文件",
+    "importButton": "选择 .nptlic 文件",
+    "importHint": "授权文件与机器码绑定；更换电脑或重装系统后需重新签发",
+    "desktopStatusActive": "已授权，有效期至 {{date}}",
+    "desktopStatusInactive": "未激活",
     "title": "配置管理",
     "licenseManagement": "License管理",
     "adminTitle": "授权管理",

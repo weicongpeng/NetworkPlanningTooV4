@@ -145,6 +145,14 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"❌ 用户数据库初始化失败: {e}")
 
+    # 桌面模式：同步签名授权到期日到 admin（前端展示依赖，失败不影响授权校验）
+    try:
+        if settings.NPT_DESKTOP:
+            from app.services.license_service import license_service
+            license_service.sync_desktop_admin_expiry()
+    except Exception as e:
+        logger.warning(f"⚠️ 同步桌面授权状态失败: {e}")
+
     # 初始化进程池（用于 CPU 密集型任务）
     pool = None
     try:

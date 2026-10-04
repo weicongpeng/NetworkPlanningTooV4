@@ -105,7 +105,7 @@ export function ProtectedRoute({ children, requireAdmin = false, requirePermissi
           </div>
 
           <div className="text-center space-y-2">
-            <h1 className="text-2xl font-bold text-foreground">授权已过期，请联系管理员</h1>
+            <h1 className="text-2xl font-bold text-foreground">{errorMessage || '授权已过期，请联系管理员'}</h1>
           </div>
 
           {remainingDays !== null && remainingDays <= 0 && (
@@ -124,6 +124,13 @@ export function ProtectedRoute({ children, requireAdmin = false, requirePermissi
               </div>
             </div>
           )}
+
+          <button
+            onClick={() => navigate('/license')}
+            className="w-full px-6 py-3 bg-primary text-primary-foreground rounded-lg hover:opacity-90 transition-opacity font-medium"
+          >
+            前往配置管理
+          </button>
         </div>
       </div>
     )

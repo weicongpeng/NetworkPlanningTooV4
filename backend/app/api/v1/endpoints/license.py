@@ -9,11 +9,13 @@ from typing import Dict, Any, Optional
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.core.database import get_db
-from app.core.security import get_current_admin_user
+from app.core.security import get_current_admin_user, get_current_user
 from app.models.database import User
 from app.models.schemas import LicenseStatus, LicenseResponse
 from app.services.license_service import license_service
+from app.utils.machine_code import get_machine_code
 
 router = APIRouter()
 
@@ -85,6 +87,21 @@ async def check_license() -> Dict[str, Any]:
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.get("/machine-info", response_model=Dict[str, Any])
+async def get_machine_info(current_user: User = Depends(get_current_user)) -> Dict[str, Any]:
+    """桌面版机器码信息（用于厂商签发绑定本机的授权文件）。"""
+    try:
+        return {
+            "success": True,
+            "data": {
+                "machineCode": get_machine_code(),
+                "desktopMode": settings.NPT_DESKTOP,
+            },
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.post("/update-expiry", response_model=Dict[str, Any])
 async def update_license_expiry(
     data: UpdateExpiryRequest,
@@ -94,7 +111,14 @@ async def update_license_expiry(
     管理员更新全局授权期限（即管理员自身的 license_expiry）
 
     expiry_date: "YYYY-MM-DD" 格式的日期字符串，或 null 表示无限期
+
+    桌面离线版：授权期限由厂商签发的授权文件控制，此接口直接拒绝。
     """
+    if settings.NPT_DESKTOP:
+        raise HTTPException(
+            status_code=403,
+            detail="桌面版授权期限由授权文件控制，请联系厂商续期",
+        )
     try:
         result = license_service.update_admin_license_expiry(data.expiry_date)
         if result is None:

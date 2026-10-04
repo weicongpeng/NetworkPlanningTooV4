@@ -1,5 +1,15 @@
 {
   "license": {
+    "desktopTitle": "Desktop Offline License",
+    "machineCodeLabel": "Machine code",
+    "copy": "Copy",
+    "copied": "Copied",
+    "machineCodeHint": "Send this machine code to the licensor, then import the machine-bound .nptlic file below",
+    "importLabel": "Import license file",
+    "importButton": "Choose .nptlic file",
+    "importHint": "The license is bound to this machine; reissue is required after changing or reinstalling the system",
+    "desktopStatusActive": "Licensed, valid until {{date}}",
+    "desktopStatusInactive": "Not activated",
     "title": "Configuration",
     "licenseManagement": "License Management",
     "adminTitle": "Authorization Management",

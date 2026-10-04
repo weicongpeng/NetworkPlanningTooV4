@@ -29,6 +29,19 @@ interface ChunkResult {
 }
 
 /**
+ * 直接触发浏览器/桌面壳下载（不打开新窗口）。
+ * window.open 在 pywebview 桌面壳中会弹系统浏览器，这里统一用 a[download]。
+ */
+function triggerDownload(url: string, filename?: string): void {
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename || url.split('/').pop() || 'download'
+  document.body.appendChild(a)
+  a.click()
+  document.body.removeChild(a)
+}
+
+/**
  * 并行分块下载大文件
  * @param url 下载 URL（服务器必须支持 Accept-Ranges: bytes）
  * @param options 配置选项
@@ -82,14 +95,14 @@ export async function parallelDownload(
   } catch (err: any) {
     if (err.name === 'AbortError') throw err
     console.warn('[parallelDownload] HEAD 请求失败，回退到普通下载', err)
-    // 回退：直接打开链接
-    window.open(url, '_blank')
+    // 回退：直接触发下载
+    triggerDownload(url, finalFilename)
     return
   }
 
   // 如果不支持 Range 或文件很小，使用普通下载
   if (!supportsRanges || totalSize < 1024 * 1024) {
-    window.open(url, '_blank')
+    triggerDownload(url, finalFilename)
     return
   }
 
@@ -122,7 +135,7 @@ export async function parallelDownload(
   } catch (err: any) {
     if (err.name === 'AbortError') throw err
     console.error('[parallelDownload] 分块下载失败，回退到普通下载', err)
-    window.open(url, '_blank')
+    triggerDownload(url, finalFilename)
     return
   }
 

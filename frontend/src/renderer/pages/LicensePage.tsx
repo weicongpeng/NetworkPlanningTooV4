@@ -1,6 +1,7 @@
-import { useEffect, useState } from 'react'
-import { Check, Palette, Sun, Moon, Key, RefreshCw, X, Globe, Calendar, Infinity, Loader2, LifeBuoy } from 'lucide-react'
+import { useCallback, useEffect, useRef, useState } from 'react'
+import { Check, Palette, Sun, Moon, Key, RefreshCw, X, Globe, Calendar, Infinity, Loader2, LifeBuoy, Monitor, Copy, Upload } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
+import type { MachineInfo, LicenseStatus } from '@shared/types'
 import {
   useThemeStore,
   ThemeMode,
@@ -27,6 +28,69 @@ export function LicensePage() {
 
   const isAdmin = user?.is_admin ?? false
   const licenseExpiry = user?.license_expiry ?? null
+
+  // 桌面离线授权：机器码与授权状态
+  const [machineInfo, setMachineInfo] = useState<MachineInfo | null>(null)
+  const [licenseStatus, setLicenseStatus] = useState<LicenseStatus | null>(null)
+  const [uploading, setUploading] = useState(false)
+  const [uploadMessage, setUploadMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
+  const [copied, setCopied] = useState(false)
+  const licenseFileRef = useRef<HTMLInputElement>(null)
+
+  const refreshLicenseState = useCallback(async () => {
+    try {
+      const [infoRes, statusRes] = await Promise.all([
+        licenseApi.getMachineInfo(),
+        licenseApi.getStatus(),
+      ])
+      if (infoRes.success) setMachineInfo(infoRes.data)
+      if (statusRes.success) setLicenseStatus(statusRes.data)
+    } catch {
+      // 服务器部署无机器码接口时静默忽略
+    }
+  }, [])
+
+  useEffect(() => {
+    if (isAdmin) refreshLicenseState()
+  }, [isAdmin, refreshLicenseState])
+
+  const handleCopyMachineCode = async () => {
+    const code = machineInfo?.machineCode
+    if (!code) return
+    try {
+      await navigator.clipboard.writeText(code)
+    } catch {
+      const ta = document.createElement('textarea')
+      ta.value = code
+      document.body.appendChild(ta)
+      ta.select()
+      document.execCommand('copy')
+      document.body.removeChild(ta)
+    }
+    setCopied(true)
+    setTimeout(() => setCopied(false), 2000)
+  }
+
+  const handleUploadLicense = async (file: File) => {
+    setUploading(true)
+    setUploadMessage(null)
+    try {
+      const result: any = await licenseApi.upload(file)
+      if (result?.success) {
+        setUploadMessage({ type: 'success', text: result.message || t('license.uploadSuccess') })
+        await fetchUser()
+        await refreshLicenseState()
+      } else {
+        setUploadMessage({ type: 'error', text: result?.message || t('license.uploadError') })
+      }
+    } catch (err: any) {
+      setUploadMessage({ type: 'error', text: err?.message || t('license.uploadError') })
+    } finally {
+      setUploading(false)
+      if (licenseFileRef.current) licenseFileRef.current.value = ''
+      setTimeout(() => setUploadMessage(null), 8000)
+    }
+  }
 
   const handleThemeSelect = (mode: ThemeMode) => {
     setPreviewTheme(mode)
@@ -122,6 +186,95 @@ export function LicensePage() {
         </div>
       )}
 
+      {/* 桌面离线授权：机器码 + 授权文件导入（仅桌面版、管理员可见） */}
+      {isAdmin && machineInfo?.desktopMode && (
+        <div className="mb-6 max-w-5xl">
+          <div className="bg-card p-5 rounded-lg border border-border">
+            <div className="flex items-center justify-between mb-4">
+              <div className="flex items-center gap-2">
+                <Monitor size={20} className="text-primary" />
+                <h2 className="text-base font-semibold">{t('license.desktopTitle')}</h2>
+              </div>
+              <button
+                onClick={() => refreshLicenseState()}
+                className="p-1.5 hover:bg-muted rounded-lg transition-colors"
+                title={t('license.refresh')}
+              >
+                <RefreshCw size={16} />
+              </button>
+            </div>
+
+            <div className="space-y-4">
+              <div>
+                <label className="block text-xs text-muted-foreground mb-1.5">{t('license.machineCodeLabel')}</label>
+                <div className="flex items-center gap-2">
+                  <code className="flex-1 px-3 py-2 bg-muted rounded-lg text-sm font-mono tracking-wider">
+                    {machineInfo.machineCode}
+                  </code>
+                  <button
+                    onClick={handleCopyMachineCode}
+                    className="px-3 py-2 border border-border rounded-lg hover:bg-muted text-sm font-medium flex items-center gap-1.5"
+                  >
+                    {copied ? <Check size={14} className="text-green-500" /> : <Copy size={14} />}
+                    {copied ? t('license.copied') : t('license.copy')}
+                  </button>
+                </div>
+                <p className="text-xs text-muted-foreground mt-1.5">{t('license.machineCodeHint')}</p>
+              </div>
+
+              <div>
+                <label className="block text-xs text-muted-foreground mb-1.5">{t('license.importLabel')}</label>
+                <input
+                  ref={licenseFileRef}
+                  type="file"
+                  accept=".nptlic,.lic,.dat,.txt"
+                  className="hidden"
+                  onChange={(e) => {
+                    const f = e.target.files?.[0]
+                    if (f) handleUploadLicense(f)
+                  }}
+                />
+                <button
+                  onClick={() => licenseFileRef.current?.click()}
+                  disabled={uploading}
+                  className="px-4 py-2 bg-primary text-primary-foreground rounded-lg hover:opacity-90 disabled:opacity-50 text-sm font-medium flex items-center gap-1.5"
+                >
+                  {uploading ? <Loader2 size={14} className="animate-spin" /> : <Upload size={14} />}
+                  {uploading ? t('license.uploading') : t('license.importButton')}
+                </button>
+                <p className="text-xs text-muted-foreground mt-1.5">{t('license.importHint')}</p>
+              </div>
+
+              {licenseStatus && (
+                <div className={`p-2 rounded flex items-center gap-2 border ${
+                  licenseStatus.valid
+                    ? 'bg-green-500/10 border-green-500/20 text-green-500'
+                    : 'bg-amber-500/10 border-amber-500/20 text-amber-600'
+                }`}>
+                  {licenseStatus.valid ? <Check size={14} /> : <X size={14} />}
+                  <span className="text-xs">
+                    {licenseStatus.valid
+                      ? t('license.desktopStatusActive', { date: licenseStatus.expiryDate })
+                      : (licenseStatus.errorMessage || t('license.desktopStatusInactive'))}
+                  </span>
+                </div>
+              )}
+
+              {uploadMessage && (
+                <div className={`p-2 rounded flex items-center gap-2 ${
+                  uploadMessage.type === 'success'
+                    ? 'bg-green-500/10 border border-green-500/20 text-green-500'
+                    : 'bg-red-500/10 border border-red-500/20 text-red-500'
+                }`}>
+                  {uploadMessage.type === 'success' ? <Check size={14} /> : <X size={14} />}
+                  <span className="text-xs">{uploadMessage.text}</span>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 max-w-5xl">
         {/* 语言设置 */}
         <div className="bg-card p-5 rounded-lg border border-border">
@@ -157,8 +310,8 @@ export function LicensePage() {
           </div>
         </div>
 
-        {/* 授权管理（仅管理员）：原"授权信息"状态/到期/剩余天数展示已移除 */}
-        {isAdmin && (
+        {/* 授权管理（仅管理员，且非桌面版）：桌面版期限由授权文件控制 */}
+        {isAdmin && !machineInfo?.desktopMode && (
           <div className="bg-card p-5 rounded-lg border border-border">
             <div className="flex items-center justify-between mb-4">
               <div className="flex items-center gap-2">

@@ -4,6 +4,7 @@ import type {
   CellBulkUpdateResultItem,
   CellSearchItem,
   LicenseStatus,
+  MachineInfo,
   NeighborConfig,
   NeighborResult,
   PCIConfig,
@@ -327,6 +328,11 @@ export const licenseApi = {
     const formData = new FormData()
     formData.append('file', file)
     return uploadClient.post('/license/upload', formData)
+  },
+
+  // 桌面离线版：本机机器码（供厂商签发绑定授权）
+  getMachineInfo: async (): Promise<ApiResponse<MachineInfo>> => {
+    return apiClient.get('/license/machine-info')
   },
 
   // 管理员更新全局授权期限
