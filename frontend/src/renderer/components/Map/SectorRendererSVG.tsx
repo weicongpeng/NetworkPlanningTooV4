@@ -15,10 +15,13 @@ import { RenderSectorData } from '../../services/mapDataService'
 import { SECTOR_CONFIG, getCellCoverStyle, getSectorColor, resolveSectorField } from '../../config/sector-config'
 import { tacColorMapper } from '../../utils/tacColors'
 import { matchThematicColor, matchRangeIndex, getFieldValue, toNumber } from '../../utils/fieldValue'
+import { buildPciModPalette, getPciModColor } from '../../utils/pciModColor'
+import type { PciRenderStats } from '../../utils/pciModColor'
 import type { ThematicSettings } from './LabelSettingsModal'
 import type { HeatPoint } from '../../utils/heatmap'
 import type { NetworkType } from '../../config/sector-config'
 import { LabelLayoutManager, type LabelCandidate } from './LabelLayoutManager'
+import { layerHitAt, layerBoundsHitPx, CLICK_HIT_TOLERANCE_PX, type FeatureHitType } from './mapHitTest'
 
 /**
  * PCI高亮配置接口
@@ -167,6 +170,18 @@ export class SectorSVGLayer extends L.Layer {
   // 默认设置覆盖（图形透明度/边框宽度；仅默认频点配色模式生效）
   private colorOverrides: { fillOpacity: number; borderWidth: number } | null = null
 
+  // 小区PCI渲染（默认设置：启用后按 PCI 模3/模30 取值配色）
+  private pciRender: { enabled: boolean; mod: 3 | 30 } | null = null
+
+  // PCI模值图例统计（按频点分组的小区数、总数、无PCI/无频点数）
+  private pciRenderStats: PciRenderStats | null = null
+
+  // PCI渲染调色板（"频点×模值"组合，与统计同步构建）
+  private pciRenderPalette: string[] | null = null
+
+  // PCI渲染频点有序列表（升序，频点序号用于调色板组合编号）
+  private pciFrequencies: number[] = []
+
   // 专题图层设置（启用时优先于频点配色）
   private thematicSettings: ThematicSettings | null = null
 
@@ -311,6 +326,7 @@ export class SectorSVGLayer extends L.Layer {
    */
   updateSectors(sectors: RenderSectorData[]): void {
     this.sectors = sectors
+    this.computePciRenderStats()
     this._render()
   }
 
@@ -401,6 +417,8 @@ export class SectorSVGLayer extends L.Layer {
    */
   setFrequencyVisibility(frequency: number, visible: boolean): void {
     this.frequencyVisibility.set(frequency, visible)
+    // 频点勾选变化：同步重算PCI图例统计（图例只展示勾选频点）
+    this.computePciRenderStats()
     this._render() // 重新渲染
   }
 
@@ -431,6 +449,43 @@ export class SectorSVGLayer extends L.Layer {
 
     // 去重并返回
     return sectors.filter((v, i, a) => a.findIndex(t => t.id === v.id) === i)
+  }
+
+  /**
+   * 获取坐标位置精确命中的扇区（几何命中，用于手形工具统一"点击查属性"）。
+   *
+   * 与 getSectorsAt（DOM elementsFromPoint）不同：
+   * - 编辑会话/测距模式下扇区元素 pointer-events:none，elementsFromPoint 会忽略它们，
+   *   而本方法直接对渲染几何做像素空间命中，不受交互状态影响；
+   * - 按 mapHitTest 口径区分 direct（扇形填充包含点击点）/ border（仅边框容差压中，
+   *   如相邻扇区的直边交叠），交由调用方做穿透收敛，避免边框交叠误弹重叠列表。
+   *
+   * @param latlng 点击位置（渲染坐标/GCJ02）
+   * @param tolerancePx 像素容差
+   */
+  public getSectorsAtLatLng(
+    latlng: L.LatLng,
+    tolerancePx: number = CLICK_HIT_TOLERANCE_PX
+  ): Array<{ sector: RenderSectorData; hitType: FeatureHitType; distancePx: number }> {
+    if (!this.mapInstance || !this.featureGroup) return []
+    const results: Array<{ sector: RenderSectorData; hitType: FeatureHitType; distancePx: number }> = []
+
+    const collect = (layer: L.Layer) => {
+      const sector = (layer as any).sectorData as RenderSectorData | undefined
+      if (!sector) return
+      // 已被移出渲染层的缓存（清理滞后）不参与命中
+      if (!this.featureGroup!.hasLayer(layer)) return
+      // 像素包围盒粗检预筛：扇区多边形点数多，避免全量逐点投影
+      if (!layerBoundsHitPx(this.mapInstance!, layer, latlng, tolerancePx)) return
+      const hit = layerHitAt(this.mapInstance!, layer, latlng, tolerancePx)
+      if (hit) results.push({ sector, hitType: hit.type, distancePx: hit.distancePx })
+    }
+
+    for (const cached of this.sectorPolygons.values()) collect(cached.polygon)
+    for (const cached of this.siteMarkers.values()) collect(cached.marker)
+
+    // 去重（同一扇区不会同时存在于两个缓存，此处仅防御）
+    return results.filter((v, i, a) => a.findIndex(t => String(t.sector.id) === String(v.sector.id)) === i)
   }
 
   /**
@@ -494,6 +549,8 @@ export class SectorSVGLayer extends L.Layer {
       }
     }
 
+    // 频点可见性初始化/变化：重算PCI图例统计后再渲染
+    this.computePciRenderStats()
     this._render()
   }
 
@@ -914,8 +971,18 @@ export class SectorSVGLayer extends L.Layer {
     const colors = getSectorColor(sector)
     const config = SECTOR_CONFIG[sector.networkType]
 
-    // 专题配色优先（启用且字段有效时）
     let fillColor = colors.fillColor
+    // 小区PCI渲染（默认设置）：同频点且同 PCI 模3/模30 取值才同色；
+    // 无有效频点/PCI时保持原配色。专题图层优先级更高，在下方覆盖。
+    if (this.pciRender?.enabled && this.pciRenderPalette) {
+      const frequency = this._getFrequencyValue(sector)
+      const pci = frequency !== null ? this._getPCIValue(sector) : null
+      const freqIndex = frequency !== null ? this.pciFrequencies.indexOf(frequency) : -1
+      if (pci !== null && freqIndex >= 0) {
+        fillColor = getPciModColor(this.pciRenderPalette, freqIndex, this.pciRender.mod, pci)
+      }
+    }
+    // 专题配色优先（启用且字段有效时）
     if (this.thematicSettings?.enabled && this.thematicSettings.field) {
       const thematicColor = matchThematicColor(
         this.thematicSettings,
@@ -953,14 +1020,76 @@ export class SectorSVGLayer extends L.Layer {
   }
 
   /**
-   * 设置默认设置覆盖（图形透明度/边框宽度；null 恢复 SECTOR_CONFIG 默认）
-   * 仅默认频点配色模式生效；专题启用时透明度/边框宽仍叠加（与图层文件一致）
+   * 设置默认设置覆盖（图形透明度/边框宽度/小区PCI渲染；null 恢复 SECTOR_CONFIG 默认）
+   * 频点配色模式下生效；专题启用时透明度/边框宽仍叠加（与图层文件一致）
    */
-  setColorOverrides(settings: { fillOpacity: number; borderWidth: number } | null): void {
+  setColorOverrides(settings: {
+    fillOpacity: number
+    borderWidth: number
+    pciRenderEnabled?: boolean
+    pciMod?: 3 | 30
+  } | null): void {
     this.colorOverrides = settings
+    this.pciRender = settings?.pciRenderEnabled
+      ? { enabled: true, mod: settings.pciMod ?? 3 }
+      : null
+    this.computePciRenderStats()
     // _render 负责新增视口内缺失的扇区，_updateSectorStyles 负责重绘已缓存的扇区
     this._render()
     this._updateSectorStyles()
+  }
+
+  /**
+   * 计算小区PCI渲染统计：收集有序频点列表与调色板，按"频点×模值"分组计数；
+   * noPci = 有频点但无有效PCI；noFrequency = 无有效频点（保持原配色）。
+   */
+  private computePciRenderStats(): void {
+    const pr = this.pciRender
+    if (!pr?.enabled || this.sectors.length === 0) {
+      this.pciRenderStats = null
+      this.pciRenderPalette = null
+      this.pciFrequencies = []
+      return
+    }
+    // 有序频点列表（去重升序）；仅控制面板已勾选可见的频点才进入图例，
+    // 与地图渲染过滤（frequencyVisibility）及频点复选框状态保持一致。
+    const freqSet = new Set<number>()
+    for (const sector of this.sectors) {
+      const f = this._getFrequencyValue(sector)
+      if (f !== null && this.frequencyVisibility.get(f) === true) freqSet.add(f)
+    }
+    const frequencies = [...freqSet].sort((a, b) => a - b)
+    this.pciFrequencies = frequencies
+    this.pciRenderPalette = buildPciModPalette(frequencies.length, pr.mod)
+
+    const groups = frequencies.map(frequency => ({
+      frequency,
+      counts: new Array(pr.mod).fill(0),
+      total: 0
+    }))
+    let total = 0
+    let noPci = 0
+    let noFrequency = 0
+    for (const sector of this.sectors) {
+      const frequency = this._getFrequencyValue(sector)
+      if (frequency === null) { noFrequency++; continue }
+      // 未勾选频点：不展示该频点图例，也不计入 noPci（其小区本就被频点过滤）
+      if (this.frequencyVisibility.get(frequency) !== true) continue
+      const pci = this._getPCIValue(sector)
+      if (pci === null) { noPci++; continue }
+      const group = groups[frequencies.indexOf(frequency)]
+      group.total++
+      total++
+      group.counts[((pci % pr.mod) + pr.mod) % pr.mod]++
+    }
+    this.pciRenderStats = { frequencies: groups, total, noPci, noFrequency }
+  }
+
+  /**
+   * 获取PCI渲染图例统计（按频点分组的各模值个数及无PCI/无频点小区数）
+   */
+  getPciRenderStats(): PciRenderStats | null {
+    return this.pciRenderStats
   }
 
   /**
@@ -1249,6 +1378,39 @@ export class SectorSVGLayer extends L.Layer {
   }
 
   /**
+   * 获取小区PCI数值（标签与PCI渲染共用）
+   * 优先使用PCI规划应用后的同步值（pciDataSyncService），再回退工参原始 pci 字段；
+   * PCI 必须为有限整数（非整数/NaN/Infinity 等脏数据视为无效），否则返回 null。
+   */
+  private _getPCIValue(sector: RenderSectorData): number | null {
+    let raw: unknown
+    try {
+      const pciDataSyncService = require('../../services/pciDataSyncService').pciDataSyncService
+      if (pciDataSyncService && sector.siteId && sector.sectorId) {
+        const syncedSector = pciDataSyncService.findSector(sector.siteId, sector.sectorId)
+        if (syncedSector && syncedSector.syncedPCI !== undefined) raw = syncedSector.syncedPCI
+      }
+    } catch (e) {
+      console.warn('[SectorRenderer] 获取同步PCI失败:', e)
+    }
+    if (raw === undefined || raw === null) raw = sector.pci
+    const num = Number(raw)
+    return Number.isInteger(num) ? num : null
+  }
+
+  /**
+   * 获取小区工作频点（标签与PCI渲染共用）
+   * 解析顺序 frequency → ssbFrequency → earfcn；必须为正有限数，否则返回 null。
+   */
+  private _getFrequencyValue(sector: RenderSectorData): number | null {
+    for (const raw of [sector.frequency, sector.ssbFrequency, sector.earfcn]) {
+      const num = Number(raw)
+      if (Number.isFinite(num) && num > 0) return num
+    }
+    return null
+  }
+
+  /**
    * 获取标签内容根据字段类型
    * 参考SectorInfoPanel的实现，直接读取sector对象的属性
    * @param sector 扇区数据
@@ -1274,31 +1436,17 @@ export class SectorSVGLayer extends L.Layer {
         // 小区ID
         return sector.sectorId || ''
 
-      case 'frequency':
-        // 下行频点 - 直接使用frequency字段
-        if (sector.frequency) return String(sector.frequency)
-        // 如果frequency为空，尝试其他字段
-        if (sector.ssbFrequency) return String(sector.ssbFrequency)
-        if (sector.earfcn) return String(sector.earfcn)
-        return ''
+      case 'frequency': {
+        // 下行频点 - 与PCI渲染的频点解析同源
+        const frequency = this._getFrequencyValue(sector)
+        return frequency !== null ? String(frequency) : ''
+      }
 
-      case 'pci':
-        // PCI - 优先使用同步服务中的PCI值，然后使用原始pci字段
-        try {
-          // 尝试从同步服务获取同步后的PCI值
-          const pciDataSyncService = require('../../services/pciDataSyncService').pciDataSyncService
-          if (pciDataSyncService && sector.siteId && sector.sectorId) {
-            const syncedSector = pciDataSyncService.findSector(sector.siteId, sector.sectorId)
-            if (syncedSector && syncedSector.syncedPCI !== undefined) {
-              return String(syncedSector.syncedPCI)
-            }
-          }
-        } catch (e) {
-          // 如果同步服务不可用，使用原始pci字段
-          console.warn('[SectorRenderer] 获取同步PCI失败:', e)
-        }
-        // 使用原始pci字段作为后备
-        return sector.pci !== undefined ? String(sector.pci) : ''
+      case 'pci': {
+        // PCI - 与PCI渲染同源（同步服务优先，原始pci字段兜底）
+        const pci = this._getPCIValue(sector)
+        return pci !== null ? String(pci) : ''
+      }
 
       case 'tac':
         // TAC - 直接使用tac字段
@@ -2242,10 +2390,13 @@ export class SectorSVGLayer extends L.Layer {
     const visibleSectors = this._getVisibleSectors(paddedBounds)
 
     // 按频点过滤扇区
+    // 口径契约：仅 raw frequency 显式 false 才隐藏；undefined（频点键缺失）放行。
+    // 已知频点由 setFrequenciesVisibility 初始化为 true/false（default 模式未勾选补 false），
+    // 故 undefined 仅在数据出现未登记频点时发生。PCI图例口径不同（===true 才展示，
+    // 且频点解析含 ssbFrequency/earfcn 回退），改动此处须与 computePciRenderStats 对齐。
     const frequencyFilteredSectors = visibleSectors.filter(sector => {
       if (!sector.frequency) return true
       const isVisible = this.frequencyVisibility.get(sector.frequency)
-      // 如果频点不在映射中（undefined），默认显示；只有在映射中且值为false时才过滤
       const result = isVisible !== false
       if (this._isDev && !result && this.renderMode === 'neighbor-planning') {
         console.log('[SectorRenderer] 扇区被频点过滤', {
@@ -2550,11 +2701,11 @@ export class SectorSVGLayer extends L.Layer {
     // 获取可见扇区（带缓存）
     const visibleSectors = this._getVisibleSectors(paddedBounds)
 
-    // 按频点过滤扇区
+    // 按频点过滤扇区（口径契约见 _renderSectorsOptimized 同名注释：
+    // 显式 false 才隐藏、undefined 放行；与 PCI 图例 ===true 口径不同，改动须同步）
     const frequencyFilteredSectors = visibleSectors.filter(sector => {
       if (!sector.frequency) return true
       const isVisible = this.frequencyVisibility.get(sector.frequency)
-      // 如果频点不在映射中（undefined），默认显示；只有在映射中且值为false时才过滤
       return isVisible !== false
     })
 
