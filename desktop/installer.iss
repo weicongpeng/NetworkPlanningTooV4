@@ -1,9 +1,12 @@
 ; 网络规划工具 —— Windows 桌面离线版安装脚本（Inno Setup 6）
 ;
 ; 构建（在仓库根目录）：
-;   1) pyinstaller --noconfirm --clean desktop/desktop.spec
-;   2) 下载 WebView2 引导安装器到 desktop/webview2/MicrosoftEdgeWebview2Setup.exe
-;   3) ISCC desktop/installer.iss  （可用 /DMyAppVersion=x.y.z 覆盖版本号）
+;   1) pip install -r backend/requirements.txt -r desktop/requirements-desktop.txt
+;   2) python desktop/tools/make_icon.py        （生成 app.ico）
+;   3) pyinstaller --noconfirm --clean desktop/desktop.spec
+;   4) 下载 WebView2 引导安装器到 desktop/webview2/MicrosoftEdgeWebview2Setup.exe
+;      （离线机器用；缺失时安装器仍可编译，仅跳过随包安装）
+;   5) ISCC desktop/installer.iss               （可用 /DMyAppVersion=x.y.z 覆盖版本号）
 ;
 ; 说明：per-user 安装（无需管理员）；用户数据在 %APPDATA%\NetworkPlanningTool，
 ;       卸载不删除；运行中的程序通过 AppMutex 检测并提示关闭。

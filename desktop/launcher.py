@@ -29,7 +29,8 @@ from typing import Any, Optional, Tuple
 APP_NAME = "网络规划工具"
 MUTEX_NAME = "Local\\NPTDesktop"
 READY_PATH = "/api/v1/system/status"
-READY_TIMEOUT_SECONDS = 90
+# 启动时 lifespan 会做数据索引检查与地图缓存预热，首次启动可能较慢
+READY_TIMEOUT_SECONDS = 120
 
 _MUTEX_HANDLE: Optional[int] = None
 _log = logging.getLogger("desktop")
