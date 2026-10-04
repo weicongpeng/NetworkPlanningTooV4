@@ -10,45 +10,47 @@ export const DEG2RAD = Math.PI / 180
 const RAD2DEG = 180 / Math.PI
 const MERCATOR_LAT_LIMIT = 85.05112878
 /**
- * 覆盖半径外的渐隐倍数：值核在 1.25×桶半径处截断（高斯查表范围）。
+ * 覆盖半径外的渐隐倍数：值核在 1.25×桶半径处截断（紧支撑核的支撑半径）。
  * 覆盖（不透明度）不再由逐桶覆盖圆决定，而是来自**区域覆盖场**（见 buildRegionAlpha）
  */
 export const FADE_OUT_FACTOR = 1.25
+/** 支撑半径的平方倍数 (1.25²)：核权重按 d² 判定，省掉每桶一次开方 */
+const SUPPORT_SQ = FADE_OUT_FACTOR * FADE_OUT_FACTOR
 /** 桶边长相对全局覆盖半径的倍数：桶越细，插值越接近真实 IDW（粒度粗会出现块状色块） */
 const CELL_FACTOR = 0.75
+/**
+ * 细网格边长相对点间距的基准（samp=1 时）。网格越细、核支撑越窄，
+ * 高值色斑越紧凑；下限由"支撑 ≥ √2×格边长（处处有细节覆盖，不出两层皮）"决定。
+ */
+const FINE_CELL_RATIO = 0.6
+/**
+ * 趋势场作为**统一归一化**的兜底权重：无桶贡献的位置靠它撑起单位分解，
+ * 同时软化粗场平台。值小（0.2），gate 抑制处不参与
+ */
+const TREND_FLOOR_W = 0.2
 /** 网格总桶数上限（按范围自适应放大桶边长，防止内存膨胀） */
 const MAX_BUCKETS_SIDE = 512
 /**
- * 权重核：高斯 exp(-d²/(2σ²))，σ = 桶半径 × GAUSS_SIGMA_RATIO。
+ * 权重核：紧支撑 C¹ 核 w(t) = (1-t)³，t = (d/支撑半径)² ∈ [0,1)。
  *
  * 为什么不用距离倒数幂（1/(d+d0)^p）：
  * - p=1（1/(d+1)）在采样点处导数不连续，分辨率提高后每个桶代表点会显出
  *   可见的尖峰/圆盘边界（"每个采样点颜色边界太明显"）
  * - p=2（1/(d²+d0)）在采样点附近近乎常量，形成平台，站间过渡被挤成一条陡边界
- * 高斯核在 d=0 处导数为 0（无尖峰）、又单调无平台，是 KDE 的标准核。
+ * w(t)=(1-t)³ 在 d=0 处导数为 0（无尖峰）、又单调无平台。
  *
- * 用查表替代 Math.exp（每像素每桶一次，属热路径）
+ * **支撑边界必须值与斜率同时归零**（C¹）：旧实现用截断高斯 exp(-d²/(2σ²))，
+ * 在 d=1.25R 处权重仍有 ~4.4%，越过该半径直接跳 0——归一化加权平均下这个
+ * 权重跳变在每个桶周围形成**圆形阶跃**，经"等效细胞计数"分位拉伸后就是用户
+ * 看到的"放大后明显的弧形分界"。w(t)=(1-t)³ 在 t→1 时 w→0、w'→0，
+ * 边界处完全无缝（有效 σ ≈ 0.42R，比高斯的 0.5R 更锐利，高值扩散更小）。
+ *
+ * 多项式直接求值（无查表）：热路径上只有 1 除 + 3 乘，与查表同量级且无量化误差
  */
-const GAUSS_SIGMA_RATIO = 0.5
-/** 查表覆盖的 x = d/σ 上界：搜索范围为 1.25R、σ=0.5R → 2.5 */
-const GAUSS_MAX_X = 2.5
-const GAUSS_LUT_SIZE = 512
-const gaussLut = (() => {
-  const lut = new Float32Array(GAUSS_LUT_SIZE + 1)
-  for (let i = 0; i <= GAUSS_LUT_SIZE; i++) {
-    const x = (i / GAUSS_LUT_SIZE) * GAUSS_MAX_X
-    lut[i] = Math.exp(-0.5 * x * x)
-  }
-  return lut
-})()
-/** 由 d 与桶半径直接得到查表下标的系数：idx = d × GAUSS_LUT_INDEX_SCALE / radius */
-const GAUSS_LUT_INDEX_SCALE = GAUSS_LUT_SIZE / (GAUSS_MAX_X * GAUSS_SIGMA_RATIO)
-
-/** 高斯核权重（查表，超界取 0） */
-function gaussWeight(d: number, radius: number): number {
-  if (!(radius > 0)) return 0
-  const idx = (d * GAUSS_LUT_INDEX_SCALE) / radius
-  return idx >= GAUSS_LUT_SIZE ? 0 : gaussLut[idx | 0]
+function kernelWeight(d2: number, supportSq: number): number {
+  if (!(supportSq > 0) || d2 >= supportSq) return 0
+  const rest = 1 - d2 / supportSq
+  return rest * rest * rest
 }
 
 /** 经纬度 → Web Mercator 平面（米） */
@@ -71,7 +73,11 @@ export function unprojectFromMercator(x: number, y: number): { lat: number; lng:
 /** IDW 采样结果（复用同一对象，避免逐像素分配） */
 export interface HeatHit {
   value: number
-  /** 最近贡献桶代表点到像元的距离（米） */
+  /**
+   * 最近贡献桶代表点到像元的距离（米）。
+   * 无任何桶贡献（值来自整体趋势场兜底）时为 **Infinity**，`radius` 为 0——
+   * 该区间不透明度由区域覆盖场（alpha）决定，渲染不依赖 distance
+   */
   distance: number
   /** 最近贡献桶的覆盖半径（米）：备用半径信息 */
   radius?: number
@@ -366,8 +372,12 @@ function buildRegionalValues(b: HeatBuckets): { grid: Float32Array; pw: number; 
 /** 区域/回退场的桶网格外扩格数：模糊半径 + 1，保证边界外钳位值为 0/NaN */
 const PAD_CELLS = 3
 
-/** 由桶网格构建采样场；blend = 细节场占比（0=纯整体趋势场，1=纯站点级细节场） */
-function makeSampler(coarse: HeatBuckets, fine: HeatBuckets, blend: number): HeatField {
+/**
+ * 由桶网格构建采样场。
+ * blend = 细节增强比例（细桶在统一归一化中的权重门）；
+ * gateSpread = 细→粗接管重叠带宽度（由 smooth 决定）
+ */
+function makeSampler(coarse: HeatBuckets, fine: HeatBuckets, blend: number, gateSpread: number): HeatField {
   const { grid, count, ixMin, iyMin, gw, gh, cell, reach } = coarse
   const { grid: regionAlpha, pw, ph } = buildRegionAlpha(coarse)
   const { grid: regionalValues } = buildRegionalValues(coarse)
@@ -393,14 +403,19 @@ function makeSampler(coarse: HeatBuckets, fine: HeatBuckets, blend: number): Hea
       maxY: (coarse.iyMin + gh) * cell,
     },
     sample(x: number, y: number, out: HeatHit) {
-      // 细节场：细粒度网格高斯 IDW（站点尺度栅格采样）
-      let detailValue = NaN
-      let fineSumW = 0
+      // 所有桶在**同一个全局归一化**中加权（不再分层归一化后混合）：
+      // value = Σ(w×v) / Σw，桶来自细网格与粗网格，趋势场以地板权重补单位分解。
+      // 单一单位分解 → 结果处处是同一结构，细/粗尺度沿权重自然过渡，
+      // 不会出现"细节点是一种纹理、全局面是另一种纹理"的圆形接缝（用户实测断层）。
+      //
+      // 细网格原始权重/加权值和（核在支撑边 C¹ 归零）+ 最近细桶距离（gate 用）
+      let fineRawW = 0
+      let fineRawV = 0
+      let minFineD2 = Infinity
+      let minFineR = 0
       {
         const cx = Math.floor(x / fCell) - fIxMin
         const cy = Math.floor(y / fCell) - fIyMin
-        let sumW = 0
-        let sumV = 0
         for (let dy = -fReach; dy <= fReach; dy++) {
           const by = cy + dy
           if (by < 0 || by >= fGh) continue
@@ -414,29 +429,22 @@ function makeSampler(coarse: HeatBuckets, fine: HeatBuckets, blend: number): Hea
             const ddy = f[idx * 4 + 1] - y
             const d2 = ddx * ddx + ddy * ddy
             const bucketRadius = f[idx * 4 + 3]
-            const limit = bucketRadius * FADE_OUT_FACTOR
-            if (d2 > limit * limit) continue
-            const d = Math.sqrt(d2)
-            // 高斯核（查表）：σ 取该桶半径的一半，站点级平滑
-            const w = gaussWeight(d, bucketRadius)
-            sumW += w
-            sumV += w * f[idx * 4 + 2]
+            const w = kernelWeight(d2, bucketRadius * bucketRadius * SUPPORT_SQ)
+            if (w <= 0) continue
+            fineRawW += w
+            fineRawV += w * f[idx * 4 + 2]
+            if (d2 < minFineD2) { minFineD2 = d2; minFineR = bucketRadius }
           }
         }
-        if (sumW > 0) {
-          detailValue = sumV / sumW
-          fineSumW = sumW
-        }
       }
-      // 粗网格高斯 IDW（自适应半径）：中尺度过渡 + 稀疏区补洞的基准场
-      let coarseValue = NaN
+      // 粗网格原始权重/加权值和 + 最近桶信息
+      let coarseRawW = 0
+      let coarseRawV = 0
       let minD2 = Infinity
       let nearestR = 0
       {
         const cx = Math.floor(x / cell) - ixMin
         const cy = Math.floor(y / cell) - iyMin
-        let sumW = 0
-        let sumV = 0
         for (let dy = -reach; dy <= reach; dy++) {
           const by = cy + dy
           if (by < 0 || by >= gh) continue
@@ -450,47 +458,39 @@ function makeSampler(coarse: HeatBuckets, fine: HeatBuckets, blend: number): Hea
             const ddy = grid[idx * 4 + 1] - y
             const d2 = ddx * ddx + ddy * ddy
             const bucketRadius = grid[idx * 4 + 3]
-            const limit = bucketRadius * FADE_OUT_FACTOR
-            if (d2 > limit * limit) continue
-            const d = Math.sqrt(d2)
-            const w = gaussWeight(d, bucketRadius)
-            sumW += w
-            sumV += w * grid[idx * 4 + 2]
+            const w = kernelWeight(d2, bucketRadius * bucketRadius * SUPPORT_SQ)
+            if (w <= 0) continue
+            coarseRawW += w
+            coarseRawV += w * grid[idx * 4 + 2]
             if (d2 < minD2) {
               minD2 = d2
               nearestR = bucketRadius
             }
           }
         }
-        if (sumW > 0) coarseValue = sumV / sumW
       }
       // pad 后粗网格坐标：pad 环使双线性在原网格外的钳位值为 0/NaN
       const gx = x / cell - coarse.ixMin - 0.5 + PAD_CELLS
       const gy = y / cell - coarse.iyMin - 0.5 + PAD_CELLS
       const trend = bilinearSample(regionalValues, pw, ph, gx, gy)
-      // 三层组合（由细到粗逐级兜底）：
-      // 1) 细节场优先：blend 比例 × **细节覆盖度软权重** 混合粗场与细节场。
-      //    覆盖度 = 细核权重质量的 smoothstep（桶中心=1，随远离斑点平滑衰减到 0）
-      //    → 斑点从中心向边缘逐渐淡化、与整体色块完美衔接，消除细节场/粗场
-      //    硬切换处的分界线（高斯查表在 1.25×半径处截断仍残留 ~4% 权重，
-      //    硬切换会在斑点边缘形成可见台阶）
-      // 2) 细节核够不到（密集区外过渡带/稀疏区间隙）→ 粗场承担中尺度过渡
-      // 3) 粗场也无核贡献（桥接缝隙中带）→ 整体趋势场兜底（连续渲染，无覆盖空洞）
-      if (Number.isFinite(detailValue)) {
-        if (Number.isFinite(coarseValue)) {
-          const t = Math.min(1, fineSumW)
-          const coverage = t * t * (3 - 2 * t)
-          out.value = coarseValue + (detailValue - coarseValue) * (blend * coverage)
-        } else {
-          out.value = detailValue
-        }
-      } else if (Number.isFinite(coarseValue)) {
-        out.value = coarseValue
-      } else if (Number.isFinite(trend)) {
-        out.value = trend
-      } else {
-        return false
+      // 细↔粗的单位分解门：以**最近细桶距离**计算覆盖率，接管重叠带宽度由
+      // gateSpread（smooth 控制，1.0~2.5）决定：
+      // - 细桶中心 gate=1：粗/趋势全抑制 → 高值点保真（粗半径再大也不污染）
+      // - 重叠带内粗场权重随 smoothstep 平滑增长 → 宽区间内软接管，
+      //   不会在细核支撑圈处突然"接手"（那是旧版"点与全局断层/单点太独立"根因）
+      // - gateSpread×支撑之外 gate=0：粗场独占
+      let gate = 0
+      if (Number.isFinite(minFineD2)) {
+        const u = Math.sqrt(minFineD2) / (minFineR * FADE_OUT_FACTOR * gateSpread)
+        if (u < 1) { const f = 1 - u; gate = f * f * (3 - 2 * f) }
       }
+      gate *= blend
+      const oneMinusGate = 1 - gate
+      const trendW = Number.isFinite(trend) ? TREND_FLOOR_W * oneMinusGate : 0
+      const totalW = fineRawW * blend + coarseRawW * oneMinusGate + trendW
+      if (!(totalW > 0)) return false
+      // trend 为 NaN 时 trendW=0，但 JS 中 NaN×0=NaN 会污染总和，故显式判空
+      out.value = (fineRawV * blend + coarseRawV * oneMinusGate + (trendW ? trend * trendW : 0)) / totalW
       out.distance = Math.sqrt(minD2)
       out.radius = nearestR
       out.alpha = bilinearSample(regionAlpha, pw, ph, gx, gy)
@@ -504,27 +504,33 @@ function makeSampler(coarse: HeatBuckets, fine: HeatBuckets, blend: number): Hea
  *
  * 双尺度结构（整体与细节按比例融合）：
  * - **整体趋势场**：粗网格（cell=0.75×全局半径）占位值的邻域平均，承担区域分布；
- * - **细节场**：细粒度网格（cell 由**点间距**决定，与平滑半径无关）上的高斯 IDW，
- *   保留被平滑强度抹平的站点级差异（参考 MapInfo 网格渲染的站点斑点纹理）。
+ * - **细节场**：细粒度网格（cell 由**点间距 × 栅格采样粒度**决定）上的核加权 IDW，
+ *   核半径由**点间距 × 平滑强度**决定，保留站点级差异
+ *   （参考 MapInfo 网格渲染的站点斑点纹理）。
  * @param radius 全局覆盖半径（米），粗网格与整体趋势的基准
  * @param pointRadii 逐点覆盖半径（米，与 points 对齐）：稀疏区粗网格桶半径放大补洞；
  *                   不传时所有桶使用全局半径
- * @param detail 细节增强 0~100：趋势场 ↔ 细节场的凸组合比例
- *               （0=纯趋势场，100=纯细节场；缺省 100 保持纯插值行为）
- * @param sampling 栅格采样粒度 1~30（缺省 4）：细节网格边长相对**点间距**的倍数——
- *               1=站点级最细，越大细节斑点越大越融合；粗于趋势网格时自动封顶
+ * @param detail 细节增强 0~100（缺省 100）：细桶在统一归一化中的**权重门比例**——
+ *               0=细桶不参与（纯粗/趋势平滑），100=细核覆盖区内细桶独占
+ * @param sampling 栅格采样粒度 1~30（缺省 1）：细节网格边长相对**点间距**的倍数。
+ *               网格细于细节核时只影响离散精度；粗于细节核时由核下限自动加宽
+ *               （更融合），故越大越糊
+ * @param smooth 平滑强度 1~10（缺省 2）：**不进入细核**（细核固定站点窄核以保峰+定位）；
+ *               它控制细→粗接管的重叠带宽（smooth 大=过渡带宽、峰值到背景更柔和；
+ *               小=定位锐利）。smooth 同时经调用方传入的全局 radius 决定粗场宽度
  */
 export function buildHeatField(
   points: HeatPoint[],
   radius: number,
   pointRadii?: Float64Array,
   detail?: number,
-  sampling?: number
+  sampling?: number,
+  smooth?: number
 ): HeatField | null {
   const coarse = buildBuckets(points, radius, pointRadii)
   if (!coarse) return null
   const d = Math.min(100, Math.max(0, Number.isFinite(detail) ? detail! : 100))
-  const samp = Math.min(30, Math.max(1, Number.isFinite(sampling) ? sampling! : 4))
+  const samp = Math.min(30, Math.max(1, Number.isFinite(sampling) ? sampling! : 1))
   // 细节网格粒度 = 站点间距 ×0.75×采样倍数，但不粗于趋势网格、
   // 不细于范围/512（内存上限，MAX_BUCKETS_SIDE 兜底）
   const nn = nearestNeighborDistances(points)
@@ -556,17 +562,41 @@ export function buildHeatField(
   }
   // 非零间距缺失（全重合/单点极端）→ 按密度半径兜底，避免细网格退化到毫米级
   const spacing = spacingP50 > 0 ? spacingP50 : Math.max(spacingP90, Math.sqrt(Math.max(span * span, 1) / Math.max(1, points.length)))
-  const fineCell = Math.min(
-    coarse.cell,
-    Math.max(0.75 * spacing * samp, span / 512, 1e-3)
-  )
-  // 细节核扩散半径 = 2×细网格边长（站点斑点充分外扩、与邻域/整体色块软融合；
-  // 核作用范围 1.25×半径 = 2.5×cell ≫ 代表点最大间距 √2×cell），
-  // P90 站间距项兜底极稀疏场景；上限 = 全局半径——细网格被 coarse.cell 封顶
-  // 后退化为与粗网格同粒度时，细节场绝不能比粗场更平滑（否则"细节增强"方向反转）
-  const fineRadius = Math.min(Math.max(2 * fineCell, 0.9 * spacingP90), radius)
+  // 细节网格边长上限 = 1.5×点间距：网格粗于数据本身只会**在桶聚合阶段就把站点差异平均掉**
+  // （代表点值=桶内均值），再宽的核也补不回来。实测旧式无此上限时「平滑强度 10×」
+  // 会经 coarse.cell 把网格顶到 7.5×点间距 → 高值点先被桶平均成邻域均值（峰值 100→11.7），
+  // 整幅图糊成一片（用户实测）。加上限后 smooth 只影响核宽、不再破坏网格分辨率
+  // sampling 全范围控制细网格粒度（1=站点级、30=大区域），不再被 coarse.cell /
+  // 1.5×spacing 夹取——旧夹取在 radius≈点距时把 fineCell 锁死，「栅格采样」滑杆无效。
+  // 网格粗=桶代表点做大面积均值（用户主动要的大尺度），细核半径下限随网格加宽，
+  // 防硬边圆盘；span/512 仍是内存下限
+  const fineCell = Math.max(FINE_CELL_RATIO * spacing * samp, span / 512, 1e-3)
+  // 细节核半径 = **点间距 × 平滑强度**（"平滑强度（N× 点间距）"文案的实际落点）。
+  // 与 sampling 解耦：采样网格只决定离散精度，不再暗中决定平滑量
+  // （旧式 fineRadius=2×fineCell 使「平滑强度」在 detail≈100 时完全失效，
+  //   实际平滑量由「栅格采样」决定，默认档核作用范围达 7.5×点间距，
+  //   高值点自身权重仅 ~11% → 高值扩散成大片、采样点层次被抹平）。
+  // 下限 = min(1.25×格边长, 1.5×点间距)：前者的作用是"核作用范围 1.56×格边长 >
+  // 代表点最大间距 √2×格边长"，保证相邻代表点互相混值（否则退化成硬边圆盘）；
+  // 但**必须再被点间距夹住**——否则「栅格采样」滑杆会把核悄悄撑爆：用户实测
+  // sampling=24 → 格边长 18×点间距 → 下限顶到 9.4×点间距（作用范围 11.75×），
+  // 表现为"高值点扩散成一大片"。网格粗于数据本身时，缺的细节由粗场/趋势场兜底，
+  // 不该靠无限加宽核来补。
+  // 上限 = 3×点间距（= SMOOTH_MAX，滑杆最大档），滑杆任何组合都撑不爆核；
+  // 再与调用方全局半径取 min（"点距远超覆盖半径时留白"契约）
+  // 细核**固定为站点级窄核** = 1.25×细网格边长（保证核支撑 1.56×cell > √2×cell，
+  // 相邻代表点互相混值、不出现硬圆盘）。
+  // **关键：细核不再随 smooth 加宽**——旧耦合让细网格里的低值站点也用宽核，
+  // 它们在高值站点处贡献、把峰值稀释（smooth=4 实测站点 100→41、红色消失）。
+  // 细核职责=保峰+红色定位在站点；smooth 的宽平滑只作用于粗场（radius 已含 smooth），
+  // 两者由 makeSampler 的加宽 gate 软混合 → 背景平滑、峰值定位，且无接缝。
+  const fineRadius = 1.25 * fineCell
   const fine = buildBuckets(points, fineRadius, undefined, fineCell)
-  return makeSampler(coarse, fine ?? coarse, d / 100)
+  // smooth 不进入细核（否则稀释峰值）；它控制细→粗接管的**重叠带宽度**：
+  // smooth 大=过渡带宽、峰值到背景更柔和；小=定位锐利。范围 1~10 → spread 1.0~2.5
+  const sm = Number.isFinite(smooth) ? Math.min(10, Math.max(1, smooth as number)) : 2
+  const gateSpread = 1.0 + ((sm - 1) / 9) * 1.5
+  return makeSampler(coarse, fine ?? coarse, d / 100, gateSpread)
 }
 
 /**

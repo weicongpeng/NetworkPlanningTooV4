@@ -166,6 +166,54 @@ export function quantizeLevel(t: number, n: number): number {
   return q <= 0 ? 0 : q >= 1 ? 1 : q
 }
 
+/** 集中度 gamma 的允许范围（防极端值使颜色塌成单点/单色） */
+export const CONCENTRATION_MIN = 0.125
+export const CONCENTRATION_MAX = 8
+/**
+ * 高端分段的下支点：该位置及以下的配色**完全不动**，
+ * 只有 (PIVOT,1] 的高端颜色参与集中度调整（不对所有配色同步平移）
+ */
+const CONCENTRATION_PIVOT = 0.5
+
+/**
+ * 高值集中度：**仅对高端分段**做幂曲线，把最高级颜色留给真正 100% 的点位突出渲染。
+ *
+ * - t ≤ PIVOT：t' = t（中低配色与面积完全不变）；
+ * - t > PIVOT：u=(t−PIVOT)/(1−PIVOT)，t' = PIVOT+(1−PIVOT)·u^gamma。
+ *   gamma>1：把接近但未到顶的值向下压，顶端色（100%）只保留给真正近峰值的点
+ *   → 真峰与周围拉开、突出；t=1 恒为 1（顶点不丢）。
+ *   gamma<1：高端色略微放宽；gamma=1：不变。
+ * 严格单调、[0,1]→[0,1]，只重新分配高端颜色面积、不改变空间插值。
+ */
+export function concentrateLevel(t: number, gamma: number): number {
+  if (!(t > 0)) return 0
+  if (t >= 1) return 1
+  if (t <= CONCENTRATION_PIVOT) return t
+  let g = Number.isFinite(gamma) ? gamma : 1
+  g = g < CONCENTRATION_MIN ? CONCENTRATION_MIN : g > CONCENTRATION_MAX ? CONCENTRATION_MAX : g
+  if (g === 1) return t
+  const u = (t - CONCENTRATION_PIVOT) / (1 - CONCENTRATION_PIVOT)
+  return CONCENTRATION_PIVOT + (1 - CONCENTRATION_PIVOT) * Math.pow(u, g)
+}
+
+/**
+ * 软分级：在硬分级值与原始连续值之间按 softness 混合。
+ *
+ * t_out = q + (t−q)×softness，q = quantizeLevel(t,n)：
+ * - softness=0：硬分级（等值区域，边界=等值线，MapInfo 式）
+ * - softness=1：完全连续（等同不分级）
+ * - 中间：色块内部（远离级别边界时 t−q≈0）仍为纯色，仅边界窄带内软过渡
+ *   → 既保留分级的清晰区域与"红区面积由断点控制"，边界又不生硬。
+ * n<2 时原样返回。
+ */
+export function softQuantizeLevel(t: number, n: number, softness: number): number {
+  if (!(n >= 2)) return t
+  const s = softness <= 0 ? 0 : softness >= 1 ? 1 : softness
+  const q = quantizeLevel(t, n)
+  const out = q + (t - q) * s
+  return out <= 0 ? 0 : out >= 1 ? 1 : out
+}
+
 /** 值热力面渲染参数 */
 export interface HeatSurfaceParams {
   points: HeatPoint[]
@@ -242,6 +290,49 @@ export function collectGeoDataPolygons(rows: unknown): HeatBoundary | null {
 }
 
 /**
+ * 点（lng/lat 度）是否在边界集合内：对所有外环/洞环做射线穿越奇偶判定，
+ * 与掩膜 canvas 的 fill('evenodd') 语义一致（天然支持多面与孔洞）。
+ * 纯几何函数，不依赖 canvas（jsdom 无 canvas 时仍可判定/测试）。
+ */
+export function pointInHeatBoundary(lng: number, lat: number, boundary: HeatBoundary): boolean {
+  let inside = false
+  for (const polygon of boundary) {
+    for (const ring of polygon) {
+      for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+        const xi = ring[i][0], yi = ring[i][1]
+        const xj = ring[j][0], yj = ring[j][1]
+        if ((yi > lat) !== (yj > lat) && lng < ((xj - xi) * (lat - yi)) / (yj - yi) + xi) {
+          inside = !inside
+        }
+      }
+    }
+  }
+  return inside
+}
+
+/**
+ * 过滤出落在裁剪边界内的采样点及其逐点半径（索引对齐）。
+ *
+ * **这是裁剪变暗修复的关键**：插值场必须只由边界内的点构建——
+ * 边界外点的核值/覆盖度会越过边界污染内像素（外部值偏低=暗，污染带宽=核半径，
+ * 几何掩膜只切外形、切不掉这种颜色污染）。
+ */
+export function filterPointsToBoundary(
+  points: HeatPoint[],
+  pointRadii: Float64Array | undefined,
+  boundary: HeatBoundary
+): { points: HeatPoint[]; pointRadii: Float64Array | undefined } {
+  const keep: number[] = []
+  for (let i = 0; i < points.length; i++) {
+    if (pointInHeatBoundary(points[i].lng, points[i].lat, boundary)) keep.push(i)
+  }
+  return {
+    points: keep.map(i => points[i]),
+    pointRadii: pointRadii ? Float64Array.from(keep, i => pointRadii[i]) : undefined,
+  }
+}
+
+/**
  * 将边界多边形栅格化为覆盖掩膜（255=范围内，0=范围外，边缘抗锯齿保留中间值）。
  * 用 canvas 奇偶填充一次成型，天然支持多个面与孔洞
  */
@@ -289,19 +380,6 @@ export function buildBoundaryMask(
   return mask
 }
 
-/** 按掩膜裁掉范围外的颜色（保留边缘抗锯齿→透明） */
-function clipToMask(canvas: HTMLCanvasElement, mask: Uint8Array): void {
-  const ctx = canvas.getContext('2d')
-  if (!ctx) return
-  const image = ctx.getImageData(0, 0, canvas.width, canvas.height)
-  const data = image.data
-  for (let i = 0; i < mask.length; i++) {
-    const offset = i * 4 + 3
-    data[offset] = (data[offset] * mask[i]) / 255
-  }
-  ctx.putImageData(image, 0, 0)
-}
-
 /** 按字段值插值渲染热力面，返回可直接叠加到地图的 canvas */
 export function renderHeatSurface(params: HeatSurfaceParams): HTMLCanvasElement | null {
   const field = params.field ?? buildHeatField(params.points, params.radius, params.pointRadii)
@@ -317,10 +395,10 @@ export function renderHeatSurface(params: HeatSurfaceParams): HTMLCanvasElement 
   const mask = params.boundary?.length
     ? buildBoundaryMask(params.boundary, params.bounds, params.width, params.height)
     : null
+  // mask 已在 sampleGrid 烘焙进 alpha（边界内不透明、仅 1px AA 软边），
+  // 无需事后再乘掩膜（二次相乘会把抗锯齿边缘压暗）
   paintSurface(image.data, params, field, mask)
   ctx.putImageData(image, 0, 0)
-  // 边界裁剪直接在原图上做（无模糊步骤，不存在颜色外溢）
-  if (mask) clipToMask(canvas, mask)
   return canvas
 }
 
@@ -352,7 +430,16 @@ function sampleGrid(values: Float32Array, alphas: Uint8Array, params: HeatSurfac
       const x = x0 + (x1 - x0) * ((px + 0.5) / width)
       if (!field.sample(x, y, hit)) continue
       values[i] = hit.value
-      // 采样场已按"所有贡献桶最大覆盖度"算出 alpha（自适应半径，消除簇边缘暗环）；
+      if (mask) {
+        // **有裁剪边界：覆盖度直接由掩膜定义**——边界内 = 255（完全不透明），
+        // 仅掩膜自身 1px 抗锯齿条带保留半透明。
+        // 不能再用 hit.alpha：边界外桶被过滤后，区域覆盖场的模糊会把边界内 ~2 格
+        // alpha 拉低（一条数格宽的半透明带，底图透上来显暗，即用户实测问题）。
+        // sample 失败（真正无数据的内部空洞）时上面已 continue，alpha 仍为 0
+        alphas[i] = mask[i]
+        continue
+      }
+      // 无边界：alpha 由场的覆盖度给出（自适应半径，消除簇边缘暗环）；
       // 外部自定义 field 不带 alpha 时，按最近桶半径（缺省回退全局 radius）补算
       let alpha = hit.alpha
       if (alpha === undefined) {

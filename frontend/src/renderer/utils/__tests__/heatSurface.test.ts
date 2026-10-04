@@ -3,7 +3,7 @@
  */
 import { describe, it, expect } from 'vitest'
 import { buildHeatField, projectToMercator, unprojectFromMercator, nearestNeighborDistance, nearestNeighborDistances, type HeatHit } from '../heatField'
-import { applyContrast, buildValueMapper, collectBoundaryPolygons, collectGeoDataPolygons, probeFieldDistribution, quantizeLevel } from '../heatSurface'
+import { applyContrast, buildValueMapper, collectBoundaryPolygons, collectGeoDataPolygons, concentrateLevel, CONCENTRATION_MIN, CONCENTRATION_MAX, filterPointsToBoundary, pointInHeatBoundary, probeFieldDistribution, quantizeLevel, softQuantizeLevel } from '../heatSurface'
 import { buildHeatLegend, buildQuantileRef, quantileRefValue } from '../heatmap'
 import type { HeatPoint } from '../heatmap'
 
@@ -123,11 +123,14 @@ describe('buildHeatField（IDW 值插值）', () => {
     expect(gap).toBeLessThan(30)
   })
 
-  it('采样点间距远超覆盖半径时保留空白（三层场均够不到，sample=false，不把整图糊成一片）', () => {
+  it('点距远超覆盖半径：中点虽被插值场桥接，但区域覆盖 alpha=0 → 渲染留白（不糊成一片）', () => {
     const base = projectToMercator(30, 120)
-    // 点距 4km、R=500（桶边 375m）：中点距任一点 5+ 桶，超出趋势场 ±4 桶支撑
+    // 细核尺度锚在点间距上（4.3km）→ 中点有插值值；但粗网格（cell=375m）闭运算
+    // 桥接宽度仅 750m，4km 间隙区域 alpha=0 → sampleGrid 跳过，视觉仍留白
     const field = buildHeatField([pointAt(0, 0, 10), pointAt(4000, 0, 30)], 500)!
-    expect(valueAt(field, base.x + 2000, base.y)).toBeNull()
+    const hit: HeatHit = { value: 0, distance: 0 }
+    expect(field.sample(base.x + 2000, base.y, hit)).toBe(true)
+    expect(hit.alpha).toBe(0)
   })
 
   it('着色只取决于值，不取决于密度（稀疏区不被密集区顶到色带末端）', () => {
@@ -159,17 +162,24 @@ describe('buildHeatField（IDW 值插值）', () => {
     expect(valueAt(a, ...xy(400, 200))).toEqual(valueAt(b, ...xy(400, 200)))
   })
 
-  it('高斯核：采样点处无尖峰，自身值被邻域平滑稀释', () => {
-    // 三点等距 1km、中间为高值：距离倒数核在中间点近乎只取自身值（表现为可见尖峰/圆盘），
-    // 高斯核（σ=半径/2）会被邻域显著稀释——这正是"每个采样点颜色边界太明显"的修复点
+  it('紧支撑 C¹ 核：采样点处无尖峰（导数连续），且以自身值为主', () => {
+    // 三点等距 1km、中间为高值：距离倒数核在中间点近乎只取自身值（可见尖峰/圆盘边界），
+    // 紧支撑核在 d=0 处导数为 0 → 无尖峰；核宽收紧到 ≈1×点距 → 自身值主导
+    // （旧宽核 σ=半径/2 时中间点被邻域稀释到 ~79，"高值扩散过大"的根因）
     const points = [pointAt(-1000, 0, 0), pointAt(0, 0, 100), pointAt(1000, 0, 0)]
     const field = buildHeatField(points, 1000)!
     const mid = valueAt(field, ...xy(0, 0))!
-    expect(mid).toBeGreaterThan(50)
-    expect(mid).toBeLessThan(95)
+    expect(mid).toBeGreaterThan(90)
+    expect(mid).toBeLessThanOrEqual(100)
+    // 无尖峰：跨越采样点左右两侧对称、连续，且都低于自身值
+    const left = valueAt(field, ...xy(-50, 0))!
+    const right = valueAt(field, ...xy(50, 0))!
+    expect(left).toBeLessThan(mid)
+    expect(right).toBeLessThan(mid)
+    expect(Math.abs(left - right)).toBeLessThan(1)
   })
 
-  it('高斯核：沿两点连线单调过渡，中部为实质渐变', () => {
+  it('紧支撑 C¹ 核：沿两点连线单调过渡，中部为实质渐变', () => {
     const field = buildHeatField([pointAt(0, 0, 0), pointAt(2000, 0, 100)], 1000)!
     const base = projectToMercator(30, 120)
     const vals: number[] = []
@@ -184,9 +194,11 @@ describe('buildHeatField（IDW 值插值）', () => {
 })
 
 describe('buildHeatField 自适应半径（逐点 pointRadii 填补稀疏空洞）', () => {
-  it('全局小半径：相距 6km 的两点间隙留白（三层场均够不到）', () => {
+  it('全局小半径：相距 6km 的两点间隙 alpha=0（渲染留白）', () => {
     const field = buildHeatField([pointAt(0, 0, 10), pointAt(6000, 0, 20)], 500)!
-    expect(valueAt(field, ...xy(3000, 0))).toBeNull()
+    const hit: HeatHit = { value: 0, distance: 0 }
+    field.sample(...xy(3000, 0), hit)
+    expect(hit.alpha).toBe(0)
   })
 
   it('逐点大半径：稀疏间隙被覆盖，hit.radius 返回最近桶半径', () => {
@@ -208,8 +220,12 @@ describe('buildHeatField 自适应半径（逐点 pointRadii 填补稀疏空洞�
     const dense = [pointAt(0, 0, 10), pointAt(100, 0, 12), pointAt(6000, 0, 20)]
     const radii = new Float64Array([300, 300, 4000])
     const field = buildHeatField(dense, 500, radii)!
-    expect(valueAt(field, ...xy(0, 0))).toBeCloseTo(11, 0)
-    // 离群点与密集区间隙（4km）被大半径覆盖
+    // 原点处不含 6km 外离群点 20（细核窄、离群点够不到 → 不被带大）；
+    // 新架构细核为站点级窄核，退化3点下原点只取到自身≈10
+    const v = valueAt(field, ...xy(0, 0))!
+    expect(v).toBeGreaterThanOrEqual(10)
+    expect(v).toBeLessThan(12.5)
+    // 离群点与密集区间隙（4km）由粗场大半径补洞覆盖
     expect(valueAt(field, ...xy(4000, 0))).not.toBeNull()
   })
 
@@ -504,7 +520,9 @@ describe('渲染场分布标定（probeFieldDistribution）', () => {
     const values = Array.from(probeFieldDistribution(field))
     expect(values.length).toBeGreaterThan(0)
     expect(Math.min(...values)).toBeGreaterThanOrEqual(5)
-    expect(Math.max(...values)).toBeLessThanOrEqual(90)
+    // 归一化加权平均存在 ~1e-14 量级的浮点溢出（所有贡献桶同值时并非精确等于该值），
+    // 不构成"超数据界"（映射层另有 [0,1] 钳制），此处按浮点误差放行
+    expect(Math.max(...values)).toBeLessThanOrEqual(90 + 1e-9)
   })
 
   it('探测点数超过上限时等距抽样（分布估计精度上界，不影响渲染）', () => {
@@ -596,6 +614,110 @@ describe('分级着色（quantizeLevel）', () => {
     expect(quantizeLevel(0.3, 1)).toBe(0.3)
   })
 })
+
+describe('裁剪边界点判定（pointInHeatBoundary）', () => {
+  // 外环：lng 0~10、lat 0~10
+  const outer = [[2, 2], [8, 2], [8, 8], [2, 8], [2, 2]]
+  const boundary: number[][][][] = [[outer]]
+
+  it('外环内=真、外=假', () => {
+    expect(pointInHeatBoundary(5, 5, boundary as any)).toBe(true)
+    expect(pointInHeatBoundary(1, 5, boundary as any)).toBe(false)
+    expect(pointInHeatBoundary(5, 9, boundary as any)).toBe(false)
+  })
+  it('洞环（evenodd）：洞内=假', () => {
+    const hole = [[4, 4], [6, 4], [6, 6], [4, 6], [4, 4]]
+    const withHole = [[outer, hole]] as any
+    expect(pointInHeatBoundary(5, 5, withHole)).toBe(false) // 洞内
+    expect(pointInHeatBoundary(3, 5, withHole)).toBe(true)  // 环与洞之间
+  })
+  it('两个不重叠多边形：各自内部都为真', () => {
+    const secondRing = [[20, 20], [22, 20], [22, 22], [20, 22], [20, 20]]
+    const b: number[][][][] = [[outer], [secondRing]]
+    expect(pointInHeatBoundary(5, 5, b)).toBe(true)
+    expect(pointInHeatBoundary(21, 21, b)).toBe(true)
+    expect(pointInHeatBoundary(15, 15, b)).toBe(false)
+  })
+})
+
+describe('按边界过滤采样点（filterPointsToBoundary）', () => {
+  const boundary = [[[[2, 2], [8, 2], [8, 8], [2, 8], [2, 2]]]] as any
+  it('只保留边界内点、逐点半径索引对齐', () => {
+    const points: HeatPoint[] = [
+      { lat: 5, lng: 5, weight: 100 },
+      { lat: 5, lng: 1, weight: 20 },
+      { lat: 5, lng: 7, weight: 30 },
+    ]
+    const radii = new Float64Array([111, 222, 333])
+    const out = filterPointsToBoundary(points, radii, boundary)
+    expect(out.points).toHaveLength(2)
+    expect(out.points[0].weight).toBe(100)
+    expect(out.points[1].weight).toBe(30)
+    expect(Array.from(out.pointRadii!)).toEqual([111, 333])
+  })
+  it('无 pointRadii 时返回 undefined；全部在界外时为空集', () => {
+    const out = filterPointsToBoundary([{ lat: 1, lng: 1, weight: 1 }], undefined, boundary)
+    expect(out.pointRadii).toBeUndefined()
+    const none = filterPointsToBoundary(
+      [{ lat: 50, lng: 50, weight: 1 }, { lat: -50, lng: -50, weight: 2 }],
+      new Float64Array([1, 2]), boundary
+    )
+    expect(none.points).toHaveLength(0)
+    expect(none.pointRadii).toHaveLength(0)
+  })
+})
+
+describe('高值集中度（concentrateLevel，仅高端分段）', () => {
+  it('支点(0.5)及以下任何 gamma 都完全不变（中低配色不同步调整）', () => {
+    for (const g of [CONCENTRATION_MIN, 0.25, 1, 4, CONCENTRATION_MAX]) {
+      expect(concentrateLevel(0.2, g)).toBe(0.2)
+      expect(concentrateLevel(0.5, g)).toBe(0.5)
+      expect(concentrateLevel(0, g)).toBe(0)
+    }
+  })
+  it('gamma=1 高端不变；>1 把近峰但未到顶的值下压（t 变小）', () => {
+    expect(concentrateLevel(0.8, 1)).toBe(0.8)
+    expect(concentrateLevel(0.8, 4)).toBeLessThan(0.8)
+    expect(concentrateLevel(0.8, 4)).toBeGreaterThan(0.5)
+  })
+  it('顶点 t=1 恒为 1（真峰不丢、被突出），严格单调于 gamma', () => {
+    expect(concentrateLevel(1, 4)).toBe(1)
+    expect(concentrateLevel(0.9, 8)).toBeLessThan(concentrateLevel(0.9, 4))
+  })
+  it('核心契约：真峰(t=1) 与近峰点拉开 → 100% 点位突出', () => {
+    // gamma 大时：真峰仍为 1，近峰(0.9)被明显压低，二者色差扩大
+    const peak = concentrateLevel(1, 8)
+    const near = concentrateLevel(0.9, 8)
+    expect(peak).toBe(1)
+    expect(1 - near).toBeGreaterThan(1 - 0.9) // 比 gamma=1 时差距更大
+  })
+  it('gamma<1 高端色放宽；越界/NaN 钳制（范围上下限、NaN→原值）', () => {
+    expect(concentrateLevel(0.6, 0.25)).toBeGreaterThan(0.6)
+    expect(concentrateLevel(0.8, 999)).toBe(concentrateLevel(0.8, CONCENTRATION_MAX))
+    expect(concentrateLevel(0.8, NaN)).toBe(0.8)
+  })
+})
+
+describe('软分级（softQuantizeLevel）', () => {
+  it('softness=0 等同硬量化、=1 等同原始连续值', () => {
+    expect(softQuantizeLevel(0.3, 5, 0)).toBe(0.25)
+    expect(softQuantizeLevel(0.3, 5, 1)).toBe(0.3)
+  })
+  it('色块内部（t 恰在级点上）任何柔化都是纯色（仅边界窄带被软化）', () => {
+    expect(softQuantizeLevel(0.5, 5, 0.5)).toBe(0.5)
+    expect(softQuantizeLevel(0, 5, 0.5)).toBe(0)
+  })
+  it('中间柔化：落在硬值与原值之间，单调且不越界', () => {
+    const v = softQuantizeLevel(0.3, 5, 0.4)
+    expect(v).toBeGreaterThan(0.25)
+    expect(v).toBeLessThan(0.3)
+    expect(softQuantizeLevel(1.2, 5, 0.5)).toBe(1)
+    expect(softQuantizeLevel(-0.2, 5, 0.5)).toBe(0)
+  })
+  it('级数不足 2 时原样返回', () => {
+    expect(softQuantizeLevel(0.3, 1, 0.5)).toBe(0.3)
+  })
+})
 describe('细节增强（整体趋势场 ↔ 细粒度细节场 凸组合）', () => {
   /**
    * 中间高值点被低值邻域包围，且**点距（300m）远小于覆盖半径（3000m）**：
@@ -623,29 +745,32 @@ describe('细节增强（整体趋势场 ↔ 细粒度细节场 凸组合）', (
     expect(v).toBeLessThan(atCenter(100))
   })
 
-  it('detail 比例单调：越大局部细节越强（凸组合端点间线性过渡）', () => {
+  it('detail 比例单调：越大局部细节越强', () => {
     const v0 = atCenter(0)
     const v50 = atCenter(50)
     const v100 = atCenter(100)
     expect(v50).toBeGreaterThan(v0)
     expect(v100).toBeGreaterThan(v50)
-    // 凸组合：50% 恰为两端均值
-    expect(v50).toBeCloseTo((v0 + v100) / 2, 6)
+    // 统一归一化里细核对粗/趋势权重的抑制门（smoothstep×blend）对 blend 非线性
+    // （趋势地板项偏低，半档向下偏），只要求半档落在两端跨度的中间区间、方向正确
+    const spanV = v100 - v0
+    expect(v50).toBeGreaterThan(v0 + spanV * 0.25)
+    expect(v50).toBeLessThan(v0 + spanV * 0.75)
   })
 
-  it('同站重合小区（nn=0 占 ≥90%）下栅格采样仍然有效（间距基准取非零最近邻）', () => {
+  it('同站重合小区（nn=0 占 ≥90%）下间距基准不退化：站点各自成桶、不被并桶平均', () => {
     // 2 站 × 10 个重合小区：18/20 的点 nn=0 → 旧实现 p50=p90=0 → spacing=0
-    // → 细网格恒为 span/512，「栅格采样」滑杆无任何变化（用户实测回归）
+    // → 细网格退化到 span/512，「栅格采样」滑杆无任何变化（用户实测回归）
     const pts: HeatPoint[] = []
     for (let k = 0; k < 10; k++) pts.push(pointAt(0, 0, 10))
     for (let k = 0; k < 10; k++) pts.push(pointAt(3000, 0, 80))
-    // 细采样（1）：细节网格 0.75×站距=2250m < 粗网格（R=8000 → cell 6000），
-    // 站点簇各自成桶 → 站点处接近自身值
+    // samp=1：两站各自成桶、站点接近自身值
     const vFine = valueAt(buildHeatField(pts, 8000, undefined, 100, 1)!, ...xy(0, 0))!
-    // 粗采样（12）：细网格被 coarse.cell 封顶 = 粗网格粒度 → 与邻站充分平均
+    expect(vFine).toBeLessThan(35)
+    // samp=12：细网格粗到站距级别、两站并入同一桶做大面积均值 → 被邻站拉高（融合）。
+    // 这正是「栅格采样」滑杆的有效区间（1=站点级、大=区域级）
     const vCoarse = valueAt(buildHeatField(pts, 8000, undefined, 100, 12)!, ...xy(0, 0))!
-    expect(vFine).toBeLessThan(35)     // 接近自身值 10（宽核仍会拉高）
-    expect(vCoarse).toBeGreaterThan(35) // 明显被邻站 80 平均
+    expect(vCoarse).toBeGreaterThan(35)
   })
 
   it('细节斑点从中心向边缘平滑淡出、与整体色块无缝衔接（覆盖度软权重，无分界线）', () => {
@@ -684,15 +809,11 @@ describe('细节增强（整体趋势场 ↔ 细粒度细节场 凸组合）', (
       const f = buildHeatField(pts, 3000, undefined, 100, 20)!
       return valueAt(f, ...xy(0, 0))!
     })()
-    // 粗采样下中间高值点被更宽的细节核平均 → 更接近邻域低值（细节更"融"）
+    // 粗采样下中间高值点被大面积桶平均 → 更接近邻域低值（细节更"融"）
     expect(vCoarse).toBeLessThan(v1)
-    // 缺省 sampling=4 介于两者之间
-    const vDef = (() => {
-      const f = buildHeatField(pts, 3000, undefined, 100)!
-      return valueAt(f, ...xy(0, 0))!
-    })()
-    expect(vDef).toBeLessThanOrEqual(v1)
-    expect(vDef).toBeGreaterThanOrEqual(vCoarse)
+    // 缺省 sampling=1 与显式 1 一致
+    const vDef = valueAt(buildHeatField(pts, 3000, undefined, 100)!, ...xy(0, 0))!
+    expect(vDef).toBeCloseTo(v1, 6)
     // sampling 越界钳到 [1,30]
     expect(valueAt(buildHeatField(pts, 3000, undefined, 100, 0)!, ...xy(0, 0))!).toBeCloseTo(v1, 6)
   })
@@ -734,5 +855,90 @@ describe('跨桶融合契约（全景渲染半径契约）', () => {
     expect(hit.alpha!).toBeGreaterThan(0.5)
     expect(field.sample(base.x + 2100 * 4, base.y + 2100 * 4, hit)).toBe(true)
     expect(hit.alpha).toBe(1)
+  })
+})
+
+describe('细节核锐化（高值不扩散 + 支撑边界无弧形阶跃）', () => {
+  /**
+   * 旧实现用截断高斯 exp(-d²/(2σ²))：在 d=1.25×核半径 处权重仍有 4.4%，
+   * 越过即跳 0。归一化加权平均下该跳变在每个桶周围形成**圆形阶跃**——
+   * 三点（-300/0/+300，中间 100）下实测场值在圆周上从 7.9 直接跳到 0，
+   * 经"等效细胞计数"分位拉伸后就是用户看到的"放大后明显的弧形分界"。
+   */
+  it('支撑边界处值连续：细步扫描无跳变（无弧形分界）', () => {
+    const points = [pointAt(-300, 0, 0), pointAt(0, 0, 100), pointAt(300, 0, 0)]
+    const field = buildHeatField(points, 3000)!
+    const base = projectToMercator(30, 120)
+    let prev = NaN
+    let maxStep = 0
+    let span = 0
+    let peak = 0
+    for (let d = 0; d <= 900; d += 2) {
+      const v = valueAt(field, base.x + d, base.y)
+      if (v === null) continue
+      if (Number.isFinite(prev)) maxStep = Math.max(maxStep, Math.abs(v - prev))
+      prev = v
+      peak = Math.max(peak, v)
+      span = Math.max(span, Math.abs(v - 100))
+    }
+    expect(peak).toBeGreaterThan(40)
+    // 2m 步进下的最大跳变必须远小于场域跨度：新核实测 0.36（阈值 1.9，跨度 95），
+    // 旧截断高斯实测 2.89（同一路径，占跨度 3.2%）→ 该断言能真正区分新旧核
+    expect(maxStep).toBeLessThan(span * 0.02)
+  })
+
+  /**
+   * 旧默认档（smooth=9/sampling=4）细节核作用范围达 **7.5×点间距**：
+   * 网格中心的高值点自身权重仅 ~11%，100 被平均成 11.4 → 再用纯分位映射把这点
+   * 微小差异拉满整条色带，高值色带覆盖"高值点聚集区"一大片，采样点层次全丢。
+   * 新规则（核半径 = 点间距 × 平滑强度）下自身权重 ≈40%，高值点成紧凑色斑。
+   */
+  it('采样点保真：高值点以自身值为主（不被邻域平均成一片）', () => {
+    const points: HeatPoint[] = []
+    for (let i = -10; i <= 10; i++) {
+      for (let j = -10; j <= 10; j++) {
+        if (i === 0 && j === 0) continue
+        points.push(pointAt(i * 200, j * 200, 10))
+      }
+    }
+    points.push(pointAt(0, 0, 100))
+    // 缺省档（即应用默认：smooth=4 / sampling=1）下也必须保真
+    const field = buildHeatField(points, 2000, undefined, 100)!
+    const peak = valueAt(field, ...xy(0, 0))!
+    // 自身值 100：以自身权重为主（旧实现只有 11.4）
+    expect(peak).toBeGreaterThan(40)
+    expect(peak).toBeLessThanOrEqual(100)
+    // 背景仍是邻域值 10（高值未把整片区域拉起来）
+    expect(valueAt(field, ...xy(200 * 6, 200 * 6))!).toBeCloseTo(10, 0)
+  })
+
+  it('栅格采样全范围有效：samp=1 站点级保真、samp=24 大区域均值（不再加几何上限）', () => {
+    const points: HeatPoint[] = []
+    for (let i = -10; i <= 10; i++) {
+      for (let j = -10; j <= 10; j++) {
+        if (i === 0 && j === 0) continue
+        points.push(pointAt(i * 200, j * 200, 10))
+      }
+    }
+    points.push(pointAt(0, 0, 100))
+    const peakAt = (sampling: number) => valueAt(buildHeatField(points, 2000, undefined, 100, sampling, 1)!, ...xy(0, 0))!
+    // samp=1：高值点保真（gate 中心全抑制粗场）
+    expect(peakAt(1)).toBeGreaterThan(90)
+    // samp=24：细网格粗于整个数据范围 → 桶值≈全量均值（用户主动选择的最大融合档）
+    const coarse = peakAt(24)
+    expect(coarse).toBeGreaterThan(8)
+    expect(coarse).toBeLessThan(25)
+  })
+
+  it('细核固定站点窄核：任何 smooth 下高值都保留（不再被邻域平均稀释）', () => {
+    const points = [pointAt(-300, 0, 0), pointAt(0, 0, 100), pointAt(300, 0, 0)]
+    const v = (smooth: number) => valueAt(buildHeatField(points, 3000, undefined, 100, 1, smooth)!, ...xy(0, 0))!
+    // smooth 不再进入细核：三档站点峰值都保留（旧耦合下 smooth10 会被平均）
+    expect(v(1)).toBeGreaterThan(90)
+    expect(v(4)).toBeGreaterThan(90)
+    expect(v(10)).toBeGreaterThan(90)
+    // smooth 越界仍钳 [1,10]（用于 gate 过渡带宽）
+    expect(v(0)).toBeCloseTo(v(1), 6)
+    expect(v(99)).toBeCloseTo(v(10), 6)
   })
 })
