@@ -3,14 +3,15 @@ import { X, Ruler, Palette } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { useLayerEditStore, type InspectFeature } from '../../store/layerEditStore'
 import { useMapStore } from '../../store/mapStore'
+import { NO_FILL_COLOR } from '../../utils/fieldValue'
 import type { DrawGeometryType } from '@shared/types'
 
 const EARTH_R = 6378137
 
 const DEFAULT_STYLES: Record<DrawGeometryType, Record<string, any>> = {
   point: { markerShape: 'circle', markerSize: 8, markerColor: '#ff6b6b', borderColor: '#cc2b2b' },
-  line: { color: '#ff6b6b', weight: 2.5, opacity: 0.95, dashArray: '' },
-  polygon: { fillColor: '#ff6b6b', fillOpacity: 0.3, borderColor: '#cc2b2b', borderWidth: 2, borderDash: '', shape: 'polygon' },
+  line: { color: '#ff6b6b', weight: 2.5, opacity: 1, dashArray: '' },
+  polygon: { fillColor: '#ff6b6b', fillOpacity: 1, borderColor: '#cc2b2b', borderWidth: 2, borderDash: '', shape: 'polygon' },
 }
 
 const DASH_OPTIONS: Array<{ value: string; key: string; fallback: string }> = [
@@ -19,9 +20,6 @@ const DASH_OPTIONS: Array<{ value: string; key: string; fallback: string }> = [
   { value: '10,10', key: 'map.lineLongDash', fallback: '长虚线' },
   { value: '2,4', key: 'map.lineDotted', fallback: '点线' },
 ]
-
-const POINT_SHAPES = ['circle', 'square', 'triangle', 'diamond']
-const POLYGON_SHAPES = ['polygon', 'circle', 'square', 'triangle']
 
 const toRad = (d: number) => (d * Math.PI) / 180
 
@@ -153,7 +151,15 @@ function fmtArea(m2: number): string {
   return `${m2.toFixed(2)} m²`
 }
 
-function ColorRow({ label, value, onChange, disabled }: { label: string; value: string; onChange: (v: string) => void; disabled?: boolean }) {
+function ColorRow({ label, value, onChange, disabled, allowNoFill }: {
+  label: string
+  value: string
+  onChange: (v: string) => void
+  disabled?: boolean
+  /** 提供"无色"选项（图形颜色=镂空/不描边） */
+  allowNoFill?: boolean
+}) {
+  const { t } = useTranslation()
   return (
     <div className="flex items-center justify-between gap-2">
       <span className="text-xs text-muted-foreground">{label}</span>
@@ -165,6 +171,24 @@ function ColorRow({ label, value, onChange, disabled }: { label: string; value: 
           onChange={(e) => onChange(e.target.value)}
           className="w-[78px] px-1.5 py-1 text-xs rounded border border-border bg-background text-foreground outline-none focus:border-primary disabled:opacity-50"
         />
+        {allowNoFill && (
+          <button
+            type="button"
+            onClick={() => onChange(NO_FILL_COLOR)}
+            disabled={disabled}
+            title={t('map.noFillColor') || '无色'}
+            aria-label={t('map.noFillColor') || '无色'}
+            className={`relative w-7 h-7 rounded border-2 overflow-hidden bg-background flex-shrink-0 transition-all disabled:opacity-50 ${
+              value === NO_FILL_COLOR
+                ? 'border-primary ring-1 ring-primary ring-offset-1'
+                : 'border-border hover:border-muted-foreground/50'
+            }`}
+          >
+            <svg className="absolute inset-0 w-full h-full" viewBox="0 0 24 24" preserveAspectRatio="none">
+              <line x1="3" y1="21" x2="21" y2="3" stroke="#ef4444" strokeWidth="2.5" />
+            </svg>
+          </button>
+        )}
         <input
           type="color"
           value={value && value !== 'none' ? value : '#000000'}
@@ -283,12 +307,8 @@ export default function FeatureStyleDialog({ open, data, layerName, onClose }: F
     onClose()
   }
 
-  const shapeOptions = (kind: DrawGeometryType) =>
-    kind === 'point'
-      ? POINT_SHAPES.map((v) => ({ value: v, label: t(`map.shape${v[0].toUpperCase()}${v.slice(1)}`) || v }))
-      : kind === 'polygon'
-        ? POLYGON_SHAPES.map((v) => ({ value: v, label: t(`map.shape${v[0].toUpperCase()}${v.slice(1)}`) || v }))
-        : DASH_OPTIONS.map((o) => ({ value: o.value, label: t(o.key) || o.fallback }))
+  // 线要素线型选项（点/面形状下拉已移除）
+  const lineDashOptions = DASH_OPTIONS.map((o) => ({ value: o.value, label: t(o.key) || o.fallback }))
 
   return (
     <div className="fixed inset-0 z-[5200] flex items-center justify-center bg-black/20" onClick={onClose}>
@@ -352,17 +372,16 @@ export default function FeatureStyleDialog({ open, data, layerName, onClose }: F
         </div>
 
         <div className="flex flex-col gap-2.5">
-          <SelectRow
-            label={t('map.markerShape') || '图形类型'}
-            value={stats.kind === 'line' ? (style.dashArray || '') : (style.markerShape || style.shape || (stats.kind === 'polygon' ? 'polygon' : 'circle'))}
-            options={shapeOptions(stats.kind)}
-            disabled={!canEdit}
-            onChange={(v) => {
-              if (stats.kind === 'line') patch({ dashArray: v })
-              else if (stats.kind === 'polygon') patch({ shape: v })
-              else patch({ markerShape: v })
-            }}
-          />
+          {/* 形状下拉已移除（点/面绘制形状不可改）；仅线要素保留线型（实线/虚线） */}
+          {stats.kind === 'line' && (
+            <SelectRow
+              label={t('map.markerShape') || '图形类型'}
+              value={style.dashArray || ''}
+              options={lineDashOptions}
+              disabled={!canEdit}
+              onChange={(v) => patch({ dashArray: v })}
+            />
+          )}
 
           {stats.kind === 'point' && (
             <>
@@ -374,14 +393,14 @@ export default function FeatureStyleDialog({ open, data, layerName, onClose }: F
                 disabled={!canEdit}
                 onChange={(v) => patch({ markerSize: v })}
               />
-              <ColorRow label={t('map.fillColor') || '图形颜色'} value={style.markerColor} disabled={!canEdit} onChange={(v) => patch({ markerColor: v })} />
+              <ColorRow label={t('map.fillColor') || '图形颜色'} value={style.markerColor} disabled={!canEdit} allowNoFill onChange={(v) => patch({ markerColor: v })} />
               <ColorRow label={t('map.borderColor') || '边框颜色'} value={style.borderColor} disabled={!canEdit} onChange={(v) => patch({ borderColor: v })} />
             </>
           )}
 
           {stats.kind === 'line' && (
             <>
-              <ColorRow label={t('map.lineColor') || '图形颜色'} value={style.color} disabled={!canEdit} onChange={(v) => patch({ color: v })} />
+              <ColorRow label={t('map.lineColor') || '图形颜色'} value={style.color} disabled={!canEdit} allowNoFill onChange={(v) => patch({ color: v })} />
               <RangeRow
                 label={t('map.lineWidth') || '线宽'}
                 value={style.weight ?? 2.5}
@@ -392,23 +411,33 @@ export default function FeatureStyleDialog({ open, data, layerName, onClose }: F
               />
               <RangeRow
                 label={t('map.opacity') || '透明度'}
-                value={Math.round((style.opacity ?? 0.95) * 100)}
+                value={Math.round((style.opacity ?? 1) * 100)}
                 min={10} max={100} step={5}
-                suffix={`${Math.round((style.opacity ?? 0.95) * 100)}%`}
+                suffix={`${Math.round((style.opacity ?? 1) * 100)}%`}
                 disabled={!canEdit}
                 onChange={(v) => patch({ opacity: v / 100 })}
               />
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-xs text-muted-foreground">{t('map.lineArrow') || '带方向线段的线'}</span>
+                <input
+                  type="checkbox"
+                  checked={!!style.arrow}
+                  disabled={!canEdit}
+                  onChange={(e) => patch({ arrow: e.target.checked })}
+                  className="layer-standard-checkbox"
+                />
+              </div>
             </>
           )}
 
           {stats.kind === 'polygon' && (
             <>
-              <ColorRow label={t('map.fillColor') || '图形颜色'} value={style.fillColor} disabled={!canEdit} onChange={(v) => patch({ fillColor: v })} />
+              <ColorRow label={t('map.fillColor') || '图形颜色'} value={style.fillColor} disabled={!canEdit} allowNoFill onChange={(v) => patch({ fillColor: v })} />
               <RangeRow
                 label={t('map.fillOpacity') || '填充透明度'}
-                value={Math.round((style.fillOpacity ?? 0.3) * 100)}
+                value={Math.round((style.fillOpacity ?? 1) * 100)}
                 min={0} max={100} step={5}
-                suffix={`${Math.round((style.fillOpacity ?? 0.3) * 100)}%`}
+                suffix={`${Math.round((style.fillOpacity ?? 1) * 100)}%`}
                 disabled={!canEdit}
                 onChange={(v) => patch({ fillOpacity: v / 100 })}
               />

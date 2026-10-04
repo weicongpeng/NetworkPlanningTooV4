@@ -11,7 +11,7 @@
  */
 import { useState, useEffect, useRef, useCallback, useMemo, type ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
-import { Loader2, Search, X, MapPin, AlertTriangle, Database, Trash2, MousePointer2, Circle as CircleIcon, Pentagon, Hand, Map as MapIcon, Satellite, Maximize2, Minimize2, FilePlus2, Save, Download, Hexagon, Spline, Palette, PenLine, Undo2, BoxSelect, ClipboardPaste } from 'lucide-react'
+import { Loader2, Search, X, MapPin, AlertTriangle, Database, Trash2, MousePointer2, Circle as CircleIcon, Pentagon, Hand, Map as MapIcon, Satellite, Maximize2, Minimize2, FilePlus2, Save, Download, Hexagon, Spline, Palette, PenLine, Undo2, BoxSelect, ClipboardPaste, Magnet, Combine, Filter } from 'lucide-react'
 import { OnlineMap, OnlineMapRef, CustomLayerOption } from '../components/Map/OnlineMap'
 import { MapSearchDialog } from '../components/Map/MapSearchDialog'
 import { LayerControl, SectorLayerOption, LayerFileOption, DecorationLayerOption } from '../components/Map/LayerControl'
@@ -24,7 +24,10 @@ import { useMapStore } from '../store/mapStore'
 import type { LayerCategory } from '../store/mapStore'
 import { useMapDataCacheStore } from '../store/mapDataCacheStore'
 import { useLayerEditStore, selectDirtyLayerIds, buildSavePlan } from '../store/layerEditStore'
+import type { EditFeature } from '../store/layerEditStore'
 import NewLayerDialog from '../components/Map/NewLayerDialog'
+import AttributeJoinDialog from '../components/Map/AttributeJoinDialog'
+import BufferDialog from '../components/Map/BufferDialog'
 import SaveLayersDialog, { type DirtyLayerItem } from '../components/Map/SaveLayersDialog'
 import MapExportDialog from '../components/Map/MapExportDialog'
 import DrawStyleModal from '../components/Map/DrawStyleModal'
@@ -35,6 +38,9 @@ import { frequencyColorMapper } from '../config/sector-config'
 import { LabelSettings, LayerColorSettings, ThematicSettings, ThematicRange, HeatmapSettings, HeatmapTemplate } from '../components/Map/LabelSettingsModal'
 import { TreeNode } from '../components/Map/LayerControl'
 import { ThematicLegend } from '../components/Map/ThematicLegend'
+import { PciModLegend } from '../components/Map/PCIModLegend'
+import type { PciModLegendItem } from '../components/Map/PCIModLegend'
+import type { PciRenderStats } from '../utils/pciModColor'
 import { HeatmapLegend } from '../components/Map/HeatmapLegend'
 import type { HeatmapStats } from '../components/Map/HeatmapLayerManager'
 import { selectionManager } from '../services/selectionManager'
@@ -96,6 +102,44 @@ async function writeSaveTarget(target: SaveTarget, blob: Blob, filename: string)
   document.body.removeChild(link)
   URL.revokeObjectURL(url)
 }
+/** 梯形图标：只有上下两边平行的四边形（边界选择专用） */
+function TrapezoidIcon({ size = 14 }: { size?: number }) {
+  return (
+    <svg
+      xmlns="http://www.w3.org/2000/svg"
+      width={size}
+      height={size}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <path d="M7 5 L17 5 L20 19 L4 19 Z" />
+    </svg>
+  )
+}
+/** 缓冲区图标：中心一条曲线，四周被与曲线等距、不相交的封闭轮廓包裹（绘制缓冲区专用） */
+function BufferIcon({ size = 14 }: { size?: number }) {
+  return (
+    <svg
+      xmlns="http://www.w3.org/2000/svg"
+      width={size}
+      height={size}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.7"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <path d="M2.40 11.42 C2.98 12.37 4.86 14.95 5.85 15.88 C6.84 16.81 7.67 16.82 8.33 16.98 C8.99 17.14 9.33 16.99 9.81 16.85 C10.29 16.71 10.51 16.82 11.23 16.16 C11.95 15.50 13.24 12.99 14.11 12.92 C14.98 12.85 15.72 15.07 16.45 15.73 C17.18 16.39 17.95 16.68 18.50 16.86 C19.05 17.04 19.36 16.90 19.72 16.81 C20.08 16.72 20.33 16.72 20.66 16.34 C20.99 15.96 21.59 15.15 21.68 14.54 C21.77 13.93 21.53 13.19 21.23 12.69 C20.93 12.19 20.46 12.19 19.86 11.53 C19.26 10.87 18.22 9.37 17.61 8.71 C17.00 8.05 16.68 7.84 16.18 7.56 C15.68 7.28 15.10 7.10 14.59 7.03 C14.08 6.96 13.59 7.00 13.10 7.13 C12.61 7.26 12.36 7.15 11.63 7.81 C10.90 8.47 9.60 10.99 8.72 11.08 C7.84 11.17 6.95 8.86 6.33 8.35 C5.71 7.84 5.40 8.01 4.98 8.00 C4.56 7.99 4.15 8.11 3.79 8.29 C3.44 8.47 3.09 8.75 2.85 9.07 C2.61 9.39 2.43 9.81 2.35 10.20 C2.27 10.59 1.82 10.47 2.40 11.42 Z" />
+      <path d="M5.00 10.70 C5.15 10.89 5.61 11.45 5.91 11.84 C6.21 12.23 6.52 12.68 6.82 13.02 C7.12 13.37 7.43 13.71 7.73 13.93 C8.03 14.14 8.34 14.28 8.64 14.30 C8.94 14.32 9.25 14.22 9.55 14.04 C9.85 13.86 10.16 13.54 10.46 13.21 C10.76 12.88 11.07 12.45 11.37 12.06 C11.67 11.67 11.98 11.23 12.28 10.89 C12.58 10.55 12.89 10.22 13.19 10.02 C13.49 9.82 13.80 9.70 14.10 9.70 C14.40 9.70 14.71 9.82 15.01 10.01 C15.31 10.21 15.62 10.53 15.92 10.87 C16.22 11.21 16.53 11.66 16.83 12.04 C17.13 12.43 17.44 12.87 17.74 13.20 C18.04 13.53 18.50 13.89 18.65 14.03" />
+    </svg>
+  )
+}
+
 const _layerListCache = new Map<string, LayerListCacheEntry>()
 const _LAYER_LIST_CACHE_TTL = 10 * 60 * 1000 // 10分钟
 
@@ -104,7 +148,8 @@ const _LAYER_LIST_CACHE_TTL = 10 * 60 * 1000 // 10分钟
 /** 可拖动排序的工具栏按钮 id（数据源指示/搜索区固定不参与）；默认顺序按使用频率排列 */
 const TOOLBAR_ITEM_IDS = [
   'save', 'export', 'new', 'undo', 'capture', 'paste', 'measure',
-  'drag', 'select', 'marquee', 'draw', 'style', 'maptype', 'fullscreen',
+  'drag', 'select', 'marquee', 'draw', 'style', 'nodesnap', 'nodemerge',
+  'maptype', 'fullscreen',
 ] as const
 type ToolbarItemId = (typeof TOOLBAR_ITEM_IDS)[number]
 
@@ -141,8 +186,21 @@ function loadToolbarPrefs(): ToolbarPrefs {
     const order: ToolbarItemId[] = Array.isArray(p.order)
       ? (p.order.filter((id: string) => known.includes(id)) as ToolbarItemId[])
       : [...TOOLBAR_ITEM_IDS]
+    // 缺失按钮按默认顺序插到"前一个默认邻居"之后，
+    // 保证新按钮（如节点捕获/节点合并）出现在规范位置而非一律追加到末尾
     for (const id of TOOLBAR_ITEM_IDS) {
-      if (!order.includes(id)) order.push(id)
+      if (order.includes(id)) continue
+      const defaultIdx = TOOLBAR_ITEM_IDS.indexOf(id)
+      let placed = false
+      for (let j = defaultIdx - 1; j >= 0; j--) {
+        const anchorPos = order.indexOf(TOOLBAR_ITEM_IDS[j])
+        if (anchorPos >= 0) {
+          order.splice(anchorPos + 1, 0, id)
+          placed = true
+          break
+        }
+      }
+      if (!placed) order.unshift(id)
     }
     return { order, showLabels: p.showLabels === true, __v: 2 }
   } catch {
@@ -193,7 +251,6 @@ export function MapPage() {
     setLayerVisibility: storeSetLayerVisibility,
     setLayerFileVisibility: storeSetLayerFileVisibility,
     setPointFileVisibility: storeSetPointFileVisibility,
-    setDecorationLayerVisible: storeSetDecorationLayerVisible,
     setSectorLabelVisibility: storeSetSectorLabelVisibility,
     setPointFileLabelVisibility: storeSetPointFileLabelVisibility,
     setLayerFileLabelVisibility: storeSetLayerFileLabelVisibility,
@@ -315,11 +372,11 @@ export function MapPage() {
   // 自定义图层 (用户创建的点)
   const [customLayers, setCustomLayers] = useState<CustomLayerOption[]>([])
 
-  // 装饰图层（打点、定位标记等）- 从持久化 store 初始化
+  // 装饰图层（打点/定位标记 + 绘制要素）- 恒定可见（控制面板复选框锁定不可关闭）
   const [decorationLayer, setDecorationLayer] = useState<DecorationLayerOption>({
     id: 'decoration-layer',
     name: '装饰图层',
-    visible: mapSettings.decorationLayerVisible,
+    visible: true,
     count: 0
   })
 
@@ -708,7 +765,7 @@ export function MapPage() {
   const [measurePoints, setMeasurePoints] = useState<Array<{ lng: number; lat: number }>>([])
 
   // 圈选模式: none, circle, polygon
-  const [selectionMode, setSelectionMode] = useState<'none' | 'circle' | 'polygon' | 'point'>('none')
+  const [selectionMode, setSelectionMode] = useState<'none' | 'circle' | 'polygon' | 'point' | 'boundary'>('none')
   const [showSelectionMenu, setShowSelectionMenu] = useState(false)
   const selectionMenuRef = useRef<HTMLDivElement>(null)
 
@@ -747,18 +804,43 @@ export function MapPage() {
   }, [mapSettings.selectableMap, layers, layerFiles, pointFiles, decorationLayer.visible])
 
   /**
+   * 统计"可见且可选开关打开"的图层数量（按图层粒度计数）。
+   * 边界选择跨图层收集，要求至少 2 个这样的图层。
+   */
+  const countSelectableLayers = useCallback((): number => {
+    const selectable = mapSettings.selectableMap ?? {}
+    const isOn = (id: string) => selectable[id] !== false
+    let n = 0
+    // 基站（LTE/NR 扇区各算一个图层）
+    n += layers.filter(l => l.visible && isOn(l.id)).length
+    // 图层文件（MapInfo）
+    n += layerFiles.filter(f => f.visible && isOn(f.id)).length
+    // 地理化数据
+    n += pointFiles.filter(f => f.visible && isOn(f.id)).length
+    // 装饰图层
+    if (decorationLayer.visible && isOn('decoration-layer')) n += 1
+    return n
+  }, [mapSettings.selectableMap, layers, layerFiles, pointFiles, decorationLayer.visible])
+
+  /**
    * 处理框选模式切换
    * 框选功能和拖拽工具互斥：激活框选时禁用拖拽工具
    */
-  const handleSelectionModeChange = (mode: 'circle' | 'polygon' | 'point') => {
+  const handleSelectionModeChange = (mode: 'circle' | 'polygon' | 'point' | 'boundary') => {
     // 工具"粘滞"：再次点击已激活的模式不再退出，只能通过切换到其他工具退出
     if (selectionMode === mode) {
       setShowSelectionMenu(false)
       return
     }
 
-    // 圆形/多边形/框选都需要至少一个"可见且可选"的图层作为圈选目标
-    if (!hasSelectableLayer()) {
+    // 边界选择需要至少 2 个"可见且可选"图层（一个提供边界、其余提供被选要素）
+    if (mode === 'boundary') {
+      if (countSelectableLayers() < 2) {
+        alert(t('map.needTwoSelectable') || '边界选择需要至少 2 个图层打开"可选"开关')
+        return
+      }
+    } else if (!hasSelectableLayer()) {
+      // 圆形/多边形/框选都需要至少一个"可见且可选"的图层作为圈选目标
       alert(t('map.enableSelectableFirst') || '请先在图层控制面板打开需要圈选图层的"可选"开关（鼠标箭头按钮）')
       return
     }
@@ -826,6 +908,8 @@ export function MapPage() {
 
   // ===== 新建 TAB 图层 / 编辑 / 保存 =====
   const [newLayerDialogOpen, setNewLayerDialogOpen] = useState(false)
+  const [joinDialogOpen, setJoinDialogOpen] = useState(false)
+  const [bufferDialogOpen, setBufferDialogOpen] = useState(false)
   const [saveDialogOpen, setSaveDialogOpen] = useState(false)
   const [exportDialogOpen, setExportDialogOpen] = useState(false)
   const [styleModalTab, setStyleModalTab] = useState<DrawGeometryType | null>(null)
@@ -874,15 +958,41 @@ export function MapPage() {
   const editableLayerId = useLayerEditStore((s) => s.editableLayerId)
   const drawTool = useLayerEditStore((s) => s.drawTool)
   const selectMode = useLayerEditStore((s) => s.selectMode)
+  const snapEnabled = useLayerEditStore((s) => s.snapEnabled)
+  const nodeMergeMode = useLayerEditStore((s) => s.nodeMergeMode)
   const inspectFeature = useLayerEditStore((s) => s.inspectFeature)
   const editWorkspaces = useLayerEditStore((s) => s.workspaces)
   const clipboardItems = useLayerEditStore((s) => s.clipboard)
-  const dirtyLayerIds = selectDirtyLayerIds(editWorkspaces)
+  // 装饰图层不参与后端保存（自动落 localStorage），从"未保存图层"列表中排除：
+  // 避免 Ctrl+S 弹窗/保存角标出现一个点保存无效果的条目
+  const dirtyLayerIds = selectDirtyLayerIds(editWorkspaces).filter(id => id !== 'decoration-layer')
   // 粘贴就绪：编辑图层存在、剪贴板非空、且编辑图层处于勾选（可见）状态
-  //（去勾选只是隐藏编辑会话渲染，但不允许向看不见的图层粘贴内容）
+  //（去勾选只是隐藏编辑会话渲染，但不允许向看不见的图层粘贴内容；装饰图层恒显）
   const pasteTargetReady = !!editableLayerId
     && clipboardItems.length > 0
-    && !!layerFiles.find((f) => f.id === editableLayerId)?.visible
+    && (editableLayerId === 'decoration-layer' || !!layerFiles.find((f) => f.id === editableLayerId)?.visible)
+
+  /**
+   * 装饰图层工作集 → localStorage 持久化（单向回写）。
+   * 装饰图层无后端文件，绘制/打点/删除后把工作集要素写回 mapStore.decorationFeatures，
+   * 由 zustand persist 落盘（按用户 key）；JSON 比对去重，跳过 seed 后的回声写入。
+   */
+  const decorationFlushJsonRef = useRef<string>(JSON.stringify(useMapStore.getState().decorationFeatures ?? []))
+  useEffect(() => {
+    const flush = (features: EditFeature[] | undefined) => {
+      if (!features) return
+      const json = JSON.stringify(features)
+      if (json === decorationFlushJsonRef.current) return
+      decorationFlushJsonRef.current = json
+      useMapStore.getState().setDecorationFeatures(features)
+    }
+    const unsub = useLayerEditStore.subscribe((state, prev) => {
+      const ws = state.workspaces['decoration-layer']
+      if (!ws || ws === prev.workspaces['decoration-layer']) return
+      flush(ws.features)
+    })
+    return unsub
+  }, [])
 
   // 点击外部收起所有工具栏下拉菜单
   useEffect(() => {
@@ -939,15 +1049,16 @@ export function MapPage() {
     }
     if (store.clipboard.length === 0) return
     // 目标图层必须处于勾选（可见）状态：去勾选只是隐藏显示、编辑会话保留（未保存更改不丢），
-    // 但不允许向看不见的图层写入内容
+    // 但不允许向看不见的图层写入内容。装饰图层恒显、名称取面板显示名。
+    const isDecoration = targetId === 'decoration-layer'
     const targetFile = layerFiles.find(f => f.id === targetId)
-    if (!targetFile?.visible) {
+    if (!isDecoration && !targetFile?.visible) {
       alert(t('map.pasteTargetHidden')
         || '目标图层当前未勾选（隐藏状态），请先在图层控制面板重新勾选该图层后再粘贴')
       return
     }
     // 执行前弹窗确认（粘贴会直接写入当前编辑图层，避免误粘）
-    const targetName = targetFile?.name || ''
+    const targetName = isDecoration ? (t('map.decorationLayer') || '装饰图层') : (targetFile?.name || '')
     const ok = window.confirm(
       t('map.pasteConfirm', { count: store.clipboard.length, name: targetName })
       || `确认把剪贴板中的 ${store.clipboard.length} 个要素粘贴到图层「${targetName}」？`
@@ -979,11 +1090,34 @@ export function MapPage() {
     setCaptureCoord(null)
   }, [t])
 
+  // 节点捕获：独立开关（与 S 键等价），不与任何工具互斥
+  const handleToggleSnap = useCallback(() => {
+    useLayerEditStore.getState().toggleSnapEnabled()
+  }, [])
+
+  // 节点合并：必须先打开一个图层的"编辑"开关；与绘制/选择/圈选/测距/打点/手形互斥
+  const handleToggleNodeMerge = useCallback(() => {
+    const store = useLayerEditStore.getState()
+    if (!store.nodeMergeMode && !store.editableLayerId) {
+      alert(t('map.mergeNeedEditableLayer') || '请先在图层控制面板打开一个图层的"编辑"开关，再使用节点合并')
+      return
+    }
+    const next = !store.nodeMergeMode
+    store.setNodeMergeMode(next)
+    setMeasureMode(false)
+    setCaptureMode(false)
+    setCaptureCoord(null)
+    setSelectionMode('none')
+    setMapDragTool(false)
+  }, [t])
+
   // 保存勾选的未保存图层
   // 把勾选图层的工作集保存落盘（返回 {name, ok, error}[]；成功图层清脏）
   const saveSelectedToStore = useCallback(async (selectedIds: string[]) => {
     const results: Array<{ name: string; ok: boolean; layerId?: string; dataId?: string; error?: string; mode?: string }> = []
     for (const layerId of selectedIds) {
+      // 装饰图层无后端文件（改动自动落 localStorage），不进入保存链路
+      if (layerId === 'decoration-layer') continue
       const ws = useLayerEditStore.getState().getWorkspace(layerId)
       const lf = layerFiles.find((f) => f.id === layerId)
       if (!ws || !lf) continue
@@ -1041,6 +1175,13 @@ export function MapPage() {
     triggerDataRefresh('layer')
     return results
   }, [layerFiles])
+
+  // 缓冲区写入 TAB 图层后的刷新：失效图层缓存并重新拉取，刷新数据列表（口径同保存链路）
+  const handleBufferSaved = useCallback((layerId: string) => {
+    useMapDataCacheStore.getState().invalidateLayer(layerId)
+    void onlineMapRef.current?.refreshLayerData(layerId, {})
+    triggerDataRefresh('layer')
+  }, [])
 
   // 保存：仅把编辑结果写回库（MapInfo TAB），不触发任何下载
   const handleSaveLayers = useCallback(async (selectedIds: string[]) => {
@@ -1156,7 +1297,8 @@ export function MapPage() {
       if (c && onlineMapRef.current) {
         onlineMapRef.current.setSectorColorSettings(layerId, {
           fillOpacity: c.fillOpacity,
-          borderWidth: c.borderWidth
+          borderWidth: c.borderWidth,
+          ...(c.pciRenderEnabled ? { pciRenderEnabled: true, pciMod: c.pciMod ?? 3 } : {})
         })
       }
     }
@@ -1377,18 +1519,6 @@ export function MapPage() {
       onlineMapRef.current.setCustomLayerVisibility(layerId, false)
     }
   }, [])
-
-  /**
-   * 处理装饰图层可见性切换
-   */
-  const handleDecorationLayerToggle = useCallback((visible: boolean) => {
-    console.log('[MapPage] 装饰图层切换:', visible)
-    setDecorationLayer(prev => ({ ...prev, visible }))
-    storeSetDecorationLayerVisible(visible)
-    if (onlineMapRef.current) {
-      onlineMapRef.current.setDecorationLayerVisibility(visible)
-    }
-  }, [storeSetDecorationLayerVisible])
 
   /**
    * 处理装饰图层标签可见性切换
@@ -2088,25 +2218,24 @@ export function MapPage() {
 
     if (!onlineMapRef.current) return
 
-    // 强制显示目标图层，便于看到改色效果
+    // 强制显示目标图层，便于看到改色效果（装饰图层恒显，无需处理）
     if (node.type === 'layer-file' && node.layerFile) {
       storeSetLayerFileVisibility(layerId, true)
-    } else if (node.type === 'decoration-layer') {
-      storeSetDecorationLayerVisible(true)
     }
 
-    // 应用颜色到地图：扇区图层仅应用透明度/边框宽度（默认按频点区分颜色）
+    // 应用颜色到地图：扇区图层应用透明度/边框宽度/小区PCI渲染（默认按频点区分颜色）
     if (node.type === 'sector-layer') {
       onlineMapRef.current?.setSectorColorSettings(layerId, {
         fillOpacity: settings.fillOpacity,
-        borderWidth: settings.borderWidth
+        borderWidth: settings.borderWidth,
+        ...(settings.pciRenderEnabled ? { pciRenderEnabled: true, pciMod: settings.pciMod ?? 3 } : {})
       })
       return
     }
 
     // 应用颜色到地图
     onlineMapRef.current.setLayerColorSettings(layerId, settings)
-  }, [storeSetColorSettings, storeSetLayerFileVisibility, storeSetDecorationLayerVisible])
+  }, [storeSetColorSettings, storeSetLayerFileVisibility])
 
   /**
    * 处理专题图层设置变化（null 表示关闭专题）
@@ -2294,13 +2423,44 @@ export function MapPage() {
     return items
   }, [layerFiles, pointFiles, sectorLayers, mapSettings.thematicSettingsMap])
 
+  // PCI模值图例项：已勾选可见且启用"小区PCI渲染"的基站扇区图层。
+  // 门控：同图层专题启用（画面为专题色）/热力图替换模式（扇区层已移除）时图例不显示，
+  // 避免画面颜色与图例不符。
+  const pciRenderLegendItems = useMemo(() => {
+    const cMap = colorSettingsMap ?? {}
+    const tsMap = mapSettings.thematicSettingsMap ?? {}
+    const hsMap = mapSettings.heatmapSettingsMap ?? {}
+    const items: PciModLegendItem[] = []
+    for (const s of sectorLayers) {
+      const c = cMap[s.id]
+      const thematicOn = tsMap[s.id]?.enabled
+      const hs = hsMap[s.id]
+      const heatReplace = hs?.enabled && !!hs.field && !hs.showOriginal
+      // 该制式至少有一个频点勾选（图例只展示勾选频点，全不勾选时无内容可显示）
+      const visibleFreqs = s.id === 'lte-sectors' ? frequencies.lte : frequencies.nr
+      const hasCheckedFrequency = visibleFreqs.some(f => f.visible)
+      if (s.visible && c?.pciRenderEnabled && !thematicOn && !heatReplace && hasCheckedFrequency) {
+        items.push({
+          id: s.id,
+          name: s.type === 'LTE' ? 'LTE' : 'NR',
+          mod: c.pciMod ?? (s.type === 'NR' ? 30 : 3)
+        })
+      }
+    }
+    return items
+  }, [sectorLayers, colorSettingsMap, mapSettings.thematicSettingsMap, mapSettings.heatmapSettingsMap, frequencies])
+
   // 图例双击跳转：打开对应图层的专题/热力图设置页
-  const [openThematicFor, setOpenThematicFor] = useState<{ layerId: string; ts: number; subTab?: 'thematic' | 'heatmap' } | null>(null)
+  const [openThematicFor, setOpenThematicFor] = useState<{ layerId: string; ts: number; subTab?: 'basic' | 'thematic' | 'heatmap' } | null>(null)
   const handleLegendItemDoubleClick = useCallback((item: { id: string }) => {
     setOpenThematicFor({ layerId: item.id, ts: Date.now(), subTab: 'thematic' })
   }, [])
   const handleHeatmapLegendItemDoubleClick = useCallback((item: { id: string }) => {
     setOpenThematicFor({ layerId: item.id, ts: Date.now(), subTab: 'heatmap' })
+  }, [])
+  // PCI模值图例双击：打开对应扇区图层默认设置（基础配置页）
+  const handlePciRenderLegendDoubleClick = useCallback((item: { id: string }) => {
+    setOpenThematicFor({ layerId: item.id, ts: Date.now(), subTab: 'basic' })
   }, [])
 
   // 专题图例统计（图例显示每个区间的个数与占比；other = 黑色“其他”要素数）
@@ -2325,6 +2485,29 @@ export function MapPage() {
     return () => clearTimeout(timer)
   }, [thematicLegendItems, fetchThematicStats])
 
+  // PCI模值图例统计（各模值小区数；noPci = 无有效PCI的小区数）
+  const [pciRenderStats, setPciRenderStats] = useState<Record<string, PciRenderStats | null>>({})
+  const fetchPciRenderStats = useCallback((ids: string[]) => {
+    if (!onlineMapRef.current) return
+    // 按当前 ids 裁剪：图层从图例消失后清除其旧统计键
+    const next: Record<string, PciRenderStats | null> = {}
+    for (const id of ids) {
+      next[id] = onlineMapRef.current.getPciRenderStats(id)
+    }
+    setPciRenderStats(next)
+  }, [])
+  // 图例项变化时拉取统计；扇区图层可能仍在异步构建，延时重拉兜底
+  useEffect(() => {
+    const ids = pciRenderLegendItems.map(i => i.id)
+    if (ids.length === 0) {
+      setPciRenderStats({})
+      return
+    }
+    fetchPciRenderStats(ids)
+    const timer = setTimeout(() => fetchPciRenderStats(ids), 2000)
+    return () => clearTimeout(timer)
+  }, [pciRenderLegendItems, fetchPciRenderStats])
+
   // 热力图例项：已勾选可见且启用热力图的图层（含基站扇区图层）
   const heatmapLegendItems = useMemo(() => {
     const hsMap = mapSettings.heatmapSettingsMap || {}
@@ -2344,7 +2527,9 @@ export function MapPage() {
     return items
   }, [layerFiles, pointFiles, sectorLayers, mapSettings.heatmapSettingsMap])
 
-  // 热力图例统计（权重 min/max/点数/抽样）；图层可能仍在异步加载，延时重拉兜底
+  // 热力图例统计（分级色块/权重 min/max/点数/抽样）。
+  // 热力栅格可能在数据图层异步构建完成（或页面切换后重放）之后才就绪，
+  // 因此短轮询补齐：统计全部就绪即停止，最多轮询 15 次（约 30s）避免永久定时器。
   const [heatmapStats, setHeatmapStats] = useState<Record<string, HeatmapStats | null>>({})
   useEffect(() => {
     const ids = heatmapLegendItems.map(i => i.id)
@@ -2352,17 +2537,25 @@ export function MapPage() {
       setHeatmapStats({})
       return
     }
-    const fetchStats = () => {
-      if (!onlineMapRef.current) return
+    const fetchStats = (): boolean => {
+      if (!onlineMapRef.current) return false
+      let allReady = true
       const next: Record<string, HeatmapStats | null> = {}
       for (const id of ids) {
-        next[id] = onlineMapRef.current.getHeatmapStats(id)
+        const st = onlineMapRef.current.getHeatmapStats(id)
+        next[id] = st
+        if (!st) allReady = false
       }
       setHeatmapStats(prev => ({ ...prev, ...next }))
+      return allReady
     }
-    fetchStats()
-    const timer = setTimeout(fetchStats, 2000)
-    return () => clearTimeout(timer)
+    if (fetchStats()) return
+    let tries = 0
+    const timer = setInterval(() => {
+      tries += 1
+      if (fetchStats() || tries >= 15) clearInterval(timer)
+    }, 2000)
+    return () => clearInterval(timer)
   }, [heatmapLegendItems])
 
   // 热力图挂载/重挂载重放兜底：地图实例跨页面缓存复用、大图层异步构建晚于设置恢复时，
@@ -2510,19 +2703,16 @@ export function MapPage() {
           className={`px-2 py-1.5 text-xs rounded transition-colors flex items-center gap-1 ${selectionMode !== 'none' ? 'bg-blue-400 text-white hover:bg-blue-500' : 'text-foreground hover:bg-muted hover:text-primary'
             }`}
           onClick={() => {
-            if (selectionMode !== 'none') {
-              // 圈选工具"粘滞"：已激活时再次点击不退出，只收起菜单（切换到其他工具才退出）
-              setShowSelectionMenu(false)
-            } else {
-              // 否则显示框选菜单
-              setShowSelectionMenu(!showSelectionMenu)
-            }
+            // 圈选工具"粘滞"：已激活时再次点击不退出模式（只能切换到其他工具退出），
+            // 仅切换菜单显隐，便于已激活状态下改选其他形状
+            setShowSelectionMenu((v) => !v)
           }}
-          title={selectionMode !== 'none' ? (t('map.exitSelectMode') || '退出框选模式（按ESC也可退出）') : (t('map.mapSelectTool') || '地图圈选工具')}
+          title={selectionMode !== 'none' ? (t('map.selectShapeHint') || '切换圈选形状（框选/圆形/多边形）') : (t('map.mapSelectTool') || '地图圈选工具')}
         >
           {selectionMode === 'point' && <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/></svg>}
           {selectionMode === 'circle' && <CircleIcon size={14} />}
           {selectionMode === 'polygon' && <Pentagon size={14} />}
+          {selectionMode === 'boundary' && <TrapezoidIcon size={14} />}
           {selectionMode === 'none' && <BoxSelect size={14} />}
           <span className="toolbar-label">
             {selectionMode === 'point'
@@ -2531,7 +2721,9 @@ export function MapPage() {
                 ? (t('map.circleSelect') || '圆形')
                 : selectionMode === 'polygon'
                   ? (t('map.polygonSelect') || '多边形')
-                  : (t('map.marqueeSelect') || '圈选')}
+                  : selectionMode === 'boundary'
+                    ? (t('map.boundarySelect') || '边界选择')
+                    : (t('map.marqueeSelect') || '圈选')}
           </span>
           {selectionMode === 'none' && (
             <svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" className="ml-0.5 opacity-60">
@@ -2561,6 +2753,20 @@ export function MapPage() {
             >
               <Pentagon size={12} />
               {t('map.polygonSelect') || '多边形'}
+            </button>
+            <button
+              onClick={() => handleSelectionModeChange('boundary')}
+              className="w-full text-left px-2 py-1.5 text-xs text-foreground hover:bg-muted hover:text-primary transition-colors flex items-center gap-1"
+            >
+              <TrapezoidIcon size={12} />
+              {t('map.boundarySelect') || '边界选择'}
+            </button>
+            <button
+              onClick={() => { setShowSelectionMenu(false); setJoinDialogOpen(true) }}
+              className="w-full text-left px-2 py-1.5 text-xs text-foreground hover:bg-muted hover:text-primary transition-colors flex items-center gap-1"
+            >
+              <Filter size={12} />
+              {t('map.attributeJoin') || '条件选择'}
             </button>
           </div>
         )}
@@ -2618,7 +2824,7 @@ export function MapPage() {
           </svg>
         </button>
         {openMenu === 'draw' && (
-          <div className="absolute top-full left-0 mt-1 z-[3000] bg-card border border-border rounded-lg shadow-lg w-32 overflow-hidden">
+          <div className="absolute top-full left-0 mt-1 z-[3000] bg-card border border-border rounded-lg shadow-lg w-36 overflow-hidden">
             <button
               onClick={() => { setOpenMenu(null); handleDrawTool('point') }}
               className="w-full text-left px-2 py-1.5 text-xs text-foreground hover:bg-muted hover:text-primary transition-colors flex items-center gap-1.5"
@@ -2640,6 +2846,13 @@ export function MapPage() {
               <Hexagon size={13} />
               {t('map.drawPolygon') || '绘制面'}
             </button>
+            <button
+              onClick={() => { setOpenMenu(null); setBufferDialogOpen(true) }}
+              className="w-full text-left px-2 py-1.5 text-xs text-foreground hover:bg-muted hover:text-primary transition-colors flex items-center gap-1.5"
+            >
+              <BufferIcon size={13} />
+              {t('map.drawBuffer') || '绘制缓冲区'}
+            </button>
           </div>
         )}
       </div>
@@ -2654,6 +2867,42 @@ export function MapPage() {
       >
         <Palette size={14} />
         <span className="toolbar-label">{t('map.style') || '样式'}</span>
+      </button>
+    ),
+
+    /* 节点捕获：与按 S 键等价的独立开关，不与其他工具互斥 */
+    nodesnap: (
+      <button
+        className={`px-2 py-1.5 text-xs rounded transition-colors flex items-center gap-1 ${
+          snapEnabled
+            ? 'bg-blue-400 text-white hover:bg-blue-500'
+            : 'text-foreground hover:bg-muted hover:text-primary'
+        }`}
+        onClick={handleToggleSnap}
+        title={snapEnabled
+          ? (t('map.nodeSnapOnHint') || '节点捕获已开启（点击或按 S 关闭）：拖动/绘制节点时自动吸附')
+          : (t('map.nodeSnapHint') || '节点捕获（同键盘 S）：开启后拖动/绘制节点靠近其他节点自动吸附')}
+      >
+        <Magnet size={14} />
+        <span className="toolbar-label">{t('map.nodeSnap') || '节点捕获'}</span>
+      </button>
+    ),
+
+    /* 节点合并：拖框把可编辑边框对齐到不可编辑参考图形边框（节点少补多删） */
+    nodemerge: (
+      <button
+        className={`px-2 py-1.5 text-xs rounded transition-colors flex items-center gap-1 ${
+          nodeMergeMode
+            ? 'bg-blue-400 text-white hover:bg-blue-500'
+            : 'text-foreground hover:bg-muted hover:text-primary'
+        }`}
+        onClick={handleToggleNodeMerge}
+        title={nodeMergeMode
+          ? (t('map.nodeMergeOnHint') || '节点合并已开启（点击关闭）：左键拖框选择相邻边框')
+          : (t('map.nodeMergeHint') || '节点合并：开启编辑图层后，拖框把可编辑边框吸附对齐到参考图层边框')}
+      >
+        <Combine size={14} />
+        <span className="toolbar-label">{t('map.nodeMerge') || '节点合并'}</span>
       </button>
     ),
 
@@ -3042,7 +3291,6 @@ export function MapPage() {
               sectorData={sectorDataCache}
               onFrequencyColorChange={handleFrequencyColorChange}
               decorationLayer={decorationLayer}
-              onDecorationLayerToggle={handleDecorationLayerToggle}
               decorationLabelVisible={decorationLabelVisible}
               onDecorationLabelToggle={handleDecorationLabelToggle}
               layerOrder={mapSettings.layerOrder}
@@ -3055,6 +3303,8 @@ export function MapPage() {
 
             {/* 专题图层图例（随图层勾选/配置实时刷新；双击图例跳转专题设置） */}
             <ThematicLegend items={thematicLegendItems} stats={thematicStats} onItemDoubleClick={handleLegendItemDoubleClick} />
+            {/* PCI模值图例（小区PCI渲染开启后显示；双击跳转默认设置） */}
+            <PciModLegend items={pciRenderLegendItems} stats={pciRenderStats} onItemDoubleClick={handlePciRenderLegendDoubleClick} />
             {/* 热力图图例（连续渐变色带 + 权重 min/max + 点数） */}
             <HeatmapLegend items={heatmapLegendItems} stats={heatmapStats} onItemDoubleClick={handleHeatmapLegendItemDoubleClick} />
 
@@ -3082,6 +3332,29 @@ export function MapPage() {
           open={newLayerDialogOpen}
           onClose={() => setNewLayerDialogOpen(false)}
           onCreated={handleLayerCreated}
+        />
+      )}
+
+      {/* 条件选择弹窗：两图层属性按地理位置空间连接并导出 Excel */}
+      {viewMode === 'online' && (
+        <AttributeJoinDialog
+          open={joinDialogOpen}
+          onClose={() => setJoinDialogOpen(false)}
+          layers={layers}
+          layerFiles={layerFiles}
+          pointFiles={pointFiles}
+        />
+      )}
+
+      {/* 绘制缓冲区弹窗：参考图层按米制球面距离生成缓冲多边形并直接保存 */}
+      {viewMode === 'online' && (
+        <BufferDialog
+          open={bufferDialogOpen}
+          onClose={() => setBufferDialogOpen(false)}
+          layers={layers}
+          layerFiles={layerFiles}
+          pointFiles={pointFiles}
+          onSaved={handleBufferSaved}
         />
       )}
 

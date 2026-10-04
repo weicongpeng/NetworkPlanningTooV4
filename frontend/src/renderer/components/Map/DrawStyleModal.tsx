@@ -8,8 +8,8 @@ const PRESET_COLORS = ['#ff6b6b', '#4dabf7', '#51cf66', '#fcc419', '#9775fa', '#
 
 const DEFAULT_STYLES: Record<DrawGeometryType, any> = {
   point: { markerShape: 'circle', markerSize: 8, markerColor: '#ff6b6b', borderColor: '#cc2b2b' },
-  line: { color: '#ff6b6b', weight: 2.5, opacity: 0.95, dashArray: '' },
-  polygon: { fillColor: '#ff6b6b', fillOpacity: 0.3, borderColor: '#cc2b2b', borderWidth: 2, borderDash: '', shape: 'polygon' },
+  line: { color: '#ff6b6b', weight: 2.5, opacity: 1, dashArray: '' },
+  polygon: { fillColor: '#ff6b6b', fillOpacity: 1, borderColor: '#cc2b2b', borderWidth: 2, borderDash: '', shape: 'polygon' },
 }
 
 const DASH_OPTIONS: Array<{ value: string; key: string; fallback: string }> = [
@@ -217,6 +217,15 @@ export default function DrawStyleModal({ open, tab, onClose }: DrawStyleModalPro
                 <option value="10,10">{t('map.lineLongDash') || '长虚线'}</option>
                 <option value="2,4">{t('map.lineDotted') || '点线'}</option>
               </select>
+            </div>
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-xs text-muted-foreground">{t('map.lineArrow') || '带方向线段的线'}</span>
+              <input
+                type="checkbox"
+                checked={!!current.arrow}
+                onChange={(e) => update({ arrow: e.target.checked })}
+                className="layer-standard-checkbox"
+              />
             </div>
           </div>
         )}

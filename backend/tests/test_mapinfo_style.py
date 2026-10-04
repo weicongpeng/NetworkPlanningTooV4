@@ -3,7 +3,7 @@
 
 覆盖:
 - _convert_to_geojson 坐标转换（WGS84→GCJ02）
-- MapInfo Pen/Brush/Symbol 单整数颜色 BGR 还原
+- MapInfo Pen/Brush/Symbol 单整数颜色 RGB 还原
 - 按属性关键词分色废弃
 """
 from typing import Dict, Any
@@ -70,17 +70,17 @@ def test_convert_to_geojson_transforms_all_geometry_types():
 
 
 # ---------------------------------------------------------------------------
-# Task 3: MapInfo 单整数颜色解析（BGR 还原）
-# MapInfo 官方规范: Color = R + G*256 + B*65536（R 在最低字节）。
-# 16711680 = 0xFF0000 → B=0xFF → #0000ff（蓝色）。
+# Task 3: MapInfo 单整数颜色解析（RGB 还原）
+# MapInfo 官方规范: Color = R*65536 + G*256 + B（R 在最高字节，与 .map 中 R,G,B 字节序一致）。
+# 16711680 = 0xFF0000 → R=0xFF → #ff0000（红色）。
 # ---------------------------------------------------------------------------
 
 
 def test_parse_pen_single_integer_color():
     """Pen(width, pattern, color_int) 单整数颜色按官方规范还原为 #rrggbb"""
-    style = MapInfoParser._parse_style_value("Pen", "1,2,16711680")  # 16711680 = 0xFF0000 → #0000ff
+    style = MapInfoParser._parse_style_value("Pen", "1,2,16711680")  # 16711680 = 0xFF0000 → #ff0000
     assert style is not None
-    assert style["strokeColor"] == "#0000ff"
+    assert style["strokeColor"] == "#ff0000"
     assert style["strokeWidth"] == 1.0
 
 
@@ -88,8 +88,15 @@ def test_parse_pen_gdal_prefixed_format():
     """GDAL 读外部 MIF 时样式列带 'Pen (...)' 前缀+括号，应同样正确解析"""
     style = MapInfoParser._parse_style_value("MAPINFO_Pen", "Pen (2, 2, 16711680)")
     assert style is not None
-    assert style["strokeColor"] == "#0000ff"
+    assert style["strokeColor"] == "#ff0000"
     assert style["strokeWidth"] == 2.0
+
+
+def test_parse_pen_blue_single_integer_color():
+    """边界：255 = 0x0000FF → 蓝（确认不是把低字节当 R）"""
+    style = MapInfoParser._parse_style_value("Pen", "1,2,255")
+    assert style is not None
+    assert style["strokeColor"] == "#0000ff"
 
 
 def test_parse_pen_black_color():
@@ -111,7 +118,7 @@ def test_parse_brush_single_integer_color():
     """Brush(pattern, forecolor, [backcolor]) 单整数前景色还原"""
     style = MapInfoParser._parse_style_value("Brush", "2,16711680,16777215")
     assert style is not None
-    assert style["fillColor"] == "#0000ff"
+    assert style["fillColor"] == "#ff0000"      # 16711680 = 0xFF0000 → 红
     assert style["fillBgColor"] == "#ffffff"  # 16777215 = 0xFFFFFF → #ffffff
     assert style["fill"] is True
 
@@ -120,7 +127,7 @@ def test_parse_symbol_single_integer_color():
     """Symbol(shape, color, size) 单整数颜色还原"""
     style = MapInfoParser._parse_style_value("Symbol", "34,16711680,12")
     assert style is not None
-    assert style["markerColor"] == "#0000ff"
+    assert style["markerColor"] == "#ff0000"
 
 
 def test_infer_style_from_properties_returns_none():

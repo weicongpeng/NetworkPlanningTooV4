@@ -214,7 +214,7 @@ export default function MapExportDialog({ open, onClose, layerFiles }: MapExport
                 key={key}
                 className="flex items-center gap-2 px-3 py-2 text-xs text-foreground hover:bg-muted cursor-pointer border-b border-border last:border-b-0"
               >
-                <input type="checkbox" checked={checked} onChange={() => toggle(key)} />
+                <input type="checkbox" className="layer-standard-checkbox" checked={checked} onChange={() => toggle(key)} />
                 {f.kind === 'mapinfo'
                   ? <FileArchive size={13} className="text-muted-foreground flex-shrink-0" />
                   : <FileSpreadsheet size={13} className="text-muted-foreground flex-shrink-0" />}

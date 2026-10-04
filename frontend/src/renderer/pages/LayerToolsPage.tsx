@@ -7,9 +7,11 @@ import { layerToolsApi, type LayerExcelInfo, type GenerateLayerResult } from '..
 import { uploadStore } from '../store/uploadStore'
 import { LayerAttributeConfig } from '../components/layer/LayerAttributeConfig'
 import { LAYER_DEFAULT_PARAMS, PRESET_COLORS } from '../config/layer-config'
+import { NO_FILL_COLOR } from '../utils/fieldValue'
 
 type LayerFormat = 'tab' | 'mif' | 'kml'
 const ALL_FORMATS: LayerFormat[] = ['tab', 'mif', 'kml']
+const DEFAULT_FORMATS: LayerFormat[] = ['tab']   // 输出格式默认仅勾选 TAB
 
 // 页面级共享文件状态：一份文件同时作用于扇区/点图两个 Tab
 interface SharedFile {
@@ -36,7 +38,7 @@ function loadSharedFile(): SharedFile {
 }
 
 interface TabState {
-  _v: number              // 状态版本标记：2=已迁移到 0-100 透明度语义；迁移只对旧版 payload 执行一次
+  _v: number              // 状态版本标记：2=新版字段结构（borderColor/fillColor 拆分）；仅用于区分旧版 payload，避免重复迁移
   selectedFields: Record<string, string>
   fieldMappings: Record<string, string>
   radiusM: string          // 字符串受控，避免删空变 0 / 前导 0
@@ -46,7 +48,6 @@ interface TabState {
   pointShape: string
   borderColor: string      // 边框颜色（扇区）
   fillColor: string        // 填充颜色（扇区内部；点图存颜色用）
-  opacity: string          // 透明度 0-100（字符串受控；0=不透明，100=全透明）
   color: string            // 旧字段兼容（保留读写，避免旧 sessionStorage 数据丢失）
   formats: LayerFormat[]   // 多格式勾选
   result: GenerateLayerResult | null
@@ -56,24 +57,23 @@ interface TabState {
 const STORAGE_KEYS = { sector: 'layerTools.sector', point: 'layerTools.point' }
 
 // 旧默认值（v2 时代）——用于迁移：仅当用户字段仍等于旧默认值时才更新为新默认值，
-// 避免覆盖用户自定义值。仅迁移默认相关的字段（颜色/点大小/透明度/线宽）。
+// 避免覆盖用户自定义值。仅迁移默认相关的字段（颜色/点大小）。
 // 字段值为数组：当前字段等于任一旧默认值即迁移到新默认（支持多代默认链）。
 const OLD_DEFAULTS_V2: Record<'sector' | 'point', {
   borderColor: string[]
   fillColor?: string[]
-  opacity: number[]
   pointSize?: number[]
   lineWidth?: number[]
 }> = {
-  sector: { lineWidth: [2], borderColor: ['#4A90D9'], fillColor: ['#4A90D9'], opacity: [0] },
+  sector: { lineWidth: [2], borderColor: ['#4A90D9'], fillColor: ['#4A90D9'] },
   // pointSize 历史默认链：8(原始) → 15(上轮) → 12(本轮)
-  point: { pointSize: [8, 15], borderColor: ['#FF0000'], opacity: [0] },
+  point: { pointSize: [8, 15], borderColor: ['#FF0000'] },
 }
 
 function emptyTabState(type: 'sector' | 'point'): TabState {
   const dp = type === 'sector' ? LAYER_DEFAULT_PARAMS.sector : LAYER_DEFAULT_PARAMS.point
   return {
-    _v: 2,                 // 当前版本：0-100 透明度语义
+    _v: 2,
     selectedFields: {},
     fieldMappings: {},
     radiusM: type === 'sector' ? String(LAYER_DEFAULT_PARAMS.sector.radiusM) : '',
@@ -84,9 +84,8 @@ function emptyTabState(type: 'sector' | 'point'): TabState {
     borderColor: dp.borderColor,
     // 点图 Tab 用 fillColor 存颜色（后端点图颜色按边框语义应用，border_color 接收 fillColor）
     fillColor: type === 'sector' ? LAYER_DEFAULT_PARAMS.sector.fillColor : dp.borderColor,
-    opacity: String(dp.opacity),
     color: dp.borderColor,   // 旧字段兼容
-    formats: ['tab', 'mif', 'kml'],
+    formats: [...DEFAULT_FORMATS],
     result: null,
     error: '',
   }
@@ -98,14 +97,13 @@ function loadState(key: string, type: 'sector' | 'point'): TabState {
     const raw = sessionStorage.getItem(key)
     if (raw) {
       const saved = JSON.parse(raw)
-      // 已带版本标记（_v === 2）→ 采用，但迁移默认字段：仅当字段仍等于旧默认值时才更新为新默认
+      delete saved.opacity   // 透明度设置已移除：清理旧 payload 残留字段
+      let merged: TabState
       if (saved._v === 2) {
+        // 已带版本标记 → 采用，但迁移默认字段：仅当字段仍等于旧默认值时才更新为新默认
         const oldD = OLD_DEFAULTS_V2[type]
-        const merged = { ...emptyTabState(type), ...saved }
+        merged = { ...emptyTabState(type), ...saved }
         // 迁移判断：当前字段值等于任一旧默认值（数组 includes）才更新为新默认
-        if (saved.opacity !== undefined && oldD.opacity.includes(Number(saved.opacity))) {
-          merged.opacity = String(LAYER_DEFAULT_PARAMS[type].opacity)
-        }
         if (oldD.borderColor.includes(saved.borderColor)) {
           merged.borderColor = LAYER_DEFAULT_PARAMS[type].borderColor
         }
@@ -122,22 +120,20 @@ function loadState(key: string, type: 'sector' | 'point'): TabState {
             merged.fillColor = LAYER_DEFAULT_PARAMS.sector.fillColor
           }
         }
-        return merged
+      } else {
+        // 旧版（v1）payload 迁移，仅执行一次：
+        // 迁移1：旧版只有 color（原"填充颜色"实为边框色），新版拆分为 borderColor/fillColor
+        if (saved.color && !saved.borderColor) saved.borderColor = saved.color
+        if (saved.color && !saved.fillColor && type === 'sector') saved.fillColor = saved.color
+        // 迁移2：点图旧 borderColor（存着颜色值）→ 新 fillColor（点图 Tab 用 fillColor 存颜色）
+        if (type === 'point' && saved.borderColor && !saved.fillColor) saved.fillColor = saved.borderColor
+        merged = { ...emptyTabState(type), ...saved, _v: 2 }
       }
-      // 旧版（v1）payload 迁移，仅执行一次：
-      // 迁移1：旧版只有 color（原"填充颜色"实为边框色），新版拆分为 borderColor/fillColor/opacity
-      if (saved.color && !saved.borderColor) saved.borderColor = saved.color
-      if (saved.color && !saved.fillColor && type === 'sector') saved.fillColor = saved.color
-      // 迁移2：点图旧 borderColor（存着颜色值）→ 新 fillColor（点图 Tab 用 fillColor 存颜色）
-      if (type === 'point' && saved.borderColor && !saved.fillColor) saved.fillColor = saved.borderColor
-      // 迁移3：透明度语义从 0-1（不透明度）反转为 0-100（透明度）。旧 0.6（不透明度 60%）→ 新 40
-      // 检测旧语义：数值在 (0,1] 区间（旧值范围）。排除 0：新默认 0（完全不透明）会在挂载后立即写入
-      // sessionStorage，若把 0 也当旧值迁移，页面刷新会把默认值 0 错迁为 100（全透明）
-      const savedOpacity = Number(saved.opacity)
-      if (saved.opacity !== undefined && saved.opacity !== '' && savedOpacity > 0 && savedOpacity <= 1) {
-        saved.opacity = String(Math.round((1 - savedOpacity) * 100))
+      // 输出格式默认由三格式全选改为仅 TAB：仅当仍是旧默认全选时才迁移，避免覆盖用户自选
+      if (Array.isArray(merged.formats) && ALL_FORMATS.every(f => merged.formats.includes(f))) {
+        merged.formats = [...DEFAULT_FORMATS]
       }
-      return { ...emptyTabState(type), ...saved, _v: 2 }
+      return merged
     }
   } catch { /* ignore */ }
   return emptyTabState(type)
@@ -271,6 +267,11 @@ export default function LayerToolsPage() {
         setState(s => ({ ...s, error: t('layer.errMissingFields') }))
         return
       }
+      // 边框与填充同时无色 → 扇区不可见，直接拦截
+      if (state.borderColor === NO_FILL_COLOR && state.fillColor === NO_FILL_COLOR) {
+        setState(s => ({ ...s, error: t('layer.errBothNoColor') }))
+        return
+      }
     } else {
       if (!state.fieldMappings.name || !state.fieldMappings.longitude || !state.fieldMappings.latitude) {
         setState(s => ({ ...s, error: t('layer.errMissingFieldsPoint') }))
@@ -280,9 +281,9 @@ export default function LayerToolsPage() {
     setGenerating(true)
     setState(s => ({ ...s, error: '', result: null }))
     try {
-      // 透明度：前端 0-100 滑块值 → 后端 opacity(0-1，语义为透明度)
-      // v=0 → opacity=0 → 不透明；v=100 → opacity=1 → 全透明。注意不是 (100-v)/100！
-      const v = Number.isFinite(parseFloat(state.opacity)) ? parseFloat(state.opacity) : 0
+      // 颜色语义（'none' = 无色）：
+      //   扇区：color(旧单值)=边框色；边框无色时不描边、填充无色时镂空
+      //   点图：color(旧单值)=填充色（无色时回退轮廓色）；borderColor=空心点轮廓色
       const base = {
         filePath: sharedFile.filePath,
         sourceFilename: sharedFile.sourceFilename,
@@ -292,13 +293,14 @@ export default function LayerToolsPage() {
         latCol: state.fieldMappings.latitude,
         attributes: Object.values(state.selectedFields),
         outputFormats: state.formats,
-        color: isSector ? state.borderColor : state.fillColor,
-        borderColor: isSector ? state.borderColor : state.fillColor,
+        color: isSector
+          ? (state.borderColor === NO_FILL_COLOR ? state.fillColor : state.borderColor)
+          : (state.fillColor === NO_FILL_COLOR ? state.borderColor : state.fillColor),
+        borderColor: state.borderColor,
         fillColor: state.fillColor,
         lineWidth: parseInt(state.lineWidth) || 2,
         pointSize: parseFloat(state.pointSize) || LAYER_DEFAULT_PARAMS.point.pointSize,
         pointShape: state.pointShape,
-        opacity: v / 100
       }
       const data = isSector
         ? await layerToolsApi.generateSector({
@@ -347,9 +349,21 @@ export default function LayerToolsPage() {
     },
   })
 
-  // 常用色块快捷选择
-  const colorSwatches = (value: string, onChange: (v: string) => void) => (
+  // 常用色块快捷选择（allowNone 时带"无色"按钮：该颜色不绘制）
+  const colorSwatches = (value: string, onChange: (v: string) => void, allowNone = false) => (
     <div className="flex flex-wrap gap-1 mt-1">
+      {allowNone && (
+        <button type="button"
+          onClick={() => onChange(NO_FILL_COLOR)}
+          aria-label={t('layer.noFillColor')}
+          aria-pressed={value === NO_FILL_COLOR}
+          title={t('layer.noFillColor')}
+          className={`relative w-5 h-5 rounded-sm border overflow-hidden bg-card ${value === NO_FILL_COLOR ? 'border-primary ring-1 ring-primary' : 'border-border'}`}>
+          <svg className="absolute inset-0 w-full h-full" viewBox="0 0 24 24" preserveAspectRatio="none">
+            <line x1="3" y1="21" x2="21" y2="3" stroke="#ef4444" strokeWidth="2.5" />
+          </svg>
+        </button>
+      )}
       {PRESET_COLORS.map(c => {
         const selected = value.toLowerCase() === c.toLowerCase()
         return (
@@ -362,6 +376,17 @@ export default function LayerToolsPage() {
             style={{ backgroundColor: c }} />
         )
       })}
+    </div>
+  )
+
+  // 颜色字段：色板（"无色"时 input[type=color] 显示白色占位，选色即恢复为具体颜色）
+  const colorField = (label: string, value: string, onChange: (v: string) => void, allowNone = false) => (
+    <div>
+      <label className="block text-xs font-medium mb-1">{label}</label>
+      <input type="color" value={value === NO_FILL_COLOR ? '#FFFFFF' : value}
+        onChange={e => onChange(e.target.value)}
+        className="w-full h-9 cursor-pointer" />
+      {colorSwatches(value, onChange, allowNone)}
     </div>
   )
 
@@ -404,39 +429,32 @@ export default function LayerToolsPage() {
           </div>
         </div>
       )}
-      {/* 颜色：扇区显示"边框颜色"（borderColor state）；点图显示"填充颜色"（fillColor state） */}
-      <div>
-        <label className="block text-xs font-medium mb-1">
-          {isSector ? t('layer.borderColor') : t('layer.fillColor')}
-        </label>
-        <input type="color" value={isSector ? ts.borderColor : ts.fillColor}
-          onChange={e => isSector
-            ? setTab(s => ({ ...s, borderColor: e.target.value, color: e.target.value }))
-            : setTab(s => ({ ...s, fillColor: e.target.value, color: e.target.value }))}
-          className="w-full h-9 cursor-pointer" />
-        {colorSwatches(isSector ? ts.borderColor : ts.fillColor, (v) => isSector
-          ? setTab(s => ({ ...s, borderColor: v, color: v }))
-          : setTab(s => ({ ...s, fillColor: v, color: v })))}
-      </div>
-      {/* 填充颜色（仅扇区；点图颜色已由上面"填充颜色"块承载） */}
-      {isSector && (
-        <div>
-          <label className="block text-xs font-medium mb-1">{t('layer.fillColor')}</label>
-          <input type="color" value={ts.fillColor} onChange={e => setTab(s => ({ ...s, fillColor: e.target.value }))}
-            className="w-full h-9 cursor-pointer" />
-          {colorSwatches(ts.fillColor, (v) => setTab(s => ({ ...s, fillColor: v })))}
-        </div>
+      {/* 颜色：扇区 = 边框颜色 + 填充颜色（均可无色：不描边 / 镂空）；
+          点图 = 填充颜色（无色 → 空心点），填充无色时显示空心轮廓色 */}
+      {colorField(
+        isSector ? t('layer.borderColor') : t('layer.fillColor'),
+        isSector ? ts.borderColor : ts.fillColor,
+        (v) => setTab(s => {
+          if (!isSector && v === NO_FILL_COLOR && s.fillColor !== NO_FILL_COLOR) {
+            // 点图转无色：把原填充色留给轮廓色，避免空心点颜色突变
+            return { ...s, fillColor: v, borderColor: s.fillColor, color: s.fillColor }
+          }
+          return isSector
+            ? { ...s, borderColor: v, color: v }
+            : { ...s, fillColor: v, color: v }
+        }),
+        true,
       )}
-      {/* 透明度 0-100：0=不透明，100=全透明（仅扇区；点图无透明度概念） */}
-      {isSector && (
-        <div className="col-span-2">
-          <label className="block text-xs font-medium mb-1">{t('layer.opacity')}</label>
-          <input {...numberInput(ts.opacity, (v) => setTab(s => ({ ...s, opacity: v })))}
-            placeholder="0"
-            className="w-full h-9 px-2 text-sm border border-border rounded bg-card" />
-          <p className="text-[10px] text-muted-foreground mt-1">{t('layer.opacityHint')}</p>
-        </div>
-      )}
+      {isSector
+        ? colorField(t('layer.fillColor'), ts.fillColor,
+            (v) => setTab(s => ({ ...s, fillColor: v })), true)
+        : ts.fillColor === NO_FILL_COLOR && (
+            <div className="col-span-2">
+              {colorField(t('layer.borderColor'), ts.borderColor,
+                (v) => setTab(s => ({ ...s, borderColor: v })))}
+              <p className="text-[10px] text-muted-foreground mt-1">{t('layer.hollowPointHint')}</p>
+            </div>
+          )}
       {/* 输出格式多选勾选 */}
       <div className="col-span-2">
         <label className="block text-xs font-medium mb-1">{t('layer.formats')}</label>
@@ -457,9 +475,6 @@ export default function LayerToolsPage() {
             </label>
           ))}
         </div>
-        {ts.formats.includes('tab') && !ts.formats.some(f => f !== 'tab') && (
-          <p className="text-[10px] text-muted-foreground mt-1">{t('layer.colorTabHint')}</p>
-        )}
       </div>
     </div>
   )
@@ -537,6 +552,7 @@ export default function LayerToolsPage() {
   )
 
   // 渲染 Tab 内容（扇区/点图共用骨架，参数和校验差异；文件共享，读 sharedFile）
+  // 三张卡片横向铺满、纵向撑满：数据来源（文件导入 + Sheet）/ 图层属性 / 参数设置 + 生成
   const renderTabContent = (
     ts: TabState,
     setTab: (u: (s: TabState) => TabState) => void,
@@ -544,76 +560,11 @@ export default function LayerToolsPage() {
     onSheetChange: (sheet: string) => void,
     includeAzimuth: boolean,
   ) => (
-    <div className="grid grid-cols-5 gap-6">
-      {/* 左栏（3/5） */}
-      <div className="col-span-3 space-y-6">
-        {/* ② Sheet 选择 */}
-        <div className="p-4 bg-card border border-border rounded-lg">
-          <label htmlFor={`layer-sheet-${activeTab}`} className="block text-xs font-medium mb-2">{t('layer.selectSheet')}</label>
-          <select id={`layer-sheet-${activeTab}`} value={file.sheetName}
-            onChange={e => onSheetChange(e.target.value)}
-            disabled={!file.info || file.info.sheets.length <= 1}
-            className="w-full h-9 px-2 text-sm border border-border rounded bg-card disabled:opacity-50">
-            {file.info && file.info.sheets.length > 0
-              ? file.info.sheets.map(s => <option key={s} value={s}>{s}</option>)
-              : <option value="">{t('layer.importHint')}</option>}
-          </select>
-        </div>
-
-        {/* ③ 属性配置 */}
-        <div className="p-4 bg-card border border-border rounded-lg">
-          <LayerAttributeConfig
-            columns={file.columns}
-            includeAzimuth={includeAzimuth}
-            selectedFields={ts.selectedFields}
-            onSelectedFieldsChange={(v) => setTab(s => ({ ...s, selectedFields: v }))}
-            fieldMappings={ts.fieldMappings}
-            onFieldMappingsChange={(v) => setTab(s => ({ ...s, fieldMappings: v }))}
-          />
-        </div>
-      </div>
-
-      {/* 右栏（2/5） */}
-      <div className="col-span-2 space-y-6">
-        {/* ④ 参数设置 */}
-        <div className="p-4 bg-card border border-border rounded-lg">
-          <p className="text-xs font-medium mb-3">{t('layer.params')}</p>
-          {renderParams(ts, setTab)}
-        </div>
-
-        {/* ⑤ 生成 + 下载 */}
-        <div className="p-4 bg-card border border-border rounded-lg">
-          <button onClick={handleGenerate} disabled={generating || !file.filePath || !file.sheetName}
-            className="w-full px-6 py-2.5 bg-primary text-primary-foreground rounded-lg hover:opacity-90 disabled:opacity-50 text-sm font-medium">
-            {generating ? <Loader2 size={16} className="animate-spin inline mr-2" /> : null}
-            {t('layer.generate')}
-          </button>
-          {renderResult(ts)}
-        </div>
-      </div>
-    </div>
-  )
-
-  // 共享文件 Sheet 切换：只改 sharedFile（两个 Tab 的配置各自保留）
-  const handleSheetChange = (sheet: string) => {
-    persistSharedFile(f => ({ ...f, sheetName: sheet, columns: f.info?.columns[sheet] || [] }))
-  }
-
-  // 切换 Tab：清空非激活 Tab 的旧下载结果（按钮+统计），避免交叉显示；配置各自保留
-  const handleTabChange = (v: 'sector' | 'point') => {
-    setActiveTab(v)
-    if (v === 'point') setSectorState(s => ({ ...s, result: null }))
-    else setPointState(s => ({ ...s, result: null }))
-  }
-
-  return (
-    <div className="p-8 max-w-6xl">
-      <h1 className="text-base font-bold mb-6">{t('nav.layerTools')}</h1>
-
-      <Tabs.Root value={activeTab} onValueChange={(v) => handleTabChange(v as 'sector' | 'point')}>
-        {/* ① 文件导入（共享，最上层，宽度与下方左栏卡片对齐：grid-cols-5 中占 col-span-3） */}
-        <div className="mb-6 grid grid-cols-5 gap-6">
-          <div className="col-span-3 p-4 bg-card border border-border rounded-lg">
+    <div className="flex-1 grid grid-cols-1 lg:grid-cols-12 gap-6">
+      {/* 卡片①（3/12）：数据来源 = 文件导入 + Sheet 选择 */}
+      <div className="lg:col-span-3 flex flex-col">
+        <div className="flex-1 p-4 bg-card border border-border rounded-lg flex flex-col gap-4">
+          <div>
             <p className="text-xs font-medium mb-3">{t('layer.fileImport')}</p>
             <label
               onDragOver={(e) => { e.preventDefault(); setDragActive(true) }}
@@ -622,10 +573,10 @@ export default function LayerToolsPage() {
                 if (!e.currentTarget.contains(e.relatedTarget as Node)) setDragActive(false)
               }}
               onDrop={(e) => { e.preventDefault(); setDragActive(false); const f = e.dataTransfer.files?.[0]; if (f) processFile(f) }}
-              className={`block flex items-center gap-3 px-4 py-3 border-2 border-dashed rounded-lg cursor-pointer transition-colors ${dragActive ? 'border-primary bg-primary/5' : 'border-border hover:border-primary'}`}>
+              className={`flex items-center gap-3 px-3 py-3 border-2 border-dashed rounded-lg cursor-pointer transition-colors ${dragActive ? 'border-primary bg-primary/5' : 'border-border hover:border-primary'}`}>
               <FileUp className="text-muted-foreground shrink-0" size={20} />
               <div className="flex-1 min-w-0">
-                <p className="text-sm truncate">{sharedFile.fileName || (dragActive ? t('layer.dropHere') : t('layer.uploadExcel'))}</p>
+                <p className="text-sm truncate">{file.fileName || (dragActive ? t('layer.dropHere') : t('layer.uploadExcel'))}</p>
                 <p className="text-xs text-muted-foreground">{t('layer.acceptExcel')}</p>
               </div>
               <input type="file" className="hidden" accept=".xlsx,.xls,.txt,.csv" onChange={handleFile} disabled={uploading} />
@@ -647,10 +598,74 @@ export default function LayerToolsPage() {
               </div>
             )}
           </div>
-        </div>
 
-        {/* ② 扇区/点图 Tab（下移） */}
-        <Tabs.List className="flex gap-2 mb-6 border-b border-border" aria-label={t('nav.layerTools')}>
+          <div>
+            <label htmlFor={`layer-sheet-${activeTab}`} className="block text-xs font-medium mb-2">{t('layer.selectSheet')}</label>
+            <select id={`layer-sheet-${activeTab}`} value={file.sheetName}
+              onChange={e => onSheetChange(e.target.value)}
+              disabled={!file.info || file.info.sheets.length <= 1}
+              className="w-full h-9 px-2 text-sm border border-border rounded bg-card disabled:opacity-50">
+              {file.info && file.info.sheets.length > 0
+                ? file.info.sheets.map(s => <option key={s} value={s}>{s}</option>)
+                : <option value="">{t('layer.importHint')}</option>}
+            </select>
+          </div>
+        </div>
+      </div>
+
+      {/* 卡片②（5/12）：图层属性配置 */}
+      <div className="lg:col-span-5 flex flex-col">
+        <div className="flex-1 p-4 bg-card border border-border rounded-lg">
+          <LayerAttributeConfig
+            columns={file.columns}
+            includeAzimuth={includeAzimuth}
+            selectedFields={ts.selectedFields}
+            onSelectedFieldsChange={(v) => setTab(s => ({ ...s, selectedFields: v }))}
+            fieldMappings={ts.fieldMappings}
+            onFieldMappingsChange={(v) => setTab(s => ({ ...s, fieldMappings: v }))}
+          />
+        </div>
+      </div>
+
+      {/* 卡片③（4/12）：参数设置 + 生成/下载（按钮紧跟参数下方，下方留白由卡片撑满） */}
+      <div className="lg:col-span-4 flex flex-col">
+        <div className="flex-1 p-4 bg-card border border-border rounded-lg flex flex-col">
+          <p className="text-xs font-medium mb-3">{t('layer.params')}</p>
+          {renderParams(ts, setTab)}
+          {/* 生成按钮紧跟参数（输出格式）下方，卡片剩余空白留在按钮下方 */}
+          <div className="mt-4 pt-4 border-t border-border">
+            <button onClick={handleGenerate} disabled={generating || !file.filePath || !file.sheetName}
+              className="w-full px-6 py-2.5 bg-primary text-primary-foreground rounded-lg hover:opacity-90 disabled:opacity-50 text-sm font-medium">
+              {generating ? <Loader2 size={16} className="animate-spin inline mr-2" /> : null}
+              {t('layer.generate')}
+            </button>
+            {renderResult(ts)}
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+
+  // 共享文件 Sheet 切换：只改 sharedFile（两个 Tab 的配置各自保留）
+  const handleSheetChange = (sheet: string) => {
+    persistSharedFile(f => ({ ...f, sheetName: sheet, columns: f.info?.columns[sheet] || [] }))
+  }
+
+  // 切换 Tab：清空非激活 Tab 的旧下载结果（按钮+统计），避免交叉显示；配置各自保留
+  const handleTabChange = (v: 'sector' | 'point') => {
+    setActiveTab(v)
+    if (v === 'point') setSectorState(s => ({ ...s, result: null }))
+    else setPointState(s => ({ ...s, result: null }))
+  }
+
+  return (
+    <div className="p-8 w-full flex-1 flex flex-col">
+      <h1 className="text-base font-bold mb-6">{t('nav.layerTools')}</h1>
+
+      <Tabs.Root value={activeTab} onValueChange={(v) => handleTabChange(v as 'sector' | 'point')}
+        className="flex-1 flex flex-col">
+        {/* ① 扇区/点图 Tab */}
+        <Tabs.List className="flex gap-2 mb-6 border-b border-border shrink-0" aria-label={t('nav.layerTools')}>
           <Tabs.Trigger value="sector"
             className="px-4 py-2 text-sm font-medium rounded-t-lg transition-colors data-[state=active]:bg-card data-[state=active]:text-primary data-[state=active]:border-b-2 data-[state=active]:border-primary data-[state=inactive]:text-muted-foreground data-[state=inactive]:hover:text-foreground">
             {t('layer.sectorLayer')}
@@ -661,14 +676,14 @@ export default function LayerToolsPage() {
           </Tabs.Trigger>
         </Tabs.List>
 
-        {/* 扇区 Tab */}
-        <Tabs.Content value="sector" className="mt-6 data-[state=inactive]:hidden">
+        {/* ② 三张卡片（数据来源 / 图层属性 / 参数设置+生成）横向铺满、纵向撑满剩余高度 */}
+        <Tabs.Content value="sector" className="flex-1 flex flex-col data-[state=inactive]:hidden">
           {renderTabContent(sectorState, (u) => setSectorState(s => u(s)), sharedFile, handleSheetChange, true)}
           {sectorState.error && <p className="mt-4 text-xs text-red-500">{sectorState.error}</p>}
         </Tabs.Content>
 
         {/* 点图 Tab */}
-        <Tabs.Content value="point" className="mt-6 data-[state=inactive]:hidden">
+        <Tabs.Content value="point" className="flex-1 flex flex-col data-[state=inactive]:hidden">
           {renderTabContent(pointState, (u) => setPointState(s => u(s)), sharedFile, handleSheetChange, false)}
           {pointState.error && <p className="mt-4 text-xs text-red-500">{pointState.error}</p>}
         </Tabs.Content>

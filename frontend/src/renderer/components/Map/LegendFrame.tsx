@@ -14,7 +14,7 @@ import type { CSSProperties, PointerEvent as ReactPointerEvent, ReactNode } from
 import { Move } from 'lucide-react'
 import { useMapStore, type LegendLayout } from '../../store/mapStore'
 
-export type LegendLayoutKey = 'thematic' | 'heatmap'
+export type LegendLayoutKey = 'thematic' | 'heatmap' | 'pci-mod'
 
 /** 浮窗最小尺寸（拖拽缩放下限） */
 const MIN_WIDTH = 140

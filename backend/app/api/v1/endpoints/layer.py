@@ -155,9 +155,9 @@ async def generate_point(
     attributes: str = Form("[]"),  # JSON 数组字符串
     output_formats: Optional[str] = Form(None),   # 逗号分隔多选，优先
     output_format: str = Form("tab"),             # 旧单值，兼容
-    color: Optional[str] = Form(None),            # 旧单值：点图按边框语义应用
-    border_color: Optional[str] = Form(None),
-    fill_color: Optional[str] = Form(None),
+    color: Optional[str] = Form(None),            # 旧单值：点颜色（fill_color 缺省时用）
+    border_color: Optional[str] = Form(None),     # 轮廓色：fill_color 为"无色"时的空心点轮廓
+    fill_color: Optional[str] = Form(None),       # 点填充色；'none'=无色（生成空心点）
     opacity: Optional[float] = Form(None),        # 0-1
     point_size: Optional[float] = Form(None),     # 点大小（像素，MIF Symbol size / KML scale）
     point_shape: Optional[str] = Form(None),      # 点形状（circle/square/diamond/triangle/triangle_down/landmark/pin）
@@ -183,7 +183,7 @@ async def generate_point(
                 layer_service.generate_point_layer,
                 str(src), sheet_name, name_col, lon_col, lat_col,
                 attr_list, fmt, color or None, original_name,
-                border_color or color, None, opacity,
+                border_color or color, fill_color, opacity,
                 point_size, point_shape,
             )
             outs.append(out)

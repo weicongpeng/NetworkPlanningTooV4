@@ -5,18 +5,35 @@
  * 供圈选、点选工具使用）不同：
  * - 点要素：点击点距要素的像素距离 ≤ 容差
  * - 线要素：点击点到任一折线段的像素距离 ≤ 容差
- * - 面要素：点击点落在封闭区域内（射线法，外环/孔洞按奇偶规则叠加），
- *   或距面边框的像素距离 ≤ 容差
+ * - 面要素：点击点落在封闭区域内（射线法，外环/孔洞按奇偶规则叠加，与填充样式无关）
+ *
+ * 命中分两级（FeatureHitType）：
+ * - direct：面填充真正包含点击点，或点/线要素被点击点压中 —— 视为"点中了该要素"
+ * - border：仅面边框在容差内（点击点不在面内）—— 弱命中，仅在没有 direct 命中时生效
  *
  * 解决问题：面状图层中，点击某要素内部时，其他要素即使只有包围盒与点击位置
  * 相交（边框/形状并未覆盖该点）也会被粗检命中，导致误弹「重叠要素」列表。
  * 精确检测只返回封闭区域真正包含点击点的要素，仅当多个要素的填充区域确实
- * 重叠于点击点时才弹出重叠列表。
+ * 重叠于点击点时才弹出重叠列表；多个要素只是边框线条交叠时不算重叠，
+ * 由 resolveHits 穿透到最近边框所属的单个要素。
  */
 import L from 'leaflet'
 
 /** 点击命中容差（像素）：点/线/面边框统一使用 */
 export const CLICK_HIT_TOLERANCE_PX = 12
+
+/**
+ * 命中类型：
+ * - direct：面填充包含点击点（或点/线要素被压中）—— 强命中，多个 direct 才算真重叠
+ * - border：仅面边框在像素容差内 —— 弱命中，边框线条交叠不视为重叠
+ */
+export type FeatureHitType = 'direct' | 'border'
+
+/** 单次命中结果：类型 + 像素距离（border 取最近边框距离，direct 取 0 或要素距离） */
+export interface FeatureHitInfo {
+  type: FeatureHitType
+  distancePx: number
+}
 
 /**
  * 将 Leaflet layer.getLatLngs() 的任意嵌套结构归一化为「环」数组。
@@ -80,12 +97,69 @@ export function minDistanceToRingPx(p: L.Point, ring: L.Point[], closed: boolean
 }
 
 /**
- * 判断点击点是否精确命中指定 Leaflet 子图层。
+ * 判断点击点是否精确命中指定 Leaflet 子图层，并给出命中类型与像素距离。
  *
  * @param map 地图实例（用于 latLng → 容器像素坐标投影）
  * @param layer Leaflet 子图层（CircleMarker/Marker/Polyline/Polygon/Rectangle）
  * @param latlng 点击位置（渲染坐标/GCJ02）
  * @param tolerancePx 像素容差
+ */
+export function layerHitAt(
+  map: L.Map,
+  layer: any,
+  latlng: L.LatLng,
+  tolerancePx: number = CLICK_HIT_TOLERANCE_PX
+): FeatureHitInfo | null {
+  const clickPx = map.latLngToContainerPoint(latlng)
+
+  // 点要素：CircleMarker / Marker（有 getLatLng，无 getLatLngs）—— 点无"面"，距离内即直接命中
+  if (typeof layer.getLatLng === 'function' && typeof layer.getLatLngs !== 'function') {
+    const markerPx = map.latLngToContainerPoint(layer.getLatLng() as L.LatLng)
+    const distance = markerPx.distanceTo(clickPx)
+    return distance <= tolerancePx ? { type: 'direct', distancePx: distance } : null
+  }
+
+  if (typeof layer.getLatLngs === 'function') {
+    const ringsPx = normalizeLatLngRings(layer.getLatLngs()).map(ring =>
+      ring.map(ll => map.latLngToContainerPoint(ll))
+    )
+    if (ringsPx.length === 0) return null
+
+    // Polygon 继承自 Polyline，instanceof 需先判断 Polygon
+    const isPolygon = layer instanceof L.Polygon
+
+    if (isPolygon) {
+      // 面填充：所有环按奇偶规则叠加（点在外环内且在孔洞外 → 命中；
+      // MultiPolygon 任一部分包含即命中）。与 fill 样式无关，镂空面内部同样命中。
+      let inside = false
+      for (const ring of ringsPx) {
+        if (pointInRingPx(clickPx, ring)) inside = !inside
+      }
+      if (inside) return { type: 'direct', distancePx: 0 }
+
+      // 未落在填充区：边框容差内只算弱命中（边框线条交叠不视为重叠）
+      let minDistance = Infinity
+      for (const ring of ringsPx) {
+        const d = minDistanceToRingPx(clickPx, ring, true)
+        if (d < minDistance) minDistance = d
+      }
+      return minDistance <= tolerancePx ? { type: 'border', distancePx: minDistance } : null
+    }
+
+    // 线要素：到折线段距离容差内即命中（线无填充，粗细即命中范围）
+    let minDistance = Infinity
+    for (const ring of ringsPx) {
+      const d = minDistanceToRingPx(clickPx, ring, false)
+      if (d < minDistance) minDistance = d
+    }
+    return minDistance <= tolerancePx ? { type: 'direct', distancePx: minDistance } : null
+  }
+
+  return null
+}
+
+/**
+ * 判断点击点是否精确命中指定 Leaflet 子图层（layerHitAt 的布尔等价形式）。
  */
 export function layerContainsPoint(
   map: L.Map,
@@ -93,42 +167,54 @@ export function layerContainsPoint(
   latlng: L.LatLng,
   tolerancePx: number = CLICK_HIT_TOLERANCE_PX
 ): boolean {
+  return layerHitAt(map, layer, latlng, tolerancePx) !== null
+}
+
+/**
+ * 图层像素包围盒粗检（预筛用，不做精确判定）：
+ * 大量要素（如扇区渲染缓存）逐个精确检测前先用包围盒排除，避免全量投影。
+ * 无法取包围盒（CircleMarker 无 getBounds）时返回 true（不预筛）。
+ *
+ * @param map 地图实例
+ * @param layer Leaflet 子图层
+ * @param latlng 点击位置（渲染坐标/GCJ02）
+ * @param tolerancePx 像素容差（包围盒外扩量）
+ */
+export function layerBoundsHitPx(
+  map: L.Map,
+  layer: any,
+  latlng: L.LatLng,
+  tolerancePx: number = CLICK_HIT_TOLERANCE_PX
+): boolean {
+  const bounds: L.LatLngBounds | undefined = typeof layer?.getBounds === 'function' ? layer.getBounds() : null
+  if (!bounds || !bounds.isValid()) return true
+  const nw = map.latLngToContainerPoint(bounds.getNorthWest())
+  const se = map.latLngToContainerPoint(bounds.getSouthEast())
   const clickPx = map.latLngToContainerPoint(latlng)
+  return clickPx.x >= Math.min(nw.x, se.x) - tolerancePx
+    && clickPx.x <= Math.max(nw.x, se.x) + tolerancePx
+    && clickPx.y >= Math.min(nw.y, se.y) - tolerancePx
+    && clickPx.y <= Math.max(nw.y, se.y) + tolerancePx
+}
 
-  // 点要素：CircleMarker / Marker（有 getLatLng，无 getLatLngs）
-  if (typeof layer.getLatLng === 'function' && typeof layer.getLatLngs !== 'function') {
-    const markerPx = map.latLngToContainerPoint(layer.getLatLng() as L.LatLng)
-    return markerPx.distanceTo(clickPx) <= tolerancePx
+/**
+ * 命中结果收敛（"手形"点击穿透规则）：
+ * - 存在 direct 命中（面填充真正包含点击点 / 点线被压中）时只保留 direct ——
+ *   仅边框线条交叠、面不重叠的要素被剔除，不再误弹重叠列表；
+ * - 全部为 border 命中（点在所有面的填充之外，只是压到边框）时，
+ *   只保留最近的边框所属要素（距离并列取 z 小 = 层级高者），实现"穿透命中"。
+ *
+ * @param hits 命中列表（需带 hitType/distancePx/z；z 越小层级越高）
+ */
+export function resolveHits<T extends { hitType: FeatureHitType; distancePx: number; z: number }>(hits: T[]): T[] {
+  if (hits.length <= 1) return hits
+  const direct = hits.filter(h => h.hitType === 'direct')
+  if (direct.length > 0) return direct
+  let best = hits[0]
+  for (const h of hits) {
+    if (h.distancePx < best.distancePx || (h.distancePx === best.distancePx && h.z < best.z)) best = h
   }
-
-  if (typeof layer.getLatLngs === 'function') {
-    const ringsPx = normalizeLatLngRings(layer.getLatLngs()).map(ring =>
-      ring.map(ll => map.latLngToContainerPoint(ll))
-    )
-    if (ringsPx.length === 0) return false
-
-    // Polygon 继承自 Polyline，instanceof 需先判断 Polygon
-    const isPolygon = layer instanceof L.Polygon
-
-    // 边框/线段容差命中（点击压线/压边框）
-    for (const ring of ringsPx) {
-      if (minDistanceToRingPx(clickPx, ring, isPolygon) <= tolerancePx) return true
-    }
-
-    // 面填充：所有环按奇偶规则叠加（点在外环内且在孔洞外 → 命中；
-    // MultiPolygon 任一部分包含即命中）
-    if (isPolygon) {
-      let inside = false
-      for (const ring of ringsPx) {
-        if (pointInRingPx(clickPx, ring)) inside = !inside
-      }
-      return inside
-    }
-
-    return false
-  }
-
-  return false
+  return [best]
 }
 
 /**

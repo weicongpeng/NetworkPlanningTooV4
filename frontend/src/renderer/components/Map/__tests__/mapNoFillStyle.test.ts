@@ -9,10 +9,11 @@
  * 4. 镂空面仍可被 getFeaturesAtPoint 射线法命中（不依赖 Leaflet 的 fill 命中）
  * 5. 基础/专题边框色 borderColor='none' → 点/面要素 stroke:false（不描边）
  * 6. 线状图层：线色由"图形颜色"（fillColor）驱动，旧版本 borderColor 存线色仍兼容
+ * 7. 点默认边框为无色（不画白边）：文件只声明图形颜色时不得出现白色描边
  */
 import { describe, it, expect, beforeAll } from 'vitest'
 import L from 'leaflet'
-import { MapInfoLayer } from '../MapInfoLayer'
+import { MapInfoLayer, resolvePointShape } from '../MapInfoLayer'
 import { GeoDataLayer } from '../GeoDataLayer'
 import { NO_FILL_COLOR } from '../../../utils/fieldValue'
 import type { ThematicSettings } from '../LabelSettingsModal'
@@ -180,6 +181,75 @@ describe('MapInfoLayer 无色（镂空）样式', () => {
     const result = layer.getFeaturesAtPoint(L.latLng(5, 5))
     const names = result.map(r => r.properties.name)
     expect(names).toContain('面A')
+  })
+})
+
+describe('MapInfo Symbol 编号 → 形状（按 MapInfo 实测对齐）', () => {
+  it('34/32/33/35 为实心圆/方/菱/星，40/41/42/38 取实测的空心圆/星/三角/方字形', () => {
+    expect(resolvePointShape(34)).toBe('circle')
+    expect(resolvePointShape(32)).toBe('square')
+    expect(resolvePointShape(33)).toBe('diamond')
+    expect(resolvePointShape(35)).toBe('star')
+    expect(resolvePointShape(40)).toBe('circle')
+    expect(resolvePointShape(41)).toBe('star')
+    expect(resolvePointShape(42)).toBe('triangle')
+    expect(resolvePointShape(38)).toBe('square')
+    expect(resolvePointShape(undefined)).toBeNull()
+    expect(resolvePointShape('square')).toBe('square')
+  })
+})
+
+describe('MapInfoLayer 点默认边框（无色，不画白边）', () => {
+  let pointLayer: MapInfoLayer
+
+  beforeAll(async () => {
+    // 文件只声明图形颜色（KML IconStyle / MapInfo Symbol 的典型形态）：
+    // 无边框色 → 不描边；默认白色描边会在缩小时盖住图形本体颜色
+    pointLayer = await MapInfoLayer.fromGeoJSON({
+      id: 'point-border-layer',
+      name: '点默认边框测试',
+      type: 'point',
+      dataId: 'data-point-border',
+      data: {
+        type: 'FeatureCollection',
+        features: [
+          makePointFeature('圆点', 1, 1, { _style: { markerColor: '#00ff00', markerSize: 4 } }),
+          makePointFeature('星形点', 2, 2, { _style: { markerColor: '#ff0000', markerSymbol: 41, markerSize: 9 } }),
+          makePointFeature('圆符号点', 3, 3, { _style: { markerColor: '#00ffff', markerSymbol: 34, markerSize: 15 } }),
+        ],
+      } as any,
+    })
+  })
+
+  function findByName(name: string): any {
+    let found: any = null
+    pointLayer.getLeafletLayer()!.eachLayer((l: any) => {
+      if (l.feature?.properties?.name === name) found = l
+    })
+    return found
+  }
+
+  it('未声明边框色的点（circleMarker）stroke:false，填充色保留', () => {
+    const point = findByName('圆点')
+    expect(point instanceof L.CircleMarker).toBe(true)
+    expect(point.options.stroke).toBe(false)
+    expect(point.options.fillColor).toBe('#00ff00')
+  })
+
+  it('未声明边框色的形状点（SVG 图标）描边为 none，不出现白色描边', () => {
+    const marker = findByName('星形点')
+    expect(marker instanceof L.Marker).toBe(true)
+    const iconUrl = decodeURIComponent(marker.options.icon.options.iconUrl)
+    expect(iconUrl).toContain('stroke="none"')
+    expect(iconUrl).not.toContain('#fff')
+  })
+
+  it('MapInfo 圆形符号（markerSymbol=34）用 Canvas circleMarker，不走 DOM 图标', () => {
+    const point = findByName('圆符号点')
+    expect(point instanceof L.CircleMarker).toBe(true)
+    expect(point instanceof L.Marker).toBe(false)
+    expect(point.options.fillColor).toBe('#00ffff')
+    expect(point.options.radius).toBe(15)
   })
 })
 

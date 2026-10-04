@@ -8,8 +8,10 @@
 import io
 import math
 import re
+import shutil
+import tempfile
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -17,6 +19,8 @@ import geopandas as gpd
 import pyogrio
 from shapely import wkb
 from shapely.geometry import Point, Polygon
+
+from app.services.tab_style_writer import convert_mif_to_tab
 
 # 输出格式 → pyogrio driver 名
 DRIVER_MAP = {
@@ -33,6 +37,21 @@ POINT_SHAPE_MIF = {
     "circle": 34, "square": 32, "diamond": 33,
     "triangle": 40, "triangle_down": 41, "landmark": 42, "pin": 38,
 }
+
+# 填充无色（空心点）用的空心符号：实测 38=空心正方形、40=空心圆、41=空心五角星、42=空心正三角；
+# 39=空心菱形按"实心编号 +6"的规律推断（38/40/41/42 均符合该规律），若 MapInfo 中显示不符需实测修正。
+POINT_SHAPE_MIF_HOLLOW = {
+    "circle": 40, "square": 38, "diamond": 39,
+    "triangle": 40, "triangle_down": 41, "landmark": 42, "pin": 38,
+}
+
+# 无色哨兵（与前端 utils/fieldValue.NO_FILL_COLOR 一致）：该颜色不绘制
+NO_FILL_COLOR = "none"
+
+
+def is_no_color(value: Optional[str]) -> bool:
+    """颜色参数是否为"无色"哨兵。仅识别 'none'（缺省/非法值仍按原语义处理）。"""
+    return isinstance(value, str) and value.strip().lower() == NO_FILL_COLOR
 
 
 # MapInfo 非法字段名字符（非字母数字/下划线/中文）
@@ -109,6 +128,23 @@ def sector_polygon(lat: float, lng: float, azimuth: float, beamwidth: float,
     return Polygon(pts)
 
 
+def tab_opacity_brush_pattern(opacity: Optional[float]) -> int:
+    """TAB 透明度 → Brush 图案（只做两档）。
+
+    MapInfo 的原生 Pen/Brush 样式没有 alpha 通道，半透明存不进去，因此 TAB 只区分：
+    透明度 > 0.5 → 1（无填充/空心，只留边框）；否则 2（实心填充）。
+    界面语义为 0=不透明、1=全透明（默认 0.5），默认值落在实心档，填充色可见。
+    非法/NaN → 2（实心）。
+    """
+    try:
+        t = float(opacity)
+    except (TypeError, ValueError):
+        return 2
+    if not math.isfinite(t):
+        return 2
+    return 1 if t > 0.5 else 2
+
+
 def hex_to_mapinfo_color(color: Optional[str]) -> Optional[int]:
     """#RRGGBB → MapInfo 十进制 RGB (R*65536+G*256+B)。非法/None 返回 None"""
     if not color:
@@ -161,8 +197,11 @@ def hex_to_kml_color(color: Optional[str]) -> Optional[str]:
         return None
 
 
-def svg_point_icon(shape: str, color: str) -> str:
-    """生成点形状的 SVG Data URI（KML Icon href，完全离线可用）。"""
+def svg_point_icon(shape: str, color: str, hollow: bool = False) -> str:
+    """生成点形状的 SVG Data URI（KML Icon href，完全离线可用）。
+
+    hollow=True：填充颜色=无色 → 只描边不填充（空心点），描边色用轮廓色。
+    """
     from urllib.parse import quote
     fill = color or "#FF0000"
     svgs = {
@@ -174,7 +213,17 @@ def svg_point_icon(shape: str, color: str) -> str:
         "landmark": f'<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><path d="M16 3 L28 10 L16 17 L4 10 Z" fill="{fill}" stroke="#fff" stroke-width="2"/><rect x="4" y="12" width="24" height="4" fill="{fill}" stroke="#fff" stroke-width="1"/><rect x="12" y="16" width="8" height="10" fill="{fill}" stroke="#fff" stroke-width="1"/></svg>',
         "pin": f'<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><path d="M16 2 C9 2 4 7 4 14 C4 23 16 30 16 30 C16 30 28 23 28 14 C28 7 23 2 16 2 Z" fill="{fill}" stroke="#fff" stroke-width="2"/><circle cx="16" cy="13" r="4" fill="#fff"/></svg>',
     }
-    svg = svgs.get(shape, svgs["circle"])
+    hollow_svgs = {
+        "circle": f'<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><circle cx="16" cy="16" r="11" fill="none" stroke="{fill}" stroke-width="3"/></svg>',
+        "square": f'<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><rect x="5" y="5" width="22" height="22" rx="1" fill="none" stroke="{fill}" stroke-width="3"/></svg>',
+        "diamond": f'<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><polygon points="16,3 29,16 16,29 3,16" fill="none" stroke="{fill}" stroke-width="3" stroke-linejoin="round"/></svg>',
+        "triangle": f'<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><polygon points="16,3 29,29 3,29" fill="none" stroke="{fill}" stroke-width="3" stroke-linejoin="round"/></svg>',
+        "triangle_down": f'<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><polygon points="3,3 29,3 16,29" fill="none" stroke="{fill}" stroke-width="3" stroke-linejoin="round"/></svg>',
+        "landmark": f'<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><path d="M16 3 L28 10 L16 17 L4 10 Z" fill="none" stroke="{fill}" stroke-width="2"/><rect x="4" y="12" width="24" height="4" fill="none" stroke="{fill}" stroke-width="1.5"/><rect x="12" y="16" width="8" height="10" fill="none" stroke="{fill}" stroke-width="1.5"/></svg>',
+        "pin": f'<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><path d="M16 2 C9 2 4 7 4 14 C4 23 16 30 16 30 C16 30 28 23 28 14 C28 7 23 2 16 2 Z" fill="none" stroke="{fill}" stroke-width="3"/><circle cx="16" cy="13" r="4" fill="none" stroke="{fill}" stroke-width="2"/></svg>',
+    }
+    table = hollow_svgs if hollow else svgs
+    svg = table.get(shape, table["circle"])
     return "data:image/svg+xml," + quote(svg, safe='')
 
 
@@ -380,11 +429,14 @@ class LayerService:
 
     def _write(self, gdf: gpd.GeoDataFrame, output_format: str,
                source_filename: str, sheet_name: str,
-               layer_type: str = "") -> Path:
-        """写入文件，返回路径。文件名 = 源文件名 + sheet名 + 图层类型标记（去uuid，冲突加序号）。
+               layer_type: str = "",
+               style: Optional[Dict[str, Any]] = None) -> Path:
+        """写入文件（含样式注入），返回路径。文件名 = 源文件名 + sheet名 + 图层类型标记。
         中文编码：TAB/MIF 写前重命名列名为 ASCII 占位 + encoding='GBK' + 写后恢复列名。
         base 按 100 字节、sheet 按 50 字节截断，总长 < ext4 NAME_MAX 255。
         layer_type: 'sector'/'point' 追加到文件名，保证扇区与点图不同文件（不互相覆盖）。
+        style: 样式参数（见 _apply_style 的签名键）；TAB 带样式时经临时 MIF 中转，见
+        _write_styled_tab。为 None 或无有效颜色时只写数据不注入样式。
         """
         if output_format not in DRIVER_MAP:
             raise ValueError(f"不支持的输出格式: {output_format}")
@@ -394,33 +446,102 @@ class LayerService:
         fname = f"{base}_{safe_sheet}{type_tag}{EXT_MAP[output_format]}"
         out_path = self._unique_path(self.output_dir / fname)
         if output_format in ("tab", "mif"):
-            # 中文字段名 GDAL MapInfo 驱动会打成 '_'，故写前用 f0..fN ASCII 占位名，写后恢复。
-            # 关键：字符串列按实际 GBK 字节长度转 U{width} 再写，否则 GDAL 把每个字符串列
-            # 都写成 Char(254)（MapInfo 最大宽度），导致 .dat/.mid 体积放大 20-70 倍。
-            orig_cols = list(gdf.columns)
-            geom_name = gdf.geometry.name
-            attr_cols = [c for c in orig_cols if c != geom_name]
-            # 占位符只覆盖属性列：几何列不写入 .tab 字段列表，算进来会让后置列名整体错位。
-            sanitized_cols = _dedupe_field_names(
-                [_sanitize_field_name(c, i) for i, c in enumerate(attr_cols)]
-            )
-            field_names = [f"f{i}" for i in range(len(attr_cols))]
-            field_data = self._build_field_data(gdf, attr_cols)
-            geoms_wkb = [wkb.dumps(g) for g in gdf.geometry]
-            geom_type = gdf.geometry.geom_type.iloc[0]
-            pyogrio.raw.write(
-                str(out_path),
-                geometry=geoms_wkb,
-                field_data=field_data,
-                fields=field_names,
-                geometry_type=geom_type,
-                crs="EPSG:4326",
-                driver=DRIVER_MAP[output_format],
-                encoding="GBK",
-            )
-            self._mapinfo_postprocess(out_path, output_format, sanitized_cols)
+            sanitized_cols = self._sanitized_columns(gdf)
+            if output_format == "tab" and self._has_effective_style(style):
+                return self._write_styled_tab(gdf, out_path, sanitized_cols, style)
+            self._write_mapinfo_raw(gdf, out_path, output_format, sanitized_cols)
         else:
             gdf.to_file(out_path, driver=DRIVER_MAP[output_format])
+        if self._has_effective_style(style):
+            self._apply_style(out_path, output_format, **style)
+        return out_path
+
+    @staticmethod
+    def _has_effective_style(style: Optional[Dict[str, Any]]) -> bool:
+        """样式是否需要注入：至少有一个能解析的颜色（点看边框色，面看边框/填充色）。
+
+        没有有效颜色时走普通写入路径，避免为无样式需求多走一次 MIF 中转。
+        """
+        if not style:
+            return False
+        return any(
+            hex_to_mapinfo_color(style.get(key)) is not None
+            for key in ("border_color", "fill_color")
+        )
+
+    @staticmethod
+    def _sanitized_columns(gdf: gpd.GeoDataFrame) -> list:
+        """属性列名 → MapInfo 合法列名（写前占位名与写后恢复列名共用同一顺序）。
+
+        占位符只覆盖属性列：几何列不写入 .tab 字段列表，算进来会让后置列名整体错位。
+        """
+        geom_name = gdf.geometry.name
+        attr_cols = [c for c in gdf.columns if c != geom_name]
+        return _dedupe_field_names(
+            [_sanitize_field_name(c, i) for i, c in enumerate(attr_cols)]
+        )
+
+    def _write_mapinfo_raw(self, gdf: gpd.GeoDataFrame, out_path: Path, output_format: str,
+                           sanitized_cols: list, patch_names: bool = True) -> None:
+        """按 MapInfo 写前约定落盘：f0..fN ASCII 占位列名 + GBK + 实际字节宽度。
+
+        关键：字符串列按实际 GBK 字节长度转 U{width} 再写，否则 GDAL 把每个字符串列
+        都写成 Char(254)（MapInfo 最大宽度），导致 .dat/.mid 体积放大 20-70 倍。
+        patch_names=False 时只修 charset、保留占位列名（供中转文件转换后再统一恢复列名）。
+        """
+        geom_name = gdf.geometry.name
+        attr_cols = [c for c in gdf.columns if c != geom_name]
+        field_names = [f"f{i}" for i in range(len(attr_cols))]
+        field_data = self._build_field_data(gdf, attr_cols)
+        geoms_wkb = [wkb.dumps(g) for g in gdf.geometry]
+        geom_type = gdf.geometry.geom_type.iloc[0]
+        pyogrio.raw.write(
+            str(out_path),
+            geometry=geoms_wkb,
+            field_data=field_data,
+            fields=field_names,
+            geometry_type=geom_type,
+            crs="EPSG:4326",
+            driver=DRIVER_MAP[output_format],
+            encoding="GBK",
+        )
+        self._mapinfo_postprocess(out_path, output_format, sanitized_cols if patch_names else [])
+
+    def _write_styled_tab(self, gdf: gpd.GeoDataFrame, out_path: Path,
+                          sanitized_cols: list, style: Dict[str, Any]) -> Path:
+        """TAB 带样式：先写临时 MIF（样式完整），再用 GDAL 转换成 TAB。
+
+        MITAB 驱动只认 OGR 样式串，pyogrio 写 TAB 时给不了样式（UPDATE 模式补写也不行，
+        实测 SetFeature 后样式不落盘），而带样式的 MIF → TAB 转换走 GDAL 的创建路径
+        （CreateTABFeature → WritePenDef/WriteBrushDef/WriteSymbolDef），样式会进 .map
+        定义表，MapInfo 即可读到。流程：
+          临时 MIF（GBK + f0..fN 占位列名）→ _apply_style 注入 Pen/Brush/Symbol
+          → 转成 TAB → 修 TAB 的 charset/中文列名 → 删除临时 MIF。
+        透明度：TAB 无 alpha，用 tab_opacity_brush_pattern 的两档（实心/空心）。
+        转换失败不影响出图：记日志并回退为无样式的普通 TAB（用户仍能拿到文件）。
+        """
+        tmp_dir = Path(tempfile.mkdtemp(prefix="npt_tab_style_"))
+        try:
+            tmp_mif = tmp_dir / f"{out_path.stem}.mif"
+            self._write_mapinfo_raw(gdf, tmp_mif, "mif", sanitized_cols, patch_names=False)
+            tmp_style = dict(style)
+            # 填充无色 → Brush pattern 1（无填充，优先于透明度档位）；否则 TAB 无 alpha，只做两档
+            if is_no_color(tmp_style.get("fill_color")):
+                tmp_style["brush_pattern"] = 1
+            else:
+                tmp_style["brush_pattern"] = tab_opacity_brush_pattern(tmp_style.get("opacity"))
+            self._apply_style(tmp_mif, "mif", **tmp_style)
+            convert_mif_to_tab(tmp_mif, out_path)
+            self._mapinfo_postprocess(out_path, "tab", sanitized_cols)
+            return out_path
+        except Exception as exc:  # noqa: BLE001 — 样式是增强项，失败不能阻断出图
+            print(f"[LayerStyle] TAB 样式写入失败，回退无样式 TAB: {exc}")
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        # 回退：清掉可能残留的半成品配套文件后按普通路径重写（局部导入避免与 tab_io 循环依赖）
+        from app.services.tab_io import remove_tab_stem
+        remove_tab_stem(out_path)
+        self._write_mapinfo_raw(gdf, out_path, "tab", sanitized_cols)
         return out_path
 
     def _build_field_data(self, gdf: gpd.GeoDataFrame, attr_cols: List[str]) -> list:
@@ -462,8 +583,10 @@ class LayerService:
                      opacity: Optional[float], is_point: bool,
                      line_width: Optional[int] = None,
                      point_size: Optional[float] = None,
-                     point_shape: Optional[str] = None) -> Path:
-        """后处理注入样式：边框颜色/填充颜色/透明度/线宽（仅 MIF/KML，TAB 无颜色支持）。
+                     point_shape: Optional[str] = None,
+                     brush_pattern: Optional[int] = None,
+                     hollow: bool = False) -> Path:
+        """后处理注入样式：边框颜色/填充颜色/透明度/线宽（MIF 文本改写、KML 内联样式）。
 
         MIF 扇区: Pen 颜色 = 边框色，Brush 前景 = 填充色（背景保留白色）。
         MIF 点:   Symbol (shape, 颜色, size) = 点形状映射 + 边框色 + 点大小。
@@ -472,7 +595,17 @@ class LayerService:
                   该样式位于本函数注入的 Style 之后、作用更优先，故需同时改写 GDAL 样式。
         KML 点:   IconStyle color=边框色 + scale 由点大小决定 + Icon href=形状 SVG Data URI。
 
-        非法颜色/透明度或 TAB 直接返回原文件。MIF 使用 GBK 编码（与 _write GBK 输出一致）。
+        颜色为"无色"哨兵（'none'）时：MIF 边框 → Pen pattern 1（无边框）、填充 → Brush
+        pattern 1（无填充/空心面）；KML 边框 → 不写 LineStyle 且 PolyStyle outline=0、
+        填充 → PolyStyle fill=0。
+        hollow=True（点图层填充无色）：MIF Symbol 换空心符号（颜色用轮廓色），KML 用只描边的
+        空心 SVG 图标。
+
+        TAB 不在这里处理：TAB 的 Pen/Brush/Symbol 只能由 GDAL 从 OGR 样式串写进 .map，
+        故 TAB 走「临时带样式 MIF → GDAL 转换」，见 _write_styled_tab（那里的中间 MIF 也会
+        调用本函数，并用 brush_pattern 覆盖成 TAB 的两档透明度）。
+        brush_pattern: 直接指定 MIF Brush 图案（不传则按透明度用 mif_opacity_brush_pattern 近似）。
+        非法颜色/透明度或非 MIF/KML 格式直接返回原文件。MIF 使用 GBK 编码（与 _write 一致）。
         """
         if output_format not in ("mif", "kml"):
             return out_path
@@ -482,7 +615,8 @@ class LayerService:
             if is_point:
                 # 点 Symbol (shape, 颜色, size) 替换：形状映射 + 边框色 + 点大小
                 if mif_border is not None:
-                    shape = POINT_SHAPE_MIF.get(point_shape or "circle", 34)
+                    shapes = POINT_SHAPE_MIF_HOLLOW if hollow else POINT_SHAPE_MIF
+                    shape = shapes.get(point_shape or "circle", 34)
                     size = int(point_size or 12)
                     text = re.sub(
                         r'Symbol \((\d+),(\d+),(\d+)\)',
@@ -492,7 +626,13 @@ class LayerService:
                 mif_fill = hex_to_mapinfo_color(fill_color)
                 # 扇区 Pen 颜色 = 边框色、线宽 = pen_width；Brush 前景 = 填充色
                 pen_width = max(1, min(7, int(line_width or 2)))
-                if mif_border is not None:
+                if is_no_color(border_color):
+                    # 边框无色：Pen pattern 1 = 无边框（颜色位保留原值，不生效）
+                    text = re.sub(
+                        r'Pen \((\d+),(\d+),(\d+)\)',
+                        lambda m: f'Pen ({pen_width},1,{m.group(3)})', text,
+                    )
+                elif mif_border is not None:
                     # MapInfo Pen (width, pattern, color)：线宽进 width、保留原 pattern、颜色进 color
                     # 修复前错误写为 (1, mif_border, pen_width) → 颜色进 pattern 位（0-71）
                     # 导致白色边框 16777215 报 Invalid stylevalue，线宽也从未生效
@@ -500,12 +640,19 @@ class LayerService:
                         r'Pen \((\d+),(\d+),(\d+)\)',
                         lambda m: f'Pen ({pen_width},{m.group(2)},{mif_border})', text,
                     )
-                if mif_fill is not None:
+                if is_no_color(fill_color):
+                    # 填充无色：Brush pattern 1 = 无填充（镂空，只留边框）
+                    text = re.sub(
+                        r'Brush \((\d+),(\d+),(\d+)\)',
+                        lambda m: f'Brush (1,{m.group(2)})', text,
+                    )
+                elif mif_fill is not None:
                     # MapInfo Brush (pattern, forecolor, backcolor)。GDAL 默认 pattern=1（无填充/透明），
                     # 保留会导致设置填充色仍显示空白 → 实心 pattern=2 使填充色生效。
                     # MIF 无 alpha 通道，透明度用【稀疏大颗粒 pattern】模拟（官方规范：
                     # pattern≥3 且省略 backcolor = 透明填充）。透明度越高颗粒越稀。
-                    pattern = mif_opacity_brush_pattern(opacity)
+                    # brush_pattern 显式传入时用它（TAB 中转时用两档：实心/空心）。
+                    pattern = brush_pattern if brush_pattern is not None else mif_opacity_brush_pattern(opacity)
                     if pattern == 2:
                         # 不透明：实心 + 保留 backcolor
                         text = re.sub(
@@ -532,7 +679,7 @@ class LayerService:
             if is_point:
                 if hex_to_kml_color(border_color) is None:
                     return out_path
-                href = svg_point_icon(point_shape or "circle", border_color)
+                href = svg_point_icon(point_shape or "circle", border_color, hollow=hollow)
                 scale = 1.0
                 if point_size is not None:
                     scale = max(0.3, min(3.0, point_size / 8 * 0.6))
@@ -550,11 +697,14 @@ class LayerService:
                     text,
                 )
             else:
-                kml_border = hex_to_kml_color(border_color)
-                kml_fill = _kml_color_with_alpha(fill_color, kml_transparency)
-                # 至少一个颜色有效才改写
+                border_none = is_no_color(border_color)
+                fill_none = is_no_color(fill_color)
+                kml_border = None if border_none else hex_to_kml_color(border_color)
+                kml_fill = None if fill_none else _kml_color_with_alpha(fill_color, kml_transparency)
+                if border_none and fill_none:
+                    return out_path      # 边框与填充都无色：无样式可写（前端已拦截）
                 if kml_border is None and kml_fill is None:
-                    return out_path
+                    return out_path      # 颜色非法
                 parts = []
                 if kml_border is not None:
                     width = int(line_width or 2)
@@ -565,11 +715,16 @@ class LayerService:
                         f'<width>{width}</width>'
                         f'</LineStyle>'
                     )
-                if kml_fill is not None:
+                if fill_none:
+                    # 填充无色：镂空（不填充，只显示边框）
+                    parts.append('<PolyStyle><fill>0</fill><outline>1</outline></PolyStyle>')
+                elif kml_fill is not None:
+                    # 边框无色时 outline=0，否则 Google Earth 会用默认黑边描边
+                    outline = 0 if border_none else 1
                     parts.append(
                         f'<PolyStyle>'
                         f'<color>{kml_fill}</color>'
-                        f'<fill>1</fill><outline>1</outline>'
+                        f'<fill>1</fill><outline>{outline}</outline>'
                         f'</PolyStyle>'
                     )
                 style = f'<Style>{"".join(parts)}</Style>'
@@ -625,11 +780,13 @@ class LayerService:
         stats 包含 total/success/failed/failures 分类计数。
         source_filename: 原始源文件名（未被 _save_upload 重命名），用于输出文件命名。
         不提供时回退到 file_path 的文件名。
-        border_color/fill_color/opacity: 样式参数。点图层颜色按边框语义应用
-        （点无填充概念），fill_color 忽略。TAB 不支持颜色。
-        point_size: 点大小（像素，MIF Symbol size / KML scale）。
+        border_color/fill_color/opacity: 样式参数。fill_color 为颜色时按填充色绘制点（无填充概念，
+        兼容旧调用把颜色放在 border_color/color）；fill_color 为"无色"哨兵时生成空心点，
+        border_color 作为空心轮廓色。TAB 经临时 MIF 中转写入原生样式，
+        透明度只做两档（实心/空心，见 tab_opacity_brush_pattern）。
+        point_size: 点大小（像素，MIF/MapInfo Symbol size、KML scale）。
         point_shape: 点形状（circle/square/diamond/triangle/triangle_down/landmark/pin，
-        MIF Symbol shape 编号、KML SVG 图标）。
+        MIF/MapInfo Symbol shape 编号、KML SVG 图标）。
         """
         df = self._read_sheet(file_path, sheet_name)
         lon, lat, coord_valid, failures = self._coerce_coords(df, lon_col, lat_col)
@@ -653,15 +810,17 @@ class LayerService:
         gdf = self._build_gdf(df, lon, lat, valid, attributes, geoms, keep_cols_extra=[name_col])
         if output_format == "kml":
             gdf = self._ensure_kml_name(gdf, name_col)
+        # 填充颜色为"无色"（'none'）→ 空心点：符号换空心形状、用轮廓色（border_color）绘制；
+        # 否则用填充色绘制（fill_color 缺省时回退 border_color/color，兼容旧调用）
+        no_fill = is_no_color(fill_color)
+        symbol_color = (border_color or color) if no_fill else (fill_color or border_color or color)
         out = self._write(gdf, output_format,
                           source_filename=source_filename or Path(file_path).name,
-                          sheet_name=sheet_name, layer_type="point")
-        out = self._apply_style(
-            out, output_format,
-            border_color=border_color or color, fill_color=None,
-            opacity=opacity, is_point=True,
-            point_size=point_size, point_shape=point_shape,
-        )
+                          sheet_name=sheet_name, layer_type="point",
+                          style=dict(border_color=symbol_color, fill_color=None,
+                                     opacity=opacity, is_point=True,
+                                     point_size=point_size, point_shape=point_shape,
+                                     hollow=no_fill))
         self._verify_readable(out, int(valid.sum()), output_format)
 
         stats = {
@@ -690,8 +849,9 @@ class LayerService:
         source_filename: 原始源文件名（未被 _save_upload 重命名），用于输出文件命名。
         不提供时回退到 file_path 的文件名。
         border_color/fill_color/opacity: 样式参数。扇区边框色=border_color、填充=fill_color、
-        透明度=opacity（作用于填充/边框/点的整体透明度）。line_width: 描边线宽（像素，clamp 1-7）。
-        TAB 不支持颜色。
+        透明度=opacity。两色均支持"无色"哨兵（'none'）：边框无色 → 不描边、填充无色 → 镂空。
+        line_width: 描边线宽（像素，clamp 1-7）。
+        TAB 经临时 MIF 中转写入原生样式，透明度只做两档（实心/空心）。
         """
         df = self._read_sheet(file_path, sheet_name)
         lon, lat, coord_valid, failures = self._coerce_coords(df, lon_col, lat_col)
@@ -728,14 +888,11 @@ class LayerService:
             gdf = self._ensure_kml_name(gdf, name_col)
         out = self._write(gdf, output_format,
                           source_filename=source_filename or Path(file_path).name,
-                          sheet_name=sheet_name, layer_type="sector")
-        out = self._apply_style(
-            out, output_format,
-            border_color=border_color or color,
-            fill_color=fill_color or color,
-            opacity=opacity, is_point=False,
-            line_width=line_width,
-        )
+                          sheet_name=sheet_name, layer_type="sector",
+                          style=dict(border_color=border_color or color,
+                                     fill_color=fill_color or color,
+                                     opacity=opacity, is_point=False,
+                                     line_width=line_width))
         self._verify_readable(out, int(valid.sum()), output_format)
 
         stats = {

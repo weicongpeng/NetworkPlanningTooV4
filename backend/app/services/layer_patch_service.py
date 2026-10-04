@@ -208,6 +208,11 @@ def apply_layer_patch(data_id: str, layer_id: str, patch: Dict[str, Any],
 
     # 读取基底（WGS84）：属性列与 dtype 均以文件为准
     raw_gdf = _read_tab_gdf(tab_path)
+    # 空 TAB（无要素）读回可能是无 geometry 列的普通 DataFrame：补空几何列
+    if "geometry" not in raw_gdf.columns:
+        raw_gdf = gpd.GeoDataFrame(
+            raw_gdf, geometry=gpd.GeoSeries(), crs="EPSG:4326"
+        )
     valid_mask = raw_gdf.geometry.notna() & ~raw_gdf.geometry.is_empty
     gdf = raw_gdf[valid_mask].reset_index(drop=True)
     # 旧 .map 逐要素原生样式（与过滤后的基底行序对齐），未变更要素重写时据此还原配色

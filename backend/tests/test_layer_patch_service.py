@@ -196,3 +196,37 @@ def test_write_tab_keeps_names_when_geometry_not_last(tmp_path):
     assert out.iloc[0]["NPT_FEATSYM"] == '{"markerColor": "#f00"}'
     assert out.iloc[0]["NPT_FEATMETA"] == '{"_shape": "circle"}'
     assert out.iloc[0]["数值"] == 5
+
+
+def test_patch_empty_tab_append(layer_env):
+    """空 TAB（读回为无 geometry 列的 DataFrame）：base count=0，追加 MultiPolygon 要素。"""
+    empty_tab = layer_env["tab"].parent / "空层.tab"
+    empty_gdf = gpd.GeoDataFrame(
+        {"name": gpd.pd.Series([], dtype="object")},
+        geometry=gpd.GeoSeries(), crs="EPSG:4326",
+    )
+    write_mapinfo_tab(empty_gdf, empty_tab, geometry_type="Polygon")
+    (layer_env["tab"].parent / "layers.json").write_text(
+        json.dumps([{
+            "id": "empty-layer", "name": "空层", "type": "polygon",
+            "metadata": {"source_file": str(empty_tab), "editable": True},
+        }], ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    from shapely.geometry import Polygon as SPoly, MultiPolygon, mapping
+    multi = MultiPolygon([
+        SPoly([(114.0, 23.0), (114.01, 23.0), (114.01, 23.01)]),
+        SPoly([(114.02, 23.02), (114.03, 23.02), (114.03, 23.03)]),
+    ])
+    res = apply_layer_patch(
+        layer_env["data_id"], "empty-layer",
+        {"base": {"count": 0, "version": layer_version(empty_tab, "empty-layer")},
+         "upserts": [{"row": None, "geometry": mapping(multi), "properties": {}}]},
+        user_id=1,
+    )
+    assert res["feature_count"] == 1
+
+    out = _read_tab_gdf(empty_tab)
+    assert len(out) == 1
+    assert out.geometry.iloc[0].geom_type == "MultiPolygon"

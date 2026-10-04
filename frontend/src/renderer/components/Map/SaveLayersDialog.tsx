@@ -76,7 +76,7 @@ export default function SaveLayersDialog({ open, dirtyLayers, saving, onClose, o
             </div>
             <div className="flex flex-col gap-1 overflow-y-auto pr-1">
               <label className="flex items-center gap-2 px-2 py-1.5 text-xs text-foreground cursor-pointer hover:bg-muted rounded">
-                <input type="checkbox" checked={allSelected} onChange={toggleAll} />
+                <input type="checkbox" className="layer-standard-checkbox" checked={allSelected} onChange={toggleAll} />
                 <span className="font-medium">{t('common.selectAll') || '全选'}</span>
               </label>
               {dirtyLayers.map((l) => (
@@ -84,7 +84,7 @@ export default function SaveLayersDialog({ open, dirtyLayers, saving, onClose, o
                   key={l.layerId}
                   className="flex items-center gap-2 px-2 py-1.5 text-xs text-foreground cursor-pointer hover:bg-muted rounded"
                 >
-                  <input type="checkbox" checked={!!selected[l.layerId]} onChange={() => toggle(l.layerId)} />
+                  <input type="checkbox" className="layer-standard-checkbox" checked={!!selected[l.layerId]} onChange={() => toggle(l.layerId)} />
                   <span className="flex-1 truncate">{l.name}</span>
                   <span className="text-amber-500 shrink-0">
                     {t('map.changesCount', { count: l.changeCount }) || `${l.changeCount} 处更改`}

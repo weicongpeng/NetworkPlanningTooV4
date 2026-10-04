@@ -79,6 +79,14 @@ export function panelRankFromIndex(index: number, total: number): number {
 }
 
 /**
+ * 类内最顶伪条目 rank（严格大于类内任何索引的 panelRank）。
+ * 用于固定在类别最顶、不参与拖拽排序的图层（如装饰图层要素显示层在「图层文件」类内最顶）。
+ */
+export function topPanelRank(total: number): number {
+  return total
+}
+
+/**
  * 图层"可选"开关判定：selectableMap 未收录该 id 时默认可选（true）。
  */
 export function isLayerSelectable(selectableMap: Record<string, boolean> | undefined, layerId: string): boolean {

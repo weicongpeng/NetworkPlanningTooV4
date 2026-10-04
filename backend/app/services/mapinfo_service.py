@@ -23,6 +23,7 @@ from app.utils.coordinate_transformer import CoordinateTransformer
 from app.utils.geojson_geometry import transform_coordinate_lists
 from app.core.database import SessionLocal
 from app.models.database import Layer
+from app.services.ogr_style_reader import read_feature_style_strings
 
 # MapInfo 图层数据缓存（避免每次请求都重新解析文件）
 _layer_cache: Dict[str, Dict] = {}
@@ -116,6 +117,13 @@ class MapInfoLayer:
 class MapInfoParser:
     """MapInfo 文件解析器"""
 
+    # OGR 样式串（GDAL 依据 .map 对象样式生成）分段与键值：
+    #   PEN(w:1px,c:#000000,id:"mapinfo-pen-2,ogr-pen-0",cap:r,j:r)
+    #   BRUSH(fc:#a0ffff,bc:#ffffff,id:"mapinfo-brush-2,ogr-brush-0")
+    #   SYMBOL(a:0,c:#ff0000,s:4pt,id:"font-sym-41,ogr-sym-9",f:"Map Symbols")
+    _OGR_STYLE_SEG_RE = re.compile(r'(PEN|BRUSH|SYMBOL)\s*\(([^)]*)\)', re.IGNORECASE)
+    _OGR_STYLE_TOKEN_RE = re.compile(r'([A-Za-z_]+)\s*:\s*(?:"([^"]*)"|([^,]*))')
+
     @staticmethod
     def detect_file_type(filename: str) -> Optional[str]:
         """检测文件类型"""
@@ -188,6 +196,9 @@ class MapInfoParser:
         - Pen: "width,color,pattern" (如 "2,255,0,0,2" 表示 2px 宽, 红色, 实线)
         - Brush: "fg_color,bg_color,pattern" (如 "255,255,0,255,255,255,1" 表示 黄色填充, 白色背景, 斜线)
         - Symbol: "shape,size,color,rotation" (如 "35,12,255,0,0,0" 表示 符号35, 12pt, 黑色, 0度)
+
+        颜色整数按 MapInfo 规范解码：Color = R*65536 + G*256 + B（R 在高字节，
+        16711680 = 0xFF0000 = 红），与 .map 二进制中 R,G,B 的字节序一致。
         """
         if value is None or value == '':
             return None
@@ -221,15 +232,16 @@ class MapInfoParser:
                     try:
                         result['stroke'] = True
                         result['strokeWidth'] = float(parts[0]) if parts[0] else 1
-                        # MapInfo 颜色规范: Color = R + G*256 + B*65536（R 最低字节）
+                        # MapInfo 颜色整数规范: Color = R*65536 + G*256 + B（R 在高字节，
+                        # 16711680 = 0xFF0000 = 红，与 .map 里 R,G,B 字节序一致）
                         # 两种格式：
                         #  1) width,pattern,color_int  (GDAL/MIF 三段，color 为 24-bit 整数)
                         #  2) width,r,g,b,pattern      (多段 RGB)
                         if len(parts) == 3:
                             color_int = int(parts[2])
-                            r = color_int & 255
+                            r = (color_int >> 16) & 255
                             g = (color_int >> 8) & 255
-                            b = (color_int >> 16) & 255
+                            b = color_int & 255
                             result['strokeColor'] = f'#{r:02x}{g:02x}{b:02x}'
                             # 三段格式的 pattern 在 parts[1]
                             if parts[1].isdigit():
@@ -255,15 +267,15 @@ class MapInfoParser:
                             result['fill'] = True
                             result['fillPattern'] = int(parts[0]) if parts[0].isdigit() else 1
                             color_int = int(parts[1])
-                            r = color_int & 255
+                            r = (color_int >> 16) & 255
                             g = (color_int >> 8) & 255
-                            b = (color_int >> 16) & 255
+                            b = color_int & 255
                             result['fillColor'] = f'#{r:02x}{g:02x}{b:02x}'
                             if len(parts) >= 3 and parts[2] and parts[2] != '0':
                                 bg_int = int(parts[2])
-                                r2 = bg_int & 255
+                                r2 = (bg_int >> 16) & 255
                                 g2 = (bg_int >> 8) & 255
-                                b2 = (bg_int >> 16) & 255
+                                b2 = bg_int & 255
                                 result['fillBgColor'] = f'#{r2:02x}{g2:02x}{b2:02x}'
                         else:
                             result['fill'] = True
@@ -299,9 +311,9 @@ class MapInfoParser:
                         if 2 <= len(parts) <= 4:
                             result['markerSymbol'] = int(parts[0]) if parts[0].isdigit() else 'circle'
                             color_int = int(parts[1])
-                            r = color_int & 255
+                            r = (color_int >> 16) & 255
                             g = (color_int >> 8) & 255
-                            b = (color_int >> 16) & 255
+                            b = color_int & 255
                             result['markerColor'] = f'#{r:02x}{g:02x}{b:02x}'
                             if len(parts) >= 3 and parts[2].replace('.', '').isdigit():
                                 result['markerSize'] = float(parts[2])
@@ -602,54 +614,116 @@ class MapInfoParser:
         )
 
     @staticmethod
-    def _extract_tab_map_styles(map_file: Path) -> Optional[List[Optional[Dict[str, Any]]]]:
-        """解析 MapInfo .map 文件的每要素样式（Pen/Brush/Symbol），返回按要素顺序的样式列表。
+    def _ogr_style_mapinfo_id(id_str: str, kind: str) -> Optional[int]:
+        """从 OGR 样式串的 id 值取 MapInfo 编号（线型图案 / 填充图案）。
 
-        .map 中每个对象恰好一组样式行（Pen/Brush/Symbol/Line/Region/Text…），
-        与 .dat 数据行一一对应。复杂对象（Line/Region）样式行后跟缩进坐标续行（忽略）。
-        以 Pen/Symbol/Line/Region/Text 等对象定义行作为新要素边界，Brush 行并入当前要素。
+        ``id:"mapinfo-pen-24,ogr-pen-7"`` → 24 是 MapInfo 线型编号，
+        ``id:"mapinfo-brush-2,ogr-brush-0"`` → 2 是填充图案编号；
+        ogr-* 是 OGR 自身的编号体系（含义与 MapInfo 不同），不能混用。
+        """
+        for part in (id_str or '').split(','):
+            part = part.strip().lower()
+            if part.startswith('mapinfo-') and part.rsplit('-', 1)[0].endswith(kind):
+                try:
+                    return int(part.rsplit('-', 1)[1])
+                except ValueError:
+                    return None
+        return None
+
+    @staticmethod
+    def _parse_ogr_style_string(style_str: str) -> Optional[Dict[str, Any]]:
+        """OGR 样式串 → 内部 _style 结构（与 MIF/KML 解析结果同构）。
+
+        颜色在 GDAL 内部已按 R/G/B 正确解码（.map 中 Pen/Brush 定义按 R,G,B 字节存储），
+        这里只做结构转换，不再做字节序换算。
+        """
+        if not style_str:
+            return None
+
+        result: Dict[str, Any] = {}
+        for seg, body in MapInfoParser._OGR_STYLE_SEG_RE.findall(style_str):
+            tokens: Dict[str, str] = {}
+            for key, quoted, plain in MapInfoParser._OGR_STYLE_TOKEN_RE.findall(body):
+                tokens[key.lower()] = quoted if quoted else plain.strip()
+
+            seg = seg.upper()
+            if seg == 'PEN':
+                # 线型图案：1 = 无边框（"无色"边框写出的占位颜色不可用 → 直接不描边），
+                # 2 = 实线，其余（虚/点/点划线）映射为 dasharray
+                pattern = MapInfoParser._ogr_style_mapinfo_id(tokens.get('id', ''), 'pen')
+                if pattern == 1:
+                    result['stroke'] = False
+                    continue
+                result['stroke'] = True
+                if tokens.get('c'):
+                    result['strokeColor'] = tokens['c']
+                width = tokens.get('w', '').replace('px', '').strip()
+                if width:
+                    try:
+                        result['strokeWidth'] = max(0.5, float(width))
+                    except ValueError:
+                        pass
+                if pattern is not None and pattern > 2:
+                    dash = MapInfoParser._get_dash_pattern(pattern)
+                    if dash:
+                        result['strokeDasharray'] = dash
+            elif seg == 'BRUSH':
+                pattern = MapInfoParser._ogr_style_mapinfo_id(tokens.get('id', ''), 'brush') or 2
+                if pattern == 1:
+                    # 图案 1 = 无填充（MapInfo 空心面）：必须显式关闭填充，
+                    # 否则 fc 里的占位黑色会被当作实心黑面渲染
+                    result['fill'] = False
+                    result['fillPattern'] = 1
+                else:
+                    result['fill'] = True
+                    result['fillPattern'] = pattern
+                    if tokens.get('fc'):
+                        result['fillColor'] = tokens['fc']
+                    result['fillOpacity'] = 0.8 if pattern == 2 else 0.5
+                    bg = tokens.get('bc')
+                    if bg and bg.lower() != '#ffffff':
+                        result['fillBgColor'] = bg
+            elif seg == 'SYMBOL':
+                # 只取颜色/大小，不输出 markerSymbol：MapInfo 符号形状（星形/三角等）会让前端改用
+                # DOM 图标渲染（L.marker + SVG），上万点的图层缩放/平移明显卡顿；点统一用 Canvas
+                # 圆点渲染，颜色与大小仍按文件还原。
+                if tokens.get('c'):
+                    result['markerColor'] = tokens['c']
+                size = tokens.get('s', '').replace('pt', '').strip()
+                if size:
+                    try:
+                        result['markerSize'] = min(24.0, max(3.0, float(size)))
+                    except ValueError:
+                        pass
+        return result or None
+
+    @staticmethod
+    def _extract_tab_styles(tab_file: Path) -> Optional[List[Optional[Dict[str, Any]]]]:
+        """解析 TAB 图层每个要素的真实样式（Pen/Brush/Symbol），返回按要素顺序的样式列表。
+
+        样式存在同名 .map 二进制文件的对象定义表中（.tab 文本里只有表结构/坐标系），
+        由 GDAL 的 MapInfo 驱动解析为 OGR 样式串后转换（见 ogr_style_reader）。
+        无样式要素占位 None，保证与要素行序对齐。
         解析失败返回 None（调用方回退图层默认样式）。
         """
-        if not map_file or not map_file.exists():
+        if not tab_file or not tab_file.exists():
             return None
-        try:
-            text = map_file.read_text(encoding="gbk", errors="replace")
-        except Exception:
+        style_strings = read_feature_style_strings(tab_file)
+        if not style_strings:
             return None
-
-        object_kw = ("pen", "symbol", "line", "region", "arc", "rect", "ellipse",
-                     "text", "roundedrect", "shape", "multiline", "point")
-        object_re = re.compile(r"^\s*([A-Za-z]+)\s*\(")
-
-        styles: List[Optional[Dict[str, Any]]] = []
-        cur: Optional[Dict[str, Any]] = None  # None = 尚未开始要素；空 dict = 无样式占位
-        for line in text.splitlines():
-            m = object_re.match(line)
-            if m:
-                kw = m.group(1).lower()
-                if kw in object_kw:
-                    # 新要素开始：push 上一组（空样式也占位，保证与 .dat 行序对齐）
-                    if cur is not None:
-                        styles.append(cur)
-                    parsed = MapInfoParser._parse_style_value(kw, line)
-                    cur = parsed if parsed else {}
-                elif kw == "brush" and cur is not None:
-                    parsed = MapInfoParser._parse_style_value("brush", line)
-                    if parsed:
-                        cur.update(parsed)
-                continue
-            # 非样式行（坐标续行/元数据）忽略
-        if cur is not None:
-            styles.append(cur)
-        return [s if s else None for s in styles] if styles else None
+        return [
+            MapInfoParser._parse_ogr_style_string(s) if s else None
+            for s in style_strings
+        ]
 
     @staticmethod
     def _extract_mif_styles(mif_file: Path) -> Optional[List[Optional[Dict[str, Any]]]]:
         """解析 MIF 文件每要素的 Pen/Brush/Symbol 样式，返回按要素顺序的样式列表。
 
-        GDAL MIF 驱动默认不把样式暴露为属性列，因此需主动解析 .mif 文本：
-        样式行（Pen/Brush/Symbol/Rotation）出现在几何对象行（Point/Line/…）之前，
-        同一要素的样式先解析到 pending，遇到几何行时绑定为当前要素并开启下一要素。
+        GDAL MIF 驱动默认不把样式暴露为属性列，因此需主动解析 .mif 文本。
+        按 MIF 规范，样式行（Pen/Brush/Symbol/Rotation）写在**所属几何对象之后**
+        （如 ``Point 114.9 24.1`` 下一行才是 ``Symbol (34,255,12)``），
+        所以遇到下一个几何对象行时，才把上一对象期间累计的样式绑定给它。
         解析失败返回 None（调用方回退图层默认样式）。
         """
         if not mif_file or not mif_file.exists():
@@ -666,8 +740,9 @@ class MapInfoParser:
         style_re = re.compile(r"^\s*(Pen|Brush|Symbol)\s*\(", re.IGNORECASE)
 
         styles: List[Optional[Dict[str, Any]]] = []
-        pending: Optional[Dict[str, Any]] = None
+        pending: Optional[Dict[str, Any]] = None  # 上一个几何对象之后累计的样式组
         in_data = False
+        started = False
         for line in text.splitlines():
             stripped = line.strip()
             if not in_data:
@@ -684,12 +759,15 @@ class MapInfoParser:
                     pending.update(parsed)
                 continue
             if geom_kw.match(line):
-                # 几何对象行：绑定当前样式为要素，开启下一要素
-                styles.append(pending if pending else None)
-                pending = None
+                # 新几何对象开始：上一个对象的样式组在此结算并绑定（首个对象前不应有样式行，
+                # 若文件把样式写在几何行之前则归给首个对象，避免丢样式）
+                if started:
+                    styles.append(pending if pending else None)
+                    pending = None
+                started = True
                 continue
             # 坐标续行/注释忽略
-        if pending is not None:
+        if started:
             styles.append(pending if pending else None)
         return styles if styles else None
 
@@ -998,8 +1076,7 @@ class MapInfoParser:
             if ext_lower == '.kml':
                 file_styles = MapInfoParser._parse_kml_styles(file_path)
             elif ext_lower == '.tab' and tab_file and tab_file.exists():
-                map_file = tab_file.with_suffix('.map')
-                file_styles = MapInfoParser._extract_tab_map_styles(map_file)
+                file_styles = MapInfoParser._extract_tab_styles(tab_file)
             elif ext_lower == '.mif':
                 file_styles = MapInfoParser._extract_mif_styles(file_path)
 
@@ -1014,6 +1091,13 @@ class MapInfoParser:
                     features=[],
                     metadata={'source_file': path_str, 'feature_count': 0, **tab_metadata}
                 )
+
+            # 样式列表与要素行必须一一对应（同一驱动、同一遍历顺序）；数量不符说明
+            # 解析异常，直接丢弃样式，避免要素串色
+            if file_styles and len(file_styles) != len(gdf):
+                print(f"[MapInfoParser] {file_path.name} 样式数({len(file_styles)})"
+                      f"与要素数({len(gdf)})不一致，回退默认配色")
+                file_styles = None
 
             # 判断主要几何类型
             first_geom = gdf.geometry.iloc[0]
@@ -1706,8 +1790,13 @@ def prebuild_layer_geojson_cache(data_id: str, data_dir: Path, layers: List[Dict
 
 
 def layer_cache_dir(data_dir: Path) -> Path:
-    """图层 GeoJSON 落盘缓存目录（v2：明文 + 预压缩 gz + mtime 标记）。"""
-    return data_dir / ".cache" / "v2"
+    """图层 GeoJSON 落盘缓存目录（v4：明文 + 预压缩 gz + mtime 标记）。
+
+    v3：TAB 改为读取文件真实样式（OGR 样式串）后 _style 内容变化，
+    v4：TAB 点不再输出 markerSymbol（改 Canvas 圆点渲染）且修正 MIF 颜色整数字节序，
+    旧缓存里的样式必须失效，否则已导入图层仍按旧样式渲染（缓存只按源文件 mtime 判定）。
+    """
+    return data_dir / ".cache" / "v4"
 
 
 def layer_version_etag(data_dir: Path, layer_id: str) -> Optional[str]:

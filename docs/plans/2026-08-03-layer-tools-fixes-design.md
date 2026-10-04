@@ -23,6 +23,15 @@ MIF 能生效是因为 MIF 是**纯文本**格式（`Pen`/`Brush`/`Symbol` 直�
 
 **结论**: 后端**无法**通过 GDAL 给 TAB 注入颜色/线宽/透明度/点大小/点形状。这是 MapInfo 格式 + 工具链的硬限制。
 
+> **2026-09-21 更正（本文档上述结论有误，勿再据此实现）**：GDAL 的 MITAB 驱动**能**写样式，
+> 只是入口是要素的 **OGR 样式串**（由 `IMapInfoFile::CreateTABFeature` →
+> `ITabFeaturePen/Brush/Symbol::Set*FromStyleString` → `TABMAPFile::WritePenDef/WriteBrushDef/WriteSymbolDef`
+> 落进 `.map` 定义表），而 pyogrio 不暴露 `OGR_F_SetStyleString`：
+> - 在 TAB 写完后以 UPDATE 模式补写样式串**无效**（`SetFeature` 成功但样式不落盘）；
+> - **带样式的 MIF → TAB 转换保留样式**（走创建路径），实测含万级要素图层样式完整。
+>
+> 现实现：`layer_service._write_styled_tab`（临时 MIF → `tab_style_writer.convert_mif_to_tab`）。
+
 ### 1.2 透明度逻辑反了
 
 **现象**: 扇区制作透明度数值越大出来的图形越不透明，正确应为数值越大越透明。

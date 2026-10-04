@@ -9,8 +9,8 @@
  * - 图层文件: 外部导入的MapInfo文件
  * - 右键菜单支持标签设置
  */
-import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
-import { ChevronDown, ChevronRight, Map, Folder, File, X, Satellite, Radio, MapPin, Route, Hexagon, Settings, Maximize2, MousePointer2, Pencil, Type } from 'lucide-react'
+import { useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo } from 'react'
+import { ChevronDown, ChevronRight, Map, Folder, File, X, Satellite, Radio, MapPin, Route, Hexagon, Settings, Maximize2, MousePointer2, Pencil, Type, Layers } from 'lucide-react'
 import { HexColorPicker } from 'react-colorful'
 import { useTranslation } from 'react-i18next'
 import { NetworkType } from '../../config/sector-config'
@@ -43,6 +43,38 @@ const PREDEFINED_LABEL_FIELDS: FieldOption[] = [
   { value: 'isShared', label: '是否共享' },
   { value: 'firstGroup', label: '厂家' }
 ]
+
+/**
+ * 悬浮图标/面板拖拽相关常量
+ */
+interface Point { x: number; y: number }
+const LAYER_ICON_SIZE = 36
+const LAYER_ICON_DEFAULT_POS: Point = { x: 12, y: 12 }
+const LAYER_ICON_POS_STORAGE_KEY = 'npt-layer-icon-pos'
+/** 指针移动超过该距离才判定为拖拽，否则视为点击 */
+const LAYER_DRAG_THRESHOLD = 4
+/** 面板宽度下/上限（上限仅防止过窄无法使用；宽度上限在 resize 时按容器剩余宽度动态计算） */
+const LAYER_PANEL_MIN_WIDTH = 200
+
+/** 读取持久化的悬浮图标位置 */
+function loadLayerIconPos(): Point {
+  try {
+    const raw = localStorage.getItem(LAYER_ICON_POS_STORAGE_KEY)
+    if (raw) {
+      const p = JSON.parse(raw)
+      if (typeof p.x === 'number' && typeof p.y === 'number') return p
+    }
+  } catch { /* ignore */ }
+  return LAYER_ICON_DEFAULT_POS
+}
+
+/** 将位置钳制在容器范围内 */
+function clampPoint(p: Point, bw: number, bh: number, sizeW: number, sizeH = sizeW): Point {
+  return {
+    x: Math.min(Math.max(p.x, 0), Math.max(0, bw - sizeW)),
+    y: Math.min(Math.max(p.y, 0), Math.max(0, bh - sizeH)),
+  }
+}
 
 // 预定义字段的翻译map - 用于动态获取翻译
 const PREDEFINED_FIELDS_I18N: Record<string, string> = {
@@ -276,7 +308,7 @@ export interface LayerControlProps {
   /** 各图层在地图上的热力统计（含渲染场分布，供设置弹窗按同一基准做分级预览） */
   heatmapStats?: Record<string, HeatmapStats | null>
   /** 外部跳转指令：打开指定图层的专题/热力图设置页（图例双击） */
-  openThematicFor?: { layerId: string; ts: number; subTab?: 'thematic' | 'heatmap' } | null
+  openThematicFor?: { layerId: string; ts: number; subTab?: 'basic' | 'thematic' | 'heatmap' } | null
   /** 图层预览回调（右键菜单：居中并最大化显示该图层全部要素） */
   onLayerPreview?: (fileId: string) => void
   /** 已保存的区间配色模板列表 */
@@ -295,10 +327,8 @@ export interface LayerControlProps {
   sectorData?: { lte: any[]; nr: any[] }
   /** 频点自定义配色变化回调（默认设置模式下点击频点色块） */
   onFrequencyColorChange?: (networkType: NetworkType, frequency: number, colors: { color: string; strokeColor: string }) => void
-  /** 装饰图层 */
+  /** 装饰图层（恒显不可关闭，无可见性开关） */
   decorationLayer?: DecorationLayerOption
-  /** 装饰图层可见性变化回调 */
-  onDecorationLayerToggle?: (visible: boolean) => void
   /** 装饰图层标签可见性 */
   decorationLabelVisible?: boolean
   /** 装饰图层标签可见性变化回调 */
@@ -358,7 +388,6 @@ export function LayerControl({
   onSaveHeatmapTemplate,
   onRemoveHeatmapTemplate,
   decorationLayer,
-  onDecorationLayerToggle,
   decorationLabelVisible,
   onDecorationLabelToggle,
   sectorData,
@@ -378,10 +407,31 @@ export function LayerControl({
   const persistedColorSettings = colorSettingsMap ?? mapSettings.colorSettingsMap ?? {}
   const persistedThematicSettings = thematicSettingsMap ?? mapSettings.thematicSettingsMap ?? {}
   const persistedHeatmapSettings = heatmapSettingsMap ?? mapSettings.heatmapSettingsMap ?? {}
-  // 边界裁剪的可选面图层：图层文件 + 地理化数据中的面类型（两者都带来源标记供分别加载）
+
+  /**
+   * 打开自定义设置弹框时的状态快照（实时预览会改写 store/地图，取消时据此恢复）。
+   * 各类设置记录"打开时实际生效值"（含未持久化的默认值），可见性按节点类型记录。
+   */
+  interface SettingsSnapshot {
+    node: TreeNode
+    layerId: string
+    label: LabelSettings
+    color: LayerColorSettings
+    thematic: ThematicSettings | null
+    heatmap: HeatmapSettings | null
+    layerVisible: boolean
+    sectorVisible: boolean
+    sectorLabelVisible: boolean
+    pointLabelVisible: boolean | undefined
+    layerFileLabelVisible: boolean | undefined
+  }
+  const settingsSnapshotRef = useRef<SettingsSnapshot | null>(null)
+
+  // 边界裁剪的可选面图层：图层文件（polygon + 可绘制面的 mixed 混合图层）
+  // 与地理化数据中的面类型（两者都带来源标记供分别加载）
   const polygonLayers = useMemo(
     () => [
-      ...layerFiles.filter(f => f.type === 'polygon').map(f => ({ id: f.id, dataId: f.dataId, name: f.name, source: 'mapinfo' as const })),
+      ...layerFiles.filter(f => f.type === 'polygon' || f.type === 'mixed').map(f => ({ id: f.id, dataId: f.dataId, name: f.name, source: 'mapinfo' as const })),
       ...pointFiles.filter(f => f.type === 'polygon').map(f => ({ id: f.id, dataId: f.dataId, name: f.name, source: 'excel' as const })),
     ],
     [layerFiles, pointFiles]
@@ -745,14 +795,23 @@ export function LayerControl({
               }
             })
           },
-          // 图层文件分组 (MapInfo)
-          ...(layerFiles.length > 0 ? [
-            {
-              id: 'layer-files',
-              type: 'layer-files' as TreeNodeType,
-              label: t('map.layerFiles'),
-              expanded: isExpanded('layer-files', true),
-              children: orderWithIds(layerOrder?.mapinfo, layerFiles.map(f => f.id))
+          // 图层文件分组 (MapInfo)：装饰图层固定在组内最顶部（恒显不可关、不参与拖拽排序），
+          // 分组常显（无图层文件时也要能操作装饰图层）
+          {
+            id: 'layer-files',
+            type: 'layer-files' as TreeNodeType,
+            label: t('map.layerFiles'),
+            expanded: isExpanded('layer-files', true),
+            children: [
+              ...(decorationLayer ? [
+                {
+                  id: 'decoration-layer',
+                  type: 'decoration-layer' as TreeNodeType,
+                  label: decorationLayer.name,
+                  decorationLayer: decorationLayer
+                }
+              ] : []),
+              ...orderWithIds(layerOrder?.mapinfo, layerFiles.map(f => f.id))
                 .map(id => layerFiles.find(f => f.id === id)!)
                 .map(file => ({
                 id: file.id,
@@ -765,8 +824,8 @@ export function LayerControl({
                   visible: layerFileLabelVisibility[file.id] || false
                 }
               }))
-            }
-          ] : []),
+            ]
+          },
           // 地理化数据分组 (Excel)
           {
             id: 'custom-group',
@@ -805,16 +864,7 @@ export function LayerControl({
                 customLayer: layer
               }))
             ]
-          },
-          // 装饰图层（打点、定位标记等）- 无子节点，复选框直接在标题旁
-          ...(decorationLayer ? [
-            {
-              id: 'decoration-layer',
-              type: 'decoration-layer' as TreeNodeType,
-              label: decorationLayer.name,
-              decorationLayer: decorationLayer
-            }
-          ] : [])
+          }
         ]
       }
     ]
@@ -965,41 +1015,127 @@ export function LayerControl({
     onMapTypeChange?.(type)
   }
 
-  // 添加显示/隐藏状态管理
-  const [isVisible, setIsVisible] = useState(true) // 默认展开
-  const [isPinned, setIsPinned] = useState(true) // 默认固定侧边栏
-  const [isPinHovered, setIsPinHovered] = useState(false) // 控件是否被悬停
+  // ===== 悬浮图标 + 全高浮动控制面板 =====
+  // 面板默认收起，仅显示黑白"图层堆叠"悬浮图标；图标位置持久化
+  const [expanded, setExpanded] = useState(true)
+  const [iconPos, setIconPos] = useState<Point>(loadLayerIconPos)
+  // 面板展开时默认完全贴合地图上、左边界 (0,0)；高度铺满，仅横向拖拽
+  const [panelPos, setPanelPos] = useState<Point>({ x: 0, y: 0 })
+  const [panelWidth, setPanelWidth] = useState(480)
+  // 地图容器尺寸（面板高度铺满，位置/宽度据此钳制）
+  const [containerSize, setContainerSize] = useState({ w: 0, h: 0 })
 
-  // 面板引用
+  // 图标/面板元素引用（offsetParent 即 relative 地图容器）
+  const iconBtnRef = useRef<HTMLDivElement>(null)
   const panelRef = useRef<HTMLDivElement>(null)
-
-  // 点击控件 - 切换固定/隐藏状态
-  const handleTogglePin = useCallback((e: React.MouseEvent) => {
-    e.stopPropagation()
-    if (isPinned) {
-      // 取消固定，隐藏面板
-      setIsPinned(false)
-      setIsVisible(false)
-    } else {
-      // 固定面板
-      setIsPinned(true)
-      setIsVisible(true)
-    }
-  }, [isPinned])
-
-  // 面板宽度状态
-  const [panelWidth, setPanelWidth] = useState(240)
+  // 宽度拖拽调整状态
   const isResizing = useRef(false)
   const startX = useRef(0)
   const startWidth = useRef(0)
+  /** 当前位置下面板允许的最大宽度（铺满到容器右边缘） */
+  const resizeMaxWidth = useRef(LAYER_PANEL_MIN_WIDTH)
 
-  // 按钮现在在面板容器内部，使用 left: -40px 相对于面板定位
+  /**
+   * 指针拖拽交互状态。指针按下时记录起点，移动超过阈值才进入拖拽，
+   * 未超过阈值则在抬起时按"点击"处理（图标点击 → 展开面板）。
+   */
+  const dragStateRef = useRef<{
+    target: 'icon' | 'panel'
+    pointerId: number
+    startX: number
+    startY: number
+    origin: Point
+    bw: number
+    bh: number
+    moved: boolean
+  } | null>(null)
 
-  // 开始调整大小
+  // 悬浮图标位置持久化
+  useEffect(() => {
+    try { localStorage.setItem(LAYER_ICON_POS_STORAGE_KEY, JSON.stringify(iconPos)) } catch { /* ignore */ }
+  }, [iconPos])
+
+  // 测量地图容器尺寸（展开/收起后重新定位 offsetParent）
+  useLayoutEffect(() => {
+    const el = (iconBtnRef.current?.offsetParent ?? panelRef.current?.offsetParent ?? null) as HTMLElement | null
+    if (!el) return
+    const update = () => setContainerSize({ w: el.clientWidth, h: el.clientHeight })
+    update()
+    const ro = new ResizeObserver(update)
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [expanded])
+
+  // 容器尺寸/面板宽度变化时，将图标/面板钳制回可视范围
+  useEffect(() => {
+    if (!containerSize.w || !containerSize.h) return
+    setIconPos(prev => {
+      const next = clampPoint(prev, containerSize.w, containerSize.h, LAYER_ICON_SIZE)
+      return next.x === prev.x && next.y === prev.y ? prev : next
+    })
+    setPanelPos(prev => {
+      // 面板高度铺满：y 恒为 0；x 保证右边缘恰好贴到容器右边缘为止
+      const x = Math.min(Math.max(prev.x, 0), Math.max(0, containerSize.w - panelWidth))
+      return x === prev.x && prev.y === 0 ? prev : { x, y: 0 }
+    })
+  }, [containerSize, panelWidth])
+
+  /** 指针按下：记录拖拽起点（图标/面板标题栏共用） */
+  const beginDrag = (e: React.PointerEvent, target: 'icon' | 'panel') => {
+    if (e.button !== 0) return
+    const el = e.currentTarget as HTMLElement
+    // 边界容器必须取"被拖动元素"自己的 offsetParent：标题栏的 offsetParent 是
+    // 面板自身（面板 absolute），直接用会拿到面板宽度，导致横向拖不动
+    const draggedEl = target === 'icon' ? el : panelRef.current
+    const container = draggedEl?.offsetParent as HTMLElement | null
+    dragStateRef.current = {
+      target,
+      pointerId: e.pointerId,
+      startX: e.clientX,
+      startY: e.clientY,
+      origin: target === 'icon' ? iconPos : panelPos,
+      bw: container?.clientWidth ?? window.innerWidth,
+      bh: container?.clientHeight ?? window.innerHeight,
+      moved: false
+    }
+    el.setPointerCapture(e.pointerId)
+  }
+
+  /** 指针移动：超过阈值后实时更新位置 */
+  const moveDrag = (e: React.PointerEvent) => {
+    const st = dragStateRef.current
+    if (!st || e.pointerId !== st.pointerId) return
+    const dx = e.clientX - st.startX
+    const dy = e.clientY - st.startY
+    if (!st.moved && Math.hypot(dx, dy) > LAYER_DRAG_THRESHOLD) st.moved = true
+    if (!st.moved) return
+    if (st.target === 'icon') {
+      setIconPos(clampPoint({ x: st.origin.x + dx, y: st.origin.y + dy }, st.bw, st.bh, LAYER_ICON_SIZE))
+    } else {
+      // 面板高度铺满地图，仅横向任意移动；x 最大到右边缘恰好贴容器右边
+      const x = Math.min(Math.max(st.origin.x + dx, 0), Math.max(0, st.bw - panelWidth))
+      setPanelPos({ x, y: 0 })
+    }
+  }
+
+  /** 指针抬起：未发生拖拽位移时，图标视为点击 → 面板贴合上、左边界展开 */
+  const endDrag = (e: React.PointerEvent) => {
+    const st = dragStateRef.current
+    if (!st || e.pointerId !== st.pointerId) return
+    dragStateRef.current = null
+    if (st.moved || st.target !== 'icon') return
+    setPanelPos({ x: 0, y: 0 })
+    setExpanded(true)
+  }
+
+  // 开始拖拽调整宽度
   const startResize = (e: React.MouseEvent) => {
     isResizing.current = true
     startX.current = e.clientX
     startWidth.current = panelWidth
+    // 宽度上限动态化：从当前位置一直拉到容器右边缘（可任意拉大，铺满剩余宽度）
+    const container = panelRef.current?.offsetParent as HTMLElement | null
+    resizeMaxWidth.current = (container?.clientWidth ?? window.innerWidth) - panelPos.x
 
     document.addEventListener('mousemove', doResize)
     document.addEventListener('mouseup', stopResize)
@@ -1009,9 +1145,8 @@ export function LayerControl({
   // 执行调整大小
   const doResize = (e: MouseEvent) => {
     if (!isResizing.current) return
-    // 面板在左侧，向右拖动（X增大）增加宽度
     const delta = e.clientX - startX.current
-    const newWidth = Math.max(200, Math.min(500, startWidth.current + delta))
+    const newWidth = Math.max(LAYER_PANEL_MIN_WIDTH, Math.min(resizeMaxWidth.current, startWidth.current + delta))
     setPanelWidth(newWidth)
   }
 
@@ -1042,6 +1177,17 @@ export function LayerControl({
   }
 
   /**
+   * "图层预览"菜单可用性：装饰图层恒显（无可关闭开关），扇区/图层文件需已勾选
+   */
+  const previewMenuEnabled = contextMenu
+    ? (contextMenu.type === 'decoration-layer'
+      ? true
+      : contextMenu.type === 'sector-layer'
+        ? isSectorVisible(contextMenu.nodeId)
+        : isFileVisible(contextMenu.nodeId))
+    : false
+
+  /**
    * 打开图层设置弹窗（右键 / 图例双击跳转共用）
    * @param node 目标图层节点
    * @param tab 初始标签页
@@ -1064,11 +1210,8 @@ export function LayerControl({
         layerId = node.layerFile.id
       }
 
-      // 从持久化 store 获取已保存的设置
-      const savedSettings = persistedLabelSettings[layerId]
-
-      // 设置当前配置（先显示默认或已保存的配置）
-      setCurrentLabelSettings(savedSettings || {
+      // 打开时实际生效的标签设置：已保存值或默认（默认对象同时用于快照，取消时恢复用）
+      const effectiveLabel: LabelSettings = persistedLabelSettings[layerId] || {
         content: 'name',
         color: '#000000',
         fontSize: 12,
@@ -1078,17 +1221,21 @@ export function LayerControl({
         shadow: false,
         background: 'none',
         backgroundColor: '#ffffff'
-      })
+      }
+      setCurrentLabelSettings(effectiveLabel)
 
       // 载入已保存的颜色设置（无保存设置时，用图层文件自带的默认样式初始化，
       // 还原 tab/mif/kml 的默认属性配置：填充色/线宽/透明度）
-      const savedColor = persistedColorSettings[layerId]
       const ds = node.type === 'layer-file' ? node.layerFile?.defaultStyle : undefined
       const geomType = node.type === 'layer-file' ? node.layerFile?.type : undefined
-      setCurrentColorSettings(savedColor || (node.type === 'sector-layer'
-        // 基站（扇区）图层默认设置：图形透明度 100%、边框宽度 1px（与 SECTOR_CONFIG 默认渲染一致）
-        ? { fillColor: '#3b82f6', fillOpacity: 1, borderWidth: 1, borderColor: '#000000' }
-        : {
+      const defaultColor: LayerColorSettings = (node.type === 'sector-layer'
+        // 基站（扇区）图层默认设置：图形透明度 100%、边框宽度 1px（与 SECTOR_CONFIG 默认渲染一致）；
+        // 小区PCI渲染默认关闭，开启后 LTE 默认模3、NR 默认模30
+        ? {
+          fillColor: '#3b82f6', fillOpacity: 1, borderWidth: 1, borderColor: '#000000',
+          pciRenderEnabled: false,
+          pciMod: node.sectorLayer?.type === 'NR' ? 30 : 3
+        } : {
           fillColor: ds?.fillColor || ds?.markerColor || '#3b82f6',
           fillOpacity: ds?.fillOpacity ?? 0.6,
           borderWidth: ds?.strokeWidth ?? 2,
@@ -1097,16 +1244,37 @@ export function LayerControl({
           borderColor: geomType === 'point' || geomType === 'polygon'
             ? NO_FILL_COLOR
             : (ds?.strokeColor || '#000000')
-        }))
+        })
+      const effectiveColor: LayerColorSettings = persistedColorSettings[layerId] || defaultColor
+      setCurrentColorSettings(effectiveColor)
 
       // 专题图层设置初始化（图层文件类与扇区类）+ 字段值样本提取（cache-first）
       // 注意：扇区类也必须从持久化初始化（或置空），否则会残留上次打开图层文件时
       // 的专题激活状态，导致"基站"图层颜色设置被错误禁用
+      const effectiveThematic = persistedThematicSettings[layerId] ?? null
+      const effectiveHeatmap = persistedHeatmapSettings[layerId] ?? null
       if (node.type === 'layer-file' || node.type === 'sector-layer') {
-        setCurrentThematicSettings(persistedThematicSettings[layerId] ?? null)
-        setCurrentHeatmapSettings(persistedHeatmapSettings[layerId] ?? null)
+        setCurrentThematicSettings(effectiveThematic)
+        setCurrentHeatmapSettings(effectiveHeatmap)
         setCurrentHeatmapStats(heatmapStats?.[layerId] ?? null)
         extractThematicSamples(node)
+      }
+
+      // 记录打开时快照（取消时恢复；可见性按节点类型从当前 props 收集）
+      const layerFile = [...layerFiles, ...pointFiles].find(f => f.id === layerId)
+      const sector = sectors.find(s => s.id === layerId)
+      settingsSnapshotRef.current = {
+        node,
+        layerId,
+        label: effectiveLabel,
+        color: effectiveColor,
+        thematic: effectiveThematic,
+        heatmap: effectiveHeatmap,
+        layerVisible: layerFile?.visible ?? true,
+        sectorVisible: sector?.visible ?? true,
+        sectorLabelVisible: sectorLabelVisibility[layerId] ?? false,
+        pointLabelVisible: pointFileLabelVisibility[layerId],
+        layerFileLabelVisible: layerFileLabelVisibility[layerId],
       }
 
       // 异步加载字段选项（不阻塞对话框显示）
@@ -1225,25 +1393,15 @@ export function LayerControl({
     e.preventDefault()
     e.stopPropagation()
 
-    // 图层文件/地理化数据/扇区图层：右键弹出冒泡菜单（自定义设置 / 图层预览）
-    if (node.type === 'layer-file' || node.type === 'sector-layer') {
+    // 图层文件/地理化数据/扇区图层/装饰图层：右键弹出冒泡菜单
+    // 装饰图层无"自定义设置"入口：其样式统一在工具栏「样式」面板（点/线/面绘制样式）配置，
+    // 右键仅提供"图层预览"
+    if (node.type === 'layer-file' || node.type === 'sector-layer' || node.type === 'decoration-layer') {
       setContextMenu({
         x: e.clientX,
         y: e.clientY,
         nodeId: node.id,
         type: node.type
-      })
-    } else if (node.type === 'decoration-layer') {
-      setShowLabelSettingsModal(true)
-      setCurrentSettingsNode(node)
-      setActiveTab('color')
-      setModalInitialSubTab(undefined)
-      const savedColor = persistedColorSettings['decoration-layer']
-      setCurrentColorSettings(savedColor || {
-        fillColor: '#ef4444',
-        fillOpacity: 1,
-        borderWidth: 2,
-        borderColor: '#ffffff'
       })
     } else if (node.type === 'custom-layer') {
       // 自定义图层支持卸载
@@ -1314,9 +1472,8 @@ export function LayerControl({
     // MapPage中的onLabelSettingsChange会自动处理：更新配置状态 + 设置可见性为true + 立即应用到地图
     onLabelSettingsChange?.(node, settings)
 
-    // 更新本地状态
+    // 更新本地状态（弹窗关闭由 Modal 保存路径自行处理；预览复用本 handler 时不关窗）
     setCurrentLabelSettings(settings)
-    setShowLabelSettingsModal(false)
   }
 
   /**
@@ -1344,9 +1501,8 @@ export function LayerControl({
     // 通知父组件应用到地图
     onColorSettingsChange?.(node, settings)
 
-    // 更新本地状态
+    // 更新本地状态（弹窗关闭由 Modal 保存路径自行处理；预览复用本 handler 时不关窗）
     setCurrentColorSettings(settings)
-    setShowLabelSettingsModal(false)
   }
 
   /**
@@ -1372,9 +1528,8 @@ export function LayerControl({
     // 通知父组件应用到地图
     onThematicSettingsChange?.(node, settings)
 
-    // 更新本地状态
+    // 更新本地状态（弹窗关闭由 Modal 保存路径自行处理；预览复用本 handler 时不关窗）
     setCurrentThematicSettings(settings)
-    setShowLabelSettingsModal(false)
   }
 
   /**
@@ -1402,6 +1557,39 @@ export function LayerControl({
 
     // 更新本地状态
     setCurrentHeatmapSettings(settings)
+  }
+
+  /**
+   * 取消自定义设置：按打开时快照恢复四类设置（重新 apply 到 store/地图）与全部
+   * 图层/标签可见性，再关闭弹窗。设置恢复时 MapPage change handler 可能强制可见，
+   * 故可见性恢复放在设置之后，以快照为准。
+   */
+  const handleCancelSettings = () => {
+    const snap = settingsSnapshotRef.current
+    if (snap) {
+      handleSaveHeatmapSettings(snap.heatmap)
+      handleSaveThematicSettings(snap.thematic)
+      handleSaveColorSettings(snap.color)
+      handleSaveLabelSettings(snap.label)
+
+      if (snap.node.type === 'layer-file') {
+        onLayerFileToggle?.(snap.layerId, snap.layerVisible)
+        const inLayerFiles = layerFiles.some(f => f.id === snap.layerId)
+        if (inLayerFiles) {
+          if (snap.layerFileLabelVisible !== undefined) {
+            onLayerFileLabelToggle?.(snap.layerId, snap.layerFileLabelVisible)
+          }
+        } else {
+          // Excel 地理化点文件标签开关；打开前无记录时按 false 恢复（=不显示）
+          onPointFileLabelToggle?.(snap.layerId, snap.pointLabelVisible ?? false)
+        }
+      } else if (snap.node.type === 'sector-layer') {
+        onSectorToggle?.(snap.layerId, snap.sectorVisible)
+        onSectorLabelToggle?.(snap.layerId, snap.sectorLabelVisible)
+      }
+    }
+    settingsSnapshotRef.current = null
+    setShowLabelSettingsModal(false)
   }
 
   return (
@@ -1437,222 +1625,190 @@ export function LayerControl({
           scrollbar-width: none;
           overflow: hidden !important;
         }
-        /* 自定义复选框样式 */
-        .custom-checkbox {
-          position: relative;
-          display: inline-block;
-          width: 14px;
-          height: 14px;
-        }
-        .custom-checkbox input {
-          opacity: 0;
-          width: 0;
-          height: 0;
-        }
-        .custom-checkbox .checkmark {
-          position: absolute;
-          top: 0;
-          left: 0;
-          width: 14px;
-          height: 14px;
-          background-color: hsl(var(--muted));
-          border: 2px solid hsl(var(--border));
-          border-radius: 4px;
-          transition: all 0.2s ease;
-        }
-        .custom-checkbox:hover input ~ .checkmark {
-          background-color: hsl(var(--accent));
-          border-color: hsl(var(--muted-foreground));
-        }
-        .custom-checkbox input:checked ~ .checkmark {
-          background-color: hsl(var(--primary));
-          border-color: hsl(var(--primary));
-        }
-        .custom-checkbox .checkmark:after {
-          content: "";
-          position: absolute;
-          display: none;
-          left: 4px;
-          top: 1px;
-          width: 4px;
-          height: 8px;
-          border: solid hsl(var(--primary-foreground));
-          border-width: 0 2px 2px 0;
-          transform: rotate(45deg);
-        }
-        .custom-checkbox input:checked ~ .checkmark:after {
-          display: block;
-        }
+        /* 标准复选框样式统一定义在全局 index.css（.layer-standard-checkbox），
+           导出/保存等独立对话框复用同一尺寸 */
       `}</style>
 
-      {/* 悬停检测区域 - 面板隐藏时显示在左侧边缘 */}
-      <div
-        onMouseEnter={() => {
-          if (!isPinned && !isVisible) {
-            setIsVisible(true)
-          }
-        }}
-        onMouseLeave={() => {
-          if (!isPinned && isVisible) {
-            setIsVisible(false)
-          }
-        }}
-        style={{
-          position: 'absolute',
-          top: 0,
-          left: 0,
-          width: '24px',
-          height: '100%',
-          zIndex: 997,
-          pointerEvents: isPinned || isVisible ? 'none' : 'auto',
-          backgroundColor: 'transparent',
-        }}
-      />
-
-      {/* 图层控制面板容器 - 相对于父容器定位，高度匹配地图窗口 */}
-      <div
-        style={{
-          position: 'absolute',
-          top: 0,
-          left: 0,
-          height: '100%',
-          width: `${panelWidth}px`,
-          zIndex: 998,
-          pointerEvents: 'none',
-        }}
-      >
-        {/* 图层控制面板 - 从左侧滑入/滑出 */}
+      {/* 收起态：黑白"图层堆叠"悬浮图标（通用图层符号，可自由拖拽，点击展开） */}
+      {!expanded && (
         <div
-          ref={panelRef}
-          className="layer-control"
+          ref={iconBtnRef}
+          role="button"
+          aria-label={t('map.layers')}
+          title={t('map.layers')}
+          onPointerDown={(e) => beginDrag(e, 'icon')}
+          onPointerMove={moveDrag}
+          onPointerUp={endDrag}
+          onPointerCancel={endDrag}
+          onMouseEnter={(e) => { e.currentTarget.style.boxShadow = '0 4px 12px rgba(0,0,0,0.3)' }}
+          onMouseLeave={(e) => { e.currentTarget.style.boxShadow = '0 2px 8px rgba(0,0,0,0.22)' }}
           style={{
             position: 'absolute',
-            top: '0px',
-            left: '0px',
-            zIndex: 1000,
-            pointerEvents: isVisible ? 'auto' : 'none',
-            backgroundColor: 'hsl(var(--popover) / 0.98)',
-            backdropFilter: 'blur(12px)',
-            borderRadius: '0',
-            boxShadow: 'none',
-            width: `${panelWidth}px`,
-            minWidth: '240px',
-            height: '100%',
-            maxHeight: '100%',
-            overflow: 'hidden',
-            fontSize: '12px',
-            border: 'none',
-            boxSizing: 'border-box',
-            transition: 'transform 0.35s cubic-bezier(0.25, 0.1, 0.25, 1), opacity 0.35s ease',
-            transform: isVisible ? 'translateX(0)' : `translateX(-${panelWidth + 10}px)`,
-            opacity: isVisible ? 1 : 0,
-          }}
-          onMouseEnter={() => {
-            // 鼠标进入面板时，如果未固定则保持显示
-            if (!isPinned) {
-              setIsVisible(true)
-            }
-          }}
-          onMouseLeave={() => {
-            // 鼠标离开面板时，如果未固定则隐藏
-            if (!isPinned) {
-              setIsVisible(false)
-            }
-          }}
-        >
-        {/* 拖动调整手柄 */}
-        <div
-          onMouseDown={startResize}
-          style={{
-            position: 'absolute',
-            right: 0,
-            top: 0,
-            bottom: 0,
-            width: '8px',
-            cursor: 'ew-resize',
-            zIndex: 10,
-            backgroundColor: 'hsl(var(--muted) / 0.5)',
-            transition: 'background-color 0.2s ease',
-          }}
-          onMouseEnter={(e) => e.currentTarget.style.backgroundColor = 'hsl(var(--primary) / 0.2)'}
-          onMouseLeave={(e) => e.currentTarget.style.backgroundColor = 'hsl(var(--muted) / 0.5)'}
-          title="拖动调整宽度"
-        />
-
-        {/* 固定/解开控件 - 位于面板内部右上角 */}
-        <button
-          onClick={handleTogglePin}
-          style={{
-            position: 'absolute',
-            top: '10px',
-            right: '10px',
-            zIndex: 1003,
-            pointerEvents: 'auto',
-            backgroundColor: 'transparent',
-            cursor: 'pointer',
-            padding: '4px 8px',
-            borderRadius: '4px',
-            border: 'none',
+            left: iconPos.x,
+            top: iconPos.y,
+            width: `${LAYER_ICON_SIZE}px`,
+            height: `${LAYER_ICON_SIZE}px`,
+            borderRadius: '10px',
+            background: 'hsl(var(--popover))',
+            border: '1px solid hsl(var(--border))',
+            boxShadow: '0 2px 8px rgba(0,0,0,0.22)',
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'center',
-            color: isPinned ? 'hsl(var(--primary))' : 'hsl(var(--muted-foreground))',
-            fontSize: '16px',
-            fontWeight: 500,
-            transition: 'color 0.2s ease',
+            cursor: 'grab',
+            touchAction: 'none',
+            zIndex: 1000,
+            transition: 'box-shadow 0.2s ease'
           }}
-          title={isPinned ? '解开固定' : '固定侧边栏'}
         >
-          ⇌
-        </button>
+          {/* 三层水平堆叠的图层片层：GIS/设计软件通用的"图层"符号，
+              图标/底色用主题 token（浅色=白底深图标、深色=深底浅图标），跟随系统主题 */}
+          <Layers size={20} color="hsl(var(--foreground))" strokeWidth={2} />
+        </div>
+      )}
 
-        {/* 内容容器 - 处理滚动 */}
-        <div style={{
-          height: '100%',
-          maxHeight: '100%',
-          overflowY: 'auto',
-          overflowX: 'hidden',
-          paddingTop: '8px',
-          paddingLeft: '8px',
-          paddingRight: '8px',
-          paddingBottom: '24px',
-          boxSizing: 'border-box',
-        }}>
-          {/* 渲染树 */}
-          {tree.map(rootNode => (
-            <TreeNodeComponent
-              key={rootNode.id}
-              node={rootNode}
-              level={0}
-              onToggle={toggleNode}
-              onSectorToggle={handleSectorToggle}
-              onSectorLabelToggle={onSectorLabelToggle}
-              onLayerFileToggle={handleLayerFileToggle}
-              onMapTypeChange={handleMapTypeChange}
-              onFrequencyToggle={onFrequencyToggle}
-              onCustomLayerToggle={onCustomLayerToggle}
-              onLayerFileRemove={onLayerFileRemove}
-              onCustomLayerRemove={onCustomLayerRemove}
-              onPointFileLabelToggle={onPointFileLabelToggle}
-              onLayerFileLabelToggle={onLayerFileLabelToggle}
-              onDecorationLayerToggle={onDecorationLayerToggle}
-              onDecorationLabelToggle={onDecorationLabelToggle}
-              decorationLabelVisible={decorationLabelVisible}
-              onContextMenu={handleContextMenu}
-              mapType={mapType}
-              pointFileLabelVisibility={pointFileLabelVisibility}
-              layerFileLabelVisibility={layerFileLabelVisibility}
-              onFrequencyColorChange={onFrequencyColorChange}
-              sectorThematicActive={sectorThematicActive}
-              selectable={selectableProps}
-              editable={editableProps}
-              labelToggleHint={t('map.showLabelsHint') || '显示/隐藏要素文字标签'}
-              dnd={dndProps}
-            />
-          ))}
+      {/* 展开态：全高浮动控制面板（默认贴合上、左边界；标题栏横向拖拽，X 收起） */}
+      {expanded && (
+        <div
+          ref={panelRef}
+          data-testid="layer-panel"
+          style={{
+            position: 'absolute',
+            left: panelPos.x,
+            top: 0,
+            zIndex: 1000,
+            width: `${panelWidth}px`,
+            height: containerSize.h ? `${containerSize.h}px` : '100%',
+            display: 'flex',
+            flexDirection: 'column',
+            backgroundColor: 'hsl(var(--popover) / 0.98)',
+            backdropFilter: 'blur(12px)',
+            border: '1px solid hsl(var(--border))',
+            borderRadius: 0,
+            boxShadow: '4px 0 16px rgba(0,0,0,0.16)',
+            overflow: 'hidden',
+            fontSize: '12px',
+            boxSizing: 'border-box'
+          }}
+        >
+          {/* 标题栏 - 拖拽手柄 */}
+          <div
+            onPointerDown={(e) => {
+              // 按在按钮上不发起拖拽
+              if ((e.target as Element).closest('button')) return
+              beginDrag(e, 'panel')
+            }}
+            onPointerMove={moveDrag}
+            onPointerUp={endDrag}
+            onPointerCancel={endDrag}
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              padding: '6px 10px',
+              borderBottom: '1px solid hsl(var(--border))',
+              cursor: 'grab',
+              userSelect: 'none',
+              touchAction: 'none',
+              flexShrink: 0
+            }}
+          >
+            <span style={{ fontWeight: 600, fontSize: '12px', color: 'hsl(var(--foreground))', pointerEvents: 'none' }}>
+              {t('map.layers')}
+            </span>
+            <button
+              type="button"
+              onClick={(e) => { e.stopPropagation(); setExpanded(false) }}
+              title={t('common.close') || '关闭'}
+              onMouseEnter={(e) => { e.currentTarget.style.backgroundColor = 'hsl(var(--accent))'; e.currentTarget.style.color = 'hsl(var(--foreground))' }}
+              onMouseLeave={(e) => { e.currentTarget.style.backgroundColor = 'transparent'; e.currentTarget.style.color = 'hsl(var(--muted-foreground))' }}
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                width: '22px',
+                height: '22px',
+                padding: 0,
+                border: 'none',
+                borderRadius: '4px',
+                backgroundColor: 'transparent',
+                color: 'hsl(var(--muted-foreground))',
+                cursor: 'pointer'
+              }}
+            >
+              <X size={14} />
+            </button>
+          </div>
+
+          {/* 内容容器 - 树形结构，超出滚动 */}
+          <div
+            className="layer-control"
+            style={{
+              flex: '1 1 auto',
+              minHeight: 0,
+              overflowY: 'auto',
+              overflowX: 'hidden',
+              paddingTop: '8px',
+              paddingLeft: '8px',
+              paddingRight: '8px',
+              paddingBottom: '12px',
+              boxSizing: 'border-box'
+            }}
+          >
+            {/* 渲染树 */}
+            {tree.map(rootNode => (
+              <TreeNodeComponent
+                key={rootNode.id}
+                node={rootNode}
+                level={0}
+                onToggle={toggleNode}
+                onSectorToggle={handleSectorToggle}
+                onSectorLabelToggle={onSectorLabelToggle}
+                onLayerFileToggle={handleLayerFileToggle}
+                onMapTypeChange={handleMapTypeChange}
+                onFrequencyToggle={onFrequencyToggle}
+                onCustomLayerToggle={onCustomLayerToggle}
+                onLayerFileRemove={onLayerFileRemove}
+                onCustomLayerRemove={onCustomLayerRemove}
+                onPointFileLabelToggle={onPointFileLabelToggle}
+                onLayerFileLabelToggle={onLayerFileLabelToggle}
+                onDecorationLabelToggle={onDecorationLabelToggle}
+                decorationLabelVisible={decorationLabelVisible}
+                decorationLockedHint={t('map.decorationLayerLockedHint') || '装饰图层常显，不可关闭'}
+                onContextMenu={handleContextMenu}
+                mapType={mapType}
+                pointFileLabelVisibility={pointFileLabelVisibility}
+                layerFileLabelVisibility={layerFileLabelVisibility}
+                onFrequencyColorChange={onFrequencyColorChange}
+                sectorThematicActive={sectorThematicActive}
+                selectable={selectableProps}
+                editable={editableProps}
+                labelToggleHint={t('map.showLabelsHint') || '显示/隐藏要素文字标签'}
+                dnd={dndProps}
+              />
+            ))}
+          </div>
+
+          {/* 拖动调整宽度手柄（位于标题栏下方的右边缘） */}
+          <div
+            onMouseDown={startResize}
+            style={{
+              position: 'absolute',
+              right: 0,
+              top: '33px',
+              bottom: 0,
+              width: '8px',
+              cursor: 'ew-resize',
+              zIndex: 10,
+              backgroundColor: 'hsl(var(--muted) / 0.5)',
+              transition: 'background-color 0.2s ease'
+            }}
+            onMouseEnter={(e) => e.currentTarget.style.backgroundColor = 'hsl(var(--primary) / 0.2)'}
+            onMouseLeave={(e) => e.currentTarget.style.backgroundColor = 'hsl(var(--muted) / 0.5)'}
+            title="拖动调整宽度"
+          />
         </div>
-        </div>
-      </div>
+      )}
 
       {/* 右键菜单 - 放在面板外部以避免被裁剪或出现滚动条 */}
       {contextMenu && (
@@ -1671,59 +1827,58 @@ export function LayerControl({
           }}
           onClick={(e) => e.stopPropagation()}
         >
-          {(contextMenu.type === 'layer-file' || contextMenu.type === 'sector-layer') && (
+          {(contextMenu.type === 'layer-file' || contextMenu.type === 'sector-layer' || contextMenu.type === 'decoration-layer') && (
             <>
-              {/* 自定义设置 */}
-              <button
-                onClick={() => {
-                  if (contextMenu.type === 'sector-layer') {
-                    const sector = sectors.find(s => s.id === contextMenu.nodeId)
-                    if (sector) {
-                      const treeNode: TreeNode = {
-                        id: sector.id,
-                        type: 'sector-layer',
-                        label: sector.type === 'LTE' ? 'LTE' : 'NR',
-                        sectorLayer: sector,
-                        sectorLabel: { layerId: sector.id, visible: sectorLabelVisibility[sector.id] || false }
+              {/* 自定义设置（装饰图层无此入口：其样式统一在工具栏「样式」面板配置） */}
+              {(contextMenu.type === 'layer-file' || contextMenu.type === 'sector-layer') && (
+                <button
+                  onClick={() => {
+                    if (contextMenu.type === 'sector-layer') {
+                      const sector = sectors.find(s => s.id === contextMenu.nodeId)
+                      if (sector) {
+                        const treeNode: TreeNode = {
+                          id: sector.id,
+                          type: 'sector-layer',
+                          label: sector.type === 'LTE' ? 'LTE' : 'NR',
+                          sectorLayer: sector,
+                          sectorLabel: { layerId: sector.id, visible: sectorLabelVisibility[sector.id] || false }
+                        }
+                        openSettingsDialog(treeNode, 'label')
                       }
-                      openSettingsDialog(treeNode, 'label')
+                    } else {
+                      const node = [...layerFiles, ...pointFiles].find(f => f.id === contextMenu.nodeId)
+                      if (node) {
+                        const treeNode: TreeNode = { id: node.id, type: 'layer-file', label: node.name, layerFile: node }
+                        openSettingsDialog(treeNode, 'label')
+                      }
                     }
-                  } else {
-                    const node = [...layerFiles, ...pointFiles].find(f => f.id === contextMenu.nodeId)
-                    if (node) {
-                      const treeNode: TreeNode = { id: node.id, type: 'layer-file', label: node.name, layerFile: node }
-                      openSettingsDialog(treeNode, 'label')
-                    }
-                  }
-                  setContextMenu(null)
-                }}
-                style={menuItemStyle}
-                onMouseEnter={(e) => (e.currentTarget.style.backgroundColor = 'hsl(var(--accent))')}
-                onMouseLeave={(e) => (e.currentTarget.style.backgroundColor = 'transparent')}
-              >
-                <Settings size={14} />
-                <span>{t('map.customSettings')}</span>
-              </button>
-              {/* 图层预览：仅已勾选图层支持 */}
+                    setContextMenu(null)
+                  }}
+                  style={menuItemStyle}
+                  onMouseEnter={(e) => (e.currentTarget.style.backgroundColor = 'hsl(var(--accent))')}
+                  onMouseLeave={(e) => (e.currentTarget.style.backgroundColor = 'transparent')}
+                >
+                  <Settings size={14} />
+                  <span>{t('map.customSettings')}</span>
+                </button>
+              )}
+              {/* 图层预览：仅已勾选图层支持（装饰图层恒显，始终可用） */}
               <button
                 onClick={() => {
                   onLayerPreview?.(contextMenu.nodeId)
                   setContextMenu(null)
                 }}
-                disabled={contextMenu.type === 'sector-layer' ? !isSectorVisible(contextMenu.nodeId) : !isFileVisible(contextMenu.nodeId)}
+                disabled={!previewMenuEnabled}
                 style={{
                   ...menuItemStyle,
-                  opacity: contextMenu.type === 'sector-layer' ? (isSectorVisible(contextMenu.nodeId) ? 1 : 0.45) : (isFileVisible(contextMenu.nodeId) ? 1 : 0.45),
-                  cursor: contextMenu.type === 'sector-layer' ? (isSectorVisible(contextMenu.nodeId) ? 'pointer' : 'not-allowed') : (isFileVisible(contextMenu.nodeId) ? 'pointer' : 'not-allowed')
+                  opacity: previewMenuEnabled ? 1 : 0.45,
+                  cursor: previewMenuEnabled ? 'pointer' : 'not-allowed'
                 }}
                 onMouseEnter={(e) => {
-                  const enabled = contextMenu.type === 'sector-layer' ? isSectorVisible(contextMenu.nodeId) : isFileVisible(contextMenu.nodeId)
-                  if (enabled) e.currentTarget.style.backgroundColor = 'hsl(var(--accent))'
+                  if (previewMenuEnabled) e.currentTarget.style.backgroundColor = 'hsl(var(--accent))'
                 }}
                 onMouseLeave={(e) => (e.currentTarget.style.backgroundColor = 'transparent')}
-                title={contextMenu.type === 'sector-layer'
-                  ? (isSectorVisible(contextMenu.nodeId) ? t('map.layerPreviewHint') : t('map.layerPreviewDisabledHint'))
-                  : (isFileVisible(contextMenu.nodeId) ? t('map.layerPreviewHint') : t('map.layerPreviewDisabledHint'))}
+                title={previewMenuEnabled ? t('map.layerPreviewHint') : t('map.layerPreviewDisabledHint')}
               >
                 <Maximize2 size={14} />
                 <span>{t('map.layerPreview')}</span>
@@ -1766,6 +1921,11 @@ export function LayerControl({
         onSaveThematic={handleSaveThematicSettings}
         currentHeatmapSettings={currentHeatmapSettings}
         onSaveHeatmap={handleSaveHeatmapSettings}
+        onCancel={handleCancelSettings}
+        onPreview={handleSaveLabelSettings}
+        onPreviewColor={handleSaveColorSettings}
+        onPreviewThematic={handleSaveThematicSettings}
+        onPreviewHeatmap={handleSaveHeatmapSettings}
         mapHeatmapStats={currentHeatmapStats}
         polygonLayers={polygonLayers}
         thematicFieldSamples={thematicFieldSamples}
@@ -1803,9 +1963,10 @@ interface TreeNodeComponentProps {
   onCustomLayerRemove?: (layerId: string) => void;
   onPointFileLabelToggle?: (fileId: string, visible: boolean) => void;
   onLayerFileLabelToggle?: (fileId: string, visible: boolean) => void;
-  onDecorationLayerToggle?: (visible: boolean) => void;
   onDecorationLabelToggle?: (visible: boolean) => void;
   decorationLabelVisible?: boolean;
+  /** 装饰图层复选框锁定提示（恒显不可关闭） */
+  decorationLockedHint?: string;
   onContextMenu: (e: React.MouseEvent, node: TreeNode) => void;
   mapType: 'roadmap' | 'satellite';
   pointFileLabelVisibility: Record<string, boolean>;
@@ -1857,9 +2018,9 @@ function TreeNodeComponent({
   onCustomLayerRemove,
   onPointFileLabelToggle,
   onLayerFileLabelToggle,
-  onDecorationLayerToggle,
   onDecorationLabelToggle,
   decorationLabelVisible,
+  decorationLockedHint,
   onContextMenu,
   mapType,
   pointFileLabelVisibility,
@@ -1924,7 +2085,8 @@ function TreeNodeComponent({
       case 'custom-layer':
         return <File size={12} color="currentColor" />
       case 'decoration-layer':
-        return <Folder size={14} color="currentColor" />
+        // 与新建 TAB 图层（混合几何，走 layer-file 的默认分支）图标一致
+        return <File size={12} color="currentColor" />
       default:
         return null
     }
@@ -1952,7 +2114,7 @@ function TreeNodeComponent({
           display: 'flex',
           alignItems: 'center',
           justifyContent: 'flex-start',
-          padding: node.type === 'frequency' ? '2px 8px' : '3px 8px',
+          padding: '3px 8px',
           // 悬停用默认光标（不用手形/grab）；仅在按住左键拖动排序时才显示"移动中"光标
           cursor: canDrag
             ? (isRowDragging ? 'grabbing' : 'default')
@@ -1966,7 +2128,7 @@ function TreeNodeComponent({
           boxShadow: 'none',
           gap: node.type === 'frequency' ? '3px' : '4px',
           height: 'auto',
-          minHeight: node.type === 'frequency' ? '16px' : '26px',
+          minHeight: node.type === 'frequency' ? '22px' : '26px',
           lineHeight: '1.2',
           position: 'relative',
           transition: 'all 0.2s ease',
@@ -2016,6 +2178,64 @@ function TreeNodeComponent({
             )}
           </>
         )}
+
+        {/* 图层可见性复选框 - 位于图层图标左侧（频点行同时含频点颜色块） */}
+        <span
+          data-no-drag
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            width: node.type === 'frequency' ? 'auto' : '16px',
+            flexShrink: 0
+          }}
+        >
+          {/* 扇区图层复选框 */}
+          {node.type === 'sector-layer' && node.sectorLayer && (
+            <SectorLayerCheckbox
+              layer={node.sectorLayer}
+              onToggle={(visible) => onSectorToggle(node.sectorLayer!.id, visible)}
+              isChecked={node.sectorLayer.visible}
+            />
+          )}
+          {/* 图层文件复选框 */}
+          {node.type === 'layer-file' && node.layerFile && (
+            <LayerFileCheckbox
+              file={node.layerFile}
+              onToggle={(visible) => onLayerFileToggle(node.layerFile!.id, visible)}
+            />
+          )}
+          {/* 频点颜色块 + 复选框 */}
+          {node.type === 'frequency' && node.frequency && (
+            <FrequencyCheckbox
+              frequency={node.frequency}
+              onToggle={(visible: boolean) => onFrequencyToggle?.(
+                node.frequency!.networkType,
+                node.frequency!.frequency,
+                visible
+              )}
+              networkType={node.frequency!.networkType}
+              onColorChange={onFrequencyColorChange
+                ? (color, strokeColor) => onFrequencyColorChange(node.frequency!.networkType, node.frequency!.frequency, { color, strokeColor })
+                : undefined}
+              colorPickDisabled={!!sectorThematicActive?.[node.frequency.networkType === 'LTE' ? 'lte-sectors' : 'nr-sectors']}
+            />
+          )}
+          {/* 自定义图层复选框 */}
+          {node.type === 'custom-layer' && node.customLayer && (
+            <CustomLayerCheckbox
+              layer={node.customLayer}
+              onToggle={(visible: boolean) => onCustomLayerToggle?.(node.customLayer!.id, visible)}
+            />
+          )}
+          {/* 装饰图层复选框（恒显不可关闭） */}
+          {node.type === 'decoration-layer' && node.decorationLayer && (
+            <DecorationLayerCheckbox
+              layer={node.decorationLayer}
+              hint={decorationLockedHint}
+            />
+          )}
+        </span>
 
         {/* 节点图标 - 图层文件类型图标（设置入口已移至右键菜单） */}
         <span
@@ -2106,15 +2326,6 @@ function TreeNodeComponent({
           />
         )}
 
-        {/* 扇区图层 - 复选框 */}
-        {node.type === 'sector-layer' && node.sectorLayer && (
-          <SectorLayerCheckbox
-            layer={node.sectorLayer}
-            onToggle={(visible) => onSectorToggle(node.sectorLayer!.id, visible)}
-            isChecked={node.sectorLayer.visible}
-          />
-        )}
-
         {/* 扇区图层 - "可选"开关（鼠标箭头；仅 z-order 最高且开启的图层被圈选；图层未勾选时不高亮） */}
         {node.type === 'sector-layer' && node.sectorLayer && selectable && (
           <SelectableToggleButton
@@ -2130,14 +2341,6 @@ function TreeNodeComponent({
             active={!!node.sectorLabel.visible}
             hint={labelToggleHint}
             onToggle={(v) => onSectorLabelToggle?.(node.sectorLabel!.layerId, v)}
-          />
-        )}
-
-        {/* 图层文件 - 复选框 */}
-        {node.type === 'layer-file' && node.layerFile && (
-          <LayerFileCheckbox
-            file={node.layerFile}
-            onToggle={(visible) => onLayerFileToggle(node.layerFile!.id, visible)}
           />
         )}
 
@@ -2180,40 +2383,7 @@ function TreeNodeComponent({
           />
         )}
 
-        {/* 频点 - 颜色方块 + 复选框 */}
-        {node.type === 'frequency' && node.frequency && (
-          <FrequencyCheckbox
-            frequency={node.frequency}
-            onToggle={(visible: boolean) => onFrequencyToggle?.(
-              node.frequency!.networkType,
-              node.frequency!.frequency,
-              visible
-            )}
-            networkType={node.frequency!.networkType}
-            onColorChange={onFrequencyColorChange
-              ? (color, strokeColor) => onFrequencyColorChange(node.frequency!.networkType, node.frequency!.frequency, { color, strokeColor })
-              : undefined}
-            colorPickDisabled={!!sectorThematicActive?.[node.frequency.networkType === 'LTE' ? 'lte-sectors' : 'nr-sectors']}
-          />
-        )}
-
-        {/* 自定义图层 - 复选框 */}
-        {node.type === 'custom-layer' && node.customLayer && (
-          <CustomLayerCheckbox
-            layer={node.customLayer}
-            onToggle={(visible: boolean) => onCustomLayerToggle?.(node.customLayer!.id, visible)}
-          />
-        )}
-
-        {/* 装饰图层 - 复选框（与上面图层的复选框对齐） */}
-        {node.type === 'decoration-layer' && node.decorationLayer && (
-          <DecorationLayerCheckbox
-            layer={node.decorationLayer}
-            onToggle={(visible: boolean) => onDecorationLayerToggle?.(visible)}
-          />
-        )}
-
-        {/* 装饰图层 - "可选"开关（鼠标箭头；打点/定位标记圈选；图层未勾选时不高亮） */}
+        {/* 装饰图层 - "可选"开关（鼠标箭头；绘制要素/打点标记圈选；图层未勾选时不高亮） */}
         {node.type === 'decoration-layer' && selectable && (
           <SelectableToggleButton
             active={!!node.decorationLayer?.visible && isLayerSelectable(selectable.map, 'decoration-layer')}
@@ -2221,7 +2391,17 @@ function TreeNodeComponent({
             onToggle={(v) => selectable.onToggle?.('decoration-layer', v)}
           />
         )}
-        {/* 装饰图层 - 文字标签显隐开关（复选框 → 可选 → 标签） */}
+
+        {/* 装饰图层 - "可编辑"开关（铅笔；开启后可在装饰图层绘制点/线/面/圆，同时只能编辑一个图层） */}
+        {node.type === 'decoration-layer' && editable?.onToggle && (
+          <EditableToggleButton
+            active={editable.editableLayerId === 'decoration-layer'}
+            hint={editable.hint}
+            onToggle={(v) => editable.onToggle?.('decoration-layer', v)}
+          />
+        )}
+
+        {/* 装饰图层 - 文字标签显隐开关（复选框 → 可选 → 编辑 → 标签） */}
         {node.type === 'decoration-layer' && node.decorationLayer && (
           <LabelToggleButton
             active={!!decorationLabelVisible}
@@ -2251,9 +2431,9 @@ function TreeNodeComponent({
               onCustomLayerRemove={onCustomLayerRemove}
               onPointFileLabelToggle={onPointFileLabelToggle}
               onLayerFileLabelToggle={onLayerFileLabelToggle}
-              onDecorationLayerToggle={onDecorationLayerToggle}
               onDecorationLabelToggle={onDecorationLabelToggle}
               decorationLabelVisible={decorationLabelVisible}
+              decorationLockedHint={decorationLockedHint}
               onContextMenu={onContextMenu}
               mapType={mapType}
               pointFileLabelVisibility={pointFileLabelVisibility}
@@ -2434,6 +2614,32 @@ function MapTypeRadio({ option, onToggle }: MapTypeRadioProps) {
 }
 
 /**
+ * 标准复选框：保留浏览器原生外观，accent-color 跟随主题色。
+ * 点击/变化均阻止冒泡，避免触发行的展开折叠等逻辑。
+ */
+function StandardCheckbox({ checked, disabled = false, title, onChange }: {
+  checked: boolean;
+  disabled?: boolean;
+  title?: string;
+  onChange: (checked: boolean) => void;
+}) {
+  return (
+    <input
+      type="checkbox"
+      className="layer-standard-checkbox"
+      checked={checked}
+      disabled={disabled}
+      title={title}
+      onClick={(e) => e.stopPropagation()}
+      onChange={(e) => {
+        e.stopPropagation();
+        onChange(e.target.checked);
+      }}
+    />
+  );
+}
+
+/**
  * 扇区图层复选框组件
  */
 interface SectorLayerCheckboxProps {
@@ -2452,22 +2658,14 @@ function SectorLayerCheckbox({ layer, onToggle, isChecked: externalChecked }: Se
     setIsChecked(externalChecked ?? layer.visible);
   }, [layer.visible, externalChecked]);
 
-  const handleToggle = (e: React.ChangeEvent<HTMLInputElement>) => {
-    e.stopPropagation();
-    const newValue = e.target.checked;
-    setIsChecked(newValue);
-    onToggle(newValue);
-  };
-
   return (
-    <label className="custom-checkbox">
-      <input
-        type="checkbox"
-        checked={isChecked}
-        onChange={handleToggle}
-      />
-      <span className="checkmark"></span>
-    </label>
+    <StandardCheckbox
+      checked={isChecked}
+      onChange={(checked) => {
+        setIsChecked(checked);
+        onToggle(checked);
+      }}
+    />
   );
 }
 
@@ -2489,22 +2687,14 @@ function LayerFileCheckbox({ file, onToggle }: LayerFileCheckboxProps) {
     setIsChecked(file.visible);
   }, [file.visible]);
 
-  const handleToggle = (e: React.ChangeEvent<HTMLInputElement>) => {
-    e.stopPropagation();
-    const newValue = e.target.checked;
-    setIsChecked(newValue);
-    onToggle(newValue);
-  };
-
   return (
-    <label className="custom-checkbox">
-      <input
-        type="checkbox"
-        checked={isChecked}
-        onChange={handleToggle}
-      />
-      <span className="checkmark"></span>
-    </label>
+    <StandardCheckbox
+      checked={isChecked}
+      onChange={(checked) => {
+        setIsChecked(checked);
+        onToggle(checked);
+      }}
+    />
   );
 }
 
@@ -2553,13 +2743,6 @@ function FrequencyCheckbox({ frequency, onToggle, networkType, onColorChange, co
     setDraftColor(frequency.color);
   }, [frequency.color]);
 
-  const handleToggle = (e: React.ChangeEvent<HTMLInputElement>) => {
-    e.stopPropagation();
-    const newValue = e.target.checked;
-    setIsChecked(newValue);
-    onToggle(newValue);
-  };
-
   const canPickColor = !!onColorChange && !colorPickDisabled;
 
   const applyColor = (color: string) => {
@@ -2588,15 +2771,14 @@ function FrequencyCheckbox({ frequency, onToggle, networkType, onColorChange, co
         }}
       />
 
-      {/* 现代化复选框 */}
-      <label className="custom-checkbox">
-        <input
-          type="checkbox"
-          checked={isChecked}
-          onChange={handleToggle}
-        />
-        <span className="checkmark"></span>
-      </label>
+      {/* 标准复选框 */}
+      <StandardCheckbox
+        checked={isChecked}
+        onChange={(checked) => {
+          setIsChecked(checked);
+          onToggle(checked);
+        }}
+      />
 
       {/* 频点配色面板（默认设置模式下点击色块弹出） */}
       {showColorPicker && (
@@ -2690,50 +2872,28 @@ function CustomLayerCheckbox({ layer, onToggle }: { layer: CustomLayerOption; on
     setIsChecked(layer.visible);
   }, [layer.visible]);
 
-  const handleToggle = (e: React.ChangeEvent<HTMLInputElement>) => {
-    e.stopPropagation();
-    const newValue = e.target.checked;
-    setIsChecked(newValue);
-    onToggle(newValue);
-  };
-
   return (
-    <label className="custom-checkbox">
-      <input
-        type="checkbox"
-        checked={isChecked}
-        onChange={handleToggle}
-      />
-      <span className="checkmark"></span>
-    </label>
+    <StandardCheckbox
+      checked={isChecked}
+      onChange={(checked) => {
+        setIsChecked(checked);
+        onToggle(checked);
+      }}
+    />
   );
 }
 
 /**
- * 装饰图层复选框组件
+ * 装饰图层复选框组件（恒显不可关闭：默认勾选 + 禁用）
  */
-function DecorationLayerCheckbox({ layer, onToggle }: { layer: DecorationLayerOption; onToggle: (visible: boolean) => void }) {
-  const [isChecked, setIsChecked] = useState(layer.visible);
-
-  useEffect(() => {
-    setIsChecked(layer.visible);
-  }, [layer.visible]);
-
-  const handleToggle = (e: React.ChangeEvent<HTMLInputElement>) => {
-    e.stopPropagation();
-    const newValue = e.target.checked;
-    setIsChecked(newValue);
-    onToggle(newValue);
-  };
-
+function DecorationLayerCheckbox({ layer, hint }: { layer: DecorationLayerOption; hint?: string }) {
+  // 恒显不可关闭：禁用的标准复选框（禁用态不会触发 onChange）
   return (
-    <label className="custom-checkbox">
-      <input
-        type="checkbox"
-        checked={isChecked}
-        onChange={handleToggle}
-      />
-      <span className="checkmark"></span>
-    </label>
+    <StandardCheckbox
+      checked={!!layer.visible}
+      disabled
+      title={hint}
+      onChange={() => { /* 禁用态不会触发 */ }}
+    />
   );
 }

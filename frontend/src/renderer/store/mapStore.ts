@@ -1,9 +1,12 @@
 import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
-import { LabelSettings, LayerColorSettings, ThematicSettings, ThematicTemplate, HeatmapSettings, HeatmapTemplate } from '../components/Map/LabelSettingsModal'
+import { LabelSettings, LayerColorSettings, ThematicSettings, ThematicTemplate, HeatmapSettings, HeatmapTemplate, DEFAULT_HEATMAP_SETTINGS, HEATMAP_SETTINGS_VERSION } from '../components/Map/LabelSettingsModal'
 import type { LayerZType } from '../components/Map/layerZOrder'
 import { userSettingsApi } from '../services/api'
 import type { DrawGeometryType, DrawStyleSettings } from '@shared/types'
+// 仅类型引用（layerEditStore 不反向依赖本文件，无循环）：装饰图层工作集要素与编辑要素同构
+import type { EditFeature } from './layerEditStore'
+import { loadDecorations, saveDecorations } from '../services/decorationStorage'
 
 /**
  * 定位点接口
@@ -34,9 +37,7 @@ export interface UserMapSettings {
   // 图层文件可见性（MapInfo 文件 / Excel 点文件）
   layerFileVisibility: Record<string, boolean>
   pointFileVisibility: Record<string, boolean>
-  // 装饰图层
-  decorationLayerVisible: boolean
-  // 装饰图层标签可见性
+  // 装饰图层标签可见性（装饰图层本身恒显、不可关闭）
   decorationLabelVisible: boolean
   // 底图可见性
   baseMapVisible: boolean
@@ -97,7 +98,6 @@ const DEFAULT_MAP_SETTINGS: UserMapSettings = {
   layerVisibility: { lte: true, nr: true },
   layerFileVisibility: {},
   pointFileVisibility: {},
-  decorationLayerVisible: false,
   decorationLabelVisible: false,
   baseMapVisible: true,
   sectorLabelVisibility: { 'lte-sectors': false, 'nr-sectors': false },
@@ -132,6 +132,15 @@ interface MapState {
   clearLocationPoints: () => void
   updateLocationPointLabel: (id: string, label: string) => void
 
+  /**
+   * 装饰图层要素（用户在装饰图层上绘制/打点的图形，GCJ02）。
+   * 顶层字段（同 locationPoints）：进 localStorage、按用户隔离；不进 mapSettings（不落后端）。
+   * 编辑期真源是 layerEditStore.workspaces['decoration-layer']，工作集变更后单向回写到这里。
+   */
+  decorationFeatures: EditFeature[]
+  setDecorationFeatures: (features: EditFeature[]) => void
+  clearDecorationFeatures: () => void
+
   // ===== 按用户持久化的地图设置 =====
   mapSettings: UserMapSettings
   setMapSettings: (settings: Partial<UserMapSettings>) => void
@@ -141,7 +150,6 @@ interface MapState {
   setLayerVisibility: (lte: boolean, nr: boolean) => void
   setLayerFileVisibility: (fileId: string, visible: boolean) => void
   setPointFileVisibility: (fileId: string, visible: boolean) => void
-  setDecorationLayerVisible: (visible: boolean) => void
   setDecorationLabelVisible: (visible: boolean) => void
   setBaseMapVisible: (visible: boolean) => void
   setSectorLabelVisibility: (layer: string, visible: boolean) => void
@@ -224,6 +232,81 @@ function migrateSectorColorDefaults(settings: UserMapSettings): UserMapSettings 
   return changed ? { ...settings, colorSettingsMap: next } : settings
 }
 
+/** 热力图 v3 的旧默认值：v3→v4 时仍是这些值的字段升到新默认（用户改过的值保持，见下） */
+const LEGACY_HEATMAP_DEFAULTS = { smooth: 2, sampling: 1, contrast: 0.5, concentration: 1 }
+
+/**
+ * 热力图设置迁移（smoothVersion < 当前版本）。
+ *
+ * **旧版语义修复（无标记条目）**：
+ * 旧版 smooth 只参与粗网格半径（`globalR = smooth × 点间距`），而 detail≈95 时细节场
+ * 占 95%，细节核半径只由「栅格采样」决定 → 旧 smooth 对渲染**完全无效**
+ * （实测 smooth=3/5/9 渲染逐像素相同）。新版 smooth 真正决定细节核宽度，同一数值
+ * 会显著改变高值扩散范围，而旧值不携带任何用户意图 → 无版本标记的一律归到新默认，
+ * 否则老图层会一直按旧默认 9（≈6.8×点距，比修复前更糊）渲染，用户以为修复没生效。
+ *
+ * 旧版 sampling 是「细节斑点大小」的倍数（`核半径 = 1.5×点间距×sampling`），新版是
+ * 「采样网格边长」的倍数，同一数值含义不同：旧值 24 在新版下让网格粗到 18×点间距，
+ * 细节场直接失去意义（用户实测"高值扩散成一大片"）。故同样归一到新默认。
+ *
+ * **v3 → v4 默认值调整**：平滑强度/栅格采样/对比度/高值集中度换新默认。与基站图层
+ * 默认值迁移同理——用户点过保存后旧默认值会写进条目，若不迁移，弹窗与地图都还显示/按
+ * 旧默认走，新默认对已保存条目不生效。只精确匹配旧默认值，用户自定义过的值不受影响。
+ * 模板同规则迁移。
+ */
+export function migrateHeatmapSmooth<T extends {
+  heatmapSettingsMap?: Record<string, HeatmapSettings>
+  heatmapTemplates?: HeatmapTemplate[]
+}>(settings: T): T {
+  const remap = <T extends {
+    smooth?: number; sampling?: number; smoothVersion?: number
+    contrast?: number; concentration?: number
+    discrete?: boolean; levelSoftness?: number
+  }>(entry: T): T => {
+    const v = entry.smoothVersion
+    if (v === HEATMAP_SETTINGS_VERSION) return entry
+    const out = { ...entry }
+    // 旧版（无标记）：smooth/sampling 归一（见上）
+    if (v === undefined) {
+      out.smooth = DEFAULT_HEATMAP_SETTINGS.smooth
+      out.sampling = DEFAULT_HEATMAP_SETTINGS.sampling
+    } else if (v === 3) {
+      // v3 → v4：仅换默认值的字段，命中旧默认才升级
+      if (out.smooth === LEGACY_HEATMAP_DEFAULTS.smooth) out.smooth = DEFAULT_HEATMAP_SETTINGS.smooth
+      if (out.sampling === LEGACY_HEATMAP_DEFAULTS.sampling) out.sampling = DEFAULT_HEATMAP_SETTINGS.sampling
+      if (out.contrast === LEGACY_HEATMAP_DEFAULTS.contrast) out.contrast = DEFAULT_HEATMAP_SETTINGS.contrast
+      if (out.concentration === LEGACY_HEATMAP_DEFAULTS.concentration) out.concentration = DEFAULT_HEATMAP_SETTINGS.concentration
+    }
+    // discrete 保留原值（默认 false=连续渐变；用户可在设置里主动开启分级）
+    out.discrete = entry.discrete ?? false
+    out.levelSoftness = entry.levelSoftness ?? DEFAULT_HEATMAP_SETTINGS.levelSoftness
+    out.smoothVersion = HEATMAP_SETTINGS_VERSION
+    return out
+  }
+  let changed = false
+  const heatMap = settings.heatmapSettingsMap
+  const nextHeat: Record<string, HeatmapSettings> = {}
+  if (heatMap) {
+    for (const [id, entry] of Object.entries(heatMap)) {
+      const mapped = remap(entry)
+      if (mapped !== entry) changed = true
+      nextHeat[id] = mapped
+    }
+  }
+  const nextTemplates = settings.heatmapTemplates?.map((tmpl) => {
+    const mapped = remap(tmpl.settings)
+    if (mapped === tmpl.settings) return tmpl
+    changed = true
+    return { ...tmpl, settings: mapped }
+  })
+  if (!changed) return settings
+  return {
+    ...settings,
+    ...(heatMap ? { heatmapSettingsMap: nextHeat } : {}),
+    ...(nextTemplates ? { heatmapTemplates: nextTemplates } : {}),
+  }
+}
+
 export const useMapStore = create<MapState>()(
   persist(
     (set, get) => ({
@@ -242,6 +325,21 @@ export const useMapStore = create<MapState>()(
             p.id === id ? { ...p, label } : p
           )
         }))
+      },
+
+      decorationFeatures: [],
+      setDecorationFeatures: (features) => {
+        set({ decorationFeatures: features })
+        // 防抖写入 IndexedDB（高频编辑不逐次写盘）
+        if (_decoSaveTimer) clearTimeout(_decoSaveTimer)
+        _decoSaveTimer = setTimeout(() => {
+          _decoSaveTimer = null
+          saveDecorations(getStorageKey(), features).catch((e) =>
+            console.error('[DecorationStorage] 保存失败:', e))
+        }, 500)
+      },
+      clearDecorationFeatures: () => {
+        set({ decorationFeatures: [] })
       },
 
       // ===== 按用户持久化的地图设置 =====
@@ -283,13 +381,6 @@ export const useMapStore = create<MapState>()(
             ...state.mapSettings,
             pointFileVisibility: { ...state.mapSettings.pointFileVisibility, [fileId]: visible },
           },
-        }))
-        scheduleBackendSync(get())
-      },
-
-      setDecorationLayerVisible: (visible) => {
-        set((state) => ({
-          mapSettings: { ...state.mapSettings, decorationLayerVisible: visible },
         }))
         scheduleBackendSync(get())
       },
@@ -526,7 +617,7 @@ export const useMapStore = create<MapState>()(
               return true
             }
             set((state) => {
-              const merged = migrateSectorColorDefaults({ ...state.mapSettings, ...serverSettings })
+              const merged = migrateHeatmapSmooth(migrateSectorColorDefaults({ ...state.mapSettings, ...serverSettings }))
               return {
                 mapSettings: merged,
                 _lastSyncSettings: stableStringify(merged),
@@ -545,6 +636,7 @@ export const useMapStore = create<MapState>()(
       name: getStorageKey(), // 初始 key，在 rehydrate 后会动态更新
       partialize: (state) => ({
         locationPoints: state.locationPoints,
+        // decorationFeatures 改存 IndexedDB（可能超 localStorage 5MB 限额），不在此持久化
         _lastSyncSettings: state._lastSyncSettings,
         mapSettings: {
           ...state.mapSettings,
@@ -567,10 +659,23 @@ export const useMapStore = create<MapState>()(
       merge: (persistedState, currentState) => {
         const persisted = persistedState as Partial<MapState> | undefined
         const persistedSettings = persisted?.mapSettings
+        // _lastSyncSettings 是迁移前的快照：不同步迁移会让 hasUnsyncedLocal 误判为真，
+        // 从而跳过服务端设置覆盖并把本地设置回推（可能覆盖其它设备上更新的设置）
+        let lastSyncSettings = persisted?._lastSyncSettings ?? ''
+        if (lastSyncSettings) {
+          try {
+            lastSyncSettings = stableStringify(migrateHeatmapSmooth(JSON.parse(lastSyncSettings)))
+          } catch {
+            // 解析失败保持原值，退回原行为
+          }
+        }
         return {
           ...currentState,
           ...persisted,
-          mapSettings: migrateSectorColorDefaults({
+          // 缺省即空数组：不能沿用 currentState（切换用户 rehydrate 时会把上一用户的装饰要素带过来）
+          decorationFeatures: persisted?.decorationFeatures ?? [],
+          _lastSyncSettings: lastSyncSettings,
+          mapSettings: migrateHeatmapSmooth(migrateSectorColorDefaults({
             ...currentState.mapSettings,
             ...persistedSettings,
             colorSettingsMap: persistedSettings?.colorSettingsMap ?? {},
@@ -589,7 +694,7 @@ export const useMapStore = create<MapState>()(
             },
             selectableMap: persistedSettings?.selectableMap ?? {},
             legendLayout: persistedSettings?.legendLayout ?? {},
-          }),
+          })),
         }
       },
     }
@@ -615,6 +720,36 @@ function scheduleBackendSync(state: MapState) {
     _syncTimer = null
     state._syncToBackend()
   }, 3000) // 3秒防抖
+}
+
+/** 装饰要素 IndexedDB 防抖保存计时器 */
+let _decoSaveTimer: ReturnType<typeof setTimeout> | null = null
+
+/**
+ * 加载指定 key 的装饰要素：IndexedDB 为主；为空时回退旧 localStorage
+ * 中的数据并自动迁移到 IndexedDB。
+ */
+export async function loadUserDecorations(key: string): Promise<EditFeature[]> {
+  const stored = await loadDecorations(key)
+  if (stored.length > 0) return stored
+  const legacy = readPersistedDecorationFeatures(key)
+  if (legacy.length > 0) {
+    saveDecorations(key, legacy).catch(() => {})
+  }
+  return legacy
+}
+
+/** 读取指定 localStorage key 下已持久化的装饰图层要素（无数据返回空数组） */
+function readPersistedDecorationFeatures(key: string): EditFeature[] {
+  try {
+    const raw = localStorage.getItem(key)
+    if (!raw) return []
+    const parsed = JSON.parse(raw)
+    const features = parsed?.state?.decorationFeatures
+    return Array.isArray(features) ? features : []
+  } catch {
+    return []
+  }
 }
 
 /** 读取指定 localStorage key 下已持久化的 mapSettings（无数据返回 null） */
@@ -655,8 +790,11 @@ export async function reloadUserMapSettings(): Promise<void> {
     // 退出登录：切换到匿名视图，不把上一用户的地图设置留在内存，
     // 同时保证重置只写入匿名 key，不破坏该用户自己的本地数据。
     const local = readPersistedMapSettings(key)
+    const decoFeatures = await loadUserDecorations(key)
     useMapStore.setState({
       mapSettings: local ? { ...DEFAULT_MAP_SETTINGS, ...local } : { ...DEFAULT_MAP_SETTINGS },
+      // 装饰要素与定位点同属用户私有数据：按 key 从 IndexedDB 恢复（匿名时为匿名数据）
+      decorationFeatures: decoFeatures,
       // 同步快照一并清空：否则匿名态的修改会被误判为"未同步改动"回推给下一个登录用户
       _lastSyncSettings: '',
     })
@@ -666,9 +804,15 @@ export async function reloadUserMapSettings(): Promise<void> {
   // 登录：先用该用户本地持久化数据恢复（后端不可用时也能保住配置），再合并服务端设置。
   await useMapStore.persist.rehydrate()
   const loaded = await useMapStore.getState()._syncFromBackend()
+  // 装饰要素改存 IndexedDB，rehydrate 不携带：显式按 key 恢复
+  const decoFeatures = await loadUserDecorations(key)
+  useMapStore.setState({ decorationFeatures: decoFeatures })
   // 本地与服务端都没有该用户的设置时才用默认值（避免把上一个匿名会话的设置带到新用户）
   if (!loaded && !readPersistedMapSettings(key)) {
-    useMapStore.setState({ mapSettings: { ...DEFAULT_MAP_SETTINGS }, _lastSyncSettings: '' })
+    useMapStore.setState({
+      mapSettings: { ...DEFAULT_MAP_SETTINGS },
+      _lastSyncSettings: '',
+    })
   }
 }
 

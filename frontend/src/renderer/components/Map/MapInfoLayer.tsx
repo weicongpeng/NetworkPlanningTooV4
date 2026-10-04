@@ -14,9 +14,13 @@ import type { LabelCandidate, LabelLayoutManager } from './LabelLayoutManager'
 import { getFieldValue, matchThematicColor, matchRangeIndex, hasValue, toNumber, NO_FILL_COLOR } from '../../utils/fieldValue'
 import type { ThematicSettings } from './LabelSettingsModal'
 import type { HeatPoint } from '../../utils/heatmap'
-import { layerContainsPoint, CLICK_HIT_TOLERANCE_PX, layerGeometry } from './mapHitTest'
+import { layerHitAt, CLICK_HIT_TOLERANCE_PX, layerGeometry, type FeatureHitType } from './mapHitTest'
+import { buildLineArrows } from './lineArrows'
 
 const IS_DEV = import.meta.env.DEV
+
+/** "带方向线段的线"箭头装饰的整层数量上限（divIcon 为 DOM 节点，大图层防止卡顿） */
+const MAX_LINE_ARROWS_PER_LAYER = 400
 
 /**
  * 图层要素类型
@@ -78,12 +82,14 @@ export interface MapInfoLayerStyle {
 
 /**
  * 默认样式配置
+ * 点默认不描边（无色哨兵）：绝大多数文件（KML IconStyle/MapInfo Symbol）只声明图形颜色，
+ * 若默认给白色描边，缩小时白边会盖住图形本体颜色
  */
 const DEFAULT_STYLES: Record<LayerGeometryType, any> = {
   point: {
     radius: 6,
     fillColor: '#f59e0b',
-    color: '#fff',
+    color: NO_FILL_COLOR,
     weight: 2,
     opacity: 1,
     fillOpacity: 0.8
@@ -121,10 +127,12 @@ const NOISE_LABEL_KEYS = new Set([
 
 /**
  * MapInfo Symbol shape 编号 → 形状名（与后端 layer_service.POINT_SHAPE_MIF 一致）
+ * 38/40/41/42 按用户实测的 MapInfo 输出取字形（空心方形/空心圆/空心五角星/空心正三角），
+ * 与图层制作页的形状标签同源；空心与否 app 侧不区分，取同族字形。
  */
 const MAPINFO_SYMBOL_SHAPES: Record<number, string> = {
   34: 'circle', 32: 'square', 33: 'diamond', 35: 'star',
-  40: 'triangle', 41: 'triangle_down', 42: 'landmark', 38: 'pin'
+  40: 'circle', 41: 'star', 42: 'triangle', 38: 'square'
 }
 
 const POINT_SHAPE_NAMES = ['circle', 'square', 'diamond', 'triangle', 'triangle_down', 'star', 'landmark', 'pin']
@@ -165,18 +173,19 @@ function editStyleForKind(props: any, kind: 'point' | 'line' | 'polygon'): any |
 
 /**
  * 生成点形状的 SVG Data URI（完全离线可用，与后端 layer_service.svg_point_icon 形状一致）
+ * stroke 缺省不描边：文件未声明边框色时不画白边，避免遮住图形颜色
  */
-function pointShapeIconDataUri(shape: string, color: string): string {
+function pointShapeIconDataUri(shape: string, color: string, stroke = 'none'): string {
   const fill = color || '#f59e0b'
   const svgs: Record<string, string> = {
-    circle: `<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><circle cx="16" cy="16" r="12" fill="${fill}" stroke="#fff" stroke-width="2"/></svg>`,
-    square: `<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><rect x="4" y="4" width="24" height="24" rx="2" fill="${fill}" stroke="#fff" stroke-width="2"/></svg>`,
-    diamond: `<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><polygon points="16,3 29,16 16,29 3,16" fill="${fill}" stroke="#fff" stroke-width="2"/></svg>`,
-    triangle: `<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><polygon points="16,3 29,29 3,29" fill="${fill}" stroke="#fff" stroke-width="2"/></svg>`,
-    triangle_down: `<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><polygon points="3,3 29,3 16,29" fill="${fill}" stroke="#fff" stroke-width="2"/></svg>`,
-    star: `<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><polygon points="16,2 19,11 29,11 21,17 24,27 16,21 8,27 11,17 3,11 13,11" fill="${fill}" stroke="#fff" stroke-width="2"/></svg>`,
-    landmark: `<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><path d="M16 3 L28 10 L16 17 L4 10 Z" fill="${fill}" stroke="#fff" stroke-width="2"/><rect x="4" y="12" width="24" height="4" fill="${fill}" stroke="#fff" stroke-width="1"/><rect x="12" y="16" width="8" height="10" fill="${fill}" stroke="#fff" stroke-width="1"/></svg>`,
-    pin: `<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><path d="M16 2 C9 2 4 7 4 14 C4 23 16 30 16 30 C16 30 28 23 28 14 C28 7 23 2 16 2 Z" fill="${fill}" stroke="#fff" stroke-width="2"/><circle cx="16" cy="13" r="4" fill="#fff"/></svg>`
+    circle: `<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><circle cx="16" cy="16" r="12" fill="${fill}" stroke="${stroke}" stroke-width="2"/></svg>`,
+    square: `<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><rect x="4" y="4" width="24" height="24" rx="2" fill="${fill}" stroke="${stroke}" stroke-width="2"/></svg>`,
+    diamond: `<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><polygon points="16,3 29,16 16,29 3,16" fill="${fill}" stroke="${stroke}" stroke-width="2"/></svg>`,
+    triangle: `<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><polygon points="16,3 29,29 3,29" fill="${fill}" stroke="${stroke}" stroke-width="2"/></svg>`,
+    triangle_down: `<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><polygon points="3,3 29,3 16,29" fill="${fill}" stroke="${stroke}" stroke-width="2"/></svg>`,
+    star: `<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><polygon points="16,2 19,11 29,11 21,17 24,27 16,21 8,27 11,17 3,11 13,11" fill="${fill}" stroke="${stroke}" stroke-width="2"/></svg>`,
+    landmark: `<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><path d="M16 3 L28 10 L16 17 L4 10 Z" fill="${fill}" stroke="${stroke}" stroke-width="2"/><rect x="4" y="12" width="24" height="4" fill="${fill}" stroke="${stroke}" stroke-width="1"/><rect x="12" y="16" width="8" height="10" fill="${fill}" stroke="${stroke}" stroke-width="1"/></svg>`,
+    pin: `<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><path d="M16 2 C9 2 4 7 4 14 C4 23 16 30 16 30 C16 30 28 23 28 14 C28 7 23 2 16 2 Z" fill="${fill}" stroke="${stroke}" stroke-width="2"/><circle cx="16" cy="13" r="4" fill="#fff"/></svg>`
   }
   const svg = svgs[shape] || svgs.circle
   return 'data:image/svg+xml,' + encodeURIComponent(svg)
@@ -225,6 +234,9 @@ export class MapInfoLayer {
 
   // 框选高亮配置
   private selectionHighlightIds: Set<string> | null = null
+
+  /** 线要素方向箭头装饰层（"带方向线段的线"：要素 _editStyle.arrow） */
+  private lineArrowGroup: L.LayerGroup | null = null
 
   constructor(options: MapInfoLayerOptions) {
     this.id = options.id
@@ -308,7 +320,8 @@ export class MapInfoLayer {
    * 与 getFeaturesInCircle（圆与包围盒相交即选中，供圈选/点选工具）不同：
    * 面要素按点击点是否落在封闭区域内判定，仅包围盒/边框相交不算命中，
    * 避免点击面内部时误弹重叠列表；点要素按像素距离、线要素按到折线段的
-   * 像素距离判定。需先 addTo 地图（依赖投影），未上图时返回空。
+   * 像素距离判定。命中附带 hitType（direct/border）供调用方做穿透收敛。
+   * 需先 addTo 地图（依赖投影），未上图时返回空。
    *
    * @param latlng 点击位置（渲染坐标/GCJ02）
    * @param tolerancePx 像素容差
@@ -316,17 +329,18 @@ export class MapInfoLayer {
   getFeaturesAtPoint(
     latlng: L.LatLng,
     tolerancePx: number = CLICK_HIT_TOLERANCE_PX
-  ): Array<{ id: string, properties: any, geometry: any }> {
+  ): Array<{ id: string, properties: any, geometry: any, hitType: FeatureHitType, distancePx: number }> {
     if (!this.geoJSONLayer || !this.currentMap) return []
-    const results: Array<{ id: string, properties: any, geometry: any }> = []
+    const results: Array<{ id: string, properties: any, geometry: any, hitType: FeatureHitType, distancePx: number }> = []
 
     this.geoJSONLayer.eachLayer((layer: any) => {
       const props = layer.feature?.properties
       if (!props) return
       const id = layer._nptSelectionId || extractFeatureId(props)
       if (!id) return
-      if (layerContainsPoint(this.currentMap!, layer, latlng, tolerancePx)) {
-        results.push({ id: String(id), properties: props, geometry: layerGeometry(layer) })
+      const hit = layerHitAt(this.currentMap!, layer, latlng, tolerancePx)
+      if (hit) {
+        results.push({ id: String(id), properties: props, geometry: layerGeometry(layer), hitType: hit.type, distancePx: hit.distancePx })
       }
     })
 
@@ -436,6 +450,8 @@ export class MapInfoLayer {
 
     this.geoJSONLayer.addTo(map)
     this.currentMap = map  // 存储地图实例
+    // 方向箭头装饰层（"带方向线段的线"）随图层一起上/下地图
+    this.lineArrowGroup?.addTo(map)
 
     // 如果标签已开启，在添加到地图时自动创建标签
     if (this.labelsEnabled) {
@@ -479,6 +495,9 @@ export class MapInfoLayer {
     // 🔧 修复：无条件清理标签层（即使几何层不在 map.hasLayer 判定内，
     // 标签 canvas 也可能残留在地图上，必须显式移除，避免"关闭标签后仍显示"）
     this._removeLabels(map)
+    if (this.lineArrowGroup && map.hasLayer(this.lineArrowGroup)) {
+      map.removeLayer(this.lineArrowGroup)
+    }
     if (this.currentMap === map) {
       this.currentMap = null
     }
@@ -585,7 +604,8 @@ export class MapInfoLayer {
         const noFill = markerColorRaw === NO_FILL_COLOR
         const markerColor = noFill ? '#f59e0b' : markerColorRaw
         // 边框色：专题边框色优先，'none'（无色）→ 不描边；专题填充无色且未设边框色时
-        // 回退基础边框色（镂空也要有边框）；非专题用基础边框色，'none' 同样不描边
+        // 回退基础边框色（镂空也要有边框）；非专题用基础边框色（缺省为无色哨兵，不画白边），
+        // 'none' 同样不描边
         let strokeColor: string
         let noStroke = false
         const thematicBorderColor = mapInfoLayer.thematicSettings?.borderColor
@@ -602,17 +622,19 @@ export class MapInfoLayer {
           }
         } else {
           noStroke = pointStyle.color === NO_FILL_COLOR
-          strokeColor = noStroke ? '#000000' : (pointStyle.color || '#fff')
+          strokeColor = noStroke ? '#000000' : (pointStyle.color || NO_FILL_COLOR)
         }
 
-        // 还原点形状（MapInfo Symbol 编号 / 形状名）：有形状信息时用 L.marker + SVG 图标，
-        // 否则保持 circleMarker（Canvas 渲染、大数据量性能好）。
+        // 还原点形状（MapInfo Symbol 编号 / 形状名）：仅**非圆形**形状用 L.marker + SVG 图标，
+        // 圆形与无形状信息一样走 circleMarker —— SVG 图标是 DOM 渲染，上万点的图层缩放/平移会卡，
+        // 而圆形用 Canvas 圆点视觉等价（与 LayerEditSession 的 circle 处理一致）。
         // 从 pointStyle 取（合并了 _editStyle 覆盖），保证编辑样式设置的形状（如方形）生效
         const shapeName = resolvePointShape(pointStyle.markerSymbol)
-        if (shapeName && !noFill) {
+        const iconShape = shapeName && shapeName !== 'circle' ? shapeName : null
+        if (iconShape && !noFill) {
           const iconPx = Math.max(12, Math.min(36, Math.round(markerSize * 2)))
           const icon = L.icon({
-            iconUrl: pointShapeIconDataUri(shapeName, markerColor),
+            iconUrl: pointShapeIconDataUri(iconShape, markerColor, noStroke ? 'none' : strokeColor),
             iconSize: [iconPx, iconPx],
             iconAnchor: [iconPx / 2, iconPx / 2]
           })
@@ -788,8 +810,40 @@ export class MapInfoLayer {
     // 先建空 GeoJSON 图层（继承 renderer/pointToLayer/style/onEachFeature 配置），再分块 addData
     mapInfoLayer.geoJSONLayer = L.geoJSON([], geoJsonOptions as any)
     await mapInfoLayer._addGeoJSONChunks(transformedData)
+    // "带方向线段的线"：要素样式（_editStyle.arrow）需要在地图上叠加箭头装饰
+    mapInfoLayer._rebuildLineArrows()
 
     return mapInfoLayer
+  }
+
+  /**
+   * 重建线要素方向箭头装饰（"带方向线段的线"）：
+   * 逐要素检查 _editStyle.arrow（绘制/风格面板配置，保存于 NPT_FEATSYM），
+   * 用该线当前渲染色沿线等距布置箭头 divIcon；数量超上限时截断（大图层防 DOM 爆炸）。
+   */
+  private _rebuildLineArrows(): void {
+    if (!this.lineArrowGroup) this.lineArrowGroup = L.layerGroup()
+    this.lineArrowGroup.clearLayers()
+    if (!this.geoJSONLayer) return
+    let count = 0
+    this.geoJSONLayer.eachLayer((layer: any) => {
+      if (count >= MAX_LINE_ARROWS_PER_LAYER) return
+      const geomType = layer?.feature?.geometry?.type
+      if (geomType !== 'LineString' && geomType !== 'MultiLineString') return
+      const es = editStyleForKind(layer.feature?.properties, 'line')
+      if (es?.arrow !== true) return
+      // 线色为无色哨兵时不描边，也不画箭头
+      if (layer.options?.stroke === false || layer.options?.color === NO_FILL_COLOR) return
+      const markers = buildLineArrows(layer.getLatLngs?.(), {
+        color: layer.options?.color || DEFAULT_STYLES.line.color,
+        opacity: layer.options?.opacity ?? 1,
+      })
+      for (const m of markers) {
+        if (count >= MAX_LINE_ARROWS_PER_LAYER) break
+        this.lineArrowGroup!.addLayer(m)
+        count += 1
+      }
+    })
   }
 
   /**
@@ -884,7 +938,7 @@ export class MapInfoLayer {
           fillColor: noFill ? '#f59e0b' : fillColor,
           fillOpacity: this.style.point?.fillOpacity ?? 0.8,
           stroke: !noStroke,
-          color: noStroke ? '#000000' : (this.style.point?.color || '#fff'),
+          color: noStroke ? '#000000' : (this.style.point?.color || NO_FILL_COLOR),
           weight: this.style.point?.weight ?? 2,
           opacity: this.style.point?.opacity ?? 1,
           // 半径保留当前已渲染值（要素级 markerSize/专题点大小），无则用基础配置或默认值，
@@ -910,8 +964,13 @@ export class MapInfoLayer {
           || this.style.point?.fillColor
           || '#f59e0b'
         const color = rawColor === NO_FILL_COLOR ? '#f59e0b' : rawColor
+        // 边框色：仅在基础/专题设置里显式配过颜色时才描边（缺省与无色哨兵都不画白边）
+        const borderRaw: string | undefined = thematicColor
+          ? (this.thematicSettings?.borderColor ?? this.style.point?.color)
+          : this.style.point?.color
+        const iconStroke = borderRaw && borderRaw !== NO_FILL_COLOR ? borderRaw : 'none'
         layer.setIcon(L.icon({
-          iconUrl: pointShapeIconDataUri(shapeName, color),
+          iconUrl: pointShapeIconDataUri(shapeName, color, iconStroke),
           iconSize: [iconSize, iconSize],
           iconAnchor: [iconSize / 2, iconSize / 2]
         }))
@@ -933,6 +992,8 @@ export class MapInfoLayer {
     this.geoJSONLayer.eachLayer((layer: any) => {
       if (typeof layer.redraw === 'function') layer.redraw()
     })
+    // 线色/透明度变化后同步箭头装饰配色
+    this._rebuildLineArrows()
   }
 
   /**

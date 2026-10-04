@@ -21,6 +21,7 @@ import { frequencyColorMapper } from '../../utils/frequencyColors'
 import { mapDataService, RenderSectorData } from '../../services/mapDataService'
 import { CoordinateTransformer } from '../../utils/coordinate'
 import { extractFeatureId } from '../../utils/featureId'
+import { isPolygonGeometry, boundaryOuterRings, mergeById } from '../../services/boundarySelection'
 import { NO_FILL_COLOR } from '../../utils/fieldValue'
 import { cleanUserProperties } from '../../utils/featureProps'
 import { SectorInfoPanel, useSectorInfoPanel } from './SectorInfoPanel'
@@ -75,7 +76,7 @@ import { pciDataSyncService } from '../../services/pciDataSyncService'
 import { neighborDataSyncService } from '../../services/neighborDataSyncService'
 import { tacDataSyncService } from '../../services/tacDataSyncService'
 import { useMapDataCacheStore } from '../../store/mapDataCacheStore'
-import { useMapStore } from '../../store/mapStore'
+import { useMapStore, loadUserDecorations, getCurrentMapStorageKey } from '../../store/mapStore'
 import { useLayerEditStore } from '../../store/layerEditStore'
 import type { AttributeErrorCode } from '../../store/layerEditStore'
 import { LayerEditSession, type MergeReferenceSource } from './LayerEditSession'
@@ -174,7 +175,7 @@ interface OnlineMapProps {
   /** 标签设置映射 */
   labelSettingsMap?: Record<string, any>
   /** 圈选模式 */
-  selectionMode?: 'none' | 'point' | 'circle' | 'polygon'
+  selectionMode?: 'none' | 'point' | 'circle' | 'polygon' | 'boundary'
   /** 结束圈选模式回调 */
   onSelectionModeEnd?: () => void
   /** 地图拖拽工具是否启用 */
@@ -564,13 +565,19 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
   const ensureWorkspace = useCallback(async (layerId: string) => {
     const store = useLayerEditStore.getState()
     if (store.getWorkspace(layerId)) return
-    // 装饰图层：无后端文件，工作集从 localStorage 持久化要素播种（不请求接口、不打开编辑开关）
+    // 装饰图层：无后端文件，工作集从持久化要素播种（不请求接口、不打开编辑开关）
     if (layerId === DECORATION_LAYER_ID) {
+      let feats = useMapStore.getState().decorationFeatures ?? []
+      // mapStore 尚未恢复（IndexedDB 异步加载）时兜底直接读取，避免首次打开地图装饰层为空
+      if (feats.length === 0) {
+        feats = await loadUserDecorations(getCurrentMapStorageKey())
+        if (feats.length > 0) useMapStore.setState({ decorationFeatures: feats })
+      }
       store.seedWorkspace(
         DECORATION_LAYER_ID,
         DECORATION_DATA_ID,
         'mixed',
-        useMapStore.getState().decorationFeatures ?? [],
+        feats,
         null,
       )
       return
@@ -3087,6 +3094,35 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
       return
     }
 
+    // 边界选择：点击面状边界 → 跨图层选中边界内其他可选图层的要素。
+    // 必须在下方 editableLayerId 早退分支之前，否则编辑开关打开时点击会被吞掉。
+    if (selectionModeRef.current === 'boundary' && event.latlng) {
+      handleBoundarySelect(
+        event.latlng,
+        event.originalEvent?.shiftKey === true,
+      )
+      return
+    }
+
+    // "选择"工具：点击要素仅高亮选中（不弹属性框），双击才弹属性/风格配置。
+    // 同样必须在下方 editableLayerId 早退分支之前：编辑开关打开时（如装饰图层），
+    // 其他"可选"图层要素的点击仍需高亮选中，否则被早退吞掉（无选中阴影）。
+    // 编辑图层自身要素由 LayerEditSession 的要素 click（stopPropagation）消费，不会走到这里。
+    if (useLayerEditStore.getState().selectMode) {
+      if (measureMode || !event.latlng) return
+      // 按住左键拖动不选中要素（地图非手形工具禁拖，浏览器在 mouseup 后仍补发 click，
+      // 若按 click 处理会在拖动终点误选中/误清除选中）
+      if (isDragGesture(event)) return
+      const hits = collectFeatureHits(event.latlng)
+      if (hits.length === 0) {
+        clearSelectHighlight()
+        closeMapPopups()
+        return
+      }
+      highlightFeature(hits[0])
+      return
+    }
+
     // 图层编辑模式：选中/绘制/删点交由 LayerEditSession（其独立监听 map click），
     // 此处直接返回，避免触发要素属性弹窗。
     // 测距/打点例外：与编辑可并存（激活测距/打点时已退出绘制与选择工具），
@@ -3388,22 +3424,6 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
       }
 
       onCaptureCoord(wgsLng, wgsLat)
-      return
-    }
-
-    // "选择"工具：点击要素仅高亮选中（不弹属性框），双击才弹属性/风格配置
-    if (useLayerEditStore.getState().selectMode) {
-      if (measureMode || !event.latlng) return
-      // 按住左键拖动不选中要素（地图非手形工具禁拖，浏览器在 mouseup 后仍补发 click，
-      // 若按 click 处理会在拖动终点误选中/误清除选中）
-      if (isDragGesture(event)) return
-      const hits = collectFeatureHits(event.latlng)
-      if (hits.length === 0) {
-        clearSelectHighlight()
-        closeMapPopups()
-        return
-      }
-      highlightFeature(hits[0])
       return
     }
 
@@ -4392,8 +4412,14 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
               // 注册到模块级数据图层集合（页面切换清理兜底）
               __mapDataLayerInstances.add(geoLayer)
 
-              // 同步标签可见性状态
+              // 同步标签：先应用已保存的标签配置，再开启可见性
+              // （否则构造函数默认 content='name'，重新打开图层后标签回退显示程序
+              // 自动生成的 name 属性；与 MapInfoLayer 路径及实时切换路径保持一致）
               const labelVisible = pointFileLabelVisibilityRef.current[layerFile.id] || false
+              const savedLabelSettings = labelSettingsMap[layerFile.id]
+              if (savedLabelSettings) {
+                geoLayer.setLabelConfig(savedLabelSettings)
+              }
               console.log('[OnlineMap] 同步 GeoDataLayer 标签可见性:', layerFile.id, labelVisible)
               geoLayer.setLabelVisibility(labelVisible)
 
@@ -5029,8 +5055,9 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
         // 注意：高德地图服务器对不存在的瓦片（如海洋区域、地图边界外）会返回 404，这是正常行为
         const tileLayer = L.tileLayer(getAMapTileUrl(savedState.mapLayerType), {
           attribution: '&copy; <a href="https://www.amap.com/">高德地图</a>',
-          maxZoom: 18,
           minZoom: 3,
+          maxZoom: 20,
+          maxNativeZoom: 18,  // 高德栅格原生上限；19-20 级拉伸 18 级瓦片（服务端 19+ 返回占位图）
           crossOrigin: 'anonymous',  // 跨域标识，与 Canvas 配合防止渲染拖影
         }).addTo(map)
 
@@ -6621,6 +6648,200 @@ function sectorPointGeometry(f: any): { type: 'Point'; coordinates: [number, num
   }, [t])
 
   /**
+   * 边界选择：跨图层收集所有"可见+可选"图层（排除边界来源图层）中落在边界内的要素。
+   * 对 MultiPolygon 的每个外环分别收集后按 id 取并集；被选图层处于编辑态时经
+   * LayerEditSession 收集（设置 shapeSelectedIds，底部"删除"按钮据此工作）。
+   */
+  const selectFeaturesInBoundary = useCallback((
+    shapes: L.Polygon[],
+    excludeLayerId: string,
+    isMultiSelect: boolean,
+  ): { ids: Set<string>, properties: any[] } => {
+    const map = mapInstanceRef.current
+    const visibility = layerVisibilityRef.current
+    const selectable = selectableMapRef.current || {}
+    const editableId = useLayerEditStore.getState().editableLayerId
+
+    // Shift 叠加从已有选中开始，否则从空集合开始
+    const acc: { ids: Set<string>, props: any[] } = isMultiSelect
+      ? { ids: new Set(selectedIdsRef.current), props: [...selectedFeaturesRef.current] }
+      : { ids: new Set<string>(), props: [] }
+
+    // 0. 编辑会话图层（被选图层打开编辑开关、且不是边界来源图层）：
+    // 原始渲染层已被会话取代，普通分支命中不到，必须在此单独收集。
+    let sessionCount = 0
+    if (map && editableId && editableId !== excludeLayerId) {
+      const session = (map as any)?.__nptEditSession as LayerEditSession | undefined
+      if (session?.isEditing()) {
+        const sessionSeen = new Set<string>()
+        const sessionCollected: Array<{ geometry: any, properties: any }> = []
+        shapes.forEach((shape, i) => {
+          // append：多外环时与会话已有圈选集合取并集
+          const items = session.selectInShape(shape, i > 0, true)
+          items.forEach((it) => {
+            const key = String(it.properties?._editId ?? extractFeatureId(it.properties))
+            if (sessionSeen.has(key)) return
+            sessionSeen.add(key)
+            sessionCollected.push(it)
+          })
+        })
+        sessionCount = sessionCollected.length
+        if (sessionCollected.length > 0) {
+          useLayerEditStore.getState().copyToClipboard(sessionCollected as any)
+          mergeById(acc, sessionCollected.map(it => ({
+            id: String(it.properties?._editId ?? extractFeatureId(it.properties)),
+            properties: { ...it.properties, _geometry: it.geometry },
+          })))
+        }
+      }
+    }
+    if (!editableId) setShapeSelectedCount(0)
+
+    shapes.forEach((shape) => {
+      // 1. 图层文件（MapInfoLayer）：跳过边界来源图层与正在编辑的图层（其渲染层已摘除）
+      mapInfoLayerRefsRef.current.forEach(({ mapInfoLayer, leafletLayer }) => {
+        const id = (mapInfoLayer as any).id as string
+        if (id === excludeLayerId || id === editableId) return
+        if (!map || !map.hasLayer(leafletLayer)) return
+        if (!mapInfoLayer.isVisible()) return
+        if (!isLayerSelectable(selectable, id)) return
+        const features = mapInfoLayer.getFeaturesInPolygon(shape)
+        mergeById(acc, features.map(item => ({
+          id: String(item.id),
+          properties: { ...item.properties, _layerType: 'MapInfo', _geometry: (item as any).geometry },
+        })))
+      })
+
+      // 2. 地理化数据（GeoDataLayer）
+      geoDataLayerManagerRef.current?.getAllLayers().forEach(geoLayer => {
+        const id = geoLayer.getId()
+        if (id === excludeLayerId) return
+        if (!geoLayer.isVisible()) return
+        if (selectable[id] === false) return
+        // byAnchor：锚点口径（边界选择），与本图层其他来源一致
+        const features = geoLayer.getFeaturesInPolygon(shape, true)
+        mergeById(acc, features.map(item => {
+          const fid = item.name || item.properties?.id || ''
+          return {
+            id: String(fid),
+            properties: { ...item.properties, _layerType: 'GeoData', _geoDataName: item.name, _geometry: (item as any).geometry },
+          }
+        }))
+      })
+
+      // 3. 装饰显示层：边界不来自装饰图层时才收集
+      if (excludeLayerId !== DECORATION_LAYER_ID) {
+        const display = decorationDisplayRef.current
+        const displayLeaf = display?.getLeafletLayer()
+        if (map && display && displayLeaf && map.hasLayer(displayLeaf)
+          && display.isVisible()
+          && isLayerSelectable(selectable, DECORATION_LAYER_ID)) {
+          const features = display.getFeaturesInPolygon(shape)
+          mergeById(acc, features.map(item => ({
+            id: String(item.id),
+            properties: { ...item.properties, _layerType: 'Decoration', _geometry: (item as any).geometry },
+          })))
+        }
+      }
+
+      // 4. 基站扇区（LTE/NR）：边界只可能来自矢量图层，excludeLayerId 不会误排扇区
+      if (visibility.lte && lteSectorLayerRef.current
+        && isLayerSelectable(selectable, 'lte-sectors')) {
+        lteSectorLayerRef.current.getSectorsInPolygon(shape).forEach(sector => {
+          mergeById(acc, [{ id: String(sector.id), properties: { ...sector, _layerType: 'LTE' } }])
+        })
+      }
+      if (visibility.nr && nrSectorLayerRef.current
+        && isLayerSelectable(selectable, 'nr-sectors')) {
+        nrSectorLayerRef.current.getSectorsInPolygon(shape).forEach(sector => {
+          mergeById(acc, [{ id: String(sector.id), properties: { ...sector, _layerType: 'NR' } }])
+        })
+      }
+    })
+
+    // 对所有显示层统一应用高亮
+    mapInfoLayerRefsRef.current.forEach(({ mapInfoLayer }) => {
+      mapInfoLayer.setSelectionHighlight(acc.ids)
+    })
+    decorationDisplayRef.current?.setSelectionHighlight(acc.ids)
+    geoDataLayerManagerRef.current?.getAllLayers().forEach(gl => {
+      gl.setSelectionHighlight(acc.ids)
+    })
+    lteSectorLayerRef.current?.setSelectionHighlight(acc.ids)
+    nrSectorLayerRef.current?.setSelectionHighlight(acc.ids)
+
+    // 状态同步（复制/导出按钮数据源）
+    selectedFeaturesRef.current = acc.props
+    selectedIdsRef.current = acc.ids
+    setSelectedFeatureCount(acc.ids.size)
+    if (editableId && editableId !== excludeLayerId) setShapeSelectedCount(sessionCount)
+
+    if (acc.ids.size > 0) {
+      console.log('[OnlineMap] 边界选择选中要素总数:', acc.ids.size)
+      setSelectionTip(`${t('map.featuresSelected', { count: acc.ids.size })}，${t('map.copyTip') || '按 Ctrl+C 复制'}`)
+    } else {
+      setSelectionTip(t('map.noFeatureSelected'))
+    }
+
+    return { ids: acc.ids, properties: acc.props }
+  }, [t])
+
+  /**
+   * 边界选择点击处理：找点击处 z-order 最高的面状要素作为边界 → 跨图层收集 →
+   * 绘制青色边界反馈形状（与其他圈选视觉一致）。
+   */
+  const handleBoundarySelect = useCallback((latlng: L.LatLng, isMultiSelect: boolean) => {
+    const map = mapInstanceRef.current
+    if (!map) return
+
+    // collectFeatureHits 已按 z-order 排序、且只收集"可选"图层
+    const hits = collectFeatureHits(latlng, false, false)
+    const boundary = hits.find(h => isPolygonGeometry(h.geometry))
+    if (!boundary) {
+      setSelectionTip(t('map.boundaryNotFound'))
+      return
+    }
+    const excludeLayerId = boundary.layerId ?? ''
+
+    // 面几何 → 外环 → L.Polygon（GCJ02 渲染坐标，[lng,lat] → [lat,lng]）
+    const rings = boundaryOuterRings(boundary.geometry)
+    const ringLatLngs = rings.map(ring =>
+      ring.map(([lng, lat]) => [lat, lng] as [number, number]),
+    )
+    const shapes = ringLatLngs.map(pts => L.polygon(pts))
+
+    selectFeaturesInBoundary(shapes, excludeLayerId, isMultiSelect)
+
+    // 青色边界反馈：非 Shift 先移除上一次的形状
+    if (!isMultiSelect && selectionShapeRef.current) {
+      map.removeLayer(selectionShapeRef.current)
+      selectionShapeRef.current = null
+    }
+    const feedbackParts = ringLatLngs.map(pts =>
+      L.polygon(pts, {
+        color: '#00ffff',
+        weight: 2,
+        fillColor: '#00ffff',
+        fillOpacity: 0.1,
+        interactive: false,
+      }))
+    const feedback: any = feedbackParts.length === 1
+      ? feedbackParts[0]
+      : L.featureGroup(feedbackParts)
+    feedback.addTo(map)
+
+    if (isMultiSelect && selectionShapeRef.current) {
+      if (selectionShapeRef.current instanceof L.FeatureGroup) {
+        selectionShapeRef.current.addLayer(feedback)
+      } else {
+        selectionShapeRef.current = L.featureGroup([selectionShapeRef.current, feedback]) as any
+      }
+    } else {
+      selectionShapeRef.current = feedback
+    }
+  }, [collectFeatureHits, selectFeaturesInBoundary, t])
+
+  /**
    * 监听圈选模式变化 - 控制地图拖拽和交互
    */
   useEffect(() => {
@@ -6658,6 +6879,8 @@ function sectorPointGeometry(f: any): { type: 'Point'; coordinates: [number, num
           setSelectionTip('按住鼠标左键拖动绘制圆形，按 Ctrl+C 复制')
         } else if (selectionMode === 'polygon') {
           setSelectionTip('点击添加多边形顶点，至少3个点后可移近起点单击闭合（或双击闭合），按 Backspace 删除上一个点，按 Ctrl+C 复制')
+        } else if (selectionMode === 'boundary') {
+          setSelectionTip(t('map.boundaryClickHint'))
         }
         // 进入框选模式时，重置临时标志（不清除已有选中）
         preserveSelectionRef.current = false
@@ -7210,8 +7433,9 @@ function sectorPointGeometry(f: any): { type: 'Point'; coordinates: [number, num
 
     const newTileLayer = L.tileLayer(getAMapTileUrl(mapLayerType), {
       attribution: '&copy; <a href="https://www.amap.com/">高德地图</a>',
-      maxZoom: 18,
       minZoom: 3,
+      maxZoom: 20,
+      maxNativeZoom: 18,  // 高德栅格原生上限；19-20 级拉伸 18 级瓦片（服务端 19+ 返回占位图）
       crossOrigin: 'anonymous'  // 跨域标识，与 Canvas 配合防止渲染拖影
     }).addTo(map)
 
@@ -7777,7 +8001,12 @@ function sectorPointGeometry(f: any): { type: 'Point'; coordinates: [number, num
 
         {/* 框选提示 */}
         {selectionTip && selectionMode !== 'none' && (
-          <div className="absolute bottom-4 left-1/2 transform -translate-x-1/2 z-[1000] bg-blue-600/95 text-white px-4 py-2 rounded-lg shadow-lg flex items-center gap-2">
+          <div
+            // 阻止提示条上的点击/双击冒泡到 Leaflet map：否则点"复制/导出/删除"按钮
+            // 会同时触发一次地图 click（边界选择下会多余地重新收集一次）
+            ref={(el) => { if (el) L.DomEvent.disableClickPropagation(el) }}
+            className="absolute bottom-4 left-1/2 transform -translate-x-1/2 z-[1000] bg-blue-600/95 text-white px-4 py-2 rounded-lg shadow-lg flex items-center gap-2"
+          >
             <span className="text-sm font-medium">{selectionTip}</span>
             {selectedFeatureCount > 0 && (
               <button

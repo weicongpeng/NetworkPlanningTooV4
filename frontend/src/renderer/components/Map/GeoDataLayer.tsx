@@ -18,7 +18,8 @@ import { getFieldValue, matchThematicColor, matchRangeIndex, hasValue, toNumber,
 import type { ThematicSettings } from './LabelSettingsModal'
 import type { HeatPoint } from '../../utils/heatmap'
 import { centroidFromLatLngRing } from '../../utils/heatmap'
-import { layerContainsPoint, CLICK_HIT_TOLERANCE_PX, layerGeometry } from './mapHitTest'
+import { layerHitAt, CLICK_HIT_TOLERANCE_PX, layerGeometry, type FeatureHitType } from './mapHitTest'
+import { geometryAnchor } from '../../services/boundarySelection'
 
 console.log('🔥🔥🔥 GeoDataLayer.tsx 已加载 (2025-03-29-v3 Canvas优化版) 🔥🔥🔥')
 
@@ -1487,7 +1488,7 @@ export class GeoDataLayer {
     return undefined
   }
 
-  getFeaturesInPolygon(polygon: L.Polygon): GeoDataItem[] {
+  getFeaturesInPolygon(polygon: L.Polygon, byAnchor: boolean = false): GeoDataItem[] {
     const results: GeoDataItem[] = []
     if (!this.data || this.data.length === 0) return results
 
@@ -1496,6 +1497,18 @@ export class GeoDataLayer {
     const polygonPoints: number[][] = (polygon.getLatLngs()[0] as L.LatLng[]).map(p => [p.lat, p.lng])
 
     for (const item of this.data) {
+      // 边界选择锚点口径：仅要素归属经纬度（点=自身；线/面=包围盒中心）落入才选中，
+      // 保证相邻边界选择时同一要素不会被重复选中。点/线/面统一经 geometryAnchor 判定。
+      if (byAnchor) {
+        const anchor = geometryAnchor(this.buildItemGeometry(item))
+        if (anchor
+          && bounds.contains([anchor.lat, anchor.lng])
+          && GeoDataLayer._isPointInPolygon([anchor.lat, anchor.lng], polygonPoints)) {
+          results.push({ name: item.name, properties: item.properties, geometry: this.buildItemGeometry(item) })
+        }
+        continue
+      }
+
       // 面状要素：以其任一顶点是否落在框选范围内判定（覆盖整片区域被框住的情况）
       if (this.geometryType === 'polygon' && item.path && item.path.length > 0) {
         const inside = item.path.some(pt =>
@@ -1576,20 +1589,28 @@ export class GeoDataLayer {
    * 面要素按点击点是否落在封闭区域内判定，仅包围盒/边框相交不算命中，
    * 避免点击面内部时因其他要素包围盒压到点击点而误弹重叠列表；
    * 点要素按像素距离、线要素按到折线段的像素距离判定。
+   * 命中附带 hitType（direct/border）供调用方做穿透收敛。
    *
    * @param latlng 点击位置（渲染坐标/GCJ02）
    * @param tolerancePx 像素容差
    */
-  getFeaturesAtPoint(latlng: L.LatLng, tolerancePx: number = CLICK_HIT_TOLERANCE_PX): GeoDataItem[] {
+  getFeaturesAtPoint(
+    latlng: L.LatLng,
+    tolerancePx: number = CLICK_HIT_TOLERANCE_PX
+  ): Array<GeoDataItem & { hitType: FeatureHitType; distancePx: number }> {
     if (!this.leafletLayer || !this.map) return []
-    const results: GeoDataItem[] = []
+    const results: Array<GeoDataItem & { hitType: FeatureHitType; distancePx: number }> = []
 
     this.leafletLayer.eachLayer((layer: any) => {
-      if (layer.options?.properties && layerContainsPoint(this.map!, layer, latlng, tolerancePx)) {
-        (results as any[]).push({
+      if (!layer.options?.properties) return
+      const hit = layerHitAt(this.map!, layer, latlng, tolerancePx)
+      if (hit) {
+        results.push({
           name: layer.options.name || layer.options.properties?.name,
           properties: layer.options.properties,
-          geometry: layerGeometry(layer),
+          geometry: layerGeometry(layer) ?? undefined,
+          hitType: hit.type,
+          distancePx: hit.distancePx,
         })
       }
     })

@@ -21,6 +21,7 @@ import { useMapStore } from '../../store/mapStore'
 import type { DrawTool } from '@shared/types'
 import { resolvePointShape } from './MapInfoLayer'
 import { layerHitAt, CLICK_HIT_TOLERANCE_PX, type FeatureHitType } from './mapHitTest'
+import { geometryAnchor } from '../../services/boundarySelection'
 import { buildLineArrows } from './lineArrows'
 import { getFieldValue, matchThematicColor, NO_FILL_COLOR } from '../../utils/fieldValue'
 import type { ThematicSettings } from './LabelSettingsModal'
@@ -828,14 +829,36 @@ export class LayerEditSession {
   }
 
   /**
-   * 面/线的"部件"数组：用内部 _latlngs 保留多部件/洞。
+   * leaf 是否为 MultiPolygon 结构（三层：部件 → 环组[外环,洞...] → 环点）。
+   * Polygon 带洞只有两层（环组 → 环点）；两种结构的 internal[0][0]
+   * 分别是"环组数组"与 LatLng。
+   */
+  private isMultiPolygonLeaf(leaf: any): boolean {
+    const internal = (leaf as any)._latlngs
+    return (
+      Array.isArray(internal) && internal.length > 0
+      && Array.isArray(internal[0]) && Array.isArray(internal[0][0])
+      && !(internal[0][0] instanceof L.LatLng)
+    )
+  }
+
+  /**
+   * 面/线的"环"数组：用内部 _latlngs 保留多部件/洞。
    * 注意 Leaflet 的 getLatLngs() 只返回第一部分（Polygon 返回扁平外环），
    * 直接用它替换会丢掉洞/其他部件（旧实现据此把带洞面与 Multi 面打平，是
    * "拖顶点整个图形坍缩为一条直线"的根因）。
+   * MultiPolygon 三层结构在此展平为环列表（各部件外环/洞依次排列），
+   * 供顶点编辑等既有逻辑统一处理；写回时 ringAccessor 还原嵌套。
    */
   private partsOf(leaf: any): L.LatLng[][] {
     const internal = (leaf as any)._latlngs
     if (Array.isArray(internal) && internal.length > 0 && Array.isArray(internal[0])) {
+      if (this.isMultiPolygonLeaf(leaf)) {
+        return (internal as any[][]).reduce(
+          (acc: L.LatLng[][], group) => acc.concat(group as L.LatLng[]),
+          [] as L.LatLng[][],
+        )
+      }
       return internal as L.LatLng[][]
     }
     const ll = leaf.getLatLngs()
@@ -848,12 +871,23 @@ export class LayerEditSession {
   private ringAccessor(leaf: any, isPoly: boolean): { getRing(): L.LatLng[]; setRing(r: L.LatLng[]): void } {
     return {
       getRing: (): L.LatLng[] => {
+        // MultiPolygon：第一部件的外环（_latlngs[0][0]）；其余取展平环列表第一个
+        if (this.isMultiPolygonLeaf(leaf)) {
+          return leaf._latlngs[0][0] || []
+        }
         const parts = this.partsOf(leaf)
         return parts[0] || []
       },
       setRing: (r: L.LatLng[]) => {
-        const parts = this.partsOf(leaf)
         const closed = isPoly ? this.closeLatLngs(r) : r
+        if (this.isMultiPolygonLeaf(leaf)) {
+          // 还原三层嵌套：只替换第一部件外环，该部件的洞与其余部件保持
+          const internal = leaf._latlngs
+          const firstGroup = internal[0]
+          leaf.setLatLngs([[closed, ...firstGroup.slice(1)], ...internal.slice(1)])
+          return
+        }
+        const parts = this.partsOf(leaf)
         if (parts.length > 1) {
           // 多部件/带洞：只替换第一个环，其余保持
           leaf.setLatLngs([closed, ...parts.slice(1)])
@@ -877,7 +911,14 @@ export class LayerEditSession {
     const parts = this.partsOf(leaf)
     if (t === 'LineString') return { type: t, coordinates: toCoords(parts[0] || []) }
     if (t === 'MultiLineString') return { type: t, coordinates: parts.map(toCoords) }
-    if (t === 'MultiPolygon') return { type: t, coordinates: parts.map((r) => [closeR(r)]) }
+    if (t === 'MultiPolygon') {
+      // 保留部件嵌套：每部件 [外环, 洞...]（不能用展平 parts，否则洞被当成独立部件）
+      return {
+        type: t,
+        coordinates: leaf._latlngs.map((group: L.LatLng[][]) =>
+          group.map((ring: L.LatLng[]) => closeR(ring))),
+      }
+    }
     // Polygon：parts[0] = 外环，其余为洞
     return { type: 'Polygon', coordinates: parts.map(closeR) }
   }
@@ -1630,13 +1671,38 @@ export class LayerEditSession {
   /**
    * 圈选：返回工作集要素中与给定形状相交的要素（几何 + 完整属性），并在编辑层上高亮。
    * 供"编辑模式下圈选图形元素并复制到剪切板"使用（形状为 L.Circle / L.Rectangle / L.Polygon）。
+   * @param append true 时与已有圈选结果取并集（边界选择 MultiPolygon 逐外环收集时使用）
+   * @param byAnchor true 时仅按要素锚点（归属经纬度）判定（边界选择口径，
+   *                 保证相邻边界不会重复选中同一要素）；false 为任一顶点口径（普通圈选）
    */
-  selectInShape(shape: L.Layer): CopiedFeature[] {
+  selectInShape(shape: L.Layer, append: boolean = false, byAnchor: boolean = false): CopiedFeature[] {
     if (!this.layerId) return []
     const ws = useLayerEditStore.getState().getWorkspace(this.layerId)
     if (!ws) return []
-    const test = this.shapeTester(shape)
-    const hits = (ws.features as any[]).filter((f: any) => test(this.featureVertices(f)))
+    const pointTest = this.shapePointTester(shape)
+    const newHits = (ws.features as any[]).filter((f: any) => {
+      if (byAnchor) {
+        const anchor = geometryAnchor(f.geometry)
+        return anchor ? pointTest(L.latLng(anchor.lat, anchor.lng)) : false
+      }
+      return this.featureVertices(f).some((p) => pointTest(p))
+    })
+    let hits: any[]
+    if (append) {
+      // 与已有命中按 _editId 去重合并，高亮整体重画
+      const seen = new Set(this.shapeSelectedIds)
+      hits = (ws.features as any[]).filter(
+        (f: any) => seen.has(f.properties?._editId),
+      )
+      for (const f of newHits) {
+        const id = f.properties?._editId
+        if (id && seen.has(id)) continue
+        if (id) seen.add(id)
+        hits.push(f)
+      }
+    } else {
+      hits = newHits
+    }
     this.shapeSelectedIds = new Set(
       hits.map((f: any) => f.properties?._editId).filter((id: any): id is string => !!id),
     )
@@ -1644,18 +1710,24 @@ export class LayerEditSession {
     return hits.map((f: any) => ({ geometry: f.geometry, properties: f.properties || {} }))
   }
 
-  /** 批量删除圈选选中的要素（Delete/Backspace 触发）。返回删除数量。 */
+  /**
+   * 批量删除圈选选中的要素（Delete/Backspace 触发）。返回删除数量。
+   * 走 store.deleteFeatures 一次写入：只拍一份历史快照、订阅侧只 rebuild 一次，
+   * 避免逐个删除（N 次深拷贝 + N 次全图层重建）在大批量选中时卡死页面。
+   */
   deleteShapeSelected(): number {
     if (!this.layerId || this.shapeSelectedIds.size === 0) return 0
     const store = useLayerEditStore.getState()
     const ids = Array.from(this.shapeSelectedIds)
-    ids.forEach((id) => store.deleteFeature(this.layerId!, id))
+    const n = store.deleteFeatures(this.layerId, ids)
     this.shapeSelectedIds.clear()
     this.clearShapeSelection()
     // 单选要素若在被删集合内则一并取消选中
     if (this.selectedEditId && ids.includes(this.selectedEditId)) this.deselect()
+    // store 写入已经订阅触发一次 setWorkspace→rebuild；此处再 rebuild 一次保证
+    // deselect 后的选中样式/把手清除（O(M)，两次全量重建对大批量仍可接受）
     this.rebuild()
-    return ids.length
+    return n
   }
 
   /** 清除圈选选中（选中集合 + 高亮图层）。供 Esc / 清除按钮 / 删除后调用。 */
@@ -1695,20 +1767,23 @@ export class LayerEditSession {
     }).addTo(this.map)
   }
 
-  /** 形状命中测试（点/包围盒粗筛 + 射线法；与 GeoDataLayer 圈选口径一致：任一顶点命中即选中） */
-  private shapeTester(shape: L.Layer): (pts: L.LatLng[]) => boolean {
+  /**
+   * 形状对单个点的命中测试（圆=距离；多边形=包围盒粗筛 + 射线法）。
+   * 顶点口径（普通圈选）与锚点口径（边界选择）共用此单点测试。
+   */
+  private shapePointTester(shape: L.Layer): (p: L.LatLng) => boolean {
     const anyShape = shape as any
     if (typeof anyShape.getRadius === 'function' && typeof anyShape.getLatLng === 'function') {
       const c = anyShape.getLatLng() as L.LatLng
       const r = anyShape.getRadius() as number
-      return (pts: L.LatLng[]) => pts.some((p) => c.distanceTo(p) <= r)
+      return (p: L.LatLng) => c.distanceTo(p) <= r
     }
     const ring: L.LatLng[] = (anyShape.getLatLngs?.() || [])[0] || []
     const bounds: L.LatLngBounds | undefined = typeof anyShape.getBounds === 'function'
       ? anyShape.getBounds()
       : undefined
     if (!ring.length || !bounds) return () => false
-    return (pts: L.LatLng[]) => pts.some((p) => {
+    return (p: L.LatLng) => {
       if (!bounds.contains(p)) return false
       let inside = false
       for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
@@ -1721,7 +1796,7 @@ export class LayerEditSession {
         if (intersect) inside = !inside
       }
       return inside
-    })
+    }
   }
 
   /** 要素几何的所有顶点（支持 Point/LineString/Polygon 及 Multi*，坐标按 [lng, lat] 遍历） */

@@ -347,9 +347,10 @@ export function FeatureInfoPanel({ title, subtitle, properties, visible, onClose
                                     if (displayValue && typeof displayValue === 'object') {
                                         displayValue = JSON.stringify(displayValue)
                                     }
-                                    // 编辑态：仅标量字段可修改（对象值保持只读展示）
+                                    // 编辑态：标量字段可修改（对象值保持只读展示）；
+                                    // 空值字段（新要素继承的字段尚未填值）同样可编辑，可直接填值
                                     const editableRow = !!editable && !!onPropertyChange
-                                        && value !== null && value !== undefined && typeof value !== 'object'
+                                        && (value === null || value === undefined || typeof value !== 'object')
 
                                     return (
                                         <tr key={key} className="hover:bg-muted/50 transition-colors">

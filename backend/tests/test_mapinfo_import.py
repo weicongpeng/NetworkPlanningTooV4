@@ -4,7 +4,7 @@
 覆盖：
 - KML 图层类型识别 + <Style>/<styleUrl> 样式还原
 - MIF 点要素 Symbol 样式还原（GDAL 不暴露样式列时的 .mif 文本兜底解析）
-- TAB .map 文件样式解析（要素占位对齐）
+- TAB 真实样式：OGR 样式串（PEN/BRUSH/SYMBOL）→ _style 结构转换与要素对齐
 - KML aabbggrr 颜色转换
 
 依赖 geopandas/pyogrio，缺失时 pytest.skip（沿用 test_layer_service 的 _try_import 模式）。
@@ -46,24 +46,21 @@ Columns 2
   NAME Char (20)
   VAL Integer
 Data
-  Symbol (35, 16711680, 12)
 Point 116.3 39.9
-  Symbol (35, 65280, 14)
+  Symbol (35, 16711680, 12)
 Point 116.4 40.0
-  Pen (2, 2, 0)
+  Symbol (35, 65280, 14)
 Line 116.3 39.9 116.5 40.1
+  Pen (2, 2, 0)
 """
 
-SAMPLE_MAP_FILE = """Version 300
-Charset "WindowsSimpChinese"
-
-Pen (1, 2, 0)
-Brush (2, 16711680, 16777215)
-Symbol (34, 0, 12)
-Line (1, 2, 0, 32, 2, 0, 2, 2, 0, 0)
-Region (1, 2, 0, 0, 32, 2, 0, 2, 2, 0, 0)
-Text (4096, 0, 0, 0)
-"""
+# GDAL 依据 .map 对象样式生成的 OGR 样式串（取自真实 TAB 图层，见 ogr_style_reader）
+OGR_STYLE_PEN_SOLID = 'PEN(w:1px,c:#000000,id:"mapinfo-pen-2,ogr-pen-0",cap:r,j:r)'
+OGR_STYLE_PEN_DASHED = 'PEN(w:1px,c:#d0e0ff,id:"mapinfo-pen-24,ogr-pen-7",p:"4 1 1 1 1px",cap:r,j:r)'
+OGR_STYLE_BRUSH_HOLLOW = 'BRUSH(fc:#000000,bc:#ffffff,id:"mapinfo-brush-1,ogr-brush-1")'
+OGR_STYLE_BRUSH_SOLID = 'BRUSH(fc:#a0ffff,bc:#ffffff,id:"mapinfo-brush-2,ogr-brush-0")'
+OGR_STYLE_SYMBOL_FONT = 'SYMBOL(a:0,c:#ff0000,s:4pt,id:"font-sym-41,ogr-sym-9",f:"Map Symbols")'
+OGR_STYLE_SYMBOL_SHAPE = 'SYMBOL(a:0,c:#0000ff,s:15pt,id:"mapinfo-sym-34,ogr-sym-3")'
 
 
 def _try_import_mapinfo_parser():
@@ -160,11 +157,11 @@ def test_parse_mif_point_symbol_style(tmp_path):
     layer = MapInfoParser.parse_file(mif)
     assert layer.type.value == "point"
     assert len(layer.features) == 3
-    # 第一个点是 Symbol(35, 16711680, 12)：35=星形, 16711680=#0000ff, size=12
+    # 第一个点是 Symbol(35, 16711680, 12)：35=星形, 16711680=0xFF0000=红, size=12
     style = layer.features[0].properties.get("_style")
     assert style is not None
     assert style.get("markerSymbol") == 35
-    assert style.get("markerColor") == "#0000ff"
+    assert style.get("markerColor") == "#ff0000"
     assert style.get("markerSize") == 12.0
     # 第二个点 Symbol(35, 65280, 14)：65280=#00ff00
     style2 = layer.features[1].properties.get("_style")
@@ -178,32 +175,102 @@ def test_parse_mif_point_symbol_style(tmp_path):
     assert style3.get("strokeWidth") == 2.0
 
 
-def test_extract_tab_map_styles_alignment(tmp_path):
-    """TAB .map 样式解析：按要素顺序对齐，空样式占位不导致错位"""
+def test_extract_tab_styles_alignment(tmp_path, monkeypatch):
+    """TAB 样式解析：按要素顺序对齐，无样式要素占位 None 不导致错位"""
     MapInfoParser = _try_import_mapinfo_parser()
-    map_file = tmp_path / "test.map"
-    map_file.write_text(SAMPLE_MAP_FILE, encoding="gbk")
+    from app.services import mapinfo_service
 
-    styles = MapInfoParser._extract_tab_map_styles(map_file)
+    tab_file = tmp_path / "test.tab"
+    tab_file.write_text('!table\n', encoding="gbk")
+    monkeypatch.setattr(
+        mapinfo_service, "read_feature_style_strings",
+        lambda path: [OGR_STYLE_PEN_SOLID, None, OGR_STYLE_SYMBOL_FONT],
+    )
+
+    styles = MapInfoParser._extract_tab_styles(tab_file)
     assert styles is not None
-    # 6 个对象行：面(Pen+Brush)、点(Symbol)、线(Line)、面(Region)、文本(Text) = 5 个要素
-    assert len(styles) == 5
-    # 要素 0 = 面（Pen + Brush 合并）
-    s0 = styles[0]
-    assert s0 is not None
-    assert s0.get("strokeColor") == "#000000"
-    assert s0.get("fillColor") == "#0000ff"
-    assert s0.get("fillBgColor") == "#ffffff"
-    # 要素 1 = 点（Symbol 34=circle, 黑色, size=12）
-    s1 = styles[1]
-    assert s1 is not None
-    assert s1.get("markerSymbol") == 34
-    assert s1.get("markerColor") == "#000000"
-    assert s1.get("markerSize") == 12.0
-    # 要素 2-4 = 线/面/文本（无样式 → None 占位，保证与 .dat 行序对齐）
-    assert styles[2] is None
-    assert styles[3] is None
-    assert styles[4] is None
+    assert len(styles) == 3
+    assert styles[0]["strokeColor"] == "#000000"
+    assert styles[1] is None          # 无样式要素占位
+    assert styles[2]["markerColor"] == "#ff0000"
+
+
+def test_extract_tab_styles_unavailable(tmp_path, monkeypatch):
+    """GDAL 样式串不可用（返回 None）或文件不存在 → None（回退默认配色）"""
+    MapInfoParser = _try_import_mapinfo_parser()
+    from app.services import mapinfo_service
+
+    tab_file = tmp_path / "test.tab"
+    tab_file.write_text('!table\n', encoding="gbk")
+    monkeypatch.setattr(mapinfo_service, "read_feature_style_strings", lambda path: None)
+    assert MapInfoParser._extract_tab_styles(tab_file) is None
+    assert MapInfoParser._extract_tab_styles(tmp_path / "nope.tab") is None
+    assert MapInfoParser._extract_tab_styles(None) is None
+
+
+def test_parse_ogr_style_string_pen():
+    """OGR 样式串 PEN：实线取色/线宽，虚线图案映射 dasharray"""
+    MapInfoParser = _try_import_mapinfo_parser()
+
+    solid = MapInfoParser._parse_ogr_style_string(OGR_STYLE_PEN_SOLID)
+    assert solid["stroke"] is True
+    assert solid["strokeColor"] == "#000000"
+    assert solid["strokeWidth"] == 1.0
+    assert "strokeDasharray" not in solid
+
+    dashed = MapInfoParser._parse_ogr_style_string(OGR_STYLE_PEN_DASHED)
+    assert dashed["strokeColor"] == "#d0e0ff"
+    assert dashed["strokeDasharray"]        # 图案 24 = 虚线/点划线
+
+
+def test_parse_ogr_style_string_brush_pattern1_means_hollow():
+    """OGR 样式串 BRUSH：图案 1 = 空心（必须显式关填充，否则 fc 的黑色会渲染成黑面）"""
+    MapInfoParser = _try_import_mapinfo_parser()
+
+    hollow = MapInfoParser._parse_ogr_style_string(OGR_STYLE_BRUSH_HOLLOW)
+    assert hollow["fill"] is False
+    assert hollow["fillPattern"] == 1
+    assert "fillColor" not in hollow
+
+    solid = MapInfoParser._parse_ogr_style_string(OGR_STYLE_BRUSH_SOLID)
+    assert solid["fill"] is True
+    assert solid["fillColor"] == "#a0ffff"
+    assert solid["fillOpacity"] == 0.8
+    assert "fillBgColor" not in solid       # 白色背景不写入
+
+
+def test_parse_ogr_style_string_symbol():
+    """OGR 样式串 SYMBOL：只取颜色/尺寸，不输出 markerSymbol（点统一用 Canvas 圆点渲染）"""
+    MapInfoParser = _try_import_mapinfo_parser()
+
+    font = MapInfoParser._parse_ogr_style_string(OGR_STYLE_SYMBOL_FONT)
+    assert font["markerColor"] == "#ff0000"
+    assert font["markerSize"] == 4.0
+    assert "markerSymbol" not in font
+    assert "markerType" not in font
+
+    shape = MapInfoParser._parse_ogr_style_string(OGR_STYLE_SYMBOL_SHAPE)
+    assert shape["markerColor"] == "#0000ff"
+    assert shape["markerSize"] == 15.0
+    assert "markerSymbol" not in shape
+
+
+def test_parse_ogr_style_string_empty():
+    """空/无法识别的样式串 → None"""
+    MapInfoParser = _try_import_mapinfo_parser()
+    assert MapInfoParser._parse_ogr_style_string(None) is None
+    assert MapInfoParser._parse_ogr_style_string("") is None
+    assert MapInfoParser._parse_ogr_style_string("FONT(f:1)") is None
+
+
+def test_read_feature_style_strings_unavailable(tmp_path):
+    """OGR 样式串读取：文件不存在/非矢量文件 → None（不抛异常，回退默认配色）"""
+    from app.services.ogr_style_reader import read_feature_style_strings
+
+    assert read_feature_style_strings(tmp_path / "nope.tab") is None
+    junk = tmp_path / "junk.tab"
+    junk.write_text("not a mapinfo file", encoding="utf-8")
+    assert read_feature_style_strings(junk) is None
 
 
 def test_extract_mif_styles_missing_file(tmp_path):

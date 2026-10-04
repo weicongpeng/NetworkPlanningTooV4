@@ -274,6 +274,36 @@ def test_point_endpoint_with_border_opacity_kml():
         os.remove(path)
 
 
+def test_point_endpoint_hollow_when_fill_none():
+    """点图层 + fill_color=none（无色）→ 空心符号 40、颜色用 border_color 轮廓色。
+    回归保护：端点曾把 fill_color 硬编码为 None，无色语义无法透传。"""
+    path = _make_excel()
+    client = _make_client()
+    try:
+        with open(path, "rb") as f:
+            resp = client.post(
+                "/api/v1/layer/point",
+                files={"file": ("sample.xlsx", f, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+                data={
+                    "sheet_name": "LTE", "name_col": "NAME",
+                    "lon_col": "LONGITUDE", "lat_col": "LATITUDE",
+                    "attributes": '["NAME"]', "output_format": "mif",
+                    "border_color": "#00FF00", "fill_color": "none",
+                    "point_size": "12", "point_shape": "circle",
+                },
+            )
+        assert resp.status_code == 200
+        dl = client.get(resp.json()["data"]["download_url"])
+        import zipfile, io
+        with zipfile.ZipFile(io.BytesIO(dl.content)) as zf:
+            mif_names = [n for n in zf.namelist() if n.endswith(".mif")]
+            assert mif_names
+            text = zf.read(mif_names[0]).decode("gbk", errors="replace")
+        assert "Symbol (40,65280,12)" in text   # 40=空心圆、65280=绿（轮廓色）
+    finally:
+        os.remove(path)
+
+
 def test_sector_endpoint_with_color():
     """扇区图层 + color 参数 → 生成成功且 MIF 颜色已注入"""
     path = _make_excel()

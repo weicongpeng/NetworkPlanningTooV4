@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { orderWithIds, panelRankFromIndex, isLayerSelectable, computeZRank, LAYER_Z_TYPE_RANK } from '../layerZOrder'
+import { orderWithIds, panelRankFromIndex, topPanelRank, isLayerSelectable, computeZRank, LAYER_Z_TYPE_RANK } from '../layerZOrder'
 
 describe('orderWithIds', () => {
   it('按持久化顺序排列已存在的 id', () => {
@@ -37,6 +37,24 @@ describe('panelRankFromIndex', () => {
     const geoTop = computeZRank('geodata', panelRankFromIndex(0, total))
     const mapinfoBottom = computeZRank('mapinfo', panelRankFromIndex(total - 1, total))
     expect(geoTop).toBeLessThan(mapinfoBottom)
+  })
+})
+
+describe('topPanelRank（类内最顶伪条目，如装饰图层要素显示层）', () => {
+  it('严格大于类内任何面板索引的 rank', () => {
+    const total = 3
+    for (let i = 0; i < total; i++) {
+      expect(topPanelRank(total)).toBeGreaterThan(panelRankFromIndex(i, total))
+    }
+  })
+
+  it('仍低于相邻更高类型的最低 rank（装饰显示层在图层文件类内最顶 < 基站）', () => {
+    const total = 10
+    const decorationTop = computeZRank('mapinfo', topPanelRank(total))
+    const sectorBottom = computeZRank('sector', panelRankFromIndex(total - 1, total))
+    expect(decorationTop).toBeLessThan(sectorBottom)
+    // 高于所有图层文件
+    expect(decorationTop).toBeGreaterThan(computeZRank('mapinfo', panelRankFromIndex(0, total)))
   })
 })
 

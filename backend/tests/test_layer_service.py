@@ -311,8 +311,8 @@ def test_kml_sector_color_injected(service, sample_excel):
     assert len(gdf) == 2
 
 
-def test_tab_color_ignored(service, sample_excel):
-    """TAB + 颜色 → 正常生成（不注入，不报错）"""
+def test_tab_point_color_injected(service, sample_excel):
+    """TAB + 颜色 → 样式写入 .map（走临时 MIF 中转），不再是"忽略颜色" """
     result, _ = service.generate_point_layer(
         file_path=str(sample_excel), sheet_name="LTE",
         name_col="NAME", lon_col="LONGITUDE", lat_col="LATITUDE",
@@ -320,6 +320,11 @@ def test_tab_color_ignored(service, sample_excel):
     )
     assert result.exists()
     assert result.suffix == ".tab"
+    from app.services.ogr_style_reader import read_feature_style_strings
+    styles = read_feature_style_strings(result)
+    assert styles and styles[0]
+    assert "c:#4a90d9" in styles[0]
+    assert "SYMBOL(" in styles[0]
 
 
 def test_invalid_color_ignored(service, sample_excel):
@@ -470,6 +475,119 @@ def test_kml_sector_opacity_semantics(service, sample_excel):
     text = result.read_text(encoding="utf-8", errors="replace")
     assert "<LineStyle><color>000000ff</color>" in text   # alpha=00
     assert "<PolyStyle><color>0000ff00</color>" in text
+
+
+def test_mif_sector_fill_none_is_hollow(service, sample_excel):
+    """扇区 MIF 填充"无色" → Brush pattern 1（无填充/镂空），边框颜色照常写入"""
+    result, _ = service.generate_sector_layer(
+        file_path=str(sample_excel), sheet_name="LTE",
+        name_col="NAME", lon_col="LONGITUDE", lat_col="LATITUDE",
+        azimuth_col="AZIMUTH", radius_m=3000, beamwidth=40.0,
+        attributes=["NAME"], output_format="mif",
+        border_color="#FF0000", fill_color="none",
+    )
+    text = result.read_text(encoding="utf-8", errors="replace")
+    assert "Brush (1," in text          # pattern 1 = 无填充
+    assert "Brush (2," not in text
+    assert "Pen (2,2,16711680)" in text  # 红色边框不失真
+
+
+def test_mif_sector_border_none_has_no_line(service, sample_excel):
+    """扇区 MIF 边框"无色" → Pen pattern 1（无边框），填充照常"""
+    result, _ = service.generate_sector_layer(
+        file_path=str(sample_excel), sheet_name="LTE",
+        name_col="NAME", lon_col="LONGITUDE", lat_col="LATITUDE",
+        azimuth_col="AZIMUTH", radius_m=3000, beamwidth=40.0,
+        attributes=["NAME"], output_format="mif",
+        border_color="none", fill_color="#0000FF",
+    )
+    text = result.read_text(encoding="utf-8", errors="replace")
+    assert "Pen (2,1," in text        # pattern 1 = 无边框
+    assert "Brush (2,255,16777215)" in text  # 蓝色实心填充
+
+
+def test_tab_sector_none_styles(service, sample_excel):
+    """TAB（经 MIF 中转）：填充无色 → mapinfo-brush-1，边框无色 → mapinfo-pen-1"""
+    result, _ = service.generate_sector_layer(
+        file_path=str(sample_excel), sheet_name="LTE",
+        name_col="NAME", lon_col="LONGITUDE", lat_col="LATITUDE",
+        azimuth_col="AZIMUTH", radius_m=3000, beamwidth=40.0,
+        attributes=["NAME"], output_format="tab",
+        border_color="#FF0000", fill_color="none",
+    )
+    from app.services.ogr_style_reader import read_feature_style_strings
+    styles = read_feature_style_strings(result)
+    assert styles and styles[0]
+    assert 'mapinfo-brush-1' in styles[0]      # 无填充
+    assert 'c:#ff0000' in styles[0]            # 边框色保留
+
+    result, _ = service.generate_sector_layer(
+        file_path=str(sample_excel), sheet_name="LTE",
+        name_col="NAME", lon_col="LONGITUDE", lat_col="LATITUDE",
+        azimuth_col="AZIMUTH", radius_m=3000, beamwidth=40.0,
+        attributes=["NAME"], output_format="tab",
+        border_color="none", fill_color="#0000FF",
+    )
+    styles = read_feature_style_strings(result)
+    assert styles and styles[0]
+    assert 'mapinfo-pen-1' in styles[0]        # 无边框
+    assert 'c:#0000ff' in styles[0]            # 填充色保留
+
+
+def test_kml_sector_fill_none_is_hollow(service, sample_excel):
+    """KML 扇区填充"无色" → PolyStyle fill=0 + outline=1（镂空，只留边框）"""
+    result, _ = service.generate_sector_layer(
+        file_path=str(sample_excel), sheet_name="LTE",
+        name_col="NAME", lon_col="LONGITUDE", lat_col="LATITUDE",
+        azimuth_col="AZIMUTH", radius_m=3000, beamwidth=40.0,
+        attributes=["NAME"], output_format="kml",
+        border_color="#FF0000", fill_color="none",
+    )
+    text = result.read_text(encoding="utf-8", errors="replace")
+    assert "<LineStyle><color>ff0000ff</color>" in text
+    assert "<PolyStyle><fill>0</fill><outline>1</outline></PolyStyle>" in text
+    # 每个 Placemark 仍只有一个 Style
+    assert text.count("<Style>") == text.count("</Style>") == 2
+
+
+def test_kml_sector_border_none_omits_line(service, sample_excel):
+    """KML 扇区边框"无色" → 不写 LineStyle，PolyStyle outline=0（否则 GE 会补默认黑边）"""
+    result, _ = service.generate_sector_layer(
+        file_path=str(sample_excel), sheet_name="LTE",
+        name_col="NAME", lon_col="LONGITUDE", lat_col="LATITUDE",
+        azimuth_col="AZIMUTH", radius_m=3000, beamwidth=40.0,
+        attributes=["NAME"], output_format="kml",
+        border_color="none", fill_color="#0000FF",
+    )
+    text = result.read_text(encoding="utf-8", errors="replace")
+    assert "<LineStyle>" not in text
+    assert "<PolyStyle><color>ffff0000</color><fill>1</fill><outline>0</outline></PolyStyle>" in text
+
+
+def test_point_fill_none_is_hollow(service, sample_excel):
+    """点填充"无色" → 空心符号（circle→40，颜色用轮廓色）；KML 图标只描边不填充"""
+    result, _ = service.generate_point_layer(
+        file_path=str(sample_excel), sheet_name="LTE",
+        name_col="NAME", lon_col="LONGITUDE", lat_col="LATITUDE",
+        attributes=["NAME"], output_format="mif",
+        border_color="#00FF00", fill_color="none",
+        point_size=12, point_shape="circle",
+    )
+    text = result.read_text(encoding="utf-8", errors="replace")
+    assert "Symbol (40,65280,12)" in text
+
+    result, _ = service.generate_point_layer(
+        file_path=str(sample_excel), sheet_name="LTE",
+        name_col="NAME", lon_col="LONGITUDE", lat_col="LATITUDE",
+        attributes=["NAME"], output_format="kml",
+        border_color="#00FF00", fill_color="none",
+        point_size=12, point_shape="circle",
+    )
+    from urllib.parse import unquote
+    text = result.read_text(encoding="utf-8", errors="replace")
+    assert "<IconStyle><color>ff00ff00</color>" in text
+    icon = unquote(text.split("<href>")[1].split("</href>")[0])
+    assert 'fill="none"' in icon and 'stroke="#00FF00"' in icon
 
 
 def test_kml_name_col_uses_cell_id(service, sample_excel):

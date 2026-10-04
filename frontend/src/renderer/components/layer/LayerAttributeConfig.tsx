@@ -48,11 +48,12 @@ export function LayerAttributeConfig({
       {/* 列勾选 */}
       <div>
         <p className="text-xs font-medium mb-2">{t('layer.selectAttributes')}</p>
-        <div className="grid grid-cols-2 gap-2 max-h-48 overflow-y-auto border border-border rounded-lg p-3">
+        <div className="grid grid-cols-2 gap-2 max-h-96 overflow-y-auto border border-border rounded-lg p-3">
           {columns.length > 0 ? columns.map(col => (
             <label key={col} className="flex items-center gap-2 text-xs cursor-pointer">
               <input
                 type="checkbox"
+                className="layer-standard-checkbox"
                 checked={!!selectedFields[col]}
                 onChange={e => toggleAttribute(col, e.target.checked)}
               />
