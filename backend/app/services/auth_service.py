@@ -8,6 +8,7 @@ from typing import Optional, List, Tuple
 
 from passlib.context import CryptContext
 from jose import jwt, JWTError
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
@@ -223,7 +224,7 @@ class AuthService:
         db.add(session)
         db.commit()
         db.refresh(session)
-        # 清理其他过期会话，自动累加使用时长
+        # 结算其他超时会话的使用时长（不注销，避免打断仍在有效期内的登录态）
         self.cleanup_stale_sessions(db, idle_minutes=6)
         return session
 
@@ -256,6 +257,7 @@ class AuthService:
         ).all()
         count = 0
         for s in sessions:
+            self._accumulate_session_duration(db, s, now)
             s.logout_time = now
             s.last_activity = now
             count += 1
@@ -264,36 +266,43 @@ class AuthService:
         return count
 
     def _accumulate_session_duration(self, db: Session, session: UserSession, end_time: Optional[datetime] = None):
-        """累加指定会话的使用时长到用户记录"""
+        """增量累加指定会话的使用时长到用户记录（从上次结算点算到 end_time）"""
         if end_time is None:
             end_time = datetime.now(timezone.utc)
-        login_time = session.login_time
-        if login_time.tzinfo is None:
-            login_time = login_time.replace(tzinfo=timezone.utc)
-        duration = (end_time - login_time).total_seconds()
+        if end_time.tzinfo is None:
+            end_time = end_time.replace(tzinfo=timezone.utc)
+        last_end = session.usage_accounted_at or session.login_time
+        if last_end.tzinfo is None:
+            last_end = last_end.replace(tzinfo=timezone.utc)
+        duration = (end_time - last_end).total_seconds()
         if duration > 0:
             user = db.query(User).filter(User.id == session.user_id).first()
             if user:
                 user.total_usage_seconds += int(duration)
+            session.usage_accounted_at = end_time
 
     def cleanup_stale_sessions(self, db: Session, idle_minutes: int = 5) -> int:
-        """清理超过 N 分钟无活动的过期会话，以最后活动时间作为离线时间点累加使用时长。
+        """结算超过 N 分钟无活动会话的使用时长（只结算，不注销会话）。
 
         解决直接关闭浏览器/APP 不调登出接口导致使用时长统计为 0 的问题。
-        返回清理的会话数量。
+        注意：不再把这些会话置为已登出——否则 JWT 仍在有效期内的用户会被
+        频繁打断、被迫重新登录；是否要求重新登录由空闲超时策略决定
+        （见 is_session_idle_expired）。返回结算的会话数量。
         """
         cutoff = datetime.now(timezone.utc) - timedelta(minutes=idle_minutes)
         stale_sessions = db.query(UserSession).filter(
             UserSession.logout_time.is_(None),
             UserSession.last_activity < cutoff,
+            or_(
+                UserSession.usage_accounted_at.is_(None),
+                UserSession.usage_accounted_at < UserSession.last_activity,
+            ),
         ).all()
-        now = datetime.now(timezone.utc)
         for s in stale_sessions:
             end_time = s.last_activity
             if end_time.tzinfo is None:
                 end_time = end_time.replace(tzinfo=timezone.utc)
             self._accumulate_session_duration(db, s, end_time)
-            s.logout_time = s.last_activity  # 以最后活动时间作为离线时间
         if stale_sessions:
             db.commit()
         return len(stale_sessions)
@@ -322,25 +331,26 @@ class AuthService:
         return True
 
     def is_token_revoked(self, db: Session, token_jti: str) -> bool:
-        """检查令牌是否已注销"""
+        """检查令牌是否已注销（主动登出或被其他设备登录踢出）"""
         session = db.query(UserSession).filter(
             UserSession.token_jti == token_jti,
             UserSession.logout_time.isnot(None),
         ).first()
         return session is not None
 
-    def verify_session_ip(self, db: Session, token_jti: str, current_ip: str) -> bool:
-        """验证请求IP是否与会话记录IP一致。APP会话跳过IP校验。"""
-        if not current_ip or current_ip == "unknown":
-            return True  # 无法获取IP时放行
+    def is_session_idle_expired(self, db: Session, token_jti: str) -> bool:
+        """检查会话是否空闲超时（连续无操作超过 SESSION_IDLE_TIMEOUT_MINUTES 才要求重新登录）。
+
+        会话记录不存在时放行（历史 token 无会话记录，交由其他逻辑处理）。
+        """
         session = db.query(UserSession).filter(UserSession.token_jti == token_jti).first()
-        if not session:
-            return True  # 会话不存在时放行（由其他逻辑处理）
-        if not session.ip_address:
-            return True  # 旧会话没有IP记录，放行
-        if session.client_type == 'app':
-            return True  # APP会话不校验IP，允许多设备同时登录
-        return session.ip_address == current_ip
+        if not session or not session.last_activity:
+            return False
+        last_activity = session.last_activity
+        if last_activity.tzinfo is None:
+            last_activity = last_activity.replace(tzinfo=timezone.utc)
+        idle = datetime.now(timezone.utc) - last_activity
+        return idle > timedelta(minutes=settings.SESSION_IDLE_TIMEOUT_MINUTES)
 
     def get_user_sessions(self, db: Session, user_id: int) -> list:
         return db.query(UserSession).filter(UserSession.user_id == user_id).order_by(UserSession.login_time.desc()).all()

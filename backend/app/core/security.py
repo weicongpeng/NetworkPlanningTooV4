@@ -2,7 +2,7 @@
 安全依赖
 FastAPI Depends 可调用对象，用于认证和授权
 """
-from fastapi import Depends, HTTPException, Request, status
+from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
 
@@ -14,7 +14,6 @@ security_scheme = HTTPBearer(auto_error=False)
 
 async def get_current_user(
     credentials: HTTPAuthorizationCredentials | None = Depends(security_scheme),
-    request: Request = None,
     db: Session = Depends(get_db),
 ):
     """从 Bearer Token 解析当前用户。未认证返回 401。"""
@@ -38,15 +37,14 @@ async def get_current_user(
             detail="会话已注销，请重新登录",
         )
 
-    # IP 校验：防止 token 被其他 IP 使用
-    # 主要场景：同一账号在新 IP 登录后，历史 token 在旧 IP 的请求被拒绝
-    if jti and request is not None:
-        current_ip = auth_service.get_client_ip(request)
-        if not auth_service.verify_session_ip(db, jti, current_ip):
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="账号已在其他设备登录，请重新登录",
-            )
+    # 空闲超时校验：连续无操作（含心跳）超过阈值才要求重新登录。
+    # 注意：不校验请求 IP——客户端 IPv4/IPv6 切换或换网络不应打断登录态；
+    # 同一账号仅在新设备登录时踢掉旧会话（见 auth_service.end_other_ip_sessions）。
+    if jti and auth_service.is_session_idle_expired(db, jti):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="长时间未操作，请重新登录",
+        )
 
     user_id = int(payload.get("sub"))
     user = auth_service.get_user_by_id(db, user_id)

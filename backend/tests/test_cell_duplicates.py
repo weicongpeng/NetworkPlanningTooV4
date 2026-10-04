@@ -258,7 +258,7 @@ def test_check_duplicates_endpoint_smoke(dup_env):
     db = SessionLocal()
     try:
         # 构造具备 can_cell_entry 权限的测试用户 + 合法 token。
-        # 该 token 未创建 UserSession 记录 → is_token_revoked 与 verify_session_ip 均放行。
+        # 该 token 未创建 UserSession 记录 → is_token_revoked 与 is_session_idle_expired 均放行。
         existing = auth_service.get_user_by_username(db, username)
         if existing:
             db.delete(existing)

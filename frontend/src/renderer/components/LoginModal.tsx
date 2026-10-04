@@ -1,8 +1,10 @@
 import { useEffect, useState } from 'react'
+import { useLocation, useNavigate } from 'react-router-dom'
 import { useTranslation } from 'react-i18next'
 import { X, LogIn, UserPlus, Loader2 } from 'lucide-react'
 import { authApi } from '../services/api'
 import { useAuthStore } from '../store/authStore'
+import { getLastRoute } from '../utils/lastRoute'
 import type { RegisterOptions } from '@shared/types'
 
 interface LoginModalProps {
@@ -17,6 +19,8 @@ const FALLBACK_OPERATORS = ['移动', '联通', '电信', '广电']
 export function LoginModal({ isOpen, forceChangePassword = false, onClose }: LoginModalProps) {
   const { t } = useTranslation()
   const { login, register, changePassword } = useAuthStore()
+  const navigate = useNavigate()
+  const location = useLocation()
 
   const [mode, setMode] = useState<'login' | 'register'>('login')
   const [username, setUsername] = useState('')
@@ -75,7 +79,12 @@ export function LoginModal({ isOpen, forceChangePassword = false, onClose }: Log
         await changePassword(oldPassword, password, confirmPassword)
         onClose?.()
       } else if (mode === 'login') {
+        // 先取上次停留页面，登录成功后恢复（须在 login 之前取，避免被路由记录覆盖）
+        const restoreTarget = getLastRoute(username.trim())
         const warningMsg = await login(username.trim(), password)
+        if (restoreTarget && restoreTarget !== location.pathname) {
+          navigate(restoreTarget, { replace: true })
+        }
         if (warningMsg) {
           setWarning(warningMsg)
           // 短暂显示警告后自动关闭

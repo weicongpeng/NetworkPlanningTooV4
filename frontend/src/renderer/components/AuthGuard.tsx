@@ -6,7 +6,7 @@ interface AuthGuardProps {
   children: React.ReactNode
 }
 
-const IDLE_TIMEOUT_MS = 60 * 60 * 1000  // 1 小时无操作才退出
+const IDLE_TIMEOUT_MS = 3 * 60 * 60 * 1000  // 3 小时无操作才校验登录态（与后端会话空闲超时一致）
 const IDLE_CHECK_INTERVAL_MS = 60 * 1000  // 每 1 分钟检查一次空闲状态
 
 export function AuthGuard({ children }: AuthGuardProps) {
@@ -26,7 +26,7 @@ export function AuthGuard({ children }: AuthGuardProps) {
   }, [])
 
   // 空闲检测：用户交互时仅更新时间戳，不检查 token
-  // 仅当无操作超过 IDLE_TIMEOUT_MS（1 小时）时才验证 token 是否过期
+  // 仅当无操作超过 IDLE_TIMEOUT_MS（3 小时）时才验证 token / 会话是否失效
   useEffect(() => {
     if (!isAuthenticated) return
     const handleInteraction = () => {
@@ -44,7 +44,7 @@ export function AuthGuard({ children }: AuthGuardProps) {
     }
   }, [isAuthenticated])
 
-  // 空闲检测定时器：每分钟检查一次，如果无操作超过 1 小时才验证 token
+  // 空闲检测定时器：每分钟检查一次，如果无操作超过 3 小时才验证 token
   useEffect(() => {
     if (!isAuthenticated) return
     const interval = setInterval(() => {

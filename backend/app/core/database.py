@@ -67,6 +67,7 @@ def init_db():
             ("can_cell_entry", "ALTER TABLE users ADD COLUMN can_cell_entry BOOLEAN NOT NULL DEFAULT 0"),
             ("can_cell_query_update", "ALTER TABLE users ADD COLUMN can_cell_query_update BOOLEAN NOT NULL DEFAULT 0"),
             ("can_assistant", "ALTER TABLE users ADD COLUMN can_assistant BOOLEAN NOT NULL DEFAULT 0"),
+            ("usage_accounted_at", "ALTER TABLE user_sessions ADD COLUMN usage_accounted_at DATETIME"),
         ]
         for col_name, sql in migrations:
             table_name = "user_sessions" if "user_sessions" in sql else "users"

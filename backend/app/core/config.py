@@ -53,6 +53,10 @@ class Settings(BaseSettings):
     NPT_JWT_ALGORITHM: str = "HS256"
     NPT_JWT_ACCESS_TOKEN_EXPIRE_MINUTES: int = 1440
 
+    # 会话空闲超时（分钟）：连续无任何请求（含心跳）超过该时长才要求重新登录。
+    # 期间换网络/IP（含 IPv4/IPv6 切换）不打断登录态；仅在新设备登录时踢掉旧会话。
+    NPT_SESSION_IDLE_TIMEOUT_MINUTES: int = 180
+
     # 任务配置 - 从环境变量读取
     NPT_MAX_TASKS: int = 10
     NPT_TASK_TIMEOUT: int = 3600
@@ -127,6 +131,10 @@ class Settings(BaseSettings):
     @property
     def JWT_ACCESS_TOKEN_EXPIRE_MINUTES(self) -> int:
         return self.NPT_JWT_ACCESS_TOKEN_EXPIRE_MINUTES
+
+    @property
+    def SESSION_IDLE_TIMEOUT_MINUTES(self) -> int:
+        return self.NPT_SESSION_IDLE_TIMEOUT_MINUTES
 
     @property
     def MAX_TASKS(self) -> int:

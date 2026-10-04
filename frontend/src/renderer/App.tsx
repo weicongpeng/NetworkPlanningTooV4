@@ -1,5 +1,5 @@
 import { Suspense, useEffect } from 'react'
-import { BrowserRouter as Router, Routes, Route, Navigate } from 'react-router-dom'
+import { BrowserRouter as Router, Routes, Route, Navigate, useLocation } from 'react-router-dom'
 import { MainLayout } from './components/Layout/MainLayout'
 import { ProtectedRoute } from './components/ProtectedRoute'
 import { AuthGuard } from './components/AuthGuard'
@@ -23,6 +23,23 @@ import {
 } from './pageLoaders'
 import { startHealthCheck, stopHealthCheck } from '@/renderer/services/api'
 import { useHeartbeat } from './hooks/useHeartbeat'
+import { useAuthStore } from './store/authStore'
+import { saveLastRoute } from './utils/lastRoute'
+
+/** 记录已登录用户当前所在页面，重新登录后可恢复到该页面 */
+function LastRouteTracker() {
+  const location = useLocation()
+  const isAuthenticated = useAuthStore((s) => s.isAuthenticated)
+  const username = useAuthStore((s) => s.user?.username)
+
+  useEffect(() => {
+    if (isAuthenticated && username) {
+      saveLastRoute(username, location.pathname)
+    }
+  }, [isAuthenticated, username, location.pathname])
+
+  return null
+}
 
 function App() {
   useHeartbeat()
@@ -35,6 +52,7 @@ function App() {
 
   return (
     <Router>
+      <LastRouteTracker />
       <AuthGuard>
         <MainLayout>
           {/* 懒加载兜底：与页面内部 loading 风格一致（转圈），导航 hover 已预加载，切换时一般不显示 */}
