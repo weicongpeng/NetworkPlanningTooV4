@@ -18,6 +18,7 @@ export const loadMapPage = () => import('./pages/MapPage').then(m => ({ default:
 export const loadAdminUsersPage = () => import('./pages/AdminUsersPage').then(m => ({ default: m.AdminUsersPage }))
 export const loadAppVersionsPage = () => import('./pages/AppVersionsPage').then(m => ({ default: m.AppVersionsPage }))
 export const loadDesktopReleasesPage = () => import('./pages/DesktopReleasesPage').then(m => ({ default: m.DesktopReleasesPage }))
+export const loadDesktopLicensesPage = () => import('./pages/DesktopLicensesPage').then(m => ({ default: m.DesktopLicensesPage }))
 
 /**
  * chunk 加载失败自动恢复
@@ -70,6 +71,7 @@ export const MapPage = lazy(recoverable(loadMapPage))
 export const AdminUsersPage = lazy(recoverable(loadAdminUsersPage))
 export const AppVersionsPage = lazy(recoverable(loadAppVersionsPage))
 export const DesktopReleasesPage = lazy(recoverable(loadDesktopReleasesPage))
+export const DesktopLicensesPage = lazy(recoverable(loadDesktopLicensesPage))
 
 /**
  * 导航预加载：导航项 hover 时提前拉取目标页面 chunk，
@@ -91,6 +93,7 @@ export function prefetchPage(href: string) {
     case '/admin/users': loadAdminUsersPage(); break
     case '/app-versions': loadAppVersionsPage(); break
     case '/desktop-releases': loadDesktopReleasesPage(); break
+    case '/desktop-licenses': loadDesktopLicensesPage(); break
     case '/assistant': loadAssistantPage(); break
     default: break
   }

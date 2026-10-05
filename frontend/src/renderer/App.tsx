@@ -20,6 +20,7 @@ import {
   AdminUsersPage,
   AppVersionsPage,
   DesktopReleasesPage,
+  DesktopLicensesPage,
   AssistantPageLazy,
 } from './pageLoaders'
 import { startHealthCheck, stopHealthCheck } from '@/renderer/services/api'
@@ -174,6 +175,14 @@ function App() {
                 element={
                   <ProtectedRoute requireAdmin>
                     <DesktopReleasesPage />
+                  </ProtectedRoute>
+                }
+              />
+              <Route
+                path="/desktop-licenses"
+                element={
+                  <ProtectedRoute requireAdmin>
+                    <DesktopLicensesPage />
                   </ProtectedRoute>
                 }
               />

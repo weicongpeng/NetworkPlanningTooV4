@@ -18,6 +18,7 @@ import {
   Wrench,
   Bot,
   MonitorDown,
+  KeyRound,
   Sun,
   Moon,
 } from 'lucide-react'
@@ -137,6 +138,7 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
     ...(isAuthenticated && user?.is_admin ? [
       { type: 'link' as const, name: t('admin.title', '用户管理'), href: '/admin/users', icon: Users },
       { type: 'link' as const, name: t('sidebar.appVersions', 'APP 版本管理'), href: '/app-versions', icon: Package },
+      { type: 'link' as const, name: t('sidebar.desktopLicenses', '桌面授权'), href: '/desktop-licenses', icon: KeyRound },
       { type: 'link' as const, name: t('sidebar.desktopReleases', '桌面版分发'), href: '/desktop-releases', icon: MonitorDown },
     ] : []),
   ]

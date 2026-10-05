@@ -6,6 +6,7 @@ import type {
   LicenseStatus,
   MachineInfo,
   DesktopCloudStatus,
+  DesktopLicenseRecord,
   DesktopReleaseInfo,
   DesktopUpdateStatus,
   NeighborConfig,
@@ -313,6 +314,49 @@ uploadClient.interceptors.response.use(
     })
   }
 )
+
+// 桌面版授权管理（管理员，按用户授权 + 激活码）
+export const desktopLicensesApi = {
+  list: async (
+    page = 1,
+    pageSize = 20,
+    status?: string,
+    keyword?: string,
+  ): Promise<ApiResponse<{ total: number; items: DesktopLicenseRecord[] }>> => {
+    const params: Record<string, any> = { page, page_size: pageSize }
+    if (status) params.status = status
+    if (keyword) params.keyword = keyword
+    return apiClient.get('/desktop-licenses', { params })
+  },
+
+  create: async (data: {
+    licensee_username: string
+    organization?: string
+    lease_days?: number
+    note?: string
+  }): Promise<ApiResponse<DesktopLicenseRecord>> => {
+    return apiClient.post('/desktop-licenses', data)
+  },
+
+  update: async (
+    id: number,
+    data: { licensee_username?: string; organization?: string; lease_days?: number; note?: string },
+  ): Promise<ApiResponse<DesktopLicenseRecord>> => {
+    return apiClient.put(`/desktop-licenses/${id}`, data)
+  },
+
+  remove: async (id: number): Promise<ApiResponse<any>> => {
+    return apiClient.delete(`/desktop-licenses/${id}`)
+  },
+
+  action: async (
+    id: number,
+    action: 'approve' | 'reject' | 'disable' | 'enable' | 'unbind' | 'regenerate-code',
+    data?: { lease_days?: number; note?: string },
+  ): Promise<ApiResponse<DesktopLicenseRecord>> => {
+    return apiClient.post(`/desktop-licenses/${id}/${action}`, data || {})
+  },
+}
 
 // 桌面版安装包管理（管理员，OTA 分发）
 export const desktopReleasesApi = {

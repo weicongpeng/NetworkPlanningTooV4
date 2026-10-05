@@ -75,6 +75,34 @@ export interface DesktopReleaseInfo {
   updated_at?: string | null
 }
 
+/** 桌面版授权记录（管理端） */
+export interface DesktopLicenseRecord {
+  id: number
+  activation_code?: string | null
+  licensee_username: string
+  organization?: string | null
+  machine_code?: string | null
+  status: 'pending' | 'issued' | 'active' | 'rejected' | 'disabled' | string
+  source: 'precreate' | 'approve' | string
+  lease_days: number
+  expire_date?: string | null
+  request_id?: string | null
+  applied_note?: string | null
+  review_note?: string | null
+  note?: string | null
+  created_by?: string | null
+  approved_by?: string | null
+  client_version?: string | null
+  hostname?: string | null
+  renewal_count: number
+  created_at: string
+  activated_at?: string | null
+  machine_bound_at?: string | null
+  last_renewed_at?: string | null
+  disabled_at?: string | null
+  updated_at?: string | null
+}
+
 /** 桌面版本机更新状态 */
 export interface DesktopUpdateStatus {
   current: string
