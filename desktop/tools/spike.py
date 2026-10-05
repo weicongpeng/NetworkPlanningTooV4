@@ -117,6 +117,57 @@ def _http_get(url: str, timeout: float = 5.0) -> tuple:
         return resp.status, resp.read()
 
 
+def _multipart_post(url: str, fields: Dict[str, str], timeout: float = 10.0) -> int:
+    """手工构造 multipart/form-data 请求体并返回状态码（4xx/5xx 由 HTTPError 携带）。"""
+    boundary = "----nptspikeboundary"
+    parts: list = []
+    for name, value in fields.items():
+        parts.append(
+            (
+                f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="{name}"\r\n\r\n'
+                f"{value}\r\n"
+            ).encode("utf-8")
+        )
+    parts.append(f"--{boundary}--\r\n".encode("utf-8"))
+    body = b"".join(parts)
+    req = urllib.request.Request(
+        url,
+        data=body,
+        method="POST",
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 - 本机回环地址
+            return resp.status
+    except urllib.error.HTTPError as exc:
+        return exc.code
+
+
+def _check_multipart(base_url: str) -> Dict[str, Any]:
+    """文件上传链路：python-multipart 可用 + 后端能解析 multipart 请求体。
+
+    冻结包漏收 python-multipart 时，request.form() 抛错，所有上传都返回
+    400 "There was an error parsing the body"，而其余接口（JSON）一切正常。
+    """
+    try:
+        import multipart
+    except Exception as exc:  # noqa: BLE001
+        raise AssertionError(f"python-multipart 不可用，文件上传会全部失败: {exc}") from exc
+
+    version = getattr(multipart, "__version__", "?")
+    if not hasattr(multipart, "MultipartParser"):
+        raise AssertionError(f"python-multipart {version} 缺少 MultipartParser")
+
+    status = _multipart_post(
+        f"{base_url}/api/v1/data/upload/start",
+        {"filename": "spike.xlsx", "total_chunks": "1", "total_size": "1"},
+    )
+    # 未带 token：解析成功才会走到鉴权（401/403）；400 说明请求体解析失败
+    assert status != 400, f"multipart 请求体解析失败（status=400），上传链路不可用"
+    return {"python_multipart": version, "upload_start_status": status}
+
+
 def _check_server(base_url: str) -> Dict[str, Any]:
     status, _ = _http_get(f"{base_url}/api/v1/system/status")
     assert status == 200, f"GET /api/v1/system/status -> {status}"
@@ -147,6 +198,7 @@ def run_spike(base_url: Optional[str] = None) -> int:
         report["gdal"] = _check_libgdal_and_styles(tab["path"])
         if base_url:
             report["server"] = _check_server(base_url)
+            report["multipart"] = _check_multipart(base_url)
     except Exception as exc:  # noqa: BLE001 - CI 需要完整报告
         report["error"] = str(exc)
         report["traceback"] = traceback.format_exc()

@@ -41,6 +41,10 @@ hiddenimports = [
     "uvicorn.protocols.http.auto",
     "uvicorn.protocols.websockets.auto",
     "uvicorn.lifespan.on",
+    # python-multipart：starlette 在 try/except 中导入，冻结时容易漏收
+    # 漏收后 request.form() 抛错 → 所有文件上传返回 400 "There was an error parsing the body"
+    "multipart",
+    "multipart.multipart",
     # pywebview 运行时按平台选择的后端
     "webview.platforms.winforms",
     "tools.spike",

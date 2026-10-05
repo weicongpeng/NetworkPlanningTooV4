@@ -268,6 +268,13 @@ def create_app() -> FastAPI:
         default_response_class=UTF8JSONResponse,  # 设置默认响应类为UTF-8 JSON响应
     )
 
+    # 诊断：python-multipart 不可用（如冻结包漏收）时，所有文件上传都会返回
+    # 400 "There was an error parsing the body"，而真实原因会被 FastAPI 吞掉
+    try:
+        import multipart  # noqa: F401
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger(__name__).error("python-multipart 不可用，文件上传将全部失败: %s", exc)
+
     # 配置CORS
     # 保留原有配置，同时添加局域网IP支持
     cors_origins = settings.BACKEND_CORS_ORIGINS + [
