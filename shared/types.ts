@@ -24,6 +24,86 @@ export interface MachineInfo {
   desktopMode: boolean
 }
 
+/** 桌面版在线许可信息（本地许可文件解析结果） */
+export interface DesktopLicenseInfo {
+  valid: boolean
+  errorMessage?: string | null
+  license_id?: number | null
+  subject?: string
+  organization?: string
+  licensee?: string
+  machine_code?: string
+  lease_days?: number | null
+  renew_count?: number | null
+  issued_via?: 'online' | 'offline' | string
+  issued_at?: string
+  expire_date?: string
+  remaining_days?: number
+}
+
+/** 桌面版本机在线状态 */
+export interface DesktopCloudStatus {
+  desktop: boolean
+  server_url: string
+  machine_code: string
+  version: string
+  channel: string
+  license: DesktopLicenseInfo | null
+  cloud: {
+    license_id?: number | null
+    last_renew_at?: string | null
+    request_id?: number | null
+  }
+}
+
+/** 桌面版安装包版本记录（OTA 管理端） */
+export interface DesktopReleaseInfo {
+  id: number
+  version: string
+  channel: string
+  filename: string
+  file_path: string
+  file_size?: number | null
+  file_size_display?: string
+  sha256?: string | null
+  release_notes?: string | null
+  mandatory: boolean
+  is_latest: boolean
+  download_count: number
+  created_by?: string | null
+  created_at: string
+  updated_at?: string | null
+}
+
+/** 桌面版本机更新状态 */
+export interface DesktopUpdateStatus {
+  current: string
+  channel: string
+  update_available: boolean
+  release: {
+    id: number
+    version: string
+    channel: string
+    file_size?: number
+    file_size_display?: string
+    sha256?: string
+    mandatory: boolean
+    release_notes?: string | null
+    published_at?: string
+    update_available: boolean
+    download_url: string
+    snooze?: { count: number; max: number; force: boolean }
+  } | null
+  download: {
+    phase: 'idle' | 'downloading' | 'ready' | 'failed'
+    version?: string | null
+    downloaded: number
+    total: number
+    error?: string | null
+    installer?: string | null
+  }
+}
+
 export interface LicenseInfo {
   licenseKey: string
   licensee: string

@@ -5,6 +5,9 @@ import type {
   CellSearchItem,
   LicenseStatus,
   MachineInfo,
+  DesktopCloudStatus,
+  DesktopReleaseInfo,
+  DesktopUpdateStatus,
   NeighborConfig,
   NeighborResult,
   PCIConfig,
@@ -311,6 +314,119 @@ uploadClient.interceptors.response.use(
   }
 )
 
+// 桌面版安装包管理（管理员，OTA 分发）
+export const desktopReleasesApi = {
+  list: async (page = 1, pageSize = 20, channel?: string): Promise<ApiResponse<{ total: number; items: DesktopReleaseInfo[] }>> => {
+    const params: Record<string, any> = { page, page_size: pageSize }
+    if (channel) params.channel = channel
+    return apiClient.get('/desktop-releases', { params })
+  },
+
+  /** 分片上传安装包（1MB/块，绕 Cloudflare 100MB 限制；complete 步骤带管理员 token） */
+  upload: async (formData: FormData) => {
+    const file = formData.get('file') as File
+    const version = (formData.get('version') as string) || ''
+    const channel = (formData.get('channel') as string) || 'stable'
+    const releaseNotes = (formData.get('release_notes') as string) || ''
+    const mandatory = formData.get('mandatory') === 'true'
+    const isLatest = formData.get('is_latest') !== 'false'
+
+    if (!file) throw new Error('请选择安装包文件')
+    if (!version) throw new Error('请输入版本号')
+
+    const basePath = '/desktop-releases/chunked'
+    const CHUNK_SIZE = 1024 * 1024
+    const MAX_RETRIES = 5
+    const totalChunks = Math.ceil(file.size / CHUNK_SIZE)
+
+    const startForm = new FormData()
+    startForm.append('filename', file.name)
+    startForm.append('total_chunks', String(totalChunks))
+    startForm.append('total_size', String(file.size))
+    const startResp = await uploadClient.post(`${basePath}/start`, startForm)
+    const uploadId = startResp.data?.id || startResp.data?.data?.id
+    if (!uploadId) throw new Error('无法创建上传会话')
+
+    for (let i = 0; i < totalChunks; i++) {
+      const chunk = file.slice(i * CHUNK_SIZE, Math.min((i + 1) * CHUNK_SIZE, file.size))
+      let retries = 0
+      let success = false
+      while (!success && retries < MAX_RETRIES) {
+        try {
+          const chunkForm = new FormData()
+          chunkForm.append('file', chunk)
+          chunkForm.append('chunk_index', String(i))
+          await uploadClient.post(`${basePath}/${uploadId}/chunk`, chunkForm)
+          success = true
+        } catch {
+          retries++
+          if (retries >= MAX_RETRIES) {
+            throw new Error(`分块 ${i + 1}/${totalChunks} 上传失败，已重试 ${MAX_RETRIES} 次`)
+          }
+          await new Promise((r) => setTimeout(r, Math.pow(2, retries - 1) * 1000))
+        }
+      }
+    }
+
+    const completeForm = new FormData()
+    completeForm.append('version', version)
+    completeForm.append('channel', channel)
+    completeForm.append('release_notes', releaseNotes)
+    completeForm.append('mandatory', mandatory ? 'true' : 'false')
+    completeForm.append('is_latest', isLatest ? 'true' : 'false')
+
+    let authToken = ''
+    try {
+      const stored = localStorage.getItem('auth-storage')
+      if (stored) authToken = JSON.parse(stored)?.state?.token || ''
+    } catch { /* ignore */ }
+
+    const headers: Record<string, string> = {}
+    if (authToken) headers['Authorization'] = `Bearer ${authToken}`
+    return uploadClient.post(`${basePath}/${uploadId}/complete`, completeForm, { headers })
+  },
+
+  update: async (
+    id: number,
+    data: { version?: string; channel?: string; release_notes?: string; mandatory?: boolean; is_latest?: boolean },
+  ) => {
+    const form = new FormData()
+    if (data.version !== undefined) form.append('version', data.version)
+    if (data.channel !== undefined) form.append('channel', data.channel)
+    if (data.release_notes !== undefined) form.append('release_notes', data.release_notes)
+    if (data.mandatory !== undefined) form.append('mandatory', data.mandatory ? 'true' : 'false')
+    if (data.is_latest !== undefined) form.append('is_latest', data.is_latest ? 'true' : 'false')
+    return apiClient.put(`/desktop-releases/${id}`, form)
+  },
+
+  setLatest: async (id: number) => {
+    return apiClient.post(`/desktop-releases/${id}/set-latest`)
+  },
+
+  delete: async (id: number) => {
+    return apiClient.delete(`/desktop-releases/${id}`)
+  },
+}
+
+// 桌面版本机 OTA（仅桌面版可用；网页端返回 404）
+export const desktopUpdateApi = {
+  status: async (): Promise<ApiResponse<DesktopUpdateStatus>> => {
+    return apiClient.get('/desktop/update/status')
+  },
+  download: async (version?: string): Promise<ApiResponse<{ phase: string }>> => {
+    return apiClient.post('/desktop/update/download', { version })
+  },
+  progress: async (): Promise<ApiResponse<{ phase: string; downloaded: number; total: number; error?: string }>> => {
+    return apiClient.get('/desktop/update/progress')
+  },
+  snooze: async (version: string): Promise<ApiResponse<{ count: number; max: number; force: boolean }>> => {
+    return apiClient.post('/desktop/update/snooze', { version })
+  },
+  install: async (): Promise<ApiResponse<{ exiting: boolean; message: string }>> => {
+    return apiClient.post('/desktop/update/install')
+  },
+}
+
 // 许可证API
 export const licenseApi = {
   // 获取许可证状态
@@ -338,6 +454,40 @@ export const licenseApi = {
   // 管理员更新全局授权期限
   updateExpiry: async (expiryDate: string | null): Promise<ApiResponse<any>> => {
     return apiClient.post('/license/update-expiry', { expiry_date: expiryDate }) as any
+  },
+}
+
+// 桌面版在线授权（本机后端 → 授权服务器；仅桌面版可用，网页端返回 404）
+export const desktopCloudApi = {
+  // 本机 + 云端状态
+  getStatus: async (): Promise<ApiResponse<DesktopCloudStatus>> => {
+    return apiClient.get('/desktop/cloud-status')
+  },
+
+  // 用激活码在线激活
+  activate: async (activationCode: string): Promise<ApiResponse<DesktopCloudStatus>> => {
+    return apiClient.post('/desktop/cloud-activate', { activation_code: activationCode })
+  },
+
+  // 用现有许可续期
+  renew: async (): Promise<ApiResponse<DesktopCloudStatus>> => {
+    return apiClient.post('/desktop/cloud-renew')
+  },
+
+  // 提交授权申请（服务器需开启 approve 模式）
+  apply: async (data: {
+    applicant_name: string
+    organization?: string
+    note?: string
+  }): Promise<ApiResponse<{ request_id: number; status: string }>> => {
+    return apiClient.post('/desktop/cloud-apply', data)
+  },
+
+  // 轮询申请结果（批准后本机自动完成激活）
+  pollApply: async (): Promise<
+    ApiResponse<{ status: string; message?: string; activated: boolean; status_detail?: DesktopCloudStatus }>
+  > => {
+    return apiClient.get('/desktop/cloud-apply')
   },
 }
 

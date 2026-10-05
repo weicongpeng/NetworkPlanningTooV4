@@ -29,6 +29,7 @@ class SelectiveGZipMiddleware(GZipMiddleware):
     """
     EXCLUDE_PATHS = (
         "/api/v1/app-versions/download/",
+        "/api/v1/desktop-cloud/releases/download/",
         "/apks/",
     )
 
@@ -83,6 +84,11 @@ async def lifespan(app: FastAPI):
     apks_dir = settings.APKS_DIR
     apks_dir.mkdir(parents=True, exist_ok=True)
     logger.info(f"✅ APK 存储目录已创建: {apks_dir}")
+
+    # 创建桌面版安装包目录（OTA 分发）
+    desktop_releases_dir = settings.DESKTOP_RELEASES_DIR
+    desktop_releases_dir.mkdir(parents=True, exist_ok=True)
+    logger.info(f"✅ 桌面版安装包目录已创建: {desktop_releases_dir}")
 
     # 🔥 启动时自动清理无效数据索引
     # 清理文件已删除但索引中仍存在的无效项
@@ -152,6 +158,15 @@ async def lifespan(app: FastAPI):
             license_service.sync_desktop_admin_expiry()
     except Exception as e:
         logger.warning(f"⚠️ 同步桌面授权状态失败: {e}")
+
+    # 桌面模式：后台自动续期（剩余 <20 天 或 距上次续期 ≥7 天时静默续期）
+    if settings.NPT_DESKTOP:
+        try:
+            import asyncio
+            from app.services.desktop_cloud_client import renewal_loop
+            asyncio.create_task(renewal_loop())
+        except Exception as e:
+            logger.warning(f"⚠️ 启动桌面自动续期任务失败: {e}")
 
     # 初始化进程池（用于 CPU 密集型任务）
     pool = None

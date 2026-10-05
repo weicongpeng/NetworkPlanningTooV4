@@ -19,6 +19,7 @@ import {
   MapPage,
   AdminUsersPage,
   AppVersionsPage,
+  DesktopReleasesPage,
   AssistantPageLazy,
 } from './pageLoaders'
 import { startHealthCheck, stopHealthCheck } from '@/renderer/services/api'
@@ -165,6 +166,14 @@ function App() {
                 element={
                   <ProtectedRoute requireAdmin>
                     <AppVersionsPage />
+                  </ProtectedRoute>
+                }
+              />
+              <Route
+                path="/desktop-releases"
+                element={
+                  <ProtectedRoute requireAdmin>
+                    <DesktopReleasesPage />
                   </ProtectedRoute>
                 }
               />

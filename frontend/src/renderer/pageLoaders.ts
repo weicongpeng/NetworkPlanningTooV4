@@ -17,6 +17,7 @@ export const loadFrequencyConversionPage = () => import('./pages/FrequencyConver
 export const loadMapPage = () => import('./pages/MapPage').then(m => ({ default: m.MapPage }))
 export const loadAdminUsersPage = () => import('./pages/AdminUsersPage').then(m => ({ default: m.AdminUsersPage }))
 export const loadAppVersionsPage = () => import('./pages/AppVersionsPage').then(m => ({ default: m.AppVersionsPage }))
+export const loadDesktopReleasesPage = () => import('./pages/DesktopReleasesPage').then(m => ({ default: m.DesktopReleasesPage }))
 
 /**
  * chunk 加载失败自动恢复
@@ -68,6 +69,7 @@ export const FrequencyConversionPage = lazy(recoverable(loadFrequencyConversionP
 export const MapPage = lazy(recoverable(loadMapPage))
 export const AdminUsersPage = lazy(recoverable(loadAdminUsersPage))
 export const AppVersionsPage = lazy(recoverable(loadAppVersionsPage))
+export const DesktopReleasesPage = lazy(recoverable(loadDesktopReleasesPage))
 
 /**
  * 导航预加载：导航项 hover 时提前拉取目标页面 chunk，
@@ -88,6 +90,7 @@ export function prefetchPage(href: string) {
     case '/map': loadMapPage(); break
     case '/admin/users': loadAdminUsersPage(); break
     case '/app-versions': loadAppVersionsPage(); break
+    case '/desktop-releases': loadDesktopReleasesPage(); break
     case '/assistant': loadAssistantPage(); break
     default: break
   }

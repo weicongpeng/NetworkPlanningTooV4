@@ -81,6 +81,7 @@ class Settings(BaseSettings):
     LICENSE_DIR: Path = _DATA_ROOT / "licenses"
     DATA_DIR: Path = _DATA_ROOT / "data"
     APKS_DIR: Path = _DATA_ROOT / "apks"
+    DESKTOP_RELEASES_DIR: Path = _DATA_ROOT / "desktop_releases"
     TEMPLATE_DIR: Path = _BUNDLE_DIR / "template"
 
     # 许可证配置 - 从环境变量读取
@@ -111,6 +112,22 @@ class Settings(BaseSettings):
 
     # 运行形态：桌面离线版（desktop/launcher.py 注入 NPT_DESKTOP=1）
     NPT_DESKTOP: bool = False
+
+    # ===== 桌面版在线授权与 OTA（服务器侧签发 / 客户端侧消费）=====
+    # 签发私钥（Ed25519 PEM）：优先环境变量，其次 LICENSE_DIR/license_private_key.pem
+    NPT_LICENSE_PRIVATE_KEY: str = ""
+    # 授权流程：precreate=管理员预建激活码（默认）；approve=客户端申请→管理员批准
+    NPT_DESKTOP_ACTIVATION_MODE: str = "precreate"
+    # 默认租约天数（管理员创建授权时可用 lease_days 覆盖）
+    NPT_DESKTOP_LEASE_DAYS: int = 30
+    # 客户端使用的服务器地址（桌面版 launcher 注入；服务器侧不用）
+    NPT_SERVER_URL: str = "https://app.pengwc.asia"
+    # 客户端更新渠道
+    NPT_DESKTOP_CHANNEL: str = "stable"
+    # 客户端构建版本（launcher 从打包内的 version.json 注入）
+    NPT_DESKTOP_VERSION: str = ""
+    # 桌面版允许点"稍后"的次数（超过后强制更新）
+    NPT_DESKTOP_MAX_SNOOZE: int = 3
 
     # 地图默认配置
     DEFAULT_MAP_CENTER: tuple = (39.9042, 116.4074)  # 北京

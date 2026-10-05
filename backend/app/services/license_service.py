@@ -314,6 +314,46 @@ class LicenseService:
                 pass
         return datetime(1970, 1, 1)
 
+    def desktop_license_info(self) -> Optional[Dict[str, Any]]:
+        """当前桌面许可的元信息（在线授权含 license_id/subject 等；无许可返回 None）。
+
+        只读许可文件，不写库、不写时间戳文件，供状态展示与续期判断使用。
+        """
+        path = self._signed_license_file()
+        if not path.is_file():
+            return None
+        try:
+            payload, error = self._decode_signed_license(path.read_text(encoding="utf-8"))
+        except Exception as e:  # noqa: BLE001
+            return {"valid": False, "errorMessage": f"读取授权文件失败: {e}"}
+        if error or not payload:
+            return {"valid": False, "errorMessage": error or "授权文件无效"}
+
+        ok, verify_error = self._verify_desktop_payload(payload)
+        expire_raw = str(payload.get("expire_date") or "")
+        remaining = 0
+        try:
+            remaining = max(
+                0, (datetime.strptime(expire_raw, "%Y-%m-%d") - datetime.now()).days
+            )
+        except ValueError:
+            pass
+        return {
+            "valid": ok,
+            "errorMessage": None if ok else verify_error,
+            "license_id": payload.get("license_id"),
+            "subject": payload.get("subject") or payload.get("licensee") or "",
+            "organization": payload.get("org") or "",
+            "licensee": payload.get("licensee") or "",
+            "machine_code": payload.get("machine_code") or "",
+            "lease_days": payload.get("lease_days"),
+            "renew_count": payload.get("renew_count"),
+            "issued_via": payload.get("issued_via") or "offline",
+            "issued_at": payload.get("issued_at") or "",
+            "expire_date": expire_raw,
+            "remaining_days": remaining,
+        }
+
     def sync_desktop_admin_expiry(self) -> None:
         """桌面模式启动时调用：让所有本地用户的 license_expiry 与授权文件保持一致。"""
         if not settings.NPT_DESKTOP:

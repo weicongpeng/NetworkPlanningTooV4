@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import json
 import logging
 import multiprocessing
 import os
@@ -58,6 +59,12 @@ def _bootstrap_environment() -> Path:
     os.environ.setdefault("NPT_MAX_WORKERS", "1")
     os.environ.setdefault("NPT_HOST", "127.0.0.1")
     os.environ.setdefault("NPT_RELOAD", "false")
+    # 在线授权与 OTA：服务器地址（可在系统环境变量覆盖）
+    os.environ.setdefault("NPT_SERVER_URL", "https://app.pengwc.asia")
+    os.environ.setdefault("NPT_DESKTOP_CHANNEL", "stable")
+    version = _desktop_version()
+    if version:
+        os.environ.setdefault("NPT_DESKTOP_VERSION", version)
     return data_root
 
 
@@ -105,6 +112,15 @@ def _asset_version() -> str:
         return str(int(index.stat().st_mtime))
     except OSError:
         return "0"
+
+
+def _desktop_version() -> str:
+    """读取打包时注入的 version.json（CI 在 PyInstaller 前写入；缺失返回空串）。"""
+    try:
+        data = json.loads((_bundle_dir() / "version.json").read_text(encoding="utf-8"))
+        return str(data.get("version") or "")
+    except Exception:
+        return ""
 
 
 def _window_size() -> tuple[int, int, tuple[int, int]]:
@@ -200,13 +216,20 @@ def _run_window(port: int, data_root: Path) -> None:
     webview.settings["ALLOW_DOWNLOADS"] = True
     width, height, min_size = _window_size()
     # ?v= 资源版本：升级后避免 WebView2 复用缓存的旧 index.html/旧前端
-    webview.create_window(
+    window = webview.create_window(
         APP_NAME,
         f"http://127.0.0.1:{port}/?v={_asset_version()}",
         width=width,
         height=height,
         min_size=min_size,
     )
+    # 注入退出回调：后端"重启并安装"时用它关闭窗口并让本进程退出（同进程桥接）
+    try:
+        from app import desktop_bridge
+
+        desktop_bridge.set_exit_handler(window.destroy)
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("注入桌面桥接退出回调失败（自动升级退避为手动重启）：%s", exc)
     # private_mode=False + storage_path：localStorage 持久化（否则每次启动掉登录）
     webview.start(private_mode=False, storage_path=str(data_root / "webview"))
 

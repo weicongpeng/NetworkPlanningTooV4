@@ -17,9 +17,14 @@
 const DEFAULT_CHUNKS = 4
 
 interface ParallelDownloadOptions {
+  /** 保存文件名（缺省从 Content-Disposition 或 URL 推断） */
   filename?: string
+  /** 分块数（默认 4，自动按文件大小收敛） */
   chunks?: number
+  /** 进度回调 */
   onProgress?: (loaded: number, total: number) => void
+  /** 合并 Blob 的 MIME（默认 APK，桌面安装包传 application/octet-stream） */
+  mime?: string
   signal?: AbortSignal
 }
 
@@ -142,7 +147,7 @@ export async function parallelDownload(
   // 4. 按顺序拼接
   chunksData.sort((a, b) => a.index - b.index)
   const blobs = chunksData.map(c => c.data)
-  const combined = new Blob(blobs, { type: 'application/vnd.android.package-archive' })
+  const combined = new Blob(blobs, { type: options.mime || 'application/vnd.android.package-archive' })
 
   // 5. 触发浏览器下载
   const blobUrl = URL.createObjectURL(combined)

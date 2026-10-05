@@ -1,0 +1,228 @@
+"""桌面客户端 → 授权服务器 的 HTTP 客户端与本地云端状态（仅桌面版使用）。
+
+设计要点：
+- 全部走 stdlib urllib（无需新依赖，PyInstaller 打包无额外隐藏导入）
+- 本机 JWT 与服务器无关：这里只用激活码/许可文件做凭证，不放任何站点 token
+- 服务器地址取 settings.NPT_SERVER_URL（launcher 注入，管理员可在配置管理页改）
+- 运行状态（license_id/上次续期/申请单）保存在 LICENSE_DIR/cloud_state.json
+"""
+from __future__ import annotations
+
+import json
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+from app.core.config import settings
+
+
+class CloudError(Exception):
+    """调用授权服务器失败（status_code=0 表示网络不可达）。"""
+
+    def __init__(self, status_code: int, message: str):
+        super().__init__(message)
+        self.status_code = status_code
+        self.message = message
+
+
+# ---------------------------------------------------------------- 本地状态
+
+def state_file() -> Path:
+    return settings.LICENSE_DIR / "cloud_state.json"
+
+
+def load_state() -> Dict[str, Any]:
+    path = state_file()
+    if not path.is_file():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return {}
+
+
+def save_state(**kwargs: Any) -> Dict[str, Any]:
+    state = load_state()
+    state.update({k: v for k, v in kwargs.items() if v is not None})
+    try:
+        settings.LICENSE_DIR.mkdir(parents=True, exist_ok=True)
+        state_file().write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+    return state
+
+
+# ---------------------------------------------------------------- HTTP
+
+def server_url() -> str:
+    return (settings.NPT_SERVER_URL or "").strip().rstrip("/")
+
+
+def _request(method: str, path: str, payload: Optional[dict] = None, timeout: int = 20) -> dict:
+    base = server_url()
+    if not base:
+        raise CloudError(0, "未配置授权服务器地址")
+    data = json.dumps(payload or {}).encode("utf-8") if payload is not None else None
+    request = urllib.request.Request(
+        f"{base}/api/v1{path}",
+        data=data,
+        method=method,
+        headers={"Content-Type": "application/json", "User-Agent": "NPT-Desktop"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as resp:
+            return json.load(resp)
+    except urllib.error.HTTPError as exc:
+        detail = f"HTTP {exc.code}"
+        try:
+            body = json.loads(exc.read().decode("utf-8", "replace"))
+            detail = body.get("detail") or body.get("message") or detail
+        except Exception:
+            pass
+        raise CloudError(exc.code, str(detail)) from exc
+    except urllib.error.URLError as exc:
+        raise CloudError(0, f"无法连接授权服务器（{exc.reason}）") from exc
+    except Exception as exc:  # noqa: BLE001
+        raise CloudError(0, f"请求授权服务器失败：{exc}") from exc
+
+
+def get_handshake() -> Dict[str, Any]:
+    """服务器能力（激活模式/默认租约/更新渠道）。"""
+    try:
+        resp = _request("GET", "/desktop-cloud/config", timeout=10)
+        return resp.get("data") or {}
+    except CloudError:
+        return {}
+
+
+# ---------------------------------------------------------------- 业务
+
+def activate(activation_code: str, hostname: Optional[str] = None) -> Dict[str, Any]:
+    from app.utils.machine_code import get_machine_code
+
+    resp = _request(
+        "POST",
+        "/desktop-cloud/license/activate",
+        {
+            "activation_code": activation_code,
+            "machine_code": get_machine_code(),
+            "client_version": settings.NPT_DESKTOP_VERSION or "",
+            "hostname": hostname or "",
+        },
+    )
+    data = resp.get("data") or {}
+    save_state(
+        license_id=data.get("license_id"),
+        last_renew_at=datetime.now().isoformat(),
+        server_url=server_url(),
+    )
+    return data
+
+
+def apply_license(
+    applicant_name: str, organization: Optional[str] = None, note: Optional[str] = None
+) -> Dict[str, Any]:
+    from app.utils.machine_code import get_machine_code
+
+    resp = _request(
+        "POST",
+        "/desktop-cloud/license/apply",
+        {
+            "machine_code": get_machine_code(),
+            "applicant_name": applicant_name,
+            "organization": organization or "",
+            "note": note or "",
+            "client_version": settings.NPT_DESKTOP_VERSION or "",
+            "hostname": "",
+        },
+    )
+    data = resp.get("data") or {}
+    save_state(request_id=data.get("request_id"), apply_token=data.get("apply_token"))
+    return data
+
+
+def poll_apply() -> Dict[str, Any]:
+    state = load_state()
+    request_id = state.get("request_id")
+    token = state.get("apply_token")
+    if not request_id or not token:
+        raise CloudError(400, "本机没有待批准的授权申请")
+    resp = _request(
+        "GET", f"/desktop-cloud/license/apply/{request_id}?token={urllib.parse.quote(str(token))}"
+    )
+    return resp.get("data") or {}
+
+
+def renew_remote(license_file: str) -> Dict[str, Any]:
+    from app.utils.machine_code import get_machine_code
+
+    resp = _request(
+        "POST",
+        "/desktop-cloud/license/renew",
+        {
+            "license_file": license_file,
+            "machine_code": get_machine_code(),
+            "client_version": settings.NPT_DESKTOP_VERSION or "",
+        },
+    )
+    data = resp.get("data") or {}
+    save_state(license_id=data.get("license_id"), last_renew_at=datetime.now().isoformat())
+    return data
+
+
+def renew_local_license() -> Dict[str, Any]:
+    """读取本机许可 → 调服务器续期 → 写回许可文件（端点与后台任务共用）。
+
+    远程调用与本地写盘都在这里，测试可只桩化 :func:`renew_remote`。
+    """
+    from app.services.license_service import license_service
+
+    path = license_service._signed_license_file()
+    if not path.is_file():
+        raise CloudError(400, "本机尚未激活，请先在线激活或导入授权文件")
+    data = renew_remote(path.read_text(encoding="utf-8"))
+    new_license = data.get("license_file")
+    if not new_license:
+        raise CloudError(500, "授权服务器未返回新的许可文件")
+    ok, message = license_service.activate(new_license)
+    if not ok:
+        raise CloudError(500, f"新的许可文件校验失败：{message}")
+    return data
+
+
+def should_renew(info: Optional[Dict[str, Any]], state: Dict[str, Any]) -> bool:
+    """续期策略：剩余 <20 天，或距上次续期 ≥7 天。"""
+    if not info or not info.get("valid") or info.get("issued_via") != "online":
+        return False
+    remaining = info.get("remaining_days")
+    if remaining is not None and remaining < 20:
+        return True
+    last = state.get("last_renew_at")
+    if not last:
+        return True
+    try:
+        return datetime.now() - datetime.fromisoformat(last) >= timedelta(days=7)
+    except ValueError:
+        return True
+
+
+async def renewal_loop() -> None:
+    """桌面版后台续期任务（启动 30s 后开始，每 24h 检查一次；失败仅记日志）。"""
+    import asyncio
+
+    from app.services.license_service import license_service
+
+    await asyncio.sleep(30)
+    while True:
+        try:
+            info = license_service.desktop_license_info()
+            state = load_state()
+            if should_renew(info, state):
+                result = renew_local_license()
+                print(f"[DesktopCloud] 已自动续期至 {result.get('expire_date')}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[DesktopCloud] 自动续期未完成（忽略）：{exc}")
+        await asyncio.sleep(24 * 3600)

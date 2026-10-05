@@ -82,6 +82,7 @@ mobile-app/build_log.txt
 mobile-app/tsc_errors.txt
 
 # 桌面端打包产物与授权密钥（私钥永不入库）
+/licenses/
 /build/
 /desktop/build/
 /desktop/dist/

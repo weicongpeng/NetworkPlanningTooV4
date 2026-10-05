@@ -53,6 +53,30 @@ jobs:
       - name: 生成桌面图标（app.ico，构建期产物）
         run: python desktop/tools/make_icon.py
 
+      - name: 计算版本号
+        shell: pwsh
+        run: |
+          if ("${{ github.ref }}" -like "refs/tags/desktop-v*") {
+            $v = "${{ github.ref_name }}".Replace("desktop-v", "")
+          } else {
+            # dev 版本带短 SHA，便于对照 Actions 页面与问题排查
+            $v = "0.0.0-dev-" + $env:GITHUB_SHA.Substring(0, 7)
+          }
+          "NPT_DESKTOP_VERSION=$v" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "桌面版版本号: $v"
+
+      - name: 写入版本文件（随包分发，供客户端 OTA 比对）
+        shell: pwsh
+        run: |
+          $info = @{
+            version  = $env:NPT_DESKTOP_VERSION
+            channel  = "stable"
+            commit   = "${{ github.sha }}"
+            built_at = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+          } | ConvertTo-Json
+          $info | Out-File -FilePath desktop/version.json -Encoding utf8
+          Get-Content desktop/version.json
+
       - name: 关键单元测试
         working-directory: backend
         run: python -m pytest tests/test_desktop_license.py tests/test_data_group_scope.py -q
@@ -100,18 +124,6 @@ jobs:
           $size = (Get-Item "desktop/webview2/MicrosoftEdgeWebview2Setup.exe").Length / 1MB
           Write-Host ("WebView2 安装器: {0:N1} MB" -f $size)
           if ($size -lt 50) { Write-Error "WebView2 安装器体积异常，下载可能失败"; exit 1 }
-
-      - name: 计算版本号
-        shell: pwsh
-        run: |
-          if ("${{ github.ref }}" -like "refs/tags/desktop-v*") {
-            $v = "${{ github.ref_name }}".Replace("desktop-v", "")
-          } else {
-            # dev 版本带短 SHA，便于对照 Actions 页面与问题排查
-            $v = "0.0.0-dev-" + $env:GITHUB_SHA.Substring(0, 7)
-          }
-          "NPT_DESKTOP_VERSION=$v" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          Write-Host "桌面版版本号: $v"
 
       - name: 生成安装器（Inno Setup）
         shell: pwsh

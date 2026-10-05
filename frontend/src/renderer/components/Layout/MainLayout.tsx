@@ -17,6 +17,7 @@ import {
   Loader2,
   Wrench,
   Bot,
+  MonitorDown,
   Sun,
   Moon,
 } from 'lucide-react'
@@ -27,6 +28,7 @@ import { useThemeStore } from '../../store/themeStore'
 import { reloadUserMapSettings } from '../../store/mapStore'
 import { GlobalTaskIndicator } from './GlobalTaskIndicator'
 import { Toaster } from './Toaster'
+import { DesktopUpdateDialog } from '../DesktopUpdateDialog'
 import { appVersionsApi } from '../../services/api'
 import { prefetchPage } from '../../pageLoaders'
 
@@ -135,6 +137,7 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
     ...(isAuthenticated && user?.is_admin ? [
       { type: 'link' as const, name: t('admin.title', '用户管理'), href: '/admin/users', icon: Users },
       { type: 'link' as const, name: t('sidebar.appVersions', 'APP 版本管理'), href: '/app-versions', icon: Package },
+      { type: 'link' as const, name: t('sidebar.desktopReleases', '桌面版分发'), href: '/desktop-releases', icon: MonitorDown },
     ] : []),
   ]
 
@@ -722,6 +725,8 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
           </div>
         )}
       <Toaster />
+      {/* 桌面版 OTA 更新提示（网页端自动静默：接口 404） */}
+      <DesktopUpdateDialog />
     </div>
   )
 }

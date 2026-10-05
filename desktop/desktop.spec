@@ -27,6 +27,11 @@ datas = [
     (TEMPLATE_DIR, "template"),
 ]
 
+# 版本文件（CI 在 PyInstaller 前生成；本地缺失时跳过）
+_VERSION_FILE = os.path.join(DESKTOP_DIR, "version.json")
+if os.path.isfile(_VERSION_FILE):
+    datas.append((_VERSION_FILE, "."))
+
 hiddenimports = [
     # passlib / python-jose 动态加载的后端
     "passlib.handlers.bcrypt",

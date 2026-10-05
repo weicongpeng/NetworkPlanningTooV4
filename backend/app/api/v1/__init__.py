@@ -3,7 +3,7 @@ API v1 路由
 """
 
 from fastapi import APIRouter
-from app.api.v1.endpoints import license, data, pci, neighbor, tac, map, geo_data, system, auth, admin_users, user_settings, websocket, app_versions, layer, distance_match, site_spacing, assistant, attribute_join, buffer
+from app.api.v1.endpoints import license, data, pci, neighbor, tac, map, geo_data, system, auth, admin_users, user_settings, websocket, app_versions, layer, distance_match, site_spacing, assistant, attribute_join, buffer, desktop_licenses, desktop_cloud, desktop_local, desktop_releases
 
 api_router = APIRouter()
 
@@ -27,3 +27,7 @@ api_router.include_router(site_spacing.router, prefix="/site-spacing", tags=["�
 api_router.include_router(assistant.router, prefix="/assistant", tags=["网优助手"])
 api_router.include_router(attribute_join.router, prefix="/attribute-join", tags=["条件选择"])
 api_router.include_router(buffer.router, prefix="/buffer", tags=["绘制缓冲区"])
+api_router.include_router(desktop_licenses.router, prefix="/desktop-licenses", tags=["桌面授权管理"])
+api_router.include_router(desktop_cloud.router, prefix="/desktop-cloud", tags=["桌面客户端在线接口"])
+api_router.include_router(desktop_local.router, prefix="/desktop", tags=["桌面客户端本地接口"])
+api_router.include_router(desktop_releases.router, prefix="/desktop-releases", tags=["桌面版版本管理"])

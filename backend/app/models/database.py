@@ -318,6 +318,107 @@ class AppVersion(Base):
         }
 
 
+class DesktopLicense(Base):
+    """桌面版在线授权记录（按用户授权，许可文件绑定机器码，租约制）
+
+    两种来源：precreate（管理员预建激活码）/ approve（客户端申请后管理员批准）。
+    状态：pending（待批准）/ issued（已生成激活码待激活）/ active（已绑定机器）/
+          rejected（已拒绝）/ disabled（已禁用）。
+    """
+    __tablename__ = "desktop_licenses"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    activation_code = Column(String(32), nullable=True, unique=True, index=True)
+    licensee_username = Column(String(100), nullable=False)
+    organization = Column(String(200), nullable=True)
+    machine_code = Column(String(64), nullable=True, index=True)
+    status = Column(String(16), nullable=False, default="issued", index=True)
+    source = Column(String(10), nullable=False, default="precreate")
+    lease_days = Column(Integer, nullable=False, default=30)
+    expire_date = Column(String(10), nullable=True)
+    request_token = Column(String(64), nullable=True, unique=True)
+    applied_note = Column(Text, nullable=True)
+    review_note = Column(Text, nullable=True)
+    note = Column(Text, nullable=True)
+    created_by = Column(String(100), nullable=True)
+    approved_by = Column(String(100), nullable=True)
+    client_version = Column(String(30), nullable=True)
+    hostname = Column(String(100), nullable=True)
+    renewal_count = Column(Integer, nullable=False, default=0)
+    created_at = Column(String(30), nullable=False)
+    activated_at = Column(String(30), nullable=True)
+    machine_bound_at = Column(String(30), nullable=True)
+    last_renewed_at = Column(String(30), nullable=True)
+    disabled_at = Column(String(30), nullable=True)
+    updated_at = Column(String(30), nullable=True)
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "activation_code": self.activation_code,
+            "licensee_username": self.licensee_username,
+            "organization": self.organization,
+            "machine_code": self.machine_code,
+            "status": self.status,
+            "source": self.source,
+            "lease_days": self.lease_days,
+            "expire_date": self.expire_date,
+            "request_id": self.request_token,
+            "applied_note": self.applied_note,
+            "review_note": self.review_note,
+            "note": self.note,
+            "created_by": self.created_by,
+            "approved_by": self.approved_by,
+            "client_version": self.client_version,
+            "hostname": self.hostname,
+            "renewal_count": self.renewal_count or 0,
+            "created_at": self.created_at,
+            "activated_at": self.activated_at,
+            "machine_bound_at": self.machine_bound_at,
+            "last_renewed_at": self.last_renewed_at,
+            "disabled_at": self.disabled_at,
+            "updated_at": self.updated_at,
+        }
+
+
+class DesktopRelease(Base):
+    """Windows 桌面版安装包版本记录（OTA 分发）"""
+    __tablename__ = "desktop_releases"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    version = Column(String(30), nullable=False, index=True)
+    channel = Column(String(20), nullable=False, default="stable", index=True)
+    filename = Column(String(255), nullable=False)
+    file_path = Column(Text, nullable=False)
+    file_size = Column(Integer, nullable=True)
+    sha256 = Column(String(64), nullable=True)
+    release_notes = Column(Text, nullable=True)
+    mandatory = Column(Boolean, nullable=False, default=False)
+    is_latest = Column(Boolean, nullable=False, default=False)
+    download_count = Column(Integer, nullable=True, default=0)
+    created_by = Column(String(100), nullable=True)
+    created_at = Column(String(30), nullable=False)
+    updated_at = Column(String(30), nullable=True)
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "version": self.version,
+            "channel": self.channel,
+            "filename": self.filename,
+            "file_path": self.file_path,
+            "file_size": self.file_size,
+            "sha256": self.sha256,
+            "release_notes": self.release_notes,
+            "mandatory": bool(self.mandatory),
+            "is_latest": bool(self.is_latest),
+            "download_count": self.download_count or 0,
+            "created_by": self.created_by,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+        }
+
+
 class StationParamRow(Base):
     """网优助手-基站无线参数（一行一个小区，参数为动态 KV）
 
