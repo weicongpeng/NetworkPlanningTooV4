@@ -88,6 +88,41 @@ def _ensure_backend_on_path() -> None:
         sys.path.insert(0, str(backend))
 
 
+def _bundle_dir() -> Path:
+    """只读资源根：冻结时 _MEIPASS（onedir 下即 _internal），源码时为仓库根。"""
+    root = getattr(sys, "_MEIPASS", None)
+    if root:
+        return Path(root)
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parents[1]
+
+
+def _asset_version() -> str:
+    """用内置 index.html 的 mtime 作为静态资源版本，升级后强制 WebView2 重新取页面。"""
+    try:
+        index = _bundle_dir() / "frontend" / "dist-renderer" / "index.html"
+        return str(int(index.stat().st_mtime))
+    except OSError:
+        return "0"
+
+
+def _window_size() -> tuple[int, int, tuple[int, int]]:
+    """按屏幕分辨率适配窗口尺寸（小屏上固定 1440x900 会让底部按钮落到屏幕外）。"""
+    width, height = 1440, 900
+    min_width, min_height = 1024, 680
+    if os.name == "nt":
+        try:
+            user32 = ctypes.windll.user32
+            screen_w, screen_h = user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
+            if screen_w and screen_h:
+                width = max(900, min(width, int(screen_w * 0.92)))
+                height = max(600, min(height, int(screen_h * 0.92)))
+        except Exception:
+            pass
+    return width, height, (min(min_width, width), min(min_height, height))
+
+
 # ------------------------------------------------------------------ 单实例
 
 def _message_box(text: str, flags: int) -> None:
@@ -163,12 +198,14 @@ def _run_window(port: int, data_root: Path) -> None:
 
     # 必须开启，否则 WebView2 会直接取消所有导出下载
     webview.settings["ALLOW_DOWNLOADS"] = True
+    width, height, min_size = _window_size()
+    # ?v= 资源版本：升级后避免 WebView2 复用缓存的旧 index.html/旧前端
     webview.create_window(
         APP_NAME,
-        f"http://127.0.0.1:{port}/",
-        width=1440,
-        height=900,
-        min_size=(1024, 680),
+        f"http://127.0.0.1:{port}/?v={_asset_version()}",
+        width=width,
+        height=height,
+        min_size=min_size,
     )
     # private_mode=False + storage_path：localStorage 持久化（否则每次启动掉登录）
     webview.start(private_mode=False, storage_path=str(data_root / "webview"))
