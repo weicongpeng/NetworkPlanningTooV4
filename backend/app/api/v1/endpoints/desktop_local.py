@@ -71,7 +71,7 @@ async def cloud_status(
 
 
 @router.post("/cloud-activate")
-async def cloud_activate(
+def cloud_activate(
     payload: ActivateRequest,
     admin_user: User = Depends(get_current_admin_user),
     _: None = Depends(_require_desktop),
@@ -88,7 +88,7 @@ async def cloud_activate(
 
 
 @router.post("/cloud-renew")
-async def cloud_renew(
+def cloud_renew(
     admin_user: User = Depends(get_current_admin_user),
     _: None = Depends(_require_desktop),
 ) -> Dict[str, Any]:
@@ -104,7 +104,7 @@ async def cloud_renew(
 
 
 @router.post("/cloud-apply")
-async def cloud_apply(
+def cloud_apply(
     payload: ApplyRequest,
     admin_user: User = Depends(get_current_admin_user),
     _: None = Depends(_require_desktop),
@@ -117,7 +117,7 @@ async def cloud_apply(
 
 
 @router.get("/cloud-apply")
-async def cloud_apply_poll(
+def cloud_apply_poll(
     admin_user: User = Depends(get_current_admin_user),
     _: None = Depends(_require_desktop),
 ) -> Dict[str, Any]:
@@ -155,7 +155,7 @@ class UpdateRequest(BaseModel):
 
 
 @router.get("/update/status")
-async def update_status(
+def update_status(
     current_user: User = Depends(get_current_user),
     _: None = Depends(_require_desktop),
 ) -> Dict[str, Any]:
@@ -175,7 +175,7 @@ async def update_status(
 
 
 @router.post("/update/download")
-async def update_download(
+def update_download(
     payload: UpdateRequest,
     admin_user: User = Depends(get_current_admin_user),
     _: None = Depends(_require_desktop),
@@ -201,7 +201,7 @@ async def update_progress(
 
 
 @router.post("/update/snooze")
-async def update_snooze(
+def update_snooze(
     payload: UpdateRequest,
     admin_user: User = Depends(get_current_admin_user),
     _: None = Depends(_require_desktop),
@@ -212,7 +212,7 @@ async def update_snooze(
 
 
 @router.post("/update/install")
-async def update_install(
+def update_install(
     admin_user: User = Depends(get_current_admin_user),
     _: None = Depends(_require_desktop),
 ) -> Dict[str, Any]:
