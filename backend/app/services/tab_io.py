@@ -177,8 +177,11 @@ def write_mapinfo_tab(gdf: gpd.GeoDataFrame, out_path: Path,
     _postprocess_tab(out_path, sanitized_cols)
 
 
-def verify_tab_readable(tab_path: Path, expected_rows: int) -> None:
-    """读回校验：文件可解析且要素数一致，否则抛 ValueError。"""
+def verify_tab_readable(tab_path: Path, expected_rows: int, label: str = "TAB") -> None:
+    """读回校验：文件可解析且要素数一致，否则抛 ValueError。
+
+    pyogrio 对 TAB / Shapefile / GeoJSON 通用，label 仅用于报错时标明格式。
+    """
     try:
         info = pyogrio.read_info(str(tab_path))
         count = info["features"]
@@ -189,4 +192,4 @@ def verify_tab_readable(tab_path: Path, expected_rows: int) -> None:
     except ValueError:
         raise
     except Exception as e:
-        raise ValueError(f"TAB 文件校验失败（不可读）: {e}") from e
+        raise ValueError(f"{label} 文件校验失败（不可读）: {e}") from e

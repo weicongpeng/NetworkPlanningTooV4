@@ -583,17 +583,18 @@ async def create_map_layer(
     payload: Dict[str, Any] = Body(...),
     current_user=Depends(require_data_import),
 ) -> Dict[str, Any]:
-    """新建空的 MapInfo TAB 图层（点/线/面），创建后出现在"图层文件"组顶层。"""
+    """新建空图层（TAB / Shapefile / GeoJSON），创建后出现在"图层文件"组顶层。"""
     try:
-        from app.services.layer_edit_service import create_empty_tab_layer
+        from app.services.layer_edit_service import create_empty_layer
         name = str(payload.get("name") or "").strip()
         geometry_type = str(
             payload.get("geometry_type") or payload.get("geometryType") or ""
         ).strip()
+        fmt = str(payload.get("format") or "tab").strip().lower()
         if not name:
             raise ValueError("图层名称不能为空")
         result = await run_in_threadpool(
-            create_empty_tab_layer, name, geometry_type, current_user.id,
+            create_empty_layer, name, geometry_type, fmt, current_user.id,
             current_user.city, current_user.operator,
         )
         # 清除地图数据缓存（连带清 MapInfo 图层缓存）

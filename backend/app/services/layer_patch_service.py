@@ -26,6 +26,7 @@ from app.services.layer_edit_service import (
     _STYLE_PERSIST_COL,
     _coerce_column,
     _geom_kind,
+    _layer_fmt,
     _read_tab_gdf,
     _resolve_layer_target,
     _resolve_feature_style,
@@ -203,6 +204,10 @@ def apply_layer_patch(data_id: str, layer_id: str, patch: Dict[str, Any],
         LayerVersionConflict: 基底不一致（调用方回退整层保存）
     """
     data_dir, entry, tab_path, entry_type = _resolve_layer_target(data_id, layer_id)
+    # 增量保存耦合 TAB 的 .map 逐要素样式与 NPT_FEATSYM 列；Shapefile/GeoJSON 的样式
+    # 落在 .qml，这里按基底版本冲突处理，让前端回退整层保存（结果正确，只是多传一次）。
+    if _layer_fmt(tab_path) != "tab":
+        raise LayerVersionConflict("该格式暂不支持增量保存，本次按整层保存")
     base = patch.get("base") or {}
     _check_base_version(tab_path, layer_id, base)
 

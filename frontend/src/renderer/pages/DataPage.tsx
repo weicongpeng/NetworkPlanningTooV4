@@ -336,8 +336,9 @@ export function DataPage() {
       }
 
       // 图层文件（map_layer）：按 stem 分组，主文件 + 配套文件一次上传
-      // （浏览器模式无真实路径时，配套的 .dat/.mid/.map/.id 需与主文件一起选中上传）
-      const MAP_MAIN_RANK = ['.tab', '.kml', '.mif', '.dat', '.zip']
+      // （浏览器模式无真实路径时，配套的 .dat/.mid/.map/.id、.shx/.dbf/.prj/.qml
+      //   需与主文件一起选中上传）
+      const MAP_MAIN_RANK = ['.shp', '.tab', '.kml', '.geojson', '.json', '.mif', '.dat', '.zip']
       let allSuccess = true
 
       if (context === 'map_layer') {
@@ -952,14 +953,14 @@ export function DataPage() {
                     <div className="flex-1">
                         <UploadArea
                             title={t('data.mapLayer') || '图层文件'}
-                            accept=".zip,.tab,.mif,.kml"
+                            accept=".zip,.tab,.mif,.kml,.shp,.shx,.dbf,.prj,.cpg,.qml,.geojson,.json"
                             onUpload={(e) => handleFileUpload(e, 'map', 'map_layer')}
                             loading={loading && uploadingType === 'map_layer'}
                             icon={<Layers size={20} />}
                             multiple={true}
                             inline={true}
                             status={uploadStatus.map_layer}
-                            description={t('data.mapLayerDesc') || '支持ZIP/TAB/MIF/KML，TAB需配套DAT文件'}
+                            hint={t('data.mapLayerHint') || '点击上传支持 TAB/MIF/KML/SHP/GeoJSON'}
                         />
                     </div>
                     <div className="w-24">
@@ -1534,7 +1535,8 @@ function UploadArea({
   multiple = false,
   description,
   inline = false,
-  status = 'idle'
+  status = 'idle',
+  hint
 }: {
   title: string
   accept: string
@@ -1545,8 +1547,11 @@ function UploadArea({
   description?: string
   inline?: boolean
   status?: 'idle' | 'success' | 'error'
+  /** 自定义提示文案；不传时显示「点击上传 + accept 扩展名列表」（扩展名过多时用） */
+  hint?: string
 }) {
   const { t } = useTranslation()
+  const hintText = hint || `${t('data.clickToUpload') || '点击上传'} ${accept}`
   // 根据状态获取边框颜色
   const getBorderClass = () => {
     if (loading) return 'border-muted bg-muted/50 cursor-not-allowed'
@@ -1580,9 +1585,7 @@ function UploadArea({
             ) : (
               <>
                 <span className="flex-shrink-0">{icon}</span>
-                <p className="text-xs whitespace-nowrap">
-                  {t('data.clickToUpload') || '点击上传'} {accept}
-                </p>
+                <p className="text-xs whitespace-nowrap">{hintText}</p>
                 {description && (
                   <span className="text-[10px] text-muted-foreground ml-1 whitespace-nowrap hidden sm:inline">· {description}</span>
                 )}
@@ -1626,9 +1629,7 @@ function UploadArea({
           ) : (
             <>
               <span className="flex-shrink-0 transition-transform duration-200 group-hover:scale-110">{icon}</span>
-              <p className="text-xs flex-1 text-center">
-                {t('data.clickToUpload') || '点击上传'} {accept}
-              </p>
+              <p className="text-xs flex-1 text-center">{hintText}</p>
             </>
           )}
         </div>

@@ -9,9 +9,9 @@
  * - 显示当前工参文件名
  * - 坐标缺失警告
  */
-import { useState, useEffect, useRef, useCallback, useMemo, type ReactNode } from 'react'
+import { useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo, type ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
-import { Loader2, Search, X, MapPin, AlertTriangle, Database, Trash2, MousePointer2, Circle as CircleIcon, Pentagon, Hand, Map as MapIcon, Satellite, Maximize2, Minimize2, FilePlus2, Save, Download, Hexagon, Spline, Palette, PenLine, Undo2, BoxSelect, ClipboardPaste, Magnet, Combine, Filter } from 'lucide-react'
+import { Loader2, Search, X, MapPin, AlertTriangle, Database, Trash2, MousePointer2, Circle as CircleIcon, Pentagon, Hand, Map as MapIcon, Satellite, Maximize2, Minimize2, FilePlus2, Save, Download, Hexagon, Spline, Palette, PenLine, Undo2, BoxSelect, ClipboardPaste, Magnet, Combine, Filter, ChevronRight, ChevronsRight } from 'lucide-react'
 import { OnlineMap, OnlineMapRef, CustomLayerOption } from '../components/Map/OnlineMap'
 import { MapSearchDialog } from '../components/Map/MapSearchDialog'
 import { LayerControl, SectorLayerOption, LayerFileOption, DecorationLayerOption } from '../components/Map/LayerControl'
@@ -143,6 +143,18 @@ function BufferIcon({ size = 14 }: { size?: number }) {
 const _layerListCache = new Map<string, LayerListCacheEntry>()
 const _LAYER_LIST_CACHE_TTL = 10 * 60 * 1000 // 10分钟
 
+/** 可编辑保存的图层源文件后缀（与后端 layer_edit_service._LAYER_FMT_BY_SUFFIX 保持一致） */
+const LAYER_EDITABLE_EXTS = ['.tab', '.shp', '.geojson', '.json']
+
+/** 源文件名 → 图层格式（仅 TAB 支持增量保存，其余走整层保存） */
+function layerFileFormat(sourceFile?: string): string {
+  const f = (sourceFile || '').toLowerCase()
+  if (f.endsWith('.tab')) return 'tab'
+  if (f.endsWith('.shp')) return 'shp'
+  if (f.endsWith('.geojson') || f.endsWith('.json')) return 'geojson'
+  return ''
+}
+
 // ===== 工具栏个性化（右键设置）：按钮排序 + 标签文字显隐，按登录用户持久化 =====
 
 /** 可拖动排序的工具栏按钮 id（数据源指示/搜索区固定不参与）；默认顺序按使用频率排列 */
@@ -156,7 +168,7 @@ type ToolbarItemId = (typeof TOOLBAR_ITEM_IDS)[number]
 interface ToolbarPrefs {
   order: ToolbarItemId[]
   showLabels: boolean
-  /** 快照格式版本（v2 = 标签默认隐藏 + 新默认顺序；旧快照一次性迁移） */
+  /** 快照格式版本（v3 = 标签默认显示；旧快照一次性迁移） */
   __v?: number
 }
 
@@ -173,15 +185,16 @@ function toolbarPrefsKey(): string {
 }
 
 function loadToolbarPrefs(): ToolbarPrefs {
-  // v2 默认：标签文字隐藏（图标态）+ 新默认按钮顺序
-  const defaults: ToolbarPrefs = { order: [...TOOLBAR_ITEM_IDS], showLabels: false, __v: 2 }
+  // v3 默认：标签文字显示 + 默认按钮顺序
+  const defaults: ToolbarPrefs = { order: [...TOOLBAR_ITEM_IDS], showLabels: true, __v: 3 }
   try {
     const raw = localStorage.getItem(toolbarPrefsKey())
     if (!raw) return defaults
     const p = JSON.parse(raw)
-    // 旧版快照（v1）：一次性迁移为新的默认外观（旧"显示标签"与新默认冲突，按未定制处理）
-    if (p.__v !== 2) return defaults
-    // v2 快照：尊重用户显式设置，仅补齐新增按钮
+    // 旧版快照（v1 及更早）：一次性迁移为新的默认外观（按未定制处理）
+    if (p.__v !== 2 && p.__v !== 3) return defaults
+    // v2 快照：旧默认"标签隐藏"与新默认冲突，按未定制处理（改为显示标签），保留自定义按钮顺序；
+    // v3 快照：尊重用户显式设置，仅补齐新增按钮
     const known = TOOLBAR_ITEM_IDS as readonly string[]
     const order: ToolbarItemId[] = Array.isArray(p.order)
       ? (p.order.filter((id: string) => known.includes(id)) as ToolbarItemId[])
@@ -202,10 +215,24 @@ function loadToolbarPrefs(): ToolbarPrefs {
       }
       if (!placed) order.unshift(id)
     }
-    return { order, showLabels: p.showLabels === true, __v: 2 }
+    return { order, showLabels: p.__v === 3 ? p.showLabels === true : true, __v: 3 }
   } catch {
     return defaults
   }
+}
+
+/** 「更多」面板条目：工具栏被收纳按钮的等价行（图标 + 文案 + 动作，与 toolbarButtons 保持一致） */
+interface ToolbarMoreEntry {
+  icon: ReactNode
+  label: string
+  title?: string
+  /** 对应工具当前处于激活态（面板行高亮） */
+  active?: boolean
+  disabled?: boolean
+  /** 直接执行的动作；带 submenu 的复合按钮改用子项列表 */
+  onSelect?: () => void
+  /** 复合按钮（新建/圈选/绘制）的下拉项 */
+  submenu?: Array<{ icon: ReactNode; label: string; onSelect: () => void }>
 }
 
 /**
@@ -571,7 +598,8 @@ export function MapPage() {
               dataId: mapItem.id,
               sourceType: 'mapinfo' as const,
               defaultStyle: layer.defaultStyle,
-              editable: (layer.metadata?.source_file || '').toLowerCase().endsWith('.tab'),
+              editable: LAYER_EDITABLE_EXTS.some((ext) => (layer.metadata?.source_file || '').toLowerCase().endsWith(ext)),
+              format: layerFileFormat(layer.metadata?.source_file),
               toolCreated: layer.metadata?.editable === true
             }))
           }
@@ -591,7 +619,8 @@ export function MapPage() {
               dataId: mapItem.id,
               sourceType: 'mapinfo' as const,
               defaultStyle: layer.defaultStyle,
-              editable: (layer.metadata?.source_file || '').toLowerCase().endsWith('.tab'),
+              editable: LAYER_EDITABLE_EXTS.some((ext) => (layer.metadata?.source_file || '').toLowerCase().endsWith(ext)),
+              format: layerFileFormat(layer.metadata?.source_file),
               toolCreated: layer.metadata?.editable === true
             }))
           }
@@ -924,6 +953,83 @@ export function MapPage() {
   const [toolbarMenu, setToolbarMenu] = useState<{ x: number; y: number } | null>(null)
   const toolbarDragIdRef = useRef<string | null>(null)
 
+  // ===== 工具栏收纳：标签全展开时放不下的按钮收进「更多」面板（最右端"》"按钮触发） =====
+  // toolbarOverflowStart：第一个被收纳按钮在 order 中的下标（Infinity = 全部放得下）
+  const [toolbarOverflowStart, setToolbarOverflowStart] = useState<number>(Number.POSITIVE_INFINITY)
+  const [toolbarMoreOpen, setToolbarMoreOpen] = useState(false)
+  const [toolbarMoreSubmenu, setToolbarMoreSubmenu] = useState<string | null>(null)
+  const toolbarItemsRef = useRef<HTMLDivElement>(null)
+  const toolbarMoreRef = useRef<HTMLDivElement>(null)
+  const toolbarMoreBtnRef = useRef<HTMLButtonElement>(null)
+  const hasToolbarOverflow = toolbarOverflowStart < toolbarPrefs.order.length
+
+  /**
+   * 实测工具区可用宽度，计算能完整显示的前 N 个按钮，其余收纳进「更多」面板。
+   * 收纳项以 absolute + w-max 保形（不可见但可测宽），因此每次都能测到全部按钮的自然宽度；
+   * 需要为「更多」按钮预留宽度，但仅当仍有按钮放不下（最后一个按钮无需预留）。
+   */
+  const measureToolbarOverflow = useCallback(() => {
+    const el = toolbarItemsRef.current
+    if (!el) return
+    const items = Array.from(el.querySelectorAll<HTMLElement>('[data-toolbar-item]'))
+    if (items.length === 0) return
+    const gapRaw = Number.parseFloat(getComputedStyle(el).columnGap)
+    const gap = Number.isFinite(gapRaw) ? gapRaw : 16
+    const moreBtn = toolbarMoreBtnRef.current
+    // 「更多」按钮按需占用 宽度 + 间距；它已渲染时容器实测宽度已扣除这部分，需加回来再统一计算，
+    // 否则窗口变宽后最后一项永远差一点、按钮无法消失
+    const moreWidth = (moreBtn?.offsetWidth ?? 30) + gap
+    const avail = el.clientWidth + (moreBtn ? moreWidth : 0)
+    let used = 0
+    let start = 0
+    for (let k = 0; k < items.length; k++) {
+      const next = used + items[k].offsetWidth + (k > 0 ? gap : 0)
+      const needMore = k + 1 < items.length
+      if (next + (needMore ? moreWidth : 0) <= avail) {
+        used = next
+        start = k + 1
+      } else {
+        break
+      }
+    }
+    setToolbarOverflowStart((prev) => (prev === start ? prev : start))
+  }, [])
+
+  // 每次渲染后重算（按钮标签/徽标/语言切换都会改变宽度）
+  useLayoutEffect(() => {
+    measureToolbarOverflow()
+  })
+
+  // 容器尺寸变化（窗口缩放/侧栏收起）时重算
+  useEffect(() => {
+    const el = toolbarItemsRef.current
+    if (!el || typeof ResizeObserver === 'undefined') return
+    const ro = new ResizeObserver(() => measureToolbarOverflow())
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [measureToolbarOverflow])
+
+  // 没有收纳项时收起「更多」面板
+  useEffect(() => {
+    if (!hasToolbarOverflow) {
+      setToolbarMoreOpen(false)
+      setToolbarMoreSubmenu(null)
+    }
+  }, [hasToolbarOverflow])
+
+  // 「更多」面板：点击其他处收起
+  useEffect(() => {
+    if (!toolbarMoreOpen) return
+    const close = (e: MouseEvent) => {
+      if (toolbarMoreRef.current && !toolbarMoreRef.current.contains(e.target as Node)) {
+        setToolbarMoreOpen(false)
+        setToolbarMoreSubmenu(null)
+      }
+    }
+    document.addEventListener('mousedown', close)
+    return () => document.removeEventListener('mousedown', close)
+  }, [toolbarMoreOpen])
+
   // 持久化到 localStorage（key 按登录用户区分）
   useEffect(() => {
     try {
@@ -1010,7 +1116,7 @@ export function MapPage() {
   }, [])
 
   // 新建图层成功：刷新列表后自动进入该图层编辑（默认可编辑）
-  const handleLayerCreated = useCallback(async (r: { data_id: string; layer_id: string; name: string }) => {
+  const handleLayerCreated = useCallback(async (r: { data_id: string; layer_id: string; name: string; geometry_type?: string; format?: string }) => {
     triggerDataRefresh()
     // 新建图层已注册到 index，须强制重新拉取数据列表；否则 items 仍是旧快照，新图层不会立即出现在图层面板
     await useDataStore.getState().fetchList(1, 50, true)
@@ -1021,7 +1127,10 @@ export function MapPage() {
     }
     // 直接建立编辑工作集（beginEdit 同时设 editableLayerId），避免 ensureWorkspace
     // 用旧 layerFiles 闭包找不到刚创建的新图层而跳过初始化，导致绘制要素无处落地。
-    useLayerEditStore.getState().beginEdit(r.layer_id, r.data_id, 'mixed', [], null)
+    // 几何类型按后端返回值初始化：新建的点/线/面 Shapefile 不能当混合图层用。
+    useLayerEditStore.getState().beginEdit(
+      r.layer_id, r.data_id, (r.geometry_type as any) || 'mixed', [], null,
+    )
     // 新图层默认可视 + 可选（可编辑图层一定可选择），便于立即绘制并在地图可见
     useMapStore.getState().setLayerFileVisibility(r.layer_id, true)
     useMapStore.getState().setLayerSelectable(r.layer_id, true)
@@ -1121,8 +1230,9 @@ export function MapPage() {
       const ws = useLayerEditStore.getState().getWorkspace(layerId)
       const lf = layerFiles.find((f) => f.id === layerId)
       if (!ws || !lf) continue
-      // 保存计划：有基底版本指纹时只回传变更要素（大图层省掉整层上传/解析），否则整层保存
-      const plan = buildSavePlan(ws)
+      // 保存计划：有基底版本指纹时只回传变更要素（大图层省掉整层上传/解析），否则整层保存。
+      // 增量保存仅 TAB 支持（SHP/GeoJSON 的样式在 .qml），其余格式直接整层。
+      const plan = buildSavePlan(ws, { allowPatch: lf.format === 'tab' })
       if (plan.mode === 'none') {
         // 无有效变更（如新增后又删除）：不写盘，仅清脏并保持基底版本
         useLayerEditStore.getState().markSaved(layerId, { remapRows: true, version: ws.version })
@@ -2568,6 +2678,47 @@ export function MapPage() {
   }, [])
 
   // ===== 工具栏按钮（id → JSX）：渲染顺序由 toolbarPrefs.order 决定（右键菜单/拖拽可调） =====
+
+  /** 打点工具"粘滞"：已激活时再次点击不关闭，只能通过切换到其他工具退出 */
+  const activateCaptureTool = () => {
+    if (captureMode) return
+    setCaptureMode(true)
+    setMeasureMode(false)
+    setSelectionMode('none')
+    setMapDragTool(false)
+    // 与绘制工具互斥：激活打点时退出绘制与选择
+    useLayerEditStore.getState().setDrawTool('none')
+    useLayerEditStore.getState().setSelectMode(false)
+  }
+
+  /** 测距工具"粘滞"：已激活时再次点击不关闭，只能通过切换到其他工具退出 */
+  const activateMeasureTool = () => {
+    if (measureMode) return
+    setMeasureMode(true)
+    setCaptureMode(false)
+    setCaptureCoord(null)
+    setSelectionMode('none')
+    setMapDragTool(false)
+    // 与绘制工具互斥：激活测距时退出绘制与选择
+    useLayerEditStore.getState().setDrawTool('none')
+    useLayerEditStore.getState().setSelectMode(false)
+  }
+
+  /** 地图类型三态循环：关闭底图 → 平面图 → 卫星图 → 关闭底图 */
+  const cycleMapType = () => {
+    if (!onlineMapVisible) {
+      // 关闭状态 → 恢复平面图
+      handleOnlineMapToggle(true)
+      handleMapTypeChange('roadmap')
+    } else if (mapType === 'roadmap') {
+      // 平面图 → 卫星图
+      handleMapTypeChange('satellite')
+    } else {
+      // 卫星图 → 关闭底图
+      handleOnlineMapToggle(false)
+    }
+  }
+
   const toolbarButtons: Record<string, ReactNode> = {
     /* 保存按钮：有未保存编辑时可点击，弹窗选择保存哪些图层 */
     save: (
@@ -2624,17 +2775,7 @@ export function MapPage() {
     capture: (
       <button
         className={`px-2 py-1.5 text-xs rounded transition-colors flex items-center gap-1 ${captureMode ? 'bg-blue-400 text-white hover:bg-blue-500' : 'text-foreground hover:bg-muted hover:text-primary'}`}
-        onClick={() => {
-          // 打点工具"粘滞"：已激活时再次点击不关闭，只能通过切换到其他工具退出
-          if (captureMode) return
-          setCaptureMode(true)
-          setMeasureMode(false)
-          setSelectionMode('none')
-          setMapDragTool(false)
-          // 与绘制工具互斥：激活打点时退出绘制与选择
-          useLayerEditStore.getState().setDrawTool('none')
-          useLayerEditStore.getState().setSelectMode(false)
-        }}
+        onClick={activateCaptureTool}
         title={captureMode ? (t('map.exitCaptureMode') || '退出打点') : (t('map.captureModeHint') || '点击地图任意位置抓取WGS84坐标')}
       >
         <div className="w-4 h-4 flex items-center justify-center">
@@ -2649,18 +2790,7 @@ export function MapPage() {
       <button
         className={`px-2 py-1.5 text-xs rounded transition-colors flex items-center gap-1 ${measureMode ? 'bg-blue-400 text-white hover:bg-blue-500' : 'text-foreground hover:bg-muted hover:text-primary'
           }`}
-        onClick={() => {
-          // 测距工具"粘滞"：已激活时再次点击不关闭，只能通过切换到其他工具退出
-          if (measureMode) return
-          setMeasureMode(true)
-          setCaptureMode(false)
-          setCaptureCoord(null)
-          setSelectionMode('none')
-          setMapDragTool(false)
-          // 与绘制工具互斥：激活测距时退出绘制与选择
-          useLayerEditStore.getState().setDrawTool('none')
-          useLayerEditStore.getState().setSelectMode(false)
-        }}
+        onClick={activateMeasureTool}
         title={measureMode ? (t('map.exitDistanceMode') || '退出测距模式') : (t('map.distanceMode') || '测距工具')}
       >
         <div className="w-4 h-4 flex items-center justify-center">
@@ -2794,7 +2924,7 @@ export function MapPage() {
               className="w-full text-left px-2 py-1.5 text-xs text-foreground hover:bg-muted hover:text-primary transition-colors flex items-center gap-1.5"
             >
               <FilePlus2 size={12} />
-              {t('map.tabLayer') || 'TAB图层'}
+              {t('map.newLayerMenu') || '图层'}
             </button>
           </div>
         )}
@@ -2931,19 +3061,7 @@ export function MapPage() {
     /* 地图类型切换按钮：平面图 → 卫星图 → 关闭底图 三态循环 */
     maptype: (
       <button
-        onClick={() => {
-          if (!onlineMapVisible) {
-            // 关闭状态 → 恢复平面图
-            handleOnlineMapToggle(true)
-            handleMapTypeChange('roadmap')
-          } else if (mapType === 'roadmap') {
-            // 平面图 → 卫星图
-            handleMapTypeChange('satellite')
-          } else {
-            // 卫星图 → 关闭底图
-            handleOnlineMapToggle(false)
-          }
-        }}
+        onClick={cycleMapType}
         className={`flex items-center gap-1 px-2 py-1.5 text-xs rounded transition-colors ${
           onlineMapVisible
             ? 'text-foreground hover:bg-muted hover:text-primary'
@@ -2987,6 +3105,155 @@ export function MapPage() {
     ),
   }
 
+  // =====「更多」面板条目：被收纳按钮的等价行 =====
+  const marqueeIcon = selectionMode === 'point'
+    ? <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" /></svg>
+    : selectionMode === 'circle'
+      ? <CircleIcon size={14} />
+      : selectionMode === 'polygon'
+        ? <Pentagon size={14} />
+        : selectionMode === 'boundary'
+          ? <TrapezoidIcon size={14} />
+          : <BoxSelect size={14} />
+  const marqueeLabel = selectionMode === 'point'
+    ? (t('map.pointSelect') || '框选')
+    : selectionMode === 'circle'
+      ? (t('map.circleSelect') || '圆形')
+      : selectionMode === 'polygon'
+        ? (t('map.polygonSelect') || '多边形')
+        : selectionMode === 'boundary'
+          ? (t('map.boundarySelect') || '边界选择')
+          : (t('map.marqueeSelect') || '圈选')
+  const drawIcon = drawTool === 'point'
+    ? <MapPin size={14} />
+    : drawTool === 'line'
+      ? <Spline size={14} />
+      : drawTool === 'polygon'
+        ? <Hexagon size={14} />
+        : <PenLine size={14} />
+  const drawLabel = drawTool === 'point'
+    ? (t('map.point') || '点')
+    : drawTool === 'line'
+      ? (t('map.line') || '线')
+      : drawTool === 'polygon'
+        ? (t('map.polygon') || '面')
+        : (t('map.draw') || '绘制')
+  const mapTypeLabel = !onlineMapVisible
+    ? (t('map.emptyMap') || '空地图')
+    : mapType === 'roadmap'
+      ? (t('map.vector') || '平面图')
+      : (t('map.satellite') || '卫星图')
+
+  const toolbarMoreEntries: Record<string, ToolbarMoreEntry> = {
+    save: {
+      icon: <Save size={14} />,
+      label: t('common.save') || '保存',
+      title: t('map.saveLayersHint') || '保存有未保存编辑的图层（Ctrl+S）',
+      disabled: dirtyLayerIds.length === 0,
+      onSelect: () => setSaveDialogOpen(true),
+    },
+    export: {
+      icon: <Download size={14} />,
+      label: t('map.exportAction') || '导出',
+      title: t('map.exportFilesHint') || '导出已导入的文件到本地',
+      onSelect: () => setExportDialogOpen(true),
+    },
+    new: {
+      icon: <FilePlus2 size={14} />,
+      label: t('map.newLayer') || '新建',
+      submenu: [
+        { icon: <FilePlus2 size={12} />, label: t('map.newLayerMenu') || '图层', onSelect: () => setNewLayerDialogOpen(true) },
+      ],
+    },
+    undo: {
+      icon: <Undo2 size={14} />,
+      label: t('map.undo') || '撤销',
+      title: t('map.undoHint') || '撤销当前编辑图层的操作（Ctrl+Z）',
+      disabled: !canUndoNow,
+      onSelect: handleUndo,
+    },
+    capture: {
+      icon: <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z" /><circle cx="12" cy="10" r="3" /></svg>,
+      label: captureMode ? (t('map.exitCaptureMode') || '退出打点') : (t('map.extractCoord') || '打点'),
+      active: captureMode,
+      onSelect: activateCaptureTool,
+    },
+    paste: {
+      icon: <ClipboardPaste size={14} />,
+      label: t('map.pasteSelection') || '粘贴',
+      disabled: !pasteTargetReady,
+      onSelect: handlePasteFeatures,
+    },
+    measure: {
+      icon: <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M8 2h8v20H8V2z"></path><path d="M13 6h3"></path><path d="M13 10h3"></path><path d="M13 14h3"></path><path d="M13 18h3"></path></svg>,
+      label: t('map.measure') || '测距',
+      active: measureMode,
+      onSelect: activateMeasureTool,
+    },
+    drag: {
+      icon: <Hand size={14} />,
+      label: t('map.drag') || '拖拽',
+      active: mapDragTool,
+      onSelect: handleMapDragToolToggle,
+    },
+    select: {
+      icon: <MousePointer2 size={14} />,
+      label: t('map.selectTool') || '选择',
+      active: selectMode,
+      onSelect: handleSelectToolToggle,
+    },
+    marquee: {
+      icon: marqueeIcon,
+      label: marqueeLabel,
+      active: selectionMode !== 'none',
+      submenu: [
+        { icon: <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" /></svg>, label: t('map.pointSelect') || '框选', onSelect: () => handleSelectionModeChange('point') },
+        { icon: <CircleIcon size={12} />, label: t('map.circleSelect') || '圆形', onSelect: () => handleSelectionModeChange('circle') },
+        { icon: <Pentagon size={12} />, label: t('map.polygonSelect') || '多边形', onSelect: () => handleSelectionModeChange('polygon') },
+        { icon: <TrapezoidIcon size={12} />, label: t('map.boundarySelect') || '边界选择', onSelect: () => handleSelectionModeChange('boundary') },
+        { icon: <Filter size={12} />, label: t('map.attributeJoin') || '条件选择', onSelect: () => setJoinDialogOpen(true) },
+      ],
+    },
+    draw: {
+      icon: drawIcon,
+      label: drawLabel,
+      active: drawTool !== 'none',
+      submenu: [
+        { icon: <MapPin size={13} />, label: t('map.drawPoint') || '绘制点', onSelect: () => handleDrawTool('point') },
+        { icon: <Spline size={13} />, label: t('map.drawLine') || '绘制线', onSelect: () => handleDrawTool('line') },
+        { icon: <Hexagon size={13} />, label: t('map.drawPolygon') || '绘制面', onSelect: () => handleDrawTool('polygon') },
+        { icon: <BufferIcon size={13} />, label: t('map.drawBuffer') || '绘制缓冲区', onSelect: () => setBufferDialogOpen(true) },
+      ],
+    },
+    style: {
+      icon: <Palette size={14} />,
+      label: t('map.style') || '样式',
+      onSelect: () => setStyleModalTab('point'),
+    },
+    nodesnap: {
+      icon: <Magnet size={14} />,
+      label: t('map.nodeSnap') || '节点捕获',
+      active: snapEnabled,
+      onSelect: handleToggleSnap,
+    },
+    nodemerge: {
+      icon: <Combine size={14} />,
+      label: t('map.nodeMerge') || '节点合并',
+      active: nodeMergeMode,
+      onSelect: handleToggleNodeMerge,
+    },
+    maptype: {
+      icon: (!onlineMapVisible || mapType === 'roadmap') ? <MapIcon size={14} /> : <Satellite size={14} />,
+      label: mapTypeLabel,
+      onSelect: cycleMapType,
+    },
+    fullscreen: {
+      icon: isFullscreen ? <Minimize2 size={14} /> : <Maximize2 size={14} />,
+      label: isFullscreen ? (t('map.exitFullscreen') || '退出全屏') : (t('map.fullscreen') || '全屏'),
+      onSelect: toggleFullscreen,
+    },
+  }
+
   return (
     <div ref={mapPageRef} className="flex flex-col h-full min-h-0">
       {/* 地图工具栏（右键可设置标签显隐/按钮顺序） */}
@@ -2997,7 +3264,7 @@ export function MapPage() {
           setToolbarMenu({ x: e.clientX, y: e.clientY })
         }}
       >
-        <div className="flex items-center gap-4">
+        <div className="flex items-center gap-4 shrink-0">
 
           {/* 数据源状态指示 - 绿色已加载/红色未加载 */}
           <div className="px-3 py-1.5 bg-muted/50 rounded-md">
@@ -3007,8 +3274,8 @@ export function MapPage() {
           </div>
         </div>
 
-        {/* 搜索框 */}
-        <div className="relative flex items-center gap-2 flex-1 justify-start">
+        {/* 搜索框（空间不足时优先收缩自身，给右侧工具按钮让位） */}
+        <div className="relative flex items-center gap-2 min-w-0 flex-shrink justify-start">
           {/* 搜索模式切换 - 单按钮切换 */}
           <button
             onClick={() => {
@@ -3017,21 +3284,21 @@ export function MapPage() {
               setSearchResults([])
               setShowSearchResults(false)
             }}
-            className="px-2 py-1.5 text-xs rounded transition-colors flex items-center gap-1 text-foreground hover:bg-muted hover:text-primary"
+            className="px-2 py-1.5 text-xs rounded transition-colors flex items-center gap-1 text-foreground hover:bg-muted hover:text-primary shrink-0"
             title={t('map.searchModeSwitchHint') || '点击可切换工参搜索、经纬度定位和地图搜索'}
           >
             <Search size={14} />
             <span>{searchMode === 'parameter' ? (t('map.searchLocation') || '搜索定位') : (t('map.searchPlace') || '地图搜索')}</span>
           </button>
           {searchMode === 'parameter' && missingCoordCount > 0 && (
-            <div className="flex items-center gap-1 ml-2 text-xs text-amber-600" title="部分扇区缺少坐标信息">
+            <div className="flex items-center gap-1 ml-2 text-xs text-amber-600 shrink-0" title="部分扇区缺少坐标信息">
               <AlertTriangle size={12} />
               <span>{missingCoordCount}{t('map.missingCoordCells') || '个扇区缺坐标'}</span>
             </div>
           )}
 
           {/* 搜索输入框 */}
-          <div className="relative w-[360px]">
+          <div className="relative w-[360px] min-w-[110px] shrink">
             <input
               ref={searchInputRef}
               type="text"
@@ -3171,45 +3438,127 @@ export function MapPage() {
                 onlineMapRef.current.clearShapeSelection()
               }
             }}
-            className="px-2 py-1.5 text-xs rounded hover:bg-muted transition-colors text-foreground hover:text-primary flex items-center gap-1"
+            className="px-2 py-1.5 text-xs rounded hover:bg-muted transition-colors text-foreground hover:text-primary flex items-center gap-1 shrink-0"
             title={t('map.clearAllMarkers') || '清除所有搜索标记和圈选状态'}
           >
             <Trash2 size={14} />
             <span className="toolbar-label">{t('map.clear') || '清除'}</span>
           </button>
+        </div>
 
-          {/* 工具栏按钮：渲染顺序由用户设置决定（右键工具栏可配置），按钮可拖拽调整位置 */}
-          {toolbarPrefs.order.map((id) => (
-            <div
-              key={id}
-              className="flex items-center"
-              draggable
-              onDragStart={(e) => {
-                toolbarDragIdRef.current = id
-                e.dataTransfer.effectAllowed = 'move'
-                e.dataTransfer.setData('text/plain', id)
-                // 拖动过程中显示"移动中"光标（与图层面板拖动排序一致）
-                ;(e.currentTarget as HTMLElement).style.cursor = 'grabbing'
-              }}
-              onDragOver={(e) => e.preventDefault()}
-              onDrop={(e) => {
-                e.preventDefault()
-                handleToolbarDrop(id)
-              }}
-              onDragEnd={(e) => {
-                const el = e.currentTarget as HTMLElement
-                el.style.cursor = ''
-              }}
+        {/* 工具栏按钮区：渲染顺序由用户设置决定（右键工具栏可配置），按钮可拖拽调整位置；
+            宽度不足时右侧放不下的按钮收进「更多」面板（收纳项不可见但保留在 DOM 中用于测宽）。
+            注意：不能加 overflow-hidden——会裁掉按钮自身的下拉菜单（新建/绘制/圈选） */}
+        <div
+          ref={toolbarItemsRef}
+          className="relative flex items-center gap-4 flex-1 min-w-0"
+        >
+          {toolbarPrefs.order.map((id, index) => {
+            const overflowed = index >= toolbarOverflowStart
+            return (
+              <div
+                key={id}
+                data-toolbar-item={id}
+                className={overflowed
+                  ? 'absolute left-0 top-0 w-max whitespace-nowrap invisible pointer-events-none'
+                  : 'flex items-center shrink-0 whitespace-nowrap'}
+                draggable
+                onDragStart={(e) => {
+                  toolbarDragIdRef.current = id
+                  e.dataTransfer.effectAllowed = 'move'
+                  e.dataTransfer.setData('text/plain', id)
+                  // 拖动过程中显示"移动中"光标（与图层面板拖动排序一致）
+                  ;(e.currentTarget as HTMLElement).style.cursor = 'grabbing'
+                }}
+                onDragOver={(e) => e.preventDefault()}
+                onDrop={(e) => {
+                  e.preventDefault()
+                  handleToolbarDrop(id)
+                }}
+                onDragEnd={(e) => {
+                  const el = e.currentTarget as HTMLElement
+                  el.style.cursor = ''
+                }}
+              >
+                {toolbarButtons[id]}
+              </div>
+            )
+          })}
+        </div>
+
+        {/* 「更多」按钮（最右端）：展开被收纳的工具按钮 */}
+        {hasToolbarOverflow && (
+          <div ref={toolbarMoreRef} className="relative shrink-0">
+            <button
+              ref={toolbarMoreBtnRef}
+              onClick={() => setToolbarMoreOpen((v) => !v)}
+              className={`flex items-center justify-center w-[30px] px-2 py-1.5 text-xs rounded transition-colors ${toolbarMoreOpen ? 'bg-muted text-primary' : 'text-foreground hover:bg-muted hover:text-primary'}`}
+              title={t('map.toolbarMoreTools') || '更多工具'}
             >
-              {toolbarButtons[id]}
-            </div>
-          ))}
+              <ChevronsRight size={14} />
+            </button>
 
-        </div>
-
-        {/* 右侧地图控件占位 */}
-        <div className="flex items-center gap-4 ml-auto">
-        </div>
+            {toolbarMoreOpen && (
+              <div className="absolute right-0 top-full mt-1 z-[4000] bg-card border border-border rounded-lg shadow-lg py-1 min-w-[168px] max-h-[70vh] overflow-y-auto">
+                <div className="px-3 py-1 text-[10px] text-muted-foreground border-b border-border/60 mb-0.5">
+                  {t('map.toolbarMoreTools') || '更多工具'}
+                </div>
+                {toolbarPrefs.order.slice(toolbarOverflowStart).map((id) => {
+                  const entry = toolbarMoreEntries[id]
+                  if (!entry) return null
+                  const submenuOpen = toolbarMoreSubmenu === id
+                  return (
+                    <div key={id}>
+                      <button
+                        className={`w-full text-left px-3 py-1.5 text-xs flex items-center gap-2 transition-colors ${
+                          entry.disabled
+                            ? 'text-muted-foreground/40 cursor-not-allowed'
+                            : entry.active
+                              ? 'bg-primary/10 text-primary hover:bg-muted'
+                              : 'text-foreground hover:bg-muted hover:text-primary'
+                        }`}
+                        disabled={entry.disabled}
+                        title={entry.title || entry.label}
+                        onClick={() => {
+                          if (entry.submenu) {
+                            setToolbarMoreSubmenu((v) => (v === id ? null : id))
+                            return
+                          }
+                          entry.onSelect?.()
+                          setToolbarMoreOpen(false)
+                          setToolbarMoreSubmenu(null)
+                        }}
+                      >
+                        {entry.icon}
+                        <span className="truncate">{entry.label}</span>
+                        {entry.submenu && (
+                          <ChevronRight
+                            size={12}
+                            className={`ml-auto shrink-0 opacity-60 transition-transform ${submenuOpen ? 'rotate-90' : ''}`}
+                          />
+                        )}
+                      </button>
+                      {entry.submenu && submenuOpen && entry.submenu.map((sub) => (
+                        <button
+                          key={sub.label}
+                          onClick={() => {
+                            sub.onSelect()
+                            setToolbarMoreOpen(false)
+                            setToolbarMoreSubmenu(null)
+                          }}
+                          className="w-full text-left pl-8 pr-3 py-1.5 text-xs flex items-center gap-2 text-foreground hover:bg-muted hover:text-primary transition-colors"
+                        >
+                          {sub.icon}
+                          <span className="truncate">{sub.label}</span>
+                        </button>
+                      ))}
+                    </div>
+                  )
+                })}
+              </div>
+            )}
+          </div>
+        )}
       </div>
 
 
@@ -3425,7 +3774,7 @@ export function MapPage() {
           </div>
           <button
             onClick={() => {
-              setToolbarPrefs({ order: [...TOOLBAR_ITEM_IDS], showLabels: false, __v: 2 })
+              setToolbarPrefs({ order: [...TOOLBAR_ITEM_IDS], showLabels: true, __v: 3 })
               setToolbarMenu(null)
             }}
             className="w-full text-left px-3 py-1.5 text-xs text-foreground hover:bg-muted hover:text-primary transition-colors border-t border-border/60"

@@ -148,8 +148,10 @@ export interface LayerFileOption {
   dataId: string
   sourceType?: 'mapinfo' | 'excel'
   geometryType?: 'point' | 'sector' | 'polygon'
-  /** 是否可编辑（仅 .tab 源的 MapInfo 图层支持绘制/保存） */
+  /** 是否可编辑（TAB / Shapefile / GeoJSON 源图层支持绘制/保存） */
   editable?: boolean
+  /** 图层源格式（'tab' | 'shp' | 'geojson'）：仅 TAB 支持增量保存，其余走整层保存 */
+  format?: string
   /** 是否本工具新建的图层（metadata.editable=true）；数据管理导入的文件为 false，导出走原始文件下载 */
   toolCreated?: boolean
   /** 图层文件自带的默认样式（用于自定义设置弹窗初始化，还原 tab/mif/kml 默认配置） */

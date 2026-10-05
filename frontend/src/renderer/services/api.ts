@@ -1098,8 +1098,9 @@ export const layerApi = {
     return apiClient.get(`/data/${dataId}/layers/${layerId}/columns`, { timeout: 600000 })
   },
 
-  // 新建空 TAB 图层（默认混合图层，可绘制点/线/面；geometryType 可选）
-  createLayer: async (payload: { name: string; geometryType?: string }): Promise<ApiResponse<{ data_id: string; layer_id: string; name: string }>> => {
+  // 新建空图层（format: tab/shp/geojson；geometryType 可选，默认 mixed。
+  // Shapefile 单文件只支持一种几何类型，mixed 会被后端拒绝）
+  createLayer: async (payload: { name: string; geometryType?: string; format?: string }): Promise<ApiResponse<{ data_id: string; layer_id: string; name: string; geometry_type?: string; format?: string }>> => {
     return apiClient.post('/data/map/layers/create', payload)
   },
 

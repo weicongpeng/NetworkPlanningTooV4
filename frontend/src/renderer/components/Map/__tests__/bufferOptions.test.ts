@@ -1,7 +1,8 @@
 /**
  * 缓冲区保存目标构建纯函数测试
  *
- * 覆盖：固定首项装饰图层；仅 editable=true 且 polygon/mixed 类型的 TAB 图层进入；
+ * 覆盖：固定首项装饰图层；仅 editable=true、format='tab' 且 polygon/mixed 类型的
+ * 图层进入（缓冲区写入走后端增量保存，目前只支持 TAB）；
  * mapinfo 目标 ref 携带 dataId/layerId；key 唯一。
  */
 import { describe, it, expect } from 'vitest'
@@ -9,12 +10,15 @@ import { buildBufferTargetOptions } from '../bufferOptions'
 import type { LayerFileOption } from '../LayerControl'
 
 const layerFiles: LayerFileOption[] = [
-  { id: 'poly-editable', name: '可画面', type: 'polygon', visible: true, dataId: 'd1', editable: true },
-  { id: 'mixed-editable', name: '可混合', type: 'mixed', visible: true, dataId: 'd2', editable: true },
-  { id: 'point-editable', name: '可画点', type: 'point', visible: true, dataId: 'd3', editable: true },
-  { id: 'line-editable', name: '可画线', type: 'line', visible: true, dataId: 'd4', editable: true },
-  { id: 'poly-imported', name: '导入面', type: 'polygon', visible: true, dataId: 'd5', editable: false },
-  { id: 'poly-no-flag', name: '无标记面', type: 'polygon', visible: true, dataId: 'd6' },
+  { id: 'poly-editable', name: '可画面', type: 'polygon', visible: true, dataId: 'd1', editable: true, format: 'tab' },
+  { id: 'mixed-editable', name: '可混合', type: 'mixed', visible: true, dataId: 'd2', editable: true, format: 'tab' },
+  { id: 'point-editable', name: '可画点', type: 'point', visible: true, dataId: 'd3', editable: true, format: 'tab' },
+  { id: 'line-editable', name: '可画线', type: 'line', visible: true, dataId: 'd4', editable: true, format: 'tab' },
+  { id: 'poly-imported', name: '导入面', type: 'polygon', visible: true, dataId: 'd5', editable: false, format: 'tab' },
+  { id: 'poly-no-flag', name: '无标记面', type: 'polygon', visible: true, dataId: 'd6', format: 'tab' },
+  // 可编辑但非 TAB：缓冲区写入走增量保存，而增量保存只支持 TAB，不应列出
+  { id: 'shp-editable', name: 'SHP面', type: 'polygon', visible: true, dataId: 'd7', editable: true, format: 'shp' },
+  { id: 'geojson-editable', name: 'GeoJSON面', type: 'polygon', visible: true, dataId: 'd8', editable: true, format: 'geojson' },
 ]
 
 describe('buildBufferTargetOptions', () => {
@@ -44,6 +48,11 @@ describe('buildBufferTargetOptions', () => {
   it('editable 非 true 的图层排除', () => {
     expect(opts.some((o) => o.key === 'mapinfo:d5:poly-imported')).toBe(false)
     expect(opts.some((o) => o.key === 'mapinfo:d6:poly-no-flag')).toBe(false)
+  })
+
+  it('非 TAB 格式即使可编辑也排除（增量保存只支持 TAB）', () => {
+    expect(opts.some((o) => o.key === 'mapinfo:d7:shp-editable')).toBe(false)
+    expect(opts.some((o) => o.key === 'mapinfo:d8:geojson-editable')).toBe(false)
   })
 
   it('mapinfo 目标 ref 携带 dataId/layerId', () => {

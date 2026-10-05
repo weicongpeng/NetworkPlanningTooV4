@@ -218,8 +218,11 @@ function markChanged(ws: LayerWorkspace, editId: string | undefined): Record<str
  * 生成保存计划：
  * - 能增量则增量（有基底版本指纹 + 存在变更集），只回传变更要素与删除行号
  * - 否则整层保存（新建图层/无版本指纹/变更集缺失时，保证不丢改动）
+ *
+ * allowPatch=false 时强制整层保存：Shapefile/GeoJSON 的样式落在 .qml，后端增量
+ * 保存只支持 TAB，直接走整层避免每次都先吃一次 409 回退。
  */
-export function buildSavePlan(ws: LayerWorkspace): SavePlan {
+export function buildSavePlan(ws: LayerWorkspace, opts?: { allowPatch?: boolean }): SavePlan {
   const upserts: any[] = []
   const present = new Set<string>()
   for (const f of ws.features) {
@@ -239,7 +242,8 @@ export function buildSavePlan(ws: LayerWorkspace): SavePlan {
     return { mode: 'none', changes: 0, payload: {} }
   }
 
-  const canPatch = !!ws.version
+  const canPatch = opts?.allowPatch !== false
+    && !!ws.version
     && Object.keys(ws.baseRows).length > 0
     && upserts.length + deletes.length > 0
     && upserts.length <= MAX_PATCH_CHANGES

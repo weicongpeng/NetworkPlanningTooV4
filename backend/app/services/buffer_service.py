@@ -29,7 +29,7 @@ from app.services.attribute_join_service import (
     load_layer_features, _feature_display, _noop_progress,
 )
 from app.services.layer_edit_service import (
-    _resolve_layer_target, _read_tab_gdf, layer_version,
+    _layer_fmt, _resolve_layer_target, _read_tab_gdf, layer_version,
 )
 from app.services.layer_patch_service import apply_layer_patch, LayerVersionConflict
 from app.utils.coordinate_transformer import CoordinateTransformer
@@ -283,6 +283,11 @@ def run_buffer(cfg: Dict[str, Any],
 
     data_id, layer_id = target["dataId"], target["layerId"]
     _, _, tab_path, _ = _resolve_layer_target(data_id, layer_id)
+    # 缓冲区写入走增量保存，而增量保存只支持 TAB（SHP/GeoJSON 的样式在 .qml）。
+    # 这里显式拒绝，避免被 apply_layer_patch 的版本冲突兜成"图层刚被修改，请重试"
+    # 这种误导性提示（用户重试多少次都不会成功）。
+    if _layer_fmt(tab_path) != "tab":
+        raise ValueError("缓冲区目前只支持写入 MapInfo TAB 图层")
     base_gdf = _read_tab_gdf(tab_path)
     # 空 TAB（新建无要素）读回可能没有 geometry 列，此时有效行数为 0
     if "geometry" in base_gdf.columns:

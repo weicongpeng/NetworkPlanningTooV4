@@ -23,7 +23,7 @@ from shapely import wkb
 
 from app.core.config import settings
 from app.services.tab_io import (
-    write_mapinfo_tab, verify_tab_readable, remove_tab_stem, _tab_stem_files,
+    write_mapinfo_tab, verify_tab_readable, remove_tab_stem,
     build_field_data, _postprocess_tab,
 )
 from app.services.layer_service import (
@@ -31,11 +31,15 @@ from app.services.layer_service import (
     hex_to_mapinfo_color, is_no_color, tab_opacity_brush_pattern,
 )
 from app.services.mapinfo_service import (
+    FIELD_MAP_TAIL,
     GeometryType,
     MapInfoParser,
     _save_layer_metadata,
     clear_layer_cache,
+    field_map_path,
     layer_cache_dir,
+    read_field_map,
+    write_field_map,
 )
 from app.services.ogr_style_reader import read_feature_style_strings
 from app.services.tab_style_writer import convert_mif_to_tab
@@ -57,6 +61,82 @@ _INVALID_FILENAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 _DEFAULT_ATTR_COLUMN = "name"
 
 
+# ESRI Shapefile 的 DBF 字段名上限。超限本身不报错，但截断到多字节字符中间会写坏
+# 整个 .dbf（读回直接 UnicodeDecodeError），故必须按 UTF-8 边界截断。
+_DBF_FIELD_NAME_MAX_BYTES = 10
+
+
+def _dbf_safe_name(name: str, index: int = 0) -> str:
+    """DBF 字段名净化：MapInfo 清洗（非法字符/数字开头）后按 UTF-8 字节截断到 ≤10。
+
+    中文一字 3 字节，故最多 3 字；已合规的名字原样返回，保证导入的 Shapefile 往返不变。
+    """
+    return _truncate_bytes(_sanitize_field_name(name, index), _DBF_FIELD_NAME_MAX_BYTES)
+
+
+# ---------------------------------------------------------------- 图层格式
+
+# 可编辑保存的图层格式（后缀 → 格式名）。MapInfo TAB 之外的格式在保存链路上
+# 只差"读旧 schema / 写盘 / 打包"三步，其余（坐标逆转换、属性对齐、元数据刷新、
+# 缓存失效）完全复用。
+_LAYER_FMT_BY_SUFFIX = {
+    ".tab": "tab",
+    ".shp": "shp",
+    ".geojson": "geojson",
+    ".json": "geojson",
+}
+
+# 各格式同 stem 的图层文件后缀（备份/回滚/打包用；均不含前导点，按小写比较）
+_LAYER_STEM_SUFFIXES = {
+    "tab": ("tab", "dat", "id", "map", "ind"),
+    "shp": ("shp", "shx", "dbf", "prj", "cpg", "qml"),
+}
+
+# 字段名映射 sidecar 的完整后缀（DBF 字段名转写后记录原名，重新导入时还原显示名）
+_FIELD_MAP_TAIL = "nptfields.json"
+
+
+def _layer_fmt(path: Path) -> Optional[str]:
+    """源文件路径 → 图层格式名；不支持编辑保存的格式返回 None。"""
+    return _LAYER_FMT_BY_SUFFIX.get(path.suffix.lower())
+
+
+def _layer_stem_suffixes(source_path: Path, fmt: str) -> tuple:
+    """同 stem 需一起管理的后缀（覆写删除 / 备份回滚 / 打包）。
+
+    GeoJSON 按源文件自身后缀取（.geojson 与 .json 并存时不能互相牵连），
+    Shapefile 则必须整套 .shp/.shx/.dbf/.prj/.cpg 一起换，残留旧 .dbf 会导致
+    新几何配旧属性。
+    """
+    if fmt == "geojson":
+        return (source_path.suffix.lower().lstrip("."), "qml")
+    return _LAYER_STEM_SUFFIXES.get(fmt, ())
+
+
+def _layer_stem_files(source_path: Path, fmt: str) -> List[Path]:
+    """收集与 source_path 同 stem 的图层文件（数据文件 + 配套 + 样式 + sidecar）。
+
+    按 `{stem}.` 前缀匹配而非 Path.stem：sidecar 名形如 `a.nptfields.json`，
+    其 stem 是 `a.nptfields`，用 stem 相等会漏掉。大小写不敏感，兼容大写后缀。
+    """
+    suffix_set = _layer_stem_suffixes(source_path, fmt)
+    prefix = source_path.stem.lower() + "."
+    results: List[Path] = []
+    try:
+        for f in source_path.parent.iterdir():
+            if not f.is_file():
+                continue
+            name = f.name.lower()
+            if not name.startswith(prefix):
+                continue
+            tail = name[len(prefix):]
+            if tail in suffix_set or tail == FIELD_MAP_TAIL:
+                results.append(f)
+    except OSError:
+        pass
+    return results
+
+
 def _sanitize_layer_name(name: str) -> str:
     """清洗图层文件名：去非法字符、空白收敛、按 UTF-8 字节截断 ≤100。"""
     name = (name or "").strip()
@@ -71,12 +151,14 @@ def _dir_size(path: Path) -> int:
     return sum(f.stat().st_size for f in path.glob("*") if f.is_file())
 
 
-def create_empty_tab_layer(name: str, geometry_type: str = "mixed",
-                           user_id: int = 1, city: Optional[str] = None,
-                           operator: Optional[str] = None) -> Dict[str, Any]:
-    """创建一个 0 要素的 MapInfo TAB 图层并注册到索引。
+def create_empty_layer(name: str, geometry_type: str = "mixed", fmt: str = "tab",
+                       user_id: int = 1, city: Optional[str] = None,
+                       operator: Optional[str] = None) -> Dict[str, Any]:
+    """创建一个 0 要素的图层并注册到索引（MapInfo TAB / ESRI Shapefile / GeoJSON）。
 
-    geometry_type: 'mixed'（默认，同一图层可绘制点/线/面）或 'point'/'line'/'polygon'。
+    geometry_type: 'mixed'（同一图层可绘制点/线/面）或 'point'/'line'/'polygon'。
+      Shapefile 单文件只能存一种几何类型，故 fmt='shp' 时不允许 'mixed'。
+    fmt: 'tab'（默认）/ 'shp' / 'geojson'。
     city/operator: 数据所属组（地市+运营商）归属快照，取自创建者。
     Returns:
         {"data_id", "layer_id", "name"}
@@ -85,20 +167,30 @@ def create_empty_tab_layer(name: str, geometry_type: str = "mixed",
     geom_key = (geometry_type or "mixed").lower().strip()
     if geom_key not in _GEOM_MAP:
         raise ValueError(f"不支持的几何类型: {geometry_type}（应为 mixed/point/line/polygon）")
+    if fmt not in ("tab", "shp", "geojson"):
+        raise ValueError(f"不支持的图层格式: {fmt}（应为 tab/shp/geojson）")
+    if fmt == "shp" and geom_key == "mixed":
+        raise ValueError("Shapefile 单文件只支持一种几何类型，请选择点/线/面之一")
     ogr_geom_type, geom_enum = _GEOM_MAP[geom_key]
 
     data_id = str(uuid.uuid4())
     data_dir = settings.DATA_DIR / data_id
     data_dir.mkdir(parents=True, exist_ok=True)
-    tab_path = data_dir / f"{safe_name}.tab"
+    source_path = data_dir / f"{safe_name}.{'geojson' if fmt == 'geojson' else fmt}"
 
-    # 0 要素 + 默认 name 属性列（U50），显式几何类型（mixed=Unknown，支持后续写入点/线/面）
+    # 0 要素 + 默认 name 属性列（.dat/.dbf 至少需 1 个字段，否则无法读回），
+    # 显式几何类型（TAB 的 mixed=Unknown，支持后续写入点/线/面）
     empty_gdf = gpd.GeoDataFrame(
         {_DEFAULT_ATTR_COLUMN: pd.Series([], dtype="object")},
         geometry=gpd.GeoSeries([], crs="EPSG:4326"),
     )
-    write_mapinfo_tab(empty_gdf, tab_path, geometry_type=ogr_geom_type)
-    verify_tab_readable(tab_path, 0)
+    if fmt == "tab":
+        write_mapinfo_tab(empty_gdf, source_path, geometry_type=ogr_geom_type)
+    elif fmt == "shp":
+        empty_gdf.to_file(source_path, driver="ESRI Shapefile", encoding="utf-8")
+    else:
+        empty_gdf.to_file(source_path, driver="GeoJSON")
+    verify_tab_readable(source_path, 0, label=fmt.upper())
 
     layer_id = data_id  # 单图层约定：layer_id 与 data_id 一致（同 parse_mapinfo_files 单文件）
     # 混合图层无单一几何默认样式（编辑绘制时按点/线/面分别取 drawStyle）；单一几何给推断样式
@@ -109,9 +201,9 @@ def create_empty_tab_layer(name: str, geometry_type: str = "mixed",
         "type": geom_key,  # 'mixed' / 'point' / 'line' / 'polygon'
         "feature_count": 0,
         "metadata": {
-            "source_file": str(tab_path),
+            "source_file": str(source_path),
             "feature_count": 0,
-            "editable": True,  # 标记为工具内新建、可编辑的 TAB 图层
+            "editable": True,  # 标记为工具内新建、可编辑的图层
         },
         "defaultStyle": default_style,
     }
@@ -125,7 +217,7 @@ def create_empty_tab_layer(name: str, geometry_type: str = "mixed",
     from app.services.data_service import data_service
     data_service.index[data_id] = {
         "id": data_id,
-        "name": f"{safe_name}.tab",
+        "name": source_path.name,
         "type": "map",
         "subType": "mapinfo",
         "user_id": user_id,
@@ -148,7 +240,7 @@ def create_empty_tab_layer(name: str, geometry_type: str = "mixed",
         city=city,
         operator=operator,
         name=safe_name,
-        file_path=str(tab_path),
+        file_path=str(source_path),
         layer_type=geom_key,
         geometry_type=geom_key,
         feature_count=0,
@@ -157,7 +249,17 @@ def create_empty_tab_layer(name: str, geometry_type: str = "mixed",
     )
 
     clear_layer_cache(data_id)
-    return {"data_id": data_id, "layer_id": layer_id, "name": safe_name}
+    # geometry_type/format 一并返回：前端据此初始化编辑工作集的几何类型，
+    # 否则新建的点/线/面 Shapefile 会被当成混合图层（绘制出异类几何后必然保存失败）
+    return {"data_id": data_id, "layer_id": layer_id, "name": safe_name,
+            "geometry_type": geom_key, "format": fmt}
+
+
+def create_empty_tab_layer(name: str, geometry_type: str = "mixed",
+                           user_id: int = 1, city: Optional[str] = None,
+                           operator: Optional[str] = None) -> Dict[str, Any]:
+    """新建 MapInfo TAB 图层（create_empty_layer 的 TAB 快捷方式，保留既有调用方）。"""
+    return create_empty_layer(name, geometry_type, "tab", user_id, city, operator)
 
 
 # 图层类型 → OGR geometry_type（保存重写用；mixed=混合几何用 Unknown）
@@ -235,10 +337,12 @@ def build_data_layers_zip(data_id: str) -> tuple:
 
 
 def build_layer_zip(data_id: str, layer_id: str) -> tuple:
-    """把图层的 MapInfo 全套文件（.tab/.dat/.id/.map）打包为 zip。
+    """把图层全套文件打包为 zip（TAB 五件套 / Shapefile 六件套 / GeoJSON 双件）。
+
+    各格式都带上同 stem 的 .qml 样式与字段名映射 sidecar，重新导入才能还原配色与列名。
 
     Returns:
-        (zip_bytes, download_filename)  # 下载名 {图层名}.tab.zip
+        (zip_bytes, download_filename)  # 下载名 {图层名}.{格式}.zip
     """
     import io as _io
     import zipfile as _zipfile
@@ -250,18 +354,19 @@ def build_layer_zip(data_id: str, layer_id: str) -> tuple:
     if entry is None:
         raise ValueError(f"未找到图层: {layer_id}")
     source_file = entry.get("metadata", {}).get("source_file")
-    tab_path = Path(source_file) if source_file else None
-    if tab_path is None or tab_path.suffix.lower() != ".tab" or not tab_path.exists():
-        raise FileNotFoundError(f"TAB 源文件不存在: {tab_path}")
+    source_path = Path(source_file) if source_file else None
+    fmt = _layer_fmt(source_path) if source_path else None
+    if source_path is None or fmt is None or not source_path.exists():
+        raise FileNotFoundError(f"图层源文件不存在: {source_path}")
 
     buf = _io.BytesIO()
     with _zipfile.ZipFile(buf, "w", _zipfile.ZIP_DEFLATED) as zf:
-        # 大小写不敏感收集同 stem 配套文件（用户上传常见 .TAB/.DAT/.MAP 大写后缀）
-        for f in _tab_stem_files(tab_path):
+        # 大小写不敏感收集同 stem 的配套文件与 sidecar（用户上传常见大写后缀）
+        for f in _layer_stem_files(source_path, fmt):
             if f.exists() and f.is_file():
                 zf.write(f, arcname=f.name)
-    safe_name = _sanitize_layer_name(entry.get("name") or tab_path.stem)
-    return buf.getvalue(), f"{safe_name}.tab.zip"
+    safe_name = _sanitize_layer_name(entry.get("name") or source_path.stem)
+    return buf.getvalue(), f"{safe_name}.{source_path.suffix.lstrip('.').lower()}.zip"
 
 
 def _resolve_effective_type(declared_type: str, geoms: List[Any]) -> str:
@@ -293,6 +398,9 @@ _INTERNAL_FIELDS = {"_editId", "_style", "_nptSelectionId"}
 # 列名刻意避开样式列正则（*style*/*pen*/*brush* 等），否则读取时会被吞进 _style。
 _STYLE_PERSIST_COL = "NPT_FEATSYM"    # _editStyle（要素级绘制样式）
 _META_PERSIST_COL = "NPT_FEATMETA"    # {_shape, _ellipse}（圆/椭圆元数据）
+# Shapefile 用的短列名（DBF 字段名上限 10 字节，12 字节的 NPT_FEATMETA 放不下）。
+# 圆/椭圆元数据不是样式、.qml 表达不了，只能落属性列，故保留这一处 DBF 例外。
+_META_PERSIST_COL_DBF = "NPT_FMETA"
 
 # 绘制样式输入键：这些键是前端绘制样式的载体（经 NPT_FEATSYM 持久化），
 # 不作为普通属性列扩展进 TAB schema
@@ -305,7 +413,7 @@ _STYLE_INPUT_KEYS = {
 
 
 def _read_tab_gdf(tab_path: Path, rows: Optional[int] = None) -> gpd.GeoDataFrame:
-    """读取 TAB 为 GeoDataFrame。
+    """读取图层源文件为 GeoDataFrame（TAB / Shapefile / GeoJSON 通用）。
 
     默认编码优先（GDAL 按 .tab 声明的 charset 解码）：项目写入的 TAB，.dat 实为 UTF-8
     而 .tab 声明 WindowsSimpChinese，显式传 encoding='gbk' 会把 UTF-8 字节静默解成乱码
@@ -315,9 +423,22 @@ def _read_tab_gdf(tab_path: Path, rows: Optional[int] = None) -> gpd.GeoDataFram
     """
     kwargs = {"rows": rows} if rows is not None else {}
     try:
-        return gpd.read_file(tab_path, **kwargs)
+        gdf = gpd.read_file(tab_path, **kwargs)
     except Exception:
-        return gpd.read_file(tab_path, encoding="gbk", **kwargs)
+        gdf = gpd.read_file(tab_path, encoding="gbk", **kwargs)
+    # Shapefile 的 DBF 字段名被转写过（≤10 字节），读回时还原为显示名，
+    # 否则保存按存储名对齐、属性框也会显示 F_3 这类转写名
+    return _apply_display_names(gdf, tab_path)
+
+
+def _apply_display_names(gdf: gpd.GeoDataFrame, source_path: Path) -> gpd.GeoDataFrame:
+    """按字段名映射 sidecar 把 DBF 存储名还原为显示名（无映射时原样返回）。"""
+    mapping = read_field_map(source_path)
+    if not mapping:
+        return gdf
+    reverse = {v: k for k, v in mapping.items()}
+    rename = {c: reverse[c] for c in gdf.columns if c in reverse}
+    return gdf.rename(columns=rename) if rename else gdf
 
 
 def _find_layer_entry(data_dir: Path, layer_id: str) -> Optional[Dict[str, Any]]:
@@ -374,22 +495,26 @@ def _dominant_kind(geoms: List[Any]) -> str:
     return max(counts.items(), key=lambda kv: kv[1])[0]
 
 
-def _backup_stem(tab_path: Path) -> Optional[Path]:
-    """备份 tab 同 stem 配套文件到临时目录，失败回滚用（大小写不敏感扫描）。"""
+def _backup_stem(source_path: Path, fmt: str) -> Optional[Path]:
+    """备份同 stem 的图层文件到临时目录，失败回滚用（大小写不敏感扫描）。"""
     import tempfile
-    backup_dir = Path(tempfile.mkdtemp(prefix="tab_edit_"))
-    for f in _tab_stem_files(tab_path):
+    backup_dir = Path(tempfile.mkdtemp(prefix="layer_edit_"))
+    for f in _layer_stem_files(source_path, fmt):
         if f.exists():
             shutil.copy2(f, backup_dir / f.name)
     return backup_dir
 
 
-def _restore_stem(backup_dir: Optional[Path], tab_path: Path) -> None:
+def _restore_stem(backup_dir: Optional[Path], source_path: Path, fmt: str) -> None:
     if not backup_dir or not backup_dir.exists():
         return
-    remove_tab_stem(tab_path)
+    for f in _layer_stem_files(source_path, fmt):
+        try:
+            f.unlink(missing_ok=True)
+        except OSError as e:
+            print(f"[LayerEdit] 回滚删除失败 {f}: {e}")
     for f in backup_dir.iterdir():
-        shutil.copy2(f, tab_path.parent / f.name)
+        shutil.copy2(f, source_path.parent / f.name)
     shutil.rmtree(backup_dir, ignore_errors=True)
 
 
@@ -439,9 +564,10 @@ def _remove_disk_cache(data_dir: Path, layer_id: str) -> None:
 
 
 def _resolve_layer_target(data_id: str, layer_id: str) -> tuple:
-    """解析图层保存目标：(data_dir, entry, tab_path, entry_type)。
+    """解析图层保存目标：(data_dir, entry, source_path, entry_type)。
 
-    只支持 MapInfo TAB（MIF/KML 不支持编辑保存）。校验失败抛 ValueError/FileNotFoundError。
+    支持 MapInfo TAB 与 ESRI Shapefile / GeoJSON（MIF/KML 不支持编辑保存）。
+    校验失败抛 ValueError/FileNotFoundError。
     """
     data_dir = settings.DATA_DIR / data_id
     if not data_dir.exists():
@@ -452,21 +578,21 @@ def _resolve_layer_target(data_id: str, layer_id: str) -> tuple:
         raise ValueError(f"未找到图层: {layer_id}")
 
     source_file = entry.get("metadata", {}).get("source_file")
-    tab_path = Path(source_file) if source_file else None
-    if tab_path is None or tab_path.suffix.lower() != ".tab":
-        raise ValueError("仅支持保存 MapInfo TAB 图层（MIF/KML 暂不支持编辑保存）")
-    if not tab_path.exists():
-        raise FileNotFoundError(f"TAB 文件不存在: {tab_path}")
+    source_path = Path(source_file) if source_file else None
+    if source_path is None or _layer_fmt(source_path) is None:
+        raise ValueError("仅支持保存 MapInfo TAB / ESRI Shapefile / GeoJSON 图层（MIF/KML 暂不支持编辑保存）")
+    if not source_path.exists():
+        raise FileNotFoundError(f"图层源文件不存在: {source_path}")
 
     entry_type = entry.get("type", "point")
     if not _OGR_GEOM_BY_ENTRY.get(entry_type):
         raise ValueError(f"未知图层几何类型: {entry_type}")
-    return data_dir, entry, tab_path, entry_type
+    return data_dir, entry, source_path, entry_type
 
 
-def layer_version(tab_path: Path, layer_id: str) -> str:
+def layer_version(source_path: Path, layer_id: str) -> str:
     """图层版本指纹（与图层数据端点 ETag 同构）："<layer_id>-<源文件 mtime>"。"""
-    return f'"{layer_id}-{tab_path.stat().st_mtime}"'
+    return f'"{layer_id}-{source_path.stat().st_mtime}"'
 
 
 def _coerce_column(series: pd.Series, old_dtype: Any) -> pd.Series:
@@ -728,13 +854,69 @@ def read_tab_native_styles(tab_path: Path) -> List[Optional[Dict[str, Any]]]:
     return [MapInfoParser._parse_ogr_style_string(s) if s else None for s in raws]
 
 
+# DBF 文本字段的字符数上限，超出会被驱动静默丢弃
+_DBF_MAX_TEXT_CHARS = 254
+
+
+def _dbf_text(v: Any) -> Any:
+    """DBF 文本值截断到 254 字符（DBF 字段宽度上限）。"""
+    return v[:_DBF_MAX_TEXT_CHARS] if isinstance(v, str) and len(v) > _DBF_MAX_TEXT_CHARS else v
+
+
+def _remove_stem_for_write(source_path: Path, fmt: str) -> None:
+    """覆写前删除同 stem 的旧图层文件，避免残留配套文件与新数据不一致。"""
+    for f in _layer_stem_files(source_path, fmt):
+        try:
+            f.unlink(missing_ok=True)
+        except OSError as e:
+            print(f"[LayerEdit] 删除旧图层文件失败 {f}: {e}")
+
+
+def _write_shapefile(gdf: gpd.GeoDataFrame, source_path: Path, kind: str,
+                     feature_styles: Optional[List[Optional[Dict[str, Any]]]]) -> None:
+    """写 ESRI Shapefile：字段名净化 + DBF 文本截断 + 同 stem .qml 样式。
+
+    DBF 字段名上限 10 字节，且截断到多字节字符中间会写坏整个 .dbf（读回
+    UnicodeDecodeError），故超限名转写为安全名并登记映射，读回时还原显示名。
+    """
+    from app.services.qml_style_writer import write_layer_qml
+
+    display_cols = [str(c) for c in gdf.columns if c != "geometry"]
+    storage_cols = _dedupe_field_names(
+        [_dbf_safe_name(c, i) for i, c in enumerate(display_cols)]
+    )
+    mapping = {d: s for d, s in zip(display_cols, storage_cols) if d != s}
+    gdf = gdf.rename(columns=dict(zip(display_cols, storage_cols)))
+
+    for c in storage_cols:
+        if gdf[c].dtype == object:
+            gdf[c] = gdf[c].map(_dbf_text)
+
+    _remove_stem_for_write(source_path, "shp")
+    gdf.to_file(source_path, driver="ESRI Shapefile", encoding="utf-8")
+    write_layer_qml(source_path.with_suffix(".qml"), kind, feature_styles or [])
+    write_field_map(source_path, mapping)
+
+
+def _write_geojson(gdf: gpd.GeoDataFrame, source_path: Path, kind: str,
+                   feature_styles: Optional[List[Optional[Dict[str, Any]]]]) -> None:
+    """写 GeoJSON：无字段名/几何类型限制，样式写同 stem .qml（QGIS 打开即见配色）。"""
+    from app.services.qml_style_writer import write_layer_qml
+
+    _remove_stem_for_write(source_path, "geojson")
+    gdf.to_file(source_path, driver="GeoJSON")
+    write_layer_qml(source_path.with_suffix(".qml"), kind, feature_styles or [])
+
+
 def _write_layer_gdf(*, data_id: str, data_dir: Path, tab_path: Path, layer_id: str,
                      entry: Dict[str, Any], entry_type: str,
                      gdf: gpd.GeoDataFrame, geoms: List[Any],
                      user_id: int,
-                     feature_styles: Optional[List[Optional[Dict[str, Any]]]] = None) -> Dict[str, Any]:
-    """整层重写 TAB（原子写 + 混合几何降级）+ 校验 + 元数据刷新 + 缓存失效。
+                     feature_styles: Optional[List[Optional[Dict[str, Any]]]] = None,
+                     fmt: str = "tab") -> Dict[str, Any]:
+    """整层重写图层文件（原子写 + 混合几何降级）+ 校验 + 元数据刷新 + 缓存失效。
 
+    fmt: tab / shp / geojson（默认 tab，向后兼容既有调用）。
     整层保存与增量保存共用此收尾：调用方负责把要素集成为 gdf。
     """
     # 实际几何类型：混合（含多种几何）或与图层声明类型不符时，用实际类型写并升级类型
@@ -742,18 +924,41 @@ def _write_layer_gdf(*, data_id: str, data_dir: Path, tab_path: Path, layer_id: 
     ogr_geom = _OGR_GEOM_BY_ENTRY.get(entry_type, "Unknown")
     entry["type"] = entry_type
 
-    # 原子写（先备份，失败回滚）
-    # GDAL MapInfo 驱动按小写后缀落盘：源文件为大写 .TAB 时改写为小写路径，
-    # 避免"写到 .TAB / 读到 .tab"的路径漂移（保存后读回 404）。
-    if tab_path.suffix != '.tab':
-        tab_path = tab_path.with_suffix('.tab')
-    backup = _backup_stem(tab_path)
     skipped = 0
     total_in = len(geoms)
     cur_styles = feature_styles
 
+    # Shapefile 单文件只能存一种几何类型（混写直接报错）。这里不做 TAB 那种"写失败再
+    # 降级"——SHP 必然失败，提前按声明类型（mixed 时取占比最高）过滤并明确报告跳过数，
+    # 避免把要素静默写丢。
+    if fmt == "shp":
+        target = entry_type if entry_type != "mixed" else _dominant_kind(geoms)
+        if target:
+            keep_idx = [i for i, g in enumerate(geoms) if _geom_kind(g) == target]
+            if len(keep_idx) != len(geoms):
+                skipped = len(geoms) - len(keep_idx)
+                gdf = gdf.iloc[keep_idx].copy()
+                geoms = [geoms[i] for i in keep_idx]
+                cur_styles = [cur_styles[i] if cur_styles else None for i in keep_idx]
+            entry_type = target
+            ogr_geom = _OGR_GEOM_BY_ENTRY.get(target, "Unknown")
+            entry["type"] = target
+
+    # 原子写（先备份，失败回滚）
+    # GDAL 驱动按小写后缀落盘：源文件为大写 .TAB/.SHP 时改写为小写路径，
+    # 避免"写到 .TAB / 读到 .tab"的路径漂移（保存后读回 404）。
+    if tab_path.suffix != f".{fmt}" and fmt != "geojson":
+        tab_path = tab_path.with_suffix(f".{fmt}")
+    backup = _backup_stem(tab_path, fmt)
+
     def _do_write(cur_gdf: gpd.GeoDataFrame, cur_ogr: str,
                   styles: Optional[List[Optional[Dict[str, Any]]]]) -> None:
+        if fmt == "shp":
+            _write_shapefile(cur_gdf, tab_path, entry_type, styles)
+            return
+        if fmt == "geojson":
+            _write_geojson(cur_gdf, tab_path, entry_type, styles)
+            return
         # 有任一样式信息时走带样式 MIF 中转；转换失败回退普通 pyogrio 写入（数据不丢）
         if styles and any(s is not None for s in styles):
             try:
@@ -767,11 +972,11 @@ def _write_layer_gdf(*, data_id: str, data_dir: Path, tab_path: Path, layer_id: 
     try:
         try:
             _do_write(gdf, ogr_geom, cur_styles)
-            verify_tab_readable(tab_path, len(geoms))
+            verify_tab_readable(tab_path, len(geoms), label=fmt.upper())
         except Exception as first_err:
             # MapInfo TAB 不支持混合几何（如把基站点粘贴到面图层）。此时按占比最高的
             # 几何类型重写并跳过不匹配的要素，避免整层保存失败导致粘贴结果丢失。
-            if entry_type != "mixed":
+            if fmt != "tab" or entry_type != "mixed":
                 raise
             dom = _dominant_kind(geoms)
             if not dom:
@@ -786,10 +991,10 @@ def _write_layer_gdf(*, data_id: str, data_dir: Path, tab_path: Path, layer_id: 
             entry_type = dom
             entry["type"] = dom
             _do_write(gdf, _OGR_GEOM_BY_ENTRY.get(dom, "Unknown"), cur_styles)
-            verify_tab_readable(tab_path, len(geoms))
+            verify_tab_readable(tab_path, len(geoms), label=fmt.upper())
             skipped = total_in - len(geoms)
     except Exception:
-        _restore_stem(backup, tab_path)
+        _restore_stem(backup, tab_path, fmt)
         raise
     finally:
         if backup and backup.exists():
@@ -854,6 +1059,11 @@ def save_layer_geojson(data_id: str, layer_id: str, geojson: Dict[str, Any],
         {"success": True, "feature_count": N}
     """
     data_dir, entry, tab_path, entry_type = _resolve_layer_target(data_id, layer_id)
+    fmt = _layer_fmt(tab_path) or "tab"
+    # Shapefile / GeoJSON 的样式落在同 stem .qml，不写 NPT_FEATSYM 列（DBF 字段名上限
+    # 也放不下 12 字节的列名）；圆的元数据 .qml 表达不了，仍走属性列但用 ≤10 字节名。
+    style_col = None if fmt != "tab" else _STYLE_PERSIST_COL
+    meta_col = _META_PERSIST_COL if fmt == "tab" else _META_PERSIST_COL_DBF
 
     # 1. 读旧 schema（权威）：属性列与 dtype（GBK 失败回退默认编码）。
     # 只取首行即可（GDAL 按列类型给 dtype），避免大图层保存时整表读取的额外耗时。
@@ -864,7 +1074,7 @@ def save_layer_geojson(data_id: str, layer_id: str, geojson: Dict[str, Any],
         if internal in attr_cols:
             attr_cols.remove(internal)
     # 样式持久化列不走通用属性对齐（前端属性里是还原后的内部字段），单独序列化
-    for c in (_STYLE_PERSIST_COL, _META_PERSIST_COL):
+    for c in (_STYLE_PERSIST_COL, _META_PERSIST_COL, _META_PERSIST_COL_DBF):
         if c in attr_cols:
             attr_cols.remove(c)
 
@@ -875,7 +1085,9 @@ def save_layer_geojson(data_id: str, layer_id: str, geojson: Dict[str, Any],
     features = geojson.get("features", []) if isinstance(geojson, dict) else []
     new_cols: List[str] = []
     seen_cols = set(attr_cols)
-    reserved = set(_INTERNAL_FIELDS) | {_STYLE_PERSIST_COL, _META_PERSIST_COL} | _STYLE_INPUT_KEYS
+    reserved = (set(_INTERNAL_FIELDS)
+                | {_STYLE_PERSIST_COL, _META_PERSIST_COL, _META_PERSIST_COL_DBF}
+                | _STYLE_INPUT_KEYS)
     for f in features:
         props = f.get("properties") or {}
         for k in props.keys():
@@ -932,10 +1144,12 @@ def save_layer_geojson(data_id: str, layer_id: str, geojson: Dict[str, Any],
         attr_cols = [_DEFAULT_ATTR_COLUMN]
 
     # 编辑样式持久化列：任一要素携带时才新增列（旧图层无样式列不受影响）
-    if any(sym_vals):
-        data[_STYLE_PERSIST_COL] = pd.Series(sym_vals, dtype="object")
+    # 非 TAB 格式不写 _STYLE_PERSIST_COL：样式已由同 stem .qml 承载，重复落列只会
+    # 在 DBF 里挤进一个被截断的列名并与 .qml 形成两份真相。
+    if any(sym_vals) and style_col:
+        data[style_col] = pd.Series(sym_vals, dtype="object")
     if any(meta_vals):
-        data[_META_PERSIST_COL] = pd.Series(meta_vals, dtype="object")
+        data[meta_col] = pd.Series(meta_vals, dtype="object")
 
     geometry = gpd.GeoSeries(geoms, crs="EPSG:4326") if geoms else gpd.GeoSeries([], crs="EPSG:4326")
     gdf = gpd.GeoDataFrame(data, geometry=geometry, crs="EPSG:4326")
@@ -943,7 +1157,7 @@ def save_layer_geojson(data_id: str, layer_id: str, geojson: Dict[str, Any],
     result = _write_layer_gdf(
         data_id=data_id, data_dir=data_dir, tab_path=tab_path, layer_id=layer_id,
         entry=entry, entry_type=entry_type, gdf=gdf, geoms=geoms, user_id=user_id,
-        feature_styles=feature_styles,
+        feature_styles=feature_styles, fmt=fmt,
     )
     result["mode"] = "full"
     return result

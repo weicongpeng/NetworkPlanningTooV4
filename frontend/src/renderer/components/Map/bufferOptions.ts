@@ -13,9 +13,12 @@ export interface BufferTargetOption {
 }
 
 /**
- * 保存目标候选：装饰图层（固定首项）+ 本工具新建的可写 TAB 中
+ * 保存目标候选：装饰图层（固定首项）+ 可写的 TAB 图层中
  * 几何类型为 polygon/mixed 的图层（点/线型 TAB 无法容纳缓冲多边形）。
  * 地理化数据 excel 不可写，不列入。
+ *
+ * 限定 format === 'tab'：缓冲区写入走后端增量保存，而增量保存目前只支持 TAB
+ * （Shapefile/GeoJSON 的样式落在 .qml）。列出它们只会在保存时失败。
  */
 export function buildBufferTargetOptions(
   layerFiles: LayerFileOption[],
@@ -25,6 +28,7 @@ export function buildBufferTargetOptions(
   ]
   for (const f of layerFiles) {
     if (f.editable !== true) continue
+    if (f.format !== 'tab') continue
     if (f.type !== 'polygon' && f.type !== 'mixed') continue
     out.push({
       key: `mapinfo:${f.dataId}:${f.id}`,

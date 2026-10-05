@@ -313,3 +313,438 @@ def test_layer_default_style_fallback_per_layer():
     c = _palette_color("站点图层")
     assert c == _palette_color("站点图层")
     assert len(c) == 7 and c.startswith("#")
+
+
+# ---------------------------------------------------------------------------
+# Shapefile(.shp) / GeoJSON 导入
+# ---------------------------------------------------------------------------
+
+QML_MARKER_CATEGORIZED = """<!DOCTYPE qgis PUBLIC 'http://mrcc.com/qgis.dtd' 'SYSTEM'>
+<qgis version="3.28" styleCategories="Symbology">
+  <renderer-v2 type="categorizedSymbol" attr="TYPE" symbollevels="0" forceraster="0">
+    <categories>
+      <category value="宏站" symbol="0" label="宏站" render="true"/>
+      <category value="微站" symbol="1" label="微站" render="true"/>
+    </categories>
+    <symbols>
+      <symbol name="0" type="marker" alpha="1">
+        <layer class="SimpleMarker" pass="0" locked="0" enabled="1">
+          <prop k="color" v="255,0,0,255"/>
+          <prop k="outline_color" v="0,0,0,255"/>
+          <prop k="outline_width" v="0.4"/>
+          <prop k="name" v="triangle"/>
+          <prop k="size" v="3"/>
+          <prop k="style" v="solid"/>
+        </layer>
+      </symbol>
+      <symbol name="1" type="marker" alpha="0.8">
+        <layer class="SimpleMarker" pass="0" locked="0" enabled="1">
+          <prop k="color" v="0,128,255,255"/>
+          <prop k="name" v="square"/>
+          <prop k="size" v="2"/>
+        </layer>
+      </symbol>
+    </symbols>
+  </renderer-v2>
+</qgis>
+"""
+
+QML_FILL_SINGLE = """<!DOCTYPE qgis PUBLIC 'http://mrcc.com/qgis.dtd' 'SYSTEM'>
+<qgis version="3.28">
+  <renderer-v2 type="singleSymbol">
+    <symbols>
+      <symbol name="0" type="fill" alpha="0.5">
+        <layer class="SimpleFill" pass="0">
+          <prop k="color" v="0,255,0,255"/>
+          <prop k="outline_color" v="255,0,0,255"/>
+          <prop k="outline_width" v="0.5"/>
+          <prop k="style" v="solid"/>
+          <prop k="outline_style" v="solid"/>
+        </layer>
+      </symbol>
+    </symbols>
+  </renderer-v2>
+</qgis>
+"""
+
+QML_LINE_SINGLE = """<qgis version="3.28" xmlns="http://qgis.org/x">
+  <renderer-v2 type="singleSymbol">
+    <symbols>
+      <symbol name="0" type="line" alpha="1">
+        <layer class="SimpleLine" pass="0">
+          <prop k="line_color" v="51,102,255,255"/>
+          <prop k="line_width" v="0.8"/>
+        </layer>
+      </symbol>
+    </symbols>
+  </renderer-v2>
+</qgis>
+"""
+
+
+def _write_shapefile(tmp_path, name, gdf):
+    """写出 shapefile（UTF-8 + .cpg），返回 .shp 路径。"""
+    shp = tmp_path / f"{name}.shp"
+    gdf.to_file(shp, driver="ESRI Shapefile", encoding="utf-8")
+    return shp
+
+
+def test_qgis_color_conversion():
+    """QGIS 颜色串（R,G,B[,A] / #hex）→ #rrggbb；完全透明返回 None"""
+    MapInfoParser = _try_import_mapinfo_parser()
+    assert MapInfoParser._qgis_color("255,0,0,255") == "#ff0000"
+    assert MapInfoParser._qgis_color("0,128,255,255") == "#0080ff"
+    assert MapInfoParser._qgis_color("0,0,0,0") is None      # 全透明
+    assert MapInfoParser._qgis_color("#abcdef") == "#abcdef"
+    assert MapInfoParser._qgis_color("255,0") is None        # 分量不足
+    assert MapInfoParser._qgis_color("") is None
+    assert MapInfoParser._qgis_color(None) is None
+
+
+def test_parse_qml_categorized_marker_styles(tmp_path):
+    """QGIS .qml categorizedSymbol → 按属性值逐要素配色（含点形状/大小换算）"""
+    _require_geopandas()
+    MapInfoParser = _try_import_mapinfo_parser()
+    import geopandas as gpd
+    from shapely.geometry import Point
+
+    gdf = gpd.GeoDataFrame(
+        {"NAME": ["A", "B", "C"], "TYPE": ["宏站", "微站", "宏站"]},
+        geometry=[Point(114.0, 22.0), Point(114.1, 22.1), Point(114.2, 22.2)],
+        crs="EPSG:4326",
+    )
+    shp = _write_shapefile(tmp_path, "stations", gdf)
+    (tmp_path / "stations.qml").write_text(QML_MARKER_CATEGORIZED, encoding="utf-8")
+
+    layer = MapInfoParser.parse_file(shp)
+    assert layer.type.value == "point"
+    assert len(layer.features) == 3
+    s0 = layer.features[0].properties["_style"]
+    s1 = layer.features[1].properties["_style"]
+    s2 = layer.features[2].properties["_style"]
+    # 宏站 → 红色三角；微站 → 蓝色方块（alpha=0.8）
+    assert s0["markerColor"] == "#ff0000"
+    assert s0["markerSymbol"] == "triangle"
+    assert s1["markerColor"] == "#0080ff"
+    assert s1["markerSymbol"] == "square"
+    assert s1["fillOpacity"] == 0.8
+    assert s2["markerColor"] == "#ff0000"
+    # QGIS size 为直径(mm) → app markerSize 为半径(px)
+    assert s0["markerSize"] == pytest.approx(3 * 3.7795 / 2, abs=0.1)
+    # 无 outline_color 的分类不应写入描边色
+    assert s1.get("color") == "none"
+
+
+def test_parse_qml_single_symbol_fill_and_line(tmp_path):
+    """QGIS .qml singleSymbol：面 SimpleFill / 线 SimpleLine（含带命名空间的 qml）"""
+    _require_geopandas()
+    MapInfoParser = _try_import_mapinfo_parser()
+    import geopandas as gpd
+    from shapely.geometry import LineString, Polygon
+
+    poly = gpd.GeoDataFrame(
+        {"N": [1]},
+        geometry=[Polygon([(114.0, 22.0), (114.1, 22.0), (114.1, 22.1), (114.0, 22.0)])],
+        crs="EPSG:4326",
+    )
+    shp_poly = _write_shapefile(tmp_path, "areas", poly)
+    (tmp_path / "areas.qml").write_text(QML_FILL_SINGLE, encoding="utf-8")
+
+    layer = MapInfoParser.parse_file(shp_poly)
+    style = layer.features[0].properties["_style"]
+    assert style["fillColor"] == "#00ff00"
+    assert style["fillOpacity"] == 0.5
+    assert style["strokeColor"] == "#ff0000"
+    assert style["strokeWidth"] == pytest.approx(0.5 * 3.7795, abs=0.1)
+
+    line = gpd.GeoDataFrame(
+        {"N": [1]}, geometry=[LineString([(114.0, 22.0), (114.1, 22.1)])], crs="EPSG:4326"
+    )
+    shp_line = _write_shapefile(tmp_path, "roads", line)
+    # 带 xmlns 的 .qml 同样要能解析（ElementTree 的 '{*}' 通配不匹配无命名空间标签）
+    (tmp_path / "roads.qml").write_text(QML_LINE_SINGLE, encoding="utf-8")
+
+    layer_line = MapInfoParser.parse_file(shp_line)
+    s = layer_line.features[0].properties["_style"]
+    assert s["strokeColor"] == "#3366ff"
+    assert s["strokeWidth"] == pytest.approx(0.8 * 3.7795, abs=0.1)
+
+
+def test_shapefile_crs_reprojected_to_wgs84(tmp_path):
+    """带 .prj 的投影坐标系 shp → 自动重投影到 WGS84"""
+    _require_geopandas()
+    MapInfoParser = _try_import_mapinfo_parser()
+    import geopandas as gpd
+    from shapely.geometry import Point
+
+    gdf = gpd.GeoDataFrame(
+        {"N": ["A"]}, geometry=[Point(500000, 2700000)], crs="EPSG:4547"
+    )
+    expected = gdf.to_crs(4326).geometry.iloc[0]
+    shp = _write_shapefile(tmp_path, "proj", gdf)
+
+    layer = MapInfoParser.parse_file(shp)
+    x, y = layer.features[0].coordinates
+    assert abs(x - expected.x) < 1e-6
+    assert abs(y - expected.y) < 1e-6
+    assert 113 < x < 115 and 23 < y < 25
+
+
+def test_shapefile_utf8_attributes_not_mojibake(tmp_path):
+    """SHP 属性按 .cpg/DBF 声明解码（不强制 GBK，避免 UTF-8 中文变乱码）"""
+    _require_geopandas()
+    MapInfoParser = _try_import_mapinfo_parser()
+    import geopandas as gpd
+    from shapely.geometry import Point
+
+    # 字段名受 DBF 10 字节上限约束（UTF-8 中文最多 3 字），此处只验证中文值解码
+    gdf = gpd.GeoDataFrame(
+        {"站名": ["基站A"], "PCI": [10]},
+        geometry=[Point(114.0, 22.0)],
+        crs="EPSG:4326",
+    )
+    shp = _write_shapefile(tmp_path, "cn", gdf)
+
+    layer = MapInfoParser.parse_file(shp)
+    props = layer.features[0].properties
+    assert props["站名"] == "基站A"
+    assert props["PCI"] == 10
+
+
+def test_parse_geojson_simplestyle(tmp_path):
+    """GeoJSON simplestyle-spec 属性 → _style（面 fill/stroke、点 marker-color）"""
+    _require_geopandas()
+    MapInfoParser = _try_import_mapinfo_parser()
+    import json
+
+    fc = {
+        "type": "FeatureCollection",
+        "features": [
+            {
+                "type": "Feature",
+                "properties": {
+                    "name": "区域一",
+                    "fill": "#ffcc00",
+                    "fill-opacity": 0.25,
+                    "stroke": "#003366",
+                    "stroke-width": 3,
+                },
+                "geometry": {
+                    "type": "Polygon",
+                    "coordinates": [[[114.0, 22.0], [114.1, 22.0], [114.1, 22.1], [114.0, 22.0]]],
+                },
+            },
+            {
+                "type": "Feature",
+                "properties": {"name": "点一", "marker-color": "#123456", "marker-size": "large"},
+                "geometry": {"type": "Point", "coordinates": [114.05, 22.05]},
+            },
+        ],
+    }
+    gj = tmp_path / "zones.geojson"
+    gj.write_text(json.dumps(fc, ensure_ascii=False), encoding="utf-8")
+
+    layer = MapInfoParser.parse_file(gj)
+    assert layer.type.value == "polygon"
+    assert len(layer.features) == 2
+
+    poly = layer.features[0].properties["_style"]
+    assert poly["fillColor"] == "#ffcc00"
+    assert poly["fillOpacity"] == 0.25
+    assert poly["strokeColor"] == "#003366"
+    assert poly["strokeWidth"] == 3.0
+
+    # 缺失字段被 pandas 补成 NaN，不得当作颜色/宽度写入 _style
+    assert poly.get("markerColor") is None
+
+    pt = layer.features[1].properties["_style"]
+    assert pt["markerColor"] == "#123456"
+    assert pt["markerSize"] == 14
+    assert pt["color"] == "#123456"
+
+
+def test_geojson_without_simplestyle_falls_back_to_default(tmp_path):
+    """无 simplestyle 属性的 GeoJSON → 回退图层默认配色，且属性完整保留"""
+    _require_geopandas()
+    MapInfoParser = _try_import_mapinfo_parser()
+    import json
+
+    fc = {
+        "type": "FeatureCollection",
+        "features": [
+            {
+                "type": "Feature",
+                "properties": {"name": "点一"},
+                "geometry": {"type": "Point", "coordinates": [114.05, 22.05]},
+            }
+        ],
+    }
+    gj = tmp_path / "plain.geojson"
+    gj.write_text(json.dumps(fc, ensure_ascii=False), encoding="utf-8")
+
+    layer = MapInfoParser.parse_file(gj)
+    props = layer.features[0].properties
+    assert props["name"] == "点一"
+    assert props["_style"] is not None  # 默认配色而非无样式
+
+
+def test_looks_like_geojson_file(tmp_path):
+    """layers.json 等元数据不会被当作 GeoJSON 图层"""
+    from app.services.mapinfo_service import looks_like_geojson_file
+
+    (tmp_path / "layers.json").write_text('[{"id": "x", "feature_count": 3}]', encoding="utf-8")
+    (tmp_path / "ok.geojson").write_text(
+        '{"type":"FeatureCollection","features":[]}', encoding="utf-8"
+    )
+    assert looks_like_geojson_file(tmp_path / "layers.json") is False
+    assert looks_like_geojson_file(tmp_path / "ok.geojson") is True
+
+
+def test_parse_directory_picks_up_shp_and_geojson(tmp_path):
+    """目录解析同时覆盖 .shp 与 .geojson，且忽略配套文件与元数据 json"""
+    _require_geopandas()
+    MapInfoParser = _try_import_mapinfo_parser()
+    import geopandas as gpd
+    from shapely.geometry import Point
+
+    gdf = gpd.GeoDataFrame(
+        {"N": ["A"]}, geometry=[Point(114.0, 22.0)], crs="EPSG:4326"
+    )
+    _write_shapefile(tmp_path, "stations", gdf)
+    (tmp_path / "zones.geojson").write_text(
+        '{"type":"FeatureCollection","features":[{"type":"Feature","properties":{},"geometry":'
+        '{"type":"Point","coordinates":[114.1,22.1]}}]}',
+        encoding="utf-8",
+    )
+    (tmp_path / "layers.json").write_text('[]', encoding="utf-8")
+
+    layers = MapInfoParser.parse_directory(tmp_path)
+    names = sorted(l.name for l in layers)
+    assert names == ["stations", "zones"]
+    # .shx/.dbf/.prj/.cpg 不产生独立图层
+    assert len(layers) == 2
+
+
+def test_detect_file_type_new_formats():
+    """新格式扩展名识别"""
+    MapInfoParser = _try_import_mapinfo_parser()
+    assert MapInfoParser.detect_file_type("a.shp") == "shp"
+    assert MapInfoParser.detect_file_type("a.geojson") == "geojson"
+    assert MapInfoParser.detect_file_type("a.json") == "json"
+    assert MapInfoParser.detect_file_type("a.shx") is None
+    assert MapInfoParser.detect_file_type("a.dbf") is None
+    assert MapInfoParser.detect_file_type("a.prj") is None
+
+
+def test_qgis_markerline_symbol_uses_marker_color(tmp_path):
+    """QGIS MarkerLine（点阵列线符号）→ 取内部 SimpleMarker 的颜色作为线色"""
+    _require_geopandas()
+    MapInfoParser = _try_import_mapinfo_parser()
+    import geopandas as gpd
+    from shapely.geometry import LineString
+
+    qml = """<qgis version="3.28">
+  <renderer-v2 type="singleSymbol">
+    <symbols>
+      <symbol name="0" type="line" alpha="1">
+        <layer class="MarkerLine" pass="0">
+          <prop k="interval" v="3"/>
+          <symbol name="marker" type="marker">
+            <layer class="SimpleMarker" pass="0">
+              <prop k="color" v="255,0,255,255"/>
+              <prop k="size" v="2"/>
+            </layer>
+          </symbol>
+        </layer>
+      </symbol>
+    </symbols>
+  </renderer-v2>
+</qgis>
+"""
+    line = gpd.GeoDataFrame(
+        {"N": [1]}, geometry=[LineString([(114.0, 22.0), (114.1, 22.1)])], crs="EPSG:4326"
+    )
+    shp = _write_shapefile(tmp_path, "dashed", line)
+    (tmp_path / "dashed.qml").write_text(qml, encoding="utf-8")
+
+    layer = MapInfoParser.parse_file(shp)
+    style = layer.features[0].properties["_style"]
+    assert style["strokeColor"] == "#ff00ff"
+
+
+def test_qml_symbol_without_supported_layer_returns_none(tmp_path):
+    """符号里没有受支持的图层类（如纯 MarkerLine 无内层标记）→ 返回 None 走默认配色"""
+    MapInfoParser = _try_import_mapinfo_parser()
+    import xml.etree.ElementTree as ET
+
+    sym = ET.fromstring(
+        '<symbol name="0" type="line"><layer class="MarkerLine"><prop k="interval" v="3"/></layer></symbol>'
+    )
+    assert MapInfoParser._qgis_symbol_to_style(sym) is None
+
+
+def test_geojson_sparse_properties_are_json_safe(tmp_path):
+    """GeoJSON 要素间字段不齐（pandas 用 NaN 补齐）→ 归一为 null，不得出现 NaN 字面量。
+
+    回归：json.dumps 默认把 NaN 写成非法 JSON 字面量 NaN，Starlette 响应
+    （allow_nan=False）会 500，浏览器 JSON.parse 直接抛错导致整层无法渲染。
+    """
+    _require_geopandas()
+    MapInfoParser = _try_import_mapinfo_parser()
+    import json
+
+    (tmp_path / "mixed.geojson").write_text(
+        json.dumps({
+            "type": "FeatureCollection",
+            "features": [
+                {"type": "Feature", "properties": {"name": "A", "PCI": 1, "fill": "#ff0000"},
+                 "geometry": {"type": "Point", "coordinates": [114.0, 22.0]}},
+                {"type": "Feature", "properties": {"name": "B", "PCI": 2},
+                 "geometry": {"type": "Point", "coordinates": [114.1, 22.1]}},
+            ],
+        }, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    layer = MapInfoParser.parse_file(tmp_path / "mixed.geojson")
+    # 缺失字段归一为 None（而非 NaN）
+    assert layer.features[1].properties["fill"] is None
+    # 整层可被严格 JSON 编码（allow_nan=False 等价 Starlette JSONResponse）
+    json.dumps([f.properties for f in layer.features], ensure_ascii=False, allow_nan=False)
+
+
+def test_shapefile_empty_dbf_value_is_json_safe(tmp_path):
+    """SHP 空 DBF 数值字段 → None，不得写出 NaN 字面量"""
+    _require_geopandas()
+    MapInfoParser = _try_import_mapinfo_parser()
+    import json
+    import geopandas as gpd
+    from shapely.geometry import Point
+
+    gdf = gpd.GeoDataFrame(
+        {"名称": ["A", "B"], "PCI": [1, None]},
+        geometry=[Point(114.0, 22.0), Point(114.1, 22.1)],
+        crs="EPSG:4326",
+    )
+    shp = _write_shapefile(tmp_path, "nulls", gdf)
+
+    layer = MapInfoParser.parse_file(shp)
+    assert layer.features[1].properties["PCI"] is None
+    json.dumps([f.properties for f in layer.features], ensure_ascii=False, allow_nan=False)
+
+
+def test_json_safe_value_normalizes_pandas_types():
+    """_json_safe_value：NaN/NaT/±Inf → None；Timestamp → ISO；numpy 标量 → 原生"""
+    MapInfoParser = _try_import_mapinfo_parser()
+    import pandas as pd
+
+    f = MapInfoParser._json_safe_value
+    assert f(float("nan")) is None
+    assert f(float("inf")) is None
+    assert f(float("-inf")) is None
+    assert f(pd.NaT) is None
+    assert f(pd.Timestamp("2020-01-01")) == "2020-01-01T00:00:00"
+    assert f("s") == "s"
+    assert f(5) == 5
+    assert f(None) is None
+    assert f(True) is True

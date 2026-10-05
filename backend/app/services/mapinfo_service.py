@@ -25,6 +25,11 @@ from app.core.database import SessionLocal
 from app.models.database import Layer
 from app.services.ogr_style_reader import read_feature_style_strings
 
+# 图层源文件扩展名（.shx/.dbf/.prj/.qml 是 SHP 的配套文件，本身不是图层源）。
+# 用于 layers.json 未命中时按图层名/目录回退定位源文件，需与 detect_file_type 支持
+# 的格式保持一致，否则新增格式的图层在回退路径下会找不到源文件。
+LAYER_SOURCE_EXTS = ('.tab', '.mif', '.kml', '.shp', '.geojson')
+
 # MapInfo 图层数据缓存（避免每次请求都重新解析文件）
 _layer_cache: Dict[str, Dict] = {}
 _layer_cache_mtime: Dict[str, float] = {}
@@ -72,6 +77,80 @@ def _rsrp_color(value: float) -> str:
         if value >= threshold:
             return color
     return '#d50000'
+
+
+def _local_tag(tag: Any) -> str:
+    """元素标签的本地名（去命名空间前缀）。"""
+    if not isinstance(tag, str):
+        return ''
+    return tag.rsplit('}', 1)[-1] if '}' in tag else tag
+
+
+def _iter_local(root: Any, name: str):
+    """遍历子树中本地名为 name 的元素。
+
+    ElementTree 的 '{*}' 通配不匹配无命名空间标签，而 QGIS 导出的 .qml 可能带
+    也可能不带 xmlns，故统一按本地名比较，两种写法都能命中。
+    """
+    for el in root.iter():
+        if _local_tag(el.tag) == name:
+            yield el
+
+
+def _children_local(root: Any, name: str) -> List[Any]:
+    """直接子元素中本地名为 name 的元素。"""
+    return [c for c in list(root) if _local_tag(c.tag) == name]
+
+
+def _first_local(root: Any, name: str) -> Optional[Any]:
+    """子树中第一个本地名为 name 的元素。"""
+    for el in _iter_local(root, name):
+        return el
+    return None
+
+
+def looks_like_geojson_file(path: Path) -> bool:
+    """轻量判别 .json 是否为 GeoJSON（避免把 data_dir 里的 layers.json 等元数据当图层解析）。"""
+    try:
+        head = path.read_bytes()[:8192].decode('utf-8', errors='ignore')
+    except Exception:
+        return False
+    return '"FeatureCollection"' in head or '"features"' in head or '"Feature"' in head
+
+
+# 字段名映射 sidecar 后缀：DBF 字段名上限 10 字节，超限名保存时被转写为安全名，
+# 原名记在这里，读回时还原为显示名。放在本模块（而非 layer_edit_service）是因为
+# 渲染链路也要用，而 layer_edit_service 已依赖本模块，反向依赖会形成循环导入。
+FIELD_MAP_TAIL = "nptfields.json"
+
+
+def field_map_path(source_path: Path) -> Path:
+    """字段名映射 sidecar 路径：`<stem>.nptfields.json`。"""
+    return Path(source_path).parent / f"{Path(source_path).stem}.{FIELD_MAP_TAIL}"
+
+
+def read_field_map(source_path: Path) -> Dict[str, str]:
+    """读取「显示名 → 存储名」映射；无 sidecar 或解析失败返回空字典。"""
+    p = field_map_path(source_path)
+    if not p.exists():
+        return {}
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        return {str(k): str(v) for k, v in data.items()} if isinstance(data, dict) else {}
+    except Exception as e:  # noqa: BLE001
+        print(f"[MapInfoParser] 读取字段名映射失败 {p.name}: {e}")
+        return {}
+
+
+def write_field_map(source_path: Path, mapping: Dict[str, str]) -> None:
+    """写出字段名映射；映射为空时删除旧 sidecar（避免残留失效映射）。"""
+    p = field_map_path(source_path)
+    if not mapping:
+        p.unlink(missing_ok=True)
+        return
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    tmp.write_text(json.dumps(mapping, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(p)
 
 
 def _detect_rsrp_column(columns) -> Optional[str]:
@@ -128,7 +207,7 @@ class MapInfoParser:
     def detect_file_type(filename: str) -> Optional[str]:
         """检测文件类型"""
         ext = os.path.splitext(filename)[1].lower()
-        if ext in ['.tab', '.mif', '.dat', '.kml']:
+        if ext in ['.tab', '.mif', '.dat', '.kml', '.shp', '.geojson', '.json']:
             return ext[1:]  # 返回不带点的扩展名
         return None
 
@@ -176,7 +255,7 @@ class MapInfoParser:
         # 检查样式列
         for col in style_cols:
             value = row.get(col) if isinstance(row, dict) else row[col]
-            if value is not None and value != '' and value != 0:
+            if not MapInfoParser._is_blank_value(value) and value != 0:
                 parsed_style = MapInfoParser._parse_style_value(col, value)
                 if parsed_style:
                     style.update(parsed_style)
@@ -771,6 +850,341 @@ class MapInfoParser:
             styles.append(pending if pending else None)
         return styles if styles else None
 
+    # ---- QGIS (.qml) / GeoJSON simplestyle 样式 ----
+
+    # QGIS 符号尺寸单位为毫米，换算为 app 的像素口径（96dpi ≈ 3.78px/mm）
+    _QGIS_MM_TO_PX = 3.7795
+
+    # QGIS 点符号名 → app 支持的点形状（resolvePointShape 的白名单）
+    _QGIS_MARKER_SHAPES = {
+        'circle': 'circle', 'square': 'square', 'rectangle': 'square',
+        'diamond': 'diamond', 'triangle': 'triangle',
+        'equilateral_triangle': 'triangle', 'arrow': 'triangle',
+        'filled_arrowhead': 'triangle', 'star': 'star', 'star_diamond': 'star',
+    }
+
+    # GeoJSON simplestyle-spec 属性 → _style 字段
+    _SIMPLESTYLE_KEYS = {
+        'fill': 'fillColor',
+        'fill-opacity': 'fillOpacity',
+        'stroke': 'strokeColor',
+        'stroke-opacity': 'strokeOpacity',
+        'stroke-width': 'strokeWidth',
+        'marker-color': 'markerColor',
+        'marker-size': 'markerSize',
+        'marker-symbol': 'markerSymbol',
+    }
+
+    _SIMPLESTYLE_MARKER_SIZES = {'small': 6, 'medium': 9, 'large': 14}
+
+    # 本工具写出的 RuleRenderer 过滤表达式（qml_style_writer）：
+    #   单要素 "$id = 3" / 同一样式的多要素 "$id IN (0,2,5)"
+    _QML_RULE_ID_EQ_RE = re.compile(r'\$id\s*=\s*(\d+)', re.IGNORECASE)
+    _QML_RULE_ID_IN_RE = re.compile(r'\$id\s+IN\s*\(([^)]*)\)', re.IGNORECASE)
+
+    @staticmethod
+    def _qgis_color(value: Any) -> Optional[str]:
+        """QGIS 颜色串 'R,G,B[,A]' 或 '#rrggbb' → '#rrggbb'；完全透明/非法返回 None。"""
+        if value is None:
+            return None
+        s = str(value).strip()
+        if not s:
+            return None
+        if s.startswith('#'):
+            return s
+        parts = [p.strip() for p in s.split(',')]
+        if len(parts) < 3:
+            return None
+        try:
+            r, g, b = (max(0, min(255, int(float(parts[i])))) for i in range(3))
+        except (TypeError, ValueError):
+            return None
+        if len(parts) >= 4:
+            try:
+                if int(float(parts[3])) == 0:
+                    return None
+            except (TypeError, ValueError):
+                pass
+        return f'#{r:02x}{g:02x}{b:02x}'
+
+    @staticmethod
+    def _qgis_symbol_to_style(symbol_el: Any) -> Optional[Dict[str, Any]]:
+        """QGIS <symbol> 元素 → _style dict。
+
+        符号由若干 <layer class="..."> 组成，取第一个与符号类型匹配的图层：
+        SimpleFill（面填充/描边）、SimpleLine（线色/线宽）、SimpleMarker（点色/大小/形状）；
+        MarkerLine 等复合符号退到内部任意 SimpleMarker 取色。
+        """
+        sym_type = (symbol_el.get('type') or '').lower()
+        try:
+            alpha = max(0.0, min(1.0, float(symbol_el.get('alpha', '1'))))
+        except (TypeError, ValueError):
+            alpha = 1.0
+
+        layers = _children_local(symbol_el, 'layer')
+        chosen = None
+        for lay in layers:
+            cls = lay.get('class') or ''
+            if cls == 'SimpleFill' and sym_type in ('fill', ''):
+                chosen = lay
+                break
+            if cls == 'SimpleLine' and sym_type == 'line':
+                chosen = lay
+                break
+            if cls == 'SimpleMarker' and sym_type == 'marker':
+                chosen = lay
+                break
+        if chosen is None:
+            # 复合符号（MarkerLine/LinePatternFill 等）退到其内部第一个受支持的图层
+            # （QGIS 3 把 MarkerLine 的标记写成嵌套 <symbol>/<layer>）
+            for lay in _iter_local(symbol_el, 'layer'):
+                if (lay.get('class') or '') in ('SimpleFill', 'SimpleLine', 'SimpleMarker'):
+                    chosen = lay
+                    break
+        if chosen is None:
+            return None
+
+        props: Dict[str, Any] = {}
+        for p in _children_local(chosen, 'prop'):
+            k = p.get('k')
+            if k:
+                props[k] = p.get('v')
+        cls = chosen.get('class') or ''
+        style: Dict[str, Any] = {}
+
+        if cls == 'SimpleFill':
+            fill = MapInfoParser._qgis_color(props.get('color'))
+            stroke = MapInfoParser._qgis_color(props.get('outline_color'))
+            if props.get('style') == 'no' or fill is None:
+                style['fill'] = False
+            else:
+                style['fillColor'] = fill
+                style['fillOpacity'] = round(alpha, 2)
+            # 无描边/描边全透明时不写 strokeColor，回退 app 默认边框色
+            # （'none' 哨兵只有前端点/线分支识别，面分支会把它当颜色直接传给 Leaflet）
+            if stroke is not None and props.get('outline_style') != 'no':
+                style['strokeColor'] = stroke
+                try:
+                    style['strokeWidth'] = round(
+                        max(0.5, min(12.0, float(props.get('outline_width', 0.26)) * MapInfoParser._QGIS_MM_TO_PX)), 2
+                    )
+                except (TypeError, ValueError):
+                    style['strokeWidth'] = 1
+        elif cls == 'SimpleLine':
+            line = MapInfoParser._qgis_color(props.get('line_color'))
+            if props.get('line_style') == 'no' or line is None:
+                # 'none' 是前端线分支识别的无色哨兵（整条线不绘制）
+                style['strokeColor'] = 'none'
+            else:
+                style['strokeColor'] = line
+                style['strokeOpacity'] = round(alpha, 2)
+                try:
+                    style['strokeWidth'] = round(
+                        max(0.5, min(12.0, float(props.get('line_width', 0.26)) * MapInfoParser._QGIS_MM_TO_PX)), 2
+                    )
+                except (TypeError, ValueError):
+                    style['strokeWidth'] = 1
+        elif cls == 'SimpleMarker':
+            color = MapInfoParser._qgis_color(props.get('color'))
+            outline = MapInfoParser._qgis_color(props.get('outline_color'))
+            if props.get('style') == 'no' or color is None:
+                style['markerColor'] = 'none'  # 前端无色哨兵：镂空显示
+            else:
+                style['markerColor'] = color
+                style['fillOpacity'] = round(alpha, 2)
+            style['color'] = outline if (outline and props.get('outline_style') != 'no') else 'none'
+            try:
+                # QGIS size 为直径(mm)，app markerSize 为半径(px)
+                style['markerSize'] = round(
+                    max(3.0, min(24.0, float(props.get('size', 2)) * MapInfoParser._QGIS_MM_TO_PX / 2)), 1
+                )
+            except (TypeError, ValueError):
+                style['markerSize'] = 8
+            shape = MapInfoParser._QGIS_MARKER_SHAPES.get(str(props.get('name', '')).lower())
+            if shape:
+                style['markerSymbol'] = shape
+        else:
+            return None
+
+        # 线符号由 MarkerLine（点阵列）构成时，选中的是内部 SimpleMarker：
+        # 线色取点色，否则前端线渲染读不到 strokeColor 会退回默认配色
+        if sym_type == 'line' and cls == 'SimpleMarker':
+            _c = style.get('markerColor')
+            if _c and _c != 'none':
+                style = {
+                    'strokeColor': _c,
+                    'strokeOpacity': style.get('fillOpacity', 1.0),
+                }
+
+        return style or None
+
+    @staticmethod
+    def _qml_rule_ids(expr: Any) -> List[int]:
+        """解析 RuleRenderer 的 $id 过滤表达式 → 命中行号；无法识别返回空列表。
+
+        只识别本工具（qml_style_writer）写出的两种形式，QGIS 手工编辑出的复杂
+        表达式一律不识别——宁可不套用样式，也不要把规则错配到别的要素上。
+        """
+        if not isinstance(expr, str) or not expr.strip():
+            return []
+        m = MapInfoParser._QML_RULE_ID_IN_RE.search(expr)
+        if m:
+            return [int(p) for p in (x.strip() for x in m.group(1).split(',')) if p.isdigit()]
+        m = MapInfoParser._QML_RULE_ID_EQ_RE.search(expr)
+        return [int(m.group(1))] if m else []
+
+    @staticmethod
+    def _parse_qml_styles(qml_file: Path, gdf: Any) -> Optional[List[Optional[Dict[str, Any]]]]:
+        """解析 QGIS .qml 样式，返回按要素行序对齐的样式列表（无匹配占位 None）。
+
+        支持 renderer-v2 的 singleSymbol（整体同色）与 categorizedSymbol（按 attr 字段
+        分类着色），以及 QGIS 2.x 的 <renderer> 旧格式（仅单一符号）。
+        解析失败返回 None，调用方回退图层默认配色。
+        """
+        import xml.etree.ElementTree as ET
+
+        try:
+            root = ET.fromstring(qml_file.read_text(encoding='utf-8', errors='replace'))
+        except Exception:
+            return None
+
+        symbols: Dict[str, Dict[str, Any]] = {}
+        for sym in _iter_local(root, 'symbol'):
+            name = sym.get('name')
+            if not name or name in symbols:
+                continue
+            st = MapInfoParser._qgis_symbol_to_style(sym)
+            if st:
+                symbols[name] = st
+        if not symbols:
+            return None
+
+        rnd = _first_local(root, 'renderer-v2')
+        value_to_symbol: Dict[str, str] = {}
+        attr = None
+        if rnd is not None:
+            attr = rnd.get('attr')
+            for cat in _iter_local(rnd, 'category'):
+                sym_name = cat.get('symbol')
+                if sym_name is not None:
+                    value_to_symbol[str(cat.get('value', ''))] = sym_name
+
+        # RuleRenderer（本工具写出的逐要素配色，按 $id 过滤命中行）：
+        # categorizedSymbol 需要属性列，而 DBF 字段名受限，故逐要素样式走 $id 规则。
+        if rnd is not None and (rnd.get('type') or '') == 'RuleRenderer':
+            row_to_symbol: Dict[int, str] = {}
+            for rule in _iter_local(rnd, 'rule'):
+                sym_name = rule.get('symbol')
+                if sym_name is None or sym_name not in symbols:
+                    continue
+                for rid in MapInfoParser._qml_rule_ids(rule.get('filter')):
+                    row_to_symbol.setdefault(rid, sym_name)
+            if not row_to_symbol:
+                return None
+            return [
+                dict(symbols[row_to_symbol[i]]) if i in row_to_symbol else None
+                for i in range(len(gdf))
+            ]
+
+        if not value_to_symbol:
+            # 无分类（singleSymbol / QGIS 2.x 旧格式）：整层同一符号
+            first = next(iter(symbols.values()))
+            return [dict(first) for _ in range(len(gdf))]
+
+        if not attr or attr not in gdf.columns:
+            # 有分类但匹配字段缺失：退回第一个符号，至少保住配色而不是丢样式
+            first = next(iter(symbols.values()))
+            return [dict(first) for _ in range(len(gdf))]
+
+        styles: List[Optional[Dict[str, Any]]] = []
+        for v in gdf[attr]:
+            sym_name = value_to_symbol.get('' if v is None else str(v))
+            st = symbols.get(sym_name) if sym_name else None
+            styles.append(dict(st) if st else None)
+        return styles
+
+    @staticmethod
+    def _json_safe_value(v: Any) -> Any:
+        """把 pandas/numpy 值归一为可 JSON 序列化的原生值。
+
+        NaN / NaT / ±Inf → None。pandas 读异构属性表（SHP 的 DBF 空值、GeoJSON
+        要素间字段不齐）时用 NaN 补齐缺失字段，而 json.dumps 默认会把它写成非法
+        JSON 字面量 NaN：走 Starlette 响应（allow_nan=False）直接 500，走预压缩
+        字节直出时浏览器 JSON.parse 抛错，整个图层渲染不出来。
+        """
+        if v is None or isinstance(v, (str, bool, int)):
+            return v
+        if isinstance(v, float):
+            return None if (v != v or v in (float("inf"), float("-inf"))) else v
+        if isinstance(v, (list, dict)):
+            return v
+        # NaN / NaT 均满足 v != v；必须在 isoformat 之前判断，因为 pd.NaT.isoformat()
+        # 会返回字符串 "NaT" 而不是空值
+        try:
+            if v != v:
+                return None
+        except (TypeError, ValueError):
+            pass
+        if hasattr(v, "isoformat"):
+            return v.isoformat()
+        if hasattr(v, "item"):  # numpy 标量 → Python 原生标量
+            try:
+                return v.item()
+            except Exception:
+                pass
+        return v
+
+    @staticmethod
+    def _is_blank_value(v: Any) -> bool:
+        """空值判定：None / NaN / 空串。
+
+        pandas 读异构属性表时用 NaN 补齐缺失字段，若不排除会把 'nan' 当成
+        颜色值或把 NaN 当成宽度，导致要素被染成无效色。
+        """
+        if v is None:
+            return True
+        if isinstance(v, float) and v != v:  # NaN（含 numpy.float64）
+            return True
+        return isinstance(v, str) and not v.strip()
+
+    @staticmethod
+    def _extract_simplestyle_style(props: Any) -> Optional[Dict[str, Any]]:
+        """从要素属性提取 GeoJSON simplestyle-spec 样式（fill/stroke/marker-color 等）。
+
+        simplestyle 的键名已自描述几何类型，无需按图层几何分支；同时补出 app 点渲染
+        使用的描边字段 color，保证同一份 _style 对点/线/面三种渲染路径都生效。
+        """
+        if not isinstance(props, dict):
+            return None
+        style: Dict[str, Any] = {}
+        for src, dst in MapInfoParser._SIMPLESTYLE_KEYS.items():
+            v = props.get(src)
+            if MapInfoParser._is_blank_value(v):
+                continue
+            if dst == 'strokeWidth':
+                try:
+                    style[dst] = round(max(0.5, min(12.0, float(v))), 2)
+                except (TypeError, ValueError):
+                    continue
+            elif dst in ('fillOpacity', 'strokeOpacity'):
+                try:
+                    style[dst] = round(max(0.0, min(1.0, float(v))), 2)
+                except (TypeError, ValueError):
+                    continue
+            elif dst == 'markerSize':
+                size = MapInfoParser._SIMPLESTYLE_MARKER_SIZES.get(str(v).lower())
+                if size:
+                    style[dst] = size
+            else:
+                style[dst] = str(v)
+        if not style:
+            return None
+        if 'strokeColor' in style:
+            style['color'] = style['strokeColor']
+        elif 'markerColor' in style:
+            style.setdefault('color', style['markerColor'])
+        return style
+
     @staticmethod
     def _normalize_tab_charset(tab_file: Optional[Path]) -> None:
         """规范化 .tab 文件的 charset 声明为 WindowsSimpChinese。
@@ -1040,8 +1454,11 @@ class MapInfoParser:
                 raise FileNotFoundError(f"文件不存在: {path_str}")
 
             # 读取 .TAB 文件元数据（不区分大小写）
-            tab_file = file_path if file_path.suffix.lower() == '.tab' else None
-            if tab_file is None:
+            # 仅 MapInfo 主文件才找同名 .tab 侧车；.shp/.geojson 等同名文件共存的目录
+            # 不应被别的 .tab 元数据/charset 规范化污染
+            _ext = file_path.suffix.lower()
+            tab_file = file_path if _ext == '.tab' else None
+            if tab_file is None and _ext in ('.dat', '.mif'):
                 # 尝试不同大小写的 .tab 扩展名
                 for ext in ['.tab', '.TAB', '.Tab']:
                     candidate = file_path.with_suffix(ext)
@@ -1056,17 +1473,40 @@ class MapInfoParser:
                 MapInfoParser._normalize_tab_charset(tab_file)
 
             # 使用 Geopandas 读取文件
-            try:
-                gdf = gpd.read_file(path_str, encoding='gbk')
-            except Exception as e1:
+            # 编码：MapInfo（TAB/MIF）的中文字段名/属性值常为 GBK，需显式指定；
+            # SHP/GeoJSON 由 GDAL 依 .cpg/DBF LDID 或 JSON 自身（规范为 UTF-8）判定，
+            # 强制 GBK 会把 UTF-8 属性解成乱码（并连带使 .qml 分类值匹配失败）。
+            ext_lower = file_path.suffix.lower()
+            if ext_lower in ('.shp', '.geojson', '.json'):
                 try:
                     gdf = gpd.read_file(path_str)
-                except Exception as e2:
-                    raise e2
+                except Exception:
+                    gdf = gpd.read_file(path_str, encoding='gbk')
+            else:
+                try:
+                    gdf = gpd.read_file(path_str, encoding='gbk')
+                except Exception as e1:
+                    try:
+                        gdf = gpd.read_file(path_str)
+                    except Exception as e2:
+                        raise e2
+
+            # 坐标系归一：QGIS 导出的 shp 常带 .prj（多为投影坐标系），geojson 也可能声明
+            # 非 WGS84 的 crs。统一重投影到 WGS84(EPSG:4326)，下游按既有链路 WGS84→GCJ02。
+            # 已是 4326（或无法判定且非投影）时跳过，避免对存量 TAB/MIF 产生任何偏移。
+            _crs = getattr(gdf, 'crs', None)
+            if _crs is not None:
+                try:
+                    _epsg = _crs.to_epsg()
+                    if _epsg != 4326 and (_epsg is not None or bool(getattr(_crs, 'is_projected', False))):
+                        print(f"[MapInfoParser] {file_path.name} 坐标系 {_epsg or _crs} → WGS84 重投影")
+                        gdf = gdf.to_crs(4326)
+                except Exception as _crs_err:
+                    print(f"[MapInfoParser] {file_path.name} 坐标系重投影失败（按原坐标处理）: {_crs_err}")
 
             # 解析文件自带的默认样式（按 gdf 行序对齐）：
             #   TAB → 同名 .map 文件；KML → <Style>/<styleUrl>；MIF → GDAL MAPINFO_* 列或 .mif 文本
-            ext_lower = file_path.suffix.lower()
+            #   SHP → 同名 .qml（QGIS 样式）；GeoJSON → simplestyle 属性（见下）
             # KML：优先自研 XML 解析（完整保留混合几何 + 样式，比 GDAL 驱动快且不丢要素）
             if ext_lower == '.kml':
                 direct = MapInfoParser._parse_kml_direct(file_path)
@@ -1079,6 +1519,17 @@ class MapInfoParser:
                 file_styles = MapInfoParser._extract_tab_styles(tab_file)
             elif ext_lower == '.mif':
                 file_styles = MapInfoParser._extract_mif_styles(file_path)
+            elif ext_lower in ('.shp', '.geojson', '.json'):
+                # QGIS 把图层样式存在与数据文件同 stem 的 .qml 里（随 zip 一起上传，
+                # 本工具保存时也写回该文件）。GeoJSON 也支持 .qml，且优先于 simplestyle
+                # 属性（下面的逐要素循环里 file_styles 先于 simplestyle 生效）。
+                _qml = file_path.with_suffix('.qml')
+                if not _qml.exists():
+                    _qml = file_path.with_suffix('.QML')
+                if _qml.exists():
+                    file_styles = MapInfoParser._parse_qml_styles(_qml, gdf)
+                    if file_styles is None:
+                        print(f"[MapInfoParser] {_qml.name} 未解析出可用样式，回退默认配色")
 
             features = []
             layer_type = GeometryType.UNKNOWN
@@ -1124,6 +1575,10 @@ class MapInfoParser:
             geoms = gdf.geometry
             columns = gdf.columns
             signal_col = _detect_rsrp_column(columns)
+            # DBF 字段名被转写过（≤10 字节）时，读回还原为显示名，属性框与保存链路
+            # 才看得到原名。NPT_* 持久化列不在映射里，不受影响。
+            _field_map = read_field_map(file_path)
+            _name_restore = {v: k for k, v in _field_map.items()}
 
             # 预计算样式列集合（列名固定，正则只执行一遍，避免逐 feature re.search）
             import re as _re
@@ -1151,17 +1606,20 @@ class MapInfoParser:
                 # 提取属性 (排除 geometry 列)
                 properties = records[idx]
                 properties.pop('geometry', None)
-                # 处理可能的时间戳等非JSON序列化类型
+                # 归一化：时间戳转 ISO 串，NaN/NaT 转 None（否则写出非法 JSON 字面量 NaN）
                 for k, v in properties.items():
-                    if hasattr(v, 'isoformat'):
-                        properties[k] = v.isoformat()
+                    properties[k] = MapInfoParser._json_safe_value(v)
 
                 # 提取 MapInfo 样式信息（传入预计算样式列，MIF 的 GDAL MAPINFO_* 列走这里）
                 style_info = MapInfoParser._extract_mapinfo_style(properties, columns, layer_type, style_cols)
 
-                # 文件自带样式（TAB .map / KML <Style>）优先于 GDAL 列推断，按 gdf 行序对齐
+                # 文件自带样式（TAB .map / KML <Style> / SHP .qml）优先于 GDAL 列推断，按 gdf 行序对齐
                 if not style_info and file_styles and idx < len(file_styles) and file_styles[idx]:
                     style_info = dict(file_styles[idx])
+
+                # GeoJSON：simplestyle-spec 属性（fill/stroke/marker-color）即文件自带样式
+                if not style_info and ext_lower in ('.geojson', '.json'):
+                    style_info = MapInfoParser._extract_simplestyle_style(properties)
 
                 # 信号强度分级着色（无文件自带样式时）：按 SSRSRP/RSRP 值取色
                 if not style_info and signal_col is not None:
@@ -1197,7 +1655,8 @@ class MapInfoParser:
                             properties['_editStyle'] = _es
                     except Exception:
                         pass
-                _meta = properties.pop('NPT_FEATMETA', None)
+                # NPT_FMETA 是 Shapefile 用的短列名（DBF 字段名上限 10 字节）
+                _meta = properties.pop('NPT_FEATMETA', None) or properties.pop('NPT_FMETA', None)
                 if isinstance(_meta, str) and _meta:
                     try:
                         _m = json.loads(_meta)
@@ -1208,6 +1667,10 @@ class MapInfoParser:
                                 properties['_ellipse'] = _m['_ellipse']
                     except Exception:
                         pass
+
+                # 字段名还原（放在持久化列剔除之后：NPT_* 用的是存储名，不能被改写）
+                if _name_restore:
+                    properties = {_name_restore.get(k, k): v for k, v in properties.items()}
 
                 # 提取坐标
                 coords = []
@@ -1368,8 +1831,72 @@ class MapInfoParser:
                     "error": f"{type(e).__name__}: {str(e)[:300]}",
                 })
 
+        # 最后解析 Shapefile(.shp) 与 GeoJSON(.geojson/.json)
+        MapInfoParser.parse_directory_shp_geojson(dir_path, layers, processed_files)
+
         print(f"[MapInfoParser] 目录解析完成，共解析 {len(layers)} 个图层")
         return layers
+
+    @staticmethod
+    def parse_directory_shp_geojson(dir_path: Path, layers: List[MapInfoLayer],
+                                    processed_files: set) -> None:
+        """解析目录中的 Shapefile(.shp) 与 GeoJSON(.geojson/.json)。
+
+        单独抽出以免 parse_directory 过长；.shx/.dbf/.prj/.cpg/.qml 为 .shp 的配套文件，
+        由 GDAL 自动读取，不作为独立图层。解析失败原因写入 _LAST_PARSE_ERRORS。
+        """
+        shp_files = sorted([f for f in dir_path.rglob("*") if f.suffix.lower() == '.shp' and f.is_file()])
+        for shp_file in shp_files:
+            if shp_file.stem.lower() in processed_files:
+                continue
+            try:
+                print(f"[MapInfoParser] 解析 SHP 文件: {shp_file.name}")
+                layers.append(MapInfoParser.parse_file(shp_file))
+                processed_files.add(shp_file.stem.lower())
+            except ImportError as e:
+                print(f"[MapInfoParser] ❌ 缺少必要的库: {e}")
+                _LAST_PARSE_ERRORS.append({
+                    "file": shp_file.name,
+                    "error": f"缺少依赖: {str(e)[:200]}",
+                })
+                break
+            except Exception as e:
+                print(f"[MapInfoParser] 解析 SHP 文件失败 {shp_file.name}: {e}")
+                import traceback
+                traceback.print_exc()
+                _LAST_PARSE_ERRORS.append({
+                    "file": shp_file.name,
+                    "error": f"{type(e).__name__}: {str(e)[:300]}",
+                })
+
+        geojson_files = sorted([
+            f for f in dir_path.rglob("*")
+            if f.suffix.lower() in ('.geojson', '.json') and f.is_file()
+        ])
+        for gj_file in geojson_files:
+            if gj_file.stem.lower() in processed_files:
+                continue
+            if gj_file.suffix.lower() == '.json' and not looks_like_geojson_file(gj_file):
+                continue  # layers.json 等元数据文件
+            try:
+                print(f"[MapInfoParser] 解析 GeoJSON 文件: {gj_file.name}")
+                layers.append(MapInfoParser.parse_file(gj_file))
+                processed_files.add(gj_file.stem.lower())
+            except ImportError as e:
+                print(f"[MapInfoParser] ❌ 缺少必要的库: {e}")
+                _LAST_PARSE_ERRORS.append({
+                    "file": gj_file.name,
+                    "error": f"缺少依赖: {str(e)[:200]}",
+                })
+                break
+            except Exception as e:
+                print(f"[MapInfoParser] 解析 GeoJSON 文件失败 {gj_file.name}: {e}")
+                import traceback
+                traceback.print_exc()
+                _LAST_PARSE_ERRORS.append({
+                    "file": gj_file.name,
+                    "error": f"{type(e).__name__}: {str(e)[:300]}",
+                })
 
 
 def get_last_parse_errors() -> List[Dict[str, str]]:
@@ -1583,7 +2110,7 @@ def get_layer_data(data_id: str, layer_id: str, data_dir: Path) -> Optional[Dict
         if source_path is None:
             name = target_layer_info.get('name')
             if name:
-                for ext in ['.tab', '.mif', '.kml']:
+                for ext in LAYER_SOURCE_EXTS:
                     candidate = data_dir / f"{name}{ext}"
                     if candidate.exists():
                         source_path = candidate
@@ -1648,10 +2175,14 @@ def get_layer_data(data_id: str, layer_id: str, data_dir: Path) -> Optional[Dict
         except Exception as e:
             print(f"[MapInfo] 解析源文件失败 {source_path}: {e}")
 
-    # 5. 回退：遍历目录
+    # 5. 回退：遍历目录（已知图层名时按名过滤，避免命中同目录的其它图层）
     if result is None:
         print(f"[MapInfo] 未在 layers.json 中找到图层 {layer_id}，尝试遍历目录")
-        for file_path in list(data_dir.rglob('*.tab')) + list(data_dir.rglob('*.mif')) + list(data_dir.rglob('*.kml')):
+        want_name = (target_layer_info or {}).get('name')
+        for file_path in [f for f in data_dir.rglob('*')
+                          if f.is_file() and f.suffix.lower() in LAYER_SOURCE_EXTS]:
+            if want_name and file_path.stem != want_name:
+                continue
             try:
                 layer = MapInfoParser.parse_file(file_path)
                 result = _convert_to_geojson(layer)
@@ -1717,7 +2248,7 @@ def get_layer_data_gz_bytes(data_id: str, layer_id: str, data_dir: Path) -> Opti
                         if source_path is None:
                             name = layer.get('name')
                             if name:
-                                for ext in ['.tab', '.mif', '.kml']:
+                                for ext in LAYER_SOURCE_EXTS:
                                     candidate = data_dir / f"{name}{ext}"
                                     if candidate.exists():
                                         source_path = candidate

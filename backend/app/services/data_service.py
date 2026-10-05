@@ -5740,9 +5740,19 @@ class DataService:
         data_dir = settings.DATA_DIR / data_id
         data_dir.mkdir(parents=True, exist_ok=True)
 
-        # 检测文件类型（KML 为自包含矢量图层）
-        is_mapinfo = filename.lower().endswith((".mif", ".tab", ".dat", ".kml"))
+        # 检测文件类型（KML/GeoJSON 为自包含矢量图层；SHP 需 .shx/.dbf 配套）
+        is_mapinfo = filename.lower().endswith(
+            (".mif", ".tab", ".dat", ".kml", ".shp", ".geojson", ".json")
+        )
         is_zip = filename.lower().endswith(".zip")
+
+        # .json 只有在内容确为 GeoJSON 时才按图层处理（避免误传普通 JSON）
+        if is_mapinfo and filename.lower().endswith(".json"):
+            from app.services.mapinfo_service import looks_like_geojson_file
+            if not looks_like_geojson_file(file_path):
+                raise ValueError(
+                    "该 .json 文件不是 GeoJSON（未找到 FeatureCollection/features），无法作为图层导入。"
+                )
 
         # 处理 ZIP 文件（离线地图或 MapInfo 包）
         if is_zip:
@@ -5756,10 +5766,12 @@ class DataService:
             with zipfile.ZipFile(file_path, "r") as zip_ref:
                 await asyncio.to_thread(zip_ref.extractall, data_dir)
 
-            # 检查解压后的文件是否为 MapInfo/KML（递归搜索子目录）
+            # 检查解压后的文件是否为矢量图层（MapInfo/KML/SHP/GeoJSON，递归搜索子目录）
             extracted_files = list(data_dir.rglob("*"))
+            from app.services.mapinfo_service import looks_like_geojson_file
             has_mapinfo = any(
-                f.suffix.lower() in [".mif", ".tab", ".kml"]
+                f.suffix.lower() in [".mif", ".tab", ".kml", ".shp", ".geojson"]
+                or (f.suffix.lower() == ".json" and looks_like_geojson_file(f))
                 for f in extracted_files
                 if f.is_file()
             )
@@ -5951,10 +5963,15 @@ class DataService:
                 return None
 
             # 配套文件按格式区分：MIF → .mid（几何在 .mif，属性在 .mid）；TAB → .dat（关键）+ .map/.id（可选）
+            # SHP → .shx/.dbf（关键）+ .prj/.cpg（可选）；KML/GeoJSON 自包含
             is_mif = filename.lower().endswith(".mif")
             is_kml = filename.lower().endswith(".kml")
-            if is_kml:
-                companion_required = []  # KML 自包含，无需配套
+            is_shp = filename.lower().endswith(".shp")
+            is_geojson = filename.lower().endswith((".geojson", ".json"))
+            if is_kml or is_geojson:
+                companion_required = []  # 自包含，无需配套
+            elif is_shp:
+                companion_required = [".shx", ".dbf"]
             else:
                 companion_required = [".mid"] if is_mif else [".dat"]
 
@@ -5973,7 +5990,10 @@ class DataService:
             copy_sources.append(str(settings.UPLOAD_DIR / "layers"))
             copy_sources.append(str(settings.UPLOAD_DIR))
 
-            all_extensions = [".dat", ".map", ".id", ".ind", ".mid", ".mif", ".tab"]
+            all_extensions = [
+                ".dat", ".map", ".id", ".ind", ".mid", ".mif", ".tab",
+                ".shx", ".dbf", ".prj", ".cpg", ".qml",
+            ]
             for src_dir in copy_sources:
                 if not missing_exts:
                     break
@@ -5997,20 +6017,33 @@ class DataService:
             if missing_exts:
                 missing_files = [f"{stem}{e}" + ("" if is_mif else " (关键文件)") for e in sorted(missing_exts)]
                 print(f"[DataService] ❌ 缺少关键文件: {missing_files}")
-                raise ValueError(
-                    f"MapInfo 文件缺少配套文件，无法正确解析。\n"
-                    f"缺少文件: {', '.join(missing_files)}\n\n"
-                    + (
+                if is_shp:
+                    _format_hint = (
+                        f"Shapefile 格式需要以下配套文件：\n"
+                        f"  • {stem}.shp - 几何数据\n"
+                        f"  • {stem}.shx - 索引文件（必需！）\n"
+                        f"  • {stem}.dbf - 属性数据（必需！）\n"
+                        f"  • {stem}.prj - 坐标系定义（可选，缺失时按 WGS84 处理）\n"
+                        f"  • {stem}.qml - QGIS 图层样式（可选，用于还原原有配色）\n\n"
+                    )
+                elif is_mif:
+                    _format_hint = (
                         f"MapInfo MIF 格式需要以下配套文件：\n"
                         f"  • {stem}.mif - 几何数据\n"
                         f"  • {stem}.mid - 属性数据（必需！）\n\n"
-                        if is_mif else
+                    )
+                else:
+                    _format_hint = (
                         f"MapInfo TAB 格式需要以下配套文件：\n"
                         f"  • {stem}.tab - 表结构定义\n"
                         f"  • {stem}.dat - 实际数据（必需！）\n"
                         f"  • {stem}.map - 样式定义（可选）\n"
                         f"  • {stem}.id - 索引文件（可选）\n\n"
                     )
+                raise ValueError(
+                    f"图层文件缺少配套文件，无法正确解析。\n"
+                    f"缺少文件: {', '.join(missing_files)}\n\n"
+                    + _format_hint
                     + f"解决方案：\n"
                     + f"  1. 上传所有配套文件（推荐）\n"
                     + f"  2. 或打包成 ZIP 文件上传（最佳）"
