@@ -341,7 +341,7 @@ def _ensure_desktop_owner(db, User, auth_service) -> None:
     if owner is None:
         presets = settings.CITY_PRESETS
         owner = User(
-            username=DESKTOP_OWNER_USERNAME(),
+            username=DESKTOP_OWNER_USERNAME,
             password_hash=auth_service.hash_password(str(uuid.uuid4())),  # 免登录，密码不可用于网页登录
             is_admin=True,          # 仅内部权限直通；UI 不暴露任何管理入口
             is_active=True,

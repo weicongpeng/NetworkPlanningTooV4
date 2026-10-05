@@ -189,17 +189,39 @@ def test_shadow_user_created_and_follows_group():
 
 # ---------------------------------------------------------------- 单用户形态
 
-def test_desktop_mode_uses_owner_instead_of_admin(monkeypatch):
-    """桌面模式不再创建 admin/admin123，而是确保唯一 owner 账号。"""
+def test_desktop_mode_creates_owner_account(monkeypatch):
+    """桌面模式不再创建 admin/admin123，而是确保唯一 owner 账号。
+
+    走真实代码路径（不打桩 _ensure_desktop_owner）：曾经把 DESKTOP_OWNER_USERNAME
+    当函数调用导致 TypeError，被 lifespan 吞掉后桌面端没有账号 → 免登录接口 500
+    → 界面回落到登录页，而打桩的测试完全测不出来。
+    """
     import app.core.database as database
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from sqlalchemy.pool import StaticPool
 
+    from app.models.database import Base, User
+
+    engine = create_engine(
+        "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
+    )
+    Base.metadata.create_all(bind=engine)
+    TestingSession = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+
+    monkeypatch.setattr(database, "SessionLocal", TestingSession)
     monkeypatch.setattr(settings, "NPT_DESKTOP", True)
-    calls = []
 
-    def fake_ensure(db, User, auth_service):
-        calls.append("owner")
-
-    monkeypatch.setattr(database, "_ensure_desktop_owner", fake_ensure)
     database.create_default_admin()
-    assert calls == ["owner"]
-    assert database.DESKTOP_OWNER_USERNAME == "owner"
+
+    db = TestingSession()
+    try:
+        owner = db.query(User).filter(User.username == database.DESKTOP_OWNER_USERNAME).first()
+        assert owner is not None, "桌面模式必须创建 owner 账号"
+        assert owner.is_active is True
+        assert owner.must_change_password is False
+        assert owner.is_admin is True  # 仅内部权限直通，UI 不暴露管理入口
+        # 桌面端不创建默认管理员
+        assert db.query(User).filter(User.username == "admin").first() is None
+    finally:
+        db.close()

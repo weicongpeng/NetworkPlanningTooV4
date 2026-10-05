@@ -12,6 +12,8 @@ interface AuthState {
   desktopMode: boolean
   /** 桌面形态探测是否已完成（未完成前不渲染登录页，避免闪一下） */
   desktopProbed: boolean
+  /** 桌面形态下免登录失败的原因（展示给用户，避免静默回落到登录页无从排查） */
+  desktopError: string | null
 
   login: (username: string, password: string) => Promise<string | null>
   register: (username: string, password: string, confirmPassword: string, city: string, operator: string, equipmentVendor?: string) => Promise<void>
@@ -44,6 +46,7 @@ export const useAuthStore = create<AuthState>()(
       isLoading: false,
       desktopMode: false,
       desktopProbed: false,
+      desktopError: null,
 
       login: async (username: string, password: string, clientType?: 'pc' | 'app') => {
         clearUserDataCaches()
@@ -143,35 +146,55 @@ export const useAuthStore = create<AuthState>()(
       probeDesktopMode: async () => {
         if (get().desktopProbed) return
         let desktopMode = false
+        let desktopError: string | null = null
         try {
-          const res: any = await systemApi.info()
-          // /system/info 是给手机 APP 做服务发现的公开接口，返回的是裸模型
-          // （{version, backend_ip, backend_port, desktop_mode}），没有 {success,data}
-          // 包裹，因此两种形状都要认。
-          const payload = res?.data ?? res
+          // 优先用专用的包裹结构接口；/system/info 是给手机 APP 做服务发现的，
+          // 返回裸模型（无 success/data），两种形状都要认。
+          let payload: any = null
+          try {
+            const primary: any = await systemApi.desktopMode()
+            payload = primary?.data ?? primary
+          } catch {
+            const fallback: any = await systemApi.info()
+            payload = fallback?.data ?? fallback
+          }
           desktopMode = Boolean(payload?.desktop_mode)
-        } catch {
-          desktopMode = false  // 服务器版没有该字段或请求失败 → 按网页版处理
+        } catch (error: any) {
+          desktopMode = false
+          desktopError = `运行形态探测失败：${error?.message || error}`
         }
-        set({ desktopMode, desktopProbed: true })
+        set({ desktopMode, desktopProbed: true, desktopError })
       },
 
       desktopAutoLogin: async () => {
-        try {
+        const attempt = async (): Promise<any> => {
           const res: any = await authApi.desktopSession()
           if (!res?.success || !res?.data?.access_token) {
-            throw new Error((res as any)?.message || '桌面会话获取失败')
+            throw new Error((res as any)?.message || `桌面会话获取失败（code=${res?.code}）`)
+          }
+          return res
+        }
+        try {
+          let res: any
+          try {
+            res = await attempt()
+          } catch (firstError: any) {
+            // 启动竞态：lifespan 还没建好 owner 账号时重试一次
+            await new Promise((r) => setTimeout(r, 1500))
+            res = await attempt()
           }
           clearUserDataCaches()
           set({
             token: res.data.access_token,
             user: res.data.user,
             isAuthenticated: true,
+            desktopError: null,
           })
         } catch (error: any) {
-          // 桌面会话不可用（如未安装完整/服务异常）→ 回落到登录页，避免白屏
-          console.warn('[desktop] 本机免登录会话获取失败，已回落登录页：', error?.message)
-          set({ desktopMode: false })
+          const message = error?.message || String(error)
+          console.warn('[desktop] 本机免登录会话获取失败：', message)
+          // 关键：不要把 desktopMode 置 false，否则会静默回落到登录页无从排查
+          set({ desktopError: message })
           throw error
         }
       },

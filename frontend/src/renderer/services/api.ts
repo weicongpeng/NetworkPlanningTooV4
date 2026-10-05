@@ -1893,6 +1893,11 @@ export const systemApi = {
   info: async (): Promise<ApiResponse<{ version: string; desktop_mode: boolean }>> => {
     return apiClient.get('/system/info') as any
   },
+
+  /** 运行形态探测专用：标准 {success, data} 包裹（/system/info 是裸模型，给手机端用） */
+  desktopMode: async (): Promise<ApiResponse<{ desktop_mode: boolean }>> => {
+    return apiClient.get('/system/desktop-mode') as any
+  },
 }
 
 // ============== 管理员用户管理API ==============

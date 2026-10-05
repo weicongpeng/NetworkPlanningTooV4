@@ -48,16 +48,24 @@ async def desktop_session(request: Request, db: Session = Depends(get_db)):
     from app.core.config import settings
     from app.core.database import DESKTOP_OWNER_USERNAME
 
+    # 桌面端没有开发者工具，失败原因只能靠日志（desktop.log）排查，这里逐项记录
     if not settings.NPT_DESKTOP:
+        print("[DesktopSession] 拒绝：NPT_DESKTOP 未启用（非桌面形态）")
         raise HTTPException(status_code=404, detail="Not Found")
 
     client_host = request.client.host if request.client else ""
     if client_host not in ("127.0.0.1", "::1", "localhost"):
+        print(f"[DesktopSession] 拒绝：来源非回环地址 {client_host}")
         raise HTTPException(status_code=403, detail="仅允许本机访问")
 
     user = db.query(User).filter(User.username == DESKTOP_OWNER_USERNAME).first()
     if user is None or not user.is_active:
+        print(
+            f"[DesktopSession] 拒绝：本机 owner 账号缺失或停用 "
+            f"(found={user is not None}, active={bool(user and user.is_active)})"
+        )
         raise HTTPException(status_code=500, detail="本机桌面账号缺失，请重新安装或联系厂商")
+    print(f"[DesktopSession] 已签发本机会话：user={user.username}, host={client_host}")
 
     token, _jti = auth_service.create_access_token(
         user.id, user.username, user.is_admin, expires_delta=timedelta(days=365)

@@ -1,6 +1,8 @@
 """
 System endpoints for service discovery
 """
+from typing import Any, Dict
+
 from fastapi import APIRouter
 from pydantic import BaseModel
 import socket
@@ -43,7 +45,8 @@ async def get_system_info():
     获取系统信息，用于服务发现
 
     返回后端的版本号、IP地址和端口号，
-    方便手机APP等客户端进行连接
+    方便手机APP等客户端进行连接。
+    注意：响应是裸模型（无 success/data 包裹），手机端依赖该形状，不要改。
     """
     from app.core.config import settings
 
@@ -53,3 +56,11 @@ async def get_system_info():
         backend_port=8000,
         desktop_mode=bool(settings.NPT_DESKTOP),
     )
+
+
+@router.get("/desktop-mode")
+async def get_desktop_mode() -> Dict[str, Any]:
+    """运行形态探测（前端在登录前调用）：标准 {success, data} 包裹，避免形状歧义。"""
+    from app.core.config import settings
+
+    return {"success": True, "data": {"desktop_mode": bool(settings.NPT_DESKTOP)}}

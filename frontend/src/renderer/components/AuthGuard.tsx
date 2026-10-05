@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useAuthStore } from '../store/authStore'
 import { LoginModal } from './LoginModal'
 import { LoadingSpinner } from './LoadingSpinner'
@@ -9,6 +9,51 @@ interface AuthGuardProps {
 
 const IDLE_TIMEOUT_MS = 3 * 60 * 60 * 1000  // 3 小时无操作才校验登录态（与后端会话空闲超时一致）
 const IDLE_CHECK_INTERVAL_MS = 60 * 1000  // 每 1 分钟检查一次空闲状态
+
+/**
+ * 桌面端启动闸门：探测形态 / 取本机会话时转圈；失败时把原因显示出来并可重试。
+ * 之前失败是静默回落到登录页，桌面端没有账号，用户只能卡在登录页且无从排查。
+ */
+function DesktopStartupGate() {
+  const desktopError = useAuthStore((s) => s.desktopError)
+  const [retrying, setRetrying] = useState(false)
+
+  if (!desktopError) {
+    return <LoadingSpinner variant="spinner" />
+  }
+
+  const retry = async () => {
+    setRetrying(true)
+    try {
+      useAuthStore.setState({ desktopError: null, desktopProbed: false })
+      await useAuthStore.getState().probeDesktopMode()
+      await useAuthStore.getState().desktopAutoLogin()
+    } catch {
+      // 失败原因已写回 desktopError，界面会刷新展示
+    } finally {
+      setRetrying(false)
+    }
+  }
+
+  return (
+    <div className="min-h-screen flex items-center justify-center p-6">
+      <div className="max-w-lg w-full border border-border rounded-lg p-5 space-y-3">
+        <div className="text-sm font-medium text-red-500">桌面端未能自动进入</div>
+        <p className="text-xs text-muted-foreground break-all">{desktopError}</p>
+        <p className="text-xs text-muted-foreground">
+          可查看日志文件排查：%APPDATA%\NetworkPlanningTool\logs\desktop.log
+        </p>
+        <button
+          onClick={retry}
+          disabled={retrying}
+          className="px-3 py-1.5 text-sm rounded border border-border hover:bg-muted disabled:opacity-50"
+        >
+          {retrying ? '重试中…' : '重试'}
+        </button>
+      </div>
+    </div>
+  )
+}
 
 export function AuthGuard({ children }: AuthGuardProps) {
   const { isAuthenticated, user } = useAuthStore()
@@ -76,7 +121,7 @@ export function AuthGuard({ children }: AuthGuardProps) {
   if (!isAuthenticated) {
     // 桌面版：形态尚未探测完 / 正在取本机会话时显示加载，探测到非桌面版才显示登录页
     if (!desktopProbed || desktopMode) {
-      return <LoadingSpinner variant="spinner" />
+      return <DesktopStartupGate />
     }
     return <LoginModal isOpen={true} />
   }
