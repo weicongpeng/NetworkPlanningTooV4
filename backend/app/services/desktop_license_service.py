@@ -69,6 +69,57 @@ def normalize_activation_code(value: Optional[str]) -> str:
     )
 
 
+def _clean_group_value(value: Optional[str]) -> Optional[str]:
+    """空串归一化为 None（组未指定 = 桌面端自选并在首次同步时绑定）。"""
+    cleaned = (value or "").strip()
+    return cleaned or None
+
+
+def _shadow_username(license_id: int) -> str:
+    return f"desktop-{license_id}"
+
+
+def ensure_shadow_user(db: Session, record: DesktopLicense, *, create: bool = True):
+    """取得（必要时创建）该桌面授权对应的服务器侧影子账号。
+
+    桌面端是单用户形态、没有账号，服务器无法用 user_id 归属数据。
+    影子账号只是数据归属载体：`is_active=False` 不能登录、`is_desktop_shadow=True`
+    便于「用户管理」过滤掉。
+
+    组信息以**授权记录**为准（为空时沿用现有值），管理员改组即级联到这里。
+    """
+    from app.models.database import User
+
+    username = _shadow_username(record.id)
+    user = db.query(User).filter(User.username == username).first()
+    if user is not None:
+        if record.city is not None and user.city != record.city:
+            user.city = record.city
+        if record.operator is not None and user.operator != record.operator:
+            user.operator = record.operator
+        user.is_desktop_shadow = True
+        return user
+    if not create:
+        return None
+    from app.services.auth_service import auth_service
+    import uuid as _uuid
+
+    user = User(
+        username=username,
+        password_hash=auth_service.hash_password(str(_uuid.uuid4())),  # 不可登录
+        is_admin=False,
+        is_active=False,
+        is_desktop_shadow=True,
+        must_change_password=False,
+        license_expiry=None,
+        city=record.city,
+        operator=record.operator,
+    )
+    db.add(user)
+    db.flush()
+    return user
+
+
 def _normalize_machine(machine_code: Optional[str]) -> str:
     normalized = normalize_machine_code(machine_code)
     if not normalized or len(normalized) != 16:
@@ -133,6 +184,8 @@ class DesktopLicenseService:
         note: Optional[str] = None,
         created_by: Optional[str] = None,
         with_code: bool = True,
+        city: Optional[str] = None,
+        operator: Optional[str] = None,
     ) -> Tuple[DesktopLicense, str]:
         name = (licensee_username or "").strip()
         if not name:
@@ -148,6 +201,8 @@ class DesktopLicenseService:
             created_by=created_by,
             created_at=_iso(),
             updated_at=_iso(),
+            city=_clean_group_value(city),
+            operator=_clean_group_value(operator),
         )
         code = ""
         if with_code:
@@ -178,6 +233,8 @@ class DesktopLicenseService:
         organization: Optional[str] = None,
         lease_days: Optional[int] = None,
         note: Optional[str] = None,
+        city: Optional[str] = None,
+        operator: Optional[str] = None,
     ) -> DesktopLicense:
         record = self.get(db, license_id)
         if licensee_username is not None:
@@ -193,9 +250,27 @@ class DesktopLicenseService:
             record.lease_days = int(lease_days)
         if note is not None:
             record.note = note.strip() or None
+        group_changed = False
+        if city is not None:
+            new_city = _clean_group_value(city)
+            group_changed = group_changed or new_city != record.city
+            record.city = new_city
+        if operator is not None:
+            new_operator = _clean_group_value(operator)
+            group_changed = group_changed or new_operator != record.operator
+            record.operator = new_operator
         record.updated_at = _iso()
         db.commit()
         db.refresh(record)
+        # 改组后同步影子账号：桌面端同步上来的数据才不会落进旧组而"消失"
+        if group_changed:
+            try:
+                shadow = ensure_shadow_user(db, record)
+                if shadow is not None:
+                    db.commit()
+            except Exception as exc:  # noqa: BLE001
+                db.rollback()
+                raise DesktopLicenseError(500, f"同步影子账号失败：{exc}") from exc
         return record
 
     def approve(
@@ -304,6 +379,9 @@ class DesktopLicenseService:
             "issued_at": _now().strftime("%Y-%m-%d %H:%M:%S"),
             "expire_date": expire_date,
             "features": ["all"],
+            # 数据组：桌面端同步时据此确定自己属于哪一组（为空则由桌面端自选）
+            "city": record.city or "",
+            "operator": record.operator or "",
         }
         try:
             license_file = desktop_signing.sign_license(payload)

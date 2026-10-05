@@ -36,6 +36,8 @@ class User(Base):
     password_hash = Column(String(255), nullable=False)
     is_admin = Column(Boolean, default=False, nullable=False)
     is_active = Column(Boolean, default=True, nullable=False)
+    # 服务器为桌面端创建的影子账号（不可登录），用于承载桌面端同步上来数据的归属
+    is_desktop_shadow = Column(Boolean, default=False, nullable=False)
     must_change_password = Column(Boolean, default=False, nullable=False)
     license_expiry = Column(DateTime, nullable=True)
     total_usage_seconds = Column(Integer, default=0, nullable=False)
@@ -72,6 +74,7 @@ class User(Base):
             "city": self.city,
             "operator": self.operator,
             "user_type": self.user_type,
+            "is_desktop_shadow": self.is_desktop_shadow,
             "can_data_import": self.can_data_import,
             "can_data_delete": self.can_data_delete,
             "can_data_update": self.can_data_update,
@@ -336,6 +339,10 @@ class DesktopLicense(Base):
     source = Column(String(10), nullable=False, default="precreate")
     lease_days = Column(Integer, nullable=False, default=30)
     expire_date = Column(String(10), nullable=True)
+    # 该桌面端所属数据组（地市+运营商）：为空时由桌面端自选并在首次同步时绑定，
+    # 非空时以服务器为准（管理员可在「桌面授权」页修改/解绑）。
+    city = Column(String(100), nullable=True)
+    operator = Column(String(50), nullable=True)
     request_token = Column(String(64), nullable=True, unique=True)
     applied_note = Column(Text, nullable=True)
     review_note = Column(Text, nullable=True)
@@ -363,6 +370,8 @@ class DesktopLicense(Base):
             "source": self.source,
             "lease_days": self.lease_days,
             "expire_date": self.expire_date,
+            "city": self.city,
+            "operator": self.operator,
             "request_id": self.request_token,
             "applied_note": self.applied_note,
             "review_note": self.review_note,
@@ -416,6 +425,40 @@ class DesktopRelease(Base):
             "created_by": self.created_by,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
+        }
+
+
+class DatasetRevision(Base):
+    """数据集修订号：桌面端共享模式下判断「服务器上的数据是否更新过」的唯一依据。
+
+    一个数据集（index.json 中的数据条目 id）一条记录。
+    rev 单调递增，任何改变数据集内容的写入都要 bump（详见 dataset_revision_service）：
+    上传完成 / 图层整层与增量保存 / PCI·TAC 应用到工参 / 小区批量更新 / 删除（墓碑）/ 组迁移。
+    deleted 为墓碑：不写墓碑的话，客户端本地删除会被当成「本地新建」被再次推上来。
+    """
+    __tablename__ = "dataset_revisions"
+
+    data_id = Column(String(36), primary_key=True)
+    rev = Column(Integer, nullable=False, default=0)
+    sha256 = Column(String(64), nullable=True)
+    deleted = Column(Boolean, nullable=False, default=False)
+    updated_by = Column(String(100), nullable=True)
+    updated_at = Column(String(30), nullable=True)
+    # 组归属快照：删除后数据集不再出现在索引里，只有靠这里才知道墓碑属于哪个组，
+    # 桌面端才能在清单里收到"服务器上这条已被删除"。
+    city = Column(String(100), nullable=True)
+    operator = Column(String(50), nullable=True)
+
+    def to_dict(self):
+        return {
+            "data_id": self.data_id,
+            "rev": self.rev,
+            "sha256": self.sha256,
+            "deleted": bool(self.deleted),
+            "updated_by": self.updated_by,
+            "updated_at": self.updated_at,
+            "city": self.city,
+            "operator": self.operator,
         }
 
 

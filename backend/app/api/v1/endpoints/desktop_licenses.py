@@ -8,14 +8,15 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.core.security import get_current_admin_user
+from app.core.security import get_current_admin_user, reject_desktop_mode
 from app.models.database import User
 from app.services.desktop_license_service import (
     DesktopLicenseError,
     desktop_license_service,
 )
 
-router = APIRouter(tags=["桌面授权管理"])
+# 桌面端是被管理方，授权只能由服务器「桌面授权」页操作
+router = APIRouter(tags=["桌面授权管理"], dependencies=[Depends(reject_desktop_mode)])
 
 
 def _gbk_safe(message: str) -> str:
@@ -29,6 +30,9 @@ class DesktopLicenseCreate(BaseModel):
     lease_days: Optional[int] = Field(default=None, ge=1, le=3650)
     note: Optional[str] = None
     with_code: bool = Field(default=True, description="是否立即生成激活码")
+    # 数据组：留空 = 由桌面端自选（首次同步时绑定到本授权）；指定则桌面端强制跟随
+    city: Optional[str] = None
+    operator: Optional[str] = None
 
 
 class DesktopLicenseUpdate(BaseModel):
@@ -36,6 +40,8 @@ class DesktopLicenseUpdate(BaseModel):
     organization: Optional[str] = None
     lease_days: Optional[int] = Field(default=None, ge=1, le=3650)
     note: Optional[str] = None
+    city: Optional[str] = None
+    operator: Optional[str] = None
 
 
 class DesktopLicenseReview(BaseModel):
@@ -74,6 +80,8 @@ async def create_desktop_license(
             note=payload.note,
             created_by=admin_user.username,
             with_code=payload.with_code,
+            city=payload.city,
+            operator=payload.operator,
         )
     except DesktopLicenseError as exc:
         raise HTTPException(status_code=exc.status_code, detail=_gbk_safe(exc.message))
@@ -97,6 +105,8 @@ async def update_desktop_license(
             organization=payload.organization,
             lease_days=payload.lease_days,
             note=payload.note,
+            city=payload.city,
+            operator=payload.operator,
         )
     except DesktopLicenseError as exc:
         raise HTTPException(status_code=exc.status_code, detail=_gbk_safe(exc.message))

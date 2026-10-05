@@ -1,8 +1,9 @@
-"""桌面版在线授权/OTA 客户端公开接口。
+"""桌面版在线授权/OTA 客户端公开接口 + 共享模式数据同步。
 
 调用方是桌面客户端（经本机后端代理），不使用站点 JWT：
 - 激活：凭证是激活码
 - 续期：凭证是上一次签发的许可文件（Ed25519 验签）
+- 数据同步：凭证同样是许可文件（服务器据此识别是哪一台桌面端）
 - 申请：返回一次性 apply_token 轮询结果
 - 版本：完全公开
 统一做轻量内存限流，防暴力猜码。
@@ -12,9 +13,11 @@ from __future__ import annotations
 import time
 import urllib.parse
 from collections import defaultdict
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
+from starlette.background import BackgroundTask
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -23,6 +26,7 @@ from app.core.database import get_db
 from app.services.desktop_license_service import (
     DesktopLicenseError,
     desktop_license_service,
+    ensure_shadow_user,
 )
 
 router = APIRouter(tags=["桌面客户端在线接口"])
@@ -180,6 +184,386 @@ async def poll_apply(
     except DesktopLicenseError as exc:
         raise HTTPException(status_code=exc.status_code, detail=_gbk_safe(exc.message))
     return {"success": True, "data": result}
+
+
+# ------------------------------------------------- 共享模式：数据同步（凭证=许可文件）
+#
+# 服务器是数据真源，桌面端保留本地全量镜像，按「数据集」粒度双向同步：
+#   manifest → 比对修订号 → pull(下载整包) / push(上传整包) / 冲突提示
+# 同一数据集并发编辑不合并行，采用「最后写入者胜 + 显式冲突」。
+
+class SyncCredential(BaseModel):
+    license_file: str = Field(..., description="本机 Ed25519 签名许可")
+    machine_code: str = Field("", description="本机机器码")
+
+
+class SessionRequest(SyncCredential):
+    city: Optional[str] = None
+    operator: Optional[str] = None
+
+
+class _Group:
+    """供 index_entry_visible 使用的轻量组对象。"""
+
+    def __init__(self, city: Optional[str], operator: Optional[str]):
+        self.city = city
+        self.operator = operator
+
+
+def _verify_license(license_file: str, machine_code: str, db: Session):
+    """验签 → 定位授权记录。桌面端没有账号，这份签名许可就是它的身份。"""
+    from app.models.database import DesktopLicense
+    from app.services import desktop_signing
+    from app.utils.machine_code import normalize_machine_code
+
+    try:
+        payload = desktop_signing.verify_license(license_file or "")
+    except desktop_signing.LicenseInvalid as exc:
+        raise HTTPException(status_code=400, detail=_gbk_safe(f"许可校验失败：{exc}"))
+
+    license_id = payload.get("license_id")
+    if not license_id:
+        raise HTTPException(status_code=400, detail="该许可不支持数据共享，请重新在线激活")
+    record = db.query(DesktopLicense).filter(DesktopLicense.id == int(license_id)).first()
+    if record is None:
+        raise HTTPException(status_code=404, detail="授权记录不存在，请联系管理员")
+    if record.status == "disabled":
+        raise HTTPException(status_code=403, detail="该授权已被禁用，请联系管理员")
+
+    machine = normalize_machine_code(machine_code)
+    if record.machine_code:
+        stored = normalize_machine_code(record.machine_code)
+        if stored and stored != machine:
+            raise HTTPException(status_code=409, detail="许可与机器码不匹配")
+    return record, payload
+
+
+def _license_group(record):
+    """桌面端所属数据组；未绑定 → None（客户端须上报自己的组来绑定）。"""
+    if record.city and record.operator:
+        return record.city, record.operator
+    return None
+
+
+@router.post("/data/session")
+async def data_session(
+    payload: SessionRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """同步握手：验签 → 确定组 → 返回服务器时间与组是否锁定。
+
+    授权记录未绑定组时，把客户端上报的组写进授权记录（管理员可在桌面授权页改/解绑）；
+    已绑定则以服务器为准并回传 group_locked=True，客户端必须纠正本地组。
+    """
+    _rate_limit(f"sync:{_client_ip(request)}", limit=120, window=300)
+    record, _ = _verify_license(payload.license_file, payload.machine_code, db)
+
+    group = _license_group(record)
+    group_locked = group is not None
+    if group is None:
+        city = (payload.city or "").strip()
+        operator = (payload.operator or "").strip()
+        from app.services.data_group import validate_group
+
+        error = validate_group(city, operator)
+        if error:
+            raise HTTPException(
+                status_code=400, detail=_gbk_safe(f"尚未指定数据组，请先在本机选择地市与运营商（{error}）")
+            )
+        record.city = city
+        record.operator = operator
+        db.commit()
+        group = (city, operator)
+    else:
+        city, operator = group
+
+    shadow = ensure_shadow_user(db, record)
+    db.commit()
+
+    return {
+        "success": True,
+        "data": {
+            "license_id": record.id,
+            "licensee": record.licensee_username,
+            "group": {"city": city, "operator": operator},
+            "group_locked": group_locked,
+            "shadow_user_id": shadow.id if shadow else None,
+            "server_time": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        },
+    }
+
+
+def _collect_manifest(city: str, operator: str) -> List[Dict[str, Any]]:
+    """列出该组的数据集清单（含删除墓碑），并为无记录的数据集补建初始修订号。"""
+    from app.services import dataset_revision_service as revs
+    from app.services.data_group import index_entry_visible
+    from app.services.data_service import data_service
+
+    group = _Group(city, operator)
+    entries = {}
+    for data_id, entry in data_service.index.items():
+        if index_entry_visible(entry, group):
+            entries[data_id] = entry
+
+    rev_map = revs.ensure(
+        {did: {"city": e.get("city"), "operator": e.get("operator")} for did, e in entries.items()}
+    )
+
+    items: List[Dict[str, Any]] = []
+    for data_id, entry in entries.items():
+        meta = entry.get("metadata") or {}
+        items.append({
+            "data_id": data_id,
+            "name": entry.get("name") or "",
+            "type": entry.get("type") or "",
+            "file_type": entry.get("fileType") or "",
+            "size": entry.get("size") or 0,
+            "status": entry.get("status") or "",
+            "layer_count": meta.get("layerCount") or 0,
+            "updated_at": entry.get("uploadDate") or "",
+            "rev": rev_map.get(data_id, 0),
+            "deleted": False,
+        })
+
+    # 墓碑：服务器上已删除、客户端本地还留着镜像的数据集
+    for row in revs.list_group(city, operator):
+        if row.get("deleted") and row.get("data_id") not in entries:
+            items.append({
+                "data_id": row["data_id"],
+                "rev": row.get("rev") or 0,
+                "deleted": True,
+            })
+    return items
+
+
+@router.post("/data/manifest")
+async def data_manifest(
+    payload: SyncCredential,
+    request: Request,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """该桌面端所属组的数据集清单（含修订号，客户端据此判断谁需要同步）。"""
+    _rate_limit(f"sync:{_client_ip(request)}", limit=120, window=300)
+    record, _ = _verify_license(payload.license_file, payload.machine_code, db)
+    group = _license_group(record)
+    if group is None:
+        raise HTTPException(status_code=409, detail="尚未绑定数据组，请先调用 /data/session")
+    return {
+        "success": True,
+        "data": {
+            "group": {"city": group[0], "operator": group[1]},
+            "items": _collect_manifest(group[0], group[1]),
+            "server_time": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        },
+    }
+
+
+@router.get("/data/dataset/{data_id}/package")
+async def download_dataset_package(
+    data_id: str,
+    license_file: str = Query(...),
+    machine_code: str = Query(default=""),
+    request: Request = None,
+    db: Session = Depends(get_db),
+):
+    """下载数据集整包（zip）。桌面端 pull 用；支持 Range 断点续传。"""
+    from fastapi.responses import FileResponse, Response
+    from starlette.concurrency import run_in_threadpool
+
+    from app.services import dataset_revision_service as revs
+    from app.services.desktop_dataset_packager import DatasetPackageError, build_package
+    from app.services.data_group import index_entry_visible
+    from app.services.data_service import data_service
+
+    _rate_limit(f"pull:{_client_ip(request)}", limit=120, window=300)
+    record, _ = _verify_license(license_file, machine_code, db)
+    group = _license_group(record)
+    if group is None:
+        raise HTTPException(status_code=409, detail="尚未绑定数据组，请先调用 /data/session")
+
+    entry = data_service.index.get(data_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="数据集不存在")
+    if not index_entry_visible(entry, _Group(group[0], group[1])):
+        # 跨组访问一律 404，不泄露数据是否存在
+        raise HTTPException(status_code=404, detail="数据集不存在")
+
+    try:
+        package = await run_in_threadpool(build_package, data_id)
+    except DatasetPackageError as exc:
+        raise HTTPException(status_code=400, detail=_gbk_safe(str(exc)))
+
+    # 打包期间算出的内容摘要写回修订记录，供后续快速比对
+    revs.bump(data_id, sha256=package["sha256"], city=group[0], operator=group[1])
+    current_rev = int((revs.get(data_id) or {}).get("rev") or 0)
+
+    zip_path = package["path"]
+    file_size = package["size"]
+    headers = {
+        "Accept-Ranges": "bytes",
+        "Cache-Control": "private, no-store, max-age=0",
+        "Content-Disposition": f"attachment; filename*=UTF-8''{urllib.parse.quote(data_id)}.zip",
+        "X-Dataset-Rev": str(current_rev),
+    }
+    # 打包产物在临时目录里，响应发出后清理（含临时根目录）
+    cleanup = BackgroundTask(_remove_temp_tree, zip_path.parent)
+
+    range_header = request.headers.get("range") if request else None
+    if range_header:
+        import re as _re
+
+        match = _re.match(r"bytes=(\d+)-(\d*)", range_header)
+        if not match:
+            return Response(status_code=416, headers={**headers, "Content-Range": f"bytes */{file_size}"})
+        start = int(match.group(1))
+        end = int(match.group(2)) if match.group(2) else file_size - 1
+        if start >= file_size or end < start:
+            return Response(status_code=416, headers={**headers, "Content-Range": f"bytes */{file_size}"})
+        end = min(end, file_size - 1)
+
+        def _read_range() -> bytes:
+            with open(zip_path, "rb") as f:
+                f.seek(start)
+                return f.read(end - start + 1)
+
+        data = await run_in_threadpool(_read_range)
+        return Response(
+            content=data,
+            status_code=206,
+            media_type="application/zip",
+            background=cleanup,
+            headers={
+                **headers,
+                "Content-Range": f"bytes {start}-{end}/{file_size}",
+                "Content-Length": str(len(data)),
+            },
+        )
+
+    return FileResponse(
+        zip_path, media_type="application/zip", headers=headers, background=cleanup
+    )
+
+
+def _remove_temp_tree(path: Path) -> None:
+    try:
+        import shutil
+
+        if path.exists() and path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+@router.post("/data/dataset/{data_id}/package")
+async def upload_dataset_package(
+    data_id: str,
+    license_file: str = Form(...),
+    machine_code: str = Form(default=""),
+    base_rev: Optional[int] = Form(default=None),
+    file: UploadFile = File(...),
+    request: Request = None,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """上传数据集整包（push）。桌面端贡献数据给同组的其它桌面端与网页端用户。
+
+    base_rev 为乐观锁：服务器当前修订号与之不符 → 409 冲突，由客户端让用户选边。
+    """
+    from starlette.concurrency import run_in_threadpool
+
+    from app.services import dataset_revision_service as revs
+    from app.services.desktop_dataset_packager import DatasetPackageError, install_package
+    from app.services.data_group import index_entry_visible
+    from app.services.data_service import data_service
+
+    _rate_limit(f"push:{_client_ip(request)}", limit=120, window=300)
+    record, _ = _verify_license(license_file, machine_code, db)
+    group = _license_group(record)
+    if group is None:
+        raise HTTPException(status_code=409, detail="尚未绑定数据组，请先调用 /data/session")
+    city, operator = group
+
+    import tempfile
+
+    tmp_path = Path(tempfile.gettempdir()) / f"npt-push-{data_id}-{int(time.time())}.zip"
+    try:
+        with tmp_path.open("wb") as out:
+            while chunk := await file.read(1024 * 1024):
+                out.write(chunk)
+    finally:
+        await file.close()
+
+    try:
+        existing = data_service.index.get(data_id)
+        if existing is not None and not index_entry_visible(existing, _Group(city, operator)):
+            raise HTTPException(status_code=403, detail="不能覆盖其它数据组的数据集")
+
+        current = revs.get(data_id)
+        current_rev = int((current or {}).get("rev") or 0)
+        # 数据集已在服务器且客户端基线落后 → 冲突（除非客户端本来就是新建）
+        if base_rev is not None and current_rev and current_rev != int(base_rev):
+            raise HTTPException(
+                status_code=409,
+                detail=_gbk_safe(
+                    f"服务器上的「{existing.get('name') if existing else data_id}」已被更新"
+                    f"（本地基线 rev={base_rev}，服务器 rev={current_rev}），"
+                    "请先拉取最新或选择覆盖服务器版本"
+                ),
+            )
+
+        shadow = ensure_shadow_user(db, record)
+        db.commit()
+        try:
+            await run_in_threadpool(
+                install_package,
+                tmp_path,
+                user_id=shadow.id,
+                city=city,
+                operator=operator,
+                username=record.licensee_username,
+            )
+        except DatasetPackageError as exc:
+            raise HTTPException(status_code=400, detail=_gbk_safe(str(exc)))
+
+        new_rev = revs.get(data_id)
+        return {
+            "success": True,
+            "data": {"data_id": data_id, "rev": int((new_rev or {}).get("rev") or 0)},
+            "message": "已同步到服务器",
+        }
+    finally:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+@router.delete("/data/dataset/{data_id}")
+async def delete_dataset(
+    data_id: str,
+    payload: SyncCredential,
+    request: Request,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """删除服务器上的数据集（客户端侧删除的传播）。"""
+    from app.services.data_group import index_entry_visible
+    from app.services.data_service import data_service
+
+    _rate_limit(f"sync:{_client_ip(request)}", limit=120, window=300)
+    record, _ = _verify_license(payload.license_file, payload.machine_code, db)
+    group = _license_group(record)
+    if group is None:
+        raise HTTPException(status_code=409, detail="尚未绑定数据组，请先调用 /data/session")
+
+    entry = data_service.index.get(data_id)
+    if entry is not None:
+        if not index_entry_visible(entry, _Group(group[0], group[1])):
+            raise HTTPException(status_code=404, detail="数据集不存在")
+        data_service.delete_data(data_id, force=True)
+    from app.services import dataset_revision_service as revs
+
+    revs.bump(data_id, deleted=True, sha256="", city=group[0], operator=group[1])
+    return {"success": True, "message": "已在服务器删除"}
 
 
 # ---------------------------------------------------------------- OTA 版本
