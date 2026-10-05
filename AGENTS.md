@@ -1,8 +1,14 @@
 # 技术规范
 
 ## 项目文档
-- 本仓库的代码架构、常用命令与开发约束见根目录 `CODEBUDDY.md`；本文件只保留通用协作与技术规范。
-- 两者冲突时，代码库实际情况以 `CODEBUDDY.md` 为准。
+- 分工：`CLAUDE.md` 与 `CODEBUDDY.md` 互为镜像，收录代码架构、常用命令、开发约束；本文件只保留通用协作与技术规范；`README.md` 是面向用户的功能概览。
+- 三者与代码不一致时以当前代码为准；发现文档滞后请顺手更新对应文件，不要另起新副本。
+- 历史设计与实施记录在 `docs/plans/`（按日期）；部署运维见 `NetworkPlanningTooV3-部署指南.md`、`NetworkPlanningTooV3-linux服务器版本部署指南.md`、`npt-backend.service`、根 `重启命令`。
+
+## 别改错文件
+- 根目录的 `data_service.py`、`mapinfo_service.py` 是 7 月旧快照（已入库），不是运行代码；一律改 `backend/app/services/` 下同名文件。
+- 根 `nptserve.spec` 与 `desktop/desktop.spec` 并存，桌面打包以 `desktop/desktop.spec` + `.github/workflows/build-windows-desktop.yml` 为准，`installer-out/` 是本地产物目录。
+- `frontend/package.json.electron`、`frontend/capacitor.config.ts`、`frontend/start-electron-dev.bat` 为遗留文件，Electron / Capacitor 已废弃。
 
 ## 编码与架构原则
 - 始终使用简体中文回复
@@ -62,6 +68,14 @@
 - 不顺手“美化”相邻代码、注释或格式；没坏的不重构；跟着现有风格走，哪怕你有更顺手的写法。
 - 撞见无关的死代码：只提醒、不删；但自己改动留下的孤儿导入/变量/函数，要顺手清干净。
 - 底线：每一行 diff 都能对上某个具体需求。
+
+## 桌面离线版（desktop/）
+- `desktop/launcher.py`（pywebview + WebView2）、`desktop/desktop.spec`（PyInstaller onedir，配 `desktop/hooks/hook-pyogrio.py`）、`desktop/installer.iss`（Inno Setup per-user 安装），由 `.github/workflows/build-windows-desktop.yml` 在 windows-latest 出包，产物落 `installer-out/`。
+- 授权：`desktop/tools/gen_keypair.py` 生成 Ed25519 密钥对，私钥在 `desktop/tools/keys/`（已 gitignore，禁止入库），公钥 hex 写进 `backend/app/core/license_public_key.py`；`desktop/tools/gen_license.py` 签发离线 `.nptlic`。
+- 桌面模式由 launcher 注入 `NPT_DESKTOP=1` 生效；任何改动不得改变服务器（systemd）部署行为。
+
+## 部署归我
+- 前端构建与后端重启由用户手动执行（`npm run build:vite`、`systemctl restart npt-backend`），不要代跑，也不要反复请示。
 
 ## 目标驱动执行
 给足成功标准，让它自己循环到达标，而不是一步一停等你喂指令。
