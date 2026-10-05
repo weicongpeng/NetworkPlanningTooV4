@@ -2318,6 +2318,7 @@ class TaskManager:
                 _logger.info(f"[ApplyPCI-Phase1] PCI+TAC联合更新: 同时标记 applied_tac")
             data_service.index[full_params_id]['uploadDate'] = datetime.now().isoformat()
             data_service._save_index()
+            data_service._bump_revision(full_params_id)  # 桌面共享模式：同组其他桌面端需同步
 
         return {
             "success": True,
@@ -3002,6 +3003,7 @@ class TaskManager:
             data_service.index[full_params_id]['excel_synced'] = False  # 下载时从SQLite按需生成
             data_service.index[full_params_id]['uploadDate'] = datetime.now().isoformat()
             data_service._save_index()
+            data_service._bump_revision(full_params_id)  # 桌面共享模式：同组其他桌面端需同步
 
         return {
             "success": True,

@@ -282,4 +282,10 @@ def apply_layer_patch(data_id: str, layer_id: str, patch: Dict[str, Any],
     )
     result["mode"] = "patch"
     result["applied"] = {"upserts": len(upserts), "deletes": len(delete_rows)}
+    try:
+        from app.services.layer_edit_service import _touch_dataset_revision
+
+        _touch_dataset_revision(data_id)
+    except Exception as e:  # noqa: BLE001
+        print(f"[LayerPatch] 数据集修订号更新失败（非致命）: {e}")
     return result

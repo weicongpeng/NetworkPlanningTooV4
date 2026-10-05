@@ -194,6 +194,8 @@ def migrate_group_data(
     # 内存索引（index.json）条目同步迁移
     index_count = 0
     try:
+        from app.services import dataset_revision_service as revs
+
         for entry in data_service.index.values():
             if entry.get("city") != old_city or entry.get("operator") != old_operator:
                 continue
@@ -202,6 +204,8 @@ def migrate_group_data(
             entry["city"] = new_city
             entry["operator"] = new_operator
             index_count += 1
+            # 归属变了 → 旧组看不到、新组看得到，等于数据对两端都变了
+            revs.bump(entry.get("id"), deleted=False)
         if index_count:
             data_service._save_index()
     except Exception as e:

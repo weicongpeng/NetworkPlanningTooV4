@@ -168,6 +168,15 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning(f"⚠️ 启动桌面自动续期任务失败: {e}")
 
+    # 桌面模式：共享模式定时数据同步（离线模式下任务内自行跳过）
+    if settings.NPT_DESKTOP:
+        try:
+            import asyncio
+            from app.services.desktop_sync_service import sync_loop
+            asyncio.create_task(sync_loop())
+        except Exception as e:
+            logger.warning(f"⚠️ 启动桌面数据同步任务失败: {e}")
+
     # 初始化进程池（用于 CPU 密集型任务）
     pool = None
     try:

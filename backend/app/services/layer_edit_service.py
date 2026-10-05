@@ -96,6 +96,23 @@ _LAYER_STEM_SUFFIXES = {
 _FIELD_MAP_TAIL = "nptfields.json"
 
 
+def _touch_dataset_revision(data_id: str) -> None:
+    """推进数据集修订号（桌面共享模式：告诉其他桌面端这份数据变了）。
+
+    旁路记账，失败只打印日志，不能让图层保存失败。
+    """
+    try:
+        from app.services import dataset_revision_service as revs
+
+        revs.bump(data_id, deleted=False)
+        # 桌面共享模式：本地改动要上行到服务器
+        from app.services.desktop_sync_service import note_change
+
+        note_change(data_id)
+    except Exception as e:  # noqa: BLE001
+        print(f"[LayerEdit] 数据集修订号更新失败（非致命）: {e}")
+
+
 def _layer_fmt(path: Path) -> Optional[str]:
     """源文件路径 → 图层格式名；不支持编辑保存的格式返回 None。"""
     return _LAYER_FMT_BY_SUFFIX.get(path.suffix.lower())
@@ -233,6 +250,7 @@ def create_empty_layer(name: str, geometry_type: str = "mixed", fmt: str = "tab"
         },
     }
     data_service._save_index()
+    _touch_dataset_revision(data_id)
 
     # SQLite Layer 行
     _save_layer_metadata(
@@ -1160,4 +1178,5 @@ def save_layer_geojson(data_id: str, layer_id: str, geojson: Dict[str, Any],
         feature_styles=feature_styles, fmt=fmt,
     )
     result["mode"] = "full"
+    _touch_dataset_revision(data_id)
     return result

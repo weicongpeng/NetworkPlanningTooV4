@@ -492,6 +492,30 @@ class DataService:
                 _os.unlink(tmp_path)
             raise
 
+    def _bump_revision(self, data_id: str, *, deleted: bool = False, group=None) -> None:
+        """推进数据集修订号（桌面共享模式的同步依据）。
+
+        group=(city, operator) 只在删除场景需要传：那时索引条目已经不存在了。
+        旁路记账：任何失败都只记日志，绝不影响业务写入。
+        """
+        try:
+            from app.services import dataset_revision_service as revs
+
+            if group is None:
+                entry = self.index.get(data_id) or {}
+                group = (entry.get("city"), entry.get("operator"))
+            city, operator = group
+            if deleted:
+                revs.mark_deleted(data_id, city=city, operator=operator)
+            else:
+                revs.bump(data_id, deleted=False, city=city, operator=operator)
+            # 桌面共享模式：本地改动要上行到服务器
+            from app.services.desktop_sync_service import note_change
+
+            note_change(data_id, deleted=deleted)
+        except Exception as e:  # noqa: BLE001
+            safe_print(f"[DataService] 数据集修订号更新失败（非致命）: {e}")
+
     def _scan_uploads_directory(self):
         """扫描uploads目录中的文件，发现 SQLite 中不存在的文件时自动迁移导入"""
         safe_print(f"[DataService] 开始扫描uploads目录...")
@@ -1118,6 +1142,7 @@ class DataService:
         if full_params_id in self.index:
             self.index[full_params_id]["size"] = excel_size
         self._save_index()
+        self._bump_revision(full_params_id)
 
         safe_print(f"[DataService] 新站录入完成: {cell_name} ({network_type_val})")
         self._invalidate_cell_search_index()
@@ -1638,6 +1663,7 @@ class DataService:
             if full_params_id in self.index:
                 self.index[full_params_id]["size"] = excel_size
             self._save_index()
+            self._bump_revision(full_params_id)
         except Exception as e:
             safe_print(f"[DataService] 更新索引失败 (非致命): {e}")
 
@@ -2178,6 +2204,7 @@ class DataService:
                 if workbook_id in self.index:
                     self.index[workbook_id]["size"] = excel_size
                 self._save_index()
+                self._bump_revision(workbook_id)  # 小区批量更新改变了工参内容
             except Exception as e:
                 safe_print(f"[DataService] 更新索引失败 (非致命): {e}")
 
@@ -3915,6 +3942,7 @@ class DataService:
                     })
                     safe_print(f"[DataService] MapInfo 图层已注册: {len(_mapinfo_layers)} 个图层")
                     self._save_index()  # 持久化 MapInfo 图层索引
+                    self._bump_revision(data_id)
                     return  # 早返回，跳过后续 Excel 处理逻辑
                 else:
                     raise ValueError("ZIP文件中未找到有效的数据文件（支持 Excel/CSV/TXT/MapInfo TAB）")
@@ -4200,6 +4228,7 @@ class DataService:
 
             safe_print(f"[DataService] 索引已更新为 ready")
             self._save_index()  # 持久化索引到 index.json
+            self._bump_revision(data_id)  # 桌面共享模式：通知桌面端拉取新版本
 
         except Exception as e:
             safe_print(f"[DataService] 后台处理失败: {type(e).__name__}: {e}")
@@ -6192,6 +6221,7 @@ class DataService:
 
 
         self._save_index()  # 持久化地图上传索引
+        self._bump_revision(data_id)
         return {"id": data_id, "name": filename, "status": "ready"}
 
     def check_access(self, data_id: str, user) -> bool:
@@ -6544,8 +6574,12 @@ class DataService:
                 safe_print(f"  - {error}")
 
         # 6. 更新索引
+        entry = self.index.get(data_id) or {}
+        _dead_group = (entry.get("city"), entry.get("operator"))
         del self.index[data_id]
         self._save_index()  # 持久化删除操作
+        # 墓碑：否则桌面端「本地删除」会被当成「本地新建」再次推回服务器
+        self._bump_revision(data_id, deleted=True, group=_dead_group)
 
         safe_print(f"[DataService] 数据 {data_id} 已从索引中移除")
 

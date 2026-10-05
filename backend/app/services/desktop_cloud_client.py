@@ -12,6 +12,7 @@ import json
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -96,6 +97,150 @@ def get_handshake() -> Dict[str, Any]:
         return resp.get("data") or {}
     except CloudError:
         return {}
+
+
+def _license_file_text() -> str:
+    from app.services.license_service import license_service
+
+    path = license_service._signed_license_file()
+    if not path.is_file():
+        raise CloudError(400, "本机尚未激活，请先在线激活或导入授权文件")
+    return path.read_text(encoding="utf-8")
+
+
+# ---------------------------------------------------------------- 共享模式数据同步
+
+def sync_session(city: str, operator: str) -> Dict[str, Any]:
+    """同步握手：服务器确定桌面端的数据组（未绑定则上报值即成为绑定值）。"""
+    from app.utils.machine_code import get_machine_code
+
+    resp = _request(
+        "POST",
+        "/desktop-cloud/data/session",
+        {
+            "license_file": _license_file_text(),
+            "machine_code": get_machine_code(),
+            "city": city or "",
+            "operator": operator or "",
+        },
+    )
+    return resp.get("data") or {}
+
+
+def sync_manifest() -> Dict[str, Any]:
+    """本组数据集清单（含修订号与删除墓碑）。"""
+    from app.utils.machine_code import get_machine_code
+
+    resp = _request(
+        "POST",
+        "/desktop-cloud/data/manifest",
+        {"license_file": _license_file_text(), "machine_code": get_machine_code()},
+        timeout=30,
+    )
+    return resp.get("data") or {}
+
+
+def download_package(data_id: str, destdir: Optional[Path] = None) -> Path:
+    """下载数据集整包，返回 zip 路径（位于专用临时目录，调用方负责清理）。"""
+    import shutil
+    import tempfile
+    import urllib.parse
+    from urllib.request import Request as UrlRequest, urlopen
+
+    from app.utils.machine_code import get_machine_code
+
+    base = server_url()
+    if not base:
+        raise CloudError(0, "未配置授权服务器地址")
+    query = urllib.parse.urlencode(
+        {"license_file": _license_file_text(), "machine_code": get_machine_code()}
+    )
+    request = UrlRequest(
+        f"{base}/api/v1/desktop-cloud/data/dataset/{urllib.parse.quote(data_id)}/package?{query}",
+        method="GET",
+        headers={"User-Agent": "NPT-Desktop"},
+    )
+    target_dir = Path(destdir) if destdir else Path(tempfile.mkdtemp(prefix="npt-pull-"))
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / f"{data_id}.zip"
+    try:
+        with urlopen(request, timeout=180) as resp, target.open("wb") as out:
+            shutil.copyfileobj(resp, out)
+    except urllib.error.HTTPError as exc:
+        shutil.rmtree(target_dir, ignore_errors=True)
+        raise CloudError(exc.code, f"下载数据集失败（HTTP {exc.code}）") from exc
+    except urllib.error.URLError as exc:
+        shutil.rmtree(target_dir, ignore_errors=True)
+        raise CloudError(0, f"无法连接授权服务器（{exc.reason}）") from exc
+    return target
+
+
+def upload_package(data_id: str, zip_path: Path, base_rev: Optional[int] = None) -> Dict[str, Any]:
+    """上传数据集整包（multipart/form-data，手动构造以免引入 requests 依赖）。"""
+    import mimetypes
+    import urllib.parse
+
+    from app.utils.machine_code import get_machine_code
+
+    base = server_url()
+    if not base:
+        raise CloudError(0, "未配置授权服务器地址")
+
+    boundary = f"----NPTDesktop{uuid.uuid4().hex}"
+    fields = [
+        ("license_file", _license_file_text()),
+        ("machine_code", get_machine_code()),
+    ]
+    if base_rev is not None:
+        fields.append(("base_rev", str(base_rev)))
+
+    body = bytearray()
+    for name, value in fields:
+        body += f"--{boundary}\r\n".encode()
+        body += f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode()
+        body += value.encode("utf-8") + b"\r\n"
+    filename = zip_path.name
+    ctype = mimetypes.guess_type(filename)[0] or "application/zip"
+    body += f"--{boundary}\r\n".encode()
+    body += (
+        f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
+        f"Content-Type: {ctype}\r\n\r\n"
+    ).encode()
+    with zip_path.open("rb") as f:
+        body += f.read()
+    body += f"\r\n--{boundary}--\r\n".encode()
+
+    request = urllib.request.Request(
+        f"{base}/api/v1/desktop-cloud/data/dataset/{urllib.parse.quote(data_id)}/package",
+        data=bytes(body),
+        method="POST",
+        headers={
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "User-Agent": "NPT-Desktop",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=600) as resp:
+            payload = json.loads(resp.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as exc:
+        raise CloudError(exc.code, _http_error_detail(exc)) from exc
+    except urllib.error.URLError as exc:
+        raise CloudError(0, f"无法连接授权服务器（{exc.reason}）") from exc
+    if not payload.get("success"):
+        raise CloudError(502, payload.get("message") or payload.get("detail") or "上传失败")
+    return payload.get("data") or {}
+
+
+def delete_dataset(data_id: str) -> Dict[str, Any]:
+    """通知服务器删除该数据集。"""
+    from app.utils.machine_code import get_machine_code
+
+    resp = _request(
+        "DELETE",
+        f"/desktop-cloud/data/dataset/{urllib.parse.quote(data_id)}",
+        {"license_file": _license_file_text(), "machine_code": get_machine_code()},
+    )
+    return resp or {}
 
 
 # ---------------------------------------------------------------- 业务
