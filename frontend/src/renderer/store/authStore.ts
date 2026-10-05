@@ -145,7 +145,11 @@ export const useAuthStore = create<AuthState>()(
         let desktopMode = false
         try {
           const res: any = await systemApi.info()
-          desktopMode = Boolean(res?.success && res?.data?.desktop_mode)
+          // /system/info 是给手机 APP 做服务发现的公开接口，返回的是裸模型
+          // （{version, backend_ip, backend_port, desktop_mode}），没有 {success,data}
+          // 包裹，因此两种形状都要认。
+          const payload = res?.data ?? res
+          desktopMode = Boolean(payload?.desktop_mode)
         } catch {
           desktopMode = false  // 服务器版没有该字段或请求失败 → 按网页版处理
         }
@@ -166,6 +170,7 @@ export const useAuthStore = create<AuthState>()(
           })
         } catch (error: any) {
           // 桌面会话不可用（如未安装完整/服务异常）→ 回落到登录页，避免白屏
+          console.warn('[desktop] 本机免登录会话获取失败，已回落登录页：', error?.message)
           set({ desktopMode: false })
           throw error
         }
