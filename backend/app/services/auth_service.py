@@ -64,7 +64,10 @@ class AuthService:
             return None, "用户名或密码错误"
         if not user.is_active:
             return None, "账号已被禁用，请联系管理员"
-        if user.license_expiry:
+        if user.license_expiry and not settings.NPT_DESKTOP:
+            # 服务器模式：按用户的 license_expiry 作登录闸门（管理员分配）
+            # 桌面模式跳过：未激活时会把全体用户镜像为过去日期，若在此拦截，
+            # 管理员将无法登录去激活（鸡生蛋）；桌面端由签名授权文件 + 前端门禁约束
             now = datetime.now(timezone.utc)
             expiry = user.license_expiry
             if expiry.tzinfo is None:

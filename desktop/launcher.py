@@ -258,7 +258,11 @@ def main(argv: Optional[list] = None) -> int:
     data_root = _bootstrap_environment()
     _setup_logging(data_root)
     _ensure_backend_on_path()
-    _log.info("桌面启动器启动，数据根: %s", data_root)
+    _log.info(
+        "桌面启动器启动，版本: %s，数据根: %s",
+        os.environ.get("NPT_DESKTOP_VERSION") or "unknown",
+        data_root,
+    )
 
     if not _acquire_single_instance():
         _log.info("检测到已有实例在运行，退出")
