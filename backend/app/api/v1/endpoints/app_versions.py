@@ -15,14 +15,15 @@ from fastapi.responses import FileResponse, Response, StreamingResponse
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.core.security import get_current_admin_user
+from app.core.security import get_current_admin_user, reject_desktop_mode
 from app.models.database import User, AppVersion
 from app.models.schemas import AppVersionUpdate
 from app.core.config import settings
 import logging
 
 logger = logging.getLogger(__name__)
-router = APIRouter(tags=["APP版本管理"])
+# 桌面端不分發 APP 版本
+router = APIRouter(tags=["APP版本管理"], dependencies=[Depends(reject_desktop_mode)])
 
 # APK 存储目录（可写数据根下）
 APKS_DIR = settings.APKS_DIR

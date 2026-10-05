@@ -30,10 +30,23 @@ class AuthService:
 
     # ---- JWT ----
 
-    def create_access_token(self, user_id: int, username: str, is_admin: bool) -> Tuple[str, str]:
-        """创建JWT令牌，返回 (token, jti)"""
+    def create_access_token(
+        self,
+        user_id: int,
+        username: str,
+        is_admin: bool,
+        expires_delta: Optional[timedelta] = None,
+    ) -> Tuple[str, str]:
+        """创建JWT令牌，返回 (token, jti)。
+
+        expires_delta 省略时用默认有效期；桌面免登录会话传入超长有效期
+        （桌面没有登录入口可重新签发，过期即死锁）。
+        """
         jti = str(uuid.uuid4())
-        expire = datetime.now(timezone.utc) + timedelta(minutes=settings.JWT_ACCESS_TOKEN_EXPIRE_MINUTES)
+        delta = expires_delta if expires_delta is not None else timedelta(
+            minutes=settings.JWT_ACCESS_TOKEN_EXPIRE_MINUTES
+        )
+        expire = datetime.now(timezone.utc) + delta
         payload = {
             "sub": str(user_id),
             "username": username,
@@ -184,6 +197,8 @@ class AuthService:
         online_stats 为全量（跨所有页）在线统计：{online, online_pc, online_app}。
         """
         query = db.query(User)
+        # 服务器为桌面端创建的影子账号（不可登录，仅承载同步数据归属）不进用户列表
+        query = query.filter(User.is_desktop_shadow == False)  # noqa: E712
         if search:
             query = query.filter(User.username.ilike(f"%{search}%"))
         if is_active is not None:

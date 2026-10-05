@@ -2,6 +2,8 @@
 数据库引擎和会话管理
 使用 SQLite + SQLAlchemy ORM
 """
+import uuid
+
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker, Session, DeclarativeBase
 from app.core.config import settings
@@ -47,7 +49,8 @@ def init_db():
     _migrate_users_db()
 
     from app.models.database import (
-        User, UserSession, Workbook, Site, Sector, GeoFile, Layer, UserSettings, TaskResult
+        User, UserSession, Workbook, Site, Sector, GeoFile, Layer, UserSettings, TaskResult,
+        DatasetRevision,
     )  # noqa: F401
     Base.metadata.create_all(bind=engine)
 
@@ -79,6 +82,27 @@ def init_db():
         wb_cols = [row[1] for row in conn.exec_driver_sql("PRAGMA table_info(workbooks)").fetchall()]
         if "remark" not in wb_cols:
             conn.exec_driver_sql("ALTER TABLE workbooks ADD COLUMN remark TEXT")
+
+        # 迁移：桌面版授权记录添加数据组归属列（共享模式下按组共享服务器端数据）
+        dl_cols = [row[1] for row in conn.exec_driver_sql("PRAGMA table_info(desktop_licenses)").fetchall()]
+        if dl_cols:
+            if "city" not in dl_cols:
+                conn.exec_driver_sql("ALTER TABLE desktop_licenses ADD COLUMN city VARCHAR(100)")
+            if "operator" not in dl_cols:
+                conn.exec_driver_sql("ALTER TABLE desktop_licenses ADD COLUMN operator VARCHAR(50)")
+
+        # 迁移：桌面共享模式数据集修订号表（早期版本可能缺组归属列）
+        dr_cols = [row[1] for row in conn.exec_driver_sql("PRAGMA table_info(dataset_revisions)").fetchall()]
+        if dr_cols:
+            if "city" not in dr_cols:
+                conn.exec_driver_sql("ALTER TABLE dataset_revisions ADD COLUMN city VARCHAR(100)")
+            if "operator" not in dr_cols:
+                conn.exec_driver_sql("ALTER TABLE dataset_revisions ADD COLUMN operator VARCHAR(50)")
+
+        # 迁移：桌面版新增一个「影子用户」标记列，用于区分服务器为桌面端创建的
+        # 不可登录账号（桌面端以签名授权为身份，没有真实账号）
+        if "is_desktop_shadow" not in existing_cols:
+            conn.exec_driver_sql("ALTER TABLE users ADD COLUMN is_desktop_shadow BOOLEAN NOT NULL DEFAULT 0")
 
         # 迁移：task_results 表添加 is_applied 列
         tr_cols = [row[1] for row in conn.exec_driver_sql("PRAGMA table_info(task_results)").fetchall()]
@@ -300,22 +324,65 @@ def _migrate_users_db():
         pass
 
 
+DESKTOP_OWNER_USERNAME = "owner"  # 桌面版唯一本机账号名（单用户形态）
+
+
+def _ensure_desktop_owner(db, User, auth_service) -> None:
+    """桌面版单用户：确保存在唯一活跃 owner 账号，冻结其余账号（不删除，可恢复）。
+
+    桌面端没有管理员概念、没有用户管理与注册入口，登录页被跳过，
+    因此本机只允许一个可用账号。旧版桌面端遗留的 admin 等账号置为停用，
+    避免「多用户」残留。
+    """
+    import logging
+
+    logger = logging.getLogger(__name__)
+    owner = db.query(User).filter(User.username == DESKTOP_OWNER_USERNAME).first()
+    if owner is None:
+        presets = settings.CITY_PRESETS
+        owner = User(
+            username=DESKTOP_OWNER_USERNAME(),
+            password_hash=auth_service.hash_password(str(uuid.uuid4())),  # 免登录，密码不可用于网页登录
+            is_admin=True,          # 仅内部权限直通；UI 不暴露任何管理入口
+            is_active=True,
+            must_change_password=False,
+            license_expiry=None,
+            city=presets[0] if presets else None,
+            operator="移动",
+        )
+        db.add(owner)
+    else:
+        if not owner.is_active:
+            owner.is_active = True
+        if owner.must_change_password:
+            owner.must_change_password = False
+
+    # 冻结其余账号（单用户形态）
+    others = db.query(User).filter(User.username != DESKTOP_OWNER_USERNAME).all()
+    deactivated = [u.username for u in others if u.is_active]
+    for u in others:
+        u.is_active = False
+    db.commit()
+    if deactivated:
+        logger.info(f"[桌面单用户] 已停用遗留账号：{', '.join(deactivated)}（数据按数据组隔离，不受影响）")
+
+
 def create_default_admin():
-    """创建默认管理员账号（如不存在）"""
+    """创建默认管理员账号（如不存在）。
+
+    桌面版（NPT_DESKTOP=1）：改为确保唯一本机 owner 账号，不创建 admin/admin123。
+    """
     from app.models.database import User
     from app.services.auth_service import auth_service
 
     db = SessionLocal()
     try:
+        if settings.NPT_DESKTOP:
+            _ensure_desktop_owner(db, User, auth_service)
+            return
+
         existing_admin = db.query(User).filter(User.is_admin == True).first()
         if existing_admin is None:
-            # 桌面版：给默认管理员一个可用数据组（NULL 组看不到任何业务数据/上传后不可见）；
-            # 首个预设地市 + 默认运营商，管理员可在「用户管理」中修改（会触发存量数据迁移）。
-            city = operator = None
-            if settings.NPT_DESKTOP:
-                presets = settings.CITY_PRESETS
-                city = presets[0] if presets else None
-                operator = "移动"
             admin = User(
                 username="admin",
                 password_hash=auth_service.hash_password("admin123"),
@@ -323,8 +390,8 @@ def create_default_admin():
                 is_active=True,
                 must_change_password=True,
                 license_expiry=None,
-                city=city,
-                operator=operator,
+                city=None,
+                operator=None,
             )
             db.add(admin)
             db.commit()

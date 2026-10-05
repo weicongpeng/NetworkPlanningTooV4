@@ -80,6 +80,7 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set())
   const location = useLocation()
   const { user, isAuthenticated, logout } = useAuthStore()
+  const desktopMode = useAuthStore((s) => s.desktopMode)
   const { themeMode, setThemeMode } = useThemeStore()
 
   // 侧边栏底部用户信息浮层：悬浮显示，点击固定（再次点击或点击浮层外关闭）
@@ -135,7 +136,8 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
       ],
     },
     { type: 'link', name: t('nav.config'), href: '/license', icon: Shield },
-    ...(isAuthenticated && user?.is_admin ? [
+    // 桌面版是单用户形态，没有管理员与用户管理，以下服务器端管理入口全部隐藏
+    ...(isAuthenticated && user?.is_admin && !desktopMode ? [
       { type: 'link' as const, name: t('admin.title', '用户管理'), href: '/admin/users', icon: Users },
       { type: 'link' as const, name: t('sidebar.appVersions', 'APP 版本管理'), href: '/app-versions', icon: Package },
       { type: 'link' as const, name: t('sidebar.desktopLicenses', '桌面授权'), href: '/desktop-licenses', icon: KeyRound },
@@ -550,7 +552,9 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
                   </div>
                 )}
               </div>
-              {/* 退出登录按钮：收起时仅显示图标（悬停提示），与导航项图标尺寸一致 */}
+              {/* 退出登录按钮：收起时仅显示图标（悬停提示），与导航项图标尺寸一致。
+                  桌面版为免登录单用户形态，退出后会自动重新进入，故隐藏 */}
+              {!desktopMode && (
               <button
                 onClick={handleLogout}
                 title={!sidebarOpen ? t('auth.logout', '退出登录') : undefined}
@@ -577,6 +581,7 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
                   {t('auth.logout', '退出登录')}
                 </span>
               </button>
+              )}
             </div>
           )}
 

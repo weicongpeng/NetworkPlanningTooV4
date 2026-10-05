@@ -1,19 +1,25 @@
 import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
 import type { UserInfo } from '@shared/types'
-import { authApi } from '../services/api'
+import { authApi, systemApi } from '../services/api'
 
 interface AuthState {
   token: string | null
   user: UserInfo | null
   isAuthenticated: boolean
   isLoading: boolean
+  /** 运行形态：True=桌面版（本机后端），由公开的 /system/info 探测得到 */
+  desktopMode: boolean
+  /** 桌面形态探测是否已完成（未完成前不渲染登录页，避免闪一下） */
+  desktopProbed: boolean
 
   login: (username: string, password: string) => Promise<string | null>
   register: (username: string, password: string, confirmPassword: string, city: string, operator: string, equipmentVendor?: string) => Promise<void>
   logout: () => Promise<void>
   fetchUser: () => Promise<void>
   changePassword: (oldPassword: string, newPassword: string, confirmPassword: string) => Promise<void>
+  probeDesktopMode: () => Promise<void>
+  desktopAutoLogin: () => Promise<void>
 }
 
 /** 清空按用户隔离的内存数据缓存（登录前/登出后调用，防止切换账号读到上一账号的组数据） */
@@ -36,6 +42,8 @@ export const useAuthStore = create<AuthState>()(
       user: null,
       isAuthenticated: false,
       isLoading: false,
+      desktopMode: false,
+      desktopProbed: false,
 
       login: async (username: string, password: string, clientType?: 'pc' | 'app') => {
         clearUserDataCaches()
@@ -128,6 +136,37 @@ export const useAuthStore = create<AuthState>()(
           }
         } catch (error: any) {
           set({ isLoading: false })
+          throw error
+        }
+      },
+
+      probeDesktopMode: async () => {
+        if (get().desktopProbed) return
+        let desktopMode = false
+        try {
+          const res: any = await systemApi.info()
+          desktopMode = Boolean(res?.success && res?.data?.desktop_mode)
+        } catch {
+          desktopMode = false  // 服务器版没有该字段或请求失败 → 按网页版处理
+        }
+        set({ desktopMode, desktopProbed: true })
+      },
+
+      desktopAutoLogin: async () => {
+        try {
+          const res: any = await authApi.desktopSession()
+          if (!res?.success || !res?.data?.access_token) {
+            throw new Error((res as any)?.message || '桌面会话获取失败')
+          }
+          clearUserDataCaches()
+          set({
+            token: res.data.access_token,
+            user: res.data.user,
+            isAuthenticated: true,
+          })
+        } catch (error: any) {
+          // 桌面会话不可用（如未安装完整/服务异常）→ 回落到登录页，避免白屏
+          set({ desktopMode: false })
           throw error
         }
       },

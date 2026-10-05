@@ -5,18 +5,17 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
-from app.core.config import settings
 from app.core.database import get_db
-from app.core.security import get_current_admin_user
+from app.core.security import get_current_admin_user, reject_desktop_mode
 from app.models.database import User
 from app.models.schemas import (
     UserCreate, UserUpdate, ResetPasswordRequest,
     UserResponse, UserDetailResponse, UserListResponse, UserSessionResponse,
 )
 from app.services.auth_service import auth_service
-from app.services.license_service import license_service
 
-router = APIRouter()
+# 桌面版为单用户形态，没有管理员与用户管理入口
+router = APIRouter(dependencies=[Depends(reject_desktop_mode)])
 
 
 def _user_to_response(user: User) -> dict:
@@ -72,9 +71,6 @@ async def create_user(
             license_expiry = datetime.fromisoformat(data.license_expiry)
         except ValueError:
             raise HTTPException(status_code=400, detail="授权截止日期格式无效")
-    if settings.NPT_DESKTOP:
-        # 桌面版：授权由厂商签名文件统一下发，忽略客户端传值
-        license_expiry = license_service.desktop_expiry_datetime()
 
     user, error = auth_service.create_user(
         db=db,
@@ -165,9 +161,6 @@ async def update_user(
             updates["license_expiry"] = datetime.fromisoformat(updates["license_expiry"])
         except ValueError:
             raise HTTPException(status_code=400, detail="授权截止日期格式无效")
-    if settings.NPT_DESKTOP:
-        # 桌面版：授权由厂商签名文件统一下发，忽略客户端传值
-        updates["license_expiry"] = license_service.desktop_expiry_datetime()
 
     # 不允许管理员禁用自己
     if updates.get("is_active") == False and user_id == admin_user.id:

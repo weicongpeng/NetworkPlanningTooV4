@@ -6,6 +6,7 @@ from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.core.database import get_db
 from app.services.auth_service import auth_service
 
@@ -90,9 +91,23 @@ async def get_token_jti(
     return payload.get("jti")
 
 
+def reject_desktop_mode() -> None:
+    """桌面版禁用依赖：服务器专用管理端点在 NPT_DESKTOP=1 下一律 404。
+
+    桌面端是单用户形态，没有管理员，也不需要用户/APP版本/安装包/授权管理入口。
+    """
+    if settings.NPT_DESKTOP:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
+
+
 def require_permission(perm: str):
-    """权限校验依赖工厂：管理员自动通过，普通用户需对应权限位为 True"""
+    """权限校验依赖工厂：管理员自动通过，普通用户需对应权限位为 True。
+
+    桌面版（NPT_DESKTOP=1）为单用户形态，不设管理员与权限位概念，一律放行。
+    """
     async def checker(current_user=Depends(get_current_user)):
+        if settings.NPT_DESKTOP:
+            return current_user
         if current_user.is_admin:
             return current_user
         if not getattr(current_user, perm, False):

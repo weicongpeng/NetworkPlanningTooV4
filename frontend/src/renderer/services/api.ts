@@ -316,6 +316,16 @@ uploadClient.interceptors.response.use(
 )
 
 // 桌面版授权管理（管理员，按用户授权 + 激活码）
+/** 桌面授权编辑字段；city/operator 为该桌面端的数据组（null=由桌面端自选） */
+export interface DesktopLicensePayload {
+  licensee_username?: string
+  organization?: string
+  lease_days?: number
+  note?: string
+  city?: string | null
+  operator?: string | null
+}
+
 export const desktopLicensesApi = {
   list: async (
     page = 1,
@@ -329,18 +339,13 @@ export const desktopLicensesApi = {
     return apiClient.get('/desktop-licenses', { params })
   },
 
-  create: async (data: {
-    licensee_username: string
-    organization?: string
-    lease_days?: number
-    note?: string
-  }): Promise<ApiResponse<DesktopLicenseRecord>> => {
+  create: async (data: DesktopLicensePayload): Promise<ApiResponse<DesktopLicenseRecord>> => {
     return apiClient.post('/desktop-licenses', data)
   },
 
   update: async (
     id: number,
-    data: { licensee_username?: string; organization?: string; lease_days?: number; note?: string },
+    data: DesktopLicensePayload,
   ): Promise<ApiResponse<DesktopLicenseRecord>> => {
     return apiClient.put(`/desktop-licenses/${id}`, data)
   },
@@ -533,6 +538,40 @@ export const desktopCloudApi = {
   > => {
     return apiClient.get('/desktop/cloud-apply')
   },
+
+  // ---- 共享模式 / 离线模式 与数据同步 ----
+  getSyncStatus: async (): Promise<ApiResponse<DesktopSyncStatus>> => {
+    return apiClient.get('/desktop/sync-status') as any
+  },
+
+  setRunMode: async (mode: 'shared' | 'offline'): Promise<ApiResponse<DesktopSyncStatus>> => {
+    return apiClient.put('/desktop/run-mode', { mode }) as any
+  },
+
+  syncNow: async (): Promise<ApiResponse<any>> => {
+    return apiClient.post('/desktop/sync') as any
+  },
+
+  resolveConflict: async (dataId: string, resolution: 'server' | 'local'): Promise<ApiResponse<any>> => {
+    return apiClient.post('/desktop/sync-resolve', { data_id: dataId, resolution }) as any
+  },
+
+  updateGroup: async (city: string, operator: string): Promise<ApiResponse<{ city: string; operator: string }>> => {
+    return apiClient.put('/desktop/group', { city, operator }) as any
+  },
+}
+
+/** 桌面共享模式同步状态 */
+export interface DesktopSyncStatus {
+  desktop: boolean
+  run_mode: 'shared' | 'offline'
+  server_url: string
+  activated: boolean
+  last_sync_at: string | null
+  last_error: string | null
+  pending_uploads: number
+  conflicts: { data_id: string; name: string; server_rev: number; local_rev: number }[]
+  synced_datasets: number
 }
 
 // ===== 优化后的分块上传（动态分块 + 串行 + 指数退避） =====
@@ -1841,6 +1880,18 @@ export const authApi = {
 
   changePassword: async (data: ChangePasswordRequest): Promise<ApiResponse<any>> => {
     return apiClient.post('/auth/change-password', data) as any
+  },
+
+  /** 桌面版免登录会话（仅 NPT_DESKTOP=1 的本机后端可用，服务器返回 404） */
+  desktopSession: async (): Promise<ApiResponse<TokenResponse>> => {
+    return apiClient.get('/auth/desktop-session') as any
+  },
+}
+
+/** 系统信息（公开）：含运行形态标识，桌面端据此走免登录 */
+export const systemApi = {
+  info: async (): Promise<ApiResponse<{ version: string; desktop_mode: boolean }>> => {
+    return apiClient.get('/system/info') as any
   },
 }
 

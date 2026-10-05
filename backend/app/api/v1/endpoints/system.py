@@ -12,6 +12,8 @@ class SystemInfo(BaseModel):
     version: str
     backend_ip: str
     backend_port: int
+    # 运行形态：桌面版为 True（前端据此跳过登录页、走本机免登录会话）
+    desktop_mode: bool = False
 
 def get_local_ip() -> str:
     """获取本机IP地址"""
@@ -43,8 +45,11 @@ async def get_system_info():
     返回后端的版本号、IP地址和端口号，
     方便手机APP等客户端进行连接
     """
+    from app.core.config import settings
+
     return SystemInfo(
         version="1.0.0",
         backend_ip=get_local_ip(),
-        backend_port=8000
+        backend_port=8000,
+        desktop_mode=bool(settings.NPT_DESKTOP),
     )

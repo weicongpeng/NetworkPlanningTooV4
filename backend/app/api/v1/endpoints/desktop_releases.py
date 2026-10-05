@@ -21,10 +21,11 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.database import get_db
-from app.core.security import get_current_admin_user
+from app.core.security import get_current_admin_user, reject_desktop_mode
 from app.models.database import DesktopRelease, User
 
-router = APIRouter(tags=["桌面版版本管理"])
+# 桌面端是升级的下游消费者，安装包只能在服务器端管理
+router = APIRouter(tags=["桌面版版本管理"], dependencies=[Depends(reject_desktop_mode)])
 
 RELEASES_DIR = settings.DESKTOP_RELEASES_DIR
 _chunked_sessions: Dict[str, Dict[str, Any]] = {}

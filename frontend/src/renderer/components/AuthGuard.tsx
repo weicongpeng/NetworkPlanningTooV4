@@ -1,6 +1,7 @@
 import { useEffect, useRef } from 'react'
 import { useAuthStore } from '../store/authStore'
 import { LoginModal } from './LoginModal'
+import { LoadingSpinner } from './LoadingSpinner'
 
 interface AuthGuardProps {
   children: React.ReactNode
@@ -11,7 +12,22 @@ const IDLE_CHECK_INTERVAL_MS = 60 * 1000  // 每 1 分钟检查一次空闲状�
 
 export function AuthGuard({ children }: AuthGuardProps) {
   const { isAuthenticated, user } = useAuthStore()
+  const desktopMode = useAuthStore((s) => s.desktopMode)
+  const desktopProbed = useAuthStore((s) => s.desktopProbed)
   const lastActivityRef = useRef(Date.now())
+
+  // 运行形态探测：桌面版（NPT_DESKTOP=1）由 /system/info 公开字段判定
+  useEffect(() => {
+    useAuthStore.getState().probeDesktopMode()
+  }, [])
+
+  // 桌面版免登录：没有账号体系，直接用本机 owner 会话进入
+  useEffect(() => {
+    if (!desktopProbed || !desktopMode || isAuthenticated) return
+    useAuthStore.getState().desktopAutoLogin().catch(() => {
+      // desktopAutoLogin 失败时已回落为网页版登录语义，这里只兜底避免未捕获拒绝
+    })
+  }, [desktopProbed, desktopMode, isAuthenticated])
 
   // 监听 401 事件（API 拦截器触发）→ 主动验证 token 并同步 store 状态
   // 后台 token 校验由 authStore persist 的 onRehydrateStorage 触发（fire-and-forget）
@@ -58,6 +74,10 @@ export function AuthGuard({ children }: AuthGuardProps) {
 
   // 未认证 → 只显示登录界面，不渲染应用内容（persist 同步恢复，无需等待网络验证）
   if (!isAuthenticated) {
+    // 桌面版：形态尚未探测完 / 正在取本机会话时显示加载，探测到非桌面版才显示登录页
+    if (!desktopProbed || desktopMode) {
+      return <LoadingSpinner variant="spinner" />
+    }
     return <LoginModal isOpen={true} />
   }
 
