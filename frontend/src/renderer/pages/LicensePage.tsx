@@ -14,6 +14,7 @@ import {
 import { useAuthStore } from '../store/authStore'
 import { licenseApi, desktopCloudApi } from '../services/api'
 import { LLMConfigCard } from '../components/LLMConfigCard'
+import { DesktopSyncCard } from '../components/DesktopSyncCard'
 
 export function LicensePage() {
   const { t, i18n } = useTranslation()
@@ -293,8 +294,8 @@ export function LicensePage() {
         </div>
       )}
 
-      {/* 桌面离线授权：在线激活/续期 + 机器码 + 离线导入（仅桌面版、管理员可见） */}
-      {isAdmin && machineInfo?.desktopMode && (
+      {/* 桌面离线授权：在线激活/续期 + 机器码 + 离线导入（仅桌面版） */}
+      {machineInfo?.desktopMode && (
         <div className="mb-6 max-w-5xl">
           <div className="bg-card p-5 rounded-lg border border-border">
             <div className="flex items-center justify-between mb-4">
@@ -507,6 +508,9 @@ export function LicensePage() {
           </div>
         </div>
       )}
+
+      {/* 桌面版：共享模式 ⇄ 离线模式 与数据同步 */}
+      <DesktopSyncCard />
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 max-w-5xl">
         {/* 语言设置 */}

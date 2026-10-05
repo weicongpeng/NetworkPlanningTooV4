@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Ban, Check, Copy, KeyRound, Loader2, Pencil, Plus, RefreshCw, RotateCcw, Trash2, Unlink, X } from 'lucide-react'
 import type { DesktopLicenseRecord } from '@shared/types'
-import { desktopLicensesApi } from '../services/api'
+import { authApi, desktopLicensesApi } from '../services/api'
 
 const STATUS_STYLE: Record<string, string> = {
   pending: 'bg-blue-500/10 text-blue-500',
@@ -32,6 +32,8 @@ export function DesktopLicensesPage() {
   const [createOrg, setCreateOrg] = useState('')
   const [createLease, setCreateLease] = useState(30)
   const [createNote, setCreateNote] = useState('')
+  const [createCity, setCreateCity] = useState('')
+  const [createOperator, setCreateOperator] = useState('')
 
   const [newCode, setNewCode] = useState<{ name: string; code: string } | null>(null)
   const [editing, setEditing] = useState<DesktopLicenseRecord | null>(null)
@@ -39,6 +41,24 @@ export function DesktopLicensesPage() {
   const [editOrg, setEditOrg] = useState('')
   const [editLease, setEditLease] = useState(30)
   const [editNote, setEditNote] = useState('')
+  const [editCity, setEditCity] = useState('')
+  const [editOperator, setEditOperator] = useState('')
+
+  // 数据组下拉（地市 + 运营商）：决定该桌面端在共享模式下共享到哪一组的数据
+  const [cities, setCities] = useState<string[]>([])
+  const [operators, setOperators] = useState<string[]>([])
+
+  useEffect(() => {
+    authApi
+      .getOptions()
+      .then((res: any) => {
+        if (res?.success) {
+          setCities(res.data?.cities ?? [])
+          setOperators(res.data?.operators ?? [])
+        }
+      })
+      .catch(() => {})
+  }, [])
 
   const fetchItems = useCallback(async () => {
     setLoading(true)
@@ -72,6 +92,8 @@ export function DesktopLicensesPage() {
         organization: createOrg.trim() || undefined,
         lease_days: createLease || undefined,
         note: createNote.trim() || undefined,
+        city: createCity || null,
+        operator: createOperator || null,
       })
       if (res?.success) {
         setShowCreate(false)
@@ -79,6 +101,8 @@ export function DesktopLicensesPage() {
         setCreateName('')
         setCreateOrg('')
         setCreateNote('')
+        setCreateCity('')
+        setCreateOperator('')
         await fetchItems()
       }
     } catch (err: any) {
@@ -129,6 +153,8 @@ export function DesktopLicensesPage() {
     setEditOrg(item.organization || '')
     setEditLease(item.lease_days)
     setEditNote(item.note || '')
+    setEditCity((item as any).city || '')
+    setEditOperator((item as any).operator || '')
   }
 
   const submitEdit = async () => {
@@ -139,6 +165,8 @@ export function DesktopLicensesPage() {
         organization: editOrg.trim(),
         lease_days: editLease,
         note: editNote.trim(),
+        city: editCity || null,
+        operator: editOperator || null,
       })
       setEditing(null)
       notify('success', t('desktopLicenses.updateSuccess'))
@@ -256,6 +284,7 @@ export function DesktopLicensesPage() {
               <th className="px-3 py-2 text-left">{t('desktopLicenses.colUser')}</th>
               <th className="px-3 py-2 text-left">{t('desktopLicenses.colStatus')}</th>
               <th className="px-3 py-2 text-left">{t('desktopLicenses.colCode')}</th>
+              <th className="px-3 py-2 text-left">{t('desktopLicenses.colGroup')}</th>
               <th className="px-3 py-2 text-left">{t('desktopLicenses.colMachine')}</th>
               <th className="px-3 py-2 text-left">{t('desktopLicenses.colExpire')}</th>
               <th className="px-3 py-2 text-left">{t('desktopLicenses.colActions')}</th>
@@ -295,6 +324,17 @@ export function DesktopLicensesPage() {
                     </div>
                   ) : (
                     <span className="text-xs text-muted-foreground">-</span>
+                  )}
+                </td>
+                <td className="px-3 py-2">
+                  {(item as any).city && (item as any).operator ? (
+                    <div className="text-xs">
+                      {(item as any).city} / {(item as any).operator}
+                    </div>
+                  ) : (
+                    <span className="text-xs text-muted-foreground">
+                      {t('desktopLicenses.groupUnset')}
+                    </span>
                   )}
                 </td>
                 <td className="px-3 py-2">
@@ -379,7 +419,7 @@ export function DesktopLicensesPage() {
             ))}
             {items.length === 0 && !loading && (
               <tr>
-                <td colSpan={6} className="px-3 py-8 text-center text-muted-foreground text-sm">
+                <td colSpan={7} className="px-3 py-8 text-center text-muted-foreground text-sm">
                   {t('desktopLicenses.empty')}
                 </td>
               </tr>
@@ -445,6 +485,29 @@ export function DesktopLicensesPage() {
               placeholder={t('desktopLicenses.noteLabel')}
               className="w-full px-3 py-2 bg-background border border-border rounded-lg text-sm"
             />
+            <div className="flex gap-2">
+              <select
+                value={createCity}
+                onChange={(e) => setCreateCity(e.target.value)}
+                className="flex-1 px-3 py-2 bg-background border border-border rounded-lg text-sm"
+              >
+                <option value="">{t('desktopLicenses.groupCityPlaceholder')}</option>
+                {cities.map((c) => (
+                  <option key={c} value={c}>{c}</option>
+                ))}
+              </select>
+              <select
+                value={createOperator}
+                onChange={(e) => setCreateOperator(e.target.value)}
+                className="flex-1 px-3 py-2 bg-background border border-border rounded-lg text-sm"
+              >
+                <option value="">{t('desktopLicenses.groupOperatorPlaceholder')}</option>
+                {operators.map((o) => (
+                  <option key={o} value={o}>{o}</option>
+                ))}
+              </select>
+            </div>
+            <p className="text-xs text-muted-foreground">{t('desktopLicenses.groupHint')}</p>
             <p className="text-xs text-muted-foreground">{t('desktopLicenses.createHint')}</p>
             <div className="flex gap-2 justify-end">
               <button
@@ -495,6 +558,29 @@ export function DesktopLicensesPage() {
               placeholder={t('desktopLicenses.noteLabel')}
               className="w-full px-3 py-2 bg-background border border-border rounded-lg text-sm"
             />
+            <div className="flex gap-2">
+              <select
+                value={editCity}
+                onChange={(e) => setEditCity(e.target.value)}
+                className="flex-1 px-3 py-2 bg-background border border-border rounded-lg text-sm"
+              >
+                <option value="">{t('desktopLicenses.groupCityPlaceholder')}</option>
+                {cities.map((c) => (
+                  <option key={c} value={c}>{c}</option>
+                ))}
+              </select>
+              <select
+                value={editOperator}
+                onChange={(e) => setEditOperator(e.target.value)}
+                className="flex-1 px-3 py-2 bg-background border border-border rounded-lg text-sm"
+              >
+                <option value="">{t('desktopLicenses.groupOperatorPlaceholder')}</option>
+                {operators.map((o) => (
+                  <option key={o} value={o}>{o}</option>
+                ))}
+              </select>
+            </div>
+            <p className="text-xs text-muted-foreground">{t('desktopLicenses.groupHint')}</p>
             <div className="flex gap-2 justify-end">
               <button
                 onClick={() => setEditing(null)}
