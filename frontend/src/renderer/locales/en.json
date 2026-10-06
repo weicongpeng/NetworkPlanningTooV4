@@ -1731,6 +1731,7 @@
     "deviation": "Deviation",
     "inBand": "Band Check",
     "inBandNone": "No common NR band matched",
+    "gscnOutOfBand": "GSCN {{gscn}} is outside the {{band}} range {{min}}–{{max}}; nearest in-band is {{nearest}} ({{freq}} MHz)",
     "gsnHint": "GSCN is a discrete sync raster; valid only at SSB center frequency",
     "invalid": "Invalid or out of range",
     "placeholderUlFreq": "Enter UL frequency",

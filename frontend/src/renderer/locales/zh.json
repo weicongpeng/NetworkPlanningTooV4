@@ -1685,6 +1685,7 @@
     "deviation": "偏差",
     "inBand": "频段校验",
     "inBandNone": "未匹配到常用 NR 频段",
+    "gscnOutOfBand": "GSCN {{gscn}} 不在 {{band}} 可用范围 {{min}}–{{max}} 内，带内最近为 {{nearest}}（{{freq}} MHz）",
     "gsnHint": "GSCN 为离散同步栅格点，仅 SSB 中心频率有效",
     "invalid": "输入无效或超出范围",
     "placeholderUlFreq": "请输入上行频率",

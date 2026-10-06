@@ -188,11 +188,13 @@ export function matchNrBand(freqMhz: number): NrBand | null {
 // ==================== GSCN ====================
 
 /**
- * GSCN 三段全局同步栅格（参照「GSCN和频点换算方法.docx」，基于 3GPP TS 38.104）
+ * GSCN 三段全局同步栅格（3GPP TS 38.104 Table 5.4.3.1-1）
  *
  * 区间1（0-3000MHz，非均匀栅格）：
  *   SS_REF = N×1200kHz + M×50kHz，N=1..2499，M∈{1,3,5}
- *   GSCN = 3(N-1) + (M-3)/2 + 1，范围 1~7497
+ *   GSCN = 3N + (M-3)/2，范围 2~7498（N=1,M=1 → GSCN 2；N=2499,M=5 → GSCN 7498）
+ *   注：仓库内「GSCN和频点换算方法.docx」在区间1 写作 3(N-1)+(M-3)/2+1，比标准少 2，
+ *   且由此臆造出 7498 空洞；此处以 TS 38.104 为准。
  * 区间2（3000-24250MHz，连续整数 GSCN，步长 1.44MHz）：
  *   SS_REF = 3000 + (GSCN-7499)×1.44，GSCN 范围 7499~22255
  *   GSCN = 7499 + int((F-3000)/1.44)
@@ -201,17 +203,17 @@ export function matchNrBand(freqMhz: number): NrBand | null {
  *   GSCN = 22256 + int((F-24250.08)/17.28)
  */
 
-/** 区间1 反推：GSCN(1~7497) → { N, M }。GSCN 对 3 取余决定 M 分支。 */
+/** 区间1 反推：GSCN(2~7498) → { N, M }。GSCN 对 3 取余决定 M 分支。 */
 function gsnRange1ToNM(gscn: number): { n: number; m: number } | null {
-  // GSCN = 3(N-1) + (M-3)/2 + 1，M∈{1,3,5}
-  // 设 x=(M-3)/2 ∈ {-1,0,1} → GSCN = 3N + x - 2 → N = (GSCN - x + 2)/3
-  // 由 GSCN mod 3 定 x：GSCN≡0→x=-1(M=1)，GSCN≡1→x=0(M=3)，GSCN≡2→x=1(M=5)
+  // GSCN = 3N + (M-3)/2，M∈{1,3,5}
+  // 设 x=(M-3)/2 ∈ {-1,0,1} → GSCN = 3N + x → N = (GSCN - x)/3
+  // 由 GSCN mod 3 定 x：GSCN≡2→x=-1(M=1)，GSCN≡0→x=0(M=3)，GSCN≡1→x=1(M=5)
   const r = gscn % 3
   let x: number, m: number
-  if (r === 0) { x = -1; m = 1 }
-  else if (r === 1) { x = 0; m = 3 }
+  if (r === 2) { x = -1; m = 1 }
+  else if (r === 0) { x = 0; m = 3 }
   else { x = 1; m = 5 }
-  const n = (gscn - x + 2) / 3
+  const n = (gscn - x) / 3
   if (!Number.isInteger(n) || n < 1 || n > 2499) return null
   return { n, m }
 }
@@ -227,7 +229,7 @@ function gsnFreqToGscnRange1(freqMhz: number): { gscn: number; actualFreq: numbe
       const actualFreq = ssRefKhz / 1000
       const deviationKHz = Math.round(Math.abs(actualFreq - freqMhz) * 1000)
       if (!best || deviationKHz < best.deviationKHz) {
-        best = { gscn: 3 * (n - 1) + (m - 3) / 2 + 1, actualFreq, deviationKHz }
+        best = { gscn: 3 * n + (m - 3) / 2, actualFreq, deviationKHz }
       }
     }
   }
@@ -238,7 +240,8 @@ function gsnFreqToGscnRange1(freqMhz: number): { gscn: number; actualFreq: numbe
 export function gsnFreqToGscn(freqMhz: number): { gscn: number; actualFreq: number; deviationKHz: number } | null {
   if (!Number.isFinite(freqMhz) || freqMhz < 0 || freqMhz > 100000) return null
   const freqKhz = Math.round(freqMhz * 1000)
-  if (freqMhz <= 3000) return gsnFreqToGscnRange1(freqMhz)
+  // 3000MHz 整点是区间2 的起点（GSCN 7499），归区间2，否则该 GSCN 无法由频率反推得到
+  if (freqMhz < 3000) return gsnFreqToGscnRange1(freqMhz)
   if (freqMhz <= 24250) {
     // 步长 1.44MHz = 1440kHz
     const gscn = 7499 + Math.floor((freqKhz - 3000000) / 1440)
@@ -253,18 +256,81 @@ export function gsnFreqToGscn(freqMhz: number): { gscn: number; actualFreq: numb
   return { gscn, actualFreq, deviationKHz: Math.round(Math.abs(actualFreq - freqMhz) * 1000) }
 }
 
-/** GSCN → SS_REF 频率（三段自动路由）；非法 GSCN 或区间空洞(7498)返回 null。区间2/3 用整数 kHz 运算 */
+/** GSCN → SS_REF 频率（三段自动路由）；非法 GSCN 返回 null。区间2/3 用整数 kHz 运算 */
 export function gsnGscnToFreq(gscn: number): { freqMhz: number } | null {
-  if (!Number.isInteger(gscn) || gscn < 1) return null
-  if (gscn <= 7497) {
+  if (!Number.isInteger(gscn) || gscn < 2) return null
+  if (gscn <= 7498) {
     const nm = gsnRange1ToNM(gscn)
     if (!nm) return null
     return { freqMhz: (nm.n * 1200 + nm.m * 50) / 1000 }
   }
-  if (gscn === 7498) return null // 区间1 与区间2 之间的空洞
   if (gscn <= 22255) return { freqMhz: (3000000 + (gscn - 7499) * 1440) / 1000 }
   if (gscn <= 26639) return { freqMhz: (24250080 + (gscn - 22256) * 17280) / 1000 }
   return null
+}
+
+// ==================== 频段可用 GSCN 范围 ====================
+
+/**
+ * 各频段的可用 GSCN 范围（TS 38.104 §5.4.3.1 同步栅格，取值范围按频段给定）
+ *
+ * 判据：SS_REF 落在该频段下行频率区间内。例如 n28 下行 758–803MHz →
+ * GSCN 1895(758.45MHz) 为首个、2007(802.95MHz) 为末个；1894(757.45MHz) 与 2008(803.05MHz) 均已出带。
+ *
+ * 只收录已确认范围的频段：未收录的频段不参与判定（宁可不提示，不可误报）。
+ * 新频段补齐后在此追加，并在测试的「范围端点与频段下行频率区间一致」用例中加对应断言。
+ */
+export interface NrBandGscnRange {
+  band: string
+  gscnMin: number
+  gscnMax: number
+}
+
+export const NR_BAND_GSCN_RANGES: NrBandGscnRange[] = [
+  { band: 'n28', gscnMin: 1895, gscnMax: 2007 },
+  { band: 'n41', gscnMin: 6239, gscnMax: 6724 },
+]
+
+/** 取频段可用 GSCN 范围；未收录该频段时返回 null */
+export function getBandGscnRange(band: string): NrBandGscnRange | null {
+  return NR_BAND_GSCN_RANGES.find(r => r.band === band) ?? null
+}
+
+/** GSCN 越界信息：该 GSCN 不在所属频段可用范围内 */
+export interface GscnBandViolation {
+  band: string
+  gscnMin: number
+  gscnMax: number
+  /** 该频段内离输入 GSCN 最近的合法 GSCN */
+  nearestInBand: number
+  nearestInBandFreqMhz: number
+}
+
+/**
+ * 校验 GSCN 是否落在所属频段的可用范围内，越界则返回带内最近点供提示。
+ *
+ * band 由频率匹配（matchNrBand）得出；未匹配到频段、或该频段未收录范围时一律返回 null——
+ * 频率→GSCN 取的是全局最近栅格点，在频段边界会落到带外（如 n41 上边界 2690MHz → GSCN 6725 @2690.45MHz，
+ * 而 n41 止于 6724），此函数用于把这种情况显式暴露出来，不改写换算结果。
+ */
+export function findGscnBandViolation(
+  gscn: number,
+  band: string | null | undefined
+): GscnBandViolation | null {
+  if (!band || !Number.isInteger(gscn)) return null
+  const range = getBandGscnRange(band)
+  if (!range) return null
+  if (gscn >= range.gscnMin && gscn <= range.gscnMax) return null
+  const nearestInBand = Math.min(Math.max(gscn, range.gscnMin), range.gscnMax)
+  const freq = gsnGscnToFreq(nearestInBand)
+  if (!freq) return null
+  return {
+    band: range.band,
+    gscnMin: range.gscnMin,
+    gscnMax: range.gscnMax,
+    nearestInBand,
+    nearestInBandFreqMhz: freq.freqMhz,
+  }
 }
 
 // ==================== GSCN ↔ ARFCN ====================

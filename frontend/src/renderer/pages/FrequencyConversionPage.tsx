@@ -4,7 +4,21 @@ import { RadioTower } from 'lucide-react'
 import {
   getLteBandTable, lteConvert, matchNrBand,
   nrFreqToArfcn, nrArfcnToFreq, gsnFreqToGscn, gsnGscnToFreq,
+  findGscnBandViolation,
 } from '../utils/frequencyConversion'
+import type { GscnBandViolation } from '../utils/frequencyConversion'
+
+/** NR 换算结果；ok 时附频段可用 GSCN 范围校验（越界才非 null） */
+type NrResult =
+  | { kind: 'error'; error: string }
+  | { kind: 'ok'; freq: number; arfcn: number; gscn: number; band: string | null; deviationKHz: number; violation: GscnBandViolation | null }
+  | { kind: 'empty' }
+
+/** 组装 ok 结果：band 由频率匹配，GSCN 越界时附带内最近点 */
+function okNrResult(freq: number, arfcn: number, gscn: number, deviationKHz: number): NrResult {
+  const band = matchNrBand(freq)?.band ?? null
+  return { kind: 'ok', freq, arfcn, gscn, band, deviationKHz, violation: findGscnBandViolation(gscn, band) }
+}
 
 export default function FrequencyConversionPage() {
   const { t } = useTranslation()
@@ -53,11 +67,6 @@ export default function FrequencyConversionPage() {
   const [nrArfcnInput, setNrArfcnInput] = useState('')
   const [nrGscnInput, setNrGscnInput] = useState('')
 
-  type NrResult =
-    | { kind: 'error'; error: string }
-    | { kind: 'ok'; freq: number; arfcn: number; gscn: number; band: string | null; deviationKHz: number }
-    | { kind: 'empty' }
-
   /** 任一输入 → 其余两个实时输出 */
   const nrResult = useMemo<NrResult>(() => {
     const freq = parseFloat(nrFreqInput)
@@ -66,7 +75,7 @@ export default function FrequencyConversionPage() {
       if (arfcn === null) return { kind: 'error', error: t('freqConversion.invalid') }
       const g = gsnFreqToGscn(freq)
       if (g === null) return { kind: 'error', error: t('freqConversion.invalid') }
-      return { kind: 'ok', freq, arfcn, gscn: g.gscn, band: matchNrBand(freq)?.band ?? null, deviationKHz: g.deviationKHz }
+      return okNrResult(freq, arfcn, g.gscn, g.deviationKHz)
     }
     const arfcn = parseInt(nrArfcnInput, 10)
     if (nrArfcnInput.trim() !== '' && Number.isInteger(arfcn)) {
@@ -74,7 +83,7 @@ export default function FrequencyConversionPage() {
       if (f === null) return { kind: 'error', error: t('freqConversion.invalid') }
       const g = gsnFreqToGscn(f)
       if (g === null) return { kind: 'error', error: t('freqConversion.invalid') }
-      return { kind: 'ok', freq: f, arfcn, gscn: g.gscn, band: matchNrBand(f)?.band ?? null, deviationKHz: g.deviationKHz }
+      return okNrResult(f, arfcn, g.gscn, g.deviationKHz)
     }
     const gscn = parseInt(nrGscnInput, 10)
     if (nrGscnInput.trim() !== '' && Number.isInteger(gscn)) {
@@ -82,7 +91,7 @@ export default function FrequencyConversionPage() {
       if (fr === null) return { kind: 'error', error: t('freqConversion.invalid') }
       const arfcn = nrFreqToArfcn(fr.freqMhz)
       if (arfcn === null) return { kind: 'error', error: t('freqConversion.invalid') }
-      return { kind: 'ok', freq: fr.freqMhz, arfcn, gscn, band: matchNrBand(fr.freqMhz)?.band ?? null, deviationKHz: 0 }
+      return okNrResult(fr.freqMhz, arfcn, gscn, 0)
     }
     return { kind: 'empty' }
   }, [nrFreqInput, nrArfcnInput, nrGscnInput, t])
@@ -237,6 +246,18 @@ export default function FrequencyConversionPage() {
               <div className="text-muted-foreground">
                 {t('freqConversion.inBand')}: {nrResult.band ?? t('freqConversion.inBandNone')}
               </div>
+              {nrResult.violation && (
+                <div className="text-amber-500">
+                  {t('freqConversion.gscnOutOfBand', {
+                    gscn: nrResult.gscn,
+                    band: nrResult.violation.band,
+                    min: nrResult.violation.gscnMin,
+                    max: nrResult.violation.gscnMax,
+                    nearest: nrResult.violation.nearestInBand,
+                    freq: nrResult.violation.nearestInBandFreqMhz,
+                  })}
+                </div>
+              )}
             </>
           ) : (
             <span className="text-muted-foreground">—</span>

@@ -3,6 +3,7 @@ import {
   lteFreqToEarfcn, lteEarfcnToFreq, lteConvert,
   nrFreqToArfcn, nrArfcnToFreq, gsnFreqToGscn, gsnGscnToFreq, getNrBandTable,
   gscnToArfcn, arfcnToGscn, matchNrBand,
+  getBandGscnRange, findGscnBandViolation,
 } from '../frequencyConversion'
 
 describe('LTE EARFCN 换算', () => {
@@ -136,19 +137,40 @@ describe('NR-ARFCN 换算（全局三段公式）', () => {
 })
 
 describe('GSCN 换算（GSCN和频点换算方法.docx / 3GPP TS 38.104）', () => {
-  // ===== 区间1：0-3000MHz 非均匀栅格（N=1..2499, M∈{1,3,5}） =====
-  it('区间1 示例3: N=100, M=3 → GSCN 298, SS_REF 120.15MHz', () => {
+  // ===== 区间1：0-3000MHz 非均匀栅格（N=1..2499, M∈{1,3,5}），GSCN = 3N + (M-3)/2，范围 2~7498 =====
+  it('区间1 示例3: N=100, M=3 → GSCN 300, SS_REF 120.15MHz', () => {
+    // GSCN = 3×100 + (3-3)/2 = 300
     // SS_REF = N×1200kHz + M×50kHz = 120000+150 = 120150kHz = 120.15MHz
     const r = gsnFreqToGscn(120.15)!
-    expect(r.gscn).toBe(298)
+    expect(r.gscn).toBe(300)
     expect(r.actualFreq).toBeCloseTo(120.15, 5)
   })
-  it('区间1: GSCN 298 → 120.15MHz', () => {
-    expect(gsnGscnToFreq(298)!.freqMhz).toBeCloseTo(120.15, 5)
+  it('区间1: GSCN 300 → 120.15MHz', () => {
+    expect(gsnGscnToFreq(300)!.freqMhz).toBeCloseTo(120.15, 5)
   })
-  it('区间1: GSCN 1（N=1,M=3）→ 1.35MHz', () => {
-    // GSCN = 3(N-1)+(M-3)/2+1，GSCN=1 时 N=1,M=3 → SS_REF = 1×1200+3×50 = 1350kHz = 1.35MHz
-    expect(gsnGscnToFreq(1)!.freqMhz).toBeCloseTo(1.35, 5)
+  it('区间1 下界: GSCN 2（N=1,M=1）→ 1.25MHz，GSCN 3（N=1,M=3）→ 1.35MHz', () => {
+    expect(gsnGscnToFreq(2)!.freqMhz).toBeCloseTo(1.25, 5)
+    expect(gsnGscnToFreq(3)!.freqMhz).toBeCloseTo(1.35, 5)
+  })
+  it('区间1 上界: GSCN 7498（N=2499,M=5）→ 2999.05MHz，GSCN 7499 → 3000MHz', () => {
+    expect(gsnGscnToFreq(7498)!.freqMhz).toBeCloseTo(2999.05, 5)
+    expect(gsnGscnToFreq(7499)!.freqMhz).toBeCloseTo(3000, 5)
+  })
+  // ===== n1（2.1G FDD）实测校验：SS_REF → GSCN → ARFCN 全链路 =====
+  it('n1 公网 SSB 2114.55MHz ↔ GSCN 5286 ↔ ARFCN 422910', () => {
+    // GSCN 5286 → 5286 mod 3 = 0 → M=3, N=1762 → SS_REF = 1762×1200+150 = 2114550kHz
+    expect(gsnGscnToFreq(5286)!.freqMhz).toBeCloseTo(2114.55, 5)
+    expect(gsnFreqToGscn(2114.55)!.gscn).toBe(5286)
+    expect(gsnFreqToGscn(2114.55)!.deviationKHz).toBe(0)
+    expect(gscnToArfcn(5286)).toBe(422910)
+    expect(arfcnToGscn(422910)).toBe(5286)
+  })
+  it('n1 高铁专网 SSB 2118.15MHz ↔ GSCN 5295 ↔ ARFCN 423630', () => {
+    // GSCN 5295 → 5295 mod 3 = 0 → M=3, N=1765 → SS_REF = 1765×1200+150 = 2118150kHz
+    expect(gsnGscnToFreq(5295)!.freqMhz).toBeCloseTo(2118.15, 5)
+    expect(gsnFreqToGscn(2118.15)!.gscn).toBe(5295)
+    expect(gscnToArfcn(5295)).toBe(423630)
+    expect(arfcnToGscn(423630)).toBe(5295)
   })
   // ===== 区间2：3000-24250MHz，连续整数 GSCN 7499~22255，步长 1.44MHz =====
   it('区间2 示例1/2: GSCN 7711 → 3305.28MHz', () => {
@@ -183,9 +205,69 @@ describe('GSCN 换算（GSCN和频点换算方法.docx / 3GPP TS 38.104）', () 
   // ===== 非法输入 =====
   it('非法 GSCN 返回 null', () => {
     expect(gsnGscnToFreq(-1)).toBeNull()
-    expect(gsnGscnToFreq(7498)).toBeNull() // 7498 是区间1与区间2之间的空洞
+    expect(gsnGscnToFreq(0)).toBeNull()
+    expect(gsnGscnToFreq(1)).toBeNull() // 区间1 从 GSCN 2 起，无 GSCN 1
     expect(gsnGscnToFreq(22256 + 100000)).toBeNull()
     expect(gsnFreqToGscn(150000)).toBeNull()
+  })
+})
+
+describe('频段可用 GSCN 范围（TS 38.104 §5.4.3.1 同步栅格 + 各频段取值范围）', () => {
+  it('已收录范围: n28 1895–2007, n41 6239–6724', () => {
+    expect(getBandGscnRange('n28')).toEqual({ band: 'n28', gscnMin: 1895, gscnMax: 2007 })
+    expect(getBandGscnRange('n41')).toEqual({ band: 'n41', gscnMin: 6239, gscnMax: 6724 })
+  })
+  it('未收录范围的频段返回 null（不判定，避免误报）', () => {
+    expect(getBandGscnRange('n1')).toBeNull()
+    expect(getBandGscnRange('n78')).toBeNull()
+    expect(getBandGscnRange('n99')).toBeNull()
+  })
+  // 范围端点 = 该频段下行频率区间内首个/末个同步栅格点，与 NR_BANDS 交叉校验防漂移
+  it('范围端点与频段下行频率区间一致', () => {
+    // n28 DL 758–803: 1895→758.45 在带内；1894→757.45 出带；2007→802.95 在带内；2008→803.05 出带
+    expect(gsnGscnToFreq(1895)!.freqMhz).toBeCloseTo(758.45, 5)
+    expect(gsnGscnToFreq(1894)!.freqMhz).toBeLessThan(758)
+    expect(gsnGscnToFreq(2007)!.freqMhz).toBeCloseTo(802.95, 5)
+    expect(gsnGscnToFreq(2008)!.freqMhz).toBeGreaterThan(803)
+    // n41 2496–2690: 6239→2496.05 在带内；6238→2495.05 出带；6724→2689.45 在带内；6725→2690.45 出带
+    expect(gsnGscnToFreq(6239)!.freqMhz).toBeCloseTo(2496.05, 5)
+    expect(gsnGscnToFreq(6238)!.freqMhz).toBeLessThan(2496)
+    expect(gsnGscnToFreq(6724)!.freqMhz).toBeCloseTo(2689.45, 5)
+    expect(gsnGscnToFreq(6725)!.freqMhz).toBeGreaterThan(2690)
+  })
+  // 用户提供并逐项核验过的向量
+  it('n28 校验向量: GSCN 1934 → 774.05MHz', () => {
+    expect(gsnGscnToFreq(1934)!.freqMhz).toBeCloseTo(774.05, 5)
+    expect(gsnFreqToGscn(774.05)!.gscn).toBe(1934)
+    expect(matchNrBand(774.05)!.band).toBe('n28')
+  })
+  it('n41 校验向量: GSCN 6612 → 2644.95MHz', () => {
+    expect(gsnGscnToFreq(6612)!.freqMhz).toBeCloseTo(2644.95, 5)
+    expect(gsnFreqToGscn(2644.95)!.gscn).toBe(6612)
+    expect(matchNrBand(2644.95)!.band).toBe('n41')
+  })
+  it('n41 上边界 2690MHz → 最近 GSCN 6725 已出带，须告警并给出带内最近点', () => {
+    const r = gsnFreqToGscn(2690)!
+    expect(r.gscn).toBe(6725)
+    const v = findGscnBandViolation(r.gscn, matchNrBand(2690)?.band)!
+    expect(v.band).toBe('n41')
+    expect(v.gscnMin).toBe(6239)
+    expect(v.gscnMax).toBe(6724)
+    expect(v.nearestInBand).toBe(6724)
+    expect(v.nearestInBandFreqMhz).toBeCloseTo(2689.45, 5)
+  })
+  it('n28 下边界 758MHz 的 GSCN 1895 恰为首个合法值，不告警', () => {
+    expect(gsnFreqToGscn(758)!.gscn).toBe(1895)
+    expect(findGscnBandViolation(1895, 'n28')).toBeNull()
+    expect(findGscnBandViolation(1894, 'n28')!.nearestInBand).toBe(1895)
+  })
+  it('范围内 / 未收录频段 / 无频段 均不告警', () => {
+    expect(findGscnBandViolation(6312, 'n41')).toBeNull()
+    expect(findGscnBandViolation(6724, 'n41')).toBeNull()
+    expect(findGscnBandViolation(6239, 'n41')).toBeNull()
+    expect(findGscnBandViolation(5286, 'n1')).toBeNull() // n1 未收录范围
+    expect(findGscnBandViolation(5286, null)).toBeNull()
+    expect(findGscnBandViolation(5286, undefined)).toBeNull()
   })
 })
 
@@ -205,7 +287,8 @@ describe('GSCN ↔ ARFCN 换算', () => {
   })
   it('非法 ARFCN → null', () => {
     expect(arfcnToGscn(-1)).toBeNull()
-    expect(gscnToArfcn(7498)).toBeNull()
+    expect(gscnToArfcn(1)).toBeNull()
+    expect(gscnToArfcn(26640)).toBeNull()
   })
 })
 
