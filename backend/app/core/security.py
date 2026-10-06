@@ -2,6 +2,8 @@
 安全依赖
 FastAPI Depends 可调用对象，用于认证和授权
 """
+from typing import Optional
+
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
@@ -11,6 +13,28 @@ from app.core.database import get_db
 from app.services.auth_service import auth_service
 
 security_scheme = HTTPBearer(auto_error=False)
+
+
+def _desktop_idle_timeout_minutes() -> Optional[int]:
+    """桌面单机模式：无操作自动退出登录的分钟数（管理员按用户设定，默认 2 天）。
+
+    单机模式才生效；共享模式沿用服务器统一的会话空闲超时。
+    """
+    if not settings.NPT_DESKTOP:
+        return None
+    try:
+        from app.services.license_service import license_service
+
+        info = license_service.desktop_license_info() or {}
+    except Exception:  # noqa: BLE001
+        return None
+    if not info.get("valid") or info.get("mode") != "standalone":
+        return None
+    try:
+        days = int(info.get("idle_logout_days") or 2)
+    except (TypeError, ValueError):
+        days = 2
+    return max(1, days) * 24 * 60
 
 
 async def get_current_user(
@@ -41,7 +65,11 @@ async def get_current_user(
     # 空闲超时校验：连续无操作（含心跳）超过阈值才要求重新登录。
     # 注意：不校验请求 IP——客户端 IPv4/IPv6 切换或换网络不应打断登录态；
     # 同一账号仅在新设备登录时踢掉旧会话（见 auth_service.end_other_ip_sessions）。
-    if jti and auth_service.is_session_idle_expired(db, jti):
+    # 桌面单机模式的阈值由管理员在「桌面授权」页按用户设定（默认 2 天）。
+    idle_minutes = None
+    if settings.NPT_DESKTOP:
+        idle_minutes = _desktop_idle_timeout_minutes()
+    if jti and auth_service.is_session_idle_expired(db, jti, idle_minutes):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="长时间未操作，请重新登录",
@@ -103,10 +131,12 @@ def reject_desktop_mode() -> None:
 def require_permission(perm: str):
     """权限校验依赖工厂：管理员自动通过，普通用户需对应权限位为 True。
 
-    桌面版（NPT_DESKTOP=1）为单用户形态，不设管理员与权限位概念，一律放行。
+    桌面版按登录时选择的运行模式区分：
+    - 单机模式（standalone）：本机独立使用，功能权限全开
+    - 共享模式（shared）：与网页端一致，按账号权限位判定
     """
     async def checker(current_user=Depends(get_current_user)):
-        if settings.NPT_DESKTOP:
+        if settings.NPT_DESKTOP and current_user.desktop_run_mode == "standalone":
             return current_user
         if current_user.is_admin:
             return current_user

@@ -37,6 +37,7 @@ def state_file() -> Path:
 def _default_state() -> Dict[str, Any]:
     return {
         "run_mode": MODE_OFFLINE,   # 默认离线，用户显式切换到共享才联网
+        "username": None,           # 当前登录账号（后台同步取数据组用）
         "datasets": {},             # data_id -> {rev, sha256, dirty, last_sync_at}
         "pending_deletes": [],      # 本地已删、待上行删除的数据集 id
         "conflicts": [],            # [{data_id, name, server_rev, local_rev}]
@@ -166,15 +167,23 @@ def record_synced(data_id: str, rev: int, sha256: Optional[str] = None) -> None:
 # ---------------------------------------------------------------- 上下文
 
 def _local_group() -> tuple:
-    """本机 owner 账号的数据组。"""
-    from app.core.database import DESKTOP_OWNER_USERNAME, SessionLocal
+    """本机当前登录账号及其数据组。
+
+    同步跑在后台线程里拿不到请求上下文，因此登录时把用户名记在 sync_state，
+    这里据此取账号（桌面端与网页端共用账号，组归属即账号的组）。
+    """
+    from app.core.database import SessionLocal
     from app.models.database import User
 
+    username = (load_state().get("username") or "").strip()
     db = SessionLocal()
     try:
-        user = db.query(User).filter(User.username == DESKTOP_OWNER_USERNAME).first()
+        query = db.query(User).filter(User.is_desktop_shadow == False)  # noqa: E712
+        user = (
+            query.filter(User.username == username).first() if username else None
+        ) or query.filter(User.desktop_run_mode.isnot(None)).first()
         if user is None:
-            raise SyncError("本机桌面账号缺失，请重新安装或联系厂商")
+            raise SyncError("本机尚未登录，请先登录后再同步")
         return user, (user.city or ""), (user.operator or "")
     finally:
         db.close()
@@ -218,7 +227,7 @@ def _sync_group(user, city: str, operator: str) -> Dict[str, Any]:
 
 
 def _apply_local_group(user, city: str, operator: str) -> None:
-    """改写本机 owner 的组并迁移存量数据（与网页端改组同一套语义）。"""
+    """改写本机账号的组并迁移存量数据（与网页端改组同一套语义）。"""
     from app.core.database import SessionLocal
     from app.models.database import User
 

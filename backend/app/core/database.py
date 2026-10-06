@@ -2,8 +2,6 @@
 数据库引擎和会话管理
 使用 SQLite + SQLAlchemy ORM
 """
-import uuid
-
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker, Session, DeclarativeBase
 from app.core.config import settings
@@ -90,6 +88,25 @@ def init_db():
                 conn.exec_driver_sql("ALTER TABLE desktop_licenses ADD COLUMN city VARCHAR(100)")
             if "operator" not in dl_cols:
                 conn.exec_driver_sql("ALTER TABLE desktop_licenses ADD COLUMN operator VARCHAR(50)")
+            # 桌面端与网页端共用账号：授权记录绑定账号与运行模式
+            if "mode" not in dl_cols:
+                conn.exec_driver_sql(
+                    "ALTER TABLE desktop_licenses ADD COLUMN mode VARCHAR(16) NOT NULL DEFAULT 'standalone'"
+                )
+            if "username" not in dl_cols:
+                conn.exec_driver_sql("ALTER TABLE desktop_licenses ADD COLUMN username VARCHAR(100)")
+            if "user_id" not in dl_cols:
+                conn.exec_driver_sql("ALTER TABLE desktop_licenses ADD COLUMN user_id INTEGER")
+            if "login_count" not in dl_cols:
+                conn.exec_driver_sql(
+                    "ALTER TABLE desktop_licenses ADD COLUMN login_count INTEGER NOT NULL DEFAULT 0"
+                )
+            if "last_login_at" not in dl_cols:
+                conn.exec_driver_sql("ALTER TABLE desktop_licenses ADD COLUMN last_login_at VARCHAR(30)")
+            if "idle_logout_days" not in dl_cols:
+                conn.exec_driver_sql(
+                    "ALTER TABLE desktop_licenses ADD COLUMN idle_logout_days INTEGER NOT NULL DEFAULT 2"
+                )
 
         # 迁移：桌面共享模式数据集修订号表（早期版本可能缺组归属列）
         dr_cols = [row[1] for row in conn.exec_driver_sql("PRAGMA table_info(dataset_revisions)").fetchall()]
@@ -103,6 +120,10 @@ def init_db():
         # 不可登录账号（桌面端以签名授权为身份，没有真实账号）
         if "is_desktop_shadow" not in existing_cols:
             conn.exec_driver_sql("ALTER TABLE users ADD COLUMN is_desktop_shadow BOOLEAN NOT NULL DEFAULT 0")
+
+        # 迁移：桌面版登录时选择的运行模式（shared / standalone，网页端为 NULL）
+        if "desktop_run_mode" not in existing_cols:
+            conn.exec_driver_sql("ALTER TABLE users ADD COLUMN desktop_run_mode VARCHAR(16)")
 
         # 迁移：task_results 表添加 is_applied 列
         tr_cols = [row[1] for row in conn.exec_driver_sql("PRAGMA table_info(task_results)").fetchall()]
@@ -324,53 +345,11 @@ def _migrate_users_db():
         pass
 
 
-DESKTOP_OWNER_USERNAME = "owner"  # 桌面版唯一本机账号名（单用户形态）
-
-
-def _ensure_desktop_owner(db, User, auth_service) -> None:
-    """桌面版单用户：确保存在唯一活跃 owner 账号，冻结其余账号（不删除，可恢复）。
-
-    桌面端没有管理员概念、没有用户管理与注册入口，登录页被跳过，
-    因此本机只允许一个可用账号。旧版桌面端遗留的 admin 等账号置为停用，
-    避免「多用户」残留。
-    """
-    import logging
-
-    logger = logging.getLogger(__name__)
-    owner = db.query(User).filter(User.username == DESKTOP_OWNER_USERNAME).first()
-    if owner is None:
-        presets = settings.CITY_PRESETS
-        owner = User(
-            username=DESKTOP_OWNER_USERNAME,
-            password_hash=auth_service.hash_password(str(uuid.uuid4())),  # 免登录，密码不可用于网页登录
-            is_admin=True,          # 仅内部权限直通；UI 不暴露任何管理入口
-            is_active=True,
-            must_change_password=False,
-            license_expiry=None,
-            city=presets[0] if presets else None,
-            operator="移动",
-        )
-        db.add(owner)
-    else:
-        if not owner.is_active:
-            owner.is_active = True
-        if owner.must_change_password:
-            owner.must_change_password = False
-
-    # 冻结其余账号（单用户形态）
-    others = db.query(User).filter(User.username != DESKTOP_OWNER_USERNAME).all()
-    deactivated = [u.username for u in others if u.is_active]
-    for u in others:
-        u.is_active = False
-    db.commit()
-    if deactivated:
-        logger.info(f"[桌面单用户] 已停用遗留账号：{', '.join(deactivated)}（数据按数据组隔离，不受影响）")
-
-
 def create_default_admin():
     """创建默认管理员账号（如不存在）。
 
-    桌面版（NPT_DESKTOP=1）：改为确保唯一本机 owner 账号，不创建 admin/admin123。
+    桌面版（NPT_DESKTOP=1）不预置任何账号：桌面端与网页端共用账号，
+    登录时由服务器校验后在本机镜像出本地账号。
     """
     from app.models.database import User
     from app.services.auth_service import auth_service
@@ -378,7 +357,6 @@ def create_default_admin():
     db = SessionLocal()
     try:
         if settings.NPT_DESKTOP:
-            _ensure_desktop_owner(db, User, auth_service)
             return
 
         existing_admin = db.query(User).filter(User.is_admin == True).first()

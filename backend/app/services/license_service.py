@@ -352,6 +352,10 @@ class LicenseService:
             "issued_at": payload.get("issued_at") or "",
             "expire_date": expire_raw,
             "remaining_days": remaining,
+            # 运行模式与绑定的网页端账号（桌面端与网页端共用账号登录）
+            "mode": payload.get("mode") or "standalone",
+            "username": payload.get("username") or "",
+            "idle_logout_days": payload.get("idle_logout_days") or 2,
         }
 
     def sync_desktop_admin_expiry(self) -> None:

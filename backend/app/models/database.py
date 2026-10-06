@@ -47,6 +47,9 @@ class User(Base):
     city = Column(String(100), nullable=True)
     operator = Column(String(50), nullable=True)
     user_type = Column(String(10), default='pc', nullable=False)
+    # 桌面版登录时选择的运行模式：shared=共享模式（权限/分组与网页端一致）
+    # / standalone=单机模式（权限全开、数据本机私有）。网页端恒为 NULL。
+    desktop_run_mode = Column(String(16), nullable=True)
 
     # 细粒度权限（PC 端数据管理页面操作权限，默认全部关闭，管理员自动拥有全部权限）
     can_data_import = Column(Boolean, default=False, nullable=False)
@@ -75,6 +78,7 @@ class User(Base):
             "operator": self.operator,
             "user_type": self.user_type,
             "is_desktop_shadow": self.is_desktop_shadow,
+            "desktop_run_mode": self.desktop_run_mode,
             "can_data_import": self.can_data_import,
             "can_data_delete": self.can_data_delete,
             "can_data_update": self.can_data_update,
@@ -335,6 +339,11 @@ class DesktopLicense(Base):
     licensee_username = Column(String(100), nullable=False)
     organization = Column(String(200), nullable=True)
     machine_code = Column(String(64), nullable=True, index=True)
+    # 运行模式：standalone=单机授权（需管理员批准）/ shared=共享模式登录时自动签发
+    mode = Column(String(16), nullable=False, default="standalone", index=True)
+    # 绑定的网页端账号：桌面端与网页端共用同一账号权限与数据组
+    username = Column(String(100), nullable=True, index=True)
+    user_id = Column(Integer, nullable=True, index=True)
     status = Column(String(16), nullable=False, default="issued", index=True)
     source = Column(String(10), nullable=False, default="precreate")
     lease_days = Column(Integer, nullable=False, default=30)
@@ -352,6 +361,11 @@ class DesktopLicense(Base):
     client_version = Column(String(30), nullable=True)
     hostname = Column(String(100), nullable=True)
     renewal_count = Column(Integer, nullable=False, default=0)
+    # 历史登录次数（单机模式每次登录累加）与最近登录时间
+    login_count = Column(Integer, nullable=False, default=0)
+    last_login_at = Column(String(30), nullable=True)
+    # 单机用户无操作自动退出登录的时长（天），默认 2 天，随许可下发到本机
+    idle_logout_days = Column(Integer, nullable=False, default=2)
     created_at = Column(String(30), nullable=False)
     activated_at = Column(String(30), nullable=True)
     machine_bound_at = Column(String(30), nullable=True)
@@ -366,9 +380,15 @@ class DesktopLicense(Base):
             "licensee_username": self.licensee_username,
             "organization": self.organization,
             "machine_code": self.machine_code,
+            "mode": self.mode,
+            "username": self.username,
+            "user_id": self.user_id,
             "status": self.status,
             "source": self.source,
             "lease_days": self.lease_days,
+            "login_count": self.login_count or 0,
+            "last_login_at": self.last_login_at,
+            "idle_logout_days": self.idle_logout_days if self.idle_logout_days is not None else 2,
             "expire_date": self.expire_date,
             "city": self.city,
             "operator": self.operator,

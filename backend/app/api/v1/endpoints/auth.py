@@ -33,54 +33,6 @@ async def get_register_options():
     }
 
 
-@router.get("/desktop-session")
-async def desktop_session(request: Request, db: Session = Depends(get_db)):
-    """桌面版免登录会话：签发本机唯一 owner 账号的长效 JWT。
-
-    仅 NPT_DESKTOP=1 且来源为回环地址时可用；桌面端是单用户形态，
-    没有注册/登录入口，令牌过期会导致无法继续操作，因此有效期取 365 天。
-
-    刻意不写 UserSession 行：`is_session_idle_expired()` 无会话记录即放行，
-    桌面端天然不受服务器会话空闲超时影响（含 4 分钟心跳）。
-    """
-    from datetime import timedelta
-
-    from app.core.config import settings
-    from app.core.database import DESKTOP_OWNER_USERNAME
-
-    # 桌面端没有开发者工具，失败原因只能靠日志（desktop.log）排查，这里逐项记录
-    if not settings.NPT_DESKTOP:
-        print("[DesktopSession] 拒绝：NPT_DESKTOP 未启用（非桌面形态）")
-        raise HTTPException(status_code=404, detail="Not Found")
-
-    client_host = request.client.host if request.client else ""
-    if client_host not in ("127.0.0.1", "::1", "localhost"):
-        print(f"[DesktopSession] 拒绝：来源非回环地址 {client_host}")
-        raise HTTPException(status_code=403, detail="仅允许本机访问")
-
-    user = db.query(User).filter(User.username == DESKTOP_OWNER_USERNAME).first()
-    if user is None or not user.is_active:
-        print(
-            f"[DesktopSession] 拒绝：本机 owner 账号缺失或停用 "
-            f"(found={user is not None}, active={bool(user and user.is_active)})"
-        )
-        raise HTTPException(status_code=500, detail="本机桌面账号缺失，请重新安装或联系厂商")
-    print(f"[DesktopSession] 已签发本机会话：user={user.username}, host={client_host}")
-
-    token, _jti = auth_service.create_access_token(
-        user.id, user.username, user.is_admin, expires_delta=timedelta(days=365)
-    )
-    return {
-        "success": True,
-        "data": {
-            "token": token,
-            "access_token": token,
-            "token_type": "bearer",
-            "user": user.to_dict(),
-        },
-    }
-
-
 @router.post("/register")
 async def register(data: UserCreate, request: Request, db: Session = Depends(get_db)):
     """注册新用户并自动登录（桌面单用户形态下不可用）"""

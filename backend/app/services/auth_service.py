@@ -356,9 +356,12 @@ class AuthService:
         ).first()
         return session is not None
 
-    def is_session_idle_expired(self, db: Session, token_jti: str) -> bool:
-        """检查会话是否空闲超时（连续无操作超过 SESSION_IDLE_TIMEOUT_MINUTES 才要求重新登录）。
+    def is_session_idle_expired(
+        self, db: Session, token_jti: str, idle_minutes: Optional[int] = None
+    ) -> bool:
+        """检查会话是否空闲超时（连续无操作超过阈值才要求重新登录）。
 
+        idle_minutes 覆盖全局阈值（桌面单机模式按管理员设定的天数是 2 天起）。
         会话记录不存在时放行（历史 token 无会话记录，交由其他逻辑处理）。
         """
         session = db.query(UserSession).filter(UserSession.token_jti == token_jti).first()
@@ -368,7 +371,10 @@ class AuthService:
         if last_activity.tzinfo is None:
             last_activity = last_activity.replace(tzinfo=timezone.utc)
         idle = datetime.now(timezone.utc) - last_activity
-        return idle > timedelta(minutes=settings.SESSION_IDLE_TIMEOUT_MINUTES)
+        minutes = settings.SESSION_IDLE_TIMEOUT_MINUTES
+        if idle_minutes:
+            minutes = int(idle_minutes)
+        return idle > timedelta(minutes=minutes)
 
     def get_user_sessions(self, db: Session, user_id: int) -> list:
         return db.query(UserSession).filter(UserSession.user_id == user_id).order_by(UserSession.login_time.desc()).all()
