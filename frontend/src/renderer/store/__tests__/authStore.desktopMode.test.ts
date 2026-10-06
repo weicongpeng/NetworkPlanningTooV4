@@ -1,8 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 vi.mock('../../services/api', () => ({
-  authApi: {
-    desktopSession: vi.fn(),
+  desktopLoginApi: {
+    login: vi.fn(),
   },
   systemApi: {
     info: vi.fn(),
@@ -11,7 +11,7 @@ vi.mock('../../services/api', () => ({
 }))
 
 import { useAuthStore } from '../authStore'
-import { authApi, systemApi } from '../../services/api'
+import { desktopLoginApi, systemApi } from '../../services/api'
 
 describe('authStore 桌面形态探测', () => {
   beforeEach(() => {
@@ -63,25 +63,39 @@ describe('authStore 桌面形态探测', () => {
     expect(useAuthStore.getState().desktopMode).toBe(false)
   })
 
-  it('免登录会话写入登录态', async () => {
-    vi.mocked(authApi.desktopSession).mockResolvedValue({
+  it('桌面端账号登录写入登录态与运行模式', async () => {
+    vi.mocked(desktopLoginApi.login).mockResolvedValue({
       success: true,
-      data: { access_token: 'tok', user: { username: 'owner' } },
+      data: { access_token: 'tok', user: { username: 'alice' }, mode: 'shared' },
     } as any)
 
-    await useAuthStore.getState().desktopAutoLogin()
+    await useAuthStore.getState().login('alice', 'pwd', 'shared')
     expect(useAuthStore.getState().isAuthenticated).toBe(true)
     expect(useAuthStore.getState().token).toBe('tok')
+    expect(useAuthStore.getState().desktopRunMode).toBe('shared')
   })
 
-  it('免登录会话失败时保留桌面形态并暴露原因（不静默回落到登录页）', async () => {
-    vi.mocked(authApi.desktopSession).mockRejectedValue({ message: '404 Not Found' })
-    useAuthStore.setState({ desktopMode: true, desktopError: null })
+  it('单机模式未授权时进入待批准态（不写登录态）', async () => {
+    vi.mocked(desktopLoginApi.login).mockResolvedValue({
+      success: true,
+      data: { result: 'pending', status: 'pending' },
+    } as any)
 
-    await expect(useAuthStore.getState().desktopAutoLogin()).rejects.toBeTruthy()
-    // 关键：不能把 desktopMode 置 false，否则界面会静默变回登录页，用户无从排查
-    expect(useAuthStore.getState().desktopMode).toBe(true)
-    expect(useAuthStore.getState().desktopError).toContain('404')
+    await useAuthStore.getState().login('alice', 'pwd', 'standalone')
+    expect(useAuthStore.getState().isAuthenticated).toBe(false)
+    expect(useAuthStore.getState().desktopPendingUsername).toBe('alice')
+    expect(useAuthStore.getState().desktopRunMode).toBe('standalone')
+  })
+
+  it('管理员批准后 applyDesktopLogin 直接建立登录态', () => {
+    useAuthStore.getState().applyDesktopLogin({
+      access_token: 'tok2',
+      user: { username: 'alice' },
+      mode: 'standalone',
+    })
+    expect(useAuthStore.getState().isAuthenticated).toBe(true)
+    expect(useAuthStore.getState().token).toBe('tok2')
+    expect(useAuthStore.getState().desktopPendingUsername).toBeNull()
   })
 
   it('探测接口两种形状都认（专用接口优先，裸模型兜底）', async () => {

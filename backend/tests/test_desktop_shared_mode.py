@@ -189,12 +189,11 @@ def test_shadow_user_created_and_follows_group():
 
 # ---------------------------------------------------------------- 单用户形态
 
-def test_desktop_mode_creates_owner_account(monkeypatch):
-    """桌面模式不再创建 admin/admin123，而是确保唯一 owner 账号。
+def test_desktop_mode_presets_no_account(monkeypatch):
+    """桌面模式不预置任何账号：桌面端与网页端共用账号，登录时才在本机镜像。
 
-    走真实代码路径（不打桩 _ensure_desktop_owner）：曾经把 DESKTOP_OWNER_USERNAME
-    当函数调用导致 TypeError，被 lifespan 吞掉后桌面端没有账号 → 免登录接口 500
-    → 界面回落到登录页，而打桩的测试完全测不出来。
+    历史上桌面端靠一个共用的 owner 免登录账号（且会冻结其它账号），
+    无法区分使用者、也没有数据组归属；现在改为登录时镜像真实账号。
     """
     import app.core.database as database
     from sqlalchemy import create_engine
@@ -216,12 +215,6 @@ def test_desktop_mode_creates_owner_account(monkeypatch):
 
     db = TestingSession()
     try:
-        owner = db.query(User).filter(User.username == database.DESKTOP_OWNER_USERNAME).first()
-        assert owner is not None, "桌面模式必须创建 owner 账号"
-        assert owner.is_active is True
-        assert owner.must_change_password is False
-        assert owner.is_admin is True  # 仅内部权限直通，UI 不暴露管理入口
-        # 桌面端不创建默认管理员
-        assert db.query(User).filter(User.username == "admin").first() is None
+        assert db.query(User).count() == 0, "桌面端不再预置 owner 或 admin 账号"
     finally:
         db.close()

@@ -1,0 +1,314 @@
+"""桌面端本机登录：账号镜像 / 运行模式 / 离线登录 / 单机模式限制共享同步。"""
+from __future__ import annotations
+
+import json
+from datetime import date, timedelta
+from types import SimpleNamespace
+
+import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
+
+from app.core.database import get_db
+from app.core.security import get_current_user
+from app.models.database import Base, User
+from app.services.auth_service import auth_service
+
+MACHINE_CODE_KEY = "NPT_TEST_MACHINE"
+
+
+@pytest.fixture()
+def local_env(tmp_path, monkeypatch):
+    """桌面本机形态：临时数据根 +  licences 目录 + 最小应用 + 真实 SQLite。"""
+    from app.api.v1.endpoints import desktop_local
+    from app.core.config import settings
+    from app.services import desktop_cloud_client as cloud
+    from app.services.desktop_signing import sign_license
+    from app.utils.machine_code import get_machine_code
+
+    private_key = Ed25519PrivateKey.generate()
+    public_hex = (
+        private_key.public_key()
+        .public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+        .hex()
+    )
+    monkeypatch.setenv("NPT_LICENSE_PUBLIC_KEY_HEX", public_hex)
+    monkeypatch.setattr(settings, "NPT_DESKTOP", True)
+    monkeypatch.setattr(settings, "LICENSE_DIR", tmp_path / "licenses")
+    monkeypatch.setattr(settings, "DATA_ROOT", tmp_path)
+    monkeypatch.setattr(settings, "NPT_SERVER_URL", "https://example.invalid")
+    monkeypatch.setattr(cloud, "state_file", lambda: tmp_path / "cloud_state.json")
+    settings.LICENSE_DIR.mkdir(parents=True, exist_ok=True)
+    machine = get_machine_code()
+
+    engine = create_engine(
+        "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
+    )
+    Base.metadata.create_all(bind=engine)
+    TestingSession = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+
+    def override_db():
+        db = TestingSession()
+        try:
+            yield db
+        finally:
+            db.close()
+
+    app = FastAPI()
+    app.include_router(desktop_local.router, prefix="/api/v1/desktop")
+    app.dependency_overrides[get_db] = override_db
+    current = {"user": None}
+    app.dependency_overrides[get_current_user] = lambda: current["user"]
+
+    state_file = tmp_path / "sync_state.json"
+    state_file.write_text(json.dumps({"run_mode": "offline"}), encoding="utf-8")
+
+    import app.services.desktop_sync_service as sync_module
+
+    monkeypatch.setattr(sync_module, "state_file", lambda: state_file)
+
+    def make_license(mode="standalone", username="alice", days=30) -> str:
+        private_pem = private_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+        from app.services import desktop_signing
+
+        monkeypatch.setenv("NPT_LICENSE_PRIVATE_KEY", private_pem.decode())
+        return sign_license(
+            {
+                "v": 1,
+                "license_id": 3,
+                "subject": username,
+                "machine_code": machine,
+                "lease_days": days,
+                "issued_via": "online",
+                "issued_at": "2026-01-01 00:00:00",
+                "expire_date": (date.today() + timedelta(days=days)).isoformat(),
+                "features": ["all"],
+                "mode": mode,
+                "username": username,
+                "idle_logout_days": 2,
+            }
+        )
+
+    yield SimpleNamespace(
+        client=TestClient(app),
+        cloud=cloud,
+        monkeypatch=monkeypatch,
+        settings=settings,
+        session_factory=TestingSession,
+        make_license=make_license,
+        current_user=current,
+        machine=machine,
+        tmp_path=tmp_path,
+        desktop_local=desktop_local,
+    )
+
+
+def _server_ok(**overrides):
+    payload = {
+        "result": "ok",
+        "mode": "shared",
+        "license_file": "signed",
+        "license_id": 3,
+        "idle_logout_days": 2,
+        "login_count": 1,
+        "user": {
+            "username": "alice",
+            "is_admin": False,
+            "city": "广州",
+            "operator": "移动",
+            "can_data_import": True,
+        },
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_login_mirrors_web_account(local_env):
+    """登录成功后本机镜像出同名账号，组与权限位照搬网页端。"""
+    local_env.monkeypatch.setattr(
+        local_env.cloud, "login", lambda *a, **kw: _server_ok()
+    )
+    resp = local_env.client.post(
+        "/api/v1/desktop/login",
+        json={"username": "alice", "password": "pwd123", "mode": "shared"},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()["data"]
+    assert data["access_token"]
+    assert data["mode"] == "shared"
+
+    db = local_env.session_factory()
+    try:
+        row = db.query(User).filter(User.username == "alice").first()
+        assert row is not None
+        assert row.city == "广州" and row.operator == "移动"
+        assert row.can_data_import is True
+        assert row.desktop_run_mode == "shared"
+        # 密码哈希落本机，单机模式断网登录时可校验
+        assert auth_service.verify_password("pwd123", row.password_hash)
+    finally:
+        db.close()
+
+
+def test_standalone_login_pending(local_env):
+    local_env.monkeypatch.setattr(
+        local_env.cloud,
+        "login",
+        lambda *a, **kw: {"result": "pending", "status": "pending", "mode": "standalone"},
+    )
+    resp = local_env.client.post(
+        "/api/v1/desktop/login",
+        json={"username": "alice", "password": "pwd123", "mode": "standalone"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["data"]["result"] == "pending"
+    db = local_env.session_factory()
+    try:
+        assert db.query(User).filter(User.username == "alice").first() is None
+    finally:
+        db.close()
+
+
+def test_standalone_login_forces_offline(local_env):
+    """单机模式不共享数据：登录后同步模式强制离线，且不能切回共享。"""
+    local_env.monkeypatch.setattr(
+        local_env.cloud,
+        "login",
+        lambda *a, **kw: _server_ok(mode="standalone", user={
+            "username": "alice", "is_admin": False, "city": None, "operator": None,
+        }),
+    )
+    resp = local_env.client.post(
+        "/api/v1/desktop/login",
+        json={"username": "alice", "password": "pwd123", "mode": "standalone"},
+    )
+    assert resp.status_code == 200, resp.text
+
+    db = local_env.session_factory()
+    try:
+        row = db.query(User).filter(User.username == "alice").first()
+        # 单机兜底：账号没有组也要有组，否则上传的数据自己都看不见
+        assert row.city and row.operator
+        local_env.current_user["user"] = row
+    finally:
+        db.close()
+
+    denied = local_env.client.put("/api/v1/desktop/run-mode", json={"mode": "shared"})
+    assert denied.status_code == 403
+    denied_group = local_env.client.put(
+        "/api/v1/desktop/group", json={"city": "广州", "operator": "移动"}
+    )
+    assert denied_group.status_code == 403
+
+
+def test_offline_login_when_server_unreachable(local_env):
+    """单机模式服务器不可达时，凭本机许可 + 本机密码哈希仍可登录。"""
+    license_file = local_env.make_license()
+    (local_env.settings.LICENSE_DIR / "license.nptlic").write_text(
+        license_file, encoding="utf-8"
+    )
+
+    def boom(*a, **kw):
+        raise local_env.cloud.CloudError(0, "无法连接授权服务器")
+
+    local_env.monkeypatch.setattr(local_env.cloud, "login", boom)
+    local_env.monkeypatch.setattr(
+        local_env.desktop_local, "_issue_local_token", lambda db, user, days=None: "offline-token"
+    )
+
+    # 本机还没有账号 → 拒绝（必须先联机登录一次建立本地账号）
+    resp = local_env.client.post(
+        "/api/v1/desktop/login",
+        json={"username": "alice", "password": "pwd123", "mode": "standalone"},
+    )
+    assert resp.status_code == 502
+
+    db = local_env.session_factory()
+    try:
+        db.add(
+            User(
+                username="alice",
+                password_hash=auth_service.hash_password("pwd123"),
+                is_active=True,
+                desktop_run_mode="standalone",
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    resp = local_env.client.post(
+        "/api/v1/desktop/login",
+        json={"username": "alice", "password": "pwd123", "mode": "standalone"},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()["data"]
+    assert data["offline"] is True
+    assert data["token"] == "offline-token"
+    # 离线登录次数本地记账，下次联机补报
+    state = json.loads((local_env.tmp_path / "cloud_state.json").read_text(encoding="utf-8"))
+    assert state["pending_offline_logins"] == 1
+
+
+def test_shared_login_error_propagates(local_env):
+    """共享模式不做离线兜底：服务器不可用就直接失败。"""
+    def boom(*a, **kw):
+        raise local_env.cloud.CloudError(0, "无法连接授权服务器")
+
+    local_env.monkeypatch.setattr(local_env.cloud, "login", boom)
+    resp = local_env.client.post(
+        "/api/v1/desktop/login",
+        json={"username": "alice", "password": "pwd123", "mode": "shared"},
+    )
+    assert resp.status_code == 502
+
+
+def test_auth_poll_completes_login(local_env):
+    """管理员批准后轮询接口直接建立登录态（无需重输密码）。"""
+    (local_env.settings.LICENSE_DIR / "license.nptlic").write_text(
+        local_env.make_license(), encoding="utf-8"
+    )
+    local_env.monkeypatch.setattr(
+        local_env.cloud,
+        "poll_login",
+        lambda username: _server_ok(mode="standalone"),
+    )
+    local_env.monkeypatch.setattr(
+        local_env.desktop_local, "_issue_local_token", lambda db, user, days=None: "poll-token"
+    )
+    resp = local_env.client.post(
+        "/api/v1/desktop/auth-poll", json={"username": "alice"}
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()["data"]
+    assert data["token"] == "poll-token"
+    assert data["mode"] == "standalone"
+
+    db = local_env.session_factory()
+    try:
+        row = db.query(User).filter(User.username == "alice").first()
+        assert row is not None and row.desktop_run_mode == "standalone"
+    finally:
+        db.close()
+
+
+def test_auth_poll_still_pending(local_env):
+    local_env.monkeypatch.setattr(
+        local_env.cloud,
+        "poll_login",
+        lambda username: {"result": "pending", "status": "pending"},
+    )
+    resp = local_env.client.post(
+        "/api/v1/desktop/auth-poll", json={"username": "alice"}
+    )
+    assert resp.status_code == 200
+    assert resp.json()["data"]["result"] == "pending"

@@ -163,7 +163,7 @@ FastAPI (backend/app/)
 | `app_versions.py` | `/api/v1/app-versions` | APP 版本管理：latest/download（公开）、上传（admin、分片） |
 | `desktop_licenses.py` | `/api/v1/desktop-licenses` | 桌面授权管理（admin）：创建激活码/批准/禁用/解绑换机/重发码 |
 | `desktop_cloud.py` | `/api/v1/desktop-cloud` | 桌面客户端公开接口：激活/续期/申请（激活码或旧许可即凭证）、`/config`、`releases/latest`、`releases/download/{id}`（Range） |
-| `desktop_local.py` | `/api/v1/desktop` | 桌面版**本机**接口（仅 `NPT_DESKTOP=1`，否则 404）：`cloud-status/activate/renew/apply`、`update/status|download|progress|snooze|install`、`exit`（经 `app/desktop_bridge.py` 关闭窗口） |
+| `desktop_local.py` | `/api/v1/desktop` | 桌面版**本机**接口（仅 `NPT_DESKTOP=1`，否则 404）：`login/auth-poll`（账号登录与单机授权轮询）、`cloud-status/activate/renew/apply`、共享模式 `sync-status/run-mode/sync/sync-resolve/group`、`update/status|download|progress|snooze|install`、`exit`（经 `app/desktop_bridge.py` 关闭窗口） |
 | `desktop_releases.py` | `/api/v1/desktop-releases` | 桌面版安装包管理（admin）：分片上传（complete 才鉴权）、列表/编辑/删除/设最新 |
 | `assistant.py` | `/api/v1/assistant` | LLM 配置、数据集、对话（需 can_assistant 权限） |
 | `system.py` | `/api/v1/system` | 状态/信息 |
@@ -205,7 +205,12 @@ FastAPI (backend/app/)
 - **绘制缓冲区**：`POST /api/v1/buffer/plan` → `buffer_service`（each 逐要素 / dissolve 融合，点用测地线、线面用局部切平面）→ 写回装饰图层（前端 IndexedDB）或已有 MapInfo 图层（`layer_patch_service`）。
 - **图层下载**：`GET /api/v1/data/{dataId}/layers/{layerId}/download` 打包同 stem 的 .tab/.dat/.id/.map/.ind；数据管理页原文件下载走 `GET /api/v1/data/{id}/download`。
 - **APP 分发**：管理端分片上传 APK（绕过 Cloudflare 100MB 限制）→ `app_versions` 表 + `backend/app/apks/`；客户端 `GET /api/v1/app-versions/latest` 与 `/download/{id}`（支持 Range、下载计数）。
-- **桌面版在线授权与 OTA**：桌面壳只调**本机** `/api/v1/desktop/*`，由本机后端（`services/desktop_cloud_client.py`，stdlib urllib）访问授权服务器（`NPT_SERVER_URL`）——避免跨域与两套 JWT 混用。激活码/旧许可即凭证；服务端签发 Ed25519 许可（私钥仅服务器：`NPT_LICENSE_PRIVATE_KEY` 或 `licenses/license_private_key.pem`，见 `services/desktop_signing.py`），租约默认 30 天、启动后台静默续期（剩余<20 天或距上次≥7 天）。OTA：管理端上传安装包到 `desktop_releases`，客户端比对版本 → 断点续传下载 + sha256 校验 → 写 `%TEMP%\npt_update_*.cmd`（等进程退出→静默安装→重启），经 `app/desktop_bridge.py` 的退出回调关闭应用；"稍后"3 次或 `mandatory` 转强制。离线 `.nptlic` 导入通道保留。
+- **桌面版登录与授权（2026-10 改版）**：桌面端不再有 owner 免登录账号，与网页端**共用同一套账号**。登录页在桌面形态下多一组「运行模式」选择：
+  - **共享模式**：`POST /desktop/login`（本机）→ 代理 `POST /desktop-cloud/auth/login`（服务器）→ `desktop_license_service.login()` 用 `auth_service.authenticate_user` 校验网页端账号 → 为该「账号+机器」自动签发许可（`DesktopLicense.mode='shared'`，作为同步凭证）→ 本机 `_mirror_local_user` 镜像同名本地账号（组/权限位/管理员位照搬）→ 签发本机 JWT。权限与数据组语义与网页端完全一致。
+  - **单机模式**：同上流程，但服务器按 `(username, machine_code)` 找/建 `mode='standalone'` 授权记录；未批准返回 `result=pending`，前端 `DesktopAuthPendingDialog` 轮询 `POST /desktop/auth-poll`，管理员在网页端「桌面授权」页批准后当场签发许可并建立登录态。单机模式 `require_permission` 一律放行（权限全开）、强制 `run_mode=offline`、隐藏「桌面离线授权/运行模式与数据同步/数据组」三张卡片。
+  - 记账：每次联机登录累加 `DesktopLicense.login_count`；断网登录本机记 `pending_offline_logins`，下次联机补报。`idle_logout_days`（默认 2 天）写在授权上并随许可下发，覆盖本机会话空闲超时（`core/security._desktop_idle_timeout_minutes`）。
+  - 本机 users 表新增 `desktop_run_mode` 列区分当前模式；`DesktopLicense` 新增 `mode/username/user_id/login_count/last_login_at/idle_logout_days`。
+- **许可签发与续期**：Ed25519 许可（私钥仅服务器：`NPT_LICENSE_PRIVATE_KEY` 或 `licenses/license_private_key.pem`，见 `services/desktop_signing.py`），租约默认 30 天、启动后台静默续期（剩余<20 天或距上次≥7 天）。OTA：管理端上传安装包到 `desktop_releases`，客户端比对版本 → 断点续传下载 + sha256 校验 → 写 `%TEMP%\npt_update_*.cmd`（等进程退出→静默安装→重启），经 `app/desktop_bridge.py` 的退出回调关闭应用；"稍后"3 次或 `mandatory` 转强制。离线 `.nptlic` 导入通道保留。
 - **网优助手**：LLM 配置/数据集导入到 `station_param_rows`、`station_metric_rows` 两张表，对话走 function-calling（最多 5 轮工具调用），查询只读。
 
 ## 添加新 API 端点
