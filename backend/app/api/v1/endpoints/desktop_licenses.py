@@ -33,6 +33,9 @@ class DesktopLicenseCreate(BaseModel):
     # 数据组：留空 = 由桌面端自选（首次同步时绑定到本授权）；指定则桌面端强制跟随
     city: Optional[str] = None
     operator: Optional[str] = None
+    # 绑定的网页端账号（桌面端与网页端共用账号权限）；单机用户无操作自动退出登录的时长
+    username: Optional[str] = None
+    idle_logout_days: Optional[int] = Field(default=None, ge=1, le=365)
 
 
 class DesktopLicenseUpdate(BaseModel):
@@ -42,11 +45,13 @@ class DesktopLicenseUpdate(BaseModel):
     note: Optional[str] = None
     city: Optional[str] = None
     operator: Optional[str] = None
+    idle_logout_days: Optional[int] = Field(default=None, ge=1, le=365)
 
 
 class DesktopLicenseReview(BaseModel):
     lease_days: Optional[int] = Field(default=None, ge=1, le=3650)
     note: Optional[str] = None
+    idle_logout_days: Optional[int] = Field(default=None, ge=1, le=365)
 
 
 @router.get("")
@@ -56,10 +61,13 @@ async def list_desktop_licenses(
     page_size: int = Query(default=20, ge=1, le=200),
     status: Optional[str] = Query(default=None),
     keyword: Optional[str] = Query(default=None),
+    mode: Optional[str] = Query(default=None, description="standalone=单机授权 / shared=共享模式自动签发 / 空=全部"),
     admin_user: User = Depends(get_current_admin_user),
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
-    total, items = desktop_license_service.list_licenses(db, page, page_size, status, keyword)
+    total, items = desktop_license_service.list_licenses(
+        db, page, page_size, status, keyword, mode
+    )
     return {"success": True, "data": {"total": total, "items": [i.to_dict() for i in items]}}
 
 
@@ -82,6 +90,8 @@ async def create_desktop_license(
             with_code=payload.with_code,
             city=payload.city,
             operator=payload.operator,
+            idle_logout_days=payload.idle_logout_days,
+            username=payload.username,
         )
     except DesktopLicenseError as exc:
         raise HTTPException(status_code=exc.status_code, detail=_gbk_safe(exc.message))
@@ -107,6 +117,7 @@ async def update_desktop_license(
             note=payload.note,
             city=payload.city,
             operator=payload.operator,
+            idle_logout_days=payload.idle_logout_days,
         )
     except DesktopLicenseError as exc:
         raise HTTPException(status_code=exc.status_code, detail=_gbk_safe(exc.message))
@@ -140,6 +151,7 @@ async def approve_desktop_license(
             lease_days=payload.lease_days,
             note=payload.note,
             approved_by=admin_user.username,
+            idle_logout_days=payload.idle_logout_days,
         )
     except DesktopLicenseError as exc:
         raise HTTPException(status_code=exc.status_code, detail=_gbk_safe(exc.message))

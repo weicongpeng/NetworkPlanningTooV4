@@ -267,6 +267,72 @@ def activate(activation_code: str, hostname: Optional[str] = None) -> Dict[str, 
     return data
 
 
+def login(
+    username: str,
+    password: str,
+    mode: str = "standalone",
+    offline_logins: Optional[int] = None,
+    hostname: Optional[str] = None,
+) -> Dict[str, Any]:
+    """桌面端账号登录：凭证是网页端用户名/密码，成功即落盘许可。
+
+    返回 {"result": "ok"|"pending"|..., ...}；result != ok 时不写许可文件。
+    """
+    from app.utils.machine_code import get_machine_code
+
+    payload: Dict[str, Any] = {
+        "username": username,
+        "password": password,
+        "mode": mode,
+        "machine_code": get_machine_code(),
+        "client_version": settings.NPT_DESKTOP_VERSION or "",
+        "hostname": hostname or "",
+    }
+    if offline_logins:
+        payload["offline_logins"] = int(offline_logins)
+    resp = _request("POST", "/desktop-cloud/auth/login", payload)
+    data = resp.get("data") or {}
+    if data.get("result") == "ok":
+        from app.services.license_service import license_service
+
+        ok, message = license_service.activate(str(data.get("license_file") or ""))
+        if not ok:
+            raise CloudError(500, f"许可文件校验失败：{message}")
+        save_state(
+            license_id=data.get("license_id"),
+            desktop_username=username,
+            desktop_mode=mode,
+            last_renew_at=datetime.now().isoformat(),
+            server_url=server_url(),
+        )
+    return data
+
+
+def poll_login(username: str) -> Dict[str, Any]:
+    """单机模式：轮询授权申请，批准后当场落盘许可。"""
+    from app.utils.machine_code import get_machine_code
+
+    resp = _request(
+        "POST",
+        "/desktop-cloud/auth/poll",
+        {"username": username, "machine_code": get_machine_code()},
+    )
+    data = resp.get("data") or {}
+    if data.get("result") == "ok":
+        from app.services.license_service import license_service
+
+        ok, message = license_service.activate(str(data.get("license_file") or ""))
+        if not ok:
+            raise CloudError(500, f"许可文件校验失败：{message}")
+        save_state(
+            license_id=data.get("license_id"),
+            desktop_username=username,
+            desktop_mode="standalone",
+            last_renew_at=datetime.now().isoformat(),
+        )
+    return data
+
+
 def apply_license(
     applicant_name: str, organization: Optional[str] = None, note: Optional[str] = None
 ) -> Dict[str, Any]:

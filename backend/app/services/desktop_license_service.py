@@ -15,6 +15,7 @@ import string
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional, Tuple
 
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
@@ -26,6 +27,11 @@ from app.utils.machine_code import normalize_machine_code
 _CODE_ALPHABET = "23456789ABCDEFGHJKMNPQRSTUVWXYZ"
 _CODE_BODY_LENGTH = 16
 CODE_PREFIX = "NPT"
+
+# 运行模式：共享模式（与网页端同账号同权限同组）/ 单机模式（单独授权、权限全开）
+MODE_SHARED = "shared"
+MODE_STANDALONE = "standalone"
+DEFAULT_IDLE_LOGOUT_DAYS = 2
 
 
 class DesktopLicenseError(Exception):
@@ -146,14 +152,18 @@ class DesktopLicenseService:
         page_size: int = 20,
         status: Optional[str] = None,
         keyword: Optional[str] = None,
+        mode: Optional[str] = None,
     ) -> Tuple[int, list]:
         query = db.query(DesktopLicense)
         if status:
             query = query.filter(DesktopLicense.status == status)
+        if mode:
+            query = query.filter(DesktopLicense.mode == mode)
         if keyword:
             like = f"%{keyword.strip()}%"
             query = query.filter(
                 (DesktopLicense.licensee_username.like(like))
+                | (DesktopLicense.username.like(like))
                 | (DesktopLicense.organization.like(like))
                 | (DesktopLicense.machine_code.like(like))
                 | (DesktopLicense.activation_code.like(like))
@@ -186,10 +196,24 @@ class DesktopLicenseService:
         with_code: bool = True,
         city: Optional[str] = None,
         operator: Optional[str] = None,
+        idle_logout_days: Optional[int] = None,
+        username: Optional[str] = None,
     ) -> Tuple[DesktopLicense, str]:
         name = (licensee_username or "").strip()
         if not name:
             raise DesktopLicenseError(400, "被授权用户不能为空")
+        if idle_logout_days is not None and int(idle_logout_days) <= 0:
+            raise DesktopLicenseError(400, "无操作退出登录时长必须为正整数（天）")
+        bound_username = (username or "").strip() or None
+        user_id = None
+        if bound_username:
+            from app.models.database import User
+
+            user = db.query(User).filter(User.username == bound_username).first()
+            if user is None:
+                raise DesktopLicenseError(404, f"账号不存在：{bound_username}")
+            user_id = user.id
+            name = name or bound_username
         record = DesktopLicense(
             licensee_username=name,
             organization=(organization or "").strip() or None,
@@ -197,12 +221,16 @@ class DesktopLicenseService:
             lease_days=int(lease_days or settings.NPT_DESKTOP_LEASE_DAYS or 30),
             note=(note or "").strip() or None,
             source="precreate",
+            mode=MODE_STANDALONE,
+            username=bound_username,
+            user_id=user_id,
             status="issued",
             created_by=created_by,
             created_at=_iso(),
             updated_at=_iso(),
             city=_clean_group_value(city),
             operator=_clean_group_value(operator),
+            idle_logout_days=int(idle_logout_days or DEFAULT_IDLE_LOGOUT_DAYS),
         )
         code = ""
         if with_code:
@@ -235,8 +263,13 @@ class DesktopLicenseService:
         note: Optional[str] = None,
         city: Optional[str] = None,
         operator: Optional[str] = None,
+        idle_logout_days: Optional[int] = None,
     ) -> DesktopLicense:
         record = self.get(db, license_id)
+        if idle_logout_days is not None:
+            if int(idle_logout_days) <= 0:
+                raise DesktopLicenseError(400, "无操作退出登录时长必须为正整数（天）")
+            record.idle_logout_days = int(idle_logout_days)
         if licensee_username is not None:
             name = licensee_username.strip()
             if not name:
@@ -280,10 +313,15 @@ class DesktopLicenseService:
         lease_days: Optional[int] = None,
         note: Optional[str] = None,
         approved_by: Optional[str] = None,
+        idle_logout_days: Optional[int] = None,
     ) -> Tuple[DesktopLicense, str]:
         record = self.get(db, license_id)
         if record.status not in ("pending", "issued"):
             raise DesktopLicenseError(409, f"当前状态不允许批准：{record.status}")
+        if idle_logout_days is not None:
+            if int(idle_logout_days) <= 0:
+                raise DesktopLicenseError(400, "无操作退出登录时长必须为正整数（天）")
+            record.idle_logout_days = int(idle_logout_days)
         if lease_days is not None:
             if int(lease_days) <= 0:
                 raise DesktopLicenseError(400, "租约天数必须为正整数")
@@ -379,6 +417,10 @@ class DesktopLicenseService:
             "issued_at": _now().strftime("%Y-%m-%d %H:%M:%S"),
             "expire_date": expire_date,
             "features": ["all"],
+            # 运行模式与绑定的网页端账号：桌面端据此决定权限策略
+            "mode": record.mode or MODE_STANDALONE,
+            "username": record.username or "",
+            "idle_logout_days": int(record.idle_logout_days or DEFAULT_IDLE_LOGOUT_DAYS),
             # 数据组：桌面端同步时据此确定自己属于哪一组（为空则由桌面端自选）
             "city": record.city or "",
             "operator": record.operator or "",
@@ -533,6 +575,267 @@ class DesktopLicenseService:
         if record.status == "issued" and record.activation_code:
             result["activation_code"] = record.activation_code
         return result
+
+    def _login_payload(
+        self, record: DesktopLicense, license_file: str, expire_date: str, user
+    ) -> Dict[str, Any]:
+        """登录响应：账号信息 + 授权信息（本机据此镜像账号与运行模式）。"""
+        return {
+            "license_file": license_file,
+            "license_id": record.id,
+            "licensee": record.licensee_username,
+            "organization": record.organization,
+            "machine_code": record.machine_code,
+            "lease_days": record.lease_days,
+            "expire_date": expire_date,
+            "remaining_days": self.remaining_days(expire_date),
+            "city": record.city,
+            "operator": record.operator,
+            "mode": record.mode,
+            "username": record.username,
+            "user_id": record.user_id,
+            "idle_logout_days": record.idle_logout_days or DEFAULT_IDLE_LOGOUT_DAYS,
+            "login_count": record.login_count or 0,
+            "user": user.to_dict(),
+        }
+
+    def _ensure_shared_license(
+        self,
+        db: Session,
+        user,
+        machine: str,
+        client_version: Optional[str],
+        hostname: Optional[str],
+    ) -> DesktopLicense:
+        """共享模式：为该「账号 + 机器」自动签发（或复用）许可，作为数据同步凭证。
+
+        共享模式不需要管理员批准——账号本身就是凭据，且组归属跟随账号，
+        因此这里一律直接签发，同时保持服务器上的组与账号组一致。
+        """
+        record = (
+            db.query(DesktopLicense)
+            .filter(
+                DesktopLicense.mode == MODE_SHARED,
+                DesktopLicense.username == user.username,
+                DesktopLicense.machine_code == machine,
+            )
+            .first()
+        )
+        if record is None:
+            record = DesktopLicense(
+                mode=MODE_SHARED,
+                username=user.username,
+                user_id=user.id,
+                licensee_username=user.username,
+                machine_code=machine,
+                lease_days=int(settings.NPT_DESKTOP_LEASE_DAYS or 30),
+                source="precreate",
+                status="active",
+                created_at=_iso(),
+                created_by="desktop-login",
+            )
+            db.add(record)
+        if record.status == "disabled":
+            raise DesktopLicenseError(403, "该授权已被禁用，请联系管理员")
+        record.licensee_username = user.username
+        record.user_id = user.id
+        record.city = user.city
+        record.operator = user.operator
+        record.status = "active"
+        record.machine_bound_at = record.machine_bound_at or _iso()
+        record.activated_at = _iso()
+        record.client_version = (client_version or "").strip() or record.client_version
+        record.hostname = (hostname or "").strip() or record.hostname
+        db.flush()
+        return record
+
+    def _standalone_record(
+        self,
+        db: Session,
+        user,
+        machine: str,
+        client_version: Optional[str],
+        hostname: Optional[str],
+    ) -> DesktopLicense:
+        """单机模式：取（必要时创建待批准申请）该账号在本机的授权记录。
+
+        管理员预建但未绑定机器码的授权也能被认领（machine_code 为空即待绑定）；
+        未申请过 → 建 pending 申请单并由调用方返回「等待管理员批准」。
+        """
+        record = (
+            db.query(DesktopLicense)
+            .filter(
+                DesktopLicense.mode == MODE_STANDALONE,
+                DesktopLicense.username == user.username,
+                or_(
+                    DesktopLicense.machine_code == machine,
+                    DesktopLicense.machine_code.is_(None),
+                ),
+            )
+            .first()
+        )
+        if record is None:
+            record = DesktopLicense(
+                mode=MODE_STANDALONE,
+                username=user.username,
+                user_id=user.id,
+                licensee_username=user.username,
+                machine_code=machine,
+                lease_days=int(settings.NPT_DESKTOP_LEASE_DAYS or 30),
+                idle_logout_days=DEFAULT_IDLE_LOGOUT_DAYS,
+                source="approve",
+                status="pending",
+                request_token=secrets.token_urlsafe(24),
+                client_version=(client_version or "").strip() or None,
+                hostname=(hostname or "").strip() or None,
+                created_at=_iso(),
+                updated_at=_iso(),
+            )
+            db.add(record)
+            db.flush()
+        return record
+
+    def login(
+        self,
+        db: Session,
+        username: str,
+        password: str,
+        mode: str,
+        machine_code: str,
+        client_version: Optional[str] = None,
+        hostname: Optional[str] = None,
+    ) -> Tuple[str, Dict[str, Any]]:
+        """桌面端账号登录：与网页端同一套账号与权限，按模式决定是否需单独授权。
+
+        返回 (result, payload)：
+        - result="ok"：已签发许可，payload 含 license_file 与账号信息
+        - result="pending"：单机模式尚未授权，payload 含 status（前端弹窗等待管理员批准）
+
+        单机模式在授权有效期内可离线登录，因此每次联机登录都累加 login_count。
+        共享模式不写服务器会话行，避免桌面端登录把网页端同账号踢下线。
+        """
+        from app.services.auth_service import auth_service
+
+        name = (username or "").strip()
+        if not name:
+            raise DesktopLicenseError(400, "请输入用户名")
+        user, error = auth_service.authenticate_user(db, name, password)
+        if error:
+            raise DesktopLicenseError(401, error)
+        if user.is_desktop_shadow:
+            raise DesktopLicenseError(403, "该账号不可用于桌面端登录")
+
+        machine = _normalize_machine(machine_code)
+        shared = str(mode).lower() == MODE_SHARED
+
+        if shared:
+            if not user.city or not user.operator:
+                raise DesktopLicenseError(
+                    400, "该账号未分配数据组（地市+运营商），请联系管理员分配后再使用共享模式"
+                )
+            record = self._ensure_shared_license(db, user, machine, client_version, hostname)
+        else:
+            record = self._standalone_record(db, user, machine, client_version, hostname)
+            if record.status == "pending":
+                record.updated_at = _iso()
+                db.commit()
+                db.refresh(record)
+                return "pending", {
+                    "status": "pending",
+                    "mode": MODE_STANDALONE,
+                    "username": user.username,
+                    "license_id": record.id,
+                    "message": "已提交授权申请，请等待管理员在「桌面授权」页面确认",
+                }
+            if record.status == "rejected":
+                db.commit()
+                raise DesktopLicenseError(403, "该账号的单机授权申请已被拒绝，请联系管理员")
+            if record.status == "disabled":
+                db.commit()
+                raise DesktopLicenseError(403, "该账号的单机授权已被禁用，请联系管理员")
+            if record.machine_code and record.machine_code != machine:
+                db.commit()
+                raise DesktopLicenseError(409, "该单机授权已绑定其它机器，换机请联系管理员解绑")
+            record.machine_code = machine
+            record.machine_bound_at = record.machine_bound_at or _iso()
+            record.status = "active"
+            record.activated_at = _iso()
+            record.login_count = (record.login_count or 0) + 1
+            record.last_login_at = _iso()
+            record.client_version = (client_version or "").strip() or record.client_version
+            record.hostname = (hostname or "").strip() or record.hostname
+            if not record.city and user.city:
+                record.city = user.city
+            if not record.operator and user.operator:
+                record.operator = user.operator
+
+        license_file, expire_date = self._build_license(record)
+        record.expire_date = expire_date
+        record.updated_at = _iso()
+        db.commit()
+        db.refresh(record)
+        return "ok", self._login_payload(record, license_file, expire_date, user)
+
+    def poll_login(
+        self, db: Session, username: str, machine_code: str
+    ) -> Tuple[str, Dict[str, Any]]:
+        """单机模式申请后轮询：管理员一批准就当场签发许可（无需再输密码）。"""
+        from app.models.database import User
+
+        name = (username or "").strip()
+        machine = _normalize_machine(machine_code)
+        user = db.query(User).filter(User.username == name).first()
+        if user is None:
+            raise DesktopLicenseError(404, "账号不存在")
+        record = (
+            db.query(DesktopLicense)
+            .filter(
+                DesktopLicense.mode == MODE_STANDALONE,
+                DesktopLicense.username == name,
+                or_(
+                    DesktopLicense.machine_code == machine,
+                    DesktopLicense.machine_code.is_(None),
+                ),
+            )
+            .first()
+        )
+        if record is None:
+            raise DesktopLicenseError(404, "没有待批准的授权申请")
+        if record.status == "pending":
+            return "pending", {
+                "status": "pending",
+                "mode": MODE_STANDALONE,
+                "license_id": record.id,
+                "message": "已提交授权申请，请等待管理员在「桌面授权」页面确认",
+            }
+        if record.status in ("rejected", "disabled"):
+            return record.status, {
+                "status": record.status,
+                "message": record.review_note or "授权申请未通过，请联系管理员",
+            }
+
+        record.status = "active"
+        record.activated_at = _iso()
+        record.login_count = (record.login_count or 0) + 1
+        record.last_login_at = _iso()
+        license_file, expire_date = self._build_license(record)
+        record.expire_date = expire_date
+        record.updated_at = _iso()
+        db.commit()
+        db.refresh(record)
+        return "ok", self._login_payload(record, license_file, expire_date, user)
+
+    def report_offline_logins(self, db: Session, license_id: int, count: int) -> int:
+        """补报离线期间的登录次数（单机模式断网登录时本机先记账）。"""
+        if not license_id or count <= 0:
+            return 0
+        record = db.query(DesktopLicense).filter(DesktopLicense.id == int(license_id)).first()
+        if record is None:
+            raise DesktopLicenseError(404, "授权记录不存在，请重新登录")
+        record.login_count = (record.login_count or 0) + int(count)
+        db.commit()
+        db.refresh(record)
+        return record.login_count
 
     def status_summary(self, record: DesktopLicense) -> Dict[str, Any]:
         return {

@@ -89,6 +89,77 @@ class ApplyRequest(BaseModel):
     hostname: Optional[str] = None
 
 
+class LoginRequest(BaseModel):
+    """桌面端账号登录：与网页端同一套账号，共享模式直接放行、单机模式需授权。"""
+
+    username: str
+    password: str
+    mode: str = Field(default="standalone", description="shared=共享模式 / standalone=单机模式")
+    machine_code: str
+    client_version: Optional[str] = None
+    hostname: Optional[str] = None
+    offline_logins: Optional[int] = Field(
+        default=None, ge=1, le=1000, description="离线期间累计的登录次数（补报）"
+    )
+
+
+class PollLoginRequest(BaseModel):
+    """单机模式授权申请轮询：管理员批准后当场签许可。"""
+
+    username: str
+    machine_code: str
+
+
+@router.post("/auth/login")
+async def desktop_login(
+    payload: LoginRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """桌面端账号登录（公开 + 限流，凭证是网页端用户名/密码）。"""
+    _rate_limit(f"login:{_client_ip(request)}", limit=20, window=300)
+    try:
+        result, data = desktop_license_service.login(
+            db,
+            username=payload.username,
+            password=payload.password,
+            mode=payload.mode,
+            machine_code=payload.machine_code,
+            client_version=payload.client_version,
+            hostname=payload.hostname,
+        )
+    except DesktopLicenseError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=_gbk_safe(exc.message))
+    # 单机模式断网期间在本机登录的次数，联机时补报（不影响本次登录本身）
+    if result == "ok" and payload.offline_logins:
+        try:
+            data["login_count"] = desktop_license_service.report_offline_logins(
+                db, int(data.get("license_id") or 0), int(payload.offline_logins)
+            )
+        except DesktopLicenseError:
+            pass  # 补报失败不阻断登录
+    return {"success": True, "data": {"result": result, **data}}
+
+
+@router.post("/auth/poll")
+async def desktop_login_poll(
+    payload: PollLoginRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """单机模式：轮询授权申请结果（approved 时直接返回许可）。"""
+    _rate_limit(f"poll:{_client_ip(request)}", limit=120, window=300)
+    try:
+        result, data = desktop_license_service.poll_login(
+            db, username=payload.username, machine_code=payload.machine_code
+        )
+    except DesktopLicenseError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=_gbk_safe(exc.message))
+    return {"success": True, "data": {"result": result, **data}}
+
+
+
+
 @router.get("/config")
 async def client_config() -> Dict[str, Any]:
     """客户端握手：激活模式/默认租约/更新渠道（公开，供客户端决定展示哪种激活方式）。"""
@@ -245,6 +316,21 @@ def _license_group(record):
     return None
 
 
+def _owner_user(db: Session, record):
+    """同步上来数据的归属用户：优先用授权绑定的网页端账号，其次才是影子账号。
+
+    共享模式登录时桌面端用的就是真实账号，数据也应归到该账号名下
+    （老授权没有绑定账号时才退回影子账号 `desktop-{license_id}`）。
+    """
+    from app.models.database import User
+
+    if record.user_id:
+        user = db.query(User).filter(User.id == record.user_id).first()
+        if user is not None:
+            return user
+    return ensure_shadow_user(db, record)
+
+
 @router.post("/data/session")
 async def data_session(
     payload: SessionRequest,
@@ -278,7 +364,7 @@ async def data_session(
     else:
         city, operator = group
 
-    shadow = ensure_shadow_user(db, record)
+    owner = _owner_user(db, record)
     db.commit()
 
     return {
@@ -288,7 +374,7 @@ async def data_session(
             "licensee": record.licensee_username,
             "group": {"city": city, "operator": operator},
             "group_locked": group_locked,
-            "shadow_user_id": shadow.id if shadow else None,
+            "shadow_user_id": owner.id if owner else None,
             "server_time": time.strftime("%Y-%m-%dT%H:%M:%S"),
         },
     }
@@ -511,13 +597,13 @@ async def upload_dataset_package(
                 ),
             )
 
-        shadow = ensure_shadow_user(db, record)
+        owner = _owner_user(db, record)
         db.commit()
         try:
             await run_in_threadpool(
                 install_package,
                 tmp_path,
-                user_id=shadow.id,
+                user_id=owner.id,
                 city=city,
                 operator=operator,
                 username=record.licensee_username,
