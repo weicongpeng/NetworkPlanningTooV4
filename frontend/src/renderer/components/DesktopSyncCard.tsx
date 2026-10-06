@@ -9,6 +9,7 @@ import type { DesktopSyncStatus } from '../services/api'
 export function DesktopSyncCard() {
   const { t } = useTranslation()
   const desktopMode = useAuthStore((s) => s.desktopMode)
+  const desktopRunMode = useAuthStore((s) => s.desktopRunMode)
   const user = useAuthStore((s) => s.user)
   const fetchUser = useAuthStore((s) => s.fetchUser)
 
@@ -49,7 +50,8 @@ export function DesktopSyncCard() {
     setOperator(user?.operator ?? '')
   }, [user?.city, user?.operator])
 
-  if (!desktopMode) return null
+  // 单机模式不参与服务器数据共享，也没有数据组概念
+  if (!desktopMode || desktopRunMode === 'standalone') return null
 
   const shared = status?.run_mode === 'shared'
 

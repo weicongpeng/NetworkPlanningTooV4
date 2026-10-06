@@ -324,6 +324,10 @@ export interface DesktopLicensePayload {
   note?: string
   city?: string | null
   operator?: string | null
+  /** 单机用户无操作自动退出登录的时长（天） */
+  idle_logout_days?: number
+  /** 绑定的网页端账号（桌面端与网页端共用同一账号权限） */
+  username?: string
 }
 
 export const desktopLicensesApi = {
@@ -332,10 +336,13 @@ export const desktopLicensesApi = {
     pageSize = 20,
     status?: string,
     keyword?: string,
+    mode?: 'standalone' | 'shared',
   ): Promise<ApiResponse<{ total: number; items: DesktopLicenseRecord[] }>> => {
     const params: Record<string, any> = { page, page_size: pageSize }
     if (status) params.status = status
     if (keyword) params.keyword = keyword
+    // 共享模式登录会自动签发许可（无需管理），默认只看单机授权
+    if (mode) params.mode = mode
     return apiClient.get('/desktop-licenses', { params })
   },
 
@@ -558,6 +565,38 @@ export const desktopCloudApi = {
 
   updateGroup: async (city: string, operator: string): Promise<ApiResponse<{ city: string; operator: string }>> => {
     return apiClient.put('/desktop/group', { city, operator }) as any
+  },
+}
+
+/** 桌面端登录结果（共享模式直接可用；单机模式可能返回 pending 等待管理员批准） */
+export interface DesktopLoginResult {
+  token?: string
+  access_token?: string
+  user?: any
+  mode?: 'shared' | 'standalone'
+  offline?: boolean
+  idle_logout_days?: number
+  license?: any
+  /** result=pending 时表示单机授权申请已提交，等待管理员在「桌面授权」页确认 */
+  result?: 'ok' | 'pending'
+  status?: string
+  message?: string
+  license_id?: number
+}
+
+// 桌面版账号登录：与网页端同一套账号（仅桌面版可用，网页端返回 404）
+export const desktopLoginApi = {
+  login: async (data: {
+    username: string
+    password: string
+    mode: 'shared' | 'standalone'
+  }): Promise<ApiResponse<DesktopLoginResult>> => {
+    return apiClient.post('/desktop/login', data) as any
+  },
+
+  /** 单机模式：轮询「申请授权」结果，管理员批准后直接返回登录态 */
+  poll: async (username: string): Promise<ApiResponse<DesktopLoginResult>> => {
+    return apiClient.post('/desktop/auth-poll', { username }) as any
   },
 }
 
@@ -1883,9 +1922,6 @@ export const authApi = {
   },
 
   /** 桌面版免登录会话（仅 NPT_DESKTOP=1 的本机后端可用，服务器返回 404） */
-  desktopSession: async (): Promise<ApiResponse<TokenResponse>> => {
-    return apiClient.get('/auth/desktop-session') as any
-  },
 }
 
 /** 系统信息（公开）：含运行形态标识，桌面端据此走免登录 */

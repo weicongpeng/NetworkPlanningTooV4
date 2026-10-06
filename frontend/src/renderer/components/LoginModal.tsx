@@ -19,10 +19,13 @@ const FALLBACK_OPERATORS = ['移动', '联通', '电信', '广电']
 export function LoginModal({ isOpen, forceChangePassword = false, onClose }: LoginModalProps) {
   const { t } = useTranslation()
   const { login, register, changePassword } = useAuthStore()
+  const desktopMode = useAuthStore((s) => s.desktopMode)
   const navigate = useNavigate()
   const location = useLocation()
 
   const [mode, setMode] = useState<'login' | 'register'>('login')
+  // 桌面端运行模式：共享模式（与网页端一致）/ 单机模式（需管理员单独授权）
+  const [desktopRunMode, setDesktopRunMode] = useState<'shared' | 'standalone'>('shared')
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
   const [confirmPassword, setConfirmPassword] = useState('')
@@ -81,7 +84,11 @@ export function LoginModal({ isOpen, forceChangePassword = false, onClose }: Log
       } else if (mode === 'login') {
         // 先取上次停留页面，登录成功后恢复（须在 login 之前取，避免被路由记录覆盖）
         const restoreTarget = getLastRoute(username.trim())
-        const warningMsg = await login(username.trim(), password)
+        const warningMsg = await login(
+          username.trim(),
+          password,
+          desktopMode ? desktopRunMode : undefined,
+        )
         if (restoreTarget && restoreTarget !== location.pathname) {
           navigate(restoreTarget, { replace: true })
         }
@@ -254,6 +261,38 @@ export function LoginModal({ isOpen, forceChangePassword = false, onClose }: Log
             />
           </div>
 
+          {/* 桌面端运行模式：共享模式与网页端一致；单机模式需管理员单独授权 */}
+          {desktopMode && mode === 'login' && (
+            <div>
+              <label className="block text-sm text-muted-foreground mb-1.5">
+                {t('desktopAuth.runModeLabel', '运行模式')}
+              </label>
+              <div className="grid grid-cols-2 gap-2">
+                {(['shared', 'standalone'] as const).map((value) => (
+                  <button
+                    key={value}
+                    type="button"
+                    onClick={() => setDesktopRunMode(value)}
+                    className={`px-3 py-2 rounded-lg border-2 text-sm font-medium transition-all ${
+                      desktopRunMode === value
+                        ? 'border-primary bg-primary/10 text-primary'
+                        : 'border-border hover:border-primary/50'
+                    }`}
+                  >
+                    {value === 'shared'
+                      ? t('desktopAuth.modeShared', '共享模式')
+                      : t('desktopAuth.modeStandalone', '单机模式')}
+                  </button>
+                ))}
+              </div>
+              <p className="mt-1.5 text-xs text-muted-foreground">
+                {desktopRunMode === 'shared'
+                  ? t('desktopAuth.modeSharedHint', '与网页端同一账号、权限与数据组，可共享数据。')
+                  : t('desktopAuth.modeStandaloneHint', '数据仅存本机，需管理员授权后使用。')}
+              </p>
+            </div>
+          )}
+
           {mode === 'register' && (
             <>
               <div>
@@ -315,8 +354,8 @@ export function LoginModal({ isOpen, forceChangePassword = false, onClose }: Log
           </button>
         </form>
 
-        {/* Switch mode */}
-        {!forceChangePassword && (
+        {/* Switch mode（桌面端没有注册入口，账号在网页端创建） */}
+        {!forceChangePassword && !desktopMode && (
           <div className="mt-5 text-center">
             <span className="text-sm text-muted-foreground">
               {mode === 'login' ? t('auth.noAccount', '还没有账号？') : t('auth.hasAccount', '已有账号？')}

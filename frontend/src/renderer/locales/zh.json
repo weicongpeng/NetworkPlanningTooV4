@@ -1774,7 +1774,17 @@
     "groupOperatorPlaceholder": "运营商（留空=桌面端自选）",
     "colMachine": "机器码",
     "colExpire": "到期 / 租约",
+    "colUsage": "登录情况",
     "colActions": "操作",
+    "loginCount": "已登录 {{count}} 次",
+    "idleLogoutDays": "无操作 {{days}} 天退出",
+    "modeStandalone": "单机授权",
+    "modeShared": "共享模式",
+    "allMode": "全部模式",
+    "boundAccount": "账号",
+    "usernameLabel": "绑定网页端账号",
+    "usernamePlaceholder": "留空则由该用户首次登录单机模式时认领",
+    "idleLogoutLabel": "无操作退出登录时长（天）",
     "sourcePrecreate": "预建",
     "sourceApprove": "申请",
     "renewCount": "已续期 {{count}} 次",
@@ -1810,5 +1820,17 @@
     "empty": "暂无授权记录",
     "total": "共 {{total}} 条",
     "loadFailed": "加载授权列表失败"
+  },
+  "desktopAuth": {
+    "title": "申请授权",
+    "runModeLabel": "运行模式",
+    "modeShared": "共享模式",
+    "modeStandalone": "单机模式",
+    "modeSharedHint": "与网页端同一账号、权限与数据组，可共享数据。",
+    "modeStandaloneHint": "数据仅存本机，需管理员授权后使用，功能权限全开。",
+    "pendingHint": "已提交单机模式授权申请，请等待管理员在「桌面授权」页面确认。",
+    "waiting": "等待管理员确认…",
+    "rejected": "授权申请未通过，请联系管理员",
+    "cancel": "取消"
   }
 }

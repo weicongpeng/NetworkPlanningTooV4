@@ -1,7 +1,10 @@
 import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
 import type { UserInfo } from '@shared/types'
-import { authApi, systemApi } from '../services/api'
+import { authApi, desktopLoginApi, systemApi } from '../services/api'
+
+/** 桌面端运行模式：共享模式（与网页端一致）/ 单机模式（单独授权、权限全开） */
+export type DesktopRunMode = 'shared' | 'standalone' | null
 
 interface AuthState {
   token: string | null
@@ -12,16 +15,21 @@ interface AuthState {
   desktopMode: boolean
   /** 桌面形态探测是否已完成（未完成前不渲染登录页，避免闪一下） */
   desktopProbed: boolean
-  /** 桌面形态下免登录失败的原因（展示给用户，避免静默回落到登录页无从排查） */
+  /** 桌面形态探测失败的原因（仅用于启动探测提示） */
   desktopError: string | null
+  /** 桌面端运行模式：登录后确定，持久化以便刷新后保持 */
+  desktopRunMode: DesktopRunMode
+  /** 单机模式已提交授权申请、等待管理员批准的账号 */
+  desktopPendingUsername: string | null
 
-  login: (username: string, password: string) => Promise<string | null>
+  login: (username: string, password: string, desktopMode?: 'shared' | 'standalone') => Promise<string | null>
   register: (username: string, password: string, confirmPassword: string, city: string, operator: string, equipmentVendor?: string) => Promise<void>
   logout: () => Promise<void>
   fetchUser: () => Promise<void>
   changePassword: (oldPassword: string, newPassword: string, confirmPassword: string) => Promise<void>
   probeDesktopMode: () => Promise<void>
-  desktopAutoLogin: () => Promise<void>
+  setDesktopPendingUsername: (username: string | null) => void
+  applyDesktopLogin: (data: { access_token?: string; token?: string; user?: any; mode?: string }) => void
 }
 
 /** 清空按用户隔离的内存数据缓存（登录前/登出后调用，防止切换账号读到上一账号的组数据） */
@@ -47,12 +55,36 @@ export const useAuthStore = create<AuthState>()(
       desktopMode: false,
       desktopProbed: false,
       desktopError: null,
+      desktopRunMode: null,
+      desktopPendingUsername: null,
 
-      login: async (username: string, password: string, clientType?: 'pc' | 'app') => {
+      login: async (username: string, password: string, desktopRunMode?: 'shared' | 'standalone') => {
         clearUserDataCaches()
         set({ isLoading: true })
         try {
-          const result: any = await authApi.login({ username, password, client_type: clientType || 'pc' })
+          // 桌面版：走本机后端代理登录，返回 result=pending 表示单机授权待管理员批准
+          if (desktopRunMode) {
+            const result: any = await desktopLoginApi.login({ username, password, mode: desktopRunMode })
+            const data = result?.data || {}
+            if (data.result === 'pending') {
+              set({ isLoading: false, desktopRunMode, desktopPendingUsername: username })
+              return null
+            }
+            if (!data.access_token) {
+              throw new Error((result as any)?.message || '登录失败')
+            }
+            set({
+              token: data.access_token,
+              user: data.user,
+              isAuthenticated: true,
+              isLoading: false,
+              desktopRunMode: data.mode || desktopRunMode,
+              desktopPendingUsername: null,
+            })
+            return null
+          }
+
+          const result: any = await authApi.login({ username, password, client_type: 'pc' })
           if (result.success && result.data) {
             set({
               token: result.data.access_token,
@@ -69,6 +101,8 @@ export const useAuthStore = create<AuthState>()(
           throw error
         }
       },
+
+      setDesktopPendingUsername: (username: string | null) => set({ desktopPendingUsername: username }),
 
       register: async (username: string, password: string, confirmPassword: string, city: string, operator: string) => {
         clearUserDataCaches()
@@ -103,6 +137,8 @@ export const useAuthStore = create<AuthState>()(
           token: null,
           user: null,
           isAuthenticated: false,
+          desktopRunMode: null,
+          desktopPendingUsername: null,
         })
         // 登出后清空所有用户的内存数据缓存，杜绝下一账号 TTL 内读到本组数据
         clearUserDataCaches()
@@ -112,7 +148,13 @@ export const useAuthStore = create<AuthState>()(
         try {
           const result = await authApi.getMe()
           if (result.success && result.data) {
-            set({ user: result.data, isAuthenticated: true })
+            const runMode = (result.data as any).desktop_run_mode
+            set({
+              user: result.data,
+              isAuthenticated: true,
+              // 桌面端运行模式以服务端为准（刷新页面后恢复）
+              desktopRunMode: runMode || get().desktopRunMode,
+            })
           }
         } catch {
           // Token 无效，清除认证状态
@@ -166,37 +208,17 @@ export const useAuthStore = create<AuthState>()(
         set({ desktopMode, desktopProbed: true, desktopError })
       },
 
-      desktopAutoLogin: async () => {
-        const attempt = async (): Promise<any> => {
-          const res: any = await authApi.desktopSession()
-          if (!res?.success || !res?.data?.access_token) {
-            throw new Error((res as any)?.message || `桌面会话获取失败（code=${res?.code}）`)
-          }
-          return res
-        }
-        try {
-          let res: any
-          try {
-            res = await attempt()
-          } catch (firstError: any) {
-            // 启动竞态：lifespan 还没建好 owner 账号时重试一次
-            await new Promise((r) => setTimeout(r, 1500))
-            res = await attempt()
-          }
-          clearUserDataCaches()
-          set({
-            token: res.data.access_token,
-            user: res.data.user,
-            isAuthenticated: true,
-            desktopError: null,
-          })
-        } catch (error: any) {
-          const message = error?.message || String(error)
-          console.warn('[desktop] 本机免登录会话获取失败：', message)
-          // 关键：不要把 desktopMode 置 false，否则会静默回落到登录页无从排查
-          set({ desktopError: message })
-          throw error
-        }
+      applyDesktopLogin: (data) => {
+        const token = data?.access_token || data?.token
+        if (!token || !data?.user) return
+        clearUserDataCaches()
+        set({
+          token,
+          user: data.user,
+          isAuthenticated: true,
+          desktopRunMode: (data.mode || 'standalone') as DesktopRunMode,
+          desktopPendingUsername: null,
+        })
       },
     }),
     {
@@ -205,6 +227,7 @@ export const useAuthStore = create<AuthState>()(
         token: state.token,
         user: state.user,
         isAuthenticated: state.isAuthenticated,
+        desktopRunMode: state.desktopRunMode,
       }),
       onRehydrateStorage: () => (state) => {
         if (state && state.token) {

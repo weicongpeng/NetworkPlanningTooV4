@@ -82,6 +82,17 @@ export interface DesktopLicenseRecord {
   licensee_username: string
   organization?: string | null
   machine_code?: string | null
+  /** 运行模式：standalone=单机授权 / shared=共享模式登录自动签发 */
+  mode?: 'standalone' | 'shared' | string
+  /** 绑定的网页端账号（桌面端与网页端共用同一账号权限） */
+  username?: string | null
+  user_id?: number | null
+  /** 历史登录次数与无操作自动退出登录时长（天） */
+  login_count?: number
+  last_login_at?: string | null
+  idle_logout_days?: number
+  city?: string | null
+  operator?: string | null
   status: 'pending' | 'issued' | 'active' | 'rejected' | 'disabled' | string
   source: 'precreate' | 'approve' | string
   lease_days: number
@@ -495,6 +506,8 @@ export interface UserInfo {
   city: string | null
   operator: string | null
   user_type?: 'pc' | 'app'
+  /** 桌面版登录时选择的运行模式（网页端为 null） */
+  desktop_run_mode?: 'shared' | 'standalone' | null
   can_data_import?: boolean
   can_data_delete?: boolean
   can_data_update?: boolean

@@ -24,6 +24,8 @@ export function LicensePage() {
 
   const { themeMode, colorScheme, setThemeMode, setColorScheme, applyTheme } = useThemeStore()
   const { user, fetchUser } = useAuthStore()
+  const desktopRunMode = useAuthStore((s) => s.desktopRunMode)
+  const isStandalone = desktopRunMode === 'standalone'
   const [previewTheme, setPreviewTheme] = useState<ThemeMode | null>(null)
   const [previewColor, setPreviewColor] = useState<ColorScheme | null>(null)
 
@@ -294,8 +296,8 @@ export function LicensePage() {
         </div>
       )}
 
-      {/* 桌面离线授权：在线激活/续期 + 机器码 + 离线导入（仅桌面版） */}
-      {machineInfo?.desktopMode && (
+      {/* 桌面离线授权：在线激活/续期 + 机器码 + 离线导入（仅共享模式桌面版） */}
+      {machineInfo?.desktopMode && !isStandalone && (
         <div className="mb-6 max-w-5xl">
           <div className="bg-card p-5 rounded-lg border border-border">
             <div className="flex items-center justify-between mb-4">
@@ -509,7 +511,7 @@ export function LicensePage() {
         </div>
       )}
 
-      {/* 桌面版：共享模式 ⇄ 离线模式 与数据同步 */}
+      {/* 共享模式桌面版：共享模式 ⇄ 离线模式 与数据同步 */}
       <DesktopSyncCard />
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 max-w-5xl">

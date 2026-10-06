@@ -24,6 +24,8 @@ export function DesktopLicensesPage() {
   const [pageSize] = useState(20)
   const [status, setStatus] = useState('')
   const [keyword, setKeyword] = useState('')
+  // 共享模式登录会自动签发许可（无需管理），默认只看单机授权
+  const [mode, setMode] = useState<'standalone' | 'shared' | ''>('standalone')
   const [loading, setLoading] = useState(false)
   const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
 
@@ -34,6 +36,8 @@ export function DesktopLicensesPage() {
   const [createNote, setCreateNote] = useState('')
   const [createCity, setCreateCity] = useState('')
   const [createOperator, setCreateOperator] = useState('')
+  const [createIdleLogout, setCreateIdleLogout] = useState(2)
+  const [createUsername, setCreateUsername] = useState('')
 
   const [newCode, setNewCode] = useState<{ name: string; code: string } | null>(null)
   const [editing, setEditing] = useState<DesktopLicenseRecord | null>(null)
@@ -43,6 +47,7 @@ export function DesktopLicensesPage() {
   const [editNote, setEditNote] = useState('')
   const [editCity, setEditCity] = useState('')
   const [editOperator, setEditOperator] = useState('')
+  const [editIdleLogout, setEditIdleLogout] = useState(2)
 
   // 数据组下拉（地市 + 运营商）：决定该桌面端在共享模式下共享到哪一组的数据
   const [cities, setCities] = useState<string[]>([])
@@ -63,7 +68,7 @@ export function DesktopLicensesPage() {
   const fetchItems = useCallback(async () => {
     setLoading(true)
     try {
-      const res = await desktopLicensesApi.list(page, pageSize, status || undefined, keyword || undefined)
+      const res = await desktopLicensesApi.list(page, pageSize, status || undefined, keyword || undefined, mode || undefined)
       if (res.success) {
         setItems(res.data.items)
         setTotal(res.data.total)
@@ -73,7 +78,7 @@ export function DesktopLicensesPage() {
     } finally {
       setLoading(false)
     }
-  }, [page, pageSize, status, keyword, t])
+  }, [page, pageSize, status, keyword, mode, t])
 
   useEffect(() => {
     fetchItems()
@@ -94,6 +99,8 @@ export function DesktopLicensesPage() {
         note: createNote.trim() || undefined,
         city: createCity || null,
         operator: createOperator || null,
+        idle_logout_days: createIdleLogout || undefined,
+        username: createUsername.trim() || undefined,
       })
       if (res?.success) {
         setShowCreate(false)
@@ -103,6 +110,7 @@ export function DesktopLicensesPage() {
         setCreateNote('')
         setCreateCity('')
         setCreateOperator('')
+        setCreateUsername('')
         await fetchItems()
       }
     } catch (err: any) {
@@ -155,6 +163,7 @@ export function DesktopLicensesPage() {
     setEditNote(item.note || '')
     setEditCity((item as any).city || '')
     setEditOperator((item as any).operator || '')
+    setEditIdleLogout(item.idle_logout_days ?? 2)
   }
 
   const submitEdit = async () => {
@@ -167,6 +176,7 @@ export function DesktopLicensesPage() {
         note: editNote.trim(),
         city: editCity || null,
         operator: editOperator || null,
+        idle_logout_days: editIdleLogout,
       })
       setEditing(null)
       notify('success', t('desktopLicenses.updateSuccess'))
@@ -228,6 +238,18 @@ export function DesktopLicensesPage() {
           <option value="disabled">{t('desktopLicenses.status_disabled')}</option>
           <option value="rejected">{t('desktopLicenses.status_rejected')}</option>
         </select>
+        <select
+          value={mode}
+          onChange={(e) => {
+            setPage(1)
+            setMode(e.target.value as 'standalone' | 'shared' | '')
+          }}
+          className="px-3 py-2 bg-background border border-border rounded-lg text-sm"
+        >
+          <option value="standalone">{t('desktopLicenses.modeStandalone', '单机授权')}</option>
+          <option value="shared">{t('desktopLicenses.modeShared', '共享模式')}</option>
+          <option value="">{t('desktopLicenses.allMode', '全部模式')}</option>
+        </select>
         <input
           value={keyword}
           onChange={(e) => setKeyword(e.target.value)}
@@ -287,6 +309,7 @@ export function DesktopLicensesPage() {
               <th className="px-3 py-2 text-left">{t('desktopLicenses.colGroup')}</th>
               <th className="px-3 py-2 text-left">{t('desktopLicenses.colMachine')}</th>
               <th className="px-3 py-2 text-left">{t('desktopLicenses.colExpire')}</th>
+              <th className="px-3 py-2 text-left">{t('desktopLicenses.colUsage', '登录情况')}</th>
               <th className="px-3 py-2 text-left">{t('desktopLicenses.colActions')}</th>
             </tr>
           </thead>
@@ -295,6 +318,11 @@ export function DesktopLicensesPage() {
               <tr key={item.id} className="border-t border-border align-top">
                 <td className="px-3 py-2">
                   <div className="font-medium">{item.licensee_username}</div>
+                  {item.username && item.username !== item.licensee_username && (
+                    <div className="text-xs text-muted-foreground">
+                      {t('desktopLicenses.boundAccount', '账号')}: {item.username}
+                    </div>
+                  )}
                   {item.organization && (
                     <div className="text-xs text-muted-foreground">{item.organization}</div>
                   )}
@@ -345,6 +373,19 @@ export function DesktopLicensesPage() {
                   <div className="text-xs text-muted-foreground">
                     {t('desktopLicenses.leaseDays', { days: item.lease_days })}
                   </div>
+                </td>
+                <td className="px-3 py-2">
+                  <div className="text-xs">
+                    {t('desktopLicenses.loginCount', { count: item.login_count ?? 0 })}
+                  </div>
+                  <div className="text-xs text-muted-foreground">
+                    {t('desktopLicenses.idleLogoutDays', { days: item.idle_logout_days ?? 2 })}
+                  </div>
+                  {item.last_login_at && (
+                    <div className="text-xs text-muted-foreground">
+                      {item.last_login_at.slice(0, 16).replace('T', ' ')}
+                    </div>
+                  )}
                 </td>
                 <td className="px-3 py-2">
                   <div className="flex flex-wrap items-center gap-1">
@@ -419,7 +460,7 @@ export function DesktopLicensesPage() {
             ))}
             {items.length === 0 && !loading && (
               <tr>
-                <td colSpan={7} className="px-3 py-8 text-center text-muted-foreground text-sm">
+                <td colSpan={8} className="px-3 py-8 text-center text-muted-foreground text-sm">
                   {t('desktopLicenses.empty')}
                 </td>
               </tr>
@@ -485,6 +526,29 @@ export function DesktopLicensesPage() {
               placeholder={t('desktopLicenses.noteLabel')}
               className="w-full px-3 py-2 bg-background border border-border rounded-lg text-sm"
             />
+            <div>
+              <label className="block text-xs text-muted-foreground mb-1">
+                {t('desktopLicenses.usernameLabel', '绑定网页端账号')}
+              </label>
+              <input
+                value={createUsername}
+                onChange={(e) => setCreateUsername(e.target.value)}
+                placeholder={t('desktopLicenses.usernamePlaceholder', '留空则由该用户首次登录单机模式时认领')}
+                className="w-full px-3 py-2 bg-background border border-border rounded-lg text-sm"
+              />
+            </div>
+            <div>
+              <label className="block text-xs text-muted-foreground mb-1">
+                {t('desktopLicenses.idleLogoutLabel', '无操作退出登录时长（天）')}
+              </label>
+              <input
+                type="number"
+                min={1}
+                value={createIdleLogout}
+                onChange={(e) => setCreateIdleLogout(Number(e.target.value))}
+                className="w-full px-3 py-2 bg-background border border-border rounded-lg text-sm"
+              />
+            </div>
             <div className="flex gap-2">
               <select
                 value={createCity}
@@ -558,6 +622,18 @@ export function DesktopLicensesPage() {
               placeholder={t('desktopLicenses.noteLabel')}
               className="w-full px-3 py-2 bg-background border border-border rounded-lg text-sm"
             />
+            <div>
+              <label className="block text-xs text-muted-foreground mb-1">
+                {t('desktopLicenses.idleLogoutLabel', '无操作退出登录时长（天）')}
+              </label>
+              <input
+                type="number"
+                min={1}
+                value={editIdleLogout}
+                onChange={(e) => setEditIdleLogout(Number(e.target.value))}
+                className="w-full px-3 py-2 bg-background border border-border rounded-lg text-sm"
+              />
+            </div>
             <div className="flex gap-2">
               <select
                 value={editCity}
