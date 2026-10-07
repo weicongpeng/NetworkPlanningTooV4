@@ -181,7 +181,9 @@ def test_helper_script_bounded_wait_and_relaunch(updater_env):
     # 静默安装 + 安装后重新启动应用
     assert "/VERYSILENT" in text and "/SUPPRESSMSGBOXES" in text
     assert 'start "" "%APP%"' in text
-    assert str(installer) in text
+    # 安装包路径按 8.3 短路径写入（见 _write_helper 注释，规避中文/代码页问题）；
+    # Windows 上 GetShortPathNameW 会真的缩写，断言必须用同一转换，否则只有 Linux 过
+    assert updater._windows_short_path(installer) in text
     # 等待应用退出的上限与 taskkill 兜底（否则应用不退出安装会永久卡住）
     assert f"GEQ {updater.EXIT_WAIT_SECONDS}" in text
     assert "taskkill /F /IM" in text
