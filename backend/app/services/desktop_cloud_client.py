@@ -243,6 +243,67 @@ def delete_dataset(data_id: str) -> Dict[str, Any]:
     return resp or {}
 
 
+# ---------------------------------------------------------------- 同组任务历史（共享）
+
+def shared_tasks_manifest() -> Dict[str, Any]:
+    """同组共享的任务历史清单（元数据；结果按需拉取）。"""
+    from app.utils.machine_code import get_machine_code
+
+    resp = _request(
+        "POST",
+        "/desktop-cloud/data/tasks/manifest",
+        {"license_file": _license_file_text(), "machine_code": get_machine_code()},
+        timeout=30,
+    )
+    return resp.get("data") or {}
+
+
+def shared_task_result(task_id: str) -> Dict[str, Any]:
+    """按需拉取组内某任务的结果（查看/导出用）。"""
+    from app.utils.machine_code import get_machine_code
+
+    query = urllib.parse.urlencode(
+        {"license_file": _license_file_text(), "machine_code": get_machine_code()}
+    )
+    resp = _request(
+        "GET",
+        f"/desktop-cloud/data/tasks/{urllib.parse.quote(task_id)}/result?{query}",
+        timeout=120,
+    )
+    return resp.get("data") or {}
+
+
+def upload_shared_task(task: Dict[str, Any], result: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """把本机任务（含结果）上行到同组历史。"""
+    from app.utils.machine_code import get_machine_code
+
+    task_id = str(task.get("task_id") or "").strip()
+    resp = _request(
+        "POST",
+        f"/desktop-cloud/data/tasks/{urllib.parse.quote(task_id)}",
+        {
+            "license_file": _license_file_text(),
+            "machine_code": get_machine_code(),
+            "task": task,
+            "result": result,
+        },
+        timeout=300,
+    )
+    return resp.get("data") or {}
+
+
+def delete_shared_task(task_id: str) -> Dict[str, Any]:
+    """通知服务器删除组内某任务（本机删除的传播）。"""
+    from app.utils.machine_code import get_machine_code
+
+    resp = _request(
+        "POST",
+        f"/desktop-cloud/data/tasks/{urllib.parse.quote(task_id)}/delete",
+        {"license_file": _license_file_text(), "machine_code": get_machine_code()},
+    )
+    return resp.get("data") or {}
+
+
 # ---------------------------------------------------------------- 业务
 
 def activate(activation_code: str, hostname: Optional[str] = None) -> Dict[str, Any]:

@@ -3169,6 +3169,8 @@ class TaskManager:
                     return False
                 existing.is_applied = 1
                 db.commit()
+                # 桌面端共享任务：应用标记也要让同组看到（由同步任务上行）
+                self._queue_shared_task_update(task_id, existing.task_type)
                 # 清除该任务的验证缓存，保证下次读取反映最新状态
                 TaskManager._history_verify_cache.pop(task_id, None)
                 logger.info(f"[TaskManager] 任务已标记为已应用: {task_id[:8]}...")
@@ -3190,6 +3192,217 @@ class TaskManager:
     # full_params_id 变化（全量工参切换）时缓存整体失效；应用/删除任务时按需清除
     _history_verify_cache: Dict[str, tuple] = {}
     _history_verify_cache_max = 300
+
+    # ================================================== 同组任务共享（桌面端同步）
+
+    # 参与同组共享的历史任务类型（规划类）；apply_* 绑定本机工参，不参与共享
+    SHARED_TASK_TYPES = ("pci", "neighbor", "tac", "tac_planning")
+
+    @staticmethod
+    def _shared_task_meta(row) -> Dict[str, Any]:
+        """任务元数据（不含大结果）：桌面端清单与镜像行共用。"""
+        return {
+            "task_id": row.task_id,
+            "task_type": row.task_type,
+            "task_name": row.task_name,
+            "user_name": row.user_name,
+            "status": row.status,
+            "is_applied": bool(row.is_applied),
+            "created_at": row.created_at,
+            "completed_at": row.completed_at,
+            "city": row.city,
+            "operator": row.operator,
+        }
+
+    def list_shared_tasks(self, city: str, operator: str) -> List[Dict[str, Any]]:
+        """（地市+运营商）组内共享的任务历史元数据（倒序，最多 200 条）。"""
+        from sqlalchemy.orm import defer
+
+        from app.core.database import SessionLocal
+        from app.models.database import TaskResult
+
+        db = SessionLocal()
+        try:
+            rows = (
+                db.query(TaskResult)
+                .options(defer(TaskResult.result_json), defer(TaskResult.config_json))
+                .filter(
+                    TaskResult.task_type.in_(self.SHARED_TASK_TYPES),
+                    TaskResult.city == city,
+                    TaskResult.operator == operator,
+                )
+                .order_by(TaskResult.created_at.desc())
+                .limit(200)
+                .all()
+            )
+            return [self._shared_task_meta(r) for r in rows]
+        finally:
+            db.close()
+
+    def get_shared_task_result(self, task_id: str, city: str, operator: str) -> Optional[Dict]:
+        """读取组内某任务的结果（组不符或结果缺失返回 None）。"""
+        from app.core.database import SessionLocal
+        from app.models.database import TaskResult
+
+        db = SessionLocal()
+        try:
+            row = (
+                db.query(TaskResult)
+                .filter(
+                    TaskResult.task_id == task_id,
+                    TaskResult.city == city,
+                    TaskResult.operator == operator,
+                )
+                .first()
+            )
+            if row is None or not row.result_json:
+                return None
+            return json.loads(row.result_json)
+        finally:
+            db.close()
+
+    def upsert_shared_task(self, payload: Dict[str, Any], *, city: str, operator: str) -> Dict[str, Any]:
+        """桌面端上行任务（同组共享）：按 task_id 新建或更新元数据与结果。
+
+        只接受规划类任务；结果按需下发，因此这里存全量 result_json 供组内查看/导出。
+        """
+        from app.core.database import SessionLocal
+        from app.models.database import TaskResult
+
+        task_id = str(payload.get("task_id") or "").strip()
+        task_type = str(payload.get("task_type") or "").strip()
+        if not task_id or task_type not in self.SHARED_TASK_TYPES:
+            raise ValueError("任务类型不支持同组共享")
+
+        result = payload.get("result")
+        result_json = (
+            json.dumps(result, ensure_ascii=False, allow_nan=False, default=str)
+            if result is not None
+            else None
+        )
+        db = SessionLocal()
+        try:
+            row = db.query(TaskResult).filter(TaskResult.task_id == task_id).first()
+            if row is None:
+                row = TaskResult(
+                    task_id=task_id,
+                    task_type=task_type,
+                    created_at=str(payload.get("created_at") or datetime.now().isoformat()),
+                )
+                db.add(row)
+            elif row.task_type not in self.SHARED_TASK_TYPES:
+                raise ValueError("任务类型不支持同组共享")
+            row.task_name = payload.get("task_name") or row.task_name
+            row.user_name = payload.get("user_name") or row.user_name
+            row.status = str(payload.get("status") or row.status or "completed")
+            row.completed_at = payload.get("completed_at") or row.completed_at
+            if result_json is not None:
+                row.result_json = result_json
+            # 组以服务器（授权记录的组）为准，防止客户端串组
+            row.city = city
+            row.operator = operator
+            db.commit()
+            db.refresh(row)
+            return self._shared_task_meta(row)
+        finally:
+            db.close()
+
+    def delete_shared_task(self, task_id: str, city: str, operator: str) -> bool:
+        """删除组内某任务（组不符返回 False）。"""
+        from app.core.database import SessionLocal
+        from app.models.database import TaskResult
+
+        db = SessionLocal()
+        try:
+            row = (
+                db.query(TaskResult)
+                .filter(
+                    TaskResult.task_id == task_id,
+                    TaskResult.city == city,
+                    TaskResult.operator == operator,
+                    TaskResult.task_type.in_(self.SHARED_TASK_TYPES),
+                )
+                .first()
+            )
+            if row is None:
+                return False
+            db.delete(row)
+            db.commit()
+            TaskManager._history_verify_cache.pop(task_id, None)
+            return True
+        finally:
+            db.close()
+
+    def _fetch_shared_task_result(self, task_id: str) -> Optional[Dict]:
+        """桌面端镜像任务：结果不在本机时按需向服务器拉取，成功后写回本机缓存。"""
+        try:
+            from app.core.config import settings
+
+            if not settings.NPT_DESKTOP:
+                return None
+            from app.services import desktop_cloud_client as cloud
+            from app.services import desktop_sync_service as sync
+
+            if not sync.is_shared():
+                return None
+            data = cloud.shared_task_result(task_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[TaskManager] 拉取共享任务结果失败（{task_id[:8]}）: {exc}")
+            return None
+        result = (data or {}).get("result")
+        if result is None:
+            return None
+        try:
+            from app.core.database import SessionLocal
+            from app.models.database import TaskResult
+
+            db = SessionLocal()
+            try:
+                row = db.query(TaskResult).filter(TaskResult.task_id == task_id).first()
+                if row is not None and not row.result_json:
+                    row.result_json = json.dumps(result, ensure_ascii=False, allow_nan=False, default=str)
+                    db.commit()
+            finally:
+                db.close()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[TaskManager] 共享任务结果缓存失败（非致命）: {exc}")
+        return result
+
+    @staticmethod
+    def _queue_shared_task_update(task_id: str, task_type: Optional[str] = None) -> None:
+        """桌面端共享任务元数据变化（如应用标记）→ 记入待上行更新。"""
+        try:
+            from app.core.config import settings
+
+            if not settings.NPT_DESKTOP:
+                return
+            if task_type and task_type not in TaskManager.SHARED_TASK_TYPES:
+                return
+            from app.services import desktop_sync_service as sync
+
+            if not sync.is_shared():
+                return
+            sync.queue_task_update(task_id)
+        except Exception:  # noqa: BLE001
+            pass
+
+    @staticmethod
+    def _queue_shared_task_delete(task_id: str, task_type: Optional[str] = None) -> None:
+        """桌面端本机删除了同组共享任务 → 记入待上行删除（否则下次同步会再拉回来）。"""
+        try:
+            from app.core.config import settings
+
+            if not settings.NPT_DESKTOP:
+                return
+            if task_type and task_type not in TaskManager.SHARED_TASK_TYPES:
+                return
+            from app.services import desktop_sync_service as sync
+
+            if not sync.is_shared():
+                return
+            sync.queue_task_delete(task_id)
+        except Exception:  # noqa: BLE001
+            pass
 
     def list_task_history(self, task_type: Optional[str] = None, page: int = 1, page_size: int = 20, user_name: Optional[str] = None, user=None) -> Dict:
         """从 SQLite 获取历史任务列表（分页），返回 {"tasks": [...], "total": 总数, "page": 当前页, "page_size": 每页条数}
@@ -3504,7 +3717,9 @@ class TaskManager:
         db_result = self.get_task_result_from_db(task_id)
         if db_result is not None:
             db_result = self._sanitize_result(db_result)
-        return db_result
+            return db_result
+        # 桌面端共享镜像任务：结果不随同步下发，第一次查看/导出时按需拉取并缓存
+        return self._fetch_shared_task_result(task_id)
 
     def cancel_task(self, task_id: str) -> bool:
         """取消任务"""
@@ -3549,6 +3764,8 @@ class TaskManager:
                 try:
                     row = db.query(TaskResult).filter(TaskResult.task_id == task_id_str).first()
                     if row:
+                        # 桌面端共享任务：本机删除要通知服务器，否则下次同步又拉回来
+                        self._queue_shared_task_delete(task_id_str, row.task_type)
                         db.delete(row)
                         db.commit()
                         # 清除该任务的验证缓存

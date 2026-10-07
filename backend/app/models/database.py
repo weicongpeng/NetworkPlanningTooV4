@@ -303,6 +303,9 @@ class TaskResult(Base):
     is_applied = Column(Integer, default=0)  # 0=未应用, 1=已应用
     created_at = Column(String(30), nullable=False)
     completed_at = Column(String(30), nullable=True)
+    # 任务来源：local=本机创建 / shared=同组共享同步进来的镜像（桌面端用；
+    # 镜像行只读，结果在查看/导出时按需从服务器拉取，不参与上行推送）
+    origin = Column(String(10), nullable=False, default="local")
 
     __table_args__ = (
         Index("idx_task_results_type", "task_type"),

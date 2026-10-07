@@ -43,6 +43,9 @@ def _default_state() -> Dict[str, Any]:
         "datasets": {},             # data_id -> {rev, sha256, dirty, last_sync_at}
         "pending_deletes": [],      # 本地已删、待上行删除的数据集 id
         "conflicts": [],            # [{data_id, name, server_rev, local_rev}]
+        "tasks_pushed": [],         # 已上行过的本机任务 id（避免重复上传大结果）
+        "task_deletes": [],         # 本地已删、待上行删除的同组任务 id
+        "task_updates": [],         # 元数据有变化（如应用标记）、待上行更新的任务 id
         "last_sync_at": None,
         "last_result": None,
         "last_error": None,
@@ -383,6 +386,155 @@ def _push(data_id: str, expected_rev: int) -> Dict[str, Any]:
     return {"data_id": data_id, "action": "push", "rev": rev}
 
 
+# ---------------------------------------------------------------- 同组任务历史（共享）
+
+def queue_task_delete(task_id: str) -> None:
+    """本机删除了同组共享任务 → 待上行删除。"""
+    if not task_id:
+        return
+    state = load_state()
+    pending = [d for d in (state.get("task_deletes") or []) if d != task_id]
+    pending.append(task_id)
+    save_state(task_deletes=pending)
+
+
+def queue_task_update(task_id: str) -> None:
+    """共享任务元数据变化（如「已应用」标记）→ 待上行更新。"""
+    if not task_id:
+        return
+    state = load_state()
+    pending = [d for d in (state.get("task_updates") or []) if d != task_id]
+    pending.append(task_id)
+    save_state(task_updates=pending)
+
+
+def sync_tasks(city: str, operator: str) -> Dict[str, Any]:
+    """同组任务历史同步：拉元数据做镜像 / 推本机新任务 / 传播删除与更新。
+
+    - 只同步规划类任务（`TaskManager.SHARED_TASK_TYPES`），apply_* 不共享
+    - 镜像行（origin=shared）只读：结果不预下载，查看/导出时按需拉取
+    - 本机任务的结果只在首次上行时发一次（`tasks_pushed` 记账）
+    """
+    import json as _json
+
+    from app.core.database import SessionLocal
+    from app.models.database import TaskResult
+    from app.services import desktop_cloud_client as cloud
+    from app.services.task_manager import TaskManager
+
+    manifest = cloud.shared_tasks_manifest()
+    items = {str(i.get("task_id")): i for i in (manifest.get("items") or []) if i.get("task_id")}
+    summary: Dict[str, Any] = {"pulled": 0, "pushed": 0, "deleted": 0, "errors": []}
+    state = load_state()
+    pushed = set(state.get("tasks_pushed") or [])
+    remaining_updates: List[str] = []
+
+    db = SessionLocal()
+    try:
+        local_rows = db.query(TaskResult).all()
+        local_by_id = {r.task_id: r for r in local_rows}
+
+        # 1) 服务器已删除 → 清掉本机镜像行（本机自建任务不动）
+        for row in list(local_rows):
+            if row.origin == "shared" and row.task_id not in items:
+                db.delete(row)
+                summary["deleted"] += 1
+
+        # 2) 新增/更新镜像行（结果留空，按需拉取）
+        for task_id, item in items.items():
+            row = local_by_id.get(task_id)
+            if row is None:
+                db.add(TaskResult(
+                    task_id=task_id,
+                    task_type=item.get("task_type") or "",
+                    task_name=item.get("task_name"),
+                    user_name=item.get("user_name"),
+                    status=item.get("status") or "completed",
+                    progress=100.0,
+                    is_applied=1 if item.get("is_applied") else 0,
+                    created_at=str(item.get("created_at") or ""),
+                    completed_at=item.get("completed_at"),
+                    city=item.get("city") or city,
+                    operator=item.get("operator") or operator,
+                    origin="shared",
+                ))
+                summary["pulled"] += 1
+            elif row.origin == "shared":
+                row.task_name = item.get("task_name") or row.task_name
+                row.user_name = item.get("user_name") or row.user_name
+                row.status = item.get("status") or row.status
+                row.completed_at = item.get("completed_at") or row.completed_at
+                if item.get("is_applied"):
+                    row.is_applied = 1
+        db.commit()
+
+        # 3) 本机新建的规划任务上行（含结果，只推一次）；以及待上行更新
+        for task_id in state.get("task_updates") or []:
+            row = db.query(TaskResult).filter(TaskResult.task_id == task_id).first()
+            if row is not None and row.task_type in TaskManager.SHARED_TASK_TYPES:
+                try:
+                    cloud.upload_shared_task({
+                        "task_id": row.task_id,
+                        "task_type": row.task_type,
+                        "task_name": row.task_name,
+                        "user_name": row.user_name,
+                        "status": row.status,
+                        "created_at": row.created_at,
+                        "completed_at": row.completed_at,
+                        "is_applied": bool(row.is_applied),
+                    }, _json.loads(row.result_json) if row.result_json else None)
+                    pushed.add(row.task_id)
+                except Exception as exc:  # noqa: BLE001
+                    summary["errors"].append(f"更新任务「{task_id[:8]}」失败：{exc}")
+                    remaining_updates.append(task_id)
+
+        for row in db.query(TaskResult).all():
+            if row.origin == "shared" or row.task_id in items or row.task_id in pushed:
+                continue
+            if row.task_type not in TaskManager.SHARED_TASK_TYPES:
+                continue
+            if (row.status or "") != "completed" or not row.result_json:
+                continue
+            try:
+                result = _json.loads(row.result_json)
+            except Exception as exc:  # noqa: BLE001
+                summary["errors"].append(f"任务「{row.task_name or row.task_id[:8]}」结果解析失败：{exc}")
+                continue
+            try:
+                cloud.upload_shared_task({
+                    "task_id": row.task_id,
+                    "task_type": row.task_type,
+                    "task_name": row.task_name,
+                    "user_name": row.user_name,
+                    "status": row.status,
+                    "created_at": row.created_at,
+                    "completed_at": row.completed_at,
+                }, result)
+                pushed.add(row.task_id)
+                summary["pushed"] += 1
+            except Exception as exc:  # noqa: BLE001
+                summary["errors"].append(f"上传任务「{row.task_name or row.task_id[:8]}」失败：{exc}")
+    finally:
+        db.close()
+
+    # 4) 待上行删除（幂等：服务器没有就当已删）
+    remaining_deletes: List[str] = []
+    for task_id in state.get("task_deletes") or []:
+        try:
+            cloud.delete_shared_task(task_id)
+            summary["deleted"] += 1
+        except Exception as exc:  # noqa: BLE001
+            summary["errors"].append(f"删除任务「{task_id[:8]}」失败：{exc}")
+            remaining_deletes.append(task_id)
+
+    save_state(
+        tasks_pushed=sorted(pushed),
+        task_deletes=remaining_deletes,
+        task_updates=remaining_updates,
+    )
+    return summary
+
+
 def sync_once() -> Dict[str, Any]:
     """执行一次完整同步。返回统计结果（不抛异常，错误写入 state.last_error）。"""
     global _sync_running
@@ -499,6 +651,14 @@ def sync_once() -> Dict[str, Any]:
                 summary["errors"].append(f"删除「{data_id}」失败：{exc}")
                 remaining.append(data_id)
         save_state(pending_deletes=remaining)
+
+        # 4. 同组任务历史（规划类）：拉元数据做镜像、推本机新任务、传播删除/更新
+        try:
+            task_summary = sync_tasks(city, operator)
+            summary["tasks"] = task_summary
+            summary["errors"].extend(task_summary.get("errors") or [])
+        except Exception as exc:  # noqa: BLE001
+            summary["errors"].append(f"任务历史同步失败：{exc}")
 
         save_state(
             last_sync_at=datetime.now().isoformat(timespec="seconds"),

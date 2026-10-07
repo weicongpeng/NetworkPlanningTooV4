@@ -787,6 +787,121 @@ async def delete_dataset(
     return {"success": True, "message": "已在服务器删除"}
 
 
+# ---------------------------------------------------------------- 同组任务历史（共享）
+
+class SharedTaskUpload(BaseModel):
+    """桌面端上行任务（同组共享）：元数据 + 完整结果。"""
+
+    license_file: str
+    machine_code: str = ""
+    task: Dict[str, Any]
+    result: Optional[Dict[str, Any]] = None
+
+
+@router.post("/data/tasks/manifest")
+async def data_tasks_manifest(
+    payload: SyncCredential,
+    request: Request,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """同组共享的任务历史清单（只含元数据，结果查看时按需拉取）。"""
+    from app.services.task_manager import task_manager
+
+    _rate_limit(f"sync:{_client_ip(request)}", limit=120, window=300)
+    record, _ = _verify_license(payload.license_file, payload.machine_code, db)
+    group = _license_group(record)
+    if group is None:
+        raise HTTPException(status_code=409, detail="尚未绑定数据组，请先调用 /data/session")
+    return {
+        "success": True,
+        "data": {
+            "group": {"city": group[0], "operator": group[1]},
+            "items": task_manager.list_shared_tasks(group[0], group[1]),
+        },
+    }
+
+
+@router.get("/data/tasks/{task_id}/result")
+async def download_shared_task_result(
+    task_id: str,
+    license_file: str = Query(...),
+    machine_code: str = Query(default=""),
+    request: Request = None,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """组内任务结果（桌面端查看/导出时按需拉取，跨组一律 404）。"""
+    from starlette.concurrency import run_in_threadpool
+
+    from app.services.task_manager import task_manager
+
+    _rate_limit(f"sync:{_client_ip(request)}", limit=120, window=300)
+    record, _ = _verify_license(license_file, machine_code, db)
+    group = _license_group(record)
+    if group is None:
+        raise HTTPException(status_code=409, detail="尚未绑定数据组，请先调用 /data/session")
+    result = await run_in_threadpool(
+        task_manager.get_shared_task_result, task_id, group[0], group[1]
+    )
+    if result is None:
+        raise HTTPException(status_code=404, detail="任务结果不存在或不属于本组")
+    return {"success": True, "data": {"task_id": task_id, "result": result}}
+
+
+@router.post("/data/tasks/{task_id}")
+async def upload_shared_task(
+    task_id: str,
+    payload: SharedTaskUpload,
+    request: Request,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """桌面端上行任务（新建或更新，同组共享；组以服务器授权记录为准）。"""
+    from starlette.concurrency import run_in_threadpool
+
+    from app.services.task_manager import task_manager
+
+    _rate_limit(f"sync:{_client_ip(request)}", limit=120, window=300)
+    record, _ = _verify_license(payload.license_file, payload.machine_code, db)
+    group = _license_group(record)
+    if group is None:
+        raise HTTPException(status_code=409, detail="尚未绑定数据组，请先调用 /data/session")
+
+    task = dict(payload.task or {})
+    task["task_id"] = task_id
+    task["result"] = payload.result
+    if not task.get("user_name"):
+        task["user_name"] = record.username or record.licensee_username
+    try:
+        meta = await run_in_threadpool(
+            task_manager.upsert_shared_task, task, city=group[0], operator=group[1]
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=_gbk_safe(str(exc)))
+    return {"success": True, "data": meta}
+
+
+@router.post("/data/tasks/{task_id}/delete")
+async def delete_shared_task(
+    task_id: str,
+    payload: SyncCredential,
+    request: Request,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """删除组内任务（桌面端删除的传播，幂等）。"""
+    from starlette.concurrency import run_in_threadpool
+
+    from app.services.task_manager import task_manager
+
+    _rate_limit(f"sync:{_client_ip(request)}", limit=120, window=300)
+    record, _ = _verify_license(payload.license_file, payload.machine_code, db)
+    group = _license_group(record)
+    if group is None:
+        raise HTTPException(status_code=409, detail="尚未绑定数据组，请先调用 /data/session")
+    removed = await run_in_threadpool(
+        task_manager.delete_shared_task, task_id, group[0], group[1]
+    )
+    return {"success": True, "data": {"deleted": bool(removed)}}
+
+
 # ---------------------------------------------------------------- OTA 版本
 
 def _release_version_key(version: str) -> tuple:

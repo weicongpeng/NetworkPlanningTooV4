@@ -129,6 +129,11 @@ def init_db():
         tr_cols = [row[1] for row in conn.exec_driver_sql("PRAGMA table_info(task_results)").fetchall()]
         if "is_applied" not in tr_cols:
             conn.exec_driver_sql("ALTER TABLE task_results ADD COLUMN is_applied INTEGER DEFAULT 0")
+        # 迁移：桌面端任务历史同步的来源标记（local / shared）
+        if tr_cols and "origin" not in tr_cols:
+            conn.exec_driver_sql(
+                "ALTER TABLE task_results ADD COLUMN origin VARCHAR(10) NOT NULL DEFAULT 'local'"
+            )
 
         # 迁移：user_settings 表添加 created_at 列（如从旧表结构升级）
         us_cols = [row[1] for row in conn.exec_driver_sql("PRAGMA table_info(user_settings)").fetchall() if row[0] >= 0]
@@ -236,8 +241,9 @@ def _fix_misattributed_task_groups():
     被 _migrate_legacy_data_groups 误归主管理员组，表现为：
     - 任务创建人刷新后历史任务"清空"（组过滤查不到自己的任务）
     - 主管理员组能看到其他组用户的任务（跨组串数据）
-    纠正规则：task_results 中行组 == 主管理员组、且 user_name 对应用户组齐全、
-    且用户组 ≠ 行组的行，按创建人组重盖章。主管理员本人创建的行组一致不受影响。
+    纠正规则：task_results 中 user_name 对应用户组齐全、且与行组不一致的行，
+    一律按创建人组重盖章（用户管理改过组后退回旧组的存量任务也一并归位）。
+    创建人本人所属组与行组一致的行不受影响；无对应用户的行保持原样。
     """
     import logging
     _logger = logging.getLogger(__name__)
@@ -255,15 +261,13 @@ def _fix_misattributed_task_groups():
             if admin is None:
                 return {"fixed": 0}
 
-            # 行组 == 主管理员组，但创建人属于其他（齐全）组的任务行
+            # 创建人组齐全、且与行组不一致的任务行 → 按创建人组重盖章
             rows = (db.query(TaskResult, User)
                     .join(User, TaskResult.user_name == User.username)
                     .filter(
-                        TaskResult.city == admin.city,
-                        TaskResult.operator == admin.operator,
                         User.city.isnot(None), User.city != "",
                         User.operator.isnot(None), User.operator != "",
-                        ((User.city != admin.city) | (User.operator != admin.operator)),
+                        ((User.city != TaskResult.city) | (User.operator != TaskResult.operator)),
                     )
                     .all())
             fixed = 0
