@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import time
 from datetime import date, timedelta
 from types import SimpleNamespace
 
@@ -159,6 +160,80 @@ def test_login_mirrors_web_account(local_env):
         db.close()
 
 
+def test_shared_login_starts_sync(local_env):
+    """共享模式登录即置为共享并触发一次同步（后台线程，失败不阻断登录）。"""
+    import app.services.desktop_sync_service as sync_module
+
+    calls = []
+    local_env.monkeypatch.setattr(local_env.cloud, "login", lambda *a, **kw: _server_ok())
+    local_env.monkeypatch.setattr(
+        sync_module, "sync_once", lambda: calls.append(True) or {"pulled": 0}
+    )
+
+    resp = local_env.client.post(
+        "/api/v1/desktop/login",
+        json={"username": "alice", "password": "pwd123", "mode": "shared"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["data"]["sync_started"] is True
+    assert sync_module.run_mode() == "shared"
+    for _ in range(50):  # 同步在后台线程触发，短暂等待
+        if calls:
+            break
+        time.sleep(0.05)
+    assert calls
+
+
+def test_register_proxies_then_logs_in(local_env):
+    """桌面端注册：先经服务器建号（含数据组），再自动以共享模式登录。"""
+    seen = {}
+    local_env.monkeypatch.setattr(
+        local_env.cloud,
+        "register",
+        lambda username, password, city, operator: seen.update(
+            {"username": username, "city": city, "operator": operator}
+        )
+        or {"username": username},
+    )
+    local_env.monkeypatch.setattr(
+        local_env.cloud, "login", lambda *a, **kw: _server_ok()
+    )
+
+    resp = local_env.client.post(
+        "/api/v1/desktop/register",
+        json={
+            "username": "alice",
+            "password": "pwd123",
+            "confirm_password": "pwd123",
+            "city": "广州",
+            "operator": "移动",
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    assert seen == {"username": "alice", "city": "广州", "operator": "移动"}
+    data = resp.json()["data"]
+    assert data["access_token"] and data["mode"] == "shared"
+
+    db = local_env.session_factory()
+    try:
+        row = db.query(User).filter(User.username == "alice").first()
+        assert row is not None and row.city == "广州"
+    finally:
+        db.close()
+
+
+def test_register_rejects_weak_input(local_env):
+    """注册校验与网页端一致：短用户名/短密码/两次不一致/缺组都拒绝。"""
+    for payload in (
+        {"username": "ab", "password": "pwd123", "confirm_password": "pwd123", "city": "广州", "operator": "移动"},
+        {"username": "alice", "password": "123", "confirm_password": "123", "city": "广州", "operator": "移动"},
+        {"username": "alice", "password": "pwd123", "confirm_password": "pwd456", "city": "广州", "operator": "移动"},
+        {"username": "alice", "password": "pwd123", "confirm_password": "pwd123", "city": "", "operator": "移动"},
+    ):
+        resp = local_env.client.post("/api/v1/desktop/register", json=payload)
+        assert resp.status_code == 400, resp.text
+
+
 def test_standalone_login_pending(local_env):
     local_env.monkeypatch.setattr(
         local_env.cloud,
@@ -204,10 +279,6 @@ def test_standalone_login_forces_offline(local_env):
 
     denied = local_env.client.put("/api/v1/desktop/run-mode", json={"mode": "shared"})
     assert denied.status_code == 403
-    denied_group = local_env.client.put(
-        "/api/v1/desktop/group", json={"city": "广州", "operator": "移动"}
-    )
-    assert denied_group.status_code == 403
 
 
 def test_offline_login_when_server_unreachable(local_env):

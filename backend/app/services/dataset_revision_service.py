@@ -89,6 +89,41 @@ def bump(
         db.close()
 
 
+def set_sha(
+    data_id: str, sha256: str, *, city: Optional[str] = None, operator: Optional[str] = None
+) -> Optional[int]:
+    """只写入内容摘要、**不推进**修订号（下载侧调用）。
+
+    下载是读操作：若每次 pull 都 bump，同组其它客户端会误判"服务器有更新"而反复
+    整包下载（rev 抖动）。摘要仅用于后续快速比对，rev 只在真正写入时推进。
+    """
+    if not data_id:
+        return None
+    auto_city, auto_operator = _lookup_group(data_id)
+    db = _session()
+    try:
+        from app.models.database import DatasetRevision
+
+        row = db.query(DatasetRevision).filter(DatasetRevision.data_id == data_id).first()
+        if row is None:
+            row = DatasetRevision(data_id=data_id, rev=1, deleted=False, updated_at=_now_str())
+            db.add(row)
+        row.sha256 = sha256
+        row.city = city if city is not None else (auto_city if auto_city is not None else row.city)
+        row.operator = (
+            operator if operator is not None
+            else (auto_operator if auto_operator is not None else row.operator)
+        )
+        db.commit()
+        return int(row.rev or 0)
+    except Exception as exc:  # noqa: BLE001
+        db.rollback()
+        logger.warning(f"[数据集修订] 摘要写入失败（不影响业务）data_id={data_id}: {exc}")
+        return None
+    finally:
+        db.close()
+
+
 def mark_deleted(
     data_id: str, *, updated_by: Optional[str] = None,
     city: Optional[str] = None, operator: Optional[str] = None,

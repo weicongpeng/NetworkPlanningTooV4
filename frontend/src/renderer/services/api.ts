@@ -502,7 +502,7 @@ export const licenseApi = {
     return uploadClient.post('/license/upload', formData)
   },
 
-  // 桌面离线版：本机机器码（供厂商签发绑定授权）
+  // 桌面端：本机机器码（供厂商签发绑定授权）
   getMachineInfo: async (): Promise<ApiResponse<MachineInfo>> => {
     return apiClient.get('/license/machine-info')
   },
@@ -546,25 +546,19 @@ export const desktopCloudApi = {
     return apiClient.get('/desktop/cloud-apply')
   },
 
-  // ---- 共享模式 / 离线模式 与数据同步 ----
+  // 共享模式数据同步状态（供同步指示器展示进度/冲突）
   getSyncStatus: async (): Promise<ApiResponse<DesktopSyncStatus>> => {
     return apiClient.get('/desktop/sync-status') as any
   },
 
-  setRunMode: async (mode: 'shared' | 'offline'): Promise<ApiResponse<DesktopSyncStatus>> => {
-    return apiClient.put('/desktop/run-mode', { mode }) as any
+  // 登录态校验：同一账号在别处登录时返回 valid=false
+  getSessionStatus: async (): Promise<ApiResponse<{ valid: boolean; reason?: string; offline?: boolean }>> => {
+    return apiClient.get('/desktop/session-status') as any
   },
 
-  syncNow: async (): Promise<ApiResponse<any>> => {
-    return apiClient.post('/desktop/sync') as any
-  },
-
-  resolveConflict: async (dataId: string, resolution: 'server' | 'local'): Promise<ApiResponse<any>> => {
-    return apiClient.post('/desktop/sync-resolve', { data_id: dataId, resolution }) as any
-  },
-
-  updateGroup: async (city: string, operator: string): Promise<ApiResponse<{ city: string; operator: string }>> => {
-    return apiClient.put('/desktop/group', { city, operator }) as any
+  // 手机 APP 最新版本（桌面端取服务器的最新版，返回可扫码的绝对下载地址）
+  appVersion: async (): Promise<ApiResponse<any>> => {
+    return apiClient.get('/desktop/app-version') as any
   },
 }
 
@@ -575,6 +569,8 @@ export interface DesktopLoginResult {
   user?: any
   mode?: 'shared' | 'standalone'
   offline?: boolean
+  /** 共享模式：登录即触发同组数据同步 */
+  sync_started?: boolean
   idle_logout_days?: number
   license?: any
   /** result=pending 时表示单机授权申请已提交，等待管理员在「桌面授权」页确认 */
@@ -598,19 +594,51 @@ export const desktopLoginApi = {
   poll: async (username: string): Promise<ApiResponse<DesktopLoginResult>> => {
     return apiClient.post('/desktop/auth-poll', { username }) as any
   },
+
+  /** 桌面端注册选项：地市/运营商取自服务器（注册时选数据组） */
+  options: async (): Promise<ApiResponse<{ cities: string[]; operators: string[] }>> => {
+    return apiClient.get('/desktop/register-options') as any
+  },
+
+  /** 桌面端注册：与网页端同一套字段，注册成功后自动以共享模式登录 */
+  register: async (data: {
+    username: string
+    password: string
+    confirm_password: string
+    city: string
+    operator: string
+  }): Promise<ApiResponse<DesktopLoginResult>> => {
+    return apiClient.post('/desktop/register', data) as any
+  },
 }
 
 /** 桌面共享模式同步状态 */
 export interface DesktopSyncStatus {
   desktop: boolean
   run_mode: 'shared' | 'offline'
+  /** 正在同步中（前端据此展示动画） */
+  syncing: boolean
   server_url: string
   activated: boolean
   last_sync_at: string | null
   last_error: string | null
+  last_result?: {
+    pulled?: number
+    pushed?: number
+    deleted?: number
+    conflicts?: number
+    errors?: string[]
+  } | null
   pending_uploads: number
   conflicts: { data_id: string; name: string; server_rev: number; local_rev: number }[]
   synced_datasets: number
+}
+
+/** 桌面端登录态校验结果（同一账号在别处登录时 valid=false） */
+export interface DesktopSessionStatus {
+  valid: boolean
+  reason?: string
+  offline?: boolean
 }
 
 // ===== 优化后的分块上传（动态分块 + 串行 + 指数退避） =====

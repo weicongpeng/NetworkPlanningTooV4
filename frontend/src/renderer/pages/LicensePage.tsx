@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { Check, Palette, Sun, Moon, Key, RefreshCw, X, Globe, Calendar, Infinity, Loader2, LifeBuoy, Monitor, Copy, Upload, Cloud, Send } from 'lucide-react'
+import { Check, Palette, Sun, Moon, Key, RefreshCw, X, Globe, Calendar, Infinity, Loader2, LifeBuoy, Monitor, Copy, Upload, Cloud, Send, Settings } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import type { MachineInfo, LicenseStatus, DesktopCloudStatus } from '@shared/types'
 import {
@@ -14,7 +14,6 @@ import {
 import { useAuthStore } from '../store/authStore'
 import { licenseApi, desktopCloudApi } from '../services/api'
 import { LLMConfigCard } from '../components/LLMConfigCard'
-import { DesktopSyncCard } from '../components/DesktopSyncCard'
 
 export function LicensePage() {
   const { t, i18n } = useTranslation()
@@ -32,7 +31,7 @@ export function LicensePage() {
   const isAdmin = user?.is_admin ?? false
   const licenseExpiry = user?.license_expiry ?? null
 
-  // 桌面离线授权：机器码与授权状态
+  // 桌面端授权：机器码与授权状态
   const [machineInfo, setMachineInfo] = useState<MachineInfo | null>(null)
   const [licenseStatus, setLicenseStatus] = useState<LicenseStatus | null>(null)
   const [uploading, setUploading] = useState(false)
@@ -286,47 +285,50 @@ export function LicensePage() {
   }, [licenseExpiry])
 
   return (
-    <div className="p-6">
-      <h1 className="text-base font-bold mb-6">{t('license.title')}</h1>
+    <div className="p-6 w-full space-y-6">
+      <div className="flex items-center gap-2">
+        <Settings size={20} className="text-primary" />
+        <h1 className="text-base font-bold">{t('license.title')}</h1>
+      </div>
 
-      {/* 大模型配置（网优助手）置顶整行：仅管理员或被授予网优助手权限的用户可见 */}
-      {(isAdmin || user?.can_assistant) && (
-        <div className="mb-6 max-w-5xl">
-          <LLMConfigCard />
-        </div>
-      )}
+      {/* 大模型配置（网优助手）：仅管理员或被授予网优助手权限的用户可见 */}
+      {(isAdmin || user?.can_assistant) && <LLMConfigCard />}
 
-      {/* 桌面离线授权：在线激活/续期 + 机器码 + 离线导入（仅共享模式桌面版） */}
+      {/* 桌面端授权：在线激活/续期 + 机器码 + 离线导入（仅共享模式桌面版） */}
       {machineInfo?.desktopMode && !isStandalone && (
-        <div className="mb-6 max-w-5xl">
-          <div className="bg-card p-5 rounded-lg border border-border">
-            <div className="flex items-center justify-between mb-4">
-              <div className="flex items-center gap-2">
-                <Monitor size={20} className="text-primary" />
-                <h2 className="text-base font-semibold">{t('license.desktopTitle')}</h2>
-              </div>
-              <button
-                onClick={() => {
-                  refreshLicenseState()
-                  refreshCloudStatus()
-                }}
-                className="p-1.5 hover:bg-muted rounded-lg transition-colors"
-                title={t('license.refresh')}
-              >
-                <RefreshCw size={16} />
-              </button>
+        <div className="bg-card p-5 rounded-lg border border-border">
+          <div className="flex items-center justify-between mb-4">
+            <div className="flex items-center gap-2">
+              <Monitor size={20} className="text-primary" />
+              <h2 className="text-base font-semibold">{t('license.desktopTitle')}</h2>
             </div>
+            <button
+              onClick={() => {
+                refreshLicenseState()
+                refreshCloudStatus()
+              }}
+              className="p-1.5 hover:bg-muted rounded-lg transition-colors"
+              title={t('license.refresh')}
+            >
+              <RefreshCw size={16} />
+            </button>
+          </div>
 
-            <div className="space-y-4">
+          {isAdmin && (
+            <p className="mb-4 text-xs text-muted-foreground">{t('license.desktopAdminHint', '管理员账号默认享有全部权限，无需授权激活')}</p>
+          )}
+
+          <div className="grid grid-cols-1 xl:grid-cols-2 gap-x-8 gap-y-5">
+            <div className="min-w-0 space-y-5">
               <div>
                 <label className="block text-xs text-muted-foreground mb-1.5">{t('license.machineCodeLabel')}</label>
                 <div className="flex items-center gap-2">
-                  <code className="flex-1 px-3 py-2 bg-muted rounded-lg text-sm font-mono tracking-wider">
+                  <code className="flex-1 px-3 py-2 bg-muted rounded-lg text-sm font-mono tracking-wider break-all">
                     {machineInfo.machineCode}
                   </code>
                   <button
                     onClick={handleCopyMachineCode}
-                    className="px-3 py-2 border border-border rounded-lg hover:bg-muted text-sm font-medium flex items-center gap-1.5"
+                    className="px-3 py-2 border border-border rounded-lg hover:bg-muted text-sm font-medium flex items-center gap-1.5 flex-shrink-0"
                   >
                     {copied ? <Check size={14} className="text-green-500" /> : <Copy size={14} />}
                     {copied ? t('license.copied') : t('license.copy')}
@@ -336,7 +338,7 @@ export function LicensePage() {
               </div>
 
               {/* 在线激活 / 续期 */}
-              <div className="pt-3 border-t border-border">
+              <div className="pt-4 border-t border-border">
                 <label className="text-xs text-muted-foreground mb-1.5 flex items-center gap-1.5">
                   <Cloud size={13} /> {t('license.cloudLabel')}
                 </label>
@@ -446,8 +448,11 @@ export function LicensePage() {
                 </p>
               </div>
 
-              {/* 离线导入（内网/无网络时由厂商签发） */}
-              <div className="pt-3 border-t border-border">
+            </div>
+
+            {/* 右列：离线导入（内网/无网络时由厂商签发）与状态提示 */}
+            <div className="min-w-0 space-y-4 pt-4 border-t border-border xl:pt-0 xl:border-t-0 xl:border-l xl:pl-8">
+              <div>
                 <label className="block text-xs text-muted-foreground mb-1.5">{t('license.importLabel')}</label>
                 <input
                   ref={licenseFileRef}
@@ -511,196 +516,187 @@ export function LicensePage() {
         </div>
       )}
 
-      {/* 共享模式桌面版：共享模式 ⇄ 离线模式 与数据同步 */}
-      <DesktopSyncCard />
+      {/* 语言设置 */}
+      <div className="bg-card p-5 rounded-lg border border-border">
+        <div className="flex items-center gap-2 mb-4">
+          <Globe size={20} className="text-primary" />
+          <h2 className="text-base font-semibold">{t('language.title')}</h2>
+        </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 max-w-5xl">
-        {/* 语言设置 */}
-        <div className="bg-card p-5 rounded-lg border border-border">
-          <div className="flex items-center gap-2 mb-4">
-            <Globe size={20} className="text-primary" />
-            <h2 className="text-base font-semibold">{t('language.title')}</h2>
+        <p className="text-xs text-muted-foreground mb-3">{t('language.select')}</p>
+        <div className="flex gap-2 max-w-md">
+          <button
+            onClick={() => handleLanguageChange('zh')}
+            className={`flex-1 px-4 py-2.5 rounded-lg border-2 transition-all text-sm font-medium ${
+              i18n.language === 'zh'
+                ? 'border-primary bg-primary/10 text-primary'
+                : 'border-border hover:border-primary/50'
+            }`}
+          >
+            {t('language.zh')}
+          </button>
+          <button
+            onClick={() => handleLanguageChange('en')}
+            className={`flex-1 px-4 py-2.5 rounded-lg border-2 transition-all text-sm font-medium ${
+              i18n.language === 'en'
+                ? 'border-primary bg-primary/10 text-primary'
+                : 'border-border hover:border-primary/50'
+            }`}
+          >
+            {t('language.en')}
+          </button>
+        </div>
+      </div>
+
+      {/* 主题与配色 */}
+      <div className="bg-card p-5 rounded-lg border border-border">
+        <div className="flex items-center gap-2 mb-4">
+          <Palette size={20} className="text-primary" />
+          <h2 className="text-base font-semibold">{t('theme.title')}</h2>
+        </div>
+
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+          <div>
+            <h3 className="text-xs font-medium text-muted-foreground mb-3">{t('theme.themeMode')}</h3>
+            <div className="grid grid-cols-2 gap-3 max-w-md">
+              <ThemeModeCard
+                mode="dark"
+                icon={<Moon size={18} />}
+                label={t('theme.dark')}
+                isSelected={(previewTheme || themeMode) === 'dark'}
+                onSelect={() => handleThemeSelect('dark')}
+                previewBg="bg-slate-900"
+                previewText="text-white"
+              />
+              <ThemeModeCard
+                mode="light"
+                icon={<Sun size={18} />}
+                label={t('theme.light')}
+                isSelected={(previewTheme || themeMode) === 'light'}
+                onSelect={() => handleThemeSelect('light')}
+                previewBg="bg-white"
+                previewText="text-slate-900"
+              />
+            </div>
           </div>
 
-          <div className="space-y-3">
-            <p className="text-xs text-muted-foreground">{t('language.select')}</p>
-            <div className="flex gap-2">
-              <button
-                onClick={() => handleLanguageChange('zh')}
-                className={`flex-1 px-4 py-2.5 rounded-lg border-2 transition-all text-sm font-medium ${
-                  i18n.language === 'zh'
-                    ? 'border-primary bg-primary/10 text-primary'
-                    : 'border-border hover:border-primary/50'
-                }`}
-              >
-                {t('language.zh')}
-              </button>
-              <button
-                onClick={() => handleLanguageChange('en')}
-                className={`flex-1 px-4 py-2.5 rounded-lg border-2 transition-all text-sm font-medium ${
-                  i18n.language === 'en'
-                    ? 'border-primary bg-primary/10 text-primary'
-                    : 'border-border hover:border-primary/50'
-                }`}
-              >
-                {t('language.en')}
-              </button>
+          <div>
+            <h3 className="text-xs font-medium text-muted-foreground mb-3">{t('theme.colorScheme')}</h3>
+            <div className="flex flex-wrap gap-2">
+              {(['blue', 'green', 'purple', 'orange', 'pink'] as ColorScheme[]).map((color) => (
+                <ColorSwatch
+                  key={color}
+                  color={color}
+                  isSelected={(previewColor || colorScheme) === color}
+                  onSelect={() => handleColorSelect(color)}
+                />
+              ))}
             </div>
           </div>
         </div>
 
-        {/* 授权管理（仅管理员，且非桌面版）：桌面版期限由授权文件控制 */}
-        {isAdmin && !machineInfo?.desktopMode && (
-          <div className="bg-card p-5 rounded-lg border border-border">
-            <div className="flex items-center justify-between mb-4">
-              <div className="flex items-center gap-2">
-                <Key size={20} className="text-primary" />
-                <h2 className="text-base font-semibold">{t('license.adminTitle')}</h2>
-              </div>
-              <button
-                onClick={() => fetchUser()}
-                className="p-1.5 hover:bg-muted rounded-lg transition-colors"
-                title={t('license.refresh')}
-              >
-                <RefreshCw size={16} />
-              </button>
-            </div>
-
-            <div className="space-y-3">
-              <p className="text-xs text-muted-foreground">{t('license.adminHint')}</p>
-
-              <div>
-                <label className="block text-xs text-muted-foreground mb-1.5">{t('license.expiryDateInput')}</label>
-                <input
-                  type="date"
-                  value={selectedDate}
-                  onChange={(e) => setSelectedDate(e.target.value)}
-                  className="w-full px-3 py-2 bg-background border border-border rounded-lg text-foreground text-sm focus:outline-none focus:ring-2 focus:ring-primary/50"
-                />
-              </div>
-
-              <div className="flex gap-2">
-                <button
-                  onClick={handleUpdateExpiry}
-                  disabled={isUpdating || !selectedDate}
-                  className="flex-1 px-4 py-2 bg-primary text-primary-foreground rounded-lg hover:opacity-90 disabled:opacity-50 text-sm font-medium flex items-center justify-center gap-1.5"
-                >
-                  {isUpdating ? <Loader2 size={14} className="animate-spin" /> : <Calendar size={14} />}
-                  {t('license.updateButton')}
-                </button>
-                <button
-                  onClick={handleSetUnlimited}
-                  disabled={isUpdating}
-                  className="px-4 py-2 border border-border rounded-lg hover:bg-muted text-sm font-medium flex items-center gap-1.5 disabled:opacity-50"
-                >
-                  <Infinity size={14} />
-                  {t('license.setUnlimited')}
-                </button>
-              </div>
-
-              {updateMessage && (
-                <div className={`p-2 rounded flex items-center gap-2 ${
-                  updateMessage.type === 'success'
-                    ? 'bg-green-500/10 border border-green-500/20 text-green-500'
-                    : 'bg-red-500/10 border border-red-500/20 text-red-500'
-                }`}>
-                  {updateMessage.type === 'success' ? <Check size={14} /> : <X size={14} />}
-                  <span className="text-xs">{updateMessage.text}</span>
-                </div>
-              )}
-            </div>
+        {(previewTheme || previewColor) && (
+          <div className="flex gap-2 pt-4 mt-4 border-t border-border max-w-md">
+            <button
+              onClick={handleApplyTheme}
+              className="flex-1 px-4 py-2 bg-primary text-primary-foreground rounded-lg hover:opacity-90 text-sm font-medium"
+            >
+              {t('theme.apply')}
+            </button>
+            <button
+              onClick={handleCancelTheme}
+              className="flex-1 px-4 py-2 bg-secondary text-secondary-foreground rounded-lg hover:opacity-90 text-sm font-medium"
+            >
+              {t('theme.cancel')}
+            </button>
           </div>
         )}
+      </div>
 
-        {/* 特别声明：声明内容在上，联系方式置于卡片底部 */}
+      {/* 授权管理（仅管理员，且非桌面版）：桌面版期限由授权文件控制 */}
+      {isAdmin && !machineInfo?.desktopMode && (
         <div className="bg-card p-5 rounded-lg border border-border">
-          <div className="flex items-center gap-2 mb-4">
-            <LifeBuoy size={20} className="text-primary" />
-            <h2 className="text-base font-semibold">{t('license.authorTitle')}</h2>
+          <div className="flex items-center justify-between mb-4">
+            <div className="flex items-center gap-2">
+              <Key size={20} className="text-primary" />
+              <h2 className="text-base font-semibold">{t('license.adminTitle')}</h2>
+            </div>
+            <button
+              onClick={() => fetchUser()}
+              className="p-1.5 hover:bg-muted rounded-lg transition-colors"
+              title={t('license.refresh')}
+            >
+              <RefreshCw size={16} />
+            </button>
           </div>
 
-          <div className="space-y-3">
-            <p className="text-sm text-muted-foreground">{t('license.authorHint')}</p>
+          <div className="space-y-3 max-w-2xl">
+            <p className="text-xs text-muted-foreground">{t('license.adminHint')}</p>
 
-            <div className="pt-3 border-t border-border space-y-2">
-              <div className="flex items-center justify-between gap-3">
-                <span className="text-sm text-muted-foreground flex-shrink-0">{t('license.adminEmailLabel')}</span>
-                <a href="mailto:weicongpeng1@163.com" className="text-sm text-primary hover:underline break-all">
-                  weicongpeng1@163.com
-                </a>
-              </div>
-              <div className="flex items-center justify-between gap-3">
-                <span className="text-sm text-muted-foreground flex-shrink-0">{t('license.adminPhoneLabel')}</span>
-                <a href="tel:15220958556" className="text-sm text-primary hover:underline">
-                  15220958556
-                </a>
-              </div>
-            </div>
-          </div>
-        </div>
-
-        {/* 主题与配色 */}
-        <div className="bg-card p-5 rounded-lg border border-border">
-          <div className="flex items-center gap-2 mb-4">
-            <Palette size={20} className="text-primary" />
-            <h2 className="text-base font-semibold">{t('theme.title')}</h2>
-          </div>
-
-          <div className="space-y-4">
-            <div>
-              <h3 className="text-xs font-medium text-muted-foreground mb-3">{t('theme.themeMode')}</h3>
-              <div className="grid grid-cols-2 gap-3">
-                <ThemeModeCard
-                  mode="dark"
-                  icon={<Moon size={18} />}
-                  label={t('theme.dark')}
-                  isSelected={(previewTheme || themeMode) === 'dark'}
-                  onSelect={() => handleThemeSelect('dark')}
-                  previewBg="bg-slate-900"
-                  previewText="text-white"
-                />
-                <ThemeModeCard
-                  mode="light"
-                  icon={<Sun size={18} />}
-                  label={t('theme.light')}
-                  isSelected={(previewTheme || themeMode) === 'light'}
-                  onSelect={() => handleThemeSelect('light')}
-                  previewBg="bg-white"
-                  previewText="text-slate-900"
-                />
-              </div>
+            <div className="max-w-xs">
+              <label className="block text-xs text-muted-foreground mb-1.5">{t('license.expiryDateInput')}</label>
+              <input
+                type="date"
+                value={selectedDate}
+                onChange={(e) => setSelectedDate(e.target.value)}
+                className="w-full px-3 py-2 bg-background border border-border rounded-lg text-foreground text-sm focus:outline-none focus:ring-2 focus:ring-primary/50"
+              />
             </div>
 
-            <div>
-              <h3 className="text-xs font-medium text-muted-foreground mb-3">{t('theme.colorScheme')}</h3>
-              <div className="flex flex-wrap gap-2">
-                {(['blue', 'green', 'purple', 'orange', 'pink'] as ColorScheme[]).map((color) => (
-                  <ColorSwatch
-                    key={color}
-                    color={color}
-                    isSelected={(previewColor || colorScheme) === color}
-                    onSelect={() => handleColorSelect(color)}
-                  />
-                ))}
-              </div>
+            <div className="flex gap-2">
+              <button
+                onClick={handleUpdateExpiry}
+                disabled={isUpdating || !selectedDate}
+                className="px-4 py-2 bg-primary text-primary-foreground rounded-lg hover:opacity-90 disabled:opacity-50 text-sm font-medium flex items-center justify-center gap-1.5"
+              >
+                {isUpdating ? <Loader2 size={14} className="animate-spin" /> : <Calendar size={14} />}
+                {t('license.updateButton')}
+              </button>
+              <button
+                onClick={handleSetUnlimited}
+                disabled={isUpdating}
+                className="px-4 py-2 border border-border rounded-lg hover:bg-muted text-sm font-medium flex items-center gap-1.5 disabled:opacity-50"
+              >
+                <Infinity size={14} />
+                {t('license.setUnlimited')}
+              </button>
             </div>
 
-            {(previewTheme || previewColor) && (
-              <div className="flex gap-2 pt-3 border-t border-border">
-                <button
-                  onClick={handleApplyTheme}
-                  className="flex-1 px-4 py-2 bg-primary text-primary-foreground rounded-lg hover:opacity-90 text-sm font-medium"
-                >
-                  {t('theme.apply')}
-                </button>
-                <button
-                  onClick={handleCancelTheme}
-                  className="flex-1 px-4 py-2 bg-secondary text-secondary-foreground rounded-lg hover:opacity-90 text-sm font-medium"
-                >
-                  {t('theme.cancel')}
-                </button>
+            {updateMessage && (
+              <div className={`p-2 rounded flex items-center gap-2 ${
+                updateMessage.type === 'success'
+                  ? 'bg-green-500/10 border border-green-500/20 text-green-500'
+                  : 'bg-red-500/10 border border-red-500/20 text-red-500'
+              }`}>
+                {updateMessage.type === 'success' ? <Check size={14} /> : <X size={14} />}
+                <span className="text-xs">{updateMessage.text}</span>
               </div>
             )}
+          </div>
+        </div>
+      )}
+
+      {/* 特别声明：声明内容在上，联系方式置于卡片底部 */}
+      <div className="bg-card p-5 rounded-lg border border-border">
+        <div className="flex items-center gap-2 mb-4">
+          <LifeBuoy size={20} className="text-primary" />
+          <h2 className="text-base font-semibold">{t('license.authorTitle')}</h2>
+        </div>
+
+        <p className="text-sm text-muted-foreground">{t('license.authorHint')}</p>
+
+        <div className="pt-3 mt-3 border-t border-border flex flex-wrap gap-x-8 gap-y-2">
+          <div className="flex items-center gap-3">
+            <span className="text-sm text-muted-foreground">{t('license.adminEmailLabel')}</span>
+            <a href="mailto:weicongpeng1@163.com" className="text-sm text-primary hover:underline break-all">
+              weicongpeng1@163.com
+            </a>
+          </div>
+          <div className="flex items-center gap-3">
+            <span className="text-sm text-muted-foreground">{t('license.adminPhoneLabel')}</span>
+            <a href="tel:15220958556" className="text-sm text-primary hover:underline">
+              15220958556
+            </a>
           </div>
         </div>
       </div>

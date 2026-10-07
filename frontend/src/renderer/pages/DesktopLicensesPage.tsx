@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { Ban, Check, Copy, KeyRound, Loader2, Pencil, Plus, RefreshCw, RotateCcw, Trash2, Unlink, X } from 'lucide-react'
+import { Ban, Check, Copy, KeyRound, Pencil, Plus, RefreshCw, RotateCcw, Trash2, Unlink, X } from 'lucide-react'
 import type { DesktopLicenseRecord } from '@shared/types'
 import { authApi, desktopLicensesApi } from '../services/api'
 
@@ -14,7 +14,7 @@ const STATUS_STYLE: Record<string, string> = {
 
 /**
  * 桌面版授权管理（管理员）：预建激活码 / 批准申请 / 禁用 / 解绑换机 / 重发码。
- * 客户端在「配置管理」页用激活码在线激活，或提交申请后由本页批准。
+ * 客户端在「系统设置」页用激活码在线激活，或提交申请后由本页批准。
  */
 export function DesktopLicensesPage() {
   const { t } = useTranslation()
@@ -200,9 +200,12 @@ export function DesktopLicensesPage() {
     t(`desktopLicenses.status_${value}`, { defaultValue: value })
 
   return (
-    <div className="p-6 max-w-6xl">
-      <div className="flex items-center justify-between mb-6">
-        <h1 className="text-base font-bold">{t('desktopLicenses.title')}</h1>
+    <div className="p-6 w-full space-y-5">
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-2">
+          <KeyRound size={20} className="text-primary" />
+          <h1 className="text-base font-bold">{t('desktopLicenses.title')}</h1>
+        </div>
         <div className="flex items-center gap-2">
           <button
             onClick={() => setShowCreate(true)}
@@ -222,7 +225,7 @@ export function DesktopLicensesPage() {
       </div>
 
       {/* 筛选 */}
-      <div className="flex flex-wrap items-center gap-2 mb-4">
+      <div className="bg-card p-4 rounded-lg border border-border flex flex-wrap items-center gap-2">
         <select
           value={status}
           onChange={(e) => {
@@ -265,7 +268,7 @@ export function DesktopLicensesPage() {
       </div>
 
       {message && (
-        <div className={`mb-4 p-2 rounded flex items-center gap-2 ${
+        <div className={`p-3 rounded-lg flex items-center gap-2 ${
           message.type === 'success'
             ? 'bg-green-500/10 border border-green-500/20 text-green-500'
             : 'bg-red-500/10 border border-red-500/20 text-red-500'
@@ -277,7 +280,7 @@ export function DesktopLicensesPage() {
 
       {/* 新激活码提示 */}
       {newCode && (
-        <div className="mb-4 p-3 rounded-lg border border-primary/30 bg-primary/5 space-y-1">
+        <div className="p-3 rounded-lg border border-primary/30 bg-primary/5 space-y-1">
           <p className="text-xs text-muted-foreground">
             {t('desktopLicenses.codeFor', { name: newCode.name })}
           </p>
@@ -300,7 +303,7 @@ export function DesktopLicensesPage() {
 
       {/* 列表 */}
       <div className="bg-card rounded-lg border border-border overflow-x-auto">
-        <table className="w-full text-sm min-w-[900px]">
+        <table className="w-full text-sm min-w-[1100px]">
           <thead className="bg-muted/50 text-xs text-muted-foreground">
             <tr>
               <th className="px-3 py-2 text-left">{t('desktopLicenses.colUser')}</th>
@@ -494,86 +497,97 @@ export function DesktopLicensesPage() {
       {/* 新建授权 */}
       {showCreate && (
         <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
-          <div className="bg-card rounded-lg border border-border p-5 w-full max-w-md space-y-3">
+          <div className="bg-card rounded-lg border border-border p-5 w-full max-w-2xl space-y-4 max-h-[90vh] overflow-y-auto">
             <h3 className="text-sm font-semibold">{t('desktopLicenses.createTitle')}</h3>
-            <input
-              value={createName}
-              onChange={(e) => setCreateName(e.target.value)}
-              placeholder={t('desktopLicenses.nameLabel')}
-              className="w-full px-3 py-2 bg-background border border-border rounded-lg text-sm"
-            />
-            <input
-              value={createOrg}
-              onChange={(e) => setCreateOrg(e.target.value)}
-              placeholder={t('desktopLicenses.orgLabel')}
-              className="w-full px-3 py-2 bg-background border border-border rounded-lg text-sm"
-            />
-            <div>
-              <label className="block text-xs text-muted-foreground mb-1">
-                {t('desktopLicenses.leaseLabel')}
-              </label>
-              <input
-                type="number"
-                min={1}
-                value={createLease}
-                onChange={(e) => setCreateLease(Number(e.target.value))}
-                className="w-full px-3 py-2 bg-background border border-border rounded-lg text-sm"
-              />
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+              <div>
+                <label className="block text-xs text-muted-foreground mb-1">{t('desktopLicenses.nameLabel')}</label>
+                <input
+                  value={createName}
+                  onChange={(e) => setCreateName(e.target.value)}
+                  placeholder={t('desktopLicenses.nameLabel')}
+                  className="w-full px-3 py-2 bg-background border border-border rounded-lg text-sm"
+                />
+              </div>
+              <div>
+                <label className="block text-xs text-muted-foreground mb-1">{t('desktopLicenses.orgLabel')}</label>
+                <input
+                  value={createOrg}
+                  onChange={(e) => setCreateOrg(e.target.value)}
+                  placeholder={t('desktopLicenses.orgLabel')}
+                  className="w-full px-3 py-2 bg-background border border-border rounded-lg text-sm"
+                />
+              </div>
+              <div>
+                <label className="block text-xs text-muted-foreground mb-1">
+                  {t('desktopLicenses.usernameLabel', '绑定网页端账号')}
+                </label>
+                <input
+                  value={createUsername}
+                  onChange={(e) => setCreateUsername(e.target.value)}
+                  placeholder={t('desktopLicenses.usernamePlaceholder', '留空则由该用户首次登录单机模式时认领')}
+                  className="w-full px-3 py-2 bg-background border border-border rounded-lg text-sm"
+                />
+              </div>
+              <div>
+                <label className="block text-xs text-muted-foreground mb-1">{t('desktopLicenses.leaseLabel')}</label>
+                <input
+                  type="number"
+                  min={1}
+                  value={createLease}
+                  onChange={(e) => setCreateLease(Number(e.target.value))}
+                  className="w-full px-3 py-2 bg-background border border-border rounded-lg text-sm"
+                />
+              </div>
+              <div>
+                <label className="block text-xs text-muted-foreground mb-1">
+                  {t('desktopLicenses.idleLogoutLabel', '无操作退出登录时长（天）')}
+                </label>
+                <input
+                  type="number"
+                  min={1}
+                  value={createIdleLogout}
+                  onChange={(e) => setCreateIdleLogout(Number(e.target.value))}
+                  className="w-full px-3 py-2 bg-background border border-border rounded-lg text-sm"
+                />
+              </div>
+              <div className="md:col-span-2">
+                <label className="block text-xs text-muted-foreground mb-1">{t('desktopLicenses.noteLabel')}</label>
+                <input
+                  value={createNote}
+                  onChange={(e) => setCreateNote(e.target.value)}
+                  placeholder={t('desktopLicenses.noteLabel')}
+                  className="w-full px-3 py-2 bg-background border border-border rounded-lg text-sm"
+                />
+              </div>
+              <div className="md:col-span-2">
+                <label className="block text-xs text-muted-foreground mb-1">{t('desktopLicenses.groupHint')}</label>
+                <div className="flex gap-2">
+                  <select
+                    value={createCity}
+                    onChange={(e) => setCreateCity(e.target.value)}
+                    className="flex-1 px-3 py-2 bg-background border border-border rounded-lg text-sm"
+                  >
+                    <option value="">{t('desktopLicenses.groupCityPlaceholder')}</option>
+                    {cities.map((c) => (
+                      <option key={c} value={c}>{c}</option>
+                    ))}
+                  </select>
+                  <select
+                    value={createOperator}
+                    onChange={(e) => setCreateOperator(e.target.value)}
+                    className="flex-1 px-3 py-2 bg-background border border-border rounded-lg text-sm"
+                  >
+                    <option value="">{t('desktopLicenses.groupOperatorPlaceholder')}</option>
+                    {operators.map((o) => (
+                      <option key={o} value={o}>{o}</option>
+                    ))}
+                  </select>
+                </div>
+              </div>
             </div>
-            <input
-              value={createNote}
-              onChange={(e) => setCreateNote(e.target.value)}
-              placeholder={t('desktopLicenses.noteLabel')}
-              className="w-full px-3 py-2 bg-background border border-border rounded-lg text-sm"
-            />
-            <div>
-              <label className="block text-xs text-muted-foreground mb-1">
-                {t('desktopLicenses.usernameLabel', '绑定网页端账号')}
-              </label>
-              <input
-                value={createUsername}
-                onChange={(e) => setCreateUsername(e.target.value)}
-                placeholder={t('desktopLicenses.usernamePlaceholder', '留空则由该用户首次登录单机模式时认领')}
-                className="w-full px-3 py-2 bg-background border border-border rounded-lg text-sm"
-              />
-            </div>
-            <div>
-              <label className="block text-xs text-muted-foreground mb-1">
-                {t('desktopLicenses.idleLogoutLabel', '无操作退出登录时长（天）')}
-              </label>
-              <input
-                type="number"
-                min={1}
-                value={createIdleLogout}
-                onChange={(e) => setCreateIdleLogout(Number(e.target.value))}
-                className="w-full px-3 py-2 bg-background border border-border rounded-lg text-sm"
-              />
-            </div>
-            <div className="flex gap-2">
-              <select
-                value={createCity}
-                onChange={(e) => setCreateCity(e.target.value)}
-                className="flex-1 px-3 py-2 bg-background border border-border rounded-lg text-sm"
-              >
-                <option value="">{t('desktopLicenses.groupCityPlaceholder')}</option>
-                {cities.map((c) => (
-                  <option key={c} value={c}>{c}</option>
-                ))}
-              </select>
-              <select
-                value={createOperator}
-                onChange={(e) => setCreateOperator(e.target.value)}
-                className="flex-1 px-3 py-2 bg-background border border-border rounded-lg text-sm"
-              >
-                <option value="">{t('desktopLicenses.groupOperatorPlaceholder')}</option>
-                {operators.map((o) => (
-                  <option key={o} value={o}>{o}</option>
-                ))}
-              </select>
-            </div>
-            <p className="text-xs text-muted-foreground">{t('desktopLicenses.groupHint')}</p>
             <p className="text-xs text-muted-foreground">{t('desktopLicenses.createHint')}</p>
-            <div className="flex gap-2 justify-end">
+            <div className="flex gap-2 justify-end pt-3 border-t border-border">
               <button
                 onClick={() => setShowCreate(false)}
                 className="px-4 py-2 border border-border rounded-lg hover:bg-muted text-sm"
@@ -595,69 +609,85 @@ export function DesktopLicensesPage() {
       {/* 编辑授权 */}
       {editing && (
         <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
-          <div className="bg-card rounded-lg border border-border p-5 w-full max-w-md space-y-3">
+          <div className="bg-card rounded-lg border border-border p-5 w-full max-w-2xl space-y-4 max-h-[90vh] overflow-y-auto">
             <h3 className="text-sm font-semibold">{t('desktopLicenses.editTitle')}</h3>
-            <input
-              value={editName}
-              onChange={(e) => setEditName(e.target.value)}
-              placeholder={t('desktopLicenses.nameLabel')}
-              className="w-full px-3 py-2 bg-background border border-border rounded-lg text-sm"
-            />
-            <input
-              value={editOrg}
-              onChange={(e) => setEditOrg(e.target.value)}
-              placeholder={t('desktopLicenses.orgLabel')}
-              className="w-full px-3 py-2 bg-background border border-border rounded-lg text-sm"
-            />
-            <input
-              type="number"
-              min={1}
-              value={editLease}
-              onChange={(e) => setEditLease(Number(e.target.value))}
-              className="w-full px-3 py-2 bg-background border border-border rounded-lg text-sm"
-            />
-            <input
-              value={editNote}
-              onChange={(e) => setEditNote(e.target.value)}
-              placeholder={t('desktopLicenses.noteLabel')}
-              className="w-full px-3 py-2 bg-background border border-border rounded-lg text-sm"
-            />
-            <div>
-              <label className="block text-xs text-muted-foreground mb-1">
-                {t('desktopLicenses.idleLogoutLabel', '无操作退出登录时长（天）')}
-              </label>
-              <input
-                type="number"
-                min={1}
-                value={editIdleLogout}
-                onChange={(e) => setEditIdleLogout(Number(e.target.value))}
-                className="w-full px-3 py-2 bg-background border border-border rounded-lg text-sm"
-              />
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+              <div>
+                <label className="block text-xs text-muted-foreground mb-1">{t('desktopLicenses.nameLabel')}</label>
+                <input
+                  value={editName}
+                  onChange={(e) => setEditName(e.target.value)}
+                  placeholder={t('desktopLicenses.nameLabel')}
+                  className="w-full px-3 py-2 bg-background border border-border rounded-lg text-sm"
+                />
+              </div>
+              <div>
+                <label className="block text-xs text-muted-foreground mb-1">{t('desktopLicenses.orgLabel')}</label>
+                <input
+                  value={editOrg}
+                  onChange={(e) => setEditOrg(e.target.value)}
+                  placeholder={t('desktopLicenses.orgLabel')}
+                  className="w-full px-3 py-2 bg-background border border-border rounded-lg text-sm"
+                />
+              </div>
+              <div>
+                <label className="block text-xs text-muted-foreground mb-1">{t('desktopLicenses.leaseLabel')}</label>
+                <input
+                  type="number"
+                  min={1}
+                  value={editLease}
+                  onChange={(e) => setEditLease(Number(e.target.value))}
+                  className="w-full px-3 py-2 bg-background border border-border rounded-lg text-sm"
+                />
+              </div>
+              <div>
+                <label className="block text-xs text-muted-foreground mb-1">
+                  {t('desktopLicenses.idleLogoutLabel', '无操作退出登录时长（天）')}
+                </label>
+                <input
+                  type="number"
+                  min={1}
+                  value={editIdleLogout}
+                  onChange={(e) => setEditIdleLogout(Number(e.target.value))}
+                  className="w-full px-3 py-2 bg-background border border-border rounded-lg text-sm"
+                />
+              </div>
+              <div className="md:col-span-2">
+                <label className="block text-xs text-muted-foreground mb-1">{t('desktopLicenses.noteLabel')}</label>
+                <input
+                  value={editNote}
+                  onChange={(e) => setEditNote(e.target.value)}
+                  placeholder={t('desktopLicenses.noteLabel')}
+                  className="w-full px-3 py-2 bg-background border border-border rounded-lg text-sm"
+                />
+              </div>
+              <div className="md:col-span-2">
+                <label className="block text-xs text-muted-foreground mb-1">{t('desktopLicenses.groupHint')}</label>
+                <div className="flex gap-2">
+                  <select
+                    value={editCity}
+                    onChange={(e) => setEditCity(e.target.value)}
+                    className="flex-1 px-3 py-2 bg-background border border-border rounded-lg text-sm"
+                  >
+                    <option value="">{t('desktopLicenses.groupCityPlaceholder')}</option>
+                    {cities.map((c) => (
+                      <option key={c} value={c}>{c}</option>
+                    ))}
+                  </select>
+                  <select
+                    value={editOperator}
+                    onChange={(e) => setEditOperator(e.target.value)}
+                    className="flex-1 px-3 py-2 bg-background border border-border rounded-lg text-sm"
+                  >
+                    <option value="">{t('desktopLicenses.groupOperatorPlaceholder')}</option>
+                    {operators.map((o) => (
+                      <option key={o} value={o}>{o}</option>
+                    ))}
+                  </select>
+                </div>
+              </div>
             </div>
-            <div className="flex gap-2">
-              <select
-                value={editCity}
-                onChange={(e) => setEditCity(e.target.value)}
-                className="flex-1 px-3 py-2 bg-background border border-border rounded-lg text-sm"
-              >
-                <option value="">{t('desktopLicenses.groupCityPlaceholder')}</option>
-                {cities.map((c) => (
-                  <option key={c} value={c}>{c}</option>
-                ))}
-              </select>
-              <select
-                value={editOperator}
-                onChange={(e) => setEditOperator(e.target.value)}
-                className="flex-1 px-3 py-2 bg-background border border-border rounded-lg text-sm"
-              >
-                <option value="">{t('desktopLicenses.groupOperatorPlaceholder')}</option>
-                {operators.map((o) => (
-                  <option key={o} value={o}>{o}</option>
-                ))}
-              </select>
-            </div>
-            <p className="text-xs text-muted-foreground">{t('desktopLicenses.groupHint')}</p>
-            <div className="flex gap-2 justify-end">
+            <div className="flex gap-2 justify-end pt-3 border-t border-border">
               <button
                 onClick={() => setEditing(null)}
                 className="px-4 py-2 border border-border rounded-lg hover:bg-muted text-sm"

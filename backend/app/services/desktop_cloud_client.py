@@ -308,6 +308,59 @@ def login(
     return data
 
 
+def register_options() -> Dict[str, Any]:
+    """注册选项（地市预设 + 运营商）：桌面端注册下拉直接取服务器的值。"""
+    resp = _request("GET", "/auth/options", timeout=10)
+    return resp.get("data") or {}
+
+
+def register(username: str, password: str, city: str, operator: str) -> Dict[str, Any]:
+    """桌面端注册：在服务器上创建与网页端同规则的账号（注册不允许自封管理员）。"""
+    resp = _request(
+        "POST",
+        "/desktop-cloud/auth/register",
+        {
+            "username": username,
+            "password": password,
+            "confirm_password": password,
+            "city": city,
+            "operator": operator,
+        },
+    )
+    return resp.get("data") or {}
+
+
+def app_version() -> Dict[str, Any]:
+    """手机 APP 最新版本：桌面端没有 APK 分发，直接从服务器取（供客户端下载页展示）。"""
+    resp = _request("GET", "/app-versions/latest", timeout=15)
+    return resp.get("data") or {}
+
+
+def session_check(session_jti: str) -> Dict[str, Any]:
+    """登录态校验：本机本次登录是否仍是该账号的最后一次登录。
+
+    网络不可达时按"有效"处理（断网不该把人踢下线，单机模式更是完全离线）。
+    """
+    from app.utils.machine_code import get_machine_code
+
+    try:
+        resp = _request(
+            "POST",
+            "/desktop-cloud/auth/session-check",
+            {
+                "license_file": _license_file_text(),
+                "machine_code": get_machine_code(),
+                "session_jti": session_jti or "",
+            },
+            timeout=15,
+        )
+    except CloudError as exc:
+        if exc.status_code == 0:
+            return {"valid": True, "offline": True}
+        return {"valid": False, "reason": exc.message}
+    return resp.get("data") or {}
+
+
 def poll_login(username: str) -> Dict[str, Any]:
     """单机模式：轮询授权申请，批准后当场落盘许可。"""
     from app.utils.machine_code import get_machine_code

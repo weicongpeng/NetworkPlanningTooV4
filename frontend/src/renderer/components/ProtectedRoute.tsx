@@ -129,7 +129,7 @@ export function ProtectedRoute({ children, requireAdmin = false, requirePermissi
             onClick={() => navigate('/license')}
             className="w-full px-6 py-3 bg-primary text-primary-foreground rounded-lg hover:opacity-90 transition-opacity font-medium"
           >
-            前往配置管理
+            前往系统设置
           </button>
         </div>
       </div>

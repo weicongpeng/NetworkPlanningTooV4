@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+import secrets
 import time
 import urllib.parse
 from collections import defaultdict
@@ -110,6 +111,24 @@ class PollLoginRequest(BaseModel):
     machine_code: str
 
 
+class SessionCheckRequest(BaseModel):
+    """登录态校验：确认本次登录仍是该账号的最后一次登录。"""
+
+    license_file: str
+    machine_code: str
+    session_jti: str
+
+
+class RegisterRequest(BaseModel):
+    """桌面端注册：规则与网页端注册一致（账号创建在服务器，注册不允许自封管理员）。"""
+
+    username: str
+    password: str
+    confirm_password: str
+    city: str
+    operator: str
+
+
 @router.post("/auth/login")
 async def desktop_login(
     payload: LoginRequest,
@@ -130,6 +149,22 @@ async def desktop_login(
         )
     except DesktopLicenseError as exc:
         raise HTTPException(status_code=exc.status_code, detail=_gbk_safe(exc.message))
+
+    # 同一账号以最后登录为准：桌面端登录同样占用服务器会话，并踢掉该账号其它
+    # 网页端/桌面端登录（客户端据此周期性校验，被踢后本机自动登出）
+    if result == "ok":
+        try:
+            from app.services.auth_service import auth_service
+
+            user_id = int((data.get("user") or {}).get("id") or data.get("user_id") or 0)
+            if user_id:
+                jti = secrets.token_urlsafe(16)
+                auth_service.record_session(db, user_id, jti, _client_ip(request), "desktop")
+                auth_service.revoke_other_sessions(db, user_id, jti)
+                data["session_jti"] = jti
+        except Exception as exc:  # noqa: BLE001
+            print(f"[DesktopCloud] 会话记账失败（不影响登录）：{exc}")
+
     # 单机模式断网期间在本机登录的次数，联机时补报（不影响本次登录本身）
     if result == "ok" and payload.offline_logins:
         try:
@@ -158,6 +193,78 @@ async def desktop_login_poll(
     return {"success": True, "data": {"result": result, **data}}
 
 
+
+
+@router.post("/auth/session-check")
+async def desktop_session_check(
+    payload: SessionCheckRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """校验桌面端登录是否仍然有效（同一账号被其它端登录时返回 valid=False）。
+
+    客户端周期性调用：一旦失效就本机登出，实现"网页端/桌面端不能同时在线"。
+    网络不可达时返回 valid=True（不因断网把人踢下线）。
+    """
+    from app.models.database import UserSession
+
+    _rate_limit(f"session:{_client_ip(request)}", limit=120, window=300)
+    try:
+        record, _ = _verify_license(payload.license_file, payload.machine_code, db)
+    except HTTPException as exc:
+        if exc.status_code in (400, 403, 404, 409):
+            return {"success": True, "data": {"valid": False, "reason": _gbk_safe(str(exc.detail))}}
+        raise
+
+    jti = (payload.session_jti or "").strip()
+    if not jti:
+        return {"success": True, "data": {"valid": False, "reason": "缺少会话标识，请重新登录"}}
+
+    session = db.query(UserSession).filter(UserSession.token_jti == jti).first()
+    if session is None or session.logout_time is not None:
+        return {
+            "success": True,
+            "data": {"valid": False, "reason": "该账号已在其它设备登录，本机已退出登录"},
+        }
+    if record.user_id and session.user_id != record.user_id:
+        return {"success": True, "data": {"valid": False, "reason": "会话与授权不匹配，请重新登录"}}
+    return {"success": True, "data": {"valid": True}}
+
+
+@router.post("/auth/register")
+async def desktop_register(
+    payload: RegisterRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """桌面端注册（公开 + 限流）：与网页端注册同一套校验，注册后即可登录。"""
+    from app.services.auth_service import auth_service
+    from app.services.data_group import validate_group
+
+    _rate_limit(f"register:{_client_ip(request)}", limit=10, window=300)
+
+    username = (payload.username or "").strip()
+    if len(username) < 3:
+        raise HTTPException(status_code=400, detail="用户名长度至少3位")
+    if len(payload.password or "") < 6:
+        raise HTTPException(status_code=400, detail="密码长度至少6位")
+    if payload.password != payload.confirm_password:
+        raise HTTPException(status_code=400, detail="两次输入的密码不一致")
+    group_error = validate_group(payload.city, payload.operator)
+    if group_error:
+        raise HTTPException(status_code=400, detail=_gbk_safe(group_error))
+
+    user, error = auth_service.create_user(
+        db=db,
+        username=username,
+        password=payload.password,
+        is_admin=False,  # 安全：注册不允许自封管理员
+        city=(payload.city or "").strip(),
+        operator=(payload.operator or "").strip(),
+    )
+    if error:
+        raise HTTPException(status_code=400, detail=_gbk_safe(error))
+    return {"success": True, "data": {"username": user.username}, "message": "注册成功"}
 
 
 @router.get("/config")
@@ -480,9 +587,10 @@ async def download_dataset_package(
     except DatasetPackageError as exc:
         raise HTTPException(status_code=400, detail=_gbk_safe(str(exc)))
 
-    # 打包期间算出的内容摘要写回修订记录，供后续快速比对
-    revs.bump(data_id, sha256=package["sha256"], city=group[0], operator=group[1])
-    current_rev = int((revs.get(data_id) or {}).get("rev") or 0)
+    # 只回写内容摘要、不推进修订号：pull 是读操作，bump 会让同组其它客户端反复重拉
+    current_rev = revs.set_sha(
+        data_id, package["sha256"], city=group[0], operator=group[1]
+    ) or 0
 
     zip_path = package["path"]
     file_size = package["size"]
@@ -611,10 +719,15 @@ async def upload_dataset_package(
         except DatasetPackageError as exc:
             raise HTTPException(status_code=400, detail=_gbk_safe(str(exc)))
 
-        new_rev = revs.get(data_id)
+        # 必须推进修订号：否则同组其它桌面端比对 rev 无变化，永远拉不到这次改动
+        new_rev = revs.bump(
+            data_id, updated_by=record.licensee_username,
+            deleted=False,  # 重新推上来要清掉墓碑，否则服务器仍当它已删除
+            city=city, operator=operator,
+        )
         return {
             "success": True,
-            "data": {"data_id": data_id, "rev": int((new_rev or {}).get("rev") or 0)},
+            "data": {"data_id": data_id, "rev": int(new_rev or 0)},
             "message": "已同步到服务器",
         }
     finally:

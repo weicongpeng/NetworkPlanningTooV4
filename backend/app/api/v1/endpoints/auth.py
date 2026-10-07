@@ -82,13 +82,15 @@ async def login(data: UserLogin, request: Request, db: Session = Depends(get_db)
 
     client_ip = auth_service.get_client_ip(request)
 
-    # 仅同类型客户端互踢（APP端不踢任何会话）
-    ended_count = auth_service.end_other_ip_sessions(db, user.id, client_ip, data.client_type)
-
     auth_service.update_last_login(db, user, client_ip)
 
     token, jti = auth_service.create_access_token(user.id, user.username, user.is_admin)
     auth_service.record_session(db, user.id, jti, client_ip, data.client_type)
+    # 同一账号只保留最后这一次登录：网页端与桌面端互踢（APP 端不参与）
+    ended_count = (
+        0 if (data.client_type or "") == "app"
+        else auth_service.revoke_other_sessions(db, user.id, jti)
+    )
 
     result = {
         "success": True,
@@ -100,7 +102,7 @@ async def login(data: UserLogin, request: Request, db: Session = Depends(get_db)
         },
     }
     if ended_count > 0:
-        result["warning"] = "该账号在另一设备上已退出登录（同一账号只能在一个IP地址登录）"
+        result["warning"] = "该账号已在其它设备登录，之前的登录已退出（同一账号以最后登录为准）"
 
     return result
 

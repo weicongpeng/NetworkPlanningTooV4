@@ -96,6 +96,44 @@ def test_activate_writes_license(desktop_local):
     assert (desktop_local.settings.LICENSE_DIR / "license.nptlic").is_file()
 
 
+def test_app_version_uses_server_absolute_url(desktop_local):
+    """桌面端不分发 APK：取服务器最新版本，且下载/二维码地址必须是服务器绝对地址。"""
+    desktop_local.monkeypatch.setattr(
+        desktop_local.cloud,
+        "app_version",
+        lambda: {
+            "version": "1.2.0",
+            "download_url": "/api/v1/app-versions/download/9",
+            "file_size_display": "85.0 MB",
+        },
+    )
+    resp = desktop_local.client.get("/api/v1/desktop/app-version")
+    assert resp.status_code == 200, resp.text
+    data = resp.json()["data"]
+    assert data["version"] == "1.2.0"
+    assert data["download_url"] == "https://example.invalid/api/v1/app-versions/download/9"
+
+
+def test_session_status_reports_kicked(desktop_local):
+    """账号在别处登录后，本机登录态接口要报失效（前端据此退出到登录页）。"""
+    desktop_local.monkeypatch.setattr(
+        desktop_local.cloud, "session_check", lambda jti: {"valid": True}
+    )
+    resp = desktop_local.client.get("/api/v1/desktop/session-status")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["data"]["valid"] is True
+
+    desktop_local.monkeypatch.setattr(
+        desktop_local.cloud,
+        "session_check",
+        lambda jti: {"valid": False, "reason": "该账号已在其它设备登录"},
+    )
+    desktop_local.cloud.save_state(session_jti="jti-1", local_jti="local-1")
+    resp2 = desktop_local.client.get("/api/v1/desktop/session-status")
+    assert resp2.json()["data"]["valid"] is False
+    assert "其它设备" in (resp2.json()["data"].get("reason") or "")
+
+
 def test_activate_error_maps_status(desktop_local):
     def boom(code, hostname=None):
         raise desktop_local.cloud.CloudError(403, "该授权已被禁用，请联系管理员")

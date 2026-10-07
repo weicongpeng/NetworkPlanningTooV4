@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { Check, Download, Loader2, Pencil, RefreshCw, Trash2, Upload, X } from 'lucide-react'
+import { Check, Download, Loader2, MonitorDown, Pencil, RefreshCw, Trash2, Upload, X } from 'lucide-react'
 import type { DesktopReleaseInfo } from '@shared/types'
 import { desktopReleasesApi } from '../services/api'
 import { parallelDownload } from '../utils/parallelDownload'
@@ -139,12 +139,15 @@ export function DesktopReleasesPage() {
   const totalPages = Math.max(1, Math.ceil(total / pageSize))
 
   return (
-    <div className="p-6 max-w-6xl">
-      <div className="flex items-center justify-between mb-6">
-        <h1 className="text-base font-bold">{t('desktopReleases.title')}</h1>
+    <div className="p-6 w-full space-y-5">
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-2">
+          <MonitorDown size={20} className="text-primary" />
+          <h1 className="text-base font-bold">{t('desktopReleases.title')}</h1>
+        </div>
         <button
           onClick={() => fetchReleases()}
-          className="p-1.5 hover:bg-muted rounded-lg transition-colors"
+          className="p-2 hover:bg-muted rounded-lg transition-colors"
           title={t('license.refresh')}
         >
           <RefreshCw size={16} className={loading ? 'animate-spin' : ''} />
@@ -152,13 +155,13 @@ export function DesktopReleasesPage() {
       </div>
 
       {/* 上传 */}
-      <div className="bg-card p-5 rounded-lg border border-border mb-6">
+      <div className="bg-card p-5 rounded-lg border border-border">
         <div className="flex items-center gap-2 mb-4">
           <Upload size={18} className="text-primary" />
           <h2 className="text-sm font-semibold">{t('desktopReleases.uploadTitle')}</h2>
         </div>
-        <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
-          <div className="md:col-span-2">
+        <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-3">
+          <div className="xl:col-span-2">
             <label className="block text-xs text-muted-foreground mb-1">{t('desktopReleases.fileLabel')}</label>
             <input
               type="file"
@@ -185,7 +188,7 @@ export function DesktopReleasesPage() {
               className="w-full px-3 py-2 bg-background border border-border rounded-lg text-sm"
             />
           </div>
-          <div className="md:col-span-4">
+          <div className="md:col-span-2 xl:col-span-4">
             <label className="block text-xs text-muted-foreground mb-1">{t('desktopReleases.notesLabel')}</label>
             <textarea
               value={releaseNotes}
@@ -194,6 +197,8 @@ export function DesktopReleasesPage() {
               className="w-full px-3 py-2 bg-background border border-border rounded-lg text-sm"
             />
           </div>
+        </div>
+        <div className="mt-3 pt-3 border-t border-border flex flex-wrap items-center gap-4">
           <label className="flex items-center gap-2 text-sm">
             <input type="checkbox" checked={isLatest} onChange={(e) => setIsLatest(e.target.checked)} />
             {t('desktopReleases.setLatestLabel')}
@@ -202,22 +207,20 @@ export function DesktopReleasesPage() {
             <input type="checkbox" checked={mandatory} onChange={(e) => setMandatory(e.target.checked)} />
             {t('desktopReleases.mandatoryLabel')}
           </label>
-          <div className="md:col-span-2 flex justify-end">
-            <button
-              onClick={handleUpload}
-              disabled={uploading || !file || !version.trim()}
-              className="px-4 py-2 bg-primary text-primary-foreground rounded-lg hover:opacity-90 disabled:opacity-50 text-sm font-medium flex items-center gap-1.5"
-            >
-              {uploading ? <Loader2 size={14} className="animate-spin" /> : <Upload size={14} />}
-              {uploading ? t('desktopReleases.uploading') : t('desktopReleases.uploadButton')}
-            </button>
-          </div>
+          <button
+            onClick={handleUpload}
+            disabled={uploading || !file || !version.trim()}
+            className="ml-auto px-4 py-2 bg-primary text-primary-foreground rounded-lg hover:opacity-90 disabled:opacity-50 text-sm font-medium flex items-center gap-1.5"
+          >
+            {uploading ? <Loader2 size={14} className="animate-spin" /> : <Upload size={14} />}
+            {uploading ? t('desktopReleases.uploading') : t('desktopReleases.uploadButton')}
+          </button>
         </div>
         <p className="text-xs text-muted-foreground mt-2">{t('desktopReleases.uploadHint')}</p>
       </div>
 
       {message && (
-        <div className={`mb-4 p-2 rounded flex items-center gap-2 ${
+        <div className={`p-3 rounded-lg flex items-center gap-2 ${
           message.type === 'success'
             ? 'bg-green-500/10 border border-green-500/20 text-green-500'
             : 'bg-red-500/10 border border-red-500/20 text-red-500'
@@ -333,32 +336,43 @@ export function DesktopReleasesPage() {
       {/* 编辑弹窗 */}
       {editing && (
         <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
-          <div className="bg-card rounded-lg border border-border p-5 w-full max-w-md space-y-3">
+          <div className="bg-card rounded-lg border border-border p-5 w-full max-w-lg space-y-4">
             <h3 className="text-sm font-semibold">{t('desktopReleases.editTitle')}</h3>
-            <input
-              value={editVersion}
-              onChange={(e) => setEditVersion(e.target.value)}
-              placeholder={t('desktopReleases.versionLabel')}
-              className="w-full px-3 py-2 bg-background border border-border rounded-lg text-sm"
-            />
-            <input
-              value={editChannel}
-              onChange={(e) => setEditChannel(e.target.value)}
-              placeholder={t('desktopReleases.channelLabel')}
-              className="w-full px-3 py-2 bg-background border border-border rounded-lg text-sm"
-            />
-            <textarea
-              value={editNotes}
-              onChange={(e) => setEditNotes(e.target.value)}
-              rows={3}
-              placeholder={t('desktopReleases.notesLabel')}
-              className="w-full px-3 py-2 bg-background border border-border rounded-lg text-sm"
-            />
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+              <div>
+                <label className="block text-xs text-muted-foreground mb-1">{t('desktopReleases.versionLabel')}</label>
+                <input
+                  value={editVersion}
+                  onChange={(e) => setEditVersion(e.target.value)}
+                  placeholder="1.0.0"
+                  className="w-full px-3 py-2 bg-background border border-border rounded-lg text-sm"
+                />
+              </div>
+              <div>
+                <label className="block text-xs text-muted-foreground mb-1">{t('desktopReleases.channelLabel')}</label>
+                <input
+                  value={editChannel}
+                  onChange={(e) => setEditChannel(e.target.value)}
+                  placeholder="stable"
+                  className="w-full px-3 py-2 bg-background border border-border rounded-lg text-sm"
+                />
+              </div>
+            </div>
+            <div>
+              <label className="block text-xs text-muted-foreground mb-1">{t('desktopReleases.notesLabel')}</label>
+              <textarea
+                value={editNotes}
+                onChange={(e) => setEditNotes(e.target.value)}
+                rows={3}
+                placeholder={t('desktopReleases.notesLabel')}
+                className="w-full px-3 py-2 bg-background border border-border rounded-lg text-sm"
+              />
+            </div>
             <label className="flex items-center gap-2 text-sm">
               <input type="checkbox" checked={editMandatory} onChange={(e) => setEditMandatory(e.target.checked)} />
               {t('desktopReleases.mandatoryLabel')}
             </label>
-            <div className="flex gap-2 justify-end">
+            <div className="flex gap-2 justify-end pt-3 border-t border-border">
               <button
                 onClick={() => setEditing(null)}
                 className="px-4 py-2 border border-border rounded-lg hover:bg-muted text-sm"

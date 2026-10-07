@@ -30,7 +30,9 @@ import { reloadUserMapSettings } from '../../store/mapStore'
 import { GlobalTaskIndicator } from './GlobalTaskIndicator'
 import { Toaster } from './Toaster'
 import { DesktopUpdateDialog } from '../DesktopUpdateDialog'
-import { appVersionsApi } from '../../services/api'
+import { DesktopSyncIndicator } from '../DesktopSyncIndicator'
+import { DesktopSessionGuard } from '../DesktopSessionGuard'
+import { appVersionsApi, desktopCloudApi } from '../../services/api'
 import { prefetchPage } from '../../pageLoaders'
 
 // ===== APP 悬浮图标：可拖拽移动、松手吸附最近左右边缘，位置按登录用户持久化 =====
@@ -211,14 +213,16 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     if (!showAppDownload) return
     setVersionLoading(true)
-    appVersionsApi.getLatest()
+    // 桌面端不分发 APK：取服务器最新版本（本机接口会拼出可扫码的绝对下载地址）
+    const loader = desktopMode ? desktopCloudApi.appVersion() : appVersionsApi.getLatest()
+    loader
       .then((res: any) => {
         if (res?.success && res?.data) setLatestVersion(res.data)
         else setLatestVersion(null)
       })
       .catch(() => setLatestVersion(null))
       .finally(() => setVersionLoading(false))
-  }, [showAppDownload])
+  }, [showAppDownload, desktopMode])
 
   const getFullDownloadUrl = (downloadUrl: string) => {
     if (!downloadUrl) return ''
@@ -553,8 +557,7 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
                 )}
               </div>
               {/* 退出登录按钮：收起时仅显示图标（悬停提示），与导航项图标尺寸一致。
-                  桌面版为免登录单用户形态，退出后会自动重新进入，故隐藏 */}
-              {!desktopMode && (
+                  桌面端与网页端一致，退出后回到登录页（可换账号或换运行模式） */}
               <button
                 onClick={handleLogout}
                 title={!sidebarOpen ? t('auth.logout', '退出登录') : undefined}
@@ -581,7 +584,6 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
                   {t('auth.logout', '退出登录')}
                 </span>
               </button>
-              )}
             </div>
           )}
 
@@ -641,6 +643,8 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
       <main className="flex-1 overflow-auto flex flex-col relative z-10">
 
         <GlobalTaskIndicator />
+        <DesktopSyncIndicator />
+        <DesktopSessionGuard />
         {children}
       </main>
 

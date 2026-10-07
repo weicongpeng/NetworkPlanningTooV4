@@ -22,6 +22,8 @@ MODE_SHARED = "shared"
 MODE_OFFLINE = "offline"
 
 _sync_lock = threading.Lock()
+# 同步进行中标记（供前端展示"同步中"动画，读状态接口直接取）
+_sync_running = False
 
 
 class SyncError(Exception):
@@ -124,10 +126,43 @@ def mark_local_deleted(data_id: str) -> None:
     save_state(datasets=datasets, pending_deletes=pending)
 
 
+_pulling_ids: set = set()
+_pulling_lock = threading.Lock()
+
+
+class _PullingGuard:
+    """装包（pull）期间：由同步自己引发的写入不算「本地改动」。
+
+    整包安装是「先删后插」，会触发 delete/insert 两条写入记账；若照常标记 dirty，
+    刚拉下来的数据会被立刻当成待上传，与服务器来回互相覆盖（rev 抖动）。
+    """
+
+    def __init__(self, data_id: str) -> None:
+        self.data_id = data_id
+
+    def __enter__(self) -> None:
+        with _pulling_lock:
+            _pulling_ids.add(self.data_id)
+
+    def __exit__(self, *exc: Any) -> None:
+        with _pulling_lock:
+            _pulling_ids.discard(self.data_id)
+
+
+def _is_pulling(data_id: str) -> bool:
+    with _pulling_lock:
+        return data_id in _pulling_ids
+
+
 def note_change(data_id: str, deleted: bool = False) -> None:
-    """记录本地数据改动（供业务写入路径调用）。非桌面模式下什么都不做。"""
+    """记录本地数据改动（供业务写入路径调用），并尽快触发一次上行同步。
+
+    非桌面模式下什么都不做。同步走防抖：连续写入（例如批量保存图层）只上行一次。
+    """
     if not settings.NPT_DESKTOP or not data_id:
         return
+    if _is_pulling(data_id):
+        return  # 同步装包引起的写入，跳过记账
     try:
         if deleted:
             mark_local_deleted(data_id)
@@ -135,6 +170,41 @@ def note_change(data_id: str, deleted: bool = False) -> None:
             mark_dirty(data_id)
     except Exception:  # noqa: BLE001
         pass  # 旁路记账，绝不能影响业务写入
+    try:
+        schedule_sync()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+# ---------------------------------------------------------------- 同步调度
+
+_sync_timer: Optional[threading.Timer] = None
+_sync_timer_lock = threading.Lock()
+
+
+def _sync_timer_tick() -> None:
+    try:
+        sync_once()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[DesktopSync] 即时同步失败（忽略）：{exc}")
+
+
+def schedule_sync(delay_seconds: Optional[float] = None) -> None:
+    """本地改动后防抖触发一次同步（共享模式才联网，单机/离线直接跳过）。"""
+    global _sync_timer
+    if not settings.NPT_DESKTOP or not is_shared():
+        return
+    delay = float(
+        delay_seconds if delay_seconds is not None
+        else (getattr(settings, "NPT_DESKTOP_SYNC_DEBOUNCE_SECONDS", 3) or 3)
+    )
+    with _sync_timer_lock:
+        if _sync_timer is not None:
+            _sync_timer.cancel()
+        timer = threading.Timer(delay, _sync_timer_tick)
+        timer.daemon = True
+        _sync_timer = timer
+        timer.start()
 
 
 def forget(data_id: str) -> None:
@@ -153,6 +223,11 @@ def forget(data_id: str) -> None:
 
 
 def record_synced(data_id: str, rev: int, sha256: Optional[str] = None) -> None:
+    """记录"该数据集已与服务器一致"。
+
+    必须同时清掉待上行删除：整包安装（pull）内部是「先删后插」，删除会记一次
+    本地删除意图，若不同步清掉，下一轮同步会把刚拉下来的数据集又从服务器删掉。
+    """
     state = load_state()
     datasets = state["datasets"]
     datasets[data_id] = {
@@ -161,7 +236,8 @@ def record_synced(data_id: str, rev: int, sha256: Optional[str] = None) -> None:
         "dirty": False,
         "last_sync_at": datetime.now().isoformat(timespec="seconds"),
     }
-    save_state(datasets=datasets)
+    pending = [d for d in (state.get("pending_deletes") or []) if d != data_id]
+    save_state(datasets=datasets, pending_deletes=pending)
 
 
 # ---------------------------------------------------------------- 上下文
@@ -273,9 +349,10 @@ def _pull(
 
     tmp_zip = cloud.download_package(data_id)
     try:
-        install_package(
-            tmp_zip, user_id=user.id, city=city, operator=operator, username=user.username
-        )
+        with _PullingGuard(data_id):
+            install_package(
+                tmp_zip, user_id=user.id, city=city, operator=operator, username=user.username
+            )
     finally:
         shutil.rmtree(tmp_zip.parent, ignore_errors=True)
 
@@ -308,6 +385,7 @@ def _push(data_id: str, expected_rev: int) -> Dict[str, Any]:
 
 def sync_once() -> Dict[str, Any]:
     """执行一次完整同步。返回统计结果（不抛异常，错误写入 state.last_error）。"""
+    global _sync_running
     if not settings.NPT_DESKTOP:
         return {"skipped": True, "reason": "非桌面模式"}
     if not is_shared():
@@ -315,6 +393,7 @@ def sync_once() -> Dict[str, Any]:
     if not _sync_lock.acquire(blocking=False):
         return {"skipped": True, "reason": "上一次同步尚未结束"}
 
+    _sync_running = True
     summary: Dict[str, Any] = {"pulled": 0, "pushed": 0, "deleted": 0, "conflicts": 0, "errors": []}
     try:
         _require_active_license()
@@ -422,6 +501,7 @@ def sync_once() -> Dict[str, Any]:
         save_state(last_error=str(exc))
         return {"error": str(exc)}
     finally:
+        _sync_running = False
         _sync_lock.release()
 
 
@@ -449,10 +529,12 @@ def status() -> Dict[str, Any]:
     return {
         "desktop": bool(settings.NPT_DESKTOP),
         "run_mode": run_mode(),
+        "syncing": bool(_sync_running),
         "server_url": _server_url(),
         "activated": _license_valid(),
         "last_sync_at": state.get("last_sync_at"),
         "last_error": state.get("last_error"),
+        "last_result": state.get("last_result"),
         "pending_uploads": len(pending),
         "conflicts": state.get("conflicts") or [],
         "synced_datasets": len([d for d in state["datasets"] if not state["datasets"][d].get("dirty")]),
@@ -476,12 +558,20 @@ def _license_valid() -> bool:
 
 # ---------------------------------------------------------------- 后台定时同步
 
-async def sync_loop(interval_minutes: int = 10) -> None:
-    """桌面版共享模式定时同步（失败仅记录日志，不影响本机离线使用）。"""
-    import asyncio
-    import threading
+async def sync_loop(interval_minutes: Optional[int] = None) -> None:
+    """桌面版共享模式定时同步（失败仅记录日志，不影响本机离线使用）。
 
-    await asyncio.sleep(45)  # 启动先让本地服务热身，避免开局抢资源
+    同组其它端（网页端或另一台桌面端）的改动只能靠轮询发现，因此间隔按
+    NPT_DESKTOP_SYNC_INTERVAL_MINUTES（默认 1 分钟）走；每次只拉清单比对
+    修订号，没有变化就不做整包传输。本机自己的改动另走 note_change 的即时上行。
+    """
+    import asyncio
+
+    minutes = int(
+        interval_minutes if interval_minutes is not None
+        else (getattr(settings, "NPT_DESKTOP_SYNC_INTERVAL_MINUTES", 1) or 1)
+    )
+    await asyncio.sleep(15)  # 启动先让本地服务热身，避免开局抢资源
     while True:
         try:
             if is_shared():
@@ -490,4 +580,4 @@ async def sync_loop(interval_minutes: int = 10) -> None:
                     print(f"[DesktopSync] 定时同步失败（忽略）：{result['error']}")
         except Exception as exc:  # noqa: BLE001
             print(f"[DesktopSync] 定时同步异常（忽略）：{exc}")
-        await asyncio.sleep(interval_minutes * 60)
+        await asyncio.sleep(max(1, minutes) * 60)

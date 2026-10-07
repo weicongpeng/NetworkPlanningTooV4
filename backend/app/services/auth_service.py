@@ -283,6 +283,36 @@ class AuthService:
             db.commit()
         return count
 
+    def revoke_other_sessions(
+        self, db: Session, user_id: int, keep_jti: str,
+        client_types: Optional[tuple] = ("pc", "desktop"),
+    ) -> int:
+        """注销该用户的其它会话：网页端与桌面端互踢，以最后登录为准。
+
+        同一账号不允许在网页端与桌面端同时在线：任一端的新登录都会把同账号的
+        其它 pc/desktop 登录踢下线，被踢方下次请求即 401（前端提示并回到登录页）。
+        client_types 限定被踢的会话类型（APP 端登录不参与互踢，保持既有行为）。
+        返回被注销的会话数量。
+        """
+        now = datetime.now(timezone.utc)
+        query = db.query(UserSession).filter(
+            UserSession.user_id == user_id,
+            UserSession.logout_time.is_(None),
+            UserSession.token_jti != keep_jti,
+        )
+        if client_types:
+            query = query.filter(UserSession.client_type.in_(list(client_types)))
+        sessions = query.all()
+        count = 0
+        for s in sessions:
+            self._accumulate_session_duration(db, s, now)
+            s.logout_time = now
+            s.last_activity = now
+            count += 1
+        if count > 0:
+            db.commit()
+        return count
+
     def _accumulate_session_duration(self, db: Session, session: UserSession, end_time: Optional[datetime] = None):
         """增量累加指定会话的使用时长到用户记录（从上次结算点算到 end_time）"""
         if end_time is None:

@@ -177,6 +177,15 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning(f"⚠️ 启动桌面数据同步任务失败: {e}")
 
+    # 桌面模式：登录态守卫（同一账号在别处登录 → 本机自动登出）
+    if settings.NPT_DESKTOP:
+        try:
+            import asyncio
+            from app.api.v1.endpoints.desktop_local import session_guard_loop
+            asyncio.create_task(session_guard_loop())
+        except Exception as e:
+            logger.warning(f"⚠️ 启动桌面登录态守卫失败: {e}")
+
     # 初始化进程池（用于 CPU 密集型任务）
     pool = None
     try:

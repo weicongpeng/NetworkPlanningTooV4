@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import threading
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -74,7 +75,12 @@ class SyncResolveRequest(BaseModel):
     resolution: str = Field(..., description="server=取服务器版本 / local=用本地覆盖")
 
 
-class DesktopGroupRequest(BaseModel):
+class DesktopRegisterRequest(BaseModel):
+    """桌面端注册：与网页端注册字段一致（数据组只能在注册时选择）。"""
+
+    username: str
+    password: str
+    confirm_password: str
     city: str
     operator: str
 
@@ -149,6 +155,11 @@ def _issue_local_token(db: Session, user, idle_logout_days: Optional[int] = None
     )
     # 写会话记录 → 空闲超时（单机模式为管理员设定的天数）才会要求重新登录
     auth_service.record_session(db, user.id, jti, "127.0.0.1", "pc")
+    # 记住本机会话 jti：账号在别处登录时可在本地直接注销这个会话
+    try:
+        cloud.save_state(local_jti=jti, desktop_username=user.username)
+    except Exception:  # noqa: BLE001
+        pass
     return token
 
 
@@ -227,6 +238,119 @@ def _sync_service():
     from app.services import desktop_sync_service as sync
 
     return sync
+
+
+def _force_local_logout(reason: str) -> None:
+    """账号在别处登录 → 注销本机会话并记账（前端下次请求即 401）。"""
+    state = cloud.load_state()
+    jti = (state.get("local_jti") or "").strip()
+    if jti:
+        from app.core.database import SessionLocal
+
+        db = SessionLocal()
+        try:
+            auth_service.end_session(db, jti)
+        except Exception:  # noqa: BLE001
+            pass
+        finally:
+            db.close()
+    cloud.save_state(
+        session_jti=None, local_jti=None, kicked=True,
+        kicked_reason=reason or "该账号已在其它设备登录，本机已退出登录",
+    )
+    print(f"[DesktopAuth] {reason or '该账号已在其它设备登录'}，本机已退出登录")
+
+
+def check_session_once() -> Dict[str, Any]:
+    """向服务器确认本机登录是否仍是该账号的最后一次登录。"""
+    state = cloud.load_state()
+    jti = (state.get("session_jti") or "").strip()
+    if not jti:
+        return {"valid": True, "skipped": True}
+    try:
+        result = cloud.session_check(jti)
+    except Exception as exc:  # noqa: BLE001
+        return {"valid": True, "offline": True, "error": str(exc)}
+    if result.get("valid") is False:
+        _force_local_logout(str(result.get("reason") or ""))
+        return {"valid": False, "reason": result.get("reason")}
+    return {"valid": True}
+
+
+async def session_guard_loop(interval_seconds: int = 60) -> None:
+    """周期性校验登录态：同一账号在网页端/另一台桌面端登录 → 本机自动登出。"""
+    import asyncio
+
+    await asyncio.sleep(30)  # 启动先让本地服务热身
+    while True:
+        try:
+            await asyncio.to_thread(check_session_once)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[DesktopAuth] 登录态校验异常（忽略）：{exc}")
+        await asyncio.sleep(max(15, interval_seconds))
+
+
+def _start_shared_sync() -> None:
+    """共享模式登录成功即同步一次同组数据。
+
+    同步可能要下载多个数据集，放后台线程跑，失败只写状态不影响本机使用。
+    """
+    from app.services.desktop_sync_service import MODE_SHARED, set_run_mode
+
+    set_run_mode(MODE_SHARED)
+    threading.Thread(target=_run_sync_once, name="desktop-login-sync", daemon=True).start()
+
+
+def _run_sync_once() -> None:
+    try:
+        _sync_service().sync_once()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[DesktopSync] 登录同步失败（忽略）：{exc}")
+
+
+@router.get("/app-version")
+async def desktop_app_version() -> Dict[str, Any]:
+    """手机 APP 最新版本（公开）：桌面端不分发 APK，直接取服务器的最新版。
+
+    相对下载路径拼成服务器绝对地址，客户端才能扫码/下载（本机 127.0.0.1 不可达）。
+    """
+    from starlette.concurrency import run_in_threadpool
+
+    _require_desktop()
+    try:
+        data = await run_in_threadpool(cloud.app_version)
+    except cloud.CloudError as exc:
+        _raise_cloud_error(exc)
+    if not data:
+        return {"success": True, "data": None}
+    download_url = str(data.get("download_url") or "")
+    if download_url and not download_url.startswith("http"):
+        download_url = f"{cloud.server_url()}{download_url}"
+    return {"success": True, "data": {**data, "download_url": download_url}}
+
+
+@router.get("/session-status")
+async def session_status(
+    current_user: User = Depends(get_current_user),
+    _: None = Depends(_require_desktop),
+) -> Dict[str, Any]:
+    """本机登录是否仍有效（同一账号被其它端登录时 valid=False）。
+
+    前端登录后周期轮询：失效即清理本地凭据并回到登录页。
+    """
+    state = cloud.load_state()
+    if state.get("kicked"):
+        return {
+            "success": True,
+            "data": {
+                "valid": False,
+                "reason": state.get("kicked_reason") or "该账号已在其它设备登录，本机已退出登录",
+            },
+        }
+    from starlette.concurrency import run_in_threadpool
+
+    result = await run_in_threadpool(check_session_once)
+    return {"success": True, "data": result}
 
 
 @router.get("/sync-status")
@@ -311,54 +435,70 @@ async def sync_resolve(
     return {"success": True, "data": {**result, **_sync_service().status()}}
 
 
-@router.put("/group")
-async def update_desktop_group(
-    payload: DesktopGroupRequest,
-    current_user: User = Depends(get_current_user),
-    _: None = Depends(_require_desktop),
-) -> Dict[str, Any]:
-    """桌面端自选数据组（地市+运营商）：决定共享模式下能共享到哪一组的数据。
+@router.get("/register-options")
+async def desktop_register_options() -> Dict[str, Any]:
+    """注册选项（公开）：地市预设与运营商取自服务器，桌面端注册与网页端一致。"""
+    from app.services.data_group import OPERATORS
 
-    服务器上若已为该授权锁定组，下次同步会按服务器的值纠正本机。
-    单机模式数据本机私有，不设组共享。
-    """
-    if current_user.desktop_run_mode == MODE_STANDALONE:
-        raise HTTPException(status_code=403, detail="单机模式不参与数据组共享")
-    from app.core.database import SessionLocal
-    from app.models.database import User as UserModel
-    from app.services.data_group import OPERATORS, migrate_group_data, validate_group
-
-    city = (payload.city or "").strip()
-    operator = (payload.operator or "").strip()
-    error = validate_group(city, operator)
-    if error:
-        raise HTTPException(status_code=400, detail=_gbk_safe(error))
-
-    db = SessionLocal()
+    _require_desktop()
     try:
-        row = db.query(UserModel).filter(UserModel.id == current_user.id).first()
-        if row is None:
-            raise HTTPException(status_code=404, detail="本机账号不存在")
-        old_city, old_operator = row.city, row.operator
-        if (old_city, old_operator) == (city, operator):
-            return {"success": True, "message": "数据组未变化", "data": {"city": city, "operator": operator}}
-        row.city = city
-        row.operator = operator
-        db.commit()
-        # 与网页端一致：改组要连带迁移存量数据，否则老数据会"消失"
-        if old_city and old_operator:
-            migrate_group_data(
-                db, user_id=row.id, username=row.username,
-                old_city=old_city, old_operator=old_operator,
-                new_city=city, new_operator=operator, scope="user",
-            )
-    finally:
-        db.close()
+        from starlette.concurrency import run_in_threadpool
+
+        data = await run_in_threadpool(cloud.register_options)
+    except cloud.CloudError as exc:
+        _raise_cloud_error(exc)
     return {
         "success": True,
-        "message": f"已切换到 {city} / {operator}，存量数据一并迁移",
-        "data": {"city": city, "operator": operator, "operators": list(OPERATORS)},
+        "data": {
+            "cities": data.get("cities") or [],
+            "operators": data.get("operators") or list(OPERATORS),
+        },
     }
+
+
+@router.post("/register")
+async def desktop_register(
+    payload: DesktopRegisterRequest,
+    db: Session = Depends(get_db),
+    _: None = Depends(_require_desktop),
+) -> Dict[str, Any]:
+    """桌面端注册：与网页端同一套注册规则（账号创建在服务器上）。
+
+    注册成功后自动以共享模式登录并同步同组数据；数据组只能在注册时选择，
+    之后只能由服务器管理员修改。
+    """
+    username = (payload.username or "").strip()
+    password = payload.password or ""
+    city = (payload.city or "").strip()
+    operator = (payload.operator or "").strip()
+    if len(username) < 3:
+        raise HTTPException(status_code=400, detail="用户名长度至少3位")
+    if len(password) < 6:
+        raise HTTPException(status_code=400, detail="密码长度至少6位")
+    if password != (payload.confirm_password or ""):
+        raise HTTPException(status_code=400, detail="两次输入的密码不一致")
+    if not city or not operator:
+        raise HTTPException(status_code=400, detail="请选择地市与运营商")
+
+    try:
+        await _register_via_server(username, password, city, operator)
+    except cloud.CloudError as exc:
+        _raise_cloud_error(exc)
+
+    # 注册成功即共享模式登录（注册时已选定数据组），登录会触发同组数据同步
+    return await desktop_login(
+        DesktopLoginRequest(username=username, password=password, mode="shared"), db
+    )
+
+
+async def _register_via_server(
+    username: str, password: str, city: str, operator: str
+) -> None:
+    from starlette.concurrency import run_in_threadpool
+
+    await run_in_threadpool(
+        cloud.register, username, password, city, operator
+    )
 
 
 @router.post("/login")
@@ -419,13 +559,19 @@ async def desktop_login(
     incoming = data.get("user") or {}
     user = _mirror_local_user(db, incoming, mode, password)
     info = license_service.desktop_license_info() or (data.get("license") or {})
-    # 单机模式不参与服务器数据同步；共享模式沿用既有同步开关
+    _remember_sync_user(username)
+    # 记住服务器会话标识：后续周期性校验"是否仍是最后一次登录"
+    server_jti = (data.get("session_jti") or "").strip()
+    cloud.save_state(session_jti=server_jti or None, kicked=False, kicked_reason=None)
     if mode == MODE_STANDALONE:
+        # 单机模式数据本机私有，不参与服务器数据同步
         from app.services.desktop_sync_service import MODE_OFFLINE, set_run_mode
 
         set_run_mode(MODE_OFFLINE)
         _ensure_local_group(db, user, info)
-    _remember_sync_user(username)
+    else:
+        # 共享模式：登录即开始同步同组数据
+        _start_shared_sync()
 
     if offline_used:
         _note_offline_login()
@@ -440,6 +586,7 @@ async def desktop_login(
             "user": user.to_dict(),
             "mode": mode,
             "offline": offline_used,
+            "sync_started": mode != MODE_STANDALONE,
             "idle_logout_days": data.get("idle_logout_days") or 2,
             "license": info,
         },

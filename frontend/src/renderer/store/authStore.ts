@@ -21,6 +21,8 @@ interface AuthState {
   desktopRunMode: DesktopRunMode
   /** 单机模式已提交授权申请、等待管理员批准的账号 */
   desktopPendingUsername: string | null
+  /** 桌面端最后一次登录的账号与运行模式（持久化的只是展示用信息，不含密码） */
+  lastDesktopLogin: { username: string; mode: 'shared' | 'standalone' } | null
 
   login: (username: string, password: string, desktopMode?: 'shared' | 'standalone') => Promise<string | null>
   register: (username: string, password: string, confirmPassword: string, city: string, operator: string, equipmentVendor?: string) => Promise<void>
@@ -57,6 +59,7 @@ export const useAuthStore = create<AuthState>()(
       desktopError: null,
       desktopRunMode: null,
       desktopPendingUsername: null,
+      lastDesktopLogin: null,
 
       login: async (username: string, password: string, desktopRunMode?: 'shared' | 'standalone') => {
         clearUserDataCaches()
@@ -80,6 +83,10 @@ export const useAuthStore = create<AuthState>()(
               isLoading: false,
               desktopRunMode: data.mode || desktopRunMode,
               desktopPendingUsername: null,
+              lastDesktopLogin: {
+                username,
+                mode: (data.mode || desktopRunMode || 'shared') as 'shared' | 'standalone',
+              },
             })
             return null
           }
@@ -104,26 +111,51 @@ export const useAuthStore = create<AuthState>()(
 
       setDesktopPendingUsername: (username: string | null) => set({ desktopPendingUsername: username }),
 
-      register: async (username: string, password: string, confirmPassword: string, city: string, operator: string) => {
-        clearUserDataCaches()
-        set({ isLoading: true })
-        try {
-          const result = await authApi.register({ username, password, confirm_password: confirmPassword, city, operator })
-          if (result.success && result.data) {
-            set({
-              token: result.data.access_token,
-              user: result.data.user,
-              isAuthenticated: true,
-              isLoading: false,
-            })
-          } else {
-            throw new Error((result as any).message || '注册失败')
-          }
-        } catch (error: any) {
-          set({ isLoading: false })
-          throw error
+  register: async (username: string, password: string, confirmPassword: string, city: string, operator: string) => {
+    clearUserDataCaches()
+    set({ isLoading: true })
+    try {
+      // 桌面端：注册请求经本机后端代理到服务器（账号建在服务器上，注册即登录）
+      if (get().desktopMode) {
+        const res: any = await desktopLoginApi.register({
+          username,
+          password,
+          confirm_password: confirmPassword,
+          city,
+          operator,
+        })
+        const data = res?.data || {}
+        if (!data.access_token) {
+          throw new Error(res?.message || '注册失败')
         }
-      },
+        set({
+          token: data.access_token,
+          user: data.user,
+          isAuthenticated: true,
+          isLoading: false,
+          desktopRunMode: data.mode || 'shared',
+          desktopPendingUsername: null,
+          lastDesktopLogin: { username, mode: 'shared' },
+        })
+        return
+      }
+
+      const result = await authApi.register({ username, password, confirm_password: confirmPassword, city, operator })
+      if (result.success && result.data) {
+        set({
+          token: result.data.access_token,
+          user: result.data.user,
+          isAuthenticated: true,
+          isLoading: false,
+        })
+      } else {
+        throw new Error((result as any).message || '注册失败')
+      }
+    } catch (error: any) {
+      set({ isLoading: false })
+      throw error
+    }
+  },
 
       logout: async () => {
         try {
@@ -228,6 +260,9 @@ export const useAuthStore = create<AuthState>()(
         user: state.user,
         isAuthenticated: state.isAuthenticated,
         desktopRunMode: state.desktopRunMode,
+        // 桌面端记住最后一次登录的账号与模式：未超过「无操作 X 天退出」时凭
+        // 持久化的令牌自动登录（这里不存密码）；要换模式则退出后重新登录
+        lastDesktopLogin: state.lastDesktopLogin,
       }),
       onRehydrateStorage: () => (state) => {
         if (state && state.token) {

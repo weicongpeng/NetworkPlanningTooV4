@@ -184,6 +184,53 @@ def test_standalone_login_counts_logins(login_env):
     assert third.json()["data"]["login_count"] == 6
 
 
+def test_login_issues_session_and_kicks_previous_login(login_env):
+    """同一账号以最后登录为准：新登录会注销该账号其它 pc/desktop 会话。"""
+    first = _login(login_env.client, "alice", "alice-pwd", mode="shared")
+    assert first.status_code == 200, first.text
+    jti_first = first.json()["data"].get("session_jti")
+    assert jti_first
+
+    # 本机（或其它端）拿这个会话标识校验 → 有效
+    license_file = first.json()["data"]["license_file"]
+    check = login_env.client.post(
+        "/api/v1/desktop-cloud/auth/session-check",
+        json={"license_file": license_file, "machine_code": MACHINE_A, "session_jti": jti_first},
+    )
+    assert check.status_code == 200, check.text
+    assert check.json()["data"]["valid"] is True
+
+    # 同一账号再次登录（另一台桌面端/网页端）→ 上一次登录被踢下线
+    second = _login(login_env.client, "alice", "alice-pwd", mode="shared")
+    assert second.json()["data"]["session_jti"] != jti_first
+
+    kicked = login_env.client.post(
+        "/api/v1/desktop-cloud/auth/session-check",
+        json={"license_file": license_file, "machine_code": MACHINE_A, "session_jti": jti_first},
+    )
+    assert kicked.json()["data"]["valid"] is False
+
+
+def test_session_check_rejects_unknown_or_invalid_license(login_env):
+    resp = login_env.client.post(
+        "/api/v1/desktop-cloud/auth/session-check",
+        json={"license_file": "bad", "machine_code": MACHINE_A, "session_jti": "x"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["data"]["valid"] is False
+
+    ok = _login(login_env.client, "alice", "alice-pwd", mode="shared")
+    resp2 = login_env.client.post(
+        "/api/v1/desktop-cloud/auth/session-check",
+        json={
+            "license_file": ok.json()["data"]["license_file"],
+            "machine_code": MACHINE_A,
+            "session_jti": "",
+        },
+    )
+    assert resp2.json()["data"]["valid"] is False
+
+
 def test_standalone_default_idle_logout_days(login_env):
     """无操作退出登录时长默认 2 天，随许可下发到本机。"""
     first = _login(login_env.client, "alice", "alice-pwd", mode="standalone")

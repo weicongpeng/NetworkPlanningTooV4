@@ -4,6 +4,7 @@ import { useDataStore } from '../store/dataStore'
 import { dataApi, assistantApi, getStoredAuthToken } from '../services/api'
 import type { CellRow, DataItem } from '@shared/types'
 import { DATA_REFRESH_EVENT, triggerDataRefresh } from '../store/dataStore'
+import { DESKTOP_SYNCED_EVENT } from '../store/desktopSyncStore'
 import { mapDataService } from '../services/mapDataService'
 import { indexedDBService } from '../services/indexedDBService'
 import { CellParamsTable } from '../components/DataTable/CellParamsTable'
@@ -150,9 +151,16 @@ export function DataPage() {
     }
 
     window.addEventListener(DATA_REFRESH_EVENT, handleDataRefresh)
+    // 桌面端共享模式同步落地后刷新：避免正在用的数据仍是旧版本
+    const handleDesktopSynced = () => {
+      console.log('[DataPage] 桌面端同步完成，正在刷新列表...')
+      fetchList(1, 50, true)
+    }
+    window.addEventListener(DESKTOP_SYNCED_EVENT, handleDesktopSynced)
 
     return () => {
       window.removeEventListener(DATA_REFRESH_EVENT, handleDataRefresh)
+      window.removeEventListener(DESKTOP_SYNCED_EVENT, handleDesktopSynced)
     }
   }, [])
 

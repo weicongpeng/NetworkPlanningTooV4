@@ -22,6 +22,13 @@ def _user_to_response(user: User) -> dict:
     return user.to_dict()
 
 
+# 管理员默认享有全部功能权限：编辑页权限项对管理员不可操作，后端一并兜底置真
+PERMISSION_FIELDS = (
+    "can_data_import", "can_data_delete", "can_data_update",
+    "can_cell_entry", "can_cell_query_update", "can_assistant",
+)
+
+
 @router.get("/")
 async def list_users(
     page: int = Query(default=1, ge=1),
@@ -83,6 +90,11 @@ async def create_user(
     )
     if error:
         raise HTTPException(status_code=400, detail=error)
+    if user.is_admin:
+        for field in PERMISSION_FIELDS:
+            setattr(user, field, True)
+        db.commit()
+        db.refresh(user)
     return {"success": True, "data": user.to_dict(), "message": "用户创建成功"}
 
 
@@ -165,6 +177,11 @@ async def update_user(
     # 不允许管理员禁用自己
     if updates.get("is_active") == False and user_id == admin_user.id:
         raise HTTPException(status_code=400, detail="不能禁用自己的账号")
+
+    # 管理员享有全部权限：权限位一律置真（编辑页对管理员不可操作，这里兜底）
+    will_be_admin = data.is_admin if data.is_admin is not None else target_user.is_admin
+    if will_be_admin:
+        updates.update({field: True for field in PERMISSION_FIELDS})
 
     user = auth_service.update_user(db, user_id, updates)
     if not user:

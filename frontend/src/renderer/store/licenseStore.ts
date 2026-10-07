@@ -12,6 +12,7 @@ interface LicenseState {
   setFromUser: (user: {
     is_active: boolean
     license_expiry: string | null
+    is_admin?: boolean
   }) => void
 
   /** 设置加载状态 */
@@ -35,6 +36,18 @@ export const useLicenseStore = create<LicenseState>()(
             expiryDate: null,
             remainingDays: 0,
             errorMessage: '账号已被禁用',
+          })
+          return
+        }
+
+        // 管理员默认享有全部功能且无需授权激活：不受全局授权期限限制
+        if (user.is_admin) {
+          set({
+            isAuthorized: true,
+            isLoading: false,
+            expiryDate: user.license_expiry,
+            remainingDays: -1,
+            errorMessage: null,
           })
           return
         }

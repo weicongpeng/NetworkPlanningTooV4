@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
 import { useTranslation } from 'react-i18next'
 import { X, LogIn, UserPlus, Loader2 } from 'lucide-react'
-import { authApi } from '../services/api'
+import { authApi, desktopLoginApi } from '../services/api'
 import { useAuthStore } from '../store/authStore'
 import { getLastRoute } from '../utils/lastRoute'
 import type { RegisterOptions } from '@shared/types'
@@ -20,13 +20,19 @@ export function LoginModal({ isOpen, forceChangePassword = false, onClose }: Log
   const { t } = useTranslation()
   const { login, register, changePassword } = useAuthStore()
   const desktopMode = useAuthStore((s) => s.desktopMode)
+  // 桌面端记住上次登录的账号与运行模式（切换模式需退出后重新登录）
+  const lastDesktopLogin = useAuthStore((s) => s.lastDesktopLogin)
   const navigate = useNavigate()
   const location = useLocation()
 
   const [mode, setMode] = useState<'login' | 'register'>('login')
   // 桌面端运行模式：共享模式（与网页端一致）/ 单机模式（需管理员单独授权）
-  const [desktopRunMode, setDesktopRunMode] = useState<'shared' | 'standalone'>('shared')
-  const [username, setUsername] = useState('')
+  const [desktopRunMode, setDesktopRunMode] = useState<'shared' | 'standalone'>(
+    desktopMode && lastDesktopLogin ? lastDesktopLogin.mode : 'shared'
+  )
+  const [username, setUsername] = useState(
+    desktopMode && lastDesktopLogin ? lastDesktopLogin.username : ''
+  )
   const [password, setPassword] = useState('')
   const [confirmPassword, setConfirmPassword] = useState('')
   const [city, setCity] = useState('')
@@ -38,11 +44,13 @@ export function LoginModal({ isOpen, forceChangePassword = false, onClose }: Log
   const [options, setOptions] = useState<RegisterOptions | null>(null)
   const [optionsError, setOptionsError] = useState(false)
 
+  // 注册选项：桌面端取服务器（经本机后端代理）的预设，网页端直接取本机接口
   useEffect(() => {
     if (!isOpen) return
     let cancelled = false
-    authApi.getOptions()
-      .then(res => {
+    const loader = desktopMode ? desktopLoginApi.options() : authApi.getOptions()
+    loader
+      .then((res: any) => {
         if (cancelled) return
         if (res.success && res.data) {
           setOptions(res.data)
@@ -52,7 +60,7 @@ export function LoginModal({ isOpen, forceChangePassword = false, onClose }: Log
       })
       .catch(() => { if (!cancelled) setOptionsError(true) })
     return () => { cancelled = true }
-  }, [isOpen])
+  }, [isOpen, desktopMode])
 
   if (!isOpen) return null
 
@@ -354,8 +362,8 @@ export function LoginModal({ isOpen, forceChangePassword = false, onClose }: Log
           </button>
         </form>
 
-        {/* Switch mode（桌面端没有注册入口，账号在网页端创建） */}
-        {!forceChangePassword && !desktopMode && (
+        {/* Switch mode：桌面端同样可以注册（账号创建在服务器上） */}
+        {!forceChangePassword && (
           <div className="mt-5 text-center">
             <span className="text-sm text-muted-foreground">
               {mode === 'login' ? t('auth.noAccount', '还没有账号？') : t('auth.hasAccount', '已有账号？')}
