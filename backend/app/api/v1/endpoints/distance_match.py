@@ -10,14 +10,22 @@ from fastapi.responses import FileResponse
 from app.core.config import settings
 from app.core.security import require_data_import
 from app.services.distance_match_service import (
+    OUTPUT_COLUMNS,
     build_output_excel,
     build_output_filename,
+    build_output_rows,
     load_full_sites_from_data_sheet,
     match_sites,
     read_arbitrary_sheet,
     read_data_sheets,
     read_match_file,
     validate_all,
+)
+from app.services.result_rows_store import (
+    DEFAULT_PAGE_SIZE,
+    ResultRowsError,
+    read_page,
+    write_rows,
 )
 
 router = APIRouter()
@@ -167,8 +175,20 @@ async def match(
         filename = build_output_filename()
         out_path = settings.OUTPUT_DIR / filename
         await run_in_threadpool(build_output_excel, str(out_path), match_df, results, unmatched, max_distance_km)
+        # 结果行另存一份，供页内分页预览（懒加载列表）；与 Excel 共用同一份行序
+        result_id = Path(filename).stem
+        rows = await run_in_threadpool(build_output_rows, match_df, results, unmatched, max_distance_km)
+        await run_in_threadpool(write_rows, result_id, OUTPUT_COLUMNS, rows)
 
-        return {"success": True, "data": {"filename": filename, "download_url": f"/static/{filename}"}}
+        return {
+            "success": True,
+            "data": {
+                "filename": filename,
+                "result_id": result_id,
+                "download_url": f"/static/{filename}",
+                "total": len(rows),
+            },
+        }
     except HTTPException:
         raise
     except ValueError as e:
@@ -180,6 +200,39 @@ async def match(
     finally:
         if is_tmp and tmp:
             Path(tmp).unlink(missing_ok=True)
+
+
+@router.post("/preview")
+async def preview(
+    result_id: str = Form(...),
+    offset: int = Form(0),
+    limit: int = Form(DEFAULT_PAGE_SIZE),
+    current_user=Depends(require_data_import),
+):
+    """分页读取匹配结果行（页内列表懒加载）。
+
+    结果行在 /match 时与 Excel 一同落盘（同一份行序），这里按 offset/limit 取一页，
+    避免把多对多的匹配结果整表塞进响应。
+    """
+    try:
+        columns, total, rows = await run_in_threadpool(read_page, result_id, offset, limit)
+    except ResultRowsError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"读取结果失败: {str(e)}")
+
+    return {
+        "success": True,
+        "data": {
+            "columns": columns,
+            "total": total,
+            "offset": max(0, offset),
+            "limit": limit,
+            "rows": rows,
+        },
+    }
 
 
 @router.get("/template")

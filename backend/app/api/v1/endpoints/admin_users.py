@@ -19,7 +19,7 @@ router = APIRouter(dependencies=[Depends(reject_desktop_mode)])
 
 
 def _user_to_response(user: User) -> dict:
-    return user.to_dict()
+    return auth_service.user_payload(user)
 
 
 # 管理员默认享有全部功能权限：编辑页权限项对管理员不可操作，后端一并兜底置真
@@ -40,12 +40,15 @@ async def list_users(
 ):
     """获取用户列表（在线用户优先置顶，在线统计为全量）"""
     users, total, online_stats = auth_service.get_all_users(db, page, page_size, search, is_active)
+    # 全局授权期限只查一次：列表里逐用户查库会变成 N+1
+    global_expiry = auth_service._global_license_expiry()
     user_list = []
     for u in users:
-        user_dict = u.to_dict()
+        user_dict = auth_service.user_payload(u, global_expiry)
         user_dict["is_online"] = auth_service.is_user_online(db, u.id)
         user_dict["is_online_pc"] = auth_service.is_user_online_by_client_type(db, u.id, 'pc')
         user_dict["is_online_app"] = auth_service.is_user_online_by_client_type(db, u.id, 'app')
+        user_dict["is_online_desktop"] = auth_service.is_user_online_by_client_type(db, u.id, 'desktop')
         user_list.append(user_dict)
     return {
         "success": True,
@@ -55,6 +58,7 @@ async def list_users(
             "online_users": online_stats["online"],
             "online_pc": online_stats["online_pc"],
             "online_app": online_stats["online_app"],
+            "online_desktop": online_stats["online_desktop"],
         },
     }
 

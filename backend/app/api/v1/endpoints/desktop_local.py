@@ -547,7 +547,7 @@ async def desktop_login(
         data = {
             "result": "ok",
             "mode": MODE_STANDALONE,
-            "user": user.to_dict(),
+            "user": auth_service.user_payload(user),
             "license": info,
             "idle_logout_days": info.get("idle_logout_days") or 2,
             "offline": True,
@@ -583,7 +583,7 @@ async def desktop_login(
             "token": token,
             "access_token": token,
             "token_type": "bearer",
-            "user": user.to_dict(),
+            "user": auth_service.user_payload(user),
             "mode": mode,
             "offline": offline_used,
             "sync_started": mode != MODE_STANDALONE,
@@ -624,7 +624,7 @@ async def desktop_auth_poll(
         "success": True,
         "data": {
             "token": _issue_local_token(db, user, data.get("idle_logout_days")),
-            "user": user.to_dict(),
+            "user": auth_service.user_payload(user),
             "mode": MODE_STANDALONE,
             "idle_logout_days": data.get("idle_logout_days") or 2,
         },
@@ -805,3 +805,27 @@ async def desktop_exit(
     if not desktop_bridge.request_exit():
         raise HTTPException(status_code=403, detail="当前运行环境不支持退出（非桌面壳）")
     return {"success": True, "message": "正在退出"}
+
+
+class WindowTitleRequest(BaseModel):
+    title: str = Field(..., description="窗口标题（应用名 + 运行模式 + 同步状态）")
+
+
+@router.post("/window-title")
+async def desktop_window_title(
+    payload: WindowTitleRequest,
+    current_user: User = Depends(get_current_user),
+    _: None = Depends(_require_desktop),
+) -> Dict[str, Any]:
+    """把「运行模式 + 实时同步状态」写到桌面窗口标题栏（web/服务器模式返回 403）。
+
+    前端在运行模式或同步状态变化时调用；标题串由前端按当前语言拼好，后端只做转发。
+    """
+    from app import desktop_bridge
+
+    title = (payload.title or "").strip()[:200]
+    if not title:
+        raise HTTPException(status_code=400, detail="标题不能为空")
+    if not desktop_bridge.set_window_title(title):
+        raise HTTPException(status_code=403, detail="当前运行环境不支持修改窗口标题（非桌面壳）")
+    return {"success": True, "data": {"title": title}}

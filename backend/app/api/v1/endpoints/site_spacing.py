@@ -14,7 +14,14 @@ from app.services.distance_match_service import (
     read_arbitrary_sheet,
     read_data_sheets,
 )
+from app.services.result_rows_store import (
+    DEFAULT_PAGE_SIZE,
+    ResultRowsError,
+    read_page,
+    write_rows,
+)
 from app.services.site_spacing_service import (
+    OUTPUT_COLUMNS,
     build_output_excel,
     build_output_filename,
     compute_avg_spacing,
@@ -180,11 +187,15 @@ async def calculate(
         filename = build_output_filename()
         out_path = settings.OUTPUT_DIR / filename
         await run_in_threadpool(build_output_excel, str(out_path), results, stats)
+        # 结果行另存一份，供页内分页预览（懒加载列表）
+        result_id = Path(filename).stem
+        await run_in_threadpool(write_rows, result_id, OUTPUT_COLUMNS, results)
 
         return {
             "success": True,
             "data": {
                 "filename": filename,
+                "result_id": result_id,
                 "download_url": f"/static/{filename}",
                 "total": stats["total"],
                 "counted": stats["counted"],
@@ -203,6 +214,39 @@ async def calculate(
     finally:
         if is_tmp and tmp:
             Path(tmp).unlink(missing_ok=True)
+
+
+@router.post("/preview")
+async def preview(
+    result_id: str = Form(...),
+    offset: int = Form(0),
+    limit: int = Form(DEFAULT_PAGE_SIZE),
+    current_user=Depends(require_data_import),
+):
+    """分页读取站间距结果行（页内列表懒加载）。
+
+    结果行在 /calculate 时与 Excel 一同落盘，这里按 offset/limit 取一页，
+    避免把可能上万行的结果整表塞进响应。
+    """
+    try:
+        columns, total, rows = await run_in_threadpool(read_page, result_id, offset, limit)
+    except ResultRowsError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"读取结果失败: {str(e)}")
+
+    return {
+        "success": True,
+        "data": {
+            "columns": columns,
+            "total": total,
+            "offset": max(0, offset),
+            "limit": limit,
+            "rows": rows,
+        },
+    }
 
 
 @router.get("/template")

@@ -134,6 +134,44 @@ def test_session_status_reports_kicked(desktop_local):
     assert "其它设备" in (resp2.json()["data"].get("reason") or "")
 
 
+def test_window_title_forwarded_to_shell(desktop_local):
+    """窗口标题由前端拼好、后端只转发给桌面壳（用于标注运行模式 + 实时同步状态）。"""
+    from app import desktop_bridge
+
+    seen: list[str] = []
+    desktop_bridge.set_title_handler(seen.append)
+    try:
+        resp = desktop_local.client.post(
+            "/api/v1/desktop/window-title", json={"title": "网优引擎 - 共享模式 · 已同步 11:28"}
+        )
+        assert resp.status_code == 200, resp.text
+        assert seen == ["网优引擎 - 共享模式 · 已同步 11:28"]
+    finally:
+        desktop_bridge.set_title_handler(None)
+
+
+def test_window_title_without_shell_returns_403(desktop_local):
+    """非桌面壳（未注入回调）必须 403，网页端据此静默忽略。"""
+    from app import desktop_bridge
+
+    desktop_bridge.set_title_handler(None)
+    resp = desktop_local.client.post(
+        "/api/v1/desktop/window-title", json={"title": "网优引擎 - 单机模式"}
+    )
+    assert resp.status_code == 403
+
+
+def test_window_title_rejects_blank(desktop_local):
+    from app import desktop_bridge
+
+    desktop_bridge.set_title_handler(lambda _t: None)
+    try:
+        resp = desktop_local.client.post("/api/v1/desktop/window-title", json={"title": "   "})
+        assert resp.status_code == 400
+    finally:
+        desktop_bridge.set_title_handler(None)
+
+
 def test_activate_error_maps_status(desktop_local):
     def boom(code, hostname=None):
         raise desktop_local.cloud.CloudError(403, "该授权已被禁用，请联系管理员")

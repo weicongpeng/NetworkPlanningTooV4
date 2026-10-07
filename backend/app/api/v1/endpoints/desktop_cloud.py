@@ -14,6 +14,7 @@ import secrets
 import time
 import urllib.parse
 from collections import defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -205,6 +206,9 @@ async def desktop_session_check(
 
     客户端周期性调用：一旦失效就本机登出，实现"网页端/桌面端不能同时在线"。
     网络不可达时返回 valid=True（不因断网把人踢下线）。
+
+    这也是桌面端的心跳（默认每 60s 一次）：必须刷新 last_activity，否则用户
+    空闲超过 5 分钟后会被「用户管理」的在线判定（5 分钟活跃窗口）误报为离线。
     """
     from app.models.database import UserSession
 
@@ -228,6 +232,11 @@ async def desktop_session_check(
         }
     if record.user_id and session.user_id != record.user_id:
         return {"success": True, "data": {"valid": False, "reason": "会话与授权不匹配，请重新登录"}}
+
+    # 心跳即活跃：刷新会话时间，供「用户管理」的桌面端在线状态判定
+    session.last_activity = datetime.now(timezone.utc)
+    db.commit()
+
     return {"success": True, "data": {"valid": True}}
 
 

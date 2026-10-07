@@ -319,6 +319,39 @@ def _format_unmatched_note(max_distance_km: float) -> str:
     return f"{max_distance_km}km内无站点匹配"
 
 
+def build_output_rows(
+    match_df: pd.DataFrame,
+    results: List[tuple],
+    unmatched: List[str],
+    max_distance_km: float,
+) -> List[list]:
+    """按 match_df 行序交错排列输出行（8 列）。
+
+    Excel 导出与页内分页预览共用同一份行序，避免两处实现漂移。
+    匹配站点全部保留：每行先输出命中结果，无命中则输出备注行
+    （备注显示门限实际值，如 '1.0km内无站点匹配'）。
+    """
+    note = _format_unmatched_note(max_distance_km)
+    unmatched_set = set(unmatched)
+    out: List[list] = []
+    r_idx = 0  # results 中顺序指针（match_sites 按 match_df 行序产出，同行的命中连续）
+    for _, row in match_df.iterrows():
+        cell = row["CELL"]
+        # 输出该匹配站点的全部命中行（results 中连续属于它的行）
+        while r_idx < len(results) and results[r_idx][0] == cell:
+            out.append(list(results[r_idx]))
+            r_idx += 1
+        # 若无任何命中 → 备注行
+        if cell in unmatched_set:
+            out.append([cell, row["LON"], row["LAT"], None, None, None, None, note])
+
+    # 防御：results 末尾剩余（正常不会发生，保留以确保完整性）
+    while r_idx < len(results):
+        out.append(list(results[r_idx]))
+        r_idx += 1
+    return out
+
+
 def build_output_excel(
     out_path: str,
     match_df: pd.DataFrame,
@@ -326,32 +359,13 @@ def build_output_excel(
     unmatched: List[str],
     max_distance_km: float,
 ) -> str:
-    """生成输出 xlsx（8 列），返回 out_path。匹配站点全部保留，无命中行备注
-    显示门限实际值（如 '1.0km内无站点匹配'）。
-    输出按 match_df 行序交错排列：每行先输出命中结果，无命中则输出备注行。"""
+    """生成输出 xlsx（8 列），返回 out_path。"""
     wb = Workbook()
     ws = wb.active
     ws.title = "匹配结果"
     ws.append(OUTPUT_COLUMNS)
-
-    note = _format_unmatched_note(max_distance_km)
-    unmatched_set = set(unmatched)
-    r_idx = 0  # results 中顺序指针（match_sites 按 match_df 行序产出，同行的命中连续）
-    for _, row in match_df.iterrows():
-        cell = row["CELL"]
-        # 输出该匹配站点的全部命中行（results 中连续属于它的行）
-        while r_idx < len(results) and results[r_idx][0] == cell:
-            ws.append(results[r_idx])
-            r_idx += 1
-        # 若无任何命中 → 备注行
-        if cell in unmatched_set:
-            ws.append([cell, row["LON"], row["LAT"], None, None, None, None, note])
-
-    # 防御：results 末尾剩余（正常不会发生，保留以确保完整性）
-    while r_idx < len(results):
-        ws.append(results[r_idx])
-        r_idx += 1
-
+    for row in build_output_rows(match_df, results, unmatched, max_distance_km):
+        ws.append(row)
     wb.save(out_path)
     return out_path
 

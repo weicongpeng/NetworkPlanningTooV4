@@ -48,7 +48,7 @@ def init_db():
 
     from app.models.database import (
         User, UserSession, Workbook, Site, Sector, GeoFile, Layer, UserSettings, TaskResult,
-        DatasetRevision,
+        DatasetRevision, SystemSetting,
     )  # noqa: F401
     Base.metadata.create_all(bind=engine)
 

@@ -16,6 +16,9 @@ from app.models.database import User, UserSession, UserSettings
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
+# 哨兵：区分「调用方没传全局期限（自己去查）」与「明确传 None（全局无限期）」
+_UNSET = object()
+
 
 class AuthService:
     """认证服务（单例模式）"""
@@ -77,17 +80,60 @@ class AuthService:
             return None, "用户名或密码错误"
         if not user.is_active:
             return None, "账号已被禁用，请联系管理员"
-        if user.license_expiry and not settings.NPT_DESKTOP:
-            # 服务器模式：按用户的 license_expiry 作登录闸门（管理员分配）
+        if not settings.NPT_DESKTOP:
+            # 服务器模式：授权期限作登录闸门。管理员始终无限期（不受全局期限约束）；
+            # 非管理员按「自身例外期限优先，否则用全局期限」判定。
             # 桌面模式跳过：未激活时会把全体用户镜像为过去日期，若在此拦截，
             # 管理员将无法登录去激活（鸡生蛋）；桌面端由签名授权文件 + 前端门禁约束
-            now = datetime.now(timezone.utc)
-            expiry = user.license_expiry
-            if expiry.tzinfo is None:
-                expiry = expiry.replace(tzinfo=timezone.utc)
-            if expiry < now:
-                return None, "授权已过期，请联系管理员"
+            expiry = self.effective_license_expiry(user)
+            if expiry is not None:
+                now = datetime.now(timezone.utc)
+                if expiry.tzinfo is None:
+                    expiry = expiry.replace(tzinfo=timezone.utc)
+                if expiry < now:
+                    return None, "授权已过期，请联系管理员"
         return user, None
+
+    @staticmethod
+    def _global_license_expiry() -> Optional[datetime]:
+        from app.services import system_settings_service as sys_settings
+
+        try:
+            return sys_settings.get_license_expiry()
+        except Exception:  # noqa: BLE001
+            return None
+
+    @classmethod
+    def effective_license_expiry(
+        cls, user: User, global_expiry: Optional[datetime] = _UNSET
+    ) -> Optional[datetime]:
+        """用户实际适用的授权期限；None = 无限期。
+
+        - 管理员：恒为 None（权限无限期，不受全局授权期限影响）
+        - 非管理员：自身 license_expiry（用户管理页单独设置的例外）优先，
+          未设置则取全局授权期限（system_settings，对所有用户生效）
+
+        global_expiry 由调用方预取，用于列表场景避免逐个用户查库。
+        """
+        if getattr(user, "is_admin", False):
+            return None
+        if user.license_expiry:
+            return user.license_expiry
+        return cls._global_license_expiry() if global_expiry is _UNSET else global_expiry
+
+    @classmethod
+    def user_payload(cls, user: User, global_expiry: Optional[datetime] = _UNSET) -> dict:
+        """用户响应体：在 to_dict() 基础上补 effective_license_expiry。
+
+        `license_expiry` 保留原值（该用户单独设置的例外期限，用户管理页展示用），
+        `effective_license_expiry` 才是前端门禁（licenseStore）该用的实际期限。
+        """
+        from app.models.database import _serialize_dt
+
+        data = user.to_dict()
+        effective = cls.effective_license_expiry(user, global_expiry)
+        data["effective_license_expiry"] = _serialize_dt(effective)
+        return data
 
     @staticmethod
     def get_client_ip(request) -> str:
@@ -194,7 +240,8 @@ class AuthService:
         """获取用户列表（分页+搜索+筛选），在线用户优先置顶。
 
         返回 (page_users, total_count, online_stats)。
-        online_stats 为全量（跨所有页）在线统计：{online, online_pc, online_app}。
+        online_stats 为全量（跨所有页）在线统计：
+        {online, online_pc, online_app, online_desktop}。
         """
         query = db.query(User)
         # 服务器为桌面端创建的影子账号（不可登录，仅承载同步数据归属）不进用户列表
@@ -215,12 +262,15 @@ class AuthService:
         ).all()
         online_pc_ids = {uid for uid, ct in active_rows if ct == 'pc'}
         online_app_ids = {uid for uid, ct in active_rows if ct == 'app'}
-        online_any_ids = online_pc_ids | online_app_ids
+        # 桌面端（共享模式登录）在服务器记 client_type='desktop' 的会话
+        online_desktop_ids = {uid for uid, ct in active_rows if ct == 'desktop'}
+        online_any_ids = online_pc_ids | online_app_ids | online_desktop_ids
 
         online_stats = {
             "online": len(online_any_ids),
             "online_pc": len(online_pc_ids),
             "online_app": len(online_app_ids),
+            "online_desktop": len(online_desktop_ids),
         }
 
         # 在线用户优先置顶，其次按注册时间倒序

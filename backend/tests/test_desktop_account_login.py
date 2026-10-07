@@ -19,6 +19,18 @@ from app.models.database import Base, DesktopLicense, User
 MACHINE_A = "AAAA-BBBB-CCCC-DDDD"
 
 
+@pytest.fixture(autouse=True)
+def _reset_rate_limit():
+    """清掉内存限流桶：同文件用例共用 TestClient 的同一个客户端 IP，
+    不限流会让后段用例撞上 login 的 20 次/5 分钟上限而收到 429。
+    """
+    from app.api.v1.endpoints import desktop_cloud
+
+    desktop_cloud._rl_buckets.clear()
+    yield
+    desktop_cloud._rl_buckets.clear()
+
+
 @pytest.fixture()
 def login_env(tmp_path, monkeypatch):
     """临时 SQLite + 临时 Ed25519 密钥对 + 授权服务器侧的最小应用。"""
@@ -302,5 +314,72 @@ def test_desktop_login_is_public_and_updates_mode(login_env):
         assert record.username == "alice"
         assert record.user_id is not None
         assert record.status == "active"
+    finally:
+        db.close()
+
+
+def test_shared_login_marks_user_online_as_desktop(login_env):
+    """桌面端共享模式登录在服务器记 client_type='desktop' 会话。
+
+    用户管理页的「桌面端」在线状态必须能看到它——原先的在线统计只算 pc/app，
+    桌面端用户会恒显示离线。
+    """
+    from app.services.auth_service import auth_service
+
+    _login(login_env.client, "alice", "alice-pwd", mode="shared")
+
+    db = login_env.session_factory()
+    try:
+        alice = db.query(User).filter(User.username == "alice").first()
+        assert auth_service.is_user_online_by_client_type(db, alice.id, "desktop") is True
+        assert auth_service.is_user_online_by_client_type(db, alice.id, "pc") is False
+
+        _, _, stats = auth_service.get_all_users(db)
+        assert stats["online_desktop"] == 1
+        assert stats["online"] == 1  # 桌面端在线同样计入总在线数
+        assert stats["online_pc"] == 0 and stats["online_app"] == 0
+    finally:
+        db.close()
+
+
+def test_session_check_refreshes_last_activity(login_env):
+    """session-check 就是桌面端心跳（默认 60s）：必须刷新 last_activity。
+
+    否则用户空闲超过 5 分钟后，会被「用户管理」的 5 分钟活跃窗口误报为离线。
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from app.models.database import UserSession
+    from app.services.auth_service import auth_service
+
+    ok = _login(login_env.client, "alice", "alice-pwd", mode="shared")
+    data = ok.json()["data"]
+    jti = data["session_jti"]
+
+    db = login_env.session_factory()
+    try:
+        db.query(UserSession).filter(UserSession.token_jti == jti).update(
+            {UserSession.last_activity: datetime.now(timezone.utc) - timedelta(minutes=30)}
+        )
+        db.commit()
+        alice = db.query(User).filter(User.username == "alice").first()
+        assert auth_service.is_user_online_by_client_type(db, alice.id, "desktop") is False
+    finally:
+        db.close()
+
+    check = login_env.client.post(
+        "/api/v1/desktop-cloud/auth/session-check",
+        json={
+            "license_file": data["license_file"],
+            "machine_code": MACHINE_A,
+            "session_jti": jti,
+        },
+    )
+    assert check.json()["data"]["valid"] is True
+
+    db = login_env.session_factory()
+    try:
+        alice = db.query(User).filter(User.username == "alice").first()
+        assert auth_service.is_user_online_by_client_type(db, alice.id, "desktop") is True
     finally:
         db.close()

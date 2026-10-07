@@ -1,7 +1,9 @@
 """
 许可证管理服务
 
-授权模型：以管理员用户的 license_expiry 字段为全局授权依据。
+授权模型：以 system_settings 里的全局 license_expiry 为授权依据，对所有用户生效
+（首次读取时从管理员行的 license_expiry 播种，兼容改造前的存量部署）。
+个别用户的例外期限放在 users.license_expiry，由登录闸门读取。
 旧版 license.dat 文件逻辑保留作为无管理员时的回退方案。
 """
 
@@ -40,7 +42,12 @@ class LicenseService:
     # ---- Admin-based 授权查询 ----
 
     def get_admin_license_expiry(self) -> Optional[datetime]:
-        """查询管理员用户的 license_expiry"""
+        """查询管理员用户的 license_expiry。
+
+        已不作为授权依据（授权期限现为 system_settings 里的全局设置，
+        见 `services/system_settings_service.get_license_expiry`）；
+        仅保留供需要读管理员行原始值的场景使用。
+        """
         from app.models.database import User
         db = self._get_db()
         try:
@@ -54,37 +61,23 @@ class LicenseService:
         finally:
             db.close()
 
-    def update_admin_license_expiry(self, expiry_date: Optional[str]) -> Optional[dict]:
-        """
-        管理员更新自身的 license_expiry（即全局授权期限）
+    def update_global_license_expiry(self, expiry_date: Optional[str]) -> Optional[dict]:
+        """管理员更新**全局**授权期限（system_settings，对所有用户生效）。
+
         expiry_date: "YYYY-MM-DD" 或 None（无限期）
-        返回更新后的 user dict 或 None
+        返回 {"license_expiry": "YYYY-MM-DD" | None}，非法日期返回 None。
 
         桌面模式：授权期限由厂商签发的授权文件决定，禁止管理员自助修改。
         """
         if settings.NPT_DESKTOP:
             return None
 
-        from app.models.database import User
-        from app.services.auth_service import auth_service
-        db = self._get_db()
-        try:
-            admin = db.query(User).filter(User.is_admin == True, User.is_active == True).first()
-            if not admin:
-                return None
-            if expiry_date:
-                try:
-                    expiry = datetime.strptime(expiry_date, "%Y-%m-%d")
-                except ValueError:
-                    return None
-            else:
-                expiry = None
-            admin.license_expiry = expiry
-            db.commit()
-            db.refresh(admin)
-            return admin.to_dict()
-        finally:
-            db.close()
+        from app.services import system_settings_service as sys_settings
+
+        expiry = sys_settings.set_license_expiry(expiry_date)
+        if expiry_date and expiry is None:
+            return None  # 日期格式非法
+        return {"license_expiry": expiry.strftime("%Y-%m-%d") if expiry else None}
 
     # ---- LicenseStatus 构建 ----
 
@@ -92,60 +85,62 @@ class LicenseService:
         """获取许可证状态。
 
         桌面模式（NPT_DESKTOP=1）：以厂商签名的授权文件为唯一依据；
-        服务器模式：以 admin license_expiry 为准（行为与改造前一致）。
+        服务器模式：以**全局**授权期限（system_settings.license_expiry）为准，
+        该设置对所有用户生效；无管理员用户时回退旧 license 文件逻辑。
         """
         if settings.NPT_DESKTOP:
             return self._desktop_status()
 
         from app.models.database import User
 
-        # 1. 尝试从 admin 用户的 license_expiry 获取
+        # 1. 全局授权期限（首次读取时从管理员行播种，兼容存量部署）
         db = self._get_db()
         try:
-            admin = db.query(User).filter(User.is_admin == True).first()
-            if admin is not None:
-                expiry = admin.license_expiry
-                if expiry and expiry.tzinfo is None:
-                    expiry = expiry.replace(tzinfo=timezone.utc)
+            has_admin = db.query(User).filter(User.is_admin == True).first() is not None  # noqa: E712
+        finally:
+            db.close()
 
-                if expiry is None:
-                    return LicenseStatus(
-                        valid=True,
-                        expiryDate="",
-                        licensee="管理员授权",
-                        licenseKey=None,
-                        features=["all"],
-                        version="user",
-                        errorMessage=None,
-                        remainingDays=-1,  # -1 表示无限期
-                    )
+        if has_admin:
+            from app.services import system_settings_service as sys_settings
 
-                now = datetime.now(timezone.utc)
-                remaining_days = (expiry - now).days
-                if remaining_days < 0:
-                    return LicenseStatus(
-                        valid=False,
-                        expiryDate=expiry.strftime("%Y-%m-%d"),
-                        licensee="管理员授权",
-                        licenseKey=None,
-                        features=None,
-                        version="user",
-                        errorMessage="授权已过期，请联系管理员",
-                        remainingDays=0,
-                    )
+            expiry = sys_settings.get_license_expiry()
 
+            if expiry is None:
                 return LicenseStatus(
                     valid=True,
-                    expiryDate=expiry.strftime("%Y-%m-%d"),
+                    expiryDate="",
                     licensee="管理员授权",
                     licenseKey=None,
                     features=["all"],
                     version="user",
                     errorMessage=None,
-                    remainingDays=remaining_days,
+                    remainingDays=-1,  # -1 表示无限期
                 )
-        finally:
-            db.close()
+
+            now = datetime.now(timezone.utc)
+            remaining_days = (expiry - now).days
+            if remaining_days < 0:
+                return LicenseStatus(
+                    valid=False,
+                    expiryDate=expiry.strftime("%Y-%m-%d"),
+                    licensee="管理员授权",
+                    licenseKey=None,
+                    features=None,
+                    version="user",
+                    errorMessage="授权已过期，请联系管理员",
+                    remainingDays=0,
+                )
+
+            return LicenseStatus(
+                valid=True,
+                expiryDate=expiry.strftime("%Y-%m-%d"),
+                licensee="管理员授权",
+                licenseKey=None,
+                features=["all"],
+                version="user",
+                errorMessage=None,
+                remainingDays=remaining_days,
+            )
 
         # 2. 无 admin 用户时回退到旧 license 文件逻辑
         return self._get_file_license_status()

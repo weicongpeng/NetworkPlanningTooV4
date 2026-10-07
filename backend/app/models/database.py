@@ -268,6 +268,20 @@ class UserSettings(Base):
         }
 
 
+class SystemSetting(Base):
+    """全局系统设置（键值对，全站唯一一份，非按用户）。
+
+    当前用于承载全局授权期限：授权是对**所有用户**生效的系统级设置，
+    不能存在某个用户行上（否则管理员改自己的期限不影响别人）。
+    个别用户的例外期限仍放在 users.license_expiry。
+    """
+    __tablename__ = "system_settings"
+
+    key = Column(String(64), primary_key=True)
+    value = Column(Text, nullable=True)
+    updated_at = Column(String(30), nullable=False)
+
+
 class TaskResult(Base):
     """规划任务结果持久化"""
     __tablename__ = "task_results"

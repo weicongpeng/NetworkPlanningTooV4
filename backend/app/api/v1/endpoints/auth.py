@@ -68,7 +68,7 @@ async def register(data: UserCreate, request: Request, db: Session = Depends(get
             "token": token,
             "access_token": token,
             "token_type": "bearer",
-            "user": user.to_dict(),
+            "user": auth_service.user_payload(user),
         },
     }
 
@@ -98,7 +98,7 @@ async def login(data: UserLogin, request: Request, db: Session = Depends(get_db)
             "token": token,
             "access_token": token,
             "token_type": "bearer",
-            "user": user.to_dict(),
+            "user": auth_service.user_payload(user),
         },
     }
     if ended_count > 0:
@@ -112,7 +112,7 @@ async def get_me(current_user: User = Depends(get_current_user)):
     """获取当前用户信息"""
     return {
         "success": True,
-        "data": current_user.to_dict(),
+        "data": auth_service.user_payload(current_user),
     }
 
 
