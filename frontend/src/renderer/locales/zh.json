@@ -269,6 +269,8 @@
     "downloadTemplateFailed": "下载模板失败",
     "unknownError": "未知错误",
     "unknownFile": "未知文件",
+    "recovered": "历史数据",
+    "recoveredHint": "索引修复时从磁盘找回的历史数据，原分组信息已丢失（暂按管理员组归属），请核对后保留或删除",
     "deleteConfirm": "确定要删除 \"{{name}}\" 吗？",
     "deleteWarning": "删除后将无法恢复，且会影响使用该数据的规划结果。",
     "forceDeleteTip": "删除失败：文件可能正在被其他程序使用。",

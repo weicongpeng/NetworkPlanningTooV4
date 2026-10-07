@@ -1247,6 +1247,15 @@ export function DataPage() {
                         )}
                       </div>
                       <span className="truncate font-medium" title={item.name}>{item.name}</span>
+                      {/* 索引自愈恢复的历史数据：原分组信息已丢失，暂按管理员组归属，提示核对 */}
+                      {(item.metadata?.recovered || (item as any).recovered) && (
+                        <span
+                          className="text-[10px] px-2 py-0.5 rounded-full font-medium bg-amber-500/15 text-amber-600 whitespace-nowrap"
+                          title={t('data.recoveredHint', '索引修复时从磁盘找回的历史数据，原分组已丢失，请核对后保留或删除')}
+                        >
+                          {t('data.recovered', '历史数据')}
+                        </span>
+                      )}
                       {/* 文件类型标签 */}
                       <span className={`text-[10px] px-2 py-0.5 rounded-full font-medium inline-flex items-center gap-0.5 ${
                         item.status === 'error'

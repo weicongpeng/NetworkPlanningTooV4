@@ -121,6 +121,9 @@ class DataService:
 
     def __init__(self, lazy_load: bool = True):
         self.data_index_file = settings.DATA_DIR / "index.json"
+        # 实例构造时绑定的数据根：用于识别"数据根已被切换（测试/迁移）"的情况，
+        # 避免继续把索引写进旧根（曾有测试把条目写进生产 index.json 的事故）
+        self._bound_data_dir = Path(settings.DATA_DIR)
         self._ensure_directories()
         self._load_index()
         # 数据缓存: {data_id: {"data": data_dict, "mtime": timestamp}}
@@ -178,12 +181,29 @@ class DataService:
         settings.UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
         settings.DATA_DIR.mkdir(parents=True, exist_ok=True)
 
+    def _index_file(self) -> Path:
+        """索引文件路径：跟随当前 settings.DATA_DIR。
+
+        data_service 是进程级单例，构造时缓存的路径会过期：测试（monkeypatch
+        DATA_DIR，或把 data_index_file 恢复成构造时的旧值）与数据根迁移都属于
+        这种情况。一旦沿用过期路径，测试数据就会写进生产 index.json（曾发生）。
+        显式 patch 到"其它目录"的隔离写法（测试）依旧被尊重。
+        """
+        target = Path(getattr(self, "data_index_file", None) or (settings.DATA_DIR / "index.json"))
+        bound = getattr(self, "_bound_data_dir", None)
+        current = Path(settings.DATA_DIR)
+        if bound is not None and target.parent == bound and current != bound:
+            # 目标仍指向实例构造时的数据根，而当前数据根已经变了 → 跟随当前数据根
+            return current / "index.json"
+        return target
+
     def _load_index(self):
         """加载数据索引（优先 index.json，然后合并 SQLite 中缺失的条目）"""
-        if self.data_index_file.exists():
+        index_file = self._index_file()
+        if index_file.exists():
             import json
             try:
-                with open(self.data_index_file, "r", encoding="utf-8") as f:
+                with open(index_file, "r", encoding="utf-8") as f:
                     self.index = json.load(f)
                 safe_print(f"[DataService] 从 index.json 加载了 {len(self.index)} 个索引条目")
             except Exception as e:
@@ -200,6 +220,8 @@ class DataService:
             self.index.update(missing)
             self._save_index()
             safe_print(f"[DataService] 从 SQLite 合并了 {len(missing)} 个缺失条目到 index.json")
+        # 与磁盘/DB 对账：清掉幽灵条目、把还在磁盘上的数据条目找回来
+        self._reconcile_index()
         safe_print(f"[DataService] 索引加载完成，共 {len(self.index)} 个条目")
 
     def _collect_db_entries_for_index(self) -> Dict:
@@ -470,6 +492,252 @@ class DataService:
         except Exception as e:
             safe_print(f"[DataService] 遗留 index.json 导入失败 (非致命): {e}")
 
+    # ---------------------------------------------------------------- 索引自愈
+
+    # 图层类文件的扩展名（用于从磁盘恢复条目时判断数据集类型）
+    _LAYER_FILE_SUFFIXES = (".tab", ".mif", ".shp", ".geojson", ".kml")
+    _SOURCE_FILE_SUFFIXES = (".xlsx", ".xls", ".csv", ".zip")
+
+    @staticmethod
+    def _looks_like_data_id(name: str) -> bool:
+        """数据集 id 形如 uuid4（data/<id>/ 只认这种目录，避免把 uploads 等目录当数据）。"""
+        return len(name) == 36 and name.count("-") == 4
+
+    def _has_upload_artifact(self, data_id: str) -> bool:
+        """uploads 里是否还有该数据集的文件：数据实体仍在的旁证。"""
+        try:
+            upload_dir = Path(settings.UPLOAD_DIR)
+            if not upload_dir.is_dir():
+                return False
+            return next(upload_dir.glob(f"{data_id}.*"), None) is not None
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _dir_has_files(self, data_dir: Path) -> bool:
+        try:
+            return data_dir.is_dir() and any(p.is_file() for p in data_dir.rglob("*"))
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _known_db_ids(self) -> Set[str]:
+        """DB 里有记录的数据集 id（有记录说明条目不该被当成幽灵清掉）。"""
+        db = SessionLocal()
+        try:
+            ids = {row[0] for row in db.query(Workbook.id).all()}
+            ids |= {row[0] for row in db.query(GeoFile.id).all()}
+            ids |= {row[0] for row in db.query(Layer.id).all()}
+            return ids
+        except Exception:  # noqa: BLE001
+            return set()
+        finally:
+            db.close()
+
+    def _recovered_group(self) -> Tuple[Optional[int], Optional[str], Optional[str], Optional[str]]:
+        """恢复条目时的兜底组：管理员账号的组。
+
+        条目的原组信息随索引一起丢失，而"没有组"的条目按数据组隔离规则谁都不
+        可见（等于没恢复），因此暂按管理员账号归属，并打 recovered 标记供核对。
+        """
+        db = SessionLocal()
+        try:
+            from app.models.database import User
+
+            row = (
+                db.query(User)
+                .filter(User.is_admin == True)  # noqa: E712
+                .filter(User.city.isnot(None), User.operator.isnot(None))
+                .order_by(User.id.asc())
+                .first()
+            )
+            if row is not None:
+                return row.id, row.username, row.city, row.operator
+        except Exception:  # noqa: BLE001
+            pass
+        finally:
+            db.close()
+        return None, None, None, None
+
+    def _build_recovered_entry(
+        self,
+        data_dir: Path,
+        user_id: Optional[int],
+        username: Optional[str],
+        city: Optional[str],
+        operator: Optional[str],
+    ) -> Optional[Dict[str, Any]]:
+        """按磁盘文件重建索引条目（原条目丢失时的恢复）。"""
+        try:
+            files = [p for p in sorted(data_dir.rglob("*")) if p.is_file()]
+        except Exception:  # noqa: BLE001
+            files = []
+        upload_file = None
+        try:
+            upload_file = next(Path(settings.UPLOAD_DIR).glob(f"{data_dir.name}.*"), None)
+        except Exception:  # noqa: BLE001
+            upload_file = None
+
+        source = next((p for p in files if p.suffix.lower() in self._SOURCE_FILE_SUFFIXES), None)
+        if source is None and upload_file is not None and upload_file.suffix.lower() in self._SOURCE_FILE_SUFFIXES:
+            source = upload_file
+        stamps = [p.stat().st_mtime for p in files]
+        if upload_file is not None:
+            try:
+                stamps.append(upload_file.stat().st_mtime)
+            except OSError:
+                pass
+        upload_date = (
+            datetime.fromtimestamp(max(stamps)).isoformat() if stamps else datetime.now().isoformat()
+        )
+        base = {
+            "id": data_dir.name,
+            "size": sum(p.stat().st_size for p in files) or None,
+            "uploadDate": upload_date,
+            "status": "ready",
+            "user_id": user_id,
+            "userName": username,
+            "city": city,
+            "operator": operator,
+            "recovered": True,
+        }
+        if source is not None:
+            return {
+                **base,
+                "name": source.name,
+                "type": "excel",
+                "fileType": "default",
+                "originalPath": str(source),
+                "metadata": {"recovered": True, "fileCount": len(files)},
+            }
+        layer_files = [p for p in files if p.suffix.lower() in self._LAYER_FILE_SUFFIXES]
+        if not layer_files and upload_file is not None and upload_file.suffix.lower() in self._LAYER_FILE_SUFFIXES:
+            layer_files = [upload_file]
+        if not layer_files:
+            return None
+        layers = [
+            {"id": data_dir.name, "name": p.stem, "type": "mixed", "feature_count": 0}
+            for p in layer_files
+        ]
+        return {
+            **base,
+            "name": layer_files[0].name,
+            "type": "map",
+            "subType": "mapinfo",
+            "originalPath": str(layer_files[0]),
+            "metadata": {
+                "layerCount": len(layers),
+                "layers": layers,
+                "fileCount": len(files),
+                "recovered": True,
+            },
+        }
+
+    def _purge_stale_layer_rows(self) -> int:
+        """删掉"测试残留"图层行（历史上 pytest 的 /tmp/pytest-of-* 路径被写进过生产库）。
+
+        判定规则：
+        - 路径里带 pytest 临时目录特征（`pytest-of-`）→ 一律删（哪怕是残留文件仍在）；
+        - 其它指向 /tmp 的行 → 仅在文件已不存在时删（保守，避免误删数据根真在 /tmp 的部署）。
+        这些行留着会在重建索引时再次生成幽灵条目。
+        """
+        db = SessionLocal()
+        purged = 0
+        try:
+            for row in db.query(Layer).all():
+                file_path = (row.file_path or "").replace("\\", "/")
+                is_pytest_artifact = "pytest-of-" in file_path or "/tmp/pytest" in file_path
+                if not is_pytest_artifact and "/tmp/" not in file_path:
+                    continue
+                if not is_pytest_artifact:
+                    try:
+                        if Path(row.file_path).exists():
+                            continue
+                    except Exception:  # noqa: BLE001
+                        pass
+                db.delete(row)
+                purged += 1
+            if purged:
+                db.commit()
+        except Exception as exc:  # noqa: BLE001
+            db.rollback()
+            safe_print(f"[DataService] 清理残留图层行失败（非致命）: {exc}")
+            return 0
+        finally:
+            db.close()
+        return purged
+
+    def _reconcile_allowed(self) -> bool:
+        """是否允许索引自愈：仅生产进程且数据根未被切换时执行。
+
+        自愈会写 index.json，若在测试进程或数据根被切换（测试隔离/数据迁移）时
+        执行，就会把临时目录的判断结果写进生产索引（历史事故的同类风险）。
+        """
+        if "pytest" in sys.modules:
+            return False
+        bound = getattr(self, "_bound_data_dir", None)
+        return bound is None or Path(settings.DATA_DIR) == Path(bound)
+
+    def _reconcile_index(self) -> Dict[str, Any]:
+        """索引自愈：清理幽灵条目 + 恢复"文件还在但索引丢了"的数据集。
+
+        背景：测试进程曾把索引写进生产 index.json，造成两类脏数据——
+        - 幽灵条目：索引里有、data 目录与 uploads 文件都没有（条目指向 /tmp 临时目录）
+        - 孤儿数据：data/<id>/ 或 uploads/<id>.* 还在、索引里没有（用户"数据丢失"）
+        本方法在启动加载索引后执行一次，两者一并处理并落盘。
+        """
+        if not self._reconcile_allowed():
+            return {"skipped": True, "reason": "当前环境不允许索引自愈（测试/数据根已切换）"}
+
+        data_root = Path(settings.DATA_DIR)
+        if not data_root.is_dir():
+            return {"skipped": True, "reason": "数据目录不存在"}
+
+        try:
+            known_ids = self._known_db_ids()
+            removed: List[str] = []
+            for data_id, info in list(self.index.items()):
+                if not self._looks_like_data_id(data_id):
+                    continue
+                if (
+                    (data_root / data_id).exists()
+                    or self._has_upload_artifact(data_id)
+                    or data_id in known_ids
+                ):
+                    continue
+                self.index.pop(data_id, None)
+                removed.append(f"{info.get('name') or data_id}")
+
+            recovered: List[str] = []
+            uid, uname, ucity, uoperator = self._recovered_group()
+            for sub in sorted(data_root.iterdir()):
+                if not sub.is_dir() or not self._looks_like_data_id(sub.name):
+                    continue
+                if sub.name in self.index:
+                    continue
+                if not self._dir_has_files(sub) and not self._has_upload_artifact(sub.name):
+                    continue
+                entry = self._build_recovered_entry(sub, uid, uname, ucity, uoperator)
+                if entry is None:
+                    continue
+                self.index[sub.name] = entry
+                recovered.append(entry.get("name") or sub.name)
+
+            purged = self._purge_stale_layer_rows()
+            if removed or recovered or purged:
+                self._save_index()
+                safe_print(
+                    f"[DataService] 索引自愈完成：清理幽灵条目 {len(removed)} 个，"
+                    f"恢复历史数据 {len(recovered)} 个，清理残留图层行 {purged} 行"
+                )
+                if recovered:
+                    safe_print(
+                        "[DataService] 恢复的数据条目暂按管理员账号的组归属"
+                        "（原组信息已丢失），请管理员核对后调整或删除"
+                    )
+            return {"removed": removed, "recovered": recovered, "purged_layers": purged}
+        except Exception as exc:  # noqa: BLE001
+            safe_print(f"[DataService] 索引自愈失败（非致命）: {exc}")
+            return {"error": str(exc)}
+
     def reload_index(self):
         """重新加载数据索引（优先 index.json）"""
         self._load_index()
@@ -481,12 +749,13 @@ class DataService:
         import tempfile
         import os as _os
 
-        self.data_index_file.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp_path = tempfile.mkstemp(dir=str(self.data_index_file.parent), suffix=".tmp")
+        index_file = self._index_file()
+        index_file.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(dir=str(index_file.parent), suffix=".tmp")
         try:
             with _os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(self.index, f, ensure_ascii=False, indent=2)
-            _os.replace(tmp_path, str(self.data_index_file))
+            _os.replace(tmp_path, str(index_file))
         except Exception:
             if _os.path.exists(tmp_path):
                 _os.unlink(tmp_path)
@@ -6958,11 +7227,18 @@ class DataService:
         finally:
             db.close()
 
+        # 数据实体仍在（uploads 有文件 / DB 有记录）的条目不算无效：数据根被切换
+        # （测试、迁移）时目录判断会失真，据此误删会造成真实数据"丢失"（曾经发生）
+        known_ids = self._known_db_ids()
+
         for data_id, data_info in list(self.index.items()):
             data_dir = settings.DATA_DIR / data_id
 
             # 检查数据目录是否存在
             if not data_dir.exists():
+                if self._has_upload_artifact(data_id) or data_id in known_ids:
+                    safe_print(f"[DataService] 索引 {data_id} 目录缺失但数据仍在，跳过清理")
+                    continue
                 safe_print(f"[DataService] 发现无效索引: {data_id} - {data_info.get('name', '未知')} (目录不存在)")
                 ids_to_remove.append(data_id)
                 removed_items.append({
@@ -6997,7 +7273,7 @@ class DataService:
                             "reason": "SQLite中不存在且无original.xlsx"
                         })
 
-        # 移除无效索引
+        # 移除无效索引，并落盘：否则下次 reload_index 会把它们从 index.json 读回来
         for data_id in ids_to_remove:
             del self.index[data_id]
 
@@ -7005,6 +7281,10 @@ class DataService:
             safe_print(f"[DataService] 清理完成，移除了 {len(ids_to_remove)} 个无效索引项")
             for data_id in ids_to_remove:
                 self.clear_cache(data_id)
+            try:
+                self._save_index()
+            except Exception as exc:  # noqa: BLE001
+                safe_print(f"[DataService] 清理后写入索引失败（非致命）: {exc}")
         else:
             safe_print("[DataService] 索引有效，无需清理")
 

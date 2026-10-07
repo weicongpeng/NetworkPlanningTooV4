@@ -319,6 +319,8 @@
     "downloadTemplateFailed": "Failed to download template",
     "unknownError": "Unknown error",
     "unknownFile": "Unknown file",
+    "recovered": "Recovered",
+    "recoveredHint": "Historical data recovered from disk during index repair. Its original data group was lost (temporarily assigned to the admin group); please review before keeping or deleting",
     "deleteConfirm": "Are you sure you want to delete \"{{name}}\"?",
     "deleteWarning": "Deletion cannot be undone and will affect planning results using this data.",
     "forceDeleteTip": "Deletion failed: file may be in use by another program.",
