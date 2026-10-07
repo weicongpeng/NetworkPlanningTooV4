@@ -129,11 +129,26 @@ jobs:
       - name: 下载 WebView2 引导安装器（随安装包分发，供离线机器使用）
         shell: pwsh
         run: |
+          # 微软 CDN 偶发中断（ResponseEnded）会让整个构建失败，这里自建重试兜底
           New-Item -ItemType Directory -Force -Path desktop/webview2 | Out-Null
-          Invoke-WebRequest -Uri "https://go.microsoft.com/fwlink/?linkid=2124701" -OutFile "desktop/webview2/MicrosoftEdgeWebview2Setup.exe"
-          $size = (Get-Item "desktop/webview2/MicrosoftEdgeWebview2Setup.exe").Length / 1MB
+          $url = "https://go.microsoft.com/fwlink/?linkid=2124701"
+          $out = "desktop/webview2/MicrosoftEdgeWebview2Setup.exe"
+          $ok = $false
+          for ($i = 1; $i -le 5; $i++) {
+            try {
+              Write-Host "尝试 $i 次下载 WebView2 安装器..."
+              Invoke-WebRequest -Uri $url -OutFile $out -MaximumRetryCount 3 -RetryIntervalSec 5
+              $size = (Get-Item $out).Length / 1MB
+              if ($size -ge 50) { $ok = $true; break }
+              Write-Host ("体积异常: {0:N1} MB，稍后重试" -f $size)
+            } catch {
+              Write-Host "下载失败：$($_.Exception.Message)"
+            }
+            Start-Sleep -Seconds 5
+          }
+          if (-not $ok) { Write-Error "WebView2 安装器下载失败（已重试 5 次）"; exit 1 }
+          $size = (Get-Item $out).Length / 1MB
           Write-Host ("WebView2 安装器: {0:N1} MB" -f $size)
-          if ($size -lt 50) { Write-Error "WebView2 安装器体积异常，下载可能失败"; exit 1 }
 
       - name: 生成安装器（Inno Setup）
         shell: pwsh

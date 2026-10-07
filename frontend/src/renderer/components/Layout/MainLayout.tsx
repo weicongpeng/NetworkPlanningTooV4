@@ -352,22 +352,8 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
                 {desktopStatus?.appName || t('common.appName', '网优引擎')}
               </span>
             </div>
-            {/* 桌面端：运行模式 + 实时同步状态（冲突/异常为琥珀色，不可隐藏） */}
-            {sidebarOpen && desktopStatus && (
-              <p
-                className={`mt-0.5 text-[10px] truncate ${
-                  desktopStatus.tone === 'warn'
-                    ? 'text-amber-500'
-                    : desktopStatus.tone === 'syncing'
-                      ? 'text-primary'
-                      : 'text-muted-foreground'
-                }`}
-                style={{ paddingLeft: '32px' }}
-                title={desktopStatus.label}
-              >
-                {desktopStatus.label}
-              </p>
-            )}
+            {/* 桌面端运行模式/同步状态不再在侧栏重复展示：窗口标题栏已有同一份文案
+                （DesktopSyncIndicator → desktopStatusLabel.title → 本机窗口标题） */}
           </div>
 
           {/* 导航菜单 - 固定高度和间距，避免上下移动，图标位置固定，内容边距统一 */}
