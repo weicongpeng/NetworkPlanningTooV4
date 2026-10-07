@@ -119,12 +119,12 @@
     "loading": "Loading...",
     "loadingHistory": "Loading history tasks...",
     "loadingResult": "Loading planning results...",
-    "adminHint": "As admin, you can set the global authorization period here",
+    "adminHint": "This setting applies to all users: anyone without an individual expiry follows it. Administrators always have unlimited access. To set an expiry for a single user, edit that user in User Management.",
     "expiryDateInput": "Expiry Date",
     "updateButton": "Update Authorization",
     "setUnlimited": "Unlimited",
-    "updateSuccess": "Authorization updated successfully",
-    "unlimitedSet": "Set to unlimited",
+    "updateSuccess": "Global authorization period updated (applies to all users)",
+    "unlimitedSet": "Set to unlimited (applies to all users)",
     "updateFailed": "Update failed",
     "refresh": "Refresh",
     "authorTitle": "Special Notice",
@@ -187,8 +187,8 @@
     "freqConversion": "Frequency Conversion"
   },
   "home": {
-    "title": "Network Planning Tool",
-    "welcome": "Welcome to Network Planning Tool",
+    "title": "NetOpt Engine",
+    "welcome": "Welcome to NetOpt Engine",
     "quickStart": "Quick Start",
     "recentFiles": "Recent Files",
     "systemStatus": "System Status",
@@ -1398,7 +1398,10 @@
     "saving": "Saving…",
     "selectAll": "Select all",
     "searchFiles": "Search files",
-    "noMatchingFiles": "No matching files"
+    "noMatchingFiles": "No matching files",
+    "allLoaded": "All loaded",
+    "loadedOfTotal": "Loaded {{loaded}} of {{total}}",
+    "appName": "NetOpt Engine"
   },
   "auth": {
     "login": "Login",
@@ -1551,7 +1554,9 @@
     "permCellQueryUpdate": "Query / Modify",
     "pcFeaturePermissions": "PC Feature Access",
     "featurePermissionsHint": "Feature pages this user can access",
-    "permAssistant": "Network Optimization Assistant"
+    "permAssistant": "Network Optimization Assistant",
+    "desktopCount": "Desktop",
+    "desktopClient": "Desktop"
   },
   "layer": {
     "sectorLayer": "Sector Layer",
@@ -1646,7 +1651,11 @@
     "errFixImport": "Please fix the import data issues and re-import first",
     "errUnknown": "Matching failed, please retry",
     "templateDownloadErr": "Template download failed, please retry",
-    "errSheet": "Please select a sheet"
+    "errSheet": "Please select a sheet",
+    "resultList": "Results",
+    "resultEmpty": "Results will appear here after matching",
+    "resultUnavailable": "Preview is unavailable for this result, please download it",
+    "summaryRows": "{{count}} result rows (including unmatched notes)"
   },
   "siteSpacing": {
     "fileImport": "File Import",
@@ -1683,7 +1692,10 @@
     "errUnknown": "Calculation failed, please retry",
     "templateDownloadErr": "Template download failed, please retry",
     "errSheet": "Please select a sheet",
-    "csvTxtHint": "CSV / TXT files have no sheet concept; all content will be read directly"
+    "csvTxtHint": "CSV / TXT files have no sheet concept; all content will be read directly",
+    "resultList": "Results",
+    "resultEmpty": "Results will appear here after calculation",
+    "resultUnavailable": "Preview is unavailable for this result, please download it"
   },
   "freqConversion": {
     "title": "Frequency Conversion",
@@ -1806,6 +1818,14 @@
     "waiting": "Waiting to sync",
     "offline": "Offline mode",
     "pending": "Pending uploads: {{count}}",
-    "conflicts": "{{count}} datasets conflict, please contact an administrator"
+    "conflicts": "{{count}} datasets conflict, please contact an administrator",
+    "modeShared": "Shared mode",
+    "modeStandalone": "Standalone mode",
+    "modeOffline": "Offline mode",
+    "modeSharedSyncing": "Shared mode · Syncing…",
+    "modeSharedSynced": "Shared mode · Synced {{time}}",
+    "modeSharedWaiting": "Shared mode · Waiting",
+    "modeSharedConflicts": "Shared mode · {{count}} conflicts",
+    "modeSharedError": "Shared mode · Sync error"
   }
 }

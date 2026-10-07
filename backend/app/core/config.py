@@ -59,7 +59,7 @@ class Settings(BaseSettings):
     """应用配置类"""
 
     # 项目信息
-    PROJECT_NAME: str = "网络规划工具"
+    PROJECT_NAME: str = "网优引擎"
     VERSION: str = "3.0.0"
 
     # API配置

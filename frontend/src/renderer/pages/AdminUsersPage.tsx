@@ -32,7 +32,7 @@ export function AdminUsersPage() {
   const [users, setUsers] = useState<UserInfo[]>([])
   const [total, setTotal] = useState(0)
   // 全量（跨所有页）在线统计，由后端返回
-  const [onlineStats, setOnlineStats] = useState({ online: 0, pc: 0, app: 0 })
+  const [onlineStats, setOnlineStats] = useState({ online: 0, pc: 0, app: 0, desktop: 0 })
   const [search, setSearch] = useState('')
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
@@ -90,6 +90,7 @@ export function AdminUsersPage() {
           online: first.data.online_users ?? 0,
           pc: first.data.online_pc ?? 0,
           app: first.data.online_app ?? 0,
+          desktop: first.data.online_desktop ?? 0,
         })
       }
     } catch (err: any) {
@@ -290,7 +291,7 @@ export function AdminUsersPage() {
   }
 
   // Per-user session cache: latest PC and APP session
-  const [userSessionsCache, setUserSessionsCache] = useState<Record<number, { pc: UserSessionInfo | null; app: UserSessionInfo | null }>>({})
+  const [userSessionsCache, setUserSessionsCache] = useState<Record<number, { pc: UserSessionInfo | null; app: UserSessionInfo | null; desktop: UserSessionInfo | null }>>({})
 
   // Fetch latest PC and APP session for each user in current list
   useEffect(() => {
@@ -308,9 +309,10 @@ export function AdminUsersPage() {
           return [u.id, {
             pc: sessions?.find((s: UserSessionInfo) => s.client_type === 'pc') || null,
             app: sessions?.find((s: UserSessionInfo) => s.client_type === 'app') || null,
+            desktop: sessions?.find((s: UserSessionInfo) => s.client_type === 'desktop') || null,
           }] as const
         } catch {
-          return [u.id, { pc: null, app: null }] as const
+          return [u.id, { pc: null, app: null, desktop: null }] as const
         }
       }))
       if (!cancelled) setUserSessionsCache(Object.fromEntries(entries))
@@ -323,6 +325,7 @@ export function AdminUsersPage() {
   const onlineCount = onlineStats.online
   const onlinePcCount = onlineStats.pc
   const onlineAppCount = onlineStats.app
+  const onlineDesktopCount = onlineStats.desktop
 
   return (
     <div className="p-6 h-full min-h-0 flex flex-col gap-6 overflow-hidden">
@@ -360,6 +363,7 @@ export function AdminUsersPage() {
           {t('admin.onlineCount')}<span className="text-foreground font-medium mx-0.5">{onlineCount}</span>
           <span className="ml-1.5">{t('admin.pcCount')}<span className="text-green-400 font-medium mx-0.5">{onlinePcCount}</span></span>
           <span className="ml-1.5">{t('admin.appCount')}<span className="text-green-400 font-medium mx-0.5">{onlineAppCount}</span></span>
+          <span className="ml-1.5">{t('admin.desktopCount', '桌面端')}<span className="text-green-400 font-medium mx-0.5">{onlineDesktopCount}</span></span>
         </div>
         <button
           onClick={() => { resetForm(); setShowAddModal(true) }}
@@ -408,21 +412,21 @@ export function AdminUsersPage() {
               </thead>
               <tbody>
                 {users.map((u) => {
-                  const sessionInfo = userSessionsCache[u.id] || { pc: null, app: null }
+                  const sessionInfo = userSessionsCache[u.id] || { pc: null, app: null, desktop: null }
                   return (
                     <>
                       {/* PC 行 */}
                       <tr key={`${u.id}-pc`} className="border-t border-border hover:bg-muted/30 transition-colors">
-                        <td className="px-4 py-3 text-foreground font-medium" rowSpan={2}>{u.username}</td>
-                        <td className="px-4 py-3" rowSpan={2}>
+                        <td className="px-4 py-3 text-foreground font-medium" rowSpan={3}>{u.username}</td>
+                        <td className="px-4 py-3" rowSpan={3}>
                           <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs ${u.is_admin ? 'bg-purple-500/10 text-purple-400' : 'bg-blue-500/10 text-blue-400'}`}>
                             {u.is_admin ? <Shield size={12} /> : <User size={12} />}
                             {u.is_admin ? t('admin.admin', '管理员') : t('admin.user', '普通用户')}
                           </span>
                         </td>
-                        <td className="px-4 py-3 text-muted-foreground text-xs" rowSpan={2}>{u.city || '-'}</td>
-                        <td className="px-4 py-3 text-muted-foreground text-xs" rowSpan={2}>{u.operator || '-'}</td>
-                        <td className="px-4 py-3" rowSpan={2}>
+                        <td className="px-4 py-3 text-muted-foreground text-xs" rowSpan={3}>{u.city || '-'}</td>
+                        <td className="px-4 py-3 text-muted-foreground text-xs" rowSpan={3}>{u.operator || '-'}</td>
+                        <td className="px-4 py-3" rowSpan={3}>
                           {u.license_expiry ? (
                             <span className={`text-xs ${new Date(u.license_expiry) < new Date() ? 'text-red-400' : 'text-muted-foreground'}`}>
                               {u.license_expiry.slice(0, 10)}
@@ -441,10 +445,10 @@ export function AdminUsersPage() {
                           </div>
                         </td>
                         <td className="px-4 py-3 text-muted-foreground font-mono text-xs">{sessionInfo.pc?.ip_address || u.last_login_ip || '-'}</td>
-                        <td className="px-4 py-3 text-muted-foreground text-xs" rowSpan={2}>{formatDate(u.created_at)}</td>
+                        <td className="px-4 py-3 text-muted-foreground text-xs" rowSpan={3}>{formatDate(u.created_at)}</td>
                         <td className="px-4 py-3 text-muted-foreground text-xs">{sessionInfo.pc ? formatDate(sessionInfo.pc.login_time) : formatDate(u.last_login)}</td>
                         <td className="px-4 py-3 text-muted-foreground text-xs">{formatDuration(u.total_usage_seconds)}</td>
-                        <td className="px-4 py-3" rowSpan={2}>
+                        <td className="px-4 py-3" rowSpan={3}>
                           <div className="flex items-center gap-1">
                             <button onClick={() => openEdit(u)} className="p-1.5 rounded hover:bg-muted text-muted-foreground hover:text-foreground transition-colors" title={t('admin.edit', '编辑')}>
                               <Pencil size={14} />
@@ -477,6 +481,21 @@ export function AdminUsersPage() {
                         </td>
                         <td className="px-4 py-3 text-muted-foreground font-mono text-xs">{sessionInfo.app?.ip_address || '-'}</td>
                         <td className="px-4 py-3 text-muted-foreground text-xs">{sessionInfo.app ? formatDate(sessionInfo.app.login_time) : '-'}</td>
+                        <td className="px-4 py-3 text-muted-foreground text-xs">-</td>
+                      </tr>
+                      {/* 桌面端行：共享模式桌面端登录在服务器记 client_type='desktop' 会话 */}
+                      <tr key={`${u.id}-desktop`} className="border-t border-border hover:bg-muted/30 transition-colors">
+                        <td className="px-4 py-3 text-xs text-muted-foreground">{t('admin.desktopClient', '桌面端')}</td>
+                        <td className="px-4 py-3">
+                          <div className="flex items-center gap-1.5">
+                            <span className={`inline-block w-2 h-2 rounded-full ${u.is_online_desktop ? 'bg-green-400' : 'bg-muted-foreground/40'}`} />
+                            <span className={`text-xs ${u.is_online_desktop ? 'text-green-400' : 'text-muted-foreground'}`}>
+                              {u.is_online_desktop ? t('admin.online', '在线') : t('admin.offline', '离线')}
+                            </span>
+                          </div>
+                        </td>
+                        <td className="px-4 py-3 text-muted-foreground font-mono text-xs">{sessionInfo.desktop?.ip_address || '-'}</td>
+                        <td className="px-4 py-3 text-muted-foreground text-xs">{sessionInfo.desktop ? formatDate(sessionInfo.desktop.login_time) : '-'}</td>
                         <td className="px-4 py-3 text-muted-foreground text-xs">-</td>
                       </tr>
                     </>

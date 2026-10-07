@@ -4,573 +4,414 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 项目概述
 
-**NetworkPlanningTooV3** (网络规划工具 v3.0) 是一个用于电信网络规划的桌面应用程序。该工具支持地图可视化、邻区规划、PCI (物理小区标识) 规划和 TAC (跟踪区域码) 规划功能。
+**NetworkPlanningTooV3**（网优引擎 v3.0）：电信网络规划应用。
 
-**架构模式**: Electron 桌面应用 + FastAPI 后端服务
-- 可以作为独立的 Electron 桌面应用运行
-- 前端也可以作为纯 Web 应用运行（`npm run dev:web`）
-- 还有 React Native (Expo) 移动端应用 (`mobile-app/`)
+**架构**：FastAPI + SQLite 后端提供 REST API，并同时以 SPA 方式托管 Vite + React 18 前端构建产物；另有独立的 Expo / React Native 移动端。
 
-**主要功能**:
-- **PCI 规划**: 物理小区标识规划，支持碰撞/混淆检测、模 3/模 30 约束
-- **邻区规划**: 自动邻区关系规划，基于覆盖圆算法
-- **TAC 规划**: 跟踪区域码规划，支持异 TAC 孤岛（插花）检测
-- **地图可视化**: 支持在线（高德/OSM）/离线地图，工参数据和规划结果展示
-- **地理化数据**: 支持上传 Excel/CSV/TXT/TAB/MIF 地理数据文件，自动识别点状/扇区图层
+- **前端**：`frontend/src/renderer/`，生产构建产物 `frontend/dist-renderer/`，由后端同域托管（前端走 `/api/v1/...`，无独立 Web 服务器）
+- **后端**：`backend/`，FastAPI + SQLAlchemy 2.0 + SQLite（仓库根 `data/data.db` 为权威数据源，Excel 双写）
+- **移动端**：`mobile-app/`（Expo，独立工程，有自己的 CLAUDE.md / AGENTS.md，本文件不覆盖）；调用同一后端，APK 由 `/api/v1/app-versions` 分发
+- **桌面端（Windows）**：`desktop/`，pywebview 壳 + 进程内 uvicorn 跑同一套 FastAPI，PyInstaller onedir → Inno Setup 安装包，由 GitHub Actions 在 windows-latest 出包；支持「共享 / 单机」两种运行模式
+- **Electron / Capacitor 已废弃**：`frontend/electron/` 目录不存在，electron 依赖已从 `package.json` 移除。仅遗留 `package.json.electron`、`start-electron-dev.bat`、`capacitor.config.ts` 等历史文件，**不要**按 Electron / Capacitor 方式启动或构建。
+
+**主要功能**：
+
+- **规划**：PCI 规划（碰撞/混淆、模 3/模 30）、邻区规划（覆盖圆）、TAC 核查与 TAC 规划（异 TAC 孤岛/插花）
+- **地图**：在线（高德/OSM）/离线地图、工参扇区渲染、专题图层、值热力面、标签防重叠、图层制作与编辑（TAB/MIF/KML）、绘制/测量/圈选/节点合并、条件选择、缓冲区、图例与导出
+- **数据**：Excel/CSV/TXT/TAB/MIF 上传、全量工参、小区查询/批量更新、新站录入、地理化数据
+- **工具**：批量距离匹配、站间距、频点换算（LTE/NR/GSCN）
+- **平台**：用户与权限、数据组隔离、网优助手（LLM）、APP 版本管理、许可证
 
 ## 常用开发命令
 
-### 快速启动
-
-```bash
-# Windows: Electron 桌面应用一键启动（推荐）
-start_electron_app.bat
-
-# 或者分别启动：
-cd frontend && npm run dev
-```
-
-### 后端服务 (FastAPI)
+### 后端（`backend/`）
 
 ```bash
 cd backend
 
-# 首次运行需要创建虚拟环境
-python -m venv venv
-venv\Scripts\activate
+# 首次运行（生产 systemd 使用的也是 backend/.venv）
+python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
-# 启动后端服务（开发模式，支持热重载）
+# 启动（开发；NPT_RELOAD=true 时热重载）
 python main.py
 
-# 单次运行（不使用 reload）
-uvicorn app.api:create_app --host 127.0.0.1 --port 8000
+# 单次运行（main.py 内已 create_app()）
+uvicorn main:app --host 127.0.0.1 --port 8000
 ```
 
-**后端服务地址**: http://127.0.0.1:8000
-**API 文档**: http://127.0.0.1:8000/docs
+- 后端地址 http://127.0.0.1:8000 ｜ Swagger http://127.0.0.1:8000/docs
 
-### 前端服务
+### 前端（`frontend/`）
 
 ```bash
 cd frontend
-
-# 首次运行需要安装依赖
 npm install
 
-# 开发模式（Electron + Vite，同时启动）
-npm run dev
-
-# 仅启动 Vite 开发服务器 (Web 模式，不启动 Electron)
-npm run dev:web
-
-# Electron 桌面应用模式
-npm run build:electron  # 先编译 TypeScript
-npm run dev:vite        # 启动 Vite
-npm run dev:electron    # 启动 Electron
-
-# 生产构建
-npm run build           # 构建前端渲染进程 + Electron 主进程
-npm run build:vite      # 仅构建 Vite
-
-# 代码检查
-npm run lint            # ESLint 检查
-npm run type-check      # TypeScript 类型检查
+npm run dev          # Vite 开发服务器 http://localhost:5173
+npm run build        # 等价 build:vite，产物 dist-renderer/
+npm run lint         # eslint src --ext .ts,.tsx
+npm run type-check   # tsc --noEmit
 ```
 
-**前端开发服务器**: http://localhost:5173
+- Vite 代理：`/api`、`/layer-files` → `http://localhost:8000`；`/ws` → `ws://localhost:8000`
+- 仓库根 `package.json` 是空的 `{}`，前端脚本全部在 `frontend/package.json`
 
 ### 测试
 
 ```bash
-# 后端测试
+# 后端 pytest（仓库无 pytest.ini，需从 backend/ 目录运行）
 cd backend
-venv\Scripts\activate
-pytest                           # 运行所有测试
-pytest -v                        # 详细输出
-pytest tests/test_specific.py    # 运行单个测试文件
-pytest -k "test_name"            # 运行匹配模式的测试
-pytest -s                        # 显示 print 输出
+python -m pytest tests/ -v                        # 全部
+python -m pytest tests/test_cell_query_update.py -v   # 单文件
+python -m pytest -k "bulk_update"                 # 按用例名
+python -m pytest -s                               # 显示 print
 ```
+
+- `backend/tests/conftest.py` 在缺少 geopandas/shapely/fiona/pyogrio 时自动 mock，无 GDAL 也能跑测试
+
+```bash
+# 前端 vitest（配置内嵌于 vite.config.ts 的 test 块：jsdom + src/test/setup.ts）
+cd frontend
+npm run test                                      # vitest run
+npx vitest run src/renderer/utils/__tests__/frequencyConversion.test.ts  # 单文件
+npx vitest run -t "GSCN"                          # 按用例名过滤
+```
+
+- `scripts/run-tests.sh` 依次执行后端 pytest 与前端 vitest
+
+### 桌面端（Windows 安装包，`desktop/`）
+
+```bash
+# 仅在 Windows 上构建；CI 见 .github/workflows/build-windows-desktop.yml
+pip install -r backend/requirements.txt -r desktop/requirements-desktop.txt
+python desktop/tools/make_icon.py                       # 生成 desktop/app.ico（构建期产物，不入库）
+python desktop/tools/spike.py                           # GDAL / pywebview / TAB 读写 / 上传链路基线自检
+pyinstaller --noconfirm --clean desktop/desktop.spec    # → dist/NetworkPlanningTool/{NPT.exe,_internal/}
+NPT.exe --selftest                                      # 打包产物冒烟
+ISCC desktop/installer.iss                              # → installer-out/NetworkPlanningTool-Setup-*.exe
+```
+
+- 权威打包链路是 `desktop/desktop.spec` + `.github/workflows/build-windows-desktop.yml`；根 `nptserve.spec` 是遗留配置（入口 `/tmp/nptserve/entry.py` 不在仓库内），**不要**用它构建
+- CI 触发：`workflow_dispatch`、push 到 `feat/windows-desktop`、push tag `desktop-v*`；仅 tag 触发时用 `gh release create` 发布安装包
+- CI 会跑桌面相关 pytest（`test_desktop_license*` / `test_desktop_local_*` / `test_desktop_releases` / `test_desktop_update_client` / `test_desktop_shared_mode` 等）并校验打包产物含 gdal/proj DLL、`proj.db`、`WebView2Loader.dll`、`frontend/dist-renderer/index.html`
+
+### 生产部署（Linux + systemd + Cloudflare Tunnel）
+
+```bash
+cd frontend && npm run build:vite     # 前端改动必须先构建
+systemctl restart npt-backend         # 后端改动 / 前端构建后重启
+```
+
+- 入口 https://app.pengwc.asia → cloudflared 隧道 → `localhost:8000`
+- systemd 单元 `/etc/systemd/system/npt-backend.service`：`WorkingDirectory=/home/pwc/NetworkPlanningTooV3/backend`、`ExecStart=.../backend/.venv/bin/python3 main.py`、`NPT_RELOAD=false`、`MemoryMax=2G`（仓库根同名文件为参考副本）
+- 日志：`journalctl -u npt-backend -n 100 --no-pager` 或 `tail -f /var/log/npt-backend.log`
+- `backend/Dockerfile`、`frontend/Dockerfile` 存在但无编排、未用于生产；生产以 systemd 为准
 
 ## 高层架构
 
-### 整体架构图
-
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                         Electron 主进程                       │
-│  (frontend/electron/main.ts - 窗口生命周期、IPC 通信)          │
-│  - 自动启动后端 Python 进程                                    │
-│  - 文件对话框处理                                              │
-└──────────────────────────┬──────────────────────────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────────┐
-│                      React 渲染进程                           │
-│   (Vite 开发服务器 / 生产构建 - frontend/src/renderer/)       │
-│                                                               │
-│  页面组件 (pages/) ──▶ API 服务层 (services/api.ts)          │
-│     │                              │                         │
-│     │                              ▼                         │
-│     │                    状态存储 (store/Zustand)             │
-│     │                      - taskStore (任务进度)             │
-│     │                      - dataStore (数据列表)             │
-│     │                      - mapStore (地图状态)              │
-│     │                      - licenseStore (许可证)            │
-│     │                      - tacStore / tacPlanningStore      │
-│     │                      - themeStore (主题)                │
-│     └───────────────────────────────────────────────────────┘
-                           │
-                    HTTP REST API + WebSocket
-                           │
-                    ┌──────┴──────┐
-                    │             │
-                    ▼             ▼
-              Vite Proxy     WebSocket
-              (/api → 8000)   (/ws → 8000)
-                    │             │
-                    └──────┬──────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                      FastAPI 后端服务                            │
-│                      (backend/app/)                              │
-│                                                                   │
-│  API 端点 (api/v1/endpoints/) ──▶ 服务层 (services/)            │
-│    - data.py      - data_service.py    - geo_data_service.py    │
-│    - pci.py       - task_manager.py    - export_service.py      │
-│    - neighbor.py  - mapinfo_service.py - tac_planning_service.py│
-│    - tac.py       - license_service.py - geo_field_detector.py  │
-│    - geo_data.py  - websocket_manager.py                        │
-│    - map.py                                                     │
-│    - system.py                                                  │
-│                                     │                            │
-│                                     ▼                            │
-│                          算法层 (algorithms/)                     │
-│                          - pci_planning_service_v2.py            │
-│                          - neighbor_planning_v1_service.py       │
-│                          - distance_calculator.py                │
-│                                                                   │
-│  数据存储: data/ (Excel + JSON 索引), outputs/, exports/         │
-│  编码处理: main.py 启动时配置 UTF-8 编码（解决 Windows GBK 问题）│
-└─────────────────────────────────────────────────────────────────┘
+浏览器 / mobile-app (Expo, JWT)
+   │ HTTPS  app.pengwc.asia → cloudflared → localhost:8000
+   ▼
+FastAPI (backend/app/)
+   ├─ /api/v1/*         REST 端点 (api/v1/endpoints/)
+   ├─ /api/v1/ws/tasks  WebSocket 任务推送
+   ├─ /static           outputs/ 静态文件
+   ├─ /layer-files      uploads/layers 图层文件
+   └─ SPA 兜底          frontend/dist-renderer/index.html
+        │
+   services/     业务逻辑：数据 / 任务 / 图层 / 认证 / 助手…
+        │
+   algorithms/   PCI、邻区、距离
+        │
+   存储：data/data.db (SQLite，权威) + data/<id>/original.xlsx (双写)
+        + data/index.json (内存索引) + outputs/ + exports/ + uploads/
 ```
 
-### 分层架构
+### 分层职责（`backend/app/`）
 
-| 层级 | 位置 | 职责 |
-|------|------|------|
-| **API 层** | `backend/app/api/v1/endpoints/` | 处理 HTTP 请求/响应，参数验证 |
-| **服务层** | `backend/app/services/` | 业务逻辑，数据管理，异步任务管理 |
-| **算法层** | `backend/app/algorithms/` | 核心规划算法（PCI、邻区） |
-| **数据层** | `backend/app/services/data_service.py` | 文件存储、Excel 解析、数据索引 |
-| **模型层** | `backend/app/models/schemas.py` | Pydantic 数据模型 |
-| **配置层** | `backend/app/core/config.py` | Settings 类，通过 NPT_ 环境变量配置 |
+| 层 | 位置 | 职责 |
+|----|------|------|
+| API 层 | `api/v1/endpoints/` | HTTP、参数校验、鉴权/权限依赖 |
+| 服务层 | `services/` | 业务逻辑、数据管理、任务编排 |
+| 算法层 | `algorithms/` | 纯计算：PCI、邻区、距离 |
+| ORM 模型 | `models/database.py` | SQLAlchemy 表定义（12 张表） |
+| Pydantic 模型 | `models/schemas.py` | 请求/响应模型 |
+| 基础设施 | `core/` | `config.py`(Settings/`NPT_`)、`database.py`(引擎+迁移+默认管理员)、`security.py`(JWT+权限依赖)、`data_access.py`(数据组鉴权) |
+| 应用入口 | `main.py` + `api/__init__.py` | UTF-8 处理；create_app/lifespan（建目录、清索引、init_db、预取图层缓存）、静态 SPA |
+
+### 数据与存储（改动前必读）
+
+- SQLite `data/data.db`（仓库根，非 `backend/data/`）是查询与规划的权威数据源（WAL、外键），由 `core/database.py` 管理
+- `init_db()` 用 `PRAGMA table_info` 做轻量迁移（**无 alembic**），启动时创建默认管理员 `admin` / `admin123`（`must_change_password=True`，首次登录强制改密）
+- 上传 Excel 时同时写 SQLite（Workbook/Site/Sector 等）并保留 `data/<id>/original.xlsx`；下载/导出时从 SQLite 反写 Excel
+- `data/index.json` 是内存索引的持久化，启动时与 SQLite 中的 Workbooks/GeoFiles/Layers 对账合并
+- **ORM 表**（`models/database.py`，15 张）：`users`、`user_sessions`、`workbooks`、`sites`、`sectors`、`geo_files`、`layers`、`user_settings`、`task_results`、`app_versions`、`desktop_licenses`、`desktop_releases`、`dataset_revisions`、`station_param_rows`、`station_metric_rows`
+- 桌面端相关列：`users.is_desktop_shadow`（服务器侧影子账号，承载无绑定授权的数据归属）、`users.desktop_run_mode`（`shared`/`standalone`，网页端恒 NULL）；`desktop_licenses` 另有 `mode`/`username`/`user_id`/`login_count`/`last_login_at`/`idle_logout_days`
+
+### 数据组隔离（地市 + 运营商）
+
+数据空间按 `(city, operator)` 分组隔离，**数据归组所有**，是本项目最容易踩坑的横切约束：
+
+- **写入盖章**：上传/创建数据时从操作者（或其操作的工参所属组）复制组信息
+- **查询过滤**：所有用户**含管理员**一律仅见同组数据，不设跨组特权；用户组信息缺失（city/operator 为 NULL）不可见任何业务数据
+- **存量迁移**：启动时把 city/operator 为 NULL 的存量数据迁移归入主管理员所在组
+- **落地工具**：`services/data_group.py`（`user_group`、`group_sql_filter`、`index_entry_visible`）、`core/data_access.py`（`require_data_group_access`、`require_task_access`，失败一律 **404** 以不泄露数据存在性）
+- 新增任何数据查询/写入路径都必须接上组门禁；`OPERATORS = ["移动","联通","电信","广电"]` 是唯一来源
+
+### 认证与权限
+
+- JWT Bearer（python-jose，HS256，默认 1440 分钟）+ bcrypt（passlib）；`user_sessions` 表支持会话吊销、IP 绑定与空闲超时
+- `core/security.py` 依赖：`get_current_user`、`get_current_admin_user`、`require_permission(...)`，预置 `require_data_import` / `require_data_delete` / `require_data_update` / `require_cell_entry` / `require_cell_query_update` / `require_assistant`（管理员绕过权限位）
+- 会话空闲超时：`NPT_SESSION_IDLE_TIMEOUT_MINUTES`（默认 180），由 `get_current_user` 在每次请求校验
+- 前端：`authStore` 持久化 `localStorage['auth-storage']`；`services/api.ts` 自动附加 Bearer，401 时清除凭证并派发 `auth:required`；`AuthGuard` 包裹全应用（未登录只显示 `LoginModal`），`ProtectedRoute` 处理 license 到期 / `requireAdmin` / `requirePermission`；`useHeartbeat` 每 4 分钟 ping
+
+### 桌面端运行形态（`desktop/`）
+
+- `desktop/launcher.py` 是 PyInstaller 入口：daemon 线程跑 uvicorn 绑 `127.0.0.1` 随机端口，主线程开 pywebview 窗口；注入 `NPT_DESKTOP=1`、`NPT_MAX_WORKERS=1`（Windows 无 fork）、`NPT_SERVER_URL`（默认 `https://app.pengwc.asia`）；可写数据落 `%APPDATA%\NetworkPlanningTool`（`NPT_DATA_ROOT` 可覆盖），与安装目录解耦；Windows 命名互斥体 `Local\NPTDesktop` 保证单实例
+- **同一份后端代码跑两种形态**：`NPT_DESKTOP=1` 时 `api/__init__.py` 额外挂后台协程（`desktop_cloud_client.renewal_loop` 静默续期、`desktop_sync_service.sync_loop` 共享模式同步、`desktop_local.session_guard_loop` 单设备登录校验），并放行 `/api/v1/desktop`；服务器专用管理端点（`admin_users` 等）经 `core/security.reject_desktop_mode` 在桌面形态下一律 404
+- **所有桌面分支必须由 `NPT_DESKTOP` 门控，不得改变服务器（systemd）部署行为**
+- 授权：Ed25519 密钥对由 `desktop/tools/gen_keypair.py` 生成，私钥在 `desktop/tools/keys/`（已 gitignore，**禁止入库/外发**），公钥 hex 写入 `backend/app/core/license_public_key.py`；`desktop/tools/gen_license.py` 签发离线 `.nptlic`
+- 同步凭证：云端数据同步端点的身份是**签名许可文件 + 机器码**（非 JWT），见 `desktop_cloud._verify_license`
 
 ### 异步任务处理
 
-**关键组件**: `backend/app/services/task_manager.py`
+- `services/task_manager.py`（单例）：`asyncio` + 信号量 `NPT_MAX_TASKS`，可选 ProcessPool（`NPT_MAX_WORKERS`）；状态 PENDING → PROCESSING → COMPLETED/FAILED
+- 进度经 `websocket_manager` 广播到 `/api/v1/ws/tasks`；结果落 `outputs/tasks_index.json` 与 `task_results` 表
+- 前端以 `taskStore` 轮询为主，WebSocket 目前只消费全局 `task_deleted` 消息
+- PCI/TAC「应用到工参」直接 UPDATE SQLite，随后后台线程同步回 Excel
 
-- 使用 `asyncio` 处理长时间运行的规划任务
-- `TaskManager` 管理任务生命周期（创建、执行、进度追踪、完成）
-- 支持进度回调，前端通过 WebSocket (`websocket_manager.py`) 获取实时进度
-- 任务状态: PENDING → PROCESSING → COMPLETED/FAILED
+### 算法层现状
+
+- **活跃**：`algorithms/pci_planning_v1_service.py`（`task_manager.py` 实际调用，**不是 v2**）、`neighbor_planning_v1_service.py`、`distance_calculator.py`
+- **非活跃**：`pci_planning_service_v2.py`（仅测试与未接线的 `_run_pci_sync` 引用）、`pci_planning_service.py`、`pci_collision_detector.py`（死代码，勿据其推断现状）
+- TAC 规划另用 scikit-learn BallTree 做插花检测
+
+### 前端架构（`frontend/src/renderer/`）
+
+- 路由在 `App.tsx`：`LastRouteTracker > AuthGuard > MainLayout > Suspense > Routes`；页面由 `pageLoaders.ts` 做 `React.lazy` 分包 + `recoverable`（chunk 加载失败自动刷新一次）+ 导航悬停预取
+- Zustand store（`store/`，17 个）：`authStore`（含桌面端 `desktopMode`/`desktopProbed`/`desktopRunMode`/`desktopPendingUsername`，`probeDesktopMode()` 探测本机后端）、`dataStore`、`taskStore`、`mapStore`（按用户持久化，与后端 user settings 同步）、`layerEditStore`（图层编辑真源：workspaces/撤销/剪贴板）、`mapDataCacheStore`（跨页 LRU）、`desktopSyncStore`（共享模式每 5s 轮询 `/desktop/sync-status`，同步落地派发 `DESKTOP_SYNCED_EVENT`）、`licenseStore`、`pciStore`/`neighborStore`/`tacCheckStore`/`tacPlanningStore`（向导状态）、`tacStore`（旧版，`@deprecated`）、`themeStore`、`toastStore`、`downloadStore`；`uploadStore` 不是 Zustand（分片上传单例）
+- `services/api.ts`：`apiClient`（`/api/v1`，300s）+ `uploadClient`（dev 直连 8000，规避 multipart 代理问题）+ 拦截器；按域导出 `authApi` / `adminUserApi` / `userSettingsApi` / `appVersionsApi` / `dataApi` / `layerApi` / `layerToolsApi` / `pciApi` / `neighborApi` / `tacApi` / `tacPlanningApi` / `distanceMatchApi` / `siteSpacingApi` / `mapApi` / `assistantApi` / `systemApi`（`info`/`desktopMode`）/ `desktopLoginApi` / `desktopCloudApi` / `desktopLicensesApi` / `desktopReleasesApi` / `desktopUpdateApi` 等
+- 地图（`components/Map/`，41 个 `.ts`/`.tsx` 源文件）：`OnlineMap.tsx`（Leaflet + 高德，跨页共享实例缓存，托管图层/选择/编辑会话）、`OfflineMap.tsx`、`MapInfoLayer.tsx`（TAB/MIF）、`GeoDataLayer.tsx`、`SectorRendererSVG.tsx`（LTE/NR 扇区）、`LayerControl.tsx`（图层树：显隐/可选/编辑开关/排序）、`LabelLayoutManager.ts`（统一标签防重叠）、`HeatmapLayerManager.ts`（值热力面）、`OriginalSamplesLayer.ts`、`FloatingPanel.tsx`（可拖拽缩放浮动面板）等
+- 图层编辑子系统：`components/Map/LayerEditSession.ts`（绘制/顶点/吸附/圈选/命中，由 OnlineMap 懒创建）+ `store/layerEditStore.ts`；工具栏在 `pages/MapPage.tsx`
+- 坐标约定见下方「坐标系」
+- i18n：i18next 单 namespace，`locales/zh.json` / `en.json`（约 1600 行 / 23 个分组）；语言切换入口在 LicensePage
+
+### 前端路由表
+
+| path | 页面 | 说明 |
+|------|------|------|
+| `/license` | `LicensePage` | 许可证/主题/语言/LLM 配置（唯一不受 `ProtectedRoute` 限制） |
+| `/` | `HomePage` | 首页（直接 import，非懒加载） |
+| `/data` | `DataPage` | 数据管理（上传/预览/查询更新/新站录入） |
+| `/pci` | `PCIPage` | PCI 规划 |
+| `/neighbor` | `NeighborPage` | 邻区规划 |
+| `/tac` | `TACPage` | TAC 核查 |
+| `/tac-planning` | `TACPlanningPage` | TAC 规划 |
+| `/map` | `MapPage` | 地图工具（在线/离线、搜索、图层、绘制、编辑） |
+| `/layer` | `LayerToolsPage` | 图层制作（Excel → TAB/MIF/KML） |
+| `/distance-match` | `DistanceMatchPage` | 批量距离匹配 |
+| `/site-spacing` | `SiteSpacingPage` | 站间距计算 |
+| `/frequency-conversion` | `FrequencyConversionPage` | 频点换算 |
+| `/admin/users` | `AdminUsersPage` | 用户管理（`requireAdmin`） |
+| `/app-versions` | `AppVersionsPage` | APP 版本管理（`requireAdmin`） |
+| `/assistant` | `AssistantPage` | 网优助手（`requirePermission="can_assistant"`） |
+| `/desktop-releases` | `DesktopReleasesPage` | 桌面版安装包分发（`requireAdmin`，侧栏仅非桌面形态的管理员可见） |
+| `/desktop-licenses` | `DesktopLicensesPage` | 桌面授权管理（`requireAdmin`，同上） |
+| `*` | — | 重定向 `/` |
+
+> `pages/HistoryPage.tsx`、`pages/TaskConfigPage.tsx`、`pages/NetworkStatusDemo.tsx` 未挂路由（组件级/演示用途）。
+
+**桌面形态下的前端差异**：是否桌面端由 `authStore.probeDesktopMode()` 探测本机后端（`GET /system/desktop-mode` → `settings.NPT_DESKTOP`）得出，`AuthGuard` 探测完成前显示 spinner 以免闪出网页登录页。桌面端隐藏管理员侧栏入口与管理员授权卡片，改走 `desktopCloudApi.appVersion()`；`components/` 下的 `DesktopAuthPendingDialog`（单机待批 5s 轮询）、`DesktopSessionGuard`（单设备登录 30s 校验）、`DesktopSyncIndicator`（共享模式同步状态）、`DesktopUpdateDialog`（OTA）仅在桌面形态生效。
+
+## API 端点前缀（`api/v1/endpoints/`）
+
+| 文件 | 前缀 | 说明 |
+|------|------|------|
+| `auth.py` | `/api/v1/auth` | 注册/登录/me/ping/登出/改密 |
+| `admin_users.py` | `/api/v1/admin/users` | 用户 CRUD、重置密码、权限（admin） |
+| `user_settings.py` | `/api/v1/user` | 用户设置（地图偏好等，GET/PUT `/settings`） |
+| `data.py` | `/api/v1/data` | 上传（含分片）、全量工参与小区查询/批量更新、图层数据读写/下载 |
+| `geo_data.py` | `/api/v1/data` | 地理化数据上传（与 data 同前缀，不同 tag） |
+| `layer.py` | `/api/v1/layer` | 图层制作（`/excel-info`、`/point`、`/sector`） |
+| `pci.py` / `neighbor.py` / `tac.py` | `/api/v1/pci` 等 | 规划/核查、进度、结果、历史、导出、应用到工参 |
+| `distance_match.py` | `/api/v1/distance-match` | 批量距离匹配 |
+| `site_spacing.py` | `/api/v1/site-spacing` | 站间距计算 |
+| `attribute_join.py` | `/api/v1/attribute-join` | 条件选择（图层属性空间连接） |
+| `buffer.py` | `/api/v1/buffer` | 绘制缓冲区 |
+| `map.py` | `/api/v1/map` | 地图数据/小区/扇区、缓存清理、在线与离线配置 |
+| `license.py` | `/api/v1/license` | 许可证状态/上传/激活 |
+| `app_versions.py` | `/api/v1/app-versions` | APP 版本管理：latest/download（公开）、上传（admin、分片） |
+| `assistant.py` | `/api/v1/assistant` | LLM 配置、数据集、对话（需 `can_assistant`） |
+| `desktop_licenses.py` | `/api/v1/desktop-licenses` | 桌面授权管理（admin）：创建激活码/批准/禁用/解绑换机/重发码 |
+| `desktop_cloud.py` | `/api/v1/desktop-cloud` | 桌面客户端**公开**接口（授权服务器侧）：账号登录/单设备会话校验、激活/续期/申请（凭证=激活码或签名许可 + 机器码，非 JWT）、`/config`、数据集同步（`/data/session|manifest|dataset/{id}/package`）、`releases/latest` 与 `releases/download/{id}`（Range） |
+| `desktop_local.py` | `/api/v1/desktop` | 桌面版**本机**接口（仅 `NPT_DESKTOP=1`，否则 404）：`login`/`auth-poll`、`cloud-status|activate|renew|apply`、共享模式 `sync-status|run-mode|sync|sync-resolve`、`update/status|download|progress|snooze|install`、`exit`（经 `app/desktop_bridge.py` 关闭窗口） |
+| `desktop_releases.py` | `/api/v1/desktop-releases` | 桌面版安装包管理（admin）：分片上传、列表/编辑/删除/设最新 |
+| `system.py` | `/api/v1/system` | 状态/信息（`/info`、`/desktop-mode` 供前端探测桌面形态） |
+| `websocket.py` | `/api/v1/ws/tasks` | 任务进度推送（**注意不是裸 `/ws`**） |
+
+> 图层编辑/增量保存的端点不在 `layer.py`，而在 `data.py` 的 `PUT /{data_id}/layers/{layer_id}/data` 等路径，内部调用 `layer_edit_service` / `layer_patch_service`。
 
 ## 关键文件位置
 
-### 后端核心文件
+### 后端
 
-| 文件 | 说明 |
-|------|------|
-| `backend/main.py` | FastAPI 应用入口，Uvicorn 服务器配置，UTF-8 编码处理 |
-| `backend/app/api/__init__.py` | 创建应用实例，配置 CORS，UTF8JSONResponse |
-| `backend/app/api/v1/__init__.py` | 路由注册 |
-| `backend/app/core/config.py` | 应用配置（Settings 类，所有配置通过 NPT_ 前缀环境变量覆盖） |
-| `backend/app/core/exceptions.py` | 自定义异常类 |
-| `backend/app/models/schemas.py` | Pydantic 数据模型 |
-| `backend/app/services/data_service.py` | 数据管理服务（单例） |
-| `backend/app/services/task_manager.py` | 异步任务管理器（单例） |
-| `backend/app/services/websocket_manager.py` | WebSocket 连接管理 |
-| `backend/app/services/export_service.py` | 导出服务（Excel/CSV） |
-| `backend/app/services/geo_data_service.py` | 地理数据处理服务 |
-| `backend/app/services/tac_planning_service.py` | TAC 规划服务 |
-| `backend/app/algorithms/pci_planning_service_v2.py` | PCI 规划算法（当前活跃版本） |
-| `backend/app/algorithms/neighbor_planning_v1_service.py` | 邻区规划算法 |
-| `backend/app/algorithms/distance_calculator.py` | 距离计算工具 |
-| `shared/types.ts` | 前后端共享的 TypeScript 类型定义 |
+- `main.py` — 入口、UTF-8/print 兜底、uvicorn；`api/__init__.py` — create_app、lifespan、CORS、GZip、SPA 静态兜底
+- `core/config.py` — Settings（`NPT_` 环境变量）；`core/database.py` — SQLite 引擎/迁移/默认管理员；`core/security.py` — JWT 与权限依赖；`core/data_access.py` — 数据组鉴权依赖
+- `models/database.py` — ORM 表；`models/schemas.py` — Pydantic 模型
+- `services/data_service.py` — 数据中心（单例）；`task_manager.py` — 任务引擎（单例）；`auth_service.py` — 认证/会话；`data_group.py` — 数据组隔离
+- `services/layer_service.py` — 图层制作；`layer_edit_service.py` — 图层编辑保存/打包下载；`layer_patch_service.py` — 增量保存与版本冲突；`tab_io.py` — TAB 底层读写；`tab_style_writer.py` / `ogr_style_reader.py` — 逐要素样式读写；`mapinfo_service.py` — TAB/MIF/KML 解析与样式
+- `services/buffer_service.py` — 缓冲区；`attribute_join_service.py` — 条件选择；`geo_data_service.py` / `geo_field_detector.py` — 地理化数据；`tac_planning_service.py` — TAC 规划；`distance_match_service.py` / `site_spacing_service.py` — 工具算法；`export_service.py` — 导出；`websocket_manager.py` — WS 广播
+- `services/assistant/` — `chat_service.py`(function-calling)、`ingest_service.py`、`query_service.py`(只读 SQL 工具)、`llm_config.py`(配置持久化到 `data/llm_config.json`)
+- 桌面端：`services/desktop_license_service.py`（授权记录/登录/续期/影子账号）、`desktop_signing.py`（Ed25519 签发与验签）、`desktop_cloud_client.py`（客户端→授权服务器 HTTP）、`desktop_sync_service.py`（共享模式数据集双向同步）、`desktop_update_service.py`（OTA 检查/断点续传/sha256/静默安装）、`dataset_revision_service.py`（数据集修订号与墓碑）、`app/desktop_bridge.py`（桌面壳退出回调）
+- `utils/` — `coordinate_transformer.py`、`excel_columns.py`、`geojson_geometry.py`、`layer_type_config.py`、`hardware_fingerprint.py`
 
-### 后端 API 端点
+### 前端
 
-| 文件 | 端点前缀 | 说明 |
-|------|---------|------|
-| `data.py` | `/api/v1/data` | 数据上传/管理/预览 |
-| `pci.py` | `/api/v1/pci` | PCI 规划 |
-| `neighbor.py` | `/api/v1/neighbor` | 邻区规划 |
-| `tac.py` | `/api/v1/tac` | TAC 规划 |
-| `geo_data.py` | `/api/v1/data` (地理化数据路由) | 地理化数据处理 |
-| `map.py` | `/api/v1/map` | 地图服务 |
-| `license.py` | `/api/v1/license` | 许可证管理 |
-| `system.py` | `/api/v1/system` | 系统服务（状态、配置等） |
-| `websocket.py` | `/ws` | WebSocket 连接 |
+- `App.tsx` — 路由与守卫；`pageLoaders.ts` — 懒加载/预取/chunk 恢复；`main.tsx` — 入口（首帧前 `applyTheme()`）；`i18n.ts` — 国际化
+- `services/api.ts` — 全部后端 API 封装；`services/mapDataService.ts` — 工参拉取/过滤/坐标转换/LOD/IndexedDB 缓存
+- `components/Map/` — 地图与图层编辑（见上文）；`store/` — Zustand；`utils/` — 坐标、配色、热力场、要素属性等纯函数
+- `config/layer-config.ts`（图层字段匹配规则）、`config/sector-config.ts`（扇区渲染配置/LOD）
 
-### 前端核心文件
+### 数据与产物
 
-| 文件 | 说明 |
-|------|------|
-| `frontend/electron/main.ts` | Electron 主进程入口，窗口管理，自动启动后端 |
-| `frontend/electron/preload.ts` | 预加载脚本，安全 API 暴露 |
-| `frontend/src/renderer/main.tsx` | React 入口 |
-| `frontend/src/renderer/App.tsx` | React 根组件，路由配置 |
-| `frontend/src/renderer/i18n.ts` | i18n 国际化配置 |
-| `frontend/src/renderer/locales/zh.json` | 中文翻译文件 |
-| `frontend/src/renderer/locales/en.json` | 英文翻译文件 |
-| `frontend/src/renderer/services/api.ts` | Axios API 封装（含 uploadClient 专用上传实例） |
-| `frontend/src/renderer/store/` | Zustand 状态管理 (7 stores) |
-| `frontend/src/renderer/pages/` | 页面组件 (9 pages) |
-| `frontend/src/renderer/components/Map/` | 地图组件 (OnlineMap, OfflineMap, SectorRendererSVG, LayerControl, GeoDataLayer, MapInfoLayer 等 18 个文件) |
-| `frontend/src/renderer/utils/` | 工具函数 (coordinate.ts 坐标转换, frequencyColors.ts 频段配色, tacColors.ts TAC配色, sector-config.ts 扇区配置) |
-
-### 前端页面
-
-| 文件 | 路由 | 说明 |
-|------|------|------|
-| `HomePage.tsx` | `/` | 首页/仪表盘 |
-| `DataPage.tsx` | `/data` | 数据管理（上传/预览/删除） |
-| `MapPage.tsx` | `/map` | 地图可视化（在线/离线） |
-| `PCIPage.tsx` | `/pci` | PCI 规划 |
-| `NeighborPage.tsx` | `/neighbor` | 邻区规划 |
-| `TACPage.tsx` | `/tac` | TAC 配置页面 |
-| `TACPlanningPage.tsx` | `/tac/planning` | TAC 规划执行页面 |
-| `LicensePage.tsx` | `/license` | 许可证管理 |
-| `NetworkStatusDemo.tsx` | `/network-status` | 网络状态演示 |
+- `data/`（上传文件、`index.json`、`data.db`）、`outputs/`（任务结果）、`exports/`、`uploads/layers/`（图层文件）、`backend/app/apks/`（APK 文件）
+- 桌面端：`desktop_releases/`（安装包仓库，`DESKTOP_RELEASES_DIR`）、`licenses/`（许可文件与 Ed25519 私钥）、`installer-out/`（本地 Inno Setup 产物）、`desktop/`（源码 + `desktop.spec` + `installer.iss` + `tools/`）
+- 设计/实施历史文档在 `docs/plans/`（按日期，含图层/距离匹配/频点换算/小区查询等）
+- 文档分工（见根 `AGENTS.md`）：本文件与根 `CODEBUDDY.md` **互为镜像**，改其一需同步另一份；`README.md` 是面向用户的功能概览；`docs/LICENSE_GUIDE.md` 等专题文档可能滞后于代码，以当前代码为准
 
 ## 数据流与关键模式
 
-### 文件上传流程
+- **文件上传**：前端 → `POST /api/v1/data/upload/excel`（大文件走分片接口）→ Pandas 解析（LTE/NR 分表）→ 写 SQLite + `data/<id>/original.xlsx` → 刷新 `index.json`
+- **规划任务**：配置 → `POST /api/v1/{pci,neighbor,tac}/plan` → `task_manager.create_*_task` → `asyncio` 执行算法 → 进度回调 → WS/轮询 → 结果存 `outputs/` 与 `task_results`
+- **应用到工参**：规划结果直接 UPDATE SQLite，后台线程再同步回 Excel
+- **图层保存**：前端 GeoJSON（GCJ02）→ `PUT /api/v1/data/{dataId}/layers/{layerId}/data` → `layer_edit_service` 整层重写 TAB/MIF（含样式元数据列）→ 刷新数据条目时间戳
+- **图层下载**：`GET /api/v1/data/{dataId}/layers/{layerId}/download` 打包同 stem 的 `.tab/.dat/.id/.map/.ind`
+- **APP 分发**：管理端分片上传 APK（绕过 Cloudflare 100MB 限制）→ `app_versions` 表 + `backend/app/apks/`；客户端 `GET /api/v1/app-versions/latest` 与 `/download/{id}`（支持 Range、下载计数）
+- **桌面版登录与授权（2026-10 改版）**：桌面端不再有 owner 免登录账号，与网页端**共用同一套账号**；桌面形态的登录页多一组「运行模式」选择：
+  - **共享模式**：`POST /desktop/login`（本机）→ 代理 `POST /desktop-cloud/auth/login`（服务器）→ 用 `auth_service.authenticate_user` 校验网页端账号 → 为「账号 + 机器」自动签发许可（`DesktopLicense.mode='shared'`，兼作同步凭证）→ 本机镜像同名本地账号（组/权限位/管理员位照搬）→ 签发本机 JWT，登录即启动双向同步。
+  - **单机模式**：同流程，但按 `(username, machine_code)` 找/建 `mode='standalone'` 授权；未批准返回 `result=pending`，前端 `DesktopAuthPendingDialog` 轮询 `POST /desktop/auth-poll`，管理员在网页端「桌面授权」页批准后签发许可。单机模式强制 `run_mode=offline`（数据本机私有、不参与同步）、隐藏授权/同步/数据组卡片；仅当「网络不可达 + 本机已有该账号 + 本机许可有效」时才回退本地校验密码离线登录。
+  - 单设备登录：共享模式登录在服务器记账并踢掉该账号其它会话；客户端每 60s 调 `POST /desktop-cloud/auth/session-check`，失效即本机登出（`desktop_local.session_guard_loop`）。每次联机登录累加 `DesktopLicense.login_count`，断网登录本机记账、联机补报。
+- **桌面端数据同步（共享模式）**：粒度是**整包数据集（zip）**，不是行级增量。`dataset_revision_service.py` 为每个数据集维护**单调递增 rev**——只有真正改变内容的写入才 `bump`，`set_sha`（下载）不推进 rev，否则 rev 抖动会导致反复整包下载；删除写**墓碑** `deleted=True`，避免本地删除被当成新建推回。客户端 `sync_state.json` 记录「服务器 rev 基线 + sha256 + dirty」，`sync_loop` 按 `NPT_DESKTOP_SYNC_INTERVAL_MINUTES` 轮询、本地改动经 `NPT_DESKTOP_SYNC_DEBOUNCE_SECONDS` 防抖上行。冲突不做行级合并，采用**最后写入者胜 + 显式选边**（`/desktop/sync-resolve` 选 server/local）；push 带 `base_rev` 乐观锁，服务器 rev 不符返回 409。**服务器权威 `dataset_revisions` 表与本地 `sync_state.json` 里记录的服务器 rev 是两套数字，不可混用。**
+- **许可签发与续期**：Ed25519 许可（私钥仅服务器：`NPT_LICENSE_PRIVATE_KEY` 或 `licenses/license_private_key.pem`），租约默认 30 天、启动后台静默续期（剩余 <20 天或距上次 ≥7 天）；离线 `.nptlic` 导入通道保留。
+- **桌面端 OTA**：管理端分片上传安装包到 `desktop_releases` → 客户端比对版本 → 断点续传下载 + sha256 校验 → 写 `%TEMP%\npt_update_*.cmd`（等进程退出 → 静默安装 → 重启），经 `app/desktop_bridge.py` 的退出回调关闭应用；「稍后」超过 `NPT_DESKTOP_MAX_SNOOZE` 次或 `mandatory` 转强制。
+- **网优助手**：LLM 配置/数据集导入到 `station_param_rows`、`station_metric_rows`；对话走 function-calling（最多 5 轮工具调用），查询只读
 
-```
-用户选择文件 → Electron IPC 获取文件路径
-→ POST /api/v1/data/upload/excel
-→ data_service 处理文件
-→ Pandas 解析 Excel（支持 LTE/NR 分表）
-→ 存储到 data/ 目录
-→ 更新内存索引（data/index.json）
-```
+## 添加新 API 端点
 
-### PCI 规划流程
+1. 在 `backend/app/api/v1/endpoints/` 新建端点文件
+2. 在 `backend/app/api/v1/__init__.py` 用 `api_router.include_router(...)` 注册
+3. 需要登录/权限时加 `Depends(get_current_user)`、`require_permission(...)`（`core/security.py`）；涉及数据条目再加 `require_data_group_access`（`core/data_access.py`）
+4. 在 `shared/types.ts` 添加 TS 类型，在 `frontend/src/renderer/services/api.ts` 添加调用函数
 
-```
-用户配置 → POST /api/v1/pci/plan
-→ task_manager.create_pci_task()
-→ asyncio.create_task(_run_pci_task)
-→ pci_planning_service_v2 执行算法
-→ progress_callback 更新进度
-→ WebSocket 推送进度到前端
-→ 完成后存储结果
-```
+## 关键开发约束
 
-### 数据结构说明
+### 多语言（前端必须遵守）
 
-**Excel 数据支持两种格式**:
-1. **新格式（推荐）**: `{ "LTE": [...], "NR": [...] }` - 按 LTE/NR 网络类型分表
-2. **旧格式**: `[...]` - 扁平列表，每条记录包含 `networkType` 字段
+- UI 文本一律用 `t()`，不得硬编码中文显示串
+- `useTranslation()` 必须在 React 组件函数体内调用（含 `UploadArea` / `DataPreview` 等子组件），不得依赖父组件传入的 `t`
+- 日期格式按 `i18n.language` 动态设 locale：`i18n.language === 'en' ? 'en-US' : 'zh-CN'`
+- 搜索/过滤逻辑不得依赖 `t()` 返回值；用布尔值或原始数据比较
+- 新增 key 必须同时在 `locales/zh.json` 和 `locales/en.json` 添加
 
-**数据文件类型识别** (data_service.py):
-- `full_params`: 包含 "LTE Project Parameters" 和 "NR Project Parameters" 工作表
-- `target_cells`: 包含 "LTE" 和 "NR" 工作表
-- `default`: 其他格式
+### 坐标系
 
-**地理数据支持格式**: Excel (.xlsx), CSV (.csv), TXT (.txt), TAB (.tab), MIF (.mif)
+- 前端渲染与图层编辑使用 **GCJ02**；后端持久化 **WGS84**
+- 工参/地理化点数据为 WGS84，前端转 GCJ02；MapInfo 与地理化多边形 path 由后端已转 GCJ02
+- 跨端传几何按既有链路转换（前端 `utils/coordinate.ts`，后端 `utils/coordinate_transformer.py` / `geojson_geometry.py`），新链路不得自行混用坐标系
 
-**数据索引**: `data/index.json` 存储所有上传文件的元数据（启动时自动清理无效索引项）
+### 后端编码（Windows GBK 兼容）
 
-## API 端点结构
-
-| 模块 | 前缀 | 主要端点 |
-|------|------|---------|
-| 许可证 | `/api/v1/license` | `/status`, `/activate`, `/upload` |
-| 数据管理 | `/api/v1/data` | `/upload/excel`, `/upload/map`, `/upload/geo`, `/list`, `/{id}`, `/update-parameters`, `/{id}/preview`, `/{id}/delete` |
-| PCI 规划 | `/api/v1/pci` | `/plan`, `/progress/{id}`, `/result/{id}`, `/export/{id}` |
-| 邻区规划 | `/api/v1/neighbor` | `/plan`, `/progress/{id}`, `/result/{id}`, `/export/{id}` |
-| TAC 规划 | `/api/v1/tac` | `/plan`, `/planning/plan`, `/progress/{id}`, `/result/{id}`, `/export/{id}` |
-| 地理数据 | `/api/v1/geo-data` | `/upload`, `/list`, `/{id}`, `/{id}/preview` |
-| 地图服务 | `/api/v1/map` | `/data`, `/online-config`, `/offline-path` |
-| 系统服务 | `/api/v1/system` | `/status`, `/config` |
-| WebSocket | `/ws` | 实时进度推送连接 |
-
-## 关键开发模式
-
-### 后端配置环境变量（NPT_ 前缀）
-
-所有可配置项通过 `backend/app/core/config.py` 的 Settings 类管理，支持 `.env` 文件覆盖：
-
-```bash
-NPT_HOST=0.0.0.0
-NPT_PORT=8000
-NPT_CORS_ORIGINS=http://localhost:5173,http://127.0.0.1:5173
-NPT_AMAP_API_KEY=your_key
-NPT_AMAP_SECURITY_CODE=your_code
-NPT_LICENSE_SECRET_KEY=your_secret
-NPT_MAX_TASKS=10
-NPT_TASK_TIMEOUT=3600
-```
-
-### 前端 API 服务模式
-
-`frontend/src/renderer/services/api.ts` 使用双客户端模式：
-
-```typescript
-// 普通 API 请求
-const apiClient = axios.create({
-  baseURL: '/api/v1',
-  timeout: 300000,
-  headers: { 'Content-Type': 'application/json' }
-})
-
-// 文件上传专用（开发环境直接访问后端）
-const uploadClient = axios.create({
-  baseURL: isDev ? 'http://localhost:8000/api/v1' : '/api/v1',
-  timeout: 300000
-})
-
-// Blob 下载
-const response = await apiClient.get('/api/download', { responseType: 'blob' })
-return response.data  // 直接返回 blob
-```
-
-### 添加新的 API 端点
-
-1. 在 `backend/app/api/v1/endpoints/` 创建新的端点文件
-2. 在 `backend/app/api/v1/__init__.py` 注册路由（`api_router.include_router(...)`）
-3. 在 `shared/types.ts` 添加对应的 TypeScript 类型
-4. 在 `frontend/src/renderer/services/api.ts` 添加 API 调用函数
-
-### 前端状态管理模式
-
-- 使用 Zustand 创建 store (`frontend/src/renderer/store/`)
-- 遵循现有模式：定义 state、actions、selectors
-- 在组件中使用 `useXxxStore()` hook 获取状态和方法
-
-### 后端编码处理（Windows GBK 兼容）
-
-所有错误消息必须进行 GBK 安全处理：
+- API 响应用 `UTF8JSONResponse`（`ensure_ascii=False`）；错误消息做 GBK 安全处理后再抛 `HTTPException`：
 
 ```python
-# 错误处理模式
-try:
-    result = operation()
 except Exception as e:
     safe_detail = str(e).encode("gbk", "replace").decode("gbk")
     raise HTTPException(status_code=400, detail=safe_detail)
 ```
 
-### CPU 密集型操作异步处理
+### CPU 密集型操作
 
-使用 `run_in_threadpool` 处理 pandas/geopandas 操作：
+- pandas/geopandas 用 `run_in_threadpool` 包裹；重任务放 `task_manager`，不要阻塞事件循环
 
-```python
-from fastapi.concurrency import run_in_threadpool
+### 前端构建
 
-# CPU 密集型操作
-result = await run_in_threadpool(heavy_pandas_operation, df)
+- Vite `outDir` 必须为 `dist-renderer`（后端按此路径托管 SPA）；**不要添加 `manualChunks`**（历史上导致跨 chunk TDZ 错误，`vite.config.ts` 有注释说明）
+
+### 别改错文件（根目录同名旧快照）
+
+- 仓库根的 `data_service.py`、`mapinfo_service.py`、`tac_planning_service.py` 是 7 月的**旧快照**（已入库，体量远小于现行版），不是运行代码；一律改 `backend/app/services/` 下的同名文件
+- 根 `nptserve.spec` 是遗留打包配置，桌面打包以 `desktop/desktop.spec` + `.github/workflows/build-windows-desktop.yml` 为准
+- 同类遗留：`frontend/package.json.electron`、`frontend/capacitor.config.ts`、`frontend/start-electron-dev.bat`（Electron/Capacitor 已废弃）
+
+### 桌面端与服务器共存
+
+- 桌面端与网页端**共用同一份后端代码**；所有桌面专属分支必须由 `NPT_DESKTOP` 门控，**不得改变服务器（systemd）部署行为**
+- 新增数据读写路径同样要接数据组门禁；桌面端本机后端与服务器端后端各有一套 `data.db`，共享模式靠 `dataset_revisions` + `sync_state.json` 对齐，不要绕开同步链路直接改对端库
+- `desktop/tools/keys/` 与 `licenses/` 下的 Ed25519 私钥已 gitignore，**禁止入库或外发**
+
+### 代码风格
+
+- 前端：外部库 → 内部 `@/` 或 `@shared` 别名 → `type` 类型导入；组件 PascalCase、函数 camelCase、常量 UPPER_SNAKE_CASE、文件 kebab-case
+- 后端：标准库 → 第三方 → 内部（`from app...`）；类 PascalCase、函数 snake_case
+- React：Effects 仅用于同步外部系统（地图/事件/WS）；派生状态用 `useMemo`；自定义 Hook 以 `use` 前缀
+- 前端栈：React 18 + TypeScript + Zustand + Tailwind + Radix UI + lucide-react；地图 Leaflet / react-leaflet（在线）+ 自定义扇区渲染
+- 单文件超过 500 行、单函数超过 50 行时应识别拆分（见根 `AGENTS.md`）
+
+### 协作与提交约定（来自根 `AGENTS.md`）
+
+- 回复使用简体中文；沟通按金字塔原理（结论先行、先全局后细节）
+- 编码遵循 DRY/KISS/SOLID/YAGNI
+- Git 采用 GitHub Flow：禁止直接提交/强推 main；Conventional Commits；原子提交
+- 依赖管理：AGENTS.md 通用约定为前端 pnpm、后端 uv；**本仓库实际使用 npm（`frontend/`）+ pip/venv（`backend/.venv`）**，不要改用 pnpm / uv
+
+## 环境变量（`NPT_` 前缀，支持 `backend/.env` 覆盖）
+
+```
+NPT_HOST / NPT_PORT / NPT_CORS_ORIGINS
+NPT_JWT_SECRET_KEY / NPT_JWT_ALGORITHM / NPT_JWT_ACCESS_TOKEN_EXPIRE_MINUTES
+NPT_SESSION_IDLE_TIMEOUT_MINUTES          # 默认 180（分钟）
+NPT_LICENSE_SECRET_KEY / NPT_LICENSE_EXPIRY_DAYS
+NPT_AMAP_API_KEY / NPT_AMAP_SECURITY_CODE
+NPT_MAX_TASKS / NPT_TASK_TIMEOUT / NPT_MAX_WORKERS
+NPT_RELOAD / NPT_WORKERS
+NPT_LLM_BASE_URL / NPT_LLM_API_KEY / NPT_LLM_MODEL / NPT_LLM_TIMEOUT
+NPT_CITY_PRESETS                          # 地市预设（逗号分隔），注册/建号校验源
+NPT_DATA_ROOT                             # 可写数据根目录（桌面端默认 %APPDATA%\NetworkPlanningTool）
+# 桌面端（仅 NPT_DESKTOP=1 时生效；服务器侧只用到 NPT_LICENSE_PRIVATE_KEY 等）
+NPT_DESKTOP                               # 运行形态开关，launcher.py 注入 1
+NPT_LICENSE_PRIVATE_KEY                   # Ed25519 签发私钥（或用 licenses/license_private_key.pem）
+NPT_SERVER_URL / NPT_DESKTOP_CHANNEL / NPT_DESKTOP_VERSION
+NPT_DESKTOP_ACTIVATION_MODE               # precreate（默认）/ approve（单机需管理员批准）
+NPT_DESKTOP_LEASE_DAYS                    # 许可租约天数，默认 30
+NPT_DESKTOP_MAX_SNOOZE                    # 强制更新前允许「稍后」的次数
+NPT_DESKTOP_SYNC_INTERVAL_MINUTES         # 共享模式后台同步轮询间隔
+NPT_DESKTOP_SYNC_DEBOUNCE_SECONDS         # 本地改动上行防抖秒数，默认 3
 ```
 
-## 代码风格指南
+前端 `frontend/.env`：`VITE_DEV_MODE`、`VITE_API_URL`。
 
-### 前端导入顺序
+## 依赖与环境注意
 
-```typescript
-// 1. 外部库
-import React from 'react'
-import { Shield } from 'lucide-react'
-
-// 2. 内部模块 (@/ 别名)
-import { apiClient } from '@/services/api'
-import { useDataStore } from '@/store/dataStore'
-
-// 3. 类型导入 (始终使用 'type' 关键字)
-import type { ApiResponse, DataItem } from '@shared/types'
-```
-
-### 后端导入顺序
-
-```python
-# 1. 标准库
-import asyncio
-from typing import List, Optional
-from pathlib import Path
-
-# 2. 第三方
-from fastapi import APIRouter, HTTPException
-import pandas as pd
-
-# 3. 内部
-from app.models.schemas import DataItem
-from app.services.data_service import data_service
-```
-
-### 命名约定
-
-| 位置 | 组件/类 | 函数/变量 | 常量 | 文件 |
-|------|---------|----------|------|------|
-| 前端 | PascalCase | camelCase | UPPER_SNAKE_CASE | kebab-case |
-| 后端 | PascalCase | snake_case | UPPER_SNAKE_CASE | snake_case |
-
-## 多语言约束（关键）
-
-应用支持中英文切换，**所有前端开发必须遵守以下规则**：
-
-1. **UI 文本必须用 `t()` 翻译函数**，不得硬编码中文字符串作为显示文本
-2. **`useTranslation()` 必须在 React 组件内部调用**，不能放在模块顶层
-3. **子函数组件（如 `UploadArea`、`DataPreview`）如需翻译，必须在自己的函数体内调用 `useTranslation()`**，不得依赖父组件传入的 `t`
-4. **日期格式化必须根据 `i18n.language` 动态设置 locale**：`i18n.language === 'en' ? 'en-US' : 'zh-CN'`，不得硬编码 `'zh-CN'`
-5. **搜索/过滤逻辑不得依赖翻译文本**：用布尔值或原始数据比较，不用 `t()` 返回值比较
-6. **翻译文件 key 必须同步**：`locales/zh.json` 和 `locales/en.json` 新增 key 必须同时添加
-
-## 开发注意事项
-
-1. **Electron 启动流程**: 需要先编译 TypeScript (`npm run build:electron`)，然后启动 Vite，最后启动 Electron（`npm run dev:electron` 依赖 `wait-on` 等待 Vite 就绪）
-2. **启动脚本**: `start_electron_app.bat` 一键启动后端 + 前端
-3. **数据格式**: 新的 Excel 数据按网络类型 (LTE/NR) 分表存储在 `data/` 目录
-4. **异步任务**: 所有规划任务通过 `task_manager` 异步执行，前端通过 WebSocket 获取实时进度
-5. **类型同步**: 前后端共享类型在 `shared/types.ts`，修改后需同步更新
-6. **编码问题**: API 响应使用自定义 `UTF8JSONResponse`（`ensure_ascii=False`），错误消息仍需 GBK 安全处理
-7. **GDAL 依赖**: 地图功能依赖 GDAL，Windows 安装参考 `install_geopandas.bat`
-8. **端口占用**: 后端默认 8000，前端默认 5173，修改需同步更新 Vite 代理配置
-9. **API 环境**: 开发环境 API 通过 Vite Proxy 转发（Web 模式）或直接连接（Electron 模式）
-10. **应用生命周期**: `backend/app/api/__init__.py` 的 `lifespan` 函数管理启动/关闭，启动时自动创建所需目录并清理无效数据索引
+- **GDAL/geopandas**：图层与地理数据处理依赖；Windows 参考 `install_geopandas.bat` 或 `conda install -c conda-forge gdal`。`requirements.txt` 中 gdal 行已注释，实际靠 pyogrio wheel 自带 libgdal
+- **端口**：后端 8000、前端 5173；改端口需同步 `frontend/vite.config.ts` 代理
+- **类型同步**：前后端共享类型在 `shared/types.ts`，修改后同步
+- **镜像源**：npm 慢用 `npm config set registry https://registry.npmmirror.com`；pip 慢用清华源
+- 生产 systemd 配 `MemoryMax=2G`；**SQLite 主库 `data/data.db` 是运行时数据，不要当临时文件清理**（`backend/data/` 下的 `data.db` / `npt.db` 是 0 字节残留，可忽略）
+- **桌面端依赖**：`desktop/requirements-desktop.txt`（pywebview / pyinstaller / pyogrio）只在 Windows 打包机上安装，不要加进 `backend/requirements.txt`
 
 ## 故障排除
 
-- **端口占用**: `netstat -ano | findstr :8000` 查找并结束占用进程
-- **GDAL 安装失败**: 使用预编译 wheel 文件或 `conda install -c conda-forge gdal`
-- **npm install 慢**: 使用国内镜像 `npm config set registry https://registry.npmmirror.com`
-- **pip install 超时**: 使用清华源 `pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple`
-- **Electron 窗口空白**: 检查 Vite 是否已启动（访问 http://localhost:5173），查看 Electron 开发者工具控制台错误
-- **后端编码错误**: 确保 `PYTHONIOENCODING=utf-8` 环境变量已设置（main.py 已配置）
-- **地图不显示**: 检查高德地图 API Key 配置（config.py），确保网络可访问高德服务；AMAP API Key 有开发环境默认值
-- **文件上传失败**: 检查开发环境下 `VITE_API_URL` 环境变量配置
-
-## 前端 React 开发规范
-
-项目使用 React 18 + TypeScript + Zustand + Tailwind CSS + Radix UI，遵循以下核心规范：
-
-- **Effects 是外部系统的同步工具**：地图组件、事件监听、WebSocket 连接等才用 Effect；派生状态用 `useMemo` 或直接计算
-- **组件内状态更新用事件处理器**：不要在 Effect 中处理用户交互逻辑
-- **组件间通信优先用组合**：通过 `children` 或 Context 传递，避免 prop drilling
-- **Ref 用于不触发渲染的可变值**：如定时器 ID、DOM 引用
-- **自定义 Hook 以 `use` 前缀命名**，且必须内部真正使用了 Hooks
-- **UI 组件库**: Radix UI (Dialog, DropdownMenu, Label, Select, Slot, Tabs, Toast) + lucide-react 图标 + Tailwind CSS
-- **地图组件**: Leaflet + react-leaflet（在线地图）；自定义组件支持离线地图（mbtiles/xyz）和扇区渲染
-
-## Docker 部署
-
-项目支持 Docker 容器化部署：
-
-```bash
-# 构建后端镜像
-docker build -t network-planning-tool-backend -f backend/Dockerfile .
-
-# 构建前端镜像
-docker build -t network-planning-tool-frontend -f frontend/Dockerfile .
-
-# 使用 docker-compose 运行
-docker-compose up -d
-```
-
-## 生产环境部署（Linux ARM / Cloudflare Tunnel）
-
-生产环境运行在 Linux ARM 服务器（Rockchip），使用 **Cloudflare Tunnel** 内网穿透提供公网访问。
-
-### 生产环境架构
-
-```
-用户浏览器 → https://app.pengwc.asia/neighbor
-         → Cloudflare Tunnel（cloudflared systemd 服务）
-         → http://localhost:8000（FastAPI 后端）
-         → FastAPI 静态文件服务（frontend/dist-renderer/）
-```
-
-**关键配置**:
-- 公网入口: https://app.pengwc.asia（Cloudflare Tunnel，token 认证）
-- 后端端口: `localhost:8000`
-- 前端构建产物: `frontend/dist-renderer/`（由 FastAPI 作为 SPA 静态文件服务）
-- 系统服务: `npt-backend.service`（systemd 管理）
-
-### 部署步骤（代码变更后）
-
-```bash
-# 1. 构建前端（在项目根目录）
-cd frontend && npm run build:vite
-
-# 2. 重启后端服务
-systemctl restart npt-backend
-
-# 或手动重启（调试用）
-# pkill -f "python3 main.py" && cd /DATA/AppData/NetworkPlanningTooV3/backend && python3 main.py
-```
-
-### 后端系统服务
-
-`/etc/systemd/system/npt-backend.service` 文件内容：
-
-```ini
-[Unit]
-Description=Network Planning Tool Backend (FastAPI)
-After=network.target
-StartLimitIntervalSec=300
-StartLimitBurst=5
-
-[Service]
-Type=simple
-User=root
-WorkingDirectory=/DATA/AppData/NetworkPlanningTooV3/backend
-ExecStart=/usr/bin/python3 main.py
-Restart=always
-RestartSec=5
-
-# 生产环境：禁用 reload 模式（避免 watchfiles 高 CPU）
-Environment=NPT_RELOAD=false
-Environment=NPT_WORKERS=1
-
-# OOM 保护
-OOMScoreAdjust=-500
-MemoryMax=2G
-MemoryHigh=1.5G
-
-StandardOutput=append:/var/log/npt-backend.log
-StandardError=append:/var/log/npt-backend.log
-
-[Install]
-WantedBy=multi-user.target
-```
-
-### Cloudflare Tunnel
-
-```bash
-# cloudflared 作为 systemd 服务运行
-systemctl status cloudflared
-
-# 使用 token 认证（Quick Tunnel），非命名隧道
-# 配置在 /etc/systemd/system/cloudflared.service
-```
-
-### 生产环境 CORS 配置
-
-`.env` 文件中的 `NPT_CORS_ORIGINS` 必须包含公网域名：
-
-```bash
-NPT_CORS_ORIGINS=http://app.pengwc.asia,http://apk.pengwc.asia,http://localhost:5173,http://127.0.0.1:5173
-NPT_HOST=0.0.0.0
-NPT_PORT=8000
-```
-
-### 生产环境注意事项
-
-1. **修改后端代码** → 仅需重启 systemd 服务（`systemctl restart npt-backend`）
-2. **修改前端代码** → 必须先构建（`npm run build:vite`），然后重启后端
-3. **API 环境**：生产环境前端通过同域 `/api/v1/...` 访问后端（同一端口，无 Vite Proxy）
-4. **编码设置**：生产环境使用 `UTF8JSONResponse`（`allow_nan=True`），前端已通过 `isFinite()` 处理非有限值
-5. **日志查看**: `journalctl -u npt-backend -n 100 --no-pager` 或 `tail -f /var/log/npt-backend.log`
-6. **内存限制**: systemd 配置了 MemoryMax=2G，避免内存泄漏导致系统 OOM
+- **端口占用**：`ss -ltnp | grep :8000`（Linux）/ `netstat -ano | findstr :8000`（Windows）
+- **401 / 掉登录**：凭证在 `localStorage['auth-storage']`；JWT 过期、会话空闲超时或服务端吊销后前端清除并要求重新登录；修改 `NPT_JWT_*` 会使旧 token 全部失效
+- **看不到数据（非 401）**：先查数据组隔离——用户 `city`/`operator` 为空即不可见任何业务数据，跨组一律 404
+- **地图不显示**：检查高德 Key（`NPT_AMAP_API_KEY`，config.py 有开发默认值）与网络
+- **上传失败（开发）**：`uploadClient` 直连 `http://localhost:8000`，检查 `VITE_API_URL` 与后端是否已启动
+- **前端构建后线上没变化**：确认执行了 `npm run build:vite` 并重启 `npt-backend`
+- **桌面端登录一直 pending**：单机模式需管理员在网页端「桌面授权」页批准（`NPT_DESKTOP_ACTIVATION_MODE=approve`），批准后前端 `auth-poll` 轮询会自动进入
+- **桌面端被踢下线**：共享模式为单设备登录，同账号在别处登录会使本机 `session-check` 失败并登出；`DesktopLicense.idle_logout_days`（默认 2 天）覆盖本机会话空闲超时
+- **桌面端数据不同步**：先看 `/desktop/sync-status` 与 `sync_state.json` 的 `conflicts`（push 带 `base_rev`，服务器 rev 不符返回 409）；服务器权威 rev 在 `dataset_revisions` 表，与本地记录的基线是两套数字
+- **桌面打包缺 GDAL**：确认 `desktop/hooks/hook-pyogrio.py` 生效且产物含 `gdal*.dll`/`proj*.dll`/`proj.db`（CI 有该校验步骤）
+- **GDAL 安装失败**：用预编译 wheel 或 conda 安装
+- **后端编码错误**：确认 `PYTHONIOENCODING=utf-8`（main.py 已设置）

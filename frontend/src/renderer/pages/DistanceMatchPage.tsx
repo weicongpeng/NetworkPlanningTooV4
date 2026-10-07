@@ -1,12 +1,20 @@
-import { useState, useEffect, useRef } from 'react'
+import { useCallback, useState, useEffect, useRef } from 'react'
 import { useTranslation } from 'react-i18next'
 import { FileUp, Loader2, Download, CheckCircle2, AlertCircle, Ruler, UploadCloud } from 'lucide-react'
 import { distanceMatchApi, dataApi, layerToolsApi } from '../services/api'
 import { uploadStore } from '../store/uploadStore'
+import { ResultTable, type ResultRowsPageData } from '../components/ResultTable'
 
 type FullSource = 'file' | 'data'
 
 interface ParseError { sheet: string; row: number; reason: string }
+
+interface MatchResult {
+  filename: string
+  result_id?: string
+  download_url: string
+  total?: number
+}
 
 // ===== sessionStorage 持久化（镜像 LayerToolsPage 模式：切页不丢失，刷新/新开/登录清除） =====
 const STORAGE_KEY = 'distanceMatch.shared'
@@ -24,7 +32,7 @@ interface SharedState {
   dataSheets: string[]
   maxDistanceKm: string
   matching: boolean
-  result: { filename: string; download_url: string } | null
+  result: MatchResult | null
   parseErrors: ParseError[]
   error: string
 }
@@ -43,7 +51,8 @@ function loadShared(): SharedState {
     if (raw) {
       const saved = JSON.parse(raw)
       if (saved && saved.pageLoadId === PAGE_LOAD_ID) {
-        const { pageLoadId, ...rest } = saved
+        const rest = { ...saved }
+        delete rest.pageLoadId  // 仅用于判定本页生命周期，不进入状态
         return { ...emptyShared(), ...rest }
       }
     }
@@ -84,7 +93,7 @@ export default function DistanceMatchPage() {
   // ===== 状态 =====
   const [matching, setMatching] = useState(initialShared.matching)
   const [parseErrors, setParseErrors] = useState<ParseError[]>(initialShared.parseErrors)
-  const [result, setResult] = useState<{ filename: string; download_url: string } | null>(initialShared.result)
+  const [result, setResult] = useState<MatchResult | null>(initialShared.result)
   const [error, setError] = useState(initialShared.error)
 
   // ===== 模块级上传进度（chunkedUpload 后台更新，切页不丢失） =====
@@ -255,7 +264,12 @@ export default function DistanceMatchPage() {
         fullDataId: fullSource === 'data' ? fullDataId : undefined,
       })
       if (res.success && res.data?.download_url) {
-        const newResult = { filename: res.data.filename, download_url: res.data.download_url }
+        const newResult: MatchResult = {
+          filename: res.data.filename,
+          result_id: res.data.result_id,
+          download_url: res.data.download_url,
+          total: res.data.total,
+        }
         persistShared(s => ({ ...s, matching: false, result: newResult, error: '' }))
         setResult(newResult)
       } else if (res.data?.errors?.length) {
@@ -271,6 +285,14 @@ export default function DistanceMatchPage() {
     } finally { setMatching(false) }
   }
 
+  // 结果行分页加载（懒加载列表）；result_id 变化时 ResultTable 自动重置
+  const resultId = result?.result_id || ''
+  const loadResultPage = useCallback(async (offset: number, limit: number): Promise<ResultRowsPageData> => {
+    const res = await distanceMatchApi.preview({ resultId, offset, limit })
+    if (!res.success) throw new Error(t('distanceMatch.errUnknown') || '读取结果失败')
+    return res.data
+  }, [resultId, t])
+
   const progressText = () => {
     if (!uploadProgress.active) return ''
     if (uploadProgress.step === 'uploading') return t('layer.uploading').replace('{percent}', String(uploadProgress.percent))
@@ -279,139 +301,137 @@ export default function DistanceMatchPage() {
   }
 
   const sheetSelectCls = "w-full h-9 px-2 text-sm border border-border rounded bg-card"
+  const cardCls = "p-4 bg-card border border-border rounded-lg"
 
   return (
-    <div className="p-8 max-w-6xl">
-      <h1 className="text-base font-bold mb-6 flex items-center gap-2">
+    <div className="p-6 w-full h-full min-h-0 flex flex-col gap-4">
+      <h1 className="text-base font-bold flex items-center gap-2 shrink-0">
         <Ruler size={18} /> {t('nav.distanceMatch')}
       </h1>
 
-      {/* ① 文件导入（顶层，单一上传框 + 模板下载） */}
-      <div className="mb-6 p-4 bg-card border border-border rounded-lg">
-        <p className="text-xs font-medium mb-3 flex items-center gap-2">
-          <FileUp size={14} /> {t('distanceMatch.fileImport')}
-          <button type="button" onClick={handleDownloadTemplate}
-            className="ml-auto text-xs text-primary hover:underline">
-            {t('distanceMatch.templateDownload')}
-          </button>
-        </p>
+      {/* 表单区：横向铺满，三列卡片 */}
+      <div className="grid grid-cols-1 xl:grid-cols-3 gap-4 shrink-0">
+        {/* ① 文件导入（顶层，单一上传框 + 模板下载） */}
+        <div className={cardCls}>
+          <p className="text-xs font-medium mb-3 flex items-center gap-2">
+            <FileUp size={14} /> {t('distanceMatch.fileImport')}
+            <button type="button" onClick={handleDownloadTemplate}
+              className="ml-auto text-xs text-primary hover:underline">
+              {t('distanceMatch.templateDownload')}
+            </button>
+          </p>
 
-        <label className="block flex items-center gap-3 px-4 py-3 border-2 border-dashed rounded-lg cursor-pointer hover:border-primary transition-colors">
-          <UploadCloud className="text-muted-foreground shrink-0" size={20} />
-          <span className="text-sm truncate flex-1">{fileName || t('distanceMatch.uploadHint')}</span>
-          <input type="file" className="hidden" accept=".xlsx,.xls"
-            onChange={e => { const f = e.target.files?.[0]; if (f) handleFile(f) }} disabled={uploading} />
-        </label>
+          <label className="flex items-center gap-3 px-4 py-3 border-2 border-dashed rounded-lg cursor-pointer hover:border-primary transition-colors">
+            <UploadCloud className="text-muted-foreground shrink-0" size={20} />
+            <span className="text-sm truncate flex-1">{fileName || t('distanceMatch.uploadHint')}</span>
+            <input type="file" className="hidden" accept=".xlsx,.xls"
+              onChange={e => { const f = e.target.files?.[0]; if (f) handleFile(f) }} disabled={uploading} />
+          </label>
 
-        {/* 上传进度条 + 状态 + 取消（模块级 uploadStore：切页不丢失） */}
-        {uploading && uploadProgress.percent > 0 && (
-          <div className="mt-2">
-            <div className="h-2 bg-muted rounded-full overflow-hidden">
-              <div className="h-full bg-primary transition-all duration-300" style={{ width: `${uploadProgress.percent}%` }} />
+          {/* 上传进度条 + 状态 + 取消（模块级 uploadStore：切页不丢失） */}
+          {uploading && uploadProgress.percent > 0 && (
+            <div className="mt-2">
+              <div className="h-2 bg-muted rounded-full overflow-hidden">
+                <div className="h-full bg-primary transition-all duration-300" style={{ width: `${uploadProgress.percent}%` }} />
+              </div>
+              <div className="flex items-center justify-between mt-1">
+                <p className="text-xs text-muted-foreground">{progressText()}</p>
+                <button type="button" onClick={() => uploadStore.cancel()}
+                  className="text-xs text-muted-foreground hover:text-red-500 underline underline-offset-2 transition-colors">
+                  {t('layer.cancelUpload')}
+                </button>
+              </div>
             </div>
-            <div className="flex items-center justify-between mt-1">
-              <p className="text-xs text-muted-foreground">{progressText()}</p>
-              <button type="button" onClick={() => uploadStore.cancel()}
-                className="text-xs text-muted-foreground hover:text-red-500 underline underline-offset-2 transition-colors">
-                {t('layer.cancelUpload')}
-              </button>
-            </div>
-          </div>
-        )}
-      </div>
+          )}
+        </div>
 
-      {/* ② 数据选择 */}
-      <div className="mb-6 p-4 bg-card border border-border rounded-lg">
-        <p className="text-xs font-medium mb-4">{t('distanceMatch.dataSelect')}</p>
+        {/* ② 数据选择 */}
+        <div className={cardCls}>
+          <p className="text-xs font-medium mb-4">{t('distanceMatch.dataSelect')}</p>
 
-        {/* 匹配站点（来源固定为导入文件） */}
-        <div className="mb-5">
-          <p className="text-xs font-medium mb-1">{t('distanceMatch.matchSite')}</p>
-          <div className="max-w-xs">
-            <select value={matchSheet} onChange={e => setMatchSheet(e.target.value)}
+          {/* 匹配站点（来源固定为导入文件） */}
+          <div className="mb-4">
+            <label htmlFor="dm-match-sheet" className="block text-xs font-medium mb-1">{t('distanceMatch.matchSite')}</label>
+            <select id="dm-match-sheet" value={matchSheet} onChange={e => setMatchSheet(e.target.value)}
               disabled={!sheetList.length} className={sheetSelectCls}>
               {!sheetList.length && <option value="">{t('distanceMatch.uploadHint')}</option>}
               {sheetList.map(s => <option key={s} value={s}>{s}</option>)}
             </select>
           </div>
-        </div>
 
-        {/* 相邻站点（来源：导入文件 / 数据管理） */}
-        <div>
-          <p className="text-xs font-medium mb-1">{t('distanceMatch.fullSite')}</p>
-          <div className="flex gap-4 mb-2">
-            <label className="flex items-center gap-1.5 text-xs cursor-pointer">
-              <input type="radio" checked={fullSource === 'file'} onChange={() => handleFullSourceChange('file')} />
-              {t('distanceMatch.fullSourceFile')}
-            </label>
-            <label className="flex items-center gap-1.5 text-xs cursor-pointer">
-              <input type="radio" checked={fullSource === 'data'} onChange={() => handleFullSourceChange('data')} />
-              {t('distanceMatch.fullSourceData')}
-            </label>
+          {/* 相邻站点（来源：导入文件 / 数据管理） */}
+          <div>
+            <p className="text-xs font-medium mb-1">{t('distanceMatch.fullSite')}</p>
+            <div className="flex gap-4 mb-2">
+              <label className="flex items-center gap-1.5 text-xs cursor-pointer">
+                <input type="radio" checked={fullSource === 'file'} onChange={() => handleFullSourceChange('file')} />
+                {t('distanceMatch.fullSourceFile')}
+              </label>
+              <label className="flex items-center gap-1.5 text-xs cursor-pointer">
+                <input type="radio" checked={fullSource === 'data'} onChange={() => handleFullSourceChange('data')} />
+                {t('distanceMatch.fullSourceData')}
+              </label>
+            </div>
+
+            {fullSource === 'file' ? (
+              <div>
+                <select value={fullSheet} onChange={e => setFullSheet(e.target.value)}
+                  disabled={!sheetList.length} className={sheetSelectCls}>
+                  {!sheetList.length && <option value="">{t('distanceMatch.uploadHint')}</option>}
+                  {sheetList.map(s => <option key={s} value={s}>{s}</option>)}
+                </select>
+              </div>
+            ) : (
+              <div className="space-y-3">
+                <div>
+                  <label htmlFor="dm-data-file" className="block text-xs font-medium mb-1">{t('distanceMatch.dataFile')}</label>
+                  <select id="dm-data-file" value={fullDataId}
+                    onChange={e => { setFullDataId(e.target.value); setDataSheets([]); setFullSheet('') }}
+                    className={sheetSelectCls}>
+                    {dataItems.length === 0 && <option value="">{t('distanceMatch.loadDataErr')}</option>}
+                    {dataItems.map(d => <option key={d.id} value={d.id}>{d.name}</option>)}
+                  </select>
+                </div>
+                <div>
+                  <label htmlFor="dm-data-sheet" className="block text-xs font-medium mb-1">{t('distanceMatch.sheetName')}</label>
+                  <select id="dm-data-sheet" value={fullSheet} onChange={e => setFullSheet(e.target.value)}
+                    disabled={!dataSheets.length} className={sheetSelectCls}>
+                    {!dataSheets.length && <option value="">{t('distanceMatch.uploadHint')}</option>}
+                    {dataSheets.map(s => <option key={s} value={s}>{s}</option>)}
+                  </select>
+                </div>
+              </div>
+            )}
           </div>
-
-          {fullSource === 'file' ? (
-            <div className="max-w-xs">
-              <select value={fullSheet} onChange={e => setFullSheet(e.target.value)}
-                disabled={!sheetList.length} className={sheetSelectCls}>
-                {!sheetList.length && <option value="">{t('distanceMatch.uploadHint')}</option>}
-                {sheetList.map(s => <option key={s} value={s}>{s}</option>)}
-              </select>
-            </div>
-          ) : (
-            <div className="grid grid-cols-2 gap-4">
-              <div>
-                <label htmlFor="dm-data-file" className="block text-xs font-medium mb-1">{t('distanceMatch.dataFile')}</label>
-                <select id="dm-data-file" value={fullDataId}
-                  onChange={e => { setFullDataId(e.target.value); setDataSheets([]); setFullSheet('') }}
-                  className={sheetSelectCls}>
-                  {dataItems.length === 0 && <option value="">{t('distanceMatch.loadDataErr')}</option>}
-                  {dataItems.map(d => <option key={d.id} value={d.id}>{d.name}</option>)}
-                </select>
-              </div>
-              <div>
-                <label htmlFor="dm-data-sheet" className="block text-xs font-medium mb-1">{t('distanceMatch.sheetName')}</label>
-                <select id="dm-data-sheet" value={fullSheet} onChange={e => setFullSheet(e.target.value)}
-                  disabled={!dataSheets.length} className={sheetSelectCls}>
-                  {!dataSheets.length && <option value="">{t('distanceMatch.uploadHint')}</option>}
-                  {dataSheets.map(s => <option key={s} value={s}>{s}</option>)}
-                </select>
-              </div>
-            </div>
-          )}
         </div>
-      </div>
 
-      {/* ③ 参数设置 */}
-      <div className="mb-6 p-4 bg-card border border-border rounded-lg">
-        <p className="text-xs font-medium mb-3">{t('distanceMatch.params')}</p>
-        <div className="max-w-xs">
-          <label htmlFor="dm-max-distance" className="block text-xs font-medium mb-1">{t('distanceMatch.maxDistance')} (km)</label>
-          <input id="dm-max-distance" value={maxDistanceKm} inputMode="decimal"
-            onChange={e => { if (/^\d*\.?\d*$/.test(e.target.value)) setMaxDistanceKm(e.target.value) }}
-            placeholder="1.0" className="w-full h-9 px-2 text-sm border border-border rounded bg-card" />
+        {/* ③ 参数设置 + 开始匹配 */}
+        <div className={cardCls}>
+          <p className="text-xs font-medium mb-3">{t('distanceMatch.params')}</p>
+          <div className="mb-4">
+            <label htmlFor="dm-max-distance" className="block text-xs font-medium mb-1">{t('distanceMatch.maxDistance')} (km)</label>
+            <input id="dm-max-distance" value={maxDistanceKm} inputMode="decimal"
+              onChange={e => { if (/^\d*\.?\d*$/.test(e.target.value)) setMaxDistanceKm(e.target.value) }}
+              placeholder="1.0" className="w-full h-9 px-2 text-sm border border-border rounded bg-card" />
+          </div>
+          <button onClick={handleMatch} disabled={matching || uploading}
+            className="w-full px-6 py-2.5 bg-primary text-primary-foreground rounded-lg hover:opacity-90 disabled:opacity-50 text-sm font-medium">
+            {matching ? <Loader2 size={16} className="animate-spin inline mr-2" /> : null}
+            {t('distanceMatch.start')}
+          </button>
         </div>
-      </div>
-
-      {/* ④ 开始匹配 */}
-      <div className="mb-6 p-4 bg-card border border-border rounded-lg">
-        <button onClick={handleMatch} disabled={matching || uploading}
-          className="w-full px-6 py-2.5 bg-primary text-primary-foreground rounded-lg hover:opacity-90 disabled:opacity-50 text-sm font-medium">
-          {matching ? <Loader2 size={16} className="animate-spin inline mr-2" /> : null}
-          {t('distanceMatch.start')}
-        </button>
       </div>
 
       {/* 错误提示 */}
       {error && (
-        <div className="mb-6 p-4 bg-red-500/10 border border-red-500/20 rounded-lg text-xs text-red-600 flex items-start gap-2">
+        <div className="p-3 bg-red-500/10 border border-red-500/20 rounded-lg text-xs text-red-600 flex items-start gap-2 shrink-0">
           <AlertCircle size={14} className="mt-0.5 shrink-0" /> {error}
         </div>
       )}
 
       {/* 校验错误明细 */}
       {parseErrors.length > 0 && (
-        <div className="mb-6 p-4 bg-amber-500/10 border border-amber-500/20 rounded-lg text-xs">
+        <div className="p-3 bg-amber-500/10 border border-amber-500/20 rounded-lg text-xs shrink-0">
           <p className="text-amber-400 font-medium mb-2 flex items-center gap-1">
             <AlertCircle size={14} /> {t('distanceMatch.invalidData')}
           </p>
@@ -443,16 +463,38 @@ export default function DistanceMatchPage() {
         </div>
       )}
 
-      {/* ⑤ 匹配结果下载 */}
+      {/* ⑤ 结果：下载 + 分页列表（占满剩余高度，内部滚动懒加载） */}
       {result && (
-        <div className="p-4 bg-card border border-border rounded-lg">
-          <a href={result.download_url + '?_t=' + Date.now()} download
-            className="w-full inline-flex items-center justify-center gap-2 px-6 py-2.5 bg-green-600 text-white rounded-lg hover:opacity-90 text-sm">
-            <Download size={16} /> {t('distanceMatch.download')} ({result.filename})
-          </a>
-          <p className="mt-2 text-xs text-green-600 flex items-center gap-1">
-            <CheckCircle2 size={14} /> {t('distanceMatch.matchDone')}
-          </p>
+        <div className="flex-1 min-h-0 flex flex-col p-4 bg-card border border-border rounded-lg gap-3">
+          <div className="flex items-center gap-4 flex-wrap shrink-0">
+            <div className="flex-1 min-w-[16rem]">
+              <p className="text-xs text-green-600 flex items-center gap-1">
+                <CheckCircle2 size={14} /> {t('distanceMatch.matchDone')}
+              </p>
+              {typeof result.total === 'number' && (
+                <p className="mt-1 text-xs text-muted-foreground">
+                  {t('distanceMatch.summaryRows', '结果共 {{count}} 行（含无命中备注行）', { count: result.total })}
+                </p>
+              )}
+            </div>
+            <a href={result.download_url + '?_t=' + Date.now()} download
+              className="inline-flex items-center justify-center gap-2 px-5 py-2.5 bg-green-600 text-white rounded-lg hover:opacity-90 text-sm shrink-0">
+              <Download size={16} /> {t('distanceMatch.download')} ({result.filename})
+            </a>
+          </div>
+
+          <p className="text-xs font-medium text-foreground shrink-0">{t('distanceMatch.resultList', '结果列表')}</p>
+          {result.result_id ? (
+            <ResultTable
+              resetKey={result.result_id}
+              loadPage={loadResultPage}
+              emptyHint={t('distanceMatch.resultEmpty', '匹配完成后结果将在此展示')}
+            />
+          ) : (
+            <div className="flex-1 min-h-0 flex items-center justify-center text-xs text-muted-foreground">
+              {t('distanceMatch.resultUnavailable', '该结果不支持页内预览，请下载查看')}
+            </div>
+          )}
         </div>
       )}
     </div>

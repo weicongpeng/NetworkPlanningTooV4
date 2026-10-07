@@ -610,6 +610,14 @@ export const desktopLoginApi = {
   }): Promise<ApiResponse<DesktopLoginResult>> => {
     return apiClient.post('/desktop/register', data) as any
   },
+
+  /**
+   * 把「应用名 + 运行模式 + 实时同步状态」写到桌面窗口标题栏。
+   * 网页端 / 非桌面壳返回 403，调用方静默忽略即可。
+   */
+  setWindowTitle: async (title: string): Promise<ApiResponse<{ title: string }>> => {
+    return apiClient.post('/desktop/window-title', { title }) as any
+  },
 }
 
 /** 桌面共享模式同步状态 */
@@ -1687,10 +1695,24 @@ export interface SiteSpacingParseResult {
   }
 }
 
+/** 结果行分页预览（站间距 / 距离匹配共用形状） */
+export interface ResultRowsPage {
+  success: boolean
+  data: {
+    columns: string[]
+    total: number
+    offset: number
+    limit: number
+    rows: (string | number | null)[][]
+  }
+}
+
 export interface SiteSpacingResult {
   success: boolean
   data: {
     filename: string
+    /** 结果行文件的标识（= 结果 Excel 的 stem），用于分页预览 */
+    result_id?: string
     download_url: string
     total: number
     counted: number
@@ -1740,6 +1762,19 @@ export const siteSpacingApi = {
     return uploadClient.post('/site-spacing/calculate', formData)
   },
 
+  // 分页读取结果行（页内列表懒加载）
+  preview: async (params: {
+    resultId: string
+    offset?: number
+    limit?: number
+  }): Promise<ResultRowsPage> => {
+    const formData = new FormData()
+    formData.append('result_id', params.resultId)
+    formData.append('offset', String(params.offset ?? 0))
+    if (params.limit != null) formData.append('limit', String(params.limit))
+    return uploadClient.post('/site-spacing/preview', formData)
+  },
+
   // 模板下载（带认证，blob 方式）
   downloadTemplate: async (): Promise<void> => {
     const res = await uploadClient.get('/site-spacing/template', { responseType: 'blob' })
@@ -1778,7 +1813,10 @@ export interface DistanceMatchResult {
   success: boolean
   data: {
     filename: string
+    /** 结果行文件的标识（= 结果 Excel 的 stem），用于分页预览 */
+    result_id?: string
     download_url: string
+    total?: number
     errors?: DistanceMatchParseError[]
   }
 }
@@ -1823,6 +1861,19 @@ export const distanceMatchApi = {
       if (params.fullLatCol) formData.append('full_lat_col', params.fullLatCol)
     }
     return uploadClient.post('/distance-match/match', formData)
+  },
+
+  // 分页读取结果行（页内列表懒加载）
+  preview: async (params: {
+    resultId: string
+    offset?: number
+    limit?: number
+  }): Promise<ResultRowsPage> => {
+    const formData = new FormData()
+    formData.append('result_id', params.resultId)
+    formData.append('offset', String(params.offset ?? 0))
+    if (params.limit != null) formData.append('limit', String(params.limit))
+    return uploadClient.post('/distance-match/preview', formData)
   },
 
   // 模板下载（带认证，blob 方式）

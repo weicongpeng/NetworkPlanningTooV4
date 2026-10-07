@@ -1,5 +1,5 @@
 [Unit]
-Description=Network Planning Tool Backend (FastAPI)
+Description=NetOpt Engine Backend (FastAPI)
 After=network.target
 StartLimitIntervalSec=300
 StartLimitBurst=5

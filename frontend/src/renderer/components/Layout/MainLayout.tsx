@@ -21,6 +21,7 @@ import {
   KeyRound,
   Sun,
   Moon,
+  Boxes,
 } from 'lucide-react'
 import { useState, useEffect, useRef } from 'react'
 import { useTranslation } from 'react-i18next'
@@ -31,6 +32,7 @@ import { GlobalTaskIndicator } from './GlobalTaskIndicator'
 import { Toaster } from './Toaster'
 import { DesktopUpdateDialog } from '../DesktopUpdateDialog'
 import { DesktopSyncIndicator } from '../DesktopSyncIndicator'
+import { useDesktopStatusLabel } from '../desktopStatusLabel'
 import { DesktopSessionGuard } from '../DesktopSessionGuard'
 import { appVersionsApi, desktopCloudApi } from '../../services/api'
 import { prefetchPage } from '../../pageLoaders'
@@ -84,6 +86,8 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
   const { user, isAuthenticated, logout } = useAuthStore()
   const desktopMode = useAuthStore((s) => s.desktopMode)
   const { themeMode, setThemeMode } = useThemeStore()
+  // 桌面端：应用名旁的运行模式 + 实时同步状态（网页端为 null）
+  const desktopStatus = useDesktopStatusLabel()
 
   // 侧边栏底部用户信息浮层：悬浮显示，点击固定（再次点击或点击浮层外关闭）
   const [userInfoHovered, setUserInfoHovered] = useState(false)
@@ -327,6 +331,45 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
           }}
           className="border-r border-border/60 flex flex-col relative z-20"
         >
+          {/* 应用名 + 运行模式/同步状态（桌面端常驻标注；网页端只显示应用名） */}
+          <div className="flex-shrink-0 border-b border-border/60 py-3" style={{ paddingLeft: '6px', paddingRight: '6px' }}>
+            <div className="flex items-center h-[30px]" style={{ gap: '8px' }}>
+              <div className="flex-shrink-0 w-6 flex justify-center">
+                <Boxes size={20} className="text-primary" />
+              </div>
+              <span
+                className="text-sm font-semibold text-foreground"
+                style={{
+                  opacity: sidebarOpen ? 1 : 0,
+                  maxWidth: sidebarOpen ? '120px' : '0px',
+                  transition: 'opacity 0.2s cubic-bezier(0.4, 0, 0.2, 1), max-width 0.3s cubic-bezier(0.4, 0, 0.2, 1)',
+                  whiteSpace: 'nowrap',
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                  display: 'block',
+                }}
+              >
+                {desktopStatus?.appName || t('common.appName', '网优引擎')}
+              </span>
+            </div>
+            {/* 桌面端：运行模式 + 实时同步状态（冲突/异常为琥珀色，不可隐藏） */}
+            {sidebarOpen && desktopStatus && (
+              <p
+                className={`mt-0.5 text-[10px] truncate ${
+                  desktopStatus.tone === 'warn'
+                    ? 'text-amber-500'
+                    : desktopStatus.tone === 'syncing'
+                      ? 'text-primary'
+                      : 'text-muted-foreground'
+                }`}
+                style={{ paddingLeft: '32px' }}
+                title={desktopStatus.label}
+              >
+                {desktopStatus.label}
+              </p>
+            )}
+          </div>
+
           {/* 导航菜单 - 固定高度和间距，避免上下移动，图标位置固定，内容边距统一 */}
           <nav className="flex-1 overflow-y-auto py-3">
             {navigation.map((item) => {

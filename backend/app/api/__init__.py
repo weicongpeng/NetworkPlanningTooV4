@@ -281,7 +281,7 @@ def create_app() -> FastAPI:
     app = FastAPI(
         title=settings.PROJECT_NAME,
         version=settings.VERSION,
-        description="网络规划工具API",
+        description="网优引擎API",
         lifespan=lifespan,
         default_response_class=UTF8JSONResponse,  # 设置默认响应类为UTF-8 JSON响应
     )
@@ -356,7 +356,7 @@ def create_app() -> FastAPI:
         if result:
             return result
         return {
-            "message": "网络规划工具API",
+            "message": "网优引擎API",
             "version": settings.VERSION,
             "status": "running",
         }

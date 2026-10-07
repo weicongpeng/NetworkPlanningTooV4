@@ -62,12 +62,12 @@
     "loading": "加载中...",
     "loadingHistory": "正在加载历史任务...",
     "loadingResult": "正在加载规划结果...",
-    "adminHint": "作为管理员，你可以在此设置全局授权期限",
+    "adminHint": "本设置对所有用户生效：未单独设置期限的用户一律按此期限判定；管理员权限无限期，不受此限制。如需为个别用户单独设置期限，请在「用户管理」中编辑该用户的授权期限。",
     "expiryDateInput": "授权到期日期",
     "updateButton": "更新授权",
     "setUnlimited": "无限期",
-    "updateSuccess": "授权期限更新成功",
-    "unlimitedSet": "已设为无限期",
+    "updateSuccess": "全局授权期限已更新（对所有用户生效）",
+    "unlimitedSet": "已设为无限期（对所有用户生效）",
     "updateFailed": "更新失败",
     "refresh": "刷新",
     "authorTitle": "特别声明",
@@ -131,8 +131,8 @@
     "freqConversion": "频点换算"
   },
   "home": {
-    "title": "网络规划工具",
-    "welcome": "欢迎使用网络规划工具",
+    "title": "网优引擎",
+    "welcome": "欢迎使用网优引擎",
     "quickStart": "快速开始",
     "recentFiles": "最近文件",
     "systemStatus": "系统状态",
@@ -1354,7 +1354,10 @@
     "saving": "保存中…",
     "selectAll": "全选",
     "searchFiles": "搜索文件",
-    "noMatchingFiles": "没有匹配的文件"
+    "noMatchingFiles": "没有匹配的文件",
+    "allLoaded": "已全部加载",
+    "loadedOfTotal": "已加载 {{loaded}} / {{total}} 条",
+    "appName": "网优引擎"
   },
   "auth": {
     "login": "登录",
@@ -1505,7 +1508,9 @@
     "permCellQueryUpdate": "查询/修改",
     "pcFeaturePermissions": "PC端功能权限",
     "featurePermissionsHint": "控制该用户可访问的功能页面",
-    "permAssistant": "网优助手"
+    "permAssistant": "网优助手",
+    "desktopCount": "桌面端",
+    "desktopClient": "桌面端"
   },
   "layer": {
     "sectorLayer": "扇区图层",
@@ -1600,7 +1605,11 @@
     "errFixImport": "请先修复导入数据的异常后重新导入",
     "errUnknown": "匹配失败，请重试",
     "templateDownloadErr": "模板下载失败，请重试",
-    "errSheet": "请选择工作表"
+    "errSheet": "请选择工作表",
+    "resultList": "结果列表",
+    "resultEmpty": "匹配完成后结果将在此展示",
+    "resultUnavailable": "该结果不支持页内预览，请下载查看",
+    "summaryRows": "结果共 {{count}} 行（含无命中备注行）"
   },
   "siteSpacing": {
     "fileImport": "文件导入",
@@ -1637,7 +1646,10 @@
     "errUnknown": "计算失败，请重试",
     "templateDownloadErr": "模板下载失败，请重试",
     "errSheet": "请选择工作表",
-    "csvTxtHint": "CSV / TXT 文件无工作表概念，将直接读取全部内容"
+    "csvTxtHint": "CSV / TXT 文件无工作表概念，将直接读取全部内容",
+    "resultList": "结果列表",
+    "resultEmpty": "计算完成后结果将在此展示",
+    "resultUnavailable": "该结果不支持页内预览，请下载查看"
   },
   "freqConversion": {
     "title": "频点换算",
@@ -1817,6 +1829,14 @@
     "waiting": "等待同步",
     "offline": "离线模式",
     "pending": "待上传 {{count}}",
-    "conflicts": "{{count}} 项数据冲突，请联系管理员处理"
+    "conflicts": "{{count}} 项数据冲突，请联系管理员处理",
+    "modeShared": "共享模式",
+    "modeStandalone": "单机模式",
+    "modeOffline": "离线模式",
+    "modeSharedSyncing": "共享模式 · 同步中…",
+    "modeSharedSynced": "共享模式 · 已同步 {{time}}",
+    "modeSharedWaiting": "共享模式 · 等待同步",
+    "modeSharedConflicts": "共享模式 · {{count}} 项冲突",
+    "modeSharedError": "共享模式 · 同步异常"
   }
 }

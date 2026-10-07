@@ -1,4 +1,4 @@
-# 网络规划工具 V3.0 部署指南
+# 网优引擎 V3.0 部署指南
 
 > 涵盖 Armbian（Linux ARM）和 Windows 两种平台的完整部署方案
 
@@ -258,7 +258,7 @@ sudo nano /etc/systemd/system/npt-backend.service
 
 ```ini
 [Unit]
-Description=Network Planning Tool Backend
+Description=NetOpt Engine Backend
 After=network.target
 
 [Service]

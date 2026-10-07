@@ -1,12 +1,23 @@
-import { useState, useEffect, useRef } from 'react'
+import { useCallback, useState, useEffect, useRef } from 'react'
 import { useTranslation } from 'react-i18next'
 import { FileUp, Loader2, Download, CheckCircle2, AlertCircle, Ruler, UploadCloud } from 'lucide-react'
 import { siteSpacingApi, dataApi, layerToolsApi } from '../services/api'
 import { uploadStore } from '../store/uploadStore'
+import { ResultTable, type ResultRowsPageData } from '../components/ResultTable'
 
 type FullSource = 'file' | 'data'
 
 interface ParseError { sheet: string; row: number; reason: string }
+
+interface SpacingResult {
+  filename: string
+  result_id?: string
+  download_url: string
+  total?: number
+  counted?: number
+  overall_avg_km?: number
+  k?: number
+}
 
 // ===== sessionStorage 持久化（镜像 DistanceMatchPage 模式：切页不丢失，刷新/新开/登录清除） =====
 const STORAGE_KEY = 'siteSpacing.shared'
@@ -24,7 +35,7 @@ interface SharedState {
   dataSheets: string[]
   kNeighbors: string
   calculating: boolean
-  result: { filename: string; download_url: string; total?: number; counted?: number; overall_avg_km?: number; k?: number } | null
+  result: SpacingResult | null
   parseErrors: ParseError[]
   parseTotal: number
   error: string
@@ -45,7 +56,8 @@ function loadShared(): SharedState {
     if (raw) {
       const saved = JSON.parse(raw)
       if (saved && saved.pageLoadId === PAGE_LOAD_ID) {
-        const { pageLoadId, ...rest } = saved
+        const rest = { ...saved }
+        delete rest.pageLoadId  // 仅用于判定本页生命周期，不进入状态
         return { ...emptyShared(), ...rest }
       }
     }
@@ -90,7 +102,7 @@ export default function SiteSpacingPage() {
   const [calculating, setCalculating] = useState(initialShared.calculating)
   const [parseErrors, setParseErrors] = useState<ParseError[]>(initialShared.parseErrors)
   const [parseTotal, setParseTotal] = useState(initialShared.parseTotal)
-  const [result, setResult] = useState<SharedState['result']>(initialShared.result)
+  const [result, setResult] = useState<SpacingResult | null>(initialShared.result)
   const [error, setError] = useState(initialShared.error)
 
   // ===== 模块级上传进度 =====
@@ -271,8 +283,9 @@ export default function SiteSpacingPage() {
         fullDataId: fullSource === 'data' ? fullDataId : undefined,
       })
       if (res.success && res.data?.download_url) {
-        const newResult = {
+        const newResult: SpacingResult = {
           filename: res.data.filename,
+          result_id: res.data.result_id,
           download_url: res.data.download_url,
           total: res.data.total,
           counted: res.data.counted,
@@ -295,6 +308,14 @@ export default function SiteSpacingPage() {
     } finally { setCalculating(false) }
   }
 
+  // 结果行分页加载（懒加载列表）；result_id 变化时 ResultTable 自动重置
+  const resultId = result?.result_id || ''
+  const loadResultPage = useCallback(async (offset: number, limit: number): Promise<ResultRowsPageData> => {
+    const res = await siteSpacingApi.preview({ resultId, offset, limit })
+    if (!res.success) throw new Error(t('siteSpacing.errUnknown') || '读取结果失败')
+    return res.data
+  }, [resultId, t])
+
   const progressText = () => {
     if (!uploadProgress.active) return ''
     if (uploadProgress.step === 'uploading') return t('layer.uploading').replace('{percent}', String(uploadProgress.percent))
@@ -303,134 +324,134 @@ export default function SiteSpacingPage() {
   }
 
   const sheetSelectCls = "w-full h-9 px-2 text-sm border border-border rounded bg-card"
+  const cardCls = "p-4 bg-card border border-border rounded-lg"
 
   // 是否需要选 sheet（Excel 才有 sheet 概念）
   const needsSheet = fileExt === '.xlsx' || fileExt === '.xls'
 
   return (
-    <div className="p-8 max-w-6xl">
-      <h1 className="text-base font-bold mb-6 flex items-center gap-2">
+    <div className="p-6 w-full h-full min-h-0 flex flex-col gap-4">
+      <h1 className="text-base font-bold flex items-center gap-2 shrink-0">
         <Ruler size={18} /> {t('nav.siteSpacing')}
       </h1>
 
-      {/* ① 文件导入 */}
-      <div className="mb-6 p-4 bg-card border border-border rounded-lg">
-        <p className="text-xs font-medium mb-3 flex items-center gap-2">
-          <FileUp size={14} /> {t('siteSpacing.fileImport')}
-          <button type="button" onClick={handleDownloadTemplate}
-            className="ml-auto text-xs text-primary hover:underline">
-            {t('siteSpacing.templateDownload')}
-          </button>
-        </p>
+      {/* 表单区：横向铺满，三列卡片 */}
+      <div className="grid grid-cols-1 xl:grid-cols-3 gap-4 shrink-0">
+        {/* ① 文件导入 */}
+        <div className={cardCls}>
+          <p className="text-xs font-medium mb-3 flex items-center gap-2">
+            <FileUp size={14} /> {t('siteSpacing.fileImport')}
+            <button type="button" onClick={handleDownloadTemplate}
+              className="ml-auto text-xs text-primary hover:underline">
+              {t('siteSpacing.templateDownload')}
+            </button>
+          </p>
 
-        <label className="block flex items-center gap-3 px-4 py-3 border-2 border-dashed rounded-lg cursor-pointer hover:border-primary transition-colors">
-          <UploadCloud className="text-muted-foreground shrink-0" size={20} />
-          <span className="text-sm truncate flex-1">{fileName || t('siteSpacing.uploadHint')}</span>
-          <input type="file" className="hidden" accept=".xlsx,.xls,.csv,.txt"
-            onChange={e => { const f = e.target.files?.[0]; if (f) handleFile(f) }} disabled={uploading} />
-        </label>
+          <label className="flex items-center gap-3 px-4 py-3 border-2 border-dashed rounded-lg cursor-pointer hover:border-primary transition-colors">
+            <UploadCloud className="text-muted-foreground shrink-0" size={20} />
+            <span className="text-sm truncate flex-1">{fileName || t('siteSpacing.uploadHint')}</span>
+            <input type="file" className="hidden" accept=".xlsx,.xls,.csv,.txt"
+              onChange={e => { const f = e.target.files?.[0]; if (f) handleFile(f) }} disabled={uploading} />
+          </label>
 
-        {uploading && uploadProgress.percent > 0 && (
-          <div className="mt-2">
-            <div className="h-2 bg-muted rounded-full overflow-hidden">
-              <div className="h-full bg-primary transition-all duration-300" style={{ width: `${uploadProgress.percent}%` }} />
-            </div>
-            <div className="flex items-center justify-between mt-1">
-              <p className="text-xs text-muted-foreground">{progressText()}</p>
-              <button type="button" onClick={() => uploadStore.cancel()}
-                className="text-xs text-muted-foreground hover:text-red-500 underline underline-offset-2 transition-colors">
-                {t('layer.cancelUpload')}
-              </button>
-            </div>
-          </div>
-        )}
-      </div>
-
-      {/* ② 数据选择 */}
-      <div className="mb-6 p-4 bg-card border border-border rounded-lg">
-        <p className="text-xs font-medium mb-4">{t('siteSpacing.dataSelect')}</p>
-
-        <div className="mb-5">
-          <p className="text-xs font-medium mb-2">{t('siteSpacing.fullSource')}</p>
-          <div className="flex gap-4 mb-2">
-            <label className="flex items-center gap-1.5 text-xs cursor-pointer">
-              <input type="radio" checked={fullSource === 'file'} onChange={() => handleFullSourceChange('file')} />
-              {t('siteSpacing.fullSourceFile')}
-            </label>
-            <label className="flex items-center gap-1.5 text-xs cursor-pointer">
-              <input type="radio" checked={fullSource === 'data'} onChange={() => handleFullSourceChange('data')} />
-              {t('siteSpacing.fullSourceData')}
-            </label>
-          </div>
-
-          {fullSource === 'file' ? (
-            needsSheet ? (
-              <div className="max-w-xs">
-                <label className="block text-xs font-medium mb-1">{t('siteSpacing.sheetName')}</label>
-                <select value={fullSheet} onChange={e => setFullSheet(e.target.value)}
-                  disabled={!sheetList.length} className={sheetSelectCls}>
-                  {!sheetList.length && <option value="">{t('siteSpacing.uploadHint')}</option>}
-                  {sheetList.map(s => <option key={s} value={s}>{s}</option>)}
-                </select>
+          {uploading && uploadProgress.percent > 0 && (
+            <div className="mt-2">
+              <div className="h-2 bg-muted rounded-full overflow-hidden">
+                <div className="h-full bg-primary transition-all duration-300" style={{ width: `${uploadProgress.percent}%` }} />
               </div>
-            ) : (
-              <p className="text-xs text-muted-foreground">{t('siteSpacing.csvTxtHint') || 'CSV/TXT 文件无工作表概念，将直接读取全部内容'}</p>
-            )
-          ) : (
-            <div className="grid grid-cols-2 gap-4">
-              <div>
-                <label className="block text-xs font-medium mb-1">{t('siteSpacing.dataFile')}</label>
-                <select value={fullDataId}
-                  onChange={e => { setFullDataId(e.target.value); setDataSheets([]); setFullSheet('') }}
-                  className={sheetSelectCls}>
-                  {dataItems.length === 0 && <option value="">{t('siteSpacing.loadDataErr')}</option>}
-                  {dataItems.map(d => <option key={d.id} value={d.id}>{d.name}</option>)}
-                </select>
-              </div>
-              <div>
-                <label className="block text-xs font-medium mb-1">{t('siteSpacing.sheetName')}</label>
-                <select value={fullSheet} onChange={e => setFullSheet(e.target.value)}
-                  disabled={!dataSheets.length} className={sheetSelectCls}>
-                  {!dataSheets.length && <option value="">{t('siteSpacing.uploadHint')}</option>}
-                  {dataSheets.map(s => <option key={s} value={s}>{s}</option>)}
-                </select>
+              <div className="flex items-center justify-between mt-1">
+                <p className="text-xs text-muted-foreground">{progressText()}</p>
+                <button type="button" onClick={() => uploadStore.cancel()}
+                  className="text-xs text-muted-foreground hover:text-red-500 underline underline-offset-2 transition-colors">
+                  {t('layer.cancelUpload')}
+                </button>
               </div>
             </div>
           )}
         </div>
-      </div>
 
-      {/* ③ 参数设置 */}
-      <div className="mb-6 p-4 bg-card border border-border rounded-lg">
-        <p className="text-xs font-medium mb-3">{t('siteSpacing.params')}</p>
-        <div className="max-w-xs">
-          <label className="block text-xs font-medium mb-1">{t('siteSpacing.kNeighbors')}</label>
-          <input value={kNeighbors} inputMode="numeric"
-            onChange={e => { if (/^\d*$/.test(e.target.value)) setKNeighbors(e.target.value) }}
-            placeholder="5" className="w-full h-9 px-2 text-sm border border-border rounded bg-card" />
-          <p className="mt-1 text-xs text-muted-foreground">{t('siteSpacing.kNeighborsHint') || '计算每个站点到最近 K 个站点的平均距离'}</p>
+        {/* ② 数据选择 */}
+        <div className={cardCls}>
+          <p className="text-xs font-medium mb-4">{t('siteSpacing.dataSelect')}</p>
+
+          <div className="mb-4">
+            <p className="text-xs font-medium mb-2">{t('siteSpacing.fullSource')}</p>
+            <div className="flex gap-4 mb-2">
+              <label className="flex items-center gap-1.5 text-xs cursor-pointer">
+                <input type="radio" checked={fullSource === 'file'} onChange={() => handleFullSourceChange('file')} />
+                {t('siteSpacing.fullSourceFile')}
+              </label>
+              <label className="flex items-center gap-1.5 text-xs cursor-pointer">
+                <input type="radio" checked={fullSource === 'data'} onChange={() => handleFullSourceChange('data')} />
+                {t('siteSpacing.fullSourceData')}
+              </label>
+            </div>
+
+            {fullSource === 'file' ? (
+              needsSheet ? (
+                <div>
+                  <label className="block text-xs font-medium mb-1">{t('siteSpacing.sheetName')}</label>
+                  <select value={fullSheet} onChange={e => setFullSheet(e.target.value)}
+                    disabled={!sheetList.length} className={sheetSelectCls}>
+                    {!sheetList.length && <option value="">{t('siteSpacing.uploadHint')}</option>}
+                    {sheetList.map(s => <option key={s} value={s}>{s}</option>)}
+                  </select>
+                </div>
+              ) : (
+                <p className="text-xs text-muted-foreground">{t('siteSpacing.csvTxtHint') || 'CSV/TXT 文件无工作表概念，将直接读取全部内容'}</p>
+              )
+            ) : (
+              <div className="space-y-3">
+                <div>
+                  <label className="block text-xs font-medium mb-1">{t('siteSpacing.dataFile')}</label>
+                  <select value={fullDataId}
+                    onChange={e => { setFullDataId(e.target.value); setDataSheets([]); setFullSheet('') }}
+                    className={sheetSelectCls}>
+                    {dataItems.length === 0 && <option value="">{t('siteSpacing.loadDataErr')}</option>}
+                    {dataItems.map(d => <option key={d.id} value={d.id}>{d.name}</option>)}
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-xs font-medium mb-1">{t('siteSpacing.sheetName')}</label>
+                  <select value={fullSheet} onChange={e => setFullSheet(e.target.value)}
+                    disabled={!dataSheets.length} className={sheetSelectCls}>
+                    {!dataSheets.length && <option value="">{t('siteSpacing.uploadHint')}</option>}
+                    {dataSheets.map(s => <option key={s} value={s}>{s}</option>)}
+                  </select>
+                </div>
+              </div>
+            )}
+          </div>
         </div>
-      </div>
 
-      {/* ④ 开始计算 */}
-      <div className="mb-6 p-4 bg-card border border-border rounded-lg">
-        <button onClick={handleCalculate} disabled={calculating || uploading}
-          className="w-full px-6 py-2.5 bg-primary text-primary-foreground rounded-lg hover:opacity-90 disabled:opacity-50 text-sm font-medium">
-          {calculating ? <Loader2 size={16} className="animate-spin inline mr-2" /> : null}
-          {t('siteSpacing.start')}
-        </button>
+        {/* ③ 参数设置 + 开始计算 */}
+        <div className={cardCls}>
+          <p className="text-xs font-medium mb-3">{t('siteSpacing.params')}</p>
+          <div className="mb-4">
+            <label className="block text-xs font-medium mb-1">{t('siteSpacing.kNeighbors')}</label>
+            <input value={kNeighbors} inputMode="numeric"
+              onChange={e => { if (/^\d*$/.test(e.target.value)) setKNeighbors(e.target.value) }}
+              placeholder="5" className="w-full h-9 px-2 text-sm border border-border rounded bg-card" />
+            <p className="mt-1 text-xs text-muted-foreground">{t('siteSpacing.kNeighborsHint') || '计算每个站点到最近 K 个站点的平均距离'}</p>
+          </div>
+          <button onClick={handleCalculate} disabled={calculating || uploading}
+            className="w-full px-6 py-2.5 bg-primary text-primary-foreground rounded-lg hover:opacity-90 disabled:opacity-50 text-sm font-medium">
+            {calculating ? <Loader2 size={16} className="animate-spin inline mr-2" /> : null}
+            {t('siteSpacing.start')}
+          </button>
+        </div>
       </div>
 
       {/* 错误提示 */}
       {error && (
-        <div className="mb-6 p-4 bg-red-500/10 border border-red-500/20 rounded-lg text-xs text-red-600 flex items-start gap-2">
+        <div className="p-3 bg-red-500/10 border border-red-500/20 rounded-lg text-xs text-red-600 flex items-start gap-2 shrink-0">
           <AlertCircle size={14} className="mt-0.5 shrink-0" /> {error}
         </div>
       )}
 
       {/* 校验错误明细 */}
       {parseErrors.length > 0 && (
-        <div className="mb-6 p-4 bg-amber-500/10 border border-amber-500/20 rounded-lg text-xs">
+        <div className="p-3 bg-amber-500/10 border border-amber-500/20 rounded-lg text-xs shrink-0">
           <p className="text-amber-400 font-medium mb-2 flex items-center gap-1">
             <AlertCircle size={14} /> {t('siteSpacing.invalidData')}
             {parseTotal > 0 && <span className="text-muted-foreground ml-2">（{t('siteSpacing.parsedTotal').replace('{count}', String(parseTotal))}）</span>}
@@ -463,34 +484,48 @@ export default function SiteSpacingPage() {
         </div>
       )}
 
-      {/* ⑤ 结果下载 */}
+      {/* ⑤ 结果：汇总 + 下载 + 分页列表（占满剩余高度，内部滚动懒加载） */}
       {result && (
-        <div className="p-4 bg-card border border-border rounded-lg space-y-3">
-          <p className="text-xs text-muted-foreground flex items-center gap-2">
-            <CheckCircle2 size={14} className="text-green-600" />
-            {t('siteSpacing.calcDone').replace('{total}', String(result.total || 0)).replace('{k}', String(result.k || 0))}
-          </p>
-
-          {/* 汇总信息 */}
-          <div className="grid grid-cols-3 gap-3 p-3 bg-muted/40 rounded-md">
-            <div>
-              <div className="text-xs text-muted-foreground">{t('siteSpacing.summaryTotal')}</div>
-              <div className="text-lg font-semibold text-foreground">{result.total ?? 0}</div>
+        <div className="flex-1 min-h-0 flex flex-col p-4 bg-card border border-border rounded-lg gap-3">
+          <div className="flex items-start gap-4 flex-wrap shrink-0">
+            <div className="flex-1 min-w-[16rem]">
+              <p className="text-xs text-muted-foreground flex items-center gap-2">
+                <CheckCircle2 size={14} className="text-green-600" />
+                {t('siteSpacing.calcDone').replace('{total}', String(result.total || 0)).replace('{k}', String(result.k || 0))}
+              </p>
+              <div className="mt-2 grid grid-cols-3 gap-3 p-2.5 bg-muted/40 rounded-md">
+                <div>
+                  <div className="text-xs text-muted-foreground">{t('siteSpacing.summaryTotal')}</div>
+                  <div className="text-base font-semibold text-foreground">{result.total ?? 0}</div>
+                </div>
+                <div>
+                  <div className="text-xs text-muted-foreground">{t('siteSpacing.summaryCounted')}</div>
+                  <div className="text-base font-semibold text-foreground">{result.counted ?? 0}</div>
+                </div>
+                <div>
+                  <div className="text-xs text-muted-foreground">{t('siteSpacing.summaryOverall')}</div>
+                  <div className="text-base font-semibold text-foreground">{(result.overall_avg_km ?? 0).toFixed(4)}</div>
+                </div>
+              </div>
             </div>
-            <div>
-              <div className="text-xs text-muted-foreground">{t('siteSpacing.summaryCounted')}</div>
-              <div className="text-lg font-semibold text-foreground">{result.counted ?? 0}</div>
-            </div>
-            <div>
-              <div className="text-xs text-muted-foreground">{t('siteSpacing.summaryOverall')}</div>
-              <div className="text-lg font-semibold text-foreground">{(result.overall_avg_km ?? 0).toFixed(4)}</div>
-            </div>
+            <a href={result.download_url + '?_t=' + Date.now()} download
+              className="inline-flex items-center justify-center gap-2 px-5 py-2.5 bg-green-600 text-white rounded-lg hover:opacity-90 text-sm shrink-0">
+              <Download size={16} /> {t('siteSpacing.download')} ({result.filename})
+            </a>
           </div>
 
-          <a href={result.download_url + '?_t=' + Date.now()} download
-            className="w-full inline-flex items-center justify-center gap-2 px-6 py-2.5 bg-green-600 text-white rounded-lg hover:opacity-90 text-sm">
-            <Download size={16} /> {t('siteSpacing.download')} ({result.filename})
-          </a>
+          <p className="text-xs font-medium text-foreground shrink-0">{t('siteSpacing.resultList', '结果列表')}</p>
+          {result.result_id ? (
+            <ResultTable
+              resetKey={result.result_id}
+              loadPage={loadResultPage}
+              emptyHint={t('siteSpacing.resultEmpty', '计算完成后结果将在此展示')}
+            />
+          ) : (
+            <div className="flex-1 min-h-0 flex items-center justify-center text-xs text-muted-foreground">
+              {t('siteSpacing.resultUnavailable', '该结果不支持页内预览，请下载查看')}
+            </div>
+          )}
         </div>
       )}
     </div>

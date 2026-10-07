@@ -27,7 +27,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Optional, Tuple
 
-APP_NAME = "网络规划工具"
+APP_NAME = "网优引擎"
 MUTEX_NAME = "Local\\NPTDesktop"
 READY_PATH = "/api/v1/system/status"
 # 启动时 lifespan 会做数据索引检查与地图缓存预热，首次启动可能较慢
@@ -230,6 +230,14 @@ def _run_window(port: int, data_root: Path) -> None:
         desktop_bridge.set_exit_handler(window.destroy)
     except Exception as exc:  # noqa: BLE001
         _log.warning("注入桌面桥接退出回调失败（自动升级退避为手动重启）：%s", exc)
+
+    # 注入标题回调：前端把「运行模式 + 实时同步状态」写到窗口标题栏（失败仅影响标题展示）
+    try:
+        from app import desktop_bridge
+
+        desktop_bridge.set_title_handler(window.set_title)
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("注入窗口标题回调失败（标题将只显示应用名）：%s", exc)
     # private_mode=False + storage_path：localStorage 持久化（否则每次启动掉登录）
     webview.start(private_mode=False, storage_path=str(data_root / "webview"))
 

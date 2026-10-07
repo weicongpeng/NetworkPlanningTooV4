@@ -1,7 +1,7 @@
 {
   "name": "network-planning-tool-frontend",
   "version": "2.0.0",
-  "description": "Network Planning Tool - React Frontend",
+  "description": "NetOpt Engine - React Frontend",
   "scripts": {
     "dev": "vite",
     "dev:web": "vite",

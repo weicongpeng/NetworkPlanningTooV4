@@ -497,8 +497,16 @@ export interface UserInfo {
   is_online?: boolean
   is_online_pc?: boolean
   is_online_app?: boolean
+  /** 桌面端（共享模式登录）是否在线 */
+  is_online_desktop?: boolean
   must_change_password: boolean
+  /** 该用户单独设置的例外授权期限（未设置=跟全局，用户管理页展示用） */
   license_expiry: string | null
+  /**
+   * 实际适用的授权期限（后端计算）：管理员恒为 null（无限期）；
+   * 非管理员为「license_expiry ?? 全局授权期限」。授权门禁一律用这个。
+   */
+  effective_license_expiry?: string | null
   total_usage_seconds: number
   last_login: string | null
   last_login_ip: string | null
@@ -550,6 +558,11 @@ export interface ChangePasswordRequest {
 export interface UserListResponse {
   total: number
   users: UserInfo[]
+  /** 在线统计为全量（跨所有页），由后端基于全部用户计算 */
+  online_users: number
+  online_pc: number
+  online_app: number
+  online_desktop: number
 }
 
 export interface UserUpdateRequest {
@@ -578,7 +591,8 @@ export interface UserSessionInfo {
   user_id: number
   token_jti: string
   ip_address: string | null
-  client_type: 'pc' | 'app'
+  /** 桌面端共享模式登录在服务器记 'desktop' */
+  client_type: 'pc' | 'app' | 'desktop'
   login_time: string | null
   logout_time: string | null
   last_activity: string | null

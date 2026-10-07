@@ -1,4 +1,4 @@
-; 网络规划工具 —— Windows 桌面离线版安装脚本（Inno Setup 6）
+; 网优引擎 —— Windows 桌面离线版安装脚本（Inno Setup 6）
 ;
 ; 构建（在仓库根目录）：
 ;   1) pip install -r backend/requirements.txt -r desktop/requirements-desktop.txt
@@ -11,7 +11,7 @@
 ; 说明：per-user 安装（无需管理员）；用户数据在 %APPDATA%\NetworkPlanningTool，
 ;       卸载不删除；运行中的程序通过 AppMutex 检测并提示关闭。
 
-#define MyAppName "网络规划工具"
+#define MyAppName "网优引擎"
 #define MyAppPublisher "pengwc"
 #define MyAppExeName "NPT.exe"
 #ifndef MyAppVersion
