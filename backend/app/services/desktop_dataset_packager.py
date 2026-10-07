@@ -2,13 +2,17 @@
 
 打包内容：
 - meta.json：index.json 中的数据条目快照（含 name/type/fileType/metadata…）
-- excel 类型：源文件（**先从 SQLite 反写**，保证 PCI/TAC 应用结果不丢）
+- excel 类型（工参）：源文件（**先从 SQLite 反写**，保证 PCI/TAC 应用结果不丢）
 - map 类型：`data/<data_id>/` 下的全部图层文件（TAB 全套 + layers.json）
+- geo_data 类型（地理化数据）：`data/<data_id>/` 下的全部内容（真身是 default.json，
+  源 Excel 只是解析输入）+ 源文件副本（供接收端反向 push 时再次打包）
 
 解包落盘的硬性要求（踩过/会踩的坑）：
 - **先删后插**：`_save_to_sqlite` 只 upsert Workbook + 追加 Site/Sector，
   不删旧行；同一 data_id 二次导入会让小区数量翻倍。
-- **map 类型不走 Excel 管线**：直接落文件 + 写 index 条目 + 补 Layer 表行。
+- **map / geo_data 类型不走 Excel 管线**：直接落文件 + 写 index 条目（+ 补 Layer / GeoFile 表行）。
+  geo_data 若误走 `_process_upload_sync`，会被工参解析覆盖 `fileType` 并抹掉 `geometryType`，
+  且 default.json 缺失——表现为接收端「扇区」标注丢失、地图回退成工参渲染。
 - Windows 文件锁：先解到临时目录再整体替换，不要直接覆盖 GDAL 正打开的文件。
 """
 from __future__ import annotations
@@ -33,6 +37,11 @@ SOURCE_PREFIX = "source"
 
 class DatasetPackageError(Exception):
     """打包/解包失败。"""
+
+
+def _is_geo_entry(entry: Dict[str, Any]) -> bool:
+    """地理化数据：数据体是 data/<id>/default.json，必须整目录同步。"""
+    return entry.get("fileType") == "geo_data"
 
 
 # ---------------------------------------------------------------- 内部工具
@@ -100,6 +109,9 @@ def build_package(data_id: str, *, workdir: Optional[Path] = None) -> Dict[str, 
     """
     entry = _entry(data_id)
     entry_type = entry.get("type") or "excel"
+    is_geo = _is_geo_entry(entry)
+    # 目录型数据集：map 的图层文件、geo_data 的 default.json 都在 data/<id>/ 下
+    packs_directory = entry_type == "map" or is_geo
 
     tmp_root = Path(tempfile.mkdtemp(prefix="npt-pkg-", dir=str(workdir) if workdir else None))
     zip_path = tmp_root / f"{data_id}.zip"
@@ -114,14 +126,22 @@ def build_package(data_id: str, *, workdir: Optional[Path] = None) -> Dict[str, 
                 ),
             )
 
-            if entry_type == "map":
+            if packs_directory:
                 data_dir = settings.DATA_DIR / data_id
                 if not data_dir.is_dir():
-                    raise DatasetPackageError(f"图层数据目录缺失：{data_dir}")
+                    raise DatasetPackageError(f"数据目录缺失：{data_dir}")
                 for f in sorted(data_dir.rglob("*")):
                     if not f.is_file():
                         continue
                     zf.write(f, str(f.relative_to(data_dir)))
+                if is_geo:
+                    # 源文件一并入包：接收端恢复 uploads/ 后，反向 push 才能再次打包
+                    try:
+                        src = _locate_source_file(data_id, entry)
+                    except DatasetPackageError:
+                        src = None
+                    if src is not None:
+                        zf.write(src, f"{SOURCE_PREFIX}{src.suffix.lower()}")
             else:
                 _ensure_excel_synced(data_id, entry)
                 src = _locate_source_file(data_id, entry)
@@ -171,6 +191,7 @@ def install_package(
     if not data_id:
         raise DatasetPackageError("数据包缺少 data_id")
     entry_type = source_entry.get("type") or "excel"
+    is_geo = _is_geo_entry(source_entry)
 
     # 1. 已存在 → 彻底删除（含文件/SQLite 行/索引），避免二次导入导致小区翻倍
     if data_id in data_service.index:
@@ -188,10 +209,18 @@ def install_package(
         settings.DATA_DIR.mkdir(parents=True, exist_ok=True)
         data_dir = settings.DATA_DIR / data_id
 
-        if entry_type == "map":
+        if entry_type == "map" or is_geo:
             data_dir.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(extract_root), str(data_dir))
             (data_dir / META_NAME).unlink(missing_ok=True)
+            if is_geo:
+                # 源文件恢复到 uploads/（与 geo_data 上传路径一致），供反向 push 再次打包
+                for cand in sorted(data_dir.glob(f"{SOURCE_PREFIX}.*")):
+                    ext = cand.suffix.lower()
+                    settings.UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(cand, settings.UPLOAD_DIR / f"{data_id}{ext}")
+                    cand.unlink(missing_ok=True)
+                    break
         else:
             src = None
             for cand in sorted(extract_root.glob(f"{SOURCE_PREFIX}.*")):
@@ -228,6 +257,13 @@ def install_package(
         data_service.index[data_id] = new_entry
         data_service._save_index()
         _upsert_layers(data_id, new_entry, user_id, city, operator)
+    elif is_geo:
+        # 地理化数据不走工参 Excel 管线：条目原样落地（保住 fileType/geometryType/metadata）
+        new_entry["status"] = "ready"
+        new_entry.pop("errorMessage", None)
+        data_service.index[data_id] = new_entry
+        data_service._save_index()
+        _upsert_geo_file(data_id, new_entry, user_id, city, operator)
     else:
         new_entry["status"] = "processing"
         data_service.index[data_id] = new_entry
@@ -303,3 +339,39 @@ def _upsert_layers(
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"[数据集解包] 图层元数据写入失败 {layer_id}: {exc}")
+
+
+def _upsert_geo_file(
+    data_id: str, entry: Dict[str, Any], user_id: int, city: Optional[str], operator: Optional[str]
+) -> None:
+    """geo_data 类型：补 SQLite geo_files 元数据行。
+
+    地理化数据没有 Workbook/Site/Sector 行，启动对账（data_service 校验索引）以
+    「geo_files 有行 或 data/<id>/default.json 存在」为有效依据；缺行会让接收端
+    的条目在下次重启被当作无效索引删掉。复用 geo_data_service 的元数据写入，
+    保证字段（field_mapping/created_at 等）与上传路径一致。
+    """
+    try:
+        from app.services.geo_data_service import _save_geo_file_metadata
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"[数据集解包] 地理化元数据模块不可用: {exc}")
+        return
+
+    metadata = entry.get("metadata") or {}
+    data_dir = settings.DATA_DIR / data_id
+    try:
+        _save_geo_file_metadata(
+            user_id=user_id,
+            filename=entry.get("name") or data_id,
+            file_path=str(data_dir / "default.json"),
+            geometry_type=entry.get("geometryType") or "point",
+            field_mapping=metadata.get("fieldMapping") or {},
+            point_count=int(metadata.get("pointCount") or 0),
+            bbox=metadata.get("bbox"),
+            file_size=entry.get("size"),
+            geo_id=data_id,
+            city=city,
+            operator=operator,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"[数据集解包] 地理化元数据写入失败 {data_id}: {exc}")
