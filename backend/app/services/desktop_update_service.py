@@ -1,13 +1,16 @@
 """桌面版 OTA：检查更新 / 断点续传下载 / sha256 校验 / 稍后计数 / 静默安装并退出。
 
 - 下载走 stdlib urllib（可断点续传，写 <version>.exe.part，完成后校验并改名）
-- 安装：写一个等待本进程退出的 helper 脚本（cmd），以脱离进程方式拉起，
-  再通过 desktop_bridge.request_exit() 退出应用；helper 静默安装后拉起新版本
+- 安装：写一个升级脚本（cmd，隐藏运行，不弹终端窗口），以脱离进程方式拉起，
+  再通过 desktop_bridge.request_exit() 退出应用；
+  脚本等待应用退出（有上限，超时 taskkill 兜底）→ 静默安装 → 拉起新版本，
+  因此应用侧退出失败也不会让安装永久卡住
 - 稍后次数记录在 cloud_state.json（同一版本最多 NPT_DESKTOP_MAX_SNOOZE 次）
 """
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import subprocess
 import sys
@@ -21,6 +24,12 @@ from app.core.config import settings
 from app.services import desktop_cloud_client as cloud
 from app.services.desktop_cloud_client import CloudError, load_state, save_state
 
+_log = logging.getLogger("desktop.update")
+
+# 升级脚本等待应用退出的上限（秒），超时后 taskkill 强制结束再继续安装
+EXIT_WAIT_SECONDS = 60
+
+
 _state: Dict[str, Any] = {
     "phase": "idle",  # idle | downloading | ready | failed
     "version": None,
@@ -31,6 +40,7 @@ _state: Dict[str, Any] = {
     "sha256": None,
 }
 _lock = threading.Lock()
+_install_started = False  # 升级脚本只允许拉起一次（重复触发会出现两个安装器）
 
 
 def _updates_dir() -> Path:
@@ -163,20 +173,64 @@ def start_download(release: Dict[str, Any]) -> Dict[str, Any]:
     return progress()
 
 
+def _windows_short_path(path: Path) -> str:
+    """取 Windows 8.3 短路径（纯 ASCII），让升级脚本不受 cmd 代码页影响。
+
+    用户名含中文时，%APPDATA% 下的路径写入 UTF-8 批处理脚本后，一旦 cmd 未能按
+    chcp 65001 解码就会拼出错误路径导致安装失败；短路径可彻底规避（未启用 8.3 时回退长路径）。
+    """
+    if os.name != "nt":
+        return str(path)
+    try:
+        import ctypes
+
+        buffer = ctypes.create_unicode_buffer(1024)
+        if ctypes.windll.kernel32.GetShortPathNameW(str(path), buffer, 1024):
+            return buffer.value or str(path)
+    except Exception:  # noqa: BLE001
+        pass
+    return str(path)
+
+
 def _write_helper(installer: Path) -> Path:
-    """写一个等待本进程退出 → 静默安装 → 拉起新版本的 cmd 脚本。"""
+    """写升级脚本：等待应用退出（超时强杀）→ 静默安装 → 重新启动应用。
+
+    脚本必须隐藏运行（调用方用 CREATE_NO_WINDOW 拉起），否则用户会看到一个卡住的
+    终端窗口；计时用 ping 而非 timeout —— 无控制台环境下 timeout 会直接报错退化为忙循环。
+    脚本正文保持纯 ASCII（注释英文 + 8.3 短路径），避免代码页解析问题。
+    """
     # onedir 冻结后 sys.executable 即安装目录下的 NPT.exe；源码模式为 python.exe（仅开发用）
     app_exe = Path(sys.executable)
+    app_path = _windows_short_path(app_exe)
+    installer_path = _windows_short_path(installer)
+    install_log = _windows_short_path(_updates_dir() / "npt_setup.log")
+    setup_args = '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /CLOSEAPPLICATIONS /LOG="%LOG%"'
     script = f"""@echo off
 chcp 65001 >nul
+rem NPT OTA updater: wait for app exit -> silent install -> restart app
+setlocal
+set "APP={app_path}"
+set "EXE={app_exe.name}"
+set "SETUP={installer_path}"
+set "LOG={install_log}"
+set /a WAITED=0
 :wait
-tasklist /FI "IMAGENAME eq {app_exe.name}" 2>nul | find /I "{app_exe.name}" >nul
-if not errorlevel 1 (
-  timeout /t 2 /nobreak >nul
-  goto wait
+tasklist /FI "IMAGENAME eq %EXE%" /NH 2>nul | find /I "%EXE%" >nul
+if errorlevel 1 goto install
+set /a WAITED+=2
+if %WAITED% GEQ {EXIT_WAIT_SECONDS} goto killapp
+ping -n 3 127.0.0.1 >nul
+goto wait
+:killapp
+taskkill /F /IM "%EXE%" >nul 2>&1
+ping -n 3 127.0.0.1 >nul
+:install
+start /wait "" "%SETUP%" {setup_args}
+if errorlevel 1 (
+  ping -n 3 127.0.0.1 >nul
+  start /wait "" "%SETUP%" {setup_args}
 )
-start /wait "" "{installer}" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /CLOSEAPPLICATIONS
-start "" "{app_exe}"
+start "" "%APP%"
 del "%~f0" >nul 2>&1
 """
     helper = _updates_dir() / f"npt_update_{installer.stem}.cmd"
@@ -185,11 +239,15 @@ del "%~f0" >nul 2>&1
 
 
 def install_and_exit() -> Dict[str, Any]:
-    """校验通过后拉起安装 helper 并请求退出应用。"""
+    """校验通过后拉起升级脚本并请求退出应用。"""
+    global _install_started
     from app import desktop_bridge
 
     with _lock:
         state = dict(_state)
+        started = _install_started
+    if started:
+        raise CloudError(409, "升级已启动，请稍候自动安装完成")
     if state.get("phase") != "ready" or not state.get("installer"):
         raise CloudError(409, "安装包尚未下载完成")
     installer = Path(str(state["installer"]))
@@ -204,11 +262,20 @@ def install_and_exit() -> Dict[str, Any]:
         raise CloudError(400, "自动安装仅在 Windows 桌面版可用")
 
     helper = _write_helper(installer)
-    creationflags = 0
-    if hasattr(subprocess, "DETACHED_PROCESS"):
-        creationflags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
-    subprocess.Popen(["cmd", "/c", str(helper)], creationflags=creationflags, close_fds=True)
+    with _lock:
+        _install_started = True
+    # CREATE_NO_WINDOW：脚本在隐藏控制台中运行，用户不会看到"卡住的终端窗口"
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(
+        subprocess, "CREATE_NEW_PROCESS_GROUP", 0
+    )
+    try:
+        subprocess.Popen(["cmd", "/c", str(helper)], creationflags=creationflags, close_fds=True)
+    except Exception:
+        with _lock:
+            _install_started = False  # 拉起失败允许重试
+        raise
+    _log.info("OTA 升级脚本已启动：installer=%s helper=%s", installer, helper)
 
     if not desktop_bridge.request_exit():
-        return {"exiting": False, "message": "已启动安装程序；本程序将在退出后自动安装"}
+        return {"exiting": False, "message": "已启动安装程序；应用未响应退出，升级脚本将自动关闭并安装"}
     return {"exiting": True, "message": "即将退出并安装新版本"}

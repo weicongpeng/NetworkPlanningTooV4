@@ -92,12 +92,17 @@ export function DesktopUpdateDialog() {
 
   const handleInstall = async () => {
     setBusy(true)
+    // 安装随即会关闭本程序、连接随之断开，先给出提示避免用户以为无响应
+    setMessage(t('desktopUpdate.installing'))
     try {
       const res: any = await desktopUpdateApi.install()
       setMessage(res?.data?.message || t('desktopUpdate.installing'))
     } catch (err: any) {
-      setMessage(err?.message || t('desktopUpdate.installFailed'))
-      setBusy(false)
+      // code === 0 表示连接被切断（应用正在退出安装），不是失败
+      if (err?.code !== 0) {
+        setMessage(err?.message || t('desktopUpdate.installFailed'))
+        setBusy(false)
+      }
     }
   }
 

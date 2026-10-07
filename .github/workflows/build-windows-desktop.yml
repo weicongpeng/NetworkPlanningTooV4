@@ -17,7 +17,8 @@ jobs:
   build-windows:
     runs-on: windows-latest
     env:
-      # CI 阶段保留控制台输出便于诊断；正式发行前改为 0（无控制台窗口）
+      # CI 阶段保留控制台输出便于诊断（冒烟自检可见）；tag 发行会用 NPT_CONSOLE=0 重新打包，
+      # 保证装到用户机器上的 NPT.exe 不带终端窗口
       NPT_CONSOLE: "1"
       # Windows 管道输出默认 cp1252，统一 UTF-8 避免中文 print 崩溃
       PYTHONUTF8: "1"
@@ -118,6 +119,12 @@ jobs:
           $size = (Get-ChildItem "dist/NetworkPlanningTool" -Recurse -File | Measure-Object -Property Length -Sum).Sum / 1MB
           Write-Host ("打包体积: {0:N1} MB" -f $size)
           if ($fail) { exit 1 }
+
+      - name: 重新打包发行版（无控制台窗口）
+        if: startsWith(github.ref, 'refs/tags/desktop-v')
+        env:
+          NPT_CONSOLE: "0"
+        run: pyinstaller --noconfirm --clean desktop/desktop.spec
 
       - name: 下载 WebView2 引导安装器（随安装包分发，供离线机器使用）
         shell: pwsh

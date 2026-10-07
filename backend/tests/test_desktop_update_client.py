@@ -9,6 +9,7 @@ import re
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -56,6 +57,7 @@ def updater_env(tmp_path, monkeypatch):
     updater._state.update(
         phase="idle", version=None, downloaded=0, total=0, error=None, installer=None, sha256=None
     )
+    updater._install_started = False
 
     yield SimpleNamespace(updater=updater, tmp_path=tmp_path, settings=settings)
     server.shutdown()
@@ -153,3 +155,143 @@ def test_install_on_non_windows_rejected(updater_env):
     with pytest.raises(CloudError) as excinfo:
         updater.install_and_exit()
     assert excinfo.value.status_code == 400
+
+
+def test_helper_script_bounded_wait_and_relaunch(updater_env):
+    """升级脚本：等待应用退出必须有上限并强杀兜底，且不能依赖 timeout（隐藏控制台下会报错）。"""
+    updater = updater_env.updater
+    installer = updater_env.tmp_path / "updates" / "NetworkPlanningTool-Setup-1.0.0.exe"
+    installer.parent.mkdir(parents=True, exist_ok=True)
+    installer.write_bytes(PAYLOAD)
+
+    helper = updater._write_helper(installer)
+    text = helper.read_text(encoding="utf-8")
+
+    assert helper.parent == updater_env.tmp_path / "updates"
+    # 静默安装 + 安装后重新启动应用
+    assert "/VERYSILENT" in text and "/SUPPRESSMSGBOXES" in text
+    assert 'start "" "%APP%"' in text
+    assert str(installer) in text
+    # 等待应用退出的上限与 taskkill 兜底（否则应用不退出安装会永久卡住）
+    assert f"GEQ {updater.EXIT_WAIT_SECONDS}" in text
+    assert "taskkill /F /IM" in text
+    # 计时不能用 timeout：无控制台环境下它直接报错，会退化成忙循环
+    assert "timeout /t" not in text
+    assert "ping -n 3 127.0.0.1" in text
+
+
+def test_install_spawns_hidden_helper_and_requests_exit(updater_env, monkeypatch):
+    """安装流程：隐藏拉起升级脚本（CREATE_NO_WINDOW）→ 请求退出；重复触发被拒绝。"""
+    from types import SimpleNamespace
+
+    updater = updater_env.updater
+    installer = updater_env.tmp_path / "updates" / "NetworkPlanningTool-Setup-1.0.0.exe"
+    installer.parent.mkdir(parents=True, exist_ok=True)
+    installer.write_bytes(PAYLOAD)
+    updater._state.update(phase="ready", installer=str(installer), sha256=SHA)
+
+    calls: list = []
+    create_no_window = 0x08000000
+    # 只在 updater 模块内替换 os/subprocess（避免影响 pathlib、真实进程调用）
+    monkeypatch.setattr(updater, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(
+        updater,
+        "subprocess",
+        SimpleNamespace(
+            Popen=lambda args, **kwargs: calls.append((args, kwargs)),
+            CREATE_NO_WINDOW=create_no_window,
+            CREATE_NEW_PROCESS_GROUP=0x00000200,
+        ),
+    )
+    monkeypatch.setattr("app.desktop_bridge.request_exit", lambda: True)
+
+    result = updater.install_and_exit()
+    assert result["exiting"] is True
+    assert calls[0][0][:2] == ["cmd", "/c"]
+    assert calls[0][1]["creationflags"] & create_no_window  # 隐藏窗口，不弹终端
+    assert Path(calls[0][0][2]).is_file()
+
+    # 已启动过升级脚本，重复调用只返回 409（避免两个安装器同时跑）
+    from app.services.desktop_cloud_client import CloudError
+
+    with pytest.raises(CloudError) as excinfo:
+        updater.install_and_exit()
+    assert excinfo.value.status_code == 409
+    assert len(calls) == 1
+
+
+def test_install_requests_exit_even_without_bridge(updater_env, monkeypatch):
+    """桌面壳未注入回调（request_exit False）时仍要返回提示，由升级脚本强杀兜底完成安装。"""
+    from types import SimpleNamespace
+
+    updater = updater_env.updater
+    installer = updater_env.tmp_path / "updates" / "NetworkPlanningTool-Setup-1.0.0.exe"
+    installer.parent.mkdir(parents=True, exist_ok=True)
+    installer.write_bytes(PAYLOAD)
+    updater._state.update(phase="ready", installer=str(installer), sha256=SHA)
+
+    monkeypatch.setattr(updater, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(
+        updater,
+        "subprocess",
+        SimpleNamespace(
+            Popen=lambda *a, **k: None,
+            CREATE_NO_WINDOW=0x08000000,
+            CREATE_NEW_PROCESS_GROUP=0x00000200,
+        ),
+    )
+    monkeypatch.setattr("app.desktop_bridge.request_exit", lambda: False)
+
+    result = updater.install_and_exit()
+    assert result["exiting"] is False
+    assert "安装" in result["message"]
+
+
+def _load_launcher():
+    """按路径加载 desktop/launcher.py（CI 从 backend/ 目录跑 pytest，模块不在 sys.path 上）。"""
+    import importlib.util
+
+    path = Path(__file__).resolve().parents[2] / "desktop" / "launcher.py"
+    spec = importlib.util.spec_from_file_location("desktop_launcher", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _stub_exit_side_effects(launcher, monkeypatch) -> list:
+    """替换 os._exit 与看门狗线程，记录强制退出调用。"""
+    from types import SimpleNamespace
+
+    exits: list = []
+    thread_stub = SimpleNamespace(Thread=lambda **kwargs: SimpleNamespace(start=lambda: None))
+    monkeypatch.setattr(launcher, "os", SimpleNamespace(_exit=exits.append))
+    monkeypatch.setattr(launcher, "threading", thread_stub)
+    return exits
+
+
+def test_launcher_force_exits_when_destroy_fails(monkeypatch):
+    """场景：window.destroy() 抛异常（跨线程/后端异常）——必须立刻强制退出，否则 OTA 永远卡在等待应用退出。"""
+    launcher = _load_launcher()
+    exits = _stub_exit_side_effects(launcher, monkeypatch)
+
+    def _broken_destroy():
+        raise RuntimeError("cross-thread operation not valid")
+
+    launcher._make_exit_handler(SimpleNamespace(destroy=_broken_destroy))()
+    assert exits == [0]
+
+
+def test_launcher_arms_watchdog_before_destroy(monkeypatch):
+    """场景：window.destroy() 永久阻塞——看门狗必须在 destroy 之前武装，否则进程永不退出。"""
+    launcher = _load_launcher()
+    exits = _stub_exit_side_effects(launcher, monkeypatch)
+
+    started: list = []
+    monkeypatch.setattr(launcher, "_force_exit_after", started.append)
+
+    def _blocking_destroy():
+        assert started, "destroy 之前必须已武装强制退出看门狗"
+
+    launcher._make_exit_handler(SimpleNamespace(destroy=_blocking_destroy))()
+    assert started == [launcher.EXIT_GRACE_SECONDS]
+    assert exits == []  # 正常提交关窗时不强制退出

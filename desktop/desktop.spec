@@ -7,7 +7,8 @@
     dist/NetworkPlanningTool/{NPT.exe, _internal/}
 
 说明：
-- console 由环境变量 NPT_CONSOLE 控制（CI 冒烟取 1，正式发布取 0）
+- console 由环境变量 NPT_CONSOLE 控制（CI 冒烟取 1 便于看日志；tag 发行会用 0 重新打包，
+  避免发布包自带控制台窗口）
 - 不加 UPX、不用 onefile：降低杀软误报与启动开销
 - GDAL 栈由 pyogrio wheel 提供，收集逻辑见 hooks/hook-pyogrio.py
 """

@@ -236,7 +236,7 @@ FastAPI (backend/app/)
   - **单机模式**：同上流程，但服务器按 `(username, machine_code)` 找/建 `mode='standalone'` 授权记录；未批准返回 `result=pending`，前端 `DesktopAuthPendingDialog` 轮询 `POST /desktop/auth-poll`，管理员在网页端「桌面授权」页批准后当场签发许可并建立登录态。单机模式 `require_permission` 一律放行（权限全开）、强制 `run_mode=offline`、隐藏「桌面离线授权/运行模式与数据同步/数据组」三张卡片。
   - 记账：每次联机登录累加 `DesktopLicense.login_count`；断网登录本机记 `pending_offline_logins`，下次联机补报。`idle_logout_days`（默认 2 天）写在授权上并随许可下发，覆盖本机会话空闲超时（`core/security._desktop_idle_timeout_minutes`）。
   - 本机 users 表新增 `desktop_run_mode` 列区分当前模式；`DesktopLicense` 新增 `mode/username/user_id/login_count/last_login_at/idle_logout_days`。
-- **许可签发与续期**：Ed25519 许可（私钥仅服务器：`NPT_LICENSE_PRIVATE_KEY` 或 `licenses/license_private_key.pem`，见 `services/desktop_signing.py`），租约默认 30 天、启动后台静默续期（剩余<20 天或距上次≥7 天）。OTA：管理端上传安装包到 `desktop_releases`，客户端比对版本 → 断点续传下载 + sha256 校验 → 写 `%TEMP%\npt_update_*.cmd`（等进程退出→静默安装→重启），经 `app/desktop_bridge.py` 的退出回调关闭应用；"稍后"3 次或 `mandatory` 转强制。离线 `.nptlic` 导入通道保留。
+- **许可签发与续期**：Ed25519 许可（私钥仅服务器：`NPT_LICENSE_PRIVATE_KEY` 或 `licenses/license_private_key.pem`，见 `services/desktop_signing.py`），租约默认 30 天、启动后台静默续期（剩余<20 天或距上次≥7 天）。OTA：管理端上传安装包到 `desktop_releases`，客户端比对版本 → 断点续传下载 + sha256 校验 → 在 `%APPDATA%\NetworkPlanningTool\updates\`（`DATA_ROOT/updates`）写升级脚本 `npt_update_*.cmd` → `CREATE_NO_WINDOW` 隐藏拉起（不弹终端窗口；脚本用 `ping` 计时，无控制台时 `timeout` 会报错），脚本等应用退出（`EXIT_WAIT_SECONDS=60` 超时 `taskkill` 兜底）→ `/VERYSILENT` 安装并记 `npt_setup.log` → 重启应用；应用侧由 `app/desktop_bridge.py` 的退出回调关窗，`desktop/launcher.py` 先武装 `EXIT_GRACE_SECONDS=20` 强制退出看门狗、`destroy` 抛异常则立即 `os._exit`，保证进程一定退出。「稍后」3 次或 `mandatory` 转强制。离线 `.nptlic` 导入通道保留。桌面版必须用 `NPT_CONSOLE=0` 构建（CI tag 发行会用 0 重新打包），否则程序自带控制台窗口。
 - **网优助手**：LLM 配置/数据集导入到 `station_param_rows`、`station_metric_rows` 两张表，对话走 function-calling（最多 5 轮工具调用），查询只读。
 
 ## 添加新 API 端点
@@ -336,4 +336,5 @@ NPT_DESKTOP_SYNC_DEBOUNCE_SECONDS         # 本地改动上行防抖秒数，默
 - **桌面端登录一直 pending**：单机模式需管理员在网页端「桌面授权」页批准（`NPT_DESKTOP_ACTIVATION_MODE=approve`），批准后前端 `auth-poll` 轮询会自动进入。
 - **桌面端被踢下线**：共享模式为单设备登录，同账号在别处登录会使本机 `session-check` 失败并登出；`DesktopLicense.idle_logout_days`（默认 2 天）覆盖本机会话空闲超时。
 - **桌面端数据不同步**：先看 `/desktop/sync-status` 与 `sync_state.json` 的 `conflicts`（push 带 `base_rev`，服务器 rev 不符返回 409）；服务器权威 rev 在 `dataset_revisions` 表，与本地记录的基线是两套数字。
+- **桌面端 OTA 安装卡住 / 关不掉程序**：升级脚本在 `%APPDATA%\NetworkPlanningTool\updates\`，安装日志 `npt_setup.log`，运行日志 `logs/desktop.log`（关注「注入桌面桥接退出回调失败」「强制结束进程」）；脚本 60 秒等不到退出会 `taskkill`，应用侧 20 秒兜底 `os._exit`。若安装包自带控制台窗口，说明构建时 `NPT_CONSOLE` 不是 0（tag 发行由 CI 用 0 重新打包）。
 - **桌面打包缺 GDAL**：确认 `desktop/hooks/hook-pyogrio.py` 生效且产物含 `gdal*.dll`/`proj*.dll`/`proj.db`（CI 有该校验步骤）。

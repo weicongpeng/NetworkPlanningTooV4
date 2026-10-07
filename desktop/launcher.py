@@ -25,13 +25,15 @@ import urllib.error
 import urllib.request
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any, Optional, Tuple
+from typing import Any, Callable, Optional, Tuple
 
 APP_NAME = "网优引擎"
 MUTEX_NAME = "Local\\NPTDesktop"
 READY_PATH = "/api/v1/system/status"
 # 启动时 lifespan 会做数据索引检查与地图缓存预热，首次启动可能较慢
 READY_TIMEOUT_SECONDS = 120
+# OTA 安装 helper 会等本进程退出后才静默安装；窗口关闭超过该秒数仍存活则强制结束进程
+EXIT_GRACE_SECONDS = 20
 
 _MUTEX_HANDLE: Optional[int] = None
 _log = logging.getLogger("desktop")
@@ -209,6 +211,35 @@ def _wait_ready(port: int, timeout: float = READY_TIMEOUT_SECONDS) -> bool:
     return False
 
 
+def _force_exit_after(delay: float) -> None:
+    """兜底定时器：delay 秒后进程仍存活则直接结束。
+
+    OTA 升级脚本在等本进程退出后才静默安装，正常关窗链路一旦被 WebView2/后台线程卡住，
+    安装就会永久卡在等待里。这里保证进程一定会退出，安装流程无需用户干预。
+    """
+    def _worker() -> None:
+        time.sleep(delay)
+        _log.warning("窗口关闭后 %.0f 秒仍未退出，强制结束进程（OTA 安装继续）", delay)
+        os._exit(0)
+
+    threading.Thread(target=_worker, daemon=True, name="npt-force-exit").start()
+
+
+def _make_exit_handler(window: Any) -> Callable[[], None]:
+    """构造退出回调：先武装强制退出看门狗，再请求关闭窗口（destroy 可能阻塞）。"""
+
+    def _exit_handler() -> None:
+        _log.info("收到退出请求：关闭窗口（%s 秒内未退出将强制结束进程）", EXIT_GRACE_SECONDS)
+        _force_exit_after(EXIT_GRACE_SECONDS)
+        try:
+            window.destroy()
+        except Exception:  # noqa: BLE001
+            _log.exception("请求关闭窗口失败，立即强制结束进程以保证 OTA 安装继续")
+            os._exit(0)
+
+    return _exit_handler
+
+
 def _run_window(port: int, data_root: Path) -> None:
     import webview
 
@@ -227,7 +258,8 @@ def _run_window(port: int, data_root: Path) -> None:
     try:
         from app import desktop_bridge
 
-        desktop_bridge.set_exit_handler(window.destroy)
+        desktop_bridge.set_exit_handler(_make_exit_handler(window))
+        _log.info("已注入桌面桥接退出回调")
     except Exception as exc:  # noqa: BLE001
         _log.warning("注入桌面桥接退出回调失败（自动升级退避为手动重启）：%s", exc)
 
