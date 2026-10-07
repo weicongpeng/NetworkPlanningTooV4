@@ -161,7 +161,7 @@ def test_login_mirrors_web_account(local_env):
 
 
 def test_shared_login_starts_sync(local_env):
-    """共享模式登录即置为共享并触发一次同步（后台线程，失败不阻断登录）。"""
+    """共享模式登录置为共享并触发一次同步（延后后台跑，失败不阻断登录）。"""
     import app.services.desktop_sync_service as sync_module
 
     calls = []
@@ -169,6 +169,8 @@ def test_shared_login_starts_sync(local_env):
     local_env.monkeypatch.setattr(
         sync_module, "sync_once", lambda: calls.append(True) or {"pulled": 0}
     )
+    # 登录优先：真实延后 5s，这里缩短以便断言"最终会跑"
+    local_env.monkeypatch.setattr(local_env.desktop_local, "LOGIN_SYNC_DELAY_SECONDS", 0.1)
 
     resp = local_env.client.post(
         "/api/v1/desktop/login",
@@ -177,7 +179,7 @@ def test_shared_login_starts_sync(local_env):
     assert resp.status_code == 200, resp.text
     assert resp.json()["data"]["sync_started"] is True
     assert sync_module.run_mode() == "shared"
-    for _ in range(50):  # 同步在后台线程触发，短暂等待
+    for _ in range(60):  # 同步延后由定时器触发，短暂等待
         if calls:
             break
         time.sleep(0.05)
@@ -440,3 +442,66 @@ def test_auth_poll_still_pending(local_env):
     )
     assert resp.status_code == 200
     assert resp.json()["data"]["result"] == "pending"
+
+
+def test_session_check_never_kicks_on_server_error(monkeypatch):
+    """服务器 5xx / 网络异常不得判为"已在别处登录"：断网时必须能继续用。"""
+    from app.services import desktop_cloud_client as cloud
+
+    def _boom(*args, **kwargs):
+        raise cloud.CloudError(503, "服务暂时不可用")
+
+    monkeypatch.setattr(cloud, "_license_file_text", lambda: "fake-license")
+    monkeypatch.setattr(cloud, "_request", _boom)
+
+    result = cloud.session_check("jti-1")
+
+    assert result["valid"] is True
+    assert result.get("offline") is True
+
+
+def test_check_session_once_keeps_login_when_offline(local_env):
+    """单机模式断网：心跳按有效处理，不注销本机登录、不写 kicked 标记。"""
+    local_env.cloud.save_state(session_jti="jti-offline", kicked=False, kicked_reason=None)
+    local_env.monkeypatch.setattr(
+        local_env.cloud,
+        "session_check",
+        lambda jti: {"valid": True, "offline": True, "reason": "无法连接授权服务器"},
+    )
+
+    result = local_env.desktop_local.check_session_once()
+
+    assert result["valid"] is True
+    assert result.get("offline") is True
+    assert not local_env.cloud.load_state().get("kicked")
+
+
+def test_login_shared_sync_is_deferred(local_env):
+    """登录优先：共享模式登录只切换运行模式，同步延后到登录流程之后再跑。"""
+    from types import SimpleNamespace
+
+    dl = local_env.desktop_local
+    calls: list = []
+    started: list = []
+
+    class FakeTimer:
+        def __init__(self, interval, fn):
+            started.append(interval)
+            self.fn = fn
+            self.daemon = False
+
+        def start(self):
+            calls.append("timer-started")
+
+    local_env.monkeypatch.setattr(dl, "threading", SimpleNamespace(Timer=FakeTimer))
+    local_env.monkeypatch.setattr(
+        "app.services.desktop_sync_service.set_run_mode",
+        lambda mode: calls.append(f"mode:{mode}"),
+    )
+    local_env.monkeypatch.setattr(dl, "_run_sync_once", lambda: calls.append("sync"))
+
+    dl._start_shared_sync()
+
+    assert calls == ["mode:shared", "timer-started"]
+    assert started == [dl.LOGIN_SYNC_DELAY_SECONDS]
+    assert "sync" not in calls  # 同步不得在登录路径上同步执行

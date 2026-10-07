@@ -339,7 +339,9 @@ def app_version() -> Dict[str, Any]:
 def session_check(session_jti: str) -> Dict[str, Any]:
     """登录态校验：本机本次登录是否仍是该账号的最后一次登录。
 
-    网络不可达时按"有效"处理（断网不该把人踢下线，单机模式更是完全离线）。
+    只有服务器**明确回复** valid=False（该账号已在别处登录 / 会话已失效）才判定
+    为本机需登出；网络不可达、超时、5xx 等一律按"无法确定"处理——断网或服务器
+    抖动时不能把人踢下线（单机模式本就允许离线长期使用）。
     """
     from app.utils.machine_code import get_machine_code
 
@@ -355,9 +357,7 @@ def session_check(session_jti: str) -> Dict[str, Any]:
             timeout=15,
         )
     except CloudError as exc:
-        if exc.status_code == 0:
-            return {"valid": True, "offline": True}
-        return {"valid": False, "reason": exc.message}
+        return {"valid": True, "offline": True, "reason": exc.message}
     return resp.get("data") or {}
 
 

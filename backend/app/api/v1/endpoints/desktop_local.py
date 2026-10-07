@@ -310,6 +310,9 @@ def check_session_once() -> Dict[str, Any]:
         return {"valid": False, "reason": result.get("reason")}
     # 权限位随心跳同步：管理员改权限后运行中的桌面端无需重登即可生效
     data: Dict[str, Any] = {"valid": True}
+    if result.get("offline"):
+        # 服务器不可达/异常：按"无法确定"处理（断网继续用，不踢下线）
+        data["offline"] = True
     user_payload = _sync_permissions_from_remote(result.get("user"))
     if user_payload is not None:
         data["user"] = user_payload
@@ -329,15 +332,24 @@ async def session_guard_loop(interval_seconds: int = 60) -> None:
         await asyncio.sleep(max(15, interval_seconds))
 
 
+# 登录优先：共享模式的首次同步延后这么久再跑
+LOGIN_SYNC_DELAY_SECONDS = 5.0
+
+
 def _start_shared_sync() -> None:
     """共享模式登录成功即同步一次同组数据。
 
-    同步可能要下载多个数据集，放后台线程跑，失败只写状态不影响本机使用。
+    同步要下载并导入多个数据集，与登录、首屏请求抢资源会让"登录很慢"，
+    因此延后再跑：登录响应与首屏先完成，同步仍是同一次后台任务
+    （失败只写状态，不影响本机使用）。
     """
     from app.services.desktop_sync_service import MODE_SHARED, set_run_mode
 
     set_run_mode(MODE_SHARED)
-    threading.Thread(target=_run_sync_once, name="desktop-login-sync", daemon=True).start()
+    timer = threading.Timer(LOGIN_SYNC_DELAY_SECONDS, _run_sync_once)
+    timer.name = "desktop-login-sync"
+    timer.daemon = True
+    timer.start()
 
 
 def _run_sync_once() -> None:

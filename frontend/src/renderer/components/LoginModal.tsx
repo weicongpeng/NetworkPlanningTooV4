@@ -275,29 +275,40 @@ export function LoginModal({ isOpen, forceChangePassword = false, onClose }: Log
               <label className="block text-sm text-muted-foreground mb-1.5">
                 {t('desktopAuth.runModeLabel', '运行模式')}
               </label>
-              <div className="grid grid-cols-2 gap-2">
-                {(['shared', 'standalone'] as const).map((value) => (
-                  <button
-                    key={value}
-                    type="button"
-                    onClick={() => setDesktopRunMode(value)}
-                    className={`px-3 py-2 rounded-lg border-2 text-sm font-medium transition-all ${
-                      desktopRunMode === value
-                        ? 'border-primary bg-primary/10 text-primary'
-                        : 'border-border hover:border-primary/50'
-                    }`}
-                  >
-                    {value === 'shared'
-                      ? t('desktopAuth.modeShared', '共享模式')
-                      : t('desktopAuth.modeStandalone', '单机模式')}
-                  </button>
-                ))}
+              <div className="space-y-2" role="radiogroup" aria-label={t('desktopAuth.runModeLabel', '运行模式')}>
+                {(['shared', 'standalone'] as const).map((value) => {
+                  const checked = desktopRunMode === value
+                  return (
+                    <label
+                      key={value}
+                      className={`flex items-start gap-2.5 px-3 py-2 rounded-lg border-2 cursor-pointer transition-all ${
+                        checked ? 'border-primary bg-primary/10' : 'border-border hover:border-primary/50'
+                      }`}
+                    >
+                      <input
+                        type="radio"
+                        name="desktop-run-mode"
+                        value={value}
+                        checked={checked}
+                        onChange={() => setDesktopRunMode(value)}
+                        className="mt-0.5 h-4 w-4 shrink-0 accent-primary"
+                      />
+                      <span className="text-sm">
+                        <span className={`font-medium ${checked ? 'text-primary' : ''}`}>
+                          {value === 'shared'
+                            ? t('desktopAuth.modeShared', '共享模式')
+                            : t('desktopAuth.modeStandalone', '单机模式')}
+                        </span>
+                        <span className="block text-xs text-muted-foreground mt-0.5">
+                          {value === 'shared'
+                            ? t('desktopAuth.modeSharedHint', '与网页端同一账号、权限与数据组，可共享数据。')
+                            : t('desktopAuth.modeStandaloneHint', '数据仅存本机，需管理员授权后使用。')}
+                        </span>
+                      </span>
+                    </label>
+                  )
+                })}
               </div>
-              <p className="mt-1.5 text-xs text-muted-foreground">
-                {desktopRunMode === 'shared'
-                  ? t('desktopAuth.modeSharedHint', '与网页端同一账号、权限与数据组，可共享数据。')
-                  : t('desktopAuth.modeStandaloneHint', '数据仅存本机，需管理员授权后使用。')}
-              </p>
             </div>
           )}
 
