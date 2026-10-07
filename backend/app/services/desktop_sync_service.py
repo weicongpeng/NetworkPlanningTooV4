@@ -468,6 +468,15 @@ def sync_once() -> Dict[str, Any]:
         for data_id in list(data_service.index.keys()):
             if data_id in items:
                 continue
+            if not data_service.is_packagable(data_id):
+                # 本地只剩空壳（数据体没了）：推不上去也用不了，直接清掉。
+                # 否则每轮同步都抱着它失败，界面会一直显示「同步异常」。
+                name = (data_service.index.get(data_id) or {}).get("name") or data_id
+                data_service.delete_data(data_id, force=True)
+                forget(data_id)  # delete_data 会记一次本地删除意图，一并清掉
+                summary.setdefault("cleaned", []).append(name)
+                summary["deleted"] += 1
+                continue
             entry = datasets_state.get(data_id)
             if entry is None or entry.get("dirty"):
                 try:

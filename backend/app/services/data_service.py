@@ -498,6 +498,84 @@ class DataService:
     _LAYER_FILE_SUFFIXES = (".tab", ".mif", ".shp", ".geojson", ".kml")
     _SOURCE_FILE_SUFFIXES = (".xlsx", ".xls", ".csv", ".zip")
 
+    def _entry_source_file(self, data_id: str, entry: Dict[str, Any]) -> Optional[Path]:
+        """定位数据集源文件（与打包/下载同一优先级）；找不到返回 None。"""
+        try:
+            from app.services.desktop_dataset_packager import _locate_source_file
+
+            return _locate_source_file(data_id, entry)
+        except Exception:  # noqa: BLE001  # DatasetPackageError：源文件缺失
+            return None
+
+    def _is_directory_dataset(self, entry: Dict[str, Any]) -> bool:
+        """目录型数据集（MapInfo 图层 / 地理化数据）：数据体就是 data/<id>/ 目录。"""
+        return (entry.get("type") or "excel") == "map" or entry.get("fileType") == "geo_data"
+
+    def _entry_has_payload(self, data_id: str, entry: Dict[str, Any], known_ids=None) -> bool:
+        """条目是否还有数据体（没有 → 残余，可自动清理）。
+
+        - 目录型：data/<id>/ 里还有文件；空目录即视为无数据体（空壳条目）
+        - 表格型：能定位到源文件，或 SQLite 里还有工参记录（网页端仍可用于规划）
+        """
+        if self._is_directory_dataset(entry):
+            return self._dir_has_files(Path(settings.DATA_DIR) / data_id)
+        if self._entry_source_file(data_id, entry) is not None:
+            return True
+        if known_ids is None:
+            known_ids = self._known_db_ids()
+        return data_id in known_ids
+
+    def is_packagable(self, data_id: str) -> bool:
+        """能否打包用于桌面共享同步（无数据体的条目打出来也是空包）。
+
+        - 导入中的条目一律视为可打包，避免与正在进行的导入竞态被当成残余清掉
+        - 目录型看 data/<id>/ 是否有文件；表格型看源文件是否还在
+        """
+        entry = self.index.get(data_id)
+        if entry is None:
+            return False
+        if entry.get("status") == "processing":
+            return True
+        return self._entry_has_payload(data_id, entry)
+
+    def prune_residual_entries(self) -> Dict[str, Any]:
+        """清理「残余条目」：索引里有、数据体已经没了（空目录 / 导入失败残留）。
+
+        这类条目在网页端会一直列出来（还删不干净），又会被同步清单发给桌面端，
+        桌面端每次都尝试打包一个空包而失败 → 永久「同步异常」。这里统一清掉：
+        走标准删除（文件 + SQLite + 索引 + 墓碑），桌面端下次同步即删除本地镜像。
+        """
+        if not self._reconcile_allowed():
+            return {"skipped": True, "reason": "当前环境不允许索引自愈（测试/数据根已切换）"}
+        data_root = Path(settings.DATA_DIR)
+        if not data_root.is_dir():
+            return {"skipped": True, "reason": "数据目录不存在"}
+
+        try:
+            known_ids = self._known_db_ids()
+            removed: List[str] = []
+            for data_id, info in list(self.index.items()):
+                if not self._looks_like_data_id(data_id):
+                    continue
+                if (info.get("status") or "") == "processing":
+                    continue  # 正在导入，不抢
+                if self._entry_has_payload(data_id, info, known_ids):
+                    continue
+                try:
+                    self.delete_data(data_id, force=True)
+                except Exception as exc:  # noqa: BLE001
+                    safe_print(f"[DataService] 残余条目清理失败（非致命）{data_id}: {exc}")
+                    continue
+                removed.append(info.get("name") or data_id)
+
+            if removed:
+                self._save_index()
+                safe_print(f"[DataService] 已自动清理残余条目 {len(removed)} 个: {removed}")
+            return {"removed": removed}
+        except Exception as exc:  # noqa: BLE001
+            safe_print(f"[DataService] 残余条目清理失败（非致命）: {exc}")
+            return {"error": str(exc)}
+
     @staticmethod
     def _looks_like_data_id(name: str) -> bool:
         """数据集 id 形如 uuid4（data/<id>/ 只认这种目录，避免把 uploads 等目录当数据）。"""
@@ -681,8 +759,9 @@ class DataService:
 
         背景：测试进程曾把索引写进生产 index.json，造成两类脏数据——
         - 幽灵条目：索引里有、data 目录与 uploads 文件都没有（条目指向 /tmp 临时目录）
-        - 孤儿数据：data/<id>/ 或 uploads/<id>.* 还在、索引里没有（用户"数据丢失"）
-        本方法在启动加载索引后执行一次，两者一并处理并落盘。
+        - 孤儿数据：data/<id>/ 还在、索引里没有（用户"数据丢失"）
+        本方法在启动加载索引后执行一次，两者一并处理并落盘；最后再清一次「残余条目」
+        （有索引有目录但数据体已空，见 prune_residual_entries）。
         """
         if not self._reconcile_allowed():
             return {"skipped": True, "reason": "当前环境不允许索引自愈（测试/数据根已切换）"}
@@ -713,7 +792,9 @@ class DataService:
                     continue
                 if sub.name in self.index:
                     continue
-                if not self._dir_has_files(sub) and not self._has_upload_artifact(sub.name):
+                # 只恢复"目录里真有文件"的数据；空目录 + uploads 残留文件不再恢复
+                # （那种组合恢复出来就是 0 要素空壳，既删不干净又会让桌面端同步失败）
+                if not self._dir_has_files(sub):
                     continue
                 entry = self._build_recovered_entry(sub, uid, uname, ucity, uoperator)
                 if entry is None:
@@ -721,19 +802,29 @@ class DataService:
                 self.index[sub.name] = entry
                 recovered.append(entry.get("name") or sub.name)
 
+            if removed or recovered:
+                self._save_index()
+
             purged = self._purge_stale_layer_rows()
-            if removed or recovered or purged:
+            residual = self.prune_residual_entries()
+            if removed or recovered or purged or residual.get("removed"):
                 self._save_index()
                 safe_print(
                     f"[DataService] 索引自愈完成：清理幽灵条目 {len(removed)} 个，"
-                    f"恢复历史数据 {len(recovered)} 个，清理残留图层行 {purged} 行"
+                    f"恢复历史数据 {len(recovered)} 个，清理残留图层行 {purged} 行，"
+                    f"清理残余条目 {len(residual.get('removed') or [])} 个"
                 )
                 if recovered:
                     safe_print(
                         "[DataService] 恢复的数据条目暂按管理员账号的组归属"
                         "（原组信息已丢失），请管理员核对后调整或删除"
                     )
-            return {"removed": removed, "recovered": recovered, "purged_layers": purged}
+            return {
+                "removed": removed,
+                "recovered": recovered,
+                "purged_layers": purged,
+                "residual": residual.get("removed") or [],
+            }
         except Exception as exc:  # noqa: BLE001
             safe_print(f"[DataService] 索引自愈失败（非致命）: {exc}")
             return {"error": str(exc)}
@@ -6795,27 +6886,32 @@ class DataService:
                 except Exception as e:
                     deletion_errors.append(f"{data_dir}: {str(e)}")
 
-        # 3. 删除上传的原始文件 - 尝试新旧两种格式
-        # 新格式：{data_id}.xlsx
-        upload_file = settings.UPLOAD_DIR / f"{data_id}.xlsx"
-        if upload_file.exists():
-            try:
-                upload_file.unlink()
-                safe_print(f"[DataService] 上传文件已删除: {upload_file}")
-            except Exception as e:
-                deletion_errors.append(f"{upload_file}: {str(e)}")
-        else:
-            # 旧格式：{data_id}_{filename}.xlsx (兼容旧数据)
-            old_filename = self.index[data_id].get("name", "")
+        # 3. 删除上传的原始文件（任何后缀：xlsx / zip / mif / tab…）
+        #    必须清干净：残留的 uploads/<id>.* 会被启动自愈当成"孤儿数据"重新恢复成
+        #    索引条目，表现为用户删掉的条目下次启动又回来（删不掉的残余记录）。
+        upload_dir = Path(settings.UPLOAD_DIR)
+        try:
+            for upload_file in upload_dir.glob(f"{data_id}.*"):
+                if not upload_file.is_file():
+                    continue
+                try:
+                    upload_file.unlink()
+                    safe_print(f"[DataService] 上传文件已删除: {upload_file}")
+                except Exception as e:
+                    deletion_errors.append(f"{upload_file}: {str(e)}")
+            # 旧格式：{data_id}_{filename} (兼容旧数据)
+            old_filename = (self.index.get(data_id) or {}).get("name", "")
             if old_filename:
-                old_upload_file = settings.UPLOAD_DIR / f"{data_id}_{old_filename}"
+                old_upload_file = upload_dir / f"{data_id}_{old_filename}"
                 if old_upload_file.exists():
                     try:
                         old_upload_file.unlink()
                         safe_print(f"[DataService] 旧格式上传文件已删除: {old_upload_file}")
-                    except:
+                    except Exception:
                         # 旧文件删除失败不记录（可能不存在）
                         pass
+        except Exception as e:
+            deletion_errors.append(f"{upload_dir}/{data_id}.*: {str(e)}")
 
         # 4. 清理 SQLite 中的数据
         db = SessionLocal()

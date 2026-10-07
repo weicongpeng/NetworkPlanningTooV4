@@ -511,6 +511,10 @@ def _collect_manifest(city: str, operator: str) -> List[Dict[str, Any]]:
     from app.services.data_group import index_entry_visible
     from app.services.data_service import data_service
 
+    # 先清残余条目（空目录/导入失败残留）：它们列在网页端删不干净，
+    # 下发到桌面端又会每次打包失败 → 永久「同步异常」
+    data_service.prune_residual_entries()
+
     group = _Group(city, operator)
     entries = {}
     for data_id, entry in data_service.index.items():

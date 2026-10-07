@@ -115,8 +115,11 @@ def test_reconcile_removes_ghosts_and_recovers_orphans(isolated_index, monkeypat
     result = data_service._reconcile_index()
 
     assert result["removed"] == ["空层.tab"]
-    assert set(result["recovered"]) == {"RSRP.tab", f"{orphan_upload}.tab"}
+    # 只有"目录里真有文件"的孤儿才恢复：空目录 + uploads 残留文件不再恢复，
+    # 那种组合恢复出来就是 0 要素空壳，删不干净还会让桌面端同步一直失败
+    assert result["recovered"] == ["RSRP.tab"]
     assert ghost not in data_service.index
+    assert orphan_upload not in data_service.index
     assert data_service.index[orphan_dir]["type"] == "map"
     assert data_service.index[orphan_dir]["subType"] == "mapinfo"
     assert data_service.index[orphan_dir]["city"] == "河源"
