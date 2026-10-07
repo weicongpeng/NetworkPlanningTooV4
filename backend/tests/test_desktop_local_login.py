@@ -361,13 +361,70 @@ def test_auth_poll_completes_login(local_env):
     )
     assert resp.status_code == 200, resp.text
     data = resp.json()["data"]
+    # 必须与 /desktop/login 同形状：前端轮询按 result + access_token 判定登录完成
+    assert data["result"] == "ok"
     assert data["token"] == "poll-token"
+    assert data["access_token"] == "poll-token"
+    assert data["user"]["username"] == "alice"
     assert data["mode"] == "standalone"
 
     db = local_env.session_factory()
     try:
         row = db.query(User).filter(User.username == "alice").first()
         assert row is not None and row.desktop_run_mode == "standalone"
+    finally:
+        db.close()
+
+
+def test_session_check_syncs_permissions_to_mirror(local_env):
+    """心跳把服务器当前权限位同步到本机镜像账号（管理员改权限无需重登）。"""
+    import app.core.database as core_database
+    from app.models.database import User as UserModel
+
+    # 本机镜像读写走 SessionLocal（生产是真实库），测试里指到临时库
+    local_env.monkeypatch.setattr(core_database, "SessionLocal", local_env.session_factory)
+
+    db = local_env.session_factory()
+    try:
+        db.add(
+            UserModel(
+                username="alice",
+                password_hash="x",
+                is_admin=True,
+                is_active=True,
+                can_data_import=True,
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    local_env.cloud.save_state(session_jti="jti-1")
+    local_env.monkeypatch.setattr(
+        local_env.cloud,
+        "session_check",
+        lambda jti: {
+            "valid": True,
+            "user": {
+                "username": "alice",
+                "is_admin": False,
+                "can_data_import": True,
+                "can_assistant": True,
+            },
+        },
+    )
+
+    result = local_env.desktop_local.check_session_once()
+    assert result["valid"] is True
+    assert result["user"]["can_assistant"] is True  # 回传同步后的账号载荷供前端刷新
+
+    db = local_env.session_factory()
+    try:
+        row = db.query(UserModel).filter(UserModel.username == "alice").first()
+        assert row is not None
+        assert row.is_admin is False  # 管理员位被撤销 → 同步
+        assert row.can_data_import is True
+        assert row.can_assistant is True  # 新授予的权限 → 同步
     finally:
         db.close()
 

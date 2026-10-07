@@ -4,6 +4,7 @@ import { AlertCircle, Download, Loader2, RefreshCw, X } from 'lucide-react'
 import type { DesktopUpdateStatus } from '@shared/types'
 import { desktopUpdateApi } from '../services/api'
 import { useAuthStore } from '../store/authStore'
+import { useDesktopUpdateStore } from '../store/desktopUpdateStore'
 
 /**
  * 桌面版 OTA 更新提示（仅桌面壳内生效；网页端接口 404 时静默）。
@@ -22,6 +23,9 @@ export function DesktopUpdateDialog() {
     phase: 'idle',
   })
   const [message, setMessage] = useState<string | null>(null)
+  // 「系统设置 → 检查更新」的交接：拿到结果直接展示（非管理员也可手动触发）
+  const requested = useDesktopUpdateStore((s) => s.requested)
+  const clearRequest = useDesktopUpdateStore((s) => s.clearRequest)
 
   const release = status?.release || null
   const force = Boolean(release?.mandatory) || Boolean(release?.snooze?.force)
@@ -52,6 +56,21 @@ export function DesktopUpdateDialog() {
     const timer = window.setTimeout(check, 8000) // 启动后延迟检查，避免与首屏争资源
     return () => window.clearTimeout(timer)
   }, [check, isAdmin])
+
+  // 系统设置页点「检查更新」→ 打开本弹窗展示新版本
+  useEffect(() => {
+    if (!requested) return
+    setStatus(requested)
+    setProgress({
+      downloaded: requested.download?.downloaded || 0,
+      total: requested.download?.total || 0,
+      phase: requested.download?.phase || 'idle',
+      error: requested.download?.error,
+    })
+    setMessage(null)
+    setVisible(Boolean(requested.update_available && requested.release))
+    clearRequest()
+  }, [requested, clearRequest])
 
   // 下载中每 1 秒轮询进度
   useEffect(() => {
@@ -123,7 +142,7 @@ export function DesktopUpdateDialog() {
     setVisible(false)
   }
 
-  if (!isAdmin) return null
+  // 可见性由「自动检查（管理员）」或「系统设置手动检查」决定，不再限定管理员
   if (!visible || (!release && progress.phase !== 'ready')) return null
 
   const percent =

@@ -57,6 +57,24 @@ async def test_normal_user_with_import_permission_allowed():
 
 
 @pytest.mark.asyncio
+async def test_standalone_desktop_uses_account_permissions(monkeypatch):
+    """单机模式不再权限全开：与网页端一致按管理员设置的权限位判定。"""
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "NPT_DESKTOP", True)
+
+    denied = FakeUser()
+    denied.desktop_run_mode = "standalone"
+    with pytest.raises(HTTPException) as exc:
+        await require_data_import(current_user=denied)
+    assert exc.value.status_code == 403
+
+    allowed = FakeUser(can_data_import=True)
+    allowed.desktop_run_mode = "standalone"
+    assert await require_data_import(current_user=allowed) is allowed
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("attr,checker", [
     ("can_data_delete", require_data_delete),
     ("can_data_update", require_data_update),

@@ -28,7 +28,8 @@ _CODE_ALPHABET = "23456789ABCDEFGHJKMNPQRSTUVWXYZ"
 _CODE_BODY_LENGTH = 16
 CODE_PREFIX = "NPT"
 
-# 运行模式：共享模式（与网页端同账号同权限同组）/ 单机模式（单独授权、权限全开）
+# 运行模式：共享模式（与网页端同账号同权限同组）/ 单机模式（单独授权、数据本机私有）
+# 两种模式的权限位都与网页端一致，由管理员在「用户管理 → 编辑」设置
 MODE_SHARED = "shared"
 MODE_STANDALONE = "standalone"
 DEFAULT_IDLE_LOGOUT_DAYS = 2
@@ -280,7 +281,12 @@ class DesktopLicenseService:
         if lease_days is not None:
             if int(lease_days) <= 0:
                 raise DesktopLicenseError(400, "租约天数必须为正整数")
-            record.lease_days = int(lease_days)
+            new_lease = int(lease_days)
+            # 租约变化 = 重签：到期日按「今天 + 新租约」重算，否则列表里的
+            # 到期日期会一直停留在旧值（客户端也要等下次续期才拿到新期限）
+            if new_lease != int(record.lease_days or 0):
+                record.expire_date = (_now().date() + timedelta(days=new_lease)).isoformat()
+            record.lease_days = new_lease
         if note is not None:
             record.note = note.strip() or None
         group_changed = False

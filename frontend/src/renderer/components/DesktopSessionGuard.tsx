@@ -26,6 +26,11 @@ export function DesktopSessionGuard() {
             .getState()
             .show(res.data.reason || t('desktopAuth.kicked', '该账号已在其它设备登录，本机已退出登录'))
           await useAuthStore.getState().logout()
+          return
+        }
+        // 心跳同时同步权限位：管理员在「用户管理 → 编辑」改动后无需重登即生效
+        if (res.data?.user) {
+          useAuthStore.getState().applyServerUser(res.data.user)
         }
       } catch {
         // 401 时 api 拦截器已处理；其它异常静默，等下个周期

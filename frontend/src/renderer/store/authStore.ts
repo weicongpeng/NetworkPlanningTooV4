@@ -32,6 +32,8 @@ interface AuthState {
   probeDesktopMode: () => Promise<void>
   setDesktopPendingUsername: (username: string | null) => void
   applyDesktopLogin: (data: { access_token?: string; token?: string; user?: any; mode?: string }) => void
+  /** 用本机后端回传的账号信息刷新本地用户（权限位被管理员改动后即时生效） */
+  applyServerUser: (nextUser: UserInfo) => void
 }
 
 /** 清空按用户隔离的内存数据缓存（登录前/登出后调用，防止切换账号读到上一账号的组数据） */
@@ -251,6 +253,20 @@ export const useAuthStore = create<AuthState>()(
           desktopRunMode: (data.mode || 'standalone') as DesktopRunMode,
           desktopPendingUsername: null,
         })
+      },
+
+      applyServerUser: (nextUser) => {
+        // 只在权限相关字段变化时更新，避免周期性心跳触发无意义的重渲染
+        const current = get().user
+        const keys: (keyof UserInfo)[] = [
+          'is_admin', 'is_active',
+          'can_data_import', 'can_data_delete', 'can_data_update',
+          'can_cell_entry', 'can_cell_query_update', 'can_assistant',
+        ]
+        const changed = !current || keys.some(
+          (key) => Boolean(current[key]) !== Boolean(nextUser[key])
+        )
+        if (changed) set({ user: nextUser })
       },
     }),
     {

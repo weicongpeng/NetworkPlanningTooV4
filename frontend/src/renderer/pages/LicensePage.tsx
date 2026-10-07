@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { Check, Palette, Sun, Moon, Key, RefreshCw, X, Globe, Calendar, Infinity, Loader2, LifeBuoy, Monitor, Copy, Upload, Cloud, Send, Settings } from 'lucide-react'
+import { Check, Palette, Sun, Moon, Key, RefreshCw, X, Globe, Calendar, Infinity, Loader2, LifeBuoy, Monitor, Copy, Upload, Cloud, Send, Settings, Info } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import type { MachineInfo, LicenseStatus, DesktopCloudStatus } from '@shared/types'
 import {
@@ -12,7 +12,8 @@ import {
   kebabCase
 } from '../store/themeStore'
 import { useAuthStore } from '../store/authStore'
-import { licenseApi, desktopCloudApi } from '../services/api'
+import { useDesktopUpdateStore } from '../store/desktopUpdateStore'
+import { licenseApi, desktopCloudApi, desktopUpdateApi } from '../services/api'
 import { LLMConfigCard } from '../components/LLMConfigCard'
 
 export function LicensePage() {
@@ -23,6 +24,7 @@ export function LicensePage() {
 
   const { themeMode, colorScheme, setThemeMode, setColorScheme, applyTheme } = useThemeStore()
   const { user, fetchUser } = useAuthStore()
+  const desktopMode = useAuthStore((s) => s.desktopMode)
   const desktopRunMode = useAuthStore((s) => s.desktopRunMode)
   const isStandalone = desktopRunMode === 'standalone'
   const [previewTheme, setPreviewTheme] = useState<ThemeMode | null>(null)
@@ -74,6 +76,31 @@ export function LicensePage() {
   useEffect(() => {
     if (machineInfo?.desktopMode) refreshCloudStatus()
   }, [machineInfo?.desktopMode, refreshCloudStatus])
+
+  // ---- 版本与更新（桌面版）：当前版本 + 手动检查更新 ----
+  const [checkingUpdate, setCheckingUpdate] = useState(false)
+  const [checkMessage, setCheckMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
+  const requestUpdateCheck = useDesktopUpdateStore((s) => s.requestCheck)
+
+  const handleCheckUpdate = async () => {
+    setCheckingUpdate(true)
+    setCheckMessage(null)
+    try {
+      const res = await desktopUpdateApi.status()
+      const data = res?.data
+      if (data?.update_available && data.release) {
+        // 有新版本：交给全局更新弹窗展示与下载，避免维护两套更新 UI
+        requestUpdateCheck(data)
+      } else {
+        setCheckMessage({ type: 'success', text: t('desktopUpdate.upToDate') })
+      }
+    } catch (err: any) {
+      setCheckMessage({ type: 'error', text: err?.message || t('desktopUpdate.checkFailed') })
+    } finally {
+      setCheckingUpdate(false)
+      setTimeout(() => setCheckMessage(null), 6000)
+    }
+  }
 
   const handleCloudActivate = async () => {
     const code = activationCode.trim()
@@ -160,8 +187,9 @@ export function LicensePage() {
   }, [applyWaiting, fetchUser, refreshLicenseState, refreshCloudStatus])
 
   useEffect(() => {
-    if (isAdmin) refreshLicenseState()
-  }, [isAdmin, refreshLicenseState])
+    // 桌面版所有用户都要机器信息（版本卡片/授权展示）；网页端仅管理员需要
+    if (isAdmin || desktopMode) refreshLicenseState()
+  }, [isAdmin, desktopMode, refreshLicenseState])
 
   const handleCopyMachineCode = async () => {
     const code = machineInfo?.machineCode
@@ -294,8 +322,8 @@ export function LicensePage() {
       {/* 大模型配置（网优助手）：仅管理员或被授予网优助手权限的用户可见 */}
       {(isAdmin || user?.can_assistant) && <LLMConfigCard />}
 
-      {/* 桌面端授权：在线激活/续期 + 机器码 + 离线导入（仅共享模式桌面版） */}
-      {machineInfo?.desktopMode && !isStandalone && (
+      {/* 桌面端授权：在线激活/续期 + 机器码 + 离线导入（仅共享模式桌面版的管理员） */}
+      {machineInfo?.desktopMode && isAdmin && !isStandalone && (
         <div className="bg-card p-5 rounded-lg border border-border">
           <div className="flex items-center justify-between mb-4">
             <div className="flex items-center gap-2">
@@ -513,6 +541,46 @@ export function LicensePage() {
               )}
             </div>
           </div>
+        </div>
+      )}
+
+      {/* 版本与更新（仅桌面版）：当前版本 + 检查更新 */}
+      {machineInfo?.desktopMode && (
+        <div className="bg-card p-5 rounded-lg border border-border">
+          <div className="flex items-center gap-2 mb-4">
+            <Info size={20} className="text-primary" />
+            <h2 className="text-base font-semibold">{t('desktopUpdate.versionTitle')}</h2>
+          </div>
+
+          <div className="flex flex-wrap items-end gap-x-8 gap-y-3">
+            <div>
+              <div className="text-xs text-muted-foreground mb-1">{t('desktopUpdate.currentVersion')}</div>
+              <div className="text-sm font-mono">{cloudStatus?.version || t('desktopUpdate.versionUnknown')}</div>
+            </div>
+            <div>
+              <div className="text-xs text-muted-foreground mb-1">{t('desktopUpdate.channelLabel')}</div>
+              <div className="text-sm">{cloudStatus?.channel || '-'}</div>
+            </div>
+            <button
+              onClick={handleCheckUpdate}
+              disabled={checkingUpdate}
+              className="px-4 py-2 border border-border rounded-lg hover:bg-muted disabled:opacity-50 text-sm font-medium flex items-center gap-1.5"
+            >
+              {checkingUpdate ? <Loader2 size={14} className="animate-spin" /> : <RefreshCw size={14} />}
+              {checkingUpdate ? t('desktopUpdate.checking') : t('desktopUpdate.checkButton')}
+            </button>
+          </div>
+
+          {checkMessage && (
+            <div className={`mt-3 p-2 rounded flex items-center gap-2 ${
+              checkMessage.type === 'success'
+                ? 'bg-green-500/10 border border-green-500/20 text-green-500'
+                : 'bg-red-500/10 border border-red-500/20 text-red-500'
+            }`}>
+              {checkMessage.type === 'success' ? <Check size={14} /> : <X size={14} />}
+              <span className="text-xs">{checkMessage.text}</span>
+            </div>
+          )}
         </div>
       )}
 

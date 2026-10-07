@@ -183,6 +183,40 @@ def test_renew_extends_and_tamper_rejected(cloud_env):
     assert resp.status_code == 400
 
 
+def test_update_lease_refreshes_expire_date(cloud_env):
+    """编辑租约后到期日期立即按新租约重算（列表不再停留在旧值）。"""
+    record = _create(cloud_env.client, lease_days=30)
+    activated = _activate(cloud_env.client, record["activation_code"]).json()["data"]
+    old_expire = datetime.strptime(activated["expire_date"], "%Y-%m-%d").date()
+    assert 29 <= (old_expire - date.today()).days <= 31
+
+    resp = cloud_env.client.put(
+        f"/api/v1/desktop-licenses/{record['id']}", json={"lease_days": 90}
+    )
+    assert resp.status_code == 200, resp.text
+    updated = resp.json()["data"]
+    assert updated["lease_days"] == 90
+    new_expire = datetime.strptime(updated["expire_date"], "%Y-%m-%d").date()
+    assert 89 <= (new_expire - date.today()).days <= 91
+
+    # 租约不变（只改备注）不应重签到未来：把库里的到期日改成过去值验证不被覆盖
+    from app.models.database import DesktopLicense
+
+    db = cloud_env.session_factory()
+    try:
+        row = db.query(DesktopLicense).filter(DesktopLicense.id == record["id"]).first()
+        row.expire_date = "2000-01-01"
+        db.commit()
+    finally:
+        db.close()
+    resp = cloud_env.client.put(
+        f"/api/v1/desktop-licenses/{record['id']}",
+        json={"lease_days": 90, "note": "只改备注"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["data"]["expire_date"] == "2000-01-01"
+
+
 def test_disable_blocks_activate_and_renew(cloud_env):
     record = _create(cloud_env.client)
     license_file = _activate(cloud_env.client, record["activation_code"]).json()["data"]["license_file"]

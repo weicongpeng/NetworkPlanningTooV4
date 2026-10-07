@@ -117,6 +117,16 @@ def test_download_sha_mismatch_fails(updater_env):
     assert "校验失败" in (state["error"] or "")
 
 
+def test_check_latest_offline_raises_only_when_asked(updater_env):
+    """手动检查更新要能区分「已是最新」与「连不上服务器」。"""
+    from app.services.desktop_cloud_client import CloudError
+
+    # 假服务器不接受该路径（返回非 JSON）→ 默认静默 None，显式要求时抛错
+    assert updater_env.updater.check_latest() is None
+    with pytest.raises(CloudError):
+        updater_env.updater.check_latest(raise_on_error=True)
+
+
 def test_snooze_forces_after_limit(updater_env):
     updater = updater_env.updater
     assert updater.snooze_state("1.0.0")["count"] == 0

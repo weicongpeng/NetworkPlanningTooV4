@@ -131,13 +131,10 @@ def reject_desktop_mode() -> None:
 def require_permission(perm: str):
     """权限校验依赖工厂：管理员自动通过，普通用户需对应权限位为 True。
 
-    桌面版按登录时选择的运行模式区分：
-    - 单机模式（standalone）：本机独立使用，功能权限全开
-    - 共享模式（shared）：与网页端一致，按账号权限位判定
+    权限位由管理员在「用户管理 → 编辑」设置，**网页端与桌面端（含单机模式）
+    一致生效**；桌面端不再整体放行，账号没给权限就与网页端一样被拒绝。
     """
     async def checker(current_user=Depends(get_current_user)):
-        if settings.NPT_DESKTOP and current_user.desktop_run_mode == "standalone":
-            return current_user
         if current_user.is_admin:
             return current_user
         if not getattr(current_user, perm, False):

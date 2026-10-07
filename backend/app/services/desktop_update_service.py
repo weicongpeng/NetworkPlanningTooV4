@@ -70,14 +70,20 @@ def snooze(version: str) -> Dict[str, Any]:
     return snooze_state(version)
 
 
-def check_latest() -> Optional[Dict[str, Any]]:
-    """查询服务器最新版本；未配置/网络不可用返回 None（不抛错）。"""
+def check_latest(raise_on_error: bool = False) -> Optional[Dict[str, Any]]:
+    """查询服务器最新版本；未配置/网络不可用返回 None（不抛错）。
+
+    raise_on_error=True 时网络失败改为抛 CloudError：手动「检查更新」需要区分
+    「确实已是最新」与「连不上授权服务器」，不能让用户误以为已是最新。
+    """
     current = settings.NPT_DESKTOP_VERSION or ""
     channel = settings.NPT_DESKTOP_CHANNEL or "stable"
     query = urllib.parse.urlencode({"current": current, "channel": channel})
     try:
         resp = cloud._request("GET", f"/desktop-cloud/releases/latest?{query}", timeout=15)
     except CloudError:
+        if raise_on_error:
+            raise
         return None
     data = resp.get("data")
     if not data:

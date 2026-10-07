@@ -28,8 +28,11 @@ export function DesktopAuthPendingDialog() {
         const res: any = await desktopLoginApi.poll(pendingUsername)
         const data = res?.data
         if (cancelled) return
-        if (data?.result === 'ok' && data?.access_token) {
-          applyDesktopLogin(data)
+        // 本机 auth-poll 与 /desktop/login 同形状返回 result=ok + access_token；
+        // 兼容只有 token 字段的旧版本本机后端
+        const token = data?.access_token || data?.token
+        if (data?.result === 'ok' && token && data?.user) {
+          applyDesktopLogin({ ...data, access_token: token })
           return
         }
         if (data?.status === 'rejected' || data?.status === 'disabled') {

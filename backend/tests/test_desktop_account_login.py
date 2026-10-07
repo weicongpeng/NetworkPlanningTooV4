@@ -243,6 +243,46 @@ def test_session_check_rejects_unknown_or_invalid_license(login_env):
     assert resp2.json()["data"]["valid"] is False
 
 
+def test_session_check_returns_current_permissions(login_env):
+    """心跳回传账号当前权限位：管理员在「用户管理 → 编辑」改动后桌面端可即时同步。"""
+    from app.services.auth_service import auth_service
+
+    ok = _login(login_env.client, "alice", "alice-pwd", mode="shared")
+    data = ok.json()["data"]
+
+    def check() -> dict:
+        resp = login_env.client.post(
+            "/api/v1/desktop-cloud/auth/session-check",
+            json={
+                "license_file": data["license_file"],
+                "machine_code": MACHINE_A,
+                "session_jti": data["session_jti"],
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        return resp.json()["data"]
+
+    payload = check()
+    assert payload["valid"] is True
+    assert payload["user"]["username"] == "alice"
+    assert payload["user"]["can_data_import"] is True
+    assert payload["user"]["can_assistant"] is False
+
+    # 管理员改权限（取消数据导入、授予网优助手）→ 下一次心跳即拿到新值
+    db = login_env.session_factory()
+    try:
+        alice = db.query(User).filter(User.username == "alice").first()
+        auth_service.update_user(
+            db, alice.id, {"can_data_import": False, "can_assistant": True}
+        )
+    finally:
+        db.close()
+
+    updated = check()
+    assert updated["user"]["can_data_import"] is False
+    assert updated["user"]["can_assistant"] is True
+
+
 def test_standalone_default_idle_logout_days(login_env):
     """无操作退出登录时长默认 2 天，随许可下发到本机。"""
     first = _login(login_env.client, "alice", "alice-pwd", mode="standalone")

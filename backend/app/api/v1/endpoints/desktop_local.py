@@ -94,6 +94,12 @@ class DesktopRegisterRequest(BaseModel):
 
 MODE_STANDALONE = "standalone"
 
+# 功能权限位：管理员在网页端「用户管理 → 编辑」设置，网页端与桌面端一致生效
+PERMISSION_FIELDS = (
+    "can_data_import", "can_data_delete", "can_data_update",
+    "can_cell_entry", "can_cell_query_update", "can_assistant",
+)
+
 
 class DesktopLoginRequest(BaseModel):
     username: str
@@ -134,14 +140,42 @@ def _mirror_local_user(db: Session, incoming: dict, mode: str, password: Optiona
     row.desktop_run_mode = mode
     row.city = incoming.get("city")
     row.operator = incoming.get("operator")
-    for perm in (
-        "can_data_import", "can_data_delete", "can_data_update",
-        "can_cell_entry", "can_cell_query_update", "can_assistant",
-    ):
+    for perm in PERMISSION_FIELDS:
         setattr(row, perm, bool(incoming.get(perm)))
     db.commit()
     db.refresh(row)
     return row
+
+
+def _sync_permissions_from_remote(incoming: Optional[dict]) -> Optional[dict]:
+    """把服务器上的最新权限位同步到本机镜像账号，返回同步后的账号载荷。
+
+    管理员在网页端「用户管理 → 编辑」改动权限位后，运行中的桌面端在下一次
+    心跳（session-check）就会拿到新权限，无需重新登录，保证两端一致；
+    断网时拿不到新值，沿用本机上次同步的结果。
+    """
+    if not incoming or not incoming.get("username"):
+        return None
+    from app.core.database import SessionLocal
+    from app.models.database import User as UserModel
+
+    db = SessionLocal()
+    try:
+        row = db.query(UserModel).filter(UserModel.username == incoming["username"]).first()
+        if row is None:
+            return None
+        row.is_admin = bool(incoming.get("is_admin"))
+        for perm in PERMISSION_FIELDS:
+            setattr(row, perm, bool(incoming.get(perm)))
+        db.commit()
+        db.refresh(row)
+        return auth_service.user_payload(row)
+    except Exception as exc:  # noqa: BLE001
+        db.rollback()
+        print(f"[DesktopAuth] 同步权限失败（忽略）：{exc}")
+        return None
+    finally:
+        db.close()
 
 
 def _issue_local_token(db: Session, user, idle_logout_days: Optional[int] = None) -> str:
@@ -274,7 +308,12 @@ def check_session_once() -> Dict[str, Any]:
     if result.get("valid") is False:
         _force_local_logout(str(result.get("reason") or ""))
         return {"valid": False, "reason": result.get("reason")}
-    return {"valid": True}
+    # 权限位随心跳同步：管理员改权限后运行中的桌面端无需重登即可生效
+    data: Dict[str, Any] = {"valid": True}
+    user_payload = _sync_permissions_from_remote(result.get("user"))
+    if user_payload is not None:
+        data["user"] = user_payload
+    return data
 
 
 async def session_guard_loop(interval_seconds: int = 60) -> None:
@@ -620,10 +659,16 @@ async def desktop_auth_poll(
 
     set_run_mode(MODE_OFFLINE)
     _remember_sync_user(username)
+    # 与 /desktop/login 返回同形状：前端轮询入口按 result/access_token 判定登录成功，
+    # 缺了这两个字段管理员批准后桌面端会一直停在等待弹窗
+    token = _issue_local_token(db, user, data.get("idle_logout_days"))
     return {
         "success": True,
         "data": {
-            "token": _issue_local_token(db, user, data.get("idle_logout_days")),
+            "result": "ok",
+            "token": token,
+            "access_token": token,
+            "token_type": "bearer",
             "user": auth_service.user_payload(user),
             "mode": MODE_STANDALONE,
             "idle_logout_days": data.get("idle_logout_days") or 2,
@@ -730,7 +775,10 @@ def update_status(
 ) -> Dict[str, Any]:
     from app.services import desktop_update_service as updater
 
-    release = updater.check_latest()
+    try:
+        release = updater.check_latest(raise_on_error=True)
+    except cloud.CloudError as exc:
+        _raise_cloud_error(exc)
     return {
         "success": True,
         "data": {
@@ -746,9 +794,10 @@ def update_status(
 @router.post("/update/download")
 def update_download(
     payload: UpdateRequest,
-    admin_user: User = Depends(get_current_admin_user),
+    current_user: User = Depends(get_current_user),
     _: None = Depends(_require_desktop),
 ) -> Dict[str, Any]:
+    """下载新版本：桌面端是本机单机形态，登录用户即可更新（接口仅桌面形态存在）。"""
     from app.services import desktop_update_service as updater
 
     release = updater.check_latest()
@@ -772,7 +821,7 @@ async def update_progress(
 @router.post("/update/snooze")
 def update_snooze(
     payload: UpdateRequest,
-    admin_user: User = Depends(get_current_admin_user),
+    current_user: User = Depends(get_current_user),
     _: None = Depends(_require_desktop),
 ) -> Dict[str, Any]:
     from app.services import desktop_update_service as updater
@@ -782,7 +831,7 @@ def update_snooze(
 
 @router.post("/update/install")
 def update_install(
-    admin_user: User = Depends(get_current_admin_user),
+    current_user: User = Depends(get_current_user),
     _: None = Depends(_require_desktop),
 ) -> Dict[str, Any]:
     from app.services import desktop_update_service as updater

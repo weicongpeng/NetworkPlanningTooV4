@@ -48,10 +48,11 @@ class User(Base):
     operator = Column(String(50), nullable=True)
     user_type = Column(String(10), default='pc', nullable=False)
     # 桌面版登录时选择的运行模式：shared=共享模式（权限/分组与网页端一致）
-    # / standalone=单机模式（权限全开、数据本机私有）。网页端恒为 NULL。
+    # / standalone=单机模式（数据本机私有；权限同样按下方权限位，与网页端一致）。网页端恒为 NULL。
     desktop_run_mode = Column(String(16), nullable=True)
 
-    # 细粒度权限（PC 端数据管理页面操作权限，默认全部关闭，管理员自动拥有全部权限）
+    # 细粒度权限（数据管理/功能页面操作权限，默认全部关闭，管理员自动拥有全部权限）
+    # 由管理员在「用户管理 → 编辑」设置，网页端与桌面端（含单机模式）一致生效
     can_data_import = Column(Boolean, default=False, nullable=False)
     can_data_delete = Column(Boolean, default=False, nullable=False)
     can_data_update = Column(Boolean, default=False, nullable=False)

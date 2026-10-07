@@ -132,7 +132,7 @@ FastAPI (backend/app/)
 
 - JWT Bearer（python-jose，HS256，默认 1440 分钟过期）+ bcrypt（passlib）。`UserSession` 表支持会话吊销、IP 绑定与空闲超时。
 - 会话空闲超时：`NPT_SESSION_IDLE_TIMEOUT_MINUTES`（默认 180 分钟），由 `get_current_user` 在每次请求校验；连续无请求（含 4 分钟心跳）超过该时长才要求重新登录，期间换网络/IP（含 IPv4/IPv6 切换）不打断，仅新设备登录踢掉旧会话。
-- `core/security.py` 提供依赖：`get_current_user`、`get_current_admin_user`、`require_permission(...)`，以及 `require_data_import/delete/update`、`require_cell_entry`、`require_cell_query_update`、`require_assistant`；管理员绕过权限位。数据条目相关路由另经 `require_data_group_access`（失败 404）。
+- `core/security.py` 提供依赖：`get_current_user`、`get_current_admin_user`、`require_permission(...)`，以及 `require_data_import/delete/update`、`require_cell_entry`、`require_cell_query_update`、`require_assistant`；管理员绕过权限位，网页端与桌面端（含单机模式）按同一套权限位判定。数据条目相关路由另经 `require_data_group_access`（失败 404）。
 - 前端：`authStore` 持久化 `localStorage['auth-storage']`；`services/api.ts` 自动附加 Bearer，401 时清除凭证并派发 `auth:required`；`AuthGuard` 包裹全应用（未登录只显示 `LoginModal`），`ProtectedRoute` 处理 license 到期 / `requireAdmin` / `requirePermission`；`useHeartbeat` 每 4 分钟 ping。
 
 ### 桌面端运行形态（`desktop/`）
@@ -233,7 +233,8 @@ FastAPI (backend/app/)
 - **APP 分发**：管理端分片上传 APK（绕过 Cloudflare 100MB 限制）→ `app_versions` 表 + `backend/app/apks/`；客户端 `GET /api/v1/app-versions/latest` 与 `/download/{id}`（支持 Range、下载计数）。
 - **桌面版登录与授权（2026-10 改版）**：桌面端不再有 owner 免登录账号，与网页端**共用同一套账号**。登录页在桌面形态下多一组「运行模式」选择：
   - **共享模式**：`POST /desktop/login`（本机）→ 代理 `POST /desktop-cloud/auth/login`（服务器）→ `desktop_license_service.login()` 用 `auth_service.authenticate_user` 校验网页端账号 → 为该「账号+机器」自动签发许可（`DesktopLicense.mode='shared'`，作为同步凭证）→ 本机 `_mirror_local_user` 镜像同名本地账号（组/权限位/管理员位照搬）→ 签发本机 JWT。权限与数据组语义与网页端完全一致。
-  - **单机模式**：同上流程，但服务器按 `(username, machine_code)` 找/建 `mode='standalone'` 授权记录；未批准返回 `result=pending`，前端 `DesktopAuthPendingDialog` 轮询 `POST /desktop/auth-poll`，管理员在网页端「桌面授权」页批准后当场签发许可并建立登录态。单机模式 `require_permission` 一律放行（权限全开）、强制 `run_mode=offline`、隐藏「桌面离线授权/运行模式与数据同步/数据组」三张卡片。
+  - **单机模式**：同上流程，但服务器按 `(username, machine_code)` 找/建 `mode='standalone'` 授权记录；未批准返回 `result=pending`，前端 `DesktopAuthPendingDialog` 轮询 `POST /desktop/auth-poll`，管理员在网页端「桌面授权」页批准后当场签发许可并建立登录态。单机模式强制 `run_mode=offline`、隐藏「桌面离线授权/运行模式与数据同步/数据组」三张卡片；**权限位与网页端一致**（不再全量放行），由管理员在「用户管理 → 编辑」设置。
+  - **权限位一致（桌面端/网页端）**：`require_permission` 对两种运行模式都只认账号权限位（管理员绕过）；登录时 `_mirror_local_user` 照搬权限位，运行中由 `session-check` 心跳回传服务器当前权限位（`desktop_cloud` → 本机 `_sync_permissions_from_remote`），前端 `DesktopSessionGuard` 刷新用户展示，管理员改权限后无需重登即生效。
   - 记账：每次联机登录累加 `DesktopLicense.login_count`；断网登录本机记 `pending_offline_logins`，下次联机补报。`idle_logout_days`（默认 2 天）写在授权上并随许可下发，覆盖本机会话空闲超时（`core/security._desktop_idle_timeout_minutes`）。
   - 本机 users 表新增 `desktop_run_mode` 列区分当前模式；`DesktopLicense` 新增 `mode/username/user_id/login_count/last_login_at/idle_logout_days`。
 - **许可签发与续期**：Ed25519 许可（私钥仅服务器：`NPT_LICENSE_PRIVATE_KEY` 或 `licenses/license_private_key.pem`，见 `services/desktop_signing.py`），租约默认 30 天、启动后台静默续期（剩余<20 天或距上次≥7 天）。OTA：管理端上传安装包到 `desktop_releases`，客户端比对版本 → 断点续传下载 + sha256 校验 → 在 `%APPDATA%\NetworkPlanningTool\updates\`（`DATA_ROOT/updates`）写升级脚本 `npt_update_*.cmd` → `CREATE_NO_WINDOW` 隐藏拉起（不弹终端窗口；脚本用 `ping` 计时，无控制台时 `timeout` 会报错），脚本等应用退出（`EXIT_WAIT_SECONDS=60` 超时 `taskkill` 兜底）→ `/VERYSILENT` 安装并记 `npt_setup.log` → 重启应用；应用侧由 `app/desktop_bridge.py` 的退出回调关窗，`desktop/launcher.py` 先武装 `EXIT_GRACE_SECONDS=20` 强制退出看门狗、`destroy` 抛异常则立即 `os._exit`，保证进程一定退出。「稍后」3 次或 `mandatory` 转强制。离线 `.nptlic` 导入通道保留。桌面版必须用 `NPT_CONSOLE=0` 构建（CI tag 发行会用 0 重新打包），否则程序自带控制台窗口。

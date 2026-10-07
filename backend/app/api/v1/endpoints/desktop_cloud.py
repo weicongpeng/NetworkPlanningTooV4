@@ -209,8 +209,11 @@ async def desktop_session_check(
 
     这也是桌面端的心跳（默认每 60s 一次）：必须刷新 last_activity，否则用户
     空闲超过 5 分钟后会被「用户管理」的在线判定（5 分钟活跃窗口）误报为离线。
+
+    valid=True 时一并返回账号当前信息（含权限位）：管理员在「用户管理 → 编辑」
+    改了权限后，客户端心跳时即可同步到本机，保持桌面端与网页端权限一致。
     """
-    from app.models.database import UserSession
+    from app.models.database import User, UserSession
 
     _rate_limit(f"session:{_client_ip(request)}", limit=120, window=300)
     try:
@@ -237,7 +240,13 @@ async def desktop_session_check(
     session.last_activity = datetime.now(timezone.utc)
     db.commit()
 
-    return {"success": True, "data": {"valid": True}}
+    data: Dict[str, Any] = {"valid": True}
+    user = db.query(User).filter(User.id == session.user_id).first()
+    if user is not None:
+        from app.services.auth_service import auth_service
+
+        data["user"] = auth_service.user_payload(user)
+    return {"success": True, "data": data}
 
 
 @router.post("/auth/register")

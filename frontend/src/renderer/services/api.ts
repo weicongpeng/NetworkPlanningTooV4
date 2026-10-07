@@ -552,7 +552,7 @@ export const desktopCloudApi = {
   },
 
   // 登录态校验：同一账号在别处登录时返回 valid=false
-  getSessionStatus: async (): Promise<ApiResponse<{ valid: boolean; reason?: string; offline?: boolean }>> => {
+  getSessionStatus: async (): Promise<ApiResponse<{ valid: boolean; reason?: string; offline?: boolean; user?: UserInfo }>> => {
     return apiClient.get('/desktop/session-status') as any
   },
 

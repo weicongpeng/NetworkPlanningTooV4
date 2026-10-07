@@ -39,7 +39,6 @@ export function DesktopLicensesPage() {
   const [createIdleLogout, setCreateIdleLogout] = useState(2)
   const [createUsername, setCreateUsername] = useState('')
 
-  const [newCode, setNewCode] = useState<{ name: string; code: string } | null>(null)
   const [editing, setEditing] = useState<DesktopLicenseRecord | null>(null)
   const [editName, setEditName] = useState('')
   const [editOrg, setEditOrg] = useState('')
@@ -104,7 +103,6 @@ export function DesktopLicensesPage() {
       })
       if (res?.success) {
         setShowCreate(false)
-        setNewCode({ name: res.data.licensee_username, code: res.data.activation_code })
         setCreateName('')
         setCreateOrg('')
         setCreateNote('')
@@ -126,9 +124,11 @@ export function DesktopLicensesPage() {
       return
     }
     try {
-      const res: any = await desktopLicensesApi.action(item.id, action)
-      if (action === 'approve' || action === 'regenerate-code') {
-        setNewCode({ name: item.licensee_username, code: res?.data?.activation_code || '' })
+      await desktopLicensesApi.action(item.id, action)
+      if (action === 'approve') {
+        notify('success', t('desktopLicenses.approveSuccess'))
+      } else if (action === 'regenerate-code') {
+        notify('success', t('desktopLicenses.regenerateSuccess'))
       } else if (action === 'unbind') {
         notify('success', t('desktopLicenses.unbindSuccess'))
       } else if (action === 'disable') {
@@ -275,29 +275,6 @@ export function DesktopLicensesPage() {
         }`}>
           {message.type === 'success' ? <Check size={14} /> : <X size={14} />}
           <span className="text-xs">{message.text}</span>
-        </div>
-      )}
-
-      {/* 新激活码提示 */}
-      {newCode && (
-        <div className="p-3 rounded-lg border border-primary/30 bg-primary/5 space-y-1">
-          <p className="text-xs text-muted-foreground">
-            {t('desktopLicenses.codeFor', { name: newCode.name })}
-          </p>
-          <div className="flex items-center gap-2">
-            <code className="text-sm font-mono tracking-wider">{newCode.code}</code>
-            <button
-              onClick={() => copyCode(newCode.code)}
-              className="p-1.5 hover:bg-muted rounded"
-              title={t('license.copy')}
-            >
-              <Copy size={14} />
-            </button>
-            <button onClick={() => setNewCode(null)} className="p-1.5 hover:bg-muted rounded">
-              <X size={14} />
-            </button>
-          </div>
-          <p className="text-xs text-muted-foreground">{t('desktopLicenses.codeHint')}</p>
         </div>
       )}
 
