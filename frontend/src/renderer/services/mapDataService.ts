@@ -680,6 +680,16 @@ export async function getCellList(): Promise<CellListResponse> {
     }
     const t2 = performance.now()
 
+    // 空结果不入缓存：桌面端是「先启动应用 → 登录后后台同步 → 用户打开规划页」，
+    // 很容易在同步落地前就把空列表取到；一旦写进缓存（内存 + IndexedDB 24h），
+    // 同步完成后小区选择仍是空的（网页端没有这个时间窗，所以只有桌面端复现）。
+    if (dedupLte.length === 0 && dedupNr.length === 0) {
+      _cellListCacheByUser.delete(userCacheSuffix())
+      await clearCellListCache()
+      console.log('[CellList] 服务端暂无小区，不写入缓存')
+      return { lte: [], nr: [] }
+    }
+
     const data: CellListResponse = {
       lte: dedupLte,
       nr: dedupNr,

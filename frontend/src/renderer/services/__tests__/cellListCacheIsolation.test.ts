@@ -85,3 +85,40 @@ describe('getCellList 按登录用户隔离', () => {
     expect(getCellsMock).toHaveBeenCalledTimes(1)
   })
 })
+
+/**
+ * 回归：桌面端「小区选择」列表空白。
+ * 桌面端是"先启动应用 → 登录后后台同步 → 用户打开规划页"，很容易在同步落地前
+ * 就把空列表取到；空结果一旦写进缓存（内存 + IndexedDB，24h），同步完成后仍是空的。
+ */
+describe('getCellList 空结果不入缓存', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    localStorage.clear()
+    clearAllInMemoryMapCaches()
+  })
+
+  it('服务端返回空列表时不写缓存，下次仍会重新请求', async () => {
+    setLoginUserId(1)
+    getCellsMock.mockResolvedValue({ success: true, data: { lte: [], nr: [] } })
+
+    const first = await getCellList()
+    expect(first.lte).toHaveLength(0)
+    expect(first.nr).toHaveLength(0)
+
+    const second = await getCellList()
+    expect(second.lte).toHaveLength(0)
+    // 第二次仍打后端 = 没有被"空结果"缓存住
+    expect(getCellsMock).toHaveBeenCalledTimes(2)
+  })
+
+  it('空结果之后服务端有数据时能正常取到（同步落地场景）', async () => {
+    setLoginUserId(1)
+    getCellsMock.mockResolvedValueOnce({ success: true, data: { lte: [], nr: [] } })
+    await getCellList()
+
+    getCellsMock.mockResolvedValueOnce({ success: true, data: groupAData })
+    const afterSync = await getCellList()
+    expect(afterSync.lte).toHaveLength(1)
+  })
+})

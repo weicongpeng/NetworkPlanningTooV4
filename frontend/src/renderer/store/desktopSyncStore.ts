@@ -1,6 +1,7 @@
 import { create } from 'zustand'
 import { desktopCloudApi } from '../services/api'
 import type { DesktopSyncStatus } from '../services/api'
+import { triggerDataRefresh } from './dataStore'
 import { useToastStore } from './toastStore'
 
 /** 桌面端数据同步完成：页面据此刷新数据（事件名，供各业务页监听） */
@@ -46,6 +47,9 @@ export const useDesktopSyncStore = create<DesktopSyncState>((set, get) => ({
             (t.pulled || 0) + (t.pushed || 0) + (t.deleted || 0) + (t.updated || 0)
           if (moved > 0) {
             useToastStore.getState().show(`数据已同步（${moved} 项）`)
+            // 同组数据落地 = 工参变了：走统一刷新（内部清小区列表缓存并广播 DATA_REFRESH_EVENT），
+            // 否则规划/核查页的「小区选择」仍停留在同步前取到的（可能是空）列表
+            triggerDataRefresh('full')
             window.dispatchEvent(new CustomEvent(DESKTOP_SYNCED_EVENT, { detail: r }))
           }
         }
