@@ -45,14 +45,28 @@ def load_state() -> Dict[str, Any]:
         return {}
 
 
-def save_state(**kwargs: Any) -> Dict[str, Any]:
-    state = load_state()
-    state.update({k: v for k, v in kwargs.items() if v is not None})
+def _write_state(state: Dict[str, Any]) -> None:
     try:
         settings.LICENSE_DIR.mkdir(parents=True, exist_ok=True)
         state_file().write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
     except OSError:
         pass
+
+
+def save_state(**kwargs: Any) -> Dict[str, Any]:
+    """合并写入状态；值为 None 表示"不更新"（要清除键请用 :func:`clear_state`）。"""
+    state = load_state()
+    state.update({k: v for k, v in kwargs.items() if v is not None})
+    _write_state(state)
+    return state
+
+
+def clear_state(*keys: str) -> Dict[str, Any]:
+    """删除指定的状态键（如联网校验标记/授权错误提示）。"""
+    state = load_state()
+    for key in keys:
+        state.pop(key, None)
+    _write_state(state)
     return state
 
 
@@ -334,10 +348,12 @@ def login(
     mode: str = "standalone",
     offline_logins: Optional[int] = None,
     hostname: Optional[str] = None,
+    timeout: int = 20,
 ) -> Dict[str, Any]:
     """桌面端账号登录：凭证是网页端用户名/密码，成功即落盘许可。
 
     返回 {"result": "ok"|"pending"|..., ...}；result != ok 时不写许可文件。
+    timeout 供单机模式"快速探测"使用：连不上就尽快回落离线登录，不让用户干等。
     """
     from app.utils.machine_code import get_machine_code
 
@@ -351,7 +367,7 @@ def login(
     }
     if offline_logins:
         payload["offline_logins"] = int(offline_logins)
-    resp = _request("POST", "/desktop-cloud/auth/login", payload)
+    resp = _request("POST", "/desktop-cloud/auth/login", payload, timeout=timeout)
     data = resp.get("data") or {}
     if data.get("result") == "ok":
         from app.services.license_service import license_service
@@ -519,9 +535,15 @@ def renew_local_license() -> Dict[str, Any]:
 
 
 def should_renew(info: Optional[Dict[str, Any]], state: Dict[str, Any]) -> bool:
-    """续期策略：剩余 <20 天，或距上次续期 ≥7 天。"""
-    if not info or not info.get("valid") or info.get("issued_via") != "online":
+    """续期策略：剩余 <20 天，或距上次续期 ≥7 天；已过期的在线许可仍尝试续期。
+
+    过期后服务器按租约重签一份有效许可，客户端无需重登即可恢复
+    （离线导入的 .nptlic 没有在线记录，无法也不应续期）。
+    """
+    if not info or info.get("issued_via") != "online":
         return False
+    if not info.get("valid"):
+        return True
     remaining = info.get("remaining_days")
     if remaining is not None and remaining < 20:
         return True

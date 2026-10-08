@@ -197,27 +197,48 @@ def _issue_local_token(db: Session, user, idle_logout_days: Optional[int] = None
     return token
 
 
-def _standalone_offline_allowed(username: str) -> bool:
-    """单机模式断网登录的前提：本机已有该账号且本机许可仍有效、模式与账号一致。"""
-    info = license_service.desktop_license_info() or {}
-    if not info.get("valid"):
-        return False
-    if (info.get("mode") or MODE_STANDALONE) != MODE_STANDALONE:
-        return False
-    return (info.get("username") or "").strip() == username
+def _standalone_local_login(db: Session, username: str, password: str):
+    """单机模式本地直登校验（不发任何网络请求）。
 
-
-def _offline_login(db: Session, username: str, password: str):
+    返回 (user, reason)：user 非空表示本地凭据有效、可立即离线登录并正常使用；
+    reason 供调用方在不能离线登录时给出可操作的提示（许可过期/换机/账号不匹配等），
+    而不是笼统的"无法连接服务器"。
+    """
     from app.models.database import User as UserModel
+
+    info = license_service.desktop_license_info()
+    if not info:
+        return None, "no_license"
+    if not info.get("valid"):
+        # 过期 / 机器码不匹配 / 系统时间回拨：直接把许可文件自身的原因透出
+        return None, info.get("errorMessage") or "本机授权无效"
+    if (info.get("mode") or MODE_STANDALONE) != MODE_STANDALONE:
+        return None, "本机授权是共享模式，切换单机模式需要联网登录"
+    if (info.get("username") or "").strip() != username:
+        licensed = (info.get("username") or "").strip() or "其它账号"
+        return None, f"本机授权归属于 {licensed}，请改用该账号登录"
 
     row = db.query(UserModel).filter(UserModel.username == username).first()
     if row is None or not row.is_active:
-        return None
+        return None, "no_local_user"
     if not auth_service.verify_password(password, row.password_hash):
-        return None
+        return None, "bad_password"
     row.desktop_run_mode = MODE_STANDALONE
     db.commit()
-    return row
+    return row, ""
+
+
+def _offline_unavailable_detail(reason: str, network_message: str) -> tuple:
+    """服务器不可达且不能离线登录时，按本地校验结果给出可操作的提示。"""
+    if reason == "bad_password":
+        return 401, "用户名或密码错误"
+    if reason == "no_local_user":
+        return 502, f"{network_message}；本机没有该账号的离线凭据，请先联网登录一次"
+    if reason == "no_license":
+        return 502, f"{network_message}；本机尚未激活单机授权，首次使用需要联网登录一次"
+    if reason:
+        return 403, f"{reason}；请连接网络后重试（联网会自动续期）"
+    return 502, network_message
 
 
 def _ensure_local_group(db: Session, user, license_payload: dict) -> None:
@@ -250,12 +271,20 @@ def _note_offline_login() -> None:
     cloud.save_state(pending_offline_logins=count)
 
 
-async def _login_via_server(username: str, password: str, mode: str) -> Dict[str, Any]:
-    """代理到授权服务器登录，顺便把断网期间的登录次数补报上去。"""
+async def _login_via_server(
+    username: str, password: str, mode: str, timeout: int = 20
+) -> Dict[str, Any]:
+    """代理到授权服务器登录，顺便把断网期间的登录次数补报上去。
+
+    timeout 用于单机模式的"快速探测"：本地凭据有效时只给很短的时间，
+    连不上就立即回落离线登录，不让用户干等 20 秒。
+    """
     from starlette.concurrency import run_in_threadpool
 
     pending = int(cloud.load_state().get("pending_offline_logins") or 0)
-    data = await run_in_threadpool(cloud.login, username, password, mode, pending or None)
+    data = await run_in_threadpool(
+        cloud.login, username, password, mode, pending or None, timeout=timeout
+    )
     if pending:
         cloud.save_state(pending_offline_logins=0)
     return data
@@ -295,27 +324,135 @@ def _force_local_logout(reason: str) -> None:
     print(f"[DesktopAuth] {reason or '该账号已在其它设备登录'}，本机已退出登录")
 
 
+# 单机模式本地凭据有效时，服务器登录只给这么长的探测时间（超时即离线登录）
+STANDALONE_ONLINE_PROBE_SECONDS = 4
+
+
+def _finish_offline_login(db: Session, user) -> Dict[str, Any]:
+    """单机模式离线登录：本地许可 + 本机账号密码校验通过即签发令牌，不等网络。
+
+    登录次数先本机记账、联网后补报；同时留下 needs_license_verify 标记，
+    由后台巡检在能连上服务器时用许可续期通道校验一次授权并续期。
+    """
+    from app.services.desktop_sync_service import MODE_OFFLINE, set_run_mode
+
+    info = license_service.desktop_license_info() or {}
+    set_run_mode(MODE_OFFLINE)  # 单机模式数据本机私有，不参与服务器数据同步
+    _ensure_local_group(db, user, info)
+    _remember_sync_user(user.username)
+    _note_offline_login()  # 登录次数先本机记账，下次联机补报
+    # 旧会话标识不再代表本次登录：清掉，避免联网后拿旧 jti 校验把用户误判为"已登出"
+    cloud.clear_state("session_jti", "kicked", "kicked_reason")
+    cloud.save_state(
+        needs_license_verify=True,  # 联网后自动校验授权
+        desktop_username=user.username,
+        desktop_mode=MODE_STANDALONE,
+    )
+    token = _issue_local_token(db, user, info.get("idle_logout_days"))
+    return {
+        "success": True,
+        "data": {
+            "token": token,
+            "access_token": token,
+            "token_type": "bearer",
+            "user": auth_service.user_payload(user),
+            "mode": MODE_STANDALONE,
+            "offline": True,
+            "verify_pending": True,
+            "sync_started": False,
+            "idle_logout_days": info.get("idle_logout_days") or 2,
+            "license": info,
+        },
+    }
+
+
+def verify_pending_license_once() -> Optional[str]:
+    """联网时用许可续期通道补一次授权校验（离线登录后调用，不依赖密码/会话）。
+
+    成功返回新到期日（顺带把过期授权续期、把到期日镜像回本机用户）；
+    授权被禁用/解绑/机器不匹配等由服务器拒绝时写 license_error 供前端提示；
+    网络不可达保留标记下轮再试，离线导入的许可无需也无法在线校验。
+    """
+    if not cloud.load_state().get("needs_license_verify"):
+        return None
+    info = license_service.desktop_license_info() or {}
+    if info.get("issued_via") != "online" or not info.get("license_id"):
+        cloud.clear_state("needs_license_verify")  # 离线导入许可：无在线记录，无需校验
+        return None
+    try:
+        data = cloud.renew_local_license()
+    except cloud.CloudError as exc:
+        if exc.status_code >= 400:
+            # 服务器明确拒绝（禁用/解绑/机器不匹配/许可被改）：提示用户并停止重试
+            cloud.save_state(license_error=_gbk_safe(exc.message))
+            cloud.clear_state("needs_license_verify")
+        return None  # 网络不可达：保留标记，下轮巡检再试
+    cloud.clear_state("needs_license_verify", "license_error")
+    print(f"[DesktopAuth] 联网后授权校验通过，已续期至 {data.get('expire_date')}")
+    return str(data.get("expire_date") or "")
+
+
+def _local_user_payload_from_state() -> Optional[dict]:
+    """取本机当前登录镜像账号的最新载荷（续期后到期日即时回传前端授权门禁）。"""
+    username = (cloud.load_state().get("desktop_username") or "").strip()
+    if not username:
+        return None
+    from app.core.database import SessionLocal
+    from app.models.database import User as UserModel
+
+    db = SessionLocal()
+    try:
+        row = db.query(UserModel).filter(UserModel.username == username).first()
+        return auth_service.user_payload(row) if row is not None else None
+    except Exception:  # noqa: BLE001
+        return None
+    finally:
+        db.close()
+
+
 def check_session_once() -> Dict[str, Any]:
-    """向服务器确认本机登录是否仍是该账号的最后一次登录。"""
+    """周期性巡检：本机登录是否仍有效 + 单机模式联网后的授权校验。
+
+    登录态：只有服务器**明确回复** valid=False（账号已在别处登录）才登出；
+    网络不可达/超时/5xx 一律按"无法确定"处理，断网时继续可用。
+    授权：离线登录留下的待校验标记在能连上服务器时自动校验一次。
+    """
     state = cloud.load_state()
     jti = (state.get("session_jti") or "").strip()
-    if not jti:
-        return {"valid": True, "skipped": True}
-    try:
-        result = cloud.session_check(jti)
-    except Exception as exc:  # noqa: BLE001
-        return {"valid": True, "offline": True, "error": str(exc)}
-    if result.get("valid") is False:
-        _force_local_logout(str(result.get("reason") or ""))
-        return {"valid": False, "reason": result.get("reason")}
-    # 权限位随心跳同步：管理员改权限后运行中的桌面端无需重登即可生效
     data: Dict[str, Any] = {"valid": True}
-    if result.get("offline"):
-        # 服务器不可达/异常：按"无法确定"处理（断网继续用，不踢下线）
-        data["offline"] = True
-    user_payload = _sync_permissions_from_remote(result.get("user"))
-    if user_payload is not None:
-        data["user"] = user_payload
+    if jti:
+        try:
+            result = cloud.session_check(jti)
+        except Exception as exc:  # noqa: BLE001
+            result = {"valid": True, "offline": True, "reason": str(exc)}
+        if result.get("valid") is False:
+            reason = str(result.get("reason") or "")
+            _force_local_logout(reason)
+            return {"valid": False, "reason": reason}
+        if result.get("offline"):
+            # 服务器不可达/异常：按"无法确定"处理（断网继续用，不踢下线）
+            data["offline"] = True
+        else:
+            # 心跳能到达服务器：前端据此确认已联网（清除离线提示）
+            data["offline"] = False
+        # 权限位随心跳同步：管理员改权限后运行中的桌面端无需重登即可生效
+        user_payload = _sync_permissions_from_remote(result.get("user"))
+        if user_payload is not None:
+            data["user"] = user_payload
+    else:
+        data["skipped"] = True
+
+    expire_date = verify_pending_license_once()
+    if expire_date:
+        data["license_verified"] = True
+        data["license_expire_date"] = expire_date
+        # 续期已把新到期日镜像到本机用户：随响应回传，授权门禁即时解除"过期"状态
+        refreshed = _local_user_payload_from_state()
+        if refreshed is not None:
+            data["user"] = refreshed
+    license_error = cloud.load_state().get("license_error")
+    if license_error:
+        data["license_error"] = license_error
     return data
 
 
@@ -560,8 +697,9 @@ async def desktop_login(
 ) -> Dict[str, Any]:
     """桌面端登录：共享模式与网页端同账号同权限；单机模式需管理员单独授权。
 
-    单机模式在服务器不可达时回退为离线登录（本机许可有效即可），断网期间
-    的登录次数本机记账，下次联机自动补报。
+    单机模式「本地优先」：本机授权 + 本机镜像账号密码校验通过就立即登录（无需网络、
+    不等待授权服务器），联网后的授权校验/权限刷新由后台任务补齐；本地凭据不可用时
+    才请求服务器（首次登录、等待批准、联网续期等）。
     """
     username = (payload.username or "").strip()
     password = payload.password or ""
@@ -569,40 +707,36 @@ async def desktop_login(
     if not username or not password:
         raise HTTPException(status_code=400, detail="请输入用户名与密码")
 
-    offline_used = False
+    local_user = None
+    local_reason = ""
+    if mode == MODE_STANDALONE:
+        local_user, local_reason = _standalone_local_login(db, username, password)
+
     try:
-        data = await _login_via_server(username, password, mode)
+        # 单机模式本地凭据有效：服务器只做短时探测，连不上就立即离线登录；
+        # 本地凭据不可用（首次登录/等待批准等）时按完整超时请求服务器。
+        probe = STANDALONE_ONLINE_PROBE_SECONDS if local_user is not None else 20
+        data = await _login_via_server(username, password, mode, probe)
     except cloud.CloudError as exc:
-        # 仅网络不可达才回退离线登录；鉴权/授权类错误照常抛出
+        # 本地凭据有效且只是网络不可达/服务器故障 → 离线登录，拿到本机授权继续用
+        if (
+            local_user is not None
+            and mode == MODE_STANDALONE
+            and (exc.status_code == 0 or exc.status_code >= 500)
+        ):
+            print(
+                f"[DesktopAuth] 授权服务器暂不可用（{exc.status_code or '网络'}），"
+                "改用本机授权离线登录"
+            )
+            return _finish_offline_login(db, local_user)
+        # 仅网络不可达才回落离线；鉴权/授权类错误照常抛出
         if exc.status_code != 0 or mode != MODE_STANDALONE:
             raise HTTPException(
                 status_code=exc.status_code or 502, detail=_gbk_safe(exc.message)
             )
-        if not _standalone_offline_allowed(username):
-            raise HTTPException(
-                status_code=exc.status_code or 502, detail=_gbk_safe(exc.message)
-            )
-        user = _offline_login(db, username, password)
-        if user is None:
-            # 本机从未联机登录过该账号 → 没有可比对的凭据，报网络原因更有指导性
-            from app.models.database import User as UserModel
-
-            known = db.query(UserModel).filter(UserModel.username == username).first()
-            if known is None:
-                raise HTTPException(
-                    status_code=exc.status_code or 502, detail=_gbk_safe(exc.message)
-                )
-            raise HTTPException(status_code=401, detail="用户名或密码错误")
-        offline_used = True
-        info = license_service.desktop_license_info() or {}
-        data = {
-            "result": "ok",
-            "mode": MODE_STANDALONE,
-            "user": auth_service.user_payload(user),
-            "license": info,
-            "idle_logout_days": info.get("idle_logout_days") or 2,
-            "offline": True,
-        }
+        # 网络不可达且本地不能离线登录：按本地校验的具体原因提示（过期/换机/账号不符…）
+        status_code, detail = _offline_unavailable_detail(local_reason, exc.message)
+        raise HTTPException(status_code=status_code, detail=_gbk_safe(detail))
 
     if data.get("result") == "pending":
         return {"success": True, "data": data}
@@ -624,9 +758,6 @@ async def desktop_login(
         # 共享模式：登录即开始同步同组数据
         _start_shared_sync()
 
-    if offline_used:
-        _note_offline_login()
-
     token = _issue_local_token(db, user, data.get("idle_logout_days"))
     return {
         "success": True,
@@ -636,7 +767,7 @@ async def desktop_login(
             "token_type": "bearer",
             "user": auth_service.user_payload(user),
             "mode": mode,
-            "offline": offline_used,
+            "offline": False,
             "sync_started": mode != MODE_STANDALONE,
             "idle_logout_days": data.get("idle_logout_days") or 2,
             "license": info,

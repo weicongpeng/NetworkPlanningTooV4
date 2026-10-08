@@ -1814,12 +1814,15 @@
     "modeShared": "Shared mode",
     "modeStandalone": "Standalone mode",
     "modeSharedHint": "Same account, permissions and data group as the web app; data can be shared.",
-    "modeStandaloneHint": "Data stays local; requires admin approval. All features unlocked.",
+    "modeStandaloneHint": "Data stays on this machine and is usable offline; requires admin approval. Permissions match the web app.",
     "pendingHint": "Standalone authorization requested. Waiting for an admin to confirm it on the Desktop Licenses page.",
     "waiting": "Waiting for admin confirmation…",
     "rejected": "The request was not approved. Please contact an administrator.",
     "cancel": "Cancel",
-    "kicked": "This account signed in elsewhere; you have been signed out"
+    "kicked": "This account signed in elsewhere; you have been signed out",
+    "offlineLogin": "Server unreachable: signed in with the local license; authorization will be verified automatically once online",
+    "licenseVerified": "Connected to the server; authorization verified (valid until {{date}})",
+    "licenseError": "Authorization check failed: {{message}}"
   },
   "desktopSync": {
     "syncing": "Syncing data…",

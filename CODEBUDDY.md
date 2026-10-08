@@ -58,7 +58,9 @@ npx vitest run -t "GSCN"                                                  # 按�
 ```bash
 # 仅在 Windows 上构建；CI 见 .github/workflows/build-windows-desktop.yml
 pip install -r backend/requirements.txt -r desktop/requirements-desktop.txt
-python desktop/tools/make_icon.py                       # 生成 desktop/app.ico（构建期产物，不入库）
+python desktop/tools/make_icon.py                       # 生成 desktop/app.ico（构建期产物，不入库；
+                                                        # 安装器把它拷成 app-<版本>.ico 作快捷方式图标
+                                                        # 并 SHChangeNotify 刷新缓存，改图标必须重跑本步）
 python desktop/tools/spike.py                           # GDAL / pywebview / TAB 读写 / 上传链路基线自检
 pyinstaller --noconfirm --clean desktop/desktop.spec    # → dist/NetworkPlanningTool/{NPT.exe,_internal/}
 NPT.exe --selftest                                      # 打包产物冒烟
@@ -234,6 +236,7 @@ FastAPI (backend/app/)
 - **桌面版登录与授权（2026-10 改版）**：桌面端不再有 owner 免登录账号，与网页端**共用同一套账号**。登录页在桌面形态下多一组「运行模式」选择：
   - **共享模式**：`POST /desktop/login`（本机）→ 代理 `POST /desktop-cloud/auth/login`（服务器）→ `desktop_license_service.login()` 用 `auth_service.authenticate_user` 校验网页端账号 → 为该「账号+机器」自动签发许可（`DesktopLicense.mode='shared'`，作为同步凭证）→ 本机 `_mirror_local_user` 镜像同名本地账号（组/权限位/管理员位照搬）→ 签发本机 JWT。权限与数据组语义与网页端完全一致。**登录优先**：首次同步不在登录路径上跑，登录响应返回后 `LOGIN_SYNC_DELAY_SECONDS`（5s）由后台定时器触发一次 `sync_once`（否则同步与登录/首屏抢资源会让登录明显变慢）。
   - **单机模式**：同上流程，但服务器按 `(username, machine_code)` 找/建 `mode='standalone'` 授权记录；未批准返回 `result=pending`，前端 `DesktopAuthPendingDialog` 轮询 `POST /desktop/auth-poll`，管理员在网页端「桌面授权」页批准后当场签发许可并建立登录态。单机模式强制 `run_mode=offline`、隐藏「桌面离线授权/运行模式与数据同步/数据组」三张卡片；**权限位与网页端一致**（不再全量放行），由管理员在「用户管理 → 编辑」设置。
+  - **单机模式离线可用**：本机已有该账号镜像且本机许可有效时，服务器登录只给短探测（`STANDALONE_ONLINE_PROBE_SECONDS`＝4s），网络不可达/5xx 立即离线登录（本地校验密码，响应 `offline=true`，连通时仍走完整联机流程）；许可过期/换机/账号不匹配按本地原因给出明确提示而不是"无法连接服务器"。离线登录置 `needs_license_verify` 标记，联网后由巡检（`verify_pending_license_once`）经许可续期通道校验并续期（过期许可可自动换回有效许可），`license_verified`/`license_error` 随 `/desktop/session-status` 回传，前端 `DesktopSessionGuard` 弹 toast、登录时提示"联网后自动校验授权"。
   - **权限位一致（桌面端/网页端）**：`require_permission` 对两种运行模式都只认账号权限位（管理员绕过）；登录时 `_mirror_local_user` 照搬权限位，运行中由 `session-check` 心跳回传服务器当前权限位（`desktop_cloud` → 本机 `_sync_permissions_from_remote`），前端 `DesktopSessionGuard` 刷新用户展示，管理员改权限后无需重登即生效。
   - **断网不退出登录**：`session-check` 心跳**只在服务器明确回复 `valid=False`**（账号在别处登录/会话失效）时才本机登出；网络不可达、超时、5xx 等一律按"无法确定"处理（`desktop_cloud_client.session_check` 返回 `offline=True`），断网时单机模式可继续使用，绝不因网络抖动踢下线。
   - 记账：每次联机登录累加 `DesktopLicense.login_count`；断网登录本机记 `pending_offline_logins`，下次联机补报。`idle_logout_days`（默认 2 天）写在授权上并随许可下发，覆盖本机会话空闲超时（`core/security._desktop_idle_timeout_minutes`）。

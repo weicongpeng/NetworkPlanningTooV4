@@ -551,8 +551,21 @@ export const desktopCloudApi = {
     return apiClient.get('/desktop/sync-status') as any
   },
 
-  // 登录态校验：同一账号在别处登录时返回 valid=false
-  getSessionStatus: async (): Promise<ApiResponse<{ valid: boolean; reason?: string; offline?: boolean; user?: UserInfo }>> => {
+  // 登录态校验：同一账号在别处登录时返回 valid=false；单机模式顺带返回离线状态与授权校验结果
+  getSessionStatus: async (): Promise<
+    ApiResponse<{
+      valid: boolean
+      reason?: string
+      offline?: boolean
+      skipped?: boolean
+      user?: UserInfo
+      /** 联网后自动校验授权成功（一次性，附续期后的到期日） */
+      license_verified?: boolean
+      license_expire_date?: string
+      /** 服务器明确拒绝的授权异常（被禁用/解绑/换机等），供前端提示 */
+      license_error?: string
+    }>
+  > => {
     return apiClient.get('/desktop/session-status') as any
   },
 

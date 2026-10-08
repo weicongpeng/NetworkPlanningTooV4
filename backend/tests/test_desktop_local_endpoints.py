@@ -272,6 +272,15 @@ def test_offline_license_not_renewed_by_policy(desktop_local):
     from app.services import desktop_cloud_client as cloud
 
     assert cloud.should_renew({"valid": True, "issued_via": "offline", "remaining_days": 3}, {}) is False
+    # 离线导入许可没有在线记录：即使已过期也不能续期
+    assert cloud.should_renew({"valid": False, "issued_via": "offline"}, {}) is False
+
+
+def test_expired_online_license_renewed_by_policy(desktop_local):
+    """过期的在线许可仍要尝试续期：联网后服务器重签，客户端无需重登即可恢复。"""
+    from app.services import desktop_cloud_client as cloud
+
+    assert cloud.should_renew({"valid": False, "issued_via": "online"}, {}) is True
 
 
 def test_renewal_policy_by_remaining_days(desktop_local):

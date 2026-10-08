@@ -100,10 +100,15 @@ export function LoginModal({ isOpen, forceChangePassword = false, onClose }: Log
         if (restoreTarget && restoreTarget !== location.pathname) {
           navigate(restoreTarget, { replace: true })
         }
-        if (warningMsg) {
-          setWarning(warningMsg)
+        // 单机模式离线登录（服务器探测不到）：提示用的是本机授权，联网后自动校验
+        const offlineNow = Boolean(desktopMode && useAuthStore.getState().desktopOffline)
+        const notice = offlineNow
+          ? t('desktopAuth.offlineLogin', '当前无网络：已用本机授权登录，联网后将自动校验授权')
+          : warningMsg
+        if (notice) {
+          setWarning(notice)
           // 短暂显示警告后自动关闭
-          setTimeout(() => onClose?.(), 2000)
+          setTimeout(() => onClose?.(), offlineNow ? 3000 : 2000)
         } else {
           onClose?.()
         }
@@ -269,21 +274,24 @@ export function LoginModal({ isOpen, forceChangePassword = false, onClose }: Log
             />
           </div>
 
-          {/* 桌面端运行模式：共享模式与网页端一致；单机模式需管理员单独授权 */}
+          {/* 桌面端运行模式：共享模式与网页端一致；单机模式可断网登录
+              （说明文案改为悬浮提示：选中只高亮左侧圆点，两个选项同行） */}
           {desktopMode && mode === 'login' && (
             <div>
               <label className="block text-sm text-muted-foreground mb-1.5">
                 {t('desktopAuth.runModeLabel', '运行模式')}
               </label>
-              <div className="space-y-2" role="radiogroup" aria-label={t('desktopAuth.runModeLabel', '运行模式')}>
+              <div className="flex gap-2" role="radiogroup" aria-label={t('desktopAuth.runModeLabel', '运行模式')}>
                 {(['shared', 'standalone'] as const).map((value) => {
                   const checked = desktopRunMode === value
+                  const hint = value === 'shared'
+                    ? t('desktopAuth.modeSharedHint', '与网页端同一账号、权限与数据组，可共享数据。')
+                    : t('desktopAuth.modeStandaloneHint', '数据仅存本机、可断网登录；需管理员授权，权限与网页端一致。')
                   return (
                     <label
                       key={value}
-                      className={`flex items-start gap-2.5 px-3 py-2 rounded-lg border-2 cursor-pointer transition-all ${
-                        checked ? 'border-primary bg-primary/10' : 'border-border hover:border-primary/50'
-                      }`}
+                      title={hint}
+                      className="flex flex-1 items-center gap-2 min-w-0 px-3 py-2 rounded-lg border border-border cursor-pointer transition-colors hover:border-primary/50"
                     >
                       <input
                         type="radio"
@@ -291,19 +299,12 @@ export function LoginModal({ isOpen, forceChangePassword = false, onClose }: Log
                         value={value}
                         checked={checked}
                         onChange={() => setDesktopRunMode(value)}
-                        className="mt-0.5 h-4 w-4 shrink-0 accent-primary"
+                        className="h-4 w-4 shrink-0 accent-primary"
                       />
-                      <span className="text-sm">
-                        <span className={`font-medium ${checked ? 'text-primary' : ''}`}>
-                          {value === 'shared'
-                            ? t('desktopAuth.modeShared', '共享模式')
-                            : t('desktopAuth.modeStandalone', '单机模式')}
-                        </span>
-                        <span className="block text-xs text-muted-foreground mt-0.5">
-                          {value === 'shared'
-                            ? t('desktopAuth.modeSharedHint', '与网页端同一账号、权限与数据组，可共享数据。')
-                            : t('desktopAuth.modeStandaloneHint', '数据仅存本机，需管理员授权后使用。')}
-                        </span>
+                      <span className="text-sm truncate">
+                        {value === 'shared'
+                          ? t('desktopAuth.modeShared', '共享模式')
+                          : t('desktopAuth.modeStandalone', '单机模式')}
                       </span>
                     </label>
                   )

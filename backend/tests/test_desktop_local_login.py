@@ -73,7 +73,7 @@ def local_env(tmp_path, monkeypatch):
 
     monkeypatch.setattr(sync_module, "state_file", lambda: state_file)
 
-    def make_license(mode="standalone", username="alice", days=30) -> str:
+    def make_license(mode="standalone", username="alice", days=30, issued_via="online") -> str:
         private_pem = private_key.private_bytes(
             encoding=serialization.Encoding.PEM,
             format=serialization.PrivateFormat.PKCS8,
@@ -89,7 +89,7 @@ def local_env(tmp_path, monkeypatch):
                 "subject": username,
                 "machine_code": machine,
                 "lease_days": days,
-                "issued_via": "online",
+                "issued_via": issued_via,
                 "issued_at": "2026-01-01 00:00:00",
                 "expire_date": (date.today() + timedelta(days=days)).isoformat(),
                 "features": ["all"],
@@ -327,9 +327,233 @@ def test_offline_login_when_server_unreachable(local_env):
     data = resp.json()["data"]
     assert data["offline"] is True
     assert data["token"] == "offline-token"
-    # 离线登录次数本地记账，下次联机补报
+    # 登录次数本地记账，下次联机补报
     state = json.loads((local_env.tmp_path / "cloud_state.json").read_text(encoding="utf-8"))
     assert state["pending_offline_logins"] == 1
+
+
+def test_standalone_login_short_probe_then_offline(local_env):
+    """单机模式本地凭据有效：服务器只做短时探测，连不上立即离线登录。"""
+    (local_env.settings.LICENSE_DIR / "license.nptlic").write_text(
+        local_env.make_license(), encoding="utf-8"
+    )
+    db = local_env.session_factory()
+    try:
+        db.add(
+            User(
+                username="alice",
+                password_hash=auth_service.hash_password("pwd123"),
+                is_active=True,
+                desktop_run_mode="standalone",
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    seen = {}
+    local_env.monkeypatch.setattr(
+        local_env.desktop_local,
+        "STANDALONE_ONLINE_PROBE_SECONDS",
+        1,
+    )
+
+    def boom(*args, **kwargs):
+        seen.update(kwargs)
+        raise local_env.cloud.CloudError(0, "无法连接授权服务器")
+
+    local_env.monkeypatch.setattr(local_env.cloud, "login", boom)
+
+    resp = local_env.client.post(
+        "/api/v1/desktop/login",
+        json={"username": "alice", "password": "pwd123", "mode": "standalone"},
+    )
+
+    assert resp.status_code == 200, resp.text
+    data = resp.json()["data"]
+    assert data["offline"] is True
+    assert data["verify_pending"] is True
+    assert data["mode"] == "standalone"
+    # 探测用的是短超时（不让用户干等完整超时）
+    assert seen.get("timeout") == 1
+    state = json.loads((local_env.tmp_path / "cloud_state.json").read_text(encoding="utf-8"))
+    # 旧会话标识被清除、留下待联网校验标记；登录次数本地记账
+    assert "session_jti" not in state
+    assert state["needs_license_verify"] is True
+    assert state["pending_offline_logins"] == 1
+
+
+def test_standalone_login_server_error_falls_back_offline(local_env):
+    """服务器 5xx 且本地凭据有效：不锁死用户，离线登录并等待联网后校验。"""
+    (local_env.settings.LICENSE_DIR / "license.nptlic").write_text(
+        local_env.make_license(), encoding="utf-8"
+    )
+    db = local_env.session_factory()
+    try:
+        db.add(
+            User(
+                username="alice",
+                password_hash=auth_service.hash_password("pwd123"),
+                is_active=True,
+                desktop_run_mode="standalone",
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    def boom(*args, **kwargs):
+        raise local_env.cloud.CloudError(503, "服务暂时不可用")
+
+    local_env.monkeypatch.setattr(local_env.cloud, "login", boom)
+    resp = local_env.client.post(
+        "/api/v1/desktop/login",
+        json={"username": "alice", "password": "pwd123", "mode": "standalone"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["data"]["offline"] is True
+
+
+def test_standalone_login_business_error_still_blocks(local_env):
+    """授权被禁用等业务错误：即使本地许可仍有效也要拦住（管理员已撤销）。"""
+    (local_env.settings.LICENSE_DIR / "license.nptlic").write_text(
+        local_env.make_license(), encoding="utf-8"
+    )
+    db = local_env.session_factory()
+    try:
+        db.add(
+            User(
+                username="alice",
+                password_hash=auth_service.hash_password("pwd123"),
+                is_active=True,
+                desktop_run_mode="standalone",
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    def denied(*args, **kwargs):
+        raise local_env.cloud.CloudError(403, "该账号的单机授权已被禁用，请联系管理员")
+
+    local_env.monkeypatch.setattr(local_env.cloud, "login", denied)
+    resp = local_env.client.post(
+        "/api/v1/desktop/login",
+        json={"username": "alice", "password": "pwd123", "mode": "standalone"},
+    )
+    assert resp.status_code == 403, resp.text
+    assert "禁用" in resp.json()["detail"]
+
+
+def test_standalone_expired_license_prompts_expiry(local_env):
+    """本机许可已过期且断网：提示授权过期（而非笼统的无法连接服务器）。"""
+    expired = local_env.make_license(days=-1)
+    (local_env.settings.LICENSE_DIR / "license.nptlic").write_text(expired, encoding="utf-8")
+
+    def boom(*a, **kw):
+        raise local_env.cloud.CloudError(0, "无法连接授权服务器")
+
+    local_env.monkeypatch.setattr(local_env.cloud, "login", boom)
+    resp = local_env.client.post(
+        "/api/v1/desktop/login",
+        json={"username": "alice", "password": "pwd123", "mode": "standalone"},
+    )
+
+    assert resp.status_code == 403, resp.text
+    detail = resp.json()["detail"]
+    assert "过期" in detail and "联网" in detail
+
+
+def test_standalone_shared_license_offline_prompts_mismatch(local_env):
+    """本机许可是共享模式：单机离线登录不可用，提示联网切换。"""
+    shared = local_env.make_license(mode="shared")
+    (local_env.settings.LICENSE_DIR / "license.nptlic").write_text(shared, encoding="utf-8")
+
+    def boom(*a, **kw):
+        raise local_env.cloud.CloudError(0, "无法连接授权服务器")
+
+    local_env.monkeypatch.setattr(local_env.cloud, "login", boom)
+    resp = local_env.client.post(
+        "/api/v1/desktop/login",
+        json={"username": "alice", "password": "pwd123", "mode": "standalone"},
+    )
+    assert resp.status_code == 403, resp.text
+    assert "共享模式" in resp.json()["detail"]
+
+
+def test_verify_pending_license_once_renews_and_clears_flag(local_env):
+    """联网后用许可续期通道校验授权：成功即清除待校验标记。"""
+    (local_env.settings.LICENSE_DIR / "license.nptlic").write_text(
+        local_env.make_license(), encoding="utf-8"
+    )
+    local_env.cloud.save_state(needs_license_verify=True, license_error="旧错误")
+
+    local_env.monkeypatch.setattr(
+        local_env.cloud,
+        "renew_local_license",
+        lambda: {"expire_date": "2026-12-31"},
+    )
+    result = local_env.desktop_local.verify_pending_license_once()
+
+    assert result == "2026-12-31"
+    state = local_env.cloud.load_state()
+    assert not state.get("needs_license_verify")
+    assert not state.get("license_error")
+
+
+def test_verify_pending_license_renews_expired_license(local_env):
+    """离线期间授权过期：联网校验时经续期通道换回有效许可并回传新到期日。"""
+    (local_env.settings.LICENSE_DIR / "license.nptlic").write_text(
+        local_env.make_license(days=-1), encoding="utf-8"
+    )
+    local_env.cloud.save_state(needs_license_verify=True)
+    local_env.monkeypatch.setattr(
+        local_env.cloud, "renew_local_license", lambda: {"expire_date": "2026-12-31"}
+    )
+
+    data = local_env.desktop_local.check_session_once()
+
+    assert data["license_verified"] is True
+    assert data["license_expire_date"] == "2026-12-31"
+    assert not local_env.cloud.load_state().get("needs_license_verify")
+
+
+def test_verify_pending_license_once_records_disabled_error(local_env):
+    """服务器明确拒绝（授权被禁用）：记录错误供前端提示，并停止重试。"""
+    (local_env.settings.LICENSE_DIR / "license.nptlic").write_text(
+        local_env.make_license(), encoding="utf-8"
+    )
+    local_env.cloud.save_state(needs_license_verify=True)
+
+    def denied():
+        raise local_env.cloud.CloudError(403, "该授权已被禁用，请联系管理员")
+
+    local_env.monkeypatch.setattr(local_env.cloud, "renew_local_license", denied)
+    result = local_env.desktop_local.verify_pending_license_once()
+
+    assert result is None
+    state = local_env.cloud.load_state()
+    assert not state.get("needs_license_verify")
+    assert "禁用" in state["license_error"]
+    # 错误也会随巡检结果带给前端
+    data = local_env.desktop_local.check_session_once()
+    assert "禁用" in data["license_error"]
+
+
+def test_verify_pending_license_once_skips_offline_issued(local_env):
+    """离线导入的许可无法在线续期：直接清除标记，不误报授权异常。"""
+    (local_env.settings.LICENSE_DIR / "license.nptlic").write_text(
+        local_env.make_license(issued_via="offline"), encoding="utf-8"
+    )
+    local_env.cloud.save_state(needs_license_verify=True)
+    local_env.monkeypatch.setattr(
+        local_env.cloud,
+        "renew_local_license",
+        lambda: (_ for _ in ()).throw(AssertionError("离线许可不应尝试续期")),
+    )
+
+    assert local_env.desktop_local.verify_pending_license_once() is None
+    assert not local_env.cloud.load_state().get("needs_license_verify")
 
 
 def test_shared_login_error_propagates(local_env):

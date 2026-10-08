@@ -44,13 +44,25 @@ CloseApplications=force
 
 [Files]
 Source: "..\dist\NetworkPlanningTool\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+; 快捷方式图标：随版本换名（app-{#MyAppVersion}.ico），避开 Windows 图标缓存
+; 一直沿用旧图标的问题——换了文件名，资源管理器必然重新读取
+Source: "app.ico"; DestDir: "{app}"; DestName: "app-{#MyAppVersion}.ico"; Flags: ignoreversion
 ; WebView2 引导安装器（缺失的机器上静默安装；安装完自动删除）
 Source: "webview2\MicrosoftEdgeWebview2Setup.exe"; DestDir: "{tmp}"; Flags: deleteafterinstall skipifsourcedoesntexist
 
+[InstallDelete]
+; 应用改名前的旧快捷方式（网络规划工具）：不清理的话用户可能点到停留在
+; 旧图标上的入口，误以为图标没更新
+Type: files; Name: "{userdesktop}\网络规划工具.lnk"
+Type: files; Name: "{group}\网络规划工具.lnk"
+Type: files; Name: "{group}\卸载 网络规划工具.lnk"
+; 上一版本的快捷方式图标（{app} 下随版本累积，安装前清理，随后拷入新版本）
+Type: files; Name: "{app}\app-*.ico"
+
 [Icons]
-Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
+Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\app-{#MyAppVersion}.ico"
 Name: "{group}\卸载 {#MyAppName}"; Filename: "{uninstallexe}"
-Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
+Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\app-{#MyAppVersion}.ico"; Tasks: desktopicon
 
 [Tasks]
 Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "附加任务:"
@@ -61,6 +73,18 @@ Filename: "{app}\{#MyAppExeName}"; Description: "启动 {#MyAppName}"; Flags: no
 [Code]
 const
   WebView2ClientKey = 'SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}';
+  SHCNE_ASSOCCHANGED = $08000000;
+  SHCNF_IDLIST = $0000;
+
+// 通知资源管理器刷新图标缓存：覆盖安装后快捷方式图标立即更新，
+// 否则可能长时间停留在旧图标（Windows 按"图标路径+索引"缓存位图）
+procedure SHChangeNotify(wEventId: Integer; uFlags: Cardinal; dwItem1, dwItem2: Cardinal);
+  external 'SHChangeNotify@shell32.dll stdcall';
+
+procedure RefreshShellIcons();
+begin
+  SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, 0, 0);
+end;
 
 function IsWebView2Installed(): Boolean;
 var
@@ -96,7 +120,16 @@ end;
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssPostInstall then
+  begin
+    RefreshShellIcons();  // 快捷方式已创建，刷新图标缓存让新图标立即生效
     InstallWebView2IfNeeded();
+  end;
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+begin
+  if CurUninstallStep = usPostUninstall then
+    RefreshShellIcons();  // 卸载后快捷方式消失，同样需要刷新缓存
 end;
 
 [UninstallDelete]

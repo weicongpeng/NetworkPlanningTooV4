@@ -19,6 +19,8 @@ interface AuthState {
   desktopError: string | null
   /** 桌面端运行模式：登录后确定，持久化以便刷新后保持 */
   desktopRunMode: DesktopRunMode
+  /** 单机模式本次为离线登录（本机授权登录，联网后自动校验授权） */
+  desktopOffline: boolean
   /** 单机模式已提交授权申请、等待管理员批准的账号 */
   desktopPendingUsername: string | null
   /** 桌面端最后一次登录的账号与运行模式（持久化的只是展示用信息，不含密码） */
@@ -31,7 +33,9 @@ interface AuthState {
   changePassword: (oldPassword: string, newPassword: string, confirmPassword: string) => Promise<void>
   probeDesktopMode: () => Promise<void>
   setDesktopPendingUsername: (username: string | null) => void
-  applyDesktopLogin: (data: { access_token?: string; token?: string; user?: any; mode?: string }) => void
+  /** 更新桌面端离线/在线状态（离线登录或心跳探测到网络变化时调用） */
+  setDesktopOffline: (offline: boolean) => void
+  applyDesktopLogin: (data: { access_token?: string; token?: string; user?: any; mode?: string; offline?: boolean }) => void
   /** 用本机后端回传的账号信息刷新本地用户（权限位被管理员改动后即时生效） */
   applyServerUser: (nextUser: UserInfo) => void
 }
@@ -60,6 +64,7 @@ export const useAuthStore = create<AuthState>()(
       desktopProbed: false,
       desktopError: null,
       desktopRunMode: null,
+      desktopOffline: false,
       desktopPendingUsername: null,
       lastDesktopLogin: null,
 
@@ -84,6 +89,7 @@ export const useAuthStore = create<AuthState>()(
               isAuthenticated: true,
               isLoading: false,
               desktopRunMode: data.mode || desktopRunMode,
+              desktopOffline: Boolean(data.offline),
               desktopPendingUsername: null,
               lastDesktopLogin: {
                 username,
@@ -112,6 +118,10 @@ export const useAuthStore = create<AuthState>()(
       },
 
       setDesktopPendingUsername: (username: string | null) => set({ desktopPendingUsername: username }),
+
+      setDesktopOffline: (offline: boolean) => {
+        if (get().desktopOffline !== offline) set({ desktopOffline: offline })
+      },
 
   register: async (username: string, password: string, confirmPassword: string, city: string, operator: string) => {
     clearUserDataCaches()
@@ -172,6 +182,7 @@ export const useAuthStore = create<AuthState>()(
           user: null,
           isAuthenticated: false,
           desktopRunMode: null,
+          desktopOffline: false,
           desktopPendingUsername: null,
         })
         // 登出后清空所有用户的内存数据缓存，杜绝下一账号 TTL 内读到本组数据
@@ -251,22 +262,31 @@ export const useAuthStore = create<AuthState>()(
           user: data.user,
           isAuthenticated: true,
           desktopRunMode: (data.mode || 'standalone') as DesktopRunMode,
+          desktopOffline: Boolean(data.offline),
           desktopPendingUsername: null,
         })
       },
 
       applyServerUser: (nextUser) => {
-        // 只在权限相关字段变化时更新，避免周期性心跳触发无意义的重渲染
+        // 只在权限/授权期限相关字段变化时更新，避免周期性心跳触发无意义的重渲染
         const current = get().user
         const keys: (keyof UserInfo)[] = [
           'is_admin', 'is_active',
           'can_data_import', 'can_data_delete', 'can_data_update',
           'can_cell_entry', 'can_cell_query_update', 'can_assistant',
+          // 联网校验授权后会续期并镜像到期日：让授权门禁即时拿到新期限
+          'license_expiry', 'effective_license_expiry',
         ]
-        const changed = !current || keys.some(
-          (key) => Boolean(current[key]) !== Boolean(nextUser[key])
-        )
-        if (changed) set({ user: nextUser })
+        const differs = (key: keyof UserInfo) => {
+          const prev = current?.[key]
+          const next = nextUser[key]
+          // 权限位按布尔比较（null/false 等价）；授权期限按值比较（null 与空串等价）
+          if (typeof prev === 'boolean' || typeof next === 'boolean') {
+            return Boolean(prev) !== Boolean(next)
+          }
+          return (prev ?? '') !== (next ?? '')
+        }
+        if (!current || keys.some(differs)) set({ user: nextUser })
       },
     }),
     {

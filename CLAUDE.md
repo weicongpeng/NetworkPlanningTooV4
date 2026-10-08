@@ -85,7 +85,8 @@ npx vitest run -t "GSCN"                          # 按用例名过滤
 ```bash
 # 仅在 Windows 上构建；CI 见 .github/workflows/build-windows-desktop.yml
 pip install -r backend/requirements.txt -r desktop/requirements-desktop.txt
-python desktop/tools/make_icon.py                       # 生成 desktop/app.ico（构建期产物，不入库）
+python desktop/tools/make_icon.py                       # 生成 desktop/app.ico（构建期产物，不入库；安装器
+                                                        # 拷成 app-<版本>.ico 作快捷方式图标并刷新图标缓存）
 python desktop/tools/spike.py                           # GDAL / pywebview / TAB 读写 / 上传链路基线自检
 pyinstaller --noconfirm --clean desktop/desktop.spec    # → dist/NetworkPlanningTool/{NPT.exe,_internal/}
 NPT.exe --selftest                                      # 打包产物冒烟
@@ -291,7 +292,7 @@ FastAPI (backend/app/)
 - **APP 分发**：管理端分片上传 APK（绕过 Cloudflare 100MB 限制）→ `app_versions` 表 + `backend/app/apks/`；客户端 `GET /api/v1/app-versions/latest` 与 `/download/{id}`（支持 Range、下载计数）
 - **桌面版登录与授权（2026-10 改版）**：桌面端不再有 owner 免登录账号，与网页端**共用同一套账号**；桌面形态的登录页多一组「运行模式」选择：
   - **共享模式**：`POST /desktop/login`（本机）→ 代理 `POST /desktop-cloud/auth/login`（服务器）→ 用 `auth_service.authenticate_user` 校验网页端账号 → 为「账号 + 机器」自动签发许可（`DesktopLicense.mode='shared'`，兼作同步凭证）→ 本机镜像同名本地账号（组/权限位/管理员位照搬）→ 签发本机 JWT。**登录优先**：首次同步不在登录路径上跑，登录响应返回后 `LOGIN_SYNC_DELAY_SECONDS`（5s）由后台定时器触发一次 `sync_once`。
-  - **单机模式**：同流程，但按 `(username, machine_code)` 找/建 `mode='standalone'` 授权；未批准返回 `result=pending`，前端 `DesktopAuthPendingDialog` 轮询 `POST /desktop/auth-poll`，管理员在网页端「桌面授权」页批准后签发许可。单机模式强制 `run_mode=offline`（数据本机私有、不参与同步）、隐藏授权/同步/数据组卡片；仅当「网络不可达 + 本机已有该账号 + 本机许可有效」时才回退本地校验密码离线登录。**权限位与网页端一致**（不再全量放行），由管理员在「用户管理 → 编辑」设置；运行中经 `session-check` 心跳同步到本机镜像账号。
+  - **单机模式**：同流程，但按 `(username, machine_code)` 找/建 `mode='standalone'` 授权；未批准返回 `result=pending`，前端 `DesktopAuthPendingDialog` 轮询 `POST /desktop/auth-poll`，管理员在网页端「桌面授权」页批准后签发许可。单机模式强制 `run_mode=offline`（数据本机私有、不参与同步）、隐藏授权/同步/数据组卡片。**离线可用**：本机已有该账号镜像且许可有效时，服务器登录只给短探测（`STANDALONE_ONLINE_PROBE_SECONDS`＝4s），连不上/5xx 立即离线登录（本地校验密码，`offline=true`）；许可过期/换机/账号不匹配按本地原因明确提示。离线登录置 `needs_license_verify`，联网后巡检经许可续期通道校验并续期（过期可自动换回有效许可），`license_verified`/`license_error` 随 `/desktop/session-status` 回传、前端 toast。**权限位与网页端一致**（不再全量放行），由管理员在「用户管理 → 编辑」设置；运行中经 `session-check` 心跳同步到本机镜像账号。
   - 单设备登录：共享模式登录在服务器记账并踢掉该账号其它会话；客户端每 60s 调 `POST /desktop-cloud/auth/session-check`，**只有服务器明确回复 `valid=False`**（账号在别处登录/会话失效）才本机登出（`desktop_local.session_guard_loop`）；网络不可达、超时、5xx 一律按"无法确定"处理，断网（尤其单机模式）可继续使用，绝不因网络抖动踢下线。每次联机登录累加 `DesktopLicense.login_count`，断网登录本机记账、联机补报。
 - **桌面端数据同步（共享模式）**：粒度是**整包数据集（zip）**，不是行级增量。`dataset_revision_service.py` 为每个数据集维护**单调递增 rev**——只有真正改变内容的写入才 `bump`，`set_sha`（下载）不推进 rev，否则 rev 抖动会导致反复整包下载；删除写**墓碑** `deleted=True`，避免本地删除被当成新建推回。客户端 `sync_state.json` 记录「服务器 rev 基线 + sha256 + dirty」，`sync_loop` 按 `NPT_DESKTOP_SYNC_INTERVAL_MINUTES` 轮询、本地改动经 `NPT_DESKTOP_SYNC_DEBOUNCE_SECONDS` 防抖上行。冲突不做行级合并，采用**最后写入者胜 + 显式选边**（`/desktop/sync-resolve` 选 server/local）；push 带 `base_rev` 乐观锁，服务器 rev 不符返回 409。**服务器权威 `dataset_revisions` 表与本地 `sync_state.json` 里记录的服务器 rev 是两套数字，不可混用。**
 - **同组任务历史共享（2026-10-08）**：PCI/邻区/TAC 核查/TAC 规划四类历史任务（`TaskManager.SHARED_TASK_TYPES`）在同组内互通。网页端历史列表本就按组过滤；桌面端共享模式新增任务同步（`sync_once` 第 4 步 `sync_tasks`）：拉同组任务元数据写入本机镜像行（`task_results.origin='shared'`，结果不预下载）、本机新建规划任务含结果上行（只推一次）、传播删除与应用标记；镜像结果在查看/导出时按需从服务器拉取并缓存。服务端接口 `/desktop-cloud/data/tasks/*`（许可+机器码鉴权，组以授权记录为准）。存量无组任务启动迁移时按发起人 `user_name` 的当前组重盖章。
