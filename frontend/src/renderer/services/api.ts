@@ -649,6 +649,15 @@ export interface DesktopSyncStatus {
     deleted?: number
     conflicts?: number
     errors?: string[]
+    /** 同组任务历史同步统计（桌面端共享模式） */
+    tasks?: {
+      pulled?: number
+      pushed?: number
+      deleted?: number
+      /** 元数据/已应用标记被更新的任务数 */
+      updated?: number
+      errors?: string[]
+    }
   } | null
   pending_uploads: number
   conflicts: { data_id: string; name: string; server_rev: number; local_rev: number }[]

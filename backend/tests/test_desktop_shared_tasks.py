@@ -259,3 +259,176 @@ def test_sync_tasks_mirrors_pushes_and_deletes(desktop_task_env, temp_db):
         assert sync.load_state()["task_deletes"] == []
     finally:
         monkeypatch_.undo()
+
+
+def _task_row(**kw):
+    """构造一条 TaskResult 行参数。"""
+    base = dict(
+        task_id="t-x", task_type="pci", task_name="任务", user_name="alice",
+        status="completed", progress=100.0, created_at="2026-10-08T08:00:00",
+        city="河源", operator="联通",
+    )
+    base.update(kw)
+    return base
+
+
+def _patch_cloud(monkeypatch_, cloud, manifest_items, uploads=None, deletes=None):
+    """把云端三个接口换成内存实现，返回可变的 server 列表。"""
+    server = {"items": {str(i["task_id"]): dict(i) for i in manifest_items},
+              "total": None, "uploads": [], "deletes": []}
+    if uploads is not None:
+        server["uploads"] = uploads
+    if deletes is not None:
+        server["deletes"] = deletes
+
+    def _manifest():
+        data = {"items": [dict(v) for v in server["items"].values()]}
+        if server["total"] is not None:
+            data["total"] = server["total"]
+        return data
+
+    def _upload(task, result=None):
+        server["uploads"].append(task["task_id"])
+        server["items"][task["task_id"]] = {k: v for k, v in task.items() if k != "result"}
+        return {"task_id": task["task_id"]}
+
+    monkeypatch_.setattr(cloud, "shared_tasks_manifest", _manifest)
+    monkeypatch_.setattr(cloud, "upload_shared_task", _upload)
+    monkeypatch_.setattr(cloud, "delete_shared_task", lambda tid: server["deletes"].append(tid) or {"deleted": True})
+    return server
+
+
+def test_sync_tasks_prunes_pushed_local_task_deleted_remotely(desktop_task_env, temp_db):
+    """本机新建并已上行过的任务，被同组其他端删除后本机也要清理（否则永久残留）。"""
+    sync = desktop_task_env
+    from app.services import desktop_cloud_client as cloud
+
+    monkeypatch_ = pytest.MonkeyPatch()
+    server = _patch_cloud(monkeypatch_, cloud, [])
+    try:
+        db = temp_db()
+        try:
+            db.add(TaskResult(**_task_row(task_id="t-local", origin="local",
+                                          result_json=json.dumps({"results": []}))))
+            db.commit()
+        finally:
+            db.close()
+
+        sync.sync_tasks("河源", "联通")  # 上行（只推一次）
+        assert "t-local" in server["items"]
+
+        # 网页端删除该记录 → 清单里没有了 → 本机应删除（且不会被当成"本机新建"再推一次）
+        server["items"].pop("t-local")
+        summary = sync.sync_tasks("河源", "联通")
+
+        assert summary["deleted"] == 1
+        db = temp_db()
+        try:
+            assert db.query(TaskResult).filter(TaskResult.task_id == "t-local").first() is None
+        finally:
+            db.close()
+        assert sync.load_state()["tasks_pushed"] == []
+    finally:
+        monkeypatch_.undo()
+
+
+def test_sync_tasks_syncs_applied_flag_both_ways(desktop_task_env, temp_db):
+    """已应用标记双向同步：服务器置 1 → 本机显示；本机待上行更新不被服务器旧值冲掉。"""
+    sync = desktop_task_env
+    from app.services import desktop_cloud_client as cloud
+
+    monkeypatch_ = pytest.MonkeyPatch()
+    server = _patch_cloud(monkeypatch_, cloud, [
+        {"task_id": "t-mirror", "task_type": "pci", "task_name": "镜像任务",
+         "user_name": "bob", "status": "completed", "is_applied": False,
+         "created_at": "2026-10-08T09:00:00", "completed_at": None,
+         "city": "河源", "operator": "联通"},
+    ])
+    try:
+        # 本机自建并已上行、且刚应用（待上行更新）
+        db = temp_db()
+        try:
+            db.add(TaskResult(**_task_row(task_id="t-local", origin="local", is_applied=1,
+                                          result_json=json.dumps({"results": []}))))
+            db.commit()
+        finally:
+            db.close()
+        sync.sync_tasks("河源", "联通")          # 上行 t-local（is_applied=True）
+        sync.queue_task_update("t-local")        # 模拟"刚应用、待上行"
+
+        # 网页端标记镜像任务为已应用
+        server["items"]["t-mirror"]["is_applied"] = True
+        summary = sync.sync_tasks("河源", "联通")
+        assert summary["updated"] >= 1
+
+        db = temp_db()
+        try:
+            mirror = db.query(TaskResult).filter(TaskResult.task_id == "t-mirror").first()
+            assert mirror is not None and int(mirror.is_applied) == 1
+            local = db.query(TaskResult).filter(TaskResult.task_id == "t-local").first()
+            # 本机待上行更新不被服务器旧值（False）覆盖
+            assert local is not None and int(local.is_applied) == 1
+        finally:
+            db.close()
+
+        # 服务器重置标记（如重新导入工参后清空）→ 本机同步回 0
+        server["items"]["t-mirror"]["is_applied"] = False
+        sync.sync_tasks("河源", "联通")
+        db = temp_db()
+        try:
+            mirror = db.query(TaskResult).filter(TaskResult.task_id == "t-mirror").first()
+            assert mirror is not None and int(mirror.is_applied) == 0
+        finally:
+            db.close()
+    finally:
+        monkeypatch_.undo()
+
+
+def test_sync_tasks_keeps_mirrors_when_manifest_truncated(desktop_task_env, temp_db):
+    """清单被 LIMIT 截断时不得按清单删除本地镜像（老任务会被误删）。"""
+    sync = desktop_task_env
+    from app.services import desktop_cloud_client as cloud
+
+    monkeypatch_ = pytest.MonkeyPatch()
+    server = _patch_cloud(monkeypatch_, cloud, [])
+    try:
+        db = temp_db()
+        try:
+            db.add(TaskResult(**_task_row(task_id="t-old", origin="shared", task_name="老任务")))
+            db.commit()
+        finally:
+            db.close()
+
+        # total=5 但只回了 1 条（截断）→ 不在清单里的镜像必须保留
+        server["total"] = 5
+        server["items"]["t-new"] = {
+            "task_id": "t-new", "task_type": "tac", "task_name": "新任务", "user_name": "bob",
+            "status": "completed", "is_applied": False, "created_at": "2026-10-08T10:00:00",
+            "completed_at": None, "city": "河源", "operator": "联通",
+        }
+        sync.sync_tasks("河源", "联通")
+
+        db = temp_db()
+        try:
+            assert db.query(TaskResult).filter(TaskResult.task_id == "t-old").first() is not None
+            assert db.query(TaskResult).filter(TaskResult.task_id == "t-new").first() is not None
+        finally:
+            db.close()
+    finally:
+        monkeypatch_.undo()
+
+
+def test_list_task_history_applied_flag_for_mirror_rows(temp_db):
+    """镜像行（结果未落地本机）也要能显示"已应用"——回退到同组同步来的标记。"""
+    db = temp_db()
+    try:
+        db.add(TaskResult(**_task_row(task_id="t-mirror-applied", origin="shared", is_applied=1)))
+        db.add(TaskResult(**_task_row(task_id="t-mirror-plain", origin="shared", is_applied=0)))
+        db.commit()
+    finally:
+        db.close()
+
+    history = task_manager.list_task_history(task_type="pci", page=1, page_size=10)
+    by_id = {t["taskId"]: t for t in history["tasks"]}
+    assert by_id["t-mirror-applied"]["isApplied"] is True
+    assert by_id["t-mirror-plain"]["isApplied"] is False

@@ -812,11 +812,14 @@ async def data_tasks_manifest(
     group = _license_group(record)
     if group is None:
         raise HTTPException(status_code=409, detail="尚未绑定数据组，请先调用 /data/session")
+    items = task_manager.list_shared_tasks(group[0], group[1])
     return {
         "success": True,
         "data": {
             "group": {"city": group[0], "operator": group[1]},
-            "items": task_manager.list_shared_tasks(group[0], group[1]),
+            "items": items,
+            # 总数：清单有 LIMIT 截断，桌面端只有拿到完整清单才能安全地按清单删除本地镜像
+            "total": task_manager.count_shared_tasks(group[0], group[1]),
         },
     }
 

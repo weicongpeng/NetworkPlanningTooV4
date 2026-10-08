@@ -348,6 +348,8 @@
     "deleteFailedPermission": "Insufficient disk permissions",
     "deleteFailedIndex": "Index file corrupted",
     "updateSuccess": "Update successful",
+    "updateStatsSummary": "Summary: {{stats}}",
+    "updateStatsNet": "{{net}}: {{matched}} matched / {{appended}} added",
     "updateFailed": "Parameter update failed",
     "updateFailedHint": "Possible cause: backend service restarted, or data cache expired",
     "tryRefreshHint": "Please try: 1. Click 'Refresh' to update the data list; 2. If the problem persists, restart the backend service",

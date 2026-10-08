@@ -290,6 +290,8 @@
     "deleteFailedPermission": "磁盘权限不足",
     "deleteFailedIndex": "索引文件损坏",
     "updateSuccess": "更新成功",
+    "updateStatsSummary": "更新统计：{{stats}}",
+    "updateStatsNet": "{{net}} 匹配 {{matched}} 行/新增 {{appended}} 行",
     "updateFailed": "工参更新失败",
     "updateFailedHint": "可能原因：后端服务已重启，或数据缓存过期",
     "tryRefreshHint": "请尝试：1. 点击「刷新」按钮更新数据列表；2. 如果问题持续，请重启后端服务",

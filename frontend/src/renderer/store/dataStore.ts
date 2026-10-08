@@ -58,7 +58,7 @@ interface DataState {
   uploadMap: (file: File, context?: string, extraFiles?: File[]) => Promise<boolean>
   uploadGeoData: (file: File, filePath?: string) => Promise<boolean>
   deleteItem: (id: string) => Promise<boolean>
-  updateParameters: (fullParamId: string, currentParamId: string) => Promise<ApiResponse<{ newFileId: string; newFileName: string; savedToOriginal: boolean } | null>>
+  updateParameters: (fullParamId: string, currentParamId: string) => Promise<ApiResponse<{ newFileId: string; newFileName: string; savedToOriginal: boolean; stats?: Record<string, { matched: number; appended: number }> | null } | null>>
   downloadTemplate: (templateType: 'full_params' | 'target_cells') => Promise<void>
   addCell: (data: {
     networkType: 'LTE' | 'NR'
@@ -313,6 +313,8 @@ export const useDataStore = create<DataState>((set, get) => ({
             newFileId: finalResult.newFileId,
             newFileName: finalResult.newFileName,
             savedToOriginal: finalResult.savedToOriginal,
+            // 合并统计（LTE/NR 匹配行数、新增行数）：前端展示实际更新量
+            stats: finalResult.stats || null,
           }
         }
       }

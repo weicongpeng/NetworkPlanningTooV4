@@ -364,6 +364,39 @@ def _pull(
     return {"data_id": data_id, "action": "pull", "rev": server_rev}
 
 
+def repair_dataset(data_id: str) -> Dict[str, Any]:
+    """共享模式：把某数据集从服务器整包补拉一次（本机镜像数据体缺失/损坏时用）。
+
+    - 仅在桌面共享模式 + 授权有效时执行；单机/离线不动
+    - 本地有未上行修改（dirty）时不拉，避免覆盖用户数据
+    - 拉取后本地记录基线修订号，后续按正常同步流转
+    """
+    if not settings.NPT_DESKTOP or not data_id:
+        return {"repaired": False, "reason": "非桌面共享模式"}
+    if not is_shared():
+        return {"repaired": False, "reason": "当前为离线模式"}
+    state = load_state()
+    if (state["datasets"].get(data_id) or {}).get("dirty"):
+        return {"repaired": False, "reason": "本机有未同步的修改"}
+
+    from app.services import desktop_cloud_client as cloud
+
+    _require_active_license()
+    user, city, operator = _local_group()
+    server_rev = 0
+    try:
+        manifest = cloud.sync_manifest()
+        for item in manifest.get("items") or []:
+            if item.get("data_id") == data_id:
+                server_rev = int(item.get("rev") or 0)
+                break
+    except Exception:  # noqa: BLE001
+        pass  # 拿不到清单就按 0 记基线，下一轮同步会按服务器 rev 修正
+
+    result = _pull(data_id, user, city, operator, server_rev)
+    return {"repaired": True, **result}
+
+
 def _push(data_id: str, expected_rev: int) -> Dict[str, Any]:
     """把本地数据集整包上传（带基地修订号乐观锁）。"""
     from app.services import desktop_cloud_client as cloud
@@ -414,6 +447,9 @@ def sync_tasks(city: str, operator: str) -> Dict[str, Any]:
     - 只同步规划类任务（`TaskManager.SHARED_TASK_TYPES`），apply_* 不共享
     - 镜像行（origin=shared）只读：结果不预下载，查看/导出时按需拉取
     - 本机任务的结果只在首次上行时发一次（`tasks_pushed` 记账）
+    - 服务器删除（网页端删记录/应用后清理）→ 删除本机镜像；已上行过的本机任务同理
+    - `is_applied` 双向同步：别处应用 → 本机显示已应用；本机刚应用未上行时保留本机值
+    - 清单被 LIMIT 截断（`total > len(items)`）时不做删除判定，避免误删老任务
     """
     import json as _json
 
@@ -424,25 +460,41 @@ def sync_tasks(city: str, operator: str) -> Dict[str, Any]:
 
     manifest = cloud.shared_tasks_manifest()
     items = {str(i.get("task_id")): i for i in (manifest.get("items") or []) if i.get("task_id")}
-    summary: Dict[str, Any] = {"pulled": 0, "pushed": 0, "deleted": 0, "errors": []}
+    # 清单可能因 LIMIT 截断：截断时绝不能把"清单里没有"当成"服务器已删除"
+    try:
+        total = int(manifest.get("total") or 0)
+    except (TypeError, ValueError):
+        total = 0
+    truncated = total > len(items)
+    summary: Dict[str, Any] = {"pulled": 0, "pushed": 0, "deleted": 0, "updated": 0, "errors": []}
     state = load_state()
     pushed = set(state.get("tasks_pushed") or [])
+    pending_updates = set(state.get("task_updates") or [])
     remaining_updates: List[str] = []
+    changed_ids: List[str] = []
 
     db = SessionLocal()
     try:
         local_rows = db.query(TaskResult).all()
         local_by_id = {r.task_id: r for r in local_rows}
 
-        # 1) 服务器已删除 → 清掉本机镜像行（本机自建任务不动）
+        # 1) 服务器已删除 → 清掉本机镜像行；本机自建且已上行过的任务同样清理
+        #    （否则网页端删掉的记录会在桌面端一直残留，且被 tasks_pushed 记账挡住不再上行）
         for row in list(local_rows):
-            if row.origin == "shared" and row.task_id not in items:
+            if row.task_id in items:
+                continue
+            if row.origin == "shared" or row.task_id in pushed:
+                if truncated:
+                    continue  # 清单被截断，不能据此判定删除
                 db.delete(row)
+                pushed.discard(row.task_id)
                 summary["deleted"] += 1
+                changed_ids.append(row.task_id)
 
-        # 2) 新增/更新镜像行（结果留空，按需拉取）
+        # 2) 新增/更新镜像行（结果留空，按需拉取），并双向同步"已应用"标记
         for task_id, item in items.items():
             row = local_by_id.get(task_id)
+            server_applied = bool(item.get("is_applied"))
             if row is None:
                 db.add(TaskResult(
                     task_id=task_id,
@@ -451,7 +503,7 @@ def sync_tasks(city: str, operator: str) -> Dict[str, Any]:
                     user_name=item.get("user_name"),
                     status=item.get("status") or "completed",
                     progress=100.0,
-                    is_applied=1 if item.get("is_applied") else 0,
+                    is_applied=1 if server_applied else 0,
                     created_at=str(item.get("created_at") or ""),
                     completed_at=item.get("completed_at"),
                     city=item.get("city") or city,
@@ -459,13 +511,20 @@ def sync_tasks(city: str, operator: str) -> Dict[str, Any]:
                     origin="shared",
                 ))
                 summary["pulled"] += 1
-            elif row.origin == "shared":
+                continue
+            if row.origin == "shared":
                 row.task_name = item.get("task_name") or row.task_name
                 row.user_name = item.get("user_name") or row.user_name
                 row.status = item.get("status") or row.status
                 row.completed_at = item.get("completed_at") or row.completed_at
-                if item.get("is_applied"):
-                    row.is_applied = 1
+            # 应用标记以服务器为准（两组用户共享同一份历史）；
+            # 本机刚应用、尚未上行的任务保留本机值，避免被服务器旧值冲掉
+            if task_id not in pending_updates:
+                new_flag = 1 if server_applied else 0
+                if int(row.is_applied or 0) != new_flag:
+                    row.is_applied = new_flag
+                    summary["updated"] += 1
+                    changed_ids.append(task_id)
         db.commit()
 
         # 3) 本机新建的规划任务上行（含结果，只推一次）；以及待上行更新
@@ -526,6 +585,11 @@ def sync_tasks(city: str, operator: str) -> Dict[str, Any]:
         except Exception as exc:  # noqa: BLE001
             summary["errors"].append(f"删除任务「{task_id[:8]}」失败：{exc}")
             remaining_deletes.append(task_id)
+
+    # 若本轮从别处同步了任务元数据/删除，失效本机历史列表的应用状态缓存，
+    # 让前端刷新时立即看到最新状态
+    for task_id in changed_ids:
+        TaskManager._history_verify_cache.pop(task_id, None)
 
     save_state(
         tasks_pushed=sorted(pushed),

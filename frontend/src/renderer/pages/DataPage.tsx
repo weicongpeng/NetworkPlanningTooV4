@@ -755,6 +755,18 @@ export function DataPage() {
          const newFileId = result?.data?.newFileId;
          const newFileName = result?.data?.newFileName;
          const savedToOriginal = result?.data?.savedToOriginal;
+         // 合并统计（LTE/NR 匹配与新增行数）：让用户直观看到"确实更新进去了多少"
+         const stats = result?.data?.stats as Record<string, { matched?: number; appended?: number }> | null;
+         const statsLine = stats
+             ? Object.entries(stats)
+                 .map(([net, s]) => t('data.updateStatsNet', {
+                     net,
+                     matched: s?.matched ?? 0,
+                     appended: s?.appended ?? 0,
+                     defaultValue: `${net} 匹配 {{matched}} 行/新增 {{appended}} 行`,
+                 }))
+                 .join('，')
+             : '';
 
          // 轮询刷新列表，最多重试 5 次，确保新文件出现
          let newFileFound = false;
@@ -770,6 +782,7 @@ export function DataPage() {
          }
 
          if (result?.success || newFileFound) {
+             const statsSuffix = statsLine ? `\n${t('data.updateStatsSummary', { stats: statsLine, defaultValue: `更新统计：{{stats}}` })}` : ''
              if (savedToOriginal && newFileName) {
                  // 从列表中查找具有 originalPath 的文件以构造完整路径
                  const items = useDataStore.getState().items;
@@ -777,14 +790,12 @@ export function DataPage() {
                  if (matchedFile?.originalPath) {
                      const originalDir = matchedFile.originalPath.substring(0, matchedFile.originalPath.lastIndexOf('\\') + 1);
                      const fullPath = `${originalDir}${newFileName}`;
-                     setUpdateSuccess(`${t('data.updateSuccess') || '更新成功'}！${t('data.savedTo') || '已保存至：'}\n${fullPath}`)
-                 } else if (matchedFile?.originalPath) {
-                     setUpdateSuccess(`${t('data.updateSuccess') || '更新成功'}！${t('data.savedToSystemNoPath') || '文件已保存在系统内 (由于未记录原路径，无法写回原文件夹)，请手动下载。'}`)
+                     setUpdateSuccess(`${t('data.updateSuccess') || '更新成功'}！${t('data.savedTo') || '已保存至：'}\n${fullPath}${statsSuffix}`)
                  } else {
-                     setUpdateSuccess(`${t('data.updateSuccess') || '更新成功'}！${t('data.savedToSystem') || '文件已保存在系统内，请手动下载。'}`)
+                     setUpdateSuccess(`${t('data.updateSuccess') || '更新成功'}！${t('data.savedToSystem') || '文件已保存在系统内，请手动下载。'}${statsSuffix}`)
                  }
              } else {
-                 setUpdateSuccess(`${t('data.updateSuccess') || '更新成功'}！${t('data.savedToSystem') || '文件已保存在系统内，请手动下载。'}`)
+                 setUpdateSuccess(`${t('data.updateSuccess') || '更新成功'}！${t('data.savedToSystem') || '文件已保存在系统内，请手动下载。'}${statsSuffix}`)
              }
 
              setSelectedFullParamId('')

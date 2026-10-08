@@ -3241,6 +3241,25 @@ class TaskManager:
         finally:
             db.close()
 
+    def count_shared_tasks(self, city: str, operator: str) -> int:
+        """组内共享任务总数：清单被 LIMIT 截断时，桌面端据此避免误删本地镜像。"""
+        from app.core.database import SessionLocal
+        from app.models.database import TaskResult
+
+        db = SessionLocal()
+        try:
+            return int(
+                db.query(TaskResult)
+                .filter(
+                    TaskResult.task_type.in_(self.SHARED_TASK_TYPES),
+                    TaskResult.city == city,
+                    TaskResult.operator == operator,
+                )
+                .count()
+            )
+        finally:
+            db.close()
+
     def get_shared_task_result(self, task_id: str, city: str, operator: str) -> Optional[Dict]:
         """读取组内某任务的结果（组不符或结果缺失返回 None）。"""
         from app.core.database import SessionLocal
@@ -3465,9 +3484,16 @@ class TaskManager:
 
                 # 🔥 优化：批量预取缓存未命中的 result_json（一次查询），
                 # 避免 defer 懒加载在循环中逐条触发 SELECT
+                # 缓存键还包含"已应用"标记：桌面端镜像任务由同步改写该标记，
+                # 标记变化时必须重算（否则跨端应用状态永远显示旧值）
                 miss_ids = [
                     r.task_id for r in results
-                    if not (TaskManager._history_verify_cache.get(r.task_id) and TaskManager._history_verify_cache[r.task_id][0] == full_params_id)
+                    if not (
+                        TaskManager._history_verify_cache.get(r.task_id)
+                        and TaskManager._history_verify_cache[r.task_id][0] == full_params_id
+                        and len(TaskManager._history_verify_cache[r.task_id]) > 3
+                        and TaskManager._history_verify_cache[r.task_id][3] == bool(r.is_applied)
+                    )
                 ]
                 miss_result_map: Dict[str, Optional[str]] = {}
                 if miss_ids:
@@ -3478,11 +3504,15 @@ class TaskManager:
                 for r in results:
                     # 动态检查：对比任务规划结果与当前全量工参的实际 PCI/TAC 值
                     # 如果一致则视为已应用（即使标记为未应用），如果不一致则视为未应用（即使标记为已应用）
+                    # 桌面端镜像任务（result_json 未落地本机）无法动态比对，回退到同组同步来的
+                    # is_applied 标记 —— 否则网页端应用过的结果在桌面端永远显示"未应用"。
+                    stored_applied = bool(getattr(r, "is_applied", 0))
                     is_applied = False
                     result_summary = None
-                    # 缓存命中（同任务 + 同工参版本）：跳过大 result_json 的 json.loads
+                    # 缓存命中（同任务 + 同工参版本 + 同应用标记）：跳过大 result_json 的 json.loads
                     cached = TaskManager._history_verify_cache.get(r.task_id)
-                    if cached and cached[0] == full_params_id:
+                    if (cached and cached[0] == full_params_id
+                            and len(cached) > 3 and cached[3] == stored_applied):
                         is_applied = cached[1]
                         result_summary = cached[2]
                     else:
@@ -3495,8 +3525,12 @@ class TaskManager:
                                 parsed_result = None
                             if parsed_result is not None:
                                 is_applied = self._verify_applied(parsed_result, current_sector_values)
+                        # 动态比对不成立但同组有人标记过"已应用"（Desktop 端同步/网页端标记）时，
+                        # 以标记为准，保证跨端一致
+                        is_applied = is_applied or stored_applied
                         result_summary = self._extract_result_summary(parsed_result)
-                        TaskManager._history_verify_cache[r.task_id] = (full_params_id, is_applied, result_summary)
+                        TaskManager._history_verify_cache[r.task_id] = (
+                            full_params_id, is_applied, result_summary, stored_applied)
                         # 防止缓存无限增长
                         if len(TaskManager._history_verify_cache) > TaskManager._history_verify_cache_max:
                             TaskManager._history_verify_cache.clear()

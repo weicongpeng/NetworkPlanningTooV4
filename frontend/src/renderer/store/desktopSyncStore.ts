@@ -39,7 +39,11 @@ export const useDesktopSyncStore = create<DesktopSyncState>((set, get) => ({
           next.last_sync_at !== prev.last_sync_at
         ) {
           const r = next.last_result || {}
-          const moved = (r.pulled || 0) + (r.pushed || 0) + (r.deleted || 0)
+          // 数据集变更 + 同组任务历史变更（镜像新增/上行/删除/应用标记更新）都要通知页面
+          const t = r.tasks || {}
+          const moved =
+            (r.pulled || 0) + (r.pushed || 0) + (r.deleted || 0) +
+            (t.pulled || 0) + (t.pushed || 0) + (t.deleted || 0) + (t.updated || 0)
           if (moved > 0) {
             useToastStore.getState().show(`数据已同步（${moved} 项）`)
             window.dispatchEvent(new CustomEvent(DESKTOP_SYNCED_EVENT, { detail: r }))

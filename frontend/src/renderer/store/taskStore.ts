@@ -395,6 +395,30 @@ export const useTaskStore = create<TaskState>()(
               }
             }
 
+            // 跨端删除：同组其他端删掉的历史记录，本机缓存要同步移除。
+            // 列表按创建时间倒序分页，"比本页最早一条更新、却不在本页响应里"的任务
+            // 只可能已被删除（否则必然排在本页内），可从本地安全剔除。
+            // 运行中/正在查看（activeTaskIds）的任务保留，避免打断进行中的流程。
+            const responseIds = new Set<string>(
+              historyTasks.map((ht: any) => ht.taskId).filter(Boolean)
+            )
+            let boundaryTime: number | null = null
+            for (const ht of historyTasks) {
+              if (!ht?.createdAt) continue
+              const t = new Date(ht.createdAt).getTime()
+              if (!Number.isNaN(t) && (boundaryTime === null || t < boundaryTime)) boundaryTime = t
+            }
+            if (boundaryTime !== null) {
+              const activeId = state.activeTaskIds?.[type] ?? null
+              for (const [id, task] of Object.entries(merged)) {
+                if (task.type !== type || responseIds.has(id)) continue
+                if (task.status === 'running' || id === activeId) continue
+                if (typeof task.startTime === 'number' && task.startTime >= boundaryTime) {
+                  delete merged[id]
+                }
+              }
+            }
+
             // 合并后端返回的历史任务
             for (const ht of historyTasks) {
               const id = ht.taskId
