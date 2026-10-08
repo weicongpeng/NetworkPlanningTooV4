@@ -177,6 +177,15 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning(f"⚠️ 启动桌面数据同步任务失败: {e}")
 
+    # 桌面模式：同组数据变更即时监听（服务器长轮询 → 立刻同步，定时同步仅作兜底）
+    if settings.NPT_DESKTOP:
+        try:
+            import asyncio
+            from app.services.desktop_sync_service import watch_loop
+            asyncio.create_task(watch_loop())
+        except Exception as e:
+            logger.warning(f"⚠️ 启动桌面数据变更监听失败: {e}")
+
     # 桌面模式：登录态守卫（同一账号在别处登录 → 本机自动登出）
     if settings.NPT_DESKTOP:
         try:

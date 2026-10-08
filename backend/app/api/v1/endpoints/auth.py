@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.core.database import get_db
 from app.core.security import get_current_user, get_token_jti
 from app.models.database import User
@@ -144,9 +145,16 @@ async def logout(
     jti: str | None = Depends(get_token_jti),
     db: Session = Depends(get_db),
 ):
-    """退出登录"""
+    """退出登录（桌面形态下同时结束服务器侧的会话，避免管理员侧显示"仍在线"）"""
     if jti:
         auth_service.end_session(db, jti)
+    if settings.NPT_DESKTOP:
+        try:
+            from app.api.v1.endpoints.desktop_local import notify_server_logout
+
+            notify_server_logout()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[DesktopAuth] 桌面端登出清理失败（忽略）：{exc}")
     return {"success": True, "message": "已退出登录"}
 
 

@@ -60,7 +60,7 @@ def ota(tmp_path, monkeypatch):
     )
 
 
-def _upload(ota, version="1.0.0", channel="stable", chunk_size=4096, mandatory=False):
+def _upload(ota, version="1.0.0", channel="stable", chunk_size=4096):
     client = ota.client
     total_chunks = (len(PAYLOAD) + chunk_size - 1) // chunk_size
     start = client.post(
@@ -84,7 +84,6 @@ def _upload(ota, version="1.0.0", channel="stable", chunk_size=4096, mandatory=F
             "version": version,
             "channel": channel,
             "release_notes": "测试版本",
-            "mandatory": str(mandatory).lower(),
             "is_latest": "true",
         },
     )
@@ -232,10 +231,10 @@ def test_update_release_fields(ota):
     data = _upload(ota, version="1.0.0", channel="stable")
     resp = ota.client.put(
         f"/api/v1/desktop-releases/{data['id']}",
-        data={"version": "1.0.1", "channel": "beta", "release_notes": "改", "mandatory": "true"},
+        data={"version": "1.0.1", "channel": "beta", "release_notes": "改"},
     )
     assert resp.status_code == 200
     updated = resp.json()["data"]
     assert updated["version"] == "1.0.1"
     assert updated["channel"] == "beta"
-    assert updated["mandatory"] is True
+    assert updated["release_notes"] == "改"

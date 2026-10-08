@@ -384,7 +384,6 @@ export const desktopReleasesApi = {
     const version = (formData.get('version') as string) || ''
     const channel = (formData.get('channel') as string) || 'stable'
     const releaseNotes = (formData.get('release_notes') as string) || ''
-    const mandatory = formData.get('mandatory') === 'true'
     const isLatest = formData.get('is_latest') !== 'false'
 
     if (!file) throw new Error('请选择安装包文件')
@@ -428,7 +427,6 @@ export const desktopReleasesApi = {
     completeForm.append('version', version)
     completeForm.append('channel', channel)
     completeForm.append('release_notes', releaseNotes)
-    completeForm.append('mandatory', mandatory ? 'true' : 'false')
     completeForm.append('is_latest', isLatest ? 'true' : 'false')
 
     let authToken = ''
@@ -444,13 +442,12 @@ export const desktopReleasesApi = {
 
   update: async (
     id: number,
-    data: { version?: string; channel?: string; release_notes?: string; mandatory?: boolean; is_latest?: boolean },
+    data: { version?: string; channel?: string; release_notes?: string; is_latest?: boolean },
   ) => {
     const form = new FormData()
     if (data.version !== undefined) form.append('version', data.version)
     if (data.channel !== undefined) form.append('channel', data.channel)
     if (data.release_notes !== undefined) form.append('release_notes', data.release_notes)
-    if (data.mandatory !== undefined) form.append('mandatory', data.mandatory ? 'true' : 'false')
     if (data.is_latest !== undefined) form.append('is_latest', data.is_latest ? 'true' : 'false')
     return apiClient.put(`/desktop-releases/${id}`, form)
   },
@@ -474,9 +471,6 @@ export const desktopUpdateApi = {
   },
   progress: async (): Promise<ApiResponse<{ phase: string; downloaded: number; total: number; error?: string }>> => {
     return apiClient.get('/desktop/update/progress')
-  },
-  snooze: async (version: string): Promise<ApiResponse<{ count: number; max: number; force: boolean }>> => {
-    return apiClient.post('/desktop/update/snooze', { version })
   },
   install: async (): Promise<ApiResponse<{ exiting: boolean; message: string }>> => {
     return apiClient.post('/desktop/update/install')

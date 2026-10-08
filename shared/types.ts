@@ -67,7 +67,6 @@ export interface DesktopReleaseInfo {
   file_size_display?: string
   sha256?: string | null
   release_notes?: string | null
-  mandatory: boolean
   is_latest: boolean
   download_count: number
   created_by?: string | null
@@ -126,12 +125,10 @@ export interface DesktopUpdateStatus {
     file_size?: number
     file_size_display?: string
     sha256?: string
-    mandatory: boolean
     release_notes?: string | null
     published_at?: string
     update_available: boolean
     download_url: string
-    snooze?: { count: number; max: number; force: boolean }
   } | null
   download: {
     phase: 'idle' | 'downloading' | 'ready' | 'failed'

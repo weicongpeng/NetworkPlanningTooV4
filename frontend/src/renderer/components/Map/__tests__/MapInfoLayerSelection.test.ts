@@ -170,6 +170,52 @@ describe('MapInfoLayer 圈选后的专题配色保持', () => {
   })
 })
 
+describe('MapInfoLayer 圈选后保留文件自带配色', () => {
+  // 回归：_applyFeatureStyle 曾只读图层级 style.point，漏掉要素自带的 _style，
+  // 圈选后所有未选中点被刷成默认橙（#f59e0b）+ 黑边（color 兜到 'none'）
+  let fileStyleLayer: MapInfoLayer
+
+  beforeAll(async () => {
+    fileStyleLayer = await MapInfoLayer.fromGeoJSON({
+      id: 'file-style-layer',
+      name: '自带配色图层',
+      type: 'point',
+      dataId: 'data-4',
+      data: {
+        type: 'FeatureCollection',
+        features: [
+          makePoint(110.0, 20.0, { name: 'ptA', _style: { fillColor: '#00ff00', color: '#0000ff' } }),
+          makePoint(110.01, 20.01, { name: 'ptB', _style: { fillColor: '#00ff00', color: '#0000ff' } }),
+        ],
+      } as any,
+    })
+  })
+
+  function findPoint(name: string): any {
+    let found: any = null
+    fileStyleLayer.getLeafletLayer()!.eachLayer((l: any) => {
+      if (l.feature?.properties?.name === name) found = l
+    })
+    return found
+  }
+
+  it('未配置图层级样式时点要素用文件自带配色', () => {
+    expect(findPoint('ptA').options.fillColor).toBe('#00ff00')
+    expect(findPoint('ptA').options.color).toBe('#0000ff')
+  })
+
+  it('圈选后未选中点仍是文件自带配色（橙底黑边即为回归）', () => {
+    fileStyleLayer.setSelectionHighlight(new Set(['ptA']))
+    expect(findPoint('ptA').options.color).toBe('#ef4444') // 选中：红色描边高亮
+    expect(findPoint('ptB').options.fillColor).toBe('#00ff00')
+    expect(findPoint('ptB').options.color).toBe('#0000ff')
+
+    fileStyleLayer.setSelectionHighlight(null)
+    expect(findPoint('ptA').options.fillColor).toBe('#00ff00')
+    expect(findPoint('ptA').options.color).toBe('#0000ff')
+  })
+})
+
 describe('MapInfoLayer 标签严格按所选字段', () => {
   let labelLayer: MapInfoLayer
 

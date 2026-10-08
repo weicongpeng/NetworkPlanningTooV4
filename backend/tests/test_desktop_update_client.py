@@ -52,7 +52,6 @@ def updater_env(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "NPT_SERVER_URL", f"http://127.0.0.1:{server.server_port}")
     monkeypatch.setattr(settings, "NPT_DESKTOP_VERSION", "0.0.0-dev-old")
     monkeypatch.setattr(settings, "NPT_DESKTOP_CHANNEL", "stable")
-    monkeypatch.setattr(settings, "NPT_DESKTOP_MAX_SNOOZE", 3)
 
     updater._state.update(
         phase="idle", version=None, downloaded=0, total=0, error=None, installer=None, sha256=None
@@ -69,7 +68,6 @@ def _release(**overrides):
         "sha256": SHA,
         "file_size": len(PAYLOAD),
         "download_url": "/api/v1/desktop-cloud/releases/download/1",
-        "mandatory": False,
     }
     data.update(overrides)
     return data
@@ -125,18 +123,6 @@ def test_check_latest_offline_raises_only_when_asked(updater_env):
     assert updater_env.updater.check_latest() is None
     with pytest.raises(CloudError):
         updater_env.updater.check_latest(raise_on_error=True)
-
-
-def test_snooze_forces_after_limit(updater_env):
-    updater = updater_env.updater
-    assert updater.snooze_state("1.0.0")["count"] == 0
-    for expected in (1, 2):
-        result = updater.snooze("1.0.0")
-        assert result["count"] == expected and result["force"] is False
-    result = updater.snooze("1.0.0")
-    assert result["count"] == 3 and result["force"] is True
-    # 不同版本独立计数
-    assert updater.snooze_state("1.1.0")["count"] == 0
 
 
 def test_install_requires_ready_package(updater_env):

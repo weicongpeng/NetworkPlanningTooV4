@@ -159,7 +159,6 @@ async def chunked_complete(
     version: str = Form(...),
     channel: str = Form(default="stable"),
     release_notes: str = Form(default=""),
-    mandatory: bool = Form(default=False),
     is_latest: bool = Form(default=True),
     admin_user: User = Depends(get_current_admin_user),
     db: Session = Depends(get_db),
@@ -206,7 +205,6 @@ async def chunked_complete(
         file_size=final_path.stat().st_size,
         sha256=sha256,
         release_notes=(release_notes or "").strip() or None,
-        mandatory=bool(mandatory),
         is_latest=bool(is_latest),
         created_by=admin_user.username,
         created_at=_now_iso(),
@@ -229,7 +227,6 @@ async def update_release(
     version: Optional[str] = Form(default=None),
     channel: Optional[str] = Form(default=None),
     release_notes: Optional[str] = Form(default=None),
-    mandatory: Optional[bool] = Form(default=None),
     is_latest: Optional[bool] = Form(default=None),
     admin_user: User = Depends(get_current_admin_user),
     db: Session = Depends(get_db),
@@ -243,8 +240,6 @@ async def update_release(
         record.channel = channel.strip()
     if release_notes is not None:
         record.release_notes = release_notes.strip() or None
-    if mandatory is not None:
-        record.mandatory = bool(mandatory)
     if is_latest is not None:
         record.is_latest = bool(is_latest)
     record.updated_at = _now_iso()

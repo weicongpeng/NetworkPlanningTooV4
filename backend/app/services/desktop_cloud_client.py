@@ -154,6 +154,28 @@ def sync_manifest() -> Dict[str, Any]:
     return resp.get("data") or {}
 
 
+def wait_change(since: Optional[str], timeout: int = 25) -> Dict[str, Any]:
+    """长轮询本组数据变更：指纹变化立刻返回，否则挂起到 timeout 秒。
+
+    返回 {"fingerprint": str, "changed": bool}；网络不可达时抛 CloudError（调用方
+    按"下一次再试"处理，定时同步仍会兜底）。
+    """
+    from app.utils.machine_code import get_machine_code
+
+    resp = _request(
+        "POST",
+        "/desktop-cloud/data/changes",
+        {
+            "license_file": _license_file_text(),
+            "machine_code": get_machine_code(),
+            "since": since or "",
+            "wait_seconds": int(timeout),
+        },
+        timeout=int(timeout) + 15,
+    )
+    return resp.get("data") or {}
+
+
 def download_package(data_id: str, destdir: Optional[Path] = None) -> Path:
     """下载数据集整包，返回 zip 路径（位于专用临时目录，调用方负责清理）。"""
     import shutil
@@ -436,6 +458,35 @@ def session_check(session_jti: str) -> Dict[str, Any]:
     except CloudError as exc:
         return {"valid": True, "offline": True, "reason": exc.message}
     return resp.get("data") or {}
+
+
+def logout(session_jti: str) -> bool:
+    """退出登录时通知服务器：结束本次登录占用的会话，使管理员侧立即显示离线。
+
+    网络不可达/服务器拒绝时返回 False —— 本机登出不能被它阻塞（服务器会话随后
+    会因心跳停止、5 分钟活跃窗口过期而自动离线）。
+    """
+    from app.utils.machine_code import get_machine_code
+
+    jti = (session_jti or "").strip()
+    if not jti:
+        return False
+    try:
+        resp = _request(
+            "POST",
+            "/desktop-cloud/auth/logout",
+            {
+                "license_file": _license_file_text(),
+                "machine_code": get_machine_code(),
+                "session_jti": jti,
+            },
+            timeout=8,
+        )
+    except CloudError:
+        return False
+    except Exception:  # noqa: BLE001
+        return False
+    return bool((resp.get("data") or {}).get("ended"))
 
 
 def poll_login(username: str) -> Dict[str, Any]:

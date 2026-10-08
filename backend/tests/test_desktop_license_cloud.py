@@ -23,6 +23,16 @@ MACHINE_A = "AAAA-BBBB-CCCC-DDDD"
 MACHINE_B = "1111-2222-3333-4444"
 
 
+@pytest.fixture(autouse=True)
+def _reset_rate_limit():
+    """限流桶是模块级字典，跨用例累计会把后续用例顶到 429。"""
+    from app.api.v1.endpoints import desktop_cloud
+
+    desktop_cloud._rl_buckets.clear()
+    yield
+    desktop_cloud._rl_buckets.clear()
+
+
 @pytest.fixture()
 def cloud_env(tmp_path, monkeypatch):
     """临时 SQLite + 临时 Ed25519 密钥对 + 最小 FastAPI 应用。"""
@@ -339,3 +349,85 @@ def test_renew_requires_matching_machine(cloud_env):
         json={"license_file": license_file, "machine_code": MACHINE_B},
     )
     assert resp.status_code == 409
+
+
+def test_logout_ends_desktop_session(cloud_env):
+    """桌面端退出必须结束服务器会话，否则「用户管理」一直显示在线。"""
+    from app.models.database import UserSession
+    from app.services.auth_service import auth_service
+
+    client = cloud_env.client
+    license_file = _activate(client, _create(client)["activation_code"]).json()["data"]["license_file"]
+
+    db = cloud_env.session_factory()
+    try:
+        user, _ = auth_service.create_user(
+            db=db, username="desktop_user", password="pass1234", is_admin=False,
+            city="广州", operator="移动",
+        )
+        auth_service.record_session(db, user.id, "jti-desktop-1", "127.0.0.1", "desktop")
+    finally:
+        db.close()
+
+    def _logout(jti):
+        return client.post(
+            "/api/v1/desktop-cloud/auth/logout",
+            json={"license_file": license_file, "machine_code": MACHINE_A, "session_jti": jti},
+        )
+
+    resp = _logout("jti-desktop-1")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["data"]["ended"] is True
+
+    db = cloud_env.session_factory()
+    try:
+        session = db.query(UserSession).filter(UserSession.token_jti == "jti-desktop-1").first()
+        assert session.logout_time is not None
+    finally:
+        db.close()
+
+    # 幂等：重复退出与错误 jti 都不报错
+    assert _logout("jti-desktop-1").json()["data"]["ended"] is False
+    assert _logout("not-exist").json()["data"]["ended"] is False
+
+
+def test_data_changes_reports_group_change(cloud_env):
+    """长轮询：无变化返回原指纹，同组写入后立刻报 changed。"""
+    from app.services import dataset_revision_service as revs
+    from app.services.data_service import data_service
+
+    client = cloud_env.client
+    record = _create(client)
+    license_file = _activate(client, record["activation_code"]).json()["data"]["license_file"]
+
+    db = cloud_env.session_factory()
+    try:
+        from app.models.database import DesktopLicense
+
+        row = db.query(DesktopLicense).filter(DesktopLicense.id == record["id"]).first()
+        row.city, row.operator = "广州", "移动"
+        db.commit()
+    finally:
+        db.close()
+
+    cred = {"license_file": license_file, "machine_code": MACHINE_A}
+    resp = client.post("/api/v1/desktop-cloud/data/changes", json={**cred, "wait_seconds": 0})
+    assert resp.status_code == 200, resp.text
+    baseline = resp.json()["data"]
+    assert baseline["changed"] is False and baseline["fingerprint"]
+
+    data_service.index["ds-test-1"] = {
+        "name": "测试工参", "city": "广州", "operator": "移动", "type": "workbook",
+    }
+    try:
+        revs.bump("ds-test-1", city="广州", operator="移动")
+        resp = client.post(
+            "/api/v1/desktop-cloud/data/changes",
+            json={**cred, "since": baseline["fingerprint"], "wait_seconds": 0},
+        )
+        data = resp.json()["data"]
+        assert data["changed"] is True
+        assert data["fingerprint"] != baseline["fingerprint"]
+    finally:
+        data_service.index.pop("ds-test-1", None)
+        revs.remove("ds-test-1")

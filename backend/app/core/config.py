@@ -126,12 +126,10 @@ class Settings(BaseSettings):
     NPT_DESKTOP_CHANNEL: str = "stable"
     # 客户端构建版本（launcher 从打包内的 version.json 注入）
     NPT_DESKTOP_VERSION: str = ""
-    # 桌面版允许点"稍后"的次数（超过后强制更新）
-    NPT_DESKTOP_MAX_SNOOZE: int = 3
-    # 共享模式后台同步轮询间隔（分钟）：轮询只比对修订号，有变化才整包同步
+    # 共享模式后台同步轮询间隔（分钟）：兜底用，正常由 /data/changes 长轮询即时触发
     NPT_DESKTOP_SYNC_INTERVAL_MINUTES: int = 1
     # 本地数据改动后触发上行的防抖秒数（连续写入只同步一次）
-    NPT_DESKTOP_SYNC_DEBOUNCE_SECONDS: int = 3
+    NPT_DESKTOP_SYNC_DEBOUNCE_SECONDS: int = 1
 
     # 地图默认配置
     DEFAULT_MAP_CENTER: tuple = (39.9042, 116.4074)  # 北京

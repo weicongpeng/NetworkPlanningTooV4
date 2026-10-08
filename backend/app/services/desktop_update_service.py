@@ -5,7 +5,7 @@
   再通过 desktop_bridge.request_exit() 退出应用；
   脚本等待应用退出（有上限，超时 taskkill 兜底）→ 静默安装 → 拉起新版本，
   因此应用侧退出失败也不会让安装永久卡住
-- 稍后次数记录在 cloud_state.json（同一版本最多 NPT_DESKTOP_MAX_SNOOZE 次）
+- 不设强制更新：新版本只提示，用户可随时关闭，下次按间隔（1 天 2 次）再提示
 """
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ from typing import Any, Dict, Optional
 
 from app.core.config import settings
 from app.services import desktop_cloud_client as cloud
-from app.services.desktop_cloud_client import CloudError, load_state, save_state
+from app.services.desktop_cloud_client import CloudError
 
 _log = logging.getLogger("desktop.update")
 
@@ -49,27 +49,6 @@ def _updates_dir() -> Path:
     return path
 
 
-def max_snooze() -> int:
-    return int(os.environ.get("NPT_DESKTOP_MAX_SNOOZE") or settings.NPT_DESKTOP_MAX_SNOOZE or 3)
-
-
-def snooze_state(version: str) -> Dict[str, Any]:
-    state = load_state()
-    snoozed = dict(state.get("snoozed") or {})
-    count = int(snoozed.get(version or "", 0))
-    limit = max_snooze()
-    return {"version": version, "count": count, "max": limit, "force": count >= limit}
-
-
-def snooze(version: str) -> Dict[str, Any]:
-    state = load_state()
-    snoozed = dict(state.get("snoozed") or {})
-    key = version or ""
-    snoozed[key] = int(snoozed.get(key, 0)) + 1
-    save_state(snoozed=snoozed)
-    return snooze_state(version)
-
-
 def check_latest(raise_on_error: bool = False) -> Optional[Dict[str, Any]]:
     """查询服务器最新版本；未配置/网络不可用返回 None（不抛错）。
 
@@ -88,7 +67,6 @@ def check_latest(raise_on_error: bool = False) -> Optional[Dict[str, Any]]:
     data = resp.get("data")
     if not data:
         return None
-    data["snooze"] = snooze_state(str(data.get("version")))
     data["current"] = current
     return data
 

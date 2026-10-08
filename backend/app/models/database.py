@@ -440,7 +440,7 @@ class DesktopRelease(Base):
     file_size = Column(Integer, nullable=True)
     sha256 = Column(String(64), nullable=True)
     release_notes = Column(Text, nullable=True)
-    mandatory = Column(Boolean, nullable=False, default=False)
+    # 强制更新已下线（新版本只提示、可关闭）；列保留仅因 SQLite 不便下线，不再读写
     is_latest = Column(Boolean, nullable=False, default=False)
     download_count = Column(Integer, nullable=True, default=0)
     created_by = Column(String(100), nullable=True)
@@ -457,7 +457,6 @@ class DesktopRelease(Base):
             "file_size": self.file_size,
             "sha256": self.sha256,
             "release_notes": self.release_notes,
-            "mandatory": bool(self.mandatory),
             "is_latest": bool(self.is_latest),
             "download_count": self.download_count or 0,
             "created_by": self.created_by,

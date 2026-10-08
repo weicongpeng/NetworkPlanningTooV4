@@ -324,6 +324,22 @@ def _force_local_logout(reason: str) -> None:
     print(f"[DesktopAuth] {reason or '该账号已在其它设备登录'}，本机已退出登录")
 
 
+def notify_server_logout() -> None:
+    """桌面端退出登录：通知服务器结束会话，并清掉本机保存的云端会话标识。
+
+    两步缺一不可——只清本机标识，服务器那条 client_type='desktop' 会话仍会被
+    心跳刷新；只通知服务器不清标识，本机心跳还会继续把它刷回来。结果都是管理员
+    「用户管理」看到「已退出却仍在线」。全程尽力而为：网络不可达也不能阻断本机登出。
+    """
+    jti = (cloud.load_state().get("session_jti") or "").strip()
+    if jti:
+        try:
+            cloud.logout(jti)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[DesktopAuth] 通知服务器退出登录失败（忽略）：{exc}")
+    cloud.clear_state("session_jti", "local_jti", "kicked", "kicked_reason")
+
+
 # 单机模式本地凭据有效时，服务器登录只给这么长的探测时间（超时即离线登录）
 STANDALONE_ONLINE_PROBE_SECONDS = 4
 
@@ -959,17 +975,6 @@ async def update_progress(
     from app.services import desktop_update_service as updater
 
     return {"success": True, "data": updater.progress()}
-
-
-@router.post("/update/snooze")
-def update_snooze(
-    payload: UpdateRequest,
-    current_user: User = Depends(get_current_user),
-    _: None = Depends(_require_desktop),
-) -> Dict[str, Any]:
-    from app.services import desktop_update_service as updater
-
-    return {"success": True, "data": updater.snooze(payload.version or "")}
 
 
 @router.post("/update/install")

@@ -569,72 +569,16 @@ export class MapInfoLayer {
       renderer: canvasRenderer,
       // 点要素样式
       pointToLayer: (feature: any, latLng: L.LatLng) => {
-        // 获取 feature 级别的样式（如果存在）
-        // 合并优先级：默认样式 < 要素样式(_style，扁平结构，含 markerSymbol/markerColor/markerSize)
-        //                 < 图层级用户设置(style.point) < 专题图层设置(优先)
-        const featureStyle = (feature.properties as any)?._style || {}
-        const pointStyle = { ...DEFAULT_STYLES.point, ...featureStyle, ...mapInfoLayer.style.point }
-
-        // 要素级编辑样式（用户绘制/配置的 _editStyle）优先于图层默认与图层级设置
-        const es = editStyleForKind(feature.properties, 'point')
-        if (es) {
-          if (es.markerColor) {
-            pointStyle.markerColor = es.markerColor
-            pointStyle.fillColor = es.markerColor
-          }
-          if (es.borderColor) pointStyle.color = es.borderColor
-          if (es.markerShape) pointStyle.markerSymbol = es.markerShape
-          // 编辑样式 markerSize 为图标直径；MapInfoLayer 约定 markerSize 为半径（iconPx = 半径×2）
-          if (es.markerSize !== undefined) pointStyle.markerSize = Number(es.markerSize) / 2
-        }
-
-        // 专题启用：按字段值配色，点大小用图形大小设置
-        const thematicColor = mapInfoLayer._thematicColor(feature)
-        if (thematicColor) {
-          pointStyle.markerColor = thematicColor
-          pointStyle.fillColor = thematicColor
-          pointStyle.color = thematicColor
-        }
-
-        const markerSize = (thematicColor && mapInfoLayer.thematicSettings?.pointSize)
-          ? mapInfoLayer.thematicSettings.pointSize
-          : (pointStyle.markerSize || pointStyle.radius || 6)
-        const markerColorRaw = pointStyle.markerColor || pointStyle.fillColor || '#f59e0b'
-        // 无色（镂空）：fill:false 仅显示描边；形状图标无法表达镂空，统一回退 circleMarker
-        const noFill = markerColorRaw === NO_FILL_COLOR
-        const markerColor = noFill ? '#f59e0b' : markerColorRaw
-        // 边框色：专题边框色优先，'none'（无色）→ 不描边；专题填充无色且未设边框色时
-        // 回退基础边框色（镂空也要有边框）；非专题用基础边框色（缺省为无色哨兵，不画白边），
-        // 'none' 同样不描边
-        let strokeColor: string
-        let noStroke = false
-        const thematicBorderColor = mapInfoLayer.thematicSettings?.borderColor
-        if (thematicColor) {
-          if (thematicBorderColor === NO_FILL_COLOR) {
-            noStroke = true
-            strokeColor = '#000000'
-          } else if (thematicBorderColor) {
-            strokeColor = thematicBorderColor
-          } else {
-            strokeColor = thematicColor === NO_FILL_COLOR
-              ? (pointStyle.color && pointStyle.color !== NO_FILL_COLOR ? pointStyle.color : '#fff')
-              : thematicColor
-          }
-        } else {
-          noStroke = pointStyle.color === NO_FILL_COLOR
-          strokeColor = noStroke ? '#000000' : (pointStyle.color || NO_FILL_COLOR)
-        }
+        const point = mapInfoLayer._resolvePointStyle(feature)
 
         // 还原点形状（MapInfo Symbol 编号 / 形状名）：仅**非圆形**形状用 L.marker + SVG 图标，
         // 圆形与无形状信息一样走 circleMarker —— SVG 图标是 DOM 渲染，上万点的图层缩放/平移会卡，
-        // 而圆形用 Canvas 圆点视觉等价（与 LayerEditSession 的 circle 处理一致）。
-        // 从 pointStyle 取（合并了 _editStyle 覆盖），保证编辑样式设置的形状（如方形）生效
-        const shapeName = resolvePointShape(pointStyle.markerSymbol)
-        const iconShape = shapeName && shapeName !== 'circle' ? shapeName : null
-        if (iconShape && !noFill) {
-          const iconPx = Math.max(12, Math.min(36, Math.round(markerSize * 2)))
+        // 而圆形用 Canvas 圆点视觉等价（与 LayerEditSession 的 circle 处理一致）
+        const iconShape = point.shapeName && point.shapeName !== 'circle' ? point.shapeName : null
+        if (iconShape && !point.noFill) {
+          const iconPx = Math.max(12, Math.min(36, Math.round(point.markerSize * 2)))
           const icon = L.icon({
-            iconUrl: pointShapeIconDataUri(iconShape, markerColor, noStroke ? 'none' : strokeColor),
+            iconUrl: pointShapeIconDataUri(iconShape, point.markerColor, point.noStroke ? 'none' : point.strokeColor),
             iconSize: [iconPx, iconPx],
             iconAnchor: [iconPx / 2, iconPx / 2]
           })
@@ -646,18 +590,16 @@ export class MapInfoLayer {
 
         return L.circleMarker(latLng, {
           renderer: canvasRenderer,
-          radius: markerSize,
-          fill: !noFill,
-          fillColor: markerColor,
+          radius: point.markerSize,
+          fill: !point.noFill,
+          fillColor: point.markerColor,
           // 边框颜色/填充透明度：专题启用时用专题设置（缺省回退专题色/基础样式）；
           // 边框色为无色哨兵时 stroke:false 不描边
-          stroke: !noStroke,
-          color: strokeColor,
-          weight: pointStyle.weight || 2,
-          opacity: pointStyle.opacity || 1,
-          fillOpacity: thematicColor
-            ? (mapInfoLayer.thematicSettings?.fillOpacity ?? pointStyle.fillOpacity ?? 0.8)
-            : (pointStyle.fillOpacity || 0.8)
+          stroke: !point.noStroke,
+          color: point.strokeColor,
+          weight: point.weight,
+          opacity: point.opacity,
+          fillOpacity: point.fillOpacity
         })
       },
 
@@ -901,6 +843,94 @@ export class MapInfoLayer {
   }
 
   /**
+   * 解析一个点要素当前应显示的完整配色（专题优先、基础次之）。
+   *
+   * 创建（pointToLayer）与恢复（_applyFeatureStyle）必须共用同一份解析结果：
+   * 早期两处各算一遍且恢复侧漏掉了要素自带配色（_style）与要素级编辑样式
+   * （_editStyle），导致圈选后「未选中」的点被刷成橙色 + 黑边。
+   */
+  private _resolvePointStyle(feature: any): {
+    markerSize: number
+    markerColor: string
+    strokeColor: string
+    noFill: boolean
+    noStroke: boolean
+    shapeName: string | null
+    weight: number
+    opacity: number
+    fillOpacity: number
+  } {
+    // 合并优先级：默认样式 < 要素样式(_style，扁平结构，含 markerSymbol/markerColor/markerSize)
+    //                 < 图层级用户设置(style.point)
+    const featureStyle = (feature?.properties as any)?._style || {}
+    const pointStyle: any = { ...DEFAULT_STYLES.point, ...featureStyle, ...this.style.point }
+
+    // 要素级编辑样式（用户绘制/配置的 _editStyle）优先于图层默认与图层级设置
+    const es = editStyleForKind(feature?.properties, 'point')
+    if (es) {
+      if (es.markerColor) {
+        pointStyle.markerColor = es.markerColor
+        pointStyle.fillColor = es.markerColor
+      }
+      if (es.borderColor) pointStyle.color = es.borderColor
+      if (es.markerShape) pointStyle.markerSymbol = es.markerShape
+      // 编辑样式 markerSize 为图标直径；MapInfoLayer 约定 markerSize 为半径（iconPx = 半径×2）
+      if (es.markerSize !== undefined) pointStyle.markerSize = Number(es.markerSize) / 2
+    }
+
+    // 专题启用：按字段值配色，点大小用图形大小设置
+    const thematicColor = this._thematicColor(feature)
+    if (thematicColor) {
+      pointStyle.markerColor = thematicColor
+      pointStyle.fillColor = thematicColor
+      pointStyle.color = thematicColor
+    }
+
+    const markerSize = (thematicColor && this.thematicSettings?.pointSize)
+      ? this.thematicSettings.pointSize
+      : (pointStyle.markerSize || pointStyle.radius || 6)
+    const markerColorRaw = pointStyle.markerColor || pointStyle.fillColor || '#f59e0b'
+    // 无色（镂空）：fill:false 仅显示描边；形状图标无法表达镂空，统一回退 circleMarker
+    const noFill = markerColorRaw === NO_FILL_COLOR
+    const markerColor = noFill ? '#f59e0b' : markerColorRaw
+    // 边框色：专题边框色优先，'none'（无色）→ 不描边；专题填充无色且未设边框色时
+    // 回退基础边框色（镂空也要有边框）；非专题用基础边框色（缺省为无色哨兵，不画白边），
+    // 'none' 同样不描边
+    let strokeColor: string
+    let noStroke = false
+    const thematicBorderColor = this.thematicSettings?.borderColor
+    if (thematicColor) {
+      if (thematicBorderColor === NO_FILL_COLOR) {
+        noStroke = true
+        strokeColor = '#000000'
+      } else if (thematicBorderColor) {
+        strokeColor = thematicBorderColor
+      } else {
+        strokeColor = thematicColor === NO_FILL_COLOR
+          ? (pointStyle.color && pointStyle.color !== NO_FILL_COLOR ? pointStyle.color : '#fff')
+          : thematicColor
+      }
+    } else {
+      noStroke = pointStyle.color === NO_FILL_COLOR
+      strokeColor = noStroke ? '#000000' : (pointStyle.color || NO_FILL_COLOR)
+    }
+
+    return {
+      markerSize,
+      markerColor,
+      strokeColor,
+      noFill,
+      noStroke,
+      shapeName: resolvePointShape(pointStyle.markerSymbol),
+      weight: pointStyle.weight || 2,
+      opacity: pointStyle.opacity || 1,
+      fillOpacity: thematicColor
+        ? (this.thematicSettings?.fillOpacity ?? pointStyle.fillOpacity ?? 0.8)
+        : (pointStyle.fillOpacity || 0.8),
+    }
+  }
+
+  /**
    * 应用单个要素的当前应显示样式（专题优先、基础次之）
    * 点要素由 pointToLayer 创建（style 函数对 Point 返回 {}，resetStyle 对其无效，
    * 且 Leaflet resetStyle 会把 layer.options 还原为创建时快照 defaultOptions，
@@ -908,69 +938,28 @@ export class MapInfoLayer {
    * 线/面走 style 函数 resetStyle 即可（style 回调已含专题逻辑）。
    */
   private _applyFeatureStyle(layer: any): void {
-    const thematicColor = this._thematicColor(layer.feature)
     if (layer instanceof L.CircleMarker) {
-      if (thematicColor) {
-        // 专题启用：按图形大小设置更新半径（否则已渲染的点大小不变）；
-        // 边框颜色/填充透明度用专题设置（缺省回退专题色/不透明）
-        const noFill = thematicColor === NO_FILL_COLOR
-        // 专题边框色：'none'（无色）→ 不描边；未设置时镂空回退基础边框色，否则用专题色
-        const tb = this.thematicSettings?.borderColor
-        const noStroke = tb === NO_FILL_COLOR
-        layer.setStyle({
-          fill: !noFill,
-          fillColor: noFill ? '#f59e0b' : thematicColor,
-          fillOpacity: this.thematicSettings?.fillOpacity ?? 1,
-          stroke: !noStroke,
-          color: noStroke
-            ? '#000000'
-            : (tb || (noFill ? (this.style.point?.color || '#fff') : thematicColor)),
-          opacity: 1,
-          ...(this.thematicSettings?.pointSize ? { radius: this.thematicSettings.pointSize } : {})
-        })
-      } else {
-        const fillColor = this.style.point?.fillColor || '#f59e0b'
-        const noFill = fillColor === NO_FILL_COLOR
-        // 基础边框色为无色哨兵 → 不描边
-        const noStroke = this.style.point?.color === NO_FILL_COLOR
-        layer.setStyle({
-          fill: !noFill,
-          fillColor: noFill ? '#f59e0b' : fillColor,
-          fillOpacity: this.style.point?.fillOpacity ?? 0.8,
-          stroke: !noStroke,
-          color: noStroke ? '#000000' : (this.style.point?.color || NO_FILL_COLOR),
-          weight: this.style.point?.weight ?? 2,
-          opacity: this.style.point?.opacity ?? 1,
-          // 半径保留当前已渲染值（要素级 markerSize/专题点大小），无则用基础配置或默认值，
-          // 避免恢复样式时把点强制缩回固定 6px
-          radius: this.style.point?.radius ?? layer.options.radius ?? 6
-        })
-      }
+      const point = this._resolvePointStyle(layer.feature)
+      layer.setStyle({
+        fill: !point.noFill,
+        fillColor: point.markerColor,
+        fillOpacity: point.fillOpacity,
+        stroke: !point.noStroke,
+        color: point.strokeColor,
+        weight: point.weight,
+        opacity: point.opacity,
+        radius: point.markerSize,
+      })
     } else if (layer instanceof L.Marker) {
       // 点形状（L.marker + SVG 图标）：用新填充色重新生成图标（无色镂空不适用图标，回退兜底色）
-      const shapeName = resolvePointShape(layer.feature?.properties?._style?.markerSymbol)
+      const point = this._resolvePointStyle(layer.feature)
+      const shapeName = point.shapeName
       if (shapeName) {
-        const curIcon: any = layer.options.icon
-        const iconPx = (curIcon?.options?.iconSize && curIcon.options.iconSize[0]) || 24
-        // 基础配置"图形大小"（radius=半径）→ 形状图标直径 = radius*2（与专题图形大小逻辑一致）
-        const baseIconPx = (!thematicColor && typeof this.style.point?.radius === 'number')
-          ? this.style.point.radius * 2
-          : null
-        const iconSize = (thematicColor && this.thematicSettings?.pointSize)
-          ? this.thematicSettings.pointSize * 2
-          : (baseIconPx ?? iconPx)
-        const rawColor = thematicColor
-          || (this.style.point as any)?.markerColor
-          || this.style.point?.fillColor
-          || '#f59e0b'
-        const color = rawColor === NO_FILL_COLOR ? '#f59e0b' : rawColor
-        // 边框色：仅在基础/专题设置里显式配过颜色时才描边（缺省与无色哨兵都不画白边）
-        const borderRaw: string | undefined = thematicColor
-          ? (this.thematicSettings?.borderColor ?? this.style.point?.color)
-          : this.style.point?.color
-        const iconStroke = borderRaw && borderRaw !== NO_FILL_COLOR ? borderRaw : 'none'
+        // 形状图标直径 = 半径×2（与专题图形大小逻辑一致）
+        const iconSize = Math.max(12, Math.min(36, Math.round(point.markerSize * 2)))
+        const iconStroke = point.noStroke ? 'none' : point.strokeColor
         layer.setIcon(L.icon({
-          iconUrl: pointShapeIconDataUri(shapeName, color, iconStroke),
+          iconUrl: pointShapeIconDataUri(shapeName, point.markerColor, iconStroke),
           iconSize: [iconSize, iconSize],
           iconAnchor: [iconSize / 2, iconSize / 2]
         }))

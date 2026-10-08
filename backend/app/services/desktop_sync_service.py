@@ -49,6 +49,7 @@ def _default_state() -> Dict[str, Any]:
         "last_sync_at": None,
         "last_result": None,
         "last_error": None,
+        "server_fingerprint": None,  # 服务器上次已知的本组数据指纹（变更监听基线）
     }
 
 
@@ -187,9 +188,13 @@ _sync_timer_lock = threading.Lock()
 
 def _sync_timer_tick() -> None:
     try:
-        sync_once()
+        result = sync_once()
     except Exception as exc:  # noqa: BLE001
         print(f"[DesktopSync] 即时同步失败（忽略）：{exc}")
+        return
+    # 上一次同步还没结束：稍后再来一次，否则这次改动要等到下轮定时同步才被发现
+    if result.get("skipped") and "尚未结束" in str(result.get("reason") or ""):
+        schedule_sync(2)
 
 
 def schedule_sync(delay_seconds: Optional[float] = None) -> None:
@@ -789,14 +794,58 @@ def _license_valid() -> bool:
         return False
 
 
+# ---------------------------------------------------------------- 变更监听（即时同步）
+
+# 长轮询挂起时长：服务器在此期间有变化会立刻返回
+WATCH_WAIT_SECONDS = 25
+
+
+def watch_once(wait_seconds: int = WATCH_WAIT_SECONDS) -> bool:
+    """挂起等待同组数据变更；有变化返回 True（调用方负责触发同步）。"""
+    from app.services import desktop_cloud_client as cloud
+
+    state = load_state()
+    since = str(state.get("server_fingerprint") or "")
+    data = cloud.wait_change(since, timeout=wait_seconds)
+    fingerprint = str(data.get("fingerprint") or "")
+    if not fingerprint or fingerprint == since:
+        return False
+    save_state(server_fingerprint=fingerprint)
+    # 首次只记录基线，不算"有变更"——否则每次启动都会白跑一次同步
+    return bool(since)
+
+
+async def watch_loop(wait_seconds: int = WATCH_WAIT_SECONDS) -> None:
+    """监听同组的服务器数据变更，一有变化立即同步。
+
+    这是「服务器 → 桌面端」的主通道（长轮询，秒级感知）；sync_loop 退化为兜底。
+    """
+    import asyncio
+
+    await asyncio.sleep(20)  # 启动先让本地服务热身
+    while True:
+        try:
+            if is_shared() and _license_valid():
+                changed = await asyncio.to_thread(watch_once, wait_seconds)
+                if changed:
+                    schedule_sync(0)  # 立刻同步，不再等定时轮询
+                    continue
+            else:
+                await asyncio.sleep(10)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[DesktopSync] 变更监听异常（忽略）：{exc}")
+            await asyncio.sleep(5)
+
+
 # ---------------------------------------------------------------- 后台定时同步
 
 async def sync_loop(interval_minutes: Optional[int] = None) -> None:
     """桌面版共享模式定时同步（失败仅记录日志，不影响本机离线使用）。
 
-    同组其它端（网页端或另一台桌面端）的改动只能靠轮询发现，因此间隔按
-    NPT_DESKTOP_SYNC_INTERVAL_MINUTES（默认 1 分钟）走；每次只拉清单比对
-    修订号，没有变化就不做整包传输。本机自己的改动另走 note_change 的即时上行。
+    兜底通道：同组其它端（网页端或另一台桌面端）的改动主要由 watch_loop 的长轮询
+    即时发现，这里只按 NPT_DESKTOP_SYNC_INTERVAL_MINUTES（默认 1 分钟）补漏；
+    每次只比对修订号，没有变化就不做整包传输。本机自己的改动另走 note_change
+    的即时上行。
     """
     import asyncio
 

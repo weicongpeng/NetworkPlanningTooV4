@@ -23,14 +23,12 @@ export function DesktopReleasesPage() {
   const [version, setVersion] = useState('')
   const [channel, setChannel] = useState('stable')
   const [releaseNotes, setReleaseNotes] = useState('')
-  const [mandatory, setMandatory] = useState(false)
   const [isLatest, setIsLatest] = useState(true)
 
   const [editing, setEditing] = useState<DesktopReleaseInfo | null>(null)
   const [editVersion, setEditVersion] = useState('')
   const [editChannel, setEditChannel] = useState('stable')
   const [editNotes, setEditNotes] = useState('')
-  const [editMandatory, setEditMandatory] = useState(false)
 
   const fetchReleases = useCallback(async () => {
     setLoading(true)
@@ -65,14 +63,12 @@ export function DesktopReleasesPage() {
       form.append('version', version.trim())
       form.append('channel', channel.trim() || 'stable')
       form.append('release_notes', releaseNotes)
-      form.append('mandatory', mandatory ? 'true' : 'false')
       form.append('is_latest', isLatest ? 'true' : 'false')
       await desktopReleasesApi.upload(form)
       notify('success', t('desktopReleases.uploadSuccess'))
       setFile(null)
       setVersion('')
       setReleaseNotes('')
-      setMandatory(false)
       setIsLatest(true)
       await fetchReleases()
     } catch (err: any) {
@@ -108,7 +104,6 @@ export function DesktopReleasesPage() {
     setEditVersion(item.version)
     setEditChannel(item.channel)
     setEditNotes(item.release_notes || '')
-    setEditMandatory(item.mandatory)
   }
 
   const submitEdit = async () => {
@@ -118,7 +113,6 @@ export function DesktopReleasesPage() {
         version: editVersion.trim(),
         channel: editChannel.trim() || 'stable',
         release_notes: editNotes,
-        mandatory: editMandatory,
       })
       setEditing(null)
       notify('success', t('desktopReleases.updateSuccess'))
@@ -203,10 +197,6 @@ export function DesktopReleasesPage() {
             <input type="checkbox" checked={isLatest} onChange={(e) => setIsLatest(e.target.checked)} />
             {t('desktopReleases.setLatestLabel')}
           </label>
-          <label className="flex items-center gap-2 text-sm">
-            <input type="checkbox" checked={mandatory} onChange={(e) => setMandatory(e.target.checked)} />
-            {t('desktopReleases.mandatoryLabel')}
-          </label>
           <button
             onClick={handleUpload}
             disabled={uploading || !file || !version.trim()}
@@ -251,11 +241,6 @@ export function DesktopReleasesPage() {
                   {item.is_latest && (
                     <span className="ml-2 px-1.5 py-0.5 rounded bg-primary/10 text-primary text-xs">
                       {t('desktopReleases.latestBadge')}
-                    </span>
-                  )}
-                  {item.mandatory && (
-                    <span className="ml-2 px-1.5 py-0.5 rounded bg-red-500/10 text-red-500 text-xs">
-                      {t('desktopReleases.mandatoryBadge')}
                     </span>
                   )}
                 </td>
@@ -368,10 +353,6 @@ export function DesktopReleasesPage() {
                 className="w-full px-3 py-2 bg-background border border-border rounded-lg text-sm"
               />
             </div>
-            <label className="flex items-center gap-2 text-sm">
-              <input type="checkbox" checked={editMandatory} onChange={(e) => setEditMandatory(e.target.checked)} />
-              {t('desktopReleases.mandatoryLabel')}
-            </label>
             <div className="flex gap-2 justify-end pt-3 border-t border-border">
               <button
                 onClick={() => setEditing(null)}

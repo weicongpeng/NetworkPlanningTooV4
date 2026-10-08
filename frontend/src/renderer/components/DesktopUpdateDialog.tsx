@@ -6,14 +6,32 @@ import { desktopUpdateApi } from '../services/api'
 import { useAuthStore } from '../store/authStore'
 import { useDesktopUpdateStore } from '../store/desktopUpdateStore'
 
+/** 自动提醒间隔：1 天 2 次 */
+const PROMPT_INTERVAL_MS = 12 * 60 * 60 * 1000
+/** 同一版本的"上次提醒时间"，避免重启应用后重复弹窗 */
+const PROMPT_STORAGE_KEY = 'npt-ota-last-prompt'
+/** 启动后延迟检查，避免与首屏争资源 */
+const FIRST_CHECK_DELAY_MS = 8000
+
+function readLastPrompt(): { version: string; at: number } | null {
+  try {
+    const raw = localStorage.getItem(PROMPT_STORAGE_KEY)
+    if (!raw) return null
+    const parsed = JSON.parse(raw)
+    return typeof parsed?.at === 'number' ? { version: String(parsed.version || ''), at: parsed.at } : null
+  } catch {
+    return null
+  }
+}
+
 /**
  * 桌面版 OTA 更新提示（仅桌面壳内生效；网页端接口 404 时静默）。
- * 规则：mandatory 或"稍后"超过服务端上限后不可再稍后（强制更新）。
+ * 规则：不强制更新，弹窗随时可关闭；自动检查每 12 小时一次（1 天 2 次）。
  */
 export function DesktopUpdateDialog() {
   const { t } = useTranslation()
-  const { user } = useAuthStore()
-  const isAdmin = user?.is_admin ?? false
+  // 更新接口只存在于桌面形态，网页端不必轮询
+  const desktopMode = useAuthStore((s) => s.desktopMode)
   const [status, setStatus] = useState<DesktopUpdateStatus | null>(null)
   const [visible, setVisible] = useState(false)
   const [busy, setBusy] = useState(false)
@@ -28,9 +46,9 @@ export function DesktopUpdateDialog() {
   const clearRequest = useDesktopUpdateStore((s) => s.clearRequest)
 
   const release = status?.release || null
-  const force = Boolean(release?.mandatory) || Boolean(release?.snooze?.force)
 
-  const check = useCallback(async () => {
+  // force=false：自动检查不打断用户；手动点「检查更新」时立即展示
+  const check = useCallback(async (force = false) => {
     try {
       const res = await desktopUpdateApi.status()
       if (!res.success) return
@@ -41,21 +59,39 @@ export function DesktopUpdateDialog() {
         phase: res.data.download?.phase || 'idle',
         error: res.data.download?.error,
       })
-      if (res.data.update_available && res.data.release) {
+      if (res.data.download?.phase === 'ready') {
         setVisible(true)
-      } else if (res.data.download?.phase === 'ready') {
-        setVisible(true)
+        return
       }
+      if (!res.data.update_available || !res.data.release) return
+      const version = String(res.data.release.version)
+      const last = readLastPrompt()
+      const due =
+        force ||
+        !last ||
+        last.version !== version ||
+        Date.now() - last.at >= PROMPT_INTERVAL_MS
+      if (!due) return
+      try {
+        localStorage.setItem(PROMPT_STORAGE_KEY, JSON.stringify({ version, at: Date.now() }))
+      } catch {
+        /* 隐私模式下写不进去也不影响本次提醒 */
+      }
+      setVisible(true)
     } catch {
       // 网页版或后端不可用
     }
   }, [])
 
   useEffect(() => {
-    if (!isAdmin) return
-    const timer = window.setTimeout(check, 8000) // 启动后延迟检查，避免与首屏争资源
-    return () => window.clearTimeout(timer)
-  }, [check, isAdmin])
+    if (!desktopMode) return
+    const timer = window.setTimeout(() => check(false), FIRST_CHECK_DELAY_MS)
+    const interval = window.setInterval(() => check(false), PROMPT_INTERVAL_MS)
+    return () => {
+      window.clearTimeout(timer)
+      window.clearInterval(interval)
+    }
+  }, [check, desktopMode])
 
   // 系统设置页点「检查更新」→ 打开本弹窗展示新版本
   useEffect(() => {
@@ -125,24 +161,12 @@ export function DesktopUpdateDialog() {
     }
   }
 
-  const handleSnooze = async () => {
-    if (!release) return
-    try {
-      const res: any = await desktopUpdateApi.snooze(String(release.version))
-      if (res?.data?.force) {
-        setStatus((prev) =>
-          prev && prev.release ? { ...prev, release: { ...prev.release, snooze: res.data } } : prev,
-        )
-        setMessage(t('desktopUpdate.forceNotice'))
-        return
-      }
-    } catch {
-      /* 记录失败也允许关闭 */
-    }
+  const handleClose = () => {
     setVisible(false)
+    setMessage(null)
   }
 
-  // 可见性由「自动检查（管理员）」或「系统设置手动检查」决定，不再限定管理员
+  // 可见性由自动检查或「系统设置 → 检查更新」决定
   if (!visible || (!release && progress.phase !== 'ready')) return null
 
   const percent =
@@ -156,11 +180,9 @@ export function DesktopUpdateDialog() {
             <Download size={18} className="text-primary" />
             <h3 className="text-sm font-semibold">{t('desktopUpdate.title')}</h3>
           </div>
-          {!force && progress.phase !== 'ready' && (
-            <button onClick={handleSnooze} className="p-1 hover:bg-muted rounded" title={t('desktopUpdate.later')}>
-              <X size={16} />
-            </button>
-          )}
+          <button onClick={handleClose} className="p-1 hover:bg-muted rounded" title={t('desktopUpdate.close')}>
+            <X size={16} />
+          </button>
         </div>
 
         {release && (
@@ -169,18 +191,6 @@ export function DesktopUpdateDialog() {
               <span className="font-mono px-1.5 py-0.5 rounded bg-muted">{release.version}</span>
               {release.file_size_display && (
                 <span className="text-muted-foreground">{release.file_size_display}</span>
-              )}
-              {release.mandatory && (
-                <span className="px-1.5 py-0.5 rounded bg-red-500/10 text-red-500 text-xs">
-                  {t('desktopUpdate.mandatoryBadge')}
-                </span>
-              )}
-              {release.snooze && !release.mandatory && (
-                <span className="text-xs text-muted-foreground">
-                  {t('desktopUpdate.snoozeLeft', {
-                    left: Math.max(0, release.snooze.max - release.snooze.count),
-                  })}
-                </span>
               )}
             </div>
             {release.release_notes && (
@@ -210,19 +220,13 @@ export function DesktopUpdateDialog() {
           </div>
         )}
 
-        {force && (
-          <p className="text-xs text-red-500">{t('desktopUpdate.forceHint')}</p>
-        )}
-
         <div className="flex justify-end gap-2">
-          {!force && progress.phase !== 'ready' && (
-            <button
-              onClick={handleSnooze}
-              className="px-4 py-2 border border-border rounded-lg hover:bg-muted text-sm"
-            >
-              {t('desktopUpdate.later')}
-            </button>
-          )}
+          <button
+            onClick={handleClose}
+            className="px-4 py-2 border border-border rounded-lg hover:bg-muted text-sm"
+          >
+            {t('desktopUpdate.close')}
+          </button>
           {progress.phase === 'ready' ? (
             <button
               onClick={handleInstall}

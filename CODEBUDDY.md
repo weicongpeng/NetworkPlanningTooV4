@@ -140,7 +140,7 @@ FastAPI (backend/app/)
 ### 桌面端运行形态（`desktop/`）
 
 - `desktop/launcher.py` 是 PyInstaller 入口：daemon 线程跑 uvicorn 绑 `127.0.0.1` 随机端口，主线程开 pywebview 窗口；注入 `NPT_DESKTOP=1`、`NPT_MAX_WORKERS=1`（Windows 无 fork）、`NPT_SERVER_URL`（默认 `https://app.pengwc.asia`）；可写数据落 `%APPDATA%\NetworkPlanningTool`（`NPT_DATA_ROOT` 可覆盖），与安装目录解耦；Windows 命名互斥体 `Local\NPTDesktop` 保证单实例。
-- **同一份后端代码跑两种形态**：`NPT_DESKTOP=1` 时 `api/__init__.py` 额外挂后台协程（`desktop_cloud_client.renewal_loop` 静默续期、`desktop_sync_service.sync_loop` 共享模式同步、`desktop_local.session_guard_loop` 单设备登录校验），并放行 `/api/v1/desktop`；服务器专用管理端点（`admin_users` 等）经 `core/security.reject_desktop_mode` 在桌面形态下一律 404。
+- **同一份后端代码跑两种形态**：`NPT_DESKTOP=1` 时 `api/__init__.py` 额外挂后台协程（`desktop_cloud_client.renewal_loop` 静默续期、`desktop_sync_service.sync_loop` 共享模式兜底同步、`desktop_sync_service.watch_loop` 长轮询即时同步、`desktop_local.session_guard_loop` 单设备登录校验），并放行 `/api/v1/desktop`；服务器专用管理端点（`admin_users` 等）经 `core/security.reject_desktop_mode` 在桌面形态下一律 404。
 - 授权：Ed25519 密钥对由 `desktop/tools/gen_keypair.py` 生成，私钥在 `desktop/tools/keys/`（已 gitignore，禁止入库/外发），公钥 hex 写入 `backend/app/core/license_public_key.py`；`desktop/tools/gen_license.py` 签发离线 `.nptlic`。
 - 云端数据同步端点的身份凭证是**签名许可文件 + 机器码**（非 JWT），见 `desktop_cloud._verify_license`。
 
@@ -242,7 +242,7 @@ FastAPI (backend/app/)
   - **断网不退出登录**：`session-check` 心跳**只在服务器明确回复 `valid=False`**（账号在别处登录/会话失效）时才本机登出；网络不可达、超时、5xx 等一律按"无法确定"处理（`desktop_cloud_client.session_check` 返回 `offline=True`），断网时单机模式可继续使用，绝不因网络抖动踢下线。
   - 记账：每次联机登录累加 `DesktopLicense.login_count`；断网登录本机记 `pending_offline_logins`，下次联机补报。`idle_logout_days`（默认 2 天）写在授权上并随许可下发，覆盖本机会话空闲超时（`core/security._desktop_idle_timeout_minutes`）。
   - 本机 users 表新增 `desktop_run_mode` 列区分当前模式；`DesktopLicense` 新增 `mode/username/user_id/login_count/last_login_at/idle_logout_days`。
-- **许可签发与续期**：Ed25519 许可（私钥仅服务器：`NPT_LICENSE_PRIVATE_KEY` 或 `licenses/license_private_key.pem`，见 `services/desktop_signing.py`），租约默认 30 天、启动后台静默续期（剩余<20 天或距上次≥7 天）。OTA：管理端上传安装包到 `desktop_releases`，客户端比对版本 → 断点续传下载 + sha256 校验 → 在 `%APPDATA%\NetworkPlanningTool\updates\`（`DATA_ROOT/updates`）写升级脚本 `npt_update_*.cmd` → `CREATE_NO_WINDOW` 隐藏拉起（不弹终端窗口；脚本用 `ping` 计时，无控制台时 `timeout` 会报错），脚本等应用退出（`EXIT_WAIT_SECONDS=60` 超时 `taskkill` 兜底）→ `/VERYSILENT` 安装并记 `npt_setup.log` → 重启应用；应用侧由 `app/desktop_bridge.py` 的退出回调关窗，`desktop/launcher.py` 先武装 `EXIT_GRACE_SECONDS=20` 强制退出看门狗、`destroy` 抛异常则立即 `os._exit`，保证进程一定退出。「稍后」3 次或 `mandatory` 转强制。离线 `.nptlic` 导入通道保留。桌面版必须用 `NPT_CONSOLE=0` 构建（CI tag 发行会用 0 重新打包），否则程序自带控制台窗口。
+- **许可签发与续期**：Ed25519 许可（私钥仅服务器：`NPT_LICENSE_PRIVATE_KEY` 或 `licenses/license_private_key.pem`，见 `services/desktop_signing.py`），租约默认 30 天、启动后台静默续期（剩余<20 天或距上次≥7 天）。OTA：管理端上传安装包到 `desktop_releases`，客户端比对版本 → 断点续传下载 + sha256 校验 → 在 `%APPDATA%\NetworkPlanningTool\updates\`（`DATA_ROOT/updates`）写升级脚本 `npt_update_*.cmd` → `CREATE_NO_WINDOW` 隐藏拉起（不弹终端窗口；脚本用 `ping` 计时，无控制台时 `timeout` 会报错），脚本等应用退出（`EXIT_WAIT_SECONDS=60` 超时 `taskkill` 兜底）→ `/VERYSILENT` 安装并记 `npt_setup.log` → 重启应用；应用侧由 `app/desktop_bridge.py` 的退出回调关窗，`desktop/launcher.py` 先武装 `EXIT_GRACE_SECONDS=20` 强制退出看门狗、`destroy` 抛异常则立即 `os._exit`，保证进程一定退出。**无强制更新**：新版本只提示，弹窗可随时关闭、「稍后」不计数；自动检查每 12 小时一次（1 天 2 次，本地 `npt-ota-last-prompt` 记录上次提醒，重启应用也不会重复打扰），面向所有桌面端用户。离线 `.nptlic` 导入通道保留。桌面版必须用 `NPT_CONSOLE=0` 构建（CI tag 发行会用 0 重新打包），否则程序自带控制台窗口。
 - **同组任务历史共享（2026-10-08）**：PCI/邻区/TAC 核查/TAC 规划四类历史任务（`TaskManager.SHARED_TASK_TYPES`）在**同组（地市+运营商）内互通**。网页端历史列表本就按组过滤；桌面端共享模式新增任务同步：`sync_once` 第 4 步 `sync_tasks()` 拉取同组任务元数据写入本机 `task_results` 镜像行（`origin='shared'`，**结果不预下载**）、把本机新建的规划任务（含结果，只推一次，`sync_state.tasks_pushed` 记账）上行，并传播删除（`task_deletes`）与应用标记更新（`task_updates`）。镜像任务的结果在查看/导出时由 `task_manager._fetch_shared_task_result()` 按需从服务器拉取并缓存；服务器侧接口 `POST /desktop-cloud/data/tasks/manifest`、`GET /desktop-cloud/data/tasks/{id}/result`、`POST /desktop-cloud/data/tasks/{id}`、`POST /desktop-cloud/data/tasks/{id}/delete`（许可+机器码鉴权，组以授权记录为准）。存量任务归属：启动迁移按发起人 `user_name` 的当前组重盖章（`core/database._fix_misattributed_task_groups`），无对应用户的行保持原样。
   - **跨端一致性（2026-10-08 修复）**：`is_applied` **双向**同步（别处应用 → 本机显示已应用；本机刚应用尚未上行时以本机为准，不被服务器旧值冲掉）；服务器删除会同时清掉本机镜像行与**已上行过的本机任务**（否则网页端删掉的记录在桌面端永久残留）；清单新增 `total`，`total > len(items)`（LIMIT 200 截断）时不做删除判定，防止误删老任务；`list_task_history` 对**无本机结果的镜像行**回退到 `is_applied` 标记（原来恒为"未应用"），且该标记参与 `_history_verify_cache` 缓存键。前端 `HistoryTable` 监听 `desktop:synced` 事件 + 可见时每 60s 静默刷新；`taskStore.syncHistoryFromBackend` 按"本页最早一条的时间边界"剔除已被别端删除的本地记录（运行中/`activeTaskIds` 除外）。
 - **网优助手**：LLM 配置/数据集导入到 `station_param_rows`、`station_metric_rows` 两张表，对话走 function-calling（最多 5 轮工具调用），查询只读。
@@ -326,8 +326,7 @@ NPT_LICENSE_PRIVATE_KEY                   # Ed25519 签发私钥（或用 licens
 NPT_SERVER_URL / NPT_DESKTOP_CHANNEL / NPT_DESKTOP_VERSION
 NPT_DESKTOP_ACTIVATION_MODE               # precreate（默认）/ approve（单机需管理员批准）
 NPT_DESKTOP_LEASE_DAYS                    # 许可租约天数，默认 30
-NPT_DESKTOP_MAX_SNOOZE                    # 强制更新前允许「稍后」的次数
-NPT_DESKTOP_SYNC_INTERVAL_MINUTES         # 共享模式后台同步轮询间隔
+NPT_DESKTOP_SYNC_INTERVAL_MINUTES         # 共享模式后台同步兜底轮询间隔（主通道为长轮询即时推送）
 NPT_DESKTOP_SYNC_DEBOUNCE_SECONDS         # 本地改动上行防抖秒数，默认 3
 ```
 

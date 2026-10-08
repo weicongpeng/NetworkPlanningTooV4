@@ -10,6 +10,8 @@
 """
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import secrets
 import time
 import urllib.parse
@@ -103,6 +105,14 @@ class LoginRequest(BaseModel):
     offline_logins: Optional[int] = Field(
         default=None, ge=1, le=1000, description="离线期间累计的登录次数（补报）"
     )
+
+
+class LogoutRequest(BaseModel):
+    """桌面端退出登录：结束服务器侧的会话记账。"""
+
+    license_file: str
+    machine_code: str
+    session_jti: str = ""
 
 
 class PollLoginRequest(BaseModel):
@@ -247,6 +257,43 @@ async def desktop_session_check(
 
         data["user"] = auth_service.user_payload(user)
     return {"success": True, "data": data}
+
+
+@router.post("/auth/logout")
+async def desktop_logout(
+    payload: LogoutRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """桌面端退出登录（公开 + 限流）：结束本次登录占用的服务器会话。
+
+    桌面端登录会在服务器建一条 client_type='desktop' 的会话，「用户管理」据此判定
+    在线；本机退出若不通知服务器，心跳会一直刷新 last_activity，管理员就会看到
+    「已退出却仍在线」。失败一律返回 ended=False，绝不影响本机登出。
+    """
+    from app.models.database import UserSession
+
+    _rate_limit(f"session:{_client_ip(request)}", limit=120, window=300)
+    try:
+        record, _ = _verify_license(payload.license_file, payload.machine_code, db)
+    except HTTPException as exc:
+        if exc.status_code in (400, 403, 404, 409):
+            return {"success": True, "data": {"ended": False, "reason": _gbk_safe(str(exc.detail))}}
+        raise
+
+    jti = (payload.session_jti or "").strip()
+    session = (
+        db.query(UserSession).filter(UserSession.token_jti == jti).first() if jti else None
+    )
+    if session is None or session.logout_time is not None:
+        return {"success": True, "data": {"ended": False, "reason": "会话不存在或已结束"}}
+    if record.user_id and session.user_id != record.user_id:
+        return {"success": True, "data": {"ended": False, "reason": "会话与授权不匹配"}}
+
+    from app.services.auth_service import auth_service
+
+    auth_service.end_session(db, jti)
+    return {"success": True, "data": {"ended": True}}
 
 
 @router.post("/auth/register")
@@ -396,6 +443,13 @@ class SyncCredential(BaseModel):
 class SessionRequest(SyncCredential):
     city: Optional[str] = None
     operator: Optional[str] = None
+
+
+class ChangesRequest(SyncCredential):
+    """组内数据变更监听（长轮询）。since 为空表示「只要当前指纹」。"""
+
+    since: Optional[str] = None
+    wait_seconds: int = Field(default=25, ge=0, le=60)
 
 
 class _Group:
@@ -570,6 +624,70 @@ async def data_manifest(
             "group": {"city": group[0], "operator": group[1]},
             "items": _collect_manifest(group[0], group[1]),
             "server_time": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        },
+    }
+
+
+def _group_fingerprint(city: str, operator: str) -> str:
+    """组内数据集指纹：任何新增 / 删除 / 修订号推进都会改变它。
+
+    只查 dataset_revisions 与内存索引的可见条目（不打包、不清残余），可以高频调用。
+    """
+    from app.services import dataset_revision_service as revs
+    from app.services.data_group import index_entry_visible
+    from app.services.data_service import data_service
+
+    group = _Group(city, operator)
+    entries = {
+        data_id: {"city": e.get("city"), "operator": e.get("operator")}
+        for data_id, e in data_service.index.items()
+        if index_entry_visible(e, group)
+    }
+    rev_map = revs.ensure(entries)
+    parts = [f"{data_id}:{rev_map.get(data_id, 0)}" for data_id in sorted(entries)]
+    # 墓碑：服务器上已删、客户端本地可能还留着镜像的数据集
+    for row in revs.list_group(city, operator):
+        if row.get("deleted") and row.get("data_id") not in entries:
+            parts.append(f"{row.get('data_id')}@del:{row.get('rev') or 0}")
+    return hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()
+
+
+@router.post("/data/changes")
+async def data_changes(
+    payload: ChangesRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """组内数据变更监听（长轮询）：指纹变化立刻返回，否则挂起至 wait_seconds。
+
+    把「服务器 → 桌面端」从定时轮询改成即时推送：客户端带上自己已知的指纹，
+    期间同组任何写入（上传 / 编辑 / 删除）都会让下一次比对命中并立即返回，
+    客户端随即触发一次同步；无变化则到时返回，客户端重新挂起。
+    """
+    from starlette.concurrency import run_in_threadpool
+
+    _rate_limit(f"sync:{_client_ip(request)}", limit=120, window=300)
+    record, _ = _verify_license(payload.license_file, payload.machine_code, db)
+    group = _license_group(record)
+    if group is None:
+        raise HTTPException(status_code=409, detail="尚未绑定数据组，请先调用 /data/session")
+
+    since = (payload.since or "").strip()
+    fingerprint = await run_in_threadpool(_group_fingerprint, group[0], group[1])
+    if since and since != fingerprint:
+        return {"success": True, "data": {"fingerprint": fingerprint, "changed": True}}
+
+    deadline = time.time() + int(payload.wait_seconds or 0)
+    while time.time() < deadline:
+        await asyncio.sleep(2)
+        fingerprint = await run_in_threadpool(_group_fingerprint, group[0], group[1])
+        if fingerprint != since:
+            break
+    return {
+        "success": True,
+        "data": {
+            "fingerprint": fingerprint,
+            "changed": bool(since) and fingerprint != since,
         },
     }
 
@@ -957,7 +1075,6 @@ async def latest_release(
                 f"{record.file_size / (1024 * 1024):.1f} MB" if record.file_size else "未知"
             ),
             "sha256": record.sha256,
-            "mandatory": bool(record.mandatory),
             "release_notes": record.release_notes,
             "published_at": record.created_at,
             "update_available": update_available,
