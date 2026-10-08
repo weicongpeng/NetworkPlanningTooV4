@@ -1062,7 +1062,20 @@ class DataService:
 
         original_excel = full_dir / "original.xlsx"
         if not original_excel.exists():
-            raise ValueError("全量工参原始文件不存在")
+            raise ValueError(f"全量工参原始文件不存在（{original_excel}）")
+
+        # 现网工参数据体预检：CSV 缺失时必须失败，不能"提示完成但文件没变化"。
+        # 桌面端共享模式先尝试从服务器补拉一次（历史版本/半途解包可能遗留不完整镜像）。
+        if not self._current_params_csv_files(current_dir, "LTE") and \
+                not self._current_params_csv_files(current_dir, "NR"):
+            repaired = self._repair_current_params_from_server(current_param_id)
+            if not repaired and not self._current_params_csv_files(current_dir, "LTE") \
+                    and not self._current_params_csv_files(current_dir, "NR"):
+                raise ValueError(
+                    "本机现网工参数据不完整：未找到 LTE_SDR_CellInfo_*.csv / "
+                    "LTE_ITBBU_CellInfo_*.csv / NR_CellInfo_*.csv。"
+                    "请确认已上传现网工参（ZIP）且已同步到本机后重试。"
+                )
 
         # 2. 准备输出文件
         # 生成新文件名：原文件名 + 时间戳
@@ -1079,10 +1092,9 @@ class DataService:
 
         new_filename = f"{new_name}{ext_part}"
 
-        # 创建新的数据ID
+        # 创建新的数据ID（目录延迟到确认可产出结果时再创建，避免校验失败留下空壳）
         new_data_id = str(uuid.uuid4())
         new_data_dir = settings.DATA_DIR / new_data_id
-        new_data_dir.mkdir(parents=True, exist_ok=True)
 
         output_excel_path = new_data_dir / "original.xlsx"
 
@@ -1093,28 +1105,52 @@ class DataService:
         except Exception as e:
             raise ValueError(f"无法打开Excel文件: {e}")
 
-        # 4. 处理LTE
+        # 4/5. 处理 LTE / NR（统计匹配与新增行数，供任务结果展示与"空更新"判定）
+        stats: Dict[str, Dict[str, int]] = {}
         if "LTE Project Parameters" in wb.sheetnames:
             safe_print(f"[DataService] 处理LTE工参...")
-            self._update_sheet(wb["LTE Project Parameters"], current_dir, "LTE")
+            stats["LTE"] = self._update_sheet(wb["LTE Project Parameters"], current_dir, "LTE")
         else:
             safe_print(f"[DataService] 警告: 未找到 'LTE Project Parameters' Sheet")
 
-        # 5. 处理NR
         if "NR Project Parameters" in wb.sheetnames:
             safe_print(f"[DataService] 处理NR工参...")
-            self._update_sheet(wb["NR Project Parameters"], current_dir, "NR")
+            stats["NR"] = self._update_sheet(wb["NR Project Parameters"], current_dir, "NR")
         else:
             safe_print(f"[DataService] 警告: 未找到 'NR Project Parameters' Sheet")
 
+        if not stats:
+            raise ValueError(
+                "全量工参缺少 'LTE Project Parameters' / 'NR Project Parameters' 工作表，"
+                "无法执行工参更新"
+            )
+        # 一个小区都没匹配上、也没追加新行 → 更新后的文件与更新前一致（用户会以为"没写入"），
+        # 明确失败而不是返回成功
+        matched_total = sum(s.get("matched", 0) for s in stats.values())
+        appended_total = sum(s.get("appended", 0) for s in stats.values())
+        if matched_total == 0 and appended_total == 0:
+            raise ValueError(
+                "现网工参与全量工参未匹配到任何小区（更新后文件与更新前一致）："
+                "请确认选择的是同一批现网工参（中兴网管导出的 CellInfo CSV，"
+                "基站/小区标识需与全量工参一致）"
+            )
+
         # 6. 保存结果
         safe_print(f"[DataService] 保存结果到: {output_excel_path}")
+        new_data_dir.mkdir(parents=True, exist_ok=True)
         wb.save(output_excel_path)
         wb.close()
 
         # 7. 解析新文件并写入 SQLite
         safe_print(f"[DataService] 解析新文件并写入 SQLite...")
         metadata = {}
+        # 组归属继承自目标全量工参（数据归组所有，不随操作者改变）
+        # 注意：这些值在解析失败时仍要用于注册新条目，必须在 try 外先算好
+        user_id_val = full_info.get("user_id", 1)
+        group_city = full_info.get("city")
+        group_operator = full_info.get("operator")
+        now_str = datetime.now().strftime("%Y/%m/%d %H:%M")
+        remark = f"{now_str} {username} 更新" if username else f"{now_str} 更新"
         try:
             import json
 
@@ -1141,12 +1177,6 @@ class DataService:
                     metadata["importWarnings"] = self.full_params_import_warnings
 
             # 写入 SQLite（含备注）
-            # 组归属继承自目标全量工参（数据归组所有，不随操作者改变）
-            user_id_val = full_info.get("user_id", 1)
-            group_city = full_info.get("city")
-            group_operator = full_info.get("operator")
-            now_str = datetime.now().strftime("%Y/%m/%d %H:%M")
-            remark = f"{now_str} {username} 更新" if username else f"{now_str} 更新"
             self._save_to_sqlite(
                 data_id=new_data_id,
                 filename=new_filename,
@@ -1262,7 +1292,24 @@ class DataService:
             "newFileId": new_data_id,
             "newFileName": new_filename,
             "savedToOriginal": saved_to_original,
+            "stats": stats,
         }
+
+    def _repair_current_params_from_server(self, data_id: str) -> bool:
+        """桌面端共享模式：本机现网工参数据体不完整时，从服务器补拉一次整包。
+
+        只针对「本机无 CSVs 可用」的场景（旧版本同步/半途解包遗留的不完整镜像），
+        且本地有未同步修改（dirty）时不动，避免覆盖用户数据。返回是否重新拉取成功。
+        """
+        try:
+            from app.core.config import settings
+            if not settings.NPT_DESKTOP:
+                return False
+            from app.services import desktop_sync_service as sync
+            return bool(sync.repair_dataset(data_id))
+        except Exception as e:  # noqa: BLE001
+            safe_print(f"[DataService] 现网工参补拉尝试失败（非致命）: {e}")
+            return False
 
     def add_cell_to_full_params(
         self,
@@ -2833,18 +2880,20 @@ class DataService:
                 # 注意：coverageType 不在 field_map 中，而是单独处理
             }
 
-        # 验证必要的列是否存在于Excel中
+        # 验证必要的列是否存在于Excel中。
+        # 不能静默跳过：缺列时"更新完成"其实是没更新任何数据，用户会以为已生效。
         missing_cols = [k for k in key_cols if k not in col_map]
         if missing_cols:
-            safe_print(
-                f"[DataService] 警告: Sheet中缺少Key列: {missing_cols}，跳过更新"
+            raise ValueError(
+                f"{network_type} 工作表缺少关键列 {missing_cols}，无法执行工参更新"
+                f"（请使用最新模板的全量工参文件重新导入后再试）"
             )
-            return
 
         # 遍历数据行（从第4行开始）—— 一次性读取，避免多次 iter_rows
         all_rows = list(ws.iter_rows(min_row=4))
         cgi_list = [None] * len(all_rows)
         mnc_list = [None] * len(all_rows)  # NR共享小区判断：记录每行的MNC值
+        matched_count = 0  # 成功匹配现网工参并更新的行数（供任务结果展示/失败判定）
 
         for row_idx, row in enumerate(all_rows):
             try:
@@ -2863,6 +2912,7 @@ class DataService:
                         if key in updates:
                             self._apply_row_update(row, col_map, updates[key], field_map, network_type)
                             updates[key]["_processed"] = True
+                            matched_count += 1
                         else:
                             missing_count = getattr(self, '_lte_missing_key_count', 0) + 1
                             self._lte_missing_key_count = missing_count
@@ -2916,6 +2966,7 @@ class DataService:
                             try:
                                 self._apply_row_update(row, col_map, updates[key], field_map, network_type)
                                 updates[key]["_processed"] = True
+                                matched_count += 1
                             except Exception as e:
                                 import traceback
                                 safe_print(f"[DataService] 更新行失败 (Key={key}): {e}")
@@ -3162,8 +3213,15 @@ class DataService:
                     row[shared_col_idx].value = "是" if ("01" in mnc_set and "11" in mnc_set) else "否"
 
         safe_print(
-            f"[DataService] 更新完成: 现有匹配 {len(existing_keys)} 行, 追加新行 {new_rows_count} 行"
+            f"[DataService] 更新完成: 现有匹配 {matched_count} 行, "
+            f"追加新行 {new_rows_count} 行（表内 {len(existing_keys)} 行）"
         )
+        return {
+            "loaded": len(updates),
+            "matched": matched_count,
+            "appended": new_rows_count,
+            "sheet_rows": len(existing_keys),
+        }
 
     def _get_cell_val(self, row, col_map, col_name):
         """获取行中指定列的值"""
@@ -3520,22 +3578,29 @@ class DataService:
 
         return best_match
 
+    @staticmethod
+    def _current_params_csv_files(current_dir: Path, network_type: str) -> List[Path]:
+        """现网工参 CSV 定位（中兴网管导出命名：SDR/ITBBU/NR CellInfo）。
+
+        顶层与子目录都找（导出 ZIP 常带一层目录），按路径去重。
+        """
+        if network_type == "LTE":
+            patterns = ["LTE_SDR_CellInfo_*.csv", "LTE_ITBBU_CellInfo_*.csv"]
+        else:
+            patterns = ["NR_CellInfo_*.csv"]
+        found: Dict[str, Path] = {}
+        for pat in patterns:
+            for f in list(current_dir.glob(pat)) + list(current_dir.glob(f"**/{pat}")):
+                found[str(f)] = f
+        return list(found.values())
+
     def _load_current_params(
         self, current_dir: Path, network_type: str
     ) -> Dict[str, Dict]:
         """读取现网工参CSV文件"""
         updates = {}
 
-        if network_type == "LTE":
-            patterns = ["LTE_SDR_CellInfo_*.csv", "LTE_ITBBU_CellInfo_*.csv"]
-        else:
-            patterns = ["NR_CellInfo_*.csv"]
-
-        files = []
-        for pat in patterns:
-            files.extend(list(current_dir.glob(pat)))
-            # Also try recursive if inside subfolders
-            files.extend(list(current_dir.glob(f"**/{pat}")))
+        files = self._current_params_csv_files(current_dir, network_type)
 
         try:
             safe_print(

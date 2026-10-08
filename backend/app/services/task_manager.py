@@ -1745,6 +1745,8 @@ class TaskManager:
                 "newFileId": result.get("newFileId"),
                 "newFileName": result.get("newFileName"),
                 "savedToOriginal": result.get("savedToOriginal", False),
+                # 合并统计（匹配/新增行数）：前端据此告知用户实际更新了多少小区
+                "stats": result.get("stats") or {},
             }
             self._persist_task(task.task_id)
             logger.info(f"[TaskManager] 工参更新任务完成: {task.task_id}")
