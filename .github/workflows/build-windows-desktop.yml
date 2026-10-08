@@ -164,13 +164,18 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Get-ChildItem installer-out | Format-Table Name, Length
 
+      # artifact 只是给开发者便捷下载的通道，配额有限（GitHub 按仓库总量计），
+      # 超额会直接失败并把整个 run 标红、连带跳过后面的 Release 步骤。
+      # 安装包的正式分发渠道是 tag 触发的 Release（不占 Actions 存储），故这里不阻断。
       - uses: actions/upload-artifact@v4
+        continue-on-error: true
         with:
           name: NPT-Windows-desktop-dev
           path: dist/NetworkPlanningTool/
           retention-days: 14
 
       - uses: actions/upload-artifact@v4
+        continue-on-error: true
         with:
           name: NPT-Windows-installer
           path: installer-out/NetworkPlanningTool-Setup-*.exe
