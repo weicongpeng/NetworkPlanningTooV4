@@ -34,6 +34,17 @@ def temp_db(tmp_path, monkeypatch):
     return Session
 
 
+@pytest.fixture(autouse=True)
+def _city_presets_available(monkeypatch):
+    """显式放行本文件用到的地市：非桌面部署的默认地市清单为空（生产靠 .env 配），
+    CI 上没有 .env，绑定数据组时会被 validate_group 拦下。"""
+    from app.core.config import settings
+
+    monkeypatch.setattr(
+        settings, "NPT_CITY_PRESETS", "广州,河源,惠州,深圳", raising=False
+    )
+
+
 # ---------------------------------------------------------------- 服务端方法
 
 def test_upsert_and_list_are_group_scoped(temp_db):
