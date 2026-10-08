@@ -28,7 +28,6 @@ import { useTranslation } from 'react-i18next'
 import { useAuthStore } from '../../store/authStore'
 import { useThemeStore } from '../../store/themeStore'
 import { reloadUserMapSettings } from '../../store/mapStore'
-import { GlobalTaskIndicator } from './GlobalTaskIndicator'
 import { Toaster } from './Toaster'
 import { DesktopUpdateDialog } from '../DesktopUpdateDialog'
 import { DesktopSyncIndicator } from '../DesktopSyncIndicator'
@@ -671,7 +670,6 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
       {/* 主内容区域 */}
       <main className="flex-1 overflow-auto flex flex-col relative z-10">
 
-        <GlobalTaskIndicator />
         <DesktopSyncIndicator />
         <DesktopSessionGuard />
         {children}

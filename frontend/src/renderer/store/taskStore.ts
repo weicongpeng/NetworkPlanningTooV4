@@ -504,8 +504,7 @@ export const useTaskStore = create<TaskState>()(
             set(state => {
               const newTasks = { ...state.tasks }
               delete newTasks[taskId]
-              // 删除任务时同步清除 activeTaskIds 中的引用，
-              // 避免 GlobalTaskIndicator 显示已删除任务的进度通知
+              // 删除任务时同步清除 activeTaskIds 中的引用（各规划页据此判断"进行中"）
               const newActiveTaskIds = { ...state.activeTaskIds }
               if (state.activeTaskIds[type] === taskId) {
                 newActiveTaskIds[type] = null
