@@ -378,8 +378,10 @@ export const desktopReleasesApi = {
     return apiClient.get('/desktop-releases', { params })
   },
 
-  /** 分片上传安装包（1MB/块，绕 Cloudflare 100MB 限制；complete 步骤带管理员 token） */
-  upload: async (formData: FormData) => {
+  /** 分片上传安装包（1MB/块，绕 Cloudflare 100MB 限制；complete 步骤带管理员 token）
+   *  @param onProgress 可选进度回调（0-100）：分片占比 3-98，合并落盘阶段 99，完成 100
+   */
+  upload: async (formData: FormData, onProgress?: (percent: number) => void) => {
     const file = formData.get('file') as File
     const version = (formData.get('version') as string) || ''
     const channel = (formData.get('channel') as string) || 'stable'
@@ -401,6 +403,7 @@ export const desktopReleasesApi = {
     const startResp = await uploadClient.post(`${basePath}/start`, startForm)
     const uploadId = startResp.data?.id || startResp.data?.data?.id
     if (!uploadId) throw new Error('无法创建上传会话')
+    onProgress?.(3)
 
     for (let i = 0; i < totalChunks; i++) {
       const chunk = file.slice(i * CHUNK_SIZE, Math.min((i + 1) * CHUNK_SIZE, file.size))
@@ -413,6 +416,7 @@ export const desktopReleasesApi = {
           chunkForm.append('chunk_index', String(i))
           await uploadClient.post(`${basePath}/${uploadId}/chunk`, chunkForm)
           success = true
+          onProgress?.(3 + Math.round(((i + 1) / totalChunks) * 95))
         } catch {
           retries++
           if (retries >= MAX_RETRIES) {
@@ -423,6 +427,7 @@ export const desktopReleasesApi = {
       }
     }
 
+    onProgress?.(99)
     const completeForm = new FormData()
     completeForm.append('version', version)
     completeForm.append('channel', channel)
@@ -437,7 +442,14 @@ export const desktopReleasesApi = {
 
     const headers: Record<string, string> = {}
     if (authToken) headers['Authorization'] = `Bearer ${authToken}`
-    return uploadClient.post(`${basePath}/${uploadId}/complete`, completeForm, { headers })
+    const resp = await uploadClient.post(`${basePath}/${uploadId}/complete`, completeForm, { headers })
+    onProgress?.(100)
+    return resp
+  },
+
+  /** 最新桌面安装包公开信息（网页端「下载应用 → 电脑端」用，不需要登录） */
+  latestPublic: async (channel = 'stable') => {
+    return apiClient.get('/desktop-cloud/releases/latest', { params: { channel } })
   },
 
   update: async (

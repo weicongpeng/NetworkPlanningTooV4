@@ -4,6 +4,20 @@ import { Check, Download, Loader2, MonitorDown, Pencil, RefreshCw, Trash2, Uploa
 import type { DesktopReleaseInfo } from '@shared/types'
 import { desktopReleasesApi } from '../services/api'
 import { parallelDownload } from '../utils/parallelDownload'
+import { uploadStore } from '../store/uploadStore'
+
+/** 上传表单草稿（模块级）：切到其他页面再回来时保留已选文件与填写内容 */
+interface UploadDraft {
+  file: File | null
+  version: string
+  channel: string
+  releaseNotes: string
+  isLatest: boolean
+}
+
+// 组件卸载后仍存活的模块级草稿；上传进度由同样模块级的 uploadStore 承载，
+// 因此上传途中切换功能页面再回来时进度条仍显示当前进度
+let uploadDraft: UploadDraft = { file: null, version: '', channel: 'stable', releaseNotes: '', isLatest: true }
 
 /**
  * 桌面版安装包管理（管理员）：上传（1MB 分片）、设最新、编辑、删除、下载。
@@ -18,12 +32,14 @@ export function DesktopReleasesPage() {
   const [loading, setLoading] = useState(false)
   const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
 
-  const [uploading, setUploading] = useState(false)
-  const [file, setFile] = useState<File | null>(null)
-  const [version, setVersion] = useState('')
-  const [channel, setChannel] = useState('stable')
-  const [releaseNotes, setReleaseNotes] = useState('')
-  const [isLatest, setIsLatest] = useState(true)
+  const [draft, setDraft] = useState<UploadDraft>(() => uploadDraft)
+  // 模块级上传进度：uploadStore 跨组件实例存活，切页回来恢复当前进度
+  const [uploadProgress, setUploadProgress] = useState(uploadStore.get())
+  useEffect(() => uploadStore.subscribe(setUploadProgress), [])
+  const uploading = uploadProgress.active
+
+  // 草稿变化回写模块级变量（含文件名，供切页回来后展示）
+  useEffect(() => { uploadDraft = draft }, [draft])
 
   const [editing, setEditing] = useState<DesktopReleaseInfo | null>(null)
   const [editVersion, setEditVersion] = useState('')
@@ -55,26 +71,23 @@ export function DesktopReleasesPage() {
   }
 
   const handleUpload = async () => {
-    if (!file) return
-    setUploading(true)
+    if (!draft.file || uploading) return
+    const form = new FormData()
+    form.append('file', draft.file)
+    form.append('version', draft.version.trim())
+    form.append('channel', draft.channel.trim() || 'stable')
+    form.append('release_notes', draft.releaseNotes)
+    form.append('is_latest', draft.isLatest ? 'true' : 'false')
+    uploadStore._set({ active: true, percent: 1, step: 'uploading', sessionId: '', fileName: draft.file.name })
     try {
-      const form = new FormData()
-      form.append('file', file)
-      form.append('version', version.trim())
-      form.append('channel', channel.trim() || 'stable')
-      form.append('release_notes', releaseNotes)
-      form.append('is_latest', isLatest ? 'true' : 'false')
-      await desktopReleasesApi.upload(form)
+      await desktopReleasesApi.upload(form, (p) => uploadStore._set({ percent: p }))
       notify('success', t('desktopReleases.uploadSuccess'))
-      setFile(null)
-      setVersion('')
-      setReleaseNotes('')
-      setIsLatest(true)
+      setDraft({ file: null, version: '', channel: draft.channel, releaseNotes: '', isLatest: true })
       await fetchReleases()
     } catch (err: any) {
       notify('error', err?.message || t('desktopReleases.uploadFailed'))
     } finally {
-      setUploading(false)
+      uploadStore._set({ active: false, percent: 0, step: '', sessionId: '', fileName: '' })
     }
   }
 
@@ -160,52 +173,85 @@ export function DesktopReleasesPage() {
             <input
               type="file"
               accept=".exe"
-              onChange={(e) => setFile(e.target.files?.[0] || null)}
-              className="w-full text-sm"
+              disabled={uploading}
+              onChange={(e) => setDraft((d) => ({ ...d, file: e.target.files?.[0] || null }))}
+              className="w-full text-sm disabled:opacity-50"
             />
           </div>
           <div>
             <label className="block text-xs text-muted-foreground mb-1">{t('desktopReleases.versionLabel')}</label>
             <input
-              value={version}
-              onChange={(e) => setVersion(e.target.value)}
+              value={draft.version}
+              disabled={uploading}
+              onChange={(e) => setDraft((d) => ({ ...d, version: e.target.value }))}
               placeholder="1.0.0"
-              className="w-full px-3 py-2 bg-background border border-border rounded-lg text-sm"
+              className="w-full px-3 py-2 bg-background border border-border rounded-lg text-sm disabled:opacity-50"
             />
           </div>
           <div>
             <label className="block text-xs text-muted-foreground mb-1">{t('desktopReleases.channelLabel')}</label>
             <input
-              value={channel}
-              onChange={(e) => setChannel(e.target.value)}
+              value={draft.channel}
+              disabled={uploading}
+              onChange={(e) => setDraft((d) => ({ ...d, channel: e.target.value }))}
               placeholder="stable"
-              className="w-full px-3 py-2 bg-background border border-border rounded-lg text-sm"
+              className="w-full px-3 py-2 bg-background border border-border rounded-lg text-sm disabled:opacity-50"
             />
           </div>
           <div className="md:col-span-2 xl:col-span-4">
             <label className="block text-xs text-muted-foreground mb-1">{t('desktopReleases.notesLabel')}</label>
             <textarea
-              value={releaseNotes}
-              onChange={(e) => setReleaseNotes(e.target.value)}
+              value={draft.releaseNotes}
+              disabled={uploading}
+              onChange={(e) => setDraft((d) => ({ ...d, releaseNotes: e.target.value }))}
               rows={2}
-              className="w-full px-3 py-2 bg-background border border-border rounded-lg text-sm"
+              className="w-full px-3 py-2 bg-background border border-border rounded-lg text-sm disabled:opacity-50"
             />
           </div>
         </div>
         <div className="mt-3 pt-3 border-t border-border flex flex-wrap items-center gap-4">
           <label className="flex items-center gap-2 text-sm">
-            <input type="checkbox" checked={isLatest} onChange={(e) => setIsLatest(e.target.checked)} />
+            <input
+              type="checkbox"
+              checked={draft.isLatest}
+              disabled={uploading}
+              onChange={(e) => setDraft((d) => ({ ...d, isLatest: e.target.checked }))}
+            />
             {t('desktopReleases.setLatestLabel')}
           </label>
           <button
             onClick={handleUpload}
-            disabled={uploading || !file || !version.trim()}
+            disabled={uploading || !draft.file || !draft.version.trim()}
             className="ml-auto px-4 py-2 bg-primary text-primary-foreground rounded-lg hover:opacity-90 disabled:opacity-50 text-sm font-medium flex items-center gap-1.5"
           >
             {uploading ? <Loader2 size={14} className="animate-spin" /> : <Upload size={14} />}
             {uploading ? t('desktopReleases.uploading') : t('desktopReleases.uploadButton')}
           </button>
         </div>
+        {/* 上传进度条（模块级 uploadStore：上传中切到其他页面，回来仍显示当前进度） */}
+        {uploading && (
+          <div className="mt-3">
+            <div className="h-2 bg-muted rounded-full overflow-hidden">
+              <div
+                className="h-full bg-primary transition-all duration-300"
+                style={{ width: `${Math.max(2, Math.min(100, uploadProgress.percent))}%` }}
+              />
+            </div>
+            <div className="flex items-center justify-between mt-1">
+              <p className="text-xs text-muted-foreground truncate">
+                {t('desktopReleases.uploadProgress', {
+                  name: uploadProgress.fileName || draft.file?.name || '',
+                  percent: Math.min(100, uploadProgress.percent),
+                })}
+              </p>
+              <span className="text-xs text-muted-foreground shrink-0">
+                {uploadProgress.percent >= 99
+                  ? t('desktopReleases.merging', 'Merging…')
+                  : `${Math.min(100, uploadProgress.percent)}%`}
+              </span>
+            </div>
+          </div>
+        )}
         <p className="text-xs text-muted-foreground mt-2">{t('desktopReleases.uploadHint')}</p>
       </div>
 

@@ -33,7 +33,7 @@ import { DesktopUpdateDialog } from '../DesktopUpdateDialog'
 import { DesktopSyncIndicator } from '../DesktopSyncIndicator'
 import { useDesktopStatusLabel } from '../desktopStatusLabel'
 import { DesktopSessionGuard } from '../DesktopSessionGuard'
-import { appVersionsApi, desktopCloudApi } from '../../services/api'
+import { appVersionsApi, desktopCloudApi, desktopReleasesApi } from '../../services/api'
 import { prefetchPage } from '../../pageLoaders'
 
 // ===== APP 悬浮图标：可拖拽移动、松手吸附最近左右边缘，位置按登录用户持久化 =====
@@ -208,10 +208,20 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
     setExpandedGroups(nextExpanded)
   }
 
-  // ===== 手机APP下载弹窗 =====
+  // ===== 应用下载弹窗（手机APP / 电脑端） =====
   const [showAppDownload, setShowAppDownload] = useState(false)
+  // 桌面端形态本身就是电脑端，不提供「电脑端」下载栏
+  const [appTab, setAppTab] = useState<'mobile' | 'desktop'>('mobile')
   const [latestVersion, setLatestVersion] = useState<any>(null)
   const [versionLoading, setVersionLoading] = useState(false)
+  // 电脑端：桌面版安装包分发（公开接口取最新版本，点击后交给浏览器下载）
+  const [desktopRelease, setDesktopRelease] = useState<any>(null)
+  const [desktopVersionLoading, setDesktopVersionLoading] = useState(false)
+
+  // 打开弹窗时回到「手机APP」栏（原有下载方式不变）
+  useEffect(() => {
+    if (showAppDownload) setAppTab('mobile')
+  }, [showAppDownload])
 
   useEffect(() => {
     if (!showAppDownload) return
@@ -226,6 +236,19 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
       .catch(() => setLatestVersion(null))
       .finally(() => setVersionLoading(false))
   }, [showAppDownload, desktopMode])
+
+  // 电脑端版本：切换/打开该栏时按需拉取（取桌面版分发里发布的安装包）
+  useEffect(() => {
+    if (!showAppDownload || appTab !== 'desktop' || desktopMode) return
+    setDesktopVersionLoading(true)
+    desktopReleasesApi
+      .latestPublic()
+      .then((res: any) => {
+        setDesktopRelease(res?.success && res?.data ? res.data : null)
+      })
+      .catch(() => setDesktopRelease(null))
+      .finally(() => setDesktopVersionLoading(false))
+  }, [showAppDownload, appTab, desktopMode])
 
   const getFullDownloadUrl = (downloadUrl: string) => {
     if (!downloadUrl) return ''
@@ -656,7 +679,7 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
         </aside>
       </div>
 
-      {/* 手机APP悬浮图标：可拖拽移动，默认吸附右侧中部，位置按用户持久化；点击打开下载弹窗 */}
+      {/* 应用下载悬浮图标：可拖拽移动，默认吸附右侧中部，位置按用户持久化；点击打开下载弹窗 */}
       <button
         onPointerDown={onAppIconPointerDown}
         onPointerMove={onAppIconPointerMove}
@@ -665,7 +688,7 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
         style={{ left: appIconPos.x, top: appIconPos.y, cursor: 'grab' }}
         title={t('app.downloadTitle')}
       >
-        <Smartphone size={18} />
+        <Download size={18} />
       </button>
       {/* 主内容区域 */}
       <main className="flex-1 overflow-auto flex flex-col relative z-10">
@@ -675,7 +698,7 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
         {children}
       </main>
 
-      {/* 手机APP下载弹窗 - 放在 main 外部避免地图组件层叠上下文遮挡 */}
+      {/* 应用下载弹窗（手机APP / 电脑端）- 放在 main 外部避免地图组件层叠上下文遮挡 */}
       {showAppDownload && (
         <div
           className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/50"
@@ -688,7 +711,7 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
               {/* 弹窗头部 */}
               <div className="flex items-center justify-between px-5 py-4 border-b border-border">
                 <h2 className="font-semibold text-foreground flex items-center gap-2">
-                  <Smartphone size={18} />
+                  <Download size={18} />
                   {t('app.downloadTitle')}
                 </h2>
                 <button
@@ -699,9 +722,75 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
                 </button>
               </div>
 
+              {/* 下载方式切换：手机APP / 电脑端（桌面端形态不显示电脑端） */}
+              {!desktopMode && (
+                <div className="flex gap-1 px-5 pt-4">
+                  {([
+                    { key: 'mobile' as const, icon: Smartphone, label: t('app.tabMobile') },
+                    { key: 'desktop' as const, icon: MonitorDown, label: t('app.tabDesktop') },
+                  ]).map((tab) => {
+                    const TabIcon = tab.icon
+                    const active = appTab === tab.key
+                    return (
+                      <button
+                        key={tab.key}
+                        onClick={() => setAppTab(tab.key)}
+                        className={`flex-1 flex items-center justify-center gap-1.5 py-2 text-sm rounded-lg border transition-colors ${
+                          active
+                            ? 'bg-primary text-primary-foreground border-primary'
+                            : 'border-border text-muted-foreground hover:bg-muted'
+                        }`}
+                      >
+                        <TabIcon size={14} />
+                        {tab.label}
+                      </button>
+                    )
+                  })}
+                </div>
+              )}
+
               {/* 弹窗内容 */}
               <div className="p-5 flex flex-col items-center space-y-4">
-                {versionLoading ? (
+                {appTab === 'desktop' ? (
+                  /* 电脑端：从桌面版分发取最新安装包，点击后由浏览器接管下载 */
+                  desktopVersionLoading ? (
+                    <div className="py-8 text-muted-foreground flex flex-col items-center gap-2">
+                      <Loader2 size={24} className="animate-spin" />
+                      <span className="text-sm">{t('app.loadingVersion')}</span>
+                    </div>
+                  ) : desktopRelease ? (
+                    <>
+                      <MonitorDown size={44} className="text-primary" />
+                      <div className="text-center">
+                        <p className="text-sm font-semibold text-foreground">
+                          {t('app.latestVersion')} V{desktopRelease.version}
+                          {desktopRelease.file_size_display ? ` · ${desktopRelease.file_size_display}` : ''}
+                        </p>
+                        {desktopRelease.release_notes && (
+                          <p className="text-xs text-muted-foreground mt-1 max-w-xs whitespace-pre-line">
+                            {desktopRelease.release_notes}
+                          </p>
+                        )}
+                      </div>
+                      <p className="text-xs text-muted-foreground">{t('app.desktopInstallHint')}</p>
+                      {/* 交给浏览器下载（新标签），与 APK 的 <a download> 行为区分：安装包走浏览器下载管理 */}
+                      <a
+                        href={getFullDownloadUrl(desktopRelease.download_url)}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="inline-flex items-center gap-2 px-6 py-2.5 bg-primary text-primary-foreground rounded-lg hover:opacity-90 transition-opacity text-sm font-medium"
+                      >
+                        <Download size={16} />
+                        <span>{t('app.downloadDesktop')}</span>
+                      </a>
+                    </>
+                  ) : (
+                    <div className="py-8 text-muted-foreground text-center">
+                      <p className="text-sm">{t('app.desktopNoVersion')}</p>
+                      <p className="text-xs mt-1">{t('app.desktopUploadHint')}</p>
+                    </div>
+                  )
+                ) : versionLoading ? (
                   <div className="py-8 text-muted-foreground flex flex-col items-center gap-2">
                     <Loader2 size={24} className="animate-spin" />
                     <span className="text-sm">{t('app.loadingVersion')}</span>

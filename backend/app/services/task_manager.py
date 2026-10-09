@@ -3510,8 +3510,9 @@ class TaskManager:
                 from app.services.data_group import user_group as _dg_user_group
                 _grp = _dg_user_group(user) or (None, None)
                 current_sector_values = self._load_current_sector_values(db, city=_grp[0], operator=_grp[1])
-                # 当前全量工参版本（用于 isApplied 验证缓存失效判断）
-                full_params_id = TaskManager._sector_values_cache.get("_full_params_id") if TaskManager._sector_values_cache else None
+                # 当前全量工参快照（工参 id + 内容指纹）：切换工参条目或工参内容变化时
+                # 「已应用」验证缓存整体失效，避免导入新工参后仍按旧值判定
+                params_snapshot = TaskManager._sector_values_cache.get("_cache_key") if TaskManager._sector_values_cache else None
 
                 # 🔥 优化：批量预取缓存未命中的 result_json（一次查询），
                 # 避免 defer 懒加载在循环中逐条触发 SELECT
@@ -3521,7 +3522,7 @@ class TaskManager:
                     r.task_id for r in results
                     if not (
                         TaskManager._history_verify_cache.get(r.task_id)
-                        and TaskManager._history_verify_cache[r.task_id][0] == full_params_id
+                        and TaskManager._history_verify_cache[r.task_id][0] == params_snapshot
                         and len(TaskManager._history_verify_cache[r.task_id]) > 3
                         and TaskManager._history_verify_cache[r.task_id][3] == bool(r.is_applied)
                     )
@@ -3542,7 +3543,7 @@ class TaskManager:
                     result_summary = None
                     # 缓存命中（同任务 + 同工参版本 + 同应用标记）：跳过大 result_json 的 json.loads
                     cached = TaskManager._history_verify_cache.get(r.task_id)
-                    if (cached and cached[0] == full_params_id
+                    if (cached and cached[0] == params_snapshot
                             and len(cached) > 3 and cached[3] == stored_applied):
                         is_applied = cached[1]
                         result_summary = cached[2]
@@ -3567,7 +3568,7 @@ class TaskManager:
                             # 否则桌面端历史列表「小区数量」列恒为 '-'
                             result_summary = {"cellCount": int(r.cell_count)}
                         TaskManager._history_verify_cache[r.task_id] = (
-                            full_params_id, is_applied, result_summary, stored_applied)
+                            params_snapshot, is_applied, result_summary, stored_applied)
                         # 防止缓存无限增长
                         if len(TaskManager._history_verify_cache) > TaskManager._history_verify_cache_max:
                             TaskManager._history_verify_cache.clear()
@@ -3594,17 +3595,87 @@ class TaskManager:
             return {"tasks": [], "total": 0, "page": 1, "page_size": page_size}
 
     @staticmethod
+    def _norm_cell_id(value: Any) -> str:
+        """站点/小区标识归一化：Excel、CSV 常把整数写成浮点（32 → "32.0"），
+        而 SQLite 里存的是 "32"，两侧必须按同一口径建键，否则「已应用」会漏判。
+        只对带小数点的整数串做归一（"0123" 这类带前导零的标识保持原样）。
+        """
+        text = str(value if value is not None else "").strip()
+        if "." not in text:
+            return text
+        try:
+            number = float(text)
+        except ValueError:
+            return text
+        return str(int(number)) if number.is_integer() else text
+
+    @staticmethod
+    def _same_param_value(current: Any, expected: Any) -> bool:
+        """参数值比较：数值型按数值比（486 == "486.0"），非数值按去空格字符串比。"""
+        if current is None or expected is None:
+            return current is None and expected is None
+        if current == expected:
+            return True
+
+        def _to_number(value: Any) -> Optional[float]:
+            if isinstance(value, bool):
+                return None
+            if isinstance(value, (int, float)):
+                return float(value)
+            try:
+                return float(str(value).strip())
+            except ValueError:
+                return None
+
+        num_cur = _to_number(current)
+        num_exp = _to_number(expected)
+        if num_cur is not None and num_exp is not None:
+            return num_cur == num_exp
+        return str(current).strip() == str(expected).strip()
+
+    @staticmethod
+    def _full_params_fingerprint(db, workbook_id: Optional[str]) -> str:
+        """全量工参内容指纹（一次聚合查询）：工参 id + 小区数 + PCI/TAC 聚合值。
+
+        用途：历史任务「已应用」判定必须反映工参的**当前内容**，而不是只反映工参条目的 id。
+        导入/同步一份新工参（可能沿用同一 id）、小区批量改 PCI/TAC 等操作都会改变这些
+        聚合值，从而让验证缓存立即失效；只靠 id + 300s TTL 会在最长 5 分钟内给出错配结果。
+        """
+        if not workbook_id:
+            return ""
+        try:
+            from sqlalchemy import text
+
+            row = db.execute(
+                text(
+                    "SELECT COUNT(*), "
+                    "COALESCE(SUM(COALESCE(pci, 0)), 0), "
+                    "COALESCE(SUM(LENGTH(COALESCE(tac, ''))), 0), "
+                    "COALESCE(SUM(CAST(tac AS INTEGER)), 0) "
+                    "FROM sectors WHERE workbook_id = :wb"
+                ),
+                {"wb": workbook_id},
+            ).first()
+            if row is None:
+                return f"{workbook_id}|0"
+            return f"{workbook_id}|{int(row[0] or 0)}|{int(row[1] or 0)}|{int(row[2] or 0)}|{int(row[3] or 0)}"
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[TaskManager] 计算工参指纹失败: {exc}")
+            return f"{workbook_id}|unknown"
+
+    @staticmethod
     def _load_current_sector_values(db, city: Optional[str] = None, operator: Optional[str] = None) -> Dict[str, Dict]:
         """加载当前全量工参中所有小区的实际 PCI/TAC 值，返回 {siteId_sectorId: {pci, tac}}
 
         city/operator: (地市+运营商) 组快照，严格组内定位全量工参；组不完整返回空。
-        缓存按（组 + full_params_id）区分，避免跨组串值。
+        缓存按（组 + full_params_id + 内容指纹）区分，避免跨组串值与内容已变但 id 未变的误判。
 
-        🔥 优化：缓存失效优先依赖 inplace_updated 信号（应用操作设置），
+        🔥 优化：缓存失效依赖内容指纹 + inplace_updated 信号（应用操作设置），
         避免每次历史列表请求都全量查询 SQLite（生产环境几万行，ARM 芯片耗时数秒）。
-        只有以下任一情况才重新查询：
+        只有以下任一情况才重新全表加载：
         - 缓存不存在
         - full_params_id 变化（切换了全量工参文件）
+        - 内容指纹变化（同 id 被重写 / 小区批量改 PCI 或 TAC / 导入的新工参与旧值不同）
         - 发生原地更新（inplace_updated=True，PCI/TAC 应用后设置）
         - TTL 兜底过期（防止未标记的工参变更）
         """
@@ -3615,17 +3686,20 @@ class TaskManager:
         current_time = _time.time()
         # 当前全量工参 workbook_id（严格组内定位；组不完整为 None → 返回空）
         current_full_params_id = TaskManager._resolve_full_params_id(city, operator)
+        # 内容指纹：同步/导入一份内容不同但 id 相同的工参也能识别出来
+        current_fingerprint = TaskManager._full_params_fingerprint(db, current_full_params_id)
 
-        # 🔥 缓存命中条件：组+id 匹配 + 未发生原地更新 + TTL 兜底内
+        # 🔥 缓存命中条件：组 + id + 内容指纹匹配 + 未发生原地更新 + TTL 兜底内
         cached = TaskManager._sector_values_cache
         if (cached
                 and cached.get("_group") == (city, operator)
                 and cached.get("_full_params_id") == current_full_params_id
+                and cached.get("_fingerprint") == current_fingerprint
                 and not data_service.index.get(current_full_params_id, {}).get("inplace_updated")
                 and (current_time - TaskManager._sector_values_cache_time) < TaskManager._sector_values_cache_ttl):
             return cached.get("values", {})
 
-        # 需要重新加载（full_params_id 变化 / 原地更新 / TTL 兜底）
+        # 需要重新加载（full_params_id / 内容指纹变化 / 原地更新 / TTL 兜底）
         full_params_id = current_full_params_id
         if not full_params_id:
             return {}
@@ -3639,7 +3713,8 @@ class TaskManager:
             Site.workbook_id == full_params_id
         ).all()
         for row in rows:
-            key = f"{row.site_id}_{row.sector_id}"
+            # 标识归一化：保证「32.0」与「32」这两种写法命中同一个键
+            key = f"{TaskManager._norm_cell_id(row.site_id)}_{TaskManager._norm_cell_id(row.sector_id)}"
             rec = {}
             if row.pci is not None:
                 rec["pci"] = row.pci
@@ -3654,6 +3729,9 @@ class TaskManager:
         TaskManager._sector_values_cache = {
             "_group": (city, operator),
             "_full_params_id": full_params_id,
+            "_fingerprint": current_fingerprint,
+            # 合并键：历史任务验证缓存按此键整体失效（换工参或工参内容变化都算）
+            "_cache_key": f"{full_params_id}|{current_fingerprint}",
             "values": values,
         }
         TaskManager._sector_values_cache_time = current_time
@@ -3682,35 +3760,35 @@ class TaskManager:
                     site_id = str(site_result.get("siteId", ""))
                     for sector in site_result.get("sectors", []):
                         sector_id = str(sector.get("sectorId", ""))
-                        key = f"{site_id}_{sector_id}"
+                        key = f"{TaskManager._norm_cell_id(site_id)}_{TaskManager._norm_cell_id(sector_id)}"
                         cur = current_values.get(key)
                         if cur is None:
                             return False
                         new_pci = sector.get("newPCI")
-                        if new_pci is not None and cur.get("pci") != new_pci:
+                        if new_pci is not None and not TaskManager._same_param_value(cur.get("pci"), new_pci):
                             return False
                         new_tac = sector.get("tac")
                         if new_tac is not None:
                             cur_tac = cur.get("tac")
-                            if cur_tac is not None and str(cur_tac).strip() != str(new_tac).strip():
-                                return False
                             if cur_tac is None:
+                                return False
+                            if not TaskManager._same_param_value(cur_tac, new_tac):
                                 return False
             else:
                 # 扁平格式（TAC核查/TAC规划）
                 for item in task_results:
                     site_id = str(item.get("siteId", ""))
                     sector_id = str(item.get("sectorId", ""))
-                    key = f"{site_id}_{sector_id}"
+                    key = f"{TaskManager._norm_cell_id(site_id)}_{TaskManager._norm_cell_id(sector_id)}"
                     cur = current_values.get(key)
                     if cur is None:
                         return False
                     new_tac = item.get("tac") or item.get("suggestedTac")
                     if new_tac is not None:
                         cur_tac = cur.get("tac")
-                        if cur_tac is not None and str(cur_tac).strip() != str(new_tac).strip():
-                            return False
                         if cur_tac is None:
+                            return False
+                        if not TaskManager._same_param_value(cur_tac, new_tac):
                             return False
 
             return True
