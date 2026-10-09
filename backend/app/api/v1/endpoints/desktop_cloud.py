@@ -1072,6 +1072,8 @@ async def latest_release(
     """返回指定渠道的最新桌面版（公开）。update_available 由服务端按版本比较给出。"""
     from app.models.database import DesktopRelease
 
+    from pathlib import Path
+
     channel = (channel or "stable").strip() or "stable"
     record = (
         db.query(DesktopRelease)
@@ -1079,13 +1081,19 @@ async def latest_release(
         .order_by(DesktopRelease.id.desc())
         .first()
     )
+    # 文件已被删掉/迁移（目录手工清理）时不能返回它：客户端下载会 404，
+    # 回退到同渠道里文件仍在的最高版本
+    if record is not None and not (record.file_path and Path(record.file_path).is_file()):
+        record = None
     if record is None:
-        record = (
+        candidates = (
             db.query(DesktopRelease)
             .filter(DesktopRelease.channel == channel)
             .order_by(DesktopRelease.id.desc())
-            .first()
+            .all()
         )
+        usable = [r for r in candidates if r.file_path and Path(r.file_path).is_file()]
+        record = max(usable, key=lambda r: _release_version_key(r.version)) if usable else None
     if record is None:
         return {"success": True, "data": None}
 

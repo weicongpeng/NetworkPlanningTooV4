@@ -143,6 +143,53 @@ def test_missing_chunk_rejected(ota):
     assert "缺失" in resp.json()["detail"]
 
 
+def test_manually_copied_installer_is_registered(ota):
+    """手工放进 desktop_releases 目录的安装包：打开列表即登记，且能被 OTA 拉到。"""
+    import pathlib
+
+    target = pathlib.Path(ota.releases_dir) / "NetworkPlanningTool-Setup-0.0.6.exe"
+    target.write_bytes(PAYLOAD)
+
+    resp = ota.client.get("/api/v1/desktop-releases", params={"page": 1, "page_size": 20})
+    assert resp.status_code == 200, resp.text
+    items = resp.json()["data"]["items"]
+    assert resp.json()["data"]["imported"] == 1
+    item = next(i for i in items if i["filename"] == target.name)
+    assert item["version"] == "0.0.6"
+    assert item["is_latest"] is True
+    assert item["file_missing"] is False
+    assert item["sha256"] == hashlib.sha256(PAYLOAD).hexdigest()
+
+    # 同一份文件再次打开列表不重复登记
+    resp = ota.client.get("/api/v1/desktop-releases", params={"page": 1, "page_size": 20})
+    assert resp.json()["data"]["imported"] == 0
+    assert len(resp.json()["data"]["items"]) == 1
+
+    # OTA 能拿到它
+    latest = ota.client.get("/api/v1/desktop-cloud/releases/latest").json()["data"]
+    assert latest["version"] == "0.0.6"
+
+
+def test_missing_installer_file_is_reported_and_skipped(ota):
+    """安装包文件被删掉：列表标「文件缺失」，OTA 不再把它当最新版。"""
+    import pathlib
+
+    data = _upload(ota, version="2.0.0")
+    pathlib.Path(data["file_path"]).unlink()
+
+    resp = ota.client.get("/api/v1/desktop-releases", params={"page": 1, "page_size": 20})
+    items = resp.json()["data"]["items"]
+    assert items[0]["file_missing"] is True
+    assert ota.client.get("/api/v1/desktop-cloud/releases/latest").json()["data"] is None
+
+    # 手工放一份可用包回来 → OTA 立刻可用（不因缺失记录恢复旧版）
+    (pathlib.Path(ota.releases_dir) / "NetworkPlanningTool-Setup-2.0.1.exe").write_bytes(PAYLOAD)
+    resp = ota.client.get("/api/v1/desktop-releases", params={"page": 1, "page_size": 20})
+    assert resp.status_code == 200
+    latest = ota.client.get("/api/v1/desktop-cloud/releases/latest").json()["data"]
+    assert latest["version"] == "2.0.1"
+
+
 def test_latest_version_comparison(ota):
     _upload(ota, version="1.0.0")
     resp = ota.client.get("/api/v1/desktop-cloud/releases/latest", params={"current": "0.9.0"})

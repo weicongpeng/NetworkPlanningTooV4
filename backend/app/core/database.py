@@ -153,6 +153,19 @@ def init_db():
         if av_cols and "download_count" not in av_cols:
             conn.exec_driver_sql("ALTER TABLE app_versions ADD COLUMN download_count INTEGER DEFAULT 0")
 
+        # 迁移：desktop_releases 移除已下线的 mandatory 列
+        # 「强制更新」功能已下线，模型里删掉了该列，但旧库残留 mandatory BOOLEAN NOT NULL
+        # （无默认值）→ 所有新插入都报 NOT NULL constraint failed，上传安装包直接 500。
+        dr_cols = [row[1] for row in conn.exec_driver_sql("PRAGMA table_info(desktop_releases)").fetchall()]
+        if "mandatory" in dr_cols:
+            import logging
+            _dr_logger = logging.getLogger(__name__)
+            try:
+                conn.exec_driver_sql("ALTER TABLE desktop_releases DROP COLUMN mandatory")
+                _dr_logger.info("✅ desktop_releases 已移除废弃的 mandatory 列")
+            except Exception as exc:  # noqa: BLE001
+                _dr_logger.error(f"❌ 移除 desktop_releases.mandatory 失败（上传安装包会失败）: {exc}")
+
         # 迁移：数据按（地市+运营商）分组隔离 —— 各业务表添加组归属列
         # 存量行保持 NULL = 仅管理员可见；新数据写入时由上传者/工参所属组盖章
         for table in (

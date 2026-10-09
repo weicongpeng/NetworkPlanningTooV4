@@ -72,6 +72,8 @@ export interface DesktopReleaseInfo {
   created_by?: string | null
   created_at: string
   updated_at?: string | null
+  /** 安装包文件已不在磁盘上（手工清理/迁移）→ 不可用于 OTA */
+  file_missing?: boolean
 }
 
 /** 桌面版授权记录（管理端） */

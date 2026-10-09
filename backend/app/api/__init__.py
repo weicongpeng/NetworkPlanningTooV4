@@ -151,6 +151,23 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"❌ 用户数据库初始化失败: {e}")
 
+    # 服务器端：登记手工放进 desktop_releases 目录的安装包（OTA 与分发页才看得到）
+    # 只在服务器形态做（桌面端不分发安装包），失败不影响启动
+    try:
+        if not settings.NPT_DESKTOP:
+            from app.core.database import SessionLocal
+            from app.api.v1.endpoints.desktop_releases import _import_local_files
+
+            db = SessionLocal()
+            try:
+                imported = _import_local_files(db)
+            finally:
+                db.close()
+            if imported:
+                logger.info(f"✅ 已登记 {len(imported)} 个本地安装包")
+    except Exception as e:
+        logger.warning(f"⚠️ 扫描本地安装包目录失败: {e}")
+
     # 桌面模式：同步签名授权到期日到 admin（前端展示依赖，失败不影响授权校验）
     try:
         if settings.NPT_DESKTOP:

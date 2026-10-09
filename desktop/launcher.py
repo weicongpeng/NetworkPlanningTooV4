@@ -34,6 +34,12 @@ READY_PATH = "/api/v1/system/status"
 READY_TIMEOUT_SECONDS = 120
 # OTA 安装 helper 会等本进程退出后才静默安装；窗口关闭超过该秒数仍存活则强制结束进程
 EXIT_GRACE_SECONDS = 20
+# 本机后端端口：必须是固定值，否则每次启动 origin（含端口）都变，WebView2 的
+# localStorage 会整体重置 —— 语言/主题/登录态等设置永远"保存不住"。
+# 端口被占用时向上找一个空闲端口并记进 DATA_ROOT/last_port.json，下次优先复用。
+PREFERRED_PORT = 18789
+PREFERRED_PORT_TRIES = 20
+PORT_STATE_FILE = "last_port.json"
 
 _MUTEX_HANDLE: Optional[int] = None
 _log = logging.getLogger("desktop")
@@ -192,12 +198,73 @@ def _release_single_instance() -> None:
 
 # -------------------------------------------------------------- 服务与窗口
 
-def _create_bound_socket() -> Tuple[socket.socket, int]:
-    """绑定 127.0.0.1 的随机空闲端口，返回已监听 socket 与实际端口。"""
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.bind(("127.0.0.1", 0))
-    sock.listen(128)
-    return sock, sock.getsockname()[1]
+def _saved_port_path(data_root: Optional[Path]) -> Optional[Path]:
+    return data_root / PORT_STATE_FILE if data_root else None
+
+
+def _read_saved_port(data_root: Optional[Path]) -> Optional[int]:
+    """上次成功监听的端口（保证 origin 稳定）。"""
+    path = _saved_port_path(data_root)
+    if not path or not path.is_file():
+        return None
+    try:
+        value = json.loads(path.read_text(encoding="utf-8")).get("port")
+        return int(value) if isinstance(value, int) else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _write_saved_port(data_root: Optional[Path], port: int) -> None:
+    path = _saved_port_path(data_root)
+    if not path:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"port": port}), encoding="utf-8")
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("记录本机端口失败（不影响启动）：%s", exc)
+
+
+def _try_bind(port: int) -> Optional[socket.socket]:
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        # 上次进程刚退出时端口可能处于 TIME_WAIT，允许复用
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(("127.0.0.1", port))
+        sock.listen(128)
+        return sock
+    except OSError:
+        try:
+            sock.close()
+        except Exception:  # noqa: BLE001
+            pass
+        return None
+
+
+def _create_bound_socket(data_root: Optional[Path] = None) -> Tuple[socket.socket, int]:
+    """绑定 127.0.0.1 的稳定端口，返回已监听 socket 与实际端口。
+
+    端口必须尽量固定：WebView2 的 localStorage 按 origin（含端口）隔离，
+    随机端口会让语言/主题/登录态等本地设置每次启动都被清空。
+    """
+    candidates: list = []
+    saved = _read_saved_port(data_root)
+    if saved:
+        candidates.append(saved)
+    candidates.extend(range(PREFERRED_PORT, PREFERRED_PORT + PREFERRED_PORT_TRIES))
+    for port in candidates:
+        sock = _try_bind(port)
+        if sock is not None:
+            _write_saved_port(data_root, port)
+            return sock, port
+    # 兜底：系统分配空闲端口（仍记录下来，下次优先复用）
+    sock = _try_bind(0)
+    if sock is None:  # pragma: no cover - 极端情况
+        raise RuntimeError("无法绑定本机回环端口")
+    port = sock.getsockname()[1]
+    _write_saved_port(data_root, port)
+    _log.warning("固定端口均被占用，本次使用随机端口 %s（本地设置可能无法保留）", port)
+    return sock, port
 
 
 def _start_server(sock: socket.socket) -> Tuple[Any, threading.Thread]:
@@ -332,7 +399,7 @@ def main(argv: Optional[list] = None) -> int:
         _message_box("程序已在运行，请在任务栏切换到已打开的窗口。", 0x40)
         return 0
 
-    sock, port = _create_bound_socket()
+    sock, port = _create_bound_socket(data_root)
     _log.info("后端监听 127.0.0.1:%s", port)
     server, thread = _start_server(sock)
     if not _wait_ready(port):

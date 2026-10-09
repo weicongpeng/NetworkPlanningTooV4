@@ -253,6 +253,7 @@ export function DesktopReleasesPage() {
           </div>
         )}
         <p className="text-xs text-muted-foreground mt-2">{t('desktopReleases.uploadHint')}</p>
+        <p className="text-xs text-muted-foreground mt-1">{t('desktopReleases.localImportHint')}</p>
       </div>
 
       {message && (
@@ -287,6 +288,14 @@ export function DesktopReleasesPage() {
                   {item.is_latest && (
                     <span className="ml-2 px-1.5 py-0.5 rounded bg-primary/10 text-primary text-xs">
                       {t('desktopReleases.latestBadge')}
+                    </span>
+                  )}
+                  {item.file_missing && (
+                    <span
+                      className="ml-2 px-1.5 py-0.5 rounded bg-red-500/10 text-red-500 text-xs"
+                      title={t('desktopReleases.fileMissingHint')}
+                    >
+                      {t('desktopReleases.fileMissing')}
                     </span>
                   )}
                 </td>
