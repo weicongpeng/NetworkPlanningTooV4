@@ -257,6 +257,10 @@ def test_standalone_login_pending(local_env):
 
 def test_standalone_login_forces_offline(local_env):
     """单机模式不共享数据：登录后同步模式强制离线，且不能切回共享。"""
+    # 组兜底依赖地市预设：CI 无 .env 时预设为空，这里显式放行（与其它用例一致）
+    local_env.monkeypatch.setattr(
+        local_env.settings, "NPT_CITY_PRESETS", "广州,河源,惠州,深圳", raising=False
+    )
     local_env.monkeypatch.setattr(
         local_env.cloud,
         "login",
@@ -464,8 +468,12 @@ def test_standalone_expired_license_prompts_expiry(local_env):
     assert "过期" in detail and "联网" in detail
 
 
-def test_standalone_shared_license_offline_prompts_mismatch(local_env):
-    """本机许可是共享模式：单机离线登录不可用，提示联网切换。"""
+def test_standalone_offline_login_accepts_shared_license(local_env):
+    """已授权用户（本机许可是共享模式）断网也能进单机模式：不再要求联网切换。
+
+    2026-10-09 调整：单机模式离线登录只要求"本机许可有效 + 归属账号匹配 + 本机密码正确"，
+    许可模式（shared/standalone）不再阻断；需要联网的续期/校验等有网后再做。
+    """
     shared = local_env.make_license(mode="shared")
     (local_env.settings.LICENSE_DIR / "license.nptlic").write_text(shared, encoding="utf-8")
 
@@ -473,12 +481,90 @@ def test_standalone_shared_license_offline_prompts_mismatch(local_env):
         raise local_env.cloud.CloudError(0, "无法连接授权服务器")
 
     local_env.monkeypatch.setattr(local_env.cloud, "login", boom)
+    local_env.monkeypatch.setattr(
+        local_env.desktop_local, "_issue_local_token", lambda db, user, days=None: "offline-token"
+    )
+    # 本机镜像账号（此前联机登录过）
+    db = local_env.session_factory()
+    try:
+        db.add(User(username="alice", password_hash=auth_service.hash_password("pwd123"), is_active=True))
+        db.commit()
+    finally:
+        db.close()
+
     resp = local_env.client.post(
         "/api/v1/desktop/login",
         json={"username": "alice", "password": "pwd123", "mode": "standalone"},
     )
-    assert resp.status_code == 403, resp.text
-    assert "共享模式" in resp.json()["detail"]
+    assert resp.status_code == 200, resp.text
+    data = resp.json()["data"]
+    assert data["offline"] is True
+    assert data["access_token"] == "offline-token"
+
+
+def test_standalone_offline_login_admin_without_license(local_env):
+    """管理员完全免授权：本机无许可，凭本机镜像管理员账号 + 密码也能离线登录。"""
+    def boom(*a, **kw):
+        raise local_env.cloud.CloudError(0, "无法连接授权服务器")
+
+    local_env.monkeypatch.setattr(local_env.cloud, "login", boom)
+    local_env.monkeypatch.setattr(
+        local_env.desktop_local, "_issue_local_token", lambda db, user, days=None: "admin-token"
+    )
+    db = local_env.session_factory()
+    try:
+        db.add(User(
+            username="root", password_hash=auth_service.hash_password("pwd123"),
+            is_active=True, is_admin=True, city="河源", operator="电信",
+        ))
+        db.commit()
+    finally:
+        db.close()
+
+    resp = local_env.client.post(
+        "/api/v1/desktop/login",
+        json={"username": "root", "password": "pwd123", "mode": "standalone"},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()["data"]
+    assert data["offline"] is True and data["access_token"] == "admin-token"
+    assert data["user"]["is_admin"] is True
+
+
+def test_last_login_remember_roundtrip(local_env):
+    """勾选「记住」→ 加密保存并可读回（落盘无明文）；取消勾选 → 清除。"""
+    local_env.monkeypatch.setattr(
+        local_env.cloud, "login",
+        lambda *a, **kw: _server_ok(mode="standalone", user={
+            "username": "alice", "is_admin": False, "city": "河源", "operator": "电信",
+        }),
+    )
+    local_env.monkeypatch.setattr(
+        local_env.desktop_local, "_issue_local_token", lambda db, user, days=None: "tok"
+    )
+
+    resp = local_env.client.post(
+        "/api/v1/desktop/login",
+        json={"username": "alice", "password": "pwd123", "mode": "standalone", "remember": True},
+    )
+    assert resp.status_code == 200, resp.text
+
+    got = local_env.client.get("/api/v1/desktop/last-login")
+    assert got.status_code == 200
+    saved = got.json()["data"]
+    assert saved["username"] == "alice" and saved["password"] == "pwd123"
+    assert saved["mode"] == "standalone"
+    # 落盘必须是密文（不能出现明文密码）
+    raw = (local_env.settings.DATA_ROOT / "last_login.json").read_bytes()
+    assert b"pwd123" not in raw
+
+    # 取消勾选再登录 → 清除已保存的凭据
+    resp2 = local_env.client.post(
+        "/api/v1/desktop/login",
+        json={"username": "alice", "password": "pwd123", "mode": "standalone", "remember": False},
+    )
+    assert resp2.status_code == 200, resp2.text
+    assert local_env.client.get("/api/v1/desktop/last-login").json()["data"] is None
 
 
 def test_verify_pending_license_once_renews_and_clears_flag(local_env):

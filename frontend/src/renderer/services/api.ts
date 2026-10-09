@@ -593,8 +593,20 @@ export const desktopLoginApi = {
     username: string
     password: string
     mode: 'shared' | 'standalone'
+    /** 记住账号密码（勾选后本机加密保存，登录页可自动登录） */
+    remember?: boolean
   }): Promise<ApiResponse<DesktopLoginResult>> => {
     return apiClient.post('/desktop/login', data) as any
+  },
+
+  /** 最近一次记住的登录账号/密码（本机加密存储；没保存过返回 null） */
+  getLastLogin: async (): Promise<ApiResponse<{ username: string; password: string; mode: 'shared' | 'standalone' } | null>> => {
+    return apiClient.get('/desktop/last-login') as any
+  },
+
+  /** 清除记住的账号/密码 */
+  deleteLastLogin: async (): Promise<ApiResponse<null>> => {
+    return apiClient.delete('/desktop/last-login') as any
   },
 
   /** 单机模式：轮询「申请授权」结果，管理员批准后直接返回登录态 */

@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import threading
+from datetime import datetime
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -101,10 +102,92 @@ PERMISSION_FIELDS = (
 )
 
 
+# ---------------------------------------------------------------- 记住账号密码
+
+LAST_LOGIN_FILE = "last_login.json"
+LAST_LOGIN_KEY_FILE = ".last_login.key"
+
+
+def _last_login_paths():
+    return settings.DATA_ROOT / LAST_LOGIN_FILE, settings.DATA_ROOT / LAST_LOGIN_KEY_FILE
+
+
+def _credential_cipher():
+    """本机凭据加密器：密钥文件首次生成（0600），丢失则已保存的凭据不再可用。"""
+    import os
+
+    from cryptography.fernet import Fernet
+
+    _, key_path = _last_login_paths()
+    key_path.parent.mkdir(parents=True, exist_ok=True)
+    if key_path.is_file():
+        key = key_path.read_bytes().strip()
+    else:
+        key = Fernet.generate_key()
+        fd = os.open(str(key_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "wb") as f:
+            f.write(key)
+    return Fernet(key)
+
+
+def save_last_login(username: str, password: str, mode: str) -> None:
+    """保存最近一次成功登录的账号/密码（加密，仅本机后端可解密）。旁路：失败不影响登录。"""
+    import json as _json
+
+    path, _ = _last_login_paths()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        blob = _credential_cipher().encrypt(_json.dumps({
+            "username": username,
+            "password": password,
+            "mode": mode,
+            "saved_at": datetime.now().isoformat(timespec="seconds"),
+        }, ensure_ascii=False).encode("utf-8"))
+        path.write_bytes(blob)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[DesktopAuth] 保存登录凭据失败（忽略）：{exc}")
+
+
+def load_last_login() -> Optional[Dict[str, Any]]:
+    import json as _json
+
+    path, key_path = _last_login_paths()
+    if not path.is_file() or not key_path.is_file():
+        return None
+    try:
+        data = _json.loads(_credential_cipher().decrypt(path.read_bytes()).decode("utf-8"))
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(data, dict) or not str(data.get("username") or "").strip():
+        return None
+    return {
+        "username": str(data.get("username") or ""),
+        "password": str(data.get("password") or ""),
+        "mode": str(data.get("mode") or MODE_SHARED),
+    }
+
+
+def clear_last_login() -> None:
+    path, _ = _last_login_paths()
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _apply_remember(remember: bool, username: str, password: str, mode: str) -> None:
+    if remember:
+        save_last_login(username, password, mode)
+    else:
+        clear_last_login()
+
+
 class DesktopLoginRequest(BaseModel):
     username: str
     password: str
     mode: str = Field(default=MODE_STANDALONE, description="shared=共享模式 / standalone=单机模式")
+    # 记住账号密码：勾选后本机加密保存，登录页可自动登录（默认勾选）
+    remember: bool = True
 
 
 class DesktopPollRequest(BaseModel):
@@ -203,8 +286,23 @@ def _standalone_local_login(db: Session, username: str, password: str):
     返回 (user, reason)：user 非空表示本地凭据有效、可立即离线登录并正常使用；
     reason 供调用方在不能离线登录时给出可操作的提示（许可过期/换机/账号不匹配等），
     而不是笼统的"无法连接服务器"。
+
+    2026-10-09 调整：
+    - 管理员完全免授权：本机镜像管理员账号 + 密码即可离线登录，不要求本机许可；
+    - 普通用户完成过一次授权后，本机许可无论是共享还是单机模式都可用于离线登录
+      （不再要求"必须单机许可"，否则共享模式转单机离线时会被拦下）。
     """
     from app.models.database import User as UserModel
+
+    row = db.query(UserModel).filter(UserModel.username == username).first()
+    local_admin = bool(row is not None and row.is_active and row.is_admin)
+
+    if local_admin:
+        if not auth_service.verify_password(password, row.password_hash):
+            return None, "bad_password"
+        row.desktop_run_mode = MODE_STANDALONE
+        db.commit()
+        return row, ""
 
     info = license_service.desktop_license_info()
     if not info:
@@ -212,13 +310,10 @@ def _standalone_local_login(db: Session, username: str, password: str):
     if not info.get("valid"):
         # 过期 / 机器码不匹配 / 系统时间回拨：直接把许可文件自身的原因透出
         return None, info.get("errorMessage") or "本机授权无效"
-    if (info.get("mode") or MODE_STANDALONE) != MODE_STANDALONE:
-        return None, "本机授权是共享模式，切换单机模式需要联网登录"
     if (info.get("username") or "").strip() != username:
         licensed = (info.get("username") or "").strip() or "其它账号"
         return None, f"本机授权归属于 {licensed}，请改用该账号登录"
 
-    row = db.query(UserModel).filter(UserModel.username == username).first()
     if row is None or not row.is_active:
         return None, "no_local_user"
     if not auth_service.verify_password(password, row.password_hash):
@@ -744,6 +839,7 @@ async def desktop_login(
                 f"[DesktopAuth] 授权服务器暂不可用（{exc.status_code or '网络'}），"
                 "改用本机授权离线登录"
             )
+            _apply_remember(payload.remember, username, password, MODE_STANDALONE)
             return _finish_offline_login(db, local_user)
         # 仅网络不可达才回落离线；鉴权/授权类错误照常抛出
         if exc.status_code != 0 or mode != MODE_STANDALONE:
@@ -775,6 +871,7 @@ async def desktop_login(
         _start_shared_sync()
 
     token = _issue_local_token(db, user, data.get("idle_logout_days"))
+    _apply_remember(payload.remember, username, password, mode)
     return {
         "success": True,
         "data": {
@@ -789,6 +886,22 @@ async def desktop_login(
             "license": info,
         },
     }
+
+
+@router.get("/last-login")
+async def get_last_login(_: None = Depends(_require_desktop)) -> Dict[str, Any]:
+    """最近一次记住的登录账号/密码（本机加密文件，仅桌面端可用）。
+
+    登录页据此预填并在勾选「记住」时自动登录；没有保存过则 data=null。
+    """
+    return {"success": True, "data": load_last_login()}
+
+
+@router.delete("/last-login")
+async def delete_last_login(_: None = Depends(_require_desktop)) -> Dict[str, Any]:
+    """清除记住的账号/密码（用户取消勾选或主动清除时调用）。"""
+    clear_last_login()
+    return {"success": True, "data": None}
 
 
 @router.post("/auth-poll")

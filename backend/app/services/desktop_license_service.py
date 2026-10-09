@@ -655,6 +655,70 @@ class DesktopLicenseService:
         db.flush()
         return record
 
+    def _ensure_admin_license(
+        self,
+        db: Session,
+        user,
+        machine: str,
+        mode: str,
+        client_version: Optional[str],
+        hostname: Optional[str],
+    ) -> DesktopLicense:
+        """管理员免授权：按请求的模式直接签发/激活许可，忽略审批与换机限制。
+
+        管理员不参与「单机授权需批准」的流程，也不需要预先存在授权记录：
+        按「模式 + 账号 + 机器」取记录（可认领预建未绑定的），没有就新建；
+        命中的记录直接被激活（禁用/待批准都覆盖）。记录只是许可证与同步凭证。
+        """
+        record = (
+            db.query(DesktopLicense)
+            .filter(
+                DesktopLicense.mode == mode,
+                DesktopLicense.username == user.username,
+                DesktopLicense.machine_code == machine,
+            )
+            .first()
+        )
+        if record is None:
+            # 认领管理员预建但未绑定机器的记录；再没有就新建（不抢占同账号其它机器的记录）
+            record = (
+                db.query(DesktopLicense)
+                .filter(
+                    DesktopLicense.mode == mode,
+                    DesktopLicense.username == user.username,
+                    DesktopLicense.machine_code.is_(None),
+                )
+                .first()
+            )
+        if record is None:
+            record = DesktopLicense(
+                mode=mode,
+                username=user.username,
+                user_id=user.id,
+                licensee_username=user.username,
+                machine_code=machine,
+                lease_days=int(settings.NPT_DESKTOP_LEASE_DAYS or 30),
+                idle_logout_days=DEFAULT_IDLE_LOGOUT_DAYS,
+                source="admin",
+                status="active",
+                created_at=_iso(),
+                updated_at=_iso(),
+                created_by="admin-login",
+            )
+            db.add(record)
+        record.user_id = user.id
+        record.licensee_username = user.username
+        record.machine_code = machine
+        record.machine_bound_at = record.machine_bound_at or _iso()
+        record.status = "active"
+        record.activated_at = _iso()
+        record.client_version = (client_version or "").strip() or record.client_version
+        record.hostname = (hostname or "").strip() or record.hostname
+        record.city = user.city or record.city
+        record.operator = user.operator or record.operator
+        db.flush()
+        return record
+
     def _standalone_record(
         self,
         db: Session,
@@ -734,11 +798,19 @@ class DesktopLicenseService:
         machine = _normalize_machine(machine_code)
         shared = str(mode).lower() == MODE_SHARED
 
-        if shared:
-            if not user.city or not user.operator:
-                raise DesktopLicenseError(
-                    400, "该账号未分配数据组（地市+运营商），请联系管理员分配后再使用共享模式"
-                )
+        # 数据组是共享模式的数据可见性前提（与授权无关），管理员同样需要
+        if shared and (not user.city or not user.operator):
+            raise DesktopLicenseError(
+                400, "该账号未分配数据组（地市+运营商），请联系管理员分配后再使用共享模式"
+            )
+
+        if user.is_admin:
+            # 管理员免授权：不需要审批/预授权，任何模式都直接签发（换机也允许）
+            record = self._ensure_admin_license(
+                db, user, machine, MODE_SHARED if shared else MODE_STANDALONE,
+                client_version, hostname,
+            )
+        elif shared:
             record = self._ensure_shared_license(db, user, machine, client_version, hostname)
         else:
             record = self._standalone_record(db, user, machine, client_version, hostname)

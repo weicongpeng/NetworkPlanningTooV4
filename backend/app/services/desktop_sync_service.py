@@ -564,6 +564,8 @@ def sync_tasks(city: str, operator: str) -> Dict[str, Any]:
     state = load_state()
     pushed = set(state.get("tasks_pushed") or [])
     pending_updates = set(state.get("task_updates") or [])
+    # 待上行更新列表（含本次同步发现的「本机已应用但服务器还没有」的修复项）
+    queued_updates: List[str] = list(state.get("task_updates") or [])
     remaining_updates: List[str] = []
     changed_ids: List[str] = []
 
@@ -617,18 +619,22 @@ def sync_tasks(city: str, operator: str) -> Dict[str, Any]:
             if server_cell_count is not None and int(row.cell_count or 0) != int(server_cell_count):
                 row.cell_count = int(server_cell_count)
                 changed_ids.append(task_id)
-            # 应用标记以服务器为准（两组用户共享同一份历史）；
-            # 本机刚应用、尚未上行的任务保留本机值，避免被服务器旧值冲掉
+            # 应用标记：服务器置 1 → 本机同步为 1；本机已置 1 而服务器仍是 0
+            # （旧版服务器上行时丢过 is_applied）→ 不回落，改为把本机标记上行
+            # （服务器单调置位）。「已应用」无撤销语义，本机知道的比服务器新。
             if task_id not in pending_updates:
                 new_flag = 1 if server_applied else 0
-                if int(row.is_applied or 0) != new_flag:
-                    row.is_applied = new_flag
+                if new_flag == 1 and int(row.is_applied or 0) != 1:
+                    row.is_applied = 1
                     summary["updated"] += 1
                     changed_ids.append(task_id)
+                elif new_flag == 0 and int(row.is_applied or 0) == 1:
+                    if task_id not in queued_updates:
+                        queued_updates.append(task_id)
         db.commit()
 
         # 3) 本机新建的规划任务上行（含结果，只推一次）；以及待上行更新
-        for task_id in state.get("task_updates") or []:
+        for task_id in queued_updates:
             row = db.query(TaskResult).filter(TaskResult.task_id == task_id).first()
             if row is not None and row.task_type in TaskManager.SHARED_TASK_TYPES:
                 try:
@@ -669,6 +675,8 @@ def sync_tasks(city: str, operator: str) -> Dict[str, Any]:
                     "status": row.status,
                     "created_at": row.created_at,
                     "completed_at": row.completed_at,
+                    # 本机已应用的任务首次上行就把标记带上（否则同组永远显示未应用）
+                    "is_applied": bool(row.is_applied),
                     "cell_count": row.cell_count if (row.cell_count or 0) > 0 else None,
                 }, result)
                 pushed.add(row.task_id)

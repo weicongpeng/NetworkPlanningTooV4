@@ -150,6 +150,48 @@ def test_shared_login_requires_account_group(login_env):
     assert "数据组" in resp.json()["detail"]
 
 
+def test_standalone_admin_login_auto_issued_without_approval(login_env):
+    """管理员完全免授权：单机模式直接签发 active 许可，不需要批准，也不受限换机/禁用。"""
+    from app.services.auth_service import auth_service
+
+    db = login_env.session_factory()
+    try:
+        db.add(User(
+            username="root", password_hash=auth_service.hash_password("root-pwd"),
+            is_admin=True, is_active=True, must_change_password=False,
+            city="广州", operator="移动",
+        ))
+        db.commit()
+    finally:
+        db.close()
+
+    resp = _login(login_env.client, "root", "root-pwd", mode="standalone")
+    assert resp.status_code == 200, resp.text
+    data = resp.json()["data"]
+    assert data["result"] == "ok" and data["license_file"]
+    assert data["mode"] == "standalone"
+
+    # 换台机器也直接可用（管理员免授权 → 不套用单机"绑定机器"限制）
+    other = _login(login_env.client, "root", "root-pwd", mode="standalone",
+                   machine="ZZZZ-ZZZZ-ZZZZ-ZZZZ")
+    assert other.status_code == 200, other.text
+    assert other.json()["data"]["machine_code"] == "ZZZZ-ZZZZ-ZZZZ-ZZZZ"
+
+    # 授权被禁用过也照常签发（管理员不参与授权管控）
+    db = login_env.session_factory()
+    try:
+        db.query(DesktopLicense).filter(DesktopLicense.username == "root").update(
+            {DesktopLicense.status: "disabled"}
+        )
+        db.commit()
+    finally:
+        db.close()
+    again = _login(login_env.client, "root", "root-pwd", mode="standalone",
+                   machine="ZZZZ-ZZZZ-ZZZZ-ZZZZ")
+    assert again.status_code == 200, again.text
+    assert again.json()["data"]["result"] == "ok"
+
+
 def test_standalone_login_pending_then_approved(login_env):
     """单机模式：首次登录建待批准申请，管理员在「桌面授权」页确认后拿到许可。"""
     resp = _login(login_env.client, "alice", "alice-pwd", mode="standalone")

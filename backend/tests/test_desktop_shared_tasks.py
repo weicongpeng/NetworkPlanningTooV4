@@ -333,7 +333,11 @@ def test_sync_tasks_prunes_pushed_local_task_deleted_remotely(desktop_task_env, 
 
 
 def test_sync_tasks_syncs_applied_flag_both_ways(desktop_task_env, temp_db):
-    """已应用标记双向同步：服务器置 1 → 本机显示；本机待上行更新不被服务器旧值冲掉。"""
+    """已应用标记双向同步：服务器置 1 → 本机显示；本机为 1 而服务器是 0 → 不回落并上行修复。
+
+    「已应用」无撤销语义：服务器为 0 只代表"从没应用过"（旧版服务器还会丢这个标记），
+    本机为 1 时以本机为准，把 1 上行到服务器（单调置位）。
+    """
     sync = desktop_task_env
     from app.services import desktop_cloud_client as cloud
 
@@ -345,7 +349,7 @@ def test_sync_tasks_syncs_applied_flag_both_ways(desktop_task_env, temp_db):
          "city": "河源", "operator": "联通"},
     ])
     try:
-        # 本机自建并已上行、且刚应用（待上行更新）
+        # 本机自建并已应用（is_applied=1）
         db = temp_db()
         try:
             db.add(TaskResult(**_task_row(task_id="t-local", origin="local", is_applied=1,
@@ -354,9 +358,9 @@ def test_sync_tasks_syncs_applied_flag_both_ways(desktop_task_env, temp_db):
         finally:
             db.close()
         sync.sync_tasks("河源", "联通")          # 上行 t-local（is_applied=True）
-        sync.queue_task_update("t-local")        # 模拟"刚应用、待上行"
+        assert server["items"]["t-local"]["is_applied"] is True
 
-        # 网页端标记镜像任务为已应用
+        # 网页端标记镜像任务为已应用 → 本机镜像随同步置 1
         server["items"]["t-mirror"]["is_applied"] = True
         summary = sync.sync_tasks("河源", "联通")
         assert summary["updated"] >= 1
@@ -365,21 +369,25 @@ def test_sync_tasks_syncs_applied_flag_both_ways(desktop_task_env, temp_db):
         try:
             mirror = db.query(TaskResult).filter(TaskResult.task_id == "t-mirror").first()
             assert mirror is not None and int(mirror.is_applied) == 1
-            local = db.query(TaskResult).filter(TaskResult.task_id == "t-local").first()
-            # 本机待上行更新不被服务器旧值（False）覆盖
-            assert local is not None and int(local.is_applied) == 1
         finally:
             db.close()
 
-        # 服务器重置标记（如重新导入工参后清空）→ 本机同步回 0
+        # 服务器丢失标记（旧版服务器忽略 is_applied / 库里被清 0）：
+        # 本机不回落，并把本机「已应用」重新上行
         server["items"]["t-mirror"]["is_applied"] = False
+        server["items"]["t-local"]["is_applied"] = False
         sync.sync_tasks("河源", "联通")
+
         db = temp_db()
         try:
             mirror = db.query(TaskResult).filter(TaskResult.task_id == "t-mirror").first()
-            assert mirror is not None and int(mirror.is_applied) == 0
+            local = db.query(TaskResult).filter(TaskResult.task_id == "t-local").first()
+            assert mirror is not None and int(mirror.is_applied) == 1
+            assert local is not None and int(local.is_applied) == 1
         finally:
             db.close()
+        assert server["items"]["t-mirror"]["is_applied"] is True
+        assert server["items"]["t-local"]["is_applied"] is True
     finally:
         monkeypatch_.undo()
 
@@ -526,3 +534,40 @@ def test_queue_shared_task_update_schedules_immediate_sync(monkeypatch, temp_db)
     scheduled.clear()
     task_manager._queue_shared_task_update("t-apply", "apply_pci")
     assert queued == [] and scheduled == []
+
+
+# ---------------------------------------------------------------- 存量「已应用」回填
+
+def test_backfill_applied_flags_marks_matching_results(temp_db, monkeypatch):
+    """存量回填：结果与当前工参一致 → 置 1；不一致 / 无可比值的类型 → 不动。"""
+    db = temp_db()
+    try:
+        db.add(TaskResult(**_task_row(task_id="t-ok", result_json=json.dumps({
+            "results": [{"siteId": "S1", "sectorId": "1", "tac": 100}],
+        }))))
+        db.add(TaskResult(**_task_row(task_id="t-diff", result_json=json.dumps({
+            "results": [{"siteId": "S1", "sectorId": "1", "tac": 999}],
+        }))))
+        # neighbor 类型不在回填范围（结果不含 PCI/TAC 值，误判会把全部邻区任务标成已应用）
+        db.add(TaskResult(**_task_row(
+            task_id="t-nb", task_type="neighbor",
+            result_json=json.dumps({"results": [{"siteId": "S1", "sectorId": "1"}]}),
+        )))
+        db.commit()
+    finally:
+        db.close()
+
+    monkeypatch.setattr(
+        type(task_manager),
+        "_load_current_sector_values",
+        staticmethod(lambda db, city=None, operator=None: {"S1_1": {"pci": 10, "tac": 100}}),
+    )
+    updated = task_manager.backfill_applied_flags()
+    assert updated == 1
+
+    db = temp_db()
+    try:
+        flags = {r.task_id: int(r.is_applied or 0) for r in db.query(TaskResult).all()}
+    finally:
+        db.close()
+    assert flags == {"t-ok": 1, "t-diff": 0, "t-nb": 0}

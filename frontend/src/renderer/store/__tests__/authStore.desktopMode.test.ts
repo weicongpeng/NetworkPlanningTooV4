@@ -87,6 +87,23 @@ describe('authStore 桌面形态探测', () => {
     expect(useAuthStore.getState().desktopRunMode).toBe('standalone')
   })
 
+  it('桌面端登录默认「记住账号密码」，显式关闭时传 remember=false', async () => {
+    vi.mocked(desktopLoginApi.login).mockResolvedValue({
+      success: true,
+      data: { access_token: 'tok', user: { username: 'alice' }, mode: 'shared' },
+    } as any)
+
+    await useAuthStore.getState().login('alice', 'pwd', 'shared')
+    expect(vi.mocked(desktopLoginApi.login)).toHaveBeenLastCalledWith(
+      expect.objectContaining({ remember: true }),
+    )
+
+    await useAuthStore.getState().login('alice', 'pwd', 'shared', false)
+    expect(vi.mocked(desktopLoginApi.login)).toHaveBeenLastCalledWith(
+      expect.objectContaining({ remember: false }),
+    )
+  })
+
   it('管理员批准后 applyDesktopLogin 直接建立登录态', () => {
     useAuthStore.getState().applyDesktopLogin({
       access_token: 'tok2',

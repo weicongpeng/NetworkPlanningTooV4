@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
 import { useTranslation } from 'react-i18next'
 import { X, LogIn, UserPlus, Loader2 } from 'lucide-react'
@@ -35,6 +35,12 @@ export function LoginModal({ isOpen, forceChangePassword = false, onClose }: Log
   )
   const [password, setPassword] = useState('')
   const [confirmPassword, setConfirmPassword] = useState('')
+  // 记住账号密码：勾选后本机加密保存，下次打开登录页自动登录（默认勾选）
+  const [remember, setRemember] = useState<boolean>(() => {
+    try { return localStorage.getItem('npt-desktop-remember') !== '0' } catch { return true }
+  })
+  // 自动登录每次打开只尝试一次，失败回退到表单
+  const autoLoginAttemptedRef = useRef(false)
   const [city, setCity] = useState('')
   const [operator, setOperator] = useState('')
   const [oldPassword, setOldPassword] = useState('')
@@ -61,6 +67,62 @@ export function LoginModal({ isOpen, forceChangePassword = false, onClose }: Log
       .catch(() => { if (!cancelled) setOptionsError(true) })
     return () => { cancelled = true }
   }, [isOpen, desktopMode])
+
+  // 记住账号密码偏好持久化（默认勾选）
+  useEffect(() => {
+    try { localStorage.setItem('npt-desktop-remember', remember ? '1' : '0') } catch { /* 忽略 */ }
+  }, [remember])
+
+  // 桌面端登录提交（手动点击与自动登录共用）
+  const doDesktopLogin = useCallback(
+    async (u: string, p: string, runMode: 'shared' | 'standalone', rememberFlag: boolean) => {
+      // 先取上次停留页面，登录成功后恢复（须在 login 之前取，避免被路由记录覆盖）
+      const restoreTarget = getLastRoute(u)
+      const warningMsg = await login(u, p, runMode, rememberFlag)
+      if (restoreTarget && restoreTarget !== location.pathname) {
+        navigate(restoreTarget, { replace: true })
+      }
+      // 单机模式离线登录（服务器探测不到）：提示用的是本机授权，联网后自动校验
+      const offlineNow = Boolean(desktopMode && useAuthStore.getState().desktopOffline)
+      const notice = offlineNow
+        ? t('desktopAuth.offlineLogin', '当前无网络：已用本机授权登录，联网后将自动校验授权')
+        : warningMsg
+      if (notice) {
+        setWarning(notice)
+        // 短暂显示警告后自动关闭
+        setTimeout(() => onClose?.(), offlineNow ? 3000 : 2000)
+      } else {
+        onClose?.()
+      }
+    },
+    [login, location.pathname, navigate, t, desktopMode, onClose],
+  )
+
+  // 桌面端：读取记住的账号密码 → 预填；勾选「记住」时自动登录一次
+  useEffect(() => {
+    if (!isOpen || !desktopMode || mode !== 'login' || forceChangePassword) return
+    let cancelled = false
+    desktopLoginApi
+      .getLastLogin()
+      .then((res: any) => {
+        if (cancelled) return
+        const saved = res?.data
+        if (!saved?.username) return
+        const savedMode: 'shared' | 'standalone' = saved.mode === 'standalone' ? 'standalone' : 'shared'
+        setUsername(saved.username)
+        setPassword(saved.password || '')
+        setDesktopRunMode(savedMode)
+        if (remember && saved.password && !autoLoginAttemptedRef.current) {
+          autoLoginAttemptedRef.current = true
+          setIsSubmitting(true)
+          doDesktopLogin(saved.username, saved.password, savedMode, remember)
+            .catch((err: any) => setError(err?.message || err?.detail || String(err)))
+            .finally(() => setIsSubmitting(false))
+        }
+      })
+      .catch(() => { /* 未保存过或本机后端不可用：忽略 */ })
+    return () => { cancelled = true }
+  }, [isOpen, desktopMode, mode, forceChangePassword, remember, doDesktopLogin])
 
   if (!isOpen) return null
 
@@ -90,27 +152,23 @@ export function LoginModal({ isOpen, forceChangePassword = false, onClose }: Log
         await changePassword(oldPassword, password, confirmPassword)
         onClose?.()
       } else if (mode === 'login') {
-        // 先取上次停留页面，登录成功后恢复（须在 login 之前取，避免被路由记录覆盖）
-        const restoreTarget = getLastRoute(username.trim())
-        const warningMsg = await login(
-          username.trim(),
-          password,
-          desktopMode ? desktopRunMode : undefined,
-        )
-        if (restoreTarget && restoreTarget !== location.pathname) {
-          navigate(restoreTarget, { replace: true })
-        }
-        // 单机模式离线登录（服务器探测不到）：提示用的是本机授权，联网后自动校验
-        const offlineNow = Boolean(desktopMode && useAuthStore.getState().desktopOffline)
-        const notice = offlineNow
-          ? t('desktopAuth.offlineLogin', '当前无网络：已用本机授权登录，联网后将自动校验授权')
-          : warningMsg
-        if (notice) {
-          setWarning(notice)
-          // 短暂显示警告后自动关闭
-          setTimeout(() => onClose?.(), offlineNow ? 3000 : 2000)
+        if (desktopMode) {
+          // 桌面端：本机后端代理登录（remember 决定是否保存账号密码）
+          await doDesktopLogin(username.trim(), password, desktopRunMode, remember)
         } else {
-          onClose?.()
+          // 先取上次停留页面，登录成功后恢复（须在 login 之前取，避免被路由记录覆盖）
+          const restoreTarget = getLastRoute(username.trim())
+          const warningMsg = await login(username.trim(), password)
+          if (restoreTarget && restoreTarget !== location.pathname) {
+            navigate(restoreTarget, { replace: true })
+          }
+          if (warningMsg) {
+            setWarning(warningMsg)
+            // 短暂显示警告后自动关闭
+            setTimeout(() => onClose?.(), 2000)
+          } else {
+            onClose?.()
+          }
         }
       } else {
         await register(username.trim(), password, confirmPassword, city, operator)
@@ -310,6 +368,17 @@ export function LoginModal({ isOpen, forceChangePassword = false, onClose }: Log
                   )
                 })}
               </div>
+              <label className="mt-2 flex items-center gap-2 cursor-pointer select-none" title={t('desktopAuth.rememberHint', '勾选后本机加密保存账号密码，下次打开自动登录；取消勾选会清除已保存的凭据。')}>
+                <input
+                  type="checkbox"
+                  checked={remember}
+                  onChange={(e) => setRemember(e.target.checked)}
+                  className="h-4 w-4 accent-primary"
+                />
+                <span className="text-xs text-muted-foreground">
+                  {t('desktopAuth.rememberPassword', '记住账号密码（下次自动登录）')}
+                </span>
+              </label>
             </div>
           )}
 

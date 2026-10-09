@@ -26,7 +26,13 @@ interface AuthState {
   /** 桌面端最后一次登录的账号与运行模式（持久化的只是展示用信息，不含密码） */
   lastDesktopLogin: { username: string; mode: 'shared' | 'standalone' } | null
 
-  login: (username: string, password: string, desktopMode?: 'shared' | 'standalone') => Promise<string | null>
+  login: (
+    username: string,
+    password: string,
+    desktopMode?: 'shared' | 'standalone',
+    /** 桌面端：是否记住账号密码（本机加密保存，供下次自动登录） */
+    remember?: boolean,
+  ) => Promise<string | null>
   register: (username: string, password: string, confirmPassword: string, city: string, operator: string, equipmentVendor?: string) => Promise<void>
   logout: () => Promise<void>
   fetchUser: () => Promise<void>
@@ -68,13 +74,16 @@ export const useAuthStore = create<AuthState>()(
       desktopPendingUsername: null,
       lastDesktopLogin: null,
 
-      login: async (username: string, password: string, desktopRunMode?: 'shared' | 'standalone') => {
+      login: async (username: string, password: string, desktopRunMode?: 'shared' | 'standalone', remember?: boolean) => {
         clearUserDataCaches()
         set({ isLoading: true })
         try {
           // 桌面版：走本机后端代理登录，返回 result=pending 表示单机授权待管理员批准
           if (desktopRunMode) {
-            const result: any = await desktopLoginApi.login({ username, password, mode: desktopRunMode })
+            const result: any = await desktopLoginApi.login({
+              username, password, mode: desktopRunMode,
+              remember: remember !== false,
+            })
             const data = result?.data || {}
             if (data.result === 'pending') {
               set({ isLoading: false, desktopRunMode, desktopPendingUsername: username })

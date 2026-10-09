@@ -3776,6 +3776,86 @@ class TaskManager:
             db.close()
         return updated
 
+    # 应用状态回填只对"结果里确实写了 PCI/TAC 值"的类型做（neighbor 结果不含参数值）
+    _APPLIED_BACKFILL_TYPES = ("pci", "tac", "tac_planning")
+
+    @staticmethod
+    def _result_has_comparable_values(result: Optional[Dict]) -> bool:
+        """结果里是否至少有一个可比较的 PCI/TAC 值。
+
+        `_verify_applied` 对"没有 results"的结果直接返回 True（视为一致），
+        回填时必须先用本函数挡住这种情况，避免把无可比值的任务误标为已应用。
+        """
+        if not isinstance(result, dict):
+            return False
+        for item in result.get("results") or []:
+            if not isinstance(item, dict):
+                continue
+            sectors = item.get("sectors")
+            if isinstance(sectors, list):
+                for sector in sectors:
+                    if isinstance(sector, dict) and (
+                        sector.get("newPCI") is not None or sector.get("tac") is not None
+                    ):
+                        return True
+            if item.get("tac") is not None or item.get("suggestedTac") is not None:
+                return True
+        return False
+
+    @staticmethod
+    def backfill_applied_flags(max_rows: int = 400) -> int:
+        """存量任务回填「已应用」：结果与当前工参一致但标记为 0 的行置 1。
+
+        背景（2026-10-09）：旧版服务器 upsert_shared_task 忽略 is_applied，
+        桌面端应用过的任务在服务器与同组镜像里全成了「未应用」。按现有动态判定
+        口径（_verify_applied 对照本组当前全量工参）回填一次，启动时后台执行。
+        """
+        from app.core.database import SessionLocal
+        from app.models.database import TaskResult
+
+        updated = 0
+        db = SessionLocal()
+        try:
+            rows = (
+                db.query(TaskResult)
+                .filter(
+                    TaskResult.task_type.in_(TaskManager._APPLIED_BACKFILL_TYPES),
+                    TaskResult.is_applied == 0,
+                    TaskResult.result_json.isnot(None),
+                )
+                .order_by(TaskResult.created_at.desc())
+                .limit(max(1, int(max_rows)))
+                .all()
+            )
+            values_by_group: Dict[Any, Dict] = {}
+            for row in rows:
+                try:
+                    parsed = json.loads(row.result_json) if row.result_json else None
+                except Exception:
+                    parsed = None
+                if not TaskManager._result_has_comparable_values(parsed):
+                    continue
+                key = (row.city, row.operator)
+                if key not in values_by_group:
+                    values_by_group[key] = TaskManager._load_current_sector_values(
+                        db, city=row.city, operator=row.operator
+                    )
+                values = values_by_group[key]
+                if not values:
+                    continue
+                if TaskManager._verify_applied(parsed, values):
+                    row.is_applied = 1
+                    updated += 1
+                    TaskManager._history_verify_cache.pop(row.task_id, None)
+            if updated:
+                db.commit()
+        except Exception as exc:  # noqa: BLE001
+            db.rollback()
+            logger.warning(f"[TaskManager] 回填已应用标记失败（非致命）: {exc}")
+        finally:
+            db.close()
+        return updated
+
     @staticmethod
     def _extract_result_summary(result: Optional[Dict]) -> Optional[Dict]:
         """从完整 result dict 中提取轻量摘要字段（避免历史列表返回大数据）
