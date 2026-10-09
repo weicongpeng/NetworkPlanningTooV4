@@ -18,7 +18,7 @@ import openpyxl
 
 from app.core.config import settings
 from app.core.database import SessionLocal
-from app.models.database import Workbook, Site, Sector, GeoFile, Layer
+from app.models.database import Workbook, Site, Sector, GeoFile, Layer, StationParamRow, StationMetricRow
 from app.models.schemas import DataItem, DataType, DataStatus, SiteData
 from app.utils.excel_columns import dedupe_column_names
 
@@ -6979,20 +6979,33 @@ class DataService:
             deletion_errors.append(f"{upload_dir}/{data_id}.*: {str(e)}")
 
         # 4. 清理 SQLite 中的数据
+        #    子表必须先于 workbooks 删除：station_param_rows / station_metric_rows
+        #    对 workbooks.id 有外键约束，漏删会让 DELETE FROM workbooks 抛
+        #    IntegrityError 并回滚整个事务（网优助手数据集删不掉的根因）。
         db = SessionLocal()
         try:
+            deleted_metrics = db.query(StationMetricRow).filter(StationMetricRow.workbook_id == data_id).delete()
+            deleted_params = db.query(StationParamRow).filter(StationParamRow.workbook_id == data_id).delete()
             deleted_sectors = db.query(Sector).filter(Sector.workbook_id == data_id).delete()
             deleted_sites = db.query(Site).filter(Site.workbook_id == data_id).delete()
             deleted_wb = db.query(Workbook).filter(Workbook.id == data_id).delete()
             deleted_geo = db.query(GeoFile).filter(GeoFile.id == data_id).delete()
             deleted_layer = db.query(Layer).filter(Layer.id == data_id).delete()
             db.commit()
-            safe_print(f"[DataService] SQLite 清理完成: workbook={deleted_wb}, sites={deleted_sites}, sectors={deleted_sectors}, geo={deleted_geo}, layer={deleted_layer}")
+            safe_print(f"[DataService] SQLite 清理完成: workbook={deleted_wb}, sites={deleted_sites}, sectors={deleted_sectors}, geo={deleted_geo}, layer={deleted_layer}, metric_rows={deleted_metrics}, param_rows={deleted_params}")
         except Exception as e:
             db.rollback()
-            safe_print(f"[DataService] SQLite 清理失败 (非致命): {e}")
+            deletion_errors.append(f"SQLite: {str(e)}")
+            safe_print(f"[DataService] SQLite 清理失败: {e}")
         finally:
             db.close()
+
+        # 4.1 残留校验：DB 记录仍在说明删除并未真正生效。此时不能删索引假装成功——
+        #     列表接口会 merge _ingest.list_datasets()（直查 workbooks），启动时
+        #     _load_index() 又会把 DB 里的条目合并回 index.json，表现为「删了又回来」。
+        if data_id in self._known_db_ids():
+            safe_print(f"[DataService] 数据 {data_id} 仍存在于 SQLite，取消删除（索引保持不变）")
+            return False
 
         # 5. 无论文件删除是否成功，都从索引中移除（保持索引一致性）
         # 但如果有严重错误，需要记录警告

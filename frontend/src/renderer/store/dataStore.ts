@@ -242,7 +242,12 @@ export const useDataStore = create<DataState>((set, get) => ({
   deleteItem: async (id: string) => {
     set({ loading: true, error: null })
     try {
-      await dataApi.delete(id)
+      const res = await dataApi.delete(id)
+      // 后端 HTTP 200 也可能是删除失败（success=false，如 SQLite 记录未能删除），
+      // 必须据此判定，否则前端会提示"删除成功"而数据仍在
+      if (res && res.success === false) {
+        throw new Error(res.message || '删除失败')
+      }
       // 删除后清除 IndexedDB 缓存（不内部刷新列表，由调用方统一处理刷新）
       await indexedDBService.delete(dataListCacheKey())
       set({ loading: false })
