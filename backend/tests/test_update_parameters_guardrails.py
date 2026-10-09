@@ -166,13 +166,16 @@ def test_repair_dataset_repulls_missing_mirror_in_shared_mode(tmp_path, monkeypa
     monkeypatch.setattr(cloud, "sync_manifest", lambda: {"items": [{"data_id": "d1", "rev": 7}]})
     monkeypatch.setattr(
         sync, "_pull",
-        lambda data_id, user, city, operator, rev: seen.update(data_id=data_id, rev=rev)
+        lambda data_id, user, city, operator, rev, server_updated_at=None: seen.update(
+            data_id=data_id, rev=rev, server_updated_at=server_updated_at
+        )
         or {"data_id": data_id, "action": "pull", "rev": rev},
     )
 
     out = sync.repair_dataset("d1")
     assert out["repaired"] is True
-    assert seen == {"data_id": "d1", "rev": 7}
+    # 补拉同时把服务器最后更新时间转发给 _pull（LWW 基线）
+    assert seen == {"data_id": "d1", "rev": 7, "server_updated_at": None}
 
 
 def test_repair_dataset_skips_when_local_dirty(tmp_path, monkeypatch):
