@@ -174,6 +174,22 @@ def _acquire_single_instance() -> bool:
     return ctypes.get_last_error() != 183  # ERROR_ALREADY_EXISTS
 
 
+def _release_single_instance() -> None:
+    """主动释放互斥体句柄。
+
+    关窗后进程还要收尾（停服务、解释器退出），这段时间互斥体仍被持有；用户马上
+    再点一次图标就会误报「程序已在运行」。窗口一关就释放句柄，立刻允许新实例启动。
+    """
+    global _MUTEX_HANDLE
+    handle, _MUTEX_HANDLE = _MUTEX_HANDLE, None
+    if not handle or os.name != "nt":
+        return
+    try:
+        ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle(ctypes.c_void_p(handle))
+    except Exception:  # noqa: BLE001
+        pass
+
+
 # -------------------------------------------------------------- 服务与窗口
 
 def _create_bound_socket() -> Tuple[socket.socket, int]:
@@ -214,12 +230,13 @@ def _wait_ready(port: int, timeout: float = READY_TIMEOUT_SECONDS) -> bool:
 def _force_exit_after(delay: float) -> None:
     """兜底定时器：delay 秒后进程仍存活则直接结束。
 
-    OTA 升级脚本在等本进程退出后才静默安装，正常关窗链路一旦被 WebView2/后台线程卡住，
-    安装就会永久卡在等待里。这里保证进程一定会退出，安装流程无需用户干预。
+    关窗后若被 WebView2 / 后台线程拖住，进程迟迟不退出会让用户再启动时误报
+    「程序已在运行」；OTA 升级脚本也会永久卡在等待本进程退出。这里保证进程一定会退出。
     """
+
     def _worker() -> None:
         time.sleep(delay)
-        _log.warning("窗口关闭后 %.0f 秒仍未退出，强制结束进程（OTA 安装继续）", delay)
+        _log.warning("窗口关闭后 %.0f 秒仍未退出，强制结束进程", delay)
         os._exit(0)
 
     threading.Thread(target=_worker, daemon=True, name="npt-force-exit").start()
@@ -253,7 +270,13 @@ def _run_window(port: int, data_root: Path) -> None:
         width=width,
         height=height,
         min_size=min_size,
+        maximized=True,  # 启动即最大化（表格/地图列多，窗口越大越好用）
     )
+    # 关窗也要兜底：正常关闭路径被卡住时进程不退出，用户再启动会误报「程序已在运行」
+    try:
+        window.events.closing += lambda: _force_exit_after(EXIT_GRACE_SECONDS)
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("订阅窗口关闭事件失败（不影响使用）：%s", exc)
     # 注入退出回调：后端"重启并安装"时用它关闭窗口并让本进程退出（同进程桥接）
     try:
         from app import desktop_bridge
@@ -324,8 +347,10 @@ def main(argv: Optional[list] = None) -> int:
     _log.info("打开桌面窗口")
     _run_window(port, data_root)
     _log.info("窗口已关闭，正在退出")
+    # 先释放单实例互斥体：收尾阶段（停服务、解释器退出）不再阻止用户重新启动
+    _release_single_instance()
     server.should_exit = True
-    thread.join(timeout=10)
+    thread.join(timeout=5)
     return 0
 
 

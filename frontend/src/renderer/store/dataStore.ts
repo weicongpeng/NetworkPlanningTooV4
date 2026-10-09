@@ -282,12 +282,18 @@ export const useDataStore = create<DataState>((set, get) => ({
       // 2. 轮询等待后台任务完成（最长 10 分钟）
       const maxWait = 600000  // 10 min
       const pollInterval = 2000  // 每 2 秒检查一次
+      // 连续多少次轮询出错才判定失败：网关/网络瞬时错误（Cloudflare 502/524、连接被重置）
+      // 不代表任务失败，直接抛出会误报"工参更新失败"（其实文件已经生成）
+      const maxPollErrors = 5
       const startTime = Date.now()
       let finalResult: any = null
+      let consecutiveErrors = 0
 
       while (Date.now() - startTime < maxWait) {
         await new Promise(r => setTimeout(r, pollInterval))
 
+        let taskError: string | null = null
+        let pollError: any = null
         try {
           const progressResp = await dataApi.getUpdateParamsProgress(actualTaskId)
           const progressData = progressResp?.data
@@ -295,17 +301,24 @@ export const useDataStore = create<DataState>((set, get) => ({
           if (progressData?.status === 'completed') {
             finalResult = progressData
             break
-          } else if (progressData?.status === 'failed') {
-            throw new Error(progressData?.error || '工参更新失败')
           }
-          // status === 'processing' 或 'pending'，继续轮询
+          if (progressData?.status === 'failed') {
+            taskError = progressData?.error || '工参更新失败'
+          }
         } catch (pollErr: any) {
-          // 404 表示任务索引尚未持久化，继续轮询
-          if (pollErr?.code === 404) {
-            continue
-          }
-          throw pollErr
+          pollError = pollErr
         }
+
+        if (taskError) throw new Error(taskError)
+        if (!pollError) {
+          consecutiveErrors = 0
+          continue
+        }
+        // 404 表示任务索引尚未持久化，继续轮询
+        if (pollError?.code === 404) continue
+        consecutiveErrors += 1
+        if (consecutiveErrors >= maxPollErrors) throw pollError
+        // status === 'processing' 或 'pending'，继续轮询
       }
 
       useTaskStore.getState().completeTask(taskId)

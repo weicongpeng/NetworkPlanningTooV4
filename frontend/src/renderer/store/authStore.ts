@@ -25,6 +25,11 @@ interface AuthState {
   desktopPendingUsername: string | null
   /** 桌面端最后一次登录的账号与运行模式（持久化的只是展示用信息，不含密码） */
   lastDesktopLogin: { username: string; mode: 'shared' | 'standalone' } | null
+  /**
+   * 桌面端：用户本次是「主动退出登录」，登录页不要再自动登录。
+   * 「记住账号密码」的语义是下次打开软件自动登录，退出后同一次会话内必须等用户点登录。
+   */
+  desktopAutoLoginSuppressed: boolean
 
   login: (
     username: string,
@@ -73,6 +78,7 @@ export const useAuthStore = create<AuthState>()(
       desktopOffline: false,
       desktopPendingUsername: null,
       lastDesktopLogin: null,
+      desktopAutoLoginSuppressed: false,
 
       login: async (username: string, password: string, desktopRunMode?: 'shared' | 'standalone', remember?: boolean) => {
         clearUserDataCaches()
@@ -100,6 +106,7 @@ export const useAuthStore = create<AuthState>()(
               desktopRunMode: data.mode || desktopRunMode,
               desktopOffline: Boolean(data.offline),
               desktopPendingUsername: null,
+              desktopAutoLoginSuppressed: false,
               lastDesktopLogin: {
                 username,
                 mode: (data.mode || desktopRunMode || 'shared') as 'shared' | 'standalone',
@@ -193,6 +200,8 @@ export const useAuthStore = create<AuthState>()(
           desktopRunMode: null,
           desktopOffline: false,
           desktopPendingUsername: null,
+          // 主动退出后停留在登录页，等用户点登录；重新打开软件时仍按「记住账号密码」自动登录
+          desktopAutoLoginSuppressed: get().desktopMode,
         })
         // 登出后清空所有用户的内存数据缓存，杜绝下一账号 TTL 内读到本组数据
         clearUserDataCaches()
@@ -273,6 +282,7 @@ export const useAuthStore = create<AuthState>()(
           desktopRunMode: (data.mode || 'standalone') as DesktopRunMode,
           desktopOffline: Boolean(data.offline),
           desktopPendingUsername: null,
+          desktopAutoLoginSuppressed: false,
         })
       },
 

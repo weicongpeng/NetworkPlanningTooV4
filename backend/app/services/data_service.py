@@ -1262,6 +1262,11 @@ class DataService:
 
         safe_print(f"[DataService] 新文件已注册到索引: {new_data_id}")
 
+        # 新工参是本机新建的数据集，必须记账（修订号 + dirty + 本地改动时间）：
+        # 否则桌面共享模式既不会把它上行，也可能被服务器上的旧工参反向覆盖，
+        # 表现为"提示更新成功、列表里还是旧文件"。
+        self._bump_revision(new_data_id)
+
         # 10. 删除同组原始的全量工参和其他旧的同组全量工参，保持组内唯一性
         # （不同地市+运营商组的 full_params 互不影响）
         files_to_delete = []
@@ -1277,8 +1282,12 @@ class DataService:
             )
             for old_id in files_to_delete:
                 try:
-                    self.delete_data(old_id)
-                    safe_print(f"[DataService] 已删除旧全量工参: {old_id}")
+                    if self.delete_data(old_id):
+                        safe_print(f"[DataService] 已删除旧全量工参: {old_id}")
+                    else:
+                        # delete_data 返回 False：SQLite 里仍有残留 → 索引保持不动，
+                        # 列表里新旧工参会同时存在（下载旧文件=更新前内容）
+                        safe_print(f"[DataService] 旧全量工参删除未完成（索引仍保留）: {old_id}")
                 except Exception as e:
                     safe_print(f"[DataService] 删除旧文件失败: {old_id}, 错误: {e}")
 

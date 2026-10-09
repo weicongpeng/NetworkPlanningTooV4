@@ -3535,8 +3535,8 @@ class TaskManager:
                 for r in results:
                     # 动态检查：对比任务规划结果与当前全量工参的实际 PCI/TAC 值
                     # 如果一致则视为已应用（即使标记为未应用），如果不一致则视为未应用（即使标记为已应用）
-                    # 桌面端镜像任务（result_json 未落地本机）无法动态比对，回退到同组同步来的
-                    # is_applied 标记 —— 否则网页端应用过的结果在桌面端永远显示"未应用"。
+                    # 同组同步来的 is_applied 标记只在「本机没有规划结果、无法比对」时兜底：
+                    # 该标记是另一端按它自己的工参判定的，本机工参与之不一致时会显示错配。
                     stored_applied = bool(getattr(r, "is_applied", 0))
                     is_applied = False
                     result_summary = None
@@ -3554,11 +3554,13 @@ class TaskManager:
                                 parsed_result = json.loads(result_json_str)
                             except Exception:
                                 parsed_result = None
-                            if parsed_result is not None:
-                                is_applied = self._verify_applied(parsed_result, current_sector_values)
-                        # 动态比对不成立但同组有人标记过"已应用"（Desktop 端同步/网页端标记）时，
-                        # 以标记为准，保证跨端一致
-                        is_applied = is_applied or stored_applied
+                        if parsed_result is not None:
+                            # 「操作」列一律以当前全量工参的 PCI/TAC 列值为准，
+                            # 不用同组同步来的标记覆盖比对结果
+                            is_applied = self._verify_applied(parsed_result, current_sector_values)
+                        else:
+                            # 本机没有结果（桌面端镜像任务尚未落地）→ 无法比对，只能沿用标记
+                            is_applied = stored_applied
                         result_summary = self._extract_result_summary(parsed_result)
                         if result_summary is None and (r.cell_count or 0) > 0:
                             # 同组镜像任务（本机无 result_json）：用同步来的小数量生成最小摘要，

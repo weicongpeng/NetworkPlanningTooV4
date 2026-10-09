@@ -737,6 +737,8 @@ def sync_once() -> Dict[str, Any]:
         _remember_clock_offset(manifest.get("server_time"))
         local_state = load_state()
         datasets_state = local_state["datasets"]
+        # 本机已删、删除尚未上行的 id（工参更新就是"新建 + 删旧"，本轮不能再拉回旧副本）
+        pending_deletes = set(local_state.get("pending_deletes") or [])
 
         # 1. 服务器 → 本地
         for data_id, item in items.items():
@@ -745,6 +747,10 @@ def sync_once() -> Dict[str, Any]:
                     data_service.delete_data(data_id, force=True)
                     forget(data_id)  # delete_data 会记 pending_delete，这里要一并清掉
                     summary["deleted"] += 1
+                continue
+            if data_id in pending_deletes:
+                # 服务器上的副本还没删掉：本轮跳过，删除意图由第 3 步上行。
+                # 否则"工参更新"刚生成的新工参还在，旧工参又被拉回本机，列表会显示旧文件。
                 continue
             local_entry = datasets_state.get(data_id)
             server_rev = int(item.get("rev") or 0)

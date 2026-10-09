@@ -47,6 +47,7 @@ describe('LoginModal 记住账号密码', () => {
       desktopRunMode: null,
       desktopOffline: false,
       lastDesktopLogin: null,
+      desktopAutoLoginSuppressed: false,
       login: loginMock as any,
     })
   })
@@ -75,6 +76,20 @@ describe('LoginModal 记住账号密码', () => {
 
     await waitFor(() => expect(getLastLoginMock).toHaveBeenCalled())
     // 给自动登录留出窗口期，确认没有触发
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    expect(loginMock).not.toHaveBeenCalled()
+  })
+
+  it('主动退出登录后不再自动登录（等用户手动点击）', async () => {
+    getLastLoginMock.mockResolvedValue({
+      success: true,
+      data: { username: 'alice', password: 'pwd123', mode: 'shared' },
+    })
+
+    useAuthStore.setState({ desktopAutoLoginSuppressed: true })
+    render(<LoginModal isOpen onClose={() => {}} />)
+
+    await waitFor(() => expect(getLastLoginMock).toHaveBeenCalled())
     await new Promise((resolve) => setTimeout(resolve, 30))
     expect(loginMock).not.toHaveBeenCalled()
   })

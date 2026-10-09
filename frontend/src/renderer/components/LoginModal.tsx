@@ -22,6 +22,8 @@ export function LoginModal({ isOpen, forceChangePassword = false, onClose }: Log
   const desktopMode = useAuthStore((s) => s.desktopMode)
   // 桌面端记住上次登录的账号与运行模式（切换模式需退出后重新登录）
   const lastDesktopLogin = useAuthStore((s) => s.lastDesktopLogin)
+  // 用户主动退出登录后本次不再自动登录，等用户手动点「登录」
+  const autoLoginSuppressed = useAuthStore((s) => s.desktopAutoLoginSuppressed)
   const navigate = useNavigate()
   const location = useLocation()
 
@@ -112,7 +114,7 @@ export function LoginModal({ isOpen, forceChangePassword = false, onClose }: Log
         setUsername(saved.username)
         setPassword(saved.password || '')
         setDesktopRunMode(savedMode)
-        if (remember && saved.password && !autoLoginAttemptedRef.current) {
+        if (remember && saved.password && !autoLoginAttemptedRef.current && !autoLoginSuppressed) {
           autoLoginAttemptedRef.current = true
           setIsSubmitting(true)
           doDesktopLogin(saved.username, saved.password, savedMode, remember)
@@ -122,7 +124,7 @@ export function LoginModal({ isOpen, forceChangePassword = false, onClose }: Log
       })
       .catch(() => { /* 未保存过或本机后端不可用：忽略 */ })
     return () => { cancelled = true }
-  }, [isOpen, desktopMode, mode, forceChangePassword, remember, doDesktopLogin])
+  }, [isOpen, desktopMode, mode, forceChangePassword, remember, doDesktopLogin, autoLoginSuppressed])
 
   if (!isOpen) return null
 

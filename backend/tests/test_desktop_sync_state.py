@@ -265,6 +265,26 @@ def test_sync_once_lww_pulls_when_server_is_newer(sync_state, monkeypatch):
     assert sync_state.load_state()["conflicts"] == []
 
 
+def test_sync_once_skips_pending_local_delete(sync_state, monkeypatch):
+    """本机已删、删除尚未上行时不得把服务器上的旧副本拉回来。
+
+    工参更新是「新建 + 删旧」：旧工参的删除要等第 3 步才上行，本轮若照常 pull，
+    旧文件会立刻在本机复活，表现为"提示更新成功、列表里还是旧文件"。
+    """
+    from app.services import desktop_cloud_client as cloud
+
+    item = {"data_id": "ds-old", "rev": 3, "deleted": False,
+            "server_updated_at": "2026-10-09T10:00:00"}
+    # 索引里已经没有该数据集（本机已删）
+    pushed, pulled = _stub_sync_once_env(monkeypatch, sync_state, {}, item)
+    monkeypatch.setattr(cloud, "delete_dataset", lambda data_id: {"ok": True})
+    sync_state.mark_local_deleted("ds-old")
+
+    summary = sync_state.sync_once()
+    assert pulled == [] and pushed == []
+    assert summary["errors"] == []
+
+
 def test_sync_once_keeps_manual_conflict_without_timestamps(sync_state, monkeypatch):
     """存量条目没有改动时间 → 无法判定，保留人工选边。"""
     item = {"data_id": "ds-1", "rev": 2, "deleted": False}
