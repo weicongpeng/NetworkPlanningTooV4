@@ -134,6 +134,9 @@ def init_db():
             conn.exec_driver_sql(
                 "ALTER TABLE task_results ADD COLUMN origin VARCHAR(10) NOT NULL DEFAULT 'local'"
             )
+        # 迁移：任务小数量（同组任务历史「小区数量」列，镜像行无本机结果时靠它显示）
+        if tr_cols and "cell_count" not in tr_cols:
+            conn.exec_driver_sql("ALTER TABLE task_results ADD COLUMN cell_count INTEGER")
 
         # 迁移：user_settings 表添加 created_at 列（如从旧表结构升级）
         us_cols = [row[1] for row in conn.exec_driver_sql("PRAGMA table_info(user_settings)").fetchall() if row[0] >= 0]

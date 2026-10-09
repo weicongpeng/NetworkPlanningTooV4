@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -40,8 +40,10 @@ def _default_state() -> Dict[str, Any]:
     return {
         "run_mode": MODE_OFFLINE,   # 默认离线，用户显式切换到共享才联网
         "username": None,           # 当前登录账号（后台同步取数据组用）
-        "datasets": {},             # data_id -> {rev, sha256, dirty, last_sync_at}
+        "datasets": {},             # data_id -> {rev, sha256, dirty, last_sync_at, changed_at, server_updated_at}
         "pending_deletes": [],      # 本地已删、待上行删除的数据集 id
+        "deleted_at": {},           # data_id -> 本地删除时间（LWW：服务器更晚则撤销删除）
+        "clock_offset_seconds": 0.0,  # 本机时钟与服务器的偏差（服务器时间 - 本机时间）
         "conflicts": [],            # [{data_id, name, server_rev, local_rev}]
         "tasks_pushed": [],         # 已上行过的本机任务 id（避免重复上传大结果）
         "task_deletes": [],         # 本地已删、待上行删除的同组任务 id
@@ -65,6 +67,7 @@ def load_state() -> Dict[str, Any]:
     base.update(data)
     base["datasets"] = base.get("datasets") or {}
     base["pending_deletes"] = base.get("pending_deletes") or []
+    base["deleted_at"] = base.get("deleted_at") or {}
     base["conflicts"] = base.get("conflicts") or []
     return base
 
@@ -104,6 +107,72 @@ def set_run_mode(mode: str) -> str:
     return normalized
 
 
+# ---------------------------------------------------------------- 时间（LWW 选边）
+
+def _now_iso() -> str:
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def _parse_iso(value: Any) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", ""))
+    except (TypeError, ValueError):
+        return None
+    # 统一成无时区（本系统内部时间戳一律为服务器/本机本地时间）
+    return parsed.replace(tzinfo=None) if parsed.tzinfo else parsed
+
+
+def _clock_offset_seconds() -> float:
+    try:
+        return float(load_state().get("clock_offset_seconds") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _to_server_time(local_iso: Optional[str]) -> Optional[str]:
+    """把本机时间戳换算到服务器时间轴（叠加最近一次同步测得的时钟偏差）。"""
+    parsed = _parse_iso(local_iso)
+    if parsed is None:
+        return None
+    return (parsed + timedelta(seconds=_clock_offset_seconds())).isoformat(timespec="seconds")
+
+
+def _remember_clock_offset(server_time: Optional[str]) -> None:
+    """用清单返回的服务器时间校准本机时钟偏差（明显异常时不采信）。"""
+    parsed = _parse_iso(server_time)
+    if parsed is None:
+        return
+    offset = (parsed - datetime.now()).total_seconds()
+    if abs(offset) > 6 * 3600:  # 偏差超过 6 小时视为不可信，回 0 走保守判定
+        offset = 0.0
+    save_state(clock_offset_seconds=offset)
+
+
+def _is_local_newer(local_changed_at: Optional[str], server_updated_at: Optional[str]) -> Optional[bool]:
+    """本地改动（换算到服务器时间轴）是否晚于服务器最后一次写入。
+
+    无法判定（缺任一时间戳）时返回 None，调用方回退到人工选边。
+    """
+    if not local_changed_at or not server_updated_at:
+        return None
+    local_time = _parse_iso(_to_server_time(local_changed_at))
+    server_time = _parse_iso(server_updated_at)
+    if local_time is None or server_time is None:
+        return None
+    return local_time > server_time
+
+
+def _clear_conflict(data_id: str) -> None:
+    """LWW 自动选边后清掉该数据集残留的人工冲突记录。"""
+    state = load_state()
+    conflicts = state.get("conflicts") or []
+    remaining = [c for c in conflicts if c.get("data_id") != data_id]
+    if len(remaining) != len(conflicts):
+        save_state(conflicts=remaining)
+
+
 # ---------------------------------------------------------------- dirty 标记
 
 def mark_dirty(data_id: str) -> None:
@@ -114,6 +183,8 @@ def mark_dirty(data_id: str) -> None:
     datasets = state["datasets"]
     entry = datasets.get(data_id) or {}
     entry["dirty"] = True
+    # 记录最后一次本地改动时间：与服务器更新时间比较，按「最后更新时间」选边
+    entry["changed_at"] = _now_iso()
     datasets[data_id] = entry
     save_state(datasets=datasets)
 
@@ -127,7 +198,9 @@ def mark_local_deleted(data_id: str) -> None:
     datasets.pop(data_id, None)
     pending = [d for d in state["pending_deletes"] if d != data_id]
     pending.append(data_id)
-    save_state(datasets=datasets, pending_deletes=pending)
+    deleted_at = state.get("deleted_at") or {}
+    deleted_at[data_id] = _now_iso()
+    save_state(datasets=datasets, pending_deletes=pending, deleted_at=deleted_at)
 
 
 _pulling_ids: set = set()
@@ -226,26 +299,37 @@ def forget(data_id: str) -> None:
     state = load_state()
     state["datasets"].pop(data_id, None)
     state["pending_deletes"] = [d for d in (state.get("pending_deletes") or []) if d != data_id]
+    deleted_at = state.get("deleted_at") or {}
+    deleted_at.pop(data_id, None)
+    state["deleted_at"] = deleted_at
     state["conflicts"] = [c for c in (state.get("conflicts") or []) if c.get("data_id") != data_id]
     save_state(state)
 
 
-def record_synced(data_id: str, rev: int, sha256: Optional[str] = None) -> None:
+def record_synced(
+    data_id: str, rev: int, sha256: Optional[str] = None, server_updated_at: Optional[str] = None
+) -> None:
     """记录"该数据集已与服务器一致"。
 
     必须同时清掉待上行删除：整包安装（pull）内部是「先删后插」，删除会记一次
     本地删除意图，若不同步清掉，下一轮同步会把刚拉下来的数据集又从服务器删掉。
+    同时清掉本地改动时间（changed_at）与删除时间（deleted_at）——本地状态已
+    与服务器对齐，下一次改动会重新记录。
     """
     state = load_state()
     datasets = state["datasets"]
+    previous = datasets.get(data_id) or {}
     datasets[data_id] = {
         "rev": int(rev or 0),
-        "sha256": sha256 or datasets.get(data_id, {}).get("sha256"),
+        "sha256": sha256 or previous.get("sha256"),
         "dirty": False,
         "last_sync_at": datetime.now().isoformat(timespec="seconds"),
+        "server_updated_at": server_updated_at or previous.get("server_updated_at") or "",
     }
     pending = [d for d in (state.get("pending_deletes") or []) if d != data_id]
-    save_state(datasets=datasets, pending_deletes=pending)
+    deleted_at = state.get("deleted_at") or {}
+    deleted_at.pop(data_id, None)
+    save_state(datasets=datasets, pending_deletes=pending, deleted_at=deleted_at)
 
 
 # ---------------------------------------------------------------- 上下文
@@ -347,7 +431,8 @@ def _move_group_data(db, row, old_city: str, old_operator: str, city: str, opera
 # ---------------------------------------------------------------- 单次同步
 
 def _pull(
-    data_id: str, user, city: str, operator: str, server_rev: int = 0
+    data_id: str, user, city: str, operator: str, server_rev: int = 0,
+    server_updated_at: Optional[str] = None,
 ) -> Dict[str, Any]:
     """从服务器下载整包并落到本机（install_package 内部先删后插，不会重复入库）。"""
     import shutil
@@ -365,7 +450,7 @@ def _pull(
         shutil.rmtree(tmp_zip.parent, ignore_errors=True)
 
     # 记录的是服务器修订号（本地 dataset_revisions 表的数字是本机自己的，不能拿来做基线）
-    record_synced(data_id, server_rev)
+    record_synced(data_id, server_rev, server_updated_at=server_updated_at)
     return {"data_id": data_id, "action": "pull", "rev": server_rev}
 
 
@@ -389,28 +474,32 @@ def repair_dataset(data_id: str) -> Dict[str, Any]:
     _require_active_license()
     user, city, operator = _local_group()
     server_rev = 0
+    server_updated_at: Optional[str] = None
     try:
         manifest = cloud.sync_manifest()
         for item in manifest.get("items") or []:
             if item.get("data_id") == data_id:
                 server_rev = int(item.get("rev") or 0)
+                server_updated_at = item.get("server_updated_at")
                 break
     except Exception:  # noqa: BLE001
         pass  # 拿不到清单就按 0 记基线，下一轮同步会按服务器 rev 修正
 
-    result = _pull(data_id, user, city, operator, server_rev)
+    result = _pull(data_id, user, city, operator, server_rev, server_updated_at)
     return {"repaired": True, **result}
 
 
-def _push(data_id: str, expected_rev: int) -> Dict[str, Any]:
-    """把本地数据集整包上传（带基地修订号乐观锁）。"""
+def _push(data_id: str, expected_rev: int, changed_at: Optional[str] = None) -> Dict[str, Any]:
+    """把本地数据集整包上传（带基地修订号乐观锁 + LWW 改动时间）。"""
     from app.services import desktop_cloud_client as cloud
     from app.services.desktop_dataset_packager import build_package
 
     package = build_package(data_id)
     try:
         result = cloud.upload_package(
-            data_id, package["path"], base_rev=expected_rev
+            data_id, package["path"], base_rev=expected_rev,
+            # 换算到服务器时间轴，供服务器在修订号冲突时按「最后更新时间」选边
+            changed_at=_to_server_time(changed_at),
         )
     finally:
         try:
@@ -509,6 +598,7 @@ def sync_tasks(city: str, operator: str) -> Dict[str, Any]:
                     status=item.get("status") or "completed",
                     progress=100.0,
                     is_applied=1 if server_applied else 0,
+                    cell_count=item.get("cell_count"),
                     created_at=str(item.get("created_at") or ""),
                     completed_at=item.get("completed_at"),
                     city=item.get("city") or city,
@@ -522,6 +612,11 @@ def sync_tasks(city: str, operator: str) -> Dict[str, Any]:
                 row.user_name = item.get("user_name") or row.user_name
                 row.status = item.get("status") or row.status
                 row.completed_at = item.get("completed_at") or row.completed_at
+            # 小数量同步（镜像行本机无结果，列表「小区数量」列完全靠它）
+            server_cell_count = item.get("cell_count")
+            if server_cell_count is not None and int(row.cell_count or 0) != int(server_cell_count):
+                row.cell_count = int(server_cell_count)
+                changed_ids.append(task_id)
             # 应用标记以服务器为准（两组用户共享同一份历史）；
             # 本机刚应用、尚未上行的任务保留本机值，避免被服务器旧值冲掉
             if task_id not in pending_updates:
@@ -546,6 +641,7 @@ def sync_tasks(city: str, operator: str) -> Dict[str, Any]:
                         "created_at": row.created_at,
                         "completed_at": row.completed_at,
                         "is_applied": bool(row.is_applied),
+                        "cell_count": row.cell_count if (row.cell_count or 0) > 0 else None,
                     }, _json.loads(row.result_json) if row.result_json else None)
                     pushed.add(row.task_id)
                 except Exception as exc:  # noqa: BLE001
@@ -573,6 +669,7 @@ def sync_tasks(city: str, operator: str) -> Dict[str, Any]:
                     "status": row.status,
                     "created_at": row.created_at,
                     "completed_at": row.completed_at,
+                    "cell_count": row.cell_count if (row.cell_count or 0) > 0 else None,
                 }, result)
                 pushed.add(row.task_id)
                 summary["pushed"] += 1
@@ -628,6 +725,8 @@ def sync_once() -> Dict[str, Any]:
 
         manifest = cloud.sync_manifest()
         items = {i["data_id"]: i for i in (manifest.get("items") or [])}
+        # 用服务器时间校准本机时钟偏差：LWW 选边要把本地改动时间换算到服务器时间轴
+        _remember_clock_offset(manifest.get("server_time"))
         local_state = load_state()
         datasets_state = local_state["datasets"]
 
@@ -641,10 +740,11 @@ def sync_once() -> Dict[str, Any]:
                 continue
             local_entry = datasets_state.get(data_id)
             server_rev = int(item.get("rev") or 0)
+            server_updated_at = item.get("server_updated_at")
             if data_id not in data_service.index:
                 name = item.get("name") or data_id
                 try:
-                    _pull(data_id, user, city, operator, server_rev)
+                    _pull(data_id, user, city, operator, server_rev, server_updated_at)
                     summary["pulled"] += 1
                     summary.setdefault("details", []).append({"name": name, "action": "pull"})
                 except Exception as exc:  # noqa: BLE001
@@ -655,9 +755,34 @@ def sync_once() -> Dict[str, Any]:
             dirty = (local_entry or {}).get("dirty") or local_entry is None
 
             if dirty:
-                # 本地改过：服务器版本也变了（或本机从未同步过，无基线）→ 交用户选边；
-                # 服务器没动过才直接上行（base_rev 乐观锁）。
+                # 本地改过：服务器版本也变了 → 按「最后更新时间」自动选边（LWW），
+                # 避免两个用户来回互相覆盖（乒乓）；时间戳缺失的存量条目才交人工选边。
                 if server_rev != local_rev:
+                    changed_at = (local_entry or {}).get("changed_at")
+                    local_newer = _is_local_newer(changed_at, server_updated_at)
+                    if local_newer is True:
+                        try:
+                            _push(data_id, local_rev or None, changed_at=changed_at)
+                            summary["pushed"] += 1
+                            summary.setdefault("details", []).append({"name": name, "action": "push-lww"})
+                            _clear_conflict(data_id)
+                        except Exception as exc:  # noqa: BLE001
+                            summary["errors"].append(f"上传「{name}」失败：{exc}")
+                        continue
+                    if local_newer is False:
+                        # 服务器版本更晚：采用服务器版本（本机未上行改动被覆盖，属预期 LWW 语义）
+                        try:
+                            _pull(data_id, user, city, operator, server_rev, server_updated_at)
+                            summary["pulled"] += 1
+                            summary.setdefault("details", []).append({
+                                "name": name, "action": "pull-lww",
+                                "note": "服务器版本更新，已按最后更新时间采用",
+                            })
+                            _clear_conflict(data_id)
+                        except Exception as exc:  # noqa: BLE001
+                            summary["errors"].append(f"更新「{name}」失败：{exc}")
+                        continue
+                    # 无法判定时间 → 保留人工选边
                     state = load_state()
                     conflicts = [c for c in state["conflicts"] if c.get("data_id") != data_id]
                     conflicts.append({
@@ -668,7 +793,7 @@ def sync_once() -> Dict[str, Any]:
                     summary["conflicts"] += 1
                     continue
                 try:
-                    _push(data_id, local_rev or None)
+                    _push(data_id, local_rev or None, changed_at=(local_entry or {}).get("changed_at"))
                     summary["pushed"] += 1
                     summary.setdefault("details", []).append({"name": name, "action": "push"})
                 except Exception as exc:  # noqa: BLE001
@@ -679,7 +804,7 @@ def sync_once() -> Dict[str, Any]:
                 continue  # 两边都没动
 
             try:
-                _pull(data_id, user, city, operator, server_rev)
+                _pull(data_id, user, city, operator, server_rev, server_updated_at)
                 summary["pulled"] += 1
                 summary.setdefault("details", []).append({"name": name, "action": "pull"})
             except Exception as exc:  # noqa: BLE001
@@ -701,7 +826,11 @@ def sync_once() -> Dict[str, Any]:
             entry = datasets_state.get(data_id)
             if entry is None or entry.get("dirty"):
                 try:
-                    _push(data_id, int((entry or {}).get("rev") or 0) or None)
+                    _push(
+                        data_id,
+                        int((entry or {}).get("rev") or 0) or None,
+                        changed_at=(entry or {}).get("changed_at"),
+                    )
                     summary["pushed"] += 1
                 except Exception as exc:  # noqa: BLE001
                     summary["errors"].append(f"上传「{data_id}」失败：{exc}")
@@ -711,9 +840,31 @@ def sync_once() -> Dict[str, Any]:
                 forget(data_id)
                 summary["deleted"] += 1
 
-        # 3. 本地已删除 → 通知服务器
+        # 3. 本地已删除 → 通知服务器。
+        #    若服务器在本地删除之后又更新过该数据集，则撤销本地删除并拉回服务器版本，
+        #    避免"删除/旧数据"反向覆盖同组的新改动。
+        state_before = load_state()
+        deleted_at_map = state_before.get("deleted_at") or {}
         remaining: List[str] = []
-        for data_id in load_state().get("pending_deletes") or []:
+        for data_id in state_before.get("pending_deletes") or []:
+            item = items.get(data_id)
+            if item and not item.get("deleted"):
+                server_newer = _is_local_newer(
+                    deleted_at_map.get(data_id), item.get("server_updated_at")
+                )
+                if server_newer is False:
+                    try:
+                        _pull(data_id, user, city, operator,
+                              int(item.get("rev") or 0), item.get("server_updated_at"))
+                        summary["pulled"] += 1
+                        summary.setdefault("details", []).append({
+                            "name": item.get("name") or data_id, "action": "pull",
+                            "note": "服务器版本更新，已撤销本机删除",
+                        })
+                    except Exception as exc:  # noqa: BLE001
+                        summary["errors"].append(f"恢复「{data_id}」失败：{exc}")
+                        remaining.append(data_id)
+                    continue
             try:
                 cloud.delete_dataset(data_id)
             except Exception as exc:  # noqa: BLE001

@@ -301,6 +301,8 @@ class TaskResult(Base):
     progress = Column(Float, default=100.0)
     error_message = Column(Text, nullable=True)
     is_applied = Column(Integer, default=0)  # 0=未应用, 1=已应用
+    # 参与规划的小区数量（列表展示用；镜像任务无本机 result_json 时靠它显示「小区数量」）
+    cell_count = Column(Integer, nullable=True)
     created_at = Column(String(30), nullable=False)
     completed_at = Column(String(30), nullable=True)
     # 任务来源：local=本机创建 / shared=同组共享同步进来的镜像（桌面端用；

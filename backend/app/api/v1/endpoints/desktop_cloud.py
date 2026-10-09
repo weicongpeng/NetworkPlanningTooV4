@@ -559,6 +559,17 @@ async def data_session(
     }
 
 
+def _parse_naive_iso(value: Any) -> Optional[datetime]:
+    """解析本系统内部使用的 ISO 时间串（统一成无时区；失败返回 None）。"""
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", ""))
+    except (TypeError, ValueError):
+        return None
+    return parsed.replace(tzinfo=None) if parsed.tzinfo else parsed
+
+
 def _collect_manifest(city: str, operator: str) -> List[Dict[str, Any]]:
     """列出该组的数据集清单（含删除墓碑），并为无记录的数据集补建初始修订号。"""
     from app.services import dataset_revision_service as revs
@@ -578,6 +589,8 @@ def _collect_manifest(city: str, operator: str) -> List[Dict[str, Any]]:
     rev_map = revs.ensure(
         {did: {"city": e.get("city"), "operator": e.get("operator")} for did, e in entries.items()}
     )
+    # 修订记录的写入时间（服务器时间轴）：客户端按"最后更新时间"选边时用
+    rev_rows = {row.get("data_id"): row for row in revs.list_group(city, operator)}
 
     items: List[Dict[str, Any]] = []
     for data_id, entry in entries.items():
@@ -592,6 +605,8 @@ def _collect_manifest(city: str, operator: str) -> List[Dict[str, Any]]:
             "layer_count": meta.get("layerCount") or 0,
             "updated_at": entry.get("uploadDate") or "",
             "rev": rev_map.get(data_id, 0),
+            # 最后一次服务器写入时间（修订号推进时间）：LWW 选边依据
+            "server_updated_at": (rev_rows.get(data_id) or {}).get("updated_at") or "",
             "deleted": False,
         })
 
@@ -601,6 +616,7 @@ def _collect_manifest(city: str, operator: str) -> List[Dict[str, Any]]:
             items.append({
                 "data_id": row["data_id"],
                 "rev": row.get("rev") or 0,
+                "server_updated_at": row.get("updated_at") or "",
                 "deleted": True,
             })
     return items
@@ -795,13 +811,17 @@ async def upload_dataset_package(
     license_file: str = Form(...),
     machine_code: str = Form(default=""),
     base_rev: Optional[int] = Form(default=None),
+    changed_at: Optional[str] = Form(default=None),
     file: UploadFile = File(...),
     request: Request = None,
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
     """上传数据集整包（push）。桌面端贡献数据给同组的其它桌面端与网页端用户。
 
-    base_rev 为乐观锁：服务器当前修订号与之不符 → 409 冲突，由客户端让用户选边。
+    base_rev 为乐观锁：服务器当前修订号与之不符 → 409 冲突。
+    冲突时按「最后更新时间」选边（LWW）：客户端可以携带本地改动的服务器时间轴
+    时间戳 changed_at，只有晚于服务器最后一次写入才接受覆盖；否则 409，
+    避免旧数据反向覆盖新数据（两端来回覆盖的乒乓）。
     """
     from starlette.concurrency import run_in_threadpool
 
@@ -834,16 +854,25 @@ async def upload_dataset_package(
 
         current = revs.get(data_id)
         current_rev = int((current or {}).get("rev") or 0)
-        # 数据集已在服务器且客户端基线落后 → 冲突（除非客户端本来就是新建）
-        if base_rev is not None and current_rev and current_rev != int(base_rev):
-            raise HTTPException(
-                status_code=409,
-                detail=_gbk_safe(
+        # 数据集已在服务器且客户端基线落后 → 冲突。
+        # 无基线（base_rev=None）但服务器已有版本、且客户端声明了本地改动时间时，
+        # 若声明的时间比服务器旧，同样按旧数据拒绝（防止旧副本反向覆盖新数据）。
+        # 显式 force（不带 base_rev 也不带 changed_at，如用户手动"覆盖服务器"）保持原语义。
+        base_mismatch = base_rev is not None and current_rev and current_rev != int(base_rev)
+        stale_unbased = base_rev is None and current_rev > 0 and bool(changed_at)
+        if base_mismatch or stale_unbased:
+            client_time = _parse_naive_iso(changed_at)
+            server_time = _parse_naive_iso((current or {}).get("updated_at"))
+            lww_allows = bool(client_time and server_time and client_time > server_time)
+            if not lww_allows:
+                detail = (
                     f"服务器上的「{existing.get('name') if existing else data_id}」已被更新"
-                    f"（本地基线 rev={base_rev}，服务器 rev={current_rev}），"
-                    "请先拉取最新或选择覆盖服务器版本"
-                ),
-            )
+                    f"（本地基线 rev={base_rev if base_rev is not None else '无'}，服务器 rev={current_rev}），"
+                    "请先拉取最新版本"
+                )
+                if changed_at:
+                    detail += "；本机改动时间不晚于服务器更新时间"
+                raise HTTPException(status_code=409, detail=_gbk_safe(detail))
 
         owner = _owner_user(db, record)
         db.commit()

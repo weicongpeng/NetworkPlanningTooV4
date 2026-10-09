@@ -70,4 +70,25 @@ describe('taskStore 历史同步：跨端删除', () => {
     await useTaskStore.getState().syncHistoryFromBackend('pci_planning', 1, 20)
     expect(useTaskStore.getState().tasks['t-1'].isApplied).toBe(true)
   })
+
+  it('镜像任务的「小区数量」摘要随列表同步（resultSummary → task.result，不破坏已应用标记）', async () => {
+    // 镜像任务本机没有完整结果，只有后端同步来的轻量摘要
+    vi.mocked(pciApi.getHistory).mockResolvedValue({
+      success: true,
+      data: {
+        tasks: [
+          { ...hItem('t-mirror', '2026-10-09T10:00:00', true), resultSummary: { cellCount: 42 } },
+          { ...hItem('t-plain', '2026-10-09T09:00:00'), resultSummary: { totalSectors: 7 } },
+        ],
+        total: 2, page: 1, page_size: 20,
+      },
+    } as any)
+
+    await useTaskStore.getState().syncHistoryFromBackend('pci_planning', 1, 20)
+
+    const mirror = useTaskStore.getState().tasks['t-mirror']
+    expect(mirror.result).toEqual({ cellCount: 42 })  // getCellCount 读它显示 42
+    expect(mirror.isApplied).toBe(true)               // 标记不被摘要覆盖
+    expect(useTaskStore.getState().tasks['t-plain'].result).toEqual({ totalSectors: 7 })
+  })
 })

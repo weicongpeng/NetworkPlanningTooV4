@@ -432,3 +432,97 @@ def test_list_task_history_applied_flag_for_mirror_rows(temp_db):
     by_id = {t["taskId"]: t for t in history["tasks"]}
     assert by_id["t-mirror-applied"]["isApplied"] is True
     assert by_id["t-mirror-plain"]["isApplied"] is False
+
+
+# ---------------------------------------------------------------- 应用标记落库 / 小数量
+
+def test_upsert_shared_task_persists_is_applied_monotonically(temp_db):
+    """桌面端应用后上行 is_applied=True 必须落库；已应用无撤销语义，不回落。"""
+    base = {"task_id": "t-applied", "task_type": "pci", "task_name": "PCI",
+            "user_name": "alice", "status": "completed", "created_at": "2026-10-09T10:00:00"}
+    task_manager.upsert_shared_task({**base, "is_applied": True}, city="河源", operator="联通")
+    assert task_manager.list_shared_tasks("河源", "联通")[0]["is_applied"] is True
+
+    # 后续上行未携带 True（如镜像任务元数据更新）不得把标记冲回 False
+    task_manager.upsert_shared_task({**base, "is_applied": False}, city="河源", operator="联通")
+    assert task_manager.list_shared_tasks("河源", "联通")[0]["is_applied"] is True
+
+
+def test_shared_task_cell_count_roundtrip(temp_db):
+    """小数量走元数据（镜像任务上行没有完整 result），历史列表镜像行回退显示。"""
+    meta = task_manager.upsert_shared_task(
+        {"task_id": "t-cell-1", "task_type": "pci", "task_name": "PCI", "user_name": "alice",
+         "status": "completed", "created_at": "2026-10-09T10:00:00", "cell_count": 42},
+        city="河源", operator="联通",
+    )
+    assert meta["cell_count"] == 42
+    assert task_manager.list_shared_tasks("河源", "联通")[0]["cell_count"] == 42
+
+    # 没有显式字段时从完整结果提取
+    meta2 = task_manager.upsert_shared_task(
+        {"task_id": "t-cell-2", "task_type": "tac", "task_name": "核查", "user_name": "bob",
+         "status": "completed", "created_at": "2026-10-09T10:00:00",
+         "result": {"results": [{"a": 1}, {"a": 2}, {"a": 3}]}},
+        city="河源", operator="联通",
+    )
+    assert meta2["cell_count"] == 3
+
+    # 镜像行（本机无结果）→ resultSummary 带归一化 cellCount，供列表「小区数量」列显示
+    history = task_manager.list_task_history(task_type="pci", page=1, page_size=10)
+    row = next(t for t in history["tasks"] if t["taskId"] == "t-cell-1")
+    assert row["resultSummary"] == {"cellCount": 42}
+
+
+def test_sync_tasks_mirrors_and_uploads_cell_count(desktop_task_env, temp_db):
+    """镜像行写入服务器小数量；本机任务上行携带小数量。"""
+    sync = desktop_task_env
+    from app.services import desktop_cloud_client as cloud
+
+    monkeypatch_ = pytest.MonkeyPatch()
+    server = _patch_cloud(monkeypatch_, cloud, [
+        {"task_id": "t-remote-cells", "task_type": "tac_planning", "task_name": "远端",
+         "user_name": "bob", "status": "completed", "is_applied": False, "cell_count": 88,
+         "created_at": "2026-10-09T09:00:00", "completed_at": None,
+         "city": "河源", "operator": "联通"},
+    ])
+    try:
+        db = temp_db()
+        try:
+            db.add(TaskResult(**_task_row(task_id="t-local-cells", origin="local", cell_count=7,
+                                          result_json=json.dumps({"results": []}))))
+            db.commit()
+        finally:
+            db.close()
+
+        sync.sync_tasks("河源", "联通")
+
+        db = temp_db()
+        try:
+            mirror = db.query(TaskResult).filter(TaskResult.task_id == "t-remote-cells").first()
+            assert mirror is not None and int(mirror.cell_count) == 88
+        finally:
+            db.close()
+        assert server["items"]["t-local-cells"]["cell_count"] == 7
+    finally:
+        monkeypatch_.undo()
+
+
+def test_queue_shared_task_update_schedules_immediate_sync(monkeypatch, temp_db):
+    """入队后要立刻安排同步，否则同组用户要等 1 分钟兜底轮询才看到应用标记。"""
+    from app.core.config import settings
+    from app.services import desktop_sync_service as sync
+
+    monkeypatch.setattr(settings, "NPT_DESKTOP", True)
+    monkeypatch.setattr(sync, "is_shared", lambda: True)
+    queued, scheduled = [], []
+    monkeypatch.setattr(sync, "queue_task_update", lambda tid: queued.append(tid))
+    monkeypatch.setattr(sync, "schedule_sync", lambda *a, **k: scheduled.append(True))
+
+    task_manager._queue_shared_task_update("t-abc", "pci")
+    assert queued == ["t-abc"] and scheduled == [True]
+
+    # 非共享任务类型不参与
+    queued.clear()
+    scheduled.clear()
+    task_manager._queue_shared_task_update("t-apply", "apply_pci")
+    assert queued == [] and scheduled == []

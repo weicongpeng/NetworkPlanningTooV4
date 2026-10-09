@@ -211,8 +211,14 @@ def download_package(data_id: str, destdir: Optional[Path] = None) -> Path:
     return target
 
 
-def upload_package(data_id: str, zip_path: Path, base_rev: Optional[int] = None) -> Dict[str, Any]:
-    """上传数据集整包（multipart/form-data，手动构造以免引入 requests 依赖）。"""
+def upload_package(
+    data_id: str, zip_path: Path, base_rev: Optional[int] = None, changed_at: Optional[str] = None
+) -> Dict[str, Any]:
+    """上传数据集整包（multipart/form-data，手动构造以免引入 requests 依赖）。
+
+    changed_at：本地改动的服务器时间轴时间戳（已按时钟偏差换算），
+    供服务器在修订号冲突时按「最后更新时间」选边（LWW）。
+    """
     import mimetypes
     import urllib.parse
 
@@ -229,6 +235,8 @@ def upload_package(data_id: str, zip_path: Path, base_rev: Optional[int] = None)
     ]
     if base_rev is not None:
         fields.append(("base_rev", str(base_rev)))
+    if changed_at:
+        fields.append(("changed_at", str(changed_at)))
 
     body = bytearray()
     for name, value in fields:

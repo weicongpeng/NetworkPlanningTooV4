@@ -4,7 +4,7 @@
  */
 
 interface WebSocketMessage {
-  type: 'progress' | 'complete' | 'failed' | 'pong' | 'task_deleted'
+  type: 'progress' | 'complete' | 'failed' | 'pong' | 'task_deleted' | 'data_changed' | 'auth_ok'
   taskId: string
   data?: any
   timestamp?: number
@@ -27,6 +27,8 @@ class WebSocketService {
   private heartbeatInterval: NodeJS.Timeout | null = null
   private isConnecting = false
   private usePollingFallback = false
+  /** 登录 JWT：服务器据此把连接归入（地市+运营商）组，仅向同组推送数据变更 */
+  private authToken: string | null = null
 
   // WebSocket服务器地址（通过Vite代理）
   // 使用相对路径，让Vite代理自动处理协议转换
@@ -81,7 +83,9 @@ class WebSocketService {
         // 开发环境使用Vite代理，生产环境使用实际路径
         const isDev = import.meta.env.DEV
         const host = isDev ? window.location.host : window.location.host
-        const wsUrl = `${protocol}//${host}${this.WS_URL}`
+        // 带上登录 JWT：服务器据此登记数据组，仅向同组连接推送 data_changed
+        const token = this.currentToken()
+        const wsUrl = `${protocol}//${host}${this.WS_URL}${token ? `?token=${encodeURIComponent(token)}` : ''}`
 
         console.log(`[WebSocketService] WebSocket URL: ${wsUrl}`)
 
@@ -150,6 +154,39 @@ class WebSocketService {
     this.subscriptions.clear()
     this.reconnectAttempts = 0
     this.isConnecting = false
+  }
+
+  /**
+   * 读取当前登录 JWT（优先用显式传入的，其次从持久化登录态里取）。
+   * 不经过 store，避免连接建立早于 store 初始化。
+   */
+  private currentToken(): string | null {
+    if (this.authToken) return this.authToken
+    try {
+      const raw = localStorage.getItem('auth-storage')
+      if (!raw) return null
+      const parsed = JSON.parse(raw)
+      const token = parsed?.state?.token
+      return typeof token === 'string' && token ? token : null
+    } catch {
+      return null
+    }
+  }
+
+  /**
+   * 登录后补鉴权：服务器据此把连接归入数据组，仅接收同组的数据变更推送。
+   * 已连接则原地发送 auth 消息，未连接则带 token 重连。
+   */
+  authenticate(token: string | null): void {
+    if (!token) return
+    if (token === this.authToken) return
+    this.authToken = token
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.sendMessage({ type: 'auth', token })
+    } else {
+      this.disconnect()
+      void this.connect()
+    }
   }
 
   /**
@@ -231,6 +268,17 @@ class WebSocketService {
         try { callback(message) } catch (error) {
           console.error('[WebSocketService] 全局回调执行失败:', error)
         }
+      })
+      return
+    }
+
+    // 同组数据变更（其他端写入服务器）：刷新数据列表并清小区列表缓存，
+    // 网页端无需手动刷新即可看到桌面端/同组用户的改动
+    if (type === 'data_changed') {
+      import('../store/dataStore').then(({ triggerDataRefresh }) => {
+        triggerDataRefresh('full')
+      }).catch(() => {
+        // 数据刷新模块不可用（降级场景）：忽略
       })
       return
     }

@@ -622,7 +622,9 @@ const _CELL_LIST_CACHE_KEY = () => `cell_list_cache${userCacheSuffix()}`
 const _CELL_LIST_CACHE_TTL = 24 * 60 * 60 * 1000 // 24小时缓存
 /** 缓存版本，递增以强制刷新缓存（接口数据格式变更时） */
 // v5：小区经纬度改为只取小区自身值（不再回退站点坐标），旧缓存会残留错误坐标
-const _CELL_LIST_CACHE_VERSION = 5
+// v6：桌面端在后台同步落地前可能把"空列表"写进 IndexedDB（TTL 24h），
+//     旧版本（v5）留下的空缓存升级后仍会被命中，导致「小区选择」一直空白
+const _CELL_LIST_CACHE_VERSION = 6
 
 // 内存缓存（持久化，仅在数据更新时失效），按登录用户分键防止切账号串组
 const _cellListCacheByUser = new Map<string, { data: CellListResponse; time: number }>()
@@ -640,17 +642,28 @@ export async function getCellList(): Promise<CellListResponse> {
   // 1. 检查内存缓存（按用户分键）
   const mem = _cellListCacheByUser.get(userKey)
   if (mem && Date.now() - mem.time < _CELL_LIST_CACHE_TTL) {
-    console.log('[CellList] 使用内存缓存')
-    return mem.data
+    // 空列表一律视为未命中：桌面端同步落地前取到的空列表不能固化在缓存里
+    if (mem.data.lte.length === 0 && mem.data.nr.length === 0) {
+      _cellListCacheByUser.delete(userKey)
+    } else {
+      console.log('[CellList] 使用内存缓存')
+      return mem.data
+    }
   }
 
   // 2. 检查 IndexedDB 缓存（仅版本匹配时使用）
   try {
     const cached = await indexedDBService.get<CellListResponse>(_CELL_LIST_CACHE_KEY())
     if (cached && cached.cacheVersion === _CELL_LIST_CACHE_VERSION) {
-      console.log('[CellList] 使用 IndexedDB 缓存')
-      _cellListCacheByUser.set(userKey, { data: cached, time: Date.now() })
-      return cached
+      if (cached.lte.length === 0 && cached.nr.length === 0) {
+        // 旧版本或同步前写入的空缓存：删除后走网络请求，避免「小区选择」长期空白
+        console.log('[CellList] 缓存的空列表不生效，改为重新请求')
+        indexedDBService.delete(_CELL_LIST_CACHE_KEY()).catch(() => {})
+      } else {
+        console.log('[CellList] 使用 IndexedDB 缓存')
+        _cellListCacheByUser.set(userKey, { data: cached, time: Date.now() })
+        return cached
+      }
     }
     // 版本不匹配时清除旧缓存
     if (cached && cached.cacheVersion !== _CELL_LIST_CACHE_VERSION) {

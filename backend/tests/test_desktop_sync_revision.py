@@ -151,3 +151,75 @@ def test_pull_does_not_bump_revision(cloud_env, tmp_path, monkeypatch):  # noqa:
     finally:
         monkeypatch.setattr(data_service, "index", backup)
         revs.remove(data_id)
+
+
+def _push_with_conflict(client, license_file: str, data_id: str, tmp_path, base_rev: int, changed_at: str):
+    pkg = tmp_path / f"{data_id}.zip"
+    with zipfile.ZipFile(pkg, "w") as zf:
+        zf.writestr("meta.json", "{}")
+    return client.post(
+        f"/api/v1/desktop-cloud/data/dataset/{data_id}/package",
+        data={"license_file": license_file, "machine_code": MACHINE,
+              "base_rev": str(base_rev), "changed_at": changed_at},
+        files={"file": (pkg.name, pkg.read_bytes(), "application/zip")},
+    )
+
+
+def test_push_conflict_accepts_newer_changed_at_lww(cloud_env, tmp_path, monkeypatch):  # noqa: F401
+    """修订号冲突时按「最后更新时间」选边：客户端改动时间更晚 → 允许覆盖（LWW）。"""
+    from datetime import datetime, timedelta
+
+    from app.services import dataset_revision_service as revs
+
+    data_id = "sync-lww-newer"
+    license_file = _issue(cloud_env)
+    client = cloud_env.client
+    _bind_group(client, license_file)
+
+    monkeypatch.setattr(
+        "app.services.desktop_dataset_packager.install_package",
+        lambda *a, **kw: {"data_id": data_id, "type": "excel"},
+    )
+    revs.ensure({data_id: {"city": "广州", "operator": "移动"}})
+    revs.bump(data_id, deleted=False)  # 同组有人刚改过：服务器 rev 已推进
+    server_updated_at = (revs.get(data_id) or {}).get("updated_at")
+    changed_at = (
+        datetime.fromisoformat(server_updated_at) + timedelta(minutes=5)
+    ).isoformat(timespec="seconds")
+
+    try:
+        resp = _push_with_conflict(client, license_file, data_id, tmp_path, base_rev=1, changed_at=changed_at)
+        assert resp.status_code == 200, resp.text
+    finally:
+        revs.remove(data_id)
+
+
+def test_push_conflict_rejects_stale_changed_at(cloud_env, tmp_path, monkeypatch):  # noqa: F401
+    """本地改动时间不晚于服务器 → 拒绝覆盖，防止旧数据反向覆盖新数据（乒乓）。"""
+    from datetime import datetime, timedelta
+
+    from app.services import dataset_revision_service as revs
+
+    data_id = "sync-lww-stale"
+    license_file = _issue(cloud_env)
+    client = cloud_env.client
+    _bind_group(client, license_file)
+
+    monkeypatch.setattr(
+        "app.services.desktop_dataset_packager.install_package",
+        lambda *a, **kw: {"data_id": data_id, "type": "excel"},
+    )
+    revs.ensure({data_id: {"city": "广州", "operator": "移动"}})
+    revs.bump(data_id, deleted=False)
+    server_updated_at = (revs.get(data_id) or {}).get("updated_at")
+    stale_changed_at = (
+        datetime.fromisoformat(server_updated_at) - timedelta(minutes=5)
+    ).isoformat(timespec="seconds")
+    before_rev = int((revs.get(data_id) or {}).get("rev") or 0)
+
+    try:
+        resp = _push_with_conflict(client, license_file, data_id, tmp_path, base_rev=1, changed_at=stale_changed_at)
+        assert resp.status_code == 409, resp.text
+        assert int((revs.get(data_id) or {}).get("rev") or 0) == before_rev  # 未写入
+    finally:
+        revs.remove(data_id)

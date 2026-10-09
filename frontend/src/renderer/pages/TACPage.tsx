@@ -216,6 +216,8 @@ export function TACPage() {
 
   // ===== getCellCount =====
   const getCellCount = useCallback((task: Task): number | string => {
+    // 归一化字段优先（同组镜像任务同步来的摘要只有它）
+    if (task.result?.cellCount != null) return task.result.cellCount
     if (task.result?.totalCells !== undefined) return task.result.totalCells
     if (task.result?.results && Array.isArray(task.result.results)) {
       return task.result.results.length

@@ -17,12 +17,24 @@ export function AuthGuard({ children }: AuthGuardProps) {
   const { t } = useTranslation()
   const { isAuthenticated, user } = useAuthStore()
   const desktopProbed = useAuthStore((s) => s.desktopProbed)
+  const token = useAuthStore((s) => s.token)
   const lastActivityRef = useRef(Date.now())
 
   // 运行形态探测：桌面版（NPT_DESKTOP=1）由 /system/info 公开字段判定
   useEffect(() => {
     useAuthStore.getState().probeDesktopMode()
   }, [])
+
+  // 登录后给 WebSocket 补鉴权：服务器据此把连接归入数据组，
+  // 同组任何端（桌面端/网页端）写入数据都会即时推送 data_changed 给本页
+  useEffect(() => {
+    if (!isAuthenticated || !token) return
+    import('../services/websocketService').then(({ websocketService }) => {
+      websocketService.authenticate(token)
+    }).catch(() => {
+      // WS 不可用：静默降级（各页面仍有页面可见时刷新等兜底）
+    })
+  }, [isAuthenticated, token])
 
   // 监听 401 事件（API 拦截器触发）→ 主动验证 token 并同步 store 状态
   // 后台 token 校验由 authStore persist 的 onRehydrateStorage 触发（fire-and-forget）

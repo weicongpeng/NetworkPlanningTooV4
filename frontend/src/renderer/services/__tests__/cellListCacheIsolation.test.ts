@@ -122,3 +122,45 @@ describe('getCellList 空结果不入缓存', () => {
     expect(afterSync.lte).toHaveLength(1)
   })
 })
+
+/**
+ * 回归：旧版本（缓存版本未 bump）把空列表写进 IndexedDB（TTL 24h），
+ * 升级后版本号若不变仍会命中空缓存 → 「小区选择」一直空白。
+ * 空列表缓存一律视为未命中（不论版本），非空缓存照常命中。
+ */
+describe('getCellList 空缓存（IndexedDB）不生效', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    localStorage.clear()
+    clearAllInMemoryMapCaches()
+  })
+
+  it('旧版本（v5）遗留的空缓存不命中，重新请求后端', async () => {
+    setLoginUserId(1)
+    indexedGet.mockResolvedValueOnce({ lte: [], nr: [], cacheVersion: 5 })
+    getCellsMock.mockResolvedValueOnce({ success: true, data: groupAData })
+
+    const data = await getCellList()
+    expect(data.lte).toHaveLength(1)
+    expect(getCellsMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('当前版本的空缓存同样不命中（同步前写入的残留）', async () => {
+    setLoginUserId(1)
+    indexedGet.mockResolvedValueOnce({ lte: [], nr: [], cacheVersion: 6 })
+    getCellsMock.mockResolvedValueOnce({ success: true, data: groupAData })
+
+    const data = await getCellList()
+    expect(data.lte).toHaveLength(1)
+    expect(getCellsMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('非空且版本匹配的缓存仍然命中（不破坏原有缓存行为）', async () => {
+    setLoginUserId(1)
+    indexedGet.mockResolvedValueOnce({ ...groupAData, cacheVersion: 6 })
+
+    const data = await getCellList()
+    expect(data.lte).toHaveLength(1)
+    expect(getCellsMock).not.toHaveBeenCalled()
+  })
+})

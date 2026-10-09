@@ -336,6 +336,8 @@ export function NeighborPage() {
 
   // ===== getCellCount =====
   const getCellCount = useCallback((task: Task): number | string => {
+    // 归一化字段优先（同组镜像任务同步来的摘要只有它）
+    if (task.result?.cellCount != null) return task.result.cellCount
     if (task.result?.totalSectors !== undefined) return task.result.totalSectors
     if (task.result?.results && Array.isArray(task.result.results)) {
       return task.result.results.length

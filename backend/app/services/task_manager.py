@@ -3121,12 +3121,15 @@ class TaskManager:
                 safe_result = self._sanitize_result(task.result) if task.result else None
                 result_json = json.dumps(safe_result, ensure_ascii=False, allow_nan=False, default=str) if safe_result else None
                 config_json = json.dumps(task.config, ensure_ascii=False, default=str) if task.config else None
+                cell_count = self._extract_cell_count(safe_result) if safe_result else None
 
                 existing = db.query(TaskResult).filter(TaskResult.task_id == task.task_id).first()
                 if existing:
                     existing.result_json = result_json
                     existing.status = task.status.value
                     existing.progress = task.progress
+                    if cell_count is not None:
+                        existing.cell_count = cell_count
                     existing.task_name = getattr(task, 'task_name', None) or existing.task_name
                     existing.user_name = getattr(task, 'user_name', None) or existing.user_name
                     existing.completed_at = task.completed_at.isoformat() if task.completed_at else None
@@ -3145,6 +3148,7 @@ class TaskManager:
                         status=task.status.value,
                         progress=task.progress,
                         error_message=task.error,
+                        cell_count=cell_count,
                         created_at=task.created_at.isoformat() if task.created_at else datetime.now().isoformat(),
                         completed_at=task.completed_at.isoformat() if task.completed_at else None,
                         # 任务发起时的组快照（地市+运营商），决定历史任务组可见性
@@ -3210,6 +3214,9 @@ class TaskManager:
             "user_name": row.user_name,
             "status": row.status,
             "is_applied": bool(row.is_applied),
+            # 镜像端结果按需拉取，列表「小区数量」只能靠元数据携带
+            # （cell_count = -1 是回填哨兵：已计算但结果里没有可用字段）
+            "cell_count": row.cell_count if (row.cell_count or 0) > 0 else None,
             "created_at": row.created_at,
             "completed_at": row.completed_at,
             "city": row.city,
@@ -3301,6 +3308,17 @@ class TaskManager:
             if result is not None
             else None
         )
+        # 小数量：优先取客户端显式字段（镜像任务上行时没有完整 result），
+        # 其次从完整结果里提取
+        cell_count = payload.get("cell_count")
+        try:
+            cell_count = int(cell_count) if cell_count is not None else None
+        except (TypeError, ValueError):
+            cell_count = None
+        if cell_count is None and result is not None:
+            cell_count = self._extract_cell_count(result)
+        if cell_count is not None and cell_count < 0:
+            cell_count = None  # 哨兵值不回写
         db = SessionLocal()
         try:
             row = db.query(TaskResult).filter(TaskResult.task_id == task_id).first()
@@ -3317,6 +3335,13 @@ class TaskManager:
             row.user_name = payload.get("user_name") or row.user_name
             row.status = str(payload.get("status") or row.status or "completed")
             row.completed_at = payload.get("completed_at") or row.completed_at
+            if cell_count is not None:
+                row.cell_count = cell_count
+            # 应用标记单调置位：桌面端「应用到工参」后上行 is_applied=True 要落库，
+            # 否则同组用户在历史列表里看到的永远是未应用（按钮全绿）。
+            # 「已应用」没有撤销语义，payload 未带或不带 True 时不回落。
+            if payload.get("is_applied"):
+                row.is_applied = 1
             if result_json is not None:
                 row.result_json = result_json
             # 组以服务器（授权记录的组）为准，防止客户端串组
@@ -3383,6 +3408,8 @@ class TaskManager:
                 if row is not None and not row.result_json:
                     row.result_json = json.dumps(result, ensure_ascii=False, allow_nan=False, default=str)
                     db.commit()
+                    # 结果落地后历史列表要重算摘要/应用状态，清掉验证缓存
+                    TaskManager._history_verify_cache.pop(task_id, None)
             finally:
                 db.close()
         except Exception as exc:  # noqa: BLE001
@@ -3404,6 +3431,9 @@ class TaskManager:
             if not sync.is_shared():
                 return
             sync.queue_task_update(task_id)
+            # 入队后立刻安排一次上行（防抖 3 秒）：否则要等 1 分钟兜底轮询，
+            # 同组用户迟迟看不到「已应用」标记
+            sync.schedule_sync()
         except Exception:  # noqa: BLE001
             pass
 
@@ -3422,6 +3452,7 @@ class TaskManager:
             if not sync.is_shared():
                 return
             sync.queue_task_delete(task_id)
+            sync.schedule_sync()
         except Exception:  # noqa: BLE001
             pass
 
@@ -3529,6 +3560,10 @@ class TaskManager:
                         # 以标记为准，保证跨端一致
                         is_applied = is_applied or stored_applied
                         result_summary = self._extract_result_summary(parsed_result)
+                        if result_summary is None and (r.cell_count or 0) > 0:
+                            # 同组镜像任务（本机无 result_json）：用同步来的小数量生成最小摘要，
+                            # 否则桌面端历史列表「小区数量」列恒为 '-'
+                            result_summary = {"cellCount": int(r.cell_count)}
                         TaskManager._history_verify_cache[r.task_id] = (
                             full_params_id, is_applied, result_summary, stored_applied)
                         # 防止缓存无限增长
@@ -3681,6 +3716,67 @@ class TaskManager:
             return False
 
     @staticmethod
+    def _extract_cell_count(result: Optional[Dict]) -> Optional[int]:
+        """从任务结果里提取「小区数量」（列表列展示用）。
+
+        各算法结果字段不一致：PCI/邻区用 totalSectors，TAC 核查/规划用 totalCells；
+        都缺时退回 results 数组长度。取不到返回 None（前端显示 '-'）。
+        """
+        if not isinstance(result, dict):
+            return None
+        for key in ("totalSectors", "totalCells"):
+            value = result.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                return int(value)
+        results = result.get("results")
+        if isinstance(results, list):
+            return len(results)
+        return None
+
+    @staticmethod
+    def backfill_task_cell_counts(batch_size: int = 20) -> int:
+        """存量任务补齐小数量（-1 = 已计算但结果里没有可用字段）。
+
+        老任务创建时没有 cell_count，同组任务清单与镜像行就无法显示「小区数量」。
+        只在服务器形态启动时后台跑一次：只扫「共享类型 + 有结果 + 未计算过」的行，
+        分批解析小 JSON 并提交，失败只记日志（绝不阻塞启动）。
+        """
+        from app.core.database import SessionLocal
+        from app.models.database import TaskResult
+
+        updated = 0
+        db = SessionLocal()
+        try:
+            while True:
+                rows = (
+                    db.query(TaskResult)
+                    .filter(
+                        TaskResult.task_type.in_(TaskManager.SHARED_TASK_TYPES),
+                        TaskResult.cell_count.is_(None),
+                        TaskResult.result_json.isnot(None),
+                    )
+                    .limit(max(1, int(batch_size)))
+                    .all()
+                )
+                if not rows:
+                    break
+                for row in rows:
+                    try:
+                        parsed = json.loads(row.result_json) if row.result_json else None
+                    except Exception:
+                        parsed = None
+                    value = TaskManager._extract_cell_count(parsed)
+                    row.cell_count = int(value) if value is not None else -1
+                    updated += 1
+                db.commit()
+        except Exception as exc:  # noqa: BLE001
+            db.rollback()
+            logger.warning(f"[TaskManager] 回填任务小数量失败（非致命）: {exc}")
+        finally:
+            db.close()
+        return updated
+
+    @staticmethod
     def _extract_result_summary(result: Optional[Dict]) -> Optional[Dict]:
         """从完整 result dict 中提取轻量摘要字段（避免历史列表返回大数据）
 
@@ -3701,6 +3797,9 @@ class TaskManager:
                 "matchedCells": r.get("matchedCells", 0),
                 "unmatchedCells": r.get("unmatchedCells", 0),
                 "singularityCount": r.get("singularityCount", 0),
+                # 归一化的小区数量（totalSectors/totalCells/results 长度三者取一），
+                # 前端历史列表「小区数量」列统一读它
+                "cellCount": TaskManager._extract_cell_count(r),
                 "startTime": r.get("startTime"),
                 "endTime": r.get("endTime"),
             }

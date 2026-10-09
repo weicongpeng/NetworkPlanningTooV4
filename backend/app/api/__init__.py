@@ -224,6 +224,26 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"❌ 启动预热图层缓存失败: {e}")
 
+    # 服务器形态：后台补齐存量任务的小数量（同组任务历史「小区数量」列展示用）。
+    # 只扫未计算过的共享类型任务，分批解析提交；桌面端不需要（本机任务可直接从结果算）。
+    if not settings.NPT_DESKTOP:
+        try:
+            import threading
+
+            from app.services.task_manager import task_manager as _task_manager
+
+            def _backfill_cell_counts() -> None:
+                try:
+                    count = _task_manager.backfill_task_cell_counts()
+                    if count:
+                        logger.info(f"✅ 存量任务小数量回填完成: {count} 条")
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(f"⚠️ 存量任务小数量回填失败: {exc}")
+
+            threading.Thread(target=_backfill_cell_counts, daemon=True, name="npt-cell-count-backfill").start()
+        except Exception as e:
+            logger.warning(f"⚠️ 启动任务小数量回填失败: {e}")
+
     logger.info("应用启动完成")
     yield
 

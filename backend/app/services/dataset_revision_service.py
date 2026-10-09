@@ -80,6 +80,14 @@ def bump(
         if deleted is not None:
             row.deleted = bool(deleted)
         db.commit()
+        # 数据变化 → 通知同组在线客户端（网页端即时刷新，不用手动刷新页面）。
+        # 嵌套 try 保证广播异常不影响 rev 推进；桌面端本机后端也会广播给自己的 webview，无害。
+        try:
+            from app.services.websocket_manager import websocket_manager
+
+            websocket_manager.notify_data_changed(row.city or "", row.operator or "", data_id)
+        except Exception:  # noqa: BLE001
+            pass
         return int(row.rev)
     except Exception as exc:  # noqa: BLE001
         db.rollback()

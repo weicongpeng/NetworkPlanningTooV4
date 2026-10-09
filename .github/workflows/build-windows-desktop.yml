@@ -84,6 +84,7 @@ jobs:
           python -m pytest tests/test_desktop_license.py tests/test_desktop_license_cloud.py
           tests/test_desktop_local_endpoints.py tests/test_desktop_releases.py
           tests/test_desktop_update_client.py tests/test_desktop_shared_tasks.py
+          tests/test_desktop_sync_state.py tests/test_desktop_sync_revision.py
           tests/test_update_parameters_guardrails.py
           tests/test_data_group_scope.py -q
 
