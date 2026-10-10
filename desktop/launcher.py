@@ -368,6 +368,35 @@ def _log_path_hint() -> str:
     return str(_default_data_root() / "logs" / "desktop.log")
 
 
+def _background_update_marker_exists(data_root: Path) -> bool:
+    """用户选了「后台运行」且更新尚未结束（标记文件由 desktop_update_service 维护）。"""
+    try:
+        return (data_root / "updates" / "background_update.json").is_file()
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _continue_background_update() -> None:
+    """窗口已关闭但用户选了「后台运行」：等下载完成后自动安装，再让进程退出。
+
+    后台更新由本进程内的 desktop_update_service 驱动（下载线程 + 状态），
+    窗口关掉后进程要活到安装脚本被拉起，否则下载会随进程一起消失。
+    """
+    try:
+        from app.services import desktop_update_service as updater
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("后台更新不可用（导入失败）：%s", exc)
+        return
+    try:
+        if not updater.is_background_armed():
+            return
+        _log.info("后台更新已启用：窗口已关闭，继续下载并在完成后自动安装")
+        result = updater.wait_background_update()
+        _log.info("后台更新结束：%s", result)
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("后台更新异常：%s", exc)
+
+
 def _run_selftest(port: int) -> int:
     from tools.spike import run_spike
 
@@ -396,7 +425,10 @@ def main(argv: Optional[list] = None) -> int:
 
     if not _acquire_single_instance():
         _log.info("检测到已有实例在运行，退出")
-        _message_box("程序已在运行，请在任务栏切换到已打开的窗口。", 0x40)
+        if _background_update_marker_exists(data_root):
+            _message_box("正在后台下载并安装新版本，安装完成后会自动打开，请稍候。", 0x40)
+        else:
+            _message_box("程序已在运行，请在任务栏切换到已打开的窗口。", 0x40)
         return 0
 
     sock, port = _create_bound_socket(data_root)
@@ -414,7 +446,12 @@ def main(argv: Optional[list] = None) -> int:
     _log.info("打开桌面窗口")
     _run_window(port, data_root)
     _log.info("窗口已关闭，正在退出")
-    # 先释放单实例互斥体：收尾阶段（停服务、解释器退出）不再阻止用户重新启动
+    # 后台更新（用户点了「后台运行」）：进程继续跑到安装脚本拉起为止。
+    # 这期间仍持有单实例互斥体：用户再点图标会被"后台更新中"的提示挡住，
+    # 避免新实例的进程被随后的 taskkill 兜底误杀。
+    _continue_background_update()
+    # 释放单实例互斥体：收尾阶段（停服务、解释器退出）不再阻止用户重新启动，
+    # 也避免安装器的 AppMutex 检测把安装挡下来
     _release_single_instance()
     server.should_exit = True
     thread.join(timeout=5)

@@ -139,7 +139,21 @@ export interface DesktopUpdateStatus {
     total: number
     error?: string | null
     installer?: string | null
+    /** 用户选了「后台运行」：关窗后继续下载安装 */
+    background?: boolean
   }
+  /** 上一次安装的结果（装失败时给出人工安装提示） */
+  last_result?: {
+    target_version?: string
+    current_version?: string
+    applied?: boolean
+    needs_manual?: boolean
+    setup_rc?: string
+    setup_retry_rc?: string
+    installer?: string
+    restarted?: string
+    finished_at?: string
+  } | null
 }
 
 export interface LicenseInfo {

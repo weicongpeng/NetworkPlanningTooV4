@@ -61,7 +61,14 @@
     "checkButton": "Check for updates",
     "checking": "Checking…",
     "upToDate": "You are on the latest version",
-    "checkFailed": "Failed to check for updates; verify the network and server address"
+    "checkFailed": "Failed to check for updates; verify the network and server address",
+    "runInBackground": "Run in background",
+    "runInBackgroundHint": "Keep downloading and installing in the background - you may close the window and the new version will open automatically",
+    "backgroundArmed": "Update moved to the background: you can close the window now; it installs and restarts automatically when the download finishes",
+    "backgroundFailed": "Failed to move the update to the background",
+    "installNotApplied": "The last automatic update did not take effect (target {{target}}, current {{current}})",
+    "setupExitCode": "installer exit code {{code}}",
+    "manualInstallHint": "The installer is still on disk - you can run it manually: "
   },
   "license": {
     "desktopTitle": "Desktop License",

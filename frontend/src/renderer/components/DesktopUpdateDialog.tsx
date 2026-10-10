@@ -41,6 +41,8 @@ export function DesktopUpdateDialog() {
     phase: 'idle',
   })
   const [message, setMessage] = useState<string | null>(null)
+  // 上一次安装的结果：装失败（安装器退出码非 0 / 版本没变）时给出人工安装提示
+  const [lastResult, setLastResult] = useState<DesktopUpdateStatus['last_result']>(null)
   // 「系统设置 → 检查更新」的交接：拿到结果直接展示（非管理员也可手动触发）
   const requested = useDesktopUpdateStore((s) => s.requested)
   const clearRequest = useDesktopUpdateStore((s) => s.clearRequest)
@@ -53,6 +55,7 @@ export function DesktopUpdateDialog() {
       const res = await desktopUpdateApi.status()
       if (!res.success) return
       setStatus(res.data)
+      setLastResult(res.data.last_result || null)
       setProgress({
         downloaded: res.data.download?.downloaded || 0,
         total: res.data.download?.total || 0,
@@ -161,6 +164,20 @@ export function DesktopUpdateDialog() {
     }
   }
 
+  const handleBackground = async () => {
+    setBusy(true)
+    setMessage(null)
+    try {
+      const res: any = await desktopUpdateApi.background()
+      setProgress((prev) => ({ ...prev, phase: res?.data?.phase || prev.phase, }))
+      setMessage(t('desktopUpdate.backgroundArmed'))
+    } catch (err: any) {
+      setMessage(err?.message || t('desktopUpdate.backgroundFailed'))
+    } finally {
+      setBusy(false)
+    }
+  }
+
   const handleClose = () => {
     setVisible(false)
     setMessage(null)
@@ -213,6 +230,28 @@ export function DesktopUpdateDialog() {
           </div>
         )}
 
+        {/* 上次自动安装没生效：给出安装器退出码与安装包路径，用户可手动运行 */}
+        {lastResult?.target_version && lastResult.applied === false && (
+          <div className="p-2 rounded bg-red-500/10 border border-red-500/20 text-red-500 text-xs space-y-1">
+            <div className="flex items-center gap-2">
+              <AlertCircle size={14} />
+              <span>
+                {t('desktopUpdate.installNotApplied', {
+                  target: lastResult.target_version,
+                  current: lastResult.current_version || t('desktopUpdate.versionUnknown'),
+                })}
+                {lastResult.setup_rc ? ` · ${t('desktopUpdate.setupExitCode', { code: lastResult.setup_rc })}` : ''}
+              </span>
+            </div>
+            {lastResult.installer && (
+              <p className="break-all text-muted-foreground">
+                {t('desktopUpdate.manualInstallHint')}
+                <span className="font-mono">{lastResult.installer}</span>
+              </p>
+            )}
+          </div>
+        )}
+
         {message && (
           <div className="p-2 rounded bg-amber-500/10 border border-amber-500/20 text-amber-600 text-xs flex items-center gap-2">
             <AlertCircle size={14} />
@@ -237,18 +276,29 @@ export function DesktopUpdateDialog() {
               {t('desktopUpdate.restartAndInstall')}
             </button>
           ) : (
-            <button
-              onClick={handleDownload}
-              disabled={busy || progress.phase === 'downloading'}
-              className="px-4 py-2 bg-primary text-primary-foreground rounded-lg hover:opacity-90 disabled:opacity-50 text-sm font-medium flex items-center gap-1.5"
-            >
-              {busy || progress.phase === 'downloading' ? (
-                <Loader2 size={14} className="animate-spin" />
-              ) : (
-                <Download size={14} />
-              )}
-              {progress.phase === 'downloading' ? t('desktopUpdate.downloading') : t('desktopUpdate.updateNow')}
-            </button>
+            <>
+              {/* 后台运行：关掉窗口也继续下载并自动安装（启动器进程接手） */}
+              <button
+                onClick={handleBackground}
+                disabled={busy}
+                title={t('desktopUpdate.runInBackgroundHint')}
+                className="px-4 py-2 border border-border rounded-lg hover:bg-muted disabled:opacity-50 text-sm font-medium"
+              >
+                {t('desktopUpdate.runInBackground')}
+              </button>
+              <button
+                onClick={handleDownload}
+                disabled={busy || progress.phase === 'downloading'}
+                className="px-4 py-2 bg-primary text-primary-foreground rounded-lg hover:opacity-90 disabled:opacity-50 text-sm font-medium flex items-center gap-1.5"
+              >
+                {busy || progress.phase === 'downloading' ? (
+                  <Loader2 size={14} className="animate-spin" />
+                ) : (
+                  <Download size={14} />
+                )}
+                {progress.phase === 'downloading' ? t('desktopUpdate.downloading') : t('desktopUpdate.updateNow')}
+              </button>
+            </>
           )}
         </div>
       </div>

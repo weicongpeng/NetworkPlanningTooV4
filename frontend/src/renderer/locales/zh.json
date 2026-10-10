@@ -1755,7 +1755,14 @@
     "checkButton": "检查更新",
     "checking": "检查中…",
     "upToDate": "已是最新版本",
-    "checkFailed": "检查更新失败，请确认网络与授权服务器地址"
+    "checkFailed": "检查更新失败，请确认网络与授权服务器地址",
+    "runInBackground": "后台运行",
+    "runInBackgroundHint": "下载与安装转入后台：可以关掉窗口，安装完成后会自动打开新版本",
+    "backgroundArmed": "已转入后台更新：现在可以关闭窗口，下载完成后会自动安装并重启",
+    "backgroundFailed": "转入后台更新失败",
+    "installNotApplied": "上次自动更新未生效（目标 {{target}}，当前 {{current}}）",
+    "setupExitCode": "安装器退出码 {{code}}",
+    "manualInstallHint": "安装包仍在本机，可手动运行："
   },
   "desktopLicenses": {
     "title": "桌面授权",

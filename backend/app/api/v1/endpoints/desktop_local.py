@@ -1059,6 +1059,8 @@ def update_status(
             "release": release,
             "update_available": bool(release and release.get("update_available")),
             "download": updater.progress(),
+            # 上一次安装的结果（目标版本/退出码/是否已生效）：装失败时前端要给出人工安装提示
+            "last_result": updater.last_result(),
         },
     }
 
@@ -1088,6 +1090,21 @@ async def update_progress(
     from app.services import desktop_update_service as updater
 
     return {"success": True, "data": updater.progress()}
+
+
+@router.post("/update/background")
+def update_background(
+    current_user: User = Depends(get_current_user),
+    _: None = Depends(_require_desktop),
+) -> Dict[str, Any]:
+    """「后台运行」：转入后台更新，窗口关闭后继续下载并自动安装（对所有登录用户开放）。"""
+    from app.services import desktop_update_service as updater
+
+    try:
+        data = updater.arm_background()
+    except cloud.CloudError as exc:
+        _raise_cloud_error(exc)
+    return {"success": True, "data": data}
 
 
 @router.post("/update/install")

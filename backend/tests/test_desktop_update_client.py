@@ -54,7 +54,8 @@ def updater_env(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "NPT_DESKTOP_CHANNEL", "stable")
 
     updater._state.update(
-        phase="idle", version=None, downloaded=0, total=0, error=None, installer=None, sha256=None
+        phase="idle", version=None, downloaded=0, total=0, error=None, installer=None, sha256=None,
+        background=False,
     )
     updater._install_started = False
 
@@ -160,13 +161,21 @@ def test_helper_script_bounded_wait_and_relaunch(updater_env):
     installer.parent.mkdir(parents=True, exist_ok=True)
     installer.write_bytes(PAYLOAD)
 
-    helper = updater._write_helper(installer)
+    helper = updater._write_helper(installer, "1.0.0")
     text = helper.read_text(encoding="utf-8")
 
     assert helper.parent == updater_env.tmp_path / "updates"
     # 静默安装 + 安装后重新启动应用
     assert "/VERYSILENT" in text and "/SUPPRESSMSGBOXES" in text
-    assert 'start "" "%APP%"' in text
+    assert 'start "" "%TARGET%"' in text
+    # 先按当前运行目录安装（否则会把新版本装到别处、重启旧目录的 exe → "版本没变"）
+    assert '/DIR="%APPDIR%"' in text
+    # /DIR 失败要退回默认目录重试一次，重启优先选安装目录（再退回默认目录/旧路径）
+    assert text.count("start /wait") >= 2
+    assert "%DEFAULTDIR%" in text
+    # 安装器退出码写盘，应用重启后据此提示"更新未生效"
+    assert "setup_rc=%RC%" in text
+    assert "npt_ota_result" in text
     # 安装包路径按 8.3 短路径写入（见 _write_helper 注释，规避中文/代码页问题）；
     # Windows 上 GetShortPathNameW 会真的缩写，断言必须用同一转换，否则只有 Linux 过
     assert updater._windows_short_path(installer) in text
@@ -293,3 +302,106 @@ def test_launcher_arms_watchdog_before_destroy(monkeypatch):
     launcher._make_exit_handler(SimpleNamespace(destroy=_blocking_destroy))()
     assert started == [launcher.EXIT_GRACE_SECONDS]
     assert exits == []  # 正常提交关窗时不强制退出
+
+
+# --------------------------------------------------- 后台运行（关窗不影响更新）
+#
+# 2026-10-10 用户要求：更新弹窗加「后台运行」，关掉窗口也不中断下载与安装。
+
+def test_arm_background_writes_marker_and_installs_on_wait(updater_env, monkeypatch):
+    """「后台运行」：置位 + 写标记文件；后台等待到 ready 后拉起安装并清标记。"""
+    updater = updater_env.updater
+    installer = updater_env.tmp_path / "updates" / "NetworkPlanningTool-Setup-1.0.0.exe"
+    installer.parent.mkdir(parents=True, exist_ok=True)
+    installer.write_bytes(PAYLOAD)
+    updater._state.update(phase="ready", version="1.0.0", installer=str(installer), sha256=SHA)
+
+    state = updater.arm_background()
+    assert state["background"] is True
+    marker = updater_env.tmp_path / "updates" / "background_update.json"
+    assert marker.is_file()
+    assert updater.is_background_armed() is True
+
+    started: list = []
+    monkeypatch.setattr(updater, "_start_installer", lambda: started.append(True) or installer)
+    result = updater.wait_background_update(poll_seconds=0.1, timeout_seconds=5)
+
+    assert result["action"] == "install"
+    assert started == [True]
+    assert not marker.exists()
+
+
+def test_arm_background_rejects_when_no_update(updater_env, monkeypatch):
+    """没有新版本时拒绝转入后台（避免用户以为在更新，实际什么都没发生）。"""
+    from app.services.desktop_cloud_client import CloudError
+
+    updater = updater_env.updater
+    monkeypatch.setattr(updater, "check_latest", lambda **_: None)
+    with pytest.raises(CloudError) as excinfo:
+        updater.arm_background()
+    assert excinfo.value.status_code == 409
+
+
+def test_last_result_flags_unapplied_install(updater_env, monkeypatch):
+    """安装器退出码非 0 / 版本没变 → applied=False、needs_manual=True（前端给人工安装提示）。"""
+    import json
+
+    updater = updater_env.updater
+    updates = updater_env.tmp_path / "updates"
+    updates.mkdir(parents=True, exist_ok=True)
+    (updates / "npt_ota_intent.json").write_text(
+        json.dumps({"target_version": "1.0.0", "installer": "/tmp/setup.exe"}), encoding="utf-8"
+    )
+    (updates / "npt_ota_result.txt").write_text(
+        "target_version=1.0.0\nsetup_rc=5\nsetup_retry_rc=5\nfinished_at=2026-10-10 10:00:00\n",
+        encoding="utf-8",
+    )
+    result = updater.last_result()
+    assert result["target_version"] == "1.0.0"
+    assert result["setup_rc"] == "5"
+    assert result["applied"] is False
+    assert result["needs_manual"] is True
+
+    # 装成功（当前版本已变成目标版本）→ 不再提示人工安装
+    monkeypatch.setattr(updater_env.settings, "NPT_DESKTOP_VERSION", "1.0.0")
+    (updates / "npt_ota_result.txt").write_text("target_version=1.0.0\nsetup_rc=0\n", encoding="utf-8")
+    result = updater.last_result()
+    assert result["applied"] is True
+    assert result["needs_manual"] is False
+
+
+def test_launcher_continues_background_update_after_window_close(monkeypatch, tmp_path):
+    """启动器：窗口关闭后若已武装后台更新，必须先等它跑完再收尾退出。"""
+    launcher = _load_launcher()
+    calls: list = []
+
+    import sys
+    import types
+
+    fake_service = types.ModuleType("app.services.desktop_update_service")
+    fake_service.is_background_armed = lambda: True
+    fake_service.wait_background_update = lambda: calls.append("waited") or {"action": "install"}
+    # 包属性优先于 sys.modules：两处都替换，否则 from app.services import ... 会拿到真实模块
+    import app.services as services_pkg
+
+    monkeypatch.setitem(sys.modules, "app.services.desktop_update_service", fake_service)
+    monkeypatch.setattr(services_pkg, "desktop_update_service", fake_service, raising=False)
+
+    launcher._continue_background_update()
+    assert calls == ["waited"]
+
+    # 未武装时直接返回，不阻塞关闭流程
+    calls.clear()
+    fake_service.is_background_armed = lambda: False
+    launcher._continue_background_update()
+    assert calls == []
+
+
+def test_launcher_background_marker_detection(tmp_path):
+    """重复启动时以标记文件提示"后台更新中"（避免第二实例被 taskkill 兜底误杀）。"""
+    launcher = _load_launcher()
+    assert launcher._background_update_marker_exists(tmp_path) is False
+    updates = tmp_path / "updates"
+    updates.mkdir(parents=True, exist_ok=True)
+    (updates / "background_update.json").write_text("{}", encoding="utf-8")
+    assert launcher._background_update_marker_exists(tmp_path) is True

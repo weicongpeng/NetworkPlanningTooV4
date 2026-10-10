@@ -487,6 +487,10 @@ export const desktopUpdateApi = {
   install: async (): Promise<ApiResponse<{ exiting: boolean; message: string }>> => {
     return apiClient.post('/desktop/update/install')
   },
+  /** 「后台运行」：转入后台更新，关掉窗口也会继续下载并自动安装 */
+  background: async (): Promise<ApiResponse<{ phase: string; background: boolean; version?: string | null }>> => {
+    return apiClient.post('/desktop/update/background')
+  },
 }
 
 // 许可证API
