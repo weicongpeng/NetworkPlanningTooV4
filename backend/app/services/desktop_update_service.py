@@ -209,7 +209,7 @@ def _now_iso() -> str:
 
 
 def _write_helper(installer: Path, target_version: str) -> Path:
-    """写升级脚本：等待应用退出（超时强杀）→ 静默安装 → 重新启动新版本。
+    """写升级脚本：等待应用退出（超时强杀）→ 静默安装 → 按实际安装目录重启新版本。
 
     脚本必须隐藏运行（调用方用 CREATE_NO_WINDOW 拉起），否则用户会看到一个卡住的
     终端窗口；计时用 ping 而非 timeout —— 无控制台环境下 timeout 会直接报错退化为忙循环。
@@ -219,7 +219,10 @@ def _write_helper(installer: Path, target_version: str) -> Path:
     - 先带 /DIR 安装到**当前正在运行的目录**——否则若程序不是装在默认目录，
       安装器会把新版本装到别处，脚本又重启旧目录的 exe，用户看到"版本没变"。
     - /DIR 安装失败（如目录无写权限）再退回默认目录重试一次。
-    - 重启优先选「安装目录里的 exe」，其次是默认目录，最后才是旧路径。
+    - 重启优先从**注册表记录的安装目录**拉：安装成功时它指向新文件真正落地的地方；
+      其次才是当前运行目录、默认目录、旧路径。（"装到别处、重启旧 exe"是历史事故）
+    - 顺带把重启目标的 version.json 拷到 updates/installed_version.json，应用重启后
+      可以核对"实际装上的版本"，而不是只靠版本号相等与否猜测。
     - 安装器退出码写进 npt_ota_result.txt，应用重启后据此告知用户失败原因。
     """
     # onedir 冻结后 sys.executable 即安装目录下的 NPT.exe；源码模式为 python.exe（仅开发用）
@@ -228,9 +231,20 @@ def _write_helper(installer: Path, target_version: str) -> Path:
     app_path = _windows_short_path(app_exe)
     app_dir_short = _windows_short_path(app_dir)
     installer_path = _windows_short_path(installer)
+    updates_dir_short = _windows_short_path(_updates_dir())
     install_log = _windows_short_path(_updates_dir() / "npt_setup.log")
     result_file = _windows_short_path(_updates_dir() / "npt_ota_result.txt")
     default_dir = "%LOCALAPPDATA%\\Programs\\NetworkPlanningTool"
+    # AppId 与 desktop/installer.iss 保持一致（改一处必须同步另一处）：注册表里记录着
+    # 上一次实际安装的目录，安装结束后据此重启才是"装了哪儿就启哪儿"
+    uninstall_key = (
+        r"HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall"
+        r"\{7C4F1E62-9B3A-4D2E-8F51-6A0C2B7D9E44}_is1"
+    )
+    uninstall_key_machine = (
+        r"HKLM\Software\Microsoft\Windows\CurrentVersion\Uninstall"
+        r"\{7C4F1E62-9B3A-4D2E-8F51-6A0C2B7D9E44}_is1"
+    )
     base_args = '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /CLOSEAPPLICATIONS /LOG="%LOG%"'
     script = f"""@echo off
 chcp 65001 >nul
@@ -240,11 +254,16 @@ set "APP={app_path}"
 set "APPDIR={app_dir_short}"
 set "EXE={app_exe.name}"
 set "SETUP={installer_path}"
+set "UPDATES={updates_dir_short}"
 set "LOG={install_log}"
 set "RESULT={result_file}"
 set "DEFAULTDIR={default_dir}"
+set "UNINSTKEY={uninstall_key}"
+set "UNINSTKEY_MACHINE={uninstall_key_machine}"
+set "REGDIR="
 set "RC="
 set "RC2=skipped"
+del "%UPDATES%\\installed_version.json" >nul 2>&1
 set /a WAITED=0
 :wait
 tasklist /FI "IMAGENAME eq %EXE%" /NH 2>nul | find /I "%EXE%" >nul
@@ -266,16 +285,22 @@ ping -n 3 127.0.0.1 >nul
 start /wait "" "%SETUP%" {base_args}
 set "RC2=%ERRORLEVEL%"
 :launch
-set "TARGET=%APPDIR%\\{app_exe.name}"
-if exist "%TARGET%" goto startapp
-set "TARGET=%DEFAULTDIR%\\{app_exe.name}"
-if exist "%TARGET%" goto startapp
-set "TARGET=%APP%"
-:startapp
+rem prefer the directory recorded by the installer: it is where new files actually landed
+for /f "tokens=2,*" %%a in ('reg query "%UNINSTKEY%" /v InstallLocation 2^>nul ^| findstr /I "InstallLocation"') do set "REGDIR=%%b"
+if not defined REGDIR for /f "tokens=2,*" %%a in ('reg query "%UNINSTKEY_MACHINE%" /v InstallLocation 2^>nul ^| findstr /I "InstallLocation"') do set "REGDIR=%%b"
+set "TARGET="
+if defined REGDIR if exist "%REGDIR%\\{app_exe.name}" set "TARGET=%REGDIR%\\{app_exe.name}"
+if not defined TARGET if exist "%APPDIR%\\{app_exe.name}" set "TARGET=%APPDIR%\\{app_exe.name}"
+if not defined TARGET if exist "%DEFAULTDIR%\\{app_exe.name}" set "TARGET=%DEFAULTDIR%\\{app_exe.name}"
+if not defined TARGET set "TARGET=%APP%"
+for %%F in ("%TARGET%") do set "TARGETDIR=%%~dpF"
 > "%RESULT%" echo target_version={target_version}
 >> "%RESULT%" echo setup_rc=%RC%
 >> "%RESULT%" echo setup_retry_rc=%RC2%
+>> "%RESULT%" echo install_dir=%REGDIR%
 >> "%RESULT%" echo restarted=%TARGET%
+if exist "%TARGETDIR%_internal\\version.json" copy /y "%TARGETDIR%_internal\\version.json" "%UPDATES%\\installed_version.json" >nul 2>&1
+if not exist "%UPDATES%\\installed_version.json" if exist "%TARGETDIR%version.json" copy /y "%TARGETDIR%version.json" "%UPDATES%\\installed_version.json" >nul 2>&1
 >> "%RESULT%" echo finished_at=%DATE% %TIME%
 start "" "%TARGET%"
 del "%~f0" >nul 2>&1
@@ -404,6 +429,13 @@ def wait_background_update(
                 try:
                     _start_installer()
                     return {"action": "install", "version": state.get("version")}
+                except CloudError as exc:
+                    if exc.status_code == 409:
+                        # 已拉起过（例如点了「后台运行」后又点了「重启并安装」）：
+                        # 安装脚本正在跑，按成功处理，别再报错吓用户
+                        return {"action": "install", "version": state.get("version"), "already": True}
+                    _log.error("后台更新拉起安装失败：%s", exc)
+                    return {"action": "abort", "error": str(exc)}
                 except Exception as exc:  # noqa: BLE001
                     _log.error("后台更新拉起安装失败：%s", exc)
                     return {"action": "abort", "error": str(exc)}
@@ -439,6 +471,16 @@ def last_result() -> Optional[Dict[str, Any]]:
                 key = key.strip()
                 if key:
                     data[key] = value.strip()
+    except Exception:  # noqa: BLE001
+        pass
+    # 升级脚本从"实际重启目标目录"拷回的 version.json：核对真实装上的版本
+    # （安装器把版本号写进包内 version.json，所以这个值不再依赖猜测）
+    try:
+        installed_path = _updates_dir() / "installed_version.json"
+        if installed_path.is_file():
+            info = json.loads(installed_path.read_text(encoding="utf-8"))
+            if isinstance(info, dict) and info.get("version"):
+                data["installed_version"] = str(info["version"])
     except Exception:  # noqa: BLE001
         pass
     if not data:

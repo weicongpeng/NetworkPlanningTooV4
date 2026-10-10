@@ -324,6 +324,34 @@ def _make_exit_handler(window: Any) -> Callable[[], None]:
     return _exit_handler
 
 
+def _background_update_armed() -> bool:
+    """本进程是否已转入后台更新（服务不可用时按未武装处理）。"""
+    try:
+        from app.services import desktop_update_service as updater
+
+        return updater.is_background_armed()
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _make_close_handler() -> Callable[[], None]:
+    """窗口关闭事件处理器：武装「关不掉就强杀」看门狗。
+
+    例外：用户点过「后台运行」——此时进程必须活到下载完成、安装脚本被拉起为止。
+    若照常武装看门狗，窗口一关 20 秒后 os._exit 就会把下载线程一起杀掉，表现为
+    "点了后台运行、关窗后什么都没发生"；这种场景交给 _continue_background_update
+    在下载等待结束后再武装看门狗。
+    """
+
+    def _on_closing() -> None:
+        if _background_update_armed():
+            _log.info("后台更新进行中：窗口关闭不启动强制退出看门狗，等待下载完成后再退出")
+            return
+        _force_exit_after(EXIT_GRACE_SECONDS)
+
+    return _on_closing
+
+
 def _run_window(port: int, data_root: Path) -> None:
     import webview
 
@@ -338,10 +366,13 @@ def _run_window(port: int, data_root: Path) -> None:
         height=height,
         min_size=min_size,
         maximized=True,  # 启动即最大化（表格/地图列多，窗口越大越好用）
+        # pywebview 默认 text_select=False 会注入 CSS 全局禁用文本选择，网页端能复制的
+        # 文字在桌面端选不中；打开后与浏览器行为一致
+        text_select=True,
     )
     # 关窗也要兜底：正常关闭路径被卡住时进程不退出，用户再启动会误报「程序已在运行」
     try:
-        window.events.closing += lambda: _force_exit_after(EXIT_GRACE_SECONDS)
+        window.events.closing += _make_close_handler()
     except Exception as exc:  # noqa: BLE001
         _log.warning("订阅窗口关闭事件失败（不影响使用）：%s", exc)
     # 注入退出回调：后端"重启并安装"时用它关闭窗口并让本进程退出（同进程桥接）
@@ -376,25 +407,42 @@ def _background_update_marker_exists(data_root: Path) -> bool:
         return False
 
 
+def _clear_stale_background_marker(data_root: Path) -> None:
+    """清理残留的「后台更新中」标记。
+
+    上一进程若在后台更新中被强杀（进程崩溃/被结束），finally 不执行、标记会留下来；
+    本进程已拿到单实例互斥体 = 没有别的进程在后台更新，标记必然是残留。
+    """
+    try:
+        (data_root / "updates" / "background_update.json").unlink(missing_ok=True)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _continue_background_update() -> None:
     """窗口已关闭但用户选了「后台运行」：等下载完成后自动安装，再让进程退出。
 
     后台更新由本进程内的 desktop_update_service 驱动（下载线程 + 状态），
     窗口关掉后进程要活到安装脚本被拉起，否则下载会随进程一起消失。
+    等待期间不武装关窗看门狗（见 _make_close_handler）；等待结束（拉起安装/失败/超时）
+    后再武装，保证收尾阶段无论被什么卡住都有界退出。
     """
     try:
         from app.services import desktop_update_service as updater
     except Exception as exc:  # noqa: BLE001
         _log.warning("后台更新不可用（导入失败）：%s", exc)
         return
+    if not updater.is_background_armed():
+        return
+    _log.info("后台更新已启用：窗口已关闭，继续下载并在完成后自动安装")
     try:
-        if not updater.is_background_armed():
-            return
-        _log.info("后台更新已启用：窗口已关闭，继续下载并在完成后自动安装")
         result = updater.wait_background_update()
         _log.info("后台更新结束：%s", result)
     except Exception as exc:  # noqa: BLE001
         _log.warning("后台更新异常：%s", exc)
+    finally:
+        # 安装脚本已被拉起（或更新失败）：进程要在有界时间内退出，脚本才能继续安装
+        _force_exit_after(EXIT_GRACE_SECONDS)
 
 
 def _run_selftest(port: int) -> int:
@@ -430,6 +478,10 @@ def main(argv: Optional[list] = None) -> int:
         else:
             _message_box("程序已在运行，请在任务栏切换到已打开的窗口。", 0x40)
         return 0
+
+    # 单实例已就绪：没有别的进程在后台更新，残留标记（上次被强杀遗留）清掉，
+    # 避免之后误报"正在后台更新"
+    _clear_stale_background_marker(data_root)
 
     sock, port = _create_bound_socket(data_root)
     _log.info("后端监听 127.0.0.1:%s", port)

@@ -1762,6 +1762,7 @@
     "backgroundFailed": "转入后台更新失败",
     "installNotApplied": "上次自动更新未生效（目标 {{target}}，当前 {{current}}）",
     "setupExitCode": "安装器退出码 {{code}}",
+    "installedVersion": "实际安装版本：{{version}}",
     "manualInstallHint": "安装包仍在本机，可手动运行："
   },
   "desktopLicenses": {
@@ -1779,7 +1780,6 @@
     "colCode": "激活码",
     "colGroup": "数据组",
     "groupUnset": "未指定（由桌面端自选）",
-    "groupFollowsUser": "跟随用户管理",
     "groupHint": "数据组决定共享模式下该桌面端与哪些用户共享数据；留空则由桌面端首次同步时自选并在此绑定",
     "groupCityPlaceholder": "地市（留空=桌面端自选）",
     "groupOperatorPlaceholder": "运营商（留空=桌面端自选）",
@@ -1788,7 +1788,6 @@
     "colUsage": "登录情况",
     "colActions": "操作",
     "loginCount": "已登录 {{count}} 次",
-    "idleLogoutDays": "无操作 {{days}} 天退出",
     "modeStandalone": "单机授权",
     "modeShared": "共享模式",
     "allMode": "全部模式",
@@ -1799,9 +1798,6 @@
     "sourcePrecreate": "预建",
     "sourceApprove": "申请",
     "renewCount": "已续期 {{count}} 次",
-    "leaseDays": "租约 {{days}} 天",
-    "expiryFollowsUser": "跟随用户管理",
-    "expiryFromLease": "按租约 {{days}} 天",
     "editHint": "许可证到期与数据组（地市 + 运营商）跟随「用户管理」中的设置，请到用户管理页修改；本页仅调整无操作退出登录时长。",
     "approve": "批准",
     "approveSuccess": "已批准，客户端将自动完成登录",

@@ -154,6 +154,10 @@ export interface DesktopUpdateStatus {
     setup_retry_rc?: string
     installer?: string
     restarted?: string
+    /** 注册表记录的实际安装目录（诊断"装到哪儿了"） */
+    install_dir?: string
+    /** 重启目标目录里实际读到的版本（安装器写入，核对是否真的换版本） */
+    installed_version?: string
     finished_at?: string
   } | null
 }

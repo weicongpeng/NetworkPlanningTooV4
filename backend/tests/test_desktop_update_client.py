@@ -170,9 +170,14 @@ def test_helper_script_bounded_wait_and_relaunch(updater_env):
     assert 'start "" "%TARGET%"' in text
     # 先按当前运行目录安装（否则会把新版本装到别处、重启旧目录的 exe → "版本没变"）
     assert '/DIR="%APPDIR%"' in text
-    # /DIR 失败要退回默认目录重试一次，重启优先选安装目录（再退回默认目录/旧路径）
+    # /DIR 失败要退回默认目录重试一次
     assert text.count("start /wait") >= 2
     assert "%DEFAULTDIR%" in text
+    # 重启目标以注册表记录的安装目录为准（历史事故：装到别处却重启旧 exe）
+    assert "InstallLocation" in text
+    assert "{7C4F1E62-9B3A-4D2E-8F51-6A0C2B7D9E44}_is1" in text
+    # 拷贝实际重启目标的 version.json，供"更新是否生效"核对
+    assert "installed_version.json" in text
     # 安装器退出码写盘，应用重启后据此提示"更新未生效"
     assert "setup_rc=%RC%" in text
     assert "npt_ota_result" in text
@@ -342,6 +347,26 @@ def test_arm_background_rejects_when_no_update(updater_env, monkeypatch):
     assert excinfo.value.status_code == 409
 
 
+def test_wait_background_update_tolerates_already_started(updater_env, monkeypatch):
+    """「后台运行」后又点了「重启并安装」：脚本已在跑（409），应按成功处理而不是报错。"""
+    from app.services.desktop_cloud_client import CloudError
+
+    updater = updater_env.updater
+    installer = updater_env.tmp_path / "updates" / "NetworkPlanningTool-Setup-1.0.0.exe"
+    installer.parent.mkdir(parents=True, exist_ok=True)
+    installer.write_bytes(PAYLOAD)
+    updater._state.update(phase="ready", version="1.0.0", installer=str(installer), sha256=SHA)
+    updater.arm_background()
+
+    def _already_started():
+        raise CloudError(409, "升级已启动，请稍候自动安装完成")
+
+    monkeypatch.setattr(updater, "_start_installer", _already_started)
+    result = updater.wait_background_update(poll_seconds=0.1, timeout_seconds=5)
+    assert result["action"] == "install"
+    assert result.get("already") is True
+
+
 def test_last_result_flags_unapplied_install(updater_env, monkeypatch):
     """安装器退出码非 0 / 版本没变 → applied=False、needs_manual=True（前端给人工安装提示）。"""
     import json
@@ -361,6 +386,13 @@ def test_last_result_flags_unapplied_install(updater_env, monkeypatch):
     assert result["setup_rc"] == "5"
     assert result["applied"] is False
     assert result["needs_manual"] is True
+
+    # 升级脚本拷回的"实际安装版本"要一并给出（诊断装的是哪个版本）
+    (updates / "installed_version.json").write_text(
+        json.dumps({"version": "0.9.9"}), encoding="utf-8"
+    )
+    result = updater.last_result()
+    assert result["installed_version"] == "0.9.9"
 
     # 装成功（当前版本已变成目标版本）→ 不再提示人工安装
     monkeypatch.setattr(updater_env.settings, "NPT_DESKTOP_VERSION", "1.0.0")
@@ -386,15 +418,46 @@ def test_launcher_continues_background_update_after_window_close(monkeypatch, tm
 
     monkeypatch.setitem(sys.modules, "app.services.desktop_update_service", fake_service)
     monkeypatch.setattr(services_pkg, "desktop_update_service", fake_service, raising=False)
+    # 等待结束后会重新武装看门狗——必须替换，否则测试进程会在 20 秒后被 os._exit 杀掉
+    armed: list = []
+    monkeypatch.setattr(launcher, "_force_exit_after", armed.append)
 
     launcher._continue_background_update()
     assert calls == ["waited"]
+    assert armed == [launcher.EXIT_GRACE_SECONDS]  # 等待结束仍要有界退出
 
     # 未武装时直接返回，不阻塞关闭流程
     calls.clear()
+    armed.clear()
     fake_service.is_background_armed = lambda: False
     launcher._continue_background_update()
     assert calls == []
+    assert armed == []
+
+
+def test_launcher_close_handler_skips_watchdog_during_background_update(monkeypatch):
+    """后台更新中关窗不得武装看门狗：否则 20 秒后 os._exit 会把下载线程一起杀掉，
+    表现为"点了后台运行、关窗后什么都没发生"。"""
+    launcher = _load_launcher()
+    armed: list = []
+    monkeypatch.setattr(launcher, "_force_exit_after", armed.append)
+
+    import sys
+    import types
+
+    import app.services as services_pkg
+
+    fake_service = types.ModuleType("app.services.desktop_update_service")
+    fake_service.is_background_armed = lambda: True
+    monkeypatch.setitem(sys.modules, "app.services.desktop_update_service", fake_service)
+    monkeypatch.setattr(services_pkg, "desktop_update_service", fake_service, raising=False)
+
+    launcher._make_close_handler()()
+    assert armed == []  # 后台更新：不武装，进程要活到下载完成
+
+    fake_service.is_background_armed = lambda: False
+    launcher._make_close_handler()()
+    assert armed == [launcher.EXIT_GRACE_SECONDS]  # 普通关闭：照常武装
 
 
 def test_launcher_background_marker_detection(tmp_path):
@@ -405,3 +468,7 @@ def test_launcher_background_marker_detection(tmp_path):
     updates.mkdir(parents=True, exist_ok=True)
     (updates / "background_update.json").write_text("{}", encoding="utf-8")
     assert launcher._background_update_marker_exists(tmp_path) is True
+
+    # 拿到单实例互斥体的新进程说明没有别的进程在后台更新：残留标记要清掉
+    launcher._clear_stale_background_marker(tmp_path)
+    assert launcher._background_update_marker_exists(tmp_path) is False

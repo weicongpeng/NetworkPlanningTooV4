@@ -309,16 +309,9 @@ export function DesktopLicensesPage() {
                 </td>
                 <td className="px-3 py-2">
                   {(item as any).city && (item as any).operator ? (
-                    <>
-                      <div className="text-xs">
-                        {(item as any).city} / {(item as any).operator}
-                      </div>
-                      {item.user_id && (
-                        <div className="text-xs text-muted-foreground">
-                          {t('desktopLicenses.groupFollowsUser', '跟随用户管理')}
-                        </div>
-                      )}
-                    </>
+                    <div className="text-xs">
+                      {(item as any).city} / {(item as any).operator}
+                    </div>
                   ) : (
                     <span className="text-xs text-muted-foreground">
                       {t('desktopLicenses.groupUnset')}
@@ -330,18 +323,10 @@ export function DesktopLicensesPage() {
                 </td>
                 <td className="px-3 py-2">
                   <div className="text-xs">{item.expire_date || '-'}</div>
-                  <div className="text-xs text-muted-foreground">
-                    {item.user_license_expiry
-                      ? t('desktopLicenses.expiryFollowsUser', '跟随用户管理')
-                      : t('desktopLicenses.expiryFromLease', '按租约 {{days}} 天', { days: item.lease_days })}
-                  </div>
                 </td>
                 <td className="px-3 py-2">
                   <div className="text-xs">
                     {t('desktopLicenses.loginCount', { count: item.login_count ?? 0 })}
-                  </div>
-                  <div className="text-xs text-muted-foreground">
-                    {t('desktopLicenses.idleLogoutDays', { days: item.idle_logout_days ?? 2 })}
                   </div>
                   {item.last_login_at && (
                     <div className="text-xs text-muted-foreground">

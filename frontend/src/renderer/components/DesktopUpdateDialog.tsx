@@ -189,6 +189,12 @@ export function DesktopUpdateDialog() {
   const percent =
     progress.total > 0 ? Math.min(100, Math.round((progress.downloaded / progress.total) * 100)) : 0
 
+  // 安装器退出码只在失败时展示：rc 是字符串 "0"（JS 真值），原来的判断会把
+  // 安装成功显示成「安装器退出码 0」，让人误以为出了问题
+  const failedCodes = [lastResult?.setup_rc, lastResult?.setup_retry_rc].filter(
+    (code): code is string => Boolean(code) && code !== '0' && code !== 'skipped'
+  )
+
   return (
     <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-[100] p-4">
       <div className="bg-card rounded-lg border border-border p-5 w-full max-w-lg space-y-4">
@@ -230,7 +236,7 @@ export function DesktopUpdateDialog() {
           </div>
         )}
 
-        {/* 上次自动安装没生效：给出安装器退出码与安装包路径，用户可手动运行 */}
+        {/* 上次自动安装没生效：给出实际安装版本/安装器退出码与安装包路径，用户可手动运行 */}
         {lastResult?.target_version && lastResult.applied === false && (
           <div className="p-2 rounded bg-red-500/10 border border-red-500/20 text-red-500 text-xs space-y-1">
             <div className="flex items-center gap-2">
@@ -240,9 +246,14 @@ export function DesktopUpdateDialog() {
                   target: lastResult.target_version,
                   current: lastResult.current_version || t('desktopUpdate.versionUnknown'),
                 })}
-                {lastResult.setup_rc ? ` · ${t('desktopUpdate.setupExitCode', { code: lastResult.setup_rc })}` : ''}
+                {failedCodes.length > 0 && ` · ${t('desktopUpdate.setupExitCode', { code: failedCodes.join(' / ') })}`}
               </span>
             </div>
+            {lastResult.installed_version && (
+              <p className="text-muted-foreground">
+                {t('desktopUpdate.installedVersion', { version: lastResult.installed_version })}
+              </p>
+            )}
             {lastResult.installer && (
               <p className="break-all text-muted-foreground">
                 {t('desktopUpdate.manualInstallHint')}

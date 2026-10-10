@@ -117,12 +117,28 @@ begin
            '请联网后手动安装 Microsoft Edge WebView2 运行时。', mbError, MB_OK);
 end;
 
+procedure WriteVersionFile();
+var
+  VersionJson: String;
+begin
+  // 把安装器版本号写进应用包：OTA 客户端以应用读到的 version.json 判断
+  // "更新是否生效"。打包产物里的 version.json 由 CI 生成，若本地构建没
+  // 重新生成（或版本没跟上），装完后应用仍报旧版本号，会被误判为"更新
+  // 未生效"。安装时按 /DMyAppVersion 统一写入可彻底避免这类不一致。
+  // PyInstaller 6.x onedir 的包根是 {app}\_internal；旧布局在 {app}，
+  // 两处都写，客户端按布局读哪份都对。
+  VersionJson := '{"version":"{#MyAppVersion}","channel":"stable","source":"installer"}';
+  SaveStringToFile(ExpandConstant('{app}\_internal\version.json'), VersionJson, False);
+  SaveStringToFile(ExpandConstant('{app}\version.json'), VersionJson, False);
+end;
+
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssPostInstall then
   begin
     RefreshShellIcons();  // 快捷方式已创建，刷新图标缓存让新图标立即生效
     InstallWebView2IfNeeded();
+    WriteVersionFile();
   end;
 end;
 
