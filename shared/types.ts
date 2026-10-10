@@ -98,6 +98,8 @@ export interface DesktopLicenseRecord {
   source: 'precreate' | 'approve' | string
   lease_days: number
   expire_date?: string | null
+  /** 「用户管理 → 许可证到期」的值（有值时 expire_date 显示的就是它） */
+  user_license_expiry?: string | null
   request_id?: string | null
   applied_note?: string | null
   review_note?: string | null

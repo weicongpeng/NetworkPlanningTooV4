@@ -219,7 +219,7 @@ FastAPI (backend/app/)
 | `/app-versions` | `AppVersionsPage` | APP 版本管理（`requireAdmin`） |
 | `/assistant` | `AssistantPage` | 网优助手（`requirePermission="can_assistant"`） |
 | `/desktop-releases` | `DesktopReleasesPage` | 桌面版安装包分发（`requireAdmin`，侧栏仅非桌面形态的管理员可见） |
-| `/desktop-licenses` | `DesktopLicensesPage` | 桌面授权管理（`requireAdmin`，同上） |
+| `/desktop-licenses` | `DesktopLicensesPage` | 桌面授权管理（`requireAdmin`，同上）；编辑弹窗只保留「无操作退出登录时长（天）」，到期/数据组跟随用户管理 |
 | `*` | — | 重定向 `/` |
 
 > `pages/HistoryPage.tsx`、`pages/TaskConfigPage.tsx`、`pages/NetworkStatusDemo.tsx` 未挂路由（组件级/演示用途）。
@@ -245,7 +245,7 @@ FastAPI (backend/app/)
 | `license.py` | `/api/v1/license` | 许可证状态/上传/激活 |
 | `app_versions.py` | `/api/v1/app-versions` | APP 版本管理：latest/download（公开）、上传（admin、分片） |
 | `assistant.py` | `/api/v1/assistant` | LLM 配置、数据集、对话（需 `can_assistant`） |
-| `desktop_licenses.py` | `/api/v1/desktop-licenses` | 桌面授权管理（admin）：创建激活码/批准/禁用/解绑换机/重发码 |
+| `desktop_licenses.py` | `/api/v1/desktop-licenses` | 桌面授权管理（admin）：创建激活码/批准/禁用/解绑换机/重发码；数据组与到期以「用户管理」的（地市+运营商）/许可证到期为准（列表回写授权记录） |
 | `desktop_cloud.py` | `/api/v1/desktop-cloud` | 桌面客户端**公开**接口（授权服务器侧）：账号登录/单设备会话校验、激活/续期/申请（凭证=激活码或签名许可 + 机器码，非 JWT）、`/config`、数据集同步（`/data/session|manifest|dataset/{id}/package`）、`releases/latest` 与 `releases/download/{id}`（Range） |
 | `desktop_local.py` | `/api/v1/desktop` | 桌面版**本机**接口（仅 `NPT_DESKTOP=1`，否则 404）：`login`/`auth-poll`、`cloud-status|activate|renew|apply`、共享模式 `sync-status|run-mode|sync|sync-resolve`、`update/status|download|progress|snooze|install`、`exit`（经 `app/desktop_bridge.py` 关闭窗口） |
 | `desktop_releases.py` | `/api/v1/desktop-releases` | 桌面版安装包管理（admin）：分片上传、列表/编辑/删除/设最新 |

@@ -13,7 +13,7 @@ from __future__ import annotations
 import secrets
 import string
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
@@ -407,9 +407,81 @@ class DesktopLicenseService:
 
     # ---------------- 客户端侧 ----------------
 
-    def _build_license(self, record: DesktopLicense) -> Tuple[str, str]:
-        """签发许可，返回 (license_file, expire_date)。"""
-        expire_date = (_now().date() + timedelta(days=int(record.lease_days or 30))).isoformat()
+    @staticmethod
+    def _bound_user(db: Optional[Session], record: DesktopLicense):
+        """授权记录绑定的网页端账号（用户管理里的那一行）；未绑定返回 None。"""
+        if db is None:
+            return None
+        from app.models.database import User
+
+        if record.user_id:
+            user = db.query(User).filter(User.id == record.user_id).first()
+            if user is not None:
+                return user
+        if record.username:
+            return db.query(User).filter(User.username == record.username).first()
+        return None
+
+    @staticmethod
+    def sync_group_from_user(record: DesktopLicense, user) -> bool:
+        """数据组跟随用户管理：「用户管理」的（地市+运营商）是唯一真源。
+
+        桌面端同步用哪一组数据由授权记录决定，因此这里把用户侧的组回写进来，
+        保证「桌面授权」页展示的组 = 客户端实际同步的组 = 用户管理里的组。
+        """
+        if user is None or not user.city or not user.operator:
+            return False
+        if record.city == user.city and record.operator == user.operator:
+            return False
+        record.city, record.operator = user.city, user.operator
+        record.user_id = record.user_id or user.id
+        return True
+
+    def user_expire_override(self, db: Optional[Session], record: DesktopLicense) -> Optional[str]:
+        """该授权对应的「用户管理 → 许可证到期」（账号例外期限优先，其次全局期限）。
+
+        用户管理是到期时间的唯一真源；返回 None 表示账号侧未设期限（管理员或未绑定）。
+        """
+        user = self._bound_user(db, record)
+        if user is None:
+            return None
+        try:
+            from app.services.auth_service import auth_service
+
+            effective = auth_service.effective_license_expiry(user)
+        except Exception:  # noqa: BLE001
+            return None
+        return effective.date().isoformat() if effective else None
+
+    def admin_list_items(self, db: Session, records: List[DesktopLicense]) -> List[Dict[str, Any]]:
+        """管理端列表数据：数据组与到期均以「用户管理」为准（有变化时回写授权记录）。"""
+        changed = False
+        items: List[Dict[str, Any]] = []
+        for record in records:
+            user = self._bound_user(db, record)
+            if self.sync_group_from_user(record, user):
+                changed = True
+            data = record.to_dict()
+            override = self.user_expire_override(db, record)
+            data["user_license_expiry"] = override
+            if override:
+                # 展示层以用户管理为准（授权记录自身的 expire_date 只是租约推算的兜底）
+                data["expire_date"] = override
+            items.append(data)
+        if changed:
+            db.commit()
+        return items
+
+    def _build_license(self, record: DesktopLicense, db: Optional[Session] = None) -> Tuple[str, str]:
+        """签发许可，返回 (license_file, expire_date)。
+
+        到期以「用户管理 → 许可证到期」为准（账号例外期限优先，其次全局期限）；
+        账号侧未设期限（管理员/未绑定账号）时退回租约天数推算。
+        """
+        expire_date = (
+            self.user_expire_override(db, record)
+            or (_now().date() + timedelta(days=int(record.lease_days or 30))).isoformat()
+        )
         payload: Dict[str, Any] = {
             "v": 1,
             "license_id": record.id,
@@ -473,8 +545,10 @@ class DesktopLicenseService:
         record.client_version = (client_version or "").strip() or record.client_version
         record.hostname = (hostname or "").strip() or record.hostname
         record.updated_at = _iso()
+        # 数据组随绑定账号（用户管理是真源），许可以它为准下发给客户端
+        self.sync_group_from_user(record, self._bound_user(db, record))
 
-        license_file, expire_date = self._build_license(record)
+        license_file, expire_date = self._build_license(record, db)
         record.expire_date = expire_date
         db.commit()
         db.refresh(record)
@@ -515,8 +589,10 @@ class DesktopLicenseService:
         record.last_renewed_at = _iso()
         record.client_version = (client_version or "").strip() or record.client_version
         record.updated_at = _iso()
+        # 续期时同样把数据组拉回用户管理的最新值（管理员改组后无需重新激活）
+        self.sync_group_from_user(record, self._bound_user(db, record))
 
-        license_file, expire_date = self._build_license(record)
+        license_file, expire_date = self._build_license(record, db)
         record.expire_date = expire_date
         db.commit()
         db.refresh(record)
@@ -842,12 +918,11 @@ class DesktopLicenseService:
             record.last_login_at = _iso()
             record.client_version = (client_version or "").strip() or record.client_version
             record.hostname = (hostname or "").strip() or record.hostname
-            if not record.city and user.city:
-                record.city = user.city
-            if not record.operator and user.operator:
-                record.operator = user.operator
+            # 数据组跟随用户管理（用户管理是真源）：管理员改组后，
+            # 桌面端下次登录即同步到新组，而不是沿用授权记录里的旧组
+            self.sync_group_from_user(record, user)
 
-        license_file, expire_date = self._build_license(record)
+        license_file, expire_date = self._build_license(record, db)
         record.expire_date = expire_date
         record.updated_at = _iso()
         db.commit()
@@ -896,7 +971,10 @@ class DesktopLicenseService:
         record.activated_at = _iso()
         record.login_count = (record.login_count or 0) + 1
         record.last_login_at = _iso()
-        license_file, expire_date = self._build_license(record)
+        record.user_id = record.user_id or user.id
+        # 数据组跟随用户管理（用户管理是真源）
+        self.sync_group_from_user(record, user)
+        license_file, expire_date = self._build_license(record, db)
         record.expire_date = expire_date
         record.updated_at = _iso()
         db.commit()

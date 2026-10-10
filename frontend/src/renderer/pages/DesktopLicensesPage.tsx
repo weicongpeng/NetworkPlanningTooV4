@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { Ban, Check, Copy, KeyRound, Pencil, Plus, RefreshCw, RotateCcw, Trash2, Unlink, X } from 'lucide-react'
+import { Ban, Check, Copy, KeyRound, Pencil, Plus, RefreshCw, RotateCcw, Unlink, X } from 'lucide-react'
 import type { DesktopLicenseRecord } from '@shared/types'
 import { authApi, desktopLicensesApi } from '../services/api'
 
@@ -39,13 +39,8 @@ export function DesktopLicensesPage() {
   const [createIdleLogout, setCreateIdleLogout] = useState(2)
   const [createUsername, setCreateUsername] = useState('')
 
+  // 编辑授权：只允许改「无操作退出登录时长」——到期与数据组以用户管理为准，不在这里改
   const [editing, setEditing] = useState<DesktopLicenseRecord | null>(null)
-  const [editName, setEditName] = useState('')
-  const [editOrg, setEditOrg] = useState('')
-  const [editLease, setEditLease] = useState(30)
-  const [editNote, setEditNote] = useState('')
-  const [editCity, setEditCity] = useState('')
-  const [editOperator, setEditOperator] = useState('')
   const [editIdleLogout, setEditIdleLogout] = useState(2)
 
   // 数据组下拉（地市 + 运营商）：决定该桌面端在共享模式下共享到哪一组的数据
@@ -144,38 +139,16 @@ export function DesktopLicensesPage() {
     }
   }
 
-  const handleDelete = async (item: DesktopLicenseRecord) => {
-    if (!window.confirm(t('desktopLicenses.deleteConfirm', { name: item.licensee_username }))) return
-    try {
-      await desktopLicensesApi.remove(item.id)
-      notify('success', t('desktopLicenses.deleteSuccess'))
-      await fetchItems()
-    } catch (err: any) {
-      notify('error', err?.message || t('desktopLicenses.deleteFailed'))
-    }
-  }
-
   const openEdit = (item: DesktopLicenseRecord) => {
     setEditing(item)
-    setEditName(item.licensee_username)
-    setEditOrg(item.organization || '')
-    setEditLease(item.lease_days)
-    setEditNote(item.note || '')
-    setEditCity((item as any).city || '')
-    setEditOperator((item as any).operator || '')
     setEditIdleLogout(item.idle_logout_days ?? 2)
   }
 
   const submitEdit = async () => {
     if (!editing) return
     try {
+      // 只提交无操作退出登录时长；到期/数据组跟随用户管理，不在此处修改
       await desktopLicensesApi.update(editing.id, {
-        licensee_username: editName.trim(),
-        organization: editOrg.trim(),
-        lease_days: editLease,
-        note: editNote.trim(),
-        city: editCity || null,
-        operator: editOperator || null,
         idle_logout_days: editIdleLogout,
       })
       setEditing(null)
@@ -336,9 +309,16 @@ export function DesktopLicensesPage() {
                 </td>
                 <td className="px-3 py-2">
                   {(item as any).city && (item as any).operator ? (
-                    <div className="text-xs">
-                      {(item as any).city} / {(item as any).operator}
-                    </div>
+                    <>
+                      <div className="text-xs">
+                        {(item as any).city} / {(item as any).operator}
+                      </div>
+                      {item.user_id && (
+                        <div className="text-xs text-muted-foreground">
+                          {t('desktopLicenses.groupFollowsUser', '跟随用户管理')}
+                        </div>
+                      )}
+                    </>
                   ) : (
                     <span className="text-xs text-muted-foreground">
                       {t('desktopLicenses.groupUnset')}
@@ -351,7 +331,9 @@ export function DesktopLicensesPage() {
                 <td className="px-3 py-2">
                   <div className="text-xs">{item.expire_date || '-'}</div>
                   <div className="text-xs text-muted-foreground">
-                    {t('desktopLicenses.leaseDays', { days: item.lease_days })}
+                    {item.user_license_expiry
+                      ? t('desktopLicenses.expiryFollowsUser', '跟随用户管理')
+                      : t('desktopLicenses.expiryFromLease', '按租约 {{days}} 天', { days: item.lease_days })}
                   </div>
                 </td>
                 <td className="px-3 py-2">
@@ -426,13 +408,6 @@ export function DesktopLicensesPage() {
                       title={t('desktopLicenses.edit')}
                     >
                       <Pencil size={14} />
-                    </button>
-                    <button
-                      onClick={() => handleDelete(item)}
-                      className="p-1.5 hover:bg-muted rounded text-red-500"
-                      title={t('desktopLicenses.delete')}
-                    >
-                      <Trash2 size={14} />
                     </button>
                   </div>
                 </td>
@@ -590,34 +565,6 @@ export function DesktopLicensesPage() {
             <h3 className="text-sm font-semibold">{t('desktopLicenses.editTitle')}</h3>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
               <div>
-                <label className="block text-xs text-muted-foreground mb-1">{t('desktopLicenses.nameLabel')}</label>
-                <input
-                  value={editName}
-                  onChange={(e) => setEditName(e.target.value)}
-                  placeholder={t('desktopLicenses.nameLabel')}
-                  className="w-full px-3 py-2 bg-background border border-border rounded-lg text-sm"
-                />
-              </div>
-              <div>
-                <label className="block text-xs text-muted-foreground mb-1">{t('desktopLicenses.orgLabel')}</label>
-                <input
-                  value={editOrg}
-                  onChange={(e) => setEditOrg(e.target.value)}
-                  placeholder={t('desktopLicenses.orgLabel')}
-                  className="w-full px-3 py-2 bg-background border border-border rounded-lg text-sm"
-                />
-              </div>
-              <div>
-                <label className="block text-xs text-muted-foreground mb-1">{t('desktopLicenses.leaseLabel')}</label>
-                <input
-                  type="number"
-                  min={1}
-                  value={editLease}
-                  onChange={(e) => setEditLease(Number(e.target.value))}
-                  className="w-full px-3 py-2 bg-background border border-border rounded-lg text-sm"
-                />
-              </div>
-              <div>
                 <label className="block text-xs text-muted-foreground mb-1">
                   {t('desktopLicenses.idleLogoutLabel', '无操作退出登录时长（天）')}
                 </label>
@@ -629,41 +576,14 @@ export function DesktopLicensesPage() {
                   className="w-full px-3 py-2 bg-background border border-border rounded-lg text-sm"
                 />
               </div>
-              <div className="md:col-span-2">
-                <label className="block text-xs text-muted-foreground mb-1">{t('desktopLicenses.noteLabel')}</label>
-                <input
-                  value={editNote}
-                  onChange={(e) => setEditNote(e.target.value)}
-                  placeholder={t('desktopLicenses.noteLabel')}
-                  className="w-full px-3 py-2 bg-background border border-border rounded-lg text-sm"
-                />
-              </div>
-              <div className="md:col-span-2">
-                <label className="block text-xs text-muted-foreground mb-1">{t('desktopLicenses.groupHint')}</label>
-                <div className="flex gap-2">
-                  <select
-                    value={editCity}
-                    onChange={(e) => setEditCity(e.target.value)}
-                    className="flex-1 px-3 py-2 bg-background border border-border rounded-lg text-sm"
-                  >
-                    <option value="">{t('desktopLicenses.groupCityPlaceholder')}</option>
-                    {cities.map((c) => (
-                      <option key={c} value={c}>{c}</option>
-                    ))}
-                  </select>
-                  <select
-                    value={editOperator}
-                    onChange={(e) => setEditOperator(e.target.value)}
-                    className="flex-1 px-3 py-2 bg-background border border-border rounded-lg text-sm"
-                  >
-                    <option value="">{t('desktopLicenses.groupOperatorPlaceholder')}</option>
-                    {operators.map((o) => (
-                      <option key={o} value={o}>{o}</option>
-                    ))}
-                  </select>
-                </div>
-              </div>
             </div>
+            {/* 到期与数据组统一由「用户管理」维护，这里只解释来源，避免两处设置打架 */}
+            <p className="text-xs text-muted-foreground">
+              {t(
+                'desktopLicenses.editHint',
+                '许可证到期与数据组（地市 + 运营商）跟随「用户管理」中的设置，请到用户管理页修改；本页仅调整无操作退出登录时长。',
+              )}
+            </p>
             <div className="flex gap-2 justify-end pt-3 border-t border-border">
               <button
                 onClick={() => setEditing(null)}

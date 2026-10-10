@@ -65,10 +65,12 @@ async def list_desktop_licenses(
     admin_user: User = Depends(get_current_admin_user),
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
-    total, items = desktop_license_service.list_licenses(
+    total, records = desktop_license_service.list_licenses(
         db, page, page_size, status, keyword, mode
     )
-    return {"success": True, "data": {"total": total, "items": [i.to_dict() for i in items]}}
+    # 数据组与到期以「用户管理」为准：展示值取自绑定账号，组变化时回写授权记录
+    items = desktop_license_service.admin_list_items(db, records)
+    return {"success": True, "data": {"total": total, "items": items}}
 
 
 @router.post("")

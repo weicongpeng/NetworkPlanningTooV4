@@ -188,7 +188,7 @@ FastAPI (backend/app/)
 | `map.py` | `/api/v1/map` | 地图数据/小区/扇区、缓存清理、在线与离线配置 |
 | `license.py` | `/api/v1/license` | 许可证状态/上传/激活 |
 | `app_versions.py` | `/api/v1/app-versions` | APP 版本管理：latest/download（公开）、上传（admin、分片） |
-| `desktop_licenses.py` | `/api/v1/desktop-licenses` | 桌面授权管理（admin）：创建激活码/批准/禁用/解绑换机/重发码 |
+| `desktop_licenses.py` | `/api/v1/desktop-licenses` | 桌面授权管理（admin）：创建激活码/批准/禁用/解绑换机/重发码；数据组与到期以「用户管理」的（地市+运营商）/许可证到期为准（列表回写授权记录） |
 | `desktop_cloud.py` | `/api/v1/desktop-cloud` | 桌面客户端公开接口：激活/续期/申请（激活码或旧许可即凭证）、`/config`、`releases/latest`、`releases/download/{id}`（Range） |
 | `desktop_local.py` | `/api/v1/desktop` | 桌面版**本机**接口（仅 `NPT_DESKTOP=1`，否则 404）：`login/auth-poll`（账号登录与单机授权轮询）、`cloud-status/activate/renew/apply`、共享模式 `sync-status/run-mode/sync/sync-resolve/group`、`update/status|download|progress|snooze|install`、`exit`（经 `app/desktop_bridge.py` 关闭窗口） |
 | `desktop_releases.py` | `/api/v1/desktop-releases` | 桌面版安装包管理（admin）：分片上传（complete 才鉴权）、列表/编辑/删除/设最新 |
