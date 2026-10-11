@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
-import { Download, Loader2, AlertCircle, Search, X, Ruler, Save, Check, GripVertical, List, Eye, Trash2 } from 'lucide-react'
+import { Download, Loader2, AlertCircle, Search, X, Ruler, Save, Check, GripVertical, List, Eye } from 'lucide-react'
 import { pciApi, dataApi } from '../services/api'
 import type { ApiResponse } from '@shared/types'
 import { useTaskStore, type Task } from '../store/taskStore'
@@ -18,7 +18,8 @@ import { triggerDataRefresh, DATA_REFRESH_EVENT } from '../store/dataStore'
 import { usePCIStore } from '../store/pciStore'
 import { useTranslation } from 'react-i18next'
 import { CellSelectionTable } from '../components/CellSelectionTable'
-import { HistoryTable, triggerBatchApply, triggerBatchDelete } from '../components/HistoryTable'
+import { HistoryTable } from '../components/HistoryTable'
+import { HistoryTabActions } from '../components/HistoryTabActions'
 import { StepIndicator } from '../components/StepIndicator'
 import { WizardFooter } from '../components/WizardFooter'
 import { extractCellIdsFromFile, matchCellIds, downloadCellTreeTemplate } from '../utils/cellFileHelper'
@@ -186,8 +187,6 @@ export function PCIPage() {
   const [unappliedCount, setUnappliedCount] = useState(0)
   const [batchApplying, setBatchApplying] = useState(false)
   const [batchDeleting, setBatchDeleting] = useState(false)
-  const showBatchApply = unappliedCount > 0
-  const showBatchDelete = selectedCount > 0
 
   const [selectedSectorKey, setSelectedSectorKey] = useState<string | null>(null)
 
@@ -1297,41 +1296,15 @@ export function PCIPage() {
                 {currentTaskResult?.status === 'failed' && <span className={btn.badgeError}>!</span>}
                 {isRunning && <span className="ml-2 inline-flex items-center"><Loader2 size={12} className="animate-spin text-blue-500" /></span>}
               </button>
-              {/* 批量操作按钮 */}
-              <div className="ml-auto flex items-center gap-1 mr-8">
-                {showBatchApply && (
-                  batchApplying ? (
-                    <span className="inline-flex items-center px-2 py-1 bg-blue-400 text-white rounded-lg">
-                      <Loader2 size={14} className="animate-spin" />
-                    </span>
-                  ) : (
-                    <button
-                      onClick={() => triggerBatchApply()}
-                      disabled={batchDeleting}
-                      className="p-1.5 bg-green-500 text-white rounded-lg hover:bg-green-600 transition-colors disabled:opacity-50"
-                      title={t('common.batchApply') || '批量应用'}
-                    >
-                      <Check size={14} />
-                    </button>
-                  )
-                )}
-                {showBatchDelete && (
-                  batchDeleting ? (
-                    <span className="inline-flex items-center px-2 py-1 bg-red-400 text-white rounded-lg">
-                      <Loader2 size={14} className="animate-spin" />
-                    </span>
-                  ) : (
-                    <button
-                      onClick={() => triggerBatchDelete()}
-                      disabled={batchApplying}
-                      className="p-1.5 bg-red-500 text-white rounded-lg hover:bg-red-600 transition-colors disabled:opacity-50"
-                      title={t('common.batchDelete') || '批量删除'}
-                    >
-                      <Trash2 size={14} />
-                    </button>
-                  )
-                )}
-              </div>
+              {/* 历史任务操作：仅「历史任务」页签显示（刷新 / 全选 / 应用 / 删除） */}
+              {activeLeftTab === 'history' && (
+                <HistoryTabActions
+                  selectedCount={selectedCount}
+                  unappliedCount={unappliedCount}
+                  applying={batchApplying}
+                  deleting={batchDeleting}
+                />
+              )}
             </div>
 
             {/* 页签内容 */}
@@ -1596,7 +1569,7 @@ export function PCIPage() {
                         </button>
                         <button
                           onClick={handleApplyToParams}
-                          disabled={applyingToParams}
+                          disabled={applyingToParams || applySuccess}
                           className={`flex items-center justify-center gap-2 px-4 py-2 rounded-lg transition-all text-xs font-medium whitespace-nowrap ${applySuccess ? 'bg-green-500/20 border border-green-500/50 text-green-600' : applyingToParams ? 'bg-blue-500/20 border border-blue-500/50 text-blue-600' : 'bg-card border border-border hover:bg-muted/80'} disabled:opacity-50 disabled:cursor-not-allowed`}
                         >
                           {applyingToParams ? <><Loader2 size={14} className="animate-spin" />{t('pci.applying') || '应用中...'}</> : applySuccess ? <><Check size={14} />{t('pci.applied') || '已应用'}</> : <><Save size={14} />{t('pci.apply') || '应用到工参'}</>}

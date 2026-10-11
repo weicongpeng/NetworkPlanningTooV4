@@ -90,14 +90,15 @@ export function HistoryPage() {
           </div>
         ) : (
           <table className="w-full text-sm">
-            <thead className="sticky top-0 bg-muted/50 z-10">
+            {/* 表头必须不透明：半透明背景会让滚动的正文透过表头显示 */}
+            <thead className="sticky top-0 z-20">
               <tr className="border-b border-border">
-                <th className="text-left px-4 py-3 font-semibold text-xs">{t('common.userName')}</th>
-                <th className="text-left px-4 py-3 font-semibold text-xs">{t('common.taskName')}</th>
-                <th className="text-left px-4 py-3 font-semibold text-xs">{t('common.taskType')}</th>
-                <th className="text-left px-4 py-3 font-semibold text-xs">{t('common.taskStartTime')}</th>
-                <th className="text-left px-4 py-3 font-semibold text-xs">{t('common.taskEndTime')}</th>
-                <th className="text-center px-4 py-3 font-semibold text-xs">{t('common.status')}</th>
+                <th className="sticky top-0 z-20 bg-muted text-left px-4 py-3 font-semibold text-xs">{t('common.userName')}</th>
+                <th className="sticky top-0 z-20 bg-muted text-left px-4 py-3 font-semibold text-xs">{t('common.taskName')}</th>
+                <th className="sticky top-0 z-20 bg-muted text-left px-4 py-3 font-semibold text-xs">{t('common.taskType')}</th>
+                <th className="sticky top-0 z-20 bg-muted text-left px-4 py-3 font-semibold text-xs">{t('common.taskStartTime')}</th>
+                <th className="sticky top-0 z-20 bg-muted text-left px-4 py-3 font-semibold text-xs">{t('common.taskEndTime')}</th>
+                <th className="sticky top-0 z-20 bg-muted text-center px-4 py-3 font-semibold text-xs">{t('common.status')}</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-border">

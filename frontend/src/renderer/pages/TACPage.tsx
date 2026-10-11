@@ -18,6 +18,7 @@ import { DATA_REFRESH_EVENT } from '../store/dataStore'
 import { useTranslation } from 'react-i18next'
 import { CellSelectionTable } from '../components/CellSelectionTable'
 import { HistoryTable } from '../components/HistoryTable'
+import { HistoryTabActions } from '../components/HistoryTabActions'
 import { StepIndicator } from '../components/StepIndicator'
 import { WizardFooter } from '../components/WizardFooter'
 import { extractCellIdsFromFile, matchCellIds, downloadCellTreeTemplate } from '../utils/cellFileHelper'
@@ -100,6 +101,7 @@ export function TACPage() {
   const viewedTaskIdRef = useRef<string | null>(null) // 防止 useEffect 覆盖 API 获取的结果
   const isLoadingResultRef = useRef(false) // 标记结果加载是否有效，防止竞态
   const [resultLoading, setResultLoading] = useState(false) // 结果页加载动画
+  const [selectedCount, setSelectedCount] = useState(0) // 历史任务已选中条数（供页签栏「删除」置灰判断）
 
   // 从 taskStore 恢复最近的任务结果，行为与 PCI/邻区规划一致
   const t0 = performance.now()
@@ -948,6 +950,7 @@ export function TACPage() {
           group="tac"
           skipped={taskResult.skippedCells}
           checkedCount={taskResult.totalCells || 0}
+          titleOnly
         />
       )}
 
@@ -992,6 +995,12 @@ export function TACPage() {
               </span>
             )}
           </button>
+          {/* 历史任务操作：仅「历史任务」页签显示（核查无可应用项，「应用」恒置灰） */}
+          {activeLeftTab === 'history' && (
+            <HistoryTabActions
+              selectedCount={selectedCount}
+            />
+          )}
         </div>
 
         {/* 页签内容 */}
@@ -1157,6 +1166,7 @@ export function TACPage() {
                 }}
                 onViewTask={handleViewTask}
                 getCellCount={getCellCount}
+                onSelectedChange={(counts) => setSelectedCount(counts.total)}
               />
             </div>
           )}

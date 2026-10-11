@@ -1,5 +1,5 @@
 import { useMemo, useEffect, useState, useCallback, useRef } from 'react'
-import { Clock, Eye, Trash2, Check, Loader2 } from 'lucide-react'
+import { Clock, Eye, Trash2, Check, CheckCheck, Loader2 } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { useTaskStore, type TaskType, type Task } from '../store/taskStore'
 import { DESKTOP_SYNCED_EVENT } from '../store/desktopSyncStore'
@@ -13,15 +13,29 @@ function formatTime(ts?: number): string {
 }
 
 // 模块级批量操作句柄（替代 forwardRef，避免 Vite production build TDZ 问题）
+// 页签栏的常驻图标按钮（刷新/全选/应用/删除）由此进入表格内部，无需提升状态
 type BatchHandler = () => Promise<void>
 let _batchApplyHandler: BatchHandler | null = null
 let _batchDeleteHandler: BatchHandler | null = null
-function setBatchHandlers(apply: BatchHandler | null, del: BatchHandler | null) {
+let _refreshHandler: BatchHandler | null = null
+let _selectAllHandler: (() => void) | null = null
+function setBatchHandlers(
+  apply: BatchHandler | null,
+  del: BatchHandler | null,
+  refresh: BatchHandler | null = null,
+  selectAll: (() => void) | null = null,
+) {
   _batchApplyHandler = apply
   _batchDeleteHandler = del
+  _refreshHandler = refresh
+  _selectAllHandler = selectAll
 }
 export function triggerBatchApply() { return _batchApplyHandler?.() }
 export function triggerBatchDelete() { return _batchDeleteHandler?.() }
+/** 刷新当前页历史任务（拉取最新条目） */
+export function triggerHistoryRefresh() { return _refreshHandler?.() }
+/** 全选/取消全选切换 */
+export function triggerHistorySelectAll() { _selectAllHandler?.() }
 
 interface HistoryTableProps {
   taskType: TaskType
@@ -317,11 +331,16 @@ export function HistoryTable({
     }
   }, [filteredTasks, selectedTaskIds, deleteHistoryTask, loadHistoryPage, t])
 
+  // 页签栏「刷新」按钮：重新拉取当前页，展示最新条目
+  const handleRefresh = useCallback(async () => {
+    await loadHistoryPage(currentPageRef.current)
+  }, [loadHistoryPage])
+
   // ===== 将批量处理方法注册到模块级变量（供父组件 tab 栏按钮调用） =====
   useEffect(() => {
-    setBatchHandlers(handleBatchApply, handleBatchDelete)
+    setBatchHandlers(handleBatchApply, handleBatchDelete, handleRefresh, handleToggleSelectAll)
     return () => setBatchHandlers(null, null)
-  }, [handleBatchApply, handleBatchDelete])
+  }, [handleBatchApply, handleBatchDelete, handleRefresh, handleToggleSelectAll])
 
   // 确认删除对话框
   const confirmDialog = confirmDelete ? (
@@ -369,10 +388,11 @@ export function HistoryTable({
       {confirmDialog}
       <div className="flex-1 min-h-0 overflow-auto bg-card border border-border rounded-xl">
         <table className="w-full text-sm">
-          <thead className="sticky top-0 bg-muted/50 z-10">
+          {/* 表头必须不透明：半透明背景会让滚动的正文透过表头显示 */}
+          <thead className="sticky top-0 z-20">
             <tr className="border-b border-border">
               {/* 复选框列 */}
-              <th className="px-3 py-3 w-10">
+              <th className="sticky top-0 z-20 bg-muted px-3 py-3 w-10">
                 {allSelectableIds.length > 0 && (
                   <input
                     type="checkbox"
@@ -384,17 +404,17 @@ export function HistoryTable({
                   />
                 )}
               </th>
-              <th className="text-left px-4 py-3 font-semibold text-xs">{t('common.userName') || '用户名称'}</th>
-              <th className="text-left px-4 py-3 font-semibold text-xs">{t('common.taskName') || '任务名称'}</th>
-              <th className="text-left px-4 py-3 font-semibold text-xs">{t('common.taskType') || '任务类型'}</th>
+              <th className="sticky top-0 z-20 bg-muted text-left px-4 py-3 font-semibold text-xs">{t('common.userName') || '用户名称'}</th>
+              <th className="sticky top-0 z-20 bg-muted text-left px-4 py-3 font-semibold text-xs">{t('common.taskName') || '任务名称'}</th>
+              <th className="sticky top-0 z-20 bg-muted text-left px-4 py-3 font-semibold text-xs">{t('common.taskType') || '任务类型'}</th>
               {getCellCount && (
-                <th className="text-center px-3 py-3 font-semibold text-xs">{t('common.cellCount')}</th>
+                <th className="sticky top-0 z-20 bg-muted text-center px-3 py-3 font-semibold text-xs">{t('common.cellCount')}</th>
               )}
-              <th className="text-left px-4 py-3 font-semibold text-xs">{t('common.taskStartTime') || '任务开始时间'}</th>
-              <th className="text-left px-4 py-3 font-semibold text-xs">{t('common.taskEndTime') || '任务完成时间'}</th>
-              <th className="text-center px-4 py-3 font-semibold text-xs">{t('common.status') || '状态'}</th>
+              <th className="sticky top-0 z-20 bg-muted text-left px-4 py-3 font-semibold text-xs">{t('common.taskStartTime') || '任务开始时间'}</th>
+              <th className="sticky top-0 z-20 bg-muted text-left px-4 py-3 font-semibold text-xs">{t('common.taskEndTime') || '任务完成时间'}</th>
+              <th className="sticky top-0 z-20 bg-muted text-center px-4 py-3 font-semibold text-xs">{t('common.status') || '状态'}</th>
               {onViewTask && (
-                <th className="text-center px-4 py-3 font-semibold text-xs min-w-[120px]">{t('common.actions')}</th>
+                <th className="sticky top-0 z-20 bg-muted text-center px-4 py-3 font-semibold text-xs min-w-[120px]">{t('common.actions')}</th>
               )}
             </tr>
           </thead>
@@ -455,18 +475,19 @@ export function HistoryTable({
                 {/* 操作列：只有图标，无文字标签 */}
                 {onViewTask && (
                   <td className="px-4 py-3 text-center">
-                    <div className="flex items-center justify-center gap-1">
+                    <div className="flex items-center justify-center gap-2">
                       <button
                         onClick={(e) => { e.stopPropagation(); onViewTask(task) }}
-                        className="p-1.5 bg-blue-500 text-white rounded-lg hover:bg-blue-600 transition-colors"
+                        className="p-0.5 text-muted-foreground hover:text-foreground transition-colors"
                         title={t('common.view') || '查看'}
                       >
-                        <Eye size={14} />
+                        <Eye size={15} />
                       </button>
                       {onApplyTask && task.status === 'completed' && (
                         task.isApplied ? (
-                          <span className="p-1.5 text-muted-foreground cursor-default" title={t('common.applied') || '已应用'}>
-                            <Check size={14} />
+                          // 已应用：灰色双勾（与「待应用」的亮色单勾区分）
+                          <span className="p-0.5 text-muted-foreground/45 cursor-default" title={t('common.applied') || '已应用'}>
+                            <CheckCheck size={15} />
                           </span>
                         ) : (
                           <button
@@ -489,24 +510,26 @@ export function HistoryTable({
                               }
                             }}
                             disabled={applyingTaskId === task.id}
-                            className={`p-1.5 rounded-lg transition-colors ${
+                            className={`p-0.5 text-primary transition-colors ${
                               applyingTaskId === task.id
-                                ? 'bg-blue-400 text-white cursor-wait'
-                                : 'bg-green-500 text-white hover:bg-green-600'
-                            } disabled:opacity-50`}
+                                ? 'cursor-wait opacity-60'
+                                : 'hover:text-primary/70'
+                            }`}
                             title={t('common.apply') || '应用'}
                           >
-                            {applyingTaskId === task.id ? <Loader2 size={14} className="animate-spin" /> : <Check size={14} />}
+                            {applyingTaskId === task.id
+                              ? <Loader2 size={15} className="animate-spin" />
+                              : <Check size={15} strokeWidth={2.5} />}
                           </button>
                         )
                       )}
                       <button
                         onClick={(e) => { e.stopPropagation(); handleDelete(task.id) }}
                         disabled={deletingId === task.id}
-                        className="p-1.5 bg-red-500 text-white rounded-lg hover:bg-red-600 transition-colors disabled:opacity-50"
+                        className="p-0.5 text-muted-foreground hover:text-destructive transition-colors disabled:opacity-50"
                         title={t('common.delete') || '删除'}
                       >
-                        {deletingId === task.id ? <Loader2 size={14} className="animate-spin" /> : <Trash2 size={14} />}
+                        {deletingId === task.id ? <Loader2 size={15} className="animate-spin" /> : <Trash2 size={15} />}
                       </button>
                     </div>
                   </td>

@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react'
-import { Play, Download, Settings, Loader2, AlertCircle, Search, X, Ruler, GripVertical, Check, Eye, Trash2 } from 'lucide-react'
+import { Play, Download, Settings, Loader2, AlertCircle, Search, X, Ruler, GripVertical, Check, Eye } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 
 
@@ -22,7 +22,8 @@ import type { RenderSectorData, CellListItem } from '../services/mapDataService'
 import { mapDataService, getCellList, clearCellListCache } from '../services/mapDataService'
 import { DATA_REFRESH_EVENT } from '../store/dataStore'
 import { CellSelectionTable } from '../components/CellSelectionTable'
-import { HistoryTable, triggerBatchDelete } from '../components/HistoryTable'
+import { HistoryTable } from '../components/HistoryTable'
+import { HistoryTabActions } from '../components/HistoryTabActions'
 import { generateFullTaskName } from '../utils/taskNameUtils'
 import { buildMissingCellsError } from '../utils/cellValidation'
 import { StepIndicator } from '../components/StepIndicator'
@@ -218,7 +219,6 @@ export function NeighborPage() {
   const [resultLoading, setResultLoading] = useState(false) // 结果页加载动画
   const [selectedCount, setSelectedCount] = useState(0)
   const [batchDeleting, setBatchDeleting] = useState(false)
-  const showBatchDelete = selectedCount > 0
   const {
     updateTaskProgress, completeTask, failTask, activeTaskIds, setActiveTaskId, startTask,
     getLatestNeighborTask,
@@ -1410,25 +1410,13 @@ export function NeighborPage() {
                   </span>
                 )}
               </button>
-              {/* 批量操作按钮 */}
-              <div className="ml-auto flex items-center gap-1 mr-8">
-                {showBatchDelete && (
-                  batchDeleting ? (
-                    <span className="inline-flex items-center px-2 py-1 bg-red-400 text-white rounded-lg">
-                      <Loader2 size={14} className="animate-spin" />
-                    </span>
-                  ) : (
-                    <button
-                      onClick={() => triggerBatchDelete()}
-                      disabled={batchDeleting}
-                      className="p-1.5 bg-red-500 text-white rounded-lg hover:bg-red-600 transition-colors disabled:opacity-50"
-                      title={t('common.batchDelete') || '批量删除'}
-                    >
-                      <Trash2 size={14} />
-                    </button>
-                  )
-                )}
-              </div>
+              {/* 历史任务操作：仅「历史任务」页签显示（邻区无可应用项，「应用」恒置灰） */}
+              {activeLeftTab === 'history' && (
+                <HistoryTabActions
+                  selectedCount={selectedCount}
+                  deleting={batchDeleting}
+                />
+              )}
             </div>
 
             {/* 页签内容 */}
