@@ -2398,6 +2398,9 @@ function CellToolsCard({
         ? {
             position: 'fixed', top: contentBox.top, left: contentBox.left,
             width: contentBox.width, height: contentBox.height, zIndex: 9999,
+            // 父容器 space-y-8 会给兄弟节点加 margin-top，fixed 元素同样吃这个
+            // margin（top: 0 被推下 32px，表现为放大后顶端留有一条空隙），必须清零
+            marginTop: 0,
           }
         : undefined}
     >
