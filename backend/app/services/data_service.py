@@ -590,6 +590,71 @@ class DataService:
             safe_print(f"[DataService] 残余条目清理失败（非致命）: {exc}")
             return {"error": str(exc)}
 
+    def backfill_coord_zero_warnings(self) -> int:
+        """存量全量工参：按库内小区记录重算「经纬度缺失或为 0」提醒条数。
+
+        该数字在导入时写进条目 metadata.importWarnings；早期版本在去重之前按源
+        文件行数统计，NR 共享小区的多条 PLMN 行 + 源文件重复行会把 4 条入库记录
+        报成 8 个（网页端提示与桌面端解析结果对不上）。启动时按 SQLite（权威数据
+        源）重算一次，只改 coord_zero，其它提醒原样保留；返回被修正的条目数。
+        """
+        from sqlalchemy import or_
+
+        updated = 0
+        db = SessionLocal()
+        try:
+            for data_id, entry in list(self.index.items()):
+                if not isinstance(entry, dict) or entry.get("fileType") != "full_params":
+                    continue
+                metadata = entry.get("metadata")
+                if not isinstance(metadata, dict):
+                    continue
+                warnings = metadata.get("importWarnings")
+                if not isinstance(warnings, list) or not any(
+                    isinstance(w, dict) and w.get("code") == "coord_zero" for w in warnings
+                ):
+                    continue
+
+                counts: Dict[str, int] = {}
+                for _nt in ("LTE", "NR"):
+                    counts[_nt] = (
+                        db.query(Sector)
+                        .join(Site, Sector.site_id_fk == Site.id)
+                        .filter(
+                            Site.workbook_id == data_id,
+                            Site.network_type == _nt,
+                            or_(Sector.longitude == 0, Sector.latitude == 0,
+                                Sector.longitude.is_(None), Sector.latitude.is_(None)),
+                        )
+                        .count()
+                    )
+
+                rebuilt = [w for w in warnings
+                           if not (isinstance(w, dict) and w.get("code") == "coord_zero")]
+                rebuilt += [{"code": "coord_zero", "network": _nt, "count": counts[_nt]}
+                            for _nt in ("LTE", "NR") if counts[_nt]]
+                if rebuilt == warnings:
+                    continue
+
+                metadata["importWarnings"] = rebuilt
+                entry["metadata"] = metadata
+                wb = db.query(Workbook).filter(Workbook.id == data_id).first()
+                if wb is not None:
+                    wb.metadata_json = json.dumps(metadata, ensure_ascii=False)
+                updated += 1
+
+            if updated:
+                db.commit()
+                self._save_index()
+                safe_print(f"[DataService] 已按库内记录修正 {updated} 个全量工参的坐标缺失提醒")
+            return updated
+        except Exception as exc:  # noqa: BLE001
+            db.rollback()
+            safe_print(f"[DataService] 坐标缺失提醒回填失败（非致命）: {exc}")
+            return 0
+        finally:
+            db.close()
+
     @staticmethod
     def _looks_like_data_id(name: str) -> bool:
         """数据集 id 形如 uuid4（data/<id>/ 只认这种目录，避免把 uploads 等目录当数据）。"""

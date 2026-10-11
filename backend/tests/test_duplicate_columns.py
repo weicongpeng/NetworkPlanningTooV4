@@ -150,6 +150,87 @@ def test_coord_zero_counts_deduped_cells():
     assert zero_cells == 2  # 重复行被去重，只剩两条 PLMN 记录
 
 
+def test_backfill_coord_zero_warnings_from_db(tmp_path, monkeypatch):
+    """存量条目：按库内小区记录重算坐标缺失提醒（旧 metadata 里的 8 修正为 4）"""
+    import json
+    import uuid
+
+    from app.core.database import SessionLocal
+    from app.models.database import Site, Sector, Workbook
+
+    wb_id = f"test-warn-{uuid.uuid4()}"
+    db = SessionLocal()
+    try:
+        db.add(Workbook(
+            id=wb_id, user_id=1, name="warn-test", file_type="full_params",
+            status="ready", created_at="2026-10-11T18:35:08",
+            metadata_json=json.dumps({
+                "importWarnings": [
+                    {"code": "coord_zero", "network": "NR", "count": 8},   # 旧口径（偏大）
+                    {"code": "single_network", "present": "LTE", "missing": "NR"},
+                ]
+            }, ensure_ascii=False),
+        ))
+        db.flush()  # 先落 Workbook，满足 Site 的外键约束
+        site = Site(workbook_id=wb_id, user_id=1, site_id="7906591", name="共享站",
+                    network_type="NR", longitude=113.0, latitude=23.0)
+        db.add(site)
+        db.flush()
+        # 库内 4 条 NR 记录缺坐标（2 个共享小区 × 2 条 PLMN）+ 1 条正常
+        for cell, mnc in (("104", "11"), ("104", "01"), ("4", "11"), ("4", "01")):
+            db.add(Sector(site_id_fk=site.id, workbook_id=wb_id, user_id=1,
+                          sector_id=cell, name=f"NR-{cell}", longitude=0, latitude=0,
+                          azimuth=0, mcc="460", mnc=mnc))
+        db.add(Sector(site_id_fk=site.id, workbook_id=wb_id, user_id=1,
+                      sector_id="9", name="NR-9", longitude=113.0, latitude=23.0,
+                      azimuth=0, mcc="460", mnc="11"))
+        db.commit()
+    finally:
+        db.close()
+
+    monkeypatch.setattr(data_service, "data_index_file", tmp_path / "index.json")
+    data_service.index[wb_id] = {
+        "id": wb_id, "fileType": "full_params", "name": "warn.xlsx",
+        "metadata": {
+            "importWarnings": [
+                {"code": "coord_zero", "network": "NR", "count": 8},
+                {"code": "single_network", "present": "LTE", "missing": "NR"},
+            ]
+        },
+    }
+    try:
+        assert data_service.backfill_coord_zero_warnings() == 1
+        warnings = data_service.index[wb_id]["metadata"]["importWarnings"]
+        assert {"code": "coord_zero", "network": "NR", "count": 4} in warnings
+        # 其它提醒原样保留
+        assert {"code": "single_network", "present": "LTE", "missing": "NR"} in warnings
+
+        # 已写回 SQLite（启动时索引由该表重建，不写回会回滚）
+        db = SessionLocal()
+        try:
+            wb = db.query(Workbook).filter(Workbook.id == wb_id).first()
+            assert json.loads(wb.metadata_json)["importWarnings"] == warnings
+        finally:
+            db.close()
+
+        # 幂等：再跑一次不再修改
+        assert data_service.backfill_coord_zero_warnings() == 0
+    finally:
+        data_service.index.pop(wb_id, None)
+        db = SessionLocal()
+        try:
+            for s in db.query(Sector).filter(Sector.workbook_id == wb_id).all():
+                db.delete(s)
+            for s in db.query(Site).filter(Site.workbook_id == wb_id).all():
+                db.delete(s)
+            row = db.query(Workbook).filter(Workbook.id == wb_id).first()
+            if row:
+                db.delete(row)
+            db.commit()
+        finally:
+            db.close()
+
+
 def test_single_network_import_warning():
     """只含单一制式时提醒可能漏传（不影响导入）"""
     data_service.full_params_import_warnings = []

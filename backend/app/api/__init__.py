@@ -250,6 +250,17 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"❌ 启动预热图层缓存失败: {e}")
 
+    # 存量全量工参：「经纬度缺失或为 0」提醒条数按库内小区记录重算一次
+    # （旧版在去重前按源文件行数统计，NR 共享小区的多条 PLMN 行会把 4 条报成 8 个，
+    # 导致网页端提示与桌面端解析结果不一致）。网页端与桌面端都需要修正。
+    try:
+        from app.services.data_service import data_service as _ds_for_warn_backfill
+        corrected = _ds_for_warn_backfill.backfill_coord_zero_warnings()
+        if corrected:
+            logger.info(f"✅ 坐标缺失提醒已按库内记录修正: {corrected} 个全量工参")
+    except Exception as e:
+        logger.warning(f"⚠️ 坐标缺失提醒回填失败: {e}")
+
     # 服务器形态：后台补齐存量任务的小数量与「已应用」标记（同组任务历史展示用）。
     # 只扫未计算过/标记为未应用的行，分批解析提交；桌面端不需要（本机任务可直接算）。
     if not settings.NPT_DESKTOP:
