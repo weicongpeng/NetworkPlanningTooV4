@@ -11,7 +11,7 @@
  */
 import { useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo, type ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
-import { Loader2, Search, X, MapPin, AlertTriangle, Database, Trash2, MousePointer2, Circle as CircleIcon, Pentagon, Hand, Map as MapIcon, Satellite, Maximize2, Minimize2, FilePlus2, Save, Download, Hexagon, Spline, Palette, PenLine, Undo2, BoxSelect, ClipboardPaste, Magnet, Combine, Filter, ChevronRight, ChevronsRight } from 'lucide-react'
+import { Loader2, Search, X, MapPin, AlertTriangle, Database, Trash2, MousePointer2, Circle as CircleIcon, Pentagon, Hand, Map as MapIcon, Satellite, Move, Shrink, FilePlus2, Save, Download, Hexagon, Spline, Palette, PenLine, Undo2, BoxSelect, ClipboardPaste, Magnet, Combine, Filter, ChevronRight, ChevronsRight } from 'lucide-react'
 import { OnlineMap, OnlineMapRef, CustomLayerOption } from '../components/Map/OnlineMap'
 import { MapSearchDialog } from '../components/Map/MapSearchDialog'
 import { LayerControl, SectorLayerOption, LayerFileOption, DecorationLayerOption } from '../components/Map/LayerControl'
@@ -158,10 +158,11 @@ function layerFileFormat(sourceFile?: string): string {
 // ===== 工具栏个性化（右键设置）：按钮排序 + 标签文字显隐，按登录用户持久化 =====
 
 /** 可拖动排序的工具栏按钮 id（数据源指示/搜索区固定不参与）；默认顺序按使用频率排列 */
+/* 全屏按钮不在此列：已迁到地图内右上角的悬浮图标（见地图内容区域） */
 const TOOLBAR_ITEM_IDS = [
   'save', 'export', 'new', 'undo', 'capture', 'paste', 'measure',
   'drag', 'select', 'marquee', 'draw', 'style', 'nodesnap', 'nodemerge',
-  'maptype', 'fullscreen',
+  'maptype',
 ] as const
 type ToolbarItemId = (typeof TOOLBAR_ITEM_IDS)[number]
 
@@ -412,27 +413,39 @@ export function MapPage() {
     mapSettings.decorationLabelVisible
   )
 
-  // 全屏模式
+  // 全屏模式：地图占满整个屏幕（隐藏侧栏与应用顶栏），按钮在地图右上角悬浮
   const [isFullscreen, setIsFullscreen] = useState(false)
   const mapPageRef = useRef<HTMLDivElement>(null)
+  // 是否真的进入了系统级全屏（Fullscreen API 成功）；桌面壳不支持时只做应用内全屏
+  const fsApiActiveRef = useRef(false)
 
-  // 切换全屏
+  // 切换全屏：先切应用内状态（保证任何环境都有"地图占满屏幕"的效果），
+  // 再尽力请求系统级全屏（浏览器里连浏览器外壳一起占满；失败/不支持也不影响）
   const toggleFullscreen = useCallback(() => {
-    if (!document.fullscreenElement) {
-      document.documentElement.requestFullscreen().catch(err => {
-        console.error('[MapPage] Fullscreen request failed:', err)
-      })
-    } else {
-      document.exitFullscreen().catch(err => {
-        console.error('[MapPage] Exit fullscreen failed:', err)
-      })
+    const next = !isFullscreen
+    setIsFullscreen(next)
+    if (next) {
+      fsApiActiveRef.current = false
+      const req = document.documentElement.requestFullscreen?.()
+      if (req && typeof req.then === 'function') {
+        req.then(() => { fsApiActiveRef.current = true }).catch(() => { /* 桌面壳/权限不允许 */ })
+      }
+    } else if (document.fullscreenElement) {
+      document.exitFullscreen?.()?.catch?.(() => { /* ignore */ })
     }
-  }, [])
+  }, [isFullscreen])
 
-  // 监听 fullscreenchange 事件
+  // 系统级全屏被外部退出（Esc / 系统手势）时同步应用内状态；
+  // 只有确实进入过系统级全屏才收敛，避免桌面壳下刚点开就被打回
   useEffect(() => {
     const handleFullscreenChange = () => {
-      setIsFullscreen(!!document.fullscreenElement)
+      if (document.fullscreenElement) {
+        fsApiActiveRef.current = true
+        setIsFullscreen(true)
+      } else if (fsApiActiveRef.current) {
+        fsApiActiveRef.current = false
+        setIsFullscreen(false)
+      }
     }
     document.addEventListener('fullscreenchange', handleFullscreenChange)
     return () => document.removeEventListener('fullscreenchange', handleFullscreenChange)
@@ -3091,18 +3104,6 @@ export function MapPage() {
         )}
       </button>
     ),
-
-    /* 全屏按钮 */
-    fullscreen: (
-      <button
-        onClick={toggleFullscreen}
-        className="flex items-center gap-1 px-2 py-1.5 text-xs rounded transition-colors text-foreground hover:bg-muted hover:text-primary"
-        title={isFullscreen ? (t('map.exitFullscreen') || '退出全屏') : (t('map.fullscreen') || '全屏')}
-      >
-        {isFullscreen ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
-        <span className="toolbar-label">{isFullscreen ? (t('map.exitFullscreen') || '退出全屏') : (t('map.fullscreen') || '全屏')}</span>
-      </button>
-    ),
   }
 
   // =====「更多」面板条目：被收纳按钮的等价行 =====
@@ -3247,17 +3248,13 @@ export function MapPage() {
       label: mapTypeLabel,
       onSelect: cycleMapType,
     },
-    fullscreen: {
-      icon: isFullscreen ? <Minimize2 size={14} /> : <Maximize2 size={14} />,
-      label: isFullscreen ? (t('map.exitFullscreen') || '退出全屏') : (t('map.fullscreen') || '全屏'),
-      onSelect: toggleFullscreen,
-    },
   }
 
   return (
     <div ref={mapPageRef} className="flex flex-col h-full min-h-0">
       {/* 地图工具栏（右键可设置标签显隐/按钮顺序） */}
       <div
+        data-map-toolbar
         className={`h-14 bg-background border-b border-border/60 flex items-center justify-start px-4 flex-shrink-0 gap-4 ${toolbarPrefs.showLabels ? '' : 'npt-hide-toolbar-labels'}`}
         onContextMenu={(e) => {
           e.preventDefault()
@@ -3661,6 +3658,17 @@ export function MapPage() {
         ) : (
           <OfflineMap data={offlineData} offlinePath={offlinePath} />
         )}
+
+        {/* 全屏悬浮按钮：贴在地图右上角（顶部工具栏下方的地图内）。
+            absolute 定位在地图容器内，窗口/侧栏尺寸变化时始终吸附地图边缘 */}
+        <button
+          onClick={toggleFullscreen}
+          className="absolute top-3 right-3 z-[1200] w-9 h-9 flex items-center justify-center rounded-lg bg-card/95 border border-border shadow-md text-muted-foreground hover:text-primary hover:bg-muted transition-colors"
+          title={isFullscreen ? (t('map.exitFullscreen') || '退出全屏') : (t('map.fullscreen') || '全屏')}
+          aria-label={isFullscreen ? (t('map.exitFullscreen') || '退出全屏') : (t('map.fullscreen') || '全屏')}
+        >
+          {isFullscreen ? <Shrink size={16} /> : <Move size={16} />}
+        </button>
       </div>
 
       {/* Ctrl+F 地图搜索弹窗（仅在线模式：数据源搜索 + 定位高亮） */}
@@ -3789,13 +3797,16 @@ export function MapPage() {
         <style>{`.npt-hide-toolbar-labels .toolbar-label{display:none !important;}`}</style>
       )}
 
-      {/* 全屏模式全局样式 */}
+      {/* 全屏模式全局样式：地图占满整个屏幕（隐藏侧栏与应用顶栏），退出按钮在地图右上角 */}
       {isFullscreen && (
         <style>{`
           body.map-fullscreen-mode aside {
             display: none !important;
           }
           body.map-fullscreen-mode > div#root > div > div:first-child {
+            display: none !important;
+          }
+          body.map-fullscreen-mode [data-map-toolbar] {
             display: none !important;
           }
         `}</style>
