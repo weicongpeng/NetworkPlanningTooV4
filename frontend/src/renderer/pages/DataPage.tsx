@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef, useMemo } from 'react'
+import { useState, useEffect, useLayoutEffect, useCallback, useRef, useMemo } from 'react'
 import { Upload, FileSpreadsheet, Trash2, Download, Loader2, AlertCircle, RefreshCw, CheckCircle2, Layers, FileDown, MapPin, Navigation, CheckSquare, Square, ScrollText, Maximize2, Minimize2, RadioTower, BarChart3, Search } from 'lucide-react'
 import { useDataStore } from '../store/dataStore'
 import { dataApi, assistantApi, getStoredAuthToken } from '../services/api'
@@ -2297,6 +2297,28 @@ function CellToolsCard({
   const { t } = useTranslation()
   const [activeTab, setActiveTab] = useState<'entry' | 'query' | 'update'>('entry')
   const [expanded, setExpanded] = useState(false)
+  // 放大态只铺到应用内容区（<main>）矩形，不覆盖侧栏/顶栏。
+  // 侧栏宽度可折叠（180px ↔ 42px），因此不写死数值，直接量 main 的矩形。
+  const [contentBox, setContentBox] = useState<DOMRect | null>(null)
+  useLayoutEffect(() => {
+    if (!expanded) {
+      setContentBox(null)
+      return
+    }
+    const measure = () => {
+      const main = document.querySelector('main')
+      setContentBox(main ? main.getBoundingClientRect() : null)
+    }
+    measure()
+    window.addEventListener('resize', measure)
+    const observer = new ResizeObserver(measure)
+    const main = document.querySelector('main')
+    if (main) observer.observe(main)
+    return () => {
+      window.removeEventListener('resize', measure)
+      observer.disconnect()
+    }
+  }, [expanded])
 
   // 页签顺序（从左到右）：新站录入 | 查询/修改 | 工参更新
   const TABS: Array<{ key: 'entry' | 'query' | 'update'; label: string }> = [
@@ -2307,7 +2329,7 @@ function CellToolsCard({
 
   // 页签 + 缩放按钮头部（普通态与放大态共用，页签字号/字重与"导入数据""已导入数据"标题一致）
   const renderHeader = () => (
-    <div className="flex items-center border-b border-border mb-3">
+    <div className="flex items-center border-b border-border mb-3 shrink-0">
       <div className="flex items-center gap-5 -mb-px">
         {TABS.map(tab => (
           <button
@@ -2370,27 +2392,27 @@ function CellToolsCard({
   // 普通态/放大态共用同一 React 树形状（仅切换 className），
   // 保证三个内容组件在缩放切换时不卸载、表单/搜索/操作结果等状态持久化
   return (
-    <>
-      {/* 放大态遮罩（普通态隐藏） */}
-      <div className={expanded ? 'fixed inset-0 z-[9998] bg-black/40 backdrop-blur-sm' : 'hidden'} />
-      {/* 放大态定位容器（普通态为无样式普通块，保持卡片在文档流中） */}
+    // 放大态定位容器贴合 <main> 内容区（普通态为无样式普通块，保持卡片在文档流中）
+    <div
+      style={expanded && contentBox
+        ? {
+            position: 'fixed', top: contentBox.top, left: contentBox.left,
+            width: contentBox.width, height: contentBox.height, zIndex: 9999,
+          }
+        : undefined}
+    >
       <div
         className={expanded
-          ? 'fixed inset-0 z-[9999] flex items-start justify-center pt-8 pb-8 overflow-y-auto'
-          : ''}
-        style={expanded ? { paddingLeft: '280px' } : undefined}
+          ? 'bg-card h-full flex flex-col p-5 overflow-hidden'
+          : 'bg-card p-3 rounded-lg border border-border -mt-6'}
       >
-        <div
-          className={expanded
-            ? 'bg-card rounded-xl shadow-2xl border border-border w-full mx-6 p-5'
-            : 'bg-card p-3 rounded-lg border border-border -mt-6'}
-          style={expanded ? { maxWidth: 'min(90vw, 1400px)' } : undefined}
-        >
-          {renderHeader()}
+        {renderHeader()}
+        {/* 放大态高度固定，内容超出时在此滚动（结构与普通态一致，切换不卸载子组件） */}
+        <div className={expanded ? 'flex-1 min-h-0 overflow-y-auto' : ''}>
           {renderContent()}
         </div>
       </div>
-    </>
+    </div>
   )
 }
 

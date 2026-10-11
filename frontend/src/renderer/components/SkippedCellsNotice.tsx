@@ -12,13 +12,15 @@ interface SkippedCellsNoticeProps {
   skipped: SkippedCellInfo[]
   /** 实际完成核查/规划的小区数 */
   checkedCount: number
+  /** 只保留标题行（核查页要求：明细与补充说明都不展示） */
+  titleOnly?: boolean
 }
 
 /**
  * 工参数据不全被跳过的小区提示横幅（黄色，非阻断）
  * 挂在错误横幅同区域，核查/规划完成与查看历史任务时均展示
  */
-export function SkippedCellsNotice({ group, skipped, checkedCount }: SkippedCellsNoticeProps) {
+export function SkippedCellsNotice({ group, skipped, checkedCount, titleOnly = false }: SkippedCellsNoticeProps) {
   const { t } = useTranslation()
   if (!skipped || skipped.length === 0) return null
 
@@ -43,20 +45,24 @@ export function SkippedCellsNotice({ group, skipped, checkedCount }: SkippedCell
           {t(`${group}.skippedCellsTitle`, { count: skipped.length }) ||
             `已跳过 ${skipped.length} 个工参数据不全的小区`}
         </p>
-        <p className="text-amber-600 text-xs mt-0.5">
-          {t(`${group}.skippedCellsSummary`, { skipped: skipped.length, checked: checkedCount })}
-        </p>
-        <ul className="mt-1 ml-4 list-disc text-xs text-amber-600 space-y-0.5">
-          {skipped.slice(0, MAX_LISTED).map((cell, i) => (
-            <li key={`${cell.siteId || ''}_${cell.sectorId || ''}_${i}`}>
-              {t(`${group}.skippedCellItem`, { name: cellName(cell), reason: reasonText(cell.reason) })}
-            </li>
-          ))}
-        </ul>
-        {skipped.length > MAX_LISTED && (
-          <p className="mt-1 ml-4 text-xs text-amber-600">
-            {t(`${group}.skippedCellsMore`, { count: skipped.length - MAX_LISTED })}
-          </p>
+        {!titleOnly && (
+          <>
+            <p className="text-amber-600 text-xs mt-0.5">
+              {t(`${group}.skippedCellsSummary`, { skipped: skipped.length, checked: checkedCount })}
+            </p>
+            <ul className="mt-1 ml-4 list-disc text-xs text-amber-600 space-y-0.5">
+              {skipped.slice(0, MAX_LISTED).map((cell, i) => (
+                <li key={`${cell.siteId || ''}_${cell.sectorId || ''}_${i}`}>
+                  {t(`${group}.skippedCellItem`, { name: cellName(cell), reason: reasonText(cell.reason) })}
+                </li>
+              ))}
+            </ul>
+            {skipped.length > MAX_LISTED && (
+              <p className="mt-1 ml-4 text-xs text-amber-600">
+                {t(`${group}.skippedCellsMore`, { count: skipped.length - MAX_LISTED })}
+              </p>
+            )}
+          </>
         )}
       </div>
     </div>
