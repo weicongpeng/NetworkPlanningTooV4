@@ -128,6 +128,8 @@ class SessionCheckRequest(BaseModel):
     license_file: str
     machine_code: str
     session_jti: str
+    # 客户端当前版本（心跳顺带上报：「桌面授权」页的「当前版本」列据此保持最新）
+    client_version: str = ""
 
 
 class RegisterRequest(BaseModel):
@@ -248,6 +250,10 @@ async def desktop_session_check(
 
     # 心跳即活跃：刷新会话时间，供「用户管理」的桌面端在线状态判定
     session.last_activity = datetime.now(timezone.utc)
+    # 顺带刷新客户端版本：OTA 升级后不必等下次登录，「桌面授权」页立即显示新版本
+    version = (payload.client_version or "").strip()
+    if version and version != (record.client_version or ""):
+        record.client_version = version
     db.commit()
 
     data: Dict[str, Any] = {"valid": True}

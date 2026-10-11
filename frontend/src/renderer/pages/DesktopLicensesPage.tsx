@@ -261,6 +261,7 @@ export function DesktopLicensesPage() {
               <th className="px-3 py-2 text-left">{t('desktopLicenses.colCode')}</th>
               <th className="px-3 py-2 text-left">{t('desktopLicenses.colGroup')}</th>
               <th className="px-3 py-2 text-left">{t('desktopLicenses.colMachine')}</th>
+              <th className="px-3 py-2 text-left">{t('desktopLicenses.colVersion', '当前版本')}</th>
               <th className="px-3 py-2 text-left">{t('desktopLicenses.colExpire')}</th>
               <th className="px-3 py-2 text-left">{t('desktopLicenses.colUsage', '登录情况')}</th>
               <th className="px-3 py-2 text-left">{t('desktopLicenses.colActions')}</th>
@@ -320,6 +321,14 @@ export function DesktopLicensesPage() {
                 </td>
                 <td className="px-3 py-2">
                   <span className="text-xs font-mono">{item.machine_code || '-'}</span>
+                </td>
+                <td className="px-3 py-2">
+                  {/* 客户端上报的版本（登录/心跳刷新），统一显示成 vX.Y.Z */}
+                  <span className="text-xs font-mono">
+                    {item.client_version
+                      ? `v${item.client_version.replace(/^v/i, '')}`
+                      : '-'}
+                  </span>
                 </td>
                 <td className="px-3 py-2">
                   <div className="text-xs">{item.expire_date || '-'}</div>

@@ -445,12 +445,17 @@ export function LoginModal({ isOpen, forceChangePassword = false, onClose }: Log
           </button>
         </form>
 
-        {/* Switch mode：桌面端同样可以注册（账号创建在服务器上） */}
+        {/* Switch mode：桌面端同样可以注册（账号创建在服务器上）
+            登录态只留「立即注册」入口，不再提示"还没有账号？" */}
         {!forceChangePassword && (
           <div className="mt-5 text-center">
-            <span className="text-sm text-muted-foreground">
-              {mode === 'login' ? t('auth.noAccount', '还没有账号？') : t('auth.hasAccount', '已有账号？')}
-            </span>{' '}
+            {mode === 'register' && (
+              <>
+                <span className="text-sm text-muted-foreground">
+                  {t('auth.hasAccount', '已有账号？')}
+                </span>{' '}
+              </>
+            )}
             <button
               onClick={switchMode}
               className="text-sm text-primary hover:underline font-medium"

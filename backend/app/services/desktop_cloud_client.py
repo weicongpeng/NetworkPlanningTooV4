@@ -460,6 +460,8 @@ def session_check(session_jti: str) -> Dict[str, Any]:
                 "license_file": _license_file_text(),
                 "machine_code": get_machine_code(),
                 "session_jti": session_jti or "",
+                # 心跳顺带上报版本：管理员在「桌面授权」页看到的就是当前实际版本
+                "client_version": (settings.NPT_DESKTOP_VERSION or "").strip(),
             },
             timeout=15,
         )

@@ -294,6 +294,33 @@ def test_login_issues_session_and_kicks_previous_login(login_env):
     assert kicked.json()["data"]["valid"] is False
 
 
+def test_session_check_refreshes_client_version(login_env):
+    """心跳顺带上报版本 →「桌面授权」页的「当前版本」列 OTA 后立即刷新。"""
+    resp = _login(login_env.client, "alice", "alice-pwd", mode="shared", client_version="0.0.13")
+    assert resp.status_code == 200, resp.text
+    license_file = resp.json()["data"]["license_file"]
+    jti = resp.json()["data"]["session_jti"]
+
+    check = login_env.client.post(
+        "/api/v1/desktop-cloud/auth/session-check",
+        json={
+            "license_file": license_file,
+            "machine_code": MACHINE_A,
+            "session_jti": jti,
+            "client_version": "0.0.14",
+        },
+    )
+    assert check.status_code == 200, check.text
+
+    db = login_env.session_factory()
+    try:
+        record = db.query(DesktopLicense).order_by(DesktopLicense.id.desc()).first()
+        assert record is not None
+        assert record.client_version == "0.0.14"
+    finally:
+        db.close()
+
+
 def test_session_check_rejects_unknown_or_invalid_license(login_env):
     resp = login_env.client.post(
         "/api/v1/desktop-cloud/auth/session-check",
