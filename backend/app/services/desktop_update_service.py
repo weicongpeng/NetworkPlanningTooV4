@@ -245,6 +245,10 @@ def _write_helper(installer: Path, target_version: str) -> Path:
     - 顺带把重启目标的 version.json 拷到 updates/installed_version.json，应用重启后
       可以核对"实际装上的版本"，而不是只靠版本号相等与否猜测。
     - 安装器退出码写进 npt_ota_result.txt，应用重启后据此告知用户失败原因。
+
+    "装完版本没变、手动关掉再开才更新"是历史事故：start /wait 只等到安装器外层进程
+    就返回，脚本随即拉起还没被替换掉的旧 exe。因此拉起前必须两个确认（都有上限）：
+    1) 安装器进程真正退出；2) 目标目录的 version.json 已经写成新版本号。
     """
     # onedir 冻结后 sys.executable 即安装目录下的 NPT.exe；源码模式为 python.exe（仅开发用）
     app_exe = Path(sys.executable)
@@ -279,6 +283,8 @@ set "UPDATES={updates_dir_short}"
 set "LOG={install_log}"
 set "RESULT={result_file}"
 set "DEFAULTDIR={default_dir}"
+set "SETUPNAME={installer.name}"
+set "TARGETVER={target_version}"
 set "UNINSTKEY={uninstall_key}"
 set "UNINSTKEY_MACHINE={uninstall_key_machine}"
 set "REGDIR="
@@ -300,11 +306,22 @@ ping -n 3 127.0.0.1 >nul
 rem 1) install into the directory the app currently runs from (upgrade in place)
 start /wait "" "%SETUP%" {base_args} /DIR="%APPDIR%"
 set "RC=%ERRORLEVEL%"
-if "%RC%"=="0" goto launch
+if "%RC%"=="0" goto waitsetup
 rem 2) fallback: default per-user directory
 ping -n 3 127.0.0.1 >nul
 start /wait "" "%SETUP%" {base_args}
 set "RC2=%ERRORLEVEL%"
+:waitsetup
+rem start /wait 可能只等到安装器的外层进程就返回；此时重启会拉起还没被替换掉的旧 exe，
+rem 表现就是"装完版本没变，手动关掉再开才更新"。这里继续等到安装器进程真正退出。
+set /a SWAIT=0
+:waitsetup2
+tasklist /FI "IMAGENAME eq %SETUPNAME%" /NH 2>nul | find /I "%SETUPNAME%" >nul
+if errorlevel 1 goto launch
+set /a SWAIT+=2
+if %SWAIT% GEQ 90 goto launch
+ping -n 3 127.0.0.1 >nul
+goto waitsetup2
 :launch
 rem prefer the directory recorded by the installer: it is where new files actually landed
 for /f "tokens=2,*" %%a in ('reg query "%UNINSTKEY%" /v InstallLocation 2^>nul ^| findstr /I "InstallLocation"') do set "REGDIR=%%b"
@@ -315,11 +332,27 @@ if not defined TARGET if exist "%APPDIR%\\{app_exe.name}" set "TARGET=%APPDIR%\\
 if not defined TARGET if exist "%DEFAULTDIR%\\{app_exe.name}" set "TARGET=%DEFAULTDIR%\\{app_exe.name}"
 if not defined TARGET set "TARGET=%APP%"
 for %%F in ("%TARGET%") do set "TARGETDIR=%%~dpF"
+rem 等到新版本的 version.json 真正落地再拉起：version.json 由安装器在文件替换完成后
+rem 写入，没等到就重启 = 拉起旧 exe（表现"装完版本没变，手动关掉再开才更新"）。
+set /a VWAIT=0
+:waitver
+set "VEROK="
+if exist "%TARGETDIR%_internal\\version.json" findstr /I /C:"%TARGETVER%" "%TARGETDIR%_internal\\version.json" >nul
+if not errorlevel 1 set "VEROK=1"
+if not defined VEROK if exist "%TARGETDIR%version.json" findstr /I /C:"%TARGETVER%" "%TARGETDIR%version.json" >nul
+if not defined VEROK if not errorlevel 1 set "VEROK=1"
+if defined VEROK goto ready
+set /a VWAIT+=2
+if %VWAIT% GEQ 90 goto ready
+ping -n 3 127.0.0.1 >nul
+goto waitver
+:ready
 > "%RESULT%" echo target_version={target_version}
 >> "%RESULT%" echo setup_rc=%RC%
 >> "%RESULT%" echo setup_retry_rc=%RC2%
 >> "%RESULT%" echo install_dir=%REGDIR%
 >> "%RESULT%" echo restarted=%TARGET%
+>> "%RESULT%" echo install_verified=%VEROK%
 if exist "%TARGETDIR%_internal\\version.json" copy /y "%TARGETDIR%_internal\\version.json" "%UPDATES%\\installed_version.json" >nul 2>&1
 if not exist "%UPDATES%\\installed_version.json" if exist "%TARGETDIR%version.json" copy /y "%TARGETDIR%version.json" "%UPDATES%\\installed_version.json" >nul 2>&1
 >> "%RESULT%" echo finished_at=%DATE% %TIME%

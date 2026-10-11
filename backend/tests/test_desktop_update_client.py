@@ -238,6 +238,12 @@ def test_helper_script_bounded_wait_and_relaunch(updater_env):
     assert "taskkill /F /IM" in text
     # 计时不能用 timeout：无控制台环境下它直接报错，会退化成忙循环
     assert "timeout /t" not in text
+    # start /wait 可能只等到安装器外层进程：重启前必须再等安装器进程真正退出，
+    # 否则拉起的还是没被替换的旧 exe（表现"装完版本没变，手关再开才更新"）
+    assert "tasklist /FI \"IMAGENAME eq %SETUPNAME%\"" in text
+    # 拉起前核对目标目录的 version.json 已是新版本，并把结果写盘供应用提示
+    assert 'findstr /I /C:"%TARGETVER%"' in text
+    assert "install_verified=%VEROK%" in text
     assert "ping -n 3 127.0.0.1" in text
 
 
