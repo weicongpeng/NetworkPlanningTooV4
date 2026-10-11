@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -722,6 +722,8 @@ def test_session_check_syncs_permissions_to_mirror(local_env):
                 "is_admin": False,
                 "can_data_import": True,
                 "can_assistant": True,
+                # 用户管理里的实际到期日：必须镜像到本机，否则到期后桌面端仍被判为已授权
+                "effective_license_expiry": "2030-03-04T00:00:00",
             },
         },
     )
@@ -729,6 +731,7 @@ def test_session_check_syncs_permissions_to_mirror(local_env):
     result = local_env.desktop_local.check_session_once()
     assert result["valid"] is True
     assert result["user"]["can_assistant"] is True  # 回传同步后的账号载荷供前端刷新
+    assert result["user"]["effective_license_expiry"]  # 前端门禁据此判定
 
     db = local_env.session_factory()
     try:
@@ -737,8 +740,30 @@ def test_session_check_syncs_permissions_to_mirror(local_env):
         assert row.is_admin is False  # 管理员位被撤销 → 同步
         assert row.can_data_import is True
         assert row.can_assistant is True  # 新授予的权限 → 同步
+        assert row.license_expiry == datetime(2030, 3, 4)  # 到期日 → 同步
     finally:
         db.close()
+
+
+def test_mirror_local_expiry_handles_expired_and_unlimited():
+    """到期日镜像：服务器给的已过期日期要原样落到本机（门禁据此拦人），
+    未设期限（无限期）则清空本机值，避免旧日期一直卡着不放行/误拦。"""
+    from app.api.v1.endpoints.desktop_local import _mirror_local_expiry
+    from app.models.database import User as UserModel
+
+    row = UserModel(username="u", password_hash="x")
+    _mirror_local_expiry(row, {"effective_license_expiry": "2020-01-02T00:00:00"})
+    assert row.license_expiry == datetime(2020, 1, 2)
+
+    # effective_license_expiry 优先于用户自身的例外期限
+    _mirror_local_expiry(
+        row,
+        {"effective_license_expiry": "2031-05-06T00:00:00", "license_expiry": "2020-01-01T00:00:00"},
+    )
+    assert row.license_expiry == datetime(2031, 5, 6)
+
+    _mirror_local_expiry(row, {"effective_license_expiry": None, "license_expiry": None})
+    assert row.license_expiry is None
 
 
 def test_auth_poll_still_pending(local_env):

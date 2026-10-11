@@ -662,6 +662,8 @@ class DesktopLicenseService:
         self, record: DesktopLicense, license_file: str, expire_date: str, user
     ) -> Dict[str, Any]:
         """登录响应：账号信息 + 授权信息（本机据此镜像账号与运行模式）。"""
+        from app.services.auth_service import auth_service
+
         return {
             "license_file": license_file,
             "license_id": record.id,
@@ -678,7 +680,9 @@ class DesktopLicenseService:
             "user_id": record.user_id,
             "idle_logout_days": record.idle_logout_days or DEFAULT_IDLE_LOGOUT_DAYS,
             "login_count": record.login_count or 0,
-            "user": user.to_dict(),
+            # 用带 effective_license_expiry 的载荷：桌面端据此把「用户管理」里的
+            # 到期日镜像到本机账号，前端门禁才能与网页端一样按时到期拦截
+            "user": auth_service.user_payload(user),
         }
 
     def _ensure_shared_license(
@@ -870,6 +874,17 @@ class DesktopLicenseService:
             raise DesktopLicenseError(401, error)
         if user.is_desktop_shadow:
             raise DesktopLicenseError(403, "该账号不可用于桌面端登录")
+
+        # 用户管理里的授权期限是登录闸门（与网页端一致）：过期账号不放行，
+        # 免得"登录成功但界面被门禁挡住"。管理员免授权，不受期限约束。
+        if not user.is_admin:
+            expiry = auth_service.effective_license_expiry(user)
+            if expiry is not None:
+                now = datetime.now(timezone.utc)
+                if expiry.tzinfo is None:
+                    expiry = expiry.replace(tzinfo=timezone.utc)
+                if expiry < now:
+                    raise DesktopLicenseError(403, "授权已过期，请联系管理员续期")
 
         machine = _normalize_machine(machine_code)
         shared = str(mode).lower() == MODE_SHARED

@@ -194,6 +194,30 @@ class DesktopPollRequest(BaseModel):
     username: str
 
 
+def _parse_expiry(value: Any) -> Optional[datetime]:
+    """解析服务器下发的授权到期日（ISO 字符串 / 空值）。"""
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", ""))
+    except ValueError:
+        return None
+    return parsed.replace(tzinfo=None) if parsed.tzinfo else parsed
+
+
+def _mirror_local_expiry(row, incoming: dict) -> None:
+    """把服务器「用户管理」里的实际到期日镜像到本机账号。
+
+    本机前端门禁（licenseStore）读的就是 user.license_expiry：不镜像的话，管理员
+    提前设置/缩短的到期日传不到桌面端，表现为「网页端提示已到期、桌面端照常能用」。
+    运行中由 session-check 心跳（60 秒）重复镜像，管理员改动无需重登即生效。
+    """
+    raw = incoming.get("effective_license_expiry")
+    if raw is None:
+        raw = incoming.get("license_expiry")
+    row.license_expiry = _parse_expiry(raw)
+
+
 def _mirror_local_user(db: Session, incoming: dict, mode: str, password: Optional[str] = None):
     """在本机 users 表镜像网页端账号（组、权限位、管理员位照搬）。
 
@@ -225,17 +249,18 @@ def _mirror_local_user(db: Session, incoming: dict, mode: str, password: Optiona
     row.operator = incoming.get("operator")
     for perm in PERMISSION_FIELDS:
         setattr(row, perm, bool(incoming.get(perm)))
+    _mirror_local_expiry(row, incoming)
     db.commit()
     db.refresh(row)
     return row
 
 
 def _sync_permissions_from_remote(incoming: Optional[dict]) -> Optional[dict]:
-    """把服务器上的最新权限位同步到本机镜像账号，返回同步后的账号载荷。
+    """把服务器上的最新权限位与授权到期日同步到本机镜像账号，返回同步后的账号载荷。
 
-    管理员在网页端「用户管理 → 编辑」改动权限位后，运行中的桌面端在下一次
-    心跳（session-check）就会拿到新权限，无需重新登录，保证两端一致；
-    断网时拿不到新值，沿用本机上次同步的结果。
+    管理员在网页端「用户管理 → 编辑」改动权限位/到期日后，运行中的桌面端在下一次
+    心跳（session-check）就会拿到新值，无需重新登录：到期日变化会让前端门禁
+    （licenseStore）当场判定"已过期"并拦下界面；断网时拿不到新值，沿用本机上次同步的结果。
     """
     if not incoming or not incoming.get("username"):
         return None
@@ -250,6 +275,7 @@ def _sync_permissions_from_remote(incoming: Optional[dict]) -> Optional[dict]:
         row.is_admin = bool(incoming.get("is_admin"))
         for perm in PERMISSION_FIELDS:
             setattr(row, perm, bool(incoming.get(perm)))
+        _mirror_local_expiry(row, incoming)
         db.commit()
         db.refresh(row)
         return auth_service.user_payload(row)

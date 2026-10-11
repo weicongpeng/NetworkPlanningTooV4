@@ -138,6 +138,35 @@ def test_shared_login_uses_web_account_and_group(login_env):
     assert resp2.json()["data"]["license_id"] == data["license_id"]
 
 
+def _set_alice_expiry(login_env, *, days):
+    from datetime import datetime, timedelta
+
+    db = login_env.session_factory()
+    try:
+        row = db.query(User).filter(User.username == "alice").first()
+        row.license_expiry = datetime.now() + timedelta(days=days) if days is not None else None
+        db.commit()
+    finally:
+        db.close()
+
+
+def test_login_payload_carries_effective_expiry(login_env):
+    """登录响应要带「用户管理」里的实际到期日：桌面端据此镜像到本机账号，
+    否则本机 effective_license_expiry 恒为空，前端门禁永远认为已授权。"""
+    _set_alice_expiry(login_env, days=10)
+    resp = _login(login_env.client, "alice", "alice-pwd", mode="shared")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["data"]["user"]["effective_license_expiry"]
+
+
+def test_shared_login_rejects_expired_account(login_env):
+    """账号在「用户管理」里已过期 → 桌面端登录被拦截（与网页端一致，不再放行）。"""
+    _set_alice_expiry(login_env, days=-1)
+    resp = _login(login_env.client, "alice", "alice-pwd", mode="shared")
+    assert resp.status_code in (401, 403), resp.text
+    assert "过期" in resp.json()["detail"]
+
+
 def test_shared_login_rejects_bad_password(login_env):
     resp = _login(login_env.client, "alice", "wrong", mode="shared")
     assert resp.status_code == 401
