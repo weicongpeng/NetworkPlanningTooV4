@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -111,30 +112,50 @@ def _download_worker(release: Dict[str, Any]) -> None:
 
         for attempt in range(1, 6):
             pos = part.stat().st_size if part.exists() else 0
+            if total and pos >= total:
+                break
             headers = {"User-Agent": "NPT-Desktop-Updater"}
             if pos:
                 headers["Range"] = f"bytes={pos}-"
             request = urllib.request.Request(url, headers=headers)
+            written = 0
             try:
                 with urllib.request.urlopen(request, timeout=60) as resp:
                     resumed = pos > 0 and getattr(resp, "status", 200) == 206
+                    if resumed:
+                        # 续传起点必须与本地已下载长度一致，否则追加会拼出坏包
+                        match = re.match(r"bytes\s+(\d+)-", resp.headers.get("Content-Range") or "")
+                        if not match or int(match.group(1)) != pos:
+                            resumed = False
                     mode = "ab" if resumed else "wb"
-                    if not resumed:
-                        pos = 0
+                    written = pos if resumed else 0
                     with part.open(mode) as out:
                         while True:
                             chunk = resp.read(1024 * 256)
                             if not chunk:
                                 break
                             out.write(chunk)
+                            written += len(chunk)
                             with _lock:
-                                _state["downloaded"] = part.stat().st_size
-                break
+                                _state["downloaded"] = written
             except Exception as exc:  # noqa: BLE001
                 if attempt >= 5:
                     raise
                 with _lock:
                     _state["error"] = f"下载中断，重试中（{attempt}/5）：{exc}"
+                continue
+
+            # 连接被中途切断时 resp.read() 只是返回 b"" 而不抛异常：
+            # 必须按大小判断是否取满，否则会拿残缺文件去算 sha256，报「校验失败」
+            if total and written < total:
+                with _lock:
+                    _state["error"] = (
+                        f"下载未完成（{written}/{total}），续传重试（{attempt}/5）"
+                    )
+                continue
+            break
+        else:
+            raise CloudError(500, f"下载多次中断，未取到完整安装包（{part.stat().st_size}/{total}）")
 
         actual_sha = _hash_file(part)
         if expected_sha and actual_sha != expected_sha:

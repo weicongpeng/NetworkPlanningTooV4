@@ -1130,7 +1130,7 @@ async def download_release(
     import re as _re
     from pathlib import Path
 
-    from fastapi.responses import FileResponse, Response
+    from fastapi.responses import FileResponse, Response, StreamingResponse
     from starlette.concurrency import run_in_threadpool
 
     from app.models.database import DesktopRelease
@@ -1169,20 +1169,32 @@ async def download_release(
             )
         end = min(end, file_size - 1)
 
-        def _read_range() -> bytes:
-            with path.open("rb") as f:
-                f.seek(start)
-                return f.read(end - start + 1)
+        # 分块流式返回：安装包约 320MB，整段读进内存会让每次续传先等上十几秒
+        # （首字节迟迟不到）并占掉数百 MB 常驻内存（生产 MemoryMax=2G）
+        chunk_size = 1024 * 1024
 
-        data = await run_in_threadpool(_read_range)
-        return Response(
-            content=data,
+        async def _iter_range():
+            handle = await run_in_threadpool(path.open, "rb")
+            try:
+                await run_in_threadpool(handle.seek, start)
+                remaining = end - start + 1
+                while remaining > 0:
+                    data = await run_in_threadpool(handle.read, min(chunk_size, remaining))
+                    if not data:
+                        break
+                    remaining -= len(data)
+                    yield data
+            finally:
+                await run_in_threadpool(handle.close)
+
+        return StreamingResponse(
+            _iter_range(),
             status_code=206,
             media_type="application/octet-stream",
             headers={
                 **headers,
                 "Content-Range": f"bytes {start}-{end}/{file_size}",
-                "Content-Length": str(len(data)),
+                "Content-Length": str(end - start + 1),
             },
         )
 

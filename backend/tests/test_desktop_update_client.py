@@ -108,6 +108,55 @@ def test_download_resumes_from_part(updater_env):
     assert installer.read_bytes() == PAYLOAD  # 续传后内容完整
 
 
+class _FlakyHandler(BaseHTTPRequestHandler):
+    """首次响应按完整长度声明、只写一半就断开：模拟链路被中途切断。
+
+    这种情况下 resp.read() 只是返回 b""，不会抛异常。
+    """
+
+    hits = 0
+
+    def do_GET(self):  # noqa: N802
+        cls = type(self)
+        cls.hits += 1
+        range_header = self.headers.get("Range")
+        start = 0
+        if range_header:
+            match = re.match(r"bytes=(\d+)-", range_header)
+            start = int(match.group(1)) if match else 0
+            self.send_response(206)
+            self.send_header("Content-Range", f"bytes {start}-{len(PAYLOAD) - 1}/{len(PAYLOAD)}")
+        else:
+            self.send_response(200)
+        body = PAYLOAD[start:]
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body[: len(body) // 2] if cls.hits == 1 else body)
+
+    def log_message(self, *args):  # 静默
+        pass
+
+
+def test_download_retries_when_connection_truncated(updater_env, monkeypatch):
+    """下载被切断后必须按大小续传，不能拿残缺文件去算 sha256 报「校验失败」。"""
+    import threading as _threading
+
+    updater = updater_env.updater
+    server = HTTPServer(("127.0.0.1", 0), _FlakyHandler)
+    _threading.Thread(target=server.serve_forever, daemon=True).start()
+    monkeypatch.setattr(
+        updater_env.settings, "NPT_SERVER_URL", f"http://127.0.0.1:{server.server_port}"
+    )
+    try:
+        updater.start_download(_release())
+        state = _wait_ready(updater)
+        assert state["phase"] == "ready", state
+        installer = updater_env.tmp_path / "updates" / "NetworkPlanningTool-Setup-1.0.0.exe"
+        assert installer.read_bytes() == PAYLOAD
+    finally:
+        server.shutdown()
+
+
 def test_download_sha_mismatch_fails(updater_env):
     updater = updater_env.updater
     updater.start_download(_release(sha256="0" * 64))
