@@ -1363,6 +1363,7 @@
     "submitting": "创建中…",
     "saving": "保存中…",
     "selectAll": "全选",
+    "toggleSelectAll": "全选 / 取消全选",
     "searchFiles": "搜索文件",
     "noMatchingFiles": "没有匹配的文件",
     "allLoaded": "已全部加载",
@@ -1865,6 +1866,7 @@
     "modeSharedSyncing": "共享模式 · 同步中…",
     "modeSharedSynced": "共享模式 · 已同步 {{time}}",
     "modeSharedWaiting": "共享模式 · 等待同步",
+    "modeSharedPending": "共享模式 · 待上传 {{count}} 项",
     "modeSharedConflicts": "共享模式 · {{count}} 项冲突",
     "modeSharedError": "共享模式 · 同步异常"
   }

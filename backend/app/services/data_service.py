@@ -869,12 +869,17 @@ class DataService:
                 revs.mark_deleted(data_id, city=city, operator=operator)
             else:
                 revs.bump(data_id, deleted=False, city=city, operator=operator)
-            # 桌面共享模式：本地改动要上行到服务器
+        except Exception as e:  # noqa: BLE001
+            safe_print(f"[DataService] 数据集修订号更新失败（非致命）: {e}")
+        # 桌面共享模式：本地改动要上行到服务器。
+        # 与修订号记账分开 try：rev 推进失败（如组信息缺失）也必须触发上行，
+        # 否则本机改动只会被 60 秒兜底轮询发现，表现为"上传后很久才同步"。
+        try:
             from app.services.desktop_sync_service import note_change
 
             note_change(data_id, deleted=deleted)
         except Exception as e:  # noqa: BLE001
-            safe_print(f"[DataService] 数据集修订号更新失败（非致命）: {e}")
+            safe_print(f"[DataService] 桌面同步记账失败（非致命）: {e}")
 
     def _scan_uploads_directory(self):
         """扫描uploads目录中的文件，发现 SQLite 中不存在的文件时自动迁移导入"""

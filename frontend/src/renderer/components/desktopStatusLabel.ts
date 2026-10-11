@@ -52,6 +52,11 @@ export function useDesktopStatusLabel(): DesktopStatusLabel | null {
   } else if (status.last_error) {
     label = t('desktopSync.modeSharedError', '共享模式 · 同步异常')
     tone = 'warn'
+  } else if ((status.pending_uploads || 0) > 0) {
+    // 有本地改动等着上行：比"已同步/等待同步"更能说明当前在做什么
+    label = t('desktopSync.modeSharedPending', '共享模式 · 待上传 {{count}} 项', {
+      count: status.pending_uploads,
+    })
   } else if (status.last_sync_at) {
     label = t('desktopSync.modeSharedSynced', '共享模式 · 已同步 {{time}}', {
       time: status.last_sync_at.slice(11, 16),

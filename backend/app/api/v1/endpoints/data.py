@@ -1400,6 +1400,7 @@ async def complete_chunked_upload(
                     }
                 })
                 data_service._save_index()
+                data_service._bump_revision(data_id)  # 桌面共享模式：新数据需上行到服务器
                 print(f"[ChunkedUpload] 地理化数据解析完成: {data_id}")
             except Exception as e:
                 import traceback

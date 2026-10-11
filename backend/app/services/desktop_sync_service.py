@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -709,6 +710,14 @@ def sync_tasks(city: str, operator: str) -> Dict[str, Any]:
     return summary
 
 
+def _has_pending_work(state: Optional[Dict[str, Any]] = None) -> bool:
+    """是否还有本地改动等着上行（dirty 数据集 / 待上行删除 / 任务队列）。"""
+    state = state or load_state()
+    if any(v.get("dirty") for v in (state.get("datasets") or {}).values()):
+        return True
+    return bool(state.get("pending_deletes") or state.get("task_updates") or state.get("task_deletes"))
+
+
 def sync_once() -> Dict[str, Any]:
     """执行一次完整同步。返回统计结果（不抛异常，错误写入 state.last_error）。"""
     global _sync_running
@@ -720,7 +729,9 @@ def sync_once() -> Dict[str, Any]:
         return {"skipped": True, "reason": "上一次同步尚未结束"}
 
     _sync_running = True
+    _started = time.time()
     summary: Dict[str, Any] = {"pulled": 0, "pushed": 0, "deleted": 0, "conflicts": 0, "errors": []}
+    print("[DesktopSync] 同步开始")
     try:
         _require_active_license()
         from app.services import desktop_cloud_client as cloud
@@ -742,6 +753,8 @@ def sync_once() -> Dict[str, Any]:
 
         # 1. 服务器 → 本地
         for data_id, item in items.items():
+            if (data_service.index.get(data_id) or {}).get("status") == "processing":
+                continue  # 本机正在导入该数据集：本轮不动，整包覆盖会把导入打断
             if item.get("deleted"):
                 if data_id in data_service.index and not (datasets_state.get(data_id) or {}).get("dirty"):
                     data_service.delete_data(data_id, force=True)
@@ -828,6 +841,10 @@ def sync_once() -> Dict[str, Any]:
         for data_id in list(data_service.index.keys()):
             if data_id in items:
                 continue
+            if (data_service.index.get(data_id) or {}).get("status") == "processing":
+                # 正在导入：解析完成时会 _bump_revision → note_change 触发上行。
+                # 这里推上去的只是半成品（大文件往往要传两次整包），还会让同组先拉到不完整数据。
+                continue
             if not data_service.is_packagable(data_id):
                 # 本地只剩空壳（数据体没了）：推不上去也用不了，直接清掉。
                 # 否则每轮同步都抱着它失败，界面会一直显示「同步异常」。
@@ -899,9 +916,22 @@ def sync_once() -> Dict[str, Any]:
             last_result=summary,
             last_error=(summary["errors"][0] if summary["errors"] else None),
         )
+        tasks = summary.get("tasks") or {}
+        print(
+            "[DesktopSync] 同步结束 "
+            f"耗时{time.time() - _started:.1f}s 下载{summary['pulled']} "
+            f"上传{summary['pushed']} 删除{summary['deleted']} 冲突{summary['conflicts']} "
+            f"任务(拉{tasks.get('pulled') or 0}/推{tasks.get('pushed') or 0}/删{tasks.get('deleted') or 0}) "
+            f"错误{len(summary['errors'])}"
+        )
+        # 长同步期间产生的本地改动（用户继续上传/编辑）要立刻补跑一次，
+        # 否则只能等下一轮兜底轮询（默认 1 分钟）才上行；本轮有错时交给轮询重试，避免失败空转
+        if not summary["errors"] and _has_pending_work():
+            schedule_sync(1)
         return summary
     except Exception as exc:  # noqa: BLE001
         save_state(last_error=str(exc))
+        print(f"[DesktopSync] 同步失败 耗时{time.time() - _started:.1f}s: {exc}")
         return {"error": str(exc)}
     finally:
         _sync_running = False

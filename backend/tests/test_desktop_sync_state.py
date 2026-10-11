@@ -121,6 +121,30 @@ def test_note_change_no_sync_in_offline_mode(sync_state, monkeypatch):
     assert calls == []
 
 
+def test_bump_revision_notes_change_even_when_rev_bump_fails(sync_state, monkeypatch):
+    """修订号记账失败不能把上行记账一起吞掉。
+
+    两者曾写在同一段 try 里：rev 推进抛错（如组信息缺失）时 note_change 被跳过，
+    本机改动只能等 60 秒兜底轮询上行，表现为「上传后很久才同步」。
+    """
+    from app.services import dataset_revision_service as revs
+    from app.services.data_service import data_service
+
+    monkeypatch.setattr(settings, "NPT_DESKTOP", True)
+    sync_state.set_run_mode(sync_state.MODE_SHARED)
+    monkeypatch.setattr(sync_state, "schedule_sync", lambda *a, **kw: None)
+    monkeypatch.setattr(
+        revs, "bump", lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("修订号记账失败"))
+    )
+    monkeypatch.setattr(data_service, "index", {
+        "ds-9": {"id": "ds-9", "city": "广州", "operator": "移动"},
+    })
+
+    data_service._bump_revision("ds-9")
+
+    assert sync_state.load_state()["datasets"]["ds-9"]["dirty"] is True
+
+
 def test_sync_once_skipped_in_offline_mode(sync_state, monkeypatch):
     monkeypatch.setattr(settings, "NPT_DESKTOP", True)
     result = sync_state.sync_once()
@@ -282,6 +306,42 @@ def test_sync_once_skips_pending_local_delete(sync_state, monkeypatch):
 
     summary = sync_state.sync_once()
     assert pulled == [] and pushed == []
+    assert summary["errors"] == []
+
+
+def test_sync_once_leaves_importing_dataset_alone(sync_state, monkeypatch):
+    """正在导入的数据集本轮不动：服务器版本更新时整包覆盖会把导入打断。"""
+    item = {"data_id": "ds-importing", "rev": 2, "deleted": False,
+            "server_updated_at": "2026-10-09T10:00:00"}
+    pushed, pulled = _stub_sync_once_env(
+        monkeypatch, sync_state,
+        {"ds-importing": {"name": "工参", "status": "processing"}}, item,
+    )
+    sync_state.save_state(datasets={"ds-importing": {"rev": 1, "dirty": False}})
+    monkeypatch.setattr(sync_state, "_clock_offset_seconds", lambda: 0.0)
+
+    summary = sync_state.sync_once()
+    assert pushed == [] and pulled == []
+    assert summary["errors"] == []
+
+
+def test_sync_once_does_not_push_half_imported_dataset(sync_state, monkeypatch):
+    """导入中的数据集不上行：半成品推上去要再传一次整包，同组还会先拉到不完整数据。
+
+    解析完成会走 _bump_revision → note_change，改动不会丢。
+    """
+    from app.services import desktop_cloud_client as cloud
+
+    item = {"data_id": "ds-importing", "rev": 2, "deleted": False,
+            "server_updated_at": "2026-10-09T10:00:00"}
+    pushed, pulled = _stub_sync_once_env(
+        monkeypatch, sync_state,
+        {"ds-importing": {"name": "工参", "status": "processing"}}, item,
+    )
+    monkeypatch.setattr(cloud, "sync_manifest", lambda: {"items": []})  # 服务器上还没有它
+
+    summary = sync_state.sync_once()
+    assert pushed == [] and pulled == []
     assert summary["errors"] == []
 
 

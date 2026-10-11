@@ -1422,6 +1422,7 @@
     "submitting": "Creating…",
     "saving": "Saving…",
     "selectAll": "Select all",
+    "toggleSelectAll": "Select all / Deselect all",
     "searchFiles": "Search files",
     "noMatchingFiles": "No matching files",
     "allLoaded": "All loaded",
@@ -1854,6 +1855,7 @@
     "modeSharedSyncing": "Shared mode · Syncing…",
     "modeSharedSynced": "Shared mode · Synced {{time}}",
     "modeSharedWaiting": "Shared mode · Waiting",
+    "modeSharedPending": "Shared mode · {{count}} pending",
     "modeSharedConflicts": "Shared mode · {{count}} conflicts",
     "modeSharedError": "Shared mode · Sync error"
   }
