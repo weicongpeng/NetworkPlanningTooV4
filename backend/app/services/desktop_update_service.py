@@ -20,7 +20,7 @@ import time
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from app.core.config import settings
 from app.services import desktop_cloud_client as cloud
@@ -547,3 +547,40 @@ def last_result() -> Optional[Dict[str, Any]]:
     data["applied"] = bool(target) and current == target
     data["needs_manual"] = bool(target) and (not data["applied"]) and not rc_ok
     return data
+
+
+def cleanup_stale_installers(force: bool = False) -> Dict[str, Any]:
+    """清理 updates 目录里已经用不上的安装包，释放磁盘（每份安装包约 320MB）。
+
+    - 只在**更新确已生效**（当前运行版本 == 上次安装目标版本）或 force 时动手；
+      安装失败/未生效时保留安装包，方便用户手动安装与排查
+    - 后台更新已武装、或正在下载时不清理（安装包还要用）
+    - 只删 NetworkPlanningTool-Setup-*.exe / *.exe.part；
+      日志、npt_ota_result.txt、installed_version.json 等诊断文件一律保留
+    """
+    if is_background_armed():
+        return {"skipped": True, "reason": "后台更新进行中"}
+    with _lock:
+        if _state.get("phase") == "downloading":
+            return {"skipped": True, "reason": "正在下载安装包"}
+    if not force:
+        result = last_result() or {}
+        if not result.get("applied"):
+            return {"skipped": True, "reason": "上次安装未确认生效，保留安装包"}
+
+    removed: List[str] = []
+    freed = 0
+    for path in sorted(_updates_dir().glob("NetworkPlanningTool-Setup-*.exe*")):
+        if not path.is_file():
+            continue
+        try:
+            size = path.stat().st_size
+            path.unlink()
+        except OSError as exc:  # noqa: BLE001
+            _log.warning("清理安装包失败（忽略）：%s: %s", path.name, exc)
+            continue
+        removed.append(path.name)
+        freed += size
+    if removed:
+        _log.info("清理历史安装包 %d 个，释放 %.0f MB", len(removed), freed / 1024 / 1024)
+    return {"removed": removed, "freed_bytes": freed}

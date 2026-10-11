@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import threading
 import time
@@ -155,6 +156,47 @@ def test_download_retries_when_connection_truncated(updater_env, monkeypatch):
         assert installer.read_bytes() == PAYLOAD
     finally:
         server.shutdown()
+
+
+def test_cleanup_stale_installers_after_success(updater_env):
+    """更新生效后清掉 updates 里的历史安装包（每份约 320MB），诊断文件保留。"""
+    updater = updater_env.updater
+    updates = updater_env.tmp_path / "updates"
+    updates.mkdir(parents=True, exist_ok=True)
+    old_pkg = updates / "NetworkPlanningTool-Setup-0.0.9.exe"
+    part = updates / "NetworkPlanningTool-Setup-0.0.10.exe.part"
+    old_pkg.write_bytes(PAYLOAD)
+    part.write_bytes(PAYLOAD)
+    # 上次安装目标 == 当前运行版本 → 视为更新已生效
+    (updates / "npt_ota_intent.json").write_text(
+        json.dumps({"target_version": updater_env.settings.NPT_DESKTOP_VERSION}),
+        encoding="utf-8",
+    )
+    (updates / "npt_ota_result.txt").write_text("setup_rc=0\n", encoding="utf-8")
+
+    result = updater.cleanup_stale_installers()
+
+    assert set(result["removed"]) == {old_pkg.name, part.name}
+    assert result["freed_bytes"] == len(PAYLOAD) * 2
+    assert not old_pkg.exists() and not part.exists()
+    assert (updates / "npt_ota_result.txt").is_file()  # 诊断文件不能删
+
+
+def test_cleanup_keeps_installer_when_update_not_applied(updater_env):
+    """更新未生效（安装失败/版本没变）时保留安装包，方便用户手动安装。"""
+    updater = updater_env.updater
+    updates = updater_env.tmp_path / "updates"
+    updates.mkdir(parents=True, exist_ok=True)
+    pkg = updates / "NetworkPlanningTool-Setup-9.9.9.exe"
+    pkg.write_bytes(PAYLOAD)
+    (updates / "npt_ota_intent.json").write_text(
+        json.dumps({"target_version": "9.9.9"}), encoding="utf-8"
+    )
+
+    result = updater.cleanup_stale_installers()
+
+    assert result.get("skipped") is True
+    assert pkg.is_file()
 
 
 def test_download_sha_mismatch_fails(updater_env):

@@ -203,6 +203,15 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning(f"⚠️ 启动桌面数据变更监听失败: {e}")
 
+    # 桌面模式：更新已生效时清掉 updates 目录里的历史安装包（每份约 320MB）
+    if settings.NPT_DESKTOP:
+        try:
+            from app.services.desktop_update_service import cleanup_stale_installers
+
+            cleanup_stale_installers()
+        except Exception as e:
+            logger.warning(f"⚠️ 清理历史安装包失败: {e}")
+
     # 桌面模式：登录态守卫（同一账号在别处登录 → 本机自动登出）
     if settings.NPT_DESKTOP:
         try:
