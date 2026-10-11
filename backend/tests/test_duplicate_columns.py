@@ -122,6 +122,34 @@ def test_data_level_import_warnings():
     assert {"code": "site_id_dropped", "network": "NR", "count": 1} in data_service.full_params_import_warnings
 
 
+def test_coord_zero_counts_deduped_cells():
+    """坐标缺失提醒按去重后的入库记录统计
+
+    回归：源文件里同一小区可能有多行（重复行、NR 共享小区的多条 PLMN 行），
+    去重前按行数统计会把 4 条入库记录报成 8 个，网页端提示与落库结果对不上
+    （桌面端按自己的解析结果提示 4 个，两端不一致）。
+    """
+    data_service.full_params_import_warnings = []
+    df = _fp_df([
+        # 同一 NR 小区（460-11）重复两行，基站坐标缺失
+        {"gNodeB标识": "1", "小区标识": "1", "基站经度": None, "基站纬度": None, "移动网络码": "11"},
+        {"gNodeB标识": "1", "小区标识": "1", "基站经度": None, "基站纬度": None, "移动网络码": "11"},
+        # 共享小区的另一条 PLMN 行（460-01），同为缺失坐标，是独立入库记录
+        {"gNodeB标识": "1", "小区标识": "1", "基站经度": None, "基站纬度": None, "移动网络码": "01"},
+        {"gNodeB标识": "1", "小区标识": "2", "基站经度": 113.1, "基站纬度": 23.1},
+    ])
+
+    sites = data_service._parse_full_params_dataframe(df, "NR")
+
+    zero_cells = sum(
+        1 for s in sites for c in s["sectors"]
+        if not c.get("longitude") or not c.get("latitude")
+    )
+    assert {"code": "coord_zero", "network": "NR", "count": zero_cells} in \
+        data_service.full_params_import_warnings
+    assert zero_cells == 2  # 重复行被去重，只剩两条 PLMN 记录
+
+
 def test_single_network_import_warning():
     """只含单一制式时提醒可能漏传（不影响导入）"""
     data_service.full_params_import_warnings = []

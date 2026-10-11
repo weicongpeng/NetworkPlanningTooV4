@@ -260,6 +260,61 @@ def test_bulk_update_cell(excel_env):
     wb.close()
 
 
+def test_bulk_update_refreshes_full_params_timestamp(excel_env):
+    """查询/修改更新成功后：全量工参文件名时间戳与列表时间标识一起刷新
+
+    回归：原来只更新 size，文件名还是旧时间戳、「已导入数据」下方时间也不动，
+    看不出这版全量工参已经被改过。
+    """
+    import re
+    from app.core.database import SessionLocal
+    from app.models.database import Workbook
+
+    old_name = "ProjectParameter_河源电信20260101000000.xlsx"
+    data_service.index[excel_env]["name"] = old_name
+    data_service.index[excel_env]["uploadDate"] = "2026-01-01T00:00:00"
+
+    data_service._invalidate_cell_search_index()
+    hit = data_service.search_cells("TH-1", workbook_id=excel_env)[0]
+    res = data_service.bulk_update_cells(
+        [{"rowKey": hit["rowKey"], "networkType": "LTE", "fields": {"azimuth": 45}}],
+        [], user_id=1, workbook_id=excel_env,
+    )
+    assert res["updated"] == 1
+
+    entry = data_service.index[excel_env]
+    assert entry["name"] != old_name
+    assert re.fullmatch(r"ProjectParameter_河源电信\d{14}\.xlsx", entry["name"]), entry["name"]
+    assert entry["uploadDate"] != "2026-01-01T00:00:00"
+
+    # SQLite 同步：启动时索引由 Workbooks 表重建，不写回则重启后名称/时间回滚
+    db = SessionLocal()
+    try:
+        wb = db.query(Workbook).filter(Workbook.id == excel_env).first()
+        assert wb.name == entry["name"]
+        assert str(wb.created_at) == str(entry["uploadDate"])
+    finally:
+        db.close()
+
+
+def test_bulk_update_no_timestamp_appends_one(excel_env):
+    """文件名本来没有时间戳时追加一个（新导入的 ProjectParameter_x.xlsx）"""
+    import re
+
+    data_service.index[excel_env]["name"] = "ProjectParameter_梅州电信.xlsx"
+    data_service.index[excel_env]["uploadDate"] = "2026-01-01T00:00:00"
+
+    data_service._invalidate_cell_search_index()
+    hit = data_service.search_cells("TH-1", workbook_id=excel_env)[0]
+    res = data_service.bulk_update_cells(
+        [{"rowKey": hit["rowKey"], "networkType": "LTE", "fields": {"azimuth": 30}}],
+        [], user_id=1, workbook_id=excel_env,
+    )
+    assert res["updated"] == 1
+    assert re.fullmatch(r"ProjectParameter_梅州电信_\d{14}\.xlsx",
+                        data_service.index[excel_env]["name"])
+
+
 def test_bulk_update_shared_nr_cell_mnc1_normalized(excel_env):
     """联通共享小区库内 MNC 为入库归一化后的 '1'（非两位），更新非 MNC 字段不应被
     "MNC 必须为 2 位数字" 拦截（bulk_update 读库时应规范为两位补零）"""

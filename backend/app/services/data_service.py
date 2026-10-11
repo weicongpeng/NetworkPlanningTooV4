@@ -77,6 +77,20 @@ def is_target_cells_filename(filename: str) -> bool:
     return any(name.startswith(p) for p in TARGET_CELLS_PREFIXES)
 
 
+def stamp_name_with_timestamp(filename: str, when: Optional[datetime] = None) -> str:
+    """把文件名里的 14 位时间戳换成指定时刻（缺省当前）；没有时间戳则追加一个。
+
+    全量工参的「这版是什么时候改的」靠文件名时间戳体现（工参更新、
+    查询/修改都在用同一套规则）。
+    """
+    timestamp = (when or datetime.now()).strftime("%Y%m%d%H%M%S")
+    name_part, ext_part = os.path.splitext(filename or "")
+    new_name = re.sub(r"\d{14}", timestamp, name_part)
+    if new_name == name_part:
+        new_name = f"{name_part}_{timestamp}"
+    return f"{new_name}{ext_part}"
+
+
 def validate_excel_upload_contract(filename: str, file_path: "Path") -> str:
     """上传门控：按文件名前缀判定意图并校验工作表，返回 file_type。
 
@@ -1083,19 +1097,9 @@ class DataService:
                 )
 
         # 2. 准备输出文件
-        # 生成新文件名：原文件名 + 时间戳
+        # 生成新文件名：把原文件名中的时间戳换成当前时刻（没有则追加）
         original_name = full_info["name"]
-        name_part, ext_part = os.path.splitext(original_name)
-        # 移除可能已有的时间戳（简单处理：如果文件名以数字结尾，可能是时间戳）
-        # 这里直接追加时间戳
-        timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-
-        # 尝试替换文件名中的最后一段数字串（如果存在）
-        new_name = re.sub(r"\d{14}", timestamp, name_part)
-        if new_name == name_part:
-            new_name = f"{name_part}_{timestamp}"
-
-        new_filename = f"{new_name}{ext_part}"
+        new_filename = stamp_name_with_timestamp(original_name)
 
         # 创建新的数据ID（目录延迟到确认可产出结果时再创建，避免校验失败留下空壳）
         new_data_id = str(uuid.uuid4())
@@ -2623,11 +2627,35 @@ class DataService:
             try:
                 excel_size = excel_path.stat().st_size
                 if workbook_id in self.index:
-                    self.index[workbook_id]["size"] = excel_size
+                    _entry = self.index[workbook_id]
+                    _entry["size"] = excel_size
+                    # 内容已变：文件名时间戳后缀与列表时间标识一起刷新，
+                    # 让「已导入数据」一眼看出这版全量工参是刚改过的
+                    _now = datetime.now()
+                    _old_name = str(_entry.get("name") or "")
+                    if _old_name:
+                        _entry["name"] = stamp_name_with_timestamp(_old_name, _now)
+                    _entry["uploadDate"] = _now.isoformat()
                 self._save_index()
                 self._bump_revision(workbook_id)  # 小区批量更新改变了工参内容
             except Exception as e:
                 safe_print(f"[DataService] 更新索引失败 (非致命): {e}")
+            # SQLite 同步：启动时索引由 Workbooks 表重建，不写回则重启后名称/时间回滚
+            try:
+                _db = SessionLocal()
+                try:
+                    _wb = _db.query(Workbook).filter(Workbook.id == workbook_id).first()
+                    if _wb is not None:
+                        _idx_entry = self.index.get(workbook_id) or {}
+                        if _idx_entry.get("name"):
+                            _wb.name = str(_idx_entry["name"])
+                        if _idx_entry.get("uploadDate"):
+                            _wb.created_at = str(_idx_entry["uploadDate"])
+                        _db.commit()
+                finally:
+                    _db.close()
+            except Exception as e:
+                safe_print(f"[DataService] 同步全量工参名称/时间到 SQLite 失败 (非致命): {e}")
 
         self._invalidate_cell_search_index()
         _msg = f"更新 {updated} 条，删除 {deleted} 条"
@@ -5321,11 +5349,6 @@ class DataService:
             print(f"=====================================\n")
             return []
 
-        # 经纬度缺失或为 0 的小区（填 0 后在地图上会落到原点）
-        coord_zero_count = int((df['_lon'].eq(0) | df['_lat'].eq(0)).sum())
-        if coord_zero_count:
-            self._add_import_warning("coord_zero", network=network_type, count=coord_zero_count)
-
         # 4) 扇区ID转换（str(int(float(val))) 或 str(val).strip()）
         def _convert_sector_id(val):
             if pd.isna(val):
@@ -5434,6 +5457,13 @@ class DataService:
         if dup_report["groups"] > 0 or dup_report["extra"] > 0:
             self.full_params_dup_report[network_type] = dup_report
         _t_dedup = _time.perf_counter()
+
+        # 经纬度缺失或为 0 的小区（填 0 后在地图上会落到原点）。
+        # 必须在去重之后统计：源文件里同一小区可能有多行（重复行、NR 共享小区的
+        # 多条 PLMN 行），按行数统计会把 4 个小区报成 8 个，与落库结果对不上。
+        coord_zero_count = int((df['_lon'].eq(0) | df['_lat'].eq(0)).sum())
+        if coord_zero_count:
+            self._add_import_warning("coord_zero", network=network_type, count=coord_zero_count)
 
         # 7) 管理网元ID处理函数
         def _extract_me_id(val):
