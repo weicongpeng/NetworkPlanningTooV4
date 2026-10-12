@@ -4,11 +4,14 @@
  */
 
 interface WebSocketMessage {
-  type: 'progress' | 'complete' | 'failed' | 'pong' | 'task_deleted' | 'data_changed' | 'auth_ok'
+  type: 'progress' | 'complete' | 'failed' | 'pong' | 'task_deleted' | 'data_changed' | 'tasks_changed' | 'auth_ok'
   taskId: string
   data?: any
   timestamp?: number
 }
+
+/** 同组共享任务历史变化（新增/删除/应用标记）→ 历史列表重载（窗口事件） */
+export const TASKS_CHANGED_EVENT = 'npt:tasks-changed'
 
 interface SubscribeCallback {
   (message: WebSocketMessage): void
@@ -280,6 +283,13 @@ class WebSocketService {
       }).catch(() => {
         // 数据刷新模块不可用（降级场景）：忽略
       })
+      return
+    }
+
+    // 同组共享任务历史变化（新增/删除/应用标记，不影响工参数据集）：
+    // 只让历史列表重载，不触发整表刷新
+    if (type === 'tasks_changed') {
+      window.dispatchEvent(new CustomEvent(TASKS_CHANGED_EVENT, { detail: message.data || {} }))
       return
     }
 

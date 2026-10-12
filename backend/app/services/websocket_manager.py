@@ -100,6 +100,30 @@ class WebSocketManager:
         except RuntimeError:
             pass
 
+    def notify_tasks_changed(self, city: str, operator: str, task_id: str = "") -> None:
+        """线程安全地通知同组客户端「共享任务历史已变化」（新增/删除/应用标记）。
+
+        与 `notify_data_changed` 分开：任务历史变化不影响工参数据集，网页端
+        只需要重载历史列表（`tasks_changed` 事件），不必整表刷新。
+        """
+        if not city or not operator:
+            return
+        loop = self.loop
+        if loop is None or loop.is_closed():
+            return
+        message = {"type": "tasks_changed", "taskId": task_id, "data": {"taskId": task_id}}
+
+        async def _send() -> None:
+            try:
+                await self.broadcast_group(city, operator, message)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(f"任务历史变更广播失败（忽略）: {exc}")
+
+        try:
+            loop.call_soon_threadsafe(lambda: asyncio.create_task(_send()))
+        except RuntimeError:
+            pass
+
     async def subscribe_task(self, client_id: str, task_id: str) -> None:
         """客户端订阅任务进度"""
         if task_id not in self.task_subscriptions:

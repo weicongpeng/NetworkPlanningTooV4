@@ -3,6 +3,7 @@ import { Clock, Eye, Trash2, Check, CheckCheck, Loader2 } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { useTaskStore, type TaskType, type Task } from '../store/taskStore'
 import { DESKTOP_SYNCED_EVENT } from '../store/desktopSyncStore'
+import { TASKS_CHANGED_EVENT } from '../services/websocketService'
 import { LoadingSpinner } from './LoadingSpinner'
 
 function formatTime(ts?: number): string {
@@ -193,12 +194,17 @@ export function HistoryTable({
 
   // 同组任务历史是跨端共享的（桌面端镜像同步 / 网页端标记应用）：
   // - 桌面端同步落地后派发 DESKTOP_SYNCED_EVENT → 立即刷新
-  // - 可见时每 60 秒静默刷新一次，保证另一端的删除/应用无需手动切页即可看到
+  // - 服务器广播 tasks_changed（同组别端删除/新增/标记应用）→ 立即刷新（网页端）
+  // - 可见时每 60 秒静默刷新一次兜底
   useEffect(() => {
     const handleDesktopSynced = () => {
       loadHistoryPage(currentPageRef.current)
     }
+    const handleTasksChanged = () => {
+      loadHistoryPage(currentPageRef.current)
+    }
     window.addEventListener(DESKTOP_SYNCED_EVENT, handleDesktopSynced)
+    window.addEventListener(TASKS_CHANGED_EVENT, handleTasksChanged)
     const pollTimer = window.setInterval(() => {
       if (document.visibilityState === 'visible') {
         loadHistoryPage(currentPageRef.current)
@@ -206,6 +212,7 @@ export function HistoryTable({
     }, 60000)
     return () => {
       window.removeEventListener(DESKTOP_SYNCED_EVENT, handleDesktopSynced)
+      window.removeEventListener(TASKS_CHANGED_EVENT, handleTasksChanged)
       window.clearInterval(pollTimer)
     }
   }, [taskType, loadHistoryPage])

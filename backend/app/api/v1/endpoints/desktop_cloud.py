@@ -650,10 +650,46 @@ async def data_manifest(
     }
 
 
+def _shared_tasks_fingerprint(city: str, operator: str) -> str:
+    """组内共享任务历史的指纹：新增 / 删除 / 「已应用」标记变化都会改变它。
+
+    任务历史不写 `dataset_revisions`，长轮询只盯数据集指纹时，同组另一端的
+    删除/新任务/应用标记最长要等 `sync_loop` 的 1 分钟兜底轮询才同步
+    （用户报"B 端过一会才同步"）。这里并进长轮询指纹，秒级唤醒另一端的同步。
+    """
+    from sqlalchemy import func
+
+    from app.core.database import SessionLocal
+    from app.models.database import TaskResult
+    from app.services.task_manager import TaskManager
+
+    db = SessionLocal()
+    try:
+        count, newest, applied = (
+            db.query(
+                func.count(TaskResult.task_id),
+                func.max(TaskResult.created_at),
+                func.sum(func.coalesce(TaskResult.is_applied, 0)),
+            )
+            .filter(
+                TaskResult.task_type.in_(TaskManager.SHARED_TASK_TYPES),
+                TaskResult.city == city,
+                TaskResult.operator == operator,
+            )
+            .first()
+        )
+        return f"tasks:{int(count or 0)}:{newest or ''}:{int(applied or 0)}"
+    except Exception:  # noqa: BLE001
+        return "tasks:?"
+    finally:
+        db.close()
+
+
 def _group_fingerprint(city: str, operator: str) -> str:
     """组内数据集指纹：任何新增 / 删除 / 修订号推进都会改变它。
 
     只查 dataset_revisions 与内存索引的可见条目（不打包、不清残余），可以高频调用。
+    末尾附组内共享任务历史的指纹（任务的新增/删除/应用标记同样要即时唤醒同组桌面端）。
     """
     from app.services import dataset_revision_service as revs
     from app.services.data_group import index_entry_visible
@@ -671,6 +707,7 @@ def _group_fingerprint(city: str, operator: str) -> str:
     for row in revs.list_group(city, operator):
         if row.get("deleted") and row.get("data_id") not in entries:
             parts.append(f"{row.get('data_id')}@del:{row.get('rev') or 0}")
+    parts.append(_shared_tasks_fingerprint(city, operator))
     return hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()
 
 

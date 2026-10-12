@@ -47,6 +47,45 @@ def _city_presets_available(monkeypatch):
 
 # ---------------------------------------------------------------- 服务端方法
 
+def test_data_changes_fingerprint_includes_shared_tasks(cloud_env, temp_db):  # noqa: F811
+    """长轮询指纹必须包含组内共享任务历史（新增/删除/应用标记）。
+
+    否则同组另一端的删除/新任务/应用标记只能等 1 分钟兜底轮询才同步
+    （用户报"B 端过一会才同步"）。
+    """
+    license_file = _issue(cloud_env)
+    _bind_group(cloud_env, license_file, city="广州", operator="移动")
+    client = cloud_env.client
+    cred = {"license_file": license_file, "machine_code": MACHINE}
+
+    baseline = client.post(
+        "/api/v1/desktop-cloud/data/changes", json={**cred, "wait_seconds": 0}
+    ).json()["data"]["fingerprint"]
+
+    # 1) 新增共享任务 → 指纹变化（同组桌面端的长轮询立刻返回）
+    up = client.post(
+        "/api/v1/desktop-cloud/data/tasks/t-wh-1",
+        json={**cred, "task": {"task_id": "t-wh-1", "task_type": "pci", "status": "completed",
+                               "created_at": "2026-10-12T21:38:00"},
+              "result": {"results": []}},
+    )
+    assert up.status_code == 200, up.text
+    after_create = client.post(
+        "/api/v1/desktop-cloud/data/changes",
+        json={**cred, "since": baseline, "wait_seconds": 0},
+    ).json()["data"]
+    assert after_create["changed"] is True and after_create["fingerprint"] != baseline
+
+    # 2) 删除同样算变化（B 端要能很快看到记录消失）
+    deleted = client.post("/api/v1/desktop-cloud/data/tasks/t-wh-1/delete", json=cred)
+    assert deleted.status_code == 200, deleted.text
+    after_delete = client.post(
+        "/api/v1/desktop-cloud/data/changes",
+        json={**cred, "since": after_create["fingerprint"], "wait_seconds": 0},
+    ).json()["data"]
+    assert after_delete["changed"] is True
+
+
 def test_upsert_and_list_are_group_scoped(temp_db):
     meta = task_manager.upsert_shared_task(
         {
@@ -647,6 +686,96 @@ def test_queue_shared_task_update_schedules_immediate_sync(monkeypatch, temp_db)
 
 
 # ---------------------------------------------------------------- 存量「已应用」回填
+
+def test_sync_tasks_does_not_remirror_pending_deleted_task(desktop_task_env, temp_db):
+    """本机刚删除的任务不能被本轮清单快照重建回本机（用户报"删掉又回来了"）。
+
+    删除意图下行到服务器之前，本轮开头取的清单里还带着它：旧逻辑按"清单里有、
+    本机没有"重建镜像行 → 用户看到删除的任务复活（要等删除上行后的下一轮才消失）。
+    这里同时覆盖两种残留：真的没有本机行（刚删）与上一轮被清单建回来的行。
+    """
+    sync = desktop_task_env
+    from app.services import desktop_cloud_client as cloud
+
+    def _item(task_id, name):
+        return {"task_id": task_id, "task_type": "pci", "task_name": name, "user_name": "bob",
+                "status": "completed", "is_applied": False, "cell_count": 3,
+                "created_at": "2026-10-12T21:38:00", "completed_at": None,
+                "city": "河源", "operator": "联通"}
+
+    monkeypatch_ = pytest.MonkeyPatch()
+    server = _patch_cloud(monkeypatch_, cloud, [
+        _item("t-doomed", "刚删除、本机无行"),
+        _item("t-residue", "待删但本机还残留行"),
+    ])
+
+    def _delete(tid):
+        server["deletes"].append(tid)
+        server["items"].pop(tid, None)  # 服务器真的删掉（下一轮清单里就没有了）
+        return {"deleted": True}
+
+    monkeypatch_.setattr(cloud, "delete_shared_task", _delete)
+    try:
+        # 两个任务都是"本机已删、删除意图待上行"
+        sync.queue_task_delete("t-doomed")
+        sync.queue_task_delete("t-residue")
+        # t-residue 还残留着上一轮（或旧版本）按清单重建出来的镜像行
+        db = temp_db()
+        try:
+            db.add(TaskResult(**_task_row(task_id="t-residue", origin="shared")))
+            db.commit()
+        finally:
+            db.close()
+
+        sync.sync_tasks("河源", "联通")
+
+        db = temp_db()
+        try:
+            left = {r.task_id for r in db.query(TaskResult).all()}
+        finally:
+            db.close()
+        assert "t-doomed" not in left      # 不能被清单重建回来
+        assert "t-residue" not in left     # 残留行要清掉
+        assert sorted(server["deletes"]) == ["t-doomed", "t-residue"]
+        assert sync.load_state()["task_deletes"] == []
+
+        # 下一轮：服务器清单里已无这两个任务，本机也保持没有
+        sync.sync_tasks("河源", "联通")
+        db = temp_db()
+        try:
+            left = {r.task_id for r in db.query(TaskResult).all()}
+        finally:
+            db.close()
+        assert left == set()
+    finally:
+        monkeypatch_.undo()
+
+
+def test_shared_task_mutations_notify_group(temp_db, monkeypatch):
+    """共享任务的新增/删除/应用标记要广播 tasks_changed（同组网页端历史列表即时刷新）。"""
+    import app.services.websocket_manager as ws
+
+    calls: list = []
+    monkeypatch.setattr(
+        ws.websocket_manager, "notify_tasks_changed",
+        lambda city, operator, task_id="": calls.append((city, operator, task_id)),
+    )
+
+    task_manager.upsert_shared_task(
+        {"task_id": "t-notify", "task_type": "pci", "status": "completed",
+         "created_at": "2026-10-12T21:00:00"},
+        city="河源", operator="联通",
+    )
+    assert calls == [("河源", "联通", "t-notify")]
+
+    calls.clear()
+    assert task_manager.mark_task_applied("t-notify") is True
+    assert calls == [("河源", "联通", "t-notify")]
+
+    calls.clear()
+    assert task_manager.delete_shared_task("t-notify", "河源", "联通") is True
+    assert calls == [("河源", "联通", "t-notify")]
+
 
 def test_backfill_applied_flags_marks_matching_results(temp_db, monkeypatch):
     """存量回填：结果与当前工参一致 → 置 1；不一致 / 无可比值的类型 → 不动。"""

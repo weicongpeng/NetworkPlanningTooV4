@@ -3174,9 +3174,12 @@ class TaskManager:
                     logger.warning(f"[TaskManager] 标记应用失败: 任务 {task_id[:8]}... 不存在")
                     return False
                 existing.is_applied = 1
+                row_city, row_operator = existing.city, existing.operator
                 db.commit()
                 # 桌面端共享任务：应用标记也要让同组看到（由同步任务上行）
                 self._queue_shared_task_update(task_id, existing.task_type)
+                # 网页端同组用户的历史列表即时刷新（桌面端另有长轮询指纹兜底）
+                self._notify_tasks_changed(row_city, row_operator, task_id)
                 # 清除该任务的验证缓存，保证下次读取反映最新状态
                 TaskManager._history_verify_cache.pop(task_id, None)
                 logger.info(f"[TaskManager] 任务已标记为已应用: {task_id[:8]}...")
@@ -3186,6 +3189,16 @@ class TaskManager:
         except Exception as e:
             logger.error(f"[TaskManager] 标记任务已应用失败: {e}")
             return False
+
+    @staticmethod
+    def _notify_tasks_changed(city: Optional[str], operator: Optional[str], task_id: str = "") -> None:
+        """共享任务历史变化（新增/删除/应用标记）→ 通知同组网页端重载历史列表。"""
+        try:
+            from app.services.websocket_manager import websocket_manager
+
+            websocket_manager.notify_tasks_changed(city or "", operator or "", task_id)
+        except Exception:  # noqa: BLE001
+            pass
 
     # 🔥 优化：_load_current_sector_values 的缓存
     _sector_values_cache: Dict[str, Any] = {}
@@ -3357,6 +3370,8 @@ class TaskManager:
             row.operator = operator
             db.commit()
             db.refresh(row)
+            # 同组网页端历史列表即时刷新（新增任务 / 应用标记变化）
+            self._notify_tasks_changed(city, operator, task_id)
             return self._shared_task_meta(row)
         finally:
             db.close()
@@ -3383,6 +3398,8 @@ class TaskManager:
             db.delete(row)
             db.commit()
             TaskManager._history_verify_cache.pop(task_id, None)
+            # 同组网页端历史列表即时刷新
+            self._notify_tasks_changed(city, operator, task_id)
             return True
         finally:
             db.close()

@@ -577,6 +577,10 @@ def sync_tasks(city: str, operator: str) -> Dict[str, Any]:
     state = load_state()
     pushed = set(state.get("tasks_pushed") or [])
     pending_updates = set(state.get("task_updates") or [])
+    # 本机已删、删除意图尚未上行到服务器的任务：清单是本轮开头取的快照，
+    # 那时服务器可能还留着这些任务——绝不能据此把本机已删的行镜像回来
+    # （否则用户会看到"删掉的历史任务又回来了"，直到删除上行完成后的下一轮才消失）
+    pending_task_deletes = set(state.get("task_deletes") or [])
     # 待上行更新列表（含本次同步发现的「本机已应用但服务器还没有」的修复项）
     queued_updates: List[str] = list(state.get("task_updates") or [])
     remaining_updates: List[str] = []
@@ -590,6 +594,12 @@ def sync_tasks(city: str, operator: str) -> Dict[str, Any]:
         # 1) 服务器已删除 → 清掉本机镜像行；本机自建且已上行过的任务同样清理
         #    （否则网页端删掉的记录会在桌面端一直残留，且被 tasks_pushed 记账挡住不再上行）
         for row in list(local_rows):
+            if row.task_id in pending_task_deletes:
+                # 本机删除意图优先：本机不该再有这一行（含上一轮按旧清单重建出来的残留）
+                db.delete(row)
+                pushed.discard(row.task_id)
+                changed_ids.append(row.task_id)
+                continue
             if row.task_id in items:
                 continue
             if row.origin == "shared" or row.task_id in pushed:
@@ -602,6 +612,8 @@ def sync_tasks(city: str, operator: str) -> Dict[str, Any]:
 
         # 2) 新增/更新镜像行（结果留空，按需拉取），并双向同步"已应用"标记
         for task_id, item in items.items():
+            if task_id in pending_task_deletes:
+                continue  # 本机删除待上行：不重建镜像（见上方 pending_task_deletes 说明）
             row = local_by_id.get(task_id)
             server_applied = bool(item.get("is_applied"))
             if row is None:
