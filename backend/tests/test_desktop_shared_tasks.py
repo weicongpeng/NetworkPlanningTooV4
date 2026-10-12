@@ -13,8 +13,8 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from app.models.database import Base, TaskResult
-from app.services.task_manager import task_manager
+from app.models.database import Base, Sector, Site, TaskResult, Workbook
+from app.services.task_manager import TaskManager, task_manager
 
 from .test_desktop_license_cloud import _activate, _create, cloud_env  # noqa: F401
 
@@ -440,6 +440,116 @@ def test_list_task_history_applied_flag_for_mirror_rows(temp_db):
     by_id = {t["taskId"]: t for t in history["tasks"]}
     assert by_id["t-mirror-applied"]["isApplied"] is True
     assert by_id["t-mirror-plain"]["isApplied"] is False
+
+
+def test_list_shared_tasks_includes_result_size(temp_db):
+    """清单要带结果体积：桌面端据此决定能否预拉取（小结果才拉）。"""
+    task_manager.upsert_shared_task(
+        {"task_id": "t-size-1", "task_type": "pci", "task_name": "PCI", "user_name": "alice",
+         "status": "completed", "created_at": "2026-10-12T10:00:00",
+         "result": {"results": [{"siteId": "S1"}]}},
+        city="河源", operator="联通",
+    )
+    task_manager.upsert_shared_task(
+        {"task_id": "t-size-2", "task_type": "pci", "task_name": "无结果", "user_name": "alice",
+         "status": "completed", "created_at": "2026-10-12T09:00:00"},
+        city="河源", operator="联通",
+    )
+    sizes = {t["task_id"]: t["result_size"] for t in task_manager.list_shared_tasks("河源", "联通")}
+    assert sizes["t-size-1"] > 0
+    assert sizes["t-size-2"] == 0
+
+
+def test_sync_tasks_prepulls_small_shared_results(desktop_task_env, temp_db, monkeypatch):
+    """镜像任务的小结果要预拉取，让「已应用」从第一眼起就按当前工参动态判定。
+
+    不预拉取时镜像行只能沿用同组同步来的标记（别端按它自己的工参判定，工参变更后
+    也不会更新）；点「查看」把结果按需拉到本机后判定来源切换 → 状态跳变。
+    """
+    sync = desktop_task_env
+    from app.core.config import settings
+    from app.services import desktop_cloud_client as cloud
+    from app.services.data_service import data_service
+
+    monkeypatch.setattr(settings, "NPT_DESKTOP", True)
+    monkeypatch.setattr(sync, "is_shared", lambda: True)
+
+    # 本机全量工参：S1_32 的 PCI/TAC 与 t-small 的规划值一致
+    wb_id = "wb-prepull"
+    db = temp_db()
+    try:
+        db.add(Workbook(id=wb_id, user_id=1, city="河源", operator="联通", name="全量工参",
+                        file_type="full_params", status="completed",
+                        created_at="2026-10-12T00:00:00"))
+        db.flush()
+        site = Site(workbook_id=wb_id, user_id=1, city="河源", operator="联通",
+                    site_id="S1", name="站点S1", network_type="LTE")
+        db.add(site)
+        db.flush()
+        db.add(Sector(workbook_id=wb_id, user_id=1, site_id_fk=site.id,
+                      sector_id="32", pci=486, tac="33807"))
+        db.commit()
+    finally:
+        db.close()
+    monkeypatch.setattr(
+        TaskManager, "_resolve_full_params_id",
+        staticmethod(lambda city=None, operator=None: wb_id),
+    )
+    monkeypatch.setattr(data_service, "index", {wb_id: {"fileType": "full_params",
+                                                        "city": "河源", "operator": "联通"}})
+    TaskManager._sector_values_cache = {}
+    TaskManager._history_verify_cache.clear()
+
+    monkeypatch_ = pytest.MonkeyPatch()
+    server = _patch_cloud(monkeypatch_, cloud, [
+        {"task_id": "t-small", "task_type": "pci", "task_name": "小 PCI", "user_name": "bob",
+         "status": "completed", "is_applied": False, "cell_count": 1, "result_size": 1200,
+         "created_at": "2026-10-12T09:00:00", "completed_at": None,
+         "city": "河源", "operator": "联通"},
+        {"task_id": "t-big", "task_type": "pci", "task_name": "大 PCI", "user_name": "bob",
+         "status": "completed", "is_applied": False, "cell_count": 90000,
+         "result_size": 9 * 1024 * 1024,
+         "created_at": "2026-10-12T08:00:00", "completed_at": None,
+         "city": "河源", "operator": "联通"},
+        {"task_id": "t-check", "task_type": "tac", "task_name": "TAC 核查", "user_name": "bob",
+         "status": "completed", "is_applied": False, "cell_count": 18000,
+         "result_size": 6 * 1024 * 1024,
+         "created_at": "2026-10-12T07:00:00", "completed_at": None,
+         "city": "河源", "operator": "联通"},
+    ])
+    pulls: list = []
+
+    def _result(task_id):
+        pulls.append(task_id)
+        return {"result": {"results": [
+            {"siteId": "S1", "sectors": [{"sectorId": "32", "newPCI": 486, "tac": "33807"}]},
+        ]}}
+
+    monkeypatch_.setattr(cloud, "shared_task_result", _result)
+    try:
+        summary = sync.sync_tasks("河源", "联通")
+
+        assert pulls == ["t-small"]              # 只预拉取可判定类型里体积可控的结果
+        assert summary["results_pulled"] == 1
+        db = temp_db()
+        try:
+            rows = {r.task_id: r for r in db.query(TaskResult).all()}
+        finally:
+            db.close()
+        assert rows["t-small"].result_json is not None
+        assert rows["t-big"].result_json is None    # 体积过大仍按需拉取
+        assert rows["t-check"].result_json is None  # 不展示应用状态的类型不预拉取
+
+        # 结果落地后镜像行立即按当前工参判定：规划值与工参一致 → 已应用
+        # （若沿用同步标记则是"未应用"，正是"查看前后跳变"的来源）
+        history = task_manager.list_task_history(task_type="pci", page=1, page_size=10)
+        by_id = {t["taskId"]: t for t in history["tasks"]}
+        assert by_id["t-small"]["isApplied"] is True
+        assert by_id["t-big"]["isApplied"] is False
+    finally:
+        monkeypatch_.undo()
+        TaskManager._sector_values_cache = {}
+        TaskManager._history_verify_cache.clear()
 
 
 # ---------------------------------------------------------------- 应用标记落库 / 小数量

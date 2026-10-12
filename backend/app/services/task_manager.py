@@ -3225,6 +3225,7 @@ class TaskManager:
 
     def list_shared_tasks(self, city: str, operator: str) -> List[Dict[str, Any]]:
         """（地市+运营商）组内共享的任务历史元数据（倒序，最多 200 条）。"""
+        from sqlalchemy import func
         from sqlalchemy.orm import defer
 
         from app.core.database import SessionLocal
@@ -3232,8 +3233,10 @@ class TaskManager:
 
         db = SessionLocal()
         try:
+            # LENGTH(result_json) 由 SQLite 计算，不会把大结果列取回 Python；
+            # 桌面端据此决定是否预拉取结果做「已应用」动态比对（见 sync_tasks）
             rows = (
-                db.query(TaskResult)
+                db.query(TaskResult, func.length(TaskResult.result_json))
                 .options(defer(TaskResult.result_json), defer(TaskResult.config_json))
                 .filter(
                     TaskResult.task_type.in_(self.SHARED_TASK_TYPES),
@@ -3244,7 +3247,12 @@ class TaskManager:
                 .limit(200)
                 .all()
             )
-            return [self._shared_task_meta(r) for r in rows]
+            items = []
+            for row, result_size in rows:
+                meta = self._shared_task_meta(row)
+                meta["result_size"] = int(result_size) if result_size is not None else 0
+                items.append(meta)
+            return items
         finally:
             db.close()
 
@@ -3555,12 +3563,13 @@ class TaskManager:
                                 parsed_result = json.loads(result_json_str)
                             except Exception:
                                 parsed_result = None
-                        if parsed_result is not None:
+                        if parsed_result is not None and self._result_has_comparable_values(parsed_result):
                             # 「操作」列一律以当前全量工参的 PCI/TAC 列值为准，
                             # 不用同组同步来的标记覆盖比对结果
                             is_applied = self._verify_applied(parsed_result, current_sector_values)
                         else:
-                            # 本机没有结果（桌面端镜像任务尚未落地）→ 无法比对，只能沿用标记
+                            # 本机没有结果（桌面端镜像任务尚未落地），或结果里没有可比的
+                            # PCI/TAC 规划值 → 无法比对，只能沿用标记
                             is_applied = stored_applied
                         result_summary = self._extract_result_summary(parsed_result)
                         if result_summary is None and (r.cell_count or 0) > 0:
@@ -3635,11 +3644,16 @@ class TaskManager:
 
     @staticmethod
     def _full_params_fingerprint(db, workbook_id: Optional[str]) -> str:
-        """全量工参内容指纹（一次聚合查询）：工参 id + 小区数 + PCI/TAC 聚合值。
+        """全量工参内容指纹（一次聚合查询）：工参 id + 小区数 + PCI/TAC 加权聚合值。
 
         用途：历史任务「已应用」判定必须反映工参的**当前内容**，而不是只反映工参条目的 id。
         导入/同步一份新工参（可能沿用同一 id）、小区批量改 PCI/TAC 等操作都会改变这些
         聚合值，从而让验证缓存立即失效；只靠 id + 300s TTL 会在最长 5 分钟内给出错配结果。
+
+        ⚠ PCI/TAC 用小区主键加权（SUM(pci * id)）而不是裸 SUM(pci)：规划结果应用最常见的
+        形态就是 PCI 值在小区之间轮换/互换（480/481/482 → 482/480/481），裸 SUM 对这种
+        变化完全不变（总量守恒），会让缓存不失效、历史列表继续显示旧状态。
+        互换任意两个不同值的小区都会改变加权和（差 = (a-b)*(i-j) ≠ 0）。
         """
         if not workbook_id:
             return ""
@@ -3649,9 +3663,9 @@ class TaskManager:
             row = db.execute(
                 text(
                     "SELECT COUNT(*), "
-                    "COALESCE(SUM(COALESCE(pci, 0)), 0), "
+                    "COALESCE(SUM(COALESCE(pci, 0) * id), 0), "
                     "COALESCE(SUM(LENGTH(COALESCE(tac, ''))), 0), "
-                    "COALESCE(SUM(CAST(tac AS INTEGER)), 0) "
+                    "COALESCE(SUM(CAST(tac AS INTEGER) * id), 0) "
                     "FROM sectors WHERE workbook_id = :wb"
                 ),
                 {"wb": workbook_id},

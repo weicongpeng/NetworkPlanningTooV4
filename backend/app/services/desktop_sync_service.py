@@ -22,6 +22,16 @@ from app.core.config import settings
 MODE_SHARED = "shared"
 MODE_OFFLINE = "offline"
 
+# 镜像任务（本机无结果）的「已应用」状态只能沿用同组同步来的标记，而该标记是别端按
+# 它自己的工参判定的：结果按需落地（点「查看」）后本机改走「规划值 vs 当前全量工参」
+# 动态比对，就会看到"查看前后状态跳变"，且工参变更后标记也不会自己更新。
+# 这两类规划的结果体积都不大（与 TAC 核查的数 MB 不同），直接把结果预拉取到本机，
+# 让镜像行与本地任务走同一套动态判定。
+PREPULL_RESULT_TYPES = ("pci", "tac_planning")
+PREPULL_MAX_SINGLE_BYTES = 8 * 1024 * 1024   # 单条结果超过该体积（病态）仍按需拉取
+PREPULL_MAX_TOTAL_BYTES = 16 * 1024 * 1024   # 每轮同步预拉取总量上限，剩余下轮继续
+PREPULL_MAX_PER_SYNC = 30  # 每轮同步最多预拉取条数（首轮收敛，之后基本为 0）
+
 _sync_lock = threading.Lock()
 # 同步进行中标记（供前端展示"同步中"动画，读状态接口直接取）
 _sync_running = False
@@ -540,7 +550,9 @@ def sync_tasks(city: str, operator: str) -> Dict[str, Any]:
     """同组任务历史同步：拉元数据做镜像 / 推本机新任务 / 传播删除与更新。
 
     - 只同步规划类任务（`TaskManager.SHARED_TASK_TYPES`），apply_* 不共享
-    - 镜像行（origin=shared）只读：结果不预下载，查看/导出时按需拉取
+    - 镜像行（origin=shared）只读：大结果不预下载，查看/导出时按需拉取；
+      小结果（`PREPULL_RESULT_TYPES`，见常量说明）预拉取，避免「已应用」状态
+      在查看前后跳变、且能随工参变更重新比对
     - 本机任务的结果只在首次上行时发一次（`tasks_pushed` 记账）
     - 服务器删除（网页端删记录/应用后清理）→ 删除本机镜像；已上行过的本机任务同理
     - `is_applied` 双向同步：别处应用 → 本机显示已应用；本机刚应用未上行时保留本机值
@@ -634,6 +646,27 @@ def sync_tasks(city: str, operator: str) -> Dict[str, Any]:
                         queued_updates.append(task_id)
         db.commit()
 
+        # 2.5) 挑出需要预拉取结果的镜像行（小结果类型；见 PREPULL_RESULT_TYPES 说明）。
+        #      按清单顺序（新 → 旧）取，且限制本轮总字节数（下轮继续，直到收敛）；
+        #      体积未知或过大的仍按需拉取。实际拉取放在主会话关闭后（避免同连接写冲突）。
+        prepull_ids: List[str] = []
+        prepull_bytes = 0
+        for task_id, item in items.items():
+            if len(prepull_ids) >= PREPULL_MAX_PER_SYNC:
+                break
+            if str(item.get("task_type") or "") not in PREPULL_RESULT_TYPES:
+                continue
+            row = local_by_id.get(task_id)
+            if row is not None and row.result_json:
+                continue  # 本机已有结果（本机任务或已拉取的镜像）
+            size = int(item.get("result_size") or 0)
+            if size <= 0 or size > PREPULL_MAX_SINGLE_BYTES:
+                continue
+            if prepull_bytes + size > PREPULL_MAX_TOTAL_BYTES:
+                continue  # 本轮预算用尽，留给下一轮（继续找后面更小的条目）
+            prepull_ids.append(task_id)
+            prepull_bytes += size
+
         # 3) 本机新建的规划任务上行（含结果，只推一次）；以及待上行更新
         for task_id in queued_updates:
             row = db.query(TaskResult).filter(TaskResult.task_id == task_id).first()
@@ -686,6 +719,21 @@ def sync_tasks(city: str, operator: str) -> Dict[str, Any]:
                 summary["errors"].append(f"上传任务「{row.task_name or row.task_id[:8]}」失败：{exc}")
     finally:
         db.close()
+
+    # 2.6) 预拉取镜像任务的小结果（结果落地后本机即可按当前工参动态判定「已应用」，
+    #      与点「查看」的结果一致；拉取失败只记日志，不阻塞同步）
+    from app.services.task_manager import task_manager
+
+    prepulled = 0
+    for task_id in prepull_ids:
+        try:
+            if task_manager._fetch_shared_task_result(task_id) is not None:
+                prepulled += 1
+                changed_ids.append(task_id)
+        except Exception as exc:  # noqa: BLE001
+            summary["errors"].append(f"预拉取任务「{task_id[:8]}」结果失败：{exc}")
+    if prepulled:
+        summary["results_pulled"] = prepulled
 
     # 4) 待上行删除（幂等：服务器没有就当已删）
     remaining_deletes: List[str] = []

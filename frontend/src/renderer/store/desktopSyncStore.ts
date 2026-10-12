@@ -44,11 +44,16 @@ export const useDesktopSyncStore = create<DesktopSyncState>((set, get) => ({
           const moved =
             (r.pulled || 0) + (r.pushed || 0) + (r.deleted || 0) +
             (t.pulled || 0) + (t.pushed || 0) + (t.deleted || 0) + (t.updated || 0)
-          if (moved > 0) {
-            if (prev) useToastStore.getState().show(`数据已同步（${moved} 项）`)
-            // 同组数据落地 = 工参变了：走统一刷新（内部清小区列表缓存并广播 DATA_REFRESH_EVENT），
-            // 否则规划/核查页的「小区选择」仍停留在同步前取到的（可能是空）列表
-            triggerDataRefresh('full')
+          // 镜像任务结果预拉取（results_pulled）只影响历史列表的「已应用」判定，
+          // 工参没变：通知历史列表重载即可，不需要整表刷新/提示
+          const resultsPulled = t.results_pulled || 0
+          if (moved > 0 || resultsPulled > 0) {
+            if (prev && moved > 0) useToastStore.getState().show(`数据已同步（${moved} 项）`)
+            if (moved > 0) {
+              // 同组数据落地 = 工参变了：走统一刷新（内部清小区列表缓存并广播 DATA_REFRESH_EVENT），
+              // 否则规划/核查页的「小区选择」仍停留在同步前取到的（可能是空）列表
+              triggerDataRefresh('full')
+            }
             window.dispatchEvent(new CustomEvent(DESKTOP_SYNCED_EVENT, { detail: r }))
           }
         }

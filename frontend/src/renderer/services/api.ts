@@ -678,6 +678,8 @@ export interface DesktopSyncStatus {
       deleted?: number
       /** 元数据/已应用标记被更新的任务数 */
       updated?: number
+      /** 镜像任务结果预拉取条数（只影响历史列表的「已应用」判定） */
+      results_pulled?: number
       errors?: string[]
     }
   } | null
