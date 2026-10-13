@@ -324,6 +324,29 @@ def _make_exit_handler(window: Any) -> Callable[[], None]:
     return _exit_handler
 
 
+def _make_fullscreen_handler(window: Any) -> Callable[[bool], None]:
+    """构造全屏回调：把前端的「全屏 / 退出全屏」转成桌面主窗口的系统级全屏。
+
+    WebView2 里的 HTML Fullscreen API 只会让网页内容占满 WebView 自身（窗口不变，
+    标题栏仍在）；桌面端必须由壳层把窗口切成全屏才能真正布满整个屏幕。
+    pywebview 只提供 toggle_fullscreen()、没有状态查询，这里按本进程记录期望状态，
+    只在状态真的变化时切换；退出全屏后补一次 maximize()，回到启动时的最大化窗口
+    （pywebview 的退出分支会先把窗口置为 Normal + 进入全屏前的尺寸）。
+    """
+    state = {"fullscreen": False}
+
+    def _handler(fullscreen: bool) -> None:
+        fullscreen = bool(fullscreen)
+        if fullscreen == state["fullscreen"]:
+            return
+        window.toggle_fullscreen()
+        state["fullscreen"] = fullscreen
+        if not fullscreen:
+            window.maximize()
+
+    return _handler
+
+
 def _background_update_armed() -> bool:
     """本进程是否已转入后台更新（服务不可用时按未武装处理）。"""
     try:
@@ -391,6 +414,13 @@ def _run_window(port: int, data_root: Path) -> None:
         desktop_bridge.set_title_handler(window.set_title)
     except Exception as exc:  # noqa: BLE001
         _log.warning("注入窗口标题回调失败（标题将只显示应用名）：%s", exc)
+    # 注入全屏回调：地图页「全屏」让主窗口真全屏（覆盖整个屏幕、无标题栏）
+    try:
+        from app import desktop_bridge
+
+        desktop_bridge.set_fullscreen_handler(_make_fullscreen_handler(window))
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("注入窗口全屏回调失败（地图全屏将退化为应用内全屏）：%s", exc)
     # private_mode=False + storage_path：localStorage 持久化（否则每次启动掉登录）
     webview.start(private_mode=False, storage_path=str(data_root / "webview"))
 

@@ -653,6 +653,14 @@ export const desktopLoginApi = {
   setWindowTitle: async (title: string): Promise<ApiResponse<{ title: string }>> => {
     return apiClient.post('/desktop/window-title', { title }) as any
   },
+
+  /**
+   * 地图页「全屏」：让桌面主窗口进入系统级全屏（覆盖整个屏幕、无标题栏）。
+   * 网页端 / 非桌面壳（含旧版桌面端）返回 403/404，调用方回退浏览器 Fullscreen API。
+   */
+  setFullscreen: async (fullscreen: boolean): Promise<ApiResponse<{ fullscreen: boolean }>> => {
+    return apiClient.post('/desktop/fullscreen', { fullscreen }) as any
+  },
 }
 
 /** 桌面共享模式同步状态 */

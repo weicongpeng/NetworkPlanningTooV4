@@ -1182,3 +1182,26 @@ async def desktop_window_title(
     if not desktop_bridge.set_window_title(title):
         raise HTTPException(status_code=403, detail="当前运行环境不支持修改窗口标题（非桌面壳）")
     return {"success": True, "data": {"title": title}}
+
+
+class FullscreenRequest(BaseModel):
+    fullscreen: bool = Field(..., description="true=进入全屏，false=退出全屏")
+
+
+@router.post("/fullscreen")
+async def desktop_fullscreen(
+    payload: FullscreenRequest,
+    current_user: User = Depends(get_current_user),
+    _: None = Depends(_require_desktop),
+) -> Dict[str, Any]:
+    """地图页「全屏」：把桌面主窗口切成系统级全屏（覆盖整个屏幕、无标题栏）。
+
+    WebView2 里的 HTML Fullscreen API 只让网页内容占满 WebView 本身，窗口不变；
+    桌面端由壳层直接切换窗口全屏。非桌面壳返回 403（网页端继续走浏览器 API）。
+    """
+    from app import desktop_bridge
+
+    fullscreen = bool(payload.fullscreen)
+    if not desktop_bridge.set_window_fullscreen(fullscreen):
+        raise HTTPException(status_code=403, detail="当前运行环境不支持窗口全屏（非桌面壳）")
+    return {"success": True, "data": {"fullscreen": fullscreen}}

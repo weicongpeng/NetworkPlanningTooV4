@@ -172,6 +172,33 @@ def test_window_title_rejects_blank(desktop_local):
         desktop_bridge.set_title_handler(None)
 
 
+def test_fullscreen_forwarded_to_shell(desktop_local):
+    """地图「全屏」由桌面壳把主窗口切成系统级全屏（WebView2 的 HTML Fullscreen 占不满屏幕）。"""
+    from app import desktop_bridge
+
+    seen: list[bool] = []
+    desktop_bridge.set_fullscreen_handler(seen.append)
+    try:
+        enter = desktop_local.client.post("/api/v1/desktop/fullscreen", json={"fullscreen": True})
+        assert enter.status_code == 200, enter.text
+        assert enter.json()["data"]["fullscreen"] is True
+
+        leave = desktop_local.client.post("/api/v1/desktop/fullscreen", json={"fullscreen": False})
+        assert leave.status_code == 200, leave.text
+        assert seen == [True, False]
+    finally:
+        desktop_bridge.set_fullscreen_handler(None)
+
+
+def test_fullscreen_without_shell_returns_403(desktop_local):
+    """非桌面壳必须 403：前端据此回退浏览器 Fullscreen API。"""
+    from app import desktop_bridge
+
+    desktop_bridge.set_fullscreen_handler(None)
+    resp = desktop_local.client.post("/api/v1/desktop/fullscreen", json={"fullscreen": True})
+    assert resp.status_code == 403
+
+
 def test_activate_error_maps_status(desktop_local):
     def boom(code, hostname=None):
         raise desktop_local.cloud.CloudError(403, "该授权已被禁用，请联系管理员")
@@ -259,12 +286,14 @@ def test_status_without_license(desktop_local):
 
 def test_endpoints_404_outside_desktop(desktop_local):
     desktop_local.monkeypatch.setattr(desktop_local.settings, "NPT_DESKTOP", False)
-    for method, path in (
-        ("get", "/api/v1/desktop/cloud-status"),
-        ("post", "/api/v1/desktop/cloud-renew"),
-        ("get", "/api/v1/desktop/cloud-apply"),
+    for method, path, payload in (
+        ("get", "/api/v1/desktop/cloud-status", None),
+        ("post", "/api/v1/desktop/cloud-renew", None),
+        ("get", "/api/v1/desktop/cloud-apply", None),
+        ("post", "/api/v1/desktop/fullscreen", {"fullscreen": True}),
     ):
-        resp = getattr(desktop_local.client, method)(path)
+        call = getattr(desktop_local.client, method)
+        resp = call(path, json=payload) if payload is not None else call(path)
         assert resp.status_code == 404, (method, path, resp.status_code)
 
 

@@ -26,7 +26,8 @@ import { CesiumMap } from '../components/Map/cesium/CesiumMap'
 import { MapSettingsPanel } from '../components/Map/MapSettingsPanel'
 import type { LayerOption, FrequencyOption } from '../components/Map'
 import { CoordinateTransformer } from '../utils/coordinate'
-import { mapApi, layerApi } from '../services/api'
+import { mapApi, layerApi, desktopLoginApi } from '../services/api'
+import { useAuthStore } from '../store/authStore'
 import { useDataStore, DATA_REFRESH_EVENT, triggerDataRefresh } from '../store/dataStore'
 import { useMapStore } from '../store/mapStore'
 import type { LayerCategory } from '../store/mapStore'
@@ -424,22 +425,38 @@ export function MapPage() {
   const mapPageRef = useRef<HTMLDivElement>(null)
   // 是否真的进入了系统级全屏（Fullscreen API 成功）；桌面壳不支持时只做应用内全屏
   const fsApiActiveRef = useRef(false)
+  // 桌面端：窗口全屏必须由桌面壳切换（WebView2 里 HTML Fullscreen 只占满 WebView 自身，
+  // 窗口/标题栏不变），否则"全屏"后仍然布满不了整个电脑屏幕
+  const isDesktop = useAuthStore((s) => s.desktopMode)
 
   // 切换全屏：先切应用内状态（保证任何环境都有"地图占满屏幕"的效果），
   // 再尽力请求系统级全屏（浏览器里连浏览器外壳一起占满；失败/不支持也不影响）
   const toggleFullscreen = useCallback(() => {
     const next = !isFullscreen
     setIsFullscreen(next)
-    if (next) {
-      fsApiActiveRef.current = false
+    const requestBrowserFullscreen = () => {
       const req = document.documentElement.requestFullscreen?.()
       if (req && typeof req.then === 'function') {
         req.then(() => { fsApiActiveRef.current = true }).catch(() => { /* 桌面壳/权限不允许 */ })
       }
-    } else if (document.fullscreenElement) {
-      document.exitFullscreen?.()?.catch?.(() => { /* ignore */ })
     }
-  }, [isFullscreen])
+    if (next) {
+      fsApiActiveRef.current = false
+      if (isDesktop) {
+        // 桌面端：连窗口一起全屏；旧版桌面壳没有该端点（403/404）时退回浏览器 API
+        desktopLoginApi.setFullscreen(true).catch(requestBrowserFullscreen)
+      } else {
+        requestBrowserFullscreen()
+      }
+    } else {
+      if (isDesktop) {
+        desktopLoginApi.setFullscreen(false).catch(() => { /* 旧版桌面壳：无窗口全屏态需退出 */ })
+      }
+      if (document.fullscreenElement) {
+        document.exitFullscreen?.()?.catch?.(() => { /* ignore */ })
+      }
+    }
+  }, [isFullscreen, isDesktop])
 
   // 系统级全屏被外部退出（Esc / 系统手势）时同步应用内状态；
   // 只有确实进入过系统级全屏才收敛，避免桌面壳下刚点开就被打回
@@ -466,6 +483,19 @@ export function MapPage() {
     }
     return () => document.body.classList.remove('map-fullscreen-mode')
   }, [isFullscreen])
+
+  // 离开地图页（卸载）时兜底退出全屏：桌面端窗口全屏尤其必要——退出按钮只在地图页，
+  // 否则切走后整个应用停在无标题栏的全屏窗口里
+  useEffect(() => {
+    return () => {
+      if (useAuthStore.getState().desktopMode) {
+        desktopLoginApi.setFullscreen(false).catch(() => { /* 非桌面壳/旧版桌面端：忽略 */ })
+      }
+      if (document.fullscreenElement) {
+        document.exitFullscreen?.()?.catch?.(() => { /* ignore */ })
+      }
+    }
+  }, [])
 
   // 当语言变化时更新装饰图层名称
   useEffect(() => {
