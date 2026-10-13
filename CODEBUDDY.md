@@ -282,6 +282,7 @@ FastAPI (backend/app/)
 
 ### 后端编码（Windows GBK 兼容）
 - API 响应用 `UTF8JSONResponse`（`ensure_ascii=False`）；错误消息做 GBK 安全处理 `str(e).encode("gbk", "replace").decode("gbk")` 后再抛 `HTTPException`。
+- **控制台/print 编码加固**：`app/core/console_encoding.setup_console_encoding()` 替换 `builtins.print`（编码失败降级为 GBK 安全串、管道断开静默）并在 Windows 下放宽 stdout/stderr。网页端由 `main.py` 调用（`force_utf8=True`，既有行为）；**桌面端由 `desktop/launcher.py` 的 `main()` 调用（`force_utf8=False`，保留控制台原生 cp936）**。桌面端不走 `main.py`，2026-10-12 因地理化数据导入里带 emoji 的调试 print（`🔴`）打到 cp936 流抛 `'gbk' codec can't encode character '\U0001f534' in position 17`，异常冒到接口层把上传报成"上传失败"（错误信息还容易被误判成文件内容问题）。**不要在 print 里用 emoji 当标记**（写 utf-8 日志文件不受影响）。
 
 ### CPU 密集型操作
 - pandas/geopandas 用 `run_in_threadpool` 包裹；重任务放 `task_manager`，不要阻塞事件循环。
@@ -348,7 +349,7 @@ NPT_DESKTOP_SYNC_DEBOUNCE_SECONDS         # 本地改动上行防抖秒数，默
 - **地图不显示**：检查高德 Key（`NPT_AMAP_API_KEY`，config.py 有开发默认值）与网络。
 - **上传失败（开发）**：`uploadClient` 直连 `http://localhost:8000`，检查 `VITE_API_URL` 与后端是否已启动。
 - **GDAL 安装失败**：用预编译 wheel 或 conda 安装。
-- **后端编码错误**：确认 `PYTHONIOENCODING=utf-8`（main.py 已设置）。
+- **编码错误（如导入报 `'gbk' codec can't encode character '\U0001f534' ...`）**：`app/core/console_encoding.setup_console_encoding()` 已统一给 print 与 stdout/stderr 兜底（网页端 `main.py`、桌面端 `desktop/launcher.py` 各自在最早处调用）；若仍复现，多半是新加的 print/日志带了 emoji 等 GBK 外字符（改用纯文本标记），或该执行路径没经过两个入口之一。
 - **前端构建后线上没变化**：确认执行了 `npm run build:vite` 并重启 `npt-backend`（静态文件由后端托管）。
 - **桌面端登录一直 pending**：单机模式需管理员在网页端「桌面授权」页批准（`NPT_DESKTOP_ACTIVATION_MODE=approve`），批准后前端 `auth-poll` 轮询会自动进入。
 - **桌面端被踢下线**：共享模式为单设备登录，同账号在别处登录会使本机 `session-check` 失败并登出；`DesktopLicense.idle_logout_days`（默认 2 天）覆盖本机会话空闲超时。

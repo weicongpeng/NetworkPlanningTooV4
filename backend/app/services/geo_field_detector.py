@@ -144,30 +144,30 @@ class GeoFieldDetector:
         detected = {}
 
         # 🔴 早期调试：打印原始列名
-        print(f"[GeoFieldDetector] 🔴🔴🔴 原始列名 (df.columns): {list(df.columns)}")
-        print(f"[GeoFieldDetector] 🔴🔴🔴 列数量: {len(df.columns)}")
+        print(f"[GeoFieldDetector] 原始列名 (df.columns): {list(df.columns)}")
+        print(f"[GeoFieldDetector] 列数量: {len(df.columns)}")
 
         # 检查是否有 POLYGON 列（原始名称，不区分大小写）
         has_polygon_col = any(str(col).strip().upper() == 'POLYGON' for col in df.columns)
-        print(f"[GeoFieldDetector] 🔴🔴🔴 是否有 POLYGON 列 (不区分大小写): {has_polygon_col}")
+        print(f"[GeoFieldDetector] 是否有 POLYGON 列 (不区分大小写): {has_polygon_col}")
 
         # 如果有 POLYGON 列，打印它的详细信息
         for col in df.columns:
             if str(col).strip().upper() == 'POLYGON':
-                print(f"[GeoFieldDetector] 🔴🔴🔴 找到 POLYGON 列！原始名称: '{col}', 类型: {type(col)}")
+                print(f"[GeoFieldDetector] 找到 POLYGON 列！原始名称: '{col}', 类型: {type(col)}")
 
         columns = [str(col).strip() for col in df.columns]
 
-        print(f"[GeoFieldDetector] 🔍 检测列名: {columns}")
-        print(f"[GeoFieldDetector] 🔍 looking for polygon in patterns: {self.FIELD_PATTERNS.get('polygon', [])}")
+        print(f"[GeoFieldDetector] 检测列名: {columns}")
+        print(f"[GeoFieldDetector] looking for polygon in patterns: {self.FIELD_PATTERNS.get('polygon', [])}")
 
         # 对每个字段类型进行匹配
-        print(f"[GeoFieldDetector] 🔍 字段类型列表: {list(self.FIELD_PATTERNS.keys())}")
-        print(f"[GeoFieldDetector] 🔍 准备开始循环检测...")
+        print(f"[GeoFieldDetector] 字段类型列表: {list(self.FIELD_PATTERNS.keys())}")
+        print(f"[GeoFieldDetector] 准备开始循环检测...")
 
         try:
             for idx, (field_name, patterns) in enumerate(self.FIELD_PATTERNS.items()):
-                print(f"[GeoFieldDetector] 🔍 [{idx}] 开始检测字段类型: {field_name}")
+                print(f"[GeoFieldDetector] [{idx}] 开始检测字段类型: {field_name}")
                 found_match = False
 
                 # 阶段1：精确匹配优先（列名 == pattern，忽略大小写）
@@ -179,7 +179,7 @@ class GeoFieldDetector:
                         if col_lower == p.lower():
                             detected[field_name] = col
                             found_match = True
-                            print(f"[GeoFieldDetector] ✅ [{idx}] {field_name} = '{col}' (精确匹配)")
+                            print(f"[GeoFieldDetector] [OK] [{idx}] {field_name} = '{col}' (精确匹配)")
                             break
                     if found_match:
                         break
@@ -193,7 +193,7 @@ class GeoFieldDetector:
                             if match_result:
                                 detected[field_name] = col
                                 found_match = True
-                                print(f"[GeoFieldDetector] ✅ [{idx}] {field_name} = '{col}'")
+                                print(f"[GeoFieldDetector] [OK] [{idx}] {field_name} = '{col}'")
                                 break
                         if found_match:
                             break
@@ -202,26 +202,26 @@ class GeoFieldDetector:
                 if not found_match:
                     detected[field_name] = None
                     if field_name in ["polygon", "name", "longitude", "latitude"]:
-                        print(f"[GeoFieldDetector] ⚠️ [{idx}] {field_name} 未找到匹配")
+                        print(f"[GeoFieldDetector] [WARN] [{idx}] {field_name} 未找到匹配")
         except Exception as e:
-            print(f"[GeoFieldDetector] ❌ 字段检测过程中出错: {e}")
+            print(f"[GeoFieldDetector] [ERR] 字段检测过程中出错: {e}")
             import traceback
             traceback.print_exc()
 
-        print(f"[GeoFieldDetector] 🔍 ========== 字段检测完成 ==========")
-        print(f"[GeoFieldDetector] 🔍 polygon 检测结果: {detected.get('polygon')}")
-        print(f"[GeoFieldDetector] 🔍 检测结果: {detected}")
+        print(f"[GeoFieldDetector] ========== 字段检测完成 ==========")
+        print(f"[GeoFieldDetector] polygon 检测结果: {detected.get('polygon')}")
+        print(f"[GeoFieldDetector] 检测结果: {detected}")
 
         # 确定几何类型优先级：polygon > sector > point
         if detected.get("polygon"):
             detected["geometry_type"] = "polygon"
-            print(f"[GeoFieldDetector] ✅ 几何类型: POLYGON")
+            print(f"[GeoFieldDetector] [OK] 几何类型: POLYGON")
         elif detected.get("azimuth"):
             detected["geometry_type"] = "sector"
-            print(f"[GeoFieldDetector] ✅ 几何类型: SECTOR")
+            print(f"[GeoFieldDetector] [OK] 几何类型: SECTOR")
         else:
             detected["geometry_type"] = "point"
-            print(f"[GeoFieldDetector] ⚠️ 几何类型: POINT (默认)")
+            print(f"[GeoFieldDetector] [WARN] 几何类型: POINT (默认)")
 
         return detected
 

@@ -340,6 +340,8 @@ except Exception as e:
     raise HTTPException(status_code=400, detail=safe_detail)
 ```
 
+- **控制台/print 编码加固**（`app/core/console_encoding.setup_console_encoding()`）：替换 `builtins.print`（编码失败降级为 GBK 安全串、管道断开静默）+ Windows 下放宽 stdout/stderr。**网页端服务端由 `main.py` 调用（强制 utf-8，既有行为）**；**桌面端必须由 `desktop/launcher.py` 的 `main()` 调用（`force_utf8=False`，保留控制台原生 cp936）**——桌面端不走 `main.py`，2026-10-12 就因地理化数据导入里带 emoji 的调试 print（`🔴`）打到 cp936 流抛 `'gbk' codec can't encode character` 而把整个上传报成"上传失败"。**业务代码里不要用 emoji 做 print/日志标记**（日志写 utf-8 文件不受影响，但 print 到控制台会翻车）。
+
 ### CPU 密集型操作
 
 - pandas/geopandas 用 `run_in_threadpool` 包裹；重任务放 `task_manager`，不要阻塞事件循环
@@ -423,4 +425,4 @@ NPT_DESKTOP_SYNC_DEBOUNCE_SECONDS         # 本地改动上行防抖秒数，默
 - **桌面打包缺 GDAL**：确认 `desktop/hooks/hook-pyogrio.py` 生效且产物含 `gdal*.dll`/`proj*.dll`/`proj.db`（CI 有该校验步骤）
 - **桌面端 OTA 安装卡住 / 关不掉程序**：升级脚本在 `%APPDATA%\NetworkPlanningTool\updates\`，安装日志 `npt_setup.log`、运行日志 `logs/desktop.log`（关注「注入桌面桥接退出回调失败」「强制结束进程」）；脚本 60 秒等不到退出会 `taskkill`，应用侧 20 秒兜底 `os._exit`（后台更新模式下关窗不武装、等下载等待结束才武装，避免下载被杀在半路）；点「重启并安装」后版本没变时先看 `updates/npt_ota_result.txt`（`setup_rc` 非 0 = 安装器未成功，实际错误见同目录 `npt_setup.log`；`install_dir` 为注册表记录的实际安装目录、`restarted` 为实际拉起路径，配合 `updates/installed_version.json` 可判断"装到哪儿、装了什么版本"）——脚本先按当前运行目录 `/DIR` 安装、失败退回默认目录重试，重启优先从注册表 `InstallLocation` 拉起；若安装包自带控制台窗口，说明构建时 `NPT_CONSOLE` 不是 0（tag 发行由 CI 用 0 重新打包）
 - **GDAL 安装失败**：用预编译 wheel 或 conda 安装
-- **后端编码错误**：确认 `PYTHONIOENCODING=utf-8`（main.py 已设置）
+- **编码错误（如导入报 `'gbk' codec can't encode character '\U0001f534' ...`）**：`app/core/console_encoding.setup_console_encoding()` 已统一给 print 与 stdout/stderr 兜底（网页端 `main.py`、桌面端 `desktop/launcher.py` 各自在最早处调用）；若仍复现，多半是新加的 print/日志带了 emoji 等 GBK 外字符（改用纯文本标记），或该执行路径没经过两个入口之一

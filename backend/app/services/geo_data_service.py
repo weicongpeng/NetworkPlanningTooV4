@@ -50,16 +50,17 @@ class GeoDataService:
         if df.empty:
             raise ValueError(f"文件「{filename}」为空或格式不正确")
 
-        # 🔴 早期调试：打印 DataFrame 信息
-        print(f"[GeoDataService] 🔴🔴🔴 ===== DataFrame 信息 =====")
-        print(f"[GeoDataService] 🔴🔴🔴 文件名: {filename}")
-        print(f"[GeoDataService] 🔴🔴🔴 行数: {len(df)}, 列数: {len(df.columns)}")
-        print(f"[GeoDataService] 🔴🔴🔴 原始列名: {list(df.columns)}")
+        # 早期调试：打印 DataFrame 信息（注意：不要带 emoji —— Windows 下
+        # print 到 GBK 流会抛 UnicodeEncodeError；参见 app/core/console_encoding.py）
+        print(f"[GeoDataService] ===== DataFrame 信息 =====")
+        print(f"[GeoDataService] 文件名: {filename}")
+        print(f"[GeoDataService] 行数: {len(df)}, 列数: {len(df.columns)}")
+        print(f"[GeoDataService] 原始列名: {list(df.columns)}")
         print(
-            f"[GeoDataService] 🔴🔴🔴 列类型: {[df[col].dtype for col in df.columns]}"
+            f"[GeoDataService] 列类型: {[df[col].dtype for col in df.columns]}"
         )
-        print(f"[GeoDataService] 🔴🔴🔴 前3行数据:\n{df.head(3).to_string()}")
-        print(f"[GeoDataService] 🔴🔴🔴 ==========================")
+        print(f"[GeoDataService] 前3行数据:\n{df.head(3).to_string()}")
+        print(f"[GeoDataService] ==========================")
 
         # 2. 字段检测
         fields = self.detector.detect_fields(df)

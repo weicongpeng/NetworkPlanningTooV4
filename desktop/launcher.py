@@ -462,9 +462,16 @@ def main(argv: Optional[list] = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    # 编码加固必须早于任何 print/日志：桌面端不走 backend/main.py，Windows 下业务
+    # 代码里的 print（如地理化数据导入的调试输出带 emoji）写到 cp936 控制台/重定向流
+    # 会抛 UnicodeEncodeError，顺着业务逻辑冒成"上传失败"（2026-10-12 实测）
+    _ensure_backend_on_path()
+    from app.core.console_encoding import setup_console_encoding
+
+    setup_console_encoding(force_utf8=False)
+
     data_root = _bootstrap_environment()
     _setup_logging(data_root)
-    _ensure_backend_on_path()
     _log.info(
         "桌面启动器启动，版本: %s，数据根: %s",
         os.environ.get("NPT_DESKTOP_VERSION") or "unknown",
