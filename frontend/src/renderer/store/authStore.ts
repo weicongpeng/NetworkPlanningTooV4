@@ -62,6 +62,17 @@ function clearUserDataCaches() {
       useDataStore.setState({ items: [], total: 0, currentPage: 1, error: null })
     )
     .catch(() => { /* 非关键 */ })
+  // 图层编辑真源（工作集/撤销栈/剪贴板/编辑态）是用户私有数据：切账号必须清空，
+  // 否则新账号进地图页会被上一账号"打开过"的编辑会话渲染出未勾选的图层，
+  // 也可能把上一账号未保存的改动当成自己的继续编辑/保存
+  import('./layerEditStore')
+    .then(({ useLayerEditStore }) => useLayerEditStore.getState().resetForUserSwitch())
+    .catch(() => { /* 非关键 */ })
+  // 图层 GeoJSON / 工参 / 地理化数据 LRU 缓存同样按账号隔离（同组内容一致时看不出，
+  // 跨组会读到上一账号的图层数据），登出/登录时一并丢弃
+  import('./mapDataCacheStore')
+    .then(({ useMapDataCacheStore }) => useMapDataCacheStore.getState().clearAll())
+    .catch(() => { /* 非关键 */ })
 }
 
 export const useAuthStore = create<AuthState>()(

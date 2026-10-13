@@ -882,6 +882,29 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
     mapSettings.thematicSettingsMap,
   ])
 
+  /**
+   * 基站图层（LTE/NR）显隐跟随外部勾选状态（首屏设置恢复 / 切换账号）。
+   *
+   * 3D 的显隐只存在 visibilityRef 里、平时由命令式 setLayerVisibility 更新；不监听这个
+   * prop 就会停在**挂载那一刻**的值（往往是上一账号的 mapSettings 或默认值），
+   * 表现为"控制面板里没勾选的基站图层，3D 地图上还画着"。2D 侧 OnlineMap 有等价的同步 effect。
+   */
+  useEffect(() => {
+    const next: Record<LayerKey, boolean> = {
+      lte: props.initialLayerVisibility?.lte ?? false,
+      nr: props.initialLayerVisibility?.nr ?? false,
+    }
+    let changed = false
+    for (const key of Object.keys(next) as LayerKey[]) {
+      if (visibilityRef.current[key] !== next[key]) {
+        visibilityRef.current[key] = next[key]
+        changed = true
+      }
+    }
+    if (changed && ready) syncAll()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ready, props.initialLayerVisibility?.lte, props.initialLayerVisibility?.nr])
+
   // 图层文件 / 地理化 / 装饰配置变化 → 重新同步图层
   useEffect(() => {
     if (!ready) return

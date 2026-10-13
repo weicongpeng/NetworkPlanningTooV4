@@ -146,6 +146,13 @@ interface LayerEditState {
   setInspectFeature: (f: InspectFeature | null) => void
   copyToClipboard: (items: CopiedFeature[]) => void
   clearClipboard: () => void
+  /**
+   * 切账号 / 登出时调用：清空用户私有的编辑态（工作集=上一账号未保存的改动、撤销栈、
+   * 剪贴板、编辑与绘制工具状态）。不清会让下一个账号看到上一账号"打开过"的图层
+   * 被编辑会话渲染出来（编辑会话渲染不受图层勾选控制），甚至把别人的未保存改动当成
+   * 自己的保存下去。设置项（snapEnabled 等工具栏偏好）不属于用户数据，保留。
+   */
+  resetForUserSwitch: () => void
   beginEdit: (
     layerId: string,
     dataId: string,
@@ -312,6 +319,17 @@ export const useLayerEditStore = create<LayerEditState>((set, get) => ({
 
   copyToClipboard: (items) => set({ clipboard: items }),
   clearClipboard: () => set({ clipboard: [] }),
+
+  resetForUserSwitch: () =>
+    set({
+      editableLayerId: null,
+      drawTool: 'none',
+      selectMode: false,
+      nodeMergeMode: false,
+      inspectFeature: null,
+      workspaces: {},
+      clipboard: [],
+    }),
 
   setEditableLayerId: (id) =>
     set((s) => ({
