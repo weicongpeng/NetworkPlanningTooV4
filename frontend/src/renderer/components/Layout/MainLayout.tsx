@@ -51,11 +51,11 @@ function appIconPosKey(): string {
   return 'app-icon-pos-anonymous'
 }
 
-/** 默认位置：吸附右侧中部 */
+/** 默认位置：吸附地图右下角 */
 function defaultAppIconPos(): { x: number; y: number } {
   return {
     x: Math.max(8, window.innerWidth - APP_ICON_SIZE - 12),
-    y: Math.max(8, window.innerHeight / 2 - APP_ICON_SIZE / 2),
+    y: Math.max(8, window.innerHeight - APP_ICON_SIZE - 12),
   }
 }
 
@@ -266,6 +266,15 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
     y: Math.min(Math.max(8, y), window.innerHeight - APP_ICON_SIZE - 8),
   })
 
+  /** 吸附到最近的左/右边缘（拖拽松手与窗口缩放共用） */
+  const snapAppIconToEdge = (p: { x: number; y: number }) => {
+    const mid = window.innerWidth / 2
+    return clampAppIconPos(
+      p.x + APP_ICON_SIZE / 2 < mid ? 12 : window.innerWidth - APP_ICON_SIZE - 12,
+      p.y,
+    )
+  }
+
   const onAppIconPointerDown = (e: React.PointerEvent<HTMLButtonElement>) => {
     e.preventDefault()
     ;(e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId)
@@ -296,21 +305,27 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
       return
     }
     setAppIconPos((p) => {
-      const mid = window.innerWidth / 2
-      const next = clampAppIconPos(
-        p.x + APP_ICON_SIZE / 2 < mid ? 12 : window.innerWidth - APP_ICON_SIZE - 12,
-        p.y,
-      )
+      const next = snapAppIconToEdge(p)
       try { localStorage.setItem(appIconPosKey(), JSON.stringify(next)) } catch { /* ignore */ }
       return next
     })
   }
 
-  // 窗口尺寸变化时把图标夹回可视范围
+  // 窗口尺寸变化时把图标夹回可视范围并重新吸附到最近的左/右边缘（始终贴在地图边缘上）
   useEffect(() => {
-    const onResize = () => setAppIconPos((p) => clampAppIconPos(p.x, p.y))
+    let timer: ReturnType<typeof setTimeout> | null = null
+    const onResize = () => {
+      if (timer) clearTimeout(timer)
+      timer = setTimeout(() => {
+        timer = null
+        setAppIconPos((p) => snapAppIconToEdge(clampAppIconPos(p.x, p.y)))
+      }, 120)
+    }
     window.addEventListener('resize', onResize)
-    return () => window.removeEventListener('resize', onResize)
+    return () => {
+      if (timer) clearTimeout(timer)
+      window.removeEventListener('resize', onResize)
+    }
   }, [])
 
   const handleLogout = async () => {

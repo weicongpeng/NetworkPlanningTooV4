@@ -11,11 +11,19 @@
  */
 import { useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo, type ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
-import { Loader2, Search, X, MapPin, AlertTriangle, Database, Trash2, MousePointer2, Circle as CircleIcon, Pentagon, Hand, Map as MapIcon, Satellite, Move, Shrink, FilePlus2, Save, Download, Hexagon, Spline, Palette, PenLine, Undo2, BoxSelect, ClipboardPaste, Magnet, Combine, Filter, ChevronRight, ChevronsRight } from 'lucide-react'
+import { Loader2, Search, X, MapPin, AlertTriangle, Database, Trash2, MousePointer2, Circle as CircleIcon, Pentagon, Hand, Map as MapIcon, Satellite, Globe, Square, Check, Settings, Move, Shrink, FilePlus2, Save, Download, Hexagon, Spline, Palette, PenLine, Undo2, BoxSelect, ClipboardPaste, Magnet, Combine, Filter, ChevronRight, ChevronsRight } from 'lucide-react'
 import { OnlineMap, OnlineMapRef, CustomLayerOption } from '../components/Map/OnlineMap'
+import {
+  MAP_SOURCE_OPTIONS,
+  layerKindOf,
+  isCesiumSource,
+  type MapSource,
+} from '../config/mapSources'
 import { MapSearchDialog } from '../components/Map/MapSearchDialog'
 import { LayerControl, SectorLayerOption, LayerFileOption, DecorationLayerOption } from '../components/Map/LayerControl'
 import { OfflineMap, createDefaultLayers } from '../components/Map'
+import { CesiumMap } from '../components/Map/cesium/CesiumMap'
+import { MapSettingsPanel } from '../components/Map/MapSettingsPanel'
 import type { LayerOption, FrequencyOption } from '../components/Map'
 import { CoordinateTransformer } from '../utils/coordinate'
 import { mapApi, layerApi } from '../services/api'
@@ -282,7 +290,7 @@ export function MapPage() {
     setSectorLabelVisibility: storeSetSectorLabelVisibility,
     setPointFileLabelVisibility: storeSetPointFileLabelVisibility,
     setLayerFileLabelVisibility: storeSetLayerFileLabelVisibility,
-    setMapType: storeSetMapType,
+    setMapSource: storeSetMapSource,
     setLabelSettings: storeSetLabelSettings,
     setColorSettings: storeSetColorSettings,
     setThematicSettings: storeSetThematicSettings,
@@ -290,7 +298,6 @@ export function MapPage() {
     setThematicTemplates: storeSetThematicTemplates,
     setHeatmapTemplates: storeSetHeatmapTemplates,
     setFrequencyCustomColors: storeSetFrequencyCustomColors,
-    setBaseMapVisible: storeSetBaseMapVisible,
     setDecorationLabelVisible: storeSetDecorationLabelVisible,
     setLayerOrder: storeSetLayerOrder,
     setLayerSelectable: storeSetLayerSelectable,
@@ -302,11 +309,10 @@ export function MapPage() {
     return 'online' // 默认在线地图
   })
 
-  // 地图类型（平面/卫星）- 从持久化 store 初始化
-  const [mapType, setMapType] = useState<'roadmap' | 'satellite'>(() => mapSettings.mapType)
-
-  // 在线地图可见性 - 从持久化 store 初始化
-  const [onlineMapVisible, setOnlineMapVisible] = useState(() => mapSettings.baseMapVisible)
+  // 地图源（高德/天地图矢量·卫星、3D、空地图）- 唯一真源是持久化的 store
+  const mapSource = mapSettings.mapSource
+  // 图层控制面板仍沿用 roadmap/satellite 二态（其底图切换行当前为禁用状态，见 LayerControl）
+  const mapType: 'roadmap' | 'satellite' = layerKindOf(mapSource) === 'satellite' ? 'satellite' : 'roadmap'
 
   // 数据存储 - 获取工参文件名
   const { items } = useDataStore()
@@ -811,11 +817,18 @@ export function MapPage() {
   const [showSelectionMenu, setShowSelectionMenu] = useState(false)
   const selectionMenuRef = useRef<HTMLDivElement>(null)
 
+  // 地图源下拉（工具栏「地图切换」）
+  const [mapSourceMenuOpen, setMapSourceMenuOpen] = useState(false)
+  const mapSourceMenuRef = useRef<HTMLDivElement>(null)
+
   // 点击外部收起下拉菜单
   useEffect(() => {
     const handleClickOutside = (e: MouseEvent) => {
       if (selectionMenuRef.current && !selectionMenuRef.current.contains(e.target as Node)) {
         setShowSelectionMenu(false)
+      }
+      if (mapSourceMenuRef.current && !mapSourceMenuRef.current.contains(e.target as Node)) {
+        setMapSourceMenuOpen(false)
       }
     }
     document.addEventListener('mousedown', handleClickOutside)
@@ -963,7 +976,12 @@ export function MapPage() {
 
   // ===== 工具栏个性化：右键菜单设置标签显隐、拖动调整按钮顺序（按用户持久化） =====
   const [toolbarPrefs, setToolbarPrefs] = useState<ToolbarPrefs>(loadToolbarPrefs)
-  const [toolbarMenu, setToolbarMenu] = useState<{ x: number; y: number } | null>(null)
+  // 右键弹出的「设置」框位置（相对地图容器）；null 表示关闭
+  const [settingsMenu, setSettingsMenu] = useState<{ x: number; y: number } | null>(null)
+  // 地图内容区域（设置框据此定位 / 边界钳制）
+  const mapAreaRef = useRef<HTMLDivElement>(null)
+  // 工具栏最右侧「设置」按钮（设置框的锚点）
+  const settingsBtnRef = useRef<HTMLButtonElement>(null)
   const toolbarDragIdRef = useRef<string | null>(null)
 
   // ===== 工具栏收纳：标签全展开时放不下的按钮收进「更多」面板（最右端"》"按钮触发） =====
@@ -1049,14 +1067,6 @@ export function MapPage() {
       localStorage.setItem(toolbarPrefsKey(), JSON.stringify(toolbarPrefs))
     } catch { /* ignore */ }
   }, [toolbarPrefs])
-
-  // 右键菜单：点击其他处收起
-  useEffect(() => {
-    if (!toolbarMenu) return
-    const close = () => setToolbarMenu(null)
-    document.addEventListener('mousedown', close)
-    return () => document.removeEventListener('mousedown', close)
-  }, [toolbarMenu])
 
   // 拖拽排序：把拖动按钮移动到目标按钮所在位置
   const handleToolbarDrop = useCallback((targetId: string) => {
@@ -2081,31 +2091,14 @@ export function MapPage() {
   }, [storeSetLayerVisibility])
 
   /**
-   * 处理地图类型切换
+   * 切换地图源（高德/天地图矢量·卫星、3D、空地图）。
+   * 唯一真源是 store 的 mapSettings.mapSource：子地图组件按 props 变化自行重建底图，
+   * 切到 3D 时 MapPage 会换成 CesiumMap 挂载，无需命令式调用。
    */
-  const handleMapTypeChange = useCallback((type: 'roadmap' | 'satellite') => {
-    console.log('[MapPage] Map type change:', type)
-    setMapType(type)
-    storeSetMapType(type)
-    // 调用 OnlineMap 的 setMapType 方法直接设置地图类型
-    if (onlineMapRef.current) {
-      console.log('[MapPage] Calling onlineMapRef.current.setMapType')
-      onlineMapRef.current.setMapType(type)
-    }
-  }, [storeSetMapType])
-
-  /**
-   * 处理在线地图可见性切换
-   */
-  const handleOnlineMapToggle = useCallback((visible: boolean) => {
-    console.log('[MapPage] Online map visibility toggle:', visible)
-    setOnlineMapVisible(visible)
-    storeSetBaseMapVisible(visible)
-    // 调用 OnlineMap 的 setBaseMapVisibility 方法
-    if (onlineMapRef.current) {
-      onlineMapRef.current.setBaseMapVisibility(visible)
-    }
-  }, [storeSetBaseMapVisible])
+  const handleMapSourceChange = useCallback((source: MapSource) => {
+    console.log('[MapPage] Map source change:', source)
+    storeSetMapSource(source)
+  }, [storeSetMapSource])
 
   /**
    * 处理频点可见性切换
@@ -2717,19 +2710,22 @@ export function MapPage() {
     useLayerEditStore.getState().setSelectMode(false)
   }
 
-  /** 地图类型三态循环：关闭底图 → 平面图 → 卫星图 → 关闭底图 */
-  const cycleMapType = () => {
-    if (!onlineMapVisible) {
-      // 关闭状态 → 恢复平面图
-      handleOnlineMapToggle(true)
-      handleMapTypeChange('roadmap')
-    } else if (mapType === 'roadmap') {
-      // 平面图 → 卫星图
-      handleMapTypeChange('satellite')
-    } else {
-      // 卫星图 → 关闭底图
-      handleOnlineMapToggle(false)
-    }
+  /* 地图源下拉：图标 / 文案 / 当前项（顺序由 MAP_SOURCE_OPTIONS 决定） */
+  const mapSourceIcon: Record<MapSource, ReactNode> = {
+    'amap-vector': <MapIcon size={14} />,
+    'amap-satellite': <Satellite size={14} />,
+    'tdt-vector': <MapIcon size={14} />,
+    'tdt-satellite': <Satellite size={14} />,
+    cesium: <Globe size={14} />,
+    none: <Square size={14} />,
+  }
+  const mapSourceLabel: Record<MapSource, string> = {
+    'amap-vector': t('map.sourceAmapVector') || '高德矢量图',
+    'amap-satellite': t('map.sourceAmapSatellite') || '高德卫星图',
+    'tdt-vector': t('map.sourceTdtVector') || '天地图矢量图',
+    'tdt-satellite': t('map.sourceTdtSatellite') || '天地图卫星图',
+    cesium: t('map.sourceCesium3d') || '3D地图',
+    none: t('map.sourceNone') || '空地图',
   }
 
   const toolbarButtons: Record<string, ReactNode> = {
@@ -3071,38 +3067,45 @@ export function MapPage() {
       </button>
     ),
 
-    /* 地图类型切换按钮：平面图 → 卫星图 → 关闭底图 三态循环 */
+    /* 地图切换下拉：高德/天地图矢量·卫星、3D地图（CesiumJS）、空地图 */
     maptype: (
-      <button
-        onClick={cycleMapType}
-        className={`flex items-center gap-1 px-2 py-1.5 text-xs rounded transition-colors ${
-          onlineMapVisible
-            ? 'text-foreground hover:bg-muted hover:text-primary'
-            : 'text-foreground hover:bg-muted hover:text-primary'
-        }`}
-        title={!onlineMapVisible
-          ? (t('map.switchToRoadmap') || '切换到平面图')
-          : mapType === 'roadmap'
-            ? (t('map.switchToSatellite') || '切换到卫星图')
-            : (t('map.emptyMap') || '空地图')}
-      >
-        {!onlineMapVisible ? (
-          <>
-            <MapIcon size={14} />
-            <span className="toolbar-label">{t('map.emptyMap') || '空地图'}</span>
-          </>
-        ) : mapType === 'roadmap' ? (
-          <>
-            <MapIcon size={14} />
-            <span className="toolbar-label">{t('map.vector') || '平面图'}</span>
-          </>
-        ) : (
-          <>
-            <Satellite size={14} />
-            <span className="toolbar-label">{t('map.satellite') || '卫星图'}</span>
-          </>
+      <div className="relative" ref={mapSourceMenuRef}>
+        <button
+          className={`px-2 py-1.5 text-xs rounded transition-colors flex items-center gap-1 ${
+            mapSourceMenuOpen ? 'bg-muted text-primary' : 'text-foreground hover:bg-muted hover:text-primary'
+          }`}
+          onClick={() => setMapSourceMenuOpen(v => !v)}
+          title={t('map.switchMapSource') || '切换地图源'}
+        >
+          {mapSourceIcon[mapSource]}
+          <span className="toolbar-label">{mapSourceLabel[mapSource]}</span>
+          <svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" className="ml-0.5 opacity-60">
+            <path d="m6 9 6 6 6-6" />
+          </svg>
+        </button>
+        {mapSourceMenuOpen && (
+          <div className="absolute top-full left-0 mt-1 z-[3000] bg-card border border-border rounded-lg shadow-lg w-40 overflow-hidden">
+            {MAP_SOURCE_OPTIONS.map((src) => (
+              <button
+                key={src}
+                onClick={() => {
+                  handleMapSourceChange(src)
+                  setMapSourceMenuOpen(false)
+                }}
+                className={`w-full text-left px-2 py-1.5 text-xs transition-colors flex items-center gap-1.5 ${
+                  src === mapSource
+                    ? 'bg-primary/10 text-primary'
+                    : 'text-foreground hover:bg-muted hover:text-primary'
+                }`}
+              >
+                {mapSourceIcon[src]}
+                <span className="truncate">{mapSourceLabel[src]}</span>
+                {src === mapSource && <Check size={12} className="ml-auto shrink-0" />}
+              </button>
+            ))}
+          </div>
         )}
-      </button>
+      </div>
     ),
   }
 
@@ -3139,12 +3142,6 @@ export function MapPage() {
       : drawTool === 'polygon'
         ? (t('map.polygon') || '面')
         : (t('map.draw') || '绘制')
-  const mapTypeLabel = !onlineMapVisible
-    ? (t('map.emptyMap') || '空地图')
-    : mapType === 'roadmap'
-      ? (t('map.vector') || '平面图')
-      : (t('map.satellite') || '卫星图')
-
   const toolbarMoreEntries: Record<string, ToolbarMoreEntry> = {
     save: {
       icon: <Save size={14} />,
@@ -3244,22 +3241,22 @@ export function MapPage() {
       onSelect: handleToggleNodeMerge,
     },
     maptype: {
-      icon: (!onlineMapVisible || mapType === 'roadmap') ? <MapIcon size={14} /> : <Satellite size={14} />,
-      label: mapTypeLabel,
-      onSelect: cycleMapType,
+      icon: mapSourceIcon[mapSource],
+      label: mapSourceLabel[mapSource],
+      submenu: MAP_SOURCE_OPTIONS.map((src) => ({
+        icon: mapSourceIcon[src],
+        label: mapSourceLabel[src],
+        onSelect: () => handleMapSourceChange(src),
+      })),
     },
   }
 
   return (
     <div ref={mapPageRef} className="flex flex-col h-full min-h-0">
-      {/* 地图工具栏（右键可设置标签显隐/按钮顺序） */}
+      {/* 地图工具栏（最右侧「设置」按钮打开设置框） */}
       <div
         data-map-toolbar
         className={`h-14 bg-background border-b border-border/60 flex items-center justify-start px-4 flex-shrink-0 gap-4 ${toolbarPrefs.showLabels ? '' : 'npt-hide-toolbar-labels'}`}
-        onContextMenu={(e) => {
-          e.preventDefault()
-          setToolbarMenu({ x: e.clientX, y: e.clientY })
-        }}
       >
         <div className="flex items-center gap-4 shrink-0">
 
@@ -3556,44 +3553,107 @@ export function MapPage() {
             )}
           </div>
         )}
+
+        {/* 设置按钮（菜单栏最右端）：打开「设置」框（地图设置 + 工具栏设置） */}
+        <button
+          ref={settingsBtnRef}
+          onClick={() => {
+            // 锚点取按钮左下角（相对地图容器），设置框从那里弹出
+            const area = mapAreaRef.current?.getBoundingClientRect()
+            const btn = settingsBtnRef.current?.getBoundingClientRect()
+            if (!area || !btn) return
+            if (settingsMenu) {
+              setSettingsMenu(null)
+              return
+            }
+            setSettingsMenu({
+              x: Math.max(8, btn.left - area.left - 300),
+              y: Math.max(8, btn.bottom - area.top + 6),
+            })
+          }}
+          className={`shrink-0 px-2 py-1.5 text-xs rounded transition-colors flex items-center gap-1 ${
+            settingsMenu ? 'bg-muted text-primary' : 'text-foreground hover:bg-muted hover:text-primary'
+          }`}
+          title={t('map.settings') || '设置'}
+        >
+          <Settings size={14} />
+          <span className="toolbar-label">{t('map.settings') || '设置'}</span>
+        </button>
       </div>
 
 
 
       {/* 地图内容区域 */}
-      <div className="flex-1 relative min-h-0 bg-muted/20 map-container" style={{ overflow: 'hidden' }}>
+      <div ref={mapAreaRef} className="flex-1 relative min-h-0 bg-muted/20 map-container" style={{ overflow: 'hidden' }}>
         {viewMode === 'online' ? (
           <>
-            <OnlineMap
-              ref={onlineMapRef}
-              layerFiles={layerFiles}
-              pointFiles={pointFiles}
-              measureMode={measureMode}
-              onMeasureModeEnd={() => setMeasureMode(false)}
-              frequencies={frequencies}
-              customLayers={customLayers}
-              onViewModeChange={setViewMode}
-              initialLayerVisibility={{
-                lte: layers.find(l => l.id === 'lte-sectors')?.visible ?? false,
-                nr: layers.find(l => l.id === 'nr-sectors')?.visible ?? false
-              }}
-              sectorLabelVisibility={sectorLabelVisibility}
-              labelSettingsMap={labelSettingsMap}
-              selectionMode={selectionMode}
-              onSelectionModeEnd={() => {
-                setSelectionMode('none')
-                // 退出框选模式时不清除拖拽工具状态，保留已绘制的框选图形
-                // 框选模式和拖拽工具独立管理
-              }}
-              mapDragTool={mapDragTool}
-              captureMode={captureMode}
-              onCaptureCoord={(lng, lat) => setCaptureCoord({ lng, lat })}
-              onCaptureBlocked={handleCaptureBlocked}
-              decorationLayerVisible={decorationLayer.visible}
-              decorationLabelVisible={decorationLabelVisible}
-              layerOrder={mapSettings.layerOrder}
-              selectableMap={mapSettings.selectableMap}
-            />
+            {/* 地图引擎：2D（高德/天地图，含空地图）/ CesiumJS 3D，二者同构（同 props/ref） */}
+            {isCesiumSource(mapSource) ? (
+              <CesiumMap
+                ref={onlineMapRef}
+                layerFiles={layerFiles}
+                pointFiles={pointFiles}
+                measureMode={measureMode}
+                onMeasureModeEnd={() => setMeasureMode(false)}
+                frequencies={frequencies}
+                customLayers={customLayers}
+                onViewModeChange={setViewMode}
+                initialLayerVisibility={{
+                  lte: layers.find(l => l.id === 'lte-sectors')?.visible ?? false,
+                  nr: layers.find(l => l.id === 'nr-sectors')?.visible ?? false
+                }}
+                sectorLabelVisibility={sectorLabelVisibility}
+                labelSettingsMap={labelSettingsMap}
+                selectionMode={selectionMode}
+                onSelectionModeEnd={() => setSelectionMode('none')}
+                mapDragTool={mapDragTool}
+                captureMode={captureMode}
+                onCaptureCoord={(lng, lat) => setCaptureCoord({ lng, lat })}
+                onCaptureBlocked={handleCaptureBlocked}
+                decorationLayerVisible={decorationLayer.visible}
+                decorationLabelVisible={decorationLabelVisible}
+                layerOrder={mapSettings.layerOrder}
+                selectableMap={mapSettings.selectableMap}
+                mapSource={mapSource}
+                tiandituApiKey={mapSettings.tiandituApiKey}
+                tiandituAnnotations={mapSettings.tiandituAnnotations}
+                cesiumPlaceNameVisible={mapSettings.cesiumAnnotations.placeName}
+              />
+            ) : (
+              <OnlineMap
+                ref={onlineMapRef}
+                layerFiles={layerFiles}
+                pointFiles={pointFiles}
+                measureMode={measureMode}
+                onMeasureModeEnd={() => setMeasureMode(false)}
+                frequencies={frequencies}
+                customLayers={customLayers}
+                onViewModeChange={setViewMode}
+                initialLayerVisibility={{
+                  lte: layers.find(l => l.id === 'lte-sectors')?.visible ?? false,
+                  nr: layers.find(l => l.id === 'nr-sectors')?.visible ?? false
+                }}
+                sectorLabelVisibility={sectorLabelVisibility}
+                labelSettingsMap={labelSettingsMap}
+                selectionMode={selectionMode}
+                onSelectionModeEnd={() => {
+                  setSelectionMode('none')
+                  // 退出框选模式时不清除拖拽工具状态，保留已绘制的框选图形
+                  // 框选模式和拖拽工具独立管理
+                }}
+                mapDragTool={mapDragTool}
+                captureMode={captureMode}
+                onCaptureCoord={(lng, lat) => setCaptureCoord({ lng, lat })}
+                onCaptureBlocked={handleCaptureBlocked}
+                decorationLayerVisible={decorationLayer.visible}
+                decorationLabelVisible={decorationLabelVisible}
+                layerOrder={mapSettings.layerOrder}
+                selectableMap={mapSettings.selectableMap}
+                mapSource={mapSource}
+                tiandituApiKey={mapSettings.tiandituApiKey}
+                tiandituAnnotations={mapSettings.tiandituAnnotations}
+              />
+            )}
 
             {/* 图层控制面板 */}
             <LayerControl
@@ -3604,7 +3664,7 @@ export function MapPage() {
               onSectorToggle={handleLayerToggle}
               onSectorLabelToggle={handleSectorLabelToggle}
               onLayerFileToggle={handleLayerFileToggle}
-              onMapTypeChange={handleMapTypeChange}
+              onMapTypeChange={(t) => handleMapSourceChange(t === 'satellite' ? 'amap-satellite' : 'amap-vector')}
               mapType={mapType}
               sectorLabelVisibility={sectorLabelVisibility}
               pointFileLabelVisibility={pointFileLabelVisibility}
@@ -3755,41 +3815,16 @@ export function MapPage() {
         />
       )}
 
-      {/* 工具栏右键设置菜单：标签文字显隐 + 提示拖拽排序 + 恢复默认 */}
-      {toolbarMenu && (
-        <div
-          className="fixed z-[6000] bg-card border border-border rounded-lg shadow-lg py-1 w-48"
-          style={{ left: toolbarMenu.x, top: toolbarMenu.y }}
-          onContextMenu={(e) => e.preventDefault()}
-          onMouseDown={(e) => e.stopPropagation()}
-        >
-          <div className="px-3 py-1 text-[10px] text-muted-foreground border-b border-border/60 mb-0.5">
-            {t('map.toolbarSettings') || '工具栏设置'}
-          </div>
-          <button
-            onClick={() => {
-              setToolbarPrefs((p) => ({ ...p, showLabels: !p.showLabels }))
-              setToolbarMenu(null)
-            }}
-            className="w-full text-left px-3 py-1.5 text-xs text-foreground hover:bg-muted hover:text-primary transition-colors"
-          >
-            {toolbarPrefs.showLabels
-              ? (t('map.toolbarHideLabels') || '隐藏标签文字')
-              : (t('map.toolbarShowLabels') || '显示标签文字')}
-          </button>
-          <div className="px-3 py-1 text-[10px] text-muted-foreground">
-            {t('map.toolbarDragHint') || '拖动按钮可调整位置'}
-          </div>
-          <button
-            onClick={() => {
-              setToolbarPrefs({ order: [...TOOLBAR_ITEM_IDS], showLabels: true, __v: 3 })
-              setToolbarMenu(null)
-            }}
-            className="w-full text-left px-3 py-1.5 text-xs text-foreground hover:bg-muted hover:text-primary transition-colors border-t border-border/60"
-          >
-            {t('map.toolbarResetLayout') || '恢复默认布局'}
-          </button>
-        </div>
+      {/* 右键弹出的「设置」框：地图设置 + 工具栏设置 */}
+      {settingsMenu && (
+        <MapSettingsPanel
+          anchor={settingsMenu}
+          onClose={() => setSettingsMenu(null)}
+          getBounds={() => mapAreaRef.current}
+          showLabels={toolbarPrefs.showLabels}
+          onToggleLabels={() => setToolbarPrefs((p) => ({ ...p, showLabels: !p.showLabels }))}
+          onResetToolbar={() => setToolbarPrefs({ order: [...TOOLBAR_ITEM_IDS], showLabels: true, __v: 3 })}
+        />
       )}
 
       {/* 工具栏标签隐藏样式（右键菜单设置） */}

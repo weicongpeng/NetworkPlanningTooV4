@@ -37,6 +37,126 @@ import { getSharedHeatmapManager, type HeatmapLayerManager, type HeatmapStats } 
 import { reconcileZOrder, ZOrderLayer, orderWithIds, panelRankFromIndex, topPanelRank, isLayerSelectable } from './layerZOrder'
 import type { LayerOrderMap } from '../../store/mapStore'
 import { layerApi, dataApi } from '../../services/api'
+import {
+  amapTileUrl,
+  tiandituTileUrl,
+  tiandituTileSource,
+  engineOf,
+  isAnnotationApplicable,
+  layerKindOf,
+  DEFAULT_TIANDITU_KEY,
+  TIANDITU_MAX_ZOOM,
+  type MapSource,
+  type TiandituAnnotations,
+} from '../../config/mapSources'
+
+/**
+ * 天地图瓦片图层（Leaflet GridLayer）。
+ *
+ * 天地图是 CGCS2000≈WGS84，而本组件显示链路整体是 GCJ02，直接按同 z/x/y 铺会整体偏移
+ * 100~700 米。纠偏方式：把每张瓦片按 `tiandituTileSource` 给出的 WGS84 重投影源
+ * **画进一张 256×256 画布**，偏移烘进位图。
+ *
+ * 为什么不用「平移瓦片层容器」：容器平移量随缩放级别翻倍，而 Leaflet 的缩放动画期间
+ * 仍按旧 zoom 的平移量渲染 → 动画中整幅底图漂移（滚轮缩放时表现为"地图不受控地滑走"）。
+ * 偏移进位图后，瓦片随 Leaflet 自身的缩放动画正常缩放，不会漂移。
+ */
+function tiandituLeafletLayer(
+  L: any, layer: 'vec' | 'img' | 'cva' | 'cia' | 'cta', key: string, zIndex = 1,
+): any {
+  const url = tiandituTileUrl(layer, key)
+
+  /** 取一张 WGS84 瓦片（子域按行列散列，与 Leaflet 的 {s} 行为一致） */
+  const loadTileImage = (z: number, x: number, y: number): Promise<HTMLImageElement> =>
+    new Promise((resolve, reject) => {
+      const img = new Image()
+      img.crossOrigin = 'anonymous'
+      img.onload = () => resolve(img)
+      img.onerror = () => reject(new Error(`tile ${z}/${x}/${y}`))
+      img.src = url
+        .replace('{s}', String((x + y) % 8))
+        .replace('{z}', String(z))
+        .replace('{x}', String(x))
+        .replace('{y}', String(y))
+    })
+
+  const TiandituGridLayer = L.GridLayer.extend({
+    createTile(coords: any, done: (err: any, tile?: HTMLElement) => void) {
+      const size = this.getTileSize()
+      const canvas = document.createElement('canvas')
+      canvas.width = size.x
+      canvas.height = size.y
+      const ctx = canvas.getContext('2d')
+      const z = coords.z
+      const n = 1 << z
+      const src = tiandituTileSource(z, coords.x, coords.y, size.x)
+      const wrapX = (v: number) => ((v % n) + n) % n
+
+      // 源矩形可能横跨 2×2 张 WGS84 瓦片：起点 + 右/下/右下各一张
+      const cells: Array<[number, number, number, number]> = [
+        [wrapX(src.wx), src.wy, -src.offX, -src.offY],
+      ]
+      if (src.offX > 0) cells.push([wrapX(src.wx + 1), src.wy, size.x - src.offX, -src.offY])
+      if (src.offY > 0) cells.push([wrapX(src.wx), src.wy + 1, -src.offX, size.y - src.offY])
+      if (src.offX > 0 && src.offY > 0) {
+        cells.push([wrapX(src.wx + 1), src.wy + 1, size.x - src.offX, size.y - src.offY])
+      }
+
+      Promise.all(
+        cells.map(([tx, ty, dx, dy]) =>
+          ty < 0 || ty >= n
+            ? Promise.resolve(null).then(() => ({ dx, dy, img: null as any }))
+            : loadTileImage(z, tx, ty).then((img) => ({ dx, dy, img })),
+        ),
+      )
+        .then((parts) => {
+          for (const p of parts) {
+            if (p.img && ctx) ctx.drawImage(p.img, p.dx, p.dy)
+          }
+          done(null, canvas)
+        })
+        .catch((err) => done(err, canvas))
+
+      return canvas
+    },
+  })
+
+  return new TiandituGridLayer({
+    minZoom: 3,
+    maxZoom: TIANDITU_MAX_ZOOM,
+    maxNativeZoom: TIANDITU_MAX_ZOOM,
+    zIndex,
+    attribution: '&copy; <a href="https://www.tianditu.gov.cn/">天地图</a>',
+  })
+}
+
+/**
+ * 构建底图瓦片图层；空地图返回 null（不铺任何底图）。
+ * 高德/天地图由 `mapSource` 的引擎部分决定，矢量/卫星由图层部分决定。
+ */
+function buildBaseTileLayer(L: any, source: MapSource, key: string): any | null {
+  const engine = engineOf(source)
+  const kind = layerKindOf(source)
+  if (!engine || !kind) return null
+  if (engine === 'amap') {
+    return L.tileLayer(amapTileUrl(kind), {
+      attribution: '&copy; <a href="https://www.amap.com/">高德地图</a>',
+      minZoom: 3,
+      maxZoom: 20,
+      maxNativeZoom: 18,  // 高德栅格原生上限；19-20 级拉伸 18 级瓦片（服务端 19+ 返回占位图）
+      crossOrigin: 'anonymous',  // 跨域标识，与 Canvas 配合防止渲染拖影
+    })
+  }
+  return tiandituLeafletLayer(L, kind === 'satellite' ? 'img' : 'vec', key)
+}
+
+/** 天地图注记叠加层编码（矢量注记 / 影像注记 / 地形注记），zIndex 高于底图 */
+const TIANDITU_ANNOTATION_CODES = ['cva', 'cia', 'cta'] as const
+type TiandituAnnotationCode = typeof TIANDITU_ANNOTATION_CODES[number]
+/** 注记编码 ↔ store 开关字段 */
+const TIANDITU_ANNOTATION_KEY: Record<TiandituAnnotationCode, keyof TiandituAnnotations> = {
+  cva: 'vector', cia: 'image', cta: 'terrain',
+}
 
 console.log('🔥🔥🔥 OnlineMap.tsx 已加载 (2025-01-27-v3) 🔥🔥🔥')
 
@@ -47,11 +167,16 @@ interface SharedMapCache {
   map: L.Map | null
   tileLayer: L.TileLayer | null
   leafletContainer: HTMLDivElement | null  // Leaflet 实际使用的容器元素
-  mapLayerType: MapLayerType
+  mapSource: MapSource
+  /** 底图构建时使用的天地图 Key（Key 变化需重建瓦片图层） */
+  tiandituKey: string
+  /** 天地图注记叠加层（随地图实例一起缓存，避免页面切换后重复叠加） */
+  annotations: Partial<Record<'cva' | 'cia' | 'cta', { layer: any; key: string }>>
   labelManager: LabelLayoutManager | null  // 共享标签布局引擎（跨图层标签防重叠）
 }
 let __sharedMapCache: SharedMapCache = {
-  map: null, tileLayer: null, leafletContainer: null, mapLayerType: 'roadmap', labelManager: null
+  map: null, tileLayer: null, leafletContainer: null,
+  mapSource: 'amap-vector', tiandituKey: '', annotations: {}, labelManager: null
 }
 let __sharedHiddenContainer: HTMLDivElement | null = null
 // 模块级共享 ref —— 地图缓存后，事件监听器闭包仍引用旧组件的 useRef 对象
@@ -81,8 +206,6 @@ import { useLayerEditStore } from '../../store/layerEditStore'
 import type { AttributeErrorCode } from '../../store/layerEditStore'
 import { LayerEditSession, type MergeReferenceSource } from './LayerEditSession'
 // TACLegend 已移除，各个页面自己管理对应的图例组件
-
-type MapLayerType = 'satellite' | 'roadmap'
 
 /**
  * 搜索标记接口
@@ -197,6 +320,14 @@ interface OnlineMapProps {
   layerOrder?: LayerOrderMap
   /** 图层"可选"开关（控制面板鼠标箭头按钮），key=图层 id；未收录视为 true */
   selectableMap?: Record<string, boolean>
+  /** 地图源：高德矢量/卫星、天地图矢量/卫星、空地图（3D 由 CesiumMap 接管，不会传进来） */
+  mapSource?: MapSource
+  /** 天地图 Key（tdt-* 源使用） */
+  tiandituApiKey?: string
+  /** 天地图注记图层显隐（矢量注记 cva / 影像注记 cia / 地形注记 cta） */
+  tiandituAnnotations?: TiandituAnnotations
+  /** CesiumJS 场景注记：三维地名（仅 3D 地图生效） */
+  cesiumPlaceNameVisible?: boolean
 }
 
 /**
@@ -375,6 +506,9 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
   decorationLabelVisible,
   layerOrder,
   selectableMap = {},
+  mapSource = 'amap-vector',
+  tiandituApiKey = DEFAULT_TIANDITU_KEY,
+  tiandituAnnotations = { vector: true, image: true, terrain: true },
 }, ref) => {
   // Refs
   const customLayerRefs = useRef<Record<string, L.LayerGroup | L.FeatureGroup>>({})
@@ -1079,7 +1213,12 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
   // 用计数器支持并发：连续勾选多个图层时，所有加载都完成才隐藏
   const [layerLoading, setLayerLoading] = useState(false)
   const layerLoadCountRef = useRef(0)
-  const [mapLayerType, setMapLayerType] = useState<MapLayerType>(() => mapStateService.getState().mapLayerType)
+  // 地图源由 props 驱动（MapPage 的 mapSettings.mapSource）；空地图/3D 不进入本组件
+  // 底图相关 props 的 ref 镜像：init 效应与跨页面缓存闭包需要读到最新值
+  const mapSourceRef = useRef(mapSource)
+  mapSourceRef.current = mapSource
+  const tiandituKeyRef = useRef(tiandituApiKey)
+  tiandituKeyRef.current = tiandituApiKey
   const [layerVisibility, setLayerVisibility] = useState<LayerVisibility>(initialLayerVisibility)
 
   // 网络错误状态
@@ -1160,7 +1299,6 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
   }>({ lte: [], nr: [] })
 
   // 底图可见性状态 - 用于控制背景颜色
-  const [baseMapVisible, setBaseMapVisibleState] = useState(true)
 
   // 测量相关状态
   const [measurePoints, setMeasurePoints] = useState<Array<{ lng: number; lat: number }>>([])
@@ -1515,10 +1653,9 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
     },
 
     setMapType: (type: 'roadmap' | 'satellite') => {
+      // 兼容旧调用点：仅映射为高德矢量/卫星；天地图与 3D 由 MapPage 的 mapSource 驱动
       console.log('[OnlineMap] setMapType called with type:', type)
-      setMapLayerType(type)
-      mapStateService.setState({ mapLayerType: type })
-      // 图层更新由useEffect钩子统一处理，不直接操作图层
+      useMapStore.getState().setMapSource(type === 'satellite' ? 'amap-satellite' : 'amap-vector')
     },
 
     setLayerFileLabelVisibility: (fileId: string, visible: boolean, settings: any) => {
@@ -1555,7 +1692,8 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
     },
 
     toggleMapType: () => {
-      toggleMapType()
+      const cur = useMapStore.getState().mapSettings.mapSource
+      useMapStore.getState().setMapSource(cur === 'amap-satellite' ? 'amap-vector' : 'amap-satellite')
     },
 
     setFrequencyVisibility: (networkType: 'LTE' | 'NR', frequency: number, visible: boolean) => {
@@ -1871,22 +2009,12 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
 
     setBaseMapVisibility: (visible: boolean) => {
       console.log('[OnlineMap] setBaseMapVisibility called:', visible)
-      setBaseMapVisibleState(visible)  // 更新本地状态
-      if (!mapInstanceRef.current || !tileLayerRef.current) return
-
+      // 底图显隐已收敛为「地图源」：空地图 = mapSource 'none'，由瓦片图层效应统一重建
+      const store = useMapStore.getState()
       if (visible) {
-        // 显示底图：恢复瓦片图层，清除 Leaflet 容器背景色
-        if (!mapInstanceRef.current.hasLayer(tileLayerRef.current)) {
-          tileLayerRef.current.addTo(mapInstanceRef.current)
-        }
-        mapInstanceRef.current.getContainer().style.backgroundColor = ''
-      } else {
-        // 空地图模式：隐藏瓦片图层，设置 Leaflet 容器背景为白色
-        if (mapInstanceRef.current.hasLayer(tileLayerRef.current)) {
-          mapInstanceRef.current.removeLayer(tileLayerRef.current)
-        }
-        // 直接在 Leaflet 容器上设置主题背景色，避免默认灰色透出
-        mapInstanceRef.current.getContainer().style.backgroundColor = 'hsl(var(--muted))'
+        if (store.mapSettings.mapSource === 'none') store.setMapSource('amap-vector')
+      } else if (store.mapSettings.mapSource !== 'none') {
+        store.setMapSource('none')
       }
     },
 
@@ -4767,15 +4895,6 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
   }, [scheduleIdlePrefetch])
 
   /**
-   * 切换地图类型
-   */
-  const toggleMapType = useCallback(() => {
-    const newType = mapLayerType === 'roadmap' ? 'satellite' : 'roadmap'
-    setMapLayerType(newType)
-    mapStateService.setState({ mapLayerType: newType })
-  }, [mapLayerType])
-
-  /**
    * 初始化Leaflet地图
    */
   useEffect(() => {
@@ -4806,15 +4925,6 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
         script.onerror = () => reject(new Error('加载Leaflet失败'))
         document.head.appendChild(script)
       })
-    }
-
-    // 获取高德地图图层URL
-    const getAMapTileUrl = (type: MapLayerType) => {
-      if (type === 'satellite') {
-        return `https://webst02.is.autonavi.com/appmaptile?style=6&x={x}&y={y}&z={z}`
-      } else {
-        return `https://webrd02.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x={x}&y={y}&z={z}`
-      }
     }
 
     const initMap = async () => {
@@ -5051,24 +5161,22 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
 
         // 测距结束由地图右键事件（contextmenu → handleMapContextMenu）触发
 
-        // 添加高德地图图层
+        // 添加底图瓦片图层（高德 / 天地图 / 空地图；空地图不加图层）
         // 注意：高德地图服务器对不存在的瓦片（如海洋区域、地图边界外）会返回 404，这是正常行为
-        const tileLayer = L.tileLayer(getAMapTileUrl(savedState.mapLayerType), {
-          attribution: '&copy; <a href="https://www.amap.com/">高德地图</a>',
-          minZoom: 3,
-          maxZoom: 20,
-          maxNativeZoom: 18,  // 高德栅格原生上限；19-20 级拉伸 18 级瓦片（服务端 19+ 返回占位图）
-          crossOrigin: 'anonymous',  // 跨域标识，与 Canvas 配合防止渲染拖影
-        }).addTo(map)
+        const tileLayer = buildBaseTileLayer(L, mapSourceRef.current, tiandituKeyRef.current)
+        tileLayer?.addTo(map)
 
         // 监听瓦片加载事件（用于检测网络恢复），直接在首次创建时添加
-        tileLayer.on('load', () => {
+        tileLayer?.on('load', () => {
           hasLoadedAnyTileRef.current = true
           hasNetworkErrorRef.current = false
           if (networkError.visible) {
             setNetworkError(prev => ({ ...prev, visible: false }))
           }
         })
+        // 空地图：不铺底图，容器用主题背景色（否则会透出 Leaflet 默认灰底）
+        map.getContainer().style.backgroundColor =
+          tileLayer ? '' : 'hsl(var(--muted))'
 
         // 监听浏览器网络状态变化（仅依赖系统级事件）
         const handleOnline = () => {
@@ -5121,7 +5229,9 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
           map: map,
           tileLayer: tileLayer,
           leafletContainer: leafletContainer,
-          mapLayerType: savedState.mapLayerType,
+          mapSource: mapSourceRef.current,
+          tiandituKey: tiandituKeyRef.current,
+          annotations: __sharedMapCache.annotations,
           labelManager
         }
 
@@ -5328,7 +5438,9 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
             map: map,
             tileLayer: tileLayer,
             leafletContainer: leafletContainer,
-            mapLayerType: mapLayerType,
+            mapSource: mapSourceRef.current,
+            tiandituKey: tiandituKeyRef.current,
+            annotations: __sharedMapCache.annotations,
             labelManager: __sharedMapCache.labelManager
           }
 
@@ -5336,7 +5448,6 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
           mapStateService.setState({
             center: [center.lat, center.lng] as [number, number],
             zoom: zoom,
-            mapLayerType: mapLayerType,
           })
         }
       }
@@ -7410,38 +7521,28 @@ function sectorPointGeometry(f: any): { type: 'Point'; coordinates: [number, num
     const L = window.L
     const map = mapInstanceRef.current
 
-    // 共享实例复用保护：如果已有瓦片图层且类型与缓存一致，跳过重建
+    // 共享实例复用保护：地图源与天地图 Key 都与缓存一致时，跳过重建
     // 避免页面切换时不必要的瓦片重新下载
-    if (tileLayerRef.current && __sharedMapCache.map && __sharedMapCache.mapLayerType === mapLayerType) {
-      console.log('[OnlineMap] 复用缓存瓦片图层，类型匹配，跳过重建')
+    if (tileLayerRef.current && __sharedMapCache.map
+      && __sharedMapCache.mapSource === mapSource
+      && __sharedMapCache.tiandituKey === tiandituApiKey) {
+      console.log('[OnlineMap] 复用缓存瓦片图层，地图源匹配，跳过重建')
       return
     }
 
     // 移除旧的瓦片图层
     if (tileLayerRef.current) {
       map.removeLayer(tileLayerRef.current)
+      tileLayerRef.current = null
     }
 
-    // 添加新的瓦片图层
-    const getAMapTileUrl = (type: MapLayerType) => {
-      if (type === 'satellite') {
-        return `https://webst02.is.autonavi.com/appmaptile?style=6&x={x}&y={y}&z={z}`
-      } else {
-        return `https://webrd02.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x={x}&y={y}&z={z}`
-      }
-    }
-
-    const newTileLayer = L.tileLayer(getAMapTileUrl(mapLayerType), {
-      attribution: '&copy; <a href="https://www.amap.com/">高德地图</a>',
-      minZoom: 3,
-      maxZoom: 20,
-      maxNativeZoom: 18,  // 高德栅格原生上限；19-20 级拉伸 18 级瓦片（服务端 19+ 返回占位图）
-      crossOrigin: 'anonymous'  // 跨域标识，与 Canvas 配合防止渲染拖影
-    }).addTo(map)
+    // 添加新的瓦片图层（空地图返回 null）
+    const newTileLayer = buildBaseTileLayer(L, mapSource, tiandituApiKey)
+    newTileLayer?.addTo(map)
 
     // 监听所有瓦片加载完成事件（用于检测网络恢复）
     // 注意：404 错误是高德地图服务器的正常行为 - 某些瓦片（如海洋区域）不存在
-    newTileLayer.on('load', () => {
+    newTileLayer?.on('load', () => {
       hasLoadedAnyTileRef.current = true
       hasNetworkErrorRef.current = false
 
@@ -7452,10 +7553,44 @@ function sectorPointGeometry(f: any): { type: 'Point'; coordinates: [number, num
     })
 
     tileLayerRef.current = newTileLayer
+    // 空地图：容器用主题背景色，避免透出 Leaflet 默认灰底
+    map.getContainer().style.backgroundColor = newTileLayer ? '' : 'hsl(var(--muted))'
 
-    // 同步共享缓存中的 mapLayerType，使下次类型比较守卫正确判断
-    __sharedMapCache.mapLayerType = mapLayerType
-  }, [isMapInitialized, mapLayerType])
+    // 同步共享缓存，使下次比较守卫正确判断
+    __sharedMapCache.mapSource = mapSource
+    __sharedMapCache.tiandituKey = tiandituApiKey
+  }, [isMapInitialized, mapSource, tiandituApiKey, networkError.visible])
+
+  /**
+   * 天地图注记叠加层（矢量注记 cva / 影像注记 cia / 地形注记 cta）。
+   *
+   * 只渲染**与当前底图匹配**的那一类注记（矢量注记↔矢量图、影像注记↔卫星图；无地形底图则 cta 不渲染），
+   * 否则三套注记默认全开时会互相叠加、视觉很乱。zIndex 高于底图。
+   */
+  useEffect(() => {
+    const map = mapInstanceRef.current
+    const L = leafletRef.current || (window as any).L
+    if (!map || !L) return
+
+    const store = __sharedMapCache.annotations
+    for (const code of TIANDITU_ANNOTATION_CODES) {
+      const want = isAnnotationApplicable(code, mapSource)
+        && tiandituAnnotations[TIANDITU_ANNOTATION_KEY[code]]
+      const existing = store[code]
+      if (want && existing?.key === tiandituApiKey) continue
+      if (existing) {
+        map.removeLayer(existing.layer)
+        delete store[code]
+      }
+      if (want) {
+        const layer = tiandituLeafletLayer(L, code, tiandituApiKey, 2)
+        layer.addTo(map)
+        store[code] = { layer, key: tiandituApiKey }
+      }
+    }
+  }, [isMapInitialized, mapSource, tiandituApiKey, tiandituAnnotations])
+
+
 
   // 地图点击事件已经在handleMapClick中处理，这里的useEffect是重复的，会导致事件被多次绑定
   // 移除重复的地图点击事件处理

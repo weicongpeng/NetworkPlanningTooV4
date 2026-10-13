@@ -1,0 +1,229 @@
+/**
+ * CesiumGeoJsonLayer 的要素配色解析与批量图元结构锁定。
+ *
+ * 后端把 TAB/MIF/KML 的逐要素样式注入到 `properties._style`（见
+ * `backend/app/services/mapinfo_service.py`），2D `MapInfoLayer` 按
+ * 「默认 < _style < 图层级用户设置 < 专题」合并；Cesium 侧此前完全忽略 `_style`，
+ * 于是 3D 里"图层文件"丢掉了文件原有配色。
+ *
+ * 渲染也从"逐 Entity"改成"面/线/点/标签各一个批量图元"（加载自有图层卡顿的主因）。
+ */
+import { describe, it, expect, beforeEach } from 'vitest'
+import { CesiumGeoJsonLayer } from '../CesiumGeoJsonLayer'
+import { NO_FILL_COLOR } from '../../../../utils/fieldValue'
+
+/** 极简 Cesium mock：覆盖 CesiumGeoJsonLayer 用到的部分，并记录创建出的批量图元 */
+function makeCesiumMock() {
+  const primitives: any[] = []
+
+  const makeCollection = (kind: 'point' | 'label') => class {
+    items: any[] = []
+    add(opts: any) { const it = { ...opts, kind }; this.items.push(it); return it }
+  }
+
+  const C: any = {
+    CustomDataSource: class {
+      entities = { removeAll: () => {}, add: () => {} }
+      constructor(public name: string) {}
+    },
+    Entity: class { constructor(opts: any) { Object.assign(this, opts) } },
+    PolygonHierarchy: class { constructor(public positions: any) {} },
+    Cartesian3: {
+      fromDegrees: (...a: number[]) => a,
+      fromDegreesArray: (a: number[]) => a,
+    },
+    Color: {
+      fromCssColorString: (css: string) => ({
+        css,
+        withAlpha(alpha: number) { return { css, alpha } },
+      }),
+    },
+    ColorGeometryInstanceAttribute: {
+      fromColor: (color: any) => ({ color }),
+    },
+    GeometryInstance: class {
+      constructor(public opts: any) {
+        this.geometry = opts.geometry
+        this.attributes = opts.attributes
+        this.id = opts.id
+      }
+      geometry: any
+      attributes: any
+      id: any
+    },
+    PolygonGeometry: class { constructor(public opts: any) {} },
+    GroundPolylineGeometry: class { constructor(public opts: any) {} },
+    PerInstanceColorAppearance: Object.assign(
+      class { constructor(public opts?: any) {} },
+      { VERTEX_FORMAT: 'vertexFormat' },
+    ),
+    PolylineColorAppearance: class { constructor(public opts?: any) {} },
+    GroundPrimitive: class {
+      kind = 'ground-polygon'
+      geometryInstances: any[]
+      constructor(opts: any) {
+        this.geometryInstances = opts.geometryInstances
+        primitives.push(this)
+      }
+    },
+    GroundPolylinePrimitive: class {
+      kind = 'ground-polyline'
+      geometryInstances: any[]
+      constructor(opts: any) {
+        this.geometryInstances = opts.geometryInstances
+        primitives.push(this)
+      }
+    },
+    PointPrimitiveCollection: class extends makeCollection('point') {
+      kind = 'points'
+      constructor() { super(); primitives.push(this) }
+    },
+    LabelCollection: class extends makeCollection('label') {
+      kind = 'labels'
+      constructor() { super(); primitives.push(this) }
+    },
+    HeightReference: { CLAMP_TO_GROUND: 1 },
+    LabelStyle: { FILL_AND_OUTLINE: 1 },
+    Cartesian2: class { constructor(public x: number, public y: number) {} },
+    VerticalOrigin: { BOTTOM: 1 },
+    HorizontalOrigin: { CENTER: 1 },
+  }
+  const viewer: any = {
+    dataSources: { add: () => {}, remove: () => {} },
+    scene: { primitives: { add: (p: any) => p, remove: () => {} } },
+  }
+  return { C, viewer, primitives }
+}
+
+function polygonFeature(style: Record<string, unknown> | undefined) {
+  return {
+    type: 'Feature',
+    geometry: {
+      type: 'Polygon',
+      coordinates: [[[114.0, 23.0], [114.01, 23.0], [114.01, 23.01], [114.0, 23.0]]],
+    },
+    properties: { id: 'f1', _style: style },
+  }
+}
+
+function pointFeature(style: Record<string, unknown> | undefined) {
+  return {
+    type: 'Feature',
+    geometry: { type: 'Point', coordinates: [114.0, 23.0] },
+    properties: { id: 'p1', _style: style },
+  }
+}
+
+/** 取出面图元的第一个实例填充色 */
+function fillColorOf(primitives: any[]) {
+  const p = primitives.find((x) => x.kind === 'ground-polygon')
+  return p?.geometryInstances?.[0]?.attributes?.color?.color
+}
+
+/** 取出线图元的第一个实例描边色 */
+function strokeColorOf(primitives: any[]) {
+  const p = primitives.find((x) => x.kind === 'ground-polyline')
+  return p?.geometryInstances?.[0]?.attributes?.color?.color
+}
+
+function strokeWidthOf(primitives: any[]) {
+  const p = primitives.find((x) => x.kind === 'ground-polyline')
+  return p?.geometryInstances?.[0]?.geometry?.opts?.width
+}
+
+describe('CesiumGeoJsonLayer 要素配色（_style 还原）', () => {
+  let primitives: any[]
+  let layer: CesiumGeoJsonLayer
+
+  beforeEach(() => {
+    const mock = makeCesiumMock()
+    primitives = mock.primitives
+    layer = new CesiumGeoJsonLayer(mock.C, mock.viewer, 'layer-1')
+  })
+
+  it('面要素：文件自带 _style 的填充/边框被还原', () => {
+    layer.setFeatureCollection({
+      features: [polygonFeature({
+        fillColor: '#ff0000', fillOpacity: 0.4,
+        strokeColor: '#00ff00', strokeWidth: 5,
+      })],
+    } as any)
+
+    expect(fillColorOf(primitives).css).toBe('#ff0000')
+    expect(fillColorOf(primitives).alpha).toBeCloseTo(0.4)
+    expect(strokeColorOf(primitives).css).toBe('#00ff00')
+    expect(strokeWidthOf(primitives)).toBe(5)
+  })
+
+  it('图层级用户设置优先于文件自带 _style（保存后要生效）', () => {
+    layer.applyConfig({ color: {
+      fillColor: '#123456', fillOpacity: 0.9, borderColor: '#654321', borderWidth: 1,
+    } as any })
+    layer.setFeatureCollection({
+      features: [polygonFeature({
+        fillColor: '#ff0000', fillOpacity: 0.4,
+        strokeColor: '#00ff00', strokeWidth: 5,
+      })],
+    } as any)
+
+    expect(fillColorOf(primitives).css).toBe('#123456')
+    expect(strokeColorOf(primitives).css).toBe('#654321')
+    expect(strokeWidthOf(primitives)).toBe(1)
+  })
+
+  it('无 _style 时回落到默认配色（与 2D DEFAULT_STYLES 一致）', () => {
+    layer.setFeatureCollection({ features: [polygonFeature(undefined)] } as any)
+    expect(fillColorOf(primitives).css).toBe('#10b981')
+  })
+
+  it('KML <fill>0</fill>：只画边框，不填充', () => {
+    layer.setFeatureCollection({
+      features: [polygonFeature({ fill: false, strokeColor: '#000000' })],
+    } as any)
+    expect(primitives.find((x) => x.kind === 'ground-polygon')).toBeUndefined()
+    expect(primitives.find((x) => x.kind === 'ground-polyline')).toBeTruthy()
+  })
+
+  it('边框色为「无色」哨兵时不画边框', () => {
+    layer.setFeatureCollection({
+      features: [polygonFeature({ fillColor: '#abcdef', strokeColor: NO_FILL_COLOR })],
+    } as any)
+    expect(primitives.find((x) => x.kind === 'ground-polygon')).toBeTruthy()
+    expect(primitives.find((x) => x.kind === 'ground-polyline')).toBeUndefined()
+  })
+
+  it('点要素：markerColor / markerSize 被还原', () => {
+    layer.setFeatureCollection({
+      features: [pointFeature({ markerColor: '#00aaff', markerSize: 12 })],
+    } as any)
+    const coll = primitives.find((x) => x.kind === 'points')
+    expect(coll.items[0].color.css).toBe('#00aaff')
+    expect(coll.items[0].pixelSize).toBe(12)
+  })
+
+  it('线要素：线色取 strokeColor，透明度取 strokeOpacity', () => {
+    layer.setFeatureCollection({
+      features: [{
+        type: 'Feature',
+        geometry: { type: 'LineString', coordinates: [[114.0, 23.0], [114.01, 23.01]] },
+        properties: { id: 'l1', _style: { strokeColor: '#ff00ff', strokeWidth: 4, strokeOpacity: 0.5 } },
+      }],
+    } as any)
+    expect(strokeColorOf(primitives).css).toBe('#ff00ff')
+    expect(strokeColorOf(primitives).alpha).toBeCloseTo(0.5)
+    expect(strokeWidthOf(primitives)).toBe(4)
+  })
+
+  it('不可见图层不产生任何图元', () => {
+    layer.applyConfig({ visible: false })
+    layer.setFeatureCollection({ features: [polygonFeature({ fillColor: '#ff0000' })] } as any)
+    expect(primitives).toHaveLength(0)
+  })
+
+  it('拾取标识挂在批量图元上（供点击弹属性框）', () => {
+    layer.setFeatureCollection({ features: [polygonFeature(undefined)] } as any)
+    const inst = primitives.find((x) => x.kind === 'ground-polygon').geometryInstances[0]
+    expect(inst.id.layerId).toBe('layer-1')
+    expect(inst.id.feature.properties.id).toBe('f1')
+  })
+})

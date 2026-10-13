@@ -7,6 +7,46 @@ import type { DrawGeometryType, DrawStyleSettings } from '@shared/types'
 // 仅类型引用（layerEditStore 不反向依赖本文件，无循环）：装饰图层工作集要素与编辑要素同构
 import type { EditFeature } from './layerEditStore'
 import { loadDecorations, saveDecorations } from '../services/decorationStorage'
+import { DEFAULT_CESIUM_ION_TOKEN } from '../services/cesiumLoader'
+import {
+  DEFAULT_TIANDITU_KEY,
+  type MapSource,
+  type TiandituAnnotations,
+} from '../config/mapSources'
+
+/**
+ * CesiumJS 建筑（OSM 3D Tiles）着色方式。
+ * 控制入口在地图页右键「设置」→ CesiumJS 页签（原为地图右上角悬浮下拉）。
+ */
+export type CesiumBuildingStyle = 'material' | 'height' | 'hideLow' | 'none'
+
+/**
+ * CesiumJS 3D 清晰度档位。控制入口在右键「设置」→ CesiumJS 页签。
+ *
+ * 3D 底图看起来比 2D 高德卫星糊，主因是渲染管线而非瓦片源（两家都是 256×256、原生 z18）：
+ * Cesium 的 `resolutionScale` 默认 1.0，按 **CSS 像素**渲染再被浏览器放大到设备像素，
+ * 而 Leaflet 的 `<img>` 瓦片由浏览器按**设备像素**合成。高分屏（DPR>1）下差距明显。
+ * 另外 Cesium 按屏幕空间误差选影像层级、且默认开 FXAA，都会再柔化一点。
+ *
+ * 清晰度与性能直接冲突（分辨率 ×DPR² 的渲染成本），所以交给用户按机器性能取舍。
+ */
+export type CesiumQuality = 'smooth' | 'balanced' | 'sharp'
+
+export interface CesiumQualityPreset {
+  /** resolutionScale 上限（实际取 min(devicePixelRatio, 该值)） */
+  maxResolutionScale: number
+  /** 抗锯齿后处理（关掉更锐，代价是边缘锯齿） */
+  fxaa: boolean
+  /** 地形/影像的屏幕空间误差上限（越小越早加载高层级瓦片，越清晰也越吃性能） */
+  maximumScreenSpaceError: number
+}
+
+/** 档位 → Cesium 参数。smooth 即改造前的默认行为，保证不改默认观感。 */
+export const CESIUM_QUALITY_PRESETS: Record<CesiumQuality, CesiumQualityPreset> = {
+  smooth: { maxResolutionScale: 1, fxaa: true, maximumScreenSpaceError: 2 },
+  balanced: { maxResolutionScale: 1.5, fxaa: false, maximumScreenSpaceError: 1.5 },
+  sharp: { maxResolutionScale: 2, fxaa: false, maximumScreenSpaceError: 1 },
+}
 
 /**
  * 定位点接口
@@ -39,16 +79,31 @@ export interface UserMapSettings {
   pointFileVisibility: Record<string, boolean>
   // 装饰图层标签可见性（装饰图层本身恒显、不可关闭）
   decorationLabelVisible: boolean
-  // 底图可见性
-  baseMapVisible: boolean
   // 扇区标签可见性
   sectorLabelVisibility: Record<string, boolean>
   // 点文件标签可见性
   pointFileLabelVisibility: Record<string, boolean>
   // 图层文件(MapInfo)标签可见性
   layerFileLabelVisibility: Record<string, boolean>
-  // 地图类型
-  mapType: 'roadmap' | 'satellite'
+  /**
+   * 地图源（唯一真源）：高德矢量/卫星、天地图矢量/卫星、3D（CesiumJS）、空地图。
+   * 由工具栏「地图切换」下拉切换；设置框只配置各引擎的 Key/Token，不切图。
+   */
+  mapSource: MapSource
+  // 高德地图 API Key（高德瓦片默认免 key，留空即可，可填自己的）
+  amapApiKey: string
+  // 天地图 Key（出厂带默认值，UI 脱敏、可更换）
+  tiandituApiKey: string
+  // 天地图注记图层显隐（矢量注记 cva / 影像注记 cia / 地形注记 cta）
+  tiandituAnnotations: TiandituAnnotations
+  // Cesium ion Access Token（出厂带默认值，UI 脱敏、可更换）
+  cesiumIonToken: string
+  // CesiumJS 场景注记显隐（三维地名 eva）
+  cesiumAnnotations: { placeName: boolean }
+  /** CesiumJS 建筑样式：按材料着色 / 按高度着色 / 隐藏 20m 以下 / 默认 */
+  cesiumBuildingStyle: CesiumBuildingStyle
+  /** CesiumJS 3D 清晰度档位 */
+  cesiumQuality: CesiumQuality
   // 标签设置（按图层ID）
   labelSettingsMap: Record<string, LabelSettings>
   // 图层颜色设置（按图层ID）
@@ -99,11 +154,17 @@ const DEFAULT_MAP_SETTINGS: UserMapSettings = {
   layerFileVisibility: {},
   pointFileVisibility: {},
   decorationLabelVisible: false,
-  baseMapVisible: true,
   sectorLabelVisibility: { 'lte-sectors': false, 'nr-sectors': false },
   pointFileLabelVisibility: {},
   layerFileLabelVisibility: {},
-  mapType: 'roadmap',
+  mapSource: 'amap-vector',
+  amapApiKey: '',
+  tiandituApiKey: DEFAULT_TIANDITU_KEY,
+  tiandituAnnotations: { vector: true, image: true, terrain: true },
+  cesiumIonToken: DEFAULT_CESIUM_ION_TOKEN,
+  cesiumAnnotations: { placeName: true },
+  cesiumBuildingStyle: 'material',
+  cesiumQuality: 'smooth',
   labelSettingsMap: {},
   colorSettingsMap: {},
   drawStyleMap: {},
@@ -151,11 +212,18 @@ interface MapState {
   setLayerFileVisibility: (fileId: string, visible: boolean) => void
   setPointFileVisibility: (fileId: string, visible: boolean) => void
   setDecorationLabelVisible: (visible: boolean) => void
-  setBaseMapVisible: (visible: boolean) => void
+  setMapSource: (source: MapSource) => void
+  /** 天地图注记图层显隐（局部合并） */
+  setTiandituAnnotation: (key: keyof TiandituAnnotations, visible: boolean) => void
+  /** CesiumJS 场景注记显隐（目前只有三维地名） */
+  setCesiumPlaceNameVisible: (visible: boolean) => void
+  /** CesiumJS 建筑着色方式 */
+  setCesiumBuildingStyle: (style: CesiumBuildingStyle) => void
+  /** CesiumJS 3D 清晰度档位 */
+  setCesiumQuality: (quality: CesiumQuality) => void
   setSectorLabelVisibility: (layer: string, visible: boolean) => void
   setPointFileLabelVisibility: (fileId: string, visible: boolean) => void
   setLayerFileLabelVisibility: (fileId: string, visible: boolean) => void
-  setMapType: (type: 'roadmap' | 'satellite') => void
   setLabelSettings: (layerId: string, settings: LabelSettings) => void
   setColorSettings: (layerId: string, settings: LayerColorSettings | null) => void
   setDrawStyle: (geomType: DrawGeometryType, settings: DrawStyleSettings) => void
@@ -230,6 +298,21 @@ function migrateSectorColorDefaults(settings: UserMapSettings): UserMapSettings 
     }
   }
   return changed ? { ...settings, colorSettingsMap: next } : settings
+}
+
+/**
+ * 地图源迁移：旧版本用 `mapType`（roadmap/satellite）+ `mapProvider`（amap/cesium）
+ * + `baseMapVisible` 三个字段描述底图，新版收敛为单一 `mapSource`。
+ * 已存在 `mapSource` 的（新版）原样返回。
+ */
+function migrateMapSource<T extends Record<string, unknown>>(settings: T): T {
+  if (settings.mapSource) return settings
+  const legacy = settings as Record<string, unknown>
+  let source: MapSource = 'amap-vector'
+  if (legacy.mapProvider === 'cesium') source = 'cesium'
+  else if (legacy.baseMapVisible === false) source = 'none'
+  else if (legacy.mapType === 'satellite') source = 'amap-satellite'
+  return { ...settings, mapSource: source }
 }
 
 /** 热力图 v3 的旧默认值：v3→v4 时仍是这些值的字段升到新默认（用户改过的值保持，见下） */
@@ -392,9 +475,43 @@ export const useMapStore = create<MapState>()(
         scheduleBackendSync(get())
       },
 
-      setBaseMapVisible: (visible) => {
+      setMapSource: (source) => {
         set((state) => ({
-          mapSettings: { ...state.mapSettings, baseMapVisible: visible },
+          mapSettings: { ...state.mapSettings, mapSource: source },
+        }))
+        scheduleBackendSync(get())
+      },
+
+      setTiandituAnnotation: (key, visible) => {
+        set((state) => ({
+          mapSettings: {
+            ...state.mapSettings,
+            tiandituAnnotations: { ...state.mapSettings.tiandituAnnotations, [key]: visible },
+          },
+        }))
+        scheduleBackendSync(get())
+      },
+
+      setCesiumBuildingStyle: (style) => {
+        set((state) => ({
+          mapSettings: { ...state.mapSettings, cesiumBuildingStyle: style },
+        }))
+        scheduleBackendSync(get())
+      },
+
+      setCesiumQuality: (quality) => {
+        set((state) => ({
+          mapSettings: { ...state.mapSettings, cesiumQuality: quality },
+        }))
+        scheduleBackendSync(get())
+      },
+
+      setCesiumPlaceNameVisible: (visible) => {
+        set((state) => ({
+          mapSettings: {
+            ...state.mapSettings,
+            cesiumAnnotations: { ...state.mapSettings.cesiumAnnotations, placeName: visible },
+          },
         }))
         scheduleBackendSync(get())
       },
@@ -429,12 +546,6 @@ export const useMapStore = create<MapState>()(
         scheduleBackendSync(get())
       },
 
-      setMapType: (type) => {
-        set((state) => ({
-          mapSettings: { ...state.mapSettings, mapType: type },
-        }))
-        scheduleBackendSync(get())
-      },
 
       setLabelSettings: (layerId, settings) => {
         set((state) => ({
@@ -616,8 +727,31 @@ export const useMapStore = create<MapState>()(
               scheduleBackendSync(current)
               return true
             }
+            // 服务端可能还是旧格式（mapType/mapProvider/baseMapVisible），先迁移再合并，
+            // 否则会把本地 mapSource 之外的旧字段一起带进来、且丢掉服务端的引擎选择
+            const serverHasLegacyMapFields =
+              'mapType' in serverSettings || 'mapProvider' in serverSettings
+              || 'baseMapVisible' in serverSettings
+            const serverMapSettings = serverHasLegacyMapFields
+              ? migrateMapSource(serverSettings as Record<string, unknown>) as Partial<UserMapSettings>
+              : serverSettings
             set((state) => {
-              const merged = migrateHeatmapSmooth(migrateSectorColorDefaults({ ...state.mapSettings, ...serverSettings }))
+              const merged = migrateHeatmapSmooth(migrateSectorColorDefaults({
+                ...state.mapSettings,
+                ...serverMapSettings,
+                tiandituAnnotations: {
+                  ...state.mapSettings.tiandituAnnotations,
+                  ...serverMapSettings.tiandituAnnotations,
+                },
+                cesiumAnnotations: {
+                  ...state.mapSettings.cesiumAnnotations,
+                  ...serverMapSettings.cesiumAnnotations,
+                },
+                cesiumBuildingStyle:
+                  serverMapSettings.cesiumBuildingStyle ?? state.mapSettings.cesiumBuildingStyle,
+                cesiumQuality:
+                  serverMapSettings.cesiumQuality ?? state.mapSettings.cesiumQuality,
+              }))
               return {
                 mapSettings: merged,
                 _lastSyncSettings: stableStringify(merged),
@@ -675,9 +809,21 @@ export const useMapStore = create<MapState>()(
           // 缺省即空数组：不能沿用 currentState（切换用户 rehydrate 时会把上一用户的装饰要素带过来）
           decorationFeatures: persisted?.decorationFeatures ?? [],
           _lastSyncSettings: lastSyncSettings,
-          mapSettings: migrateHeatmapSmooth(migrateSectorColorDefaults({
+          mapSettings: migrateHeatmapSmooth(migrateSectorColorDefaults(migrateMapSource({
             ...currentState.mapSettings,
             ...persistedSettings,
+            tiandituAnnotations: {
+              ...currentState.mapSettings.tiandituAnnotations,
+              ...persistedSettings?.tiandituAnnotations,
+            },
+            cesiumAnnotations: {
+              ...currentState.mapSettings.cesiumAnnotations,
+              ...persistedSettings?.cesiumAnnotations,
+            },
+            cesiumBuildingStyle:
+              persistedSettings?.cesiumBuildingStyle ?? currentState.mapSettings.cesiumBuildingStyle,
+            cesiumQuality:
+              persistedSettings?.cesiumQuality ?? currentState.mapSettings.cesiumQuality,
             colorSettingsMap: persistedSettings?.colorSettingsMap ?? {},
             drawStyleMap: persistedSettings?.drawStyleMap ?? {},
             labelSettingsMap: persistedSettings?.labelSettingsMap ?? {},
@@ -694,7 +840,7 @@ export const useMapStore = create<MapState>()(
             },
             selectableMap: persistedSettings?.selectableMap ?? {},
             legendLayout: persistedSettings?.legendLayout ?? {},
-          })),
+          }))),
         }
       },
     }
