@@ -18,6 +18,7 @@ import {
 } from './cesiumSectorStyle'
 import { resolvePlanningStyle, type PlanningHighlight } from './cesiumHighlight'
 import type { LabelSettings } from '../LabelSettingsModal'
+import { computeThematicStats, type ThematicStats } from '../../../utils/thematicStats'
 
 const METERS_PER_LAT = 111319.9
 
@@ -199,6 +200,12 @@ export class CesiumSectorLayer {
   /** 全部扇区（圈选按几何收集时用，不做视口剔除） */
   getAllSectors(): RenderSectorData[] {
     return this.allSectors
+  }
+
+  /** 专题图例统计（与 2D 同算法，保证两边图例数字一致） */
+  getThematicStats(): ThematicStats | null {
+    return computeThematicStats(
+      this.ctx.thematic, this.allSectors as unknown as Array<Record<string, any>>)
   }
   isVisible(): boolean {
     return this.visible

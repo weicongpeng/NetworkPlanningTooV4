@@ -37,6 +37,7 @@ import {
   isGeoDataDot,
   GEO_DATA_SECTOR_LOD_ZOOM,
   featureSelectionId,
+  geometryAnchor,
   emptyBounds,
   hasBounds,
   extendBounds,
@@ -61,6 +62,16 @@ import {
 } from './CesiumSelectionSession'
 import { orderWithIds, isLayerSelectable } from '../layerZOrder'
 import { selectionManager } from '../../../services/selectionManager'
+import { CesiumHeatmapLayer } from './CesiumHeatmapLayer'
+import type { HeatmapSettings } from '../LabelSettingsModal'
+import {
+  collectBoundaryPolygons,
+  collectGeoDataPolygons,
+  type HeatBoundary,
+} from '../../../utils/heatSurface'
+import type { HeatPoint } from '../../../utils/heatmap'
+import { getFieldValue, toNumber } from '../../../utils/fieldValue'
+import { resolveSectorField } from '../../../config/sector-config'
 
 type CesiumMapProps = ComponentProps<typeof OnlineMap>
 
@@ -94,6 +105,17 @@ function sectorFromPick(picked: any): RenderSectorData | null {
   if (id.sector) return id.sector as RenderSectorData
   if (id.sectorData) return id.sectorData as RenderSectorData
   return null
+}
+
+/**
+ * 热力渲染边界多边形 GCJ02 → WGS84。
+ * 后端给出的边界多边形是 GCJ02（与 2D 显示链路一致），Cesium 侧一切按 WGS84 对齐。
+ */
+function toWgs84Boundary(polygons: HeatBoundary): HeatBoundary {
+  return polygons.map((rings) => rings.map((ring) => ring.map(([lng, lat]) => {
+    const [wlat, wlng] = gcj02ToWgs84(lat, lng)
+    return [wlng, wlat]
+  })))
 }
 
 /**
@@ -178,6 +200,10 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
   const editSessionRef = useRef<CesiumEditSession | null>(null)
   // 测距 / 抓取坐标工具
   const mapToolsRef = useRef<CesiumMapTools | null>(null)
+  // 值热力面（按图层 id 复用）
+  const heatmapsRef = useRef<Map<string, CesiumHeatmapLayer>>(new Map())
+  // 天地图注记影像层（只清理自己创建的，避免误删热力面等其它 imagery 层）
+  const annotationLayersRef = useRef<any[]>([])
   // 圈选 / 点选会话
   const selectionRef = useRef<CesiumSelectionSession | null>(null)
   const [selectionTip, setSelectionTip] = useState('')
@@ -306,6 +332,8 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
       layer.setSelectionIds(selectionIdsRef.current)
     }
     decorationLayerRef.current?.setSelectionIds(selectionIdsRef.current)
+    // 数据/设置变化后重放热力面（指纹未变时 CesiumHeatmapLayer 内部会跳过重算）
+    replayHeatmaps()
   }
 
   /** 同步图层文件 + 地理化数据（layerFiles / pointFiles 结构一致） */
@@ -482,6 +510,96 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
     setGeoInfo(null)
     setSectorInfo(null)
     setOverlapSectors([])
+  }
+
+  // ===== 值热力面（与 2D 共用计算与栅格化，见 CesiumHeatmapLayer） =====
+
+  /** 收集某图层的热力点（WGS84）。扇区取 originalLat/Lng，图层要素取几何锚点 */
+  function collectHeatPoints(layerId: string, field: string): HeatPoint[] {
+    const key: LayerKey | null = layerId === 'lte-sectors' ? 'lte'
+      : layerId === 'nr-sectors' ? 'nr' : null
+    if (key) {
+      // 与 2D SectorRendererSVG.getHeatPoints 同口径：展示别名先映射回真实字段，非数值跳过
+      const realField = resolveSectorField(field)
+      const out: HeatPoint[] = []
+      for (const s of sectorLayersRef.current[key]?.getAllSectors() ?? []) {
+        const w = toNumber((s as unknown as Record<string, unknown>)[realField])
+        if (w === null) continue
+        if (!Number.isFinite(s.originalLat) || !Number.isFinite(s.originalLng)) continue
+        out.push({ lat: s.originalLat, lng: s.originalLng, weight: w })
+      }
+      return out
+    }
+    const layer = geoJsonLayersRef.current.get(layerId)
+    if (!layer) return []
+    const out: HeatPoint[] = []
+    for (const f of layer.getFeatures() as any[]) {
+      const props = (f.properties ?? {}) as Record<string, unknown>
+      const w = toNumber(getFieldValue(props, field))
+      if (w === null) continue
+      const anchor = geometryAnchor(f.geometry)
+      if (!anchor) continue
+      out.push({ lat: anchor[1], lng: anchor[0], weight: w })
+    }
+    return out
+  }
+
+  /**
+   * 渲染某图层的热力面；settings 为 null/未启用时移除。
+   * 边界多边形从后端取（GCJ02）后转 WGS84 —— Cesium 侧一切都按 WGS84 对齐。
+   */
+  async function renderHeatmapFor(layerId: string, settings: HeatmapSettings | null) {
+    let layer = heatmapsRef.current.get(layerId)
+    if (!settings?.enabled || !settings.field) {
+      if (layer) { layer.remove(); heatmapsRef.current.delete(layerId) }
+      return
+    }
+    if (!layer) {
+      const C = (window as any).Cesium
+      const viewer = viewerRef.current
+      if (!C || !viewer) return
+      layer = new CesiumHeatmapLayer(C, viewer, layerId)
+      heatmapsRef.current.set(layerId, layer)
+    }
+    const boundary = await loadHeatBoundary(settings)
+    if (!heatmapsRef.current.has(layerId)) return // 期间被关掉了
+    layer.render(collectHeatPoints(layerId, settings.field), settings, boundary)
+  }
+
+  /** 加载热力渲染边界多边形（GCJ02 → WGS84） */
+  async function loadHeatBoundary(settings: HeatmapSettings): Promise<HeatBoundary | null> {
+    const layerId = settings.boundaryLayerId
+    if (!layerId) return null
+    try {
+      let polygons: HeatBoundary | null = null
+      if ((settings.boundarySource ?? 'mapinfo') === 'excel') {
+        const resp = await dataApi.get(settings.boundaryDataId ?? '')
+        polygons = collectGeoDataPolygons(resp?.data)
+      } else {
+        let geojson = useMapDataCacheStore.getState().layers[layerId]?.geojson
+        if (!geojson && settings.boundaryDataId) {
+          const resp = await layerApi.getLayerData(settings.boundaryDataId, layerId)
+          if (resp.success && resp.data) geojson = resp.data
+        }
+        polygons = collectBoundaryPolygons(geojson)
+      }
+      return polygons ? toWgs84Boundary(polygons) : null
+    } catch (e) {
+      console.warn('[CesiumMap] 热力边界加载失败:', layerId, e)
+      return null
+    }
+  }
+
+  /** 重放所有已启用的热力设置（数据变化 / 首次进入 3D 时） */
+  function replayHeatmaps() {
+    const map = (mapSettingsRef.current.heatmapSettingsMap ?? {}) as Record<string, HeatmapSettings>
+    for (const [layerId, settings] of Object.entries(map)) {
+      if (settings?.enabled) void renderHeatmapFor(layerId, settings)
+    }
+    // 已关掉的图层要把残留热力面摘掉
+    for (const [layerId, layer] of [...heatmapsRef.current]) {
+      if (!map[layerId]?.enabled) { layer.remove(); heatmapsRef.current.delete(layerId) }
+    }
   }
 
   /** 图层 id → 显示名（属性框副标题） */
@@ -733,6 +851,10 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
       editSessionRef.current = null
       try { selectionRef.current?.destroy() } catch { /* ignore */ }
       selectionRef.current = null
+      for (const h of heatmapsRef.current.values()) {
+        try { h.destroy() } catch { /* ignore */ }
+      }
+      heatmapsRef.current.clear()
       try { sectorLayersRef.current.lte?.destroy() } catch { /* ignore */ }
       try { sectorLayersRef.current.nr?.destroy() } catch { /* ignore */ }
       try { viewerRef.current?.destroy() } catch { /* ignore */ }
@@ -861,8 +983,12 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
     const ann = mapSettings.tiandituAnnotations
     const layers = viewer.imageryLayers
 
-    // 移除除底图外的所有注记层（destroy=true 释放瓦片资源）
-    while (layers.length > 1) layers.remove(layers.get(1), true)
+    // 只移除**本效应自己创建的**注记层（destroy=true 释放瓦片资源）。
+    // 不能"删掉除底图外的所有层"——那会把热力面等其它 imagery 层一起清掉。
+    for (const l of annotationLayersRef.current) {
+      try { layers.remove(l, true) } catch { /* ignore */ }
+    }
+    annotationLayersRef.current = []
 
     // 3D 底图是天地图**影像**，所以只叠影像注记（矢量注记/地形注记与影像底图不匹配，不渲染），
     // 与 2D 侧的「只渲染与当前底图匹配的注记」规则一致
@@ -873,7 +999,7 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
     for (const [code, on] of wanted) {
       if (!on) continue
       try {
-        layers.addImageryProvider(tiandituProvider(C, code, key))
+        annotationLayersRef.current.push(layers.addImageryProvider(tiandituProvider(C, code, key)))
       } catch (e) {
         console.warn('[CesiumMap] 注记图层加载失败:', code, e)
       }
@@ -1011,12 +1137,25 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
       refreshSectorColors: () => syncAll(),
       setLayerThematicSettings: noop,
       setSectorThematicSettings: () => syncAll(),
-      setLayerHeatmapSettings: noop,
-      setSectorHeatmapSettings: noop,
-      getHeatmapStats: () => null,
-      replayHeatmapSettings: noop,
-      getSectorThematicStats: () => null,
-      getLayerThematicStats: () => null,
+      setLayerHeatmapSettings: (fileId, settings) => {
+        void renderHeatmapFor(fileId, settings)
+      },
+      setSectorHeatmapSettings: (layerId, settings) => {
+        void renderHeatmapFor(layerId, settings)
+      },
+      getHeatmapStats: (layerId) => heatmapsRef.current.get(layerId)?.getStats() ?? null,
+      replayHeatmapSettings: () => replayHeatmaps(),
+      getSectorThematicStats: (layerId) => {
+        const key: LayerKey | null = layerId === 'lte-sectors' ? 'lte'
+          : layerId === 'nr-sectors' ? 'nr' : null
+        return key ? sectorLayersRef.current[key]?.getThematicStats() ?? null : null
+      },
+      getLayerThematicStats: (fileId) => {
+        const key: LayerKey | null = fileId === 'lte-sectors' ? 'lte'
+          : fileId === 'nr-sectors' ? 'nr' : null
+        if (key) return sectorLayersRef.current[key]?.getThematicStats() ?? null
+        return geoJsonLayersRef.current.get(fileId)?.getThematicStats() ?? null
+      },
       toggleMapType: noop,
       setFrequencyVisibility: () => syncAll(),
       setCustomLayerVisibility: noop,

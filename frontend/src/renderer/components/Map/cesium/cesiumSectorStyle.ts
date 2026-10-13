@@ -102,10 +102,12 @@ export function resolveSectorStyle(
     if (typeof ctx.colorOverrides.borderWidth === 'number') strokeWidth = ctx.colorOverrides.borderWidth
   }
 
-  // 专题覆盖（透明度/边框色）
+  // 专题覆盖（透明度/边框色/图形大小）
+  // 扇区属面状图层，「图形大小」语义为**边框宽度**（与 2D SectorRendererSVG 及图层文件一致）
   if (ctx.thematic?.enabled) {
     if (typeof ctx.thematic.fillOpacity === 'number') fillOpacity = ctx.thematic.fillOpacity
     if (ctx.thematic.borderColor) strokeColor = ctx.thematic.borderColor
+    if (typeof ctx.thematic.pointSize === 'number') strokeWidth = ctx.thematic.pointSize
   }
 
   return { fillColor, strokeColor, strokeWidth, fillOpacity }

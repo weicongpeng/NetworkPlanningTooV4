@@ -1222,6 +1222,7 @@
     "annotationTerrain": "地形注记",
     "annotationPlaceName": "三维地名",
     "annotationMatchHint": "注记只在对应的天地图底图上显示：矢量注记→矢量图，影像注记→卫星图。当前下拉没有地形底图，地形注记暂不显示。",
+    "copyFailed": "复制失败，请检查浏览器剪贴板权限",
     "compassReset": "回正北",
     "buildingStyle": "建筑样式",
     "buildingStyleHint": "仅影响 OSM 3D 建筑；关闭底图建筑可明显提升 3D 交互流畅度。",

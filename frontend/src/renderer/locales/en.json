@@ -1281,6 +1281,7 @@
     "annotationTerrain": "Terrain annotation",
     "annotationPlaceName": "3D place names",
     "annotationMatchHint": "Annotations only show on their matching Tianditu basemap: vector annotation on the vector map, image annotation on the satellite map. There is no terrain basemap yet, so terrain annotation stays hidden.",
+    "copyFailed": "Copy failed — check browser clipboard permissions",
     "compassReset": "Reset to north",
     "buildingStyle": "Building style",
     "buildingStyleHint": "Affects OSM 3D buildings only. Turning them off noticeably improves 3D interaction smoothness.",

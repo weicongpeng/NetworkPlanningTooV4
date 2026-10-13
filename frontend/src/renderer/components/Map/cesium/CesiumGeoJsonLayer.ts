@@ -14,6 +14,7 @@ import {
 } from '../../../utils/fieldValue'
 import type { LayerColorSettings, LabelSettings, ThematicSettings } from '../LabelSettingsModal'
 import { geometryAnchor, polygonOuterRings, featureSelectionId } from './cesiumGeoJson'
+import { computeThematicStats, type ThematicStats } from '../../../utils/thematicStats'
 
 type Position = number[]
 
@@ -121,6 +122,13 @@ export class CesiumGeoJsonLayer {
   getFeatures(): GeoFeature[] {
     return this.fc.features
   }
+
+  /** 专题图例统计（与 2D 同算法，保证两边图例数字一致） */
+  getThematicStats(): ThematicStats | null {
+    return computeThematicStats(
+      this.thematic,
+      this.fc.features.map((f) => (f.properties ?? {}) as Record<string, any>))
+  }
   setVisible(visible: boolean): void {
     this.visible = visible
     this.render()
@@ -200,10 +208,10 @@ export class CesiumGeoJsonLayer {
     }
 
     let fillOpacity = user?.fillOpacity ?? fs.fillOpacity ?? base.fillOpacity ?? def.fillOpacity
-    const strokeWidth = user?.borderWidth ?? fs.strokeWidth ?? base.borderWidth ?? def.width
-    const pointSize = user?.pointSize ?? fs.markerSize ?? base.pointSize ?? def.pointSize
+    let strokeWidth = user?.borderWidth ?? fs.strokeWidth ?? base.borderWidth ?? def.width
+    let pointSize = user?.pointSize ?? fs.markerSize ?? base.pointSize ?? def.pointSize
 
-    // 专题：填充色/透明度/边框色覆盖（与 2D 的专题优先级一致）
+    // 专题：填充色/透明度/边框色/图形大小覆盖（与 2D 的专题优先级一致）
     if (this.thematic?.enabled) {
       if (this.thematic.field && feature.properties) {
         const c = matchThematicColor(
@@ -212,6 +220,11 @@ export class CesiumGeoJsonLayer {
       }
       if (typeof this.thematic.fillOpacity === 'number') fillOpacity = this.thematic.fillOpacity
       if (this.thematic.borderColor) strokeColor = this.thematic.borderColor
+      // 「图形大小」：点要素=点大小，线/面=边框宽度（2D MapInfoLayer / GeoDataLayer 同语义）
+      if (typeof this.thematic.pointSize === 'number') {
+        if (kind === 'point') pointSize = this.thematic.pointSize
+        else strokeWidth = this.thematic.pointSize
+      }
     }
 
     // KML 声明无填充且用户未自定义 → 不填充（只画边框）

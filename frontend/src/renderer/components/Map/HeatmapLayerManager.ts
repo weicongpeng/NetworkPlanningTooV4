@@ -26,6 +26,7 @@ import {
   type HeatLegendLevel,
   type HeatLegendOverride,
   type HeatPoint,
+  type NormalizedHeat,
 } from '../../utils/heatmap'
 import { buildValueMapper, collectBoundaryPolygons, collectGeoDataPolygons, concentrateLevel, filterPointsToBoundary, probeFieldDistribution, softQuantizeLevel, renderHeatSurface, type HeatBoundary } from '../../utils/heatSurface'
 import { DEG2RAD, EARTH_RADIUS, buildHeatField, nearestNeighborDistances, projectToMercator, unprojectFromMercator, type HeatField } from '../../utils/heatField'
@@ -84,6 +85,8 @@ interface HeatEntry {
   radiusMeters: number
   /** 逐点覆盖半径（米，与 points 对齐）：稀疏点半径放大补洞，与视口无关 */
   pointRadii: Float64Array
+  /** 本次渲染的纯计算结果（半径/场/映射/统计）——paint 直接用它栅格化 */
+  comp: HeatComputation
   /** 插值场（建桶结果）：颜色分级标定与栅格渲染共用同一个场 */
   field: HeatField | null
   /** 原始采样模式的逐点渲染图层（grid 模式为 null） */
@@ -116,7 +119,7 @@ interface HeatEntry {
 /**
  * 稳定的设置序列化（key 排序）：用于判断热力设置是否变化，决定能否复用已渲染栅格
  */
-function heatSettingsSignature(settings: HeatmapSettings): string {
+export function heatSettingsSignature(settings: HeatmapSettings): string {
   const src = settings as unknown as Record<string, unknown>
   const keys = Object.keys(src).sort()
   return JSON.stringify(keys.map(k => [k, src[k]]))
@@ -126,7 +129,7 @@ function heatSettingsSignature(settings: HeatmapSettings): string {
  * 点集指纹（FNV-1a，含点数）：坐标或权重任一变化都会得到不同指纹。
  * 用于判断"数据未变"，从而跳过昂贵的插值渲染/编码（跨页面返回时直接复用栅格）。
  */
-function fingerprintHeatPoints(points: HeatPoint[]): string {
+export function fingerprintHeatPoints(points: HeatPoint[]): string {
   let h = 2166136261 >>> 0
   for (let i = 0; i < points.length; i++) {
     const p = points[i]
@@ -137,79 +140,47 @@ function fingerprintHeatPoints(points: HeatPoint[]): string {
   return `${points.length}:${h.toString(36)}`
 }
 
-export class HeatmapLayerManager {
-  private entries = new Map<string, HeatEntry>()
-  /** 边界图层多边形缓存：key=图层 id，值 null 表示该图层不是面或无数据 */
-  private boundaries = new Map<string, HeatBoundary | null>()
-  /** 正在加载的边界图层 id → 开始时间戳（避免重复请求，并支持超时后重试） */
-  private boundaryLoading = new Map<string, number>()
+/**
+ * 热力渲染的**纯计算部分**：点集 + 设置 → 半径 / 插值场 / 值→色带位置映射 / 图例统计。
+ *
+ * 抽出来是为了让 **3D（Cesium）复用同一套计算**：半径推导、分级、分位基准、图例取值全部与
+ * 2D 同源，否则同一个设置在两边会渲染出不同的颜色分布。整个过程不涉及任何 Leaflet 对象。
+ *
+ * @returns null 表示无有效点（调用方应移除既有热力层）
+ */
+export interface HeatComputation {
+  normalized: NormalizedHeat
+  /** 图例统计中与渲染无关的部分 */
+  baseStats: { min: number; max: number; count: number; sampled: boolean; field: string }
+  /** 全局覆盖半径（米） */
+  radiusMeters: number
+  /** 逐点半径（米） */
+  pointRadii: Float64Array
+  /** IDW 插值场；原始采样模式下为 null */
+  field: HeatField | null
+  /** 值 → 色带位置（0~1）的最终映射（含对比度/高值集中度/分级量化） */
+  mapValue: (v: number) => number
+  stats: HeatmapStats
+  /** 是否"原始采样"模式 */
+  isOriginal: boolean
+}
 
-  /**
-   * 应用/更新某图层的热力渲染。
-   * 无有效点时移除既有热力层并返回 null。
-   */
-  apply(map: L.Map, layerId: string, points: HeatPoint[], settings: HeatmapSettings): Promise<HeatmapStats | null> {
-    const settingsSig = heatSettingsSignature(settings)
-    const dataFingerprint = fingerprintHeatPoints(points)
+export function computeHeatComputation(
+  points: HeatPoint[],
+  settings: HeatmapSettings,
+): HeatComputation | null {
+  const normalized = normalizeHeatPoints(points)
+  if (normalized.points.length === 0) return null
 
-    // 设置与点集都未变化 → 复用已渲染栅格：只把覆盖层挂回地图（跨页面返回/重复重放时
-    // 跳过 IDW 插值渲染与 PNG 编码这两个最耗时的步骤）
-    const reusable = this.entries.get(layerId)
-    if (reusable && reusable.map === map && reusable.ready
-      && reusable.settingsSig === settingsSig && reusable.dataFingerprint === dataFingerprint) {
-      this.attach(reusable)
-      // 渲染边界兜底：栅格未按当前边界裁剪（边界刚换/当时未就绪）时补绘或重试加载
-      this.ensureBoundaryApplied(reusable)
-      return Promise.resolve(reusable.stats)
-    }
+  // 图例统计中与渲染无关的部分（levels 要等映射函数算好后才能定）
+  const baseStats: HeatComputation['baseStats'] = {
+    min: normalized.min,
+    max: normalized.max,
+    count: normalized.count,
+    sampled: normalized.sampled,
+    field: settings.field,
+  }
 
-    const normalized = normalizeHeatPoints(points)
-    if (normalized.points.length === 0) {
-      this.remove(layerId)
-      return Promise.resolve(null)
-    }
-
-    // 图例统计中与渲染无关的部分（levels 要等映射函数算好后才能定）
-    const baseStats = {
-      min: normalized.min,
-      max: normalized.max,
-      count: normalized.count,
-      sampled: normalized.sampled,
-      field: settings.field,
-    }
-
-    const existing = this.entries.get(layerId)
-    // 地图实例不同（旧地图已销毁/重建）：先释放旧栅格与 blob URL，避免内存泄漏
-    if (existing && existing.map !== map) this.remove(layerId)
-    const entry: HeatEntry = existing && existing.map === map
-      ? existing
-      : {
-        layerId,
-        overlay: L.imageOverlay(EMPTY_TILE, map.getBounds(), { interactive: false }).addTo(map),
-        map,
-        stats: { ...baseStats, levels: [], fieldDistribution: new Float64Array(0) },
-        points: normalized.points,
-        settings,
-        radiusMeters: 0,
-        pointRadii: new Float64Array(0),
-        field: null,
-        pointLayer: null,
-        mapValue: (v: number) => v,
-        generation: 0,
-        bounds: map.getBounds(),
-        objectUrl: null,
-        settingsSig,
-        dataFingerprint,
-        ready: false,
-        rendered: false,
-        paintedFingerprint: null,
-        paintedBoundaryId: null,
-      }
-    entry.points = normalized.points
-    entry.settings = settings
-    entry.settingsSig = settingsSig
-    entry.dataFingerprint = dataFingerprint
-    entry.ready = false
     // 渲染基准只在数据/设置变化时重算，且均与视口无关 → 缩放平移时同一位置颜色固定：
     // - 全局半径 = max(P90 最近邻, 密度半径) × 平滑强度，全部由数据决定（无屏幕像素项，
     //   旧"40 屏幕像素"兜底随缩放变化，是"缩放前后结果不一致"的来源之一）
@@ -260,8 +231,6 @@ export class HeatmapLayerManager {
         pointRadii[i] = Math.min(Math.max(nn[i] * smooth, globalR), cap)
       }
     }
-    entry.radiusMeters = globalR
-    entry.pointRadii = pointRadii
     // 颜色分级基准分布按采样方式分别取：
     // - grid（默认）：取**渲染出来的插值场**分布（按桶面积等权）——插值会把邻域值
     //   平均掉，与原始点分布差很远，用后者定分位时整幅图只用得到色带中段
@@ -276,11 +245,6 @@ export class HeatmapLayerManager {
     if (isOriginal) {
       field = null
       distribution = buildQuantileRef(Float64Array.from(normalized.points, p => p.weight).sort())
-      // 上一模式是 grid：旧逐点图层（若存在）先移除，paint 中按新数据惰性重建
-      if (entry.pointLayer) {
-        try { map.removeLayer(entry.pointLayer) } catch { /* ignore */ }
-        entry.pointLayer = null
-      }
     } else {
       field = buildHeatField(
         normalized.points,
@@ -292,7 +256,6 @@ export class HeatmapLayerManager {
       )
       distribution = field ? buildQuantileRef(probeFieldDistribution(field)) : new Float64Array(0)
     }
-    entry.field = field
     const method = settings.method ?? 'cellCount'
     const contrast = settings.contrast ?? DEFAULT_HEATMAP_SETTINGS.contrast
     // 用户手工编辑过分级 → 以 (值, 色带位置) 锚点做分段映射；
@@ -331,10 +294,9 @@ export class HeatmapLayerManager {
     const finalMapValue = discreteLevels >= 2
       ? (v: number) => softQuantizeLevel(mappedWithConcentration(v), discreteLevels, settings.levelSoftness ?? DEFAULT_HEATMAP_SETTINGS.levelSoftness!)
       : mappedWithConcentration
-    entry.mapValue = finalMapValue
     // 分级图例与渲染走同一套分级与同一映射函数，
     // 图例色块不会列出地图上不存在的颜色（重复值/退化值域下尤其明显）
-    entry.stats = {
+    const stats: HeatmapStats = {
       ...baseStats,
       fieldDistribution: distribution,
       levels: buildHeatLegend(
@@ -346,6 +308,183 @@ export class HeatmapLayerManager {
         settings.round ?? DEFAULT_HEATMAP_SETTINGS.round!,
         { mapValue: finalMapValue, overrides: customLevels ?? undefined, distribution }
       ),
+    }
+  return {
+    normalized,
+    baseStats,
+    radiusMeters: globalR,
+    pointRadii,
+    field,
+    mapValue: finalMapValue,
+    stats,
+    isOriginal,
+  }
+}
+
+/** 热力面栅格：位图 + 其地理范围 */
+export interface HeatRaster {
+  canvas: HTMLCanvasElement
+  bounds: { south: number; west: number; north: number; east: number }
+}
+
+/**
+ * 把热力计算结果**栅格化成位图**（含边界裁剪、色带映射、覆盖半径外渐隐）。
+ *
+ * 2D 侧把它贴成 `L.ImageOverlay`、3D 侧贴成 Cesium `SingleTileImageryProvider`，
+ * 两边用同一张图、同一套色带与分级，同一设置在两端的观感一致。
+ *
+ * @returns null 表示数据范围退化（点完全重合）或渲染失败
+ */
+export function renderHeatRaster(
+  comp: HeatComputation,
+  settings: HeatmapSettings,
+  boundary: HeatBoundary | null,
+): HeatRaster | null {
+  // 数据范围（Mercator 米），外扩全局半径的 1.5 倍作为边缘渐隐带
+  let minX = Infinity
+  let maxX = -Infinity
+  let minY = Infinity
+  let maxY = -Infinity
+  for (const p of comp.normalized.points) {
+    const m = projectToMercator(p.lat, p.lng)
+    if (m.x < minX) minX = m.x
+    if (m.x > maxX) maxX = m.x
+    if (m.y < minY) minY = m.y
+    if (m.y > maxY) maxY = m.y
+  }
+  const pad = comp.radiusMeters * 1.5
+  minX -= pad
+  maxX += pad
+  minY -= pad
+  maxY += pad
+  const spanX = maxX - minX
+  const spanY = maxY - minY
+  if (!(spanX > 0) || !(spanY > 0)) return null
+  // 分辨率：长边适配预算（与视口无关），短边按纵横比
+  const budget = MAX_SIDE
+  const spanMax = Math.max(spanX, spanY)
+  const width = Math.max(64, Math.min(MAX_SIDE, Math.round((spanX / spanMax) * budget)))
+  const height = Math.max(64, Math.min(MAX_SIDE, Math.round((spanY / spanMax) * budget)))
+  const dataBounds = mercatorBoundsToLatLng(minX, minY, maxX, maxY)
+  // 有裁剪边界时：**用边界内的点重建插值场**（entry.field 含边界外桶，其核值/覆盖度
+  // 会越界污染内像素，外部值偏低时表现为沿边界整体偏暗）；无边界则复用标定场
+  let paintField: HeatField | null = comp.field
+  let paintPoints = comp.normalized.points
+  let paintRadii: Float64Array | undefined = comp.pointRadii
+  if (boundary) {
+    const inside = filterPointsToBoundary(comp.normalized.points, comp.pointRadii, boundary)
+    paintPoints = inside.points
+    paintRadii = inside.pointRadii
+    paintField = buildHeatField(
+      inside.points,
+      comp.radiusMeters,
+      inside.pointRadii,
+      settings.detail ?? DEFAULT_HEATMAP_SETTINGS.detail!,
+      settings.sampling ?? DEFAULT_HEATMAP_SETTINGS.sampling,
+      settings.smooth ?? DEFAULT_HEATMAP_SETTINGS.smooth
+    )
+  }
+  const canvas = renderHeatSurface({
+    points: paintPoints,
+    // 无边界=复用标定场（同源）；有边界=边界内点重建场（无污染）
+    field: paintField,
+    min: comp.stats.min,
+    max: comp.stats.max,
+    mapValue: comp.mapValue,
+    // 色带：有自定义级色时按分级锚点重建（含颜色方向镜像：自定义色注册到镜像位），
+    // 保证地图配色与图例色块一致
+    lut: buildGradientLut(resolveLevelGradient(
+      resolveHeatGradient(settings.colorScheme, settings.colorDirection),
+      comp.stats.levels,
+      settings.colorDirection
+    )),
+    radius: comp.radiusMeters,
+    pointRadii: paintRadii,
+    bounds: dataBounds,
+    width,
+    height,
+    opacity: settings.opacity ?? 1,
+    boundary,
+  })
+
+  return canvas ? { canvas, bounds: dataBounds } : null
+}
+
+export class HeatmapLayerManager {
+  private entries = new Map<string, HeatEntry>()
+  /** 边界图层多边形缓存：key=图层 id，值 null 表示该图层不是面或无数据 */
+  private boundaries = new Map<string, HeatBoundary | null>()
+  /** 正在加载的边界图层 id → 开始时间戳（避免重复请求，并支持超时后重试） */
+  private boundaryLoading = new Map<string, number>()
+
+  /**
+   * 应用/更新某图层的热力渲染。
+   * 无有效点时移除既有热力层并返回 null。
+   */
+  apply(map: L.Map, layerId: string, points: HeatPoint[], settings: HeatmapSettings): Promise<HeatmapStats | null> {
+    const settingsSig = heatSettingsSignature(settings)
+    const dataFingerprint = fingerprintHeatPoints(points)
+
+    // 设置与点集都未变化 → 复用已渲染栅格：只把覆盖层挂回地图（跨页面返回/重复重放时
+    // 跳过 IDW 插值渲染与 PNG 编码这两个最耗时的步骤）
+    const reusable = this.entries.get(layerId)
+    if (reusable && reusable.map === map && reusable.ready
+      && reusable.settingsSig === settingsSig && reusable.dataFingerprint === dataFingerprint) {
+      this.attach(reusable)
+      // 渲染边界兜底：栅格未按当前边界裁剪（边界刚换/当时未就绪）时补绘或重试加载
+      this.ensureBoundaryApplied(reusable)
+      return Promise.resolve(reusable.stats)
+    }
+
+    const comp = computeHeatComputation(points, settings)
+    if (!comp) {
+      this.remove(layerId)
+      return Promise.resolve(null)
+    }
+
+    const existing = this.entries.get(layerId)
+    // 地图实例不同（旧地图已销毁/重建）：先释放旧栅格与 blob URL，避免内存泄漏
+    if (existing && existing.map !== map) this.remove(layerId)
+    const entry: HeatEntry = existing && existing.map === map
+      ? existing
+      : {
+        layerId,
+        overlay: L.imageOverlay(EMPTY_TILE, map.getBounds(), { interactive: false }).addTo(map),
+        map,
+        stats: { ...comp.baseStats, levels: [], fieldDistribution: new Float64Array(0) },
+        comp,
+        points: comp.normalized.points,
+        settings,
+        radiusMeters: 0,
+        pointRadii: new Float64Array(0),
+        field: null,
+        pointLayer: null,
+        mapValue: (v: number) => v,
+        generation: 0,
+        bounds: map.getBounds(),
+        objectUrl: null,
+        settingsSig,
+        dataFingerprint,
+        ready: false,
+        rendered: false,
+        paintedFingerprint: null,
+        paintedBoundaryId: null,
+      }
+    entry.points = comp.normalized.points
+    entry.settings = settings
+    entry.settingsSig = settingsSig
+    entry.dataFingerprint = dataFingerprint
+    entry.ready = false
+    entry.comp = comp
+    entry.radiusMeters = comp.radiusMeters
+    entry.pointRadii = comp.pointRadii
+    entry.field = comp.field
+    entry.mapValue = comp.mapValue
+    entry.stats = comp.stats
+    // 原始采样模式下上一轮的逐点图层（若存在）先移除，paint 中按新数据惰性重建
+    if (comp.isOriginal && entry.pointLayer) {
+      try { map.removeLayer(entry.pointLayer) } catch { /* ignore */ }
+      entry.pointLayer = null
     }
     this.entries.set(layerId, entry)
 
@@ -475,72 +614,9 @@ export class HeatmapLayerManager {
       entry.pointLayer = null
     }
 
-    // 数据范围（Mercator 米），外扩全局半径的 1.5 倍作为边缘渐隐带
-    let minX = Infinity
-    let maxX = -Infinity
-    let minY = Infinity
-    let maxY = -Infinity
-    for (const p of entry.points) {
-      const m = projectToMercator(p.lat, p.lng)
-      if (m.x < minX) minX = m.x
-      if (m.x > maxX) maxX = m.x
-      if (m.y < minY) minY = m.y
-      if (m.y > maxY) maxY = m.y
-    }
-    const pad = entry.radiusMeters * 1.5
-    minX -= pad
-    maxX += pad
-    minY -= pad
-    maxY += pad
-    const spanX = maxX - minX
-    const spanY = maxY - minY
-    if (!(spanX > 0) || !(spanY > 0)) return
-    // 分辨率：长边适配预算（与视口无关），短边按纵横比
-    const budget = MAX_SIDE
-    const spanMax = Math.max(spanX, spanY)
-    const width = Math.max(64, Math.min(MAX_SIDE, Math.round((spanX / spanMax) * budget)))
-    const height = Math.max(64, Math.min(MAX_SIDE, Math.round((spanY / spanMax) * budget)))
-    const dataBounds = mercatorBoundsToLatLng(minX, minY, maxX, maxY)
-    // 有裁剪边界时：**用边界内的点重建插值场**（entry.field 含边界外桶，其核值/覆盖度
-    // 会越界污染内像素，外部值偏低时表现为沿边界整体偏暗）；无边界则复用标定场
-    let paintField: HeatField | null = entry.field
-    let paintPoints = entry.points
-    let paintRadii: Float64Array | undefined = entry.pointRadii
-    if (boundary) {
-      const inside = filterPointsToBoundary(entry.points, entry.pointRadii, boundary)
-      paintPoints = inside.points
-      paintRadii = inside.pointRadii
-      paintField = buildHeatField(
-        inside.points,
-        entry.radiusMeters,
-        inside.pointRadii,
-        entry.settings.detail ?? DEFAULT_HEATMAP_SETTINGS.detail!,
-        entry.settings.sampling ?? DEFAULT_HEATMAP_SETTINGS.sampling,
-        entry.settings.smooth ?? DEFAULT_HEATMAP_SETTINGS.smooth
-      )
-    }
-    const canvas = renderHeatSurface({
-      points: paintPoints,
-      // 无边界=复用标定场（同源）；有边界=边界内点重建场（无污染）
-      field: paintField,
-      min: entry.stats.min,
-      max: entry.stats.max,
-      mapValue: entry.mapValue,
-      // 色带：有自定义级色时按分级锚点重建（含颜色方向镜像：自定义色注册到镜像位），
-      // 保证地图配色与图例色块一致
-      lut: buildGradientLut(resolveLevelGradient(
-        resolveHeatGradient(entry.settings.colorScheme, entry.settings.colorDirection),
-        entry.stats.levels,
-        entry.settings.colorDirection
-      )),
-      radius: entry.radiusMeters,
-      pointRadii: paintRadii,
-      bounds: dataBounds,
-      width,
-      height,
-      opacity: entry.settings.opacity ?? 1,
-      boundary,
-    })
+    const raster = renderHeatRaster(entry.comp, entry.settings, boundary)
+    const canvas = raster?.canvas ?? null
+    const dataBounds = raster?.bounds ?? mercatorBoundsToLatLng(0, 0, 0, 0)
 
     // 栅格地理范围固定：只需设一次边界（数据/设置变化会重走 paint）
     const bounds = L.latLngBounds([dataBounds.south, dataBounds.west], [dataBounds.north, dataBounds.east])

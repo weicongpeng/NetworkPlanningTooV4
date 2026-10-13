@@ -1010,10 +1010,12 @@ export class SectorSVGLayer extends L.Layer {
       if (typeof this.colorOverrides.borderWidth === 'number') strokeWidth = this.colorOverrides.borderWidth
     }
 
-    // 专题设置覆盖（图形透明度/边框颜色）：专题启用时优先于默认设置
+    // 专题设置覆盖（图形透明度/边框颜色/图形大小）：专题启用时优先于默认设置。
+    // 扇区属面状图层，「图形大小」语义为**边框宽度**（与图层文件的面/线一致）。
     if (this.thematicSettings?.enabled) {
       if (typeof this.thematicSettings.fillOpacity === 'number') fillOpacity = this.thematicSettings.fillOpacity
       if (this.thematicSettings.borderColor) strokeColor = this.thematicSettings.borderColor
+      if (typeof this.thematicSettings.pointSize === 'number') strokeWidth = this.thematicSettings.pointSize
     }
 
     return { fillColor, strokeColor, strokeWidth, fillOpacity }
