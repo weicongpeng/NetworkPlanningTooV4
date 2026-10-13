@@ -19,6 +19,9 @@ import type { LabelCandidateBase } from '../labelLayoutCore'
 
 /** 单图层的标签候选上限（按离视野中心近的优先保留） */
 const MAX_LABEL_CANDIDATES = 2000
+/** 选中态整面高亮（与 2D GeoDataLayer.setSelectionHighlight 同口径） */
+const SELECTED_FILL_COLOR = '#ef4444'
+const SELECTED_FILL_OPACITY = 0.35
 import { computeThematicStats, type ThematicStats } from '../../../utils/thematicStats'
 
 type Position = number[]
@@ -435,9 +438,16 @@ export class CesiumGeoJsonLayer {
                 vertexFormat: C.PerInstanceColorAppearance.VERTEX_FORMAT,
               }),
               attributes: {
+                /**
+                 * 选中态：**整个面**用选中色填充（不再只是描边变色）。
+                 * 面状要素圈选/点选后只有红框时，"到底选中了哪个面"在密集图层里很难辨认，
+                 * 与 2D `GeoDataLayer.setSelectionHighlight` 的整面高亮口径对齐。
+                 * 未选中时维持原填充；「无色填充」仍只给 0.01 的命中用 alpha。
+                 */
                 color: C.ColorGeometryInstanceAttribute.fromColor(
-                  C.Color.fromCssColorString(st.fillColor)
-                    .withAlpha(st.noFill ? 0.01 : st.fillOpacity)),
+                  C.Color.fromCssColorString(
+                    selected ? SELECTED_FILL_COLOR : st.fillColor)
+                    .withAlpha(selected ? SELECTED_FILL_OPACITY : (st.noFill ? 0.01 : st.fillOpacity))),
               },
               id: pickId,
             }))

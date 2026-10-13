@@ -1681,7 +1681,7 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
 
       {loading && (
         <div className="absolute inset-0 flex items-center justify-center bg-muted/40 text-foreground text-xs">
-          {t('map.cesiumLoading') || '正在加载 3D 地图…'}
+          {t('map.loading')}
         </div>
       )}
       {!!loadError && (
@@ -1767,6 +1767,7 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
         居中动画标记：热力图渲染中 / 图层加载中。
         IDW 插值与图层批量图元重建都是同步重活，不提示会让界面看着像卡死；
         提示在所有 await **之前**就亮起（调用方保证），所以用户点了操作立刻能看到。
+        文案统一用 `map.loading`（与 2D 同键），不再带具体图层名。
       */}
       {(heatmapBusy > 0 || !!loadingLayer) && (
         <div className="absolute inset-0 z-[1100] flex items-center justify-center pointer-events-none">
@@ -1780,9 +1781,7 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
               <path d="M21 12a9 9 0 0 0-9-9" stroke="currentColor" strokeWidth="3" strokeLinecap="round" />
             </svg>
             <span className="text-xs text-foreground">
-              {loadingLayer
-                ? `${t('map.layerLoading') || '正在加载图层'}：${loadingLayer}`
-                : (t('map.heatmapRendering') || '正在渲染热力图…')}
+              {t('map.loading')}
             </span>
           </div>
         </div>

@@ -875,7 +875,7 @@
     "skippedCount": "经纬度缺失",
     "missingInfoTitle": "以下 {{count}} 个要素经纬度缺失，已跳过",
     "downloadedHint": "已下载：{{name}}，请点击\"完成\"关闭",
-    "loading": "加载中...",
+    "loading": "加载中....",
     "loadFailed": "加载失败",
     "noCoordinate": "缺少坐标信息",
     "coordWarning": "以下小区缺少坐标信息",

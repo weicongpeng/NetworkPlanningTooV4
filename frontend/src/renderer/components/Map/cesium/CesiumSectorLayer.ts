@@ -112,10 +112,42 @@ export function sampleCenteredOn(
     .map((e) => e.x)
 }
 
-/** 某点的米/像素：优先用相机透视换算，否则回退 Web Mercator zoom 公式 */
+/** Web Mercator zoom 0 赤道每像素米数 */
+const EQUATOR_MPP = 156543.03392
+/**
+ * 米/像素的量化档位数（每档 2^1/32 ≈ 2.2%）。
+ *
+ * 透视下"某点的米/像素"随相机位置连续变化，扇区半径 = 目标像素 × 米/像素，
+ * 于是**任何**相机移动（哪怕只是平移或旋转）都会让半径变一点 → 几何全变 → 整个重建。
+ * 把米/像素量化到 2.2% 档位后：
+ * - 档内半径完全一致 → 平移/旋转/微缩放**不触发重建**（这是卡顿的大头）
+ * - 视觉上扇区尺寸偏差 ≤2.2%，肉眼不可辨
+ */
+const MPP_BUCKETS_PER_ZOOM = 32
+
+/** 量化档位索引（zoom 的 1/32 分档，向上取整避免 0 附近震荡） */
+function mppBucketIndex(mpp: number): number {
+  if (!Number.isFinite(mpp) || mpp <= 0) return 0
+  return Math.max(0, Math.round(Math.log2(EQUATOR_MPP / mpp) * MPP_BUCKETS_PER_ZOOM))
+}
+
+/** 档位索引 → 该档的米/像素 */
+function mppOfBucket(idx: number): number {
+  return EQUATOR_MPP / Math.pow(2, idx / MPP_BUCKETS_PER_ZOOM)
+}
+
+/**
+ * 某点的米/像素（已量化到 2.2% 档位）。
+ * 优先用相机透视换算后量化；无透视信息时回退 Web Mercator zoom 公式（本身就是整数档）。
+ */
+export function metersPerPixelQuantized(mppAt: () => number): number {
+  return mppOfBucket(mppBucketIndex(mppAt()))
+}
+
 function metersPerPixel(view: CameraView, lat: number, lng: number): number {
-  if (view.metersPerPixelAt) return view.metersPerPixelAt(lat, lng)
-  return (156543.03392 * Math.cos((lat * Math.PI) / 180)) / Math.pow(2, view.zoom)
+  if (view.metersPerPixelAt) return metersPerPixelQuantized(() => view.metersPerPixelAt!(lat, lng))
+  return mppOfBucket(mppBucketIndex(
+    (EQUATOR_MPP * Math.cos((lat * Math.PI) / 180)) / Math.pow(2, view.zoom)))
 }
 
 /**
@@ -143,7 +175,6 @@ export function arcPointsCount(zoom: number, pciPlanning: boolean): number {
   if (zoom <= 17) return 30
   return 40
 }
-
 /** 圆形采样点数（对齐 SectorRendererSVG._getCirclePointsCount） */
 export function circlePointsCount(zoom: number, pciPlanning: boolean): number {
   if (pciPlanning) return 8
@@ -177,6 +208,15 @@ export class CesiumSectorLayer {
   private configDirty = true
   /** 上次重建时的视野量化键 */
   private lastViewKey = ''
+  /**
+   * 扇区几何缓存（`sectorId|半径|采样数` → Cartesian3 顶点数组）。
+   *
+   * 量化档位让同一个扇区在相邻缩放档之间几何完全一致，缩放来回时可以直接复用，
+   * 省掉 `Cartesian3.fromDegreesArray` + `PolygonGeometry` + `GeometryInstance` 的重复创建。
+   * 上限封顶，超限整体清空（简单可控，避免无界增长）。
+   */
+  private geomCache = new Map<string, any[]>()
+  private static readonly GEOM_CACHE_MAX = 12000
 
   constructor(
     private C: any,
@@ -342,15 +382,19 @@ export class CesiumSectorLayer {
    * 标签仍用 Entity（数量少、且 Cesium 标签本就无批量接口）。
    */
   /**
-   * 视野量化键：把视野平移量按跨度的 1/20 分档。
-   * 小幅平移不触发重建（视口剔除本来就有 15% 外扩余量，边缘不会缺图形）。
+   * 视野量化键：把视野平移量按跨度的 1/20 分档，并把米/像素档位一并纳入。
+   * 小幅平移 / 旋转 / 微缩放都不触发重建（视口剔除本来就有 15% 外扩余量，边缘不会缺图形）。
    */
   private viewKey(view: CameraView): string {
     const spanLat = Math.max(1e-6, view.north - view.south)
     const spanLng = Math.max(1e-6, view.east - view.west)
     const qx = Math.round(view.west / (spanLng / 20))
     const qy = Math.round(view.south / (spanLat / 20))
-    return `${Math.round(view.zoom)}|${qx}|${qy}`
+    // 视野中心处的米/像素档位：跨档才意味着"尺寸真的变了"，需要重建
+    const cLat = (view.south + view.north) / 2
+    const cLng = (view.west + view.east) / 2
+    const mppIdx = mppBucketIndex(metersPerPixel(view, cLat, cLng))
+    return `${Math.round(view.zoom)}|${mppIdx}|${qx}|${qy}`
   }
 
   update(view: CameraView): void {
@@ -389,15 +433,22 @@ export class CesiumSectorLayer {
         String(sector.id) === String(nh.sourceSectorId)
         || nh.targetSectorIds.has(String(sector.id)))
       const radius = sectorRadius(sector, view, magnify)
-
-      const ring = sectorRing(sector, radius, cover.isCircular ? circleSegments : arcSegments)
+      const segments = cover.isCircular ? circleSegments : arcSegments
+      const ring = sectorRing(sector, radius, segments)
       const style = resolvePlanningStyle(sector, this.renderMode, this.highlight)
         ?? resolveSectorStyle(sector, this.ctx)
       const strokeCss = selected ? '#ef4444' : style.strokeColor
       const strokeWidth = selected ? 4 : style.strokeWidth
 
-      const positions = C.Cartesian3.fromDegreesArray(
-        ring.flatMap((p) => [p[1], p[0]]))
+      // 顶点数组按「扇区 + 半径档 + 采样数」缓存：量化后同档几何一致，缩放来回可直接复用
+      const geomKey = `${sector.id}|${Math.round(radius)}|${segments}|${magnify ? 1 : 0}`
+      let positions = this.geomCache.get(geomKey)
+      if (!positions) {
+        const verts = C.Cartesian3.fromDegreesArray(ring.flatMap((p) => [p[1], p[0]]))
+        if (this.geomCache.size >= CesiumSectorLayer.GEOM_CACHE_MAX) this.geomCache.clear()
+        this.geomCache.set(geomKey, verts)
+        positions = verts
+      }
 
       fills.push(new C.GeometryInstance({
         geometry: new C.PolygonGeometry({

@@ -8,7 +8,7 @@
 import { describe, it, expect } from 'vitest'
 import {
   sectorRadius, arcPointsCount, circlePointsCount,
-  sampleCenteredOn, MAX_RENDER_SECTORS,
+  sampleCenteredOn, MAX_RENDER_SECTORS, metersPerPixelQuantized,
 } from '../CesiumSectorLayer'
 import type { CameraView } from '../CesiumSectorLayer'
 import type { RenderSectorData } from '../../../../services/mapDataService'
@@ -40,11 +40,19 @@ function amapRadius(zoom: number, lat: number): number {
   return Math.max(5, Math.min(5000, 16 * mpp))
 }
 
+/**
+ * 量化允许的最大相对偏差：米/像素按 2^1/32 分档， worst case 偏差即 2^(1/32)-1。
+ * 3D 半径 = 目标像素 × 量化后的米/像素，所以与高德侧的偏差也在这个量级。
+ */
+const MPP_MAX_REL_ERR = Math.pow(2, 1 / 32) - 1
+
 describe('扇区半径：与高德侧恒定像素口径一致', () => {
-  it('室外扇区半径 = 16px × 米/像素（同一 zoom 下与高德侧完全相同）', () => {
+  it('室外扇区半径 = 16px × 米/像素（同一 zoom 下与高德侧相同，量化偏差 ≤2.2%）', () => {
     for (const zoom of [10, 12, 14, 16, 18]) {
       const r = sectorRadius(sector(), view(zoom), false)
-      expect(r).toBeCloseTo(amapRadius(zoom, 23.7433), 6)
+      const amap = amapRadius(zoom, 23.7433)
+      expect(r).toBeGreaterThan(amap * (1 - MPP_MAX_REL_ERR) - 1e-9)
+      expect(r).toBeLessThan(amap * (1 + MPP_MAX_REL_ERR) + 1e-9)
     }
   })
 
@@ -73,10 +81,24 @@ describe('扇区半径：与高德侧恒定像素口径一致', () => {
     expect(sectorRadius(sector(), view(0), false)).toBeLessThanOrEqual(5000)
   })
 
-  it('提供 metersPerPixelAt 时按其换算（3D 透视路径）', () => {
+  it('提供 metersPerPixelAt 时按其换算（3D 透视路径，量化后偏差 ≤2.2%）', () => {
     const v: CameraView = { ...view(12), metersPerPixelAt: () => 50 }
-    // 16px × 50m/px = 800m
-    expect(sectorRadius(sector(), v, false)).toBe(800)
+    // 16px × 50m/px ≈ 800m，量化到 2^1/32 档位后有小幅偏差
+    const r = sectorRadius(sector(), v, false)
+    expect(r).toBeGreaterThan(800 * (1 - MPP_MAX_REL_ERR) - 1e-9)
+    expect(r).toBeLessThan(800 * (1 + MPP_MAX_REL_ERR) + 1e-9)
+  })
+
+  it('量化让同一档位内的米/像素完全一致（平移/旋转不改变几何）', () => {
+    // 档宽 2^(1/32)-1 ≈ 2.2%，取中心 ±0.8% 必落在同一档内
+    const center = metersPerPixelQuantized(() => 44.4758)
+    const lo = metersPerPixelQuantized(() => 44.4758 * 0.992)
+    const hi = metersPerPixelQuantized(() => 44.4758 * 1.008)
+    // 同档内取值必须逐位相同 —— 这是"不随相机微动重建"的根据
+    expect(lo).toBe(center)
+    expect(hi).toBe(center)
+    // 明显跨档则必须不同（否则量化就没起作用）
+    expect(metersPerPixelQuantized(() => 44.4758 * 1.5)).not.toBe(center)
   })
 })
 

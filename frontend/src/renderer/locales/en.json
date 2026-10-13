@@ -934,7 +934,7 @@
     "skippedCount": "Missing coordinates",
     "missingInfoTitle": "{{count}} feature(s) skipped due to missing coordinates",
     "downloadedHint": "Downloaded: {{name}}. Click Finish to close.",
-    "loading": "Loading...",
+    "loading": "Loading....",
     "loadFailed": "Load failed",
     "noCoordinate": "Missing coordinates",
     "coordWarning": "The following cells are missing coordinates",
