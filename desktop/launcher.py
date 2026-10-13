@@ -70,9 +70,16 @@ def _bootstrap_environment() -> Path:
     # 在线授权与 OTA：服务器地址（可在系统环境变量覆盖）
     os.environ.setdefault("NPT_SERVER_URL", "https://app.pengwc.asia")
     os.environ.setdefault("NPT_DESKTOP_CHANNEL", "stable")
+    # 版本必须以包内 version.json 为准（不能用 setdefault）：OTA 升级脚本由**旧版本**
+    # 进程拉起，重启的新进程会继承旧进程环境里的 NPT_DESKTOP_VERSION（旧版本号），
+    # setdefault 会一直沿用旧值——「桌面授权」页的「当前版本」列、OTA「是否已生效」
+    # 的判定都会卡在升级前的版本上（version.json 缺失时才退回环境变量，供源码调试）。
+    # 用户可见表现：点「重启并更新」后自动打开的应用里版本还是旧的、提示"更新未生效"，
+    # 手动再关一次再开才对——这条必须保证"重启即完成"，不能依赖用户再重启一次。
+    # （升级脚本也会在拉起前 `set "NPT_DESKTOP_VERSION="` 兜底清掉继承值。）
     version = _desktop_version()
     if version:
-        os.environ.setdefault("NPT_DESKTOP_VERSION", version)
+        os.environ["NPT_DESKTOP_VERSION"] = version
     return data_root
 
 

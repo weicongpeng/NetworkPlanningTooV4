@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import threading
 import time
@@ -287,6 +288,35 @@ def test_helper_script_bounded_wait_and_relaunch(updater_env):
     assert 'findstr /I /C:"%TARGETVER%"' in text
     assert "install_verified=%VEROK%" in text
     assert "ping -n 3 127.0.0.1" in text
+    # 拉起前必须清掉旧进程继承下来的 NPT_DESKTOP_VERSION：否则重启的新版本会自报旧版本，
+    # 系统设置显示旧版本、OTA 判"未生效"，要用户手动再重启一次才对（重启即完成）
+    assert 'set "NPT_DESKTOP_VERSION="' in text
+    assert text.index('set "NPT_DESKTOP_VERSION="') < text.index('start "" "%TARGET%"')
+
+
+def test_launcher_prefers_bundled_version_over_inherited_env(monkeypatch, tmp_path):
+    """OTA 自动重启后"版本还是旧的"根因：重启的进程继承了旧进程的 NPT_DESKTOP_VERSION。
+
+    launcher 必须以包内 version.json 为准（覆盖继承值），version.json 缺失时才退回环境变量
+    （源码调试：CI 只在打包前写 version.json，仓库里没有这个文件）。
+    """
+    launcher = _load_launcher()
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    monkeypatch.setattr(launcher, "_bundle_dir", lambda: bundle)
+    monkeypatch.setattr(launcher, "_default_data_root", lambda: tmp_path / "data")
+
+    # 1) 有 version.json：覆盖掉从旧进程继承来的版本号
+    (bundle / "version.json").write_text('{"version": "0.0.23"}', encoding="utf-8")
+    monkeypatch.setenv("NPT_DESKTOP_VERSION", "0.0.22")
+    launcher._bootstrap_environment()
+    assert os.environ["NPT_DESKTOP_VERSION"] == "0.0.23"
+
+    # 2) 没有 version.json（源码运行）：保留环境变量里的值
+    (bundle / "version.json").unlink()
+    monkeypatch.setenv("NPT_DESKTOP_VERSION", "0.0.0-dev")
+    launcher._bootstrap_environment()
+    assert os.environ["NPT_DESKTOP_VERSION"] == "0.0.0-dev"
 
 
 def test_install_spawns_hidden_helper_and_requests_exit(updater_env, monkeypatch):

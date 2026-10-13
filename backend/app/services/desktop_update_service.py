@@ -356,6 +356,10 @@ goto waitver
 if exist "%TARGETDIR%_internal\\version.json" copy /y "%TARGETDIR%_internal\\version.json" "%UPDATES%\\installed_version.json" >nul 2>&1
 if not exist "%UPDATES%\\installed_version.json" if exist "%TARGETDIR%version.json" copy /y "%TARGETDIR%version.json" "%UPDATES%\\installed_version.json" >nul 2>&1
 >> "%RESULT%" echo finished_at=%DATE% %TIME%
+rem clear the version inherited from the old process: the relaunched app would
+rem otherwise report the pre-upgrade version (settings page shows old version,
+rem OTA marks itself "not applied") until the user restarts it manually once.
+set "NPT_DESKTOP_VERSION="
 start "" "%TARGET%"
 del "%~f0" >nul 2>&1
 """
