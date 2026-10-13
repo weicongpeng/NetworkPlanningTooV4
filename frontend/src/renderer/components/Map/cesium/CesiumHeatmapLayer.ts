@@ -26,6 +26,15 @@ export class CesiumHeatmapLayer {
   private stats: HeatmapStats | null = null
   /** 上次渲染的「设置 + 点集」指纹：不变就跳过 IDW 重算（很贵） */
   private sig = ''
+  /** 是否已经尝试渲染过（含"范围退化画不出来"这种结果）——供宿主的幂等重放判断 */
+  private rendered = false
+  /**
+   * 已销毁标记。
+   * 宿主的渲染流程是异步的（取边界 → 等一帧 → 同步 IDW），期间本层可能已被移除销毁。
+   * 没有这个标记时，那次迟到的 `render()` 会把图重新贴回去，且新贴的图层不在宿主的
+   * 热力表里的 → 再也摘不掉（"热力关不掉，只能刷新页面"）。
+   */
+  private destroyed = false
 
   constructor(
     private C: any,
@@ -37,6 +46,11 @@ export class CesiumHeatmapLayer {
     return this.stats
   }
 
+  /** 是否已尝试渲染过（宿主据此跳过"设置没变"的重复请求） */
+  isRendered(): boolean {
+    return this.rendered
+  }
+
   /**
    * 渲染/更新热力面。
    * @returns 图例统计；无有效点或范围退化时返回 null（并移除既有图层）
@@ -46,6 +60,8 @@ export class CesiumHeatmapLayer {
     settings: HeatmapSettings,
     boundary: HeatBoundary | null,
   ): HeatmapStats | null {
+    if (this.destroyed) return null // 迟到的异步渲染：本层已销毁，不能再贴图
+    this.rendered = true
     const sig = `${heatSettingsSignature(settings)}|${fingerprintHeatPoints(points)}|${boundary ? 'b' : '-'}`
     // 设置与点集都没变：保留现有图层，直接复用统计（缩放平移不重算）
     if (this.layer && sig === this.sig) return this.stats
@@ -94,10 +110,12 @@ export class CesiumHeatmapLayer {
     this.removeLayer()
     this.stats = null
     this.sig = ''
+    this.rendered = false
   }
 
   destroy(): void {
-    this.removeLayer()
+    this.destroyed = true
+    this.remove()
   }
 
   private removeLayer(): void {

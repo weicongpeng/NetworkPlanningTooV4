@@ -14,6 +14,11 @@ import {
 } from '../../../utils/fieldValue'
 import type { LayerColorSettings, LabelSettings, ThematicSettings } from '../LabelSettingsModal'
 import { geometryAnchor, polygonOuterRings, featureSelectionId } from './cesiumGeoJson'
+import type { CameraView } from './CesiumSectorLayer'
+import type { LabelCandidateBase } from '../labelLayoutCore'
+
+/** 单图层的标签候选上限（按离视野中心近的优先保留） */
+const MAX_LABEL_CANDIDATES = 2000
 import { computeThematicStats, type ThematicStats } from '../../../utils/thematicStats'
 
 type Position = number[]
@@ -78,7 +83,6 @@ interface ResolvedFeatureStyle {
 }
 
 export class CesiumGeoJsonLayer {
-  readonly dataSource: any
   private fc: FeatureCollection = { features: [] }
   private visible = true
   private color: LayerColorSettings | null = null
@@ -89,13 +93,16 @@ export class CesiumGeoJsonLayer {
   private selectionIds: Set<string> | null = null
 
   private viewer: any
-  /** 本次渲染创建的批量图元（面/线/点/标签各 1 个），重建时整体移除 */
+  /** 本次渲染创建的批量图元（面/线/点各 1 个），重建时整体移除 */
   private primitives: any[] = []
+  /**
+   * 重建序号：每次「请求重建」或「立即重建」都 +1，挂起的 rAF 回调序号对不上就放弃。
+   * 用来合并同一帧内的多次配置变更——后面那次会覆盖前面那次，避免重复重建。
+   */
+  private renderSeq = 0
 
   constructor(private C: any, viewer: any, readonly layerId: string) {
     this.viewer = viewer
-    this.dataSource = new C.CustomDataSource('layer-' + layerId)
-    viewer.dataSources.add(this.dataSource)
   }
 
   /** 移除本次渲染的批量图元 */
@@ -110,12 +117,32 @@ export class CesiumGeoJsonLayer {
 
   /** 图层卸载：释放图元 */
   destroy(): void {
+    this.renderSeq += 1 // 作废挂起中的重建
     this.clearPrimitives()
-    try { this.viewer?.dataSources?.remove(this.dataSource) } catch { /* ignore */ }
   }
 
+  /**
+   * 请求重建（rAF 合并）。
+   * 连续多个 setter（可见性 → 配色 → 专题 → 标签 → 选中）原来会各自触发一次全量重建，
+   * 上千要素时等于同一帧重建四五遍。合并后一帧只重建一次，也避免在调用栈里同步增删
+   * `scene.primitives`（Cesium 在集合被改的瞬间迭代会抛 `_target` 相关错误）。
+   */
+  private requestRender(): void {
+    const seq = ++this.renderSeq
+    requestAnimationFrame(() => {
+      if (seq !== this.renderSeq) return // 已被后续一次重建覆盖
+      this.render()
+    })
+  }
+
+  /**
+   * 换数据立即重建（同步）。
+   * 取数完成的时机天然低频，且上层的要素收集/热力取点紧接着就要用新的要素集合，
+   * 推迟到下一帧会让这些读路径拿到旧数据。
+   */
   setFeatureCollection(fc: FeatureCollection): void {
     this.fc = fc
+    this.renderSeq += 1 // 作废挂起中的重建，避免紧随其后又重建一遍
     this.render()
   }
   /** 当前要素集合（WGS84）——供圈选/点选按几何收集命中要素 */
@@ -129,13 +156,16 @@ export class CesiumGeoJsonLayer {
       this.thematic,
       this.fc.features.map((f) => (f.properties ?? {}) as Record<string, any>))
   }
+  isVisible(): boolean {
+    return this.visible
+  }
   setVisible(visible: boolean): void {
     this.visible = visible
-    this.render()
+    this.requestRender()
   }
   setColorSettings(color: LayerColorSettings | null): void {
     this.color = color
-    this.render()
+    this.requestRender()
   }
   setBaseStyle(base: LayerBaseStyle): void {
     this.base = base
@@ -143,15 +173,77 @@ export class CesiumGeoJsonLayer {
   setLabel(enabled: boolean, label: LabelSettings | null): void {
     this.labelEnabled = enabled
     this.label = label
-    this.render()
+    this.requestRender()
   }
   setThematic(thematic: ThematicSettings | null): void {
     this.thematic = thematic
-    this.render()
+    this.requestRender()
   }
   setSelectionIds(ids: Set<string> | null): void {
     this.selectionIds = ids
-    this.render()
+    this.requestRender()
+  }
+
+  /**
+   * 本图层当前的标签候选（WGS84）。
+   * 与扇区层同口径：交给 `CesiumLabelOverlay` 统一防重叠绘制，不再建 Cesium 标签图元。
+   *
+   * **必须先按视口裁剪**：地理化数据常有几万个点，不裁剪的话全量候选会在覆盖层被
+   * "候选上限"按要素顺序截断 —— 于是放大地图后，视口内的要素反而一个标签都没有。
+   * 超过上限时按"离视野中心近的优先"保留（与扇区层 sampleCenteredOn 同思路）。
+   */
+  labelCandidates(view: CameraView | null): LabelCandidateBase[] {
+    if (!this.visible || !this.labelEnabled || !this.label) return []
+    const ls = this.label
+    // 视口外扩 15%（与 CesiumSectorLayer.pickSectors 同口径）
+    let south = -90, north = 90, west = -180, east = 180
+    let cLat = 0, cLng = 0
+    if (view) {
+      const padLat = (view.north - view.south) * 0.15
+      const padLng = (view.east - view.west) * 0.15
+      south = view.south - padLat
+      north = view.north + padLat
+      west = view.west - padLng
+      east = view.east + padLng
+      cLat = (view.south + view.north) / 2
+      cLng = (view.west + view.east) / 2
+    }
+    const out: LabelCandidateBase[] = []
+    for (let fi = 0; fi < this.fc.features.length; fi++) {
+      const f = this.fc.features[fi]
+      if (!f.geometry || !f.properties) continue
+      const anchor = geometryAnchor(f.geometry)
+      if (!anchor) continue
+      const lng = anchor[0]
+      const lat = anchor[1]
+      if (lng < west || lng > east || lat < south || lat > north) continue
+      const value = getFieldValue(f.properties, ls.content)
+      if (value === undefined || value === null) continue
+      const text = String(value)
+      if (!text) continue
+      const sid = featureSelectionId(f.properties, fi)
+      out.push({
+        id: sid,
+        lat,
+        lng,
+        text,
+        fontSize: ls.fontSize || 12,
+        fontFamily: ls.fontFamily,
+        bold: ls.bold,
+        italic: ls.italic,
+        shadow: ls.shadow,
+        background: ls.background,
+        backgroundColor: ls.backgroundColor,
+        color: ls.color || '#000000',
+        priority: this.selectionIds?.has(sid) ? 10 : 0,
+      })
+    }
+    if (out.length <= MAX_LABEL_CANDIDATES) return out
+    return out
+      .map((c) => ({ c, d: (c.lat - cLat) ** 2 + (c.lng - cLng) ** 2 }))
+      .sort((a, b) => a.d - b.d)
+      .slice(0, MAX_LABEL_CANDIDATES)
+      .map((e) => e.c)
   }
 
   /** 批量更新配置（合并后只 render 一次，避免连续 setter 各触发一次重建） */
@@ -169,7 +261,7 @@ export class CesiumGeoJsonLayer {
     if (cfg.thematic !== undefined) this.thematic = cfg.thematic
     if (cfg.labelEnabled !== undefined) this.labelEnabled = cfg.labelEnabled
     if (cfg.label !== undefined) this.label = cfg.label
-    this.render()
+    this.requestRender()
   }
 
   /**
@@ -248,16 +340,14 @@ export class CesiumGeoJsonLayer {
   private render(): void {
     const C = this.C
     this.clearPrimitives()
-    this.dataSource.entities.removeAll()
     if (!this.visible) return
 
-    // 批量容器：面 / 线 / 点 / 标签各合成一个图元。
+    // 批量容器：面 / 线 / 点 各合成一个图元（标签改由 CesiumLabelOverlay 统一绘制）。
     // 逐 Entity 的写法在图层要素上千时，每次配置变化都要重建上千个 Entity（PropertyBag +
     // 集合事件 + 逐实体图元），是 3D 加载自有图层后卡顿的主因。
     const polygons: any[] = []
     const polylines: any[] = []
     const points: Array<{ opts: any; id: any }> = []
-    const labels: Array<{ opts: any; id: any }> = []
 
     for (let fi = 0; fi < this.fc.features.length; fi++) {
       const feature = this.fc.features[fi]
@@ -272,8 +362,14 @@ export class CesiumGeoJsonLayer {
       const strokeW = selected ? st.strokeWidth + 2 : st.strokeWidth
       const drawStroke = selected || !st.noStroke
 
-      // 拾取用标识：批量图元把它挂在 GeometryInstance.id / 图元 .id 上
-      const pickId = { feature, layerId: this.layerId }
+      // 拾取用标识：批量图元把它挂在 GeometryInstance.id / 图元 .id 上。
+      // `selectionId` 必须带出来：点选高亮按它写选中态，而图层要素普遍没有 properties.id，
+      // 早先宿主用 `properties.id` 兜出空字符串 → 点选后"没有任何高亮"。
+      const pickId = {
+        feature,
+        layerId: this.layerId,
+        selectionId: featureSelectionId(feature.properties, fi),
+      }
 
       switch (g.type) {
         case 'Point':
@@ -325,19 +421,26 @@ export class CesiumGeoJsonLayer {
           for (const ring of rings) {
             if (ring.length < 3) continue
             const positions = C.Cartesian3.fromDegreesArray(ring.flatMap((p) => p))
-            if (!st.noFill) {
-              polygons.push(new C.GeometryInstance({
-                geometry: new C.PolygonGeometry({
-                  polygonHierarchy: new C.PolygonHierarchy(positions),
-                  vertexFormat: C.PerInstanceColorAppearance.VERTEX_FORMAT,
-                }),
-                attributes: {
-                  color: C.ColorGeometryInstanceAttribute.fromColor(
-                    C.Color.fromCssColorString(st.fillColor).withAlpha(st.fillOpacity)),
-                },
-                id: pickId,
-              }))
-            }
+            /**
+             * 面图元**始终**建（"无色填充"时给一个近乎全透明的 alpha）。
+             *
+             * 面图元同时承担"点击命中区域"的职责：不建面就只剩贴地边框线，而线的命中宽度
+             * 只有几个像素 —— 表现为"透明填充的多边形点内部没反应，只能点中边框"。
+             * 视觉上 alpha 0.01 与无填充没有区别，但 `scene.pick`（已开 pickTranslucentDepth）
+             * 就能拾到整个面了。
+             */
+            polygons.push(new C.GeometryInstance({
+              geometry: new C.PolygonGeometry({
+                polygonHierarchy: new C.PolygonHierarchy(positions),
+                vertexFormat: C.PerInstanceColorAppearance.VERTEX_FORMAT,
+              }),
+              attributes: {
+                color: C.ColorGeometryInstanceAttribute.fromColor(
+                  C.Color.fromCssColorString(st.fillColor)
+                    .withAlpha(st.noFill ? 0.01 : st.fillOpacity)),
+              },
+              id: pickId,
+            }))
             // 贴地面不支持 outline，边框另画贴地线
             if (drawStroke) {
               polylines.push(new C.GeometryInstance({
@@ -355,60 +458,34 @@ export class CesiumGeoJsonLayer {
         default:
           break
       }
-
-      // 标签
-      if (this.labelEnabled && this.label && feature.properties) {
-        const anchor = geometryAnchor(g)
-        if (anchor) {
-          const value = getFieldValue(feature.properties, this.label.content)
-          const text = value === undefined || value === null ? '' : String(value)
-          if (text) {
-            const ls = this.label
-            labels.push({
-              id: pickId,
-              opts: {
-                position: C.Cartesian3.fromDegrees(anchor[0], anchor[1]),
-                text,
-                font: `${ls.bold ? 'bold ' : ''}${ls.italic ? 'italic ' : ''}${ls.fontSize || 12}px ${ls.fontFamily || 'sans-serif'}`,
-                fillColor: C.Color.fromCssColorString(ls.color || '#000000'),
-                showBackground: !!ls.background,
-                backgroundColor: C.Color.fromCssColorString(ls.backgroundColor || '#ffffff').withAlpha(0.85),
-                style: C.LabelStyle.FILL_AND_OUTLINE,
-                pixelOffset: new C.Cartesian2(0, -6),
-                verticalOrigin: C.VerticalOrigin.BOTTOM,
-                disableDepthTestDistance: Number.POSITIVE_INFINITY,
-              },
-            })
-          }
-        }
-      }
     }
 
     const collection = this.viewer?.scene?.primitives
     if (!collection) return
     try {
+      /**
+       * `asynchronous: true` —— 把贴地图元的三角化/构造丢给 Web Worker。
+       * `false` 时整个图层的几何构建都在主线程同步跑完，上万要素能把界面冻住 1~3 秒
+       * （这正是"加载图层卡顿"的主因）。本层的重建都是低频事件（取数完成 / 配置变更 /
+       * 选中态变化，且已被 rAF 合并），不存在"相机每帧重建"的闪烁风险，可以放心用异步。
+       */
       if (polygons.length > 0) {
         this.primitives.push(collection.add(new C.GroundPrimitive({
           geometryInstances: polygons,
           appearance: new C.PerInstanceColorAppearance({ flat: true, translucent: true }),
-          asynchronous: false,
+          asynchronous: true,
         })))
       }
       if (polylines.length > 0) {
         this.primitives.push(collection.add(new C.GroundPolylinePrimitive({
           geometryInstances: polylines,
           appearance: new C.PolylineColorAppearance(),
-          asynchronous: false,
+          asynchronous: true,
         })))
       }
       if (points.length > 0) {
         const coll = new C.PointPrimitiveCollection()
         for (const p of points) coll.add({ ...p.opts, id: p.id })
-        this.primitives.push(collection.add(coll))
-      }
-      if (labels.length > 0) {
-        const coll = new C.LabelCollection()
-        for (const l of labels) coll.add({ ...l.opts, id: l.id })
         this.primitives.push(collection.add(coll))
       }
     } catch (e) {

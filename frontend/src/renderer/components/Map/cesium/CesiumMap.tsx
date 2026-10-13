@@ -32,6 +32,7 @@ import { buildPciModPalette } from '../../../utils/pciModColor'
 import { CesiumGeoJsonLayer } from './CesiumGeoJsonLayer'
 import {
   transformFeatureCollection,
+  transformFeatureCollectionAsync,
   transformGeometry,
   geoDataSectorRing,
   isGeoDataDot,
@@ -47,7 +48,9 @@ import { layerApi, dataApi } from '../../../services/api'
 import { CesiumEditSession } from './CesiumEditSession'
 import { SectorInfoPanel } from '../SectorInfoPanel'
 import { FeatureInfoPanel } from '../FeatureInfoPanel'
-import { CesiumMapTools } from './CesiumMapTools'
+import { CesiumMapTools, type CapturePoint } from './CesiumMapTools'
+import { CapturePointPanel } from '../CapturePointPanel'
+import { CesiumLabelOverlay } from './CesiumLabelOverlay'
 import { useLayerEditStore } from '../../../store/layerEditStore'
 import { useMapDataCacheStore } from '../../../store/mapDataCacheStore'
 import {
@@ -69,6 +72,7 @@ import {
   collectGeoDataPolygons,
   type HeatBoundary,
 } from '../../../utils/heatSurface'
+import { heatSettingsSignature } from '../HeatmapLayerManager'
 import type { HeatPoint } from '../../../utils/heatmap'
 import { getFieldValue, toNumber } from '../../../utils/fieldValue'
 import { resolveSectorField } from '../../../config/sector-config'
@@ -89,6 +93,20 @@ function heightToZoom(height: number, lat: number, hPx: number, fovy: number): n
 
 type LayerKey = 'lte' | 'nr'
 const LAYER_IDS: Record<LayerKey, string> = { lte: 'lte-sectors', nr: 'nr-sectors' }
+
+/** 图层取数的并发上限：并发取数能显著缩短"打开多个图层"的等待，但也不能一次打满后端 */
+const GEO_FETCH_CONCURRENCY = 4
+
+/**
+ * 等浏览器真正画出一帧（双 rAF：第一帧提交 React 的 DOM 变更，第二帧确保已合成上屏）。
+ * 用于在开始同步重活前先把"渲染中"的动画标记显示出来。
+ */
+function nextPaint(): Promise<void> {
+  return new Promise((resolve) => {
+    if (typeof requestAnimationFrame !== 'function') { setTimeout(resolve, 16); return }
+    requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
+  })
+}
 
 /** 天地图底图/注记图层编码（3D 底图用影像 img，注记按设置叠加） */
 type CesiumTdtLayer = 'vec' | 'img' | 'cia' | 'cva' | 'cta' | 'eva'
@@ -124,13 +142,25 @@ function toWgs84Boundary(polygons: HeatBoundary): HeatBoundary {
  * 图层要素现在走批量图元：`GeometryInstance.id` / `PointPrimitive.id` / `Label.id` 都是
  * `{ feature, layerId }`。为了兼容仍走 Entity 的路径（如有），两种形状都认。
  */
-function pickGeo(picked: any): { feature: any; layerId: string } | null {
+function pickGeo(picked: any): {
+  feature: any
+  layerId: string
+  selectionId: string
+} | null {
   if (!picked) return null
   // Primitive 返回 { primitive, id }；Point/LabelCollection 直接返回图元本身
   for (const cand of [picked.id, picked]) {
     if (!cand) continue
-    if (cand.geoFeature) return { feature: cand.geoFeature, layerId: cand.geoLayerId }
-    if (cand.feature && cand.layerId) return { feature: cand.feature, layerId: cand.layerId }
+    if (cand.geoFeature) {
+      return { feature: cand.geoFeature, layerId: cand.geoLayerId, selectionId: '' }
+    }
+    if (cand.feature && cand.layerId) {
+      return {
+        feature: cand.feature,
+        layerId: cand.layerId,
+        selectionId: String(cand.selectionId ?? ''),
+      }
+    }
   }
   return null
 }
@@ -202,10 +232,30 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
   const mapToolsRef = useRef<CesiumMapTools | null>(null)
   // 值热力面（按图层 id 复用）
   const heatmapsRef = useRef<Map<string, CesiumHeatmapLayer>>(new Map())
+  /** 热力渲染取消令牌：每次请求 +1，await 回来后令牌对不上就放弃（防止关掉后又贴回来） */
+  const heatTokenRef = useRef<Map<string, number>>(new Map())
+  /** 上次请求渲染时的设置指纹（用于跳过"设置没变且已画出来"的重复重算） */
+  const heatReqRef = useRef<Map<string, string>>(new Map())
   // 天地图注记影像层（只清理自己创建的，避免误删热力面等其它 imagery 层）
   const annotationLayersRef = useRef<any[]>([])
+  // 正在渲染热力面的图层数（>0 时在地图中央显示动画标记）
+  const [heatmapBusy, setHeatmapBusy] = useState(0)
+  /** 正在加载的图层名（图层取数 / 建批量图元时显示，非 null 即提示） */
+  const [loadingLayer, setLoadingLayer] = useState<string | null>(null)
   // 圈选 / 点选会话
   const selectionRef = useRef<CesiumSelectionSession | null>(null)
+  /**
+   * 圈选图形框覆盖层（SVG）。
+   * 贴地图元（clampToGround）在拖动中每帧重建永远等不到地形瓦片出图 → 框根本不显示，
+   * 所以框改画在这张屏幕空间 SVG 上（与 2D Leaflet 的 SVG renderer 同机制）。
+   */
+  const selectionOverlayRef = useRef<SVGSVGElement>(null)
+  /**
+   * 标签覆盖层（Canvas）：基站 / 图层文件 / 地理化 / 装饰的标签统一在这里防重叠绘制，
+   * 与 2D 的 LabelLayoutManager 同一套算法（见 labelLayoutCore）。
+   */
+  const labelCanvasRef = useRef<HTMLCanvasElement>(null)
+  const labelOverlayRef = useRef<CesiumLabelOverlay | null>(null)
   const [selectionTip, setSelectionTip] = useState('')
   const [selectedCount, setSelectedCount] = useState(0)
   // 扇区属性框（手形工具点击查属性）+ 重叠扇区列表
@@ -226,6 +276,9 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
     props: Record<string, unknown>
     position: { x: number; y: number }
   } | null>(null)
+  /** 定位打点属性面板（「选择」工具点击已有打点标记时打开） */
+  const [capturePanel, setCapturePanel] = useState<CapturePoint | null>(null)
+  const [capturePanelPos, setCapturePanelPos] = useState<{ x: number; y: number }>({ x: 0, y: 0 })
 
   const { mapSettings, decorationFeatures, locationPoints } = useMapStore() as any
   const mapSettingsRef = useRef(mapSettings)
@@ -236,6 +289,9 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
   locationPointsRef.current = locationPoints
   const propsRef = useRef(props)
   propsRef.current = props
+  /** i18n 取值器（命令式类里用，避免闭包捕获过期语言） */
+  const tRef = useRef(t)
+  tRef.current = t
 
   // 动态配置（命令式方法写入）
   const visibilityRef = useRef<Record<LayerKey, boolean>>({
@@ -322,7 +378,8 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
       layer.setSelectionIds(selectionIdsRef.current)
       layer.setRenderMode(p.mode ?? 'default')
       layer.setLabels(!!p.sectorLabelVisibility?.[layerId], p.labelSettingsMap?.[layerId] ?? null)
-      layer.setVisible(visibilityRef.current[key])
+      // 热力替换模式（enabled && !showOriginal）下原扇区图形隐藏，只留热力面
+      layer.setVisible(visibilityRef.current[key] && !isHeatmapReplacement(layerId))
       layer.update(view)
     })
 
@@ -332,8 +389,54 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
       layer.setSelectionIds(selectionIdsRef.current)
     }
     decorationLayerRef.current?.setSelectionIds(selectionIdsRef.current)
+    syncLabels()
     // 数据/设置变化后重放热力面（指纹未变时 CesiumHeatmapLayer 内部会跳过重算）
     replayHeatmaps()
+  }
+
+  /**
+   * 把各图层的标签候选推给统一覆盖层（CesiumLabelOverlay）。
+   *
+   * 3D 早期是"每个要素一个 Cesium Label Entity/图元"，既不防重叠，又跟着相机停下时的
+   * 全量重建一起增删（几千个标签 → 卡顿）。现在对齐 2D：只注册候选，
+   * 由覆盖层在屏幕空间做真实文本矩形的贪心避让后批量画到一张 Canvas 上。
+   */
+  function syncLabels() {
+    const overlay = labelOverlayRef.current
+    if (!overlay) return
+    const p = propsRef.current
+    const ms = mapSettingsRef.current
+    const view = getCameraView()
+
+    // 基站（LTE / NR）
+    for (const key of Object.keys(LAYER_IDS) as LayerKey[]) {
+      const id = LAYER_IDS[key]
+      const layer = sectorLayersRef.current[key]
+      const enabled = !!p.sectorLabelVisibility?.[id]
+      if (!layer || !enabled || !layer.isVisible() || !view) {
+        overlay.removeSource(id)
+        continue
+      }
+      overlay.setCandidates(id, layer.labelCandidates(view))
+    }
+
+    // 图层文件 / 地理化数据
+    for (const [fileId, layer] of geoJsonLayersRef.current) {
+      const isGeoData = (p.pointFiles ?? []).some((x: any) => x.id === fileId)
+      const labelVis = isGeoData
+        ? ms.pointFileLabelVisibility?.[fileId]
+        : ms.layerFileLabelVisibility?.[fileId]
+      if (!labelVis || !layer.isVisible()) {
+        overlay.removeSource(fileId)
+        continue
+      }
+      overlay.setCandidates(fileId, layer.labelCandidates(view))
+    }
+
+    // 装饰图层（含定位点）
+    const deco = decorationLayerRef.current
+    if (!deco || !ms.decorationLabelVisible) overlay.removeSource('decoration-layer')
+    else overlay.setCandidates('decoration-layer', deco.labelCandidates(view))
   }
 
   /** 同步图层文件 + 地理化数据（layerFiles / pointFiles 结构一致） */
@@ -348,8 +451,19 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
       ...(p.pointFiles ?? []).map((f: any) => ({ f, isGeoData: true })),
     ]
     const liveIds = new Set<string>()
+    /** 本轮真正换了数据的图层（它们的热力面必须重算） */
+    const dataChanged = new Set<string>()
     const zoom = getCameraView()?.zoom ?? 15
 
+    // ===== 阶段 1：应用配置（同步、很快）。图层先建出来并处于正确显隐，
+    // 这样即便随后被新一轮取代提前返回，也不会残留"该隐的图层还画着"。=====
+    const pending: Array<{
+      f: any
+      isGeoData: boolean
+      layer: CesiumGeoJsonLayer
+      geojson: any
+      alreadyWgs84: boolean
+    }> = []
     for (const { f, isGeoData } of files) {
       liveIds.add(f.id)
       let layer = geoJsonLayersRef.current.get(f.id)
@@ -358,17 +472,14 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
         geoJsonLayersRef.current.set(f.id, layer)
       }
 
-      // 显隐/配色/标签**先于**异步取数应用：即使随后被更新一轮取代而提前返回，
-      // 图层也已经处于正确的可见性（否则新建图层默认 visible=true 会残留显示）
       const labelVis = isGeoData
         ? ms.pointFileLabelVisibility?.[f.id]
         : ms.layerFileLabelVisibility?.[f.id]
       // 显隐按来源取对应开关（与 MapPage 的写入路径一致，避免两个 map 互相污染），
       // 未设置时回退 layerFile.visible 字段
-      const visFromSettings = isGeoData
-        ? ms.pointFileVisibility?.[f.id]
-        : ms.layerFileVisibility?.[f.id]
-      const visible = visFromSettings !== undefined ? !!visFromSettings : !!f.visible
+      // 用户勾选真值决定要不要取数据；热力替换模式下原图形隐藏但数据仍要取
+      // ——热力面就是用这批数据算出来的。
+      const { userVisible, visible } = resolveLayerVisibility(f.id)
       layer.applyConfig({
         visible,
         base: f.defaultStyle ?? {},
@@ -377,54 +488,101 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
         labelEnabled: !!labelVis,
         label: ms.labelSettingsMap?.[f.id] ?? null,
       })
-      if (!visible) continue
-
-      // 数据：单层失败不影响其它图层；仅原始引用变化时才重新转换
-      let geojson: any
-      let alreadyWgs84 = false
-      try {
-        if (f.sourceType === 'excel') {
-          // Excel 地理化数据：dataApi.get 返回原始 WGS84 行（坐标不转换）
-          const res = await dataApi.get(f.dataId)
-          if (geoRunRef.current !== runId) return // 已被更新一轮取代
-          let rows = Array.isArray(res.data) ? res.data : (res.data?.data ?? [])
-          rows = rows.filter((r: any) => r && r.longitude != null && r.latitude != null)
-          geojson = {
-            features: rows.map((r: any) => buildGeoDataFeature(f, r, zoom)),
-          }
-          alreadyWgs84 = true
-        } else {
-          // MapInfo：缓存 → API（后端已转 GCJ02 GeoJSON，需转 WGS84）
-          geojson = useMapDataCacheStore.getState().layers[f.id]?.geojson
-          if (!geojson) {
-            const fetched = await layerApi.getLayerDataWithVersion(f.dataId, f.id)
-            if (geoRunRef.current !== runId) return
-            geojson = fetched.data
-            if (geojson) {
-              useMapDataCacheStore.getState().cacheLayerGeoJSON(f.id, geojson, fetched.version)
-            }
-          }
-        }
-        console.log('[NPT-LAYER] loaded', f.name, geojson?.features?.length ?? 0, 'features')
-      } catch (e: any) {
-        console.warn('[NPT-LAYER] load failed', f.name, e?.message)
+      if (!userVisible) continue
+      // 缓存里已有 → 不需要取数，直接进"应用数据"阶段
+      const cached = f.sourceType === 'excel'
+        ? null
+        : useMapDataCacheStore.getState().layers[f.id]?.geojson
+      if (cached) {
+        pending.push({ f, isGeoData, layer, geojson: cached, alreadyWgs84: false })
+        continue
       }
-      if (geojson && rawGeoRef.current.get(f.id) !== geojson) {
-        rawGeoRef.current.set(f.id, geojson)
-        layer.setFeatureCollection(alreadyWgs84 ? geojson : transformFeatureCollection(geojson))
-      }
+      pending.push({ f, isGeoData, layer, geojson: null, alreadyWgs84: false })
     }
 
-    // 移除已不存在的图层（连同批量图元一起释放）
+    // ===== 阶段 2：并行取数（限并发）。
+    // 早先是 `for` 里逐个 await，N 个图层的网络等待会线性叠加；改成并发后
+    // 总耗时从 Σ(每层) 降到 max(每层) —— 这是"打开多个图层时卡"最直接的原因。=====
+    const needFetch = pending.filter((x) => !x.geojson)
+    if (needFetch.length > 0) {
+      let cursor = 0
+      const worker = async (): Promise<void> => {
+        // 无限循环 + 越界 return：并发 worker 的常用写法，用 for(;;) 让意图明确
+        for (;;) {
+          const idx = cursor++
+          if (idx >= needFetch.length) return
+          const item = needFetch[idx]
+          setLoadingLayer(item.f.name)
+          try {
+            if (item.f.sourceType === 'excel') {
+              // Excel 地理化数据：dataApi.get 返回原始 WGS84 行（坐标不转换）
+              const res = await dataApi.get(item.f.dataId)
+              let rows = Array.isArray(res.data) ? res.data : (res.data?.data ?? [])
+              rows = rows.filter((r: any) => r && r.longitude != null && r.latitude != null)
+              item.geojson = { features: rows.map((r: any) => buildGeoDataFeature(item.f, r, zoom)) }
+              item.alreadyWgs84 = true
+            } else {
+              const fetched = await layerApi.getLayerDataWithVersion(item.f.dataId, item.f.id)
+              item.geojson = fetched.data
+              if (item.geojson) {
+                useMapDataCacheStore.getState()
+                  .cacheLayerGeoJSON(item.f.id, item.geojson, fetched.version)
+              }
+            }
+          } catch (e: any) {
+            console.warn('[NPT-LAYER] load failed', item.f.name, e?.message)
+          }
+        }
+      }
+      await Promise.all(
+        Array.from({ length: Math.min(GEO_FETCH_CONCURRENCY, needFetch.length) }, worker),
+      )
+      if (geoRunRef.current !== runId) { setLoadingLayer(null); return } // 已被更新一轮取代
+    }
+
+    // ===== 阶段 3：逐个应用数据（分块转换 + 建图元，每块之间让出一帧）=====
+    for (const item of pending) {
+      const { f, layer } = item
+      const geojson = item.geojson
+      if (!geojson || rawGeoRef.current.get(f.id) === geojson) continue
+      if (geoRunRef.current !== runId) { setLoadingLayer(null); return }
+      // 提示放在 await 之前：转换与建图元都是主线程重活，先亮提示再算
+      setLoadingLayer(f.name)
+      await nextPaint()
+      if (geoRunRef.current !== runId) { setLoadingLayer(null); return }
+      rawGeoRef.current.set(f.id, geojson)
+      // 大图层的 GCJ02→WGS84 转换按块跑，每块让一帧，避免整段占住主线程
+      const wgs84 = item.alreadyWgs84
+        ? geojson
+        : await transformFeatureCollectionAsync(geojson)
+      if (geoRunRef.current !== runId) { setLoadingLayer(null); return }
+      layer.setFeatureCollection(wgs84)
+      dataChanged.add(f.id)
+      console.log('[NPT-LAYER] loaded', f.name, geojson?.features?.length ?? 0, 'features')
+    }
+    setLoadingLayer(null)
+
+    // 移除已不存在的图层（连同批量图元与其热力面一起释放）
     for (const [id, layer] of [...geoJsonLayersRef.current]) {
       if (!liveIds.has(id)) {
         layer.destroy()
         geoJsonLayersRef.current.delete(id)
         rawGeoRef.current.delete(id)
+        const heat = heatmapsRef.current.get(id)
+        if (heat) { cancelPendingHeat(id); heat.destroy(); heatmapsRef.current.delete(id) }
+        heatReqRef.current.delete(id)
       }
     }
 
     syncDecoration()
+    syncLabels()
+    /**
+     * 数据就绪后重放热力面。
+     * 热力渲染依赖图层要素（取几何锚点算权重），而取数是异步的——首屏 `syncAll` 跑重放时
+     * 数据还没到，点集为空 → 什么都没画，之后也没有任何重试，于是"保存了热力配置，
+     * 切回地图页只有空图例、必须重新进设置页才渲染"。数据到了这里补一次就行。
+     */
+    replayHeatmaps(dataChanged)
   }
 
   /** 同步装饰图层（装饰要素 + 定位点） */
@@ -510,9 +668,51 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
     setGeoInfo(null)
     setSectorInfo(null)
     setOverlapSectors([])
+    setCapturePanel(null)
   }
 
   // ===== 值热力面（与 2D 共用计算与栅格化，见 CesiumHeatmapLayer） =====
+
+  /**
+   * 该图层是否处于热力「替换模式」：热力启用且「显示原图层」关闭。
+   * 此时原图形与标签必须隐藏，只留热力面 —— 与 2D `OnlineMap.isHeatmapReplacement` 同语义。
+   * 所有"按勾选状态恢复原图层可见性"的路径都要经过此判定，否则兜底显隐会把已隐藏的原图层重新显示出来。
+   */
+  function isHeatmapReplacement(layerId: string): boolean {
+    const hs = mapSettingsRef.current.heatmapSettingsMap?.[layerId] as HeatmapSettings | undefined
+    return !!(hs?.enabled && hs.field && !hs.showOriginal)
+  }
+
+  /**
+   * 解析某图层当前的可见性：
+   * - `userVisible`：用户勾选真值（只有它决定要不要取数据）
+   * - `visible`：叠加热力替换模式后的最终显隐
+   * 显隐规则只此一处，避免 sync 路径与热力开关路径各写一份而分叉。
+   */
+  function resolveLayerVisibility(fileId: string): { userVisible: boolean; visible: boolean } {
+    const p = propsRef.current
+    const ms = mapSettingsRef.current
+    const isGeoData = (p.pointFiles ?? []).some((x: any) => x.id === fileId)
+    const f = [...(p.layerFiles ?? []), ...(p.pointFiles ?? [])]
+      .find((x: any) => x.id === fileId) as any
+    const vis = isGeoData ? ms.pointFileVisibility?.[fileId] : ms.layerFileVisibility?.[fileId]
+    const userVisible = vis !== undefined ? !!vis : !!f?.visible
+    return { userVisible, visible: userVisible && !isHeatmapReplacement(fileId) }
+  }
+
+  /**
+   * 热力开关变化后重算原图层显隐。
+   *
+   * 替换模式下原图形要隐藏、关掉热力后要恢复显示；而显隐只在 sync 路径重算，
+   * 不补这一步就会出现「关掉热力图，原图层还是不见」。
+   * 这里只重算显隐，不重新取数（避免每次切换热力都打一轮网络请求）。
+   */
+  function refreshHeatVisibility() {
+    syncAll() // 扇区显隐（含替换模式判定）
+    for (const [id, layer] of geoJsonLayersRef.current) {
+      layer.setVisible(resolveLayerVisibility(id).visible)
+    }
+  }
 
   /** 收集某图层的热力点（WGS84）。扇区取 originalLat/Lng，图层要素取几何锚点 */
   function collectHeatPoints(layerId: string, field: string): HeatPoint[] {
@@ -545,13 +745,39 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
   }
 
   /**
-   * 渲染某图层的热力面；settings 为 null/未启用时移除。
+   * 作废某图层挂起中的热力渲染（取消令牌）。
+   *
+   * `renderHeatmapFor` 里有两个 await（取边界 + 等一帧），期间用户可能已经把热力关掉、
+   * 把图层隐藏或删掉了。没有令牌时那次渲染仍会在 await 之后照常 `addImageryProvider`，
+   * 贴出一个**不在 heatmapsRef 里**的孤儿图层 —— 后续所有移除路径都找不到它，
+   * 表现就是"热力关不掉，只能刷新页面"。
+   */
+  function cancelPendingHeat(layerId: string) {
+    heatTokenRef.current.set(layerId, (heatTokenRef.current.get(layerId) ?? 0) + 1)
+  }
+
+  /** 热力面还该显示吗：设置启用 + 源图层处于勾选可见状态且仍存在 */
+  function isHeatActive(layerId: string): boolean {
+    const p = propsRef.current
+    const key: LayerKey | null = layerId === 'lte-sectors' ? 'lte'
+      : layerId === 'nr-sectors' ? 'nr' : null
+    if (key) return !!visibilityRef.current[key]
+    const exists = [...(p.layerFiles ?? []), ...(p.pointFiles ?? [])]
+      .some((f: any) => f.id === layerId)
+    return exists && resolveLayerVisibility(layerId).userVisible
+  }
+
+  /**
+   * 渲染某图层的热力面；settings 为 null / 未启用 / 源图层不可见时移除。
    * 边界多边形从后端取（GCJ02）后转 WGS84 —— Cesium 侧一切都按 WGS84 对齐。
    */
   async function renderHeatmapFor(layerId: string, settings: HeatmapSettings | null) {
+    cancelPendingHeat(layerId)
+    const token = heatTokenRef.current.get(layerId) ?? 0
     let layer = heatmapsRef.current.get(layerId)
-    if (!settings?.enabled || !settings.field) {
+    if (!settings?.enabled || !settings.field || !isHeatActive(layerId)) {
       if (layer) { layer.remove(); heatmapsRef.current.delete(layerId) }
+      heatReqRef.current.delete(layerId)
       return
     }
     if (!layer) {
@@ -561,9 +787,21 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
       layer = new CesiumHeatmapLayer(C, viewer, layerId)
       heatmapsRef.current.set(layerId, layer)
     }
-    const boundary = await loadHeatBoundary(settings)
-    if (!heatmapsRef.current.has(layerId)) return // 期间被关掉了
-    layer.render(collectHeatPoints(layerId, settings.field), settings, boundary)
+    /**
+     * 提示必须在任何 await **之前**亮起。
+     * 早先它排在 `await loadHeatBoundary()` 之后——边界是网络请求（几百毫秒到数秒），
+     * 于是"点了确定之后要等网络回来才出现'正在渲染热力图'"，看起来就是慢了一拍。
+     * IDW 插值 + 逐像素着色是同步重活，先让浏览器真正画出一帧再算，界面才不会僵住。
+     */
+    setHeatmapBusy((n) => n + 1)
+    await nextPaint()
+    try {
+      const boundary = await loadHeatBoundary(settings)
+      if (heatTokenRef.current.get(layerId) !== token) return // 期间被关掉/换了一轮
+      layer.render(collectHeatPoints(layerId, settings.field), settings, boundary)
+    } finally {
+      setHeatmapBusy((n) => Math.max(0, n - 1))
+    }
   }
 
   /** 加载热力渲染边界多边形（GCJ02 → WGS84） */
@@ -590,15 +828,33 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
     }
   }
 
-  /** 重放所有已启用的热力设置（数据变化 / 首次进入 3D 时） */
-  function replayHeatmaps() {
+  /**
+   * 重放所有已启用的热力设置（设置变化 / 数据就绪 / 图层显隐变化 / 首次进入 3D）。
+   *
+   * 幂等靠"上次请求的设置指纹"记账：指纹没变且已经画出来了就跳过，避免每次同步都
+   * 重跑一遍 IDW（`forceIds` 里的图层例外——它们的数据刚变，必须重算）。
+   * 反过来，源图层被取消勾选 / 被删除 / 热力被关掉时，这里负责把残留的热力面摘掉。
+   */
+  function replayHeatmaps(forceIds?: Set<string>) {
     const map = (mapSettingsRef.current.heatmapSettingsMap ?? {}) as Record<string, HeatmapSettings>
     for (const [layerId, settings] of Object.entries(map)) {
-      if (settings?.enabled) void renderHeatmapFor(layerId, settings)
+      if (!settings?.enabled || !settings.field) continue
+      if (!isHeatActive(layerId)) continue
+      const sig = heatSettingsSignature(settings)
+      const existing = heatmapsRef.current.get(layerId)
+      if (!forceIds?.has(layerId) && existing?.isRendered()
+        && heatReqRef.current.get(layerId) === sig) continue
+      heatReqRef.current.set(layerId, sig)
+      void renderHeatmapFor(layerId, settings)
     }
-    // 已关掉的图层要把残留热力面摘掉
+    // 已关掉 / 源图层已隐藏或删除的，把残留热力面摘掉
     for (const [layerId, layer] of [...heatmapsRef.current]) {
-      if (!map[layerId]?.enabled) { layer.remove(); heatmapsRef.current.delete(layerId) }
+      if (!map[layerId]?.enabled || !isHeatActive(layerId)) {
+        cancelPendingHeat(layerId)
+        layer.destroy()
+        heatmapsRef.current.delete(layerId)
+        heatReqRef.current.delete(layerId)
+      }
     }
   }
 
@@ -725,6 +981,20 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
           // 测距 / 抓取坐标 / 圈选激活时，点击由对应会话消费
           if (propsRef.current.measureMode || propsRef.current.captureMode) return
           if ((propsRef.current.selectionMode ?? 'none') !== 'none') return
+          // 定位打点：与 2D 一致，「选择」工具点击已有标记 → 打开属性面板
+          // （编辑经纬度 / 重命名 / 复制属性 / 删除），点空白仍照常走扇区与要素拾取
+          if (useLayerEditStore.getState().selectMode) {
+            const capHit = mapToolsRef.current?.pickCapture(movement.position)
+            if (capHit) {
+              // 只收起其它属性框（不能用 closeInfoPanels：它会把 capturePanel 一起清掉）
+              setGeoInfo(null)
+              setSectorInfo(null)
+              setOverlapSectors([])
+              setCapturePanel(capHit)
+              setCapturePanelPos({ x: movement.position.x, y: movement.position.y })
+              return
+            }
+          }
           const picked = viewer.scene.pick(movement.position)
           const pickedSector = sectorFromPick(picked)
           if (pickedSector) {
@@ -737,7 +1007,7 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
             // 与高德侧一致：「选择」工具只高亮，手形工具才弹属性框
             if (useLayerEditStore.getState().selectMode && !propsRef.current.mapDragTool) {
               selectionRef.current?.selectSingle(
-                String(featProps.id ?? ''), { ...featProps, _layerType: 'MapInfo' })
+                pickedGeo.selectionId, { ...featProps, _layerType: 'MapInfo' })
               return
             }
             if (!propsRef.current.mapDragTool) return
@@ -789,6 +1059,10 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
           }
           // 平移/缩放后属性框跟随的锚点已失效 → 收起（与高德侧"移动地图即关闭属性框"一致）
           if (!moveTimer) closeInfoPanels()
+          // 覆盖层（圈选框 / 点选高亮）锚定在地理要素上，相机一动屏幕位置就变了
+          selectionRef.current?.refreshOverlay()
+          // 标签：移动中只按旧偏移重绘（不重排），停下才重新布局 —— 与 2D 的 move/moveend 同策略
+          labelOverlayRef.current?.requestDraw()
           if (moveTimer) clearTimeout(moveTimer)
           moveTimer = setTimeout(() => {
             moveTimer = null
@@ -799,6 +1073,7 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
               // 跨过地理化数据扇区 LOD 阈值时才重建（圆点 ↔ 扇形）
               setGeoLodLow(view.zoom <= GEO_DATA_SECTOR_LOD_ZOOM)
             }
+            syncLabels()
           }, 350)
         })
         // 相机变化 10% 就触发重建 → 交互中重建过密；放宽到 25%，只在明显移动后重建
@@ -809,7 +1084,7 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
 
         // 图层编辑会话：viewer 就绪即创建（无工作集时零渲染）
         editSessionRef.current = new CesiumEditSession(C, viewer)
-        // 圈选 / 点选会话（高亮直接写回扇区与 GeoJSON 图层）
+        // 圈选 / 点选会话（高亮直接写回扇区与 GeoJSON 图层；图形框画在 SVG 覆盖层上）
         selectionRef.current = new CesiumSelectionSession(C, viewer, {
           getTarget: resolveSelectionTarget,
           getSectors: (networkType) => {
@@ -825,10 +1100,15 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
           onSelectionChange: (count) => setSelectedCount(count),
           onTip: (tip) => setSelectionTip(tip),
           t: (key, opts) => t(key, opts) as string,
-        })
+        }, selectionOverlayRef.current)
+        labelOverlayRef.current = new CesiumLabelOverlay(C, viewer, labelCanvasRef.current)
         // 测距 / 抓取坐标工具
-        mapToolsRef.current = new CesiumMapTools(C, viewer, (lng, lat) =>
-          propsRef.current.onCaptureCoord?.(lng, lat))
+        mapToolsRef.current = new CesiumMapTools(
+          C, viewer,
+          (lng, lat) => propsRef.current.onCaptureCoord?.(lng, lat),
+          (key) => tRef.current(key),
+          (point, screen) => { setCapturePanel(point); setCapturePanelPos(screen) },
+        )
 
         setLoading(false)
         setReady(true)
@@ -851,6 +1131,8 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
       editSessionRef.current = null
       try { selectionRef.current?.destroy() } catch { /* ignore */ }
       selectionRef.current = null
+      try { labelOverlayRef.current?.destroy() } catch { /* ignore */ }
+      labelOverlayRef.current = null
       for (const h of heatmapsRef.current.values()) {
         try { h.destroy() } catch { /* ignore */ }
       }
@@ -880,6 +1162,9 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
     props.sectorLabelVisibility,
     props.labelSettingsMap,
     mapSettings.thematicSettingsMap,
+    // 热力设置变化必须能触发重放：3D 侧热力面只在"设置对话框确定"和同步路径里渲染，
+    // 不监听它就会出现"保存了配置、切回地图页只剩空图例"。
+    mapSettings.heatmapSettingsMap,
   ])
 
   /**
@@ -991,6 +1276,25 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
   }, [ready, t])
+
+  /**
+   * 测距 / 圈选的键盘快捷键（对等 2D OnlineMap 的全局 keydown）：
+   * - 测距中：Esc / Delete 清空测量（Delete 连打点标记一起清），Backspace 撤销上一个点
+   * - 圈选中：Esc / Backspace 撤销多边形上一个顶点；Esc（未绘制中）取消当前选中
+   * 输入框聚焦时不响应（否则网页端其它表单里的 Backspace 会误删测量点）。
+   */
+  useEffect(() => {
+    if (!ready) return
+    const onKeyDown = (e: KeyboardEvent) => {
+      const el = e.target as HTMLElement | null
+      const tag = el?.tagName
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || el?.isContentEditable) return
+      if (mapToolsRef.current?.handleKeyDown(e)) return
+      selectionRef.current?.handleKeyDown(e)
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [ready])
 
   /**
    * 天地图注记叠加层同步（影像注记 cia / 矢量注记 cva / 地形注记 cta）+ 三维地名 eva。
@@ -1162,9 +1466,11 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
       setSectorThematicSettings: () => syncAll(),
       setLayerHeatmapSettings: (fileId, settings) => {
         void renderHeatmapFor(fileId, settings)
+        refreshHeatVisibility()
       },
       setSectorHeatmapSettings: (layerId, settings) => {
         void renderHeatmapFor(layerId, settings)
+        refreshHeatVisibility()
       },
       getHeatmapStats: (layerId) => heatmapsRef.current.get(layerId)?.getStats() ?? null,
       replayHeatmapSettings: () => replayHeatmaps(),
@@ -1270,8 +1576,61 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
           destination: C.Rectangle.fromDegrees(west, south, east, north),
         })
       },
-      locateLayerFeature: () => Promise.resolve(false),
-      clearLayerFeatureHighlight: noop,
+      /**
+       * 搜索定位（图层文件 / 地理化数据）：等图层就绪 → 红色描边高亮目标要素 → 飞行定位。
+       * 与 2D `OnlineMap.locateLayerFeature` 同口径：入参是 **GCJ02** 渲染坐标，
+       * Cesium 侧一切按 WGS84，需先转换。
+       */
+      locateLayerFeature: async (opts) => {
+        const findLayer = () => {
+          const l = geoJsonLayersRef.current.get(opts.layerId)
+          return l && l.isVisible() ? l : null
+        }
+        // 大图层首次取数 + 建批量图元要等一会儿（同 2D：最多 30s、每 200ms 试一次）
+        let layer = findLayer()
+        const deadline = Date.now() + 30000
+        while (!layer && Date.now() < deadline) {
+          await new Promise((r) => setTimeout(r, 200))
+          layer = findLayer()
+        }
+        if (!layer) {
+          console.warn('[CesiumMap] locateLayerFeature: 图层未加载或不可见', opts.layerId)
+          return false
+        }
+        // 清掉其它高亮，只留目标要素（红色描边即搜索定位高亮，与 2D 一致）
+        selectionIdsRef.current = new Set([String(opts.featureId)])
+        syncAll()
+
+        const viewer = viewerRef.current
+        const C = (window as any).Cesium
+        if (!viewer || !C) return true
+        if (opts.bounds) {
+          const [[s, w], [n, e]] = opts.bounds
+          const [ws, ww] = gcj02ToWgs84(s, w)
+          const [wn, we] = gcj02ToWgs84(n, e)
+          viewer.camera.flyTo({ destination: C.Rectangle.fromDegrees(ww, ws, we, wn) })
+          return true
+        }
+        if (opts.center) {
+          const [wlat, wlng] = gcj02ToWgs84(opts.center[0], opts.center[1])
+          const carto = viewer.camera.positionCartographic
+          const curZoom = heightToZoom(
+            carto.height, C.Math.toDegrees(carto.latitude),
+            viewer.canvas.clientHeight, viewer.camera.frustum.fovy)
+          viewer.camera.flyTo({
+            destination: C.Cartesian3.fromDegrees(
+              wlng, wlat,
+              zoomToHeight(Math.max(curZoom, 16), wlat,
+                viewer.canvas.clientHeight, viewer.camera.frustum.fovy)),
+          })
+        }
+        return true
+      },
+      /** 清除搜索定位的要素高亮（图层文件 / 地理化数据） */
+      clearLayerFeatureHighlight: () => {
+        selectionIdsRef.current = null
+        syncAll()
+      },
       locateSector: (opts) => {
         const viewer = viewerRef.current
         if (!viewer) return
@@ -1299,6 +1658,26 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
   return (
     <div className="absolute inset-0">
       <div ref={containerRef} className="w-full h-full" />
+
+      {/*
+        圈选图形框覆盖层（拖框预览 + 松手后的终态框）。
+        用屏幕空间 SVG 而非 Cesium 贴地图元：贴地图元要等地形瓦片就绪才出图，
+        拖动中每帧重建等于永远画不出来（表现为"圈选没有框"）。
+      */}
+      <svg
+        ref={selectionOverlayRef}
+        className="absolute inset-0 w-full h-full pointer-events-none z-[900]"
+        aria-hidden="true"
+      />
+      {/*
+        标签覆盖层：基站 / 图层文件 / 地理化 / 装饰的标签统一在这里防重叠绘制。
+        与 2D 的 LabelLayoutManager 同一套算法，避免逐要素 Cesium 标签既不防重叠又拖垮帧率。
+      */}
+      <canvas
+        ref={labelCanvasRef}
+        className="absolute inset-0 w-full h-full pointer-events-none z-[902]"
+        aria-hidden="true"
+      />
 
       {loading && (
         <div className="absolute inset-0 flex items-center justify-center bg-muted/40 text-foreground text-xs">
@@ -1351,6 +1730,63 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
         viewportBounds={containerRef.current?.getBoundingClientRect() ?? null}
         onClose={() => setGeoInfo(null)}
       />
+
+      {/* 定位打点属性面板（「选择」工具点击已有打点：改经纬度 / 重命名 / 复制 / 删除） */}
+      {!!capturePanel && (
+        <CapturePointPanel
+          point={capturePanel}
+          position={capturePanelPos}
+          viewportBounds={containerRef.current
+            ? { width: containerRef.current.clientWidth, height: containerRef.current.clientHeight }
+            : null}
+          onRename={(name) => {
+            mapToolsRef.current?.renameCapturePoint(capturePanel.id, name)
+            setCapturePanel({ ...capturePanel, name })
+          }}
+          onMove={(lng, lat) => {
+            mapToolsRef.current?.moveCapturePoint(capturePanel.id, lng, lat)
+            setCapturePanel({ ...capturePanel, lng, lat })
+          }}
+          onCopy={() => {
+            void selectionManager.copyToClipboard([{
+              [t('map.labelName') || '标签']: capturePanel.name,
+              [t('map.longitude') || '经度']: capturePanel.lng.toFixed(6),
+              [t('map.latitude') || '纬度']: capturePanel.lat.toFixed(6),
+            }])
+          }}
+          onDelete={() => {
+            mapToolsRef.current?.removeCapturePoint(capturePanel.id)
+            setCapturePanel(null)
+          }}
+          onClose={() => setCapturePanel(null)}
+          t={t}
+        />
+      )}
+
+      {/*
+        居中动画标记：热力图渲染中 / 图层加载中。
+        IDW 插值与图层批量图元重建都是同步重活，不提示会让界面看着像卡死；
+        提示在所有 await **之前**就亮起（调用方保证），所以用户点了操作立刻能看到。
+      */}
+      {(heatmapBusy > 0 || !!loadingLayer) && (
+        <div className="absolute inset-0 z-[1100] flex items-center justify-center pointer-events-none">
+          <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-card/95 border border-border shadow-lg">
+            <svg
+              width="18" height="18" viewBox="0 0 24 24" fill="none"
+              className="animate-spin text-primary"
+              aria-hidden="true"
+            >
+              <circle cx="12" cy="12" r="9" stroke="currentColor" strokeOpacity="0.25" strokeWidth="3" />
+              <path d="M21 12a9 9 0 0 0-9-9" stroke="currentColor" strokeWidth="3" strokeLinecap="round" />
+            </svg>
+            <span className="text-xs text-foreground">
+              {loadingLayer
+                ? `${t('map.layerLoading') || '正在加载图层'}：${loadingLayer}`
+                : (t('map.heatmapRendering') || '正在渲染热力图…')}
+            </span>
+          </div>
+        </div>
+      )}
 
       {/* 圈选提示条（与高德侧同款：底部居中，显示选中数量与复制提示） */}
       {selectionTip && (props.selectionMode ?? 'none') !== 'none' && (

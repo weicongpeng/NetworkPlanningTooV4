@@ -18,6 +18,7 @@ import {
 } from './cesiumSectorStyle'
 import { resolvePlanningStyle, type PlanningHighlight } from './cesiumHighlight'
 import type { LabelSettings } from '../LabelSettingsModal'
+import type { LabelCandidateBase } from '../labelLayoutCore'
 import { computeThematicStats, type ThematicStats } from '../../../utils/thematicStats'
 
 const METERS_PER_LAT = 111319.9
@@ -153,8 +154,6 @@ export function circlePointsCount(zoom: number, pciPlanning: boolean): number {
 }
 
 export class CesiumSectorLayer {
-  /** 标签专用数据源（面/边框已改批量图元，不再走 Entity） */
-  readonly dataSource: any
   private viewer: any
   /** 扇区面（贴地，按 PerInstanceColor 批量） */
   private fillPrimitive: any = null
@@ -169,6 +168,15 @@ export class CesiumSectorLayer {
   private renderMode: string = 'default'
   private ctx: SectorStyleContext = {}
   private highlight: PlanningHighlight = {}
+  /**
+   * 配置是否变过（任一 setter 写入即置位）。
+   * `update()` 只在"配置变了"或"视野明显移动了"时才重建几何 —— 同步路径（热力重放、
+   * 选中态刷新等）会频繁调 `syncAll()` → `update()`，没有这个判断就会反复重建
+   * 几千个扇区的几何，是"3D 缩放/平移卡顿"的直接来源。
+   */
+  private configDirty = true
+  /** 上次重建时的视野量化键 */
+  private lastViewKey = ''
 
   constructor(
     private C: any,
@@ -176,8 +184,6 @@ export class CesiumSectorLayer {
     private networkType: NetworkType,
   ) {
     this.viewer = viewer
-    this.dataSource = new C.CustomDataSource('sector-labels-' + networkType)
-    viewer.dataSources.add(this.dataSource)
   }
 
   /** 释放批量图元（重建前 / 卸载时） */
@@ -188,18 +194,52 @@ export class CesiumSectorLayer {
     if (this.outlinePrimitive) { primitives.remove(this.outlinePrimitive); this.outlinePrimitive = null }
   }
 
-  /** 图层卸载：释放图元与标签 */
+  /** 图层卸载：释放图元 */
   destroy(): void {
     this.clearPrimitives()
-    try { this.viewer?.dataSources?.remove(this.dataSource) } catch { /* ignore */ }
   }
 
   setRenderData(sectors: RenderSectorData[]): void {
     this.allSectors = sectors
+    this.configDirty = true
   }
   /** 全部扇区（圈选按几何收集时用，不做视口剔除） */
   getAllSectors(): RenderSectorData[] {
     return this.allSectors
+  }
+
+  /**
+   * 本图层当前的标签候选（WGS84）。
+   *
+   * 标签不再走 Cesium 的逐要素 Entity/LabelCollection —— 那些标签既不防重叠，
+   * 又要跟着相机停下时的 `removeAll()` 一起全量重建（卡顿主因之一）。
+   * 现在只把候选交给 `CesiumLabelOverlay`，在屏幕空间统一避让后批量画到一张 Canvas 上。
+   */
+  labelCandidates(view: CameraView): LabelCandidateBase[] {
+    if (!this.visible || !this.labelsEnabled || !this.labelSettings) return []
+    const ls = this.labelSettings
+    const out: LabelCandidateBase[] = []
+    for (const sector of this.pickSectors(view)) {
+      const text = this.labelText(sector)
+      if (!text) continue
+      out.push({
+        id: String(sector.id),
+        lat: sector.originalLat,
+        lng: sector.originalLng,
+        text,
+        fontSize: ls.fontSize || 12,
+        fontFamily: ls.fontFamily,
+        bold: ls.bold,
+        italic: ls.italic,
+        shadow: ls.shadow,
+        background: ls.background,
+        backgroundColor: ls.backgroundColor,
+        color: ls.color || '#000000',
+        // 选中的要素优先占位（与 2D SectorRendererSVG 的 priority=10 一致）
+        priority: this.isSelected(sector) ? 10 : 0,
+      })
+    }
+    return out
   }
 
   /** 专题图例统计（与 2D 同算法，保证两边图例数字一致） */
@@ -211,26 +251,34 @@ export class CesiumSectorLayer {
     return this.visible
   }
   setVisible(visible: boolean): void {
+    if (this.visible === visible) return
     this.visible = visible
+    this.configDirty = true
   }
   setWhitelist(whitelist: Set<string> | null): void {
     this.whitelist = whitelist
+    this.configDirty = true
   }
   setSelectionIds(ids: Set<string> | null): void {
     this.selectionIds = ids
+    this.configDirty = true
   }
   setLabels(enabled: boolean, settings: LabelSettings | null): void {
     this.labelsEnabled = enabled
     this.labelSettings = settings
   }
   setRenderMode(mode: string): void {
+    if (this.renderMode === mode) return
     this.renderMode = mode
+    this.configDirty = true
   }
   setStyleContext(ctx: SectorStyleContext): void {
     this.ctx = ctx
+    this.configDirty = true
   }
   setHighlight(highlight: PlanningHighlight): void {
     this.highlight = highlight
+    this.configDirty = true
   }
 
   private inWhitelist(sector: RenderSectorData): boolean {
@@ -293,17 +341,40 @@ export class CesiumSectorLayer {
    * 逐实例颜色走 `ColorGeometryInstanceAttribute`，拾取走 `GeometryInstance.id = { sector }`。
    * 标签仍用 Entity（数量少、且 Cesium 标签本就无批量接口）。
    */
+  /**
+   * 视野量化键：把视野平移量按跨度的 1/20 分档。
+   * 小幅平移不触发重建（视口剔除本来就有 15% 外扩余量，边缘不会缺图形）。
+   */
+  private viewKey(view: CameraView): string {
+    const spanLat = Math.max(1e-6, view.north - view.south)
+    const spanLng = Math.max(1e-6, view.east - view.west)
+    const qx = Math.round(view.west / (spanLng / 20))
+    const qy = Math.round(view.south / (spanLat / 20))
+    return `${Math.round(view.zoom)}|${qx}|${qy}`
+  }
+
   update(view: CameraView): void {
     const C = this.C
+    const viewKey = this.viewKey(view)
+    // 配置没变且视野没实质移动：这次重建可以整个省掉
+    if (!this.configDirty && viewKey === this.lastViewKey) return
+    this.configDirty = false
+    this.lastViewKey = viewKey
+
     this.clearPrimitives()
-    this.dataSource.entities.removeAll()
 
     if (!this.visible) return
 
     const sectors = this.pickSectors(view)
     const pciPlanning = this.renderMode === 'pci-planning'
-    const arcSegments = arcPointsCount(view.zoom, pciPlanning)
-    const circleSegments = circlePointsCount(view.zoom, pciPlanning)
+    // 要素极多时降采样弧/圆：全场几万个顶点会把重建拖到秒级，视觉上几乎看不出差别
+    const dense = sectors.length > 1500
+    const arcSegments = dense
+      ? Math.min(arcPointsCount(view.zoom, pciPlanning), 12)
+      : arcPointsCount(view.zoom, pciPlanning)
+    const circleSegments = dense
+      ? Math.min(circlePointsCount(view.zoom, pciPlanning), 16)
+      : circlePointsCount(view.zoom, pciPlanning)
     const showStroke = view.zoom >= STROKE_MIN_ZOOM
 
     const fills: any[] = []
@@ -353,30 +424,6 @@ export class CesiumSectorLayer {
         }))
       }
 
-      if (this.labelsEnabled && this.labelSettings) {
-        const text = this.labelText(sector)
-        if (text) {
-          const ls = this.labelSettings
-          const labelEntity = new C.Entity({
-            position: C.Cartesian3.fromDegrees(sector.originalLng, sector.originalLat),
-            label: {
-              text,
-              font: `${ls.bold ? 'bold ' : ''}${ls.italic ? 'italic ' : ''}${ls.fontSize || 12}px ${ls.fontFamily || 'sans-serif'}`,
-              fillColor: C.Color.fromCssColorString(ls.color || '#000000'),
-              showBackground: !!ls.background,
-              backgroundColor: C.Color.fromCssColorString(ls.backgroundColor || '#ffffff').withAlpha(0.85),
-              style: C.LabelStyle.FILL_AND_OUTLINE,
-              pixelOffset: new C.Cartesian2(0, -8),
-              verticalOrigin: C.VerticalOrigin.BOTTOM,
-              horizontalOrigin: C.HorizontalOrigin.CENTER,
-              heightReference: C.HeightReference.CLAMP_TO_GROUND,
-              disableDepthTestDistance: Number.POSITIVE_INFINITY,
-            },
-          })
-          labelEntity.sectorData = sector
-          this.dataSource.entities.add(labelEntity)
-        }
-      }
     }
 
     const primitives = this.viewer?.scene?.primitives

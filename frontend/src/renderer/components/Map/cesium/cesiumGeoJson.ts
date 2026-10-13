@@ -53,6 +53,41 @@ export function transformFeatureCollection<FC extends {
   }
 }
 
+/** 分块大小：每块要素转换之间让出一帧 */
+const CHUNK = 2000
+
+/** 等一帧（无 rAF 的环境退化成 setTimeout，测试里不会挂住） */
+function yieldFrame(): Promise<void> {
+  return new Promise((resolve) => {
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(() => resolve())
+    else setTimeout(resolve, 0)
+  })
+}
+
+/**
+ * 分块转换整个 FeatureCollection（异步，每块之间让出一帧）。
+ *
+ * 大图层（几万个点/面的 MapInfo）的 GCJ02→WGS84 是纯计算重活，`transformFeatureCollection`
+ * 整段跑完要占住主线程几秒 —— 期间界面完全冻住，"正在加载图层"的提示也停在第一帧不动。
+ * 分块让帧后提示能持续转，浏览器也能继续响应取消/缩放。
+ */
+export async function transformFeatureCollectionAsync<FC extends {
+  features: Array<{ geometry?: { type: string; coordinates: unknown } }>
+}>(fc: FC): Promise<FC> {
+  const total = fc.features.length
+  if (total <= CHUNK) return transformFeatureCollection(fc)
+  const out: typeof fc.features = new Array(total)
+  for (let start = 0; start < total; start += CHUNK) {
+    const end = Math.min(start + CHUNK, total)
+    for (let i = start; i < end; i++) {
+      const f = fc.features[i]
+      out[i] = f.geometry ? { ...f, geometry: transformGeometry(f.geometry) } : f
+    }
+    await yieldFrame()
+  }
+  return { ...fc, features: out }
+}
+
 /** 提取几何锚点 [lng,lat]（标签/定位用；取首个坐标） */
 export function geometryAnchor(geometry: {
   type: string

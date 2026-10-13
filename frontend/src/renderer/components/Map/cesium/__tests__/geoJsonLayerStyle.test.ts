@@ -176,11 +176,15 @@ describe('CesiumGeoJsonLayer 要素配色（_style 还原）', () => {
     expect(fillColorOf(primitives).css).toBe('#10b981')
   })
 
-  it('KML <fill>0</fill>：只画边框，不填充', () => {
+  it('KML <fill>0</fill>：视觉上只画边框，但保留一个近乎全透明的面图元用于点击命中', () => {
     layer.setFeatureCollection({
       features: [polygonFeature({ fill: false, strokeColor: '#000000' })],
     } as any)
-    expect(primitives.find((x) => x.kind === 'ground-polygon')).toBeUndefined()
+    // 面图元仍在（否则点击多边形内部拾取不到，只能点中边框那几个像素），
+    // 但 alpha 被压到 0.01 —— 肉眼看等于"只画边框"。
+    const fill = primitives.find((x) => x.kind === 'ground-polygon')
+    expect(fill).toBeTruthy()
+    expect(fillColorOf(primitives).alpha).toBeLessThan(0.02)
     expect(primitives.find((x) => x.kind === 'ground-polyline')).toBeTruthy()
   })
 
