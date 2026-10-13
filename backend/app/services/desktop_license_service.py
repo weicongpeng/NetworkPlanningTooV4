@@ -472,6 +472,36 @@ class DesktopLicenseService:
             db.commit()
         return items
 
+    def mirror_client_version(
+        self, db: Session, record: DesktopLicense, version: Optional[str]
+    ) -> None:
+        """把客户端上报的版本同步到同一台机器的其它授权记录（不提交事务）。
+
+        客户端只会上报给「当前正在使用的那条授权」（共享/单机各一条记录），而
+        「桌面授权」页默认只看单机记录：只回写当前记录时，用共享模式跑着的机器
+        升级后，单机记录会永远停在升级前的旧版本（v0.0.17 显示成 v0.0.15）。
+        版本是「这台机器上装的桌面端」的属性，因此按机器码同步（跨账号/跨模式）。
+        """
+        version = (version or "").strip()
+        if not version:
+            return
+        if record.client_version != version:
+            record.client_version = version
+        machine = (record.machine_code or "").strip()
+        if not machine:
+            return
+        siblings = (
+            db.query(DesktopLicense)
+            .filter(
+                DesktopLicense.machine_code == machine,
+                DesktopLicense.id != (record.id or 0),
+            )
+            .all()
+        )
+        for item in siblings:
+            if (item.client_version or "").strip() != version:
+                item.client_version = version
+
     def _build_license(self, record: DesktopLicense, db: Optional[Session] = None) -> Tuple[str, str]:
         """签发许可，返回 (license_file, expire_date)。
 
@@ -550,6 +580,8 @@ class DesktopLicenseService:
 
         license_file, expire_date = self._build_license(record, db)
         record.expire_date = expire_date
+        # 版本按机器码镜像到同机器其它授权记录（换模式/换账号后视图不留旧版本）
+        self.mirror_client_version(db, record, client_version)
         db.commit()
         db.refresh(record)
         return record, license_file, expire_date
@@ -594,6 +626,8 @@ class DesktopLicenseService:
 
         license_file, expire_date = self._build_license(record, db)
         record.expire_date = expire_date
+        # 版本按机器码镜像到同机器其它授权记录（换模式/换账号后视图不留旧版本）
+        self.mirror_client_version(db, record, client_version)
         db.commit()
         db.refresh(record)
         return record, license_file, expire_date
@@ -940,6 +974,9 @@ class DesktopLicenseService:
         license_file, expire_date = self._build_license(record, db)
         record.expire_date = expire_date
         record.updated_at = _iso()
+        # 登录即刷新同机器全部记录（同机器可能有共享/单机两条）的客户端版本：
+        # 只写当前记录时，「桌面授权」页默认的单机视图会停在升级前的旧版本
+        self.mirror_client_version(db, record, client_version)
         db.commit()
         db.refresh(record)
         return "ok", self._login_payload(record, license_file, expire_date, user)

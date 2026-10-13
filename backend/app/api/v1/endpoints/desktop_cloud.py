@@ -250,10 +250,11 @@ async def desktop_session_check(
 
     # 心跳即活跃：刷新会话时间，供「用户管理」的桌面端在线状态判定
     session.last_activity = datetime.now(timezone.utc)
-    # 顺带刷新客户端版本：OTA 升级后不必等下次登录，「桌面授权」页立即显示新版本
-    version = (payload.client_version or "").strip()
-    if version and version != (record.client_version or ""):
-        record.client_version = version
+    # 顺带刷新客户端版本：OTA 升级后不必等下次登录，「桌面授权」页立即显示新版本。
+    # 版本是「这台机器上装的桌面端」的属性：同机器可能有共享/单机两条记录，
+    # 客户端只会报给当前使用的那条，因此按机器码镜像到全部记录（否则默认的
+    # 单机视图会停在升级前的旧版本）
+    desktop_license_service.mirror_client_version(db, record, payload.client_version)
     db.commit()
 
     data: Dict[str, Any] = {"valid": True}

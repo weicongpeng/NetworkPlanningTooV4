@@ -321,6 +321,69 @@ def test_session_check_refreshes_client_version(login_env):
         db.close()
 
 
+def test_client_version_mirrors_to_all_records_of_machine(login_env):
+    """「当前版本」是整台机器的属性：同机器其它记录（单机/共享）一起刷新。
+
+    客户端只会上报给当前正在使用的那条授权，而「桌面授权」页默认只看单机记录：
+    只回写当前记录时，用共享模式跑着的机器升级后，单机记录会停在升级前的旧版本
+    （v0.0.17 显示成 v0.0.15）。其它机器上的记录不受影响。
+    """
+    # 同机器的单机记录（申请 → 批准），版本停在 0.0.15
+    standalone = _login(
+        login_env.client, "alice", "alice-pwd", mode="standalone", client_version="0.0.15"
+    )
+    standalone_id = standalone.json()["data"]["license_id"]
+    assert (
+        login_env.client.post(
+            f"/api/v1/desktop-licenses/{standalone_id}/approve", json={}
+        ).status_code
+        == 200
+    )
+
+    # 另一台机器上的记录：不应被本机的上报改动
+    other = _login(
+        login_env.client,
+        "alice",
+        "alice-pwd",
+        mode="standalone",
+        machine="ZZZZ-ZZZZ-ZZZZ-ZZZZ",
+        client_version="0.0.9",
+    )
+    other_id = other.json()["data"]["license_id"]
+    assert (
+        login_env.client.post(
+            f"/api/v1/desktop-licenses/{other_id}/approve", json={}
+        ).status_code
+        == 200
+    )
+
+    # 本机改走共享模式并升级到 0.0.17 → 同机器的单机记录也要跟着刷新
+    shared = _login(login_env.client, "alice", "alice-pwd", mode="shared", client_version="0.0.17")
+    assert shared.status_code == 200, shared.text
+    license_file = shared.json()["data"]["license_file"]
+    jti = shared.json()["data"]["session_jti"]
+
+    # 心跳上报的版本同样镜像（OTA 升级后不必等下一次登录）
+    check = login_env.client.post(
+        "/api/v1/desktop-cloud/auth/session-check",
+        json={
+            "license_file": license_file,
+            "machine_code": MACHINE_A,
+            "session_jti": jti,
+            "client_version": "0.0.18",
+        },
+    )
+    assert check.status_code == 200, check.text
+
+    db = login_env.session_factory()
+    try:
+        versions = {row.id: row.client_version for row in db.query(DesktopLicense).all()}
+    finally:
+        db.close()
+    assert versions[standalone_id] == "0.0.18"
+    assert versions[other_id] == "0.0.9"
+
+
 def test_session_check_rejects_unknown_or_invalid_license(login_env):
     resp = login_env.client.post(
         "/api/v1/desktop-cloud/auth/session-check",
