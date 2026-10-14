@@ -88,24 +88,79 @@ export async function transformFeatureCollectionAsync<FC extends {
   return { ...fc, features: out }
 }
 
-/** 提取几何锚点 [lng,lat]（标签/定位用；取首个坐标） */
+/**
+ * 提取几何锚点 [lng,lat]（标签/定位用）。
+ *
+ * 与 2D `MapInfoLayer._labelAnchorFromGeometry` **同口径**：
+ * - 点（Point）→ 自身坐标
+ * - 线 / 面 / Multi* → **全部顶点的包围盒中心**（Leaflet `layer.getBounds().getCenter()`）
+ *
+ * 早先取的是"第一个坐标"：对多边形就是外环的第一个顶点 —— 大面要素的标签因此贴在图形的
+ * 边框/角上，而不是图形中央（2026-10-14 用户报"较大的多边形要素标签显示在图形边框位置"）。
+ */
 export function geometryAnchor(geometry: {
   type: string
   coordinates: unknown
 }): [number, number] | null {
-  const c = geometry.coordinates
-  const first = (v: unknown): Position | null => {
-    if (Array.isArray(v)) {
-      if (typeof v[0] === 'number') return v as Position
-      for (const child of v) {
-        const r = first(child)
-        if (r) return r
-      }
-    }
-    return null
+  const coords = geometry.coordinates
+  if (geometry.type === 'Point') {
+    const p = coords as Position
+    return Array.isArray(p) && typeof p[0] === 'number' ? [p[0], p[1]] : null
   }
-  const p = first(c)
-  return p ? [p[0], p[1]] : null
+  let minLng = Infinity
+  let minLat = Infinity
+  let maxLng = -Infinity
+  let maxLat = -Infinity
+  let found = false
+  const walk = (node: unknown): void => {
+    if (!Array.isArray(node) || node.length === 0) return
+    if (typeof node[0] === 'number') {
+      const lng = node[0] as number
+      const lat = node[1] as number
+      if (!Number.isFinite(lng) || !Number.isFinite(lat)) return
+      found = true
+      if (lng < minLng) minLng = lng
+      if (lng > maxLng) maxLng = lng
+      if (lat < minLat) minLat = lat
+      if (lat > maxLat) maxLat = lat
+      return
+    }
+    for (const child of node) walk(child)
+  }
+  walk(coords)
+  if (!found) return null
+  return [(minLng + maxLng) / 2, (minLat + maxLat) / 2]
+}
+
+/**
+ * 几何质心 [lng,lat]（全部顶点的算术平均）——热力取点用。
+ *
+ * 与 2D `MapInfoLayer.geometryCentroid` 同口径（面状要素的热力权重落在图形重心上，
+ * 而不是某个角点）。标签锚点请用 `geometryAnchor`（2D 标签用的是包围盒中心，两者不同源）。
+ */
+export function geometryCentroid(geometry: {
+  type: string
+  coordinates: unknown
+}): [number, number] | null {
+  let lngSum = 0
+  let latSum = 0
+  let n = 0
+  const walk = (node: unknown): void => {
+    if (!Array.isArray(node) || node.length === 0) return
+    if (typeof node[0] === 'number') {
+      const lng = node[0] as number
+      const lat = node[1] as number
+      if (!Number.isFinite(lng) || !Number.isFinite(lat)) return
+      lngSum += lng
+      latSum += lat
+      n += 1
+      return
+    }
+    for (const child of node) walk(child)
+  }
+  walk(geometry.coordinates)
+  if (n === 0) return null
+  return [lngSum / n, latSum / n]
 }
 
 // ===== 地理化数据（Excel 点/扇区文件）的扇区几何 =====

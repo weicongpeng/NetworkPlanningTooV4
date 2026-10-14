@@ -38,7 +38,7 @@ import {
   isGeoDataDot,
   GEO_DATA_SECTOR_LOD_ZOOM,
   featureSelectionId,
-  geometryAnchor,
+  geometryCentroid,
   emptyBounds,
   hasBounds,
   extendBounds,
@@ -748,7 +748,9 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
       const props = (f.properties ?? {}) as Record<string, unknown>
       const w = toNumber(getFieldValue(props, field))
       if (w === null) continue
-      const anchor = geometryAnchor(f.geometry)
+      // 与 2D `MapInfoLayer.getHeatPoints` 同口径：面/线要素的热力权重取**顶点质心**，
+      // 早先取的是"第一个坐标"（多边形的外环首顶点）→ 大面要素的热点被顶到图形角上
+      const anchor = geometryCentroid(f.geometry)
       if (!anchor) continue
       out.push({ lat: anchor[1], lng: anchor[0], weight: w })
     }
@@ -1105,9 +1107,25 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
         // 相机变化 10% 就触发重建 → 交互中重建过密；放宽到 25%，只在明显移动后重建
         // （仅用于上方的防抖重建路径，覆盖层重绘不依赖它）
         viewer.camera.percentageChanged = 0.25
-        // 半透明几何（扇区填充、图层文件面）默认**不可拾取** —— 点击取不到要素，
-        // 表现为"点要素没反应/不弹属性框"。开启后 Scene.pick 会一并拾取半透明几何。
-        viewer.scene.pickTranslucentDepth = true
+        /**
+         * 刻意**不**开启 `scene.pickTranslucentDepth`（2026-10-14 修"缩放必崩 _target"的根因）。
+         *
+         * 该开关只影响 `scene.pickPosition`（半透明几何的深度拾取），**不影响 `scene.pick`
+         * 能不能点到半透明要素** —— 点击命中靠的是"近乎全透明的命中面"那一招（见
+         * `CesiumGeoJsonLayer` 里 alpha 0.01 的说明），与这个开关无关。
+         *
+         * 但相机控制器在**滚轮缩放的每一步**（相机高度 < 150km，即所有城市级缩放）都会内部调用
+         * `scene.pickPositionWorldCoordinates`；开关打开时它走 `renderTranslucentDepthForPick`
+         * —— 一次"把整个场景重绘进 pick-depth framebuffer"的旁路渲染。该旁路有已知缺陷
+         * （CesiumGS/cesium#12617，标题就是本错误，至今 open）：图元被 remove/add（正是扇区随
+         * 缩放重建时）会让它拿到已销毁/undefined 的纹理，抛
+         * `TypeError: Cannot read properties of undefined (reading '_target')`；
+         * 错误落在渲染循环里 → Cesium 停掉渲染循环 + 插全屏错误浮层 = 3D 页面"冻结、点不动"。
+         * 保持默认 false，缩放就不再走那条旁路。
+         *
+         * 曾经误以为"半透明几何不可拾取"要靠它解决：其实 `scene.pick`（点击命中）本来就拾取
+         * 半透明图元（贴地面也一样），真正让"点透明面没反应"消失的是那层 alpha 0.01 的命中面。
+         */
 
         /**
          * 渲染崩溃自恢复。一次渲染异常会留下两个后果，都要处理：

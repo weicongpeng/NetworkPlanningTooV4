@@ -421,8 +421,9 @@ export class CesiumGeoJsonLayer {
              *
              * 面图元同时承担"点击命中区域"的职责：不建面就只剩贴地边框线，而线的命中宽度
              * 只有几个像素 —— 表现为"透明填充的多边形点内部没反应，只能点中边框"。
-             * 视觉上 alpha 0.01 与无填充没有区别，但 `scene.pick`（已开 pickTranslucentDepth）
-             * 就能拾到整个面了。
+             * 视觉上 alpha 0.01 与无填充没有区别，但 `scene.pick` 就能拾到整个面了
+             * （`scene.pick` 本来就拾取半透明/贴地面，不需要 `pickTranslucentDepth`；
+             * 那个开关只影响 `pickPosition`，且会引入缩放崩溃，见 CesiumMap 里的说明）。
              */
             polygons.push(new C.GeometryInstance({
               geometry: new C.PolygonGeometry({
