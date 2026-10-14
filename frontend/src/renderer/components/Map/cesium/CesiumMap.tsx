@@ -397,10 +397,9 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
 
     // 圈选高亮同步到图层文件 / 地理化数据 / 装饰图层。
     // 早先只推给扇区图层 → 基站能高亮、图层文件与地理化数据圈选后毫无反应。
-    // 连视野一起推：图层据此判断"选中集合没变就不重建"（否则每次相机停下都全量重建），
-    // 并按当前米/像素把选中描边换算成像素宽。
+    // 图层内部会判断"选中集合没变就不重建"（否则每次相机停下都全量重建）。
     for (const layer of geoJsonLayersRef.current.values()) {
-      layer.setSelectionIds(selectionIdsRef.current, view)
+      layer.setSelectionIds(selectionIdsRef.current)
     }
     decorationLayerRef.current?.setSelectionIds(selectionIdsRef.current)
     syncLabels()

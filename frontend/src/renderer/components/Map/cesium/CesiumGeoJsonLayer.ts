@@ -24,12 +24,6 @@ const MAX_LABEL_CANDIDATES = 2000
  * 2D 只改描边、不动填充，3D 同口径 —— 见 render() 里的说明。
  */
 const SELECTED_STROKE_COLOR = '#ef4444'
-/** 选中态描边加粗量（2D 是 weight:3，这里在要素描边宽基础上 +2） */
-const SELECTED_STROKE_EXTRA = 2
-/** 选中态描边的最小像素宽（对齐 2D 的 weight:3） */
-const SELECTED_STROKE_MIN_PX = 3
-/** Web Mercator zoom 0 赤道处每像素米数（与 CesiumSectorLayer 同式） */
-const EQUATOR_MPP = 156543.03392
 import { computeThematicStats, type ThematicStats } from '../../../utils/thematicStats'
 
 type Position = number[]
@@ -93,8 +87,6 @@ export class CesiumGeoJsonLayer {
   private label: LabelSettings | null = null
   private thematic: ThematicSettings | null = null
   private selectionIds: Set<string> | null = null
-  /** 最近一次推送的视野（选中描边按像素宽换算时用） */
-  private view: CameraView | null = null
 
   private viewer: any
   /** 本次渲染创建的批量图元（面/线/点各 1 个），重建时整体移除 */
@@ -183,24 +175,14 @@ export class CesiumGeoJsonLayer {
   /**
    * 选中集合（+ 当前视野）。
    *
-   * 宿主 `syncAll()` 每次相机停下都会重推一遍，所以：
-   * - 集合没变就**直接返回**，不再重建 —— 否则每次平移/缩放后都要把上千个要素的
-   *   贴地图元全量重建一遍，是"缩放/平移卡顿"的主要来源之一
-   * - 视野随推送一起更新：选中描边要按"当前米/像素"换算成像素宽（见 render 里的说明）
+   * 宿主 `syncAll()` 每次相机停下都会重推一遍，所以集合没变就**直接返回**、不再重建 ——
+   * 否则每次平移/缩放后都要把上千个要素的贴地图元全量重建一遍，是"缩放/平移卡顿"的
+   * 主要来源之一。
    */
-  setSelectionIds(ids: Set<string> | null, view?: CameraView | null): void {
-    if (view !== undefined) this.view = view
+  setSelectionIds(ids: Set<string> | null): void {
     if (sameSelection(this.selectionIds, ids)) return
     this.selectionIds = ids
     this.requestRender()
-  }
-
-  /** 视野中心处的米/像素（Web Mercator）——选中描边按像素宽换算时用 */
-  private metersPerPixel(): number {
-    const v = this.view
-    if (!v) return 1
-    const cLat = (v.south + v.north) / 2
-    return (EQUATOR_MPP * Math.cos((cLat * Math.PI) / 180)) / Math.pow(2, v.zoom)
   }
 
   /**
@@ -383,18 +365,13 @@ export class CesiumGeoJsonLayer {
       const selected = this.selectionIds?.has(featureSelectionId(feature.properties, fi))
       const strokeCss = selected ? SELECTED_STROKE_COLOR : st.strokeColor
       /**
-       * 选中态描边必须有**最小像素宽**。
+       * 选中态**只把颜色换成红色，宽度用要素原本的描边宽**（不放大、也不做像素下限）。
        *
-       * `GroundPolylineGeometry.width` 的单位是**米**（几何在 worker 里构建，拿不到相机，
-       * 所以只能是物理单位），而 2D 的 `weight:3` 是像素。直接把 `strokeWidth` 当米用，
-       * 在常用 zoom 下（1px ≈ 数米）边框会细到看不见 —— 选中就"点了没反应"。
-       * 这里对选中态按当前米/像素换算，保证至少 `SELECTED_STROKE_MIN_PX` 像素宽。
-       * 未选中态维持原样（既有的"米"口径），避免牵动所有图层的观感。
+       * 试过两种"加粗"口径都被用户否掉了：早先 `strokeWidth + 2`（米），以及后来按
+       * 米/像素换算保证至少 3px —— 在常用 zoom 下都比原边框明显粗，观感像给图形描了
+       * 一圈粗红边。保持原宽度只变色，才与图形本身的边框一致。
        */
-      const strokeW = selected
-        ? Math.max(st.strokeWidth + SELECTED_STROKE_EXTRA,
-          SELECTED_STROKE_MIN_PX * this.metersPerPixel())
-        : st.strokeWidth
+      const strokeW = st.strokeWidth
       const drawStroke = selected || !st.noStroke
 
       // 拾取用标识：批量图元把它挂在 GeometryInstance.id / 图元 .id 上。
