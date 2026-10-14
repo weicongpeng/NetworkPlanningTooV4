@@ -25,6 +25,8 @@ import {
 
 /** 单个标签源的候选上限：给最坏情况下的布局代价封顶 */
 const MAX_CANDIDATES_PER_SOURCE = 1500
+/** 地形高度缓存上限（键 = 量化到 4 位小数的经纬度） */
+const HEIGHT_CACHE_MAX = 20000
 
 export class CesiumLabelOverlay {
   private canvas: HTMLCanvasElement | null
@@ -34,6 +36,8 @@ export class CesiumLabelOverlay {
 
   private measureCtx: CanvasRenderingContext2D | null = null
   private textWidthCache = new Map<string, number>()
+  /** 地形高度缓存：绘制路径每帧 × 每标签都要用，不能每次都去查瓦片 */
+  private heightCache = new Map<string, number>()
 
   private layoutQueued = false
   private drawQueued = false
@@ -99,6 +103,19 @@ export class CesiumLabelOverlay {
     })
   }
 
+  /**
+   * 立即重绘（不排 rAF）。
+   *
+   * 供 `scene.postRender` 调用：Cesium 的渲染循环是 rAF，我们自己再排一个 rAF 时，
+   * 回调可能落在 Cesium 那一帧**之前**，于是用的是上一帧的相机状态 —— 表现为
+   * "缩放/平移时标签比地图慢半拍"。在 postRender 里同步画，拿到的就是本帧最终相机，
+   * 零延迟。
+   */
+  drawNow(): void {
+    this.drawQueued = false
+    this.draw()
+  }
+
   destroy(): void {
     this.sources.clear()
     this.placements = []
@@ -112,14 +129,31 @@ export class CesiumLabelOverlay {
    * WGS84 → 屏幕像素；在相机背面/被地球遮挡时返回 null。
    * 高度取地形高：图形是贴地（clampToGround）渲染的，标签若按椭球面高度投影会在
    * 斜视/高海拔处与图形明显错位。
+   *
+   * 地形高按「经纬度（4 位小数 ≈ 10 米）」缓存：`Globe.getHeight` 是一次瓦片查询，
+   * 而绘制路径是**每帧 × 每个标签**，几百个标签就是每帧几百次查询。高度在同一位置
+   * 不会变，缓存后绘制路径只剩矩阵运算。
    */
   private project(lat: number, lng: number): { x: number; y: number } | null {
     const scene = this.viewer?.scene
     if (!scene) return null
     try {
-      const carto = this.C.Cartographic.fromDegrees(lng, lat)
-      const h = typeof scene.globe?.getHeight === 'function' ? scene.globe.getHeight(carto) : 0
-      const cartesian = this.C.Cartesian3.fromRadians(carto.longitude, carto.latitude, h ?? 0)
+      const qLat = Math.round(lat * 1e4) / 1e4
+      const qLng = Math.round(lng * 1e4) / 1e4
+      const hKey = `${qLat},${qLng}`
+      let height = this.heightCache.get(hKey)
+      if (height === undefined) {
+        const carto = this.C.Cartographic.fromDegrees(qLng, qLat)
+        const raw = typeof scene.globe?.getHeight === 'function'
+          ? scene.globe.getHeight(carto)
+          : 0
+        height = typeof raw === 'number' && Number.isFinite(raw) ? raw : 0
+        if (this.heightCache.size >= HEIGHT_CACHE_MAX) this.heightCache.clear()
+        this.heightCache.set(hKey, height)
+      }
+      // 弧度换算用普通 Math（不依赖 C.Math，测试替身更简单）
+      const cartesian = this.C.Cartesian3.fromRadians(
+        qLng * Math.PI / 180, qLat * Math.PI / 180, height)
       const p = this.C.SceneTransforms.worldToWindowCoordinates(scene, cartesian)
       return p ? { x: p.x, y: p.y } : null
     } catch {

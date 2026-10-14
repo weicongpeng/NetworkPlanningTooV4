@@ -155,6 +155,26 @@ describe('CesiumGeoJsonLayer 要素配色（_style 还原）', () => {
     expect(strokeWidthOf(primitives)).toBe(5)
   })
 
+  /**
+   * 回归：`defaultStyle` 不得参与渲染配色。
+   *
+   * 后端 `_get_layer_default_style` 在命名规则未命中时用 `_palette_color(图层名)` 返回
+   * **按图层名固定的一种颜色**。它一旦进入渲染优先级链，就会无条件盖掉逐要素的 `_style`，
+   * 表现为「整层被刷成同一种颜色」——例如按 RSRP 分级、多段配色的线全部变绿。
+   * 2D `MapInfoLayer` 从不把 defaultStyle 放进渲染链，这里锁死同一口径。
+   */
+  it('逐要素 _style 不会被图层 defaultStyle 覆盖（多段配色必须还原）', () => {
+    layer.applyConfig({
+      base: { fillColor: '#10b981', fillOpacity: 0.35, borderColor: '#10b981' },
+    } as any)
+    layer.setFeatureCollection({
+      features: [polygonFeature({ fillColor: '#ffd600', strokeColor: '#d50000' })],
+    } as any)
+
+    expect(fillColorOf(primitives).css).toBe('#ffd600')
+    expect(strokeColorOf(primitives).css).toBe('#d50000')
+  })
+
   it('图层级用户设置优先于文件自带 _style（保存后要生效）', () => {
     layer.applyConfig({ color: {
       fillColor: '#123456', fillOpacity: 0.9, borderColor: '#654321', borderWidth: 1,

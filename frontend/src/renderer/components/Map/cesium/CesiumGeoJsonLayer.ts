@@ -35,14 +35,6 @@ interface FeatureCollection {
   features: GeoFeature[]
 }
 
-export interface LayerBaseStyle {
-  fillColor?: string
-  fillOpacity?: number
-  borderColor?: string
-  borderWidth?: number
-  pointSize?: number
-}
-
 /**
  * 要素自带样式：后端从 TAB/MIF/KML 逐要素读出后注入到 `properties._style`（扁平结构）。
  * 字段口径见 `backend/app/services/mapinfo_service.py`（`properties['_style'] = style_info`）。
@@ -89,7 +81,6 @@ export class CesiumGeoJsonLayer {
   private fc: FeatureCollection = { features: [] }
   private visible = true
   private color: LayerColorSettings | null = null
-  private base: LayerBaseStyle = {}
   private labelEnabled = false
   private label: LabelSettings | null = null
   private thematic: ThematicSettings | null = null
@@ -169,9 +160,6 @@ export class CesiumGeoJsonLayer {
   setColorSettings(color: LayerColorSettings | null): void {
     this.color = color
     this.requestRender()
-  }
-  setBaseStyle(base: LayerBaseStyle): void {
-    this.base = base
   }
   setLabel(enabled: boolean, label: LabelSettings | null): void {
     this.labelEnabled = enabled
@@ -253,12 +241,10 @@ export class CesiumGeoJsonLayer {
   applyConfig(cfg: {
     visible?: boolean
     color?: LayerColorSettings | null
-    base?: LayerBaseStyle
     thematic?: ThematicSettings | null
     labelEnabled?: boolean
     label?: LabelSettings | null
   }): void {
-    if (cfg.base) this.base = cfg.base
     if (cfg.visible !== undefined) this.visible = cfg.visible
     if (cfg.color !== undefined) this.color = cfg.color
     if (cfg.thematic !== undefined) this.thematic = cfg.thematic
@@ -270,19 +256,25 @@ export class CesiumGeoJsonLayer {
   /**
    * 单要素最终配色。
    *
-   * 合并优先级与 2D `MapInfoLayer` 完全一致：
-   * **默认样式 < 文件自带 `_style` < 图层级用户设置(colorSettings) < 专题**。
-   * 早先只认用户设置与默认值，文件自带的配色（MapInfo 符号色 / KML 样式）全部丢失，
-   * 于是 3D 里"图层文件"显示成了默认色而不是原有配色。
+   * 合并优先级与 2D `MapInfoLayer` **完全一致**：
+   * **渲染默认值 < 要素自带 `_style` < 图层级用户设置(colorSettings) < 专题**。
+   *
+   * 关键：**`defaultStyle`（字段 `base`）不参与渲染配色**。
+   * 后端 `MapInfoParser._get_layer_default_style` 在命名规则未命中时会用
+   * `_palette_color(图层名)` 返回**按图层名固定的一种颜色**（`mapinfo_service.py:1419-1428`）。
+   * 早先这里写的是 `user ?? base ?? _style ?? def`，那一层 `base` 会无条件盖掉
+   * 逐要素的 `_style`（MapInfo 各要素 Brush/Pen 色、KML <Style>、RSRP 分级色…），
+   * 表现就是「整层被刷成同一种颜色」——例如按 RSRP 分级着色的多段配色全变绿。
+   * 2D 从来不把 `defaultStyle` 放进渲染链（它只在图层控制里作为颜色设置弹窗的初始值出现），
+   * 这里保持同口径即可让 3D 与 2D 一致。
    */
   private resolveFeatureStyle(feature: GeoFeature, kind: GeomKind): ResolvedFeatureStyle {
     const fs = (((feature.properties ?? {}) as Record<string, unknown>)._style ?? {}) as FeatureStyle
     const user = this.color
-    const base = this.base
     const def = DEFAULT_BY_KIND[kind]
 
     // 用户设置的"图形颜色"（面/点填充、线的颜色来源）
-    const userFill = user?.fillColor ?? base.fillColor
+    const userFill = user?.fillColor
 
     let fillColor: string
     let strokeColor: string
@@ -293,18 +285,18 @@ export class CesiumGeoJsonLayer {
       const userLineColor = user?.borderColor && user.borderColor !== NO_FILL_COLOR
         ? user.borderColor
         : userFill
-      fillColor = userLineColor ?? fs.strokeColor ?? base.borderColor ?? def.stroke
+      fillColor = userLineColor ?? fs.strokeColor ?? def.stroke
       strokeColor = fillColor
-      strokeOpacity = user?.fillOpacity ?? fs.strokeOpacity ?? fs.fillOpacity ?? base.fillOpacity ?? def.fillOpacity
+      strokeOpacity = user?.fillOpacity ?? fs.strokeOpacity ?? fs.fillOpacity ?? def.fillOpacity
     } else {
       fillColor = userFill ?? fs.fillColor ?? fs.markerColor ?? def.fill
-      strokeColor = user?.borderColor ?? fs.strokeColor ?? base.borderColor ?? def.stroke
-      strokeOpacity = user?.fillOpacity ?? fs.strokeOpacity ?? base.fillOpacity ?? def.fillOpacity
+      strokeColor = user?.borderColor ?? fs.strokeColor ?? def.stroke
+      strokeOpacity = user?.fillOpacity ?? fs.strokeOpacity ?? def.fillOpacity
     }
 
-    let fillOpacity = user?.fillOpacity ?? fs.fillOpacity ?? base.fillOpacity ?? def.fillOpacity
-    let strokeWidth = user?.borderWidth ?? fs.strokeWidth ?? base.borderWidth ?? def.width
-    let pointSize = user?.pointSize ?? fs.markerSize ?? base.pointSize ?? def.pointSize
+    let fillOpacity = user?.fillOpacity ?? fs.fillOpacity ?? def.fillOpacity
+    let strokeWidth = user?.borderWidth ?? fs.strokeWidth ?? def.width
+    let pointSize = user?.pointSize ?? fs.markerSize ?? def.pointSize
 
     // 专题：填充色/透明度/边框色/图形大小覆盖（与 2D 的专题优先级一致）
     if (this.thematic?.enabled) {
@@ -474,23 +466,28 @@ export class CesiumGeoJsonLayer {
     if (!collection) return
     try {
       /**
-       * `asynchronous: true` —— 把贴地图元的三角化/构造丢给 Web Worker。
-       * `false` 时整个图层的几何构建都在主线程同步跑完，上万要素能把界面冻住 1~3 秒
-       * （这正是"加载图层卡顿"的主因）。本层的重建都是低频事件（取数完成 / 配置变更 /
-       * 选中态变化，且已被 rAF 合并），不存在"相机每帧重建"的闪烁风险，可以放心用异步。
+       * `asynchronous` 必须为 `false`（同步构建）。
+       *
+       * 曾经改成 `true`（把三角化丢给 Web Worker）想省主线程，结果引入**渲染崩溃**：
+       * 缩放/平移会连续触发重建，而重建是 `primitives.remove()` + 重新 `add()`。
+       * 异步图元在 worker 还在跑时被移除，Cesium 内部拿着已销毁的纹理/批处理继续走
+       * 渲染管线，抛 `TypeError: Cannot read properties of undefined (reading '_target')`，
+       * `Scene` 直接停掉渲染循环 → 整个 3D 页面冻结。
+       * 这里的重建虽有 rAF 合并，但缩放是持续事件，一秒内仍有数次 remove/add，
+       * 竞态窗口足够大。同步构建没有这个窗口，代价只是重建时多占几十毫秒主线程。
        */
       if (polygons.length > 0) {
         this.primitives.push(collection.add(new C.GroundPrimitive({
           geometryInstances: polygons,
           appearance: new C.PerInstanceColorAppearance({ flat: true, translucent: true }),
-          asynchronous: true,
+          asynchronous: false,
         })))
       }
       if (polylines.length > 0) {
         this.primitives.push(collection.add(new C.GroundPolylinePrimitive({
           geometryInstances: polylines,
           appearance: new C.PolylineColorAppearance(),
-          asynchronous: true,
+          asynchronous: false,
         })))
       }
       if (points.length > 0) {

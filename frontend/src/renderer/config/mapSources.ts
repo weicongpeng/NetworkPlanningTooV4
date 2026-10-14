@@ -74,8 +74,15 @@ export type TiandituLayer = 'vec' | 'cva' | 'img' | 'cia' | 'ter' | 'cta' | 'eva
 /** 天地图 WMTS 子域（t0~t7） */
 export const TIANDITU_SUBDOMAINS = ['0', '1', '2', '3', '4', '5', '6', '7']
 
-/** 天地图 WMTS 原生最大级别 */
-export const TIANDITU_MAX_ZOOM = 18
+/**
+ * 天地图 WMTS 声明的最大级别。
+ *
+ * 设成 20（而不是官方文档写的 18）是为了与高德拉齐：高德的栅格瓦片实际可下到 z20，
+ * 本项目把最大缩放统一到 20 后，两边"放到最大"的观感一致。
+ * 超过服务端真实级别的瓦片请求会返回错误/空图，此时Leaflet/Cesium 会继续用更低级别的
+ * 瓦片放大显示（不会出现空白），属于可接受的降级。
+ */
+export const TIANDITU_MAX_ZOOM = 20
 
 /**
  * 天地图 WMTS 瓦片 URL 模板（球面墨卡托 `_w`）。

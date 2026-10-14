@@ -98,6 +98,12 @@ const LAYER_IDS: Record<LayerKey, string> = { lte: 'lte-sectors', nr: 'nr-sector
 const GEO_FETCH_CONCURRENCY = 4
 
 /**
+ * 渲染崩溃自恢复的次数上限。
+ * 正常情况下一次都不该触发；若真是"每帧必崩"的确定性错误，无限重拉只会无限刷屏。
+ */
+const MAX_RENDER_RECOVERIES = 3
+
+/**
  * 等浏览器真正画出一帧（双 rAF：第一帧提交 React 的 DOM 变更，第二帧确保已合成上屏）。
  * 用于在开始同步重活前先把"渲染中"的动画标记显示出来。
  */
@@ -480,9 +486,11 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
       // 用户勾选真值决定要不要取数据；热力替换模式下原图形隐藏但数据仍要取
       // ——热力面就是用这批数据算出来的。
       const { userVisible, visible } = resolveLayerVisibility(f.id)
+      // 刻意不传 defaultStyle：后端在命名规则未命中时会按图层名给一个固定颜色
+      // （`_palette_color`），若把它当作渲染底色会盖掉逐要素的 `_style`（MapInfo 要素色 /
+      // KML Style / RSRP 分级色），整层会被刷成同一种颜色。2D `MapInfoLayer` 同样不用它。
       layer.applyConfig({
         visible,
-        base: f.defaultStyle ?? {},
         color: ms.colorSettingsMap?.[f.id] ?? null,
         thematic: ms.thematicSettingsMap?.[f.id] ?? null,
         labelEnabled: !!labelVis,
@@ -1041,6 +1049,12 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
         // 相机移动：防抖重建扇区（视口剔除）+ 回写 mapStateService + 更新指南针
         let moveTimer: ReturnType<typeof setTimeout> | null = null
         let headingTimer: ReturnType<typeof setTimeout> | null = null
+        /**
+         * 覆盖层（圈选框 + 标签）是否需要重绘。
+         * camera.changed 里只置脏标记，真正绘制放在 `scene.postRender` ——
+         * 否则自己排 rAF 可能跑在 Cesium 那帧之前，用的是上一帧相机，标签就慢半拍。
+         */
+        let overlayDirty = false
         viewer.camera.changed.addEventListener(() => {
           const carto = viewer.camera.positionCartographic
           const lat = C.Math.toDegrees(carto.latitude)
@@ -1059,10 +1073,9 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
           }
           // 平移/缩放后属性框跟随的锚点已失效 → 收起（与高德侧"移动地图即关闭属性框"一致）
           if (!moveTimer) closeInfoPanels()
-          // 覆盖层（圈选框 / 点选高亮）锚定在地理要素上，相机一动屏幕位置就变了
-          selectionRef.current?.refreshOverlay()
-          // 标签：移动中只按旧偏移重绘（不重排），停下才重新布局 —— 与 2D 的 move/moveend 同策略
-          labelOverlayRef.current?.requestDraw()
+          // 覆盖层（圈选框 / 标签）锚定在地理要素上，相机一动屏幕位置就变了。
+          // 只置脏，实际绘制交给 postRender（拿本帧最终相机，零延迟）。
+          overlayDirty = true
           if (moveTimer) clearTimeout(moveTimer)
           moveTimer = setTimeout(() => {
             moveTimer = null
@@ -1076,11 +1089,46 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
             syncLabels()
           }, 350)
         })
+        /**
+         * Cesium 每帧渲染完成后重绘覆盖层。
+         * 放在这里而不是 camera.changed 里：postRender 时 `frameState`/相机已是本帧最终值，
+         * 标签与底图严格同帧，缩放/平移时不再有"标签慢半拍"的观感。
+         */
+        viewer.scene.postRender.addEventListener(() => {
+          if (!overlayDirty) return
+          overlayDirty = false
+          selectionRef.current?.refreshOverlay()
+          labelOverlayRef.current?.drawNow()
+        })
         // 相机变化 10% 就触发重建 → 交互中重建过密；放宽到 25%，只在明显移动后重建
         viewer.camera.percentageChanged = 0.25
         // 半透明几何（扇区填充、图层文件面）默认**不可拾取** —— 点击取不到要素，
         // 表现为"点要素没反应/不弹属性框"。开启后 Scene.pick 会一并拾取半透明几何。
         viewer.scene.pickTranslucentDepth = true
+
+        /**
+         * 渲染崩溃自恢复。
+         *
+         * Cesium 的渲染循环里任何未捕获异常都会走 `catch { _useDefaultRenderLoop = false;
+         * _renderLoopRunning = false }` —— 循环**永久停止**，页面就冻住了，只能刷新。
+         * `useDefaultRenderLoop` 的 setter 在 `_renderLoopRunning === false` 时会重启循环，
+         * 所以这里接到 `scene.renderError` 后重新置 true 把它拉起来。
+         *
+         * 设次数上限：若是"每帧必崩"的确定性错误，无限重拉会变成无限刷屏，反而更难定位。
+         * 正常情况下一次都不该触发；真触发了说明有别的问题，日志会留下现场。
+         */
+        let renderRecoveries = 0
+        viewer.scene.renderError.addEventListener((_scene: unknown, error: unknown) => {
+          console.error('[CesiumMap] 渲染出错（已尝试恢复渲染循环）:', error)
+          if (renderRecoveries >= MAX_RENDER_RECOVERIES) return
+          renderRecoveries += 1
+          try {
+            viewer.useDefaultRenderLoop = false
+            viewer.useDefaultRenderLoop = true
+          } catch (e) {
+            console.error('[CesiumMap] 恢复渲染循环失败:', e)
+          }
+        })
 
         // 图层编辑会话：viewer 就绪即创建（无工作集时零渲染）
         editSessionRef.current = new CesiumEditSession(C, viewer)

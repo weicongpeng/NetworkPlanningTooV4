@@ -35,15 +35,18 @@ beforeAll(() => {
 /**
  * 最小 Cesium 替身：投影退化成"以 (114.7, 23.75) 为画布中心的局部切平面"。
  * 1e-4 度 ≈ 1 像素，便于构造"屏幕上贴在一起"的候选。
+ * `fromRadians` 收弧度（与真实 Cesium 一致），`worldToWindowCoordinates` 再折回度。
  */
 const ORIGIN = { lng: 114.7, lat: 23.75 }
 const C = {
   Cartographic: { fromDegrees: (lng: number, lat: number) => ({ longitude: lng, latitude: lat, height: 0 }) },
-  Cartesian3: { fromRadians: (lon: number, lat: number, h: number) => ({ lon, lat, h }) },
+  Cartesian3: {
+    fromRadians: (lonRad: number, latRad: number, h: number) => ({ lonRad, latRad, h }),
+  },
   SceneTransforms: {
-    worldToWindowCoordinates: (_scene: unknown, cart: { lon: number; lat: number }) => ({
-      x: 400 + (cart.lon - ORIGIN.lng) * 10000,
-      y: 300 - (cart.lat - ORIGIN.lat) * 10000,
+    worldToWindowCoordinates: (_scene: unknown, cart: { lonRad: number; latRad: number }) => ({
+      x: 400 + (cart.lonRad * 180 / Math.PI - ORIGIN.lng) * 10000,
+      y: 300 - (cart.latRad * 180 / Math.PI - ORIGIN.lat) * 10000,
     }),
   },
 }

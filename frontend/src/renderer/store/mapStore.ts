@@ -157,7 +157,8 @@ const DEFAULT_MAP_SETTINGS: UserMapSettings = {
   sectorLabelVisibility: { 'lte-sectors': false, 'nr-sectors': false },
   pointFileLabelVisibility: {},
   layerFileLabelVisibility: {},
-  mapSource: 'amap-vector',
+  // 默认底图取天地图矢量：与高德矢量观感接近，且无需高德 Key 即可出图
+  mapSource: 'tdt-vector',
   amapApiKey: '',
   tiandituApiKey: DEFAULT_TIANDITU_KEY,
   tiandituAnnotations: { vector: true, image: true, terrain: true },
