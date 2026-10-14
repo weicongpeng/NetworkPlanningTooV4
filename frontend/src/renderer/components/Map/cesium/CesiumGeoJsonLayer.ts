@@ -352,6 +352,16 @@ export class CesiumGeoJsonLayer {
     // 集合事件 + 逐实体图元），是 3D 加载自有图层后卡顿的主因。
     const polygons: any[] = []
     const polylines: any[] = []
+    /**
+     * 选中要素的边框走**单独一批图元，且在 render 末尾最后 add**。
+     *
+     * 贴地边框是"深度不写、开启混合"的渲染状态（`GroundPolylinePrimitive` 的
+     * `depthMask:false` + PRE_MULTIPLIED_ALPHA_BLEND），同一位置**后画的覆盖先画的**。
+     * 多个多边形共用/重叠的边如果挤在同一批里，选中那条红边会被邻近图形的边框压掉 ——
+     * 表现为"重叠处的边框没有被红色高亮"。单独成批并最后添加，等价于 2D 的
+     * `layer.bringToFront()`（2D 选中时就是把该要素提到最上层）。
+     */
+    const selectedPolylines: any[] = []
     const points: Array<{ opts: any; id: any }> = []
 
     for (let fi = 0; fi < this.fc.features.length; fi++) {
@@ -467,16 +477,20 @@ export class CesiumGeoJsonLayer {
               },
               id: pickId,
             }))
-            // 贴地面不支持 outline，边框另画贴地线
+            // 贴地面不支持 outline，边框另画贴地线。
+            // 选中要素的边框走单独一批（render 末尾最后 add）—— 与相邻图形重叠的边
+            // 也要是红的，见 selectedPolylines 的说明
             if (drawStroke) {
-              polylines.push(new C.GeometryInstance({
+              const outline = new C.GeometryInstance({
                 geometry: new C.GroundPolylineGeometry({ positions, width: strokeW }),
                 attributes: {
                   color: C.ColorGeometryInstanceAttribute.fromColor(
                     C.Color.fromCssColorString(strokeCss)),
                 },
                 id: pickId,
-              }))
+              })
+              if (selected) selectedPolylines.push(outline)
+              else polylines.push(outline)
             }
           }
           break
@@ -517,6 +531,14 @@ export class CesiumGeoJsonLayer {
       if (polylines.length > 0) {
         this.primitives.push(collection.add(new C.GroundPolylinePrimitive({
           geometryInstances: polylines,
+          appearance: new C.PolylineColorAppearance(),
+          asynchronous: false,
+        })))
+      }
+      // 选中边框必须**最后** add：同一 pass 内后画的覆盖先画的（见 selectedPolylines 说明）
+      if (selectedPolylines.length > 0) {
+        this.primitives.push(collection.add(new C.GroundPolylinePrimitive({
+          geometryInstances: selectedPolylines,
           appearance: new C.PolylineColorAppearance(),
           asynchronous: false,
         })))
