@@ -50,8 +50,9 @@ function sectorRing(
     return pts
   }
 
-  const beamwidth = sector.beamwidth || cover.angle
-  const half = beamwidth / 2
+  // 固定 45° 波束（不再取要素自带 beamwidth）：几何与数据无关 → 缓存命中率更高，
+  // 且缩放/平移时几何完全不变
+  const half = BASE_SECTOR_BEAMWIDTH_DEG / 2
   const startAz = sector.azimuth - half
   const endAz = sector.azimuth + half
 
@@ -71,19 +72,16 @@ export interface CameraView {
   west: number
   east: number
   zoom: number
-  /**
-   * 某点处的米/像素（3D 透视：按该点到相机的距离换算）。
-   * 不提供时回退到 Web Mercator 的 zoom 公式（与高德侧一致）。
-   */
-  metersPerPixelAt?: (lat: number, lng: number) => number
 }
 
-// ===== 扇区视觉尺寸：与 SectorRendererSVG 保持一致 =====
-/** 室外扇区在屏幕上的目标半径（像素）；室内取一半 */
-const TARGET_PIXEL_RADIUS_OUTDOOR = 16
-/** 物理半径上下限（米），避免极端缩放下的过小/过大 */
-const MIN_SECTOR_RADIUS_M = 5
-const MAX_SECTOR_RADIUS_M = 5000
+// ===== 扇区视觉尺寸：固定物理半径（与「地理化数据」扇区同一套做法） =====
+/**
+ * 室外扇区半径（米）。按用户要求固定为 55 米 —— 不随缩放变化。
+ * 见 `sectorRadius` 里"为什么不再是恒定屏幕像素"的说明。
+ */
+export const BASE_SECTOR_RADIUS_M = 55
+/** 扇区水平波束角（度）。按用户要求固定为 45°（不再取要素自带的 beamwidth）。 */
+export const BASE_SECTOR_BEAMWIDTH_DEG = 45
 /** 邻区高亮的源/目标扇区放大倍数（覆盖初始扇区的黑边框） */
 const NEIGHBOR_HIGHLIGHT_SCALE = 1.15
 /** 低于此 zoom 不画扇区边框（对齐 SectorRendererSVG 的 LOD showStroke） */
@@ -93,6 +91,19 @@ const STROKE_MIN_ZOOM = 12
  * 目的是给重建代价封顶：否则大网规模下每次相机停下都要建上万条几何，缩放/平移必然卡。
  */
 export const MAX_RENDER_SECTORS = 4000
+
+/**
+ * 两个选中集合是否等价（都为空 / 成员完全一致）。
+ * 供各图层的 `setSelectionIds` 判断"这次推送要不要触发重建"——
+ * 宿主每次相机停下都会重推一遍选中集合，不做这个判断就等于每次都全量重建。
+ */
+export function sameSelection(a: Set<string> | null, b: Set<string> | null): boolean {
+  if (a === b) return true
+  if (!a || !b) return false
+  if (a.size !== b.size) return false
+  for (const id of a) if (!b.has(id)) return false
+  return true
+}
 
 /**
  * 以视野中心为圆心、由近及远取前 `limit` 个（近似：按到中心的平方距离排序）。
@@ -112,60 +123,24 @@ export function sampleCenteredOn(
     .map((e) => e.x)
 }
 
-/** Web Mercator zoom 0 赤道每像素米数 */
-const EQUATOR_MPP = 156543.03392
 /**
- * 米/像素的量化档位数（每档 2^1/8 ≈ 9%）。
+ * 扇区物理半径（米）：**固定值**，与相机无关。
  *
- * 透视下"某点的米/像素"随相机位置连续变化，扇区半径 = 目标像素 × 米/像素，
- * 于是**任何**相机移动（哪怕只是平移或旋转）都会让半径变一点 → 几何全变 → 整个重建。
- * 把米/像素量化到 9% 档位后：
- * - 档内半径完全一致 → 平移/旋转/微缩放**不触发重建**（这是卡顿的大头）
- * - 视觉上扇区尺寸偏差 ≤9%（16px 半径约 1.4px），肉眼不可辨
- * - 之前的分档是 2.2%（1/32），档位太密：一段缩放要重建几十次（每次都要
- *   `primitives.remove()` + `add()` 上千个扇区），既卡又更容易踩 Cesium 的渲染状态问题
+ * 早先是"恒定屏幕像素半径 16px × 该点米/像素"，即扇区尺寸随缩放变化。那套口径在 3D 里
+ * 代价极大：半径依赖相机 → 每次缩放/平移都要重算几何、重建上千个贴地图元
+ * （`primitives.remove()` + `add()`），是"缩放/平移卡顿"的主因，也更容易踩 Cesium
+ * 的渲染状态问题。
+ *
+ * 改成与「地理化数据」扇区同一套做法（固定物理半径，几何与相机无关）后：
+ * - 缩放**完全不重建**（除非跨过 LOD 阈值），几何缓存可跨缩放级别复用
+ * - 扇区在地图上有真实尺度感（放大看得到覆盖范围），与地理化数据一致
+ *
+ * 室内/全向（`cover.isCircular`）仍取一半，保持原有形态区分。
+ * 导出供单测锁定。
  */
-const MPP_BUCKETS_PER_ZOOM = 8
-
-/** 量化档位索引（zoom 的 1/8 分档，避免 0 附近震荡） */
-function mppBucketIndex(mpp: number): number {
-  if (!Number.isFinite(mpp) || mpp <= 0) return 0
-  return Math.max(0, Math.round(Math.log2(EQUATOR_MPP / mpp) * MPP_BUCKETS_PER_ZOOM))
-}
-
-/** 档位索引 → 该档的米/像素 */
-function mppOfBucket(idx: number): number {
-  return EQUATOR_MPP / Math.pow(2, idx / MPP_BUCKETS_PER_ZOOM)
-}
-
-/**
- * 某点的米/像素（已量化到 2.2% 档位）。
- * 优先用相机透视换算后量化；无透视信息时回退 Web Mercator zoom 公式（本身就是整数档）。
- */
-export function metersPerPixelQuantized(mppAt: () => number): number {
-  return mppOfBucket(mppBucketIndex(mppAt()))
-}
-
-function metersPerPixel(view: CameraView, lat: number, lng: number): number {
-  if (view.metersPerPixelAt) return metersPerPixelQuantized(() => view.metersPerPixelAt!(lat, lng))
-  return mppOfBucket(mppBucketIndex(
-    (EQUATOR_MPP * Math.cos((lat * Math.PI) / 180)) / Math.pow(2, view.zoom)))
-}
-
-/**
- * 扇区物理半径（米）：恒定屏幕像素半径 × 该点米/像素，钳制后室内取一半。
- * 导出供单测锁定与 SectorRendererSVG（高德侧）的一致性。
- */
-export function sectorRadius(
-  sector: RenderSectorData, view: CameraView, magnify: boolean,
-): number {
+export function sectorRadius(sector: RenderSectorData, magnify: boolean): number {
   const cover = getCellCoverStyle(sector.cell_cover_type, sector.networkType)
-  const mpp = metersPerPixel(view, sector.originalLat, sector.originalLng)
-  const outdoor = Math.max(
-    MIN_SECTOR_RADIUS_M,
-    Math.min(MAX_SECTOR_RADIUS_M, TARGET_PIXEL_RADIUS_OUTDOOR * mpp),
-  )
-  const base = cover.isCircular ? outdoor / 2 : outdoor
+  const base = cover.isCircular ? BASE_SECTOR_RADIUS_M / 2 : BASE_SECTOR_RADIUS_M
   return magnify ? base * NEIGHBOR_HIGHLIGHT_SCALE : base
 }
 
@@ -302,6 +277,9 @@ export class CesiumSectorLayer {
     this.configDirty = true
   }
   setSelectionIds(ids: Set<string> | null): void {
+    // 选中集合没变就别标脏：`syncAll()` 每次相机停下都会推一遍，
+    // 无条件标脏 = 每次平移/缩放后把上千个扇区的贴地图元全量重建一遍（卡顿主因之一）
+    if (sameSelection(this.selectionIds, ids)) return
     this.selectionIds = ids
     this.configDirty = true
   }
@@ -384,19 +362,24 @@ export class CesiumSectorLayer {
    * 标签仍用 Entity（数量少、且 Cesium 标签本就无批量接口）。
    */
   /**
-   * 视野量化键：把视野平移量按跨度的 1/20 分档，并把米/像素档位一并纳入。
-   * 小幅平移 / 旋转 / 微缩放都不触发重建（视口剔除本来就有 15% 外扩余量，边缘不会缺图形）。
+   * 视野量化键：**只由"真正会改变几何/取舍的派生值"构成**。
+   *
+   * 早先键里含 zoom 与米/像素档位，而扇区半径是"像素 × 米/像素"—— 于是每跨一个
+   * 缩放档就要把上千个扇区的几何全部重算重建，这是缩放卡顿的根源。
+   * 现在半径固定，zoom 只通过下面这几个派生值影响画面（LOD 采样步长、是否画边框、
+   * 弧/圆采样点数），因此把它们直接放进键里：zoom 在这些阈值之间变化**不重建**。
+   * 平移仍按跨度 1/20 分档（视口剔除有 15% 外扩余量，边缘不会缺图形）。
    */
   private viewKey(view: CameraView): string {
     const spanLat = Math.max(1e-6, view.north - view.south)
     const spanLng = Math.max(1e-6, view.east - view.west)
     const qx = Math.round(view.west / (spanLng / 20))
     const qy = Math.round(view.south / (spanLat / 20))
-    // 视野中心处的米/像素档位：跨档才意味着"尺寸真的变了"，需要重建
-    const cLat = (view.south + view.north) / 2
-    const cLng = (view.west + view.east) / 2
-    const mppIdx = mppBucketIndex(metersPerPixel(view, cLat, cLng))
-    return `${Math.round(view.zoom)}|${mppIdx}|${qx}|${qy}`
+    const step = view.zoom < 10 ? 4 : view.zoom < 12 ? 2 : 1
+    const showStroke = view.zoom >= STROKE_MIN_ZOOM
+    const pciPlanning = this.renderMode === 'pci-planning'
+    return `${step}|${showStroke ? 1 : 0}|${arcPointsCount(view.zoom, pciPlanning)}`
+      + `|${circlePointsCount(view.zoom, pciPlanning)}|${qx}|${qy}`
   }
 
   update(view: CameraView): void {
@@ -435,7 +418,7 @@ export class CesiumSectorLayer {
       const magnify = !!nh && this.renderMode === 'neighbor-planning' && (
         String(sector.id) === String(nh.sourceSectorId)
         || nh.targetSectorIds.has(String(sector.id)))
-      const radius = sectorRadius(sector, view, magnify)
+      const radius = sectorRadius(sector, magnify)
       const segments = cover.isCircular ? circleSegments : arcSegments
       const ring = sectorRing(sector, radius, segments)
       const style = resolvePlanningStyle(sector, this.renderMode, this.highlight)

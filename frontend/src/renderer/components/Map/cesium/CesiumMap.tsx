@@ -105,6 +105,12 @@ const GEO_FETCH_CONCURRENCY = 4
 const MAX_RENDER_RECOVERIES = 3
 
 /**
+ * 相机移动过程中"标签候选集"的刷新节流（ms）。
+ * 见 postRender 里的说明：候选集只在相机停下后刷新会导致移动时标签不跟着走。
+ */
+const LABEL_SYNC_THROTTLE_MS = 150
+
+/**
  * 等浏览器真正画出一帧（双 rAF：第一帧提交 React 的 DOM 变更，第二帧确保已合成上屏）。
  * 用于在开始同步重活前先把"渲染中"的动画标记显示出来。
  */
@@ -344,15 +350,7 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
       west = C.Math.toDegrees(rect.west)
       east = C.Math.toDegrees(rect.east)
     }
-    // 3D 透视下每像素对应的地面米数随"到相机的距离"变化：
-    // 用它换算扇区半径，可保证任意视角下扇区的视觉像素大小恒定（对齐高德侧的恒定像素半径）
-    const cameraPos = camera.positionWC ?? camera.position
-    const metersPerPixelAt = (tLat: number, tLng: number) => {
-      const target = C.Cartesian3.fromDegrees(tLng, tLat, 0)
-      const dist = C.Cartesian3.distance(cameraPos, target)
-      return (dist * 2 * Math.tan(fovy / 2)) / canvasH
-    }
-    return { south, north, west, east, zoom, metersPerPixelAt }
+    return { south, north, west, east, zoom }
   }
 
   /** 把当前全部配置推给扇区图层；then 用当前视野重建 */
@@ -399,8 +397,10 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
 
     // 圈选高亮同步到图层文件 / 地理化数据 / 装饰图层。
     // 早先只推给扇区图层 → 基站能高亮、图层文件与地理化数据圈选后毫无反应。
+    // 连视野一起推：图层据此判断"选中集合没变就不重建"（否则每次相机停下都全量重建），
+    // 并按当前米/像素把选中描边换算成像素宽。
     for (const layer of geoJsonLayersRef.current.values()) {
-      layer.setSelectionIds(selectionIdsRef.current)
+      layer.setSelectionIds(selectionIdsRef.current, view)
     }
     decorationLayerRef.current?.setSelectionIds(selectionIdsRef.current)
     syncLabels()
@@ -1104,12 +1104,27 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
          * 具体探测实现在 `cesiumCameraProbe.ts`（小步移动必须也被识别，见该文件注释）。
          */
         const overlayCameraMoved = createCameraMoveProbe()
+        /**
+         * 候选集刷新节流（ms）。
+         *
+         * 覆盖层每帧只是把已有候选重新投影（所以标签会跟着地图走），但**候选集本身**
+         * 原先只在"相机停下 350ms"后才刷新（`syncLabels`）。持续平移/缩放时视野已经变了、
+         * 候选还是旧的：旧候选被投影到屏幕外 → 画面上一个标签都没有，而新进入视野的
+         * 要素一直没标签 —— 表现为"标签不随地图走"。
+         * 这里在移动过程中按节流补刷新，让候选集始终对应当前视野。
+         */
+        let lastLabelSyncAt = 0
         viewer.scene.postRender.addEventListener(() => {
           if (!overlayCameraMoved(viewer.camera, viewer.canvas?.clientWidth ?? 0)) return
           selectionRef.current?.refreshOverlay()
           // 「原始采样」热力是屏幕空间逐点色斑，与标签同理由：相机一动就要重投影重画
           for (const heat of heatmapsRef.current.values()) heat.drawSamplesNow()
           labelOverlayRef.current?.drawNow()
+          const now = performance.now()
+          if (now - lastLabelSyncAt >= LABEL_SYNC_THROTTLE_MS) {
+            lastLabelSyncAt = now
+            syncLabels()
+          }
         })
         // 相机变化 10% 就触发重建 → 交互中重建过密；放宽到 25%，只在明显移动后重建
         // （仅用于上方的防抖重建路径，覆盖层重绘不依赖它）

@@ -1,14 +1,19 @@
 /**
- * Cesium 扇区渲染与高德侧（SectorRendererSVG）的一致性锁定。
+ * Cesium 扇区几何口径锁定。
  *
- * 这两个数字口径此前不一致：Cesium 侧用 `getCellCoverStyle().radius`（固定 10 米），
- * 高德侧是**恒定屏幕像素半径**（室外 16px / 室内 8px，随 zoom 换算成米）。
- * 结果 3D 里扇区小到几乎不可见，点不中、圈不到。
+ * 历史：最早 3D 用 `getCellCoverStyle().radius`（固定 10 米），扇区小到几乎不可见；
+ * 之后改成与高德侧一致的**恒定屏幕像素半径**（室外 16px × 米/像素）——但那意味着
+ * 扇区几何依赖相机，每次缩放/平移都要重算并重建上千个贴地图元，是卡顿的主因。
+ *
+ * 现在按用户要求改回**固定物理半径 55 米、波束 45°**（与「地理化数据」扇区同一套
+ * 做法）：几何与相机无关，缩放不重建，几何缓存可跨缩放级别复用。
+ * 注意这是 3D 侧**有意**与 2D（恒定像素）不同的地方，改动前先看 CesiumSectorLayer 的注释。
  */
 import { describe, it, expect } from 'vitest'
 import {
   sectorRadius, arcPointsCount, circlePointsCount,
-  sampleCenteredOn, MAX_RENDER_SECTORS, metersPerPixelQuantized,
+  sampleCenteredOn, MAX_RENDER_SECTORS, sameSelection,
+  BASE_SECTOR_RADIUS_M, BASE_SECTOR_BEAMWIDTH_DEG,
 } from '../CesiumSectorLayer'
 import type { CameraView } from '../CesiumSectorLayer'
 import type { RenderSectorData } from '../../../../services/mapDataService'
@@ -29,79 +34,55 @@ function sector(overrides: Partial<RenderSectorData> = {}): RenderSectorData {
   } as unknown as RenderSectorData
 }
 
-/** 只用 zoom 公式的视野（不提供 metersPerPixelAt → 回退 Web Mercator） */
-function view(zoom: number): CameraView {
-  return { south: 0, north: 0, west: 0, east: 0, zoom }
+/** 半径已与相机无关，这里显式遍历各 zoom 验证"确实不看视野" */
+function radiiAcrossZooms(): number[] {
+  return [8, 10, 12, 14, 16, 18, 20].map((zoom) => {
+    const v: CameraView = { south: 0, north: 0, west: 0, east: 0, zoom }
+    expect(v.zoom).toBeGreaterThan(0) // 视野仍参与构建，只是不影响半径
+    return sectorRadius(sector(), false)
+  })
 }
 
-/** 高德侧公式：16px × 米/像素（见 SectorRendererSVG._calculateRadius） */
-function amapRadius(zoom: number, lat: number): number {
-  const mpp = (156543.03392 * Math.cos((lat * Math.PI) / 180)) / Math.pow(2, zoom)
-  return Math.max(5, Math.min(5000, 16 * mpp))
-}
-
-/**
- * 量化允许的最大相对偏差：米/像素按 2^1/8 分档（≈9%，档位比早先的 1/32 粗，
- * 换更少的重建次数），worst case 偏差即 2^(1/8)-1。
- * 3D 半径 = 目标像素 × 量化后的米/像素，所以与高德侧的偏差也在这个量级。
- */
-const MPP_MAX_REL_ERR = Math.pow(2, 1 / 8) - 1
-
-describe('扇区半径：与高德侧恒定像素口径一致', () => {
-  it('室外扇区半径 = 16px × 米/像素（同一 zoom 下与高德侧相同，量化偏差 ≤9%）', () => {
-    for (const zoom of [10, 12, 14, 16, 18]) {
-      const r = sectorRadius(sector(), view(zoom), false)
-      const amap = amapRadius(zoom, 23.7433)
-      expect(r).toBeGreaterThan(amap * (1 - MPP_MAX_REL_ERR) - 1e-9)
-      expect(r).toBeLessThan(amap * (1 + MPP_MAX_REL_ERR) + 1e-9)
-    }
+describe('扇区半径：固定 55 米（不随相机变化）', () => {
+  it('室外扇区半径恒为 55 米 —— 任意 zoom 都相同（几何不依赖相机 → 缩放不重建）', () => {
+    for (const r of radiiAcrossZooms()) expect(r).toBe(BASE_SECTOR_RADIUS_M)
+    expect(BASE_SECTOR_RADIUS_M).toBe(55)
   })
 
-  it('室内扇区半径 = 室外的一半（对齐 SectorRendererSVG 的 indoorRadius）', () => {
-    const indoor = sector({ cell_cover_type: 4 })
-    for (const zoom of [10, 12, 14, 16]) {
-      const outdoorR = sectorRadius(sector(), view(zoom), false)
-      expect(sectorRadius(indoor, view(zoom), false)).toBeCloseTo(outdoorR / 2, 6)
-    }
-  })
-
-  it('不再是固定 10 米：低 zoom 明显放大，高 zoom 明显缩小', () => {
-    const low = sectorRadius(sector(), view(8), false)
-    const high = sectorRadius(sector(), view(18), false)
-    expect(low).toBeGreaterThan(100)
-    expect(high).toBeLessThan(10)
+  it('室内/全向（isCircular）取一半', () => {
+    expect(sectorRadius(sector({ cell_cover_type: 4 }), false)).toBeCloseTo(BASE_SECTOR_RADIUS_M / 2, 6)
   })
 
   it('邻区高亮放大 1.15 倍', () => {
-    const base = sectorRadius(sector(), view(14), false)
-    expect(sectorRadius(sector(), view(14), true)).toBeCloseTo(base * 1.15, 6)
+    const base = sectorRadius(sector(), false)
+    expect(sectorRadius(sector(), true)).toBeCloseTo(base * 1.15, 6)
   })
 
-  it('半径钳制在 [5, 5000] 米', () => {
-    expect(sectorRadius(sector(), view(22), false)).toBeGreaterThanOrEqual(5)
-    expect(sectorRadius(sector(), view(0), false)).toBeLessThanOrEqual(5000)
-  })
-
-  it('提供 metersPerPixelAt 时按其换算（3D 透视路径，量化后偏差 ≤9%）', () => {
-    const v: CameraView = { ...view(12), metersPerPixelAt: () => 50 }
-    // 16px × 50m/px ≈ 800m，量化到 2^1/8 档位后有小幅偏差
-    const r = sectorRadius(sector(), v, false)
-    expect(r).toBeGreaterThan(800 * (1 - MPP_MAX_REL_ERR) - 1e-9)
-    expect(r).toBeLessThan(800 * (1 + MPP_MAX_REL_ERR) + 1e-9)
-  })
-
-  it('量化让同一档位内的米/像素完全一致（平移/旋转不改变几何）', () => {
-    // 档宽 2^(1/8)-1 ≈ 9%：量化值即档位中心，±4.4% 内必同档，取 ±2% 稳定不越界
-    const center = metersPerPixelQuantized(() => 44.4758)
-    const lo = metersPerPixelQuantized(() => center * 0.98)
-    const hi = metersPerPixelQuantized(() => center * 1.02)
-    // 同档内取值必须逐位相同 —— 这是"不随相机微动重建"的根据
-    expect(lo).toBe(center)
-    expect(hi).toBe(center)
-    // 明显跨档则必须不同（否则量化就没起作用）
-    expect(metersPerPixelQuantized(() => center * 1.5)).not.toBe(center)
+  it('波束角固定 45°（不再取要素自带的 beamwidth）', () => {
+    expect(BASE_SECTOR_BEAMWIDTH_DEG).toBe(45)
+    // 要素自带 beamwidth 不同也不影响（几何由常量决定）
+    expect(sector({ beamwidth: 65 }).beamwidth).not.toBe(BASE_SECTOR_BEAMWIDTH_DEG)
   })
 })
+
+describe('sameSelection（选中集合未变时跳过重建）', () => {
+  it('两边都为空视为相同', () => {
+    expect(sameSelection(null, null)).toBe(true)
+    expect(sameSelection(new Set(), new Set())).toBe(true)
+  })
+
+  it('成员完全一致视为相同（集合实例不同也要认）', () => {
+    expect(sameSelection(new Set(['a', 'b']), new Set(['b', 'a']))).toBe(true)
+  })
+
+  it('空 ↔ 非空、成员不同都视为不同', () => {
+    expect(sameSelection(null, new Set(['a']))).toBe(false)
+    expect(sameSelection(new Set(['a']), null)).toBe(false)
+    expect(sameSelection(new Set(['a']), new Set(['b']))).toBe(false)
+    expect(sameSelection(new Set(['a']), new Set(['a', 'b']))).toBe(false)
+  })
+})
+
 
 describe('重建量封顶：大网规模下保证单次重建代价有界', () => {
   /** 生成以 (lat,lng) 为中心、按行列铺开的扇区 */

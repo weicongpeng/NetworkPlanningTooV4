@@ -14,14 +14,22 @@ import {
 } from '../../../utils/fieldValue'
 import type { LayerColorSettings, LabelSettings, ThematicSettings } from '../LabelSettingsModal'
 import { geometryAnchor, polygonOuterRings, featureSelectionId } from './cesiumGeoJson'
-import type { CameraView } from './CesiumSectorLayer'
+import { sameSelection, type CameraView } from './CesiumSectorLayer'
 import type { LabelCandidateBase } from '../labelLayoutCore'
 
 /** 单图层的标签候选上限（按离视野中心近的优先保留） */
 const MAX_LABEL_CANDIDATES = 2000
-/** 选中态整面高亮（与 2D GeoDataLayer.setSelectionHighlight 同口径） */
-const SELECTED_FILL_COLOR = '#ef4444'
-const SELECTED_FILL_OPACITY = 0.35
+/**
+ * 选中态描边色（与 2D `setSelectionHighlight` 的 `color:'#ef4444'` 同色）。
+ * 2D 只改描边、不动填充，3D 同口径 —— 见 render() 里的说明。
+ */
+const SELECTED_STROKE_COLOR = '#ef4444'
+/** 选中态描边加粗量（2D 是 weight:3，这里在要素描边宽基础上 +2） */
+const SELECTED_STROKE_EXTRA = 2
+/** 选中态描边的最小像素宽（对齐 2D 的 weight:3） */
+const SELECTED_STROKE_MIN_PX = 3
+/** Web Mercator zoom 0 赤道处每像素米数（与 CesiumSectorLayer 同式） */
+const EQUATOR_MPP = 156543.03392
 import { computeThematicStats, type ThematicStats } from '../../../utils/thematicStats'
 
 type Position = number[]
@@ -85,6 +93,8 @@ export class CesiumGeoJsonLayer {
   private label: LabelSettings | null = null
   private thematic: ThematicSettings | null = null
   private selectionIds: Set<string> | null = null
+  /** 最近一次推送的视野（选中描边按像素宽换算时用） */
+  private view: CameraView | null = null
 
   private viewer: any
   /** 本次渲染创建的批量图元（面/线/点各 1 个），重建时整体移除 */
@@ -170,9 +180,27 @@ export class CesiumGeoJsonLayer {
     this.thematic = thematic
     this.requestRender()
   }
-  setSelectionIds(ids: Set<string> | null): void {
+  /**
+   * 选中集合（+ 当前视野）。
+   *
+   * 宿主 `syncAll()` 每次相机停下都会重推一遍，所以：
+   * - 集合没变就**直接返回**，不再重建 —— 否则每次平移/缩放后都要把上千个要素的
+   *   贴地图元全量重建一遍，是"缩放/平移卡顿"的主要来源之一
+   * - 视野随推送一起更新：选中描边要按"当前米/像素"换算成像素宽（见 render 里的说明）
+   */
+  setSelectionIds(ids: Set<string> | null, view?: CameraView | null): void {
+    if (view !== undefined) this.view = view
+    if (sameSelection(this.selectionIds, ids)) return
     this.selectionIds = ids
     this.requestRender()
+  }
+
+  /** 视野中心处的米/像素（Web Mercator）——选中描边按像素宽换算时用 */
+  private metersPerPixel(): number {
+    const v = this.view
+    if (!v) return 1
+    const cLat = (v.south + v.north) / 2
+    return (EQUATOR_MPP * Math.cos((cLat * Math.PI) / 180)) / Math.pow(2, v.zoom)
   }
 
   /**
@@ -353,8 +381,20 @@ export class CesiumGeoJsonLayer {
         : (g.type === 'LineString' || g.type === 'MultiLineString') ? 'line' : 'polygon'
       const st = this.resolveFeatureStyle(feature, geomKind)
       const selected = this.selectionIds?.has(featureSelectionId(feature.properties, fi))
-      const strokeCss = selected ? '#ef4444' : st.strokeColor
-      const strokeW = selected ? st.strokeWidth + 2 : st.strokeWidth
+      const strokeCss = selected ? SELECTED_STROKE_COLOR : st.strokeColor
+      /**
+       * 选中态描边必须有**最小像素宽**。
+       *
+       * `GroundPolylineGeometry.width` 的单位是**米**（几何在 worker 里构建，拿不到相机，
+       * 所以只能是物理单位），而 2D 的 `weight:3` 是像素。直接把 `strokeWidth` 当米用，
+       * 在常用 zoom 下（1px ≈ 数米）边框会细到看不见 —— 选中就"点了没反应"。
+       * 这里对选中态按当前米/像素换算，保证至少 `SELECTED_STROKE_MIN_PX` 像素宽。
+       * 未选中态维持原样（既有的"米"口径），避免牵动所有图层的观感。
+       */
+      const strokeW = selected
+        ? Math.max(st.strokeWidth + SELECTED_STROKE_EXTRA,
+          SELECTED_STROKE_MIN_PX * this.metersPerPixel())
+        : st.strokeWidth
       const drawStroke = selected || !st.noStroke
 
       // 拾取用标识：批量图元把它挂在 GeometryInstance.id / 图元 .id 上。
@@ -441,15 +481,19 @@ export class CesiumGeoJsonLayer {
               }),
               attributes: {
                 /**
-                 * 选中态：**整个面**用选中色填充（不再只是描边变色）。
-                 * 面状要素圈选/点选后只有红框时，"到底选中了哪个面"在密集图层里很难辨认，
-                 * 与 2D `GeoDataLayer.setSelectionHighlight` 的整面高亮口径对齐。
-                 * 未选中时维持原填充；「无色填充」仍只给 0.01 的命中用 alpha。
+                 * 选中态**只改描边，填充保持原色** —— 与 2D 完全同口径：
+                 * `MapInfoLayer.setSelectionHighlight` / `GeoDataLayer.setSelectionHighlight`
+                 * 都只是 `setStyle({ color:'#ef4444', weight:3 })`，动的是边框，
+                 * `fillColor`/`fillOpacity` 一律保留。
+                 *
+                 * 早先这里给选中面整面铺一层半透明红（`SELECTED_FILL_*`），结果就是用户
+                 * 报的"框内阴影有的超出图形框、有的空洞"：贴地面是分类（classification）
+                 * 渲染，填充会被拖到 3D 建筑上（超出），也会被建筑/地形挡出缺口（空洞）；
+                 * 而 2D 根本没有这层填充，所以按 2D 的做法做，问题从根上消失。
                  */
                 color: C.ColorGeometryInstanceAttribute.fromColor(
-                  C.Color.fromCssColorString(
-                    selected ? SELECTED_FILL_COLOR : st.fillColor)
-                    .withAlpha(selected ? SELECTED_FILL_OPACITY : (st.noFill ? 0.01 : st.fillOpacity))),
+                  C.Color.fromCssColorString(st.fillColor)
+                    .withAlpha(st.noFill ? 0.01 : st.fillOpacity)),
               },
               id: pickId,
             }))
