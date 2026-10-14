@@ -16,14 +16,14 @@ import L from 'leaflet'
 import type { HeatPoint } from '../../utils/heatmap'
 import type { HeatBoundary } from '../../utils/heatSurface'
 import { layoutSampleBlobs, type ProjectedPoint } from '../../utils/sampleBlobLayout'
+import {
+  drawSampleBlobs,
+  SAMPLE_BLOB_R_MIN_PX,
+  sampleBlobRMax,
+} from '../../utils/sampleBlobDraw'
 
 /** backing 相对视口四周的外扩比例（平移缓冲：小幅拖出视口的内容已在 backing 内） */
 const PADDING = 0.3
-
-/** 屏幕空间斑半径约束（px）：rMax = R_MAX_BASE + smooth×R_MAX_SMOOTH_K */
-const R_MIN_PX = 1.5
-const R_MAX_BASE = 20
-const R_MAX_SMOOTH_K = 3
 
 /** 逐点渲染输入（与栅格管线共用同一套映射/色带，保证与图例同源） */
 export interface OriginalSamplesData {
@@ -254,10 +254,8 @@ export class OriginalSamplesLayer extends L.Layer {
       return
     }
     const { points, pointRadii, mapValue, smooth } = this.data
-    // 兜底值与 DEFAULT_HEATMAP_SETTINGS.smooth 保持一致（Manager 始终显式传入，兜底不会触发）
-    const smoothN = Math.min(10, Math.max(1, smooth ?? 4))
-    // 屏幕半径上限（与平滑强度联动，smooth 1→23px、10→50px）：放大后斑不再变大
-    const rMax = R_MAX_BASE + smoothN * R_MAX_SMOOTH_K
+    // 屏幕半径上限（与平滑强度联动）：放大后斑不再变大（与 3D 同一函数）
+    const rMax = sampleBlobRMax(smooth)
     const zoom = map.getZoom()
     // 当前 zoom 下"米/像素"：40075016.686 * cos(lat) / 2^(zoom+8)
     const zoomScale = 256 * Math.pow(2, zoom)
@@ -280,7 +278,7 @@ export class OriginalSamplesLayer extends L.Layer {
       projected.push({ x: lp.x, y: lp.y, baseR, tc: t <= 0 ? 0 : t >= 1 ? 1 : t })
     }
     // 屏幕空间最近邻防重叠 + 重合点合并（纯函数，见 utils/sampleBlobLayout）
-    this.items = layoutSampleBlobs(projected, { rMin: R_MIN_PX, rMax })
+    this.items = layoutSampleBlobs(projected, { rMin: SAMPLE_BLOB_R_MIN_PX, rMax })
   }
 
   /**
@@ -296,56 +294,28 @@ export class OriginalSamplesLayer extends L.Layer {
     const bSize = this._bounds.max.subtract(bMin)
     ctx.clearRect(bMin.x, bMin.y, bSize.x, bSize.y)
 
-    const a0 = opacity <= 0 ? 0 : opacity >= 1 ? 1 : opacity
-    if (a0 === 0 || this.items.length === 0) return
-
-    // 细节增强 → 颜色层次跨度：色斑从中心 t=tc 沿色带向低端过渡，
-    // detail=0 仅微降（近似单色柔和斑），detail=100 几乎降到色带底端（完整色环层次）
-    const span = 0.05 + 0.9 * Math.min(1, Math.max(0, detail / 100))
-    // 径向分段数：连续梯度呈现色带的色相环，离散时相邻段同色形成硬色环
-    const K = 10
-
-    ctx.save()
-    // 边界裁剪：layerPoint 坐标环 + evenodd（与栅格掩膜规则一致，支持多面/洞）
-    if (boundary && boundary.length) {
-      ctx.beginPath()
-      for (const polygon of boundary) {
-        for (const ring of polygon) {
-          for (let i = 0; i < ring.length; i++) {
-            const lp = map.latLngToLayerPoint([ring[i][1], ring[i][0]])
-            if (i === 0) ctx.moveTo(lp.x, lp.y)
-            else ctx.lineTo(lp.x, lp.y)
+    // 绘制与 3D（CesiumSamplesOverlay）共用：色带层次、离散色环、边缘羽化逐像素同源
+    drawSampleBlobs(ctx, this.items, {
+      lut,
+      opacity,
+      detail,
+      discreteLevels,
+      // 边界裁剪：layerPoint 坐标环 + evenodd（与栅格掩膜规则一致，支持多面/洞）
+      buildClip: boundary && boundary.length
+        ? (c) => {
+          for (const polygon of boundary) {
+            for (const ring of polygon) {
+              for (let i = 0; i < ring.length; i++) {
+                const lp = map.latLngToLayerPoint([ring[i][1], ring[i][0]])
+                if (i === 0) c.moveTo(lp.x, lp.y)
+                else c.lineTo(lp.x, lp.y)
+              }
+              c.closePath()
+            }
           }
-          ctx.closePath()
         }
-      }
-      ctx.clip('evenodd')
-    }
-
-    for (const it of this.items) {
-      const grad = ctx.createRadialGradient(it.x, it.y, 0, it.x, it.y, it.r)
-      for (let s = 0; s <= K; s++) {
-        const f = s / K
-        let t = it.tc * (1 - span * f)
-        // 离散分级：量化到 N 级 → 同心硬色环
-        if (discreteLevels >= 2) t = Math.floor(t * discreteLevels) / discreteLevels
-        const li = (t <= 0 ? 0 : t >= 1 ? 255 : (t * 255) | 0) << 2
-        // 不透明度：中心 60% 半径内保持 opacity 完全不透明，仅外缘 40% smoothstep 羽化
-        let af: number
-        if (f <= 0.6) {
-          af = a0
-        } else {
-          const g = (f - 0.6) / 0.4
-          af = a0 * (1 - g * g * (3 - 2 * g))
-        }
-        grad.addColorStop(f, `rgba(${lut[li]},${lut[li + 1]},${lut[li + 2]},${af})`)
-      }
-      ctx.beginPath()
-      ctx.fillStyle = grad
-      ctx.arc(it.x, it.y, it.r, 0, Math.PI * 2)
-      ctx.fill()
-    }
-    ctx.restore()
+        : null,
+    })
   }
 
   private _requestDraw(): void {

@@ -53,6 +53,8 @@ function makeCesiumMock() {
     },
     PolygonGeometry: class { constructor(public opts: any) {} },
     GroundPolylineGeometry: class { constructor(public opts: any) {} },
+    ArcType: { GEODESIC: 0, RHUMB: 1 },
+    ClassificationType: { TERRAIN: 0, CESIUM_3D_TILE: 1, BOTH: 2 },
     PerInstanceColorAppearance: Object.assign(
       class { constructor(public opts?: any) {} },
       { VERTEX_FORMAT: 'vertexFormat' },

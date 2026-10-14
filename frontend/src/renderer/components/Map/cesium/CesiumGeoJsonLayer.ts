@@ -429,6 +429,15 @@ export class CesiumGeoJsonLayer {
               geometry: new C.PolygonGeometry({
                 polygonHierarchy: new C.PolygonHierarchy(positions),
                 vertexFormat: C.PerInstanceColorAppearance.VERTEX_FORMAT,
+                /**
+                 * 边走**恒向线**（RHUMB），不用默认的测地线（GEODESIC）。
+                 *
+                 * 2D（Leaflet）是在墨卡托投影平面里连直线，而墨卡托直线正对应球面的恒向线。
+                 * 测地线在大跨度边上会相对墨卡托直线外鼓（1° 边约 180m、5° 边约 4.5km），
+                 * 于是填充与贴地描边（`GroundPolylineGeometry` 是在经纬空间连直线，
+                 * 即墨卡托直线）对不上 —— 填充鼓到图形外面去了。
+                 */
+                arcType: C.ArcType.RHUMB,
               }),
               attributes: {
                 /**
@@ -482,6 +491,21 @@ export class CesiumGeoJsonLayer {
           geometryInstances: polygons,
           appearance: new C.PerInstanceColorAppearance({ flat: true, translucent: true }),
           asynchronous: false,
+          /**
+           * **只贴地形，绝不贴 3D Tiles（建筑）** —— 这是"填充/选中阴影跑到图形外面"的根因。
+           *
+           * `GroundPrimitive` 走的是分类（classification）渲染：把几何体沿竖直方向
+           * 拉伸成一个"体"，凡是落在这个体内的表面（默认 `ClassificationType.BOTH` =
+           * 地形 **和** 3D Tiles）都会被涂上颜色。
+           * 而体的上下界取自 `ApproximateTerrainHeights` —— 未初始化时是
+           * **[-100km, +9km]**（`ApproximateTerrainHeights._defaultMin/MaxTerrainHeight`），
+           * 也就是"这个多边形水平范围内的任何高度表面都算体内"。
+           * 于是场景里常驻的 OSM 建筑（`createOsmBuildingsAsync`）整面被涂上面色：
+           * 建筑墙面/屋顶在斜视下相对其地面轮廓有明显视差，看上去就是
+           * "阴影不在图形区域内，飘到图形外面去了"。
+           * 2D 没有建筑，面就是平铺在地图上 —— 限定 TERRAIN 才是对等口径。
+           */
+          classificationType: C.ClassificationType.TERRAIN,
         })))
       }
       if (polylines.length > 0) {

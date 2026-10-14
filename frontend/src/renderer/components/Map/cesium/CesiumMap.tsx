@@ -265,6 +265,11 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
    */
   const labelCanvasRef = useRef<HTMLCanvasElement>(null)
   const labelOverlayRef = useRef<CesiumLabelOverlay | null>(null)
+  /**
+   * 「原始采样」热力覆盖层的宿主（每个热力层在里面建自己的 canvas）。
+   * 与 2D 一样是屏幕空间逐点色斑，必须叠在 Cesium 画布之上、标签之下。
+   */
+  const heatSamplesHostRef = useRef<HTMLDivElement>(null)
   const [selectionTip, setSelectionTip] = useState('')
   const [selectedCount, setSelectedCount] = useState(0)
   // 扇区属性框（手形工具点击查属性）+ 重叠扇区列表
@@ -797,7 +802,7 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
       const C = (window as any).Cesium
       const viewer = viewerRef.current
       if (!C || !viewer) return
-      layer = new CesiumHeatmapLayer(C, viewer, layerId)
+      layer = new CesiumHeatmapLayer(C, viewer, layerId, heatSamplesHostRef.current)
       heatmapsRef.current.set(layerId, layer)
     }
     /**
@@ -1102,6 +1107,8 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
         viewer.scene.postRender.addEventListener(() => {
           if (!overlayCameraMoved(viewer.camera, viewer.canvas?.clientWidth ?? 0)) return
           selectionRef.current?.refreshOverlay()
+          // 「原始采样」热力是屏幕空间逐点色斑，与标签同理由：相机一动就要重投影重画
+          for (const heat of heatmapsRef.current.values()) heat.drawSamplesNow()
           labelOverlayRef.current?.drawNow()
         })
         // 相机变化 10% 就触发重建 → 交互中重建过密；放宽到 25%，只在明显移动后重建
@@ -1754,6 +1761,15 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
       <svg
         ref={selectionOverlayRef}
         className="absolute inset-0 w-full h-full pointer-events-none z-[900]"
+        aria-hidden="true"
+      />
+      {/*
+        「原始采样」热力覆盖层的宿主：每个热力图层在里面自建一张 canvas（叠放顺序=创建顺序）。
+        屏幕空间逐点色斑，与 2D 的 OriginalSamplesLayer 同一套画法；放在标签覆盖层之下。
+      */}
+      <div
+        ref={heatSamplesHostRef}
+        className="absolute inset-0 w-full h-full pointer-events-none z-[901]"
         aria-hidden="true"
       />
       {/*
