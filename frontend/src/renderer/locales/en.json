@@ -51,6 +51,8 @@
     "downloadReady": "Download complete; it will install after restart",
     "downloadFailed": "Download failed, please retry",
     "restartAndInstall": "Restart and install",
+    "updateReady": "Update ready — restart to finish updating",
+    "restartNow": "Restart now",
     "installing": "Exiting and installing…",
     "installFailed": "Failed to start installer",
     "mimeHint": "The installer is downloaded locally and applied automatically; user data (%APPDATA%) is preserved",

@@ -15,6 +15,7 @@ import { useAuthStore } from '../store/authStore'
 import { useDesktopUpdateStore } from '../store/desktopUpdateStore'
 import { licenseApi, desktopCloudApi, desktopUpdateApi } from '../services/api'
 import { LLMConfigCard } from '../components/LLMConfigCard'
+import { DesktopUpdateReadyBanner } from '../components/DesktopUpdateReadyBanner'
 
 export function LicensePage() {
   const { t, i18n } = useTranslation()
@@ -570,6 +571,9 @@ export function LicensePage() {
               {checkingUpdate ? t('desktopUpdate.checking') : t('desktopUpdate.checkButton')}
             </button>
           </div>
+
+          {/* 安装包已下载完成 → 「更新已就绪，重启后完成更新」+ 立即重启 */}
+          <DesktopUpdateReadyBanner />
 
           {checkMessage && (
             <div className={`mt-3 p-2 rounded flex items-center gap-2 ${

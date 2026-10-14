@@ -1794,6 +1794,8 @@
     "downloadReady": "下载完成，重启后自动安装",
     "downloadFailed": "下载失败，请重试",
     "restartAndInstall": "重启并安装",
+    "updateReady": "更新已就绪，重启后完成更新",
+    "restartNow": "立即重启",
     "installing": "正在退出并安装…",
     "installFailed": "安装启动失败",
     "mimeHint": "安装包将下载到本机后自动安装，用户数据（%APPDATA%）不受影响",
