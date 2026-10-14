@@ -41,13 +41,14 @@ function amapRadius(zoom: number, lat: number): number {
 }
 
 /**
- * 量化允许的最大相对偏差：米/像素按 2^1/32 分档， worst case 偏差即 2^(1/32)-1。
+ * 量化允许的最大相对偏差：米/像素按 2^1/8 分档（≈9%，档位比早先的 1/32 粗，
+ * 换更少的重建次数），worst case 偏差即 2^(1/8)-1。
  * 3D 半径 = 目标像素 × 量化后的米/像素，所以与高德侧的偏差也在这个量级。
  */
-const MPP_MAX_REL_ERR = Math.pow(2, 1 / 32) - 1
+const MPP_MAX_REL_ERR = Math.pow(2, 1 / 8) - 1
 
 describe('扇区半径：与高德侧恒定像素口径一致', () => {
-  it('室外扇区半径 = 16px × 米/像素（同一 zoom 下与高德侧相同，量化偏差 ≤2.2%）', () => {
+  it('室外扇区半径 = 16px × 米/像素（同一 zoom 下与高德侧相同，量化偏差 ≤9%）', () => {
     for (const zoom of [10, 12, 14, 16, 18]) {
       const r = sectorRadius(sector(), view(zoom), false)
       const amap = amapRadius(zoom, 23.7433)
@@ -81,24 +82,24 @@ describe('扇区半径：与高德侧恒定像素口径一致', () => {
     expect(sectorRadius(sector(), view(0), false)).toBeLessThanOrEqual(5000)
   })
 
-  it('提供 metersPerPixelAt 时按其换算（3D 透视路径，量化后偏差 ≤2.2%）', () => {
+  it('提供 metersPerPixelAt 时按其换算（3D 透视路径，量化后偏差 ≤9%）', () => {
     const v: CameraView = { ...view(12), metersPerPixelAt: () => 50 }
-    // 16px × 50m/px ≈ 800m，量化到 2^1/32 档位后有小幅偏差
+    // 16px × 50m/px ≈ 800m，量化到 2^1/8 档位后有小幅偏差
     const r = sectorRadius(sector(), v, false)
     expect(r).toBeGreaterThan(800 * (1 - MPP_MAX_REL_ERR) - 1e-9)
     expect(r).toBeLessThan(800 * (1 + MPP_MAX_REL_ERR) + 1e-9)
   })
 
   it('量化让同一档位内的米/像素完全一致（平移/旋转不改变几何）', () => {
-    // 档宽 2^(1/32)-1 ≈ 2.2%，取中心 ±0.8% 必落在同一档内
+    // 档宽 2^(1/8)-1 ≈ 9%：量化值即档位中心，±4.4% 内必同档，取 ±2% 稳定不越界
     const center = metersPerPixelQuantized(() => 44.4758)
-    const lo = metersPerPixelQuantized(() => 44.4758 * 0.992)
-    const hi = metersPerPixelQuantized(() => 44.4758 * 1.008)
+    const lo = metersPerPixelQuantized(() => center * 0.98)
+    const hi = metersPerPixelQuantized(() => center * 1.02)
     // 同档内取值必须逐位相同 —— 这是"不随相机微动重建"的根据
     expect(lo).toBe(center)
     expect(hi).toBe(center)
     // 明显跨档则必须不同（否则量化就没起作用）
-    expect(metersPerPixelQuantized(() => 44.4758 * 1.5)).not.toBe(center)
+    expect(metersPerPixelQuantized(() => center * 1.5)).not.toBe(center)
   })
 })
 

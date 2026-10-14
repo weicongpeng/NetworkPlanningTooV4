@@ -14,6 +14,8 @@ import {
   tiandituTileSource,
   isAnnotationApplicable,
   tiandituBaseLayerOf,
+  TIANDITU_MAX_ZOOM,
+  TIANDITU_NATIVE_MAX_ZOOM,
 } from '../mapSources'
 import { gcj02ToWgs84 } from '../../utils/coordinate'
 
@@ -180,5 +182,17 @@ describe('天地图纠偏：瓦片重投影源', () => {
     const src = tiandituTileSource(3, 0, 0)
     expect(Number.isFinite(src.wx)).toBe(true)
     expect(Number.isFinite(src.wy)).toBe(true)
+  })
+})
+
+describe('天地图缩放上限：可缩放到 20，但只请求真实存在的层级', () => {
+  it('可缩放上限 = 20（与高德侧 maxZoom 拉齐，用户要求能再放大底图）', () => {
+    expect(TIANDITU_MAX_ZOOM).toBe(20)
+  })
+
+  it('取瓦片层级上限 = 18（服务端真实级别；19-20 由客户端拉伸 18 级瓦片）', () => {
+    // 服务端没有 19/20 级瓦片：请求它们会得到空白/错位底图
+    expect(TIANDITU_NATIVE_MAX_ZOOM).toBe(18)
+    expect(TIANDITU_NATIVE_MAX_ZOOM).toBeLessThan(TIANDITU_MAX_ZOOM)
   })
 })

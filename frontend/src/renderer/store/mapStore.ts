@@ -929,6 +929,11 @@ export async function reloadUserMapSettings(): Promise<void> {
   }
 
   const key = getStorageKey()
+  // 该用户在本机是否已有自己的设置快照 —— 必须在**任何 set 之前**判断。
+  // persist 包装过的 setState 会立刻把当前内存态（可能还是上一账号/匿名会话的）写进新 key，
+  // 之后再读必然非空，"本地与服务端都没有 → 用默认值"的兜底就永远不生效
+  // （表现为：刚注册的用户继承了上一个账号的底图，默认天地图矢量图不生效）。
+  const hadPersistedSettings = readPersistedMapSettings(key) !== null
   if (useMapStore.persist.getOptions().name !== key) {
     useMapStore.persist.setOptions({ name: key })
   }
@@ -951,11 +956,17 @@ export async function reloadUserMapSettings(): Promise<void> {
   // 登录：先用该用户本地持久化数据恢复（后端不可用时也能保住配置），再合并服务端设置。
   await useMapStore.persist.rehydrate()
   const loaded = await useMapStore.getState()._syncFromBackend()
-  // 装饰要素改存 IndexedDB，rehydrate 不携带：显式按 key 恢复
-  const decoFeatures = await loadUserDecorations(key)
+  // 装饰要素改存 IndexedDB，rehydrate 不携带：显式按 key 恢复。
+  // IndexedDB 不可用（隐私模式/被禁用）时不阻断后面的默认值兜底。
+  let decoFeatures: EditFeature[] = []
+  try {
+    decoFeatures = await loadUserDecorations(key)
+  } catch { /* 装饰要素读取失败非关键 */ }
   useMapStore.setState({ decorationFeatures: decoFeatures })
-  // 本地与服务端都没有该用户的设置时才用默认值（避免把上一个匿名会话的设置带到新用户）
-  if (!loaded && !readPersistedMapSettings(key)) {
+  // 本地与服务端都没有该用户的设置时才用默认值（避免把上一个账号/匿名会话的设置带到新用户）。
+  // 用 hadPersistedSettings（进入本函数时的快照）而不是此刻再读 localStorage：
+  // 上面的 setState 已经把内存态写进新 key 了。
+  if (!loaded && !hadPersistedSettings) {
     useMapStore.setState({
       mapSettings: { ...DEFAULT_MAP_SETTINGS },
       _lastSyncSettings: '',

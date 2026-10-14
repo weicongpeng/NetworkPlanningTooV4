@@ -46,6 +46,7 @@ import {
   layerKindOf,
   DEFAULT_TIANDITU_KEY,
   TIANDITU_MAX_ZOOM,
+  TIANDITU_NATIVE_MAX_ZOOM,
   type MapSource,
   type TiandituAnnotations,
 } from '../../config/mapSources'
@@ -124,7 +125,9 @@ function tiandituLeafletLayer(
   return new TiandituGridLayer({
     minZoom: 3,
     maxZoom: TIANDITU_MAX_ZOOM,
-    maxNativeZoom: TIANDITU_MAX_ZOOM,
+    // 服务端只有到 18 级的瓦片（见 TIANDITU_NATIVE_MAX_ZOOM 注释）：
+    // 19-20 级交给 Leaflet 拉伸 18 级瓦片显示，而不是去请求不存在的瓦片（那会是整片空白）
+    maxNativeZoom: TIANDITU_NATIVE_MAX_ZOOM,
     zIndex,
     attribution: '&copy; <a href="https://www.tianditu.gov.cn/">天地图</a>',
   })

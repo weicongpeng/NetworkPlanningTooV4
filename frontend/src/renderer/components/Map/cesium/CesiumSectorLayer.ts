@@ -115,17 +115,19 @@ export function sampleCenteredOn(
 /** Web Mercator zoom 0 赤道每像素米数 */
 const EQUATOR_MPP = 156543.03392
 /**
- * 米/像素的量化档位数（每档 2^1/32 ≈ 2.2%）。
+ * 米/像素的量化档位数（每档 2^1/8 ≈ 9%）。
  *
  * 透视下"某点的米/像素"随相机位置连续变化，扇区半径 = 目标像素 × 米/像素，
  * 于是**任何**相机移动（哪怕只是平移或旋转）都会让半径变一点 → 几何全变 → 整个重建。
- * 把米/像素量化到 2.2% 档位后：
+ * 把米/像素量化到 9% 档位后：
  * - 档内半径完全一致 → 平移/旋转/微缩放**不触发重建**（这是卡顿的大头）
- * - 视觉上扇区尺寸偏差 ≤2.2%，肉眼不可辨
+ * - 视觉上扇区尺寸偏差 ≤9%（16px 半径约 1.4px），肉眼不可辨
+ * - 之前的分档是 2.2%（1/32），档位太密：一段缩放要重建几十次（每次都要
+ *   `primitives.remove()` + `add()` 上千个扇区），既卡又更容易踩 Cesium 的渲染状态问题
  */
-const MPP_BUCKETS_PER_ZOOM = 32
+const MPP_BUCKETS_PER_ZOOM = 8
 
-/** 量化档位索引（zoom 的 1/32 分档，向上取整避免 0 附近震荡） */
+/** 量化档位索引（zoom 的 1/8 分档，避免 0 附近震荡） */
 function mppBucketIndex(mpp: number): number {
   if (!Number.isFinite(mpp) || mpp <= 0) return 0
   return Math.max(0, Math.round(Math.log2(EQUATOR_MPP / mpp) * MPP_BUCKETS_PER_ZOOM))
@@ -405,9 +407,10 @@ export class CesiumSectorLayer {
     this.configDirty = false
     this.lastViewKey = viewKey
 
-    this.clearPrimitives()
-
-    if (!this.visible) return
+    if (!this.visible) {
+      this.clearPrimitives()
+      return
+    }
 
     const sectors = this.pickSectors(view)
     const pciPlanning = this.renderMode === 'pci-planning'
@@ -479,27 +482,40 @@ export class CesiumSectorLayer {
 
     const primitives = this.viewer?.scene?.primitives
     if (!primitives) return
+    const oldFill = this.fillPrimitive
+    const oldOutline = this.outlinePrimitive
+    let newFill: any = null
+    let newOutline: any = null
     try {
       if (fills.length > 0) {
-        this.fillPrimitive = primitives.add(new C.GroundPrimitive({
+        newFill = primitives.add(new C.GroundPrimitive({
           geometryInstances: fills,
           appearance: new C.PerInstanceColorAppearance({ flat: true, translucent: true }),
-          // 同步构建：我们重建频繁，异步会产生中间态闪烁
+          // 同步构建：我们重建频繁，异步构建会在 worker 未完成时被 remove，
+          // Cesium 拿着已销毁的纹理继续渲染 → TypeError ...reading '_target' + 渲染循环永久停止
           asynchronous: false,
         }))
       }
       if (outlines.length > 0) {
-        this.outlinePrimitive = primitives.add(new C.GroundPolylinePrimitive({
+        newOutline = primitives.add(new C.GroundPolylinePrimitive({
           geometryInstances: outlines,
           appearance: new C.PolylineColorAppearance(),
           asynchronous: false,
         }))
       }
     } catch (e) {
-      // 设备不支持贴地图元等情况下不让整层崩掉
+      // 设备不支持贴地图元等情况下不让整层崩掉：清掉已建起来的部分，保留旧图元
       console.warn('[CesiumSectorLayer] 批量图元创建失败:', e)
-      this.clearPrimitives()
+      if (newFill) { try { primitives.remove(newFill) } catch { /* ignore */ } }
+      if (newOutline) { try { primitives.remove(newOutline) } catch { /* ignore */ } }
+      return
     }
+    // 新图元就位后再摘旧的：先删后建会留下"图元集合里什么都没有"的一帧
+    // （渲染循环正拿着旧图元的命令时，旧图元已被销毁），也是 _target 类报错的高危窗口。
+    this.fillPrimitive = newFill
+    this.outlinePrimitive = newOutline
+    if (oldFill) { try { primitives.remove(oldFill) } catch { /* ignore */ } }
+    if (oldOutline) { try { primitives.remove(oldOutline) } catch { /* ignore */ } }
   }
 
   getNetworkType(): NetworkType {

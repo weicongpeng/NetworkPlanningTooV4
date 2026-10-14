@@ -75,14 +75,24 @@ export type TiandituLayer = 'vec' | 'cva' | 'img' | 'cia' | 'ter' | 'cta' | 'eva
 export const TIANDITU_SUBDOMAINS = ['0', '1', '2', '3', '4', '5', '6', '7']
 
 /**
- * 天地图 WMTS 声明的最大级别。
+ * 天地图 WMTS 声明的最大级别（可缩放到的最深层级）。
  *
  * 设成 20（而不是官方文档写的 18）是为了与高德拉齐：高德的栅格瓦片实际可下到 z20，
  * 本项目把最大缩放统一到 20 后，两边"放到最大"的观感一致。
- * 超过服务端真实级别的瓦片请求会返回错误/空图，此时Leaflet/Cesium 会继续用更低级别的
- * 瓦片放大显示（不会出现空白），属于可接受的降级。
+ * 但**取瓦片**的层级仍受 `TIANDITU_NATIVE_MAX_ZOOM` 限制（见下），
+ * 19-20 级由客户端拉伸 18 级瓦片显示 —— 与高德分支的 `maxNativeZoom: 18` 同一口径。
  */
 export const TIANDITU_MAX_ZOOM = 20
+
+/**
+ * 天地图服务端**真实存在瓦片**的最大级别 = 18（官方文档口径，实测超过 18 级：
+ * 矢量图会错位、影像图直接提示"此级别下，该区域无影像"）。
+ *
+ * 所以它只约束"请求哪一级瓦片"（2D `maxNativeZoom`、3D `maximumLevel`），
+ * 不约束可缩放到的最深层级（那是 `TIANDITU_MAX_ZOOM`）。
+ * 若把它也设成 20，19/20 级会去请求不存在的瓦片 → 底图整片空白/报错。
+ */
+export const TIANDITU_NATIVE_MAX_ZOOM = 18
 
 /**
  * 天地图 WMTS 瓦片 URL 模板（球面墨卡托 `_w`）。
