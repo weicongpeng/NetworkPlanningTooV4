@@ -63,6 +63,44 @@ export function amapTileUrl(kind: 'vector' | 'satellite'): string {
     : 'https://webrd02.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x={x}&y={y}&z={z}'
 }
 
+/**
+ * 高德注记（路网 + 地名）叠加瓦片。
+ *
+ * **为什么卫星图原来没有注记**：高德的卫星影像 `style=6` 是一张**不含任何注记**的纯影像
+ * （实测返回 JPEG），注记在高德那边是**单独一张透明图层** `style=8`（实测返回 RGBA PNG，
+ * 约 54% 像素全透明、15% 半透明，其余是道路与地名），需要由客户端自己叠在影像之上。
+ * 而矢量底图 `webrd ... style=8` 已经把这张注记层烘进底图了，所以矢量图一直"看着正常"。
+ *
+ * 注：`wprd` 与 `webst` 两个主机返回的是**同一张**瓦片（实测 md5 一致），这里统一用
+ * `webst`（与影像底图同源，少一个域名）。
+ *
+ * 瓦片本身就是 GCJ02，与本项目的显示链路（工参/图层/装饰都是 GCJ02）直接对齐，无需纠偏。
+ */
+export function amapAnnotationTileUrl(): string {
+  return 'https://webst02.is.autonavi.com/appmaptile?style=8&x={x}&y={y}&z={z}'
+}
+
+/** 高德注记开关（与天地图注记同语义：矢量注记↔矢量图、影像注记↔卫星图） */
+export interface AmapAnnotations {
+  /** 矢量注记（叠在**矢量图**上的路网注记层） */
+  vector: boolean
+  /** 影像注记（叠在**卫星图**上的路网注记层） */
+  image: boolean
+}
+
+/**
+ * 高德注记是否适用于当前地图源。
+ * 与天地图注记同一口径：只渲染与当前底图匹配的那一类（矢量注记→矢量图、影像注记→卫星图）。
+ */
+export function isAmapAnnotationApplicable(
+  kind: 'vector' | 'image', source: MapSource,
+): boolean {
+  if (engineOf(source) !== 'amap') return false
+  // 注记的'image'对应底图的'satellite'（高德把卫星叫影像）
+  const layerKind = layerKindOf(source)
+  return kind === 'image' ? layerKind === 'satellite' : layerKind === 'vector'
+}
+
 // ===== 天地图瓦片 =====
 
 /** 内置默认天地图 Key（浏览器端 Key，出厂值，UI 脱敏展示、用户可更换） */

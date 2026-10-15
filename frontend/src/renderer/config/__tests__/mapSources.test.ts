@@ -16,6 +16,8 @@ import {
   tiandituBaseLayerOf,
   TIANDITU_MAX_ZOOM,
   TIANDITU_NATIVE_MAX_ZOOM,
+  amapAnnotationTileUrl,
+  isAmapAnnotationApplicable,
 } from '../mapSources'
 import { gcj02ToWgs84 } from '../../utils/coordinate'
 
@@ -194,5 +196,32 @@ describe('天地图缩放上限：可缩放到 20，但只请求真实存在的�
     // 服务端没有 19/20 级瓦片：请求它们会得到空白/错位底图
     expect(TIANDITU_NATIVE_MAX_ZOOM).toBe(18)
     expect(TIANDITU_NATIVE_MAX_ZOOM).toBeLessThan(TIANDITU_MAX_ZOOM)
+  })
+})
+
+describe('高德注记叠加层', () => {
+  it('注记瓦片 URL：style=8 透明路网注记，且带 {x}/{y}/{z} 占位符', () => {
+    const url = amapAnnotationTileUrl()
+    expect(url).toContain('style=8')
+    expect(url).toContain('{x}').valueOf()
+    expect(url).toContain('{y}')
+    expect(url).toContain('{z}')
+    // 与卫星底图（style=6）必须是两张不同的瓦片，否则叠加没有意义
+    expect(url).not.toBe(amapTileUrl('satellite'))
+    expect(amapTileUrl('satellite')).toContain('style=6')
+  })
+
+  it('注记只在与它匹配的高德底图上生效（与天地图同口径）', () => {
+    expect(isAmapAnnotationApplicable('image', 'amap-satellite')).toBe(true)
+    expect(isAmapAnnotationApplicable('image', 'amap-vector')).toBe(false)
+    expect(isAmapAnnotationApplicable('vector', 'amap-vector')).toBe(true)
+    expect(isAmapAnnotationApplicable('vector', 'amap-satellite')).toBe(false)
+  })
+
+  it('天地图与 3D / 空地图上不叠加高德注记', () => {
+    for (const src of ['tdt-vector', 'tdt-satellite', 'cesium', 'none'] as const) {
+      expect(isAmapAnnotationApplicable('image', src)).toBe(false)
+      expect(isAmapAnnotationApplicable('vector', src)).toBe(false)
+    }
   })
 })

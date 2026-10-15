@@ -39,6 +39,9 @@ import type { LayerOrderMap } from '../../store/mapStore'
 import { layerApi, dataApi } from '../../services/api'
 import {
   amapTileUrl,
+  amapAnnotationTileUrl,
+  isAmapAnnotationApplicable,
+  type AmapAnnotations,
   tiandituTileUrl,
   tiandituTileSource,
   engineOf,
@@ -175,11 +178,14 @@ interface SharedMapCache {
   tiandituKey: string
   /** 天地图注记叠加层（随地图实例一起缓存，避免页面切换后重复叠加） */
   annotations: Partial<Record<'cva' | 'cia' | 'cta', { layer: any; key: string }>>
+  /** 高德注记叠加层（路网+地名，叠在卫星影像 / 矢量底图之上） */
+  amapAnnotation: { layer: any; kind: 'vector' | 'image' } | null
   labelManager: LabelLayoutManager | null  // 共享标签布局引擎（跨图层标签防重叠）
 }
 let __sharedMapCache: SharedMapCache = {
   map: null, tileLayer: null, leafletContainer: null,
-  mapSource: 'amap-vector', tiandituKey: '', annotations: {}, labelManager: null
+  mapSource: 'amap-vector', tiandituKey: '', annotations: {}, amapAnnotation: null,
+  labelManager: null
 }
 let __sharedHiddenContainer: HTMLDivElement | null = null
 // 模块级共享 ref —— 地图缓存后，事件监听器闭包仍引用旧组件的 useRef 对象
@@ -329,6 +335,8 @@ interface OnlineMapProps {
   tiandituApiKey?: string
   /** 天地图注记图层显隐（矢量注记 cva / 影像注记 cia / 地形注记 cta） */
   tiandituAnnotations?: TiandituAnnotations
+  /** 高德注记叠加层显隐（矢量注记 / 影像注记）：高德卫星影像本身不含注记，靠它叠加 */
+  amapAnnotations?: AmapAnnotations
   /** CesiumJS 场景注记：三维地名（仅 3D 地图生效） */
   cesiumPlaceNameVisible?: boolean
 }
@@ -512,6 +520,7 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
   mapSource = 'amap-vector',
   tiandituApiKey = DEFAULT_TIANDITU_KEY,
   tiandituAnnotations = { vector: true, image: true, terrain: true },
+  amapAnnotations = { vector: false, image: true },
 }, ref) => {
   // Refs
   const customLayerRefs = useRef<Record<string, L.LayerGroup | L.FeatureGroup>>({})
@@ -5235,6 +5244,7 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
           mapSource: mapSourceRef.current,
           tiandituKey: tiandituKeyRef.current,
           annotations: __sharedMapCache.annotations,
+          amapAnnotation: __sharedMapCache.amapAnnotation,
           labelManager
         }
 
@@ -5444,6 +5454,7 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
             mapSource: mapSourceRef.current,
             tiandituKey: tiandituKeyRef.current,
             annotations: __sharedMapCache.annotations,
+            amapAnnotation: __sharedMapCache.amapAnnotation,
             labelManager: __sharedMapCache.labelManager
           }
 
@@ -7592,6 +7603,51 @@ function sectorPointGeometry(f: any): { type: 'Point'; coordinates: [number, num
       }
     }
   }, [isMapInitialized, mapSource, tiandituApiKey, tiandituAnnotations])
+
+  /**
+   * 高德注记叠加层（路网 + 地名）。
+   *
+   * **这是"高德卫星图没有注记"的正解**：高德卫星影像（`style=6`）是一张纯影像、本身不含
+   * 任何注记，注记在高德那边是单独一张透明瓦片（`style=8`），必须由客户端叠上去；
+   * 矢量底图则已把注记烘进底图（所以矢量图一直看着正常）。
+   *
+   * 与天地图注记同一口径：只渲染**与当前底图匹配**的那一类（矢量注记↔矢量图、
+   * 影像注记↔卫星图）。高德瓦片本身就是 GCJ02，与本项目显示链路一致，无需纠偏。
+   * zIndex 与天地图注记同为 2（高于底图；两个引擎互斥，不会同时存在）。
+   */
+  useEffect(() => {
+    const map = mapInstanceRef.current
+    const L = leafletRef.current || (window as any).L
+    if (!map || !L) return
+
+    const wantKind: 'vector' | 'image' | null =
+      isAmapAnnotationApplicable('image', mapSource) && amapAnnotations.image ? 'image'
+        : isAmapAnnotationApplicable('vector', mapSource) && amapAnnotations.vector ? 'vector'
+          : null
+
+    const existing = __sharedMapCache.amapAnnotation
+    // 已按同一种底图叠好 → 什么都不用做（继续复用，避免页面切换后重复叠加）
+    if (existing && wantKind && existing.kind === wantKind
+      && map.hasLayer(existing.layer)) return
+    if (!existing && !wantKind) return
+
+    if (existing) {
+      try { map.removeLayer(existing.layer) } catch { /* ignore */ }
+      __sharedMapCache.amapAnnotation = null
+    }
+    if (wantKind) {
+      const layer = L.tileLayer(amapAnnotationTileUrl(), {
+        attribution: '&copy; <a href="https://www.amap.com/">高德地图</a>',
+        minZoom: 3,
+        maxZoom: 20,
+        maxNativeZoom: 18,
+        zIndex: 2,
+        crossOrigin: 'anonymous',
+      })
+      layer.addTo(map)
+      __sharedMapCache.amapAnnotation = { layer, kind: wantKind }
+    }
+  }, [isMapInitialized, mapSource, amapAnnotations])
 
 
 

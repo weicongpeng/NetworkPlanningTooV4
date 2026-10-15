@@ -10,6 +10,7 @@ import { loadDecorations, saveDecorations } from '../services/decorationStorage'
 import { DEFAULT_CESIUM_ION_TOKEN } from '../services/cesiumLoader'
 import {
   DEFAULT_TIANDITU_KEY,
+  type AmapAnnotations,
   type MapSource,
   type TiandituAnnotations,
 } from '../config/mapSources'
@@ -96,6 +97,9 @@ export interface UserMapSettings {
   tiandituApiKey: string
   // 天地图注记图层显隐（矢量注记 cva / 影像注记 cia / 地形注记 cta）
   tiandituAnnotations: TiandituAnnotations
+  // 高德注记叠加层显隐（矢量注记 / 影像注记）。
+  // 高德卫星影像本身不含注记，影像注记层是"卫星图有地名"的唯一来源。
+  amapAnnotations: AmapAnnotations
   // Cesium ion Access Token（出厂带默认值，UI 脱敏、可更换）
   cesiumIonToken: string
   // CesiumJS 场景注记显隐（三维地名 eva）
@@ -162,6 +166,9 @@ const DEFAULT_MAP_SETTINGS: UserMapSettings = {
   amapApiKey: '',
   tiandituApiKey: DEFAULT_TIANDITU_KEY,
   tiandituAnnotations: { vector: true, image: true, terrain: true },
+  // 影像注记默认开（高德卫星图本身没有注记，不开就是一张"没地名"的影像）；
+  // 矢量注记默认关：高德矢量底图已把路网注记烘进底图，叠加只会重复描一遍
+  amapAnnotations: { vector: false, image: true },
   cesiumIonToken: DEFAULT_CESIUM_ION_TOKEN,
   cesiumAnnotations: { placeName: true },
   cesiumBuildingStyle: 'material',
@@ -216,6 +223,7 @@ interface MapState {
   setMapSource: (source: MapSource) => void
   /** 天地图注记图层显隐（局部合并） */
   setTiandituAnnotation: (key: keyof TiandituAnnotations, visible: boolean) => void
+  setAmapAnnotation: (key: keyof AmapAnnotations, visible: boolean) => void
   /** CesiumJS 场景注记显隐（目前只有三维地名） */
   setCesiumPlaceNameVisible: (visible: boolean) => void
   /** CesiumJS 建筑着色方式 */
@@ -493,6 +501,16 @@ export const useMapStore = create<MapState>()(
         scheduleBackendSync(get())
       },
 
+      setAmapAnnotation: (key, visible) => {
+        set((state) => ({
+          mapSettings: {
+            ...state.mapSettings,
+            amapAnnotations: { ...state.mapSettings.amapAnnotations, [key]: visible },
+          },
+        }))
+        scheduleBackendSync(get())
+      },
+
       setCesiumBuildingStyle: (style) => {
         set((state) => ({
           mapSettings: { ...state.mapSettings, cesiumBuildingStyle: style },
@@ -744,6 +762,10 @@ export const useMapStore = create<MapState>()(
                   ...state.mapSettings.tiandituAnnotations,
                   ...serverMapSettings.tiandituAnnotations,
                 },
+                amapAnnotations: {
+                  ...state.mapSettings.amapAnnotations,
+                  ...serverMapSettings.amapAnnotations,
+                },
                 cesiumAnnotations: {
                   ...state.mapSettings.cesiumAnnotations,
                   ...serverMapSettings.cesiumAnnotations,
@@ -816,6 +838,10 @@ export const useMapStore = create<MapState>()(
             tiandituAnnotations: {
               ...currentState.mapSettings.tiandituAnnotations,
               ...persistedSettings?.tiandituAnnotations,
+            },
+            amapAnnotations: {
+              ...currentState.mapSettings.amapAnnotations,
+              ...persistedSettings?.amapAnnotations,
             },
             cesiumAnnotations: {
               ...currentState.mapSettings.cesiumAnnotations,

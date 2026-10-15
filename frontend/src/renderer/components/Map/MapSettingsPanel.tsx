@@ -169,7 +169,7 @@ export function MapSettingsPanel({
 }: MapSettingsPanelProps) {
   const { t } = useTranslation()
   const {
-    mapSettings, setMapSettings, setTiandituAnnotation,
+    mapSettings, setMapSettings, setTiandituAnnotation, setAmapAnnotation,
     setCesiumPlaceNameVisible, setCesiumBuildingStyle, setCesiumQuality,
   } = useMapStore()
 
@@ -237,6 +237,26 @@ export function MapSettingsPanel({
               <p className="text-[10px] text-muted-foreground leading-relaxed">
                 {t('map.amapKeyHint') || '高德瓦片默认免 Key，可留空；如需使用自己的 Key 可在此填写。'}
               </p>
+
+              <div className="space-y-0.5 border-t border-border pt-3">
+                <div className="text-[11px] text-muted-foreground mb-1">
+                  {t('map.annotationLayer') || '注记图层'}
+                </div>
+                <ToggleRow
+                  label={t('map.annotationVector') || '矢量注记'}
+                  checked={mapSettings.amapAnnotations.vector}
+                  onChange={(v) => setAmapAnnotation('vector', v)}
+                />
+                <ToggleRow
+                  label={t('map.annotationImage') || '影像注记'}
+                  checked={mapSettings.amapAnnotations.image}
+                  onChange={(v) => setAmapAnnotation('image', v)}
+                />
+                <p className="text-[10px] text-muted-foreground leading-relaxed pt-1">
+                  {t('map.amapAnnotationHint') ||
+                    '高德卫星影像本身不含任何注记（没有地名/路网），影像注记层是卫星图上注记的唯一来源，默认开启。矢量底图已自带注记，矢量注记开关只是在其上再叠一层路网注记，按需开启。'}
+                </p>
+              </div>
             </div>
           )}
 
@@ -255,7 +275,7 @@ export function MapSettingsPanel({
               />
               <div className="space-y-0.5 border-t border-border pt-3">
                 <div className="text-[11px] text-muted-foreground mb-1">
-                  {t('map.tiandituAnnotation') || '注记图层'}
+                  {t('map.annotationLayer') || '注记图层'}
                 </div>
                 <ToggleRow
                   label={t('map.annotationVector') || '矢量注记'}
@@ -295,7 +315,7 @@ export function MapSettingsPanel({
               />
               <div className="space-y-0.5 border-t border-border pt-3">
                 <div className="text-[11px] text-muted-foreground mb-1">
-                  {t('map.tiandituAnnotation') || '注记图层'}
+                  {t('map.annotationLayer') || '注记图层'}
                 </div>
                 <ToggleRow
                   label={t('map.annotationPlaceName') || '三维地名'}

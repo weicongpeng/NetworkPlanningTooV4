@@ -3682,6 +3682,7 @@ export function MapPage() {
                 mapSource={mapSource}
                 tiandituApiKey={mapSettings.tiandituApiKey}
                 tiandituAnnotations={mapSettings.tiandituAnnotations}
+                amapAnnotations={mapSettings.amapAnnotations}
               />
             )}
 
