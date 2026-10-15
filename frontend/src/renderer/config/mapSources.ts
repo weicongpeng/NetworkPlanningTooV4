@@ -11,7 +11,7 @@
  *   做瓦片偏移补偿（把 GCJ02 网格的瓦片换算成 WGS84 网格的瓦片再取图）；3D 侧 Cesium 本身
  *   就是 WGS84，无需补偿。
  */
-import { gcj02ToWgs84 } from '../utils/coordinate'
+import { gcj02ToWgs84, wgs84ToGcj02 } from '../utils/coordinate'
 
 /** 地图源 */
 export type MapSource =
@@ -56,28 +56,34 @@ export function isCesiumSource(source: MapSource): boolean {
 
 // ===== 高德瓦片 =====
 
-/** 高德栅格瓦片 URL（style=8 矢量 / style=6 卫星） */
+/**
+ * 高德栅格瓦片 URL。
+ *
+ * - 卫星 `style=6`：**纯影像，不含任何注记**（实测返回 JPEG）—— 卫星图上的地名必须靠
+ *   单独的注记层叠加（见 `amapAnnotationTileUrl`）。
+ * - 矢量 `style=8&ltype=11`：**不含文字注记**的矢量底图（实测：道路/绿地/水系都在，
+ *   一个地名都没有）。这样「矢量注记」开关关掉后底图就是干净的；打开时由注记层补上文字，
+ *   与打开前的观感一致。
+ */
 export function amapTileUrl(kind: 'vector' | 'satellite'): string {
   return kind === 'satellite'
     ? 'https://webst02.is.autonavi.com/appmaptile?style=6&x={x}&y={y}&z={z}'
-    : 'https://webrd02.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x={x}&y={y}&z={z}'
+    : 'https://webrd02.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scl=1&style=8&ltype=11&x={x}&y={y}&z={z}'
 }
 
 /**
- * 高德注记（路网 + 地名）叠加瓦片。
+ * 高德注记叠加瓦片：**只含文字与图标（建筑/道路/山体/地铁站等），不含道路线条**。
  *
- * **为什么卫星图原来没有注记**：高德的卫星影像 `style=6` 是一张**不含任何注记**的纯影像
- * （实测返回 JPEG），注记在高德那边是**单独一张透明图层** `style=8`（实测返回 RGBA PNG，
- * 约 54% 像素全透明、15% 半透明，其余是道路与地名），需要由客户端自己叠在影像之上。
- * 而矢量底图 `webrd ... style=8` 已经把这张注记层烘进底图了，所以矢量图一直"看着正常"。
+ * 关键在 `ltype=4`：高德默认的 `style=8`（不带 ltype）是"路网+注记"，线条很密，
+ * 压在卫星影像上会明显遮挡影像；`ltype=4` 才是纯注记层（实测透明像素占比 81.8%，
+ * 而默认的 style=8 只有 54.2%），观感与天地图的影像注记 cia 一致。
  *
  * 注：`wprd` 与 `webst` 两个主机返回的是**同一张**瓦片（实测 md5 一致），这里统一用
- * `webst`（与影像底图同源，少一个域名）。
- *
- * 瓦片本身就是 GCJ02，与本项目的显示链路（工参/图层/装饰都是 GCJ02）直接对齐，无需纠偏。
+ * `webst`（与影像底图同源，少一个域名）。瓦片本身是 GCJ02，与 2D 显示链路直接对齐、
+ * 无需纠偏（3D 里才需要纠偏，见 `amapTileSourceForWgsTile`）。
  */
 export function amapAnnotationTileUrl(): string {
-  return 'https://webst02.is.autonavi.com/appmaptile?style=8&x={x}&y={y}&z={z}'
+  return 'https://webst02.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scl=1&style=8&ltype=4&x={x}&y={y}&z={z}'
 }
 
 /** 高德注记开关（与天地图注记同语义：矢量注记↔矢量图、影像注记↔卫星图） */
@@ -246,4 +252,31 @@ export function tiandituTileSource(
   const wx = Math.floor(px / tileSize)
   const wy = Math.floor(py / tileSize)
   return { wx, wy, offX: px - wx * tileSize, offY: py - wy * tileSize }
+}
+
+/**
+ * 高德瓦片纠偏（3D 用）：一张 **WGS84** 瓦片应当从哪张 **GCJ02** 瓦片的哪个像素开始绘制。
+ *
+ * 与 `tiandituTileSource` **互为反向**：那边解决"2D 显示链路是 GCJ02、天地图是 WGS84"，
+ * 这边解决"3D（Cesium）是 WGS84、高德是 GCJ02"。不纠偏的话，高德底图会相对工参/图层
+ * 整体偏 100~700 米。
+ *
+ * 同 2D 的做法：取 WGS84 瓦片左上角换算到 GCJ02 网格 → 落在哪张 GCJ02 瓦片的哪个像素，
+ * 把该 GCJ02 瓦片按这个偏移画到画布 (0,0)，整张瓦片就与 WGS84 数据对齐了。
+ * （GCJ02 偏移在一张瓦片范围内变化只有几米，远小于 1 像素，所以按左上角取整张偏移即可。）
+ */
+export function amapTileSourceForWgsTile(
+  z: number,
+  x: number,
+  y: number,
+  tileSize = 256,
+): TiandituTileSource {
+  const lngW = tileXToLng(x, z)
+  const latW = tileYToLat(y, z)
+  const [latG, lngG] = wgs84ToGcj02(latW, lngW)
+  const px = lngToTileX(lngG, z) * tileSize
+  const py = latToTileY(latG, z) * tileSize
+  const gx = Math.floor(px / tileSize)
+  const gy = Math.floor(py / tileSize)
+  return { wx: gx, wy: gy, offX: px - gx * tileSize, offY: py - gy * tileSize }
 }

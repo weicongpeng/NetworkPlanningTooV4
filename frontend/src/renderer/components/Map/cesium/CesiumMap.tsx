@@ -55,11 +55,10 @@ import { createCameraMoveProbe } from './cesiumCameraProbe'
 import { useLayerEditStore } from '../../../store/layerEditStore'
 import { useMapDataCacheStore } from '../../../store/mapDataCacheStore'
 import {
-  tiandituTileUrl,
-  TIANDITU_SUBDOMAINS,
-  TIANDITU_NATIVE_MAX_ZOOM,
-  DEFAULT_TIANDITU_KEY,
+  amapTileUrl,
+  amapAnnotationTileUrl,
 } from '../../../config/mapSources'
+import { createAmapImageryProvider } from './amapImageryProvider'
 import {
   CesiumSelectionSession,
   type SelectionTarget,
@@ -120,9 +119,6 @@ function nextPaint(): Promise<void> {
     requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
   })
 }
-
-/** 天地图底图/注记图层编码（3D 底图用影像 img，注记按设置叠加） */
-type CesiumTdtLayer = 'vec' | 'img' | 'cia' | 'cva' | 'cta' | 'eva'
 
 /**
  * 从拾取结果里取出扇区数据。
@@ -211,23 +207,6 @@ function buildGeoDataFeature(
   }
 }
 
-/**
- * 天地图瓦片影像提供器（Cesium）。
- *
- * Cesium 场景本身就是 WGS84，而天地图也是 CGCS2000≈WGS84，**无需 GCJ02 补偿**
- * （与 2D 侧 `OnlineMap` 的瓦片偏移处理不同）。
- */
-function tiandituProvider(C: any, layer: CesiumTdtLayer, key: string): any {
-  return new C.UrlTemplateImageryProvider({
-    url: tiandituTileUrl(layer, key || DEFAULT_TIANDITU_KEY),
-    subdomains: TIANDITU_SUBDOMAINS,
-    // 只请求服务端真实存在的层级（18）；19-20 级由 Cesium 拉伸 18 级瓦片显示。
-    // 若请求不存在的 19/20 级，Cesium 会持续报"获取影像瓦片失败"且那一级没有像素。
-    maximumLevel: TIANDITU_NATIVE_MAX_ZOOM,
-    credit: '天地图',
-  })
-}
-
 /** 扇区颜色设置（默认设置/PCI 渲染） */
 interface SectorColorSettings {
   fillOpacity?: number
@@ -251,7 +230,19 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
   const heatTokenRef = useRef<Map<string, number>>(new Map())
   /** 上次请求渲染时的设置指纹（用于跳过"设置没变且已画出来"的重复重算） */
   const heatReqRef = useRef<Map<string, string>>(new Map())
-  // 天地图注记影像层（只清理自己创建的，避免误删热力面等其它 imagery 层）
+  /**
+   * 3D 底图层（高德卫星/矢量）与其当前类型。
+   * Cesium 的 imageryLayers.get(0) 是底图，热力面等其它 imagery 层挂在它之上；
+   * 换底图时必须只替换这一层（不能 removeAll，否则热力面会被一起清掉）。
+   */
+  const baseImageryLayerRef = useRef<any>(null)
+  /** 期望的底图类型（由地图类型切换设置） */
+  const baseKindRef = useRef<'satellite' | 'roadmap'>('satellite')
+  /** 已经建好的底图类型（与期望不同才重建底图） */
+  const appliedBaseKindRef = useRef<'satellite' | 'roadmap' | null>(null)
+  /** 底图类型切换的触发计数（ref API 里 setMapType 改动 ref 后靠它触发重建） */
+  const [baseKindVersion, setBaseKindVersion] = useState(0)
+  // 高德注记影像层（只清理自己创建的，避免误删热力面等其它 imagery 层）
   const annotationLayersRef = useRef<any[]>([])
   // 正在渲染热力面的图层数（>0 时在地图中央显示动画标记）
   const [heatmapBusy, setHeatmapBusy] = useState(0)
@@ -945,9 +936,11 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
         C.Ion.defaultAccessToken = mapSettingsRef.current.cesiumIonToken
 
         const viewer = new C.Viewer(container, {
-          // 底图：天地图影像（原为 Cesium ion 的 Bing 影像）
+          // 底图：高德卫星影像（原为天地图影像）。
+          // 高德瓦片是 GCJ02 而 Cesium 场景是 WGS84，必须走 createAmapImageryProvider
+          // 做瓦片级纠偏，否则底图会相对工参/图层整体偏 100~700 米
           baseLayer: new C.ImageryLayer(
-            tiandituProvider(C, 'img', mapSettingsRef.current.tiandituApiKey)),
+            createAmapImageryProvider(C, amapTileUrl('satellite'))),
           terrain: C.Terrain.fromWorldTerrain(),
           animation: false,
           timeline: false,
@@ -962,6 +955,10 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
         })
         if (disposed) { viewer.destroy(); return }
         viewerRef.current = viewer
+        // 记录底图层（imageryLayers[0] = 构造时传入的 baseLayer）：
+        // 后续换底图只替换这一层，不 removeAll（否则会清掉热力面等 imagery 层）
+        baseImageryLayerRef.current = viewer.imageryLayers.get(0)
+        appliedBaseKindRef.current = 'satellite'
         // 调试钩子：暴露 viewer 与编辑 store，便于外部检查 3D 场景/编辑状态
         const winHook = window as unknown as Record<string, unknown>
         winHook.__nptCesiumViewer = viewer
@@ -1405,47 +1402,58 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
   }, [ready])
 
   /**
-   * 天地图注记叠加层同步（影像注记 cia / 矢量注记 cva / 地形注记 cta）+ 三维地名 eva。
-   * 底图恒为 imageryLayers[0]，注记全部挂在它上面；设置变化时整体重建（层数很少，代价可忽略）。
+   * 3D 底图与注记（高德）。
+   *
+   * - **底图**：高德卫星影像（`webst style=6`）。原为天地图影像，按要求换成高德；
+   *   高德瓦片是 GCJ02 而 Cesium 场景是 WGS84，所以统一走 `createAmapImageryProvider`
+   *   做瓦片级纠偏（否则底图会相对工参/图层整体偏 100~700 米）。
+   * - **注记**：高德注记层（`ltype=4`，纯文字/图标、不含道路线条），开关沿用
+   *   设置 → 高德页签的「矢量注记 / 影像注记」，与 2D 同一口径
+   *   （矢量注记↔矢量底图、影像注记↔卫星影像）。
+   * - 天地图那套注记（cia/cva/cta/eva）与 3D 的关联已取消，这里不再读取天地图设置。
    */
   useEffect(() => {
     if (!ready) return
     const viewer = viewerRef.current
     const C = (window as any).Cesium
     if (!viewer || !C) return
-
-    const key = mapSettings.tiandituApiKey
-    const ann = mapSettings.tiandituAnnotations
     const layers = viewer.imageryLayers
+    const kind = baseKindRef.current
 
-    // 只移除**本效应自己创建的**注记层（destroy=true 释放瓦片资源）。
-    // 不能"删掉除底图外的所有层"——那会把热力面等其它 imagery 层一起清掉。
+    // ① 底图：类型变了才换（先加新的、再删旧的，避免中间空一帧）
+    if (!baseImageryLayerRef.current || appliedBaseKindRef.current !== kind) {
+      try {
+        const next = layers.addImageryProvider(
+          createAmapImageryProvider(C, amapTileUrl(kind === 'satellite' ? 'satellite' : 'vector')),
+          0,
+        )
+        const old = baseImageryLayerRef.current
+        baseImageryLayerRef.current = next
+        appliedBaseKindRef.current = kind
+        if (old) { try { layers.remove(old, true) } catch { /* ignore */ } }
+      } catch (e) {
+        console.warn('[CesiumMap] 底图加载失败:', e)
+      }
+    }
+
+    // ② 注记层：整体重建（层数很少，代价可忽略）。
+    // 只移除**本效应自己创建的**层，不能"删掉除底图外的所有层"——那会清掉热力面等 imagery 层。
     for (const l of annotationLayersRef.current) {
       try { layers.remove(l, true) } catch { /* ignore */ }
     }
     annotationLayersRef.current = []
-
-    // 3D 底图是天地图**影像**，所以只叠影像注记（矢量注记/地形注记与影像底图不匹配，不渲染），
-    // 与 2D 侧的「只渲染与当前底图匹配的注记」规则一致
-    const wanted: Array<[CesiumTdtLayer, boolean]> = [
-      ['cia', !!ann?.image],
-      ['eva', !!props.cesiumPlaceNameVisible],
-    ]
-    for (const [code, on] of wanted) {
-      if (!on) continue
+    const ann = mapSettings.amapAnnotations
+    const wantAnnotation = kind === 'satellite' ? !!ann?.image : !!ann?.vector
+    if (wantAnnotation) {
       try {
-        annotationLayersRef.current.push(layers.addImageryProvider(tiandituProvider(C, code, key)))
+        annotationLayersRef.current.push(layers.addImageryProvider(
+          createAmapImageryProvider(C, amapAnnotationTileUrl(), { hasAlpha: true })))
       } catch (e) {
-        console.warn('[CesiumMap] 注记图层加载失败:', code, e)
+        console.warn('[CesiumMap] 注记图层加载失败:', e)
       }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [
-    ready,
-    mapSettings.tiandituApiKey,
-    mapSettings.tiandituAnnotations,
-    props.cesiumPlaceNameVisible,
-  ])
+  }, [ready, baseKindVersion, mapSettings.amapAnnotations])
 
   // 暴露当前图层文件给编辑会话（打开现有图层编辑时据此查找 dataId/sourceType）
   useEffect(() => {
@@ -1548,18 +1556,10 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
       setMapInfoLayerVisibility: noop,
       refreshLayerData: noopAsync,
       setMapType: (type) => {
-        const viewer = viewerRef.current
-        if (!viewer) return
-        const C = (window as any).Cesium
-        const code: CesiumTdtLayer = type === 'satellite' ? 'img' : 'vec'
-        // 天地图矢量图在 3D 下没有底图注记会很难看，矢量底图直接叠 cva
-        viewer.imageryLayers.removeAll()
-        viewer.imageryLayers.addImageryProvider(
-          tiandituProvider(C, code, mapSettingsRef.current.tiandituApiKey))
-        if (type === 'roadmap') {
-          viewer.imageryLayers.addImageryProvider(
-            tiandituProvider(C, 'cva', mapSettingsRef.current.tiandituApiKey))
-        }
+        // 3D 底图在高德卫星 / 高德矢量之间切换；注记层随之切换（见上方底图与注记的 effect）。
+        // 这里只改"期望类型"再触发重建 —— 不再 removeAll（那会把热力面等 imagery 层一起清掉）
+        baseKindRef.current = type === 'satellite' ? 'satellite' : 'roadmap'
+        setBaseKindVersion((v) => v + 1)
       },
       setLayerFileLabelVisibility: noop,
       setLayerColorSettings: noop,

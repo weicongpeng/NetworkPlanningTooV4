@@ -3647,7 +3647,6 @@ export function MapPage() {
                 mapSource={mapSource}
                 tiandituApiKey={mapSettings.tiandituApiKey}
                 tiandituAnnotations={mapSettings.tiandituAnnotations}
-                cesiumPlaceNameVisible={mapSettings.cesiumAnnotations.placeName}
               />
             ) : (
               <OnlineMap

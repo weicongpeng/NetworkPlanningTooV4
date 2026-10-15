@@ -18,6 +18,7 @@ import {
   TIANDITU_NATIVE_MAX_ZOOM,
   amapAnnotationTileUrl,
   isAmapAnnotationApplicable,
+  amapTileSourceForWgsTile,
 } from '../mapSources'
 import { gcj02ToWgs84 } from '../../utils/coordinate'
 
@@ -200,15 +201,25 @@ describe('天地图缩放上限：可缩放到 20，但只请求真实存在的�
 })
 
 describe('高德注记叠加层', () => {
-  it('注记瓦片 URL：style=8 透明路网注记，且带 {x}/{y}/{z} 占位符', () => {
+  it('注记瓦片 URL：style=8 且 ltype=4（纯文字/图标，不含道路线条）', () => {
     const url = amapAnnotationTileUrl()
     expect(url).toContain('style=8')
-    expect(url).toContain('{x}').valueOf()
+    // ltype=4 才是纯注记层（不带 ltype 的是"路网+注记"，线条太密会遮挡影像）
+    expect(url).toContain('ltype=4')
+    expect(url).toContain('{x}')
     expect(url).toContain('{y}')
     expect(url).toContain('{z}')
     // 与卫星底图（style=6）必须是两张不同的瓦片，否则叠加没有意义
     expect(url).not.toBe(amapTileUrl('satellite'))
     expect(amapTileUrl('satellite')).toContain('style=6')
+  })
+
+  it('矢量底图取无注记版（ltype=11）：关掉「矢量注记」后底图才是干净的', () => {
+    const url = amapTileUrl('vector')
+    expect(url).toContain('style=8')
+    expect(url).toContain('ltype=11')
+    // 底图与注记层是两个不同的 URL（一个无注记、一个只有注记）
+    expect(url).not.toBe(amapAnnotationTileUrl())
   })
 
   it('注记只在与它匹配的高德底图上生效（与天地图同口径）', () => {
@@ -223,5 +234,27 @@ describe('高德注记叠加层', () => {
       expect(isAmapAnnotationApplicable('image', src)).toBe(false)
       expect(isAmapAnnotationApplicable('vector', src)).toBe(false)
     }
+  })
+})
+
+describe('高德瓦片纠偏（3D）：WGS84 瓦片 → GCJ02 源', () => {
+  it('返回的源瓦片与偏移能把 WGS84 瓦片对齐（偏移量 < 一张瓦片）', () => {
+    const src = amapTileSourceForWgsTile(14, 13382, 7138)
+    expect(src.offX).toBeGreaterThanOrEqual(0)
+    expect(src.offX).toBeLessThan(256)
+    expect(src.offY).toBeGreaterThanOrEqual(0)
+    expect(src.offY).toBeLessThan(256)
+    // 深圳一带 GCJ02 相对 WGS84 是"向东北"偏，所以源瓦片不会跑到西/南边去
+    expect(Number.isFinite(src.wx)).toBe(true)
+    expect(Number.isFinite(src.wy)).toBe(true)
+  })
+
+  it('与 2D 的天地图纠偏互为反向（同一位置两套换算各自自洽）', () => {
+    // 2D：GCJ02 瓦片 → WGS84 源；3D：WGS84 瓦片 → GCJ02 源。
+    // 取 2D 的源瓦片，反算回 3D 时应当落在原瓦片附近（±1 张瓦片内）
+    const tdt = tiandituTileSource(14, 13382, 7138)
+    const back = amapTileSourceForWgsTile(14, tdt.wx, tdt.wy)
+    expect(Math.abs(back.wx - 13382)).toBeLessThanOrEqual(1)
+    expect(Math.abs(back.wy - 7138)).toBeLessThanOrEqual(1)
   })
 })

@@ -103,7 +103,6 @@ export interface UserMapSettings {
   // Cesium ion Access Token（出厂带默认值，UI 脱敏、可更换）
   cesiumIonToken: string
   // CesiumJS 场景注记显隐（三维地名 eva）
-  cesiumAnnotations: { placeName: boolean }
   /** CesiumJS 建筑样式：按材料着色 / 按高度着色 / 隐藏 20m 以下 / 默认 */
   cesiumBuildingStyle: CesiumBuildingStyle
   /** CesiumJS 3D 清晰度档位 */
@@ -166,11 +165,10 @@ const DEFAULT_MAP_SETTINGS: UserMapSettings = {
   amapApiKey: '',
   tiandituApiKey: DEFAULT_TIANDITU_KEY,
   tiandituAnnotations: { vector: true, image: true, terrain: true },
-  // 影像注记默认开（高德卫星图本身没有注记，不开就是一张"没地名"的影像）；
-  // 矢量注记默认关：高德矢量底图已把路网注记烘进底图，叠加只会重复描一遍
-  amapAnnotations: { vector: false, image: true },
+  // 两个都默认开：底图本身都不带注记（矢量底图用 ltype=11 的无注记版、卫星是纯影像），
+  // 注记全靠注记层叠加 —— 关掉对应开关即得到"干净的底图"
+  amapAnnotations: { vector: true, image: true },
   cesiumIonToken: DEFAULT_CESIUM_ION_TOKEN,
-  cesiumAnnotations: { placeName: true },
   cesiumBuildingStyle: 'material',
   cesiumQuality: 'smooth',
   labelSettingsMap: {},
@@ -225,7 +223,6 @@ interface MapState {
   setTiandituAnnotation: (key: keyof TiandituAnnotations, visible: boolean) => void
   setAmapAnnotation: (key: keyof AmapAnnotations, visible: boolean) => void
   /** CesiumJS 场景注记显隐（目前只有三维地名） */
-  setCesiumPlaceNameVisible: (visible: boolean) => void
   /** CesiumJS 建筑着色方式 */
   setCesiumBuildingStyle: (style: CesiumBuildingStyle) => void
   /** CesiumJS 3D 清晰度档位 */
@@ -525,15 +522,6 @@ export const useMapStore = create<MapState>()(
         scheduleBackendSync(get())
       },
 
-      setCesiumPlaceNameVisible: (visible) => {
-        set((state) => ({
-          mapSettings: {
-            ...state.mapSettings,
-            cesiumAnnotations: { ...state.mapSettings.cesiumAnnotations, placeName: visible },
-          },
-        }))
-        scheduleBackendSync(get())
-      },
 
       setSectorLabelVisibility: (layer, visible) => {
         set((state) => ({
@@ -766,10 +754,6 @@ export const useMapStore = create<MapState>()(
                   ...state.mapSettings.amapAnnotations,
                   ...serverMapSettings.amapAnnotations,
                 },
-                cesiumAnnotations: {
-                  ...state.mapSettings.cesiumAnnotations,
-                  ...serverMapSettings.cesiumAnnotations,
-                },
                 cesiumBuildingStyle:
                   serverMapSettings.cesiumBuildingStyle ?? state.mapSettings.cesiumBuildingStyle,
                 cesiumQuality:
@@ -842,10 +826,6 @@ export const useMapStore = create<MapState>()(
             amapAnnotations: {
               ...currentState.mapSettings.amapAnnotations,
               ...persistedSettings?.amapAnnotations,
-            },
-            cesiumAnnotations: {
-              ...currentState.mapSettings.cesiumAnnotations,
-              ...persistedSettings?.cesiumAnnotations,
             },
             cesiumBuildingStyle:
               persistedSettings?.cesiumBuildingStyle ?? currentState.mapSettings.cesiumBuildingStyle,

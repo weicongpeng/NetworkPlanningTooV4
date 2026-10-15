@@ -337,8 +337,6 @@ interface OnlineMapProps {
   tiandituAnnotations?: TiandituAnnotations
   /** 高德注记叠加层显隐（矢量注记 / 影像注记）：高德卫星影像本身不含注记，靠它叠加 */
   amapAnnotations?: AmapAnnotations
-  /** CesiumJS 场景注记：三维地名（仅 3D 地图生效） */
-  cesiumPlaceNameVisible?: boolean
 }
 
 /**
@@ -520,7 +518,7 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
   mapSource = 'amap-vector',
   tiandituApiKey = DEFAULT_TIANDITU_KEY,
   tiandituAnnotations = { vector: true, image: true, terrain: true },
-  amapAnnotations = { vector: false, image: true },
+  amapAnnotations = { vector: true, image: true },
 }, ref) => {
   // Refs
   const customLayerRefs = useRef<Record<string, L.LayerGroup | L.FeatureGroup>>({})

@@ -170,7 +170,7 @@ export function MapSettingsPanel({
   const { t } = useTranslation()
   const {
     mapSettings, setMapSettings, setTiandituAnnotation, setAmapAnnotation,
-    setCesiumPlaceNameVisible, setCesiumBuildingStyle, setCesiumQuality,
+    setCesiumBuildingStyle, setCesiumQuality,
   } = useMapStore()
 
   // 配置页签：默认跟随当前地图源对应的引擎（3D / 空地图落到 CesiumJS / 高德）
@@ -254,7 +254,7 @@ export function MapSettingsPanel({
                 />
                 <p className="text-[10px] text-muted-foreground leading-relaxed pt-1">
                   {t('map.amapAnnotationHint') ||
-                    '高德卫星影像本身不含任何注记（没有地名/路网），影像注记层是卫星图上注记的唯一来源，默认开启。矢量底图已自带注记，矢量注记开关只是在其上再叠一层路网注记，按需开启。'}
+                    '高德底图本身都不含注记（卫星是纯影像、矢量底图取的是无注记版），注记由注记层叠加，两个开关默认都开；关掉对应开关即得到一张干净的底图。注记层只含文字与图标（建筑/道路/山体/站点等），不含道路线条，不会遮挡影像。'}
                 </p>
               </div>
             </div>
@@ -313,17 +313,6 @@ export function MapSettingsPanel({
                 restoreLabel={t('map.restoreDefaultToken') || '恢复默认 Token'}
                 onChange={(v) => setMapSettings({ cesiumIonToken: v })}
               />
-              <div className="space-y-0.5 border-t border-border pt-3">
-                <div className="text-[11px] text-muted-foreground mb-1">
-                  {t('map.annotationLayer') || '注记图层'}
-                </div>
-                <ToggleRow
-                  label={t('map.annotationPlaceName') || '三维地名'}
-                  checked={mapSettings.cesiumAnnotations.placeName}
-                  onChange={setCesiumPlaceNameVisible}
-                />
-              </div>
-
               {/* 建筑样式（原为地图右上角悬浮下拉，统一收到这里） */}
               <div className="space-y-1.5 border-t border-border pt-3">
                 <div className="text-[11px] text-muted-foreground">
