@@ -50,7 +50,12 @@
     "downloading": "Downloading…",
     "downloadReady": "Download complete; it will install after restart",
     "downloadFailed": "Download failed, please retry",
-    "restartAndInstall": "Restart and install",
+        "restartAndInstall": "Restart and install",
+    "downloadDoneTitle": "Installer downloaded",
+    "targetVersion": "Target version: ",
+    "updateLater": "Update later",
+    "restartUpdate": "Restart & update",
+
     "updateReady": "Update ready — restart to finish updating",
     "restartNow": "Restart now",
     "installing": "Exiting and installing…",

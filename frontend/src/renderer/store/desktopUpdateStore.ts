@@ -10,10 +10,19 @@ interface DesktopUpdateState {
   requested: DesktopUpdateStatus | null
   requestCheck: (status: DesktopUpdateStatus) => void
   clearRequest: () => void
+  /**
+   * 主更新弹窗（DesktopUpdateDialog）当前是否可见。
+   * 后台下载完成时的「重启更新」弹窗据此避让：主弹窗开着就由它自己提示，
+   * 不叠两个对话框。
+   */
+  mainDialogVisible: boolean
+  setMainDialogVisible: (visible: boolean) => void
 }
 
 export const useDesktopUpdateStore = create<DesktopUpdateState>((set) => ({
   requested: null,
   requestCheck: (status) => set({ requested: status }),
   clearRequest: () => set({ requested: null }),
+  mainDialogVisible: false,
+  setMainDialogVisible: (visible) => set({ mainDialogVisible: visible }),
 }))

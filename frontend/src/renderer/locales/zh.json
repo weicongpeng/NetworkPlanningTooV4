@@ -1791,7 +1791,12 @@
     "downloading": "正在下载…",
     "downloadReady": "下载完成，重启后自动安装",
     "downloadFailed": "下载失败，请重试",
-    "restartAndInstall": "重启并安装",
+        "restartAndInstall": "重启并安装",
+    "downloadDoneTitle": "安装包已下载完成",
+    "targetVersion": "待更新版本：",
+    "updateLater": "稍后更新",
+    "restartUpdate": "重启更新",
+
     "updateReady": "更新已就绪，重启后完成更新",
     "restartNow": "立即重启",
     "installing": "正在退出并安装…",

@@ -96,6 +96,13 @@ export function DesktopUpdateDialog() {
     }
   }, [check, desktopMode])
 
+  // 把本弹窗的可见性发布到 store：后台下载完成时的「重启更新」弹窗据此避让，
+  // 避免两个更新对话框叠在一起
+  const setMainDialogVisible = useDesktopUpdateStore((s) => s.setMainDialogVisible)
+  useEffect(() => {
+    setMainDialogVisible(visible)
+  }, [visible, setMainDialogVisible])
+
   // 系统设置页点「检查更新」→ 打开本弹窗展示新版本
   useEffect(() => {
     if (!requested) return
@@ -169,8 +176,10 @@ export function DesktopUpdateDialog() {
     setMessage(null)
     try {
       const res: any = await desktopUpdateApi.background()
-      setProgress((prev) => ({ ...prev, phase: res?.data?.phase || prev.phase, }))
-      setMessage(t('desktopUpdate.backgroundArmed'))
+      setProgress((prev) => ({ ...prev, phase: res?.data?.phase || prev.phase }))
+      // 关窗：下载与安装转后台，完成后由 DesktopUpdateReadyDialog 弹「重启更新」
+      setVisible(false)
+      setMessage(null)
     } catch (err: any) {
       setMessage(err?.message || t('desktopUpdate.backgroundFailed'))
     } finally {

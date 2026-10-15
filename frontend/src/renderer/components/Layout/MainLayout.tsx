@@ -30,6 +30,7 @@ import { useThemeStore } from '../../store/themeStore'
 import { reloadUserMapSettings } from '../../store/mapStore'
 import { Toaster } from './Toaster'
 import { DesktopUpdateDialog } from '../DesktopUpdateDialog'
+import { DesktopUpdateReadyDialog } from '../DesktopUpdateReadyDialog'
 import { DesktopSyncIndicator } from '../DesktopSyncIndicator'
 import { useDesktopStatusLabel } from '../desktopStatusLabel'
 import { DesktopSessionGuard } from '../DesktopSessionGuard'
@@ -869,6 +870,8 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
       <Toaster />
       {/* 桌面版 OTA 更新提示（网页端自动静默：接口 404） */}
       <DesktopUpdateDialog />
+      {/* 后台下载完成后的「重启更新 / 稍后更新」提示 */}
+      <DesktopUpdateReadyDialog />
     </div>
   )
 }
