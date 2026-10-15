@@ -1626,6 +1626,15 @@ export function LabelSettingsModal({
   /** 预览"已下发基线"签名：用来打断 下发→重渲染→再下发 的自激循环 */
   const previewBaselineRef = useRef('')
   /**
+   * 预览的**页签基线**：切到某个页签时只记录当前签名、**不下发**。
+   *
+   * 没有它时，"打开弹窗 → 点开颜色页签"就会把弹窗里的默认配色当成一次实时预览写到
+   * 地图上（并写进 store）—— 用户并没有保存任何设置，地图配色却变了（用户明确要求
+   * "没保存设置时地图原配色不能改变"）。实时预览语义保留：只有**在同一页签内**改动
+   * 控件才下发。
+   */
+  const previewTabBaselineRef = useRef<{ kind: string; sig: string }>({ kind: '', sig: '' })
+  /**
    * 打开后的"初始化抑制"：props→表单 的同步 effect（及 fieldOptions 到达后的自动
    * 选字段）会程序化改变签名，抑制期内只把签名吸收进基线、不下发，保证打开瞬间
    * 不改变地图/不冒标签。
@@ -1637,11 +1646,14 @@ export function LabelSettingsModal({
     if (isOpen) {
       previewSuppressRef.current = true
       previewBaselineRef.current = previewSig(buildPreviewTarget())
+      // 页签基线清空：打开后第一次评估只记录（切页/初始化都不下发）
+      previewTabBaselineRef.current = { kind: '', sig: '' }
       const release = window.setTimeout(() => { previewSuppressRef.current = false }, 350)
       return () => window.clearTimeout(release)
     }
     previewSuppressRef.current = false
     previewBaselineRef.current = ''
+    previewTabBaselineRef.current = { kind: '', sig: '' }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isOpen])
 
@@ -1651,6 +1663,13 @@ export function LabelSettingsModal({
     if (!isOpen) return
     const target = buildPreviewTarget()
     const sig = previewSig(target)
+    // 换了页签（或打开后的首次评估）：只记录基线，不下发 —— 见 previewTabBaselineRef 注释
+    const tab = previewTabBaselineRef.current
+    if (tab.kind !== target.kind) {
+      previewTabBaselineRef.current = { kind: target.kind, sig }
+      previewBaselineRef.current = sig
+      return
+    }
     if (sig === previewBaselineRef.current) return
     previewBaselineRef.current = sig
     if (previewSuppressRef.current) return

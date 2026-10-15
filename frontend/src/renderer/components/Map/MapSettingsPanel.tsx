@@ -252,10 +252,6 @@ export function MapSettingsPanel({
                   checked={mapSettings.amapAnnotations.image}
                   onChange={(v) => setAmapAnnotation('image', v)}
                 />
-                <p className="text-[10px] text-muted-foreground leading-relaxed pt-1">
-                  {t('map.amapAnnotationHint') ||
-                    '高德底图本身都不含注记（卫星是纯影像、矢量底图取的是无注记版），注记由注记层叠加，两个开关默认都开；关掉对应开关即得到一张干净的底图。注记层只含文字与图标（建筑/道路/山体/站点等），不含道路线条，不会遮挡影像。'}
-                </p>
               </div>
             </div>
           )}
@@ -292,10 +288,6 @@ export function MapSettingsPanel({
                   checked={mapSettings.tiandituAnnotations.terrain}
                   onChange={(v) => setTiandituAnnotation('terrain', v)}
                 />
-                <p className="text-[10px] text-muted-foreground leading-relaxed pt-1">
-                  {t('map.annotationMatchHint') ||
-                    '注记只在对应的天地图底图上显示：矢量注记→矢量图，影像注记→卫星图。当前下拉没有地形底图，地形注记暂不显示。'}
-                </p>
               </div>
             </div>
           )}

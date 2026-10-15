@@ -73,7 +73,8 @@ const DEFAULT_SECTOR_STYLE = {
   color: '#000000',
   weight: 2,
   opacity: 1,
-  fillOpacity: 0.6
+  // 默认不透明度 100%（用户要求：地图上所有图形的默认不透明度都是 100%）
+  fillOpacity: 1
 }
 
 const DEFAULT_POLYGON_STYLE = {
@@ -81,7 +82,8 @@ const DEFAULT_POLYGON_STYLE = {
   color: '#000000',
   weight: 2,
   opacity: 1,
-  fillOpacity: 0.5
+  // 默认不透明度 100%（同上）
+  fillOpacity: 1
 }
 
 // LOD 阈值

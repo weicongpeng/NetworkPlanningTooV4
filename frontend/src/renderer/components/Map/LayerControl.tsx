@@ -352,6 +352,13 @@ export interface LayerControlProps {
 /**
  * 图层控制组件 - 树形结构
  */
+/** 图层文件按几何类型的默认填充色（与 2D `MapInfoLayer.DEFAULT_STYLES` 对齐） */
+const KIND_DEFAULT_FILL: Record<string, string> = {
+  point: '#f59e0b',
+  line: '#8b5cf6',
+  polygon: '#10b981',
+}
+
 export function LayerControl({
   sectors = [],
   layerFiles = [],
@@ -1238,8 +1245,12 @@ export function LayerControl({
           pciRenderEnabled: false,
           pciMod: node.sectorLayer?.type === 'NR' ? 30 : 3
         } : {
-          fillColor: ds?.fillColor || ds?.markerColor || '#3b82f6',
-          fillOpacity: ds?.fillOpacity ?? 0.6,
+          // 默认填充色/不透明度与地图**实际渲染**的默认值对齐（MapInfoLayer.DEFAULT_STYLES）：
+          // 否则"打开弹窗→切到颜色页签"会把弹窗里的默认值当成一次实时预览写到地图上，
+          // 用户并没有保存设置，地图配色却变了（用户明确要求没保存就不能改地图配色）。
+          // 默认不透明度 100%（用户要求：所有图形默认不透明度都是 100%）
+          fillColor: ds?.fillColor || ds?.markerColor || KIND_DEFAULT_FILL[geomType ?? ''] || '#3b82f6',
+          fillOpacity: ds?.fillOpacity ?? 1,
           borderWidth: ds?.strokeWidth ?? 2,
           // 点/面图层边框颜色默认无色（不描边）；线图层无边框色项，strokeColor 作为
           // 线色种子（弹窗内映射到"图形颜色"，兼容旧版本线色语义）

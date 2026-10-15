@@ -57,13 +57,13 @@ interface FeatureStyle {
 
 type GeomKind = 'point' | 'line' | 'polygon'
 
-/** 与 2D `MapInfoLayer.DEFAULT_STYLES` 一致的默认值 */
+/** 与 2D `MapInfoLayer.DEFAULT_STYLES` 一致的默认值（填充不透明度一律 100%） */
 const DEFAULT_BY_KIND: Record<GeomKind, {
   fill: string; stroke: string; width: number; fillOpacity: number; pointSize: number
 }> = {
-  point: { fill: '#f59e0b', stroke: NO_FILL_COLOR, width: 2, fillOpacity: 0.8, pointSize: 6 },
+  point: { fill: '#f59e0b', stroke: NO_FILL_COLOR, width: 2, fillOpacity: 1, pointSize: 6 },
   line: { fill: '#8b5cf6', stroke: '#8b5cf6', width: 3, fillOpacity: 1, pointSize: 0 },
-  polygon: { fill: '#10b981', stroke: '#10b981', width: 2, fillOpacity: 0.3, pointSize: 0 },
+  polygon: { fill: '#10b981', stroke: '#10b981', width: 2, fillOpacity: 1, pointSize: 0 },
 }
 
 /** 单要素最终配色 */

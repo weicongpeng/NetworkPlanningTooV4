@@ -86,13 +86,14 @@ export interface MapInfoLayerStyle {
  * 若默认给白色描边，缩小时白边会盖住图形本体颜色
  */
 const DEFAULT_STYLES: Record<LayerGeometryType, any> = {
+  // 填充不透明度一律 100%（用户要求：地图上所有图形的默认不透明度都是 100%）
   point: {
     radius: 6,
     fillColor: '#f59e0b',
     color: NO_FILL_COLOR,
     weight: 2,
     opacity: 1,
-    fillOpacity: 0.8
+    fillOpacity: 1
   },
   line: {
     color: '#8b5cf6',
@@ -104,7 +105,7 @@ const DEFAULT_STYLES: Record<LayerGeometryType, any> = {
     weight: 2,
     opacity: 1,
     fillColor: '#10b981',
-    fillOpacity: 0.3
+    fillOpacity: 1
   }
 }
 
@@ -696,7 +697,7 @@ export class MapInfoLayer {
             weight: mergedStyle.weight || 2,
             opacity: mergedStyle.opacity !== undefined ? mergedStyle.opacity : 1,
             fillColor: mergedStyle.fillColor || '#10b981',
-            fillOpacity: noFill ? 0 : (mergedStyle.fillOpacity || 0.3)
+            fillOpacity: noFill ? 0 : (mergedStyle.fillOpacity || 1)
           }
           // 面状图层：专题"边框宽度"设置优先（专题启用时）
           if (mapInfoLayer.thematicSettings?.enabled && mapInfoLayer.thematicSettings.pointSize) {
