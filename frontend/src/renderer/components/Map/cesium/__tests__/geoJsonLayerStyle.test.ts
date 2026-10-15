@@ -198,6 +198,37 @@ describe('CesiumGeoJsonLayer 要素配色（_style 还原）', () => {
     expect(fillColorOf(primitives).css).toBe('#10b981')
   })
 
+  /**
+   * 默认不透明度必须是 100%（用户要求：地图上所有图形的默认不透明度都是 100%）。
+   * 早先面默认 0.3、点默认 0.8，与 2D 改后的口径不一致，且"打开自定义设置不保存"
+   * 时会把弹窗默认值写上去，导致地图配色悄悄变化。
+   */
+  it('默认填充不透明度 100%（面/点/线，无 _style 无用户设置时）', () => {
+    layer.setFeatureCollection({ features: [polygonFeature(undefined)] } as any)
+    expect(fillColorOf(primitives).alpha).toBe(1)
+
+    const mock2 = makeCesiumMock()
+    const layer2 = new CesiumGeoJsonLayer(mock2.C, mock2.viewer, 'layer-2')
+    layer2.setFeatureCollection({
+      features: [{ type: 'Feature', geometry: { type: 'Point', coordinates: [114, 23.7] }, properties: {} }],
+    } as any)
+    const pointColl = mock2.primitives.find((x) => x.kind === 'points')
+    expect(pointColl?.items?.[0]?.color?.alpha).toBe(1)
+  })
+
+  /**
+   * 选中态只改描边色、不铺整面填充（2D `setSelectionHighlight` 同口径）：
+   * 填充 alpha 必须保持要素/默认的 100%，不能出现"选中后变半透明红"的那一层。
+   */
+  it('选中态只改描边色，填充仍是不透明的原填充', () => {
+    layer.setSelectionIds(new Set(['f1']))
+    layer.setFeatureCollection({ features: [polygonFeature(undefined)] } as any)
+    const fill = fillColorOf(primitives)
+    expect(fill.css).toBe('#10b981')
+    expect(fill.alpha).toBe(1)
+    expect(strokeColorOf(primitives).css).toBe('#ef4444')
+  })
+
   it('KML <fill>0</fill>：视觉上只画边框，但保留一个近乎全透明的面图元用于点击命中', () => {
     layer.setFeatureCollection({
       features: [polygonFeature({ fill: false, strokeColor: '#000000' })],

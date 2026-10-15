@@ -359,7 +359,11 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
       const layerId = LAYER_IDS[key]
       const freqList = (key === 'lte' ? p.frequencies?.lte : p.frequencies?.nr) ?? []
       const visibleFreqs = freqList.filter((f) => f.visible).map((f) => f.frequency)
-      const colorSet = colorSettingsRef.current[layerId]
+      // 颜色设置以 store 为准：MapPage 保存配色时只调用 2D 地图的 ref（3D 模式下
+      // onlineMapRef 为 null，命令式路径走不到这里），若只读本地 ref，3D 的基站扇区
+      // 就永远吃不到保存的透明度/边框/PCI 设置（表现为"只有 2D 生效"）。
+      // 本地 ref 保留给命令式 setSectorColorSettings 兜底。
+      const colorSet = ms.colorSettingsMap?.[layerId] ?? colorSettingsRef.current[layerId]
 
       const ctx: SectorStyleContext = {
         colorOverrides: colorSet
@@ -1266,6 +1270,8 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
     props.frequencies,
     props.sectorLabelVisibility,
     props.labelSettingsMap,
+    // 保存配色（不透明度/边框/PCI）必须能推到 3D：与 2D 拉齐
+    mapSettings.colorSettingsMap,
     mapSettings.thematicSettingsMap,
     // 热力设置变化必须能触发重放：3D 侧热力面只在"设置对话框确定"和同步路径里渲染，
     // 不监听它就会出现"保存了配置、切回地图页只剩空图例"。

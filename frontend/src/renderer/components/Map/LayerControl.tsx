@@ -1241,16 +1241,24 @@ export function LayerControl({
         // 基站（扇区）图层默认设置：图形透明度 100%、边框宽度 1px（与 SECTOR_CONFIG 默认渲染一致）；
         // 小区PCI渲染默认关闭，开启后 LTE 默认模3、NR 默认模30
         ? {
-          fillColor: '#3b82f6', fillOpacity: 1, borderWidth: 1, borderColor: '#000000',
+          // 默认填充色按制式取（与 SECTOR_CONFIG 渲染默认一致：LTE 蓝 / NR 绿），
+          // 否则 NR 图层一保存就被刷成蓝色；不透明度 100%、边框 1px 同口径
+          fillColor: node.sectorLayer?.type === 'NR' ? '#10b981' : '#3b82f6',
+          fillOpacity: 1,
+          borderWidth: 1,
+          borderColor: '#000000',
           pciRenderEnabled: false,
           pciMod: node.sectorLayer?.type === 'NR' ? 30 : 3
         } : {
-          // 默认填充色/不透明度与地图**实际渲染**的默认值对齐（MapInfoLayer.DEFAULT_STYLES）：
-          // 否则"打开弹窗→切到颜色页签"会把弹窗里的默认值当成一次实时预览写到地图上，
-          // 用户并没有保存设置，地图配色却变了（用户明确要求没保存就不能改地图配色）。
-          // 默认不透明度 100%（用户要求：所有图形默认不透明度都是 100%）
+          // 默认填充色/不透明度与地图**实际渲染**的默认值对齐（MapInfoLayer.DEFAULT_STYLES /
+          // CesiumGeoJsonLayer.DEFAULT_BY_KIND）：否则"打开弹窗→切到颜色页签"会把弹窗里的
+          // 默认值当成一次实时预览写到地图上，用户并没有保存设置，地图配色却变了
+          // （用户明确要求没保存就不能改地图配色）。
+          // 默认不透明度恒为 100%（用户要求：所有图形默认不透明度都是 100%）——
+          // 注意**不取 `ds.fillOpacity`**：文件自带的 defaultStyle 不参与渲染链
+          // （2D/3D 都不用它出图），把它当初始值只会让弹窗显示 30% 而地图画的是 100%
           fillColor: ds?.fillColor || ds?.markerColor || KIND_DEFAULT_FILL[geomType ?? ''] || '#3b82f6',
-          fillOpacity: ds?.fillOpacity ?? 1,
+          fillOpacity: 1,
           borderWidth: ds?.strokeWidth ?? 2,
           // 点/面图层边框颜色默认无色（不描边）；线图层无边框色项，strokeColor 作为
           // 线色种子（弹窗内映射到"图形颜色"，兼容旧版本线色语义）

@@ -16,6 +16,7 @@ import {
   BASE_SECTOR_RADIUS_M, BASE_SECTOR_BEAMWIDTH_DEG,
 } from '../CesiumSectorLayer'
 import type { CameraView } from '../CesiumSectorLayer'
+import { resolveSectorStyle } from '../cesiumSectorStyle'
 import type { RenderSectorData } from '../../../../services/mapDataService'
 
 /** 只带半径换算所需字段的最小扇区 */
@@ -160,5 +161,26 @@ describe('弧线/圆形采样点数：与高德侧分档一致', () => {
     expect(circlePointsCount(16, false)).toBe(48)
     expect(circlePointsCount(18, false)).toBe(64)
     expect(circlePointsCount(18, true)).toBe(8)
+  })
+})
+
+describe('扇区配色：默认 100% 不透明，用户保存的设置可覆盖', () => {
+  const ctx = (over: Record<string, unknown> | null) => ({
+    colorOverrides: over,
+    pciRender: null,
+    thematic: null,
+  } as any)
+
+  it('无用户设置时填充不透明度 = 100%（SECTOR_CONFIG 默认）', () => {
+    for (const net of ['LTE', 'NR'] as const) {
+      const st = resolveSectorStyle(sector({ networkType: net }), ctx(null))
+      expect(st.fillOpacity).toBe(1)
+    }
+  })
+
+  it('用户保存的不透明度/边框宽度覆盖默认（2D/3D 同口径）', () => {
+    const st = resolveSectorStyle(sector(), ctx({ fillOpacity: 0.6, borderWidth: 3 }))
+    expect(st.fillOpacity).toBe(0.6)
+    expect(st.strokeWidth).toBe(3)
   })
 })
