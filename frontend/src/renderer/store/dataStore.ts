@@ -1,11 +1,10 @@
 import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
 import { dataApi } from '../services/api'
-import { mapApi } from '../services/api'
 import { indexedDBService } from '../services/indexedDBService'
 import type { DataItem, ApiResponse } from '@shared/types'
 import { useTaskStore } from './taskStore'
-import { clearCellListCache, bumpDataVersion } from '../services/mapDataService'
+import { clearCellListCache, bumpDataVersion, mapDataService } from '../services/mapDataService'
 import { userCacheSuffix } from '../utils/cacheKey'
 
 const CACHE_TTL_5MIN = 5 * 60 * 1000
@@ -420,7 +419,10 @@ export const useDataStore = create<DataState>((set, get) => ({
         await get().fetchList(1, 50, true)
         await clearCellListCache()
         bumpDataVersion()
-        try { await mapApi.clearCache() } catch (_) {}
+        // 地图扇区缓存（内存 + IndexedDB 2h）也必须清：只清小区列表缓存时，
+        // 地图页重开仍读到旧扇区数据，新录入的小区不渲染（与上传/删除流程拉齐）
+        try { await mapDataService.clearCache() } catch (_) { /* 清缓存失败不阻断录入 */ }
+        triggerDataRefresh()
         set({ isAddingCell: false })
         return { success: true, message: result.message, data: result.data }
       }
@@ -446,7 +448,10 @@ export const useDataStore = create<DataState>((set, get) => ({
         // 清除所有缓存层，确保小区选择列表能立即看到新数据
         await clearCellListCache()                         // ① 前端 getCellList 缓存（内存 + IndexedDB）
         bumpDataVersion()                                  // ② sessionStorage 版本号（mapDataService 强制刷新）
-        try { await mapApi.clearCache() } catch (_) {}    // ③ 后端 30min 内存缓存
+        // ③ 地图扇区缓存（内存 + IndexedDB 2h）+ 后端 30min 内存缓存：
+        //    只清小区列表缓存时，地图页重开仍读到旧扇区数据，新录入的小区不渲染
+        try { await mapDataService.clearCache() } catch (_) { /* 清缓存失败不阻断录入 */ }
+        triggerDataRefresh()                               // ④ 通知已打开的地图页立即重载
         set({ isAddingCell: false })
         return { success: true, message: result.message, data: result.data }
       }

@@ -221,6 +221,11 @@ async def add_cell(
             current_user.city,
             current_user.operator,
         )
+        # 新站录入改的是全量工参内容：必须失效地图数据缓存（30 分钟 TTL），
+        # 否则地图继续渲染旧数据，新增小区在地图上看不到（上传/删除/批量更新/
+        # 工参更新各路径均已失效，此处曾遗漏）
+        import app.api.v1.endpoints.map as map_module
+        map_module.invalidate_map_data_cache()
         return {"success": True, "message": result.get("message", ""), "data": result}
     except ValueError as e:
         error_msg = str(e).replace("✗", "x")
@@ -272,6 +277,11 @@ async def batch_add_cells(
             current_user.city,
             current_user.operator,
         )
+        # 新站录入改的是全量工参内容：必须失效地图数据缓存（30 分钟 TTL），
+        # 否则地图继续渲染旧数据，新增小区在地图上看不到（上传/删除/批量更新/
+        # 工参更新各路径均已失效，此处曾遗漏）
+        import app.api.v1.endpoints.map as map_module
+        map_module.invalidate_map_data_cache()
         return {
             "success": result.get("success", False),
             "message": result.get("message", ""),
