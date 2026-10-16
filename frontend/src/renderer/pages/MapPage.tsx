@@ -1188,7 +1188,7 @@ export function MapPage() {
     // 用旧 layerFiles 闭包找不到刚创建的新图层而跳过初始化，导致绘制要素无处落地。
     // 几何类型按后端返回值初始化：新建的点/线/面 Shapefile 不能当混合图层用。
     useLayerEditStore.getState().beginEdit(
-      r.layer_id, r.data_id, (r.geometry_type as any) || 'mixed', [], null,
+      r.layer_id, r.data_id, (r.geometry_type as any) || 'mixed', [],
     )
     // 新图层默认可视 + 可选（可编辑图层一定可选择），便于立即绘制并在地图可见
     useMapStore.getState().setLayerFileVisibility(r.layer_id, true)

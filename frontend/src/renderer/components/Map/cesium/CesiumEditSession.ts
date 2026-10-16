@@ -20,7 +20,6 @@ import {
 } from '../../../store/mapStore'
 import { layerApi } from '../../../services/api'
 import { useMapDataCacheStore } from '../../../store/mapDataCacheStore'
-import { NO_FILL_COLOR } from '../../../utils/fieldValue'
 
 /** 装饰图层固定 id / 数据哨兵（与 OnlineMap 一致） */
 const DECORATION_LAYER_ID = 'decoration-layer'
@@ -408,7 +407,7 @@ export class CesiumEditSession {
           if (feats.length > 0) useMapStore.setState({ decorationFeatures: feats })
         }
         store.seedWorkspace(
-          DECORATION_LAYER_ID, DECORATION_DATA_ID, 'mixed', feats, null,
+          DECORATION_LAYER_ID, DECORATION_DATA_ID, 'mixed', feats,
         )
         return
       }
@@ -433,32 +432,11 @@ export class CesiumEditSession {
       }
       if (useLayerEditStore.getState().editableLayerId !== layerId) return
       const features = (geojson?.features || []).map((f: any) => ({ ...f }))
-      const cs = useMapStore.getState().mapSettings.colorSettingsMap?.[layerId] as any
-      const baseStyle = {
-        point: {
-          markerColor: cs?.fillColor,
-          markerRadius: cs?.pointSize,
-          fillOpacity: cs?.fillOpacity,
-          borderColor: cs?.borderColor,
-        },
-        line: {
-          color: cs?.borderColor && cs.borderColor !== NO_FILL_COLOR ? cs.borderColor : cs?.fillColor,
-          weight: cs?.borderWidth,
-          opacity: cs?.fillOpacity,
-        },
-        polygon: {
-          fillColor: cs?.fillColor,
-          fillOpacity: cs?.fillOpacity,
-          borderColor: cs?.borderColor,
-          borderWidth: cs?.borderWidth,
-        },
-      }
       useLayerEditStore.getState().beginEdit(
         layerId,
         lf.dataId,
         geomType as 'point' | 'line' | 'polygon' | 'mixed',
         features,
-        baseStyle,
         { version },
       )
     } catch (e) {

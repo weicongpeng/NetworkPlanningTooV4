@@ -22,7 +22,6 @@ import { mapDataService, RenderSectorData } from '../../services/mapDataService'
 import { CoordinateTransformer } from '../../utils/coordinate'
 import { extractFeatureId } from '../../utils/featureId'
 import { isPolygonGeometry, boundaryOuterRings, mergeById } from '../../services/boundarySelection'
-import { NO_FILL_COLOR } from '../../utils/fieldValue'
 import { cleanUserProperties } from '../../utils/featureProps'
 import { SectorInfoPanel, useSectorInfoPanel } from './SectorInfoPanel'
 import { FeatureInfoPanel, useFeatureInfoPanel } from './FeatureInfoPanel'
@@ -723,7 +722,6 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
         DECORATION_DATA_ID,
         'mixed',
         feats,
-        null,
       )
       return
     }
@@ -750,38 +748,13 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
       }
     }
     const features = (geojson?.features || []).map((f: any) => ({ ...f }))
-    // baseStyle 只承载"用户在图层颜色设置里显式配置过的配色"（与 MapInfoLayer.setStyleOverrides 同口径）。
-    // 不并入图层 defaultStyle：它是"首要素样式/调色板单色"，而 MapInfoLayer 渲染时根本不使用它
-    // （逐要素按自带 _style 各自配色），并入后会无条件覆盖要素 _style，
-    // 表现为"一打开编辑开关整层变成同一种颜色"。
-    // 未配置的键保持 undefined（不发明颜色），编辑会话据此回退到要素自带 _style / 渲染默认值。
-    const cs = useMapStore.getState().mapSettings.colorSettingsMap?.[layerId] as any
-    const baseStyle = {
-      point: {
-        markerColor: cs?.fillColor,
-        markerRadius: cs?.pointSize,
-        fillOpacity: cs?.fillOpacity,
-        borderColor: cs?.borderColor,
-      },
-      line: {
-        // 线色与 setStyleOverrides 约定一致：用户边框色（有效时）优先，其次图形颜色
-        color: cs?.borderColor && cs.borderColor !== NO_FILL_COLOR ? cs.borderColor : cs?.fillColor,
-        weight: cs?.borderWidth,
-        opacity: cs?.fillOpacity,
-      },
-      polygon: {
-        fillColor: cs?.fillColor,
-        fillOpacity: cs?.fillOpacity,
-        borderColor: cs?.borderColor,
-        borderWidth: cs?.borderWidth,
-      },
-    }
+    // 图层配色不进工作集：编辑会话每次渲染实时读 mapSettings.colorSettingsMap，
+    // 保证"编辑"开关打开后右键改配色同样立即生效（快照会停在打开编辑开关那一刻）。
     useLayerEditStore.getState().beginEdit(
       layerId,
       lf.dataId,
       geomType as 'point' | 'line' | 'polygon' | 'mixed',
       features,
-      baseStyle,
       // 版本指纹（ETag）随数据来源一起传递：增量保存据此校验基底，未知则整层保存
       { version },
     )
@@ -832,6 +805,16 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
     })
     const unsubStyle = useMapStore.subscribe((state: any, prev: any) => {
       if (state.mapSettings?.drawStyleMap !== prev.mapSettings?.drawStyleMap) {
+        getEditSession()?.refreshStyle()
+      }
+      // 图层配色/专题（右键"自定义设置"）是本机个性设置，与"编辑"开关无关：
+      // 编辑态下改动也要立即生效（会话渲染实时读 store，这里只负责触发重建）。
+      const editId = useLayerEditStore.getState().editableLayerId
+      if (!editId) return
+      const cur = state.mapSettings
+      const old = prev.mapSettings
+      if (cur?.colorSettingsMap?.[editId] !== old?.colorSettingsMap?.[editId]
+        || cur?.thematicSettingsMap?.[editId] !== old?.thematicSettingsMap?.[editId]) {
         getEditSession()?.refreshStyle()
       }
     })

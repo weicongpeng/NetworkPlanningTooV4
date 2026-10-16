@@ -99,7 +99,7 @@ export default function BufferDialog(
         if (!store.getWorkspace(DECORATION_LAYER_ID)) {
           store.seedWorkspace(
             DECORATION_LAYER_ID, DECORATION_DATA_ID, 'mixed',
-            useMapStore.getState().decorationFeatures ?? [], null,
+            useMapStore.getState().decorationFeatures ?? [],
           )
         }
         store.addFeatures(

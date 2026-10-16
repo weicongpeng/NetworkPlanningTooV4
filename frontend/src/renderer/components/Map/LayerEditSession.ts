@@ -388,14 +388,10 @@ export class LayerEditSession {
 
   // ---------- 渲染 ----------
 
-  private currentWorkspace() {
-    return this.layerId ? useLayerEditStore.getState().getWorkspace(this.layerId) : undefined
-  }
-
   /**
    * 要素渲染样式优先级：要素自身 _editStyle（属性弹窗里配置的风格）
    * > 新绘制要素用 drawStyleMap / 原要素按编辑前渲染优先级还原
-   *   （图层用户配色 baseStyle > 要素自带 _style > MapInfoLayer 默认 > 专题配色最优先）。
+   *   （图层用户配色 > 要素自带 _style > MapInfoLayer 默认 > 专题配色最优先）。
    * 注：MapInfo 原生自带 _style 字段，故要素级样式用 _editStyle 键避免冲突。
    */
   private styleFor(kind: GeomKind, feature?: any): any {
@@ -419,9 +415,9 @@ export class LayerEditSession {
       return saved || DEFAULT_STYLES[kind]
     }
     // 原始要素：还原编辑前的渲染配色（打开编辑开关不应改变图形配色）。
-    // 优先级与 MapInfoLayer 一致：默认 < 要素自带 _style < 图层用户配色(baseStyle) < 专题设置。
+    // 优先级与 MapInfoLayer 一致：默认 < 要素自带 _style < 图层用户配色 < 专题设置。
     const merged: any = { ...ORIG_DEFAULT_STYLES[kind], ...(this.nativeStyleFor(kind, feature) || {}) }
-    const base = this.currentWorkspace()?.baseStyle?.[kind] || {}
+    const base = this.layerColorStyle(kind)
     for (const [k, v] of Object.entries(base)) {
       // 仅覆盖用户/文件真正配置过的键（未配置的键保持 undefined，避免发明颜色覆盖要素原生配色）
       if (v !== undefined && v !== null && v !== '') (merged as any)[k] = v
@@ -453,6 +449,40 @@ export class LayerEditSession {
       }
     }
     return merged
+  }
+
+  /**
+   * 图层用户配色（右键"自定义设置" → 颜色）按几何类型映射为编辑会话样式键。
+   * 实时读 store 而非工作集快照：配色是本软件内的个性设置、与"编辑"开关无关，
+   * 编辑态下改配色同样要立即生效（快照会停在打开编辑开关那一刻）。
+   * 未配置（该图层没保存过配色）返回空对象 —— 不发明默认值，交回要素自带 _style/默认色。
+   */
+  private layerColorStyle(kind: GeomKind): Record<string, any> {
+    if (!this.layerId) return {}
+    const cs = useMapStore.getState().mapSettings.colorSettingsMap?.[this.layerId] as any
+    if (!cs) return {}
+    if (kind === 'point') {
+      return {
+        markerColor: cs.fillColor,
+        markerRadius: cs.pointSize,
+        fillOpacity: cs.fillOpacity,
+        borderColor: cs.borderColor,
+      }
+    }
+    if (kind === 'line') {
+      // 线色与 MapInfoLayer.setStyleOverrides 同口径：有效边框色优先，其次图形颜色
+      return {
+        color: cs.borderColor && cs.borderColor !== NO_FILL_COLOR ? cs.borderColor : cs.fillColor,
+        weight: cs.borderWidth,
+        opacity: cs.fillOpacity,
+      }
+    }
+    return {
+      fillColor: cs.fillColor,
+      fillOpacity: cs.fillOpacity,
+      borderColor: cs.borderColor,
+      borderWidth: cs.borderWidth,
+    }
   }
 
   /** 当前图层生效的专题设置（未启用返回 null） */

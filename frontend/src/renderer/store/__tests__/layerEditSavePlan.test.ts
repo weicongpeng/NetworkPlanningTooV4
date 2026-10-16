@@ -19,7 +19,7 @@ const feature = (id: string, name: string, lng = 114) => ({
 
 function beginEditWith(features: any[], version: string | null = '"layer-1-100"') {
   const store = useLayerEditStore.getState()
-  store.beginEdit('L1', 'D1', 'point', features, null, { version })
+  store.beginEdit('L1', 'D1', 'point', features, { version })
   return store
 }
 
@@ -126,7 +126,7 @@ describe('buildSavePlan', () => {
     useLayerEditStore.setState({
       workspaces: {
         L1: {
-          layerId: 'L1', dataId: 'D1', geometryType: 'point', baseStyle: null,
+          layerId: 'L1', dataId: 'D1', geometryType: 'point',
           features, dirty: true, changeCount: features.length, history: [],
           baseRows, changedIds, version: '"layer-1-100"', baseCount: features.length,
         },

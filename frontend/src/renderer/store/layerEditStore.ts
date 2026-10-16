@@ -20,19 +20,10 @@ export interface EditFeature {
   geometry: { type: string; coordinates: any }
 }
 
-/** 编辑会话中"新建"要素使用的样式（非新建沿用图层原配色）。字段与 drawStyleMap 各几何一致。 */
-export interface EditBaseStyle {
-  point: Record<string, any>
-  line: Record<string, any>
-  polygon: Record<string, any>
-}
-
 export interface LayerWorkspace {
   layerId: string
   dataId: string
   geometryType: WorkspaceGeometryType
-  /** 图层原始渲染样式（非新建要素沿用它，保证配色不变） */
-  baseStyle: EditBaseStyle | null
   features: EditFeature[]
   dirty: boolean
   changeCount: number   // 未保存增删改计数（用于角标）
@@ -158,7 +149,6 @@ interface LayerEditState {
     dataId: string,
     geometryType: WorkspaceGeometryType,
     baseFeatures: EditFeature[],
-    baseStyle?: EditBaseStyle | null,
     base?: { version?: string | null },
   ) => void
   /**
@@ -170,7 +160,6 @@ interface LayerEditState {
     dataId: string,
     geometryType: WorkspaceGeometryType,
     baseFeatures: EditFeature[],
-    baseStyle?: EditBaseStyle | null,
   ) => void
   addFeature: (layerId: string, geometry: EditFeature['geometry'], props?: Record<string, any>) => void
   /** 批量追加：一次 set、一次撤销历史（缓冲区结果批量写入用，避免逐个追加多次重渲染） */
@@ -391,7 +380,7 @@ export const useLayerEditStore = create<LayerEditState>((set, get) => ({
 
   setInspectFeature: (f) => set({ inspectFeature: f }),
 
-  beginEdit: (layerId, dataId, geometryType, baseFeatures, baseStyle, base) =>
+  beginEdit: (layerId, dataId, geometryType, baseFeatures, base) =>
     set((s) => {
       const existing = s.workspaces[layerId]
       const features = existing
@@ -405,7 +394,6 @@ export const useLayerEditStore = create<LayerEditState>((set, get) => ({
             layerId,
             dataId,
             geometryType,
-            baseStyle: baseStyle ?? existing?.baseStyle ?? null,
             features,
             dirty: existing?.dirty ?? false,
             changeCount: existing?.changeCount ?? 0,
@@ -419,7 +407,7 @@ export const useLayerEditStore = create<LayerEditState>((set, get) => ({
       }
     }),
 
-  seedWorkspace: (layerId, dataId, geometryType, baseFeatures, baseStyle) =>
+  seedWorkspace: (layerId, dataId, geometryType, baseFeatures) =>
     set((s) => {
       if (s.workspaces[layerId]) return s // 已有工作集（含未保存更改）不覆盖
       const features = withEditIds(baseFeatures || [])
@@ -430,7 +418,6 @@ export const useLayerEditStore = create<LayerEditState>((set, get) => ({
             layerId,
             dataId,
             geometryType,
-            baseStyle: baseStyle ?? null,
             features,
             // 播种即基线：无未保存更改、无撤销历史，首次保存按整层/本地处理
             dirty: false,

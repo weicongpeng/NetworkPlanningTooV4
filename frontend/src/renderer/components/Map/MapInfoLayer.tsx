@@ -992,14 +992,21 @@ export class MapInfoLayer {
    */
   setStyleOverrides(settings: { fillColor: string; fillOpacity: number; borderWidth: number; borderColor: string; pointSize?: number }): void {
     // 点样式：填充 + 边框；图形大小（点要素半径）覆盖到 radius
+    // markerColor/markerSize 必须与要素自带 _style 同名写入：_resolvePointStyle 的读取顺序是
+    // markerColor → fillColor、markerSize → radius，只写 fillColor/radius 会被要素自带配色/大小
+    // 挡住（图层级设置必须优先于要素自带，否则"改图形颜色/大小"看起来没反应）。
     this.style.point = {
       ...this.style.point,
+      markerColor: settings.fillColor,
       fillColor: settings.fillColor,
       fillOpacity: settings.fillOpacity,
       color: settings.borderColor,
       weight: settings.borderWidth,
       opacity: 1,
-      ...(typeof settings.pointSize === 'number' ? { radius: settings.pointSize } : {})
+      // 未设置图形大小时保持 undefined：不覆盖要素自带 markerSize/radius
+      ...(typeof settings.pointSize === 'number'
+        ? { markerSize: settings.pointSize, radius: settings.pointSize }
+        : {})
     }
 
     // 线样式：无填充，透明度作用于描边。
