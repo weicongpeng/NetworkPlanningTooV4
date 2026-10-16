@@ -739,16 +739,20 @@ export function MapPage() {
     loadLayerFiles()
   }, [items, loadLayerFiles])
 
-  /**
-   * 加载工参数据用于搜索（带缓存检查）
-   */
   const { cacheSectors, getCachedSectors, markSectorsDirty } = useMapDataCacheStore()
 
-  const loadSectorDataForSearch = useCallback(async () => {
+  /**
+   * 加载工参数据用于搜索（带缓存检查）
+   * forceRefresh=true（数据变更事件：上传/录入/删除/别端同步）时绕过内存 +
+   * IndexedDB 缓存直接回源：频点列表与搜索都以这份数据为准，若它落后于地图
+   * 实际渲染的扇区（onlineMapRef.refreshData 是强刷），新频点会因不在频点表
+   * 里被渲染器默认判不可见——新增小区就此不显示。
+   */
+  const loadSectorDataForSearch = useCallback(async (forceRefresh = false) => {
     try {
       // 尝试从缓存加载当前激活的 workbook 数据
       const loadedIds = useMapStore.getState().mapSettings.loadedWorkbookIds
-      if (loadedIds.length > 0) {
+      if (!forceRefresh && loadedIds.length > 0) {
         const primaryId = loadedIds[0]
         const cached = getCachedSectors(primaryId)
         if (cached) {
@@ -761,7 +765,7 @@ export function MapPage() {
         }
       }
 
-      const data = await mapDataService.getMapData()
+      const data = await mapDataService.getMapData(undefined, forceRefresh)
       setSectorDataCache({
         lte: data.lteSectors,
         nr: data.nrSectors
@@ -788,8 +792,10 @@ export function MapPage() {
         return
       }
       console.log('[MapPage] 数据已变更，重新加载扇区数据')
-      // 重载扇区数据缓存（用于频点提取和工参搜索）
-      loadSectorDataForSearch()
+      // 重载扇区数据缓存（用于频点提取和工参搜索）——强制回源，
+      // 与 onlineMapRef.refreshData() 的强刷保持一致，避免频点表/搜索
+      // 数据源落后于实际渲染的扇区（落后时新频点默认不可见）
+      loadSectorDataForSearch(true)
       // 刷新在线地图（sectorData state + 图层重绘）
       onlineMapRef.current?.refreshData()
     }
@@ -1795,26 +1801,23 @@ export function MapPage() {
       // 检查是否是首次初始化
       const isFirstInit = !frequenciesInitializedRef.current
 
-      // 获取扇区图层总开关状态（仅在首次初始化时使用）
-      let lteLayerVisible = false
-      let nrLayerVisible = false
-      if (isFirstInit) {
-        lteLayerVisible = layers.find(l => l.id === 'lte-sectors')?.visible ?? false
-        nrLayerVisible = layers.find(l => l.id === 'nr-sectors')?.visible ?? false
-      }
+      // 扇区图层总开关状态：首次初始化时所有频点跟随它；数据刷新后出现的
+      // **新频点**也跟随它（默认可见）——否则导入/录入带来的新频点小区会
+      // 因频点表里没有它而被渲染器判为不可见，表现为"新增小区地图不渲染"
+      const lteLayerVisible = layers.find(l => l.id === 'lte-sectors')?.visible ?? false
+      const nrLayerVisible = layers.find(l => l.id === 'nr-sectors')?.visible ?? false
 
       // 为LTE频点生成颜色和小区数量
       const lteFrequencies: FrequencyOption[] = Array.from(lteFreqCountMap.entries())
         .sort((a, b) => a[0] - b[0])
         .map(([freq, count]) => {
           const colorObj = frequencyColorMapper.getColor(freq, 'LTE')
-          // 首次初始化时根据图层总开关设置，之后保持用户的选择
-          let visible = false
-          if (isFirstInit) {
-            visible = lteLayerVisible
-          } else {
+          // 首次初始化时根据图层总开关设置，之后保持用户的选择；
+          // 数据刷新后新出现的频点跟随总开关（默认可见）
+          let visible = lteLayerVisible
+          if (!isFirstInit) {
             const existingFreq = frequencies.lte.find(f => f.frequency === freq)
-            visible = existingFreq?.visible ?? false
+            visible = existingFreq?.visible ?? lteLayerVisible
           }
           return {
             frequency: freq,
@@ -1831,13 +1834,12 @@ export function MapPage() {
         .sort((a, b) => a[0] - b[0])
         .map(([freq, count]) => {
           const colorObj = frequencyColorMapper.getColor(freq, 'NR')
-          // 首次初始化时根据图层总开关设置，之后保持用户的选择
-          let visible = false
-          if (isFirstInit) {
-            visible = nrLayerVisible
-          } else {
+          // 首次初始化时根据图层总开关设置，之后保持用户的选择；
+          // 数据刷新后新出现的频点跟随总开关（默认可见）
+          let visible = nrLayerVisible
+          if (!isFirstInit) {
             const existingFreq = frequencies.nr.find(f => f.frequency === freq)
-            visible = existingFreq?.visible ?? false
+            visible = existingFreq?.visible ?? nrLayerVisible
           }
           return {
             frequency: freq,

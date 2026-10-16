@@ -100,6 +100,10 @@ export interface UserMapSettings {
   // 高德注记叠加层显隐（矢量注记 / 影像注记）。
   // 高德卫星影像本身不含注记，影像注记层是"卫星图有地名"的唯一来源。
   amapAnnotations: AmapAnnotations
+  /** 3D 影像底图是否叠加天地图影像注记 cia */
+  cesiumImageAnnotation: boolean
+  /** 3D 等高线（客户端采样地形生成），默认关闭 */
+  cesiumContours: boolean
   // Cesium ion Access Token（出厂带默认值，UI 脱敏、可更换）
   cesiumIonToken: string
   // CesiumJS 场景注记显隐（三维地名 eva）
@@ -165,9 +169,13 @@ const DEFAULT_MAP_SETTINGS: UserMapSettings = {
   amapApiKey: '',
   tiandituApiKey: DEFAULT_TIANDITU_KEY,
   tiandituAnnotations: { vector: true, image: true, terrain: true },
-  // 两个都默认开：底图本身都不带注记（矢量底图用 ltype=11 的无注记版、卫星是纯影像），
-  // 注记全靠注记层叠加 —— 关掉对应开关即得到"干净的底图"
+  // 影像注记默认开：三种卫星底图（高德卫星 / 天地图卫星 / 3D 影像）统一叠天地图 cia，
+  // 关掉即得到"干净的影像底图"。矢量注记控制高德矢量底图取官方 style=8 还是 ltype=11 无注记版
   amapAnnotations: { vector: true, image: true },
+  // 3D 影像底图上的天地图影像注记（Cesium 场景本身 WGS84，与天地图同坐标系，无需纠偏）
+  cesiumImageAnnotation: true,
+  // 等高线：采样地形有开销且多数场景不需要，默认关闭
+  cesiumContours: false,
   cesiumIonToken: DEFAULT_CESIUM_ION_TOKEN,
   cesiumBuildingStyle: 'material',
   cesiumQuality: 'smooth',
@@ -227,6 +235,8 @@ interface MapState {
   setCesiumBuildingStyle: (style: CesiumBuildingStyle) => void
   /** CesiumJS 3D 清晰度档位 */
   setCesiumQuality: (quality: CesiumQuality) => void
+  setCesiumImageAnnotation: (visible: boolean) => void
+  setCesiumContours: (visible: boolean) => void
   setSectorLabelVisibility: (layer: string, visible: boolean) => void
   setPointFileLabelVisibility: (fileId: string, visible: boolean) => void
   setLayerFileLabelVisibility: (fileId: string, visible: boolean) => void
@@ -522,6 +532,20 @@ export const useMapStore = create<MapState>()(
         scheduleBackendSync(get())
       },
 
+      setCesiumImageAnnotation: (visible) => {
+        set((state) => ({
+          mapSettings: { ...state.mapSettings, cesiumImageAnnotation: visible },
+        }))
+        scheduleBackendSync(get())
+      },
+
+      setCesiumContours: (visible) => {
+        set((state) => ({
+          mapSettings: { ...state.mapSettings, cesiumContours: visible },
+        }))
+        scheduleBackendSync(get())
+      },
+
 
       setSectorLabelVisibility: (layer, visible) => {
         set((state) => ({
@@ -751,9 +775,15 @@ export const useMapStore = create<MapState>()(
                   ...serverMapSettings.tiandituAnnotations,
                 },
                 amapAnnotations: {
-                  ...state.mapSettings.amapAnnotations,
-                  ...serverMapSettings.amapAnnotations,
+                  vector: serverMapSettings.amapAnnotations?.vector
+                    ?? state.mapSettings.amapAnnotations.vector,
+                  image: serverMapSettings.amapAnnotations?.image
+                    ?? state.mapSettings.amapAnnotations.image,
                 },
+                cesiumImageAnnotation: serverMapSettings.cesiumImageAnnotation
+                  ?? state.mapSettings.cesiumImageAnnotation,
+                cesiumContours: serverMapSettings.cesiumContours
+                  ?? state.mapSettings.cesiumContours,
                 cesiumBuildingStyle:
                   serverMapSettings.cesiumBuildingStyle ?? state.mapSettings.cesiumBuildingStyle,
                 cesiumQuality:
@@ -824,9 +854,15 @@ export const useMapStore = create<MapState>()(
               ...persistedSettings?.tiandituAnnotations,
             },
             amapAnnotations: {
-              ...currentState.mapSettings.amapAnnotations,
-              ...persistedSettings?.amapAnnotations,
+              vector: persistedSettings?.amapAnnotations?.vector
+                ?? currentState.mapSettings.amapAnnotations.vector,
+              image: persistedSettings?.amapAnnotations?.image
+                ?? currentState.mapSettings.amapAnnotations.image,
             },
+            cesiumImageAnnotation: persistedSettings?.cesiumImageAnnotation
+              ?? currentState.mapSettings.cesiumImageAnnotation,
+            cesiumContours: persistedSettings?.cesiumContours
+              ?? currentState.mapSettings.cesiumContours,
             cesiumBuildingStyle:
               persistedSettings?.cesiumBuildingStyle ?? currentState.mapSettings.cesiumBuildingStyle,
             cesiumQuality:

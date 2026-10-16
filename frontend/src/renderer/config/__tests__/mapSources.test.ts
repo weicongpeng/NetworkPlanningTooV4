@@ -16,8 +16,6 @@ import {
   tiandituBaseLayerOf,
   TIANDITU_MAX_ZOOM,
   TIANDITU_NATIVE_MAX_ZOOM,
-  amapAnnotationTileUrl,
-  isAmapAnnotationApplicable,
   amapTileSourceForWgsTile,
 } from '../mapSources'
 import { gcj02ToWgs84 } from '../../utils/coordinate'
@@ -52,7 +50,7 @@ describe('地图源枚举', () => {
   })
 })
 
-describe('天地图注记只与匹配的底图同显', () => {
+describe('天地图注记按底图同显（影像注记跨底图共用）', () => {
   it('矢量图只放矢量注记', () => {
     expect(isAnnotationApplicable('cva', 'tdt-vector')).toBe(true)
     expect(isAnnotationApplicable('cia', 'tdt-vector')).toBe(false)
@@ -71,8 +69,21 @@ describe('天地图注记只与匹配的底图同显', () => {
     }
   })
 
-  it('非天地图底图（高德/3D/空地图）不放任何天地图注记', () => {
-    for (const s of ['amap-vector', 'amap-satellite', 'cesium', 'none'] as const) {
+  it('影像注记 cia 跨底图共用：高德卫星也叠同一张天地图影像注记', () => {
+    expect(isAnnotationApplicable('cia', 'amap-satellite')).toBe(true)
+    expect(isAnnotationApplicable('cia', 'tdt-satellite')).toBe(true)
+    // 矢量底图不叠 cia（高德矢量自带官方注记、天地图矢量用 cva）
+    expect(isAnnotationApplicable('cia', 'amap-vector')).toBe(false)
+    expect(isAnnotationApplicable('cia', 'tdt-vector')).toBe(false)
+  })
+
+  it('矢量注记 cva 只配天地图矢量（高德矢量底图已自带官方注记）', () => {
+    expect(isAnnotationApplicable('cva', 'amap-vector')).toBe(false)
+    expect(isAnnotationApplicable('cva', 'tdt-vector')).toBe(true)
+  })
+
+  it('3D 与空地图不放任何 2D 天地图注记（3D 的 cia 由 CesiumMap 自己加层）', () => {
+    for (const s of ['cesium', 'none'] as const) {
       expect(isAnnotationApplicable('cva', s)).toBe(false)
       expect(isAnnotationApplicable('cia', s)).toBe(false)
     }
@@ -100,6 +111,16 @@ describe('瓦片 URL', () => {
     expect(amapTileUrl('satellite')).toContain('style=6')
     expect(amapTileUrl('vector')).toContain('style=8')
     expect(amapTileUrl('vector')).toContain('{x}')
+  })
+
+  it('高德矢量默认是官方配置（style=8 且不带 ltype，注记烘在底图里）', () => {
+    const url = amapTileUrl('vector')
+    expect(url).toContain('style=8')
+    expect(url).not.toContain('ltype')
+    // 官方写法：lang/size/scale
+    expect(url).toContain('lang=zh_cn')
+    expect(url).toContain('size=1')
+    expect(url).toContain('scale=1')
   })
 
   it('天地图 URL 带图层编码、Key 与占位符', () => {
@@ -200,40 +221,18 @@ describe('天地图缩放上限：可缩放到 20，但只请求真实存在的�
   })
 })
 
-describe('高德注记叠加层', () => {
-  it('注记瓦片 URL：style=8 且 ltype=4（纯文字/图标，不含道路线条）', () => {
-    const url = amapAnnotationTileUrl()
-    expect(url).toContain('style=8')
-    // ltype=4 才是纯注记层（不带 ltype 的是"路网+注记"，线条太密会遮挡影像）
-    expect(url).toContain('ltype=4')
-    expect(url).toContain('{x}')
-    expect(url).toContain('{y}')
-    expect(url).toContain('{z}')
-    // 与卫星底图（style=6）必须是两张不同的瓦片，否则叠加没有意义
-    expect(url).not.toBe(amapTileUrl('satellite'))
+describe('高德注记口径：矢量底图二选一，卫星不叠注记层', () => {
+  it('关掉「矢量注记」时矢量底图换成 ltype=11 无注记版', () => {
+    const off = amapTileUrl('vector', { vectorAnnotations: false })
+    expect(off).toContain('style=8')
+    expect(off).toContain('ltype=11')
+    // 与官方版必须是两张不同的瓦片
+    expect(off).not.toBe(amapTileUrl('vector'))
+  })
+
+  it('卫星影像不随注记开关变化（高德只提供一种注记瓦片，文字与图标捆绑）', () => {
+    expect(amapTileUrl('satellite')).toBe(amapTileUrl('satellite', { vectorAnnotations: false }))
     expect(amapTileUrl('satellite')).toContain('style=6')
-  })
-
-  it('矢量底图取无注记版（ltype=11）：关掉「矢量注记」后底图才是干净的', () => {
-    const url = amapTileUrl('vector')
-    expect(url).toContain('style=8')
-    expect(url).toContain('ltype=11')
-    // 底图与注记层是两个不同的 URL（一个无注记、一个只有注记）
-    expect(url).not.toBe(amapAnnotationTileUrl())
-  })
-
-  it('注记只在与它匹配的高德底图上生效（与天地图同口径）', () => {
-    expect(isAmapAnnotationApplicable('image', 'amap-satellite')).toBe(true)
-    expect(isAmapAnnotationApplicable('image', 'amap-vector')).toBe(false)
-    expect(isAmapAnnotationApplicable('vector', 'amap-vector')).toBe(true)
-    expect(isAmapAnnotationApplicable('vector', 'amap-satellite')).toBe(false)
-  })
-
-  it('天地图与 3D / 空地图上不叠加高德注记', () => {
-    for (const src of ['tdt-vector', 'tdt-satellite', 'cesium', 'none'] as const) {
-      expect(isAmapAnnotationApplicable('image', src)).toBe(false)
-      expect(isAmapAnnotationApplicable('vector', src)).toBe(false)
-    }
   })
 })
 

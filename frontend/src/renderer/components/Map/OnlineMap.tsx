@@ -39,8 +39,6 @@ import type { LayerOrderMap } from '../../store/mapStore'
 import { layerApi, dataApi } from '../../services/api'
 import {
   amapTileUrl,
-  amapAnnotationTileUrl,
-  isAmapAnnotationApplicable,
   type AmapAnnotations,
   tiandituTileUrl,
   tiandituTileSource,
@@ -139,13 +137,16 @@ function tiandituLeafletLayer(
 /**
  * 构建底图瓦片图层；空地图返回 null（不铺任何底图）。
  * 高德/天地图由 `mapSource` 的引擎部分决定，矢量/卫星由图层部分决定。
+ * 高德矢量底图随「矢量注记」开关在"官方 style=8（自带注记）/ ltype=11 无注记"之间二选一。
  */
-function buildBaseTileLayer(L: any, source: MapSource, key: string): any | null {
+function buildBaseTileLayer(
+  L: any, source: MapSource, key: string, amapVectorAnnotations = true,
+): any | null {
   const engine = engineOf(source)
   const kind = layerKindOf(source)
   if (!engine || !kind) return null
   if (engine === 'amap') {
-    return L.tileLayer(amapTileUrl(kind), {
+    return L.tileLayer(amapTileUrl(kind, { vectorAnnotations: amapVectorAnnotations }), {
       attribution: '&copy; <a href="https://www.amap.com/">高德地图</a>',
       minZoom: 3,
       maxZoom: 20,
@@ -178,13 +179,13 @@ interface SharedMapCache {
   tiandituKey: string
   /** 天地图注记叠加层（随地图实例一起缓存，避免页面切换后重复叠加） */
   annotations: Partial<Record<'cva' | 'cia' | 'cta', { layer: any; key: string }>>
-  /** 高德注记叠加层（路网+地名，叠在卫星影像 / 矢量底图之上） */
-  amapAnnotation: { layer: any; kind: 'vector' | 'image' } | null
+  /** 底图构建时的高德「矢量注记」开关（决定 style=8 / ltype=11 两版矢量底图） */
+  amapVectorAnnotations: boolean
   labelManager: LabelLayoutManager | null  // 共享标签布局引擎（跨图层标签防重叠）
 }
 let __sharedMapCache: SharedMapCache = {
   map: null, tileLayer: null, leafletContainer: null,
-  mapSource: 'amap-vector', tiandituKey: '', annotations: {}, amapAnnotation: null,
+  mapSource: 'amap-vector', tiandituKey: '', annotations: {}, amapVectorAnnotations: true,
   labelManager: null
 }
 let __sharedHiddenContainer: HTMLDivElement | null = null
@@ -1229,6 +1230,9 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
   mapSourceRef.current = mapSource
   const tiandituKeyRef = useRef(tiandituApiKey)
   tiandituKeyRef.current = tiandituApiKey
+  // 高德「矢量注记」开关：决定矢量底图取官方 style=8（自带注记）还是 ltype=11 无注记版
+  const amapVectorAnnotationsRef = useRef(amapAnnotations.vector)
+  amapVectorAnnotationsRef.current = amapAnnotations.vector
   const [layerVisibility, setLayerVisibility] = useState<LayerVisibility>(initialLayerVisibility)
 
   // 网络错误状态
@@ -5173,7 +5177,9 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
 
         // 添加底图瓦片图层（高德 / 天地图 / 空地图；空地图不加图层）
         // 注意：高德地图服务器对不存在的瓦片（如海洋区域、地图边界外）会返回 404，这是正常行为
-        const tileLayer = buildBaseTileLayer(L, mapSourceRef.current, tiandituKeyRef.current)
+        const tileLayer = buildBaseTileLayer(
+          L, mapSourceRef.current, tiandituKeyRef.current, amapVectorAnnotationsRef.current,
+        )
         tileLayer?.addTo(map)
 
         // 监听瓦片加载事件（用于检测网络恢复），直接在首次创建时添加
@@ -5242,7 +5248,7 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
           mapSource: mapSourceRef.current,
           tiandituKey: tiandituKeyRef.current,
           annotations: __sharedMapCache.annotations,
-          amapAnnotation: __sharedMapCache.amapAnnotation,
+          amapVectorAnnotations: amapVectorAnnotationsRef.current,
           labelManager
         }
 
@@ -5452,7 +5458,7 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
             mapSource: mapSourceRef.current,
             tiandituKey: tiandituKeyRef.current,
             annotations: __sharedMapCache.annotations,
-            amapAnnotation: __sharedMapCache.amapAnnotation,
+            amapVectorAnnotations: amapVectorAnnotationsRef.current,
             labelManager: __sharedMapCache.labelManager
           }
 
@@ -7524,7 +7530,7 @@ function sectorPointGeometry(f: any): { type: 'Point'; coordinates: [number, num
   }, [selectionMode, selectFeaturesAtPoint, selectFeaturesInCircle, selectFeaturesInPolygon, selectFeaturesInRectangle])
 
   /**
-   * 当地图类型改变时更新瓦片图层
+   * 当地图类型 / 高德矢量注记开关改变时更新瓦片图层
    */
   useEffect(() => {
     // 当地图初始化完成后，更新瓦片图层
@@ -7532,12 +7538,15 @@ function sectorPointGeometry(f: any): { type: 'Point'; coordinates: [number, num
 
     const L = window.L
     const map = mapInstanceRef.current
+    // 高德「矢量注记」开关：矢量底图在官方 style=8（自带注记）与 ltype=11 无注记版之间二选一
+    const amapVectorAnnotations = amapAnnotations.vector
 
-    // 共享实例复用保护：地图源与天地图 Key 都与缓存一致时，跳过重建
+    // 共享实例复用保护：地图源、天地图 Key、高德矢量注记开关都与缓存一致时，跳过重建
     // 避免页面切换时不必要的瓦片重新下载
     if (tileLayerRef.current && __sharedMapCache.map
       && __sharedMapCache.mapSource === mapSource
-      && __sharedMapCache.tiandituKey === tiandituApiKey) {
+      && __sharedMapCache.tiandituKey === tiandituApiKey
+      && __sharedMapCache.amapVectorAnnotations === amapVectorAnnotations) {
       console.log('[OnlineMap] 复用缓存瓦片图层，地图源匹配，跳过重建')
       return
     }
@@ -7549,7 +7558,7 @@ function sectorPointGeometry(f: any): { type: 'Point'; coordinates: [number, num
     }
 
     // 添加新的瓦片图层（空地图返回 null）
-    const newTileLayer = buildBaseTileLayer(L, mapSource, tiandituApiKey)
+    const newTileLayer = buildBaseTileLayer(L, mapSource, tiandituApiKey, amapVectorAnnotations)
     newTileLayer?.addTo(map)
 
     // 监听所有瓦片加载完成事件（用于检测网络恢复）
@@ -7571,23 +7580,29 @@ function sectorPointGeometry(f: any): { type: 'Point'; coordinates: [number, num
     // 同步共享缓存，使下次比较守卫正确判断
     __sharedMapCache.mapSource = mapSource
     __sharedMapCache.tiandituKey = tiandituApiKey
-  }, [isMapInitialized, mapSource, tiandituApiKey, networkError.visible])
+    __sharedMapCache.amapVectorAnnotations = amapVectorAnnotations
+  }, [isMapInitialized, mapSource, tiandituApiKey, amapAnnotations.vector, networkError.visible])
 
   /**
    * 天地图注记叠加层（矢量注记 cva / 影像注记 cia / 地形注记 cta）。
    *
-   * 只渲染**与当前底图匹配**的那一类注记（矢量注记↔矢量图、影像注记↔卫星图；无地形底图则 cta 不渲染），
-   * 否则三套注记默认全开时会互相叠加、视觉很乱。zIndex 高于底图。
+   * **影像注记 cia 跨底图共用**：高德卫星与天地图卫星叠的是同一张 cia（2D 显示链路是
+   * GCJ02，`tiandituLeafletLayer` 内部已做 WGS84→GCJ02 瓦片纠偏，与底图来源无关），
+   * 开关按当前底图所属引擎取（高德页签的「影像注记」/ 天地图页签的「影像注记」）。
+   * cva 只配天地图矢量、cta 无匹配底图（见 `isAnnotationApplicable`）。zIndex 高于底图。
    */
   useEffect(() => {
     const map = mapInstanceRef.current
     const L = leafletRef.current || (window as any).L
     if (!map || !L) return
 
+    const onAmap = engineOf(mapSource) === 'amap'
     const store = __sharedMapCache.annotations
     for (const code of TIANDITU_ANNOTATION_CODES) {
-      const want = isAnnotationApplicable(code, mapSource)
-        && tiandituAnnotations[TIANDITU_ANNOTATION_KEY[code]]
+      const on = onAmap
+        ? (code === 'cia' ? amapAnnotations.image : false)
+        : tiandituAnnotations[TIANDITU_ANNOTATION_KEY[code]]
+      const want = isAnnotationApplicable(code, mapSource) && on
       const existing = store[code]
       if (want && existing?.key === tiandituApiKey) continue
       if (existing) {
@@ -7600,52 +7615,7 @@ function sectorPointGeometry(f: any): { type: 'Point'; coordinates: [number, num
         store[code] = { layer, key: tiandituApiKey }
       }
     }
-  }, [isMapInitialized, mapSource, tiandituApiKey, tiandituAnnotations])
-
-  /**
-   * 高德注记叠加层（路网 + 地名）。
-   *
-   * **这是"高德卫星图没有注记"的正解**：高德卫星影像（`style=6`）是一张纯影像、本身不含
-   * 任何注记，注记在高德那边是单独一张透明瓦片（`style=8`），必须由客户端叠上去；
-   * 矢量底图则已把注记烘进底图（所以矢量图一直看着正常）。
-   *
-   * 与天地图注记同一口径：只渲染**与当前底图匹配**的那一类（矢量注记↔矢量图、
-   * 影像注记↔卫星图）。高德瓦片本身就是 GCJ02，与本项目显示链路一致，无需纠偏。
-   * zIndex 与天地图注记同为 2（高于底图；两个引擎互斥，不会同时存在）。
-   */
-  useEffect(() => {
-    const map = mapInstanceRef.current
-    const L = leafletRef.current || (window as any).L
-    if (!map || !L) return
-
-    const wantKind: 'vector' | 'image' | null =
-      isAmapAnnotationApplicable('image', mapSource) && amapAnnotations.image ? 'image'
-        : isAmapAnnotationApplicable('vector', mapSource) && amapAnnotations.vector ? 'vector'
-          : null
-
-    const existing = __sharedMapCache.amapAnnotation
-    // 已按同一种底图叠好 → 什么都不用做（继续复用，避免页面切换后重复叠加）
-    if (existing && wantKind && existing.kind === wantKind
-      && map.hasLayer(existing.layer)) return
-    if (!existing && !wantKind) return
-
-    if (existing) {
-      try { map.removeLayer(existing.layer) } catch { /* ignore */ }
-      __sharedMapCache.amapAnnotation = null
-    }
-    if (wantKind) {
-      const layer = L.tileLayer(amapAnnotationTileUrl(), {
-        attribution: '&copy; <a href="https://www.amap.com/">高德地图</a>',
-        minZoom: 3,
-        maxZoom: 20,
-        maxNativeZoom: 18,
-        zIndex: 2,
-        crossOrigin: 'anonymous',
-      })
-      layer.addTo(map)
-      __sharedMapCache.amapAnnotation = { layer, kind: wantKind }
-    }
-  }, [isMapInitialized, mapSource, amapAnnotations])
+  }, [isMapInitialized, mapSource, tiandituApiKey, tiandituAnnotations, amapAnnotations.image])
 
 
 

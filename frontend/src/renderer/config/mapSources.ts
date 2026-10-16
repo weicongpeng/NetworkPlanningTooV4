@@ -59,52 +59,39 @@ export function isCesiumSource(source: MapSource): boolean {
 /**
  * 高德栅格瓦片 URL。
  *
- * - 卫星 `style=6`：**纯影像，不含任何注记**（实测返回 JPEG）—— 卫星图上的地名必须靠
- *   单独的注记层叠加（见 `amapAnnotationTileUrl`）。
- * - 矢量 `style=8&ltype=11`：**不含文字注记**的矢量底图（实测：道路/绿地/水系都在，
- *   一个地名都没有）。这样「矢量注记」开关关掉后底图就是干净的；打开时由注记层补上文字，
- *   与打开前的观感一致。
+ * - 卫星 `style=6`：**纯影像，不含任何注记**（实测返回 JPEG）。底图本身没有注记，
+ *   地名靠叠加**天地图影像注记 cia**（见 `isAnnotationApplicable`——影像注记跨底图共用）。
+ * - 矢量：走**高德官方标准矢量**（`style=8`，注记已烘进底图，参数写法与官方
+ *   `webrd?lang=zh_cn&size=1&scale=1&style=8` 一致）。关掉「矢量注记」时改取
+ *   `ltype=11` 的**无注记**矢量底图（实测道路/绿地/水系都在、一个文字都没有），
+ *   于是开关仍然有效：开=官方原生观感，关=干净底图。
+ *
+ * 注：`scl=1` 与官方的 `scale=1` 返回同一张瓦片（实测 md5 一致），这里用官方写法。
  */
-export function amapTileUrl(kind: 'vector' | 'satellite'): string {
-  return kind === 'satellite'
-    ? 'https://webst02.is.autonavi.com/appmaptile?style=6&x={x}&y={y}&z={z}'
-    : 'https://webrd02.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scl=1&style=8&ltype=11&x={x}&y={y}&z={z}'
+export function amapTileUrl(
+  kind: 'vector' | 'satellite',
+  opts?: { vectorAnnotations?: boolean },
+): string {
+  if (kind === 'satellite') {
+    return 'https://webst02.is.autonavi.com/appmaptile?style=6&x={x}&y={y}&z={z}'
+  }
+  const base = 'https://webrd02.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8'
+  return opts?.vectorAnnotations === false ? `${base}&ltype=11&x={x}&y={y}&z={z}` : `${base}&x={x}&y={y}&z={z}`
 }
 
 /**
- * 高德注记叠加瓦片：**只含文字与图标（建筑/道路/山体/地铁站等），不含道路线条**。
+ * 高德底图的注记开关。
  *
- * 关键在 `ltype=4`：高德默认的 `style=8`（不带 ltype）是"路网+注记"，线条很密，
- * 压在卫星影像上会明显遮挡影像；`ltype=4` 才是纯注记层（实测透明像素占比 81.8%，
- * 而默认的 style=8 只有 54.2%），观感与天地图的影像注记 cia 一致。
- *
- * 注：`wprd` 与 `webst` 两个主机返回的是**同一张**瓦片（实测 md5 一致），这里统一用
- * `webst`（与影像底图同源，少一个域名）。瓦片本身是 GCJ02，与 2D 显示链路直接对齐、
- * 无需纠偏（3D 里才需要纠偏，见 `amapTileSourceForWgsTile`）。
+ * 两项都不是高德自己的注记层（高德矢量已把注记烘进官方 style=8 底图），而是控制
+ * **天地图 cia 影像注记**要不要叠在高德卫星影像之上：
+ * - `vector`：矢量底图取官方 style=8（自带注记）还是 ltype=11 无注记版
+ * - `image`：卫星影像上是否叠加天地图影像注记
  */
-export function amapAnnotationTileUrl(): string {
-  return 'https://webst02.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scl=1&style=8&ltype=4&x={x}&y={y}&z={z}'
-}
-
-/** 高德注记开关（与天地图注记同语义：矢量注记↔矢量图、影像注记↔卫星图） */
 export interface AmapAnnotations {
-  /** 矢量注记（叠在**矢量图**上的路网注记层） */
+  /** 矢量注记：开=官方 style=8 底图（自带注记），关=ltype=11 无注记底图 */
   vector: boolean
-  /** 影像注记（叠在**卫星图**上的路网注记层） */
+  /** 影像注记：天地图 cia 叠在高德卫星影像上 */
   image: boolean
-}
-
-/**
- * 高德注记是否适用于当前地图源。
- * 与天地图注记同一口径：只渲染与当前底图匹配的那一类（矢量注记→矢量图、影像注记→卫星图）。
- */
-export function isAmapAnnotationApplicable(
-  kind: 'vector' | 'image', source: MapSource,
-): boolean {
-  if (engineOf(source) !== 'amap') return false
-  // 注记的'image'对应底图的'satellite'（高德把卫星叫影像）
-  const layerKind = layerKindOf(source)
-  return kind === 'image' ? layerKind === 'satellite' : layerKind === 'vector'
 }
 
 // ===== 天地图瓦片 =====
@@ -153,13 +140,12 @@ export function tiandituTileUrl(layer: TiandituLayer, key: string): string {
 }
 
 /**
- * 天地图注记与底图的对应关系。
+ * 天地图注记图层（按当前底图类型叠加）。
  *
- * 三类注记各自只服务一种底图：矢量注记 cva 叠在矢量图 vec 上、影像注记 cia 叠在卫星（影像）图 img 上、
- * 地形注记 cta 叠在地形晕渲 ter 上。当前下拉里没有"地形图"底图，所以 cta 无匹配底图、不会渲染。
- *
- * 渲染规则：**只渲染与当前底图匹配的那一类注记**（且该注记的开关为开）。这样默认全开时，
- * 矢量图只显示矢量注记、卫星图只显示影像注记，不会三套注记互相叠加。
+ * 影像注记 cia 是**跨底图共用**的：不论底下是高德卫星还是天地图影像，叠加的都是这同一张
+ * 天地图 cia（2D 侧靠 `tiandituTileSource` 做 WGS84→GCJ02 纠偏，与底图来源无关；
+ * 3D 侧 Cesium 本身就是 WGS84，直接加层无需纠偏）。
+ * cva 只给天地图矢量用（高德矢量底图自带官方注记，不需要再叠）；cta 没有匹配底图。
  */
 export const TIANDITU_ANNOTATION_BASE: Record<'cva' | 'cia' | 'cta', TiandituLayer> = {
   cva: 'vec', cia: 'img', cta: 'ter',
@@ -172,10 +158,13 @@ export function tiandituBaseLayerOf(source: MapSource): TiandituLayer | null {
   return null
 }
 
-/** 该注记是否适用于当前地图源（不适用则不渲染，避免三套注记叠加） */
+/** 该注记是否适用于当前地图源（不适用则不渲染，避免多套注记叠加） */
 export function isAnnotationApplicable(
   code: 'cva' | 'cia' | 'cta', source: MapSource,
 ): boolean {
+  // 影像注记：凡是卫星/影像类底图都叠（高德卫星、天地图卫星）
+  if (code === 'cia') return layerKindOf(source) === 'satellite'
+  // 其余注记只服务天地图自己的底图
   const base = tiandituBaseLayerOf(source)
   return base !== null && TIANDITU_ANNOTATION_BASE[code] === base
 }

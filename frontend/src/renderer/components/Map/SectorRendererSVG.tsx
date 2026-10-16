@@ -534,7 +534,9 @@ export class SectorSVGLayer extends L.Layer {
       let hasNewFrequencies = false
       allFrequencies.forEach(f => {
         if (!this.frequencyVisibility.has(f)) {
-          // 频点不在映射中，默认为不可见（只有用户明确勾选的频点才显示）
+          // 频点不在映射中，默认为不可见（只有用户明确勾选的频点才显示）。
+          // 映射本身由 MapPage 的频点表提供，新频点在那边默认跟随总开关为可见，
+          // 这里保持"严格按映射执行"，不与 PCI 图例的 `=== true` 口径分叉。
           this.frequencyVisibility.set(f, false)
           hasNewFrequencies = true
         }
@@ -2393,7 +2395,8 @@ export class SectorSVGLayer extends L.Layer {
 
     // 按频点过滤扇区
     // 口径契约：仅 raw frequency 显式 false 才隐藏；undefined（频点键缺失）放行。
-    // 已知频点由 setFrequenciesVisibility 初始化为 true/false（default 模式未勾选补 false），
+    // 已知频点由 setFrequenciesVisibility 初始化为 true/false（default 模式未勾选补 false，
+    // 映射由 MapPage 频点表提供，新频点默认跟随图层总开关为可见），
     // 故 undefined 仅在数据出现未登记频点时发生。PCI图例口径不同（===true 才展示，
     // 且频点解析含 ssbFrequency/earfcn 回退），改动此处须与 computePciRenderStats 对齐。
     const frequencyFilteredSectors = visibleSectors.filter(sector => {

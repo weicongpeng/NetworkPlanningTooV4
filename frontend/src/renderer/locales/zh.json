@@ -1905,6 +1905,10 @@
     "rememberHint": "勾选后本机加密保存账号密码，下次打开自动登录；取消勾选会清除已保存的凭据。",
     "licenseVerified": "已连接服务器，授权校验通过（有效期至 {{date}}）",
     "licenseError": "授权校验异常：{{message}}",
+    "amapAnnotationHint": "矢量注记关掉后取无注记矢量底图；影像注记使用天地图影像注记叠加在卫星图上。",
+    "contourLayer": "地形辅助",
+    "contourLines": "等高线",
+    "contourLinesHint": "按当前视野实时采样地形生成，等高距随缩放自适应；相机停下后才重算。",
     "switching": "正在切换到{{mode}}，应用将自动重启，重启后自动登录…",
     "switchRestartManual": "自动重启未执行，请手动关闭软件后重新打开（数据空间已切换）"
   },

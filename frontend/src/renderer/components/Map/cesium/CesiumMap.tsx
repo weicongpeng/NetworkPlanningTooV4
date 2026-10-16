@@ -56,9 +56,13 @@ import { useLayerEditStore } from '../../../store/layerEditStore'
 import { useMapDataCacheStore } from '../../../store/mapDataCacheStore'
 import {
   amapTileUrl,
-  amapAnnotationTileUrl,
+  tiandituTileUrl,
+  TIANDITU_SUBDOMAINS,
+  TIANDITU_NATIVE_MAX_ZOOM,
+  DEFAULT_TIANDITU_KEY,
 } from '../../../config/mapSources'
 import { createAmapImageryProvider } from './amapImageryProvider'
+import { createContourLayer } from './cesiumContours'
 import {
   CesiumSelectionSession,
   type SelectionTarget,
@@ -240,10 +244,16 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
   const baseKindRef = useRef<'satellite' | 'roadmap'>('satellite')
   /** 已经建好的底图类型（与期望不同才重建底图） */
   const appliedBaseKindRef = useRef<'satellite' | 'roadmap' | null>(null)
+  /** 底图建好时的高德「矢量注记」开关（矢量底图两版，变了要重建） */
+  const appliedVectorAnnotationsRef = useRef<boolean | null>(null)
+  /** 3D 影像底图上叠加的天地图影像注记 cia 层（只删自己创建的这层） */
+  const ciaAnnotationLayerRef = useRef<any>(null)
+  /** cia 层建好时用的天地图 Key（Key 换了要重建该层） */
+  const appliedCiaKeyRef = useRef<string | null>(null)
+  /** 等高线图层管理器；仅在设置开启时创建（createContourLayer 返回的对象） */
+  const contourRef = useRef<{ update: () => Promise<void>; destroy: () => void } | null>(null)
   /** 底图类型切换的触发计数（ref API 里 setMapType 改动 ref 后靠它触发重建） */
   const [baseKindVersion, setBaseKindVersion] = useState(0)
-  // 高德注记影像层（只清理自己创建的，避免误删热力面等其它 imagery 层）
-  const annotationLayersRef = useRef<any[]>([])
   // 正在渲染热力面的图层数（>0 时在地图中央显示动画标记）
   const [heatmapBusy, setHeatmapBusy] = useState(0)
   /** 正在加载的图层名（图层取数 / 建批量图元时显示，非 null 即提示） */
@@ -963,6 +973,7 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
         // 后续换底图只替换这一层，不 removeAll（否则会清掉热力面等 imagery 层）
         baseImageryLayerRef.current = viewer.imageryLayers.get(0)
         appliedBaseKindRef.current = 'satellite'
+        appliedVectorAnnotationsRef.current = false
         // 调试钩子：暴露 viewer 与编辑 store，便于外部检查 3D 场景/编辑状态
         const winHook = window as unknown as Record<string, unknown>
         winHook.__nptCesiumViewer = viewer
@@ -1088,6 +1099,8 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
               setGeoLodLow(view.zoom <= GEO_DATA_SECTOR_LOD_ZOOM)
             }
             syncLabels()
+            // 等高线：相机停下后按新视野重新采样（模块内有同视野守卫，重复调用无害）
+            void contourRef.current?.update()
           }, 350)
         })
         /**
@@ -1408,15 +1421,16 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
   }, [ready])
 
   /**
-   * 3D 底图与注记（高德）。
+   * 3D 底图（高德）与影像注记（天地图 cia）。
    *
-   * - **底图**：高德卫星影像（`webst style=6`）。原为天地图影像，按要求换成高德；
-   *   高德瓦片是 GCJ02 而 Cesium 场景是 WGS84，所以统一走 `createAmapImageryProvider`
-   *   做瓦片级纠偏（否则底图会相对工参/图层整体偏 100~700 米）。
-   * - **注记**：高德注记层（`ltype=4`，纯文字/图标、不含道路线条），开关沿用
-   *   设置 → 高德页签的「矢量注记 / 影像注记」，与 2D 同一口径
-   *   （矢量注记↔矢量底图、影像注记↔卫星影像）。
-   * - 天地图那套注记（cia/cva/cta/eva）与 3D 的关联已取消，这里不再读取天地图设置。
+   * - **底图**：高德卫星影像（`webst style=6`）；也可切到高德矢量。原为天地图影像，
+   *   按要求换成高德；高德瓦片是 GCJ02 而 Cesium 场景是 WGS84，所以统一走
+   *   `createAmapImageryProvider` 做瓦片级纠偏（否则底图会相对工参/图层整体偏 100~700 米）。
+   * - **矢量底图的注记**：沿用设置 → 高德页签的「矢量注记」开关（开=官方 `style=8`
+   *   自带注记，关=`ltype=11` 无注记版），与 2D 同一口径；矢量底图本身已含注记，无需再叠。
+   * - **影像注记**：影像类底图（当前即高德卫星）上叠**天地图 cia**，与 2D 的卫星图同一张
+   *   注记（天地图是 WGS84、Cesium 场景也是 WGS84，**不需要**纠偏，直接 UrlTemplate 即可）。
+   *   开关在设置 → CesiumJS 页签的「影像注记」，默认开。
    */
   useEffect(() => {
     if (!ready) return
@@ -1426,40 +1440,87 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
     const layers = viewer.imageryLayers
     const kind = baseKindRef.current
 
-    // ① 底图：类型变了才换（先加新的、再删旧的，避免中间空一帧）
-    if (!baseImageryLayerRef.current || appliedBaseKindRef.current !== kind) {
+    // 底图：类型或矢量注记开关变了才换（先加新的、再删旧的，避免中间空一帧）
+    const vectorAnnotations = mapSettings.amapAnnotations?.vector !== false
+    if (!baseImageryLayerRef.current
+      || appliedBaseKindRef.current !== kind
+      || appliedVectorAnnotationsRef.current !== vectorAnnotations) {
       try {
         const next = layers.addImageryProvider(
-          createAmapImageryProvider(C, amapTileUrl(kind === 'satellite' ? 'satellite' : 'vector')),
+          createAmapImageryProvider(C, amapTileUrl(
+            kind === 'satellite' ? 'satellite' : 'vector',
+            { vectorAnnotations },
+          )),
           0,
         )
         const old = baseImageryLayerRef.current
         baseImageryLayerRef.current = next
         appliedBaseKindRef.current = kind
+        appliedVectorAnnotationsRef.current = vectorAnnotations
         if (old) { try { layers.remove(old, true) } catch { /* ignore */ } }
       } catch (e) {
         console.warn('[CesiumMap] 底图加载失败:', e)
       }
     }
 
-    // ② 注记层：整体重建（层数很少，代价可忽略）。
-    // 只移除**本效应自己创建的**层，不能"删掉除底图外的所有层"——那会清掉热力面等 imagery 层。
-    for (const l of annotationLayersRef.current) {
-      try { layers.remove(l, true) } catch { /* ignore */ }
-    }
-    annotationLayersRef.current = []
-    const ann = mapSettings.amapAnnotations
-    const wantAnnotation = kind === 'satellite' ? !!ann?.image : !!ann?.vector
-    if (wantAnnotation) {
+    // 影像注记：只叠天地图 cia，且只加/删**自己创建**的这一层
+    // （绝不能 imageryLayers.removeAll()——热力面也是 imagery 层，会被一起清掉）。
+    const wantCia = kind === 'satellite' && mapSettings.cesiumImageAnnotation !== false
+    const ciaKey = mapSettingsRef.current.tiandituApiKey || DEFAULT_TIANDITU_KEY
+    const ciaStale = !!ciaAnnotationLayerRef.current && appliedCiaKeyRef.current !== ciaKey
+    if ((wantCia && !ciaAnnotationLayerRef.current) || ciaStale || (!wantCia && ciaAnnotationLayerRef.current)) {
       try {
-        annotationLayersRef.current.push(layers.addImageryProvider(
-          createAmapImageryProvider(C, amapAnnotationTileUrl(), { hasAlpha: true })))
+        // 先删旧的（Key 变更/底图切走/开关关闭都走这里），再加新的
+        const old = ciaAnnotationLayerRef.current
+        ciaAnnotationLayerRef.current = null
+        appliedCiaKeyRef.current = null
+        if (old) { try { layers.remove(old, true) } catch { /* ignore */ } }
+        if (wantCia) {
+          const provider = new C.UrlTemplateImageryProvider({
+            url: tiandituTileUrl('cia', ciaKey),
+            subdomains: TIANDITU_SUBDOMAINS,
+            minimumLevel: 3,
+            maximumLevel: TIANDITU_NATIVE_MAX_ZOOM,  // 服务端只有到 18 级
+            credit: '天地图',
+            hasAlpha: true,                        // cia 是带透明通道的 PNG
+          })
+          ciaAnnotationLayerRef.current = layers.addImageryProvider(provider)
+          appliedCiaKeyRef.current = ciaKey
+        }
       } catch (e) {
-        console.warn('[CesiumMap] 注记图层加载失败:', e)
+        console.warn('[CesiumMap] 影像注记图层加载失败:', e)
       }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [ready, baseKindVersion, mapSettings.amapAnnotations])
+  }, [ready, baseKindVersion, mapSettings.amapAnnotations, mapSettings.cesiumImageAnnotation, mapSettings.tiandituApiKey])
+
+  /**
+   * 等高线：按设置开关创建 / 销毁图层管理器（默认关闭）。
+   *
+   * 采样地形是异步且开销随视野平方增长，所以既不进逐帧渲染循环、也不在相机移动过程中
+   * 采样 —— 只在开关变化时建/拆，以及相机停下后由 `camera.changed` 的 350ms 节流触发
+   * （见 viewer 初始化处）。模块内部还有"同一视野不重算"守卫。
+   */
+  useEffect(() => {
+    if (!ready) return
+    const viewer = viewerRef.current
+    const C = (window as any).Cesium
+    if (!viewer || !C) return
+
+    if (!mapSettings.cesiumContours) {
+      contourRef.current?.destroy()
+      contourRef.current = null
+      return
+    }
+    if (!contourRef.current) {
+      contourRef.current = createContourLayer({ C, viewer })
+      void contourRef.current.update()
+    }
+    return () => {
+      contourRef.current?.destroy()
+      contourRef.current = null
+    }
+  }, [ready, mapSettings.cesiumContours])
 
   // 暴露当前图层文件给编辑会话（打开现有图层编辑时据此查找 dataId/sourceType）
   useEffect(() => {

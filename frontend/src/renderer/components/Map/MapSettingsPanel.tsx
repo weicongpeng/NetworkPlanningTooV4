@@ -170,7 +170,7 @@ export function MapSettingsPanel({
   const { t } = useTranslation()
   const {
     mapSettings, setMapSettings, setTiandituAnnotation, setAmapAnnotation,
-    setCesiumBuildingStyle, setCesiumQuality,
+    setCesiumBuildingStyle, setCesiumQuality, setCesiumImageAnnotation, setCesiumContours,
   } = useMapStore()
 
   // 配置页签：默认跟随当前地图源对应的引擎（3D / 空地图落到 CesiumJS / 高德）
@@ -252,6 +252,10 @@ export function MapSettingsPanel({
                   checked={mapSettings.amapAnnotations.image}
                   onChange={(v) => setAmapAnnotation('image', v)}
                 />
+                <p className="text-[10px] text-muted-foreground leading-relaxed pt-1">
+                  {t('map.amapAnnotationHint')
+                    || '矢量注记关掉后取无注记矢量底图；影像注记使用天地图影像注记叠加在卫星图上。'}
+                </p>
               </div>
             </div>
           )}
@@ -305,6 +309,33 @@ export function MapSettingsPanel({
                 restoreLabel={t('map.restoreDefaultToken') || '恢复默认 Token'}
                 onChange={(v) => setMapSettings({ cesiumIonToken: v })}
               />
+              {/* 注记图层：影像底图上叠天地图影像注记（与 2D 卫星图同一张） */}
+              <div className="space-y-0.5 border-t border-border pt-3">
+                <div className="text-[11px] text-muted-foreground mb-1">
+                  {t('map.annotationLayer') || '注记图层'}
+                </div>
+                <ToggleRow
+                  label={t('map.annotationImage') || '影像注记'}
+                  checked={mapSettings.cesiumImageAnnotation}
+                  onChange={(v) => setCesiumImageAnnotation(v)}
+                />
+              </div>
+
+              {/* 等高线：客户端采样地形生成，无外部服务；采样有开销，默认关闭 */}
+              <div className="space-y-0.5 border-t border-border pt-3">
+                <div className="text-[11px] text-muted-foreground mb-1">
+                  {t('map.contourLayer') || '地形辅助'}
+                </div>
+                <ToggleRow
+                  label={t('map.contourLines') || '等高线'}
+                  checked={mapSettings.cesiumContours}
+                  onChange={(v) => setCesiumContours(v)}
+                />
+                <p className="text-[10px] text-muted-foreground leading-relaxed">
+                  {t('map.contourLinesHint')
+                    || '按当前视野实时采样地形生成，等高距随缩放自适应；相机停下后才重算。'}
+                </p>
+              </div>
               {/* 建筑样式（原为地图右上角悬浮下拉，统一收到这里） */}
               <div className="space-y-1.5 border-t border-border pt-3">
                 <div className="text-[11px] text-muted-foreground">
