@@ -92,21 +92,21 @@ def test_download_happy_path(updater_env):
     state = _wait_ready(updater)
     assert state["phase"] == "ready", state
     assert state["error"] is None
-    installer = updater_env.tmp_path / "updates" / "NetworkPlanningTool-Setup-1.0.0.exe"
+    installer = updater_env.tmp_path / "updates" / "NetOpt Engine_Setup-1.0.0.exe"
     assert installer.read_bytes() == PAYLOAD
     assert state["downloaded"] == len(PAYLOAD)
 
 
 def test_download_resumes_from_part(updater_env):
     updater = updater_env.updater
-    part = updater_env.tmp_path / "updates" / "NetworkPlanningTool-Setup-1.0.0.exe.part"
+    part = updater_env.tmp_path / "updates" / "NetOpt Engine_Setup-1.0.0.exe.part"
     part.parent.mkdir(parents=True, exist_ok=True)
     part.write_bytes(PAYLOAD[:1000])  # 模拟上次中断留下的分片
 
     updater.start_download(_release())
     state = _wait_ready(updater)
     assert state["phase"] == "ready", state
-    installer = updater_env.tmp_path / "updates" / "NetworkPlanningTool-Setup-1.0.0.exe"
+    installer = updater_env.tmp_path / "updates" / "NetOpt Engine_Setup-1.0.0.exe"
     assert installer.read_bytes() == PAYLOAD  # 续传后内容完整
 
 
@@ -153,7 +153,7 @@ def test_download_retries_when_connection_truncated(updater_env, monkeypatch):
         updater.start_download(_release())
         state = _wait_ready(updater)
         assert state["phase"] == "ready", state
-        installer = updater_env.tmp_path / "updates" / "NetworkPlanningTool-Setup-1.0.0.exe"
+        installer = updater_env.tmp_path / "updates" / "NetOpt Engine_Setup-1.0.0.exe"
         assert installer.read_bytes() == PAYLOAD
     finally:
         server.shutdown()
@@ -164,10 +164,13 @@ def test_cleanup_stale_installers_after_success(updater_env):
     updater = updater_env.updater
     updates = updater_env.tmp_path / "updates"
     updates.mkdir(parents=True, exist_ok=True)
-    old_pkg = updates / "NetworkPlanningTool-Setup-0.0.9.exe"
-    part = updates / "NetworkPlanningTool-Setup-0.0.10.exe.part"
+    old_pkg = updates / "NetOpt Engine_Setup-0.0.9.exe"
+    part = updates / "NetOpt Engine_Setup-0.0.10.exe.part"
+    # 旧命名（老版本客户端下载的包）也必须清掉，否则永久残留
+    legacy_pkg = updates / "NetworkPlanningTool-Setup-0.0.8.exe"
     old_pkg.write_bytes(PAYLOAD)
     part.write_bytes(PAYLOAD)
+    legacy_pkg.write_bytes(PAYLOAD)
     # 上次安装目标 == 当前运行版本 → 视为更新已生效
     (updates / "npt_ota_intent.json").write_text(
         json.dumps({"target_version": updater_env.settings.NPT_DESKTOP_VERSION}),
@@ -177,9 +180,9 @@ def test_cleanup_stale_installers_after_success(updater_env):
 
     result = updater.cleanup_stale_installers()
 
-    assert set(result["removed"]) == {old_pkg.name, part.name}
-    assert result["freed_bytes"] == len(PAYLOAD) * 2
-    assert not old_pkg.exists() and not part.exists()
+    assert set(result["removed"]) == {old_pkg.name, part.name, legacy_pkg.name}
+    assert result["freed_bytes"] == len(PAYLOAD) * 3
+    assert not old_pkg.exists() and not part.exists() and not legacy_pkg.exists()
     assert (updates / "npt_ota_result.txt").is_file()  # 诊断文件不能删
 
 
@@ -188,7 +191,7 @@ def test_cleanup_keeps_installer_when_update_not_applied(updater_env):
     updater = updater_env.updater
     updates = updater_env.tmp_path / "updates"
     updates.mkdir(parents=True, exist_ok=True)
-    pkg = updates / "NetworkPlanningTool-Setup-9.9.9.exe"
+    pkg = updates / "NetOpt Engine_Setup-9.9.9.exe"
     pkg.write_bytes(PAYLOAD)
     (updates / "npt_ota_intent.json").write_text(
         json.dumps({"target_version": "9.9.9"}), encoding="utf-8"
@@ -249,7 +252,7 @@ def test_install_on_non_windows_rejected(updater_env):
 def test_helper_script_bounded_wait_and_relaunch(updater_env):
     """升级脚本：等待应用退出必须有上限并强杀兜底，且不能依赖 timeout（隐藏控制台下会报错）。"""
     updater = updater_env.updater
-    installer = updater_env.tmp_path / "updates" / "NetworkPlanningTool-Setup-1.0.0.exe"
+    installer = updater_env.tmp_path / "updates" / "NetOpt Engine_Setup-1.0.0.exe"
     installer.parent.mkdir(parents=True, exist_ok=True)
     installer.write_bytes(PAYLOAD)
 
@@ -324,7 +327,7 @@ def test_install_spawns_hidden_helper_and_requests_exit(updater_env, monkeypatch
     from types import SimpleNamespace
 
     updater = updater_env.updater
-    installer = updater_env.tmp_path / "updates" / "NetworkPlanningTool-Setup-1.0.0.exe"
+    installer = updater_env.tmp_path / "updates" / "NetOpt Engine_Setup-1.0.0.exe"
     installer.parent.mkdir(parents=True, exist_ok=True)
     installer.write_bytes(PAYLOAD)
     updater._state.update(phase="ready", installer=str(installer), sha256=SHA)
@@ -364,7 +367,7 @@ def test_install_requests_exit_even_without_bridge(updater_env, monkeypatch):
     from types import SimpleNamespace
 
     updater = updater_env.updater
-    installer = updater_env.tmp_path / "updates" / "NetworkPlanningTool-Setup-1.0.0.exe"
+    installer = updater_env.tmp_path / "updates" / "NetOpt Engine_Setup-1.0.0.exe"
     installer.parent.mkdir(parents=True, exist_ok=True)
     installer.write_bytes(PAYLOAD)
     updater._state.update(phase="ready", installer=str(installer), sha256=SHA)
@@ -443,7 +446,7 @@ def test_launcher_arms_watchdog_before_destroy(monkeypatch):
 def test_arm_background_writes_marker_and_installs_on_wait(updater_env, monkeypatch):
     """「后台运行」：置位 + 写标记文件；后台等待到 ready 后拉起安装并清标记。"""
     updater = updater_env.updater
-    installer = updater_env.tmp_path / "updates" / "NetworkPlanningTool-Setup-1.0.0.exe"
+    installer = updater_env.tmp_path / "updates" / "NetOpt Engine_Setup-1.0.0.exe"
     installer.parent.mkdir(parents=True, exist_ok=True)
     installer.write_bytes(PAYLOAD)
     updater._state.update(phase="ready", version="1.0.0", installer=str(installer), sha256=SHA)
@@ -479,7 +482,7 @@ def test_wait_background_update_tolerates_already_started(updater_env, monkeypat
     from app.services.desktop_cloud_client import CloudError
 
     updater = updater_env.updater
-    installer = updater_env.tmp_path / "updates" / "NetworkPlanningTool-Setup-1.0.0.exe"
+    installer = updater_env.tmp_path / "updates" / "NetOpt Engine_Setup-1.0.0.exe"
     installer.parent.mkdir(parents=True, exist_ok=True)
     installer.write_bytes(PAYLOAD)
     updater._state.update(phase="ready", version="1.0.0", installer=str(installer), sha256=SHA)

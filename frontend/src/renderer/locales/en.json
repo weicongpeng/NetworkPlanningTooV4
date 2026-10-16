@@ -12,7 +12,7 @@
     "uploadProgress": "Uploading {{name}}",
     "merging": "Merging chunks…",
     "uploadHint": "Uploaded in 1MB chunks to bypass the Cloudflare 100MB limit; you may switch to other pages while uploading - the progress stays when you come back",
-    "localImportHint": "You can also copy the installer straight into the server's desktop_releases folder - opening this page registers it automatically (version parsed from the file name, e.g. NetworkPlanningTool-Setup-0.0.6.exe)",
+    "localImportHint": "You can also copy the installer straight into the server's desktop_releases folder - opening this page registers it automatically (version parsed from the file name, e.g. NetOpt Engine_Setup-0.0.6.exe)",
     "fileMissing": "File missing",
     "fileMissingHint": "The installer file is no longer on disk; clients skip this version during OTA",
     "uploadSuccess": "Uploaded",

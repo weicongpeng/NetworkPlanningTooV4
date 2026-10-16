@@ -99,7 +99,7 @@ def _download_worker(release: Dict[str, Any]) -> None:
     version = str(release.get("version") or "unknown")
     expected_sha = (release.get("sha256") or "").lower()
     url = _download_url(release)
-    target = _updates_dir() / f"NetworkPlanningTool-Setup-{version}.exe"
+    target = _updates_dir() / f"NetOpt Engine_Setup-{version}.exe"
     part = target.with_suffix(".exe.part")
     total = int(release.get("file_size") or 0)
 
@@ -559,7 +559,8 @@ def cleanup_stale_installers(force: bool = False) -> Dict[str, Any]:
     - 只在**更新确已生效**（当前运行版本 == 上次安装目标版本）或 force 时动手；
       安装失败/未生效时保留安装包，方便用户手动安装与排查
     - 后台更新已武装、或正在下载时不清理（安装包还要用）
-    - 只删 NetworkPlanningTool-Setup-*.exe / *.exe.part；
+    - 只删 NetOpt Engine_Setup-*.exe / *.exe.part（含旧命名 NetworkPlanningTool-Setup-*，
+      老版本客户端下载的包不能永久残留）；
       日志、npt_ota_result.txt、installed_version.json 等诊断文件一律保留
     """
     if is_background_armed():
@@ -574,17 +575,18 @@ def cleanup_stale_installers(force: bool = False) -> Dict[str, Any]:
 
     removed: List[str] = []
     freed = 0
-    for path in sorted(_updates_dir().glob("NetworkPlanningTool-Setup-*.exe*")):
-        if not path.is_file():
-            continue
-        try:
-            size = path.stat().st_size
-            path.unlink()
-        except OSError as exc:  # noqa: BLE001
-            _log.warning("清理安装包失败（忽略）：%s: %s", path.name, exc)
-            continue
-        removed.append(path.name)
-        freed += size
+    for pattern in ("NetOpt Engine_Setup-*.exe*", "NetworkPlanningTool-Setup-*.exe*"):
+        for path in sorted(_updates_dir().glob(pattern)):
+            if not path.is_file():
+                continue
+            try:
+                size = path.stat().st_size
+                path.unlink()
+            except OSError as exc:  # noqa: BLE001
+                _log.warning("清理安装包失败（忽略）：%s: %s", path.name, exc)
+                continue
+            removed.append(path.name)
+            freed += size
     if removed:
         _log.info("清理历史安装包 %d 个，释放 %.0f MB", len(removed), freed / 1024 / 1024)
     return {"removed": removed, "freed_bytes": freed}

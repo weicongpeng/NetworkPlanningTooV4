@@ -65,7 +65,7 @@ def _upload(ota, version="1.0.0", channel="stable", chunk_size=4096):
     total_chunks = (len(PAYLOAD) + chunk_size - 1) // chunk_size
     start = client.post(
         "/api/v1/desktop-releases/chunked/start",
-        data={"filename": "NetworkPlanningTool-Setup-1.0.0.exe", "total_chunks": total_chunks,
+        data={"filename": "NetOpt Engine_Setup-1.0.0.exe", "total_chunks": total_chunks,
               "total_size": len(PAYLOAD)},
     )
     assert start.status_code == 200, start.text
@@ -147,7 +147,7 @@ def test_manually_copied_installer_is_registered(ota):
     """手工放进 desktop_releases 目录的安装包：打开列表即登记，且能被 OTA 拉到。"""
     import pathlib
 
-    target = pathlib.Path(ota.releases_dir) / "NetworkPlanningTool-Setup-0.0.6.exe"
+    target = pathlib.Path(ota.releases_dir) / "NetOpt Engine_Setup-0.0.6.exe"
     target.write_bytes(PAYLOAD)
 
     resp = ota.client.get("/api/v1/desktop-releases", params={"page": 1, "page_size": 20})
@@ -183,7 +183,7 @@ def test_missing_installer_file_is_reported_and_skipped(ota):
     assert ota.client.get("/api/v1/desktop-cloud/releases/latest").json()["data"] is None
 
     # 手工放一份可用包回来 → OTA 立刻可用（不因缺失记录恢复旧版）
-    (pathlib.Path(ota.releases_dir) / "NetworkPlanningTool-Setup-2.0.1.exe").write_bytes(PAYLOAD)
+    (pathlib.Path(ota.releases_dir) / "NetOpt Engine_Setup-2.0.1.exe").write_bytes(PAYLOAD)
     resp = ota.client.get("/api/v1/desktop-releases", params={"page": 1, "page_size": 20})
     assert resp.status_code == 200
     latest = ota.client.get("/api/v1/desktop-cloud/releases/latest").json()["data"]

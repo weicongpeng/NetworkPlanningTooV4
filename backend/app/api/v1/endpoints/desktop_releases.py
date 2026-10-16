@@ -49,7 +49,7 @@ def _safe_filename(version: str, original_name: str) -> str:
         c for c in os.path.basename(original_name) if c.isalnum() or c in "._-"
     )
     if not safe_name:
-        safe_name = "NetworkPlanningTool-Setup.exe"
+        safe_name = "NetOpt Engine_Setup.exe"
     return f"{safe_version}_{safe_name}"
 
 
@@ -72,7 +72,7 @@ def _sha256_of(path: Path) -> str:
 
 
 def _version_from_filename(filename: str) -> Optional[str]:
-    """从安装包文件名解析版本号（NetworkPlanningTool-Setup-0.0.6.exe → 0.0.6）。
+    """从安装包文件名解析版本号（NetOpt Engine_Setup-0.0.6.exe → 0.0.6）。
 
     解析不到返回 None：该类文件不登记，避免往 OTA 里塞版本号不可信的安装包。
     """
