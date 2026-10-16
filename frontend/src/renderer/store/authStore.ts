@@ -23,6 +23,8 @@ interface AuthState {
   desktopOffline: boolean
   /** 单机模式已提交授权申请、等待管理员批准的账号 */
   desktopPendingUsername: string | null
+  /** 已确认切换到另一运行模式数据空间，等待应用重启（非持久：仅本次界面展示） */
+  desktopSwitchPending: { mode: 'shared' | 'standalone'; username: string } | null
   /** 桌面端最后一次登录的账号与运行模式（持久化的只是展示用信息，不含密码） */
   lastDesktopLogin: { username: string; mode: 'shared' | 'standalone' } | null
   /**
@@ -88,6 +90,7 @@ export const useAuthStore = create<AuthState>()(
       desktopRunMode: null,
       desktopOffline: false,
       desktopPendingUsername: null,
+      desktopSwitchPending: null,
       lastDesktopLogin: null,
       desktopAutoLoginSuppressed: false,
 
@@ -104,6 +107,21 @@ export const useAuthStore = create<AuthState>()(
             const data = result?.data || {}
             if (data.result === 'pending') {
               set({ isLoading: false, desktopRunMode, desktopPendingUsername: username })
+              return null
+            }
+            // 运行模式与当前数据空间不一致：后端已记账一次性凭据与目标档，
+            // 清登录态（localStorage 不得带旧档令牌进新档），交登录页触发重启
+            if (data.restart_required) {
+              const targetMode = (data.mode || desktopRunMode || 'shared') as 'shared' | 'standalone'
+              set({
+                isLoading: false,
+                token: null,
+                user: null,
+                isAuthenticated: false,
+                desktopRunMode: targetMode,
+                desktopPendingUsername: null,
+                desktopSwitchPending: { mode: targetMode, username },
+              })
               return null
             }
             if (!data.access_token) {
@@ -164,6 +182,19 @@ export const useAuthStore = create<AuthState>()(
           operator,
         })
         const data = res?.data || {}
+        // 单机数据空间内注册：先重启到共享档再完成注册（凭据由后端一次性保存）
+        if (data.restart_required) {
+          set({
+            isLoading: false,
+            token: null,
+            user: null,
+            isAuthenticated: false,
+            desktopRunMode: 'shared',
+            desktopPendingUsername: null,
+            desktopSwitchPending: { mode: 'shared', username },
+          })
+          return
+        }
         if (!data.access_token) {
           throw new Error(res?.message || '注册失败')
         }
@@ -211,6 +242,7 @@ export const useAuthStore = create<AuthState>()(
           desktopRunMode: null,
           desktopOffline: false,
           desktopPendingUsername: null,
+          desktopSwitchPending: null,
           // 主动退出后停留在登录页，等用户点登录；重新打开软件时仍按「记住账号密码」自动登录
           desktopAutoLoginSuppressed: get().desktopMode,
         })

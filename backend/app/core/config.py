@@ -9,6 +9,8 @@ from pathlib import Path
 from pydantic_settings import BaseSettings
 from pydantic import field_validator
 
+from app.core.desktop_profiles import normalize_profile, profile_root_for
+
 
 def _parse_cors_origins(v: Optional[str]) -> List[str]:
     """解析CORS配置字符串"""
@@ -55,6 +57,27 @@ _BUNDLE_DIR = _bundle_dir()
 _DATA_ROOT = _data_root()
 
 
+def _is_desktop_env() -> bool:
+    return os.environ.get("NPT_DESKTOP", "").strip().lower() in ("1", "true", "yes")
+
+
+def _profile_root() -> Path:
+    """业务数据根：桌面形态按运行模式分档（共享/单机物理隔离）；其余形态即 DATA_ROOT。
+
+    配置档由 launcher 读 active_profile.json 后以 NPT_DESKTOP_PROFILE 注入；
+    licenses / updates / webview 等机器级数据仍直接放 DATA_ROOT，不在档内。
+    """
+    if not _is_desktop_env():
+        return _DATA_ROOT
+    return profile_root_for(_DATA_ROOT, normalize_profile(os.environ.get("NPT_DESKTOP_PROFILE")))
+
+
+_PROFILE_ROOT = _profile_root()
+_DESKTOP_PROFILE = (
+    normalize_profile(os.environ.get("NPT_DESKTOP_PROFILE")) if _is_desktop_env() else ""
+)
+
+
 class Settings(BaseSettings):
     """应用配置类"""
 
@@ -72,17 +95,23 @@ class Settings(BaseSettings):
     NPT_HOST: str = "0.0.0.0"
     NPT_PORT: int = 8000
 
-    # 目录配置：BUNDLE_DIR 为只读资源根（冻结时 _MEIPASS），DATA_ROOT 为可写数据根
+    # 目录配置：BUNDLE_DIR 为只读资源根（冻结时 _MEIPASS），DATA_ROOT 为全局可写根
+    # 桌面形态下业务数据按配置档隔离（PROFILE_ROOT=DATA_ROOT/profiles/<profile>）：
+    # data/uploads/outputs/exports 在档内；授权、OTA、webview 等机器级数据仍在 DATA_ROOT
     BUNDLE_DIR: Path = _BUNDLE_DIR
     DATA_ROOT: Path = _DATA_ROOT
-    UPLOAD_DIR: Path = _DATA_ROOT / "uploads"
-    OUTPUT_DIR: Path = _DATA_ROOT / "outputs"
-    EXPORT_DIR: Path = _DATA_ROOT / "exports"
+    PROFILE_ROOT: Path = _PROFILE_ROOT
+    UPLOAD_DIR: Path = _PROFILE_ROOT / "uploads"
+    OUTPUT_DIR: Path = _PROFILE_ROOT / "outputs"
+    EXPORT_DIR: Path = _PROFILE_ROOT / "exports"
     LICENSE_DIR: Path = _DATA_ROOT / "licenses"
-    DATA_DIR: Path = _DATA_ROOT / "data"
+    DATA_DIR: Path = _PROFILE_ROOT / "data"
     APKS_DIR: Path = _DATA_ROOT / "apks"
     DESKTOP_RELEASES_DIR: Path = _DATA_ROOT / "desktop_releases"
     TEMPLATE_DIR: Path = _BUNDLE_DIR / "template"
+
+    # 桌面端当前配置档（shared/standalone），由 NPT_DESKTOP_PROFILE 注入；非桌面为空
+    DESKTOP_PROFILE: str = _DESKTOP_PROFILE
 
     # 许可证配置 - 从环境变量读取
     NPT_LICENSE_SECRET_KEY: str = "network-planning-tool-secret-key-2024"

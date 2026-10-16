@@ -73,6 +73,17 @@ async def lifespan(app: FastAPI):
     # 启动时执行
     logger.info("应用启动中...")
 
+    # 桌面形态：业务数据按运行模式配置档隔离。launcher 已在导入 app 前完成迁移；
+    # 此处对直接运行本机后端（开发/测试）的场景幂等补跑，必须早于索引清理与 init_db
+    # （两者都会绑定/创建设置路径下的数据库文件）。
+    if settings.NPT_DESKTOP:
+        try:
+            from app.core.desktop_profiles import ensure_legacy_migrated
+
+            ensure_legacy_migrated(settings.DATA_ROOT, settings.DESKTOP_PROFILE)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"⚠️ 配置档存量数据迁移失败: {e}")
+
     # 确保必要的目录存在
     settings.UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     settings.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)

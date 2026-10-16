@@ -598,6 +598,8 @@ export interface DesktopLoginResult {
   license?: any
   /** result=pending 时表示单机授权申请已提交，等待管理员在「桌面授权」页确认 */
   result?: 'ok' | 'pending'
+  /** 请求模式与当前数据空间不一致：前端提示并调 /desktop/restart 重启到目标档 */
+  restart_required?: boolean
   status?: string
   message?: string
   license_id?: number
@@ -628,6 +630,28 @@ export const desktopLoginApi = {
   /** 单机模式：轮询「申请授权」结果，管理员批准后直接返回登录态 */
   poll: async (username: string): Promise<ApiResponse<DesktopLoginResult>> => {
     return apiClient.post('/desktop/auth-poll', { username }) as any
+  },
+
+  /**
+   * 消费跨运行模式重启前保存的一次性登录/注册凭据（读后即删）。
+   * 无凭据或目标档不匹配时返回 null。
+   */
+  getPendingLogin: async (): Promise<ApiResponse<{
+    kind: 'login' | 'register'
+    username: string
+    password: string
+    mode: 'shared' | 'standalone'
+    remember?: boolean
+    confirm_password?: string
+    city?: string
+    operator?: string
+  } | null>> => {
+    return apiClient.get('/desktop/pending-login') as any
+  },
+
+  /** 切换运行模式数据空间后重启应用（Windows 自动拉起；其他环境提示手动重启） */
+  restart: async (): Promise<ApiResponse<{ restart_supported: boolean; exiting: boolean }>> => {
+    return apiClient.post('/desktop/restart') as any
   },
 
   /** 桌面端注册选项：地市/运营商取自服务器（注册时选数据组） */

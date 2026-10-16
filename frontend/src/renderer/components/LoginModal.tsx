@@ -24,6 +24,9 @@ export function LoginModal({ isOpen, forceChangePassword = false, onClose }: Log
   const lastDesktopLogin = useAuthStore((s) => s.lastDesktopLogin)
   // 用户主动退出登录后本次不再自动登录，等用户手动点「登录」
   const autoLoginSuppressed = useAuthStore((s) => s.desktopAutoLoginSuppressed)
+  // 运行模式数据空间切换中（后端已记账，等待应用重启进入目标档）
+  const switchPending = useAuthStore((s) => s.desktopSwitchPending)
+  const [switchRestartFailed, setSwitchRestartFailed] = useState(false)
   const navigate = useNavigate()
   const location = useLocation()
 
@@ -100,13 +103,55 @@ export function LoginModal({ isOpen, forceChangePassword = false, onClose }: Log
     [login, location.pathname, navigate, t, desktopMode, onClose],
   )
 
-  // 桌面端：读取记住的账号密码 → 预填；勾选「记住」时自动登录一次
+  // 桌面端自动登录：跨模式重启的一次性凭据优先，其次「记住的账号密码」
   useEffect(() => {
     if (!isOpen || !desktopMode || mode !== 'login' || forceChangePassword) return
     let cancelled = false
-    desktopLoginApi
-      .getLastLogin()
-      .then((res: any) => {
+
+    const attempt = async () => {
+      // 1) 跨运行模式重启后保存的一次性登录/注册凭据（当前已是目标数据空间）
+      let pending: any = null
+      try {
+        const res: any = await desktopLoginApi.getPendingLogin()
+        pending = res?.data
+      } catch {
+        pending = null
+      }
+      if (cancelled) return
+      if (pending) {
+        const targetMode: 'shared' | 'standalone' =
+          pending.mode === 'standalone' ? 'standalone' : 'shared'
+        autoLoginAttemptedRef.current = true
+        setDesktopRunMode(targetMode)
+        setUsername(pending.username || '')
+        setIsSubmitting(true)
+        try {
+          if (pending.kind === 'register') {
+            await register(
+              pending.username,
+              pending.password,
+              pending.confirm_password || pending.password,
+              pending.city || '',
+              pending.operator || '',
+            )
+            onClose?.()
+          } else {
+            await doDesktopLogin(
+              pending.username, pending.password, targetMode, pending.remember !== false
+            )
+          }
+        } catch (err: any) {
+          setError(err?.message || err?.detail || String(err))
+          setPassword('')
+        } finally {
+          if (!cancelled) setIsSubmitting(false)
+        }
+        return
+      }
+
+      // 2) 无切换凭据：读取记住的账号密码预填；勾选「记住」时自动登录一次
+      try {
+        const res: any = await desktopLoginApi.getLastLogin()
         if (cancelled) return
         const saved = res?.data
         if (!saved?.username) return
@@ -121,12 +166,60 @@ export function LoginModal({ isOpen, forceChangePassword = false, onClose }: Log
             .catch((err: any) => setError(err?.message || err?.detail || String(err)))
             .finally(() => setIsSubmitting(false))
         }
-      })
-      .catch(() => { /* 未保存过或本机后端不可用：忽略 */ })
+      } catch {
+        /* 未保存过或本机后端不可用：忽略 */
+      }
+    }
+    void attempt()
     return () => { cancelled = true }
-  }, [isOpen, desktopMode, mode, forceChangePassword, remember, doDesktopLogin, autoLoginSuppressed])
+  }, [
+    isOpen, desktopMode, mode, forceChangePassword, remember,
+    doDesktopLogin, register, onClose, autoLoginSuppressed,
+  ])
+
+  // 切换数据空间：调本机重启接口；Windows 自动拉起，失败时提示手动重启
+  useEffect(() => {
+    if (!isOpen || !switchPending) return
+    let cancelled = false
+    setSwitchRestartFailed(false)
+    desktopLoginApi
+      .restart()
+      .then((res: any) => {
+        if (cancelled) return
+        if (!res?.data?.restart_supported) setSwitchRestartFailed(true)
+        // restart_supported=true 时进程即将退出，保持「正在重启」遮罩
+      })
+      .catch(() => {
+        if (!cancelled) setSwitchRestartFailed(true)
+      })
+    return () => { cancelled = true }
+  }, [isOpen, switchPending])
 
   if (!isOpen) return null
+
+  // 运行模式切换中：全屏遮罩 + 自动重启（不允许再操作表单）
+  if (switchPending) {
+    const modeName = switchPending.mode === 'standalone'
+      ? t('desktopAuth.modeStandalone', '单机模式')
+      : t('desktopAuth.modeShared', '共享模式')
+    return (
+      <div className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/50 backdrop-blur-sm">
+        <div className="bg-card border border-border rounded-xl shadow-2xl px-8 py-7 w-[26rem] text-center">
+          {!switchRestartFailed && (
+            <Loader2 className="mx-auto mb-4 h-8 w-8 animate-spin text-primary" />
+          )}
+          <div className="text-base font-medium text-foreground">
+            {t('desktopAuth.switching', { mode: modeName })}
+          </div>
+          {switchRestartFailed && (
+            <div className="mt-3 text-sm text-destructive">
+              {t('desktopAuth.switchRestartManual', '自动重启未执行，请手动关闭软件后重新打开')}
+            </div>
+          )}
+        </div>
+      </div>
+    )
+  }
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()

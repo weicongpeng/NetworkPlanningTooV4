@@ -93,6 +93,7 @@ class DesktopRegisterRequest(BaseModel):
 # 之后的权限与数据组语义与网页端完全一致。
 # 单机模式在授权有效期内允许断网登录（本机保存密码哈希），登录次数下次联机补报。
 
+MODE_SHARED = "shared"
 MODE_STANDALONE = "standalone"
 
 # 功能权限位：管理员在网页端「用户管理 → 编辑」设置，网页端与桌面端一致生效
@@ -180,6 +181,85 @@ def _apply_remember(remember: bool, username: str, password: str, mode: str) -> 
         save_last_login(username, password, mode)
     else:
         clear_last_login()
+
+
+# ------------------------------------------------- 跨配置档登录（数据隔离）
+#
+# 登录选择的运行模式与当前配置档不一致时，不能在当前档完成登录（否则共享档的
+# 用户镜像/会话又会写进单机档）。此时只把登录凭据加密存为一次性 pending，
+# 由 launcher 重启到目标档后消费，实现「切模式即换数据空间」。
+
+PENDING_LOGIN_FILE = "pending_login.json"
+
+
+def _pending_login_path():
+    return settings.DATA_ROOT / PENDING_LOGIN_FILE
+
+
+def save_pending_login(payload: Dict[str, Any]) -> None:
+    """加密保存一次性登录/注册凭据（复用记住密码的 Fernet 密钥）。"""
+    import json as _json
+
+    path = _pending_login_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        blob = _credential_cipher().encrypt(
+            _json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        )
+        path.write_bytes(blob)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[DesktopAuth] 保存切换登录凭据失败（忽略）：{exc}")
+
+
+def consume_pending_login() -> Optional[Dict[str, Any]]:
+    """读取并立即销毁一次性凭据；仅当目标档与当前运行档一致时有效。"""
+    import json as _json
+
+    from app.core.desktop_profiles import normalize_profile
+
+    path = _pending_login_path()
+    if not path.is_file():
+        return None
+    try:
+        data = _json.loads(_credential_cipher().decrypt(path.read_bytes()).decode("utf-8"))
+    except Exception:  # noqa: BLE001
+        data = None
+    finally:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+    if not isinstance(data, dict):
+        return None
+    # 双保险：标记档与实际运行档不一致（例如用户连点两次）则丢弃
+    if normalize_profile(data.get("mode")) != normalize_profile(getattr(settings, "DESKTOP_PROFILE", "")):
+        return None
+    return data
+
+
+def _cross_profile_required(mode: str) -> bool:
+    """请求的模式档是否与当前运行档不同（需要重启切换数据空间）。"""
+    from app.core.desktop_profiles import normalize_profile
+
+    if not settings.NPT_DESKTOP:
+        return False
+    return normalize_profile(mode) != normalize_profile(getattr(settings, "DESKTOP_PROFILE", ""))
+
+
+def _accept_cross_profile_switch(mode: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """跨档登录/注册短路：记账目标档与一次性凭据，不触碰当前档任何数据。"""
+    from app.core.desktop_profiles import write_active_profile
+
+    normalized = MODE_STANDALONE if str(mode).lower() != MODE_SHARED else MODE_SHARED
+    save_pending_login({**payload, "mode": normalized})
+    write_active_profile(settings.DATA_ROOT, normalized)
+    return {
+        "success": True,
+        "data": {
+            "restart_required": True,
+            "mode": normalized,
+        },
+    }
 
 
 class DesktopLoginRequest(BaseModel):
@@ -301,6 +381,13 @@ def _issue_local_token(db: Session, user, idle_logout_days: Optional[int] = None
     # 记住本机会话 jti：账号在别处登录时可在本地直接注销这个会话
     try:
         cloud.save_state(local_jti=jti, desktop_username=user.username)
+    except Exception:  # noqa: BLE001
+        pass
+    # 成功登录即确认当前配置档（幂等），下次启动直接进该档
+    try:
+        from app.core.desktop_profiles import write_active_profile
+
+        write_active_profile(settings.DATA_ROOT, getattr(settings, "DESKTOP_PROFILE", ""))
     except Exception:  # noqa: BLE001
         pass
     return token
@@ -805,6 +892,18 @@ async def desktop_register(
     if not city or not operator:
         raise HTTPException(status_code=400, detail="请选择地市与运营商")
 
+    # 注册成功即以共享模式登录：当前若是单机档，同样先重启切档再注册，
+    # 避免在服务器建号后本机登录落进错误的数据空间
+    if _cross_profile_required(MODE_SHARED):
+        return _accept_cross_profile_switch(MODE_SHARED, {
+            "kind": "register",
+            "username": username,
+            "password": password,
+            "confirm_password": payload.confirm_password,
+            "city": city,
+            "operator": operator,
+        })
+
     try:
         await _register_via_server(username, password, city, operator)
     except cloud.CloudError as exc:
@@ -840,9 +939,19 @@ async def desktop_login(
     """
     username = (payload.username or "").strip()
     password = payload.password or ""
-    mode = MODE_STANDALONE if str(payload.mode).lower() != "shared" else "shared"
+    mode = MODE_STANDALONE if str(payload.mode).lower() != MODE_SHARED else MODE_SHARED
     if not username or not password:
         raise HTTPException(status_code=400, detail="请输入用户名与密码")
+
+    # 数据隔离：模式与当前配置档不一致时绝不在当前档登录（镜像账号/会话/数据同步
+    # 都会落进错误的数据空间），只记账一次性凭据并重启到目标档完成登录
+    if _cross_profile_required(mode):
+        return _accept_cross_profile_switch(mode, {
+            "kind": "login",
+            "username": username,
+            "password": password,
+            "remember": bool(payload.remember),
+        })
 
     local_user = None
     local_reason = ""
@@ -912,6 +1021,33 @@ async def desktop_login(
             "license": info,
         },
     }
+
+
+@router.get("/pending-login")
+async def get_pending_login(_: None = Depends(_require_desktop)) -> Dict[str, Any]:
+    """消费跨档重启前保存的一次性登录/注册凭据（读后即删）。
+
+    目标档与当前运行档不一致时返回 null（凭据同时被销毁）。
+    """
+    return {"success": True, "data": consume_pending_login()}
+
+
+@router.post("/restart")
+async def desktop_restart(_: None = Depends(_require_desktop)) -> Dict[str, Any]:
+    """切换配置档后重启应用：拉起重启脚本并退出当前进程。
+
+    Windows 桌面壳返回 restart_supported=true；非 Windows/壳环境不支持自动重启，
+    前端提示用户手动关闭后重新打开（数据空间已在标记文件中指定）。
+    """
+    from app.core.desktop_profiles import spawn_relaunch
+
+    spawned = spawn_relaunch(settings.DATA_ROOT)
+    if not spawned:
+        return {"success": True, "data": {"restart_supported": False, "exiting": False}}
+    from app import desktop_bridge
+
+    exiting = desktop_bridge.request_exit()
+    return {"success": True, "data": {"restart_supported": True, "exiting": bool(exiting)}}
 
 
 @router.get("/last-login")

@@ -42,6 +42,8 @@ def local_env(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "NPT_DESKTOP", True)
     monkeypatch.setattr(settings, "LICENSE_DIR", tmp_path / "licenses")
     monkeypatch.setattr(settings, "DATA_ROOT", tmp_path)
+    # 当前配置档：本文件以单机模式登录用例为主；共享模式用例内部切到 shared 档
+    monkeypatch.setattr(settings, "DESKTOP_PROFILE", "standalone")
     monkeypatch.setattr(settings, "NPT_SERVER_URL", "https://example.invalid")
     monkeypatch.setattr(cloud, "state_file", lambda: tmp_path / "cloud_state.json")
     settings.LICENSE_DIR.mkdir(parents=True, exist_ok=True)
@@ -134,6 +136,7 @@ def _server_ok(**overrides):
 
 
 def test_login_mirrors_web_account(local_env):
+    local_env.monkeypatch.setattr(local_env.settings, "DESKTOP_PROFILE", "shared")
     """登录成功后本机镜像出同名账号，组与权限位照搬网页端。"""
     local_env.monkeypatch.setattr(
         local_env.cloud, "login", lambda *a, **kw: _server_ok()
@@ -161,6 +164,7 @@ def test_login_mirrors_web_account(local_env):
 
 
 def test_shared_login_starts_sync(local_env):
+    local_env.monkeypatch.setattr(local_env.settings, "DESKTOP_PROFILE", "shared")
     """共享模式登录置为共享并触发一次同步（延后后台跑，失败不阻断登录）。"""
     import app.services.desktop_sync_service as sync_module
 
@@ -187,6 +191,7 @@ def test_shared_login_starts_sync(local_env):
 
 
 def test_register_proxies_then_logs_in(local_env):
+    local_env.monkeypatch.setattr(local_env.settings, "DESKTOP_PROFILE", "shared")
     """桌面端注册：先经服务器建号（含数据组），再自动以共享模式登录。"""
     seen = {}
     local_env.monkeypatch.setattr(
@@ -643,6 +648,7 @@ def test_verify_pending_license_once_skips_offline_issued(local_env):
 
 
 def test_shared_login_error_propagates(local_env):
+    local_env.monkeypatch.setattr(local_env.settings, "DESKTOP_PROFILE", "shared")
     """共享模式不做离线兜底：服务器不可用就直接失败。"""
     def boom(*a, **kw):
         raise local_env.cloud.CloudError(0, "无法连接授权服务器")
@@ -812,6 +818,7 @@ def test_check_session_once_keeps_login_when_offline(local_env):
 
 
 def test_login_shared_sync_is_deferred(local_env):
+    local_env.monkeypatch.setattr(local_env.settings, "DESKTOP_PROFILE", "shared")
     """登录优先：共享模式登录只切换运行模式，同步延后到登录流程之后再跑。"""
     from types import SimpleNamespace
 

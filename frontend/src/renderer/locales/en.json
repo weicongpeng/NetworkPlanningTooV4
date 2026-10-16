@@ -1893,7 +1893,9 @@
     "rememberPassword": "Remember account & password (auto sign-in next time)",
     "rememberHint": "When checked, the account and password are stored encrypted on this machine and used to sign in automatically next time; unchecking clears the saved credentials.",
     "licenseVerified": "Connected to the server; authorization verified (valid until {{date}})",
-    "licenseError": "Authorization check failed: {{message}}"
+    "licenseError": "Authorization check failed: {{message}}",
+    "switching": "Switching to {{mode}}. The app will restart automatically and sign you in…",
+    "switchRestartManual": "Automatic restart did not start. Please close the app and reopen it manually (the data space has been switched)."
   },
   "desktopSync": {
     "syncing": "Syncing data…",

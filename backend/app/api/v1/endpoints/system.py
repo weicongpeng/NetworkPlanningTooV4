@@ -63,4 +63,12 @@ async def get_desktop_mode() -> Dict[str, Any]:
     """运行形态探测（前端在登录前调用）：标准 {success, data} 包裹，避免形状歧义。"""
     from app.core.config import settings
 
-    return {"success": True, "data": {"desktop_mode": bool(settings.NPT_DESKTOP)}}
+    return {
+        "success":
+        True,
+        "data": {
+            "desktop_mode": bool(settings.NPT_DESKTOP),
+            # 当前运行模式配置档（shared/standalone）：前端跨档登录后据此提示重启
+            "desktop_profile": getattr(settings, "DESKTOP_PROFILE", "") or "",
+        },
+    }

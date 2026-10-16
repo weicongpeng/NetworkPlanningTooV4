@@ -59,10 +59,37 @@ def _default_data_root() -> Path:
     return Path.home() / ".network-planning-tool"
 
 
+def _select_desktop_profile(data_root: Path) -> str:
+    """选当前运行模式配置档并完成存量数据迁移。
+
+    必须在导入 app.core.config 之前执行：config 在导入时就按
+    NPT_DESKTOP_PROFILE 定型全部业务数据路径（数据库引擎同理）。
+    显式注入了 NPT_DESKTOP_PROFILE（调试/测试）时尊重环境变量，
+    否则读上次登录写入的 active_profile.json（默认 shared）。
+    """
+    from app.core.desktop_profiles import (
+        active_profile_from_env,
+        ensure_legacy_migrated,
+        read_active_profile,
+        write_active_profile,
+    )
+
+    if not os.environ.get("NPT_DESKTOP_PROFILE"):
+        os.environ["NPT_DESKTOP_PROFILE"] = read_active_profile(data_root)
+    profile = active_profile_from_env()
+    write_active_profile(data_root, profile)
+    # 旧版本平铺在数据根的业务数据首启时一次性迁入 shared 档
+    ensure_legacy_migrated(data_root, profile)
+    _log.info("桌面配置档：%s（业务数据根：%s/profiles/%s）", profile, data_root, profile)
+    return profile
+
+
 def _bootstrap_environment() -> Path:
     data_root = _default_data_root()
     os.environ.setdefault("NPT_DATA_ROOT", str(data_root))
     os.environ.setdefault("NPT_DESKTOP", "1")
+    # 配置档选择先于一切 app 导入（路径在 config 导入时定型）
+    _select_desktop_profile(data_root)
     # Windows 无 fork，桌面版统一走线程池（跳过 ProcessPoolExecutor）
     os.environ.setdefault("NPT_MAX_WORKERS", "1")
     os.environ.setdefault("NPT_HOST", "127.0.0.1")

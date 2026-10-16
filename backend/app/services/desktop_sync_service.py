@@ -44,7 +44,8 @@ class SyncError(Exception):
 # ---------------------------------------------------------------- 本地状态
 
 def state_file() -> Path:
-    return settings.DATA_ROOT / "sync_state.json"
+    # 同步状态随配置档隔离：共享/单机各一份，切档重启后互不污染
+    return settings.PROFILE_ROOT / "sync_state.json"
 
 
 def _default_state() -> Dict[str, Any]:

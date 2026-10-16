@@ -22,6 +22,7 @@ describe('authStore 桌面形态探测', () => {
       token: null,
       user: null,
       isAuthenticated: false,
+      desktopSwitchPending: null,
     })
   })
 
@@ -73,6 +74,18 @@ describe('authStore 桌面形态探测', () => {
     expect(useAuthStore.getState().isAuthenticated).toBe(true)
     expect(useAuthStore.getState().token).toBe('tok')
     expect(useAuthStore.getState().desktopRunMode).toBe('shared')
+  })
+
+  it('跨数据空间登录返回 restart_required 时不写登录态，只置切换态', async () => {
+    vi.mocked(desktopLoginApi.login).mockResolvedValue({
+      success: true,
+      data: { restart_required: true, mode: 'standalone' },
+    } as any)
+    await useAuthStore.getState().login('alice', 'pwd', 'standalone')
+    const state = useAuthStore.getState()
+    expect(state.isAuthenticated).toBe(false)
+    expect(state.token).toBeNull()
+    expect(state.desktopSwitchPending).toEqual({ mode: 'standalone', username: 'alice' })
   })
 
   it('单机模式未授权时进入待批准态（不写登录态）', async () => {

@@ -8,7 +8,9 @@ from app.core.config import settings
 
 @pytest.fixture()
 def sync_state(tmp_path, monkeypatch):
+    # 同步状态文件随配置档落在 PROFILE_ROOT（数据隔离后不再直接放 DATA_ROOT）
     monkeypatch.setattr(settings, "DATA_ROOT", tmp_path)
+    monkeypatch.setattr(settings, "PROFILE_ROOT", tmp_path)
     from app.services import desktop_sync_service as sync
 
     sync.save_state(run_mode=sync.MODE_OFFLINE, datasets={}, pending_deletes=[], conflicts=[])

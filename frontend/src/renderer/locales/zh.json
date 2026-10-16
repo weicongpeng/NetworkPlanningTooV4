@@ -1904,7 +1904,9 @@
     "rememberPassword": "记住账号密码（下次自动登录）",
     "rememberHint": "勾选后本机加密保存账号密码，下次打开自动登录；取消勾选会清除已保存的凭据。",
     "licenseVerified": "已连接服务器，授权校验通过（有效期至 {{date}}）",
-    "licenseError": "授权校验异常：{{message}}"
+    "licenseError": "授权校验异常：{{message}}",
+    "switching": "正在切换到{{mode}}，应用将自动重启，重启后自动登录…",
+    "switchRestartManual": "自动重启未执行，请手动关闭软件后重新打开（数据空间已切换）"
   },
   "desktopSync": {
     "syncing": "数据同步中…",
