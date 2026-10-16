@@ -1032,6 +1032,14 @@ async def get_pending_login(_: None = Depends(_require_desktop)) -> Dict[str, An
     return {"success": True, "data": consume_pending_login()}
 
 
+def _discard_pending_login() -> None:
+    """销毁跨档一次性凭据（用户在确认弹窗点了取消）。"""
+    try:
+        _pending_login_path().unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 @router.post("/restart")
 async def desktop_restart(_: None = Depends(_require_desktop)) -> Dict[str, Any]:
     """切换配置档后重启应用：拉起重启脚本并退出当前进程。
@@ -1048,6 +1056,20 @@ async def desktop_restart(_: None = Depends(_require_desktop)) -> Dict[str, Any]
 
     exiting = desktop_bridge.request_exit()
     return {"success": True, "data": {"restart_supported": True, "exiting": bool(exiting)}}
+
+
+@router.post("/switch-cancel")
+async def desktop_switch_cancel(_: None = Depends(_require_desktop)) -> Dict[str, Any]:
+    """用户在重启确认弹窗取消：放弃模式切换。
+
+    跨档登录短路时已把 active_profile 改写为目标档；取消必须恢复成当前运行档
+    并销毁一次性凭据，否则下次启动应用会误入目标档（空数据空间）。
+    """
+    from app.core.desktop_profiles import write_active_profile
+
+    current = write_active_profile(settings.DATA_ROOT, getattr(settings, "DESKTOP_PROFILE", ""))
+    _discard_pending_login()
+    return {"success": True, "data": {"cancelled": True, "mode": current}}
 
 
 @router.get("/last-login")

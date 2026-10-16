@@ -155,16 +155,20 @@ set /a WAITED=0
 :wait
 tasklist /FI "IMAGENAME eq %EXE%" /NH 2>nul | find /I "%EXE%" >nul
 if errorlevel 1 goto launch
-set /a WAITED+=2
+set /a WAITED+=1
 if %WAITED% GEQ {_RESTART_WAIT_SECONDS} goto killapp
-ping -n 3 127.0.0.1 >nul
+rem ~1s poll: restart should feel immediate once the app exits
+ping -n 2 127.0.0.1 >nul
 goto wait
 :killapp
 taskkill /F /IM "%EXE%" >nul 2>&1
-ping -n 3 127.0.0.1 >nul
 :launch
-rem wait for the single-instance mutex to be released before relaunching
-ping -n 3 127.0.0.1 >nul
+rem The new process must select its data profile from active_profile.json,
+rem not inherit the old process NPT_DESKTOP_PROFILE (same pitfall as
+rem NPT_DESKTOP_VERSION in the OTA helper: env inheritance across restart).
+set "NPT_DESKTOP_PROFILE="
+rem brief wait for the single-instance mutex / fixed port to be released
+ping -n 2 127.0.0.1 >nul
 start "" "%APP%"
 del "%~f0" >nul 2>&1
 """
@@ -173,16 +177,23 @@ del "%~f0" >nul 2>&1
 
 
 def spawn_relaunch(data_root: Path) -> bool:
-    """拉起重启脚本。仅 Windows 桌面壳支持；其他平台返回 False（提示手动重启）。"""
+    """拉起重启脚本。仅 Windows 桌面壳支持；其他平台返回 False（提示手动重启）。
+
+    显式用净化后的环境启动：删除当前进程的 NPT_DESKTOP_PROFILE，保证重启后的
+    新进程一定从 active_profile.json 选档（否则它会继承旧档变量、重启后仍进
+    旧数据空间，pending 凭据因档不符被丢弃）。
+    """
     if os.name != "nt":
         return False
     helper = write_relaunch_helper(data_root)
+    child_env = {k: v for k, v in os.environ.items() if k != "NPT_DESKTOP_PROFILE"}
     creationflags = (
         getattr(subprocess, "CREATE_NO_WINDOW", 0)
         | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
     )
     subprocess.Popen(
         ["cmd", "/c", str(helper)],
+        env=child_env,
         creationflags=creationflags,
         close_fds=True,
     )

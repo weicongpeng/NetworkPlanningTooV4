@@ -654,6 +654,11 @@ export const desktopLoginApi = {
     return apiClient.post('/desktop/restart') as any
   },
 
+  /** 用户在重启确认弹窗取消：恢复当前档标记并销毁一次性凭据 */
+  switchCancel: async (): Promise<ApiResponse<{ cancelled: boolean; mode: string }>> => {
+    return apiClient.post('/desktop/switch-cancel') as any
+  },
+
   /** 桌面端注册选项：地市/运营商取自服务器（注册时选数据组） */
   options: async (): Promise<ApiResponse<{ cities: string[]; operators: string[] }>> => {
     return apiClient.get('/desktop/register-options') as any

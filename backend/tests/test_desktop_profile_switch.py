@@ -198,3 +198,41 @@ def test_pending_login_endpoint_404_outside_desktop(switch_env, monkeypatch):
     monkeypatch.setattr(switch_env.settings, "NPT_DESKTOP", False)
     assert switch_env.client.get("/api/v1/desktop/pending-login").status_code == 404
     assert switch_env.client.post("/api/v1/desktop/restart").status_code == 404
+
+
+# ------------------------------------------------- 重启脚本环境净化与取消回滚
+
+def test_relaunch_helper_clears_inherited_profile_env(tmp_path):
+    """重启脚本必须清掉继承的 NPT_DESKTOP_PROFILE：否则新进程沿用旧档变量，
+    不读 active_profile.json，重启后仍进入旧数据空间（本次用户报障根因）。"""
+    from app.core.desktop_profiles import write_relaunch_helper
+
+    helper = write_relaunch_helper(tmp_path)
+    content = helper.read_text(encoding="ascii")
+    assert 'set "NPT_DESKTOP_PROFILE="' in content
+
+
+def test_switch_cancel_restores_active_profile_and_discards_pending(switch_env):
+    # 先制造一次跨档切换：standalone 档请求共享登录
+    resp = switch_env.client.post(
+        "/api/v1/desktop/login",
+        json={"username": "alice", "password": "pwd123", "mode": "shared"},
+    )
+    assert resp.json()["data"]["restart_required"] is True
+    assert (switch_env.tmp_path / "pending_login.json").is_file()
+    marker = json.loads((switch_env.tmp_path / "active_profile.json").read_text("utf-8"))
+    assert marker["mode"] == "shared"
+
+    # 用户在确认弹窗取消：标记恢复为当前运行档，一次性凭据销毁
+    resp = switch_env.client.post("/api/v1/desktop/switch-cancel")
+    assert resp.status_code == 200
+    assert resp.json()["data"]["cancelled"] is True
+    assert resp.json()["data"]["mode"] == "standalone"
+    marker = json.loads((switch_env.tmp_path / "active_profile.json").read_text("utf-8"))
+    assert marker["mode"] == "standalone"
+    assert not (switch_env.tmp_path / "pending_login.json").exists()
+
+
+def test_switch_cancel_404_outside_desktop(switch_env, monkeypatch):
+    monkeypatch.setattr(switch_env.settings, "NPT_DESKTOP", False)
+    assert switch_env.client.post("/api/v1/desktop/switch-cancel").status_code == 404

@@ -49,6 +49,10 @@ interface AuthState {
   /** 更新桌面端离线/在线状态（离线登录或心跳探测到网络变化时调用） */
   setDesktopOffline: (offline: boolean) => void
   applyDesktopLogin: (data: { access_token?: string; token?: string; user?: any; mode?: string; offline?: boolean }) => void
+  /** 取消运行模式切换：后端恢复当前数据空间标记后清本地切换态；失败时抛出以便界面重试 */
+  cancelDesktopSwitch: () => Promise<void>
+  /** 仅关闭切换弹窗（保留目标档标记）：无法自动重启时，用户将手动关闭后重开 */
+  dismissDesktopSwitch: () => void
   /** 用本机后端回传的账号信息刷新本地用户（权限位被管理员改动后即时生效） */
   applyServerUser: (nextUser: UserInfo) => void
 }
@@ -328,6 +332,14 @@ export const useAuthStore = create<AuthState>()(
           desktopAutoLoginSuppressed: false,
         })
       },
+
+      cancelDesktopSwitch: async () => {
+        // 必须后端确认已恢复当前档标记才能清状态：否则下次启动会误入目标档
+        await desktopLoginApi.switchCancel()
+        set({ desktopSwitchPending: null })
+      },
+
+      dismissDesktopSwitch: () => set({ desktopSwitchPending: null }),
 
       applyServerUser: (nextUser) => {
         // 只在权限/授权期限相关字段变化时更新，避免周期性心跳触发无意义的重渲染

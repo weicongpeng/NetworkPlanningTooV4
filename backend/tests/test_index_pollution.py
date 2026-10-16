@@ -200,3 +200,37 @@ def test_purge_stale_tmp_layer_rows(isolated_index, monkeypatch):
     finally:
         db.close()
     assert names == ["真实图层"]
+
+
+def test_purge_upload_tmp_removes_only_stale_src_files(isolated_index):
+    """启动维护：只删 layer_tmp/distance_tmp 中超过 24h 的 src_* 残留。
+
+    - 过期 src_old 必须删除；新 src_new 保留（可能是正在进行的分块上传）
+    - 非 src_ 前缀文件一律不碰（端点产物/用户文件）
+    """
+    import os
+    import time
+
+    from app.api import _purge_upload_tmp
+
+    _data_dir, upload_dir = isolated_index
+    stale_cutoff = time.time() - 86400 - 60
+    for sub in ("layer_tmp", "distance_tmp"):
+        tmp_dir = upload_dir / sub
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        old = tmp_dir / "src_old.tmp"
+        new = tmp_dir / "src_new.tmp"
+        keep = tmp_dir / "result_export.tab"
+        old.write_text("old", encoding="utf-8")
+        new.write_text("new", encoding="utf-8")
+        keep.write_text("keep", encoding="utf-8")
+        os.utime(old, (stale_cutoff, stale_cutoff))
+
+    _purge_upload_tmp()
+
+    for sub in ("layer_tmp", "distance_tmp"):
+        tmp_dir = upload_dir / sub
+        assert not (tmp_dir / "src_old.tmp").exists(), f"{sub} 过期残留应被清理"
+        assert (tmp_dir / "src_new.tmp").is_file(), f"{sub} 未过期的分块文件不应删除"
+        assert (tmp_dir / "result_export.tab").is_file(), f"{sub} 非 src_ 前缀文件不应触碰"
+

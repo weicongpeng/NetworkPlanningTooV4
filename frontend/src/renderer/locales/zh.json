@@ -1910,7 +1910,15 @@
     "contourLines": "等高线",
     "contourLinesHint": "按当前视野实时采样地形生成，等高距随缩放自适应；相机停下后才重算。",
     "switching": "正在切换到{{mode}}，应用将自动重启，重启后自动登录…",
-    "switchRestartManual": "自动重启未执行，请手动关闭软件后重新打开（数据空间已切换）"
+    "switchRestartingHint": "正在关闭并重新启动，请勿手动关闭软件…",
+    "switchConfirmTitle": "切换运行模式",
+    "switchConfirmBody": "即将切换到{{mode}}。共享模式与单机模式的导入文件、历史任务等数据各自独立保存、互不可见。应用需要重启，重启后将自动登录。",
+    "switchConfirmOk": "立即重启",
+    "switchConfirmCancel": "取消",
+    "switchManualTitle": "需要手动重启",
+    "switchRestartManual": "当前环境无法自动重启。请手动关闭软件后重新打开，将自动进入{{mode}}并完成登录。",
+    "switchManualAck": "知道了",
+    "switchBack": "取消切换"
   },
   "desktopSync": {
     "syncing": "数据同步中…",

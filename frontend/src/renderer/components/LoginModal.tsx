@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
 import { useTranslation } from 'react-i18next'
-import { X, LogIn, UserPlus, Loader2 } from 'lucide-react'
+import { X, LogIn, UserPlus, Loader2, RefreshCw, AlertTriangle } from 'lucide-react'
 import { authApi, desktopLoginApi } from '../services/api'
 import { useAuthStore } from '../store/authStore'
 import { getLastRoute } from '../utils/lastRoute'
@@ -18,7 +18,7 @@ const FALLBACK_OPERATORS = ['移动', '联通', '电信', '广电']
 
 export function LoginModal({ isOpen, forceChangePassword = false, onClose }: LoginModalProps) {
   const { t } = useTranslation()
-  const { login, register, changePassword } = useAuthStore()
+  const { login, register, changePassword, cancelDesktopSwitch, dismissDesktopSwitch } = useAuthStore()
   const desktopMode = useAuthStore((s) => s.desktopMode)
   // 桌面端记住上次登录的账号与运行模式（切换模式需退出后重新登录）
   const lastDesktopLogin = useAuthStore((s) => s.lastDesktopLogin)
@@ -26,7 +26,10 @@ export function LoginModal({ isOpen, forceChangePassword = false, onClose }: Log
   const autoLoginSuppressed = useAuthStore((s) => s.desktopAutoLoginSuppressed)
   // 运行模式数据空间切换中（后端已记账，等待应用重启进入目标档）
   const switchPending = useAuthStore((s) => s.desktopSwitchPending)
-  const [switchRestartFailed, setSwitchRestartFailed] = useState(false)
+  // 切换弹窗三阶段：confirm=等待用户确认 / restarting=已确认、应用退出中 / manual=需手动重启
+  const [switchPhase, setSwitchPhase] = useState<'confirm' | 'restarting' | 'manual'>('confirm')
+  const [switchBusy, setSwitchBusy] = useState(false)
+  const [switchActionError, setSwitchActionError] = useState('')
   const navigate = useNavigate()
   const location = useLocation()
 
@@ -177,43 +180,143 @@ export function LoginModal({ isOpen, forceChangePassword = false, onClose }: Log
     doDesktopLogin, register, onClose, autoLoginSuppressed,
   ])
 
-  // 切换数据空间：调本机重启接口；Windows 自动拉起，失败时提示手动重启
+  // 每次新的切换请求都回到确认阶段
   useEffect(() => {
-    if (!isOpen || !switchPending) return
-    let cancelled = false
-    setSwitchRestartFailed(false)
-    desktopLoginApi
-      .restart()
-      .then((res: any) => {
-        if (cancelled) return
-        if (!res?.data?.restart_supported) setSwitchRestartFailed(true)
-        // restart_supported=true 时进程即将退出，保持「正在重启」遮罩
-      })
-      .catch(() => {
-        if (!cancelled) setSwitchRestartFailed(true)
-      })
-    return () => { cancelled = true }
-  }, [isOpen, switchPending])
+    if (switchPending) {
+      setSwitchPhase('confirm')
+      setSwitchBusy(false)
+      setSwitchActionError('')
+    }
+  }, [switchPending])
+
+  // 用户确认：拉起重启脚本并退出应用；不支持自动重启时引导手动操作
+  const handleConfirmSwitch = useCallback(async () => {
+    setSwitchActionError('')
+    setSwitchBusy(true)
+    try {
+      const res: any = await desktopLoginApi.restart()
+      if (res?.data?.restart_supported) {
+        setSwitchPhase('restarting')
+      } else {
+        setSwitchPhase('manual')
+      }
+    } catch (err: any) {
+      setSwitchActionError(err?.message || err?.detail || String(err))
+    } finally {
+      setSwitchBusy(false)
+    }
+  }, [])
+
+  // 用户取消：后端恢复当前数据空间标记、销毁一次性凭据后关闭弹窗
+  const handleCancelSwitch = useCallback(async () => {
+    setSwitchActionError('')
+    setSwitchBusy(true)
+    try {
+      await cancelDesktopSwitch()
+      setSwitchPhase('confirm')
+    } catch (err: any) {
+      // 取消未被后端确认：保留弹窗允许重试，避免下次启动误入目标数据空间
+      setSwitchActionError(err?.message || err?.detail || String(err))
+    } finally {
+      setSwitchBusy(false)
+    }
+  }, [cancelDesktopSwitch])
 
   if (!isOpen) return null
 
-  // 运行模式切换中：全屏遮罩 + 自动重启（不允许再操作表单）
+  // 运行模式切换：确认 → 自动重启 →（不支持时）手动重启引导
   if (switchPending) {
     const modeName = switchPending.mode === 'standalone'
       ? t('desktopAuth.modeStandalone', '单机模式')
       : t('desktopAuth.modeShared', '共享模式')
     return (
       <div className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/50 backdrop-blur-sm">
-        <div className="bg-card border border-border rounded-xl shadow-2xl px-8 py-7 w-[26rem] text-center">
-          {!switchRestartFailed && (
-            <Loader2 className="mx-auto mb-4 h-8 w-8 animate-spin text-primary" />
+        <div className="bg-card border border-border rounded-xl shadow-2xl px-8 py-7 w-[28rem]">
+          {switchPhase === 'confirm' && (
+            <div className="text-center">
+              <div className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-full bg-primary/10">
+                <RefreshCw className="h-6 w-6 text-primary" />
+              </div>
+              <div className="text-base font-medium text-foreground">
+                {t('desktopAuth.switchConfirmTitle', '切换运行模式')}
+              </div>
+              <p className="mt-3 text-sm leading-6 text-muted-foreground">
+                {t('desktopAuth.switchConfirmBody', {
+                  mode: modeName,
+                  defaultValue: '即将切换到{{mode}}。共享模式与单机模式的导入文件、历史任务等数据各自独立保存、互不可见。应用需要重启，重启后将自动登录。',
+                })}
+              </p>
+              {switchActionError && (
+                <div className="mt-3 text-sm text-destructive">{switchActionError}</div>
+              )}
+              <div className="mt-6 flex justify-end gap-3">
+                <button
+                  type="button"
+                  disabled={switchBusy}
+                  onClick={handleCancelSwitch}
+                  className="px-4 py-2 rounded-lg border border-border text-foreground text-sm hover:bg-accent transition-colors disabled:opacity-50"
+                >
+                  {t('desktopAuth.switchConfirmCancel', '取消')}
+                </button>
+                <button
+                  type="button"
+                  disabled={switchBusy}
+                  onClick={handleConfirmSwitch}
+                  className="px-4 py-2 rounded-lg bg-primary text-primary-foreground text-sm font-medium hover:opacity-90 transition-opacity disabled:opacity-50 flex items-center gap-2"
+                >
+                  {switchBusy && <Loader2 className="h-4 w-4 animate-spin" />}
+                  {t('desktopAuth.switchConfirmOk', '立即重启')}
+                </button>
+              </div>
+            </div>
           )}
-          <div className="text-base font-medium text-foreground">
-            {t('desktopAuth.switching', { mode: modeName })}
-          </div>
-          {switchRestartFailed && (
-            <div className="mt-3 text-sm text-destructive">
-              {t('desktopAuth.switchRestartManual', '自动重启未执行，请手动关闭软件后重新打开')}
+
+          {switchPhase === 'restarting' && (
+            <div className="text-center">
+              <Loader2 className="mx-auto mb-4 h-8 w-8 animate-spin text-primary" />
+              <div className="text-base font-medium text-foreground">
+                {t('desktopAuth.switching', { mode: modeName })}
+              </div>
+              <p className="mt-3 text-sm text-muted-foreground">
+                {t('desktopAuth.switchRestartingHint', '正在关闭并重新启动，请勿手动关闭软件…')}
+              </p>
+            </div>
+          )}
+
+          {switchPhase === 'manual' && (
+            <div className="text-center">
+              <div className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-full bg-amber-500/10">
+                <AlertTriangle className="h-6 w-6 text-amber-500" />
+              </div>
+              <div className="text-base font-medium text-foreground">
+                {t('desktopAuth.switchManualTitle', '需要手动重启')}
+              </div>
+              <p className="mt-3 text-sm leading-6 text-muted-foreground">
+                {t('desktopAuth.switchRestartManual', {
+                  mode: modeName,
+                  defaultValue: '当前环境无法自动重启。请手动关闭软件后重新打开，将自动进入{{mode}}并完成登录。',
+                })}
+              </p>
+              {switchActionError && (
+                <div className="mt-3 text-sm text-destructive">{switchActionError}</div>
+              )}
+              <div className="mt-6 flex justify-end gap-3">
+                <button
+                  type="button"
+                  disabled={switchBusy}
+                  onClick={handleCancelSwitch}
+                  className="px-4 py-2 rounded-lg border border-border text-foreground text-sm hover:bg-accent transition-colors disabled:opacity-50"
+                >
+                  {t('desktopAuth.switchBack', '取消切换')}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => dismissDesktopSwitch()}
+                  className="px-4 py-2 rounded-lg bg-primary text-primary-foreground text-sm font-medium hover:opacity-90 transition-opacity"
+                >
+                  {t('desktopAuth.switchManualAck', '知道了')}
+                </button>
+              </div>
             </div>
           )}
         </div>

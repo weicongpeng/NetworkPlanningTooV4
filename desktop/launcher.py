@@ -324,7 +324,7 @@ def _wait_ready(port: int, timeout: float = READY_TIMEOUT_SECONDS) -> bool:
                 if resp.status == 200:
                     return True
         except (urllib.error.URLError, OSError):
-            time.sleep(0.3)
+            time.sleep(0.15)  #  lifespan 一结束（服务可接客）尽快感知，缩短重启后白屏等待
     return False
 
 

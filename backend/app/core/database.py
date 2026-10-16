@@ -2,6 +2,8 @@
 数据库引擎和会话管理
 使用 SQLite + SQLAlchemy ORM
 """
+from pathlib import Path
+
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker, Session, DeclarativeBase
 from app.core.config import settings
@@ -39,6 +41,49 @@ def get_db():
         yield db
     finally:
         db.close()
+
+
+_GROUP_MIGRATION_MARKER = ".group_migration_v1"
+
+
+def _group_migration_marker_path():
+    from app.core.config import settings
+
+    return Path(settings.DATA_DIR) / _GROUP_MIGRATION_MARKER
+
+
+def _group_migration_done() -> bool:
+    try:
+        return _group_migration_marker_path().is_file()
+    except OSError:
+        return False
+
+
+def _mark_group_migration_done() -> None:
+    try:
+        path = _group_migration_marker_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("1\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _has_grouped_admin() -> bool:
+    """是否存在组信息齐全的管理员（组迁移的前提：没有组就无处可归）。"""
+    try:
+        from app.models.database import User
+
+        db = SessionLocal()
+        try:
+            return (db.query(User)
+                    .filter(User.is_admin == True,  # noqa: E712
+                            User.city.isnot(None), User.city != "",
+                            User.operator.isnot(None), User.operator != "")
+                    .first()) is not None
+        finally:
+            db.close()
+    except Exception:
+        return False
 
 
 def init_db():
@@ -181,12 +226,15 @@ def init_db():
                 conn.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN operator VARCHAR(50)")
         conn.commit()
 
-    # 存量无组数据一次性迁移：归入主管理员所在组（幂等，仅 city IS NULL 的行）
-    _migrate_legacy_data_groups()
-
-    # 误归组任务一次性纠正（幂等）：任务创建未盖章期间产生的 NULL 组任务被上一步
-    # 误归主管理员组，此处按创建人（user_name）的归属组重盖章，恢复组隔离
-    _fix_misattributed_task_groups()
+    # 存量无组/误归组数据一次性纠正。两项都是全表扫描（大库 8 张表 + join），
+    # 历史数据纠正完毕后用 marker 门控跳过，避免每次冷启动（含桌面模式切换重启）
+    # 都为"零行修正"支付扫描成本；marker 随 data.db 同目录，拷库即随迁移状态迁移。
+    if not _group_migration_done():
+        _migrate_legacy_data_groups()
+        _fix_misattributed_task_groups()
+        # 还没有组齐全的管理员时迁移无的放矢（首装常见）：不写 marker，下次启动再试
+        if _has_grouped_admin():
+            _mark_group_migration_done()
 
 
 def _migrate_legacy_data_groups():

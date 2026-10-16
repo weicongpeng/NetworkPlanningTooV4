@@ -67,6 +67,58 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def _cleanup_invalid_index() -> None:
+    """启动对账：清理文件与 SQLite 均已不存在的无效数据索引项。"""
+    try:
+        from app.services.data_service import data_service
+
+        cleanup_result = data_service.cleanup_index()
+        removed_count = cleanup_result.get('removed', 0)
+        if removed_count > 0:
+            logger.info(f"✅ 已清理 {removed_count} 个无效数据索引项")
+            for item in cleanup_result.get('items', []):
+                logger.info(f"   - {item.get('name', '未知')} ({item.get('id', '')}): {item.get('reason', '')}")
+        else:
+            logger.info("✅ 数据索引检查完成，无无效项")
+    except Exception as e:  # noqa: BLE001
+        logger.error(f"❌ 清理无效数据索引失败: {e}")
+
+
+def _purge_upload_tmp() -> None:
+    """清理 layer_tmp/distance_tmp 中超过 24h 的分块上传残留（src_*）。"""
+    import time
+
+    for dirname in ("layer_tmp", "distance_tmp"):
+        tmp_dir = settings.UPLOAD_DIR / dirname
+        if not tmp_dir.exists():
+            continue
+        now = time.time()
+        removed = 0
+        for f in tmp_dir.glob("src_*"):
+            try:
+                if now - f.stat().st_mtime > 86400:  # 24h
+                    f.unlink(missing_ok=True)
+                    removed += 1
+            except Exception:  # noqa: BLE001
+                pass
+        if removed:
+            logger.info(f"✅ 已清理 {removed} 个过期 {dirname} 临时文件")
+        else:
+            logger.info(f"✅ {dirname} 临时文件检查完成，无过期文件")
+
+
+def _desktop_startup_maintenance() -> None:
+    """桌面端启动后的非关键维护（后台线程串行执行，不阻塞窗口就绪）。"""
+    _cleanup_invalid_index()
+    _purge_upload_tmp()
+    try:
+        from app.services.desktop_update_service import cleanup_stale_installers
+
+        cleanup_stale_installers()
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"⚠️ 清理历史安装包失败: {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期管理"""
@@ -101,56 +153,22 @@ async def lifespan(app: FastAPI):
     desktop_releases_dir.mkdir(parents=True, exist_ok=True)
     logger.info(f"✅ 桌面版安装包目录已创建: {desktop_releases_dir}")
 
-    # 🔥 启动时自动清理无效数据索引
-    # 清理文件已删除但索引中仍存在的无效项
-    try:
-        from app.services.data_service import data_service
-        cleanup_result = data_service.cleanup_index()
-        removed_count = cleanup_result.get('removed', 0)
-        if removed_count > 0:
-            logger.info(f"✅ 已清理 {removed_count} 个无效数据索引项")
-            for item in cleanup_result.get('items', []):
-                logger.info(f"   - {item.get('name', '未知')} ({item.get('id', '')}): {item.get('reason', '')}")
-        else:
-            logger.info("✅ 数据索引检查完成，无无效项")
-    except Exception as e:
-        logger.error(f"❌ 清理无效数据索引失败: {e}")
+    # 启动对账与临时文件清理：
+    # - 桌面端：放后台守护线程串行执行（非关键维护，登录前跑完即可）。launcher 以
+    #   /system/status 返回 200 为就绪信号，而 uvicorn 在 lifespan 结束前不接请求，
+    #   同步项越少，双击图标后窗口出现得越快
+    # - 服务器形态：保持启动时同步完成（systemd 重启不频繁，期望启动即对账干净）
+    if settings.NPT_DESKTOP:
+        import threading as _maint_threading
 
-    # 🧹 清理 layer_tmp 中超过 24h 的临时文件
-    # 分块上传后未消费/失败的残留（src_*），以及端点处理产生的临时副本
-    import time
-    _layer_tmp = settings.UPLOAD_DIR / "layer_tmp"
-    if _layer_tmp.exists():
-        now = time.time()
-        removed = 0
-        for f in _layer_tmp.glob("src_*"):
-            try:
-                if now - f.stat().st_mtime > 86400:  # 24h
-                    f.unlink(missing_ok=True)
-                    removed += 1
-            except Exception:
-                pass
-        if removed:
-            logger.info(f"✅ 已清理 {removed} 个过期 layer_tmp 临时文件")
-        else:
-            logger.info("✅ layer_tmp 临时文件检查完成，无过期文件")
-
-    # 🧹 清理 distance_tmp 中超过 24h 的临时文件（批量距离匹配上传的清单残留）
-    _distance_tmp = settings.UPLOAD_DIR / "distance_tmp"
-    if _distance_tmp.exists():
-        now = time.time()
-        removed = 0
-        for f in _distance_tmp.glob("src_*"):
-            try:
-                if now - f.stat().st_mtime > 86400:  # 24h
-                    f.unlink(missing_ok=True)
-                    removed += 1
-            except Exception:
-                pass
-        if removed:
-            logger.info(f"✅ 已清理 {removed} 个过期 distance_tmp 临时文件")
-        else:
-            logger.info("✅ distance_tmp 临时文件检查完成，无过期文件")
+        _maint_threading.Thread(
+            target=_desktop_startup_maintenance,
+            daemon=True,
+            name="npt-startup-maintenance",
+        ).start()
+    else:
+        _cleanup_invalid_index()
+        _purge_upload_tmp()
 
     # 初始化用户数据库
     try:
@@ -214,14 +232,7 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning(f"⚠️ 启动桌面数据变更监听失败: {e}")
 
-    # 桌面模式：更新已生效时清掉 updates 目录里的历史安装包（每份约 320MB）
-    if settings.NPT_DESKTOP:
-        try:
-            from app.services.desktop_update_service import cleanup_stale_installers
-
-            cleanup_stale_installers()
-        except Exception as e:
-            logger.warning(f"⚠️ 清理历史安装包失败: {e}")
+    # 历史安装包清理（每份约 320MB）已并入 npt-startup-maintenance 后台线程，不阻塞就绪
 
     # 桌面模式：登录态守卫（同一账号在别处登录 → 本机自动登出）
     if settings.NPT_DESKTOP:
@@ -263,14 +274,33 @@ async def lifespan(app: FastAPI):
 
     # 存量全量工参：「经纬度缺失或为 0」提醒条数按库内小区记录重算一次
     # （旧版在去重前按源文件行数统计，NR 共享小区的多条 PLMN 行会把 4 条报成 8 个，
-    # 导致网页端提示与桌面端解析结果不一致）。网页端与桌面端都需要修正。
-    try:
-        from app.services.data_service import data_service as _ds_for_warn_backfill
-        corrected = _ds_for_warn_backfill.backfill_coord_zero_warnings()
-        if corrected:
-            logger.info(f"✅ 坐标缺失提醒已按库内记录修正: {corrected} 个全量工参")
-    except Exception as e:
-        logger.warning(f"⚠️ 坐标缺失提醒回填失败: {e}")
+    # 导致网页端提示与桌面端解析结果不一致）。纯展示数字校正、首屏不依赖它，
+    # 桌面模式（含模式切换重启）放后台线程执行，避免大库 COUNT 拖慢窗口出现；
+    # 网页端保持启动时同步完成（systemd 重启不频繁，且运维期望启动即一致）。
+    if settings.NPT_DESKTOP:
+        import threading as _threading
+
+        def _backfill_coord_warnings_async() -> None:
+            try:
+                from app.services.data_service import data_service as _ds
+                corrected = _ds.backfill_coord_zero_warnings()
+                if corrected:
+                    logger.info(f"✅ 坐标缺失提醒已按库内记录修正: {corrected} 个全量工参")
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"⚠️ 坐标缺失提醒回填失败: {e}")
+
+        _threading.Thread(
+            target=_backfill_coord_warnings_async, daemon=True,
+            name="npt-coord-warn-backfill",
+        ).start()
+    else:
+        try:
+            from app.services.data_service import data_service as _ds_for_warn_backfill
+            corrected = _ds_for_warn_backfill.backfill_coord_zero_warnings()
+            if corrected:
+                logger.info(f"✅ 坐标缺失提醒已按库内记录修正: {corrected} 个全量工参")
+        except Exception as e:
+            logger.warning(f"⚠️ 坐标缺失提醒回填失败: {e}")
 
     # 服务器形态：后台补齐存量任务的小数量与「已应用」标记（同组任务历史展示用）。
     # 只扫未计算过/标记为未应用的行，分批解析提交；桌面端不需要（本机任务可直接算）。
