@@ -90,7 +90,7 @@ python desktop/tools/make_icon.py                       # 生成 desktop/app.ico
 python desktop/tools/spike.py                           # GDAL / pywebview / TAB 读写 / 上传链路基线自检
 pyinstaller --noconfirm --clean desktop/desktop.spec    # → dist/NetworkPlanningTool/{NPT.exe,_internal/}
 NPT.exe --selftest                                      # 打包产物冒烟
-ISCC desktop/installer.iss                              # → installer-out/NetworkPlanningTool-Setup-*.exe
+ISCC desktop/installer.iss                              # → installer-out/NetOpt Engine_Setup-*.exe
 ```
 
 - 权威打包链路是 `desktop/desktop.spec` + `.github/workflows/build-windows-desktop.yml`；根 `nptserve.spec` 是遗留配置（入口 `/tmp/nptserve/entry.py` 不在仓库内），**不要**用它构建
@@ -170,7 +170,7 @@ FastAPI (backend/app/)
 
 ### 桌面端运行形态（`desktop/`）
 
-- `desktop/launcher.py` 是 PyInstaller 入口：daemon 线程跑 uvicorn 绑 `127.0.0.1` 随机端口，主线程开 pywebview 窗口；注入 `NPT_DESKTOP=1`、`NPT_MAX_WORKERS=1`（Windows 无 fork）、`NPT_SERVER_URL`（默认 `https://app.pengwc.asia`）；可写数据落 `%APPDATA%\NetworkPlanningTool`（`NPT_DATA_ROOT` 可覆盖），与安装目录解耦；Windows 命名互斥体 `Local\NPTDesktop` 保证单实例；创建窗口须显式 `text_select=True`（pywebview 默认 False 会注入 `body{user-select:none}`，桌面端 UI 文字无法选中复制，网页端却能复制）；地图页「全屏」由壳层切窗口全屏（`POST /desktop/fullscreen` → `desktop_bridge.set_window_fullscreen` → pywebview `toggle_fullscreen()`，退出后补 `maximize()` 回到启动时的最大化窗口）——WebView2 里的 HTML Fullscreen 只让网页内容占满 WebView 自身，窗口/标题栏不变、占不满屏幕
+- `desktop/launcher.py` 是 PyInstaller 入口：daemon 线程跑 uvicorn 绑 `127.0.0.1` 随机端口，主线程开 pywebview 窗口；注入 `NPT_DESKTOP=1`、`NPT_MAX_WORKERS=1`（Windows 无 fork）、`NPT_SERVER_URL`（默认 `https://app.pengwc.asia`）；可写数据落 `%APPDATA%\NetworkPlanningTool`（`NPT_DATA_ROOT` 可覆盖），与安装目录解耦；**业务数据按运行模式分档**（`profiles/shared/`、`profiles/standalone/` 各一套 data.db/导入文件/任务历史，详见「数据隔离」）；Windows 命名互斥体 `Local\NPTDesktop` 保证单实例；创建窗口须显式 `text_select=True`（pywebview 默认 False 会注入 `body{user-select:none}`，桌面端 UI 文字无法选中复制，网页端却能复制）；地图页「全屏」由壳层切窗口全屏（`POST /desktop/fullscreen` → `desktop_bridge.set_window_fullscreen` → pywebview `toggle_fullscreen()`，退出后补 `maximize()` 回到启动时的最大化窗口）——WebView2 里的 HTML Fullscreen 只让网页内容占满 WebView 自身，窗口/标题栏不变、占不满屏幕
 - **同一份后端代码跑两种形态**：`NPT_DESKTOP=1` 时 `api/__init__.py` 额外挂后台协程（`desktop_cloud_client.renewal_loop` 静默续期、`desktop_sync_service.sync_loop` 共享模式同步、`desktop_local.session_guard_loop` 单设备登录校验），并放行 `/api/v1/desktop`；服务器专用管理端点（`admin_users` 等）经 `core/security.reject_desktop_mode` 在桌面形态下一律 404
 - **所有桌面分支必须由 `NPT_DESKTOP` 门控，不得改变服务器（systemd）部署行为**
 - 授权：Ed25519 密钥对由 `desktop/tools/gen_keypair.py` 生成，私钥在 `desktop/tools/keys/`（已 gitignore，**禁止入库/外发**），公钥 hex 写入 `backend/app/core/license_public_key.py`；`desktop/tools/gen_license.py` 签发离线 `.nptlic`
@@ -195,7 +195,8 @@ FastAPI (backend/app/)
 - Zustand store（`store/`，17 个）：`authStore`（含桌面端 `desktopMode`/`desktopProbed`/`desktopRunMode`/`desktopPendingUsername`，`probeDesktopMode()` 探测本机后端）、`dataStore`、`taskStore`、`mapStore`（按用户持久化，与后端 user settings 同步）、`layerEditStore`（图层编辑真源：workspaces/撤销/剪贴板）、`mapDataCacheStore`（跨页 LRU）、`desktopSyncStore`（共享模式每 5s 轮询 `/desktop/sync-status`，同步落地派发 `DESKTOP_SYNCED_EVENT`）、`licenseStore`、`pciStore`/`neighborStore`/`tacCheckStore`/`tacPlanningStore`（向导状态）、`tacStore`（旧版，`@deprecated`）、`themeStore`、`toastStore`、`downloadStore`；`uploadStore` 不是 Zustand（分片上传单例）
 **切账号时的内存态清理**：`authStore.clearUserDataCaches()`（登录/注册/登出/桌面登录四处调用）统一清 `mapDataService` 内存缓存、数据列表、`layerEditStore`（工作集/撤销栈/剪贴板/编辑态，`resetForUserSwitch`）与 `mapDataCacheStore`（图层 GeoJSON/工参/地理化 LRU）；新增「按用户隔离」的内存态必须挂到这里，否则会出现「上一账号打开过的图层/未保存改动」带到下一个账号（2026-10-13 修：3D 基站图层显隐曾停在挂载那一刻的值、编辑工作集跨账号残留）。
 - `services/api.ts`：`apiClient`（`/api/v1`，300s）+ `uploadClient`（dev 直连 8000，规避 multipart 代理问题）+ 拦截器；按域导出 `authApi` / `adminUserApi` / `userSettingsApi` / `appVersionsApi` / `dataApi` / `layerApi` / `layerToolsApi` / `pciApi` / `neighborApi` / `tacApi` / `tacPlanningApi` / `distanceMatchApi` / `siteSpacingApi` / `mapApi` / `assistantApi` / `systemApi`（`info`/`desktopMode`）/ `desktopLoginApi` / `desktopCloudApi` / `desktopLicensesApi` / `desktopReleasesApi` / `desktopUpdateApi` 等
-- 地图（`components/Map/`，41 个 `.ts`/`.tsx` 源文件）：`OnlineMap.tsx`（Leaflet + 高德，跨页共享实例缓存，托管图层/选择/编辑会话）、`OfflineMap.tsx`、`MapInfoLayer.tsx`（TAB/MIF）、`GeoDataLayer.tsx`、`SectorRendererSVG.tsx`（LTE/NR 扇区）、`LayerControl.tsx`（图层树：显隐/可选/编辑开关/排序）、`LabelLayoutManager.ts`（统一标签防重叠）、`HeatmapLayerManager.ts`（值热力面）、`OriginalSamplesLayer.ts`、`FloatingPanel.tsx`（可拖拽缩放浮动面板）等
+- 地图（`components/Map/`，44 个 `.ts`/`.tsx` 源文件，另有 `__tests__/`）：`OnlineMap.tsx`（2D，Leaflet + 高德，跨页共享实例缓存，托管图层/选择/编辑会话）、`cesium/CesiumMap.tsx`（3D，CesiumJS + 天地图影像，`OnlineMap` 的同构替身：同一套 props 与 `OnlineMapRef`，MapPage 按 `mapProvider` 只换挂载点）、`OfflineMap.tsx`、`MapInfoLayer.tsx`（TAB/MIF）、`GeoDataLayer.tsx`、`SectorRendererSVG.tsx`（LTE/NR 扇区 + PCI 模着色）、`LayerControl.tsx`（图层树：显隐/可选/编辑开关/排序）、`labelLayoutCore.ts`（标签防重叠与绘制的共享纯函数）+ `LabelLayoutManager.ts`（2D Leaflet 侧接入）+ `cesium/CesiumLabelOverlay.ts`（3D 侧接入，同一算法）、`HeatmapLayerManager.ts`（2D 值热力面）+ `cesium/CesiumHeatmapLayer.ts`（3D 侧，共用计算与栅格化）、`OriginalSamplesLayer.ts`、`FloatingPanel.tsx`（可拖拽缩放面板）、`AttributeJoinDialog.tsx`（条件选择）、`BufferDialog.tsx`（绘制缓冲区）、各类图例与对话框。
+  - **2D/3D 行为必须拉齐**：3D 的交互手势、配色、图例口径一律以 2D 为准（测量＝右键结束、圈选＝拖动有框且松手保留终态框、点选＝橙色描边、标签统一防重叠）。3D 侧的高频重绘图形（圈选框、点选高亮、标签）走**屏幕空间覆盖层**（SVG / Canvas），不要每次鼠标移动都重建 Cesium 贴地图元——`clampToGround` 图元要等地形瓦片就绪才出图，每帧重建等于永远画不出来，且集合在渲染帧附近被改会触发 Cesium 内部 `TypeError: ...reading '_target'`。
 - 图层编辑子系统：`components/Map/LayerEditSession.ts`（绘制/顶点/吸附/圈选/命中，由 OnlineMap 懒创建）+ `store/layerEditStore.ts`；工具栏在 `pages/MapPage.tsx`
 - 坐标约定见下方「坐标系」
 - i18n：i18next 单 namespace，`locales/zh.json` / `en.json`（约 1600 行 / 23 个分组）；语言切换入口在 LicensePage
@@ -295,6 +296,8 @@ FastAPI (backend/app/)
 - **桌面版登录与授权（2026-10 改版）**：桌面端不再有 owner 免登录账号，与网页端**共用同一套账号**；桌面形态的登录页多一组「运行模式」选择：
   - **共享模式**：`POST /desktop/login`（本机）→ 代理 `POST /desktop-cloud/auth/login`（服务器）→ 用 `auth_service.authenticate_user` 校验网页端账号 → 为「账号 + 机器」自动签发许可（`DesktopLicense.mode='shared'`，兼作同步凭证）→ 本机镜像同名本地账号（组/权限位/管理员位照搬）→ 签发本机 JWT。**登录优先**：首次同步不在登录路径上跑，登录响应返回后 `LOGIN_SYNC_DELAY_SECONDS`（5s）由后台定时器触发一次 `sync_once`。
   - **单机模式**：同流程，但按 `(username, machine_code)` 找/建 `mode='standalone'` 授权；未批准返回 `result=pending`，前端 `DesktopAuthPendingDialog` 轮询 `POST /desktop/auth-poll`，管理员在网页端「桌面授权」页批准后签发许可。单机模式强制 `run_mode=offline`（数据本机私有、不参与同步）、隐藏授权/同步/数据组卡片。**离线可用**：本机已有该账号镜像且许可有效时，服务器登录只给短探测（`STANDALONE_ONLINE_PROBE_SECONDS`＝4s），连不上/5xx 立即离线登录（本地校验密码，`offline=true`）；许可过期/换机/账号不匹配按本地原因明确提示。离线登录置 `needs_license_verify`，联网后巡检经许可续期通道校验并续期（过期可自动换回有效许可），`license_verified`/`license_error` 随 `/desktop/session-status` 回传、前端 toast。**权限位与网页端一致**（不再全量放行），由管理员在「用户管理 → 编辑」设置；运行中经 `session-check` 心跳同步到本机镜像账号。**2026-10-09 调整**：① **管理员完全免授权**——服务端按模式直接签发 active 许可（忽略 pending/禁用/换机限制），本机离线也不要求已有许可（镜像管理员账号 + 密码即可登录）；② 普通用户**授权一次即可**——离线单机登录不再要求"本机许可必须是单机模式"，有效许可（shared/standalone）归属账号匹配 + 本机密码正确即可；③ **记住账号密码**——登录页勾选（默认勾选）后本机 Fernet 加密存 `DATA_ROOT/last_login.json`（密钥 `.last_login.key` 0600），`GET/DELETE /desktop/last-login` 读写，勾选时登录页自动登录一次（失败回退表单）；用户主动退出登录后本次不再自动登录（必须手动点登录），凭据保留、下次启动软件照常自动登录。
+
+- **共享/单机数据物理隔离（2026-10-16）**：两种运行模式各用独立配置档（profile），路径 `%APPDATA%/NetworkPlanningTool/profiles/<shared|standalone>/`，档内各自持有 `data/data.db`（工参/图层/**历史任务**/用户镜像全部表）、`data/<id>/`（导入文件 original.xlsx 等）、`uploads/`、`outputs/`、`exports/`、`sync_state.json`；授权（`licenses/`）、记住密码、OTA（`updates/`）、`webview/`、日志、端口仍在数据根全局共享。配置档由 `core/desktop_profiles.py` 管理，launcher 导入 app 前读 `active_profile.json` 注入 `NPT_DESKTOP_PROFILE`（config 导入时按档定型路径）；首启自动把旧版平铺数据幂等迁入 shared 档（单机档从空库开始）。**切模式必须重启进程**：`/desktop/login`（注册同理）发现请求模式 ≠ 当前档时短路（不建镜像、不发 token、不触服务器），把加密的一次性凭据写全局 `pending_login.json` 并改 `active_profile.json`，前端收到 `restart_required` 调 `/desktop/restart`（Windows 脚本等退出后自动拉起，非 Windows 提示手动重启），新档登录页消费 pending 自动登录；浏览器侧 IndexedDB 缓存键经 `utils/cacheKey.ts` 追加 `_dshared/_dstandalone` 后缀，防止同账号两档镜像 id 相同导致串缓存。
   - 单设备登录：共享模式登录在服务器记账并踢掉该账号其它会话；客户端每 60s 调 `POST /desktop-cloud/auth/session-check`，**只有服务器明确回复 `valid=False`**（账号在别处登录/会话失效）才本机登出（`desktop_local.session_guard_loop`）；网络不可达、超时、5xx 一律按"无法确定"处理，断网（尤其单机模式）可继续使用，绝不因网络抖动踢下线。每次联机登录累加 `DesktopLicense.login_count`，断网登录本机记账、联机补报。
 - **桌面端数据同步（共享模式）**：粒度是**整包数据集（zip）**，不是行级增量。`dataset_revision_service.py` 为每个数据集维护**单调递增 rev**——只有真正改变内容的写入才 `bump`，`set_sha`（下载）不推进 rev，否则 rev 抖动会导致反复整包下载；删除写**墓碑** `deleted=True`，避免本地删除被当成新建推回。客户端 `sync_state.json` 记录「服务器 rev 基线 + sha256 + dirty」，本地改动经 `NPT_DESKTOP_SYNC_DEBOUNCE_SECONDS` 防抖后立即上行；**服务器 → 桌面端走长轮询即时推送**（`desktop_sync_service.watch_loop` 常连 `POST /desktop-cloud/data/changes`，服务器按「组内数据集 + rev + 墓碑」算指纹，变化即刻返回并触发 `sync_once`，无变化挂起 25 秒），`sync_loop` 只作兜底轮询。冲突不做行级合并：**按「最后更新时间」自动选边（LWW）**——清单项带 `server_updated_at`，本地改动记 `changed_at`（用清单 `server_time` 校准时钟偏差），本地更晚则带 `changed_at` 覆盖服务器、服务器更晚则直接采用服务器版本；时间戳缺失的存量条目才走人工选边（`/desktop/sync-resolve`）。push 带 `base_rev` 乐观锁 + `changed_at`，服务器 rev 不符且改动时间不晚于服务器更新时间时返回 409；待上行删除在服务器有更新时会被撤销并拉回。**服务器权威 `dataset_revisions` 表与本地 `sync_state.json` 里记录的服务器 rev 是两套数字，不可混用。**
 - **同组任务历史共享（2026-10-08）**：PCI/邻区/TAC 核查/TAC 规划四类历史任务（`TaskManager.SHARED_TASK_TYPES`）在同组内互通。网页端历史列表本就按组过滤；桌面端共享模式新增任务同步（`sync_once` 第 4 步 `sync_tasks`）：拉同组任务元数据写入本机镜像行（`task_results.origin='shared'`，结果按需拉取，小结果类型另预拉取，见下条）、本机新建规划任务含结果上行（只推一次）、传播删除与应用标记；镜像结果在查看/导出时按需从服务器拉取并缓存。服务端接口 `/desktop-cloud/data/tasks/*`（许可+机器码鉴权，组以授权记录为准）。存量无组任务启动迁移时按发起人 `user_name` 的当前组重盖章。
@@ -360,7 +363,7 @@ except Exception as e:
 ### 桌面端与服务器共存
 
 - 桌面端与网页端**共用同一份后端代码**；所有桌面专属分支必须由 `NPT_DESKTOP` 门控，**不得改变服务器（systemd）部署行为**
-- 新增数据读写路径同样要接数据组门禁；桌面端本机后端与服务器端后端各有一套 `data.db`，共享模式靠 `dataset_revisions` + `sync_state.json` 对齐，不要绕开同步链路直接改对端库
+- 新增数据读写路径同样要接数据组门禁；桌面端本机按运行模式持有**两套** `data.db`（`profiles/shared/`、`profiles/standalone/`，2026-10-16 起物理隔离，切档靠重启），与服务器端再各一套；共享模式靠 `dataset_revisions` + 档内 `sync_state.json` 对齐，不要绕开同步链路直接改对端库
 - `desktop/tools/keys/` 与 `licenses/` 下的 Ed25519 私钥已 gitignore，**禁止入库或外发**
 
 ### 代码风格
@@ -368,7 +371,7 @@ except Exception as e:
 - 前端：外部库 → 内部 `@/` 或 `@shared` 别名 → `type` 类型导入；组件 PascalCase、函数 camelCase、常量 UPPER_SNAKE_CASE、文件 kebab-case
 - 后端：标准库 → 第三方 → 内部（`from app...`）；类 PascalCase、函数 snake_case
 - React：Effects 仅用于同步外部系统（地图/事件/WS）；派生状态用 `useMemo`；自定义 Hook 以 `use` 前缀
-- 前端栈：React 18 + TypeScript + Zustand + Tailwind + Radix UI + lucide-react；地图 Leaflet / react-leaflet（在线）+ 自定义扇区渲染
+- 前端栈：React 18 + TypeScript + Zustand + Tailwind + Radix UI + lucide-react；地图 Leaflet/react-leaflet（2D 在线/离线）+ CesiumJS（3D，CDN 懒加载 `services/cesiumLoader.ts`，无本地包故类型一律 `any`）+ 自定义扇区渲染。
 - 单文件超过 500 行、单函数超过 50 行时应识别拆分（见根 `AGENTS.md`）
 
 ### 协作与提交约定（来自根 `AGENTS.md`）
