@@ -100,7 +100,9 @@ def _clean_props(props: Dict[str, Any]) -> Dict[str, Any]:
 # ============================ 图层加载 ============================
 
 def _resolve_source_file(data_id: str, layer_id: str) -> Optional[Path]:
-    """定位 MapInfo 图层源文件（优先 layers.json 记录的 metadata.source_file）"""
+    """定位 MapInfo 图层源文件（记录路径跨机器失效时回退到本机数据目录同名文件）。"""
+    from app.services.layer_paths import resolve_layer_source_path
+
     data_dir = settings.DATA_DIR / data_id
     layers_file = data_dir / "layers.json"
     if layers_file.exists():
@@ -109,15 +111,9 @@ def _resolve_source_file(data_id: str, layer_id: str) -> Optional[Path]:
             for layer in layers:
                 if layer.get("id") != layer_id:
                     continue
-                sf = layer.get("metadata", {}).get("source_file")
-                if sf and Path(sf).exists():
-                    return Path(sf)
-                name = layer.get("name")
-                if name:
-                    for ext in (".tab", ".mif", ".kml"):
-                        cand = data_dir / f"{name}{ext}"
-                        if cand.exists():
-                            return cand
+                src = resolve_layer_source_path(data_dir, layer)
+                if src is not None:
+                    return src
         except Exception as e:
             print(f"[AttributeJoin] 读 layers.json 失败: {e}")
     # 兜底：在数据目录内按 layer_id/名称模糊查找

@@ -23,6 +23,7 @@ from app.utils.coordinate_transformer import CoordinateTransformer
 from app.utils.geojson_geometry import transform_coordinate_lists
 from app.core.database import SessionLocal
 from app.models.database import Layer
+from app.services.layer_paths import resolve_layer_source_path
 from app.services.ogr_style_reader import read_feature_style_strings
 
 # 图层源文件扩展名（.shx/.dbf/.prj/.qml 是 SHP 的配套文件，本身不是图层源）。
@@ -2100,21 +2101,11 @@ def get_layer_data(data_id: str, layer_id: str, data_dir: Path) -> Optional[Dict
             print(f"[MapInfo] 读取 layers.json 失败: {e}")
 
     # 2. 确定源文件路径（用于缓存 mtime 验证）
-    source_path = None
-    if target_layer_info:
-        source_file = target_layer_info.get('metadata', {}).get('source_file')
-        if source_file:
-            candidate = Path(source_file)
-            if candidate.exists():
-                source_path = candidate
-        if source_path is None:
-            name = target_layer_info.get('name')
-            if name:
-                for ext in LAYER_SOURCE_EXTS:
-                    candidate = data_dir / f"{name}{ext}"
-                    if candidate.exists():
-                        source_path = candidate
-                        break
+    #    记录路径可能来自另一台机器 / 旧数据根，统一走可移植解析（失败回退同名文件）
+    source_path = (
+        resolve_layer_source_path(data_dir, target_layer_info)
+        if target_layer_info else None
+    )
 
     # 3. 检查缓存（基于源文件 mtime）
     if source_path and cache_key in _layer_cache:
@@ -2240,19 +2231,7 @@ def get_layer_data_gz_bytes(data_id: str, layer_id: str, data_dir: Path) -> Opti
             with open(layers_file, 'r', encoding='utf-8') as f:
                 for layer in _json.load(f):
                     if layer.get('id') == layer_id:
-                        source_file = layer.get('metadata', {}).get('source_file')
-                        if source_file:
-                            candidate = Path(source_file)
-                            if candidate.exists():
-                                source_path = candidate
-                        if source_path is None:
-                            name = layer.get('name')
-                            if name:
-                                for ext in LAYER_SOURCE_EXTS:
-                                    candidate = data_dir / f"{name}{ext}"
-                                    if candidate.exists():
-                                        source_path = candidate
-                                        break
+                        source_path = resolve_layer_source_path(data_dir, layer)
                         break
         except Exception:
             pass

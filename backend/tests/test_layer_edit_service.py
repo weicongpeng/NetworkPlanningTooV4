@@ -280,3 +280,34 @@ def test_empty_layer_has_default_attribute_column(temp_data_dir):
     # 0 要素读回时 geopandas 不推断 geometry 列，但默认 name 属性列必须存在、行数为 0
     assert "name" in gdf.columns
     assert len(gdf) == 0
+
+
+def test_save_resolves_foreign_source_path(temp_data_dir):
+    """layers.json 记录的是另一台机器/旧数据根的绝对路径时，保存应回退到本机同名文件。
+
+    回归点（用户报告）：桌面端共享模式/网页端保存图层报
+    「图层源文件不存在: C:\\Users\\...\\NetworkPlanningTool\\data\\<id>\\xxx.tab」——
+    图层文件随数据集同步到了当前数据目录，但 metadata.source_file 还是打包端的绝对路径。
+    """
+    from app.services.layer_edit_service import save_layer_geojson, build_layer_zip
+
+    r = layer_edit_service.create_empty_tab_layer("跨端图层", "point", user_id=1)
+    did, lid = r["data_id"], r["layer_id"]
+    data_dir = temp_data_dir / did
+    layers_file = data_dir / "layers.json"
+    layers = json.loads(layers_file.read_text("utf-8"))
+    layers[0]["metadata"]["source_file"] = (
+        rf"C:\Users\old\AppData\Roaming\NetworkPlanningTool\data\{did}\\{r['name']}.tab"
+    )
+    layers_file.write_text(json.dumps(layers, ensure_ascii=False), encoding="utf-8")
+
+    feats = [{"type": "Feature", "properties": {"name": "点"},
+              "geometry": {"type": "Point", "coordinates": [116.4, 39.9]}}]
+    save_layer_geojson(did, lid, _fc(feats), user_id=1)
+
+    # 保存后路径自愈为本机真实路径
+    healed = json.loads(layers_file.read_text("utf-8"))[0]
+    assert healed["metadata"]["source_file"] == str(data_dir / f"{r['name']}.tab")
+    # 下载打包同样不受影响
+    data, _ = build_layer_zip(did, lid)
+    assert data

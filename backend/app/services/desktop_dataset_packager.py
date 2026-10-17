@@ -254,6 +254,18 @@ def install_package(
     if entry_type == "map":
         new_entry["status"] = "ready"
         new_entry.pop("errorMessage", None)
+        # 包内 layers.json 的 source_file 是打包机器上的绝对路径（Windows/POSIX 各不相同），
+        # 必须按接收方当前数据根重写，否则网页端 / 另一端保存图层会报「图层源文件不存在」。
+        try:
+            from app.services.layer_paths import rebase_layer_entries
+
+            layers, _ = rebase_layer_entries(data_dir)
+            if layers:
+                metadata = new_entry.setdefault("metadata", {})
+                metadata["layers"] = layers
+                metadata["layerCount"] = len(layers)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[数据集解包] 图层路径校正失败（按原路径继续）{data_id}: {exc}")
         data_service.index[data_id] = new_entry
         data_service._save_index()
         _upsert_layers(data_id, new_entry, user_id, city, operator)
@@ -313,6 +325,8 @@ def _upsert_layers(
         logger.warning(f"[数据集解包] 图层元数据模块不可用: {exc}")
         return
 
+    from app.services.layer_paths import resolve_layer_source_path
+
     layers = (entry.get("metadata") or {}).get("layers") or []
     data_dir = settings.DATA_DIR / data_id
     for layer in layers:
@@ -321,10 +335,13 @@ def _upsert_layers(
         layer_id = layer.get("id") or layer.get("layer_id")
         if not layer_id:
             continue
-        file_field = layer.get("file_path") or layer.get("file") or layer.get("path") or ""
-        rel = Path(file_field).name if file_field else ""
-        resolved = (data_dir / rel) if rel else None
-        file_path = str(resolved) if resolved and resolved.exists() else str(data_dir / rel)
+        resolved = resolve_layer_source_path(data_dir, layer)
+        if resolved is not None:
+            file_path = str(resolved)
+        else:
+            file_field = layer.get("file_path") or layer.get("file") or layer.get("path") or ""
+            rel = Path(file_field).name if file_field else ""
+            file_path = str(data_dir / rel) if rel else str(data_dir)
         try:
             _upsert_layer_metadata(
                 layer_id=layer_id,

@@ -26,6 +26,7 @@ from app.services.tab_io import (
     write_mapinfo_tab, verify_tab_readable, remove_tab_stem,
     build_field_data, _postprocess_tab,
 )
+from app.services.layer_paths import layer_source_suffix, resolve_layer_source_path
 from app.services.layer_service import (
     _truncate_bytes, _sanitize_field_name, _dedupe_field_names,
     hex_to_mapinfo_color, is_no_color, tab_opacity_brush_pattern,
@@ -105,12 +106,16 @@ def _touch_dataset_revision(data_id: str) -> None:
         from app.services import dataset_revision_service as revs
 
         revs.bump(data_id, deleted=False)
-        # 桌面共享模式：本地改动要上行到服务器
+    except Exception as e:  # noqa: BLE001
+        print(f"[LayerEdit] 数据集修订号更新失败（非致命）: {e}")
+    # 桌面共享模式：本地改动要上行到服务器。与修订号记账分开 try——
+    # rev 推进失败（如组信息缺失）也必须触发上行，否则网页端同组用户看不到这次保存。
+    try:
         from app.services.desktop_sync_service import note_change
 
         note_change(data_id)
     except Exception as e:  # noqa: BLE001
-        print(f"[LayerEdit] 数据集修订号更新失败（非致命）: {e}")
+        print(f"[LayerEdit] 桌面同步记账失败（非致命）: {e}")
 
 
 def _layer_fmt(path: Path) -> Optional[str]:
@@ -323,12 +328,10 @@ def build_data_layers_zip(data_id: str) -> tuple:
     used_names: set = set()
     with _zipfile.ZipFile(buf, "w", _zipfile.ZIP_DEFLATED) as zf:
         for entry in layers:
-            src = (entry.get("metadata", {}) or {}).get("source_file")
-            src_path = Path(src) if src else None
-            if src_path is None or not src_path.exists():
+            src_path = resolve_layer_source_path(data_dir, entry)
+            if src_path is None:
                 # 兜底：按图层名在数据目录找同名源文件
                 name = entry.get("name") or ""
-                src_path = None
                 for ext in (".tab", ".TAB", ".mif", ".kml"):
                     cand = data_dir / f"{name}{ext}"
                     if cand.exists():
@@ -372,10 +375,14 @@ def build_layer_zip(data_id: str, layer_id: str) -> tuple:
     if entry is None:
         raise ValueError(f"未找到图层: {layer_id}")
     source_file = entry.get("metadata", {}).get("source_file")
-    source_path = Path(source_file) if source_file else None
+    # 记录本身就是 MIF/KML 时明确不支持编辑保存，不能借同名 TAB 回退
+    if layer_source_suffix(entry) in (".mif", ".kml"):
+        raise FileNotFoundError(f"图层源文件不存在: {source_file}")
+    source_path = resolve_layer_source_path(data_dir, entry)
     fmt = _layer_fmt(source_path) if source_path else None
-    if source_path is None or fmt is None or not source_path.exists():
-        raise FileNotFoundError(f"图层源文件不存在: {source_path}")
+    if source_path is None or fmt is None:
+        # 记录路径可能来自另一台机器 / 旧数据根；解析不到时给出原记录便于排查
+        raise FileNotFoundError(f"图层源文件不存在: {source_file or entry.get('name') or layer_id}")
 
     buf = _io.BytesIO()
     with _zipfile.ZipFile(buf, "w", _zipfile.ZIP_DEFLATED) as zf:
@@ -596,11 +603,15 @@ def _resolve_layer_target(data_id: str, layer_id: str) -> tuple:
         raise ValueError(f"未找到图层: {layer_id}")
 
     source_file = entry.get("metadata", {}).get("source_file")
-    source_path = Path(source_file) if source_file else None
+    # 原图层是 MIF/KML：即使同目录有同名 TAB 也不能当成可编辑目标
+    if layer_source_suffix(entry) in (".mif", ".kml"):
+        raise ValueError("仅支持保存 MapInfo TAB / ESRI Shapefile / GeoJSON 图层（MIF/KML 暂不支持编辑保存）")
+    source_path = resolve_layer_source_path(data_dir, entry)
     if source_path is None or _layer_fmt(source_path) is None:
         raise ValueError("仅支持保存 MapInfo TAB / ESRI Shapefile / GeoJSON 图层（MIF/KML 暂不支持编辑保存）")
-    if not source_path.exists():
-        raise FileNotFoundError(f"图层源文件不存在: {source_path}")
+    # 记录的是别的机器 / 旧数据根的绝对路径时，解析结果已自动回退到本机 data_dir 下的同名文件
+    if str(source_path) != str(source_file or ""):
+        entry.setdefault("metadata", {})["source_file"] = str(source_path)
 
     entry_type = entry.get("type", "point")
     if not _OGR_GEOM_BY_ENTRY.get(entry_type):
