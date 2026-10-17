@@ -65,6 +65,22 @@ export function DesktopUpdateDialog() {
 
   const release = status?.release || null
 
+  /**
+   * 发现可更新且尚无下载任务时**静默预下载**安装包：下载在后台进行，不打断用户
+   * （不弹进度窗）；完成后由 DesktopUpdateReadyDialog 弹窗提示「重启更新」。
+   * 下载失败静默忽略，下次自动检查会再试；ready/downloading 状态不重复启动。
+   */
+  const maybeAutoDownload = useCallback(async (data: DesktopUpdateStatus) => {
+    if (!data.update_available || !data.release) return
+    if ((data.download?.phase || 'idle') !== 'idle') return
+    try {
+      await desktopUpdateApi.download(data.release.version)
+      setProgress((prev) => ({ ...prev, phase: 'downloading' }))
+    } catch {
+      /* 静默下载失败不打扰用户 */
+    }
+  }, [])
+
   // force=false：自动检查不打断用户；手动点「检查更新」时立即展示
   const check = useCallback(async (force = false) => {
     try {
@@ -78,6 +94,7 @@ export function DesktopUpdateDialog() {
         phase: res.data.download?.phase || 'idle',
         error: res.data.download?.error,
       })
+      void maybeAutoDownload(res.data)
       if (res.data.download?.phase === 'ready') {
         setVisible(true)
         return
@@ -100,7 +117,7 @@ export function DesktopUpdateDialog() {
     } catch {
       // 网页版或后端不可用
     }
-  }, [])
+  }, [maybeAutoDownload])
 
   useEffect(() => {
     if (!desktopMode) return
@@ -131,9 +148,10 @@ export function DesktopUpdateDialog() {
       error: requested.download?.error,
     })
     setMessage(null)
+    void maybeAutoDownload(requested)
     setVisible(Boolean(requested.update_available && requested.release))
     clearRequest()
-  }, [requested, clearRequest])
+  }, [requested, clearRequest, maybeAutoDownload])
 
   // 下载中每 1 秒轮询进度
   useEffect(() => {

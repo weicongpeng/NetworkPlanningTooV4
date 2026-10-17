@@ -1,14 +1,13 @@
 /**
- * 后台下载完成后的「重启更新」提示弹窗。
+ * 安装包下载完成后的「重启更新」提示弹窗。
  *
- * 场景：用户在更新弹窗点了「后台运行」→ 窗口关掉 → 安装包在后台继续下载。
- * 下载完成后**必须再给用户一个明确入口**：此前只有「系统设置 → 版本」里的那一条提示，
- * 用户不主动打开设置就看不到"可以重启更新了"。
+ * 场景：发现新版本后客户端**静默预下载**安装包（用户点「立即更新」/「后台运行」的
+ * 下载同样适用）。下载完成后**必须再给用户一个明确入口**：静默下载不打扰用户，
+ * 若没有这个弹窗，用户只有打开「系统设置 → 版本」才能看到"可以重启更新了"。
  *
  * 触发条件（后端 `/desktop/update/progress` 的 state）：
- * - `background === true`：这条下载是后台模式的（前台下载由 DesktopUpdateDialog 自己提示，
- *   不重复弹）
- * - `phase === 'ready'`：安装包已下载完成
+ * - `phase === 'ready'`：安装包已下载完成（前台/后台/静默下载都提示）
+ * - 主更新弹窗可见时避让：由主弹窗自己的「重启并安装」按钮接手，不叠两个对话框
  *
  * 「稍后更新」按版本记忆，不反复打扰；「重启更新」与更新弹窗的「重启并安装」是同一个
  * 后端动作（拉起升级脚本 → 等本进程退出 → 静默安装 → 自动重启新版本）。
@@ -58,17 +57,17 @@ export function DesktopUpdateReadyDialog() {
       const res: any = await desktopUpdateApi.progress()
       const data = res?.data || {}
       const phase = String(data.phase || 'idle')
-      // 只关心**后台模式**的下载：前台下载由 DesktopUpdateDialog 负责提示
-      if (!data.background) return
+      // 安装包已就绪就提示（静默/前台/后台下载都算）：主更新弹窗可见时不轮询、
+      // 渲染时也让位，由主弹窗的「重启并安装」接手
       if (phase === 'ready') {
         const version = String(data.version || '')
         const dismissed = readDismissed()
         if (dismissed && dismissed.version === version) return
         if (promptedRef.current === version) return
         promptedRef.current = version
-        setReady({ phase, background: true, version })
+        setReady({ phase, background: Boolean(data.background), version })
       } else if (phase === 'failed') {
-        // 后台下载失败：交给自动检查下次提醒，这里不占着屏幕
+        // 下载失败：交给自动检查下次提醒，这里不占着屏幕
         setReady(null)
       }
     } catch {
@@ -79,11 +78,13 @@ export function DesktopUpdateReadyDialog() {
   useEffect(() => {
     if (!desktopMode || mainVisible) return
     const timer = window.setInterval(poll, POLL_INTERVAL_MS)
-    // 首轮立即跑一次：软件启动时后台下载可能已经完成（重启过软件）
+    // 首轮立即跑一次：软件启动时下载可能已经完成（重启过软件）
     void poll()
     return () => window.clearInterval(timer)
   }, [desktopMode, mainVisible, poll])
 
+  // 主弹窗打开后让位：安装入口由主弹窗接手
+  if (!ready || mainVisible) return null
   const handleInstall = async () => {
     setBusy(true)
     setMessage(t('desktopUpdate.installing'))
@@ -108,8 +109,6 @@ export function DesktopUpdateReadyDialog() {
     }
     setReady(null)
   }
-
-  if (!ready) return null
 
   return (
     <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-[110] p-4">

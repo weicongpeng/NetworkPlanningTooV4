@@ -1,9 +1,9 @@
 /**
- * DesktopUpdateReadyDialog：**后台**下载安装包完成后，要弹「重启更新 / 稍后更新」对话框。
+ * DesktopUpdateReadyDialog：**安装包下载完成后**要弹「重启更新 / 稍后更新」对话框。
  *
  * 回归点：
- * - 只有 `background === true` 且 `phase === 'ready'` 才弹（前台下载由 DesktopUpdateDialog
- *   自己提示，不叠两个对话框；主弹窗可见时也避让）
+ * - `phase === 'ready'` 即弹（静默预下载/前台/后台下载都提示；主弹窗可见时避让，
+ *   由主弹窗的「重启并安装」接手，不叠两个对话框）
  * - 「重启更新」= POST /desktop/update/install（与更新弹窗同一后端动作）；
  *   code===0（连接被切断，应用正在退出）不算失败
  * - 「稍后更新」按版本记忆，不反复打扰
@@ -57,13 +57,15 @@ describe('DesktopUpdateReadyDialog', () => {
     expect(screen.queryByText(TITLE)).toBeNull()
   })
 
-  it('前台下载完成（background=false）不弹 —— 由主更新弹窗提示', async () => {
+  it('前台/静默下载完成（background=false）同样弹「重启更新」提示', async () => {
+    // 静默预下载（不经过主更新弹窗手动触发）完成后也必须给用户安装入口
     vi.mocked(desktopUpdateApi.progress).mockResolvedValue({
       success: true, data: { phase: 'ready', background: false, version: '0.0.33' },
     } as any)
     render(<DesktopUpdateReadyDialog />)
-    await waitFor(() => expect(desktopUpdateApi.progress).toHaveBeenCalled())
-    expect(screen.queryByText(TITLE)).toBeNull()
+    expect(await screen.findByText(TITLE)).toBeTruthy()
+    expect(screen.getByText(READY)).toBeTruthy()
+    expect(screen.getByText(RESTART)).toBeTruthy()
   })
 
   it('后台下载完成 → 弹出「重启更新 / 稍后更新」与目标版本', async () => {
