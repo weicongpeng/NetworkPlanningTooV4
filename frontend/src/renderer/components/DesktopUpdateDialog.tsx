@@ -13,6 +13,22 @@ const PROMPT_STORAGE_KEY = 'npt-ota-last-prompt'
 /** 启动后延迟检查，避免与首屏争资源 */
 const FIRST_CHECK_DELAY_MS = 8000
 
+/** 版本比较：a>b 返回 1，a<b 返回 -1，相等返回 0（数字段按数值比，避免 9>37 的字符串误判） */
+function compareVersions(a: string, b: string): number {
+  const pa = String(a || '').split(/[.\-_+]/)
+  const pb = String(b || '').split(/[.\-_+]/)
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const na = Number.parseInt(pa[i] ?? '', 10)
+    const nb = Number.parseInt(pb[i] ?? '', 10)
+    if (!Number.isNaN(na) && !Number.isNaN(nb)) {
+      if (na !== nb) return na > nb ? 1 : -1
+    } else if ((pa[i] ?? '') !== (pb[i] ?? '')) {
+      return (pa[i] ?? '') > (pb[i] ?? '') ? 1 : -1
+    }
+  }
+  return 0
+}
+
 function readLastPrompt(): { version: string; at: number } | null {
   try {
     const raw = localStorage.getItem(PROMPT_STORAGE_KEY)
@@ -107,6 +123,7 @@ export function DesktopUpdateDialog() {
   useEffect(() => {
     if (!requested) return
     setStatus(requested)
+    setLastResult(requested.last_result || null)
     setProgress({
       downloaded: requested.download?.downloaded || 0,
       total: requested.download?.total || 0,
@@ -204,6 +221,14 @@ export function DesktopUpdateDialog() {
     (code): code is string => Boolean(code) && code !== '0' && code !== 'skipped'
   )
 
+  // 上次失败的目标版本比本次推送的版本旧（如失败在 0.0.37，现推 0.0.39）时，
+  // 中间版本的"手动安装"提示已过时：安装包是完整安装，直接更新到最新版即可，
+  // 不能引导用户先装中间版本再装新版本
+  const staleFailedTarget =
+    Boolean(release?.version) &&
+    Boolean(lastResult?.target_version) &&
+    compareVersions(release!.version, lastResult!.target_version!) > 0
+
   return (
     <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-[100] p-4">
       <div className="bg-card rounded-lg border border-border p-5 w-full max-w-lg space-y-4">
@@ -245,8 +270,9 @@ export function DesktopUpdateDialog() {
           </div>
         )}
 
-        {/* 上次自动安装没生效：给出实际安装版本/安装器退出码与安装包路径，用户可手动运行 */}
-        {lastResult?.target_version && lastResult.applied === false && (
+        {/* 上次自动安装没生效且失败目标就是本次推送的版本：给出实际安装版本/安装器
+            退出码与安装包路径，用户可手动运行；跨版本（推送更新版本）时不提示旧安装包 */}
+        {lastResult?.target_version && lastResult.applied === false && !staleFailedTarget && (
           <div className="p-2 rounded bg-red-500/10 border border-red-500/20 text-red-500 text-xs space-y-1">
             <div className="flex items-center gap-2">
               <AlertCircle size={14} />
@@ -267,6 +293,12 @@ export function DesktopUpdateDialog() {
               <p className="break-all text-muted-foreground">
                 {t('desktopUpdate.manualInstallHint')}
                 <span className="font-mono">{lastResult.installer}</span>
+              </p>
+            )}
+            {/* 安装日志尾部：退出码说不清原因时（如 rc=1 初始化失败），日志里才有真实原因 */}
+            {lastResult.setup_log_tail && (
+              <p className="break-all text-muted-foreground/80 font-mono">
+                {lastResult.setup_log_tail}
               </p>
             )}
           </div>

@@ -158,6 +158,8 @@ export interface DesktopUpdateStatus {
     install_dir?: string
     /** 重启目标目录里实际读到的版本（安装器写入，核对是否真的换版本） */
     installed_version?: string
+    /** 安装日志尾部（安装器初始化失败时定位真实原因） */
+    setup_log_tail?: string
     finished_at?: string
   } | null
 }

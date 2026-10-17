@@ -17,6 +17,7 @@ export const DATA_REFRESH_EVENT = 'data-list-refresh'
 
 // 防抖：2 秒内多次触发只发送一次事件，避免多页面同时响应产生惊群效应
 let _lastRefreshTime = 0
+let _lastRefreshScope: DataRefreshScope | null = null
 const REFRESH_DEBOUNCE_MS = 2000
 
 /** 刷新范围：full=数据增删/上传（各页面全量刷新）；layer=仅图层内容变化（地图页跳过扇区数据重载） */
@@ -27,8 +28,13 @@ export type DataRefreshScope = 'full' | 'layer'
 // 地图页无需重载扇区数据/重绘，避免保存后地图卡顿数秒。
 export function triggerDataRefresh(scope: DataRefreshScope = 'full') {
   const now = Date.now()
-  if (now - _lastRefreshTime < REFRESH_DEBOUNCE_MS) return
+  const withinDebounce = now - _lastRefreshTime < REFRESH_DEBOUNCE_MS
+  // 「全量」刷新不能被先前轻量的「图层」刷新吞掉：本地保存图层（layer）后 2 秒内
+  // 到达的远端数据变更（full，如同组其他端写入的 data_changed 推送）若被防抖丢弃，
+  // 本端地图会一直显示旧数据直到重新登录
+  if (withinDebounce && !(scope === 'full' && _lastRefreshScope !== 'full')) return
   _lastRefreshTime = now
+  _lastRefreshScope = scope
   // 清除小区列表缓存，确保各页面新建任务时获取最新数据
   clearCellListCache()
   window.dispatchEvent(new CustomEvent(DATA_REFRESH_EVENT, { detail: { scope } }))

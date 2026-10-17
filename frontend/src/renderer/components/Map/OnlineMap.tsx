@@ -2017,6 +2017,19 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
 
     refreshData: async () => {
       await loadSectorData(true)
+      // 同组其他端的数据变更（WS data_changed / 桌面同步落地）到达时：除了工参扇区，
+      // 已渲染的图层实例也必须丢弃重建，否则地图一直显示旧图层内容
+      // （缓存的 GeoJSON 已由 markAllDirty 丢弃，这里只负责拆旧实例、重置加载守卫）
+      const map = mapInstanceRef.current
+      if (map) {
+        for (const [layerId, ref] of Array.from(mapInfoLayerRefsRef.current)) {
+          try { ref.mapInfoLayer.remove(map) } catch { /* ignore */ }
+          mapInfoLayerRefsRef.current.delete(layerId)
+          loadedMapInfoLayersRef.current.delete(layerId)
+          try { getHeatmapManager().remove(layerId) } catch { /* ignore */ }
+        }
+        await loadMapInfoLayers()
+      }
     },
 
     addLocationMarker: (marker: LocationMarker, index: number) => {

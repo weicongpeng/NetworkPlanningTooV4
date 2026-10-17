@@ -3,6 +3,7 @@ import { BrowserRouter as Router, Routes, Route, Navigate, useLocation } from 'r
 import { MainLayout } from './components/Layout/MainLayout'
 import { ProtectedRoute } from './components/ProtectedRoute'
 import { AuthGuard } from './components/AuthGuard'
+import { ErrorBoundary } from './components/ErrorBoundary'
 import { LoadingSpinner } from './components/LoadingSpinner'
 import { HomePage } from './pages/HomePage'
 import {
@@ -56,7 +57,9 @@ function App() {
     <Router>
       <LastRouteTracker />
       <AuthGuard>
-        <MainLayout>
+        {/* 顶层错误边界：页面渲染抛错时给出可恢复界面，不再整树卸载白屏 */}
+        <ErrorBoundary>
+          <MainLayout>
           {/* 懒加载兜底：与页面内部 loading 风格一致（转圈），导航 hover 已预加载，切换时一般不显示 */}
           <Suspense fallback={<LoadingSpinner variant="spinner" />}>
             <Routes>
@@ -200,7 +203,8 @@ function App() {
               <Route path="*" element={<Navigate to="/" replace />} />
             </Routes>
           </Suspense>
-        </MainLayout>
+          </MainLayout>
+        </ErrorBoundary>
       </AuthGuard>
     </Router>
   )

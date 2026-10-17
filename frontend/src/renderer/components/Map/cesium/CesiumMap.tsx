@@ -1349,6 +1349,11 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
     init()
     return () => {
       disposed = true
+      // 等高线最先拆：贴地图元（GroundPolylinePrimitive）必须在 scene 还活着时从
+      // primitives 里摘除，viewer.destroy() 连带销毁它们在部分 Cesium 版本会触发
+      // 渲染崩溃（"开等高线后切页白屏"）；迟到的 update()/瓦片回调由 destroyed 标志挡住
+      try { contourRef.current?.destroy() } catch { /* ignore */ }
+      contourRef.current = null
       try { mapToolsRef.current?.destroy() } catch { /* ignore */ }
       mapToolsRef.current = null
       try { editSessionRef.current?.destroy() } catch { /* ignore */ }
@@ -1784,7 +1789,14 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
         if (viewer) viewer.imageryLayers.get(0) &&
           (viewer.imageryLayers.get(0).show = visible)
       },
-      refreshData: noopAsync,
+      refreshData: async () => {
+        // 同名 2D 方法：MapPage 在数据变更事件（同组其他端写入/同步落地）里调用。
+        // 工参扇区数据由 MapPage 强刷后经 props 下发（props effect 会 syncAll），
+        // 这里负责重建 GeoJSON 图层：markAllDirty 已丢弃缓存的 GeoJSON，
+        // 重建时按"缺缓存即拉取"逐层回源，地图不再停留在旧图层内容
+        syncAll()
+        await syncGeoJsonLayers()
+      },
       addLocationMarker: (marker) => {
         // 经纬度抓取/外部定位标记（WGS84）：与打点标记同源，切工具不会被清掉
         mapToolsRef.current?.addLocationMarker(marker.lng, marker.lat)

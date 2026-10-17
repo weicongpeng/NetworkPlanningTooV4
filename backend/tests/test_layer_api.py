@@ -534,6 +534,59 @@ def test_chunked_upload_layer_returns_source_filename():
         os.remove(path)
 
 
+def test_chunked_upload_excel_records_original_path():
+    """分块上传 Excel：complete 带 file_path → 索引记 originalPath。
+
+    工参更新据此把更新结果回存到本机原始文件路径（savedToOriginal）；
+    不传 file_path（网页端拿不到真实路径）时保持为空，不影响上传。
+    """
+    path = tempfile.mktemp(suffix=".xlsx")
+    pd.DataFrame({"NAME": ["A"], "LONGITUDE": [116.3], "LATITUDE": [39.9]}).to_excel(
+        path, sheet_name="LTE Project Parameters", index=False)
+    file_size = os.path.getsize(path)
+    client = _make_client()
+    # Excel 分支的索引条目要读 city/operator，mock 用户补上这两个字段
+    client.app.dependency_overrides[require_data_import] = lambda: SimpleNamespace(
+        id=1, city=None, operator=None)
+    data_id = data_id2 = None
+
+    try:
+        r = client.post("/api/v1/data/upload/start",
+            data={"filename": "ProjectParameter-full.xlsx", "total_chunks": "1", "total_size": str(file_size)})
+        assert r.status_code == 200
+        data_id = r.json()["data"]["id"]
+        with open(path, "rb") as f:
+            r2 = client.post(f"/api/v1/data/upload/{data_id}/chunk",
+                data={"chunk_index": "0"},
+                files={"file": ("chunk", f, "application/octet-stream")})
+        assert r2.status_code == 200
+        r3 = client.post(f"/api/v1/data/upload/{data_id}/complete",
+            data={"filename": "ProjectParameter-full.xlsx", "file_path": "D:\\工参\\full.xlsx"})
+        assert r3.status_code == 200
+        entry = data_service.index[data_id]
+        # 索引立即记录本机原始路径（后台解析会把它写进 Workbook.original_path，
+        # 工参更新时据此回存 savedToOriginal）
+        assert entry["originalPath"] == "D:\\工参\\full.xlsx"
+
+        # 不带 file_path：originalPath 为空（不挡上传）
+        r = client.post("/api/v1/data/upload/start",
+            data={"filename": "ProjectParameter-plain.xlsx", "total_chunks": "1", "total_size": str(file_size)})
+        data_id2 = r.json()["data"]["id"]
+        with open(path, "rb") as f:
+            client.post(f"/api/v1/data/upload/{data_id2}/chunk",
+                data={"chunk_index": "0"},
+                files={"file": ("chunk", f, "application/octet-stream")})
+        r6 = client.post(f"/api/v1/data/upload/{data_id2}/complete",
+            data={"filename": "ProjectParameter-plain.xlsx"})
+        assert r6.status_code == 200
+        assert not data_service.index[data_id2].get("originalPath")
+    finally:
+        os.remove(path)
+        # 清理索引，避免污染其他用例
+        data_service.index.pop(data_id, None)
+        data_service.index.pop(data_id2, None)
+
+
 def test_layer_point_endpoint_uses_source_filename_in_download_name():
     """端点传 source_filename → 下载文件名以原始源文件名开头（而非 src_ 副本名）"""
     path = _make_excel()

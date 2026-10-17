@@ -158,9 +158,13 @@ export const useMapDataCacheStore = create<MapDataCacheState>()((set, get) => ({
       for (const key of Object.keys(sectors)) {
         sectors[key] = { ...sectors[key], dirty: true }
       }
+      // 图层缓存的 GeoJSON 必须一并丢弃：远端（同组其他端）改写源文件后它已失效，
+      // 只置 loadedAt=0 没用 —— 渲染器/导出/搜索都直接读 geojson 字段（不检查 loadedAt），
+      // 保留旧值会让地图一直显示旧图层（"编辑后其他用户不刷新"的根因）。
+      // bounds 保留（几何范围不变，图层定位/编辑会话仍可用）。
       const layers = { ...state.layers }
       for (const key of Object.keys(layers)) {
-        layers[key] = { ...layers[key], loadedAt: 0 }
+        layers[key] = { ...layers[key], geojson: undefined, version: null, loadedAt: 0 }
       }
       const geoData = { ...state.geoData }
       for (const key of Object.keys(geoData)) {

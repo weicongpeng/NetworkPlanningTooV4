@@ -249,6 +249,14 @@ def _write_helper(installer: Path, target_version: str) -> Path:
     "装完版本没变、手动关掉再开才更新"是历史事故：start /wait 只等到安装器外层进程
     就返回，脚本随即拉起还没被替换掉的旧 exe。因此拉起前必须两个确认（都有上限）：
     1) 安装器进程真正退出；2) 目标目录的 version.json 已经写成新版本号。
+
+    "安装器退出码 1/1"是另一类历史事故：静默安装对失败尤其敏感——
+    - 上一次挂死的安装器进程占着 SetupMutex / 安装日志，后续每次静默安装初始化即败
+      （交互式安装会弹框让用户重试，静默模式直接 rc=1 退出）；
+    - 应用刚退出时互斥体/文件句柄尚未放干净，立即安装也会撞上。
+    因此安装前先杀掉残留安装器进程、稍等互斥体释放，并且每次安装尝试失败后重试
+    （/DIR 3 次、默认目录 2 次），仍失败才写结果文件；npt_setup.log 尾部随结果
+    一并落盘，前端能把真实原因展示给用户。
     """
     # onedir 冻结后 sys.executable 即安装目录下的 NPT.exe；源码模式为 python.exe（仅开发用）
     app_exe = Path(sys.executable)
@@ -258,6 +266,7 @@ def _write_helper(installer: Path, target_version: str) -> Path:
     installer_path = _windows_short_path(installer)
     updates_dir_short = _windows_short_path(_updates_dir())
     install_log = _windows_short_path(_updates_dir() / "npt_setup.log")
+    log_tail = _windows_short_path(_updates_dir() / "npt_setup_tail.txt")
     result_file = _windows_short_path(_updates_dir() / "npt_ota_result.txt")
     default_dir = "%LOCALAPPDATA%\\Programs\\NetworkPlanningTool"
     # AppId 与 desktop/installer.iss 保持一致（改一处必须同步另一处）：注册表里记录着
@@ -270,7 +279,10 @@ def _write_helper(installer: Path, target_version: str) -> Path:
         r"HKLM\Software\Microsoft\Windows\CurrentVersion\Uninstall"
         r"\{7C4F1E62-9B3A-4D2E-8F51-6A0C2B7D9E44}_is1"
     )
-    base_args = '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /CLOSEAPPLICATIONS /LOG="%LOG%"'
+    base_args = (
+        '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /CLOSEAPPLICATIONS '
+        '/FORCECLOSEAPPLICATIONS /LOG="%LOG%"'
+    )
     script = f"""@echo off
 chcp 65001 >nul
 rem NPT OTA updater: wait for app exit -> silent install -> restart new version
@@ -282,6 +294,7 @@ set "SETUP={installer_path}"
 set "UPDATES={updates_dir_short}"
 set "LOG={install_log}"
 set "RESULT={result_file}"
+set "LOGTAIL={log_tail}"
 set "DEFAULTDIR={default_dir}"
 set "SETUPNAME={installer.name}"
 set "TARGETVER={target_version}"
@@ -303,14 +316,32 @@ goto wait
 taskkill /F /IM "%EXE%" >nul 2>&1
 ping -n 3 127.0.0.1 >nul
 :install
-rem 1) install into the directory the app currently runs from (upgrade in place)
+rem stale installers from hung previous runs hold the setup mutex / log file and make
+rem every later silent install abort with rc=1 ("installer exit code 1/1"); kill them
+powershell -NoProfile -Command "Get-Process | Where-Object {{ $_.Name -like 'NetOpt*Setup*' }} | Stop-Process -Force" >nul 2>&1
+rem give the just-exited app a moment to release its single-instance mutex
+ping -n 4 127.0.0.1 >nul
+rem 1) install into the directory the app currently runs from (upgrade in place),
+rem    retried: transient file locks (AV scan / lingering handles) fail setup init rc=1
+set /a TRY=0
+:tryappdir
 start /wait "" "%SETUP%" {base_args} /DIR="%APPDIR%"
 set "RC=%ERRORLEVEL%"
 if "%RC%"=="0" goto waitsetup
-rem 2) fallback: default per-user directory
-ping -n 3 127.0.0.1 >nul
+set /a TRY+=1
+if %TRY% GEQ 3 goto trydefault
+ping -n 5 127.0.0.1 >nul
+goto tryappdir
+rem 2) fallback: default per-user directory (also retried once)
+:trydefault
+set /a DTRY=0
+:trydefault2
+if %DTRY% GTR 0 ping -n 5 127.0.0.1 >nul
 start /wait "" "%SETUP%" {base_args}
 set "RC2=%ERRORLEVEL%"
+if "%RC2%"=="0" goto waitsetup
+set /a DTRY+=1
+if %DTRY% LSS 2 goto trydefault2
 :waitsetup
 rem start /wait 可能只等到安装器的外层进程就返回；此时重启会拉起还没被替换掉的旧 exe，
 rem 表现就是"装完版本没变，手动关掉再开才更新"。这里继续等到安装器进程真正退出。
@@ -347,6 +378,9 @@ if %VWAIT% GEQ 90 goto ready
 ping -n 3 127.0.0.1 >nul
 goto waitver
 :ready
+rem keep the tail of the setup log next to the result file: the exit code alone rarely
+rem tells why the installer bailed, the log tail usually names the real reason
+powershell -NoProfile -Command "if (Test-Path -LiteralPath '%LOG%') {{ Get-Content -LiteralPath '%LOG%' -Tail 40 | Set-Content -LiteralPath '%LOGTAIL%' -Encoding UTF8 }}" >nul 2>&1
 > "%RESULT%" echo target_version={target_version}
 >> "%RESULT%" echo setup_rc=%RC%
 >> "%RESULT%" echo setup_retry_rc=%RC2%
@@ -539,6 +573,17 @@ def last_result() -> Optional[Dict[str, Any]]:
             info = json.loads(installed_path.read_text(encoding="utf-8"))
             if isinstance(info, dict) and info.get("version"):
                 data["installed_version"] = str(info["version"])
+    except Exception:  # noqa: BLE001
+        pass
+    # 安装日志尾部：退出码（尤其 rc=1 初始化失败）往往说不清原因，日志尾部才有线索。
+    # 由升级脚本在安装结束后从 npt_setup.log 摘出最近 40 行（UTF-8 带头）。
+    try:
+        tail_path = _updates_dir() / "npt_setup_tail.txt"
+        if tail_path.is_file():
+            tail = tail_path.read_text(encoding="utf-8-sig", errors="replace")
+            lines = [ln.strip() for ln in tail.splitlines() if ln.strip()]
+            if lines:
+                data["setup_log_tail"] = " | ".join(lines[-12:])[-600:]
     except Exception:  # noqa: BLE001
         pass
     if not data:

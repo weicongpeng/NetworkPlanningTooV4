@@ -1302,12 +1302,23 @@ async def complete_chunked_upload(
     data_id: str,
     filename: str = Form(...),
     file_type: str = Form("excel"),
+    file_path: Optional[str] = Form(None),
     current_user=Depends(require_data_import),
 ) -> Dict[str, Any]:
-    """完成分块上传：重组文件、创建索引、启动后台处理"""
+    """完成分块上传：重组文件、创建索引、启动后台处理。
+
+    file_path：导入文件在本机的真实路径（桌面端可用时传入）。与 upload_excel 的
+    file_path 同义，落到索引 originalPath —— 后续"工参更新"据此把更新结果回存到
+    本机原始文件路径（savedToOriginal）。缺失时仅影响回存，不影响上传本身。
+    """
     session = _chunked_sessions.get(data_id)
     if not session or session.get("user_id") != current_user.id:
         raise HTTPException(status_code=404, detail="上传会话不存在或已过期")
+
+    # 先解析本机原始路径参数（下方 file_path 变量会被重组后的本地文件 Path 覆盖）；
+    # 只剥引号不做 isabs 过滤（与 upload_excel 的 init_upload 一致，Windows 盘符路径
+    # 在 Linux 宿主上 isabs=False，误杀会导致桌面端回存失效）
+    original_path_arg = (file_path or "").strip().strip("\"'") or None
 
     chunks_dir = Path(session["chunks_dir"])
     total = session["total_chunks"]
@@ -1451,6 +1462,8 @@ async def complete_chunked_upload(
         data_dir.mkdir(parents=True, exist_ok=True)
         shutil.copy(file_path, data_dir / f"original{ext}")
 
+        # 与 upload_excel 的 originalPath 语义一致：记录导入时的本机真实路径，
+        # "工参更新"完成后据此把结果回存（_process_upload_sync 会把它写进 Workbook）
         data_service.index[data_id] = {
             "id": data_id,
             "name": safe_filename,
@@ -1462,6 +1475,7 @@ async def complete_chunked_upload(
             "size": file_path.stat().st_size,
             "uploadDate": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "status": "processing",
+            "originalPath": original_path_arg,
         }
         print(f"[ChunkedUpload] 索引条目已创建: {data_id}")
 

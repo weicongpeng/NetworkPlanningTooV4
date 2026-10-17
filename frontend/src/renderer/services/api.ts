@@ -779,6 +779,7 @@ async function chunkedUpload(
   fileType?: string,
   onProgress?: (percent: number) => void,
   trackProgress?: boolean,
+  filePath?: string,
 ): Promise<any> {
   onProgress?.(1)                     // 立即显示 1%，start 请求前就有反馈
   const chunkSize = calcChunkSize(file.size)
@@ -870,6 +871,11 @@ async function chunkedUpload(
   if (fileType) {
     completeForm.append('file_type', fileType)
   }
+  // 本机真实路径（桌面端可用时）：后端记为 originalPath，
+  // "工参更新"据此把更新结果回存到本机原始文件路径
+  if (filePath && filePath !== 'undefined' && filePath !== 'null') {
+    completeForm.append('file_path', filePath)
+  }
 
   const completeResp = await uploadClient.post(`${basePath}/${dataId}/complete`, completeForm)
   onProgress?.(100)
@@ -944,7 +950,8 @@ export const dataApi = {
 
     // 所有文件都走分块上传（避免 Cloudflare 524 超时）
     // 小文件也会走分块流程，但只有 1 个分块，开销很小
-    return await chunkedUpload(file, '/data/upload')
+    // filePath 一并透传：后端记为 originalPath，工参更新后回存本机原始路径
+    return await chunkedUpload(file, '/data/upload', undefined, undefined, false, filePath)
   },
 
   /** 上传地图文件并保存到服务器 - 使用原生 fetch API

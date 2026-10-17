@@ -532,6 +532,52 @@ def test_last_result_flags_unapplied_install(updater_env, monkeypatch):
     assert result["needs_manual"] is False
 
 
+def test_helper_script_kills_stale_installers_and_retries(updater_env):
+    """升级脚本加固：静默安装 rc=1 的两类根因都要兜住。
+
+    - 上一次挂死的安装器进程占着 SetupMutex/日志 → 安装前先杀残留 NetOpt*Setup* 进程
+    - 应用刚退出互斥体/句柄未放干净 → 安装前稍等，且每次失败要重试（/DIR 3 次、默认目录 2 次）
+    - 退出码说不清原因 → 安装结束后把 npt_setup.log 尾部摘到独立文件供前端展示
+    """
+    updater = updater_env.updater
+    installer = updater_env.tmp_path / "updates" / "NetOpt Engine_Setup-1.0.0.exe"
+    installer.parent.mkdir(parents=True, exist_ok=True)
+    installer.write_bytes(PAYLOAD)
+
+    text = updater._write_helper(installer, "1.0.0").read_text(encoding="utf-8")
+    # 杀残留安装器（静默模式无弹窗，占着互斥体的老安装器会让每次安装初始化即败）
+    assert "Stop-Process -Force" in text and "NetOpt*Setup*" in text
+    # 应用退出后稍等再安装（互斥体释放），失败有重试
+    assert ":tryappdir" in text and ":trydefault2" in text
+    assert "if %TRY% GEQ 3 goto trydefault" in text
+    assert "if %DTRY% LSS 2 goto trydefault2" in text
+    # 安装器加 /FORCECLOSEAPPLICATIONS：文件被占用时强关而不是静默放弃
+    assert "/FORCECLOSEAPPLICATIONS" in text
+    # 安装日志尾部落盘（退出码 rc=1 时只有日志能说明真实原因）
+    assert "npt_setup_tail.txt" in text and "Get-Content -LiteralPath '%LOG%' -Tail 40" in text
+
+
+def test_last_result_includes_setup_log_tail(updater_env):
+    """安装日志尾部要随 last_result 返回，前端据此展示失败的真实原因。"""
+    import json
+
+    updater = updater_env.updater
+    updates = updater_env.tmp_path / "updates"
+    updates.mkdir(parents=True, exist_ok=True)
+    (updates / "npt_ota_intent.json").write_text(
+        json.dumps({"target_version": "1.0.0", "installer": "/tmp/setup.exe"}), encoding="utf-8"
+    )
+    (updates / "npt_ota_result.txt").write_text("target_version=1.0.0\nsetup_rc=1\n", encoding="utf-8")
+    (updates / "npt_setup_tail.txt").write_text(
+        "\ufeff2026-10-18 10:00:00.123   Log opened.\n"
+        "2026-10-18 10:00:00.456   Setup version: 6.x\n"
+        "2026-10-18 10:00:01.000   Another instance is running, aborting.\n",
+        encoding="utf-8",
+    )
+    result = updater.last_result()
+    assert "Another instance is running" in result["setup_log_tail"]
+
+
 def test_launcher_continues_background_update_after_window_close(monkeypatch, tmp_path):
     """启动器：窗口关闭后若已武装后台更新，必须先等它跑完再收尾退出。"""
     launcher = _load_launcher()

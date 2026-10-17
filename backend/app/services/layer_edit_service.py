@@ -937,6 +937,33 @@ def _write_geojson(gdf: gpd.GeoDataFrame, source_path: Path, kind: str,
     write_layer_qml(source_path.with_suffix(".qml"), kind, feature_styles or [])
 
 
+def _mirror_layer_to_original(entry: Dict[str, Any], tab_path: Path, fmt: str) -> None:
+    """把重写后的图层文件回写到导入时记录的本机原始路径（originalPath）。
+
+    桌面端（尤其单机）用户在导入时选择的是本机文件：编辑保存除了更新应用数据目录
+    里的源文件，还要把同 stem 全套文件（数据文件 + 配套 + 样式 + 字段映射）拷回
+    原始位置，用户在外部看到的文件才是"保存过"的。originalPath 缺失 / 目录不存在 /
+    与源同目录时静默跳过；回写是旁路动作，任何失败只记日志，绝不能让保存失败。
+    """
+    original = str((entry or {}).get("originalPath") or "").strip()
+    if not original:
+        return
+    try:
+        dst = Path(original)
+        if not dst.parent.is_dir():
+            return
+        if dst.parent.resolve() == tab_path.parent.resolve():
+            return
+        copied = 0
+        for src in _layer_stem_files(tab_path, fmt):
+            shutil.copy2(src, dst.parent / src.name)
+            copied += 1
+        if copied:
+            print(f"[LayerEdit] 图层文件已回写到原始路径: {dst.parent}（{copied} 个文件）")
+    except Exception as e:  # noqa: BLE001
+        print(f"[LayerEdit] 回写原始路径失败（非致命）: {e}")
+
+
 def _write_layer_gdf(*, data_id: str, data_dir: Path, tab_path: Path, layer_id: str,
                      entry: Dict[str, Any], entry_type: str,
                      gdf: gpd.GeoDataFrame, geoms: List[Any],
@@ -1070,6 +1097,10 @@ def _write_layer_gdf(*, data_id: str, data_dir: Path, tab_path: Path, layer_id: 
     # 失效缓存（内存 + 落盘；落盘按源文件 mtime 也会自动失效）
     clear_layer_cache(data_id)
     _remove_disk_cache(data_dir, layer_id)
+
+    # 桌面端单机用户：源文件已在应用数据目录里更新，再把同 stem 全套文件回写到
+    # 导入时记录的本机原始路径（originalPath），外部看到的文件才是"保存过"的
+    _mirror_layer_to_original(idx or entry, tab_path, fmt)
 
     result = {"success": True, "feature_count": feature_count,
               # 保存后新的版本指纹（源文件 mtime）：前端据此发起下一次增量保存，无需重新拉取图层数据
