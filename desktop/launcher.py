@@ -324,6 +324,9 @@ def _wait_ready(port: int, timeout: float = READY_TIMEOUT_SECONDS) -> bool:
     url = f"http://127.0.0.1:{port}{READY_PATH}"
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
+        # 用户在后端就绪前就关了窗：main() 已置 should_exit，别傻等到超时
+        if _SERVER is not None and getattr(_SERVER, "should_exit", False):
+            return False
         try:
             with urllib.request.urlopen(url, timeout=2) as resp:
                 if resp.status == 200:
@@ -499,34 +502,28 @@ def _create_window() -> Any:
     return window
 
 
-def _boot_backend_and_open(window: Any, sock: Any, port: int, url: str) -> None:
-    """GUI 起来后在独立线程执行：启动后端 → 等就绪 → 把窗口导航到应用页面。
+def _open_when_ready(window: Any, port: int, url: str) -> None:
+    """GUI 线程外执行：等后端就绪 → 把启动页导航到真正的应用页面。
 
-    pywebview 的 webview.start(func, args) 就是为这种"先开窗、后加载"准备的。
+    后端线程在 main() 里、创建窗口**之前**就已启动：import app + lifespan（数秒）
+    与 WebView2 运行时冷启动并行进行，切模式重启时启动页停留时间最短。
     """
-    global _SERVER, _SERVER_THREAD, _STARTUP_FAILED
-    try:
-        server, thread = _start_server(sock)
-        _SERVER, _SERVER_THREAD = server, thread
-        if not _wait_ready(port):
-            _log.error("后端启动超时（%s 秒），日志: %s", READY_TIMEOUT_SECONDS, _log_path_hint())
-            _STARTUP_FAILED = True
-            _show_startup_error(window, "后端服务启动超时，请把日志发送给技术支持。")
-            return
-        _log.info("后端就绪，切换到应用页面")
-        try:
-            window.load_url(url)
-        except Exception as exc:  # noqa: BLE001
-            # load_url 不可用（pywebview 版本差异）时退回页面内跳转
-            _log.warning("窗口导航失败（改用页面内跳转）：%s", exc)
-            window.load_html(
-                f"<script>location.replace({url!r})</script>",
-                base_uri=url,
-            )
-    except Exception as exc:  # noqa: BLE001
-        _log.exception("后端启动失败")
+    global _STARTUP_FAILED
+    if not _wait_ready(port):
+        _log.error("后端启动超时（%s 秒），日志: %s", READY_TIMEOUT_SECONDS, _log_path_hint())
         _STARTUP_FAILED = True
-        _show_startup_error(window, f"后端服务启动失败：{exc}")
+        _show_startup_error(window, "后端服务启动超时，请把日志发送给技术支持。")
+        return
+    _log.info("后端就绪，切换到应用页面")
+    try:
+        window.load_url(url)
+    except Exception as exc:  # noqa: BLE001
+        # load_url 不可用（pywebview 版本差异）时退回页面内跳转
+        _log.warning("窗口导航失败（改用页面内跳转）：%s", exc)
+        window.load_html(
+            f"<script>location.replace({url!r})</script>",
+            base_uri=url,
+        )
 
 
 def _show_startup_error(window: Any, message: str) -> None:
@@ -645,16 +642,20 @@ def main(argv: Optional[list] = None) -> int:
         _log.info("后端就绪")
         return _run_selftest(port)
 
+    # 后端先在独立线程起跑（import app + lifespan 要数秒），与随后的 WebView2 运行时
+    # 初始化并行——窗口出现时后端通常已就绪大半，切模式重启的启动页停留时间最短
+    global _SERVER, _SERVER_THREAD
+    _SERVER, _SERVER_THREAD = _start_server(sock)
+
     import webview
 
-    # 先开窗（显示启动页），后端在后台线程启动 —— 用户立刻有反馈，
-    # 不必等整份后端导入 + lifespan 跑完才看到窗口
+    # 窗口先显示启动页；webview.start 的 func 在 GUI 起来后只负责等就绪并导航
     window = _create_window()
-    _log.info("打开桌面窗口（启动页），后端在后台启动")
+    _log.info("打开桌面窗口（启动页），等待后端就绪")
     # private_mode=False + storage_path：localStorage 持久化（否则每次启动掉登录）
     webview.start(
-        _boot_backend_and_open,
-        (window, sock, port, f"http://127.0.0.1:{port}/?v={_asset_version()}"),
+        _open_when_ready,
+        (window, port, f"http://127.0.0.1:{port}/?v={_asset_version()}"),
         private_mode=False,
         storage_path=str(data_root / "webview"),
     )

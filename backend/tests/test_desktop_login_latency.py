@@ -174,3 +174,57 @@ def test_offline_login_releases_startup_gate(login_env):
     assert resp.status_code == 200, resp.text
     assert resp.json()["data"]["offline"] is True
     assert login_env.startup_gate.is_login_completed() is True
+
+
+def test_shared_mode_falls_back_offline_when_server_unreachable(login_env):
+    """共享模式本机凭据有效 + 服务器不可达：也要能立即离线进入（不再等 20s/直接报错）。
+
+    2026-10-17：用户反馈切到共享模式频繁出现 TLS 握手超时。本机许可有效时，
+    服务器连不上不应把用户挡在门外；run_mode 保持 shared，联网后同步自动恢复。
+    """
+    login_env.monkeypatch.setattr(login_env.settings, "DESKTOP_PROFILE", "shared")
+    import app.services.desktop_sync_service as sync_module
+
+    # 起点为 shared（不是单机离线的 offline）
+    sync_module.set_run_mode("shared")
+    assert sync_module.is_shared() is True
+
+    def _unreachable(*args, **kwargs):
+        raise login_env.cloud.CloudError(0, "TLS handshake timeout")
+
+    login_env.monkeypatch.setattr(login_env.cloud, "login", _unreachable)
+
+    started = time.monotonic()
+    resp = login_env.client.post(
+        "/api/v1/desktop/login",
+        json={"username": "alice", "password": "pwd123", "mode": "shared", "remember": False},
+    )
+    elapsed = time.monotonic() - started
+
+    assert resp.status_code == 200, resp.text
+    data = resp.json()["data"]
+    assert data["offline"] is True
+    assert data["mode"] == "shared"
+    assert elapsed < 3.0, f"共享模式离线回落耗时 {elapsed:.2f}s，仍在等网络"
+    # 关键：run_mode 不能被切成 offline，否则共享同步永远停摆
+    assert sync_module.is_shared() is True
+
+
+def test_shared_mode_slow_server_uses_fast_probe(login_env):
+    """共享模式服务器慢：1.2s 快速探测超时后离线进入，后台探测继续。"""
+    login_env.monkeypatch.setattr(login_env.settings, "DESKTOP_PROFILE", "shared")
+    def _slow_login(*args, **kwargs):
+        time.sleep(6)
+        return {"result": "ok", "user": {"username": "alice", "is_admin": True}}
+
+    login_env.monkeypatch.setattr(login_env.cloud, "login", _slow_login)
+    started = time.monotonic()
+    resp = login_env.client.post(
+        "/api/v1/desktop/login",
+        json={"username": "alice", "password": "pwd123", "mode": "shared", "remember": False},
+    )
+    elapsed = time.monotonic() - started
+    assert resp.status_code == 200, resp.text
+    data = resp.json()["data"]
+    assert data["offline"] is True and data["mode"] == "shared"
+    assert elapsed < 3.0

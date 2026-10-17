@@ -232,11 +232,11 @@ export const useAuthStore = create<AuthState>()(
   },
 
       logout: async () => {
-        try {
-          await authApi.logout()
-        } catch {
-          // 即使服务端登出失败也清除本地状态
-        }
+        // 先立即清除本地登录态（登录窗立刻出现），服务器侧会话结束通知 fire-and-forget：
+        // 桌面端该通知是一次跨公网 HTTP，TLS 握手不好时要等好几秒，绝不能挡住 UI 切换
+        const logoutRequest = authApi.logout().catch(() => {
+          // 即使服务端登出失败也不影响本机退出；服务器会话会因心跳停止而自动过期
+        })
         // 重新登录清除批量距离匹配持久化状态（初始登录语义）
         try { sessionStorage.removeItem('distanceMatch.shared') } catch { /* ignore */ }
         set({
@@ -252,6 +252,8 @@ export const useAuthStore = create<AuthState>()(
         })
         // 登出后清空所有用户的内存数据缓存，杜绝下一账号 TTL 内读到本组数据
         clearUserDataCaches()
+        // 后台等通知发完即可（不阻塞 UI；测试/异常路径下也不会 unhandled rejection）
+        await logoutRequest
       },
 
       fetchUser: async () => {

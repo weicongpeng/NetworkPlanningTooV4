@@ -149,12 +149,22 @@ async def logout(
     if jti:
         auth_service.end_session(db, jti)
     if settings.NPT_DESKTOP:
-        try:
-            from app.api.v1.endpoints.desktop_local import notify_server_logout
+        # 通知服务器是一次跨公网 HTTP（TLS 握手不好时可能数秒），绝不能让它挡住
+        # 本端点返回——用户点「退出登录」后期望立刻看到登录窗。丢后台线程尽力而为，
+        # 服务器会话也会因心跳停止在活跃窗口过期后自动离线
+        import threading
 
-            notify_server_logout()
-        except Exception as exc:  # noqa: BLE001
-            print(f"[DesktopAuth] 桌面端登出清理失败（忽略）：{exc}")
+        def _notify_in_background() -> None:
+            try:
+                from app.api.v1.endpoints.desktop_local import notify_server_logout
+
+                notify_server_logout()
+            except Exception as exc:  # noqa: BLE001
+                print(f"[DesktopAuth] 桌面端登出清理失败（忽略）：{exc}")
+
+        threading.Thread(
+            target=_notify_in_background, daemon=True, name="npt-logout-notify"
+        ).start()
     return {"success": True, "message": "已退出登录"}
 
 

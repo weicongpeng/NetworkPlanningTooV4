@@ -378,12 +378,17 @@ def login(
     mode: str = "standalone",
     offline_logins: Optional[int] = None,
     hostname: Optional[str] = None,
-    timeout: int = 20,
+    timeout: int = 10,
+    retries: int = 1,
 ) -> Dict[str, Any]:
     """桌面端账号登录：凭证是网页端用户名/密码，成功即落盘许可。
 
     返回 {"result": "ok"|"pending"|..., ...}；result != ok 时不写许可文件。
-    timeout 供单机模式"快速探测"使用：连不上就尽快回落离线登录，不让用户干等。
+    timeout 供"快速探测"使用：连不上就尽快回落离线登录，不让用户干等。
+
+    网络类失败（含 TLS 握手超时 `_ssl.c handshake operation timed out`，移动网络/
+    弱网下很常见且多为瞬时）重试 retries 次；HTTP 业务错误（4xx/5xx）不重试，
+    立刻抛出避免无谓等待。
     """
     from app.utils.machine_code import get_machine_code
 
@@ -397,7 +402,20 @@ def login(
     }
     if offline_logins:
         payload["offline_logins"] = int(offline_logins)
-    resp = _request("POST", "/desktop-cloud/auth/login", payload, timeout=timeout)
+
+    last_error: Optional[CloudError] = None
+    for attempt in range(max(0, retries) + 1):
+        try:
+            resp = _request("POST", "/desktop-cloud/auth/login", payload, timeout=timeout)
+            break
+        except CloudError as exc:
+            last_error = exc
+            # 只有网络不可达（status_code=0，含 DNS/TCP/TLS 握手超时）才重试
+            if exc.status_code != 0 or attempt >= retries:
+                raise
+    else:  # pragma: no cover - 理论不可达
+        raise last_error or CloudError(0, "登录请求失败")
+
     data = resp.get("data") or {}
     if data.get("result") == "ok":
         from app.services.license_service import license_service
