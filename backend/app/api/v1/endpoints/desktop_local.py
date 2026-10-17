@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import threading
 from datetime import datetime
 from typing import Any, Dict, Optional
@@ -13,10 +14,12 @@ from typing import Any, Dict, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
+from starlette.concurrency import run_in_threadpool
 
 from app.core.config import settings
 from app.core.database import get_db
 from app.core.security import get_current_admin_user, get_current_user
+from app.core.startup_gate import mark_login_completed
 from app.models.database import User
 from app.services import desktop_cloud_client as cloud
 from app.services.auth_service import auth_service
@@ -318,7 +321,9 @@ def _mirror_local_user(db: Session, incoming: dict, mode: str, password: Optiona
             password_hash=auth_service.hash_password(password or str(_uuid.uuid4())),
         )
         db.add(row)
-    elif password:
+    elif password and not auth_service.verify_password(password, row.password_hash):
+        # 仅在密码真的变了时才重哈希：bcrypt 一次 300~1000ms，而这里每次登录都会走到，
+        # 无条件重哈希等于给每次登录白加一段开销 + 一次无谓的 commit
         row.password_hash = auth_service.hash_password(password)
     row.is_admin = bool(incoming.get("is_admin"))
     row.is_active = True
@@ -548,8 +553,26 @@ def notify_server_logout() -> None:
     cloud.clear_state("session_jti", "local_jti", "kicked", "kicked_reason")
 
 
-# 单机模式本地凭据有效时，服务器登录只给这么长的探测时间（超时即离线登录）
+# 单机模式本地凭据有效时，服务器登录后台探测的总超时（超时按离线登录处理）
 STANDALONE_ONLINE_PROBE_SECONDS = 4
+# 上面那次探测里，登录请求**愿意等**多久：本机凭据已经证明身份，没必要为网络干等，
+# 超过这个时间就先用本机授权进页面，服务器结果到了再由后台补权限/会话
+STANDALONE_FAST_PROBE_SECONDS = 1.2
+
+
+def _task_result_or_none(task: "asyncio.Task") -> Optional[Dict[str, Any]]:
+    """取出已完成的探测任务结果；异常/取消一律当"没探测到"处理。
+
+    必须在这里取一次异常，否则 asyncio 会打 "Task exception was never retrieved"。
+    """
+    if task.cancelled():
+        return None
+    exc = task.exception()
+    if exc is not None:
+        print(f"[DesktopAuth] 服务器探测失败（已按离线登录处理）：{exc}")
+        return None
+    result = task.result()
+    return result if isinstance(result, dict) else None
 
 
 def _finish_offline_login(db: Session, user) -> Dict[str, Any]:
@@ -573,6 +596,8 @@ def _finish_offline_login(db: Session, user) -> Dict[str, Any]:
         desktop_mode=MODE_STANDALONE,
     )
     token = _issue_local_token(db, user, info.get("idle_logout_days"))
+    # 放行「登录优先」的后台重活队列（图层预热/索引对账/首次同步等）
+    mark_login_completed()
     return {
         "success": True,
         "data": {
@@ -693,8 +718,9 @@ async def session_guard_loop(interval_seconds: int = 60) -> None:
         await asyncio.sleep(max(15, interval_seconds))
 
 
-# 登录优先：共享模式的首次同步延后这么久再跑
-LOGIN_SYNC_DELAY_SECONDS = 5.0
+# 登录优先：共享模式的首次同步延后这么久再跑（整包下载+解压+导入会抢磁盘，
+# 留足首屏请求落地的时间，避免"刚进首页就卡一下"）
+LOGIN_SYNC_DELAY_SECONDS = 15.0
 
 
 def _start_shared_sync() -> None:
@@ -718,6 +744,71 @@ def _run_sync_once() -> None:
         _sync_service().sync_once()
     except Exception as exc:  # noqa: BLE001
         print(f"[DesktopSync] 登录同步失败（忽略）：{exc}")
+
+
+def _complete_online_login(
+    db: Session,
+    incoming: Dict[str, Any],
+    mode: str,
+    password: str,
+    username: str,
+    server_jti: Optional[str],
+    idle_logout_days: Optional[int],
+    fallback_license: Optional[Dict[str, Any]] = None,
+):
+    """服务器校验通过后的本机收尾：镜像账号 → 许可信息 → 会话记录 → 签发本机令牌。
+
+    整段含 bcrypt（实测 300~1000ms）与多次 SQLite 提交，是登录请求里最重的一段
+    纯本地开销；必须整体丢线程池执行，否则会卡住事件循环上的所有其它请求。
+    """
+    user = _mirror_local_user(db, incoming, mode, password)
+    info = license_service.desktop_license_info() or (fallback_license or {})
+    _remember_sync_user(username)
+    # 记住服务器会话标识：后续周期性校验"是否仍是最后一次登录"
+    cloud.save_state(session_jti=server_jti or None, kicked=False, kicked_reason=None)
+    if mode == MODE_STANDALONE:
+        # 单机模式数据本机私有，不参与服务器数据同步
+        from app.services.desktop_sync_service import MODE_OFFLINE, set_run_mode
+
+        set_run_mode(MODE_OFFLINE)
+        _ensure_local_group(db, user, info)
+    else:
+        # 共享模式：登录即开始同步同组数据（延后触发，见 _start_shared_sync）
+        _start_shared_sync()
+    token = _issue_local_token(db, user, idle_logout_days)
+    return user, info, token
+
+
+def _apply_late_login_result(data: Optional[Dict[str, Any]]) -> None:
+    """单机模式「快速探测」超时后，服务器结果姗姗来迟时的后台补账。
+
+    用户此刻已经用本机授权离线登录成功，这里只把服务器上的权限位/到期日与会话标识
+    补上（等价于 60 秒心跳 session_guard_loop 会做的事），不改变已下发的本机令牌。
+    """
+    if not isinstance(data, dict) or data.get("result") == "pending":
+        return
+    try:
+        incoming = data.get("user") or {}
+        if incoming:
+            _sync_permissions_from_remote(incoming)
+        server_jti = (data.get("session_jti") or "").strip()
+        if server_jti:
+            cloud.save_state(session_jti=server_jti, kicked=False, kicked_reason=None)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[DesktopAuth] 迟到的服务器登录结果处理失败（忽略）：{exc}")
+
+
+def _apply_late_login_probe(task: "asyncio.Task") -> None:
+    """asyncio 完成回调：起个线程去补账，绝不在事件循环里做 DB 写。"""
+    data = _task_result_or_none(task)
+    if data is None:
+        return
+    threading.Thread(
+        target=_apply_late_login_result,
+        args=(data,),
+        daemon=True,
+        name="npt-late-login-probe",
+    ).start()
 
 
 @router.get("/app-version")
@@ -956,13 +1047,35 @@ async def desktop_login(
     local_user = None
     local_reason = ""
     if mode == MODE_STANDALONE:
-        local_user, local_reason = _standalone_local_login(db, username, password)
+        # bcrypt 校验（实测 400ms 起）丢线程池，别卡住事件循环
+        local_user, local_reason = await run_in_threadpool(
+            _standalone_local_login, db, username, password
+        )
 
     try:
-        # 单机模式本地凭据有效：服务器只做短时探测，连不上就立即离线登录；
-        # 本地凭据不可用（首次登录/等待批准等）时按完整超时请求服务器。
-        probe = STANDALONE_ONLINE_PROBE_SECONDS if local_user is not None else 20
-        data = await _login_via_server(username, password, mode, probe)
+        if local_user is not None and mode == MODE_STANDALONE:
+            # 单机模式 + 本机凭据有效：服务器只做「快速探测」。本地凭据已经证明用户
+            # 身份，没必要让用户干等网络——超过 FAST 秒立即离线登录，探测结果稍后
+            # 由 _apply_late_login_result 在后台补权限/会话（断网时原来要等满 4 秒）。
+            probe_task = asyncio.create_task(
+                _login_via_server(username, password, mode, STANDALONE_ONLINE_PROBE_SECONDS)
+            )
+            try:
+                data = await asyncio.wait_for(
+                    asyncio.shield(probe_task), timeout=STANDALONE_FAST_PROBE_SECONDS
+                )
+            except asyncio.TimeoutError:
+                print(
+                    f"[DesktopAuth] 授权服务器响应超过 {STANDALONE_FAST_PROBE_SECONDS}s，"
+                    "先用本机授权登录，结果到达后后台补校验"
+                )
+                probe_task.add_done_callback(_apply_late_login_probe)
+                _apply_remember(payload.remember, username, password, MODE_STANDALONE)
+                return _finish_offline_login(db, local_user)
+        else:
+            # 共享模式必须等服务器（账号/许可都在服务器侧）；本地凭据不可用时
+            # （首次登录/等待批准）也按完整超时请求服务器
+            data = await _login_via_server(username, password, mode, 20)
     except cloud.CloudError as exc:
         # 本地凭据有效且只是网络不可达/服务器故障 → 离线登录，拿到本机授权继续用
         if (
@@ -989,24 +1102,20 @@ async def desktop_login(
         return {"success": True, "data": data}
 
     incoming = data.get("user") or {}
-    user = _mirror_local_user(db, incoming, mode, password)
-    info = license_service.desktop_license_info() or (data.get("license") or {})
-    _remember_sync_user(username)
-    # 记住服务器会话标识：后续周期性校验"是否仍是最后一次登录"
-    server_jti = (data.get("session_jti") or "").strip()
-    cloud.save_state(session_jti=server_jti or None, kicked=False, kicked_reason=None)
-    if mode == MODE_STANDALONE:
-        # 单机模式数据本机私有，不参与服务器数据同步
-        from app.services.desktop_sync_service import MODE_OFFLINE, set_run_mode
-
-        set_run_mode(MODE_OFFLINE)
-        _ensure_local_group(db, user, info)
-    else:
-        # 共享模式：登录即开始同步同组数据
-        _start_shared_sync()
-
-    token = _issue_local_token(db, user, data.get("idle_logout_days"))
+    user, info, token = await run_in_threadpool(
+        _complete_online_login,
+        db,
+        incoming,
+        mode,
+        password,
+        username,
+        (data.get("session_jti") or "").strip(),
+        data.get("idle_logout_days"),
+        data.get("license") or {},
+    )
     _apply_remember(payload.remember, username, password, mode)
+    # 放行「登录优先」的后台重活队列（图层预热/索引对账/首次同步等）
+    mark_login_completed()
     return {
         "success": True,
         "data": {

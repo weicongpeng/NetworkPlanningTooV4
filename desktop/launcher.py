@@ -44,6 +44,11 @@ PORT_STATE_FILE = "last_port.json"
 _MUTEX_HANDLE: Optional[int] = None
 _log = logging.getLogger("desktop")
 
+# 后端服务句柄：由 _boot_backend_and_open 在后台线程里填，main() 关窗后用它收尾
+_SERVER: Any = None
+_SERVER_THREAD: Optional[threading.Thread] = None
+_STARTUP_FAILED = False
+
 
 # ---------------------------------------------------------------- 环境与日志
 
@@ -409,16 +414,52 @@ def _make_close_handler() -> Callable[[], None]:
     return _on_closing
 
 
-def _run_window(port: int, data_root: Path) -> None:
+# 启动页：窗口创建后立即显示它，后端在后台线程启动；就绪后再导航到真正的应用地址。
+# 否则「双击图标 / 切运行模式重启」后要等整份后端导入 + lifespan 跑完才出现窗口，
+# 那段时间用户只看到空白（共享↔单机切换重启时尤其明显）。
+SPLASH_HTML = """<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>%(title)s</title>
+<style>
+html,body{height:100%%;margin:0}
+body{display:flex;align-items:center;justify-content:center;flex-direction:column;
+background:#0b1220;color:#e2e8f0;font-family:"Microsoft YaHei",system-ui,sans-serif}
+.ring{width:42px;height:42px;border:4px solid rgba(226,232,240,.22);border-top-color:#38bdf8;
+border-radius:50%%;animation:spin .9s linear infinite;margin-bottom:18px}
+@keyframes spin{to{transform:rotate(360deg)}}
+.t{font-size:15px;letter-spacing:.5px}
+.h{font-size:12px;color:#94a3b8;margin-top:10px}
+</style></head>
+<body><div class="ring"></div>
+<div class="t">正在启动，请稍候…</div>
+<div class="h">首次启动或切换运行模式时需要一点时间</div>
+</body></html>"""
+
+
+def _splash_html() -> str:
+    return SPLASH_HTML % {"title": APP_NAME}
+
+
+def _error_html(message: str) -> str:
+    return (
+        "<!DOCTYPE html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
+        f"<title>{APP_NAME}</title></head>"
+        "<body style=\"font-family:'Microsoft YaHei',system-ui,sans-serif;padding:32px;"
+        "color:#e2e8f0;background:#0b1220\">"
+        f"<h3>{APP_NAME} 启动失败</h3><p>{message}</p>"
+        f"<p style=\"color:#94a3b8;font-size:12px\">日志：{_log_path_hint()}</p></body></html>"
+    )
+
+
+def _create_window() -> Any:
+    """创建主窗口并注册各类回调（初始显示启动页）。"""
     import webview
 
     # 必须开启，否则 WebView2 会直接取消所有导出下载
     webview.settings["ALLOW_DOWNLOADS"] = True
     width, height, min_size = _window_size()
-    # ?v= 资源版本：升级后避免 WebView2 复用缓存的旧 index.html/旧前端
     window = webview.create_window(
         APP_NAME,
-        f"http://127.0.0.1:{port}/?v={_asset_version()}",
+        html=_splash_html(),
         width=width,
         height=height,
         min_size=min_size,
@@ -455,8 +496,46 @@ def _run_window(port: int, data_root: Path) -> None:
         desktop_bridge.set_fullscreen_handler(_make_fullscreen_handler(window))
     except Exception as exc:  # noqa: BLE001
         _log.warning("注入窗口全屏回调失败（地图全屏将退化为应用内全屏）：%s", exc)
-    # private_mode=False + storage_path：localStorage 持久化（否则每次启动掉登录）
-    webview.start(private_mode=False, storage_path=str(data_root / "webview"))
+    return window
+
+
+def _boot_backend_and_open(window: Any, sock: Any, port: int, url: str) -> None:
+    """GUI 起来后在独立线程执行：启动后端 → 等就绪 → 把窗口导航到应用页面。
+
+    pywebview 的 webview.start(func, args) 就是为这种"先开窗、后加载"准备的。
+    """
+    global _SERVER, _SERVER_THREAD, _STARTUP_FAILED
+    try:
+        server, thread = _start_server(sock)
+        _SERVER, _SERVER_THREAD = server, thread
+        if not _wait_ready(port):
+            _log.error("后端启动超时（%s 秒），日志: %s", READY_TIMEOUT_SECONDS, _log_path_hint())
+            _STARTUP_FAILED = True
+            _show_startup_error(window, "后端服务启动超时，请把日志发送给技术支持。")
+            return
+        _log.info("后端就绪，切换到应用页面")
+        try:
+            window.load_url(url)
+        except Exception as exc:  # noqa: BLE001
+            # load_url 不可用（pywebview 版本差异）时退回页面内跳转
+            _log.warning("窗口导航失败（改用页面内跳转）：%s", exc)
+            window.load_html(
+                f"<script>location.replace({url!r})</script>",
+                base_uri=url,
+            )
+    except Exception as exc:  # noqa: BLE001
+        _log.exception("后端启动失败")
+        _STARTUP_FAILED = True
+        _show_startup_error(window, f"后端服务启动失败：{exc}")
+
+
+def _show_startup_error(window: Any, message: str) -> None:
+    """启动失败时把原因显示在窗口里（窗口已存在，不再弹模态框挡住它）。"""
+    try:
+        window.load_html(_error_html(message))
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("显示启动失败页失败：%s", exc)
+        _message_box(f"程序启动失败，请将日志发送给技术支持：\n{_log_path_hint()}", 0x10)
 
 
 def _log_path_hint() -> str:
@@ -556,18 +635,29 @@ def main(argv: Optional[list] = None) -> int:
 
     sock, port = _create_bound_socket(data_root)
     _log.info("后端监听 127.0.0.1:%s", port)
-    server, thread = _start_server(sock)
-    if not _wait_ready(port):
-        _log.error("后端启动超时（%s 秒），日志: %s", READY_TIMEOUT_SECONDS, _log_path_hint())
-        _message_box(f"程序启动失败，请将日志发送给技术支持：\n{_log_path_hint()}", 0x10)
-        return 1
-    _log.info("后端就绪")
 
     if args.selftest:
+        server, thread = _start_server(sock)
+        if not _wait_ready(port):
+            _log.error("后端启动超时（%s 秒），日志: %s", READY_TIMEOUT_SECONDS, _log_path_hint())
+            _message_box(f"程序启动失败，请将日志发送给技术支持：\n{_log_path_hint()}", 0x10)
+            return 1
+        _log.info("后端就绪")
         return _run_selftest(port)
 
-    _log.info("打开桌面窗口")
-    _run_window(port, data_root)
+    import webview
+
+    # 先开窗（显示启动页），后端在后台线程启动 —— 用户立刻有反馈，
+    # 不必等整份后端导入 + lifespan 跑完才看到窗口
+    window = _create_window()
+    _log.info("打开桌面窗口（启动页），后端在后台启动")
+    # private_mode=False + storage_path：localStorage 持久化（否则每次启动掉登录）
+    webview.start(
+        _boot_backend_and_open,
+        (window, sock, port, f"http://127.0.0.1:{port}/?v={_asset_version()}"),
+        private_mode=False,
+        storage_path=str(data_root / "webview"),
+    )
     _log.info("窗口已关闭，正在退出")
     # 后台更新（用户点了「后台运行」）：进程继续跑到安装脚本拉起为止。
     # 这期间仍持有单实例互斥体：用户再点图标会被"后台更新中"的提示挡住，
@@ -576,9 +666,13 @@ def main(argv: Optional[list] = None) -> int:
     # 释放单实例互斥体：收尾阶段（停服务、解释器退出）不再阻止用户重新启动，
     # 也避免安装器的 AppMutex 检测把安装挡下来
     _release_single_instance()
-    server.should_exit = True
-    thread.join(timeout=5)
-    return 0
+    # 后端由 _boot_backend_and_open 在后台线程启动：窗口可能在它起来之前就被关掉
+    # （用户等不及直接关窗），这里按实际拿到的句柄收尾，拿不到就交给进程退出
+    if _SERVER is not None:
+        _SERVER.should_exit = True
+    if _SERVER_THREAD is not None:
+        _SERVER_THREAD.join(timeout=5)
+    return 1 if _STARTUP_FAILED else 0
 
 
 if __name__ == "__main__":

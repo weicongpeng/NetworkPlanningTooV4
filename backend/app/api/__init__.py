@@ -108,7 +108,7 @@ def _purge_upload_tmp() -> None:
 
 
 def _desktop_startup_maintenance() -> None:
-    """桌面端启动后的非关键维护（后台线程串行执行，不阻塞窗口就绪）。"""
+    """桌面端启动后的非关键维护（延后队列里串行执行，不阻塞窗口就绪）。"""
     _cleanup_invalid_index()
     _purge_upload_tmp()
     try:
@@ -117,6 +117,68 @@ def _desktop_startup_maintenance() -> None:
         cleanup_stale_installers()
     except Exception as e:  # noqa: BLE001
         logger.warning(f"⚠️ 清理历史安装包失败: {e}")
+
+
+def _desktop_deferred_job_maintenance() -> None:
+    _desktop_startup_maintenance()
+
+
+def _desktop_deferred_job_index_migration() -> None:
+    """拆分旧版「结果内嵌」任务索引（解析上百 MB，放这里才不会拖慢登录）。"""
+    from app.services.task_manager import task_manager
+
+    task_manager.migrate_legacy_index_if_needed()
+
+
+def _desktop_deferred_job_prewarm() -> None:
+    """预热图层 GeoJSON 缓存（GDAL 解析 + 坐标转换，最重的一项）。"""
+    from app.services.data_service import data_service
+
+    data_service.prewarm_all_map_caches(blocking=True)
+
+
+def _desktop_deferred_job_coord_backfill() -> None:
+    """按库内小区记录重算「经纬度缺失或为 0」提醒条数（大库上是一次全表统计）。"""
+    from app.services.data_service import data_service
+
+    corrected = data_service.backfill_coord_zero_warnings()
+    if corrected:
+        logger.info(f"✅ 坐标缺失提醒已按库内记录修正: {corrected} 个全量工参")
+
+
+def _run_desktop_deferred_startup() -> None:
+    """桌面端启动后的重活队列：**等首次登录完成再逐项跑**。
+
+    这些活儿（索引对账、删历史安装包、图层缓存预热、大表统计、旧索引拆分）都是
+    纯 Python / GDAL 线程、持 GIL，若在 lifespan 里并发起跑，正好压在用户点登录
+    的那几秒上。改为等首次登录后串行执行，让登录与首屏独占资源；用户长时间不
+    登录则按 timeout 兜底放行（见 core/startup_gate）。
+    每项之间留间隔，避免首屏请求刚落地就撞上下一项。
+    """
+    import time as _time
+
+    from app.core.startup_gate import wait_for_login
+
+    logged_in = wait_for_login()
+    logger.info(
+        "▶️ 桌面端延后维护开始（%s）",
+        "登录后触发" if logged_in else "等待登录超时，兜底执行",
+    )
+    for index, job in enumerate(
+        (
+            _desktop_deferred_job_index_migration,
+            _desktop_deferred_job_maintenance,
+            _desktop_deferred_job_coord_backfill,
+            _desktop_deferred_job_prewarm,
+        )
+    ):
+        if index:
+            _time.sleep(2.0)
+        try:
+            job()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"⚠️ 桌面端延后维护任务失败（忽略）: {e}")
+    logger.info("✅ 桌面端延后维护完成")
 
 
 @asynccontextmanager
@@ -154,21 +216,29 @@ async def lifespan(app: FastAPI):
     logger.info(f"✅ 桌面版安装包目录已创建: {desktop_releases_dir}")
 
     # 启动对账与临时文件清理：
-    # - 桌面端：放后台守护线程串行执行（非关键维护，登录前跑完即可）。launcher 以
-    #   /system/status 返回 200 为就绪信号，而 uvicorn 在 lifespan 结束前不接请求，
-    #   同步项越少，双击图标后窗口出现得越快
+    # - 桌面端：连同图层缓存预热、坐标提醒回填、旧索引拆分一起进 npt-desktop-deferred
+    #   队列，**等首次登录完成后再串行跑**——它们持 GIL，与用户点登录/开首屏同时起跑
+    #   会把登录拖慢；队列本身是守护线程，uvicorn 不会等它（launcher 以 /system/status
+    #   返回 200 为就绪信号，同步项越少，窗口出现得越快）
     # - 服务器形态：保持启动时同步完成（systemd 重启不频繁，期望启动即对账干净）
     if settings.NPT_DESKTOP:
         import threading as _maint_threading
 
         _maint_threading.Thread(
-            target=_desktop_startup_maintenance,
+            target=_run_desktop_deferred_startup,
             daemon=True,
-            name="npt-startup-maintenance",
+            name="npt-desktop-deferred",
         ).start()
     else:
         _cleanup_invalid_index()
         _purge_upload_tmp()
+        # 服务器形态：旧版任务索引仍在启动时同步拆分一次（保持既有启动行为）
+        try:
+            from app.services.task_manager import task_manager
+
+            task_manager.migrate_legacy_index_if_needed()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"⚠️ 拆分历史任务索引失败: {e}")
 
     # 初始化用户数据库
     try:
@@ -263,37 +333,16 @@ async def lifespan(app: FastAPI):
         logger.warning(f"⚠️ ProcessPoolExecutor 创建失败: {e}，将使用线程池")
         pool = None
 
-    # 🔥 启动时后台预热所有 MapInfo 图层的 GeoJSON 缓存
-    # 解决"首次勾选图层时后端 parse+转换耗时过长导致前端 300s 超时"：
-    # 现有数据在启动时即预热磁盘缓存，后续勾选图层请求直接命中缓存
-    try:
-        from app.services.data_service import data_service
-        data_service.prewarm_all_map_caches()
-    except Exception as e:
-        logger.error(f"❌ 启动预热图层缓存失败: {e}")
+    # 桌面端：图层缓存预热、坐标缺失提醒回填、旧索引拆分、索引对账等重活统一进
+    # npt-desktop-deferred 队列，等首次登录后再串行跑（见 _run_desktop_deferred_startup）。
+    # 服务器形态保持既有行为：预热后台线程 + 启动时同步回填（systemd 重启不频繁）。
+    if not settings.NPT_DESKTOP:
+        try:
+            from app.services.data_service import data_service
+            data_service.prewarm_all_map_caches()
+        except Exception as e:
+            logger.error(f"❌ 启动预热图层缓存失败: {e}")
 
-    # 存量全量工参：「经纬度缺失或为 0」提醒条数按库内小区记录重算一次
-    # （旧版在去重前按源文件行数统计，NR 共享小区的多条 PLMN 行会把 4 条报成 8 个，
-    # 导致网页端提示与桌面端解析结果不一致）。纯展示数字校正、首屏不依赖它，
-    # 桌面模式（含模式切换重启）放后台线程执行，避免大库 COUNT 拖慢窗口出现；
-    # 网页端保持启动时同步完成（systemd 重启不频繁，且运维期望启动即一致）。
-    if settings.NPT_DESKTOP:
-        import threading as _threading
-
-        def _backfill_coord_warnings_async() -> None:
-            try:
-                from app.services.data_service import data_service as _ds
-                corrected = _ds.backfill_coord_zero_warnings()
-                if corrected:
-                    logger.info(f"✅ 坐标缺失提醒已按库内记录修正: {corrected} 个全量工参")
-            except Exception as e:  # noqa: BLE001
-                logger.warning(f"⚠️ 坐标缺失提醒回填失败: {e}")
-
-        _threading.Thread(
-            target=_backfill_coord_warnings_async, daemon=True,
-            name="npt-coord-warn-backfill",
-        ).start()
-    else:
         try:
             from app.services.data_service import data_service as _ds_for_warn_backfill
             corrected = _ds_for_warn_backfill.backfill_coord_zero_warnings()

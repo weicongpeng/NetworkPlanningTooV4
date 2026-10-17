@@ -6960,12 +6960,15 @@ class DataService:
         import threading
         threading.Thread(target=_run, daemon=True).start()
 
-    def prewarm_all_map_caches(self):
+    def prewarm_all_map_caches(self, blocking: bool = False):
         """服务启动时后台预热所有 MapInfo 图层的 GeoJSON 缓存。
 
         解决"首次勾选图层时后端 parse + 坐标转换耗时过长导致前端 300s 超时"：
         扫描索引中所有 map 类型数据，逐个预热 .cache/*.geojson 磁盘缓存。
-        幂等、后台线程、失败仅记日志，不阻塞启动。
+        幂等、失败仅记日志，不阻塞启动。
+
+        blocking=True 时在当前线程跑完（桌面端由「登录后」的延后队列串行调用，
+        避免这里再开一层线程导致多项重活并发抢 GIL）。
         """
         def _run():
             map_ids = [
@@ -6981,6 +6984,10 @@ class DataService:
                 except Exception as e:
                     safe_print(f"[DataService] 预热 {data_id} 失败: {e}")
             safe_print("[DataService] 图层缓存预热任务已全部提交（后台执行）")
+
+        if blocking:
+            _run()
+            return
 
         import threading
         threading.Thread(target=_run, daemon=True).start()

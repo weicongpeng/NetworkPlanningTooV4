@@ -1109,7 +1109,11 @@ async def sync_loop(interval_minutes: Optional[int] = None) -> None:
         interval_minutes if interval_minutes is not None
         else (getattr(settings, "NPT_DESKTOP_SYNC_INTERVAL_MINUTES", 1) or 1)
     )
-    await asyncio.sleep(15)  # 启动先让本地服务热身，避免开局抢资源
+    # 首次同步等「首次登录完成」再跑：整包下载 + 解压 + 导入要抢 CPU/磁盘，
+    # 若在用户点登录那几秒起跑会明显拖慢登录与首屏（超时兜底见 startup_gate）
+    from app.core.startup_gate import wait_for_login
+
+    await asyncio.to_thread(wait_for_login)
     while True:
         try:
             if is_shared():
