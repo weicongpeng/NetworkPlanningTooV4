@@ -239,9 +239,14 @@ export function LoginModal({ isOpen, forceChangePassword = false, onClose }: Log
 
   // 运行模式切换：确认 → 自动重启 →（不支持时）手动重启引导
   if (switchPending) {
-    const modeName = switchPending.mode === 'standalone'
+    const isStandalone = switchPending.mode === 'standalone'
+    const modeName = isStandalone
       ? t('desktopAuth.modeStandalone', '单机模式')
       : t('desktopAuth.modeShared', '共享模式')
+    // 两种模式的数据语义相反：共享模式同组互通，单机模式完全本机私有
+    const switchConfirmBody = isStandalone
+      ? t('desktopAuth.switchConfirmBodyStandalone', '即将切换到单机模式，数据独有，不共享')
+      : t('desktopAuth.switchConfirmBodyShared', '即将切换到共享模式，同组用户数据共享')
     return (
       <div className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/50 backdrop-blur-sm">
         <div className="bg-card border border-border rounded-xl shadow-2xl px-8 py-7 w-[28rem]">
@@ -254,10 +259,7 @@ export function LoginModal({ isOpen, forceChangePassword = false, onClose }: Log
                 {t('desktopAuth.switchConfirmTitle', '切换运行模式')}
               </div>
               <p className="mt-3 text-sm leading-6 text-muted-foreground">
-                {t('desktopAuth.switchConfirmBody', {
-                  mode: modeName,
-                  defaultValue: '即将切换到{{mode}}，数据独有，不共享。',
-                })}
+                {switchConfirmBody}
               </p>
               {switchActionError && (
                 <div className="mt-3 text-sm text-destructive">{switchActionError}</div>
