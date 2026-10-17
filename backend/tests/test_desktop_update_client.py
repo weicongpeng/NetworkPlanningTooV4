@@ -648,3 +648,26 @@ def test_launcher_background_marker_detection(tmp_path):
     # 拿到单实例互斥体的新进程说明没有别的进程在后台更新：残留标记要清掉
     launcher._clear_stale_background_marker(tmp_path)
     assert launcher._background_update_marker_exists(tmp_path) is False
+
+
+def test_launcher_splash_distinguishes_mode_switch(monkeypatch):
+    """启动过渡页按场景区分文案：模式切换重启（spawn_relaunch 注入
+    NPT_DESKTOP_SWITCHING=1）显示「正在切换到XX模式」，普通启动用通用文案。"""
+    launcher = _load_launcher()
+
+    monkeypatch.delenv("NPT_DESKTOP_SWITCHING", raising=False)
+    html = launcher._splash_html()
+    assert "正在启动" in html
+    assert "正在切换" not in html
+
+    # 切到共享模式（目标档由 active_profile.json 写入，经环境变量传入）
+    monkeypatch.setenv("NPT_DESKTOP_SWITCHING", "1")
+    monkeypatch.setenv("NPT_DESKTOP_PROFILE", "shared")
+    html = launcher._splash_html()
+    assert "正在切换到共享模式" in html
+    assert "请勿手动关闭窗口" in html
+
+    # 切到单机模式
+    monkeypatch.setenv("NPT_DESKTOP_PROFILE", "standalone")
+    html = launcher._splash_html()
+    assert "正在切换到单机模式" in html

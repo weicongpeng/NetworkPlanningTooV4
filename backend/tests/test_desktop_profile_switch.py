@@ -230,6 +230,32 @@ def test_relaunch_helper_clears_inherited_profile_env(tmp_path):
     assert 'set "NPT_DESKTOP_PROFILE="' in content
 
 
+def test_spawn_relaunch_marks_switching_for_splash(monkeypatch, tmp_path):
+    """模式切换重启要给新进程打上 NPT_DESKTOP_SWITCHING=1：启动器据此把
+    过渡页显示为「正在切换运行模式」，用户不会把重启误判为崩溃/更新失败。"""
+    import os as _os
+
+    from app.core import desktop_profiles
+
+    captured: dict = {}
+
+    def fake_popen(*args, **kwargs):
+        captured["env"] = kwargs.get("env") or {}
+        return SimpleNamespace(pid=0)
+
+    # 只替换模块内引用的 os（不 patch 全局 os.name，避免 pathlib 走到 WindowsPath）
+    class _FakeOs:
+        name = "nt"
+        environ = _os.environ
+
+    monkeypatch.setattr(desktop_profiles, "os", _FakeOs)
+    monkeypatch.setattr(desktop_profiles.subprocess, "Popen", fake_popen)
+    assert desktop_profiles.spawn_relaunch(tmp_path) is True
+    assert captured["env"].get("NPT_DESKTOP_SWITCHING") == "1"
+    # 选档变量仍要清掉：新进程必须从 active_profile.json 选目标档
+    assert "NPT_DESKTOP_PROFILE" not in captured["env"]
+
+
 def test_switch_cancel_restores_active_profile_and_discards_pending(switch_env):
     # 先制造一次跨档切换：standalone 档请求共享登录
     resp = switch_env.client.post(

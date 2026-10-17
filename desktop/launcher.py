@@ -420,6 +420,8 @@ def _make_close_handler() -> Callable[[], None]:
 # 启动页：窗口创建后立即显示它，后端在后台线程启动；就绪后再导航到真正的应用地址。
 # 否则「双击图标 / 切运行模式重启」后要等整份后端导入 + lifespan 跑完才出现窗口，
 # 那段时间用户只看到空白（共享↔单机切换重启时尤其明显）。
+# 模式切换重启（NPT_DESKTOP_SWITCHING=1，由 spawn_relaunch 注入）显示专属文案：
+# 告诉用户"应用没有坏，是在切数据空间"，与普通启动区分开。
 SPLASH_HTML = """<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8"><title>%(title)s</title>
 <style>
@@ -430,16 +432,38 @@ background:#0b1220;color:#e2e8f0;font-family:"Microsoft YaHei",system-ui,sans-se
 border-radius:50%%;animation:spin .9s linear infinite;margin-bottom:18px}
 @keyframes spin{to{transform:rotate(360deg)}}
 .t{font-size:15px;letter-spacing:.5px}
-.h{font-size:12px;color:#94a3b8;margin-top:10px}
+.h{font-size:12px;color:#94a3b8;margin-top:10px;max-width:420px;text-align:center;line-height:1.6}
 </style></head>
 <body><div class="ring"></div>
-<div class="t">正在启动，请稍候…</div>
-<div class="h">首次启动或切换运行模式时需要一点时间</div>
+<div class="t">%(text)s</div>
+<div class="h">%(hint)s</div>
 </body></html>"""
+
+_SPLASH_TEXT_DEFAULT = "正在启动，请稍候…"
+_SPLASH_HINT_DEFAULT = "首次启动或切换运行模式时需要一点时间"
+_SPLASH_TEXT_SWITCHING = "正在切换运行模式，请稍候…"
+_SPLASH_HINT_SWITCHING = "数据空间切换中：正在关闭旧实例并启动新配置档，请勿手动关闭窗口"
 
 
 def _splash_html() -> str:
-    return SPLASH_HTML % {"title": APP_NAME}
+    """按启动场景生成过渡页文案。
+
+    模式切换重启（spawn_relaunch 注入 NPT_DESKTOP_SWITCHING=1）时明确告知目标模式，
+    避免用户把"应用消失又出现"误判为崩溃或更新失败。
+    """
+    if os.environ.get("NPT_DESKTOP_SWITCHING") == "1":
+        profile = os.environ.get("NPT_DESKTOP_PROFILE") or "shared"
+        mode_name = "共享模式" if profile == "shared" else "单机模式"
+        return SPLASH_HTML % {
+            "title": APP_NAME,
+            "text": f"正在切换到{mode_name}，请稍候…",
+            "hint": _SPLASH_HINT_SWITCHING,
+        }
+    return SPLASH_HTML % {
+        "title": APP_NAME,
+        "text": _SPLASH_TEXT_DEFAULT,
+        "hint": _SPLASH_HINT_DEFAULT,
+    }
 
 
 def _error_html(message: str) -> str:

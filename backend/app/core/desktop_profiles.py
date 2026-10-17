@@ -192,6 +192,9 @@ def spawn_relaunch(data_root: Path) -> bool:
         return False
     helper = write_relaunch_helper(data_root)
     child_env = {k: v for k, v in os.environ.items() if k != "NPT_DESKTOP_PROFILE"}
+    # 标记"这次重启是模式切换"：启动器读到它会把启动过渡页显示为
+    # 「正在切换运行模式」（通用文案会让用户误以为应用只是普通重启）
+    child_env["NPT_DESKTOP_SWITCHING"] = "1"
     creationflags = (
         getattr(subprocess, "CREATE_NO_WINDOW", 0)
         | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)

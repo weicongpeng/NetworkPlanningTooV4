@@ -2018,17 +2018,27 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
     refreshData: async () => {
       await loadSectorData(true)
       // 同组其他端的数据变更（WS data_changed / 桌面同步落地）到达时：除了工参扇区，
-      // 已渲染的图层实例也必须丢弃重建，否则地图一直显示旧图层内容
-      // （缓存的 GeoJSON 已由 markAllDirty 丢弃，这里只负责拆旧实例、重置加载守卫）
+      // 已渲染的图层实例也必须丢弃重建，否则地图一直显示旧图层内容/旧属性
       const map = mapInstanceRef.current
       if (map) {
+        // 1) MapInfo 图层：拆旧实例 + 重置加载守卫（缓存 GeoJSON 已由 markAllDirty 丢弃）
         for (const [layerId, ref] of Array.from(mapInfoLayerRefsRef.current)) {
           try { ref.mapInfoLayer.remove(map) } catch { /* ignore */ }
           mapInfoLayerRefsRef.current.delete(layerId)
           loadedMapInfoLayersRef.current.delete(layerId)
           try { getHeatmapManager().remove(layerId) } catch { /* ignore */ }
         }
+        // 2) 地理化数据图层（点/扇区/面）：loadMapInfoLayer 按 geoDataLayerManager.getLayer
+        //    守卫跳过重建，必须一并拆除，否则远端更新后点击要素看到的还是旧属性
+        try { geoDataLayerManagerRef.current?.clear() } catch { /* ignore */ }
+        // 3) Excel 地理化数据的预取缓存是旧数据源，一并失效（重建时重新拉取）
+        prefetchedExcelDataRef.current.clear()
         await loadMapInfoLayers()
+        // 4) 重建后重放热力面：重建时热力栅格已随图层移除，按当前设置以新数据重算挂回
+        const heatmapSettings = useMapStore.getState().mapSettings.heatmapSettingsMap || {}
+        for (const [fileId, settings] of Object.entries(heatmapSettings)) {
+          if (settings?.enabled) applyDataLayerHeat(fileId, settings)
+        }
       }
     },
 
