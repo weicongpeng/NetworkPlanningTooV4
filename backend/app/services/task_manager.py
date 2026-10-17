@@ -6,6 +6,7 @@ import asyncio
 import uuid
 import math
 import json
+import os
 import threading
 from pathlib import Path
 from datetime import datetime
@@ -77,6 +78,9 @@ class Task:
         self.status = TaskStatus.PENDING
         self.progress = 0.0
         self.result = None
+        # 结果外置后（见 _load_tasks_index）：从磁盘索引恢复的任务此处为 None，
+        # 首次读取时再按需从 sidecar/SQLite 装载。执行中的任务恒为 False。
+        self._result_pending = False
         self.error = None
         self.created_at = datetime.now()
         self.started_at = None
@@ -143,8 +147,9 @@ class TaskManager:
         self._semaphore = asyncio.Semaphore(self.max_tasks)
         # 数据准备缓存，避免同一任务重复读取
         self._data_prep_cache: Dict[str, Any] = {}
-        # 持久化索引文件路径
-        self._tasks_index_file = settings.OUTPUT_DIR / "tasks_index.json"
+        # 旧版大索引后台拆分状态（见 _load_tasks_index / _migrate_legacy_index）
+        self._index_migration_pending = False
+        self._index_migration_done = threading.Event()
         # 启动时从磁盘恢复已完成的任务（支持后端重启后导出历史结果）
         self._load_tasks_index()
 
@@ -187,8 +192,13 @@ class TaskManager:
     # 任务持久化方法 - 支持后端重启后恢复历史任务
     # ============================================================
 
-    def _get_task_serializable_data(self, task: Task) -> Dict[str, Any]:
-        """获取任务的可序列化数据（排除 asyncio.Task 等不可序列化字段）"""
+    def _get_task_serializable_data(self, task: Task, include_result: bool = True) -> Dict[str, Any]:
+        """获取任务的可序列化数据（排除 asyncio.Task 等不可序列化字段）
+
+        include_result=False 用于写 tasks_index.json：单条结果可达十几 MB（buffer/tac），
+        全塞进一个索引文件会让进程启动时解析上百 MB（实测 271 MB / 6 秒以上），
+        结果改为按任务外置落盘，索引只留元数据。
+        """
         # config 可能是 Pydantic 模型，需要用 mode='json' 转为 JSON 兼容格式
         config_data = {}
         if task.config is not None:
@@ -203,13 +213,13 @@ class TaskManager:
                 logger.warning(f'[TaskManager] config 序列化失败: {e}')
                 config_data = {'raw': str(task.config)}
 
-        return {
+        data = {
             'task_id': task.task_id,
             'task_type': task.task_type.value if hasattr(task.task_type, 'value') else str(task.task_type),
             'config': config_data,
             'status': task.status.value if hasattr(task.status, 'value') else str(task.status),
             'progress': task.progress,
-            'result': self._safe_serialize_result(task.result),
+            'result': self._safe_serialize_result(task.result) if include_result else None,
             'error': task.error,
             'task_name': getattr(task, 'task_name', None),
             'user_name': getattr(task, 'user_name', None),
@@ -220,6 +230,10 @@ class TaskManager:
             'started_at': task.started_at.isoformat() if task.started_at else None,
             'completed_at': task.completed_at.isoformat() if task.completed_at else None,
         }
+        if not include_result:
+            # 索引里连键都不留：写索引的格式与迁移产物保持一致
+            data.pop('result', None)
+        return data
 
     def _safe_serialize_result(self, result: Optional[Dict]) -> Optional[Dict]:
         """安全序列化任务结果，处理 numpy/int64/NaN/Infinity 等非 JSON 原生类型"""
@@ -234,7 +248,7 @@ class TaskManager:
             return {'error': f'result序列化失败: {str(e)}', '_raw': str(result)[:500]}
 
     def _persist_task(self, task_id: str) -> None:
-        """保存单个任务到磁盘索引"""
+        """保存单个任务：结果写 sidecar，元数据写磁盘索引"""
         try:
             task = self.tasks.get(task_id)
             if task is None:
@@ -248,6 +262,8 @@ class TaskManager:
                     f"[TaskManager] 任务 {task_id[:8]}... 的 result 序列化失败！"
                     f"原始 result 有 {len(task.result)} 个 key，序列化后为 None。"
                 )
+            if saved_result is not None:
+                self._write_result_sidecar(task_id, saved_result)
 
             self._tasks_index_file.parent.mkdir(parents=True, exist_ok=True)
             index_data = {}
@@ -258,10 +274,12 @@ class TaskManager:
                 except Exception:
                     index_data = {}
 
-            index_data[task_id] = serializable_data
+            # 索引只留元数据（result 已在 sidecar 里），否则索引会随任务数膨胀到上百 MB，
+            # 每次启动解析它都要数秒；_load_tasks_index 也只信这个格式
+            index_data[task_id] = self._get_task_serializable_data(task, include_result=False)
 
             with open(self._tasks_index_file, "w", encoding="utf-8") as f:
-                json.dump(index_data, f, ensure_ascii=False, indent=2)
+                json.dump(index_data, f, ensure_ascii=False)
 
             logger.info(f"[TaskManager] 任务已持久化: {task_id[:8]}... type={task.task_type.value} status={task.status.value}")
 
@@ -270,18 +288,122 @@ class TaskManager:
             logger.error(f"[TaskManager] 保存任务 {task_id[:8] if task_id else '?'}... 索引失败: {e}")
             logger.error(f"[TaskManager] Traceback: {traceback.format_exc()[:500]}")
 
+    # ---- 结果外置（sidecar）------------------------------------------------
+    # 背景：历史实现把每个任务的完整 result 一并塞进 tasks_index.json，生产上该文件
+    # 已到 271 MB / 267 条（result 占 145 MB），TaskManager 又在**模块导入时**构造，
+    # 于是每次启动都要同步解析上百 MB（实测 +6.2s，Windows 冻结包更久），并且这份
+    # 结果与 SQLite task_results.result_json 完全重复。现在索引只留元数据，
+    # 结果按任务落 OUTPUT_DIR/task_results/<task_id>.json，按需装载。
+
+    # 超过该体积即判定为「旧版含结果的大索引」，改为后台迁移、启动时不解析
+    LEGACY_INDEX_SIZE_LIMIT = 8 * 1024 * 1024
+
+    @property
+    def _tasks_index_file(self) -> Path:
+        """任务索引路径**每次取当前 settings**。
+
+        不能在 __init__ 里定死：settings.OUTPUT_DIR 会被测试/多形态改写，而本类是
+        进程级单例（导入时构造）。定死的话，测试里 `TestClient(create_app())` 跑到的
+        lifespan 会拿着生产路径去拆分生产索引（历史事故同类：单例固化路径导致测试写
+        生产数据）。
+        """
+        return Path(settings.OUTPUT_DIR) / "tasks_index.json"
+
+    @property
+    def _result_sidecar_dir(self) -> Path:
+        return self._tasks_index_file.parent / "task_results"
+
+    def _result_sidecar_path(self, task_id: str) -> Path:
+        return self._result_sidecar_dir / f"{task_id}.json"
+
+    def _write_result_sidecar(self, task_id: str, result: Dict) -> None:
+        """原子写结果文件（先写临时文件再 os.replace，避免读到半截 JSON）"""
+        try:
+            path = self._result_sidecar_path(task_id)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".json.tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(result, f, ensure_ascii=False)
+            os.replace(tmp, path)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[TaskManager] 写入任务结果文件失败（{task_id[:8]}...）: {e}")
+
+    def _delete_result_sidecar(self, task_id: str) -> None:
+        try:
+            self._result_sidecar_path(task_id).unlink(missing_ok=True)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[TaskManager] 删除任务结果文件失败（{task_id[:8]}...）: {e}")
+
+    def _read_result_sidecar(self, task_id: str) -> Optional[Dict]:
+        path = self._result_sidecar_path(task_id)
+        if not path.is_file():
+            return None
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[TaskManager] 读取任务结果文件失败（{task_id[:8]}...）: {e}")
+            return None
+
+    def _ensure_result(self, task: Task) -> None:
+        """按需装载外置结果：sidecar 优先，其次 SQLite（存量/写入失败时兜底）。"""
+        if task.result is not None or not getattr(task, "_result_pending", False):
+            return
+        # 无论成败都清标记：避免结果确实为空时反复读盘
+        task._result_pending = False
+        result = self._read_result_sidecar(task.task_id)
+        if result is None:
+            result = self.get_task_result_from_db(task.task_id)
+        if result is not None:
+            task.result = result
+
     def _load_tasks_index(self) -> None:
         """从磁盘恢复已完成的任务元数据（支持后端重启后导出）"""
         if not self._tasks_index_file.exists():
             logger.info(f"[TaskManager] 任务索引文件不存在，将从头开始")
             return
         try:
+            if self._tasks_index_file.stat().st_size > self.LEGACY_INDEX_SIZE_LIMIT:
+                # 旧版大索引：启动路径上绝不解析它（登录/切模式重启的等待时间直接受影响）。
+                # 这里只打标记，真正拆分由调用方决定时机（桌面端放到「首次登录之后」的
+                # 延后队列里，服务器端启动时同步跑一次）——解析 271 MB 会持 GIL，
+                # 若在此处起线程，正好和紧随其后的 app 导入抢 CPU，反而更慢。
+                self._index_migration_pending = True
+                logger.info(
+                    f"[TaskManager] 检测到含结果的历史任务索引（"
+                    f"{self._tasks_index_file.stat().st_size // (1024 * 1024)} MB），"
+                    "延迟到启动完成后拆分"
+                )
+                return
             with open(self._tasks_index_file, "r", encoding="utf-8") as f:
                 index_data = json.load(f)
         except json.JSONDecodeError as e:
             logger.warning(f"[TaskManager] 任务索引文件损坏，将重新创建: {e}")
             return
 
+        if any(
+            isinstance(entry, dict) and entry.get("result") is not None
+            for entry in index_data.values()
+        ):
+            # 体积没超阈值、但仍是「结果内嵌」的旧格式（任务少 / 结果小）：结果同样要
+            # 外置，否则 buffer / 条件选择 / 工参更新这三类不在 SQLite 里的结果会丢
+            try:
+                self._split_index_results(index_data)
+            except Exception as e:  # noqa: BLE001
+                # 拆分失败（磁盘满/权限）不能连累进程启动：退回普通恢复，结果仍在内存里
+                logger.warning(f"[TaskManager] 拆分小体积旧索引失败（改用内存结果）: {e}")
+                self._restore_tasks_from_index(index_data, results_inline=True)
+        else:
+            self._restore_tasks_from_index(index_data, results_inline=False)
+        # 无需迁移也置位：调用方（get_task_result）会等这个事件，别让它白等
+        self._index_migration_done.set()
+
+    def _restore_tasks_from_index(self, index_data: Dict[str, Any], results_inline: bool) -> int:
+        """把索引条目还原成内存 Task，返回恢复条数。
+
+        results_inline=True 仅用于迁移旧版索引：那时 result 就在条目里，顺手写进
+        sidecar；新格式下索引不含 result，置 _result_pending 让首次读取时按需装载。
+        """
         recovered = 0
         skipped = 0
         for task_id, task_data in index_data.items():
@@ -303,12 +425,6 @@ class TaskManager:
             task_type = TaskType._value2member_map_[task_type_str]
             task_result = task_data.get("result")
 
-            if task_result is None:
-                logger.warning(
-                    f"[TaskManager] 任务 {task_id[:8]}... 已完成但 result 为 None！"
-                    f"可能是持久化时序列化失败。请尝试重新运行该规划任务。"
-                )
-
             task = Task(task_type, task_data.get("config", {}),
                         task_name=task_data.get("task_name"),
                         user_name=task_data.get("user_name"),
@@ -317,17 +433,73 @@ class TaskManager:
             task.task_id = task_id
             task.status = status
             task.progress = task_data.get("progress", 100.0)
-            task.result = task_result
             task.error = task_data.get("error")
             task.created_at = datetime.fromisoformat(task_data["created_at"]) if task_data.get("created_at") else datetime.now()
             task.started_at = datetime.fromisoformat(task_data["started_at"]) if task_data.get("started_at") else None
             task.completed_at = datetime.fromisoformat(task_data["completed_at"]) if task_data.get("completed_at") else None
             task.task = None
 
+            if results_inline:
+                if task_result is not None:
+                    self._write_result_sidecar(task_id, task_result)
+                    task.result = task_result
+                else:
+                    task._result_pending = True
+            else:
+                # 结果外置：先不读盘，首次用到再装载（见 _ensure_result）
+                task._result_pending = True
+
             self.tasks[task_id] = task
             recovered += 1
 
         logger.info(f"[TaskManager] 从磁盘恢复任务: 成功={recovered}, 跳过={skipped}, 总计={len(index_data)}")
+        return recovered
+
+    def migrate_legacy_index_if_needed(self) -> bool:
+        """把旧版「结果内嵌」索引拆成 sidecar + 元数据索引（无旧索引时直接返回）。
+
+        由调用方决定时机：桌面端放进「首次登录之后」的延后队列（避免与登录抢 CPU），
+        服务器端启动时同步跑一次（保持既有启动行为）。
+        """
+        if not self._index_migration_pending:
+            self._index_migration_done.set()
+            return False
+        self._migrate_legacy_index()
+        return True
+
+    def _migrate_legacy_index(self) -> None:
+        """拆分旧版索引。
+
+        不改名、不预删原文件：进程中途被杀（用户关窗/升级）时原文件仍完整，
+        下次启动重新走一遍。
+        """
+        try:
+            with open(self._tasks_index_file, "r", encoding="utf-8") as f:
+                index_data = json.load(f)
+            self._split_index_results(index_data)
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"[TaskManager] 拆分历史任务索引失败（下次启动重试）: {e}")
+        finally:
+            self._index_migration_pending = False
+            self._index_migration_done.set()
+
+    def _split_index_results(self, index_data: Dict[str, Any]) -> None:
+        """把「结果内嵌」的索引拆成 sidecar + 元数据索引（原地原子写回）。"""
+        self._restore_tasks_from_index(index_data, results_inline=True)
+        metadata_only = {
+            task_id: {
+                key: value for key, value in task_data.items() if key != "result"
+            }
+            for task_id, task_data in index_data.items()
+        }
+        tmp = self._tasks_index_file.with_suffix(".json.tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(metadata_only, f, ensure_ascii=False)
+        os.replace(tmp, self._tasks_index_file)
+        logger.info(
+            f"[TaskManager] 历史任务索引拆分完成：{len(metadata_only)} 条元数据，"
+            f"结果已外置到 {self._result_sidecar_dir}"
+        )
 
     def set_process_pool(self, pool: Optional[ProcessPoolExecutor]) -> None:
         """设置进程池引用（供 CPU 密集型任务使用）"""
@@ -4022,6 +4194,7 @@ class TaskManager:
             return None
         # 如果任务完成，返回完整的结果数据（包含统计）
         if task.status == TaskStatus.COMPLETED:
+            self._ensure_result(task)
             result = task.result
             # 🔥 防御：确保结果不包含 NaN/Infinity（避免前端 JSON.parse 失败）
             if result is not None:
@@ -4034,16 +4207,31 @@ class TaskManager:
         """获取任务结果（内存优先，回退到 SQLite）"""
         task = self.tasks.get(task_id)
         if task and task.status == TaskStatus.COMPLETED:
+            self._ensure_result(task)
             result = task.result
             # 🔥 防御：确保结果不包含 NaN/Infinity
             if result is not None:
                 result = self._sanitize_result(result)
-            return result
+            if result is not None:
+                return result
         # 回退到 SQLite 历史任务
         db_result = self.get_task_result_from_db(task_id)
         if db_result is not None:
             db_result = self._sanitize_result(db_result)
             return db_result
+        # 旧版大索引正在后台拆分：此刻 self.tasks 还是空的，等它跑完再取一次，
+        # 避免升级后首次启动的几秒窗口里「查看历史结果」拿到空
+        if self._index_migration_pending:
+            self._index_migration_done.wait(timeout=30)
+            if task is None:
+                task = self.tasks.get(task_id)
+                if task and task.status == TaskStatus.COMPLETED:
+                    self._ensure_result(task)
+                    if task.result is not None:
+                        return self._sanitize_result(task.result)
+            db_result = self.get_task_result_from_db(task_id)
+            if db_result is not None:
+                return self._sanitize_result(db_result)
         # 桌面端共享镜像任务：结果不随同步下发，第一次查看/导出时按需拉取并缓存
         return self._fetch_shared_task_result(task_id)
 
@@ -4086,6 +4274,7 @@ class TaskManager:
                 from app.core.database import SessionLocal
                 from app.models.database import TaskResult
 
+
                 db = SessionLocal()
                 try:
                     row = db.query(TaskResult).filter(TaskResult.task_id == task_id_str).first()
@@ -4113,6 +4302,9 @@ class TaskManager:
                         logger.info(f"[TaskManager] 已删除导出文件: {export_file.name}")
             except Exception as e:
                 logger.warning(f"[TaskManager] 导出文件删除失败（可忽略）: {e}")
+
+            # 4b. 删除外置的结果文件，避免任务删了、结果还占着磁盘
+            self._delete_result_sidecar(task_id_str)
 
             # 5. 广播任务删除事件到所有 WebSocket 客户端，实现实时更新
             try:
@@ -4158,6 +4350,7 @@ class TaskManager:
         if task.status != TaskStatus.COMPLETED:
             logger.warning(f"[TaskManager] 导出失败: 任务 {task_id[:8]}... 未完成 (status={task.status.value})")
             return None
+        self._ensure_result(task)
         if task.result is None:
             logger.warning(f"[TaskManager] 导出失败: 任务 {task_id[:8]}... 已完成但结果数据为空，可能是不完整的历史任务")
             return None
