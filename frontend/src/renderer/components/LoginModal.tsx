@@ -112,6 +112,19 @@ export function LoginModal({ isOpen, forceChangePassword = false, onClose }: Log
     let cancelled = false
 
     const attempt = async () => {
+      // 0) 先取**当前实际运行档**：跨档重启后「记住的 mode」是切换前的旧值，
+      //    拿它自动登录会被再次判定为跨档 → 又弹「切换需要重启」（重启两次的根因）。
+      //    预填与自动登录一律以运行档为准。
+      let runningMode: 'shared' | 'standalone' = 'shared'
+      try {
+        const res: any = await desktopLoginApi.getProfile()
+        runningMode = res?.data?.profile === 'standalone' ? 'standalone' : 'shared'
+      } catch {
+        runningMode = 'shared'
+      }
+      if (cancelled) return
+      setDesktopRunMode(runningMode)
+
       // 1) 跨运行模式重启后保存的一次性登录/注册凭据（当前已是目标数据空间）
       let pending: any = null
       try {
@@ -158,14 +171,14 @@ export function LoginModal({ isOpen, forceChangePassword = false, onClose }: Log
         if (cancelled) return
         const saved = res?.data
         if (!saved?.username) return
-        const savedMode: 'shared' | 'standalone' = saved.mode === 'standalone' ? 'standalone' : 'shared'
         setUsername(saved.username)
         setPassword(saved.password || '')
-        setDesktopRunMode(savedMode)
+        // 用运行档（上面已 setDesktopRunMode），**不要**用 saved.mode：
+        // 它是切换前的旧值，会造成二次跨档判定
         if (remember && saved.password && !autoLoginAttemptedRef.current && !autoLoginSuppressed) {
           autoLoginAttemptedRef.current = true
           setIsSubmitting(true)
-          doDesktopLogin(saved.username, saved.password, savedMode, remember)
+          doDesktopLogin(saved.username, saved.password, runningMode, remember)
             .catch((err: any) => setError(err?.message || err?.detail || String(err)))
             .finally(() => setIsSubmitting(false))
         }

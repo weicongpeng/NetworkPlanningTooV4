@@ -26,7 +26,7 @@ import { CesiumMap } from '../components/Map/cesium/CesiumMap'
 import { MapSettingsPanel } from '../components/Map/MapSettingsPanel'
 import type { LayerOption, FrequencyOption } from '../components/Map'
 import { CoordinateTransformer } from '../utils/coordinate'
-import { mapApi, layerApi, desktopLoginApi } from '../services/api'
+import { mapApi, layerApi, dataApi, desktopLoginApi } from '../services/api'
 import { useAuthStore } from '../store/authStore'
 import { useDataStore, DATA_REFRESH_EVENT, triggerDataRefresh } from '../store/dataStore'
 import { useMapStore } from '../store/mapStore'
@@ -2232,6 +2232,64 @@ export function MapPage() {
   }, [storeSetSectorLabelVisibility])
 
   /**
+   * 首次打开图层「标签」时的默认设置：**图层属性的第一列**作为标签内容。
+   *
+   * 背景：标签开关第一次打开时还没有保存过任何设置，地图侧拿不到 content；
+   * 而设置弹窗的默认值会落到预设字段 `name`（多数图层并没有这个字段）——
+   * 表现为"勾了标签什么都不显示，必须去自定义设置里手动选字段"。
+   * 这里在首次开启时取图层字段列表的第一列建默认设置，开箱即用。
+   */
+  const ensureLabelSettingsForFile = useCallback(async (
+    fileId: string, kind: 'layer' | 'point',
+  ): Promise<LabelSettings | null> => {
+    const existing = labelSettingsMap[fileId]
+    if (existing?.content) return existing
+    const file: any = (kind === 'layer' ? layerFiles : pointFiles).find((f: any) => f.id === fileId)
+    if (!file?.dataId) return null
+    let firstField = ''
+    try {
+      if (kind === 'layer') {
+        const res: any = await layerApi.getLayerColumns(file.dataId, fileId)
+        firstField = String(res?.data?.fields?.[0] ?? '')
+      } else {
+        // 地理化数据没有列接口：取首行的第一个有效属性（插入序 = 源表列序）
+        const res: any = await dataApi.get(file.dataId)
+        const d: any = res?.data
+        const rows: any[] = Array.isArray(d) ? d
+          : (Array.isArray(d?.data) ? d.data : (d?.lte ?? d?.nr ?? []))
+        const first = rows?.[0]
+        const props = first?.properties ?? first ?? null
+        if (props && typeof props === 'object') {
+          const skip = new Set([
+            'attributes', 'properties', 'longitude', 'latitude',
+            'displayLng', 'displayLat', 'type', 'geometry',
+          ])
+          firstField = Object.keys(props).find(
+            (k) => !skip.has(k) && props[k] !== null && props[k] !== undefined,
+          ) ?? ''
+        }
+      }
+    } catch {
+      firstField = ''
+    }
+    if (!firstField) return null
+    const settings: LabelSettings = {
+      content: firstField,
+      color: '#000000',
+      fontSize: 12,
+      fontFamily: 'sans-serif',
+      bold: false,
+      italic: false,
+      shadow: false,
+      background: 'none',
+      backgroundColor: '#ffffff',
+    }
+    setLabelSettingsMap((prev) => ({ ...prev, [fileId]: settings }))
+    storeSetLabelSettings(fileId, settings)
+    return settings
+  }, [labelSettingsMap, layerFiles, pointFiles, storeSetLabelSettings])
+
+  /**
    * 处理点文件标签可见性切换
    */
   const handlePointFileLabelToggle = useCallback((fileId: string, visible: boolean) => {
@@ -2243,10 +2301,16 @@ export function MapPage() {
     storeSetPointFileLabelVisibility(fileId, visible)
 
     // 通知地图组件
-    if (onlineMapRef.current) {
-      onlineMapRef.current.setPointFileLabelVisibility(fileId, visible)
+    if (!onlineMapRef.current) return
+    if (!visible) {
+      onlineMapRef.current.setPointFileLabelVisibility(fileId, false)
+      return
     }
-  }, [storeSetPointFileLabelVisibility])
+    // 首次开启：同样先补"第一列属性"的默认设置，再开标签
+    void ensureLabelSettingsForFile(fileId, 'point').then(() => {
+      onlineMapRef.current?.setPointFileLabelVisibility(fileId, true)
+    })
+  }, [storeSetPointFileLabelVisibility, ensureLabelSettingsForFile])
 
   /**
    * 处理图层文件标签可见性切换
@@ -2260,11 +2324,18 @@ export function MapPage() {
     storeSetLayerFileLabelVisibility(fileId, visible)
 
     // 通知地图组件更新图层文件标签可见性
-    if (onlineMapRef.current) {
-      const settings = labelSettingsMap[fileId]
-      onlineMapRef.current.setLayerFileLabelVisibility(fileId, visible, settings)
+    if (!onlineMapRef.current) return
+    if (!visible) {
+      onlineMapRef.current.setLayerFileLabelVisibility(fileId, false, labelSettingsMap[fileId])
+      return
     }
-  }, [labelSettingsMap, storeSetLayerFileLabelVisibility])
+    // 首次开启：先补一份"第一列属性"的默认设置（取字段是异步的），再开标签
+    void ensureLabelSettingsForFile(fileId, 'layer').then((settings) => {
+      onlineMapRef.current?.setLayerFileLabelVisibility(
+        fileId, true, settings ?? labelSettingsMap[fileId],
+      )
+    })
+  }, [labelSettingsMap, storeSetLayerFileLabelVisibility, ensureLabelSettingsForFile])
 
   /**
    * 处理标签设置变化

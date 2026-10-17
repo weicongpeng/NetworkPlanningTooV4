@@ -6,9 +6,10 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { render, waitFor } from '@testing-library/react'
 
-const { loginMock, getLastLoginMock } = vi.hoisted(() => ({
+const { loginMock, getLastLoginMock, getProfileMock } = vi.hoisted(() => ({
   loginMock: vi.fn(),
   getLastLoginMock: vi.fn(),
+  getProfileMock: vi.fn(),
 }))
 
 vi.mock('../../services/api', () => ({
@@ -17,6 +18,7 @@ vi.mock('../../services/api', () => ({
     login: vi.fn(),
     options: vi.fn().mockResolvedValue({ success: true, data: { cities: [], operators: [] } }),
     getLastLogin: getLastLoginMock,
+    getProfile: getProfileMock,
     deleteLastLogin: vi.fn(),
   },
 }))
@@ -52,17 +54,37 @@ describe('LoginModal 记住账号密码', () => {
     })
   })
 
-  it('勾选「记住」时按保存的凭据自动登录一次', async () => {
+  it('勾选「记住」时按保存的凭据自动登录一次（用当前运行档）', async () => {
     getLastLoginMock.mockResolvedValue({
       success: true,
       data: { username: 'alice', password: 'pwd123', mode: 'standalone' },
     })
+    getProfileMock.mockResolvedValue({ success: true, data: { profile: 'standalone' } })
     loginMock.mockResolvedValue(null)
 
     render(<LoginModal isOpen onClose={() => {}} />)
 
     await waitFor(() => expect(loginMock).toHaveBeenCalledTimes(1))
     expect(loginMock).toHaveBeenCalledWith('alice', 'pwd123', 'standalone', true)
+  })
+
+  /**
+   * 回归：跨档重启后「记住的 mode」是切换前的旧值。
+   * 旧实现照旧值自动登录 → 再次判定为跨档 → 又弹「切换需要重启」（要重启两次）。
+   * 现在必须用**当前运行档**登录，一次重启即完成切换。
+   */
+  it('保存的旧 mode 与运行档不一致时，按运行档自动登录（不触发二次重启）', async () => {
+    getLastLoginMock.mockResolvedValue({
+      success: true,
+      data: { username: 'alice', password: 'pwd123', mode: 'standalone' },
+    })
+    getProfileMock.mockResolvedValue({ success: true, data: { profile: 'shared' } })
+    loginMock.mockResolvedValue(null)
+
+    render(<LoginModal isOpen onClose={() => {}} />)
+
+    await waitFor(() => expect(loginMock).toHaveBeenCalledTimes(1))
+    expect(loginMock).toHaveBeenCalledWith('alice', 'pwd123', 'shared', true)
   })
 
   it('取消勾选「记住」时不自动登录（仅预填）', async () => {

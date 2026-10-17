@@ -147,6 +147,12 @@ def test_cross_profile_register_short_circuits_before_server_call(switch_env):
 # ------------------------------------------------------------- 凭据一次性
 
 def test_pending_login_consumed_once_and_requires_matching_profile(switch_env):
+    """跨档凭据：档不匹配时**保留**、匹配时消费一次。
+
+    回归背景：旧实现在 finally 里无条件删除凭据（而档匹配校验在删除之后），
+    导致旧进程/重复读取把凭据提前销毁 → 重启后的新进程取不到凭据 →
+    退回用"记住的旧模式"自动登录 → 再次判定跨档 → 二次重启弹窗。
+    """
     # standalone 档请求共享登录
     resp = switch_env.client.post(
         "/api/v1/desktop/login",
@@ -154,17 +160,12 @@ def test_pending_login_consumed_once_and_requires_matching_profile(switch_env):
     )
     assert resp.json()["data"]["restart_required"] is True
 
-    # 仍在原档消费：档不匹配 → 丢弃凭据，返回 null
+    # 仍在原档消费：档不匹配 → 返回 null，但凭据必须**保留**（重启后新档还要用）
     pending = switch_env.client.get("/api/v1/desktop/pending-login").json()["data"]
     assert pending is None
-    # 不匹配的消费也已销毁凭据（防止原档误用）
-    assert not (switch_env.tmp_path / "pending_login.json").exists()
+    assert (switch_env.tmp_path / "pending_login.json").exists()
 
-    # 再来一次：切到正确档后正常消费
-    switch_env.client.post(
-        "/api/v1/desktop/login",
-        json={"username": "bob", "password": "secret", "mode": "shared", "remember": False},
-    )
+    # 切到正确档后直接消费同一个凭据（不需要重新发起切换请求）
     switch_env.monkeypatch.setattr(switch_env.settings, "DESKTOP_PROFILE", "shared")
     pending = switch_env.client.get("/api/v1/desktop/pending-login").json()["data"]
     assert pending == {
@@ -172,14 +173,31 @@ def test_pending_login_consumed_once_and_requires_matching_profile(switch_env):
         "username": "bob",
         "password": "secret",
         "mode": "shared",
-        "remember": False,
+        "remember": True,
     }
-    # 第二次消费：已删除
+    # 读后即删：第二次消费为空
     assert switch_env.client.get("/api/v1/desktop/pending-login").json()["data"] is None
 
 
 def test_pending_login_absent_returns_null(switch_env):
     assert switch_env.client.get("/api/v1/desktop/pending-login").json()["data"] is None
+
+
+# --------------------------------------------------- 当前运行档（登录页据此自动登录）
+
+def test_profile_endpoint_returns_running_profile(switch_env):
+    """登录页必须按**实际运行档**预填与自动登录。
+
+    回归背景：跨档重启后「记住的 mode」是切换前的旧值，照它登录会再次被
+    判定为跨档 → 二次重启弹窗。前端改为读这个接口。
+    """
+    assert switch_env.client.get("/api/v1/desktop/profile").json()["data"] == {
+        "profile": "standalone",
+    }
+    switch_env.monkeypatch.setattr(switch_env.settings, "DESKTOP_PROFILE", "shared")
+    assert switch_env.client.get("/api/v1/desktop/profile").json()["data"] == {
+        "profile": "shared",
+    }
 
 
 # ----------------------------------------------------------------- 重启端点

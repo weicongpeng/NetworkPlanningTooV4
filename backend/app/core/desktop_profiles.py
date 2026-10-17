@@ -157,8 +157,11 @@ tasklist /FI "IMAGENAME eq %EXE%" /NH 2>nul | find /I "%EXE%" >nul
 if errorlevel 1 goto launch
 set /a WAITED+=1
 if %WAITED% GEQ {_RESTART_WAIT_SECONDS} goto killapp
-rem ~1s poll: restart should feel immediate once the app exits
-ping -n 2 127.0.0.1 >nul
+rem fast poll: ping returns immediately, so the loop is bounded by tasklist
+rem (~0.1s) -> the relaunch starts right after the old process is gone.
+rem The loop only runs while the old process is alive, so the tight cadence
+rem costs nothing once it has exited.
+ping -n 1 127.0.0.1 >nul
 goto wait
 :killapp
 taskkill /F /IM "%EXE%" >nul 2>&1
@@ -167,8 +170,10 @@ rem The new process must select its data profile from active_profile.json,
 rem not inherit the old process NPT_DESKTOP_PROFILE (same pitfall as
 rem NPT_DESKTOP_VERSION in the OTA helper: env inheritance across restart).
 set "NPT_DESKTOP_PROFILE="
-rem brief wait for the single-instance mutex / fixed port to be released
-ping -n 2 127.0.0.1 >nul
+rem tasklist already confirmed the old process is gone: its mutex handle is
+rem released by the kernel at termination and the port uses SO_REUSEADDR.
+rem A single ping (~0.3s) only cushions slow antivirus scans of the new exe.
+ping -n 1 127.0.0.1 >nul
 start "" "%APP%"
 del "%~f0" >nul 2>&1
 """

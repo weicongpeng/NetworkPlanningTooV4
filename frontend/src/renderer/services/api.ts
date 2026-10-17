@@ -633,6 +633,15 @@ export const desktopLoginApi = {
   },
 
   /**
+   * 当前**实际运行**的配置档（shared / standalone）。
+   * 登录页预填与自动登录必须按它来：跨档重启后「记住的 mode」是旧值，
+   * 照旧值登录会被再次判定为跨档 → 二次重启弹窗。
+   */
+  getProfile: async (): Promise<ApiResponse<{ profile: 'shared' | 'standalone' }>> => {
+    return apiClient.get('/desktop/profile') as any
+  },
+
+  /**
    * 消费跨运行模式重启前保存的一次性登录/注册凭据（读后即删）。
    * 无凭据或目标档不匹配时返回 null。
    */

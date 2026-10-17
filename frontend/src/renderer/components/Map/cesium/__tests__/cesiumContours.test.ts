@@ -12,6 +12,10 @@ import {
   niceIntervalCeil,
   gridSizeFor,
   createContourLayer,
+  reliefMask,
+  reliefRadiusFor,
+  chainContourSegments,
+  type ContourSegment,
 } from '../cesiumContours'
 
 /** 行主序网格：index = row * cols + col，row 0 在北 */
@@ -148,8 +152,9 @@ describe('gridSizeFor', () => {
 })
 
 describe('contourLevels（按高差反推等高距——"开了开关没线"的回归）', () => {
-  it('城市/河谷小高差也必须能切出十来条（按跨度算会得到 0 条）', () => {
-    // 这些组合在旧算法（等高距按视野跨度算）下 levels 全为空：开开关看不到任何线
+  it('城市/河谷小高差也必须能切出好几条（按跨度算会得到 0 条）', () => {
+    // 这些组合在旧算法（等高距按视野跨度算）下 levels 全为空：开开关看不到任何线。
+    // 目标条数已调疏（TARGET_LINES=7），下界相应放宽到 4，但**绝不能为 0**。
     const cases: Array<[number, number, string]> = [
       [100, 180, '3km 视野 80m 高差'],
       [100, 250, '5km 视野 150m 高差'],
@@ -159,7 +164,7 @@ describe('contourLevels（按高差反推等高距——"开了开关没线"的�
     ]
     for (const [min, max, label] of cases) {
       const levels = contourLevels(min, max)
-      expect(levels.length, label).toBeGreaterThanOrEqual(6)
+      expect(levels.length, label).toBeGreaterThanOrEqual(4)
       expect(levels.length, label).toBeLessThanOrEqual(12)
       // 所有等高值都必须落在 [min, max] 内
       for (const lv of levels) {
@@ -172,7 +177,7 @@ describe('contourLevels（按高差反推等高距——"开了开关没线"的�
   it('高差越大条数不增（等高距跟着放大）', () => {
     const small = contourLevels(0, 120)
     const big = contourLevels(0, 3000)
-    expect(small.length).toBeGreaterThanOrEqual(6)
+    expect(small.length).toBeGreaterThanOrEqual(4)
     expect(big.length).toBeGreaterThanOrEqual(6)
     expect(big.length).toBeLessThanOrEqual(small.length)
   })
@@ -213,7 +218,9 @@ describe('端到端：合成地形必须真的出线段', () => {
     const n = 80
     const h = syntheticTerrain(n, 200)
     const levels = contourLevels(100, 300)
-    expect(levels.length).toBeGreaterThanOrEqual(6)
+    // 目标条数已调疏（TARGET_LINES=7，用户要"稀疏"），但绝不能是 0 ——
+    // 这正是当年"开了开关一条线都没有"要防的回归
+    expect(levels.length).toBeGreaterThanOrEqual(4)
     const segs = contourSegments(h, n, n, levels)
     expect(segs.length).toBeGreaterThan(50)
     // 线段坐标必须落在网格范围内（渲染时按此插值成经纬度）
@@ -411,5 +418,113 @@ describe('createContourLayer：terrarium 高程采样契约', () => {
     expect(allWarns).toContain("高差")
     warn.mockRestore()
     layer.destroy()
+  })
+})
+
+describe('reliefMask / reliefRadiusFor（只在山体出线）', () => {
+  /** 造一片高程网格：左半边平地（噪声级），右半边山坡 */
+  function halfFlatHalfHill(n: number): number[] {
+    const h: number[] = []
+    for (let row = 0; row < n; row++) {
+      for (let col = 0; col < n; col++) {
+        const t = col / (n - 1)
+        // 左半：平地 + 米级噪声；右半：30% 坡
+        const noise = Math.sin(row * 1.7) * 2
+        h.push(t < 0.5 ? 100 + noise : 100 + (t - 0.5) * 400)
+      }
+    }
+    return h
+  }
+
+  it('平地邻域高差接近 0，山坡邻域高差很大', () => {
+    const n = 40
+    const h = halfFlatHalfHill(n)
+    const mask = reliefMask(h, n, n, 2)
+    const flat = mask[10 * n + 5]     // 左半平地
+    const hill = mask[10 * n + 35]    // 右半山坡
+    expect(flat).toBeLessThan(12)      // 低于门槛 → 不画
+    expect(hill).toBeGreaterThan(30)   // 远高于门槛 → 画
+  })
+
+  it('起伏掩码能滤掉平地的等高线（城市不再横七竖八）', () => {
+    const n = 40
+    const h = halfFlatHalfHill(n)
+    const levels = contourLevels(Math.min(...h), Math.max(...h))
+    expect(levels.length).toBeGreaterThan(0)
+    const all = contourSegments(h, n, n, levels)
+    const masked = contourSegments(h, n, n, levels, reliefMask(h, n, n, 2))
+    expect(all.length).toBeGreaterThan(masked.length)
+    // 掩码后剩下的段必须都在山坡那半边（列号 > n/2）
+    for (const s of masked) {
+      expect(Math.min(s.x1, s.x2)).toBeGreaterThan(n / 2 - 3)
+    }
+  })
+
+  it('邻域半径随视野自适应：放大也不至于把山体误判成平地', () => {
+    // 1km 视野 / 80 格 → 每格 12.5m，固定半径 2 只有 62m，坡度再大也会被误判
+    const zoomedIn = reliefRadiusFor(0.009, 80)
+    expect(zoomedIn).toBeGreaterThanOrEqual(4)
+    // 100km 视野 → 每格 1.25km，半径取下限 1 就够（邻域 3.75km）
+    const zoomedOut = reliefRadiusFor(0.9, 80)
+    expect(zoomedOut).toBeGreaterThanOrEqual(1)
+    expect(zoomedOut).toBeLessThanOrEqual(6)
+  })
+})
+
+describe('chainContourSegments（碎段 → 连续等高线）', () => {
+  /** 一条从 (0,0) 到 (5,0) 的水平等高线，逐格给 5 段 */
+  function fiveSegments(): ContourSegment[] {
+    const out: ContourSegment[] = []
+    for (let i = 0; i < 5; i++) {
+      out.push({ x1: i, y1: 0, x2: i + 1, y2: 0, level: 100 })
+    }
+    return out
+  }
+
+  it('首尾相接的段串成一条连续折线（不再是一堆短横线）', () => {
+    const lines = chainContourSegments(fiveSegments())
+    expect(lines).toHaveLength(1)
+    expect(lines[0].level).toBe(100)
+    // 5 段 → 6 个顶点，且首尾正是整条线的两个端点
+    expect(lines[0].points).toHaveLength(6)
+    expect(lines[0].points[0]).toEqual({ x: 0, y: 0 })
+    expect(lines[0].points[5]).toEqual({ x: 5, y: 0 })
+  })
+
+  it('不同等高值的段不会串到一起', () => {
+    const segs: ContourSegment[] = [
+      { x1: 0, y1: 0, x2: 1, y2: 0, level: 100 },
+      { x1: 1, y1: 0, x2: 2, y2: 0, level: 200 },
+    ]
+    const lines = chainContourSegments(segs)
+    expect(lines).toHaveLength(2)
+    expect(lines.map((l) => l.level).sort()).toEqual([100, 200])
+  })
+
+  it('闭合的一圈串成环（首尾同点）', () => {
+    // 正方形一圈：4 段首尾相接
+    const segs: ContourSegment[] = [
+      { x1: 0, y1: 0, x2: 1, y2: 0, level: 300 },
+      { x1: 1, y1: 0, x2: 1, y2: 1, level: 300 },
+      { x1: 1, y1: 1, x2: 0, y2: 1, level: 300 },
+      { x1: 0, y1: 1, x2: 0, y2: 0, level: 300 },
+    ]
+    const lines = chainContourSegments(segs)
+    expect(lines).toHaveLength(1)
+    const pts = lines[0].points
+    expect(pts).toHaveLength(5)
+    // 闭合：最后一个顶点回到起点
+    expect(pts[pts.length - 1].x).toBe(pts[0].x)
+    expect(pts[pts.length - 1].y).toBe(pts[0].y)
+  })
+
+  it('端点浮点误差（1ulp）不断链', () => {
+    const segs: ContourSegment[] = [
+      { x1: 0, y1: 0, x2: 1 + 1e-15, y2: 0, level: 100 },
+      { x1: 1 - 1e-15, y1: 0, x2: 2, y2: 0, level: 100 },
+    ]
+    const lines = chainContourSegments(segs)
+    expect(lines).toHaveLength(1)
+    expect(lines[0].points).toHaveLength(3)
   })
 })

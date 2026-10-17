@@ -35,12 +35,92 @@ const MAX_SAMPLES = 6400
 /** 相机高于此高度（米）不画：全球视野下等高线没有意义，采样也不划算 */
 const MAX_CAMERA_HEIGHT = 400_000
 
+/**
+ * 局部起伏门槛（米）：格点邻域高差小于此值**不画等高线**。
+ * 城市/平地的高程噪声是米级的，门槛太低会把噪声画成碎线（"横七竖八"）；
+ * 12m 能把平坦城区滤掉，同时保留真实丘陵/山地。
+ */
+const MIN_LOCAL_RELIEF = 12
+
+/** 等高线标签（海拔标注）上限，避免密密麻麻压住画面 */
+const MAX_CONTOUR_LABELS = 24
+
+/** 等高线标签样式：与线同色系、小字号、带白描边（卫星/矢量底图上都看得清） */
+const CONTOUR_LABEL_COLOR = '#8a5a2b'
+const CONTOUR_LABEL_FONT_SIZE = 10
+
 export interface ContourSegment {
   /** 起点格点列号（0..cols-1 的浮点插值） */
   x1: number
   y1: number
   x2: number
   y2: number
+  /** 所属等高值（米）；串联成线与标注海拔都要用 */
+  level: number
+}
+
+/** 串起来的一条等高线（同一等高值上的连续折线，格点坐标） */
+export interface ContourPolyline {
+  level: number
+  /** 折线顶点（x=列、y=行，浮点） */
+  points: Array<{ x: number; y: number }>
+}
+
+/**
+ * 起伏掩码的邻域半径（格）。
+ *
+ * **必须随视野尺度自适应**：固定格数在放大时会退化（1 格只有十几米 → 任何坡度
+ * 的邻域高差都很小 → 整片被误判为平地）。这里让邻域大致覆盖 ~500m 的地面距离：
+ * 半径 = clamp(1, 6, 500m ÷ 每格米数)。放大到 1km 视野时半径取上限 6 格
+ * （约 160m），仍足以把平坦城区（米级噪声）滤掉。
+ */
+export function reliefRadiusFor(spanDeg: number, cols: number): number {
+  if (!(spanDeg > 0) || !(cols > 1)) return 2
+  const spanMeters = spanDeg * 111320
+  const metersPerCell = spanMeters / cols
+  return Math.max(1, Math.min(6, Math.round(500 / metersPerCell)))
+}
+
+/**
+ * 局部起伏掩码：每个格点邻域（半径 radius 格）内的高差（米）。
+ *
+ * 用途：**只在山体画等高线**。城市/平地的高程数据（SRTM）有米级噪声，
+ * 不加掩码会把这些噪声画成密密麻麻的碎线（用户反馈"横七竖八"）；
+ * 加了掩码后平坦/城区（邻域高差小于阈值）一条线都不画，只有真有起伏的山体才出线。
+ *
+ * 邻域高差不足（NaN 过多）时记 0，等价于"不画"。
+ */
+export function reliefMask(
+  heights: ArrayLike<number>,
+  cols: number,
+  rows: number,
+  radius = 2,
+): Float64Array {
+  const mask = new Float64Array(cols * rows)
+  if (cols < 2 || rows < 2) return mask
+  for (let row = 0; row < rows; row++) {
+    for (let col = 0; col < cols; col++) {
+      let lo = Infinity
+      let hi = -Infinity
+      let valid = 0
+      const c0 = Math.max(0, col - radius)
+      const c1 = Math.min(cols - 1, col + radius)
+      const r0 = Math.max(0, row - radius)
+      const r1 = Math.min(rows - 1, row + radius)
+      for (let r = r0; r <= r1; r++) {
+        for (let c = c0; c <= c1; c++) {
+          const h = heights[r * cols + c]
+          if (!Number.isFinite(h)) continue
+          if (h < lo) lo = h
+          if (h > hi) hi = h
+          valid++
+        }
+      }
+      // 邻域里有效点太少（瓦片缺数据边缘）也不画
+      mask[row * cols + col] = valid >= 3 ? hi - lo : 0
+    }
+  }
+  return mask
 }
 
 /**
@@ -60,6 +140,8 @@ export function contourSegments(
   cols: number,
   rows: number,
   levels: number[],
+  mask?: ArrayLike<number>,
+  minLocalRelief = MIN_LOCAL_RELIEF,
 ): ContourSegment[] {
   const out: ContourSegment[] = []
   if (cols < 2 || rows < 2 || levels.length === 0) return out
@@ -69,6 +151,8 @@ export function contourSegments(
 
   for (let row = 0; row < rows - 1; row++) {
     for (let col = 0; col < cols - 1; col++) {
+      // 起伏不足（平地/城区噪声）整格跳过 —— "只在山体出线"的落地点
+      if (mask && mask[row * cols + col] < minLocalRelief) continue
       const a = at(col, row)          // NW
       const b = at(col + 1, row)      // NE
       const c = at(col + 1, row + 1)  // SE
@@ -97,12 +181,82 @@ export function contourSegments(
         edge(c, d, col + 1, row + 1, col, row + 1)
         edge(d, a, col, row + 1, col, row)
         if (xs.length === 2) {
-          out.push({ x1: xs[0], y1: ys[0], x2: xs[1], y2: ys[1] })
+          out.push({ x1: xs[0], y1: ys[0], x2: xs[1], y2: ys[1], level })
         } else if (xs.length === 4) {
-          out.push({ x1: xs[0], y1: ys[0], x2: xs[1], y2: ys[1] })
-          out.push({ x1: xs[2], y1: ys[2], x2: xs[3], y2: ys[3] })
+          out.push({ x1: xs[0], y1: ys[0], x2: xs[1], y2: ys[1], level })
+          out.push({ x1: xs[2], y1: ys[2], x2: xs[3], y2: ys[3], level })
         }
       }
+    }
+  }
+  return out
+}
+
+/**
+ * 把逐格碎段**串联成连续等高线**（纯函数，便于单测）。
+ *
+ * 为什么必须串联：`contourSegments` 每个格子各自出一段，不串联的话画面上就是
+ * 一堆互不相连的短横线 —— 正是用户反馈的"横七竖八"。串联后同一等高值的段按
+ * 端点相接，连成一条条完整曲线（闭合的等高线自然闭合成环）。
+ *
+ * 端点量化到 1e-3 格：相邻格子算同一个交点时浮点会有 1ulp 级差异，
+ * 直接比相等会断链。
+ */
+export function chainContourSegments(segments: ContourSegment[]): ContourPolyline[] {
+  const EPS = 1e3
+  const key = (x: number, y: number) => `${Math.round(x * EPS)},${Math.round(y * EPS)}`
+  // 按等高值分组，组内串联
+  const byLevel = new Map<number, ContourSegment[]>()
+  for (const s of segments) {
+    const list = byLevel.get(s.level)
+    if (list) list.push(s)
+    else byLevel.set(s.level, [s])
+  }
+
+  const out: ContourPolyline[] = []
+  for (const [level, list] of byLevel) {
+    // 端点 → 段下标（每段两个端点）
+    const ends = new Map<string, number[]>()
+    const push = (k: string, i: number) => {
+      const arr = ends.get(k)
+      if (arr) arr.push(i)
+      else ends.set(k, [i])
+    }
+    list.forEach((s, i) => {
+      push(key(s.x1, s.y1), i)
+      push(key(s.x2, s.y2), i)
+    })
+    const used = new Array(list.length).fill(false)
+
+    for (let start = 0; start < list.length; start++) {
+      if (used[start]) continue
+      used[start] = true
+      const s0 = list[start]
+      const pts: Array<{ x: number; y: number }> = [
+        { x: s0.x1, y: s0.y1 }, { x: s0.x2, y: s0.y2 },
+      ]
+      // 向前接：以当前末端点为键找下一段
+      const walk = (atTail: boolean): void => {
+        for (;;) {
+          const tip = atTail ? pts[pts.length - 1] : pts[0]
+          const candidates = ends.get(key(tip.x, tip.y)) ?? []
+          let next = -1
+          for (const i of candidates) {
+            if (!used[i]) { next = i; break }
+          }
+          if (next < 0) return
+          used[next] = true
+          const s = list[next]
+          // 接上：把新段"另一端"补进来（新段与当前端点重合的那端跳过）
+          const nearStart = Math.abs(s.x1 - tip.x) < 1e-3 && Math.abs(s.y1 - tip.y) < 1e-3
+          const other = nearStart ? { x: s.x2, y: s.y2 } : { x: s.x1, y: s.y1 }
+          if (atTail) pts.push(other)
+          else pts.unshift(other)
+        }
+      }
+      walk(true)
+      walk(false)
+      out.push({ level, points: pts })
     }
   }
   return out
@@ -141,10 +295,16 @@ export function gridSizeFor(cameraHeight: number): number {
   return Math.max(16, Math.min(Math.round(budget * factor), budget))
 }
 
-/** 目标等高线条数（视野内高差被切成几份） */
-const TARGET_LINES = 10
-/** 高差小于此值视为平地，不画等高线（否则会出现 0.1m 级的碎线） */
-const MIN_RELIEF = 2
+/**
+ * 目标等高线条数（视野内高差被切成几份）。
+ * 稀疏一点更耐看（用户要求"稀疏"），且配局部起伏掩码后平坦区本来就不出线。
+ */
+const TARGET_LINES = 7
+/**
+ * 视野内总高差小于此值直接不画（近乎平地）。
+ * 2m 太低：城市视野常有 3~5m 噪声高差，会触发一堆碎线；提到 15m 更稳。
+ */
+const MIN_RELIEF = 15
 /** 单次最多取多少条等高线（levels 数组上限） */
 const MAX_LEVELS = 200
 
@@ -177,6 +337,22 @@ export interface ContourLayerHandle {
   destroy(): void
 }
 
+/** 一个等高线海拔标注（交给统一标签覆盖层防重叠绘制） */
+export interface ContourLabel {
+  lat: number
+  lng: number
+  /** 标注文本，形如 `320m` */
+  text: string
+}
+
+/** 等高线标签样式（宿主转成标签候选时用，保证 3D 与等高线颜色一致） */
+export const CONTOUR_LABEL_STYLE = {
+  fontSize: CONTOUR_LABEL_FONT_SIZE,
+  color: CONTOUR_LABEL_COLOR,
+  background: 'halo' as const,
+  backgroundColor: 'rgba(255,255,255,0.85)',
+}
+
 export interface ContourLayerOptions {
   C: any
   viewer: any
@@ -189,6 +365,11 @@ export interface ContourLayerOptions {
    * 每层只调一次；之后仍会随相机移动静默重试。
    */
   onSamplerError?: (message: string) => void
+  /**
+   * 海拔标注回调：每次重建后给出本视野的标注锚点；没有等高线时给空数组。
+   * 宿主应把它们交给统一标签覆盖层（CesiumLabelOverlay）做防重叠绘制。
+   */
+  onLabels?: (labels: ContourLabel[]) => void
 }
 
 /**
@@ -201,6 +382,7 @@ export function createContourLayer(opts: ContourLayerOptions): ContourLayerHandl
   const { C, viewer } = opts
   const width = opts.width ?? 1
   const prefix = opts.logPrefix ?? '[CesiumContours]'
+  const onLabels = opts.onLabels
   /** 高程采样器（terrarium 瓦片 + LRU 缓存），随图层创建/销毁 */
   const sampler: TerrariumSampler = createTerrariumSampler({
     logPrefix: prefix,
@@ -238,38 +420,59 @@ export function createContourLayer(opts: ContourLayerOptions): ContourLayerHandl
     if (old && viewer?.scene?.primitives) {
       try { viewer.scene.primitives.remove(old) } catch { /* ignore */ }
     }
+    onLabels?.([])
   }
 
-  const render = (segments: ContourSegment[], rect: {
+  /**
+   * 画出等高线（**连续曲线**，不是逐格碎段）+ 产出海拔标注锚点。
+   *
+   * 贴地范围限定为 **TERRAIN（只贴地形）**：默认的 BOTH 会把等高线一起拖到
+   * OSM 3D 建筑上，建筑密集区就变成一团乱线（用户反馈"其他建筑不要渲染"）。
+   */
+  const render = (lines: ContourPolyline[], rect: {
     west: number; south: number; east: number; north: number;
   }, cols: number, rows: number) => {
     const primitives = viewer?.scene?.primitives
     if (!primitives || destroyed) return
-    lastWasEmpty = segments.length === 0
-    if (segments.length === 0) {
+    lastWasEmpty = lines.length === 0
+    if (lines.length === 0) {
       clearPrimitive()
+      onLabels?.([])
       return
     }
     warnedEmpty = false
     // 格点列号 → 经度、行号 → 纬度（row 0 在北）
     const lonAt = (col: number) => rect.west + ((rect.east - rect.west) * col) / (cols - 1)
     const latAt = (row: number) => rect.north - ((rect.north - rect.south) * row) / (rows - 1)
-    const flat: number[] = []
-    for (const s of segments) {
-      flat.push(lonAt(s.x1), latAt(s.y1), lonAt(s.x2), latAt(s.y2))
+    const instances: any[] = []
+    for (const line of lines) {
+      if (line.points.length < 2) continue
+      const flat: number[] = []
+      for (const p of line.points) flat.push(lonAt(p.x), latAt(p.y))
+      instances.push(new C.GeometryInstance({
+        geometry: new C.GroundPolylineGeometry({
+          positions: C.Cartesian3.fromDegreesArray(flat),
+          width,
+        }),
+        attributes: {
+          color: C.ColorGeometryInstanceAttribute.fromColor(
+            C.Color.fromCssColorString(CONTOUR_COLOR),
+          ),
+        },
+      }))
     }
-    const positions = C.Cartesian3.fromDegreesArray(flat)
-    const color = C.ColorGeometryInstanceAttribute.fromColor(
-      C.Color.fromCssColorString(CONTOUR_COLOR),
-    )
+    if (instances.length === 0) {
+      clearPrimitive()
+      onLabels?.([])
+      return
+    }
     let next: any = null
     try {
       next = primitives.add(new C.GroundPolylinePrimitive({
-        geometryInstances: [new C.GeometryInstance({
-          geometry: new C.GroundPolylineGeometry({ positions, width }),
-          attributes: { color },
-        })],
+        geometryInstances: instances,
         appearance: new C.PolylineColorAppearance(),
+        // 只贴地形，不贴 3D 建筑：等高线爬到楼上会变成一团乱线
+        classificationType: C.ClassificationType?.TERRAIN,
         // 同步构建：与 CesiumSectorLayer 同口径，异步构建易触发 _target 崩溃
         asynchronous: false,
       }))
@@ -281,6 +484,45 @@ export function createContourLayer(opts: ContourLayerOptions): ContourLayerHandl
     const old = primitive
     primitive = next
     if (old) { try { primitives.remove(old) } catch { /* ignore */ } }
+    onLabels?.(pickLabelAnchors(lines, rect, cols, rows))
+  }
+
+  /**
+   * 挑海拔标注锚点：**每个等高值取最长的一两条线**的中点，避免同一圈堆一堆字。
+   */
+  const pickLabelAnchors = (
+    lines: ContourPolyline[],
+    rect: { west: number; south: number; east: number; north: number },
+    cols: number,
+    rows: number,
+  ): ContourLabel[] => {
+    const lonAt = (col: number) => rect.west + ((rect.east - rect.west) * col) / (cols - 1)
+    const latAt = (row: number) => rect.north - ((rect.north - rect.south) * row) / (rows - 1)
+    // 按等高值分组，每组按折线长度降序
+    const byLevel = new Map<number, ContourPolyline[]>()
+    for (const l of lines) {
+      const arr = byLevel.get(l.level)
+      if (arr) arr.push(l)
+      else byLevel.set(l.level, [l])
+    }
+    const picked: ContourLabel[] = []
+    for (const [level, arr] of byLevel) {
+      arr.sort((a, b) => b.points.length - a.points.length)
+      // 每个等高值最多 2 个标注（太长的一圈标两处也合理）
+      for (const line of arr.slice(0, 2)) {
+        if (picked.length >= MAX_CONTOUR_LABELS) break
+        const mid = line.points[Math.floor(line.points.length / 2)]
+        if (mid) {
+          picked.push({
+            lat: latAt(mid.y),
+            lng: lonAt(mid.x),
+            text: `${Math.round(level)}m`,
+          })
+        }
+      }
+      if (picked.length >= MAX_CONTOUR_LABELS) break
+    }
+    return picked
   }
 
   const update = async (): Promise<void> => {
@@ -353,15 +595,22 @@ export function createContourLayer(opts: ContourLayerOptions): ContourLayerHandl
         clearPrimitive()
         return
       }
-      let segments = contourSegments(heights, cols, rows, levels)
+      // 局部起伏掩码：平坦/城区（邻域高差 < MIN_LOCAL_RELIEF）一格都不画，
+      // 只有山体出线 —— 这是"别画得横七竖八"的关键一步。
+      const spanDeg = Math.max(east - west, north - south)
+      const mask = reliefMask(heights, cols, rows, reliefRadiusFor(spanDeg, cols))
+      let segments = contourSegments(heights, cols, rows, levels, mask)
       if (segments.length > MAX_SEGMENTS) {
         // 段数爆了：把**目标条数减半**（等高距随之变粗 → 线更少），重算一次。
         // 注意 targetLines 是"想要几条线"，减才是稀疏；乘 2 会更多线更多段，方向反了。
         segments = contourSegments(
           heights, cols, rows, contourLevels(min, max, Math.max(TARGET_LINES / 2, 3)),
+          mask,
         )
       }
-      render(segments, { west, south, east, north }, cols, rows)
+      // 逐格碎段 → 连续等高线（不串联画面上就是一堆断开的短横线）
+      const lines = chainContourSegments(segments)
+      render(lines, { west, south, east, north }, cols, rows)
     } catch (e) {
       // 高程瓦片不可用（网络不通 / 被拦截 / 全 404）时只是没有等高线，不该影响地图
       lastWasEmpty = true

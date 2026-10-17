@@ -215,7 +215,16 @@ def save_pending_login(payload: Dict[str, Any]) -> None:
 
 
 def consume_pending_login() -> Optional[Dict[str, Any]]:
-    """读取并立即销毁一次性凭据；仅当目标档与当前运行档一致时有效。"""
+    """读取一次性登录/注册凭据；**只有确认可用（目标档 == 当前运行档）才销毁**。
+
+    为什么销毁必须放在校验之后（原实现是 `finally` 里无条件删除，而"档是否匹配"
+    的判断在删除之后 —— 等于这道校验形同虚设）：跨档重启前，仍在运行的旧进程
+    （或前端重复读取兜底路径）会把凭据提前销毁，重启后的新进程就取不到凭据 →
+    退回用"记住的旧模式"自动登录 → 再次被判定为跨档 → 二次弹窗要求重启。
+    这就是"切换模式要重启两次"的根因。
+
+    档不匹配时**必须保留**（很可能是旧进程的误读），否则重启后永远消费不到。
+    """
     import json as _json
 
     from app.core.desktop_profiles import normalize_profile
@@ -223,21 +232,30 @@ def consume_pending_login() -> Optional[Dict[str, Any]]:
     path = _pending_login_path()
     if not path.is_file():
         return None
+    data = None
     try:
         data = _json.loads(_credential_cipher().decrypt(path.read_bytes()).decode("utf-8"))
     except Exception:  # noqa: BLE001
         data = None
-    finally:
+    if not isinstance(data, dict):
+        # 内容损坏（密钥变更/写坏）：留着只会反复解密失败，销毁
         try:
             path.unlink(missing_ok=True)
         except OSError:
             pass
-    if not isinstance(data, dict):
         return None
-    # 双保险：标记档与实际运行档不一致（例如用户连点两次）则丢弃
-    if normalize_profile(data.get("mode")) != normalize_profile(getattr(settings, "DESKTOP_PROFILE", "")):
+    # 目标档与当前运行档不一致 → 保留，不要销毁
+    if normalize_profile(data.get("mode")) != normalize_profile(
+        getattr(settings, "DESKTOP_PROFILE", "")
+    ):
         return None
+    # 确认可用：读后即删（一次性）
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
     return data
+
 
 
 def _cross_profile_required(mode: str) -> bool:
@@ -398,10 +416,10 @@ def _issue_local_token(db: Session, user, idle_logout_days: Optional[int] = None
     return token
 
 
-def _standalone_local_login(db: Session, username: str, password: str):
-    """单机模式本地直登校验（不发任何网络请求）。
+def _local_offline_login(db: Session, username: str, password: str, mode: str):
+    """本机离线直登校验（不发任何网络请求），共享/单机两种模式共用。
 
-    返回 (user, reason)：user 非空表示本地凭据有效、可立即离线登录并正常使用；
+    返回 (user, reason)：user 非空表示本地凭据有效、服务器连不上时可立即离线进入；
     reason 供调用方在不能离线登录时给出可操作的提示（许可过期/换机/账号不匹配等），
     而不是笼统的"无法连接服务器"。
 
@@ -409,6 +427,8 @@ def _standalone_local_login(db: Session, username: str, password: str):
     - 管理员完全免授权：本机镜像管理员账号 + 密码即可离线登录，不要求本机许可；
     - 普通用户完成过一次授权后，本机许可无论是共享还是单机模式都可用于离线登录
       （不再要求"必须单机许可"，否则共享模式转单机离线时会被拦下）。
+    2026-10-17：共享模式同样适用——本机许可有效时，授权服务器 TLS 握手超时不应
+    把用户挡在门外；共享模式离线进入后数据同步暂停，联网后由后台循环自动恢复。
     """
     from app.models.database import User as UserModel
 
@@ -418,7 +438,7 @@ def _standalone_local_login(db: Session, username: str, password: str):
     if local_admin:
         if not auth_service.verify_password(password, row.password_hash):
             return None, "bad_password"
-        row.desktop_run_mode = MODE_STANDALONE
+        row.desktop_run_mode = mode
         db.commit()
         return row, ""
 
@@ -436,9 +456,14 @@ def _standalone_local_login(db: Session, username: str, password: str):
         return None, "no_local_user"
     if not auth_service.verify_password(password, row.password_hash):
         return None, "bad_password"
-    row.desktop_run_mode = MODE_STANDALONE
+    row.desktop_run_mode = mode
     db.commit()
     return row, ""
+
+
+# 兼容旧名字（测试/历史调用点）
+def _standalone_local_login(db: Session, username: str, password: str):
+    return _local_offline_login(db, username, password, MODE_STANDALONE)
 
 
 def _offline_unavailable_detail(reason: str, network_message: str) -> tuple:
@@ -485,18 +510,24 @@ def _note_offline_login() -> None:
 
 
 async def _login_via_server(
-    username: str, password: str, mode: str, timeout: int = 20
+    username: str, password: str, mode: str, timeout: int = 20, retries: int = 1
 ) -> Dict[str, Any]:
     """代理到授权服务器登录，顺便把断网期间的登录次数补报上去。
 
-    timeout 用于单机模式的"快速探测"：本地凭据有效时只给很短的时间，
-    连不上就立即回落离线登录，不让用户干等 20 秒。
+    timeout/retries：本地凭据有效时走"快速探测"（短超时、不重试），连不上立即
+    回落离线登录；无本地凭据时给完整超时并对 TLS 握手超时等瞬断重试一次。
     """
     from starlette.concurrency import run_in_threadpool
 
     pending = int(cloud.load_state().get("pending_offline_logins") or 0)
     data = await run_in_threadpool(
-        cloud.login, username, password, mode, pending or None, timeout=timeout
+        cloud.login,
+        username,
+        password,
+        mode,
+        pending or None,
+        timeout=timeout,
+        retries=retries,
     )
     if pending:
         cloud.save_state(pending_offline_logins=0)
@@ -575,16 +606,21 @@ def _task_result_or_none(task: "asyncio.Task") -> Optional[Dict[str, Any]]:
     return result if isinstance(result, dict) else None
 
 
-def _finish_offline_login(db: Session, user) -> Dict[str, Any]:
-    """单机模式离线登录：本地许可 + 本机账号密码校验通过即签发令牌，不等网络。
+def _finish_offline_login(db: Session, user, mode: str = MODE_STANDALONE) -> Dict[str, Any]:
+    """离线登录：本地许可 + 本机账号密码校验通过即签发令牌，不等网络。
 
+    单机模式：run_mode 置 offline（数据本机私有，不参与同步）；
+    共享模式：run_mode 保持 shared（同步循环联网后自动恢复），数据仍按共享档可见。
     登录次数先本机记账、联网后补报；同时留下 needs_license_verify 标记，
     由后台巡检在能连上服务器时用许可续期通道校验一次授权并续期。
     """
     from app.services.desktop_sync_service import MODE_OFFLINE, set_run_mode
 
     info = license_service.desktop_license_info() or {}
-    set_run_mode(MODE_OFFLINE)  # 单机模式数据本机私有，不参与服务器数据同步
+    if mode == MODE_STANDALONE:
+        set_run_mode(MODE_OFFLINE)  # 单机模式数据本机私有，不参与服务器数据同步
+    # 共享模式离线进入：不切 run_mode，sync_loop/watch_loop 继续按 shared 尝试，
+    # 连不上时各自按"下一轮再试"处理，联网后自动恢复同步
     _ensure_local_group(db, user, info)
     _remember_sync_user(user.username)
     _note_offline_login()  # 登录次数先本机记账，下次联机补报
@@ -593,7 +629,7 @@ def _finish_offline_login(db: Session, user) -> Dict[str, Any]:
     cloud.save_state(
         needs_license_verify=True,  # 联网后自动校验授权
         desktop_username=user.username,
-        desktop_mode=MODE_STANDALONE,
+        desktop_mode=mode,
     )
     token = _issue_local_token(db, user, info.get("idle_logout_days"))
     # 放行「登录优先」的后台重活队列（图层预热/索引对账/首次同步等）
@@ -605,7 +641,7 @@ def _finish_offline_login(db: Session, user) -> Dict[str, Any]:
             "access_token": token,
             "token_type": "bearer",
             "user": auth_service.user_payload(user),
-            "mode": MODE_STANDALONE,
+            "mode": mode,
             "offline": True,
             "verify_pending": True,
             "sync_started": False,
@@ -1046,19 +1082,22 @@ async def desktop_login(
 
     local_user = None
     local_reason = ""
-    if mode == MODE_STANDALONE:
-        # bcrypt 校验（实测 400ms 起）丢线程池，别卡住事件循环
-        local_user, local_reason = await run_in_threadpool(
-            _standalone_local_login, db, username, password
-        )
+    # 两种模式都先做一次本机离线凭据校验（bcrypt，丢线程池别卡事件循环）：
+    # 本机镜像账号 + 有效许可存在时，服务器连不上也能立即进入，不必干等 TLS 握手超时
+    local_user, local_reason = await run_in_threadpool(
+        _local_offline_login, db, username, password, mode
+    )
 
     try:
-        if local_user is not None and mode == MODE_STANDALONE:
-            # 单机模式 + 本机凭据有效：服务器只做「快速探测」。本地凭据已经证明用户
-            # 身份，没必要让用户干等网络——超过 FAST 秒立即离线登录，探测结果稍后
-            # 由 _apply_late_login_result 在后台补权限/会话（断网时原来要等满 4 秒）。
+        if local_user is not None:
+            # 本机凭据有效：服务器只做「快速探测」。本地凭据已经证明用户身份，没必要
+            # 让用户干等网络——超过 FAST 秒立即离线进入，探测结果稍后由
+            # _apply_late_login_result 在后台补权限/会话（共享模式同步会在联网后恢复）。
             probe_task = asyncio.create_task(
-                _login_via_server(username, password, mode, STANDALONE_ONLINE_PROBE_SECONDS)
+                _login_via_server(
+                    username, password, mode,
+                    STANDALONE_ONLINE_PROBE_SECONDS, retries=0,
+                )
             )
             try:
                 data = await asyncio.wait_for(
@@ -1070,27 +1109,23 @@ async def desktop_login(
                     "先用本机授权登录，结果到达后后台补校验"
                 )
                 probe_task.add_done_callback(_apply_late_login_probe)
-                _apply_remember(payload.remember, username, password, MODE_STANDALONE)
-                return _finish_offline_login(db, local_user)
+                _apply_remember(payload.remember, username, password, mode)
+                return _finish_offline_login(db, local_user, mode)
         else:
-            # 共享模式必须等服务器（账号/许可都在服务器侧）；本地凭据不可用时
-            # （首次登录/等待批准）也按完整超时请求服务器
-            data = await _login_via_server(username, password, mode, 20)
+            # 本机没有可用离线凭据（首次登录/等待批准/许可归属其它账号）：
+            # 只能等服务器；完整超时 + TLS 握手超时等瞬断自动重试一次
+            data = await _login_via_server(username, password, mode, 10, retries=1)
     except cloud.CloudError as exc:
-        # 本地凭据有效且只是网络不可达/服务器故障 → 离线登录，拿到本机授权继续用
-        if (
-            local_user is not None
-            and mode == MODE_STANDALONE
-            and (exc.status_code == 0 or exc.status_code >= 500)
-        ):
+        # 本地凭据有效且只是网络不可达/服务器故障 → 离线进入，拿到本机授权继续用
+        if local_user is not None and (exc.status_code == 0 or exc.status_code >= 500):
             print(
                 f"[DesktopAuth] 授权服务器暂不可用（{exc.status_code or '网络'}），"
                 "改用本机授权离线登录"
             )
-            _apply_remember(payload.remember, username, password, MODE_STANDALONE)
-            return _finish_offline_login(db, local_user)
-        # 仅网络不可达才回落离线；鉴权/授权类错误照常抛出
-        if exc.status_code != 0 or mode != MODE_STANDALONE:
+            _apply_remember(payload.remember, username, password, mode)
+            return _finish_offline_login(db, local_user, mode)
+        # 鉴权/授权类错误照常抛出（密码错、待批准、许可无效等不能离线绕过）
+        if exc.status_code != 0:
             raise HTTPException(
                 status_code=exc.status_code or 502, detail=_gbk_safe(exc.message)
             )
@@ -1179,6 +1214,21 @@ async def desktop_switch_cancel(_: None = Depends(_require_desktop)) -> Dict[str
     current = write_active_profile(settings.DATA_ROOT, getattr(settings, "DESKTOP_PROFILE", ""))
     _discard_pending_login()
     return {"success": True, "data": {"cancelled": True, "mode": current}}
+
+
+@router.get("/profile")
+async def get_desktop_profile(_: None = Depends(_require_desktop)) -> Dict[str, Any]:
+    """当前**实际运行**的配置档（shared / standalone）。
+
+    登录页必须按它来预填与自动登录，不能用"记住账号密码"里保存的 mode ——
+    跨档重启后那份 mode 是切换前的旧值，照它登录会被再次判定为跨档，
+    于是弹窗又要求重启一次（"切换模式要重启两次"）。
+    """
+    from app.core.desktop_profiles import normalize_profile
+
+    return {"success": True, "data": {
+        "profile": normalize_profile(getattr(settings, "DESKTOP_PROFILE", "")),
+    }}
 
 
 @router.get("/last-login")

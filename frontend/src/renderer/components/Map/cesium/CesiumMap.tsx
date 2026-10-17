@@ -12,7 +12,7 @@
  * 后续阶段补齐图层文件/地理化/编辑/工具（对应 ref 方法由 no-op 替换）。
  */
 import {
-  forwardRef, useEffect, useImperativeHandle, useRef, useState,
+  forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useState,
   type ComponentProps,
 } from 'react'
 import { useTranslation } from 'react-i18next'
@@ -63,7 +63,12 @@ import {
   DEFAULT_TIANDITU_KEY,
 } from '../../../config/mapSources'
 import { createAmapImageryProvider } from './amapImageryProvider'
-import { createContourLayer } from './cesiumContours'
+import type { LabelCandidateBase } from '../labelLayoutCore'
+import {
+  createContourLayer,
+  CONTOUR_LABEL_STYLE,
+  type ContourLabel,
+} from './cesiumContours'
 import {
   CesiumSelectionSession,
   type SelectionTarget,
@@ -429,6 +434,34 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
     // 数据/设置变化后重放热力面（指纹未变时 CesiumHeatmapLayer 内部会跳过重算）
     replayHeatmaps()
   }
+
+  /**
+   * 等高线的海拔标注（每圈一条）推给统一标签覆盖层。
+   *
+   * 与基站/图层标签共用同一套防重叠布局，所以标注不会互相压住；
+   * 没有等高线（平地/关开关/瓦片不可用）时移除该标签源。
+   */
+  const applyContourLabels = useCallback((labels: ContourLabel[]) => {
+    const overlay = labelOverlayRef.current
+    if (!overlay) return
+    if (labels.length === 0) {
+      overlay.removeSource('contours')
+      return
+    }
+    overlay.setCandidates(
+      'contours',
+      labels.map((l, i) => ({
+        id: `contour-${i}-${l.text}` as string,
+        lat: l.lat,
+        lng: l.lng,
+        text: l.text,
+        fontSize: CONTOUR_LABEL_STYLE.fontSize,
+        color: CONTOUR_LABEL_STYLE.color,
+        background: CONTOUR_LABEL_STYLE.background,
+        backgroundColor: CONTOUR_LABEL_STYLE.backgroundColor,
+      })) as LabelCandidateBase[],
+    )
+  }, [])
 
   /**
    * 把各图层的标签候选推给统一覆盖层（CesiumLabelOverlay）。
@@ -1591,6 +1624,8 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
             t('map.contourTerrainUnavailable') || '地形高程数据暂不可用，等高线未渲染（联网后恢复）',
           )
         },
+        // 海拔标注交给统一标签覆盖层（与基站/图层标签同一套防重叠布局）
+        onLabels: applyContourLabels,
       })
       void contourRef.current.update()
     }
@@ -1859,25 +1894,32 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
         const viewer = viewerRef.current
         const C = (window as any).Cesium
         if (!viewer || !C) return true
+        /**
+         * 搜索定位的目标 zoom：用户要求跳过去就放到 **18**（原来按
+         * `max(当前zoom, 16)`，城区细节不够、要素红框看不清）。
+         * 有 bounds 时飞到包围盒中心（只贴合 bounds 会停在很高的高度），
+         * 无 bounds 时飞到 center。
+         */
+        const TARGET_ZOOM = 18
+        const flyTo = (wlat: number, wlng: number) => {
+          viewer.camera.flyTo({
+            destination: C.Cartesian3.fromDegrees(
+              wlng, wlat,
+              zoomToHeight(TARGET_ZOOM, wlat,
+                viewer.canvas.clientHeight, viewer.camera.frustum.fovy)),
+          })
+        }
         if (opts.bounds) {
           const [[s, w], [n, e]] = opts.bounds
           const [ws, ww] = gcj02ToWgs84(s, w)
           const [wn, we] = gcj02ToWgs84(n, e)
-          viewer.camera.flyTo({ destination: C.Rectangle.fromDegrees(ww, ws, we, wn) })
+          // 面/线要素：先按包围盒定区域，再落到 18 级看清要素本身
+          flyTo((ws + wn) / 2, (ww + we) / 2)
           return true
         }
         if (opts.center) {
           const [wlat, wlng] = gcj02ToWgs84(opts.center[0], opts.center[1])
-          const carto = viewer.camera.positionCartographic
-          const curZoom = heightToZoom(
-            carto.height, C.Math.toDegrees(carto.latitude),
-            viewer.canvas.clientHeight, viewer.camera.frustum.fovy)
-          viewer.camera.flyTo({
-            destination: C.Cartesian3.fromDegrees(
-              wlng, wlat,
-              zoomToHeight(Math.max(curZoom, 16), wlat,
-                viewer.canvas.clientHeight, viewer.camera.frustum.fovy)),
-          })
+          flyTo(wlat, wlng)
         }
         return true
       },

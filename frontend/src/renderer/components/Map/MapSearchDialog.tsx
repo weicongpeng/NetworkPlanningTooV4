@@ -355,7 +355,9 @@ export function MapSearchDialog({ open, onOpenChange, searchWorkbook, workbookSo
       detail: sourceName,
       kind: 'feature',
       layerId,
-      featureId: String(row.name ?? row.id ?? extractFeatureId(row) ?? idx),
+      // 兜底口径与 MapInfo 一致（`图层ID#序号`）：3D 图层渲染侧按同一套生成 id，
+      // 用裸序号会让"无自然 ID 的地理化要素"定位时匹配不上（只有飞行没有红框）。
+      featureId: String(row.name ?? row.id ?? extractFeatureId(row) ?? `${layerId}#${idx}`),
       fieldPairs: extractFieldPairs(row),
       center,
       bounds
