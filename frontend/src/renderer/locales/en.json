@@ -1902,7 +1902,7 @@
     "switching": "Switching to {{mode}}. The app will restart automatically and sign you in…",
     "switchRestartingHint": "Closing and restarting. Please do not close the app manually…",
     "switchConfirmTitle": "Switch run mode",
-    "switchConfirmBody": "You are about to switch to {{mode}}. Imported files and task history in shared and standalone modes are stored separately and are not visible to each other. The app needs to restart and will sign you in automatically afterwards.",
+    "switchConfirmBody": "You are about to switch to {{mode}}. Data is stored separately and is not shared.",
     "switchConfirmOk": "Restart now",
     "switchConfirmCancel": "Cancel",
     "switchManualTitle": "Manual restart required",

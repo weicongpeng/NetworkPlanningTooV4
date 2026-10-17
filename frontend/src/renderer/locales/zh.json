@@ -1913,7 +1913,7 @@
     "switching": "正在切换到{{mode}}，应用将自动重启，重启后自动登录…",
     "switchRestartingHint": "正在关闭并重新启动，请勿手动关闭软件…",
     "switchConfirmTitle": "切换运行模式",
-    "switchConfirmBody": "即将切换到{{mode}}。共享模式与单机模式的导入文件、历史任务等数据各自独立保存、互不可见。应用需要重启，重启后将自动登录。",
+    "switchConfirmBody": "即将切换到{{mode}}，数据独有，不共享。",
     "switchConfirmOk": "立即重启",
     "switchConfirmCancel": "取消",
     "switchManualTitle": "需要手动重启",

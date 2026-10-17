@@ -256,7 +256,7 @@ export function LoginModal({ isOpen, forceChangePassword = false, onClose }: Log
               <p className="mt-3 text-sm leading-6 text-muted-foreground">
                 {t('desktopAuth.switchConfirmBody', {
                   mode: modeName,
-                  defaultValue: '即将切换到{{mode}}。共享模式与单机模式的导入文件、历史任务等数据各自独立保存、互不可见。应用需要重启，重启后将自动登录。',
+                  defaultValue: '即将切换到{{mode}}，数据独有，不共享。',
                 })}
               </p>
               {switchActionError && (
