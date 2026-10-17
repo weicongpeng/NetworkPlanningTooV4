@@ -51,6 +51,21 @@ export class CesiumSamplesOverlay {
   /** 上次 backing 尺寸（CSS 像素），尺寸变了才重建 backing（重建会清空画布） */
   private cssW = 0
   private cssH = 0
+  /**
+   * 逐点笛卡尔坐标缓存（WGS84 椭球面，每点 3 个分量）。
+   *
+   * 绘制路径是**每帧 × 每点**：不缓存的话每次重画都要对全部点重跑一遍
+   * `Cartesian3.fromDegrees`（三角函数 + 对象分配）。点集是静态的，换数据时算一次即可。
+   */
+  private cartesians: Float64Array | null = null
+  /** 预计算失败（拿不到笛卡尔坐标）时退化为每帧现算，见 ensureCartesians */
+  private cartesianFallback = false
+  /**
+   * 复用给遮挡剔除的坐标替身（避免每帧每点分配）。
+   * `EllipsoidalOccluder.isPointVisible` 只读 x/y/z（平面点积），普通对象即可，
+   * 也不依赖 Cesium 构造器在极端环境下的可用性。
+   */
+  private scratch = { x: 0, y: 0, z: 0 }
 
   constructor(
     private C: any,
@@ -73,7 +88,38 @@ export class CesiumSamplesOverlay {
   /** 数据/设置变化：替换并重画。传 null 清空（切回栅格模式时用） */
   setData(data: CesiumSampleBlobData | null): void {
     this.data = data
+    this.cartesians = null // 点集变了，缓存失效
+    this.cartesianFallback = false
     this.drawNow()
+  }
+
+  /**
+   * 预计算逐点笛卡尔坐标（换数据后第一次绘制时算一次）。
+   *
+   * 放在绘制路径里懒加载（而不是 setData 里算）：jsdom / 无 2D 上下文的环境下
+   * drawNow 会提前返回，碰不到这里的 Cesium 调用。
+   */
+  private ensureCartesians(): boolean {
+    const data = this.data
+    if (!data || data.points.length === 0) return false
+    if (this.cartesians) return true
+    if (this.cartesianFallback) return false
+    try {
+      const n = data.points.length
+      const arr = new Float64Array(n * 3)
+      for (let i = 0; i < n; i++) {
+        const p = data.points[i]
+        const c = this.C.Cartesian3.fromDegrees(p.lng, p.lat, 0)
+        arr[i * 3] = c.x
+        arr[i * 3 + 1] = c.y
+        arr[i * 3 + 2] = c.z
+      }
+      this.cartesians = arr
+      return true
+    } catch {
+      this.cartesianFallback = true
+      return false
+    }
   }
 
   /** 相机变化后重画（宿主在 postRender 里调用） */
@@ -114,15 +160,35 @@ export class CesiumSamplesOverlay {
     const camPos = camera.positionWC
     // 地平线遮挡：地球背面的点必须剔除（2D 没有遮挡问题，3D 不剔除会画到屏幕另一端）
     const occluder = new C.EllipsoidalOccluder(scene.globe?.ellipsoid ?? C.Ellipsoid.WGS84, camPos)
+    // 逐点笛卡尔坐标缓存（静态点集只算一次）；拿不到时退化为每帧现算
+    const cart = this.ensureCartesians() ? this.cartesians : null
 
     const projected: ProjectedPoint[] = []
     for (let i = 0; i < points.length; i++) {
       const p = points[i]
-      const cartesian = C.Cartesian3.fromDegrees(p.lng, p.lat, 0)
+      let cx: number
+      let cy: number
+      let cz: number
+      if (cart) {
+        cx = cart[i * 3]
+        cy = cart[i * 3 + 1]
+        cz = cart[i * 3 + 2]
+      } else {
+        const c = C.Cartesian3.fromDegrees(p.lng, p.lat, 0)
+        cx = c.x
+        cy = c.y
+        cz = c.z
+      }
+      // 遮挡剔除**放在投影之前**：它是一个点积，而投影要跑一整套矩阵运算 + 分配。
+      // 万级点集缩放时视口内通常只有几百个点，先剔除可省掉绝大部分投影开销
+      this.scratch.x = cx
+      this.scratch.y = cy
+      this.scratch.z = cz
+      if (!occluder.isPointVisible(this.scratch)) continue
+      const cartesian = new C.Cartesian3(cx, cy, cz)
       const sp = C.SceneTransforms.worldToWindowCoordinates(scene, cartesian)
       if (!sp) continue
       if (sp.x < -rMax || sp.y < -rMax || sp.x > w + rMax || sp.y > h + rMax) continue
-      if (!occluder.isPointVisible(cartesian)) continue
       // 该点处的局部"米/像素"：2D 用 zoom 的定值，3D 用该点深度上的透视尺度
       const dist = C.Cartesian3.distance(camPos, cartesian)
       const metersPerPixel = (2 * dist * tanHalfFovy) / h
@@ -171,6 +237,7 @@ export class CesiumSamplesOverlay {
 
   destroy(): void {
     this.data = null
+    this.cartesians = null
     if (this.canvas?.parentNode) this.canvas.parentNode.removeChild(this.canvas)
     this.canvas = null
     this.ctx = null

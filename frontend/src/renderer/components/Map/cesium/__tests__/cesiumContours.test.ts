@@ -4,7 +4,7 @@
  * 覆盖：等高线段提取（marching squares 简化版：线性插值交点、鞍形配对）、
  * 等高距归整、采样网格边长自适应。
  */
-import { describe, it, expect, vi } from 'vitest'
+import { describe, it, expect, vi, afterEach } from 'vitest'
 import {
   contourSegments,
   contourLevels,
@@ -243,36 +243,55 @@ describe('端到端：合成地形必须真的出线段', () => {
  * `TypeError: Cannot read properties of undefined (reading 'length')`
  * （线上就踩过一次：开关打开后控制台报这个错、地图没有任何等高线）。
  */
-describe('createContourLayer：地形采样调用契约', () => {
-  function makeFakeCesium() {
-    const calls: any[] = []
-    const terrainProvider = { availability: { computeMaximumLevelAtPosition: () => 14 } }
+describe('createContourLayer：terrarium 高程采样契约', () => {
+  /**
+   * 为什么锁 terrarium 而不是 ion 的 sampleTerrainMostDetailed：
+   * 免费 Cesium WorldTerrain 在中国全境没有高程数据（实测 ≈-13m），
+   * 按 ion 地形采样国内永远采回平地，等高线一条都画不出来。
+   * 这里锁住高程源是 AWS terrarium 瓦片，防止有人改回 ion。
+   */
+  /** 把高程编码成 terrarium 像素（elevation = R*256 + G + B/256 - 32768） */
+  function encodeTerrarium(elev: number): [number, number, number] {
+    const v = elev + 32768
+    const r = Math.floor(v / 256)
+    const g = Math.round(v - r * 256)
+    return [r, g, 0]
+  }
+
+  /**
+   * 合成地形：高程随像素坐标线性起伏（保证有高差、能切出等高线）。
+   * 每块瓦片用同一张图案（测试不关心瓦片间接缝）。
+   */
+  function syntheticTileData(): Uint8ClampedArray {
+    const data = new Uint8ClampedArray(256 * 256 * 4)
+    for (let y = 0; y < 256; y++) {
+      for (let x = 0; x < 256; x++) {
+        const [r, g, b] = encodeTerrarium(100 + (x + y) / 4)
+        const i = (y * 256 + x) * 4
+        data[i] = r; data[i + 1] = g; data[i + 2] = b; data[i + 3] = 255
+      }
+    }
+    return data
+  }
+
+  function makeFakeCesium(opts?: { tileOk?: boolean }) {
+    const fetchedUrls: string[] = []
     const C: any = {
       Math: { toDegrees: (r: number) => (r * 180) / Math.PI },
-      TerrainDataType: { BILINEAR: 'BILINEAR' },
-      Cartesian3: {
-        fromDegreesArray: (flat: number[]) => flat.map((v, i) => ({ i, v })),
-      },
-      Cartographic: { fromCartesian: (p: any) => ({ height: p.v }) },
+      Cartesian3: { fromDegreesArray: (flat: number[]) => flat },
       Color: { fromCssColorString: (s: string) => s },
       ColorGeometryInstanceAttribute: { fromColor: (c: any) => c },
       GeometryInstance: class { constructor(public o: any) {} },
       GroundPolylineGeometry: class { constructor(public o: any) {} },
       GroundPolylinePrimitive: class { constructor(public o: any) {} },
       PolylineColorAppearance: class {},
-      sampleTerrainMostDetailed: (...args: any[]) => {
-        calls.push(args)
-        // 返回与传入等长、形状一致（{i, v}，v 由 Cartographic.fromCartesian 读作 height）的笛卡尔数组，
-        // 高度随下标起伏，保证能切出等高线
-        return args[1].map((_: any, i: number) => ({ i, v: 100 + (i % 40) }))
-      },
     }
+    // 城市级视野（约 0.1°×0.05°，与真实使用同量级：terrarium z13、9 块瓦片）
     const viewer: any = {
-      terrainProvider,
       camera: {
         positionCartographic: { height: 3000 },
         computeViewRectangle: () => ({
-          west: 1.1, south: 0.5, east: 1.3, north: 0.7,
+          west: 2.094, south: 0.523, east: 2.096, north: 0.525,
         }),
       },
       scene: {
@@ -286,26 +305,65 @@ describe('createContourLayer：地形采样调用契约', () => {
         },
       },
     }
-    return { C, viewer, calls, terrainProvider }
+    const tileOk = opts?.tileOk !== false
+    const fetchMock = vi.fn(async (url: string) => {
+      fetchedUrls.push(url)
+      if (!tileOk) return { ok: false, status: 404, blob: async () => new Blob([]) }
+      return { ok: true, status: 200, blob: async () => new Blob([new Uint8Array([1, 2, 3])]) }
+    })
+    const bitmapMock = vi.fn(async () => ({ width: 256, height: 256, close() {} }))
+    const tileData = syntheticTileData()
+    const ctxMock = {
+      drawImage() {},
+      getImageData: (_x: number, _y: number, w: number, h: number) => ({
+        data: tileData, width: w, height: h,
+      }),
+    }
+    const getContextMock = vi.fn(() => ctxMock)
+    return { C, viewer, fetchedUrls, fetchMock, bitmapMock, getContextMock, tileData }
   }
 
-  it('第一个参数必须是地形提供器，第二个是采样点数组', async () => {
-    const { C, viewer, calls, terrainProvider } = makeFakeCesium()
-    const layer = createContourLayer({ C, viewer })
+  let restoreGetContext: (() => void) | null = null
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    restoreGetContext?.()
+    restoreGetContext = null
+    vi.restoreAllMocks()
+  })
+
+  /** 打桩浏览器全局（fetch / createImageBitmap / canvas 2d） */
+  function stubBrowser(fake: ReturnType<typeof makeFakeCesium>) {
+    vi.stubGlobal('fetch', fake.fetchMock)
+    vi.stubGlobal('createImageBitmap', fake.bitmapMock)
+    const orig = HTMLCanvasElement.prototype.getContext
+    HTMLCanvasElement.prototype.getContext = function () {
+      return fake.getContextMock() as any
+    } as any
+    restoreGetContext = () => { HTMLCanvasElement.prototype.getContext = orig }
+  }
+
+  it('高程取自 terrarium 瓦片（URL 形状锁定，防止退回 ion 地形）', async () => {
+    const fake = makeFakeCesium()
+    stubBrowser(fake)
+    const layer = createContourLayer({ C: fake.C, viewer: fake.viewer })
     await layer.update()
 
-    expect(calls.length).toBe(1)
-    expect(calls[0][0]).toBe(terrainProvider)      // 第一个参数 = terrainProvider
-    expect(Array.isArray(calls[0][1])).toBe(true)    // 第二个参数 = positions
-    expect(calls[0][1].length).toBeGreaterThan(0)
-    expect(calls[0][2] ?? false).toBe(false)         // 第三个参数是布尔量（不是插值类型字符串）
+    expect(fake.fetchMock).toHaveBeenCalled()
+    for (const url of fake.fetchedUrls) {
+      expect(url).toContain("elevation-tiles-prod/terrarium/")
+      expect(url).toMatch(/\.png$/)
+    }
+    // 城市级视野只取少数几块瓦片（LRU 缓存的就是这些）
+    expect(fake.fetchedUrls.length).toBeGreaterThan(0)
+    expect(fake.fetchedUrls.length).toBeLessThanOrEqual(16)
     layer.destroy()
   })
 
   it('采样有结果时确实加上了贴地图元，destroy 后移除', async () => {
-    const { C, viewer } = makeFakeCesium()
-    const primitives = viewer.scene.primitives
-    const layer = createContourLayer({ C, viewer })
+    const fake = makeFakeCesium()
+    stubBrowser(fake)
+    const primitives = fake.viewer.scene.primitives
+    const layer = createContourLayer({ C: fake.C, viewer: fake.viewer })
     await layer.update()
 
     expect(primitives.added.length).toBe(1)
@@ -313,15 +371,44 @@ describe('createContourLayer：地形采样调用契约', () => {
     expect(primitives.added.length).toBe(0)
   })
 
-  it('地形提供器不支持最精细采样时给出明确原因而不是崩掉', async () => {
-    const { C, viewer } = makeFakeCesium()
-    viewer.terrainProvider = { availability: undefined }
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
-    const layer = createContourLayer({ C, viewer })
+  it('瓦片全部取不到时不崩：给警告、走 onError、不出图元', async () => {
+    const fake = makeFakeCesium({ tileOk: false })
+    stubBrowser(fake)
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+    const onSamplerError = vi.fn()
+    const layer = createContourLayer({
+      C: fake.C, viewer: fake.viewer, onSamplerError,
+    })
     await expect(layer.update()).resolves.toBeUndefined()
     expect(warn).toHaveBeenCalled()
-    expect(String(warn.mock.calls[0][0])).toContain('最精细采样')
-    expect(viewer.scene.primitives.added.length).toBe(0)
+    // 采样器自己先 warn 一次（高程瓦片不可用），图层再 warn 一次；两条都要有
+    const allWarns = warn.mock.calls.map((c) => String(c[0])).join("\n")
+    expect(allWarns).toContain("高程采样失败")
+    expect(allWarns).toContain("高程瓦片不可用")
+    expect(onSamplerError).toHaveBeenCalled()
+    expect(fake.viewer.scene.primitives.added.length).toBe(0)
+    warn.mockRestore()
+    layer.destroy()
+  })
+
+  it('视野内无高差（全平）时不出图元但也不报错', async () => {
+    // 把所有瓦片像素编码成同一高程（平地）。双线性插值后 min/max 会有 1ulp 级
+    // 浮点差（199.99999999999997 vs 200.00000000000003），走"高差不足"分支 ——
+    // 两个分支都不出图元、都给明确警告，这里锁"不出图元 + 警告提到高差"。
+    const fake = makeFakeCesium()
+    const flat = new Uint8ClampedArray(256 * 256 * 4)
+    for (let i = 0; i < flat.length; i += 4) {
+      const [r, g, b] = encodeTerrarium(200)
+      flat[i] = r; flat[i + 1] = g; flat[i + 2] = b; flat[i + 3] = 255
+    }
+    fake.tileData.set(flat)
+    stubBrowser(fake)
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+    const layer = createContourLayer({ C: fake.C, viewer: fake.viewer })
+    await layer.update()
+    expect(fake.viewer.scene.primitives.added.length).toBe(0)
+    const allWarns = warn.mock.calls.map((c) => String(c[0])).join("\n")
+    expect(allWarns).toContain("高差")
     warn.mockRestore()
     layer.destroy()
   })

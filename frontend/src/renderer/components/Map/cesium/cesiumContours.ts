@@ -1,21 +1,24 @@
 /**
  * 3D 等高线：**客户端采样地形**生成，不依赖任何外部等高线服务。
  *
- * 为什么不用现成服务：高德 / 天地图都没有公开的等高线瓦片接口，而本项目已经有
- * Cesium World Terrain（`Terrain.fromWorldTerrain()`，settings 里的 Cesium ion Token），
- * 直接采样地形高度即可画等高线 —— 不引入新服务、不新增 Key。
+ * 高程来源是 AWS Terrain Tiles（terrarium 格式，见 `cesiumTerrarium.ts`）：
+ * 高德 / 天地图都没有公开的等高线瓦片接口；Cesium ion 的免费 WorldTerrain 又在
+ * 中国全境没有高程数据（实测全部 ≈-13m），所以改用免鉴权、全球覆盖（含中国）的
+ * terrarium 瓦片，高程编码在 PNG 像素里，客户端解码 + 双线性采样。
  *
- * 流程：相机视野矩形 → 经纬网格 → `sampleTerrainMostDetailed` 采高程 → 从高程网格提取
+ * 流程：相机视野矩形 → 经纬网格 → terrarium 采高程 → 从高程网格提取
  * 等高线段（marching squares 的简化版，见 `contourSegments`）→ 合并成一个
  * `GroundPolylinePrimitive`（贴地线，跨地形起伏贴合）。
  *
  * 性能约束（采样是异步且按视野大小平方增长的）：
  * - 只在相机停下后触发（由调用方节流），不在逐帧里跑；
  * - 网格边长按缩放自适应并封顶（见 `gridSizeFor`），总采样点有硬上限；
+ * - 一个视野只取 1~9 块瓦片（LRU 缓存，见 `cesiumTerrarium.ts`）；
  * - 图元**同步构建**（`asynchronous: false`，与 `CesiumSectorLayer` 同口径），
  *   且先建新的再摘旧的 —— 贴地图元异步构建/先删后建会触发
  *   `TypeError: ...reading '_target'` 并让渲染循环永久停止。
  */
+import { createTerrariumSampler, type TerrariumSampler } from './cesiumTerrarium'
 
 /** 等高线颜色（半透明棕灰，卫星/矢量底图上都清晰但不抢眼） */
 const CONTOUR_COLOR = 'rgba(196, 140, 90, 0.75)'
@@ -181,6 +184,11 @@ export interface ContourLayerOptions {
   width?: number
   /** 日志前缀，便于定位 */
   logPrefix?: string
+  /**
+   * 高程瓦片整体不可用（网络不通 / 被拦截）时的 UI 提示回调。
+   * 每层只调一次；之后仍会随相机移动静默重试。
+   */
+  onSamplerError?: (message: string) => void
 }
 
 /**
@@ -193,6 +201,11 @@ export function createContourLayer(opts: ContourLayerOptions): ContourLayerHandl
   const { C, viewer } = opts
   const width = opts.width ?? 1
   const prefix = opts.logPrefix ?? '[CesiumContours]'
+  /** 高程采样器（terrarium 瓦片 + LRU 缓存），随图层创建/销毁 */
+  const sampler: TerrariumSampler = createTerrariumSampler({
+    logPrefix: prefix,
+    onError: opts.onSamplerError,
+  })
 
   let primitive: any = null
   let destroyed = false
@@ -206,8 +219,9 @@ export function createContourLayer(opts: ContourLayerOptions): ContourLayerHandl
   let warnedEmpty = false
 
   /**
-   * 地形瓦片加载完（含 ion 瓦片异步到位）后允许重采样：开关刚打开时地形往往还没好，
-   * 此时采样得到全 0，若被"同一视野不重算"守卫挡住就永远画不出线。
+   * 场景瓦片加载完后允许重采样：开关刚打开/刚到新区域时高程瓦片可能还没取到，
+   * 若被"同一视野不重算"守卫挡住就永远画不出线。这里借场景的瓦片加载事件当
+   * "场景就绪"信号触发一次重试（与高程源无关，只是个廉价的就绪探测）。
    */
   const onTileLoadProgress = (e: any) => {
     if (destroyed || !lastWasEmpty) return
@@ -297,48 +311,29 @@ export function createContourLayer(opts: ContourLayerOptions): ContourLayerHandl
     try {
       const cols = n
       const rows = n
-      const positions: number[] = []
-      for (let row = 0; row < rows; row++) {
-        const lat = north - ((north - south) * row) / (rows - 1)
-        for (let col = 0; col < cols; col++) {
-          const lon = west + ((east - west) * col) / (cols - 1)
-          positions.push(lon, lat)
-        }
-      }
-      const cartesians = C.Cartesian3.fromDegreesArray(positions)
-      // Cesium 1.146 的签名是 sampleTerrainMostDetailed(terrainProvider, positions, singleTileFallback)
-      // —— **地形提供器是第一个参数**（早期版本曾是没有提供器的重载，别照抄旧写法：
-      // 传错会让 Cesium 内部去读 positions.length 而抛 "Cannot read properties of undefined"）。
-      const terrainProvider = viewer.terrainProvider ?? viewer.scene?.globe?.terrainProvider
-      if (!terrainProvider?.availability) {
-        throw new Error(
-          '当前地形提供器不支持"最精细采样"（缺少 availability）：'
-          + '请确认 3D 底图用的是 Cesium World Terrain 而非椭球地形',
-        )
-      }
-      const sampled = await C.sampleTerrainMostDetailed(terrainProvider, cartesians)
+      // 高程来源：terrarium 瓦片（含中国；ion 的免费 WorldTerrain 在国内没有高程数据）。
+      // 瓦片缺失/取不到的点高程为 NaN，contourSegments 会跳过 —— 局部缺数据不整体失败。
+      const heights = await sampler.sample({ west, south, east, north }, cols, rows)
       if (destroyed) return
-      const heights = new Float64Array(sampled.length)
       let min = Infinity
       let max = -Infinity
-      for (let i = 0; i < sampled.length; i++) {
-        const h = sampled[i] ? C.Cartographic.fromCartesian(sampled[i]).height : NaN
-        heights[i] = h
+      for (let i = 0; i < heights.length; i++) {
+        const h = heights[i]
         if (Number.isFinite(h)) {
           if (h < min) min = h
           if (h > max) max = h
         }
       }
       if (!(max > min)) {
-        // 全 0（地形瓦片未加载 / 无 ion Token 拿不到地形）或全平：没有可画的等高线；
-        // 清掉视野守卫，等瓦片到位后重试
+        // 全 NaN（瓦片还没到位 / 被拦）或全平：没有可画的等高线；
+        // 清掉视野守卫，等瓦片到位或移动相机后重试
         lastKey = ''
         lastWasEmpty = true
         if (!warnedEmpty) {
           warnedEmpty = true
           console.warn(
-            `${prefix} 本次采样高程全为 ${min.toFixed(1)}m —— `
-            + '若为 0 通常是 Cesium ion 地形未就绪或 Token 无效，等瓦片加载完会自动重试；'
+            `${prefix} 本次采样没有有效高程（NaN/平地）—— `
+            + '若瓦片刚切换可能是网络慢，移动相机会重试；'
             + '若两值相同则是视野内确实没有高差（平地/海面）。',
           )
         }
@@ -368,12 +363,12 @@ export function createContourLayer(opts: ContourLayerOptions): ContourLayerHandl
       }
       render(segments, { west, south, east, north }, cols, rows)
     } catch (e) {
-      // 地形服务不可用（无 ion Token / 离线 / 地形类型不支持）时只是没有等高线，不该影响地图
+      // 高程瓦片不可用（网络不通 / 被拦截 / 全 404）时只是没有等高线，不该影响地图
       lastWasEmpty = true
-      lastKey = ''   // 允许下次相机停下时重试（地形可能随后才就绪）
+      lastKey = ''   // 允许下次相机停下时重试（网络可能随后恢复）
       const detail = e instanceof Error ? e.message : String(e)
       console.warn(
-        `${prefix} 地形采样失败，本次不出等高线（地形就绪或移动相机后会重试）: ${detail}`, e,
+        `${prefix} 高程采样失败，本次不出等高线（网络恢复或移动相机后会重试）: ${detail}`, e,
       )
     } finally {
       running = false
@@ -388,6 +383,7 @@ export function createContourLayer(opts: ContourLayerOptions): ContourLayerHandl
     destroyed = true
     lastKey = ''
     try { globe?.tileLoadProgressEvent?.removeEventListener(onTileLoadProgress) } catch { /* ignore */ }
+    sampler.destroy()
     clearPrimitive()
   }
 

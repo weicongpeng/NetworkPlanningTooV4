@@ -5,6 +5,7 @@
  * 加载前递归转换坐标。点/线/面/Multi* 全覆盖。
  */
 import { gcj02ToWgs84 } from '../../../utils/coordinate'
+import { extractFeatureId } from '../../../utils/featureId'
 
 type Position = number[]
 
@@ -163,6 +164,95 @@ export function geometryCentroid(geometry: {
   return [lngSum / n, latSum / n]
 }
 
+/**
+ * 顶点数低于该值的线/环不做抽稀。
+ *
+ * 抽稀本身也有代价（一次 O(n) 遍历 + 结果数组），顶点很少的图形省不了多少几何，
+ * 反而让"小图形"多一分被改变形状的风险。
+ */
+export const SIMPLIFY_MIN_POINTS = 40
+
+/**
+ * Douglas-Peucker 抽稀（迭代版，避免大环递归爆栈）。
+ *
+ * 保留"偏离首尾连线超过容差"的点，逐段二分直到没有点超差。
+ * 用于 3D 贴地图元的几何瘦身：MapInfo/地理化数据的边界动辄成千上万个点，
+ * 而城市级视野下一屏只能看到几百个像素 —— 抽稀后通常只剩 10~30% 的点，
+ * 视觉差异极小（容差按要素尺度缩放，见 simplifyRingOrLine）。
+ */
+export function douglasPeucker(points: Position[], tolerance: number): Position[] {
+  const n = points.length
+  if (n < 3) return points
+  const tolSq = tolerance * tolerance
+  const keep = new Array<boolean>(n).fill(false)
+  keep[0] = true
+  keep[n - 1] = true
+  // 显式栈代替递归：省界/县界动辄几万点，递归深度会爆栈
+  const stack: Array<[number, number]> = [[0, n - 1]]
+  while (stack.length > 0) {
+    const [first, last] = stack.pop() as [number, number]
+    if (last <= first + 1) continue
+    const ax = points[first][0]
+    const ay = points[first][1]
+    const dx = points[last][0] - ax
+    const dy = points[last][1] - ay
+    const lenSq = dx * dx + dy * dy
+    let maxDistSq = -1
+    let index = -1
+    for (let i = first + 1; i < last; i++) {
+      const px = points[i][0]
+      const py = points[i][1]
+      let distSq: number
+      if (lenSq === 0) {
+        distSq = (px - ax) ** 2 + (py - ay) ** 2
+      } else {
+        let t = ((px - ax) * dx + (py - ay) * dy) / lenSq
+        t = t < 0 ? 0 : t > 1 ? 1 : t
+        const cx = ax + t * dx
+        const cy = ay + t * dy
+        distSq = (px - cx) ** 2 + (py - cy) ** 2
+      }
+      if (distSq > maxDistSq) {
+        maxDistSq = distSq
+        index = i
+      }
+    }
+    if (index > 0 && maxDistSq > tolSq) {
+      keep[index] = true
+      stack.push([first, index], [index, last])
+    }
+  }
+  const out: Position[] = []
+  for (let i = 0; i < n; i++) if (keep[i]) out.push(points[i])
+  return out
+}
+
+/** 首尾是否同点（GeoJSON 闭合环惯例） */
+function samePosition(a: Position, b: Position): boolean {
+  return a[0] === b[0] && a[1] === b[1]
+}
+
+/**
+ * 抽稀一条线 / 一个环（仅用于 **3D 渲染几何**；2D 与命中/标签/热力取点仍用原始坐标）。
+ *
+ * - 顶点数 ≤ SIMPLIFY_MIN_POINTS 原样返回
+ * - 闭合环：去掉重复的首尾点再抽稀、结果重新闭合；抽稀后不足 3 个不同点则放弃
+ * - 容差 tolerance 由调用方按要素尺度给出（度）
+ */
+export function simplifyRingOrLine(
+  points: Position[],
+  tolerance: number,
+  closed: boolean,
+): Position[] {
+  const n = points.length
+  if (n <= SIMPLIFY_MIN_POINTS) return points
+  const isClosed = closed && samePosition(points[0], points[n - 1])
+  const open = isClosed ? points.slice(0, n - 1) : points
+  const simplified = douglasPeucker(open, tolerance)
+  if (simplified.length < (isClosed ? 3 : 2)) return points
+  return isClosed ? [...simplified, simplified[0]] : simplified
+}
+
 // ===== 地理化数据（Excel 点/扇区文件）的扇区几何 =====
 // 与 2D GeoDataLayer 同口径：固定半径 80 米、波束默认 65°、低 zoom 退化为圆点。
 
@@ -219,15 +309,27 @@ export function isGeoDataDot(
 /**
  * 要素的选中标识。
  *
- * 圈选收集（`CesiumSelectionSession`）与高亮渲染（`CesiumGeoJsonLayer.setSelectionIds`）
- * **必须用同一套 id**，否则圈选出来的是 id A、高亮找的是 id B，表现为"圈到了但不高亮"。
- * 图层要素普遍没有 `properties.id`，所以按 后端 id → 编辑 id → 序号 依次回退。
+ * 圈选收集（`layerSelectables` / `decorationSelectables`）、高亮渲染
+ * （`CesiumGeoJsonLayer.setSelectionIds`）与**搜索定位**（`MapSearchDialog` 的 featureId）
+ * **必须用同一套 id**，否则圈选出来的是 id A、高亮找的是 id B，表现为"圈到了但不高亮"；
+ * 搜索结果也是 id C，定位高亮匹配不上，表现为"飞过去了但没有红色标注"。
+ *
+ * 口径与 2D 完全一致（2D `MapInfoLayer` 构建时分配的 `_nptSelectionId`、
+ * 搜索弹窗 `prepareMapInfoRecord` 的 featureId 都是这条规则）：
+ * 1. 编辑期稳定标识 `_editId`（编辑会话新建要素的身份，优先，避免与属性字段混淆）；
+ * 2. 自然 ID（`extractFeatureId`：id/name/小区名称/OBJECTID/CGI…）；
+ * 3. 兜底 `图层ID#序号`（与 2D 的 `_nptSelectionId` 兜底同形）。
  */
 export function featureSelectionId(
-  props: Record<string, unknown> | undefined, index: number,
+  props: Record<string, unknown> | undefined,
+  layerId: string,
+  index: number,
 ): string {
-  const raw = props?.id ?? props?._editId
-  return raw === undefined || raw === null ? String(index) : String(raw)
+  const editId = props?._editId
+  if (editId !== undefined && editId !== null) return String(editId)
+  const natural = extractFeatureId(props)
+  if (natural) return natural
+  return `${layerId}#${index}`
 }
 
 /** WGS84 经纬度包围盒（用于「图层预览」把相机飞到该图层全貌） */

@@ -25,7 +25,7 @@ import {
 
 /** 单个标签源的候选上限：给最坏情况下的布局代价封顶 */
 const MAX_CANDIDATES_PER_SOURCE = 1500
-/** 地形高度缓存上限（键 = 量化到 4 位小数的经纬度） */
+/** 地形高度缓存上限（键 = 量化到 4 位小数的经纬度；LRU 逐出） */
 const HEIGHT_CACHE_MAX = 20000
 
 export class CesiumLabelOverlay {
@@ -142,13 +142,22 @@ export class CesiumLabelOverlay {
       const qLng = Math.round(lng * 1e4) / 1e4
       const hKey = `${qLat},${qLng}`
       let height = this.heightCache.get(hKey)
-      if (height === undefined) {
+      if (height !== undefined) {
+        // LRU 刷新：命中后移到队尾（Map 保持插入序），被逐出的才是真最久未用
+        this.heightCache.delete(hKey)
+        this.heightCache.set(hKey, height)
+      } else {
         const carto = this.C.Cartographic.fromDegrees(qLng, qLat)
         const raw = typeof scene.globe?.getHeight === 'function'
           ? scene.globe.getHeight(carto)
           : 0
         height = typeof raw === 'number' && Number.isFinite(raw) ? raw : 0
-        if (this.heightCache.size >= HEIGHT_CACHE_MAX) this.heightCache.clear()
+        // 满则逐出最久未用的一条（原来是整体 clear：大网缩放漫游时会周期性
+        // 触发一整轮高度重查，表现为周期性的帧时间尖刺）
+        if (this.heightCache.size >= HEIGHT_CACHE_MAX) {
+          const oldest = this.heightCache.keys().next().value
+          if (oldest !== undefined) this.heightCache.delete(oldest)
+        }
         this.heightCache.set(hKey, height)
       }
       // 弧度换算用普通 Math（不依赖 C.Math，测试替身更简单）

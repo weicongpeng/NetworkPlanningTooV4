@@ -13,12 +13,35 @@ import {
   NO_FILL_COLOR,
 } from '../../../utils/fieldValue'
 import type { LayerColorSettings, LabelSettings, ThematicSettings } from '../LabelSettingsModal'
-import { geometryAnchor, polygonOuterRings, featureSelectionId } from './cesiumGeoJson'
+import {
+  geometryAnchor,
+  polygonOuterRings,
+  featureSelectionId,
+  simplifyRingOrLine,
+} from './cesiumGeoJson'
 import { sameSelection, type CameraView } from './CesiumSectorLayer'
 import type { LabelCandidateBase } from '../labelLayoutCore'
 
 /** 单图层的标签候选上限（按离视野中心近的优先保留） */
 const MAX_LABEL_CANDIDATES = 2000
+/**
+ * 视口裁剪的要素数阈值：超过才裁。
+ *
+ * 阈值以下的小图层（TAC 边界、装饰图层等常见场景）全量渲染，行为与优化前完全一致；
+ * 超过的大图层只建视野内图元 —— 否则万级要素的图层每次重建都要把全部几何重新
+ * 三角化一遍，平移/缩放后要卡几百毫秒到数秒（"叠加自定义图层后卡顿"的主因）。
+ */
+const VIEWPORT_CULL_MIN_FEATURES = 2000
+/**
+ * 视野外扩比例（相对视野跨度）。
+ *
+ * 比扇区层的 15% 更宽松：GeoJSON 重建同样只在相机停下时发生，外扩大一些可让
+ * "只平移了一小段"的场景不发生重建、也不缺要素。
+ */
+const VIEW_PADDING_RATIO = 0.5
+/** 抽稀容差上下界（度）：1e-6°≈0.11m，5e-4°≈55m */
+const SIMPLIFY_TOLERANCE_MIN = 1e-6
+const SIMPLIFY_TOLERANCE_MAX = 5e-4
 /**
  * 选中态描边色（与 2D `setSelectionHighlight` 的 `color:'#ef4444'` 同色）。
  * 2D 只改描边、不动填充，3D 同口径 —— 见 render() 里的说明。
@@ -57,6 +80,64 @@ interface FeatureStyle {
 
 type GeomKind = 'point' | 'line' | 'polygon'
 
+/** 几何类型 → 归类（无法归类的一律跳过，与旧 switch 的 default 分支同结果） */
+function geomKindOf(type: string): GeomKind | null {
+  if (type === 'Point' || type === 'MultiPoint') return 'point'
+  if (type === 'LineString' || type === 'MultiLineString') return 'line'
+  if (type === 'Polygon' || type === 'MultiPolygon') return 'polygon'
+  return null
+}
+
+/**
+ * 按类型取出"点/线/环"列表。
+ * 点：[[lng,lat],...]；线：[[点...],...]；面：只取外环（与 polygonOuterRings 一致）。
+ */
+function extractGeoms(g: { type: string; coordinates: unknown }, kind: GeomKind): Position[][] {
+  const c = g.coordinates as any
+  if (kind === 'point') return g.type === 'Point' ? [c] : c
+  if (kind === 'line') return g.type === 'LineString' ? [c] : c
+  return polygonOuterRings(g)
+}
+
+/**
+ * 视野量化键（与 CesiumSectorLayer.viewKey 同思路）：平移按跨度 1/20 分档、
+ * zoom 按 0.5 步长分档。只有"真正改变裁剪结果"的视野变化才重建 —— 视野外扩有
+ * VIEW_PADDING_RATIO 余量，阈值之间的微小移动不会缺要素。
+ */
+function geoViewKey(view: CameraView): string {
+  const spanLat = Math.max(1e-6, view.north - view.south)
+  const spanLng = Math.max(1e-6, view.east - view.west)
+  const qx = Math.round(view.west / (spanLng / 20))
+  const qy = Math.round(view.south / (spanLat / 20))
+  return `${Math.round(view.zoom * 2)}|${qx}|${qy}`
+}
+
+/** 要素包围盒是否与视野（含外扩）相交 */
+function bboxInView(
+  pf: { west: number; south: number; east: number; north: number },
+  view: CameraView,
+): boolean {
+  const padLat = (view.north - view.south) * VIEW_PADDING_RATIO
+  const padLng = (view.east - view.west) * VIEW_PADDING_RATIO
+  return pf.west <= view.east + padLng && pf.east >= view.west - padLng
+    && pf.south <= view.north + padLat && pf.north >= view.south - padLat
+}
+
+/** 预整理后的要素（换数据时算一次；重建只做图元构建，不重复抽稀/算包围盒） */
+interface PreparedFeature {
+  /** 在 fc.features 里的下标（选中标识/拾取标识要用） */
+  fi: number
+  feature: GeoFeature
+  kind: GeomKind
+  /** 点：[[lng,lat],...]；线：[[点...],...]；面：[外环,...]（线/环均已抽稀） */
+  geoms: Position[][]
+  /** WGS84 包围盒（按抽稀前的原始点计算，是保守超集，裁剪判定不会漏） */
+  south: number
+  west: number
+  north: number
+  east: number
+}
+
 /** 与 2D `MapInfoLayer.DEFAULT_STYLES` 一致的默认值（填充不透明度一律 100%） */
 const DEFAULT_BY_KIND: Record<GeomKind, {
   fill: string; stroke: string; width: number; fillOpacity: number; pointSize: number
@@ -91,6 +172,15 @@ export class CesiumGeoJsonLayer {
   private viewer: any
   /** 本次渲染创建的批量图元（面/线/点各 1 个），重建时整体移除 */
   private primitives: any[] = []
+  /**
+   * 预整理后的要素（换数据时算一次：抽稀 + 包围盒）。
+   * render() 只从这里建图元，不再每次遍历原始 FC。
+   */
+  private prepared: PreparedFeature[] = []
+  /** 当前视野（setView 推入）；null = 不裁剪（全量渲染） */
+  private view: CameraView | null = null
+  /** 视野分档键：与上次相同就不重建（见 geoViewKey） */
+  private lastViewKey = ''
   /**
    * 重建序号：每次「请求重建」或「立即重建」都 +1，挂起的 rAF 回调序号对不上就放弃。
    * 用来合并同一帧内的多次配置变更——后面那次会覆盖前面那次，避免重复重建。
@@ -138,8 +228,76 @@ export class CesiumGeoJsonLayer {
    */
   setFeatureCollection(fc: FeatureCollection): void {
     this.fc = fc
+    this.prepare()
     this.renderSeq += 1 // 作废挂起中的重建，避免紧随其后又重建一遍
     this.render()
+  }
+
+  /**
+   * 预整理要素（换数据时算一次）。
+   *
+   * - 按类型归组"点/线/环"（面只取外环）
+   * - 线/环做 Douglas-Peucker 抽稀：MapInfo/地理化边界动辄上万点，城市级视野下
+   *   一屏只有几百像素，通常可减到 10~30% 的点，视觉差异极小（仅影响 3D 渲染几何，
+   *   2D / 命中 / 标签 / 热力取点仍用原始坐标）
+   * - 记录 WGS84 包围盒（视口裁剪用）
+   */
+  private prepare(): void {
+    this.prepared = []
+    for (let fi = 0; fi < this.fc.features.length; fi++) {
+      const feature = this.fc.features[fi]
+      const g = feature.geometry
+      if (!g) continue
+      const kind = geomKindOf(g.type)
+      if (!kind) continue
+      const raw = extractGeoms(g, kind)
+      if (raw.length === 0) continue
+      let south = Infinity
+      let west = Infinity
+      let north = -Infinity
+      let east = -Infinity
+      const visit = (lng: number, lat: number): void => {
+        if (!Number.isFinite(lng) || !Number.isFinite(lat)) return
+        if (lng < west) west = lng
+        if (lng > east) east = lng
+        if (lat < south) south = lat
+        if (lat > north) north = lat
+      }
+      if (kind === 'point') {
+        // 点要素的 raw 元素本身就是 [lng,lat]（比线/面少一层，见 extractGeoms）
+        for (const p of raw as unknown as Position[]) visit(p[0], p[1])
+      } else {
+        // 线/面要素的 raw 元素是点数组
+        for (const geom of raw) {
+          for (const p of geom) visit(p[0], p[1])
+        }
+      }
+      if (!Number.isFinite(west)) continue
+      let geoms = raw
+      if (kind !== 'point') {
+        // 容差 = 要素对角线 / 2000（相对误差 0.05%），封顶 5e-4 度（≈55m）：
+        // 大边界允许的绝对误差大一些，小图形保持精细
+        const diag = Math.hypot(east - west, north - south)
+        const tol = Math.min(SIMPLIFY_TOLERANCE_MAX, Math.max(SIMPLIFY_TOLERANCE_MIN, diag / 2000))
+        geoms = raw.map((geom) => simplifyRingOrLine(geom, tol, kind === 'polygon'))
+      }
+      this.prepared.push({ fi, feature, kind, geoms, south, west, north, east })
+    }
+  }
+
+  /**
+   * 推入当前视野（宿主在相机停下 / syncAll 时调用）。
+   *
+   * 视口裁剪：要素数超过阈值的图层只建"视野内（含外扩）"的图元，重建时机与扇区图层
+   * 一致（只在相机停下后，移动中不重建）。阈值以下的小图层 setView 不触发重建 ——
+   * 全量渲染，视野变化不影响结果。
+   */
+  setView(view: CameraView | null): void {
+    const key = view ? geoViewKey(view) : ''
+    if (key === this.lastViewKey) return
+    this.lastViewKey = key
+    this.view = view
+    if (this.prepared.length > VIEWPORT_CULL_MIN_FEATURES) this.requestRender()
   }
   /** 当前要素集合（WGS84）——供圈选/点选按几何收集命中要素 */
   getFeatures(): GeoFeature[] {
@@ -222,7 +380,7 @@ export class CesiumGeoJsonLayer {
       if (value === undefined || value === null) continue
       const text = String(value)
       if (!text) continue
-      const sid = featureSelectionId(f.properties, fi)
+      const sid = featureSelectionId(f.properties, this.layerId, fi)
       out.push({
         id: sid,
         lat,
@@ -364,15 +522,17 @@ export class CesiumGeoJsonLayer {
     const selectedPolylines: any[] = []
     const points: Array<{ opts: any; id: any }> = []
 
-    for (let fi = 0; fi < this.fc.features.length; fi++) {
-      const feature = this.fc.features[fi]
-      if (!feature.geometry) continue
-      const g = feature.geometry
-      const geomKind: GeomKind = g.type === 'Point' || g.type === 'MultiPoint'
-        ? 'point'
-        : (g.type === 'LineString' || g.type === 'MultiLineString') ? 'line' : 'polygon'
-      const st = this.resolveFeatureStyle(feature, geomKind)
-      const selected = this.selectionIds?.has(featureSelectionId(feature.properties, fi))
+    // 视口裁剪只对"大图层"生效（见 VIEWPORT_CULL_MIN_FEATURES）：小图层 cullView 为
+    // null，全量渲染，与优化前行为完全一致。
+    const cullView = this.prepared.length > VIEWPORT_CULL_MIN_FEATURES ? this.view : null
+
+    for (const pf of this.prepared) {
+      const sid = featureSelectionId(pf.feature.properties, this.layerId, pf.fi)
+      const selected = this.selectionIds?.has(sid) ?? false
+      // 视野外且未选中的要素不建图元。选中态必须保留：圈选高亮不能因为
+      // "选中要素在视口外"而缺一块（跨视野选中/定位场景）。
+      if (cullView && !selected && !bboxInView(pf, cullView)) continue
+      const st = this.resolveFeatureStyle(pf.feature, pf.kind)
       const strokeCss = selected ? SELECTED_STROKE_COLOR : st.strokeColor
       /**
        * 选中态**只把颜色换成红色，宽度用要素原本的描边宽**（不放大、也不做像素下限）。
@@ -388,18 +548,14 @@ export class CesiumGeoJsonLayer {
       // `selectionId` 必须带出来：点选高亮按它写选中态，而图层要素普遍没有 properties.id，
       // 早先宿主用 `properties.id` 兜出空字符串 → 点选后"没有任何高亮"。
       const pickId = {
-        feature,
+        feature: pf.feature,
         layerId: this.layerId,
-        selectionId: featureSelectionId(feature.properties, fi),
+        selectionId: sid,
       }
 
-      switch (g.type) {
-        case 'Point':
-        case 'MultiPoint': {
-          const pts: Position[] = g.type === 'Point'
-            ? [g.coordinates as Position]
-            : (g.coordinates as Position[])
-          for (const p of pts) {
+      switch (pf.kind) {
+        case 'point': {
+          for (const p of pf.geoms) {
             points.push({
               id: pickId,
               opts: {
@@ -416,12 +572,8 @@ export class CesiumGeoJsonLayer {
           }
           break
         }
-        case 'LineString':
-        case 'MultiLineString': {
-          const lines: Position[][] = g.type === 'LineString'
-            ? [g.coordinates as Position[]]
-            : (g.coordinates as Position[][])
-          for (const line of lines) {
+        case 'line': {
+          for (const line of pf.geoms) {
             if (line.length < 2) continue
             polylines.push(new C.GeometryInstance({
               geometry: new C.GroundPolylineGeometry({
@@ -437,10 +589,8 @@ export class CesiumGeoJsonLayer {
           }
           break
         }
-        case 'Polygon':
-        case 'MultiPolygon': {
-          const rings = polygonOuterRings(g)
-          for (const ring of rings) {
+        case 'polygon': {
+          for (const ring of pf.geoms) {
             if (ring.length < 3) continue
             const positions = C.Cartesian3.fromDegreesArray(ring.flatMap((p) => p))
             /**
@@ -448,7 +598,7 @@ export class CesiumGeoJsonLayer {
              *
              * 面图元同时承担"点击命中区域"的职责：不建面就只剩贴地边框线，而线的命中宽度
              * 只有几个像素 —— 表现为"透明填充的多边形点内部没反应，只能点中边框"。
-             * 视觉上 alpha 0.01 与无填充没有区别，但 `scene.pick` 就能拾到整个面了
+             * 视觉上 alpha 0.01 与无填充没有区别，但 `scene.pick` 就能拾取整个面了
              * （`scene.pick` 本来就拾取半透明/贴地面，不需要 `pickTranslucentDepth`；
              * 那个开关只影响 `pickPosition`，且会引入缩放崩溃，见 CesiumMap 里的说明）。
              */

@@ -16,6 +16,7 @@ import {
   type ComponentProps,
 } from 'react'
 import { useTranslation } from 'react-i18next'
+import { useToastStore } from '../../../store/toastStore'
 import { OnlineMap, type OnlineMapRef } from '../OnlineMap'
 import { loadCesium } from '../../../services/cesiumLoader'
 import { mapStateService } from '../../../services/mapStateService'
@@ -112,6 +113,15 @@ const MAX_RENDER_RECOVERIES = 3
  * 见 postRender 里的说明：候选集只在相机停下后刷新会导致移动时标签不跟着走。
  */
 const LABEL_SYNC_THROTTLE_MS = 150
+
+/**
+ * 相机移动中的渲染分辨率缩放（交互降级）。
+ *
+ * 平移/缩放是最高频的卡顿场景，而 GPU 填充成本 ≈ 像素数（= resolutionScale²）。
+ * 移动中把分辨率压到 0.75（像素量降到约 56%），停下后恢复清晰度档位设定的值 ——
+ * 交互流畅度优先，静止观感不变。
+ */
+const INTERACTION_RESOLUTION_SCALE = 0.75
 
 /**
  * 等浏览器真正画出一帧（双 rAF：第一帧提交 React 的 DOM 变更，第二帧确保已合成上屏）。
@@ -224,6 +234,11 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
   const containerRef = useRef<HTMLDivElement>(null)
   const viewerRef = useRef<any>(null)
   const tilesetRef = useRef<any>(null)
+  /**
+   * 清晰度档位设定的渲染分辨率基准（静止时用这个值；相机移动中临时压低，
+   * 停下后恢复，见 camera.changed 里的交互降级）。
+   */
+  const baseResolutionScaleRef = useRef(1)
   // 图层编辑会话（绘制/顶点/圈选；无可编辑图层时不渲染内容）
   const editSessionRef = useRef<CesiumEditSession | null>(null)
   // 测距 / 抓取坐标工具
@@ -405,7 +420,10 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
     // 图层内部会判断"选中集合没变就不重建"（否则每次相机停下都全量重建）。
     for (const layer of geoJsonLayersRef.current.values()) {
       layer.setSelectionIds(selectionIdsRef.current)
+      // 视野推给图层（视口裁剪用）：配置变化时按当前视野重建，键没变则不重建
+      layer.setView(view)
     }
+    decorationLayerRef.current?.setView(view)
     decorationLayerRef.current?.setSelectionIds(selectionIdsRef.current)
     syncLabels()
     // 数据/设置变化后重放热力面（指纹未变时 CesiumHeatmapLayer 内部会跳过重算）
@@ -508,6 +526,9 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
         labelEnabled: !!labelVis,
         label: ms.labelSettingsMap?.[f.id] ?? null,
       })
+      // 先推当前视野：数据到手时（阶段 3 的 setFeatureCollection）直接按视野裁剪建图元，
+      // 避免"先全量建一遍、再裁剪重建一遍"的双倍构建
+      layer.setView(getCameraView())
       if (!userVisible) continue
       // 缓存里已有 → 不需要取数，直接进"应用数据"阶段
       const cached = f.sourceType === 'excel'
@@ -623,6 +644,7 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
       properties: { id: p.id, name: p.label ?? '' },
     }))
     const fc = { type: 'FeatureCollection', features: [...decoFeatures, ...pointFeatures] }
+    layer.setView(getCameraView())
     layer.setFeatureCollection(transformFeatureCollection(fc))
     layer.applyConfig({
       visible: true,
@@ -676,8 +698,9 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
   function layerSelectables(layerId: string) {
     const layer = geoJsonLayersRef.current.get(layerId)
     if (!layer) return []
+    // id 口径必须与图层渲染/搜索弹窗一致（见 featureSelectionId 注释）
     return layer.getFeatures().map((f: any, i: number) => ({
-      id: featureSelectionId(f.properties, i),
+      id: featureSelectionId(f.properties, layerId, i),
       geometry: f.geometry,
       properties: (f.properties ?? {}) as Record<string, unknown>,
     }))
@@ -891,7 +914,8 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
   function decorationSelectables() {
     const feats = (useMapStore.getState().decorationFeatures ?? []) as any[]
     return feats.map((f, i) => ({
-      id: String(f.properties?._editId ?? f.properties?.id ?? i),
+      // 与装饰图层（decoration-layer）渲染侧同一套 id 口径
+      id: featureSelectionId(f.properties, 'decoration-layer', i),
       geometry: f.geometry ? transformGeometry(f.geometry) : null,
       properties: (f.properties ?? {}) as Record<string, unknown>,
     })).filter((f) => !!f.geometry)
@@ -969,6 +993,29 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
         })
         if (disposed) { viewer.destroy(); return }
         viewerRef.current = viewer
+        /**
+         * 场景渲染效果瘦身（3D 性能优化，与 2D 观感拉齐）。
+         *
+         * 这些效果都是逐像素/逐帧的全屏 shader 开销，而本工具的视角是城市级：
+         * - `enableLighting`：太阳光照逐帧算太阳方位、改全局光照 uniform，让卫星影像
+         *   （本身就是"拍好的照片"）随虚拟时间变色。2D 高德卫星没有任何光照，
+         *   关掉才与 2D 一致，也省掉整帧的光照计算。
+         * - `skyAtmosphere` / `globe.showGroundAtmosphere` / `fog`：大气与雾的
+         *   全屏后效，城市级视角下观感贡献极小。
+         * - `sun` / `moon`：天空里的两个 billboard，关光照后没有存在意义。
+         *
+         * 清晰度档位（resolutionScale / FXAA / SSE）走下方独立 effect，与此处不冲突。
+         */
+        try {
+          viewer.scene.globe.enableLighting = false
+          viewer.scene.skyAtmosphere.show = false
+          viewer.scene.globe.showGroundAtmosphere = false
+          viewer.scene.fog.enabled = false
+          viewer.scene.sun.show = false
+          viewer.scene.moon.show = false
+        } catch {
+          // 理论上 1.146 全都有；个别开关缺失不该拦住整个地图初始化
+        }
         // 记录底图层（imageryLayers[0] = 构造时传入的 baseLayer）：
         // 后续换底图只替换这一层，不 removeAll（否则会清掉热力面等 imagery 层）
         baseImageryLayerRef.current = viewer.imageryLayers.get(0)
@@ -980,6 +1027,10 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
         winHook.__nptLayerEditStore = useLayerEditStore
 
         const tileset = await C.createOsmBuildingsAsync()
+        // 3D Tiles 的遍历/加载成本主要由屏幕空间误差阈值决定：默认 16（越早细化越精细）。
+        // 本工具是城市级俯瞰视角，建筑在屏幕上通常只有几十像素，32 的细化阈值
+        // 观感几乎无差，但显著减少瓦片遍历与加载量（Cesium 专项优化）。
+        tileset.maximumScreenSpaceError = 32
         viewer.scene.primitives.add(tileset)
         tilesetRef.current = tileset
 
@@ -1070,6 +1121,8 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
         // 相机移动：防抖重建扇区（视口剔除）+ 回写 mapStateService + 更新指南针
         let moveTimer: ReturnType<typeof setTimeout> | null = null
         let headingTimer: ReturnType<typeof setTimeout> | null = null
+        /** 交互中（降分辨率）标记：true = 已压低 resolutionScale，停下后要恢复 */
+        let interacting = false
         viewer.camera.changed.addEventListener(() => {
           const carto = viewer.camera.positionCartographic
           const lat = C.Math.toDegrees(carto.latitude)
@@ -1079,6 +1132,13 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
             center: [glat, glng],
             zoom: heightToZoom(carto.height, lat, container.clientHeight, viewer.camera.frustum.fovy),
           })
+          // 交互中降渲染分辨率：一次交互只压一次（连续 changed 事件不重复设置），
+          // 像素量降到约 56%，停下后在 moveTimer 里恢复清晰度
+          if (!interacting) {
+            interacting = true
+            viewer.resolutionScale = Math.min(
+              baseResolutionScaleRef.current, INTERACTION_RESOLUTION_SCALE)
+          }
           // 指南针：方位角变化较碎，节流到 ~100ms 更新一次
           if (!headingTimer) {
             headingTimer = setTimeout(() => {
@@ -1091,10 +1151,19 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
           if (moveTimer) clearTimeout(moveTimer)
           moveTimer = setTimeout(() => {
             moveTimer = null
+            interacting = false
+            // 卸载/销毁后迟到的一次恢复：viewer 已毁时写属性会抛错
+            if (viewer.isDestroyed()) return
+            // 恢复清晰度档位设定的渲染分辨率（静止观感不变）
+            viewer.resolutionScale = baseResolutionScaleRef.current
             const view = getCameraView()
             if (view) {
               sectorLayersRef.current.lte?.update(view)
               sectorLayersRef.current.nr?.update(view)
+              // GeoJSON 图层视口裁剪重建：与扇区同时机（停下才重建，移动中不重建）。
+              // 图层内部按视野分档键去重，视野没实质变化不会重建
+              for (const layer of geoJsonLayersRef.current.values()) layer.setView(view)
+              decorationLayerRef.current?.setView(view)
               // 跨过地理化数据扇区 LOD 阈值时才重建（圆点 ↔ 扇形）
               setGeoLodLow(view.zoom <= GEO_DATA_SECTOR_LOD_ZOOM)
             }
@@ -1513,7 +1582,16 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
       return
     }
     if (!contourRef.current) {
-      contourRef.current = createContourLayer({ C, viewer })
+      contourRef.current = createContourLayer({
+        C,
+        viewer,
+        // 高程瓦片整体取不到（断网/被拦）时给一次明确提示，避免"开了开关什么都没发生"
+        onSamplerError: () => {
+          useToastStore.getState().show(
+            t('map.contourTerrainUnavailable') || '地形高程数据暂不可用，等高线未渲染（联网后恢复）',
+          )
+        },
+      })
       void contourRef.current.update()
     }
     return () => {
@@ -1537,7 +1615,9 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
     const preset = (tier && CESIUM_QUALITY_PRESETS[tier]) || CESIUM_QUALITY_PRESETS.smooth
     const dpr = window.devicePixelRatio || 1
     // resolutionScale > 1：按高于 CSS 像素的分辨率渲染再缩回，文字与影像更锐（成本 ×DPR²）
-    viewer.resolutionScale = Math.min(dpr, preset.maxResolutionScale)
+    const base = Math.min(dpr, preset.maxResolutionScale)
+    baseResolutionScaleRef.current = base
+    viewer.resolutionScale = base
     viewer.scene.fxaa = preset.fxaa
     viewer.scene.globe.maximumScreenSpaceError = preset.maximumScreenSpaceError
   }, [ready, mapSettings.cesiumQuality])
