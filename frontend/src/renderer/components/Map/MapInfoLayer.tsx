@@ -1114,14 +1114,27 @@ export class MapInfoLayer {
     if (!this.geoJSONLayer) return null
     const bounds = L.latLngBounds([])
     let has = false
+    // 无效坐标（解析失败默认 (0,0)、越界值）不并入包围盒，避免双击"显示全部"
+    // 的视野被拉到印度洋
+    const isValidLatLng = (lat: number, lng: number): boolean =>
+      !(lat === 0 && lng === 0) && Math.abs(lng) <= 180 && Math.abs(lat) <= 90
     this.geoJSONLayer.eachLayer((layer: any) => {
       try {
         if (typeof layer.getLatLng === 'function') {
-          bounds.extend(layer.getLatLng())
-          has = true
+          const ll = layer.getLatLng()
+          if (ll && isValidLatLng(ll.lat, ll.lng)) {
+            bounds.extend(ll)
+            has = true
+          }
         } else if (typeof layer.getBounds === 'function') {
-          bounds.extend(layer.getBounds())
-          has = true
+          const b = layer.getBounds()
+          if (b && b.isValid()) {
+            const c = b.getCenter()
+            if (isValidLatLng(c.lat, c.lng)) {
+              bounds.extend(b)
+              has = true
+            }
+          }
         }
       } catch { /* 忽略单要素异常 */ }
     })

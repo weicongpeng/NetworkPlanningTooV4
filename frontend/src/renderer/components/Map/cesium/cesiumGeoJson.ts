@@ -351,9 +351,12 @@ export function hasBounds(b: LngLatBounds): boolean {
     && b.west <= b.east && b.south <= b.north
 }
 
-/** 把一个 WGS84 经纬度点并入包围盒 */
+/** 把一个 WGS84 经纬度点并入包围盒。
+ * 工参/撒点解析失败的行坐标默认 (0,0)：并入会把"显示全部"的视野拉到印度洋，
+ * 连同越界值一并按无效坐标剔除 */
 export function extendBoundsWithPoint(b: LngLatBounds, lng: number, lat: number): void {
   if (!Number.isFinite(lng) || !Number.isFinite(lat)) return
+  if ((lng === 0 && lat === 0) || Math.abs(lng) > 180 || Math.abs(lat) > 90) return
   if (lng < b.west) b.west = lng
   if (lng > b.east) b.east = lng
   if (lat < b.south) b.south = lat

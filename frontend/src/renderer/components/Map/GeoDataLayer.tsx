@@ -1388,16 +1388,25 @@ export class GeoDataLayer {
     let has = false
     for (const item of this.data) {
       try {
+        // 无效坐标（工参/撒点解析失败默认 (0,0)、越界值）不并入包围盒：
+        // 否则双击"显示全部"会被拉到印度洋（视野覆盖非洲-印度洋-亚洲）
+        const isValid = (lat: number | undefined, lng: number | undefined): boolean =>
+          typeof lat === 'number' && typeof lng === 'number'
+          && !(lat === 0 && lng === 0)
+          && Math.abs(lng) <= 180 && Math.abs(lat) <= 90
         if (Array.isArray(item.path) && item.path.length > 0) {
           for (const p of item.path) {
-            bounds.extend([p[0], p[1]])
+            const plat: number | undefined = p[0]
+            const plng: number | undefined = p[1]
+            if (!isValid(plat, plng)) continue
+            bounds.extend([plat as number, plng as number])
             has = true
           }
         } else {
           const lat = item.displayLat ?? item.latitude
           const lng = item.displayLng ?? item.longitude
-          if (typeof lat === 'number' && typeof lng === 'number') {
-            bounds.extend([lat, lng])
+          if (isValid(lat, lng)) {
+            bounds.extend([lat as number, lng as number])
             has = true
           }
         }
