@@ -781,23 +781,35 @@ export function MapPage() {
 
   // 监听数据刷新事件（数据被删除或上传时重新加载扇区数据和图层文件）
   useEffect(() => {
-    const handleDataRefresh = (e: Event) => {
+    const handleDataRefresh = async (e: Event) => {
       const scope = (e as CustomEvent)?.detail?.scope
       // 清除图层列表缓存（图层保存后源文件时间戳变化，列表需重取）
       _layerListCache.clear()
-      loadLayerFiles()
       if (scope === 'layer') {
-        // 仅图层内容变化（保存链路）：扇区/工参数据未变，跳过重载与重绘，避免保存后卡顿
+        // 仅本机图层内容变化（保存链路）：保存流程已精确失效并重建目标图层，
+        // 扇区/工参数据未变，只刷新图层列表，避免保存后卡顿
+        await loadLayerFiles()
         console.log('[MapPage] 图层内容已更新，跳过扇区数据重载')
         return
       }
-      console.log('[MapPage] 数据已变更，重新加载扇区数据')
-      // 重载扇区数据缓存（用于频点提取和工参搜索）——强制回源，
-      // 与 onlineMapRef.refreshData() 的强刷保持一致，避免频点表/搜索
-      // 数据源落后于实际渲染的扇区（落后时新频点默认不可见）
+
+      console.log('[MapPage] 数据已变更，重新加载扇区数据与图层')
+      try {
+        // 1) 数据条目列表先回源：同组其他端新建/删除图层或数据条目后，
+        //    本地 items 可能仍是旧快照，不回源会导致新图层根本不进图层面板。
+        await useDataStore.getState().fetchList(1, 50, true)
+      } catch (error) {
+        console.warn('[MapPage] 数据列表回源失败（继续按现有列表刷新）:', error)
+      }
+      // 2) 图层列表重建（强制走接口，读取 layers.json 最新元数据）
+      await loadLayerFiles()
+      // 3) 丢弃图层 GeoJSON 与扇区缓存：远端改写源文件后旧缓存必然失效。
+      //    这一步不能只依赖 data_changed 的全局监听——桌面端同步落地 / 事件
+      //    监听顺序异常时，地图会一直显示旧图层内容（同组“编辑后别人看不到”根因）。
+      useMapDataCacheStore.getState().markAllDirty()
+      // 4) 重载扇区数据缓存（频点提取/工参搜索）与地图图层
       loadSectorDataForSearch(true)
-      // 刷新在线地图（sectorData state + 图层重绘）
-      onlineMapRef.current?.refreshData()
+      await onlineMapRef.current?.refreshData()
     }
     window.addEventListener(DATA_REFRESH_EVENT, handleDataRefresh)
     return () => window.removeEventListener(DATA_REFRESH_EVENT, handleDataRefresh)
@@ -2584,6 +2596,28 @@ export function MapPage() {
   }, [])
 
   /**
+   * 图层刷新（右键菜单）：重新拉取并重建该图层。
+   * - 图层文件 / 地理化数据：丢弃缓存后走 refreshLayerData（3D 侧同接口实现）
+   * - 基站 LTE/NR：工参数据整体强刷
+   * - 装饰图层：真源在前端 store，触发显示层重建即可
+   */
+  const handleLayerRefresh = useCallback((layerId: string) => {
+    if (layerId === 'lte-sectors' || layerId === 'nr-sectors') {
+      // 工参数据整体强刷：同时更新搜索/频点用的缓存与地图渲染（2D/3D 一致）
+      loadSectorDataForSearch(true)
+      void onlineMapRef.current?.refreshData()
+      return
+    }
+    if (layerId === 'decoration-layer') {
+      const features = useMapStore.getState().decorationFeatures ?? []
+      useMapStore.setState({ decorationFeatures: [...features] })
+      return
+    }
+    useMapDataCacheStore.getState().invalidateLayer(layerId)
+    void onlineMapRef.current?.refreshLayerData(layerId, {})
+  }, [loadSectorDataForSearch])
+
+  /**
    * 保存区间配色模板
    */
   const handleSaveThematicTemplate = useCallback((name: string, ranges: ThematicRange[]) => {
@@ -3791,6 +3825,7 @@ export function MapPage() {
               heatmapStats={heatmapStats}
               openThematicFor={openThematicFor}
               onLayerPreview={handleLayerPreview}
+              onLayerRefresh={handleLayerRefresh}
               thematicTemplates={mapSettings.thematicTemplates || []}
               onSaveThematicTemplate={handleSaveThematicTemplate}
               onRemoveThematicTemplate={handleRemoveThematicTemplate}

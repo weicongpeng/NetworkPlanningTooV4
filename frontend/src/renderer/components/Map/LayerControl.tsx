@@ -10,7 +10,7 @@
  * - 右键菜单支持标签设置
  */
 import { useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo } from 'react'
-import { ChevronDown, ChevronRight, Map, Folder, File, X, Satellite, Radio, MapPin, Route, Hexagon, Settings, Maximize2, MousePointer2, Pencil, Type, Layers } from 'lucide-react'
+import { ChevronDown, ChevronRight, Map, Folder, File, X, Satellite, Radio, MapPin, Route, Hexagon, Settings, Maximize2, MousePointer2, Pencil, Type, Layers, Search, RefreshCw } from 'lucide-react'
 import { HexColorPicker } from 'react-colorful'
 import { useTranslation } from 'react-i18next'
 import { NetworkType } from '../../config/sector-config'
@@ -311,8 +311,10 @@ export interface LayerControlProps {
   heatmapStats?: Record<string, HeatmapStats | null>
   /** 外部跳转指令：打开指定图层的专题/热力图设置页（图例双击） */
   openThematicFor?: { layerId: string; ts: number; subTab?: 'basic' | 'thematic' | 'heatmap' } | null
-  /** 图层预览回调（右键菜单：居中并最大化显示该图层全部要素） */
+  /** 图层预览回调（右键菜单「显示全部」：居中并最大化显示该图层全部要素） */
   onLayerPreview?: (fileId: string) => void
+  /** 图层刷新回调（右键菜单「刷新」：重新拉取/重建该图层） */
+  onLayerRefresh?: (fileId: string) => void
   /** 已保存的区间配色模板列表 */
   thematicTemplates?: ThematicTemplate[]
   /** 保存区间配色模板回调 */
@@ -390,6 +392,7 @@ export function LayerControl({
   heatmapStats,
   openThematicFor,
   onLayerPreview,
+  onLayerRefresh,
   thematicTemplates = [],
   onSaveThematicTemplate,
   onRemoveThematicTemplate,
@@ -457,6 +460,8 @@ export function LayerControl({
 
   // 用户手动切换的展开节点ID集合
   const [expandedNodeIds, setExpandedNodeIds] = useState<Set<string>>(new Set(['root', 'sector-group', 'custom-group']))
+  // 图层搜索：只过滤「图层文件」「地理化数据」组内的图层名（大小写不敏感）
+  const [layerSearch, setLayerSearch] = useState('')
 
   // 标签设置弹窗状态
   const [showLabelSettingsModal, setShowLabelSettingsModal] = useState(false)
@@ -763,6 +768,10 @@ export function LayerControl({
     const isExpanded = (id: string, defaultExpanded: boolean) => {
       return expandedNodeIds.has(id) || (defaultExpanded && !expandedNodeIds.has(`collapse-${id}`))
     }
+    // 搜索只作用于图层文件 / 地理化数据组内的图层名；搜索时强制展开这两组
+    const query = layerSearch.trim().toLowerCase()
+    const hasQuery = query.length > 0
+    const matchName = (name: string) => !hasQuery || String(name || '').toLowerCase().includes(query)
 
     return [
       {
@@ -810,9 +819,9 @@ export function LayerControl({
             id: 'layer-files',
             type: 'layer-files' as TreeNodeType,
             label: t('map.layerFiles'),
-            expanded: isExpanded('layer-files', true),
+            expanded: hasQuery || isExpanded('layer-files', true),
             children: [
-              ...(decorationLayer ? [
+              ...(decorationLayer && matchName(decorationLayer.name) ? [
                 {
                   id: 'decoration-layer',
                   type: 'decoration-layer' as TreeNodeType,
@@ -822,6 +831,7 @@ export function LayerControl({
               ] : []),
               ...orderWithIds(layerOrder?.mapinfo, layerFiles.map(f => f.id))
                 .map(id => layerFiles.find(f => f.id === id)!)
+                .filter(file => matchName(file.name))
                 .map(file => ({
                 id: file.id,
                 type: 'layer-file' as TreeNodeType,
@@ -840,11 +850,12 @@ export function LayerControl({
             id: 'custom-group',
             type: 'custom-group' as TreeNodeType,
             label: t('map.geoData'),
-            expanded: isExpanded('custom-group', true),
+            expanded: hasQuery || isExpanded('custom-group', true),
             children: [
               // pointFiles 按面板拖拽顺序排列，为每个文件添加标签子项
               ...orderWithIds(layerOrder?.geodata, pointFiles.map(f => f.id))
                 .map(id => pointFiles.find(f => f.id === id)!)
+                .filter(file => matchName(file.name))
                 .map(file => {
                 console.log('[LayerControl] 处理点文件:', {
                   id: file.id,
@@ -884,7 +895,7 @@ export function LayerControl({
   // 当外部数据变化时更新树（layerOrder 变化也需重建以应用拖拽排序）
   useEffect(() => {
     setTree(buildTree())
-  }, [sectors, layerFiles, pointFiles, mapType, sectorLabelVisibility, layerFileLabelVisibility, pointFileLabelVisibility, frequencies, customLayers, decorationLayer, layerOrder])
+  }, [sectors, layerFiles, pointFiles, mapType, sectorLabelVisibility, layerFileLabelVisibility, pointFileLabelVisibility, frequencies, customLayers, decorationLayer, layerOrder, layerSearch])
 
   // ===== 类内拖拽排序 =====
   const [draggingLayer, setDraggingLayer] = useState<{ category: LayerCategory; layerId: string } | null>(null)
@@ -1734,9 +1745,55 @@ export function LayerControl({
               flexShrink: 0
             }}
           >
-            <span style={{ fontWeight: 600, fontSize: '12px', color: 'hsl(var(--foreground))', pointerEvents: 'none' }}>
-              {t('map.layers')}
-            </span>
+            <div
+              style={{ display: 'flex', alignItems: 'center', gap: '6px', flex: '1 1 auto', minWidth: 0 }}
+              onPointerDown={(e) => e.stopPropagation()}
+            >
+              {/* 搜索框：只过滤「图层文件」「地理化数据」组内的图层名 */}
+              <div style={{ position: 'relative', flex: '0 0 92px', minWidth: 0 }}>
+                <Search
+                  size={12}
+                  style={{
+                    position: 'absolute',
+                    left: '6px',
+                    top: '50%',
+                    transform: 'translateY(-50%)',
+                    color: 'hsl(var(--muted-foreground))',
+                    pointerEvents: 'none'
+                  }}
+                />
+                <input
+                  type="search"
+                  value={layerSearch}
+                  onChange={(e) => setLayerSearch(e.target.value)}
+                  placeholder={t('map.searchLayers') || '搜索'}
+                  aria-label={t('map.searchLayers') || '搜索'}
+                  style={{
+                    width: '100%',
+                    height: '22px',
+                    padding: '0 6px 0 20px',
+                    fontSize: '11px',
+                    color: 'hsl(var(--foreground))',
+                    backgroundColor: 'hsl(var(--muted))',
+                    border: '1px solid hsl(var(--border))',
+                    borderRadius: '4px',
+                    outline: 'none',
+                    boxSizing: 'border-box'
+                  }}
+                />
+              </div>
+              <span
+                style={{
+                  fontWeight: 600,
+                  fontSize: '12px',
+                  color: 'hsl(var(--foreground))',
+                  pointerEvents: 'none',
+                  whiteSpace: 'nowrap'
+                }}
+              >
+                {t('map.layers')}
+              </span>
+            </div>
             <button
               type="button"
               onClick={(e) => { e.stopPropagation(); setExpanded(false) }}
@@ -1848,7 +1905,7 @@ export function LayerControl({
           }}
           onClick={(e) => e.stopPropagation()}
         >
-          {(contextMenu.type === 'layer-file' || contextMenu.type === 'sector-layer' || contextMenu.type === 'decoration-layer') && (
+          {(contextMenu.type === 'layer-file' || contextMenu.type === 'sector-layer' || contextMenu.type === 'decoration-layer' || contextMenu.type === 'custom-layer') && (
             <>
               {/* 自定义设置（装饰图层无此入口：其样式统一在工具栏「样式」面板配置） */}
               {(contextMenu.type === 'layer-file' || contextMenu.type === 'sector-layer') && (
@@ -1903,6 +1960,20 @@ export function LayerControl({
               >
                 <Maximize2 size={14} />
                 <span>{t('map.layerPreview')}</span>
+              </button>
+              {/* 刷新：重新拉取并重建该图层（图层文件 / 地理化数据） */}
+              <button
+                onClick={() => {
+                  onLayerRefresh?.(contextMenu.nodeId)
+                  setContextMenu(null)
+                }}
+                style={menuItemStyle}
+                onMouseEnter={(e) => (e.currentTarget.style.backgroundColor = 'hsl(var(--accent))')}
+                onMouseLeave={(e) => (e.currentTarget.style.backgroundColor = 'transparent')}
+                title={t('map.refreshLayerHint')}
+              >
+                <RefreshCw size={14} />
+                <span>{t('map.refreshLayer')}</span>
               </button>
             </>
           )}

@@ -1706,7 +1706,6 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
 
   useImperativeHandle(ref, (): OnlineMapRef => {
     const noop = () => {}
-    const noopAsync = () => Promise.resolve()
     return {
       flyTo: (latLng, zoom) => {
         const viewer = viewerRef.current
@@ -1741,7 +1740,12 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
       setSectorLabelVisibility: noop,
       setPointFileLabelVisibility: noop,
       setMapInfoLayerVisibility: noop,
-      refreshLayerData: noopAsync,
+      refreshLayerData: async (layerId) => {
+        // 丢弃该图层缓存后重建：非 Excel 源由 syncGeoJsonLayers 按缺缓存重新拉取，
+        // Excel 地理化数据本身每次都走 dataApi.get
+        useMapDataCacheStore.getState().invalidateLayer(layerId)
+        await syncGeoJsonLayers()
+      },
       setMapType: (type) => {
         // 3D 底图在高德卫星 / 高德矢量之间切换；注记层随之切换（见上方底图与注记的 effect）。
         // 这里只改"期望类型"再触发重建 —— 不再 removeAll（那会把热力面等 imagery 层一起清掉）

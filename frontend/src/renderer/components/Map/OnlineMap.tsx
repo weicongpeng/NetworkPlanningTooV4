@@ -1602,7 +1602,8 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
     // 否则关闭"编辑"开关后属性框/标签仍显示保存前的旧值（内存中旧数据）。
     refreshLayerData: async (layerId, fresh) => {
       const map = mapInstanceRef.current
-      const file = layerFiles.find((f) => f.id === layerId)
+      // 图层文件与地理化数据都可能在图层控制面板里点“刷新”
+      const file = [...layerFiles, ...pointFiles].find((f) => f.id === layerId)
       if (!map || !file) return
       try {
         // 1) 缓存处理：有最新数据（编辑工作集）则直接以之替换缓存，避免保存后再下载整层
@@ -1618,6 +1619,10 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
           try { oldRef.mapInfoLayer.remove(map) } catch { /* ignore */ }
           mapInfoLayerRefsRef.current.delete(layerId)
         }
+        // 地理化数据（点/扇区/面）由 GeoDataLayerManager 持有，必须一并拆掉
+        try { geoDataLayerManagerRef.current?.removeLayer(layerId) } catch { /* ignore */ }
+        // Excel 地理化数据另有一层预取缓存，不清会立刻拿旧数据重建
+        prefetchedExcelDataRef.current.delete(layerId)
         loadedMapInfoLayersRef.current.delete(layerId)
         getHeatmapManager().remove(layerId)
         // 3) 重新构建（先按不可见加载，避免编辑态下与编辑会话层重叠显示）
