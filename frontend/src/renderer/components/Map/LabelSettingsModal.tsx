@@ -423,6 +423,12 @@ interface LabelSettingsModalProps {
   loadingThematicSamples?: boolean
   /** 打开弹窗时颜色设置页的初始子页（默认基础配置） */
   initialColorSubTab?: 'basic' | 'thematic' | 'heatmap'
+  /**
+   * 弹窗模式：
+   * - full（默认）：完整设置（标签设置 / 图形设置〔基础+专题+热力〕）
+   * - thematic：「专题渲染」——只保留专题图层 / 热力图两个配置页（右键菜单与图例双击入口）
+   */
+  mode?: 'full' | 'thematic'
   /** 图层几何类型（决定"图形大小"设置的语义：点→图形大小 / 面→边框宽度 / 线→线宽） */
   thematicGeometryType?: 'point' | 'line' | 'polygon' | 'sector'
   /** 扇区图层颜色模式：默认设置按频点区分颜色，不提供图形颜色/边框颜色设置项，仅保留透明度/边框宽度 */
@@ -838,6 +844,7 @@ export function LabelSettingsModal({
   thematicFieldSamples = {},
   loadingThematicSamples = false,
   initialColorSubTab = 'basic',
+  mode = 'full',
   thematicGeometryType = 'point',
   sectorColorMode = false,
   thematicTemplates = [],
@@ -1698,7 +1705,8 @@ export function LabelSettingsModal({
     >
       {/* 内容区 - 固定高度内滚动 */}
       <div className="flex-1 overflow-y-auto min-h-0 px-5 pt-4 pb-2">
-        {/* 标签页切换 */}
+        {/* 标签页切换（「专题渲染」模式只保留专题页，隐藏顶层 tab） */}
+        {mode === 'full' && (
         <div className="flex gap-1 mb-4 p-1 bg-muted/60 rounded-lg">
           <button
             type="button"
@@ -1721,6 +1729,7 @@ export function LabelSettingsModal({
             {t('map.colorSettings')}
           </button>
         </div>
+        )}
 
         {/* ===== 标签设置页 ===== */}
         {activeTab === 'label' && (
@@ -1874,19 +1883,22 @@ export function LabelSettingsModal({
         {/* ===== 图层颜色设置页 ===== */}
         {activeTab === 'color' && (
           <>
-            {/* 子页切换：基础配置 / 专题图层（图层文件类与扇区类） */}
+            {/* 子页切换：基础配置 / 专题图层（图层文件类与扇区类）。
+                「专题渲染」模式（mode='thematic'）只保留专题图层/热力图两项 */}
             {showThematicTab && (
               <div className="flex gap-1 mb-4 p-1 bg-muted/60 rounded-lg">
-                <button
-                  type="button"
-                  onClick={() => setColorSubTab('basic')}
-                  className={`flex-1 px-3 py-1.5 text-xs rounded-md transition-colors font-medium ${colorSubTab === 'basic'
-                    ? 'bg-background text-primary shadow-sm border border-border'
-                    : 'text-muted-foreground hover:text-foreground'
-                    }`}
-                >
-                  {sectorColorMode ? t('map.defaultSettings') : t('map.thematicBasicTab')}
-                </button>
+                {mode !== 'thematic' && (
+                  <button
+                    type="button"
+                    onClick={() => setColorSubTab('basic')}
+                    className={`flex-1 px-3 py-1.5 text-xs rounded-md transition-colors font-medium ${colorSubTab === 'basic'
+                      ? 'bg-background text-primary shadow-sm border border-border'
+                      : 'text-muted-foreground hover:text-foreground'
+                      }`}
+                  >
+                    {sectorColorMode ? t('map.defaultSettings') : t('map.thematicBasicTab')}
+                  </button>
+                )}
                 <button
                   type="button"
                   onClick={() => setColorSubTab('thematic')}

@@ -1069,6 +1069,8 @@
     "thematicTemplateApply": "选择已保存的模板应用…",
     "thematicTemplateDelete": "删除模板",
     "customSettings": "自定义设置",
+    "settings": "设置",
+    "thematicRender": "专题渲染",
     "layerPreview": "显示全部",
     "layerPreviewHint": "居中并最大化显示该图层全部要素",
     "layerPreviewDisabledHint": "请先勾选该图层后再显示全部",

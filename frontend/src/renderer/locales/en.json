@@ -1135,6 +1135,8 @@
     "thematicTemplateApply": "Apply a saved template…",
     "thematicTemplateDelete": "Delete Template",
     "customSettings": "Custom Settings",
+    "settings": "Settings",
+    "thematicRender": "Thematic Rendering",
     "layerPreview": "Show All",
     "layerPreviewHint": "Center and maximize all features of this layer",
     "layerPreviewDisabledHint": "Check the layer first to show all",

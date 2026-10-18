@@ -10,7 +10,7 @@
  * - 右键菜单支持标签设置
  */
 import { useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo } from 'react'
-import { ChevronDown, ChevronRight, Map, Folder, File, X, Satellite, Radio, MapPin, Route, Hexagon, Settings, Maximize2, MousePointer2, Pencil, Type, Layers, Search, RefreshCw } from 'lucide-react'
+import { ChevronDown, ChevronRight, Map, Folder, File, X, Satellite, Radio, MapPin, Route, Hexagon, Settings, MousePointer2, Pencil, Type, Layers, Search, RefreshCw, Palette } from 'lucide-react'
 import { HexColorPicker } from 'react-colorful'
 import { useTranslation } from 'react-i18next'
 import { NetworkType } from '../../config/sector-config'
@@ -496,6 +496,8 @@ export function LayerControl({
   const [loadingThematicSamples, setLoadingThematicSamples] = useState(false)
   // 颜色设置页初始子页（图例双击跳转时打开专题图层页）
   const [modalInitialSubTab, setModalInitialSubTab] = useState<'basic' | 'thematic' | 'heatmap' | undefined>(undefined)
+  // 设置弹窗模式：full=完整设置（标签/图形），thematic=专题渲染（仅专题图层/热力图）
+  const [settingsMode, setSettingsMode] = useState<'full' | 'thematic'>('full')
   // 专题字段样本缓存（避免重复提取同一图层）
   const thematicSamplesCacheRef = useRef<Record<string, Record<string, any[]>>>({})
 
@@ -1185,35 +1187,24 @@ export function LayerControl({
   /**
    * 判断图层文件是否已勾选可见（图层预览菜单可用性）
    */
-  const isFileVisible = (fileId: string): boolean => {
-    return [...layerFiles, ...pointFiles].some(f => f.id === fileId && f.visible)
-  }
 
   /**
    * 判断扇区图层是否已勾选可见（图层预览菜单可用性）
    */
-  const isSectorVisible = (layerId: string): boolean => {
-    return sectors.some(s => s.id === layerId && s.visible)
-  }
-
-  /**
-   * "图层预览"菜单可用性：装饰图层恒显（无可关闭开关），扇区/图层文件需已勾选
-   */
-  const previewMenuEnabled = contextMenu
-    ? (contextMenu.type === 'decoration-layer'
-      ? true
-      : contextMenu.type === 'sector-layer'
-        ? isSectorVisible(contextMenu.nodeId)
-        : isFileVisible(contextMenu.nodeId))
-    : false
 
   /**
    * 打开图层设置弹窗（右键 / 图例双击跳转共用）
    * @param node 目标图层节点
    * @param tab 初始标签页
    * @param subTab 颜色设置页初始子页（'thematic' 表示专题图层页）
+   * @param mode 弹窗模式：full=完整设置；thematic=专题渲染（仅专题图层/热力图两个配置页）
    */
-  const openSettingsDialog = (node: TreeNode, tab: 'label' | 'color', subTab?: 'basic' | 'thematic' | 'heatmap') => {
+  const openSettingsDialog = (
+    node: TreeNode,
+    tab: 'label' | 'color',
+    subTab?: 'basic' | 'thematic' | 'heatmap',
+    mode: 'full' | 'thematic' = 'full',
+  ) => {
     // 支持 sector-layer 和 layer-file 的标签设置
     if (node.type === 'sector-layer' || node.type === 'layer-file') {
       // 先立即显示对话框
@@ -1221,6 +1212,7 @@ export function LayerControl({
       setCurrentSettingsNode(node)
       setActiveTab(tab)
       setModalInitialSubTab(subTab)
+      setSettingsMode(mode)
 
       // 获取图层ID用于加载已保存的设置
       let layerId = ''
@@ -1459,6 +1451,9 @@ export function LayerControl({
   useEffect(() => {
     if (!openThematicFor) return
     const layerId = openThematicFor.layerId
+    // 基础图形图例 → 完整设置弹窗；专题/热力图例 → 专题渲染弹窗（仅两项配置页）
+    const subTab = openThematicFor.subTab ?? 'thematic'
+    const mode: 'full' | 'thematic' = subTab === 'basic' ? 'full' : 'thematic'
     // 扇区图层（基站 LTE/NR）
     const sector = sectors.find(s => s.id === layerId)
     if (sector) {
@@ -1469,14 +1464,14 @@ export function LayerControl({
         sectorLayer: sector,
         sectorLabel: { layerId: sector.id, visible: sectorLabelVisibility[sector.id] || false }
       }
-      openSettingsDialog(node, 'color', openThematicFor.subTab ?? 'thematic')
+      openSettingsDialog(node, 'color', subTab, mode)
       return
     }
     // 图层文件 / 地理化数据
     const file = [...layerFiles, ...pointFiles].find(f => f.id === layerId)
     if (!file) return
     const node: TreeNode = { id: file.id, type: 'layer-file', label: file.name, layerFile: file }
-    openSettingsDialog(node, 'color', openThematicFor.subTab ?? 'thematic')
+    openSettingsDialog(node, 'color', subTab, mode)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [openThematicFor])
 
@@ -1854,6 +1849,8 @@ export function LayerControl({
                 decorationLabelVisible={decorationLabelVisible}
                 decorationLockedHint={t('map.decorationLayerLockedHint') || '装饰图层常显，不可关闭'}
                 onContextMenu={handleContextMenu}
+                onLayerPreview={onLayerPreview}
+                layerPreviewHint={t('map.layerPreviewHint') || ''}
                 mapType={mapType}
                 pointFileLabelVisibility={pointFileLabelVisibility}
                 layerFileLabelVisibility={layerFileLabelVisibility}
@@ -1907,7 +1904,7 @@ export function LayerControl({
         >
           {(contextMenu.type === 'layer-file' || contextMenu.type === 'sector-layer' || contextMenu.type === 'decoration-layer' || contextMenu.type === 'custom-layer') && (
             <>
-              {/* 自定义设置（装饰图层无此入口：其样式统一在工具栏「样式」面板配置） */}
+              {/* 设置（装饰图层无此入口：其样式统一在工具栏「样式」面板配置） */}
               {(contextMenu.type === 'layer-file' || contextMenu.type === 'sector-layer') && (
                 <button
                   onClick={() => {
@@ -1921,13 +1918,13 @@ export function LayerControl({
                           sectorLayer: sector,
                           sectorLabel: { layerId: sector.id, visible: sectorLabelVisibility[sector.id] || false }
                         }
-                        openSettingsDialog(treeNode, 'label')
+                        openSettingsDialog(treeNode, 'label', undefined, 'full')
                       }
                     } else {
                       const node = [...layerFiles, ...pointFiles].find(f => f.id === contextMenu.nodeId)
                       if (node) {
                         const treeNode: TreeNode = { id: node.id, type: 'layer-file', label: node.name, layerFile: node }
-                        openSettingsDialog(treeNode, 'label')
+                        openSettingsDialog(treeNode, 'label', undefined, 'full')
                       }
                     }
                     setContextMenu(null)
@@ -1937,31 +1934,44 @@ export function LayerControl({
                   onMouseLeave={(e) => (e.currentTarget.style.backgroundColor = 'transparent')}
                 >
                   <Settings size={14} />
-                  <span>{t('map.customSettings')}</span>
+                  <span>{t('map.settings')}</span>
                 </button>
               )}
-              {/* 图层预览：仅已勾选图层支持（装饰图层恒显，始终可用） */}
-              <button
-                onClick={() => {
-                  onLayerPreview?.(contextMenu.nodeId)
-                  setContextMenu(null)
-                }}
-                disabled={!previewMenuEnabled}
-                style={{
-                  ...menuItemStyle,
-                  opacity: previewMenuEnabled ? 1 : 0.45,
-                  cursor: previewMenuEnabled ? 'pointer' : 'not-allowed'
-                }}
-                onMouseEnter={(e) => {
-                  if (previewMenuEnabled) e.currentTarget.style.backgroundColor = 'hsl(var(--accent))'
-                }}
-                onMouseLeave={(e) => (e.currentTarget.style.backgroundColor = 'transparent')}
-                title={previewMenuEnabled ? t('map.layerPreviewHint') : t('map.layerPreviewDisabledHint')}
-              >
-                <Maximize2 size={14} />
-                <span>{t('map.layerPreview')}</span>
-              </button>
-              {/* 刷新：重新拉取并重建该图层（图层文件 / 地理化数据） */}
+              {/* 专题渲染：仅专题图层/热力图两项配置页（原「图形设置」下的两项迁移至此） */}
+              {(contextMenu.type === 'layer-file' || contextMenu.type === 'sector-layer') && (
+                <button
+                  onClick={() => {
+                    if (contextMenu.type === 'sector-layer') {
+                      const sector = sectors.find(s => s.id === contextMenu.nodeId)
+                      if (sector) {
+                        const treeNode: TreeNode = {
+                          id: sector.id,
+                          type: 'sector-layer',
+                          label: sector.type === 'LTE' ? 'LTE' : 'NR',
+                          sectorLayer: sector,
+                          sectorLabel: { layerId: sector.id, visible: sectorLabelVisibility[sector.id] || false }
+                        }
+                        openSettingsDialog(treeNode, 'color', 'thematic', 'thematic')
+                      }
+                    } else {
+                      const node = [...layerFiles, ...pointFiles].find(f => f.id === contextMenu.nodeId)
+                      if (node) {
+                        const treeNode: TreeNode = { id: node.id, type: 'layer-file', label: node.name, layerFile: node }
+                        openSettingsDialog(treeNode, 'color', 'thematic', 'thematic')
+                      }
+                    }
+                    setContextMenu(null)
+                  }}
+                  style={menuItemStyle}
+                  onMouseEnter={(e) => (e.currentTarget.style.backgroundColor = 'hsl(var(--accent))')}
+                  onMouseLeave={(e) => (e.currentTarget.style.backgroundColor = 'transparent')}
+                >
+                  <Palette size={14} />
+                  <span>{t('map.thematicRender')}</span>
+                </button>
+              )}
+              {/* 刷新：重新拉取并重建该图层（图层文件 / 地理化数据）。 */}
+              {/* 原「显示全部」（居中并最大化显示该图层全部要素）改为双击图层文件名触发 */}
               <button
                 onClick={() => {
                   onLayerRefresh?.(contextMenu.nodeId)
@@ -1999,7 +2009,14 @@ export function LayerControl({
         isOpen={showLabelSettingsModal}
         onClose={() => setShowLabelSettingsModal(false)}
         onSave={handleSaveLabelSettings}
-        title={currentSettingsNode?.type === 'sector-layer' ? t('map.customSettings') : t('map.layerFileLabelSettings')}
+        mode={settingsMode}
+        title={
+          settingsMode === 'thematic'
+            ? t('map.thematicRender')
+            : currentSettingsNode?.type === 'sector-layer'
+              ? t('map.customSettings')
+              : t('map.layerFileLabelSettings')
+        }
         currentSettings={currentLabelSettings}
         fieldOptions={fieldOptions}
         loadingFields={loadingFields}
@@ -2060,6 +2077,10 @@ interface TreeNodeComponentProps {
   /** 装饰图层复选框锁定提示（恒显不可关闭） */
   decorationLockedHint?: string;
   onContextMenu: (e: React.MouseEvent, node: TreeNode) => void;
+  /** 双击图层文件名：显示全部（居中并最大化显示该图层全部要素，原右键菜单功能迁移） */
+  onLayerPreview?: (fileId: string) => void;
+  /** 双击"显示全部"的悬停提示文案（TreeNodeComponent 不接 i18n，由父组件传入） */
+  layerPreviewHint?: string;
   mapType: 'roadmap' | 'satellite';
   pointFileLabelVisibility: Record<string, boolean>;
   layerFileLabelVisibility: Record<string, boolean>;
@@ -2114,6 +2135,8 @@ function TreeNodeComponent({
   decorationLabelVisible,
   decorationLockedHint,
   onContextMenu,
+  onLayerPreview,
+  layerPreviewHint = '',
   mapType,
   pointFileLabelVisibility,
   layerFileLabelVisibility,
@@ -2343,7 +2366,18 @@ function TreeNodeComponent({
 
         {/* 节点标签 */}
         <span
-          title={node.label}
+          title={
+            node.type === 'layer-file' && node.layerFile && node.layerFile.visible && layerPreviewHint
+              ? `${node.label}（${layerPreviewHint}）`
+              : node.label
+          }
+          onDoubleClick={(e) => {
+            // 双击图层文件名 = 显示全部（原右键菜单「显示全部」迁移至此）
+            if (node.type === 'layer-file' && node.layerFile && node.layerFile.visible) {
+              e.stopPropagation()
+              onLayerPreview?.(node.id)
+            }
+          }}
           style={{
             flex: 1,
             color: 'hsl(var(--foreground))',
@@ -2527,6 +2561,8 @@ function TreeNodeComponent({
               decorationLabelVisible={decorationLabelVisible}
               decorationLockedHint={decorationLockedHint}
               onContextMenu={onContextMenu}
+              onLayerPreview={onLayerPreview}
+              layerPreviewHint={layerPreviewHint}
               mapType={mapType}
               pointFileLabelVisibility={pointFileLabelVisibility}
               layerFileLabelVisibility={layerFileLabelVisibility}
