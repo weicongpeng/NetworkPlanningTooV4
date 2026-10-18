@@ -1197,6 +1197,10 @@ export class SectorSVGLayer extends L.Layer {
     let has = false
     for (const sector of this.sectors) {
       if (typeof sector.displayLat !== 'number' || typeof sector.displayLng !== 'number') continue
+      // 工参解析失败的行经纬度默认 (0,0)（落在几内亚湾，视野内不可见）：
+      // 并入 bounds 会把"显示全部"的视野拉到印度洋，必须按无效坐标剔除
+      if ((sector.displayLat === 0 && sector.displayLng === 0)
+        || Math.abs(sector.displayLng) > 180 || Math.abs(sector.displayLat) > 90) continue
       bounds.extend([sector.displayLat, sector.displayLng])
       has = true
     }

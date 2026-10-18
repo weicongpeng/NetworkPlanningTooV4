@@ -1858,6 +1858,10 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
         if (fileId === 'lte-sectors' || fileId === 'nr-sectors') {
           const key: LayerKey = fileId === 'lte-sectors' ? 'lte' : 'nr'
           for (const s of sectorLayersRef.current[key]?.getAllSectors() ?? []) {
+            // 工参解析失败的行经纬度默认 (0,0)：并入 bounds 会把"显示全部"的
+            // 视野拉到印度洋（Rectangle 覆盖非洲-印度洋-亚洲），按无效坐标剔除
+            if ((s.originalLat === 0 && s.originalLng === 0)
+              || Math.abs(s.originalLng) > 180 || Math.abs(s.originalLat) > 90) continue
             extendBoundsWithPoint(b, s.originalLng, s.originalLat)
           }
         } else if (fileId === 'decoration-layer') {
