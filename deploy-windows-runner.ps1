@@ -36,6 +36,30 @@ if (-not $isAdmin) {
 
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
+# 自托管 Windows Runner 是干净系统：补齐 workflow 依赖的 git / Chocolatey / Inno Setup。
+# Node、Python 由 actions/setup-node、setup-python 在 job 内安装，无需预装。
+function Ensure-Choco {
+  if (Get-Command choco.exe -ErrorAction SilentlyContinue) { return }
+  Write-Host "安装 Chocolatey ..."
+  Set-ExecutionPolicy Bypass -Scope Process -Force
+  Invoke-Expression ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
+  $env:Path += ";$env:ProgramData\chocolatey\bin"
+}
+
+Ensure-Choco
+if (-not (Get-Command git.exe -ErrorAction SilentlyContinue)) {
+  Write-Host "安装 Git ..."
+  choco install git -y --no-progress
+  if ($LASTEXITCODE -ne 0) { throw "Git 安装失败，退出码 $LASTEXITCODE" }
+  $env:Path += ";C:\Program Files\Git\cmd"
+}
+if (-not (Test-Path "C:\Program Files (x86)\Inno Setup 6\ISCC.exe")) {
+  Write-Host "安装 Inno Setup 6 ..."
+  choco install innosetup -y --no-progress
+  if ($LASTEXITCODE -ne 0) { throw "Inno Setup 安装失败，退出码 $LASTEXITCODE" }
+}
+git config --system core.longpaths true 2>$null
+
 $zipName = "actions-runner-win-x64-$Version.zip"
 $zipPath = Join-Path $Root $zipName
 $expectedHash = "1150692AFA94E71F872017E254EA55B6EECE1EECE3FE7E3A6D4C93D0A1B85CFC"
