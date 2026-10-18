@@ -2149,6 +2149,8 @@ function TreeNodeComponent({
 }: TreeNodeComponentProps) {
   // 长按拖动排序时的光标态（悬停保持默认光标，拖动中才变"移动中"光标）
   const [isRowDragging, setIsRowDragging] = useState(false)
+  // 基站 LTE/NR 标签单击展开下一级的延时器（延时执行以与双击"显示全部"区分）
+  const labelClickTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   // 该节点所属图层类别（custom-layer 不参与圈选/排序，返回 null）
   const layerCategory: LayerCategory | null = (() => {
     if (node.type === 'sector-layer') return 'sector'
@@ -2367,12 +2369,32 @@ function TreeNodeComponent({
         {/* 节点标签 */}
         <span
           title={
-            node.type === 'layer-file' && node.layerFile && node.layerFile.visible && layerPreviewHint
+            (node.type === 'layer-file' && node.layerFile && node.layerFile.visible
+              || node.type === 'sector-layer' && node.sectorLayer) && layerPreviewHint
               ? `${node.label}（${layerPreviewHint}）`
               : node.label
           }
+          onClick={(e) => {
+            // 基站 LTE/NR 标签单击 = 展开下一级（延时执行，双击时取消）。
+            // 双击的第二次 click（detail=2）也要拦截冒泡：否则行 handleClick 会误展开
+            if (node.type === 'sector-layer' && node.sectorLayer) {
+              e.stopPropagation()
+              if (e.detail !== 1 || !isExpandable) return
+              if (labelClickTimerRef.current) clearTimeout(labelClickTimerRef.current)
+              labelClickTimerRef.current = setTimeout(() => {
+                labelClickTimerRef.current = null
+                onToggle(node.id)
+              }, 240)
+            }
+          }}
           onDoubleClick={(e) => {
-            // 双击图层文件名 = 显示全部（原右键菜单「显示全部」迁移至此）
+            // 双击基站 LTE/NR / 图层文件名 = 显示全部（原右键菜单「显示全部」迁移至此）
+            if (node.type === 'sector-layer' && node.sectorLayer) {
+              e.stopPropagation()
+              if (labelClickTimerRef.current) { clearTimeout(labelClickTimerRef.current); labelClickTimerRef.current = null }
+              onLayerPreview?.(node.id)
+              return
+            }
             if (node.type === 'layer-file' && node.layerFile && node.layerFile.visible) {
               e.stopPropagation()
               onLayerPreview?.(node.id)
