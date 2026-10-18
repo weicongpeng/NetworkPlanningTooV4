@@ -1749,6 +1749,17 @@ export function LayerControl({
               style={{ display: 'flex', alignItems: 'center', gap: '6px', flex: '1 1 auto', minWidth: 0 }}
               onPointerDown={(e) => e.stopPropagation()}
             >
+              <span
+                style={{
+                  fontWeight: 600,
+                  fontSize: '12px',
+                  color: 'hsl(var(--foreground))',
+                  pointerEvents: 'none',
+                  whiteSpace: 'nowrap'
+                }}
+              >
+                {t('map.layers')}
+              </span>
               {/* 搜索框：只过滤「图层文件」「地理化数据」组内的图层名 */}
               <div style={{ position: 'relative', flex: '0 0 92px', minWidth: 0 }}>
                 <Search
@@ -1782,17 +1793,6 @@ export function LayerControl({
                   }}
                 />
               </div>
-              <span
-                style={{
-                  fontWeight: 600,
-                  fontSize: '12px',
-                  color: 'hsl(var(--foreground))',
-                  pointerEvents: 'none',
-                  whiteSpace: 'nowrap'
-                }}
-              >
-                {t('map.layers')}
-              </span>
             </div>
             <button
               type="button"
