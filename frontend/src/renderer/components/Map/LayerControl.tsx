@@ -2902,6 +2902,15 @@ function FrequencyCheckbox({ frequency, onToggle, networkType, onColorChange, co
 
   return (
     <div style={{ display: 'flex', alignItems: 'center', gap: '8px', position: 'relative' }}>
+      {/* 标准复选框（在色块左侧） */}
+      <StandardCheckbox
+        checked={isChecked}
+        onChange={(checked) => {
+          setIsChecked(checked);
+          onToggle(checked);
+        }}
+      />
+
       {/* 颜色方块 - 优化样式；默认设置模式下可点击进入配色面板 */}
       <div
         onClick={(e) => {
@@ -2918,15 +2927,6 @@ function FrequencyCheckbox({ frequency, onToggle, networkType, onColorChange, co
           borderRadius: '4px',
           boxShadow: '0 1px 2px rgba(0, 0, 0, 0.1)',
           cursor: canPickColor ? 'pointer' : 'default'
-        }}
-      />
-
-      {/* 标准复选框 */}
-      <StandardCheckbox
-        checked={isChecked}
-        onChange={(checked) => {
-          setIsChecked(checked);
-          onToggle(checked);
         }}
       />
 
