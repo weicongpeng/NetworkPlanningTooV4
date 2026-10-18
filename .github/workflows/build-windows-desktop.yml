@@ -15,7 +15,9 @@ permissions:
 
 jobs:
   build-windows:
-    runs-on: windows-latest
+    # 自托管 Windows Runner 上线后，在仓库 Variables 设置 NPT_WINDOWS_RUNNER=npt-windows-builder；
+    # 未设置时保持 GitHub 托管 windows-latest（托管 runner 受账户 Actions 配额限制）。
+    runs-on: ${{ vars.NPT_WINDOWS_RUNNER || 'windows-latest' }}
     env:
       # CI 阶段保留控制台输出便于诊断（冒烟自检可见）；tag 发行会用 NPT_CONSOLE=0 重新打包，
       # 保证装到用户机器上的 NPT.exe 不带终端窗口
