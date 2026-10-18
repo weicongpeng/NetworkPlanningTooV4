@@ -420,25 +420,6 @@ export function LayerControl({
   const persistedThematicSettings = thematicSettingsMap ?? mapSettings.thematicSettingsMap ?? {}
   const persistedHeatmapSettings = heatmapSettingsMap ?? mapSettings.heatmapSettingsMap ?? {}
 
-  /**
-   * 打开自定义设置弹框时的状态快照（实时预览会改写 store/地图，取消时据此恢复）。
-   * 各类设置记录"打开时实际生效值"（含未持久化的默认值），可见性按节点类型记录。
-   */
-  interface SettingsSnapshot {
-    node: TreeNode
-    layerId: string
-    label: LabelSettings
-    color: LayerColorSettings
-    thematic: ThematicSettings | null
-    heatmap: HeatmapSettings | null
-    layerVisible: boolean
-    sectorVisible: boolean
-    sectorLabelVisible: boolean
-    pointLabelVisible: boolean | undefined
-    layerFileLabelVisible: boolean | undefined
-  }
-  const settingsSnapshotRef = useRef<SettingsSnapshot | null>(null)
-
   // 边界裁剪的可选面图层：图层文件（polygon + 可绘制面的 mixed 混合图层）
   // 与地理化数据中的面类型（两者都带来源标记供分别加载）
   const polygonLayers = useMemo(
@@ -1284,23 +1265,6 @@ export function LayerControl({
         extractThematicSamples(node)
       }
 
-      // 记录打开时快照（取消时恢复；可见性按节点类型从当前 props 收集）
-      const layerFile = [...layerFiles, ...pointFiles].find(f => f.id === layerId)
-      const sector = sectors.find(s => s.id === layerId)
-      settingsSnapshotRef.current = {
-        node,
-        layerId,
-        label: effectiveLabel,
-        color: effectiveColor,
-        thematic: effectiveThematic,
-        heatmap: effectiveHeatmap,
-        layerVisible: layerFile?.visible ?? true,
-        sectorVisible: sector?.visible ?? true,
-        sectorLabelVisible: sectorLabelVisibility[layerId] ?? false,
-        pointLabelVisible: pointFileLabelVisibility[layerId],
-        layerFileLabelVisible: layerFileLabelVisibility[layerId],
-      }
-
       // 异步加载字段选项（不阻塞对话框显示）
       if (node.type === 'sector-layer' && node.sectorLayer) {
         setFieldOptions(PREDEFINED_LABEL_FIELDS)
@@ -1587,35 +1551,10 @@ export function LayerControl({
   }
 
   /**
-   * 取消自定义设置：按打开时快照恢复四类设置（重新 apply 到 store/地图）与全部
-   * 图层/标签可见性，再关闭弹窗。设置恢复时 MapPage change handler 可能强制可见，
-   * 故可见性恢复放在设置之后，以快照为准。
+   * 取消/关闭弹窗：未保存的设置不会应用到地图或写入 store（无实时预览），
+   * 因此无需恢复状态，直接关闭弹窗即可。
    */
   const handleCancelSettings = () => {
-    const snap = settingsSnapshotRef.current
-    if (snap) {
-      handleSaveHeatmapSettings(snap.heatmap)
-      handleSaveThematicSettings(snap.thematic)
-      handleSaveColorSettings(snap.color)
-      handleSaveLabelSettings(snap.label)
-
-      if (snap.node.type === 'layer-file') {
-        onLayerFileToggle?.(snap.layerId, snap.layerVisible)
-        const inLayerFiles = layerFiles.some(f => f.id === snap.layerId)
-        if (inLayerFiles) {
-          if (snap.layerFileLabelVisible !== undefined) {
-            onLayerFileLabelToggle?.(snap.layerId, snap.layerFileLabelVisible)
-          }
-        } else {
-          // Excel 地理化点文件标签开关；打开前无记录时按 false 恢复（=不显示）
-          onPointFileLabelToggle?.(snap.layerId, snap.pointLabelVisible ?? false)
-        }
-      } else if (snap.node.type === 'sector-layer') {
-        onSectorToggle?.(snap.layerId, snap.sectorVisible)
-        onSectorLabelToggle?.(snap.layerId, snap.sectorLabelVisible)
-      }
-    }
-    settingsSnapshotRef.current = null
     setShowLabelSettingsModal(false)
   }
 
@@ -2004,7 +1943,10 @@ export function LayerControl({
         </div>
       )}
 
-      {/* 标签设置弹窗 */}
+      {/* 标签设置弹窗
+          注意：不传 onPreview* 实时预览回调——弹窗内改动未点"保存"前不得应用到地图
+          （此前把预览接到保存处理器，弹窗内改控件甚至打开弹窗后字段选项异步到达
+          触发程序化签名变化，都会把未保存的设置写入 store 并刷到地图上） */}
       <LabelSettingsModal
         isOpen={showLabelSettingsModal}
         onClose={() => setShowLabelSettingsModal(false)}
@@ -2031,10 +1973,6 @@ export function LayerControl({
         currentHeatmapSettings={currentHeatmapSettings}
         onSaveHeatmap={handleSaveHeatmapSettings}
         onCancel={handleCancelSettings}
-        onPreview={handleSaveLabelSettings}
-        onPreviewColor={handleSaveColorSettings}
-        onPreviewThematic={handleSaveThematicSettings}
-        onPreviewHeatmap={handleSaveHeatmapSettings}
         mapHeatmapStats={currentHeatmapStats}
         polygonLayers={polygonLayers}
         thematicFieldSamples={thematicFieldSamples}
