@@ -1243,8 +1243,8 @@ export function LabelSettingsModal({
       setPciRenderEnabled(currentColorSettings?.pciRenderEnabled ?? false)
       setPciMod(currentColorSettings?.pciMod ?? 3)
 
-      // 专题图层设置
-      setColorSubTab(initialColorSubTab)
+      // 专题图层设置：完整弹窗的图形设置只保留基础设置内容（专题/热力入口在「专题渲染」）
+      setColorSubTab(mode === 'full' ? 'basic' : initialColorSubTab)
       const ts = currentThematicSettings
       if (ts && ts.enabled) {
         setThematicEnabled(true)
@@ -1550,43 +1550,44 @@ export function LabelSettingsModal({
     if (activeTab === 'color') {
       // 互斥前置：专题图层与热力图不能同时开启。
       // 必须在任何 onSave 回调之前判断两个开关的最终状态——否则 onSaveThematic 先、
-      // onSaveHeatmap 后，分散在 LayerControl 各 handler 中检查会依赖调用顺序与 store
-      // 旧状态，在"关一个开另一个"时产生时序误判。冲突时不保存任何内容并提示。
-      if (showThematicTab && thematicEnabled && heatEnabled) {
-        useToastStore.getState().show(
-          colorSubTab === 'heatmap' ? t('map.conflictEnableHeatmap') : t('map.conflictEnableThematic')
-        )
-        return
-      }
-      // 热力图校验前置：启用但无可用数值字段/未选字段/选中字段为文本类时，阻断本次全部保存并提示
-      if (showThematicTab && heatEnabled) {
-        if (!loadingThematicSamples && hasFieldSamples && numericFieldOptions.length === 0) {
-          setHeatError(t('map.heatmapNoNumericFields'))
-          setColorSubTab('heatmap')
+      if (mode === 'thematic') {
+        // 「专题渲染」弹窗：保存前做专题/热力互斥与字段校验（UI 在本弹窗内，
+        // 冲突时不保存任何内容并提示；跳到出错子页让用户修正）
+        if (thematicEnabled && heatEnabled) {
+          useToastStore.getState().show(
+            colorSubTab === 'heatmap' ? t('map.conflictEnableHeatmap') : t('map.conflictEnableThematic')
+          )
           return
         }
-        if (!heatField) {
-          setHeatError(t('map.heatmapFieldRequired'))
-          setColorSubTab('heatmap')
-          return
+        if (heatEnabled) {
+          // 启用但无可用数值字段/未选字段/选中字段为文本类时，阻断本次全部保存并提示
+          if (!loadingThematicSamples && hasFieldSamples && numericFieldOptions.length === 0) {
+            setHeatError(t('map.heatmapNoNumericFields'))
+            setColorSubTab('heatmap')
+            return
+          }
+          if (!heatField) {
+            setHeatError(t('map.heatmapFieldRequired'))
+            setColorSubTab('heatmap')
+            return
+          }
+          // 样本就绪后所选字段被识别为文本类：阻断，避免存了文本字段导致渲染为空
+          // （基站图层清单与专题一致，含文本字段，因此这里必须逐字段校验；
+          //  覆盖类型/是否共享/厂家为展示别名，需映射回真实字段名后再查样本）
+          const heatSampleKey = sectorColorMode ? resolveSectorField(heatField) : heatField
+          if (!loadingThematicSamples && hasFieldSamples && detectFieldType(thematicFieldSamples[heatSampleKey]) === 'text') {
+            setHeatError(t('map.heatmapFieldNotNumeric'))
+            setColorSubTab('heatmap')
+            return
+          }
         }
-        // 样本就绪后所选字段被识别为文本类：阻断，避免存了文本字段导致渲染为空
-        // （基站图层清单与专题一致，含文本字段，因此这里必须逐字段校验；
-        //  覆盖类型/是否共享/厂家为展示别名，需映射回真实字段名后再查样本）
-        const heatSampleKey = sectorColorMode ? resolveSectorField(heatField) : heatField
-        if (!loadingThematicSamples && hasFieldSamples && detectFieldType(thematicFieldSamples[heatSampleKey]) === 'text') {
-          setHeatError(t('map.heatmapFieldNotNumeric'))
-          setColorSubTab('heatmap')
-          return
-        }
-      }
-      // 总是同时保存基础配置与专题配置（两套独立存储，互不覆盖）
-      onSaveColor?.(buildColorPayload())
-      if (showThematicTab) {
+        // 专题/热力两套独立存储，同时保存（互不覆盖；启用校验已在上面完成）
         onSaveThematic?.(buildThematicPayload())
-        // 热力图独立于专题保存（两者可共存；启用校验已在保存前完成）
         if (onSaveHeatmap) onSaveHeatmap(buildHeatmapPayload())
       }
+      // 完整设置弹窗只负责标签 + 基础图形：专题/热力配置已迁移至「专题渲染」，
+      // 这里不回写两者（保留已生效值），已同时激活的专题+热力也不阻断本弹窗保存
+      onSaveColor?.(buildColorPayload())
     } else {
       // 修复：确保content不为空字符串，如果为空则使用默认值
       const validContent = (content && content !== '')
@@ -1883,22 +1884,11 @@ export function LabelSettingsModal({
         {/* ===== 图层颜色设置页 ===== */}
         {activeTab === 'color' && (
           <>
-            {/* 子页切换：基础配置 / 专题图层（图层文件类与扇区类）。
-                「专题渲染」模式（mode='thematic'）只保留专题图层/热力图两项 */}
-            {showThematicTab && (
+            {/* 子页切换：完整设置弹窗的图形设置直接平铺基础设置内容（专题图层/热力图
+                已迁移至「专题渲染」），不显示子页切换条；「专题渲染」弹窗（mode='thematic'）
+                保留专题图层/热力图两个页签 */}
+            {showThematicTab && mode === 'thematic' && (
               <div className="flex gap-1 mb-4 p-1 bg-muted/60 rounded-lg">
-                {mode !== 'thematic' && (
-                  <button
-                    type="button"
-                    onClick={() => setColorSubTab('basic')}
-                    className={`flex-1 px-3 py-1.5 text-xs rounded-md transition-colors font-medium ${colorSubTab === 'basic'
-                      ? 'bg-background text-primary shadow-sm border border-border'
-                      : 'text-muted-foreground hover:text-foreground'
-                      }`}
-                  >
-                    {sectorColorMode ? t('map.defaultSettings') : t('map.thematicBasicTab')}
-                  </button>
-                )}
                 <button
                   type="button"
                   onClick={() => setColorSubTab('thematic')}
