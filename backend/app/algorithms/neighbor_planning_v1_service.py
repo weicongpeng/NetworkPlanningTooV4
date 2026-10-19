@@ -28,14 +28,29 @@ class RelationType(str, Enum):
     NR_NR = "NR-NR"
 
 
+# 源朝向闸门（度）：目标须在源天线方位角前向 ±120° 内才算覆盖可达。
+# 覆盖圆是各向同性圆、仅向天线方向偏移半径的一半，天线背后仍有约 0.28km
+# 覆盖范围，单靠圆相交会把背后 1km 内的"背打"小区误判为邻区；因此叠加朝向
+# 闸门——背后方向（偏角 > 120°）不靠覆盖圆/远端补足添加（300m 内强制邻区除外）。
+# 与 V2 参考实现 is_in_direction 的 max(beamwidth, 120°) 阈值一致。
+DIRECTION_GATE_DEG = 120.0
+
+
 @dataclass
 class NeighborConfig:
     """邻区规划配置"""
     source_type: str  # "LTE" 或 "NR"
     target_type: str  # "LTE" 或 "NR"
-    max_neighbors: int = 64  # 最大邻区数
+    max_neighbors: int = 64  # 最大邻区数（每频）
     coverage_distance_factor: float = 1.0  # 覆盖圆距离系数
     coverage_radius_factor: float = 1.0  # 覆盖圆半径系数
+    # 以下为前端可配置的场景门限（默认值=算法内部经验值）
+    dense_spacing_threshold_km: float = 1.0   # 密集/稀疏门限：平均站间距<该值为密集
+    dense_multiplier: float = 1.3             # 密集场景全量添加半径倍数
+    outdoor_to_indoor_max_km: float = 0.6     # 室外→室分最大距离（公里，600米）
+    indoor_to_indoor_radius_km: float = 0.35  # 室分→室分距离（公里，350米）
+    indoor_to_outdoor_multiplier: float = 1.5 # 室分→室外全量半径倍数
+    outdoor_spacing_site_count: int = 9       # 室外源站间距取最近N个室外站
 
 
 @dataclass
@@ -85,7 +100,14 @@ class NeighborPlanner:
         self.max_neighbors = config.max_neighbors
         self.coverage_distance_factor = config.coverage_distance_factor
         self.coverage_radius_factor = config.coverage_radius_factor
-        
+        # 前端可配置场景门限
+        self.dense_spacing_threshold_km = config.dense_spacing_threshold_km
+        self.dense_multiplier = config.dense_multiplier
+        self.outdoor_to_indoor_max_km = config.outdoor_to_indoor_max_km
+        self.indoor_to_indoor_radius_km = config.indoor_to_indoor_radius_km
+        self.indoor_to_outdoor_multiplier = config.indoor_to_outdoor_multiplier
+        self.outdoor_spacing_site_count = config.outdoor_spacing_site_count
+
         # 默认覆盖距离（米）
         self.default_coverage_distance = 1000.0
         
@@ -231,6 +253,16 @@ class NeighborPlanner:
         """计算两个方向角之间的差值（0-180度）"""
         diff = abs(azimuth1 - azimuth2)
         return min(diff, 360 - diff)
+
+    def calculate_forward_diff(self, src_lat: float, src_lon: float, src_azimuth: float,
+                               tgt_lat: float, tgt_lon: float) -> float:
+        """源天线方位角 与 源→目标方位角 的夹角（0-180度）。
+
+        值越小表示目标越处在源小区天线的主覆盖方向（对打/顺向）；
+        接近 180° 表示目标在源天线背后（背打）。
+        """
+        src_to_tgt_bearing = self.calculate_azimuth_angle(src_lat, src_lon, tgt_lat, tgt_lon)
+        return self.calculate_angle_difference(src_azimuth, src_to_tgt_bearing)
     
     def calculate_coverage_circle_center(self, lat: float, lon: float, azimuth: float,
                                         distance_factor: float, coverage_distance: float) -> Tuple[float, float]:
@@ -274,54 +306,69 @@ class NeighborPlanner:
                                   pointing_diff: Optional[float] = None,
                                   is_forward_cell: bool = False) -> float:
         """
-        计算邻区评分 - 评分越高优先级越高
+        计算邻区评分 - 评分越高优先级越高（评分仅用于同距离下的排序 tiebreak，
+        候选截断以距离优先）。
         主要考虑：
-        1. 对打邻区（主小区朝向的邻区）优先级更高
-        2. 距离越近评分越高
-        3. 方向角匹配度越好评分越高
+        1. 双向对打邻区（两小区天线互相朝向）优先级最高
+        2. 源小区天线正打向的目标（顺向）次之
+        3. 距离越近评分越高
 
         Args:
             distance: 距离（公里）
-            angle_diff: 角度差（已废弃，仅保留兼容性）
-            facing_diff: 主小区方位角与目标小区背向角度差（对打关系）
-            pointing_diff: 目标小区方位角与主小区方向的角度差（内向关系）
-            is_forward_cell: 是否为对打邻区（主小区朝向的邻区）
+            angle_diff: 角度差（min(facing, pointing)，强制邻区简单评分用）
+            facing_diff: 源天线方位角 与 源→目标方位角 的夹角（0=源正打目标）
+            pointing_diff: 目标天线方位角 与 目标→源方位角 的夹角（0=目标正打源）
+            is_forward_cell: 是否为双向对打（两小区天线互相朝向前向半球）
         """
         # 距离评分（距离越近分数越高）
         distance_score = max(0, 10 - distance)
 
         # 方向角评分
         if facing_diff is not None and pointing_diff is not None:
-            # 对打邻区（主小区朝向的目标小区）评分更高
-            # facing_diff: 目标小区背向与主小区方位角差（对打关系）
-            # pointing_diff: 目标小区朝向与主小区位置差（内向关系）
             if is_forward_cell:
-                # 对打邻区：优先考虑 facing_diff
-                angle_score = max(0, (180 - facing_diff) / 18)  # 0-10分
-                # 对打邻区额外加分
-                angle_score += 3
+                # 双向对打：两个朝向都要对上，取较差的偏角，额外加分
+                angle_score = max(0, (180 - max(facing_diff, pointing_diff)) / 18) + 3
             else:
-                # 内向邻区：考虑 pointing_diff，但评分打折
-                angle_score = max(0, (180 - pointing_diff) / 18) * 0.6  # 0-6分
+                # 非对打：主要看源天线是否打向目标（facing_diff 越小越正对），
+                # 背向源（facing_diff 大）角度分趋近 0
+                angle_score = max(0, (180 - facing_diff) / 18) * 0.8  # 0-8分
         elif angle_diff is not None:
             angle_score = max(0, (180 - angle_diff) / 18)  # 0-10分
         else:
             angle_score = 5  # 无方向角信息时给中等分
 
         return distance_score + angle_score
-    
+
+    @staticmethod
+    def _is_same_frequency(src_earfcn, tgt_earfcn) -> bool:
+        """判断源/目标小区是否同频（EARFCN/SSB 频点相同）。
+
+        任一侧频点缺失时按异频处理（更保守，避免同频类别超限）。
+        """
+        if src_earfcn is None or tgt_earfcn is None:
+            return False
+        try:
+            return int(src_earfcn) == int(tgt_earfcn)
+        except (ValueError, TypeError):
+            return False
+
     def get_cell_key(self, row: pd.Series) -> str:
         """获取小区唯一标识"""
         return f"{row['enodeb_id']}_{row['cell_id']}"
     
     def calculate_site_spacing(self, source_row: pd.Series) -> float:
         """
-        计算站间距：待规划小区到周边最近5个室外站点的平均距离
+        计算小区平均站间距：待规划小区到周边最近 N 个室外物理站点的平均距离
+
+        N 按源小区类型取值：
+          - 室分源（cell_cover_type=4，室分→室外）：最近 8 个室外站点
+          - 室外源（室外→室外、室外→室分）：最近 N 个室外站点（配置项，默认9）
 
         规则：
-        1. 只考虑室外站点（室分站点不参加计算）
-        2. 100米内的小区都算同站点，这些站点不计入
-        3. 取最近5个站点的平均距离作为站间距
+        1. 只考虑室外站点（室分目标 cell_cover_type=4 不参与计算）
+        2. 相同经纬度的站点算 1 个物理站点（共址/多系统同址只计一次），
+           按 (纬度, 经度) 去重，100米内（同站/共址）不计入
+        3. 取最近 N 个室外物理站点的平均距离作为站间距
 
         Returns:
             站间距（公里），如果无法计算则返回默认值 0.5
@@ -332,86 +379,84 @@ class NeighborPlanner:
         source_lat = source_row.get('lat')
         source_lon = source_row.get('lon')
         source_enodeb_id = str(source_row.get('enodeb_id', ''))
+        # 室分源取最近8个室外站，室外源取最近 N 个室外站（前端可配置）
+        is_source_indoor = (source_row.get('cell_cover_type', 1) == 4)
+        nearest_count = 8 if is_source_indoor else self.outdoor_spacing_site_count
 
-        # 同基站小区共享站间距计算结果
-        if source_enodeb_id in self._site_spacing_cache:
-            return self._site_spacing_cache[source_enodeb_id]
+        # 同基站、同类型小区共享站间距计算结果（缓存键含类型，避免室外/室分混用）
+        cache_key = f"{source_enodeb_id}:{'in' if is_source_indoor else 'out'}"
+        if cache_key in self._site_spacing_cache:
+            return self._site_spacing_cache[cache_key]
 
         if pd.isna(source_lat) or pd.isna(source_lon):
             return 0.5
 
-        # 收集所有室外站点距离（按站点去重，100米内算同站点）
-        site_distances = []
+        # 物理站点位置 -> 最小距离（相同经纬度算1个站点）
+        # round(...,6) 约 0.1m 精度，足以合并共址站点、区分真实不同站点
+        site_min_distances: Dict[tuple, float] = {}
 
         for _, target_row in self.target_cells_df.iterrows():
             target_lat = target_row.get('lat')
             target_lon = target_row.get('lon')
-            target_enodeb_id = str(target_row.get('enodeb_id', ''))
 
             if pd.isna(target_lat) or pd.isna(target_lon):
                 continue
 
-            # 跳过自身站点
-            if source_enodeb_id == target_enodeb_id:
-                continue
-
-            # 检查是否是室分站点（cell_cover_type=4表示室内小区）
-            cell_cover_type = target_row.get('cell_cover_type')
-            if cell_cover_type == 4:
+            # 室分站点不参与站间距计算
+            if target_row.get('cell_cover_type') == 4:
                 continue
 
             # 计算距离
             distance = self.calculate_distance(source_lat, source_lon, target_lat, target_lon)
 
-            # 100米内算同站点，不计入
+            # 100米内算同站点（含自身/共址），不计入
             if distance < 0.1:  # 0.1公里 = 100米
                 continue
 
-            site_distances.append({
-                'enodeb_id': target_enodeb_id,
-                'distance': distance
-            })
+            # 相同经纬度算1个物理站点，保留该位置的最小距离
+            pos_key = (round(float(target_lat), 6), round(float(target_lon), 6))
+            if pos_key not in site_min_distances or distance < site_min_distances[pos_key]:
+                site_min_distances[pos_key] = distance
 
-        if not site_distances:
+        if not site_min_distances:
             return 0.5  # 默认站间距
 
-        # 按站点ID去重，保留每个站点的最小距离
-        site_min_distances = {}
-        for site_info in site_distances:
-            site_id = site_info['enodeb_id']
-            dist = site_info['distance']
-            if site_id not in site_min_distances or dist < site_min_distances[site_id]:
-                site_min_distances[site_id] = dist
-
-        # 获取所有站点距离并排序
+        # 获取所有物理站点距离并排序
         unique_distances = sorted(site_min_distances.values())
 
-        # 取最近5个站点的平均距离作为站间距
-        nearest_5 = unique_distances[:5]
-        avg_spacing = sum(nearest_5) / len(nearest_5) if nearest_5 else 0.5
+        # 取最近 N 个室外物理站点的平均距离作为站间距
+        nearest_n = unique_distances[:nearest_count]
+        avg_spacing = sum(nearest_n) / len(nearest_n) if nearest_n else 0.5
 
-        logger.debug(f"站间距计算: 源站点={source_enodeb_id}, 最近{len(nearest_5)}个站点, 平均距离={avg_spacing:.3f}km")
+        logger.debug(f"站间距计算: 源站点={source_enodeb_id}, 源类型={'室分' if is_source_indoor else '室外'}, "
+                     f"最近{len(nearest_n)}个室外站点, 平均距离={avg_spacing:.3f}km")
 
-        # 缓存该基站的结果，供同站其他小区复用
-        self._site_spacing_cache[source_enodeb_id] = avg_spacing
+        # 缓存该基站（同类型）的结果，供同站其他小区复用
+        self._site_spacing_cache[cache_key] = avg_spacing
         return avg_spacing
 
     def plan_neighbors_for_cell(self, source_row: pd.Series) -> List[NeighborRelation]:
-        """为单个源小区规划邻区 - 三步骤筛选逻辑
+        """为单个源小区规划邻区 - 分层候选 + 距离优先截断
 
         筛选步骤：
-        第一步：距离优先选择（强制邻区，无需后续筛选）
+        第一步：距离优先选择（强制邻区）
            - 室外-室外：300米内站点的所有小区作为邻区
            - 室分到室外/室外到室分：160米内
 
-        第二步：使用最大邻区数、距离系数、半径系数筛选候选邻区
-           - 对剩余候选使用覆盖圆相交判断
+        第二步：按源/目标小区类型与站间距分场景筛选候选
+           - 站间距 = 到周边室外物理站点的平均距离（相同经纬度算1站、剔除室分站）：
+             室外源取最近N个室外站（默认9，前端可配）；室分源取最近8个室外站
+           - 室外→室分（硬规则，与密集/稀疏无关）：距离 ≤ 600米 且 在源天线
+             前向±120°内才添加；>600米 或 背向的室分一律不添加
+           - 室外→室外：
+             · 密集（站间距 < 1000米）：1.3倍站间距范围内全量添加（不判朝向）
+             · 稀疏（站间距 ≥ 1000米）：仅按覆盖圆相交添加，再由每频最大邻区数截断
+           - 室分源（全向，不做覆盖圆/朝向判断）：
+             · 室分→室分：350米内添加
+             · 室分→室外：站间距>350米按1.5倍站间距全量添加，否则350米内添加
 
-        第三步：根据站间距筛选候选邻区
-           - 待规划小区到候选邻区距离需小于1.8倍站间距
-           - 站间距计算时室分小区不参与，只计算室外小区之间的距离
-
-        最终结果 = 第一步 + 第二步 + 第三步的合集（去重）
+        最终结果 = 第一步强制邻区 + 第二步候选（去重），同频/异频各自按
+        (距离升序, 评分降序) 截断到 max_neighbors（每频门限）。
         """
         if self.target_cells_df is None or self.target_cells_df.empty:
             return []
@@ -456,140 +501,132 @@ class NeighborPlanner:
             # 查询批量计算结果（O(1) 数组访问替代逐对 Haversine）
             distance = float(all_distances[i])
 
-            # 规则1：室外-室外300米内站点的所有小区作为邻区
+            # 规则：室外-室外300米内站点的所有小区作为强制邻区
+            # （室分相关不在此强制——室外→室分按第二步"≤1km且前向"硬规则，
+            #   室分源按第二步 350m/1.5倍站间距 规则，避免背向室分被误加强制）
             if not is_source_indoor and not is_target_indoor:
                 if distance <= 0.30:  # 300米
                     step1_forced_neighbors.append((target_row, distance))
                     forced_neighbor_keys.add(target_key)
                     continue
 
-            # 规则2：室分到室外/室外到室分160米内
-            if (is_source_indoor and not is_target_indoor) or (not is_source_indoor and is_target_indoor):
-                if distance <= 0.16:  # 160米
-                    step1_forced_neighbors.append((target_row, distance))
-                    forced_neighbor_keys.add(target_key)
-                    continue
-
-            # 其他情况进入剩余候选（带行号索引）
+            # 其他情况进入剩余候选（带行号索引），交给第二步场景化筛选
             step1_remaining_candidates.append((i, target_row, distance))
 
         logger.debug(f"第一步距离筛选: 源小区={source_key}, 强制邻区={len(step1_forced_neighbors)}, 剩余候选={len(step1_remaining_candidates)}")
 
-        # ========== 第二步：使用距离系数、半径系数筛选候选邻区 ==========
-        # 对剩余候选使用覆盖圆相交判断
+        # ========== 第二步：按源/目标小区类型与站间距分场景筛选候选 ==========
         step2_candidates = []
 
-        # 获取源小区的覆盖圆
+        # 小区平均站间距（相同经纬度算1站，剔除室分目标）：
+        # 室外源取最近N(默认9，前端可配)个室外站，室分源取最近8个室外站。
+        site_spacing = self.calculate_site_spacing(source_row)
+
+        # 室外场景阈值（门限均前端可配置）：站间距 < dense_spacing_threshold 为密集，
+        # 按 dense_multiplier 倍站间距全量添加；≥门限为稀疏，按覆盖圆相交 + 每频门限。
+        dense_spacing_threshold = self.dense_spacing_threshold_km
+        dense_multiplier = self.dense_multiplier
+        outdoor_is_dense = site_spacing < dense_spacing_threshold
+        dense_radius = dense_multiplier * site_spacing             # 密集全量半径
+
+        # 室分场景阈值（前端可配置）
+        INDOOR_NEIGHBOR_RADIUS_KM = self.indoor_to_indoor_radius_km  # 室分-室分距离
+        OUTDOOR_TO_INDOOR_MAX_KM = self.outdoor_to_indoor_max_km     # 室外→室分最远距离
+        # 室分-室外：站间距>室分距离时按 indoor_to_outdoor_multiplier 倍站间距，否则至少按该距离
+        indoor_outdoor_radius = (
+            self.indoor_to_outdoor_multiplier * site_spacing
+            if site_spacing > INDOOR_NEIGHBOR_RADIUS_KM
+            else INDOOR_NEIGHBOR_RADIUS_KM
+        )
+
+        # 稀疏场景覆盖圆距离按站间距缩放：固定1km覆盖距离在农村大站间距(2km+)时
+        # 半径仅约0.5km、对打最多够到约1.5km，够不着邻区导致只剩本站邻区。
+        # 稀疏时覆盖距离取站间距，使覆盖圆前向可达约1.5倍站间距、背向仍不相交。
+        # 注意：coverage_distance 单位为米（default=1000），site_spacing 单位为公里，需 ×1000
+        effective_coverage_distance = (
+            self.default_coverage_distance if outdoor_is_dense
+            else max(self.default_coverage_distance, site_spacing * 1000.0)
+        )
+
+        # 源小区覆盖圆（室外稀疏场景使用，距离按站间距缩放）
         if pd.notna(source_azimuth):
             source_center_lat, source_center_lon = self.calculate_coverage_circle_center(
                 source_lat, source_lon, source_azimuth,
-                self.coverage_distance_factor, self.default_coverage_distance
+                self.coverage_distance_factor, effective_coverage_distance
             )
         else:
             source_center_lat, source_center_lon = source_lat, source_lon
 
         source_radius = self.calculate_coverage_radius(
-            self.default_coverage_distance, self.coverage_radius_factor
+            effective_coverage_distance, self.coverage_radius_factor
         )
 
         for i, target_row, distance in step1_remaining_candidates:
-            target_key = self.get_cell_key(target_row)
-            target_cover_type = target_row.get('cell_cover_type', 1)
-            is_target_indoor = (target_cover_type == 4)
+            is_target_indoor = (target_row.get('cell_cover_type', 1) == 4)
 
-            # 室分到室分：限制160米以内
-            if is_source_indoor and is_target_indoor:
-                if distance <= 0.16:
+            if is_source_indoor:
+                # 室分源（全向覆盖，不做覆盖圆/朝向判断）
+                if is_target_indoor:
+                    # 室分-室分：350米内添加
+                    if distance <= INDOOR_NEIGHBOR_RADIUS_KM:
+                        step2_candidates.append((target_row, distance))
+                else:
+                    # 室分-室外：1.5倍站间距（站间距>350米）或至少350米内全量添加
+                    if distance < indoor_outdoor_radius:
+                        step2_candidates.append((target_row, distance))
+                continue
+
+            # 室外源 → 室外→室分：硬规则（与密集/稀疏无关）
+            if is_target_indoor:
+                # 距离 > 1000米的室分不添加；≤1000米且在源天线前向±120°内才添加
+                # （背向室分不添加）。源无方位角信息时仅按距离判断。
+                if distance <= OUTDOOR_TO_INDOOR_MAX_KM:
+                    if pd.isna(source_azimuth):
+                        step2_candidates.append((target_row, distance))
+                    else:
+                        forward_diff = self.calculate_forward_diff(
+                            source_lat, source_lon, source_azimuth,
+                            target_row['lat'], target_row['lon']
+                        )
+                        if forward_diff <= DIRECTION_GATE_DEG:
+                            step2_candidates.append((target_row, distance))
+                continue
+
+            # 室外源 → 室外→室外
+            if outdoor_is_dense:
+                # 密集（站间距<1km）：1.3倍站间距范围内全量添加（不判朝向）
+                if distance < dense_radius:
                     step2_candidates.append((target_row, distance))
                 continue
 
-            # 使用预计算的目标小区覆盖圆数据（避免逐对三角函数运算）
-            tclat = self._target_center_lats[i]
-            tclon = self._target_center_lons[i]
-            trad = self._target_radii[i]
-
-            # 判断覆盖圆是否相交（覆盖圆中心的距离 <= 两圆半径之和）
+            # 稀疏（站间距≥1km）：仅按覆盖圆相交添加，再由每频最大邻区数截断。
+            # 覆盖圆距离按站间距缩放（effective_coverage_distance），故目标覆盖圆
+            # 也用同一距离实时计算（预计算数组用固定1km，稀疏时够不着邻区）。
+            target_azimuth = target_row.get('azimuth')
+            if pd.notna(target_azimuth):
+                tclat, tclon = self.calculate_coverage_circle_center(
+                    target_row['lat'], target_row['lon'], target_azimuth,
+                    self.coverage_distance_factor, effective_coverage_distance
+                )
+            else:
+                tclat, tclon = target_row['lat'], target_row['lon']
+            trad = self.calculate_coverage_radius(
+                effective_coverage_distance, self.coverage_radius_factor
+            )
             center_dist = self.calculate_distance(
                 source_center_lat, source_center_lon, tclat, tclon
             )
             if center_dist <= (source_radius + trad):
                 step2_candidates.append((target_row, distance))
 
-        logger.debug(f"第二步覆盖圆筛选: 候选数={len(step2_candidates)}")
+        logger.debug(
+            f"第二步场景筛选: 源小区={source_key}, 站间距={site_spacing:.3f}km, "
+            f"源类型={'室分' if is_source_indoor else '室外'}, "
+            f"场景={'密集(1.5x全量)' if (not is_source_indoor and outdoor_is_dense) else '室分/稀疏'}, "
+            f"候选数={len(step2_candidates)}"
+        )
 
-        # ========== 第三步：根据站间距筛选候选邻区 ==========
-        # 待规划小区到候选邻区距离需小于1.8倍站间距
-        # 站间距计算时室分小区不参与，只计算室外小区之间的距离
-        step3_candidates = []
-
-        if step2_candidates:
-            # 计算站间距（只计算室外小区之间的距离，室分不参与）
-            site_spacing = self.calculate_site_spacing(source_row)
-            max_distance_threshold = 1.8 * site_spacing  # 1.8倍站间距
-
-            logger.debug(f"第三步站间距筛选: 源小区={source_key}, 站间距={site_spacing:.3f}km, 阈值={max_distance_threshold:.3f}km")
-
-            for target_row, distance in step2_candidates:
-                target_key = self.get_cell_key(target_row)
-                target_cover_type = target_row.get('cell_cover_type', 1)
-                is_target_indoor = (target_cover_type == 4)
-
-                # 室分到室分：已经在第二步限制在160米内，直接通过
-                if is_source_indoor and is_target_indoor:
-                    step3_candidates.append((target_row, distance))
-                    continue
-
-                # 室外小区：检查是否满足1.8倍站间距
-                if distance < max_distance_threshold:
-                    step3_candidates.append((target_row, distance))
-
-        logger.debug(f"第三步站间距筛选后: 候选数={len(step3_candidates)}")
-
-        # ========== 第四步：兜底逻辑 - 站点稀疏时的邻区补充 ==========
-        # 当站点稀疏（周边站点数量少）时，按"距离 <= 平均站间距"添加兜底邻区
-        # 规则：
-        # 1. 如果候选邻区数量少于4个（或少于周边站点数），说明站点稀疏
-        # 2. 从第一步剩余候选中（排除强制邻区后），对于满足距离 <= 平均站间距的候选小区，补充添加为邻区
-        # 注意：这里直接从第一步剩余候选中筛选，因为第二步的覆盖圆判断可能过滤掉所有候选
-        step4_fallback_neighbors = []
-
-        if step1_remaining_candidates:
-            # 计算第一步剩余候选中的站点数量
-            unique_target_sites = set()
-            for _i, target_row, _ in step1_remaining_candidates:
-                target_enodeb_id = str(target_row.get('enodeb_id', ''))
-                unique_target_sites.add(target_enodeb_id)
-
-            site_count = len(unique_target_sites)
-            candidate_count = len(step3_candidates)
-
-            # 触发条件：候选邻区数量少于4个，或少于周边站点数
-            # 这两种情况都说明站点稀疏，需要兜底
-            needs_fallback = candidate_count < min(4, site_count) if site_count > 0 else candidate_count < 4
-
-            if needs_fallback:
-                site_spacing = self.calculate_site_spacing(source_row)
-
-                logger.debug(f"第四步兜底逻辑: 源小区={source_key}, 剩余候选站点数={site_count}, 第三步候选数={candidate_count}, 站间距={site_spacing:.3f}km")
-
-                for _i, target_row, distance in step1_remaining_candidates:
-                    target_key = self.get_cell_key(target_row)
-                    target_cover_type = target_row.get('cell_cover_type', 1)
-                    is_target_indoor = (target_cover_type == 4)
-
-                    # 跳过已在强制邻区中的
-                    if target_key in forced_neighbor_keys:
-                        continue
-
-                    # 跳过室分到室分
-                    if is_source_indoor and is_target_indoor:
-                        continue
-
-                    # 兜底条件：距离 <= 平均站间距
-                    if distance <= site_spacing:
-                        step4_fallback_neighbors.append((target_row, distance))
-
-        logger.debug(f"第四步兜底逻辑后: 补充邻区数={len(step4_fallback_neighbors)}")
+        step3_candidates = step2_candidates
 
         # ========== 合并结果并去重 ==========
         # 最终结果 = 第一步 + 第三步的合集（第二步是中间过程）
@@ -606,11 +643,18 @@ class NeighborPlanner:
             # 计算角度差
             facing_diff = None
             pointing_diff = None
-            if pd.notna(source_azimuth) and pd.notna(target_azimuth):
-                facing_diff = self.calculate_angle_difference(source_azimuth, (target_azimuth + 180) % 360)
-                pointing_diff = self.calculate_angle_difference(target_azimuth, source_to_target_azimuth)
-                # 对打邻区判断：目标小区背向与主小区方位角差小于目标小区朝向与主小区位置差
-                is_forward = facing_diff < pointing_diff
+            # 100米内视为同站：两点重合/极近时方位角无意义
+            # （calculate_azimuth_angle 对重合点返回伪值0°，会错误压低同站邻区评分）
+            if pd.notna(source_azimuth) and pd.notna(target_azimuth) and distance >= 0.1:
+                # facing_diff：源天线方位角 与 源→目标方位角 的夹角（小=源正打目标）
+                facing_diff = self.calculate_angle_difference(source_azimuth, source_to_target_azimuth)
+                # pointing_diff：目标天线方位角 与 目标→源方位角 的夹角（小=目标正打源）；
+                # 目标→源 = (源→目标)+180，旧代码误用 源→目标 导致方向反 180°
+                pointing_diff = self.calculate_angle_difference(
+                    target_azimuth, (source_to_target_azimuth + 180) % 360
+                )
+                # 双向对打：两小区天线各自朝向对方（偏角均在前向半球 <90° 内）
+                is_forward = facing_diff < 90 and pointing_diff < 90
             else:
                 is_forward = False
 
@@ -622,7 +666,7 @@ class NeighborPlanner:
                 source_key=source_key,
                 target_key=target_key,
                 distance=round(distance, 3),
-                angle_diff=round(angle_diff, 1) if angle_diff else None,
+                angle_diff=round(angle_diff, 1) if angle_diff is not None else None,
                 source_cell_name=str(source_row.get('cell_name', '')),
                 target_cell_name=str(target_row.get('cell_name', '')),
                 source_enodeb_id=str(source_row.get('enodeb_id', '')),
@@ -652,11 +696,18 @@ class NeighborPlanner:
             # 计算角度差
             facing_diff = None
             pointing_diff = None
-            if pd.notna(source_azimuth) and pd.notna(target_azimuth):
-                facing_diff = self.calculate_angle_difference(source_azimuth, (target_azimuth + 180) % 360)
-                pointing_diff = self.calculate_angle_difference(target_azimuth, source_to_target_azimuth)
-                # 对打邻区判断：facing_diff < pointing_diff 表示目标小区在主小区朝向方向
-                is_forward = facing_diff < pointing_diff
+            # 100米内视为同站：两点重合/极近时方位角无意义
+            # （calculate_azimuth_angle 对重合点返回伪值0°，会错误压低同站邻区评分）
+            if pd.notna(source_azimuth) and pd.notna(target_azimuth) and distance >= 0.1:
+                # facing_diff：源天线方位角 与 源→目标方位角 的夹角（小=源正打目标）
+                facing_diff = self.calculate_angle_difference(source_azimuth, source_to_target_azimuth)
+                # pointing_diff：目标天线方位角 与 目标→源方位角 的夹角（小=目标正打源）；
+                # 目标→源 = (源→目标)+180，旧代码误用 源→目标 导致方向反 180°
+                pointing_diff = self.calculate_angle_difference(
+                    target_azimuth, (source_to_target_azimuth + 180) % 360
+                )
+                # 双向对打：两小区天线各自朝向对方（偏角均在前向半球 <90° 内）
+                is_forward = facing_diff < 90 and pointing_diff < 90
             else:
                 is_forward = False
 
@@ -668,7 +719,7 @@ class NeighborPlanner:
                 source_key=source_key,
                 target_key=target_key,
                 distance=round(distance, 3),
-                angle_diff=round(angle_diff, 1) if angle_diff else None,
+                angle_diff=round(angle_diff, 1) if angle_diff is not None else None,
                 source_cell_name=str(source_row.get('cell_name', '')),
                 target_cell_name=str(target_row.get('cell_name', '')),
                 source_enodeb_id=str(source_row.get('enodeb_id', '')),
@@ -682,61 +733,49 @@ class NeighborPlanner:
             )
             candidate_neighbors.append(neighbor)
 
-        # 候选邻区按评分排序并限制数量
-        candidate_neighbors.sort(key=lambda x: x.score, reverse=True)
-        # 候选邻区数量 = 最大邻区数 - 强制邻区数 - 兜底邻区数
-        remaining_slots = max(0, self.max_neighbors - len(forced_neighbors) - len(step4_fallback_neighbors))
-        selected_candidates = candidate_neighbors[:remaining_slots]
+        # 候选邻区（近端层 + 远端补足层）不在本层截断：
+        # 最终在合并后按 同频/异频 各自 (距离升序, 评分降序) 截断到 max_neighbors
+        selected_candidates = candidate_neighbors
 
-        # 构建兜底邻区列表
-        fallback_neighbors = []
-        fallback_keys = set()  # 记录兜底邻区的key，避免重复
-        for target_row, distance in step4_fallback_neighbors:
-            target_key = self.get_cell_key(target_row)
-            target_azimuth = target_row.get('azimuth')
+        # ========== 合并 + 同频/异频分类 + 各自上限截断 ==========
+        # "最大邻区数(max_neighbors)" 指 同频 与 异频 各自的上限：
+        # 每小区最终邻区 = 同频前 max_neighbors + 异频前 max_neighbors。
+        # 强制邻区(第一步)也纳入各自频率类别的上限，但按距离优先排序时
+        # 同站(0km)与300米内强制邻区距离最近，必然排在截断线之内；
+        # 近端层填满后，远端补足层（含所打方向的较远邻区）按距离递补，
+        # 直到达到 max_neighbors 或候选耗尽。
+        # 合并前先去重（近端层/远端层可能包含同一目标，避免重复出现）。
+        combined_neighbors = forced_neighbors + selected_candidates
+        seen_keys = set()
+        unique_neighbors = []
+        for n in combined_neighbors:
+            if n.target_key not in seen_keys:
+                seen_keys.add(n.target_key)
+                unique_neighbors.append(n)
 
-            source_to_target_azimuth = self.calculate_azimuth_angle(source_lat, source_lon, target_row['lat'], target_row['lon'])
-
-            # 计算角度差
-            facing_diff = None
-            pointing_diff = None
-            if pd.notna(source_azimuth) and pd.notna(target_azimuth):
-                facing_diff = self.calculate_angle_difference(source_azimuth, (target_azimuth + 180) % 360)
-                pointing_diff = self.calculate_angle_difference(target_azimuth, source_to_target_azimuth)
-                # 对打邻区判断
-                is_forward = facing_diff < pointing_diff
+        same_freq_neighbors = []
+        inter_freq_neighbors = []
+        for n in unique_neighbors:
+            if self._is_same_frequency(n.source_earfcn, n.target_earfcn):
+                same_freq_neighbors.append(n)
             else:
-                is_forward = False
+                inter_freq_neighbors.append(n)
 
-            # 使用新的评分函数，对打邻区优先级更高
-            angle_diff = min(facing_diff, pointing_diff) if facing_diff is not None else None
-            score = self.calculate_neighbor_score(distance, angle_diff, facing_diff, pointing_diff, is_forward)
-            # 兜底邻区整体评分稍低
-            score *= 0.8
+        # 距离优先排序：同站(0km)、300米内强制邻区、近端候选必须先占满名额，
+        # 再考虑远端邻区；距离相同时按方向角评分（对打/内向）排序。
+        # 旧逻辑仅按 score 降序：距离分(10-d)在1km内区分度不足，角度分(0~13)主导，
+        # 远端对打邻区评分反超同站/近端邻区，候选超上限时近端被截断漏配。
+        same_freq_neighbors.sort(key=lambda x: (x.distance, -x.score))
+        inter_freq_neighbors.sort(key=lambda x: (x.distance, -x.score))
 
-            neighbor = NeighborRelation(
-                source_key=source_key,
-                target_key=target_key,
-                distance=round(distance, 3),
-                angle_diff=round(angle_diff, 1) if angle_diff else None,
-                source_cell_name=str(source_row.get('cell_name', '')),
-                target_cell_name=str(target_row.get('cell_name', '')),
-                source_enodeb_id=str(source_row.get('enodeb_id', '')),
-                target_enodeb_id=str(target_row.get('enodeb_id', '')),
-                score=score,
-                source_pci=source_row.get('pci'),
-                target_pci=target_row.get('pci'),
-                source_earfcn=source_row.get('earfcn'),
-                target_earfcn=target_row.get('earfcn'),
-                relation_type=f"{self.config.source_type}-{self.config.target_type}"
-            )
-            fallback_neighbors.append(neighbor)
-            fallback_keys.add(target_key)
+        # 每频门限截断：同频/异频各自最多 max_neighbors 个
+        final_neighbors = same_freq_neighbors[:self.max_neighbors] + inter_freq_neighbors[:self.max_neighbors]
 
-        # 最终结果 = 强制邻区 + 兜底邻区 + 选中的候选邻区
-        final_neighbors = forced_neighbors + fallback_neighbors + selected_candidates
-
-        logger.debug(f"最终结果: 强制邻区={len(forced_neighbors)}, 兜底邻区={len(fallback_neighbors)}, 候选邻区={len(selected_candidates)}, 总计={len(final_neighbors)}")
+        logger.debug(
+            f"最终结果: 同频={len(same_freq_neighbors[:self.max_neighbors])}, "
+            f"异频={len(inter_freq_neighbors[:self.max_neighbors])}, "
+            f"总计={len(final_neighbors)}, 上限={self.max_neighbors}(同频/异频各限)"
+        )
 
         return final_neighbors
     
@@ -793,6 +832,12 @@ class NeighborPlanner:
             planner.coverage_distance_factor = self.coverage_distance_factor
             planner.coverage_radius_factor = self.coverage_radius_factor
             planner.default_coverage_distance = self.default_coverage_distance
+            planner.dense_spacing_threshold_km = self.dense_spacing_threshold_km
+            planner.dense_multiplier = self.dense_multiplier
+            planner.outdoor_to_indoor_max_km = self.outdoor_to_indoor_max_km
+            planner.indoor_to_indoor_radius_km = self.indoor_to_indoor_radius_km
+            planner.indoor_to_outdoor_multiplier = self.indoor_to_outdoor_multiplier
+            planner.outdoor_spacing_site_count = self.outdoor_spacing_site_count
             planner.target_cells_df = self.target_cells_df
             planner._target_lats_arr = self._target_lats_arr
             planner._target_lons_arr = self._target_lons_arr

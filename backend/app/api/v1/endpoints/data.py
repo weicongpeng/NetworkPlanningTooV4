@@ -3,15 +3,17 @@
 """
 
 import asyncio
+import gzip
+import json
 import os
 import shutil
 import time
 import uuid
 import logging
 from pathlib import Path
-from fastapi import APIRouter, Depends, UploadFile, File, HTTPException, Body, Form
+from fastapi import APIRouter, Depends, UploadFile, File, HTTPException, Body, Form, Request
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from typing import Dict, Any, List, Optional
 from app.core.config import settings
 from app.models.schemas import (
@@ -20,11 +22,15 @@ from app.models.schemas import (
     CellCreateRequest,
     CellBatchCreateRequest,
     CellDupCheckRequest,
+    CellSearchRequest,
+    CellBulkUpdateRequest,
     UpdateParametersRequest,
     ImportPointsRequest,
 )
-from app.services.data_service import data_service
-from app.core.security import get_current_user, require_data_import, require_data_delete, require_data_update, require_cell_entry
+from app.services.data_service import data_service, validate_excel_upload_contract
+from app.core.security import get_current_user, require_data_import, require_data_delete, require_data_update, require_cell_entry, require_cell_query_update
+from app.core.data_access import require_data_group_access
+from app.models.database import User
 
 router = APIRouter()
 
@@ -51,10 +57,34 @@ async def import_points(
 
 
 @router.get("/{data_id}/download")
-async def download_file(data_id: str):
+async def download_file(data_id: str, _group=Depends(require_data_group_access)):
     """下载文件（原地更新后返回原始格式的 Excel，仅更新 PCI/TAC 值）"""
     try:
         data_dir = settings.DATA_DIR / data_id
+
+        # 方案B：map 类型数据条目存在图层定义时，实时打包**当前图层文件**返回
+        # （编辑保存整层重写的源文件），不再返回上传时刻的 original.zip 快照。
+        # 打包失败（无图层/源文件缺失）时静默回退到下面的原始文件逻辑。
+        try:
+            if (data_dir / "layers.json").exists():
+                from app.services.layer_edit_service import build_data_layers_zip
+                zip_bytes, layer_count = await run_in_threadpool(build_data_layers_zip, data_id)
+                if zip_bytes:
+                    from urllib.parse import quote
+                    idx = data_service.index.get(data_id) or {}
+                    dl_name = idx.get("name") or "layers.zip"
+                    if not dl_name.lower().endswith(".zip"):
+                        dl_name = f"{dl_name}.zip"
+                    return Response(
+                        content=zip_bytes,
+                        media_type="application/zip",
+                        headers={
+                            "Content-Disposition": f"attachment; filename*=utf-8''{quote(dl_name)}",
+                            "Cache-Control": "no-cache",
+                        },
+                    )
+        except Exception as e:
+            print(f"[Download] 打包当前图层失败，回退原始文件: {data_id} {e}")
 
         # 按优先级查找原始文件
         candidates = [
@@ -184,11 +214,19 @@ async def add_cell(
             request.longitude,
             request.latitude,
             request.azimuth,
+            request.height,
             request.frequency,
             request.ssbFrequency,
             request.cellCoverType,
             current_user.id,
+            current_user.city,
+            current_user.operator,
         )
+        # 新站录入改的是全量工参内容：必须失效地图数据缓存（30 分钟 TTL），
+        # 否则地图继续渲染旧数据，新增小区在地图上看不到（上传/删除/批量更新/
+        # 工参更新各路径均已失效，此处曾遗漏）
+        import app.api.v1.endpoints.map as map_module
+        map_module.invalidate_map_data_cache()
         return {"success": True, "message": result.get("message", ""), "data": result}
     except ValueError as e:
         error_msg = str(e).replace("✗", "x")
@@ -227,6 +265,7 @@ async def batch_add_cells(
                     "longitude": c.longitude,
                     "latitude": c.latitude,
                     "azimuth": c.azimuth,
+                    "height": c.height,
                     "frequency": c.frequency,
                     "ssbFrequency": c.ssbFrequency,
                     "cellCoverType": c.cellCoverType,
@@ -236,7 +275,14 @@ async def batch_add_cells(
                 }
                 for c in request.cells
             ],
+            current_user.city,
+            current_user.operator,
         )
+        # 新站录入改的是全量工参内容：必须失效地图数据缓存（30 分钟 TTL），
+        # 否则地图继续渲染旧数据，新增小区在地图上看不到（上传/删除/批量更新/
+        # 工参更新各路径均已失效，此处曾遗漏）
+        import app.api.v1.endpoints.map as map_module
+        map_module.invalidate_map_data_cache()
         return {
             "success": result.get("success", False),
             "message": result.get("message", ""),
@@ -263,7 +309,7 @@ async def check_cell_duplicates(
     request: CellDupCheckRequest,
     current_user=Depends(require_cell_entry),
 ) -> Dict[str, Any]:
-    """检查小区是否重复：按制式区分（siteId_cellId 匹配数据库已有记录）"""
+    """检查小区是否重复：LTE 按 基站_小区、NR 按 MCC_MNC_基站_小区 匹配库内记录"""
     if not request.cells:
         return {"success": True, "data": {"duplicates": [], "exists": {}}}
 
@@ -273,13 +319,86 @@ async def check_cell_duplicates(
                 "siteId": c.siteId,
                 "cellId": c.cellId,
                 "networkType": c.networkType.value,
+                "mcc": c.mcc,
+                "mnc": c.mnc,
             }
             for c in request.cells
         ]
         result = await run_in_threadpool(
-            data_service.check_cell_duplicates, cells
+            data_service.check_cell_duplicates, cells,
+            current_user.city, current_user.operator,
         )
         return {"success": True, "data": result}
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        error_msg = str(e).replace("✗", "x")
+        safe_detail = error_msg.encode("utf-8", "replace").decode("utf-8")
+        raise HTTPException(status_code=500, detail=safe_detail)
+
+
+@router.post("/full-params/cells/search", response_model=Dict[str, Any])
+async def search_cells(
+    request: CellSearchRequest,
+    current_user=Depends(require_cell_query_update),
+) -> Dict[str, Any]:
+    """查询/更新：智能搜索小区（小区名/网元ID/基站ID/站点名模糊匹配）"""
+    try:
+        result = await run_in_threadpool(
+            data_service.search_cells,
+            request.query,
+            request.networkType.value if request.networkType else None,
+            request.limit,
+            None,  # workbook_id
+            current_user.city,
+            current_user.operator,
+        )
+        return {"success": True, "data": result}
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        error_msg = str(e).replace("✗", "x")
+        safe_detail = error_msg.encode("utf-8", "replace").decode("utf-8")
+        raise HTTPException(status_code=500, detail=safe_detail)
+
+
+@router.post("/full-params/cells/bulk-update", response_model=Dict[str, Any])
+async def bulk_update_cells(
+    request: CellBulkUpdateRequest,
+    current_user=Depends(require_cell_query_update),
+) -> Dict[str, Any]:
+    """查询/更新：批量更新 + 删除小区（一次事务，双写 DB + 全量工参 Excel）"""
+    try:
+        updates = [
+            {"rowKey": u.rowKey, "networkType": u.networkType.value, "fields": u.fields}
+            for u in request.updates
+        ]
+        deletes = [
+            {"rowKey": d.rowKey, "networkType": d.networkType.value}
+            for d in request.deletes
+        ]
+        result = await run_in_threadpool(
+            data_service.bulk_update_cells,
+            updates, deletes, current_user.id, None,
+            current_user.city, current_user.operator,
+        )
+        # 有实际变更时失效地图数据缓存（30min TTL），否则地图扇区仍显示旧属性
+        if result.get("success") and (result.get("updated") or result.get("deleted")):
+            import app.api.v1.endpoints.map as map_module
+            map_module.invalidate_map_data_cache()
+        return {
+            "success": result.get("success", False),
+            "message": result.get("message", ""),
+            "data": {
+                "results": result.get("results", []),
+                "updated": result.get("updated", 0),
+                "deleted": result.get("deleted", 0),
+            },
+        }
+    except ValueError as e:
+        error_msg = str(e).replace("✗", "x")
+        safe_detail = error_msg.encode("utf-8", "replace").decode("utf-8")
+        raise HTTPException(status_code=400, detail=safe_detail)
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -383,7 +502,10 @@ async def upload_excel(
 
     try:
         # 阶段1：保存文件并创建处理中索引（快速返回）
-        result = await data_service.init_upload(file, file_path, user_id=current_user.id, overwrite=overwrite)
+        result = await data_service.init_upload(
+            file, file_path, user_id=current_user.id, overwrite=overwrite,
+            city=current_user.city, operator=current_user.operator,
+        )
 
         # 同名文件检测：未覆盖时返回提示
         if result.get("status") == "duplicate":
@@ -434,18 +556,25 @@ async def upload_excel(
 
 @router.post("/upload/map", response_model=Dict[str, Any])
 async def upload_map(
-    file: Optional[UploadFile] = File(None), file_path: Optional[str] = Form(None)
+    file: Optional[UploadFile] = File(None),
+    files: Optional[List[UploadFile]] = File(None),
+    file_path: Optional[str] = Form(None),
+    current_user=Depends(require_data_import),
 ) -> Dict[str, Any]:
-    """上传地图文件"""
+    """上传地图文件（支持 MapInfo TAB/MIF、KML、ZIP、离线地图）
+    files: 配套文件列表（与主文件同 stem 的 .dat/.mid/.map/.id 等，浏览器模式补齐关联文件）"""
     try:
         try:
-            print(f"[API] upload_map: file={file}, file_path={file_path}")
+            print(f"[API] upload_map: file={file}, files={[f.filename for f in files] if files else None}, file_path={file_path}")
         except:
             print(f"[API] upload_map: file_path encoding error")
     except:
         pass
     try:
-        result = await data_service.upload_map(file, file_path)
+        result = await data_service.upload_map(
+            file, file_path, files=files,
+            user_id=current_user.id, city=current_user.city, operator=current_user.operator,
+        )
         # 清除地图数据缓存
         import app.api.v1.endpoints.map as map_module
         map_module.invalidate_map_data_cache()
@@ -460,40 +589,197 @@ async def upload_map(
         raise HTTPException(status_code=500, detail=safe_detail)
 
 
+@router.post("/map/layers/create", response_model=Dict[str, Any])
+async def create_map_layer(
+    payload: Dict[str, Any] = Body(...),
+    current_user=Depends(require_data_import),
+) -> Dict[str, Any]:
+    """新建空图层（TAB / Shapefile / GeoJSON），创建后出现在"图层文件"组顶层。"""
+    try:
+        from app.services.layer_edit_service import create_empty_layer
+        name = str(payload.get("name") or "").strip()
+        geometry_type = str(
+            payload.get("geometry_type") or payload.get("geometryType") or ""
+        ).strip()
+        fmt = str(payload.get("format") or "tab").strip().lower()
+        if not name:
+            raise ValueError("图层名称不能为空")
+        result = await run_in_threadpool(
+            create_empty_layer, name, geometry_type, fmt, current_user.id,
+            current_user.city, current_user.operator,
+        )
+        # 清除地图数据缓存（连带清 MapInfo 图层缓存）
+        import app.api.v1.endpoints.map as map_module
+        map_module.invalidate_map_data_cache()
+        return {"success": True, "data": result}
+    except ValueError as e:
+        print(f"[API] create_map_layer ValueError: {e}")
+        safe_detail = str(e).encode("gbk", "replace").decode("gbk")
+        raise HTTPException(status_code=400, detail=safe_detail)
+    except Exception as e:
+        print(f"[API] create_map_layer Exception: {e}")
+        safe_detail = str(e).encode("gbk", "replace").decode("gbk")
+        raise HTTPException(status_code=500, detail=safe_detail)
+
+
+@router.put("/{data_id}/layers/{layer_id}/data", response_model=Dict[str, Any])
+async def save_layer_data(
+    data_id: str,
+    layer_id: str,
+    request: Request,
+    current_user=Depends(require_data_update),
+    _group=Depends(require_data_group_access),
+) -> Dict[str, Any]:
+    """保存图层编辑结果（整层重写 TAB）。请求体 {geojson: FeatureCollection}（坐标为 GCJ02）。
+
+    支持 gzip 压缩请求体（Content-Encoding: gzip，前端大图层保存默认压缩）。
+    按 gzip 魔数检测而非仅看请求头：中间代理解压后可能残留请求头，魔数检测两边都兼容。
+    """
+    try:
+        from app.services.layer_edit_service import save_layer_geojson
+        from app.services.layer_patch_service import apply_layer_patch, LayerVersionConflict
+        raw = await request.body()
+        if raw[:2] == b"\x1f\x8b":
+            raw = gzip.decompress(raw)
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except Exception:
+            raise ValueError("请求体不是合法的 JSON")
+        patch = payload.get("patch")
+        if isinstance(patch, dict):
+            # 增量保存：只回传变更要素，后端按行合并（基底版本不一致时 409，前端回退整层保存）
+            result = await run_in_threadpool(
+                apply_layer_patch, data_id, layer_id, patch, current_user.id
+            )
+        else:
+            geojson = payload.get("geojson")
+            if not isinstance(geojson, dict):
+                raise ValueError("缺少 geojson 要素集合或 patch 增量")
+            result = await run_in_threadpool(
+                save_layer_geojson, data_id, layer_id, geojson, current_user.id
+            )
+        import app.api.v1.endpoints.map as map_module
+        map_module.invalidate_map_data_cache()
+        return {"success": True, "data": result}
+    except LayerVersionConflict as e:
+        print(f"[API] save_layer_data 基底版本冲突: {e}")
+        safe_detail = str(e).encode("gbk", "replace").decode("gbk")
+        raise HTTPException(status_code=409, detail=safe_detail)
+    except ValueError as e:
+        print(f"[API] save_layer_data ValueError: {e}")
+        safe_detail = str(e).encode("gbk", "replace").decode("gbk")
+        raise HTTPException(status_code=400, detail=safe_detail)
+    except FileNotFoundError as e:
+        safe_detail = str(e).encode("gbk", "replace").decode("gbk")
+        raise HTTPException(status_code=404, detail=safe_detail)
+    except Exception as e:
+        print(f"[API] save_layer_data Exception: {e}")
+        safe_detail = str(e).encode("gbk", "replace").decode("gbk")
+        raise HTTPException(status_code=500, detail=safe_detail)
+
+
+@router.get("/{data_id}/layers/{layer_id}/download")
+async def download_layer_bundle(data_id: str, layer_id: str, _group=Depends(require_data_group_access)):
+    """下载图层的 MapInfo 全套关联文件（.tab/.dat/.id/.map），打包为 .tab.zip。"""
+    try:
+        from urllib.parse import quote
+        from app.services.layer_edit_service import build_layer_zip
+        zip_bytes, filename = await run_in_threadpool(build_layer_zip, data_id, layer_id)
+        # 中文文件名必须走 RFC 5987 filename*（HTTP header 仅 latin-1，
+        # 直接放 filename="中文名" 会触发 'latin-1' codec can't encode 500）
+        encoded = quote(filename)
+        return Response(
+            content=zip_bytes,
+            media_type="application/zip",
+            headers={
+                "Content-Disposition": f"attachment; filename*=utf-8''{encoded}",
+                "Cache-Control": "no-cache",
+            },
+        )
+    except ValueError as e:
+        safe_detail = str(e).encode("gbk", "replace").decode("gbk")
+        raise HTTPException(status_code=400, detail=safe_detail)
+    except FileNotFoundError as e:
+        safe_detail = str(e).encode("gbk", "replace").decode("gbk")
+        raise HTTPException(status_code=404, detail=safe_detail)
+    except Exception as e:
+        print(f"[API] download_layer_bundle Exception: {e}")
+        safe_detail = str(e).encode("gbk", "replace").decode("gbk")
+        raise HTTPException(status_code=500, detail=safe_detail)
+
+
+@router.get("/revisions")
+async def data_revisions(current_user: User = Depends(get_current_user)) -> Dict[str, Any]:
+    """本组可见数据集的修订号快照（网页端兜底轮询用）。
+
+    WebSocket 的 data_changed 是唯一的即时通知通道：浏览器后台节流/网络抖动断开
+    期间错过的事件不会补发。桌面端有长轮询 + 定时同步兜底，网页端此前没有——
+    桌面端编辑上行后若网页端 WS 恰好断开，就只能手动刷新页面才能看到新数据。
+    前端定期拉本快照比对修订号，变化即补触发整表刷新。
+    """
+    try:
+        from app.services.data_group import index_entry_visible
+        from app.services import dataset_revision_service as revs
+
+        items: Dict[str, int] = {}
+        for data_id, entry in list(data_service.index.items()):
+            if not index_entry_visible(entry, current_user):
+                continue
+            rev = revs.get(data_id)
+            if rev:
+                items[data_id] = int(rev.get("rev") or 0)
+        return {"success": True, "data": {"revisions": items}}
+    except Exception as e:
+        safe_detail = str(e).encode("gbk", "replace").decode("gbk")
+        raise HTTPException(status_code=500, detail=safe_detail)
+
+
 @router.get("/list", response_model=Dict[str, Any])
 async def list_data(
     page: int = 1, page_size: int = 50,
     current_user=Depends(get_current_user),
 ) -> Dict[str, Any]:
-    """获取数据列表（支持分页，所有用户共享数据）"""
+    """获取数据列表（支持分页，按（地市+运营商）组隔离；含网优助手基站参数/指标）"""
     try:
+        from app.services.assistant import ingest_service as _ingest
+        assistant_items = _ingest.list_datasets(current_user)
+
         # 主路径：使用内存索引（由 index.json 支持，传统文件处理逻辑）
-        items = data_service.list_data(page=page, page_size=page_size)
-        total = data_service.get_total_count()
+        items = data_service.list_data(page=page, page_size=page_size, user=current_user)
+        total = data_service.get_total_count(user=current_user)
 
         if items:
-            return {"success": True, "data": items, "total": total, "page": page, "page_size": page_size}
+            merged = list(items) + assistant_items
+            return {"success": True, "data": merged,
+                    "total": total + len(assistant_items),
+                    "page": page, "page_size": page_size}
 
         # 回退：从 SQLite 查询（兼容旧数据）
         try:
-            workbooks = data_service.get_workbooks_from_db()
+            workbooks = data_service.get_workbooks_from_db(user=current_user)
         except Exception:
             workbooks = None
 
         if workbooks:
-            total = len(workbooks)
+            from app.services.assistant import ingest_service as _ingest
+            assistant_items = _ingest.list_datasets(current_user)
+            merged = list(workbooks) + assistant_items
+            total = len(merged)
             start = (page - 1) * page_size
-            paginated = workbooks[start:start + page_size]
+            paginated = merged[start:start + page_size]
             return {"success": True, "data": paginated, "total": total, "page": page, "page_size": page_size}
 
-        return {"success": True, "data": [], "total": 0, "page": page, "page_size": page_size}
+        from app.services.assistant import ingest_service as _ingest
+        assistant_items = _ingest.list_datasets(current_user)
+        return {"success": True, "data": assistant_items,
+                "total": len(assistant_items), "page": page, "page_size": page_size}
     except Exception as e:
         safe_detail = str(e).encode("gbk", "replace").decode("gbk")
         raise HTTPException(status_code=500, detail=safe_detail)
 
 
 @router.get("/{data_id}", response_model=Dict[str, Any])
-async def get_data(data_id: str) -> Dict[str, Any]:
+async def get_data(data_id: str, _group=Depends(require_data_group_access)) -> Dict[str, Any]:
     """获取数据详情"""
     try:
         data = data_service.get_data(data_id)
@@ -508,7 +794,7 @@ async def get_data(data_id: str) -> Dict[str, Any]:
 
 
 @router.delete("/{data_id}", response_model=Dict[str, Any])
-async def delete_data(data_id: str, force: bool = False, current_user=Depends(require_data_delete)) -> Dict[str, Any]:
+async def delete_data(data_id: str, force: bool = False, current_user=Depends(require_data_delete), _group=Depends(require_data_group_access)) -> Dict[str, Any]:
     """删除数据
 
     Args:
@@ -516,6 +802,11 @@ async def delete_data(data_id: str, force: bool = False, current_user=Depends(re
         force: 是否强制删除（即使文件被占用也尝试从索引中移除）
     """
     try:
+        # 网优助手基站参数/指标数据集走独立删除路径
+        from app.services.assistant import ingest_service as _ingest
+        if data_service.index.get(data_id) is None and _ingest.delete_dataset(data_id):
+            return {"success": True, "message": "删除成功"}
+
         result = data_service.delete_data(data_id, force=force)
         message = "删除成功" if result else "删除失败"
         if force and result:
@@ -531,7 +822,7 @@ async def delete_data(data_id: str, force: bool = False, current_user=Depends(re
 
 
 @router.get("/{data_id}/preview", response_model=Dict[str, Any])
-async def preview_data(data_id: str, rows: int = 100) -> Dict[str, Any]:
+async def preview_data(data_id: str, rows: int = 100, _group=Depends(require_data_group_access)) -> Dict[str, Any]:
     """预览数据"""
     try:
         # O(1) 索引查找，替代原来的 list_data() + next() O(N) 扫描
@@ -558,7 +849,7 @@ async def preview_data(data_id: str, rows: int = 100) -> Dict[str, Any]:
 
 
 @router.get("/{data_id}/layers", response_model=Dict[str, Any])
-async def get_layer_files(data_id: str) -> Dict[str, Any]:
+async def get_layer_files(data_id: str, _group=Depends(require_data_group_access)) -> Dict[str, Any]:
     """获取MapInfo图层文件列表"""
     try:
         data = data_service.get_data(data_id)
@@ -594,19 +885,52 @@ async def get_layer_files(data_id: str) -> Dict[str, Any]:
 
 
 @router.get("/{data_id}/layers/{layer_id}/data", response_model=Dict[str, Any])
-async def get_layer_data(data_id: str, layer_id: str) -> Dict[str, Any]:
+async def get_layer_data(data_id: str, layer_id: str, request: Request, response: Response, _group=Depends(require_data_group_access)) -> Dict[str, Any]:
     """获取图层要素数据（GeoJSON格式）"""
     try:
-        from app.services.mapinfo_service import get_layer_data
+        from app.services.mapinfo_service import get_layer_data, layer_version_etag
         from app.core.config import settings
 
         data_dir = settings.DATA_DIR / data_id
         if not data_dir.exists():
             raise HTTPException(status_code=404, detail="数据不存在")
 
-        geojson = get_layer_data(data_id, layer_id, data_dir)
+        # 🔧 ETag 基于源文件 mtime（与 mapinfo_service 落盘缓存失效逻辑一致），
+        # 浏览器刷新后文件未变则 304 复用，避免大 GeoJSON 重传（前端内存缓存刷新即失）
+        etag = layer_version_etag(data_dir, layer_id)
+        if etag and request.headers.get("if-none-match") == etag:
+            return Response(status_code=304)
+
+        # 🔧 预压缩 gzip 直出：命中 .geojson.gz 缓存时直接返回字节，跳过 json.dumps + gzip
+        # （大数据层每请求省 ~5s；响应已带 Content-Encoding，中间件不会二次压缩）
+        from app.services.mapinfo_service import get_layer_data_gz_bytes
+        from fastapi.concurrency import run_in_threadpool
+        gz_bytes = await run_in_threadpool(get_layer_data_gz_bytes, data_id, layer_id, data_dir)
+        if gz_bytes is not None:
+            # 🔧 重算 etag：首次请求在 get_layer_data_gz_bytes 内生成了 .mtime 文件
+            if etag is None:
+                etag = layer_version_etag(data_dir, layer_id)
+            gz_response = Response(
+                content=gz_bytes,
+                media_type="application/json",
+                headers={
+                    "Content-Encoding": "gzip",
+                    "Cache-Control": "private, max-age=0, must-revalidate",
+                },
+            )
+            if etag:
+                gz_response.headers["ETag"] = etag
+            return gz_response
+
+        # 回退：常规路径（gz 缓存生成失败时）
+        geojson = await run_in_threadpool(get_layer_data, data_id, layer_id, data_dir)
         if geojson is None:
             raise HTTPException(status_code=404, detail="图层不存在")
+
+        # 设置缓存头：ETag 命中时浏览器可 304 复用，避免大 GeoJSON 重传
+        if etag:
+            response.headers["ETag"] = etag
+            response.headers["Cache-Control"] = "private, max-age=0, must-revalidate"
 
         return {"success": True, "data": geojson}
     except HTTPException:
@@ -633,7 +957,7 @@ async def download_template(template_type: str):
 
         # 确定模板文件名前缀
         if template_type == "full_params":
-            prefix = "ProjectParameter_mongoose"
+            prefix = "ProjectParameter"
             description = "全量工参模板"
         elif template_type == "target_cells":
             prefix = "cell-tree-export"
@@ -663,11 +987,16 @@ async def download_template(template_type: str):
             if not template_file.exists():
                 template_file = None
         else:
-            # 对于其他类型，使用前缀搜索
-            for file in template_dir.iterdir():
-                if file.is_file() and file.name.startswith(prefix):
-                    template_file = file
-                    break
+            # 优先精确匹配规范文件名，找不到再按前缀搜索
+            # （前缀匹配兼容服务器上尚未改名的旧模板 ProjectParameter_mongoose.xlsx）
+            exact = template_dir / f"{prefix}.xlsx"
+            if exact.is_file():
+                template_file = exact
+            else:
+                for file in template_dir.iterdir():
+                    if file.is_file() and file.name.startswith(prefix):
+                        template_file = file
+                        break
 
         if not template_file:
             raise HTTPException(
@@ -692,7 +1021,7 @@ async def download_template(template_type: str):
 
         # 使用原始文件名（不带时间戳后缀）
         if template_type == "full_params":
-            download_filename = "ProjectParameter_mongoose.xlsx"
+            download_filename = "ProjectParameter.xlsx"
         elif template_type == "target_cells":
             download_filename = "cell-tree-export.xlsx"
         elif template_type == "geo_data":
@@ -726,7 +1055,7 @@ async def download_template(template_type: str):
 
 
 @router.get("/{data_id}/columns", response_model=Dict[str, Any])
-async def get_data_columns(data_id: str, network_type: Optional[str] = None) -> Dict[str, Any]:
+async def get_data_columns(data_id: str, network_type: Optional[str] = None, _group=Depends(require_data_group_access)) -> Dict[str, Any]:
     """获取工参数据的列名列表
 
     Args:
@@ -770,7 +1099,7 @@ async def get_data_columns(data_id: str, network_type: Optional[str] = None) -> 
 
 
 @router.get("/{data_id}/layers/{layer_id}/columns", response_model=Dict[str, Any])
-async def get_layer_columns(data_id: str, layer_id: str) -> Dict[str, Any]:
+async def get_layer_columns(data_id: str, layer_id: str, _group=Depends(require_data_group_access)) -> Dict[str, Any]:
     """获取MapInfo图层的字段名列表
 
     Args:
@@ -780,13 +1109,14 @@ async def get_layer_columns(data_id: str, layer_id: str) -> Dict[str, Any]:
     try:
         from app.services.mapinfo_service import get_layer_data
         from app.core.config import settings
+        from fastapi.concurrency import run_in_threadpool
 
         data_dir = settings.DATA_DIR / data_id
         if not data_dir.exists():
             raise HTTPException(status_code=404, detail="数据不存在")
 
-        # 获取图层数据
-        layer_data = get_layer_data(data_id, layer_id, data_dir)
+        # 获取图层数据（缓存未命中时 gpd 解析为 CPU 密集型，用线程池避免阻塞事件循环）
+        layer_data = await run_in_threadpool(get_layer_data, data_id, layer_id, data_dir)
         if not layer_data or "features" not in layer_data:
             raise HTTPException(status_code=404, detail="图层数据不存在")
 
@@ -820,7 +1150,7 @@ async def get_layer_columns(data_id: str, layer_id: str) -> Dict[str, Any]:
 
 
 @router.get("/{data_id}/render-mobile", response_model=Dict[str, Any])
-async def render_mobile_data(data_id: str) -> Dict[str, Any]:
+async def render_mobile_data(data_id: str, _group=Depends(require_data_group_access)) -> Dict[str, Any]:
     """移动端数据渲染接口 - 返回可直接渲染的数据（坐标已转换GCJ02）
     
     根据数据类型自动处理：
@@ -835,26 +1165,19 @@ async def render_mobile_data(data_id: str) -> Dict[str, Any]:
         data_type = data_info.get("type", "")
         
         if data_type == "map":
-            # MapInfo 文件：获取所有图层的 GeoJSON 数据（坐标转换 GCJ02）
+            # MapInfo 文件：获取所有图层的 GeoJSON 数据
+            # 坐标转换统一由 get_layer_data 内部完成（transform_coords=True，WGS84→GCJ02）
             from app.services.mapinfo_service import get_layer_data as get_mapinfo_layer_data
-            from app.utils.coordinate_transformer import CoordinateTransformer
-            
+
             layers_meta = data_info.get("metadata", {}).get("layers", [])
             data_dir = settings.DATA_DIR / data_id
-            
+
             layers_result = []
             for layer_meta in layers_meta:
                 try:
                     layer_id = layer_meta.get("id", "")
                     geojson = get_mapinfo_layer_data(data_id, layer_id, data_dir)
                     if geojson and "features" in geojson:
-                        # 转换坐标 WGS84 → GCJ02
-                        for feature in geojson["features"]:
-                            if feature.get("geometry") and feature["geometry"].get("coordinates"):
-                                feature["geometry"]["coordinates"] = \
-                                    CoordinateTransformer.transform_geojson_coordinates(
-                                        feature["geometry"]["coordinates"], from_wgs84=True
-                                    )
                         layers_result.append({
                             "id": layer_id,
                             "name": layer_meta.get("name", layer_id),
@@ -960,6 +1283,9 @@ async def start_chunked_upload(
         "total_size": total_size,
         "received": set(),
         "created_at": time.time(),
+        # 会话属主：data_id 是上传会话 ID（索引中尚无该条目），不能用组门禁；
+        # 归属校验改为会话级——仅创建者本人可续传/完成/取消
+        "user_id": current_user.id,
     }
 
     print(f"[ChunkedUpload] 会话已创建: {data_id}, 文件: {safe_filename}, 分块: {total_chunks}")
@@ -982,7 +1308,7 @@ async def upload_chunk(
 ) -> Dict[str, Any]:
     """上传单个分块"""
     session = _chunked_sessions.get(data_id)
-    if not session:
+    if not session or session.get("user_id") != current_user.id:
         raise HTTPException(status_code=404, detail="上传会话不存在或已过期")
 
     content = await file.read()
@@ -1003,12 +1329,23 @@ async def complete_chunked_upload(
     data_id: str,
     filename: str = Form(...),
     file_type: str = Form("excel"),
+    file_path: Optional[str] = Form(None),
     current_user=Depends(require_data_import),
 ) -> Dict[str, Any]:
-    """完成分块上传：重组文件、创建索引、启动后台处理"""
+    """完成分块上传：重组文件、创建索引、启动后台处理。
+
+    file_path：导入文件在本机的真实路径（桌面端可用时传入）。与 upload_excel 的
+    file_path 同义，落到索引 originalPath —— 后续"工参更新"据此把更新结果回存到
+    本机原始文件路径（savedToOriginal）。缺失时仅影响回存，不影响上传本身。
+    """
     session = _chunked_sessions.get(data_id)
-    if not session:
+    if not session or session.get("user_id") != current_user.id:
         raise HTTPException(status_code=404, detail="上传会话不存在或已过期")
+
+    # 先解析本机原始路径参数（下方 file_path 变量会被重组后的本地文件 Path 覆盖）；
+    # 只剥引号不做 isabs 过滤（与 upload_excel 的 init_upload 一致，Windows 盘符路径
+    # 在 Linux 宿主上 isabs=False，误杀会导致桌面端回存失效）
+    original_path_arg = (file_path or "").strip().strip("\"'") or None
 
     chunks_dir = Path(session["chunks_dir"])
     total = session["total_chunks"]
@@ -1047,7 +1384,23 @@ async def complete_chunked_upload(
 
     print(f"[ChunkedUpload] 文件重组完成: {file_path}, 大小: {file_path.stat().st_size:,} 字节")
 
-    if file_type == "geo_data":
+    if file_type == "layer":
+        # 图层制作：只重组文件到 layer_tmp，不建 data 索引，返回 file_path
+        # 前端后续用 file_path 调 /layer/excel-info 和 /layer/point|sector（上传只发生一次）
+        layer_tmp = settings.UPLOAD_DIR / "layer_tmp"
+        layer_tmp.mkdir(parents=True, exist_ok=True)
+        dest = layer_tmp / f"src_{data_id[:8]}{ext}"
+        shutil.move(str(file_path), str(dest))  # 同文件系统原子重命名，避免 uploads 根目录残留被 scan 迁入索引
+        print(f"[ChunkedUpload] 图层文件已保存: {dest}")
+        return {
+            "success": True,
+            "data": {
+                "file_path": str(dest),
+                "name": safe_filename,
+                "source_filename": safe_filename,  # 原始文件名（未重命名），供 /layer/* 命名输出
+            },
+        }
+    elif file_type == "geo_data":
         # 地理化数据：创建索引后异步处理（避免解析耗时阻塞请求）
         data_dir = settings.DATA_DIR / data_id
         data_dir.mkdir(parents=True, exist_ok=True)
@@ -1057,6 +1410,9 @@ async def complete_chunked_upload(
             'name': safe_filename,
             'type': 'excel',
             'fileType': 'geo_data',
+            'user_id': current_user.id,
+            'city': current_user.city,
+            'operator': current_user.operator,
             'size': file_path.stat().st_size,
             'uploadDate': time.strftime("%Y-%m-%dT%H:%M:%S"),
             'status': 'processing',
@@ -1072,8 +1428,10 @@ async def complete_chunked_upload(
                     geo_service.parse_geo_data,
                     str(file_path),
                     safe_filename,
-                    1,  # user_id
+                    current_user.id,  # user_id
                     data_id,  # geo_id
+                    current_user.city,
+                    current_user.operator,
                 )
 
                 json_path = data_dir / 'default.json'
@@ -1090,6 +1448,7 @@ async def complete_chunked_upload(
                     }
                 })
                 data_service._save_index()
+                data_service._bump_revision(data_id)  # 桌面共享模式：新数据需上行到服务器
                 print(f"[ChunkedUpload] 地理化数据解析完成: {data_id}")
             except Exception as e:
                 import traceback
@@ -1114,33 +1473,36 @@ async def complete_chunked_upload(
         }
     else:
         # 默认：Excel 工参数据处理
-        # 检查同名文件
-        existing_id = None
-        for exist_id, exist_info in data_service.index.items():
-            if exist_info.get("name") == safe_filename and exist_info.get("type") == "excel":
-                existing_id = exist_id
-                break
-
-        if existing_id:
-            # 删除旧文件，覆盖
-            print(f"[ChunkedUpload] 覆盖同名文件: {safe_filename} (旧ID: {existing_id})")
+        # 文件名契约 + 内部工作表强校验：失败直接 400，不建索引、不删旧文件
+        if ext.lower() in (".xlsx", ".xls"):
             try:
-                data_service.delete_data(existing_id)
-            except Exception as e:
-                print(f"[ChunkedUpload] 删除旧文件失败 (非致命): {e}")
+                validate_excel_upload_contract(safe_filename, file_path)
+            except ValueError as e:
+                file_path.unlink(missing_ok=True)
+                safe_detail = str(e).encode("gbk", "replace").decode("gbk")
+                raise HTTPException(status_code=400, detail=safe_detail)
+
+        # 同名旧文件不在此删除：后台解析成功后由 data_service 的"同组同类型替换"
+        # 逻辑统一清理，避免新文件解析失败导致旧数据丢失。
 
         data_dir = settings.DATA_DIR / data_id
         data_dir.mkdir(parents=True, exist_ok=True)
         shutil.copy(file_path, data_dir / f"original{ext}")
 
+        # 与 upload_excel 的 originalPath 语义一致：记录导入时的本机真实路径，
+        # "工参更新"完成后据此把结果回存（_process_upload_sync 会把它写进 Workbook）
         data_service.index[data_id] = {
             "id": data_id,
             "name": safe_filename,
             "type": "excel",
             "fileType": "pending",
+            "user_id": current_user.id,
+            "city": current_user.city,
+            "operator": current_user.operator,
             "size": file_path.stat().st_size,
             "uploadDate": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "status": "processing",
+            "originalPath": original_path_arg,
         }
         print(f"[ChunkedUpload] 索引条目已创建: {data_id}")
 
@@ -1167,9 +1529,13 @@ async def complete_chunked_upload(
 
 
 @router.post("/upload/{data_id}/cancel")
-async def cancel_chunked_upload(data_id: str) -> Dict[str, Any]:
+async def cancel_chunked_upload(data_id: str, current_user=Depends(get_current_user)) -> Dict[str, Any]:
     """取消分块上传并清理临时文件"""
     session = _chunked_sessions.pop(data_id, None)
+    if session and session.get("user_id") != current_user.id:
+        # 非本人会话按不存在处理（不泄露会话存在性）
+        _chunked_sessions[data_id] = session
+        session = None
     if session:
         chunks_dir = Path(session["chunks_dir"])
         if chunks_dir.exists():

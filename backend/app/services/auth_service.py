@@ -8,12 +8,16 @@ from typing import Optional, List, Tuple
 
 from passlib.context import CryptContext
 from jose import jwt, JWTError
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
-from app.models.database import User, UserSession, UserSettings, TaskResult, Workbook, Site, Sector, GeoFile, Layer
+from app.models.database import User, UserSession, UserSettings
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+# 哨兵：区分「调用方没传全局期限（自己去查）」与「明确传 None（全局无限期）」
+_UNSET = object()
 
 
 class AuthService:
@@ -29,10 +33,23 @@ class AuthService:
 
     # ---- JWT ----
 
-    def create_access_token(self, user_id: int, username: str, is_admin: bool) -> Tuple[str, str]:
-        """创建JWT令牌，返回 (token, jti)"""
+    def create_access_token(
+        self,
+        user_id: int,
+        username: str,
+        is_admin: bool,
+        expires_delta: Optional[timedelta] = None,
+    ) -> Tuple[str, str]:
+        """创建JWT令牌，返回 (token, jti)。
+
+        expires_delta 省略时用默认有效期；桌面免登录会话传入超长有效期
+        （桌面没有登录入口可重新签发，过期即死锁）。
+        """
         jti = str(uuid.uuid4())
-        expire = datetime.now(timezone.utc) + timedelta(minutes=settings.JWT_ACCESS_TOKEN_EXPIRE_MINUTES)
+        delta = expires_delta if expires_delta is not None else timedelta(
+            minutes=settings.JWT_ACCESS_TOKEN_EXPIRE_MINUTES
+        )
+        expire = datetime.now(timezone.utc) + delta
         payload = {
             "sub": str(user_id),
             "username": username,
@@ -63,14 +80,60 @@ class AuthService:
             return None, "用户名或密码错误"
         if not user.is_active:
             return None, "账号已被禁用，请联系管理员"
-        if user.license_expiry:
-            now = datetime.now(timezone.utc)
-            expiry = user.license_expiry
-            if expiry.tzinfo is None:
-                expiry = expiry.replace(tzinfo=timezone.utc)
-            if expiry < now:
-                return None, "授权已过期，请联系管理员"
+        if not settings.NPT_DESKTOP:
+            # 服务器模式：授权期限作登录闸门。管理员始终无限期（不受全局期限约束）；
+            # 非管理员按「自身例外期限优先，否则用全局期限」判定。
+            # 桌面模式跳过：未激活时会把全体用户镜像为过去日期，若在此拦截，
+            # 管理员将无法登录去激活（鸡生蛋）；桌面端由签名授权文件 + 前端门禁约束
+            expiry = self.effective_license_expiry(user)
+            if expiry is not None:
+                now = datetime.now(timezone.utc)
+                if expiry.tzinfo is None:
+                    expiry = expiry.replace(tzinfo=timezone.utc)
+                if expiry < now:
+                    return None, "授权已过期，请联系管理员"
         return user, None
+
+    @staticmethod
+    def _global_license_expiry() -> Optional[datetime]:
+        from app.services import system_settings_service as sys_settings
+
+        try:
+            return sys_settings.get_license_expiry()
+        except Exception:  # noqa: BLE001
+            return None
+
+    @classmethod
+    def effective_license_expiry(
+        cls, user: User, global_expiry: Optional[datetime] = _UNSET
+    ) -> Optional[datetime]:
+        """用户实际适用的授权期限；None = 无限期。
+
+        - 管理员：恒为 None（权限无限期，不受全局授权期限影响）
+        - 非管理员：自身 license_expiry（用户管理页单独设置的例外）优先，
+          未设置则取全局授权期限（system_settings，对所有用户生效）
+
+        global_expiry 由调用方预取，用于列表场景避免逐个用户查库。
+        """
+        if getattr(user, "is_admin", False):
+            return None
+        if user.license_expiry:
+            return user.license_expiry
+        return cls._global_license_expiry() if global_expiry is _UNSET else global_expiry
+
+    @classmethod
+    def user_payload(cls, user: User, global_expiry: Optional[datetime] = _UNSET) -> dict:
+        """用户响应体：在 to_dict() 基础上补 effective_license_expiry。
+
+        `license_expiry` 保留原值（该用户单独设置的例外期限，用户管理页展示用），
+        `effective_license_expiry` 才是前端门禁（licenseStore）该用的实际期限。
+        """
+        from app.models.database import _serialize_dt
+
+        data = user.to_dict()
+        effective = cls.effective_license_expiry(user, global_expiry)
+        data["effective_license_expiry"] = _serialize_dt(effective)
+        return data
 
     @staticmethod
     def get_client_ip(request) -> str:
@@ -130,7 +193,8 @@ class AuthService:
     def update_user(self, db: Session, user_id: int, updates: dict) -> Optional[User]:
         """更新用户字段（不含密码）"""
         allowed_fields = {"is_active", "is_admin", "license_expiry", "must_change_password", "total_usage_seconds", "city", "operator",
-                          "can_data_import", "can_data_delete", "can_data_update", "can_cell_entry"}
+                          "can_data_import", "can_data_delete", "can_data_update", "can_cell_entry", "can_cell_query_update",
+                          "can_assistant"}
         user = self.get_user_by_id(db, user_id)
         if not user:
             return None
@@ -172,16 +236,54 @@ class AuthService:
         page_size: int = 20,
         search: Optional[str] = None,
         is_active: Optional[bool] = None,
-    ) -> Tuple[List[User], int]:
-        """获取用户列表（分页+搜索+筛选），返回 (users, total_count)"""
+    ) -> Tuple[List[User], int, dict]:
+        """获取用户列表（分页+搜索+筛选），在线用户优先置顶。
+
+        返回 (page_users, total_count, online_stats)。
+        online_stats 为全量（跨所有页）在线统计：
+        {online, online_pc, online_app, online_desktop}。
+        """
         query = db.query(User)
+        # 服务器为桌面端创建的影子账号（不可登录，仅承载同步数据归属）不进用户列表
+        query = query.filter(User.is_desktop_shadow == False)  # noqa: E712
         if search:
             query = query.filter(User.username.ilike(f"%{search}%"))
         if is_active is not None:
             query = query.filter(User.is_active == is_active)
-        total = query.count()
-        users = query.order_by(User.created_at.desc()).offset((page - 1) * page_size).limit(page_size).all()
-        return users, total
+
+        all_users = query.order_by(User.created_at.desc()).all()
+        total = len(all_users)
+
+        # 最近 5 分钟内的活跃会话（一次性查出，避免逐用户查询）
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=5)
+        active_rows = db.query(UserSession.user_id, UserSession.client_type).filter(
+            UserSession.logout_time.is_(None),
+            UserSession.last_activity >= cutoff,
+        ).all()
+        online_pc_ids = {uid for uid, ct in active_rows if ct == 'pc'}
+        online_app_ids = {uid for uid, ct in active_rows if ct == 'app'}
+        # 桌面端（共享模式登录）在服务器记 client_type='desktop' 的会话
+        online_desktop_ids = {uid for uid, ct in active_rows if ct == 'desktop'}
+        online_any_ids = online_pc_ids | online_app_ids | online_desktop_ids
+
+        online_stats = {
+            "online": len(online_any_ids),
+            "online_pc": len(online_pc_ids),
+            "online_app": len(online_app_ids),
+            "online_desktop": len(online_desktop_ids),
+        }
+
+        # 在线用户优先置顶，其次按注册时间倒序
+        all_users.sort(
+            key=lambda u: (
+                0 if u.id in online_any_ids else 1,
+                -(u.created_at.timestamp() if u.created_at else 0),
+            )
+        )
+
+        start = (page - 1) * page_size
+        page_users = all_users[start:start + page_size]
+        return page_users, total, online_stats
 
     # ---- 会话管理 ----
 
@@ -190,7 +292,7 @@ class AuthService:
         db.add(session)
         db.commit()
         db.refresh(session)
-        # 清理其他过期会话，自动累加使用时长
+        # 结算其他超时会话的使用时长（不注销，避免打断仍在有效期内的登录态）
         self.cleanup_stale_sessions(db, idle_minutes=6)
         return session
 
@@ -223,6 +325,37 @@ class AuthService:
         ).all()
         count = 0
         for s in sessions:
+            self._accumulate_session_duration(db, s, now)
+            s.logout_time = now
+            s.last_activity = now
+            count += 1
+        if count > 0:
+            db.commit()
+        return count
+
+    def revoke_other_sessions(
+        self, db: Session, user_id: int, keep_jti: str,
+        client_types: Optional[tuple] = ("pc", "desktop"),
+    ) -> int:
+        """注销该用户的其它会话：网页端与桌面端互踢，以最后登录为准。
+
+        同一账号不允许在网页端与桌面端同时在线：任一端的新登录都会把同账号的
+        其它 pc/desktop 登录踢下线，被踢方下次请求即 401（前端提示并回到登录页）。
+        client_types 限定被踢的会话类型（APP 端登录不参与互踢，保持既有行为）。
+        返回被注销的会话数量。
+        """
+        now = datetime.now(timezone.utc)
+        query = db.query(UserSession).filter(
+            UserSession.user_id == user_id,
+            UserSession.logout_time.is_(None),
+            UserSession.token_jti != keep_jti,
+        )
+        if client_types:
+            query = query.filter(UserSession.client_type.in_(list(client_types)))
+        sessions = query.all()
+        count = 0
+        for s in sessions:
+            self._accumulate_session_duration(db, s, now)
             s.logout_time = now
             s.last_activity = now
             count += 1
@@ -231,36 +364,43 @@ class AuthService:
         return count
 
     def _accumulate_session_duration(self, db: Session, session: UserSession, end_time: Optional[datetime] = None):
-        """累加指定会话的使用时长到用户记录"""
+        """增量累加指定会话的使用时长到用户记录（从上次结算点算到 end_time）"""
         if end_time is None:
             end_time = datetime.now(timezone.utc)
-        login_time = session.login_time
-        if login_time.tzinfo is None:
-            login_time = login_time.replace(tzinfo=timezone.utc)
-        duration = (end_time - login_time).total_seconds()
+        if end_time.tzinfo is None:
+            end_time = end_time.replace(tzinfo=timezone.utc)
+        last_end = session.usage_accounted_at or session.login_time
+        if last_end.tzinfo is None:
+            last_end = last_end.replace(tzinfo=timezone.utc)
+        duration = (end_time - last_end).total_seconds()
         if duration > 0:
             user = db.query(User).filter(User.id == session.user_id).first()
             if user:
                 user.total_usage_seconds += int(duration)
+            session.usage_accounted_at = end_time
 
     def cleanup_stale_sessions(self, db: Session, idle_minutes: int = 5) -> int:
-        """清理超过 N 分钟无活动的过期会话，以最后活动时间作为离线时间点累加使用时长。
+        """结算超过 N 分钟无活动会话的使用时长（只结算，不注销会话）。
 
         解决直接关闭浏览器/APP 不调登出接口导致使用时长统计为 0 的问题。
-        返回清理的会话数量。
+        注意：不再把这些会话置为已登出——否则 JWT 仍在有效期内的用户会被
+        频繁打断、被迫重新登录；是否要求重新登录由空闲超时策略决定
+        （见 is_session_idle_expired）。返回结算的会话数量。
         """
         cutoff = datetime.now(timezone.utc) - timedelta(minutes=idle_minutes)
         stale_sessions = db.query(UserSession).filter(
             UserSession.logout_time.is_(None),
             UserSession.last_activity < cutoff,
+            or_(
+                UserSession.usage_accounted_at.is_(None),
+                UserSession.usage_accounted_at < UserSession.last_activity,
+            ),
         ).all()
-        now = datetime.now(timezone.utc)
         for s in stale_sessions:
             end_time = s.last_activity
             if end_time.tzinfo is None:
                 end_time = end_time.replace(tzinfo=timezone.utc)
             self._accumulate_session_duration(db, s, end_time)
-            s.logout_time = s.last_activity  # 以最后活动时间作为离线时间
         if stale_sessions:
             db.commit()
         return len(stale_sessions)
@@ -289,25 +429,32 @@ class AuthService:
         return True
 
     def is_token_revoked(self, db: Session, token_jti: str) -> bool:
-        """检查令牌是否已注销"""
+        """检查令牌是否已注销（主动登出或被其他设备登录踢出）"""
         session = db.query(UserSession).filter(
             UserSession.token_jti == token_jti,
             UserSession.logout_time.isnot(None),
         ).first()
         return session is not None
 
-    def verify_session_ip(self, db: Session, token_jti: str, current_ip: str) -> bool:
-        """验证请求IP是否与会话记录IP一致。APP会话跳过IP校验。"""
-        if not current_ip or current_ip == "unknown":
-            return True  # 无法获取IP时放行
+    def is_session_idle_expired(
+        self, db: Session, token_jti: str, idle_minutes: Optional[int] = None
+    ) -> bool:
+        """检查会话是否空闲超时（连续无操作超过阈值才要求重新登录）。
+
+        idle_minutes 覆盖全局阈值（桌面单机模式按管理员设定的天数是 2 天起）。
+        会话记录不存在时放行（历史 token 无会话记录，交由其他逻辑处理）。
+        """
         session = db.query(UserSession).filter(UserSession.token_jti == token_jti).first()
-        if not session:
-            return True  # 会话不存在时放行（由其他逻辑处理）
-        if not session.ip_address:
-            return True  # 旧会话没有IP记录，放行
-        if session.client_type == 'app':
-            return True  # APP会话不校验IP，允许多设备同时登录
-        return session.ip_address == current_ip
+        if not session or not session.last_activity:
+            return False
+        last_activity = session.last_activity
+        if last_activity.tzinfo is None:
+            last_activity = last_activity.replace(tzinfo=timezone.utc)
+        idle = datetime.now(timezone.utc) - last_activity
+        minutes = settings.SESSION_IDLE_TIMEOUT_MINUTES
+        if idle_minutes:
+            minutes = int(idle_minutes)
+        return idle > timedelta(minutes=minutes)
 
     def get_user_sessions(self, db: Session, user_id: int) -> list:
         return db.query(UserSession).filter(UserSession.user_id == user_id).order_by(UserSession.login_time.desc()).all()
@@ -334,22 +481,17 @@ class AuthService:
         return session is not None
 
     def delete_user(self, db: Session, user_id: int) -> bool:
-        """硬删除用户及其所有关联数据"""
+        """硬删除用户及其会话/设置。
+
+        注意：业务数据（Workbook/Site/Sector/GeoFile/Layer/TaskResult）不归用户所有，
+        而是归（地市+运营商）组所有，不随成员删除而级联删除。
+        """
         user = self.get_user_by_id(db, user_id)
         if not user:
             return False
-        # 级联删除所有关联数据（按外键依赖顺序）
+        # 仅级联删除用户私有数据（会话与个性化设置）
         db.query(UserSession).filter(UserSession.user_id == user_id).delete()
         db.query(UserSettings).filter(UserSettings.user_id == user_id).delete()
-        db.query(TaskResult).filter(TaskResult.user_name == user.username).delete()
-        # 获取该用户的所有 workbook_id
-        workbook_ids = [w.id for w in db.query(Workbook).filter(Workbook.user_id == user_id).all()]
-        for wid in workbook_ids:
-            db.query(Sector).filter(Sector.workbook_id == wid).delete()
-            db.query(Site).filter(Site.workbook_id == wid).delete()
-        db.query(Workbook).filter(Workbook.user_id == user_id).delete()
-        db.query(GeoFile).filter(GeoFile.user_id == user_id).delete()
-        db.query(Layer).filter(Layer.user_id == user_id).delete()
         db.delete(user)
         db.commit()
         return True

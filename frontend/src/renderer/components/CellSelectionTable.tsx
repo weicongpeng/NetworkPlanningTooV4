@@ -20,6 +20,8 @@ export interface CellSector {
   name?: string
   frequency?: number
   pci?: number
+  longitude?: number | null
+  latitude?: number | null
 }
 
 export interface CellSelectionTableProps {
@@ -29,8 +31,8 @@ export interface CellSelectionTableProps {
   selectedCellIds: Set<string>
   /** 切换小区选中状态 */
   onToggleCell: (cellId: string) => void
-  /** 全选回调 */
-  onSelectAll: () => void
+  /** 全选回调（传入当前搜索过滤后的小区ID列表） */
+  onSelectAll: (filteredIds: string[]) => void
   /** 清空选择回调 */
   onClearSelections: () => void
   /** 选中数量展示文本（可选） */
@@ -46,6 +48,8 @@ export interface CellSelectionTableProps {
     cellName: string
     cellFreq: string
     cellPci: string
+    cellLng?: string
+    cellLat?: string
     selectAll: string
     clearSelections: string
     uploadCellFile?: string
@@ -143,9 +147,15 @@ export const CellSelectionTable = ({
     cellName: '小区名称',
     cellFreq: '频点',
     cellPci: 'PCI',
+    cellLng: '经度',
+    cellLat: '纬度',
     selectAll: '全选',
     clearSelections: '清空选择'
   }
+
+  // 经纬度格式化：6 位小数，无效值显示 '-'
+  const formatCoord = (v?: number | null) =>
+    v != null && isFinite(v) ? v.toFixed(6) : '-'
 
   if (loading) {
     return (
@@ -156,9 +166,9 @@ export const CellSelectionTable = ({
     )
   }
 
-  // 判断当前网络类型的所有小区是否都已选中
-  const allSelected = sectors.length > 0 && sectors.every(s => selectedCellIds.has(s.id))
-  const someSelected = sectors.some(s => selectedCellIds.has(s.id))
+  // 判断当前搜索过滤后的小区是否都已选中
+  const allSelected = filtered.length > 0 && filtered.every(s => selectedCellIds.has(s.id))
+  const someSelected = filtered.some(s => selectedCellIds.has(s.id))
   const noneSelected = !someSelected
 
   return (
@@ -242,7 +252,7 @@ export const CellSelectionTable = ({
               <div className="flex text-[10px] font-medium">
                 <div className="p-2 bg-muted border-r border-border w-10 shrink-0 flex items-center justify-center">
                   <button
-                    onClick={() => !disabled && onSelectAll()}
+                    onClick={() => !disabled && onSelectAll(filtered.map(s => s.id))}
                     disabled={disabled}
                     className="w-4 h-4 rounded-sm border flex items-center justify-center disabled:opacity-50 disabled:cursor-not-allowed"
                     style={{
@@ -262,7 +272,9 @@ export const CellSelectionTable = ({
                 <div className="p-2 bg-muted border-r border-border w-[80px] shrink-0">{colLabels.cellId}</div>
                 <div className="p-2 bg-muted border-r border-border w-[90px] shrink-0">{colLabels.cellFreq}</div>
                 <div className="p-2 bg-muted border-r border-border w-[70px] shrink-0">{colLabels.cellPci}</div>
-                <div className="p-2 bg-muted flex-1 min-w-0">{colLabels.cellName}</div>
+                <div className="p-2 bg-muted border-r border-border flex-1 min-w-0">{colLabels.cellName}</div>
+                <div className="p-2 bg-muted border-r border-border w-[95px] shrink-0">{colLabels.cellLng ?? '经度'}</div>
+                <div className="p-2 bg-muted w-[85px] shrink-0">{colLabels.cellLat ?? '纬度'}</div>
               </div>
             </div>
 
@@ -279,7 +291,7 @@ export const CellSelectionTable = ({
                     disabled ? 'cursor-not-allowed' : 'cursor-pointer'
                   } ${
                     selectedCellIds.has(sector.id)
-                      ? 'bg-blue-50/50'
+                      ? 'bg-blue-500/10'
                       : disabled ? 'bg-card' : 'bg-card hover:bg-muted/50'
                   }`}
                   style={{ height: ITEM_HEIGHT }}
@@ -326,11 +338,25 @@ export const CellSelectionTable = ({
                     {sector.pci != null ? sector.pci : '-'}
                   </div>
                   <div
-                    className="p-2 truncate flex-1 min-w-0"
+                    className="p-2 truncate border-r border-border flex-1 min-w-0"
                     title={sector.name}
                     style={{ lineHeight: `${ITEM_HEIGHT - 16}px` }}
                   >
                     {sector.name}
+                  </div>
+                  <div
+                    className="p-2 font-mono truncate border-r border-border w-[95px] shrink-0"
+                    title={formatCoord(sector.longitude)}
+                    style={{ lineHeight: `${ITEM_HEIGHT - 16}px` }}
+                  >
+                    {formatCoord(sector.longitude)}
+                  </div>
+                  <div
+                    className="p-2 font-mono truncate w-[85px] shrink-0"
+                    title={formatCoord(sector.latitude)}
+                    style={{ lineHeight: `${ITEM_HEIGHT - 16}px` }}
+                  >
+                    {formatCoord(sector.latitude)}
                   </div>
                 </div>
               ))}

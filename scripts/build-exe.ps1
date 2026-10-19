@@ -1,4 +1,4 @@
-# Network Planning Tool Build Script
+# NetOpt Engine Build Script
 # Builds the project into executable files
 
 param(
@@ -26,7 +26,7 @@ $BackendDir = Join-Path $ProjectRoot "backend"
 $ReleaseDir = Join-Path $FrontendDir "release"
 
 Write-Host ""
-Write-Host ">>> Network Planning Tool Build Script <<<" -ForegroundColor Magenta
+Write-Host ">>> NetOpt Engine Build Script <<<" -ForegroundColor Magenta
 Write-Host ""
 Write-Host "[INFO] Project Root: $ProjectRoot" -ForegroundColor Cyan
 Write-Host "[INFO] Target Platform: $Target" -ForegroundColor Cyan

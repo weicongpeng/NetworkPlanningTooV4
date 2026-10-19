@@ -1,0 +1,26 @@
+[Unit]
+Description=NetOpt Engine Backend (FastAPI)
+After=network.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=pwc
+WorkingDirectory=/home/pwc/NetworkPlanningTooV3/backend
+ExecStart=/home/pwc/NetworkPlanningTooV3/backend/.venv/bin/python3 main.py
+Restart=always
+RestartSec=5
+
+Environment=NPT_RELOAD=false
+Environment=NPT_WORKERS=1
+
+OOMScoreAdjust=-500
+MemoryMax=2G
+MemoryHigh=1.5G
+
+StandardOutput=append:/var/log/npt-backend.log
+StandardError=append:/var/log/npt-backend.log
+
+[Install]
+WantedBy=multi-user.target

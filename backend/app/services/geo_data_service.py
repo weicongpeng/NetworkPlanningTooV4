@@ -24,15 +24,17 @@ class GeoDataService:
     def __init__(self):
         self.detector = GeoFieldDetector()
 
-    def parse_geo_data(self, file_path: str, filename: str, user_id: int = 1, geo_id: str = None) -> Dict[str, Any]:
+    def parse_geo_data(self, file_path: str, filename: str, user_id: int = 1, geo_id: str = None,
+                       city: Optional[str] = None, operator: Optional[str] = None) -> Dict[str, Any]:
         """
         解析地理化数据文件
 
         Args:
             file_path: 文件路径
             filename: 文件名
-            user_id: 用户ID（用于数据隔离）
+            user_id: 用户ID（上传者印记）
             geo_id: 可选的 geo 数据 ID（与 API 层 data_id 一致，避免写入时生成新 UUID）
+            city/operator: 数据所属组（地市+运营商）归属快照，取自上传者
 
         Returns:
             解析结果字典：
@@ -48,16 +50,17 @@ class GeoDataService:
         if df.empty:
             raise ValueError(f"文件「{filename}」为空或格式不正确")
 
-        # 🔴 早期调试：打印 DataFrame 信息
-        print(f"[GeoDataService] 🔴🔴🔴 ===== DataFrame 信息 =====")
-        print(f"[GeoDataService] 🔴🔴🔴 文件名: {filename}")
-        print(f"[GeoDataService] 🔴🔴🔴 行数: {len(df)}, 列数: {len(df.columns)}")
-        print(f"[GeoDataService] 🔴🔴🔴 原始列名: {list(df.columns)}")
+        # 早期调试：打印 DataFrame 信息（注意：不要带 emoji —— Windows 下
+        # print 到 GBK 流会抛 UnicodeEncodeError；参见 app/core/console_encoding.py）
+        print(f"[GeoDataService] ===== DataFrame 信息 =====")
+        print(f"[GeoDataService] 文件名: {filename}")
+        print(f"[GeoDataService] 行数: {len(df)}, 列数: {len(df.columns)}")
+        print(f"[GeoDataService] 原始列名: {list(df.columns)}")
         print(
-            f"[GeoDataService] 🔴🔴🔴 列类型: {[df[col].dtype for col in df.columns]}"
+            f"[GeoDataService] 列类型: {[df[col].dtype for col in df.columns]}"
         )
-        print(f"[GeoDataService] 🔴🔴🔴 前3行数据:\n{df.head(3).to_string()}")
-        print(f"[GeoDataService] 🔴🔴🔴 ==========================")
+        print(f"[GeoDataService] 前3行数据:\n{df.head(3).to_string()}")
+        print(f"[GeoDataService] ==========================")
 
         # 2. 字段检测
         fields = self.detector.detect_fields(df)
@@ -158,6 +161,8 @@ class GeoDataService:
             bbox=_compute_bbox(geo_data) if geo_data else None,
             file_size=Path(file_path).stat().st_size if Path(file_path).exists() else None,
             geo_id=geo_id,
+            city=city,
+            operator=operator,
         )
 
         return {
@@ -479,6 +484,8 @@ def _save_geo_file_metadata(
     bbox: Optional[List[float]] = None,
     file_size: Optional[int] = None,
     geo_id: Optional[str] = None,
+    city: Optional[str] = None,
+    operator: Optional[str] = None,
 ):
     """保存地理化数据文件元数据到 SQLite"""
     db = SessionLocal()
@@ -486,6 +493,8 @@ def _save_geo_file_metadata(
         geo = GeoFile(
             id=geo_id or str(uuid.uuid4()),
             user_id=user_id,
+            city=city,
+            operator=operator,
             filename=filename,
             file_path=file_path,
             geometry_type=geometry_type,

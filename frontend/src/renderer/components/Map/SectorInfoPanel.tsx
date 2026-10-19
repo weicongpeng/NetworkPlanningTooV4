@@ -9,8 +9,14 @@
  * - 支持自定义属性字段
  */
 import { useState, useEffect, useRef, useCallback } from 'react'
+import { ArrowLeft } from 'lucide-react'
+import { useTranslation } from 'react-i18next'
 import { RenderSectorData } from '../../services/mapDataService'
 import L from 'leaflet'
+import { clampPopupPosition, type MapViewportBounds } from './popupPosition'
+
+/** 弹窗固定宽度（高度随内容，上限为地图视口高度，超出纵向滚动） */
+const PANEL_WIDTH = 420
 
 /**
  * 属性面板属性
@@ -22,11 +28,15 @@ export interface SectorInfoPanelProps {
   visible: boolean
   /** 关闭回调 */
   onClose: () => void
+  /** 返回回调（从重叠扇区列表进入属性框时提供，显示返回按钮回到列表） */
+  onBack?: () => void
   /** 位置信息 */
   position?: {
     x: number
     y: number
   }
+  /** 地图视口矩形（弹窗始终完整落在该区域内） */
+  viewportBounds?: MapViewportBounds | null
   /** 鼠标进入回调（暂停自动关闭计时器） */
   onMouseEnter?: () => void
   /** 鼠标离开回调（恢复自动关闭计时器） */
@@ -36,7 +46,8 @@ export interface SectorInfoPanelProps {
 /**
  * 扇区属性信息面板
  */
-export function SectorInfoPanel({ sector, visible, position, onClose, onMouseEnter, onMouseLeave }: SectorInfoPanelProps) {
+export function SectorInfoPanel({ sector, visible, position, viewportBounds, onClose, onBack, onMouseEnter, onMouseLeave }: SectorInfoPanelProps) {
+  const { t } = useTranslation()
   const panelRef = useRef<HTMLDivElement>(null)
 
   // 右键菜单状态
@@ -93,76 +104,43 @@ export function SectorInfoPanel({ sector, visible, position, onClose, onMouseEnt
     return null
   }
 
-  // 计算面板位置，确保始终显示在视口内
-  const calculatePosition = () => {
-    const panelWidth = 280
-    const viewportWidth = window.innerWidth
-    const viewportHeight = window.innerHeight
+  // 固定宽度；高度上限取地图视口（无视口信息时回退 70vh），内容超出纵向滚动
+  const availW = viewportBounds ? viewportBounds.right - viewportBounds.left - 16 : window.innerWidth
+  const panelW = Math.min(PANEL_WIDTH, Math.max(280, availW))
+  const maxH = viewportBounds
+    ? viewportBounds.bottom - viewportBounds.top - 16
+    : window.innerHeight * 0.7
 
-    let left = position ? position.x + 10 : 20
-    let right = position ? 'auto' : 20
-    let top: number | 'auto'
-    let bottom: number | 'auto' = 'auto'
-
-    // 如果提供了点击事件，根据鼠标位置智能定位
-    if (position) {
-      // 计算鼠标位置到视口底部的距离
-      const distanceToBottom = viewportHeight - position.y
-
-      // 如果鼠标靠近底部边缘，将弹窗显示在鼠标上方
-      if (distanceToBottom < 300) {
-        // 弹窗显示在鼠标上方，距离鼠标10px
-        bottom = viewportHeight - position.y + 10
-        top = 'auto'
-      } else {
-        // 正常显示在鼠标下方
-        top = position.y
-        bottom = 'auto'
-      }
-
-      // 如果面板超出右侧视口，调整为左侧显示
-      if (left + panelWidth > viewportWidth) {
-        left = position.x - panelWidth - 10
-        if (left < 0) left = 20
-      }
-    } else {
-      // 没有点击事件时的默认位置
-      top = 80
-      bottom = 'auto'
-    }
-
-    return { top, left, right, bottom }
-  }
-
-  const { top, left, right, bottom } = calculatePosition()
+  // 点击位置在地图视口内时按视口钳制；无点击位置时停靠视口右上角
+  const anchor = position ?? (viewportBounds
+    ? { x: viewportBounds.right - 20, y: viewportBounds.top + 60 }
+    : { x: window.innerWidth - 40, y: 80 })
+  const { left, top } = clampPopupPosition(anchor, { width: panelW, height: maxH }, viewportBounds)
 
   // 面板样式 - 直接设置所有颜色和样式，确保不被覆盖
   const panelStyle: React.CSSProperties = {
     position: 'fixed',
-    top: top,
-    bottom: bottom,
+    top,
     left: `${left}px`,
-    right: right,
-    width: 'auto',
-    minWidth: '200px',
-    maxWidth: '300px',
-    maxHeight: '70vh',
+    width: `${panelW}px`,
+    maxWidth: '96vw',
+    maxHeight: `${maxH}px`,
     overflowY: 'auto',
     zIndex: 10000,
     opacity: visible ? 1 : 0,
     visibility: visible ? 'visible' : 'hidden',
     pointerEvents: visible ? 'auto' : 'none',
-    background: 'white',
-    color: '#000000', // 直接设置字体颜色为黑色，确保不透明
-    boxShadow: '0 4px 20px rgba(0, 0, 0, 0.15)',
+    background: 'hsl(var(--popover) / 0.98)',
+    color: 'hsl(var(--foreground))',
+    boxShadow: '0 8px 28px rgba(0, 0, 0, 0.22)',
     userSelect: 'text',
     cursor: 'auto',
-    border: '1px solid #e2e8f0',
-    borderRadius: '8px',
-    padding: '8px 12px',
+    border: '1px solid hsl(var(--border))',
+    borderRadius: '12px',
+    padding: '14px 18px',
     fontFamily: 'Arial, sans-serif',
-    fontSize: '14px',
-    lineHeight: '1.2' // 减小行间距
+    fontSize: '15px',
+    lineHeight: '1.5'
   }
 
   return (
@@ -171,7 +149,7 @@ export function SectorInfoPanel({ sector, visible, position, onClose, onMouseEnt
         ref={panelRef}
         style={panelStyle}
         tabIndex={0} // 使面板可以获得焦点，支持键盘事件
-        className="bg-white border border-gray-300 rounded-lg shadow-lg outline-none"
+        className="bg-card border border-border rounded-lg shadow-lg outline-none"
         onMouseEnter={onMouseEnter}
         onMouseLeave={onMouseLeave}
         onClick={(e) => {
@@ -206,7 +184,46 @@ export function SectorInfoPanel({ sector, visible, position, onClose, onMouseEnt
 
 
         {/* 属性列表 */}
-        <div className="p-4 space-y-1 relative">
+        <div className="p-3 space-y-2 relative">
+          {/* 返回重叠列表按钮（从重叠扇区列表进入属性框时显示，与要素属性框返回行为一致） */}
+          {onBack && (
+            <button
+              onClick={(e) => {
+                e.stopPropagation()
+                onBack()
+              }}
+              style={{
+                position: 'absolute',
+                top: '10px',
+                left: '12px',
+                width: '28px',
+                height: '28px',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                border: 'none',
+                background: 'transparent',
+                cursor: 'pointer',
+                borderRadius: '6px',
+                color: 'hsl(var(--muted-foreground))',
+                padding: 0,
+                zIndex: 1
+              }}
+              onMouseEnter={(e) => {
+                e.currentTarget.style.background = 'hsl(var(--accent))'
+                e.currentTarget.style.color = 'hsl(var(--foreground))'
+              }}
+              onMouseLeave={(e) => {
+                e.currentTarget.style.background = 'transparent'
+                e.currentTarget.style.color = 'hsl(var(--muted-foreground))'
+              }}
+              title={t('map.backToOverlapList')}
+              aria-label={t('map.backToOverlapList')}
+            >
+              <ArrowLeft size={17} />
+            </button>
+          )}
+
           {/* 关闭按钮 */}
           <button
             onClick={(e) => {
@@ -215,30 +232,30 @@ export function SectorInfoPanel({ sector, visible, position, onClose, onMouseEnt
             }}
             style={{
               position: 'absolute',
-              top: '6px',
-              right: '8px',
-              width: '20px',
-              height: '20px',
+              top: '10px',
+              right: '12px',
+              width: '28px',
+              height: '28px',
               display: 'flex',
               alignItems: 'center',
               justifyContent: 'center',
               border: 'none',
               background: 'transparent',
               cursor: 'pointer',
-              borderRadius: '4px',
-              color: '#999',
-              fontSize: '14px',
+              borderRadius: '6px',
+              color: 'hsl(var(--muted-foreground))',
+              fontSize: '16px',
               lineHeight: '1',
               padding: 0,
               zIndex: 1
             }}
             onMouseEnter={(e) => {
-              (e.target as HTMLElement).style.background = '#f3f4f6'
-              ;(e.target as HTMLElement).style.color = '#374151'
+              (e.target as HTMLElement).style.background = 'hsl(var(--accent))'
+              ;(e.target as HTMLElement).style.color = 'hsl(var(--foreground))'
             }}
             onMouseLeave={(e) => {
               (e.target as HTMLElement).style.background = 'transparent'
-              ;(e.target as HTMLElement).style.color = '#999'
+              ;(e.target as HTMLElement).style.color = 'hsl(var(--muted-foreground))'
             }}
             title="关闭"
           >
@@ -247,13 +264,15 @@ export function SectorInfoPanel({ sector, visible, position, onClose, onMouseEnt
 
           {/* 小区名称 - 标题样式 - 确保不透明 */}
           <div style={{
-            color: '#000000',
-            fontSize: '12px',
+            color: 'hsl(var(--foreground))',
+            fontSize: '16px',
             fontWeight: '600',
             opacity: 1,
-            paddingBottom: '6px',
-            borderBottom: '1px solid #e2e8f0',
-            marginBottom: '6px',
+            paddingBottom: '10px',
+            paddingRight: '32px',
+            paddingLeft: onBack ? '32px' : undefined,
+            borderBottom: '1px solid hsl(var(--border))',
+            marginBottom: '12px',
             userSelect: 'text',
             cursor: 'text'
           }}>
@@ -261,10 +280,14 @@ export function SectorInfoPanel({ sector, visible, position, onClose, onMouseEnt
           </div>
 
           {/* 属性网格 */}
-          <div className="grid grid-cols-2 gap-1 text-sm">
+          <div className="grid grid-cols-2 gap-x-6 gap-y-3 text-sm">
             {/* 网络类型 */}
             <AttributeLabel label="网络类型" />
             <AttributeValue value={sector.networkType} highlight />
+
+            {/* 网元ID（映射全量工参「管理网元ID」，站点级） */}
+            <AttributeLabel label={t('map.netElementId')} />
+            <AttributeValue value={sector.managedElementId || '-'} />
 
             {/* 基站ID */}
             <AttributeLabel label="基站ID" />
@@ -338,18 +361,18 @@ export function SectorInfoPanel({ sector, visible, position, onClose, onMouseEnt
             top: contextMenu.y,
             left: contextMenu.x,
             zIndex: 11000,
-            background: 'white',
-            border: '1px solid #e2e8f0',
-            borderRadius: '4px',
-            boxShadow: '0 2px 10px rgba(0,0,0,0.1)',
-            padding: '4px 0',
-            minWidth: '80px'
+            background: 'hsl(var(--popover))',
+            border: '1px solid hsl(var(--border))',
+            borderRadius: '8px',
+            boxShadow: '0 6px 20px rgba(0,0,0,0.2)',
+            padding: '6px 0',
+            minWidth: '130px'
           }}
           onClick={handleCopy}
         >
-          <div className="px-4 py-2 hover:bg-blue-50 cursor-pointer text-sm flex items-center">
+          <div className="px-4 py-2.5 hover:bg-accent cursor-pointer text-sm flex items-center">
             <span className="mr-2">复制</span>
-            <span className="text-gray-400 text-xs">Ctrl+C</span>
+            <span className="text-muted-foreground text-xs">Ctrl+C</span>
           </div>
         </div>
       )}
@@ -363,12 +386,12 @@ export function SectorInfoPanel({ sector, visible, position, onClose, onMouseEnt
 function AttributeLabel({ label }: { label: string }) {
   return (
     <div style={{
-      color: '#000000',
-      fontSize: '12px',
-      fontWeight: '600',
-      opacity: 1, // 透明度100% = 不透明
-      marginBottom: '2px',
-      lineHeight: '1.0', // 减小行间距
+      color: 'hsl(var(--muted-foreground))',
+      fontSize: '13px',
+      fontWeight: '500',
+      opacity: 1,
+      marginBottom: '3px',
+      lineHeight: '1.4',
       userSelect: 'text'
     }}>
       {label}
@@ -382,17 +405,18 @@ function AttributeLabel({ label }: { label: string }) {
 function AttributeValue({ value, highlight }: { value: string | number | undefined | null; highlight?: boolean }) {
   // 简化条件，确保所有值都能显示，包括0
   const displayValue = value === undefined || value === null ? '-' : String(value)
-  const textColor = highlight ? '#2563eb' : '#000000'
+  const textColor = highlight ? 'hsl(var(--primary))' : 'hsl(var(--foreground))'
 
   return (
     <div
       style={{
         color: textColor,
-        fontSize: '12px',
-        fontWeight: '500',
-        opacity: 1, // 透明度100% = 不透明
-        marginBottom: '2px',
-        lineHeight: '1.0', // 减小行间距
+        fontSize: '14px',
+        fontWeight: highlight ? '600' : '500',
+        opacity: 1,
+        marginBottom: '3px',
+        lineHeight: '1.4',
+        wordBreak: 'break-word',
         userSelect: 'text',
         cursor: 'text'
       }}

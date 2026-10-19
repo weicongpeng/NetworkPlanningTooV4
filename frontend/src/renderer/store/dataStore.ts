@@ -1,29 +1,43 @@
 import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
 import { dataApi } from '../services/api'
-import { mapApi } from '../services/api'
 import { indexedDBService } from '../services/indexedDBService'
 import type { DataItem, ApiResponse } from '@shared/types'
 import { useTaskStore } from './taskStore'
-import { clearCellListCache, bumpDataVersion } from '../services/mapDataService'
+import { clearCellListCache, bumpDataVersion, mapDataService } from '../services/mapDataService'
+import { userCacheSuffix } from '../utils/cacheKey'
 
 const CACHE_TTL_5MIN = 5 * 60 * 1000
+
+// 数据列表缓存按登录用户隔离（同浏览器切换账号时不得读到他账号的数据）
+const dataListCacheKey = () => `data_list_cache${userCacheSuffix()}`
 
 // 全局数据更新事件名称
 export const DATA_REFRESH_EVENT = 'data-list-refresh'
 
 // 防抖：2 秒内多次触发只发送一次事件，避免多页面同时响应产生惊群效应
 let _lastRefreshTime = 0
+let _lastRefreshScope: DataRefreshScope | null = null
 const REFRESH_DEBOUNCE_MS = 2000
 
+/** 刷新范围：full=数据增删/上传（各页面全量刷新）；layer=仅图层内容变化（地图页跳过扇区数据重载） */
+export type DataRefreshScope = 'full' | 'layer'
+
 // 触发数据刷新事件（用于跨页面通信）
-export function triggerDataRefresh() {
+// scope='layer' 由"图层保存"触发：数据条目本身未变（仅图层内容与上传时间），
+// 地图页无需重载扇区数据/重绘，避免保存后地图卡顿数秒。
+export function triggerDataRefresh(scope: DataRefreshScope = 'full') {
   const now = Date.now()
-  if (now - _lastRefreshTime < REFRESH_DEBOUNCE_MS) return
+  const withinDebounce = now - _lastRefreshTime < REFRESH_DEBOUNCE_MS
+  // 「全量」刷新不能被先前轻量的「图层」刷新吞掉：本地保存图层（layer）后 2 秒内
+  // 到达的远端数据变更（full，如同组其他端写入的 data_changed 推送）若被防抖丢弃，
+  // 本端地图会一直显示旧数据直到重新登录
+  if (withinDebounce && !(scope === 'full' && _lastRefreshScope !== 'full')) return
   _lastRefreshTime = now
+  _lastRefreshScope = scope
   // 清除小区列表缓存，确保各页面新建任务时获取最新数据
   clearCellListCache()
-  window.dispatchEvent(new CustomEvent(DATA_REFRESH_EVENT))
+  window.dispatchEvent(new CustomEvent(DATA_REFRESH_EVENT, { detail: { scope } }))
 }
 
 interface DataListCache {
@@ -46,10 +60,10 @@ interface DataState {
   error: string | null
   fetchList: (page?: number, pageSize?: number, forceRefresh?: boolean) => Promise<void>
   uploadExcel: (file: File, context?: string) => Promise<boolean>
-  uploadMap: (file: File, context?: string) => Promise<boolean>
+  uploadMap: (file: File, context?: string, extraFiles?: File[]) => Promise<boolean>
   uploadGeoData: (file: File, filePath?: string) => Promise<boolean>
   deleteItem: (id: string) => Promise<boolean>
-  updateParameters: (fullParamId: string, currentParamId: string) => Promise<ApiResponse<{ newFileId: string; newFileName: string; savedToOriginal: boolean } | null>>
+  updateParameters: (fullParamId: string, currentParamId: string) => Promise<ApiResponse<{ newFileId: string; newFileName: string; savedToOriginal: boolean; stats?: Record<string, { matched: number; appended: number }> | null } | null>>
   downloadTemplate: (templateType: 'full_params' | 'target_cells') => Promise<void>
   addCell: (data: {
     networkType: 'LTE' | 'NR'
@@ -70,8 +84,11 @@ interface DataState {
     siteId: string
     cellId: string
     cellName: string
+    mcc?: string
+    mnc?: string
     longitude: number
     latitude: number
+    height?: number
     azimuth: number
     frequency?: string
     ssbFrequency?: string
@@ -96,7 +113,7 @@ export const useDataStore = create<DataState>((set, get) => ({
     // 尝试从缓存读取
     if (!forceRefresh) {
       try {
-        const cached = await indexedDBService.get<DataListCache>('data_list_cache')
+        const cached = await indexedDBService.get<DataListCache>(dataListCacheKey())
         if (cached && cached.page === page && cached.pageSize === pageSize) {
           // 检查缓存是否过期
           const now = Date.now()
@@ -140,7 +157,7 @@ export const useDataStore = create<DataState>((set, get) => ({
           pageSize,
           timestamp: Date.now()
         }
-        await indexedDBService.set('data_list_cache', cacheData, CACHE_TTL_5MIN)
+        await indexedDBService.set(dataListCacheKey(), cacheData, CACHE_TTL_5MIN)
       } catch (error) {
         console.warn('[DataStore] 写入缓存失败:', error)
       }
@@ -196,11 +213,11 @@ export const useDataStore = create<DataState>((set, get) => ({
     }
   },
 
-  uploadMap: async (file: File, context: string = 'map') => {
+  uploadMap: async (file: File, context: string = 'map', extraFiles?: File[]) => {
     set({ loading: true, uploadingType: context, error: null })
     try {
       let filePath = (file as any).path;
-      
+
       if (!filePath && (window as any).electronAPI?.getFilePath) {
           try {
               // 修复：添加 await 等待 Promise 解析
@@ -210,10 +227,10 @@ export const useDataStore = create<DataState>((set, get) => ({
               console.warn('Failed to get path via electronAPI:', e);
           }
       }
-      
-      console.log('Upload Map:', file.name, 'Path:', filePath);
 
-      await dataApi.uploadMap(file, filePath)
+      console.log('Upload Map:', file.name, 'Path:', filePath, 'Companions:', extraFiles?.map(f => f.name));
+
+      await dataApi.uploadMap(file, filePath, extraFiles)
       await get().fetchList(1, 50, true)  // 上传成功后强制刷新
       set({ loading: false, uploadingType: null })
       return true
@@ -230,9 +247,14 @@ export const useDataStore = create<DataState>((set, get) => ({
   deleteItem: async (id: string) => {
     set({ loading: true, error: null })
     try {
-      await dataApi.delete(id)
+      const res = await dataApi.delete(id)
+      // 后端 HTTP 200 也可能是删除失败（success=false，如 SQLite 记录未能删除），
+      // 必须据此判定，否则前端会提示"删除成功"而数据仍在
+      if (res && res.success === false) {
+        throw new Error(res.message || '删除失败')
+      }
       // 删除后清除 IndexedDB 缓存（不内部刷新列表，由调用方统一处理刷新）
-      await indexedDBService.delete('data_list_cache')
+      await indexedDBService.delete(dataListCacheKey())
       set({ loading: false })
       return true
     } catch (error: any) {
@@ -265,12 +287,18 @@ export const useDataStore = create<DataState>((set, get) => ({
       // 2. 轮询等待后台任务完成（最长 10 分钟）
       const maxWait = 600000  // 10 min
       const pollInterval = 2000  // 每 2 秒检查一次
+      // 连续多少次轮询出错才判定失败：网关/网络瞬时错误（Cloudflare 502/524、连接被重置）
+      // 不代表任务失败，直接抛出会误报"工参更新失败"（其实文件已经生成）
+      const maxPollErrors = 5
       const startTime = Date.now()
       let finalResult: any = null
+      let consecutiveErrors = 0
 
       while (Date.now() - startTime < maxWait) {
         await new Promise(r => setTimeout(r, pollInterval))
 
+        let taskError: string | null = null
+        let pollError: any = null
         try {
           const progressResp = await dataApi.getUpdateParamsProgress(actualTaskId)
           const progressData = progressResp?.data
@@ -278,17 +306,24 @@ export const useDataStore = create<DataState>((set, get) => ({
           if (progressData?.status === 'completed') {
             finalResult = progressData
             break
-          } else if (progressData?.status === 'failed') {
-            throw new Error(progressData?.error || '工参更新失败')
           }
-          // status === 'processing' 或 'pending'，继续轮询
+          if (progressData?.status === 'failed') {
+            taskError = progressData?.error || '工参更新失败'
+          }
         } catch (pollErr: any) {
-          // 404 表示任务索引尚未持久化，继续轮询
-          if (pollErr?.code === 404) {
-            continue
-          }
-          throw pollErr
+          pollError = pollErr
         }
+
+        if (taskError) throw new Error(taskError)
+        if (!pollError) {
+          consecutiveErrors = 0
+          continue
+        }
+        // 404 表示任务索引尚未持久化，继续轮询
+        if (pollError?.code === 404) continue
+        consecutiveErrors += 1
+        if (consecutiveErrors >= maxPollErrors) throw pollError
+        // status === 'processing' 或 'pending'，继续轮询
       }
 
       useTaskStore.getState().completeTask(taskId)
@@ -301,6 +336,8 @@ export const useDataStore = create<DataState>((set, get) => ({
             newFileId: finalResult.newFileId,
             newFileName: finalResult.newFileName,
             savedToOriginal: finalResult.savedToOriginal,
+            // 合并统计（LTE/NR 匹配行数、新增行数）：前端展示实际更新量
+            stats: finalResult.stats || null,
           }
         }
       }
@@ -388,7 +425,10 @@ export const useDataStore = create<DataState>((set, get) => ({
         await get().fetchList(1, 50, true)
         await clearCellListCache()
         bumpDataVersion()
-        try { await mapApi.clearCache() } catch (_) {}
+        // 地图扇区缓存（内存 + IndexedDB 2h）也必须清：只清小区列表缓存时，
+        // 地图页重开仍读到旧扇区数据，新录入的小区不渲染（与上传/删除流程拉齐）
+        try { await mapDataService.clearCache() } catch (_) { /* 清缓存失败不阻断录入 */ }
+        triggerDataRefresh()
         set({ isAddingCell: false })
         return { success: true, message: result.message, data: result.data }
       }
@@ -414,7 +454,10 @@ export const useDataStore = create<DataState>((set, get) => ({
         // 清除所有缓存层，确保小区选择列表能立即看到新数据
         await clearCellListCache()                         // ① 前端 getCellList 缓存（内存 + IndexedDB）
         bumpDataVersion()                                  // ② sessionStorage 版本号（mapDataService 强制刷新）
-        try { await mapApi.clearCache() } catch (_) {}    // ③ 后端 30min 内存缓存
+        // ③ 地图扇区缓存（内存 + IndexedDB 2h）+ 后端 30min 内存缓存：
+        //    只清小区列表缓存时，地图页重开仍读到旧扇区数据，新录入的小区不渲染
+        try { await mapDataService.clearCache() } catch (_) { /* 清缓存失败不阻断录入 */ }
+        triggerDataRefresh()                               // ④ 通知已打开的地图页立即重载
         set({ isAddingCell: false })
         return { success: true, message: result.message, data: result.data }
       }

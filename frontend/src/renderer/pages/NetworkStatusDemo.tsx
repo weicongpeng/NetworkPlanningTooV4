@@ -89,7 +89,7 @@ export default function NetworkStatusDemo() {
             <div className="flex items-start gap-3">
               <div className="w-2 h-2 rounded-full bg-emerald-400 mt-1.5 flex-shrink-0" />
               <div>
-                <strong className="text-white">航图雷达美学:</strong> 雷达扫描效果和脉冲动画，营造专业的网络规划工具氛围
+                <strong className="text-white">航图雷达美学:</strong> 雷达扫描效果和脉冲动画，营造专业的网优引擎氛围
               </div>
             </div>
             <div className="flex items-start gap-3">

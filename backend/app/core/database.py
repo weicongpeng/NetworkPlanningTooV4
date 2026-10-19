@@ -2,13 +2,15 @@
 数据库引擎和会话管理
 使用 SQLite + SQLAlchemy ORM
 """
+from pathlib import Path
+
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker, Session, DeclarativeBase
 from app.core.config import settings
 
-# SQLite 数据库文件路径
-DATABASE_URL = f"sqlite:///{settings.DATA_DIR / 'data.db'}"
-OLD_DATABASE_URL = f"sqlite:///{settings.DATA_DIR / 'users.db'}"
+# SQLite 数据库文件路径（as_posix 避免 Windows 反斜杠路径解析异常）
+DATABASE_URL = f"sqlite:///{(settings.DATA_DIR / 'data.db').as_posix()}"
+OLD_DATABASE_URL = f"sqlite:///{(settings.DATA_DIR / 'users.db').as_posix()}"
 
 engine = create_engine(
     DATABASE_URL,
@@ -41,13 +43,57 @@ def get_db():
         db.close()
 
 
+_GROUP_MIGRATION_MARKER = ".group_migration_v1"
+
+
+def _group_migration_marker_path():
+    from app.core.config import settings
+
+    return Path(settings.DATA_DIR) / _GROUP_MIGRATION_MARKER
+
+
+def _group_migration_done() -> bool:
+    try:
+        return _group_migration_marker_path().is_file()
+    except OSError:
+        return False
+
+
+def _mark_group_migration_done() -> None:
+    try:
+        path = _group_migration_marker_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("1\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _has_grouped_admin() -> bool:
+    """是否存在组信息齐全的管理员（组迁移的前提：没有组就无处可归）。"""
+    try:
+        from app.models.database import User
+
+        db = SessionLocal()
+        try:
+            return (db.query(User)
+                    .filter(User.is_admin == True,  # noqa: E712
+                            User.city.isnot(None), User.city != "",
+                            User.operator.isnot(None), User.operator != "")
+                    .first()) is not None
+        finally:
+            db.close()
+    except Exception:
+        return False
+
+
 def init_db():
     """初始化数据库表结构（含迁移逻辑）"""
     # 迁移 users.db → data.db
     _migrate_users_db()
 
     from app.models.database import (
-        User, UserSession, Workbook, Site, Sector, GeoFile, Layer, UserSettings, TaskResult
+        User, UserSession, Workbook, Site, Sector, GeoFile, Layer, UserSettings, TaskResult,
+        DatasetRevision, SystemSetting,
     )  # noqa: F401
     Base.metadata.create_all(bind=engine)
 
@@ -65,6 +111,9 @@ def init_db():
             ("can_data_delete", "ALTER TABLE users ADD COLUMN can_data_delete BOOLEAN NOT NULL DEFAULT 0"),
             ("can_data_update", "ALTER TABLE users ADD COLUMN can_data_update BOOLEAN NOT NULL DEFAULT 0"),
             ("can_cell_entry", "ALTER TABLE users ADD COLUMN can_cell_entry BOOLEAN NOT NULL DEFAULT 0"),
+            ("can_cell_query_update", "ALTER TABLE users ADD COLUMN can_cell_query_update BOOLEAN NOT NULL DEFAULT 0"),
+            ("can_assistant", "ALTER TABLE users ADD COLUMN can_assistant BOOLEAN NOT NULL DEFAULT 0"),
+            ("usage_accounted_at", "ALTER TABLE user_sessions ADD COLUMN usage_accounted_at DATETIME"),
         ]
         for col_name, sql in migrations:
             table_name = "user_sessions" if "user_sessions" in sql else "users"
@@ -77,10 +126,62 @@ def init_db():
         if "remark" not in wb_cols:
             conn.exec_driver_sql("ALTER TABLE workbooks ADD COLUMN remark TEXT")
 
+        # 迁移：桌面版授权记录添加数据组归属列（共享模式下按组共享服务器端数据）
+        dl_cols = [row[1] for row in conn.exec_driver_sql("PRAGMA table_info(desktop_licenses)").fetchall()]
+        if dl_cols:
+            if "city" not in dl_cols:
+                conn.exec_driver_sql("ALTER TABLE desktop_licenses ADD COLUMN city VARCHAR(100)")
+            if "operator" not in dl_cols:
+                conn.exec_driver_sql("ALTER TABLE desktop_licenses ADD COLUMN operator VARCHAR(50)")
+            # 桌面端与网页端共用账号：授权记录绑定账号与运行模式
+            if "mode" not in dl_cols:
+                conn.exec_driver_sql(
+                    "ALTER TABLE desktop_licenses ADD COLUMN mode VARCHAR(16) NOT NULL DEFAULT 'standalone'"
+                )
+            if "username" not in dl_cols:
+                conn.exec_driver_sql("ALTER TABLE desktop_licenses ADD COLUMN username VARCHAR(100)")
+            if "user_id" not in dl_cols:
+                conn.exec_driver_sql("ALTER TABLE desktop_licenses ADD COLUMN user_id INTEGER")
+            if "login_count" not in dl_cols:
+                conn.exec_driver_sql(
+                    "ALTER TABLE desktop_licenses ADD COLUMN login_count INTEGER NOT NULL DEFAULT 0"
+                )
+            if "last_login_at" not in dl_cols:
+                conn.exec_driver_sql("ALTER TABLE desktop_licenses ADD COLUMN last_login_at VARCHAR(30)")
+            if "idle_logout_days" not in dl_cols:
+                conn.exec_driver_sql(
+                    "ALTER TABLE desktop_licenses ADD COLUMN idle_logout_days INTEGER NOT NULL DEFAULT 2"
+                )
+
+        # 迁移：桌面共享模式数据集修订号表（早期版本可能缺组归属列）
+        dr_cols = [row[1] for row in conn.exec_driver_sql("PRAGMA table_info(dataset_revisions)").fetchall()]
+        if dr_cols:
+            if "city" not in dr_cols:
+                conn.exec_driver_sql("ALTER TABLE dataset_revisions ADD COLUMN city VARCHAR(100)")
+            if "operator" not in dr_cols:
+                conn.exec_driver_sql("ALTER TABLE dataset_revisions ADD COLUMN operator VARCHAR(50)")
+
+        # 迁移：桌面版新增一个「影子用户」标记列，用于区分服务器为桌面端创建的
+        # 不可登录账号（桌面端以签名授权为身份，没有真实账号）
+        if "is_desktop_shadow" not in existing_cols:
+            conn.exec_driver_sql("ALTER TABLE users ADD COLUMN is_desktop_shadow BOOLEAN NOT NULL DEFAULT 0")
+
+        # 迁移：桌面版登录时选择的运行模式（shared / standalone，网页端为 NULL）
+        if "desktop_run_mode" not in existing_cols:
+            conn.exec_driver_sql("ALTER TABLE users ADD COLUMN desktop_run_mode VARCHAR(16)")
+
         # 迁移：task_results 表添加 is_applied 列
         tr_cols = [row[1] for row in conn.exec_driver_sql("PRAGMA table_info(task_results)").fetchall()]
         if "is_applied" not in tr_cols:
             conn.exec_driver_sql("ALTER TABLE task_results ADD COLUMN is_applied INTEGER DEFAULT 0")
+        # 迁移：桌面端任务历史同步的来源标记（local / shared）
+        if tr_cols and "origin" not in tr_cols:
+            conn.exec_driver_sql(
+                "ALTER TABLE task_results ADD COLUMN origin VARCHAR(10) NOT NULL DEFAULT 'local'"
+            )
+        # 迁移：任务小数量（同组任务历史「小区数量」列，镜像行无本机结果时靠它显示）
+        if tr_cols and "cell_count" not in tr_cols:
+            conn.exec_driver_sql("ALTER TABLE task_results ADD COLUMN cell_count INTEGER")
 
         # 迁移：user_settings 表添加 created_at 列（如从旧表结构升级）
         us_cols = [row[1] for row in conn.exec_driver_sql("PRAGMA table_info(user_settings)").fetchall() if row[0] >= 0]
@@ -96,7 +197,157 @@ def init_db():
         av_cols = [row[1] for row in conn.exec_driver_sql("PRAGMA table_info(app_versions)").fetchall()]
         if av_cols and "download_count" not in av_cols:
             conn.exec_driver_sql("ALTER TABLE app_versions ADD COLUMN download_count INTEGER DEFAULT 0")
+
+        # 迁移：desktop_releases 移除已下线的 mandatory 列
+        # 「强制更新」功能已下线，模型里删掉了该列，但旧库残留 mandatory BOOLEAN NOT NULL
+        # （无默认值）→ 所有新插入都报 NOT NULL constraint failed，上传安装包直接 500。
+        dr_cols = [row[1] for row in conn.exec_driver_sql("PRAGMA table_info(desktop_releases)").fetchall()]
+        if "mandatory" in dr_cols:
+            import logging
+            _dr_logger = logging.getLogger(__name__)
+            try:
+                conn.exec_driver_sql("ALTER TABLE desktop_releases DROP COLUMN mandatory")
+                _dr_logger.info("✅ desktop_releases 已移除废弃的 mandatory 列")
+            except Exception as exc:  # noqa: BLE001
+                _dr_logger.error(f"❌ 移除 desktop_releases.mandatory 失败（上传安装包会失败）: {exc}")
+
+        # 迁移：数据按（地市+运营商）分组隔离 —— 各业务表添加组归属列
+        # 存量行保持 NULL = 仅管理员可见；新数据写入时由上传者/工参所属组盖章
+        for table in (
+            "workbooks", "sites", "sectors", "geo_files", "layers",
+            "station_param_rows", "station_metric_rows", "task_results",
+        ):
+            table_cols = [row[1] for row in conn.exec_driver_sql(f"PRAGMA table_info({table})").fetchall()]
+            if not table_cols:
+                continue
+            if "city" not in table_cols:
+                conn.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN city VARCHAR(100)")
+            if "operator" not in table_cols:
+                conn.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN operator VARCHAR(50)")
         conn.commit()
+
+    # 存量无组/误归组数据一次性纠正。两项都是全表扫描（大库 8 张表 + join），
+    # 历史数据纠正完毕后用 marker 门控跳过，避免每次冷启动（含桌面模式切换重启）
+    # 都为"零行修正"支付扫描成本；marker 随 data.db 同目录，拷库即随迁移状态迁移。
+    if not _group_migration_done():
+        _migrate_legacy_data_groups()
+        _fix_misattributed_task_groups()
+        # 还没有组齐全的管理员时迁移无的放矢（首装常见）：不写 marker，下次启动再试
+        if _has_grouped_admin():
+            _mark_group_migration_done()
+
+
+def _migrate_legacy_data_groups():
+    """存量无组数据一次性迁移：归入主管理员（id 最小、组齐全的管理员）所在组。
+
+    背景：可见性规则已改为「所有用户（含管理员）一律按组隔离」，NULL 组数据
+    将对所有人不可见，因此启动时把存量 NULL 组数据盖章为主管理员组（幂等）。
+    """
+    import logging
+    _logger = logging.getLogger(__name__)
+    try:
+        from app.models.database import User
+
+        db = SessionLocal()
+        try:
+            admin = (db.query(User)
+                     .filter(User.is_admin == True,  # noqa: E712
+                             User.city.isnot(None), User.city != "",
+                             User.operator.isnot(None), User.operator != "")
+                     .order_by(User.id.asc())
+                     .first())
+        finally:
+            db.close()
+        if admin is None:
+            _logger.warning("[组迁移] 未找到组信息齐全的管理员，跳过存量数据组迁移")
+            return {"migrated": 0}
+
+        city, operator = admin.city, admin.operator
+        total = 0
+        with engine.begin() as conn:
+            for table in (
+                "workbooks", "sites", "sectors", "geo_files", "layers",
+                "station_param_rows", "station_metric_rows", "task_results",
+            ):
+                result = conn.exec_driver_sql(
+                    f"UPDATE {table} SET city = ?, operator = ? WHERE city IS NULL",
+                    (city, operator),
+                )
+                total += result.rowcount
+
+        # 内存索引条目同步盖章（index.json 中缺组键/空组的存量条目）
+        stamped = 0
+        try:
+            from app.services.data_service import data_service
+            for entry in data_service.index.values():
+                if not entry.get("city") or not entry.get("operator"):
+                    entry["city"] = city
+                    entry["operator"] = operator
+                    stamped += 1
+            if stamped:
+                data_service._save_index()
+        except Exception as e:
+            _logger.warning(f"[组迁移] 索引条目盖章失败（不影响 SQLite 迁移）: {e}")
+
+        if total or stamped:
+            _logger.info(f"[组迁移] 存量无组数据已归入 ({city}, {operator}) 组: "
+                         f"SQLite {total} 行, 索引条目 {stamped} 个")
+        return {"migrated": total, "stamped": stamped}
+    except Exception as e:
+        _logger.warning(f"[组迁移] 执行失败（不影响启动）: {e}")
+        return {"migrated": 0}
+
+
+def _fix_misattributed_task_groups():
+    """纠正误归组的任务结果行（幂等）。
+
+    背景：任务创建端点曾长期不盖（地市+运营商）章，TaskResult 行组为 NULL，
+    被 _migrate_legacy_data_groups 误归主管理员组，表现为：
+    - 任务创建人刷新后历史任务"清空"（组过滤查不到自己的任务）
+    - 主管理员组能看到其他组用户的任务（跨组串数据）
+    纠正规则：task_results 中 user_name 对应用户组齐全、且与行组不一致的行，
+    一律按创建人组重盖章（用户管理改过组后退回旧组的存量任务也一并归位）。
+    创建人本人所属组与行组一致的行不受影响；无对应用户的行保持原样。
+    """
+    import logging
+    _logger = logging.getLogger(__name__)
+    try:
+        from app.models.database import User, TaskResult
+
+        db = SessionLocal()
+        try:
+            admin = (db.query(User)
+                     .filter(User.is_admin == True,  # noqa: E712
+                             User.city.isnot(None), User.city != "",
+                             User.operator.isnot(None), User.operator != "")
+                     .order_by(User.id.asc())
+                     .first())
+            if admin is None:
+                return {"fixed": 0}
+
+            # 创建人组齐全、且与行组不一致的任务行 → 按创建人组重盖章
+            rows = (db.query(TaskResult, User)
+                    .join(User, TaskResult.user_name == User.username)
+                    .filter(
+                        User.city.isnot(None), User.city != "",
+                        User.operator.isnot(None), User.operator != "",
+                        ((User.city != TaskResult.city) | (User.operator != TaskResult.operator)),
+                    )
+                    .all())
+            fixed = 0
+            for tr, u in rows:
+                tr.city = u.city
+                tr.operator = u.operator
+                fixed += 1
+            if fixed:
+                db.commit()
+                _logger.info(f"[组迁移] 误归组任务已按创建人重盖章 {fixed} 行")
+            return {"fixed": fixed}
+        finally:
+            db.close()
+    except Exception as e:
+        _logger.warning(f"[组迁移] 误归组任务纠正失败（不影响启动）: {e}")
+        return {"fixed": 0}
 
 
 def _migrate_users_db():
@@ -163,12 +414,19 @@ def _migrate_users_db():
 
 
 def create_default_admin():
-    """创建默认管理员账号（如不存在）"""
+    """创建默认管理员账号（如不存在）。
+
+    桌面版（NPT_DESKTOP=1）不预置任何账号：桌面端与网页端共用账号，
+    登录时由服务器校验后在本机镜像出本地账号。
+    """
     from app.models.database import User
     from app.services.auth_service import auth_service
 
     db = SessionLocal()
     try:
+        if settings.NPT_DESKTOP:
+            return
+
         existing_admin = db.query(User).filter(User.is_admin == True).first()
         if existing_admin is None:
             admin = User(
@@ -178,6 +436,8 @@ def create_default_admin():
                 is_active=True,
                 must_change_password=True,
                 license_expiry=None,
+                city=None,
+                operator=None,
             )
             db.add(admin)
             db.commit()

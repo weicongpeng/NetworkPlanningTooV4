@@ -18,10 +18,13 @@ import { DATA_REFRESH_EVENT } from '../store/dataStore'
 import { useTranslation } from 'react-i18next'
 import { CellSelectionTable } from '../components/CellSelectionTable'
 import { HistoryTable } from '../components/HistoryTable'
+import { HistoryTabActions } from '../components/HistoryTabActions'
 import { StepIndicator } from '../components/StepIndicator'
 import { WizardFooter } from '../components/WizardFooter'
 import { extractCellIdsFromFile, matchCellIds, downloadCellTreeTemplate } from '../utils/cellFileHelper'
 import { generateFullTaskName } from '../utils/taskNameUtils'
+import { SkippedCellsNotice } from '../components/SkippedCellsNotice'
+import type { SkippedCellInfo } from '@shared/types'
 
 // 虚拟滚动配置
 const ITEM_HEIGHT = 48 // 每行高度
@@ -61,6 +64,8 @@ interface TACResultData {
   mismatchedCells: number
   mismatchedRate: number
   singularityCount?: number  // TAC插花数量
+  skippedCells?: SkippedCellInfo[]  // 因工参数据不全被跳过的小区
+  skippedCount?: number
   results: any[]
   startTime: string
   endTime?: string
@@ -85,19 +90,27 @@ export function TACPage() {
   const [taskNameError, setTaskNameError] = useState<string | null>(null)
   const [nextTaskError, setNextTaskError] = useState<string | null>(null)
   const { activeTaskIds, setActiveTaskId, getLatestTACCheckTask, startTask, updateTaskProgress, completeTask, failTask, syncHistoryFromBackend,
-    startGlobalPolling, stopGlobalPolling, isGlobalPollingActive } = useTaskStore()
+    startGlobalPolling, isGlobalPollingActive } = useTaskStore()
+  // 🔥 页面挂载时同步一次历史计数（badge 显示后端真实任务总数）
+  useEffect(() => {
+    syncHistoryFromBackend('tac_check').catch(() => {})
+  }, [syncHistoryFromBackend])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [localTaskResult, setLocalTaskResult] = useState<TACResultData | null>(null)
   const viewedTaskIdRef = useRef<string | null>(null) // 防止 useEffect 覆盖 API 获取的结果
   const isLoadingResultRef = useRef(false) // 标记结果加载是否有效，防止竞态
   const [resultLoading, setResultLoading] = useState(false) // 结果页加载动画
+  const [selectedCount, setSelectedCount] = useState(0) // 历史任务已选中条数（供页签栏「删除」置灰判断）
 
   // 从 taskStore 恢复最近的任务结果，行为与 PCI/邻区规划一致
   const t0 = performance.now()
   const latestTACCheckTask = getLatestTACCheckTask()
   const taskId = activeTaskIds.tac_check
-  const tacCheckHistoryCount = useTaskStore(s => Object.values(s.tasks).filter(t => t.type === 'tac_check').length)
+  // 响应式订阅当前活跃任务，跨页面切回时据此水合本地状态（修复进度停滞）
+  const activeStoreTask = useTaskStore((s: any) => (s.activeTaskIds.tac_check ? s.tasks[s.activeTaskIds.tac_check] : null))
+  // 🔥 修复：改用后端返回的真实任务总数（historyCounts），避免本地 store 缓存截断导致计数不准
+  const tacCheckHistoryCount = useTaskStore(s => s.historyCounts.tac_check)
   const taskResult = localTaskResult || (latestTACCheckTask?.result as TACResultData | null)
   // 只有当有完整结果数据（含 results 数组）或由 handleViewTask 设置时才认为是有效结果
   const hasFullResult = taskResult && (!!(taskResult as any).results || viewedTaskIdRef.current)
@@ -205,6 +218,8 @@ export function TACPage() {
 
   // ===== getCellCount =====
   const getCellCount = useCallback((task: Task): number | string => {
+    // 归一化字段优先（同组镜像任务同步来的摘要只有它）
+    if (task.result?.cellCount != null) return task.result.cellCount
     if (task.result?.totalCells !== undefined) return task.result.totalCells
     if (task.result?.results && Array.isArray(task.result.results)) {
       return task.result.results.length
@@ -214,7 +229,7 @@ export function TACPage() {
 
   // 插花检测配置状态
   const [singularityConfig, setSingularityConfig] = useState({
-    searchRadius: 1500,
+    spacingFactor: 2,
     singularityThreshold: 0.5,
   })
 
@@ -255,32 +270,54 @@ export function TACPage() {
 
   const pollingIntervalRef = useRef<NodeJS.Timeout | null>(null)
   const errorCountRef = useRef(0)
-  // === 全局轮询：页面切换不中断 ===
+  // 响应式同步活跃任务 → 本地状态（修复：切换到其他页面再切回时进度停滞/不显示完成）。
+  // 全局轮询跨页面持续写 store，本 effect 在 progress/status 变化时回填本地并确保轮询运行。
   useEffect(() => {
-    if (taskId && (taskResult?.status === 'pending' || taskResult?.status === 'processing')) {
-      if (!isGlobalPollingActive('tac_check')) {
-        startGlobalPolling('tac_check')
-      }
-    }
-  }, [taskId, taskResult?.status])
+    if (!taskId || !activeStoreTask) return
+    if (viewedTaskIdRef.current === taskId) return
+    const st = activeStoreTask.status
+    const progress = activeStoreTask.progress ?? 0
 
-  // 从 taskStore 同步进度到 localTaskResult（但不要覆盖用户通过"查看"按钮加载的结果）
-  useEffect(() => {
-    if (taskId && viewedTaskIdRef.current === taskId) {
-      return
-    }
-    if (taskId) {
-      const t = useTaskStore.getState().tasks[taskId]
-      if (t) {
-        if (t.result && Object.keys(t.result).length > 0) {
-          setLocalTaskResult(t.result as TACResultData)
+    if (st === 'completed' && activeStoreTask.result) {
+      setLocalTaskResult(activeStoreTask.result as TACResultData)
+    } else if (st === 'failed') {
+      setLocalTaskResult((prev) =>
+        prev?.taskId === taskId && (prev.status === 'failed' || prev.status === 'completed') ? prev : {
+          taskId, status: 'failed' as const, progress,
+          totalCells: 0, matchedCells: 0, unmatchedCells: 0,
+          mismatchedCells: 0, mismatchedRate: 0, results: [],
+          startTime: new Date(activeStoreTask.startTime || Date.now()).toISOString(),
+        })
+    } else if (st === 'running' || st === 'processing' || st === 'pending') {
+      setWizardStep('executing')
+      setLocalTaskResult((prev) => {
+        if (prev?.taskId === taskId && (prev.status === 'processing' || prev.status === 'pending')) {
+          return prev.progress === progress ? prev : { ...prev, status: 'processing' as const, progress }
         }
-        if (t.status === 'completed' || t.status === 'failed') {
-          stopGlobalPolling('tac_check')
+        if (prev?.taskId === taskId && prev.status === 'completed') return prev
+        return {
+          taskId, status: 'processing' as const, progress,
+          totalCells: 0, matchedCells: 0, unmatchedCells: 0,
+          mismatchedCells: 0, mismatchedRate: 0, results: [],
+          startTime: new Date(activeStoreTask.startTime || Date.now()).toISOString(),
         }
-      }
+      })
+      if (!isGlobalPollingActive('tac_check')) startGlobalPolling('tac_check')
     }
-  }, [taskId])
+    // 全局轮询在任务完成/失败时由 store 自行停止，页面不停止它
+  }, [taskId, activeStoreTask, setWizardStep, isGlobalPollingActive, startGlobalPolling])
+
+  // 🔥 可复用的 TAC 同步服务初始化（消除查看历史任务时的竞态）
+  const tacInitPromiseRef = useRef<Promise<void> | null>(null)
+  const ensureTacSyncService = useCallback(async () => {
+    if (!tacInitPromiseRef.current) {
+      tacInitPromiseRef.current = tacDataSyncService.initialize().catch(err => {
+        tacInitPromiseRef.current = null // 失败后允许重试
+        throw err
+      })
+    }
+    return tacInitPromiseRef.current
+  }, [])
 
   // 初始化TAC数据同步服务（异步执行，不阻塞页面渲染）
   useEffect(() => {
@@ -290,7 +327,7 @@ export function TACPage() {
     const initMapServices = async () => {
       console.time('[TACPage] init:tacDataSyncService')
       try {
-        await tacDataSyncService.initialize()
+        await ensureTacSyncService()
         // 初始化完成后刷新地图数据
         if (mapRef.current && mounted) {
           await mapRef.current.refreshData()
@@ -448,7 +485,7 @@ export function TACPage() {
     setWizardStep('idle'); setTaskName(''); setTaskNameError(null); setNextTaskError(null)
     setSelectedCellIdsSet(new Set()); setError(null)
     setConfig({ networkType: 'LTE' })
-    setSingularityConfig({ searchRadius: 1500, singularityThreshold: 0.5 })
+    setSingularityConfig({ spacingFactor: 2, singularityThreshold: 0.5 })
   }
 
   // ===== 上一步逻辑 =====
@@ -465,7 +502,9 @@ export function TACPage() {
   // ===== 统一的"下一步"逻辑 =====
   const handleNext = useCallback(() => {
     if (wizardStep === 'idle') {
-      setWizardStep('task_created'); setTaskNameError(null); setError(null)
+      const nameError = validateTaskName(taskName)
+      if (nameError) { setTaskNameError(nameError); return }
+      setTaskNameError(null); setWizardStep('params_set'); setError(null)
     } else if (wizardStep === 'task_created') {
       if (!config?.networkType) { setNextTaskError(t('tac.selectNetworkType') || '请选择网络类型'); return }
       const nameError = validateTaskName(taskName)
@@ -505,6 +544,7 @@ export function TACPage() {
       setError(t('tac.noCellsSelected') || '请在小区选择列表中至少选择一个小区后再执行TAC核查')
       return
     }
+    // 工参数据不全（缺经纬度/缺基站ID/小区ID）的小区不阻断执行，由后端跳过并在结果中回传提示
     setLoading(true); setError(null); setLocalTaskResult(null)
     setActiveTaskId('tac_check', null); setWizardStep('executing'); errorCountRef.current = 0
     try {
@@ -590,6 +630,9 @@ export function TACPage() {
         setActiveLeftTab('planning-result')
         setShowMap(true)
         if (result.results) {
+          // 🔥 修复：查看历史任务时确保 sync service 已初始化，
+          // 否则点击结果行时 findSector 无数据可查，地图不渲染
+          await ensureTacSyncService().catch(() => {})
           const taskNetworkType = result.networkType || config?.networkType || 'LTE'
           const uniqueTACs = new Set<string>()
           result.results.forEach((cell: any) => {
@@ -809,10 +852,8 @@ export function TACPage() {
     })
   }
 
-  const toggleSelectAll = () => {
-    const networkType = (config?.networkType || 'LTE') as 'LTE' | 'NR'
-    const sectors = networkType === 'LTE' ? cellListData.lte : cellListData.nr
-    const allIds = sectors.map(s => s.id)
+  const toggleSelectAll = (filteredIds: string[]) => {
+    const allIds = filteredIds
     const allSelected = allIds.length > 0 && allIds.every(id => selectedCellIdsSet.has(id))
     setSelectedCellIdsSet(prev => {
       const next = new Set(prev)
@@ -903,6 +944,16 @@ export function TACPage() {
         </div>
       )}
 
+      {/* 工参数据不全被跳过的小区提示（非阻断） */}
+      {taskResult?.skippedCells && taskResult.skippedCells.length > 0 && (
+        <SkippedCellsNotice
+          group="tac"
+          skipped={taskResult.skippedCells}
+          checkedCount={taskResult.totalCells || 0}
+          titleOnly
+        />
+      )}
+
       {/* 小区选择与结果面板（页签切换） */}
       <div className="bg-card p-4 rounded-lg border border-border flex-1 min-h-0 flex flex-col overflow-hidden">
         {/* 页签切换栏 */}
@@ -944,6 +995,12 @@ export function TACPage() {
               </span>
             )}
           </button>
+          {/* 历史任务操作：仅「历史任务」页签显示（核查无可应用项，「应用」恒置灰） */}
+          {activeLeftTab === 'history' && (
+            <HistoryTabActions
+              selectedCount={selectedCount}
+            />
+          )}
         </div>
 
         {/* 页签内容 */}
@@ -961,19 +1018,21 @@ export function TACPage() {
                   }
                   executingProgress={wizardStep === 'executing' ? (taskResult?.progress ?? 0) : undefined}
                 />
-                <div className="flex flex-row gap-4 flex-1 min-h-0 overflow-hidden">
-                  {/* 左侧：任务名称 + 参数设置 */}
-                  <div className="flex flex-col overflow-y-auto flex-1 min-w-0">
+                {/* 每步仅渲染当前操作卡片，居中显示 */}
+                <div className="flex-1 min-h-0 overflow-y-auto flex justify-center px-4">
+                  <div className="w-full max-w-3xl py-2 flex flex-col gap-4 min-h-0">
+                    {/* 步骤1：任务名称卡片 */}
+                    {(wizardStep === 'idle' || wizardStep === 'task_created') && (
                     <div className="bg-card border border-border rounded-xl p-6 w-full">
                       {nextTaskError && (
-                        <div className="mb-4 p-3 bg-red-50 border border-red-200 rounded-lg flex items-center gap-3 text-red-700">
+                        <div className="mb-4 p-3 bg-red-500/10 border border-red-500/20 rounded-lg flex items-center gap-3 text-red-400">
                           <AlertCircle size={18} />
                           <span className="text-sm">{nextTaskError}</span>
                           <button onClick={() => setNextTaskError(null)} className="ml-auto text-sm underline">{t('tac.close') || '关闭'}</button>
                         </div>
                       )}
                       {/* 任务名称 */}
-                      <div className="mb-6">
+                      <div>
                         <label className="block text-sm font-semibold mb-2">{t('common.taskName') || '任务名称'}</label>
                         <input
                           type="text" value={taskName}
@@ -986,7 +1045,13 @@ export function TACPage() {
                         {taskNameError && <p className="mt-1 text-xs text-red-500">{taskNameError}</p>}
                         <p className="mt-1 text-xs text-muted-foreground">{taskName.length}/25</p>
                       </div>
+                    </div>
+                    )}
 
+                    {/* 步骤2：规划参数卡片 */}
+                    {wizardStep === 'params_set' && (
+                    <div className="bg-card border border-border rounded-xl p-6 w-full">
+                      <h3 className="text-sm font-semibold mb-4">{t('tac.planningParams') || '规划参数'}</h3>
                       {/* TAC核查参数 */}
                       <div className="space-y-4">
                         <div>
@@ -1002,22 +1067,25 @@ export function TACPage() {
                         </div>
                         <div className="grid grid-cols-2 gap-x-4 gap-y-3">
                           <div>
-                            <label className="block text-xs font-medium mb-0.5">{t('tac.searchRadius') || '搜索半径(m)'}</label>
-                            <input type="number" value={singularityConfig.searchRadius} onChange={(e) => setSingularityConfig(prev => ({ ...prev, searchRadius: parseInt(e.target.value) || 0 }))} disabled={wizardStep !== 'params_set'} step={100} className="w-full px-2 py-1.5 text-sm bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary disabled:opacity-60 disabled:cursor-not-allowed" />
+                            <label className="block text-xs font-medium mb-0.5">{t('tac.spacingFactor') || '站间距系数'}</label>
+                            <input type="number" value={singularityConfig.spacingFactor} onChange={(e) => setSingularityConfig(prev => ({ ...prev, spacingFactor: parseFloat(e.target.value) || 0 }))} disabled={wizardStep !== 'params_set'} step={0.5} className="w-full px-2 py-1.5 text-sm bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary disabled:opacity-60 disabled:cursor-not-allowed" />
+                            <p className="mt-1 text-[10px] text-muted-foreground">{t('tac.spacingFactorHint') || '搜索半径 = 系数 × 平均站间距（最近4个站间距均值）'}</p>
                           </div>
                           <div>
-                            <label className="block text-xs font-medium mb-0.5">{t('tac.singularityThreshold') || '异TAC阈值'}</label>
-                            <input type="number" value={singularityConfig.singularityThreshold} onChange={(e) => setSingularityConfig(prev => ({ ...prev, singularityThreshold: parseFloat(e.target.value) || 0 }))} disabled={wizardStep !== 'params_set'} step={0.1} className="w-full px-2 py-1.5 text-sm bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary disabled:opacity-60 disabled:cursor-not-allowed" />
+                            <label className="block text-xs font-medium mb-0.5">{t('tac.singularityThreshold') || '异TAC占比阈值(%)'}</label>
+                            <input type="number" value={Math.round(singularityConfig.singularityThreshold * 100)} onChange={(e) => setSingularityConfig(prev => ({ ...prev, singularityThreshold: (parseFloat(e.target.value) || 0) / 100 }))} disabled={wizardStep !== 'params_set'} step={5} className="w-full px-2 py-1.5 text-sm bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary disabled:opacity-60 disabled:cursor-not-allowed" />
                           </div>
                         </div>
                       </div>
                     </div>
-                  </div>
+                    )}
 
-                  {/* 右侧：小区选择 */}
-                  <div className="flex flex-col flex-1 min-w-0 border-l border-border pl-4 overflow-hidden">
-                    <div className="flex flex-col h-full overflow-hidden">
+                    {/* 步骤3：小区选择卡片（含执行中/完成前展示） */}
+                    {(wizardStep === 'cells_selected' || wizardStep === 'executing' || wizardStep === 'completed') && (
+                    <div className="bg-card border border-border rounded-xl p-6 w-full h-[70vh] min-h-[420px] flex flex-col">
+                      <h3 className="text-sm font-semibold mb-4 shrink-0">{t('pci.cellSelection') || '小区选择'}</h3>
                       <input type="file" ref={cellFileInputRef} onChange={handleCellFileChange} accept=".xlsx,.xls" className="hidden" />
+                      <div className="flex-1 min-h-0 flex flex-col">
                       <CellSelectionTable
                         sectors={(() => { const nt = (config?.networkType || 'LTE') as 'LTE' | 'NR'; return nt === 'LTE' ? cellListData.lte : cellListData.nr })()}
                         selectedCellIds={selectedCellIdsSet}
@@ -1030,9 +1098,11 @@ export function TACPage() {
                         onDownloadCellTemplate={wizardStep === 'cells_selected' ? handleDownloadCellTemplate : undefined}
                         uploading={cellFileUploading}
                         disabled={wizardStep !== 'cells_selected' || isRunning}
-                        columnLabels={{ siteId: t('tac.siteId') || '基站ID', cellId: t('tac.cellId') || '小区ID', cellName: t('tac.cellName') || '小区名称', cellFreq: t('tac.cellFreq') || '频点', cellPci: t('tac.cellPci') || 'PCI', selectAll: t('tac.selectAll') || '全选', clearSelections: t('tac.clearSelections') || '清空选择', uploadCellFile: t('tac.uploadCellFile') || '上传待规划小区文件', downloadCellTemplate: t('tac.downloadCellTemplate') || '下载待规划小区模板' }}
+                        columnLabels={{ siteId: t('tac.siteId') || '基站ID', cellId: t('tac.cellId') || '小区ID', cellName: t('tac.cellName') || '小区名称', cellFreq: t('tac.cellFreq') || '频点', cellPci: t('tac.cellPci') || 'PCI', cellLng: t('tac.cellLng') || '经度', cellLat: t('tac.cellLat') || '纬度', selectAll: t('tac.selectAll') || '全选', clearSelections: t('tac.clearSelections') || '清空选择', uploadCellFile: t('tac.uploadCellFile') || '上传待规划小区文件', downloadCellTemplate: t('tac.downloadCellTemplate') || '下载待规划小区模板' }}
                       />
+                      </div>
                     </div>
+                    )}
                   </div>
                 </div>
 
@@ -1047,7 +1117,7 @@ export function TACPage() {
                   }
                   isExecuting={loading || isRunning}
                   canProceed={
-                    wizardStep === 'idle' ? true
+                    wizardStep === 'idle' ? taskName.trim().length > 0
                     : wizardStep === 'task_created' ? taskName.trim().length > 0
                     : wizardStep === 'params_set' ? true
                     : wizardStep === 'cells_selected' ? selectedCellIdsSet.size > 0
@@ -1096,6 +1166,7 @@ export function TACPage() {
                 }}
                 onViewTask={handleViewTask}
                 getCellCount={getCellCount}
+                onSelectedChange={(counts) => setSelectedCount(counts.total)}
               />
             </div>
           )}
@@ -1135,7 +1206,7 @@ export function TACPage() {
                       <div className="px-2.5 py-1.5 bg-blue-500/10 border border-blue-500/20 rounded-md">
                         <p className="text-[10px] text-blue-600">{t('tac.mismatchRate') || '错配率'}</p>
                         <p className="text-sm font-semibold text-blue-600">
-                          {taskResult.matchedCells > 0 ? ((taskResult.mismatchedCells / taskResult.matchedCells) * 100).toFixed(1) : '0'}%
+                          {taskResult.matchedCells > 0 ? ((taskResult.mismatchedCells / taskResult.matchedCells) * 100).toFixed(2) : '0.00'}%
                         </p>
                       </div>
                       <div className="px-2.5 py-1.5 bg-purple-500/10 border border-purple-500/20 rounded-md">
@@ -1145,7 +1216,7 @@ export function TACPage() {
                       <div className="px-2.5 py-1.5 bg-muted/50 rounded-md">
                         <p className="text-[10px] text-muted-foreground">{t('tac.matchRate') || '匹配率'}</p>
                         <p className="text-sm font-semibold">
-                          {taskResult.totalCells > 0 ? ((taskResult.matchedCells / taskResult.totalCells) * 100).toFixed(1) : '0'}%
+                          {taskResult.totalCells > 0 ? ((taskResult.matchedCells / taskResult.totalCells) * 100).toFixed(2) : '0.00'}%
                         </p>
                       </div>
                     </div>
@@ -1278,7 +1349,7 @@ export function TACPage() {
                                   value={searchFilters[column.key as keyof typeof searchFilters]}
                                   onChange={(e) => handleSearchChange(column.key, e.target.value)}
                                   placeholder={t('tac.search') || '搜索'}
-                                  className="mt-1 w-full p-1 border border-border rounded text-[10px] text-gray-900 bg-gray-100 placeholder:text-gray-400"
+                                  className="mt-1 w-full p-1 border border-border rounded text-[10px] text-foreground bg-input placeholder:text-muted-foreground"
                                 />
                               )}
                               {/* 拖拽手柄 */}
@@ -1307,7 +1378,7 @@ export function TACPage() {
                           return (
                             <tr
                               key={`${cell.sectorId}-${actualIndex}`}
-                              className={`border-b hover:bg-muted/50 cursor-pointer ${isSelected ? 'bg-blue-50/50 dark:bg-blue-900/20' : ''
+                              className={`border-b hover:bg-muted/50 cursor-pointer ${isSelected ? 'bg-blue-500/10' : ''
                                 }`}
                               style={{ height: `${ITEM_HEIGHT}px` }}
                               onClick={() => handleResultRowClick(cell)}
@@ -1397,10 +1468,13 @@ export function TACPage() {
                                     break
                                   case 'suggestedTac':
                                     cellContent = cell.existingTac && cell.existingTac !== '-' && cell.suggestedTac ? (
-                                      <span className={`px-1.5 py-0.5 rounded text-[10px] font-mono ${cell.isSingularity
-                                          ? 'bg-purple-500/10 text-purple-600'
+                                      <span
+                                        title={String(cell.suggestedTac)}
+                                        className={`inline-block max-w-full px-1.5 py-0.5 rounded text-[10px] truncate align-middle ${cell.isSingularity
+                                          ? 'bg-purple-500/10 text-purple-600 font-mono'
                                           : 'bg-blue-500/10 text-blue-600'
-                                        }`}>
+                                        }`}
+                                      >
                                         {cell.suggestedTac}
                                       </span>
                                     ) : (

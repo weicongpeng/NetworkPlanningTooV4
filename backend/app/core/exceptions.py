@@ -4,7 +4,7 @@
 """
 
 class NetworkPlanningError(Exception):
-    """网络规划工具基础异常类"""
+    """网优引擎基础异常类"""
     pass
 
 
