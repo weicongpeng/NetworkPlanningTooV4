@@ -1318,8 +1318,10 @@ export function MapPage() {
         try {
           resp = await save(plan.payload)
         } catch (e: any) {
-          // 409：基底已被其它会话改写（axios 非 2xx 走 reject）→ 回退整层保存，本次改动不丢
-          if (e?.response?.status === 409 && plan.mode === 'patch') {
+          // 409：基底已被其它会话改写 → 回退整层保存，本次改动不丢。
+          // 拦截器 reject 的错误对象只有 {message, code}（无 response 字段），
+          // 此前只判 e.response.status 导致回退永不生效，冲突直接报"保存失败"
+          if ((e?.response?.status === 409 || e?.code === 409) && plan.mode === 'patch') {
             console.warn('[MapPage] 增量保存基底冲突，回退整层保存:', lf.name)
             mode = 'full'
             resp = await save({ geojson: { type: 'FeatureCollection', features: ws.features } })
