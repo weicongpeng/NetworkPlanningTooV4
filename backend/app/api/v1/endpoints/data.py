@@ -707,6 +707,32 @@ async def download_layer_bundle(data_id: str, layer_id: str, _group=Depends(requ
         raise HTTPException(status_code=500, detail=safe_detail)
 
 
+@router.get("/revisions")
+async def data_revisions(current_user: User = Depends(get_current_user)) -> Dict[str, Any]:
+    """本组可见数据集的修订号快照（网页端兜底轮询用）。
+
+    WebSocket 的 data_changed 是唯一的即时通知通道：浏览器后台节流/网络抖动断开
+    期间错过的事件不会补发。桌面端有长轮询 + 定时同步兜底，网页端此前没有——
+    桌面端编辑上行后若网页端 WS 恰好断开，就只能手动刷新页面才能看到新数据。
+    前端定期拉本快照比对修订号，变化即补触发整表刷新。
+    """
+    try:
+        from app.services.data_group import index_entry_visible
+        from app.services import dataset_revision_service as revs
+
+        items: Dict[str, int] = {}
+        for data_id, entry in list(data_service.index.items()):
+            if not index_entry_visible(entry, current_user):
+                continue
+            rev = revs.get(data_id)
+            if rev:
+                items[data_id] = int(rev.get("rev") or 0)
+        return {"success": True, "data": {"revisions": items}}
+    except Exception as e:
+        safe_detail = str(e).encode("gbk", "replace").decode("gbk")
+        raise HTTPException(status_code=500, detail=safe_detail)
+
+
 @router.get("/list", response_model=Dict[str, Any])
 async def list_data(
     page: int = 1, page_size: int = 50,

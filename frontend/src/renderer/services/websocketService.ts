@@ -190,6 +190,46 @@ class WebSocketService {
       this.disconnect()
       void this.connect()
     }
+    this.startRevisionFallback()
+  }
+
+  /**
+   * 修订号兜底轮询（网页端专用，60s 一次）。
+   *
+   * data_changed 即时推送依赖 WebSocket 存活：浏览器对后台 tab 的节流/网络抖动
+   * 会断开 WS，断开期间桌面端上行的变更事件不会补发——桌面端有长轮询+定时同步
+   * 兜底，网页端此前没有，表现为"桌面端编辑后网页端地图一直不刷新"。
+   * 这里定期比对数据集修订号快照，有变化即补触发整表刷新（与 data_changed 同一动作）。
+   * 首次快照只建立基线不触发刷新。
+   */
+  private revisionSnapshot: Record<string, number> | null = null
+  private revisionTimer: number | null = null
+
+  startRevisionFallback(): void {
+    if (this.revisionTimer !== null) return
+    const poll = async () => {
+      try {
+        const { dataApi } = await import('./api')
+        const res: any = await dataApi.revisions()
+        const next: Record<string, number> = res?.data?.revisions || {}
+        const prev = this.revisionSnapshot
+        this.revisionSnapshot = next
+        if (!prev) return // 首次：建立基线
+        let changed = false
+        const ids = new Set([...Object.keys(prev), ...Object.keys(next)])
+        for (const id of ids) {
+          if ((prev[id] ?? 0) !== (next[id] ?? 0)) { changed = true; break }
+        }
+        if (changed) {
+          const { triggerDataRefresh } = await import('../store/dataStore')
+          triggerDataRefresh('full')
+        }
+      } catch {
+        // 未登录/桌面端无此接口/网络失败：静默下轮再试
+      }
+    }
+    void poll()
+    this.revisionTimer = window.setInterval(poll, 60_000)
   }
 
   /**

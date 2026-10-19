@@ -1629,6 +1629,15 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
         await loadMapInfoLayer({ ...file, visible: false })
         // 4) 按"当前"状态恢复显隐：编辑态保持隐藏（退出编辑由图层可见性 effect 恢复）
         const nowEditing = useLayerEditStore.getState().editableLayerId === layerId
+        if (nowEditing) {
+          // 编辑态「刷新」：以服务器最新数据重置编辑工作集——否则地图上渲染的仍是
+          // 打开编辑时快照的旧工作集，刷新看起来无效（丢弃未保存修改，以服务器为准）
+          const freshCache = useMapDataCacheStore.getState().layers[layerId]
+          if (freshCache?.geojson) {
+            useLayerEditStore.getState().resetWorkspace(
+              layerId, freshCache.geojson.features || [], freshCache.version)
+          }
+        }
         const newRef = mapInfoLayerRefsRef.current.get(layerId)
         if (newRef && mapInstanceRef.current) {
           // 编辑态 / 热力替换模式（显示原图层关闭）下保持隐藏

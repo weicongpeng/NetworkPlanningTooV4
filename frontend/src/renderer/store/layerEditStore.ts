@@ -161,6 +161,13 @@ interface LayerEditState {
     geometryType: WorkspaceGeometryType,
     baseFeatures: EditFeature[],
   ) => void
+  /**
+   * 以服务器最新数据重置编辑工作集（图层右键「刷新」在编辑态的行为）：
+   * 丢弃未保存修改与撤销历史，features/version 整体替换；
+   * 编辑会话（2D/3D）订阅本 store，重置后自动按新要素重渲染。
+   * 工作集不存在（未打开过编辑）时忽略。
+   */
+  resetWorkspace: (layerId: string, features: EditFeature[], version?: string | null) => void
   addFeature: (layerId: string, geometry: EditFeature['geometry'], props?: Record<string, any>) => void
   /** 批量追加：一次 set、一次撤销历史（缓冲区结果批量写入用，避免逐个追加多次重渲染） */
   addFeatures: (
@@ -427,6 +434,30 @@ export const useLayerEditStore = create<LayerEditState>((set, get) => ({
             changedIds: {},
             version: null,
             baseCount: features.length,
+          },
+        },
+      }
+    }),
+
+  resetWorkspace: (layerId, features, version) =>
+    set((s) => {
+      const ws = s.workspaces[layerId]
+      if (!ws) return s // 未打开过编辑：无工作集可重置
+      const nextFeatures = withEditIds(features || [])
+      return {
+        workspaces: {
+          ...s.workspaces,
+          [layerId]: {
+            ...ws,
+            features: nextFeatures,
+            // 重置即新基线：丢弃未保存修改与撤销历史
+            dirty: false,
+            changeCount: 0,
+            history: [],
+            baseRows: buildBaseRows(nextFeatures),
+            changedIds: {},
+            version: version ?? null,
+            baseCount: nextFeatures.length,
           },
         },
       }

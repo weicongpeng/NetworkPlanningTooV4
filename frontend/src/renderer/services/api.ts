@@ -936,6 +936,10 @@ async function chunkedUpload(
 
 // 数据管理API
 export const dataApi = {
+  // 本组可见数据集修订号快照（网页端兜底轮询：WS 断开期间错过的 data_changed 靠它补刷）
+  revisions: async (): Promise<ApiResponse<{ revisions: Record<string, number> }>> => {
+    return apiClient.get('/data/revisions') as any
+  },
   // 上传工参文件 - 使用分块上传（解决 Cloudflare 524 超时）+ 异步处理轮询
   uploadExcel: async (file: File | null, filePath?: string): Promise<ApiResponse<UploadResponse>> => {
     console.log('[uploadExcel] START - file:', file, 'filePath:', filePath)

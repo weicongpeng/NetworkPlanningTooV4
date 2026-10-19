@@ -1745,6 +1745,15 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
         // Excel 地理化数据本身每次都走 dataApi.get
         useMapDataCacheStore.getState().invalidateLayer(layerId)
         await syncGeoJsonLayers()
+        // 编辑态「刷新」：以服务器最新数据重置编辑工作集——工作集是打开编辑时的
+        // 快照，不重置的话刷新对地图上显示的编辑内容无效（丢弃未保存修改）
+        if (useLayerEditStore.getState().editableLayerId === layerId) {
+          const freshCache = useMapDataCacheStore.getState().layers[layerId]
+          if (freshCache?.geojson) {
+            useLayerEditStore.getState().resetWorkspace(
+              layerId, freshCache.geojson.features || [], freshCache.version)
+          }
+        }
       },
       setMapType: (type) => {
         // 3D 底图在高德卫星 / 高德矢量之间切换；注记层随之切换（见上方底图与注记的 effect）。
