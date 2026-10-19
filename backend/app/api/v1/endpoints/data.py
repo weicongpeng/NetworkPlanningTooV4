@@ -30,6 +30,7 @@ from app.models.schemas import (
 from app.services.data_service import data_service, validate_excel_upload_contract
 from app.core.security import get_current_user, require_data_import, require_data_delete, require_data_update, require_cell_entry, require_cell_query_update
 from app.core.data_access import require_data_group_access
+from app.models.database import User
 
 router = APIRouter()
 
