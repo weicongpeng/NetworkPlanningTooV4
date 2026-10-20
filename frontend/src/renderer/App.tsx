@@ -17,6 +17,7 @@ import {
   DistanceMatchPage,
   SiteSpacingPage,
   FrequencyConversionPage,
+  IntermodulationPage,
   MapPage,
   AdminUsersPage,
   AppVersionsPage,
@@ -152,6 +153,14 @@ function App() {
                 element={
                   <ProtectedRoute>
                     <FrequencyConversionPage />
+                  </ProtectedRoute>
+                }
+              />
+              <Route
+                path="/intermodulation"
+                element={
+                  <ProtectedRoute>
+                    <IntermodulationPage />
                   </ProtectedRoute>
                 }
               />

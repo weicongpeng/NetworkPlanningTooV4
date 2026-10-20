@@ -212,7 +212,8 @@
     "layerPoint": "Point Layer Tools",
     "distanceMatch": "Batch Distance Match",
     "siteSpacing": "Site Spacing",
-    "freqConversion": "Frequency Conversion"
+    "freqConversion": "Frequency Conversion",
+    "im3Evaluation": "3rd-Order IMD Evaluation"
   },
   "home": {
     "title": "NetOpt Engine",
@@ -245,7 +246,8 @@
     "invalid": "Not Activated",
     "layerSectorDesc": "Create sector layer from params (tab/mif/kml)",
     "layerPointDesc": "Create point layer from params (tab/mif/kml)",
-    "freqConversionDesc": "LTE/NR frequency & channel number conversion incl. GSCN"
+    "freqConversionDesc": "LTE/NR frequency & channel number conversion incl. GSCN",
+    "im3EvaluationDesc": "Two-tone third-order IMD overlap and risk assessment"
   },
   "data": {
     "title": "Data Management",
@@ -1933,5 +1935,95 @@
     "modeSharedPending": "Shared mode · {{count}} pending",
     "modeSharedConflicts": "Shared mode · {{count}} conflicts",
     "modeSharedError": "Shared mode · Sync error"
+  },
+  "im3Evaluation": {
+    "title": "3rd-Order IMD Evaluation",
+    "subtitle": "Two-tone third-order intermodulation pre-assessment per ITU-R SM.332-6, 3GPP TR 36.942 and YD/T 3826-2021",
+    "source1": "First Transmit Interferer",
+    "source2": "Second Transmit Interferer",
+    "receiver": "Victim Receiver",
+    "preset": "Preset Band",
+    "bandName": "Band Name",
+    "unnamedBand": "Unnamed Band",
+    "freqLow": "Lower Frequency (MHz)",
+    "freqHigh": "Upper Frequency (MHz)",
+    "params": "Optional Assessment Parameters",
+    "imType": "IMD Type",
+    "pim": "Passive IMD (PIM)",
+    "active": "Active IMD",
+    "txPower": "Per-Carrier Tx Power (dBm)",
+    "isolation": "Antenna Isolation (dB)",
+    "isolationHint": "Isolation applies to active IMD only; passive IMD uses the antenna PIM suppression estimate.",
+    "invalidParams": "Tx power must be 0–100 dBm and isolation must be 0–100 dB.",
+    "result": "Assessment Result",
+    "emptyHint": "Enter lower and upper frequencies for both interferers and the victim receiver.",
+    "invalidFreq": "Frequencies must be numbers greater than 0.",
+    "singlePoint": "Single-frequency input mode.",
+    "sortedTitle": "Automatically Sorted Fundamental Frequencies",
+    "lowSource": "Lower fundamental f₁ ({{tag}})",
+    "highSource": "Upper fundamental f₂ ({{tag}})",
+    "sourceN": "Interferer {{n}}",
+    "rxBand": "Receiver Band",
+    "lowIm3": "Lower IM3 (2f₁−f₂)",
+    "highIm3": "Upper IM3 (2f₂−f₁)",
+    "negativeProduct": "The product is negative and has no physical meaning; interference is not assessed.",
+    "overlapYes": "Overlaps the receiver band: {{low}}–{{high}} MHz, overlap bandwidth {{bw}} MHz.",
+    "overlapNo": "No overlap with the receiver band.",
+    "judgment": "Interference Verdict",
+    "hasInterference": "Potential third-order IMD interference",
+    "noInterference": "No frequency-domain interference",
+    "riskTitle": "Risk Assessment",
+    "risk": {
+      "none": "No Interference",
+      "low": "Low Risk",
+      "medium": "Medium Risk",
+      "high": "High Risk"
+    },
+    "reason": {
+      "none": "The IM3 products do not fall within the receiver passband; no frequency conflict.",
+      "edge": "Only the band edge overlaps ({{bw}} MHz); normally imperceptible to services.",
+      "belowNoise": "Overlap bandwidth {{bw}} MHz; the estimated IMD level is {{diff}} dB below the noise floor, no normal impact.",
+      "mediumAged": "Overlap bandwidth {{bw}} MHz; the estimated IMD level is {{diff}} dB above the noise floor. Slight noise rise may occur as antenna feeders age.",
+      "high": "Overlap bandwidth {{bw}} MHz covers the main uplink bandwidth of the victim system; the estimated IMD level is {{diff}} dB above the noise floor. Co-sited deployment is likely to raise the noise floor by 3–15 dB, reducing uplink throughput and causing access failures.",
+      "mediumEqual": "Overlap bandwidth {{bw}} MHz; the estimated IMD level is comparable to the noise floor and will interfere if the antenna system degrades.",
+      "lowIsolated": "Overlap bandwidth {{bw}} MHz, but the estimated IMD level is {{diff}} dB below the noise floor; no impact when isolation is adequate."
+    },
+    "suggestion": {
+      "none": "No action required.",
+      "edge": "Avoid by shifting carrier frequencies; no antenna feeder remediation needed.",
+      "belowNoise": "Periodic noise-floor monitoring is sufficient.",
+      "mediumAged": "Check waterproofing and torque of co-sited antenna feeder connectors in advance and reserve frequency adjustment margin.",
+      "high": "Priority 1: check antenna PIM (aged connectors, failed waterproofing, corroded metal) and ensure PIM ≤ -107 dBm @ 2×43 dBm; Priority 2: increase antenna isolation to ≥30 dB (horizontal spacing ≥1.5 m / vertical ≥1 m); Priority 3: shift carrier frequencies away from the receiver band.",
+      "mediumEqual": "Perform PIM testing strictly during antenna feeder installation and prepare a frequency optimization plan.",
+      "lowIsolated": "Ensure antenna isolation meets the specification."
+    },
+    "estimateLevel": "Estimated IMD Level",
+    "noiseFloor": "Typical Receiver Noise Floor (20 MHz)",
+    "levelDiff": "Level Difference",
+    "standards": "Basis: ITU-R SM.332-6, 3GPP TR 36.942 clause 8, YD/T 3826-2021.",
+    "note1": "This is a frequency-domain potential-interference assessment; actual interference also requires both frequency overlap and a level above the noise floor.",
+    "note2": "If a TDD source is involved, IMD is pulsed and aligned with the TDD downlink slots; verify with symbol shutdown.",
+    "note3": "Final interference should be confirmed by on-site spectrum scanning / PIM testing.",
+    "note4": "Only differential third-order IMD (2f₁−f₂ / 2f₂−f₁) is assessed; sum-frequency and higher-order products are out of scope.",
+    "calibration": "Passive PIM suppression is estimated at -130 dBc (calibrated to reproduce the reference case in the specification document). Compliant antenna systems are usually better than -150 dBc; validate with on-site PIM measurements.",
+    "presets": {
+      "ct2g1Dl": "China Telecom 2.1G FDD DL (B1/n1 20M)",
+      "ctCuShared2g1Dl": "Telecom/Unicom Shared 2.1G FDD DL (B1/n1 40M)",
+      "cm2g3Tdd": "China Mobile 2.3G TDD (B40/n40 50M)",
+      "ct2g1Ul": "China Telecom 2.1G FDD UL (B1/n1 20M)",
+      "ctCuShared2g1Ul": "Telecom/Unicom Shared 2.1G FDD UL (B1/n1 40M)",
+      "cm2g6Tdd": "China Mobile 2.6G TDD (n41 160M)",
+      "cm900Dl": "China Mobile 900M FDD DL (B8 20M)",
+      "cm900Ul": "China Mobile 900M FDD UL (B8 20M)",
+      "cu1g8Dl": "China Unicom 1.8G FDD DL (B3 20M)",
+      "cu1g8Ul": "China Unicom 1.8G FDD UL (B3 20M)",
+      "custom": "Custom Band"
+    },
+    "mode": {
+      "fddDl": "FDD DL",
+      "fddUl": "FDD UL",
+      "tdd": "TDD",
+      "custom": "Custom"
+    }
   }
 }

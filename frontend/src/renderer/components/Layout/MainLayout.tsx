@@ -139,6 +139,7 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
         { type: 'link', name: t('nav.distanceMatch'), href: '/distance-match' },
         { type: 'link', name: t('nav.siteSpacing'), href: '/site-spacing' },
         { type: 'link', name: t('nav.freqConversion'), href: '/frequency-conversion' },
+        { type: 'link', name: t('nav.im3Evaluation'), href: '/intermodulation' },
       ],
     },
     { type: 'link', name: t('nav.config'), href: '/license', icon: Shield },

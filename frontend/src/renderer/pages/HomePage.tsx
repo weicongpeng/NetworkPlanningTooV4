@@ -10,6 +10,7 @@ import {
   Ruler,
   MoveHorizontal,
   RadioTower,
+  Waves,
   Bot,
   LucideIcon
 } from 'lucide-react'
@@ -100,6 +101,13 @@ export function HomePage() {
           icon={RadioTower}
           link="/frequency-conversion"
           iconColor="text-indigo-600"
+        />
+        <FeatureCard
+          title={t('nav.im3Evaluation')}
+          description={t('home.im3EvaluationDesc')}
+          icon={Waves}
+          link="/intermodulation"
+          iconColor="text-violet-600"
         />
         <FeatureCard
           title={t('nav.config')}

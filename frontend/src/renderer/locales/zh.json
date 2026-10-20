@@ -134,7 +134,8 @@
     "layerPoint": "图层制作（点）",
     "distanceMatch": "批量距离匹配",
     "siteSpacing": "站间距计算",
-    "freqConversion": "频点换算"
+    "freqConversion": "频点换算",
+    "im3Evaluation": "三阶互调评估"
   },
   "home": {
     "title": "网优引擎",
@@ -167,7 +168,8 @@
     "invalid": "未激活",
     "layerSectorDesc": "根据工参制作扇区图层 (tab/mif/kml)",
     "layerPointDesc": "根据工参制作点图层 (tab/mif/kml)",
-    "freqConversionDesc": "LTE/NR 频点与频率双向换算，含 GSCN"
+    "freqConversionDesc": "LTE/NR 频点与频率双向换算，含 GSCN",
+    "im3EvaluationDesc": "两音三阶互调频率重叠与风险等级评估"
   },
   "data": {
     "title": "数据管理",
@@ -1944,5 +1946,95 @@
     "modeSharedPending": "共享模式 · 待上传 {{count}} 项",
     "modeSharedConflicts": "共享模式 · {{count}} 项冲突",
     "modeSharedError": "共享模式 · 同步异常"
+  },
+  "im3Evaluation": {
+    "title": "三阶互调评估",
+    "subtitle": "两音三阶互调干扰预判：遵循 ITU-R SM.332-6、3GPP TR 36.942、YD/T 3826-2021",
+    "source1": "第一个发射干扰源",
+    "source2": "第二个发射干扰源",
+    "receiver": "被干扰接收系统",
+    "preset": "预置频段",
+    "bandName": "频段名称",
+    "unnamedBand": "未命名频段",
+    "freqLow": "频率下限 (MHz)",
+    "freqHigh": "频率上限 (MHz)",
+    "params": "可选评估参数",
+    "imType": "互调类型",
+    "pim": "无源互调 (PIM)",
+    "active": "有源互调",
+    "txPower": "单载波发射功率 (dBm)",
+    "isolation": "天线隔离度 (dB)",
+    "isolationHint": "天线隔离度仅用于有源互调估算；无源互调按天馈 PIM 抑制量估算。",
+    "invalidParams": "发射功率需在 0~100dBm 之间，隔离度需在 0~100dB 之间。",
+    "result": "评估结果",
+    "emptyHint": "请填写两个干扰源与被干扰接收系统的频率上下限。",
+    "invalidFreq": "频率必须为大于 0 的数字。",
+    "singlePoint": "当前为单频点输入模式。",
+    "sortedTitle": "基波频率自动排序结果",
+    "lowSource": "低频基波 f₁（{{tag}}）",
+    "highSource": "高频基波 f₂（{{tag}}）",
+    "sourceN": "干扰源 {{n}}",
+    "rxBand": "接收频段",
+    "lowIm3": "低段三阶互调 (2f₁−f₂)",
+    "highIm3": "高段三阶互调 (2f₂−f₁)",
+    "negativeProduct": "产物为负频率，无物理意义，不评估干扰。",
+    "overlapYes": "与接收频段存在重叠：{{low}} ~ {{high}} MHz，重叠带宽 {{bw}} MHz。",
+    "overlapNo": "与接收频段无重叠。",
+    "judgment": "干扰判定",
+    "hasInterference": "存在潜在三阶互调干扰",
+    "noInterference": "无频率层面干扰",
+    "riskTitle": "风险评估",
+    "risk": {
+      "none": "无干扰",
+      "low": "低风险",
+      "medium": "中风险",
+      "high": "高风险"
+    },
+    "reason": {
+      "none": "三阶互调产物未落入接收通带，无频率冲突，无需额外规避。",
+      "edge": "仅边缘频点擦边，重叠带宽 {{bw}} MHz，正常场景下对业务无感知。",
+      "belowNoise": "重叠带宽 {{bw}} MHz，预估互调电平低于底噪 {{diff}} dB，正常无影响。",
+      "mediumAged": "重叠带宽 {{bw}} MHz，预估互调电平高于底噪 {{diff}} dB，天馈老化时可能出现轻度底噪抬升。",
+      "high": "重叠带宽 {{bw}} MHz，覆盖受扰系统主要上行带宽；预估互调电平高于底噪 {{diff}} dB，共站场景大概率出现底噪抬升 3~15dB，导致上行速率下降、接入失败。",
+      "mediumEqual": "重叠带宽 {{bw}} MHz，预估互调电平与底噪相当，天馈劣化时会产生干扰。",
+      "lowIsolated": "重叠带宽 {{bw}} MHz，但预估互调电平低于底噪 {{diff}} dB，隔离度充足时无影响。"
+    },
+    "suggestion": {
+      "none": "无需处理。",
+      "edge": "可通过优化频点偏移彻底避让，无需天馈整改。",
+      "belowNoise": "定期监控底噪即可。",
+      "mediumAged": "建议提前排查共站天馈接头防水与紧固度，预留频点调整空间。",
+      "high": "优先级1：排查天馈 PIM（接头老化、防水失效、金属生锈），保证 PIM ≤ -107dBm@2×43dBm；优先级2：增大天线隔离度至 ≥30dB（水平间距 ≥1.5m/垂直间距 ≥1m）；优先级3：调整载波频点避让接收频段。",
+      "mediumEqual": "建议天馈施工时严格执行 PIM 测试，预留频点优化预案。",
+      "lowIsolated": "保证天线隔离度符合规范即可。"
+    },
+    "estimateLevel": "预估互调电平",
+    "noiseFloor": "接收机 20MHz 带宽典型底噪",
+    "levelDiff": "电平差",
+    "standards": "计算依据：ITU-R SM.332-6、3GPP TR 36.942 第 8 章、YD/T 3826-2021。",
+    "note1": "本结果为频率维度的潜在干扰判定，实际干扰需同时满足「频率重叠 + 电平高于底噪」。",
+    "note2": "若存在 TDD 干扰源，互调为脉冲式，与 TDD 下行时隙严格对齐，可通过符号关断验证。",
+    "note3": "最终干扰情况请以现场扫频 / PIM 测试结果为准。",
+    "note4": "本工具仅评估差模三阶互调 2f₁−f₂ / 2f₂−f₁，三阶和频与高阶互调不在评估范围内。",
+    "calibration": "无源 PIM 抑制量按 -130dBc 估算（用于复现文档经典案例的风险结论）；合格天馈通常优于 -150dBc，实际评估请结合现场 PIM 测试。",
+    "presets": {
+      "ct2g1Dl": "中国电信 2.1G FDD 下行 (B1/n1 20M)",
+      "ctCuShared2g1Dl": "电联共享 2.1G FDD 下行 (B1/n1 40M 全带宽)",
+      "cm2g3Tdd": "中国移动 2.3G TDD (B40/n40 50M)",
+      "ct2g1Ul": "中国电信 2.1G FDD 上行 (B1/n1 20M)",
+      "ctCuShared2g1Ul": "电联共享 2.1G FDD 上行 (B1/n1 40M 全带宽)",
+      "cm2g6Tdd": "中国移动 2.6G TDD (n41 160M)",
+      "cm900Dl": "中国移动 900M FDD 下行 (B8 20M)",
+      "cm900Ul": "中国移动 900M FDD 上行 (B8 20M)",
+      "cu1g8Dl": "中国联通 1.8G FDD 下行 (B3 20M)",
+      "cu1g8Ul": "中国联通 1.8G FDD 上行 (B3 20M)",
+      "custom": "自定义频段"
+    },
+    "mode": {
+      "fddDl": "FDD 下行",
+      "fddUl": "FDD 上行",
+      "tdd": "TDD",
+      "custom": "自定义"
+    }
   }
 }

@@ -14,6 +14,7 @@ export const loadLayerToolsPage = () => import('./pages/LayerToolsPage')
 export const loadDistanceMatchPage = () => import('./pages/DistanceMatchPage')
 export const loadSiteSpacingPage = () => import('./pages/SiteSpacingPage')
 export const loadFrequencyConversionPage = () => import('./pages/FrequencyConversionPage')
+export const loadIntermodulationPage = () => import('./pages/IntermodulationPage')
 export const loadMapPage = () => import('./pages/MapPage').then(m => ({ default: m.MapPage }))
 export const loadAdminUsersPage = () => import('./pages/AdminUsersPage').then(m => ({ default: m.AdminUsersPage }))
 export const loadAppVersionsPage = () => import('./pages/AppVersionsPage').then(m => ({ default: m.AppVersionsPage }))
@@ -67,6 +68,7 @@ export const LayerToolsPage = lazy(recoverable(loadLayerToolsPage))
 export const DistanceMatchPage = lazy(recoverable(loadDistanceMatchPage))
 export const SiteSpacingPage = lazy(recoverable(loadSiteSpacingPage))
 export const FrequencyConversionPage = lazy(recoverable(loadFrequencyConversionPage))
+export const IntermodulationPage = lazy(recoverable(loadIntermodulationPage))
 export const MapPage = lazy(recoverable(loadMapPage))
 export const AdminUsersPage = lazy(recoverable(loadAdminUsersPage))
 export const AppVersionsPage = lazy(recoverable(loadAppVersionsPage))
@@ -89,6 +91,7 @@ export function prefetchPage(href: string) {
     case '/distance-match': loadDistanceMatchPage(); break
     case '/site-spacing': loadSiteSpacingPage(); break
     case '/frequency-conversion': loadFrequencyConversionPage(); break
+    case '/intermodulation': loadIntermodulationPage(); break
     case '/map': loadMapPage(); break
     case '/admin/users': loadAdminUsersPage(); break
     case '/app-versions': loadAppVersionsPage(); break
