@@ -274,3 +274,79 @@ def test_invalid_full_params_upload_reports_reason_and_keeps_existing(tmp_path, 
     assert "基站经度" in entry["errorMessage"]
     assert "重新导入" in entry["errorMessage"]
     assert deleted == [], "不合法的文件不应删除已有工参"
+
+
+def _write_nr_xlsx(path, header_row0, header_row2) -> None:
+    """按真实三行表头写 NR 工参：第 1 行中文名，第 2 行必填标记，第 3 行英文名。
+
+    row0 / row2 由调用方给出，便于构造被污染或缺列的极端文件。
+    """
+    rows = [
+        header_row0,
+        ["非必填"] * len(header_row0),
+        header_row2,
+        ["Cell_A", 7905741, 1, "站A", 114.55, 24.03, 460, 11, 1],
+        ["Cell_B", 7905741, 2, "站A", 114.55, 24.03, 460, 11, 2],
+    ]
+    pd.DataFrame(rows).to_excel(path, sheet_name="NR Project Parameters", header=False, index=False)
+
+
+_NR_ROW0_OK = [
+    "小区名称\nCELL NAME\nString[0..128]",
+    "gNodeB标识\ngNodeB ID\nLong:[0..1048575]",
+    "小区标识\ncellLocalId\nInteger:[0~2147483647]",
+    "基站名称\ngNodeB Name\nString[0..128]",
+    "基站经度\ngNodeB Longitude Double:[-180..180]",
+    "基站纬度\ngNodeB Latitude\nDouble:[-90..90]",
+    "移动国家码\nMCC\nString:[3..3]",
+    "移动网络码\nMNC\nString:[2..3]",
+    "物理小区识别码\nPCI\nLong:[0..1007]",
+]
+_NR_ROW2_OK = [
+    "CELL NAME", "gNodeB ID", "Cell ID", "gNodeB Name",
+    "gNodeB Longitude", "gNodeB Latitude", "MCC", "MNC", "PCI",
+]
+
+
+def test_polluted_cell_name_header_falls_back_to_english(tmp_path):
+    """「小区名称」列的中文表头被覆盖成小区名时，凭英文表头 CELL NAME 仍能识别该列
+
+    回归（2026-10-22）：河源电信全量工参的 NR 表第 15 列第 1 行被写成
+    「GS_N78_河源市区_…RRU2（二载）」，解析找不到「小区名称」列，
+    静默回退成「基站名称_小区标识」，地图属性与标签都显示成基站名。
+    """
+    path = tmp_path / "ProjectParameter_polluted.xlsx"
+    row0 = list(_NR_ROW0_OK)
+    row0[0] = "GS_N78_河源市区_坚基商业中心三层四层22号弱电井RRU2（二载）"
+    _write_nr_xlsx(path, row0, _NR_ROW2_OK)
+    data_service.full_params_import_warnings = []
+
+    sites = data_service._parse_full_params_sheet(
+        pd.ExcelFile(path), "NR Project Parameters", "NR"
+    )
+
+    site = sites[0]
+    assert site["name"] == "站A"
+    assert sorted(c["name"] for c in site["sectors"]) == ["Cell_A", "Cell_B"]
+    assert not any(
+        w["code"] == "sector_name_missing" for w in data_service.full_params_import_warnings
+    )
+
+
+def test_missing_cell_name_column_warns_and_falls_back(tmp_path):
+    """连英文表头都没有「小区名称」列时：回退「基站名称_小区标识」并留下导入提醒"""
+    path = tmp_path / "ProjectParameter_noname.xlsx"
+    row0 = list(_NR_ROW0_OK)
+    row0[0] = "备注\nREMARK\nString[0..128]"
+    row2 = list(_NR_ROW2_OK)
+    row2[0] = "REMARK"
+    _write_nr_xlsx(path, row0, row2)
+    data_service.full_params_import_warnings = []
+
+    sites = data_service._parse_full_params_sheet(
+        pd.ExcelFile(path), "NR Project Parameters", "NR"
+    )
+
+    site = sites[0]
+    assert sorted(c["name"] for c in site["sectors"]) == ["站A_1", "站A_2"]
+    assert {"code": "sector_name_missing", "network": "NR"} in data_service.full_params_import_warnings

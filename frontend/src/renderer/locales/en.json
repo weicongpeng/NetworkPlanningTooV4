@@ -322,6 +322,7 @@
     "importWarnCoordZero": "{{count}} cell(s) with missing or zero longitude/latitude (plotted at the origin)",
     "importWarnSectorIdMissing": "{{count}} row(s) with empty cell ID (kept with a temporary ID)",
     "importWarnSiteIdDropped": "{{count}} row(s) dropped because the site ID is empty",
+    "importWarnSectorNameMissing": "No \"Cell Name\" column found (header may have been overwritten); cell names fall back to \"site name_cell ID\"",
     "importWarnSingleNetwork": "Only {{present}} found in the file; check whether the {{missing}} parameters are missing",
     "importWarnHint": "Please check the source file and re-import if needed (the imported data is usable).",
     "refresh": "Refresh",

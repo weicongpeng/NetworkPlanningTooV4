@@ -5088,10 +5088,12 @@ class DataService:
             # 直接使用传入的ExcelFile对象
             xls = excel_file
 
-            # 读取第一行获取列名（包含\n分隔的多行信息）
-            header_row = pd.read_excel(
-                xls, sheet_name=sheet_name, header=None, nrows=1
-            ).iloc[0]
+            # 读取前 3 行表头：第 1 行「中文名\n英文名\n元数据」，第 2/3 行是必填标记与英文名。
+            # 第 2/3 行在下面作为列别名收集，中文表头被改写/污染时仍能定位到列。
+            header_rows = pd.read_excel(
+                xls, sheet_name=sheet_name, header=None, nrows=3
+            )
+            header_row = header_rows.iloc[0]
 
             # 提取列名：复杂表头第一行形如「中文名\n英文名\n元数据」，取第一个非空行
             # （个别列首行为空，如 '\ngNodeBLength\nLong:[0..999999]'，取英文名兜底）
@@ -5119,6 +5121,25 @@ class DataService:
                 self._add_import_warning(
                     "duplicate_columns", network=network_type, columns=dup_names
                 )
+
+            # 复杂表头第 2/3 行的英文名（CELL NAME / gNodeB Name…）作为列别名：
+            # 中文表头被误改写时（如某列中文名被覆盖成一个小区的名字），
+            # find_column 仍能凭英文名定位该列，避免静默回退成兜底值。
+            column_aliases: Dict[str, List[str]] = {}
+            if is_complex_header and len(header_rows) > 1:
+                for idx, col_name in enumerate(clean_columns):
+                    if idx >= header_rows.shape[1]:
+                        break
+                    aliases: List[str] = []
+                    for r in range(1, len(header_rows)):
+                        val = header_rows.iat[r, idx]
+                        if val is None or pd.isna(val):
+                            continue
+                        text = str(val).strip()
+                        if text and text not in ("必填", "非必填"):
+                            aliases.append(text)
+                    if aliases:
+                        column_aliases[col_name] = aliases
 
             # 确定跳过的行数
             # 复杂表头通常占3行（第4行开始是数据）
@@ -5171,6 +5192,9 @@ class DataService:
             except:
                 pass
 
+            # 列别名（英文表头）随 DataFrame 传给列名匹配：find_column 中文名匹配失败时兜底
+            df.attrs["column_aliases"] = column_aliases
+
             # 使用专门的解析方法处理全量工参数据
             return self._parse_full_params_dataframe(df, network_type)
 
@@ -5198,11 +5222,11 @@ class DataService:
                 "site_id": [
                     "eNodeB标识", "eNodeBID", "eNodeB ID", "基站ID",
                 ],
-                "site_name": ["基站名称"],
+                "site_name": ["基站名称", "eNodeB Name", "eNBName"],
                 "longitude": ["基站经度", "经度", "小区经度"],
                 "latitude": ["基站纬度", "纬度", "小区纬度"],
                 "sector_id": ["小区标识", "小区ID"],
-                "sector_name": ["小区名称"],
+                "sector_name": ["小区名称", "CELL NAME", "Cell Name", "userLabel", "UserLabel"],
                 "azimuth": ["天线方向角", "方位角"],
                 "height": ["天线挂高", "挂高"],
                 "pci": ["物理小区识别码", "PCI"],
@@ -5217,11 +5241,11 @@ class DataService:
                 "site_id": [
                     "gNodeB标识", "gNodeBID", "gNodeB ID", "基站ID", "管理网元ID",
                 ],
-                "site_name": ["基站名称"],
+                "site_name": ["基站名称", "gNodeB Name", "gNBName"],
                 "longitude": ["基站经度", "经度", "小区经度"],
                 "latitude": ["基站纬度", "纬度", "小区纬度"],
                 "sector_id": ["小区标识", "小区ID"],
-                "sector_name": ["小区名称"],
+                "sector_name": ["小区名称", "CELL NAME", "Cell Name", "CELLNAME", "userLabel", "UserLabel"],
                 "azimuth": ["天线方向角", "方位角"],
                 "height": ["天线挂高", "挂高"],
                 "pci": ["物理小区识别码", "PCI"],
@@ -5233,6 +5257,9 @@ class DataService:
                 "mnc": ["移动网络码", "MNC"],
                 "first_group": ["第一分组"],
             }
+
+        # 复杂表头第 2/3 行的英文名别名（列名 → 别名列表），由 _parse_full_params_sheet 写入
+        column_aliases = dict(df.attrs.get("column_aliases") or {})
 
         # 智能列名匹配函数（精简打印）
         def find_column(col_names, possible_names, column_type=""):
@@ -5253,6 +5280,20 @@ class DataService:
                         continue
                     if pl in col_lower[i] or col_lower[i] in pl:
                         return cc
+
+                # 英文表头兜底：中文名被改写/污染时，用复杂表头第 2/3 行的英文名精确匹配
+                # （比较时忽略大小写与空格，CELL NAME / CELLNAME 视为同一字段）
+                pl_norm = pl.replace(" ", "")
+                for col_name, aliases in column_aliases.items():
+                    if any(
+                        str(alias).strip().lower().replace(" ", "") == pl_norm
+                        for alias in aliases
+                    ):
+                        print(
+                            f"[DataService] 列名兜底命中: {possible} → {col_name}"
+                            f"（英文表头 {aliases[0]}）"
+                        )
+                        return col_name
 
                 # 管理网元ID宽松匹配
                 if column_type == "managed_element":
@@ -5446,6 +5487,13 @@ class DataService:
             df['_sector_name_col'] = _sname_clean.where(valid_mask)
         else:
             df['_sector_name_col'] = pd.NA
+            # 缺「小区名称」列不再静默：小区名会回退成「基站名称_小区标识」，
+            # 地图属性/标签会看起来像"小区名称变成了基站名称"，必须让用户看到。
+            safe_print(
+                f"[DataService] {network_type} 工参表未找到「小区名称」列，"
+                f"小区名称将回退为「基站名称_小区标识」"
+            )
+            self._add_import_warning("sector_name_missing", network=network_type)
 
         # 6) 构建唯一键用于去重
         if network_type == "LTE":

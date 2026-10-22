@@ -8,6 +8,7 @@ const t = (key: string, options: Record<string, unknown> = {}) => {
     'data.importWarnCoordZero': '{{count}} 个小区经纬度缺失或为 0（地图上会落在原点）',
     'data.importWarnSectorIdMissing': '{{count}} 行小区标识为空（已分配临时编号并保留）',
     'data.importWarnSiteIdDropped': '已丢弃 {{count}} 行基站标识为空的数据',
+    'data.importWarnSectorNameMissing': '未找到「小区名称」列（列名可能被误改），小区名称按「基站名称_小区标识」显示',
     'data.importWarnSingleNetwork': '文件只含 {{present}} 制式，请确认是否漏传 {{missing}} 工参',
   }
   return (dict[key] || key).replace(/\{\{(\w+)\}\}/g, (_, k) => String(options[k] ?? ''))
@@ -29,6 +30,11 @@ describe('formatImportWarning', () => {
       .toBe('[NR] 3 行小区标识为空（已分配临时编号并保留）')
     expect(formatImportWarning({ code: 'site_id_dropped', network: 'NR', count: 5 }, t))
       .toBe('[NR] 已丢弃 5 行基站标识为空的数据')
+  })
+
+  it('缺「小区名称」列：提示回退为基站名称_小区标识', () => {
+    expect(formatImportWarning({ code: 'sector_name_missing', network: 'NR' }, t))
+      .toBe('[NR] 未找到「小区名称」列（列名可能被误改），小区名称按「基站名称_小区标识」显示')
   })
 
   it('单一制式：不带制式前缀，说明缺失的制式', () => {

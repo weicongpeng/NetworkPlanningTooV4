@@ -250,6 +250,7 @@
     "importWarnCoordZero": "{{count}} 个小区经纬度缺失或为 0（地图上会落在原点）",
     "importWarnSectorIdMissing": "{{count}} 行小区标识为空（已分配临时编号并保留）",
     "importWarnSiteIdDropped": "已丢弃 {{count}} 行基站标识为空的数据",
+    "importWarnSectorNameMissing": "未找到「小区名称」列（列名可能被误改），小区名称按「基站名称_小区标识」显示",
     "importWarnSingleNetwork": "文件只含 {{present}} 制式，请确认是否漏传 {{missing}} 工参",
     "importWarnHint": "请核对源文件，如有问题修改后重新导入即可（现有数据可正常使用）",
     "refresh": "刷新",

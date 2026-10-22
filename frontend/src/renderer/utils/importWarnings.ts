@@ -24,6 +24,8 @@ export function formatImportWarning(warning: ImportWarning, t: Translate): strin
       return prefix + t('data.importWarnSectorIdMissing', { count: warning.count ?? 0 })
     case 'site_id_dropped':
       return prefix + t('data.importWarnSiteIdDropped', { count: warning.count ?? 0 })
+    case 'sector_name_missing':
+      return prefix + t('data.importWarnSectorNameMissing')
     case 'single_network':
       return t('data.importWarnSingleNetwork', { present: warning.present ?? '', missing: warning.missing ?? '' })
     default:
