@@ -10,7 +10,7 @@ import { indexedDBService } from '../services/indexedDBService'
 import { CellParamsTable } from '../components/DataTable/CellParamsTable'
 import { CellQueryUpdateContent } from '../components/DataTable/CellQueryUpdateCard'
 import { cellDedupKey } from '../utils/cellDedup'
-import { formatImportWarning } from '../utils/importWarnings'
+import { formatImportWarning, formatImportWarningTitle } from '../utils/importWarnings'
 import type { ImportWarning } from '../utils/importWarnings'
 import { useDownloadStore } from '../store/downloadStore'
 import { useTranslation } from 'react-i18next'
@@ -1055,25 +1055,30 @@ export function DataPage() {
             </div>
             </div>
 
-            {/* 全量工参导入提醒（重复列名/坐标缺失/小区标识为空等，数据已导入，仅提示修正源文件） */}
+            {/* 导入提醒（工参/地理化数据：重复列名、坐标缺失/为 0 等，数据已导入，仅提示修正源文件） */}
             {(() => {
-              const warnings = fullParamFiles
-                .flatMap(f => (f.metadata?.importWarnings || []) as ImportWarning[])
-              if (warnings.length === 0) return null
+              const warnedFiles = items
+                .map(item => ({ item, warnings: (item.metadata?.importWarnings || []) as ImportWarning[] }))
+                .filter(({ warnings }) => warnings.length > 0)
+              if (warnedFiles.length === 0) return null
               return (
                 <div className="mb-4 px-3 py-2 bg-amber-500/10 border border-amber-500/20 rounded-lg text-xs text-warning-foreground">
-                  <div className="flex items-center gap-2 font-medium">
-                    <AlertCircle size={14} className="shrink-0" />
-                    <span>{t('data.importWarnTitle') || '工参文件存在问题，数据已导入'}</span>
-                  </div>
-                  <div className="mt-1 ml-6 space-y-0.5">
-                    {warnings.map((w, i) => (
-                      <div key={i}>
-                        {formatImportWarning(w, t)}
+                  {warnedFiles.map(({ item, warnings }, fileIndex) => (
+                    <div key={item.id} className={fileIndex > 0 ? 'mt-2' : ''}>
+                      <div className="flex items-center gap-2 font-medium">
+                        <AlertCircle size={14} className="shrink-0" />
+                        <span>{formatImportWarningTitle(item.fileType, item.name, t)}</span>
                       </div>
-                    ))}
-                    <div>{t('data.importWarnHint') || '请核对源文件，如有问题修改后重新导入即可（现有数据可正常使用）'}</div>
-                  </div>
+                      <div className="mt-1 ml-6 space-y-0.5">
+                        {warnings.map((w, i) => (
+                          <div key={i}>
+                            {formatImportWarning(w, t)}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+                  <div className="mt-1 ml-6">{t('data.importWarnHint') || '请核对源文件，如有问题修改后重新导入即可（现有数据可正常使用）'}</div>
                 </div>
               )
             })()}

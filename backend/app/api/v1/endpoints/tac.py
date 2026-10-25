@@ -3,7 +3,7 @@ TAC规划API端点
 """
 
 import asyncio
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Request, Query
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Request, Query, Response
 from typing import Dict, Any
 from datetime import datetime
 from app.models.schemas import TACConfig, TACResult
@@ -41,12 +41,93 @@ async def start_tac_planning(
 
 @router.get("/progress/{task_id}", response_model=Dict[str, Any])
 async def get_tac_progress(task_id: str, _group=Depends(require_task_access)) -> Dict[str, Any]:
-    """获取TAC规划进度"""
+    """获取TAC规划进度（只返回状态/统计，不返回完整结果）"""
     try:
-        progress = task_manager.get_task_progress(task_id)
+        # 任务完成后进度轮询若带完整结果，会每 2 秒重复解析/传输数 MB JSON
+        progress = task_manager.get_task_progress_meta(task_id)
         if not progress:
             raise HTTPException(status_code=404, detail="任务不存在")
         return {"success": True, "data": progress}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/result/{task_id}/meta", response_model=Dict[str, Any])
+async def get_tac_result_meta(task_id: str, _group=Depends(require_task_access)) -> Dict[str, Any]:
+    """TAC 核查结果轻量元数据（不加载完整结果）。"""
+    try:
+        from app.services import task_result_index_service as index_service
+
+        meta = index_service.get_task_meta(task_id)
+        if meta is None:
+            raise HTTPException(status_code=404, detail="任务不存在")
+        if meta["status"] == "completed" and not meta["rowsReady"]:
+            index_service.schedule_index(task_id, "tac")
+        return {"success": True, "data": meta}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/result/{task_id}/rows", response_model=Dict[str, Any])
+async def get_tac_result_rows(
+    task_id: str,
+    request: Request,
+    response: Response,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(200, ge=1, le=1000),
+    _group=Depends(require_task_access),
+) -> Dict[str, Any]:
+    """TAC 核查结果分页；搜索条件通过查询参数透传。"""
+    try:
+        from starlette.concurrency import run_in_threadpool
+        from app.services import task_result_index_service as index_service
+        from app.api.v1.endpoints import _result_cache
+
+        cached = _result_cache.not_modified(request, task_id)
+        if cached is not None:
+            return cached
+        if not index_service.ensure_indexed(task_id, "tac"):
+            return {"success": True, "data": {"preparing": True, "rows": [], "total": 0}}
+        filters = {
+            key: value for key, value in request.query_params.items()
+            if key not in ("page", "page_size")
+        }
+        data = await run_in_threadpool(
+            index_service.query_rows, task_id, "tac", page, page_size, filters
+        )
+        _result_cache.apply_headers(request, response, task_id)
+        return {"success": True, "data": data}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/result/{task_id}/map", response_model=Dict[str, Any])
+async def get_tac_result_map(
+    task_id: str,
+    request: Request,
+    response: Response,
+    _group=Depends(require_task_access),
+) -> Dict[str, Any]:
+    """地图专用精简结果（TAC 核查/规划字段较少，可整包下发）。"""
+    try:
+        from starlette.concurrency import run_in_threadpool
+        from app.services import task_result_index_service as index_service
+        from app.api.v1.endpoints import _result_cache
+
+        cached = _result_cache.not_modified(request, task_id)
+        if cached is not None:
+            return cached
+        if not index_service.ensure_indexed(task_id, "tac"):
+            return {"success": True, "data": {"preparing": True, "rows": []}}
+        rows = await run_in_threadpool(index_service.query_map_rows, task_id, "tac")
+        _result_cache.apply_headers(request, response, task_id)
+        return {"success": True, "data": {"rows": rows}}
     except HTTPException:
         raise
     except Exception as e:
@@ -57,7 +138,9 @@ async def get_tac_progress(task_id: str, _group=Depends(require_task_access)) ->
 async def get_tac_result(task_id: str, _group=Depends(require_task_access)) -> Dict[str, Any]:
     """获取TAC规划结果"""
     try:
-        result = task_manager.get_task_result(task_id)
+        from starlette.concurrency import run_in_threadpool
+
+        result = await run_in_threadpool(task_manager.get_task_result, task_id)
         if not result:
             raise HTTPException(status_code=404, detail="任务不存在")
         return {"success": True, "data": result}
@@ -71,8 +154,9 @@ async def get_tac_result(task_id: str, _group=Depends(require_task_access)) -> D
 async def export_tac_result(task_id: str, format: str = "xlsx", _group=Depends(require_task_access)):
     """导出TAC规划结果"""
     try:
-        # 从任务管理器获取任务结果
-        result = task_manager.get_task_result(task_id)
+        from starlette.concurrency import run_in_threadpool
+
+        result = await run_in_threadpool(task_manager.get_task_result, task_id)
         if not result:
             raise HTTPException(status_code=404, detail="任务不存在")
 
@@ -142,9 +226,9 @@ async def start_tac_planning_task(
  
 @router.get("/planning/progress/{task_id}", response_model=Dict[str, Any])
 async def get_tac_planning_progress(task_id: str, _group=Depends(require_task_access)) -> Dict[str, Any]:
-    """获取TAC规划任务进度"""
+    """获取TAC规划任务进度（只返回状态/统计）"""
     try:
-        progress = task_manager.get_task_progress(task_id)
+        progress = task_manager.get_task_progress_meta(task_id)
         if not progress:
             raise HTTPException(status_code=404, detail="任务不存在")
         return {"success": True, "data": progress}
@@ -154,11 +238,92 @@ async def get_tac_planning_progress(task_id: str, _group=Depends(require_task_ac
         raise HTTPException(status_code=500, detail=str(e))
  
  
+@router.get("/planning/result/{task_id}/meta", response_model=Dict[str, Any])
+async def get_tac_planning_result_meta(task_id: str, _group=Depends(require_task_access)) -> Dict[str, Any]:
+    try:
+        from app.services import task_result_index_service as index_service
+
+        meta = index_service.get_task_meta(task_id)
+        if meta is None:
+            raise HTTPException(status_code=404, detail="任务不存在")
+        if meta["status"] == "completed" and not meta["rowsReady"]:
+            index_service.schedule_index(task_id, "tac_planning")
+        return {"success": True, "data": meta}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/planning/result/{task_id}/rows", response_model=Dict[str, Any])
+async def get_tac_planning_result_rows(
+    task_id: str,
+    request: Request,
+    response: Response,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(200, ge=1, le=1000),
+    _group=Depends(require_task_access),
+) -> Dict[str, Any]:
+    try:
+        from starlette.concurrency import run_in_threadpool
+        from app.services import task_result_index_service as index_service
+        from app.api.v1.endpoints import _result_cache
+
+        cached = _result_cache.not_modified(request, task_id)
+        if cached is not None:
+            return cached
+        if not index_service.ensure_indexed(task_id, "tac_planning"):
+            return {"success": True, "data": {"preparing": True, "rows": [], "total": 0}}
+        filters = {
+            key: value for key, value in request.query_params.items()
+            if key not in ("page", "page_size")
+        }
+        data = await run_in_threadpool(
+            index_service.query_rows, task_id, "tac_planning", page, page_size, filters
+        )
+        _result_cache.apply_headers(request, response, task_id)
+        return {"success": True, "data": data}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/planning/result/{task_id}/map", response_model=Dict[str, Any])
+async def get_tac_planning_result_map(
+    task_id: str,
+    request: Request,
+    response: Response,
+    _group=Depends(require_task_access),
+) -> Dict[str, Any]:
+    try:
+        from starlette.concurrency import run_in_threadpool
+        from app.services import task_result_index_service as index_service
+        from app.api.v1.endpoints import _result_cache
+
+        cached = _result_cache.not_modified(request, task_id)
+        if cached is not None:
+            return cached
+        if not index_service.ensure_indexed(task_id, "tac_planning"):
+            return {"success": True, "data": {"preparing": True, "rows": []}}
+        rows = await run_in_threadpool(
+            index_service.query_map_rows, task_id, "tac_planning"
+        )
+        _result_cache.apply_headers(request, response, task_id)
+        return {"success": True, "data": {"rows": rows}}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get("/planning/result/{task_id}", response_model=Dict[str, Any])
 async def get_tac_planning_result_data(task_id: str, _group=Depends(require_task_access)) -> Dict[str, Any]:
     """获取TAC规划任务结果"""
     try:
-        result = task_manager.get_task_result(task_id)
+        from starlette.concurrency import run_in_threadpool
+
+        result = await run_in_threadpool(task_manager.get_task_result, task_id)
         if not result:
             raise HTTPException(status_code=404, detail="任务不存在")
         return {"success": True, "data": result}
@@ -174,8 +339,9 @@ async def export_tac_planning_result_file(task_id: str, format: str = "xlsx", _g
     try:
         # 从任务管理器获取任务结果 (使用统一的 export_result)
         # 或者使用专用的 export_tac_planning_result (如果需要特殊格式)
+        from starlette.concurrency import run_in_threadpool
         from app.services.export_service import export_tac_planning_result
-        result = task_manager.get_task_result(task_id)
+        result = await run_in_threadpool(task_manager.get_task_result, task_id)
         if not result:
             raise HTTPException(status_code=404, detail="任务不存在")
         return await export_tac_planning_result(task_id, result, format)

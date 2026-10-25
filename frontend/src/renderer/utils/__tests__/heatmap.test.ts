@@ -41,6 +41,17 @@ describe('normalizeHeatPoints', () => {
     expect(r.points).toHaveLength(2)
   })
 
+  it('跳过 (0,0) 无效坐标，不参与点数与值域统计', () => {
+    const r = normalizeHeatPoints([
+      { lat: 23.74, lng: 114.69, weight: 5 },
+      { lat: 0, lng: 0, weight: 100 },
+      { lat: 23.75, lng: 114.7, weight: 7 },
+    ])
+    expect(r.count).toBe(2)
+    expect(r.points).toHaveLength(2)
+    expect(r.max).toBe(7)
+  })
+
   it('负权重原样保留（RSRP 等全负字段）', () => {
     const r = normalizeHeatPoints([
       { lat: 30, lng: 120, weight: -110 },

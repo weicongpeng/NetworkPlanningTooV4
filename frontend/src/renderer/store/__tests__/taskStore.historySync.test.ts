@@ -28,7 +28,7 @@ describe('taskStore 历史同步：跨端删除', () => {
       historyCounts: {},
       activeTaskIds: {
         parameter_update: null, pci_planning: null, neighbor_planning: null,
-        tac_check: null, tac_planning: null, upload: null,
+        tac_check: null, tac_planning: null, pci_check: null, upload: null,
       },
     })
   })

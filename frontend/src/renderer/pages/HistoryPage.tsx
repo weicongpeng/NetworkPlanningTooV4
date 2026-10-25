@@ -5,7 +5,7 @@ import { useTranslation } from 'react-i18next'
 import { useTaskStore, type TaskType } from '../store/taskStore'
 import { btn } from '../utils/buttonStyles'
 
-type PageType = 'pci' | 'neighbor' | 'tac' | 'tac-planning'
+type PageType = 'pci' | 'pci-check' | 'neighbor' | 'tac' | 'tac-planning'
 
 interface TypeMeta {
   taskType: TaskType
@@ -17,6 +17,7 @@ const TYPE_META: Record<PageType, TypeMeta> = {
   pci: { taskType: 'pci_planning', backRoute: '/pci', typeLabel: 'PCI规划' },
   neighbor: { taskType: 'neighbor_planning', backRoute: '/neighbor', typeLabel: '邻区规划' },
   tac: { taskType: 'tac_check', backRoute: '/tac', typeLabel: 'TAC核查' },
+  'pci-check': { taskType: 'pci_check', backRoute: '/pci-check', typeLabel: 'PCI核查' },
   'tac-planning': { taskType: 'tac_planning', backRoute: '/tac-planning', typeLabel: 'TAC规划' },
 }
 

@@ -15,6 +15,7 @@ import logging
 import multiprocessing
 import socket
 import sys
+import time
 from concurrent.futures import ProcessPoolExecutor
 
 from app.core.config import settings
@@ -138,12 +139,15 @@ def _desktop_deferred_job_prewarm() -> None:
 
 
 def _desktop_deferred_job_coord_backfill() -> None:
-    """按库内小区记录重算「经纬度缺失或为 0」提醒条数（大库上是一次全表统计）。"""
+    """按库内记录/地理化数据补算「经纬度缺失或为 0」提醒（大库上是一次全表统计）。"""
     from app.services.data_service import data_service
 
     corrected = data_service.backfill_coord_zero_warnings()
     if corrected:
         logger.info(f"✅ 坐标缺失提醒已按库内记录修正: {corrected} 个全量工参")
+    geo_corrected = data_service.backfill_geo_coord_zero_warnings()
+    if geo_corrected:
+        logger.info(f"✅ 坐标缺失提醒已补算: {geo_corrected} 个地理化数据")
 
 
 def _run_desktop_deferred_startup() -> None:
@@ -348,6 +352,9 @@ async def lifespan(app: FastAPI):
             corrected = _ds_for_warn_backfill.backfill_coord_zero_warnings()
             if corrected:
                 logger.info(f"✅ 坐标缺失提醒已按库内记录修正: {corrected} 个全量工参")
+            geo_corrected = _ds_for_warn_backfill.backfill_geo_coord_zero_warnings()
+            if geo_corrected:
+                logger.info(f"✅ 坐标缺失提醒已补算: {geo_corrected} 个地理化数据")
         except Exception as e:
             logger.warning(f"⚠️ 坐标缺失提醒回填失败: {e}")
 
@@ -372,6 +379,16 @@ async def lifespan(app: FastAPI):
                         logger.info(f"✅ 存量任务「已应用」标记回填完成: {applied} 条")
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(f"⚠️ 存量任务「已应用」标记回填失败: {exc}")
+                # 等启动流量稳定后再为旧任务补摘要/明细索引（一次只解析一份大结果）
+                try:
+                    import time as _time
+                    _time.sleep(30)
+                    from app.services import task_result_index_service as _index_service
+                    processed = _index_service.backfill_pending(limit=5)
+                    if processed:
+                        logger.info(f"✅ 存量任务结果元数据/明细索引回填完成: {processed} 条")
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(f"⚠️ 存量任务结果索引回填失败: {exc}")
 
             threading.Thread(target=_backfill_task_metadata, daemon=True, name="npt-task-meta-backfill").start()
         except Exception as e:
@@ -472,7 +489,9 @@ def create_app() -> FastAPI:
     )
 
     # GZip 压缩（排除 APK 等已压缩二进制文件——二次压缩在 ARM 上 CPU 开销极高）
-    app.add_middleware(SelectiveGZipMiddleware, minimum_size=1024)
+    # 级别 3：大结果（邻区单份 200MB+）压缩耗时约为默认 9 的 1/4，
+    # 压缩率仍接近 90%；再高的级别只省少量带宽，却会把事件循环卡住数秒。
+    app.add_middleware(SelectiveGZipMiddleware, minimum_size=1024, compresslevel=3)
 
     # 添加 Cache-Control 中间件：防止 HTML 被浏览器缓存
     @app.middleware("http")
@@ -480,6 +499,19 @@ def create_app() -> FastAPI:
         response = await call_next(request)
         if response.headers.get("content-type", "").startswith("text/html"):
             response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        return response
+
+    # 慢请求日志：uvicorn access_log 关闭，出现"无操作也卡"时至少能定位到具体接口
+    @app.middleware("http")
+    async def log_slow_requests(request, call_next):
+        started = time.perf_counter()
+        response = await call_next(request)
+        elapsed = time.perf_counter() - started
+        if elapsed >= 2.0 and request.url.path.startswith(settings.API_V1_STR):
+            logger.warning(
+                "[SlowRequest] %s %s -> %s %.1fs",
+                request.method, request.url.path, response.status_code, elapsed,
+            )
         return response
 
     # 注册路由

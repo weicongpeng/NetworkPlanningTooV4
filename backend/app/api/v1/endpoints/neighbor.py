@@ -1,7 +1,7 @@
 """
 邻区规划API端点
 """
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Request, Query
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Request, Query, Response
 from typing import Dict, Any
 from datetime import datetime
 from app.models.schemas import NeighborConfig, NeighborResult
@@ -43,9 +43,11 @@ async def start_neighbor_planning(
 
 @router.get("/progress/{task_id}", response_model=Dict[str, Any])
 async def get_neighbor_progress(task_id: str, _group=Depends(require_task_access)) -> Dict[str, Any]:
-    """获取邻区规划进度"""
+    """获取邻区规划进度（只返回状态/统计，不返回完整结果）"""
     try:
-        progress = task_manager.get_task_progress(task_id)
+        # 邻区结果可达 200MB+，进度轮询绝不能带完整 result：完成时由前端
+        # 显式“查看/加载完整结果”再走 /result 接口。
+        progress = task_manager.get_task_progress_meta(task_id)
         if progress is None:
             raise HTTPException(status_code=404, detail="任务不存在")
         return {
@@ -58,11 +60,132 @@ async def get_neighbor_progress(task_id: str, _group=Depends(require_task_access
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.get("/result/{task_id}/meta", response_model=Dict[str, Any])
+async def get_neighbor_result_meta(task_id: str, _group=Depends(require_task_access)) -> Dict[str, Any]:
+    """结果页轻量元数据：摘要 + 分页索引状态，不加载完整结果。"""
+    try:
+        from app.services import task_result_index_service as index_service
+
+        meta = index_service.get_task_meta(task_id)
+        if meta is None:
+            raise HTTPException(status_code=404, detail="任务不存在")
+        if meta["status"] == "completed" and not meta["rowsReady"]:
+            index_service.schedule_index(task_id, "neighbor")
+        return {"success": True, "data": meta}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/result/{task_id}/sources", response_model=Dict[str, Any])
+async def get_neighbor_result_sources(
+    task_id: str,
+    request: Request,
+    response: Response,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=500),
+    _group=Depends(require_task_access),
+) -> Dict[str, Any]:
+    """邻区结果按源小区分页；目标小区随源小区一并返回，保证表格分组不跨页。"""
+    try:
+        from starlette.concurrency import run_in_threadpool
+        from app.services import task_result_index_service as index_service
+        from app.api.v1.endpoints import _result_cache
+
+        cached = _result_cache.not_modified(request, task_id)
+        if cached is not None:
+            return cached
+        if not index_service.ensure_indexed(task_id, "neighbor"):
+            return {"success": True, "data": {"preparing": True, "sources": [], "total": 0}}
+        filters = {
+            key: value for key, value in request.query_params.items()
+            if key not in ("page", "page_size")
+        }
+        data = await run_in_threadpool(
+            index_service.query_neighbor_sources, task_id, page, page_size, filters
+        )
+        _result_cache.apply_headers(request, response, task_id)
+        return {"success": True, "data": data}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/result/{task_id}/neighbors", response_model=Dict[str, Any])
+async def get_neighbor_source_neighbors(
+    task_id: str,
+    request: Request,
+    response: Response,
+    source_site_id: str = Query(..., alias="sourceSiteId"),
+    source_cell_id: str = Query(..., alias="sourceCellId"),
+    _group=Depends(require_task_access),
+) -> Dict[str, Any]:
+    """地图点击源小区时按需取邻区关系，不再下发全量关系。"""
+    try:
+        from starlette.concurrency import run_in_threadpool
+        from app.services import task_result_index_service as index_service
+        from app.api.v1.endpoints import _result_cache
+
+        cached = _result_cache.not_modified(request, task_id)
+        if cached is not None:
+            return cached
+        if not index_service.ensure_indexed(task_id, "neighbor"):
+            return {"success": True, "data": {"preparing": True, "rows": []}}
+        rows = await run_in_threadpool(
+            index_service.query_neighbor_relations, task_id, source_site_id, source_cell_id
+        )
+        _result_cache.apply_headers(request, response, task_id)
+        return {"success": True, "data": {"rows": rows}}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/result/{task_id}/rows", response_model=Dict[str, Any])
+async def get_neighbor_result_rows(
+    task_id: str,
+    request: Request,
+    response: Response,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(200, ge=1, le=1000),
+    _group=Depends(require_task_access),
+) -> Dict[str, Any]:
+    """邻区结果扁平分页（导出预览/兼容调用）。"""
+    try:
+        from starlette.concurrency import run_in_threadpool
+        from app.services import task_result_index_service as index_service
+        from app.api.v1.endpoints import _result_cache
+
+        cached = _result_cache.not_modified(request, task_id)
+        if cached is not None:
+            return cached
+        if not index_service.ensure_indexed(task_id, "neighbor"):
+            return {"success": True, "data": {"preparing": True, "rows": [], "total": 0}}
+        filters = {
+            key: value for key, value in request.query_params.items()
+            if key not in ("page", "page_size")
+        }
+        data = await run_in_threadpool(
+            index_service.query_rows, task_id, "neighbor", page, page_size, filters
+        )
+        _result_cache.apply_headers(request, response, task_id)
+        return {"success": True, "data": data}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get("/result/{task_id}", response_model=Dict[str, Any])
 async def get_neighbor_result(task_id: str, _group=Depends(require_task_access)) -> Dict[str, Any]:
     """获取邻区规划结果"""
     try:
-        result = task_manager.get_task_result(task_id)
+        from starlette.concurrency import run_in_threadpool
+        # 大结果解析/清洗是同步 CPU 活，必须丢线程池，避免阻塞事件循环
+        result = await run_in_threadpool(task_manager.get_task_result, task_id)
         if result is None:
             raise HTTPException(status_code=404, detail="任务不存在")
         return {
@@ -109,8 +232,9 @@ async def export_neighbor_result(task_id: str, format: str = "xlsx", _group=Depe
     """导出邻区规划结果"""
     try:
         from fastapi.responses import FileResponse
+        from starlette.concurrency import run_in_threadpool
 
-        file_path = task_manager.export_result(task_id, format)
+        file_path = await run_in_threadpool(task_manager.export_result, task_id, format)
         if file_path is None:
             raise HTTPException(status_code=404, detail="任务不存在或导出失败")
 

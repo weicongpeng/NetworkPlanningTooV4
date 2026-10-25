@@ -100,6 +100,9 @@ export function HistoryTable({
   const storeHistoryCount = useTaskStore(s => s.historyCounts[taskType] ?? 0)
   const [currentPage, setCurrentPage] = useState(1)
   const [totalCount, setTotalCount] = useState(storeHistoryCount)
+  // 当前页任务 ID：store 会累积多页与运行中任务，表格只渲染本页 20 条，
+  // 避免历史任务多时每次刷新都重渲染上百行。
+  const [currentPageIds, setCurrentPageIds] = useState<Set<string> | null>(null)
   const currentPageRef = useRef(1) // 供 visibilitychange / 批量操作等非渲染场景读取当前页
   const totalPages = Math.max(1, Math.ceil(totalCount / pageSize))
 
@@ -110,24 +113,35 @@ export function HistoryTable({
 
   // 加载指定页历史任务，并同步分页信息（总数 / 当前页）
   const loadHistoryPage = useCallback(async (page: number) => {
-    const info = await syncHistoryFromBackend(taskType, page, pageSize)
-    const nextPage = info?.page ?? page
+    let effectivePage = page
+    let info = await syncHistoryFromBackend(taskType, page, pageSize)
+    // 删掉末页最后一条后自动回退一页，避免停在空白页
+    if (info && info.taskIds.length === 0 && info.total > 0 && page > 1) {
+      effectivePage = page - 1
+      info = await syncHistoryFromBackend(taskType, effectivePage, pageSize)
+    }
+    const nextPage = info?.page ?? effectivePage
     setCurrentPage(nextPage)
     currentPageRef.current = nextPage
-    if (info) setTotalCount(info.total)
+    if (info) {
+      setTotalCount(info.total)
+      setCurrentPageIds(new Set(info.taskIds))
+    }
     return info
   }, [taskType, syncHistoryFromBackend])
 
   // ===== 派生数据（必须在使用前定义，避免 Rollup 生产构建 TDZ 问题） =====
   const filteredTasks = useMemo(() => {
-    return Object.values(tasks)
+    const sorted = Object.values(tasks)
       .filter((task) => task.type === taskType)
       .sort((a, b) => {
         const timeA = a.endTime || a.startTime || 0
         const timeB = b.endTime || b.startTime || 0
         return timeB - timeA
       })
-  }, [tasks, taskType])
+    if (currentPageIds === null) return sorted.slice(0, pageSize)
+    return sorted.filter((task) => currentPageIds.has(task.id))
+  }, [tasks, taskType, currentPageIds, pageSize])
 
   // ===== 全选逻辑 =====
   const allSelectable = useMemo(() => {

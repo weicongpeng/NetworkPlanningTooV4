@@ -98,6 +98,9 @@ async def upload_geo_data(
             json.dump(parse_result['data'], f, ensure_ascii=False, indent=2)
 
         # 更新索引
+        metadata = {'pointCount': parse_result['pointCount']}
+        if parse_result.get('importWarnings'):
+            metadata['importWarnings'] = parse_result['importWarnings']
         data_service.index[data_id] = {
             'id': data_id,
             'name': filename,
@@ -111,9 +114,7 @@ async def upload_geo_data(
             'user_id': current_user.id,
             'city': current_user.city,
             'operator': current_user.operator,
-            'metadata': {
-                'pointCount': parse_result['pointCount']
-            }
+            'metadata': metadata
         }
         # 持久化索引到 index.json（防止重启后丢失）
         data_service._save_index()
@@ -125,7 +126,8 @@ async def upload_geo_data(
                 'name': filename,
                 'fileType': 'geo_data',
                 'geometryType': parse_result['geometryType'],
-                'pointCount': parse_result['pointCount']
+                'pointCount': parse_result['pointCount'],
+                'importWarnings': parse_result.get('importWarnings', []),
             }
         }
 

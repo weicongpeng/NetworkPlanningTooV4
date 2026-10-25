@@ -307,9 +307,9 @@ describe('assessIm3Risk 风险等级', () => {
 })
 
 describe('IM3_PRESETS 预置频段库', () => {
-  it('包含 10 条预置 + 自定义', () => {
-    expect(IM3_PRESETS).toHaveLength(11)
-    expect(IM3_PRESETS.filter(preset => preset.id !== 'custom')).toHaveLength(10)
+  it('包含 12 条预置 + 自定义', () => {
+    expect(IM3_PRESETS).toHaveLength(13)
+    expect(IM3_PRESETS.filter(preset => preset.id !== 'custom')).toHaveLength(12)
     expect(IM3_PRESETS[IM3_PRESETS.length - 1].id).toBe('custom')
   })
 
@@ -319,6 +319,8 @@ describe('IM3_PRESETS 预置频段库', () => {
     expect(byId('3')).toMatchObject({ low: 2320, high: 2370 })
     expect(byId('5')).toMatchObject({ low: 1920, high: 1960 })
     expect(byId('6')).toMatchObject({ low: 2515, high: 2675 })
+    expect(byId('11')).toMatchObject({ low: 949, high: 959 })
+    expect(byId('12')).toMatchObject({ low: 758, high: 788 })
     expect(byId('custom')).toMatchObject({ low: null, high: null })
   })
 })

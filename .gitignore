@@ -93,3 +93,12 @@ mobile-app/tsc_errors.txt
 /desktop/tools/*.pem
 /desktop/tools/*.key
 *.nptlic
+
+# 桌面安装包由 GitHub Release 分发，不入库
+/desktop_releases/
+# 桌面端运行时同步状态
+/sync_state.json
+# 本地工具/调试产物
+/.tool_view_test.txt
+/.qoder/
+/frontend/src/renderer/utils/__tests__/zz-*.test.ts

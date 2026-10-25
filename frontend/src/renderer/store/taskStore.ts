@@ -1,6 +1,6 @@
 import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
-import { pciApi, neighborApi, tacApi, tacPlanningApi } from '../services/api'
+import { pciApi, pciCheckApi, neighborApi, tacApi, tacPlanningApi } from '../services/api'
 
 /**
  * 全局任务状态管理
@@ -40,7 +40,7 @@ function _initWsTaskDeleteListener() {
 _initWsTaskDeleteListener()
 
 
-export type TaskType = 'parameter_update' | 'pci_planning' | 'neighbor_planning' | 'tac_check' | 'tac_planning' | 'upload'
+export type TaskType = 'parameter_update' | 'pci_planning' | 'neighbor_planning' | 'tac_check' | 'tac_planning' | 'pci_check' | 'upload'
 export type TaskStatus = 'idle' | 'running' | 'completed' | 'failed'
 
 export interface Task {
@@ -98,11 +98,13 @@ interface TaskState {
 
   // 获取最新的TAC核查任务结果
   getLatestTACCheckTask: () => Task | undefined
+  // 获取最新的PCI核查任务结果
+  getLatestPCICheckTask: () => Task | undefined
   // 设置模块活跃任务ID
   setActiveTaskId: (type: TaskType, id: string | null) => void
 
-  // 从后端同步历史任务到本地 store（支持分页，返回分页信息）
-  syncHistoryFromBackend: (type: TaskType, page?: number, pageSize?: number) => Promise<{ total: number; page: number; page_size: number } | undefined>
+  // 从后端同步历史任务到本地 store（支持分页，返回分页信息与当前页 ID）
+  syncHistoryFromBackend: (type: TaskType, page?: number, pageSize?: number) => Promise<{ total: number; page: number; page_size: number; taskIds: string[] } | undefined>
 
   // 标记任务为已应用（本地状态同步，不依赖后端刷新）
   markTaskApplied: (taskId: string) => void
@@ -161,6 +163,7 @@ export const useTaskStore = create<TaskState>()(
         neighbor_planning: null,
         tac_check: null,
         tac_planning: null,
+        pci_check: null,
         upload: null
       },
       historyCounts: {
@@ -169,6 +172,7 @@ export const useTaskStore = create<TaskState>()(
         neighbor_planning: 0,
         tac_check: 0,
         tac_planning: 0,
+        pci_check: 0,
         upload: 0
       },
 
@@ -236,7 +240,10 @@ export const useTaskStore = create<TaskState>()(
         set(state => {
           const task = state.tasks[id]
           if (!task) return state
-
+          // 进度轮询只带轻量摘要：与已有 result 合并，避免把 totals / 完整结果覆盖掉
+          const mergedResult = task.result && typeof task.result === 'object'
+            ? { ...task.result, ...(result && typeof result === 'object' ? result : {}) }
+            : result
           return {
             tasks: {
               ...state.tasks,
@@ -245,7 +252,7 @@ export const useTaskStore = create<TaskState>()(
                 status: 'completed',
                 progress: 100,
                 endTime: Date.now(),
-                result
+                result: mergedResult
               }
             }
           }
@@ -351,6 +358,18 @@ export const useTaskStore = create<TaskState>()(
         return sortedTasks.length > 0 ? sortedTasks[0] : undefined;
       },
 
+      getLatestPCICheckTask: () => {
+        const state = get();
+        const pciCheckTasks = Object.values(state.tasks)
+          .filter(task => task.type === 'pci_check');
+        const sortedTasks = pciCheckTasks.sort((a, b) => {
+          const endTimeA = a.endTime || a.startTime || 0;
+          const endTimeB = b.endTime || b.startTime || 0;
+          return endTimeB - endTimeA;
+        });
+        return sortedTasks.length > 0 ? sortedTasks[0] : undefined;
+      },
+
       setActiveTaskId: (type, id) => {
         set(state => ({
           activeTaskIds: {
@@ -360,7 +379,7 @@ export const useTaskStore = create<TaskState>()(
         }))
       },
 
-      syncHistoryFromBackend: async (type, page = 1, pageSize = 20): Promise<{ total: number; page: number; page_size: number } | undefined> => {
+      syncHistoryFromBackend: async (type, page = 1, pageSize = 20): Promise<{ total: number; page: number; page_size: number; taskIds: string[] } | undefined> => {
         try {
           let response: any
           switch (type) {
@@ -376,6 +395,9 @@ export const useTaskStore = create<TaskState>()(
             case 'tac_planning':
               response = await tacPlanningApi.getHistory(page, pageSize)
               break
+            case 'pci_check':
+              response = await pciCheckApi.getHistory(page, pageSize)
+              break
             default:
               return
           }
@@ -383,7 +405,8 @@ export const useTaskStore = create<TaskState>()(
           const data = response?.data
           const historyTasks = data?.tasks
           const historyTotal = typeof data?.total === 'number' ? data.total : (Array.isArray(historyTasks) ? historyTasks.length : 0)
-          if (!Array.isArray(historyTasks)) return { total: historyTotal, page, page_size: pageSize }
+          if (!Array.isArray(historyTasks)) return { total: historyTotal, page, page_size: pageSize, taskIds: [] }
+          const taskIds = historyTasks.map((ht: any) => ht.taskId).filter(Boolean)
 
           set(state => {
             const merged: Record<string, any> = {}
@@ -456,10 +479,10 @@ export const useTaskStore = create<TaskState>()(
             }
           })
           // 🔥 分页：返回后端的分页信息（供 HistoryTable 翻页栏显示）
-          return { total: historyTotal, page: data?.page ?? page, page_size: data?.page_size ?? pageSize }
+          return { total: historyTotal, page: data?.page ?? page, page_size: data?.page_size ?? pageSize, taskIds }
         } catch (err) {
           console.warn(`[taskStore] 同步 ${type} 历史任务失败:`, err)
-          return { total: 0, page, page_size: pageSize }
+          return { total: 0, page, page_size: pageSize, taskIds: [] }
         }
       },
 
@@ -494,6 +517,9 @@ export const useTaskStore = create<TaskState>()(
               break
             case 'tac_planning':
               response = await tacPlanningApi.deleteHistory(taskId)
+              break
+            case 'pci_check':
+              response = await pciCheckApi.deleteHistory(taskId)
               break
             default:
               console.warn(`[taskStore] 不支持的删除类型: ${type}`)
@@ -540,7 +566,8 @@ export const useTaskStore = create<TaskState>()(
               case 'neighbor_planning': response = await neighborApi.getProgress(taskId); break
               case 'tac_check': response = await tacApi.getProgress(taskId); break
               case 'tac_planning': response = await tacPlanningApi.getProgress(taskId); break
-              default: return
+              case 'pci_check': response = await pciCheckApi.getProgress(taskId); break
+              default: get().stopGlobalPolling(type); return
             }
             if (response?.success && response?.data) {
               const data = response.data
@@ -577,14 +604,18 @@ export const useTaskStore = create<TaskState>()(
               }
               delete (pollingIntervals as any)[errorKey]
             }
+          } finally {
+            // 串行轮询：上次请求返回后再排下一次，慢请求（大结果）不会叠加并发
+            if (pollingIntervals[type]) {
+              pollingIntervals[type] = setTimeout(poll, 2000) as unknown as NodeJS.Timeout
+            }
           }
         }
-        poll()
-        pollingIntervals[type] = setInterval(poll, 2000) as unknown as NodeJS.Timeout
+        pollingIntervals[type] = setTimeout(poll, 0) as unknown as NodeJS.Timeout
       },
 
       stopGlobalPolling: (type) => {
-        if (pollingIntervals[type]) { clearInterval(pollingIntervals[type]); delete pollingIntervals[type] }
+        if (pollingIntervals[type]) { clearTimeout(pollingIntervals[type]); delete pollingIntervals[type] }
       },
 
       isGlobalPollingActive: (type) => {

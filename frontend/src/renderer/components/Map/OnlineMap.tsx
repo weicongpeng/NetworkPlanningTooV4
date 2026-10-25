@@ -30,12 +30,14 @@ import { clampPopupPosition, type MapViewportBounds } from './popupPosition'
 import { resolveHits, type FeatureHitType } from './mapHitTest'
 import { MapInfoLayerManager, MapInfoLayer, MapInfoLayerOptions, LayerGeometryType } from './MapInfoLayer'
 import { GeoDataLayerManager, GeoDataLayer, GeoDataItem } from './GeoDataLayer'
-import type { ThematicSettings, HeatmapSettings } from './LabelSettingsModal'
+import type { ThematicSettings, HeatmapSettings, LabelSettings, LayerColorSettings } from './LabelSettingsModal'
 import type { PciRenderStats } from '../../utils/pciModColor'
-import { getSharedHeatmapManager, type HeatmapLayerManager, type HeatmapStats } from './HeatmapLayerManager'
+import { getSharedHeatmapManager, heatSettingsSignature, type HeatmapLayerManager, type HeatmapStats } from './HeatmapLayerManager'
 import { reconcileZOrder, ZOrderLayer, orderWithIds, panelRankFromIndex, topPanelRank, isLayerSelectable } from './layerZOrder'
 import type { LayerOrderMap } from '../../store/mapStore'
 import { layerApi, dataApi } from '../../services/api'
+import { syncEditingWorkspaceFromServer } from '../../services/syncEditingWorkspace'
+import { useToastStore } from '../../store/toastStore'
 import {
   amapTileUrl,
   type AmapAnnotations,
@@ -418,6 +420,21 @@ export interface OnlineMapRef {
   setLayerHeatmapSettings: (fileId: string, settings: HeatmapSettings | null) => void
   /** 设置扇区图层热力图（null 关闭） */
   setSectorHeatmapSettings: (layerId: string, settings: HeatmapSettings | null) => void
+  /**
+   * 实时预览热力图设置（**不持久化、不改图层勾选状态**）：
+   * 设置弹窗调参时直接出图；取消时调用方用打开弹窗时的已保存快照再调一次即完成还原。
+   * 渲染语义与 setXHeatmapSettings 一致（含替换模式下原图形显隐）。
+   */
+  previewHeatmapSettings: (layerId: string, settings: HeatmapSettings | null) => void
+  /**
+   * 实时预览标签设置（**不持久化、不改标签开关**）：调参时直接重绘标签；
+   * 取消时调用方用打开弹窗时的快照（含渲染默认值）再调一次即完成还原。
+   */
+  previewLabelSettings: (layerId: string, settings: LabelSettings) => void
+  /** 实时预览基础图形设置（填充色/透明度/边框/点大小/PCI 渲染）；null=取消时清除覆盖，恢复图层/要素自带样式 */
+  previewColorSettings: (layerId: string, settings: LayerColorSettings | null) => void
+  /** 实时预览专题图层设置（null=预览态关闭专题），取消时回传快照还原 */
+  previewThematicSettings: (layerId: string, settings: ThematicSettings | null) => void
   /** 获取热力图图例统计（min/max/count/sampled） */
   getHeatmapStats: (layerId: string) => HeatmapStats | null
   /** 重放全部已保存热力设置（跨页面缓存复用/异步图层兜底） */
@@ -468,7 +485,7 @@ export interface OnlineMapRef {
   clearSelectionHighlight: () => void
   /** 设置圈选高亮 */
   setSelectionHighlight: (ids: Set<string> | null) => void
-  /** 搜索定位：等待图层可见后红色边框高亮指定要素并飞行定位（图层文件/地理化数据） */
+  /** 搜索定位：等待图层可见后红色边框高亮指定要素并飞行定位（多次搜索结果累计保持） */
   locateLayerFeature: (opts: {
     layerId: string
     featureId: string
@@ -479,7 +496,7 @@ export interface OnlineMapRef {
   }) => Promise<boolean>
   /** 清除搜索定位的要素红色边框高亮（数据图层） */
   clearLayerFeatureHighlight: () => void
-  /** 工参搜索定位：红色边框高亮目标扇区图形本身并飞行定位（LTE/NR，替代中心标记点） */
+  /** 工参搜索定位：红色边框高亮目标扇区图形本身并飞行定位（LTE/NR，多次搜索结果累计保持） */
   locateSector: (opts: { id: string; lat: number; lng: number; zoom?: number }) => void
   /** 清除扇区红色边框高亮（工参搜索定位） */
   clearSectorHighlight: () => void
@@ -544,6 +561,8 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
   const isUserInteractingRef = useRef(false)
   const isInitializingRef = useRef(false) // 防止 React Strict Mode 双重初始化
   const initializedRef = useRef(false) // 跟踪是否已初始化过
+  /** 热力实时预览覆盖（不写 store）：key=layerId；null=预览态关闭 */
+  const heatPreviewRef = useRef<Map<string, HeatmapSettings | null>>(new Map())
   const measureModeRef = useRef(measureMode) // 测距模式Ref
   const selectionModeRef = useRef(selectionMode) // 圈选模式Ref
   const captureModeRef = useRef(captureMode) // 抓取模式Ref
@@ -1050,7 +1069,10 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
   const lteSectorLayerRef = useRef<SectorSVGLayer | null>(null)
   const nrSectorLayerRef = useRef<SectorSVGLayer | null>(null)
   // 工参搜索定位的扇区红框高亮（createSectorLayers 重建渲染器后新实例会丢失高亮，需据此恢复）
+  // 多次搜索结果累计保持，只有“清除”按钮才统一清空
   const searchSectorHighlightRef = useRef<Set<string> | null>(null)
+  // 搜索定位的要素红框高亮：layerId -> 要素ID集合（同上，跨图层累计保持）
+  const searchFeatureHighlightsRef = useRef<Map<string, Set<string>>>(new Map())
   const labelLayoutManagerRef = useRef<LabelLayoutManager | null>(null)
 
   // MapInfo图层管理器引用
@@ -1442,6 +1464,14 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
   /**
    * 应用装饰图层颜色（marker 填充色 / 边框 / 边框宽度 / 透明度）
    */
+  /** 装饰（定位点）图层的出厂样式：与 marker 创建时的红白样式同源；取消未保存预览时还原用 */
+  const DECORATION_DEFAULT_COLOR: { fillColor: string; fillOpacity: number; borderWidth: number; borderColor: string } = {
+    fillColor: '#ef4444',
+    fillOpacity: 1,
+    borderWidth: 2,
+    borderColor: '#ffffff',
+  }
+
   const applyDecorationColor = useCallback((settings: { fillColor: string; fillOpacity: number; borderWidth: number; borderColor: string }) => {
     const fg = decorationLayerRef.current
     if (!fg || !window.L) return
@@ -1630,12 +1660,22 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
         // 4) 按"当前"状态恢复显隐：编辑态保持隐藏（退出编辑由图层可见性 effect 恢复）
         const nowEditing = useLayerEditStore.getState().editableLayerId === layerId
         if (nowEditing) {
-          // 编辑态「刷新」：以服务器最新数据重置编辑工作集——否则地图上渲染的仍是
-          // 打开编辑时快照的旧工作集，刷新看起来无效（丢弃未保存修改，以服务器为准）
+          // 编辑态「刷新」：freshCache 是上面强制回源的服务器最新数据。
+          // 仅当两端版本指纹都存在且相同（数据确实未变）时才保留工作集与撤销历史；
+          // 指纹缺失或版本不同 → 以服务器为准整体重置（last-write-wins）。
+          const ws = useLayerEditStore.getState().getWorkspace(layerId)
           const freshCache = useMapDataCacheStore.getState().layers[layerId]
-          if (freshCache?.geojson) {
+          const sameVersion = !!freshCache?.version && !!ws?.version
+            && freshCache.version === ws.version
+          if (freshCache?.geojson && !sameVersion) {
+            const hadUnsaved = !!ws?.dirty
+            const layerName = file.name
             useLayerEditStore.getState().resetWorkspace(
               layerId, freshCache.geojson.features || [], freshCache.version)
+            if (hadUnsaved) {
+              useToastStore.getState().show(
+                t('map.editWorkspaceUpdatedByOtherNamed', { name: layerName }))
+            }
           }
         }
         const newRef = mapInfoLayerRefsRef.current.get(layerId)
@@ -1655,9 +1695,10 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
           }
         }
         reconcileLayerZOrder()
-        // 5) 热力图重放（与图层可见性 effect 的兜底逻辑一致）
-        const hs = useMapStore.getState().mapSettings.heatmapSettingsMap?.[layerId]
+        // 5) 热力图重放（与图层可见性 effect 的兜底逻辑一致；预览覆盖优先）
+        const hs = getEffectiveHeatSettings(layerId)
         if (hs?.enabled) applyDataLayerHeat(layerId, hs)
+        else if (heatPreviewRef.current.has(layerId)) applyDataLayerHeat(layerId, null)
       } catch (e) {
         console.error('[OnlineMap] 刷新图层数据失败:', layerId, e)
       }
@@ -1817,12 +1858,91 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
     },
 
     setLayerHeatmapSettings: (fileId, settings) => {
+      // 已保存提交：预览覆盖失效，落回 store 真值，再按提交值渲染
+      heatPreviewRef.current.delete(fileId)
       heatOpsRef.current?.applyDataLayerHeat(fileId, settings)
     },
 
     setSectorHeatmapSettings: (layerId, settings) => {
+      heatPreviewRef.current.delete(layerId)
       if (layerId === 'lte-sectors' || layerId === 'nr-sectors') {
         heatOpsRef.current?.applySectorHeat(layerId, settings)
+      }
+    },
+
+    // 实时预览：设置暂存进覆盖（不写 store），渲染与替换模式显隐均按覆盖值；
+    // 下发值与已保存值指纹相同（取消时回传快照）时删除覆盖，避免残留临时态。
+    previewHeatmapSettings: (layerId, settings) => {
+      const committed = useMapStore.getState().mapSettings.heatmapSettingsMap?.[layerId]
+      const previewSig = settings ? heatSettingsSignature(settings) : null
+      const committedSig = committed ? heatSettingsSignature(committed) : null
+      if (previewSig === committedSig) {
+        heatPreviewRef.current.delete(layerId)
+      } else {
+        heatPreviewRef.current.set(layerId, settings)
+      }
+      if (layerId === 'lte-sectors' || layerId === 'nr-sectors') {
+        heatOpsRef.current?.applySectorHeat(layerId, settings)
+      } else {
+        heatOpsRef.current?.applyDataLayerHeat(layerId, settings)
+      }
+    },
+
+    // 标签实时预览：只推配置不碰标签开关；MapInfoLayer 走瞬态路径（不打"已自定义"标记，
+    // 否则取消后该图层首次开标签的"自动挑选默认字段"行为会被预览污染）。
+    previewLabelSettings: (layerId, settings) => {
+      if (layerId === 'lte-sectors' || layerId === 'nr-sectors') {
+        if (layerId === 'lte-sectors') lteSectorLayerRef.current?.updateLabelConfig(settings)
+        else nrSectorLayerRef.current?.updateLabelConfig(settings)
+        return
+      }
+      const mapInfoRef = mapInfoLayerRefsRef.current.get(layerId)
+      if (mapInfoRef) {
+        mapInfoRef.mapInfoLayer.setLabelConfig(settings, { transient: true })
+        return
+      }
+      geoDataLayerManagerRef.current?.getLayer(layerId)?.setLabelConfig(settings)
+    },
+
+    // 基础图形实时预览：扇区只取透明度/边框/PCI（与保存路径同口径，fillColor 不参与扇区渲染）；
+    // 装饰图层与图层文件走既有覆盖 setter。settings=null（取消且图层从未保存过配色）时
+    // **清除覆盖**恢复图层/要素自带样式——不能用弹窗构造的文件默认色顶替（文件级 defaultStyle
+    // 不参与渲染链，可能与实际初始配色不一致，典型表现：县界取消后整层变成 defaultStyle 的粉红）。
+    previewColorSettings: (layerId, settings) => {
+      if (layerId === 'lte-sectors' || layerId === 'nr-sectors') {
+        const sectorLayer = layerId === 'lte-sectors' ? lteSectorLayerRef.current : nrSectorLayerRef.current
+        if (sectorLayer) {
+          sectorLayer.setColorOverrides(settings === null
+            ? null
+            : {
+              fillOpacity: settings.fillOpacity,
+              borderWidth: settings.borderWidth,
+              ...(settings.pciRenderEnabled ? { pciRenderEnabled: true, pciMod: settings.pciMod ?? 3 } : {})
+            })
+        }
+        return
+      }
+      if (layerId === 'decoration-layer') {
+        applyDecorationColor(settings ?? DECORATION_DEFAULT_COLOR)
+        return
+      }
+      const geoLayer = geoDataLayerManagerRef.current?.getLayer(layerId)
+      if (geoLayer) {
+        geoLayer.setStyleOverrides(settings)
+        return
+      }
+      mapInfoLayerRefsRef.current.get(layerId)?.mapInfoLayer.setStyleOverrides(settings)
+    },
+
+    // 专题实时预览：纯覆盖值（null=预览态关闭），取消时回传快照（含 null）还原
+    previewThematicSettings: (layerId, settings) => {
+      if (layerId === 'lte-sectors' || layerId === 'nr-sectors') {
+        const sectorLayer = layerId === 'lte-sectors' ? lteSectorLayerRef.current : nrSectorLayerRef.current
+        sectorLayer?.setThematicOverrides(settings)
+      } else {
+        const geoLayer = geoDataLayerManagerRef.current?.getLayer(layerId)
+        if (geoLayer) geoLayer.setThematicOverrides(settings)
+        else mapInfoLayerRefsRef.current.get(layerId)?.mapInfoLayer.setThematicOverrides(settings)
       }
     },
 
@@ -1886,8 +2006,8 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
 
     /**
      * 搜索定位图层文件/地理化数据要素：
-     * 父组件已开启图层可见性后，轮询等待异步图层构建完成 → 清除其他数据图层高亮
-     * → 目标要素红色边框高亮 → 飞行定位（面/线按包围盒适配，点/扇区飞至中心）
+     * 父组件已开启图层可见性后，轮询等待异步图层构建完成 → 目标要素加入累计高亮集合
+     * → 飞行定位（面/线按包围盒适配，点/扇区飞至中心）。多次搜索结果同时保持。
      */
     locateLayerFeature: async (opts) => {
       const map = mapInstanceRef.current
@@ -1913,17 +2033,12 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
         return false
       }
 
-      // 清除其他数据图层与扇区图层的高亮，仅高亮目标要素
-      mapInfoLayerRefsRef.current.forEach(({ mapInfoLayer }) => {
-        mapInfoLayer.setSelectionHighlight(null)
-      })
-      geoDataLayerManagerRef.current?.getAllLayers().forEach(geoLayer => {
-        geoLayer.setSelectionHighlight(null)
-      })
-      searchSectorHighlightRef.current = null
-      lteSectorLayerRef.current?.setSelectionHighlight(null)
-      nrSectorLayerRef.current?.setSelectionHighlight(null)
-      target.instance.setSelectionHighlight(new Set([String(opts.featureId)]))
+      // 累加搜索高亮：多次搜索的要素红框同时保持（不清理其他图层/扇区），
+      // 只有工具栏“清除”按钮才统一清空
+      const ids = new Set(searchFeatureHighlightsRef.current.get(opts.layerId) ?? [])
+      ids.add(String(opts.featureId))
+      searchFeatureHighlightsRef.current.set(opts.layerId, ids)
+      target.instance.setSelectionHighlight(new Set(ids))
 
       // 定位：线/面要素按包围盒适配视野，点/扇区飞到中心点
       if (opts.bounds) {
@@ -1941,6 +2056,7 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
 
     /** 清除搜索定位的要素红色边框高亮（所有数据图层） */
     clearLayerFeatureHighlight: () => {
+      searchFeatureHighlightsRef.current.clear()
       mapInfoLayerRefsRef.current.forEach(({ mapInfoLayer }) => {
         mapInfoLayer.setSelectionHighlight(null)
       })
@@ -1951,20 +2067,15 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
 
     /**
      * 工参搜索定位：红色边框高亮目标扇区图形本身（视口外扇区由渲染器强制补绘），
-     * 并飞行定位。与图层文件搜索一致，不再使用中心标记点。
+     * 并飞行定位。与图层文件搜索一致，多次搜索结果累计保持、互不清除。
      */
     locateSector: (opts) => {
       const map = mapInstanceRef.current
       if (!map) return
-      // 清除数据图层（图层文件/地理化数据）高亮，避免与扇区高亮混杂
-      mapInfoLayerRefsRef.current.forEach(({ mapInfoLayer }) => {
-        mapInfoLayer.setSelectionHighlight(null)
-      })
-      geoDataLayerManagerRef.current?.getAllLayers().forEach(geoLayer => {
-        geoLayer.setSelectionHighlight(null)
-      })
       // LTE/NR 两个渲染器都设置（各自只命中自己的扇区）
-      const ids = new Set([String(opts.id)])
+      // 多次搜索累计保持，且不再清除数据图层高亮，要素红框与扇区红框可同时存在
+      const ids = new Set(searchSectorHighlightRef.current ?? [])
+      ids.add(String(opts.id))
       // 持久化到 ref：图层总开关/频点变化会触发 createSectorLayers 重建渲染器，重建后据此恢复
       searchSectorHighlightRef.current = ids
       lteSectorLayerRef.current?.setSelectionHighlight(ids)
@@ -2048,10 +2159,31 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
         // 3) Excel 地理化数据的预取缓存是旧数据源，一并失效（重建时重新拉取）
         prefetchedExcelDataRef.current.clear()
         await loadMapInfoLayers()
-        // 4) 重建后重放热力面：重建时热力栅格已随图层移除，按当前设置以新数据重算挂回
-        const heatmapSettings = useMapStore.getState().mapSettings.heatmapSettingsMap || {}
+        // 4) 重建后重放热力面：重建时热力栅格已随图层移除，按当前设置以新数据重算挂回。
+        //    合并预览覆盖（弹窗调参期间 store 尚未变更），预览态关闭（null）也要摘除旧栅格
+        const heatmapSettings: Record<string, HeatmapSettings | null> = {
+          ...(useMapStore.getState().mapSettings.heatmapSettingsMap || {}),
+        }
+        for (const [id, preview] of heatPreviewRef.current) heatmapSettings[id] = preview
         for (const [fileId, settings] of Object.entries(heatmapSettings)) {
-          if (settings?.enabled) applyDataLayerHeat(fileId, settings)
+          const effective = settings?.enabled ? settings : null
+          if (fileId === 'lte-sectors' || fileId === 'nr-sectors') {
+            heatOpsRef.current?.applySectorHeat(fileId, effective)
+          } else {
+            heatOpsRef.current?.applyDataLayerHeat(fileId, effective)
+          }
+        }
+        // 5) 编辑态图层：loadMapInfoLayers 只重建 visible 图层，编辑图层被隐藏而
+        //    跳过，编辑会话渲染的仍是打开编辑时快照的工作集。这里单独回源同步：
+        //    版本指纹变化即以服务器最新内容重置工作集（last-write-wins），
+        //    版本相同（自己保存后的广播回声）则保留撤销历史。
+        const synced = await syncEditingWorkspaceFromServer()
+        if (synced?.hadUnsavedChanges) {
+          const fileName = layerFiles.find((f) => f.id === synced.layerId)?.name
+          useToastStore.getState().show(
+            fileName
+              ? t('map.editWorkspaceUpdatedByOtherNamed', { name: fileName })
+              : t('map.editWorkspaceUpdatedByOther'))
         }
       }
     },
@@ -2588,8 +2720,9 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
       selectedIdsRef.current = new Set()
       setSelectedFeatureCount(0)
       selectionPointsRef.current = []
-      // 清除扇区图层高亮（含工参搜索定位红框）
+      // 清除扇区图层高亮（含工参搜索定位红框）与数据图层搜索高亮
       searchSectorHighlightRef.current = null
+      searchFeatureHighlightsRef.current.clear()
       if (lteSectorLayerRef.current) lteSectorLayerRef.current.setSelectionHighlight(null)
       if (nrSectorLayerRef.current) nrSectorLayerRef.current.setSelectionHighlight(null)
       // 清除MapInfo图层高亮
@@ -4105,15 +4238,27 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
   }, [])
 
   /**
+   * 某图层当前生效的热力设置：实时预览覆盖优先，否则取持久化 store。
+   * 与 3D `getEffectiveHeatSettings` 同语义——替换模式判定与重放读取"生效设置"时
+   * 必须先看预览覆盖，否则预览期间任一显隐/图层重建路径都会用已保存值覆盖预览。
+   */
+  const getEffectiveHeatSettings = useCallback((layerId: string): HeatmapSettings | undefined => {
+    if (heatPreviewRef.current.has(layerId)) {
+      return heatPreviewRef.current.get(layerId) ?? undefined
+    }
+    return useMapStore.getState().mapSettings.heatmapSettingsMap?.[layerId]
+  }, [])
+
+  /**
    * 图层是否处于热力图"替换模式"（热力启用且"显示原图层"关闭）：
    * 此时原图形/标签必须强制隐藏，只保留热力渲染。
    * 所有"按勾选状态恢复原图层可见性"的路径都要经过此判定，
    * 否则兜底显隐会把已隐藏的原图层重新显示出来。
    */
   const isHeatmapReplacement = useCallback((layerId: string): boolean => {
-    const hs = useMapStore.getState().mapSettings.heatmapSettingsMap?.[layerId]
+    const hs = getEffectiveHeatSettings(layerId)
     return !!(hs?.enabled && hs.field && !hs.showOriginal)
-  }, [])
+  }, [getEffectiveHeatSettings])
 
   /**
    * 应用数据图层热力设置（null/disabled=关闭热力）。
@@ -4214,13 +4359,17 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
    * 重放全部已保存且启用的热力设置（地图跨页面缓存复用 / 异步图层构建完成兜底）。
    */
   const replayHeatmaps = useCallback(() => {
-    const heat = useMapStore.getState().mapSettings.heatmapSettingsMap ?? {}
+    const heat: Record<string, HeatmapSettings | null> = {
+      ...(useMapStore.getState().mapSettings.heatmapSettingsMap ?? {}),
+    }
+    // 合并预览覆盖：弹窗调参期间 store 未变，预览图层也要能在重放（数据就绪/显隐同步）中存活
+    for (const [layerId, preview] of heatPreviewRef.current) heat[layerId] = preview
     for (const [id, hs] of Object.entries(heat)) {
-      if (!hs?.enabled) continue
+      const settings = hs?.enabled ? hs : null
       if (id === 'lte-sectors' || id === 'nr-sectors') {
-        applySectorHeat(id, hs)
+        applySectorHeat(id, settings)
       } else {
-        applyDataLayerHeat(id, hs)
+        applyDataLayerHeat(id, settings)
       }
     }
   }, [applyDataLayerHeat, applySectorHeat])
@@ -4249,8 +4398,8 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
       if (thematic) {
         layer.setThematicOverrides(thematic)
       }
-      // 热力图重放（渲染器已持有 sectors，可立即取点；含替换模式图形隐藏）
-      const heat = ms.heatmapSettingsMap?.[layerId]
+      // 热力图重放（渲染器已持有 sectors，可立即取点；含替换模式图形隐藏；预览覆盖优先）
+      const heat = getEffectiveHeatSettings(layerId)
       if (heat?.enabled) {
         applySectorHeat(layerId, heat)
       } else {
@@ -4374,7 +4523,7 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
 
     // 扇区图层已就绪，重排图层顺序
     reconcileLayerZOrder()
-  }, [sectorData, layerVisibility, labelVisibility, sectorLabelVisibility, labelSettingsMap, handleSectorClick, mode, frequencies, createSectorLayer, measureMode, reconcileLayerZOrder, applySectorHeat])
+  }, [sectorData, layerVisibility, labelVisibility, sectorLabelVisibility, labelSettingsMap, handleSectorClick, mode, frequencies, createSectorLayer, measureMode, reconcileLayerZOrder, applySectorHeat, getEffectiveHeatSettings])
 
   /**
    * 加载单个MapInfo图层或Excel点图层
@@ -4573,6 +4722,9 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
               loadedMapInfoLayersRef.current.add(layerFile.id)
               // 注册到模块级数据图层集合（页面切换清理兜底）
               __mapDataLayerInstances.add(geoLayer)
+              // 图层重建（刷新/重新拉取）后恢复累计的搜索红框，直到“清除”按钮
+              const savedGeoSearchIds = searchFeatureHighlightsRef.current.get(layerFile.id)
+              if (savedGeoSearchIds) geoLayer.setSelectionHighlight(new Set(savedGeoSearchIds))
 
               // 同步标签：先应用已保存的标签配置，再开启可见性
               // （否则构造函数默认 content='name'，重新打开图层后标签回退显示程序
@@ -4715,6 +4867,9 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
           loadedMapInfoLayersRef.current.add(layerFile.id)
           // 注册到模块级数据图层集合（页面切换清理兜底）
           __mapDataLayerInstances.add(mapInfoLayer)
+          // 图层重建（刷新/重新拉取）后恢复累计的搜索红框，直到“清除”按钮
+          const savedMapInfoSearchIds = searchFeatureHighlightsRef.current.get(layerFile.id)
+          if (savedMapInfoSearchIds) mapInfoLayer.setSelectionHighlight(new Set(savedMapInfoSearchIds))
           // 测距模式下新加载的工参图层同步测距状态（要素点击穿透到地图，测量可正常加点）
           mapInfoLayer.setMeasureMode(measureModeRef.current)
           console.log('[OnlineMap] 图层已存储到refs, loaded状态:', loadedMapInfoLayersRef.current.has(layerFile.id))
@@ -5737,6 +5892,9 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
     selectedFeaturesRef.current = []
     selectedIdsRef.current = new Set()
     setSelectedFeatureCount(0)
+    // 高亮通道与搜索定位共用，清空选中时同步清搜索累计，避免下次搜索把旧红框复活
+    searchSectorHighlightRef.current = null
+    searchFeatureHighlightsRef.current.clear()
     // 清除扇区图层高亮
     if (lteSectorLayerRef.current) {
       lteSectorLayerRef.current.setSelectionHighlight(null)
@@ -7882,14 +8040,15 @@ function sectorPointGeometry(f: any): { type: 'Point'; coordinates: [number, num
       // 图层加载就绪后重排一次，确保初始点击命中正确目标
       reconcileLayerZOrder()
 
-      // 热力图重放：图层可能刚在此 effect 中异步构建完成，按 store 设置取点渲染，
+      // 热力图重放：图层可能刚在此 effect 中异步构建完成，按生效设置（预览优先）取点渲染，
       // 并同步替换模式下的原图形隐藏（applyDataLayerHeat 内部幂等校正显隐）。
       // 注意不看 layerFile.visible：用户取消勾选时也要走到 remove 分支清除热力 canvas。
-      const heatSettingsMap = useMapStore.getState().mapSettings.heatmapSettingsMap ?? {}
       for (const layerFile of allFiles) {
-        const hs = heatSettingsMap[layerFile.id]
+        const hs = getEffectiveHeatSettings(layerFile.id)
         if (hs?.enabled) {
           applyDataLayerHeat(layerFile.id, hs)
+        } else if (heatPreviewRef.current.has(layerFile.id)) {
+          applyDataLayerHeat(layerFile.id, null)
         }
       }
 
@@ -7897,7 +8056,7 @@ function sectorPointGeometry(f: any): { type: 'Point'; coordinates: [number, num
       // 保证新打开的图层节点立即可捕获，无需再开关编辑）
       getEditSession()?.invalidateSnapCache()
     })();
-  }, [layerFiles, pointFiles, loadMapInfoLayers, reconcileLayerZOrder, editableLayerId, getEditSession, applyDataLayerHeat, clearSelectHighlight, isHeatmapReplacement]);
+  }, [layerFiles, pointFiles, loadMapInfoLayers, reconcileLayerZOrder, editableLayerId, getEditSession, applyDataLayerHeat, clearSelectHighlight, isHeatmapReplacement, getEffectiveHeatSettings]);
 
   /**
    * 当扇区数据变化时更新图层
@@ -8082,13 +8241,16 @@ function sectorPointGeometry(f: any): { type: 'Point'; coordinates: [number, num
 
     // 热力替换模式（启用热力且关闭"显示原图层"）下原扇区图形必须保持隐藏，
     // 因此这里不能按总开关无脑 addTo；统一交给 applySectorHeat 处理
-    // （它同时负责热力渲染、替换模式隐藏、取消勾选时一并移除热力）。
-    const heatSettingsMap = useMapStore.getState().mapSettings.heatmapSettingsMap ?? {}
+    // （它同时负责热力渲染、替换模式隐藏、取消勾选时一并移除热力；预览覆盖优先）。
     const applySectorVisibility = (layerId: 'lte-sectors' | 'nr-sectors', layer: SectorSVGLayer | null) => {
       if (!layer) return
-      const hs = heatSettingsMap[layerId]
+      const hs = getEffectiveHeatSettings(layerId)
       if (hs?.enabled) {
         heatOpsRef.current?.applySectorHeat(layerId, hs)
+        return
+      }
+      if (heatPreviewRef.current.has(layerId)) {
+        heatOpsRef.current?.applySectorHeat(layerId, null)
         return
       }
       const visible = layerId === 'lte-sectors' ? layerVisibility.lte : layerVisibility.nr
@@ -8103,7 +8265,7 @@ function sectorPointGeometry(f: any): { type: 'Point'; coordinates: [number, num
     applySectorVisibility('nr-sectors', nrSectorLayerRef.current)
 
     reconcileLayerZOrder()
-  }, [layerVisibility, reconcileLayerZOrder])
+  }, [layerVisibility, reconcileLayerZOrder, getEffectiveHeatSettings])
 
 
   /**

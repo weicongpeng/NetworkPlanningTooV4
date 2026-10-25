@@ -79,6 +79,17 @@ describe('computeHeatComputation（2D/3D 共用）', () => {
     expect(b.mapValue(5)).toBe(a.mapValue(5))
   })
 
+  it('(0,0) 无效坐标不参与半径推导（不得把插值场撑到跨洲尺度）', () => {
+    const base = gridPoints()
+    const a = computeHeatComputation(base, SETTINGS)!
+    const b = computeHeatComputation(
+      [...base, { lat: 0, lng: 0, weight: 9 }],
+      SETTINGS,
+    )!
+    expect(b.normalized.count).toBe(9)
+    expect(b.radiusMeters).toBeCloseTo(a.radiusMeters, 6)
+  })
+
   it('原始采样模式不建场，但仍给出半径与图例', () => {
     const c = computeHeatComputation(gridPoints(), {
       ...SETTINGS, sampleMode: 'original',

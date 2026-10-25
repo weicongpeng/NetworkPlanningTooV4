@@ -150,6 +150,9 @@ export function normalizeHeatPoints(
   let max = -Infinity
   for (const p of points) {
     if (!Number.isFinite(p.lat) || !Number.isFinite(p.lng)) continue
+    // 解析失败的行坐标默认为 (0,0)：并入会把插值场范围/密度半径撑到跨洲尺度，
+    // 在离采样区数百公里处渲染出虚假热区（与地图包围盒的无效坐标约定一致）
+    if (p.lat === 0 && p.lng === 0) continue
     if (!Number.isFinite(p.weight)) continue
     if (p.weight < min) min = p.weight
     if (p.weight > max) max = p.weight

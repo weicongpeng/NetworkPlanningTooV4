@@ -46,6 +46,7 @@ import {
   extendBoundsWithPoint,
 } from './cesiumGeoJson'
 import { layerApi, dataApi } from '../../../services/api'
+import { syncEditingWorkspaceFromServer } from '../../../services/syncEditingWorkspace'
 import { CesiumEditSession } from './CesiumEditSession'
 import { SectorInfoPanel } from '../SectorInfoPanel'
 import { FeatureInfoPanel } from '../FeatureInfoPanel'
@@ -76,7 +77,7 @@ import {
 import { orderWithIds, isLayerSelectable } from '../layerZOrder'
 import { selectionManager } from '../../../services/selectionManager'
 import { CesiumHeatmapLayer } from './CesiumHeatmapLayer'
-import type { HeatmapSettings } from '../LabelSettingsModal'
+import type { HeatmapSettings, LabelSettings, LayerColorSettings, ThematicSettings } from '../LabelSettingsModal'
 import {
   collectBoundaryPolygons,
   collectGeoDataPolygons,
@@ -250,6 +251,24 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
   const mapToolsRef = useRef<CesiumMapTools | null>(null)
   // 值热力面（按图层 id 复用）
   const heatmapsRef = useRef<Map<string, CesiumHeatmapLayer>>(new Map())
+  /**
+   * 热力图**实时预览**覆盖（未保存，不进 store）：设置弹窗调参期间按图层 id 暂存预览设置，
+   * 优先级高于持久化的 heatmapSettingsMap —— 3D 的替换模式显隐判定（isHeatmapReplacement）
+   * 与重放（replayHeatmaps）都读这里，保证预览态与已保存态行为一致。
+   * 值为 null 表示预览态关闭；与已保存设置指纹相同（取消还原/保存提交）时删除该键，落回 store 真值。
+   */
+  const heatPreviewRef = useRef<Map<string, HeatmapSettings | null>>(new Map())
+  /**
+   * 基础图形/标签/专题的**实时预览**覆盖（未保存，不进 store），语义同 heatPreviewRef。
+   * 每条覆盖记录下发瞬间的"已提交值指纹"：设置弹窗保存后 store 变更会触发 syncAll /
+   * syncGeoJsonLayers，届时发现已提交指纹变化即作废覆盖（提交值优先），避免预览残留盖住新保存值。
+   * thematic 的 value 允许 null（预览态关闭专题）。
+   */
+  const stylePreviewRef = useRef<{
+    color: Map<string, { value: LayerColorSettings; committedSig: string | null }>
+    label: Map<string, { value: LabelSettings; committedSig: string | null }>
+    thematic: Map<string, { value: ThematicSettings | null; committedSig: string | null }>
+  }>({ color: new Map(), label: new Map(), thematic: new Map() })
   /** 热力渲染取消令牌：每次请求 +1，await 回来后令牌对不上就放弃（防止关掉后又贴回来） */
   const heatTokenRef = useRef<Map<string, number>>(new Map())
   /** 上次请求渲染时的设置指纹（用于跳过"设置没变且已画出来"的重复重算） */
@@ -379,9 +398,11 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
     const viewer = viewerRef.current
     if (!viewer) return
     const p = propsRef.current
-    const ms = mapSettingsRef.current
     const view = getCameraView()
     if (!view) return
+
+    // 已保存设置若在预览期间发生变化（用户点了保存），先作废对应预览覆盖
+    pruneStylePreviews()
 
     ;(Object.keys(LAYER_IDS) as LayerKey[]).forEach((key) => {
       const layer = sectorLayersRef.current[key]
@@ -393,7 +414,7 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
       // onlineMapRef 为 null，命令式路径走不到这里），若只读本地 ref，3D 的基站扇区
       // 就永远吃不到保存的透明度/边框/PCI 设置（表现为"只有 2D 生效"）。
       // 本地 ref 保留给命令式 setSectorColorSettings 兜底。
-      const colorSet = ms.colorSettingsMap?.[layerId] ?? colorSettingsRef.current[layerId]
+      const colorSet = effectiveColorSettings(layerId) ?? colorSettingsRef.current[layerId]
 
       const ctx: SectorStyleContext = {
         colorOverrides: colorSet
@@ -406,7 +427,7 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
           ? buildPciModPalette(visibleFreqs.length, colorSet.pciMod ?? 3)
           : null,
         pciFrequencies: visibleFreqs,
-        thematic: ms.thematicSettingsMap?.[layerId] ?? null,
+        thematic: effectiveThematicSettings(layerId),
       }
 
       layer.setStyleContext(ctx)
@@ -414,7 +435,7 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
       layer.setWhitelist(whitelistRef.current)
       layer.setSelectionIds(selectionIdsRef.current)
       layer.setRenderMode(p.mode ?? 'default')
-      layer.setLabels(!!p.sectorLabelVisibility?.[layerId], p.labelSettingsMap?.[layerId] ?? null)
+      layer.setLabels(!!p.sectorLabelVisibility?.[layerId], effectiveLabelSettings(layerId))
       // 热力替换模式（enabled && !showOriginal）下原扇区图形隐藏，只留热力面
       layer.setVisible(visibilityRef.current[key] && !isHeatmapReplacement(layerId))
       layer.update(view)
@@ -515,6 +536,8 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
     const C = (window as any).Cesium
     const p = propsRef.current
     const ms = mapSettingsRef.current
+    // 与 syncAll 同口径：保存导致 store 变化时先作废该图层的预览覆盖
+    pruneStylePreviews()
     const files = [
       ...(p.layerFiles ?? []).map((f: any) => ({ f, isGeoData: false })),
       ...(p.pointFiles ?? []).map((f: any) => ({ f, isGeoData: true })),
@@ -554,10 +577,10 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
       // KML Style / RSRP 分级色），整层会被刷成同一种颜色。2D `MapInfoLayer` 同样不用它。
       layer.applyConfig({
         visible,
-        color: ms.colorSettingsMap?.[f.id] ?? null,
-        thematic: ms.thematicSettingsMap?.[f.id] ?? null,
+        color: effectiveColorSettings(f.id) ?? null,
+        thematic: effectiveThematicSettings(f.id),
         labelEnabled: !!labelVis,
-        label: ms.labelSettingsMap?.[f.id] ?? null,
+        label: effectiveLabelSettings(f.id),
       })
       // 先推当前视野：数据到手时（阶段 3 的 setFeatureCollection）直接按视野裁剪建图元，
       // 避免"先全量建一遍、再裁剪重建一遍"的双倍构建
@@ -750,13 +773,120 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
   // ===== 值热力面（与 2D 共用计算与栅格化，见 CesiumHeatmapLayer） =====
 
   /**
+   * 某图层当前生效的热力设置：实时预览覆盖优先，否则取持久化 store。
+   * 覆盖键存在但值为 null（预览态关闭）时返回 undefined。
+   */
+  function getEffectiveHeatSettings(layerId: string): HeatmapSettings | undefined {
+    if (heatPreviewRef.current.has(layerId)) {
+      return heatPreviewRef.current.get(layerId) ?? undefined
+    }
+    return mapSettingsRef.current.heatmapSettingsMap?.[layerId] as HeatmapSettings | undefined
+  }
+
+  /**
    * 该图层是否处于热力「替换模式」：热力启用且「显示原图层」关闭。
    * 此时原图形与标签必须隐藏，只留热力面 —— 与 2D `OnlineMap.isHeatmapReplacement` 同语义。
    * 所有"按勾选状态恢复原图层可见性"的路径都要经过此判定，否则兜底显隐会把已隐藏的原图层重新显示出来。
    */
   function isHeatmapReplacement(layerId: string): boolean {
-    const hs = mapSettingsRef.current.heatmapSettingsMap?.[layerId] as HeatmapSettings | undefined
+    const hs = getEffectiveHeatSettings(layerId)
     return !!(hs?.enabled && hs.field && !hs.showOriginal)
+  }
+
+  const STYLE_PREVIEW_KINDS = ['color', 'label', 'thematic'] as const
+  type StylePreviewKind = (typeof STYLE_PREVIEW_KINDS)[number]
+
+  /** 读某类设置当前的已提交（store/props）原始值，指纹基准 */
+  function committedStyleRaw(kind: StylePreviewKind, layerId: string): unknown {
+    const ms = mapSettingsRef.current
+    const p = propsRef.current
+    if (kind === 'color') return ms.colorSettingsMap?.[layerId]
+    if (kind === 'thematic') return ms.thematicSettingsMap?.[layerId] ?? null
+    // 扇区标签在 syncAll 里从 props 读，数据图层从 ms 读；任一处存在即视为已提交
+    return ms.labelSettingsMap?.[layerId] ?? p.labelSettingsMap?.[layerId] ?? null
+  }
+
+  /**
+   * 作废"已提交值已变化"的预览覆盖（保存优先）。在 syncAll / syncGeoJsonLayers
+   * 读取生效配置**之前**执行：保存触发的 store 变更必然先于/同批驱动这两个 sync，
+   * 保证新保存值不会被旧预览盖住；指纹未变（预览自身的重入）则保留。
+   */
+  function pruneStylePreviews() {
+    for (const kind of STYLE_PREVIEW_KINDS) {
+      const map = stylePreviewRef.current[kind]
+      for (const [layerId, entry] of map) {
+        if (JSON.stringify(committedStyleRaw(kind, layerId)) !== entry.committedSig) {
+          map.delete(layerId)
+        }
+      }
+    }
+  }
+
+  function effectiveColorSettings(layerId: string): LayerColorSettings | undefined {
+    return stylePreviewRef.current.color.get(layerId)?.value
+      ?? (mapSettingsRef.current.colorSettingsMap?.[layerId] as LayerColorSettings | undefined)
+  }
+
+  function effectiveThematicSettings(layerId: string): ThematicSettings | null {
+    const preview = stylePreviewRef.current.thematic
+    if (preview.has(layerId)) return preview.get(layerId)!.value
+    return (mapSettingsRef.current.thematicSettingsMap?.[layerId] as ThematicSettings | undefined) ?? null
+  }
+
+  function effectiveLabelSettings(layerId: string): LabelSettings | null {
+    const preview = stylePreviewRef.current.label
+    if (preview.has(layerId)) return preview.get(layerId)!.value
+    const ms = mapSettingsRef.current
+    const p = propsRef.current
+    return (ms.labelSettingsMap?.[layerId] ?? p.labelSettingsMap?.[layerId] ?? null) as LabelSettings | null
+  }
+
+  /** 登记/刷新一条预览覆盖；下发值与已提交值同指纹（取消还原）时直接删除覆盖 */
+  function upsertStylePreview(kind: StylePreviewKind, layerId: string, value: LayerColorSettings | LabelSettings | ThematicSettings | null) {
+    const map = stylePreviewRef.current[kind] as Map<string, { value: unknown; committedSig: string | null }>
+    const committed = committedStyleRaw(kind, layerId)
+    // 空值归一：颜色/专题"无覆盖"（null）与已提交"无保存"（undefined）等价——
+    // 取消从未保存过配色的图层时下发 null，应直接删除覆盖，让图层回退自身默认/要素样式，
+    // 而不是残留一条 value=null 的永久覆盖（JSON.stringify 下 null≠undefined 会误保留）。
+    if (value === null && (committed === null || committed === undefined)) {
+      map.delete(layerId)
+      return
+    }
+    const committedSig = JSON.stringify(committed)
+    if (JSON.stringify(value) === committedSig) {
+      map.delete(layerId)
+    } else {
+      map.set(layerId, { value, committedSig })
+    }
+  }
+
+  /**
+   * 把某图层的预览覆盖立即落到图元：
+   * 扇区层走 syncAll（重推 styleContext/标签/可见性）；数据图层直接 applyConfig + syncLabels。
+   * 图层实例尚未建立时无需处理 —— 后续 syncGeoJsonLayers 会读到生效覆盖。
+   */
+  function applyStylePreview(layerId: string) {
+    if (layerId === 'lte-sectors' || layerId === 'nr-sectors') {
+      syncAll()
+      return
+    }
+    const layer = geoJsonLayersRef.current.get(layerId)
+    if (!layer) return
+    const p = propsRef.current
+    const ms = mapSettingsRef.current
+    const isGeoData = (p.pointFiles ?? []).some((x: any) => x.id === layerId)
+    const labelVis = isGeoData
+      ? ms.pointFileLabelVisibility?.[layerId]
+      : ms.layerFileLabelVisibility?.[layerId]
+    const { visible } = resolveLayerVisibility(layerId)
+    layer.applyConfig({
+      visible,
+      color: effectiveColorSettings(layerId) ?? null,
+      thematic: effectiveThematicSettings(layerId),
+      labelEnabled: !!labelVis,
+      label: effectiveLabelSettings(layerId),
+    })
+    syncLabels()
   }
 
   /**
@@ -914,7 +1044,13 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
    * 反过来，源图层被取消勾选 / 被删除 / 热力被关掉时，这里负责把残留的热力面摘掉。
    */
   function replayHeatmaps(forceIds?: Set<string>) {
-    const map = (mapSettingsRef.current.heatmapSettingsMap ?? {}) as Record<string, HeatmapSettings>
+    // 合并实时预览覆盖：弹窗调参期间 store 未变，预览图层也要能在重放（数据就绪/显隐同步）中存活；
+    // 值为 null 的覆盖表示预览态关闭，需从合并结果删除（走下方清理分支摘面）。
+    const map: Record<string, HeatmapSettings> = { ...(mapSettingsRef.current.heatmapSettingsMap ?? {}) }
+    for (const [layerId, preview] of heatPreviewRef.current) {
+      if (preview) map[layerId] = preview
+      else delete map[layerId]
+    }
     for (const [layerId, settings] of Object.entries(map)) {
       if (!settings?.enabled || !settings.field) continue
       if (!isHeatActive(layerId)) continue
@@ -1741,19 +1877,25 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
       setPointFileLabelVisibility: noop,
       setMapInfoLayerVisibility: noop,
       refreshLayerData: async (layerId) => {
+        // 编辑态图层在 syncGeoJsonLayers 中因不可见被跳过（实体已摘、缓存不拉），
+        // 必须单独回源并按版本指纹重置编辑工作集，否则刷新对编辑内容无效
+        if (useLayerEditStore.getState().editableLayerId === layerId) {
+          const synced = await syncEditingWorkspaceFromServer()
+          if (synced?.hadUnsavedChanges) {
+            const fileName = props.layerFiles?.find((f) => f.id === synced.layerId)?.name
+            useToastStore.getState().show(
+              fileName
+                ? t('map.editWorkspaceUpdatedByOtherNamed', { name: fileName })
+                : t('map.editWorkspaceUpdatedByOther'))
+          }
+          return
+        }
         // 丢弃该图层缓存后重建：非 Excel 源由 syncGeoJsonLayers 按缺缓存重新拉取，
         // Excel 地理化数据本身每次都走 dataApi.get
         useMapDataCacheStore.getState().invalidateLayer(layerId)
-        await syncGeoJsonLayers()
-        // 编辑态「刷新」：以服务器最新数据重置编辑工作集——工作集是打开编辑时的
-        // 快照，不重置的话刷新对地图上显示的编辑内容无效（丢弃未保存修改）
-        if (useLayerEditStore.getState().editableLayerId === layerId) {
-          const freshCache = useMapDataCacheStore.getState().layers[layerId]
-          if (freshCache?.geojson) {
-            useLayerEditStore.getState().resetWorkspace(
-              layerId, freshCache.geojson.features || [], freshCache.version)
-          }
-        }
+        // 传当前 runId：runId=0 会在取数完成后被"已被更新一轮取代"判定中止，
+        // 导致阶段 3 不应用新数据（原图层残留旧内容）
+        await syncGeoJsonLayers(geoRunRef.current)
       },
       setMapType: (type) => {
         // 3D 底图在高德卫星 / 高德矢量之间切换；注记层随之切换（见上方底图与注记的 effect）。
@@ -1773,12 +1915,46 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
       setLayerThematicSettings: noop,
       setSectorThematicSettings: () => syncAll(),
       setLayerHeatmapSettings: (fileId, settings) => {
+        // 已保存提交：预览覆盖失效，落回 store 真值，再按提交值渲染
+        heatPreviewRef.current.delete(fileId)
         void renderHeatmapFor(fileId, settings)
         refreshHeatVisibility()
       },
       setSectorHeatmapSettings: (layerId, settings) => {
+        heatPreviewRef.current.delete(layerId)
         void renderHeatmapFor(layerId, settings)
         refreshHeatVisibility()
+      },
+      // 实时预览：设置暂存进覆盖（不写 store），渲染与替换模式显隐均按覆盖值；
+      // 下发值与已保存值指纹相同（取消时回传快照）时删除覆盖，避免残留临时态。
+      previewHeatmapSettings: (layerId, settings) => {
+        const committed = mapSettingsRef.current.heatmapSettingsMap?.[layerId] as HeatmapSettings | undefined
+        const previewSig = settings ? heatSettingsSignature(settings) : null
+        const committedSig = committed ? heatSettingsSignature(committed) : null
+        if (previewSig === committedSig) {
+          heatPreviewRef.current.delete(layerId)
+        } else {
+          heatPreviewRef.current.set(layerId, settings)
+        }
+        // 预览态 null 必须真的摘面：不能回退到已保存值，否则 3D 上"关闭热力图"预览无效
+        void renderHeatmapFor(layerId, settings)
+        refreshHeatVisibility()
+      },
+
+      // ===== 基础图形/标签/专题实时预览（3D）=====
+      // 覆盖只存渲染层（stylePreviewRef），不写 store；保存后 store 变更经 pruneStylePreviews
+      // 自动作废覆盖，取消时调用方回传快照（与已提交同指纹即删覆盖）完成还原。
+      previewColorSettings: (layerId, settings) => {
+        upsertStylePreview('color', layerId, settings)
+        applyStylePreview(layerId)
+      },
+      previewLabelSettings: (layerId, settings) => {
+        upsertStylePreview('label', layerId, settings)
+        applyStylePreview(layerId)
+      },
+      previewThematicSettings: (layerId, settings) => {
+        upsertStylePreview('thematic', layerId, settings)
+        applyStylePreview(layerId)
       },
       getHeatmapStats: (layerId) => heatmapsRef.current.get(layerId)?.getStats() ?? null,
       replayHeatmapSettings: () => replayHeatmaps(),
@@ -1808,7 +1984,18 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
         // 这里负责重建 GeoJSON 图层：markAllDirty 已丢弃缓存的 GeoJSON，
         // 重建时按"缺缓存即拉取"逐层回源，地图不再停留在旧图层内容
         syncAll()
-        await syncGeoJsonLayers()
+        await syncGeoJsonLayers(geoRunRef.current)
+        // 编辑态图层不可见，syncGeoJsonLayers 会跳过它，单独回源同步工作集：
+        // 版本指纹变化即以服务器最新内容重置（last-write-wins），
+        // 相同（自己保存后的广播回声）则保留撤销历史（装饰图层在 helper 内跳过）
+        const synced = await syncEditingWorkspaceFromServer()
+        if (synced?.hadUnsavedChanges) {
+          const fileName = props.layerFiles?.find((f) => f.id === synced.layerId)?.name
+          useToastStore.getState().show(
+            fileName
+              ? t('map.editWorkspaceUpdatedByOtherNamed', { name: fileName })
+              : t('map.editWorkspaceUpdatedByOther'))
+        }
       },
       addLocationMarker: (marker) => {
         // 经纬度抓取/外部定位标记（WGS84）：与打点标记同源，切工具不会被清掉
@@ -1916,8 +2103,11 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
           console.warn('[CesiumMap] locateLayerFeature: 图层未加载或不可见', opts.layerId)
           return false
         }
-        // 清掉其它高亮，只留目标要素（红色描边即搜索定位高亮，与 2D 一致）
-        selectionIdsRef.current = new Set([String(opts.featureId)])
+        // 累加搜索高亮：多次搜索的要素红框同时保持（红色描边即搜索定位高亮，与 2D 一致）
+        selectionIdsRef.current = new Set([
+          ...(selectionIdsRef.current ?? []),
+          String(opts.featureId)
+        ])
         syncAll()
 
         const viewer = viewerRef.current

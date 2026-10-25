@@ -8,6 +8,7 @@ export const loadDataPage = () => import('./pages/DataPage').then(m => ({ defaul
 export const loadPCIPage = () => import('./pages/PCIPage').then(m => ({ default: m.PCIPage }))
 export const loadNeighborPage = () => import('./pages/NeighborPage').then(m => ({ default: m.NeighborPage }))
 export const loadTACPage = () => import('./pages/TACPage').then(m => ({ default: m.TACPage }))
+export const loadPCICheckPage = () => import('./pages/PCICheckPage').then(m => ({ default: m.PCICheckPage }))
 export const loadTACPlanningPage = () => import('./pages/TACPlanningPage').then(m => ({ default: m.TACPlanningPage }))
 export const loadLicensePage = () => import('./pages/LicensePage').then(m => ({ default: m.LicensePage }))
 export const loadLayerToolsPage = () => import('./pages/LayerToolsPage')
@@ -62,6 +63,7 @@ export const DataPage = lazy(recoverable(loadDataPage))
 export const PCIPage = lazy(recoverable(loadPCIPage))
 export const NeighborPage = lazy(recoverable(loadNeighborPage))
 export const TACPage = lazy(recoverable(loadTACPage))
+export const PCICheckPage = lazy(recoverable(loadPCICheckPage))
 export const TACPlanningPage = lazy(recoverable(loadTACPlanningPage))
 export const LicensePage = lazy(recoverable(loadLicensePage))
 export const LayerToolsPage = lazy(recoverable(loadLayerToolsPage))
@@ -85,6 +87,7 @@ export function prefetchPage(href: string) {
     case '/pci': loadPCIPage(); break
     case '/neighbor': loadNeighborPage(); break
     case '/tac': loadTACPage(); break
+    case '/pci-check': loadPCICheckPage(); break
     case '/tac-planning': loadTACPlanningPage(); break
     case '/license': loadLicensePage(); break
     case '/layer': loadLayerToolsPage(); break

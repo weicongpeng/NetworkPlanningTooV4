@@ -45,6 +45,30 @@ const PREDEFINED_LABEL_FIELDS: FieldOption[] = [
 ]
 
 /**
+ * 图层字段缓存（模块级）
+ *
+ * 「标签内容」「专题配色」等下拉的候选字段由后端 columns 接口取回后缓存在这里，避免
+ * 每次右键都重拉。代价是图层属性被改写（如"更新表"写回新列）后缓存会过期，
+ * 故对外暴露 `invalidateLayerFieldCache`，写回成功后必须调用。
+ */
+const fieldOptionsCache: Record<string, FieldOption[]> = {}
+const thematicSamplesCache: Record<string, Record<string, any[]>> = {}
+
+/** 使某图层的字段缓存失效（属性表被改写后调用，下次打开下拉会重新拉取） */
+export function invalidateLayerFieldCache(dataId: string, layerId: string): void {
+  delete fieldOptionsCache[`${dataId}-${layerId}`]
+  for (const key of Object.keys(thematicSamplesCache)) {
+    if (key.includes(`${dataId}-${layerId}`)) delete thematicSamplesCache[key]
+  }
+}
+
+/** 清空全部字段缓存（远端改写图层后调用：本端不知道具体是哪个图层变了） */
+export function clearLayerFieldCache(): void {
+  for (const key of Object.keys(fieldOptionsCache)) delete fieldOptionsCache[key]
+  for (const key of Object.keys(thematicSamplesCache)) delete thematicSamplesCache[key]
+}
+
+/**
  * 悬浮图标/面板拖拽相关常量
  */
 interface Point { x: number; y: number }
@@ -303,6 +327,17 @@ export interface LayerControlProps {
   onThematicSettingsChange?: (node: TreeNode, settings: ThematicSettings | null) => void
   /** 保存热力图设置（null=关闭），由 MapPage 应用到 OnlineMap */
   onHeatmapSettingsChange?: (node: TreeNode, settings: HeatmapSettings | null) => void
+  /**
+   * 热力图参数实时预览（**不落盘**）：弹窗调参时直接下发地图渲染。
+   * 取消时由本组件用打开弹窗时的快照再调一次，完成还原。
+   */
+  onHeatmapSettingsPreview?: (node: TreeNode, settings: HeatmapSettings | null) => void
+  /** 标签设置实时预览（**不落盘**）：调参时直接重绘地图标签；取消时回传快照还原 */
+  onLabelSettingsPreview?: (node: TreeNode, settings: LabelSettings) => void
+  /** 基础图形设置实时预览（**不落盘**）：填充色/透明度/边框/点大小/PCI 渲染即调即见 */
+  onColorSettingsPreview?: (node: TreeNode, settings: LayerColorSettings | null) => void
+  /** 专题图层设置实时预览（**不落盘**；null=预览态关闭） */
+  onThematicSettingsPreview?: (node: TreeNode, settings: ThematicSettings | null) => void
   /** 专题图层设置映射 */
   thematicSettingsMap?: Record<string, ThematicSettings>
   /** 热力图设置映射 */
@@ -387,6 +422,10 @@ export function LayerControl({
   colorSettingsMap,
   onThematicSettingsChange,
   onHeatmapSettingsChange,
+  onHeatmapSettingsPreview,
+  onLabelSettingsPreview,
+  onColorSettingsPreview,
+  onThematicSettingsPreview,
   thematicSettingsMap,
   heatmapSettingsMap,
   heatmapStats,
@@ -471,6 +510,25 @@ export function LayerControl({
   // 专题图层设置弹窗状态
   const [currentThematicSettings, setCurrentThematicSettings] = useState<ThematicSettings | null>(null)
   const [currentHeatmapSettings, setCurrentHeatmapSettings] = useState<HeatmapSettings | null>(null)
+  /**
+   * 热力图实时预览的“打开弹窗时快照”（= 当前已保存/已生效设置）。
+   * 用户调参 → onHeatmapSettingsPreview 只下发地图不落盘；不保存退出时按此快照重新下发，
+   * 地图立即还原为调整前效果（预览覆盖在 2D/3D 渲染层均随入参即时生效/摘除）。
+   */
+  const heatmapPreviewSnapshotRef = useRef<HeatmapSettings | null>(null)
+  /** 本次打开弹窗后是否真的下发过热力预览（没有则取消时不做多余重渲染） */
+  const heatmapPreviewDirtyRef = useRef(false)
+  /**
+   * 标签/基础图形/专题实时预览的"打开弹窗时快照"（含与渲染对齐的默认值，取消时原样回传）。
+   * 只下发地图渲染、不写 store；不保存退出时逐类按快照重新下发，地图还原调整前效果。
+   */
+  const stylePreviewSnapshotsRef = useRef<{
+    label: LabelSettings | null
+    color: LayerColorSettings | null
+    thematic: ThematicSettings | null
+  }>({ label: null, color: null, thematic: null })
+  /** 本次打开弹窗后已下发过实时预览的样式类别（取消时逐类按快照回滚） */
+  const stylePreviewDirtyKindsRef = useRef<Set<'label' | 'color' | 'thematic'>>(new Set())
   /** 当前设置图层在地图上的热力统计（打开弹窗时快照，供分级预览取渲染场分布） */
   const [currentHeatmapStats, setCurrentHeatmapStats] = useState<HeatmapStats | null>(null)
   const [thematicFieldSamples, setThematicFieldSamples] = useState<Record<string, any[]>>({})
@@ -480,22 +538,13 @@ export function LayerControl({
   // 设置弹窗模式：full=完整设置（标签/图形），thematic=专题渲染（仅专题图层/热力图）
   const [settingsMode, setSettingsMode] = useState<'full' | 'thematic'>('full')
   // 专题字段样本缓存（避免重复提取同一图层）
-  const thematicSamplesCacheRef = useRef<Record<string, Record<string, any[]>>>({})
 
   // 字段选项状态 - 初始化为预定义字段，避免右键时为空
   const [fieldOptions, setFieldOptions] = useState<FieldOption[]>(PREDEFINED_LABEL_FIELDS)
   const [loadingFields, setLoadingFields] = useState(false)
 
-  // 字段选项缓存 - 避免重复请求同一图层（使用简单的对象存储）
-  const fieldOptionsCacheRef = useRef<Record<string, FieldOption[]>>({})
-
-  // 获取缓存实例
-  const getCache = useCallback((): Record<string, FieldOption[]> => {
-    if (!fieldOptionsCacheRef.current) {
-      fieldOptionsCacheRef.current = {}
-    }
-    return fieldOptionsCacheRef.current
-  }, [])
+  // 获取字段选项缓存实例（模块级，见文件顶部 fieldOptionsCache）
+  const getCache = useCallback((): Record<string, FieldOption[]> => fieldOptionsCache, [])
 
   /**
    * 获取LTE/NR扇区的字段选项
@@ -640,7 +689,7 @@ export function LayerControl({
       if (!sl) return
       const records = sectorData ? (sl.type === 'LTE' ? sectorData.lte : sectorData.nr) : []
       const cacheKey = `samples-sector-${sl.id}`
-      const cache = thematicSamplesCacheRef.current
+      const cache = thematicSamplesCache
       if (cache[cacheKey]) {
         setThematicFieldSamples(cache[cacheKey])
         return
@@ -663,7 +712,7 @@ export function LayerControl({
     if (!lf) return
     // 采样逻辑变更时递增，使旧版本的不完整样本缓存失效
     const cacheKey = `samples-v2-${lf.dataId}-${lf.id}`
-    const cache = thematicSamplesCacheRef.current
+    const cache = thematicSamplesCache
     if (cache[cacheKey]) {
       setThematicFieldSamples(cache[cacheKey])
       return
@@ -1216,6 +1265,7 @@ export function LayerControl({
         backgroundColor: '#ffffff'
       }
       setCurrentLabelSettings(effectiveLabel)
+      stylePreviewSnapshotsRef.current.label = effectiveLabel
 
       // 载入已保存的颜色设置（无保存设置时，用图层文件自带的默认样式初始化，
       // 还原 tab/mif/kml 的默认属性配置：填充色/线宽/透明度）
@@ -1252,12 +1302,19 @@ export function LayerControl({
         })
       const effectiveColor: LayerColorSettings = persistedColorSettings[layerId] || defaultColor
       setCurrentColorSettings(effectiveColor)
+      // 颜色快照只记已持久化的真值（无保存记录为 null）；弹窗表单仍用 effectiveColor 显示
+      stylePreviewSnapshotsRef.current.color = persistedColorSettings[layerId] ?? null
 
       // 专题图层设置初始化（图层文件类与扇区类）+ 字段值样本提取（cache-first）
       // 注意：扇区类也必须从持久化初始化（或置空），否则会残留上次打开图层文件时
       // 的专题激活状态，导致"基站"图层颜色设置被错误禁用
       const effectiveThematic = persistedThematicSettings[layerId] ?? null
       const effectiveHeatmap = persistedHeatmapSettings[layerId] ?? null
+      // 实时预览快照：记录打开弹窗时已保存的热力设置，取消关闭时按它还原地图
+      heatmapPreviewSnapshotRef.current = effectiveHeatmap
+      heatmapPreviewDirtyRef.current = false
+      stylePreviewSnapshotsRef.current.thematic = effectiveThematic
+      stylePreviewDirtyKindsRef.current.clear()
       if (node.type === 'layer-file' || node.type === 'sector-layer') {
         setCurrentThematicSettings(effectiveThematic)
         setCurrentHeatmapSettings(effectiveHeatmap)
@@ -1463,7 +1520,8 @@ export function LayerControl({
     // MapPage中的onLabelSettingsChange会自动处理：更新配置状态 + 设置可见性为true + 立即应用到地图
     onLabelSettingsChange?.(node, settings)
 
-    // 更新本地状态（弹窗关闭由 Modal 保存路径自行处理；预览复用本 handler 时不关窗）
+    // 已保存提交：该类预览临时态终结，取消时不再回滚
+    stylePreviewDirtyKindsRef.current.delete('label')
     setCurrentLabelSettings(settings)
   }
 
@@ -1492,7 +1550,8 @@ export function LayerControl({
     // 通知父组件应用到地图
     onColorSettingsChange?.(node, settings)
 
-    // 更新本地状态（弹窗关闭由 Modal 保存路径自行处理；预览复用本 handler 时不关窗）
+    // 已保存提交：该类预览临时态终结，取消时不再回滚
+    stylePreviewDirtyKindsRef.current.delete('color')
     setCurrentColorSettings(settings)
   }
 
@@ -1519,7 +1578,8 @@ export function LayerControl({
     // 通知父组件应用到地图
     onThematicSettingsChange?.(node, settings)
 
-    // 更新本地状态（弹窗关闭由 Modal 保存路径自行处理；预览复用本 handler 时不关窗）
+    // 已保存提交：该类预览临时态终结，取消时不再回滚
+    stylePreviewDirtyKindsRef.current.delete('thematic')
     setCurrentThematicSettings(settings)
   }
 
@@ -1548,13 +1608,64 @@ export function LayerControl({
 
     // 更新本地状态
     setCurrentHeatmapSettings(settings)
+    // 已保存提交：预览临时态终结，取消时不再回滚
+    heatmapPreviewDirtyRef.current = false
   }
 
   /**
-   * 取消/关闭弹窗：未保存的设置不会应用到地图或写入 store（无实时预览），
-   * 因此无需恢复状态，直接关闭弹窗即可。
+   * 热力图参数实时预览：仅把当前表单值下发地图渲染，**不写持久化 store、不改图层勾选**。
+   * 地图层（2D/3D）的预览渲染与替换模式显隐都随入参即时变化；取消时由 handleCancelSettings 还原。
+   */
+  const handlePreviewHeatmapSettings = (settings: HeatmapSettings | null) => {
+    const node = currentSettingsNode
+    if (!node) return
+    heatmapPreviewDirtyRef.current = true
+    onHeatmapSettingsPreview?.(node, settings)
+  }
+
+  /** 标签设置实时预览：仅下发地图，不写持久化 store、不改标签开关 */
+  const handlePreviewLabelSettings = (settings: LabelSettings) => {
+    const node = currentSettingsNode
+    if (!node) return
+    stylePreviewDirtyKindsRef.current.add('label')
+    onLabelSettingsPreview?.(node, settings)
+  }
+
+  /** 基础图形设置实时预览：仅下发地图，不写持久化 store、不改图层勾选 */
+  const handlePreviewColorSettings = (settings: LayerColorSettings) => {
+    const node = currentSettingsNode
+    if (!node) return
+    stylePreviewDirtyKindsRef.current.add('color')
+    onColorSettingsPreview?.(node, settings)
+  }
+
+  /** 专题图层设置实时预览：仅下发地图，不写持久化 store */
+  const handlePreviewThematicSettings = (settings: ThematicSettings | null) => {
+    const node = currentSettingsNode
+    if (!node) return
+    stylePreviewDirtyKindsRef.current.add('thematic')
+    onThematicSettingsPreview?.(node, settings)
+  }
+
+  /**
+   * 取消/关闭弹窗：所有本次实时预览过的设置类别（标签/基础图形/专题/热力图），
+   * 逐类按打开弹窗时的已保存快照重新下发，地图立即还原调整前效果（配色、标签样式、专题、热力面），
+   * 保证未保存的预览不会残留在地图上；未预览过的类别不下发，避免多余重渲染。
    */
   const handleCancelSettings = () => {
+    const node = currentSettingsNode
+    if (node) {
+      const dirty = stylePreviewDirtyKindsRef.current
+      const snap = stylePreviewSnapshotsRef.current
+      if (dirty.has('label') && snap.label) onLabelSettingsPreview?.(node, snap.label)
+      if (dirty.has('color')) onColorSettingsPreview?.(node, snap.color)
+      if (dirty.has('thematic')) onThematicSettingsPreview?.(node, snap.thematic ?? null)
+      if (heatmapPreviewDirtyRef.current) {
+        onHeatmapSettingsPreview?.(node, heatmapPreviewSnapshotRef.current ?? null)
+      }
+    }
+    stylePreviewDirtyKindsRef.current.clear()
+    heatmapPreviewDirtyRef.current = false
     setShowLabelSettingsModal(false)
   }
 
@@ -1944,9 +2055,10 @@ export function LayerControl({
       )}
 
       {/* 标签设置弹窗
-          注意：不传 onPreview* 实时预览回调——弹窗内改动未点"保存"前不得应用到地图
-          （此前把预览接到保存处理器，弹窗内改控件甚至打开弹窗后字段选项异步到达
-          触发程序化签名变化，都会把未保存的设置写入 store 并刷到地图上） */}
+          标签 / 基础图形 / 专题图层 / 热力图四类设置全部接入实时预览：
+          onPreview* 只下发地图渲染、不写 store；未保存退出（onCancel）时按打开弹窗时的
+          快照逐类回滚，地图立即还原调整前的标签样式、配色、专题与热力面。
+          弹窗内部保证仅"同页签内用户改值"才下发（切页签/字段选项异步到达不下发）。 */}
       <LabelSettingsModal
         isOpen={showLabelSettingsModal}
         onClose={() => setShowLabelSettingsModal(false)}
@@ -1972,6 +2084,10 @@ export function LayerControl({
         onSaveThematic={handleSaveThematicSettings}
         currentHeatmapSettings={currentHeatmapSettings}
         onSaveHeatmap={handleSaveHeatmapSettings}
+        onPreview={handlePreviewLabelSettings}
+        onPreviewColor={handlePreviewColorSettings}
+        onPreviewThematic={handlePreviewThematicSettings}
+        onPreviewHeatmap={handlePreviewHeatmapSettings}
         onCancel={handleCancelSettings}
         mapHeatmapStats={currentHeatmapStats}
         polygonLayers={polygonLayers}

@@ -42,7 +42,7 @@ const defaultConfig: NeighborConfig = {
   outdoorToIndoorMaxDistance: 0.6,
   indoorToIndoorRadius: 0.35,
   indoorToOutdoorMultiplier: 1.5,
-  outdoorSpacingSiteCount: 9,
+  outdoorSpacingSiteCount: 11,
 }
 
 export const useNeighborStore = create<NeighborState>()(

@@ -73,9 +73,9 @@ async def start_pci_planning(
 
 @router.get("/progress/{task_id}", response_model=Dict[str, Any])
 async def get_pci_progress(task_id: str, _group=Depends(require_task_access)) -> Dict[str, Any]:
-    """获取PCI规划进度"""
+    """获取PCI规划进度（只返回状态/统计）"""
     try:
-        progress = task_manager.get_task_progress(task_id)
+        progress = task_manager.get_task_progress_meta(task_id)
         if progress is None:
             raise HTTPException(status_code=404, detail="任务不存在")
         return {"success": True, "data": progress}
@@ -89,7 +89,9 @@ async def get_pci_progress(task_id: str, _group=Depends(require_task_access)) ->
 async def get_pci_result(task_id: str, _group=Depends(require_task_access)) -> Dict[str, Any]:
     """获取PCI规划结果"""
     try:
-        result = task_manager.get_task_result(task_id)
+        from starlette.concurrency import run_in_threadpool
+
+        result = await run_in_threadpool(task_manager.get_task_result, task_id)
         if result is None:
             raise HTTPException(status_code=404, detail="任务不存在")
         return {"success": True, "data": result}
@@ -103,9 +105,10 @@ async def get_pci_result(task_id: str, _group=Depends(require_task_access)) -> D
 async def export_pci_result(task_id: str, format: str = "xlsx", _group=Depends(require_task_access)):
     """导出PCI规划结果"""
     from fastapi.responses import FileResponse
+    from starlette.concurrency import run_in_threadpool
 
-    # 检查任务是否存在
-    task_data = task_manager.get_task_progress(task_id)
+    # 检查任务是否存在（只取元数据，避免为状态判断加载完整结果）
+    task_data = task_manager.get_task_progress_meta(task_id)
     if task_data is None:
         raise HTTPException(status_code=404, detail="任务不存在")
 
@@ -114,7 +117,7 @@ async def export_pci_result(task_id: str, format: str = "xlsx", _group=Depends(r
         raise HTTPException(status_code=400, detail=f"任务未完成（当前状态: {task_data.get('status', '未知')}）")
 
     # 执行导出
-    file_path = task_manager.export_result(task_id, format)
+    file_path = await run_in_threadpool(task_manager.export_result, task_id, format)
     if file_path is None:
         raise HTTPException(status_code=500, detail="导出失败，请查看后端日志获取详细信息")
 

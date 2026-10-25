@@ -11,7 +11,7 @@
  */
 import { useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo, type ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
-import { Loader2, Search, X, MapPin, AlertTriangle, Database, Trash2, MousePointer2, Circle as CircleIcon, Pentagon, Hand, Map as MapIcon, Satellite, Globe, Square, Check, Settings, Move, Shrink, FilePlus2, Save, Download, Hexagon, Spline, Palette, PenLine, Undo2, BoxSelect, ClipboardPaste, Magnet, Combine, Filter, ChevronRight, ChevronsRight } from 'lucide-react'
+import { Loader2, Search, X, MapPin, AlertTriangle, Database, Trash2, MousePointer2, Circle as CircleIcon, Pentagon, Hand, Map as MapIcon, Satellite, Globe, Square, Check, Settings, Move, Shrink, FilePlus2, Save, Download, Hexagon, Spline, Palette, PenLine, Undo2, BoxSelect, ClipboardPaste, Magnet, Combine, Filter, ChevronRight, ChevronsRight, Table2 } from 'lucide-react'
 import { OnlineMap, OnlineMapRef, CustomLayerOption } from '../components/Map/OnlineMap'
 import {
   MAP_SOURCE_OPTIONS,
@@ -20,7 +20,7 @@ import {
   type MapSource,
 } from '../config/mapSources'
 import { MapSearchDialog } from '../components/Map/MapSearchDialog'
-import { LayerControl, SectorLayerOption, LayerFileOption, DecorationLayerOption } from '../components/Map/LayerControl'
+import { LayerControl, clearLayerFieldCache, SectorLayerOption, LayerFileOption, DecorationLayerOption } from '../components/Map/LayerControl'
 import { OfflineMap, createDefaultLayers } from '../components/Map'
 import { CesiumMap } from '../components/Map/cesium/CesiumMap'
 import { MapSettingsPanel } from '../components/Map/MapSettingsPanel'
@@ -39,6 +39,7 @@ import AttributeJoinDialog from '../components/Map/AttributeJoinDialog'
 import BufferDialog from '../components/Map/BufferDialog'
 import SaveLayersDialog, { type DirtyLayerItem } from '../components/Map/SaveLayersDialog'
 import MapExportDialog from '../components/Map/MapExportDialog'
+import UpdateTableDialog from '../components/Map/UpdateTableDialog'
 import DrawStyleModal from '../components/Map/DrawStyleModal'
 import FeatureStyleDialog from '../components/Map/FeatureStyleDialog'
 import type { DrawGeometryType } from '@shared/types'
@@ -169,7 +170,7 @@ function layerFileFormat(sourceFile?: string): string {
 /** 可拖动排序的工具栏按钮 id（数据源指示/搜索区固定不参与）；默认顺序按使用频率排列 */
 /* 全屏按钮不在此列：已迁到地图内右上角的悬浮图标（见地图内容区域） */
 const TOOLBAR_ITEM_IDS = [
-  'save', 'export', 'new', 'undo', 'capture', 'paste', 'measure',
+  'save', 'export', 'new', 'table', 'undo', 'capture', 'paste', 'measure',
   'drag', 'select', 'marquee', 'draw', 'style', 'nodesnap', 'nodemerge',
   'maptype',
 ] as const
@@ -807,6 +808,9 @@ export function MapPage() {
       //    这一步不能只依赖 data_changed 的全局监听——桌面端同步落地 / 事件
       //    监听顺序异常时，地图会一直显示旧图层内容（同组“编辑后别人看不到”根因）。
       useMapDataCacheStore.getState().markAllDirty()
+      // 3.5) 字段候选缓存一并清空：远端（同组其他端）给图层加了属性列后，
+      //     「标签内容 / 专题配色」下拉必须回源重取，否则看不到新字段
+      clearLayerFieldCache()
       // 4) 重载扇区数据缓存（频点提取/工参搜索）与地图图层
       loadSectorDataForSearch(true)
       await onlineMapRef.current?.refreshData()
@@ -1012,15 +1016,17 @@ export function MapPage() {
   // ===== 新建 TAB 图层 / 编辑 / 保存 =====
   const [newLayerDialogOpen, setNewLayerDialogOpen] = useState(false)
   const [joinDialogOpen, setJoinDialogOpen] = useState(false)
+  const [updateTableDialogOpen, setUpdateTableDialogOpen] = useState(false)
   const [bufferDialogOpen, setBufferDialogOpen] = useState(false)
   const [saveDialogOpen, setSaveDialogOpen] = useState(false)
   const [exportDialogOpen, setExportDialogOpen] = useState(false)
   const [styleModalTab, setStyleModalTab] = useState<DrawGeometryType | null>(null)
-  // 工具栏下拉菜单：'new' 新建 / 'draw' 绘制 / null 关闭
-  const [openMenu, setOpenMenu] = useState<'new' | 'draw' | null>(null)
+  // 工具栏下拉菜单：'new' 新建 / 'draw' 绘制 / 'table' 表 / null 关闭
+  const [openMenu, setOpenMenu] = useState<'new' | 'draw' | 'table' | null>(null)
   const [savingLayers, setSavingLayers] = useState(false)
   const newMenuRef = useRef<HTMLDivElement>(null)
   const drawMenuRef = useRef<HTMLDivElement>(null)
+  const tableMenuRef = useRef<HTMLDivElement>(null)
 
   // ===== 工具栏个性化：右键菜单设置标签显隐、拖动调整按钮顺序（按用户持久化） =====
   const [toolbarPrefs, setToolbarPrefs] = useState<ToolbarPrefs>(loadToolbarPrefs)
@@ -1177,7 +1183,8 @@ export function MapPage() {
       const t = e.target as Node
       if (
         !newMenuRef.current?.contains(t) &&
-        !drawMenuRef.current?.contains(t)
+        !drawMenuRef.current?.contains(t) &&
+        !tableMenuRef.current?.contains(t)
       ) {
         setOpenMenu(null)
       }
@@ -2591,6 +2598,70 @@ export function MapPage() {
   }, [storeSetHeatmapSettings, storeSetLayerFileVisibility, storeSetPointFileVisibility, layerFiles])
 
   /**
+   * 热力图参数**实时预览**：仅命令式下发地图渲染（2D/3D 同一接口），
+   * 不写本地 state / 持久化 store，也不强制改动图层勾选与可见性。
+   * 未保存退出时 LayerControl 会用打开弹窗时的快照再调一次，地图即时还原。
+   */
+  const handleHeatmapSettingsPreview = useCallback((node: TreeNode, settings: HeatmapSettings | null) => {
+    let layerId: string | undefined
+    if (node.type === 'layer-file' && node.layerFile) {
+      layerId = node.layerFile.id
+    } else if (node.type === 'sector-layer' && node.sectorLayer) {
+      layerId = node.sectorLayer.id
+    }
+    if (!layerId || !onlineMapRef.current) return
+    // 2D/3D 均实现该命令：渲染层按入参即时出图/摘除，替换模式显隐同步校正
+    onlineMapRef.current.previewHeatmapSettings(layerId, settings)
+  }, [])
+
+  /**
+   * 标签设置**实时预览**：仅命令式下发地图渲染（2D/3D 同一接口），
+   * 不写 state/store、不改标签开关；取消时 LayerControl 用快照再调一次完成还原。
+   */
+  const handleLabelSettingsPreview = useCallback((node: TreeNode, settings: LabelSettings) => {
+    let layerId: string | undefined
+    if (node.type === 'sector-layer' && node.sectorLayer) {
+      layerId = node.sectorLayer.id
+    } else if (node.type === 'layer-file' && node.layerFile) {
+      layerId = node.layerFile.id
+    }
+    if (!layerId || !onlineMapRef.current) return
+    onlineMapRef.current.previewLabelSettings(layerId, settings)
+  }, [])
+
+  /**
+   * 基础图形设置**实时预览**：填充色/透明度/边框/点大小/PCI 渲染即调即见，
+   * 只下发渲染、不写 state/store、不强制图层可见性；取消时按快照还原（含装饰图层）。
+   */
+  const handleColorSettingsPreview = useCallback((node: TreeNode, settings: LayerColorSettings | null) => {
+    let layerId: string | undefined
+    if (node.type === 'sector-layer' && node.sectorLayer) {
+      layerId = node.sectorLayer.id
+    } else if (node.type === 'layer-file' && node.layerFile) {
+      layerId = node.layerFile.id
+    } else if (node.type === 'decoration-layer') {
+      layerId = 'decoration-layer'
+    }
+    if (!layerId || !onlineMapRef.current) return
+    onlineMapRef.current.previewColorSettings(layerId, settings)
+  }, [])
+
+  /**
+   * 专题图层设置**实时预览**（null=预览态关闭专题，回退基础配色），
+   * 只下发渲染、不写 state/store；取消时按快照还原。
+   */
+  const handleThematicSettingsPreview = useCallback((node: TreeNode, settings: ThematicSettings | null) => {
+    let layerId: string | undefined
+    if (node.type === 'layer-file' && node.layerFile) {
+      layerId = node.layerFile.id
+    } else if (node.type === 'sector-layer' && node.sectorLayer) {
+      layerId = node.sectorLayer.id
+    }
+    if (!layerId || !onlineMapRef.current) return
+    onlineMapRef.current.previewThematicSettings(layerId, settings)
+  }, [])
+
+  /**
    * 图层预览（右键菜单）：居中并最大化显示该图层全部要素
    */
   const handleLayerPreview = useCallback((fileId: string) => {
@@ -3079,6 +3150,34 @@ export function MapPage() {
       </div>
     ),
 
+    /* 更新表菜单：给图层文件追加图形固有属性（经纬度/长度/面积…）并导出或写回 */
+    table: (
+      <div className="relative" ref={tableMenuRef}>
+        <button
+          className={`px-2 py-1.5 text-xs rounded transition-colors flex items-center gap-1 ${openMenu === 'table' ? 'bg-muted text-primary' : 'text-foreground hover:bg-muted hover:text-primary'}`}
+          onClick={() => setOpenMenu(openMenu === 'table' ? null : 'table')}
+          title={t('map.tableMenu') || '表'}
+        >
+          <Table2 size={14} />
+          <span className="toolbar-label">{t('map.tableMenu') || '表'}</span>
+          <svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" className="ml-0.5 opacity-60">
+            <path d="m6 9 6 6 6-6"/>
+          </svg>
+        </button>
+        {openMenu === 'table' && (
+          <div className="absolute top-full left-0 mt-1 z-[3000] bg-card border border-border rounded-lg shadow-lg w-36 overflow-hidden">
+            <button
+              onClick={() => { setOpenMenu(null); setUpdateTableDialogOpen(true) }}
+              className="w-full text-left px-2 py-1.5 text-xs text-foreground hover:bg-muted hover:text-primary transition-colors flex items-center gap-1.5"
+            >
+              <Table2 size={12} />
+              {t('map.updateTable') || '更新表'}
+            </button>
+          </div>
+        )}
+      </div>
+    ),
+
     /* 绘制工具下拉：点 / 线 / 面（互斥，需先打开图层编辑开关） */
     draw: (
       <div className="relative" ref={drawMenuRef}>
@@ -3300,6 +3399,13 @@ export function MapPage() {
       label: t('map.newLayer') || '新建',
       submenu: [
         { icon: <FilePlus2 size={12} />, label: t('map.newLayerMenu') || '图层', onSelect: () => setNewLayerDialogOpen(true) },
+      ],
+    },
+    table: {
+      icon: <Table2 size={14} />,
+      label: t('map.tableMenu') || '表',
+      submenu: [
+        { icon: <Table2 size={12} />, label: t('map.updateTable') || '更新表', onSelect: () => setUpdateTableDialogOpen(true) },
       ],
     },
     undo: {
@@ -3823,6 +3929,10 @@ export function MapPage() {
               onThematicSettingsChange={handleThematicSettingsChange}
               thematicSettingsMap={thematicSettingsMap}
               onHeatmapSettingsChange={handleHeatmapSettingsChange}
+              onHeatmapSettingsPreview={handleHeatmapSettingsPreview}
+              onLabelSettingsPreview={handleLabelSettingsPreview}
+              onColorSettingsPreview={handleColorSettingsPreview}
+              onThematicSettingsPreview={handleThematicSettingsPreview}
               heatmapSettingsMap={heatmapSettingsMap}
               heatmapStats={heatmapStats}
               openThematicFor={openThematicFor}
@@ -3900,6 +4010,16 @@ export function MapPage() {
           layers={layers}
           layerFiles={layerFiles}
           pointFiles={pointFiles}
+        />
+      )}
+
+      {/* 更新表弹窗：给图层文件追加图形固有属性列，导出 Excel 或写回源图层 */}
+      {viewMode === 'online' && (
+        <UpdateTableDialog
+          open={updateTableDialogOpen}
+          onClose={() => setUpdateTableDialogOpen(false)}
+          layerFiles={layerFiles}
+          onSaved={handleBufferSaved}
         />
       )}
 

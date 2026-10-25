@@ -1330,6 +1330,23 @@ export const tacApi = {
     return apiClient.get(`/tac/result/${taskId}`)
   },
 
+  // 结果页轻量元数据（摘要 + 明细索引状态）
+  getResultMeta: async (taskId: string): Promise<ApiResponse<any>> => {
+    return apiClient.get(`/tac/result/${taskId}/meta`)
+  },
+
+  // 结果明细分页
+  getResultRows: async (taskId: string, page = 1, pageSize = 200, filters?: Record<string, string>): Promise<ApiResponse<any>> => {
+    return apiClient.get(`/tac/result/${taskId}/rows`, {
+      params: { page, page_size: pageSize, ...(filters || {}) }
+    })
+  },
+
+  // 地图精简结果
+  getResultMap: async (taskId: string): Promise<ApiResponse<any>> => {
+    return apiClient.get(`/tac/result/${taskId}/map`)
+  },
+
   // 获取历史任务列表
   getHistory: async (page = 1, pageSize = 20): Promise<ApiResponse<any[]>> => {
     return apiClient.get('/tac/history', { params: { page, page_size: pageSize } })
@@ -1345,6 +1362,43 @@ export const tacApi = {
     const response = await apiClient.get(`/tac/export/${taskId}`, {
       responseType: 'blob',
       params: { format }
+    })
+    return response.data
+  }
+}
+
+// PCI核查API
+export const pciCheckApi = {
+  // 开始核查
+  plan: async (config: any): Promise<ApiResponse<{ taskId: string; message: string }>> => {
+    return apiClient.post('/pci-check/plan', config)
+  },
+
+  // 获取核查进度
+  getProgress: async (taskId: string): Promise<ApiResponse<TaskProgress>> => {
+    return apiClient.get(`/pci-check/progress/${taskId}`)
+  },
+
+  // 获取核查结果
+  getResult: async (taskId: string): Promise<ApiResponse<any>> => {
+    return apiClient.get(`/pci-check/result/${taskId}`)
+  },
+
+  // 获取历史任务列表
+  getHistory: async (page = 1, pageSize = 20): Promise<ApiResponse<any[]>> => {
+    return apiClient.get('/pci-check/history', { params: { page, page_size: pageSize } })
+  },
+
+  // 删除历史任务
+  deleteHistory: async (taskId: string): Promise<ApiResponse<any>> => {
+    return apiClient.delete(`/pci-check/history/${taskId}`)
+  },
+
+  // 导出核查结果（xlsx 每类一个 sheet；csv 需指定核查类型）
+  export: async (taskId: string, format: 'xlsx' | 'csv', checkType?: string): Promise<Blob> => {
+    const response = await apiClient.get(`/pci-check/export/${taskId}`, {
+      responseType: 'blob',
+      params: { format, checkType }
     })
     return response.data
   }
@@ -1375,6 +1429,20 @@ export const tacPlanningApi = {
   // 获取规划结果
   getResult: async (taskId: string): Promise<ApiResponse<any>> => {
     return apiClient.get(`/tac/planning/result/${taskId}`)
+  },
+
+  getResultMeta: async (taskId: string): Promise<ApiResponse<any>> => {
+    return apiClient.get(`/tac/planning/result/${taskId}/meta`)
+  },
+
+  getResultRows: async (taskId: string, page = 1, pageSize = 200, filters?: Record<string, string>): Promise<ApiResponse<any>> => {
+    return apiClient.get(`/tac/planning/result/${taskId}/rows`, {
+      params: { page, page_size: pageSize, ...(filters || {}) }
+    })
+  },
+
+  getResultMap: async (taskId: string): Promise<ApiResponse<any>> => {
+    return apiClient.get(`/tac/planning/result/${taskId}/map`)
   },
 
   // 导出规划结果
@@ -1427,6 +1495,30 @@ export const neighborApi = {
   // 获取规划结果
   getResult: async (taskId: string): Promise<ApiResponse<NeighborResult>> => {
     return apiClient.get(`/neighbor/result/${taskId}`)
+  },
+
+  getResultMeta: async (taskId: string): Promise<ApiResponse<any>> => {
+    return apiClient.get(`/neighbor/result/${taskId}/meta`)
+  },
+
+  // 按源小区分页（每页包含该源小区的全部目标小区）
+  getResultSources: async (taskId: string, page = 1, pageSize = 50, filters?: Record<string, string>): Promise<ApiResponse<any>> => {
+    return apiClient.get(`/neighbor/result/${taskId}/sources`, {
+      params: { page, page_size: pageSize, ...(filters || {}) }
+    })
+  },
+
+  // 地图点击源小区时按需取邻区关系
+  getSourceNeighbors: async (taskId: string, sourceSiteId: string, sourceCellId: string): Promise<ApiResponse<any>> => {
+    return apiClient.get(`/neighbor/result/${taskId}/neighbors`, {
+      params: { sourceSiteId, sourceCellId }
+    })
+  },
+
+  getResultRows: async (taskId: string, page = 1, pageSize = 200, filters?: Record<string, string>): Promise<ApiResponse<any>> => {
+    return apiClient.get(`/neighbor/result/${taskId}/rows`, {
+      params: { page, page_size: pageSize, ...(filters || {}) }
+    })
   },
 
   // 获取历史任务列表
@@ -1523,7 +1615,8 @@ export const layerApi = {
   saveLayerData: async (
     dataId: string,
     layerId: string,
-    payload: { geojson?: any; patch?: any },
+    // dropFields：整列删除（"更新表"把无单位旧列换成带单位列时用）
+    payload: { geojson?: any; patch?: any; dropFields?: string[] },
   ): Promise<ApiResponse<{ success: boolean; feature_count: number; mode?: 'full' | 'patch'; version?: string }>> => {
     const url = `/data/${dataId}/layers/${layerId}/data`
     const gz = await gzipText(JSON.stringify(payload))

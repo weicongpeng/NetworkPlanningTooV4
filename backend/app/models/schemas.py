@@ -469,10 +469,10 @@ class NeighborConfig(BaseModel):
         description="室分→室外全量半径倍数（×站间距），默认1.5"
     )
     outdoorSpacingSiteCount: int = Field(
-        default=9,
+        default=11,
         ge=1,
         le=30,
-        description="室外源站间距取最近N个室外站点，默认9"
+        description="室外源站间距取最近N个室外站点，默认11"
     )
     customRules: Optional[List[Dict[str, Any]]] = None
     selectedCellIds: Optional[List[str]] = Field(
@@ -656,6 +656,70 @@ class TACResult(BaseModel):
     startTime: str
     endTime: Optional[str] = None
     error: Optional[str] = None
+
+
+# ============== PCI核查相关 ==============
+class PCICheckConfig(BaseModel):
+    """PCI核查配置"""
+
+    networkType: NetworkType = Field(
+        default=NetworkType.LTE, description="网络类型: LTE 或 NR（一次任务只核查一个制式）"
+    )
+    macroPairDistance: float = Field(
+        default=200.0,
+        ge=10.0,
+        le=5000.0,
+        description="宏站到宏站对打距离门限(米)，默认200"
+    )
+    mixedPairDistance: float = Field(
+        default=100.0,
+        ge=10.0,
+        le=5000.0,
+        description="宏站到室分对打距离门限(米)，默认100"
+    )
+    indoorPairDistance: float = Field(
+        default=50.0,
+        ge=10.0,
+        le=5000.0,
+        description="室分到室分对打距离门限(米)，默认50"
+    )
+    minReuseDistanceMacro: float = Field(
+        default=2000.0,
+        ge=100.0,
+        le=50000.0,
+        description="宏站PCI最小复用距离门限(米)，默认2000"
+    )
+    minReuseDistanceIndoor: float = Field(
+        default=500.0,
+        ge=100.0,
+        le=50000.0,
+        description="室分PCI最小复用距离门限(米)，默认500"
+    )
+    macroFacingAngle: float = Field(
+        default=90.0,
+        ge=10.0,
+        le=180.0,
+        description="宏站对打小区夹角门限(度)，默认90"
+    )
+    indoorFacingAngle: float = Field(
+        default=60.0,
+        ge=10.0,
+        le=180.0,
+        description="室分对打小区夹角门限(度)，默认60"
+    )
+    reuseCheck: bool = Field(default=True, description="是否核查PCI复用距离")
+    collisionCheck: bool = Field(default=True, description="是否核查PCI冲突")
+    confusionCheck: bool = Field(default=True, description="是否核查PCI混淆")
+    mod3Check: bool = Field(default=True, description="是否核查PCI模3，LTE/NR通用")
+    mod30Check: bool = Field(default=True, description="是否核查PCI模30（仅NR生效）")
+    neighborAssoc: bool = Field(
+        default=True,
+        description="邻区关联开关：打开后冲突/混淆/模值邻区核查基于预规划同频邻区对",
+    )
+    selectedCellIds: Optional[List[str]] = Field(
+        default=None,
+        description="选中的小区ID列表（格式：siteId_sectorId）"
+    )
 
 
 # ============== 地图相关 ==============

@@ -93,7 +93,7 @@ def init_db():
 
     from app.models.database import (
         User, UserSession, Workbook, Site, Sector, GeoFile, Layer, UserSettings, TaskResult,
-        DatasetRevision, SystemSetting,
+        TaskResultRow, TaskResultSourceGroup, DatasetRevision, SystemSetting,
     )  # noqa: F401
     Base.metadata.create_all(bind=engine)
 
@@ -125,6 +125,11 @@ def init_db():
         wb_cols = [row[1] for row in conn.exec_driver_sql("PRAGMA table_info(workbooks)").fetchall()]
         if "remark" not in wb_cols:
             conn.exec_driver_sql("ALTER TABLE workbooks ADD COLUMN remark TEXT")
+
+        # 迁移：geo_files 表添加导入提醒列（NULL=存量未检查，回填后写 JSON 数组）
+        gf_cols = [row[1] for row in conn.exec_driver_sql("PRAGMA table_info(geo_files)").fetchall()]
+        if gf_cols and "import_warnings" not in gf_cols:
+            conn.exec_driver_sql("ALTER TABLE geo_files ADD COLUMN import_warnings TEXT")
 
         # 迁移：桌面版授权记录添加数据组归属列（共享模式下按组共享服务器端数据）
         dl_cols = [row[1] for row in conn.exec_driver_sql("PRAGMA table_info(desktop_licenses)").fetchall()]
@@ -182,6 +187,13 @@ def init_db():
         # 迁移：任务小数量（同组任务历史「小区数量」列，镜像行无本机结果时靠它显示）
         if tr_cols and "cell_count" not in tr_cols:
             conn.exec_driver_sql("ALTER TABLE task_results ADD COLUMN cell_count INTEGER")
+        # 迁移：历史列表轻量元数据（摘要/规划值映射），避免列表解析整份 result_json
+        if tr_cols and "summary_json" not in tr_cols:
+            conn.exec_driver_sql("ALTER TABLE task_results ADD COLUMN summary_json TEXT")
+        if tr_cols and "applied_values_json" not in tr_cols:
+            conn.exec_driver_sql("ALTER TABLE task_results ADD COLUMN applied_values_json TEXT")
+        if tr_cols and "rows_ready" not in tr_cols:
+            conn.exec_driver_sql("ALTER TABLE task_results ADD COLUMN rows_ready INTEGER NOT NULL DEFAULT 0")
 
         # 迁移：user_settings 表添加 created_at 列（如从旧表结构升级）
         us_cols = [row[1] for row in conn.exec_driver_sql("PRAGMA table_info(user_settings)").fetchall() if row[0] >= 0]

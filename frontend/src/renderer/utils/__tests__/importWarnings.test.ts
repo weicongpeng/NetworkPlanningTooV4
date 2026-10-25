@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { formatImportWarning } from '../importWarnings'
+import { formatImportWarning, formatImportWarningTitle } from '../importWarnings'
 
 /** 用 zh.json 的文案做替身，校验插值与制式前缀 */
 const t = (key: string, options: Record<string, unknown> = {}) => {
@@ -10,6 +10,10 @@ const t = (key: string, options: Record<string, unknown> = {}) => {
     'data.importWarnSiteIdDropped': '已丢弃 {{count}} 行基站标识为空的数据',
     'data.importWarnSectorNameMissing': '未找到「小区名称」列（列名可能被误改），小区名称按「基站名称_小区标识」显示',
     'data.importWarnSingleNetwork': '文件只含 {{present}} 制式，请确认是否漏传 {{missing}} 工参',
+    'data.importWarnTitle': '{{type}}文件「{{name}}」存在问题，数据已导入',
+    'data.importWarnGenericType': '数据',
+    'data.fullParams': '全量工参',
+    'data.geoData': '地理化数据',
   }
   return (dict[key] || key).replace(/\{\{(\w+)\}\}/g, (_, k) => String(options[k] ?? ''))
 }
@@ -23,6 +27,11 @@ describe('formatImportWarning', () => {
   it('坐标缺失/为 0：带条数', () => {
     expect(formatImportWarning({ code: 'coord_zero', network: 'LTE', count: 12 }, t))
       .toBe('[LTE] 12 个小区经纬度缺失或为 0（地图上会落在原点）')
+  })
+
+  it('地理化数据坐标缺失/为 0：不带制式前缀', () => {
+    expect(formatImportWarning({ code: 'coord_zero', count: 2 }, t))
+      .toBe('2 个小区经纬度缺失或为 0（地图上会落在原点）')
   })
 
   it('小区标识为空、基站标识被丢弃：带条数', () => {
@@ -44,5 +53,22 @@ describe('formatImportWarning', () => {
 
   it('未知 code 原样回显，避免新增后端类型时显示空白', () => {
     expect(formatImportWarning({ code: 'future_code', network: 'NR' }, t)).toBe('[NR] future_code')
+  })
+})
+
+describe('formatImportWarningTitle', () => {
+  it('地理化数据：标题指明入口类型与文件名', () => {
+    expect(formatImportWarningTitle('geo_data', 'geo.xlsx', t))
+      .toBe('地理化数据文件「geo.xlsx」存在问题，数据已导入')
+  })
+
+  it('全量工参：标题指明入口类型与文件名', () => {
+    expect(formatImportWarningTitle('full_params', 'params.xlsx', t))
+      .toBe('全量工参文件「params.xlsx」存在问题，数据已导入')
+  })
+
+  it('未知入口类型回退为通用「数据文件」', () => {
+    expect(formatImportWarningTitle('unknown', 'x.xlsx', t))
+      .toBe('数据文件「x.xlsx」存在问题，数据已导入')
   })
 })

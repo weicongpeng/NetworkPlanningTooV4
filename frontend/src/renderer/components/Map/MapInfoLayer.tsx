@@ -202,6 +202,12 @@ export class MapInfoLayer {
   private geoJSONLayer: L.GeoJSON | null = null
   private canvasRenderer: L.Canvas | null = null // 独立 Canvas renderer（用于 z-order 置顶）
   private style: MapInfoLayerStyle
+  /**
+   * 构造时各几何类型的原始样式快照（来自 options.style，即图层/要素自带样式）。
+   * setStyleOverrides(null)（设置弹窗取消实时预览）时逐 kind 还原，
+   * 避免未保存的配色预览残留或被文件级默认色顶替。
+   */
+  private originalKindStyles: { point?: unknown; line?: unknown; polygon?: unknown } = {}
   // 专题图层设置（启用时优先于 style 基础配置；null 表示未启用）
   private thematicSettings: ThematicSettings | null = null
   // 专题区间统计（每个区间的要素数/总数，用于图例展示）
@@ -244,6 +250,12 @@ export class MapInfoLayer {
     this.name = options.name
     this.type = options.type
     this.style = options.style || {}
+    // 深拷贝各 kind 原始样式，供 setStyleOverrides(null) 无损还原
+    this.originalKindStyles = {
+      point: this.style.point ? JSON.parse(JSON.stringify(this.style.point)) : undefined,
+      line: this.style.line ? JSON.parse(JSON.stringify(this.style.line)) : undefined,
+      polygon: this.style.polygon ? JSON.parse(JSON.stringify(this.style.polygon)) : undefined,
+    }
 
     // 初始化标签配置
     this.labelConfig = {
@@ -990,7 +1002,21 @@ export class MapInfoLayer {
    * 设置图层颜色覆盖（图形颜色 / 透明度 / 边框宽度 / 边框颜色）
    * 写入 style 配置后重新应用样式，使已渲染要素即时生效。
    */
-  setStyleOverrides(settings: { fillColor: string; fillOpacity: number; borderWidth: number; borderColor: string; pointSize?: number }): void {
+  setStyleOverrides(settings: { fillColor: string; fillOpacity: number; borderWidth: number; borderColor: string; pointSize?: number } | null): void {
+    // null = 取消实时预览：恢复构造时各 kind 的原始样式并重绘（无图层级配色覆盖）
+    if (settings === null) {
+      this.style.point = this.originalKindStyles.point
+        ? JSON.parse(JSON.stringify(this.originalKindStyles.point))
+        : undefined
+      this.style.line = this.originalKindStyles.line
+        ? JSON.parse(JSON.stringify(this.originalKindStyles.line))
+        : undefined
+      this.style.polygon = this.originalKindStyles.polygon
+        ? JSON.parse(JSON.stringify(this.originalKindStyles.polygon))
+        : undefined
+      this._reapplyStyles()
+      return
+    }
     // 点样式：填充 + 边框；图形大小（点要素半径）覆盖到 radius
     // markerColor/markerSize 必须与要素自带 _style 同名写入：_resolvePointStyle 的读取顺序是
     // markerColor → fillColor、markerSize → radius，只写 fillColor/radius 会被要素自带配色/大小
@@ -1297,10 +1323,16 @@ export class MapInfoLayer {
   /**
    * 设置标签配置
    * @param config 标签配置
+   * @param opts.transient 实时预览专用：只更新配置出图，**不打"用户已自定义"标记**。
+   *   否则用户在设置弹窗里调了标签样式但取消退出，本图层首次开启标签时"自动挑选默认字段"
+   *   的行为会被一次未保存的预览污染（取消后仍记住预览字段）。
    */
-  setLabelConfig(config: { content: string; color: string; fontSize: number }): void {
-    // 标记为用户显式保存过配置，后续不再自动挑选默认字段
-    this.labelConfigCustomized = true
+  setLabelConfig(
+    config: { content: string; color: string; fontSize: number },
+    opts?: { transient?: boolean }
+  ): void {
+    // 标记为用户显式保存过配置，后续不再自动挑选默认字段（瞬态预览除外）
+    if (!opts?.transient) this.labelConfigCustomized = true
     // 更新配置
     this.labelConfig = { ...this.labelConfig, ...config }
     if (IS_DEV) console.log('[MapInfoLayer] setLabelConfig:', this.id, this.labelConfig)

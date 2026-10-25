@@ -134,10 +134,12 @@ def _load_mapinfo(data_id: str, layer_id: str) -> Tuple[List[JoinFeature], List[
     src = _resolve_source_file(data_id, layer_id)
     if src is None:
         raise ValueError(f"未找到图层源文件: {layer_id}")
+    # 与 MapInfoParser.parse_file 同口径：先按 .tab 声明的 charset 读，gbk 仅兜底。
+    # 反序（先 encoding="gbk"）会把本工具写出的 GBK 文件二次转码，字段名变乱码。
     try:
-        gdf = gpd.read_file(str(src), encoding="gbk")
-    except Exception:
         gdf = gpd.read_file(str(src))
+    except Exception:
+        gdf = gpd.read_file(str(src), encoding="gbk")
 
     records = gdf.to_dict("records")
     geoms = list(gdf.geometry)

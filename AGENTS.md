@@ -1,4 +1,6 @@
-# 技术规范
+# AGENTS.md
+
+This file provides guidance to the AI agent when working with code in this repository.
 
 ## 项目文档
 - 分工：`CLAUDE.md` 与 `CODEBUDDY.md` 互为镜像，收录代码架构、常用命令、开发约束；本文件只保留通用协作与技术规范；`README.md` 是面向用户的功能概览。
@@ -6,9 +8,22 @@
 - 历史设计与实施记录在 `docs/plans/`（按日期）；部署运维见 `NetworkPlanningTooV3-部署指南.md`、`NetworkPlanningTooV3-linux服务器版本部署指南.md`、`npt-backend.service`、根 `重启命令`。
 
 ## 别改错文件
-- 根目录的 `data_service.py`、`mapinfo_service.py` 是 7 月旧快照（已入库），不是运行代码；一律改 `backend/app/services/` 下同名文件。
+- 根目录的 `data_service.py`、`mapinfo_service.py`、`tac_planning_service.py` 是 7 月旧快照（已入库），不是运行代码；一律改 `backend/app/services/` 下同名文件。
 - 根 `nptserve.spec` 与 `desktop/desktop.spec` 并存，桌面打包以 `desktop/desktop.spec` + `.github/workflows/build-windows-desktop.yml` 为准，`installer-out/` 是本地产物目录。
 - `frontend/package.json.electron`、`frontend/capacitor.config.ts`、`frontend/start-electron-dev.bat` 为遗留文件，Electron / Capacitor 已废弃。
+
+## 常用命令与验证
+- 后端测试必须从 `backend/` 运行（仓库无 pytest.ini）：`python -m pytest tests/ -v`；`tests/conftest.py` 会 mock 缺失的 GDAL 栈，并把数据根隔离到 tmp，不会写生产 `data/`。
+- 前端测试配置内嵌在 `vite.config.ts`（无独立 vitest 配置）；根 `package.json` 是空壳，脚本全在 `frontend/package.json`。
+- 前端构建产物固定为 `frontend/dist-renderer/`（后端同域托管 SPA）；不要在 `vite.config.ts` 加 `manualChunks`（历史上导致跨 chunk TDZ 错误）。
+- 桌面端仅 Windows 构建：`pyinstaller --noconfirm --clean desktop/desktop.spec`，产物用 `NPT.exe --selftest` 冒烟。
+- 后端配置统一 `NPT_` 前缀，模板见 `backend/.env.example`；不要提交 `.env`。
+
+## 跨端硬约束
+- 坐标系：前端渲染/图层编辑用 GCJ02，后端持久化 WGS84；新链路必须复用既有转换（前端 `utils/coordinate.ts`，后端 `utils/coordinate_transformer.py`），不得混用。
+- 数据组隔离：所有数据查询/写入路径必须接组门禁（`services/data_group.py`、`core/data_access.py`），管理员同样按组隔离。
+- 前端 UI 文本一律 `t()`；新增 key 必须同时写入 `locales/zh.json` 与 `locales/en.json`。
+- 后端业务代码的 print 禁用 emoji：桌面端控制台是 cp936，emoji 会抛编码错误并把上传报成失败。
 
 ## 编码与架构原则
 - 始终使用简体中文回复
@@ -72,7 +87,8 @@
 ## 桌面离线版（desktop/）
 - `desktop/launcher.py`（pywebview + WebView2）、`desktop/desktop.spec`（PyInstaller onedir，配 `desktop/hooks/hook-pyogrio.py`）、`desktop/installer.iss`（Inno Setup per-user 安装），由 `.github/workflows/build-windows-desktop.yml` 在 windows-latest 出包，产物落 `installer-out/`。
 - 授权：`desktop/tools/gen_keypair.py` 生成 Ed25519 密钥对，私钥在 `desktop/tools/keys/`（已 gitignore，禁止入库），公钥 hex 写进 `backend/app/core/license_public_key.py`；`desktop/tools/gen_license.py` 签发离线 `.nptlic`。
-- 桌面模式由 launcher 注入 `NPT_DESKTOP=1` 生效；任何改动不得改变服务器（systemd）部署行为。
+- 桌面模式由 launcher 注入 `NPT_DESKTOP=1` 生效；桌面专属逻辑必须由其门控，任何改动不得改变服务器（systemd）部署行为。
+- 本机按运行模式持有两套 `data.db`（`profiles/shared/`、`profiles/standalone/`）；共享模式靠 `dataset_revisions` + `sync_state.json` 对齐，不要绕开同步链路直接改对端库。
 
 ## 部署归我
 - 前端构建与后端重启由用户手动执行（`npm run build:vite`、`systemctl restart npt-backend`），不要代跑，也不要反复请示。

@@ -11,6 +11,7 @@ import {
   PCIPage,
   NeighborPage,
   TACPage,
+  PCICheckPage,
   TACPlanningPage,
   LicensePage,
   LayerToolsPage,
@@ -105,6 +106,14 @@ function App() {
                 element={
                   <ProtectedRoute>
                     <TACPage />
+                  </ProtectedRoute>
+                }
+              />
+              <Route
+                path="/pci-check"
+                element={
+                  <ProtectedRoute>
+                    <PCICheckPage />
                   </ProtectedRoute>
                 }
               />

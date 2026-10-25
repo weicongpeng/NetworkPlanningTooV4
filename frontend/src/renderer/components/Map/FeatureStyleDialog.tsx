@@ -4,6 +4,7 @@ import { useTranslation } from 'react-i18next'
 import { useLayerEditStore, type InspectFeature } from '../../store/layerEditStore'
 import { useMapStore } from '../../store/mapStore'
 import { NO_FILL_COLOR } from '../../utils/fieldValue'
+import { wgs84ToGcj02 } from '../../utils/coordinate'
 import type { DrawGeometryType } from '@shared/types'
 
 const EARTH_R = 6378137
@@ -22,6 +23,22 @@ const DASH_OPTIONS: Array<{ value: string; key: string; fallback: string }> = [
 ]
 
 const toRad = (d: number) => (d * Math.PI) / 180
+
+/**
+ * GCJ02 → WGS84 精确逆变换（固定点迭代，与后端保存时口径一致）。
+ * 一阶近似 w = g - offset(g) 残留 0.3~2m 误差，中心点展示 6 位小数时可见，
+ * 这里迭代到往返位级一致（单点开销可忽略；共享工具保持一阶近似供 3D 批量转换）。
+ */
+function gcj02ToWgs84Exact(lat: number, lng: number): [number, number] {
+  let wLat = lat
+  let wLng = lng
+  for (let i = 0; i < 6; i++) {
+    const [fLat, fLng] = wgs84ToGcj02(wLat, wLng)
+    wLat += lat - fLat
+    wLng += lng - fLng
+  }
+  return [wLat, wLng]
+}
 
 function haversine(a: [number, number], b: [number, number]): number {
   const dLat = toRad(b[1] - a[1])
@@ -143,6 +160,11 @@ function computeStats(geometry: any): GeometryStats | null {
 
 function fmtLength(m: number, t: any): string {
   return m >= 1000 ? `${(m / 1000).toFixed(3)} km` : `${m.toFixed(2)} ${t('map.meters') || '米'}`
+}
+
+/** 周长统一千米（边界/长度类量按需求统一口径） */
+function fmtPerimeterKm(m: number): string {
+  return `${(m / 1000).toFixed(3)} km`
 }
 
 function fmtArea(m2: number): string {
@@ -282,6 +304,13 @@ export default function FeatureStyleDialog({ open, data, layerName, onClose }: F
   }, [open, onClose])
 
   const stats = useMemo(() => (open && data ? computeStats(data.geometry) : null), [open, data])
+  // 几何统计与命中几何均为渲染坐标（GCJ02），中心点展示给用户前转回 WGS84，
+  // 与地图打点/属性弹窗的展示口径一致（见 utils/coordinate.ts）
+  const centerWgs84 = useMemo(() => {
+    if (!stats?.centroid) return null
+    const [lat, lng] = gcj02ToWgs84Exact(stats.centroid[1], stats.centroid[0])
+    return [lng, lat] as [number, number]
+  }, [stats])
   const initialStyle = useMemo(() => {
     if (!data || !stats) return null
     const own = data.properties?._editStyle
@@ -345,8 +374,8 @@ export default function FeatureStyleDialog({ open, data, layerName, onClose }: F
           )}
           {stats.perimeterM !== null && (
             <>
-              <span className="text-xs text-muted-foreground">{t('map.geomPerimeter') || '周长'}</span>
-              <span className="text-xs text-foreground text-right">{fmtLength(stats.perimeterM, t)}</span>
+              <span className="text-xs text-muted-foreground">{t('map.geomPerimeter') || '周长(km)'}</span>
+              <span className="text-xs text-foreground text-right">{fmtPerimeterKm(stats.perimeterM)}</span>
             </>
           )}
           {stats.areaM2 !== null && (
@@ -355,11 +384,11 @@ export default function FeatureStyleDialog({ open, data, layerName, onClose }: F
               <span className="text-xs text-foreground text-right">{fmtArea(stats.areaM2)}</span>
             </>
           )}
-          {stats.centroid && (
+          {centerWgs84 && (
             <>
               <span className="text-xs text-muted-foreground">{t('map.geomCentroid') || '中心点'}</span>
               <span className="text-xs text-foreground text-right">
-                {stats.centroid[0].toFixed(6)}, {stats.centroid[1].toFixed(6)}
+                {centerWgs84[0].toFixed(6)}, {centerWgs84[1].toFixed(6)}
               </span>
             </>
           )}

@@ -1291,7 +1291,10 @@ export class GeoDataLayer {
    *   因此重建图层必然带上新颜色，避免不同要素类型（circleMarker/polygon）与
    *   Canvas 渲染器在 setStyle 重绘上的细微差异导致不生效。
    */
-  setStyleOverrides(settings: { fillColor: string; fillOpacity: number; borderWidth: number; borderColor: string; pointSize?: number }): void {
+  setStyleOverrides(settings: { fillColor: string; fillOpacity: number; borderWidth: number; borderColor: string; pointSize?: number } | null): void {
+    // null = 清除图层级颜色覆盖：恢复到逐要素自带样式（_mergeStyleOverrides 在
+    // styleOverrides 为 null 时自然回退 baseStyle）。设置弹窗"取消实时预览"时用它还原，
+    // 不能拿弹窗构造的文件默认样式顶替——文件级 defaultStyle 并不参与渲染链，颜色可能不一致。
     this.styleOverrides = settings
 
     // 未渲染/不可见时仅保存覆盖，几何由后续 addTo/_reRenderGeometries 统一按新覆盖渲染

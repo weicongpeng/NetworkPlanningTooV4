@@ -212,6 +212,7 @@ FastAPI (backend/app/)
 | `/pci` | `PCIPage` | PCI 规划 |
 | `/neighbor` | `NeighborPage` | 邻区规划 |
 | `/tac` | `TACPage` | TAC 核查 |
+| `/pci-check` | `PCICheckPage` | PCI 核查（复用距离/冲突/混淆/同站模3/对打模3/NR模30） |
 | `/tac-planning` | `TACPlanningPage` | TAC 规划 |
 | `/map` | `MapPage` | 地图工具（在线/离线、搜索、图层、绘制、编辑） |
 | `/layer` | `LayerToolsPage` | 图层制作（Excel → TAB/MIF/KML） |

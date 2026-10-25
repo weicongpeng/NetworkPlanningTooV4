@@ -632,6 +632,8 @@ async def save_layer_data(
 ) -> Dict[str, Any]:
     """保存图层编辑结果（整层重写 TAB）。请求体 {geojson: FeatureCollection}（坐标为 GCJ02）。
 
+    可选字段 drop_fields: string[] —— 整列删除（"更新表"把无单位旧列换成带单位列时用）。
+
     支持 gzip 压缩请求体（Content-Encoding: gzip，前端大图层保存默认压缩）。
     按 gzip 魔数检测而非仅看请求头：中间代理解压后可能残留请求头，魔数检测两边都兼容。
     """
@@ -655,8 +657,13 @@ async def save_layer_data(
             geojson = payload.get("geojson")
             if not isinstance(geojson, dict):
                 raise ValueError("缺少 geojson 要素集合或 patch 增量")
+            # 可选：整列删除（"更新表"用带单位列替换历史无单位列时清理旧列）
+            raw_drop = payload.get("drop_fields") or payload.get("dropFields") or []
+            if not isinstance(raw_drop, list):
+                raise ValueError("drop_fields 必须是字段名数组")
+            drop_fields = [str(c) for c in raw_drop if str(c).strip()]
             result = await run_in_threadpool(
-                save_layer_geojson, data_id, layer_id, geojson, current_user.id
+                save_layer_geojson, data_id, layer_id, geojson, current_user.id, drop_fields
             )
         import app.api.v1.endpoints.map as map_module
         map_module.invalidate_map_data_cache()
@@ -1438,14 +1445,15 @@ async def complete_chunked_upload(
                 with open(json_path, 'w', encoding='utf-8') as f:
                     json.dump(parse_result['data'], f, ensure_ascii=False, indent=2)
 
+                metadata = {'pointCount': parse_result['pointCount']}
+                if parse_result.get('importWarnings'):
+                    metadata['importWarnings'] = parse_result['importWarnings']
                 data_service.index[data_id].update({
                     'geometryType': parse_result['geometryType'],
                     'sourceType': 'excel',
                     'size': len(str(parse_result['data'])),
                     'status': 'ready',
-                    'metadata': {
-                        'pointCount': parse_result['pointCount']
-                    }
+                    'metadata': metadata
                 })
                 data_service._save_index()
                 data_service._bump_revision(data_id)  # 桌面共享模式：新数据需上行到服务器

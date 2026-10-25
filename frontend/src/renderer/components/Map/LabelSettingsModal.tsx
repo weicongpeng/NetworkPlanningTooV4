@@ -1636,10 +1636,9 @@ export function LabelSettingsModal({
   /**
    * 预览的**页签基线**：切到某个页签时只记录当前签名、**不下发**。
    *
-   * 没有它时，"打开弹窗 → 点开颜色页签"就会把弹窗里的默认配色当成一次实时预览写到
-   * 地图上（并写进 store）—— 用户并没有保存任何设置，地图配色却变了（用户明确要求
-   * "没保存设置时地图原配色不能改变"）。实时预览语义保留：只有**在同一页签内**改动
-   * 控件才下发。
+   * 没有它时，"打开弹窗 → 点开颜色页签"就会把弹窗里的初始值当成一次实时预览下发到
+   * 地图上—— 用户并未修改任何控件，地图却变了。实时预览语义保留：只有**在同一页签内**
+   * 控件实际改动才下发（下发仅作用于渲染，不写持久化 store）。
    */
   const previewTabBaselineRef = useRef<{ kind: string; sig: string }>({ kind: '', sig: '' })
   /**
@@ -1648,10 +1647,22 @@ export function LabelSettingsModal({
    * 不改变地图/不冒标签。
    */
   const previewSuppressRef = useRef(false)
+  /** 预览 debounce 计时器与已排期签名：独立于 effect 生命周期，父级重渲染不会把它饿死 */
+  const previewTimerRef = useRef<number | null>(null)
+  const previewPendingRef = useRef<string | null>(null)
+
+  const clearPreviewTimer = () => {
+    if (previewTimerRef.current !== null) {
+      window.clearTimeout(previewTimerRef.current)
+      previewTimerRef.current = null
+    }
+    previewPendingRef.current = null
+  }
 
   // 打开：置抑制并记录初始基线，350ms 后解除（覆盖表单同步）；关闭：复位
   useEffect(() => {
     if (isOpen) {
+      clearPreviewTimer()
       previewSuppressRef.current = true
       previewBaselineRef.current = previewSig(buildPreviewTarget())
       // 页签基线清空：打开后第一次评估只记录（切页/初始化都不下发）
@@ -1659,14 +1670,25 @@ export function LabelSettingsModal({
       const release = window.setTimeout(() => { previewSuppressRef.current = false }, 350)
       return () => window.clearTimeout(release)
     }
+    clearPreviewTimer()
     previewSuppressRef.current = false
     previewBaselineRef.current = ''
     previewTabBaselineRef.current = { kind: '', sig: '' }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isOpen])
 
-  // 实时预览：仅签名实际变化（用户改值/切页）且不在初始化抑制期时 debounce 下发；
-  // 下发引起的父级重渲染签名与基线相同 → 不再下发，循环终止。cleanup 清旧定时器。
+  // 卸载兜底：清掉尚未下发的预览定时器
+  useEffect(() => () => {
+    if (previewTimerRef.current !== null) {
+      window.clearTimeout(previewTimerRef.current)
+      previewTimerRef.current = null
+    }
+    previewPendingRef.current = null
+  }, [])
+
+  // 实时预览：仅签名实际变化（用户改值/切页）且不在初始化抑制期时 debounce 下发。
+  // 用独立 ref 计时器（而非 effect cleanup）排期：父级重渲染会重跑本 effect，
+  // 若在 cleanup 里清计时器，持续重渲染会不断推迟甚至吞掉预览。
   useEffect(() => {
     if (!isOpen) return
     const target = buildPreviewTarget()
@@ -1674,14 +1696,29 @@ export function LabelSettingsModal({
     // 换了页签（或打开后的首次评估）：只记录基线，不下发 —— 见 previewTabBaselineRef 注释
     const tab = previewTabBaselineRef.current
     if (tab.kind !== target.kind) {
+      clearPreviewTimer()
       previewTabBaselineRef.current = { kind: target.kind, sig }
       previewBaselineRef.current = sig
       return
     }
-    if (sig === previewBaselineRef.current) return
-    previewBaselineRef.current = sig
-    if (previewSuppressRef.current) return
-    const timer = window.setTimeout(() => {
+    if (sig === previewBaselineRef.current) {
+      clearPreviewTimer()
+      return
+    }
+    if (previewSuppressRef.current) {
+      clearPreviewTimer()
+      previewBaselineRef.current = sig
+      return
+    }
+    // 同一签名已排期：保持现有计时器，不因无关重渲染重新计时
+    if (sig === previewPendingRef.current) return
+    clearPreviewTimer()
+    previewPendingRef.current = sig
+    previewTimerRef.current = window.setTimeout(() => {
+      // 基线只在**真正下发时**推进：避免"下发→父级重渲染→误判签名未变"
+      previewTimerRef.current = null
+      previewPendingRef.current = null
+      previewBaselineRef.current = sig
       switch (target.kind) {
         case 'label': onPreview?.(target.payload); break
         case 'color': onPreviewColor?.(target.payload); break
@@ -1689,7 +1726,6 @@ export function LabelSettingsModal({
         case 'heatmap': onPreviewHeatmap?.(target.payload); break
       }
     }, 200)
-    return () => window.clearTimeout(timer)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   })
 

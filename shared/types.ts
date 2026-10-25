@@ -307,7 +307,7 @@ export interface NeighborConfig {
   outdoorToIndoorMaxDistance?: number  // 室外→室分最大距离（公里），默认0.6
   indoorToIndoorRadius?: number    // 室分→室分距离（公里），默认0.35
   indoorToOutdoorMultiplier?: number   // 室分→室外全量半径倍数，默认1.5
-  outdoorSpacingSiteCount?: number // 室外源站间距取最近N个室外站，默认9
+  outdoorSpacingSiteCount?: number // 室外源站间距取最近N个室外站，默认11
   customRules?: NeighborRule[]
   selectedCellIds?: string[]  // 选中的小区ID列表（格式：siteId_sectorId）
 }
@@ -384,13 +384,13 @@ export interface TACResult {
   error?: string
 }
 
-/** 因工参数据不全（缺经纬度/缺ID）或工参中未找到而被跳过核查/规划的小区 */
+/** 因工参数据不全（缺经纬度/缺ID/缺PCI）或工参中未找到而被跳过核查/规划的小区 */
 export interface SkippedCellInfo {
   siteId?: string
   siteName?: string
   sectorId?: string
   sectorName?: string
-  reason: 'missing_coordinates' | 'missing_ids' | 'not_in_params'
+  reason: 'missing_coordinates' | 'missing_ids' | 'missing_pci' | 'not_in_params'
 }
 
 export interface CellTACResult {

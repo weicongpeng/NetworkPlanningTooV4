@@ -137,8 +137,9 @@ class GeoDataService:
         # 根据几何类型提取数据
         if geometry_type == "polygon":
             geo_data = self._extract_polygon_data(df, fields)
+            coord_zero_count = 0
         else:
-            geo_data = self._extract_data(df, fields)
+            geo_data, coord_zero_count = self._extract_data(df, fields)
 
         # 验证提取结果
         if len(geo_data) == 0:
@@ -149,6 +150,13 @@ class GeoDataService:
                 f"  • 坐标值格式不正确\n"
                 f"  • 数据被过滤（如非数值类型）"
             )
+
+        # 非致命提醒：坐标缺失/为 0 的小区仍保留（与原工参导入的 coord_zero 约定一致），
+        # 但会落在原点并撑大地图/热力范围，前端据此提示用户修正源文件
+        import_warnings = (
+            [{"code": "coord_zero", "count": coord_zero_count}]
+            if coord_zero_count else []
+        )
 
         # 元数据入库（阶段 0 双写）
         _save_geo_file_metadata(
@@ -163,6 +171,7 @@ class GeoDataService:
             geo_id=geo_id,
             city=city,
             operator=operator,
+            import_warnings=import_warnings,
         )
 
         return {
@@ -170,6 +179,7 @@ class GeoDataService:
             "fields": fields,
             "data": geo_data,
             "pointCount": len(geo_data),
+            "importWarnings": import_warnings,
         }
 
     def _read_file(self, file_path: str) -> pd.DataFrame:
@@ -254,8 +264,13 @@ class GeoDataService:
 
     def _extract_data(
         self, df: pd.DataFrame, fields: Dict[str, Any]
-    ) -> List[Dict[str, Any]]:
-        """提取并转换坐标数据（numpy 向量化优化版）"""
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        """提取并转换坐标数据（numpy 向量化优化版）
+
+        Returns:
+            (有效数据行, 经纬度为 0 的有效行数)。坐标缺失的行直接丢弃；
+            为 0 的行按历史约定保留并由调用方生成 coord_zero 提醒。
+        """
         import numpy as np
 
         lon_col = fields["longitude"]
@@ -274,7 +289,9 @@ class GeoDataService:
         valid_indices = np.where(valid_mask)[0]
 
         if len(valid_indices) == 0:
-            return []
+            return [], 0
+        # 与全量工参 coord_zero 口径一致：经度或纬度为 0 均视为缺失
+        coord_zero_count = int(np.sum(((lons == 0) | (lats == 0)) & valid_mask))
 
         # 2. 向量化批量坐标转换（比逐行 math 快 10-50 倍）
         gcj_lats, gcj_lngs = CoordinateTransformer.wgs84_to_gcj02_batch(
@@ -347,7 +364,7 @@ class GeoDataService:
 
             result.append(point)
 
-        return result
+        return result, coord_zero_count
 
     def _parse_polygon(self, polygon_str: str) -> Tuple[bool, str, List[List[float]]]:
         """
@@ -486,8 +503,13 @@ def _save_geo_file_metadata(
     geo_id: Optional[str] = None,
     city: Optional[str] = None,
     operator: Optional[str] = None,
+    import_warnings: Optional[List[Dict[str, Any]]] = None,
 ):
-    """保存地理化数据文件元数据到 SQLite"""
+    """保存地理化数据文件元数据到 SQLite
+
+    import_warnings=None 表示尚未检查（存量/旧端解包），启动回填会补算；
+    空列表表示已检查且无提醒。
+    """
     db = SessionLocal()
     try:
         geo = GeoFile(
@@ -502,6 +524,10 @@ def _save_geo_file_metadata(
             point_count=point_count,
             bbox=json.dumps(bbox) if bbox else None,
             file_size=file_size,
+            import_warnings=(
+                json.dumps(import_warnings, ensure_ascii=False)
+                if import_warnings is not None else None
+            ),
             created_at=datetime.now().isoformat(),
         )
         db.add(geo)

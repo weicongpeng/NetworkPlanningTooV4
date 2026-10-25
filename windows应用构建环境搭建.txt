@@ -1,0 +1,90 @@
+Runner 部署本身完全成功（online、busy=false、Listening for Jobs、开机自启都正常）。智能体提示的"不能在本机构建安装包"不是部署报错，而是一个正确的架构判断。问题出在两层：路由层和工具链层。
+
+一、第一层：路由层——这个 workflow 根本不会选中你的 Linux Runner
+看你的 build-windows-desktop.yml：
+
+runs-on: ${{ vars.NPT_WINDOWS_RUNNER || 'windows-latest' }}
+变量 NPT_WINDOWS_RUNNER 未设置时，回退到 windows-latest = GitHub 托管的 Windows Runner（继续吃你那 2000 分钟配额）；
+即使设置了，也得指向一个 Windows Runner 的标签；
+你这台 Linux Runner 的标签是 self-hosted, Linux, X64, npt-linux-builder，永远匹配不上这条 runs-on。
+所以现状是：Linux Runner 在线待命，但 Windows 构建任务要么跑在托管 Runner 上（烧配额），要么你手动改 runs-on 指过来后在下一步直接失败——因为第二层问题。
+
+二、第二层：工具链层——这套技术栈在 Linux 上"物理上"产不出 Windows 安装包
+你的构建链是 PowerShell 脚本 + Windows 版 GDAL + PyInstaller + Inno Setup，每一环都是 Windows 绑定的：
+
+表格
+环节	能否在 Linux 上交叉产出 Windows 产物
+PyInstaller
+❌ 官方明确不支持交叉编译：它打包的是"当前运行环境"的解释器和 DLL，Linux 上只能产出 Linux 二进制
+Windows GDAL 二进制/wheel
+❌ 需要 Windows 原生库，Linux 上的 GDAL 是另一套 .so
+Inno Setup
+⚠️ 理论上可借 Wine 跑，但非官方支持，签名/字体/路径问题多
+PowerShell 构建脚本
+⚠️ pwsh 有 Linux 版，但脚本里的盘符路径、注册表、Windows API 调用全部失效
+关键认知：PyInstaller 不是交叉编译器。这和 Go/Rust/.NET 那种"Linux 上出 .exe"完全不同——Python 打包类项目要出 Windows exe，必须在 Windows 上跑 PyInstaller。所以智能体的提示是准确的，不是它部署错了。
+
+三、正确姿势：双 Runner 分工，而不是让 Linux 硬扛
+Linux Runner (npt-linux-builder)      Windows Runner (npt-windows-builder)
+├── 单元测试 / lint                    ├── PyInstaller 打包 exe
+├── Linux 版产物 / wheel               ├── Windows GDAL 绑定
+├── Web 前端 / 文档构建                ├── Inno Setup 编译安装包
+└── 代码检查、镜像构建                 └── signtool 签名（如有）
+workflow 改成显式分流（或利用现有变量零改动分流，见下）：
+
+jobs:
+  build-linux:
+    runs-on: [self-hosted, linux, npt-linux-builder]
+    steps: [...]
+
+  build-windows-installer:
+    runs-on: ${{ vars.NPT_WINDOWS_RUNNER || 'windows-latest' }}
+    steps: [...]   # 原有 PowerShell/PyInstaller/Inno 步骤不动
+四、Windows Runner 从哪来（你这台 Linux 主机就能解决）
+方案 A（推荐）：在同一台 Linux 主机上用 KVM 开 Windows 虚拟机
+你的主机是 Z790 桌面平台，性能足够跑构建 VM：
+
+# 1. 装虚拟化组件
+sudo apt install -y qemu-kvm virt-manager virtinst ovmf
+
+# 2. 建 Windows VM（4核8G、80G盘足够构建用）
+virt-install \
+  --name win-runner \
+  --ram 8192 --vcpus 4 \
+  --disk path=/var/lib/libvirt/images/win-runner.qcow2,size=80 \
+  --cdrom /path/to/Win10_11.iso \
+  --os-variant win11 \
+  --network network=default \
+  --graphics spice --boot uefi
+VM 装好后，把智能体保留的 deploy-windows-runner.ps1 拷进去执行，注册时加标签：
+
+.\config.cmd --url https://github.com/weicongpeng/NetworkPlanningTooV4 `
+  --token XXXX --labels self-hosted,Windows,X64,npt-windows-builder
+.\config.cmd install    # 装成 Windows 服务常驻
+方案 B：闲置 Windows 笔记本 / 云 Windows 主机
+直接在那台机器上跑同一个 ps1 脚本即可，效果等价。
+
+方案 C（不推荐）：Linux + Wine 硬跑 Inno Setup
+只能解决安装包编译一环，PyInstaller 那步仍是死路，别在这条路上耗时间。
+
+五、让现有 workflow 零改动切到自托管 Windows Runner
+Windows Runner 上线后，设置仓库变量，把流量从托管 Runner（烧配额）切到自托管（免费）：
+
+gh variable set NPT_WINDOWS_RUNNER --body "npt-windows-builder"
+# 或网页：仓库 Settings → Secrets and variables → Actions → Variables → New
+这样 ${{ vars.NPT_WINDOWS_RUNNER || 'windows-latest' }} 会解析成 npt-windows-builder，YAML 一行不用改，Windows 构建立刻落到你的 VM Runner 上，不再消耗 2000 分钟配额。
+
+六、验证清单
+# 1. 两台 Runner 都应在线
+#    仓库 Settings → Actions → Runners：
+#    npt-linux-builder (Linux)  ✅ online
+#    npt-windows-builder (Windows) ✅ online
+
+# 2. 触发一次构建，确认分流正确
+gh run watch
+
+# 3. 看任务落在哪台：Run 详情页每个 job 会显示 Runner 名字
+#    build-linux → pwc-BATTLE-AX-...-linux
+#    build-windows-installer → 你的 Windows VM 主机名
+一句话总结
+不是部署坏了，是分工错了：Linux Runner 部署成功但它天生产不出 Windows 安装包（PyInstaller/Inno Setup/Windows GDAL 都不支持交叉构建），而你的 workflow 路由表达式也压根不会把任务派给它。解法 = 在同一台 Linux 主机上用 KVM 开一台 Windows VM 装第二个自托管 Runner（deploy-windows-runner.ps1 现成可用），再用仓库变量 NPT_WINDOWS_RUNNER 把 Windows 构建指过去、Linux 任务显式用 npt-linux-builder 标签——配额和构建能力两个问题同时解决。

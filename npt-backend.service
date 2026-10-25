@@ -16,8 +16,8 @@ Environment=NPT_RELOAD=false
 Environment=NPT_WORKERS=1
 
 OOMScoreAdjust=-500
-MemoryMax=2G
-MemoryHigh=1.5G
+MemoryMax=4G
+MemoryHigh=3G
 
 StandardOutput=append:/var/log/npt-backend.log
 StandardError=append:/var/log/npt-backend.log

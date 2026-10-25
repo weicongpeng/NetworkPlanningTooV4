@@ -221,3 +221,35 @@ def test_delete_task_removes_sidecar(index_env):
 
     assert manager.delete_task(task.task_id) is True
     assert not sidecar.exists()
+
+
+def test_progress_meta_never_returns_full_results(index_env):
+    """进度轮询只回摘要：完成时也不得把 results 大数组塞进响应。"""
+    legacy = _write_legacy_index(index_env["path"], count=1, blob="x" * 10)
+    manager = index_env["manager_cls"]()
+    manager.migrate_legacy_index_if_needed()
+    task_id = next(iter(legacy))
+
+    meta = manager.get_task_progress_meta(task_id)
+    assert meta["status"] == "completed"
+    assert "results" not in meta
+
+    # 重启后结果已外置：取进度摘要时不得触发大结果装载
+    reloaded = index_env["manager_cls"]()
+    assert reloaded.tasks[task_id].result is None
+    reloaded_meta = reloaded.get_task_progress_meta(task_id)
+    assert "results" not in reloaded_meta
+    assert reloaded.tasks[task_id].result is None
+
+
+def test_sanitize_result_in_place_avoids_copy():
+    """大结果清洗必须原地修改，不能再复制一份（否则 200MB JSON 会翻倍成 2GB）。"""
+    from app.services.task_manager import TaskManager
+
+    payload = {"a": float("nan"), "b": [float("inf"), 1.0], "c": {"d": 2.0}}
+    result = TaskManager._sanitize_result(payload)
+    assert result is payload
+    assert payload["a"] is None
+    assert payload["b"][0] is None
+    assert payload["b"][1] == 1.0
+    assert payload["c"]["d"] == 2.0

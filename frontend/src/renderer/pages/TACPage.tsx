@@ -103,6 +103,17 @@ export function TACPage() {
   const [resultLoading, setResultLoading] = useState(false) // 结果页加载动画
   const [selectedCount, setSelectedCount] = useState(0) // 历史任务已选中条数（供页签栏「删除」置灰判断）
 
+  // ===== 分页结果 =====
+  const [pagedTotal, setPagedTotal] = useState(0)
+  const [pagedPage, setPagedPage] = useState(1)
+  const [pagedLoading, setPagedLoading] = useState(false)
+  const [pagedPreparing, setPagedPreparing] = useState(false)
+  const [pagedRequest, setPagedRequest] = useState<{ taskId: string; summary?: any } | null>(null)
+  const [mapRows, setMapRows] = useState<any[]>([])
+  const pagedTaskIdRef = useRef<string | null>(null)
+  const pagedPollRef = useRef<number | null>(null)
+  const TAC_PAGE_SIZE = 200
+
   // 从 taskStore 恢复最近的任务结果，行为与 PCI/邻区规划一致
   const t0 = performance.now()
   const latestTACCheckTask = getLatestTACCheckTask()
@@ -124,7 +135,7 @@ export function TACPage() {
       console.timeEnd('[TACPage] effect:sync-store')
       return
     }
-    if (latestTACCheckTask && latestTACCheckTask.result && latestTACCheckTask.result.results) {
+    if (latestTACCheckTask && latestTACCheckTask.result) {
       setLocalTaskResult(latestTACCheckTask.result as TACResultData)
     }
     console.log('[TACPage] 效果:sync-store fired, tStore=', tStore.toFixed(1), 'ms', 'hasTask=', !!latestTACCheckTask)
@@ -180,30 +191,12 @@ export function TACPage() {
         await syncHistoryFromBackend('tac_check')
         if (!isLoadingResultRef.current) return
         const latest = getLatestTACCheckTask()
-        if (latest && latest.result) {
-          // 如果缺少完整 results（来自 resultSummary），尝试从 API 重新获取
-          if (!latest.result.results && latest.id) {
-            try {
-              const response = await tacApi.getResult(latest.id)
-              if (!isLoadingResultRef.current) return
-              if (response?.success && response?.data?.results) {
-                const fullResult = response.data as TACResultData
-                setLocalTaskResult(fullResult)
-                tacDataSyncService.setTACResults({ results: fullResult.results })
-                if (isLoadingResultRef.current) setWizardStep('completed')
-                return
-              }
-            } catch (fetchErr: any) {
-              console.warn('[TACPage] 获取完整核查结果失败，使用缓存摘要:', fetchErr?.message)
-            }
-          }
-          if (!isLoadingResultRef.current) return
-          // 有完整 results 或 API 获取失败时使用已有结果
+        if (latest?.status === 'completed' && latest.result) {
           setLocalTaskResult(latest.result as TACResultData)
-          if (latest.result.results) {
-            tacDataSyncService.setTACResults({ results: latest.result.results })
+          setWizardStep('completed')
+          if (pagedTaskIdRef.current !== latest.id) {
+            setPagedRequest({ taskId: latest.id, summary: latest.result })
           }
-          if (isLoadingResultRef.current) setWizardStep('completed')
         }
       }
       loadLatest().finally(() => {
@@ -381,13 +374,14 @@ export function TACPage() {
       return
     }
 
-    if (taskResult?.status === 'completed' && taskResult.results) {
+    const rowsForMap = mapRows.length > 0 ? mapRows : (taskResult?.results || [])
+    if (taskResult?.status === 'completed' && rowsForMap.length > 0) {
       console.log('[TACPage] 任务完成，同步数据并初始化地图')
       const taskNetworkType = taskResult.networkType || config?.networkType || 'LTE'
 
       // 预加载所有TAC颜色，确保图例能立即显示
       const uniqueTACs = new Set<string>()
-      taskResult.results.forEach((cell: any) => {
+      rowsForMap.forEach((cell: any) => {
         if (cell.tac) uniqueTACs.add(String(cell.tac))
         if (cell.existingTac) uniqueTACs.add(String(cell.existingTac))
       })
@@ -397,7 +391,7 @@ export function TACPage() {
       })
 
       tacDataSyncService.setTACResults({
-        results: taskResult.results,
+        results: rowsForMap,
         singularityCount: taskResult.singularityCount || 0
       })
 
@@ -409,7 +403,7 @@ export function TACPage() {
       }
     }
     console.timeEnd('[TACPage] effect:resultSync')
-  }, [taskResult?.status, taskResult?.results])
+  }, [taskResult?.status, taskResult?.results, mapRows])
 
   // 地图扇区点击处理
   const handleMapSectorClick = (sector: any) => {
@@ -618,43 +612,12 @@ export function TACPage() {
     }
   }
 
-  // 从历史任务查看 - 跳转到结果页并自动打开地图
-  const handleViewTask = async (task: any) => {
-    try {
-      const response = await tacApi.getResult(task.id)
-      if (response?.success && response?.data) {
-        const result = response.data as TACResultData
-        viewedTaskIdRef.current = task.id // 必须在 setActiveTaskId 之前设置！
-        setLocalTaskResult(result)
-        setActiveTaskId('tac_check', task.id)
-        setActiveLeftTab('planning-result')
-        setShowMap(true)
-        if (result.results) {
-          // 🔥 修复：查看历史任务时确保 sync service 已初始化，
-          // 否则点击结果行时 findSector 无数据可查，地图不渲染
-          await ensureTacSyncService().catch(() => {})
-          const taskNetworkType = result.networkType || config?.networkType || 'LTE'
-          const uniqueTACs = new Set<string>()
-          result.results.forEach((cell: any) => {
-            if (cell.tac) uniqueTACs.add(String(cell.tac))
-            if (cell.existingTac) uniqueTACs.add(String(cell.existingTac))
-          })
-          uniqueTACs.forEach(tac => {
-            tacColorMapper.getColor(tac, taskNetworkType)
-          })
-          tacDataSyncService.setTACResults({
-            results: result.results,
-            singularityCount: result.singularityCount || 0
-          })
-          if (mapRef.current) {
-            mapRef.current.setSectorIdWhitelist(null, 'tac-check', taskNetworkType)
-          }
-        }
-      }
-    } catch (err: any) {
-      console.error('加载TAC核查结果失败:', err)
-      setError('加载核查结果失败: ' + (err.message || '未知错误'))
-    }
+  // 从历史任务查看 - 先切到结果页，再分页加载
+  const handleViewTask = (task: any) => {
+    setActiveTaskId('tac_check', task.id)
+    setActiveLeftTab('planning-result')
+    setShowMap(true)
+    loadPagedResult(task.id, task.result)
   }
 
   // 搜索功能状态
@@ -772,6 +735,169 @@ export function TACPage() {
       [field]: value
     }))
   }
+
+  // ===== 分页结果加载 =====
+  const activeFilters = useMemo(() => {
+    if (!searchEnabled) return {}
+    return Object.fromEntries(
+      Object.entries(searchFilters).filter(([, value]) => String(value || '').trim() !== '')
+    )
+  }, [searchEnabled, searchFilters])
+  const activeFiltersRef = useRef<Record<string, string>>({})
+  activeFiltersRef.current = activeFilters
+
+  const fetchPagedRows = useCallback(async (
+    targetTaskId: string,
+    page: number,
+    filters: Record<string, string>
+  ): Promise<boolean> => {
+    setPagedLoading(true)
+    try {
+      const response = await tacApi.getResultRows(targetTaskId, page, TAC_PAGE_SIZE, filters)
+      const data = response?.data
+      if (!response?.success || !data) return true
+      if (data.preparing) {
+        setPagedPreparing(true)
+        return false
+      }
+      setPagedPreparing(false)
+      setFilteredResults(Array.isArray(data.rows) ? data.rows : [])
+      setPagedTotal(Number(data.total) || 0)
+      setPagedPage(Number(data.page) || page)
+      return true
+    } catch (err: any) {
+      console.warn('[TACPage] 加载分页结果失败:', err?.message)
+      return true
+    } finally {
+      setPagedLoading(false)
+    }
+  }, [])
+
+  const mapLoadedTaskRef = useRef<string | null>(null)
+  const loadMapRows = useCallback(async (targetTaskId: string) => {
+    if (mapLoadedTaskRef.current === targetTaskId) return
+    try {
+      const response = await tacApi.getResultMap(targetTaskId)
+      if (response?.success && Array.isArray(response.data?.rows)) {
+        mapLoadedTaskRef.current = targetTaskId
+        setMapRows(response.data.rows)
+      }
+    } catch (err: any) {
+      console.warn('[TACPage] 加载地图结果失败:', err?.message)
+    }
+  }, [])
+
+  const schedulePagedPollRef = useRef<(taskId: string) => void>(() => {})
+  const schedulePagedPoll = useCallback((targetTaskId: string) => {
+    if (pagedPollRef.current) return
+    pagedPollRef.current = window.setTimeout(async () => {
+      pagedPollRef.current = null
+      if (pagedTaskIdRef.current !== targetTaskId) return
+      try {
+        const metaResponse = await tacApi.getResultMeta(targetTaskId)
+        if (metaResponse?.data?.rowsReady) {
+          if (metaResponse.data.summary) {
+            setLocalTaskResult({
+              ...metaResponse.data.summary,
+              taskId: targetTaskId,
+              status: 'completed',
+            } as TACResultData)
+          }
+          const ready = await fetchPagedRows(targetTaskId, 1, activeFiltersRef.current)
+          if (!ready) schedulePagedPollRef.current(targetTaskId)
+          loadMapRows(targetTaskId)
+        } else {
+          schedulePagedPollRef.current(targetTaskId)
+        }
+      } catch {
+        schedulePagedPollRef.current(targetTaskId)
+      }
+    }, 1000)
+  }, [fetchPagedRows, loadMapRows])
+  useEffect(() => {
+    schedulePagedPollRef.current = schedulePagedPoll
+  }, [schedulePagedPoll])
+  useEffect(() => () => {
+    if (pagedPollRef.current) {
+      window.clearTimeout(pagedPollRef.current)
+      pagedPollRef.current = null
+    }
+  }, [])
+
+  const loadPagedResult = useCallback(async (targetTaskId: string, fallbackSummary?: any) => {
+    if (!targetTaskId) return
+    if (pagedPollRef.current) {
+      window.clearTimeout(pagedPollRef.current)
+      pagedPollRef.current = null
+    }
+    pagedTaskIdRef.current = targetTaskId
+    viewedTaskIdRef.current = targetTaskId
+    mapLoadedTaskRef.current = null
+    setMapRows([])
+    setFilteredResults([])
+    setPagedTotal(0)
+    setPagedPage(1)
+    setPagedPreparing(false)
+    setResultLoading(true)
+    try {
+      const response = await tacApi.getResultMeta(targetTaskId)
+      const meta = response?.data
+      if (!meta) {
+        setError(t('tac.getResultFailed') || '获取核查结果失败')
+        return
+      }
+      setLocalTaskResult({
+        ...(meta.summary || fallbackSummary || {}),
+        taskId: targetTaskId,
+        status: 'completed',
+      } as TACResultData)
+      setWizardStep('completed')
+      await ensureTacSyncService().catch(() => {})
+      if (meta.rowsReady) {
+        const ready = await fetchPagedRows(targetTaskId, 1, activeFiltersRef.current)
+        if (ready) await loadMapRows(targetTaskId)
+        else schedulePagedPollRef.current(targetTaskId)
+      } else {
+        setPagedPreparing(true)
+        schedulePagedPollRef.current(targetTaskId)
+      }
+    } catch (err: any) {
+      setError(`${t('tac.loadResultFailed') || '加载核查结果失败'}: ${err?.message || ''}`)
+    } finally {
+      setResultLoading(false)
+    }
+  }, [ensureTacSyncService, fetchPagedRows, loadMapRows, t])
+
+  useEffect(() => {
+    if (!pagedRequest) return
+    const request = pagedRequest
+    setPagedRequest(null)
+    loadPagedResult(request.taskId, request.summary)
+  }, [pagedRequest, loadPagedResult])
+
+  // 任务完成后自动进入分页结果
+  useEffect(() => {
+    if (taskResult?.status !== 'completed' || (taskResult as any).results) return
+    const targetTaskId = taskResult.taskId || taskId
+    if (!targetTaskId || pagedTaskIdRef.current === targetTaskId) return
+    setPagedRequest({ taskId: targetTaskId, summary: taskResult })
+  }, [taskResult?.status, taskResult?.taskId, taskResult?.results, taskId])
+
+  // 搜索条件变化：防抖后服务端查询
+  useEffect(() => {
+    const targetTaskId = pagedTaskIdRef.current
+    if (!targetTaskId || pagedPreparing) return
+    const timer = window.setTimeout(() => {
+      fetchPagedRows(targetTaskId, 1, activeFiltersRef.current)
+    }, 300)
+    return () => window.clearTimeout(timer)
+  }, [searchFilters, searchEnabled, pagedPreparing, fetchPagedRows])
+
+  const goToPagedPage = useCallback((page: number) => {
+    const targetTaskId = pagedTaskIdRef.current
+    if (!targetTaskId || page < 1) return
+    fetchPagedRows(targetTaskId, page, activeFiltersRef.current)
+  }, [fetchPagedRows])
 
   // 虚拟滚动状态
   const [scrollTop, setScrollTop] = useState(0)
@@ -1234,7 +1360,13 @@ export function TACPage() {
                           </div>
                         </div>
                       )}
-                      {taskResult.status === 'completed' && taskResult.results && (
+                      {taskResult.status === 'completed' && (
+                        (taskResult as any).results ||
+                        filteredResults.length > 0 ||
+                        pagedPreparing ||
+                        pagedLoading ||
+                        resultLoading
+                      ) && (
                         <div className="flex-1 min-h-0 flex flex-col overflow-hidden">
                           <div className="flex justify-end items-center gap-2 mb-3 shrink-0">
                             {taskResult.status === 'completed' && (
@@ -1311,7 +1443,6 @@ export function TACPage() {
                                     networkType: '', longitude: '', latitude: '', tac: '', existingTac: '',
                                     tacConsistent: '', isSingularity: '', suggestedTac: '', matched: ''
                                   })
-                                  setFilteredResults([])
                                 }
                                 setSearchEnabled(!searchEnabled)
                               }}
@@ -1331,6 +1462,18 @@ export function TACPage() {
                               {t('tac.showMap') || '地图展示'}
                             </button>
                           </div>
+                          {pagedPreparing && (
+                            <div className="flex items-center gap-2 px-3 py-2 mb-2 text-xs text-muted-foreground bg-muted/40 rounded-md shrink-0">
+                              <Loader2 size={14} className="animate-spin" />
+                              {t('tac.preparingResult') || '正在准备结果明细（首次查看大结果约需数秒）...'}
+                            </div>
+                          )}
+                          {pagedLoading && filteredResults.length === 0 && !pagedPreparing && (
+                            <div className="flex items-center gap-2 px-3 py-2 mb-2 text-xs text-muted-foreground shrink-0">
+                              <Loader2 size={14} className="animate-spin" />
+                              {t('common.loading') || '加载中...'}
+                            </div>
+                          )}
                           <div ref={tableContainerRef} onScroll={handleScroll}
                             className="overflow-x-auto overflow-y-auto flex-1 min-h-0">
                     <table className="w-full text-xs border-collapse table-fixed">
@@ -1517,6 +1660,33 @@ export function TACPage() {
                       </tbody>
                     </table>
                   </div>
+                  {!(taskResult as any).results && pagedTotal > 0 && (
+                    <div className="flex items-center justify-between px-4 py-2 border-t border-border bg-card shrink-0">
+                      <span className="text-xs text-muted-foreground">
+                        {t('common.historyTotal', { defaultValue: '共 {{total}} 条' }).replace('{{total}}', String(pagedTotal))}
+                        {' · '}
+                        {t('common.pageInfo', { defaultValue: '第 {{page}} / {{totalPages}} 页' })
+                          .replace('{{page}}', String(pagedPage))
+                          .replace('{{totalPages}}', String(Math.max(1, Math.ceil(pagedTotal / TAC_PAGE_SIZE))))}
+                      </span>
+                      <div className="flex items-center gap-2">
+                        <button
+                          onClick={() => goToPagedPage(pagedPage - 1)}
+                          disabled={pagedPage <= 1 || pagedLoading}
+                          className="px-2.5 py-1 text-xs rounded-md border border-border disabled:opacity-40 disabled:cursor-not-allowed hover:bg-muted/50 transition-colors"
+                        >
+                          {t('common.prevPage') || '上一页'}
+                        </button>
+                        <button
+                          onClick={() => goToPagedPage(pagedPage + 1)}
+                          disabled={pagedPage >= Math.ceil(pagedTotal / TAC_PAGE_SIZE) || pagedLoading}
+                          className="px-2.5 py-1 text-xs rounded-md border border-border disabled:opacity-40 disabled:cursor-not-allowed hover:bg-muted/50 transition-colors"
+                        >
+                          {t('common.nextPage') || '下一页'}
+                        </button>
+                      </div>
+                    </div>
+                  )}
                 </div>
               )}
 

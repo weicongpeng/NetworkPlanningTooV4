@@ -389,6 +389,7 @@ def _upsert_geo_file(
             geo_id=data_id,
             city=city,
             operator=operator,
+            import_warnings=metadata.get("importWarnings"),
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning(f"[数据集解包] 地理化元数据写入失败 {data_id}: {exc}")

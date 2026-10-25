@@ -61,6 +61,13 @@ export function HomePage() {
           iconColor="text-orange-500"
         />
         <FeatureCard
+          title={t('nav.pciCheck')}
+          description={t('home.pciCheckDesc') || '核查PCI复用距离、冲突混淆与模3/模30冲突'}
+          icon={Shield}
+          link="/pci-check"
+          iconColor="text-teal-500"
+        />
+        <FeatureCard
           title={t('nav.tacPlanning')}
           description={t('home.tacPlanningDesc') || '数据驱动的新站小区TAC分配'}
           icon={MapPin}

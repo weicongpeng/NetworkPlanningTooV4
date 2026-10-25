@@ -1484,11 +1484,17 @@ class MapInfoParser:
                 except Exception:
                     gdf = gpd.read_file(path_str, encoding='gbk')
             else:
+                # 先按 .tab 声明的 charset 读（读取前已 _normalize_tab_charset 归一为
+                # WindowsSimpChinese）：GDAL 自己会按声明解码，字段名/属性值都正确。
+                # 不能反过来先强制 encoding='gbk' —— 本工具写出的 TAB 字节本就是 GBK
+                # 且已声明 WindowsSimpChinese，再指定 gbk 等于二次转码，中文字段名会
+                # 变成 "闈㈢Нkm2" 这类乱码（写回后本机与同组用户都读到乱码列名的根因）。
+                # gbk 仅作为读取失败时的兜底。
                 try:
-                    gdf = gpd.read_file(path_str, encoding='gbk')
+                    gdf = gpd.read_file(path_str)
                 except Exception as e1:
                     try:
-                        gdf = gpd.read_file(path_str)
+                        gdf = gpd.read_file(path_str, encoding='gbk')
                     except Exception as e2:
                         raise e2
 

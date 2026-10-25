@@ -1,0 +1,16 @@
+Download
+We recommend configuring the runner under "\actions-runner". This will help avoid issues related to service identity folder permissions and long path restrictions on Windows.
+# Create a folder under the drive root
+$ mkdir actions-runner; cd actions-runner# Download the latest runner package
+$ Invoke-WebRequest -Uri https://github.com/actions/runner/releases/download/v2.337.0/actions-runner-win-x64-2.337.0.zip -OutFile actions-runner-win-x64-2.337.0.zip# Optional: Validate the hash
+$ if((Get-FileHash -Path actions-runner-win-x64-2.337.0.zip -Algorithm SHA256).Hash.ToUpper() -ne '1150692afa94e71f872017e254ea55b6eece1eece3fe7e3a6d4c93d0a1b85cfc'.ToUpper()){ throw 'Computed checksum did not match' }# Extract the installer
+$ Add-Type -AssemblyName System.IO.Compression.FileSystem ; [System.IO.Compression.ZipFile]::ExtractToDirectory("$PWD/actions-runner-win-x64-2.337.0.zip", "$PWD")
+
+Configure
+# Create the runner and start the configuration experience
+$ ./config.cmd --url https://github.com/weicongpeng/NetworkPlanningTooV4 --token A67RXPGEWDZZWPRLDL2GXD3K2RFVM# Run it!
+$ ./run.cmd
+
+Using your self-hosted runner
+# Use this YAML in your workflow file for each job
+runs-on: self-hosted

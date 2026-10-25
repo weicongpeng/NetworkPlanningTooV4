@@ -6,8 +6,8 @@ import type { SkippedCellInfo } from '@shared/types'
 const MAX_LISTED = 5
 
 interface SkippedCellsNoticeProps {
-  /** i18n 分组：tac=核查 / tacPlanning=规划 */
-  group: 'tac' | 'tacPlanning'
+  /** i18n 分组：tac=核查 / tacPlanning=规划 / pciCheck=PCI核查 */
+  group: 'tac' | 'tacPlanning' | 'pciCheck'
   /** 因工参数据不全被跳过的小区 */
   skipped: SkippedCellInfo[]
   /** 实际完成核查/规划的小区数 */
@@ -30,6 +30,8 @@ export function SkippedCellsNotice({ group, skipped, checkedCount, titleOnly = f
         return t(`${group}.skipReasonMissingIds`) || '缺少基站ID或小区ID'
       case 'not_in_params':
         return t(`${group}.skipReasonNotInParams`) || '工参中未找到该小区'
+      case 'missing_pci':
+        return t(`${group}.skipReasonMissingPci`) || '缺少PCI，无法核查'
       default:
         return t(`${group}.skipReasonMissingCoordinates`) || '缺少经纬度，无法定位'
     }

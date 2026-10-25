@@ -7,6 +7,10 @@ import { useTranslation } from 'react-i18next'
 const ITEM_HEIGHT = 40 // 每行高度
 const VISIBLE_COUNT = 25 // 可见行数
 const BUFFER_COUNT = 5 // 缓冲行数
+// 历史结果超过该邻区条数时不在打开页面时自动拉取完整结果：
+// 单份 20 万+ 条邻区 JSON 解析后约 1GB，会把后端内存打满并触发 swap / 长时间高 CPU
+// 结果表按「源小区」分页：每页包含该源小区的全部目标小区
+const NEIGHBOR_SOURCE_PAGE_SIZE = 50
 import { neighborApi } from '../services/api'
 import type { ApiResponse } from '@shared/types'
 import { useTaskStore, type Task } from '../store/taskStore'
@@ -217,6 +221,20 @@ export function NeighborPage() {
   const viewedTaskIdRef = useRef<string | null>(null) // 防止 useEffect 覆盖 API 获取的结果
   const isLoadingResultRef = useRef(false) // 标记结果加载是否有效，防止竞态
   const [resultLoading, setResultLoading] = useState(false) // 结果页加载动画
+  const [loadingFullResult, setLoadingFullResult] = useState(false) // 大结果按需加载
+  // 已按需加载过完整结果的 taskId：切回结果页时不要再用摘要覆盖
+  const loadedFullResultTaskIdRef = useRef<string | null>(null)
+
+  // ===== 分页结果（按源小区）=====
+  const [pagedSources, setPagedSources] = useState<any[]>([])
+  const [pagedSourceTotal, setPagedSourceTotal] = useState(0)
+  const [pagedSourcePage, setPagedSourcePage] = useState(1)
+  const [pagedLoading, setPagedLoading] = useState(false)
+  const [pagedPreparing, setPagedPreparing] = useState(false)
+  const [pagedRequest, setPagedRequest] = useState<{ taskId: string; summary?: any } | null>(null)
+  const pagedTaskIdRef = useRef<string | null>(null)
+  const pagedPollRef = useRef<number | null>(null)
+  // 已经自动补拉过完整结果的 taskId，失败也不重试，避免 effect 循环打后端
   const [selectedCount, setSelectedCount] = useState(0)
   const [batchDeleting, setBatchDeleting] = useState(false)
   const {
@@ -287,7 +305,6 @@ export function NeighborPage() {
         return
       }
       isLoadingResultRef.current = true
-      // 仅当没有已有结果时才显示加载动画
       if (!localTaskResult && !latestNeighborTask?.result) {
         setResultLoading(true)
       }
@@ -295,34 +312,17 @@ export function NeighborPage() {
         await syncHistoryFromBackend('neighbor_planning')
         if (!isLoadingResultRef.current) return
         const latest = getLatestNeighborTask()
-        if (latest && latest.result) {
-          // 如果缺少完整 results（来自 resultSummary），尝试从 API 重新获取
-          if (!latest.result.results && latest.id) {
-            try {
-              const response = await neighborApi.getResult(latest.id)
-              if (!isLoadingResultRef.current) return
-              if (response?.success && response?.data?.results) {
-                const fullResult = response.data as NeighborResultData
-                setLocalTaskResult(fullResult)
-                neighborDataSyncService.setNeighborResults({ results: fullResult.results })
-                if (isLoadingResultRef.current) setWizardStep('completed')
-                return
-              }
-            } catch (fetchErr: any) {
-              console.warn('[NeighborPage] 获取完整规划结果失败，使用缓存摘要:', fetchErr?.message)
-            }
+        if (latest?.status === 'completed' && latest.result) {
+          setLocalTaskResult({ ...(latest.result as any), taskId: latest.id })
+          setWizardStep('completed')
+          if (pagedTaskIdRef.current !== latest.id) {
+            setPagedRequest({ taskId: latest.id, summary: latest.result })
           }
-          if (!isLoadingResultRef.current) return
-          // 有完整 results 或 API 获取失败时使用已有结果
-          setLocalTaskResult(latest.result as NeighborResultData)
-          if (latest.result.results) {
-            neighborDataSyncService.setNeighborResults({ results: latest.result.results })
-          }
-          if (isLoadingResultRef.current) setWizardStep('completed')
         }
       }
       loadLatest().finally(() => {
         if (isLoadingResultRef.current) setResultLoading(false)
+        isLoadingResultRef.current = false
       })
       return () => {
         isLoadingResultRef.current = false
@@ -435,10 +435,9 @@ export function NeighborPage() {
   const pollingTimeoutRef = useRef<NodeJS.Timeout | null>(null)
   const errorCountRef = useRef(0)
 
-  // 确定当前显示的任务结果
+  // 确定当前显示的任务结果（分页模式下只含摘要；完整 results 仅作兜底）
   const taskResult = localTaskResult || (latestNeighborTask?.result as NeighborResultData | null)
-  // 只有当有完整结果数据（含 results 数组）或由 handleViewTask 设置时才认为是有效结果
-  const hasFullResult = taskResult && (!!(taskResult as any).results || viewedTaskIdRef.current)
+  const hasPagedSources = pagedSources.length > 0
 
   // 组件挂载时，检查是否有最新的邻区规划结果
   useEffect(() => {
@@ -502,6 +501,198 @@ export function NeighborPage() {
     return lazyNeighborInitRef.current
   }, [])
 
+  // 当前有效搜索条件（供分页请求使用）
+  const activeFilters = useMemo(() => {
+    if (!resultSearchEnabled) return {}
+    return Object.fromEntries(
+      Object.entries(resultSearchFilters).filter(([, value]) => String(value || '').trim() !== '')
+    )
+  }, [resultSearchEnabled, resultSearchFilters])
+  const activeFiltersRef = useRef<Record<string, string>>({})
+  activeFiltersRef.current = activeFilters
+
+  const fetchPagedSources = useCallback(async (
+    targetTaskId: string,
+    page: number,
+    filters: Record<string, string>
+  ): Promise<boolean> => {
+    setPagedLoading(true)
+    try {
+      const response = await neighborApi.getResultSources(
+        targetTaskId, page, NEIGHBOR_SOURCE_PAGE_SIZE, filters
+      )
+      const data = response?.data
+      if (!response?.success || !data) return true
+      if (data.preparing) {
+        setPagedPreparing(true)
+        return false
+      }
+      setPagedPreparing(false)
+      const sources = Array.isArray(data.sources) ? data.sources : []
+      setPagedSources(sources)
+      setPagedSourceTotal(Number(data.total) || 0)
+      setPagedSourcePage(Number(data.page) || page)
+      const flat = sources.flatMap((source: any) => (source.targets || []).map((target: any) => ({
+        ...target,
+        sourceSiteId: target.sourceSiteId ?? source.sourceSiteId,
+        sourceCellId: target.sourceCellId ?? source.sourceCellId,
+        sourceCellName: target.sourceCellName ?? source.sourceCellName,
+        sourceFrequency: target.sourceFrequency ?? source.sourceFrequency,
+        sourcePci: target.sourcePci ?? source.sourcePci,
+        relationType: target.relationType ?? source.relationType,
+      })))
+      setFilteredResults(flat)
+      return true
+    } catch (err: any) {
+      console.warn('[NeighborPage] 加载分页结果失败:', err?.message)
+      return true
+    } finally {
+      setPagedLoading(false)
+    }
+  }, [])
+
+  const schedulePagedPollRef = useRef<(taskId: string) => void>(() => {})
+  const schedulePagedPoll = useCallback((targetTaskId: string) => {
+    if (pagedPollRef.current) return
+    pagedPollRef.current = window.setTimeout(async () => {
+      pagedPollRef.current = null
+      if (pagedTaskIdRef.current !== targetTaskId) return
+      try {
+        const metaResponse = await neighborApi.getResultMeta(targetTaskId)
+        if (metaResponse?.data?.rowsReady) {
+          if (metaResponse.data.summary) {
+            setLocalTaskResult({
+              ...metaResponse.data.summary,
+              taskId: targetTaskId,
+              status: 'completed',
+            } as NeighborResultData)
+          }
+          const ready = await fetchPagedSources(targetTaskId, 1, activeFiltersRef.current)
+          if (!ready) schedulePagedPollRef.current(targetTaskId)
+        } else {
+          schedulePagedPollRef.current(targetTaskId)
+        }
+      } catch {
+        schedulePagedPollRef.current(targetTaskId)
+      }
+    }, 1000)
+  }, [fetchPagedSources])
+  useEffect(() => {
+    schedulePagedPollRef.current = schedulePagedPoll
+  }, [schedulePagedPoll])
+  useEffect(() => () => {
+    if (pagedPollRef.current) {
+      window.clearTimeout(pagedPollRef.current)
+      pagedPollRef.current = null
+    }
+  }, [])
+
+  /** 分页结果入口：先取摘要，再按源小区拉第一页；未建好索引时展示准备状态并轮询 */
+  const loadPagedResult = useCallback(async (targetTaskId: string, fallbackSummary?: any) => {
+    if (!targetTaskId) return
+    if (pagedPollRef.current) {
+      window.clearTimeout(pagedPollRef.current)
+      pagedPollRef.current = null
+    }
+    pagedTaskIdRef.current = targetTaskId
+    viewedTaskIdRef.current = targetTaskId
+    loadedFullResultTaskIdRef.current = null
+    setPagedSources([])
+    setPagedSourceTotal(0)
+    setPagedSourcePage(1)
+    setFilteredResults([])
+    setPagedPreparing(false)
+    setResultLoading(true)
+    try {
+      const response = await neighborApi.getResultMeta(targetTaskId)
+      const meta = response?.data
+      if (!meta) {
+        setError(i18n.getResultFailed)
+        return
+      }
+      setLocalTaskResult({
+        ...(meta.summary || fallbackSummary || {}),
+        taskId: targetTaskId,
+        status: 'completed',
+      } as NeighborResultData)
+      setWizardStep('completed')
+      await ensureNeighborSyncService().catch(() => {})
+      if (meta.rowsReady) {
+        const ready = await fetchPagedSources(targetTaskId, 1, activeFiltersRef.current)
+        if (!ready) schedulePagedPollRef.current(targetTaskId)
+      } else {
+        setPagedPreparing(true)
+        schedulePagedPollRef.current(targetTaskId)
+      }
+    } catch (err: any) {
+      setError(`${i18n.loadResultFailed}: ${err?.message || ''}`)
+    } finally {
+      setResultLoading(false)
+    }
+  }, [ensureNeighborSyncService, fetchPagedSources, i18n.getResultFailed, i18n.loadResultFailed])
+
+  // 历史/任务完成时发起分页加载请求
+  useEffect(() => {
+    if (!pagedRequest) return
+    const request = pagedRequest
+    setPagedRequest(null)
+    loadPagedResult(request.taskId, request.summary)
+  }, [pagedRequest, loadPagedResult])
+
+  // 搜索条件变化：防抖后从第一页重新查询（服务端搜索全量结果）
+  useEffect(() => {
+    const targetTaskId = pagedTaskIdRef.current
+    if (!targetTaskId || pagedPreparing) return
+    const timer = window.setTimeout(() => {
+      fetchPagedSources(targetTaskId, 1, activeFiltersRef.current)
+    }, 300)
+    return () => window.clearTimeout(timer)
+  }, [resultSearchFilters, resultSearchEnabled, pagedPreparing, fetchPagedSources])
+
+  const goToPagedSourcePage = useCallback((page: number) => {
+    const targetTaskId = pagedTaskIdRef.current
+    if (!targetTaskId || page < 1) return
+    fetchPagedSources(targetTaskId, page, activeFiltersRef.current)
+  }, [fetchPagedSources])
+
+  /** 兜底：索引失败或用户主动要求时，仍可加载完整结果 */
+  const loadFullResultForTask = useCallback(async (targetTaskId: string) => {
+    if (!targetTaskId || loadingFullResult) return
+    setLoadingFullResult(true)
+    try {
+      const response = await neighborApi.getResult(targetTaskId)
+      if (response?.success && response?.data && (response.data as any).results) {
+        const fullResult = response.data as NeighborResultData
+        if (pagedPollRef.current) {
+          window.clearTimeout(pagedPollRef.current)
+          pagedPollRef.current = null
+        }
+        pagedTaskIdRef.current = null
+        setPagedPreparing(false)
+        viewedTaskIdRef.current = targetTaskId
+        loadedFullResultTaskIdRef.current = targetTaskId
+        setLocalTaskResult(fullResult)
+        setWizardStep('completed')
+        await ensureNeighborSyncService().catch(() => {})
+        neighborDataSyncService.setNeighborResults({ results: fullResult.results || [] })
+      } else {
+        setError(i18n.getResultFailed)
+      }
+    } catch (err: any) {
+      setError(`${i18n.loadResultFailed}: ${err?.message || ''}`)
+    } finally {
+      setLoadingFullResult(false)
+    }
+  }, [loadingFullResult, ensureNeighborSyncService, i18n.getResultFailed, i18n.loadResultFailed])
+
+  // 任务完成时进度接口只回摘要：自动切到分页结果（不再整包拉取）
+  useEffect(() => {
+    if (taskResult?.status !== 'completed' || (taskResult as any).results) return
+    const targetTaskId = taskResult.taskId || taskId
+    if (!targetTaskId || pagedTaskIdRef.current === targetTaskId) return
+    setPagedRequest({ taskId: targetTaskId, summary: taskResult })
+  }, [taskResult?.status, taskResult?.taskId, taskResult?.results, taskId])
+
   useEffect(() => {
     let mounted = true
 
@@ -542,10 +733,9 @@ export function NeighborPage() {
       return
     }
 
-    // 仅在规划任务完成且有结果时加载数据
-    if (taskResult?.status !== 'completed' || !taskResult?.results || taskResult.results.length === 0) {
-      return
-    }
+    // 仅在规划任务完成且有结果时加载数据（分页模式下有当前页源小区即可）
+    if (taskResult?.status !== 'completed') return
+    if (!(taskResult?.results?.length) && !hasPagedSources) return
 
     const loadFullParamsData = async () => {
       try {
@@ -555,9 +745,11 @@ export function NeighborPage() {
         let shouldLoadLTE = false
         let shouldLoadNR = false
 
-        // 检查规划结果的关系类型
-        const relationTypes = new Set(
-          taskResult.results.map((r: any) => r.relationType || 'LTE-LTE')
+        // 检查规划结果的关系类型（分页模式下来自当前页的源小区）
+        const relationTypes = new Set<string>(
+          taskResult.results
+            ? taskResult.results.map((r: any) => r.relationType || 'LTE-LTE')
+            : pagedSources.map((source: any) => source.relationType || 'LTE-LTE')
         )
 
         console.log('[NeighborPage] 规划结果关系类型', Array.from(relationTypes))
@@ -629,7 +821,7 @@ export function NeighborPage() {
     }
 
     loadFullParamsData()
-  }, [taskResult?.status, taskResult?.results, syncServiceInitialized])
+  }, [taskResult?.status, taskResult?.results, hasPagedSources, syncServiceInitialized])
 
   // 处理规划结果搜索过滤
   useEffect(() => {
@@ -665,8 +857,8 @@ export function NeighborPage() {
       } else {
         setFilteredResults(allResults)
       }
-    } else {
-      // 任务未完成或没有结果时，清空filteredResults
+    } else if (!pagedTaskIdRef.current) {
+      // 任务未完成且没有进入分页模式时才清空；分页数据由 fetchPagedSources 维护
       setFilteredResults([])
     }
   }, [taskResult, resultSearchEnabled, resultSearchFilters, buildFlatResults])
@@ -900,7 +1092,7 @@ export function NeighborPage() {
       coverageDistanceFactor: 0.5, coverageRadiusFactor: 0.5,
       denseSpacingThreshold: 1.0, denseMultiplier: 1.3,
       outdoorToIndoorMaxDistance: 0.6, indoorToIndoorRadius: 0.35,
-      indoorToOutdoorMultiplier: 1.5, outdoorSpacingSiteCount: 9,
+      indoorToOutdoorMultiplier: 1.5, outdoorSpacingSiteCount: 11,
     })
   }
 
@@ -994,7 +1186,7 @@ export function NeighborPage() {
         outdoorToIndoorMaxDistance: config.outdoorToIndoorMaxDistance ?? 0.6,
         indoorToIndoorRadius: config.indoorToIndoorRadius ?? 0.35,
         indoorToOutdoorMultiplier: config.indoorToOutdoorMultiplier ?? 1.5,
-        outdoorSpacingSiteCount: config.outdoorSpacingSiteCount ?? 9,
+        outdoorSpacingSiteCount: config.outdoorSpacingSiteCount ?? 11,
         selectedCellIds: Array.from(selectedCellIdsSet)
       })
       if (response.success && response.data) {
@@ -1010,29 +1202,12 @@ export function NeighborPage() {
     } finally { setLoading(false) }
   }
 
-  // 从历史任务查看 - 跳转到结果页并自动打开地图
-  const handleViewTask = async (task: any) => {
-    try {
-      const response = await neighborApi.getResult(task.id)
-      if (response?.success && response?.data) {
-        const result = response.data as NeighborResultData
-        viewedTaskIdRef.current = task.id // 必须在 setActiveTaskId 之前设置！
-        setLocalTaskResult(result)
-        setActiveTaskId('neighbor_planning', task.id)
-        setActiveLeftTab('planning-result')
-        setShowMap(true)
-        if (result.results) {
-          // 🔥 修复：历史任务从后端只拿 resultSummary（无 results 数组），
-          // 自动初始化不再触发，必须主动初始化 sync service，
-          // 否则点击结果行时 findSector 无数据可查，地图不渲染
-          await ensureNeighborSyncService().catch(() => {})
-          neighborDataSyncService.setNeighborResults({ results: result.results })
-        }
-      }
-    } catch (err: any) {
-      console.error('加载邻区规划结果失败:', err)
-      setError('加载规划结果失败: ' + (err.message || '未知错误'))
-    }
+  // 从历史任务查看 - 先切到结果页，再按源小区分页加载
+  const handleViewTask = (task: any) => {
+    setActiveTaskId('neighbor_planning', task.id)
+    setActiveLeftTab('planning-result')
+    setShowMap(true)
+    loadPagedResult(task.id, task.result)
   }
 
   const handleExport = async () => {
@@ -1590,7 +1765,7 @@ export function NeighborPage() {
                                 {t('neighbor.outdoorSpacingSiteCount') || '室外站间距站点数'}
                               </label>
                               <NumberInput
-                                value={config.outdoorSpacingSiteCount ?? 9}
+                                value={config.outdoorSpacingSiteCount ?? 11}
                                 onChange={(v) => setConfig({ outdoorSpacingSiteCount: Math.round(v) })}
                                 disabled={wizardStep !== 'params_set'}
                                 min={1} max={30}
@@ -1665,7 +1840,7 @@ export function NeighborPage() {
                     onSelectTask={(task) => {
                       if (task.result) {
                         const result = task.result as NeighborResultData
-                        setLocalTaskResult(result)
+                        setLocalTaskResult({ ...result, taskId: task.id })
                         setActiveTaskId('neighbor_planning', task.id)
                         setActiveLeftTab('planning-result')
                         if (result.results) {
@@ -1709,7 +1884,6 @@ export function NeighborPage() {
                                   sourceFrequency: '', sourcePci: '', targetSiteId: '', targetCellId: '',
                                   targetCellName: '', targetFrequency: '', targetPci: '', distance: ''
                                 })
-                                setFilteredResults([])
                               }
                               setResultSearchEnabled(!resultSearchEnabled)
                             }}
@@ -1762,28 +1936,78 @@ export function NeighborPage() {
                       <AlertCircle size={48} className="mx-auto mb-4" />
                       <p className="font-semibold">{i18n.taskFailed}</p>
                     </div>
-                  ) : taskResult.status === 'completed' && !(taskResult as any).results ? (
-                    <div className="flex-1 flex items-center justify-center text-muted-foreground">
-                      <AlertCircle size={48} className="mx-auto mb-4 opacity-50" />
-                      <p>{t('common.resultUnavailable') || '结果数据不可用，请重新执行规划任务'}</p>
-                    </div>
-                  ) : hasFullResult ? (
+                  ) : taskResult.status === 'completed' ? (
                     <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
-                      {taskResult.results && taskResult.results.length > 0 ? (
-                        <NeighborTable
-                          results={filteredResults}
-                          onSourceSectorClick={handleSourceSectorClick}
-                          selectedSectorKey={selectedSourceSector?.sourceKey || null}
-                          searchEnabled={resultSearchEnabled}
-                          searchFilters={resultSearchFilters}
-                          onSearchChange={handleResultSearchChange}
-                          columnWidths={neighborColumnWidths}
-                          resizingColumn={neighborResizingColumn}
-                          onResizeStart={handleNeighborResizeStart}
-                        />
+                      {pagedPreparing ? (
+                        <div className="flex-1 flex flex-col items-center justify-center gap-3 px-6 text-center text-muted-foreground">
+                          <Loader2 className="animate-spin" size={40} />
+                          <p className="text-sm">
+                            {t('neighbor.preparingResult') || '正在准备结果明细（首次查看大结果约需数秒）...'}
+                          </p>
+                          <button
+                            onClick={() => loadFullResultForTask(taskResult.taskId || taskId!)}
+                            disabled={loadingFullResult}
+                            className="flex items-center justify-center gap-2 px-3 py-1.5 rounded-lg bg-muted hover:bg-muted/80 transition-colors text-xs font-medium disabled:opacity-50"
+                          >
+                            <Download size={14} />
+                            {t('neighbor.loadFullResult') || '直接加载完整结果'}
+                          </button>
+                        </div>
+                      ) : pagedLoading && filteredResults.length === 0 ? (
+                        <div className="flex-1 flex items-center justify-center text-muted-foreground">
+                          <Loader2 className="animate-spin mx-auto mb-4" size={40} />
+                          <p className="text-sm">{i18n.loadingResult || '正在加载规划结果...'}</p>
+                        </div>
+                      ) : hasPagedSources || filteredResults.length > 0 || (taskResult as any).results ? (
+                        <>
+                          <NeighborTable
+                            results={filteredResults}
+                            onSourceSectorClick={handleSourceSectorClick}
+                            selectedSectorKey={selectedSourceSector?.sourceKey || null}
+                            searchEnabled={resultSearchEnabled}
+                            searchFilters={resultSearchFilters}
+                            onSearchChange={handleResultSearchChange}
+                            columnWidths={neighborColumnWidths}
+                            resizingColumn={neighborResizingColumn}
+                            onResizeStart={handleNeighborResizeStart}
+                          />
+                          {!(taskResult as any).results && pagedSourceTotal > 0 && (
+                            <div className="flex items-center justify-between px-4 py-2 border-t border-border bg-card shrink-0">
+                              <span className="text-xs text-muted-foreground">
+                                {t('neighbor.sourcePageInfo', {
+                                  total: pagedSourceTotal,
+                                  page: pagedSourcePage,
+                                  pages: Math.max(1, Math.ceil(pagedSourceTotal / NEIGHBOR_SOURCE_PAGE_SIZE)),
+                                }) || `共 ${pagedSourceTotal} 个源小区 · 第 ${pagedSourcePage} / ${Math.max(1, Math.ceil(pagedSourceTotal / NEIGHBOR_SOURCE_PAGE_SIZE))} 页`}
+                              </span>
+                              <div className="flex items-center gap-2">
+                                <button
+                                  onClick={() => goToPagedSourcePage(pagedSourcePage - 1)}
+                                  disabled={pagedSourcePage <= 1 || pagedLoading}
+                                  className="px-2.5 py-1 text-xs rounded-md border border-border disabled:opacity-40 disabled:cursor-not-allowed hover:bg-muted/50 transition-colors"
+                                >
+                                  {t('common.prevPage') || '上一页'}
+                                </button>
+                                <button
+                                  onClick={() => goToPagedSourcePage(pagedSourcePage + 1)}
+                                  disabled={pagedSourcePage >= Math.ceil(pagedSourceTotal / NEIGHBOR_SOURCE_PAGE_SIZE) || pagedLoading}
+                                  className="px-2.5 py-1 text-xs rounded-md border border-border disabled:opacity-40 disabled:cursor-not-allowed hover:bg-muted/50 transition-colors"
+                                >
+                                  {t('common.nextPage') || '下一页'}
+                                </button>
+                              </div>
+                            </div>
+                          )}
+                        </>
+                      ) : resultLoading ? (
+                        <div className="flex-1 flex items-center justify-center text-muted-foreground">
+                          <Loader2 className="animate-spin mx-auto mb-4" size={40} />
+                          <p className="text-sm">{i18n.loadingResult || '正在加载规划结果...'}</p>
+                        </div>
                       ) : (
-                        <div className="flex items-center justify-center h-full text-muted-foreground">
-                          <p>{i18n.noResult}</p>
+                        <div className="flex-1 flex items-center justify-center text-muted-foreground">
+                          <AlertCircle size={48} className="mx-auto mb-4 opacity-50" />
+                          <p>{t('common.resultUnavailable') || '结果数据不可用，请重新执行规划任务'}</p>
                         </div>
                       )}
                     </div>
@@ -2017,40 +2241,62 @@ function NeighborTable({
   const [scrollTop, setScrollTop] = useState(0)
   const tableContainerRef = useRef<HTMLDivElement>(null)
 
-  // 计算总行数（展开后的行数）
-  const totalRows = useMemo(() => {
-    return groupedData.reduce((sum, group) => sum + group.targets.length, 0)
+  // 分组行偏移表：只在结果变化时算一次，滚动时二分定位，
+  // 避免每次滚动都遍历/重建 70 万行扁平数组（历史卡顿主因之一）。
+  const groupOffsets = useMemo(() => {
+    const offsets = new Array<number>(groupedData.length + 1)
+    let total = 0
+    groupedData.forEach((group, index) => {
+      offsets[index] = total
+      total += group.targets.length
+    })
+    offsets[groupedData.length] = total
+    return offsets
   }, [groupedData])
 
   // 计算虚拟滚动的可见数据
   const virtualData = useMemo(() => {
     const startIndex = Math.max(0, Math.floor(scrollTop / ITEM_HEIGHT) - BUFFER_COUNT)
+    const totalRows = groupOffsets[groupOffsets.length - 1] || 0
     const endIndex = Math.min(
       totalRows,
       Math.ceil((scrollTop + VISIBLE_COUNT * ITEM_HEIGHT) / ITEM_HEIGHT) + BUFFER_COUNT
     )
-    
-    // 将分组数据转换为扁平的行数据
-    const flatRows: any[] = []
-    groupedData.forEach((group) => {
-      group.targets.forEach((target: any, targetIdx: number) => {
-        flatRows.push({
-          ...target,
+
+    // 二分找到起始行所属分组，只展开可视范围内的行
+    let low = 0
+    let high = Math.max(0, groupOffsets.length - 2)
+    while (low < high) {
+      const mid = Math.ceil((low + high) / 2)
+      if (groupOffsets[mid] <= startIndex) low = mid
+      else high = mid - 1
+    }
+
+    const visibleData: any[] = []
+    for (let groupIndex = low; groupIndex < groupedData.length; groupIndex++) {
+      const groupStart = groupOffsets[groupIndex]
+      if (groupStart >= endIndex) break
+      const group = groupedData[groupIndex]
+      const from = Math.max(0, startIndex - groupStart)
+      const to = Math.min(group.targets.length, endIndex - groupStart)
+      for (let targetIdx = from; targetIdx < to; targetIdx++) {
+        visibleData.push({
+          ...group.targets[targetIdx],
           group,
           targetIdx,
           isFirstInGroup: targetIdx === 0
         })
-      })
-    })
-    
+      }
+    }
+
     return {
       startIndex,
       endIndex,
-      visibleData: flatRows.slice(startIndex, endIndex),
+      visibleData,
       totalHeight: totalRows * ITEM_HEIGHT,
       offsetY: startIndex * ITEM_HEIGHT
     }
-  }, [scrollTop, groupedData, totalRows])
+  }, [scrollTop, groupedData, groupOffsets])
 
   // 处理滚动事件
   const handleScroll = useCallback((e: React.UIEvent<HTMLDivElement>) => {

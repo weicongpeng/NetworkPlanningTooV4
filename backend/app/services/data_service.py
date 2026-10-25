@@ -9,6 +9,7 @@ import uuid
 import shutil
 import glob
 import re
+import math
 from datetime import datetime
 from typing import List, Optional, Dict, Any, Set, Tuple
 from pathlib import Path
@@ -128,6 +129,19 @@ def validate_excel_upload_contract(filename: str, file_path: "Path") -> str:
         "文件名不符合导入规范：全量工参文件名必须以 'ProjectParameter' 开头，"
         "待规划小区文件名必须以 'cell-tree' 开头。请下载对应模板填写后再导入。"
     )
+
+
+def geo_file_metadata(gf: GeoFile) -> Dict[str, Any]:
+    """GeoFile 行 → 索引 metadata（点数 + 导入提醒）"""
+    metadata: Dict[str, Any] = {"pointCount": gf.point_count}
+    if gf.import_warnings:
+        try:
+            warnings = json.loads(gf.import_warnings)
+        except (TypeError, ValueError):
+            warnings = None
+        if warnings:
+            metadata["importWarnings"] = warnings
+    return metadata
 
 
 class DataService:
@@ -271,7 +285,7 @@ class DataService:
                     "city": gf.city,
                     "operator": gf.operator,
                     "originalPath": gf.file_path,
-                    "metadata": {"pointCount": gf.point_count},
+                    "metadata": geo_file_metadata(gf),
                 }
         finally:
             db.close()
@@ -325,7 +339,7 @@ class DataService:
                     "city": gf.city,
                     "operator": gf.operator,
                     "originalPath": gf.file_path,
-                    "metadata": {"pointCount": gf.point_count},
+                    "metadata": geo_file_metadata(gf),
                 }
 
             # 3) Layers (MapInfo 图层) — 按数据目录分组，避免重复索引条目
@@ -651,6 +665,66 @@ class DataService:
         except Exception as exc:  # noqa: BLE001
             db.rollback()
             safe_print(f"[DataService] 坐标缺失提醒回填失败（非致命）: {exc}")
+            return 0
+        finally:
+            db.close()
+
+    def backfill_geo_coord_zero_warnings(self) -> int:
+        """存量地理化数据：导入时未记录提醒的条目，从 default.json 补算 coord_zero。
+
+        import_warnings 为 NULL 表示录入时代码尚未检查（旧版本/旧端解包）；
+        扫描一次后即使无提醒也写 []，避免每次启动重复解析大文件。
+        """
+        updated = 0
+        db = SessionLocal()
+        try:
+            pending = db.query(GeoFile).filter(GeoFile.import_warnings.is_(None)).all()
+            for gf in pending:
+                payload = self._bound_data_dir / gf.id / "default.json"
+                if not payload.is_file():
+                    continue
+                try:
+                    rows = json.loads(payload.read_text(encoding="utf-8"))
+                except (OSError, ValueError) as exc:
+                    safe_print(f"[DataService] 地理化提醒回填跳过 {gf.id}: {exc}")
+                    continue
+                if not isinstance(rows, list):
+                    continue
+
+                count = 0
+                for row in rows:
+                    if not isinstance(row, dict):
+                        continue
+                    try:
+                        lat = float(row.get("latitude"))
+                        lng = float(row.get("longitude"))
+                    except (TypeError, ValueError):
+                        continue
+                    if not (math.isfinite(lat) and math.isfinite(lng)):
+                        continue
+                    # 与导入统计口径一致：经度或纬度为 0 视为缺失
+                    if lat == 0 or lng == 0:
+                        count += 1
+
+                warnings = [{"code": "coord_zero", "count": count}] if count else []
+                gf.import_warnings = json.dumps(warnings, ensure_ascii=False)
+                entry = self.index.get(gf.id)
+                if isinstance(entry, dict):
+                    metadata = entry.setdefault("metadata", {})
+                    if warnings:
+                        metadata["importWarnings"] = warnings
+                    else:
+                        metadata.pop("importWarnings", None)
+                updated += 1
+
+            if updated:
+                db.commit()
+                self._save_index()
+                safe_print(f"[DataService] 已补算 {updated} 个地理化数据的坐标缺失提醒")
+            return updated
+        except Exception as exc:  # noqa: BLE001
+            db.rollback()
+            safe_print(f"[DataService] 地理化数据提醒回填失败（非致命）: {exc}")
             return 0
         finally:
             db.close()
@@ -7318,7 +7392,7 @@ class DataService:
                     "size": gf.file_size,
                     "status": "ready",
                     "uploadDate": gf.created_at,
-                    "metadata": {"pointCount": gf.point_count},
+                    "metadata": geo_file_metadata(gf),
                 })
 
             # 3) Layers (MapInfo 图层)

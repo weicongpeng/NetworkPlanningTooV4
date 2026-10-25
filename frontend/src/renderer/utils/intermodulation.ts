@@ -28,6 +28,8 @@ export const IM3_PRESETS: Im3BandPreset[] = [
   { id: '8', nameKey: 'im3Evaluation.presets.cm900Ul', modeKey: 'im3Evaluation.mode.fddUl', low: 889, high: 909 },
   { id: '9', nameKey: 'im3Evaluation.presets.cu1g8Dl', modeKey: 'im3Evaluation.mode.fddDl', low: 1840, high: 1860 },
   { id: '10', nameKey: 'im3Evaluation.presets.cu1g8Ul', modeKey: 'im3Evaluation.mode.fddUl', low: 1745, high: 1765 },
+  { id: '11', nameKey: 'im3Evaluation.presets.cu900Dl', modeKey: 'im3Evaluation.mode.fddDl', low: 949, high: 959 },
+  { id: '12', nameKey: 'im3Evaluation.presets.cm700Dl', modeKey: 'im3Evaluation.mode.fddDl', low: 758, high: 788 },
   { id: 'custom', nameKey: 'im3Evaluation.presets.custom', modeKey: 'im3Evaluation.mode.custom', low: null, high: null },
 ]
 

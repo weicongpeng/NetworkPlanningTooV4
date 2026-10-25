@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 from app.models.schemas import (
     TaskStatus,
     PCIConfig,
+    PCICheckConfig,
     NeighborConfig,
     TACConfig,
     NetworkType,
@@ -41,6 +42,7 @@ class TaskType(str, Enum):
     NEIGHBOR = "neighbor"
     TAC = "tac"  # 核查
     TAC_PLANNING = "tac_planning"  # 规划
+    PCI_CHECK = "pci_check"  # PCI核查
     UPDATE_PARAMS = "update_params"  # 工参更新
     APPLY_PCI = "apply_pci"  # PCI应用到工参
     APPLY_TAC_PLANNING = "apply_tac_planning"  # TAC规划应用到工参
@@ -81,6 +83,8 @@ class Task:
         # 结果外置后（见 _load_tasks_index）：从磁盘索引恢复的任务此处为 None，
         # 首次读取时再按需从 sidecar/SQLite 装载。执行中的任务恒为 False。
         self._result_pending = False
+        # 结果是否已做过 NaN/Infinity 清洗（清洗改为原地修改，避免大结果深拷贝翻倍内存）
+        self._result_sanitized = False
         self.error = None
         self.created_at = datetime.now()
         self.started_at = None
@@ -123,14 +127,25 @@ class TaskManager:
 
     @staticmethod
     def _sanitize_result(obj: Any) -> Any:
-        """递归替换 NaN/Infinity 为 None，确保结果可安全序列化为 JSON"""
+        """递归替换 NaN/Infinity 为 None，确保结果可安全序列化为 JSON。
+
+        原地修改 dict/list：邻区结果可达 20 万+ 条，旧实现每层都新建容器，
+        单次读取会额外复制约 1GB，叠加 cgroup 内存上限后触发 swap 与长时间
+        高 CPU（表现为无操作也卡）。tuple 不可变，仍返回新 list。
+        """
         if isinstance(obj, float):
             if math.isnan(obj) or math.isinf(obj):
                 return None
             return obj
         elif isinstance(obj, dict):
-            return {k: TaskManager._sanitize_result(v) for k, v in obj.items()}
-        elif isinstance(obj, (list, tuple)):
+            for k, v in obj.items():
+                obj[k] = TaskManager._sanitize_result(v)
+            return obj
+        elif isinstance(obj, list):
+            for i, v in enumerate(obj):
+                obj[i] = TaskManager._sanitize_result(v)
+            return obj
+        elif isinstance(obj, tuple):
             return [TaskManager._sanitize_result(i) for i in obj]
         # 处理 numpy.float64 等类型（通过尝试转换检测）
         try:
@@ -139,6 +154,16 @@ class TaskManager:
         except Exception:
             pass
         return obj
+
+    @staticmethod
+    def _sanitize_task_result(task: "Task") -> Optional[Dict]:
+        """按需清洗任务结果；同一进程内只遍历一次（大结果遍历一次约数秒）。"""
+        if task.result is None:
+            return None
+        if not getattr(task, "_result_sanitized", False):
+            TaskManager._sanitize_result(task.result)
+            task._result_sanitized = True
+        return task.result
 
     def __init__(self):
         self.tasks: Dict[str, Task] = {}
@@ -1113,6 +1138,26 @@ class TaskManager:
 
         return task.task_id
 
+    async def create_pci_check_task(self, config: PCICheckConfig, task_name: Optional[str] = None, user_name: Optional[str] = None,
+                                    city: Optional[str] = None, operator: Optional[str] = None) -> str:
+        """创建PCI核查任务"""
+        logger.info(f"[TaskManager] 创建PCI核查任务, task_name: {task_name}, user_name: {user_name}")
+        city, operator = self._task_group(city, operator, user_name)
+
+        # 核查必须指定小区，提前拦截，避免空跑一次邻区预规划
+        if not config.selectedCellIds:
+            raise ValueError("请在小区选择列表中至少选择一个小区后再执行PCI核查")
+
+        task = Task(TaskType.PCI_CHECK, config, task_name=task_name, user_name=user_name, city=city, operator=operator)
+        self.tasks[task.task_id] = task
+        self._persist_task(task.task_id)
+
+        # 启动任务（含信号量准入和超时保护）
+        task.task = asyncio.create_task(self._run_task_with_slot(task, self._run_pci_check_task))
+        logger.info(f"[TaskManager] PCI核查任务已启动, task_id: {task.task_id}")
+
+        return task.task_id
+
     async def _run_pci_task(self, task: Task):
         """运行PCI规划任务"""
         logger.info(f"[TaskManager] _run_pci_task 开始执行, task_id: {task.task_id}")
@@ -1661,6 +1706,134 @@ class TaskManager:
                 "error": str(e),
             }
  
+    async def _run_pci_check_task(self, task: Task):
+        """运行PCI核查任务（基于全量工参 + 内存预规划邻区对）"""
+        logger.info(f"[TaskManager] _run_pci_check_task 开始执行, task_id: {task.task_id}")
+        try:
+            task.status = TaskStatus.PROCESSING
+            task.started_at = datetime.now()
+
+            config = task.config
+            network_type = config.networkType.value  # "LTE" 或 "NR"
+
+            if not config.selectedCellIds:
+                raise ValueError("请在小区选择列表中至少选择一个小区后再执行PCI核查")
+
+            selected_set = set(config.selectedCellIds)
+            logger.info(
+                f"[TaskManager] PCI核查: networkType={network_type}, "
+                f"对打距离(宏-宏/宏-室/室-室)={config.macroPairDistance}/{config.mixedPairDistance}/{config.indoorPairDistance}米, "
+                f"宏站复用距离={config.minReuseDistanceMacro}米, 室分复用距离={config.minReuseDistanceIndoor}米, "
+                f"宏站夹角={config.macroFacingAngle}度, 室分夹角={config.indoorFacingAngle}度, "
+                f"复用距离核查={config.reuseCheck}, 冲突核查={config.collisionCheck}, "
+                f"混淆核查={config.confusionCheck}, 模3核查={config.mod3Check}, "
+                f"模30核查={config.mod30Check}, 邻区关联={config.neighborAssoc}, 核查小区={len(selected_set)}个"
+            )
+
+            # 只查找本组全量工参文件（与PCI/邻区规划同一入口，按任务组快照隔离）
+            full_params_item = self._find_full_params_item(task.city, task.operator)
+            if not full_params_item:
+                raise ValueError("未找到全量工参文件（前缀为'ProjectParameter'的Excel文件）")
+            full_params_data = data_service.get_data(full_params_item.id)
+            if not full_params_data:
+                raise ValueError("全量工参文件为空")
+
+            sites = full_params_data.get(network_type, []) if isinstance(full_params_data, dict) else []
+            if not sites:
+                raise ValueError(f"全量工参文件中没有{network_type}数据")
+
+            from app.algorithms.pci_check_service import PCICheckParams, PCICheckService
+
+            params = PCICheckParams(
+                network_type=network_type,
+                macro_pair_distance_km=float(config.macroPairDistance) / 1000.0,
+                mixed_pair_distance_km=float(config.mixedPairDistance) / 1000.0,
+                indoor_pair_distance_km=float(config.indoorPairDistance) / 1000.0,
+                min_reuse_distance_macro_km=float(config.minReuseDistanceMacro) / 1000.0,
+                min_reuse_distance_indoor_km=float(config.minReuseDistanceIndoor) / 1000.0,
+                macro_facing_gate_deg=float(config.macroFacingAngle),
+                indoor_facing_gate_deg=float(config.indoorFacingAngle),
+                enable_reuse_check=bool(config.reuseCheck),
+                enable_collision_check=bool(config.collisionCheck),
+                enable_confusion_check=bool(config.confusionCheck),
+                enable_mod3_check=bool(config.mod3Check),
+                enable_mod30_check=bool(config.mod30Check),
+                neighbor_assoc=bool(config.neighborAssoc),
+            )
+            check_service = PCICheckService()
+
+            def progress_callback(progress: float):
+                task.progress = progress
+
+            check_result = await asyncio.to_thread(
+                check_service.run, sites, list(selected_set), params, progress_callback
+            )
+
+            # 进入核查链路的小区 key（两种形式），供跳过小区汇总复用
+            matched_keys = set()
+            for key in check_result.get("matchedKeys", []):
+                matched_keys.add(key)
+                if "_" in key:
+                    matched_keys.add(key.split("_", 1)[1])
+            skipped_cells = self._collect_skipped_cells(
+                check_service.last_load_skipped, matched_keys, selected_set
+            )
+
+            task.status = TaskStatus.COMPLETED
+            task.completed_at = datetime.now()
+            task.result = {
+                "taskId": task.task_id,
+                "status": "completed",
+                "progress": 100,
+                "networkType": network_type,
+                "macroPairDistanceM": check_result["macroPairDistanceM"],
+                "mixedPairDistanceM": check_result["mixedPairDistanceM"],
+                "indoorPairDistanceM": check_result["indoorPairDistanceM"],
+                "minReuseDistanceMacroM": check_result["minReuseDistanceMacroM"],
+                "minReuseDistanceIndoorM": check_result["minReuseDistanceIndoorM"],
+                "macroFacingAngleDeg": check_result["macroFacingAngleDeg"],
+                "indoorFacingAngleDeg": check_result["indoorFacingAngleDeg"],
+                "reuseCheck": check_result["reuseCheck"],
+                "collisionCheck": check_result["collisionCheck"],
+                "confusionCheck": check_result["confusionCheck"],
+                "mod3Check": check_result["mod3Check"],
+                "mod30Check": check_result["mod30Check"],
+                "neighborAssoc": check_result["neighborAssoc"],
+                "totalCells": check_result["totalCells"],
+                "poolCells": check_result["poolCells"],
+                "neighborPairCount": check_result["neighborPairCount"],
+                "summary": check_result["summary"],
+                "skippedCells": skipped_cells,
+                "skippedCount": len(skipped_cells),
+                "results": check_result["results"],
+                "startTime": task.started_at.isoformat() if task.started_at else None,
+                "endTime": task.completed_at.isoformat() if task.completed_at else None,
+            }
+            self._persist_task(task.task_id)
+            self._save_task_result_to_db(task)
+            logger.info(
+                f"[TaskManager] PCI核查完成: 核查小区={check_result['totalCells']}, "
+                f"分类命中={check_result['summary']}, 跳过={len(skipped_cells)}"
+            )
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            task.status = TaskStatus.FAILED
+            task.error = str(e)
+            task.completed_at = datetime.now()
+            task.result = {
+                "taskId": task.task_id,
+                "status": "failed",
+                "progress": task.progress,
+                "totalCells": 0,
+                "summary": {},
+                "results": {},
+                "startTime": task.started_at.isoformat() if task.started_at else "",
+                "endTime": task.completed_at.isoformat() if task.completed_at else None,
+                "error": str(e),
+            }
+
     async def _run_tac_planning_task(self, task: Task):
         """运行TAC规划任务 (数据驱动型)"""
         logger.info(f"[TaskManager] _run_tac_planning_task 开始执行, task_id: {task.task_id}")
@@ -3291,13 +3464,21 @@ class TaskManager:
             try:
                 # 使用 sanitize + default=str 确保 NaN/Infinity/numpy 等非 JSON 原生类型也能安全序列化
                 safe_result = self._sanitize_result(task.result) if task.result else None
+                if task.result is not None:
+                    # 原地清洗后标记，后续查看结果不再重复遍历大结果
+                    task._result_sanitized = True
                 result_json = json.dumps(safe_result, ensure_ascii=False, allow_nan=False, default=str) if safe_result else None
                 config_json = json.dumps(task.config, ensure_ascii=False, default=str) if task.config else None
                 cell_count = self._extract_cell_count(safe_result) if safe_result else None
+                summary, applied_values = self._result_metadata(safe_result, task.task_type)
+                summary_json = self._dump_meta_json(summary)
+                applied_values_json = self._dump_meta_json(applied_values)
 
                 existing = db.query(TaskResult).filter(TaskResult.task_id == task.task_id).first()
                 if existing:
                     existing.result_json = result_json
+                    existing.summary_json = summary_json
+                    existing.applied_values_json = applied_values_json
                     existing.status = task.status.value
                     existing.progress = task.progress
                     if cell_count is not None:
@@ -3317,6 +3498,8 @@ class TaskManager:
                         user_name=getattr(task, 'user_name', None),
                         config_json=config_json,
                         result_json=result_json,
+                        summary_json=summary_json,
+                        applied_values_json=applied_values_json,
                         status=task.status.value,
                         progress=task.progress,
                         error_message=task.error,
@@ -3328,6 +3511,14 @@ class TaskManager:
                         operator=getattr(task, 'operator', None),
                     ))
                 db.commit()
+                if safe_result is not None:
+                    try:
+                        from app.services import task_result_index_service as index_service
+                        index_service.schedule_index(
+                            task.task_id, task.task_type.value, safe_result
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
             finally:
                 db.close()
         except Exception as e:
@@ -3383,11 +3574,13 @@ class TaskManager:
     # full_params_id 变化（全量工参切换）时缓存整体失效；应用/删除任务时按需清除
     _history_verify_cache: Dict[str, tuple] = {}
     _history_verify_cache_max = 300
+    # 已判定「体积过大、不在列表请求里解析」的旧任务，避免每次刷新都算一遍体积
+    _legacy_meta_skipped: set = set()
 
     # ================================================== 同组任务共享（桌面端同步）
 
     # 参与同组共享的历史任务类型（规划类）；apply_* 绑定本机工参，不参与共享
-    SHARED_TASK_TYPES = ("pci", "neighbor", "tac", "tac_planning")
+    SHARED_TASK_TYPES = ("pci", "neighbor", "tac", "tac_planning", "pci_check")
 
     @staticmethod
     def _shared_task_meta(row) -> Dict[str, Any]:
@@ -3537,11 +3730,20 @@ class TaskManager:
                 row.is_applied = 1
             if result_json is not None:
                 row.result_json = result_json
+                summary, applied_values = self._result_metadata(result, task_type)
+                row.summary_json = self._dump_meta_json(summary)
+                row.applied_values_json = self._dump_meta_json(applied_values)
             # 组以服务器（授权记录的组）为准，防止客户端串组
             row.city = city
             row.operator = operator
             db.commit()
             db.refresh(row)
+            if result is not None:
+                try:
+                    from app.services import task_result_index_service as index_service
+                    index_service.schedule_index(task_id, task_type, result)
+                except Exception:  # noqa: BLE001
+                    pass
             # 同组网页端历史列表即时刷新（新增任务 / 应用标记变化）
             self._notify_tasks_changed(city, operator, task_id)
             return self._shared_task_meta(row)
@@ -3604,9 +3806,16 @@ class TaskManager:
                 row = db.query(TaskResult).filter(TaskResult.task_id == task_id).first()
                 if row is not None and not row.result_json:
                     row.result_json = json.dumps(result, ensure_ascii=False, allow_nan=False, default=str)
+                    summary, applied_values = self._result_metadata(result, row.task_type)
+                    row.summary_json = self._dump_meta_json(summary)
+                    row.applied_values_json = self._dump_meta_json(applied_values)
                     db.commit()
-                    # 结果落地后历史列表要重算摘要/应用状态，清掉验证缓存
                     TaskManager._history_verify_cache.pop(task_id, None)
+                    try:
+                        from app.services import task_result_index_service as index_service
+                        index_service.schedule_index(task_id, row.task_type, result)
+                    except Exception:  # noqa: BLE001
+                        pass
             finally:
                 db.close()
         except Exception as exc:  # noqa: BLE001
@@ -3653,6 +3862,84 @@ class TaskManager:
         except Exception:  # noqa: BLE001
             pass
 
+    def _ensure_history_metadata(self, db, rows) -> Dict[str, tuple]:
+        """读取历史列表摘要；仅对体积可控的旧任务做一次懒回填。
+
+        返回 {task_id: (summary, applied_values)}。大结果不在这里解析：
+        首次访问旧大任务时沿用 cell_count / is_applied，等后台回填完成。
+        """
+        from app.models.database import TaskResult
+        from sqlalchemy import LargeBinary, cast, func
+
+        meta_map: Dict[str, tuple] = {}
+        legacy_ids = []
+        for row in rows:
+            summary = self._load_meta_json(getattr(row, "summary_json", None))
+            applied = self._load_meta_json(getattr(row, "applied_values_json", None))
+            if (
+                getattr(row, "summary_json", None) is None
+                and getattr(row, "applied_values_json", None) is None
+                and row.status == "completed"
+            ):
+                legacy_ids.append(row.task_id)
+            else:
+                meta_map[row.task_id] = (summary, applied)
+        if not legacy_ids:
+            return meta_map
+
+        # 按 BLOB 字节数判断体积：TEXT 的 length() 会逐字符扫描整列，
+        # 对 200MB+ 的旧结果会重现历史列表卡顿。
+        pending_ids = [
+            task_id for task_id in legacy_ids
+            if task_id not in TaskManager._legacy_meta_skipped
+        ]
+        size_rows = (
+            db.query(
+                TaskResult.task_id,
+                func.length(cast(TaskResult.result_json, LargeBinary)),
+            )
+            .filter(TaskResult.task_id.in_(pending_ids))
+            .all()
+        ) if pending_ids else []
+        small_ids = []
+        for task_id, size in size_rows:
+            if size is None:
+                # 镜像任务暂无结果：不能标记为「过大」，否则结果按需落地后永远不再解析
+                continue
+            if size <= self._LEGACY_META_INLINE_LIMIT:
+                small_ids.append(task_id)
+            else:
+                TaskManager._legacy_meta_skipped.add(task_id)
+        if len(TaskManager._legacy_meta_skipped) > 2000:
+            TaskManager._legacy_meta_skipped.clear()
+        if small_ids:
+            row_by_id = {row.task_id: row for row in rows}
+            payload_rows = (
+                db.query(TaskResult.task_id, TaskResult.result_json)
+                .filter(TaskResult.task_id.in_(small_ids))
+                .all()
+            )
+            for task_id, raw in payload_rows:
+                try:
+                    parsed = json.loads(raw) if raw else None
+                except Exception:  # noqa: BLE001
+                    parsed = None
+                if parsed is None:
+                    continue
+                row = row_by_id.get(task_id)
+                summary = self._extract_result_summary(parsed)
+                applied = None
+                if row is not None and row.task_type in self._APPLIED_VALUE_TYPES:
+                    applied = self._extract_applied_values(parsed)
+                if row is not None:
+                    row.summary_json = self._dump_meta_json(summary)
+                    row.applied_values_json = self._dump_meta_json(applied)
+                meta_map[task_id] = (summary, applied)
+            db.commit()
+        for task_id in legacy_ids:
+            meta_map.setdefault(task_id, (None, None))
+        return meta_map
+
     def list_task_history(self, task_type: Optional[str] = None, page: int = 1, page_size: int = 20, user_name: Optional[str] = None, user=None) -> Dict:
         """从 SQLite 获取历史任务列表（分页），返回 {"tasks": [...], "total": 总数, "page": 当前页, "page_size": 每页条数}
 
@@ -3660,17 +3947,13 @@ class TaskManager:
         一律仅见本组任务，组信息缺失用户不可见任何任务。
         user_name 参数保留兼容（按发起人过滤，通常不与 user 同用）。
 
-        🔥 性能优化：
-        - total 单独 COUNT，不受分页截断影响，供前端 badge / 分页栏显示真实任务数
-        - 不再返回完整 result（含 results 数组）。单条任务结果可达数 MB，
-          一次加载会让响应膨胀到 10+ MB，是历史任务加载慢的根因。
-          前端"查看"时通过 /result/{taskId} 按需获取完整结果。
-        - result_json 只解析一次，供 isApplied 校验与摘要提取复用
-        - 同一任务在 sector 版本未变时缓存 isApplied/摘要，跳过大 result_json 的 json.loads
+        性能约束：列表只读 summary_json / applied_values_json / cell_count 等元数据，
+        绝不为了摘要或「已应用」状态解析整份 result_json（邻区单任务可达 200MB+）。
+        旧任务仅在结果体积可控时做一次懒回填，大结果交给后台回填。
         """
         try:
             from app.core.database import SessionLocal
-            from app.models.database import TaskResult, Sector, Site
+            from app.models.database import TaskResult
             from sqlalchemy.orm import defer
 
             db = SessionLocal()
@@ -3702,74 +3985,31 @@ class TaskManager:
                     .offset(offset).limit(safe_page_size).all()
                 )
 
-                # 读取当前全量工参的 sector 实际值，用于动态判断 applied 状态
+                # 摘要/规划值全部来自轻量列；只有旧任务才可能触发一次小结果懒回填
+                meta_map = self._ensure_history_metadata(db, results)
+
+                # 仅当页面里存在可应用参数的紧凑值时才加载当前工参
                 # （一律按请求用户的组定位工参；user=None 系统调用保持全局行为）
                 from app.services.data_group import user_group as _dg_user_group
                 _grp = _dg_user_group(user) or (None, None)
-                current_sector_values = self._load_current_sector_values(db, city=_grp[0], operator=_grp[1])
-                # 当前全量工参快照（工参 id + 内容指纹）：切换工参条目或工参内容变化时
-                # 「已应用」验证缓存整体失效，避免导入新工参后仍按旧值判定
-                params_snapshot = TaskManager._sector_values_cache.get("_cache_key") if TaskManager._sector_values_cache else None
-
-                # 🔥 优化：批量预取缓存未命中的 result_json（一次查询），
-                # 避免 defer 懒加载在循环中逐条触发 SELECT
-                # 缓存键还包含"已应用"标记：桌面端镜像任务由同步改写该标记，
-                # 标记变化时必须重算（否则跨端应用状态永远显示旧值）
-                miss_ids = [
-                    r.task_id for r in results
-                    if not (
-                        TaskManager._history_verify_cache.get(r.task_id)
-                        and TaskManager._history_verify_cache[r.task_id][0] == params_snapshot
-                        and len(TaskManager._history_verify_cache[r.task_id]) > 3
-                        and TaskManager._history_verify_cache[r.task_id][3] == bool(r.is_applied)
-                    )
-                ]
-                miss_result_map: Dict[str, Optional[str]] = {}
-                if miss_ids:
-                    miss_rows = db.query(TaskResult.task_id, TaskResult.result_json).filter(TaskResult.task_id.in_(miss_ids)).all()
-                    miss_result_map = {rid: rj for rid, rj in miss_rows}
+                current_sector_values = None
 
                 task_list = []
                 for r in results:
-                    # 动态检查：对比任务规划结果与当前全量工参的实际 PCI/TAC 值
-                    # 如果一致则视为已应用（即使标记为未应用），如果不一致则视为未应用（即使标记为已应用）
-                    # 同组同步来的 is_applied 标记只在「本机没有规划结果、无法比对」时兜底：
-                    # 该标记是另一端按它自己的工参判定的，本机工参与之不一致时会显示错配。
+                    # 「已应用」优先用紧凑规划值对照当前工参；无规划值的结果沿用同步标记
                     stored_applied = bool(getattr(r, "is_applied", 0))
-                    is_applied = False
-                    result_summary = None
-                    # 缓存命中（同任务 + 同工参版本 + 同应用标记）：跳过大 result_json 的 json.loads
-                    cached = TaskManager._history_verify_cache.get(r.task_id)
-                    if (cached and cached[0] == params_snapshot
-                            and len(cached) > 3 and cached[3] == stored_applied):
-                        is_applied = cached[1]
-                        result_summary = cached[2]
-                    else:
-                        parsed_result = None
-                        result_json_str = miss_result_map.get(r.task_id)
-                        if result_json_str:
-                            try:
-                                parsed_result = json.loads(result_json_str)
-                            except Exception:
-                                parsed_result = None
-                        if parsed_result is not None and self._result_has_comparable_values(parsed_result):
-                            # 「操作」列一律以当前全量工参的 PCI/TAC 列值为准，
-                            # 不用同组同步来的标记覆盖比对结果
-                            is_applied = self._verify_applied(parsed_result, current_sector_values)
-                        else:
-                            # 本机没有结果（桌面端镜像任务尚未落地），或结果里没有可比的
-                            # PCI/TAC 规划值 → 无法比对，只能沿用标记
-                            is_applied = stored_applied
-                        result_summary = self._extract_result_summary(parsed_result)
-                        if result_summary is None and (r.cell_count or 0) > 0:
-                            # 同组镜像任务（本机无 result_json）：用同步来的小数量生成最小摘要，
-                            # 否则桌面端历史列表「小区数量」列恒为 '-'
-                            result_summary = {"cellCount": int(r.cell_count)}
-                        TaskManager._history_verify_cache[r.task_id] = (
-                            params_snapshot, is_applied, result_summary, stored_applied)
-                        # 防止缓存无限增长
-                        if len(TaskManager._history_verify_cache) > TaskManager._history_verify_cache_max:
-                            TaskManager._history_verify_cache.clear()
+                    result_summary, applied_values = meta_map.get(r.task_id, (None, None))
+                    is_applied = stored_applied
+                    if applied_values:
+                        if current_sector_values is None:
+                            current_sector_values = self._load_current_sector_values(
+                                db, city=_grp[0], operator=_grp[1]
+                            )
+                        is_applied = self._verify_applied_values(applied_values, current_sector_values)
+                    if result_summary is None and (r.cell_count or 0) > 0:
+                        # 同组镜像任务（本机无 result_json）：用同步来的小数量生成最小摘要，
+                        # 否则桌面端历史列表「小区数量」列恒为 '-'
+                        result_summary = {"cellCount": int(r.cell_count)}
                     entry = {
                         "taskId": r.task_id,
                         "taskType": r.task_type,
@@ -4059,9 +4299,6 @@ class TaskManager:
             db.close()
         return updated
 
-    # 应用状态回填只对"结果里确实写了 PCI/TAC 值"的类型做（neighbor 结果不含参数值）
-    _APPLIED_BACKFILL_TYPES = ("pci", "tac", "tac_planning")
-
     @staticmethod
     def _result_has_comparable_values(result: Optional[Dict]) -> bool:
         """结果里是否至少有一个可比较的 PCI/TAC 值。
@@ -4102,7 +4339,7 @@ class TaskManager:
             rows = (
                 db.query(TaskResult)
                 .filter(
-                    TaskResult.task_type.in_(TaskManager._APPLIED_BACKFILL_TYPES),
+                    TaskResult.task_type.in_(TaskManager._APPLIED_VALUE_TYPES),
                     TaskResult.is_applied == 0,
                     TaskResult.result_json.isnot(None),
                 )
@@ -4139,6 +4376,96 @@ class TaskManager:
             db.close()
         return updated
 
+    # 只有这些任务的规划值可参与「已应用」动态比对；其余类型沿用同步标记。
+    _APPLIED_VALUE_TYPES = ("pci", "tac", "tac_planning")
+    # 旧任务首次进列表时，只对不超过该体积的结果做同步懒回填；
+    # 更大的结果交给后台回填（INLINE 解析会重现历史列表卡顿）。
+    _LEGACY_META_INLINE_LIMIT = 2 * 1024 * 1024
+
+    @staticmethod
+    def _extract_applied_values(result: Optional[Dict]) -> Optional[Dict[str, list]]:
+        """把规划结果压缩成 {小区键: [pci, tac]}，供历史列表快速比对当前工参。
+
+        邻区/PCI 核查结果没有可应用的参数值，返回 None，列表沿用 is_applied 标记。
+        """
+        if not isinstance(result, dict):
+            return None
+        items = result.get("results")
+        if not isinstance(items, list) or not items:
+            return None
+        values: Dict[str, list] = {}
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            sectors = item.get("sectors")
+            if isinstance(sectors, list):
+                site_id = TaskManager._norm_cell_id(item.get("siteId", ""))
+                for sector in sectors:
+                    if not isinstance(sector, dict):
+                        continue
+                    pci = sector.get("newPCI")
+                    tac = sector.get("tac")
+                    if pci is None and tac is None:
+                        continue
+                    key = f"{site_id}_{TaskManager._norm_cell_id(sector.get('sectorId', ''))}"
+                    values[key] = [pci, tac]
+            else:
+                tac = item.get("tac")
+                if tac is None:
+                    tac = item.get("suggestedTac")
+                if tac is None:
+                    continue
+                key = (
+                    f"{TaskManager._norm_cell_id(item.get('siteId', ''))}_"
+                    f"{TaskManager._norm_cell_id(item.get('sectorId', ''))}"
+                )
+                values[key] = [None, tac]
+        return values or None
+
+    @staticmethod
+    def _verify_applied_values(values: Dict[str, list], current_values: Dict[str, Dict]) -> bool:
+        """用压缩值映射比对当前工参；语义与 _verify_applied 一致。"""
+        if not values:
+            return False
+        for key, pair in values.items():
+            current = current_values.get(key)
+            if current is None:
+                return False
+            pci = pair[0] if isinstance(pair, list) and len(pair) > 0 else None
+            tac = pair[1] if isinstance(pair, list) and len(pair) > 1 else None
+            if pci is not None and not TaskManager._same_param_value(current.get("pci"), pci):
+                return False
+            if tac is not None and not TaskManager._same_param_value(current.get("tac"), tac):
+                return False
+        return True
+
+    @staticmethod
+    def _dump_meta_json(value: Optional[Any]) -> Optional[str]:
+        # 即使 value 为 None 也落一个 "null"，用于区分「已计算但无值」与「尚未回填」
+        try:
+            return json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
+        except Exception:  # noqa: BLE001
+            return None
+
+    @staticmethod
+    def _load_meta_json(raw: Optional[str]) -> Optional[Any]:
+        if not raw:
+            return None
+        try:
+            return json.loads(raw)
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _result_metadata(self, result: Optional[Dict], task_type: Any) -> tuple:
+        """返回 (summary, applied_values)；applied_values 只对可应用参数的类型生成。"""
+        if result is None:
+            return None, None
+        type_value = getattr(task_type, "value", task_type)
+        applied_values = None
+        if type_value in self._APPLIED_VALUE_TYPES:
+            applied_values = self._extract_applied_values(result)
+        return self._extract_result_summary(result), applied_values
+
     @staticmethod
     def _extract_result_summary(result: Optional[Dict]) -> Optional[Dict]:
         """从完整 result dict 中提取轻量摘要字段（避免历史列表返回大数据）
@@ -4151,6 +4478,7 @@ class TaskManager:
             r = result
             return {
                 "status": r.get("status"),
+                "networkType": r.get("networkType"),
                 "totalSites": r.get("totalSites", 0),
                 "totalSectors": r.get("totalSectors", 0),
                 "collisions": r.get("collisions", 0),
@@ -4195,30 +4523,47 @@ class TaskManager:
         # 如果任务完成，返回完整的结果数据（包含统计）
         if task.status == TaskStatus.COMPLETED:
             self._ensure_result(task)
-            result = task.result
             # 🔥 防御：确保结果不包含 NaN/Infinity（避免前端 JSON.parse 失败）
-            if result is not None:
-                result = self._sanitize_result(result)
-            return result
+            return self._sanitize_task_result(task)
         # 否则返回进度信息
         return task.to_dict()
+
+    def get_task_progress_meta(self, task_id: str) -> Optional[Dict]:
+        """进度轮询专用：只返回状态与轻量统计，绝不装载外置大结果。
+
+        邻区结果单份可达 200MB+。旧实现让进度接口在任务完成后直接返回完整
+        result，前端每 2s 轮询一次会重复解析/序列化 200MB JSON，阻塞事件循环
+        并占满一个 CPU 核（表现为“无操作也卡”）。完整结果由用户显式查看时
+        再走 /result 接口按需加载。
+        """
+        task = self.tasks.get(task_id)
+        if task is None:
+            return None
+        meta = task.to_dict()
+        # 同进程内刚完成的任务结果还在内存里，可零成本带上统计摘要；
+        # 已外置/重启恢复的任务不在这里读盘，前端由历史摘要补全。
+        if task.result is not None:
+            summary = self._extract_result_summary(task.result)
+            if summary:
+                for key, value in summary.items():
+                    if value is not None:
+                        meta.setdefault(key, value)
+        return meta
 
     def get_task_result(self, task_id: str) -> Optional[Dict]:
         """获取任务结果（内存优先，回退到 SQLite）"""
         task = self.tasks.get(task_id)
         if task and task.status == TaskStatus.COMPLETED:
             self._ensure_result(task)
-            result = task.result
             # 🔥 防御：确保结果不包含 NaN/Infinity
-            if result is not None:
-                result = self._sanitize_result(result)
+            result = self._sanitize_task_result(task)
             if result is not None:
                 return result
         # 回退到 SQLite 历史任务
         db_result = self.get_task_result_from_db(task_id)
         if db_result is not None:
-            db_result = self._sanitize_result(db_result)
-            return db_result
+            return self._sanitize_result(db_result)
+
         # 旧版大索引正在后台拆分：此刻 self.tasks 还是空的，等它跑完再取一次，
         # 避免升级后首次启动的几秒窗口里「查看历史结果」拿到空
         if self._index_migration_pending:
@@ -4227,8 +4572,9 @@ class TaskManager:
                 task = self.tasks.get(task_id)
                 if task and task.status == TaskStatus.COMPLETED:
                     self._ensure_result(task)
-                    if task.result is not None:
-                        return self._sanitize_result(task.result)
+                    result = self._sanitize_task_result(task)
+                    if result is not None:
+                        return result
             db_result = self.get_task_result_from_db(task_id)
             if db_result is not None:
                 return self._sanitize_result(db_result)
@@ -4290,6 +4636,12 @@ class TaskManager:
                     db.close()
             except Exception as e:
                 logger.warning(f"[TaskManager] SQLite 删除失败（可忽略）: {e}")
+
+            try:
+                from app.services import task_result_index_service as index_service
+                index_service.delete_task_rows(task_id_str)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"[TaskManager] 明细索引删除失败（可忽略）: {e}")
 
             # 4. 删除导出文件
             try:

@@ -24,6 +24,28 @@ export interface CellSector {
   latitude?: number | null
 }
 
+/** 列过滤字段 → 取值文本（大小写不敏感的模糊匹配基础） */
+const COLUMN_ACCESSORS: Record<string, (sector: CellSector) => string> = {
+  siteId: s => s.siteId ?? '',
+  cellId: s => s.id,
+  cellFreq: s => s.frequency == null ? '' : String(s.frequency),
+  cellPci: s => s.pci == null ? '' : String(s.pci),
+  cellName: s => s.name ?? '',
+  cellLng: s => s.longitude == null ? '' : String(s.longitude),
+  cellLat: s => s.latitude == null ? '' : String(s.latitude),
+}
+
+/** 表头下方过滤行的列顺序与宽度，与表头保持一致 */
+const FILTER_COLUMNS: Array<{ key: string; width: string; fallbackLabel: string }> = [
+  { key: 'siteId', width: 'w-[80px] shrink-0', fallbackLabel: '基站ID' },
+  { key: 'cellId', width: 'w-[80px] shrink-0', fallbackLabel: '小区ID' },
+  { key: 'cellFreq', width: 'w-[90px] shrink-0', fallbackLabel: '频点' },
+  { key: 'cellPci', width: 'w-[70px] shrink-0', fallbackLabel: 'PCI' },
+  { key: 'cellName', width: 'flex-1 min-w-0', fallbackLabel: '小区名称' },
+  { key: 'cellLng', width: 'w-[95px] shrink-0', fallbackLabel: '经度' },
+  { key: 'cellLat', width: 'w-[85px] shrink-0', fallbackLabel: '纬度' },
+]
+
 export interface CellSelectionTableProps {
   /** 当前网络类型的小区列表 */
   sectors: CellSector[]
@@ -39,6 +61,8 @@ export interface CellSelectionTableProps {
   selectedCountText?: string
   /** 搜索框占位文本（可选） */
   searchPlaceholder?: string
+  /** 是否启用「搜索」按钮 + 表头下方按列模糊过滤（默认关闭，保持其他页面原样） */
+  enableColumnSearch?: boolean
   /** 加载状态 */
   loading?: boolean
   /** 列标题文本（可选，用于国际化） */
@@ -54,6 +78,7 @@ export interface CellSelectionTableProps {
     clearSelections: string
     uploadCellFile?: string
     downloadCellTemplate?: string
+    search?: string
   }
   /** 上传待规划小区文件回调 */
   onUploadCellFile?: () => void
@@ -83,6 +108,7 @@ export const CellSelectionTable = ({
   onClearSelections: _onClearSelections,
   selectedCountText,
   searchPlaceholder = '搜索基站ID、小区ID或名称...',
+  enableColumnSearch = false,
   loading = false,
   columnLabels,
   onUploadCellFile,
@@ -96,19 +122,27 @@ export const CellSelectionTable = ({
   disabled = false,
 }: CellSelectionTableProps) => {
   const [searchValue, setSearchValue] = useState('')
+  const [columnSearchEnabled, setColumnSearchEnabled] = useState(false)
+  const [columnFilters, setColumnFilters] = useState<Record<string, string>>({})
   const [scrollTop, setScrollTop] = useState(0)
   const containerRef = useRef<HTMLDivElement>(null)
 
-  // 搜索过滤
+  // 搜索过滤：全局关键字 + 按列模糊匹配
   const filtered = useMemo(() => {
-    if (!searchValue) return sectors
-    const q = searchValue.toLowerCase()
-    return sectors.filter(s =>
-      (s.siteId || '').toLowerCase().includes(q) ||
-      s.id.toLowerCase().includes(q) ||
-      (s.name || '').toLowerCase().includes(q)
-    )
-  }, [sectors, searchValue])
+    const globalQuery = searchValue.toLowerCase()
+    const activeColumns = Object.entries(columnFilters).filter(([, value]) => value.trim())
+    if (!globalQuery && activeColumns.length === 0) return sectors
+    return sectors.filter(s => {
+      if (globalQuery && !(
+        (s.siteId || '').toLowerCase().includes(globalQuery) ||
+        s.id.toLowerCase().includes(globalQuery) ||
+        (s.name || '').toLowerCase().includes(globalQuery)
+      )) return false
+      return activeColumns.every(([key, value]) =>
+        COLUMN_ACCESSORS[key](s).toLowerCase().includes(value.trim().toLowerCase())
+      )
+    })
+  }, [sectors, searchValue, columnFilters])
 
   // 虚拟滚动计算 —— 当过滤后结果能完全显示时，直接渲染全部（无需滚动）
   const { visibleData, totalHeight, offsetY } = useMemo(() => {
@@ -135,7 +169,7 @@ export const CellSelectionTable = ({
   useEffect(() => {
     setScrollTop(0)
     if (containerRef.current) containerRef.current.scrollTop = 0
-  }, [searchValue])
+  }, [searchValue, columnFilters])
 
   const handleScroll = useCallback((e: React.UIEvent<HTMLDivElement>) => {
     setScrollTop(e.currentTarget.scrollTop)
@@ -185,6 +219,21 @@ export const CellSelectionTable = ({
             className="w-full pl-7 pr-3 py-1.5 text-xs bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-inset focus:ring-primary"
           />
         </div>
+        {enableColumnSearch && (
+          <button
+            onClick={() => {
+              if (columnSearchEnabled) setColumnFilters({})
+              setColumnSearchEnabled(prev => !prev)
+            }}
+            className={`flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs transition-colors shrink-0 ${
+              columnSearchEnabled ? 'bg-blue-400 text-white hover:bg-blue-500' : 'bg-card border border-border hover:bg-muted/80'
+            }`}
+            title={columnLabels?.search || '搜索'}
+          >
+            <Search size={14} />
+            {columnLabels?.search || '搜索'}
+          </button>
+        )}
         {onUploadCellFile && (
           <button
             onClick={onUploadCellFile}
@@ -232,8 +281,8 @@ export const CellSelectionTable = ({
       </div>
 
 
-      {/* 表格区域 */}
-      {filtered.length === 0 ? (
+      {/* 表格区域：无数据才整块占位，过滤无命中时保留表头与过滤行以便修改关键字 */}
+      {sectors.length === 0 ? (
         <div className="flex-1 flex items-center justify-center text-muted-foreground">
           <p>暂无小区数据</p>
         </div>
@@ -276,7 +325,28 @@ export const CellSelectionTable = ({
                 <div className="p-2 bg-muted border-r border-border w-[95px] shrink-0">{colLabels.cellLng ?? '经度'}</div>
                 <div className="p-2 bg-muted w-[85px] shrink-0">{colLabels.cellLat ?? '纬度'}</div>
               </div>
+              {enableColumnSearch && columnSearchEnabled && (
+                <div className="flex text-[10px]">
+                  <div className="p-1 bg-card border-t border-r border-border w-10 shrink-0" />
+                  {FILTER_COLUMNS.map((column) => (
+                    <div key={column.key} className={`p-1 bg-card border-t border-r border-border ${column.width}`}>
+                      <input
+                        type="text"
+                        value={columnFilters[column.key] || ''}
+                        onChange={e => setColumnFilters(prev => ({ ...prev, [column.key]: e.target.value }))}
+                        aria-label={`${column.fallbackLabel}筛选`}
+                        className="w-full px-1 py-0.5 border border-border rounded text-[10px] text-foreground bg-input focus:outline-none focus:ring-1 focus:ring-primary"
+                      />
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
+
+            {/* 过滤无命中提示（表头保留可继续改关键字） */}
+            {filtered.length === 0 && (
+              <div className="p-4 text-center text-xs text-muted-foreground">无匹配小区</div>
+            )}
 
             {/* 虚拟滚动内容 */}
             <div

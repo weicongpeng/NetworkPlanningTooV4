@@ -184,6 +184,53 @@ def test_save_extends_schema_for_new_scalar_keys(temp_data_dir):
     assert "name" in gdf.columns
 
 
+def test_saved_chinese_columns_read_back_intact(temp_data_dir):
+    """保存后经下发链路（get_layer_data）读回：中文字段名不得是二次转码的乱码。
+
+    回归：读取侧若先强制 encoding='gbk'，本工具写出的 TAB（GBK 字节 + 声明
+    WindowsSimpChinese）会被二次转码，"面积km2" 变成 "闈㈢Нkm2"——本机与同组
+    用户看到的都是乱码列名。
+    """
+    r = layer_edit_service.create_empty_tab_layer("中文列测试", "point", user_id=1)
+    did, lid = r["data_id"], r["layer_id"]
+    data_dir = temp_data_dir / did
+
+    get_layer_data(did, lid, data_dir)  # 先建缓存，模拟"改动前已被别人读过"
+    f = _point(116.4, 39.9)
+    f["properties"].update({"名称": "站点A", "面积km2": 1.25})
+    layer_edit_service.save_layer_geojson(did, lid, _fc([f]), user_id=1)
+
+    back = get_layer_data(did, lid, data_dir)
+    props = back["features"][0]["properties"]
+    assert "面积km2" in props and "名称" in props
+    assert not any("闈" in k or "�" in k for k in props)
+
+
+def test_save_drops_legacy_columns(temp_data_dir):
+    """drop_fields 整列删除：历史无单位列（面积/长度）被移除，带单位列（面积km2）落盘，
+    且被删列即使仍出现在要素属性里也不会复活。"""
+    from app.services.layer_edit_service import save_layer_geojson, _read_tab_gdf
+
+    r = layer_edit_service.create_empty_tab_layer("删列测试", "point", user_id=1)
+    did, lid = r["data_id"], r["layer_id"]
+    tab = temp_data_dir / did / f"{r['name']}.tab"
+
+    # 第一次：旧版口径写入无单位列
+    f1 = _point(116.4, 39.9)
+    f1["properties"].update({"面积": 1.5, "长度": 2.5})
+    save_layer_geojson(did, lid, _fc([f1]), user_id=1)
+    assert {"面积", "长度"} <= set(_read_tab_gdf(tab).columns)
+
+    # 第二次：删除旧列，写带单位列（属性里仍残留旧键，模拟前端未清理干净）
+    f2 = _point(116.4, 39.9)
+    f2["properties"].update({"面积": 1.5, "长度": 2.5, "面积km2": 1.5, "长度m": 2.5})
+    save_layer_geojson(did, lid, _fc([f2]), user_id=1, drop_fields=["面积", "长度"])
+
+    cols = set(_read_tab_gdf(tab).columns)
+    assert "面积km2" in cols and "长度m" in cols
+    assert "面积" not in cols and "长度" not in cols
+
+
 def test_save_rejects_non_tab(temp_data_dir):
     """源文件非 .tab（MIF/KML）时保存应抛错。"""
     r = layer_edit_service.create_empty_tab_layer("非tab测试", "point", user_id=1)

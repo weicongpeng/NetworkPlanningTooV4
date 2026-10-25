@@ -231,3 +231,67 @@ def test_result_without_comparable_values_keeps_synced_flag(params_db):
 
     _add_pci_task(params_db, task_id="t-nb", result={"results": [{"siteId": "S1"}]})
     assert _applied_of("t-nb") is False
+
+
+def test_history_list_uses_metadata_without_parsing_result(params_db):
+    """已有轻量元数据时，列表不能再碰 result_json（即使它是非法 JSON）。"""
+    _seed_work_params(params_db)
+    db = params_db()
+    try:
+        db.add(TaskResult(
+            task_id="t-meta", task_type="pci", task_name="PCI", user_name="tester",
+            status="completed", city="河源", operator="联通",
+            created_at="2026-10-10T02:00:00",
+            result_json="{ this is not json",
+            summary_json=json.dumps({"totalSectors": 1, "cellCount": 1}),
+            applied_values_json=json.dumps({"S1_32": [486, 33807]}),
+        ))
+        db.commit()
+    finally:
+        db.close()
+
+    history = task_manager.list_task_history(task_type="pci", page=1, page_size=20, user=USER)
+    row = next(t for t in history["tasks"] if t["taskId"] == "t-meta")
+    assert row["isApplied"] is True
+    assert row["resultSummary"]["cellCount"] == 1
+
+
+def test_small_legacy_result_is_backfilled_once(params_db):
+    """旧任务首次进列表时懒回填元数据，之后不再解析 result_json。"""
+    _seed_work_params(params_db)
+    _add_pci_task(params_db, task_id="t-legacy")
+
+    assert _applied_of("t-legacy") is True
+
+    db = params_db()
+    try:
+        row = db.query(TaskResult).filter(TaskResult.task_id == "t-legacy").first()
+        assert row.summary_json is not None
+        assert row.applied_values_json is not None
+    finally:
+        db.close()
+
+
+def test_large_legacy_result_is_not_parsed_inline(params_db, monkeypatch):
+    """超过阈值的旧结果不在列表请求里解析：回退 cell_count / 已存标记。"""
+    _seed_work_params(params_db)
+    monkeypatch.setattr(TaskManager, "_LEGACY_META_INLINE_LIMIT", 10)
+    db = params_db()
+    try:
+        db.add(TaskResult(
+            task_id="t-large-legacy", task_type="pci", task_name="PCI", user_name="tester",
+            status="completed", city="河源", operator="联通",
+            created_at="2026-10-10T03:00:00", cell_count=1,
+            result_json=json.dumps({
+                "results": [{"siteId": "S1", "sectors": [{"sectorId": "32", "newPCI": 486}]}]
+            }),
+        ))
+        db.commit()
+    finally:
+        db.close()
+
+    history = task_manager.list_task_history(task_type="pci", page=1, page_size=20, user=USER)
+    row = next(t for t in history["tasks"] if t["taskId"] == "t-large-legacy")
+    # 未解析结果 → 无法动态比对，沿用已存标记（默认 0）
+    assert row["isApplied"] is False
+    assert row["resultSummary"] == {"cellCount": 1}

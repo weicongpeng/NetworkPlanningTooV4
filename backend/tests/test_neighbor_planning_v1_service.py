@@ -281,12 +281,12 @@ class TestSiteSpacingAndScenarios:
             ]))
         return targets
 
-    def test_site_spacing_outdoor_uses_nearest_9(self, planner_factory):
+    def test_site_spacing_outdoor_uses_nearest_11(self, planner_factory):
         targets = self._spacing_targets()
         planner = planner_factory(self._single_source(), targets, max_neighbors=64)
         spacing = planner.calculate_site_spacing(planner.source_cells_df.iloc[0])
-        # 室外源取最近9站距离 0.5~1.3km → 平均 0.9km
-        assert spacing == pytest.approx(0.9, abs=0.02)
+        # 室外源取最近11站距离 0.5~1.5km → 平均 1.0km
+        assert spacing == pytest.approx(1.0, abs=0.02)
 
     def test_site_spacing_indoor_uses_nearest_8(self, planner_factory):
         targets = self._spacing_targets()
@@ -524,6 +524,22 @@ class TestDirectionGate:
         assert "IN_FWD" in kept       # ≤600米 前向：加
         assert "IN_BACK" not in kept  # ≤600米 背向：不加
         assert "IN_FAR" not in kept   # 800米>600米：不加
+
+    def test_outdoor_to_indoor_within_300m_exempted_from_gate(self, planner_factory):
+        # 超近室分豁免：300米内背向室分免朝向闸门入候选，>300米背向仍被拒。
+        # 回归背景：河源东站AAU1（az=20°）89m 站房室分偏角124.7°>120°被误杀
+        targets = self._sparse_ctl()
+        lat, lon = _point_at(SOURCE_LAT, SOURCE_LON, 180.0, 0.089)
+        targets.append(_make_site("IN_CLOSEBACK", [
+            _make_sector("IN_CLOSEBACK", "1", lat, lon, 1850, azimuth=360.0, cover_type=4)]))
+        lat, lon = _point_at(SOURCE_LAT, SOURCE_LON, 180.0, 0.4)
+        targets.append(_make_site("IN_FARBACK", [
+            _make_sector("IN_FARBACK", "1", lat, lon, 1850, azimuth=0.0, cover_type=4)]))
+        planner = planner_factory(self._source(), targets, max_neighbors=64)
+        neighbors = _plan(planner)
+        kept = {n.target_enodeb_id for n in neighbors}
+        assert "IN_CLOSEBACK" in kept    # 89米背向：300米内豁免，加
+        assert "IN_FARBACK" not in kept  # 400米背向：超300米仍被闸门拒
 
     def test_forced_close_neighbor_not_affected_by_gate(self, planner_factory):
         # 稀疏场景下，300m 内强制邻区不受朝向闸门影响（极近站间切换必需）

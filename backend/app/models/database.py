@@ -4,7 +4,7 @@ SQLAlchemy ORM 模型定义
 import json
 from datetime import datetime, timezone
 from sqlalchemy import (
-    Column, Integer, String, Boolean, DateTime, Float, ForeignKey, Index, Text
+    Column, Integer, String, Boolean, DateTime, Float, ForeignKey, Index, LargeBinary, Text
 )
 from sqlalchemy.orm import relationship
 from app.core.database import Base
@@ -220,6 +220,8 @@ class GeoFile(Base):
     point_count = Column(Integer, nullable=True)
     bbox = Column(Text, nullable=True)
     file_size = Column(Integer, nullable=True)
+    # 导入提醒（JSON 数组，如 coord_zero）：非致命问题，前端黄色提示；NULL=存量未检查
+    import_warnings = Column(Text, nullable=True)
     created_at = Column(String(30), nullable=False)
 
     __table_args__ = (
@@ -297,6 +299,11 @@ class TaskResult(Base):
     operator = Column(String(50), nullable=True)
     config_json = Column(Text, nullable=True)
     result_json = Column(Text, nullable=True)
+    # 历史列表专用轻量元数据：避免为了摘要/已应用状态解析整份 result_json
+    summary_json = Column(Text, nullable=True)
+    applied_values_json = Column(Text, nullable=True)
+    # 明细行索引是否已建好（0/1）；旧任务由后台回填
+    rows_ready = Column(Integer, nullable=False, default=0)
     status = Column(String(20), nullable=False, default="completed")
     progress = Column(Float, default=100.0)
     error_message = Column(Text, nullable=True)
@@ -312,6 +319,79 @@ class TaskResult(Base):
     __table_args__ = (
         Index("idx_task_results_type", "task_type"),
         Index("idx_task_results_created", "created_at"),
+    )
+
+
+class TaskResultRow(Base):
+    """任务结果明细行索引：把大 JSON 拆成可按页/按条件查询的行。
+
+    大结果仍保留在 result_json/sidecar 供导出与旧客户端使用；本表只服务
+    结果页分页、搜索与地图按需加载，避免每次查看都解析整份 JSON。
+    """
+    __tablename__ = "task_result_rows"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    task_id = Column(String(36), nullable=False)
+    seq = Column(Integer, nullable=False)
+    # PCI 核查按类别分 Tab；其余任务为 NULL
+    category = Column(String(40), nullable=True)
+    # 邻区规划（扁平关系行）
+    relation_type = Column(String(40), nullable=True)
+    source_site = Column(String(64), nullable=True)
+    source_cell = Column(String(64), nullable=True)
+    source_name = Column(String(255), nullable=True)
+    source_pci = Column(String(40), nullable=True)
+    source_freq = Column(String(40), nullable=True)
+    target_site = Column(String(64), nullable=True)
+    target_cell = Column(String(64), nullable=True)
+    target_name = Column(String(255), nullable=True)
+    target_pci = Column(String(40), nullable=True)
+    target_freq = Column(String(40), nullable=True)
+    distance = Column(String(40), nullable=True)
+    # TAC 核查/规划（小区行）
+    first_group = Column(String(100), nullable=True)
+    site_id = Column(String(64), nullable=True)
+    site_name = Column(String(255), nullable=True)
+    sector_id = Column(String(64), nullable=True)
+    sector_name = Column(String(255), nullable=True)
+    network_type = Column(String(20), nullable=True)
+    longitude = Column(String(40), nullable=True)
+    latitude = Column(String(40), nullable=True)
+    tac = Column(String(40), nullable=True)
+    existing_tac = Column(String(40), nullable=True)
+    tac_consistent = Column(String(20), nullable=True)
+    is_singularity = Column(String(20), nullable=True)
+    suggested_tac = Column(String(40), nullable=True)
+    matched = Column(String(20), nullable=True)
+    # 完整行（zlib 压缩）：覆盖搜索列之外的展示字段与地图附加信息
+    record_blob = Column(LargeBinary, nullable=False)
+
+    __table_args__ = (
+        Index("idx_task_result_rows_task_seq", "task_id", "seq", unique=True),
+        Index("idx_task_result_rows_task_source", "task_id", "source_site", "source_cell"),
+        Index("idx_task_result_rows_task_category", "task_id", "category", "seq"),
+        Index("idx_task_result_rows_task_site", "task_id", "site_id", "sector_id"),
+    )
+
+
+class TaskResultSourceGroup(Base):
+    """邻区结果的源小区分组索引（供结果表按源小区快速分页）。"""
+    __tablename__ = "task_result_source_groups"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    task_id = Column(String(36), nullable=False)
+    seq = Column(Integer, nullable=False)
+    source_site = Column(String(64), nullable=True)
+    source_cell = Column(String(64), nullable=True)
+    source_name = Column(String(255), nullable=True)
+    source_pci = Column(String(40), nullable=True)
+    source_freq = Column(String(40), nullable=True)
+    relation_type = Column(String(40), nullable=True)
+    row_count = Column(Integer, nullable=False, default=0)
+    first_seq = Column(Integer, nullable=False, default=0)
+
+    __table_args__ = (
+        Index("idx_task_result_groups_task_seq", "task_id", "seq", unique=True),
     )
 
 

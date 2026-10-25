@@ -123,6 +123,7 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
       icon: GitCompare,
       children: [
         { type: 'link', name: t('nav.tac'), href: '/tac' },
+        { type: 'link', name: t('nav.pciCheck'), href: '/pci-check' },
       ],
     },
     // 网优助手：管理员或被授予 can_assistant 权限的用户可见

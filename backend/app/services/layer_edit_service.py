@@ -1112,13 +1112,20 @@ def _write_layer_gdf(*, data_id: str, data_dir: Path, tab_path: Path, layer_id: 
 
 
 def save_layer_geojson(data_id: str, layer_id: str, geojson: Dict[str, Any],
-                       user_id: int = 1) -> Dict[str, Any]:
+                       user_id: int = 1,
+                       drop_fields: Optional[List[str]] = None) -> Dict[str, Any]:
     """把前端编辑工作集整层重写回 TAB（GCJ02→WGS84，保留旧属性表 schema）。
+
+    Args:
+        drop_fields: 需要从旧 schema 中**删除**的列名（整列丢弃，不只是清空值）。
+            用于"更新表"把历史遗留的无单位列（如 `面积`）换成带单位列（如 `面积km2`）
+            时清理旧列，否则旧列会永久残留在源文件里。
 
     Returns:
         {"success": True, "feature_count": N}
     """
     data_dir, entry, tab_path, entry_type = _resolve_layer_target(data_id, layer_id)
+    drop_set = {str(c) for c in (drop_fields or []) if str(c)}
     fmt = _layer_fmt(tab_path) or "tab"
     # Shapefile / GeoJSON 的样式落在同 stem .qml，不写 NPT_FEATSYM 列（DBF 字段名上限
     # 也放不下 12 字节的列名）；圆的元数据 .qml 表达不了，仍走属性列但用 ≤10 字节名。
@@ -1133,6 +1140,12 @@ def save_layer_geojson(data_id: str, layer_id: str, geojson: Dict[str, Any],
     for internal in _INTERNAL_FIELDS:
         if internal in attr_cols:
             attr_cols.remove(internal)
+    # 待删除列：旧 schema 里直接剔除（整列丢弃）
+    if drop_set:
+        attr_cols = [c for c in attr_cols if c not in drop_set]
+        for c in list(old_dtypes):
+            if c in drop_set:
+                old_dtypes.pop(c, None)
     # 样式持久化列不走通用属性对齐（前端属性里是还原后的内部字段），单独序列化
     for c in (_STYLE_PERSIST_COL, _META_PERSIST_COL, _META_PERSIST_COL_DBF):
         if c in attr_cols:
@@ -1151,7 +1164,8 @@ def save_layer_geojson(data_id: str, layer_id: str, geojson: Dict[str, Any],
     for f in features:
         props = f.get("properties") or {}
         for k in props.keys():
-            if k in seen_cols or k in reserved or k.startswith("_"):
+            # drop_set 里的列即使仍出现在属性里也不得复活（否则等于没删）
+            if k in seen_cols or k in reserved or k in drop_set or k.startswith("_"):
                 continue
             if len(new_cols) >= 200:
                 break
