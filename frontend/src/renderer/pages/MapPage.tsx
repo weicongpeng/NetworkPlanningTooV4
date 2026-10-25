@@ -1510,11 +1510,13 @@ export function MapPage() {
       net === 'lte' ? true : currentVis.lte,
       net === 'nr' ? true : currentVis.nr
     )
-    // 勾选总开关时该制式所有频点设为可见
-    setFrequencies(prev => ({
-      ...prev,
-      [net]: prev[net].map(f => ({ ...f, visible: true }))
-    }))
+    // 勾选总开关时该制式所有频点设为可见。
+    // 已全可见时保持原引用：frequencies 身份变化会触发扇区图层整体拆除重建，定位瞬间闪烁
+    setFrequencies(prev => (
+      prev[net].every(f => f.visible)
+        ? prev
+        : { ...prev, [net]: prev[net].map(f => ({ ...f, visible: true })) }
+    ))
     onlineMapRef.current?.setLayerVisibility(net, true)
   }, [layers, storeSetLayerVisibility])
 
@@ -1531,11 +1533,12 @@ export function MapPage() {
       const gcjLat = parseFloat(parts[1])
 
       if (onlineMapRef.current) {
-        onlineMapRef.current.flyTo([gcjLat, gcjLng], 15)
+        // duration=0：搜索定位瞬时跳转，不做飞行/缩放动画（动画期间标签与图层重建会闪烁）
+        onlineMapRef.current.flyTo([gcjLat, gcjLng], 15, 0)
         onlineMapRef.current.setSearchMarker({ lng: gcjLng, lat: gcjLat, name: result.name })
       }
     } else {
-      // 工参搜索：红色边框高亮目标扇区图形本身并飞行定位（与图层文件搜索一致，不再放中心标记点）
+      // 工参搜索：红色边框高亮目标扇区图形本身并瞬时定位（与图层文件搜索一致，不再放中心标记点）
       if (result.hasLocation && result.latitude !== undefined && result.longitude !== undefined && onlineMapRef.current) {
         // 目标制式图层未勾选时自动开启（总开关+频点全可见），否则扇区图形不渲染、红框高亮无目标
         ensureSectorLayerVisible(result.networkType)
@@ -1579,7 +1582,7 @@ export function MapPage() {
   }, [])
 
   /**
-   * 搜索弹窗：工参结果定位（红色边框高亮扇区图形本身 + 飞行定位，与原搜索框工参定位一致）
+   * 搜索弹窗：工参结果定位（红色边框高亮扇区图形本身 + 瞬时定位，与原搜索框工参定位一致）
    * 目标制式图层未勾选时自动开启，否则扇区不渲染、红框无目标
    */
   const handleDialogLocateSector = useCallback((r: { id: string; lat: number; lng: number; networkType?: string }) => {
@@ -1595,7 +1598,7 @@ export function MapPage() {
   /**
    * 搜索弹窗：图层文件/地理化要素定位
    * 图层未勾选时自动开启（搜索定位不受框选互斥限制），OnlineMap 监听 props 变化后懒加载，
-   * 再由 locateLayerFeature 等待图层可见 → 红色边框高亮 → 飞行定位
+   * 再由 locateLayerFeature 等待图层可见 → 红色边框高亮 → 瞬时定位
    */
   const handleDialogLocateLayerFeature = useCallback(async (opts: {
     layerId: string
@@ -2018,7 +2021,8 @@ export function MapPage() {
     const newPoint = { id, lng: correctedLng, lat: correctedLat }
     addLocationPoint(newPoint)
     if (onlineMapRef.current) {
-      onlineMapRef.current.flyTo([correctedLat, correctedLng], 15)
+      // duration=0：坐标定位瞬时跳转，不做飞行/缩放动画
+      onlineMapRef.current.flyTo([correctedLat, correctedLng], 15, 0)
     }
     // 定位点标记由 locationPoints 驱动的 useEffect 统一添加，
     // 此处不再重复调用 addLocationMarker，避免与 effect 产生重复标记/标签

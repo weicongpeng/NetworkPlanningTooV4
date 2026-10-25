@@ -128,6 +128,12 @@ function strokeColorOf(primitives: any[]) {
   return p?.geometryInstances?.[0]?.attributes?.color?.color
 }
 
+/** 取出最后一个线图元（选中描边是独立批次、最后绘制）的描边色 */
+function lastStrokeColorOf(primitives: any[]) {
+  const p = [...primitives].reverse().find((x) => x.kind === 'ground-polyline')
+  return p?.geometryInstances?.[0]?.attributes?.color?.color
+}
+
 function strokeWidthOf(primitives: any[]) {
   const p = primitives.find((x) => x.kind === 'ground-polyline')
   return p?.geometryInstances?.[0]?.geometry?.opts?.width
@@ -219,6 +225,7 @@ describe('CesiumGeoJsonLayer 要素配色（_style 还原）', () => {
   /**
    * 选中态只改描边色、不铺整面填充（2D `setSelectionHighlight` 同口径）：
    * 填充 alpha 必须保持要素/默认的 100%，不能出现"选中后变半透明红"的那一层。
+   * 选中描边是独立批次并最后绘制（等价 2D bringToFront），所以取最后一个线图元。
    */
   it('选中态只改描边色，填充仍是不透明的原填充', () => {
     layer.setSelectionIds(new Set(['f1']))
@@ -226,7 +233,7 @@ describe('CesiumGeoJsonLayer 要素配色（_style 还原）', () => {
     const fill = fillColorOf(primitives)
     expect(fill.css).toBe('#10b981')
     expect(fill.alpha).toBe(1)
-    expect(strokeColorOf(primitives).css).toBe('#ef4444')
+    expect(lastStrokeColorOf(primitives).css).toBe('#ef4444')
   })
 
   it('KML <fill>0</fill>：视觉上只画边框，但保留一个近乎全透明的面图元用于点击命中', () => {

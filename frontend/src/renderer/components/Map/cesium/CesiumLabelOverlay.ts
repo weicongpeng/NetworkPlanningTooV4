@@ -56,6 +56,11 @@ export class CesiumLabelOverlay {
     }
   }
 
+  /** 当前标签源数量（性能埋点用） */
+  get sourceCount(): number {
+    return this.sources.size
+  }
+
   /** 注册（全量替换）某标签源的候选 */
   setCandidates(sourceId: string, candidates: LabelCandidateBase[]): void {
     this.sources.set(

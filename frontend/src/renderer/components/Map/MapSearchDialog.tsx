@@ -2,7 +2,7 @@
  * 地图搜索弹窗（Ctrl+F 调出）
  *
  * 数据源来自「数据管理」已导入数据，分三组：
- * - 基站工参（excel 工参文件）：模糊搜索小区/基站，定位方式与原工参搜索一致（飞行 + 标记点）
+ * - 基站工参（excel 工参文件）：模糊搜索小区/基站，定位方式与原工参搜索一致（瞬时定位 + 标记点）
  * - 图层文件（MapInfo 图层）：模糊搜索要素属性，定位到要素并红色边框高亮
  * - 地理化数据（Excel 点/扇区/多边形）：同上，红色边框高亮
  *
@@ -91,9 +91,9 @@ interface MapSearchDialogProps {
   searchWorkbook: (keyword: string) => WorkbookSearchResult[]
   /** 当前工参数据源名称（工参分组条目显示名） */
   workbookSourceName?: string
-  /** 工参搜索结果定位（飞行 + 搜索标记，与原搜索框行为一致） */
+  /** 工参搜索结果定位（瞬时定位 + 搜索标记，与原搜索框行为一致） */
   onLocateSector: (r: SectorLocate) => void
-  /** 图层/地理化要素定位（飞行 + 红色边框高亮） */
+  /** 图层/地理化要素定位（瞬时定位 + 红色边框高亮） */
   onLocateLayerFeature: (r: LayerFeatureLocate) => Promise<boolean>
 }
 

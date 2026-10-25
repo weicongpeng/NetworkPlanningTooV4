@@ -17,9 +17,32 @@ import {
   type SectorStyleContext,
 } from './cesiumSectorStyle'
 import { resolvePlanningStyle, type PlanningHighlight } from './cesiumHighlight'
+import { perfStart, perfEnd } from './cesiumPerf'
 import type { LabelSettings } from '../LabelSettingsModal'
 import type { LabelCandidateBase } from '../labelLayoutCore'
 import { computeThematicStats, type ThematicStats } from '../../../utils/thematicStats'
+
+/** 配置对象内容比较（store 每次可能给新引用，内容没变不应触发重建） */
+function sameJson(a: unknown, b: unknown): boolean {
+  if (a === b) return true
+  if (a === null || b === null || a === undefined || b === undefined) return false
+  try {
+    return JSON.stringify(a) === JSON.stringify(b)
+  } catch {
+    return false
+  }
+}
+
+/** 规划高亮比较：邻区目标集合是 Set，JSON 序列化会丢失内容，需单独比较 */
+function sameHighlight(a: PlanningHighlight, b: PlanningHighlight): boolean {
+  if (a === b) return true
+  const pci = (x: PlanningHighlight['pci']) => x ? `${x.selectedId}|${x.relatedIds.join(',')}` : ''
+  const tac = (x: PlanningHighlight['tac']) => x ? JSON.stringify(x) : ''
+  const neighbor = (x: PlanningHighlight['neighbor']) => x
+    ? `${x.sourceSectorId}|${x.sourceColor}|${x.targetColor}|${[...x.targetSectorIds].sort().join(',')}`
+    : ''
+  return pci(a.pci) === pci(b.pci) && tac(a.tac) === tac(b.tac) && neighbor(a.neighbor) === neighbor(b.neighbor)
+}
 
 const METERS_PER_LAT = 111319.9
 
@@ -203,12 +226,34 @@ export class CesiumSectorLayer {
     this.viewer = viewer
   }
 
+  private removePrimitiveSafely(p: any): void {
+    const primitives = this.viewer?.scene?.primitives
+    if (!primitives || !p) return
+    try { primitives.remove(p) } catch { /* ignore */ }
+  }
+
+  /**
+   * 异步图元等 ready 后再摘（构建中被 remove 会让 Cesium 拿已销毁资源继续渲染，
+   * 历史 `_target` 崩溃即源于此）。hideFirst 用于隐藏/卸载：先关显示再等就绪摘除。
+   */
+  private retireWhenReady(p: any, hideFirst = false): void {
+    if (!p) return
+    if (hideFirst) {
+      try { p.show = false } catch { /* ignore */ }
+    }
+    if (p.ready === false && typeof p.readyPromise?.then === 'function') {
+      p.readyPromise
+        .then(() => this.removePrimitiveSafely(p))
+        .catch(() => this.removePrimitiveSafely(p))
+    } else {
+      this.removePrimitiveSafely(p)
+    }
+  }
+
   /** 释放批量图元（重建前 / 卸载时） */
   private clearPrimitives(): void {
-    const primitives = this.viewer?.scene?.primitives
-    if (!primitives) return
-    if (this.fillPrimitive) { primitives.remove(this.fillPrimitive); this.fillPrimitive = null }
-    if (this.outlinePrimitive) { primitives.remove(this.outlinePrimitive); this.outlinePrimitive = null }
+    if (this.fillPrimitive) { this.retireWhenReady(this.fillPrimitive, true); this.fillPrimitive = null }
+    if (this.outlinePrimitive) { this.retireWhenReady(this.outlinePrimitive, true); this.outlinePrimitive = null }
   }
 
   /** 图层卸载：释放图元 */
@@ -270,9 +315,12 @@ export class CesiumSectorLayer {
   setVisible(visible: boolean): void {
     if (this.visible === visible) return
     this.visible = visible
-    this.configDirty = true
+    // 隐藏立即摘图元（释放显存）；显示时由宿主随后的 update() 重建
+    if (!visible) this.clearPrimitives()
+    else this.configDirty = true
   }
   setWhitelist(whitelist: Set<string> | null): void {
+    if (sameSelection(this.whitelist, whitelist)) return
     this.whitelist = whitelist
     this.configDirty = true
   }
@@ -284,6 +332,7 @@ export class CesiumSectorLayer {
     this.configDirty = true
   }
   setLabels(enabled: boolean, settings: LabelSettings | null): void {
+    if (this.labelsEnabled === enabled && sameJson(this.labelSettings, settings)) return
     this.labelsEnabled = enabled
     this.labelSettings = settings
   }
@@ -293,11 +342,21 @@ export class CesiumSectorLayer {
     this.configDirty = true
   }
   setStyleContext(ctx: SectorStyleContext): void {
+    if (sameJson(this.ctx, ctx)) return
     this.ctx = ctx
     this.configDirty = true
   }
   setHighlight(highlight: PlanningHighlight): void {
+    if (sameHighlight(this.highlight, highlight)) return
     this.highlight = highlight
+    this.configDirty = true
+  }
+
+  /**
+   * 强制重建：样式的部分输入不在 setter 的配置里（频点自定义颜色、PCI 同步值等
+   * 由渲染时从 store/同步服务实时读取），这类"外部状态变了"必须显式标脏。
+   */
+  refresh(): void {
     this.configDirty = true
   }
 
@@ -383,6 +442,7 @@ export class CesiumSectorLayer {
   }
 
   update(view: CameraView): void {
+    const perf = perfStart()
     const C = this.C
     const viewKey = this.viewKey(view)
     // 配置没变且视野没实质移动：这次重建可以整个省掉
@@ -474,31 +534,31 @@ export class CesiumSectorLayer {
         newFill = primitives.add(new C.GroundPrimitive({
           geometryInstances: fills,
           appearance: new C.PerInstanceColorAppearance({ flat: true, translucent: true }),
-          // 同步构建：我们重建频繁，异步构建会在 worker 未完成时被 remove，
-          // Cesium 拿着已销毁的纹理继续渲染 → TypeError ...reading '_target' + 渲染循环永久停止
-          asynchronous: false,
+          // 异步构建：三角化交给 worker；旧图元在 ready 后才摘（双缓冲）
+          asynchronous: true,
         }))
       }
       if (outlines.length > 0) {
         newOutline = primitives.add(new C.GroundPolylinePrimitive({
           geometryInstances: outlines,
           appearance: new C.PolylineColorAppearance(),
-          asynchronous: false,
+          asynchronous: true,
         }))
       }
     } catch (e) {
       // 设备不支持贴地图元等情况下不让整层崩掉：清掉已建起来的部分，保留旧图元
       console.warn('[CesiumSectorLayer] 批量图元创建失败:', e)
-      if (newFill) { try { primitives.remove(newFill) } catch { /* ignore */ } }
-      if (newOutline) { try { primitives.remove(newOutline) } catch { /* ignore */ } }
+      if (newFill) this.retireWhenReady(newFill, true)
+      if (newOutline) this.retireWhenReady(newOutline, true)
       return
     }
     // 新图元就位后再摘旧的：先删后建会留下"图元集合里什么都没有"的一帧
     // （渲染循环正拿着旧图元的命令时，旧图元已被销毁），也是 _target 类报错的高危窗口。
     this.fillPrimitive = newFill
     this.outlinePrimitive = newOutline
-    if (oldFill) { try { primitives.remove(oldFill) } catch { /* ignore */ } }
-    if (oldOutline) { try { primitives.remove(oldOutline) } catch { /* ignore */ } }
+    if (oldFill) this.retireWhenReady(oldFill)
+    if (oldOutline) this.retireWhenReady(oldOutline)
+    perfEnd('SectorLayer.update', perf, `${this.networkType} ${sectors.length} sectors`)
   }
 
   getNetworkType(): NetworkType {

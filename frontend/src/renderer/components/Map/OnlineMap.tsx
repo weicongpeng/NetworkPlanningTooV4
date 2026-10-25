@@ -485,7 +485,7 @@ export interface OnlineMapRef {
   clearSelectionHighlight: () => void
   /** 设置圈选高亮 */
   setSelectionHighlight: (ids: Set<string> | null) => void
-  /** 搜索定位：等待图层可见后红色边框高亮指定要素并飞行定位（多次搜索结果累计保持） */
+  /** 搜索定位：等待图层可见后红色边框高亮指定要素并瞬时定位（多次搜索结果累计保持） */
   locateLayerFeature: (opts: {
     layerId: string
     featureId: string
@@ -496,7 +496,7 @@ export interface OnlineMapRef {
   }) => Promise<boolean>
   /** 清除搜索定位的要素红色边框高亮（数据图层） */
   clearLayerFeatureHighlight: () => void
-  /** 工参搜索定位：红色边框高亮目标扇区图形本身并飞行定位（LTE/NR，多次搜索结果累计保持） */
+  /** 工参搜索定位：红色边框高亮目标扇区图形本身并瞬时定位（LTE/NR，多次搜索结果累计保持） */
   locateSector: (opts: { id: string; lat: number; lng: number; zoom?: number }) => void
   /** 清除扇区红色边框高亮（工参搜索定位） */
   clearSectorHighlight: () => void
@@ -1502,7 +1502,8 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
       if (mapInstanceRef.current) {
         isUserInteractingRef.current = true
         if (duration === 0) {
-          mapInstanceRef.current.setView(latLng, zoom)
+          // Leaflet setView 缩放级别变化时默认仍做缩放动画，必须显式 animate:false 才是瞬时跳转
+          mapInstanceRef.current.setView(latLng, zoom, { animate: false })
         } else {
           mapInstanceRef.current.flyTo(latLng, zoom, { duration })
         }
@@ -2007,7 +2008,7 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
     /**
      * 搜索定位图层文件/地理化数据要素：
      * 父组件已开启图层可见性后，轮询等待异步图层构建完成 → 目标要素加入累计高亮集合
-     * → 飞行定位（面/线按包围盒适配，点/扇区飞至中心）。多次搜索结果同时保持。
+     * → 瞬时定位（面/线按包围盒适配，点/扇区直达中心）。多次搜索结果同时保持。
      */
     locateLayerFeature: async (opts) => {
       const map = mapInstanceRef.current
@@ -2040,16 +2041,18 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
       searchFeatureHighlightsRef.current.set(opts.layerId, ids)
       target.instance.setSelectionHighlight(new Set(ids))
 
-      // 定位：线/面要素按包围盒适配视野，点/扇区飞到中心点
+      // 定位：线/面要素按包围盒适配视野，点/扇区直达中心点。
+      // 搜索定位必须瞬时完成（animate: false）：飞行/缩放动画期间标签层整体隐藏、
+      // 数据图层逐帧重建视口几何，动画结束前会持续闪烁。
       if (opts.bounds) {
         const latLngBounds = L.latLngBounds(opts.bounds)
         if (latLngBounds.isValid()) {
-          map.flyToBounds(latLngBounds, { padding: [120, 120], maxZoom: 17, duration: 0.8 })
+          map.fitBounds(latLngBounds, { padding: [120, 120], maxZoom: 17, animate: false })
           return true
         }
       }
       if (opts.center) {
-        map.flyTo(opts.center, Math.max(map.getZoom(), 16), { duration: 0.8 })
+        map.setView(opts.center, Math.max(map.getZoom(), 16), { animate: false })
       }
       return true
     },
@@ -2067,7 +2070,7 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
 
     /**
      * 工参搜索定位：红色边框高亮目标扇区图形本身（视口外扇区由渲染器强制补绘），
-     * 并飞行定位。与图层文件搜索一致，多次搜索结果累计保持、互不清除。
+     * 并瞬时定位。与图层文件搜索一致，多次搜索结果累计保持、互不清除。
      */
     locateSector: (opts) => {
       const map = mapInstanceRef.current
@@ -2080,7 +2083,8 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
       searchSectorHighlightRef.current = ids
       lteSectorLayerRef.current?.setSelectionHighlight(ids)
       nrSectorLayerRef.current?.setSelectionHighlight(ids)
-      map.flyTo([opts.lat, opts.lng], opts.zoom ?? Math.max(map.getZoom(), 16), { duration: 0.8 })
+      // 瞬时定位（与要素搜索一致）：不做飞行/缩放动画，避免动画期间图层重建造成的闪烁
+      map.setView([opts.lat, opts.lng], opts.zoom ?? Math.max(map.getZoom(), 16), { animate: false })
     },
 
     /** 清除扇区红色边框高亮（工参搜索定位） */

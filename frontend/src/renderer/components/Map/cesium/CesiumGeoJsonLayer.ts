@@ -21,6 +21,7 @@ import {
 } from './cesiumGeoJson'
 import { sameSelection, type CameraView } from './CesiumSectorLayer'
 import type { LabelCandidateBase } from '../labelLayoutCore'
+import { perfStart, perfEnd } from './cesiumPerf'
 
 /** 单图层的标签候选上限（按离视野中心近的优先保留） */
 const MAX_LABEL_CANDIDATES = 2000
@@ -39,6 +40,23 @@ const VIEWPORT_CULL_MIN_FEATURES = 2000
  * "只平移了一小段"的场景不发生重建、也不缺要素。
  */
 const VIEW_PADDING_RATIO = 0.5
+/**
+ * 分块渲染参数（仅面/线；点仍走全局 PointPrimitiveCollection）。
+ *
+ * 导入图层的主要成本是"每次视野变化把整层几何重新三角化 + 重建贴地图元"。
+ * 按空间网格切成若干块后：视野变化只重建进出视口的块，其余块直接复用；
+ * 图元用 `asynchronous: true` 把三角化交给 Cesium worker，主线程只做实例包装；
+ * 新图元就绪后才摘旧图元（双缓冲），避免历史上"异步构建中被 remove"的渲染崩溃。
+ */
+const CHUNK_MIN_FEATURES = 1500
+const CHUNK_TARGET_FEATURES = 500
+const CHUNK_GRID_MAX = 12
+/** 块级视口外扩（比按要素裁剪粗一档，避免块边缘反复进出） */
+const CHUNK_VIEW_PADDING_RATIO = 0.25
+/** 已构建块缓存上限：超出按"最久未可见"淘汰，控制显存 */
+const MAX_BUILT_CHUNKS = 40
+/** 每帧最多构建的块数（把主线程实例包装摊到多帧） */
+const CHUNK_BUILD_BUDGET = 2
 /** 抽稀容差上下界（度）：1e-6°≈0.11m，5e-4°≈55m */
 const SIMPLIFY_TOLERANCE_MIN = 1e-6
 const SIMPLIFY_TOLERANCE_MAX = 5e-4
@@ -48,6 +66,17 @@ const SIMPLIFY_TOLERANCE_MAX = 5e-4
  */
 const SELECTED_STROKE_COLOR = '#ef4444'
 import { computeThematicStats, type ThematicStats } from '../../../utils/thematicStats'
+
+/** 配置对象内容比较：store 每次可能给出新引用，内容没变不应触发整层重建 */
+function sameJson(a: unknown, b: unknown): boolean {
+  if (a === b) return true
+  if (a === null || b === null || a === undefined || b === undefined) return false
+  try {
+    return JSON.stringify(a) === JSON.stringify(b)
+  } catch {
+    return false
+  }
+}
 
 type Position = number[]
 
@@ -138,6 +167,46 @@ interface PreparedFeature {
   east: number
 }
 
+interface ChunkBounds { south: number; west: number; north: number; east: number }
+
+/** 空间分块：一块 = 一批相邻面/线要素 + 自己的贴地图元 */
+interface GeoChunk {
+  id: string
+  features: PreparedFeature[]
+  bounds: ChunkBounds
+  /** 当前挂在地图上的图元（面/线各至多一个） */
+  primitives: any[]
+  /** 构建时的样式签名；与当前不一致说明需要重建 */
+  signature: string
+  /** 当前是否应显示 */
+  visible: boolean
+  /** 上次写入的 show 值（避免重复设置） */
+  shown: boolean
+  /** 是否已在构建队列（防重复入队） */
+  queued: boolean
+  /** 最近一次可见的帧序号（LRU 淘汰用） */
+  lastVisibleTick: number
+}
+
+function unionBounds(features: PreparedFeature[]): ChunkBounds {
+  let south = Infinity, west = Infinity, north = -Infinity, east = -Infinity
+  for (const f of features) {
+    if (f.south < south) south = f.south
+    if (f.west < west) west = f.west
+    if (f.north > north) north = f.north
+    if (f.east > east) east = f.east
+  }
+  return { south, west, north, east }
+}
+
+/** 块包围盒是否与视野（含块级外扩）相交 */
+function chunkInView(bounds: ChunkBounds, view: CameraView): boolean {
+  const padLat = (view.north - view.south) * CHUNK_VIEW_PADDING_RATIO
+  const padLng = (view.east - view.west) * CHUNK_VIEW_PADDING_RATIO
+  return bounds.west <= view.east + padLng && bounds.east >= view.west - padLng
+    && bounds.south <= view.north + padLat && bounds.north >= view.south - padLat
+}
+
 /** 与 2D `MapInfoLayer.DEFAULT_STYLES` 一致的默认值（填充不透明度一律 100%） */
 const DEFAULT_BY_KIND: Record<GeomKind, {
   fill: string; stroke: string; width: number; fillOpacity: number; pointSize: number
@@ -170,8 +239,6 @@ export class CesiumGeoJsonLayer {
   private selectionIds: Set<string> | null = null
 
   private viewer: any
-  /** 本次渲染创建的批量图元（面/线/点各 1 个），重建时整体移除 */
-  private primitives: any[] = []
   /**
    * 预整理后的要素（换数据时算一次：抽稀 + 包围盒）。
    * render() 只从这里建图元，不再每次遍历原始 FC。
@@ -187,24 +254,87 @@ export class CesiumGeoJsonLayer {
    */
   private renderSeq = 0
 
+  /** 空间分块（仅面/线；点无三角化成本，仍走全局 PointPrimitiveCollection） */
+  private chunks: GeoChunk[] = []
+  /** 待构建块队列（每帧限量，把实例包装摊到多帧） */
+  private buildQueue: GeoChunk[] = []
+  private drainScheduled = false
+  /** 渲染帧序号：块缓存 LRU 淘汰用 */
+  private tick = 0
+  /** 样式签名：数据/配色/专题变化时递增，已建块据此判断是否过期 */
+  private dataVersion = 0
+  private styleVersion = 0
+  /**
+   * 选中集合版本：选中态走**独立红色描边批次**，不让所有块失效
+   * （否则每次搜索/框选都要把整层重三角化一遍）。
+   */
+  private selectionVersion = 0
+  private selectionBuiltVersion = -1
+  private selectionPrimitives: any[] = []
+  /** 点图元（全局，含选中描边） */
+  private pointsPrimitive: any = null
+  private destroyed = false
+
   constructor(private C: any, viewer: any, readonly layerId: string) {
     this.viewer = viewer
   }
 
-  /** 移除本次渲染的批量图元 */
-  private clearPrimitives(): void {
+  private styleSignature(): string {
+    return `${this.dataVersion}.${this.styleVersion}`
+  }
+
+  private removePrimitiveSafely(p: any): void {
     const collection = this.viewer?.scene?.primitives
-    if (!collection) return
-    for (const p of this.primitives) {
-      try { collection.remove(p) } catch { /* ignore */ }
+    if (!collection || !p) return
+    try { collection.remove(p) } catch { /* ignore */ }
+  }
+
+  /**
+   * 延迟摘除图元。
+   *
+   * 异步图元在 worker 构建期间被 remove，会让 Cesium 拿已销毁的纹理/批处理继续渲染
+   * （历史 `_target` 崩溃）。这里等 `readyPromise` 完成后再摘，构建中的旧图元同理。
+   */
+  private retirePrimitives(primitives: any[]): void {
+    for (const p of primitives) {
+      if (!p) continue
+      if (p.ready === false && typeof p.readyPromise?.then === 'function') {
+        p.readyPromise
+          .then(() => this.removePrimitiveSafely(p))
+          .catch(() => this.removePrimitiveSafely(p))
+      } else {
+        this.removePrimitiveSafely(p)
+      }
     }
-    this.primitives = []
+  }
+
+  /** 新图元就绪后再摘旧图元（双缓冲，避免重建期间出现空白帧） */
+  private retireAfterReplacement(old: any[], replacement: any[]): void {
+    if (old.length === 0) return
+    const pending = replacement
+      .filter((p) => p?.ready === false && typeof p.readyPromise?.then === 'function')
+      .map((p) => p.readyPromise.catch(() => undefined))
+    if (pending.length === 0) {
+      this.retirePrimitives(old)
+      return
+    }
+    Promise.all(pending).then(() => this.retirePrimitives(old))
   }
 
   /** 图层卸载：释放图元 */
   destroy(): void {
-    this.renderSeq += 1 // 作废挂起中的重建
-    this.clearPrimitives()
+    this.destroyed = true
+    this.renderSeq += 1
+    this.buildQueue = []
+    for (const chunk of this.chunks) {
+      this.retirePrimitives(chunk.primitives)
+      chunk.primitives = []
+    }
+    this.chunks = []
+    this.retirePrimitives(this.selectionPrimitives)
+    this.selectionPrimitives = []
+    if (this.pointsPrimitive) this.retirePrimitives([this.pointsPrimitive])
+    this.pointsPrimitive = null
   }
 
   /**
@@ -217,18 +347,20 @@ export class CesiumGeoJsonLayer {
     const seq = ++this.renderSeq
     requestAnimationFrame(() => {
       if (seq !== this.renderSeq) return // 已被后续一次重建覆盖
-      this.render()
+      if (!this.destroyed) this.render()
     })
   }
 
   /**
-   * 换数据立即重建（同步）。
+   * 换数据立即重建（同步）。首屏只构建视野内的块（其余块按需构建）。
    * 取数完成的时机天然低频，且上层的要素收集/热力取点紧接着就要用新的要素集合，
    * 推迟到下一帧会让这些读路径拿到旧数据。
    */
   setFeatureCollection(fc: FeatureCollection): void {
+    if (this.destroyed) return
     this.fc = fc
     this.prepare()
+    this.dataVersion += 1
     this.renderSeq += 1 // 作废挂起中的重建，避免紧随其后又重建一遍
     this.render()
   }
@@ -283,6 +415,50 @@ export class CesiumGeoJsonLayer {
       }
       this.prepared.push({ fi, feature, kind, geoms, south, west, north, east })
     }
+    this.rebuildChunks()
+  }
+
+  /**
+   * 按空间网格重建分块（换数据时一次）。
+   *
+   * 面/线要素按包围盒中心落入网格；每块目标 ~CHUNK_TARGET_FEATURES 个要素、格数封顶。
+   * 小图层（≤CHUNK_MIN_FEATURES）保持单块、不按视野裁剪，行为与优化前一致。
+   */
+  private rebuildChunks(): void {
+    for (const chunk of this.chunks) this.retirePrimitives(chunk.primitives)
+    this.chunks = []
+    this.buildQueue = []
+    const heavy = this.prepared.filter((pf) => pf.kind !== 'point')
+    if (heavy.length === 0) return
+    if (heavy.length <= CHUNK_MIN_FEATURES) {
+      this.chunks.push({
+        id: 'all', features: heavy, bounds: unionBounds(heavy),
+        primitives: [], signature: '', visible: true, shown: false, queued: false, lastVisibleTick: 0,
+      })
+      return
+    }
+    const all = unionBounds(heavy)
+    const n = Math.max(1, Math.min(
+      CHUNK_GRID_MAX,
+      Math.ceil(Math.sqrt(heavy.length / CHUNK_TARGET_FEATURES)),
+    ))
+    const cellW = Math.max(1e-9, (all.east - all.west) / n)
+    const cellH = Math.max(1e-9, (all.north - all.south) / n)
+    const cells = new Map<string, PreparedFeature[]>()
+    for (const pf of heavy) {
+      const cx = Math.min(n - 1, Math.max(0, Math.floor(((pf.west + pf.east) / 2 - all.west) / cellW)))
+      const cy = Math.min(n - 1, Math.max(0, Math.floor(((pf.south + pf.north) / 2 - all.south) / cellH)))
+      const key = `${cx}_${cy}`
+      const list = cells.get(key)
+      if (list) list.push(pf)
+      else cells.set(key, [pf])
+    }
+    for (const [id, features] of cells) {
+      this.chunks.push({
+        id, features, bounds: unionBounds(features),
+        primitives: [], signature: '', visible: true, shown: false, queued: false, lastVisibleTick: 0,
+      })
+    }
   }
 
   /**
@@ -297,7 +473,10 @@ export class CesiumGeoJsonLayer {
     if (key === this.lastViewKey) return
     this.lastViewKey = key
     this.view = view
-    if (this.prepared.length > VIEWPORT_CULL_MIN_FEATURES) this.requestRender()
+    // 分块图层按视野增删块；大要素图层（点裁剪）也依赖视野；小图层全量渲染不受影响
+    if (this.chunks.length > 1 || this.prepared.length > VIEWPORT_CULL_MIN_FEATURES) {
+      this.requestRender()
+    }
   }
   /** 当前要素集合（WGS84）——供圈选/点选按几何收集命中要素 */
   getFeatures(): GeoFeature[] {
@@ -314,20 +493,34 @@ export class CesiumGeoJsonLayer {
     return this.visible
   }
   setVisible(visible: boolean): void {
+    if (this.visible === visible) return
     this.visible = visible
-    this.requestRender()
+    // 隐藏只切 show（块图元保留复用）；点图元直接摘掉
+    if (!visible) {
+      for (const chunk of this.chunks) this.applyChunkShown(chunk, false)
+      this.applySelectionShown(false)
+      if (this.pointsPrimitive) this.retirePrimitives([this.pointsPrimitive])
+      this.pointsPrimitive = null
+    } else {
+      this.applySelectionShown(true)
+      this.requestRender()
+    }
   }
   setColorSettings(color: LayerColorSettings | null): void {
+    if (sameJson(this.color, color)) return
     this.color = color
+    this.styleVersion += 1
     this.requestRender()
   }
   setLabel(enabled: boolean, label: LabelSettings | null): void {
+    // 标签由 Canvas 覆盖层绘制，与几何无关：只更新配置，不重建图元
     this.labelEnabled = enabled
     this.label = label
-    this.requestRender()
   }
   setThematic(thematic: ThematicSettings | null): void {
+    if (sameJson(this.thematic, thematic)) return
     this.thematic = thematic
+    this.styleVersion += 1
     this.requestRender()
   }
   /**
@@ -340,6 +533,7 @@ export class CesiumGeoJsonLayer {
   setSelectionIds(ids: Set<string> | null): void {
     if (sameSelection(this.selectionIds, ids)) return
     this.selectionIds = ids
+    this.selectionVersion += 1
     this.requestRender()
   }
 
@@ -405,7 +599,12 @@ export class CesiumGeoJsonLayer {
       .map((e) => e.c)
   }
 
-  /** 批量更新配置（合并后只 render 一次，避免连续 setter 各触发一次重建） */
+  /**
+   * 批量更新配置（合并后只 render 一次）。
+   *
+   * 按值比较去重：`syncGeoJsonLayers` 会在任一 store 配置变化时推给**所有**图层，
+   * 若每次无条件重建，切换一个图层的显隐/标签就会把所有已打开图层重新三角化一遍。
+   */
   applyConfig(cfg: {
     visible?: boolean
     color?: LayerColorSettings | null
@@ -413,12 +612,24 @@ export class CesiumGeoJsonLayer {
     labelEnabled?: boolean
     label?: LabelSettings | null
   }): void {
-    if (cfg.visible !== undefined) this.visible = cfg.visible
-    if (cfg.color !== undefined) this.color = cfg.color
-    if (cfg.thematic !== undefined) this.thematic = cfg.thematic
+    let styleChanged = false
+    if (cfg.visible !== undefined && cfg.visible !== this.visible) {
+      this.setVisible(cfg.visible)
+    }
+    if (cfg.color !== undefined && !sameJson(cfg.color, this.color)) {
+      this.color = cfg.color
+      this.styleVersion += 1
+      styleChanged = true
+    }
+    if (cfg.thematic !== undefined && !sameJson(cfg.thematic, this.thematic)) {
+      this.thematic = cfg.thematic
+      this.styleVersion += 1
+      styleChanged = true
+    }
+    // 标签只影响 Canvas 覆盖层（syncLabels 负责刷新），不参与图元重建
     if (cfg.labelEnabled !== undefined) this.labelEnabled = cfg.labelEnabled
     if (cfg.label !== undefined) this.label = cfg.label
-    this.requestRender()
+    if (styleChanged && this.visible) this.requestRender()
   }
 
   /**
@@ -501,207 +712,313 @@ export class CesiumGeoJsonLayer {
   }
 
   private render(): void {
-    const C = this.C
-    this.clearPrimitives()
-    if (!this.visible) return
+    const perf = perfStart()
+    if (this.destroyed) return
+    if (!this.visible) {
+      for (const chunk of this.chunks) this.applyChunkShown(chunk, false)
+      this.applySelectionShown(false)
+      return
+    }
+    if (!this.viewer?.scene?.primitives) return
+    this.tick += 1
 
-    // 批量容器：面 / 线 / 点 各合成一个图元（标签改由 CesiumLabelOverlay 统一绘制）。
-    // 逐 Entity 的写法在图层要素上千时，每次配置变化都要重建上千个 Entity（PropertyBag +
-    // 集合事件 + 逐实体图元），是 3D 加载自有图层后卡顿的主因。
-    const polygons: any[] = []
-    const polylines: any[] = []
-    /**
-     * 选中要素的边框走**单独一批图元，且在 render 末尾最后 add**。
-     *
-     * 贴地边框是"深度不写、开启混合"的渲染状态（`GroundPolylinePrimitive` 的
-     * `depthMask:false` + PRE_MULTIPLIED_ALPHA_BLEND），同一位置**后画的覆盖先画的**。
-     * 多个多边形共用/重叠的边如果挤在同一批里，选中那条红边会被邻近图形的边框压掉 ——
-     * 表现为"重叠处的边框没有被红色高亮"。单独成批并最后添加，等价于 2D 的
-     * `layer.bringToFront()`（2D 选中时就是把该要素提到最上层）。
-     */
-    const selectedPolylines: any[] = []
-    const points: Array<{ opts: any; id: any }> = []
+    // 点：无三角化成本，仍走全局 PointPrimitiveCollection（大图层按视野裁剪、选中强制渲染）
+    this.rebuildPoints()
 
-    // 视口裁剪只对"大图层"生效（见 VIEWPORT_CULL_MIN_FEATURES）：小图层 cullView 为
-    // null，全量渲染，与优化前行为完全一致。
-    const cullView = this.prepared.length > VIEWPORT_CULL_MIN_FEATURES ? this.view : null
-
-    for (const pf of this.prepared) {
-      const sid = featureSelectionId(pf.feature.properties, this.layerId, pf.fi)
-      const selected = this.selectionIds?.has(sid) ?? false
-      // 视野外且未选中的要素不建图元。选中态必须保留：圈选高亮不能因为
-      // "选中要素在视口外"而缺一块（跨视野选中/定位场景）。
-      if (cullView && !selected && !bboxInView(pf, cullView)) continue
-      const st = this.resolveFeatureStyle(pf.feature, pf.kind)
-      const strokeCss = selected ? SELECTED_STROKE_COLOR : st.strokeColor
-      /**
-       * 选中态**只把颜色换成红色，宽度用要素原本的描边宽**（不放大、也不做像素下限）。
-       *
-       * 试过两种"加粗"口径都被用户否掉了：早先 `strokeWidth + 2`（米），以及后来按
-       * 米/像素换算保证至少 3px —— 在常用 zoom 下都比原边框明显粗，观感像给图形描了
-       * 一圈粗红边。保持原宽度只变色，才与图形本身的边框一致。
-       */
-      const strokeW = st.strokeWidth
-      const drawStroke = selected || !st.noStroke
-
-      // 拾取用标识：批量图元把它挂在 GeometryInstance.id / 图元 .id 上。
-      // `selectionId` 必须带出来：点选高亮按它写选中态，而图层要素普遍没有 properties.id，
-      // 早先宿主用 `properties.id` 兜出空字符串 → 点选后"没有任何高亮"。
-      const pickId = {
-        feature: pf.feature,
-        layerId: this.layerId,
-        selectionId: sid,
+    const sig = this.styleSignature()
+    // 分块图层按视野裁剪；单块小图层全量渲染，行为与优化前一致
+    const cullView = this.chunks.length > 1 ? this.view : null
+    for (const chunk of this.chunks) {
+      const visible = !cullView || chunkInView(chunk.bounds, cullView)
+      chunk.visible = visible
+      if (visible) chunk.lastVisibleTick = this.tick
+      const built = chunk.primitives.length > 0 && chunk.signature === sig
+      if (built) {
+        this.applyChunkShown(chunk, visible)
+        continue
       }
-
-      switch (pf.kind) {
-        case 'point': {
-          for (const p of pf.geoms) {
-            points.push({
-              id: pickId,
-              opts: {
-                position: C.Cartesian3.fromDegrees(p[0], p[1]),
-                pixelSize: st.pointSize,
-                color: C.Color.fromCssColorString(st.fillColor)
-                  .withAlpha(st.noFill ? 0 : st.fillOpacity),
-                outlineColor: C.Color.fromCssColorString(strokeCss),
-                outlineWidth: st.noStroke && !selected ? 0 : strokeW,
-                // PointPrimitive 无 heightReference，用"始终画在最上层"达到同等可见性
-                disableDepthTestDistance: Number.POSITIVE_INFINITY,
-              },
-            })
-          }
-          break
-        }
-        case 'line': {
-          for (const line of pf.geoms) {
-            if (line.length < 2) continue
-            polylines.push(new C.GeometryInstance({
-              geometry: new C.GroundPolylineGeometry({
-                positions: C.Cartesian3.fromDegreesArray(line.flatMap((p) => p)),
-                width: strokeW,
-              }),
-              attributes: {
-                color: C.ColorGeometryInstanceAttribute.fromColor(
-                  C.Color.fromCssColorString(strokeCss).withAlpha(st.strokeOpacity)),
-              },
-              id: pickId,
-            }))
-          }
-          break
-        }
-        case 'polygon': {
-          for (const ring of pf.geoms) {
-            if (ring.length < 3) continue
-            const positions = C.Cartesian3.fromDegreesArray(ring.flatMap((p) => p))
-            /**
-             * 面图元**始终**建（"无色填充"时给一个近乎全透明的 alpha）。
-             *
-             * 面图元同时承担"点击命中区域"的职责：不建面就只剩贴地边框线，而线的命中宽度
-             * 只有几个像素 —— 表现为"透明填充的多边形点内部没反应，只能点中边框"。
-             * 视觉上 alpha 0.01 与无填充没有区别，但 `scene.pick` 就能拾取整个面了
-             * （`scene.pick` 本来就拾取半透明/贴地面，不需要 `pickTranslucentDepth`；
-             * 那个开关只影响 `pickPosition`，且会引入缩放崩溃，见 CesiumMap 里的说明）。
-             */
-            polygons.push(new C.GeometryInstance({
-              geometry: new C.PolygonGeometry({
-                polygonHierarchy: new C.PolygonHierarchy(positions),
-                vertexFormat: C.PerInstanceColorAppearance.VERTEX_FORMAT,
-                // 几何口径保持 Cesium 默认（测地线 GEODESIC）。
-                // 曾经为了与 2D 的"墨卡托直线"对齐改成 RHUMB，用户实测观感更差 → 已回退。
-              }),
-              attributes: {
-                /**
-                 * 选中态**只改描边，填充保持原色** —— 与 2D 完全同口径：
-                 * `MapInfoLayer.setSelectionHighlight` / `GeoDataLayer.setSelectionHighlight`
-                 * 都只是 `setStyle({ color:'#ef4444', weight:3 })`，动的是边框，
-                 * `fillColor`/`fillOpacity` 一律保留。
-                 *
-                 * 早先这里给选中面整面铺一层半透明红（`SELECTED_FILL_*`），结果就是用户
-                 * 报的"框内阴影有的超出图形框、有的空洞"：贴地面是分类（classification）
-                 * 渲染，填充会被拖到 3D 建筑上（超出），也会被建筑/地形挡出缺口（空洞）；
-                 * 而 2D 根本没有这层填充，所以按 2D 的做法做，问题从根上消失。
-                 */
-                color: C.ColorGeometryInstanceAttribute.fromColor(
-                  C.Color.fromCssColorString(st.fillColor)
-                    .withAlpha(st.noFill ? 0.01 : st.fillOpacity)),
-              },
-              id: pickId,
-            }))
-            // 贴地面不支持 outline，边框另画贴地线。
-            // 选中要素的边框走单独一批（render 末尾最后 add）—— 与相邻图形重叠的边
-            // 也要是红的，见 selectedPolylines 的说明
-            if (drawStroke) {
-              const outline = new C.GeometryInstance({
-                geometry: new C.GroundPolylineGeometry({ positions, width: strokeW }),
-                attributes: {
-                  color: C.ColorGeometryInstanceAttribute.fromColor(
-                    C.Color.fromCssColorString(strokeCss)),
-                },
-                id: pickId,
-              })
-              if (selected) selectedPolylines.push(outline)
-              else polylines.push(outline)
-            }
-          }
-          break
-        }
-        default:
-          break
+      // 样式过期：旧图元先顶着（双缓冲，新图元就绪后再摘）；不可见则先隐藏
+      if (chunk.primitives.length > 0) this.applyChunkShown(chunk, visible)
+      if (visible && !chunk.queued) {
+        chunk.queued = true
+        this.buildQueue.push(chunk)
       }
     }
 
+    this.trimChunkCache()
+    this.drainBuildQueue()
+    // 选中描边最后建（独立批次，选中变化不会让任何块失效；后画的覆盖先画的）
+    this.rebuildSelectionIfNeeded()
+    this.raiseSelectionToTop()
+    perfEnd(
+      'GeoJsonLayer.render', perf,
+      `${this.layerId} ${this.prepared.length} features / ${this.chunks.length} chunks`,
+    )
+  }
+
+  /** 设置块可见性：只切 show，不重建几何 */
+  private applyChunkShown(chunk: GeoChunk, visible: boolean): void {
+    chunk.visible = visible
+    if (chunk.shown === visible) return
+    chunk.shown = visible
+    for (const p of chunk.primitives) {
+      try { p.show = visible } catch { /* ignore */ }
+    }
+  }
+
+  /** 每帧限量构建，剩余排队到下一帧（避免手势结束一次产生几百毫秒长任务） */
+  private drainBuildQueue(): void {
+    if (this.destroyed || !this.visible) return
+    let built = 0
+    while (this.buildQueue.length > 0 && built < CHUNK_BUILD_BUDGET) {
+      const chunk = this.buildQueue.shift()!
+      chunk.queued = false
+      if (!chunk.visible || this.destroyed || !this.visible) continue
+      this.buildChunk(chunk)
+      built += 1
+    }
+    if (this.buildQueue.length > 0 && !this.drainScheduled) {
+      this.drainScheduled = true
+      requestAnimationFrame(() => {
+        this.drainScheduled = false
+        this.drainBuildQueue()
+      })
+    }
+  }
+
+  /** 构建一个块的面/线图元（异步构建 + 双缓冲替换） */
+  private buildChunk(chunk: GeoChunk): void {
+    const C = this.C
     const collection = this.viewer?.scene?.primitives
     if (!collection) return
-    try {
+    const polygons: any[] = []
+    const polylines: any[] = []
+    for (const pf of chunk.features) {
+      const st = this.resolveFeatureStyle(pf.feature, pf.kind)
+      const sid = featureSelectionId(pf.feature.properties, this.layerId, pf.fi)
       /**
-       * `asynchronous` 必须为 `false`（同步构建）。
-       *
-       * 曾经改成 `true`（把三角化丢给 Web Worker）想省主线程，结果引入**渲染崩溃**：
-       * 缩放/平移会连续触发重建，而重建是 `primitives.remove()` + 重新 `add()`。
-       * 异步图元在 worker 还在跑时被移除，Cesium 内部拿着已销毁的纹理/批处理继续走
-       * 渲染管线，抛 `TypeError: Cannot read properties of undefined (reading '_target')`，
-       * `Scene` 直接停掉渲染循环 → 整个 3D 页面冻结。
-       * 这里的重建虽有 rAF 合并，但缩放是持续事件，一秒内仍有数次 remove/add，
-       * 竞态窗口足够大。同步构建没有这个窗口，代价只是重建时多占几十毫秒主线程。
+       * 拾取用标识：批量图元把它挂在 GeometryInstance.id / 图元 .id 上。
+       * `selectionId` 必须带出来：点选高亮按它写选中态，而图层要素普遍没有 properties.id。
        */
+      const pickId = { feature: pf.feature, layerId: this.layerId, selectionId: sid }
+      const strokeW = st.strokeWidth
+      if (pf.kind === 'line') {
+        for (const line of pf.geoms) {
+          if (line.length < 2) continue
+          polylines.push(new C.GeometryInstance({
+            geometry: new C.GroundPolylineGeometry({
+              positions: C.Cartesian3.fromDegreesArray(line.flatMap((p) => p)),
+              width: strokeW,
+            }),
+            attributes: {
+              color: C.ColorGeometryInstanceAttribute.fromColor(
+                C.Color.fromCssColorString(st.strokeColor).withAlpha(st.strokeOpacity)),
+            },
+            id: pickId,
+          }))
+        }
+        continue
+      }
+      if (pf.kind !== 'polygon') continue
+      for (const ring of pf.geoms) {
+        if (ring.length < 3) continue
+        const positions = C.Cartesian3.fromDegreesArray(ring.flatMap((p) => p))
+        /**
+         * 面图元**始终**建（"无色填充"时给一个近乎全透明的 alpha）。
+         * 面图元同时承担"点击命中区域"的职责：不建面就只剩贴地边框线，
+         * 线的命中宽度只有几个像素（见原实现说明）。
+         */
+        polygons.push(new C.GeometryInstance({
+          geometry: new C.PolygonGeometry({
+            polygonHierarchy: new C.PolygonHierarchy(positions),
+            vertexFormat: C.PerInstanceColorAppearance.VERTEX_FORMAT,
+          }),
+          attributes: {
+            color: C.ColorGeometryInstanceAttribute.fromColor(
+              C.Color.fromCssColorString(st.fillColor)
+                .withAlpha(st.noFill ? 0.01 : st.fillOpacity)),
+          },
+          id: pickId,
+        }))
+        if (!st.noStroke) {
+          polylines.push(new C.GeometryInstance({
+            geometry: new C.GroundPolylineGeometry({ positions, width: strokeW }),
+            attributes: {
+              color: C.ColorGeometryInstanceAttribute.fromColor(
+                C.Color.fromCssColorString(st.strokeColor)),
+            },
+            id: pickId,
+          }))
+        }
+      }
+    }
+
+    const newPrimitives: any[] = []
+    try {
       if (polygons.length > 0) {
-        this.primitives.push(collection.add(new C.GroundPrimitive({
+        newPrimitives.push(collection.add(new C.GroundPrimitive({
           geometryInstances: polygons,
           appearance: new C.PerInstanceColorAppearance({ flat: true, translucent: true }),
-          asynchronous: false,
           /**
-           * 分类范围保持 Cesium 默认（`ClassificationType.BOTH`：地形 + 3D Tiles）。
-           *
-           * 曾经为了"填充别爬到 OSM 建筑上"而限定 `TERRAIN`，用户实测观感更差 → 已回退。
-           * "选中阴影超出/空洞"那个问题的正解是**不给选中态加整面填充**（见上面 attributes
-           * 的说明），与分类范围无关。
+           * 分块后每批图元较小，异步构建把三角化交给 worker，主线程只做实例包装。
+           * 旧图元在新图元 ready 后才摘（retireAfterReplacement），不会重演
+           * "worker 构建中被 remove → `_target` 崩溃"。
            */
+          asynchronous: true,
         })))
       }
       if (polylines.length > 0) {
-        this.primitives.push(collection.add(new C.GroundPolylinePrimitive({
+        newPrimitives.push(collection.add(new C.GroundPolylinePrimitive({
           geometryInstances: polylines,
           appearance: new C.PolylineColorAppearance(),
-          asynchronous: false,
+          asynchronous: true,
         })))
-      }
-      // 选中边框必须**最后** add：同一 pass 内后画的覆盖先画的（见 selectedPolylines 说明）
-      if (selectedPolylines.length > 0) {
-        this.primitives.push(collection.add(new C.GroundPolylinePrimitive({
-          geometryInstances: selectedPolylines,
-          appearance: new C.PolylineColorAppearance(),
-          asynchronous: false,
-        })))
-      }
-      if (points.length > 0) {
-        const coll = new C.PointPrimitiveCollection()
-        for (const p of points) coll.add({ ...p.opts, id: p.id })
-        this.primitives.push(collection.add(coll))
       }
     } catch (e) {
-      // 设备不支持贴地图元等情况下不让整层崩掉
-      console.warn('[CesiumGeoJsonLayer] 批量图元创建失败:', e)
-      this.clearPrimitives()
+      console.warn('[CesiumGeoJsonLayer] 分块图元创建失败:', this.layerId, chunk.id, e)
+      this.retirePrimitives(newPrimitives)
+      return
+    }
+    const old = chunk.primitives
+    chunk.primitives = newPrimitives
+    chunk.signature = this.styleSignature()
+    chunk.shown = chunk.visible
+    for (const p of newPrimitives) {
+      try { p.show = chunk.visible } catch { /* ignore */ }
+    }
+    this.retireAfterReplacement(old, newPrimitives)
+    this.raiseSelectionToTop()
+  }
+
+  /** 点图元：全局一个 PointPrimitiveCollection（大图层按视野裁剪、选中强制渲染） */
+  private rebuildPoints(): void {
+    const C = this.C
+    const collection = this.viewer?.scene?.primitives
+    if (!collection) return
+    if (this.pointsPrimitive) {
+      this.retirePrimitives([this.pointsPrimitive])
+      this.pointsPrimitive = null
+    }
+    const points: Array<{ opts: any; id: any }> = []
+    const cullView = this.prepared.length > VIEWPORT_CULL_MIN_FEATURES ? this.view : null
+    for (const pf of this.prepared) {
+      if (pf.kind !== 'point') continue
+      const sid = featureSelectionId(pf.feature.properties, this.layerId, pf.fi)
+      const selected = this.selectionIds?.has(sid) ?? false
+      // 视野外且未选中的点不建图元；选中态必须保留（跨视野选中/定位场景）
+      if (cullView && !selected && !bboxInView(pf, cullView)) continue
+      const st = this.resolveFeatureStyle(pf.feature, pf.kind)
+      const pickId = { feature: pf.feature, layerId: this.layerId, selectionId: sid }
+      for (const p of pf.geoms) {
+        points.push({
+          id: pickId,
+          opts: {
+            position: C.Cartesian3.fromDegrees(p[0], p[1]),
+            pixelSize: st.pointSize,
+            color: C.Color.fromCssColorString(st.fillColor)
+              .withAlpha(st.noFill ? 0 : st.fillOpacity),
+            outlineColor: C.Color.fromCssColorString(
+              selected ? SELECTED_STROKE_COLOR : st.strokeColor),
+            outlineWidth: st.noStroke && !selected ? 0 : st.strokeWidth,
+            // PointPrimitive 无 heightReference，用"始终画在最上层"达到同等可见性
+            disableDepthTestDistance: Number.POSITIVE_INFINITY,
+          },
+        })
+      }
+    }
+    if (points.length === 0) return
+    const coll = new C.PointPrimitiveCollection()
+    for (const p of points) coll.add({ ...p.opts, id: p.id })
+    coll.show = this.visible
+    this.pointsPrimitive = collection.add(coll)
+  }
+
+  /**
+   * 选中要素的红色描边（面/线）：独立批次、最后绘制（等价 2D 的 bringToFront）。
+   * 选中只换描边色、宽度沿用原描边宽，填充保持原色（与 2D `setSelectionHighlight` 同口径）。
+   */
+  private rebuildSelectionIfNeeded(): void {
+    if (this.selectionBuiltVersion === this.selectionVersion) return
+    this.selectionBuiltVersion = this.selectionVersion
+    const C = this.C
+    const collection = this.viewer?.scene?.primitives
+    const old = this.selectionPrimitives
+    this.selectionPrimitives = []
+    if (!collection || !this.selectionIds || this.selectionIds.size === 0) {
+      this.retirePrimitives(old)
+      return
+    }
+    const outlines: any[] = []
+    for (const pf of this.prepared) {
+      if (pf.kind === 'point') continue
+      const sid = featureSelectionId(pf.feature.properties, this.layerId, pf.fi)
+      if (!this.selectionIds.has(sid)) continue
+      const st = this.resolveFeatureStyle(pf.feature, pf.kind)
+      const pickId = { feature: pf.feature, layerId: this.layerId, selectionId: sid }
+      const addLine = (line: Position[]): void => {
+        if (line.length < 2) return
+        outlines.push(new C.GeometryInstance({
+          geometry: new C.GroundPolylineGeometry({
+            positions: C.Cartesian3.fromDegreesArray(line.flatMap((p) => p)),
+            width: st.strokeWidth,
+          }),
+          attributes: {
+            color: C.ColorGeometryInstanceAttribute.fromColor(
+              C.Color.fromCssColorString(SELECTED_STROKE_COLOR)),
+          },
+          id: pickId,
+        }))
+      }
+      if (pf.kind === 'line') pf.geoms.forEach(addLine)
+      else pf.geoms.forEach((ring) => { if (ring.length >= 3) addLine(ring) })
+    }
+    if (outlines.length === 0) {
+      this.retirePrimitives(old)
+      return
+    }
+    try {
+      const prim = collection.add(new C.GroundPolylinePrimitive({
+        geometryInstances: outlines,
+        appearance: new C.PolylineColorAppearance(),
+        asynchronous: true,
+      }))
+      this.selectionPrimitives = [prim]
+      this.retireAfterReplacement(old, this.selectionPrimitives)
+    } catch (e) {
+      console.warn('[CesiumGeoJsonLayer] 选中描边创建失败:', this.layerId, e)
+      this.retirePrimitives(old)
+    }
+  }
+
+  private applySelectionShown(visible: boolean): void {
+    for (const p of this.selectionPrimitives) {
+      try { p.show = visible } catch { /* ignore */ }
+    }
+  }
+
+  /** 选中红边框必须画在所有块之上 */
+  private raiseSelectionToTop(): void {
+    const collection = this.viewer?.scene?.primitives
+    if (!collection) return
+    for (const p of this.selectionPrimitives) {
+      try { collection.raiseToTop?.(p) } catch { /* ignore */ }
+    }
+  }
+
+  /** 已构建块超过上限时，按"最久未可见"淘汰（控制显存） */
+  private trimChunkCache(): void {
+    const built = this.chunks.filter((c) => c.primitives.length > 0)
+    if (built.length <= MAX_BUILT_CHUNKS) return
+    const evictable = built
+      .filter((c) => !c.visible)
+      .sort((a, b) => a.lastVisibleTick - b.lastVisibleTick)
+    let excess = built.length - MAX_BUILT_CHUNKS
+    for (const chunk of evictable) {
+      if (excess <= 0) break
+      this.retirePrimitives(chunk.primitives)
+      chunk.primitives = []
+      chunk.shown = false
+      excess -= 1
     }
   }
 }

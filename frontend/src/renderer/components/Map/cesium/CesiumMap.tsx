@@ -27,6 +27,8 @@ import {
 } from '../../../store/mapStore'
 import { gcj02ToWgs84, wgs84ToGcj02 } from '../../../utils/coordinate'
 import { CesiumSectorLayer, type CameraView } from './CesiumSectorLayer'
+import { jumpCameraToPoint } from './cesiumCameraJump'
+import { perfStart, perfEnd } from './cesiumPerf'
 import type { SectorStyleContext } from './cesiumSectorStyle'
 import type { PlanningHighlight } from './cesiumHighlight'
 import { buildPciModPalette } from '../../../utils/pciModColor'
@@ -115,19 +117,27 @@ const GEO_FETCH_CONCURRENCY = 4
 const MAX_RENDER_RECOVERIES = 3
 
 /**
- * 相机移动过程中"标签候选集"的刷新节流（ms）。
- * 见 postRender 里的说明：候选集只在相机停下后刷新会导致移动时标签不跟着走。
+ * 相机移动中的标签重绘节流（ms）。
+ *
+ * 标签是"每帧投影 + fillText"的 Canvas 绘制，几百个标签时每帧都吃主线程；
+ * 交互中按 ~30fps 重绘，静止时由 postRender 的相机变化检测自然停掉。
+ * 候选集（碰撞布局）只在相机停下/配置变化时重算，移动中不再全量扫描图层。
  */
-const LABEL_SYNC_THROTTLE_MS = 150
+const LABEL_DRAW_THROTTLE_MS = 33
 
 /**
- * 相机移动中的渲染分辨率缩放（交互降级）。
+ * 交互期降载参数。
  *
- * 平移/缩放是最高频的卡顿场景，而 GPU 填充成本 ≈ 像素数（= resolutionScale²）。
- * 移动中把分辨率压到 0.75（像素量降到约 56%），停下后恢复清晰度档位设定的值 ——
- * 交互流畅度优先，静止观感不变。
+ * 平移/缩放是最高频的卡顿场景：GPU 填充成本 ≈ 像素数（resolutionScale²），
+ * 影像/建筑瓦片选择与地面分类也随屏幕空间误差放大。移动中降载、停下恢复清晰度档位。
  */
-const INTERACTION_RESOLUTION_SCALE = 0.75
+const INTERACTION_RESOLUTION_SCALE = 0.5
+const INTERACTION_GLOBE_SSE = 4
+/** OSM 建筑的屏幕空间误差：静止沿用既有口径 32，交互中放宽到 64 */
+const BASE_TILESET_SSE = 32
+const INTERACTION_TILESET_SSE = 64
+/** 相机停下后延迟多久做视口重建（等惯性/瓦片稳定） */
+const MOVE_REBUILD_DELAY_MS = 250
 
 /**
  * 等浏览器真正画出一帧（双 rAF：第一帧提交 React 的 DOM 变更，第二帧确保已合成上屏）。
@@ -494,6 +504,7 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
   function syncLabels() {
     const overlay = labelOverlayRef.current
     if (!overlay) return
+    const perf = perfStart()
     const p = propsRef.current
     const ms = mapSettingsRef.current
     const view = getCameraView()
@@ -527,6 +538,7 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
     const deco = decorationLayerRef.current
     if (!deco || !ms.decorationLabelVisible) overlay.removeSource('decoration-layer')
     else overlay.setCandidates('decoration-layer', deco.labelCandidates(view))
+    perfEnd('syncLabels', perf, `${overlay.sourceCount} sources`)
   }
 
   /** 同步图层文件 + 地理化数据（layerFiles / pointFiles 结构一致） */
@@ -1199,7 +1211,7 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
         // 3D Tiles 的遍历/加载成本主要由屏幕空间误差阈值决定：默认 16（越早细化越精细）。
         // 本工具是城市级俯瞰视角，建筑在屏幕上通常只有几十像素，32 的细化阈值
         // 观感几乎无差，但显著减少瓦片遍历与加载量（Cesium 专项优化）。
-        tileset.maximumScreenSpaceError = 32
+        tileset.maximumScreenSpaceError = BASE_TILESET_SSE
         viewer.scene.primitives.add(tileset)
         tilesetRef.current = tileset
 
@@ -1287,12 +1299,14 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
           }
         }, C.ScreenSpaceEventType.LEFT_CLICK)
 
-        // 相机移动：防抖重建扇区（视口剔除）+ 回写 mapStateService + 更新指南针
-        let moveTimer: ReturnType<typeof setTimeout> | null = null
+        // 相机交互：移动中降载、停下后分帧重建（视口剔除）+ 回写 mapStateService + 更新指南针
+        let rebuildTimer: ReturnType<typeof setTimeout> | null = null
         let headingTimer: ReturnType<typeof setTimeout> | null = null
-        /** 交互中（降分辨率）标记：true = 已压低 resolutionScale，停下后要恢复 */
+        let refreshRaf: number | null = null
+        /** 交互中（降载）标记：true = 已压低分辨率/放宽屏幕空间误差，停下后恢复 */
         let interacting = false
-        viewer.camera.changed.addEventListener(() => {
+
+        const persistMapState = () => {
           const carto = viewer.camera.positionCartographic
           const lat = C.Math.toDegrees(carto.latitude)
           const lng = C.Math.toDegrees(carto.longitude)
@@ -1301,13 +1315,93 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
             center: [glat, glng],
             zoom: heightToZoom(carto.height, lat, container.clientHeight, viewer.camera.frustum.fovy),
           })
-          // 交互中降渲染分辨率：一次交互只压一次（连续 changed 事件不重复设置），
-          // 像素量降到约 56%，停下后在 moveTimer 里恢复清晰度
-          if (!interacting) {
-            interacting = true
-            viewer.resolutionScale = Math.min(
-              baseResolutionScaleRef.current, INTERACTION_RESOLUTION_SCALE)
+        }
+
+        /** 交互期降载：像素量降到约 25%、放宽影像/建筑误差、关 FXAA */
+        const applyInteractionProfile = () => {
+          if (interacting) return
+          interacting = true
+          viewer.resolutionScale = Math.min(
+            baseResolutionScaleRef.current, INTERACTION_RESOLUTION_SCALE)
+          viewer.scene.globe.maximumScreenSpaceError = INTERACTION_GLOBE_SSE
+          viewer.scene.fxaa = false
+          if (tilesetRef.current) tilesetRef.current.maximumScreenSpaceError = INTERACTION_TILESET_SSE
+        }
+
+        /** 交互结束：恢复清晰度档位（右键设置 → CesiumJS）的渲染参数 */
+        const restoreQuality = () => {
+          if (!interacting) return
+          interacting = false
+          if (viewer.isDestroyed()) return
+          const tier = mapSettingsRef.current.cesiumQuality as CesiumQuality | undefined
+          const preset = (tier && CESIUM_QUALITY_PRESETS[tier]) || CESIUM_QUALITY_PRESETS.smooth
+          viewer.resolutionScale = baseResolutionScaleRef.current
+          viewer.scene.globe.maximumScreenSpaceError = preset.maximumScreenSpaceError
+          viewer.scene.fxaa = preset.fxaa
+          if (tilesetRef.current) tilesetRef.current.maximumScreenSpaceError = BASE_TILESET_SSE
+        }
+
+        /**
+         * 分帧重建：一帧只处理一个图层。
+         *
+         * 早先是同一个定时器里把 LTE/NR 扇区层 + 所有 GeoJSON 图层 + 标签 + 等高线
+         * 一次性重建，导入图层多/大时会形成一次几百毫秒的长任务（手势结束明显卡一下）。
+         */
+        const rebuildLayers = (view: CameraView) => {
+          if (refreshRaf !== null) cancelAnimationFrame(refreshRaf)
+          const tasks: Array<() => void> = []
+          const lte = sectorLayersRef.current.lte
+          const nr = sectorLayersRef.current.nr
+          if (lte) tasks.push(() => lte.update(view))
+          if (nr) tasks.push(() => nr.update(view))
+          for (const layer of geoJsonLayersRef.current.values()) {
+            tasks.push(() => layer.setView(view))
           }
+          const decoration = decorationLayerRef.current
+          if (decoration) tasks.push(() => decoration.setView(view))
+          // 跨过地理化数据扇区 LOD 阈值时才重建（圆点 ↔ 扇形）
+          tasks.push(() => setGeoLodLow(view.zoom <= GEO_DATA_SECTOR_LOD_ZOOM))
+          tasks.push(() => syncLabels())
+          // 等高线：停下后按新视野重新采样（模块内有同视野守卫，重复调用无害）
+          tasks.push(() => { void contourRef.current?.update() })
+          const run = () => {
+            refreshRaf = null
+            if (viewer.isDestroyed()) return
+            const task = tasks.shift()
+            if (!task) return
+            try { task() } catch (e) { console.warn('[CesiumMap] 图层刷新失败:', e) }
+            if (tasks.length > 0) refreshRaf = requestAnimationFrame(run)
+          }
+          refreshRaf = requestAnimationFrame(run)
+        }
+
+        /** 防抖：连续 changed 事件只保留最后一次（惯性/滚轮连击结束后再重建） */
+        const scheduleRebuild = () => {
+          if (rebuildTimer) clearTimeout(rebuildTimer)
+          rebuildTimer = setTimeout(() => {
+            rebuildTimer = null
+            if (viewer.isDestroyed()) return
+            const view = getCameraView()
+            if (view) rebuildLayers(view)
+          }, MOVE_REBUILD_DELAY_MS)
+        }
+
+        // 用户交互用 moveStart/moveEnd 驱动降载/恢复：`camera.changed` 受
+        // percentageChanged=0.25 限制，小幅拖动/缩放的多数手势根本不触发，挂在那里会漏掉降载；
+        // changed 继续承担程序化移动（flyTo/focusLayer）的兜底重建与状态回写。
+        viewer.camera.moveStart.addEventListener(() => {
+          applyInteractionProfile()
+          // 平移/缩放后属性框跟随的锚点已失效 → 收起（与高德侧"移动地图即关闭属性框"一致）
+          closeInfoPanels()
+        })
+        viewer.camera.moveEnd.addEventListener(() => {
+          restoreQuality()
+          persistMapState()
+          scheduleRebuild()
+        })
+        viewer.camera.changed.addEventListener(() => {
+          persistMapState()
+          scheduleRebuild()
           // 指南针：方位角变化较碎，节流到 ~100ms 更新一次
           if (!headingTimer) {
             headingTimer = setTimeout(() => {
@@ -1315,70 +1409,30 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
               setHeadingDeg(C.Math.toDegrees(viewer.camera.heading))
             }, 100)
           }
-          // 平移/缩放后属性框跟随的锚点已失效 → 收起（与高德侧"移动地图即关闭属性框"一致）
-          if (!moveTimer) closeInfoPanels()
-          if (moveTimer) clearTimeout(moveTimer)
-          moveTimer = setTimeout(() => {
-            moveTimer = null
-            interacting = false
-            // 卸载/销毁后迟到的一次恢复：viewer 已毁时写属性会抛错
-            if (viewer.isDestroyed()) return
-            // 恢复清晰度档位设定的渲染分辨率（静止观感不变）
-            viewer.resolutionScale = baseResolutionScaleRef.current
-            const view = getCameraView()
-            if (view) {
-              sectorLayersRef.current.lte?.update(view)
-              sectorLayersRef.current.nr?.update(view)
-              // GeoJSON 图层视口裁剪重建：与扇区同时机（停下才重建，移动中不重建）。
-              // 图层内部按视野分档键去重，视野没实质变化不会重建
-              for (const layer of geoJsonLayersRef.current.values()) layer.setView(view)
-              decorationLayerRef.current?.setView(view)
-              // 跨过地理化数据扇区 LOD 阈值时才重建（圆点 ↔ 扇形）
-              setGeoLodLow(view.zoom <= GEO_DATA_SECTOR_LOD_ZOOM)
-            }
-            syncLabels()
-            // 等高线：相机停下后按新视野重新采样（模块内有同视野守卫，重复调用无害）
-            void contourRef.current?.update()
-          }, 350)
         })
         /**
-         * 覆盖层（圈选框 + 标签）跟随相机：在 `scene.postRender` 里**逐帧比较相机状态**，
-         * 只要相机动过就重绘，与底图严格同帧。
+         * 覆盖层（圈选框 + 热力采样 + 标签）跟随相机：在 `scene.postRender` 里逐帧比较
+         * 相机状态（不能用 `camera.changed`：它受 `percentageChanged` 阈值限制，小幅移动
+         * 不触发 → 覆盖层停在旧屏幕位置；探测实现见 `cesiumCameraProbe.ts`）。
          *
-         * 不能用 `camera.changed` 事件驱动（早先的做法）：它受 `percentageChanged` 阈值
-         * （这里为 0.25＝相机变化 25% 才触发）限制，小幅平移/缩放根本不触发 →
-         * 标签停在旧的屏幕位置、看起来"不跟随要素移动、错位"。
-         * 2D 的 `LabelLayoutManager` 是 Leaflet 每个 `move` 帧都重绘，这里必须等价。
-         *
-         * 比较 `positionWC` / `directionWC` / `upWC`（Cesium 每帧原地更新的公开属性，
-         * 免去 `viewMatrix` getter 的 updateMembers 计算）+ 画布尺寸（窗口 resize 改变视锥）。
-         * 具体探测实现在 `cesiumCameraProbe.ts`（小步移动必须也被识别，见该文件注释）。
+         * 性能：标签每帧"投影 + fillText"成本高，交互中按 ~30fps 限帧；候选集（碰撞布局）
+         * 只在相机停下（scheduleRebuild → syncLabels）或配置变化时重算 —— 早先移动中每
+         * 150ms 全量重排一次，开大图层且启用标签时会周期性掉帧。
          */
         const overlayCameraMoved = createCameraMoveProbe()
-        /**
-         * 候选集刷新节流（ms）。
-         *
-         * 覆盖层每帧只是把已有候选重新投影（所以标签会跟着地图走），但**候选集本身**
-         * 原先只在"相机停下 350ms"后才刷新（`syncLabels`）。持续平移/缩放时视野已经变了、
-         * 候选还是旧的：旧候选被投影到屏幕外 → 画面上一个标签都没有，而新进入视野的
-         * 要素一直没标签 —— 表现为"标签不随地图走"。
-         * 这里在移动过程中按节流补刷新，让候选集始终对应当前视野。
-         */
-        let lastLabelSyncAt = 0
+        let lastLabelDrawAt = 0
         viewer.scene.postRender.addEventListener(() => {
           if (!overlayCameraMoved(viewer.camera, viewer.canvas?.clientWidth ?? 0)) return
           selectionRef.current?.refreshOverlay()
           // 「原始采样」热力是屏幕空间逐点色斑，与标签同理由：相机一动就要重投影重画
           for (const heat of heatmapsRef.current.values()) heat.drawSamplesNow()
-          labelOverlayRef.current?.drawNow()
           const now = performance.now()
-          if (now - lastLabelSyncAt >= LABEL_SYNC_THROTTLE_MS) {
-            lastLabelSyncAt = now
-            syncLabels()
-          }
+          if (now - lastLabelDrawAt < LABEL_DRAW_THROTTLE_MS) return
+          lastLabelDrawAt = now
+          labelOverlayRef.current?.drawNow()
         })
-        // 相机变化 10% 就触发重建 → 交互中重建过密；放宽到 25%，只在明显移动后重建
-        // （仅用于上方的防抖重建路径，覆盖层重绘不依赖它）
+        // changed 只承担状态回写/指南针/兜底重建调度（重建已防抖+分帧），
+        // 阈值保持 25% 以减少无谓事件；覆盖层重绘不依赖它。
         viewer.camera.percentageChanged = 0.25
         /**
          * 刻意**不**开启 `scene.pickTranslucentDepth`（2026-10-14 修"缩放必崩 _target"的根因）。
@@ -1843,15 +1897,24 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
   useImperativeHandle(ref, (): OnlineMapRef => {
     const noop = () => {}
     return {
-      flyTo: (latLng, zoom) => {
+      flyTo: (latLng, zoom, duration = 1.5) => {
         const viewer = viewerRef.current
         if (!viewer) return
         const C = (window as any).Cesium
         const [wlat, wlng] = gcj02ToWgs84(latLng[0], latLng[1])
-        const h = zoom !== undefined
-          ? zoomToHeight(zoom, wlat, viewer.canvas.clientHeight, viewer.camera.frustum.fovy)
-          : viewer.camera.positionCartographic.height
-        viewer.camera.flyTo({ destination: C.Cartesian3.fromDegrees(wlng, wlat, h) })
+        if (duration === 0) {
+          // 搜索定位等场景要求瞬时跳转；倾斜视角下还必须把目标放到屏幕中心（见 jumpCameraToPoint）
+          const viewHeight = zoom !== undefined
+            ? zoomToHeight(zoom, wlat, viewer.canvas.clientHeight, viewer.camera.frustum.fovy)
+            : viewer.camera.positionCartographic.height
+          jumpCameraToPoint(C, viewer, wlng, wlat, viewHeight)
+          return
+        }
+        const destination = zoom !== undefined
+          ? C.Cartesian3.fromDegrees(wlng, wlat,
+            zoomToHeight(zoom, wlat, viewer.canvas.clientHeight, viewer.camera.frustum.fovy))
+          : C.Cartesian3.fromDegrees(wlng, wlat, viewer.camera.positionCartographic.height)
+        viewer.camera.flyTo({ destination })
       },
       fitBounds: (latLngs) => {
         const viewer = viewerRef.current
@@ -1911,7 +1974,12 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
         syncAll()
       },
       getPciRenderStats: () => null,
-      refreshSectorColors: () => syncAll(),
+      refreshSectorColors: () => {
+        // 频点自定义颜色/PCI 同步值不在样式上下文里（渲染时实时读取），必须显式标脏
+        sectorLayersRef.current.lte?.refresh()
+        sectorLayersRef.current.nr?.refresh()
+        syncAll()
+      },
       setLayerThematicSettings: noop,
       setSectorThematicSettings: () => syncAll(),
       setLayerHeatmapSettings: (fileId, settings) => {
@@ -2083,7 +2151,7 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
         })
       },
       /**
-       * 搜索定位（图层文件 / 地理化数据）：等图层就绪 → 红色描边高亮目标要素 → 飞行定位。
+       * 搜索定位（图层文件 / 地理化数据）：等图层就绪 → 红色描边高亮目标要素 → 瞬时定位。
        * 与 2D `OnlineMap.locateLayerFeature` 同口径：入参是 **GCJ02** 渲染坐标，
        * Cesium 侧一切按 WGS84，需先转换。
        */
@@ -2120,25 +2188,24 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
          * 无 bounds 时飞到 center。
          */
         const TARGET_ZOOM = 18
-        const flyTo = (wlat: number, wlng: number) => {
-          viewer.camera.flyTo({
-            destination: C.Cartesian3.fromDegrees(
-              wlng, wlat,
-              zoomToHeight(TARGET_ZOOM, wlat,
-                viewer.canvas.clientHeight, viewer.camera.frustum.fovy)),
-          })
+        const jumpTo = (wlat: number, wlng: number) => {
+          // 搜索定位瞬时完成，目标居中（倾斜视角下沿用俯仰角，见 jumpCameraToPoint）
+          jumpCameraToPoint(
+            C, viewer, wlng, wlat,
+            zoomToHeight(TARGET_ZOOM, wlat,
+              viewer.canvas.clientHeight, viewer.camera.frustum.fovy))
         }
         if (opts.bounds) {
           const [[s, w], [n, e]] = opts.bounds
           const [ws, ww] = gcj02ToWgs84(s, w)
           const [wn, we] = gcj02ToWgs84(n, e)
           // 面/线要素：先按包围盒定区域，再落到 18 级看清要素本身
-          flyTo((ws + wn) / 2, (ww + we) / 2)
+          jumpTo((ws + wn) / 2, (ww + we) / 2)
           return true
         }
         if (opts.center) {
           const [wlat, wlng] = gcj02ToWgs84(opts.center[0], opts.center[1])
-          flyTo(wlat, wlng)
+          jumpTo(wlat, wlng)
         }
         return true
       },
@@ -2151,15 +2218,29 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
         const viewer = viewerRef.current
         if (!viewer) return
         const C = (window as any).Cesium
+        // 与 2D 同口径：搜索定位要给目标扇区画红色边框；多次搜索结果累计保持
+        const ids = new Set(selectionIdsRef.current ?? [])
+        ids.add(String(opts.id))
+        selectionIdsRef.current = ids
+
         const [wlat, wlng] = gcj02ToWgs84(opts.lat, opts.lng)
-        viewer.camera.flyTo({
-          destination: C.Cartesian3.fromDegrees(wlng, wlat,
-            opts.zoom !== undefined
-              ? zoomToHeight(opts.zoom, wlat, viewer.canvas.clientHeight, viewer.camera.frustum.fovy)
-              : viewer.camera.positionCartographic.height),
-        })
+        // 与 2D 一致：至少放到 16 级，避免从大范围视野跳过去后目标只有几个像素
+        const canvasH = viewer.canvas.clientHeight
+        const currentZoom = heightToZoom(
+          viewer.camera.positionCartographic.height, wlat, canvasH, viewer.camera.frustum.fovy)
+        const targetZoom = opts.zoom ?? Math.max(currentZoom, 16)
+        // 目标居中：倾斜视角下不能只把相机位置挪到目标点上空（见 jumpCameraToPoint）
+        jumpCameraToPoint(
+          C, viewer, wlng, wlat,
+          zoomToHeight(targetZoom, wlat, canvasH, viewer.camera.frustum.fovy))
+        // 跳转后再同步：扇区层按新视野裁剪，远处目标才会进入本次重建批次并应用红框
+        syncAll()
       },
-      clearSectorHighlight: noop,
+      clearSectorHighlight: () => {
+        // 3D 的选中/搜索高亮共用同一集合（同 clearLayerFeatureHighlight 口径）
+        selectionIdsRef.current = null
+        syncAll()
+      },
       getPointFileData: () => ({}),
       setSectorLabelSettings: () => syncAll(),
       clearCaptureMarkers: () => mapToolsRef.current?.clearCapture(),
