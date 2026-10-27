@@ -16,11 +16,23 @@ import httpx
 
 router = APIRouter()
 
-# 地图数据缓存
-_map_data_cache: Optional[Dict[str, Any]] = None
-_map_data_cache_time: float = 0
+# 地图数据缓存（按（地市+运营商）组隔离，避免 TTL 内跨组串数据）
+_map_data_cache: Dict[str, Dict[str, Any]] = {}
+_map_data_cache_time: Dict[str, float] = {}
 _map_data_cache_ttl: int = 1800  # 缓存30分钟（数据变更时主动失效）
 _map_data_cache_lock: asyncio.Lock = asyncio.Lock()  # 防止并发重建缓存
+
+
+def _map_cache_key(user) -> str:
+    """地图数据缓存键：一律按（地市+运营商）组分键，管理员不设全局键；
+    组信息缺失用户用专属空键（看不到任何站点）；user=None 系统调用用全局键。"""
+    from app.services.data_group import user_group
+    if user is None:
+        return "__all__"
+    group = user_group(user)
+    if group is None:
+        return "__none__"
+    return f"{group[0]}|{group[1]}"
 
 
 def _filter_sites_by_bbox(sites: List[Dict], min_lat: float, max_lat: float, min_lon: float, max_lon: float) -> List[Dict]:
@@ -55,20 +67,25 @@ async def get_map_data(
     """
     try:
         from app.services.data_service import data_service
-        global _map_data_cache, _map_data_cache_time
 
-        # 检查缓存是否有效（加锁防止并发重建）
+        # 检查缓存是否有效（按组分键；加锁防止并发重建）
+        cache_key = _map_cache_key(current_user)
         current_time = time.time()
-        if _map_data_cache is None or (current_time - _map_data_cache_time) > _map_data_cache_ttl:
+        cached = _map_data_cache.get(cache_key)
+        cached_time = _map_data_cache_time.get(cache_key, 0)
+        if cached is None or (current_time - cached_time) > _map_data_cache_ttl:
             async with _map_data_cache_lock:
                 # 二次检查：获取锁后再次确认缓存确实需要重建
-                if _map_data_cache is None or (time.time() - _map_data_cache_time) > _map_data_cache_ttl:
-                    _map_data_cache = await run_in_threadpool(_load_map_data_from_files, data_service)
-                    _map_data_cache_time = time.time()
+                cached = _map_data_cache.get(cache_key)
+                cached_time = _map_data_cache_time.get(cache_key, 0)
+                if cached is None or (time.time() - cached_time) > _map_data_cache_ttl:
+                    cached = await run_in_threadpool(_load_map_data_from_files, data_service, current_user)
+                    _map_data_cache[cache_key] = cached
+                    _map_data_cache_time[cache_key] = time.time()
 
-        all_sites = _map_data_cache.get("sites", [])
-        bounds = _map_data_cache.get("bounds", {})
-        center = _map_data_cache.get("center", {})
+        all_sites = cached.get("sites", [])
+        bounds = cached.get("bounds", {})
+        center = cached.get("center", {})
 
         # 如果提供了边界框参数，进行筛选
         if min_lat is not None and max_lat is not None and min_lon is not None and max_lon is not None:
@@ -91,23 +108,37 @@ async def get_map_data(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-def _load_map_data_from_files(data_service) -> Dict[str, Any]:
-    """从 SQLite 加载地图数据（优化版：直接 SQL 查询，跳过 ORM 开销）"""
+def _load_map_data_from_files(data_service, user=None) -> Dict[str, Any]:
+    """从 SQLite 加载地图数据（优化版：直接 SQL 查询，跳过 ORM 开销）
+
+    user 提供时仅加载该组（地市+运营商）最新的 full_params 工参；
+    user 为 None 保持历史全局行为（管理员/系统内部调用）。
+    """
     from app.services.data_service import SessionLocal
     from app.models.database import Workbook, Site, Sector
+    from app.services.data_group import group_sql_filter
 
     db = SessionLocal()
     try:
-        # 只取最新的 full_params 工作簿
-        wb = db.query(Workbook).filter(
+        # 组过滤条件（管理员返回 None = 不加过滤）
+        group_filter = group_sql_filter(Workbook.city, Workbook.operator, user)
+
+        # 只取该组最新的 full_params 工作簿
+        wb_query = db.query(Workbook).filter(
             Workbook.file_type == "full_params",
             Workbook.status == "ready"
-        ).order_by(Workbook.created_at.desc()).first()
+        )
+        if group_filter is not None:
+            wb_query = wb_query.filter(group_filter)
+        wb = wb_query.order_by(Workbook.created_at.desc()).first()
 
         if not wb:
-            wb = db.query(Workbook).filter(
+            wb_query2 = db.query(Workbook).filter(
                 Workbook.file_type == "full_params"
-            ).order_by(Workbook.created_at.desc()).first()
+            )
+            if group_filter is not None:
+                wb_query2 = wb_query2.filter(group_filter)
+            wb = wb_query2.order_by(Workbook.created_at.desc()).first()
 
         if not wb:
             return {"sites": [], "bounds": _default_bounds(), "center": _default_center()}
@@ -210,27 +241,32 @@ def _default_center():
 
 
 @router.get("/cells", response_model=Dict[str, Any])
-async def get_cell_list(limit: int = 50000) -> Dict[str, Any]:
+async def get_cell_list(limit: int = 50000, current_user=Depends(get_current_user)) -> Dict[str, Any]:
     """获取小区选择列表（轻量API，不含坐标转换）
-    
+
     比 /api/v1/map/data 轻量许多：
-    - 只返回 id/name/siteId/networkType 四个字段
+    - 只返回 id/name/siteId/networkType/frequency/pci/经纬度 等列表字段
     - 跳过扇区验证、坐标转换、边界计算
     - 复用 _load_map_data_from_files() 的缓存机制
     """
     try:
         from app.services.data_service import data_service
-        global _map_data_cache, _map_data_cache_time
 
-        # 复用地图数据的文件缓存
+        # 复用地图数据的文件缓存（按（地市+运营商）组分键，跨组不串数据）
+        cache_key = _map_cache_key(current_user)
         current_time = time.time()
-        if _map_data_cache is None or (current_time - _map_data_cache_time) > _map_data_cache_ttl:
+        cached = _map_data_cache.get(cache_key)
+        cached_time = _map_data_cache_time.get(cache_key, 0)
+        if cached is None or (current_time - cached_time) > _map_data_cache_ttl:
             async with _map_data_cache_lock:
-                if _map_data_cache is None or (time.time() - _map_data_cache_time) > _map_data_cache_ttl:
-                    _map_data_cache = await run_in_threadpool(_load_map_data_from_files, data_service)
-                    _map_data_cache_time = time.time()
+                cached = _map_data_cache.get(cache_key)
+                cached_time = _map_data_cache_time.get(cache_key, 0)
+                if cached is None or (time.time() - cached_time) > _map_data_cache_ttl:
+                    cached = await run_in_threadpool(_load_map_data_from_files, data_service, current_user)
+                    _map_data_cache[cache_key] = cached
+                    _map_data_cache_time[cache_key] = time.time()
 
-        all_sites = _map_data_cache.get("sites", [])
+        all_sites = cached.get("sites", [])
         cells_lte: List[Dict[str, Any]] = []
         cells_nr: List[Dict[str, Any]] = []
         dedup_set: set = set()
@@ -252,13 +288,24 @@ async def get_cell_list(limit: int = 50000) -> Dict[str, Any]:
 
                 sector_name = sector.get("name") or site_name or unique_key
 
+                # 经纬度只取小区（扇区）自身值，缺失/为 0 时返回 None。
+                # 不能回退到站点级：一个站点行下可能挂多个逻辑站点的小区（共 BBU/多站共站址），
+                # 站点级坐标取自该行第一条小区，回退会把别的小区坐标显示到本小区上，
+                # 与数据管理「查询/修改」口径不一致，也会让缺坐标的小区绕过执行前校验。
+                sector_lat = sector.get("latitude") or 0.0
+                sector_lng = sector.get("longitude") or 0.0
+                latitude = sector_lat if 0 < sector_lat < 90 else None
+                longitude = sector_lng if 0 < sector_lng < 180 else None
+
                 cell_item = {
                     "id": unique_key,
                     "name": sector_name,
                     "siteId": site_id,
                     "networkType": network_type,
                     "frequency": sector.get("frequency"),
-                    "pci": sector.get("pci")
+                    "pci": sector.get("pci"),
+                    "longitude": longitude,
+                    "latitude": latitude
                 }
 
                 if network_type == "LTE":
@@ -286,6 +333,7 @@ async def get_cell_list(limit: int = 50000) -> Dict[str, Any]:
 @router.get("/sectors", response_model=Dict[str, Any])
 async def get_sectors_mobile(
     network_type: Optional[str] = None,
+    current_user=Depends(get_current_user),
 ) -> Dict[str, Any]:
     """获取扇区数据（移动端优化版）
 
@@ -295,16 +343,22 @@ async def get_sectors_mobile(
     """
     try:
         from app.services.data_service import data_service
-        global _map_data_cache, _map_data_cache_time
 
+        # 复用地图数据的文件缓存（按（地市+运营商）组分键，跨组不串数据）
+        cache_key = _map_cache_key(current_user)
         current_time = time.time()
-        if _map_data_cache is None or (current_time - _map_data_cache_time) > _map_data_cache_ttl:
+        cached = _map_data_cache.get(cache_key)
+        cached_time = _map_data_cache_time.get(cache_key, 0)
+        if cached is None or (current_time - cached_time) > _map_data_cache_ttl:
             async with _map_data_cache_lock:
-                if _map_data_cache is None or (time.time() - _map_data_cache_time) > _map_data_cache_ttl:
-                    _map_data_cache = await run_in_threadpool(_load_map_data_from_files, data_service)
-                    _map_data_cache_time = time.time()
+                cached = _map_data_cache.get(cache_key)
+                cached_time = _map_data_cache_time.get(cache_key, 0)
+                if cached is None or (time.time() - cached_time) > _map_data_cache_ttl:
+                    cached = await run_in_threadpool(_load_map_data_from_files, data_service, current_user)
+                    _map_data_cache[cache_key] = cached
+                    _map_data_cache_time[cache_key] = time.time()
 
-        all_sites = _map_data_cache.get("sites", [])
+        all_sites = cached.get("sites", [])
 
         lte_sectors: List[Dict[str, Any]] = []
         nr_sectors: List[Dict[str, Any]] = []
@@ -394,10 +448,9 @@ async def clear_map_cache() -> Dict[str, Any]:
 
 
 def invalidate_map_data_cache():
-    """清除地图数据缓存和 MapInfo 图层缓存（供其他模块调用）"""
-    global _map_data_cache, _map_data_cache_time
-    _map_data_cache = None
-    _map_data_cache_time = 0
+    """清除地图数据缓存和 MapInfo 图层缓存（供其他模块调用；按组缓存则全组清空）"""
+    _map_data_cache.clear()
+    _map_data_cache_time.clear()
     try:
         from app.services.mapinfo_service import clear_layer_cache
         clear_layer_cache()

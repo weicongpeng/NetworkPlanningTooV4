@@ -1,7 +1,7 @@
 import L from 'leaflet'
 import { RenderSectorData } from './mapDataService'
 
-export type SelectionMode = 'none' | 'circle' | 'polygon' | 'point'
+export type SelectionMode = 'none' | 'circle' | 'polygon' | 'point' | 'boundary'
 
 export interface SelectionState {
   mode: SelectionMode

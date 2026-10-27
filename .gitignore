@@ -51,6 +51,8 @@ coverage/
 
 # 构建产物
 *.egg-info/
+__pycache__/
+*.pyc
 dist/
 
 # 项目级上传/输出/数据目录
@@ -60,3 +62,43 @@ dist/
 /全量工参/
 /待规划小区/
 /输出文件/
+
+# 构建产物/运行时大文件（APK 安装包、分块上传临时文件、Playwright 浏览器）
+/backend/app/apks/
+/.playwright-cli/
+
+# 依赖/构建缓存与临时文件
+/node_modules/
+/package.json
+/package-lock.json
+/.qwen/tmp/
+*.bak
+*.backup
+mobile-app/$buildDir/
+mobile-app/ninja-temp/
+mobile-app/ninja-win.zip
+mobile-app/android/ninja-fix/
+mobile-app/build_log.txt
+mobile-app/tsc_errors.txt
+
+# 桌面端打包产物与授权密钥（私钥永不入库）
+/licenses/
+/build/
+/desktop/build/
+/desktop/dist/
+/desktop/app.ico
+/desktop/webview2/
+/installer-out/
+/desktop/tools/keys/
+/desktop/tools/*.pem
+/desktop/tools/*.key
+*.nptlic
+
+# 桌面安装包由 GitHub Release 分发，不入库
+/desktop_releases/
+# 桌面端运行时同步状态
+/sync_state.json
+# 本地工具/调试产物
+/.tool_view_test.txt
+/.qoder/
+/frontend/src/renderer/utils/__tests__/zz-*.test.ts

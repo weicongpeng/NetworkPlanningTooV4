@@ -45,7 +45,7 @@ export function TACLegend({
           onClick={onToggleVisible}
           style={{
             padding: '4px 8px',
-            backgroundColor: 'rgba(255, 255, 255, 0.95)',
+            backgroundColor: 'hsl(var(--popover) / 0.95)',
             border: '1px solid #ddd',
             borderRadius: '4px',
             cursor: 'pointer',
@@ -66,7 +66,7 @@ export function TACLegend({
       top: '10px',
       right: '10px',
       bottom: '10px',
-      backgroundColor: 'rgba(255, 255, 255, 0.95)',
+      backgroundColor: 'hsl(var(--popover) / 0.95)',
       padding: '8px',
       borderRadius: '4px',
       boxShadow: '0 2px 8px rgba(0, 0, 0, 0.15)',
@@ -78,7 +78,7 @@ export function TACLegend({
       flexDirection: 'column'
     }}>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '6px', flexShrink: 0 }}>
-        <div style={{ fontWeight: 600, color: '#333', fontSize: '12px' }}>
+        <div style={{ fontWeight: 600, color: 'hsl(var(--foreground))', fontSize: '12px' }}>
           {t('tac.legend') || '图例'}({networkType})
         </div>
         {onToggleVisible && (
@@ -90,7 +90,7 @@ export function TACLegend({
               cursor: 'pointer',
               fontSize: '14px',
               padding: '0 4px',
-              color: '#666',
+              color: 'hsl(var(--muted-foreground))',
             }}
             title={t('tac.hideLegend') || '隐藏图例'}
           >
@@ -125,7 +125,7 @@ export function TACLegend({
               flexShrink: 0
             }} />
             <span style={{
-              color: '#374151',
+              color: 'hsl(var(--foreground))',
               fontWeight: 500,
               whiteSpace: 'nowrap',
               overflow: 'hidden',
@@ -143,7 +143,7 @@ export function TACLegend({
         paddingTop: '4px',
         marginTop: '4px',
         fontSize: '9px',
-        color: '#6B7280',
+        color: 'hsl(var(--muted-foreground))',
         flexShrink: 0
       }}>
         {t('tac.totalTacValues', { count: tacCount }) || `共 ${tacCount} 个不同TAC值`}

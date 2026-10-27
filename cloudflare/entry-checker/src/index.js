@@ -174,7 +174,7 @@ function renderFallbackPage(results, error) {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>网络规划工具 — 入口检测</title>
+  <title>网优引擎 — 入口检测</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {

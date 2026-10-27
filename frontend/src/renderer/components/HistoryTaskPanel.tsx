@@ -41,7 +41,7 @@ function StatusIcon({ status }: { status: string }) {
     case 'running':
       return <Loader2 size={16} className="animate-spin text-blue-500" />
     default:
-      return <Clock size={16} className="text-gray-400" />
+      return <Clock size={16} className="text-muted-foreground" />
   }
 }
 
@@ -51,10 +51,10 @@ function StatusBadge({ status, labels }: { status: string; labels: HistoryTaskPa
     : status === 'running' ? labels.running
     : status
 
-  const colorClass = status === 'completed' ? 'bg-green-100 text-green-700'
-    : status === 'failed' ? 'bg-red-100 text-red-700'
-    : status === 'running' ? 'bg-blue-100 text-blue-700'
-    : 'bg-gray-100 text-gray-600'
+  const colorClass = status === 'completed' ? 'bg-green-500/15 text-green-500'
+    : status === 'failed' ? 'bg-red-500/15 text-red-500'
+    : status === 'running' ? 'bg-blue-500/15 text-blue-500'
+    : 'bg-muted text-muted-foreground'
 
   return (
     <span className={`px-1.5 py-0.5 text-[10px] rounded-full font-medium ${colorClass}`}>
@@ -142,7 +142,7 @@ export function HistoryTaskPanel({
                   <div
                     key={task.id}
                     className={`px-4 py-3 hover:bg-muted/30 transition-colors ${
-                      isActive ? 'bg-blue-50/50 border-l-2 border-blue-400' : 'border-l-2 border-transparent'
+                      isActive ? 'bg-blue-500/10 border-l-2 border-blue-400' : 'border-l-2 border-transparent'
                     }`}
                   >
                     <div className="flex items-start justify-between gap-2">

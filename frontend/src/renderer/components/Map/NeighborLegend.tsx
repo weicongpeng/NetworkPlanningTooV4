@@ -37,7 +37,7 @@ export function NeighborLegend({
           onClick={onToggleVisible}
           style={{
             padding: '4px 8px',
-            backgroundColor: 'rgba(255, 255, 255, 0.95)',
+            backgroundColor: 'hsl(var(--popover) / 0.95)',
             border: '1px solid #ddd',
             borderRadius: '4px',
             cursor: 'pointer',
@@ -57,7 +57,7 @@ export function NeighborLegend({
       position: 'absolute',
       top: '10px',
       right: '10px',
-      backgroundColor: 'rgba(255, 255, 255, 0.95)',
+      backgroundColor: 'hsl(var(--popover) / 0.95)',
       padding: '6px',
       borderRadius: '4px',
       boxShadow: '0 2px 8px rgba(0, 0, 0, 0.15)',
@@ -66,7 +66,7 @@ export function NeighborLegend({
       fontSize: '7px'
     }}>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '4px' }}>
-        <div style={{ fontWeight: 600, color: '#333', fontSize: '7px' }}>
+        <div style={{ fontWeight: 600, color: 'hsl(var(--foreground))', fontSize: '7px' }}>
           {t('neighbor.legend') || '邻区规划图例'}
         </div>
         {onToggleVisible && (
@@ -78,7 +78,7 @@ export function NeighborLegend({
               cursor: 'pointer',
               fontSize: '10px',
               padding: '0 2px',
-              color: '#666',
+              color: 'hsl(var(--muted-foreground))',
             }}
             title={t('neighbor.hideLegend') || '隐藏图例'}
           >
@@ -97,7 +97,7 @@ export function NeighborLegend({
           borderRadius: '1px',
           marginRight: '4px'
         }} />
-        <span style={{ color: '#333', fontWeight: 500, fontSize: '7px' }}>{t('neighbor.sourceCellLegend') || '源小区'}</span>
+        <span style={{ color: 'hsl(var(--foreground))', fontWeight: 500, fontSize: '7px' }}>{t('neighbor.sourceCellLegend') || '源小区'}</span>
       </div>
 
       {/* 目标小区 */}
@@ -110,7 +110,7 @@ export function NeighborLegend({
           borderRadius: '1px',
           marginRight: '4px'
         }} />
-        <span style={{ color: '#333', fontWeight: 500, fontSize: '7px' }}>{t('neighbor.targetCellLegend') || '目标小区'}</span>
+        <span style={{ color: 'hsl(var(--foreground))', fontWeight: 500, fontSize: '7px' }}>{t('neighbor.targetCellLegend') || '目标小区'}</span>
       </div>
 
       {/* 其他小区 - 白色填充带黑色边框 */}
@@ -123,7 +123,7 @@ export function NeighborLegend({
           borderRadius: '1px',
           marginRight: '4px'
         }} />
-        <span style={{ color: '#333', fontWeight: 500, fontSize: '7px' }}>{t('neighbor.otherCellLegend') || '其他小区'}</span>
+        <span style={{ color: 'hsl(var(--foreground))', fontWeight: 500, fontSize: '7px' }}>{t('neighbor.otherCellLegend') || '其他小区'}</span>
       </div>
     </div>
   )

@@ -141,7 +141,7 @@ async def root():
     index_path = FRONTEND_DIST / "index.html"
     if index_path.exists():
         return HTMLResponse(index_path.read_text(encoding="utf-8"))
-    return {"message": "网络规划工具API", "version": settings.VERSION}
+    return {"message": "网优引擎API", "version": settings.VERSION}
 
 # SPA 回退路由（必须放在所有路由最后）
 @app.get("/{full_path:path}")
@@ -396,7 +396,7 @@ curl -s -o /dev/null -w "%{http_code}" https://armbian.tail362392.ts.net/health
 
 ```ini
 [Unit]
-Description=Network Planning Tool Backend (FastAPI)
+Description=NetOpt Engine Backend (FastAPI)
 After=network.target
 
 [Service]

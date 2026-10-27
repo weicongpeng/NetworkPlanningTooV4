@@ -1,0 +1,673 @@
+"""桌面客户端 OTA 下载测试：断点续传 / sha256 校验 / 稍后计数 / 安装前置条件。
+
+用标准库起一个支持 Range 的本地 HTTP 服务当"授权服务器"，验证下载 worker 的真实行为。
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+PAYLOAD = bytes(range(256)) * 80  # 20480 字节
+SHA = hashlib.sha256(PAYLOAD).hexdigest()
+
+
+class _RangeHandler(BaseHTTPRequestHandler):
+    def do_GET(self):  # noqa: N802
+        range_header = self.headers.get("Range")
+        if range_header:
+            match = re.match(r"bytes=(\d+)-", range_header)
+            start = int(match.group(1)) if match else 0
+            body = PAYLOAD[start:]
+            self.send_response(206)
+            self.send_header("Content-Range", f"bytes {start}-{len(PAYLOAD) - 1}/{len(PAYLOAD)}")
+        else:
+            body = PAYLOAD
+            self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):  # 静默
+        pass
+
+
+@pytest.fixture()
+def updater_env(tmp_path, monkeypatch):
+    from app.core.config import settings
+    from app.services import desktop_update_service as updater
+
+    server = HTTPServer(("127.0.0.1", 0), _RangeHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    monkeypatch.setattr(settings, "DATA_ROOT", tmp_path)
+    monkeypatch.setattr(settings, "LICENSE_DIR", tmp_path)
+    monkeypatch.setattr(settings, "NPT_SERVER_URL", f"http://127.0.0.1:{server.server_port}")
+    monkeypatch.setattr(settings, "NPT_DESKTOP_VERSION", "0.0.0-dev-old")
+    monkeypatch.setattr(settings, "NPT_DESKTOP_CHANNEL", "stable")
+
+    updater._state.update(
+        phase="idle", version=None, downloaded=0, total=0, error=None, installer=None, sha256=None,
+        background=False,
+    )
+    updater._install_started = False
+
+    yield SimpleNamespace(updater=updater, tmp_path=tmp_path, settings=settings)
+    server.shutdown()
+
+
+def _release(**overrides):
+    data = {
+        "version": "1.0.0",
+        "sha256": SHA,
+        "file_size": len(PAYLOAD),
+        "download_url": "/api/v1/desktop-cloud/releases/download/1",
+    }
+    data.update(overrides)
+    return data
+
+
+def _wait_ready(updater, timeout=15.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        state = updater.progress()
+        if state["phase"] in ("ready", "failed"):
+            return state
+        time.sleep(0.1)
+    return updater.progress()
+
+
+def test_download_happy_path(updater_env):
+    updater = updater_env.updater
+    updater.start_download(_release())
+    state = _wait_ready(updater)
+    assert state["phase"] == "ready", state
+    assert state["error"] is None
+    installer = updater_env.tmp_path / "updates" / "NetOpt Engine_Setup-1.0.0.exe"
+    assert installer.read_bytes() == PAYLOAD
+    assert state["downloaded"] == len(PAYLOAD)
+
+
+def test_download_resumes_from_part(updater_env):
+    updater = updater_env.updater
+    part = updater_env.tmp_path / "updates" / "NetOpt Engine_Setup-1.0.0.exe.part"
+    part.parent.mkdir(parents=True, exist_ok=True)
+    part.write_bytes(PAYLOAD[:1000])  # 模拟上次中断留下的分片
+
+    updater.start_download(_release())
+    state = _wait_ready(updater)
+    assert state["phase"] == "ready", state
+    installer = updater_env.tmp_path / "updates" / "NetOpt Engine_Setup-1.0.0.exe"
+    assert installer.read_bytes() == PAYLOAD  # 续传后内容完整
+
+
+class _FlakyHandler(BaseHTTPRequestHandler):
+    """首次响应按完整长度声明、只写一半就断开：模拟链路被中途切断。
+
+    这种情况下 resp.read() 只是返回 b""，不会抛异常。
+    """
+
+    hits = 0
+
+    def do_GET(self):  # noqa: N802
+        cls = type(self)
+        cls.hits += 1
+        range_header = self.headers.get("Range")
+        start = 0
+        if range_header:
+            match = re.match(r"bytes=(\d+)-", range_header)
+            start = int(match.group(1)) if match else 0
+            self.send_response(206)
+            self.send_header("Content-Range", f"bytes {start}-{len(PAYLOAD) - 1}/{len(PAYLOAD)}")
+        else:
+            self.send_response(200)
+        body = PAYLOAD[start:]
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body[: len(body) // 2] if cls.hits == 1 else body)
+
+    def log_message(self, *args):  # 静默
+        pass
+
+
+def test_download_retries_when_connection_truncated(updater_env, monkeypatch):
+    """下载被切断后必须按大小续传，不能拿残缺文件去算 sha256 报「校验失败」。"""
+    import threading as _threading
+
+    updater = updater_env.updater
+    server = HTTPServer(("127.0.0.1", 0), _FlakyHandler)
+    _threading.Thread(target=server.serve_forever, daemon=True).start()
+    monkeypatch.setattr(
+        updater_env.settings, "NPT_SERVER_URL", f"http://127.0.0.1:{server.server_port}"
+    )
+    try:
+        updater.start_download(_release())
+        state = _wait_ready(updater)
+        assert state["phase"] == "ready", state
+        installer = updater_env.tmp_path / "updates" / "NetOpt Engine_Setup-1.0.0.exe"
+        assert installer.read_bytes() == PAYLOAD
+    finally:
+        server.shutdown()
+
+
+def test_cleanup_stale_installers_after_success(updater_env):
+    """更新生效后清掉 updates 里的历史安装包（每份约 320MB），诊断文件保留。"""
+    updater = updater_env.updater
+    updates = updater_env.tmp_path / "updates"
+    updates.mkdir(parents=True, exist_ok=True)
+    old_pkg = updates / "NetOpt Engine_Setup-0.0.9.exe"
+    part = updates / "NetOpt Engine_Setup-0.0.10.exe.part"
+    # 旧命名（老版本客户端下载的包）也必须清掉，否则永久残留
+    legacy_pkg = updates / "NetworkPlanningTool-Setup-0.0.8.exe"
+    old_pkg.write_bytes(PAYLOAD)
+    part.write_bytes(PAYLOAD)
+    legacy_pkg.write_bytes(PAYLOAD)
+    # 上次安装目标 == 当前运行版本 → 视为更新已生效
+    (updates / "npt_ota_intent.json").write_text(
+        json.dumps({"target_version": updater_env.settings.NPT_DESKTOP_VERSION}),
+        encoding="utf-8",
+    )
+    (updates / "npt_ota_result.txt").write_text("setup_rc=0\n", encoding="utf-8")
+
+    result = updater.cleanup_stale_installers()
+
+    assert set(result["removed"]) == {old_pkg.name, part.name, legacy_pkg.name}
+    assert result["freed_bytes"] == len(PAYLOAD) * 3
+    assert not old_pkg.exists() and not part.exists() and not legacy_pkg.exists()
+    assert (updates / "npt_ota_result.txt").is_file()  # 诊断文件不能删
+
+
+def test_cleanup_keeps_installer_when_update_not_applied(updater_env):
+    """更新未生效（安装失败/版本没变）时保留安装包，方便用户手动安装。"""
+    updater = updater_env.updater
+    updates = updater_env.tmp_path / "updates"
+    updates.mkdir(parents=True, exist_ok=True)
+    pkg = updates / "NetOpt Engine_Setup-9.9.9.exe"
+    pkg.write_bytes(PAYLOAD)
+    (updates / "npt_ota_intent.json").write_text(
+        json.dumps({"target_version": "9.9.9"}), encoding="utf-8"
+    )
+
+    result = updater.cleanup_stale_installers()
+
+    assert result.get("skipped") is True
+    assert pkg.is_file()
+
+
+def test_download_sha_mismatch_fails(updater_env):
+    updater = updater_env.updater
+    updater.start_download(_release(sha256="0" * 64))
+    state = _wait_ready(updater)
+    assert state["phase"] == "failed"
+    assert "校验失败" in (state["error"] or "")
+
+
+def test_check_latest_offline_raises_only_when_asked(updater_env):
+    """手动检查更新要能区分「已是最新」与「连不上服务器」。"""
+    from app.services.desktop_cloud_client import CloudError
+
+    # 假服务器不接受该路径（返回非 JSON）→ 默认静默 None，显式要求时抛错
+    assert updater_env.updater.check_latest() is None
+    with pytest.raises(CloudError):
+        updater_env.updater.check_latest(raise_on_error=True)
+
+
+def test_install_requires_ready_package(updater_env):
+    updater = updater_env.updater
+    from app.services.desktop_cloud_client import CloudError
+
+    with pytest.raises(CloudError) as excinfo:
+        updater.install_and_exit()
+    assert excinfo.value.status_code == 409
+
+
+def test_install_on_non_windows_rejected(updater_env):
+    """Linux 上出现"ready"也应拒绝自动安装（仅 Windows 桌面版支持）。"""
+    import os
+
+    if os.name == "nt":
+        pytest.skip("仅在非 Windows 环境验证")
+    updater = updater_env.updater
+    item = updater_env.tmp_path / "updates" / "fake.exe"
+    item.parent.mkdir(parents=True, exist_ok=True)
+    item.write_bytes(PAYLOAD)
+    updater._state.update(phase="ready", installer=str(item), sha256=SHA)
+
+    from app.services.desktop_cloud_client import CloudError
+
+    with pytest.raises(CloudError) as excinfo:
+        updater.install_and_exit()
+    assert excinfo.value.status_code == 400
+
+
+def test_helper_script_bounded_wait_and_relaunch(updater_env):
+    """升级脚本：等待应用退出必须有上限并强杀兜底，且不能依赖 timeout（隐藏控制台下会报错）。"""
+    updater = updater_env.updater
+    installer = updater_env.tmp_path / "updates" / "NetOpt Engine_Setup-1.0.0.exe"
+    installer.parent.mkdir(parents=True, exist_ok=True)
+    installer.write_bytes(PAYLOAD)
+
+    helper = updater._write_helper(installer, "1.0.0")
+    text = helper.read_text(encoding="utf-8")
+
+    assert helper.parent == updater_env.tmp_path / "updates"
+    # 静默安装 + 安装后重新启动应用
+    assert "/VERYSILENT" in text and "/SUPPRESSMSGBOXES" in text
+    assert 'start "" "%TARGET%"' in text
+    # 先按当前运行目录安装（否则会把新版本装到别处、重启旧目录的 exe → "版本没变"）
+    assert '/DIR="%APPDIR%"' in text
+    # /DIR 失败要退回默认目录重试一次
+    assert text.count("start /wait") >= 2
+    assert "%DEFAULTDIR%" in text
+    # 重启目标以注册表记录的安装目录为准（历史事故：装到别处却重启旧 exe）
+    assert "InstallLocation" in text
+    assert "{7C4F1E62-9B3A-4D2E-8F51-6A0C2B7D9E44}_is1" in text
+    # 拷贝实际重启目标的 version.json，供"更新是否生效"核对
+    assert "installed_version.json" in text
+    # 安装器退出码写盘，应用重启后据此提示"更新未生效"
+    assert "setup_rc=%RC%" in text
+    assert "npt_ota_result" in text
+    # 安装包路径按 8.3 短路径写入（见 _write_helper 注释，规避中文/代码页问题）；
+    # Windows 上 GetShortPathNameW 会真的缩写，断言必须用同一转换，否则只有 Linux 过
+    assert updater._windows_short_path(installer) in text
+    # 等待应用退出的上限与 taskkill 兜底（否则应用不退出安装会永久卡住）
+    assert f"GEQ {updater.EXIT_WAIT_SECONDS}" in text
+    assert "taskkill /F /IM" in text
+    # 计时不能用 timeout：无控制台环境下它直接报错，会退化成忙循环
+    assert "timeout /t" not in text
+    # start /wait 可能只等到安装器外层进程：重启前必须再等安装器进程真正退出，
+    # 否则拉起的还是没被替换的旧 exe（表现"装完版本没变，手关再开才更新"）
+    assert "tasklist /FI \"IMAGENAME eq %SETUPNAME%\"" in text
+    # 拉起前核对目标目录的 version.json 已是新版本，并把结果写盘供应用提示
+    assert 'findstr /I /C:"%TARGETVER%"' in text
+    assert "install_verified=%VEROK%" in text
+    assert "ping -n 3 127.0.0.1" in text
+    # 拉起前必须清掉旧进程继承下来的 NPT_DESKTOP_VERSION：否则重启的新版本会自报旧版本，
+    # 系统设置显示旧版本、OTA 判"未生效"，要用户手动再重启一次才对（重启即完成）
+    assert 'set "NPT_DESKTOP_VERSION="' in text
+    assert text.index('set "NPT_DESKTOP_VERSION="') < text.index('start "" "%TARGET%"')
+
+
+def test_launcher_prefers_bundled_version_over_inherited_env(monkeypatch, tmp_path):
+    """OTA 自动重启后"版本还是旧的"根因：重启的进程继承了旧进程的 NPT_DESKTOP_VERSION。
+
+    launcher 必须以包内 version.json 为准（覆盖继承值），version.json 缺失时才退回环境变量
+    （源码调试：CI 只在打包前写 version.json，仓库里没有这个文件）。
+    """
+    launcher = _load_launcher()
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    monkeypatch.setattr(launcher, "_bundle_dir", lambda: bundle)
+    monkeypatch.setattr(launcher, "_default_data_root", lambda: tmp_path / "data")
+
+    # 1) 有 version.json：覆盖掉从旧进程继承来的版本号
+    (bundle / "version.json").write_text('{"version": "0.0.23"}', encoding="utf-8")
+    monkeypatch.setenv("NPT_DESKTOP_VERSION", "0.0.22")
+    launcher._bootstrap_environment()
+    assert os.environ["NPT_DESKTOP_VERSION"] == "0.0.23"
+
+    # 2) 没有 version.json（源码运行）：保留环境变量里的值
+    (bundle / "version.json").unlink()
+    monkeypatch.setenv("NPT_DESKTOP_VERSION", "0.0.0-dev")
+    launcher._bootstrap_environment()
+    assert os.environ["NPT_DESKTOP_VERSION"] == "0.0.0-dev"
+
+
+def test_install_spawns_hidden_helper_and_requests_exit(updater_env, monkeypatch):
+    """安装流程：隐藏拉起升级脚本（CREATE_NO_WINDOW）→ 请求退出；重复触发被拒绝。"""
+    from types import SimpleNamespace
+
+    updater = updater_env.updater
+    installer = updater_env.tmp_path / "updates" / "NetOpt Engine_Setup-1.0.0.exe"
+    installer.parent.mkdir(parents=True, exist_ok=True)
+    installer.write_bytes(PAYLOAD)
+    updater._state.update(phase="ready", installer=str(installer), sha256=SHA)
+
+    calls: list = []
+    create_no_window = 0x08000000
+    # 只在 updater 模块内替换 os/subprocess（避免影响 pathlib、真实进程调用）
+    monkeypatch.setattr(updater, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(
+        updater,
+        "subprocess",
+        SimpleNamespace(
+            Popen=lambda args, **kwargs: calls.append((args, kwargs)),
+            CREATE_NO_WINDOW=create_no_window,
+            CREATE_NEW_PROCESS_GROUP=0x00000200,
+        ),
+    )
+    monkeypatch.setattr("app.desktop_bridge.request_exit", lambda: True)
+
+    result = updater.install_and_exit()
+    assert result["exiting"] is True
+    assert calls[0][0][:2] == ["cmd", "/c"]
+    assert calls[0][1]["creationflags"] & create_no_window  # 隐藏窗口，不弹终端
+    assert Path(calls[0][0][2]).is_file()
+
+    # 已启动过升级脚本，重复调用只返回 409（避免两个安装器同时跑）
+    from app.services.desktop_cloud_client import CloudError
+
+    with pytest.raises(CloudError) as excinfo:
+        updater.install_and_exit()
+    assert excinfo.value.status_code == 409
+    assert len(calls) == 1
+
+
+def test_install_requests_exit_even_without_bridge(updater_env, monkeypatch):
+    """桌面壳未注入回调（request_exit False）时仍要返回提示，由升级脚本强杀兜底完成安装。"""
+    from types import SimpleNamespace
+
+    updater = updater_env.updater
+    installer = updater_env.tmp_path / "updates" / "NetOpt Engine_Setup-1.0.0.exe"
+    installer.parent.mkdir(parents=True, exist_ok=True)
+    installer.write_bytes(PAYLOAD)
+    updater._state.update(phase="ready", installer=str(installer), sha256=SHA)
+
+    monkeypatch.setattr(updater, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(
+        updater,
+        "subprocess",
+        SimpleNamespace(
+            Popen=lambda *a, **k: None,
+            CREATE_NO_WINDOW=0x08000000,
+            CREATE_NEW_PROCESS_GROUP=0x00000200,
+        ),
+    )
+    monkeypatch.setattr("app.desktop_bridge.request_exit", lambda: False)
+
+    result = updater.install_and_exit()
+    assert result["exiting"] is False
+    assert "安装" in result["message"]
+
+
+def _load_launcher():
+    """按路径加载 desktop/launcher.py（CI 从 backend/ 目录跑 pytest，模块不在 sys.path 上）。"""
+    import importlib.util
+
+    path = Path(__file__).resolve().parents[2] / "desktop" / "launcher.py"
+    spec = importlib.util.spec_from_file_location("desktop_launcher", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _stub_exit_side_effects(launcher, monkeypatch) -> list:
+    """替换 os._exit 与看门狗线程，记录强制退出调用。"""
+    from types import SimpleNamespace
+
+    exits: list = []
+    thread_stub = SimpleNamespace(Thread=lambda **kwargs: SimpleNamespace(start=lambda: None))
+    monkeypatch.setattr(launcher, "os", SimpleNamespace(_exit=exits.append))
+    monkeypatch.setattr(launcher, "threading", thread_stub)
+    return exits
+
+
+def test_launcher_force_exits_when_destroy_fails(monkeypatch):
+    """场景：window.destroy() 抛异常（跨线程/后端异常）——必须立刻强制退出，否则 OTA 永远卡在等待应用退出。"""
+    launcher = _load_launcher()
+    exits = _stub_exit_side_effects(launcher, monkeypatch)
+
+    def _broken_destroy():
+        raise RuntimeError("cross-thread operation not valid")
+
+    launcher._make_exit_handler(SimpleNamespace(destroy=_broken_destroy))()
+    assert exits == [0]
+
+
+def test_launcher_arms_watchdog_before_destroy(monkeypatch):
+    """场景：window.destroy() 永久阻塞——看门狗必须在 destroy 之前武装，否则进程永不退出。"""
+    launcher = _load_launcher()
+    exits = _stub_exit_side_effects(launcher, monkeypatch)
+
+    started: list = []
+    monkeypatch.setattr(launcher, "_force_exit_after", started.append)
+
+    def _blocking_destroy():
+        assert started, "destroy 之前必须已武装强制退出看门狗"
+
+    launcher._make_exit_handler(SimpleNamespace(destroy=_blocking_destroy))()
+    assert started == [launcher.EXIT_GRACE_SECONDS]
+    assert exits == []  # 正常提交关窗时不强制退出
+
+
+# --------------------------------------------------- 后台运行（关窗不影响更新）
+#
+# 2026-10-10 用户要求：更新弹窗加「后台运行」，关掉窗口也不中断下载与安装。
+
+def test_arm_background_writes_marker_and_installs_on_wait(updater_env, monkeypatch):
+    """「后台运行」：置位 + 写标记文件；后台等待到 ready 后拉起安装并清标记。"""
+    updater = updater_env.updater
+    installer = updater_env.tmp_path / "updates" / "NetOpt Engine_Setup-1.0.0.exe"
+    installer.parent.mkdir(parents=True, exist_ok=True)
+    installer.write_bytes(PAYLOAD)
+    updater._state.update(phase="ready", version="1.0.0", installer=str(installer), sha256=SHA)
+
+    state = updater.arm_background()
+    assert state["background"] is True
+    marker = updater_env.tmp_path / "updates" / "background_update.json"
+    assert marker.is_file()
+    assert updater.is_background_armed() is True
+
+    started: list = []
+    monkeypatch.setattr(updater, "_start_installer", lambda: started.append(True) or installer)
+    result = updater.wait_background_update(poll_seconds=0.1, timeout_seconds=5)
+
+    assert result["action"] == "install"
+    assert started == [True]
+    assert not marker.exists()
+
+
+def test_arm_background_rejects_when_no_update(updater_env, monkeypatch):
+    """没有新版本时拒绝转入后台（避免用户以为在更新，实际什么都没发生）。"""
+    from app.services.desktop_cloud_client import CloudError
+
+    updater = updater_env.updater
+    monkeypatch.setattr(updater, "check_latest", lambda **_: None)
+    with pytest.raises(CloudError) as excinfo:
+        updater.arm_background()
+    assert excinfo.value.status_code == 409
+
+
+def test_wait_background_update_tolerates_already_started(updater_env, monkeypatch):
+    """「后台运行」后又点了「重启并安装」：脚本已在跑（409），应按成功处理而不是报错。"""
+    from app.services.desktop_cloud_client import CloudError
+
+    updater = updater_env.updater
+    installer = updater_env.tmp_path / "updates" / "NetOpt Engine_Setup-1.0.0.exe"
+    installer.parent.mkdir(parents=True, exist_ok=True)
+    installer.write_bytes(PAYLOAD)
+    updater._state.update(phase="ready", version="1.0.0", installer=str(installer), sha256=SHA)
+    updater.arm_background()
+
+    def _already_started():
+        raise CloudError(409, "升级已启动，请稍候自动安装完成")
+
+    monkeypatch.setattr(updater, "_start_installer", _already_started)
+    result = updater.wait_background_update(poll_seconds=0.1, timeout_seconds=5)
+    assert result["action"] == "install"
+    assert result.get("already") is True
+
+
+def test_last_result_flags_unapplied_install(updater_env, monkeypatch):
+    """安装器退出码非 0 / 版本没变 → applied=False、needs_manual=True（前端给人工安装提示）。"""
+    import json
+
+    updater = updater_env.updater
+    updates = updater_env.tmp_path / "updates"
+    updates.mkdir(parents=True, exist_ok=True)
+    (updates / "npt_ota_intent.json").write_text(
+        json.dumps({"target_version": "1.0.0", "installer": "/tmp/setup.exe"}), encoding="utf-8"
+    )
+    (updates / "npt_ota_result.txt").write_text(
+        "target_version=1.0.0\nsetup_rc=5\nsetup_retry_rc=5\nfinished_at=2026-10-10 10:00:00\n",
+        encoding="utf-8",
+    )
+    result = updater.last_result()
+    assert result["target_version"] == "1.0.0"
+    assert result["setup_rc"] == "5"
+    assert result["applied"] is False
+    assert result["needs_manual"] is True
+
+    # 升级脚本拷回的"实际安装版本"要一并给出（诊断装的是哪个版本）
+    (updates / "installed_version.json").write_text(
+        json.dumps({"version": "0.9.9"}), encoding="utf-8"
+    )
+    result = updater.last_result()
+    assert result["installed_version"] == "0.9.9"
+
+    # 装成功（当前版本已变成目标版本）→ 不再提示人工安装
+    monkeypatch.setattr(updater_env.settings, "NPT_DESKTOP_VERSION", "1.0.0")
+    (updates / "npt_ota_result.txt").write_text("target_version=1.0.0\nsetup_rc=0\n", encoding="utf-8")
+    result = updater.last_result()
+    assert result["applied"] is True
+    assert result["needs_manual"] is False
+
+
+def test_helper_script_kills_stale_installers_and_retries(updater_env):
+    """升级脚本加固：静默安装 rc=1 的两类根因都要兜住。
+
+    - 上一次挂死的安装器进程占着 SetupMutex/日志 → 安装前先杀残留 NetOpt*Setup* 进程
+    - 应用刚退出互斥体/句柄未放干净 → 安装前稍等，且每次失败要重试（/DIR 3 次、默认目录 2 次）
+    - 退出码说不清原因 → 安装结束后把 npt_setup.log 尾部摘到独立文件供前端展示
+    """
+    updater = updater_env.updater
+    installer = updater_env.tmp_path / "updates" / "NetOpt Engine_Setup-1.0.0.exe"
+    installer.parent.mkdir(parents=True, exist_ok=True)
+    installer.write_bytes(PAYLOAD)
+
+    text = updater._write_helper(installer, "1.0.0").read_text(encoding="utf-8")
+    # 杀残留安装器（静默模式无弹窗，占着互斥体的老安装器会让每次安装初始化即败）
+    assert "Stop-Process -Force" in text and "NetOpt*Setup*" in text
+    # 应用退出后稍等再安装（互斥体释放），失败有重试
+    assert ":tryappdir" in text and ":trydefault2" in text
+    assert "if %TRY% GEQ 3 goto trydefault" in text
+    assert "if %DTRY% LSS 2 goto trydefault2" in text
+    # 安装器加 /FORCECLOSEAPPLICATIONS：文件被占用时强关而不是静默放弃
+    assert "/FORCECLOSEAPPLICATIONS" in text
+    # 安装日志尾部落盘（退出码 rc=1 时只有日志能说明真实原因）
+    assert "npt_setup_tail.txt" in text and "Get-Content -LiteralPath '%LOG%' -Tail 40" in text
+
+
+def test_last_result_includes_setup_log_tail(updater_env):
+    """安装日志尾部要随 last_result 返回，前端据此展示失败的真实原因。"""
+    import json
+
+    updater = updater_env.updater
+    updates = updater_env.tmp_path / "updates"
+    updates.mkdir(parents=True, exist_ok=True)
+    (updates / "npt_ota_intent.json").write_text(
+        json.dumps({"target_version": "1.0.0", "installer": "/tmp/setup.exe"}), encoding="utf-8"
+    )
+    (updates / "npt_ota_result.txt").write_text("target_version=1.0.0\nsetup_rc=1\n", encoding="utf-8")
+    (updates / "npt_setup_tail.txt").write_text(
+        "\ufeff2026-10-18 10:00:00.123   Log opened.\n"
+        "2026-10-18 10:00:00.456   Setup version: 6.x\n"
+        "2026-10-18 10:00:01.000   Another instance is running, aborting.\n",
+        encoding="utf-8",
+    )
+    result = updater.last_result()
+    assert "Another instance is running" in result["setup_log_tail"]
+
+
+def test_launcher_continues_background_update_after_window_close(monkeypatch, tmp_path):
+    """启动器：窗口关闭后若已武装后台更新，必须先等它跑完再收尾退出。"""
+    launcher = _load_launcher()
+    calls: list = []
+
+    import sys
+    import types
+
+    fake_service = types.ModuleType("app.services.desktop_update_service")
+    fake_service.is_background_armed = lambda: True
+    fake_service.wait_background_update = lambda: calls.append("waited") or {"action": "install"}
+    # 包属性优先于 sys.modules：两处都替换，否则 from app.services import ... 会拿到真实模块
+    import app.services as services_pkg
+
+    monkeypatch.setitem(sys.modules, "app.services.desktop_update_service", fake_service)
+    monkeypatch.setattr(services_pkg, "desktop_update_service", fake_service, raising=False)
+    # 等待结束后会重新武装看门狗——必须替换，否则测试进程会在 20 秒后被 os._exit 杀掉
+    armed: list = []
+    monkeypatch.setattr(launcher, "_force_exit_after", armed.append)
+
+    launcher._continue_background_update()
+    assert calls == ["waited"]
+    assert armed == [launcher.EXIT_GRACE_SECONDS]  # 等待结束仍要有界退出
+
+    # 未武装时直接返回，不阻塞关闭流程
+    calls.clear()
+    armed.clear()
+    fake_service.is_background_armed = lambda: False
+    launcher._continue_background_update()
+    assert calls == []
+    assert armed == []
+
+
+def test_launcher_close_handler_skips_watchdog_during_background_update(monkeypatch):
+    """后台更新中关窗不得武装看门狗：否则 20 秒后 os._exit 会把下载线程一起杀掉，
+    表现为"点了后台运行、关窗后什么都没发生"。"""
+    launcher = _load_launcher()
+    armed: list = []
+    monkeypatch.setattr(launcher, "_force_exit_after", armed.append)
+
+    import sys
+    import types
+
+    import app.services as services_pkg
+
+    fake_service = types.ModuleType("app.services.desktop_update_service")
+    fake_service.is_background_armed = lambda: True
+    monkeypatch.setitem(sys.modules, "app.services.desktop_update_service", fake_service)
+    monkeypatch.setattr(services_pkg, "desktop_update_service", fake_service, raising=False)
+
+    launcher._make_close_handler()()
+    assert armed == []  # 后台更新：不武装，进程要活到下载完成
+
+    fake_service.is_background_armed = lambda: False
+    launcher._make_close_handler()()
+    assert armed == [launcher.EXIT_GRACE_SECONDS]  # 普通关闭：照常武装
+
+
+def test_launcher_background_marker_detection(tmp_path):
+    """重复启动时以标记文件提示"后台更新中"（避免第二实例被 taskkill 兜底误杀）。"""
+    launcher = _load_launcher()
+    assert launcher._background_update_marker_exists(tmp_path) is False
+    updates = tmp_path / "updates"
+    updates.mkdir(parents=True, exist_ok=True)
+    (updates / "background_update.json").write_text("{}", encoding="utf-8")
+    assert launcher._background_update_marker_exists(tmp_path) is True
+
+    # 拿到单实例互斥体的新进程说明没有别的进程在后台更新：残留标记要清掉
+    launcher._clear_stale_background_marker(tmp_path)
+    assert launcher._background_update_marker_exists(tmp_path) is False
+
+
+def test_launcher_splash_distinguishes_mode_switch(monkeypatch):
+    """启动过渡页按场景区分文案：模式切换重启（spawn_relaunch 注入
+    NPT_DESKTOP_SWITCHING=1）显示「正在切换到XX模式」，普通启动用通用文案。"""
+    launcher = _load_launcher()
+
+    monkeypatch.delenv("NPT_DESKTOP_SWITCHING", raising=False)
+    html = launcher._splash_html()
+    assert "正在启动" in html
+    assert "正在切换" not in html
+
+    # 切到共享模式（目标档由 active_profile.json 写入，经环境变量传入）
+    monkeypatch.setenv("NPT_DESKTOP_SWITCHING", "1")
+    monkeypatch.setenv("NPT_DESKTOP_PROFILE", "shared")
+    html = launcher._splash_html()
+    assert "正在切换到共享模式" in html
+    assert "请勿手动关闭窗口" in html
+
+    # 切到单机模式
+    monkeypatch.setenv("NPT_DESKTOP_PROFILE", "standalone")
+    html = launcher._splash_html()
+    assert "正在切换到单机模式" in html

@@ -77,13 +77,15 @@ async def upload_geo_data(
         if not saved_file_path.exists():
             raise FileNotFoundError(f"文件保存失败: {saved_file_path}")
 
-        # 解析数据（传入 data_id 避免元数据写入时生成新 UUID）
+        # 解析数据（传入 data_id 避免元数据写入时生成新 UUID；组归属取自上传者）
         parse_result = await run_in_threadpool(
             geo_data_service.parse_geo_data,
             str(saved_file_path),
             filename,
-            1,  # user_id
+            current_user.id,  # user_id
             data_id,  # geo_id
+            current_user.city,
+            current_user.operator,
         )
 
         # 保存解析结果到 JSON 文件
@@ -96,6 +98,9 @@ async def upload_geo_data(
             json.dump(parse_result['data'], f, ensure_ascii=False, indent=2)
 
         # 更新索引
+        metadata = {'pointCount': parse_result['pointCount']}
+        if parse_result.get('importWarnings'):
+            metadata['importWarnings'] = parse_result['importWarnings']
         data_service.index[data_id] = {
             'id': data_id,
             'name': filename,
@@ -106,9 +111,10 @@ async def upload_geo_data(
             'size': len(str(parse_result['data'])),
             'uploadDate': datetime.now().isoformat(),
             'status': 'ready',
-            'metadata': {
-                'pointCount': parse_result['pointCount']
-            }
+            'user_id': current_user.id,
+            'city': current_user.city,
+            'operator': current_user.operator,
+            'metadata': metadata
         }
         # 持久化索引到 index.json（防止重启后丢失）
         data_service._save_index()
@@ -120,7 +126,8 @@ async def upload_geo_data(
                 'name': filename,
                 'fileType': 'geo_data',
                 'geometryType': parse_result['geometryType'],
-                'pointCount': parse_result['pointCount']
+                'pointCount': parse_result['pointCount'],
+                'importWarnings': parse_result.get('importWarnings', []),
             }
         }
 

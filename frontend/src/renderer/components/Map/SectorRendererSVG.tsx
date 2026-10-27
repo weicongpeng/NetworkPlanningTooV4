@@ -12,9 +12,16 @@
  */
 import L from 'leaflet'
 import { RenderSectorData } from '../../services/mapDataService'
-import { SECTOR_CONFIG, getCellCoverStyle, getSectorColor } from '../../config/sector-config'
+import { SECTOR_CONFIG, getCellCoverStyle, getSectorColor, resolveSectorField } from '../../config/sector-config'
 import { tacColorMapper } from '../../utils/tacColors'
+import { matchThematicColor, matchRangeIndex, getFieldValue, toNumber } from '../../utils/fieldValue'
+import { buildPciModPalette, getPciModColor } from '../../utils/pciModColor'
+import type { PciRenderStats } from '../../utils/pciModColor'
+import type { ThematicSettings } from './LabelSettingsModal'
+import type { HeatPoint } from '../../utils/heatmap'
 import type { NetworkType } from '../../config/sector-config'
+import { LabelLayoutManager, type LabelCandidate } from './LabelLayoutManager'
+import { layerHitAt, layerBoundsHitPx, CLICK_HIT_TOLERANCE_PX, type FeatureHitType } from './mapHitTest'
 
 /**
  * PCI高亮配置接口
@@ -71,6 +78,18 @@ export interface SectorLabelConfig {
   color: string
   /** 字体大小 */
   fontSize: number
+  /** 字体族（CSS font-family 栈），默认 sans-serif */
+  fontFamily?: string
+  /** 字体效果：加粗 */
+  bold?: boolean
+  /** 字体效果：斜体 */
+  italic?: boolean
+  /** 字体效果：阴影 */
+  shadow?: boolean
+  /** 字体背景：none=无 / halo=光晕 / box=框形 */
+  background?: 'none' | 'halo' | 'box'
+  /** 字体背景颜色（background 为 halo/box 时生效） */
+  backgroundColor?: string
 }
 
 /**
@@ -91,6 +110,10 @@ export interface SectorLayerOptions extends L.LayerOptions {
   labelConfig?: SectorLabelConfig
   /** 是否处于测距模式（测距模式下禁用扇区点击和悬停效果） */
   measureMode?: boolean
+  /** 共享标签布局引擎（统一防重叠，跨图层不重叠） */
+  labelManager?: LabelLayoutManager
+  /** 标签源 ID（在共享引擎中的唯一标识） */
+  labelSourceId?: string
 }
 
 /**
@@ -110,6 +133,7 @@ export class SectorSVGLayer extends L.Layer {
   private renderMode: 'default' | 'pci-planning' | 'neighbor-planning' | 'tac-check' = 'default'
   private measureMode: boolean = false  // 测距模式标志
   private isSelectionMode: boolean = false // 框选模式标志 (满足需求3)
+  private editSessionMode: boolean = false // 图层编辑会话标志（点击穿透到地图）
 
   // 动画帧请求ID
   private _animRequestId: number | null = null
@@ -143,6 +167,27 @@ export class SectorSVGLayer extends L.Layer {
     fontSize: 12
   }
 
+  // 默认设置覆盖（图形透明度/边框宽度；仅默认频点配色模式生效）
+  private colorOverrides: { fillOpacity: number; borderWidth: number } | null = null
+
+  // 小区PCI渲染（默认设置：启用后按 PCI 模3/模30 取值配色）
+  private pciRender: { enabled: boolean; mod: 3 | 30 } | null = null
+
+  // PCI模值图例统计（按频点分组的小区数、总数、无PCI/无频点数）
+  private pciRenderStats: PciRenderStats | null = null
+
+  // PCI渲染调色板（"频点×模值"组合，与统计同步构建）
+  private pciRenderPalette: string[] | null = null
+
+  // PCI渲染频点有序列表（升序，频点序号用于调色板组合编号）
+  private pciFrequencies: number[] = []
+
+  // 专题图层设置（启用时优先于频点配色）
+  private thematicSettings: ThematicSettings | null = null
+
+  // 专题图例统计（区间/属性值/文本的要素数与总数）
+  private thematicStats: { counts: number[]; total: number; other: number } | null = null
+
   // 扇区多边形映射（带缓存时间戳）
   private sectorPolygons = new Map<string, {
     polygon: L.Polygon
@@ -157,8 +202,9 @@ export class SectorSVGLayer extends L.Layer {
     zoom: number
   }>()
 
-  // 扇区标签映射
-  private sectorLabels = new Map<string, L.Marker>()
+  // 共享标签布局引擎（标签防重叠统一由 LabelLayoutManager 处理）
+  private labelManager: LabelLayoutManager | null
+  private labelSourceId: string
 
   // 位置分组缓存 - 用于同一位置的扇区分组
   private locationGroupsCache: {
@@ -187,6 +233,8 @@ export class SectorSVGLayer extends L.Layer {
     this.showLabels = options.showLabels || false
     this.renderMode = options.renderMode || 'default'
     this.measureMode = options.measureMode || false
+    this.labelManager = options.labelManager || null
+    this.labelSourceId = options.labelSourceId || `sector-layer-${Math.random().toString(36).slice(2, 8)}`
 
     console.log('[SectorRenderer] 构造函数初始化', {
       sectorsCount: this.sectors.length,
@@ -268,7 +316,7 @@ export class SectorSVGLayer extends L.Layer {
 
     this.sectorPolygons.clear()
     this.siteMarkers.clear()
-    this.sectorLabels.clear()
+    this.labelManager?.removeSource(this.labelSourceId)
     this.visibleSectorsCache = null
     return this
   }
@@ -278,6 +326,7 @@ export class SectorSVGLayer extends L.Layer {
    */
   updateSectors(sectors: RenderSectorData[]): void {
     this.sectors = sectors
+    this.computePciRenderStats()
     this._render()
   }
 
@@ -321,12 +370,55 @@ export class SectorSVGLayer extends L.Layer {
   }
 
   /**
+   * 图层编辑会话模式：扇区要素禁用鼠标交互（pointer-events: none），
+   * 点击穿透到地图供编辑会话绘制/选中使用（否则扇区 click stopPropagation 吞掉地图 click）。
+   * 与测距模式同机制；重渲染时通过 className 计算保持状态。
+   */
+  setEditSessionMode(enabled: boolean): void {
+    if (this.editSessionMode === enabled) return
+    this.editSessionMode = enabled
+    // 重新套用各要素 className（与 setMeasureMode 相同的刷新方式）
+    this.featureGroup?.eachLayer((layer: any) => {
+      const el = layer.getElement?.()
+      if (el && el.classList) {
+        el.classList.toggle('sector-edit-passthrough', enabled)
+      }
+    })
+  }
+
+  /** 计算扇区要素 className：编辑会话模式下追加穿透类（pointer-events: none） */
+  private pathClassName(base: string): string {
+    return this.editSessionMode ? `${base} sector-edit-passthrough` : base
+  }
+
+  /**
+   * 把扇区 svg 渲染层移到 pane 顶部，使其成为点击命中目标。
+   * featureGroup 无 getContainer()；扇区路径共用地图默认 SVG renderer 的容器
+   * （<svg>）。从 featureGroup 内任一 Path 图层取 renderer（Path.getRenderer()
+   * 无需参数），将其 appendChild 到 overlayPane 顶部即可让基站层高于各 canvas 层。
+   */
+  bringToFrontForZOrder(): void {
+    if (!this.featureGroup) return
+    let container: HTMLElement | undefined
+    this.featureGroup.eachLayer((layer: any) => {
+      if (container) return
+      const renderer = typeof layer?.getRenderer === 'function' ? layer.getRenderer() : undefined
+      container = renderer?._container as HTMLElement | undefined
+    })
+    if (container && container.parentNode) {
+      container.parentNode.appendChild(container)
+    }
+  }
+
+  /**
    * 设置频点可见性
    * @param frequency 频点值
    * @param visible 是否可见
    */
   setFrequencyVisibility(frequency: number, visible: boolean): void {
     this.frequencyVisibility.set(frequency, visible)
+    // 频点勾选变化：同步重算PCI图例统计（图例只展示勾选频点）
+    this.computePciRenderStats()
     this._render() // 重新渲染
   }
 
@@ -357,6 +449,43 @@ export class SectorSVGLayer extends L.Layer {
 
     // 去重并返回
     return sectors.filter((v, i, a) => a.findIndex(t => t.id === v.id) === i)
+  }
+
+  /**
+   * 获取坐标位置精确命中的扇区（几何命中，用于手形工具统一"点击查属性"）。
+   *
+   * 与 getSectorsAt（DOM elementsFromPoint）不同：
+   * - 编辑会话/测距模式下扇区元素 pointer-events:none，elementsFromPoint 会忽略它们，
+   *   而本方法直接对渲染几何做像素空间命中，不受交互状态影响；
+   * - 按 mapHitTest 口径区分 direct（扇形填充包含点击点）/ border（仅边框容差压中，
+   *   如相邻扇区的直边交叠），交由调用方做穿透收敛，避免边框交叠误弹重叠列表。
+   *
+   * @param latlng 点击位置（渲染坐标/GCJ02）
+   * @param tolerancePx 像素容差
+   */
+  public getSectorsAtLatLng(
+    latlng: L.LatLng,
+    tolerancePx: number = CLICK_HIT_TOLERANCE_PX
+  ): Array<{ sector: RenderSectorData; hitType: FeatureHitType; distancePx: number }> {
+    if (!this.mapInstance || !this.featureGroup) return []
+    const results: Array<{ sector: RenderSectorData; hitType: FeatureHitType; distancePx: number }> = []
+
+    const collect = (layer: L.Layer) => {
+      const sector = (layer as any).sectorData as RenderSectorData | undefined
+      if (!sector) return
+      // 已被移出渲染层的缓存（清理滞后）不参与命中
+      if (!this.featureGroup!.hasLayer(layer)) return
+      // 像素包围盒粗检预筛：扇区多边形点数多，避免全量逐点投影
+      if (!layerBoundsHitPx(this.mapInstance!, layer, latlng, tolerancePx)) return
+      const hit = layerHitAt(this.mapInstance!, layer, latlng, tolerancePx)
+      if (hit) results.push({ sector, hitType: hit.type, distancePx: hit.distancePx })
+    }
+
+    for (const cached of this.sectorPolygons.values()) collect(cached.polygon)
+    for (const cached of this.siteMarkers.values()) collect(cached.marker)
+
+    // 去重（同一扇区不会同时存在于两个缓存，此处仅防御）
+    return results.filter((v, i, a) => a.findIndex(t => String(t.sector.id) === String(v.sector.id)) === i)
   }
 
   /**
@@ -405,7 +534,9 @@ export class SectorSVGLayer extends L.Layer {
       let hasNewFrequencies = false
       allFrequencies.forEach(f => {
         if (!this.frequencyVisibility.has(f)) {
-          // 频点不在映射中，默认为不可见（只有用户明确勾选的频点才显示）
+          // 频点不在映射中，默认为不可见（只有用户明确勾选的频点才显示）。
+          // 映射本身由 MapPage 的频点表提供，新频点在那边默认跟随总开关为可见，
+          // 这里保持"严格按映射执行"，不与 PCI 图例的 `=== true` 口径分叉。
           this.frequencyVisibility.set(f, false)
           hasNewFrequencies = true
         }
@@ -420,6 +551,8 @@ export class SectorSVGLayer extends L.Layer {
       }
     }
 
+    // 频点可见性初始化/变化：重算PCI图例统计后再渲染
+    this.computePciRenderStats()
     this._render()
   }
 
@@ -516,7 +649,7 @@ export class SectorSVGLayer extends L.Layer {
       const polygon = cached.polygon
       if (polygon) {
         polygon.setStyle({
-          className: this.measureMode ? 'sector-polygon sector-polygon-measure' : 'sector-polygon'
+          className: this.pathClassName(this.measureMode ? 'sector-polygon sector-polygon-measure' : 'sector-polygon')
         })
       }
     }
@@ -526,7 +659,7 @@ export class SectorSVGLayer extends L.Layer {
       const marker = cached.marker
       if (marker) {
         marker.setStyle({
-          className: this.measureMode ? 'sector-marker sector-marker-measure' : 'sector-marker'
+          className: this.pathClassName(this.measureMode ? 'sector-marker sector-marker-measure' : 'sector-marker')
         })
       }
     }
@@ -590,12 +723,10 @@ export class SectorSVGLayer extends L.Layer {
         const existingMarker = this.siteMarkers.get(sectorId)
 
         if (existingPolygon) {
-          // 扇区已存在，更新其样式以应用高亮
+          // 扇区已存在，更新其样式以应用高亮（红色边框，保留原频点填充色，与图层文件/地理化数据圈选效果一致）
           existingPolygon.polygon.setStyle({
-            fillColor: '#ff4444',
-            color: '#ff0000',
-            weight: 4,
-            fillOpacity: 0.6
+            color: '#ef4444',
+            weight: 4
           })
           existingPolygon.polygon.bringToFront()
           console.log('[SectorRenderer] 更新已有扇区多边形高亮', sectorId)
@@ -603,11 +734,10 @@ export class SectorSVGLayer extends L.Layer {
         }
 
         if (existingMarker) {
-          // 标记已存在，更新其样式以应用高亮
+          // 标记已存在，更新其样式以应用高亮（红色边框，保留原填充色）
           existingMarker.marker.setStyle({
-            color: '#ff0000',
-            weight: 3,
-            fillOpacity: 0.6
+            color: '#ef4444',
+            weight: 3
           })
           existingMarker.marker.bringToFront()
           console.log('[SectorRenderer] 更新已有标记高亮', sectorId)
@@ -664,21 +794,19 @@ export class SectorSVGLayer extends L.Layer {
       if (!sector) continue
       const isSelected = this._isSectorSelected(sectorId, sector)
       if (isSelected) {
+        // 红色边框高亮，保留原频点填充色/透明度（与图层文件/地理化数据圈选效果一致）
         layer.setStyle({
-          fillColor: '#ff4444',
-          color: '#ff0000',
-          weight: 4,
-          fillOpacity: 0.6
+          color: '#ef4444',
+          weight: 4
         })
         if (layer.bringToFront) layer.bringToFront()
       } else {
-        const config = SECTOR_CONFIG[sector.networkType]
-        const colors = getSectorColor(sector)
+        const base = this._sectorBaseStyle(sector)
         layer.setStyle({
-          fillColor: colors.fillColor,
-          color: config.strokeColor || '#000000',
-          weight: config.strokeWidth || 0.5,
-          fillOpacity: config.opacity
+          fillColor: base.fillColor,
+          color: base.strokeColor,
+          weight: base.strokeWidth,
+          fillOpacity: base.fillOpacity
         })
       }
     }
@@ -689,19 +817,19 @@ export class SectorSVGLayer extends L.Layer {
       if (!sector) continue
       const isSelected = this._isSectorSelected(siteKey, sector)
       if (isSelected) {
+        // 红色边框高亮，保留圆点原填充色
         layer.setStyle({
-          color: '#ff0000',
-          weight: 3,
-          fillOpacity: 0.6
+          color: '#ef4444',
+          weight: 3
         })
         if (layer.bringToFront) layer.bringToFront()
       } else {
-        const colors = getSectorColor(sector)
+        const base = this._sectorBaseStyle(sector, 'marker')
         layer.setStyle({
-          fillColor: colors.fillColor,
-          color: colors.strokeColor,
-          weight: 1,
-          fillOpacity: 0.8
+          fillColor: base.fillColor,
+          color: base.strokeColor,
+          weight: base.strokeWidth,
+          fillOpacity: base.fillOpacity
         })
       }
     }
@@ -794,13 +922,12 @@ export class SectorSVGLayer extends L.Layer {
       sectorName: sector.name
     })
 
-    const colors = getSectorColor(sector)
-    const config = SECTOR_CONFIG[sector.networkType]
+    const base = this._sectorBaseStyle(sector)
 
     // 检查是否选中
-    let strokeColor = config.strokeColor || '#000000'
-    let strokeWidth = config.strokeWidth || 0.5
-    let fillOpacity = config.opacity
+    let strokeColor = base.strokeColor
+    let strokeWidth = base.strokeWidth
+    let fillOpacity = base.fillOpacity
 
     if (this.selectionHighlightIds && this.selectionHighlightIds.size > 0) {
       const sectorId = String(sector.id)
@@ -810,9 +937,9 @@ export class SectorSVGLayer extends L.Layer {
         (sector.name && this.selectionHighlightIds.has(sector.name))
 
       if (isSelected) {
-        strokeColor = '#ff0000'
-        strokeWidth = 3
-        fillOpacity = 0.6
+        // 红色边框高亮，填充色/透明度保持频点基础样式
+        strokeColor = '#ef4444'
+        strokeWidth = 4
       }
     }
 
@@ -820,7 +947,7 @@ export class SectorSVGLayer extends L.Layer {
       color: strokeColor,
       weight: strokeWidth,
       opacity: 1,
-      fillColor: colors.fillColor,
+      fillColor: base.fillColor,
       fillOpacity: fillOpacity,
       className: 'sector-polygon',
       smoothFactor: 0.1,
@@ -831,6 +958,253 @@ export class SectorSVGLayer extends L.Layer {
       ; (polygon as any).sectorData = sector
 
     return polygon
+  }
+
+  /**
+   * 计算扇区基础样式（专题配色优先、默认频点配色次之，再叠加默认设置覆盖的透明度/边框宽度）
+   * @param sector 扇区数据
+   * @param kind 渲染形态：'polygon' 使用 SECTOR_CONFIG 默认边框/透明度；'marker' 使用站点圆点默认
+   * @returns 基础样式
+   */
+  private _sectorBaseStyle(
+    sector: RenderSectorData,
+    kind: 'polygon' | 'marker' = 'polygon'
+  ): { fillColor: string; strokeColor: string; strokeWidth: number; fillOpacity: number } {
+    const colors = getSectorColor(sector)
+    const config = SECTOR_CONFIG[sector.networkType]
+
+    let fillColor = colors.fillColor
+    // 小区PCI渲染（默认设置）：同频点且同 PCI 模3/模30 取值才同色；
+    // 无有效频点/PCI时保持原配色。专题图层优先级更高，在下方覆盖。
+    if (this.pciRender?.enabled && this.pciRenderPalette) {
+      const frequency = this._getFrequencyValue(sector)
+      const pci = frequency !== null ? this._getPCIValue(sector) : null
+      const freqIndex = frequency !== null ? this.pciFrequencies.indexOf(frequency) : -1
+      if (pci !== null && freqIndex >= 0) {
+        fillColor = getPciModColor(this.pciRenderPalette, freqIndex, this.pciRender.mod, pci)
+      }
+    }
+    // 专题配色优先（启用且字段有效时）
+    if (this.thematicSettings?.enabled && this.thematicSettings.field) {
+      const thematicColor = matchThematicColor(
+        this.thematicSettings,
+        getFieldValue(sector as unknown as Record<string, any>, this.thematicSettings.field)
+      )
+      if (thematicColor) fillColor = thematicColor
+    }
+
+    let strokeColor: string
+    let strokeWidth: number
+    let fillOpacity: number
+    if (kind === 'marker') {
+      strokeColor = colors.strokeColor
+      strokeWidth = 1
+      fillOpacity = 0.8
+    } else {
+      strokeColor = config.strokeColor || '#000000'
+      strokeWidth = config.strokeWidth || 0.5
+      fillOpacity = config.opacity
+    }
+
+    // 默认设置覆盖（图形透明度/边框宽度）
+    if (this.colorOverrides) {
+      if (typeof this.colorOverrides.fillOpacity === 'number') fillOpacity = this.colorOverrides.fillOpacity
+      if (typeof this.colorOverrides.borderWidth === 'number') strokeWidth = this.colorOverrides.borderWidth
+    }
+
+    // 专题设置覆盖（图形透明度/边框颜色/图形大小）：专题启用时优先于默认设置。
+    // 扇区属面状图层，「图形大小」语义为**边框宽度**（与图层文件的面/线一致）。
+    if (this.thematicSettings?.enabled) {
+      if (typeof this.thematicSettings.fillOpacity === 'number') fillOpacity = this.thematicSettings.fillOpacity
+      if (this.thematicSettings.borderColor) strokeColor = this.thematicSettings.borderColor
+      if (typeof this.thematicSettings.pointSize === 'number') strokeWidth = this.thematicSettings.pointSize
+    }
+
+    return { fillColor, strokeColor, strokeWidth, fillOpacity }
+  }
+
+  /**
+   * 设置默认设置覆盖（图形透明度/边框宽度/小区PCI渲染；null 恢复 SECTOR_CONFIG 默认）
+   * 频点配色模式下生效；专题启用时透明度/边框宽仍叠加（与图层文件一致）
+   */
+  setColorOverrides(settings: {
+    fillOpacity: number
+    borderWidth: number
+    pciRenderEnabled?: boolean
+    pciMod?: 3 | 30
+  } | null): void {
+    this.colorOverrides = settings
+    this.pciRender = settings?.pciRenderEnabled
+      ? { enabled: true, mod: settings.pciMod ?? 3 }
+      : null
+    this.computePciRenderStats()
+    // _render 负责新增视口内缺失的扇区，_updateSectorStyles 负责重绘已缓存的扇区
+    this._render()
+    this._updateSectorStyles()
+  }
+
+  /**
+   * 计算小区PCI渲染统计：收集有序频点列表与调色板，按"频点×模值"分组计数；
+   * noPci = 有频点但无有效PCI；noFrequency = 无有效频点（保持原配色）。
+   */
+  private computePciRenderStats(): void {
+    const pr = this.pciRender
+    if (!pr?.enabled || this.sectors.length === 0) {
+      this.pciRenderStats = null
+      this.pciRenderPalette = null
+      this.pciFrequencies = []
+      return
+    }
+    // 有序频点列表（去重升序）；仅控制面板已勾选可见的频点才进入图例，
+    // 与地图渲染过滤（frequencyVisibility）及频点复选框状态保持一致。
+    const freqSet = new Set<number>()
+    for (const sector of this.sectors) {
+      const f = this._getFrequencyValue(sector)
+      if (f !== null && this.frequencyVisibility.get(f) === true) freqSet.add(f)
+    }
+    const frequencies = [...freqSet].sort((a, b) => a - b)
+    this.pciFrequencies = frequencies
+    this.pciRenderPalette = buildPciModPalette(frequencies.length, pr.mod)
+
+    const groups = frequencies.map(frequency => ({
+      frequency,
+      counts: new Array(pr.mod).fill(0),
+      total: 0
+    }))
+    let total = 0
+    let noPci = 0
+    let noFrequency = 0
+    for (const sector of this.sectors) {
+      const frequency = this._getFrequencyValue(sector)
+      if (frequency === null) { noFrequency++; continue }
+      // 未勾选频点：不展示该频点图例，也不计入 noPci（其小区本就被频点过滤）
+      if (this.frequencyVisibility.get(frequency) !== true) continue
+      const pci = this._getPCIValue(sector)
+      if (pci === null) { noPci++; continue }
+      const group = groups[frequencies.indexOf(frequency)]
+      group.total++
+      total++
+      group.counts[((pci % pr.mod) + pr.mod) % pr.mod]++
+    }
+    this.pciRenderStats = { frequencies: groups, total, noPci, noFrequency }
+  }
+
+  /**
+   * 获取PCI渲染图例统计（按频点分组的各模值个数及无PCI/无频点小区数）
+   */
+  getPciRenderStats(): PciRenderStats | null {
+    return this.pciRenderStats
+  }
+
+  /**
+   * 设置专题图层覆盖（启用时优先于频点配色；null 关闭专题后回退到频点配色）
+   */
+  setThematicOverrides(settings: ThematicSettings | null): void {
+    this.thematicSettings = settings
+    this.computeThematicStats()
+    // _render 负责新增视口内缺失的扇区，_updateSectorStyles 负责重绘已缓存的扇区
+    this._render()
+    this._updateSectorStyles()
+  }
+
+  /**
+   * 重新渲染全部已渲染扇区（频点自定义配色等颜色变化后调用）
+   */
+  redraw(): void {
+    this._render()
+    this._updateSectorStyles()
+  }
+
+  /**
+   * 计算专题图例统计（各配色模式的扇区数与总数，供图例展示）
+   */
+  private computeThematicStats(): void {
+    const ts = this.thematicSettings
+    if (!ts?.enabled || this.sectors.length === 0) {
+      this.thematicStats = null
+      return
+    }
+    const isRange = ts.fieldType === 'numeric' && ts.colorMode !== 'value' && ts.ranges.length > 0
+    const isValue = ts.fieldType === 'numeric' && ts.colorMode === 'value' && (ts.valueColors?.length ?? 0) > 0
+    const isText = ts.fieldType === 'text' && ts.categories.length > 0
+    if (!isRange && !isValue && !isText) {
+      this.thematicStats = null
+      return
+    }
+    const counts = new Array(
+      isRange ? ts.ranges.length : isValue ? ts.valueColors!.length : ts.categories.length
+    ).fill(0)
+    let total = 0
+    let other = 0
+    const valueIndex = isValue ? new Map(ts.valueColors!.map((c, i) => [c.value, i])) : null
+    const otherIdx = isText ? ts.categories.findIndex(c => c.value === '__other__') : -1
+    const categoryIndex = isText ? new Map(ts.categories.map((c, i) => [c.value, i])) : null
+    for (const sector of this.sectors) {
+      const raw = getFieldValue(sector as unknown as Record<string, any>, ts.field)
+      if (isRange) {
+        total++
+        const idx = matchRangeIndex(ts, raw)
+        if (idx >= 0) counts[idx]++; else other++
+      } else if (isValue) {
+        total++
+        if (raw === undefined || raw === null || raw === '') { other++; continue }
+        const idx = valueIndex!.get(String(raw))
+        if (idx !== undefined) counts[idx]++; else other++
+      } else {
+        total++
+        if (raw === undefined || raw === null || raw === '') { if (otherIdx >= 0) counts[otherIdx]++; else other++; continue }
+        const idx = categoryIndex!.get(String(raw))
+        if (idx !== undefined) counts[idx]++
+        else if (otherIdx >= 0) counts[otherIdx]++
+        else other++
+      }
+    }
+    this.thematicStats = { counts, total, other }
+  }
+
+  /**
+   * 获取专题图例统计（图例显示每个区间的个数与占比；other = 未匹配的扇区数）
+   */
+  getThematicStats(): { counts: number[]; total: number; other: number } | null {
+    return this.thematicStats
+  }
+
+  /**
+   * 收集热力图点（displayLat/displayLng 为已纠偏 GCJ02 渲染坐标）。
+   * 权重取扇区对象上的工参数值字段（azimuth/beamwidth/height/pci/tac/frequency/cell_cover_type）；
+   * 展示别名（覆盖类型/是否共享/厂家）按 SECTOR_FIELD_ALIAS 映射回真实字段；
+   * 字段非数值的扇区跳过。
+   */
+  getHeatPoints(field: string): HeatPoint[] {
+    if (this.sectors.length === 0 || !field) return []
+    const points: HeatPoint[] = []
+    const key = resolveSectorField(field)
+    for (const sector of this.sectors) {
+      if (typeof sector.displayLat !== 'number' || typeof sector.displayLng !== 'number') continue
+      const weight = toNumber((sector as any)[key])
+      if (weight === null) continue
+      points.push({ lat: sector.displayLat, lng: sector.displayLng, weight })
+    }
+    return points
+  }
+
+  /**
+   * 获取该图层全部扇区的地理范围（图层预览：居中最大化显示）
+   * @returns LatLngBounds；无扇区/无有效坐标返回 null
+   */
+  getSectorBounds(): L.LatLngBounds | null {
+    const bounds = L.latLngBounds([])
+    let has = false
+    for (const sector of this.sectors) {
+      if (typeof sector.displayLat !== 'number' || typeof sector.displayLng !== 'number') continue
+      // 工参解析失败的行经纬度默认 (0,0)（落在几内亚湾，视野内不可见）：
+      // 并入 bounds 会把"显示全部"的视野拉到印度洋，必须按无效坐标剔除
+      if ((sector.displayLat === 0 && sector.displayLng === 0)
+        || Math.abs(sector.displayLng) > 180 || Math.abs(sector.displayLat) > 90) continue
+      bounds.extend([sector.displayLat, sector.displayLng])
+      has = true
+    }
+    return has ? bounds : null
   }
 
   /**
@@ -955,17 +1329,93 @@ export class SectorSVGLayer extends L.Layer {
       fontSize: this.labelConfig.fontSize
     })
 
-    // 强制重新创建所有标签以应用新的配置
-    // 移除所有现有标签标记
-    for (const [, label] of this.sectorLabels) {
-      if (this.featureGroup && this.featureGroup.hasLayer(label)) {
-        this.featureGroup.removeLayer(label)
-      }
-    }
-    this.sectorLabels.clear()
-
-    // 重新渲染以更新标签
+    // 重新渲染以更新标签（候选标签随渲染重新注册到共享布局引擎）
     this._render()
+  }
+
+  /**
+   * 将当前可见扇区的标签候选注册到共享标签布局引擎。
+   * 标签的防重叠/避让/显隐统一由 LabelLayoutManager 按屏幕空间处理，
+   * 跨图层（LTE/NR/地理化数据）全局不重叠。
+   */
+  private _syncLabelCandidates(sectorsToRender: RenderSectorData[]): void {
+    if (!this.labelManager) return
+
+    const shouldShowLabel = this.showLabels || this.sectorLabelsEnabled
+    if (!shouldShowLabel) {
+      this.labelManager.setCandidates(this.labelSourceId, [])
+      return
+    }
+
+    const isPciMode = this.pciHighlightConfig && this.renderMode === 'pci-planning'
+    const candidates: LabelCandidate[] = []
+
+    for (const sector of sectorsToRender) {
+      if (typeof sector.displayLat !== 'number' || typeof sector.displayLng !== 'number') continue
+
+      let text: string
+      if (isPciMode) {
+        // PCI模式：显示 小区名称 + PCI（优先使用规划后的PCI）
+        text = `${sector.name || ''} (PCI: ${this._getLabelContent(sector, 'pci') || '-'})`
+      } else {
+        text = this._getLabelContent(sector, this.labelConfig.content)
+      }
+      if (!text) continue
+
+      const sectorId = String(sector.id)
+      const priority = this._isSectorSelected(sectorId, sector) ? 10 : 0
+
+      candidates.push({
+        id: sectorId,
+        lat: sector.displayLat,
+        lng: sector.displayLng,
+        text,
+        fontSize: this.labelConfig.fontSize || 12,
+        fontFamily: this.labelConfig.fontFamily,
+        bold: this.labelConfig.bold,
+        italic: this.labelConfig.italic,
+        shadow: this.labelConfig.shadow,
+        background: this.labelConfig.background,
+        backgroundColor: this.labelConfig.backgroundColor,
+        color: this.labelConfig.color || '#000000',
+        priority
+      })
+    }
+
+    this.labelManager.setCandidates(this.labelSourceId, candidates)
+  }
+
+  /**
+   * 获取小区PCI数值（标签与PCI渲染共用）
+   * 优先使用PCI规划应用后的同步值（pciDataSyncService），再回退工参原始 pci 字段；
+   * PCI 必须为有限整数（非整数/NaN/Infinity 等脏数据视为无效），否则返回 null。
+   */
+  private _getPCIValue(sector: RenderSectorData): number | null {
+    let raw: unknown
+    try {
+      const pciDataSyncService = require('../../services/pciDataSyncService').pciDataSyncService
+      if (pciDataSyncService && sector.siteId && sector.sectorId) {
+        const syncedSector = pciDataSyncService.findSector(sector.siteId, sector.sectorId)
+        if (syncedSector && syncedSector.syncedPCI !== undefined) raw = syncedSector.syncedPCI
+      }
+    } catch (e) {
+      console.warn('[SectorRenderer] 获取同步PCI失败:', e)
+    }
+    if (raw === undefined || raw === null) raw = sector.pci
+    const num = Number(raw)
+    return Number.isInteger(num) ? num : null
+  }
+
+  /**
+   * 获取小区工作频点（标签与PCI渲染共用）
+   * 解析顺序 frequency → ssbFrequency → earfcn；必须为正有限数，否则返回 null。
+   */
+  private _getFrequencyValue(sector: RenderSectorData): number | null {
+    for (const raw of [sector.frequency, sector.ssbFrequency, sector.earfcn]) {
+      const num = Number(raw)
+      if (Number.isFinite(num) && num > 0) return num
+    }
+    return null
   }
 
   /**
@@ -994,31 +1444,17 @@ export class SectorSVGLayer extends L.Layer {
         // 小区ID
         return sector.sectorId || ''
 
-      case 'frequency':
-        // 下行频点 - 直接使用frequency字段
-        if (sector.frequency) return String(sector.frequency)
-        // 如果frequency为空，尝试其他字段
-        if (sector.ssbFrequency) return String(sector.ssbFrequency)
-        if (sector.earfcn) return String(sector.earfcn)
-        return ''
+      case 'frequency': {
+        // 下行频点 - 与PCI渲染的频点解析同源
+        const frequency = this._getFrequencyValue(sector)
+        return frequency !== null ? String(frequency) : ''
+      }
 
-      case 'pci':
-        // PCI - 优先使用同步服务中的PCI值，然后使用原始pci字段
-        try {
-          // 尝试从同步服务获取同步后的PCI值
-          const pciDataSyncService = require('../../services/pciDataSyncService').pciDataSyncService
-          if (pciDataSyncService && sector.siteId && sector.sectorId) {
-            const syncedSector = pciDataSyncService.findSector(sector.siteId, sector.sectorId)
-            if (syncedSector && syncedSector.syncedPCI !== undefined) {
-              return String(syncedSector.syncedPCI)
-            }
-          }
-        } catch (e) {
-          // 如果同步服务不可用，使用原始pci字段
-          console.warn('[SectorRenderer] 获取同步PCI失败:', e)
-        }
-        // 使用原始pci字段作为后备
-        return sector.pci !== undefined ? String(sector.pci) : ''
+      case 'pci': {
+        // PCI - 与PCI渲染同源（同步服务优先，原始pci字段兜底）
+        const pci = this._getPCIValue(sector)
+        return pci !== null ? String(pci) : ''
+      }
 
       case 'tac':
         // TAC - 直接使用tac字段
@@ -1281,9 +1717,8 @@ export class SectorSVGLayer extends L.Layer {
           (sector.name && this.selectionHighlightIds?.has(sector.name))
 
         if (isSelected) {
-          const colors = getSectorColor(sector)
           cached.polygon.setStyle({
-            fillColor: colors.fillColor,
+            fillColor: this._sectorBaseStyle(sector).fillColor,
             color: '#ef4444', // 红色高亮边框
             weight: 3,
             fillOpacity: 0.9
@@ -1293,13 +1728,12 @@ export class SectorSVGLayer extends L.Layer {
           // PCI模式：检查是否在白名单中
           const isInWhitelist = this.sectorIdWhitelist ? this.sectorIdWhitelist.has(sectorId) : false
           if (isInWhitelist) {
-            const colors = getSectorColor(sector)
-            const config = SECTOR_CONFIG[sector.networkType]
+            const base = this._sectorBaseStyle(sector)
             cached.polygon.setStyle({
-              fillColor: colors.fillColor,
-              color: config.strokeColor || '#000000',
-              weight: config.strokeWidth || 0.5,
-              fillOpacity: config.opacity
+              fillColor: base.fillColor,
+              color: base.strokeColor,
+              weight: base.strokeWidth,
+              fillOpacity: base.fillOpacity
             })
           } else {
             cached.polygon.setStyle({
@@ -1312,13 +1746,12 @@ export class SectorSVGLayer extends L.Layer {
           })
         } else {
           // 默认模式
-          const colors = getSectorColor(sector)
-          const config = SECTOR_CONFIG[sector.networkType]
+          const base = this._sectorBaseStyle(sector)
           cached.polygon.setStyle({
-            fillColor: colors.fillColor,
-            color: config.strokeColor || '#000000',
-            weight: config.strokeWidth || 0.5,
-            fillOpacity: config.opacity
+            fillColor: base.fillColor,
+            color: base.strokeColor,
+            weight: base.strokeWidth,
+            fillOpacity: base.fillOpacity
           })
         }
       }
@@ -1330,9 +1763,8 @@ export class SectorSVGLayer extends L.Layer {
           (sector.name && this.selectionHighlightIds?.has(sector.name))
 
         if (isSelected) {
-          const colors = getSectorColor(sector)
           cached.marker.setStyle({
-            fillColor: colors.fillColor,
+            fillColor: this._sectorBaseStyle(sector, 'marker').fillColor,
             color: '#ef4444', // 红色高亮边框
             weight: 3,
             fillOpacity: 1
@@ -1341,12 +1773,12 @@ export class SectorSVGLayer extends L.Layer {
         } else if (this.renderMode === 'pci-planning') {
           const isInWhitelist = this.sectorIdWhitelist ? this.sectorIdWhitelist.has(sector.id) : false
           if (isInWhitelist) {
-            const colors = getSectorColor(sector)
+            const base = this._sectorBaseStyle(sector, 'marker')
             cached.marker.setStyle({
-              fillColor: colors.fillColor,
-              color: colors.strokeColor,
-              weight: 1,
-              fillOpacity: 0.8
+              fillColor: base.fillColor,
+              color: base.strokeColor,
+              weight: base.strokeWidth,
+              fillOpacity: base.fillOpacity
             })
           } else {
             cached.marker.setStyle({
@@ -1354,12 +1786,12 @@ export class SectorSVGLayer extends L.Layer {
             })
           }
         } else {
-          const colors = getSectorColor(sector)
+          const base = this._sectorBaseStyle(sector, 'marker')
           cached.marker.setStyle({
-            fillColor: colors.fillColor,
-            color: colors.strokeColor,
-            weight: 1,
-            fillOpacity: 0.8
+            fillColor: base.fillColor,
+            color: base.strokeColor,
+            weight: base.strokeWidth,
+            fillOpacity: base.fillOpacity
           })
         }
       }
@@ -1448,9 +1880,8 @@ export class SectorSVGLayer extends L.Layer {
         highlightPolygons.push(cached.polygon)
       } else if (isSelected) {
         // 仅被框选的高亮：保持原色但加红色边框
-        const colors = getSectorColor(sector)
         cached.polygon.setStyle({
-          fillColor: colors.fillColor,
+          fillColor: this._sectorBaseStyle(sector).fillColor,
           color: '#ef4444', // 红色高亮边框
           weight: 3,
           fillOpacity: 0.9
@@ -1468,13 +1899,12 @@ export class SectorSVGLayer extends L.Layer {
           })
         } else {
           // 默认模式：彩色
-          const colors = getSectorColor(sector)
-          const config = SECTOR_CONFIG[sector.networkType]
+          const base = this._sectorBaseStyle(sector)
           cached.polygon.setStyle({
-            fillColor: colors.fillColor,
-            color: config.strokeColor || '#000000',
-            weight: config.strokeWidth || 0.5,
-            fillOpacity: config.opacity
+            fillColor: base.fillColor,
+            color: base.strokeColor,
+            weight: base.strokeWidth,
+            fillOpacity: base.fillOpacity
           })
         }
       }
@@ -1520,9 +1950,8 @@ export class SectorSVGLayer extends L.Layer {
           fillOpacity: 1
         })
       } else if (isSelected) {
-        const colors = getSectorColor(sector)
         cached.marker.setStyle({
-          fillColor: colors.fillColor,
+          fillColor: this._sectorBaseStyle(sector, 'marker').fillColor,
           color: '#ef4444', // 红色高亮边框
           weight: 3,
           fillOpacity: 1
@@ -1539,12 +1968,12 @@ export class SectorSVGLayer extends L.Layer {
           })
         } else {
           // 默认模式：彩色
-          const colors = getSectorColor(sector)
+          const base = this._sectorBaseStyle(sector, 'marker')
           cached.marker.setStyle({
-            fillColor: colors.fillColor,
-            color: colors.strokeColor,
-            weight: 1,
-            fillOpacity: 0.8
+            fillColor: base.fillColor,
+            color: base.strokeColor,
+            weight: base.strokeWidth,
+            fillOpacity: base.fillOpacity
           })
         }
       }
@@ -1913,6 +2342,9 @@ export class SectorSVGLayer extends L.Layer {
         }, this)
       }
 
+      // 低缩放级别不渲染扇区，同步清空标签候选
+      this.labelManager?.setCandidates(this.labelSourceId, [])
+
       return
     }
 
@@ -1966,10 +2398,14 @@ export class SectorSVGLayer extends L.Layer {
     const visibleSectors = this._getVisibleSectors(paddedBounds)
 
     // 按频点过滤扇区
+    // 口径契约：仅 raw frequency 显式 false 才隐藏；undefined（频点键缺失）放行。
+    // 已知频点由 setFrequenciesVisibility 初始化为 true/false（default 模式未勾选补 false，
+    // 映射由 MapPage 频点表提供，新频点默认跟随图层总开关为可见），
+    // 故 undefined 仅在数据出现未登记频点时发生。PCI图例口径不同（===true 才展示，
+    // 且频点解析含 ssbFrequency/earfcn 回退），改动此处须与 computePciRenderStats 对齐。
     const frequencyFilteredSectors = visibleSectors.filter(sector => {
       if (!sector.frequency) return true
       const isVisible = this.frequencyVisibility.get(sector.frequency)
-      // 如果频点不在映射中（undefined），默认显示；只有在映射中且值为false时才过滤
       const result = isVisible !== false
       if (this._isDev && !result && this.renderMode === 'neighbor-planning') {
         console.log('[SectorRenderer] 扇区被频点过滤', {
@@ -2051,6 +2487,9 @@ export class SectorSVGLayer extends L.Layer {
         this.siteMarkers.delete(sectorId)
       }
     }
+
+    // 标签：注册候选到共享标签布局引擎，由引擎按屏幕空间统一防重叠
+    this._syncLabelCandidates(sectorsToRender)
   }
 
   /**
@@ -2168,26 +2607,25 @@ export class SectorSVGLayer extends L.Layer {
 
       if (isSelected) {
         // 选中扇区：红色高亮
-        const colors = getSectorColor(sector)
-        fillColor = colors.fillColor
+        fillColor = this._sectorBaseStyle(sector, 'marker').fillColor
         color = '#ff0000'
         weight = 3
         fillOpacity = 0.6
       } else {
         // 默认模式：彩色（基于频点或网络类型）
-        const colors = getSectorColor(sector)
-        fillColor = colors.fillColor
-        color = colors.strokeColor
-        weight = 1
-        fillOpacity = 0.8
+        const base = this._sectorBaseStyle(sector, 'marker')
+        fillColor = base.fillColor
+        color = base.strokeColor
+        weight = base.strokeWidth
+        fillOpacity = base.fillOpacity
       }
     } else {
       // 默认模式：彩色（基于频点或网络类型）
-      const colors = getSectorColor(sector)
-      fillColor = colors.fillColor
-      color = colors.strokeColor
-      weight = 1
-      fillOpacity = 0.8
+      const base = this._sectorBaseStyle(sector, 'marker')
+      fillColor = base.fillColor
+      color = base.strokeColor
+      weight = base.strokeWidth
+      fillOpacity = base.fillOpacity
     }
 
     const marker = L.circleMarker(centerLatLng, {
@@ -2197,7 +2635,7 @@ export class SectorSVGLayer extends L.Layer {
       weight: weight,
       opacity: 1,
       fillOpacity: fillOpacity,
-      className: this.measureMode ? 'sector-marker sector-marker-measure' : 'sector-marker'
+      className: this.pathClassName(this.measureMode ? 'sector-marker sector-marker-measure' : 'sector-marker')
     })
 
     // 绑定点击事件 - 测距模式或框选模式下禁用
@@ -2207,6 +2645,8 @@ export class SectorSVGLayer extends L.Layer {
         L.DomEvent.stopPropagation(e)
         return
       }
+      // 图层编辑会话：放行点击（不拦截），让地图 click 供编辑会话使用
+      if (this.editSessionMode) return
       // 点选模式下允许点击事件
       L.DomEvent.stopPropagation(e)
       e.originalEvent.preventDefault()
@@ -2270,11 +2710,11 @@ export class SectorSVGLayer extends L.Layer {
     // 获取可见扇区（带缓存）
     const visibleSectors = this._getVisibleSectors(paddedBounds)
 
-    // 按频点过滤扇区
+    // 按频点过滤扇区（口径契约见 _renderSectorsOptimized 同名注释：
+    // 显式 false 才隐藏、undefined 放行；与 PCI 图例 ===true 口径不同，改动须同步）
     const frequencyFilteredSectors = visibleSectors.filter(sector => {
       if (!sector.frequency) return true
       const isVisible = this.frequencyVisibility.get(sector.frequency)
-      // 如果频点不在映射中（undefined），默认显示；只有在映射中且值为false时才过滤
       return isVisible !== false
     })
 
@@ -2302,51 +2742,13 @@ export class SectorSVGLayer extends L.Layer {
       console.log(`[SectorRenderer] 扇区模式: 总扇区=${this.sectors.length}, 可见=${visibleSectors.length}, 频点过滤后=${frequencyFilteredSectors.length}, 白名单过滤后=${sectorsToRender.length}, Zoom=${currentZoom}`)
     }
 
-    // 按物理位置（经纬度）分组扇区 - 同一位置的扇区只显示部分标签
+    // 按物理位置（经纬度）分组扇区 - 同位置扇区集中渲染多边形
     const locationGroups = this._groupSectorsByLocation(sectorsToRender)
-
-    // 获取当前zoom级别下每个位置最多显示的标签数
-    const maxLabelsPerLocation = this._getMaxLabelsPerLocation()
-
-    // 标签碰撞检测优化：使用屏幕坐标网格分桶，避免 O(n^2) 的全量遍历
-    // gridSize 越大越保守（更少标签），越小越激进（更易重叠）
-    const fontSize = this.labelConfig.fontSize || 12
-    const gridSize = Math.max(8, fontSize * 6)
-    const occupiedGrid = new Set<string>()
-
-    const markOccupied = (latLng: L.LatLng) => {
-      if (!this.mapInstance) return
-      const p = this.mapInstance.latLngToContainerPoint(latLng)
-      const gx = Math.floor(p.x / gridSize)
-      const gy = Math.floor(p.y / gridSize)
-      occupiedGrid.add(`${gx},${gy}`)
-    }
-
-    const isGridOccupied = (latLng: L.LatLng) => {
-      if (!this.mapInstance) return false
-      const p = this.mapInstance.latLngToContainerPoint(latLng)
-      const gx = Math.floor(p.x / gridSize)
-      const gy = Math.floor(p.y / gridSize)
-      for (let dx = -1; dx <= 1; dx++) {
-        for (let dy = -1; dy <= 1; dy++) {
-          if (occupiedGrid.has(`${gx + dx},${gy + dy}`)) return true
-        }
-      }
-      return false
-    }
-
-    // 先把本轮“已存在且仍在地图上”的标签占位写入网格
-    for (const [, label] of this.sectorLabels) {
-      if (this.featureGroup && this.featureGroup.hasLayer(label)) {
-        markOccupied(label.getLatLng())
-      }
-    }
 
     // 标记当前应该可见的扇区ID
     const currentVisibleIds = new Set<string>()
 
-    let renderedCount = 0
-    // 渲染每个位置组内的扇区，处理同一位置多扇区标签显示问题
+    // 渲染每个位置组内的扇区多边形
     for (const [, locationSectors] of locationGroups.entries()) {
       locationSectors.sort((a, b) => {
         const aId = a.sectorId || ''
@@ -2354,8 +2756,7 @@ export class SectorSVGLayer extends L.Layer {
         return aId.localeCompare(bId)
       })
 
-      for (let i = 0; i < locationSectors.length; i++) {
-        const sector = locationSectors[i]
+      for (const sector of locationSectors) {
         const coverStyle = getCellCoverStyle(sector.cell_cover_type, sector.networkType)
         let radius = coverStyle.isCircular ? indoorRadius : outdoorRadius
 
@@ -2390,87 +2791,16 @@ export class SectorSVGLayer extends L.Layer {
             lastUsed: now,
             zoom: currentZoom
           })
-          renderedCount++
         } else {
           // 更新时间戳
           cached.lastUsed = now
         }
 
-        // 处理标签
-        // 检查是否应该显示标签：
-        // 1. 全局标签开关开启 (this.showLabels)
-        // 2. PCI模式标签开关开启 (this.sectorLabelsEnabled)
-        const shouldShowLabel = this.showLabels || this.sectorLabelsEnabled
-
-        // 临时调试日志：只记录特定频点的扇区（仅开发环境）
-        if (this._isDev && (sector.frequency === 100 || sector.frequency === 200)) {
-          console.log('[SectorRendererSVG] Label check:', {
-            sectorName: sector.name,
-            sectorFrequency: sector.frequency,
-            shouldShowLabel,
-            showLabels: this.showLabels,
-            sectorLabelsEnabled: this.sectorLabelsEnabled
-          })
-        }
-
-        if (shouldShowLabel) {
-          // 动态计算当前zoom下可以显示的标签数量
-          // 优化策略：更保守的标签显示，避免重叠
-          // zoom < 14: 只显示1个标签
-          // zoom 14-15: 显示2个标签
-          // zoom 16-17: 显示3个标签
-          // zoom >= 18: 显示更多标签但仍控制上限
-          const maxLabelsPerLocation = this._getMaxLabelsPerLocation()
-
-          // 如果扇区数量小于允许的最大值，则全部显示
-          if (i < maxLabelsPerLocation) {
-            // 创建临时标签以获取位置
-            const tempLabel = this._createSectorLabel(sector, i, locationSectors.length, false)
-            const isOverlapping = isGridOccupied(tempLabel.getLatLng())
-
-            if (!isOverlapping) {
-              // 不重叠，显示标签
-              // 检查是否需要重新创建标签
-              const existingLabel = this.sectorLabels.get(String(sector.id))
-              if (existingLabel) {
-                if (this.featureGroup && this.featureGroup.hasLayer(existingLabel)) {
-                  this.featureGroup.removeLayer(existingLabel)
-                }
-                this.sectorLabels.delete(String(sector.id))
-              }
-
-              // 添加标签到地图
-              tempLabel.addTo(this.featureGroup!)
-              this.sectorLabels.set(String(sector.id), tempLabel)
-              markOccupied(tempLabel.getLatLng())
-            } else {
-              // 重叠，隐藏标签
-              const existingLabel = this.sectorLabels.get(String(sector.id))
-              if (existingLabel) {
-                if (this.featureGroup && this.featureGroup.hasLayer(existingLabel)) {
-                  this.featureGroup.removeLayer(existingLabel)
-                }
-                this.sectorLabels.delete(String(sector.id))
-              }
-            }
-          } else {
-            // 超出限制的标签，清理已存在的
-            const label = this.sectorLabels.get(String(sector.id))
-            if (label && this.featureGroup && this.featureGroup.hasLayer(label)) {
-              this.featureGroup.removeLayer(label)
-            }
-            this.sectorLabels.delete(String(sector.id))
-          }
-        } else {
-          // 清理标签
-          const label = this.sectorLabels.get(String(sector.id))
-          if (label && this.featureGroup && this.featureGroup.hasLayer(label)) {
-            this.featureGroup.removeLayer(label)
-          }
-          this.sectorLabels.delete(String(sector.id))
-        }
       }
     }
+
+    // 标签：注册候选到共享标签布局引擎，由引擎按屏幕空间统一防重叠
+    this._syncLabelCandidates(sectorsToRender)
 
     for (const [sectorId, cached] of this.sectorPolygons) {
       const sector = (cached.polygon as any).sectorData as RenderSectorData
@@ -2481,16 +2811,6 @@ export class SectorSVGLayer extends L.Layer {
           this.featureGroup.removeLayer(cached.polygon)
         }
         this.sectorPolygons.delete(sectorId)
-      }
-    }
-
-    // 清理不再需要显示的标签（针对那些不可见的扇区）
-    for (const [sectorId, label] of this.sectorLabels) {
-      if (!currentVisibleIds.has(sectorId)) {
-        if (this.featureGroup && this.featureGroup.hasLayer(label)) {
-          this.featureGroup.removeLayer(label)
-        }
-        this.sectorLabels.delete(sectorId)
       }
     }
   }
@@ -2512,132 +2832,6 @@ export class SectorSVGLayer extends L.Layer {
       groups.get(key)!.push(sector)
     }
     return groups
-  }
-
-  /**
-   * 获取当前zoom级别下每个位置最多显示的标签数
-   * 优化策略：更激进的标签显示，避免重叠
-   * 当zoom < 14: 只显示1个标签
-   * zoom 14-15: 显示2个标签
-   * zoom 16-17: 显示3个标签
-   * zoom 18-19: 显示5个标签
-   * zoom >= 20: 显示8个标签（仍然控制上限，避免过于密集）
-   */
-  private _getMaxLabelsPerLocation(): number {
-    const zoom = this.currentZoom
-
-    if (zoom < 14) return 1      // 低zoom：只显示1个
-    if (zoom < 16) return 2      // 中低zoom：显示2个
-    if (zoom < 18) return 3      // 中zoom：显示3个
-    if (zoom < 20) return 5      // 中高zoom：显示5个
-    return 8                     // 高zoom：最多显示8个，仍然控制上限
-  }
-
-  /**
-   * 检测标签是否与已显示的标签重叠
-   * @param labelPos 标签位置
-   * @param occupiedPositions 已占用的标签位置集合
-   * @param minDistance 最小间距（像素）
-   * @returns 是否重叠
-   */
-  private _isLabelOverlapping(
-    labelPos: L.LatLng,
-    occupiedPositions: L.LatLng[],
-    minDistance: number
-  ): boolean {
-    if (!this.mapInstance) return false
-
-    for (const occupiedPos of occupiedPositions) {
-      // 将LatLng转换为屏幕像素坐标
-      const labelPoint = this.mapInstance.latLngToContainerPoint(labelPos)
-      const occupiedPoint = this.mapInstance.latLngToContainerPoint(occupiedPos)
-
-      // 计算两点之间的像素距离
-      const distance = Math.sqrt(
-        Math.pow(labelPoint.x - occupiedPoint.x, 2) +
-        Math.pow(labelPoint.y - occupiedPoint.y, 2)
-      )
-
-      if (distance < minDistance) {
-        return true  // 重叠
-      }
-    }
-
-    return false  // 不重叠
-  }
-
-  /**
-   * 创建扇区标签
-   * @param sector 扇区数据
-   * @param index 同一位置的扇区索引
-   * @param totalSectors 同一位置的总扇区数
-   * @param isAggregated 是否是聚合标签（低zoom模式）
-   */
-  private _createSectorLabel(sector: RenderSectorData, index: number, totalSectors: number, isAggregated: boolean = false): L.Marker {
-    // 获取标签内容
-    let content = ''
-    if (this.pciHighlightConfig && this.renderMode === 'pci-planning') {
-      // PCI模式：显示 小区名称 + PCI（优先使用规划后的PCI）
-      content = `${sector.name || ''} (PCI: ${this._getLabelContent(sector, 'pci') || '-'})`
-    } else {
-      // 默认模式：根据配置获取
-      // 如果是聚合标签(isAggregated=true)，优先显示站点名称
-      if (isAggregated) {
-        // 尝试获取站点名称，如果没有则回退到配置内容
-        // 通常站点名称在 sector.siteName 或者 sector.name 中包含
-        // 这里简单使用配置内容，但在样式上可能有所不同
-        content = this._getLabelContent(sector, this.labelConfig.content)
-        // 如果配置是显示小区名，但在聚合模式下可能想显示基站名？
-        // 暂时保持一致，用户配置什么显示什么
-      } else {
-        content = this._getLabelContent(sector, this.labelConfig.content)
-      }
-    }
-
-    // 计算标签位置 - 扇区中间对齐
-    // 标签位于扇区中心（基站位置），通过CSS居中对齐
-    const centerLatLng = L.latLng(sector.displayLat, sector.displayLng)
-    const labelPos = centerLatLng
-
-    // 创建标签图标
-    const textColor = this.labelConfig.color || '#000000'
-    const fontSize = this.labelConfig.fontSize || 12
-
-    // Leaflet 定位逻辑：
-    // - iconAnchor 是图标上与地图位置对齐的点
-    // - 设置 iconAnchor 为图标中心，使标签中点与基站中心重合
-    // - 由于文字宽度动态变化，使用一个足够大的固定尺寸，通过 CSS 居中
-
-    const html = `
-      <div style="
-        font-size: ${fontSize}px;
-        color: ${textColor};
-        font-weight: 500;
-        white-space: nowrap;
-        background-color: transparent;
-        padding: 0;
-        margin: 0;
-        margin-top: -20px;
-        pointer-events: none;
-        position: absolute;
-        left: 50%;
-        top: 50%;
-        transform: translate(-50%, -50%);
-      ">${content}</div>
-    `
-
-    const icon = L.divIcon({
-      html: html,
-      className: 'sector-label-centered',
-      iconSize: [200, 20],     // 足够大的容器，容纳各种长度的文字
-      iconAnchor: [100, 10]    // 容器中心点：(200/2, 20/2)
-    })
-
-    return L.marker(labelPos, {
-      icon: icon,
-      interactive: false,
-      zIndexOffset: 1000 // 确保标签在顶层
-    })
   }
 
   /**
@@ -2767,49 +2961,52 @@ export class SectorSVGLayer extends L.Layer {
 
       if (isSelected) {
         // 选中扇区：红色高亮
-        const colors = getSectorColor(sector)
-        fillColor = colors.fillColor
+        fillColor = '#ff4444'
         strokeColor = '#ff0000'
         strokeWidth = 4
         fillOpacity = 0.6
-        fillColor = '#ff4444'
       } else {
         // 默认模式：彩色（基于频点或网络类型）
-        const colors = getSectorColor(sector)
-        const config = SECTOR_CONFIG[sector.networkType]
-        fillColor = colors.fillColor
-        strokeColor = config.strokeColor || '#000000'
-        strokeWidth = config.strokeWidth || 0.5
-        fillOpacity = config.opacity
+        const base = this._sectorBaseStyle(sector)
+        fillColor = base.fillColor
+        strokeColor = base.strokeColor
+        strokeWidth = base.strokeWidth
+        fillOpacity = base.fillOpacity
       }
     } else {
       // 默认模式：彩色（基于频点或网络类型）
-      const colors = getSectorColor(sector)
-      const config = SECTOR_CONFIG[sector.networkType]
-      fillColor = colors.fillColor
-      strokeColor = config.strokeColor || '#000000'
-      strokeWidth = config.strokeWidth || 0.5
-      fillOpacity = config.opacity
+      const base = this._sectorBaseStyle(sector)
+      fillColor = base.fillColor
+      strokeColor = base.strokeColor
+      strokeWidth = base.strokeWidth
+      fillOpacity = base.fillOpacity
     }
 
     // 获取当前缩放级别用于动态调整渲染质量
     const currentZoom = this.mapInstance ? this.mapInstance.getZoom() : 12
 
+    // 选中红框扇区在高缩放级别也保持粗红边，不被压缩为 0.3px（否则圈选/搜索高亮几乎不可见）
+    const isSelHL = !!(this.selectionHighlightIds && this.selectionHighlightIds.size > 0 && (
+      this.selectionHighlightIds.has(String(sector.id)) ||
+      (sector.siteId && sector.sectorId && this.selectionHighlightIds.has(`${sector.siteId}_${sector.sectorId}`)) ||
+      (sector.name && this.selectionHighlightIds.has(sector.name))
+    ))
+
     // 创建多边形 - PCI模式下禁用平滑处理以提升性能
     const polygon = L.polygon(latLngs, {
       color: strokeColor,
-      weight: currentZoom >= 17 ? 0.3 : strokeWidth,
+      weight: (currentZoom >= 17 && !isSelHL) ? 0.3 : strokeWidth,
       opacity: 1,
       fillColor: fillColor,
       fillOpacity: fillOpacity,
-      className: this.measureMode ? 'sector-polygon sector-polygon-measure' : 'sector-polygon',
+      className: this.pathClassName(this.measureMode ? 'sector-polygon sector-polygon-measure' : 'sector-polygon'),
       smoothFactor: this.renderMode === 'pci-planning' ? 0 : (currentZoom >= 17 ? 0.5 : 0.1),
       noClip: this.renderMode !== 'pci-planning'  // PCI模式启用裁剪以提升性能
     })
 
     // 设置交互样式
     polygon.setStyle({
-      className: this.measureMode ? 'sector-polygon sector-polygon-measure' : 'sector-polygon'
+      className: this.pathClassName(this.measureMode ? 'sector-polygon sector-polygon-measure' : 'sector-polygon')
     })
 
     // 绑定点击事件 - 测距模式或框选模式下禁用
@@ -2819,6 +3016,8 @@ export class SectorSVGLayer extends L.Layer {
         L.DomEvent.stopPropagation(e)
         return
       }
+      // 图层编辑会话：放行点击（不拦截），让地图 click 供编辑会话使用
+      if (this.editSessionMode) return
       // 点选模式下允许点击事件，通过 onClick 回调处理
       L.DomEvent.stopPropagation(e)
       e.originalEvent.preventDefault()

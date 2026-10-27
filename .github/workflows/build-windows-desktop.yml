@@ -1,0 +1,195 @@
+name: Build Windows Desktop
+
+# 触发：
+# - 手动 workflow_dispatch
+# - 分支推送（快速迭代反馈）
+# - tag desktop-v* （走发行流程：编译安装器并创建 Release）
+on:
+  workflow_dispatch:
+  push:
+    branches: [feat/windows-desktop]
+    tags: ["desktop-v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    # 自托管 Windows Runner 上线后，在仓库 Variables 设置 NPT_WINDOWS_RUNNER=npt-windows-builder；
+    # 未设置时保持 GitHub 托管 windows-latest（托管 runner 受账户 Actions 配额限制）。
+    runs-on: ${{ vars.NPT_WINDOWS_RUNNER || 'windows-latest' }}
+    env:
+      # CI 阶段保留控制台输出便于诊断（冒烟自检可见）；tag 发行会用 NPT_CONSOLE=0 重新打包，
+      # 保证装到用户机器上的 NPT.exe 不带终端窗口
+      NPT_CONSOLE: "1"
+      # Windows 管道输出默认 cp1252，统一 UTF-8 避免中文 print 崩溃
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: utf-8
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: 构建前端
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build:vite
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            backend/requirements.txt
+            desktop/requirements-desktop.txt
+
+      - name: 安装 Python 依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r backend/requirements.txt -r desktop/requirements-desktop.txt
+
+      - name: 生成桌面图标（app.ico，构建期产物）
+        run: python desktop/tools/make_icon.py
+
+      - name: 计算版本号
+        shell: pwsh
+        run: |
+          if ("${{ github.ref }}" -like "refs/tags/desktop-v*") {
+            $v = "${{ github.ref_name }}".Replace("desktop-v", "")
+          } else {
+            # dev 版本带短 SHA，便于对照 Actions 页面与问题排查
+            $v = "0.0.0-dev-" + $env:GITHUB_SHA.Substring(0, 7)
+          }
+          "NPT_DESKTOP_VERSION=$v" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "桌面版版本号: $v"
+
+      - name: 写入版本文件（随包分发，供客户端 OTA 比对）
+        shell: pwsh
+        run: |
+          $info = @{
+            version  = $env:NPT_DESKTOP_VERSION
+            channel  = "stable"
+            commit   = "${{ github.sha }}"
+            built_at = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+          } | ConvertTo-Json
+          $info | Out-File -FilePath desktop/version.json -Encoding utf8
+          Get-Content desktop/version.json
+
+      - name: 关键单元测试
+        working-directory: backend
+        run: >-
+          python -m pytest tests/test_desktop_license.py tests/test_desktop_license_cloud.py
+          tests/test_desktop_local_endpoints.py tests/test_desktop_releases.py
+          tests/test_desktop_update_client.py tests/test_desktop_shared_tasks.py
+          tests/test_desktop_sync_state.py tests/test_desktop_sync_revision.py
+          tests/test_desktop_window_fullscreen.py
+          tests/test_update_parameters_guardrails.py tests/test_console_encoding.py
+          tests/test_data_group_scope.py -q
+
+      - name: GDAL 栈基线检查（源码环境）
+        run: python desktop/tools/spike.py
+
+      - name: PyInstaller 打包
+        run: pyinstaller --noconfirm --clean desktop/desktop.spec
+
+      - name: 冻结包自检（后端 + GDAL + SPA + WebView2 后端）
+        shell: pwsh
+        run: |
+          & "dist/NetworkPlanningTool/NPT.exe" --selftest
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "== selftest 失败，输出 desktop.log 末尾 =="
+            $logDir = Join-Path $env:APPDATA "NetworkPlanningTool\logs"
+            if (Test-Path $logDir) {
+              Get-ChildItem $logDir -File | ForEach-Object { Get-Content $_.FullName -Tail 200 }
+            }
+            exit $LASTEXITCODE
+          }
+
+      - name: 校验打包产物关键文件
+        shell: pwsh
+        run: |
+          $internal = "dist/NetworkPlanningTool/_internal"
+          $fail = $false
+          foreach ($name in @("gdal*.dll", "proj*.dll", "WebView2Loader.dll", "proj.db")) {
+            $hit = Get-ChildItem -Path $internal -Recurse -File -Filter $name -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($hit) { Write-Host "OK   $name -> $($hit.FullName)" } else { Write-Host "MISS $name"; $fail = $true }
+          }
+          if (-not (Test-Path "$internal/frontend/dist-renderer/index.html")) {
+            Write-Host "MISS frontend/dist-renderer/index.html"; $fail = $true
+          }
+          $size = (Get-ChildItem "dist/NetworkPlanningTool" -Recurse -File | Measure-Object -Property Length -Sum).Sum / 1MB
+          Write-Host ("打包体积: {0:N1} MB" -f $size)
+          if ($fail) { exit 1 }
+
+      - name: 重新打包发行版（无控制台窗口）
+        if: startsWith(github.ref, 'refs/tags/desktop-v')
+        env:
+          NPT_CONSOLE: "0"
+        run: pyinstaller --noconfirm --clean desktop/desktop.spec
+
+      - name: 下载 WebView2 引导安装器（随安装包分发，供离线机器使用）
+        shell: pwsh
+        run: |
+          # 微软 CDN 偶发中断（ResponseEnded）会让整个构建失败，这里自建重试兜底
+          New-Item -ItemType Directory -Force -Path desktop/webview2 | Out-Null
+          $url = "https://go.microsoft.com/fwlink/?linkid=2124701"
+          $out = "desktop/webview2/MicrosoftEdgeWebview2Setup.exe"
+          $ok = $false
+          for ($i = 1; $i -le 5; $i++) {
+            try {
+              Write-Host "尝试 $i 次下载 WebView2 安装器..."
+              Invoke-WebRequest -Uri $url -OutFile $out -MaximumRetryCount 3 -RetryIntervalSec 5
+              $size = (Get-Item $out).Length / 1MB
+              if ($size -ge 50) { $ok = $true; break }
+              Write-Host ("体积异常: {0:N1} MB，稍后重试" -f $size)
+            } catch {
+              Write-Host "下载失败：$($_.Exception.Message)"
+            }
+            Start-Sleep -Seconds 5
+          }
+          if (-not $ok) { Write-Error "WebView2 安装器下载失败（已重试 5 次）"; exit 1 }
+          $size = (Get-Item $out).Length / 1MB
+          Write-Host ("WebView2 安装器: {0:N1} MB" -f $size)
+
+      - name: 生成安装器（Inno Setup）
+        shell: pwsh
+        run: |
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            Write-Host "未找到 Inno Setup，尝试通过 Chocolatey 安装..."
+            choco install innosetup -y --no-progress
+          }
+          & $iscc "/DMyAppVersion=$env:NPT_DESKTOP_VERSION" "desktop\installer.iss"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-ChildItem installer-out | Format-Table Name, Length
+
+      # artifact 只是给开发者便捷下载的通道，且受仓库存储配额限制（超额会直接失败）。
+      # 分支迭代与 tag 发行都不需要它：tag 的安装包走 Release（不占 Actions 存储），
+      # 分支要产物时手动 workflow_dispatch 触发一次即可，避免每次推送白烧 450MB、
+      # 也不用在配额异常时对着满屏红色误判"构建失败"。
+      - uses: actions/upload-artifact@v7
+        if: github.event_name == 'workflow_dispatch'
+        with:
+          name: NPT-Windows-desktop-dev
+          path: dist/NetworkPlanningTool/
+          retention-days: 14
+
+      - uses: actions/upload-artifact@v7
+        if: github.event_name == 'workflow_dispatch'
+        with:
+          name: NPT-Windows-installer
+          path: installer-out/NetOpt Engine_Setup-*.exe
+          retention-days: 30
+
+      - name: 发布 Release（tag desktop-v*）
+        if: startsWith(github.ref, 'refs/tags/desktop-v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: |
+          gh release create "${{ github.ref_name }}" (Get-ChildItem "installer-out/NetOpt Engine_Setup-*.exe" | ForEach-Object { $_.FullName }) --title "${{ github.ref_name }}" --generate-notes --verify-tag

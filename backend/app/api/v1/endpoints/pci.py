@@ -8,7 +8,7 @@ import shutil
 import re
 import asyncio
 from datetime import datetime
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Request
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Request, Query
 from pydantic import ValidationError
 from typing import Dict, Any, Optional
 from app.models.schemas import PCIConfig, PCIResult, NetworkType
@@ -16,6 +16,7 @@ from app.services.task_manager import task_manager
 from app.services.data_service import data_service
 from app.core.config import settings
 from app.core.security import get_current_user
+from app.core.data_access import require_task_access, ensure_task_access
 
 router = APIRouter()
 
@@ -71,10 +72,10 @@ async def start_pci_planning(
 
 
 @router.get("/progress/{task_id}", response_model=Dict[str, Any])
-async def get_pci_progress(task_id: str) -> Dict[str, Any]:
-    """获取PCI规划进度"""
+async def get_pci_progress(task_id: str, _group=Depends(require_task_access)) -> Dict[str, Any]:
+    """获取PCI规划进度（只返回状态/统计）"""
     try:
-        progress = task_manager.get_task_progress(task_id)
+        progress = task_manager.get_task_progress_meta(task_id)
         if progress is None:
             raise HTTPException(status_code=404, detail="任务不存在")
         return {"success": True, "data": progress}
@@ -85,10 +86,12 @@ async def get_pci_progress(task_id: str) -> Dict[str, Any]:
 
 
 @router.get("/result/{task_id}", response_model=Dict[str, Any])
-async def get_pci_result(task_id: str) -> Dict[str, Any]:
+async def get_pci_result(task_id: str, _group=Depends(require_task_access)) -> Dict[str, Any]:
     """获取PCI规划结果"""
     try:
-        result = task_manager.get_task_result(task_id)
+        from starlette.concurrency import run_in_threadpool
+
+        result = await run_in_threadpool(task_manager.get_task_result, task_id)
         if result is None:
             raise HTTPException(status_code=404, detail="任务不存在")
         return {"success": True, "data": result}
@@ -99,12 +102,13 @@ async def get_pci_result(task_id: str) -> Dict[str, Any]:
 
 
 @router.get("/export/{task_id}")
-async def export_pci_result(task_id: str, format: str = "xlsx"):
+async def export_pci_result(task_id: str, format: str = "xlsx", _group=Depends(require_task_access)):
     """导出PCI规划结果"""
     from fastapi.responses import FileResponse
+    from starlette.concurrency import run_in_threadpool
 
-    # 检查任务是否存在
-    task_data = task_manager.get_task_progress(task_id)
+    # 检查任务是否存在（只取元数据，避免为状态判断加载完整结果）
+    task_data = task_manager.get_task_progress_meta(task_id)
     if task_data is None:
         raise HTTPException(status_code=404, detail="任务不存在")
 
@@ -113,7 +117,7 @@ async def export_pci_result(task_id: str, format: str = "xlsx"):
         raise HTTPException(status_code=400, detail=f"任务未完成（当前状态: {task_data.get('status', '未知')}）")
 
     # 执行导出
-    file_path = task_manager.export_result(task_id, format)
+    file_path = await run_in_threadpool(task_manager.export_result, task_id, format)
     if file_path is None:
         raise HTTPException(status_code=500, detail="导出失败，请查看后端日志获取详细信息")
 
@@ -124,7 +128,7 @@ async def export_pci_result(task_id: str, format: str = "xlsx"):
 
 
 @router.delete("/task/{task_id}", response_model=Dict[str, Any])
-async def cancel_pci_task(task_id: str) -> Dict[str, Any]:
+async def cancel_pci_task(task_id: str, _group=Depends(require_task_access)) -> Dict[str, Any]:
     """取消PCI规划任务"""
     try:
         result = task_manager.cancel_task(task_id)
@@ -134,7 +138,7 @@ async def cancel_pci_task(task_id: str) -> Dict[str, Any]:
 
 
 @router.post("/apply-to-params/{task_id}", response_model=Dict[str, Any])
-async def apply_pci_to_params(task_id: str) -> Dict[str, Any]:
+async def apply_pci_to_params(task_id: str, _group=Depends(require_task_access)) -> Dict[str, Any]:
     """
     将PCI规划结果应用到全量工参
 
@@ -177,7 +181,7 @@ async def apply_pci_to_params(task_id: str) -> Dict[str, Any]:
 
 
 @router.post("/apply-batch", response_model=Dict[str, Any])
-async def apply_pci_batch(request: Dict[str, Any]) -> Dict[str, Any]:
+async def apply_pci_batch(request: Dict[str, Any], current_user=Depends(get_current_user)) -> Dict[str, Any]:
     """
     批量将多个PCI规划结果应用到全量工参
 
@@ -188,6 +192,9 @@ async def apply_pci_batch(request: Dict[str, Any]) -> Dict[str, Any]:
         task_ids = request.get("taskIds", [])
         if not task_ids or not isinstance(task_ids, list):
             raise HTTPException(status_code=400, detail="请提供有效的taskIds列表")
+        # 跨组隔离：仅允许应用本组任务
+        for _tid in task_ids:
+            ensure_task_access(_tid, current_user)
 
         apply_task_id = await task_manager.create_apply_pci_batch_task(task_ids)
 
@@ -224,7 +231,7 @@ async def apply_pci_batch(request: Dict[str, Any]) -> Dict[str, Any]:
 
 
 @router.get("/apply-to-params/progress/{apply_task_id}", response_model=Dict[str, Any])
-async def get_apply_pci_progress(apply_task_id: str) -> Dict[str, Any]:
+async def get_apply_pci_progress(apply_task_id: str, _group=Depends(require_task_access)) -> Dict[str, Any]:
     """获取PCI应用到工参任务进度"""
     try:
         progress = task_manager.get_task_progress(apply_task_id)
@@ -238,17 +245,21 @@ async def get_apply_pci_progress(apply_task_id: str) -> Dict[str, Any]:
 
 
 @router.get("/history", response_model=Dict[str, Any])
-async def get_pci_history() -> Dict[str, Any]:
-    """获取所有用户的 PCI 规划历史任务列表"""
+async def get_pci_history(
+    page: int = Query(1, ge=1, description="页码（从 1 开始）"),
+    page_size: int = Query(20, ge=1, le=100, description="每页条数"),
+    current_user=Depends(get_current_user),
+) -> Dict[str, Any]:
+    """获取 PCI 规划历史任务列表（分页，按地市+运营商组隔离）"""
     try:
-        results = task_manager.list_task_history(task_type="pci")
+        results = task_manager.list_task_history(task_type="pci", page=page, page_size=page_size, user=current_user)
         return {"success": True, "data": results}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.delete("/history/{task_id}", response_model=Dict[str, Any])
-async def delete_pci_history(task_id: str) -> Dict[str, Any]:
+async def delete_pci_history(task_id: str, _group=Depends(require_task_access)) -> Dict[str, Any]:
     """删除指定的 PCI 规划历史任务"""
     try:
         success = task_manager.delete_task(task_id)
@@ -263,7 +274,7 @@ async def delete_pci_history(task_id: str) -> Dict[str, Any]:
 
 
 @router.get("/apply-to-params/result/{apply_task_id}", response_model=Dict[str, Any])
-async def get_apply_pci_result(apply_task_id: str) -> Dict[str, Any]:
+async def get_apply_pci_result(apply_task_id: str, _group=Depends(require_task_access)) -> Dict[str, Any]:
     """获取PCI应用到工参结果"""
     try:
         result = task_manager.get_task_result(apply_task_id)
@@ -277,7 +288,7 @@ async def get_apply_pci_result(apply_task_id: str) -> Dict[str, Any]:
 
 
 @router.post("/history/{task_id}/mark-applied", response_model=Dict[str, Any])
-async def mark_pci_task_applied(task_id: str) -> Dict[str, Any]:
+async def mark_pci_task_applied(task_id: str, _group=Depends(require_task_access)) -> Dict[str, Any]:
     """标记PCI规划任务为已应用（跨用户共享），同时清除地图缓存"""
     try:
         success = task_manager.mark_task_applied(task_id)
@@ -286,8 +297,7 @@ async def mark_pci_task_applied(task_id: str) -> Dict[str, Any]:
         # 清除后端地图缓存，使扇区属性更新生效
         try:
             import app.api.v1.endpoints.map as map_module
-            map_module._map_data_cache = None
-            map_module._map_data_cache_time = 0
+            map_module.invalidate_map_data_cache()
         except Exception:
             pass
         from app.services.mapinfo_service import clear_layer_cache

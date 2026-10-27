@@ -1,0 +1,11 @@
+[Unit]
+Description=NPT disk cleanup (safe caches + old desktop releases)
+After=network.target
+
+[Service]
+Type=oneshot
+User=pwc
+WorkingDirectory=/home/pwc/NetworkPlanningTooV3
+ExecStart=/home/pwc/NetworkPlanningTooV3/backend/.venv/bin/python3 scripts/npt_disk_cleanup.py --apply --releases --keep-releases 3 --apks --keep-apks 2 --dev
+Nice=10
+IOSchedulingClass=idle

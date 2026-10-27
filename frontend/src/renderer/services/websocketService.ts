@@ -4,11 +4,14 @@
  */
 
 interface WebSocketMessage {
-  type: 'progress' | 'complete' | 'failed' | 'pong' | 'task_deleted'
+  type: 'progress' | 'complete' | 'failed' | 'pong' | 'task_deleted' | 'data_changed' | 'tasks_changed' | 'auth_ok'
   taskId: string
   data?: any
   timestamp?: number
 }
+
+/** 同组共享任务历史变化（新增/删除/应用标记）→ 历史列表重载（窗口事件） */
+export const TASKS_CHANGED_EVENT = 'npt:tasks-changed'
 
 interface SubscribeCallback {
   (message: WebSocketMessage): void
@@ -27,6 +30,8 @@ class WebSocketService {
   private heartbeatInterval: NodeJS.Timeout | null = null
   private isConnecting = false
   private usePollingFallback = false
+  /** 登录 JWT：服务器据此把连接归入（地市+运营商）组，仅向同组推送数据变更 */
+  private authToken: string | null = null
 
   // WebSocket服务器地址（通过Vite代理）
   // 使用相对路径，让Vite代理自动处理协议转换
@@ -81,7 +86,9 @@ class WebSocketService {
         // 开发环境使用Vite代理，生产环境使用实际路径
         const isDev = import.meta.env.DEV
         const host = isDev ? window.location.host : window.location.host
-        const wsUrl = `${protocol}//${host}${this.WS_URL}`
+        // 带上登录 JWT：服务器据此登记数据组，仅向同组连接推送 data_changed
+        const token = this.currentToken()
+        const wsUrl = `${protocol}//${host}${this.WS_URL}${token ? `?token=${encodeURIComponent(token)}` : ''}`
 
         console.log(`[WebSocketService] WebSocket URL: ${wsUrl}`)
 
@@ -150,6 +157,79 @@ class WebSocketService {
     this.subscriptions.clear()
     this.reconnectAttempts = 0
     this.isConnecting = false
+  }
+
+  /**
+   * 读取当前登录 JWT（优先用显式传入的，其次从持久化登录态里取）。
+   * 不经过 store，避免连接建立早于 store 初始化。
+   */
+  private currentToken(): string | null {
+    if (this.authToken) return this.authToken
+    try {
+      const raw = localStorage.getItem('auth-storage')
+      if (!raw) return null
+      const parsed = JSON.parse(raw)
+      const token = parsed?.state?.token
+      return typeof token === 'string' && token ? token : null
+    } catch {
+      return null
+    }
+  }
+
+  /**
+   * 登录后补鉴权：服务器据此把连接归入数据组，仅接收同组的数据变更推送。
+   * 已连接则原地发送 auth 消息，未连接则带 token 重连。
+   */
+  authenticate(token: string | null): void {
+    if (!token) return
+    if (token === this.authToken) return
+    this.authToken = token
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.sendMessage({ type: 'auth', token })
+    } else {
+      this.disconnect()
+      void this.connect()
+    }
+    this.startRevisionFallback()
+  }
+
+  /**
+   * 修订号兜底轮询（网页端专用，60s 一次）。
+   *
+   * data_changed 即时推送依赖 WebSocket 存活：浏览器对后台 tab 的节流/网络抖动
+   * 会断开 WS，断开期间桌面端上行的变更事件不会补发——桌面端有长轮询+定时同步
+   * 兜底，网页端此前没有，表现为"桌面端编辑后网页端地图一直不刷新"。
+   * 这里定期比对数据集修订号快照，有变化即补触发整表刷新（与 data_changed 同一动作）。
+   * 首次快照只建立基线不触发刷新。
+   */
+  private revisionSnapshot: Record<string, number> | null = null
+  private revisionTimer: number | null = null
+
+  startRevisionFallback(): void {
+    if (this.revisionTimer !== null) return
+    const poll = async () => {
+      try {
+        const { dataApi } = await import('./api')
+        const res: any = await dataApi.revisions()
+        const next: Record<string, number> = res?.data?.revisions || {}
+        const prev = this.revisionSnapshot
+        this.revisionSnapshot = next
+        if (!prev) return // 首次：建立基线
+        let changed = false
+        const ids = new Set([...Object.keys(prev), ...Object.keys(next)])
+        for (const id of ids) {
+          if ((prev[id] ?? 0) !== (next[id] ?? 0)) { changed = true; break }
+        }
+        if (changed) {
+          const { triggerDataRefresh } = await import('../store/dataStore')
+          triggerDataRefresh('full')
+        }
+      } catch {
+        // 未登录/桌面端无此接口/网络失败：静默下轮再试
+      }
+    }
+    void poll()
+    this.revisionTimer = window.setInterval(poll, 60_000)
   }
 
   /**
@@ -232,6 +312,24 @@ class WebSocketService {
           console.error('[WebSocketService] 全局回调执行失败:', error)
         }
       })
+      return
+    }
+
+    // 同组数据变更（其他端写入服务器）：刷新数据列表并清小区列表缓存，
+    // 网页端无需手动刷新即可看到桌面端/同组用户的改动
+    if (type === 'data_changed') {
+      import('../store/dataStore').then(({ triggerDataRefresh }) => {
+        triggerDataRefresh('full')
+      }).catch(() => {
+        // 数据刷新模块不可用（降级场景）：忽略
+      })
+      return
+    }
+
+    // 同组共享任务历史变化（新增/删除/应用标记，不影响工参数据集）：
+    // 只让历史列表重载，不触发整表刷新
+    if (type === 'tasks_changed') {
+      window.dispatchEvent(new CustomEvent(TASKS_CHANGED_EVENT, { detail: message.data || {} }))
       return
     }
 
