@@ -11,10 +11,7 @@ import {
   LogOut,
   ChevronRight,
   Package,
-  Smartphone,
   Download,
-  X,
-  Loader2,
   Wrench,
   Bot,
   MonitorDown,
@@ -23,7 +20,7 @@ import {
   Moon,
   Boxes,
 } from 'lucide-react'
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useLayoutEffect, useRef } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useAuthStore } from '../../store/authStore'
 import { useThemeStore } from '../../store/themeStore'
@@ -34,7 +31,7 @@ import { DesktopUpdateReadyDialog } from '../DesktopUpdateReadyDialog'
 import { DesktopSyncIndicator } from '../DesktopSyncIndicator'
 import { useDesktopStatusLabel } from '../desktopStatusLabel'
 import { DesktopSessionGuard } from '../DesktopSessionGuard'
-import { appVersionsApi, desktopCloudApi, desktopReleasesApi } from '../../services/api'
+import { AppDownloadDialog } from '../AppDownloadDialog'
 import { prefetchPage } from '../../pageLoaders'
 
 // ===== APP 悬浮图标：可拖拽移动、松手吸附最近左右边缘，位置按登录用户持久化 =====
@@ -76,9 +73,23 @@ type NavLink = { type: 'link'; name: string; href: string; icon?: LucideIcon }
 type NavGroup = { type: 'group'; name: string; icon: LucideIcon; children: NavLink[] }
 type NavItem = NavLink | NavGroup
 
+// --- 展开态侧栏宽度自适应：以当前语言的最长标签为准 ---
+const SIDEBAR_COLLAPSED_WIDTH = 42
+const SIDEBAR_MIN_WIDTH = 180
+const SIDEBAR_MAX_WIDTH = 320
+// 行内文本可用宽度的占位：左右内边距 6+6 + 图标 24 + 间距 8（子项缩进 38 与图标位等宽）
+const ROW_LABEL_OFFSET = 6 + 24 + 8 + 6
+// 分组行额外的展开箭头占位：间距 8 + 图标 14
+const GROUP_ARROW_OFFSET = 8 + 14
+// 导航区滚动条宽度（index.css 中 ::-webkit-scrollbar 为 8px），出现时会挤占标签宽度
+const NAV_SCROLLBAR_WIDTH = 8
+const MEASURE_LABEL_STYLE: React.CSSProperties = { display: 'inline-block' }
+
 export function MainLayout({ children }: { children: React.ReactNode }) {
-  const { t } = useTranslation()
+  const { t, i18n } = useTranslation()
   const [sidebarOpen, setSidebarOpen] = useState(true)
+  const [sidebarWidth, setSidebarWidth] = useState(SIDEBAR_MIN_WIDTH)
+  const navMeasureRef = useRef<HTMLDivElement>(null)
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set())
   // 用户手动收起的分组（即使子项被选中也不自动展开）；路由切换时清空
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set())
@@ -153,6 +164,24 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
     ] : []),
   ]
 
+  // 语言或权限变化导致标签内容变化后，重新测量最宽标签并调整展开态侧栏宽度
+  useLayoutEffect(() => {
+    const root = navMeasureRef.current
+    if (!root) return
+    const maxLabelWidth = (kind: 'link' | 'group') => {
+      let max = 0
+      root.querySelectorAll<HTMLElement>(`[data-measure="${kind}"]`).forEach((el) => {
+        max = Math.max(max, el.getBoundingClientRect().width)
+      })
+      return max
+    }
+    const required = Math.max(
+      ROW_LABEL_OFFSET + maxLabelWidth('link'),
+      ROW_LABEL_OFFSET + GROUP_ARROW_OFFSET + maxLabelWidth('group'),
+    ) + NAV_SCROLLBAR_WIDTH
+    setSidebarWidth(Math.min(SIDEBAR_MAX_WIDTH, Math.max(SIDEBAR_MIN_WIDTH, Math.ceil(required))))
+  }, [i18n.language, isAuthenticated, user?.is_admin, user?.can_assistant, desktopMode])
+
   /** 判断分组是否展开：用户手动收起则收起；否则当前路径匹配子项或手动展开时展开 */
   const isGroupExpanded = (group: NavGroup) => {
     // 用户手动收起的分组优先（即使子项被选中也保持收起）
@@ -211,54 +240,8 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
     setExpandedGroups(nextExpanded)
   }
 
-  // ===== 应用下载弹窗（手机APP / 电脑端） =====
+  // ===== 应用下载弹窗（手机APP / 电脑端）：内容与数据加载在 AppDownloadDialog，网页端悬浮图标打开 =====
   const [showAppDownload, setShowAppDownload] = useState(false)
-  // 桌面端形态本身就是电脑端，不提供「电脑端」下载栏
-  const [appTab, setAppTab] = useState<'mobile' | 'desktop'>('mobile')
-  const [latestVersion, setLatestVersion] = useState<any>(null)
-  const [versionLoading, setVersionLoading] = useState(false)
-  // 电脑端：桌面版安装包分发（公开接口取最新版本，点击后交给浏览器下载）
-  const [desktopRelease, setDesktopRelease] = useState<any>(null)
-  const [desktopVersionLoading, setDesktopVersionLoading] = useState(false)
-
-  // 打开弹窗时回到「手机APP」栏（原有下载方式不变）
-  useEffect(() => {
-    if (showAppDownload) setAppTab('mobile')
-  }, [showAppDownload])
-
-  useEffect(() => {
-    if (!showAppDownload) return
-    setVersionLoading(true)
-    // 桌面端不分发 APK：取服务器最新版本（本机接口会拼出可扫码的绝对下载地址）
-    const loader = desktopMode ? desktopCloudApi.appVersion() : appVersionsApi.getLatest()
-    loader
-      .then((res: any) => {
-        if (res?.success && res?.data) setLatestVersion(res.data)
-        else setLatestVersion(null)
-      })
-      .catch(() => setLatestVersion(null))
-      .finally(() => setVersionLoading(false))
-  }, [showAppDownload, desktopMode])
-
-  // 电脑端版本：切换/打开该栏时按需拉取（取桌面版分发里发布的安装包）
-  useEffect(() => {
-    if (!showAppDownload || appTab !== 'desktop' || desktopMode) return
-    setDesktopVersionLoading(true)
-    desktopReleasesApi
-      .latestPublic()
-      .then((res: any) => {
-        setDesktopRelease(res?.success && res?.data ? res.data : null)
-      })
-      .catch(() => setDesktopRelease(null))
-      .finally(() => setDesktopVersionLoading(false))
-  }, [showAppDownload, appTab, desktopMode])
-
-  const getFullDownloadUrl = (downloadUrl: string) => {
-    if (!downloadUrl) return ''
-    if (downloadUrl.startsWith('http')) return downloadUrl
-    const base = window.location.origin
-    return `${base}${downloadUrl}`
-  }
 
   // ===== APP 悬浮图标拖拽（点击不动 = 打开下载弹窗；拖动后吸附最近左右边缘并持久化） =====
   const [appIconPos, setAppIconPos] = useState(loadAppIconPos)
@@ -352,9 +335,9 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
   }, [location.pathname])
 
   return (
-    <div className="flex h-screen bg-background overflow-hidden">
-      {/* 侧边栏容器 - 包含侧边栏和控件 */}
-      <div className="relative">
+    <div className="flex h-full bg-background overflow-hidden">
+      {/* 侧边栏容器 - 包含侧边栏和控件（MapPage 全屏 CSS 用 data-app-sidebar 定位隐藏） */}
+      <div className="relative" data-app-sidebar>
         {/* 侧边栏 - 使用主题变量，跟随系统主题设置 */}
         <aside
           onClick={(e) => {
@@ -364,13 +347,40 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
             }
           }}
           style={{
-            width: sidebarOpen ? '180px' : '42px',
-            height: '100vh',
+            width: `${sidebarOpen ? sidebarWidth : SIDEBAR_COLLAPSED_WIDTH}px`,
+            height: '100%',
             transition: 'width 0.35s cubic-bezier(0.25, 0.1, 0.25, 1)',
             backgroundColor: 'hsl(var(--background))',
           }}
           className="border-r border-border/60 flex flex-col relative z-20"
         >
+          {/* 隐藏测量层：用当前语言的真实标签字体渲染文本，供侧栏宽度自适应取值 */}
+          <div
+            aria-hidden="true"
+            style={{
+              position: 'absolute',
+              inset: 0,
+              overflow: 'hidden',
+              visibility: 'hidden',
+              pointerEvents: 'none',
+            }}
+          >
+            <div ref={navMeasureRef} style={{ width: 'max-content', whiteSpace: 'nowrap' }}>
+              {navigation.flatMap((item) => (
+                item.type === 'group'
+                  ? [
+                      <span key={`measure-group-${item.name}`} data-measure="group" style={MEASURE_LABEL_STYLE}>{item.name}</span>,
+                      ...item.children.map((child) => (
+                        <span key={`measure-link-${child.href}`} data-measure="link" style={MEASURE_LABEL_STYLE}>{child.name}</span>
+                      )),
+                    ]
+                  : [
+                      <span key={`measure-link-${item.href}`} data-measure="link" style={MEASURE_LABEL_STYLE}>{item.name}</span>,
+                    ]
+              ))}
+            </div>
+          </div>
+
           {/* 应用名 + 运行模式/同步状态（桌面端常驻标注；网页端只显示应用名） */}
           <div className="flex-shrink-0 border-b border-border/60 py-3" style={{ paddingLeft: '6px', paddingRight: '6px' }}>
             <div className="flex items-center h-[30px]" style={{ gap: '8px' }}>
@@ -433,7 +443,7 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
                       <span
                         style={{
                           opacity: sidebarOpen ? 1 : 0,
-                          maxWidth: sidebarOpen ? '100px' : '0px',
+                          maxWidth: sidebarOpen ? `${sidebarWidth}px` : '0px',
                           transition: 'opacity 0.2s cubic-bezier(0.4, 0, 0.2, 1), max-width 0.3s cubic-bezier(0.4, 0, 0.2, 1)',
                           whiteSpace: 'nowrap',
                           overflow: 'hidden',
@@ -557,7 +567,7 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
                   <span
                     style={{
                       opacity: sidebarOpen ? 1 : 0,
-                      maxWidth: sidebarOpen ? '140px' : '0px',
+                      maxWidth: sidebarOpen ? `${sidebarWidth}px` : '0px',
                       transition: 'opacity 0.2s cubic-bezier(0.4, 0, 0.2, 1), max-width 0.3s cubic-bezier(0.4, 0, 0.2, 1)',
                       whiteSpace: 'nowrap',
                       overflow: 'hidden',
@@ -697,17 +707,20 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
         </aside>
       </div>
 
-      {/* 应用下载悬浮图标：可拖拽移动，默认吸附右侧中部，位置按用户持久化；点击打开下载弹窗 */}
-      <button
-        onPointerDown={onAppIconPointerDown}
-        onPointerMove={onAppIconPointerMove}
-        onPointerUp={onAppIconPointerUp}
-        className="fixed z-50 w-11 h-11 rounded-full bg-card border border-border shadow-lg flex items-center justify-center text-muted-foreground hover:text-foreground hover:bg-muted transition-colors touch-none select-none"
-        style={{ left: appIconPos.x, top: appIconPos.y, cursor: 'grab' }}
-        title={t('app.downloadTitle')}
-      >
-        <Download size={18} />
-      </button>
+      {/* 应用下载悬浮图标（仅网页端：桌面端入口已迁到自绘标题栏 WindowTitleBar）：
+          可拖拽移动，默认吸附右侧中部，位置按用户持久化；点击打开下载弹窗 */}
+      {!desktopMode && (
+        <button
+          onPointerDown={onAppIconPointerDown}
+          onPointerMove={onAppIconPointerMove}
+          onPointerUp={onAppIconPointerUp}
+          className="fixed z-50 w-11 h-11 rounded-full bg-card border border-border shadow-lg flex items-center justify-center text-muted-foreground hover:text-foreground hover:bg-muted transition-colors touch-none select-none"
+          style={{ left: appIconPos.x, top: appIconPos.y, cursor: 'grab' }}
+          title={t('app.downloadTitle')}
+        >
+          <Download size={18} />
+        </button>
+      )}
       {/* 主内容区域 */}
       <main className="flex-1 overflow-auto flex flex-col relative z-10">
 
@@ -717,158 +730,7 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
       </main>
 
       {/* 应用下载弹窗（手机APP / 电脑端）- 放在 main 外部避免地图组件层叠上下文遮挡 */}
-      {showAppDownload && (
-        <div
-          className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/50"
-          onClick={() => setShowAppDownload(false)}
-        >
-          <div
-            className="bg-card border border-border rounded-xl w-full max-w-sm mx-4 shadow-2xl"
-            onClick={(e) => e.stopPropagation()}
-          >
-              {/* 弹窗头部 */}
-              <div className="flex items-center justify-between px-5 py-4 border-b border-border">
-                <h2 className="font-semibold text-foreground flex items-center gap-2">
-                  <Download size={18} />
-                  {t('app.downloadTitle')}
-                </h2>
-                <button
-                  onClick={() => setShowAppDownload(false)}
-                  className="p-1 rounded-md hover:bg-muted text-muted-foreground"
-                >
-                  <X size={18} />
-                </button>
-              </div>
-
-              {/* 下载方式切换：手机APP / 电脑端（桌面端形态不显示电脑端） */}
-              {!desktopMode && (
-                <div className="flex gap-1 px-5 pt-4">
-                  {([
-                    { key: 'mobile' as const, icon: Smartphone, label: t('app.tabMobile') },
-                    { key: 'desktop' as const, icon: MonitorDown, label: t('app.tabDesktop') },
-                  ]).map((tab) => {
-                    const TabIcon = tab.icon
-                    const active = appTab === tab.key
-                    return (
-                      <button
-                        key={tab.key}
-                        onClick={() => setAppTab(tab.key)}
-                        className={`flex-1 flex items-center justify-center gap-1.5 py-2 text-sm rounded-lg border transition-colors ${
-                          active
-                            ? 'bg-primary text-primary-foreground border-primary'
-                            : 'border-border text-muted-foreground hover:bg-muted'
-                        }`}
-                      >
-                        <TabIcon size={14} />
-                        {tab.label}
-                      </button>
-                    )
-                  })}
-                </div>
-              )}
-
-              {/* 弹窗内容 */}
-              <div className="p-5 flex flex-col items-center space-y-4">
-                {appTab === 'desktop' ? (
-                  /* 电脑端：从桌面版分发取最新安装包，点击后由浏览器接管下载 */
-                  desktopVersionLoading ? (
-                    <div className="py-8 text-muted-foreground flex flex-col items-center gap-2">
-                      <Loader2 size={24} className="animate-spin" />
-                      <span className="text-sm">{t('app.loadingVersion')}</span>
-                    </div>
-                  ) : desktopRelease ? (
-                    <>
-                      <MonitorDown size={44} className="text-primary" />
-                      <div className="text-center">
-                        <p className="text-sm font-semibold text-foreground">
-                          {t('app.latestVersion')} V{desktopRelease.version}
-                          {desktopRelease.file_size_display ? ` · ${desktopRelease.file_size_display}` : ''}
-                        </p>
-                        {desktopRelease.release_notes && (
-                          <p className="text-xs text-muted-foreground mt-1 max-w-xs whitespace-pre-line">
-                            {desktopRelease.release_notes}
-                          </p>
-                        )}
-                      </div>
-                      <p className="text-xs text-muted-foreground">{t('app.desktopInstallHint')}</p>
-                      {/* 交给浏览器下载（新标签），与 APK 的 <a download> 行为区分：安装包走浏览器下载管理 */}
-                      <a
-                        href={getFullDownloadUrl(desktopRelease.download_url)}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="inline-flex items-center gap-2 px-6 py-2.5 bg-primary text-primary-foreground rounded-lg hover:opacity-90 transition-opacity text-sm font-medium"
-                      >
-                        <Download size={16} />
-                        <span>{t('app.downloadDesktop')}</span>
-                      </a>
-                    </>
-                  ) : (
-                    <div className="py-8 text-muted-foreground text-center">
-                      <p className="text-sm">{t('app.desktopNoVersion')}</p>
-                      <p className="text-xs mt-1">{t('app.desktopUploadHint')}</p>
-                    </div>
-                  )
-                ) : versionLoading ? (
-                  <div className="py-8 text-muted-foreground flex flex-col items-center gap-2">
-                    <Loader2 size={24} className="animate-spin" />
-                    <span className="text-sm">{t('app.loadingVersion')}</span>
-                  </div>
-                ) : latestVersion ? (
-                  <>
-                    {/* 二维码 */}
-                    {(() => {
-                      const downloadUrl = getFullDownloadUrl(latestVersion.download_url)
-                      const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(downloadUrl)}`
-                      return (
-                        <div className="bg-card p-3 rounded-lg shadow-sm border border-border">
-                          <img
-                            src={qrUrl}
-                            alt={t('app.downloadTitle')}
-                            className="w-[200px] h-[200px]"
-                            crossOrigin="anonymous"
-                          />
-                        </div>
-                      )
-                    })()}
-
-                    {/* 版本信息 */}
-                    <div className="text-center">
-                      <p className="text-sm font-semibold text-foreground">
-                        {t('app.latestVersion')} V{latestVersion.version}
-                        {latestVersion.file_size_display ? ` · ${latestVersion.file_size_display}` : ''}
-                      </p>
-                      {latestVersion.changelog && (
-                        <p className="text-xs text-muted-foreground mt-1 max-w-xs whitespace-pre-line">
-                          {latestVersion.changelog}
-                        </p>
-                      )}
-                    </div>
-
-                    {/* 扫码提示 */}
-                    <p className="text-xs text-muted-foreground">
-                      {t('app.installHint')}
-                    </p>
-
-                    {/* 下载按钮 */}
-                    <a
-                      href={getFullDownloadUrl(latestVersion.download_url)}
-                      download
-                      className="inline-flex items-center gap-2 px-6 py-2.5 bg-primary text-primary-foreground rounded-lg hover:opacity-90 transition-opacity text-sm font-medium"
-                    >
-                      <Download size={16} />
-                      <span>{t('app.downloadApk')}</span>
-                    </a>
-                  </>
-                ) : (
-                  <div className="py-8 text-muted-foreground text-center">
-                    <p className="text-sm">{t('app.noVersionAvailable')}</p>
-                    <p className="text-xs mt-1">{t('app.uploadApkHint')}</p>
-                  </div>
-                )}
-              </div>
-            </div>
-          </div>
-        )}
+      <AppDownloadDialog open={showAppDownload} onClose={() => setShowAppDownload(false)} />
       <Toaster />
       {/* 桌面版 OTA 更新提示（网页端自动静默：接口 404） */}
       <DesktopUpdateDialog />
