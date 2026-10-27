@@ -18,9 +18,10 @@ import { useMapStore } from '../store/mapStore'
 import { useAuthStore } from '../store/authStore'
 import { useNeighborStore } from '../store/neighborStore'
 import { btn } from '../utils/buttonStyles'
-import { OnlineMap, type OnlineMapRef } from '../components/Map/OnlineMap'
+import type { OnlineMapRef } from '../components/Map/OnlineMap'
 import { NeighborLegend } from '../components/Map/NeighborLegend'
-import { MapTypeSwitch } from '../components/Map/MapTypeSwitch'
+import { MapCanvas } from '../components/Map/MapCanvas'
+import { MapSourceSwitch } from '../components/Map/MapSourceSwitch'
 import { neighborDataSyncService } from '../services/neighborDataSyncService'
 import type { RenderSectorData, CellListItem } from '../services/mapDataService'
 import { mapDataService, getCellList, clearCellListCache } from '../services/mapDataService'
@@ -268,6 +269,7 @@ export function NeighborPage() {
 
   // 全局地图控制
   const setGlobalShowMap = useMapStore((s) => s.setGlobalShowMap)
+  const mapSettings = useMapStore((s) => s.mapSettings)
 
   // ===== 状态重置 =====
   const resetConfig = useCallback(() => {
@@ -2085,7 +2087,7 @@ export function NeighborPage() {
                 {i18n.clear}
               </button>
               <div className="ml-auto">
-                <MapTypeSwitch mapRef={mapRef} />
+                <MapSourceSwitch />
               </div>
             </div>
 
@@ -2124,16 +2126,17 @@ export function NeighborPage() {
             {(showMap || mapEverLoadedRef.current) && (
               <>
                 {!mapEverLoadedRef.current && (mapEverLoadedRef.current = true)}
-                <OnlineMap
+                <MapCanvas
                   ref={mapRef}
                   mode="neighbor-planning"
-                  neighborData={taskResult?.results || []}
                   onSectorClick={handleMapSectorClick}
-                  onMapReady={() => {
-                    console.log('[NeighborPage] 地图已就绪')
-                  }}
                   measureMode={measureMode}
                   onMeasureModeEnd={handleMeasureModeEnd}
+                  initialLayerVisibility={{ lte: true, nr: true }}
+                  mapSource={mapSettings.mapSource}
+                  tiandituApiKey={mapSettings.tiandituApiKey}
+                  tiandituAnnotations={mapSettings.tiandituAnnotations}
+                  amapAnnotations={mapSettings.amapAnnotations}
                 />
                 <NeighborLegend
                   visible={isLegendVisible}

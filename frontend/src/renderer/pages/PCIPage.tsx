@@ -5,9 +5,10 @@ import type { ApiResponse } from '@shared/types'
 import { useTaskStore, type Task } from '../store/taskStore'
 import { useMapStore } from '../store/mapStore'
 import { btn } from '../utils/buttonStyles'
-import { OnlineMap, type OnlineMapRef } from '../components/Map/OnlineMap'
+import type { OnlineMapRef } from '../components/Map/OnlineMap'
 import { PCILegend } from '../components/Map/PCILegend'
-import { MapTypeSwitch } from '../components/Map/MapTypeSwitch'
+import { MapCanvas } from '../components/Map/MapCanvas'
+import { MapSourceSwitch } from '../components/Map/MapSourceSwitch'
 import { LoadingSpinner } from '../components/LoadingSpinner'
 import { useAuthStore } from '../store/authStore'
 import { pciDataSyncService } from '../services/pciDataSyncService'
@@ -222,6 +223,7 @@ export function PCIPage() {
 
   // 全局地图控制
   const setGlobalShowMap = useMapStore((s) => s.setGlobalShowMap)
+  const mapSettings = useMapStore((s) => s.mapSettings)
 
   // ===== 状态重置：切换到"新建任务"时重置表单 =====
   const resetConfig = useCallback(() => {
@@ -1690,7 +1692,7 @@ export function PCIPage() {
               <button onClick={handleSearch} className="flex items-center gap-2 px-4 py-2 bg-card border border-border rounded-lg hover:bg-muted/80 transition-colors text-xs"><Search size={14} />{t('pci.search') || '搜索'}</button>
               <button onClick={handleToggleMeasure} className={`flex items-center gap-2 px-4 py-2 bg-card border border-border rounded-lg hover:bg-muted/80 transition-colors text-xs ${measureMode ? 'bg-primary' : ''}`} title={measureMode ? (t('pci.exitMeasureMode') || '退出测距模式') : (t('pci.enterMeasureMode') || '进入测距模式')}><Ruler size={14} />{t('pci.measure') || '测距'}</button>
               <button onClick={handleClearAllMarkers} className="flex items-center gap-2 px-4 py-2 bg-card border border-border rounded-lg hover:bg-muted/80 transition-colors text-xs" title={t('pci.clearAllMarkersTip') || '清除所有标记'}><X size={14} />{t('pci.clear') || '清除'}</button>
-              <MapTypeSwitch mapRef={mapRef} />
+              <MapSourceSwitch />
             </div>
             {searchMarkers.length > 0 && (
               <div className="mb-3 p-2 bg-blue-500/10 border border-blue-500/30 rounded-lg text-xs text-blue-600 flex items-center justify-between">
@@ -1708,7 +1710,7 @@ export function PCIPage() {
               {(showMap || mapEverLoadedRef.current) && (
                 <>
                   {!mapEverLoadedRef.current && (mapEverLoadedRef.current = true)}
-                  <OnlineMap ref={mapRef} mode="pci-planning" pciData={currentTaskResult?.results || []} onSectorClick={handleMapSectorClick} initialLayerVisibility={{ lte: true, nr: true }} frequencies={{ lte: [], nr: [] }} measureMode={measureMode} onMeasureModeEnd={handleMeasureModeEnd} />
+                  <MapCanvas ref={mapRef} mode="pci-planning" onSectorClick={handleMapSectorClick} initialLayerVisibility={{ lte: true, nr: true }} frequencies={{ lte: [], nr: [] }} measureMode={measureMode} onMeasureModeEnd={handleMeasureModeEnd} mapSource={mapSettings.mapSource} tiandituApiKey={mapSettings.tiandituApiKey} tiandituAnnotations={mapSettings.tiandituAnnotations} amapAnnotations={mapSettings.amapAnnotations} />
                   <PCILegend visible={isLegendVisible} onToggleVisible={() => setIsLegendVisible(!isLegendVisible)} />
                 </>
               )}

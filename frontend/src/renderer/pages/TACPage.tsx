@@ -7,8 +7,9 @@ import { useTaskStore, type Task } from '../store/taskStore'
 import { useMapStore } from '../store/mapStore'
 import { useAuthStore } from '../store/authStore'
 import { btn } from '../utils/buttonStyles'
-import { OnlineMap } from '../components/Map/OnlineMap'
 import { TACLegend } from '../components/Map/TACLegend'
+import { MapCanvas } from '../components/Map/MapCanvas'
+import { MapSourceSwitch } from '../components/Map/MapSourceSwitch'
 import { tacDataSyncService } from '../services/tacDataSyncService'
 import { tacColorMapper } from '../utils/tacColors'
 import type { OnlineMapRef } from '../components/Map/OnlineMap'
@@ -152,6 +153,7 @@ export function TACPage() {
 
   // 全局地图控制
   const setGlobalShowMap = useMapStore((s) => s.setGlobalShowMap)
+  const mapSettings = useMapStore((s) => s.mapSettings)
 
   // ===== 状态重置 =====
   const resetConfig = useCallback(() => {
@@ -1461,6 +1463,7 @@ export function TACPage() {
                               <Eye size={16} />
                               {t('tac.showMap') || '地图展示'}
                             </button>
+                            {showMap && <MapSourceSwitch />}
                           </div>
                           {pagedPreparing && (
                             <div className="flex items-center gap-2 px-3 py-2 mb-2 text-xs text-muted-foreground bg-muted/40 rounded-md shrink-0">
@@ -1701,12 +1704,17 @@ export function TACPage() {
                 {(showMap || mapEverLoadedRef.current) && (
                   <>
                     {!mapEverLoadedRef.current && (mapEverLoadedRef.current = true)}
-                    <OnlineMap
+                    <MapCanvas
                       ref={mapRef}
                       mode="tac-check"
                       onSectorClick={handleMapSectorClick}
                       measureMode={measureMode}
                       onMeasureModeEnd={handleMeasureModeEnd}
+                      initialLayerVisibility={{ lte: true, nr: true }}
+                      mapSource={mapSettings.mapSource}
+                      tiandituApiKey={mapSettings.tiandituApiKey}
+                      tiandituAnnotations={mapSettings.tiandituAnnotations}
+                      amapAnnotations={mapSettings.amapAnnotations}
                     />
                     <TACLegend
                       visible={isLegendVisible}

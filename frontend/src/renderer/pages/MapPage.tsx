@@ -475,6 +475,18 @@ export function MapPage() {
     return () => document.removeEventListener('fullscreenchange', handleFullscreenChange)
   }, [])
 
+  // 桌面壳全屏不是 HTML Fullscreen：Esc 无原生行为、fullscreenchange 不触发，
+  // 必须自己绑 Escape 退出，否则用户全屏后被困在应用内（frameless 窗口连标题栏都没有）
+  useEffect(() => {
+    if (!isDesktop) return
+    const onKeyDown = (e: KeyboardEvent) => {
+      // 弹窗等组件已消费 Esc（preventDefault）时不再连带退出全屏
+      if (e.key === 'Escape' && isFullscreen && !e.defaultPrevented) toggleFullscreen()
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [isDesktop, isFullscreen, toggleFullscreen])
+
   // 全屏时添加/移除 body class 用于 CSS 隐藏侧边栏
   useEffect(() => {
     if (isFullscreen) {
@@ -4102,7 +4114,10 @@ export function MapPage() {
           body.map-fullscreen-mode aside {
             display: none !important;
           }
-          body.map-fullscreen-mode > div#root > div > div:first-child {
+          body.map-fullscreen-mode [data-app-sidebar] {
+            display: none !important;
+          }
+          body.map-fullscreen-mode [data-app-titlebar] {
             display: none !important;
           }
           body.map-fullscreen-mode [data-map-toolbar] {
