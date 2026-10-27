@@ -70,6 +70,23 @@ def test_fullscreen_handler_is_idempotent():
     assert window.maximizes == 1
 
 
+def test_fullscreen_clears_and_restores_work_area_limit(monkeypatch):
+    """进入全屏要盖住任务栏（清限制），退出全屏回最大化要重新按工作区收口。"""
+    launcher = _load_launcher()
+    window = _FakeWindow()
+    limited: list[bool] = []
+    monkeypatch.setattr(
+        launcher,
+        "_limit_maximized_to_work_area",
+        lambda _window, enable: limited.append(enable),
+    )
+    handler = launcher._make_fullscreen_handler(window)
+
+    handler(True)
+    handler(False)
+    assert limited == [False, True]
+
+
 def test_bridge_without_shell_returns_false():
     """非桌面壳（未注入回调，含网页端/服务器）必须返回 False，端点据此回 403。"""
     from app import desktop_bridge

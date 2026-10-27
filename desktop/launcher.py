@@ -366,6 +366,41 @@ def _make_exit_handler(window: Any) -> Callable[[], None]:
     return _exit_handler
 
 
+def _limit_maximized_to_work_area(window: Any, enable: bool) -> None:
+    """把无边框窗口的最大化范围限定到显示器工作区（排除任务栏）。
+
+    frameless 窗口没有最大化边框可依，WinForms 会直接铺满整个显示器，任务栏盖住
+    页面下沿，底部控件看不见。这里显式设置 MaximizedBounds：
+    - enable=True：取窗口当前所在显示器的工作区；
+    - enable=False：清空限制，避免窗口移到其他显示器后仍按旧屏幕收口。
+
+    仅 Windows 生效；窗体尚未就绪或非桌面壳时静默跳过。
+    """
+    native = getattr(window, "native", None)
+    if os.name != "nt" or native is None:
+        return
+    try:
+        import clr  # pywebview 已加载 CLR，显式导入保证 .NET 类型可用
+
+        clr.AddReference("System.Windows.Forms")
+        from System import Func, Type
+        from System.Drawing import Rectangle
+        from System.Windows.Forms import Screen
+
+        bounds = Screen.FromControl(native).WorkingArea if enable else Rectangle.Empty
+
+        def _apply() -> None:
+            native.MaximizedBounds = bounds
+
+        # js_api 回调跑在后台线程，WinForms 控件属性只能在 GUI 线程设置
+        if native.InvokeRequired:
+            native.Invoke(Func[Type](_apply))
+        else:
+            _apply()
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("设置窗口最大化边界失败（窗口可能盖住任务栏）：%s", exc)
+
+
 def _make_fullscreen_handler(window: Any, state: Optional[dict] = None) -> Callable[[bool], None]:
     """构造全屏回调：把前端的「全屏 / 退出全屏」转成桌面主窗口的系统级全屏。
 
@@ -384,9 +419,13 @@ def _make_fullscreen_handler(window: Any, state: Optional[dict] = None) -> Calla
         fullscreen = bool(fullscreen)
         if fullscreen == state.get("fullscreen", False):
             return
+        if fullscreen:
+            # 真全屏要盖住任务栏：先清掉工作区限制，否则最大化会被收口到任务栏之上
+            _limit_maximized_to_work_area(window, False)
         window.toggle_fullscreen()
         state["fullscreen"] = fullscreen
         if not fullscreen:
+            _limit_maximized_to_work_area(window, True)
             window.maximize()
             # 与窗口控制共享 state 时同步缓存：不等 on_resize（GUI 线程时序），
             # 否则标题栏按钮可能短暂显示"最大化"图标而窗口已最大化
@@ -437,8 +476,10 @@ def _make_window_control_handler(
         if action == "toggle-maximize":
             if state.get("maximized", False):
                 window.restore()
+                _limit_maximized_to_work_area(window, False)
                 state["maximized"] = False
             else:
+                _limit_maximized_to_work_area(window, True)
                 window.maximize()
                 state["maximized"] = True
             return {"maximized": state["maximized"]}

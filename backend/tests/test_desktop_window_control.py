@@ -85,6 +85,26 @@ def test_toggle_maximize_uses_state_cache():
     assert window.calls == ["restore", "maximize"]
 
 
+def test_toggle_maximize_limits_borderless_window_to_work_area(monkeypatch):
+    """无边框窗口最大化默认会盖住任务栏：还原时清限制、最大化前按工作区收口。"""
+    launcher = _load_launcher()
+    window = _FakeWindow()
+    limited: list[bool] = []
+    monkeypatch.setattr(
+        launcher,
+        "_limit_maximized_to_work_area",
+        lambda _window, enable: limited.append(enable),
+    )
+    handler, _ = _make_handler(launcher, window)
+
+    handler("toggle-maximize", {})
+    assert limited == [False]  # 启动即最大化 → 还原并清掉工作区限制
+
+    handler("toggle-maximize", {})
+    assert limited == [False, True]  # 最大化前先按工作区收口
+    assert window.calls == ["restore", "maximize"]
+
+
 def test_state_events_converge_cache():
     """Win+↑/↓、任务栏还原等系统路径触发 maximized/restored 事件 → 缓存自然收敛。"""
     launcher = _load_launcher()
