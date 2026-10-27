@@ -30,6 +30,7 @@ import { startHealthCheck, stopHealthCheck } from '@/renderer/services/api'
 import { useHeartbeat } from './hooks/useHeartbeat'
 import { useAuthStore } from './store/authStore'
 import { saveLastRoute } from './utils/lastRoute'
+import { WindowTitleBar } from './components/WindowTitleBar'
 
 /** 记录已登录用户当前所在页面，重新登录后可恢复到该页面 */
 function LastRouteTracker() {
@@ -57,8 +58,11 @@ function App() {
 
   return (
     <Router>
-      <LastRouteTracker />
-      <AuthGuard>
+      <div className="flex h-screen flex-col">
+        <WindowTitleBar />
+        <div className="min-h-0 flex-1">
+          <LastRouteTracker />
+          <AuthGuard>
         {/* 顶层错误边界：页面渲染抛错时给出可恢复界面，不再整树卸载白屏 */}
         <ErrorBoundary>
           <MainLayout>
@@ -224,6 +228,8 @@ function App() {
           </MainLayout>
         </ErrorBoundary>
       </AuthGuard>
+        </div>
+      </div>
     </Router>
   )
 }

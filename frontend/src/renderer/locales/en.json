@@ -194,6 +194,12 @@
     "downloadApk": "Download APK",
     "latestVersion": "Latest Version"
   },
+  "titleBar": {
+    "minimize": "Minimize",
+    "maximize": "Maximize",
+    "restore": "Restore",
+    "close": "Close"
+  },
   "nav": {
     "home": "Home",
     "data": "Data",

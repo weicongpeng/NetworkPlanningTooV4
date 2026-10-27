@@ -199,6 +199,87 @@ def test_fullscreen_without_shell_returns_403(desktop_local):
     assert resp.status_code == 403
 
 
+def test_window_control_forwarded_to_shell(desktop_local):
+    """自绘标题栏动作逐条转发给壳层 handler（resize 透传 width/height）。"""
+    from app import desktop_bridge
+
+    seen: list = []
+
+    def handler(action, params):
+        seen.append((action, params))
+        return {"maximized": action == "toggle-maximize"}
+
+    desktop_bridge.set_window_control_handler(handler)
+    try:
+        for body in [
+            {"action": "minimize"},
+            {"action": "toggle-maximize"},
+            {"action": "close"},
+            {"action": "resize", "width": 1200, "height": 800},
+        ]:
+            resp = desktop_local.client.post("/api/v1/desktop/window-control", json=body)
+            assert resp.status_code == 200, resp.text
+            assert resp.json()["success"] is True
+        assert seen == [
+            ("minimize", {}),
+            ("toggle-maximize", {}),
+            ("close", {}),
+            ("resize", {"width": 1200, "height": 800}),
+        ]
+    finally:
+        desktop_bridge.set_window_control_handler(None)
+
+
+def test_window_control_without_shell_returns_403(desktop_local):
+    from app import desktop_bridge
+
+    desktop_bridge.set_window_control_handler(None)
+    resp = desktop_local.client.post("/api/v1/desktop/window-control", json={"action": "minimize"})
+    assert resp.status_code == 403
+
+
+def test_window_control_validates_payload(desktop_local):
+    from app import desktop_bridge
+
+    desktop_bridge.set_window_control_handler(lambda action, params: {})
+    try:
+        bad_action = desktop_local.client.post(
+            "/api/v1/desktop/window-control", json={"action": "shuffle"}
+        )
+        assert bad_action.status_code == 422  # Literal 白名单在 Pydantic 层拒绝
+
+        resize_without_size = desktop_local.client.post(
+            "/api/v1/desktop/window-control", json={"action": "resize"}
+        )
+        assert resize_without_size.status_code == 400
+    finally:
+        desktop_bridge.set_window_control_handler(None)
+
+
+def test_window_state_forwarded_to_shell(desktop_local):
+    """窗口状态查询读壳层缓存（maximized/fullscreen），供标题栏聚焦时校准图标。"""
+    from app import desktop_bridge
+
+    desktop_bridge.set_window_control_handler(
+        lambda action, params: {"maximized": True, "fullscreen": False}
+    )
+    try:
+        resp = desktop_local.client.get("/api/v1/desktop/window-state")
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["data"]["maximized"] is True
+    finally:
+        desktop_bridge.set_window_control_handler(None)
+
+
+def test_window_state_without_shell_returns_403(desktop_local):
+    """非桌面壳 403：前端据此静默跳过校准。"""
+    from app import desktop_bridge
+
+    desktop_bridge.set_window_control_handler(None)
+    resp = desktop_local.client.get("/api/v1/desktop/window-state")
+    assert resp.status_code == 403
+
+
 def test_activate_error_maps_status(desktop_local):
     def boom(code, hostname=None):
         raise desktop_local.cloud.CloudError(403, "该授权已被禁用，请联系管理员")

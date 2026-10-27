@@ -366,7 +366,7 @@ def _make_exit_handler(window: Any) -> Callable[[], None]:
     return _exit_handler
 
 
-def _make_fullscreen_handler(window: Any) -> Callable[[bool], None]:
+def _make_fullscreen_handler(window: Any, state: Optional[dict] = None) -> Callable[[bool], None]:
     """构造全屏回调：把前端的「全屏 / 退出全屏」转成桌面主窗口的系统级全屏。
 
     WebView2 里的 HTML Fullscreen API 只会让网页内容占满 WebView 自身（窗口不变，
@@ -374,17 +374,88 @@ def _make_fullscreen_handler(window: Any) -> Callable[[bool], None]:
     pywebview 只提供 toggle_fullscreen()、没有状态查询，这里按本进程记录期望状态，
     只在状态真的变化时切换；退出全屏后补一次 maximize()，回到启动时的最大化窗口
     （pywebview 的退出分支会先把窗口置为 Normal + 进入全屏前的尺寸）。
+
+    state 可与窗口控制回调共享（自绘标题栏查询窗口状态时一并返回 fullscreen）。
     """
-    state = {"fullscreen": False}
+    if state is None:
+        state = {"fullscreen": False}
 
     def _handler(fullscreen: bool) -> None:
         fullscreen = bool(fullscreen)
-        if fullscreen == state["fullscreen"]:
+        if fullscreen == state.get("fullscreen", False):
             return
         window.toggle_fullscreen()
         state["fullscreen"] = fullscreen
         if not fullscreen:
             window.maximize()
+            # 与窗口控制共享 state 时同步缓存：不等 on_resize（GUI 线程时序），
+            # 否则标题栏按钮可能短暂显示"最大化"图标而窗口已最大化
+            if "maximized" in state:
+                state["maximized"] = True
+
+    return _handler
+
+
+def _make_window_control_handler(
+    window: Any, state: dict, min_size: tuple
+) -> Callable[[str, dict], dict]:
+    """构造窗口控制回调（frameless 自绘标题栏的按钮/把手 → pywebview 原生动作）。
+
+    - state 与全屏回调共享，并在 maximized/restored 事件里持续更新：
+      Win+↑/↓、任务栏还原等系统路径同样触发 on_resize → 缓存自然收敛，
+      前端只在按钮响应与窗口聚焦时读取，不需要轮询。
+    - close 走 window.destroy()：会触发 FormClosing → events.closing，
+      保留 _make_close_handler 的看门狗与后台更新例外；
+      不能复用 _make_exit_handler（它无条件武装看门狗）。
+    - resize 是裸 SetWindowPos、绕过 WinForms MinimumSize → 这里按 min_size clamp。
+    """
+
+    def _on_maximized(*_args: Any, **_kwargs: Any) -> None:
+        state["maximized"] = True
+
+    def _on_restored(*_args: Any, **_kwargs: Any) -> None:
+        state["maximized"] = False
+
+    for event, callback in (("maximized", _on_maximized), ("restored", _on_restored)):
+        try:
+            # Event.__iadd__ 把回调 append 进事件对象（并返回 self），
+            # 先取到对象再 +=，属性增赋值写法 getattr(...) += 不是合法表达式
+            window_event = getattr(window.events, event)
+            window_event += callback
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("订阅窗口 %s 事件失败（标题栏按钮状态可能不同步）：%s", event, exc)
+
+    def _handler(action: str, params: dict) -> dict:
+        if action == "state":
+            return {
+                "maximized": bool(state.get("maximized", False)),
+                "fullscreen": bool(state.get("fullscreen", False)),
+            }
+        if action == "minimize":
+            window.minimize()
+            return {"maximized": bool(state.get("maximized", False))}
+        if action == "toggle-maximize":
+            if state.get("maximized", False):
+                window.restore()
+                state["maximized"] = False
+            else:
+                window.maximize()
+                state["maximized"] = True
+            return {"maximized": state["maximized"]}
+        if action == "close":
+            _log.info("收到窗口关闭请求（标题栏关闭按钮）")
+            try:
+                window.destroy()
+            except Exception:  # noqa: BLE001
+                _log.exception("关闭窗口失败，2 秒后强制结束进程")
+                _force_exit_after(2)
+            return {}
+        if action == "resize":
+            width = max(int(params.get("width") or 0), int(min_size[0]))
+            height = max(int(params.get("height") or 0), int(min_size[1]))
+            window.resize(width, height)
+            return {"maximized": bool(state.get("maximized", False))}
+        raise ValueError(f"未知窗口控制动作: {action}")
 
     return _handler
 
@@ -434,7 +505,7 @@ border-radius:50%%;animation:spin .9s linear infinite;margin-bottom:18px}
 .t{font-size:15px;letter-spacing:.5px}
 .h{font-size:12px;color:#94a3b8;margin-top:10px;max-width:420px;text-align:center;line-height:1.6}
 </style></head>
-<body><div class="ring"></div>
+<body class="pywebview-drag-region"><div class="ring"></div>
 <div class="t">%(text)s</div>
 <div class="h">%(hint)s</div>
 </body></html>"""
@@ -483,6 +554,9 @@ def _create_window() -> Any:
 
     # 必须开启，否则 WebView2 会直接取消所有导出下载
     webview.settings["ALLOW_DOWNLOADS"] = True
+    # 无边框窗口由前端自绘标题栏：只有自身带 .pywebview-drag-region 的元素按下才拖动窗口，
+    # 避免标题栏上的下载/最小化/最大化/关闭按钮按下被误判为拖窗
+    webview.settings["DRAG_REGION_DIRECT_TARGET_ONLY"] = True
     width, height, min_size = _window_size()
     window = webview.create_window(
         APP_NAME,
@@ -494,7 +568,14 @@ def _create_window() -> Any:
         # pywebview 默认 text_select=False 会注入 CSS 全局禁用文本选择，网页端能复制的
         # 文字在桌面端选不中；打开后与浏览器行为一致
         text_select=True,
+        # 标题栏由前端自绘（含应用下载入口），窗口不再用原生边框；
+        # easy_drag 默认 True 会让页面任意按下都拖动窗口（地图没法用），必须关闭，
+        # 拖动只走标题栏的 .pywebview-drag-region 机制
+        frameless=True,
+        easy_drag=False,
     )
+    # 窗口状态缓存：最大化/还原事件 + 全屏回调共同维护，供自绘标题栏查询
+    win_state: dict = {"fullscreen": False, "maximized": True}
     # 关窗也要兜底：正常关闭路径被卡住时进程不退出，用户再启动会误报「程序已在运行」
     try:
         window.events.closing += _make_close_handler()
@@ -520,9 +601,12 @@ def _create_window() -> Any:
     try:
         from app import desktop_bridge
 
-        desktop_bridge.set_fullscreen_handler(_make_fullscreen_handler(window))
+        desktop_bridge.set_fullscreen_handler(_make_fullscreen_handler(window, win_state))
+        desktop_bridge.set_window_control_handler(
+            _make_window_control_handler(window, win_state, min_size)
+        )
     except Exception as exc:  # noqa: BLE001
-        _log.warning("注入窗口全屏回调失败（地图全屏将退化为应用内全屏）：%s", exc)
+        _log.warning("注入窗口全屏/控制回调失败（地图全屏将退化为应用内全屏）：%s", exc)
     return window
 
 

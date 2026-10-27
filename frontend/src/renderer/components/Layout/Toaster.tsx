@@ -1,6 +1,7 @@
 import * as Toast from '@radix-ui/react-toast'
 import { AlertTriangle } from 'lucide-react'
 import { useToastStore } from '../../store/toastStore'
+import { useAuthStore } from '../../store/authStore'
 
 /**
  * 全局轻提示：自包含 Radix Toast Provider，挂载到 MainLayout 后全应用可用。
@@ -9,6 +10,7 @@ import { useToastStore } from '../../store/toastStore'
 export function Toaster() {
   const toasts = useToastStore((s) => s.toasts)
   const dismiss = useToastStore((s) => s.dismiss)
+  const desktopMode = useAuthStore((s) => s.desktopMode)
 
   return (
     <Toast.Provider swipeDirection="down" duration={3000}>
@@ -26,8 +28,8 @@ export function Toaster() {
         </Toast.Root>
       ))}
       <Toast.Viewport
-        className="fixed top-0 left-1/2 -translate-x-1/2 z-[2000] flex flex-col gap-2 p-4
-                   w-[min(92vw,440px)] list-none outline-none"
+        className={`fixed ${desktopMode ? 'top-8' : 'top-0'} left-1/2 -translate-x-1/2 z-[2000] flex flex-col gap-2 p-4
+                   w-[min(92vw,440px)] list-none outline-none`}
       />
     </Toast.Provider>
   )

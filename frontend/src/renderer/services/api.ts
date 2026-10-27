@@ -699,6 +699,22 @@ export const desktopLoginApi = {
   setFullscreen: async (fullscreen: boolean): Promise<ApiResponse<{ fullscreen: boolean }>> => {
     return apiClient.post('/desktop/fullscreen', { fullscreen }) as any
   },
+
+  /**
+   * frameless 窗口的窗口动作（自绘标题栏按钮 / 边缘缩放把手）。
+   * toggle-maximize/resize 的响应带最新 maximized；非桌面壳 403，调用方静默忽略。
+   */
+  windowControl: async (
+    action: 'minimize' | 'toggle-maximize' | 'close' | 'resize',
+    params?: { width?: number; height?: number }
+  ): Promise<ApiResponse<{ maximized?: boolean }>> => {
+    return apiClient.post('/desktop/window-control', { action, ...(params || {}) }) as any
+  },
+
+  /** 查询壳层窗口状态缓存（maximized/fullscreen），窗口聚焦时校准标题栏图标，不轮询。 */
+  windowState: async (): Promise<ApiResponse<{ maximized: boolean; fullscreen: boolean }>> => {
+    return apiClient.get('/desktop/window-state') as any
+  },
 }
 
 /** 桌面共享模式同步状态 */

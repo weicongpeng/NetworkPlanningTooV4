@@ -117,6 +117,12 @@
     "downloadApk": "下载 APK",
     "latestVersion": "最新版本"
   },
+  "titleBar": {
+    "minimize": "最小化",
+    "maximize": "最大化",
+    "restore": "还原",
+    "close": "关闭"
+  },
   "nav": {
     "home": "首页",
     "data": "数据管理",

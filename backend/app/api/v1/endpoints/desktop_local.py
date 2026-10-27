@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 import threading
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
@@ -1522,3 +1522,49 @@ async def desktop_fullscreen(
     if not desktop_bridge.set_window_fullscreen(fullscreen):
         raise HTTPException(status_code=403, detail="当前运行环境不支持窗口全屏（非桌面壳）")
     return {"success": True, "data": {"fullscreen": fullscreen}}
+
+
+class WindowControlRequest(BaseModel):
+    action: Literal["minimize", "toggle-maximize", "close", "resize"] = Field(
+        ..., description="窗口控制动作（自绘标题栏按钮 / 边缘缩放把手）"
+    )
+    width: Optional[int] = Field(None, ge=1, description="resize 目标宽度（逻辑像素）")
+    height: Optional[int] = Field(None, ge=1, description="resize 目标高度（逻辑像素）")
+
+
+@router.post("/window-control")
+async def desktop_window_control(
+    payload: WindowControlRequest,
+    current_user: User = Depends(get_current_user),
+    _: None = Depends(_require_desktop),
+) -> Dict[str, Any]:
+    """frameless 窗口自绘标题栏的窗口动作：最小化/最大化还原/关闭/边缘缩放。
+
+    关闭走 window.destroy() → events.closing（保留后台更新例外与看门狗兜底）；
+    缩放由壳层按 min_size clamp 后执行。非桌面壳返回 403。
+    """
+    from app import desktop_bridge
+
+    params: Dict[str, Any] = {}
+    if payload.action == "resize":
+        if not payload.width or not payload.height:
+            raise HTTPException(status_code=400, detail="resize 需要同时提供 width 与 height")
+        params = {"width": payload.width, "height": payload.height}
+    result = desktop_bridge.control_window(payload.action, params)
+    if result is None:
+        raise HTTPException(status_code=403, detail="当前运行环境不支持窗口控制（非桌面壳）")
+    return {"success": True, "data": result}
+
+
+@router.get("/window-state")
+async def desktop_window_state(
+    current_user: User = Depends(get_current_user),
+    _: None = Depends(_require_desktop),
+) -> Dict[str, Any]:
+    """查询窗口状态缓存（maximized/fullscreen），供自绘标题栏在窗口聚焦时校准按钮图标。"""
+    from app import desktop_bridge
+
+    result = desktop_bridge.control_window("state")
+    if result is None:
+        raise HTTPException(status_code=403, detail="当前运行环境不支持窗口状态查询（非桌面壳）")
+    return {"success": True, "data": result}
