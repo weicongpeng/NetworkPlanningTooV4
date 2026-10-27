@@ -9,8 +9,10 @@ import { LayerAttributeConfig } from '../components/layer/LayerAttributeConfig'
 import { LAYER_DEFAULT_PARAMS, PRESET_COLORS } from '../config/layer-config'
 import { NO_FILL_COLOR } from '../utils/fieldValue'
 
-type LayerFormat = 'tab' | 'mif' | 'kml'
-const ALL_FORMATS: LayerFormat[] = ['tab', 'mif', 'kml']
+type TabKind = 'sector' | 'point' | 'polygon'
+type LayerFormat = 'tab' | 'mif' | 'kml' | 'shp'
+const ALL_FORMATS: LayerFormat[] = ['tab', 'mif', 'kml']          // 扇区/点图
+const POLYGON_FORMATS: LayerFormat[] = ['tab', 'mif', 'kml', 'shp'] // 面状图（多 SHP）
 const DEFAULT_FORMATS: LayerFormat[] = ['tab']   // 输出格式默认仅勾选 TAB
 
 // 页面级共享文件状态：一份文件同时作用于扇区/点图两个 Tab
@@ -54,12 +56,12 @@ interface TabState {
   error: string
 }
 
-const STORAGE_KEYS = { sector: 'layerTools.sector', point: 'layerTools.point' }
+const STORAGE_KEYS = { sector: 'layerTools.sector', point: 'layerTools.point', polygon: 'layerTools.polygon' }
 
 // 旧默认值（v2 时代）——用于迁移：仅当用户字段仍等于旧默认值时才更新为新默认值，
 // 避免覆盖用户自定义值。仅迁移默认相关的字段（颜色/点大小）。
 // 字段值为数组：当前字段等于任一旧默认值即迁移到新默认（支持多代默认链）。
-const OLD_DEFAULTS_V2: Record<'sector' | 'point', {
+const OLD_DEFAULTS_V2: Record<TabKind, {
   borderColor: string[]
   fillColor?: string[]
   pointSize?: number[]
@@ -68,22 +70,35 @@ const OLD_DEFAULTS_V2: Record<'sector' | 'point', {
   sector: { lineWidth: [2], borderColor: ['#4A90D9'], fillColor: ['#4A90D9'] },
   // pointSize 历史默认链：8(原始) → 15(上轮) → 12(本轮)
   point: { pointSize: [8, 15], borderColor: ['#FF0000'] },
+  polygon: { borderColor: [], fillColor: [] },   // 面状图无历史默认
 }
 
-function emptyTabState(type: 'sector' | 'point'): TabState {
-  const dp = type === 'sector' ? LAYER_DEFAULT_PARAMS.sector : LAYER_DEFAULT_PARAMS.point
+// 各 Tab 默认颜色/线宽（点图用 borderColor 存颜色，fillColor 复用同值）
+function tabDefaults(type: TabKind) {
+  if (type === 'sector') return LAYER_DEFAULT_PARAMS.sector
+  if (type === 'point') {
+    const p = LAYER_DEFAULT_PARAMS.point
+    return { ...p, fillColor: p.borderColor }
+  }
+  return LAYER_DEFAULT_PARAMS.polygon
+}
+
+function emptyTabState(type: TabKind): TabState {
+  const dp = tabDefaults(type)
+  const lineWidthDefault = type === 'sector' ? LAYER_DEFAULT_PARAMS.sector.lineWidth
+    : type === 'polygon' ? LAYER_DEFAULT_PARAMS.polygon.lineWidth : ''
   return {
     _v: 2,
     selectedFields: {},
     fieldMappings: {},
     radiusM: type === 'sector' ? String(LAYER_DEFAULT_PARAMS.sector.radiusM) : '',
     beamwidth: type === 'sector' ? String(LAYER_DEFAULT_PARAMS.sector.beamwidth) : '',
-    lineWidth: type === 'sector' ? String(LAYER_DEFAULT_PARAMS.sector.lineWidth) : '',
+    lineWidth: String(lineWidthDefault),
     pointSize: type === 'point' ? String(LAYER_DEFAULT_PARAMS.point.pointSize) : '',
     pointShape: type === 'point' ? LAYER_DEFAULT_PARAMS.point.pointShape : '',
     borderColor: dp.borderColor,
     // 点图 Tab 用 fillColor 存颜色（后端点图颜色按边框语义应用，border_color 接收 fillColor）
-    fillColor: type === 'sector' ? LAYER_DEFAULT_PARAMS.sector.fillColor : dp.borderColor,
+    fillColor: dp.fillColor,
     color: dp.borderColor,   // 旧字段兼容
     formats: [...DEFAULT_FORMATS],
     result: null,
@@ -92,7 +107,7 @@ function emptyTabState(type: 'sector' | 'point'): TabState {
 }
 
 // 从 sessionStorage 恢复状态（页面内保留：切换路由切回后不丢失）
-function loadState(key: string, type: 'sector' | 'point'): TabState {
+function loadState(key: string, type: TabKind): TabState {
   try {
     const raw = sessionStorage.getItem(key)
     if (raw) {
@@ -105,7 +120,7 @@ function loadState(key: string, type: 'sector' | 'point'): TabState {
         merged = { ...emptyTabState(type), ...saved }
         // 迁移判断：当前字段值等于任一旧默认值（数组 includes）才更新为新默认
         if (oldD.borderColor.includes(saved.borderColor)) {
-          merged.borderColor = LAYER_DEFAULT_PARAMS[type].borderColor
+          merged.borderColor = tabDefaults(type).borderColor
         }
         if (type === 'point') {
           // 点图颜色存在 fillColor（存颜色用），且空Tab 时 fillColor = dp.borderColor
@@ -117,7 +132,7 @@ function loadState(key: string, type: 'sector' | 'point'): TabState {
           }
         } else {
           if (oldD.fillColor !== undefined && oldD.fillColor.includes(saved.fillColor)) {
-            merged.fillColor = LAYER_DEFAULT_PARAMS.sector.fillColor
+            merged.fillColor = tabDefaults(type).fillColor
           }
         }
       } else {
@@ -130,7 +145,9 @@ function loadState(key: string, type: 'sector' | 'point'): TabState {
         merged = { ...emptyTabState(type), ...saved, _v: 2 }
       }
       // 输出格式默认由三格式全选改为仅 TAB：仅当仍是旧默认全选时才迁移，避免覆盖用户自选
-      if (Array.isArray(merged.formats) && ALL_FORMATS.every(f => merged.formats.includes(f))) {
+      // （面状图含 SHP，三格式全选属正常配置，不迁移）
+      if (type !== 'polygon' && Array.isArray(merged.formats)
+          && ALL_FORMATS.every(f => merged.formats.includes(f))) {
         merged.formats = [...DEFAULT_FORMATS]
       }
       return merged
@@ -145,10 +162,11 @@ function saveState(key: string, s: unknown) {
 
 export default function LayerToolsPage() {
   const { t } = useTranslation()
-  const [activeTab, setActiveTab] = useState<'sector' | 'point'>('sector')
+  const [activeTab, setActiveTab] = useState<TabKind>('sector')
   const [sectorState, setSectorState] = useState<TabState>(() => loadState(STORAGE_KEYS.sector, 'sector'))
   const [pointState, setPointState] = useState<TabState>(() => loadState(STORAGE_KEYS.point, 'point'))
-  // 页面级共享文件（一份文件同时作用于扇区/点图两个 Tab）——模块级 store，
+  const [polygonState, setPolygonState] = useState<TabState>(() => loadState(STORAGE_KEYS.polygon, 'polygon'))
+  // 页面级共享文件（一份文件同时作用于扇区/点图/面状图三个 Tab）——模块级 store，
   // 切页不丢失：上传/解析完成后写入模块级 + sessionStorage，组件卸载后成功结果仍保留
   const [sharedFile, setSharedFile] = useState<SharedFile>(() => loadSharedFile())
   // 模块级 ref：persistSharedFile 里读取最新 sharedFile（避免闭包过期）
@@ -173,15 +191,18 @@ export default function LayerToolsPage() {
   // 持久化：state 变化写 sessionStorage
   useEffect(() => saveState(STORAGE_KEYS.sector, sectorState), [sectorState])
   useEffect(() => saveState(STORAGE_KEYS.point, pointState), [pointState])
+  useEffect(() => saveState(STORAGE_KEYS.polygon, polygonState), [polygonState])
 
   // 当前激活 Tab 的 state
-  const state = activeTab === 'sector' ? sectorState : pointState
+  const state = activeTab === 'sector' ? sectorState : activeTab === 'point' ? pointState : polygonState
   const setState = (updater: (s: TabState) => TabState) => {
     if (activeTab === 'sector') setSectorState(s => updater(s))
-    else setPointState(s => updater(s))
+    else if (activeTab === 'point') setPointState(s => updater(s))
+    else setPolygonState(s => updater(s))
   }
 
   const isSector = activeTab === 'sector'
+  const isPolygon = activeTab === 'polygon'
 
   // 点形状选项：图标/标签与实际生成图形严格匹配（用户实测 MapInfo 输出）：
   // circle=圆形、square=正方形、diamond=菱形（MIF Symbol 34/32/33 正确）
@@ -218,6 +239,7 @@ export default function LayerToolsPage() {
     // 保证切换 Tab 后不会显示指向旧文件的失效下载按钮）
     setSectorState(s => ({ ...s, result: null, error: '' }))
     setPointState(s => ({ ...s, result: null, error: '' }))
+    setPolygonState(s => ({ ...s, result: null, error: '' }))
     // 导入区是页面级共享的：上传前清空共享文件（只作用于共享状态，两个 Tab 的配置各自保留）
     persistSharedFile(() => emptySharedFile())
     // 模块级进度：chunkedUpload 内部 trackProgress 会写入并暴露取消句柄
@@ -272,6 +294,16 @@ export default function LayerToolsPage() {
         setState(s => ({ ...s, error: t('layer.errBothNoColor') }))
         return
       }
+    } else if (isPolygon) {
+      if (!state.fieldMappings.name || !state.fieldMappings.polygon) {
+        setState(s => ({ ...s, error: t('layer.errMissingFieldsPolygon') }))
+        return
+      }
+      // 边框与填充同时无色 → 面不可见，直接拦截
+      if (state.borderColor === NO_FILL_COLOR && state.fillColor === NO_FILL_COLOR) {
+        setState(s => ({ ...s, error: t('layer.errBothNoColor') }))
+        return
+      }
     } else {
       if (!state.fieldMappings.name || !state.fieldMappings.longitude || !state.fieldMappings.latitude) {
         setState(s => ({ ...s, error: t('layer.errMissingFieldsPoint') }))
@@ -293,7 +325,7 @@ export default function LayerToolsPage() {
         latCol: state.fieldMappings.latitude,
         attributes: Object.values(state.selectedFields),
         outputFormats: state.formats,
-        color: isSector
+        color: isSector || isPolygon
           ? (state.borderColor === NO_FILL_COLOR ? state.fillColor : state.borderColor)
           : (state.fillColor === NO_FILL_COLOR ? state.borderColor : state.fillColor),
         borderColor: state.borderColor,
@@ -309,7 +341,12 @@ export default function LayerToolsPage() {
             radiusM: parseFloat(state.radiusM) || LAYER_DEFAULT_PARAMS.sector.radiusM,
             beamwidth: parseFloat(state.beamwidth) || LAYER_DEFAULT_PARAMS.sector.beamwidth,
           })
-        : await layerToolsApi.generatePoint(base)
+        : isPolygon
+          ? await layerToolsApi.generatePolygon({
+              ...base,
+              polygonCol: state.fieldMappings.polygon,
+            })
+          : await layerToolsApi.generatePoint(base)
       setState(s => ({ ...s, result: data }))
     } catch (err: any) {
       // 文件过期（后端 TTL 清理后 file_path 失效）→ 清空共享文件提示重新导入
@@ -390,9 +427,9 @@ export default function LayerToolsPage() {
     </div>
   )
 
-  const renderParams = (ts: TabState, setTab: (u: (s: TabState) => TabState) => void) => (
+  const renderParams = (ts: TabState, setTab: (u: (s: TabState) => TabState) => void, kind: TabKind) => (
     <div className="grid grid-cols-2 gap-4">
-      {isSector ? (
+      {kind === 'sector' ? (
         // 扇区：半径 / 波瓣夹角 / 线宽 同一行（3 列）
         <div className="col-span-2 grid grid-cols-3 gap-4">
           <div>
@@ -405,6 +442,15 @@ export default function LayerToolsPage() {
             <input {...numberInput(ts.beamwidth, (v) => setTab(s => ({ ...s, beamwidth: v })))}
               className="w-full h-9 px-2 text-sm border border-border rounded bg-card" />
           </div>
+          <div>
+            <label className="block text-xs font-medium mb-1">{t('layer.lineWidth')}</label>
+            <input {...numberInput(ts.lineWidth, (v) => setTab(s => ({ ...s, lineWidth: v })))}
+              placeholder="2" className="w-full h-9 px-2 text-sm border border-border rounded bg-card" />
+          </div>
+        </div>
+      ) : kind === 'polygon' ? (
+        // 面状图：线宽（其余为边框/填充颜色与输出格式）
+        <div className="col-span-2 grid grid-cols-2 gap-4">
           <div>
             <label className="block text-xs font-medium mb-1">{t('layer.lineWidth')}</label>
             <input {...numberInput(ts.lineWidth, (v) => setTab(s => ({ ...s, lineWidth: v })))}
@@ -429,37 +475,48 @@ export default function LayerToolsPage() {
           </div>
         </div>
       )}
-      {/* 颜色：扇区 = 边框颜色 + 填充颜色（均可无色：不描边 / 镂空）；
+      {/* 颜色：扇区/面状图 = 边框颜色 + 填充颜色（均可无色：不描边 / 镂空）；
           点图 = 填充颜色（无色 → 空心点），填充无色时显示空心轮廓色 */}
-      {colorField(
-        isSector ? t('layer.borderColor') : t('layer.fillColor'),
-        isSector ? ts.borderColor : ts.fillColor,
-        (v) => setTab(s => {
-          if (!isSector && v === NO_FILL_COLOR && s.fillColor !== NO_FILL_COLOR) {
-            // 点图转无色：把原填充色留给轮廓色，避免空心点颜色突变
-            return { ...s, fillColor: v, borderColor: s.fillColor, color: s.fillColor }
-          }
-          return isSector
-            ? { ...s, borderColor: v, color: v }
-            : { ...s, fillColor: v, color: v }
-        }),
-        true,
-      )}
-      {isSector
-        ? colorField(t('layer.fillColor'), ts.fillColor,
-            (v) => setTab(s => ({ ...s, fillColor: v })), true)
-        : ts.fillColor === NO_FILL_COLOR && (
-            <div className="col-span-2">
-              {colorField(t('layer.borderColor'), ts.borderColor,
-                (v) => setTab(s => ({ ...s, borderColor: v })))}
-              <p className="text-[10px] text-muted-foreground mt-1">{t('layer.hollowPointHint')}</p>
-            </div>
+      {kind === 'polygon' ? (
+        <>
+          {colorField(t('layer.borderColor'), ts.borderColor,
+            (v) => setTab(s => ({ ...s, borderColor: v, color: v })), true)}
+          {colorField(t('layer.fillColor'), ts.fillColor,
+            (v) => setTab(s => ({ ...s, fillColor: v })), true)}
+        </>
+      ) : (
+        <>
+          {colorField(
+            kind === 'sector' ? t('layer.borderColor') : t('layer.fillColor'),
+            kind === 'sector' ? ts.borderColor : ts.fillColor,
+            (v) => setTab(s => {
+              if (kind === 'point' && v === NO_FILL_COLOR && s.fillColor !== NO_FILL_COLOR) {
+                // 点图转无色：把原填充色留给轮廓色，避免空心点颜色突变
+                return { ...s, fillColor: v, borderColor: s.fillColor, color: s.fillColor }
+              }
+              return kind === 'sector'
+                ? { ...s, borderColor: v, color: v }
+                : { ...s, fillColor: v, color: v }
+            }),
+            true,
           )}
+          {kind === 'sector'
+            ? colorField(t('layer.fillColor'), ts.fillColor,
+                (v) => setTab(s => ({ ...s, fillColor: v })), true)
+            : ts.fillColor === NO_FILL_COLOR && (
+                <div className="col-span-2">
+                  {colorField(t('layer.borderColor'), ts.borderColor,
+                    (v) => setTab(s => ({ ...s, borderColor: v })))}
+                  <p className="text-[10px] text-muted-foreground mt-1">{t('layer.hollowPointHint')}</p>
+                </div>
+              )}
+        </>
+      )}
       {/* 输出格式多选勾选 */}
       <div className="col-span-2">
         <label className="block text-xs font-medium mb-1">{t('layer.formats')}</label>
         <div className="flex gap-4">
-          {ALL_FORMATS.map(fmt => (
+          {(kind === 'polygon' ? POLYGON_FORMATS : ALL_FORMATS).map(fmt => (
             <label key={fmt} className="flex items-center gap-1.5 text-xs cursor-pointer">
               <input
                 type="checkbox"
@@ -484,6 +541,8 @@ export default function LayerToolsPage() {
       missing_coord: t('layer.statsMissingCoord'),
       invalid_coord: t('layer.statsInvalidCoord'),
       invalid_azimuth: t('layer.statsInvalidAzimuth'),
+      missing_polygon: t('layer.statsMissingPolygon'),
+      invalid_polygon: t('layer.statsInvalidPolygon'),
       missing_name: t('layer.statsMissingName'),
     }
     return map[reason] || reason
@@ -508,6 +567,8 @@ export default function LayerToolsPage() {
                 missing_coord: t('layer.statsMissingCoord'),
                 invalid_coord: t('layer.statsInvalidCoord'),
                 invalid_azimuth: t('layer.statsInvalidAzimuth'),
+                missing_polygon: t('layer.statsMissingPolygon'),
+                invalid_polygon: t('layer.statsInvalidPolygon'),
                 missing_name: t('layer.statsMissingName'),
               })}
             </p>
@@ -551,14 +612,14 @@ export default function LayerToolsPage() {
     </div>
   )
 
-  // 渲染 Tab 内容（扇区/点图共用骨架，参数和校验差异；文件共享，读 sharedFile）
+  // 渲染 Tab 内容（扇区/点图/面状图共用骨架，参数和校验差异；文件共享，读 sharedFile）
   // 三张卡片横向铺满、纵向撑满：数据来源（文件导入 + Sheet）/ 图层属性 / 参数设置 + 生成
   const renderTabContent = (
     ts: TabState,
     setTab: (u: (s: TabState) => TabState) => void,
     file: SharedFile,
     onSheetChange: (sheet: string) => void,
-    includeAzimuth: boolean,
+    kind: TabKind,
   ) => (
     <div className="flex-1 grid grid-cols-1 lg:grid-cols-12 gap-6">
       {/* 卡片①（3/12）：数据来源 = 文件导入 + Sheet 选择 */}
@@ -581,6 +642,17 @@ export default function LayerToolsPage() {
               </div>
               <input type="file" className="hidden" accept=".xlsx,.xls,.txt,.csv" onChange={handleFile} disabled={uploading} />
             </label>
+
+            {/* 面状图数据模板：与「地理化数据」同源的多边形模板 */}
+            {kind === 'polygon' && (
+              <div className="mt-2">
+                <a href="/api/v1/data/template/geo_polygon" download="GeoDataTemplate-多边形.xlsx"
+                  className="inline-flex items-center gap-1 text-xs text-primary hover:underline">
+                  <Download size={12} /> {t('layer.downloadTemplate')}
+                </a>
+                <p className="text-[10px] text-muted-foreground mt-1">{t('layer.polygonHint')}</p>
+              </div>
+            )}
 
             {/* 进度条 + 状态（模块级进度：切页不丢失，回来实时恢复）+ 取消按钮 */}
             {uploading && uploadProgress.percent > 0 && (
@@ -618,7 +690,8 @@ export default function LayerToolsPage() {
         <div className="flex-1 p-4 bg-card border border-border rounded-lg">
           <LayerAttributeConfig
             columns={file.columns}
-            includeAzimuth={includeAzimuth}
+            includeAzimuth={kind === 'sector'}
+            includePolygon={kind === 'polygon'}
             selectedFields={ts.selectedFields}
             onSelectedFieldsChange={(v) => setTab(s => ({ ...s, selectedFields: v }))}
             fieldMappings={ts.fieldMappings}
@@ -631,7 +704,7 @@ export default function LayerToolsPage() {
       <div className="lg:col-span-4 flex flex-col">
         <div className="flex-1 p-4 bg-card border border-border rounded-lg flex flex-col">
           <p className="text-xs font-medium mb-3">{t('layer.params')}</p>
-          {renderParams(ts, setTab)}
+          {renderParams(ts, setTab, kind)}
           {/* 生成按钮紧跟参数（输出格式）下方，卡片剩余空白留在按钮下方 */}
           <div className="mt-4 pt-4 border-t border-border">
             <button onClick={handleGenerate} disabled={generating || !file.filePath || !file.sheetName}
@@ -652,19 +725,20 @@ export default function LayerToolsPage() {
   }
 
   // 切换 Tab：清空非激活 Tab 的旧下载结果（按钮+统计），避免交叉显示；配置各自保留
-  const handleTabChange = (v: 'sector' | 'point') => {
+  const handleTabChange = (v: TabKind) => {
     setActiveTab(v)
-    if (v === 'point') setSectorState(s => ({ ...s, result: null }))
-    else setPointState(s => ({ ...s, result: null }))
+    if (v !== 'sector') setSectorState(s => ({ ...s, result: null }))
+    if (v !== 'point') setPointState(s => ({ ...s, result: null }))
+    if (v !== 'polygon') setPolygonState(s => ({ ...s, result: null }))
   }
 
   return (
     <div className="p-8 w-full flex-1 flex flex-col">
       <h1 className="text-base font-bold mb-6">{t('nav.layerTools')}</h1>
 
-      <Tabs.Root value={activeTab} onValueChange={(v) => handleTabChange(v as 'sector' | 'point')}
+      <Tabs.Root value={activeTab} onValueChange={(v) => handleTabChange(v as TabKind)}
         className="flex-1 flex flex-col">
-        {/* ① 扇区/点图 Tab */}
+        {/* ① 扇区/点图/面状图 Tab */}
         <Tabs.List className="flex gap-2 mb-6 border-b border-border shrink-0" aria-label={t('nav.layerTools')}>
           <Tabs.Trigger value="sector"
             className="px-4 py-2 text-sm font-medium rounded-t-lg transition-colors data-[state=active]:bg-card data-[state=active]:text-primary data-[state=active]:border-b-2 data-[state=active]:border-primary data-[state=inactive]:text-muted-foreground data-[state=inactive]:hover:text-foreground">
@@ -674,18 +748,28 @@ export default function LayerToolsPage() {
             className="px-4 py-2 text-sm font-medium rounded-t-lg transition-colors data-[state=active]:bg-card data-[state=active]:text-primary data-[state=active]:border-b-2 data-[state=active]:border-primary data-[state=inactive]:text-muted-foreground data-[state=inactive]:hover:text-foreground">
             {t('layer.pointLayer')}
           </Tabs.Trigger>
+          <Tabs.Trigger value="polygon"
+            className="px-4 py-2 text-sm font-medium rounded-t-lg transition-colors data-[state=active]:bg-card data-[state=active]:text-primary data-[state=active]:border-b-2 data-[state=active]:border-primary data-[state=inactive]:text-muted-foreground data-[state=inactive]:hover:text-foreground">
+            {t('layer.polygonLayer')}
+          </Tabs.Trigger>
         </Tabs.List>
 
         {/* ② 三张卡片（数据来源 / 图层属性 / 参数设置+生成）横向铺满、纵向撑满剩余高度 */}
         <Tabs.Content value="sector" className="flex-1 flex flex-col data-[state=inactive]:hidden">
-          {renderTabContent(sectorState, (u) => setSectorState(s => u(s)), sharedFile, handleSheetChange, true)}
+          {renderTabContent(sectorState, (u) => setSectorState(s => u(s)), sharedFile, handleSheetChange, 'sector')}
           {sectorState.error && <p className="mt-4 text-xs text-red-500">{sectorState.error}</p>}
         </Tabs.Content>
 
         {/* 点图 Tab */}
         <Tabs.Content value="point" className="flex-1 flex flex-col data-[state=inactive]:hidden">
-          {renderTabContent(pointState, (u) => setPointState(s => u(s)), sharedFile, handleSheetChange, false)}
+          {renderTabContent(pointState, (u) => setPointState(s => u(s)), sharedFile, handleSheetChange, 'point')}
           {pointState.error && <p className="mt-4 text-xs text-red-500">{pointState.error}</p>}
+        </Tabs.Content>
+
+        {/* 面状图 Tab */}
+        <Tabs.Content value="polygon" className="flex-1 flex flex-col data-[state=inactive]:hidden">
+          {renderTabContent(polygonState, (u) => setPolygonState(s => u(s)), sharedFile, handleSheetChange, 'polygon')}
+          {polygonState.error && <p className="mt-4 text-xs text-red-500">{polygonState.error}</p>}
         </Tabs.Content>
       </Tabs.Root>
     </div>

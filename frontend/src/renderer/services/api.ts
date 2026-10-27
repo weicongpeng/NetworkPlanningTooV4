@@ -1776,9 +1776,10 @@ export interface GenerateLayerParams {
   lonCol: string
   latCol: string
   azimuthCol?: string
+  polygonCol?: string     // 面状图：多边形坐标串列（"经度 纬度,…"）
   attributes: string[]
-  outputFormats: Array<'tab' | 'mif' | 'kml'>  // 多格式
-  outputFormat?: 'tab' | 'mif' | 'kml'          // 旧单值，兼容
+  outputFormats: Array<'tab' | 'mif' | 'kml' | 'shp'>  // 多格式
+  outputFormat?: 'tab' | 'mif' | 'kml' | 'shp'         // 旧单值，兼容
   radiusM?: number
   beamwidth?: number
   lineWidth?: number
@@ -1872,6 +1873,25 @@ export const layerToolsApi = {
     if (params.pointSize) formData.append('point_size', String(params.pointSize))
     if (params.pointShape) formData.append('point_shape', params.pointShape)
     const res = await uploadClient.post('/layer/point', formData)
+    return res.data
+  },
+
+  // 生成面状图层（用 file_path；polygonCol 为 "经度 纬度,…" 坐标串列）
+  generatePolygon: async (params: GenerateLayerParams): Promise<GenerateLayerResult> => {
+    const formData = new FormData()
+    formData.append('file_path', params.filePath)
+    if (params.sourceFilename) formData.append('source_filename', params.sourceFilename)
+    formData.append('sheet_name', params.sheetName)
+    formData.append('name_col', params.nameCol)
+    formData.append('polygon_col', params.polygonCol || '')
+    formData.append('attributes', JSON.stringify(params.attributes))
+    formData.append('output_formats', (params.outputFormats || [params.outputFormat!]).join(','))
+    if (params.lineWidth) formData.append('line_width', String(params.lineWidth))
+    if (params.color) formData.append('color', params.color)
+    if (params.borderColor) formData.append('border_color', params.borderColor)
+    if (params.fillColor) formData.append('fill_color', params.fillColor)
+    if (params.opacity != null) formData.append('opacity', String(params.opacity))
+    const res = await uploadClient.post('/layer/polygon', formData)
     return res.data
   },
 }

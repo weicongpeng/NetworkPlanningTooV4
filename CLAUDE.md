@@ -170,7 +170,7 @@ FastAPI (backend/app/)
 
 ### 桌面端运行形态（`desktop/`）
 
-- `desktop/launcher.py` 是 PyInstaller 入口：daemon 线程跑 uvicorn 绑 `127.0.0.1` 随机端口，主线程开 pywebview 窗口；注入 `NPT_DESKTOP=1`、`NPT_MAX_WORKERS=1`（Windows 无 fork）、`NPT_SERVER_URL`（默认 `https://app.pengwc.asia`）；可写数据落 `%APPDATA%\NetworkPlanningTool`（`NPT_DATA_ROOT` 可覆盖），与安装目录解耦；**业务数据按运行模式分档**（`profiles/shared/`、`profiles/standalone/` 各一套 data.db/导入文件/任务历史，详见「数据隔离」）；Windows 命名互斥体 `Local\NPTDesktop` 保证单实例；创建窗口须显式 `text_select=True`（pywebview 默认 False 会注入 `body{user-select:none}`，桌面端 UI 文字无法选中复制，网页端却能复制）；地图页「全屏」由壳层切窗口全屏（`POST /desktop/fullscreen` → `desktop_bridge.set_window_fullscreen` → pywebview `toggle_fullscreen()`，退出后补 `maximize()` 回到启动时的最大化窗口）——WebView2 里的 HTML Fullscreen 只让网页内容占满 WebView 自身，窗口/标题栏不变、占不满屏幕
+- `desktop/launcher.py` 是 PyInstaller 入口：daemon 线程跑 uvicorn 绑 `127.0.0.1` 随机端口，主线程开 pywebview 窗口；注入 `NPT_DESKTOP=1`、`NPT_MAX_WORKERS=1`（Windows 无 fork）、`NPT_SERVER_URL`（默认 `https://app.pengwc.asia`）；可写数据落 `%APPDATA%\NetworkPlanningTool`（`NPT_DATA_ROOT` 可覆盖），与安装目录解耦；**业务数据按运行模式分档**（`profiles/shared/`、`profiles/standalone/` 各一套 data.db/导入文件/任务历史，详见「数据隔离」）；Windows 命名互斥体 `Local\NPTDesktop` 保证单实例；创建窗口须显式 `text_select=True`（pywebview 默认 False 会注入 `body{user-select:none}`，桌面端 UI 文字无法选中复制，网页端却能复制）；地图页「全屏」由壳层切窗口全屏（`POST /desktop/fullscreen` → `desktop_bridge.set_window_fullscreen` → pywebview `toggle_fullscreen()`，退出后补 `maximize()` 回到启动时的最大化窗口）——WebView2 里的 HTML Fullscreen 只让网页内容占满 WebView 自身，窗口不变、占不满屏幕；**无边框窗口 + 自绘标题栏**：`create_window(frameless=True, easy_drag=False)`（无原生最小化/最大化/关闭），前端 `components/WindowTitleBar.tsx` 仅 desktopMode 渲染（App.tsx 顶层挂载，登录页也可见）：下载|最小化|最大化/还原|关闭 经 `POST /desktop/window-control` → `desktop_bridge.control_window` → launcher `_make_window_control_handler`（close 走 `window.destroy()`，保留 events.closing 看门狗与后台更新例外）；拖窗只走 `.pywebview-drag-region`（`DRAG_REGION_DIRECT_TARGET_ONLY=True` 避免按钮误拖，easy_drag 默认 True 必须关）；frameless 后原生边缘缩放消失，标题栏组件自绘 右/下/右下 把手（壳层按 min_size clamp）；maximized 缓存由壳层订阅 `window.events.maximized/restored` 维护，前端在窗口聚焦时 `GET /desktop/window-state` 校准（不轮询）；地图全屏的 Esc 退出由前端补绑（壳级全屏无 fullscreenchange/Esc 原生行为）。网页端不受影响（悬浮可拖拽下载图标仅 `!desktopMode` 渲染，下载弹窗两端共用 `AppDownloadDialog`）
 - **同一份后端代码跑两种形态**：`NPT_DESKTOP=1` 时 `api/__init__.py` 额外挂后台协程（`desktop_cloud_client.renewal_loop` 静默续期、`desktop_sync_service.sync_loop` 共享模式同步、`desktop_local.session_guard_loop` 单设备登录校验），并放行 `/api/v1/desktop`；服务器专用管理端点（`admin_users` 等）经 `core/security.reject_desktop_mode` 在桌面形态下一律 404
 - **所有桌面分支必须由 `NPT_DESKTOP` 门控，不得改变服务器（systemd）部署行为**
 - 授权：Ed25519 密钥对由 `desktop/tools/gen_keypair.py` 生成，私钥在 `desktop/tools/keys/`（已 gitignore，**禁止入库/外发**），公钥 hex 写入 `backend/app/core/license_public_key.py`；`desktop/tools/gen_license.py` 签发离线 `.nptlic`
@@ -215,7 +215,7 @@ FastAPI (backend/app/)
 | `/pci-check` | `PCICheckPage` | PCI 核查（复用距离/冲突/混淆/同站模3/对打模3/NR模30） |
 | `/tac-planning` | `TACPlanningPage` | TAC 规划 |
 | `/map` | `MapPage` | 地图工具（在线/离线、搜索、图层、绘制、编辑） |
-| `/layer` | `LayerToolsPage` | 图层制作（Excel → TAB/MIF/KML） |
+| `/layer` | `LayerToolsPage` | 图层制作（Excel → 扇区/点/面状图，TAB/MIF/KML/SHP） |
 | `/distance-match` | `DistanceMatchPage` | 批量距离匹配 |
 | `/site-spacing` | `SiteSpacingPage` | 站间距计算 |
 | `/frequency-conversion` | `FrequencyConversionPage` | 频点换算 |
@@ -239,7 +239,7 @@ FastAPI (backend/app/)
 | `user_settings.py` | `/api/v1/user` | 用户设置（地图偏好等，GET/PUT `/settings`） |
 | `data.py` | `/api/v1/data` | 上传（含分片）、全量工参与小区查询/批量更新、图层数据读写/下载 |
 | `geo_data.py` | `/api/v1/data` | 地理化数据上传（与 data 同前缀，不同 tag） |
-| `layer.py` | `/api/v1/layer` | 图层制作（`/excel-info`、`/point`、`/sector`） |
+| `layer.py` | `/api/v1/layer` | 图层制作（`/excel-info`、`/point`、`/sector`、`/polygon`） |
 | `pci.py` / `neighbor.py` / `tac.py` | `/api/v1/pci` 等 | 规划/核查、进度、结果、历史、导出、应用到工参 |
 | `distance_match.py` | `/api/v1/distance-match` | 批量距离匹配 |
 | `site_spacing.py` | `/api/v1/site-spacing` | 站间距计算 |
@@ -251,7 +251,7 @@ FastAPI (backend/app/)
 | `assistant.py` | `/api/v1/assistant` | LLM 配置、数据集、对话（需 `can_assistant`） |
 | `desktop_licenses.py` | `/api/v1/desktop-licenses` | 桌面授权管理（admin）：创建激活码/批准/禁用/解绑换机/重发码；数据组与到期以「用户管理」的（地市+运营商）/许可证到期为准（列表回写授权记录） |
 | `desktop_cloud.py` | `/api/v1/desktop-cloud` | 桌面客户端**公开**接口（授权服务器侧）：账号登录/单设备会话校验、激活/续期/申请（凭证=激活码或签名许可 + 机器码，非 JWT）、`/config`、数据集同步（`/data/session|manifest|dataset/{id}/package`）、`releases/latest` 与 `releases/download/{id}`（Range） |
-| `desktop_local.py` | `/api/v1/desktop` | 桌面版**本机**接口（仅 `NPT_DESKTOP=1`，否则 404）：`login`/`auth-poll`、`cloud-status|activate|renew|apply`、共享模式 `sync-status|run-mode|sync|sync-resolve`、`update/status|download|progress|snooze|install`、`exit`（经 `app/desktop_bridge.py` 关闭窗口）、`window-title`/`fullscreen`（经 `desktop_bridge` 写标题栏 / 切窗口全屏） |
+| `desktop_local.py` | `/api/v1/desktop` | 桌面版**本机**接口（仅 `NPT_DESKTOP=1`，否则 404）：`login`/`auth-poll`、`cloud-status|activate|renew|apply`、共享模式 `sync-status|run-mode|sync|sync-resolve`、`update/status|download|progress|snooze|install`、`exit`（经 `app/desktop_bridge.py` 关闭窗口）、`window-title`/`fullscreen`（经 `desktop_bridge` 写标题栏 / 切窗口全屏）、`window-control`/`window-state`（自绘标题栏的 最小化/最大化还原/关闭/边缘缩放 与状态校准） |
 | `desktop_releases.py` | `/api/v1/desktop-releases` | 桌面版安装包管理（admin）：分片上传、列表/编辑/删除/设最新 |
 | `system.py` | `/api/v1/system` | 状态/信息（`/info`、`/desktop-mode` 供前端探测桌面形态） |
 | `websocket.py` | `/api/v1/ws/tasks` | 任务进度推送 + 同组数据变更 `data_changed`（`?token=JWT` 登记数据组；**注意不是裸 `/ws`**） |

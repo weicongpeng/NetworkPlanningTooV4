@@ -27,9 +27,16 @@ DRIVER_MAP = {
     "tab": "MapInfo File",
     "mif": "MapInfo File",
     "kml": "KML",
+    "shp": "ESRI Shapefile",
 }
 # 扩展名
-EXT_MAP = {"tab": ".tab", "mif": ".mif", "kml": ".kml"}
+EXT_MAP = {"tab": ".tab", "mif": ".mif", "kml": ".kml", "shp": ".shp"}
+
+# 多边形坐标串：成对的 "经度 纬度"（允许负号/整数/小数，兼容 WKT POLYGON ((...)) 包裹）
+_POLY_COORD_RE = re.compile(r"(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)")
+
+# DBF 字段名上限（字节）。中文一字 3 字节，超出会截断到字符中间写坏 .dbf
+_DBF_FIELD_NAME_MAX_BYTES = 10
 
 # 点形状 → MapInfo Symbol shape 编号（MapInfo 3.0 Symbols：34=Circle 32=Square 33=Diamond 35=Star）
 # 修正：原 circle=35(Star)/square=33(Diamond)/diamond=36 全部错位 → 34/32/33
@@ -58,7 +65,10 @@ def is_no_color(value: Optional[str]) -> bool:
 _MAPINFO_INVALID = re.compile(r"[^\w一-鿿]+")
 
 # 生成前清理的历史输出后缀（含 -1/-2 序号残留）
-_CLEANUP_SUFFIXES = (".tab", ".dat", ".id", ".map", ".mif", ".mid", ".zip", ".kml")
+_CLEANUP_SUFFIXES = (
+    ".tab", ".dat", ".id", ".map", ".mif", ".mid", ".zip", ".kml",
+    ".shp", ".shx", ".dbf", ".prj", ".cpg", ".qml",
+)
 
 
 def _sanitize_field_name(name: str, index: int = 0) -> str:
@@ -94,6 +104,46 @@ def _dedupe_field_names(names: list) -> list:
             used.add(unique)
             result.append(unique)
     return result
+
+
+def _dbf_safe_name(name: str, index: int = 0) -> str:
+    """DBF 字段名净化：MapInfo 清洗后按 UTF-8 字节截断到 ≤10。
+
+    与 layer_edit_service 的同名逻辑保持一致：截断到多字节字符中间会写坏整个
+    .dbf（读回报 UnicodeDecodeError），此处按字节安全截断。
+    """
+    return _truncate_bytes(_sanitize_field_name(name, index), _DBF_FIELD_NAME_MAX_BYTES)
+
+
+def parse_polygon_coords(value: Any) -> tuple:
+    """解析多边形坐标串 → (点列表[(经度, 纬度)], 失败原因)。
+
+    支持 "经度 纬度,经度 纬度,…"（GeoDataTemplate -多边形.xlsx）以及 WKT
+    "POLYGON ((...))" 包裹（正则只取成对数字）。失败时返回 (None, reason)，
+    reason ∈ {'missing_polygon', 'invalid_polygon'}。
+    """
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return None, "missing_polygon"
+    text = str(value).strip()
+    if not text or text.lower() in ("nan", "none"):
+        return None, "missing_polygon"
+    pairs = _POLY_COORD_RE.findall(text)
+    if len(pairs) < 3:
+        return None, "invalid_polygon"
+    pts = []
+    for lon_s, lat_s in pairs:
+        lon, lat = float(lon_s), float(lat_s)
+        if not (-180 <= lon <= 180) or not (-90 <= lat <= 90):
+            return None, "invalid_polygon"
+        pts.append((lon, lat))
+    if len(set(pts)) < 3:
+        return None, "invalid_polygon"
+    try:
+        if Polygon(pts).area <= 0:
+            return None, "invalid_polygon"
+    except Exception:  # noqa: BLE001 — 退化几何一律按格式错误处理
+        return None, "invalid_polygon"
+    return pts, None
 
 
 def fast_destination(lat: float, lng: float, azimuth_deg: float, distance_m: float) -> tuple:
@@ -434,7 +484,7 @@ class LayerService:
         """写入文件（含样式注入），返回路径。文件名 = 源文件名 + sheet名 + 图层类型标记。
         中文编码：TAB/MIF 写前重命名列名为 ASCII 占位 + encoding='GBK' + 写后恢复列名。
         base 按 100 字节、sheet 按 50 字节截断，总长 < ext4 NAME_MAX 255。
-        layer_type: 'sector'/'point' 追加到文件名，保证扇区与点图不同文件（不互相覆盖）。
+        layer_type: 'sector'/'point'/'polygon' 追加到文件名，保证不同类型图层不同文件（不互相覆盖）。
         style: 样式参数（见 _apply_style 的签名键）；TAB 带样式时经临时 MIF 中转，见
         _write_styled_tab。为 None 或无有效颜色时只写数据不注入样式。
         """
@@ -442,7 +492,7 @@ class LayerService:
             raise ValueError(f"不支持的输出格式: {output_format}")
         base = _truncate_bytes(Path(source_filename).stem, 100)
         safe_sheet = _truncate_bytes(re.sub(r'[<>:"/\\|?*]', "_", sheet_name), 50)
-        type_tag = "_sector" if layer_type == "sector" else "_point"
+        type_tag = {"sector": "_sector", "point": "_point", "polygon": "_polygon"}.get(layer_type, "")
         fname = f"{base}_{safe_sheet}{type_tag}{EXT_MAP[output_format]}"
         out_path = self._unique_path(self.output_dir / fname)
         if output_format in ("tab", "mif"):
@@ -450,11 +500,53 @@ class LayerService:
             if output_format == "tab" and self._has_effective_style(style):
                 return self._write_styled_tab(gdf, out_path, sanitized_cols, style)
             self._write_mapinfo_raw(gdf, out_path, output_format, sanitized_cols)
+        elif output_format == "shp":
+            self._write_shapefile(gdf, out_path, style)
+            return out_path
         else:
             gdf.to_file(out_path, driver=DRIVER_MAP[output_format])
         if self._has_effective_style(style):
             self._apply_style(out_path, output_format, **style)
         return out_path
+
+    def _write_shapefile(self, gdf: gpd.GeoDataFrame, out_path: Path,
+                         style: Optional[Dict[str, Any]] = None) -> None:
+        """写 ESRI Shapefile：DBF 字段名净化 + 文本截断 + 同 stem .qml 样式。
+
+        DBF 字段名上限 10 字节（中文 3 字），超出按字节安全截断并去重；属性值完整保留。
+        样式无法写进 .shp/.dbf，改为写 QGIS .qml（同 stem，QGIS 打开即生效）。
+        """
+        attr_cols = [c for c in gdf.columns if c != gdf.geometry.name]
+        storage_cols = _dedupe_field_names(
+            [_dbf_safe_name(c, i) for i, c in enumerate(attr_cols)]
+        )
+        gdf = gdf.rename(columns=dict(zip(attr_cols, storage_cols)))
+        for c in storage_cols:
+            s = gdf[c]
+            if pd.api.types.is_datetime64_any_dtype(s.dtype):
+                gdf[c] = s.dt.strftime("%Y-%m-%d %H:%M:%S").fillna("")
+            elif pd.api.types.is_bool_dtype(s.dtype):
+                gdf[c] = s.astype(str)
+            elif s.dtype == object:
+                gdf[c] = s.map(lambda v: v[:254] if isinstance(v, str) and len(v) > 254 else v)
+        gdf.to_file(out_path, driver=DRIVER_MAP["shp"], encoding="utf-8")
+
+        if not self._has_effective_style(style):
+            return
+        from app.services.qml_style_writer import write_layer_qml
+
+        geom_type = str(gdf.geometry.geom_type.iloc[0]).lower()
+        kind = "polygon" if "polygon" in geom_type else ("line" if "line" in geom_type else "point")
+        qml_style = {
+            "kind": kind,
+            "fillColor": style.get("fill_color"),
+            "fillOff": is_no_color(style.get("fill_color")),
+            "strokeColor": style.get("border_color"),
+            "strokeOff": is_no_color(style.get("border_color")),
+            "fillOpacity": 1 - float(style.get("opacity") or 0),
+            "strokeWidth": style.get("line_width") or 2,
+        }
+        write_layer_qml(out_path.with_suffix(".qml"), kind, [qml_style] * len(gdf))
 
     @staticmethod
     def _has_effective_style(style: Optional[Dict[str, Any]]) -> bool:
@@ -904,6 +996,75 @@ class LayerService:
                 df, valid, lon_col, lat_col,
                 azimuth_col=azimuth_col, name_col=name_col,
             ),
+        }
+        return out, stats
+
+    def generate_polygon_layer(self, file_path: str, sheet_name: str,
+                               name_col: str, polygon_col: str,
+                               attributes: List[str], output_format: str,
+                               color: Optional[str] = None,
+                               source_filename: Optional[str] = None,
+                               border_color: Optional[str] = None,
+                               fill_color: Optional[str] = None,
+                               opacity: Optional[float] = None,
+                               line_width: Optional[float] = None):
+        """由多边形坐标串生成面状图层，返回 (输出文件路径, stats_dict)。
+
+        polygon_col 为 "经度 纬度,经度 纬度,…" 坐标串列（GeoDataTemplate -多边形.xlsx）。
+        attributes 为需要写入图层的原始属性列（默认全选，几何坐标列本身除外）。
+        border_color/fill_color 支持"无色"哨兵（'none'）：边框无色 → 不描边、填充无色 → 镂空。
+        SHP 无原生样式，样式写同 stem 的 .qml（QGIS 可用）。
+        """
+        df = self._read_sheet(file_path, sheet_name)
+        for col, label in ((polygon_col, "多边形坐标列"), (name_col, "标签名称列")):
+            if col not in df.columns:
+                raise ValueError(f"{label}不存在: {col}")
+
+        failures = {"missing_polygon": 0, "invalid_polygon": 0, "missing_name": 0}
+        valid = pd.Series(False, index=df.index)
+        geoms, details = [], []
+        for idx, rec in df.iterrows():
+            name_val = rec.get(name_col)
+            name_missing = (
+                name_val is None
+                or (isinstance(name_val, float) and math.isnan(name_val))
+                or str(name_val).strip() in ("", "nan")
+            )
+            pts, reason = parse_polygon_coords(rec.get(polygon_col))
+            if reason is None and name_missing:
+                reason = "missing_name"
+            if reason is not None:
+                failures[reason] += 1
+                details.append({
+                    "row": int(idx) + 2,
+                    "name": "" if name_missing else str(name_val),
+                    "reason": reason,
+                })
+                continue
+            valid.loc[idx] = True
+            geoms.append(Polygon(pts))
+
+        if valid.sum() == 0:
+            raise ValueError(f"全部行校验失败（成功 0/{len(df)}），请检查数据")
+
+        gdf = self._build_gdf(df, None, None, valid, attributes, geoms, keep_cols_extra=[name_col])
+        if output_format == "kml":
+            gdf = self._ensure_kml_name(gdf, name_col)
+        out = self._write(gdf, output_format,
+                          source_filename=source_filename or Path(file_path).name,
+                          sheet_name=sheet_name, layer_type="polygon",
+                          style=dict(border_color=border_color or color,
+                                     fill_color=fill_color or color,
+                                     opacity=opacity, is_point=False,
+                                     line_width=line_width))
+        self._verify_readable(out, int(valid.sum()), output_format)
+
+        stats = {
+            "total": int(len(df)),
+            "success": int(valid.sum()),
+            "failed": int(len(df) - valid.sum()),
+            "failures": {k: int(v) for k, v in failures.items()},
+            "failedDetails": details,
         }
         return out, stats
 

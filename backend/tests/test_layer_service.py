@@ -1281,3 +1281,93 @@ def test_normalize_tab_charset_preserves_gbk_field_names_bytewise(tmp_path):
         "字节级替换必须仅替换 Neutral → WindowsSimpChinese，"
         "其他字节（包括 GBK 字段名、CRLF）必须完全保留"
     )
+
+
+# ---------------------------------------------------------------- 面状图（多边形）
+
+POLYGON_RING = "114.65 23.60,114.66 23.60,114.66 23.61,114.65 23.61"
+
+
+@pytest.fixture
+def polygon_excel(tmp_path: Path) -> Path:
+    """面状图示例：合法 / WKT 包裹 / 点数不足 / 空坐标 / 缺名称"""
+    path = tmp_path / "polygon.xlsx"
+    pd.DataFrame({
+        "名称": ["A", "B", "C", "D", None],
+        "polygon": [
+            POLYGON_RING,
+            "POLYGON ((114.1 23.1, 114.2 23.1, 114.2 23.2, 114.1 23.1))",
+            "114.0 23.0,114.1 23.0",
+            "",
+            POLYGON_RING,
+        ],
+        "TAC": [1, 2, 3, 4, 5],
+    }).to_excel(path, sheet_name="多边形", index=False)
+    return path
+
+
+def test_parse_polygon_coords_variants():
+    """坐标串解析：普通列格式 / WKT 包裹 / 缺坐标 / 点数不足"""
+    from app.services.layer_service import parse_polygon_coords
+
+    pts, reason = parse_polygon_coords(POLYGON_RING)
+    assert reason is None and len(pts) == 4 and pts[0] == (114.65, 23.60)
+
+    pts, reason = parse_polygon_coords(
+        "POLYGON ((114.1 23.1, 114.2 23.1, 114.2 23.2, 114.1 23.1))"
+    )
+    assert reason is None and len(pts) == 4
+
+    assert parse_polygon_coords("") == (None, "missing_polygon")
+    assert parse_polygon_coords(None) == (None, "missing_polygon")
+    assert parse_polygon_coords("114.0 23.0,114.1 23.0") == (None, "invalid_polygon")
+    # 越界坐标
+    assert parse_polygon_coords("200 23,114 23,114 24") == (None, "invalid_polygon")
+    # 退化（共线）几何
+    assert parse_polygon_coords("114 23,114.1 23,114.2 23") == (None, "invalid_polygon")
+
+
+@pytest.mark.parametrize("fmt", ["tab", "mif", "kml", "shp"])
+def test_generate_polygon_layer_all_formats(service, polygon_excel, fmt):
+    """四种格式均可读回，属性字段完整保留"""
+    import pyogrio
+
+    out, stats = service.generate_polygon_layer(
+        str(polygon_excel), "多边形", "名称", "polygon", ["名称", "TAC"], fmt,
+        source_filename="polygon.xlsx",
+        border_color="#FF0000", fill_color="#00FF00", line_width=2,
+    )
+    assert stats["total"] == 5
+    assert stats["success"] == 2
+    assert stats["failures"] == {"missing_polygon": 1, "invalid_polygon": 1, "missing_name": 1}
+
+    gdf = pyogrio.read_dataframe(str(out))
+    assert len(gdf) == 2
+    assert "TAC" in gdf.columns
+    # KML 写前会把标签名列重命名为 Name（GDAL KML 驱动约定），其余格式保留原始列名
+    name_col = "Name" if fmt == "kml" else "名称"
+    assert name_col in gdf.columns
+    assert set(gdf[name_col]) == {"A", "B"}
+
+    if fmt == "kml":
+        text = out.read_text(encoding="utf-8")
+        assert "<LineStyle>" in text and "<PolyStyle>" in text
+    elif fmt == "mif":
+        text = out.read_text(encoding="gbk")
+        assert "Pen (2," in text and "Brush (2,65280" in text   # 边框/填充色已注入
+    elif fmt == "shp":
+        # SHP 无原生样式 → 同 stem .qml（QGIS 读样式）
+        qml = out.with_suffix(".qml")
+        assert qml.exists() and "SimpleFill" in qml.read_text(encoding="utf-8")
+        # 配套文件齐全（打包下载依赖）
+        for ext in (".shx", ".dbf", ".prj", ".cpg"):
+            assert out.with_suffix(ext).exists()
+
+
+def test_generate_polygon_layer_requires_attributes(service, polygon_excel):
+    """未选属性列 → 报错（与其他图层类型一致）"""
+    with pytest.raises(ValueError):
+        service.generate_polygon_layer(
+            str(polygon_excel), "多边形", "名称", "polygon", [], "tab",
+            source_filename="polygon.xlsx",
+        )

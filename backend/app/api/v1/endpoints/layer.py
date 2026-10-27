@@ -24,12 +24,16 @@ ALLOWED_EXTS = {".xlsx", ".xls", ".txt", ".csv"}
 
 
 def _companion_files(out: Path) -> list:
-    """TAB/MIF 的精确配套文件（不含历史序号残留）。TAB: .tab/.dat/.id/.map；MIF: .mif/.mid；KML: .kml 单文件。"""
+    """TAB/MIF/SHP 的精确配套文件（不含历史序号残留）。
+    TAB: .tab/.dat/.id/.map；MIF: .mif/.mid；SHP: .shp/.shx/.dbf/.prj/.cpg/.qml；KML: .kml 单文件。"""
     stem = out.stem
     if out.suffix == ".tab":
         return [out.parent / f"{stem}{s}" for s in (".tab", ".dat", ".id", ".map") if (out.parent / f"{stem}{s}").exists()]
     if out.suffix == ".mif":
         return [out.parent / f"{stem}{s}" for s in (".mif", ".mid") if (out.parent / f"{stem}{s}").exists()]
+    if out.suffix == ".shp":
+        return [out.parent / f"{stem}{s}" for s in (".shp", ".shx", ".dbf", ".prj", ".cpg", ".qml")
+                if (out.parent / f"{stem}{s}").exists()]
     return [out]
 
 
@@ -53,8 +57,8 @@ def _zip_layer(out_path: Path, fmt_tag: str = "") -> Path:
 
 
 def _finalize_output(out: Path, output_format: str, fmt_tag: str = "") -> dict:
-    """根据输出格式确定下载文件名/URL：TAB/MIF 多文件打包成 zip（含格式后缀），KML 单文件直接返回"""
-    if output_format in ("tab", "mif"):
+    """根据输出格式确定下载文件名/URL：TAB/MIF/SHP 多文件打包成 zip（含格式后缀），KML 单文件直接返回"""
+    if output_format in ("tab", "mif", "shp"):
         zip_path = _zip_layer(out, fmt_tag)
         return {"filename": zip_path.name, "download_url": f"/layer-files/{zip_path.name}"}
     # KML 单文件
@@ -185,6 +189,59 @@ async def generate_point(
                 attr_list, fmt, color or None, original_name,
                 border_color or color, fill_color, opacity,
                 point_size, point_shape,
+            )
+            outs.append(out)
+        return {"success": True, "data": {**_finalize_outputs(outs, fmt_list, _fmt_tag(fmt_list)), "stats": stats}}
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"生成失败: {str(e)}")
+    finally:
+        if src is not None:
+            src.unlink(missing_ok=True)
+
+
+@router.post("/polygon")
+async def generate_polygon(
+    file: Optional[UploadFile] = None,
+    file_path: Optional[str] = Form(None),
+    sheet_name: str = Form(...),
+    name_col: str = Form(...),
+    polygon_col: str = Form(...),
+    attributes: str = Form("[]"),
+    output_formats: Optional[str] = Form(None),   # 逗号分隔多选，优先
+    output_format: str = Form("tab"),             # 旧单值，兼容
+    color: Optional[str] = Form(None),            # 旧单值：边框/填充缺省时同时应用
+    border_color: Optional[str] = Form(None),
+    fill_color: Optional[str] = Form(None),
+    opacity: Optional[float] = Form(None),        # 0-1
+    line_width: Optional[float] = Form(None),     # 描边线宽（像素，clamp 1-7）
+    source_filename: Optional[str] = Form(None),
+    current_user=Depends(require_data_import),
+):
+    """由多边形坐标串生成面状图层，返回下载 URL + stats"""
+    src = None
+    try:
+        src, original_name = _save_upload(file, file_path, source_filename)
+        attr_list = json.loads(attributes) if attributes else []
+        fmt_list = [f.strip() for f in (output_formats or output_format).split(",") if f.strip()] or ["tab"]
+
+        _base = _truncate_bytes(Path(original_name).stem, 100)
+        _safe_sheet = re.sub(r'[<>:"/\\|?*]', "_", sheet_name)
+        layer_service._cleanup_old_outputs(f"{_base}_{_safe_sheet}_polygon")
+
+        outs, stats = [], None
+        for fmt in fmt_list:
+            out, stats = await run_in_threadpool(
+                layer_service.generate_polygon_layer,
+                str(src), sheet_name, name_col, polygon_col,
+                attr_list, fmt, color or None, original_name,
+                border_color or color, fill_color or color, opacity,
+                line_width,
             )
             outs.append(out)
         return {"success": True, "data": {**_finalize_outputs(outs, fmt_list, _fmt_tag(fmt_list)), "stats": stats}}

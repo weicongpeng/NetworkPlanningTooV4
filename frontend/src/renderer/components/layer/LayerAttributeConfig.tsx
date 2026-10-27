@@ -5,6 +5,7 @@ import { autoMatchFields, LAYER_FIELD_MATCHES, LayerFieldMatch } from '../../con
 interface Props {
   columns: string[]
   includeAzimuth: boolean
+  includePolygon?: boolean                    // 面状图：只映射名称 + 多边形坐标串
   selectedFields: Record<string, string>      // 已选属性列名 → 列名
   onSelectedFieldsChange: (f: Record<string, string>) => void
   fieldMappings: Record<string, string>       // type → 列名
@@ -13,28 +14,35 @@ interface Props {
 
 /**
  * 图层属性配置：列勾选 + 关键字匹配下拉
- * 勾选的列进入图层属性；name/lon/lat/azimuth 四类关键字必选映射。
+ * 勾选的列进入图层属性；name/lon/lat/azimuth/polygon 关键字必选映射。
  */
 export function LayerAttributeConfig({
-  columns, includeAzimuth, selectedFields, onSelectedFieldsChange,
+  columns, includeAzimuth, includePolygon = false, selectedFields, onSelectedFieldsChange,
   fieldMappings, onFieldMappingsChange,
 }: Props) {
   const { t } = useTranslation()
   const fieldTypes: LayerFieldMatch[] = useMemo(
-    () => LAYER_FIELD_MATCHES.filter(m => includeAzimuth || m.type !== 'azimuth'),
-    [includeAzimuth],
+    () => LAYER_FIELD_MATCHES.filter(m => {
+      if (m.type === 'azimuth') return includeAzimuth
+      if (m.type === 'polygon') return includePolygon
+      // 面状图不需要单独的经度/纬度列
+      if (m.type === 'longitude' || m.type === 'latitude') return !includePolygon
+      return true
+    }),
+    [includeAzimuth, includePolygon],
   )
 
   // 列变化时自动匹配关键字，并默认全选所有列作为属性
+  // （面状图排除多边形坐标串列本身：它是几何，不作为属性字段写入图层）
   useEffect(() => {
     if (!columns.length) return
-    const matched = autoMatchFields(columns, includeAzimuth)
+    const matched = autoMatchFields(columns, includeAzimuth, includePolygon)
     onFieldMappingsChange({ ...matched })
     const all: Record<string, string> = {}
-    columns.forEach(c => { all[c] = c })
+    columns.forEach(c => { if (c !== matched.polygon) all[c] = c })
     onSelectedFieldsChange(all)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [columns.join('|'), includeAzimuth])
+  }, [columns.join('|'), includeAzimuth, includePolygon])
 
   const toggleAttribute = (col: string, checked: boolean) => {
     const next = { ...selectedFields }

@@ -957,3 +957,84 @@ def test_companion_files_collects_exact_stem_only(tmp_path):
     (tmp_path / "只tab.tab").write_text("x")
     files = _companion_files(tmp_path / "只tab.tab")
     assert {f.name for f in files} == {"只tab.tab"}
+
+
+def _make_polygon_excel() -> str:
+    """面状图示例：名称 + 多边形坐标串 + 附加属性"""
+    tmp = tempfile.mktemp(suffix=".xlsx")
+    ring = "114.65 23.60,114.66 23.60,114.66 23.61,114.65 23.61,114.65 23.60"
+    pd.DataFrame({
+        "名称": ["高新区", "明珠"],
+        "polygon": [ring, ring],
+        "TAC": [100, 200],
+    }).to_excel(tmp, sheet_name="多边形", index=False)
+    return tmp
+
+
+def test_polygon_endpoint_multi_format_zip_includes_all_companions():
+    """output_formats=tab,shp,kml,mif → 单一 zip 内含四种格式及全部配套文件"""
+    import io
+    import zipfile
+
+    path = _make_polygon_excel()
+    client = _make_client()
+    try:
+        with open(path, "rb") as f:
+            resp = client.post(
+                "/api/v1/layer/polygon",
+                files={"file": ("polygon.xlsx", f, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+                data={
+                    "sheet_name": "多边形", "name_col": "名称", "polygon_col": "polygon",
+                    "attributes": '["名称", "TAC"]', "output_formats": "tab,shp,kml,mif",
+                    "border_color": "#FF0000", "fill_color": "#00FF00", "line_width": "2",
+                },
+            )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()["data"]
+        assert body["stats"]["success"] == 2
+        assert body["filename"].endswith(".zip")
+        dl = client.get(body["download_url"])
+        assert dl.status_code == 200
+        with zipfile.ZipFile(io.BytesIO(dl.content)) as zf:
+            names = zf.namelist()
+        suffixes = {Path(n).suffix for n in names}
+        assert {".tab", ".dat", ".id", ".map", ".mif", ".mid", ".kml",
+                ".shp", ".shx", ".dbf", ".prj", ".cpg", ".qml"}.issubset(suffixes)
+        assert len(names) == len(set(names))
+    finally:
+        os.remove(path)
+
+
+def test_polygon_endpoint_reports_invalid_rows():
+    """坐标无效行计入 stats.failed 且不影响其余行出图"""
+    path = tempfile.mktemp(suffix=".xlsx")
+    pd.DataFrame({
+        "名称": ["A", "B"],
+        "polygon": ["114.65 23.60,114.66 23.60,114.66 23.61", "114.0 23.0,114.1 23.0"],
+    }).to_excel(path, sheet_name="多边形", index=False)
+    client = _make_client()
+    try:
+        with open(path, "rb") as f:
+            resp = client.post(
+                "/api/v1/layer/polygon",
+                files={"file": ("polygon.xlsx", f, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+                data={
+                    "sheet_name": "多边形", "name_col": "名称", "polygon_col": "polygon",
+                    "attributes": '["名称"]', "output_formats": "tab",
+                },
+            )
+        assert resp.status_code == 200
+        stats = resp.json()["data"]["stats"]
+        assert stats["total"] == 2 and stats["success"] == 1
+        assert stats["failures"]["invalid_polygon"] == 1
+    finally:
+        os.remove(path)
+
+
+def test_geo_polygon_template_download():
+    """面状图模板下载：返回 GeoDataTemplate -多边形.xlsx"""
+    client = _make_client()
+    resp = client.get("/api/v1/data/template/geo_polygon")
+    assert resp.status_code == 200
+    assert resp.content[:2] == b"PK"   # xlsx 是 zip 容器
+    assert "GeoDataTemplate" in resp.headers.get("content-disposition", "")

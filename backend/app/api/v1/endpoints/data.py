@@ -972,6 +972,10 @@ async def download_template(template_type: str):
         elif template_type == "geo_data":
             prefix = "GeoDataTemplate"
             description = "地理化数据模板"
+        elif template_type == "geo_polygon":
+            # 图层制作「面状图」页使用的多边形模板（与地理化数据同源）
+            prefix = "GeoDataTemplate -多边形"
+            description = "面状图层数据模板"
         else:
             raise HTTPException(
                 status_code=400, detail=f"不支持的模板类型: {template_type}"
@@ -993,6 +997,17 @@ async def download_template(template_type: str):
             template_file = template_dir / target_filename
             if not template_file.exists():
                 template_file = None
+        elif template_type == "geo_polygon":
+            # 精确名优先；兼容文件名带空格的存量模板，排除百度坐标系变体
+            exact = template_dir / "GeoDataTemplate -多边形.xlsx"
+            template_file = exact if exact.is_file() else None
+            if template_file is None:
+                for file in template_dir.iterdir():
+                    if (file.is_file() and file.suffix.lower() == ".xlsx"
+                            and not file.name.startswith("~$")
+                            and "多边形" in file.name and "百度" not in file.name):
+                        template_file = file
+                        break
         else:
             # 优先精确匹配规范文件名，找不到再按前缀搜索
             # （前缀匹配兼容服务器上尚未改名的旧模板 ProjectParameter_mongoose.xlsx）
@@ -1033,11 +1048,19 @@ async def download_template(template_type: str):
             download_filename = "cell-tree-export.xlsx"
         elif template_type == "geo_data":
             download_filename = "GeoDataTemplate.zip"
+        elif template_type == "geo_polygon":
+            download_filename = "GeoDataTemplate-多边形.xlsx"
         else:
             download_filename = template_file.name
 
-        # 使用标准的Content-Disposition格式
-        content_disposition = f'attachment; filename="{download_filename}"'
+        # 使用标准的Content-Disposition格式（中文文件名按 RFC 5987 编码，HTTP 头只能是 latin-1）
+        if download_filename.isascii():
+            content_disposition = f'attachment; filename="{download_filename}"'
+        else:
+            from urllib.parse import quote
+            content_disposition = (
+                f"attachment; filename*=UTF-8''{quote(download_filename)}"
+            )
 
         print(
             f"[API] download_template: template_type={template_type}, file={template_file.name}, download_as={download_filename}, media_type={media_type}"

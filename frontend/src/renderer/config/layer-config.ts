@@ -6,7 +6,7 @@ export const PRESET_COLORS = [
 
 // 图层制作关键字匹配规则（与后端 GeoFieldDetector 保持一致）
 export interface LayerFieldMatch {
-  type: 'name' | 'longitude' | 'latitude' | 'azimuth'
+  type: 'name' | 'longitude' | 'latitude' | 'azimuth' | 'polygon'
   labelKey: string
   patterns: string[]
 }
@@ -16,14 +16,19 @@ export const LAYER_FIELD_MATCHES: LayerFieldMatch[] = [
   { type: 'longitude', labelKey: 'layer.fieldLongitude', patterns: ['经度', 'longitude', 'lng', 'lon', 'long', 'x'] },
   { type: 'latitude', labelKey: 'layer.fieldLatitude', patterns: ['纬度', 'latitude', 'lat', 'y'] },
   { type: 'azimuth', labelKey: 'layer.fieldAzimuth', patterns: ['方位角', '方向角', 'azimuth', 'azi', 'azim', 'bearing'] },
+  { type: 'polygon', labelKey: 'layer.fieldPolygon', patterns: ['polygon', '多边形', '轮廓', '边界', '坐标串', 'geometry'] },
 ]
 
 // 自动匹配：对给定列名列表，找出每个字段最匹配的列
-export function autoMatchFields(columns: string[], includeAzimuth: boolean): Record<string, string> {
+export function autoMatchFields(columns: string[], includeAzimuth: boolean,
+                                includePolygon = false): Record<string, string> {
   const result: Record<string, string> = {}
   const lowerCols = columns.map(c => c.toLowerCase())
   for (const match of LAYER_FIELD_MATCHES) {
     if (match.type === 'azimuth' && !includeAzimuth) continue
+    if (match.type === 'polygon' && !includePolygon) continue
+    // 面状图不使用经纬度列（坐标合并在 polygon 列中）
+    if (includePolygon && (match.type === 'longitude' || match.type === 'latitude')) continue
     let found: string | null = null
     // 精确匹配优先（含单字符 x/y 仅精确）
     for (let i = 0; i < columns.length; i++) {
@@ -54,5 +59,10 @@ export const LAYER_DEFAULT_PARAMS = {
     pointSize: 12,            // 点大小默认 12
     pointShape: 'circle',
     borderColor: '#0000FF',   // 默认蓝色
+  },
+  polygon: {
+    lineWidth: 2,
+    borderColor: '#FFFF00',   // 边框黄色
+    fillColor: '#FF0000',     // 填充红色
   },
 }
