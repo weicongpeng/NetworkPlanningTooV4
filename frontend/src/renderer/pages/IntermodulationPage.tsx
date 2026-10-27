@@ -254,66 +254,70 @@ export default function IntermodulationPage() {
         <p className="text-sm text-muted-foreground mt-1">{t('im3Evaluation.subtitle')}</p>
       </div>
 
-      <BandInputCard
-        title={t('im3Evaluation.source1')}
-        value={source1}
-        onChange={setSource1}
-      />
-      <BandInputCard
-        title={t('im3Evaluation.source2')}
-        value={source2}
-        onChange={setSource2}
-      />
-      <BandInputCard
-        title={t('im3Evaluation.receiver')}
-        value={receiver}
-        onChange={setReceiver}
-      />
-
-      <div className="p-6 bg-card rounded-lg border border-border space-y-4">
-        <h2 className="text-sm font-semibold">{t('im3Evaluation.params')}</h2>
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-          <label className="block text-sm">
-            <span className="text-muted-foreground">{t('im3Evaluation.imType')}</span>
-            <select
-              value={imType}
-              onChange={event => setImType(event.target.value as Im3Type)}
-              className={inputCls + ' mt-1'}
-            >
-              <option value="pim">{t('im3Evaluation.pim')}</option>
-              <option value="active">{t('im3Evaluation.active')}</option>
-            </select>
-          </label>
-          <label className="block text-sm">
-            <span className="text-muted-foreground">{t('im3Evaluation.txPower')}</span>
-            <input
-              type="number"
-              min="0"
-              max="100"
-              step="0.1"
-              value={txPower}
-              onChange={event => setTxPower(event.target.value)}
-              className={inputCls + ' mt-1'}
-            />
-          </label>
-          <label className="block text-sm">
-            <span className="text-muted-foreground">{t('im3Evaluation.isolation')}</span>
-            <input
-              type="number"
-              min="0"
-              max="100"
-              step="0.1"
-              value={isolation}
-              disabled={imType === 'pim'}
-              onChange={event => setIsolation(event.target.value)}
-              className={inputCls + ' mt-1 disabled:opacity-50 disabled:cursor-not-allowed'}
-            />
-          </label>
+      {/* 第一个/第二个发射干扰源：同一卡片内左右横向排列（组件宽度各自收窄） */}
+      <div className="p-6 bg-card rounded-lg border border-border">
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-5 md:gap-0 md:divide-x md:divide-border">
+          <div className="md:pr-6">
+            <BandInputCard compact title={t('im3Evaluation.source1')} value={source1} onChange={setSource1} />
+          </div>
+          <div className="pt-5 md:pt-0 md:pl-6 border-t md:border-t-0 border-border">
+            <BandInputCard compact title={t('im3Evaluation.source2')} value={source2} onChange={setSource2} />
+          </div>
         </div>
-        {imType === 'pim' && (
-          <p className="text-xs text-muted-foreground">{t('im3Evaluation.isolationHint')}</p>
-        )}
-        {!paramsValid && <p className="text-xs text-red-500">{t('im3Evaluation.invalidParams')}</p>}
+      </div>
+
+      {/* 被干扰接收系统 + 可选评估参数：合并同一卡片内左右横向排列 */}
+      <div className="p-6 bg-card rounded-lg border border-border">
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-5 lg:gap-0 lg:divide-x lg:divide-border">
+          <div className="lg:pr-6">
+            <BandInputCard compact title={t('im3Evaluation.receiver')} value={receiver} onChange={setReceiver} />
+          </div>
+          <div className="pt-5 lg:pt-0 lg:pl-6 border-t lg:border-t-0 border-border space-y-3">
+            <h2 className="text-sm font-semibold">{t('im3Evaluation.params')}</h2>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <label className="block text-sm">
+                <span className="text-muted-foreground">{t('im3Evaluation.imType')}</span>
+                <select
+                  value={imType}
+                  onChange={event => setImType(event.target.value as Im3Type)}
+                  className={inputCls + ' mt-1'}
+                >
+                  <option value="pim">{t('im3Evaluation.pim')}</option>
+                  <option value="active">{t('im3Evaluation.active')}</option>
+                </select>
+              </label>
+              <label className="block text-sm">
+                <span className="text-muted-foreground">{t('im3Evaluation.txPower')}</span>
+                <input
+                  type="number"
+                  min="0"
+                  max="100"
+                  step="0.1"
+                  value={txPower}
+                  onChange={event => setTxPower(event.target.value)}
+                  className={inputCls + ' mt-1'}
+                />
+              </label>
+              <label className="block text-sm">
+                <span className="text-muted-foreground">{t('im3Evaluation.isolation')}</span>
+                <input
+                  type="number"
+                  min="0"
+                  max="100"
+                  step="0.1"
+                  value={isolation}
+                  disabled={imType === 'pim'}
+                  onChange={event => setIsolation(event.target.value)}
+                  className={inputCls + ' mt-1 disabled:opacity-50 disabled:cursor-not-allowed'}
+                />
+              </label>
+            </div>
+            {imType === 'pim' && (
+              <p className="text-xs text-muted-foreground">{t('im3Evaluation.isolationHint')}</p>
+            )}
+            {!paramsValid && <p className="text-xs text-red-500">{t('im3Evaluation.invalidParams')}</p>}
+          </div>
+        </div>
       </div>
 
       <div className="p-6 bg-card rounded-lg border border-border space-y-4">

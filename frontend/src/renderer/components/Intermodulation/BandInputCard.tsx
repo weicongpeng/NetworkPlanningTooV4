@@ -13,13 +13,15 @@ interface BandInputCardProps {
   title: string
   value: BandState
   onChange: (next: BandState) => void
+  /** 紧凑模式：不画卡片外壳，供多个频段并排放在同一张卡片内 */
+  compact?: boolean
 }
 
 const inputCls =
   'w-full px-3 py-2 rounded-lg border border-border bg-background text-sm focus:outline-none focus:ring-2 focus:ring-primary/40'
 
 /** 单个频段输入卡片：预置选择 + 名称 + 频率上下限（复用三次） */
-export default function BandInputCard({ title, value, onChange }: BandInputCardProps) {
+export default function BandInputCard({ title, value, onChange, compact = false }: BandInputCardProps) {
   const { t } = useTranslation()
   const preset = IM3_PRESETS.find(item => item.id === value.presetId)
   const isCustom = value.presetId === 'custom'
@@ -56,7 +58,7 @@ export default function BandInputCard({ title, value, onChange }: BandInputCardP
   }
 
   return (
-    <div className="p-6 bg-card rounded-lg border border-border space-y-4">
+    <div className={compact ? 'space-y-3' : 'p-6 bg-card rounded-lg border border-border space-y-4'}>
       <div className="flex items-center justify-between gap-3">
         <h2 className="text-sm font-semibold">{title}</h2>
         {!isCustom && preset && (
@@ -64,7 +66,7 @@ export default function BandInputCard({ title, value, onChange }: BandInputCardP
         )}
       </div>
 
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+      <div className={compact ? 'grid grid-cols-2 gap-3' : 'grid grid-cols-1 md:grid-cols-2 gap-4'}>
         <label className="block text-sm">
           <span className="text-muted-foreground">{t('im3Evaluation.preset')}</span>
           <select
@@ -99,7 +101,7 @@ export default function BandInputCard({ title, value, onChange }: BandInputCardP
         </label>
       </div>
 
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+      <div className={compact ? 'grid grid-cols-2 gap-3' : 'grid grid-cols-1 md:grid-cols-2 gap-4'}>
         <label className="block text-sm">
           <span className="text-muted-foreground">{t('im3Evaluation.freqLow')}</span>
           <input
