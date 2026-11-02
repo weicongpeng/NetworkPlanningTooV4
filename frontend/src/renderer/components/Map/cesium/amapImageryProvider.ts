@@ -11,6 +11,10 @@
  *
  * 必须是 canvas 而不是直接给 URL —— 偏移要烘进位图；Cesium 的 `ImageryProvider` 接受
  * canvas 作为瓦片内容（`GridImageryProvider` 也是这么做的）。
+ *
+ * 失败语义（重要）：Cesium 的 `ImageryLayer` 把 `requestImage` **resolve** 视为"瓦片已就绪"，
+ * 会缓存纹理且不再重试；只有 **reject** 才会回滚瓦片状态。所以本 provider 在子瓦片重试后
+ * 仍全部失败、或请求被取消时一律 reject，绝不返回"全透明画布冒充成功"。
  */
 import { amapTileSourceForWgsTile } from '../../../config/mapSources'
 
@@ -18,6 +22,19 @@ import { amapTileSourceForWgsTile } from '../../../config/mapSources'
 export const AMAP_NATIVE_MAX_ZOOM = 18
 /** 低层级从 3 级起（与 2D 底图的 minZoom 一致） */
 export const AMAP_MIN_ZOOM = 3
+
+/**
+ * 单张瓦片取图失败后的重试退避（毫秒）。
+ *
+ * 为什么必须重试：`ImageryLayer` 一旦收到 image 就把瓦片标记为 RECEIVED 并缓存纹理，
+ * 不会再请求第二次。桌面端（WebView2）的跨域图片/缓存/代理与浏览器不同，偶发失败比
+ * 浏览器频繁得多 —— 不重试的话每一次抖动都会变成**永久的底图空洞**（底图位置露出地球
+ * 底色，天地图注记照常叠在上面，看起来就是"底图没了只剩注记"）。
+ */
+export const AMAP_TILE_RETRY_DELAYS_MS = [200, 600] as const
+
+/** 单张瓦片取图超时（毫秒）：不可达的瓦片不能让 Promise 永远挂着 */
+export const AMAP_TILE_TIMEOUT_MS = 8000
 
 export interface AmapImageryOptions {
   /** 是否带透明通道（卫星影像/矢量底图 false，注记层 true） */
@@ -51,14 +68,59 @@ export function createAmapImageryProvider(
       .replace('{z}', String(z))
 
   /** 取一张 GCJ02 瓦片位图（crossOrigin：画布要能上传给 WebGL，否则会被判定为污染画布） */
-  const loadTile = (z: number, x: number, y: number): Promise<HTMLImageElement> =>
+  const loadTileOnce = (
+    z: number,
+    x: number,
+    y: number,
+    isCancelled: () => boolean,
+  ): Promise<HTMLImageElement> =>
     new Promise((resolve, reject) => {
       const img = new Image()
       img.crossOrigin = 'anonymous'
-      img.onload = () => resolve(img)
-      img.onerror = () => reject(new Error(`amap tile ${z}/${x}/${y}`))
+      let settled = false
+      const finish = (fn: () => void) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        fn()
+      }
+      // 网络黑洞（代理挂起/连接不返回）时不能让这个 Promise 永远 outstanding：
+      // ImageryLayer 会一直等它，底图瓦片卡在 TRANSITIONING 永远出不来。
+      const timer = setTimeout(
+        () => finish(() => reject(new Error(`amap tile timeout ${z}/${x}/${y}`))),
+        AMAP_TILE_TIMEOUT_MS,
+      )
+      img.onload = () => finish(() => {
+        if (isCancelled()) reject(new Error(`amap imagery cancelled ${z}/${x}/${y}`))
+        else resolve(img)
+      })
+      img.onerror = () => finish(() => reject(new Error(`amap tile ${z}/${x}/${y}`)))
       img.src = tileUrl(z, x, y)
     })
+
+  /** 带退避重试的取图：偶发失败重试两次，仍失败才把错误抛给上层；取消后立即放弃 */
+  const loadTile = async (
+    z: number,
+    x: number,
+    y: number,
+    isCancelled: () => boolean,
+  ): Promise<HTMLImageElement> => {
+    let lastError: unknown
+    for (let attempt = 0; attempt <= AMAP_TILE_RETRY_DELAYS_MS.length; attempt++) {
+      if (isCancelled()) throw new Error(`amap imagery cancelled ${z}/${x}/${y}`)
+      try {
+        return await loadTileOnce(z, x, y, isCancelled)
+      } catch (e) {
+        lastError = e
+        const delay = AMAP_TILE_RETRY_DELAYS_MS[attempt]
+        // 取消是"这块瓦片已经不在视野里了"，重试毫无意义，也不该拖住整个请求
+        if (delay !== undefined && !isCancelled()) {
+          await new Promise((r) => setTimeout(r, delay))
+        }
+      }
+    }
+    throw lastError
+  }
 
   provider.requestImage = function (x: number, y: number, level: number, request: any) {
     const size = 256
@@ -79,26 +141,41 @@ export function createAmapImageryProvider(
     // Cesium 取消请求时把已发出的图也中止掉（相机快速移动会大量取消）
     let cancelled = false
     if (request && typeof request === 'object') {
-      request.cancelFunction = () => { cancelled = true }
+      const prevCancel = request.cancelFunction
+      request.cancelFunction = () => {
+        cancelled = true
+        if (typeof prevCancel === 'function') prevCancel.call(request)
+      }
     }
 
     return Promise.all(
       cells.map(([tx, ty, dx, dy]) =>
         ty < 0 || ty >= n
           ? null
-          : loadTile(level, tx, ty)
-            .then((img) => (cancelled ? null : { img, dx, dy }))
+          : loadTile(level, tx, ty, () => cancelled)
+            .then((img) => ({ img, dx, dy }))
             .catch(() => null), // 单张小图失败不算整块失败（海洋/无数据瓦片会 404）
       ),
     ).then((parts) => {
+      /**
+       * 失败/取消必须 reject，不能"伪造成功"。
+       *
+       * `ImageryLayer._requestImagery` 的语义是：promise resolve → 该瓦片标记 RECEIVED 并
+       * 上传纹理（空白纹理也照上，永不重试）；reject → 回滚 UNLOADED/FAILED。
+       * 早先这里无论成败都返回一张（可能是全透明的）画布，于是任何一次网络抖动都会把一块
+       * 底图永久钉成空白 —— 桌面端失败率高，表现就是底图成片消失、只剩天地图注记，并随
+       * 瓦片重建反复出现（闪烁）。
+       */
+      if (cancelled) throw new Error(`amap imagery cancelled ${level}/${x}/${y}`)
+      const loaded = parts.filter((p): p is { img: HTMLImageElement; dx: number; dy: number } => !!p)
+      if (loaded.length === 0) throw new Error(`amap tile unavailable ${level}/${x}/${y}`)
+
       const canvas = document.createElement('canvas')
       canvas.width = size
       canvas.height = size
       const ctx = canvas.getContext('2d')
       if (ctx) {
-        for (const p of parts) {
-          if (p) ctx.drawImage(p.img, p.dx, p.dy)
-        }
+        for (const p of loaded) ctx.drawImage(p.img, p.dx, p.dy)
       }
       return canvas
     })

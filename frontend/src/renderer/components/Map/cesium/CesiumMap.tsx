@@ -1207,13 +1207,23 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
         winHook.__nptCesiumViewer = viewer
         winHook.__nptLayerEditStore = useLayerEditStore
 
-        const tileset = await C.createOsmBuildingsAsync()
-        // 3D Tiles 的遍历/加载成本主要由屏幕空间误差阈值决定：默认 16（越早细化越精细）。
-        // 本工具是城市级俯瞰视角，建筑在屏幕上通常只有几十像素，32 的细化阈值
-        // 观感几乎无差，但显著减少瓦片遍历与加载量（Cesium 专项优化）。
-        tileset.maximumScreenSpaceError = BASE_TILESET_SSE
-        viewer.scene.primitives.add(tileset)
-        tilesetRef.current = tileset
+        /**
+         * 3D 建筑来自 Cesium ion（要联网 + 有效 token），**必须允许失败**。
+         * 早先是裸 `await`：ion 不可达（企业内网/无外网/代理拦截）会抛错，
+         * 被下面的 catch 当成整个 3D 初始化失败 → 地图位置只显示「Cesium 初始化失败」，
+         * 而建筑其实只是锦上添花，不该连累底图与工参渲染。
+         */
+        try {
+          const tileset = await C.createOsmBuildingsAsync()
+          // 3D Tiles 的遍历/加载成本主要由屏幕空间误差阈值决定：默认 16（越早细化越精细）。
+          // 本工具是城市级俯瞰视角，建筑在屏幕上通常只有几十像素，32 的细化阈值
+          // 观感几乎无差，但显著减少瓦片遍历与加载量（Cesium 专项优化）。
+          tileset.maximumScreenSpaceError = BASE_TILESET_SSE
+          viewer.scene.primitives.add(tileset)
+          tilesetRef.current = tileset
+        } catch (e) {
+          console.warn('[CesiumMap] 3D 建筑加载失败，已跳过（不影响底图与工参渲染）:', e)
+        }
 
         // 扇区图层
         const lteLayer = new CesiumSectorLayer(C, viewer, 'LTE')
