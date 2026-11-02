@@ -104,8 +104,8 @@
   "app": {
     "download": "APP",
     "downloadTitle": "下载应用",
-    "tabMobile": "手机APP",
-    "tabDesktop": "电脑端",
+    "tabMobile": "移动APP下载",
+    "tabDesktop": "桌面端更新",
     "downloadDesktop": "下载电脑端安装包",
     "desktopInstallHint": "下载完成后运行安装包即可安装",
     "desktopNoVersion": "暂无可用桌面版",

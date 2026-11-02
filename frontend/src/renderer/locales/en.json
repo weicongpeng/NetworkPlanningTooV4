@@ -181,8 +181,8 @@
   "app": {
     "download": "APP",
     "downloadTitle": "Download App",
-    "tabMobile": "Mobile",
-    "tabDesktop": "Desktop",
+    "tabMobile": "Mobile App",
+    "tabDesktop": "Desktop Update",
     "downloadDesktop": "Download Desktop Installer",
     "desktopInstallHint": "Run the installer once the download finishes",
     "desktopNoVersion": "No desktop version available",
