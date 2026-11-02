@@ -22,6 +22,7 @@ vi.mock('../../services/api', () => ({
   appVersionsApi: { getLatest: vi.fn() },
   desktopCloudApi: { appVersion: vi.fn() },
   desktopReleasesApi: { latestPublic: vi.fn() },
+  desktopUpdateApi: { status: vi.fn() },
 }))
 
 import { WindowTitleBar } from '../WindowTitleBar'
@@ -82,12 +83,22 @@ describe('WindowTitleBar', () => {
     )
   })
 
-  it('双击标题区 = 最大化/还原', async () => {
+  it('标题区按下 = 交给壳层走原生拖窗（贴边分屏的前提）', async () => {
     useAuthStore.setState({ desktopMode: true })
     const { container } = render(<WindowTitleBar />)
 
-    const dragRegion = container.querySelector('.pywebview-drag-region') as HTMLElement
-    fireEvent.doubleClick(dragRegion)
+    const dragRegion = container.querySelector('[data-titlebar-drag]') as HTMLElement
+    fireEvent.mouseDown(dragRegion, { button: 0 })
+    await waitFor(() => expect(desktopLoginApi.windowControl).toHaveBeenCalledWith('drag'))
+  })
+
+  it('标题区双击 = 最大化/还原（原生移动循环会吃掉 dblclick，需自己判定）', async () => {
+    useAuthStore.setState({ desktopMode: true })
+    const { container } = render(<WindowTitleBar />)
+    const dragRegion = container.querySelector('[data-titlebar-drag]') as HTMLElement
+
+    fireEvent.mouseDown(dragRegion, { button: 0 })
+    fireEvent.mouseDown(dragRegion, { button: 0 })
     await waitFor(() => expect(desktopLoginApi.windowControl).toHaveBeenCalledWith('toggle-maximize'))
   })
 

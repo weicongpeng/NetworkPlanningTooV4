@@ -705,7 +705,7 @@ export const desktopLoginApi = {
    * toggle-maximize/resize 的响应带最新 maximized；非桌面壳 403，调用方静默忽略。
    */
   windowControl: async (
-    action: 'minimize' | 'toggle-maximize' | 'close' | 'resize',
+    action: 'minimize' | 'toggle-maximize' | 'close' | 'resize' | 'drag',
     params?: { width?: number; height?: number }
   ): Promise<ApiResponse<{ maximized?: boolean }>> => {
     return apiClient.post('/desktop/window-control', { action, ...(params || {}) }) as any

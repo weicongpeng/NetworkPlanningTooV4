@@ -2,7 +2,10 @@
 
 frameless 窗口（WinForms FormBorderStyle.None）没有原生标题栏，样式里也没有最小化/最大化
 箱位，任务栏图标点击发来的 WM_SYSCOMMAND(SC_MINIMIZE) 被系统丢弃 → 点图标没反应。
-launcher._enable_taskbar_minimize 负责补回 WS_MINIMIZEBOX/WS_MAXIMIZEBOX/WS_SYSMENU。
+launcher._enable_taskbar_minimize 负责补回 WS_MINIMIZEBOX/WS_MAXIMIZEBOX/WS_SYSMENU/WS_THICKFRAME。
+
+WS_THICKFRAME 是 Windows 贴边分屏（左右半屏 / 四角四分屏）的前提：系统只对"可缩放"的
+窗口做 Snap。补完样式位必须跟一次 SetWindowPos(SWP_FRAMECHANGED)，否则新边框不生效。
 
 本文件用假的 ctypes / 窗体验证样式位语义（Linux CI 上不能真调 user32）。
 """
@@ -13,9 +16,11 @@ from pathlib import Path
 from types import SimpleNamespace
 
 WS_POPUP = 0x80000000
+WS_THICKFRAME = 0x00040000
 WS_MINIMIZEBOX = 0x00020000
 WS_MAXIMIZEBOX = 0x00010000
 WS_SYSMENU = 0x00080000
+WANTED = WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU | WS_THICKFRAME
 
 
 def _load_launcher():
@@ -32,6 +37,7 @@ class _FakeUser32:
     def __init__(self, style: int):
         self.style = style
         self.set_calls: list[int] = []
+        self.set_window_pos_calls: list[tuple] = []
 
         def _get(hwnd, index):
             return self.style
@@ -41,9 +47,14 @@ class _FakeUser32:
             self.style = value
             return value
 
+        def _set_window_pos(hwnd, insert_after, x, y, cx, cy, flags):
+            self.set_window_pos_calls.append((x, y, cx, cy, flags))
+            return 1
+
         # 实例属性存函数对象：函数可被赋 restype/argtypes，绑定方法不行
         self.GetWindowLongW = _get
         self.SetWindowLongW = _set
+        self.SetWindowPos = _set_window_pos
 
 
 class _FakeCtypes:
@@ -83,13 +94,17 @@ def test_adds_minimize_and_maximize_style_bits(monkeypatch):
 
     launcher._enable_taskbar_minimize(_fake_window())
 
-    assert user32.set_calls == [WS_POPUP | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU]
+    assert user32.set_calls == [WS_POPUP | WANTED]
+    # 改完样式位要让系统重算非客户区，否则 WS_THICKFRAME 不生效（贴边分屏仍然不可用）
+    assert user32.set_window_pos_calls == [(0, 0, 0, 0, launcher.SWP_FRAMECHANGED
+                                            | launcher.SWP_NOMOVE | launcher.SWP_NOSIZE
+                                            | launcher.SWP_NOZORDER | launcher.SWP_NOACTIVATE)]
 
 
 def test_idempotent_when_bits_already_present(monkeypatch):
     """样式位已在时不重复 SetWindowLongW（全屏切换后会再调一次）。"""
     launcher = _load_launcher()
-    full = WS_POPUP | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU
+    full = WS_POPUP | WANTED
     user32, _ = _patch(monkeypatch, launcher, full)
 
     launcher._enable_taskbar_minimize(_fake_window())

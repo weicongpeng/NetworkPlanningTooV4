@@ -2,8 +2,8 @@
  * 桌面端（frameless 窗口）自绘标题栏。
  *
  * 桌面壳去掉了原生边框（launcher create_window frameless=True），窗口控制由本组件承担：
- * - 拖拽：容器与标题文字带 .pywebview-drag-region（壳层 DRAG_REGION_DIRECT_TARGET_ONLY=True，
- *   只有命中带 class 的元素本身才拖窗，按钮按下不受影响）；双击标题区 = 最大化/还原
+ * - 拖拽：标题区按下 → POST window-control drag，由壳层发 WM_NCLBUTTONDOWN(HTCAPTION)
+ *   走**系统原生移动循环**（贴边最大化、侧边分屏、四分屏都靠它）；双击标题区 = 最大化/还原
  * - 按钮（仿原生窗口按钮，右对齐）：应用下载（原悬浮图标入口迁入）| 最小化 | 最大化/还原 | 关闭
  * - 缩放把手：frameless 后原生边缘拖拽消失，这里贴视口右/下/右下角三条热区，
  *   拖拽经 POST /desktop/window-control resize 交给壳层（壳层 clamp min_size）；
@@ -33,6 +33,8 @@ export function WindowTitleBar() {
   const desktopStatus = useDesktopStatusLabel()
   const [maximized, setMaximized] = useState(true) // 桌面启动即最大化
   const [showAppDownload, setShowAppDownload] = useState(false)
+  /** 上一次标题栏按下的时间戳：用来判定双击（原生移动循环会吃掉 dblclick） */
+  const lastDragDownRef = useRef(0)
   const resizeRef = useRef<{
     dir: ResizeDir
     sx: number
@@ -65,6 +67,34 @@ export function WindowTitleBar() {
         /* 壳层不可用（403/网络）：静默 */
       })
   }, [])
+
+  /**
+   * 标题栏按下：把拖动交回壳层，由系统走自己的移动循环。
+   *
+   * 早先用 `.pywebview-drag-region`，壳层按鼠标位移自己挪窗口 —— Windows 的移动循环
+   * 根本没参与，所以拖到屏幕边缘不会最大化、也不会出现侧边分屏/四分屏。
+   * 双击在这里自己判定（320ms 内第二次按下）：原生移动循环会吃掉浏览器自己的 dblclick，
+   * 保留原生标题栏「双击最大化/还原」的习惯。
+   */
+  const onDragMouseDown = useCallback(
+    (e: React.MouseEvent) => {
+      if (e.button !== 0) return
+      e.preventDefault()
+      const now = Date.now()
+      const isDouble = now - lastDragDownRef.current < 320
+      lastDragDownRef.current = isDouble ? 0 : now
+      if (isDouble) {
+        control('toggle-maximize')
+        return
+      }
+      desktopLoginApi
+        .windowControl('drag')
+        .catch(() => {
+          /* 旧版壳层没有该动作：本次拖动无效，其余功能不受影响 */
+        })
+    },
+    [control],
+  )
 
   // 窗口聚焦/标签页可见时向壳层校准一次最大化状态（不轮询）
   useEffect(() => {
@@ -141,13 +171,14 @@ export function WindowTitleBar() {
         data-app-titlebar
         className="relative z-[9998] flex h-8 flex-shrink-0 items-center border-b border-border/60 bg-background select-none"
       >
-        {/* 拖拽区（pywebview-drag-region 必须落在实际命中的元素上：容器、图标、文字都加） */}
+        {/* 拖拽区：交互交给壳层的原生标题栏拖动（见 onDragMouseDown） */}
         <div
-          className="pywebview-drag-region flex h-full flex-1 items-center gap-2 overflow-hidden pl-2"
-          onDoubleClick={() => control('toggle-maximize')}
+          data-titlebar-drag
+          className="flex h-full flex-1 items-center gap-2 overflow-hidden pl-2"
+          onMouseDown={onDragMouseDown}
         >
-          <Boxes size={16} className="pywebview-drag-region shrink-0 text-primary" />
-          <span className="pywebview-drag-region truncate text-xs text-foreground">{title}</span>
+          <Boxes size={16} className="shrink-0 text-primary" />
+          <span className="truncate text-xs text-foreground">{title}</span>
         </div>
         {/* 窗口按钮：应用下载 | 最小化 | 最大化/还原 | 关闭（仿原生：透明底 hover 浅灰，关闭 hover 红） */}
         <div className="flex h-full items-stretch">

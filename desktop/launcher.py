@@ -370,17 +370,36 @@ def _make_exit_handler(window: Any) -> Callable[[], None]:
 # 箱位；系统据此丢弃任务栏图标点击发来的 WM_SYSCOMMAND(SC_MINIMIZE)，用户看到的就是
 # 「点任务栏图标没反应，既不能最小化也不能还原」。这里只补样式位（不设 WS_CAPTION，仍无原生标题栏）。
 GWL_STYLE = -16
+GWL_WNDPROC = -4
+WS_THICKFRAME = 0x00040000
 WS_MINIMIZEBOX = 0x00020000
 WS_MAXIMIZEBOX = 0x00010000
 WS_SYSMENU = 0x00080000
+SWP_NOSIZE = 0x0001
+SWP_NOMOVE = 0x0002
+SWP_NOZORDER = 0x0004
+SWP_NOACTIVATE = 0x0010
+SWP_FRAMECHANGED = 0x0020
+WM_NCCALCSIZE = 0x0083
+# 原生标题栏拖动：WM_NCLBUTTONDOWN 命中 HTCAPTION 后系统进入自己的移动循环
+WM_NCLBUTTONDOWN = 0x00A1
+HTCAPTION = 2
+# 持有子类化后的窗口过程引用：ctypes 回调对象被 GC 之后再收到窗口消息会直接崩溃
+_wndproc_refs: list = []
+# 已装钩子的窗口句柄：全屏切换会让 WinForms 重建句柄，需要在新句柄上重装
+_wndproc_hwnd: Optional[int] = None
 
 
 def _enable_taskbar_minimize(window: Any) -> None:
-    """给无边框主窗口补 WS_MINIMIZEBOX/WS_MAXIMIZEBOX/WS_SYSMENU。
+    """给无边框主窗口补最小化/最大化/系统菜单/可缩放样式位。
 
     仅 Windows 生效；窗体尚未就绪或非桌面壳时静默跳过。WinForms 重算窗口样式
     （切换 FormBorderStyle，如全屏进出）时会把样式位覆盖回 CreateParams，所以全屏
     切换后要再补一次（见 _make_fullscreen_handler）。
+
+    WS_THICKFRAME 不是为了让系统画边框，而是**贴边分屏的前提**：Windows 只对"可缩放"
+    的窗口做 Snap（左右半屏、四角四分屏、Win11 贴靠布局），缺这一位时拖到屏幕边缘
+    只会停在原地。它带出来的 8px 原生边框由 `_install_client_area_wndproc` 吃掉。
     """
     native = getattr(window, "native", None)
     if os.name != "nt" or native is None:
@@ -395,12 +414,114 @@ def _enable_taskbar_minimize(window: Any) -> None:
         handle = native.Handle
         hwnd = ctypes.c_void_p(int(handle.ToInt64() if hasattr(handle, "ToInt64") else handle))
         style = user32.GetWindowLongW(hwnd, GWL_STYLE)
-        wanted = style | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU
+        wanted = style | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU | WS_THICKFRAME
         if wanted != style:
             user32.SetWindowLongW(hwnd, GWL_STYLE, wanted)
-            _log.info("已补齐无边框窗口的最小化/最大化样式（任务栏图标可最小化/还原）")
+            # 改完样式位必须让系统重算非客户区，否则新加的边框/贴边语义不生效
+            user32.SetWindowPos(
+                hwnd, None, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+            )
+            _log.info("已补齐无边框窗口的最小化/最大化/可缩放样式（任务栏可最小化、拖到屏幕边缘可贴边分屏）")
     except Exception as exc:  # noqa: BLE001
-        _log.warning("补充窗口最小化/最大化样式失败（任务栏点击可能无响应）：%s", exc)
+        _log.warning("补充窗口最小化/最大化样式失败（任务栏点击与贴边分屏可能不可用）：%s", exc)
+
+
+def _install_client_area_wndproc(window: Any) -> None:
+    """让客户区铺满整个窗口，吃掉 WS_THICKFRAME 带出来的原生边框。
+
+    贴边分屏要求窗口"可缩放"，但无边框窗口加上 WS_THICKFRAME 后系统会在四周留出
+    8px 非客户区 —— 页面被缩进一圈、露出底色。这里子类化窗口过程，把 WM_NCCALCSIZE
+    的客户区直接算成整个窗口矩形：既保留"可缩放 → 可贴边"的系统语义，又维持页面满铺。
+    原生边缘缩放随之消失（本来也没用），窗口缩放仍由自绘把手经 window-control resize 完成。
+
+    仅 Windows 生效；任何一步失败都只记日志（退化为带一圈细边框，不影响功能）。
+    """
+    global _wndproc_hwnd
+    native = getattr(window, "native", None)
+    if os.name != "nt" or native is None:
+        return
+    handle = native.Handle
+    hwnd = int(handle.ToInt64() if hasattr(handle, "ToInt64") else handle)
+    if _wndproc_hwnd == hwnd:
+        return
+    try:
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        get_ptr = getattr(user32, "GetWindowLongPtrW", user32.GetWindowLongW)
+        set_ptr = getattr(user32, "SetWindowLongPtrW", user32.SetWindowLongW)
+        get_ptr.restype = ctypes.c_void_p
+        get_ptr.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        set_ptr.restype = ctypes.c_void_p
+        set_ptr.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
+        call_proc = user32.CallWindowProcW
+        call_proc.restype = ctypes.c_ssize_t
+        call_proc.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t, ctypes.c_ssize_t,
+        ]
+
+        wndproc_type = ctypes.WINFUNCTYPE(
+            ctypes.c_ssize_t, ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t, ctypes.c_ssize_t,
+        )
+        old_proc = get_ptr(ctypes.c_void_p(hwnd), GWL_WNDPROC)
+        if not old_proc:
+            # 拿不到原过程就不要装钩子：转发失败会让窗口收不到任何消息（直接白屏/无响应）
+            raise RuntimeError("读取原窗口过程失败")
+
+        def _wndproc(hwnd_: Any, msg: int, wparam: int, lparam: int) -> int:
+            # 客户区 = 整个窗口（默认过程会把 WS_THICKFRAME 的边框扣掉）
+            if msg == WM_NCCALCSIZE and wparam:
+                return 0
+            return call_proc(old_proc, hwnd_, msg, wparam, lparam)
+
+        callback = wndproc_type(_wndproc)
+        set_ptr(ctypes.c_void_p(hwnd), GWL_WNDPROC, ctypes.cast(callback, ctypes.c_void_p))
+        _wndproc_refs.extend([callback, old_proc])
+        _wndproc_hwnd = hwnd
+        # 装上钩子后再触发一次非客户区重算：补 WS_THICKFRAME 的那一刻系统按"有边框"
+        # 算过一次，客户区已经缩进 8px，不重算会一直露着那圈边框
+        user32.SetWindowPos(
+            ctypes.c_void_p(hwnd), None, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+        )
+        _log.info("已子类化窗口过程：客户区铺满整窗（去掉 WS_THICKFRAME 的原生边框）")
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("子类化窗口过程失败（无边框窗口会露出一圈原生边框）：%s", exc)
+
+
+def _start_caption_drag(window: Any) -> None:
+    """按系统原生标题栏的方式拖动窗口（等价于按住标题栏拖）。
+
+    为什么不用 pywebview 的 `.pywebview-drag-region`：它按鼠标位移自己挪窗口，
+    Windows 的移动循环根本没有参与 —— 这正是"拖到屏幕边缘不会最大化/分屏"的根因。
+    这里发 WM_NCLBUTTONDOWN(HTCAPTION)，系统进入自己的移动循环，贴边分屏、四分屏、
+    Win11 贴靠布局、拖动中把最大化窗口还原，全部按原生行为走。
+
+    SendMessage 会阻塞到用户松开鼠标（系统的模态移动循环），因此必须在独立线程里跑：
+    放在 HTTP 请求线程里会让该请求一直挂到拖拽结束，放进事件循环更会卡死整个后端。
+    """
+    native = getattr(window, "native", None)
+    if os.name != "nt" or native is None:
+        return
+
+    def _drag() -> None:
+        try:
+            class _POINT(ctypes.Structure):
+                _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+            handle = native.Handle
+            hwnd = int(handle.ToInt64() if hasattr(handle, "ToInt64") else handle)
+            pt = _POINT()
+            user32.GetCursorPos(ctypes.byref(pt))
+            user32.ScreenToClient(ctypes.c_void_p(hwnd), ctypes.byref(pt))
+            # lParam 用客户区坐标（与真实 WM_NCLBUTTONDOWN 一致），系统据此算抓取偏移
+            lparam = (pt.y << 16) | (pt.x & 0xFFFF)
+            user32.ReleaseCapture()
+            user32.SendMessageW(ctypes.c_void_p(hwnd), WM_NCLBUTTONDOWN, HTCAPTION, lparam)
+        except Exception:  # noqa: BLE001
+            _log.exception("原生标题栏拖窗失败（本次拖动无效）")
+
+    threading.Thread(target=_drag, name="npt-caption-drag", daemon=True).start()
 
 
 def _limit_maximized_to_work_area(window: Any, enable: bool) -> None:
@@ -460,8 +581,10 @@ def _make_fullscreen_handler(window: Any, state: Optional[dict] = None) -> Calla
             # 真全屏要盖住任务栏：先清掉工作区限制，否则最大化会被收口到任务栏之上
             _limit_maximized_to_work_area(window, False)
         window.toggle_fullscreen()
-        # 全屏切换重设了 FormBorderStyle，样式位可能被 CreateParams 覆盖回去 → 再补一次
+        # 全屏切换重设了 FormBorderStyle，样式位可能被 CreateParams 覆盖回去 → 再补一次；
+        # WinForms 还可能重建窗口句柄（旧句柄上的窗口过程钩子随之失效），按新句柄重装
         _enable_taskbar_minimize(window)
+        _install_client_area_wndproc(window)
         state["fullscreen"] = fullscreen
         if not fullscreen:
             _limit_maximized_to_work_area(window, True)
@@ -530,6 +653,10 @@ def _make_window_control_handler(
                 _log.exception("关闭窗口失败，2 秒后强制结束进程")
                 _force_exit_after(2)
             return {}
+        if action == "drag":
+            # 系统移动循环会阻塞到用户松开鼠标 → 与 HTTP 请求解耦，立即返回
+            _start_caption_drag(window)
+            return {"maximized": bool(state.get("maximized", False))}
         if action == "resize":
             width = max(int(params.get("width") or 0), int(min_size[0]))
             height = max(int(params.get("height") or 0), int(min_size[1]))
@@ -658,8 +785,13 @@ def _create_window() -> Any:
     win_state: dict = {"fullscreen": False, "maximized": True}
     # 无边框窗口补最小化/最大化样式位：必须在窗体真正显示后再做（webview.start 的 func
     # 线程早于 create_window，这时 window.native 还没就绪，直调会静默跳过）
+    def _on_shown(*_args: Any) -> None:
+        # 顺序要紧：先补样式位（含 WS_THICKFRAME），再子类化窗口过程把多出来的边框吃掉
+        _enable_taskbar_minimize(window)
+        _install_client_area_wndproc(window)
+
     try:
-        window.events.shown += lambda *_: _enable_taskbar_minimize(window)
+        window.events.shown += _on_shown
     except Exception as exc:  # noqa: BLE001
         _log.warning("订阅窗口显示事件失败（任务栏点击可能无法最小化）：%s", exc)
     # 关窗也要兜底：正常关闭路径被卡住时进程不退出，用户再启动会误报「程序已在运行」

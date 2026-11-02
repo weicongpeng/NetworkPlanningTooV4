@@ -1525,8 +1525,8 @@ async def desktop_fullscreen(
 
 
 class WindowControlRequest(BaseModel):
-    action: Literal["minimize", "toggle-maximize", "close", "resize"] = Field(
-        ..., description="窗口控制动作（自绘标题栏按钮 / 边缘缩放把手）"
+    action: Literal["minimize", "toggle-maximize", "close", "resize", "drag"] = Field(
+        ..., description="窗口控制动作（自绘标题栏按钮 / 边缘缩放把手 / 原生拖窗）"
     )
     width: Optional[int] = Field(None, ge=1, description="resize 目标宽度（逻辑像素）")
     height: Optional[int] = Field(None, ge=1, description="resize 目标高度（逻辑像素）")

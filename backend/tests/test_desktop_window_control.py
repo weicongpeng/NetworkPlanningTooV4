@@ -206,3 +206,23 @@ def test_bridge_forwards_and_swallows_errors():
         assert desktop_bridge.control_window("minimize") is None
     finally:
         desktop_bridge.set_window_control_handler(None)
+
+
+def test_drag_action_hands_over_to_native_caption_drag(monkeypatch):
+    """标题栏按下 → 壳层发 WM_NCLBUTTONDOWN(HTCAPTION) 走系统移动循环。
+
+    只有系统自己的移动循环才会触发 Windows 贴边分屏/四分屏；且该调用会阻塞到用户
+    松开鼠标，所以 handler 必须立刻返回（拖拽在独立线程里跑），不能把 HTTP 请求挂住。
+    """
+    launcher = _load_launcher()
+    window = _FakeWindow()
+    handler, state = _make_handler(launcher, window)
+
+    started: list = []
+    monkeypatch.setattr(launcher, "_start_caption_drag", lambda win: started.append(win))
+
+    assert handler("drag", {}) == {"maximized": True}
+    assert started == [window]
+    # 原生拖动期间不做任何窗口动作（最大化/还原由系统在处理移动循环时自行决定）
+    assert window.calls == []
+    assert state["maximized"] is True
