@@ -2,11 +2,14 @@
 图层制作服务测试
 遵循TDD方法论: RED → GREEN → REFACTOR
 """
+import math
 import pytest
 import pandas as pd
 from pathlib import Path
 from app.services.layer_service import (
+    circle_polygon,
     fast_destination,
+    is_indoor_coverage,
     sector_polygon,
     LayerService,
 )
@@ -51,6 +54,86 @@ def test_sector_polygon_geometry():
     from shapely.geometry import Point
     center = Point(116.3, 39.9)
     assert poly.distance(center) < 1000 / 111319.9 * 1.1
+
+
+def _flat_dist(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    """平面近似的两点距离（米），与生成几何使用的 fast_destination 同源。"""
+    return math.hypot((lat2 - lat1) * 111319.9,
+                      (lng2 - lng1) * 111319.9 * math.cos(math.radians(lat1)))
+
+
+def test_circle_polygon_vertices_on_radius():
+    """圆形多边形：每个顶点到圆心距离都等于半径，且闭合"""
+    poly = circle_polygon(39.9, 116.3, radius_m=500)
+    assert poly.geom_type == "Polygon" and poly.is_valid
+    coords = list(poly.exterior.coords)
+    assert coords[0] == coords[-1]
+    for lng, lat in coords:
+        assert abs(_flat_dist(39.9, 116.3, lat, lng) - 500) < 1
+
+
+def test_is_indoor_coverage():
+    """覆盖类型判定：室分/室内/indoor 为室内，其余与空值按室外"""
+    for v in ("室分", "室内", "indoor", "INDOOR", "室内分布"):
+        assert is_indoor_coverage(v) is True
+    for v in ("室外", "宏站", "outdoor", "", None, float("nan")):
+        assert is_indoor_coverage(v) is False
+
+
+def test_generate_sector_layer_indoor_draws_circle(service, tmp_path):
+    """覆盖类型=室分/室内/indoor 的行画圆（半径=扇形半径一半、不要求方位角），其余仍画扇形"""
+    path = tmp_path / "coverage.xlsx"
+    lats = [39.90] * 6
+    lngs = [116.30, 116.32, 116.34, 116.36, 116.38, 116.40]
+    names = ["室外A", "室内B", "室分C", "indoorD", "宏站E", "空值F"]
+    df = pd.DataFrame({
+        "NAME": names,
+        "LONGITUDE": lngs,
+        "LATITUDE": lats,
+        "AZIMUTH": [90, 0, None, None, 120, 30],
+        "COVERAGE": ["室外", "室内", "室分", "indoor", "宏站", None],
+    })
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name="S", index=False)
+
+    out, stats = service.generate_sector_layer(
+        str(path), "S", "NAME", "LONGITUDE", "LATITUDE", "AZIMUTH",
+        1000, 40.0, ["NAME"], "tab",
+        source_filename="coverage.xlsx", coverage_col="COVERAGE",
+    )
+    # 室内行方位角为 0/空也参与绘制；未匹配到异常
+    assert stats["success"] == 6 and stats["failed"] == 0
+
+    import geopandas as gpd
+    gdf = gpd.read_file(out)
+    assert len(gdf) == 6
+    centers = dict(zip(names, zip(lats, lngs)))
+    indoor = {"室内B", "室分C", "indoorD"}
+    for _, row in gdf.iterrows():
+        lat0, lng0 = centers[row["NAME"]]
+        maxd = max(_flat_dist(lat0, lng0, y, x) for x, y in row.geometry.exterior.coords)
+        expect = 500 if row["NAME"] in indoor else 1000
+        assert abs(maxd - expect) < expect * 0.02, f"{row['NAME']} 半径 {maxd:.0f}m ≠ {expect}m"
+
+
+def test_generate_sector_layer_all_indoor_ignores_azimuth(service, tmp_path):
+    """全部为室内覆盖时，方位角整列 0/空不再报错（圆形绘制不使用方位角）"""
+    path = tmp_path / "indoor.xlsx"
+    df = pd.DataFrame({
+        "NAME": ["室分1", "室分2"],
+        "LONGITUDE": [116.30, 116.32],
+        "LATITUDE": [39.90, 39.90],
+        "AZIMUTH": [0, None],
+        "COVERAGE": ["室分", "室内"],
+    })
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name="S", index=False)
+
+    _, stats = service.generate_sector_layer(
+        str(path), "S", "NAME", "LONGITUDE", "LATITUDE", "AZIMUTH",
+        1000, 40.0, ["NAME"], "mif", coverage_col="COVERAGE",
+    )
+    assert stats["success"] == 2 and stats["failed"] == 0
 
 
 def test_generate_point_layer(service, sample_excel):
@@ -1362,6 +1445,93 @@ def test_generate_polygon_layer_all_formats(service, polygon_excel, fmt):
         # 配套文件齐全（打包下载依赖）
         for ext in (".shx", ".dbf", ".prj", ".cpg"):
             assert out.with_suffix(ext).exists()
+
+
+@pytest.mark.parametrize("kind", ["sector", "point"])
+def test_template_is_usable_for_generation(service, tmp_path, kind):
+    """模板直接可用来出图：必填列名与生成流程的字段参数一致，3 行示例全部成功"""
+    template = tmp_path / f"{kind}_template.xlsx"
+    template.write_bytes(service.build_template(kind))
+
+    if kind == "sector":
+        out, stats = service.generate_sector_layer(
+            str(template), "扇区图层", "小区名称", "经度", "纬度", "方位角",
+            3000, 40.0, ["小区名称", "PCI"], "tab",
+            source_filename="sector_template.xlsx",
+            coverage_col="覆盖类型",
+        )
+    else:
+        out, stats = service.generate_point_layer(
+            str(template), "点图层", "小区名称", "经度", "纬度",
+            ["小区名称", "PCI"], "tab",
+            source_filename="point_template.xlsx",
+        )
+    assert stats["total"] == 3 and stats["success"] == 3 and stats["failed"] == 0
+    assert out.exists()
+
+
+def test_generate_point_layer_shp(service, sample_excel):
+    """点图层 SHP：几何/属性完整，配套文件齐全，样式经同 stem .qml（QGIS）表达为实心符号"""
+    import pyogrio
+
+    out, stats = service.generate_point_layer(
+        str(sample_excel), "LTE", "NAME", "LONGITUDE", "LATITUDE",
+        ["NAME", "PCI"], "shp",
+        source_filename="sample.xlsx",
+        fill_color="#FF0000", point_size=12, point_shape="square",
+    )
+    assert stats["success"] == 2
+    assert out.suffix == ".shp"
+    for ext in (".shx", ".dbf", ".prj", ".cpg"):
+        assert out.with_suffix(ext).exists()
+
+    gdf = pyogrio.read_dataframe(str(out))
+    assert len(gdf) == 2
+    assert all(g == "Point" for g in gdf.geometry.geom_type)
+    assert set(gdf["PCI"]) == {100, 200}
+
+    qml = out.with_suffix(".qml").read_text(encoding="utf-8")
+    assert "SimpleMarker" in qml
+    assert 'v="square"' in qml        # 点形状 → QGIS marker name
+    assert "255,0,0,255" in qml       # 符号色 #FF0000
+
+
+def test_generate_point_layer_shp_hollow(service, sample_excel):
+    """空心点（填充为"无色"）：.qml 不填色，轮廓用边框色"""
+    out, _ = service.generate_point_layer(
+        str(sample_excel), "LTE", "NAME", "LONGITUDE", "LATITUDE",
+        ["NAME"], "shp",
+        source_filename="sample.xlsx",
+        border_color="#0000FF", fill_color="none",
+    )
+    qml = out.with_suffix(".qml").read_text(encoding="utf-8")
+    assert "SimpleMarker" in qml
+    assert 'v="no"' in qml            # marker style no → 不填充
+    assert "0,0,255,255" in qml       # 轮廓色 #0000FF
+
+
+def test_generate_sector_layer_shp(service, sample_excel):
+    """扇区图层 SHP：面几何 + 边框/填充色写入同 stem .qml"""
+    import pyogrio
+
+    out, stats = service.generate_sector_layer(
+        str(sample_excel), "LTE", "NAME", "LONGITUDE", "LATITUDE", "AZIMUTH",
+        3000, 40.0, ["NAME", "PCI"], "shp",
+        source_filename="sample.xlsx",
+        border_color="#FF0000", fill_color="#00FF00", line_width=3,
+    )
+    assert stats["success"] == 2
+    assert out.suffix == ".shp"
+    for ext in (".shx", ".dbf", ".prj", ".cpg", ".qml"):
+        assert out.with_suffix(ext).exists()
+
+    gdf = pyogrio.read_dataframe(str(out))
+    assert len(gdf) == 2
+    assert all(g == "Polygon" for g in gdf.geometry.geom_type)
+
+    qml = out.with_suffix(".qml").read_text(encoding="utf-8")
+    assert "SimpleFill" in qml
+    assert "0,255,0,255" in qml       # 填充色 #00FF00
 
 
 def test_generate_polygon_layer_requires_attributes(service, polygon_excel):

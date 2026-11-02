@@ -3,6 +3,8 @@
 """
 from types import SimpleNamespace
 
+import io
+
 import pandas as pd
 import tempfile
 import os
@@ -69,6 +71,52 @@ def test_excel_info_endpoint():
         os.remove(path)
 
 
+def test_template_sector_and_point_follow_required_fields():
+    """扇区/点图模板：表头即为各自必填字段（+可选属性），示例行与填写说明齐全"""
+    client = _make_client()
+    for kind, sheet, required in (
+        ("sector", "扇区图层", ["小区名称", "经度", "纬度", "方位角"]),
+        ("point", "点图层", ["小区名称", "经度", "纬度"]),
+    ):
+        resp = client.get(f"/api/v1/layer/template/{kind}")
+        assert resp.status_code == 200
+        assert resp.content
+        book = pd.ExcelFile(io.BytesIO(resp.content))
+        # 数据表必须是第一个 sheet（前端上传后默认选 sheets[0]）
+        assert book.sheet_names[0] == sheet
+        assert "填写说明" in book.sheet_names
+
+        df = book.parse(sheet)
+        assert list(df.columns)[:len(required)] == required
+        assert len(df) >= 1                                  # 有示例行
+        assert df["经度"].between(-180, 180).all()
+        assert df["纬度"].between(-90, 90).all()
+        if kind == "sector":
+            assert df["方位角"].between(0, 360).all()
+            # 覆盖类型列：用户在模板里填室内/室外，决定画圆还是画扇区
+            assert "覆盖类型" in df.columns
+            assert df["覆盖类型"].isin(["室内", "室外"]).all()
+        else:
+            assert "方位角" not in df.columns
+            assert "覆盖类型" not in df.columns
+
+
+def test_template_polygon_keeps_geo_template():
+    """面状图模板沿用「地理化数据」的多边形模板（坐标串列）"""
+    client = _make_client()
+    resp = client.get("/api/v1/layer/template/polygon")
+    assert resp.status_code == 200
+    assert resp.content
+    sheets = pd.ExcelFile(io.BytesIO(resp.content)).sheet_names
+    assert sheets
+
+
+def test_template_unknown_kind_rejected():
+    client = _make_client()
+    resp = client.get("/api/v1/layer/template/unknown")
+    assert resp.status_code == 400
+
+
 def test_point_endpoint_returns_download_url():
     """生成点图层返回下载 URL（TAB 打包 zip 含 .tab/.dat/.id/.map），且可通过 /layer-files/ 下载"""
     path = _make_excel()
@@ -125,6 +173,7 @@ def test_sector_endpoint():
                     "beamwidth": "40",
                     "attributes": '["NAME"]',
                     "output_format": "mif",
+                    "coverage_col": "覆盖类型",   # 列不存在 → 全部按扇区绘制，接口须接受该参数
                 },
             )
         assert resp.status_code == 200
@@ -828,6 +877,38 @@ def test_multi_format_zip_name_includes_formats():
             names = zf.namelist()
         suffixes = {Path(n).suffix for n in names}
         assert {".tab", ".mif", ".kml"}.issubset(suffixes)
+    finally:
+        os.remove(path)
+
+
+def test_point_shp_format_packages_companions():
+    """点图层 output_formats=shp → zip 含 .shp/.shx/.dbf/.prj/.cpg 与样式 .qml"""
+    path = _make_excel()
+    client = _make_client()
+    try:
+        with open(path, "rb") as f:
+            resp = client.post(
+                "/api/v1/layer/point",
+                files={"file": ("sample.xlsx", f, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+                data={
+                    "sheet_name": "LTE", "name_col": "NAME",
+                    "lon_col": "LONGITUDE", "lat_col": "LATITUDE",
+                    "attributes": '["NAME"]', "output_formats": "shp",
+                    "border_color": "#FF0000",
+                },
+            )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["success"] is True
+        assert body["data"]["filename"] == "sample_LTE_point_shp.zip"
+        download_url = body["data"]["download_url"]
+        assert download_url == "/layer-files/sample_LTE_point_shp.zip"
+        dl = client.get(download_url)
+        assert dl.status_code == 200
+        import zipfile, io
+        with zipfile.ZipFile(io.BytesIO(dl.content)) as zf:
+            suffixes = {Path(n).suffix for n in zf.namelist()}
+        assert {".shp", ".shx", ".dbf", ".prj", ".cpg", ".qml"}.issubset(suffixes)
     finally:
         os.remove(path)
 

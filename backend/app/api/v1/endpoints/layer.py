@@ -1,6 +1,7 @@
 """
 图层制作 API 端点
 """
+import io
 import json
 import re
 import shutil
@@ -8,9 +9,11 @@ import uuid
 import zipfile
 from pathlib import Path
 from typing import Optional
+from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, Form
 from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import FileResponse, StreamingResponse
 
 from app.core.config import settings
 from app.core.security import require_data_import
@@ -148,6 +151,41 @@ async def excel_info(
             src.unlink(missing_ok=True)
 
 
+# 模板文件名（下载时使用；polygon 沿用「地理化数据」的多边形模板）
+_TEMPLATE_FILENAMES = {
+    "sector": "扇区图层模板.xlsx",
+    "point": "点图层模板.xlsx",
+    "polygon": "GeoDataTemplate-多边形.xlsx",
+}
+_XLSX_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+
+@router.get("/template/{kind}")
+async def download_template(kind: str, current_user=Depends(require_data_import)):
+    """下载图层制作模板。
+
+    - sector/point：按各自必填字段（名称/经纬度，扇区另需方位角）现场生成，
+      含 3 行示例与「填写说明」sheet（约束条件）
+    - polygon：沿用「地理化数据」的多边形模板（坐标串列格式与面状图一致）
+    """
+    filename = _TEMPLATE_FILENAMES.get(kind)
+    if filename is None:
+        raise HTTPException(status_code=400, detail=f"不支持的模板类型: {kind}")
+
+    if kind == "polygon":
+        path = settings.TEMPLATE_DIR / "GeoDataTemplate -多边形.xlsx"
+        if not path.is_file():
+            raise HTTPException(status_code=404, detail="模板文件不存在")
+        return FileResponse(path=str(path), media_type=_XLSX_MEDIA_TYPE, filename=filename)
+
+    content = await run_in_threadpool(layer_service.build_template, kind)
+    return StreamingResponse(
+        io.BytesIO(content),
+        media_type=_XLSX_MEDIA_TYPE,
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}"},
+    )
+
+
 @router.post("/point")
 async def generate_point(
     file: Optional[UploadFile] = None,
@@ -267,6 +305,7 @@ async def generate_sector(
     lon_col: str = Form(...),
     lat_col: str = Form(...),
     azimuth_col: str = Form(...),
+    coverage_col: Optional[str] = Form(None),     # 覆盖类型列：室分/室内/indoor → 圆形（半径取一半）
     radius_m: float = Form(3000.0),
     beamwidth: float = Form(40.0),
     attributes: str = Form("[]"),
@@ -301,7 +340,7 @@ async def generate_sector(
                 radius_m, beamwidth, attr_list, fmt,
                 color or None, original_name,
                 border_color or color, fill_color or color, opacity,
-                line_width,
+                line_width, coverage_col or None,
             )
             outs.append(out)
         return {"success": True, "data": {**_finalize_outputs(outs, fmt_list, _fmt_tag(fmt_list)), "stats": stats}}

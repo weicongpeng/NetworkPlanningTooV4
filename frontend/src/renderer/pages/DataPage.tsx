@@ -187,8 +187,11 @@ export function DataPage() {
     const file = e.target.files?.[0]
     e.target.value = ''
     if (!file) return
-    const label = dataType === 'station_params' ? '基站参数' : '基站指标'
-    addLog('upload', `开始${label}上传: ${file.name}`, 'running', undefined, `upload:${file.name}`)
+    const label = dataType === 'station_params'
+      ? t('data.stationParamsLabel')
+      : t('data.stationMetricsLabel')
+    addLog('upload', t('data.stationUploadStart', { label, name: file.name }),
+      'running', undefined, `upload:${file.name}`)
     setStationBusy(dataType)
     setUploadStatus(prev => ({ ...prev, [dataType]: 'idle' }))
     try {
@@ -201,12 +204,14 @@ export function DataPage() {
           setStationBusy('')
           if (st.status === 'error') {
             setUploadStatus(prev => ({ ...prev, [dataType]: 'error' }))
-            addLog('upload', `${label}解析失败: ${st.error}`, 'error', undefined, `upload:${file.name}`)
-            alert(`${label}解析失败：${st.error}`)
+            const failure = t('data.stationParseFailed', { label, error: st.error })
+            addLog('upload', failure, 'error', undefined, `upload:${file.name}`)
+            alert(failure)
           } else {
             setUploadStatus(prev => ({ ...prev, [dataType]: 'success' }))
             setTimeout(() => setUploadStatus(prev => ({ ...prev, [dataType]: 'idle' })), 3000)
-            addLog('upload', `${label}导入成功: ${file.name}`, 'success', undefined, `upload:${file.name}`)
+            addLog('upload', t('data.stationImported', { label, name: file.name }),
+              'success', undefined, `upload:${file.name}`)
           }
           await indexedDBService.delete('data_list_cache')
           fetchList(1, 50, true)
@@ -217,8 +222,9 @@ export function DataPage() {
       setStationBusy('')
       setUploadStatus(prev => ({ ...prev, [dataType]: 'error' }))
       const detail = err?.response?.data?.detail || err.message
-      addLog('upload', `${label}上传失败: ${detail}`, 'error', undefined, `upload:${file.name}`)
-      alert(`${label}上传失败：${detail}`)
+      const failure = t('data.stationUploadFailed', { label, error: detail })
+      addLog('upload', failure, 'error', undefined, `upload:${file.name}`)
+      alert(failure)
     }
   }
 

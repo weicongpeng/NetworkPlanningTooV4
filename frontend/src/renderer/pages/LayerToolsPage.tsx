@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from 'react'
 import { useTranslation } from 'react-i18next'
 import * as Tabs from '@radix-ui/react-tabs'
 import * as Select from '@radix-ui/react-select'
-import { FileUp, Loader2, Download, CheckCircle2, ChevronDown } from 'lucide-react'
+import { UploadCloud, Loader2, Download, CheckCircle2, ChevronDown, Layers, AlertCircle } from 'lucide-react'
 import { layerToolsApi, type LayerExcelInfo, type GenerateLayerResult } from '../services/api'
 import { uploadStore } from '../store/uploadStore'
 import { LayerAttributeConfig } from '../components/layer/LayerAttributeConfig'
@@ -11,8 +11,8 @@ import { NO_FILL_COLOR } from '../utils/fieldValue'
 
 type TabKind = 'sector' | 'point' | 'polygon'
 type LayerFormat = 'tab' | 'mif' | 'kml' | 'shp'
-const ALL_FORMATS: LayerFormat[] = ['tab', 'mif', 'kml']          // 扇区/点图
-const POLYGON_FORMATS: LayerFormat[] = ['tab', 'mif', 'kml', 'shp'] // 面状图（多 SHP）
+const ALL_FORMATS: LayerFormat[] = ['tab', 'mif', 'kml', 'shp']     // 扇区/点图/面状图（SHP 样式另写同 stem .qml）
+const LEGACY_DEFAULT_FORMATS: LayerFormat[] = ['tab', 'mif', 'kml'] // 旧版默认全选：仅用于 loadState 迁移判定
 const DEFAULT_FORMATS: LayerFormat[] = ['tab']   // 输出格式默认仅勾选 TAB
 
 // 页面级共享文件状态：一份文件同时作用于扇区/点图两个 Tab
@@ -145,9 +145,8 @@ function loadState(key: string, type: TabKind): TabState {
         merged = { ...emptyTabState(type), ...saved, _v: 2 }
       }
       // 输出格式默认由三格式全选改为仅 TAB：仅当仍是旧默认全选时才迁移，避免覆盖用户自选
-      // （面状图含 SHP，三格式全选属正常配置，不迁移）
       if (type !== 'polygon' && Array.isArray(merged.formats)
-          && ALL_FORMATS.every(f => merged.formats.includes(f))) {
+          && LEGACY_DEFAULT_FORMATS.every(f => merged.formats.includes(f))) {
         merged.formats = [...DEFAULT_FORMATS]
       }
       return merged
@@ -338,6 +337,7 @@ export default function LayerToolsPage() {
         ? await layerToolsApi.generateSector({
             ...base,
             azimuthCol: state.fieldMappings.azimuth,
+            coverageCol: state.fieldMappings.coverage,
             radiusM: parseFloat(state.radiusM) || LAYER_DEFAULT_PARAMS.sector.radiusM,
             beamwidth: parseFloat(state.beamwidth) || LAYER_DEFAULT_PARAMS.sector.beamwidth,
           })
@@ -367,6 +367,16 @@ export default function LayerToolsPage() {
     if (uploadProgress.step === 'uploading') return t('layer.uploading').replace('{percent}', String(uploadProgress.percent))
     if (uploadProgress.step === 'reading') return t('layer.reading')
     return t('layer.done')
+  }
+
+  // 模板下载：扇区/点图按各自必填字段生成，面状图沿用多边形模板；失败提示到当前 Tab
+  const handleDownloadTemplate = async (kind: TabKind) => {
+    const setTab = kind === 'sector' ? setSectorState : kind === 'point' ? setPointState : setPolygonState
+    try {
+      await layerToolsApi.downloadTemplate(kind)
+    } catch (err: any) {
+      setTab(s => ({ ...s, error: err?.message || String(err) }))
+    }
   }
 
   const formatFailures = (failures: Record<string, number>, labels: Record<string, string>) => {
@@ -516,7 +526,7 @@ export default function LayerToolsPage() {
       <div className="col-span-2">
         <label className="block text-xs font-medium mb-1">{t('layer.formats')}</label>
         <div className="flex gap-4">
-          {(kind === 'polygon' ? POLYGON_FORMATS : ALL_FORMATS).map(fmt => (
+          {ALL_FORMATS.map(fmt => (
             <label key={fmt} className="flex items-center gap-1.5 text-xs cursor-pointer">
               <input
                 type="checkbox"
@@ -547,6 +557,13 @@ export default function LayerToolsPage() {
     }
     return map[reason] || reason
   }
+
+  // 错误提示：与「批量距离匹配」页同一套告警样式（红底浅色块 + 图标）
+  const renderError = (msg: string) => msg && (
+    <div className="mt-4 p-3 bg-red-500/10 border border-red-500/20 rounded-lg text-xs text-red-600 flex items-start gap-2 shrink-0">
+      <AlertCircle size={14} className="mt-0.5 shrink-0" /> {msg}
+    </div>
+  )
 
   const renderResult = (ts: TabState) => ts.result && (
     <div className="mt-3">
@@ -613,7 +630,8 @@ export default function LayerToolsPage() {
   )
 
   // 渲染 Tab 内容（扇区/点图/面状图共用骨架，参数和校验差异；文件共享，读 sharedFile）
-  // 三张卡片横向铺满、纵向撑满：数据来源（文件导入 + Sheet）/ 图层属性 / 参数设置 + 生成
+  // 三张卡片横向铺满、高度自适应内容（items-start：不被同行最高卡片拉到一样高，
+  // 也不随页面高度撑满）：数据来源（文件导入 + Sheet）/ 图层属性 / 参数设置 + 生成
   const renderTabContent = (
     ts: TabState,
     setTab: (u: (s: TabState) => TabState) => void,
@@ -621,12 +639,19 @@ export default function LayerToolsPage() {
     onSheetChange: (sheet: string) => void,
     kind: TabKind,
   ) => (
-    <div className="flex-1 grid grid-cols-1 lg:grid-cols-12 gap-6">
+    <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 items-start">
       {/* 卡片①（3/12）：数据来源 = 文件导入 + Sheet 选择 */}
-      <div className="lg:col-span-3 flex flex-col">
-        <div className="flex-1 p-4 bg-card border border-border rounded-lg flex flex-col gap-4">
+      <div className="lg:col-span-3">
+        <div className="p-4 bg-card border border-border rounded-lg flex flex-col gap-4">
           <div>
-            <p className="text-xs font-medium mb-3">{t('layer.fileImport')}</p>
+            <p className="text-xs font-medium mb-3 flex items-center gap-2">
+              {t('layer.fileImport')}
+              {/* 模板下载：扇区/点图按各自必填字段生成，面状图沿用多边形模板 */}
+              <button type="button" onClick={() => handleDownloadTemplate(kind)}
+                className="ml-auto text-xs text-primary hover:underline">
+                {t('layer.downloadTemplate')}
+              </button>
+            </p>
             <label
               onDragOver={(e) => { e.preventDefault(); setDragActive(true) }}
               onDragLeave={(e) => {
@@ -634,25 +659,16 @@ export default function LayerToolsPage() {
                 if (!e.currentTarget.contains(e.relatedTarget as Node)) setDragActive(false)
               }}
               onDrop={(e) => { e.preventDefault(); setDragActive(false); const f = e.dataTransfer.files?.[0]; if (f) processFile(f) }}
-              className={`flex items-center gap-3 px-3 py-3 border-2 border-dashed rounded-lg cursor-pointer transition-colors ${dragActive ? 'border-primary bg-primary/5' : 'border-border hover:border-primary'}`}>
-              <FileUp className="text-muted-foreground shrink-0" size={20} />
-              <div className="flex-1 min-w-0">
-                <p className="text-sm truncate">{file.fileName || (dragActive ? t('layer.dropHere') : t('layer.uploadExcel'))}</p>
-                <p className="text-xs text-muted-foreground">{t('layer.acceptExcel')}</p>
-              </div>
+              className={`flex items-center gap-3 px-4 py-3 border-2 border-dashed rounded-lg cursor-pointer transition-colors ${dragActive ? 'border-primary bg-primary/5' : 'border-border hover:border-primary'}`}>
+              <UploadCloud className="text-muted-foreground shrink-0" size={20} />
+              <span className="text-sm truncate flex-1">
+                {file.fileName || (dragActive ? t('layer.dropHere') : t('layer.uploadExcel'))}
+              </span>
               <input type="file" className="hidden" accept=".xlsx,.xls,.txt,.csv" onChange={handleFile} disabled={uploading} />
             </label>
-
-            {/* 面状图数据模板：与「地理化数据」同源的多边形模板 */}
-            {kind === 'polygon' && (
-              <div className="mt-2">
-                <a href="/api/v1/data/template/geo_polygon" download="GeoDataTemplate-多边形.xlsx"
-                  className="inline-flex items-center gap-1 text-xs text-primary hover:underline">
-                  <Download size={12} /> {t('layer.downloadTemplate')}
-                </a>
-                <p className="text-[10px] text-muted-foreground mt-1">{t('layer.polygonHint')}</p>
-              </div>
-            )}
+            <p className="text-[10px] text-muted-foreground mt-1">
+              {kind === 'polygon' ? t('layer.polygonHint') : t('layer.acceptExcel')}
+            </p>
 
             {/* 进度条 + 状态（模块级进度：切页不丢失，回来实时恢复）+ 取消按钮 */}
             {uploading && uploadProgress.percent > 0 && (
@@ -686,11 +702,12 @@ export default function LayerToolsPage() {
       </div>
 
       {/* 卡片②（5/12）：图层属性配置 */}
-      <div className="lg:col-span-5 flex flex-col">
-        <div className="flex-1 p-4 bg-card border border-border rounded-lg">
+      <div className="lg:col-span-5">
+        <div className="p-4 bg-card border border-border rounded-lg">
           <LayerAttributeConfig
             columns={file.columns}
             includeAzimuth={kind === 'sector'}
+            includeCoverage={kind === 'sector'}
             includePolygon={kind === 'polygon'}
             selectedFields={ts.selectedFields}
             onSelectedFieldsChange={(v) => setTab(s => ({ ...s, selectedFields: v }))}
@@ -700,12 +717,12 @@ export default function LayerToolsPage() {
         </div>
       </div>
 
-      {/* 卡片③（4/12）：参数设置 + 生成/下载（按钮紧跟参数下方，下方留白由卡片撑满） */}
-      <div className="lg:col-span-4 flex flex-col">
-        <div className="flex-1 p-4 bg-card border border-border rounded-lg flex flex-col">
+      {/* 卡片③（4/12）：参数设置 + 生成/下载（按钮紧跟参数下方，卡片高度随内容） */}
+      <div className="lg:col-span-4">
+        <div className="p-4 bg-card border border-border rounded-lg flex flex-col">
           <p className="text-xs font-medium mb-3">{t('layer.params')}</p>
           {renderParams(ts, setTab, kind)}
-          {/* 生成按钮紧跟参数（输出格式）下方，卡片剩余空白留在按钮下方 */}
+          {/* 生成按钮紧跟参数（输出格式）下方 */}
           <div className="mt-4 pt-4 border-t border-border">
             <button onClick={handleGenerate} disabled={generating || !file.filePath || !file.sheetName}
               className="w-full px-6 py-2.5 bg-primary text-primary-foreground rounded-lg hover:opacity-90 disabled:opacity-50 text-sm font-medium">
@@ -733,13 +750,15 @@ export default function LayerToolsPage() {
   }
 
   return (
-    <div className="p-8 w-full flex-1 flex flex-col">
-      <h1 className="text-base font-bold mb-6">{t('nav.layerTools')}</h1>
+    <div className="p-6 w-full h-full min-h-0 flex flex-col gap-4">
+      <h1 className="text-base font-bold flex items-center gap-2 shrink-0">
+        <Layers size={18} /> {t('nav.layerTools')}
+      </h1>
 
       <Tabs.Root value={activeTab} onValueChange={(v) => handleTabChange(v as TabKind)}
         className="flex-1 flex flex-col">
         {/* ① 扇区/点图/面状图 Tab */}
-        <Tabs.List className="flex gap-2 mb-6 border-b border-border shrink-0" aria-label={t('nav.layerTools')}>
+        <Tabs.List className="flex gap-2 mb-4 border-b border-border shrink-0" aria-label={t('nav.layerTools')}>
           <Tabs.Trigger value="sector"
             className="px-4 py-2 text-sm font-medium rounded-t-lg transition-colors data-[state=active]:bg-card data-[state=active]:text-primary data-[state=active]:border-b-2 data-[state=active]:border-primary data-[state=inactive]:text-muted-foreground data-[state=inactive]:hover:text-foreground">
             {t('layer.sectorLayer')}
@@ -754,22 +773,22 @@ export default function LayerToolsPage() {
           </Tabs.Trigger>
         </Tabs.List>
 
-        {/* ② 三张卡片（数据来源 / 图层属性 / 参数设置+生成）横向铺满、纵向撑满剩余高度 */}
+        {/* ② 三张卡片（数据来源 / 图层属性 / 参数设置+生成）横向铺满，高度随内容 */}
         <Tabs.Content value="sector" className="flex-1 flex flex-col data-[state=inactive]:hidden">
           {renderTabContent(sectorState, (u) => setSectorState(s => u(s)), sharedFile, handleSheetChange, 'sector')}
-          {sectorState.error && <p className="mt-4 text-xs text-red-500">{sectorState.error}</p>}
+          {renderError(sectorState.error)}
         </Tabs.Content>
 
         {/* 点图 Tab */}
         <Tabs.Content value="point" className="flex-1 flex flex-col data-[state=inactive]:hidden">
           {renderTabContent(pointState, (u) => setPointState(s => u(s)), sharedFile, handleSheetChange, 'point')}
-          {pointState.error && <p className="mt-4 text-xs text-red-500">{pointState.error}</p>}
+          {renderError(pointState.error)}
         </Tabs.Content>
 
         {/* 面状图 Tab */}
         <Tabs.Content value="polygon" className="flex-1 flex flex-col data-[state=inactive]:hidden">
           {renderTabContent(polygonState, (u) => setPolygonState(s => u(s)), sharedFile, handleSheetChange, 'polygon')}
-          {polygonState.error && <p className="mt-4 text-xs text-red-500">{polygonState.error}</p>}
+          {renderError(polygonState.error)}
         </Tabs.Content>
       </Tabs.Root>
     </div>

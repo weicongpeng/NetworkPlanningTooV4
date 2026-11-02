@@ -64,6 +64,50 @@ def is_no_color(value: Optional[str]) -> bool:
 # MapInfo 非法字段名字符（非字母数字/下划线/中文）
 _MAPINFO_INVALID = re.compile(r"[^\w一-鿿]+")
 
+# 图层制作导入模板：列名刻意用前端 LAYER_FIELD_MATCHES 的关键字（名称/经度/纬度/方位角），
+# 上传后自动完成字段匹配，用户按表填写即可出图。数据表必须是第一个 sheet（前端默认选
+# sheets[0]），填写说明放第二个；半径/波瓣/点大小等参数在页面参数区设置，不进模板。
+_TEMPLATE_SPECS: Dict[str, Dict[str, Any]] = {
+    "sector": {
+        "sheet": "扇区图层",
+        "columns": ["小区名称", "经度", "纬度", "方位角", "覆盖类型", "PCI", "频点"],
+        "widths": [20, 12, 12, 10, 12, 10, 10],
+        "rows": [
+            ["示例_小区1", 116.3974, 39.9093, 0, "室外", 100, 100],
+            ["示例_小区2", 116.4074, 39.9093, 120, "室内", 101, 100],
+            ["示例_小区3", 116.4174, 39.9093, 240, "室外", 102, 100],
+        ],
+        "notes": [
+            "必填列：小区名称、经度、纬度、方位角（首行表头不能删改，关键字用于自动匹配字段）",
+            "经度/纬度：WGS84 十进制度，如 116.3974 / 39.9093",
+            "方位角：0-360 度，正北为 0、顺时针增大；室外行整列为 0 或空值会报错",
+            "覆盖类型：填 室分 / 室内 / indoor 绘制圆形（半径为「扇区半径」的一半，可不填方位角）；"
+            "填室外 / 宏站 / outdoor 或留空按扇形绘制；列名含「覆盖类型」可自动匹配",
+            "覆盖半径、波瓣夹角、线宽、边框/填充颜色在页面「参数设置」区填写，不写在本表",
+            "PCI、频点等其余列会作为图层属性保留，可自行增删；示例行请删除或替换为真实数据",
+            "坐标或名称缺失的行会被跳过，并在生成结果的失败统计中列出",
+        ],
+    },
+    "point": {
+        "sheet": "点图层",
+        "columns": ["小区名称", "经度", "纬度", "PCI", "频点"],
+        "widths": [20, 12, 12, 10, 10],
+        "rows": [
+            ["示例_小区1", 116.3974, 39.9093, 100, 100],
+            ["示例_小区2", 116.4074, 39.9093, 101, 100],
+            ["示例_小区3", 116.4174, 39.9093, 102, 100],
+        ],
+        "notes": [
+            "必填列：小区名称、经度、纬度（首行表头不能删改，关键字用于自动匹配字段）",
+            "经度/纬度：WGS84 十进制度，如 116.3974 / 39.9093",
+            "点大小、点形状、填充颜色在页面「参数设置」区填写，不写在本表",
+            "PCI、频点等其余列会作为图层属性保留，可自行增删；示例行请删除或替换为真实数据",
+            "坐标或名称缺失的行会被跳过，并在生成结果的失败统计中列出",
+        ],
+    },
+}
+
+
 # 生成前清理的历史输出后缀（含 -1/-2 序号残留）
 _CLEANUP_SUFFIXES = (
     ".tab", ".dat", ".id", ".map", ".mif", ".mid", ".zip", ".kml",
@@ -176,6 +220,28 @@ def sector_polygon(lat: float, lng: float, azimuth: float, beamwidth: float,
     pts.append((lng2, lat2))
     pts.append((lng, lat))
     return Polygon(pts)
+
+
+def circle_polygon(lat: float, lng: float, radius_m: float, arc_points: int = 24) -> Polygon:
+    """生成圆形多边形（室内覆盖），圆心为 (lat, lng)、半径 radius_m，首尾闭合。"""
+    pts = []
+    for i in range(arc_points):
+        lat2, lng2 = fast_destination(lat, lng, 360.0 * i / arc_points, radius_m)
+        pts.append((lng2, lat2))
+    pts.append(pts[0])
+    return Polygon(pts)
+
+
+# 覆盖类型判定：室内覆盖（室分/室内/indoor）画圆形，其余（室外/宏站/outdoor/空值）画扇形
+INDOOR_COVERAGE_KEYWORDS = ("室分", "室内", "indoor")
+
+
+def is_indoor_coverage(value: Any) -> bool:
+    """覆盖类型值是否为室内覆盖。空值、无法识别的值一律按室外扇区处理。"""
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return False
+    text = str(value).strip().lower()
+    return any(k in text for k in INDOOR_COVERAGE_KEYWORDS)
 
 
 def tab_opacity_brush_pattern(opacity: Optional[float]) -> int:
@@ -537,15 +603,30 @@ class LayerService:
 
         geom_type = str(gdf.geometry.geom_type.iloc[0]).lower()
         kind = "polygon" if "polygon" in geom_type else ("line" if "line" in geom_type else "point")
-        qml_style = {
-            "kind": kind,
-            "fillColor": style.get("fill_color"),
-            "fillOff": is_no_color(style.get("fill_color")),
-            "strokeColor": style.get("border_color"),
-            "strokeOff": is_no_color(style.get("border_color")),
-            "fillOpacity": 1 - float(style.get("opacity") or 0),
-            "strokeWidth": style.get("line_width") or 2,
-        }
+        if kind == "point":
+            # 点图层 QML 用 marker 键（markerColor/color/markerSize/markerSymbol），与面/线的
+            # fillColor/strokeColor 不同；generate_point_layer 把符号色放在 border_color
+            # （fill_color 恒为 None），空心点不填色、只按该色描轮廓
+            symbol = style.get("border_color")
+            hollow = bool(style.get("hollow"))
+            qml_style = {
+                "kind": kind,
+                "markerColor": None if hollow else symbol,
+                "color": symbol,
+                "markerSize": style.get("point_size"),
+                "markerSymbol": style.get("point_shape"),
+                "fillOpacity": 1 - float(style.get("opacity") or 0),
+            }
+        else:
+            qml_style = {
+                "kind": kind,
+                "fillColor": style.get("fill_color"),
+                "fillOff": is_no_color(style.get("fill_color")),
+                "strokeColor": style.get("border_color"),
+                "strokeOff": is_no_color(style.get("border_color")),
+                "fillOpacity": 1 - float(style.get("opacity") or 0),
+                "strokeWidth": style.get("line_width") or 2,
+            }
         write_layer_qml(out_path.with_suffix(".qml"), kind, [qml_style] * len(gdf))
 
     @staticmethod
@@ -935,7 +1016,8 @@ class LayerService:
                               border_color: Optional[str] = None,
                               fill_color: Optional[str] = None,
                               opacity: Optional[float] = None,
-                              line_width: Optional[float] = None):
+                              line_width: Optional[float] = None,
+                              coverage_col: Optional[str] = None):
         """生成扇区图层，返回 (输出文件路径, stats_dict)。
         stats 包含 total/success/failed/failures 分类计数。
         source_filename: 原始源文件名（未被 _save_upload 重命名），用于输出文件命名。
@@ -943,16 +1025,24 @@ class LayerService:
         border_color/fill_color/opacity: 样式参数。扇区边框色=border_color、填充=fill_color、
         透明度=opacity。两色均支持"无色"哨兵（'none'）：边框无色 → 不描边、填充无色 → 镂空。
         line_width: 描边线宽（像素，clamp 1-7）。
+        coverage_col: 覆盖类型列（可选）。值为 室分/室内/indoor 的行画圆形，半径为 radius_m
+        的一半且不要求方位角；其余行按扇形绘制（半径 radius_m、波瓣夹角 beamwidth）。
         TAB 经临时 MIF 中转写入原生样式，透明度只做两档（实心/空心）。
         """
         df = self._read_sheet(file_path, sheet_name)
         lon, lat, coord_valid, failures = self._coerce_coords(df, lon_col, lat_col)
 
-        # 方位角校验
+        # 覆盖类型：室内覆盖画圆，其余画扇区（列不存在时全部按扇区）
+        if coverage_col and coverage_col in df.columns:
+            indoor = df[coverage_col].map(is_indoor_coverage).astype(bool)
+        else:
+            indoor = pd.Series(False, index=df.index)
+
+        # 方位角校验（室内行为圆形，不依赖方位角）
         failures["invalid_azimuth"] = 0
         azi = pd.to_numeric(df[azimuth_col], errors="coerce")
         azi_ok = azi.between(0, 360) & azi.notna()
-        failures["invalid_azimuth"] += int((~azi_ok).sum())
+        failures["invalid_azimuth"] += int((~azi_ok & ~indoor).sum())
 
         # 标签名缺失校验
         if name_col and name_col in df.columns:
@@ -962,18 +1052,21 @@ class LayerService:
             failures["missing_name"] = 0
             name_missing = pd.Series([False] * len(df), index=df.index)
 
-        valid = coord_valid & azi_ok & ~name_missing
+        valid = coord_valid & (azi_ok | indoor) & ~name_missing
         if valid.sum() == 0:
             raise ValueError(
                 f"全部行校验失败（成功 0/{len(df)}），请检查数据"
             )
         # 全零/全空方位角列会被 between(0,360) 静默接受，导致所有扇区退化为朝北楔形
-        nonzero = azi_ok & (azi > 0)
-        if nonzero.sum() == 0:
+        # 仅校验按扇形绘制的行（室内圆形不看方位角）
+        sector_rows = valid & ~indoor
+        if sector_rows.any() and not (azi_ok & (azi > 0) & sector_rows).any():
             raise ValueError("方位角列全为 0 或空值，无法生成有效扇区，请检查方位角列选择")
+        indoor_radius = radius_m / 2
         geoms = [
-            sector_polygon(y, x, a, beamwidth, radius_m)
-            for x, y, a in zip(lon[valid], lat[valid], azi[valid])
+            circle_polygon(y, x, indoor_radius) if is_indoor
+            else sector_polygon(y, x, a, beamwidth, radius_m)
+            for x, y, a, is_indoor in zip(lon[valid], lat[valid], azi[valid], indoor[valid])
         ]
         gdf = self._build_gdf(df, lon, lat, valid, attributes, geoms, keep_cols_extra=[name_col])
         if output_format == "kml":
@@ -1067,6 +1160,37 @@ class LayerService:
             "failedDetails": details,
         }
         return out, stats
+
+    def build_template(self, kind: str) -> bytes:
+        """按图层类型的必填字段生成导入模板（xlsx 字节流）。
+
+        列名与前端 LAYER_FIELD_MATCHES 的关键字一致，上传后自动匹配字段映射；
+        内容 = 表头 + 3 行示例 + 第二个 sheet「填写说明」（约束条件）。
+        """
+        spec = _TEMPLATE_SPECS.get(kind)
+        if spec is None:
+            raise ValueError(f"不支持的模板类型: {kind}")
+        from openpyxl import Workbook
+        from openpyxl.styles import Font
+        from openpyxl.utils import get_column_letter
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = spec["sheet"]
+        ws.append(spec["columns"])
+        for row in spec["rows"]:
+            ws.append(row)
+        for cell in ws[1]:
+            cell.font = Font(bold=True)
+        for idx, width in enumerate(spec["widths"], start=1):
+            ws.column_dimensions[get_column_letter(idx)].width = width
+        notes = wb.create_sheet("填写说明")
+        for line in spec["notes"]:
+            notes.append([line])
+        notes.column_dimensions["A"].width = 88
+        buf = io.BytesIO()
+        wb.save(buf)
+        return buf.getvalue()
 
     def get_sheet_info(self, file_path: str) -> dict:
         """读取文件的 sheet 列表和各 sheet 列名。txt/csv 返回 ['默认']。"""
