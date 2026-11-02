@@ -366,6 +366,43 @@ def _make_exit_handler(window: Any) -> Callable[[], None]:
     return _exit_handler
 
 
+# 无边框窗口（WinForms FormBorderStyle.None）没有原生标题栏，窗口样式里也就不带最小化/最大化
+# 箱位；系统据此丢弃任务栏图标点击发来的 WM_SYSCOMMAND(SC_MINIMIZE)，用户看到的就是
+# 「点任务栏图标没反应，既不能最小化也不能还原」。这里只补样式位（不设 WS_CAPTION，仍无原生标题栏）。
+GWL_STYLE = -16
+WS_MINIMIZEBOX = 0x00020000
+WS_MAXIMIZEBOX = 0x00010000
+WS_SYSMENU = 0x00080000
+
+
+def _enable_taskbar_minimize(window: Any) -> None:
+    """给无边框主窗口补 WS_MINIMIZEBOX/WS_MAXIMIZEBOX/WS_SYSMENU。
+
+    仅 Windows 生效；窗体尚未就绪或非桌面壳时静默跳过。WinForms 重算窗口样式
+    （切换 FormBorderStyle，如全屏进出）时会把样式位覆盖回 CreateParams，所以全屏
+    切换后要再补一次（见 _make_fullscreen_handler）。
+    """
+    native = getattr(window, "native", None)
+    if os.name != "nt" or native is None:
+        return
+    try:
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.GetWindowLongW.restype = ctypes.c_long
+        user32.GetWindowLongW.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        user32.SetWindowLongW.restype = ctypes.c_long
+        user32.SetWindowLongW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_long]
+
+        handle = native.Handle
+        hwnd = ctypes.c_void_p(int(handle.ToInt64() if hasattr(handle, "ToInt64") else handle))
+        style = user32.GetWindowLongW(hwnd, GWL_STYLE)
+        wanted = style | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU
+        if wanted != style:
+            user32.SetWindowLongW(hwnd, GWL_STYLE, wanted)
+            _log.info("已补齐无边框窗口的最小化/最大化样式（任务栏图标可最小化/还原）")
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("补充窗口最小化/最大化样式失败（任务栏点击可能无响应）：%s", exc)
+
+
 def _limit_maximized_to_work_area(window: Any, enable: bool) -> None:
     """把无边框窗口的最大化范围限定到显示器工作区（排除任务栏）。
 
@@ -423,6 +460,8 @@ def _make_fullscreen_handler(window: Any, state: Optional[dict] = None) -> Calla
             # 真全屏要盖住任务栏：先清掉工作区限制，否则最大化会被收口到任务栏之上
             _limit_maximized_to_work_area(window, False)
         window.toggle_fullscreen()
+        # 全屏切换重设了 FormBorderStyle，样式位可能被 CreateParams 覆盖回去 → 再补一次
+        _enable_taskbar_minimize(window)
         state["fullscreen"] = fullscreen
         if not fullscreen:
             _limit_maximized_to_work_area(window, True)
@@ -617,6 +656,12 @@ def _create_window() -> Any:
     )
     # 窗口状态缓存：最大化/还原事件 + 全屏回调共同维护，供自绘标题栏查询
     win_state: dict = {"fullscreen": False, "maximized": True}
+    # 无边框窗口补最小化/最大化样式位：必须在窗体真正显示后再做（webview.start 的 func
+    # 线程早于 create_window，这时 window.native 还没就绪，直调会静默跳过）
+    try:
+        window.events.shown += lambda *_: _enable_taskbar_minimize(window)
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("订阅窗口显示事件失败（任务栏点击可能无法最小化）：%s", exc)
     # 关窗也要兜底：正常关闭路径被卡住时进程不退出，用户再启动会误报「程序已在运行」
     try:
         window.events.closing += _make_close_handler()
