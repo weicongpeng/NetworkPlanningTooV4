@@ -266,7 +266,7 @@ FastAPI (backend/app/)
 - **同组数据同步的「最后更新时间」选边与即时推送（2026-10-09）**：
   - **LWW**：清单项带 `server_updated_at`（`dataset_revisions.updated_at`，服务器时间轴）；桌面端 `mark_dirty`/`mark_local_deleted` 记本地 `changed_at`/`deleted_at`，并用清单 `server_time` 校准 `clock_offset_seconds`（>6h 偏差不采信）。`sync_once` 在"本地 dirty 且服务器 rev 也变了"时自动选边：本地更新更晚 → 带 `changed_at`（换算到服务器时间轴）LWW 覆盖；服务器更晚 → 直接 pull 覆盖本地并清 dirty；时间戳缺失的存量条目仍走人工冲突。服务端 `POST /desktop-cloud/data/dataset/{id}/package` 在 `base_rev` 冲突（或 base 缺失但声明了 `changed_at`）时只接受**晚于服务器更新时间**的覆盖，否则 409——堵住旧副本反向覆盖（乒乓）。待上行删除同理：清单显示服务器更新更晚则撤销本地删除并拉回。
   - **即时推送**：`dataset_revision_service.bump()` 成功后经 `websocket_manager.notify_data_changed` 向**同组**连接广播 `data_changed`（线程安全，`call_soon_threadsafe`；单进程广播，现网 `NPT_WORKERS=1`）。`/api/v1/ws/tasks` 支持 `?token=JWT` 或连接后 `{"type":"auth","token"}` 登记数据组；前端 `websocketService` 收到即动态 import `triggerDataRefresh('full')`（清小区列表缓存 + 广播 `DATA_REFRESH_EVENT`），网页端无需手动刷新即可看到桌面端/同组用户的改动；`AuthGuard` 登录后调用 `websocketService.authenticate(token)`。
-- **网优助手**：LLM 配置/数据集导入到 `station_param_rows`、`station_metric_rows` 两张表，对话走 function-calling（最多 5 轮工具调用），查询只读。
+- **网优助手**：LLM 配置/数据集导入到 `station_param_rows`、`station_metric_rows` 两张表，对话走 function-calling（最多 5 轮工具调用），查询只读。聚合分析统一走 `analyze`：模型只产 QueryPlan（`query_plan.py`），由 `compiler.py` 编成参数化 SQL（字段白名单 + 强制组过滤 + 强制 LIMIT），`executor.py` 只读连接执行；指标口径在 `semantic/builtin_metrics.json`（**比率类必须声明分子/分母，禁止 avg(比率)**），字段白名单在 `semantic/field_catalog.py`，数据目录（字段/指标/时间覆盖）注入 system prompt；返回带图表 spec（`chart_spec.py`）与取数配方（`provenance.py`）。规范见 `docs/plans/2026-10-30-assistant-analytics-spec.md`。
 
 ## 添加新 API 端点
 
@@ -318,6 +318,17 @@ FastAPI (backend/app/)
 - Git 采用 GitHub Flow：禁止直接提交/强推 main；Conventional Commits；原子提交。
 - 编码前有歧义先问；极简优先；只做精准修改，不顺手重构无关代码。
 - 依赖管理：AGENTS.md 的通用约定是前端 pnpm、后端 uv；本仓库实际使用 npm（`frontend/`）+ pip/venv（`backend/.venv`），AGENTS.md 中已注明该例外。
+
+### 深度优先（更深，不是更大）
+
+需求含糊或产出可能停留在泛泛层面时，交付"更深"的版本而不是"更大"的版本；动手改写/开工前先答四问，再按这四问重写需求（与根 `AGENTS.md` 同源）：
+
+1. 本领域顶尖专家在这里会做、而用户未要求的是什么？（缺的那一步，而非多加的功能）
+2. 从什么一手材料开始：源数据、原始日志、官方文档与协议原文、可复现的实测，而不是总结与二手转述。
+3. 用什么具体专业方法与工具：GDAL/OGR、pytest、真实数据集回归、浏览器实测、上游规范条款，而不是凭印象推断。
+4. 除你我之外什么外部标准能证明结果是对的：可跑的测试、构建产物、真实数据比对、上游格式/协议校验。
+
+深度 = 更好的问题 + 一手材料 + 可验证标准；更大 = 更多章节、更多字数、更多选项。禁止用篇幅冒充深度，四问的答案必须落进方案或验收点。
 
 ## 依赖与环境注意
 

@@ -317,7 +317,7 @@ FastAPI (backend/app/)
 - **同组数据变更即时推送（2026-10-09）**：`dataset_revision_service.bump()` 成功后经 `websocket_manager.notify_data_changed` 向**同组** WebSocket 连接广播 `data_changed`（线程安全；单进程广播，`NPT_WORKERS=1`）；`/api/v1/ws/tasks` 支持 `?token=JWT` 或 `{"type":"auth","token"}` 登记数据组；前端 `websocketService` 收到即 `triggerDataRefresh('full')`（清小区列表缓存 + 广播事件），网页端无需刷新即可看到桌面端/同组用户的写入；`AuthGuard` 登录后 `websocketService.authenticate(token)`。另：`getCellList()` 的空结果一律不信任（内存/IndexedDB 空缓存视为未命中，缓存版本 v6），桌面端 `desktopSyncStore` 首次拿到 `last_sync_at` 时也触发一次刷新。
 - **许可签发与续期**：Ed25519 许可（私钥仅服务器：`NPT_LICENSE_PRIVATE_KEY` 或 `licenses/license_private_key.pem`），租约默认 30 天、启动后台静默续期（剩余 <20 天或距上次 ≥7 天）；离线 `.nptlic` 导入通道保留。
 - **桌面端 OTA**：管理端分片上传安装包到 `desktop_releases` → 客户端比对版本 → 断点续传下载 + sha256 校验 → 在 `%APPDATA%\NetworkPlanningTool\updates\`（`DATA_ROOT/updates`）写升级脚本 `npt_update_*.cmd` → `CREATE_NO_WINDOW` 隐藏拉起（不弹终端窗口；脚本用 `ping` 计时，无控制台时 `timeout` 会报错）→ 等应用退出（`EXIT_WAIT_SECONDS=60` 超时 `taskkill` 兜底）→ `/VERYSILENT` 静默安装（日志 `npt_setup.log`；安装命令带 `/DIR="<当前运行目录>"`，失败退回默认目录重试；重启优先从注册表 `InstallLocation`（安装器记录的实际安装目录）拉起，其次当前运行目录/默认目录/旧路径，避免"装到别处、重启旧 exe"导致版本没变；`installer.iss` 安装时按 `/DMyAppVersion` 统一重写包内 `version.json`，打包产物版本缺失/滞后也不会误报"更新未生效"）→ 重启应用；安装器退出码写 `updates/npt_ota_result.txt`（含 `install_dir` 与实际重启目标），重启目标的 `version.json` 拷成 `updates/installed_version.json` 供核对，应用重启后经 `/desktop/update/status` 的 `last_result` 判定是否已生效，未生效则弹窗提示手动运行安装包。**后台运行**：弹窗可选「后台运行」（`POST /desktop/update/background`），关掉窗口后由启动器进程继续下载，完成后自动安装并重启（期间持有单实例互斥体，重复启动会提示"正在后台更新"；后台更新期间关窗不武装 20 秒强制退出看门狗，否则下载会被杀在半路，下载等待结束后再武装）。应用侧经 `app/desktop_bridge.py` 的退出回调关闭窗口，`desktop/launcher.py` 先武装 `EXIT_GRACE_SECONDS=20` 强制退出看门狗、`destroy` 抛异常则立即 `os._exit`，确保进程一定退出、安装不会卡在等待里。**无强制更新**：新版本只提示，弹窗可随时关闭、「稍后」不计数；自动检查每 12 小时一次（1 天 2 次，本地 `npt-ota-last-prompt` 记录上次提醒，重启应用也不会重复打扰），面向所有桌面端用户。桌面版必须 `NPT_CONSOLE=0` 构建（CI tag 发行会用 0 重新打包），否则程序自带控制台窗口。 **版本号只认包内 `version.json`**：升级脚本由**旧版本进程**拉起，重启的新进程会继承旧进程环境里的 `NPT_DESKTOP_VERSION`（旧版本号）——launcher 必须用赋值覆盖（不能用 `setdefault`），升级脚本拉起前也 `set "NPT_DESKTOP_VERSION="` 兜底；否则自动重启后「系统设置」的版本、OTA `last_result.applied`、服务器「桌面授权」的「当前版本」列都停在升级前，要用户手动再重启一次才会对（"重启即完成"是该链路的要求）。
-- **网优助手**：LLM 配置/数据集导入到 `station_param_rows`、`station_metric_rows`；对话走 function-calling（最多 5 轮工具调用），查询只读
+- **网优助手**：LLM 配置/数据集导入到 `station_param_rows`、`station_metric_rows`；对话走 function-calling（最多 5 轮工具调用），查询只读。聚合分析统一走 `analyze`：模型只产 QueryPlan（`query_plan.py`），由 `compiler.py` 编成参数化 SQL（字段白名单 + 强制组过滤 + 强制 LIMIT），`executor.py` 只读连接执行；指标口径在 `semantic/builtin_metrics.json`（**比率类必须声明分子/分母，禁止 avg(比率)**），字段白名单在 `semantic/field_catalog.py`，数据目录（字段/指标/时间覆盖）注入 system prompt；返回带图表 spec（`chart_spec.py`）与取数配方（`provenance.py`）。规范见 `docs/plans/2026-10-30-assistant-analytics-spec.md`
 
 ## 添加新 API 端点
 
@@ -388,6 +388,17 @@ except Exception as e:
 - 编码遵循 DRY/KISS/SOLID/YAGNI
 - Git 采用 GitHub Flow：禁止直接提交/强推 main；Conventional Commits；原子提交
 - 依赖管理：AGENTS.md 通用约定为前端 pnpm、后端 uv；**本仓库实际使用 npm（`frontend/`）+ pip/venv（`backend/.venv`）**，不要改用 pnpm / uv
+
+### 深度优先（更深，不是更大）
+
+需求含糊或产出可能停留在泛泛层面时，交付"更深"的版本而不是"更大"的版本；动手改写/开工前先答四问，再按这四问重写需求（与根 `AGENTS.md` 同源）：
+
+1. 本领域顶尖专家在这里会做、而用户未要求的是什么？（缺的那一步，而非多加的功能）
+2. 从什么一手材料开始：源数据、原始日志、官方文档与协议原文、可复现的实测，而不是总结与二手转述。
+3. 用什么具体专业方法与工具：GDAL/OGR、pytest、真实数据集回归、浏览器实测、上游规范条款，而不是凭印象推断。
+4. 除你我之外什么外部标准能证明结果是对的：可跑的测试、构建产物、真实数据比对、上游格式/协议校验。
+
+深度 = 更好的问题 + 一手材料 + 可验证标准；更大 = 更多章节、更多字数、更多选项。禁止用篇幅冒充深度，四问的答案必须落进方案或验收点。
 
 ## 环境变量（`NPT_` 前缀，支持 `backend/.env` 覆盖）
 
