@@ -124,7 +124,13 @@ async def update_license_expiry(
         result = license_service.update_global_license_expiry(data.expiry_date)
         if result is None:
             raise HTTPException(status_code=400, detail="更新授权期限失败，请检查日期格式")
-        return {"success": True, "data": result, "message": "授权期限更新成功（对所有用户生效）"}
+        target = result.get("license_expiry")
+        action = "已设为无限期" if target is None else f"授权期限已更新为 {target}"
+        return {
+            "success": True,
+            "data": result,
+            "message": f"{action}（已同步到 {result.get('users_updated', 0)} 个用户）",
+        }
     except HTTPException:
         raise
     except Exception as e:

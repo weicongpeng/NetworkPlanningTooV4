@@ -413,6 +413,8 @@ export function AdminUsersPage() {
               <tbody>
                 {users.map((u) => {
                   const sessionInfo = userSessionsCache[u.id] || { pc: null, app: null, desktop: null }
+                  // 实际生效期限（后端算好）：未单独设置的用户跟随全局授权期限
+                  const effectiveExpiry = u.effective_license_expiry ?? u.license_expiry
                   return (
                     <>
                       {/* PC 行 */}
@@ -427,9 +429,14 @@ export function AdminUsersPage() {
                         <td className="px-4 py-3 text-muted-foreground text-xs" rowSpan={3}>{u.city || '-'}</td>
                         <td className="px-4 py-3 text-muted-foreground text-xs" rowSpan={3}>{u.operator || '-'}</td>
                         <td className="px-4 py-3" rowSpan={3}>
-                          {u.license_expiry ? (
-                            <span className={`text-xs ${new Date(u.license_expiry) < new Date() ? 'text-red-400' : 'text-muted-foreground'}`}>
-                              {u.license_expiry.slice(0, 10)}
+                          {effectiveExpiry ? (
+                            <span className={`text-xs ${new Date(effectiveExpiry) < new Date() ? 'text-red-400' : 'text-muted-foreground'}`}>
+                              {effectiveExpiry.slice(0, 10)}
+                              {!u.license_expiry && (
+                                <span className="ml-1 text-muted-foreground/70">
+                                  （{t('admin.inheritGlobal', '跟随全局')}）
+                                </span>
+                              )}
                             </span>
                           ) : (
                             <span className="text-xs text-muted-foreground">{t('admin.unlimited', '无限期')}</span>
@@ -546,6 +553,7 @@ export function AdminUsersPage() {
             <div>
               <label className="block text-sm text-muted-foreground mb-1">{t('admin.licenseExpiryOptional')}</label>
               <input type="date" value={formLicenseExpiry} onChange={(e) => setFormLicenseExpiry(e.target.value)} className="w-full px-3 py-2 bg-background border border-border rounded-lg text-foreground focus:outline-none focus:ring-2 focus:ring-primary/50" />
+              <p className="mt-1 text-xs text-muted-foreground">{t('admin.licenseExpiryHint', '留空表示跟随「授权管理」的全局期限')}</p>
             </div>
             <button onClick={handleAdd} disabled={formSubmitting} className="w-full py-2 bg-primary text-primary-foreground rounded-lg disabled:opacity-50 flex items-center justify-center gap-2">
               {formSubmitting && <Loader2 size={16} className="animate-spin" />}
@@ -650,6 +658,7 @@ export function AdminUsersPage() {
             <div>
               <label className="block text-sm text-muted-foreground mb-1">{t('admin.licenseExpiryLabel')}</label>
               <input type="date" value={formLicenseExpiry} onChange={(e) => setFormLicenseExpiry(e.target.value)} className="w-full px-3 py-2 bg-background border border-border rounded-lg text-foreground focus:outline-none focus:ring-2 focus:ring-primary/50" />
+              <p className="mt-1 text-xs text-muted-foreground">{t('admin.licenseExpiryHint', '留空表示跟随「授权管理」的全局期限')}</p>
             </div>
             <button onClick={handleEdit} disabled={formSubmitting} className="w-full py-2 bg-primary text-primary-foreground rounded-lg disabled:opacity-50 flex items-center justify-center gap-2">
               {formSubmitting && <Loader2 size={16} className="animate-spin" />}

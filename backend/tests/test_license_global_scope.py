@@ -161,3 +161,67 @@ def test_license_status_reads_global_expiry(db):
     sys_settings.set_license_expiry((_days(-1)).strftime("%Y-%m-%d"))
     status = license_service.get_status()
     assert status.valid is False and status.remainingDays == 0
+
+
+# ---------------------------------------------------------------- 全局期限同步到用户
+
+def test_global_update_syncs_every_non_admin_user(db):
+    """管理员改全局期限后，存量用户行上的旧日期不得继续遮蔽全局设置。"""
+    from app.services.license_service import license_service
+
+    admin = _add_user(db, username="admin", is_admin=True, expiry=_days(5))
+    stale = _add_user(db, username="stale", expiry=_days(200))
+    sys_settings.set_license_expiry(None)
+
+    target = _days(99).strftime("%Y-%m-%d")
+    result = license_service.update_global_license_expiry(target)
+    assert result == {"license_expiry": target, "users_updated": 1}
+
+    db.expire_all()
+    assert db.get(User, stale.id).license_expiry.strftime("%Y-%m-%d") == target
+    # 管理员恒无限期，不参与同步
+    assert db.get(User, admin.id).license_expiry.strftime("%Y-%m-%d") == _days(5).strftime("%Y-%m-%d")
+
+    user, error = auth_service.authenticate_user(db, "stale", "pw123456")
+    assert error is None and user is not None
+
+
+def test_invalid_global_date_does_not_touch_users(db):
+    from app.services.license_service import license_service
+
+    own = _add_user(db, username="op", expiry=_days(30))
+    before = own.license_expiry
+
+    assert license_service.update_global_license_expiry("2030-13-99") is None
+
+    db.expire_all()
+    assert db.get(User, own.id).license_expiry == before
+
+
+def test_admin_can_clear_user_expiry_to_follow_global(db):
+    """用户管理里清空个人期限（显式传 null）后，恢复跟随全局期限。"""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from app.api.v1.endpoints import admin_users as admin_users_ep
+    from app.core.database import get_db
+    from app.core.security import get_current_admin_user
+
+    admin = _add_user(db, username="admin", is_admin=True)
+    op = _add_user(db, username="op", expiry=_days(5))
+    global_day = _days(99).strftime("%Y-%m-%d")
+    sys_settings.set_license_expiry(global_day)
+
+    app = FastAPI()
+    app.include_router(admin_users_ep.router, prefix="/admin/users")
+    app.dependency_overrides[get_db] = lambda: db
+    app.dependency_overrides[get_current_admin_user] = lambda: admin
+    client = TestClient(app)
+
+    resp = client.put(f"/admin/users/{op.id}", json={"license_expiry": None})
+    assert resp.status_code == 200
+
+    db.expire_all()
+    cleared = db.get(User, op.id)
+    assert cleared.license_expiry is None
+    assert auth_service.effective_license_expiry(cleared).strftime("%Y-%m-%d") == global_day

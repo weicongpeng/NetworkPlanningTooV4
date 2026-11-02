@@ -65,7 +65,11 @@ class LicenseService:
         """管理员更新**全局**授权期限（system_settings，对所有用户生效）。
 
         expiry_date: "YYYY-MM-DD" 或 None（无限期）
-        返回 {"license_expiry": "YYYY-MM-DD" | None}，非法日期返回 None。
+        返回 {"license_expiry": "YYYY-MM-DD" | None, "users_updated": N}，非法日期返回 None。
+
+        写入后同步覆盖每个非管理员用户的 `license_expiry`：授权闸门是「自身期限优先，
+        否则全局」，存量用户行上遗留的旧日期会遮蔽新设的全局期限（管理员改了全局却对
+        别人无效）。管理员恒为无限期，不参与同步。
 
         桌面模式：授权期限由厂商签发的授权文件决定，禁止管理员自助修改。
         """
@@ -77,7 +81,32 @@ class LicenseService:
         expiry = sys_settings.set_license_expiry(expiry_date)
         if expiry_date and expiry is None:
             return None  # 日期格式非法
-        return {"license_expiry": expiry.strftime("%Y-%m-%d") if expiry else None}
+        updated = self._apply_global_expiry_to_users(expiry)
+        return {
+            "license_expiry": expiry.strftime("%Y-%m-%d") if expiry else None,
+            "users_updated": updated,
+        }
+
+    def _apply_global_expiry_to_users(self, expiry: Optional[datetime]) -> int:
+        """把全局期限写到所有非管理员用户行，返回受影响行数。
+
+        SQLite 里的 users.license_expiry 存 naive（与其它历史写入一致），
+        这里去掉 tzinfo 再落库，避免时区字段参与比较。
+        """
+        from app.models.database import User
+
+        value = expiry.replace(tzinfo=None) if expiry is not None and expiry.tzinfo else expiry
+        db = self._get_db()
+        try:
+            count = (
+                db.query(User)
+                .filter(User.is_admin.is_(False))
+                .update({User.license_expiry: value}, synchronize_session=False)
+            )
+            db.commit()
+            return count
+        finally:
+            db.close()
 
     # ---- LicenseStatus 构建 ----
 

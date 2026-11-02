@@ -32,7 +32,6 @@ export function LicensePage() {
   const [previewColor, setPreviewColor] = useState<ColorScheme | null>(null)
 
   const isAdmin = user?.is_admin ?? false
-  const licenseExpiry = user?.license_expiry ?? null
 
   // 桌面端授权：机器码与授权状态
   const [machineInfo, setMachineInfo] = useState<MachineInfo | null>(null)
@@ -273,9 +272,12 @@ export function LicensePage() {
     try {
       const result = await licenseApi.updateExpiry(selectedDate || null)
       if (result.success) {
-        setUpdateMessage({ type: 'success', text: t('license.updateSuccess') })
+        setUpdateMessage({
+          type: 'success',
+          text: t('license.updateSuccess', { count: result.data?.users_updated ?? 0 }),
+        })
         await fetchUser()
-        setSelectedDate('')
+        await refreshLicenseState()
       } else {
         setUpdateMessage({ type: 'error', text: (result as any).message || t('license.updateFailed') })
       }
@@ -293,9 +295,12 @@ export function LicensePage() {
     try {
       const result = await licenseApi.updateExpiry(null)
       if (result.success) {
-        setUpdateMessage({ type: 'success', text: t('license.unlimitedSet') })
+        setUpdateMessage({
+          type: 'success',
+          text: t('license.unlimitedSet', { count: result.data?.users_updated ?? 0 }),
+        })
         await fetchUser()
-        setSelectedDate('')
+        await refreshLicenseState()
       } else {
         setUpdateMessage({ type: 'error', text: (result as any).message || t('license.updateFailed') })
       }
@@ -307,11 +312,12 @@ export function LicensePage() {
     }
   }
 
-  // 授权状态/到期展示已从卡片移除：用当前到期日期预填输入框，便于管理员查看与修改
+  // 输入框预填**全局**授权期限（/license/status 返回的就是全局值）。
+  // 不能用 user.license_expiry：那是管理员个人的例外期限，与该卡片改的全局值不是一回事。
   useEffect(() => {
-    if (!licenseExpiry) return
-    setSelectedDate(licenseExpiry.slice(0, 10))
-  }, [licenseExpiry])
+    if (!isAdmin) return
+    setSelectedDate(licenseStatus?.expiryDate ? licenseStatus.expiryDate.slice(0, 10) : '')
+  }, [isAdmin, licenseStatus?.expiryDate])
 
   return (
     <div className="p-6 w-full space-y-6">

@@ -172,7 +172,11 @@ async def update_user(
 
     updates = data.model_dump(exclude_none=True)
     updates.pop("migrate_scope", None)  # 非 users 表字段
-    if "license_expiry" in updates and updates["license_expiry"] is not None:
+    # license_expiry 支持显式传 null：清掉个人例外期限，恢复跟随全局授权期限
+    # （exclude_none 会丢掉显式 null，这里按"字段是否出现在请求里"单独补回）
+    if "license_expiry" in data.model_fields_set and data.license_expiry is None:
+        updates["license_expiry"] = None
+    if updates.get("license_expiry") is not None:
         try:
             updates["license_expiry"] = datetime.fromisoformat(updates["license_expiry"])
         except ValueError:
