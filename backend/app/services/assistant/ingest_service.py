@@ -19,6 +19,7 @@ from sqlalchemy import delete
 from app.core.config import settings
 from app.core.database import SessionLocal
 from app.models.database import StationParamRow, StationMetricRow, Workbook
+from .semantic import metric_registry, profile
 
 PARAM_TYPE = "station_params"
 METRIC_TYPE = "station_metrics"
@@ -167,14 +168,19 @@ def ingest_file(file_path: str, original_name: str, user_id: int,
         db.commit()
 
     try:
+        dim_cols = [v for v in col.values() if v]
         if data_type == PARAM_TYPE:
             fields, count = _ingest_params(df, col, wb_id, user_id, created, city, operator)
-            meta = {"fields": fields, "rowCount": count}
+            meta = {"fields": fields, "rowCount": count,
+                    "columns": profile.profile_columns(df, fields, dim_cols)}
         else:
             fields, count, gran, tmin, tmax = _ingest_metrics(
                 df, col, wb_id, user_id, created, original_name, city, operator)
             meta = {"fields": fields, "rowCount": count, "granularity": gran,
-                    "timeRange": [tmin, tmax]}
+                    "timeRange": [tmin, tmax],
+                    "metricIds": sorted({mid for mid in
+                                         (metric_registry.resolve_column(c) for c in fields) if mid}),
+                    "columns": profile.profile_columns(df, fields, dim_cols)}
     except Exception:
         # 解析失败：清理半成品 Workbook，避免孤儿元数据
         delete_dataset(wb_id)
@@ -237,6 +243,8 @@ def _ingest_metrics(df: pd.DataFrame, col: Dict[str, Optional[str]],
     metric_cols = [c for c in df.columns if c not in dims and _is_metric_col(c, df[c])]
     if not metric_cols:
         raise ValueError("未识别到任何指标列（数值列），请确认指标文件格式")
+    # 口径 ID：有注册表口径的列按口径存储（比率类据此找分子分母），没解析出的留空
+    metric_ids = {c: metric_registry.resolve_column(c) for c in metric_cols}
 
     rows: List[Dict[str, Any]] = []
     count = 0
@@ -259,7 +267,8 @@ def _ingest_metrics(df: pd.DataFrame, col: Dict[str, Optional[str]],
             val = pd.to_numeric(r[mc], errors="coerce")
             if pd.isna(val):
                 continue
-            rows.append({**base, "metric_name": mc, "metric_value": float(val)})
+            rows.append({**base, "metric_name": mc, "metric_id": metric_ids.get(mc),
+                         "metric_value": float(val)})
             count += 1
             if len(rows) >= _BATCH:
                 _bulk_insert(StationMetricRow, rows)
@@ -301,10 +310,16 @@ def list_datasets(user=None) -> List[Dict[str, Any]]:
         return [_wb_summary(wb) for wb in q.order_by(Workbook.created_at.desc()).all()]
 
 
-def delete_dataset(workbook_id: str) -> bool:
-    """删除助手数据集：行数据 + Workbook 元数据 + 原始文件"""
+def delete_dataset(workbook_id: str, user=None) -> bool:
+    """删除助手数据集：行数据 + Workbook 元数据 + 原始文件（按数据组隔离）。"""
+    from app.services.data_group import group_sql_filter
+
     with SessionLocal() as db:
-        wb = db.query(Workbook).filter_by(id=workbook_id).first()
+        q = db.query(Workbook).filter(Workbook.id == workbook_id)
+        f = group_sql_filter(Workbook.city, Workbook.operator, user)
+        if f is not None:
+            q = q.filter(f)
+        wb = q.first()
         if not wb or wb.file_type not in (PARAM_TYPE, METRIC_TYPE):
             return False
         db.execute(delete(StationParamRow).where(StationParamRow.workbook_id == workbook_id))

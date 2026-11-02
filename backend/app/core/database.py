@@ -195,6 +195,16 @@ def init_db():
         if tr_cols and "rows_ready" not in tr_cols:
             conn.exec_driver_sql("ALTER TABLE task_results ADD COLUMN rows_ready INTEGER NOT NULL DEFAULT 0")
 
+        # 迁移：网优助手指标表添加口径 ID 列（关联指标注册表，比率按分子分母聚合）
+        sm_cols = [row[1] for row in conn.exec_driver_sql(
+            "PRAGMA table_info(station_metric_rows)").fetchall()]
+        if sm_cols and "metric_id" not in sm_cols:
+            conn.exec_driver_sql("ALTER TABLE station_metric_rows ADD COLUMN metric_id VARCHAR(64)")
+        if sm_cols:
+            conn.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS idx_metric_rows_group_metric "
+                "ON station_metric_rows(city, operator, metric_id)")
+
         # 迁移：user_settings 表添加 created_at 列（如从旧表结构升级）
         us_cols = [row[1] for row in conn.exec_driver_sql("PRAGMA table_info(user_settings)").fetchall() if row[0] >= 0]
         if us_cols and "created_at" not in us_cols:

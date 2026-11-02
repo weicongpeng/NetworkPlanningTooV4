@@ -1792,6 +1792,7 @@ export interface GenerateLayerParams {
   lonCol: string
   latCol: string
   azimuthCol?: string
+  coverageCol?: string    // 扇区图：覆盖类型列（室分/室内/indoor → 圆形，半径为扇区半径一半）
   polygonCol?: string     // 面状图：多边形坐标串列（"经度 纬度,…"）
   attributes: string[]
   outputFormats: Array<'tab' | 'mif' | 'kml' | 'shp'>  // 多格式
@@ -1815,6 +1816,13 @@ export interface LayerUploadResult {
 }
 
 // 图层制作 API（生成新图层，区别于读取已有图层的 layerApi）
+// 图层制作模板的下载文件名（与后端 _TEMPLATE_FILENAMES 对应）
+const LAYER_TEMPLATE_FILENAMES = {
+  sector: '扇区图层模板.xlsx',
+  point: '点图层模板.xlsx',
+  polygon: 'GeoDataTemplate-多边形.xlsx',
+} as const
+
 export const layerToolsApi = {
   // 分块上传 Excel 文件，返回 file_path + source_filename（进度回调）
   uploadLayerFile: async (
@@ -1856,6 +1864,7 @@ export const layerToolsApi = {
     formData.append('lon_col', params.lonCol)
     formData.append('lat_col', params.latCol)
     formData.append('azimuth_col', params.azimuthCol || '')
+    if (params.coverageCol) formData.append('coverage_col', params.coverageCol)
     formData.append('attributes', JSON.stringify(params.attributes))
     // 多格式优先，兼容旧单值
     formData.append('output_formats', (params.outputFormats || [params.outputFormat!]).join(','))
@@ -1909,6 +1918,23 @@ export const layerToolsApi = {
     if (params.opacity != null) formData.append('opacity', String(params.opacity))
     const res = await uploadClient.post('/layer/polygon', formData)
     return res.data
+  },
+
+  // 下载图层制作模板（带认证，blob 方式）：扇区/点图按各自必填字段生成，面状图沿用多边形模板
+  downloadTemplate: async (kind: 'sector' | 'point' | 'polygon'): Promise<void> => {
+    const res = await uploadClient.get(`/layer/template/${kind}`, { responseType: 'blob' })
+    const blob = res as unknown as Blob
+    if (!(blob instanceof Blob) || blob.size === 0) throw new Error('模板下载失败：文件内容为空')
+    const url = window.URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = LAYER_TEMPLATE_FILENAMES[kind]
+    document.body.appendChild(link)
+    link.click()
+    setTimeout(() => {
+      document.body.removeChild(link)
+      window.URL.revokeObjectURL(url)
+    }, 100)
   },
 }
 
@@ -2417,14 +2443,58 @@ export const appVersionsApi = {
 }
 
 // ==================== 网优助手 ====================
+export type AssistantChartType =
+  | 'line' | 'bar' | 'stacked_bar' | 'heatmap' | 'big_number' | 'scatter'
+
+/** 后端 chart_spec 生成的受控图表规格（数字全部来自 SQL 结果） */
 export interface AssistantChart {
-  type: 'line' | 'bar' | 'scatter' | string
+  type: AssistantChartType | string
   title?: string
-  xAxis?: any[]
-  yAxis?: any[]
-  series?: any[]
+  note?: string
+  x?: { label: string; categories: string[] }
+  y?: { label: string; unit?: string }
+  series?: { name: string; data: (number | null)[] }[]
+  values?: { x: string; y: string; v: number | null }[]
+  value?: number
+  label?: string
+  unit?: string
+  /** 周边站点散点（沿用旧结构） */
   points?: any[]
   center?: [number, number]
+}
+
+export interface AssistantTable {
+  columns: string[]
+  rows: Record<string, any>[]
+}
+
+/** 取数配方：数据集/时间窗/过滤/口径/行数/耗时，可展开核对 */
+export interface AssistantProvenance {
+  dataset: string
+  dataset_label: string
+  metrics: {
+    metric: string
+    metric_id?: string | null
+    aggregation: string
+    unit?: string
+    direction?: string
+    source?: string
+    degraded_reason?: string
+  }[]
+  dimensions: string[]
+  filters: { field: string; op: string; value: any }[]
+  time_range: { start?: string | null; end?: string | null }
+  granularity?: string | null
+  limit: number
+  row_count: number
+  elapsed_ms: number
+  degraded: string[]
+}
+
+export interface AssistantArtifact {
+  charts?: AssistantChart[]
+  table?: AssistantTable
+  provenance?: AssistantProvenance
 }
 export interface AssistantDataset {
   id: string
@@ -2463,7 +2533,7 @@ export const assistantApi = {
   /** 对话 */
   chat: async (messages: { role: string; content: string }[]): Promise<{
     success: boolean; configured: boolean; reply: string;
-    charts: AssistantChart[]; message?: string
+    charts: AssistantChart[]; artifacts?: AssistantArtifact[]; message?: string
   }> => apiClient.post('/assistant/chat', { messages }),
 
   /** 数据集列表 */

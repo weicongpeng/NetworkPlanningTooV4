@@ -74,26 +74,32 @@ async def upload_dataset(
     tmp.write_bytes(await file.read())
     uid = current_user.id if hasattr(current_user, "id") else None
 
+    # 轮询键按用户前缀隔离，避免同名文件互相看到对方的上传结果
+    poll_key = f"{uid}:{file.filename}"
+
     async def _process():
         try:
             result = await run_in_threadpool(
                 ingest_service.ingest_file, str(tmp), file.filename, uid,
                 current_user.city, current_user.operator)
-            _UPLOAD_STATUS[file.filename] = {"status": "ready", "result": result}
+            _UPLOAD_STATUS[poll_key] = {"status": "ready", "result": result}
         except Exception as e:
             logger.exception("assistant ingest failed")
-            _UPLOAD_STATUS[file.filename] = {"status": "error", "error": str(e)}
+            _UPLOAD_STATUS[poll_key] = {"status": "error", "error": str(e)}
 
-    _UPLOAD_STATUS[file.filename] = {"status": "processing"}
+    _UPLOAD_STATUS[poll_key] = {"status": "processing"}
     import asyncio
     asyncio.create_task(_process())
 
     return {"success": True, "filename": file.filename, "status": "processing",
-            "pollKey": file.filename}
+            "pollKey": poll_key}
 
 
 @router.get("/datasets/upload-status")
 async def upload_status(poll_key: str, current_user=Depends(require_assistant)) -> Dict[str, Any]:
+    uid = current_user.id if hasattr(current_user, "id") else None
+    if not poll_key.startswith(f"{uid}:"):
+        return {"status": "unknown"}
     st = _UPLOAD_STATUS.get(poll_key)
     if not st:
         return {"status": "unknown"}
@@ -108,7 +114,7 @@ async def list_datasets(current_user=Depends(require_assistant)) -> Dict[str, An
 
 @router.delete("/datasets/{dataset_id}")
 async def delete_dataset(dataset_id: str, current_user=Depends(require_assistant)) -> Dict[str, Any]:
-    ok = ingest_service.delete_dataset(dataset_id)
+    ok = ingest_service.delete_dataset(dataset_id, current_user)
     if not ok:
         raise HTTPException(status_code=404, detail="数据集不存在或类型不匹配")
     return {"success": True}

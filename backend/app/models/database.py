@@ -627,6 +627,8 @@ class StationMetricRow(Base):
     granularity = Column(String(10), nullable=True)  # hour/day/month/busy_hour
     metric_time = Column(DateTime, nullable=False, index=True)
     metric_name = Column(String(100), nullable=False, index=True)
+    # 口径 ID（来自指标注册表，如 call_drop_rate）；解析不出的列留空，按原始列名查询
+    metric_id = Column(String(64), nullable=True, index=True)
     metric_value = Column(Float, nullable=True)
     created_at = Column(String(30), nullable=False)
 

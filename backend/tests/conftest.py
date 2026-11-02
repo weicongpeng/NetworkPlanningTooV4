@@ -107,3 +107,44 @@ def _isolate_data_root(tmp_path, monkeypatch):
         pass
     yield
 
+
+
+@pytest.fixture()
+def assistant_db(tmp_path, monkeypatch):
+    """网优助手测试用独立 SQLite（绝不碰生产 data/data.db）。
+
+    同时重定向：SQLAlchemy 引擎、各服务模块已导入的 SessionLocal、executor 的只读路径、
+    指标口径覆盖文件路径。返回 {"session": factory, "path": db 文件路径}。
+    """
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from app.core import database as db_module
+    from app.core.config import settings
+    from app.models.database import Base
+    from app.services.assistant import catalog as catalog_module
+    from app.services.assistant import ingest_service, query_service
+    from app.services.assistant.semantic import metric_registry
+
+    # 文件名必须是 data.db：助手只读执行器按 settings.DATA_DIR/"data.db" 打开
+    path = tmp_path / "data.db"
+    engine = create_engine(f"sqlite:///{path.as_posix()}",
+                           connect_args={"check_same_thread": False})
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+    monkeypatch.setattr(db_module, "engine", engine)
+    monkeypatch.setattr(db_module, "SessionLocal", factory)
+    for mod in (query_service, catalog_module, ingest_service):
+        monkeypatch.setattr(mod, "SessionLocal", factory, raising=False)
+    monkeypatch.setattr(settings, "DATA_DIR", tmp_path, raising=False)
+    monkeypatch.setattr(settings, "UPLOAD_DIR", tmp_path / "uploads", raising=False)
+    (tmp_path / "uploads").mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setattr(metric_registry, "_OVERRIDE_PATH", tmp_path / "metric_registry.json")
+    monkeypatch.setattr(metric_registry, "_cache", None)
+
+    yield {"session": factory, "path": path, "tmp": tmp_path}
+
+    engine.dispose()
+    metric_registry._cache = None
