@@ -24,7 +24,7 @@ import { mapStateService } from '../../../services/mapStateService'
 import { mapDataService } from '../../../services/mapDataService'
 import type { RenderSectorData } from '../../../services/mapDataService'
 import {
-  useMapStore, CESIUM_QUALITY_PRESETS, type CesiumQuality,
+  useMapStore, CESIUM_QUALITY_PRESETS, cesiumGlobeSse, type CesiumQuality,
 } from '../../../store/mapStore'
 import { gcj02ToWgs84, wgs84ToGcj02 } from '../../../utils/coordinate'
 import { CesiumSectorLayer, type CameraView } from './CesiumSectorLayer'
@@ -103,6 +103,23 @@ function zoomToHeight(zoom: number, lat: number, hPx: number, fovy: number): num
 function heightToZoom(height: number, lat: number, hPx: number, fovy: number): number {
   const mpp = (height * 2 * Math.tan(fovy / 2)) / hPx
   return Math.round(Math.log((EQUATOR_MPP * Math.cos((lat * Math.PI) / 180)) / mpp) / Math.LN2)
+}
+
+/** 相机当前高度对应的等效 zoom（与 mapState 持久化同口径，四舍五入到整数档） */
+function viewerZoom(viewer: any): number {
+  const carto = viewer.camera.positionCartographic
+  return heightToZoom(
+    carto.height,
+    (carto.latitude * 180) / Math.PI,
+    Math.max(1, viewer.canvas?.clientHeight || 0),
+    viewer.camera.frustum.fovy,
+  )
+}
+
+/** 当前清晰度档位（右键设置 → CesiumJS） */
+function qualityPresetOf(settings: any) {
+  const tier = settings?.cesiumQuality as CesiumQuality | undefined
+  return (tier && CESIUM_QUALITY_PRESETS[tier]) || CESIUM_QUALITY_PRESETS.smooth
 }
 
 type LayerKey = 'lte' | 'nr'
@@ -1244,6 +1261,10 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
             wlng, wlat,
             zoomToHeight(saved.zoom, wlat, container.clientHeight, viewer.camera.frustum.fovy)),
         })
+        // 初始视角立刻按等效 zoom 定档：默认 SSE=2 会先铺低一层瓦片，
+        // 等下面的清晰度 effect 生效后才变清晰（首屏可见一次糊→清）
+        viewer.scene.globe.maximumScreenSpaceError = cesiumGlobeSse(
+          qualityPresetOf(mapSettingsRef.current).maximumScreenSpaceError, viewerZoom(viewer))
 
         // 点击：扇区 → onSectorClick；GeoJSON 要素 → 属性；建筑 → 高亮 + 属性
         let selectedTile: any = null
@@ -1321,15 +1342,27 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
         /** 交互中（降载）标记：true = 已压低分辨率/放宽屏幕空间误差，停下后恢复 */
         let interacting = false
 
+        /**
+         * 相机静止时按等效 zoom 收紧影像/地形误差：zoom >= 15 时 Cesium 默认的 SSE=2
+         * 只会铺低一层瓦片（3D 比 2D 糊），压到 1 后瓦片层级与 2D 对齐。
+         * 交互中由 applyInteractionProfile 统一降载，不能被这里覆盖。
+         */
+        const applyStaticGlobeSse = (zoom: number) => {
+          if (interacting) return
+          viewer.scene.globe.maximumScreenSpaceError =
+            cesiumGlobeSse(qualityPresetOf(mapSettingsRef.current).maximumScreenSpaceError, zoom)
+        }
+
         const persistMapState = () => {
           const carto = viewer.camera.positionCartographic
           const lat = C.Math.toDegrees(carto.latitude)
           const lng = C.Math.toDegrees(carto.longitude)
           const [glat, glng] = wgs84ToGcj02(lat, lng)
-          mapStateService.setState({
-            center: [glat, glng],
-            zoom: heightToZoom(carto.height, lat, container.clientHeight, viewer.camera.frustum.fovy),
-          })
+          const zoom = heightToZoom(
+            carto.height, lat, container.clientHeight, viewer.camera.frustum.fovy)
+          mapStateService.setState({ center: [glat, glng], zoom })
+          // 程序化移动（flyTo/搜索定位）同样要按新 zoom 切换瓦片层级
+          applyStaticGlobeSse(zoom)
         }
 
         /** 交互期降载：像素量降到约 56%、放宽影像/建筑误差、关 FXAA */
@@ -1349,10 +1382,9 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
           if (!interacting) return
           interacting = false
           if (viewer.isDestroyed()) return
-          const tier = mapSettingsRef.current.cesiumQuality as CesiumQuality | undefined
-          const preset = (tier && CESIUM_QUALITY_PRESETS[tier]) || CESIUM_QUALITY_PRESETS.smooth
+          const preset = qualityPresetOf(mapSettingsRef.current)
           viewer.resolutionScale = baseResolutionScaleRef.current
-          viewer.scene.globe.maximumScreenSpaceError = preset.maximumScreenSpaceError
+          applyStaticGlobeSse(viewerZoom(viewer))
           viewer.scene.fxaa = preset.fxaa
           if (tilesetRef.current) tilesetRef.current.maximumScreenSpaceError = BASE_TILESET_SSE
         }
@@ -1876,7 +1908,9 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
     baseResolutionScaleRef.current = base
     viewer.resolutionScale = base
     viewer.scene.fxaa = preset.fxaa
-    viewer.scene.globe.maximumScreenSpaceError = preset.maximumScreenSpaceError
+    // zoom >= 15 时收紧一档，让 3D 底图的瓦片层级与 2D 对齐（见 cesiumGlobeSse）
+    viewer.scene.globe.maximumScreenSpaceError =
+      cesiumGlobeSse(preset.maximumScreenSpaceError, viewerZoom(viewer))
   }, [ready, mapSettings.cesiumQuality])
 
   // 建筑样式（由右键「设置」→ CesiumJS 页签控制；仅影响 OSM 建筑）

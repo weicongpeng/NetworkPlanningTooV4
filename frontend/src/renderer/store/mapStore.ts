@@ -42,11 +42,30 @@ export interface CesiumQualityPreset {
   maximumScreenSpaceError: number
 }
 
-/** 档位 → Cesium 参数。smooth 即改造前的默认行为，保证不改默认观感。 */
+/** 档位 → Cesium 参数。smooth 即改造前的默认行为；底图 zoom>=15 的层级收紧见 cesiumGlobeSse。 */
 export const CESIUM_QUALITY_PRESETS: Record<CesiumQuality, CesiumQualityPreset> = {
   smooth: { maxResolutionScale: 1, fxaa: true, maximumScreenSpaceError: 2 },
   balanced: { maxResolutionScale: 1.5, fxaa: false, maximumScreenSpaceError: 1.5 },
   sharp: { maxResolutionScale: 2, fxaa: false, maximumScreenSpaceError: 1 },
+}
+
+/**
+ * 3D 底图开始按「当前层级」取瓦片的 zoom 阈值（对齐 2D 底图清晰度）。
+ *
+ * Cesium 的 `globe.maximumScreenSpaceError = 2`（默认档 smooth）会让影像瓦片比相机
+ * 等效 zoom 低一层：zoom 15 实际铺的是 z14 影像，与 2D 在 zoom 15 用的 z15 瓦片相比
+ * 明显发糊；只有继续放大到 16/17 级才"看起来清楚"。
+ */
+export const CESIUM_BASEMAP_SHARP_ZOOM = 15
+
+/**
+ * 按相机等效 zoom 收紧地形/影像的屏幕空间误差。
+ *
+ * zoom >= 15 时把误差压到 1（瓦片层级与 2D 对齐）；低 zoom 保持档位原值，
+ * 避免小比例尺下多取 4 倍瓦片。只收紧、不放宽：sharp 档的 1 或更低保持原样。
+ */
+export function cesiumGlobeSse(presetSse: number, zoom: number): number {
+  return zoom >= CESIUM_BASEMAP_SHARP_ZOOM ? Math.min(presetSse, 1) : presetSse
 }
 
 /**

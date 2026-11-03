@@ -6,7 +6,9 @@
  * 这里锁定三档的映射关系，并保证默认档 `smooth` 与改造前行为一致（不改默认观感）。
  */
 import { describe, it, expect } from 'vitest'
-import { CESIUM_QUALITY_PRESETS, type CesiumQuality } from '../mapStore'
+import {
+  CESIUM_QUALITY_PRESETS, cesiumGlobeSse, CESIUM_BASEMAP_SHARP_ZOOM, type CesiumQuality,
+} from '../mapStore'
 
 describe('CesiumJS 3D 清晰度档位', () => {
   const tiers: CesiumQuality[] = ['smooth', 'balanced', 'sharp']
@@ -41,5 +43,18 @@ describe('CesiumJS 3D 清晰度档位', () => {
     for (const t of tiers) {
       expect(CESIUM_QUALITY_PRESETS[t].maxResolutionScale).toBeLessThanOrEqual(2)
     }
+  })
+
+  /**
+   * Cesium 默认 SSE=2 时影像瓦片永远比相机 zoom 低一层（实测 zoom 15 渲染 z14），
+   * 用户看到的是"要放大到很大才清楚"。阈值 15 起把误差收紧到 1，瓦片层级与 2D 对齐。
+   */
+  it('zoom 15 起收紧屏幕空间误差，低 zoom 保持档位原值', () => {
+    expect(CESIUM_BASEMAP_SHARP_ZOOM).toBe(15)
+    expect(cesiumGlobeSse(2, 14)).toBe(2)
+    expect(cesiumGlobeSse(2, 15)).toBe(1)
+    expect(cesiumGlobeSse(1.5, 18)).toBe(1)
+    // 只收紧不放宽：sharp 档已经是 1，不能被改回 2
+    expect(cesiumGlobeSse(1, 18)).toBe(1)
   })
 })

@@ -61,6 +61,15 @@ describe('3D 场景效果瘦身（性能优化）', () => {
     const setViewCalls = cesiumMapSource.match(/\.setView\(/g)
     expect(setViewCalls?.length ?? 0).toBeGreaterThanOrEqual(3)
   })
+
+  /**
+   * 3D 底图清晰度：zoom >= 15 必须把 globe SSE 收紧到 1，否则 Cesium 永远铺低一层瓦片
+   * （zoom 15 用 z14 影像），用户必须放大到 16/17 才觉得清楚。
+   */
+  it('zoom >= 15 收紧 globe 屏幕空间误差（底图瓦片层级与 2D 对齐）', () => {
+    expect(cesiumMapSource).toContain('cesiumGlobeSse(')
+    expect(cesiumMapSource).toContain('viewer.scene.globe.maximumScreenSpaceError =')
+  })
 })
 
 describe('3D 贴地多边形：选中态不得加整面填充', () => {
