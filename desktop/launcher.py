@@ -384,6 +384,7 @@ WM_NCCALCSIZE = 0x0083
 # 原生标题栏拖动：WM_NCLBUTTONDOWN 命中 HTCAPTION 后系统进入自己的移动循环
 WM_NCLBUTTONDOWN = 0x00A1
 HTCAPTION = 2
+SW_RESTORE = 9
 # 持有子类化后的窗口过程引用：ctypes 回调对象被 GC 之后再收到窗口消息会直接崩溃
 _wndproc_refs: list = []
 # 已装钩子的窗口句柄：全屏切换会让 WinForms 重建句柄，需要在新句柄上重装
@@ -496,32 +497,88 @@ def _start_caption_drag(window: Any) -> None:
     这里发 WM_NCLBUTTONDOWN(HTCAPTION)，系统进入自己的移动循环，贴边分屏、四分屏、
     Win11 贴靠布局、拖动中把最大化窗口还原，全部按原生行为走。
 
-    SendMessage 会阻塞到用户松开鼠标（系统的模态移动循环），因此必须在独立线程里跑：
-    放在 HTTP 请求线程里会让该请求一直挂到拖拽结束，放进事件循环更会卡死整个后端。
+    关键点：按下时鼠标捕获在 WebView2 子窗口上，**ReleaseCapture 必须在 GUI 线程
+    执行**才有效；在 uvicorn 线程直接调用既释放不了捕获，系统移动循环也拿不到后续
+    鼠标消息（表现为按住标题栏完全拖不动）。所以用 native.Invoke 把
+    「ReleaseCapture + WM_NCLBUTTONDOWN」派发到 WinForms UI 线程，阻塞的移动循环
+    放独立线程等待，不挡 HTTP 请求与事件循环。
     """
     native = getattr(window, "native", None)
     if os.name != "nt" or native is None:
         return
 
-    def _drag() -> None:
+    def _perform() -> None:
         try:
             class _POINT(ctypes.Structure):
                 _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
 
+            class _RECT(ctypes.Structure):
+                _fields_ = [
+                    ("left", ctypes.c_long), ("top", ctypes.c_long),
+                    ("right", ctypes.c_long), ("bottom", ctypes.c_long),
+                ]
+
             user32 = ctypes.WinDLL("user32", use_last_error=True)
             handle = native.Handle
             hwnd = int(handle.ToInt64() if hasattr(handle, "ToInt64") else handle)
-            pt = _POINT()
-            user32.GetCursorPos(ctypes.byref(pt))
-            user32.ScreenToClient(ctypes.c_void_p(hwnd), ctypes.byref(pt))
-            # lParam 用客户区坐标（与真实 WM_NCLBUTTONDOWN 一致），系统据此算抓取偏移
-            lparam = (pt.y << 16) | (pt.x & 0xFFFF)
+
+            user32.IsZoomed.argtypes = [ctypes.c_void_p]
+            user32.IsZoomed.restype = ctypes.c_bool
+            user32.GetCursorPos.argtypes = [ctypes.POINTER(_POINT)]
+            user32.GetCursorPos.restype = ctypes.c_bool
+            user32.GetWindowRect.argtypes = [ctypes.c_void_p, ctypes.POINTER(_RECT)]
+            user32.GetWindowRect.restype = ctypes.c_bool
+            user32.ShowWindow.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            user32.ShowWindow.restype = ctypes.c_bool
+            user32.SetWindowPos.argtypes = [
+                ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint,
+            ]
+            user32.SetWindowPos.restype = ctypes.c_bool
+            user32.ReleaseCapture.argtypes = []
+            user32.ReleaseCapture.restype = ctypes.c_bool
+            user32.SendMessageW.argtypes = [
+                ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t, ctypes.c_ssize_t,
+            ]
+            user32.SendMessageW.restype = ctypes.c_ssize_t
+
+            # 最大化窗口先还原，并按拖动起点的横向比例把窗口放到光标下。
+            # 直接对最大化窗口注入 HTCAPTION，部分 Windows 版本不会自动还原。
+            if user32.IsZoomed(ctypes.c_void_p(hwnd)):
+                pt = _POINT()
+                user32.GetCursorPos(ctypes.byref(pt))
+                rect = _RECT()
+                user32.GetWindowRect(ctypes.c_void_p(hwnd), ctypes.byref(rect))
+                width = max(1, rect.right - rect.left)
+                ratio = min(1.0, max(0.0, (pt.x - rect.left) / width))
+                user32.ShowWindow(ctypes.c_void_p(hwnd), SW_RESTORE)
+                restored = _RECT()
+                user32.GetWindowRect(ctypes.c_void_p(hwnd), ctypes.byref(restored))
+                new_x = pt.x - int(ratio * max(1, restored.right - restored.left))
+                new_y = pt.y - 16  # 光标保持在标题栏内，避免落到内容区
+                user32.SetWindowPos(
+                    ctypes.c_void_p(hwnd), None, new_x, new_y, 0, 0,
+                    SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                )
+
+            # ReleaseCapture 在 UI 线程才有效：捕获原本在 WebView2 子窗口上。
             user32.ReleaseCapture()
-            user32.SendMessageW(ctypes.c_void_p(hwnd), WM_NCLBUTTONDOWN, HTCAPTION, lparam)
+            user32.SendMessageW(ctypes.c_void_p(hwnd), WM_NCLBUTTONDOWN, HTCAPTION, 0)
         except Exception:  # noqa: BLE001
             _log.exception("原生标题栏拖窗失败（本次拖动无效）")
 
-    threading.Thread(target=_drag, name="npt-caption-drag", daemon=True).start()
+    def _invoke_on_ui() -> None:
+        """GUI 线程执行移动循环；Invoke 会阻塞到松手，因此放在独立线程。"""
+        try:
+            from System import Func, Type
+
+            # 与 _limit_maximized_to_work_area 同一套 pythonnet 调用方式
+            native.Invoke(Func[Type](_perform))
+        except Exception:  # noqa: BLE001
+            # pythonnet/Invoke 不可用（旧环境）：退回直接调用，至少不影响窗口其它功能
+            _perform()
+
+    threading.Thread(target=_invoke_on_ui, name="npt-caption-drag", daemon=True).start()
 
 
 def _limit_maximized_to_work_area(window: Any, enable: bool) -> None:
