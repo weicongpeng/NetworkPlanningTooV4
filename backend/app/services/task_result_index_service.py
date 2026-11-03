@@ -281,6 +281,29 @@ def schedule_index(task_id: str, task_type: str, result: Optional[Dict[str, Any]
     return True
 
 
+def _fill_avg_neighbors(
+    summary: Optional[Dict[str, Any]],
+    fallback_cells: Optional[int] = None,
+) -> Optional[Dict[str, Any]]:
+    """旧摘要没有 avgNeighbors：按 totalNeighbors / 小区数补算，避免结果页统计卡显示 0。
+
+    新任务在 TaskManager._extract_result_summary 里已直接写入；这里只兜底历史行，
+    不解析 result_json（邻区结果可达 200MB+）。fallback_cells 取 TaskResult.cell_count。
+    """
+    if not isinstance(summary, dict) or summary.get("avgNeighbors") is not None:
+        return summary
+    total = summary.get("totalNeighbors")
+    cells = (
+        summary.get("totalSectors")
+        or summary.get("totalCells")
+        or summary.get("cellCount")
+        or fallback_cells
+    )
+    if isinstance(total, (int, float)) and isinstance(cells, (int, float)) and cells > 0:
+        summary = {**summary, "avgNeighbors": round(total / cells, 2)}
+    return summary
+
+
 def get_task_meta(task_id: str) -> Optional[Dict[str, Any]]:
     """轻量元数据：摘要 + 明细索引状态（不读 result_json）。"""
     db = _new_session()
@@ -307,6 +330,7 @@ def get_task_meta(task_id: str) -> Optional[Dict[str, Any]]:
                 summary = None
         if summary is None and (row.cell_count or 0) > 0:
             summary = {"cellCount": int(row.cell_count)}
+        summary = _fill_avg_neighbors(summary, row.cell_count)
         row_count = db.query(func.count(TaskResultRow.id)).filter(
             TaskResultRow.task_id == task_id
         ).scalar() or 0

@@ -4485,6 +4485,9 @@ class TaskManager:
                 "confusions": r.get("confusions", 0),
                 "totalCells": r.get("totalCells", 0),
                 "totalNeighbors": r.get("totalNeighbors", 0),
+                # 邻区结果页统计卡直接读它；结果页走 meta 摘要而不是完整结果，
+                # 漏这个字段会一直显示 0（完整结果里其实有值）。
+                "avgNeighbors": r.get("avgNeighbors"),
                 "matchedCells": r.get("matchedCells", 0),
                 "unmatchedCells": r.get("unmatchedCells", 0),
                 "singularityCount": r.get("singularityCount", 0),

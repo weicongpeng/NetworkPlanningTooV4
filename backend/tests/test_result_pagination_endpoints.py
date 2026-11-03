@@ -71,6 +71,8 @@ def test_neighbor_pagination_endpoints(api_env):
     assert meta.status_code == 200
     assert meta.json()["data"]["rowsReady"] is True
     assert meta.json()["data"]["summary"]["cellCount"] == 2
+    # 旧摘要没有 avgNeighbors：按 totalNeighbors / 小区数补算，结果页不再显示 0
+    assert meta.json()["data"]["summary"]["avgNeighbors"] == 1.0
 
     sources = client.get("/api/v1/neighbor/result/t-nb/sources?page=1&page_size=10")
     assert sources.status_code == 200

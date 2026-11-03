@@ -10,6 +10,7 @@ from sqlalchemy.pool import StaticPool
 
 from app.models.database import Base, TaskResult, TaskResultRow
 from app.services import task_result_index_service as index_service
+from app.services.task_manager import TaskManager
 
 
 @pytest.fixture()
@@ -94,6 +95,29 @@ def test_neighbor_index_paging_and_grouping(index_db):
     relations = index_service.query_neighbor_relations("t-nb", "S2", "2")
     assert len(relations) == 1
     assert relations[0]["targetSiteId"] == "S1"
+
+
+def test_neighbor_meta_derives_avg_neighbors_for_legacy_summary(index_db):
+    """旧摘要（存量行）没有 avgNeighbors 时按总数/小区数补算，结果页不再显示 0。"""
+    _add_task(index_db, "t-nb-avg", "neighbor", _neighbor_result(),
+              {"totalSectors": 3, "totalNeighbors": 3, "cellCount": 3})
+
+    meta = index_service.get_task_meta("t-nb-avg")
+
+    assert meta["summary"]["avgNeighbors"] == 1.0
+
+
+def test_neighbor_summary_keeps_avg_neighbors_for_new_results():
+    """新任务摘要必须带 avgNeighbors：结果页统计卡读 meta.summary，不读完整结果。"""
+    summary = TaskManager._extract_result_summary({
+        "status": "completed",
+        "totalSectors": 100,
+        "totalNeighbors": 257,
+        "avgNeighbors": 2.57,
+        "results": [],
+    })
+
+    assert summary["avgNeighbors"] == 2.57
 
 
 def test_tac_index_search_and_map(index_db):
