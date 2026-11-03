@@ -61,11 +61,14 @@ export const CESIUM_BASEMAP_SHARP_ZOOM = 15
 /**
  * 按相机等效 zoom 收紧地形/影像的屏幕空间误差。
  *
- * zoom >= 15 时把误差压到 1（瓦片层级与 2D 对齐）；低 zoom 保持档位原值，
+ * zoom >= 15 时把误差压到 `sharpSse`（默认 1：瓦片层级与 2D 对齐）；低 zoom 保持档位原值，
  * 避免小比例尺下多取 4 倍瓦片。只收紧、不放宽：sharp 档的 1 或更低保持原样。
+ *
+ * 桌面端（WebView2）的 canvas 按 devicePixelRatio 放大、纹理再被拉伸，浏览器端没有这一步；
+ * 桌面端传 0.5 多取一级瓦片做超采样，否则同样 zoom 下仍比 2D 糊（用户实测要放大到 18）。
  */
-export function cesiumGlobeSse(presetSse: number, zoom: number): number {
-  return zoom >= CESIUM_BASEMAP_SHARP_ZOOM ? Math.min(presetSse, 1) : presetSse
+export function cesiumGlobeSse(presetSse: number, zoom: number, sharpSse = 1): number {
+  return zoom >= CESIUM_BASEMAP_SHARP_ZOOM ? Math.min(presetSse, sharpSse) : presetSse
 }
 
 /**

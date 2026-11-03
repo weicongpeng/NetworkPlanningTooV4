@@ -69,6 +69,9 @@ describe('3D 场景效果瘦身（性能优化）', () => {
   it('zoom >= 15 收紧 globe 屏幕空间误差（底图瓦片层级与 2D 对齐）', () => {
     expect(cesiumMapSource).toContain('cesiumGlobeSse(')
     expect(cesiumMapSource).toContain('viewer.scene.globe.maximumScreenSpaceError =')
+    // 桌面端 WebView2 需要再多一级瓦片超采样（SSE 0.5），网页端保持 1
+    expect(cesiumMapSource).toContain('DESKTOP_BASEMAP_SSE')
+    expect(cesiumMapSource).toContain('basemapSseFloor()')
   })
 })
 

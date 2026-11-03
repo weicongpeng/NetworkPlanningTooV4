@@ -57,4 +57,12 @@ describe('CesiumJS 3D 清晰度档位', () => {
     // 只收紧不放宽：sharp 档已经是 1，不能被改回 2
     expect(cesiumGlobeSse(1, 18)).toBe(1)
   })
+
+  it('桌面端可再收紧一档（0.5）：多取一级瓦片抵消 WebView2 的纹理放大', () => {
+    expect(CESIUM_BASEMAP_SHARP_ZOOM).toBe(15)
+    expect(cesiumGlobeSse(2, 15, 0.5)).toBe(0.5)
+    expect(cesiumGlobeSse(1.5, 18, 0.5)).toBe(0.5)
+    // 低 zoom 仍保持档位原值
+    expect(cesiumGlobeSse(2, 14, 0.5)).toBe(2)
+  })
 })

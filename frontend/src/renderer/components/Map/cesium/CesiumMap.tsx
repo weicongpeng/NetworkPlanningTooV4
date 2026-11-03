@@ -122,6 +122,19 @@ function qualityPresetOf(settings: any) {
   return (tier && CESIUM_QUALITY_PRESETS[tier]) || CESIUM_QUALITY_PRESETS.smooth
 }
 
+/**
+ * 底图屏幕空间误差下限（zoom >= 15 生效）。
+ *
+ * 桌面端 WebView2 的 canvas 按 devicePixelRatio 渲染、影像纹理再被放大一档：
+ * 同样 z15 瓦片在 150%/200% 系统缩放下会明显发虚（网页端没有这一步）。
+ * 桌面端取 0.5 多加载一级瓦片做超采样；网页端保持 1，与 2D 的 z15 对齐。
+ */
+const DESKTOP_BASEMAP_SSE = 0.5
+
+function basemapSseFloor(): number {
+  return useAuthStore.getState().desktopMode ? DESKTOP_BASEMAP_SSE : 1
+}
+
 type LayerKey = 'lte' | 'nr'
 const LAYER_IDS: Record<LayerKey, string> = { lte: 'lte-sectors', nr: 'nr-sectors' }
 
@@ -1264,7 +1277,8 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
         // 初始视角立刻按等效 zoom 定档：默认 SSE=2 会先铺低一层瓦片，
         // 等下面的清晰度 effect 生效后才变清晰（首屏可见一次糊→清）
         viewer.scene.globe.maximumScreenSpaceError = cesiumGlobeSse(
-          qualityPresetOf(mapSettingsRef.current).maximumScreenSpaceError, viewerZoom(viewer))
+          qualityPresetOf(mapSettingsRef.current).maximumScreenSpaceError,
+          viewerZoom(viewer), basemapSseFloor())
 
         // 点击：扇区 → onSectorClick；GeoJSON 要素 → 属性；建筑 → 高亮 + 属性
         let selectedTile: any = null
@@ -1349,8 +1363,8 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
          */
         const applyStaticGlobeSse = (zoom: number) => {
           if (interacting) return
-          viewer.scene.globe.maximumScreenSpaceError =
-            cesiumGlobeSse(qualityPresetOf(mapSettingsRef.current).maximumScreenSpaceError, zoom)
+          viewer.scene.globe.maximumScreenSpaceError = cesiumGlobeSse(
+            qualityPresetOf(mapSettingsRef.current).maximumScreenSpaceError, zoom, basemapSseFloor())
         }
 
         const persistMapState = () => {
@@ -1908,9 +1922,10 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
     baseResolutionScaleRef.current = base
     viewer.resolutionScale = base
     viewer.scene.fxaa = preset.fxaa
-    // zoom >= 15 时收紧一档，让 3D 底图的瓦片层级与 2D 对齐（见 cesiumGlobeSse）
+    // zoom >= 15 时收紧误差，让 3D 底图的瓦片层级与 2D 对齐；
+    // 桌面端再低一档（0.5）做超采样，抵消 WebView2 的纹理放大（见 cesiumGlobeSse）
     viewer.scene.globe.maximumScreenSpaceError =
-      cesiumGlobeSse(preset.maximumScreenSpaceError, viewerZoom(viewer))
+      cesiumGlobeSse(preset.maximumScreenSpaceError, viewerZoom(viewer), basemapSseFloor())
   }, [ready, mapSettings.cesiumQuality])
 
   // 建筑样式（由右键「设置」→ CesiumJS 页签控制；仅影响 OSM 建筑）
