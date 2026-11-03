@@ -1355,6 +1355,8 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
         let refreshRaf: number | null = null
         /** 交互中（降载）标记：true = 已压低分辨率/放宽屏幕空间误差，停下后恢复 */
         let interacting = false
+        /** 最近一次相机真正移动的时间：不依赖 moveEnd 的降载恢复看门狗用 */
+        let lastCameraActivityAt = Date.now()
 
         /**
          * 相机静止时按等效 zoom 收紧影像/地形误差：zoom >= 15 时 Cesium 默认的 SSE=2
@@ -1384,8 +1386,11 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
           if (restoreTimer) { clearTimeout(restoreTimer); restoreTimer = null }
           if (interacting) return
           interacting = true
-          viewer.resolutionScale = Math.min(
-            baseResolutionScaleRef.current, INTERACTION_RESOLUTION_SCALE)
+          lastCameraActivityAt = Date.now()
+          // 必须相对基准缩放：桌面端 base=DPR（1.25~2），若用 min(base, 0.75) 会直接掉到
+          // 0.75（低于 CSS 像素），交互/卡住时比网页端糊得多；0.75 是"像素量约 56%"的比例。
+          viewer.resolutionScale =
+            baseResolutionScaleRef.current * INTERACTION_RESOLUTION_SCALE
           viewer.scene.globe.maximumScreenSpaceError = INTERACTION_GLOBE_SSE
           viewer.scene.fxaa = false
           if (tilesetRef.current) tilesetRef.current.maximumScreenSpaceError = INTERACTION_TILESET_SSE
@@ -1490,14 +1495,28 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
         const overlayCameraMoved = createCameraMoveProbe()
         let lastLabelDrawAt = 0
         viewer.scene.postRender.addEventListener(() => {
-          if (!overlayCameraMoved(viewer.camera, viewer.canvas?.clientWidth ?? 0)) return
-          selectionRef.current?.refreshOverlay()
-          // 「原始采样」热力是屏幕空间逐点色斑，与标签同理由：相机一动就要重投影重画
-          for (const heat of heatmapsRef.current.values()) heat.drawSamplesNow()
-          const now = performance.now()
-          if (now - lastLabelDrawAt < LABEL_DRAW_THROTTLE_MS) return
-          lastLabelDrawAt = now
-          labelOverlayRef.current?.drawNow()
+          const moved = overlayCameraMoved(viewer.camera, viewer.canvas?.clientWidth ?? 0)
+          if (moved) {
+            lastCameraActivityAt = Date.now()
+            selectionRef.current?.refreshOverlay()
+            // 「原始采样」热力是屏幕空间逐点色斑，与标签同理由：相机一动就要重投影重画
+            for (const heat of heatmapsRef.current.values()) heat.drawSamplesNow()
+            const now = performance.now()
+            if (now - lastLabelDrawAt >= LABEL_DRAW_THROTTLE_MS) {
+              lastLabelDrawAt = now
+              labelOverlayRef.current?.drawNow()
+            }
+          }
+          /**
+           * 交互降载的兜底恢复：不能只依赖 `camera.moveEnd`。
+           * 桌面端 WebView2 的滚轮/触控板手势偶发不发 moveEnd（网页端正常），
+           * `interacting` 会一直为 true → resolutionScale 停在 0.75、SSE 停在 4，
+           * 表现为 3D 缩放后永远发虚、瓦片层级也低（注记变少）。
+           * 相机静止 320ms 后强制按静态档位恢复；moveEnd 的 150ms 防抖路径不受影响。
+           */
+          if (interacting && Date.now() - lastCameraActivityAt > 320) {
+            restoreQuality()
+          }
         })
         // changed 只承担状态回写/指南针/兜底重建调度（重建已防抖+分帧），
         // 阈值保持 25% 以减少无谓事件；覆盖层重绘不依赖它。

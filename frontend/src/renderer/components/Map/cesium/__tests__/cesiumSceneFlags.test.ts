@@ -45,12 +45,22 @@ describe('3D 场景效果瘦身（性能优化）', () => {
    */
   it('交互中压低 resolutionScale，停下后恢复清晰度基准', () => {
     expect(cesiumMapSource).toContain('INTERACTION_RESOLUTION_SCALE')
-    // 交互开始：压到 min(基准, 交互缩放)
-    expect(cesiumMapSource).toContain('viewer.resolutionScale = Math.min(')
+    // 交互开始：按基准比例缩放（桌面端 base=DPR，不能写死 0.75）
+    expect(cesiumMapSource).toContain(
+      'baseResolutionScaleRef.current * INTERACTION_RESOLUTION_SCALE')
     // 相机停下（防抖回调）：恢复清晰度基准
     expect(cesiumMapSource).toContain('viewer.resolutionScale = baseResolutionScaleRef.current')
     // 清晰度档位 effect：把基准记进 ref（交互恢复时要用）
     expect(cesiumMapSource).toContain('baseResolutionScaleRef.current = base')
+  })
+
+  /**
+   * 桌面端 WebView2 的滚轮/触控板手势偶发不发 camera.moveEnd，交互降载会一直卡住
+   * （resolutionScale=0.75 + SSE=4 → 永远发虚、瓦片层级低）。必须有相机静止的兜底恢复。
+   */
+  it('交互降载要有相机静止兜底（不能只依赖 moveEnd）', () => {
+    expect(cesiumMapSource).toContain('lastCameraActivityAt')
+    expect(cesiumMapSource).toContain('Date.now() - lastCameraActivityAt > 320')
   })
 
   /**
