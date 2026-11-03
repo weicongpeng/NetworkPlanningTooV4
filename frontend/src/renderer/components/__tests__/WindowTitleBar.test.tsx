@@ -6,6 +6,7 @@
  * - 「应用下载」入口从悬浮图标迁入：点击打开 AppDownloadDialog（功能不变）
  * - 最小化 / 最大化(还原) / 关闭 → POST /desktop/window-control 对应动作；
  *   toggle-maximize 响应带回 maximized 时同步按钮图标与 title
+ * - 单击标题区不还原最大化窗口；按住并移动超过阈值才交给壳层拖窗
  * - 双击标题区 = 最大化/还原
  * - 窗口聚焦校准：mount 时 GET /desktop/window-state，用缓存修正按钮状态
  */
@@ -83,12 +84,25 @@ describe('WindowTitleBar', () => {
     )
   })
 
-  it('标题区按下 = 交给壳层走原生拖窗（贴边分屏的前提）', async () => {
+  it('单击标题区不触发拖窗（最大化窗口不得因单击被还原）', async () => {
     useAuthStore.setState({ desktopMode: true })
     const { container } = render(<WindowTitleBar />)
 
     const dragRegion = container.querySelector('[data-titlebar-drag]') as HTMLElement
-    fireEvent.mouseDown(dragRegion, { button: 0 })
+    fireEvent.mouseDown(dragRegion, { button: 0, clientX: 100, clientY: 10 })
+    fireEvent.mouseUp(window)
+    // 给潜在的错误请求留出一个微任务窗口
+    await Promise.resolve()
+    expect(desktopLoginApi.windowControl).not.toHaveBeenCalledWith('drag')
+  })
+
+  it('按住标题区并移动超过阈值 = 交给壳层走原生拖窗（贴边分屏的前提）', async () => {
+    useAuthStore.setState({ desktopMode: true })
+    const { container } = render(<WindowTitleBar />)
+
+    const dragRegion = container.querySelector('[data-titlebar-drag]') as HTMLElement
+    fireEvent.mouseDown(dragRegion, { button: 0, clientX: 100, clientY: 10 })
+    fireEvent.mouseMove(window, { clientX: 100 + 8, clientY: 10 })
     await waitFor(() => expect(desktopLoginApi.windowControl).toHaveBeenCalledWith('drag'))
   })
 
