@@ -1321,9 +1321,17 @@ export function TACPlanningPage() {
                                                         </tr>
                                                     </thead>
                                                     <tbody>
-                                                        <tr style={{ height: `${virtualData.offsetY}px` }}>
-                                                            <td colSpan={COLUMNS.length}></td>
-                                                        </tr>
+                                                        {filteredResults.length === 0 ? (
+                                                            <tr>
+                                                                <td colSpan={COLUMNS.length} className="px-3 py-8 text-center text-muted-foreground">
+                                                                    {t('common.noMatchResult') || '暂无匹配结果'}
+                                                                </td>
+                                                            </tr>
+                                                        ) : (
+                                                            <tr style={{ height: `${virtualData.offsetY}px` }}>
+                                                                <td colSpan={COLUMNS.length}></td>
+                                                            </tr>
+                                                        )}
                                                         {virtualData.visibleData.map((cell, index) => {
                                                             const actualIndex = virtualData.startIndex + index
                                                             return (
@@ -1380,9 +1388,11 @@ export function TACPlanningPage() {
                                                                 </tr>
                                                             )
                                                         })}
-                                                        <tr style={{ height: `${virtualData.totalHeight - virtualData.offsetY - virtualData.visibleData.length * ITEM_HEIGHT}px` }}>
-                                                            <td colSpan={8}></td>
-                                                        </tr>
+                                                        {filteredResults.length > 0 && (
+                                                            <tr style={{ height: `${virtualData.totalHeight - virtualData.offsetY - virtualData.visibleData.length * ITEM_HEIGHT}px` }}>
+                                                                <td colSpan={8}></td>
+                                                            </tr>
+                                                        )}
                                                     </tbody>
                                                 </table>
                                             </div>

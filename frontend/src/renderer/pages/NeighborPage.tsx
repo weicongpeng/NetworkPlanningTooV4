@@ -232,9 +232,15 @@ export function NeighborPage() {
   const [pagedSourcePage, setPagedSourcePage] = useState(1)
   const [pagedLoading, setPagedLoading] = useState(false)
   const [pagedPreparing, setPagedPreparing] = useState(false)
+  // 至少完成过一次分页查询（含 0 行）：区分「无匹配结果」与「结果不可用」
+  const [pagedLoaded, setPagedLoaded] = useState(false)
+  const [pagedError, setPagedError] = useState<string | null>(null)
   const [pagedRequest, setPagedRequest] = useState<{ taskId: string; summary?: any } | null>(null)
   const pagedTaskIdRef = useRef<string | null>(null)
   const pagedPollRef = useRef<number | null>(null)
+  // 请求序号：搜索条件变化时会有多个请求并发，只允许最新一个落地，
+  // 否则先发后到的旧响应（可能是 0 行）会覆盖新结果，表现为列表空白不恢复。
+  const pagedRequestSeqRef = useRef(0)
   // 已经自动补拉过完整结果的 taskId，失败也不重试，避免 effect 循环打后端
   const [selectedCount, setSelectedCount] = useState(0)
   const [batchDeleting, setBatchDeleting] = useState(false)
@@ -518,13 +524,19 @@ export function NeighborPage() {
     page: number,
     filters: Record<string, string>
   ): Promise<boolean> => {
+    const seq = ++pagedRequestSeqRef.current
     setPagedLoading(true)
     try {
       const response = await neighborApi.getResultSources(
         targetTaskId, page, NEIGHBOR_SOURCE_PAGE_SIZE, filters
       )
+      // 过期响应（用户又改了搜索条件/切了任务）：直接丢弃，不能覆盖最新结果
+      if (seq !== pagedRequestSeqRef.current) return true
       const data = response?.data
-      if (!response?.success || !data) return true
+      if (!response?.success || !data) {
+        setPagedError(t('neighbor.searchErrorFailed') || '搜索失败，请重试')
+        return true
+      }
       if (data.preparing) {
         setPagedPreparing(true)
         return false
@@ -544,14 +556,20 @@ export function NeighborPage() {
         relationType: target.relationType ?? source.relationType,
       })))
       setFilteredResults(flat)
+      // 查询已完成（哪怕 0 行）：此后表格渲染「暂无匹配结果」，不再报「结果不可用」
+      setPagedLoaded(true)
+      setPagedError(null)
       return true
     } catch (err: any) {
-      console.warn('[NeighborPage] 加载分页结果失败:', err?.message)
+      if (seq === pagedRequestSeqRef.current) {
+        console.warn('[NeighborPage] 加载分页结果失败:', err?.message)
+        setPagedError(err?.message || (t('neighbor.searchErrorFailed') || '搜索失败，请重试'))
+      }
       return true
     } finally {
-      setPagedLoading(false)
+      if (seq === pagedRequestSeqRef.current) setPagedLoading(false)
     }
-  }, [])
+  }, [t])
 
   const schedulePagedPollRef = useRef<(taskId: string) => void>(() => {})
   const schedulePagedPoll = useCallback((targetTaskId: string) => {
@@ -599,11 +617,17 @@ export function NeighborPage() {
     pagedTaskIdRef.current = targetTaskId
     viewedTaskIdRef.current = targetTaskId
     loadedFullResultTaskIdRef.current = null
+    // 新任务：作废上一个任务还在飞的分页请求
+    pagedRequestSeqRef.current++
     setPagedSources([])
     setPagedSourceTotal(0)
     setPagedSourcePage(1)
     setFilteredResults([])
     setPagedPreparing(false)
+    setPagedLoaded(false)
+    setPagedError(null)
+    // 旧请求的 finally 不会再清 loading（序号已作废），这里显式复位
+    setPagedLoading(false)
     setResultLoading(true)
     try {
       const response = await neighborApi.getResultMeta(targetTaskId)
@@ -1939,7 +1963,20 @@ export function NeighborPage() {
                       <p className="font-semibold">{i18n.taskFailed}</p>
                     </div>
                   ) : taskResult.status === 'completed' ? (
-                    <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
+                    <div className="relative flex-1 flex flex-col min-h-0 overflow-hidden">
+                      {/*
+                        搜索/翻页的加载指示固定在右上角，不占布局高度：早先顶部插一条
+                        「搜索中...」横幅会把表格整体下推，搜索期间页面反复跳动。
+                      */}
+                      {pagedLoading && (
+                        <span
+                          className="pointer-events-none absolute right-2 top-1 z-30 inline-flex items-center text-muted-foreground"
+                          title={t('common.searching') || '搜索中...'}
+                          aria-label={t('common.searching') || '搜索中...'}
+                        >
+                          <Loader2 size={12} className="animate-spin" />
+                        </span>
+                      )}
                       {pagedPreparing ? (
                         <div className="flex-1 flex flex-col items-center justify-center gap-3 px-6 text-center text-muted-foreground">
                           <Loader2 className="animate-spin" size={40} />
@@ -1955,13 +1992,25 @@ export function NeighborPage() {
                             {t('neighbor.loadFullResult') || '直接加载完整结果'}
                           </button>
                         </div>
-                      ) : pagedLoading && filteredResults.length === 0 ? (
+                      ) : pagedLoading && filteredResults.length === 0 && !pagedLoaded ? (
                         <div className="flex-1 flex items-center justify-center text-muted-foreground">
                           <Loader2 className="animate-spin mx-auto mb-4" size={40} />
                           <p className="text-sm">{i18n.loadingResult || '正在加载规划结果...'}</p>
                         </div>
-                      ) : hasPagedSources || filteredResults.length > 0 || (taskResult as any).results ? (
+                      ) : hasPagedSources || filteredResults.length > 0 || (taskResult as any).results || pagedLoaded ? (
                         <>
+                          {pagedError && (
+                            <div className="flex items-center gap-2 px-3 py-1.5 border-b border-border bg-red-500/10 text-xs text-red-600 shrink-0">
+                              <AlertCircle size={12} />
+                              <span className="flex-1">{pagedError}</span>
+                              <button
+                                onClick={() => pagedTaskIdRef.current && fetchPagedSources(pagedTaskIdRef.current, pagedSourcePage, activeFiltersRef.current)}
+                                className="px-2 py-0.5 rounded border border-red-500/30 hover:bg-red-500/10"
+                              >
+                                {t('common.refresh') || '刷新'}
+                              </button>
+                            </div>
+                          )}
                           <NeighborTable
                             results={filteredResults}
                             onSourceSectorClick={handleSourceSectorClick}
@@ -2000,16 +2049,44 @@ export function NeighborPage() {
                               </div>
                             </div>
                           )}
+                          {!(taskResult as any).results && pagedLoaded && filteredResults.length === 0 && Object.keys(activeFilters).length === 0 && (
+                            <div className="flex items-center justify-center gap-2 px-4 py-2 border-t border-border bg-card shrink-0">
+                              <span className="text-xs text-muted-foreground">
+                                {t('neighbor.resultEmptyHint') || '未取到结果明细，可尝试加载完整结果'}
+                              </span>
+                              <button
+                                onClick={() => loadFullResultForTask(taskResult.taskId || taskId!)}
+                                disabled={loadingFullResult}
+                                className="flex items-center gap-1 px-2.5 py-1 text-xs rounded-md border border-border hover:bg-muted/50 transition-colors disabled:opacity-50"
+                              >
+                                <Download size={12} />
+                                {t('neighbor.loadFullResult') || '直接加载完整结果'}
+                              </button>
+                            </div>
+                          )}
                         </>
                       ) : resultLoading ? (
                         <div className="flex-1 flex items-center justify-center text-muted-foreground">
                           <Loader2 className="animate-spin mx-auto mb-4" size={40} />
                           <p className="text-sm">{i18n.loadingResult || '正在加载规划结果...'}</p>
                         </div>
+                      ) : pagedError ? (
+                        <div className="flex-1 flex flex-col items-center justify-center gap-3 text-muted-foreground">
+                          <AlertCircle size={48} className="opacity-50" />
+                          <p className="text-sm">{pagedError}</p>
+                          <button
+                            onClick={() => pagedTaskIdRef.current && fetchPagedSources(pagedTaskIdRef.current, 1, activeFiltersRef.current)}
+                            className="px-3 py-1.5 rounded-lg bg-muted hover:bg-muted/80 transition-colors text-xs font-medium"
+                          >
+                            {t('common.refresh') || '刷新'}
+                          </button>
+                        </div>
                       ) : (
+                        // 结果摘要已到但明细还没就绪（首次查看需建索引）：按加载态处理，
+                        // 不再提示「结果数据不可用，请重新执行规划任务」
                         <div className="flex-1 flex items-center justify-center text-muted-foreground">
-                          <AlertCircle size={48} className="mx-auto mb-4 opacity-50" />
-                          <p>{t('common.resultUnavailable') || '结果数据不可用，请重新执行规划任务'}</p>
+                          <Loader2 className="animate-spin mx-auto mb-4" size={40} />
+                          <p className="text-sm">{i18n.loadingResult || '正在加载规划结果...'}</p>
                         </div>
                       )}
                     </div>

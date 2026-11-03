@@ -109,10 +109,15 @@ export function TACPage() {
   const [pagedPage, setPagedPage] = useState(1)
   const [pagedLoading, setPagedLoading] = useState(false)
   const [pagedPreparing, setPagedPreparing] = useState(false)
+  // 至少完成过一次分页查询（含 0 行）：区分「无匹配结果」与「结果不可用」
+  const [pagedLoaded, setPagedLoaded] = useState(false)
+  const [pagedError, setPagedError] = useState<string | null>(null)
   const [pagedRequest, setPagedRequest] = useState<{ taskId: string; summary?: any } | null>(null)
   const [mapRows, setMapRows] = useState<any[]>([])
   const pagedTaskIdRef = useRef<string | null>(null)
   const pagedPollRef = useRef<number | null>(null)
+  // 请求序号：只让最新一次分页查询落地，避免旧响应（可能 0 行）覆盖新搜索结果
+  const pagedRequestSeqRef = useRef(0)
   const TAC_PAGE_SIZE = 200
 
   // 从 taskStore 恢复最近的任务结果，行为与 PCI/邻区规划一致
@@ -753,11 +758,17 @@ export function TACPage() {
     page: number,
     filters: Record<string, string>
   ): Promise<boolean> => {
+    const seq = ++pagedRequestSeqRef.current
     setPagedLoading(true)
     try {
       const response = await tacApi.getResultRows(targetTaskId, page, TAC_PAGE_SIZE, filters)
+      // 过期响应（用户又改了搜索条件/切了任务）：直接丢弃
+      if (seq !== pagedRequestSeqRef.current) return true
       const data = response?.data
-      if (!response?.success || !data) return true
+      if (!response?.success || !data) {
+        setPagedError(t('common.loadFailed') || '加载失败，请重试')
+        return true
+      }
       if (data.preparing) {
         setPagedPreparing(true)
         return false
@@ -766,14 +777,20 @@ export function TACPage() {
       setFilteredResults(Array.isArray(data.rows) ? data.rows : [])
       setPagedTotal(Number(data.total) || 0)
       setPagedPage(Number(data.page) || page)
+      // 查询完成（哪怕 0 行）：表格渲染「暂无匹配结果」，不再整块消失
+      setPagedLoaded(true)
+      setPagedError(null)
       return true
     } catch (err: any) {
-      console.warn('[TACPage] 加载分页结果失败:', err?.message)
+      if (seq === pagedRequestSeqRef.current) {
+        console.warn('[TACPage] 加载分页结果失败:', err?.message)
+        setPagedError(err?.message || (t('common.loadFailed') || '加载失败，请重试'))
+      }
       return true
     } finally {
-      setPagedLoading(false)
+      if (seq === pagedRequestSeqRef.current) setPagedLoading(false)
     }
-  }, [])
+  }, [t])
 
   const mapLoadedTaskRef = useRef<string | null>(null)
   const loadMapRows = useCallback(async (targetTaskId: string) => {
@@ -835,11 +852,17 @@ export function TACPage() {
     pagedTaskIdRef.current = targetTaskId
     viewedTaskIdRef.current = targetTaskId
     mapLoadedTaskRef.current = null
+    // 新任务：作废上一个任务还在飞的分页请求
+    pagedRequestSeqRef.current++
     setMapRows([])
     setFilteredResults([])
     setPagedTotal(0)
     setPagedPage(1)
     setPagedPreparing(false)
+    setPagedLoaded(false)
+    setPagedError(null)
+    // 旧请求的 finally 不会再清 loading（序号已作废），这里显式复位
+    setPagedLoading(false)
     setResultLoading(true)
     try {
       const response = await tacApi.getResultMeta(targetTaskId)
@@ -1367,9 +1390,25 @@ export function TACPage() {
                         filteredResults.length > 0 ||
                         pagedPreparing ||
                         pagedLoading ||
+                        // 已查过（哪怕 0 行）也要保留表格：搜索条件输入框不能被清空，
+                        // 否则用户看到的是整块空白，只能靠清空搜索恢复
+                        pagedLoaded ||
                         resultLoading
                       ) && (
-                        <div className="flex-1 min-h-0 flex flex-col overflow-hidden">
+                        <div className="relative flex-1 min-h-0 flex flex-col overflow-hidden">
+                          {/*
+                            搜索/翻页加载指示固定在右上角，不占布局高度：早先顶部插
+                            「加载中/搜索中」横条会把表格整体下推，搜索期间页面反复跳动。
+                          */}
+                          {pagedLoading && (
+                            <span
+                              className="pointer-events-none absolute right-2 top-1 z-30 inline-flex items-center text-muted-foreground"
+                              title={t('common.searching') || '搜索中...'}
+                              aria-label={t('common.searching') || '搜索中...'}
+                            >
+                              <Loader2 size={12} className="animate-spin" />
+                            </span>
+                          )}
                           <div className="flex justify-end items-center gap-2 mb-3 shrink-0">
                             {taskResult.status === 'completed' && (
                               <button
@@ -1471,10 +1510,16 @@ export function TACPage() {
                               {t('tac.preparingResult') || '正在准备结果明细（首次查看大结果约需数秒）...'}
                             </div>
                           )}
-                          {pagedLoading && filteredResults.length === 0 && !pagedPreparing && (
-                            <div className="flex items-center gap-2 px-3 py-2 mb-2 text-xs text-muted-foreground shrink-0">
-                              <Loader2 size={14} className="animate-spin" />
-                              {t('common.loading') || '加载中...'}
+                          {pagedError && (
+                            <div className="flex items-center gap-2 px-3 py-2 mb-2 text-xs text-red-600 bg-red-500/10 rounded-md shrink-0">
+                              <AlertCircle size={14} className="flex-shrink-0" />
+                              <span className="flex-1">{pagedError}</span>
+                              <button
+                                onClick={() => pagedTaskIdRef.current && fetchPagedRows(pagedTaskIdRef.current, pagedPage, activeFiltersRef.current)}
+                                className="px-2 py-0.5 rounded border border-red-500/30 hover:bg-red-500/10"
+                              >
+                                {t('common.refresh') || '刷新'}
+                              </button>
                             </div>
                           )}
                           <div ref={tableContainerRef} onScroll={handleScroll}
@@ -1514,9 +1559,17 @@ export function TACPage() {
                         </tr>
                       </thead>
                       <tbody>
-                        <tr style={{ height: `${virtualData.offsetY}px` }}>
-                          <td colSpan={COLUMNS.length}></td>
-                        </tr>
+                        {filteredResults.length === 0 && !pagedPreparing && !pagedLoading && !resultLoading ? (
+                          <tr>
+                            <td colSpan={COLUMNS.length} className="px-3 py-8 text-center text-muted-foreground">
+                              {t('common.noMatchResult') || '暂无匹配结果'}
+                            </td>
+                          </tr>
+                        ) : (
+                          <tr style={{ height: `${virtualData.offsetY}px` }}>
+                            <td colSpan={COLUMNS.length}></td>
+                          </tr>
+                        )}
                         {virtualData.visibleData.map((cell, index) => {
                           const actualIndex = virtualData.startIndex + index
                           const sectorKey = `${cell.siteId}-${cell.sectorId}`
@@ -1657,9 +1710,11 @@ export function TACPage() {
                             </tr>
                           )
                         })}
-                        <tr style={{ height: `${virtualData.totalHeight - virtualData.offsetY - virtualData.visibleData.length * ITEM_HEIGHT}px` }}>
-                          <td colSpan={COLUMNS.length}></td>
-                        </tr>
+                        {!(filteredResults.length === 0 && !pagedPreparing && !pagedLoading && !resultLoading) && (
+                          <tr style={{ height: `${virtualData.totalHeight - virtualData.offsetY - virtualData.visibleData.length * ITEM_HEIGHT}px` }}>
+                            <td colSpan={COLUMNS.length}></td>
+                          </tr>
+                        )}
                       </tbody>
                     </table>
                   </div>

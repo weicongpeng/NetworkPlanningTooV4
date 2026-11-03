@@ -1603,10 +1603,8 @@ export function PCIPage() {
                       <p className="font-semibold">{t('pci.planFailed') || '规划任务失败'}</p>
                     </div>
                   ) : !resultLoading && currentTaskResult?.status === 'completed' && !(currentTaskResult as any).results ? (
-                    <div className="flex-1 flex items-center justify-center text-muted-foreground flex-col">
-                      <AlertCircle size={48} className="mb-4 opacity-50" />
-                      <p>{t('common.resultUnavailable') || '结果数据不可用，请重新执行规划任务'}</p>
-                    </div>
+                    // 结果摘要已到但明细仍在拉取：按加载态处理，不再提示「结果不可用，请重新执行」
+                    <LoadingSpinner variant="spinner" text={t('common.loadingResult') || '正在加载规划结果...'} />
                   ) : !resultLoading && hasFullResult ? (
                     <div className="flex flex-col h-full min-h-0">
                       {currentTaskResult.results && currentTaskResult.results.length > 0 ? (
@@ -1666,6 +1664,13 @@ export function PCIPage() {
                                   </tr>
                                 )
                               })}
+                              {filteredResults.length === 0 && (
+                                <tr>
+                                  <td colSpan={PCI_COLUMNS.length} className="px-3 py-8 text-center text-muted-foreground">
+                                    {t('common.noMatchResult') || '暂无匹配结果'}
+                                  </td>
+                                </tr>
+                              )}
                             </tbody>
                           </table>
                         </div>
