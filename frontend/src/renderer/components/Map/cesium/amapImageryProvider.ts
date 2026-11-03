@@ -148,36 +148,40 @@ export function createAmapImageryProvider(
       }
     }
 
-    return Promise.all(
-      cells.map(([tx, ty, dx, dy]) =>
-        ty < 0 || ty >= n
-          ? null
-          : loadTile(level, tx, ty, () => cancelled)
-            .then((img) => ({ img, dx, dy }))
-            .catch(() => null), // 单张小图失败不算整块失败（海洋/无数据瓦片会 404）
-      ),
-    ).then((parts) => {
+    // 只请求落在世界范围内的子瓦片；任一有效子瓦片失败都让整块瓦片 reject，
+    // 不能画一张带透明缺口的画布（Cesium 会把它当成功并永久缓存，表现为底图闪洞）。
+    const requests = cells
+      .filter(([, ty]) => ty >= 0 && ty < n)
+      .map(([tx, ty, dx, dy]) =>
+        loadTile(level, tx, ty, () => cancelled).then((img) => ({ img, dx, dy })))
+    if (requests.length === 0) {
+      // 极区/世界范围外：本来就没有影像，返回空白画布是正确的
+      const canvas = document.createElement('canvas')
+      canvas.width = size
+      canvas.height = size
+      return canvas
+    }
+
+    return Promise.all(requests).then((parts) => {
       /**
        * 失败/取消必须 reject，不能"伪造成功"。
        *
        * `ImageryLayer._requestImagery` 的语义是：promise resolve → 该瓦片标记 RECEIVED 并
        * 上传纹理（空白纹理也照上，永不重试）；reject → 回滚 UNLOADED/FAILED。
-       * 早先这里无论成败都返回一张（可能是全透明的）画布，于是任何一次网络抖动都会把一块
-       * 底图永久钉成空白 —— 桌面端失败率高，表现就是底图成片消失、只剩天地图注记，并随
-       * 瓦片重建反复出现（闪烁）。
+       * 早先这里单张子瓦片失败也照常 resolve，任何一次网络抖动都会让底图出现永久
+       * 透明缺口（桌面端 WebView2 网络抖动更频繁，表现就是底图成片闪烁）。
        */
-      if (cancelled) throw new Error(`amap imagery cancelled ${level}/${x}/${y}`)
-      const loaded = parts.filter((p): p is { img: HTMLImageElement; dx: number; dy: number } => !!p)
-      if (loaded.length === 0) throw new Error(`amap tile unavailable ${level}/${x}/${y}`)
-
       const canvas = document.createElement('canvas')
       canvas.width = size
       canvas.height = size
       const ctx = canvas.getContext('2d')
       if (ctx) {
-        for (const p of loaded) ctx.drawImage(p.img, p.dx, p.dy)
+        for (const p of parts) ctx.drawImage(p.img, p.dx, p.dy)
       }
       return canvas
+    }).catch((err) => {
+      if (cancelled) throw new Error(`amap imagery cancelled ${level}/${x}/${y}`)
+      throw new Error(`amap tile unavailable ${level}/${x}/${y}: ${String(err?.message || err)}`)
     })
   }
 

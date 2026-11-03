@@ -17,6 +17,7 @@ import {
 } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useToastStore } from '../../../store/toastStore'
+import { useAuthStore } from '../../../store/authStore'
 import { OnlineMap, type OnlineMapRef } from '../OnlineMap'
 import { loadCesium } from '../../../services/cesiumLoader'
 import { mapStateService } from '../../../services/mapStateService'
@@ -131,7 +132,7 @@ const LABEL_DRAW_THROTTLE_MS = 33
  * 平移/缩放是最高频的卡顿场景：GPU 填充成本 ≈ 像素数（resolutionScale²），
  * 影像/建筑瓦片选择与地面分类也随屏幕空间误差放大。移动中降载、停下恢复清晰度档位。
  */
-const INTERACTION_RESOLUTION_SCALE = 0.5
+const INTERACTION_RESOLUTION_SCALE = 0.75
 const INTERACTION_GLOBE_SSE = 4
 /** OSM 建筑的屏幕空间误差：静止沿用既有口径 32，交互中放宽到 64 */
 const BASE_TILESET_SSE = 32
@@ -1171,6 +1172,9 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
           fullscreenButton: false,
           infoBox: false,
           selectionIndicator: false,
+          // 桌面端（WebView2）持续 60fps 重绘在部分集显/远程桌面环境会闪帧；
+          // 城市级静态视角 30fps 足够，交互降载期间也更稳。网页端保持默认。
+          ...(useAuthStore.getState().desktopMode ? { targetFrameRate: 30 } : {}),
         })
         if (disposed) { viewer.destroy(); return }
         viewerRef.current = viewer
@@ -1312,6 +1316,7 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
         // 相机交互：移动中降载、停下后分帧重建（视口剔除）+ 回写 mapStateService + 更新指南针
         let rebuildTimer: ReturnType<typeof setTimeout> | null = null
         let headingTimer: ReturnType<typeof setTimeout> | null = null
+        let restoreTimer: ReturnType<typeof setTimeout> | null = null
         let refreshRaf: number | null = null
         /** 交互中（降载）标记：true = 已压低分辨率/放宽屏幕空间误差，停下后恢复 */
         let interacting = false
@@ -1327,8 +1332,9 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
           })
         }
 
-        /** 交互期降载：像素量降到约 25%、放宽影像/建筑误差、关 FXAA */
+        /** 交互期降载：像素量降到约 56%、放宽影像/建筑误差、关 FXAA */
         const applyInteractionProfile = () => {
+          if (restoreTimer) { clearTimeout(restoreTimer); restoreTimer = null }
           if (interacting) return
           interacting = true
           viewer.resolutionScale = Math.min(
@@ -1405,7 +1411,13 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
           closeInfoPanels()
         })
         viewer.camera.moveEnd.addEventListener(() => {
-          restoreQuality()
+          // 滚轮/触控板会连续触发 moveStart→moveEnd：立即恢复清晰度会让
+          // resolutionScale 反复跳（观感闪/糊）。等手势真正停下再恢复。
+          if (restoreTimer) clearTimeout(restoreTimer)
+          restoreTimer = setTimeout(() => {
+            restoreTimer = null
+            restoreQuality()
+          }, 150)
           persistMapState()
           scheduleRebuild()
         })
@@ -1855,7 +1867,12 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
     const preset = (tier && CESIUM_QUALITY_PRESETS[tier]) || CESIUM_QUALITY_PRESETS.smooth
     const dpr = window.devicePixelRatio || 1
     // resolutionScale > 1：按高于 CSS 像素的分辨率渲染再缩回，文字与影像更锐（成本 ×DPR²）
-    const base = Math.min(dpr, preset.maxResolutionScale)
+    const presetScale = Math.min(dpr, preset.maxResolutionScale)
+    // 桌面端 WebView2 常见 125%/150% 系统缩放：smooth 档上限 1 时按 CSS 像素渲染，
+    // 画面会明显发虚。桌面端至少按设备像素渲染（最高 2 倍），网页端维持原档位。
+    const base = useAuthStore.getState().desktopMode
+      ? Math.min(2, Math.max(presetScale, dpr))
+      : presetScale
     baseResolutionScaleRef.current = base
     viewer.resolutionScale = base
     viewer.scene.fxaa = preset.fxaa

@@ -134,14 +134,16 @@ describe('createAmapImageryProvider 失败语义', () => {
     expect(drawImage).toHaveBeenCalledTimes(t.cells)
   })
 
-  it('单张子瓦片始终失败、其余成功 → 仍出图（部分空块可接受）', async () => {
+  it('单张子瓦片始终失败 → 整块 reject（不能带透明缺口出图）', async () => {
     const t = sampleTile()
     const firstUrl = tileUrl(t.wx, t.wy, t.level)
     respond = (url) => (url === firstUrl ? 'fail' : 'ok')
     const promise = createAmapImageryProvider(C, URL_TEMPLATE).requestImage(t.x, t.y, t.level, {})
+    const assertion = expect(promise).rejects.toThrow(/unavailable/)
     await vi.advanceTimersByTimeAsync(AMAP_TILE_TIMEOUT_MS)
-    await expect(promise).resolves.toBeTruthy()
-    expect(drawImage).toHaveBeenCalledTimes(t.cells - 1)
+    await assertion
+    // 半透明/透明缺口都不能画进画布：否则 Cesium 会把它当成功永久缓存
+    expect(drawImage).not.toHaveBeenCalled()
   })
 
   it('请求被取消时 reject（Cesium 会据此把瓦片状态回滚重试）', async () => {

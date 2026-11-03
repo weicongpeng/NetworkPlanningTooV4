@@ -9,6 +9,7 @@ import { describe, expect, it } from 'vitest'
 // Vite 的 ?raw 导入：拿到源码文本（不需要 node 类型）
 import cesiumMapSource from '../CesiumMap.tsx?raw'
 import geoJsonLayerSource from '../CesiumGeoJsonLayer.ts?raw'
+import sectorLayerSource from '../CesiumSectorLayer.ts?raw'
 
 describe('3D 场景开关守卫', () => {
   it('不得开启 scene.pickTranslucentDepth（缩放必崩 _target 的根因）', () => {
@@ -16,6 +17,11 @@ describe('3D 场景开关守卫', () => {
     expect(/scene\.pickTranslucentDepth\s*=\s*true/.test(cesiumMapSource)).toBe(false)
     // 说明文字还在（防止有人顺手删掉注释后又把开关加回来）
     expect(cesiumMapSource).toContain('12617')
+  })
+
+  it('贴地图元不得异步构建（worker 就绪前新旧两批同时渲染会闪）', () => {
+    expect(sectorLayerSource).not.toContain('asynchronous: true')
+    expect(geoJsonLayerSource).not.toContain('asynchronous: true')
   })
 })
 

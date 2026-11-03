@@ -45,8 +45,9 @@ const VIEW_PADDING_RATIO = 0.5
  *
  * 导入图层的主要成本是"每次视野变化把整层几何重新三角化 + 重建贴地图元"。
  * 按空间网格切成若干块后：视野变化只重建进出视口的块，其余块直接复用；
- * 图元用 `asynchronous: true` 把三角化交给 Cesium worker，主线程只做实例包装；
- * 新图元就绪后才摘旧图元（双缓冲），避免历史上"异步构建中被 remove"的渲染崩溃。
+ * 图元**同步构建**（`asynchronous: false`）：异步 worker 就绪前新旧两批图元会同时
+ * 渲染，半透明填充叠画会闪；历史上还踩过构建中被 remove 的 `_target` 崩溃。
+ * 分块后每批较小，同步三角化的停顿可控。
  */
 const CHUNK_MIN_FEATURES = 1500
 const CHUNK_TARGET_FEATURES = 500
@@ -860,18 +861,18 @@ export class CesiumGeoJsonLayer {
           geometryInstances: polygons,
           appearance: new C.PerInstanceColorAppearance({ flat: true, translucent: true }),
           /**
-           * 分块后每批图元较小，异步构建把三角化交给 worker，主线程只做实例包装。
-           * 旧图元在新图元 ready 后才摘（retireAfterReplacement），不会重演
-           * "worker 构建中被 remove → `_target` 崩溃"。
+           * 贴地图元必须同步构建：异步 worker 就绪前新旧两批图元会同时渲染，
+           * 半透明填充叠画会闪烁；历史上还踩过 worker 构建中被移除的 `_target` 崩溃。
+           * 分块后每批图元较小，同步三角化的停顿可控。
            */
-          asynchronous: true,
+          asynchronous: false,
         })))
       }
       if (polylines.length > 0) {
         newPrimitives.push(collection.add(new C.GroundPolylinePrimitive({
           geometryInstances: polylines,
           appearance: new C.PolylineColorAppearance(),
-          asynchronous: true,
+          asynchronous: false,
         })))
       }
     } catch (e) {
@@ -980,7 +981,7 @@ export class CesiumGeoJsonLayer {
       const prim = collection.add(new C.GroundPolylinePrimitive({
         geometryInstances: outlines,
         appearance: new C.PolylineColorAppearance(),
-        asynchronous: true,
+        asynchronous: false,
       }))
       this.selectionPrimitives = [prim]
       this.retireAfterReplacement(old, this.selectionPrimitives)

@@ -534,15 +534,16 @@ export class CesiumSectorLayer {
         newFill = primitives.add(new C.GroundPrimitive({
           geometryInstances: fills,
           appearance: new C.PerInstanceColorAppearance({ flat: true, translucent: true }),
-          // 异步构建：三角化交给 worker；旧图元在 ready 后才摘（双缓冲）
-          asynchronous: true,
+          // 贴地图元必须同步构建：异步 worker 就绪前新旧两批图元会同时渲染，
+          // 半透明扇区叠画会明显闪一下；历史上还踩过 worker 构建中被移除的 _target 崩溃。
+          asynchronous: false,
         }))
       }
       if (outlines.length > 0) {
         newOutline = primitives.add(new C.GroundPolylinePrimitive({
           geometryInstances: outlines,
           appearance: new C.PolylineColorAppearance(),
-          asynchronous: true,
+          asynchronous: false,
         }))
       }
     } catch (e) {
