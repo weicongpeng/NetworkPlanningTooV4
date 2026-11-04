@@ -385,6 +385,26 @@ WM_NCCALCSIZE = 0x0083
 WM_NCLBUTTONDOWN = 0x00A1
 HTCAPTION = 2
 SW_RESTORE = 9
+# 非客户区命中码：用同一个入口（WM_NCLBUTTONDOWN）告诉系统拉哪条边/哪个角，
+# 系统随即进入自己的缩放循环 —— 四边四角都能拉，最小尺寸/DPI/贴边语义全按原生走
+HTLEFT = 10
+HTRIGHT = 11
+HTTOP = 12
+HTTOPLEFT = 13
+HTTOPRIGHT = 14
+HTBOTTOM = 15
+HTBOTTOMLEFT = 16
+HTBOTTOMRIGHT = 17
+RESIZE_HIT_TESTS = {
+    "w": HTLEFT,
+    "e": HTRIGHT,
+    "n": HTTOP,
+    "nw": HTTOPLEFT,
+    "ne": HTTOPRIGHT,
+    "s": HTBOTTOM,
+    "sw": HTBOTTOMLEFT,
+    "se": HTBOTTOMRIGHT,
+}
 # 持有子类化后的窗口过程引用：ctypes 回调对象被 GC 之后再收到窗口消息会直接崩溃
 _wndproc_refs: list = []
 # 已装钩子的窗口句柄：全屏切换会让 WinForms 重建句柄，需要在新句柄上重装
@@ -434,7 +454,7 @@ def _install_client_area_wndproc(window: Any) -> None:
     贴边分屏要求窗口"可缩放"，但无边框窗口加上 WS_THICKFRAME 后系统会在四周留出
     8px 非客户区 —— 页面被缩进一圈、露出底色。这里子类化窗口过程，把 WM_NCCALCSIZE
     的客户区直接算成整个窗口矩形：既保留"可缩放 → 可贴边"的系统语义，又维持页面满铺。
-    原生边缘缩放随之消失（本来也没用），窗口缩放仍由自绘把手经 window-control resize 完成。
+    原生边缘缩放随之消失，窗口缩放改由自绘把手经 window-control resize-edge 交给系统缩放循环。
 
     仅 Windows 生效；任何一步失败都只记日志（退化为带一圈细边框，不影响功能）。
     """
@@ -487,6 +507,28 @@ def _install_client_area_wndproc(window: Any) -> None:
         _log.info("已子类化窗口过程：客户区铺满整窗（去掉 WS_THICKFRAME 的原生边框）")
     except Exception as exc:  # noqa: BLE001
         _log.warning("子类化窗口过程失败（无边框窗口会露出一圈原生边框）：%s", exc)
+
+
+def _run_window_loop(window: Any, perform: Callable[[], None], thread_name: str) -> None:
+    """把阻塞式的原生窗口循环（拖动/缩放）派发到 WinForms GUI 线程执行。
+
+    SendMessage(WM_NCLBUTTONDOWN) 会一直阻塞到用户松开鼠标，所以放独立线程等待、
+    HTTP 请求立即返回。而 Invoke 本身必须走 GUI 线程：鼠标捕获在 WebView2 子窗口上，
+    在 uvicorn 线程里 ReleaseCapture 既释放不了捕获，系统也拿不到后续鼠标消息。
+    """
+    native = window.native
+
+    def _invoke() -> None:
+        try:
+            from System import Func, Type
+
+            # 与 _limit_maximized_to_work_area 同一套 pythonnet 调用方式
+            native.Invoke(Func[Type](perform))
+        except Exception:  # noqa: BLE001
+            # pythonnet/Invoke 不可用（旧环境）：退回直接调用，至少不影响窗口其它功能
+            perform()
+
+    threading.Thread(target=_invoke, name=thread_name, daemon=True).start()
 
 
 def _start_caption_drag(window: Any) -> None:
@@ -567,18 +609,43 @@ def _start_caption_drag(window: Any) -> None:
         except Exception:  # noqa: BLE001
             _log.exception("原生标题栏拖窗失败（本次拖动无效）")
 
-    def _invoke_on_ui() -> None:
-        """GUI 线程执行移动循环；Invoke 会阻塞到松手，因此放在独立线程。"""
+    _run_window_loop(window, _perform, "npt-caption-drag")
+
+
+def _start_native_resize(window: Any, direction: str) -> bool:
+    """按系统原生边缘缩放拖拽（等价于抓住窗口边框/角落拉）。
+
+    与标题栏拖动同源：发 WM_NCLBUTTONDOWN 命中 HTLEFT/HTTOP… 后由 Windows 进入自己的
+    缩放循环 —— 四边四角都能拉，最小尺寸、DPI 缩放、贴边语义全按系统行为走。
+    早先前端逐帧发 resize 请求的做法只能锚定左上角单向外扩，拉不了左边和上边。
+
+    返回是否成功发起（方向非法或非 Windows 环境返回 False）。
+    """
+    hit = RESIZE_HIT_TESTS.get(direction)
+    native = getattr(window, "native", None)
+    if hit is None or os.name != "nt" or native is None:
+        return False
+
+    def _perform() -> None:
         try:
-            from System import Func, Type
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+            handle = native.Handle
+            hwnd = int(handle.ToInt64() if hasattr(handle, "ToInt64") else handle)
+            user32.ReleaseCapture.argtypes = []
+            user32.ReleaseCapture.restype = ctypes.c_bool
+            user32.SendMessageW.argtypes = [
+                ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t, ctypes.c_ssize_t,
+            ]
+            user32.SendMessageW.restype = ctypes.c_ssize_t
 
-            # 与 _limit_maximized_to_work_area 同一套 pythonnet 调用方式
-            native.Invoke(Func[Type](_perform))
+            # ReleaseCapture 在 UI 线程才有效：捕获原本在 WebView2 子窗口上
+            user32.ReleaseCapture()
+            user32.SendMessageW(ctypes.c_void_p(hwnd), WM_NCLBUTTONDOWN, hit, 0)
         except Exception:  # noqa: BLE001
-            # pythonnet/Invoke 不可用（旧环境）：退回直接调用，至少不影响窗口其它功能
-            _perform()
+            _log.exception("原生边缘缩放失败（本次拖拽无效）")
 
-    threading.Thread(target=_invoke_on_ui, name="npt-caption-drag", daemon=True).start()
+    _run_window_loop(window, _perform, "npt-window-resize")
+    return True
 
 
 def _limit_maximized_to_work_area(window: Any, enable: bool) -> None:
@@ -654,9 +721,7 @@ def _make_fullscreen_handler(window: Any, state: Optional[dict] = None) -> Calla
     return _handler
 
 
-def _make_window_control_handler(
-    window: Any, state: dict, min_size: tuple
-) -> Callable[[str, dict], dict]:
+def _make_window_control_handler(window: Any, state: dict) -> Callable[[str, dict], dict]:
     """构造窗口控制回调（frameless 自绘标题栏的按钮/把手 → pywebview 原生动作）。
 
     - state 与全屏回调共享，并在 maximized/restored 事件里持续更新：
@@ -665,7 +730,7 @@ def _make_window_control_handler(
     - close 走 window.destroy()：会触发 FormClosing → events.closing，
       保留 _make_close_handler 的看门狗与后台更新例外；
       不能复用 _make_exit_handler（它无条件武装看门狗）。
-    - resize 是裸 SetWindowPos、绕过 WinForms MinimumSize → 这里按 min_size clamp。
+    - resize-edge 把拖拽交给系统原生缩放循环（四边四角），不逐帧改窗口尺寸。
     """
 
     def _on_maximized(*_args: Any, **_kwargs: Any) -> None:
@@ -714,10 +779,10 @@ def _make_window_control_handler(
             # 系统移动循环会阻塞到用户松开鼠标 → 与 HTTP 请求解耦，立即返回
             _start_caption_drag(window)
             return {"maximized": bool(state.get("maximized", False))}
-        if action == "resize":
-            width = max(int(params.get("width") or 0), int(min_size[0]))
-            height = max(int(params.get("height") or 0), int(min_size[1]))
-            window.resize(width, height)
+        if action == "resize-edge":
+            # 系统缩放循环会阻塞到用户松开鼠标 → 与 HTTP 请求解耦，立即返回
+            if not _start_native_resize(window, str(params.get("direction") or "")):
+                raise ValueError(f"未知缩放方向: {params.get('direction')!r}")
             return {"maximized": bool(state.get("maximized", False))}
         raise ValueError(f"未知窗口控制动作: {action}")
 
@@ -878,7 +943,7 @@ def _create_window() -> Any:
 
         desktop_bridge.set_fullscreen_handler(_make_fullscreen_handler(window, win_state))
         desktop_bridge.set_window_control_handler(
-            _make_window_control_handler(window, win_state, min_size)
+            _make_window_control_handler(window, win_state)
         )
     except Exception as exc:  # noqa: BLE001
         _log.warning("注入窗口全屏/控制回调失败（地图全屏将退化为应用内全屏）：%s", exc)

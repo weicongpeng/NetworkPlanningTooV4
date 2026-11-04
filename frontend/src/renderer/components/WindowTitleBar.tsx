@@ -7,9 +7,10 @@
  *   单击不触发拖动：最大化窗口若在按下瞬间就交给壳层，壳层会先还原窗口（单击也会"掉下来"）。
  *   双击标题区 = 最大化/还原。
  * - 按钮（仿原生窗口按钮，右对齐）：应用下载（原悬浮图标入口迁入）| 最小化 | 最大化/还原 | 关闭
- * - 缩放把手：frameless 后原生边缘拖拽消失，这里贴视口右/下/右下角三条热区，
- *   拖拽经 POST /desktop/window-control resize 交给壳层（壳层 clamp min_size）；
- *   最大化时隐藏。起始尺寸取 outerWidth/outerHeight 快照（CSS px 与壳层逻辑像素一致）
+ * - 缩放把手：frameless 后原生边缘拖拽消失，这里贴视口四边 + 四角共八条热区；
+ *   按下即经 POST /desktop/window-control resize-edge 交给壳层，由壳层发
+ *   WM_NCLBUTTONDOWN(HTLEFT/HTTOP…) 进入**系统原生缩放循环** —— 四边四角都能拉，
+ *   最小尺寸、DPI 缩放、贴边语义全按系统行为走（不再逐帧发宽高请求）；最大化时隐藏
  * - 状态收敛：按钮动作响应带回 maximized；窗口 focus/visibilitychange 时 GET window-state
  *   校准一次（Win+↑/↓ 等系统路径经壳层 events 缓存自然正确），不轮询
  *
@@ -30,7 +31,22 @@ const BUTTON_CLASS =
 /** 按下后移动超过该距离才进入原生拖窗；低于阈值视为单击（不还原最大化窗口） */
 const DRAG_START_THRESHOLD_PX = 4
 
-type ResizeDir = 'e' | 's' | 'se'
+type ResizeDir = 'n' | 's' | 'e' | 'w' | 'ne' | 'nw' | 'se' | 'sw'
+
+/**
+ * 缩放热区：方向 → 定位/光标。四角压在四边上，所以排在四边之后渲染（同 z 后渲染者在上）；
+ * 顶边压在自绘标题栏上，故 z 略高，标题栏内部其余区域仍可拖窗/点按钮。
+ */
+const RESIZE_HANDLES: Array<{ dir: ResizeDir; className: string }> = [
+  { dir: 'n', className: 'fixed top-0 right-[10px] left-[10px] z-[9998] h-[5px] cursor-ns-resize' },
+  { dir: 's', className: 'fixed right-[10px] bottom-0 left-[10px] z-[9997] h-[5px] cursor-ns-resize' },
+  { dir: 'e', className: 'fixed top-8 right-0 bottom-[10px] z-[9997] w-[5px] cursor-ew-resize' },
+  { dir: 'w', className: 'fixed top-8 bottom-[10px] left-0 z-[9997] w-[5px] cursor-ew-resize' },
+  { dir: 'nw', className: 'fixed top-0 left-0 z-[9998] h-[10px] w-[10px] cursor-nwse-resize' },
+  { dir: 'ne', className: 'fixed top-0 right-0 z-[9998] h-[10px] w-[10px] cursor-nesw-resize' },
+  { dir: 'sw', className: 'fixed bottom-0 left-0 z-[9997] h-[10px] w-[10px] cursor-nesw-resize' },
+  { dir: 'se', className: 'fixed right-0 bottom-0 z-[9997] h-[10px] w-[10px] cursor-nwse-resize' },
+]
 
 type PendingDrag = {
   onMove: (e: MouseEvent) => void
@@ -47,26 +63,6 @@ export function WindowTitleBar() {
   const lastDragDownRef = useRef(0)
   /** 已按下但尚未越过拖动阈值：单击时在这里收尾，不惊动壳层 */
   const pendingDragRef = useRef<PendingDrag | null>(null)
-  const resizeRef = useRef<{
-    dir: ResizeDir
-    sx: number
-    sy: number
-    w0: number
-    h0: number
-    raf: number | null
-    next: { w: number; h: number } | null
-  } | null>(null)
-
-  const sendResize = useCallback((w: number, h: number) => {
-    desktopLoginApi
-      .windowControl('resize', { width: Math.round(w), height: Math.round(h) })
-      .then((res: any) => {
-        if (typeof res?.data?.maximized === 'boolean') setMaximized(res.data.maximized)
-      })
-      .catch(() => {
-        /* 非桌面壳/请求失败：静默（把手只在桌面端渲染） */
-      })
-  }, [])
 
   /** 按钮动作统一入口：响应带 maximized 时同步图标状态 */
   const control = useCallback((action: 'minimize' | 'toggle-maximize' | 'close') => {
@@ -159,44 +155,12 @@ export function WindowTitleBar() {
     }
   }, [desktopMode])
 
+  /** 边缘/角落按下：把缩放交给壳层的系统原生缩放循环（之后由 Windows 接手鼠标） */
   const onResizePointerDown = (dir: ResizeDir) => (e: React.PointerEvent<HTMLDivElement>) => {
     e.preventDefault()
-    ;(e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId)
-    resizeRef.current = {
-      dir,
-      sx: e.clientX,
-      sy: e.clientY,
-      w0: window.outerWidth,
-      h0: window.outerHeight,
-      raf: null,
-      next: null,
-    }
-  }
-
-  const onResizePointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
-    const d = resizeRef.current
-    if (!d) return
-    const dx = e.clientX - d.sx
-    const dy = e.clientY - d.sy
-    d.next = {
-      w: d.dir === 'e' || d.dir === 'se' ? d.w0 + dx : d.w0,
-      h: d.dir === 's' || d.dir === 'se' ? d.h0 + dy : d.h0,
-    }
-    if (d.raf !== null) return
-    // rAF 合并帧：一帧最多发一次本机请求，后发请求生效
-    d.raf = requestAnimationFrame(() => {
-      d.raf = null
-      if (d.next) {
-        sendResize(d.next.w, d.next.h)
-        d.next = null
-      }
+    desktopLoginApi.windowControl('resize-edge', { direction: dir }).catch(() => {
+      /* 旧版壳层没有该动作：本次缩放无效，其余功能不受影响 */
     })
-  }
-
-  const onResizePointerUp = () => {
-    const d = resizeRef.current
-    if (d?.raf != null) cancelAnimationFrame(d.raf)
-    resizeRef.current = null
   }
 
   if (!desktopMode) return null
@@ -264,32 +228,16 @@ export function WindowTitleBar() {
         </div>
       </div>
 
-      {/* 边缘缩放把手（仅非最大化）：贴视口右/下/右下角，拖拽经 window-control resize 交给壳层 */}
-      {!maximized && (
-        <>
+      {/* 边缘/角落缩放热区（仅非最大化）：按下交给壳层的系统原生缩放循环 */}
+      {!maximized &&
+        RESIZE_HANDLES.map(({ dir, className }) => (
           <div
-            className="fixed top-8 right-0 bottom-[10px] z-[9997] w-[5px] cursor-ew-resize"
-            onPointerDown={onResizePointerDown('e')}
-            onPointerMove={onResizePointerMove}
-            onPointerUp={onResizePointerUp}
-            onPointerCancel={onResizePointerUp}
+            key={dir}
+            data-resize-dir={dir}
+            className={className}
+            onPointerDown={onResizePointerDown(dir)}
           />
-          <div
-            className="fixed right-[10px] bottom-0 left-0 z-[9997] h-[5px] cursor-ns-resize"
-            onPointerDown={onResizePointerDown('s')}
-            onPointerMove={onResizePointerMove}
-            onPointerUp={onResizePointerUp}
-            onPointerCancel={onResizePointerUp}
-          />
-          <div
-            className="fixed right-0 bottom-0 z-[9997] h-[10px] w-[10px] cursor-nwse-resize"
-            onPointerDown={onResizePointerDown('se')}
-            onPointerMove={onResizePointerMove}
-            onPointerUp={onResizePointerUp}
-            onPointerCancel={onResizePointerUp}
-          />
-        </>
-      )}
+        ))}
 
       <AppDownloadDialog open={showAppDownload} onClose={() => setShowAppDownload(false)} />
     </>

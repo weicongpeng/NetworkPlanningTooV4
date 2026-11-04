@@ -1525,11 +1525,12 @@ async def desktop_fullscreen(
 
 
 class WindowControlRequest(BaseModel):
-    action: Literal["minimize", "toggle-maximize", "close", "resize", "drag"] = Field(
+    action: Literal["minimize", "toggle-maximize", "close", "resize-edge", "drag"] = Field(
         ..., description="窗口控制动作（自绘标题栏按钮 / 边缘缩放把手 / 原生拖窗）"
     )
-    width: Optional[int] = Field(None, ge=1, description="resize 目标宽度（逻辑像素）")
-    height: Optional[int] = Field(None, ge=1, description="resize 目标高度（逻辑像素）")
+    direction: Optional[Literal["n", "s", "e", "w", "ne", "nw", "se", "sw"]] = Field(
+        None, description="resize-edge 缩放方向（n/s/e/w/ne/nw/se/sw，对应上/下/右/左与四角）"
+    )
 
 
 @router.post("/window-control")
@@ -1541,15 +1542,15 @@ async def desktop_window_control(
     """frameless 窗口自绘标题栏的窗口动作：最小化/最大化还原/关闭/边缘缩放。
 
     关闭走 window.destroy() → events.closing（保留后台更新例外与看门狗兜底）；
-    缩放由壳层按 min_size clamp 后执行。非桌面壳返回 403。
+    缩放把方向交给壳层，由系统原生缩放循环接管（四边四角都能拉）。非桌面壳返回 403。
     """
     from app import desktop_bridge
 
     params: Dict[str, Any] = {}
-    if payload.action == "resize":
-        if not payload.width or not payload.height:
-            raise HTTPException(status_code=400, detail="resize 需要同时提供 width 与 height")
-        params = {"width": payload.width, "height": payload.height}
+    if payload.action == "resize-edge":
+        if not payload.direction:
+            raise HTTPException(status_code=400, detail="resize-edge 需要提供 direction")
+        params = {"direction": payload.direction}
     result = desktop_bridge.control_window(payload.action, params)
     if result is None:
         raise HTTPException(status_code=403, detail="当前运行环境不支持窗口控制（非桌面壳）")

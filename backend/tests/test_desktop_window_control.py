@@ -2,10 +2,10 @@
 
 桌面端窗口去掉了原生边框（launcher._create_window 的 frameless=True），
 最小化/最大化/关闭/边缘缩放由前端标题栏按钮经 POST /desktop/window-control 进来，
-最终落到 launcher._make_window_control_handler(window, state, min_size)。
+最终落到 launcher._make_window_control_handler(window, state)。
 
-本文件覆盖 handler 的动作语义（按缓存选 maximize/restore、resize clamp、close 走
-destroy 且不复用退出看门狗）与 state 事件的缓存收敛；端点转发见
+本文件覆盖 handler 的动作语义（按缓存选 maximize/restore、resize-edge 交给系统原生
+缩放循环、close 走 destroy 且不复用退出看门狗）与 state 事件的缓存收敛；端点转发见
 tests/test_desktop_local_endpoints.py。
 """
 from __future__ import annotations
@@ -13,6 +13,8 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 
 def _load_launcher():
@@ -62,14 +64,11 @@ class _FakeWindow:
         if self._destroy_error:
             raise RuntimeError("gui not ready")
 
-    def resize(self, width, height):
-        self.calls.append(("resize", width, height))
 
-
-def _make_handler(launcher, window, state=None, min_size=(1024, 680)):
+def _make_handler(launcher, window, state=None):
     if state is None:
         state = {"fullscreen": False, "maximized": True}
-    return launcher._make_window_control_handler(window, state, min_size), state
+    return launcher._make_window_control_handler(window, state), state
 
 
 def test_toggle_maximize_uses_state_cache():
@@ -120,17 +119,32 @@ def test_state_events_converge_cache():
     assert handler("state", {})["maximized"] is True
 
 
-def test_resize_clamps_min_size():
-    """resize 走裸 SetWindowPos、绕过 WinForms MinimumSize → 壳层必须自己 clamp。"""
+def test_resize_edge_hands_over_to_native_loop(monkeypatch):
+    """四边四角 → 壳层把方向转成非客户区命中码，交给系统原生缩放循环。
+
+    逐帧发宽高请求的老做法锚定左上角，只有右/下边能外扩；交给系统后左边、上边与
+    四角都能拉，最小尺寸/DPI/贴边语义也回归原生行为。阻塞的缩放循环同样放独立线程，
+    handler 必须立刻返回。
+    """
     launcher = _load_launcher()
     window = _FakeWindow()
-    handler, _ = _make_handler(launcher, window, min_size=(1024, 680))
+    handler, _ = _make_handler(launcher, window)
 
-    handler("resize", {"width": 800, "height": 900})
-    assert ("resize", 1024, 900) in window.calls
+    started: list = []
+    monkeypatch.setattr(
+        launcher,
+        "_start_native_resize",
+        lambda win, direction: started.append((win, direction))
+        or direction in launcher.RESIZE_HIT_TESTS,
+    )
 
-    handler("resize", {"width": 1600, "height": 500})
-    assert ("resize", 1600, 680) in window.calls
+    assert handler("resize-edge", {"direction": "w"}) == {"maximized": True}
+    assert started == [(window, "w")]
+    # 缩放期间不做任何窗口动作（尺寸由系统缩放循环自己改）
+    assert window.calls == []
+
+    with pytest.raises(ValueError):
+        handler("resize-edge", {"direction": "diagonal"})
 
 
 def test_close_destroys_without_force_exit():
@@ -192,8 +206,8 @@ def test_bridge_forwards_and_swallows_errors():
         lambda action, params: seen.append((action, params)) or {"ok": True}
     )
     try:
-        assert desktop_bridge.control_window("resize", {"width": 100}) == {"ok": True}
-        assert seen == [("resize", {"width": 100})]
+        assert desktop_bridge.control_window("resize-edge", {"direction": "se"}) == {"ok": True}
+        assert seen == [("resize-edge", {"direction": "se"})]
     finally:
         desktop_bridge.set_window_control_handler(None)
 

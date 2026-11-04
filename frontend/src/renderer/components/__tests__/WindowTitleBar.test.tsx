@@ -8,6 +8,7 @@
  *   toggle-maximize 响应带回 maximized 时同步按钮图标与 title
  * - 单击标题区不还原最大化窗口；按住并移动超过阈值才交给壳层拖窗
  * - 双击标题区 = 最大化/还原
+ * - 非最大化时四边四角共八条缩放热区，按下即发 window-control resize-edge
  * - 窗口聚焦校准：mount 时 GET /desktop/window-state，用缓存修正按钮状态
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -82,6 +83,36 @@ describe('WindowTitleBar', () => {
     await waitFor(() =>
       expect(desktopLoginApi.windowControl).toHaveBeenCalledWith('close')
     )
+  })
+
+  it('非最大化时四边四角都有缩放热区，按下即交给壳层原生缩放', async () => {
+    useAuthStore.setState({ desktopMode: true })
+    vi.mocked(desktopLoginApi.windowState).mockResolvedValue({
+      success: true,
+      data: { maximized: false, fullscreen: false },
+    } as any)
+    const { container } = render(<WindowTitleBar />)
+
+    await waitFor(() =>
+      expect(container.querySelectorAll('[data-resize-dir]')).toHaveLength(8)
+    )
+    const dirs = Array.from(container.querySelectorAll('[data-resize-dir]')).map((el) =>
+      el.getAttribute('data-resize-dir')
+    )
+    expect(dirs.sort()).toEqual(['e', 'n', 'ne', 'nw', 's', 'se', 'sw', 'w'])
+
+    // 左边框：早些时候只有右/下两条边能拉，这里锁定"任意边/角都行"
+    fireEvent.pointerDown(container.querySelector('[data-resize-dir="w"]') as HTMLElement)
+    await waitFor(() =>
+      expect(desktopLoginApi.windowControl).toHaveBeenCalledWith('resize-edge', { direction: 'w' })
+    )
+  })
+
+  it('最大化时隐藏缩放热区', async () => {
+    useAuthStore.setState({ desktopMode: true })
+    const { container } = render(<WindowTitleBar />)
+    await waitFor(() => expect(desktopLoginApi.windowState).toHaveBeenCalled())
+    expect(container.querySelector('[data-resize-dir]')).toBeNull()
   })
 
   it('单击标题区不触发拖窗（最大化窗口不得因单击被还原）', async () => {

@@ -702,11 +702,11 @@ export const desktopLoginApi = {
 
   /**
    * frameless 窗口的窗口动作（自绘标题栏按钮 / 边缘缩放把手）。
-   * toggle-maximize/resize 的响应带最新 maximized；非桌面壳 403，调用方静默忽略。
+   * toggle-maximize 的响应带最新 maximized；非桌面壳 403，调用方静默忽略。
    */
   windowControl: async (
-    action: 'minimize' | 'toggle-maximize' | 'close' | 'resize' | 'drag',
-    params?: { width?: number; height?: number }
+    action: 'minimize' | 'toggle-maximize' | 'close' | 'drag' | 'resize-edge',
+    params?: { direction?: 'n' | 's' | 'e' | 'w' | 'ne' | 'nw' | 'se' | 'sw' }
   ): Promise<ApiResponse<{ maximized?: boolean }>> => {
     return apiClient.post('/desktop/window-control', { action, ...(params || {}) }) as any
   },

@@ -200,7 +200,7 @@ def test_fullscreen_without_shell_returns_403(desktop_local):
 
 
 def test_window_control_forwarded_to_shell(desktop_local):
-    """自绘标题栏动作逐条转发给壳层 handler（resize 透传 width/height）。"""
+    """自绘标题栏动作逐条转发给壳层 handler（resize-edge 透传缩放方向）。"""
     from app import desktop_bridge
 
     seen: list = []
@@ -215,7 +215,7 @@ def test_window_control_forwarded_to_shell(desktop_local):
             {"action": "minimize"},
             {"action": "toggle-maximize"},
             {"action": "close"},
-            {"action": "resize", "width": 1200, "height": 800},
+            {"action": "resize-edge", "direction": "nw"},
         ]:
             resp = desktop_local.client.post("/api/v1/desktop/window-control", json=body)
             assert resp.status_code == 200, resp.text
@@ -224,7 +224,7 @@ def test_window_control_forwarded_to_shell(desktop_local):
             ("minimize", {}),
             ("toggle-maximize", {}),
             ("close", {}),
-            ("resize", {"width": 1200, "height": 800}),
+            ("resize-edge", {"direction": "nw"}),
         ]
     finally:
         desktop_bridge.set_window_control_handler(None)
@@ -248,10 +248,10 @@ def test_window_control_validates_payload(desktop_local):
         )
         assert bad_action.status_code == 422  # Literal 白名单在 Pydantic 层拒绝
 
-        resize_without_size = desktop_local.client.post(
-            "/api/v1/desktop/window-control", json={"action": "resize"}
+        resize_without_dir = desktop_local.client.post(
+            "/api/v1/desktop/window-control", json={"action": "resize-edge"}
         )
-        assert resize_without_size.status_code == 400
+        assert resize_without_dir.status_code == 400
     finally:
         desktop_bridge.set_window_control_handler(None)
 
