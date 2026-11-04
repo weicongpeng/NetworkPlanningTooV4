@@ -33,6 +33,7 @@ from app.algorithms.neighbor_planning_v1_service import (
     run_neighbor_planning,
 )
 from app.services.data_service import data_service, is_full_params_filename
+from app.utils.file_integrity import save_workbook_atomic
 
 
 class TaskType(str, Enum):
@@ -2787,7 +2788,9 @@ class TaskManager:
                     total_updated += sheet_updated
                     _logger.info(f"[ExcelSync] 工作表 '{sheet_name}': 更新 {sheet_updated} 个单元格")
 
-                wb.save(file_path)
+                # 必须原子替换：原地 wb.save() 写出期间文件是半截 zip，并发读取
+                # （下载 / 数据集打包 / 导入）会报「Cannot detect file format」
+                save_workbook_atomic(wb, file_path)
                 wb.close()
 
                 # 标记 Excel 已同步
@@ -2960,7 +2963,8 @@ class TaskManager:
                         row[tac_col_idx].value = int(new_tac) if new_tac.isdigit() else new_tac
                         tac_updated += 1
 
-            wb.save(new_excel_path)
+            # 原地更新时 new_excel_path 就是权威文件，必须原子替换
+            save_workbook_atomic(wb, new_excel_path)
             wb.close()
             parts = []
             if pci_updated:
@@ -3426,7 +3430,7 @@ class TaskManager:
                 else:
                     _logger.warning(f"[SyncApplyTAC-Background] 未找到必要列: siteId={site_id_col}, sectorId={sector_id_col}, tac={tac_col}")
 
-                wb.save(new_excel_path)
+                save_workbook_atomic(wb, new_excel_path)
                 _logger.info(f"[SyncApplyTAC-Background] Excel已保存: {new_excel_path}")
                 # 标记 Excel 已同步，下载端点可跳过重复的 openpyxl 同步
                 if new_data_id in data_service.index:

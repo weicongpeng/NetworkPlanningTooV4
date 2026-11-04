@@ -22,6 +22,7 @@ from app.core.database import SessionLocal
 from app.models.database import Workbook, Site, Sector, GeoFile, Layer, StationParamRow, StationMetricRow
 from app.models.schemas import DataItem, DataType, DataStatus, SiteData
 from app.utils.excel_columns import dedupe_column_names
+from app.utils.file_integrity import save_workbook_atomic
 
 # 设置stdout编码为utf-8，避免Windows下GBK编码问题
 if sys.platform == "win32":
@@ -1606,9 +1607,9 @@ class DataService:
             except (ValueError, TypeError):
                 pass
 
-        # 6. 追加行并保存 Excel
+        # 6. 追加行并保存 Excel（原子替换，避免并发读取拿到半截 zip）
         ws.append(new_row)
-        wb.save(excel_path)
+        save_workbook_atomic(wb, excel_path)
         wb.close()
         safe_print(f"[DataService] Excel 已保存: {excel_path}")
 
@@ -2095,9 +2096,9 @@ class DataService:
             wb.close()
             raise
 
-        # 4. 一次性保存 Excel
+        # 4. 一次性保存 Excel（原子替换，避免并发读取拿到半截 zip）
         try:
-            wb.save(excel_path)
+            save_workbook_atomic(wb, excel_path)
             safe_print(f"[DataService] 批量 Excel 已保存: {excel_path}")
         except Exception as e:
             wb.close()
@@ -2748,7 +2749,7 @@ class DataService:
             wb = openpyxl.load_workbook(excel_path)
             try:
                 self._apply_excel_updates(wb, updates, deletes, results)
-                wb.save(excel_path)
+                save_workbook_atomic(wb, excel_path)
             except Exception as e:
                 excel_error = str(e)[:200]
                 raise
