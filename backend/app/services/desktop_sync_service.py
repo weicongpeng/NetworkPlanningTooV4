@@ -645,12 +645,17 @@ def sync_tasks(city: str, operator: str) -> Dict[str, Any]:
             if server_cell_count is not None and int(row.cell_count or 0) != int(server_cell_count):
                 row.cell_count = int(server_cell_count)
                 changed_ids.append(task_id)
-            # 应用标记：服务器置 1 → 本机同步为 1；本机已置 1 而服务器仍是 0
-            # （旧版服务器上行时丢过 is_applied）→ 不回落，改为把本机标记上行
-            # （服务器单调置位）。「已应用」无撤销语义，本机知道的比服务器新。
+            # 应用标记：镜像行以服务器为准（服务器按当前工参动态判定，与网页端列表同口径，
+            # 本机没有结果时无法自行判定）；本机任务沿用「服务器置 1 → 本机 1；本机 1 而
+            # 服务器 0 → 把本机标记上行」（旧版服务器上行时丢过 is_applied）。
             if task_id not in pending_updates:
                 new_flag = 1 if server_applied else 0
-                if new_flag == 1 and int(row.is_applied or 0) != 1:
+                if row.origin == "shared":
+                    if int(row.is_applied or 0) != new_flag:
+                        row.is_applied = new_flag
+                        summary["updated"] += 1
+                        changed_ids.append(task_id)
+                elif new_flag == 1 and int(row.is_applied or 0) != 1:
                     row.is_applied = 1
                     summary["updated"] += 1
                     changed_ids.append(task_id)

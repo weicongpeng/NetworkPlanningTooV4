@@ -131,3 +131,35 @@ def test_export_skips_unfinished_history_task(temp_db):
 
     assert task_manager.get_task_status("t-unfinished") == "processing"
     assert task_manager.export_result("t-unfinished", "xlsx") is None
+
+
+# ---------------------------------------------------------------- 已应用口径
+
+def test_shared_task_manifest_uses_dynamic_applied_state(temp_db):
+    """清单里的 is_applied 必须是动态判定结果，而不是可能过期的存储标记。"""
+    _seed_params(temp_db, pci=486)          # 工参里的 PCI 已经是规划值
+    _add_task(temp_db, is_applied=0)        # 存储标记仍是「未应用」
+
+    items = task_manager.list_shared_tasks(CITY, OPERATOR)
+    item = next(i for i in items if i["task_id"] == "t-shared-1")
+    assert item["is_applied"] is True
+
+    # 工参被改成别的值 → 同一任务必须翻回「未应用」（两端同口径）
+    db = temp_db()
+    try:
+        db.query(Sector).filter(Sector.workbook_id == WB_ID).update({"pci": 1})
+        db.commit()
+    finally:
+        db.close()
+    TaskManager._sector_values_cache = {}
+    items = task_manager.list_shared_tasks(CITY, OPERATOR)
+    item = next(i for i in items if i["task_id"] == "t-shared-1")
+    assert item["is_applied"] is False
+
+
+def test_shared_task_manifest_falls_back_to_flag_without_values(temp_db):
+    """没有紧凑规划值（邻区/核查等）时沿用同步标记，不能凭空判成未应用。"""
+    _add_task(temp_db, task_id="t-neighbor", is_applied=1, applied_values={})
+    items = task_manager.list_shared_tasks(CITY, OPERATOR)
+    item = next(i for i in items if i["task_id"] == "t-neighbor")
+    assert item["is_applied"] is True

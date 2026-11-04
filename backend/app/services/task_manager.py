@@ -3630,9 +3630,20 @@ class TaskManager:
                 .all()
             )
             items = []
+            current_values = None
             for row, result_size in rows:
                 meta = self._shared_task_meta(row)
                 meta["result_size"] = int(result_size) if result_size is not None else 0
+                # 与网页端历史列表同口径：有紧凑规划值时按**当前工参**动态判定，
+                # 否则沿用同步标记。镜像行本机没有结果无法自行判定，靠这个值显示
+                # 「已应用」；只发存储标记会让两端状态长期不一致（换过工参后尤其明显）。
+                applied_values = self._load_meta_json(getattr(row, "applied_values_json", None))
+                if applied_values:
+                    if current_values is None:
+                        current_values = self._load_current_sector_values(
+                            db, city=city, operator=operator
+                        )
+                    meta["is_applied"] = self._verify_applied_values(applied_values, current_values)
                 items.append(meta)
             return items
         finally:

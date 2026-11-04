@@ -372,10 +372,13 @@ def test_sync_tasks_prunes_pushed_local_task_deleted_remotely(desktop_task_env, 
 
 
 def test_sync_tasks_syncs_applied_flag_both_ways(desktop_task_env, temp_db):
-    """已应用标记双向同步：服务器置 1 → 本机显示；本机为 1 而服务器是 0 → 不回落并上行修复。
+    """已应用标记双向同步。
 
-    「已应用」无撤销语义：服务器为 0 只代表"从没应用过"（旧版服务器还会丢这个标记），
-    本机为 1 时以本机为准，把 1 上行到服务器（单调置位）。
+    - 镜像行（origin=shared）：以服务器清单为准，**两个方向都跟随**——清单里的
+      is_applied 是服务器按当前工参动态判定的有效状态，镜像行本机没有结果无法自行判定，
+      只按「单调置位」会让两端图标长期不一致（工参换过/改过之后）；
+    - 本机任务（origin=local）：服务器为 0 而本机为 1 → 不回落并把标记上行
+      （旧版服务器上行时会丢这个标记，本机知道自己应用过）。
     """
     sync = desktop_task_env
     from app.services import desktop_cloud_client as cloud
@@ -411,8 +414,8 @@ def test_sync_tasks_syncs_applied_flag_both_ways(desktop_task_env, temp_db):
         finally:
             db.close()
 
-        # 服务器丢失标记（旧版服务器忽略 is_applied / 库里被清 0）：
-        # 本机不回落，并把本机「已应用」重新上行
+        # 服务器把标记算回 0（工参已变 / 旧版服务器丢标记）：
+        # 镜像行跟随服务器（与网页端图标一致），本机任务不回落并把标记重新上行
         server["items"]["t-mirror"]["is_applied"] = False
         server["items"]["t-local"]["is_applied"] = False
         sync.sync_tasks("河源", "联通")
@@ -421,11 +424,11 @@ def test_sync_tasks_syncs_applied_flag_both_ways(desktop_task_env, temp_db):
         try:
             mirror = db.query(TaskResult).filter(TaskResult.task_id == "t-mirror").first()
             local = db.query(TaskResult).filter(TaskResult.task_id == "t-local").first()
-            assert mirror is not None and int(mirror.is_applied) == 1
+            assert mirror is not None and int(mirror.is_applied) == 0
             assert local is not None and int(local.is_applied) == 1
         finally:
             db.close()
-        assert server["items"]["t-mirror"]["is_applied"] is True
+        assert server["items"]["t-mirror"]["is_applied"] is False
         assert server["items"]["t-local"]["is_applied"] is True
     finally:
         monkeypatch_.undo()
