@@ -107,14 +107,15 @@ async def export_pci_result(task_id: str, format: str = "xlsx", _group=Depends(r
     from fastapi.responses import FileResponse
     from starlette.concurrency import run_in_threadpool
 
-    # 检查任务是否存在（只取元数据，避免为状态判断加载完整结果）
-    task_data = task_manager.get_task_progress_meta(task_id)
-    if task_data is None:
+    # 检查任务是否存在（只取状态，避免为状态判断加载完整结果）。
+    # 必须回退到 SQLite：桌面端共享模式的镜像任务只在 task_results 里，不在内存 tasks
+    status = task_manager.get_task_status(task_id)
+    if status is None:
         raise HTTPException(status_code=404, detail="任务不存在")
 
     # 检查任务是否完成
-    if task_data.get("status") != "completed":
-        raise HTTPException(status_code=400, detail=f"任务未完成（当前状态: {task_data.get('status', '未知')}）")
+    if status != "completed":
+        raise HTTPException(status_code=400, detail=f"任务未完成（当前状态: {status}）")
 
     # 执行导出
     file_path = await run_in_threadpool(task_manager.export_result, task_id, format)

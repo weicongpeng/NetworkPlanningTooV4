@@ -4701,20 +4701,27 @@ class TaskManager:
             return False
 
     def export_result(self, task_id: str, format: str = "xlsx") -> Optional[str]:
-        """导出任务结果"""
+        """导出任务结果（内存任务优先；历史任务与桌面端镜像任务回退到 SQLite/服务器）"""
         task = self.tasks.get(task_id)
-        if task is None:
-            logger.warning(f"[TaskManager] 导出失败: 任务 {task_id[:8]}... 不存在")
-            return None
-        if task.status != TaskStatus.COMPLETED:
-            logger.warning(f"[TaskManager] 导出失败: 任务 {task_id[:8]}... 未完成 (status={task.status.value})")
-            return None
-        self._ensure_result(task)
-        if task.result is None:
-            logger.warning(f"[TaskManager] 导出失败: 任务 {task_id[:8]}... 已完成但结果数据为空，可能是不完整的历史任务")
-            return None
+        if task is not None:
+            if task.status != TaskStatus.COMPLETED:
+                logger.warning(f"[TaskManager] 导出失败: 任务 {task_id[:8]}... 未完成 (status={task.status.value})")
+                return None
+            self._ensure_result(task)
+            if task.result is None:
+                logger.warning(f"[TaskManager] 导出失败: 任务 {task_id[:8]}... 已完成但结果数据为空，可能是不完整的历史任务")
+                return None
+            task_type = task.task_type
+            task_result = task.result
+        else:
+            # 历史任务（同组共享的历史规划 / 桌面端镜像行）不在内存 tasks 里：
+            # 类型与状态取自 task_results，结果按需装载（镜像任务会向服务器拉取并缓存）
+            task_type, task_result = self._load_export_source(task_id)
+            if task_type is None or task_result is None:
+                logger.warning(f"[TaskManager] 导出失败: 任务 {task_id[:8]}... 不存在或结果不可用")
+                return None
 
-        logger.info(f"[TaskManager] 开始导出任务 {task_id[:8]}... type={task.task_type.value}, format={format}, networkType={task.result.get('networkType', 'N/A')}")
+        logger.info(f"[TaskManager] 开始导出任务 {task_id[:8]}... type={getattr(task_type, 'value', task_type)}, format={format}, networkType={task_result.get('networkType', 'N/A')}")
 
         try:
             import pandas as pd
@@ -4725,10 +4732,10 @@ class TaskManager:
             output_file.parent.mkdir(parents=True, exist_ok=True)
 
             # 根据任务类型导出
-            if task.task_type == TaskType.PCI:
+            if task_type == TaskType.PCI:
                 # PCI规划结果导出
                 data = []
-                for site_result in task.result.get("results", []):
+                for site_result in task_result.get("results", []):
                     site_id = site_result.get("siteId", "")
                     site_name = site_result.get("siteName", "")
 
@@ -4793,11 +4800,11 @@ class TaskManager:
                 logger.info(f"[TaskManager] PCI导出: 共 {len(data)} 行数据")
                 df = pd.DataFrame(data)
 
-            elif task.task_type == TaskType.NEIGHBOR:
+            elif task_type == TaskType.NEIGHBOR:
                 # 邻区规划结果导出 (扁平化结构)
                 data = []
-                if task.result:
-                    for result in task.result.get("results", []):
+                if task_result:
+                    for result in task_result.get("results", []):
                         data.append(
                             {
                                 "关系类型": result.get("relationType", ""),
@@ -4819,11 +4826,11 @@ class TaskManager:
                 logger.info(f"[TaskManager] 邻区导出: 共 {len(data)} 行数据")
                 df = pd.DataFrame(data)
 
-            elif task.task_type in [TaskType.TAC, TaskType.TAC_PLANNING]:
+            elif task_type in [TaskType.TAC, TaskType.TAC_PLANNING]:
                 # TAC结果导出 (核查和规划共用)
                 data = []
-                if task.result:
-                    for result in task.result.get("results", []):
+                if task_result:
+                    for result in task_result.get("results", []):
                         tac_planned = str(result.get("tac") or "").strip()
                         tac_existing = str(result.get("existingTac") or "").strip()
 
@@ -4852,7 +4859,7 @@ class TaskManager:
                 df = pd.DataFrame(data)
 
             else:
-                raise ValueError(f"未知的任务类型: {task.task_type}")
+                raise ValueError(f"未知的任务类型: {task_type}")
 
             if format == "xlsx":
                 df.to_excel(output_file, index=False, engine="openpyxl")
@@ -4866,8 +4873,59 @@ class TaskManager:
             return str(output_file)
 
         except Exception as e:
-            logger.error(f"[TaskManager] 导出失败: task_id={task_id[:8]}..., type={task.task_type.value}, error={e}", exc_info=True)
+            logger.error(f"[TaskManager] 导出失败: task_id={task_id[:8]}..., type={getattr(task_type, 'value', task_type)}, error={e}", exc_info=True)
             return None
+
+    def get_task_status(self, task_id: str) -> Optional[str]:
+        """任务状态：内存优先，其次 task_results（历史任务 / 桌面端镜像行），不加载结果。"""
+        task = self.tasks.get(task_id)
+        if task is not None:
+            return getattr(task.status, "value", str(task.status))
+        try:
+            from app.core.database import SessionLocal
+            from app.models.database import TaskResult
+
+            db = SessionLocal()
+            try:
+                row = db.query(TaskResult.status).filter(TaskResult.task_id == task_id).first()
+            finally:
+                db.close()
+            return (row[0] or None) if row is not None else None
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"[TaskManager] 读取任务状态失败 {task_id[:8]}: {exc}")
+            return None
+
+    def _load_export_source(self, task_id: str) -> tuple:
+        """内存里没有的任务：类型/状态取 task_results，结果按需装载。
+
+        桌面端共享模式的镜像任务（origin='shared'）只有元数据行，结果由
+        get_task_result 向服务器拉取并缓存后再导出。
+        """
+        try:
+            from app.core.database import SessionLocal
+            from app.models.database import TaskResult
+
+            db = SessionLocal()
+            try:
+                row = (
+                    db.query(TaskResult.task_type, TaskResult.status)
+                    .filter(TaskResult.task_id == task_id)
+                    .first()
+                )
+            finally:
+                db.close()
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"[TaskManager] 读取历史任务元数据失败 {task_id[:8]}: {exc}")
+            return None, None
+        if row is None or (row[1] or "") != "completed":
+            return None, None
+        type_value = row[0] or ""
+        try:
+            task_type = TaskType(type_value)
+        except ValueError:
+            logger.warning(f"[TaskManager] 导出失败: 未支持导出该任务类型 {type_value} ({task_id[:8]})")
+            return None, None
+        return task_type, (self.get_task_result(task_id) or None)
 
     def cleanup_old_tasks(self):
         """清理旧任务"""
