@@ -877,3 +877,32 @@ def test_repair_stale_params_repulls_when_server_applied_but_local_missing(
     )
 
     assert pulled == [wb_id]
+
+
+def test_backfill_ignores_cells_absent_from_work_params(temp_db, monkeypatch):
+    """存量回填与列表同口径：规划结果里不在工参的小区剔除后再判定。"""
+    db = temp_db()
+    try:
+        db.add(TaskResult(**_task_row(task_id="t-mixed", result_json=json.dumps({
+            "results": [
+                {"siteId": "S1", "sectorId": "1", "tac": 100},
+                {"siteId": "S9", "sectorId": "99", "tac": 777},   # 不在工参内 → 剔除
+            ],
+        }))))
+        db.commit()
+    finally:
+        db.close()
+
+    monkeypatch.setattr(
+        type(task_manager),
+        "_load_current_sector_values",
+        staticmethod(lambda db, city=None, operator=None: {"S1_1": {"pci": 10, "tac": 100}}),
+    )
+    assert task_manager.backfill_applied_flags() == 1
+
+    db = temp_db()
+    try:
+        flags = {r.task_id: int(r.is_applied or 0) for r in db.query(TaskResult).all()}
+    finally:
+        db.close()
+    assert flags == {"t-mixed": 1}

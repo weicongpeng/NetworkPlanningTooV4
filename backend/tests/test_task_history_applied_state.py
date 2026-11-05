@@ -223,12 +223,11 @@ def test_mirror_row_applied_state_uses_result_when_available(params_db):
     assert _applied_of("t-mirror") is False
 
 
-def test_mirror_row_keeps_synced_flag_when_local_params_missing(params_db):
-    """镜像行本机工参缺 PCI（同步未落地）时不能判成未应用 → 沿用服务器下发值。
+def test_mirror_row_follows_work_params_like_local_tasks(params_db):
+    """镜像行与本机任务同口径：按本机工参判定，工参同步回来后状态跟着变。
 
-    场景（2026-11-04 用户报）：网页端应用后 PCI 已写入服务器工参，桌面端本机
-    工参还是旧副本（该小区 PCI 为空），历史列表却显示未应用。镜像任务的结果与
-    应用都在服务器侧完成，本机缺值时属于"无法判定"，应回退服务器值。
+    2026-11-04 桌面端工参副本落后由 sync_tasks 自动补拉修复；列表展示一律以
+    当前工参为准，不再用服务器下发的标记兜底（新口径）。
     """
     _seed_work_params(params_db)
     _add_pci_task(
@@ -237,18 +236,63 @@ def test_mirror_row_keeps_synced_flag_when_local_params_missing(params_db):
     )
     assert _applied_of("t-mirror-missing") is True
 
-    # 本机工参 PCI 为空（尚未同步到应用后的版本）→ 仍沿用服务器值
+    # 本机工参 PCI 为空（副本尚未同步）→ 小区在工参里但值不一致 → 未应用
     db = params_db()
     try:
         db.query(Sector).filter(Sector.workbook_id == WB_ID).update({"pci": None})
         db.commit()
     finally:
         db.close()
+    assert _applied_of("t-mirror-missing") is False
+
+    # 工参补拉完成（PCI 回到 486）→ 已应用
+    _rewrite_work_params(params_db, pci=486)
     assert _applied_of("t-mirror-missing") is True
 
-    # 本机工参有值但不一致 → 以本机为准（不能把"真的没应用"说成已应用）
-    _rewrite_work_params(params_db, pci=100)
-    assert _applied_of("t-mirror-missing") is False
+
+def test_applied_state_ignores_cells_absent_from_work_params(params_db):
+    """规划结果里含「已从工参删除/不在工参」的小区时剔除，只比对工参内的小区。"""
+    _seed_work_params(params_db)
+    _add_pci_task(params_db, task_id="t-mixed", result={"results": [{
+        "siteId": "S1",
+        "sectors": [
+            {"sectorId": "32", "newPCI": 486, "tac": "33807"},   # 工参内，一致
+            {"sectorId": "99", "newPCI": 300, "tac": "12345"},   # 工参内不存在 → 剔除
+        ],
+    }]})
+    assert _applied_of("t-mixed") is True
+
+    # 工参内的小区 PCI 变了 → 未应用
+    _rewrite_work_params(params_db, pci=487)
+    assert _applied_of("t-mixed") is False
+
+
+def test_applied_state_false_when_present_cell_has_empty_pci(params_db):
+    """小区在工参里但 PCI 为空，不能被当成「不存在」剔除后误判已应用。"""
+    _seed_work_params(params_db)
+    _add_pci_task(params_db, task_id="t-empty-pci", result={"results": [{
+        "siteId": "S1",
+        "sectors": [
+            {"sectorId": "32", "newPCI": 486},
+            {"sectorId": "99", "newPCI": 300},
+        ],
+    }]})
+    db = params_db()
+    try:
+        db.query(Sector).filter(Sector.workbook_id == WB_ID).update({"pci": None})
+        db.commit()
+    finally:
+        db.close()
+    assert _applied_of("t-empty-pci") is False
+
+
+def test_applied_state_false_when_all_cells_absent(params_db):
+    """规划小区全都不在工参里 → 无可比小区，保守判未应用。"""
+    _seed_work_params(params_db)
+    _add_pci_task(params_db, task_id="t-all-absent", result={"results": [{
+        "siteId": "S9", "sectors": [{"sectorId": "99", "newPCI": 300, "tac": "12345"}],
+    }]})
+    assert _applied_of("t-all-absent") is False
 
 
 def test_result_without_comparable_values_keeps_synced_flag(params_db):

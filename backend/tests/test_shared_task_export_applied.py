@@ -163,3 +163,34 @@ def test_shared_task_manifest_falls_back_to_flag_without_values(temp_db):
     items = task_manager.list_shared_tasks(CITY, OPERATOR)
     item = next(i for i in items if i["task_id"] == "t-neighbor")
     assert item["is_applied"] is True
+
+
+def test_shared_task_manifest_ignores_cells_absent_from_work_params(temp_db):
+    """清单动态判定同样剔除不在工参内的小区（与网页端列表同口径）。"""
+    _seed_params(temp_db, pci=486)
+    _add_task(
+        temp_db, task_id="t-mixed", is_applied=0,
+        applied_values={"S1_32": [486, "33807"], "S9_99": [300, "12345"]},
+    )
+    items = task_manager.list_shared_tasks(CITY, OPERATOR)
+    assert next(i for i in items if i["task_id"] == "t-mixed")["is_applied"] is True
+
+    # 工参内的小区值变了 → 未应用（不在工参里的小区不影响结论）
+    db = temp_db()
+    try:
+        db.query(Sector).filter(Sector.workbook_id == WB_ID).update({"pci": 1})
+        db.commit()
+    finally:
+        db.close()
+    TaskManager._sector_values_cache = {}
+    items = task_manager.list_shared_tasks(CITY, OPERATOR)
+    assert next(i for i in items if i["task_id"] == "t-mixed")["is_applied"] is False
+
+
+def test_shared_task_manifest_false_when_all_cells_absent(temp_db):
+    """规划小区全都不在工参里 → 无可比小区，保守判未应用。"""
+    _seed_params(temp_db, pci=486)
+    _add_task(temp_db, task_id="t-absent", is_applied=1,
+              applied_values={"S9_99": [300, "12345"]})
+    items = task_manager.list_shared_tasks(CITY, OPERATOR)
+    assert next(i for i in items if i["task_id"] == "t-absent")["is_applied"] is False

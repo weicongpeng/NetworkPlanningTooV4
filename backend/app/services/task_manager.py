@@ -3649,16 +3649,17 @@ class TaskManager:
             for row, result_size in rows:
                 meta = self._shared_task_meta(row)
                 meta["result_size"] = int(result_size) if result_size is not None else 0
-                # 与网页端历史列表同口径：有紧凑规划值时按**当前工参**动态判定，
-                # 否则沿用同步标记。镜像行本机没有结果无法自行判定，靠这个值显示
-                # 「已应用」；只发存储标记会让两端状态长期不一致（换过工参后尤其明显）。
+                # 与网页端历史列表同口径：有紧凑规划值时按**当前工参**动态判定
+                # （剔除不在工参内的小区），否则沿用同步标记。镜像行本机没有结果
+                # 无法自行判定，靠这个值显示「已应用」。
                 applied_values = self._load_meta_json(getattr(row, "applied_values_json", None))
                 if applied_values:
                     if current_values is None:
                         current_values = self._load_current_sector_values(
                             db, city=city, operator=operator
                         )
-                    meta["is_applied"] = self._verify_applied_values(applied_values, current_values)
+                    verdict = self._compare_applied_values(applied_values, current_values)
+                    meta["is_applied"] = bool(verdict) if verdict is not None else False
                 items.append(meta)
             return items
         finally:
@@ -4026,12 +4027,9 @@ class TaskManager:
 
                 task_list = []
                 for r in results:
-                    # 「已应用」优先用紧凑规划值对照当前工参；无规划值的结果沿用同步标记。
-                    # 镜像行（origin=shared）的结果与应用都发生在服务器侧，本机工参只是
-                    # 副本：本机缺该小区/PCI 为空时无法判定，回退服务器清单下发的动态值，
-                    # 否则本机工参落后就会两端永久分歧（桌面端显示未应用、地图 PCI 为空）。
+                    # 「已应用」按当前工参判定：剔除不在工参内的小区，只对工参里存在的
+                    # 小区比对 PCI/TAC；无紧凑规划值的结果沿用同步标记。
                     stored_applied = bool(getattr(r, "is_applied", 0))
-                    is_shared_mirror = (getattr(r, "origin", "local") or "local") == "shared"
                     result_summary, applied_values = meta_map.get(r.task_id, (None, None))
                     is_applied = stored_applied
                     if applied_values:
@@ -4039,13 +4037,9 @@ class TaskManager:
                             current_sector_values = self._load_current_sector_values(
                                 db, city=_grp[0], operator=_grp[1]
                             )
-                        if is_shared_mirror:
-                            local_verdict = self._verify_applied_values_local(
-                                applied_values, current_sector_values
-                            )
-                            is_applied = stored_applied if local_verdict is None else local_verdict
-                        else:
-                            is_applied = self._verify_applied_values(applied_values, current_sector_values)
+                        verdict = self._compare_applied_values(applied_values, current_sector_values)
+                        # 规划小区全都不在工参里时保守判未应用，不能凭空变成「已应用」
+                        is_applied = bool(verdict) if verdict is not None else False
                     if result_summary is None and (r.cell_count or 0) > 0:
                         # 同组镜像任务（本机无 result_json）：用同步来的小数量生成最小摘要，
                         # 否则桌面端历史列表「小区数量」列恒为 '-'
@@ -4200,15 +4194,11 @@ class TaskManager:
             Sector.id
         ).all()
         for row in rows:
-            # 标识归一化：保证「32.0」与「32」这两种写法命中同一个键
+            # 标识归一化：保证「32.0」与「32」这两种写法命中同一个键。
+            # 即使 PCI/TAC 都为空也要收录该小区：列表判定时要能区分
+            # 「小区不在工参里」（剔除）与「小区在工参里但参数为空」（判未应用）。
             key = f"{TaskManager._norm_cell_id(row.site_id)}_{TaskManager._norm_cell_id(row.sector_id)}"
-            rec = {}
-            if row.pci is not None:
-                rec["pci"] = row.pci
-            if row.tac is not None:
-                rec["tac"] = row.tac
-            if rec:
-                values[key] = rec
+            values[key] = {"pci": row.pci, "tac": row.tac}
 
         # 🔥 写入缓存，并清除原地更新信号（表示已消费该次变更）
         if full_params_id in data_service.index:
@@ -4226,61 +4216,15 @@ class TaskManager:
 
     @staticmethod
     def _verify_applied(result: Dict, current_values: Dict[str, Dict]) -> bool:
-        """检查任务结果中的 PCI/TAC 是否与当前全量工参的实际值一致
+        """启动回填用的入口：把完整结果转成紧凑规划值后，按列表统一口径判定。
 
-        🔥 优化：直接接收已解析的 result dict，避免在历史列表循环中重复 json.loads
+        统一走 `_compare_applied_values`（剔除不在工参内的小区），避免回填的
+        is_applied 标记与历史列表的动态判定给出不同答案。
         """
-        try:
-            task_results = result.get("results", [])
-            if not task_results:
-                return True  # 无规划结果，视为一致
-
-            # 兼容两种格式：
-            # 嵌套格式（PCI规划）: results = [{siteId, sectors: [{sectorId, newPCI, tac}]}]
-            # 扁平格式（TAC核查/规划）: results = [{siteId, sectorId, tac, ...}]
-            first = task_results[0]
-            is_nested = "sectors" in first
-
-            if is_nested:
-                # 嵌套格式（PCI规划）
-                for site_result in task_results:
-                    site_id = str(site_result.get("siteId", ""))
-                    for sector in site_result.get("sectors", []):
-                        sector_id = str(sector.get("sectorId", ""))
-                        key = f"{TaskManager._norm_cell_id(site_id)}_{TaskManager._norm_cell_id(sector_id)}"
-                        cur = current_values.get(key)
-                        if cur is None:
-                            return False
-                        new_pci = sector.get("newPCI")
-                        if new_pci is not None and not TaskManager._same_param_value(cur.get("pci"), new_pci):
-                            return False
-                        new_tac = sector.get("tac")
-                        if new_tac is not None:
-                            cur_tac = cur.get("tac")
-                            if cur_tac is None:
-                                return False
-                            if not TaskManager._same_param_value(cur_tac, new_tac):
-                                return False
-            else:
-                # 扁平格式（TAC核查/TAC规划）
-                for item in task_results:
-                    site_id = str(item.get("siteId", ""))
-                    sector_id = str(item.get("sectorId", ""))
-                    key = f"{TaskManager._norm_cell_id(site_id)}_{TaskManager._norm_cell_id(sector_id)}"
-                    cur = current_values.get(key)
-                    if cur is None:
-                        return False
-                    new_tac = item.get("tac") or item.get("suggestedTac")
-                    if new_tac is not None:
-                        cur_tac = cur.get("tac")
-                        if cur_tac is None:
-                            return False
-                        if not TaskManager._same_param_value(cur_tac, new_tac):
-                            return False
-
-            return True
-        except Exception:
+        values = TaskManager._extract_applied_values(result)
+        if not values:
             return False
+        return TaskManager._compare_applied_values(values, current_values) is True
 
     @staticmethod
     def _extract_cell_count(result: Optional[Dict]) -> Optional[int]:
@@ -4347,8 +4291,8 @@ class TaskManager:
     def _result_has_comparable_values(result: Optional[Dict]) -> bool:
         """结果里是否至少有一个可比较的 PCI/TAC 值。
 
-        `_verify_applied` 对"没有 results"的结果直接返回 True（视为一致），
-        回填时必须先用本函数挡住这种情况，避免把无可比值的任务误标为已应用。
+        回填时必须先用本函数挡住空 results / 无参数值的结果，避免把无可比值的
+        任务误标为已应用。
         """
         if not isinstance(result, dict):
             return False
@@ -4468,7 +4412,11 @@ class TaskManager:
 
     @staticmethod
     def _verify_applied_values(values: Dict[str, list], current_values: Dict[str, Dict]) -> bool:
-        """用压缩值映射比对当前工参；语义与 _verify_applied 一致（严格口径）。"""
+        """严格比对：任一规划小区不在当前工参里即判未应用。
+
+        仅用于检测「本机工参副本是否落后」（桌面端自动补拉），不是列表展示口径：
+        列表展示用 `_compare_applied_values`，会剔除不在工参内的小区。
+        """
         if not values:
             return False
         for key, pair in values.items():
@@ -4484,32 +4432,32 @@ class TaskManager:
         return True
 
     @staticmethod
-    def _verify_applied_values_local(
+    def _compare_applied_values(
         values: Dict[str, list], current_values: Dict[str, Dict]
     ) -> Optional[bool]:
-        """本机镜像行的宽松判定：本机工参缺小区/缺 PCI 时返回 None（无从判定）。
+        """历史任务「已应用」判定口径：剔除不在当前工参内的小区，只比对工参里存在的小区。
 
-        镜像任务的结果与应用都在服务器侧完成，本机工参只是副本。换工参后本机
-        可能还没有这些小区或 PCI 为空（同步未落地），严格比对会把"无法判定"
-        当成"未应用"——两端状态长期不一致。返回 None 时调用方沿用服务器下发的值。
+        - 存在的小区 PCI/TAC 全部与规划值一致 → True（已应用）
+        - 存在的小区任一不一致（含工参里该参数为空）→ False（未应用）
+        - 规划小区全都不在工参里 → None（无可比小区，调用方保守判未应用）
+
+        Why：规划结果常含已从工参删除/新建后未同步的小区，若把「小区不存在」也当作
+        「未应用」，整条任务会永远显示未应用，即使工参内的小区确实已按规划改过。
         """
         if not values:
-            return False
+            return None
         comparable = 0
         for key, pair in values.items():
             current = current_values.get(key)
             if current is None:
-                continue
+                continue  # 该小区不在当前工参内 → 剔除，不参与判定
+            comparable += 1
             pci = pair[0] if isinstance(pair, list) and len(pair) > 0 else None
             tac = pair[1] if isinstance(pair, list) and len(pair) > 1 else None
-            if pci is not None and current.get("pci") is not None:
-                comparable += 1
-                if not TaskManager._same_param_value(current.get("pci"), pci):
-                    return False
-            if tac is not None and current.get("tac") is not None:
-                comparable += 1
-                if not TaskManager._same_param_value(current.get("tac"), tac):
-                    return False
+            if pci is not None and not TaskManager._same_param_value(current.get("pci"), pci):
+                return False
+            if tac is not None and not TaskManager._same_param_value(current.get("tac"), tac):
+                return False
         return True if comparable else None
 
     @staticmethod
