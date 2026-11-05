@@ -813,3 +813,67 @@ def test_backfill_applied_flags_marks_matching_results(temp_db, monkeypatch):
     finally:
         db.close()
     assert flags == {"t-ok": 1, "t-diff": 0, "t-nb": 0}
+
+
+def test_repair_stale_params_repulls_when_server_applied_but_local_missing(
+    temp_db, tmp_path, monkeypatch
+):
+    """服务器已应用、本机工参缺值 → 主动补拉全量工参（两端永久分叉的自愈）。
+
+    历史根因：打包曾在 Excel 回写完成前发旧文件，对端记下新修订号后不再重拉，
+    本机工参永远停在应用前（地图 PCI 为空、历史任务显示未应用）。
+    """
+    from app.core.config import settings
+    from app.services import desktop_sync_service as sync
+    from app.services.data_service import data_service
+
+    monkeypatch.setattr(settings, "PROFILE_ROOT", tmp_path, raising=False)
+
+    wb_id = "wb-stale-params"
+    db = temp_db()
+    try:
+        db.add(Workbook(
+            id=wb_id, user_id=1, city="河源", operator="联通", name="全量工参",
+            file_type="full_params", status="completed", created_at="2026-11-04T00:00:00",
+        ))
+        db.flush()
+        site = Site(
+            workbook_id=wb_id, user_id=1, city="河源", operator="联通",
+            site_id="S1", name="站点S1", network_type="LTE",
+        )
+        db.add(site)
+        db.flush()
+        db.add(Sector(
+            workbook_id=wb_id, user_id=1, site_id_fk=site.id,
+            sector_id="32", pci=None, tac="33807",   # 本机 PCI 尚未同步到应用后的值
+        ))
+        db.add(TaskResult(
+            task_id="t-stale", task_type="pci", task_name="PCI", user_name="bob",
+            status="completed", city="河源", operator="联通",
+            created_at="2026-11-04T09:00:00", origin="shared",
+            applied_values_json=json.dumps({"S1_32": [486, "33807"]}),
+        ))
+        db.commit()
+    finally:
+        db.close()
+
+    monkeypatch.setattr(data_service, "index", {
+        wb_id: {"fileType": "full_params", "city": "河源", "operator": "联通",
+                "uploadDate": "2026-11-04T00:00:00"},
+    })
+    monkeypatch.setattr(
+        TaskManager, "_resolve_full_params_id",
+        staticmethod(lambda city=None, operator=None: wb_id),
+    )
+    TaskManager._sector_values_cache = {}
+    pulled: list = []
+    monkeypatch.setattr(
+        sync, "repair_dataset", lambda did: pulled.append(did) or {"repaired": True}
+    )
+
+    sync._repair_stale_params(
+        "河源", "联通",
+        {"t-stale": {"task_id": "t-stale", "task_type": "pci", "is_applied": True}},
+    )
+
+    assert pulled == [wb_id]

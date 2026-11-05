@@ -59,16 +59,33 @@ def _entry(data_id: str) -> Dict[str, Any]:
 def _ensure_excel_synced(data_id: str, entry: Dict[str, Any]) -> None:
     """SQLite 才是权威：原地更新（应用 PCI/TAC）后必须先把结果反写回 Excel 再打包。
 
-    否则桌面端拿到的会是应用结果之前的旧文件。
+    否则桌面端拿到的是应用结果之前的旧文件。
+
+    ⚠ 判据必须是 `excel_synced`（Excel 是否已回写），**不能**用 `inplace_updated`：
+    后者会被历史列表的工参缓存读取消费（`_load_current_sector_values` 置回 False），
+    而 Excel 回写是应用后的后台任务。应用后只要有人刷新历史列表，标记就变 False，
+    此时按它判断会直接打包旧 Excel —— 对端记下新修订号却拿到旧内容，rev 相同后
+    再也不会重拉（桌面端地图 PCI 为空、历史任务应用状态长期不一致的根因）。
     """
-    if not entry.get("inplace_updated") or entry.get("excel_synced"):
+    if entry.get("excel_synced") is not False:
+        return
+    source = settings.DATA_DIR / data_id / "original.xlsx"
+    if not source.is_file():
+        # 非 xlsx 源（xls/zip）无法回写，沿用旧行为：记录告警后按源文件打包
+        logger.warning(f"[数据集打包] 源文件不是 original.xlsx，无法回写应用结果: {data_id}")
         return
     try:
         from app.services.task_manager import TaskManager
 
         TaskManager._sync_excel_from_sqlite(data_id, logger)
     except Exception as exc:  # noqa: BLE001
-        logger.warning(f"[数据集打包] Excel 反写失败（将打包当前文件）{data_id}: {exc}")
+        # 回写失败绝不能继续打包旧文件：那会让对端把旧内容永久当成新版本
+        raise DatasetPackageError(f"工参回写失败，拒绝打包旧数据（{data_id}）：{exc}") from exc
+    from app.services.data_service import data_service
+
+    if (data_service.index.get(data_id) or {}).get("excel_synced") is not True:
+        # _sync_excel_from_sqlite 内部会吞异常只记日志，这里必须再用标记确认
+        raise DatasetPackageError(f"工参尚未完成数据库回写，请稍后重试（{data_id}）")
 
 
 def _locate_source_file(data_id: str, entry: Dict[str, Any]) -> Path:

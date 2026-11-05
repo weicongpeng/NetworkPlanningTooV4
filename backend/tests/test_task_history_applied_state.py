@@ -103,7 +103,7 @@ _UNSET = object()
 
 
 def _add_pci_task(Session, *, task_id="t-verify-pci", sector_id="32.0", pci=486.0, tac="33807",
-                  result=_UNSET, origin="local"):
+                  result=_UNSET, origin="local", is_applied=0):
     db = Session()
     try:
         payload = {
@@ -117,6 +117,7 @@ def _add_pci_task(Session, *, task_id="t-verify-pci", sector_id="32.0", pci=486.
             status="completed", city="河源", operator="联通",
             created_at="2026-10-10T01:00:00",
             origin=origin,
+            is_applied=is_applied,
             result_json=json.dumps(payload) if payload is not None else None,
         ))
         db.commit()
@@ -220,6 +221,34 @@ def test_mirror_row_applied_state_uses_result_when_available(params_db):
     # 工参再变化 → 立即回到未应用（缓存不能把上一次的结论钉住）
     _rewrite_work_params(params_db, pci=100)
     assert _applied_of("t-mirror") is False
+
+
+def test_mirror_row_keeps_synced_flag_when_local_params_missing(params_db):
+    """镜像行本机工参缺 PCI（同步未落地）时不能判成未应用 → 沿用服务器下发值。
+
+    场景（2026-11-04 用户报）：网页端应用后 PCI 已写入服务器工参，桌面端本机
+    工参还是旧副本（该小区 PCI 为空），历史列表却显示未应用。镜像任务的结果与
+    应用都在服务器侧完成，本机缺值时属于"无法判定"，应回退服务器值。
+    """
+    _seed_work_params(params_db)
+    _add_pci_task(
+        params_db, task_id="t-mirror-missing", origin="shared", is_applied=1,
+        result={"results": [{"siteId": "S1", "sectors": [{"sectorId": "32", "newPCI": 486}]}]},
+    )
+    assert _applied_of("t-mirror-missing") is True
+
+    # 本机工参 PCI 为空（尚未同步到应用后的版本）→ 仍沿用服务器值
+    db = params_db()
+    try:
+        db.query(Sector).filter(Sector.workbook_id == WB_ID).update({"pci": None})
+        db.commit()
+    finally:
+        db.close()
+    assert _applied_of("t-mirror-missing") is True
+
+    # 本机工参有值但不一致 → 以本机为准（不能把"真的没应用"说成已应用）
+    _rewrite_work_params(params_db, pci=100)
+    assert _applied_of("t-mirror-missing") is False
 
 
 def test_result_without_comparable_values_keeps_synced_flag(params_db):

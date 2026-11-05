@@ -41,8 +41,10 @@ export const useDesktopSyncStore = create<DesktopSyncState>((set, get) => ({
           const r = next.last_result || {}
           // 数据集变更 + 同组任务历史变更（镜像新增/上行/删除/应用标记更新）都要通知页面
           const t = r.tasks || {}
+          // 工参副本落后被自动补拉（后端只在本机工参与服务器应用结果不一致时才做）
+          const paramsRepaired = r.params_repaired ? 1 : 0
           const moved =
-            (r.pulled || 0) + (r.pushed || 0) + (r.deleted || 0) +
+            (r.pulled || 0) + (r.pushed || 0) + (r.deleted || 0) + paramsRepaired +
             (t.pulled || 0) + (t.pushed || 0) + (t.deleted || 0) + (t.updated || 0)
           // 镜像任务结果预拉取（results_pulled）只影响历史列表的「已应用」判定，
           // 工参没变：通知历史列表重载即可，不需要整表刷新/提示

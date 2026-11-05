@@ -2545,18 +2545,22 @@ class TaskManager:
         # ====== 核心优化：批量 UPDATE Sector 表（避免 N+1 查询 + LIKE 全表扫描）======
         db = SessionLocal()
         try:
-            # 建立 site_id → 主键 映射
-            site_pk_map = {}
+            # 建立 site_id → 主键列表 映射。
+            # 同一 site_id 可能对应多条 Site 行（历史覆盖上传曾追加写入，见
+            # _save_to_sqlite 的清理逻辑），只取其中一条会让另一份小区永远应用不到。
+            site_pk_map: Dict[str, list] = {}
             for row in db.query(Site).filter(Site.workbook_id == full_params_id).all():
-                site_pk_map[row.site_id] = row.id
+                site_pk_map.setdefault(row.site_id, []).append(row.id)
 
             # 收集所有待更新的 sector（归一化 sector_id，去掉小数点）
             from sqlalchemy import text
             all_updates = []  # [(site_pk, sector_id, {pci, tac})]
+            pci_targets: set = set()  # 按 (siteId, sectorId) 去重计数
+            tac_targets: set = set()
             for site_result in results:
                 result_site_id = str(site_result.get("siteId", ""))
-                site_pk = site_pk_map.get(result_site_id)
-                if site_pk is None:
+                site_pks = site_pk_map.get(result_site_id)
+                if not site_pks:
                     _logger.warning(f"[ApplyPCI-Phase1] 未找到站点 {result_site_id}，跳过")
                     continue
 
@@ -2577,19 +2581,29 @@ class TaskManager:
                     if new_tac is not None:
                         update_vals["tac"] = str(new_tac)
                     if update_vals:
-                        all_updates.append((site_pk, sid, update_vals))
+                        if "pci" in update_vals:
+                            pci_targets.add((result_site_id, sid))
+                        if "tac" in update_vals:
+                            tac_targets.add((result_site_id, sid))
+                        # 同一站点存在多条 Site 行时全部更新（避免只改到其中一份副本）
+                        for site_pk in site_pks:
+                            all_updates.append((site_pk, sid, update_vals))
 
             if not all_updates:
                 _logger.warning("[ApplyPCI-Phase1] 所有站点都未匹配到，跳过更新")
                 db.close()
                 raise ValueError("未能匹配到任何待更新的站点")
 
-            _logger.info(f"[ApplyPCI-Phase1] 准备批量更新 {len(all_updates)} 个小区")
+            _logger.info(
+                f"[ApplyPCI-Phase1] 准备批量更新 "
+                f"{len(pci_targets | tac_targets)} 个小区（{len(all_updates)} 条行更新）"
+            )
 
             # 使用单个 CASE WHEN UPDATE 替代逐条 execute（性能提升 5-10x）
             # 分块以避免 SQLite 参数上限 (SQLITE_MAX_VARIABLE_NUMBER=999)
-            pci_updated = 0
-            tac_updated = 0
+            pci_updated = len(pci_targets)
+            tac_updated = len(tac_targets)
+            matched_rows = 0
             CHUNK = 150  # 每块 ~150 个小区，每个用 5 个参数 (3 for CASE + 2 for IN)
 
             for chunk_start in range(0, len(all_updates), CHUNK):
@@ -2633,13 +2647,7 @@ class TaskManager:
                 all_params = {"wb_id": full_params_id, **in_params, **all_case_params}
 
                 result = db.execute(text(sql), all_params)
-                if result.rowcount:
-                    # 近似计数：按照 chunk 中每个 sector 贡献一个计数
-                    for _, _, vals in chunk:
-                        if "pci" in vals:
-                            pci_updated += 1
-                        if "tac" in vals:
-                            tac_updated += 1
+                matched_rows += int(result.rowcount or 0)
 
             # 更新 workbook 的 created_at 使其排在最前
             db.query(Workbook).filter(Workbook.id == full_params_id).update({
@@ -2649,7 +2657,7 @@ class TaskManager:
             db.commit()
             _logger.info(f"[ApplyPCI-Phase1] 批量更新完成: {pci_updated}个PCI, {tac_updated}个TAC")
 
-            if pci_updated + tac_updated == 0:
+            if matched_rows == 0:
                 raise ValueError("规划结果未匹配到任何小区（0个小区更新），请检查规划小区与全量工参是否一致")
         finally:
             db.close()
@@ -2796,6 +2804,13 @@ class TaskManager:
                 # 标记 Excel 已同步
                 data_service.index[data_id]["excel_synced"] = True
                 data_service._save_index()
+                # 服务器侧：Excel 内容变了要推进修订号，让同组各端重新拉取。
+                # 应用 PCI 时已 bump 过一次，但那次只保证 SQLite 新；源文件回写完成
+                # 之前的包仍是旧内容，若对端在两者之间拉取会拿到旧工参却记下新修订号，
+                # 之后 rev 相同就再也不会重拉（两端应用状态/地图 PCI 长期不一致）。
+                # 桌面端不 bump：本地应用路径已 bump 过，这里只是打包前的兜底回写。
+                if not settings.NPT_DESKTOP:
+                    data_service._bump_revision(data_id)
                 _logger.info(f"[ExcelSync] 完成: {file_path}, 共 {total_updated} 处变更")
 
         except Exception as e:
@@ -4011,8 +4026,12 @@ class TaskManager:
 
                 task_list = []
                 for r in results:
-                    # 「已应用」优先用紧凑规划值对照当前工参；无规划值的结果沿用同步标记
+                    # 「已应用」优先用紧凑规划值对照当前工参；无规划值的结果沿用同步标记。
+                    # 镜像行（origin=shared）的结果与应用都发生在服务器侧，本机工参只是
+                    # 副本：本机缺该小区/PCI 为空时无法判定，回退服务器清单下发的动态值，
+                    # 否则本机工参落后就会两端永久分歧（桌面端显示未应用、地图 PCI 为空）。
                     stored_applied = bool(getattr(r, "is_applied", 0))
+                    is_shared_mirror = (getattr(r, "origin", "local") or "local") == "shared"
                     result_summary, applied_values = meta_map.get(r.task_id, (None, None))
                     is_applied = stored_applied
                     if applied_values:
@@ -4020,7 +4039,13 @@ class TaskManager:
                             current_sector_values = self._load_current_sector_values(
                                 db, city=_grp[0], operator=_grp[1]
                             )
-                        is_applied = self._verify_applied_values(applied_values, current_sector_values)
+                        if is_shared_mirror:
+                            local_verdict = self._verify_applied_values_local(
+                                applied_values, current_sector_values
+                            )
+                            is_applied = stored_applied if local_verdict is None else local_verdict
+                        else:
+                            is_applied = self._verify_applied_values(applied_values, current_sector_values)
                     if result_summary is None and (r.cell_count or 0) > 0:
                         # 同组镜像任务（本机无 result_json）：用同步来的小数量生成最小摘要，
                         # 否则桌面端历史列表「小区数量」列恒为 '-'
@@ -4169,6 +4194,10 @@ class TaskManager:
             Sector, Sector.site_id_fk == Site.id
         ).filter(
             Site.workbook_id == full_params_id
+        ).order_by(
+            # 同一小区存在多行（历史覆盖上传追加写入）时，后写入的行覆盖先写入的：
+            # 主键升序保证最终取到的是最新一次导入/应用的值
+            Sector.id
         ).all()
         for row in rows:
             # 标识归一化：保证「32.0」与「32」这两种写法命中同一个键
@@ -4439,7 +4468,7 @@ class TaskManager:
 
     @staticmethod
     def _verify_applied_values(values: Dict[str, list], current_values: Dict[str, Dict]) -> bool:
-        """用压缩值映射比对当前工参；语义与 _verify_applied 一致。"""
+        """用压缩值映射比对当前工参；语义与 _verify_applied 一致（严格口径）。"""
         if not values:
             return False
         for key, pair in values.items():
@@ -4453,6 +4482,35 @@ class TaskManager:
             if tac is not None and not TaskManager._same_param_value(current.get("tac"), tac):
                 return False
         return True
+
+    @staticmethod
+    def _verify_applied_values_local(
+        values: Dict[str, list], current_values: Dict[str, Dict]
+    ) -> Optional[bool]:
+        """本机镜像行的宽松判定：本机工参缺小区/缺 PCI 时返回 None（无从判定）。
+
+        镜像任务的结果与应用都在服务器侧完成，本机工参只是副本。换工参后本机
+        可能还没有这些小区或 PCI 为空（同步未落地），严格比对会把"无法判定"
+        当成"未应用"——两端状态长期不一致。返回 None 时调用方沿用服务器下发的值。
+        """
+        if not values:
+            return False
+        comparable = 0
+        for key, pair in values.items():
+            current = current_values.get(key)
+            if current is None:
+                continue
+            pci = pair[0] if isinstance(pair, list) and len(pair) > 0 else None
+            tac = pair[1] if isinstance(pair, list) and len(pair) > 1 else None
+            if pci is not None and current.get("pci") is not None:
+                comparable += 1
+                if not TaskManager._same_param_value(current.get("pci"), pci):
+                    return False
+            if tac is not None and current.get("tac") is not None:
+                comparable += 1
+                if not TaskManager._same_param_value(current.get("tac"), tac):
+                    return False
+        return True if comparable else None
 
     @staticmethod
     def _dump_meta_json(value: Optional[Any]) -> Optional[str]:

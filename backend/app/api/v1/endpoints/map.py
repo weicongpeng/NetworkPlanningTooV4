@@ -145,37 +145,52 @@ def _load_map_data_from_files(data_service, user=None) -> Dict[str, Any]:
 
         data_id = wb.id
 
-        # 批量加载站点
-        sites_raw = db.query(Site).filter(Site.workbook_id == data_id).all()
+        # 批量加载站点（同一 site_id 可能有重复行：历史覆盖上传曾追加写入，
+        # 保留主键最大的一行即最新一次导入的副本，避免地图重复渲染/取到旧小区）。
+        # site_id 为空的行走独立键，不能被合并成一个站点。
+        sites_by_id: Dict[str, Any] = {}
+        for site in db.query(Site).filter(Site.workbook_id == data_id).order_by(Site.id).all():
+            sites_by_id[site.site_id or f"__pk_{site.id}"] = site
+        sites_raw = list(sites_by_id.values())
         if not sites_raw:
             return {"sites": [], "bounds": _default_bounds(), "center": _default_center()}
 
-        # 批量加载扇区
-        sectors_raw = db.query(Sector).filter(Sector.workbook_id == data_id).all()
+        # 批量加载扇区（按主键升序：同一小区有重复行时后写入的覆盖先写入的）
+        sectors_raw = (
+            db.query(Sector)
+            .filter(Sector.workbook_id == data_id)
+            .order_by(Sector.id)
+            .all()
+        )
 
         # 构建扇区索引: {site_id_fk: [sector_dict, ...]}
-        sectors_by_site: Dict[int, List[Dict]] = {}
+        # 同一 (站点, 小区) 只保留最新一行：历史覆盖上传曾追加写入，重复行会让
+        # 前端去重时取到旧值（地图上 PCI 与应用结果不一致）。
+        sectors_by_key: Dict[tuple, Dict] = {}
         for s in sectors_raw:
-            if s.site_id_fk is not None:
-                sec_dict = {
-                    "id": s.sector_id,
-                    "siteId": s.sector_id.split("_")[0] if "_" in s.sector_id else "",
-                    "name": s.name or "",
-                    "longitude": s.longitude or 0.0,
-                    "latitude": s.latitude or 0.0,
-                    "azimuth": s.azimuth or 0.0,
-                    "beamwidth": s.beamwidth or 65.0,
-                    "height": s.height or 30.0,
-                    "pci": s.pci,
-                    "cell_cover_type": s.cell_cover_type or 1,
-                    "tac": s.tac,
-                    "frequency": s.frequency,
-                    "mcc": s.mcc,
-                    "mnc": s.mnc,
-                    "is_shared": s.is_shared,
-                    "first_group": s.first_group,
-                }
-                sectors_by_site.setdefault(s.site_id_fk, []).append(sec_dict)
+            if s.site_id_fk is None:
+                continue
+            sectors_by_key[(s.site_id_fk, s.sector_id)] = {
+                "id": s.sector_id,
+                "siteId": s.sector_id.split("_")[0] if "_" in s.sector_id else "",
+                "name": s.name or "",
+                "longitude": s.longitude or 0.0,
+                "latitude": s.latitude or 0.0,
+                "azimuth": s.azimuth or 0.0,
+                "beamwidth": s.beamwidth or 65.0,
+                "height": s.height or 30.0,
+                "pci": s.pci,
+                "cell_cover_type": s.cell_cover_type or 1,
+                "tac": s.tac,
+                "frequency": s.frequency,
+                "mcc": s.mcc,
+                "mnc": s.mnc,
+                "is_shared": s.is_shared,
+                "first_group": s.first_group,
+            }
+        sectors_by_site: Dict[int, List[Dict]] = {}
+        for (site_pk, _sector_id), sec_dict in sectors_by_key.items():
+            sectors_by_site.setdefault(site_pk, []).append(sec_dict)
 
         # 构建站点列表 + 边界计算
         all_sites = []

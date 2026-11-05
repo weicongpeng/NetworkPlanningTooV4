@@ -4660,19 +4660,24 @@ class DataService:
                     safe_print(f"[DataService] 文件类型: {file_type}")
 
                     if file_type in ["full_params", "target_cells"]:
-                        # 新工参上传时，清除所有已有的应用标记（数据已替换，旧的已应用状态失效）
-                        if file_type == "full_params":
+                        # 新工参上传时，清除本组已有的应用标记（数据已替换，旧的已应用状态失效）。
+                        # 桌面端共享模式跳过：装包只是同步服务器数据，应用标记由 sync_tasks
+                        # 按服务器口径维护；在这里清零会把本机尚未上行的任务标记一起抹掉。
+                        if file_type == "full_params" and not settings.NPT_DESKTOP:
                             try:
                                 from app.core.database import SessionLocal
                                 from app.models.database import TaskResult
                                 _db_reset = SessionLocal()
                                 try:
-                                    _count = _db_reset.query(TaskResult).filter(
-                                        TaskResult.is_applied == 1
-                                    ).update({"is_applied": 0})
+                                    _reset_query = _db_reset.query(TaskResult).filter(
+                                        TaskResult.is_applied == 1,
+                                        TaskResult.city == data_info.get("city"),
+                                        TaskResult.operator == data_info.get("operator"),
+                                    )
+                                    _count = _reset_query.update({"is_applied": 0})
                                     _db_reset.commit()
                                     if _count > 0:
-                                        safe_print(f"[DataService] 新工参上传，重置了 {_count} 个任务的已应用标记")
+                                        safe_print(f"[DataService] 新工参上传，重置了 {_count} 个本组任务的已应用标记")
                                 finally:
                                     _db_reset.close()
                             except Exception as _reset_err:
@@ -4882,7 +4887,17 @@ class DataService:
                 _existing_wb.created_at = datetime.now().isoformat()
                 _existing_wb.city = city
                 _existing_wb.operator = operator
-                safe_print(f"[DataService] 已更新 Workbook 记录: {data_id}")
+                # 同一 data_id 重新导入（网页端覆盖上传等）必须先清掉旧行：
+                # 下面只做追加写入，不清会让同一小区出现两条 Site/Sector 行，
+                # 「应用 PCI」按 site_id 建主键映射只会更新其中一份，
+                # 地图/应用判定读到的可能是另一份旧值（两端状态不一致的根因之一）。
+                db.query(Sector).filter(Sector.workbook_id == data_id).delete(
+                    synchronize_session=False
+                )
+                db.query(Site).filter(Site.workbook_id == data_id).delete(
+                    synchronize_session=False
+                )
+                safe_print(f"[DataService] 已更新 Workbook 记录并清理旧小区行: {data_id}")
             else:
                 wb = Workbook(
                     id=data_id,

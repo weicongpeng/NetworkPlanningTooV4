@@ -31,6 +31,8 @@ PREPULL_RESULT_TYPES = ("pci", "tac_planning")
 PREPULL_MAX_SINGLE_BYTES = 8 * 1024 * 1024   # 单条结果超过该体积（病态）仍按需拉取
 PREPULL_MAX_TOTAL_BYTES = 16 * 1024 * 1024   # 每轮同步预拉取总量上限，剩余下轮继续
 PREPULL_MAX_PER_SYNC = 30  # 每轮同步最多预拉取条数（首轮收敛，之后基本为 0）
+# 本机工参与服务器应用结果比对不上时的补拉节流（同一数据集 30 分钟内最多一次）
+PARAM_REPAIR_COOLDOWN_SECONDS = 30 * 60
 
 _sync_lock = threading.Lock()
 # 同步进行中标记（供前端展示"同步中"动画，读状态接口直接取）
@@ -768,12 +770,85 @@ def sync_tasks(city: str, operator: str) -> Dict[str, Any]:
     for task_id in changed_ids:
         TaskManager._history_verify_cache.pop(task_id, None)
 
+    # 2.7) 本机工参副本落后检测：服务器认为已应用、本机工参却对不上 →
+    #      说明本机工参是旧的（历史上有过打包拿到回写前旧 Excel 的情况，
+    #      两端 rev 相同后再也不会重拉），主动补拉一次全量工参自愈。
+    try:
+        repaired = _repair_stale_params(city, operator, items)
+        if repaired:
+            summary["params_repaired"] = repaired
+            TaskManager._history_verify_cache.clear()
+    except Exception as exc:  # noqa: BLE001
+        summary["errors"].append(f"补齐本机工参失败：{exc}")
+
     save_state(
         tasks_pushed=sorted(pushed),
         task_deletes=remaining_deletes,
         task_updates=remaining_updates,
     )
     return summary
+
+
+def _repair_stale_params(city: str, operator: str, items: Dict[str, Dict[str, Any]]) -> Optional[str]:
+    """服务器侧已应用、本机工参比对不上时补拉全量工参（限流，失败不阻塞同步）。
+
+    只比对 `PREPULL_RESULT_TYPES`（紧凑规划值已随清单/结果落地到本机）。
+    """
+    from app.core.database import SessionLocal
+    from app.models.database import TaskResult
+    from app.services.task_manager import TaskManager
+
+    applied_ids = [
+        task_id for task_id, item in items.items()
+        if bool(item.get("is_applied"))
+        and str(item.get("task_type") or "") in PREPULL_RESULT_TYPES
+    ]
+    if not applied_ids:
+        return None
+    full_params_id = TaskManager._resolve_full_params_id(city, operator)
+    if not full_params_id:
+        return None
+    throttle = (load_state().get("param_repairs") or {})
+    last_try = throttle.get(full_params_id)
+    if last_try:
+        elapsed = (datetime.now() - (_parse_iso(last_try) or datetime.min)).total_seconds()
+        if elapsed < PARAM_REPAIR_COOLDOWN_SECONDS:
+            return None
+
+    db = SessionLocal()
+    try:
+        # 只看镜像行：本机任务的结果/应用都在本机，工参与规划值不一致是正常业务状态
+        rows = (
+            db.query(TaskResult)
+            .filter(TaskResult.task_id.in_(applied_ids), TaskResult.origin == "shared")
+            .all()
+        )
+        values = None
+        for row in rows:
+            applied_values = TaskManager._load_meta_json(row.applied_values_json)
+            if not applied_values:
+                continue
+            if values is None:
+                values = TaskManager._load_current_sector_values(db, city=city, operator=operator)
+            if not values:
+                return None
+            if not TaskManager._verify_applied_values(applied_values, values):
+                break
+        else:
+            return None  # 本机工参与服务器应用结果一致，无需补拉
+    finally:
+        db.close()
+
+    throttle[full_params_id] = _now_iso()
+    save_state(param_repairs=throttle)
+    outcome = repair_dataset(full_params_id) or {}
+    if not outcome.get("repaired"):
+        # 本机有未上行修改等场景不覆盖用户数据，下一轮再判定
+        print(f"[DesktopSync] 本机工参待补拉但已跳过: {outcome.get('reason') or '未知原因'}")
+        return None
+    name = ((load_state().get("datasets") or {}).get(full_params_id) or {}).get("name") or full_params_id
+    print(f"[DesktopSync] 本机工参与服务器应用结果不一致，已补拉: {name}")
+    return name
 
 
 def _has_pending_work(state: Optional[Dict[str, Any]] = None) -> bool:
