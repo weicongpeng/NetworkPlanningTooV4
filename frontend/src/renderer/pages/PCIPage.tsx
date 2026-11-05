@@ -836,7 +836,7 @@ export function PCIPage() {
         inheritModulus: config.inheritModulus,
         pciRange: { min: pciMin, max: pciMax },
         enableTACPlanning: config.enableTACPlanning,
-        selectedCellIds: selectedCellIdsSet.size > 0 ? Array.from(storeSelectedCellIds) : undefined
+        selectedCellIds: selectedCellIdsSet.size > 0 ? Array.from(selectedCellIdsSet) : undefined
       })
       if (response.success && response.data) {
         const newTaskId = response.data.taskId
@@ -1233,7 +1233,9 @@ export function PCIPage() {
       const matchedIds = matchCellIds(extractedIds, allAvailableIds)
 
       if (matchedIds.length > 0) {
-        setSelectedCellIdsSet(new Set(matchedIds))
+        // 必须同时同步 store：执行与跨页恢复都读 store，只写本地 Set 会让
+        // 界面显示已选中但提交给后端的 selectedCellIds 为空
+        updateCellSelection(() => new Set(matchedIds))
       } else {
         setError(t('pci.noMatchingCells') || '未匹配到任何小区，请检查文件内容与当前工参数据是否一致')
       }
