@@ -1,0 +1,47 @@
+# mobile-app .gitignore
+
+# dependencies
+node_modules/
+
+# Expo
+.expo/
+dist/
+web-build/
+
+# Native
+*.orig.*
+*.jks
+*.p8
+*.p12
+*.key
+*.mobileprovision
+
+# Metro
+.metro-health-check*
+
+# debug
+npm-debug.*
+yarn-debug.*
+yarn-error.*
+
+# macOS
+.DS_Store
+*.pem
+
+# local env files
+.env*.local
+
+# typescript
+*.tsbuildinfo
+
+# Android
+android/app/build/
+android/.gradle/
+android/build/
+android/local.properties
+android/gradle_error*.txt
+android/gradle_debug.txt
+
+# iOS
+ios/build/
+ios/Pods/

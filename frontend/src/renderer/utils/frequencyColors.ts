@@ -26,6 +26,55 @@ export class FrequencyColorMapper {
         ['NR', new Set()]
     ])
 
+    // 用户自定义频点配色（key: `${networkType}:${frequency}`），优先于算法色与特定频点映射表
+    private customColors: Map<string, { color: string; strokeColor: string }> = new Map()
+
+    private static customKey(frequency: number, networkType: NetworkType): string {
+        return `${networkType}:${frequency}`
+    }
+
+    /**
+     * 设置自定义频点配色（持久化前先写入内存，保证当前会话立即生效）
+     */
+    setCustomColor(frequency: number, networkType: NetworkType, color: string, strokeColor: string): void {
+        this.customColors.set(FrequencyColorMapper.customKey(frequency, networkType), { color, strokeColor })
+        // 使该频点已缓存的颜色失效，下次 getColor 重新计算（命中自定义色）
+        this.colorMap.delete(frequency)
+    }
+
+    /**
+     * 删除指定频点的自定义配色（回退到算法/特定频点色）
+     */
+    removeCustomColor(frequency: number, networkType: NetworkType): void {
+        this.customColors.delete(FrequencyColorMapper.customKey(frequency, networkType))
+        this.colorMap.delete(frequency)
+    }
+
+    /**
+     * 获取全部自定义频点配色（用于持久化存储）
+     */
+    getCustomColors(): Record<string, { color: string; strokeColor: string }> {
+        const result: Record<string, { color: string; strokeColor: string }> = {}
+        this.customColors.forEach((v, k) => { result[k] = { ...v } })
+        return result
+    }
+
+    /**
+     * 从持久化数据恢复自定义频点配色（应用启动时调用）
+     */
+    loadCustomColors(colors: Record<string, { color: string; strokeColor: string }> | null | undefined): void {
+        this.customColors.clear()
+        if (!colors) return
+        for (const [key, v] of Object.entries(colors)) {
+            if (v && typeof v.color === 'string') {
+                this.customColors.set(key, { color: v.color, strokeColor: v.strokeColor || v.color })
+                // 解析 key 里的频点以清除缓存（网络类型未知也可通过频点清除，getColor 会重新生成）
+                const freq = Number(key.split(':')[1])
+                if (Number.isFinite(freq)) this.colorMap.delete(freq)
+            }
+        }
+    }
+
     // LTE和NR使用不同的起始色调
     private readonly LTE_HUE_BASE = 210 // 蓝色基准
     private readonly NR_HUE_BASE = 120  // 绿色基准
@@ -163,18 +212,25 @@ export class FrequencyColorMapper {
             let color: string
             let strokeColor: string
 
-            // 优先检查特定频点颜色映射表
-            const freqMap = this.specificFrequencyColors.get(frequency)
-            if (freqMap && freqMap.has(networkType)) {
-                // 使用特定颜色
-                const specificColor = freqMap.get(networkType)! as { color: string; strokeColor: string }
-                color = specificColor.color
-                strokeColor = specificColor.strokeColor
+            // 0. 优先用户自定义配色（在持久化里配置）
+            const custom = this.customColors.get(FrequencyColorMapper.customKey(frequency, networkType))
+            if (custom) {
+                color = custom.color
+                strokeColor = custom.strokeColor
             } else {
-                // 计算样式属性，使用自动生成的颜色
-                const { h, s, l } = this.calculateStyles(frequency, networkType)
-                color = this.generateHSL(h, s, l)
-                strokeColor = this.darkenColor(h, s, l, this.STROKE_LIGHTNESS_OFFSET)
+                // 1. 优先检查特定频点颜色映射表
+                const freqMap = this.specificFrequencyColors.get(frequency)
+                if (freqMap && freqMap.has(networkType)) {
+                    // 使用特定颜色
+                    const specificColor = freqMap.get(networkType)! as { color: string; strokeColor: string }
+                    color = specificColor.color
+                    strokeColor = specificColor.strokeColor
+                } else {
+                    // 2. 计算样式属性，使用自动生成的颜色
+                    const { h, s, l } = this.calculateStyles(frequency, networkType)
+                    color = this.generateHSL(h, s, l)
+                    strokeColor = this.darkenColor(h, s, l, this.STROKE_LIGHTNESS_OFFSET)
+                }
             }
 
             const colorObj: FrequencyColor = {
@@ -220,6 +276,7 @@ export class FrequencyColorMapper {
 
     /**
      * 清除缓存（用于数据刷新）
+     * 保留用户自定义配色：自定义色属于用户偏好，数据刷新后仍应生效
      */
     clear(): void {
         this.colorMap.clear()

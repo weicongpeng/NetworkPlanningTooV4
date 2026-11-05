@@ -1,0 +1,14 @@
+[Unit]
+Description=cloudflared
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+TimeoutStartSec=30
+Type=notify
+ExecStart=/usr/bin/cloudflared --protocol http2 --edge-ip-version auto --no-autoupdate tunnel run --token eyJhIjoiZGQyNjU5ODA4NmE2NDNkM2QyMmVlNjU4M2JjMWFlMWYiLCJ0IjoiYzUzNWFmNjUtNzhhNi00NTBhLTk5MWUtNzExODA2Nzg2NDVlIiwicyI6IlpHWmtZVGM1TVRVdFpqUTNPUzAwWkRZekxUZzNNREl0TURnNFl6WTFNV05pTTJVeCJ9
+Restart=always
+RestartSec=10s
+
+[Install]
+WantedBy=multi-user.target

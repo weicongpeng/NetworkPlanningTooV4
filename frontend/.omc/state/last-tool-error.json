@@ -1,7 +1,7 @@
 {
   "tool_name": "Bash",
-  "tool_input_preview": "{\"command\":\"sudo systemctl restart npt-backend && sleep 2 && sudo systemctl status npt-backend --no-pager | head -15\",\"description\":\"Restart npt-backend systemd service\"}",
-  "error": "Exit code 1\nsudo: a terminal is required to read the password; either use the -S option to read from standard input or configure an askpass helper\nsudo: 需要密码",
-  "timestamp": "2026-07-06T16:00:22.121Z",
+  "tool_input_preview": "{\"command\":\"cd frontend && npx vitest run src/renderer/services/__tests__/cellListCacheIsolation.test.ts 2>&1 | tail -12\",\"timeout\":180000,\"description\":\"运行前端隔离测试\"}",
+  "error": "Exit code 1\n/bin/bash: 第 1 行： cd: frontend: 没有那个文件或目录",
+  "timestamp": "2026-09-19T04:06:01.683Z",
   "retry_count": 1
 }

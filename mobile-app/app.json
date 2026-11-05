@@ -1,0 +1,58 @@
+{
+  "expo": {
+    "name": "网优伴侣",
+    "slug": "network-planning-mobile",
+    "version": "2.0.2",
+    "platforms": [
+      "android"
+    ],
+    "icon": "./APP图标.png",
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./APP图标.png",
+        "backgroundColor": "#FFFFFF"
+      },
+      "package": "com.networkplanning.mobile",
+      "permissions": [
+        "ACCESS_FINE_LOCATION",
+        "ACCESS_COARSE_LOCATION",
+        "INTERNET",
+        "ACCESS_NETWORK_STATE",
+        "READ_EXTERNAL_STORAGE",
+        "WRITE_EXTERNAL_STORAGE",
+        "android.permission.ACCESS_COARSE_LOCATION",
+        "android.permission.ACCESS_FINE_LOCATION",
+        "android.permission.REQUEST_INSTALL_PACKAGES"
+      ],
+      "runtimeVersion": "2.0.2"
+    },
+    "packagerOpts": {
+      "customHostUrl": "https://apk.pengwc.asia"
+    },
+    "plugins": [
+      "expo-asset",
+      [
+        "expo-location",
+        {
+          "locationAlwaysAndWhenInUsePermission": "允许\"网优伴侣\"在后台获取您的位置以便导航",
+          "locationWhenInUsePermission": "允许\"网优伴侣\"获取您的位置信息",
+          "isAndroidBackgroundLocationEnabled": true,
+          "isIosBackgroundLocationEnabled": false
+        }
+      ],
+      "expo-task-manager"
+    ],
+    "web": {
+      "bundler": "metro"
+    },
+    "extra": {
+      "eas": {
+        "projectId": "0ced5215-39c6-4472-9497-65dc2d2a9da5"
+      }
+    },
+    "updates": {
+      "url": "https://u.expo.dev/0ced5215-39c6-4472-9497-65dc2d2a9da5"
+    },
+    "owner": "peng2026"
+  }
+}

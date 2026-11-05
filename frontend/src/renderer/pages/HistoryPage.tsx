@@ -5,7 +5,7 @@ import { useTranslation } from 'react-i18next'
 import { useTaskStore, type TaskType } from '../store/taskStore'
 import { btn } from '../utils/buttonStyles'
 
-type PageType = 'pci' | 'neighbor' | 'tac' | 'tac-planning'
+type PageType = 'pci' | 'pci-check' | 'neighbor' | 'tac' | 'tac-planning'
 
 interface TypeMeta {
   taskType: TaskType
@@ -17,6 +17,7 @@ const TYPE_META: Record<PageType, TypeMeta> = {
   pci: { taskType: 'pci_planning', backRoute: '/pci', typeLabel: 'PCI规划' },
   neighbor: { taskType: 'neighbor_planning', backRoute: '/neighbor', typeLabel: '邻区规划' },
   tac: { taskType: 'tac_check', backRoute: '/tac', typeLabel: 'TAC核查' },
+  'pci-check': { taskType: 'pci_check', backRoute: '/pci-check', typeLabel: 'PCI核查' },
   'tac-planning': { taskType: 'tac_planning', backRoute: '/tac-planning', typeLabel: 'TAC规划' },
 }
 
@@ -90,14 +91,15 @@ export function HistoryPage() {
           </div>
         ) : (
           <table className="w-full text-sm">
-            <thead className="sticky top-0 bg-muted/50 z-10">
+            {/* 表头必须不透明：半透明背景会让滚动的正文透过表头显示 */}
+            <thead className="sticky top-0 z-20">
               <tr className="border-b border-border">
-                <th className="text-left px-4 py-3 font-semibold text-xs">{t('common.userName')}</th>
-                <th className="text-left px-4 py-3 font-semibold text-xs">{t('common.taskName')}</th>
-                <th className="text-left px-4 py-3 font-semibold text-xs">{t('common.taskType')}</th>
-                <th className="text-left px-4 py-3 font-semibold text-xs">{t('common.taskStartTime')}</th>
-                <th className="text-left px-4 py-3 font-semibold text-xs">{t('common.taskEndTime')}</th>
-                <th className="text-center px-4 py-3 font-semibold text-xs">{t('common.status')}</th>
+                <th className="sticky top-0 z-20 bg-muted text-left px-4 py-3 font-semibold text-xs">{t('common.userName')}</th>
+                <th className="sticky top-0 z-20 bg-muted text-left px-4 py-3 font-semibold text-xs">{t('common.taskName')}</th>
+                <th className="sticky top-0 z-20 bg-muted text-left px-4 py-3 font-semibold text-xs">{t('common.taskType')}</th>
+                <th className="sticky top-0 z-20 bg-muted text-left px-4 py-3 font-semibold text-xs">{t('common.taskStartTime')}</th>
+                <th className="sticky top-0 z-20 bg-muted text-left px-4 py-3 font-semibold text-xs">{t('common.taskEndTime')}</th>
+                <th className="sticky top-0 z-20 bg-muted text-center px-4 py-3 font-semibold text-xs">{t('common.status')}</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-border">
@@ -126,17 +128,17 @@ export function HistoryPage() {
                   </td>
                   <td className="px-4 py-3 text-center">
                     {task.status === 'completed' ? (
-                      <span className="inline-flex items-center gap-1 px-2 py-0.5 text-[10px] bg-green-100 text-green-700 rounded-full font-medium">
+                      <span className="inline-flex items-center gap-1 px-2 py-0.5 text-[10px] bg-green-500/15 text-green-400 rounded-full font-medium">
                         <CheckCircle2 size={10} />
                         {t('common.taskSuccess')}
                       </span>
                     ) : task.status === 'failed' ? (
-                      <span className="inline-flex items-center gap-1 px-2 py-0.5 text-[10px] bg-red-100 text-red-700 rounded-full font-medium">
+                      <span className="inline-flex items-center gap-1 px-2 py-0.5 text-[10px] bg-red-500/15 text-red-400 rounded-full font-medium">
                         <AlertCircle size={10} />
                         {t('common.taskFailed')}
                       </span>
                     ) : task.status === 'running' ? (
-                      <span className="inline-flex items-center gap-1 px-2 py-0.5 text-[10px] bg-blue-100 text-blue-700 rounded-full font-medium">
+                      <span className="inline-flex items-center gap-1 px-2 py-0.5 text-[10px] bg-blue-500/15 text-blue-400 rounded-full font-medium">
                         <span className="inline-block w-2 h-2 rounded-full bg-blue-500 animate-pulse" />
                         {task.progress || 0}%
                       </span>

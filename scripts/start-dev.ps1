@@ -6,7 +6,7 @@
 # ====================================================
 
 Write-Host "======================================" -ForegroundColor Cyan
-Write-Host "  网络规划工具 - 移动端开发环境启动" -ForegroundColor Cyan
+Write-Host "  网优引擎 - 移动端开发环境启动" -ForegroundColor Cyan
 Write-Host "======================================" -ForegroundColor Cyan
 Write-Host ""
 

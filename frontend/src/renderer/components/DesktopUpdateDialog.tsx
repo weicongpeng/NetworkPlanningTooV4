@@ -1,0 +1,377 @@
+import { useCallback, useEffect, useState } from 'react'
+import { useTranslation } from 'react-i18next'
+import { AlertCircle, Download, Loader2, RefreshCw, X } from 'lucide-react'
+import type { DesktopUpdateStatus } from '@shared/types'
+import { desktopUpdateApi } from '../services/api'
+import { useAuthStore } from '../store/authStore'
+import { useDesktopUpdateStore } from '../store/desktopUpdateStore'
+
+/** 自动提醒间隔：1 天 2 次 */
+const PROMPT_INTERVAL_MS = 12 * 60 * 60 * 1000
+/** 同一版本的"上次提醒时间"，避免重启应用后重复弹窗 */
+const PROMPT_STORAGE_KEY = 'npt-ota-last-prompt'
+/** 启动后延迟检查，避免与首屏争资源 */
+const FIRST_CHECK_DELAY_MS = 8000
+
+/** 版本比较：a>b 返回 1，a<b 返回 -1，相等返回 0（数字段按数值比，避免 9>37 的字符串误判） */
+function compareVersions(a: string, b: string): number {
+  const pa = String(a || '').split(/[.\-_+]/)
+  const pb = String(b || '').split(/[.\-_+]/)
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const na = Number.parseInt(pa[i] ?? '', 10)
+    const nb = Number.parseInt(pb[i] ?? '', 10)
+    if (!Number.isNaN(na) && !Number.isNaN(nb)) {
+      if (na !== nb) return na > nb ? 1 : -1
+    } else if ((pa[i] ?? '') !== (pb[i] ?? '')) {
+      return (pa[i] ?? '') > (pb[i] ?? '') ? 1 : -1
+    }
+  }
+  return 0
+}
+
+function readLastPrompt(): { version: string; at: number } | null {
+  try {
+    const raw = localStorage.getItem(PROMPT_STORAGE_KEY)
+    if (!raw) return null
+    const parsed = JSON.parse(raw)
+    return typeof parsed?.at === 'number' ? { version: String(parsed.version || ''), at: parsed.at } : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * 桌面版 OTA 更新提示（仅桌面壳内生效；网页端接口 404 时静默）。
+ * 规则：不强制更新，弹窗随时可关闭；自动检查每 12 小时一次（1 天 2 次）。
+ */
+export function DesktopUpdateDialog() {
+  const { t } = useTranslation()
+  // 更新接口只存在于桌面形态，网页端不必轮询
+  const desktopMode = useAuthStore((s) => s.desktopMode)
+  const [status, setStatus] = useState<DesktopUpdateStatus | null>(null)
+  const [visible, setVisible] = useState(false)
+  const [busy, setBusy] = useState(false)
+  const [progress, setProgress] = useState<{ downloaded: number; total: number; phase: string; error?: string | null }>({
+    downloaded: 0,
+    total: 0,
+    phase: 'idle',
+  })
+  const [message, setMessage] = useState<string | null>(null)
+  // 上一次安装的结果：装失败（安装器退出码非 0 / 版本没变）时给出人工安装提示
+  const [lastResult, setLastResult] = useState<DesktopUpdateStatus['last_result']>(null)
+  // 「系统设置 → 检查更新」的交接：拿到结果直接展示（非管理员也可手动触发）
+  const requested = useDesktopUpdateStore((s) => s.requested)
+  const clearRequest = useDesktopUpdateStore((s) => s.clearRequest)
+
+  const release = status?.release || null
+
+  /**
+   * 发现可更新且尚无下载任务时**静默预下载**安装包：下载在后台进行，不打断用户
+   * （不弹进度窗）；完成后由 DesktopUpdateReadyDialog 弹窗提示「重启更新」。
+   * 下载失败静默忽略，下次自动检查会再试；ready/downloading 状态不重复启动。
+   */
+  const maybeAutoDownload = useCallback(async (data: DesktopUpdateStatus) => {
+    if (!data.update_available || !data.release) return
+    if ((data.download?.phase || 'idle') !== 'idle') return
+    try {
+      await desktopUpdateApi.download(data.release.version)
+      setProgress((prev) => ({ ...prev, phase: 'downloading' }))
+    } catch {
+      /* 静默下载失败不打扰用户 */
+    }
+  }, [])
+
+  // force=false：自动检查不打断用户；手动点「检查更新」时立即展示
+  const check = useCallback(async (force = false) => {
+    try {
+      const res = await desktopUpdateApi.status()
+      if (!res.success) return
+      setStatus(res.data)
+      setLastResult(res.data.last_result || null)
+      setProgress({
+        downloaded: res.data.download?.downloaded || 0,
+        total: res.data.download?.total || 0,
+        phase: res.data.download?.phase || 'idle',
+        error: res.data.download?.error,
+      })
+      void maybeAutoDownload(res.data)
+      if (res.data.download?.phase === 'ready') {
+        setVisible(true)
+        return
+      }
+      if (!res.data.update_available || !res.data.release) return
+      const version = String(res.data.release.version)
+      const last = readLastPrompt()
+      const due =
+        force ||
+        !last ||
+        last.version !== version ||
+        Date.now() - last.at >= PROMPT_INTERVAL_MS
+      if (!due) return
+      try {
+        localStorage.setItem(PROMPT_STORAGE_KEY, JSON.stringify({ version, at: Date.now() }))
+      } catch {
+        /* 隐私模式下写不进去也不影响本次提醒 */
+      }
+      setVisible(true)
+    } catch {
+      // 网页版或后端不可用
+    }
+  }, [maybeAutoDownload])
+
+  useEffect(() => {
+    if (!desktopMode) return
+    const timer = window.setTimeout(() => check(false), FIRST_CHECK_DELAY_MS)
+    const interval = window.setInterval(() => check(false), PROMPT_INTERVAL_MS)
+    return () => {
+      window.clearTimeout(timer)
+      window.clearInterval(interval)
+    }
+  }, [check, desktopMode])
+
+  // 把本弹窗的可见性发布到 store：后台下载完成时的「重启更新」弹窗据此避让，
+  // 避免两个更新对话框叠在一起
+  const setMainDialogVisible = useDesktopUpdateStore((s) => s.setMainDialogVisible)
+  useEffect(() => {
+    setMainDialogVisible(visible)
+  }, [visible, setMainDialogVisible])
+
+  // 系统设置页点「检查更新」→ 打开本弹窗展示新版本
+  useEffect(() => {
+    if (!requested) return
+    setStatus(requested)
+    setLastResult(requested.last_result || null)
+    setProgress({
+      downloaded: requested.download?.downloaded || 0,
+      total: requested.download?.total || 0,
+      phase: requested.download?.phase || 'idle',
+      error: requested.download?.error,
+    })
+    setMessage(null)
+    void maybeAutoDownload(requested)
+    setVisible(Boolean(requested.update_available && requested.release))
+    clearRequest()
+  }, [requested, clearRequest, maybeAutoDownload])
+
+  // 下载中每 1 秒轮询进度
+  useEffect(() => {
+    if (!visible || progress.phase !== 'downloading') return
+    const timer = window.setInterval(async () => {
+      try {
+        const res: any = await desktopUpdateApi.progress()
+        setProgress({
+          downloaded: res.data?.downloaded || 0,
+          total: res.data?.total || 0,
+          phase: res.data?.phase || 'idle',
+          error: res.data?.error,
+        })
+        if (res.data?.phase === 'ready') {
+          setMessage(t('desktopUpdate.downloadReady'))
+        } else if (res.data?.phase === 'failed') {
+          setMessage(res.data?.error || t('desktopUpdate.downloadFailed'))
+        }
+      } catch {
+        /* 下个周期重试 */
+      }
+    }, 1000)
+    return () => window.clearInterval(timer)
+  }, [visible, progress.phase, t])
+
+  const handleDownload = async () => {
+    setBusy(true)
+    setMessage(null)
+    try {
+      await desktopUpdateApi.download(release?.version)
+      setProgress((prev) => ({ ...prev, phase: 'downloading' }))
+    } catch (err: any) {
+      setMessage(err?.message || t('desktopUpdate.downloadFailed'))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const handleInstall = async () => {
+    setBusy(true)
+    // 安装随即会关闭本程序、连接随之断开，先给出提示避免用户以为无响应
+    setMessage(t('desktopUpdate.installing'))
+    try {
+      const res: any = await desktopUpdateApi.install()
+      setMessage(res?.data?.message || t('desktopUpdate.installing'))
+    } catch (err: any) {
+      // code === 0 表示连接被切断（应用正在退出安装），不是失败
+      if (err?.code !== 0) {
+        setMessage(err?.message || t('desktopUpdate.installFailed'))
+        setBusy(false)
+      }
+    }
+  }
+
+  const handleBackground = async () => {
+    setBusy(true)
+    setMessage(null)
+    try {
+      const res: any = await desktopUpdateApi.background()
+      setProgress((prev) => ({ ...prev, phase: res?.data?.phase || prev.phase }))
+      // 关窗：下载与安装转后台，完成后由 DesktopUpdateReadyDialog 弹「重启更新」
+      setVisible(false)
+      setMessage(null)
+    } catch (err: any) {
+      setMessage(err?.message || t('desktopUpdate.backgroundFailed'))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const handleClose = () => {
+    setVisible(false)
+    setMessage(null)
+  }
+
+  // 可见性由自动检查或「系统设置 → 检查更新」决定
+  if (!visible || (!release && progress.phase !== 'ready')) return null
+
+  const percent =
+    progress.total > 0 ? Math.min(100, Math.round((progress.downloaded / progress.total) * 100)) : 0
+
+  // 安装器退出码只在失败时展示：rc 是字符串 "0"（JS 真值），原来的判断会把
+  // 安装成功显示成「安装器退出码 0」，让人误以为出了问题
+  const failedCodes = [lastResult?.setup_rc, lastResult?.setup_retry_rc].filter(
+    (code): code is string => Boolean(code) && code !== '0' && code !== 'skipped'
+  )
+
+  // 上次失败的目标版本比本次推送的版本旧（如失败在 0.0.37，现推 0.0.39）时，
+  // 中间版本的"手动安装"提示已过时：安装包是完整安装，直接更新到最新版即可，
+  // 不能引导用户先装中间版本再装新版本
+  const staleFailedTarget =
+    Boolean(release?.version) &&
+    Boolean(lastResult?.target_version) &&
+    compareVersions(release!.version, lastResult!.target_version!) > 0
+
+  return (
+    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-[100] p-4">
+      <div className="bg-card rounded-lg border border-border p-5 w-full max-w-lg space-y-4">
+        <div className="flex items-start justify-between gap-3">
+          <div className="flex items-center gap-2">
+            <Download size={18} className="text-primary" />
+            <h3 className="text-sm font-semibold">{t('desktopUpdate.title')}</h3>
+          </div>
+          <button onClick={handleClose} className="p-1 hover:bg-muted rounded" title={t('desktopUpdate.close')}>
+            <X size={16} />
+          </button>
+        </div>
+
+        {release && (
+          <div className="space-y-2 text-sm">
+            <div className="flex items-center gap-2 flex-wrap">
+              <span className="font-mono px-1.5 py-0.5 rounded bg-muted">{release.version}</span>
+              {release.file_size_display && (
+                <span className="text-muted-foreground">{release.file_size_display}</span>
+              )}
+            </div>
+            {release.release_notes && (
+              <p className="text-xs text-muted-foreground whitespace-pre-wrap max-h-40 overflow-auto">
+                {release.release_notes}
+              </p>
+            )}
+          </div>
+        )}
+
+        {progress.phase === 'downloading' && (
+          <div className="space-y-1">
+            <div className="h-2 rounded bg-muted overflow-hidden">
+              <div className="h-full bg-primary transition-all" style={{ width: `${percent}%` }} />
+            </div>
+            <p className="text-xs text-muted-foreground">
+              {t('desktopUpdate.downloading')} {percent}%
+              {progress.total > 0 && `（${(progress.downloaded / 1048576).toFixed(1)} / ${(progress.total / 1048576).toFixed(1)} MB）`}
+            </p>
+          </div>
+        )}
+
+        {/* 上次自动安装没生效且失败目标就是本次推送的版本：给出实际安装版本/安装器
+            退出码与安装包路径，用户可手动运行；跨版本（推送更新版本）时不提示旧安装包 */}
+        {lastResult?.target_version && lastResult.applied === false && !staleFailedTarget && (
+          <div className="p-2 rounded bg-red-500/10 border border-red-500/20 text-red-500 text-xs space-y-1">
+            <div className="flex items-center gap-2">
+              <AlertCircle size={14} />
+              <span>
+                {t('desktopUpdate.installNotApplied', {
+                  target: lastResult.target_version,
+                  current: lastResult.current_version || t('desktopUpdate.versionUnknown'),
+                })}
+                {failedCodes.length > 0 && ` · ${t('desktopUpdate.setupExitCode', { code: failedCodes.join(' / ') })}`}
+              </span>
+            </div>
+            {lastResult.installed_version && (
+              <p className="text-muted-foreground">
+                {t('desktopUpdate.installedVersion', { version: lastResult.installed_version })}
+              </p>
+            )}
+            {lastResult.installer && (
+              <p className="break-all text-muted-foreground">
+                {t('desktopUpdate.manualInstallHint')}
+                <span className="font-mono">{lastResult.installer}</span>
+              </p>
+            )}
+            {/* 安装日志尾部：退出码说不清原因时（如 rc=1 初始化失败），日志里才有真实原因 */}
+            {lastResult.setup_log_tail && (
+              <p className="break-all text-muted-foreground/80 font-mono">
+                {lastResult.setup_log_tail}
+              </p>
+            )}
+          </div>
+        )}
+
+        {message && (
+          <div className="p-2 rounded bg-amber-500/10 border border-amber-500/20 text-amber-600 text-xs flex items-center gap-2">
+            <AlertCircle size={14} />
+            {message}
+          </div>
+        )}
+
+        <div className="flex justify-end gap-2">
+          <button
+            onClick={handleClose}
+            className="px-4 py-2 border border-border rounded-lg hover:bg-muted text-sm"
+          >
+            {t('desktopUpdate.close')}
+          </button>
+          {progress.phase === 'ready' ? (
+            <button
+              onClick={handleInstall}
+              disabled={busy}
+              className="px-4 py-2 bg-primary text-primary-foreground rounded-lg hover:opacity-90 disabled:opacity-50 text-sm font-medium flex items-center gap-1.5"
+            >
+              {busy ? <Loader2 size={14} className="animate-spin" /> : <RefreshCw size={14} />}
+              {t('desktopUpdate.restartAndInstall')}
+            </button>
+          ) : (
+            <>
+              {/* 后台运行：关掉窗口也继续下载并自动安装（启动器进程接手） */}
+              <button
+                onClick={handleBackground}
+                disabled={busy}
+                title={t('desktopUpdate.runInBackgroundHint')}
+                className="px-4 py-2 border border-border rounded-lg hover:bg-muted disabled:opacity-50 text-sm font-medium"
+              >
+                {t('desktopUpdate.runInBackground')}
+              </button>
+              <button
+                onClick={handleDownload}
+                disabled={busy || progress.phase === 'downloading'}
+                className="px-4 py-2 bg-primary text-primary-foreground rounded-lg hover:opacity-90 disabled:opacity-50 text-sm font-medium flex items-center gap-1.5"
+              >
+                {busy || progress.phase === 'downloading' ? (
+                  <Loader2 size={14} className="animate-spin" />
+                ) : (
+                  <Download size={14} />
+                )}
+                {progress.phase === 'downloading' ? t('desktopUpdate.downloading') : t('desktopUpdate.updateNow')}
+              </button>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}

@@ -2,10 +2,16 @@ import {
   Database,
   Settings,
   Network,
-  Layers,
+  GitCompare,
   MapPin,
   Map,
   Shield,
+  Wrench,
+  Ruler,
+  MoveHorizontal,
+  RadioTower,
+  Waves,
+  Bot,
   LucideIcon
 } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
@@ -27,6 +33,13 @@ export function HomePage() {
           iconColor="text-blue-500"
         />
         <FeatureCard
+          title={t('nav.assistant', '网优助手')}
+          description={t('home.assistantDesc', '对话查询基站参数与小区指标，自动生成趋势图/柱状图/周边站点')}
+          icon={Bot}
+          link="/assistant"
+          iconColor="text-pink-500"
+        />
+        <FeatureCard
           title={t('nav.pci')}
           description={t('home.pciDesc') || 'LTE和NR的PCI自动规划'}
           icon={Settings}
@@ -43,9 +56,16 @@ export function HomePage() {
         <FeatureCard
           title={t('nav.tac')}
           description={t('home.tacDesc') || '对比图层TAC与现网TAC，统计一致性'}
-          icon={Layers}
+          icon={GitCompare}
           link="/tac"
           iconColor="text-orange-500"
+        />
+        <FeatureCard
+          title={t('nav.pciCheck')}
+          description={t('home.pciCheckDesc') || '核查PCI复用距离、冲突混淆与模3/模30冲突'}
+          icon={Shield}
+          link="/pci-check"
+          iconColor="text-teal-500"
         />
         <FeatureCard
           title={t('nav.tacPlanning')}
@@ -60,6 +80,41 @@ export function HomePage() {
           icon={Map}
           link="/map"
           iconColor="text-cyan-500"
+        />
+        <FeatureCard
+          title={t('nav.layerTools')}
+          description={t('home.layerToolsDesc') || '根据工参文件制作扇区/点图层 (tab/mif/kml)'}
+          icon={Wrench}
+          link="/layer"
+          iconColor="text-blue-600"
+        />
+        <FeatureCard
+          title={t('nav.distanceMatch')}
+          description={t('home.distanceMatchDesc')}
+          icon={Ruler}
+          link="/distance-match"
+          iconColor="text-emerald-600"
+        />
+        <FeatureCard
+          title={t('nav.siteSpacing')}
+          description={t('home.siteSpacingDesc')}
+          icon={MoveHorizontal}
+          link="/site-spacing"
+          iconColor="text-teal-600"
+        />
+        <FeatureCard
+          title={t('nav.freqConversion')}
+          description={t('home.freqConversionDesc')}
+          icon={RadioTower}
+          link="/frequency-conversion"
+          iconColor="text-indigo-600"
+        />
+        <FeatureCard
+          title={t('nav.im3Evaluation')}
+          description={t('home.im3EvaluationDesc')}
+          icon={Waves}
+          link="/intermodulation"
+          iconColor="text-violet-600"
         />
         <FeatureCard
           title={t('nav.config')}

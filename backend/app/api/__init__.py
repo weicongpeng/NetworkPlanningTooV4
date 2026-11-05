@@ -12,7 +12,10 @@ from fastapi.responses import Response
 from contextlib import asynccontextmanager
 from starlette.types import ASGIApp, Scope, Receive, Send
 import logging
+import multiprocessing
 import socket
+import sys
+import time
 from concurrent.futures import ProcessPoolExecutor
 
 from app.core.config import settings
@@ -27,6 +30,7 @@ class SelectiveGZipMiddleware(GZipMiddleware):
     """
     EXCLUDE_PATHS = (
         "/api/v1/app-versions/download/",
+        "/api/v1/desktop-cloud/releases/download/",
         "/apks/",
     )
 
@@ -39,8 +43,8 @@ class SelectiveGZipMiddleware(GZipMiddleware):
                 return
         await super().__call__(scope, receive, send)
 
-# 前端构建产物目录
-FRONTEND_DIST = Path(__file__).parent.parent.parent.parent / "frontend" / "dist-renderer"
+# 前端构建产物目录（冻结时位于资源根 _MEIPASS 内，由 PyInstaller add-data 提供）
+FRONTEND_DIST = settings.BUNDLE_DIR / "frontend" / "dist-renderer"
 
 
 def get_local_ip():
@@ -64,29 +68,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """应用生命周期管理"""
-    # 启动时执行
-    logger.info("应用启动中...")
-
-    # 确保必要的目录存在
-    settings.UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    settings.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    settings.LICENSE_DIR.mkdir(parents=True, exist_ok=True)
-    settings.DATA_DIR.mkdir(parents=True, exist_ok=True)
-    settings.TEMPLATE_DIR.mkdir(parents=True, exist_ok=True)
-
-    # 创建 APK 文件存储目录
-    BASE_DIR = Path(__file__).parent.parent
-    apks_dir = BASE_DIR / "apks"
-    apks_dir.mkdir(parents=True, exist_ok=True)
-    logger.info(f"✅ APK 存储目录已创建: {apks_dir}")
-
-    # 🔥 启动时自动清理无效数据索引
-    # 清理文件已删除但索引中仍存在的无效项
+def _cleanup_invalid_index() -> None:
+    """启动对账：清理文件与 SQLite 均已不存在的无效数据索引项。"""
     try:
         from app.services.data_service import data_service
+
         cleanup_result = data_service.cleanup_index()
         removed_count = cleanup_result.get('removed', 0)
         if removed_count > 0:
@@ -95,8 +81,168 @@ async def lifespan(app: FastAPI):
                 logger.info(f"   - {item.get('name', '未知')} ({item.get('id', '')}): {item.get('reason', '')}")
         else:
             logger.info("✅ 数据索引检查完成，无无效项")
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         logger.error(f"❌ 清理无效数据索引失败: {e}")
+
+
+def _purge_upload_tmp() -> None:
+    """清理 layer_tmp/distance_tmp 中超过 24h 的分块上传残留（src_*）。"""
+    import time
+
+    for dirname in ("layer_tmp", "distance_tmp"):
+        tmp_dir = settings.UPLOAD_DIR / dirname
+        if not tmp_dir.exists():
+            continue
+        now = time.time()
+        removed = 0
+        for f in tmp_dir.glob("src_*"):
+            try:
+                if now - f.stat().st_mtime > 86400:  # 24h
+                    f.unlink(missing_ok=True)
+                    removed += 1
+            except Exception:  # noqa: BLE001
+                pass
+        if removed:
+            logger.info(f"✅ 已清理 {removed} 个过期 {dirname} 临时文件")
+        else:
+            logger.info(f"✅ {dirname} 临时文件检查完成，无过期文件")
+
+
+def _desktop_startup_maintenance() -> None:
+    """桌面端启动后的非关键维护（延后队列里串行执行，不阻塞窗口就绪）。"""
+    _cleanup_invalid_index()
+    _purge_upload_tmp()
+    try:
+        from app.services.desktop_update_service import cleanup_stale_installers
+
+        cleanup_stale_installers()
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"⚠️ 清理历史安装包失败: {e}")
+
+
+def _desktop_deferred_job_maintenance() -> None:
+    _desktop_startup_maintenance()
+
+
+def _desktop_deferred_job_index_migration() -> None:
+    """拆分旧版「结果内嵌」任务索引（解析上百 MB，放这里才不会拖慢登录）。"""
+    from app.services.task_manager import task_manager
+
+    task_manager.migrate_legacy_index_if_needed()
+
+
+def _desktop_deferred_job_prewarm() -> None:
+    """预热图层 GeoJSON 缓存（GDAL 解析 + 坐标转换，最重的一项）。"""
+    from app.services.data_service import data_service
+
+    data_service.prewarm_all_map_caches(blocking=True)
+
+
+def _desktop_deferred_job_coord_backfill() -> None:
+    """按库内记录/地理化数据补算「经纬度缺失或为 0」提醒（大库上是一次全表统计）。"""
+    from app.services.data_service import data_service
+
+    corrected = data_service.backfill_coord_zero_warnings()
+    if corrected:
+        logger.info(f"✅ 坐标缺失提醒已按库内记录修正: {corrected} 个全量工参")
+    geo_corrected = data_service.backfill_geo_coord_zero_warnings()
+    if geo_corrected:
+        logger.info(f"✅ 坐标缺失提醒已补算: {geo_corrected} 个地理化数据")
+
+
+def _run_desktop_deferred_startup() -> None:
+    """桌面端启动后的重活队列：**等首次登录完成再逐项跑**。
+
+    这些活儿（索引对账、删历史安装包、图层缓存预热、大表统计、旧索引拆分）都是
+    纯 Python / GDAL 线程、持 GIL，若在 lifespan 里并发起跑，正好压在用户点登录
+    的那几秒上。改为等首次登录后串行执行，让登录与首屏独占资源；用户长时间不
+    登录则按 timeout 兜底放行（见 core/startup_gate）。
+    每项之间留间隔，避免首屏请求刚落地就撞上下一项。
+    """
+    import time as _time
+
+    from app.core.startup_gate import wait_for_login
+
+    logged_in = wait_for_login()
+    logger.info(
+        "▶️ 桌面端延后维护开始（%s）",
+        "登录后触发" if logged_in else "等待登录超时，兜底执行",
+    )
+    for index, job in enumerate(
+        (
+            _desktop_deferred_job_index_migration,
+            _desktop_deferred_job_maintenance,
+            _desktop_deferred_job_coord_backfill,
+            _desktop_deferred_job_prewarm,
+        )
+    ):
+        if index:
+            _time.sleep(2.0)
+        try:
+            job()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"⚠️ 桌面端延后维护任务失败（忽略）: {e}")
+    logger.info("✅ 桌面端延后维护完成")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """应用生命周期管理"""
+    # 启动时执行
+    logger.info("应用启动中...")
+
+    # 桌面形态：业务数据按运行模式配置档隔离。launcher 已在导入 app 前完成迁移；
+    # 此处对直接运行本机后端（开发/测试）的场景幂等补跑，必须早于索引清理与 init_db
+    # （两者都会绑定/创建设置路径下的数据库文件）。
+    if settings.NPT_DESKTOP:
+        try:
+            from app.core.desktop_profiles import ensure_legacy_migrated
+
+            ensure_legacy_migrated(settings.DATA_ROOT, settings.DESKTOP_PROFILE)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"⚠️ 配置档存量数据迁移失败: {e}")
+
+    # 确保必要的目录存在
+    settings.UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    settings.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    settings.LICENSE_DIR.mkdir(parents=True, exist_ok=True)
+    settings.DATA_DIR.mkdir(parents=True, exist_ok=True)
+    settings.TEMPLATE_DIR.mkdir(parents=True, exist_ok=True)
+
+    # 创建 APK 文件存储目录（可写数据根下）
+    apks_dir = settings.APKS_DIR
+    apks_dir.mkdir(parents=True, exist_ok=True)
+    logger.info(f"✅ APK 存储目录已创建: {apks_dir}")
+
+    # 创建桌面版安装包目录（OTA 分发）
+    desktop_releases_dir = settings.DESKTOP_RELEASES_DIR
+    desktop_releases_dir.mkdir(parents=True, exist_ok=True)
+    logger.info(f"✅ 桌面版安装包目录已创建: {desktop_releases_dir}")
+
+    # 启动对账与临时文件清理：
+    # - 桌面端：连同图层缓存预热、坐标提醒回填、旧索引拆分一起进 npt-desktop-deferred
+    #   队列，**等首次登录完成后再串行跑**——它们持 GIL，与用户点登录/开首屏同时起跑
+    #   会把登录拖慢；队列本身是守护线程，uvicorn 不会等它（launcher 以 /system/status
+    #   返回 200 为就绪信号，同步项越少，窗口出现得越快）
+    # - 服务器形态：保持启动时同步完成（systemd 重启不频繁，期望启动即对账干净）
+    if settings.NPT_DESKTOP:
+        import threading as _maint_threading
+
+        _maint_threading.Thread(
+            target=_run_desktop_deferred_startup,
+            daemon=True,
+            name="npt-desktop-deferred",
+        ).start()
+    else:
+        _cleanup_invalid_index()
+        _purge_upload_tmp()
+        # 服务器形态：旧版任务索引仍在启动时同步拆分一次（保持既有启动行为）
+        try:
+            from app.services.task_manager import task_manager
+
+            task_manager.migrate_legacy_index_if_needed()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"⚠️ 拆分历史任务索引失败: {e}")
 
     # 初始化用户数据库
     try:
@@ -108,15 +254,81 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"❌ 用户数据库初始化失败: {e}")
 
+    # 服务器端：登记手工放进 desktop_releases 目录的安装包（OTA 与分发页才看得到）
+    # 只在服务器形态做（桌面端不分发安装包），失败不影响启动
+    try:
+        if not settings.NPT_DESKTOP:
+            from app.core.database import SessionLocal
+            from app.api.v1.endpoints.desktop_releases import _import_local_files
+
+            db = SessionLocal()
+            try:
+                imported = _import_local_files(db)
+            finally:
+                db.close()
+            if imported:
+                logger.info(f"✅ 已登记 {len(imported)} 个本地安装包")
+    except Exception as e:
+        logger.warning(f"⚠️ 扫描本地安装包目录失败: {e}")
+
+    # 桌面模式：同步签名授权到期日到 admin（前端展示依赖，失败不影响授权校验）
+    try:
+        if settings.NPT_DESKTOP:
+            from app.services.license_service import license_service
+            license_service.sync_desktop_admin_expiry()
+    except Exception as e:
+        logger.warning(f"⚠️ 同步桌面授权状态失败: {e}")
+
+    # 桌面模式：后台自动续期（剩余 <20 天 或 距上次续期 ≥7 天时静默续期）
+    if settings.NPT_DESKTOP:
+        try:
+            import asyncio
+            from app.services.desktop_cloud_client import renewal_loop
+            asyncio.create_task(renewal_loop())
+        except Exception as e:
+            logger.warning(f"⚠️ 启动桌面自动续期任务失败: {e}")
+
+    # 桌面模式：共享模式定时数据同步（离线模式下任务内自行跳过）
+    if settings.NPT_DESKTOP:
+        try:
+            import asyncio
+            from app.services.desktop_sync_service import sync_loop
+            asyncio.create_task(sync_loop())
+        except Exception as e:
+            logger.warning(f"⚠️ 启动桌面数据同步任务失败: {e}")
+
+    # 桌面模式：同组数据变更即时监听（服务器长轮询 → 立刻同步，定时同步仅作兜底）
+    if settings.NPT_DESKTOP:
+        try:
+            import asyncio
+            from app.services.desktop_sync_service import watch_loop
+            asyncio.create_task(watch_loop())
+        except Exception as e:
+            logger.warning(f"⚠️ 启动桌面数据变更监听失败: {e}")
+
+    # 历史安装包清理（每份约 320MB）已并入 npt-startup-maintenance 后台线程，不阻塞就绪
+
+    # 桌面模式：登录态守卫（同一账号在别处登录 → 本机自动登出）
+    if settings.NPT_DESKTOP:
+        try:
+            import asyncio
+            from app.api.v1.endpoints.desktop_local import session_guard_loop
+            asyncio.create_task(session_guard_loop())
+        except Exception as e:
+            logger.warning(f"⚠️ 启动桌面登录态守卫失败: {e}")
+
     # 初始化进程池（用于 CPU 密集型任务）
     pool = None
     try:
         if hasattr(settings, 'MAX_WORKERS') and settings.MAX_WORKERS > 1:
+            # fork 仅 Linux 可用；Windows/macOS 必须 spawn。
+            # 冻结包（桌面版）默认 MAX_WORKERS=1，不会走到这里。
+            mp_ctx = "fork" if sys.platform.startswith("linux") else "spawn"
             pool = ProcessPoolExecutor(
                 max_workers=settings.MAX_WORKERS,
-                mp_context="fork"
+                mp_context=mp_ctx
             )
-            logger.info(f"✅ ProcessPoolExecutor 已创建: {settings.MAX_WORKERS} workers (fork)")
+            logger.info(f"✅ ProcessPoolExecutor 已创建: {settings.MAX_WORKERS} workers ({mp_ctx})")
 
             # 注入到 TaskManager
             from app.services.task_manager import task_manager
@@ -124,6 +336,63 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"⚠️ ProcessPoolExecutor 创建失败: {e}，将使用线程池")
         pool = None
+
+    # 桌面端：图层缓存预热、坐标缺失提醒回填、旧索引拆分、索引对账等重活统一进
+    # npt-desktop-deferred 队列，等首次登录后再串行跑（见 _run_desktop_deferred_startup）。
+    # 服务器形态保持既有行为：预热后台线程 + 启动时同步回填（systemd 重启不频繁）。
+    if not settings.NPT_DESKTOP:
+        try:
+            from app.services.data_service import data_service
+            data_service.prewarm_all_map_caches()
+        except Exception as e:
+            logger.error(f"❌ 启动预热图层缓存失败: {e}")
+
+        try:
+            from app.services.data_service import data_service as _ds_for_warn_backfill
+            corrected = _ds_for_warn_backfill.backfill_coord_zero_warnings()
+            if corrected:
+                logger.info(f"✅ 坐标缺失提醒已按库内记录修正: {corrected} 个全量工参")
+            geo_corrected = _ds_for_warn_backfill.backfill_geo_coord_zero_warnings()
+            if geo_corrected:
+                logger.info(f"✅ 坐标缺失提醒已补算: {geo_corrected} 个地理化数据")
+        except Exception as e:
+            logger.warning(f"⚠️ 坐标缺失提醒回填失败: {e}")
+
+    # 服务器形态：后台补齐存量任务的小数量与「已应用」标记（同组任务历史展示用）。
+    # 只扫未计算过/标记为未应用的行，分批解析提交；桌面端不需要（本机任务可直接算）。
+    if not settings.NPT_DESKTOP:
+        try:
+            import threading
+
+            from app.services.task_manager import task_manager as _task_manager
+
+            def _backfill_task_metadata() -> None:
+                try:
+                    count = _task_manager.backfill_task_cell_counts()
+                    if count:
+                        logger.info(f"✅ 存量任务小数量回填完成: {count} 条")
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(f"⚠️ 存量任务小数量回填失败: {exc}")
+                try:
+                    applied = _task_manager.backfill_applied_flags()
+                    if applied:
+                        logger.info(f"✅ 存量任务「已应用」标记回填完成: {applied} 条")
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(f"⚠️ 存量任务「已应用」标记回填失败: {exc}")
+                # 等启动流量稳定后再为旧任务补摘要/明细索引（一次只解析一份大结果）
+                try:
+                    import time as _time
+                    _time.sleep(30)
+                    from app.services import task_result_index_service as _index_service
+                    processed = _index_service.backfill_pending(limit=5)
+                    if processed:
+                        logger.info(f"✅ 存量任务结果元数据/明细索引回填完成: {processed} 条")
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(f"⚠️ 存量任务结果索引回填失败: {exc}")
+
+            threading.Thread(target=_backfill_task_metadata, daemon=True, name="npt-task-meta-backfill").start()
+        except Exception as e:
+            logger.warning(f"⚠️ 启动任务元数据回填失败: {e}")
 
     logger.info("应用启动完成")
     yield
@@ -191,10 +460,17 @@ def create_app() -> FastAPI:
     app = FastAPI(
         title=settings.PROJECT_NAME,
         version=settings.VERSION,
-        description="网络规划工具API",
+        description="网优引擎API",
         lifespan=lifespan,
         default_response_class=UTF8JSONResponse,  # 设置默认响应类为UTF-8 JSON响应
     )
+
+    # 诊断：python-multipart 不可用（如冻结包漏收）时，所有文件上传都会返回
+    # 400 "There was an error parsing the body"，而真实原因会被 FastAPI 吞掉
+    try:
+        import multipart  # noqa: F401
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger(__name__).error("python-multipart 不可用，文件上传将全部失败: %s", exc)
 
     # 配置CORS
     # 保留原有配置，同时添加局域网IP支持
@@ -213,7 +489,9 @@ def create_app() -> FastAPI:
     )
 
     # GZip 压缩（排除 APK 等已压缩二进制文件——二次压缩在 ARM 上 CPU 开销极高）
-    app.add_middleware(SelectiveGZipMiddleware, minimum_size=1024)
+    # 级别 3：大结果（邻区单份 200MB+）压缩耗时约为默认 9 的 1/4，
+    # 压缩率仍接近 90%；再高的级别只省少量带宽，却会把事件循环卡住数秒。
+    app.add_middleware(SelectiveGZipMiddleware, minimum_size=1024, compresslevel=3)
 
     # 添加 Cache-Control 中间件：防止 HTML 被浏览器缓存
     @app.middleware("http")
@@ -223,6 +501,19 @@ def create_app() -> FastAPI:
             response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
         return response
 
+    # 慢请求日志：uvicorn access_log 关闭，出现"无操作也卡"时至少能定位到具体接口
+    @app.middleware("http")
+    async def log_slow_requests(request, call_next):
+        started = time.perf_counter()
+        response = await call_next(request)
+        elapsed = time.perf_counter() - started
+        if elapsed >= 2.0 and request.url.path.startswith(settings.API_V1_STR):
+            logger.warning(
+                "[SlowRequest] %s %s -> %s %.1fs",
+                request.method, request.url.path, response.status_code, elapsed,
+            )
+        return response
+
     # 注册路由
     app.include_router(api_router, prefix=settings.API_V1_STR)
 
@@ -230,6 +521,11 @@ def create_app() -> FastAPI:
     # 在挂载静态文件之前确保目录存在
     settings.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     app.mount("/static", StaticFiles(directory=str(settings.OUTPUT_DIR)), name="static")
+
+    # 图层制作输出文件（下载）
+    layers_dir = settings.UPLOAD_DIR / "layers"
+    layers_dir.mkdir(parents=True, exist_ok=True)
+    app.mount("/layer-files", StaticFiles(directory=str(layers_dir)), name="layer-files")
 
     def _serve_index():
         """读取 index.html 并返回 HTML 响应（禁用缓存）"""
@@ -254,7 +550,7 @@ def create_app() -> FastAPI:
         if result:
             return result
         return {
-            "message": "网络规划工具API",
+            "message": "网优引擎API",
             "version": settings.VERSION,
             "status": "running",
         }

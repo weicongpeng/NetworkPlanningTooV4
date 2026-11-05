@@ -1,0 +1,79 @@
+{
+  "_comment": "指标口径注册表（内置）。每条口径必须声明聚合语义；比率类必须给出分子/分母，禁止对比率直接求平均。source 为口径出处，具体分子分母以省公司 KPI 口径文件为准，可用 data/metric_registry.json 覆盖。",
+  "metrics": [
+    {
+      "metric_id": "rrc_conn_setup_attempt",
+      "name": "RRC连接建立请求次数",
+      "aliases": ["RRC连接建立请求次数", "建立请求次数", "请求建立次数", "RRC建立请求次数"],
+      "unit": "count",
+      "direction": "none",
+      "aggregation": "sum",
+      "granularities": ["hour", "day", "busy_hour"],
+      "source": "3GPP TS 28.552（RRC 连接建立）；分子分母以省公司 KPI 口径文件为准"
+    },
+    {
+      "metric_id": "rrc_conn_setup_success",
+      "name": "RRC连接建立成功次数",
+      "aliases": ["RRC连接建立成功次数", "建立成功次数", "成功建立次数", "RRC建立成功次数"],
+      "unit": "count",
+      "direction": "higher_better",
+      "aggregation": "sum",
+      "granularities": ["hour", "day", "busy_hour"],
+      "source": "3GPP TS 28.552；分子分母以省公司 KPI 口径文件为准"
+    },
+    {
+      "metric_id": "rrc_abnormal_release_times",
+      "name": "RRC异常释放次数",
+      "aliases": ["RRC异常释放次数", "异常释放次数", "掉线次数", "掉话次数"],
+      "unit": "count",
+      "direction": "lower_better",
+      "aggregation": "sum",
+      "granularities": ["hour", "day", "busy_hour"],
+      "source": "3GPP TS 28.552（连接异常释放）；分子分母以省公司 KPI 口径文件为准"
+    },
+    {
+      "metric_id": "call_drop_rate",
+      "name": "掉线率",
+      "aliases": ["掉线率", "掉话率", "无线掉线率", "DCR", "call drop rate"],
+      "unit": "percent",
+      "direction": "lower_better",
+      "aggregation": "ratio",
+      "numerator": {"metric_id": "rrc_abnormal_release_times"},
+      "denominator": {"metric_id": "rrc_conn_setup_success"},
+      "granularities": ["hour", "day", "busy_hour"],
+      "source": "3GPP TS 28.552（连接管理 KPI）；分子分母以省公司 KPI 口径文件为准"
+    },
+    {
+      "metric_id": "conn_success_rate",
+      "name": "接通率",
+      "aliases": ["接通率", "RRC连接建立成功率", "无线接通率", "connection success rate"],
+      "unit": "percent",
+      "direction": "higher_better",
+      "aggregation": "ratio",
+      "numerator": {"metric_id": "rrc_conn_setup_success"},
+      "denominator": {"metric_id": "rrc_conn_setup_attempt"},
+      "granularities": ["hour", "day", "busy_hour"],
+      "source": "3GPP TS 28.552；分子分母以省公司 KPI 口径文件为准"
+    },
+    {
+      "metric_id": "traffic_volume",
+      "name": "流量",
+      "aliases": ["流量", "上下行总流量", "总流量", "忙时流量", "数据流量", "traffic"],
+      "unit": "MB",
+      "direction": "none",
+      "aggregation": "sum",
+      "granularities": ["hour", "day", "busy_hour"],
+      "source": "3GPP TS 28.552（业务量）；单位以源文件为准"
+    },
+    {
+      "metric_id": "prb_utilization",
+      "name": "PRB利用率",
+      "aliases": ["PRB利用率", "下行PRB利用率", "上行PRB利用率", "PRB占用率"],
+      "unit": "percent",
+      "direction": "lower_better",
+      "aggregation": "avg",
+      "granularities": ["hour", "day", "busy_hour"],
+      "source": "瞬时/区间占比类指标，无分子分母时按区间均值聚合"
+    }
+  ]
+}

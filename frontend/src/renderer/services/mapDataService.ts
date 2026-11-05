@@ -14,8 +14,13 @@ import { mapApi } from './api'
 import { CoordinateTransformer } from '../utils/coordinate'
 import { SECTOR_VALIDATION, getLODLevel } from '../config/sector-config'
 import { indexedDBService } from './indexedDBService'
+import { userCacheSuffix } from '../utils/cacheKey'
 
-const CACHE_KEY = 'map_data_cache'
+// v2：扇区数据新增 managedElementId（网元ID）字段，旧缓存换键强制重建，避免属性框短暂显示 '-'
+// 地图工参缓存按登录用户隔离（同浏览器切换账号不得读到他账号所在组的扇区数据）
+const CACHE_KEY = () => `map_data_cache_v2${userCacheSuffix()}`
+// 旧版缓存键：拿到新数据后清理，避免废弃缓存长期占用 IndexedDB 空间
+const LEGACY_CACHE_KEY = 'map_data_cache'
 const CACHE_TTL = 2 * 60 * 60 * 1000 // 2小时缓存（持久化，数据更新时通过版本号强制刷新）
 
 // 数据版本键名 — 应用结果后递增版本号，地图强制重新加载
@@ -43,6 +48,8 @@ export interface SectorData {
   height?: number
   siteId?: string
   sectorId?: string
+  /** 网元ID（全量工参「管理网元ID」，站点级） */
+  managedElementId?: string
   networkType: 'LTE' | 'NR'
   earfcn?: number
   ssbFrequency?: number
@@ -104,10 +111,15 @@ export interface ValidationResult {
 /**
  * 地图数据服务类
  */
+interface MemoryCacheEntry {
+  data: MapDataResponse
+  expiry: number
+  version: number
+}
+
 export class MapDataService {
-  private cachedData: MapDataResponse | null = null
-  private cacheExpiry: number = 0
-  private _cacheVersion: number = 0 // 配合 sessionStorage 数据版本，版本号变更时强制重新加载
+  // 内存缓存按登录用户分键：同一浏览器切换账号时绝不能读到上个账号（组）的数据
+  private memoryCacheByUser = new Map<string, MemoryCacheEntry>()
   private readonly CACHE_DURATION = 60 * 60 * 1000 // 1小时缓存（持久化，仅在数据更新时失效）
 
   /**
@@ -283,8 +295,13 @@ export class MapDataService {
       const siteId = site.id || site.siteId || `unknown_site_${Math.random().toString(36).substr(2, 9)}`
 
       for (const sector of site.sectors) {
-        // 提取小区标识
-        const cellId = sector.id || sector.cellId || sector.localCellId || sector.sectorId
+        // 提取小区标识。sector.id 可能是纯小区标识（'55'，全量工参解析入库）
+        // 或 '基站_小区' 复合格式（'542685_55'，新站录入/历史数据）；小区标识本身不含下划线，
+        // 取末段得到纯小区标识，避免属性弹窗"小区ID"显示成 '542685_55'。
+        const rawCellId = sector.id || sector.cellId || sector.localCellId || sector.sectorId || ''
+        const cellId = String(rawCellId).includes('_')
+          ? String(rawCellId).split('_').pop()!
+          : String(rawCellId)
 
         // LTE: eNodeB标识 + 小区标识
         // NR: gNodeB标识 + 小区标识
@@ -325,6 +342,7 @@ export class MapDataService {
           height: sector.height || site.height,
           siteId: siteId,
           sectorId: cellId,
+          managedElementId: sector.managedElementId || site.managedElementId,
           networkType: site.networkType,
           earfcn: sector.earfcn || sector.earfcnDL,
           ssbFrequency: sector.ssbFrequency || sector.arfcnDL,
@@ -414,37 +432,42 @@ export class MapDataService {
    * 优先从 IndexedDB 读取，未命中则从后端获取
    */
   async getMapData(zoom?: number, forceRefresh = false): Promise<MapDataResponse> {
+    const cacheUserKey = userCacheSuffix()
+    const memEntry = this.memoryCacheByUser.get(cacheUserKey)
+
     // 数据版本检查：如果 sessionStorage 记录了更新版本，强制刷新
     const latestVersion = getDataVersion()
-    if (!forceRefresh && latestVersion > this._cacheVersion) {
+    if (!forceRefresh && memEntry && latestVersion > memEntry.version) {
       console.log('[MapDataService] 检测到数据版本已更新，强制刷新')
       forceRefresh = true
     }
 
     // 检查内存缓存
-    if (!forceRefresh && this.cachedData && Date.now() < this.cacheExpiry) {
+    if (!forceRefresh && memEntry && Date.now() < memEntry.expiry) {
       console.log('[MapDataService] 使用内存缓存')
-      return this.cachedData
+      return memEntry.data
     }
 
     // 尝试从 IndexedDB 读取（仅当未强制刷新时）
     if (!forceRefresh) {
       try {
-        const cachedData = await indexedDBService.get<MapDataResponse>(CACHE_KEY)
+        const cachedData = await indexedDBService.get<MapDataResponse>(CACHE_KEY())
         // 验证缓存数据有效性：扇区数量至少达到最小阈值
         if (cachedData) {
           const cachedTotal = (cachedData.lteSectors?.length || 0) + (cachedData.nrSectors?.length || 0)
           if (cachedTotal >= MapDataService.MIN_CACHED_SECTORS) {
             console.log('[MapDataService] 使用 IndexedDB 缓存')
-            // 同步到内存缓存
-            this.cachedData = cachedData
-            this.cacheExpiry = Date.now() + this.CACHE_DURATION
-            this._cacheVersion = getDataVersion()
+            // 同步到内存缓存（按用户分键）
+            this.memoryCacheByUser.set(cacheUserKey, {
+              data: cachedData,
+              expiry: Date.now() + this.CACHE_DURATION,
+              version: getDataVersion(),
+            })
             return cachedData
           } else {
             // 缓存数据量过少，视为无效，删除后重新获取
             console.warn(`[MapDataService] IndexedDB 缓存数据量异常（${cachedTotal} < ${MapDataService.MIN_CACHED_SECTORS}），丢弃并重新获取`)
-            indexedDBService.delete(CACHE_KEY).catch(() => {})
+            indexedDBService.delete(CACHE_KEY()).catch(() => {})
           }
         }
       } catch (error) {
@@ -486,17 +509,21 @@ export class MapDataService {
         bounds
       }
 
-      // 缓存到内存
-      this.cachedData = result
-      this.cacheExpiry = Date.now() + this.CACHE_DURATION
-      this._cacheVersion = getDataVersion()
+      // 缓存到内存（按用户分键）
+      this.memoryCacheByUser.set(cacheUserKey, {
+        data: result,
+        expiry: Date.now() + this.CACHE_DURATION,
+        version: getDataVersion(),
+      })
 
       // 仅在数据量正常时才写入 IndexedDB 持久缓存
       // 避免后端短暂异常时缓存空/部分数据导致地图长时间空白
       const totalSectors = result.lteSectors.length + result.nrSectors.length
       if (totalSectors >= MapDataService.MIN_CACHED_SECTORS) {
         try {
-          await indexedDBService.set(CACHE_KEY, result, CACHE_TTL)
+          await indexedDBService.set(CACHE_KEY(), result, CACHE_TTL)
+          // 新数据已落盘，旧键不再需要
+          indexedDBService.delete(LEGACY_CACHE_KEY).catch(() => {})
         } catch (error) {
           console.warn('[MapDataService] 写入 IndexedDB 缓存失败:', error)
         }
@@ -521,13 +548,16 @@ export class MapDataService {
     }
   }
 
+  /** 清空所有用户的内存缓存（登出/切换账号时调用） */
+  clearAllInMemory(): void {
+    this.memoryCacheByUser.clear()
+  }
+
   /**
    * 刷新缓存（清除前端 + 后端所有地图缓存）
    */
   async clearCache(): Promise<void> {
-    this.cachedData = null
-    this.cacheExpiry = 0
-    this._cacheVersion = 0 // 重置版本号，下次 getMapData 时 version > 0 必强制刷新
+    this.memoryCacheByUser.delete(userCacheSuffix())
     // 清除后端 _map_data_cache，确保下次请求重新读取最新 data.json
     try {
       await mapApi.clearCache()
@@ -535,7 +565,8 @@ export class MapDataService {
       // 后端清理非关键，即使失败也继续清理前端
     }
     try {
-      await indexedDBService.delete(CACHE_KEY)
+      await indexedDBService.delete(CACHE_KEY())
+      await indexedDBService.delete(LEGACY_CACHE_KEY).catch(() => {})
       console.log('[MapDataService] 所有缓存已清除')
     } catch (error) {
       console.warn('[MapDataService] 清除 IndexedDB 缓存失败:', error)
@@ -554,6 +585,15 @@ export class MapDataService {
 export const mapDataService = new MapDataService()
 export { bumpDataVersion }
 
+/**
+ * 清空所有用户的内存数据缓存（登录/登出切换账号时调用）。
+ * IndexedDB 缓存本身按用户 id 分键不会串读，清内存可立即释放并杜绝 TTL 内残留。
+ */
+export function clearAllInMemoryMapCaches(): void {
+  mapDataService.clearAllInMemory()
+  _cellListCacheByUser.clear()
+}
+
 // ============================================================
 // 轻量级小区列表服务（独立于地图数据，用于小区选择表格）
 // ============================================================
@@ -566,6 +606,8 @@ export interface CellListItem {
   networkType: 'LTE' | 'NR'
   frequency?: number
   pci?: number
+  longitude?: number | null
+  latitude?: number | null
 }
 
 /** 小区列表响应 */
@@ -575,15 +617,17 @@ interface CellListResponse {
   cacheVersion?: number
 }
 
-const _CELL_LIST_CACHE_KEY = 'cell_list_cache'
+// 小区列表缓存同样按登录用户隔离
+const _CELL_LIST_CACHE_KEY = () => `cell_list_cache${userCacheSuffix()}`
 const _CELL_LIST_CACHE_TTL = 24 * 60 * 60 * 1000 // 24小时缓存
 /** 缓存版本，递增以强制刷新缓存（接口数据格式变更时） */
-const _CELL_LIST_CACHE_VERSION = 3
+// v5：小区经纬度改为只取小区自身值（不再回退站点坐标），旧缓存会残留错误坐标
+// v6：桌面端在后台同步落地前可能把"空列表"写进 IndexedDB（TTL 24h），
+//     旧版本（v5）留下的空缓存升级后仍会被命中，导致「小区选择」一直空白
+const _CELL_LIST_CACHE_VERSION = 6
 
-// 内存缓存（持久化，仅在数据更新时失效）
-let _cellListCache: { data: CellListResponse | null; time: number } = {
-  data: null, time: 0
-}
+// 内存缓存（持久化，仅在数据更新时失效），按登录用户分键防止切账号串组
+const _cellListCacheByUser = new Map<string, { data: CellListResponse; time: number }>()
 
 /**
  * 获取小区选择列表（轻量级，跳过坐标转换和扇区验证）
@@ -594,24 +638,37 @@ let _cellListCache: { data: CellListResponse | null; time: number } = {
  * - 双缓存：内存（快速） + IndexedDB（持久化，应用重启后仍可用）
  */
 export async function getCellList(): Promise<CellListResponse> {
-  // 1. 检查内存缓存
-  if (_cellListCache.data && Date.now() - _cellListCache.time < _CELL_LIST_CACHE_TTL) {
-    console.log('[CellList] 使用内存缓存')
-    return _cellListCache.data
+  const userKey = userCacheSuffix()
+  // 1. 检查内存缓存（按用户分键）
+  const mem = _cellListCacheByUser.get(userKey)
+  if (mem && Date.now() - mem.time < _CELL_LIST_CACHE_TTL) {
+    // 空列表一律视为未命中：桌面端同步落地前取到的空列表不能固化在缓存里
+    if (mem.data.lte.length === 0 && mem.data.nr.length === 0) {
+      _cellListCacheByUser.delete(userKey)
+    } else {
+      console.log('[CellList] 使用内存缓存')
+      return mem.data
+    }
   }
 
   // 2. 检查 IndexedDB 缓存（仅版本匹配时使用）
   try {
-    const cached = await indexedDBService.get<CellListResponse>(_CELL_LIST_CACHE_KEY)
+    const cached = await indexedDBService.get<CellListResponse>(_CELL_LIST_CACHE_KEY())
     if (cached && cached.cacheVersion === _CELL_LIST_CACHE_VERSION) {
-      console.log('[CellList] 使用 IndexedDB 缓存')
-      _cellListCache = { data: cached, time: Date.now() }
-      return cached
+      if (cached.lte.length === 0 && cached.nr.length === 0) {
+        // 旧版本或同步前写入的空缓存：删除后走网络请求，避免「小区选择」长期空白
+        console.log('[CellList] 缓存的空列表不生效，改为重新请求')
+        indexedDBService.delete(_CELL_LIST_CACHE_KEY()).catch(() => {})
+      } else {
+        console.log('[CellList] 使用 IndexedDB 缓存')
+        _cellListCacheByUser.set(userKey, { data: cached, time: Date.now() })
+        return cached
+      }
     }
     // 版本不匹配时清除旧缓存
     if (cached && cached.cacheVersion !== _CELL_LIST_CACHE_VERSION) {
       console.log('[CellList] 缓存版本不匹配，清除旧缓存')
-      indexedDBService.delete(_CELL_LIST_CACHE_KEY).catch(() => {})
+      indexedDBService.delete(_CELL_LIST_CACHE_KEY()).catch(() => {})
     }
   } catch (err) {
     // IndexedDB 读取失败，回退到网络请求
@@ -636,16 +693,26 @@ export async function getCellList(): Promise<CellListResponse> {
     }
     const t2 = performance.now()
 
+    // 空结果不入缓存：桌面端是「先启动应用 → 登录后后台同步 → 用户打开规划页」，
+    // 很容易在同步落地前就把空列表取到；一旦写进缓存（内存 + IndexedDB 24h），
+    // 同步完成后小区选择仍是空的（网页端没有这个时间窗，所以只有桌面端复现）。
+    if (dedupLte.length === 0 && dedupNr.length === 0) {
+      _cellListCacheByUser.delete(userCacheSuffix())
+      await clearCellListCache()
+      console.log('[CellList] 服务端暂无小区，不写入缓存')
+      return { lte: [], nr: [] }
+    }
+
     const data: CellListResponse = {
       lte: dedupLte,
       nr: dedupNr,
       cacheVersion: _CELL_LIST_CACHE_VERSION
     }
 
-    // 写入双缓存
-    _cellListCache = { data, time: Date.now() }
+    // 写入双缓存（按用户分键）
+    _cellListCacheByUser.set(userCacheSuffix(), { data, time: Date.now() })
     try {
-      await indexedDBService.set(_CELL_LIST_CACHE_KEY, data, _CELL_LIST_CACHE_TTL)
+      await indexedDBService.set(_CELL_LIST_CACHE_KEY(), data, _CELL_LIST_CACHE_TTL)
     } catch (err) {
       // IndexedDB 写入失败非关键
     }
@@ -658,12 +725,50 @@ export async function getCellList(): Promise<CellListResponse> {
 }
 
 /**
+ * 执行规划前小区必须具备的字段
+ * - siteId: 基站ID；id: 小区ID；frequency: 频点；longitude/latitude: 经纬度
+ */
+export type CellRequiredField = 'siteId' | 'id' | 'frequency' | 'longitude' | 'latitude'
+
+/** 存在字段缺失的小区 */
+export interface CellMissingFields {
+  id: string
+  name: string
+  missing: CellRequiredField[]
+}
+
+/**
+ * 校验选中小区的必要字段完整性（经度/纬度/频点/基站ID/小区ID）
+ *
+ * @returns 存在缺失的小区列表（含每个小区缺失的字段），为空表示全部通过
+ */
+export function findCellsMissingRequiredFields(
+  sectors: CellListItem[],
+  selectedIds: Set<string>
+): CellMissingFields[] {
+  const invalid: CellMissingFields[] = []
+  for (const s of sectors) {
+    if (!selectedIds.has(s.id)) continue
+    const missing: CellRequiredField[] = []
+    if (!s.siteId) missing.push('siteId')
+    if (!s.id) missing.push('id')
+    if (s.frequency == null || !Number.isFinite(s.frequency)) missing.push('frequency')
+    if (s.longitude == null || !Number.isFinite(s.longitude)) missing.push('longitude')
+    if (s.latitude == null || !Number.isFinite(s.latitude)) missing.push('latitude')
+    if (missing.length > 0) {
+      invalid.push({ id: s.id, name: s.name || s.id, missing })
+    }
+  }
+  return invalid
+}
+
+/**
  * 清除小区列表缓存（内存 + IndexedDB）
  */
 export async function clearCellListCache(): Promise<void> {
-  _cellListCache = { data: null, time: 0 }
+  _cellListCacheByUser.delete(userCacheSuffix())
   try {
-    await indexedDBService.delete(_CELL_LIST_CACHE_KEY)
+    await indexedDBService.delete(_CELL_LIST_CACHE_KEY())
   } catch (err) {
     // IndexedDB 删除失败非关键
   }

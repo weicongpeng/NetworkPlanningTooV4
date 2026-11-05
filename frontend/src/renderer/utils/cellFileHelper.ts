@@ -24,15 +24,15 @@ function findColumn(columns: string[], patterns: string[]): string | undefined {
 }
 
 /**
- * 从上传的 cell-tree Excel 文件中提取小区ID集合
+ * 从上传的 cell-tree Excel 文件中按网络类型分组提取小区ID
  *
  * 文件格式：
  * - LTE Sheet: eNodeBID + CellID → `${siteId}_${cellId}`
  * - NR Sheet: gNodeBID + CellID → `${siteId}_${cellId}`
  *
- * @returns 提取的小区ID数组
+ * @returns { lte: string[], nr: string[] } 分别对应 LTE / NR Sheet 提取的小区ID
  */
-export function extractCellIdsFromFile(file: File): Promise<string[]> {
+export function extractCellIdsFromFileGrouped(file: File): Promise<{ lte: string[]; nr: string[] }> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader()
     reader.onload = (e) => {
@@ -40,7 +40,8 @@ export function extractCellIdsFromFile(file: File): Promise<string[]> {
         const data = new Uint8Array(e.target!.result as ArrayBuffer)
         const workbook = XLSX.read(data, { type: 'array' })
 
-        const allIds: string[] = []
+        const lteIds: string[] = []
+        const nrIds: string[] = []
 
         for (const sheetName of workbook.SheetNames) {
           const upperName = sheetName.toUpperCase()
@@ -69,6 +70,7 @@ export function extractCellIdsFromFile(file: File): Promise<string[]> {
             continue
           }
 
+          const target = isLTE ? lteIds : nrIds
           for (const row of rows) {
             const siteId = String(row[siteIdCol] ?? '').trim()
             const cellId = String(row[cellIdCol] ?? '').trim()
@@ -76,12 +78,12 @@ export function extractCellIdsFromFile(file: File): Promise<string[]> {
             const cleanSiteId = siteId.replace(/\.0+$/, '')
             const cleanCellId = cellId.replace(/\.0+$/, '')
             if (cleanSiteId && cleanCellId) {
-              allIds.push(`${cleanSiteId}_${cleanCellId}`)
+              target.push(`${cleanSiteId}_${cleanCellId}`)
             }
           }
         }
 
-        resolve(allIds)
+        resolve({ lte: lteIds, nr: nrIds })
       } catch (err) {
         reject(err)
       }
@@ -89,6 +91,15 @@ export function extractCellIdsFromFile(file: File): Promise<string[]> {
     reader.onerror = () => reject(new Error('文件读取失败'))
     reader.readAsArrayBuffer(file)
   })
+}
+
+/**
+ * 从上传的 cell-tree Excel 文件中提取全部小区ID（LTE + NR 合并）
+ *
+ * @returns 提取的小区ID数组（不区分网络类型）
+ */
+export function extractCellIdsFromFile(file: File): Promise<string[]> {
+  return extractCellIdsFromFileGrouped(file).then(({ lte, nr }) => [...lte, ...nr])
 }
 
 /**

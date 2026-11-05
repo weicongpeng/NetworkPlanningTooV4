@@ -7,14 +7,12 @@
 interface MapState {
   center: [number, number]
   zoom: number
-  mapLayerType: 'roadmap' | 'satellite'
 }
 
 class MapStateService {
   private state: MapState = {
     center: [23.7433, 114.6974], // 河源市 GCJ02坐标
-    zoom: 12,
-    mapLayerType: 'roadmap'
+    zoom: 12
   }
 
   private listeners: Set<(state: MapState) => void> = new Set()
@@ -48,8 +46,7 @@ class MapStateService {
   reset(): void {
     this.state = {
       center: [23.7433, 114.6974],
-      zoom: 12,
-      mapLayerType: 'roadmap'
+      zoom: 12
     }
     this.notifyListeners()
   }

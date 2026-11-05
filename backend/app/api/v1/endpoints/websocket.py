@@ -12,6 +12,30 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
+def _resolve_ws_group(token: str):
+    """解码查询串/消息里的 JWT，返回用户的数据组 (city, operator)；失败返回 None。"""
+    if not token:
+        return None
+    try:
+        from app.core.database import SessionLocal
+        from app.services import auth_service
+
+        payload = auth_service.decode_token(token)
+        if not payload:
+            return None
+        user_id = int(payload.get("sub"))
+        db = SessionLocal()
+        try:
+            user = auth_service.get_user_by_id(db, user_id)
+        finally:
+            db.close()
+        if user is None or not getattr(user, "is_active", True):
+            return None
+        return (user.city or "", user.operator or "")
+    except Exception:  # noqa: BLE001
+        return None
+
+
 @router.websocket("/ws/tasks")
 async def websocket_tasks_endpoint(websocket: WebSocket):
     """
@@ -34,6 +58,11 @@ async def websocket_tasks_endpoint(websocket: WebSocket):
 
     try:
         await websocket_manager.connect(websocket, client_id)
+        # 查询串里的 JWT（前端在已登录时携带）：登记数据组，
+        # 之后只接收同组的数据变更推送（data_changed）
+        group = _resolve_ws_group(websocket.query_params.get("token") or "")
+        if group:
+            websocket_manager.register_client_group(client_id, group[0], group[1])
         logger.info(f"WebSocket客户端连接: {client_id}")
 
         # 持续接收客户端消息
@@ -68,6 +97,15 @@ async def websocket_tasks_endpoint(websocket: WebSocket):
                     # 心跳响应
                     await websocket.send_json({"type": "pong"})
                     logger.debug(f"收到心跳: {client_id}")
+
+                elif message_type == "auth":
+                    # 登录后补鉴权（连接建立时可能还没登录）：登记数据组
+                    auth_group = _resolve_ws_group(str(data.get("token") or ""))
+                    if auth_group:
+                        websocket_manager.register_client_group(client_id, auth_group[0], auth_group[1])
+                        await websocket.send_json({"type": "auth_ok"})
+                    else:
+                        logger.warning(f"WebSocket 鉴权失败: {client_id}")
 
                 else:
                     logger.warning(f"未知消息类型: {message_type}, 来自客户端: {client_id}")

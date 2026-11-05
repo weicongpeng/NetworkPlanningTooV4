@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find *)",
+      "Bash(dpkg *)",
+      "Bash(curl *)",
+      "Bash(do)",
+      "Bash(done)",
+      "Bash(python3 *)",
+      "Bash(pip3 *)",
+      "Bash(rm *)",
+      "Bash(grep *)",
+      "Bash(npm view *)"
+    ]
+  },
+  "$version": 4
+}

@@ -40,6 +40,9 @@ export default {
         card: {
           DEFAULT: 'hsl(var(--card))',
           foreground: 'hsl(var(--card-foreground))'
+        },
+        warning: {
+          foreground: 'hsl(var(--warning-foreground))'
         }
       },
       borderRadius: {
