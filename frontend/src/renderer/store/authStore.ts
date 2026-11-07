@@ -239,6 +239,9 @@ export const useAuthStore = create<AuthState>()(
         })
         // 重新登录清除批量距离匹配持久化状态（初始登录语义）
         try { sessionStorage.removeItem('distanceMatch.shared') } catch { /* ignore */ }
+        // 通知页面级缓存（数据管理「运行结果」日志等）按当前账号清理；
+        // 必须在清空 user 之前派发，页面此时才能定位到当前账号的日志桶
+        try { window.dispatchEvent(new CustomEvent('auth:logout')) } catch { /* ignore */ }
         set({
           token: null,
           user: null,

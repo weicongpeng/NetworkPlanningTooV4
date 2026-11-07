@@ -1795,6 +1795,7 @@ export function LayerControl({
               onPointerDown={(e) => e.stopPropagation()}
             >
               <span
+                data-guide="map-layer-control"
                 style={{
                   fontWeight: 600,
                   fontSize: '12px',

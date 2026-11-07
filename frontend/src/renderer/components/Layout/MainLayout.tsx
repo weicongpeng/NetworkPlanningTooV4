@@ -26,6 +26,7 @@ import { useAuthStore } from '../../store/authStore'
 import { useThemeStore } from '../../store/themeStore'
 import { reloadUserMapSettings } from '../../store/mapStore'
 import { Toaster } from './Toaster'
+import { GuideTipsHost } from '../GuideTipsHost'
 import { DesktopUpdateDialog } from '../DesktopUpdateDialog'
 import { DesktopUpdateReadyDialog } from '../DesktopUpdateReadyDialog'
 import { DesktopSyncIndicator } from '../DesktopSyncIndicator'
@@ -732,6 +733,8 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
       {/* 应用下载弹窗（手机APP / 电脑端）- 放在 main 外部避免地图组件层叠上下文遮挡 */}
       <AppDownloadDialog open={showAppDownload} onClose={() => setShowAppDownload(false)} />
       <Toaster />
+      {/* 页面冒泡引导：所有登录用户；停留 3 秒触发、同刻只显示一条；登录周期内每条一次、累计 30 次后停止 */}
+      <GuideTipsHost />
       {/* 桌面版 OTA 更新提示（网页端自动静默：接口 404） */}
       <DesktopUpdateDialog />
       {/* 后台下载完成后的「重启更新 / 稍后更新」提示 */}

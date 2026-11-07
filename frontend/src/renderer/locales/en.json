@@ -1,4 +1,17 @@
 {
+  "guide": {
+    "pciNewTask": "If previous tasks have unapplied planning results, check whether they need to be applied to the parameters before starting a new planning task, to ensure accuracy.",
+    "resultShowMap": "On the result page, click 'Map Display' to show or hide the map.",
+    "dataImportToMap": "Imported parameters, layer files and geo data can be synced to Map Tools; import them as needed. Layer files must be zipped to be recognized, e.g. pack tab, map, dat, id into one zip.",
+    "importedDownload": "In 'Imported Data', click the download icon on the right of a file to download it.",
+    "cellToolsExpand": "Click 'Expand' at the top right to enlarge the window. 'Parameter Update' currently supports ZTE live-network data only.",
+    "mapLayerControl": "Double-click a layer to show it globally; right-click a layer for settings, thematic rendering and refresh.",
+    "mapSearchSwitch": "Click to switch between map POI/place-name search and cell-parameter search; Ctrl+F lets you pick a geo data file to search.",
+    "mapSourceSwitch": "Click to switch the map source (AMap / Tianditu vector & satellite, 3D map, blank map).",
+    "mapDragTool": "Enable the hand tool to pan the map; click a layer feature to view its attributes.",
+    "mapClearMarkers": "Click to clear markers produced while using the map: search marks, measurement trails, points and selection shapes.",
+    "close": "Close"
+  },
   "desktopReleases": {
     "title": "Desktop Distribution",
     "uploadTitle": "Upload a new installer",
@@ -2095,7 +2108,7 @@
     "modeStandalone": "Standalone mode",
     "modeSharedHint": "Same account, permissions and data group as the web app; data can be shared.",
     "modeStandaloneHint": "Data stays on this machine and is usable offline; regular users need a one-time admin approval (admins are exempt). Permissions match the web app.",
-    "pendingHint": "Standalone authorization requested. Waiting for an admin to confirm it on the Desktop Licenses page.",
+    "pendingHint": "Standalone authorization request submitted. Please wait or contact an administrator for approval.",
     "waiting": "Waiting for admin confirmation…",
     "rejected": "The request was not approved. Please contact an administrator.",
     "cancel": "Cancel",

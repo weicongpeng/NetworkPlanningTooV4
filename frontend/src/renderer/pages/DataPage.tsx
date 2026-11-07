@@ -58,7 +58,7 @@ export function DataPage() {
   // 下载状态跟踪
   const downloadStore = useDownloadStore()
 
-  // 操作日志（持久化到 sessionStorage，退出登录/刷新页面时清除）
+  // 操作日志（模块级按账号分桶：页面切换保留、刷新后消失；同一设备切换/注册账号互不串日志）
   interface LogEntry {
     id: number
     time: string
@@ -69,19 +69,29 @@ export function DataPage() {
     // 用于去重覆盖的 key（同一操作的多次状态变更共用同一 key）
     opKey?: string
   }
-  // 模块级持久化存储（页面切换保留，刷新页面后自然消失）
-  const _store: { entries: LogEntry[]; id: number } = (window as any).__nptLog || ((window as any).__nptLog = { entries: [], id: 0 })
+  interface LogBucket { entries: LogEntry[]; id: number }
+  const _buckets: Record<string, LogBucket> =
+    (window as any).__nptLogByUser || ((window as any).__nptLogByUser = {})
 
-  const [logs, setLogs] = useState<LogEntry[]>(_store.entries)
-  const LOG_STORAGE_KEY = 'npt_operation_logs'
+  // 按当前账号取桶；addLog 经 ref 读取，保证换账号后闭包指向新账号的桶
+  const logUsername = currentUser?.username || '__anonymous__'
+  const currentBucket = () => _buckets[logUsername] || (_buckets[logUsername] = { entries: [], id: 0 })
+  const bucketRef = useRef<LogBucket>(currentBucket())
+  bucketRef.current = currentBucket()
+
+  const [logs, setLogs] = useState<LogEntry[]>(() => [...bucketRef.current.entries])
   const logEndRef = useRef<HTMLDivElement>(null)
 
-  // 退出登录时清除日志
+  // 账号变化（含同一设备注册新用户）时切到该账号自己的日志桶
+  useEffect(() => {
+    setLogs([...bucketRef.current.entries])
+  }, [logUsername])
+
+  // 退出登录时清空当前账号日志（事件由 authStore.logout 派发）
   useEffect(() => {
     const handleLogout = () => {
-      _store.entries = []
+      bucketRef.current.entries = []
       setLogs([])
-      try { sessionStorage.removeItem(LOG_STORAGE_KEY) } catch {}
     }
     window.addEventListener('auth:logout', handleLogout)
     return () => window.removeEventListener('auth:logout', handleLogout)
@@ -97,11 +107,12 @@ export function DataPage() {
     const now = new Date()
     const pad = (n: number) => String(n).padStart(2, '0')
     const time = `${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`
-    _store.id += 1
-    const entry: LogEntry = { id: _store.id, time, type, message, status, detail, opKey }
+    const store = bucketRef.current
+    store.id += 1
+    const entry: LogEntry = { id: store.id, time, type, message, status, detail, opKey }
 
-    // 直接在模块级数组上操作，避免 React 闭包问题
-    const arr = _store.entries
+    // 直接在当前账号的桶上操作，避免 React 闭包问题
+    const arr = store.entries
     let replaced = false
     if (opKey && arr.length > 0) {
       for (let i = arr.length - 1; i >= 0; i--) {
@@ -926,7 +937,7 @@ export function DataPage() {
         <div className="space-y-8">
             {/* 文件上传 */}
             <div className="bg-card p-3 rounded-lg border border-border">
-            <h2 className="text-base font-semibold mb-2">{t('data.importData') || '导入数据'}</h2>
+            <h2 data-guide="data-import-to-map" className="text-base font-semibold mb-2">{t('data.importData') || '导入数据'}</h2>
             {!permImport && (
               <p className="text-xs text-muted-foreground mb-2 bg-muted/40 px-2 py-1 rounded">
                 {t('data.noPermission', '无权限，请联系管理员')}
@@ -1412,6 +1423,7 @@ export function DataPage() {
                       </div>
                     ) : (
                     <button
+                      data-guide="imported-download"
                       onClick={(e) => {
                         e.stopPropagation()
                         handleDownload(item)
@@ -1470,7 +1482,7 @@ export function DataPage() {
             {logs.length > 0 && (
               <button
                 onClick={() => {
-              _store.entries = []
+              bucketRef.current.entries = []
               setLogs([])
             }}
                 className="text-[11px] px-2 py-1 rounded text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
@@ -2357,6 +2369,7 @@ function CellToolsCard({
         ))}
       </div>
       <button
+        data-guide="cell-tools-expand"
         onClick={() => setExpanded(!expanded)}
         className="ml-auto text-muted-foreground hover:text-foreground transition-colors p-1 rounded hover:bg-muted"
         title={expanded ? (t('newCellEntry.collapse') || '缩回') : (t('newCellEntry.expand') || '展开')}

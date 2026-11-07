@@ -61,7 +61,7 @@ export function DesktopAuthPendingDialog() {
           <h2 className="text-base font-semibold">{t('desktopAuth.title', '申请授权')}</h2>
         </div>
         <p className="text-sm text-muted-foreground">
-          {t('desktopAuth.pendingHint', '已提交单机模式授权申请，请等待管理员在「桌面授权」页面确认。')}
+          {t('desktopAuth.pendingHint', '已提交单机模式授权申请，请等待或联系管理员授权。')}
         </p>
         <div className="text-xs text-muted-foreground">
           {t('auth.username', '用户名')}：{pendingUsername}

@@ -1288,6 +1288,7 @@ export function PCIPage() {
                 onClick={() => !isRunning && setActiveLeftTab('task-config')}
                 className={activeLeftTab === 'task-config' ? btn.activeTab : btn.ghost}
                 disabled={isRunning}
+                data-guide={activeLeftTab === 'task-config' ? 'pci-new-task' : undefined}
               >
                 {t('common.newTask') || '新建任务'}
               </button>
@@ -1579,6 +1580,7 @@ export function PCIPage() {
                           {applyingToParams ? <><Loader2 size={14} className="animate-spin" />{t('pci.applying') || '应用中...'}</> : applySuccess ? <><Check size={14} />{t('pci.applied') || '已应用'}</> : <><Save size={14} />{t('pci.apply') || '应用到工参'}</>}
                         </button>
                         <button
+                          data-guide="result-show-map"
                           onClick={() => setShowMap(prev => !prev)}
                           className={`flex items-center gap-2 px-4 py-2 rounded-lg transition-colors text-xs font-medium whitespace-nowrap ${showMap ? 'bg-blue-400 text-white hover:bg-blue-500' : 'bg-card border border-border hover:bg-muted/80'}`}
                         >

@@ -1492,6 +1492,7 @@ export function TACPage() {
                               {t('tac.search') || '搜索'}
                             </button>
                             <button
+                              data-guide="result-show-map"
                               onClick={() => setShowMap(prev => !prev)}
                               className={`flex items-center gap-2 px-3 py-1.5 rounded-lg transition-colors text-sm ${
                                 showMap

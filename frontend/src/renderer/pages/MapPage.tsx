@@ -3038,6 +3038,7 @@ export function MapPage() {
     /* 地图拖拽（手形）工具按钮：保持激活，再次点击不去激活，点击其他工具切换出去 */
     drag: (
       <button
+        data-guide="map-drag-tool"
         className={`px-2 py-1.5 text-xs rounded transition-colors flex items-center gap-1 ${mapDragTool ? 'bg-blue-400 text-white hover:bg-blue-500' : 'text-foreground hover:bg-muted hover:text-primary'
           }`}
         onClick={handleMapDragToolToggle}
@@ -3325,6 +3326,7 @@ export function MapPage() {
     maptype: (
       <div className="relative" ref={mapSourceMenuRef}>
         <button
+          data-guide="map-source-switch"
           className={`px-2 py-1.5 text-xs rounded transition-colors flex items-center gap-1 ${
             mapSourceMenuOpen ? 'bg-muted text-primary' : 'text-foreground hover:bg-muted hover:text-primary'
           }`}
@@ -3533,6 +3535,7 @@ export function MapPage() {
         <div className="relative flex items-center gap-2 min-w-0 flex-shrink justify-start">
           {/* 搜索模式切换 - 单按钮切换 */}
           <button
+            data-guide="map-search-switch"
             onClick={() => {
               const newMode = searchMode === 'parameter' ? 'map' : 'parameter'
               setSearchMode(newMode)
@@ -3679,6 +3682,7 @@ export function MapPage() {
 
           {/* 独立的清除搜索标记按钮，使用文字标签 */}
           <button
+            data-guide="map-clear-markers"
             onClick={() => {
               // 只清除各工具的轨迹/标记/选中状态，不退出已激活工具（打点/测量/圈选保持激活）
               clearAllSearch()
