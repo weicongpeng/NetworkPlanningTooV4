@@ -18,7 +18,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { CSSProperties, PointerEvent as ReactPointerEvent, ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
-import { ChevronUp, List, Move } from 'lucide-react'
+import { ChevronUp, List } from 'lucide-react'
 import { useMapStore, type LegendLayout } from '../../store/mapStore'
 
 export type LegendLayoutKey = 'thematic' | 'heatmap' | 'pci-mod'
@@ -28,6 +28,8 @@ const MIN_WIDTH = 140
 const MIN_HEIGHT = 48
 /** 折叠后悬浮图标的边长 */
 const COLLAPSED_SIZE = 34
+/** 右吸附时距地图容器右边缘的间距（折叠图标与展开窗口共用右锚点） */
+const EDGE_GAP = 10
 
 interface InteractionState {
   mode: 'move' | 'resize'
@@ -85,6 +87,11 @@ export function LegendFrame({
   const movedRef = useRef(false)
   /** 默认展开；折叠态不持久化，每次进入图例都是展开的 */
   const [collapsed, setCollapsed] = useState(false)
+  /**
+   * 右吸附模式：点折叠按钮后置位，悬浮图标贴地图右边缘；点图标展开后窗口复用同一
+   * 右锚点向左展开。任一拖动开始时退出该模式，恢复用户自定义位置（拖动仍可用）。
+   */
+  const [docked, setDocked] = useState(false)
 
   const effective = draft ?? layout ?? {}
 
@@ -149,7 +156,11 @@ export function LegendFrame({
     const onMove = (e: PointerEvent) => {
       const dx = e.clientX - interaction.startX
       const dy = e.clientY - interaction.startY
-      if (Math.abs(dx) > 2 || Math.abs(dy) > 2) movedRef.current = true
+      if (Math.abs(dx) > 2 || Math.abs(dy) > 2) {
+        // 真正拖动才退出右吸附；单纯点击（随后展开）保持右锚定
+        if (!movedRef.current) setDocked(false)
+        movedRef.current = true
+      }
       if (interaction.mode === 'move') {
         setDraft({
           ...interaction.start,
@@ -222,17 +233,30 @@ export function LegendFrame({
     fontSize: '11px',
     overflow: 'hidden'
   }
-  if (effective.x !== undefined) {
-    style.left = effective.x
+  if (docked && !draft) {
+    // 折叠图标贴地图右边缘；展开窗口共用右锚点，宽度自适应即向左展开。
+    // 垂直位置沿用自定义 y 或默认锚点，避免折叠/展开时上下跳动。
+    style.right = EDGE_GAP
+    if (effective.y !== undefined) {
+      style.top = effective.y
+    } else if (defaultAnchor.top !== undefined) {
+      style.top = defaultAnchor.top
+    } else if (defaultAnchor.bottom !== undefined) {
+      style.bottom = defaultAnchor.bottom
+    }
   } else {
-    if (defaultAnchor.left !== undefined) style.left = defaultAnchor.left
-    if (defaultAnchor.right !== undefined) style.right = defaultAnchor.right
-  }
-  if (effective.y !== undefined) {
-    style.top = effective.y
-  } else {
-    if (defaultAnchor.top !== undefined) style.top = defaultAnchor.top
-    if (defaultAnchor.bottom !== undefined) style.bottom = defaultAnchor.bottom
+    if (effective.x !== undefined) {
+      style.left = effective.x
+    } else {
+      if (defaultAnchor.left !== undefined) style.left = defaultAnchor.left
+      if (defaultAnchor.right !== undefined) style.right = defaultAnchor.right
+    }
+    if (effective.y !== undefined) {
+      style.top = effective.y
+    } else {
+      if (defaultAnchor.top !== undefined) style.top = defaultAnchor.top
+      if (defaultAnchor.bottom !== undefined) style.bottom = defaultAnchor.bottom
+    }
   }
   if (effective.width !== undefined) {
     style.width = effective.width
@@ -303,16 +327,15 @@ export function LegendFrame({
         }}
       >
         <span style={{ fontWeight: 600, color: 'hsl(var(--foreground))' }}>{title}</span>
-        <Move size={10} style={{ marginLeft: 'auto', color: 'hsl(var(--muted-foreground))', flexShrink: 0 }} />
         <button
           type="button"
           onPointerDown={(e) => e.stopPropagation()}
-          onClick={() => setCollapsed(true)}
+          onClick={() => { setDocked(true); setCollapsed(true) }}
           title={t('map.legendCollapse')}
           aria-label={t('map.legendCollapse')}
           style={{
             display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
-            padding: 0, border: 'none', background: 'transparent', lineHeight: 0,
+            marginLeft: 'auto', padding: 0, border: 'none', background: 'transparent', lineHeight: 0,
             color: 'hsl(var(--muted-foreground))', cursor: 'pointer', flexShrink: 0
           }}
         >

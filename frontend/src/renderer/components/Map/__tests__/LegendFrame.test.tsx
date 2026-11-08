@@ -70,19 +70,37 @@ function renderFrame() {
 }
 
 describe('LegendFrame 折叠与越界纠偏', () => {
-  it('默认展开；折叠为悬浮图标后点击图标恢复展开', () => {
-    renderFrame()
+  it('默认展开；折叠图标右吸附，点击展开后窗口以右锚定向左展开', () => {
+    const { container } = renderFrame()
+    const frame = () => container.querySelector('.legend-frame-test') as HTMLElement
     expect(screen.getByText('图例内容')).toBeTruthy()
+    // 十字拖动图标已移除：标题栏只剩折叠按钮一个图标（拖动仍挂在标题栏上）
+    expect(frame().querySelectorAll('svg').length).toBe(1)
 
     fireEvent.click(screen.getByRole('button', { name: 'map.legendCollapse' }))
     expect(screen.queryByText('图例内容')).toBeNull()
     const icon = screen.getByRole('button', { name: 'map.legendExpand' })
-    expect(icon).toBeTruthy()
+    // 折叠图标贴地图右边缘，不再沿用窗口的左侧绝对位置
+    expect(frame().style.right).toBe('10px')
+    expect(frame().style.left).toBe('')
 
     // 点击（无位移）：pointerdown 开始交互，window pointerup 结束 → 展开
     fireEvent.pointerDown(icon, { button: 0, clientX: 100, clientY: 100 })
     fireEvent.pointerUp(window, { clientX: 100, clientY: 100 })
     expect(screen.getByText('图例内容')).toBeTruthy()
+    // 展开后共用右锚点：窗口向左展开（不设 left）
+    expect(frame().style.right).toBe('10px')
+    expect(frame().style.left).toBe('')
+    cleanup()
+  })
+
+  it('已有自定义左侧布局时折叠仍强制右吸附', () => {
+    storeState.legendLayout = { heatmap: { x: 400, y: 200 } }
+    const { container } = renderFrame()
+    fireEvent.click(screen.getByRole('button', { name: 'map.legendCollapse' }))
+    const frame = container.querySelector('.legend-frame-test') as HTMLElement
+    expect(frame.style.right).toBe('10px')
+    expect(frame.style.left).toBe('')
     cleanup()
   })
 
