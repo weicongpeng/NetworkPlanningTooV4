@@ -1304,6 +1304,8 @@
     "thematicLegendEditHint": "Double-click to edit this layer's thematic settings",
     "legendDragHint": "Drag to move the legend",
     "legendResizeHint": "Drag to resize the legend window",
+    "legendCollapse": "Collapse to floating icon",
+    "legendExpand": "Expand legend",
     "thematicModeRange": "Range Coloring",
     "thematicModeValue": "Value Coloring",
     "thematicValueColors": "Value Colors",

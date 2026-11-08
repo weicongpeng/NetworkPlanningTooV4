@@ -1,17 +1,24 @@
 /**
- * 图例浮窗容器（专题图层图例 / 热力图图例共用）
+ * 图例浮窗容器（专题图层图例 / 热力图图例 / PCI模值图例共用）
  *
  * 交互：
  * - 拖拽标题栏：自由移动位置
  * - 拖拽右下角手柄：自由调整窗口大小
+ * - 点击标题栏折叠按钮：收起为一个悬浮图标；点击该图标展开（默认展开）
+ * - 折叠后的悬浮图标同样可按住拖动，位置与窗口布局一并持久化
  * - 位置/大小按登录用户持久化（mapStore.mapSettings.legendLayout），
  *   随现有 mapSettings → 后端 user_settings 链路跨会话保存
  *
  * 未自定义过布局时沿用默认锚点（专题右上、热力右下），首次拖拽/缩放后转为绝对定位。
+ *
+ * 布局是跨端共享的绝对像素坐标：桌面端地图容器可能比网页端小，挂载时以及容器
+ * 尺寸变化时都必须把越界布局拉回可视区域，否则图例会被地图容器的
+ * overflow:hidden 整个裁掉（"桌面端热力图没有图例、网页端正常"的根因）。
  */
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { CSSProperties, PointerEvent as ReactPointerEvent, ReactNode } from 'react'
-import { Move } from 'lucide-react'
+import { useTranslation } from 'react-i18next'
+import { ChevronUp, List, Move } from 'lucide-react'
 import { useMapStore, type LegendLayout } from '../../store/mapStore'
 
 export type LegendLayoutKey = 'thematic' | 'heatmap' | 'pci-mod'
@@ -19,6 +26,8 @@ export type LegendLayoutKey = 'thematic' | 'heatmap' | 'pci-mod'
 /** 浮窗最小尺寸（拖拽缩放下限） */
 const MIN_WIDTH = 140
 const MIN_HEIGHT = 48
+/** 折叠后悬浮图标的边长 */
+const COLLAPSED_SIZE = 34
 
 interface InteractionState {
   mode: 'move' | 'resize'
@@ -62,6 +71,7 @@ export function LegendFrame({
   className,
   children
 }: LegendFrameProps) {
+  const { t } = useTranslation()
   const layout = useMapStore(s => s.mapSettings.legendLayout?.[layoutKey])
   const setLegendLayout = useMapStore(s => s.setLegendLayout)
 
@@ -73,6 +83,8 @@ export function LegendFrame({
   const [interaction, setInteraction] = useState<InteractionState | null>(null)
   /** 本次交互是否真的产生位移（仅点击标题/手柄不写入布局，保持默认锚点） */
   const movedRef = useRef(false)
+  /** 默认展开；折叠态不持久化，每次进入图例都是展开的 */
+  const [collapsed, setCollapsed] = useState(false)
 
   const effective = draft ?? layout ?? {}
 
@@ -117,15 +129,19 @@ export function LegendFrame({
     const finalLayout = movedRef.current ? draftRef.current : null
     if (finalLayout) {
       setLegendLayout(layoutKey, {
+        ...(layout ?? {}),
         x: finalLayout.x,
         y: finalLayout.y,
-        width: finalLayout.width,
-        height: finalLayout.height,
+        // 折叠态拖动只改位置：窗口宽高保留展开态的自定义值，别把 34x34 写进布局
+        ...(collapsed ? {} : { width: finalLayout.width, height: finalLayout.height }),
       })
+    } else if (collapsed) {
+      // 折叠态点击图标（无位移）→ 展开；拖动过则只保存位置、不展开
+      setCollapsed(false)
     }
     setDraft(null)
     setInteraction(null)
-  }, [layoutKey, setLegendLayout])
+  }, [layoutKey, setLegendLayout, collapsed, layout])
 
   // 交互期间在 window 上跟踪指针：移出浮窗/地图容器也能继续拖拽
   useEffect(() => {
@@ -159,25 +175,41 @@ export function LegendFrame({
     }
   }, [interaction, endInteraction])
 
-  // 窗口/地图容器尺寸变化后把越界的浮窗拉回可视区域并持久化
+  // 把越界的持久化布局拉回可视区域并持久化。
+  // 必须挂载时立即纠正（而非仅 window resize）：布局跨端共享，桌面端地图容器常比网页端小，
+  // 从网页端同步来的大坐标会让浮窗整个落在容器外、被 overflow:hidden 裁掉。
+  // ResizeObserver 额外覆盖侧栏展开/容器初次完成布局等不触发 window resize 的情况。
   useEffect(() => {
-    if (!layout) return
-    const onResize = () => {
+    // 折叠态元素只有 34px，不能代表窗口尺寸，此时纠偏会把布局算错；展开后再纠正
+    if (!layout || collapsed) return
+    const parent = frameRef.current?.parentElement
+    if (!parent) return
+    const correct = () => {
       const el = frameRef.current
-      const parent = el?.parentElement
-      if (!el || !parent) return
+      if (!el) return
       const parentRect = parent.getBoundingClientRect()
+      // 容器尚未完成布局（flex-1 高度为 0）时不要写回，等 ResizeObserver 的下一次回调
+      if (parentRect.width <= 0 || parentRect.height <= 0) return
       const elRect = el.getBoundingClientRect()
       const width = layout.width !== undefined ? Math.min(layout.width, parentRect.width) : undefined
       const height = layout.height !== undefined ? Math.min(layout.height, parentRect.height) : undefined
-      const x = Math.round(clamp(layout.x ?? elRect.left - parentRect.left, 0, parentRect.width - (width ?? elRect.width)))
-      const y = Math.round(clamp(layout.y ?? elRect.top - parentRect.top, 0, parentRect.height - (height ?? elRect.height)))
+      const x = Math.round(clamp(layout.x ?? elRect.left - parentRect.left, 0, Math.max(0, parentRect.width - (width ?? elRect.width))))
+      const y = Math.round(clamp(layout.y ?? elRect.top - parentRect.top, 0, Math.max(0, parentRect.height - (height ?? elRect.height))))
       if (x === layout.x && y === layout.y && width === layout.width && height === layout.height) return
       setLegendLayout(layoutKey, { x, y, width, height })
     }
-    window.addEventListener('resize', onResize)
-    return () => window.removeEventListener('resize', onResize)
-  }, [layout, layoutKey, setLegendLayout])
+    correct()
+    let observer: ResizeObserver | null = null
+    if (typeof ResizeObserver !== 'undefined') {
+      observer = new ResizeObserver(correct)
+      observer.observe(parent)
+    }
+    window.addEventListener('resize', correct)
+    return () => {
+      observer?.disconnect()
+      window.removeEventListener('resize', correct)
+    }
+  }, [layout, layoutKey, setLegendLayout, collapsed])
 
   const style: CSSProperties = {
     position: 'absolute',
@@ -217,6 +249,44 @@ export function LegendFrame({
     style.cursor = interaction.mode === 'move' ? 'move' : 'nwse-resize'
   }
 
+  if (collapsed) {
+    style.width = COLLAPSED_SIZE
+    style.height = COLLAPSED_SIZE
+    style.maxWidth = undefined
+    style.maxHeight = undefined
+    style.flexDirection = undefined
+    style.alignItems = 'center'
+    style.justifyContent = 'center'
+    style.border = '1px solid hsl(var(--border))'
+    style.color = 'hsl(var(--foreground))'
+    style.cursor = interaction?.mode === 'move' ? 'grabbing' : 'grab'
+    style.touchAction = 'none'
+  }
+
+  // 折叠态：一个可按住拖动的悬浮图标；点击（无位移）由 endInteraction 展开
+  if (collapsed) {
+    return (
+      <div
+        ref={frameRef}
+        className={className}
+        style={style}
+        role="button"
+        tabIndex={0}
+        title={typeof title === 'string' ? `${title} · ${t('map.legendExpand')}` : t('map.legendExpand')}
+        aria-label={t('map.legendExpand')}
+        onPointerDown={beginInteraction('move')}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault()
+            setCollapsed(false)
+          }
+        }}
+      >
+        <List size={16} />
+      </div>
+    )
+  }
+
   return (
     <div ref={frameRef} className={className} style={style}>
       <div
@@ -234,6 +304,20 @@ export function LegendFrame({
       >
         <span style={{ fontWeight: 600, color: 'hsl(var(--foreground))' }}>{title}</span>
         <Move size={10} style={{ marginLeft: 'auto', color: 'hsl(var(--muted-foreground))', flexShrink: 0 }} />
+        <button
+          type="button"
+          onPointerDown={(e) => e.stopPropagation()}
+          onClick={() => setCollapsed(true)}
+          title={t('map.legendCollapse')}
+          aria-label={t('map.legendCollapse')}
+          style={{
+            display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+            padding: 0, border: 'none', background: 'transparent', lineHeight: 0,
+            color: 'hsl(var(--muted-foreground))', cursor: 'pointer', flexShrink: 0
+          }}
+        >
+          <ChevronUp size={12} />
+        </button>
       </div>
       <div style={{ padding: '6px 10px 8px', overflowY: 'auto', overflowX: 'hidden', flex: 1, minHeight: 0 }}>
         {children}

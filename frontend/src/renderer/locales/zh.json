@@ -1235,6 +1235,8 @@
     "thematicLegendEditHint": "双击编辑该图层的专题配置",
     "legendDragHint": "按住拖动可移动图例位置",
     "legendResizeHint": "拖动可调整图例窗口大小",
+    "legendCollapse": "收起为悬浮图标",
+    "legendExpand": "展开图例",
     "thematicModeRange": "区间配色",
     "thematicModeValue": "属性值配色",
     "thematicValueColors": "属性值配色",
