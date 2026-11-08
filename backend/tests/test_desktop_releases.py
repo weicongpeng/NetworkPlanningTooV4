@@ -208,9 +208,10 @@ def test_latest_version_comparison(ota):
     # 渠道隔离
     resp = ota.client.get("/api/v1/desktop-cloud/releases/latest", params={"channel": "beta"})
     assert resp.json()["data"] is None
-    # 无 current 时默认提示可用
+    # 客户端没上报当前版本时不能默认「有更新」：会把手装了更高版本的客户端
+    # 反向推送一个更旧的安装包（用户看到"更新版本比当前还低"）。
     resp = ota.client.get("/api/v1/desktop-cloud/releases/latest")
-    assert resp.json()["data"]["update_available"] is True
+    assert resp.json()["data"]["update_available"] is False
 
 
 def test_set_latest_clears_same_channel(ota):
