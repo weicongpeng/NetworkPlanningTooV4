@@ -5,6 +5,7 @@ import type { DesktopUpdateStatus } from '@shared/types'
 import { desktopUpdateApi } from '../services/api'
 import { useAuthStore } from '../store/authStore'
 import { useDesktopUpdateStore } from '../store/desktopUpdateStore'
+import { compareVersions } from '../utils/versionCompare'
 
 /** 自动提醒间隔：1 天 2 次 */
 const PROMPT_INTERVAL_MS = 12 * 60 * 60 * 1000
@@ -13,22 +14,7 @@ const PROMPT_STORAGE_KEY = 'npt-ota-last-prompt'
 /** 启动后延迟检查，避免与首屏争资源 */
 const FIRST_CHECK_DELAY_MS = 8000
 
-/** 版本比较：a>b 返回 1，a<b 返回 -1，相等返回 0（数字段按数值比，避免 9>37 的字符串误判） */
-function compareVersions(a: string, b: string): number {
-  const pa = String(a || '').split(/[.\-_+]/)
-  const pb = String(b || '').split(/[.\-_+]/)
-  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
-    const na = Number.parseInt(pa[i] ?? '', 10)
-    const nb = Number.parseInt(pb[i] ?? '', 10)
-    if (!Number.isNaN(na) && !Number.isNaN(nb)) {
-      if (na !== nb) return na > nb ? 1 : -1
-    } else if ((pa[i] ?? '') !== (pb[i] ?? '')) {
-      return (pa[i] ?? '') > (pb[i] ?? '') ? 1 : -1
-    }
-  }
-  return 0
-}
-
+// 版本比较统一走 utils/versionCompare：自动检查与各「更新就绪」提示必须同口径
 function readLastPrompt(): { version: string; at: number } | null {
   try {
     const raw = localStorage.getItem(PROMPT_STORAGE_KEY)
@@ -116,19 +102,28 @@ export function DesktopUpdateDialog() {
       // 上次自动安装没生效：失败原因（退出码 / 日志尾 / 手动安装路径）只在本弹窗渲染，
       // 等 12 小时提醒周期才弹的话，用户只会看到"重启了还是旧版本、似乎没触发安装"。
       // 按目标版本只主动弹一次，避免 result 文件常驻导致每次检查都打扰。
+      const currentVersion = String(res.data.current || '')
       const failed = res.data.last_result
+      // 上次失败的目标版本若不高于当前版本（例如已手动装了更新的包），提示无意义
       if (failed && failed.applied === false && failed.target_version &&
+          (!currentVersion || compareVersions(String(failed.target_version), currentVersion) > 0) &&
           res.data.release && !installFailureShown(failed.target_version)) {
         markInstallFailureShown(failed.target_version)
         setVisible(true)
         return
       }
       if (res.data.download?.phase === 'ready') {
+        // 就绪的安装包必须高于当前版本：手动装了新版本后，残留的旧包 ready 状态
+        // 不能再弹「比当前版本低」的更新（手动检查走 update_available 会正确显示已是最新）
+        const readyVersion = String(res.data.download?.version || '')
+        if (readyVersion && currentVersion && compareVersions(readyVersion, currentVersion) <= 0) return
         setVisible(true)
         return
       }
       if (!res.data.update_available || !res.data.release) return
       const version = String(res.data.release.version)
+      // 双保险：服务端误判时本机版本比较也不让旧包当作新版本提示
+      if (currentVersion && version && compareVersions(version, currentVersion) <= 0) return
       const last = readLastPrompt()
       const due =
         force ||

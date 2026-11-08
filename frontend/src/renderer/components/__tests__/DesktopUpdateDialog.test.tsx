@@ -122,6 +122,35 @@ describe('DesktopUpdateDialog 跨版本更新提示', () => {
     expect(desktopUpdateApi.download).not.toHaveBeenCalled()
   })
 
+  it('就绪安装包版本低于当前版本时不弹窗（手动装新版后残留旧包）', async () => {
+    vi.useFakeTimers()
+    try {
+      vi.mocked(desktopUpdateApi.status).mockResolvedValue({
+        success: true,
+        data: {
+          current: '0.0.63',
+          channel: 'stable',
+          update_available: false,
+          release: {
+            id: 1, version: '0.0.62', channel: 'stable',
+            update_available: false, download_url: '/api/v1/desktop-cloud/releases/download/1',
+          },
+          download: { phase: 'ready', version: '0.0.62', downloaded: 10, total: 10 },
+          last_result: null,
+        },
+      } as any)
+      vi.mocked(desktopUpdateApi.download).mockResolvedValue({ success: true } as any)
+
+      render(<DesktopUpdateDialog />)
+      await act(async () => { await vi.advanceTimersByTimeAsync(8200) })
+      // 手动「检查更新」看 update_available 会显示已是最新；自动检查也不能因
+      // ready 状态弹出更低版本的更新窗口
+      expect(screen.queryByText('0.0.62')).toBeNull()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('上次自动安装失败：不受 12 小时提醒周期门控，自动检查时主动弹窗给出失败原因', async () => {
     vi.useFakeTimers()
     try {

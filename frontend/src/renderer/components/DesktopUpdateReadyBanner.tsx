@@ -16,6 +16,7 @@ import { useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { DownloadCloud, Loader2, RefreshCw } from 'lucide-react'
 import { desktopUpdateApi } from '../services/api'
+import { compareVersions } from '../utils/versionCompare'
 
 /** 轮询间隔（毫秒） */
 const POLL_MS = 4000
@@ -35,6 +36,13 @@ export function DesktopUpdateReadyBanner() {
         if (cancelled) return
         const data = res?.data
         if (data?.phase === 'ready') {
+          const version = data?.version ? String(data.version) : ''
+          const current = data?.current ? String(data.current) : ''
+          // 就绪包不高于当前版本时不提示：手动装了新版本后残留的旧安装包
+          if (version && current && compareVersions(version, current) <= 0) {
+            setReady(null)
+            return
+          }
           // 保持对象引用稳定，避免每次轮询都重渲染（版本号取不到时也不闪烁）
           setReady((prev) => prev ?? { version: data?.version ? String(data.version) : null })
         } else {

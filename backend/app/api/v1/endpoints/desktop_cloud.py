@@ -1141,7 +1141,9 @@ async def latest_release(
     if record is None:
         return {"success": True, "data": None}
 
-    update_available = True
+    # 客户端没上报当前版本时不能默认「有更新」：会把手装了更高版本的客户端
+    # 反向推送一个更旧的安装包（用户看到"更新版本比当前还低"）。
+    update_available = False
     if current:
         update_available = _release_version_key(record.version) > _release_version_key(current)
 

@@ -48,6 +48,17 @@ describe('DesktopUpdateReadyDialog', () => {
   })
   afterEach(() => cleanup())
 
+  it('就绪安装包版本不高于当前版本时不弹（手动装新版后残留旧包）', async () => {
+    vi.mocked(desktopUpdateApi.progress).mockResolvedValue({
+      success: true,
+      data: { phase: 'ready', background: false, version: '0.0.62', current: '0.0.63' },
+    } as any)
+    render(<DesktopUpdateReadyDialog />)
+    await waitFor(() => expect(desktopUpdateApi.progress).toHaveBeenCalled())
+    expect(screen.queryByText(TITLE)).toBeNull()
+    expect(screen.queryByText(READY)).toBeNull()
+  })
+
   it('后台下载未完成（downloading）时不弹', async () => {
     vi.mocked(desktopUpdateApi.progress).mockResolvedValue({
       success: true, data: { phase: 'downloading', background: true, version: '0.0.33' },

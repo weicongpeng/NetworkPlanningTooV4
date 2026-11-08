@@ -1422,6 +1422,9 @@ def update_download(
         raise HTTPException(
             status_code=502, detail="无法获取版本信息，请检查网络或授权服务器地址"
         )
+    # 只下载确实高于本机的版本：手动装了新版本后，服务器仍可能标着一个更旧的包
+    if not release.get("update_available"):
+        raise HTTPException(status_code=409, detail="当前已是最新版本，无需下载")
     return {"success": True, "data": updater.start_download(release)}
 
 

@@ -16,6 +16,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { AlertCircle, Loader2, RefreshCw } from 'lucide-react'
 import { desktopUpdateApi } from '../services/api'
+import { compareVersions } from '../utils/versionCompare'
 import { useAuthStore } from '../store/authStore'
 import { useDesktopUpdateStore } from '../store/desktopUpdateStore'
 
@@ -61,6 +62,12 @@ export function DesktopUpdateReadyDialog() {
       // 渲染时也让位，由主弹窗的「重启并安装」接手
       if (phase === 'ready') {
         const version = String(data.version || '')
+        const current = String(data.current || '')
+        // 就绪包不高于当前版本时不提示：手动装了新版本后残留的旧安装包
+        if (version && current && compareVersions(version, current) <= 0) {
+          setReady(null)
+          return
+        }
         const dismissed = readDismissed()
         if (dismissed && dismissed.version === version) return
         if (promptedRef.current === version) return

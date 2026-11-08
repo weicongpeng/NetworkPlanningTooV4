@@ -32,6 +32,14 @@ _log = logging.getLogger("desktop.update")
 EXIT_WAIT_SECONDS = 60
 
 
+def _version_key(version: str) -> tuple:
+    """版本比较键：数字段按数值、其余按字符串，与服务端 _release_version_key 同口径。"""
+    key = []
+    for part in re.split(r"[.\-_+]", (version or "").strip()):
+        key.append((0, int(part)) if part.isdigit() else (1, part))
+    return tuple(key)
+
+
 _state: Dict[str, Any] = {
     "phase": "idle",  # idle | downloading | ready | failed
     "version": None,
@@ -72,12 +80,21 @@ def check_latest(raise_on_error: bool = False) -> Optional[Dict[str, Any]]:
     if not data:
         return None
     data["current"] = current
+    # 服务端已按版本比较；客户端再兜底一次：服务器记录格式差异（或 current 上报为空）
+    # 不能把低于本机版本的包当「有更新」推送——手动装了新版本后最容易复现。
+    if current and data.get("version"):
+        data["update_available"] = bool(data.get("update_available")) and (
+            _version_key(str(data["version"])) > _version_key(current)
+        )
     return data
 
 
 def progress() -> Dict[str, Any]:
     with _lock:
-        return dict(_state)
+        state = dict(_state)
+    # 带上本机版本：前端「更新已就绪」提示要据此排除不高于当前版本的残留安装包
+    state["current"] = settings.NPT_DESKTOP_VERSION or ""
+    return state
 
 
 def _download_url(release: Dict[str, Any]) -> str:

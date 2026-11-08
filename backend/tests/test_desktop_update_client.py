@@ -221,6 +221,46 @@ def test_check_latest_offline_raises_only_when_asked(updater_env):
         updater_env.updater.check_latest(raise_on_error=True)
 
 
+def test_check_latest_rejects_lower_version_even_if_server_says_available(updater_env, monkeypatch):
+    """服务端误判/记录格式差异时，客户端必须拦住低于本机的版本。
+
+    用户手动装了 0.0.63、服务器仍标着 0.0.62 是最新：自动检查曾因 ready 状态
+    弹出「比当前版本低」的更新，而手动检查走 update_available 显示已是最新。
+    """
+    updater = updater_env.updater
+    monkeypatch.setattr(updater_env.settings, "NPT_DESKTOP_VERSION", "0.0.63")
+    monkeypatch.setattr(
+        updater.cloud, "_request",
+        lambda *a, **k: {
+            "success": True,
+            "data": _release(version="0.0.62", update_available=True),
+        },
+    )
+    release = updater.check_latest()
+    assert release["version"] == "0.0.62"
+    assert release["current"] == "0.0.63"
+    assert release["update_available"] is False
+
+
+def test_check_latest_keeps_higher_version_available(updater_env, monkeypatch):
+    updater = updater_env.updater
+    monkeypatch.setattr(updater_env.settings, "NPT_DESKTOP_VERSION", "0.0.62")
+    monkeypatch.setattr(
+        updater.cloud, "_request",
+        lambda *a, **k: {
+            "success": True,
+            "data": _release(version="0.0.63", update_available=True),
+        },
+    )
+    assert updater.check_latest()["update_available"] is True
+
+
+def test_progress_includes_current_version(updater_env, monkeypatch):
+    """前端「更新已就绪」提示要据此排除不高于当前版本的残留安装包。"""
+    monkeypatch.setattr(updater_env.settings, "NPT_DESKTOP_VERSION", "0.0.63")
+    assert updater_env.updater.progress()["current"] == "0.0.63"
+
+
 def test_install_requires_ready_package(updater_env):
     updater = updater_env.updater
     from app.services.desktop_cloud_client import CloudError
