@@ -10,7 +10,7 @@
  *   下载完成后由 DesktopUpdateReadyDialog 弹窗提示安装；已在下载/已就绪不重复启动。
  */
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest'
-import { render, screen, cleanup, waitFor } from '@testing-library/react'
+import { render, screen, cleanup, waitFor, act } from '@testing-library/react'
 import i18n from '../../i18n'
 
 vi.mock('../../services/api', () => ({
@@ -120,5 +120,45 @@ describe('DesktopUpdateDialog 跨版本更新提示', () => {
     openDialog('0.0.37', '0.0.39', 'ready')
     await new Promise((r) => setTimeout(r, 20))
     expect(desktopUpdateApi.download).not.toHaveBeenCalled()
+  })
+
+  it('上次自动安装失败：不受 12 小时提醒周期门控，自动检查时主动弹窗给出失败原因', async () => {
+    vi.useFakeTimers()
+    try {
+      vi.mocked(desktopUpdateApi.status).mockResolvedValue({
+        success: true,
+        data: {
+          current: '0.0.36',
+          channel: 'stable',
+          update_available: true,
+          release: {
+            id: 1, version: '0.0.39', channel: 'stable',
+            update_available: true, download_url: '/api/v1/desktop-cloud/releases/download/1',
+          },
+          download: { phase: 'idle', downloaded: 0, total: 0 },
+          last_result: {
+            target_version: '0.0.39', current_version: '0.0.36',
+            applied: false, needs_manual: true, setup_rc: '1',
+            installer: 'C:\\updates\\NetOpt Engine_Setup-0.0.39.exe',
+          },
+        },
+      } as any)
+      vi.mocked(desktopUpdateApi.download).mockResolvedValue({ success: true } as any)
+      // 让 12 小时提醒周期本来会拦住弹窗：失败信息仍必须可见
+      localStorage.setItem('npt-ota-last-prompt', JSON.stringify({ version: '0.0.39', at: Date.now() }))
+
+      render(<DesktopUpdateDialog />)
+      await act(async () => { await vi.advanceTimersByTimeAsync(8200) })
+
+      expect(
+        screen.getByText(
+          i18n.t('desktopUpdate.installNotApplied', { target: '0.0.39', current: '0.0.36' }),
+          { exact: false }
+        )
+      ).toBeTruthy()
+      expect(screen.getByText(MANUAL_HINT, { exact: false })).toBeTruthy()
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })

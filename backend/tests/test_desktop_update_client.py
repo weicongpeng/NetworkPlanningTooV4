@@ -260,6 +260,9 @@ def test_helper_script_bounded_wait_and_relaunch(updater_env):
     text = helper.read_text(encoding="utf-8")
 
     assert helper.parent == updater_env.tmp_path / "updates"
+    # 脚本正文必须纯 ASCII：chcp 65001 下 cmd 按字节偏移解析批处理，中文 rem 注释会让
+    # goto 标签定位错乱、脚本中途终止（用户看到"似乎没触发安装流程"）
+    assert all(ord(ch) < 128 for ch in text)
     # 静默安装 + 安装后重新启动应用
     assert "/VERYSILENT" in text and "/SUPPRESSMSGBOXES" in text
     assert 'start "" "%TARGET%"' in text
@@ -284,9 +287,11 @@ def test_helper_script_bounded_wait_and_relaunch(updater_env):
     assert "taskkill /F /IM" in text
     # 计时不能用 timeout：无控制台环境下它直接报错，会退化成忙循环
     assert "timeout /t" not in text
-    # start /wait 可能只等到安装器外层进程：重启前必须再等安装器进程真正退出，
-    # 否则拉起的还是没被替换的旧 exe（表现"装完版本没变，手关再开才更新"）
-    assert "tasklist /FI \"IMAGENAME eq %SETUPNAME%\"" in text
+    # start /wait 可能只等到安装器外层进程就返回；重启前不能靠进程名轮询：
+    # 安装包经 8.3 短路径启动、tasklist 的 IMAGENAME 又截断到 25 字符，名字永远匹配不到
+    # （曾导致等待循环形同虚设）。改由 :waitver 轮询 version.json 作为安装完成判据。
+    assert "tasklist /NH" not in text
+    assert "SETUPNAME" not in text
     # 拉起前核对目标目录的 version.json 已是新版本，并把结果写盘供应用提示
     assert 'findstr /I /C:"%TARGETVER%"' in text
     assert "install_verified=%VEROK%" in text

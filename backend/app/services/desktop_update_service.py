@@ -296,7 +296,6 @@ set "LOG={install_log}"
 set "RESULT={result_file}"
 set "LOGTAIL={log_tail}"
 set "DEFAULTDIR={default_dir}"
-set "SETUPNAME={installer.name}"
 set "TARGETVER={target_version}"
 set "UNINSTKEY={uninstall_key}"
 set "UNINSTKEY_MACHINE={uninstall_key_machine}"
@@ -327,7 +326,7 @@ set /a TRY=0
 :tryappdir
 start /wait "" "%SETUP%" {base_args} /DIR="%APPDIR%"
 set "RC=%ERRORLEVEL%"
-if "%RC%"=="0" goto waitsetup
+if "%RC%"=="0" goto launch
 set /a TRY+=1
 if %TRY% GEQ 3 goto trydefault
 ping -n 5 127.0.0.1 >nul
@@ -339,20 +338,13 @@ set /a DTRY=0
 if %DTRY% GTR 0 ping -n 5 127.0.0.1 >nul
 start /wait "" "%SETUP%" {base_args}
 set "RC2=%ERRORLEVEL%"
-if "%RC2%"=="0" goto waitsetup
+if "%RC2%"=="0" goto launch
 set /a DTRY+=1
 if %DTRY% LSS 2 goto trydefault2
-:waitsetup
-rem start /wait 可能只等到安装器的外层进程就返回；此时重启会拉起还没被替换掉的旧 exe，
-rem 表现就是"装完版本没变，手动关掉再开才更新"。这里继续等到安装器进程真正退出。
-set /a SWAIT=0
-:waitsetup2
-tasklist /FI "IMAGENAME eq %SETUPNAME%" /NH 2>nul | find /I "%SETUPNAME%" >nul
-if errorlevel 1 goto launch
-set /a SWAIT+=2
-if %SWAIT% GEQ 90 goto launch
-ping -n 3 127.0.0.1 >nul
-goto waitsetup2
+rem Do not poll the setup process by name: the installer is launched via its 8.3
+rem short path and tasklist truncates IMAGENAME to 25 chars, so a name match never
+rem hits. :waitver below waits for the new version.json instead -- the direct proof
+rem that the installer finished replacing files before we relaunch the app.
 :launch
 rem prefer the directory recorded by the installer: it is where new files actually landed
 for /f "tokens=2,*" %%a in ('reg query "%UNINSTKEY%" /v InstallLocation 2^>nul ^| findstr /I "InstallLocation"') do set "REGDIR=%%b"
@@ -363,8 +355,8 @@ if not defined TARGET if exist "%APPDIR%\\{app_exe.name}" set "TARGET=%APPDIR%\\
 if not defined TARGET if exist "%DEFAULTDIR%\\{app_exe.name}" set "TARGET=%DEFAULTDIR%\\{app_exe.name}"
 if not defined TARGET set "TARGET=%APP%"
 for %%F in ("%TARGET%") do set "TARGETDIR=%%~dpF"
-rem 等到新版本的 version.json 真正落地再拉起：version.json 由安装器在文件替换完成后
-rem 写入，没等到就重启 = 拉起旧 exe（表现"装完版本没变，手动关掉再开才更新"）。
+rem Wait until the installer has written the new version.json after replacing files;
+rem relaunching before that would start the old exe ("version did not change").
 set /a VWAIT=0
 :waitver
 set "VEROK="

@@ -40,6 +40,24 @@ function readLastPrompt(): { version: string; at: number } | null {
   }
 }
 
+/** 安装失败提示按目标版本只主动弹一次：result 文件常驻，不能每次自动检查都打扰 */
+const INSTALL_FAILURE_SHOWN_KEY = 'npt-ota-install-failure-shown'
+function installFailureShown(version: string): boolean {
+  try {
+    const raw = localStorage.getItem(INSTALL_FAILURE_SHOWN_KEY)
+    return raw ? JSON.parse(raw)?.version === version : false
+  } catch {
+    return false
+  }
+}
+function markInstallFailureShown(version: string): void {
+  try {
+    localStorage.setItem(INSTALL_FAILURE_SHOWN_KEY, JSON.stringify({ version, at: Date.now() }))
+  } catch {
+    /* 隐私模式下写不进去也不影响本次提示 */
+  }
+}
+
 /**
  * 桌面版 OTA 更新提示（仅桌面壳内生效；网页端接口 404 时静默）。
  * 规则：不强制更新，弹窗随时可关闭；自动检查每 12 小时一次（1 天 2 次）。
@@ -95,6 +113,16 @@ export function DesktopUpdateDialog() {
         error: res.data.download?.error,
       })
       void maybeAutoDownload(res.data)
+      // 上次自动安装没生效：失败原因（退出码 / 日志尾 / 手动安装路径）只在本弹窗渲染，
+      // 等 12 小时提醒周期才弹的话，用户只会看到"重启了还是旧版本、似乎没触发安装"。
+      // 按目标版本只主动弹一次，避免 result 文件常驻导致每次检查都打扰。
+      const failed = res.data.last_result
+      if (failed && failed.applied === false && failed.target_version &&
+          res.data.release && !installFailureShown(failed.target_version)) {
+        markInstallFailureShown(failed.target_version)
+        setVisible(true)
+        return
+      }
       if (res.data.download?.phase === 'ready') {
         setVisible(true)
         return
