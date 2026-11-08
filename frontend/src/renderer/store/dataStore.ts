@@ -4,7 +4,7 @@ import { dataApi } from '../services/api'
 import { indexedDBService } from '../services/indexedDBService'
 import type { DataItem, ApiResponse } from '@shared/types'
 import { useTaskStore } from './taskStore'
-import { clearCellListCache, bumpDataVersion, mapDataService } from '../services/mapDataService'
+import { clearCellListCache, bumpDataVersion, mapDataService, invalidateMapDataCaches } from '../services/mapDataService'
 import { userCacheSuffix } from '../utils/cacheKey'
 
 const CACHE_TTL_5MIN = 5 * 60 * 1000
@@ -37,6 +37,11 @@ export function triggerDataRefresh(scope: DataRefreshScope = 'full') {
   _lastRefreshScope = scope
   // 清除小区列表缓存，确保各页面新建任务时获取最新数据
   clearCellListCache()
+  if (scope === 'full') {
+    // 地图扇区缓存（内存 1h + IndexedDB 2h）也要失效：同组同步落地时地图页可能未挂载，
+    // 收不到 DATA_REFRESH_EVENT 的 refreshData()，之后首次进地图会命中同步前的空/旧扇区
+    invalidateMapDataCaches()
+  }
   window.dispatchEvent(new CustomEvent(DATA_REFRESH_EVENT, { detail: { scope } }))
 }
 

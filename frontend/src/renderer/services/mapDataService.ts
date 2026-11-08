@@ -509,16 +509,21 @@ export class MapDataService {
         bounds
       }
 
-      // 缓存到内存（按用户分键）
-      this.memoryCacheByUser.set(cacheUserKey, {
-        data: result,
-        expiry: Date.now() + this.CACHE_DURATION,
-        version: getDataVersion(),
-      })
+      const totalSectors = result.lteSectors.length + result.nrSectors.length
+
+      // 缓存到内存（按用户分键）：空结果不缓存。桌面端后台同步落地前 /map/data 可能返回空，
+      // 一旦把空扇区固化 1 小时，同步完成后首次进地图会命中它而一直不渲染扇区
+      // （数据管理页读 index.json 却已显示全量工参文件）。
+      if (totalSectors > 0) {
+        this.memoryCacheByUser.set(cacheUserKey, {
+          data: result,
+          expiry: Date.now() + this.CACHE_DURATION,
+          version: getDataVersion(),
+        })
+      }
 
       // 仅在数据量正常时才写入 IndexedDB 持久缓存
       // 避免后端短暂异常时缓存空/部分数据导致地图长时间空白
-      const totalSectors = result.lteSectors.length + result.nrSectors.length
       if (totalSectors >= MapDataService.MIN_CACHED_SECTORS) {
         try {
           await indexedDBService.set(CACHE_KEY(), result, CACHE_TTL)
@@ -592,6 +597,20 @@ export { bumpDataVersion }
 export function clearAllInMemoryMapCaches(): void {
   mapDataService.clearAllInMemory()
   _cellListCacheByUser.clear()
+}
+
+/**
+ * 数据变更（含同组同步落地）时让地图扇区缓存整体失效：内存 + IndexedDB + 版本号。
+ *
+ * triggerDataRefresh 原先只清 getCellList 缓存，而地图页若当时未挂载就收不到
+ * DATA_REFRESH_EVENT 的 refreshData()；之后首次进地图会命中同步前写入的空/旧扇区缓存。
+ * 不请求后端 clearCache —— 后端 _map_data_cache 已由写入方主动 invalidate。
+ */
+export function invalidateMapDataCaches(): void {
+  mapDataService.clearAllInMemory()
+  bumpDataVersion()
+  void indexedDBService.delete(CACHE_KEY()).catch(() => {})
+  void indexedDBService.delete(LEGACY_CACHE_KEY).catch(() => {})
 }
 
 // ============================================================
