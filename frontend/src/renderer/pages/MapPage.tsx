@@ -53,6 +53,7 @@ import type { PciModLegendItem } from '../components/Map/PCIModLegend'
 import type { PciRenderStats } from '../utils/pciModColor'
 import { HeatmapLegend } from '../components/Map/HeatmapLegend'
 import type { HeatmapStats } from '../components/Map/HeatmapLayerManager'
+import { buildHeatmapLegendItems } from '../utils/heatmapLegendItems'
 import { selectionManager } from '../services/selectionManager'
 
 // MapInfo 图层列表缓存（避免每次挂载都重新请求）
@@ -2850,23 +2851,15 @@ export function MapPage() {
     return () => clearTimeout(timer)
   }, [pciRenderLegendItems, fetchPciRenderStats])
 
-  // 热力图例项：已勾选可见且启用热力图的图层（含基站扇区图层）
+  // 热力图例项：已启用热力图的设置（含基站扇区图层）。
+  // 设置 key 与图层 id 对不上时仍由图例兜底显示，避免跨端同步后图例整个消失
   const heatmapLegendItems = useMemo(() => {
-    const hsMap = mapSettings.heatmapSettingsMap || {}
-    const items: { id: string; name: string; settings: HeatmapSettings }[] = []
-    for (const f of [...layerFiles, ...pointFiles]) {
-      const hs = hsMap[f.id]
-      if (f.visible && hs?.enabled) {
-        items.push({ id: f.id, name: f.name, settings: hs })
-      }
-    }
-    for (const s of sectorLayers) {
-      const hs = hsMap[s.id]
-      if (s.visible && hs?.enabled) {
-        items.push({ id: s.id, name: s.type === 'LTE' ? 'LTE' : 'NR', settings: hs })
-      }
-    }
-    return items
+    const sources = [
+      ...layerFiles.map(f => ({ id: f.id, name: f.name, visible: f.visible })),
+      ...pointFiles.map(f => ({ id: f.id, name: f.name, visible: f.visible })),
+      ...sectorLayers.map(s => ({ id: s.id, name: s.type === 'LTE' ? 'LTE' : 'NR', visible: s.visible })),
+    ]
+    return buildHeatmapLegendItems(mapSettings.heatmapSettingsMap, sources)
   }, [layerFiles, pointFiles, sectorLayers, mapSettings.heatmapSettingsMap])
 
   // 热力图例统计（分级色块/权重 min/max/点数/抽样）。
