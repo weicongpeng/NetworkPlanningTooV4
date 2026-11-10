@@ -105,8 +105,8 @@ export function PCILegend({
         <div style={{
           width: '12px',
           height: '8px',
-          backgroundColor: '#3b82f6',
-          border: '1px solid #2563eb',
+          backgroundColor: 'hsl(var(--primary))',
+          border: '1px solid hsl(var(--primary))',
           borderRadius: '1px',
           marginRight: '4px'
         }} />

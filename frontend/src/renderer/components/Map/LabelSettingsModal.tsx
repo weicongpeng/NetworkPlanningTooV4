@@ -358,7 +358,7 @@ const PRESET_COLORS = [
   '#ffffff', // 白色
   '#ef4444', // 红色
   '#22c55e', // 绿色
-  '#3b82f6', // 蓝色
+  'hsl(var(--primary))', // 蓝色
   '#f59e0b', // 橙色
   '#8b5cf6', // 紫色
   '#06b6d4', // 青色
@@ -875,7 +875,7 @@ export function LabelSettingsModal({
   const [showDropdown, setShowDropdown] = useState(false)
 
   // 内部状态 - 图层颜色设置
-  const [fillColor, setFillColor] = useState(currentColorSettings?.fillColor || '#3b82f6')
+  const [fillColor, setFillColor] = useState(currentColorSettings?.fillColor || 'hsl(var(--primary))')
   const [fillOpacityPct, setFillOpacityPct] = useState(Math.round((currentColorSettings?.fillOpacity ?? 1) * 100))
   const [borderWidth, setBorderWidth] = useState(currentColorSettings?.borderWidth || 2)
   // 边框颜色默认无色（点/面图层不描边）；线状图层无边框色项（线色由图形颜色控制）
@@ -1232,7 +1232,7 @@ export function LabelSettingsModal({
           : (currentColorSettings?.fillColor || '#8b5cf6'))
         setBorderColor(NO_FILL_COLOR)
       } else {
-        setFillColor(currentColorSettings?.fillColor || '#3b82f6')
+        setFillColor(currentColorSettings?.fillColor || 'hsl(var(--primary))')
         // 点/面图层边框颜色默认无色；已保存值（含旧版黑色/自定义色）原样保留
         setBorderColor(currentColorSettings?.borderColor
           || (borderColorSupportsNone ? NO_FILL_COLOR : '#000000'))

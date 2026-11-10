@@ -238,6 +238,8 @@ export interface PCIConfig {
   inheritModulus: boolean
   pciRange?: PCIRange
   enableTACPlanning?: boolean
+  useMod6?: boolean
+  useMod4?: boolean
   enableCollisionCheck?: boolean
   enableConfusionCheck?: boolean
   selectedCellIds?: string[]  // 选中的小区ID列表（格式：siteId_sectorId）

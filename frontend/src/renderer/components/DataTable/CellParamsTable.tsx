@@ -93,51 +93,51 @@ export function CellParamsTable({
           <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30 w-0'}>{/* 操作列 */}</th>
           <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30 relative'} style={{ width: colWidths.managedElementId }}>
             {t('newCellEntry.fieldManagedElementId') || '网元ID'}
-            <div className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-blue-400/60" onMouseDown={e => onColResize(e, 'managedElementId')} />
+            <div className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-primary/90/60" onMouseDown={e => onColResize(e, 'managedElementId')} />
           </th>
           <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30 relative'} style={{ width: colWidths.siteId }}>
             {t('newCellEntry.fieldSiteIdLTE') || '基站ID'}
-            <div className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-blue-400/60" onMouseDown={e => onColResize(e, 'siteId')} />
+            <div className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-primary/90/60" onMouseDown={e => onColResize(e, 'siteId')} />
           </th>
           <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30 relative'} style={{ width: colWidths.cellId }}>
             {t('newCellEntry.fieldCellId') || '小区ID'}
-            <div className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-blue-400/60" onMouseDown={e => onColResize(e, 'cellId')} />
+            <div className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-primary/90/60" onMouseDown={e => onColResize(e, 'cellId')} />
           </th>
           <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30 relative'} style={{ width: colWidths.cellName }}>
             {t('newCellEntry.fieldCellName') || '小区名称'}
-            <div className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-blue-400/60" onMouseDown={e => onColResize(e, 'cellName')} />
+            <div className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-primary/90/60" onMouseDown={e => onColResize(e, 'cellName')} />
           </th>
           <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30 relative'} style={{ width: colWidths.mcc }}>
             {t('newCellEntry.fieldMCC') || 'MCC'}
-            <div className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-blue-400/60" onMouseDown={e => onColResize(e, 'mcc')} />
+            <div className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-primary/90/60" onMouseDown={e => onColResize(e, 'mcc')} />
           </th>
           <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30 relative'} style={{ width: colWidths.mnc }}>
             {t('newCellEntry.fieldMNC') || 'MNC'}
-            <div className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-blue-400/60" onMouseDown={e => onColResize(e, 'mnc')} />
+            <div className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-primary/90/60" onMouseDown={e => onColResize(e, 'mnc')} />
           </th>
           <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30 relative'} style={{ width: colWidths.longitude }}>
             {t('newCellEntry.fieldLongitude') || '经度'}
-            <div className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-blue-400/60" onMouseDown={e => onColResize(e, 'longitude')} />
+            <div className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-primary/90/60" onMouseDown={e => onColResize(e, 'longitude')} />
           </th>
           <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30 relative'} style={{ width: colWidths.latitude }}>
             {t('newCellEntry.fieldLatitude') || '纬度'}
-            <div className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-blue-400/60" onMouseDown={e => onColResize(e, 'latitude')} />
+            <div className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-primary/90/60" onMouseDown={e => onColResize(e, 'latitude')} />
           </th>
           <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30 relative'} style={{ width: colWidths.height }}>
             {t('newCellEntry.fieldHeight') || '站高'}
-            <div className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-blue-400/60" onMouseDown={e => onColResize(e, 'height')} />
+            <div className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-primary/90/60" onMouseDown={e => onColResize(e, 'height')} />
           </th>
           <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30 relative'} style={{ width: colWidths.azimuth }}>
             {t('newCellEntry.fieldAzimuth') || '方向角'}
-            <div className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-blue-400/60" onMouseDown={e => onColResize(e, 'azimuth')} />
+            <div className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-primary/90/60" onMouseDown={e => onColResize(e, 'azimuth')} />
           </th>
           <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30 relative'} style={{ width: isLte ? colWidths.frequency : colWidths.ssbFrequency }}>
             {isLte ? (t('newCellEntry.fieldFrequency') || '下行频点') : (t('newCellEntry.fieldSsbFrequency') || 'SSB频点')}
-            <div className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-blue-400/60" onMouseDown={e => onColResize(e, isLte ? 'frequency' : 'ssbFrequency')} />
+            <div className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-primary/90/60" onMouseDown={e => onColResize(e, isLte ? 'frequency' : 'ssbFrequency')} />
           </th>
           <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30 relative'} style={{ width: colWidths.cellCoverType }}>
             {t('newCellEntry.fieldCellCoverType') || '覆盖类型'}
-            <div className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-blue-400/60" onMouseDown={e => onColResize(e, 'cellCoverType')} />
+            <div className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-primary/90/60" onMouseDown={e => onColResize(e, 'cellCoverType')} />
           </th>
         </tr>
       </thead>
@@ -148,7 +148,7 @@ export function CellParamsTable({
           // 查重标记键：LTE=基站_小区，NR=MCC_MNC_基站_小区（与 DataPage 写入端同口径）
           const dupKind = duplicateMap?.[cellDedupKey(activeTab, row)]
           return (
-            <tr key={row.id} data-row-id={row.id} className={`${selectedRowIds?.has(row.id) ? 'bg-blue-500/10' : ''} ${
+            <tr key={row.id} data-row-id={row.id} className={`${selectedRowIds?.has(row.id) ? 'bg-primary/10' : ''} ${
               dupKind === 'same' ? 'bg-red-500/10' :
               dupKind === 'cross' ? 'bg-amber-500/10' : ''
             } ${isMarked ? 'opacity-40 line-through' : ''}`}>

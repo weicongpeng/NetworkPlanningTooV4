@@ -5,7 +5,7 @@ import type { DesktopLicenseRecord } from '@shared/types'
 import { authApi, desktopLicensesApi } from '../services/api'
 
 const STATUS_STYLE: Record<string, string> = {
-  pending: 'bg-blue-500/10 text-blue-500',
+  pending: 'bg-primary/10 text-primary',
   issued: 'bg-amber-500/10 text-amber-600',
   active: 'bg-green-500/10 text-green-500',
   rejected: 'bg-red-500/10 text-red-500',
@@ -253,7 +253,7 @@ export function DesktopLicensesPage() {
 
       {/* 列表 */}
       <div className="bg-card rounded-lg border border-border overflow-x-auto">
-        <table className="w-full text-sm min-w-[1100px]">
+        <table className="w-full text-sm min-w-[1100px] npt-resizable">
           <thead className="bg-muted/50 text-xs text-muted-foreground">
             <tr>
               <th className="px-3 py-2 text-left">{t('desktopLicenses.colUser')}</th>

@@ -5,6 +5,8 @@ import {
   RefreshCw, Key, X, Circle, Ban, History
 } from 'lucide-react'
 import { adminUserApi, authApi } from '../services/api'
+import { useAuthStore } from '../store/authStore'
+import { ChangePasswordDialog } from '../components/ChangePasswordDialog'
 import type { UserInfo, UserSessionInfo, RegisterOptions } from '@shared/types'
 
 function formatDuration(seconds: number): string {
@@ -28,6 +30,8 @@ function formatDate(dateStr: string | null): string {
 
 export function AdminUsersPage() {
   const { t } = useTranslation()
+  // 当前登录管理员：改自己密码走「旧密码+新密码」自助流程，而非管理员重置
+  const currentUser = useAuthStore((s) => s.user)
 
   const [users, setUsers] = useState<UserInfo[]>([])
   const [total, setTotal] = useState(0)
@@ -40,6 +44,8 @@ export function AdminUsersPage() {
   const [showAddModal, setShowAddModal] = useState(false)
   const [showEditModal, setShowEditModal] = useState(false)
   const [showResetPwdModal, setShowResetPwdModal] = useState(false)
+  // 管理员修改自己密码：走自助修改流程（成功后回到登录页）
+  const [showChangePwdModal, setShowChangePwdModal] = useState(false)
   // 组（地市+运营商）变更时的历史数据迁移范围选择弹窗
   const [showMigrateDialog, setShowMigrateDialog] = useState(false)
   const [editUser, setEditUser] = useState<UserInfo | null>(null)
@@ -393,7 +399,7 @@ export function AdminUsersPage() {
         </div>
       ) : (
         <div className="flex-1 min-h-0 overflow-auto bg-card border border-border rounded-lg shadow-sm">
-            <table className="w-full text-sm">
+            <table className="w-full text-sm npt-resizable">
               <thead className="bg-muted sticky top-0 z-10">
                 <tr>
                   <th className="px-4 py-3 text-left text-muted-foreground font-medium">{t('auth.username', '用户名')}</th>
@@ -421,7 +427,7 @@ export function AdminUsersPage() {
                       <tr key={`${u.id}-pc`} className="border-t border-border hover:bg-muted/30 transition-colors">
                         <td className="px-4 py-3 text-foreground font-medium" rowSpan={3}>{u.username}</td>
                         <td className="px-4 py-3" rowSpan={3}>
-                          <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs ${u.is_admin ? 'bg-purple-500/10 text-purple-400' : 'bg-blue-500/10 text-blue-400'}`}>
+                          <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs ${u.is_admin ? 'bg-primary/10 text-primary' : 'bg-primary/10 text-primary'}`}>
                             {u.is_admin ? <Shield size={12} /> : <User size={12} />}
                             {u.is_admin ? t('admin.admin', '管理员') : t('admin.user', '普通用户')}
                           </span>
@@ -460,7 +466,11 @@ export function AdminUsersPage() {
                             <button onClick={() => openEdit(u)} className="p-1.5 rounded hover:bg-muted text-muted-foreground hover:text-foreground transition-colors" title={t('admin.edit', '编辑')}>
                               <Pencil size={14} />
                             </button>
-                            <button onClick={() => openResetPwd(u)} className="p-1.5 rounded hover:bg-muted text-muted-foreground hover:text-foreground transition-colors" title={t('admin.resetPassword', '重置密码')}>
+                            <button
+                              onClick={() => (u.id === currentUser?.id ? setShowChangePwdModal(true) : openResetPwd(u))}
+                              className="p-1.5 rounded hover:bg-muted text-muted-foreground hover:text-foreground transition-colors"
+                              title={u.id === currentUser?.id ? t('auth.changePassword', '修改密码') : t('admin.resetPassword', '重置密码')}
+                            >
                               <Key size={14} />
                             </button>
                             <button onClick={() => openSessions(u)} className="p-1.5 rounded hover:bg-muted text-muted-foreground hover:text-foreground transition-colors" title={t('admin.viewLoginRecords', '查看登录记录')}>
@@ -580,15 +590,15 @@ export function AdminUsersPage() {
                 <span className="text-sm text-foreground">{t('admin.enableAccount')}</span>
               </label>
             </div>
-            <div className="p-3 bg-blue-500/5 border border-blue-500/20 rounded-lg">
-              <div className="flex items-center gap-2 text-sm text-blue-400">
+            <div className="p-3 bg-primary/5 border border-primary/20 rounded-lg">
+              <div className="flex items-center gap-2 text-sm text-primary">
                 <span>📱 APP权限</span>
                 <span className="text-muted-foreground">：{formIsActive ? '已启用' : '已禁用'}</span>
               </div>
               <p className="text-xs text-muted-foreground mt-1">APP权限由账号启用状态统一控制</p>
             </div>
-            <div className="p-3 bg-blue-500/5 border border-blue-500/20 rounded-lg">
-              <div className="flex items-center gap-2 text-sm text-blue-400 mb-2">
+            <div className="p-3 bg-primary/5 border border-primary/20 rounded-lg">
+              <div className="flex items-center gap-2 text-sm text-primary mb-2">
                 <span>🖥️ {t('admin.pcDataPermissions', 'PC端数据权限')}</span>
               </div>
               <p className="text-xs text-muted-foreground mb-2">{t('admin.permissionsApplyToDataPage', '控制该用户在数据管理页面的操作权限')}</p>
@@ -616,8 +626,8 @@ export function AdminUsersPage() {
                 ))}
               </div>
             </div>
-            <div className="p-3 bg-blue-500/5 border border-blue-500/20 rounded-lg">
-              <div className="flex items-center gap-2 text-sm text-blue-400 mb-2">
+            <div className="p-3 bg-primary/5 border border-primary/20 rounded-lg">
+              <div className="flex items-center gap-2 text-sm text-primary mb-2">
                 <span>🧩 {t('admin.pcFeaturePermissions', 'PC端功能权限')}</span>
               </div>
               <p className="text-xs text-muted-foreground mb-2">{t('admin.featurePermissionsHint', '控制该用户可访问的功能页面')}</p>
@@ -685,6 +695,9 @@ export function AdminUsersPage() {
         </Modal>
       )}
 
+      {/* 修改自己密码：走旧密码+新密码自助流程，成功后回到登录页 */}
+      <ChangePasswordDialog open={showChangePwdModal} onClose={() => setShowChangePwdModal(false)} />
+
       {/* Session History Modal */}
       {showSessionModal && sessionUser && (
         <Modal title={`${t('admin.viewLoginRecords', '查看登录记录')} - ${sessionUser.username}`} onClose={() => setShowSessionModal(false)}>
@@ -704,7 +717,7 @@ export function AdminUsersPage() {
                     <span className="text-muted-foreground">{t('admin.loginRecordTime', '登录时间')}:</span>
                     <span className="text-foreground">{formatDate(s.login_time)}</span>
                     <span className={`ml-auto px-1.5 py-0.5 rounded text-xs ${
-                      s.client_type === 'app' ? 'bg-green-500/10 text-green-400' : 'bg-blue-500/10 text-blue-400'
+                      s.client_type === 'app' ? 'bg-green-500/10 text-green-400' : 'bg-primary/10 text-primary'
                     }`}>
                       {s.client_type === 'app' ? t('admin.appClient', 'APP端') : t('admin.pcClient', 'PC端')}
                     </span>

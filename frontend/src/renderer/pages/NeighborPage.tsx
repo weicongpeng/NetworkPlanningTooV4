@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react'
-import { Play, Download, Settings, Loader2, AlertCircle, Search, X, Ruler, GripVertical, Check, Eye } from 'lucide-react'
+import { Play, Download, Settings, Loader2, AlertCircle, Search, X, Ruler, GripVertical, Check, Eye, Network } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 
 
@@ -67,6 +67,12 @@ export function NeighborPage() {
   const { wizardStep, setWizardStep, config, setConfig, selectedCellIds: storeSelectedCellIds, activeLeftTab, setActiveLeftTab, taskName, setTaskName, resetConfig: storeResetConfig } = useNeighborStore()
   const [taskNameError, setTaskNameError] = useState<string | null>(null)
   const [nextTaskError, setNextTaskError] = useState<string | null>(null)
+  // 导出动画状态（大结果导出耗时较长，按钮内给出进行中/完成反馈）
+  const [exportState, setExportState] = useState<'idle' | 'exporting' | 'success'>('idle')
+  const exportTimerRef = useRef<ReturnType<typeof setTimeout>>()
+  useEffect(() => () => {
+    if (exportTimerRef.current) clearTimeout(exportTimerRef.current)
+  }, [])
 
   // 翻译文本（带中文后备）
   const i18n = {
@@ -77,6 +83,8 @@ export function NeighborPage() {
     planning: t('neighbor.planning') || '规划中...',
     starting: t('neighbor.starting') || '启动中...',
     export: t('neighbor.export') || '导出',
+    exporting: t('neighbor.exporting') || '导出中',
+    exportSuccess: t('neighbor.exportSuccess') || '已导出',
     search: t('neighbor.search') || '搜索',
     clear: t('neighbor.clear') || '清除',
     clearAll: t('neighbor.clearAll') || '清除全部',
@@ -323,6 +331,7 @@ export function NeighborPage() {
         if (latest?.status === 'completed' && latest.result) {
           setLocalTaskResult({ ...(latest.result as any), taskId: latest.id })
           setWizardStep('completed')
+          setActiveTaskId('neighbor_planning', latest.id)
           if (pagedTaskIdRef.current !== latest.id) {
             setPagedRequest({ taskId: latest.id, summary: latest.result })
           }
@@ -1237,10 +1246,12 @@ export function NeighborPage() {
   }
 
   const handleExport = async () => {
-    if (!taskId) return
+    const exportTaskId = taskId || pagedRequest?.taskId || (taskResult as any)?.taskId
+    if (!exportTaskId || exportState !== 'idle') return
 
+    setExportState('exporting')
     try {
-      const blob = await neighborApi.export(taskId, 'xlsx')
+      const blob = await neighborApi.export(exportTaskId, 'xlsx')
       const url = window.URL.createObjectURL(blob)
       const a = document.createElement('a')
       a.href = url
@@ -1255,7 +1266,11 @@ export function NeighborPage() {
       a.click()
       document.body.removeChild(a)
       window.URL.revokeObjectURL(url)
+      setExportState('success')
+      if (exportTimerRef.current) clearTimeout(exportTimerRef.current)
+      exportTimerRef.current = setTimeout(() => setExportState('idle'), 2000)
     } catch (err: any) {
+      setExportState('idle')
       setError(i18n.exportFailed + ': ' + (err.message || '未知错误'))
     }
   }
@@ -1555,7 +1570,10 @@ export function NeighborPage() {
         </div>
       )}
 
-      <h1 className="text-base font-bold mb-6 shrink-0">{i18n.title}</h1>
+      <h1 className="text-base font-bold mb-6 shrink-0 flex items-center gap-2">
+        <Network size={20} className="text-primary" />
+        {i18n.title}
+      </h1>
 
       {/* 错误提示 */}
       {error && (
@@ -1607,7 +1625,7 @@ export function NeighborPage() {
                 )}
                 {isRunning && (
                   <span className="ml-2 inline-flex items-center">
-                    <Loader2 size={12} className="animate-spin text-blue-500" />
+                    <Loader2 size={12} className="animate-spin text-primary" />
                   </span>
                 )}
               </button>
@@ -1915,7 +1933,7 @@ export function NeighborPage() {
                             }}
                             className={`flex items-center gap-2 px-3 py-1.5 rounded-lg transition-colors text-xs font-medium ${
                               resultSearchEnabled
-                                ? 'bg-blue-400 text-white hover:bg-blue-500'
+                                ? 'bg-primary text-primary-foreground hover:bg-primary/90'
                                 : 'bg-card border border-border hover:bg-muted/80'
                             }`}
                           >
@@ -1924,17 +1942,73 @@ export function NeighborPage() {
                           </button>
                           <button
                             onClick={handleExport}
-                            className="flex items-center justify-center gap-2 px-3 py-1.5 bg-card border border-border rounded-lg hover:bg-muted/80 transition-colors disabled:opacity-50 disabled:cursor-not-allowed text-xs font-medium whitespace-nowrap"
+                            disabled={exportState !== 'idle'}
+                            className={`
+                              relative flex items-center justify-center gap-2 px-3 py-1.5 rounded-lg
+                              transition-all duration-300 ease-out overflow-hidden
+                              disabled:cursor-not-allowed text-xs font-medium whitespace-nowrap
+                              ${exportState === 'idle' ? 'bg-card border border-border hover:bg-muted/80' : ''}
+                              ${exportState === 'exporting' ? 'bg-primary/10 text-primary border border-primary/30' : ''}
+                              ${exportState === 'success' ? 'bg-green-500/10 text-green-600 border border-green-500/30' : ''}
+                            `}
                           >
-                            <Download size={14} />
-                            {i18n.export}
+                            <span className="relative flex items-center justify-center w-4 h-4">
+                              <Download
+                                size={14}
+                                className={`
+                                  absolute transition-all duration-300
+                                  ${exportState === 'exporting' ? 'opacity-0 scale-75' : 'opacity-100 scale-100'}
+                                `}
+                              />
+                              {exportState === 'exporting' && (
+                                <svg
+                                  className="animate-spin text-primary"
+                                  width={14}
+                                  height={14}
+                                  viewBox="0 0 24 24"
+                                  fill="none"
+                                >
+                                  <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" strokeLinecap="round" className="opacity-20" />
+                                  <path d="M12 2a10 10 0 0 1 10 10" stroke="currentColor" strokeWidth="3" strokeLinecap="round" />
+                                </svg>
+                              )}
+                              {exportState === 'success' && (
+                                <svg
+                                  className="text-green-500 animate-[ping_0.3s_ease-out]"
+                                  width={14}
+                                  height={14}
+                                  viewBox="0 0 24 24"
+                                  fill="none"
+                                  stroke="currentColor"
+                                  strokeWidth="2.5"
+                                  strokeLinecap="round"
+                                  strokeLinejoin="round"
+                                >
+                                  <polyline points="20 6 9 17 4 12" />
+                                </svg>
+                              )}
+                            </span>
+                            <span className="relative">
+                              {exportState === 'idle' && i18n.export}
+                              {exportState === 'exporting' && (
+                                <span className="inline-flex items-center gap-0.5">
+                                  {i18n.exporting}
+                                  <span className="inline-flex gap-0.5">
+                                    <span className="w-1 h-1 bg-current rounded-full animate-[bounce_0.6s_infinite]" style={{ animationDelay: '0s' }} />
+                                    <span className="w-1 h-1 bg-current rounded-full animate-[bounce_0.6s_infinite]" style={{ animationDelay: '0.15s' }} />
+                                    <span className="w-1 h-1 bg-current rounded-full animate-[bounce_0.6s_infinite]" style={{ animationDelay: '0.3s' }} />
+                                  </span>
+                                </span>
+                              )}
+                              {exportState === 'success' && i18n.exportSuccess}
+                            </span>
                           </button>
                           <button
                             data-guide="result-show-map"
                             onClick={() => setShowMap(prev => !prev)}
                             className={`flex items-center gap-2 px-3 py-1.5 rounded-lg transition-colors text-xs font-medium whitespace-nowrap ${
                               showMap
-                                ? 'bg-blue-400 text-white hover:bg-blue-500'
+                                ? 'bg-primary text-primary-foreground hover:bg-primary/90'
                                 : 'bg-card border border-border hover:bg-muted/80'
                             }`}
                           >
@@ -2171,14 +2245,14 @@ export function NeighborPage() {
 
             {/* 搜索标记计数 */}
             {searchMarkers.length > 0 && (
-              <div className="mb-2 p-2 bg-blue-500/10 border border-blue-500/30 rounded-lg text-xs text-blue-600 flex items-center justify-between">
+              <div className="mb-2 p-2 bg-primary/10 border border-primary/30 rounded-lg text-xs text-primary flex items-center justify-between">
                 <span className="flex items-center gap-2">
                   <Search size={14} />
                   {i18n.searchMarkerCount.replace('{{count}}', String(searchMarkers.length))}
                 </span>
                 <button
                   onClick={handleClearMarkers}
-                  className="text-blue-600 hover:text-blue-500 font-medium"
+                  className="text-primary hover:text-primary font-medium"
                 >
                   {i18n.clearAll}
                 </button>
@@ -2470,9 +2544,9 @@ function NeighborTable({
                         case 'relationType':
                           cellContent = (
                             <span className={`px-1.5 py-0.5 rounded text-[10px] ${
-                              group.relationType === 'LTE-LTE' ? 'bg-blue-500/15 text-blue-400' :
-                              group.relationType === 'NR-NR' ? 'bg-purple-500/15 text-purple-400' :
-                                'bg-green-500/15 text-green-400'
+                              group.relationType === 'LTE-LTE' ? 'bg-primary/15 text-primary' :
+                              group.relationType === 'NR-NR' ? 'bg-primary/15 text-primary' :
+                                'bg-primary/15 text-primary'
                             }`}>
                               {group.relationType}
                             </span>

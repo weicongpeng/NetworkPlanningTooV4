@@ -226,7 +226,7 @@ export const CellSelectionTable = ({
               setColumnSearchEnabled(prev => !prev)
             }}
             className={`flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs transition-colors shrink-0 ${
-              columnSearchEnabled ? 'bg-blue-400 text-white hover:bg-blue-500' : 'bg-card border border-border hover:bg-muted/80'
+              columnSearchEnabled ? 'bg-primary text-primary-foreground hover:bg-primary/90' : 'bg-card border border-border hover:bg-muted/80'
             }`}
             title={columnLabels?.search || '搜索'}
           >
@@ -290,7 +290,8 @@ export const CellSelectionTable = ({
         <div
           ref={containerRef}
           onScroll={handleScroll}
-          className="overflow-y-auto overflow-x-hidden rounded-lg border border-border flex-1 min-h-0"
+          data-npt-div-table
+          className="overflow-y-auto overflow-x-auto rounded-lg border border-border flex-1 min-h-0"
         >
           <div
             className="relative w-full"
@@ -298,15 +299,15 @@ export const CellSelectionTable = ({
           >
             {/* 固定表头，使用 sticky 定位 */}
             <div className="sticky top-0 z-10 bg-background border-b border-border shadow-sm">
-              <div className="flex text-[10px] font-medium">
+              <div className="npt-row flex text-[10px] font-medium" data-npt-header>
                 <div className="p-2 bg-muted border-r border-border w-10 shrink-0 flex items-center justify-center">
                   <button
                     onClick={() => !disabled && onSelectAll(filtered.map(s => s.id))}
                     disabled={disabled}
                     className="w-4 h-4 rounded-sm border flex items-center justify-center disabled:opacity-50 disabled:cursor-not-allowed"
                     style={{
-                      borderColor: noneSelected ? 'hsl(var(--muted-foreground))' : '#3b82f6',
-                      backgroundColor: noneSelected ? 'transparent' : '#3b82f6',
+                      borderColor: noneSelected ? 'hsl(var(--muted-foreground))' : 'hsl(var(--primary))',
+                      backgroundColor: noneSelected ? 'transparent' : 'hsl(var(--primary))',
                     }}
                   >
                     {allSelected && (
@@ -321,12 +322,12 @@ export const CellSelectionTable = ({
                 <div className="p-2 bg-muted border-r border-border w-[80px] shrink-0">{colLabels.cellId}</div>
                 <div className="p-2 bg-muted border-r border-border w-[90px] shrink-0">{colLabels.cellFreq}</div>
                 <div className="p-2 bg-muted border-r border-border w-[70px] shrink-0">{colLabels.cellPci}</div>
-                <div className="p-2 bg-muted border-r border-border flex-1 min-w-0">{colLabels.cellName}</div>
+                <div className="p-2 bg-muted border-r border-border flex-1 min-w-0" data-npt-flex-col>{colLabels.cellName}</div>
                 <div className="p-2 bg-muted border-r border-border w-[95px] shrink-0">{colLabels.cellLng ?? '经度'}</div>
                 <div className="p-2 bg-muted w-[85px] shrink-0">{colLabels.cellLat ?? '纬度'}</div>
               </div>
               {enableColumnSearch && columnSearchEnabled && (
-                <div className="flex text-[10px]">
+                <div className="npt-row flex text-[10px]">
                   <div className="p-1 bg-card border-t border-r border-border w-10 shrink-0" />
                   {FILTER_COLUMNS.map((column) => (
                     <div key={column.key} className={`p-1 bg-card border-t border-r border-border ${column.width}`}>
@@ -357,11 +358,11 @@ export const CellSelectionTable = ({
                 <div
                   key={sector.id}
                   onClick={() => !disabled && onToggleCell(sector.id)}
-                  className={`flex transition-colors text-xs border-b border-border ${
+                  className={`npt-row flex transition-colors text-xs border-b border-border ${
                     disabled ? 'cursor-not-allowed' : 'cursor-pointer'
                   } ${
                     selectedCellIds.has(sector.id)
-                      ? 'bg-blue-500/10'
+                      ? 'bg-primary/10'
                       : disabled ? 'bg-card' : 'bg-card hover:bg-muted/50'
                   }`}
                   style={{ height: ITEM_HEIGHT }}
@@ -370,7 +371,7 @@ export const CellSelectionTable = ({
                     <div
                       className={`w-4 h-4 rounded-sm border flex items-center justify-center ${
                         selectedCellIds.has(sector.id)
-                          ? 'bg-blue-500 border-blue-500'
+                          ? 'bg-primary border-primary'
                           : 'border-border'
                       }`}
                     >

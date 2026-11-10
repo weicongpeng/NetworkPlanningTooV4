@@ -2262,7 +2262,7 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
         const lngInputId = `location-lng-input-${locationId}`
         const latInputId = `location-lat-input-${locationId}`
         const inputStyle = `padding:4px 8px;border:1px solid hsl(var(--border));border-radius:4px;font-size:12px;width:100%;color:hsl(var(--foreground));background:hsl(var(--muted));outline:none;font-family:monospace;`
-        const inputFocus = `onfocus="this.style.borderColor='#3b82f6';this.style.boxShadow='0 0 0 2px rgba(59,130,246,0.2)'" onblur="this.style.borderColor='hsl(var(--border))';this.style.boxShadow='none'"`
+        const inputFocus = `onfocus="this.style.borderColor='hsl(var(--primary))';this.style.boxShadow='0 0 0 2px hsl(var(--primary) / 0.2)'" onblur="this.style.borderColor='hsl(var(--border))';this.style.boxShadow='none'"`
         const deleteBtnText = t('map.delete') || '删除'
         const copyBtnText = t('map.copy') || '复制'
         const propertiesText = t('map.properties') || '属性'
@@ -2287,7 +2287,7 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
             </div>
             <div style="margin-top:10px;padding-top:8px;border-top:1px solid hsl(var(--border));display:flex;justify-content:flex-end;gap:8px;">
               <button class="confirm-btn" style="background:#22c55e;border:1px solid #22c55e;cursor:pointer;color:#fff;font-size:12px;padding:4px 14px;border-radius:4px;transition:all 0.15s;">${confirmBtnText}</button>
-              <button class="cp-all-btn" style="background:#3b82f6;border:1px solid #3b82f6;cursor:pointer;color:#fff;font-size:12px;padding:4px 14px;border-radius:4px;transition:all 0.15s;">${copyBtnText}</button>
+              <button class="cp-all-btn" style="background:hsl(var(--primary));border:1px solid hsl(var(--primary));cursor:pointer;color:#fff;font-size:12px;padding:4px 14px;border-radius:4px;transition:all 0.15s;">${copyBtnText}</button>
               <button class="del-btn" style="background:#ef4444;border:1px solid #ef4444;cursor:pointer;color:#fff;font-size:12px;padding:4px 14px;border-radius:4px;transition:all 0.15s;">${deleteBtnText}</button>
             </div>
           </div>
@@ -2320,8 +2320,8 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
                 this.style.borderColor = '#16a34a'
                 setTimeout(() => {
                   this.textContent = (window as any).__gsdT?.('map.copy') || '复制'
-                  this.style.background = '#3b82f6'
-                  this.style.borderColor = '#3b82f6'
+                  this.style.background = 'hsl(var(--primary))'
+                  this.style.borderColor = 'hsl(var(--primary))'
                 }, 1200)
               })
             })
@@ -3507,7 +3507,7 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
         const lngInputId = `capture-lng-input-${captureId}`
         const latInputId = `capture-lat-input-${captureId}`
         const inputStyle = `padding:4px 8px;border:1px solid hsl(var(--border));border-radius:4px;font-size:12px;width:100%;color:hsl(var(--foreground));background:hsl(var(--muted));outline:none;font-family:monospace;`
-        const inputFocus = `onfocus="this.style.borderColor='#3b82f6';this.style.boxShadow='0 0 0 2px rgba(59,130,246,0.2)'" onblur="this.style.borderColor='hsl(var(--border))';this.style.boxShadow='none'"`
+        const inputFocus = `onfocus="this.style.borderColor='hsl(var(--primary))';this.style.boxShadow='0 0 0 2px hsl(var(--primary) / 0.2)'" onblur="this.style.borderColor='hsl(var(--border))';this.style.boxShadow='none'"`
         const deleteBtnText = t('map.delete') || '删除'
         const copyBtnText = t('map.copy') || '复制'
         const confirmBtnText = t('common.confirm') || '确定'
@@ -3533,7 +3533,7 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
             </div>
             <div style="margin-top:10px;padding-top:8px;border-top:1px solid hsl(var(--border));display:flex;justify-content:flex-end;gap:8px;">
               <button class="confirm-btn" style="background:#22c55e;border:1px solid #22c55e;cursor:pointer;color:#fff;font-size:12px;padding:4px 14px;border-radius:4px;transition:all 0.15s;">${confirmBtnText}</button>
-              <button class="cp-all-btn" style="background:#3b82f6;border:1px solid #3b82f6;cursor:pointer;color:#fff;font-size:12px;padding:4px 14px;border-radius:4px;transition:all 0.15s;">${copyBtnText}</button>
+              <button class="cp-all-btn" style="background:hsl(var(--primary));border:1px solid hsl(var(--primary));cursor:pointer;color:#fff;font-size:12px;padding:4px 14px;border-radius:4px;transition:all 0.15s;">${copyBtnText}</button>
               <button class="del-btn" style="background:#ef4444;border:1px solid #ef4444;cursor:pointer;color:#fff;font-size:12px;padding:4px 14px;border-radius:4px;transition:all 0.15s;">${deleteBtnText}</button>
             </div>
           </div>
@@ -3566,8 +3566,8 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
                 this.style.borderColor = '#16a34a'
                 setTimeout(() => {
                   this.textContent = (window as any).__gsdT?.('map.copy') || '复制'
-                  this.style.background = '#3b82f6'
-                  this.style.borderColor = '#3b82f6'
+                  this.style.background = 'hsl(var(--primary))'
+                  this.style.borderColor = 'hsl(var(--primary))'
                 }, 1200)
               })
             })
@@ -8332,8 +8332,8 @@ function sectorPointGeometry(f: any): { type: 'Point'; coordinates: [number, num
         {/* 加载提示 */}
         {loading && (
           <div className="absolute top-4 left-4 z-[1000] bg-card/95 backdrop-blur px-4 py-2 rounded-lg shadow-md border border-border flex items-center gap-2">
-            <Loader2 className="animate-spin text-blue-600" size={16} />
-            <span className="text-sm text-blue-600">加载地图中...</span>
+            <Loader2 className="animate-spin text-primary" size={16} />
+            <span className="text-sm text-primary">加载地图中...</span>
           </div>
         )}
 
@@ -8341,8 +8341,8 @@ function sectorPointGeometry(f: any): { type: 'Point'; coordinates: [number, num
         {layerLoading && (
           <div className="absolute inset-0 z-[1001] flex items-center justify-center pointer-events-none">
             <div className="bg-card/95 backdrop-blur rounded-xl shadow-lg border border-border px-5 py-3 flex items-center gap-3">
-              <Loader2 className="animate-spin text-blue-600" size={20} />
-              <span className="text-sm text-blue-600">{t('map.loading')}</span>
+              <Loader2 className="animate-spin text-primary" size={20} />
+              <span className="text-sm text-primary">{t('map.loading')}</span>
             </div>
           </div>
         )}
@@ -8353,7 +8353,7 @@ function sectorPointGeometry(f: any): { type: 'Point'; coordinates: [number, num
             // 阻止提示条上的点击/双击冒泡到 Leaflet map：否则点"复制/导出/删除"按钮
             // 会同时触发一次地图 click（边界选择下会多余地重新收集一次）
             ref={(el) => { if (el) L.DomEvent.disableClickPropagation(el) }}
-            className="absolute bottom-4 left-1/2 transform -translate-x-1/2 z-[1000] bg-blue-600/95 text-white px-4 py-2 rounded-lg shadow-lg flex items-center gap-2"
+            className="absolute bottom-4 left-1/2 transform -translate-x-1/2 z-[1000] bg-primary/95 text-white px-4 py-2 rounded-lg shadow-lg flex items-center gap-2"
           >
             <span className="text-sm font-medium">{selectionTip}</span>
             {selectedFeatureCount > 0 && (
@@ -8361,7 +8361,7 @@ function sectorPointGeometry(f: any): { type: 'Point'; coordinates: [number, num
                 type="button"
                 onClick={() => { void copySelectionBoth() }}
                 title={t('map.copySelectionHint') || '复制圈选要素：属性文本可粘贴到 Excel，几何+属性可粘贴到其他打开编辑开关的图层'}
-                className="flex items-center gap-1 bg-white text-blue-600 text-sm font-medium px-2.5 py-1 rounded-md hover:bg-blue-50 active:bg-blue-100 transition-colors"
+                className="flex items-center gap-1 bg-white text-primary text-sm font-medium px-2.5 py-1 rounded-md hover:bg-primary/10 active:bg-primary/20 transition-colors"
               >
                 <CopyIcon size={14} />
                 {t('map.copySelection') || '复制'}
@@ -8372,7 +8372,7 @@ function sectorPointGeometry(f: any): { type: 'Point'; coordinates: [number, num
                 type="button"
                 onClick={openSelectionExportDialog}
                 title={t('map.exportAction') || '导出'}
-                className="flex items-center gap-1 bg-white text-blue-600 text-sm font-medium px-2.5 py-1 rounded-md hover:bg-blue-50 active:bg-blue-100 transition-colors"
+                className="flex items-center gap-1 bg-white text-primary text-sm font-medium px-2.5 py-1 rounded-md hover:bg-primary/10 active:bg-primary/20 transition-colors"
               >
                 <FileSpreadsheet size={14} />
                 {t('map.exportAction') || '导出'}

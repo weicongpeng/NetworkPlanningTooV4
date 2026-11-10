@@ -71,7 +71,7 @@ export function DesktopAuthPendingDialog() {
             {error}
           </div>
         ) : (
-          <div className="flex items-center gap-2 text-xs text-blue-500">
+          <div className="flex items-center gap-2 text-xs text-primary">
             <Loader2 size={14} className="animate-spin" />
             {t('desktopAuth.waiting', '等待管理员确认…')}
           </div>

@@ -52,7 +52,7 @@ export function HistoryTabActions({
         className={`${BASE} ${unappliedCount === 0 ? 'text-muted-foreground' : 'text-primary hover:text-primary/70'}`}
         title={t('common.batchApply') || '批量应用'}
       >
-        {applying ? <Loader2 size={15} className="animate-spin" /> : <Check size={15} strokeWidth={2.5} />}
+        {applying ? <Loader2 size={15} className="animate-spin" /> : <Check size={15} strokeWidth={3} />}
       </button>
       <button
         onClick={() => triggerBatchDelete()}

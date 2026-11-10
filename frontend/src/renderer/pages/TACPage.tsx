@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useMemo, useCallback } from 'react'
-import { Download, Loader2, AlertCircle, Search, GripVertical, List, Eye } from 'lucide-react'
+import { Download, Loader2, AlertCircle, Search, GripVertical, List, Eye, GitCompare } from 'lucide-react'
 import { LoadingSpinner } from '../components/LoadingSpinner'
 import { tacApi } from '../services/api'
 import { useTACCheckStore } from '../store/tacCheckStore'
@@ -201,6 +201,7 @@ export function TACPage() {
         if (latest?.status === 'completed' && latest.result) {
           setLocalTaskResult(latest.result as TACResultData)
           setWizardStep('completed')
+          setActiveTaskId('tac_check', latest.id)
           if (pagedTaskIdRef.current !== latest.id) {
             setPagedRequest({ taskId: latest.id, summary: latest.result })
           }
@@ -566,12 +567,13 @@ export function TACPage() {
   }
 
   const handleExport = async (format: 'xlsx' | 'csv' = 'xlsx') => {
-    if (!taskId || exportState !== 'idle') return
+    const exportTaskId = taskId || pagedRequest?.taskId || viewedTaskIdRef.current
+    if (!exportTaskId || exportState !== 'idle') return
 
     setExportState('exporting')
 
     try {
-      const blob = await tacApi.export(taskId, format)
+      const blob = await tacApi.export(exportTaskId, format)
 
       setExportState('success')
       if (exportTimerRef.current) clearTimeout(exportTimerRef.current)
@@ -1082,7 +1084,7 @@ export function TACPage() {
   return (
     <div className="h-full flex flex-col p-4 min-h-0">
       {/* 页面标题 */}
-      <h1 className="text-base font-bold mb-6 shrink-0">{t('tac.title') || 'TAC核查'}</h1>
+      <h1 className="text-base font-bold mb-6 shrink-0 flex items-center gap-2"><GitCompare size={20} className="text-primary" />{t('tac.title') || 'TAC核查'}</h1>
 
       {/* 错误提示 */}
       {error && (
@@ -1142,7 +1144,7 @@ export function TACPage() {
             )}
             {taskResult?.status === 'processing' && (
               <span className="ml-2 inline-flex items-center">
-                <Loader2 size={12} className="animate-spin text-blue-500" />
+                <Loader2 size={12} className="animate-spin text-primary" />
               </span>
             )}
           </button>
@@ -1354,20 +1356,20 @@ export function TACPage() {
                         <p className="text-[10px] text-red-600">{t('tac.tacMismatch') || 'TAC错配'}</p>
                         <p className="text-sm font-semibold text-red-600">{taskResult.mismatchedCells || 0}</p>
                       </div>
-                      <div className="px-2.5 py-1.5 bg-blue-500/10 border border-blue-500/20 rounded-md">
-                        <p className="text-[10px] text-blue-600">{t('tac.mismatchRate') || '错配率'}</p>
-                        <p className="text-sm font-semibold text-blue-600">
-                          {taskResult.matchedCells > 0 ? ((taskResult.mismatchedCells / taskResult.matchedCells) * 100).toFixed(2) : '0.00'}%
+                      <div className="px-2.5 py-1.5 bg-primary/10 border border-primary/20 rounded-md">
+                        <p className="text-[10px] text-primary">{t('tac.mismatchRate') || '错配率'}</p>
+                        <p className="text-sm font-semibold text-primary">
+                          {Number(taskResult.mismatchedCells) > 0 && Number(taskResult.matchedCells) > 0 ? ((Number(taskResult.mismatchedCells) / Number(taskResult.matchedCells)) * 100).toFixed(2) : '0'}%
                         </p>
                       </div>
-                      <div className="px-2.5 py-1.5 bg-purple-500/10 border border-purple-500/20 rounded-md">
-                        <p className="text-[10px] text-purple-600">{t('tac.singularity') || 'TAC插花'}</p>
-                        <p className="text-sm font-semibold text-purple-600">{taskResult.singularityCount || 0}</p>
+                      <div className="px-2.5 py-1.5 bg-primary/10 border border-purple-500/20 rounded-md">
+                        <p className="text-[10px] text-primary">{t('tac.singularity') || 'TAC插花'}</p>
+                        <p className="text-sm font-semibold text-primary">{taskResult.singularityCount || 0}</p>
                       </div>
                       <div className="px-2.5 py-1.5 bg-muted/50 rounded-md">
                         <p className="text-[10px] text-muted-foreground">{t('tac.matchRate') || '匹配率'}</p>
                         <p className="text-sm font-semibold">
-                          {taskResult.totalCells > 0 ? ((taskResult.matchedCells / taskResult.totalCells) * 100).toFixed(2) : '0.00'}%
+                          {Number(taskResult.matchedCells) > 0 && Number(taskResult.totalCells) > 0 ? ((Number(taskResult.matchedCells) / Number(taskResult.totalCells)) * 100).toFixed(2) : '0'}%
                         </p>
                       </div>
                     </div>
@@ -1418,7 +1420,7 @@ export function TACPage() {
                                   relative flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm
                                   transition-all duration-300 ease-out overflow-hidden
                                   ${exportState === 'idle' ? 'bg-muted hover:bg-muted/80 text-foreground' : ''}
-                                  ${exportState === 'exporting' ? 'bg-blue-500/10 text-blue-600 border border-blue-500/30' : ''}
+                                  ${exportState === 'exporting' ? 'bg-primary/10 text-primary border border-primary/30' : ''}
                                   ${exportState === 'success' ? 'bg-green-500/10 text-green-600 border border-green-500/30' : ''}
                                 `}
                               >
@@ -1433,7 +1435,7 @@ export function TACPage() {
                                   />
                                   {exportState === 'exporting' && (
                                     <svg
-                                      className="animate-spin text-blue-500"
+                                      className="animate-spin text-primary"
                                       width={16}
                                       height={16}
                                       viewBox="0 0 24 24"
@@ -1487,7 +1489,7 @@ export function TACPage() {
                                 }
                                 setSearchEnabled(!searchEnabled)
                               }}
-                              className={`flex items-center gap-2 px-3 py-1.5 rounded-lg transition-colors text-sm ${searchEnabled ? 'bg-blue-400 text-white hover:bg-blue-500' : 'bg-muted hover:bg-muted/80'}`}>
+                              className={`flex items-center gap-2 px-3 py-1.5 rounded-lg transition-colors text-sm ${searchEnabled ? 'bg-primary text-primary-foreground hover:bg-primary/90' : 'bg-muted hover:bg-muted/80'}`}>
                               <Search size={16} />
                               {t('tac.search') || '搜索'}
                             </button>
@@ -1496,7 +1498,7 @@ export function TACPage() {
                               onClick={() => setShowMap(prev => !prev)}
                               className={`flex items-center gap-2 px-3 py-1.5 rounded-lg transition-colors text-sm ${
                                 showMap
-                                  ? 'bg-blue-400 text-white hover:bg-blue-500'
+                                  ? 'bg-primary text-primary-foreground hover:bg-primary/90'
                                   : 'bg-muted hover:bg-muted/80'
                               }`}
                             >
@@ -1578,7 +1580,7 @@ export function TACPage() {
                           return (
                             <tr
                               key={`${cell.sectorId}-${actualIndex}`}
-                              className={`border-b hover:bg-muted/50 cursor-pointer ${isSelected ? 'bg-blue-500/10' : ''
+                              className={`border-b hover:bg-muted/50 cursor-pointer ${isSelected ? 'bg-primary/10' : ''
                                 }`}
                               style={{ height: `${ITEM_HEIGHT}px` }}
                               onClick={() => handleResultRowClick(cell)}
@@ -1612,8 +1614,8 @@ export function TACPage() {
                                   case 'networkType':
                                     cellContent = (
                                       <span className={`px-1.5 py-0.5 rounded text-[10px] ${cell.networkType === 'LTE'
-                                          ? 'bg-blue-500/10 text-blue-600'
-                                          : 'bg-purple-500/10 text-purple-600'
+                                          ? 'bg-primary/10 text-primary'
+                                          : 'bg-primary/10 text-primary'
                                         }`}>
                                         {cell.networkType}
                                       </span>
@@ -1652,7 +1654,7 @@ export function TACPage() {
                                   case 'isSingularity':
                                     cellContent = cell.existingTac && cell.existingTac !== '-' ? (
                                       cell.isSingularity ? (
-                                        <span className="px-2 py-1 bg-purple-500/10 text-purple-600 rounded">
+                                        <span className="px-2 py-1 bg-primary/10 text-primary rounded">
                                           {t('tac.yes') || '是'}
                                         </span>
                                       ) : (
@@ -1671,8 +1673,8 @@ export function TACPage() {
                                       <span
                                         title={String(cell.suggestedTac)}
                                         className={`inline-block max-w-full px-1.5 py-0.5 rounded text-[10px] truncate align-middle ${cell.isSingularity
-                                          ? 'bg-purple-500/10 text-purple-600 font-mono'
-                                          : 'bg-blue-500/10 text-blue-600'
+                                          ? 'bg-primary/10 text-primary font-mono'
+                                          : 'bg-primary/10 text-primary'
                                         }`}
                                       >
                                         {cell.suggestedTac}

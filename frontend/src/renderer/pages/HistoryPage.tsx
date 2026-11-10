@@ -90,7 +90,7 @@ export function HistoryPage() {
             <p className="text-sm">{t('common.noTaskHistory')}</p>
           </div>
         ) : (
-          <table className="w-full text-sm">
+          <table className="w-full text-sm npt-resizable">
             {/* 表头必须不透明：半透明背景会让滚动的正文透过表头显示 */}
             <thead className="sticky top-0 z-20">
               <tr className="border-b border-border">
@@ -128,7 +128,7 @@ export function HistoryPage() {
                   </td>
                   <td className="px-4 py-3 text-center">
                     {task.status === 'completed' ? (
-                      <span className="inline-flex items-center gap-1 px-2 py-0.5 text-[10px] bg-green-500/15 text-green-400 rounded-full font-medium">
+                      <span className="inline-flex items-center gap-1 px-2 py-0.5 text-[10px] bg-primary/15 text-green-400 rounded-full font-medium">
                         <CheckCircle2 size={10} />
                         {t('common.taskSuccess')}
                       </span>
@@ -138,8 +138,8 @@ export function HistoryPage() {
                         {t('common.taskFailed')}
                       </span>
                     ) : task.status === 'running' ? (
-                      <span className="inline-flex items-center gap-1 px-2 py-0.5 text-[10px] bg-blue-500/15 text-blue-400 rounded-full font-medium">
-                        <span className="inline-block w-2 h-2 rounded-full bg-blue-500 animate-pulse" />
+                      <span className="inline-flex items-center gap-1 px-2 py-0.5 text-[10px] bg-primary/15 text-primary rounded-full font-medium">
+                        <span className="inline-block w-2 h-2 rounded-full bg-primary animate-pulse" />
                         {task.progress || 0}%
                       </span>
                     ) : null}

@@ -624,7 +624,7 @@ export function MapSearchDialog({ open, onOpenChange, searchWorkbook, workbookSo
                     className="w-full text-left px-4 py-2.5 flex items-start gap-2.5 hover:bg-accent transition-colors border-b border-border/50 last:border-0"
                   >
                     {r.kind === 'sector'
-                      ? <Database size={14} className={`mt-0.5 shrink-0 ${r.networkType === 'LTE' ? 'text-blue-500' : 'text-green-500'}`} />
+                      ? <Database size={14} className={`mt-0.5 shrink-0 ${r.networkType === 'LTE' ? 'text-primary' : 'text-green-500'}`} />
                       : <MapPin size={14} className="mt-0.5 shrink-0 text-red-500" />}
                     <span className="flex-1 min-w-0">
                       <span className="block text-xs font-medium text-foreground break-words whitespace-normal leading-relaxed">

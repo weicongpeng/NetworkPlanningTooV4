@@ -18,6 +18,8 @@ import asyncio
 import logging
 
 from app.algorithms.distance_calculator import DistanceCalculator
+from app.algorithms.pci_check_candidates import coerce_azimuth, is_facing
+from app.algorithms.pci_check_types import PCICheckParams
 
 logger = logging.getLogger(__name__)
 
@@ -29,7 +31,9 @@ class PlanningConfig:
     reuse_distance_km: float = 3.0  # 最小PCI复用距离（公里）
     inherit_mod: bool = False  # 是否继承原PCI的模值
     pci_range: Optional[Tuple[int, int]] = None  # 自定义PCI范围
-    
+    use_mod6: bool = True  # LTE 同站/对打同频小区模6不相等约束
+    use_mod4: bool = True  # NR 同站/对打同频小区模4不相等约束
+
     # 常量
     LTE_MIN_PCI = 0
     LTE_MAX_PCI = 503
@@ -107,7 +111,12 @@ class LTENRPCIPlanner:
             self.mod_value = 30
             self.dual_mod_requirement = True
             default_pci_range = list(range(0, 1008))
-        
+
+        # 次级模约束：LTE 模6 / NR 模4，优先级低于主模(mod3/mod30)
+        self.secondary_mod_value = 6 if self.network_type == "LTE" else 4
+        self.enable_secondary_mod = config.use_mod6 if self.network_type == "LTE" else config.use_mod4
+        self._check_params = PCICheckParams(network_type=self.network_type)
+
         # 使用自定义PCI范围或默认范围
         if config.pci_range:
             self.pci_range = list(range(config.pci_range[0], config.pci_range[1] + 1))
@@ -155,6 +164,8 @@ class LTENRPCIPlanner:
                     "earfcn_dl": sector.get("earfcn") or sector.get("frequency") or sector.get("ssb_frequency"),
                     "managed_element_id": site.get("managedElementId"),
                     "first_group": sector.get("firstGroup") or sector.get("first_group"),
+                    "azimuth": sector.get("azimuth"),
+                    "cell_cover_type": sector.get("cell_cover_type", 1),
                 })
         
         self.cells_to_plan_df = pd.DataFrame(plan_rows)
@@ -172,12 +183,14 @@ class LTENRPCIPlanner:
                     "lat": sector.get("latitude") or site.get("latitude", 0.0),
                     "lon": sector.get("longitude") or site.get("longitude", 0.0),
                     "earfcn_dl": sector.get("earfcn") or sector.get("frequency") or sector.get("ssb_frequency"),
+                    "azimuth": sector.get("azimuth"),
+                    "cell_cover_type": sector.get("cell_cover_type", 1),
                 })
         
         self.all_cells_df = pd.DataFrame(all_rows)
         
         # 转换数值列
-        numeric_cols = ['pci', 'lat', 'lon', 'earfcn_dl']
+        numeric_cols = ['pci', 'lat', 'lon', 'earfcn_dl', 'azimuth', 'cell_cover_type']
         for col in numeric_cols:
             if col in self.cells_to_plan_df.columns:
                 self.cells_to_plan_df[col] = pd.to_numeric(self.cells_to_plan_df[col], errors='coerce')
@@ -310,17 +323,74 @@ class LTENRPCIPlanner:
             
         return conflicts
 
+    def get_facing_cells(self, lat: float, lon: float, earfcn: float, azimuth: Any,
+                         is_indoor: bool, exclude_enodeb, exclude_cell,
+                         same_site_keys: Set[Tuple[str, str]]) -> List[Dict]:
+        """获取与目标小区同频且对打(双向主瓣互指)的小区，复用 PCI 核查口径。
+
+        口径与核查 _check_facing_mod 一致：非同站 + 同频 + 距离 ≤ 对应类型对打
+        门限 + 双向互指；方位角缺失时 is_facing 退化为仅距离判定(保守从严)。
+        """
+        freq_cells = self.all_cells_by_freq.get(earfcn)
+        if freq_cells is None or freq_cells.empty:
+            return []
+
+        max_km = self._check_params.max_pair_distance_km
+        # 经纬度粗筛步长与核查 grid_steps 一致：经度按纬度 cos 放大，避免高纬漏对
+        lat_pad = max_km / 111.0
+        lon_pad = max_km / (111.0 * max(0.2, math.cos(math.radians(abs(lat)))))
+        nearby = freq_cells[
+            (abs(freq_cells['lat'] - lat) < lat_pad) &
+            (abs(freq_cells['lon'] - lon) < lon_pad)
+        ].copy()
+        if nearby.empty:
+            return []
+
+        ex_id = self.normalize_id(exclude_enodeb)
+        ex_cell = self.normalize_id(exclude_cell)
+        nearby = nearby[
+            ~((nearby['enodeb_id'].apply(self.normalize_id) == ex_id) &
+              (nearby['cell_id'].apply(self.normalize_id) == ex_cell))
+        ]
+        keys = list(zip(nearby['enodeb_id'].apply(self.normalize_id),
+                        nearby['cell_id'].apply(self.normalize_id)))
+        nearby = nearby.iloc[[i for i, k in enumerate(keys) if k not in same_site_keys]]
+        if nearby.empty:
+            return []
+
+        nearby['dist'] = self.calculate_distance_vectorized(
+            lat, lon, nearby['lat'].values, nearby['lon'].values)
+        target = {"azimuth": coerce_azimuth(azimuth), "longitude": lon, "latitude": lat}
+
+        facing_cells = []
+        for cell in nearby.to_dict('records'):
+            if cell['dist'] > max_km:
+                continue
+            cand_cover = cell.get('cell_cover_type')
+            cand_indoor = bool(pd.notna(cand_cover) and int(cand_cover) == 4)
+            gate_km = self._check_params.pair_distance_km(is_indoor, cand_indoor)
+            if cell['dist'] > gate_km:
+                continue
+            gate_deg = self._check_params.facing_gate_deg(is_indoor or cand_indoor)
+            cand = {"azimuth": coerce_azimuth(cell.get('azimuth')),
+                    "longitude": cell['lon'], "latitude": cell['lat']}
+            if is_facing(target, cand, gate_deg):
+                facing_cells.append(cell)
+        return facing_cells
+
     def get_reuse_compliant_pcis(self, target_lat: float, target_lon: float, target_earfcn: float,
                                 exclude_enodeb=None, exclude_cell=None,
                                 target_mod: Optional[int] = None,
                                 strict_site_mod: bool = True,
                                 pci_conflicts: Optional[Dict] = None,
-                                same_site_cells: Optional[List[Dict]] = None) -> List[Tuple[int, float, bool, float, str]]:
+                                same_site_cells: Optional[List[Dict]] = None,
+                                forbidden_secondary_mods: Optional[Set[int]] = None) -> List[Tuple[int, float, bool, float, str]]:
         """
         获取满足要求的PCI列表
         Args:
             pci_conflicts: 预计算的PCI冲突结果，避免重复计算
             same_site_cells: 预计算的同站小区列表
+            forbidden_secondary_mods: 次级模(模6/模4)禁止集合；None/空集表示不约束
         Returns: (pci, min_distance, has_mod_conflict, balance_score, min_distance_cell_name)
         """
         # 获取所有可能的PCI冲突（20km半径）
@@ -367,7 +437,12 @@ class LTENRPCIPlanner:
                     continue
                 if self.network_type == "NR" and self.dual_mod_requirement and mod3 in same_site_mod3s:
                     continue
-            
+
+            # 【次级模约束】同站同频 ∪ 对打同频小区的模6(LTE)/模4(NR)不能相同。
+            # 优先级低于 mod3/mod30：仅阶段1~4调用本方法时启用，阶段5/6内联不检查。
+            if forbidden_secondary_mods and pci % self.secondary_mod_value in forbidden_secondary_mods:
+                continue
+
             # 检查复用距离
             conflict = pci_conflicts.get(pci)
             if conflict:
@@ -493,7 +568,29 @@ class LTENRPCIPlanner:
         # 获取同站小区
         same_site_cells = self.get_same_site_cells(lat, lon, enodeb_id, cell_id)
         same_freq_site_cells = [c for c in same_site_cells if c.get('earfcn_dl') is not None and float(c['earfcn_dl']) == float(earfcn)]
-        
+
+        # 次级模约束(模6/模4)：作用范围 = 同站同频 ∪ 对打同频小区。
+        # 优先级低于 mod3/mod30：阶段1~4 强制，阶段5/6(内联)不检查，故无解时先放宽本约束。
+        same_site_keys = {
+            (self.normalize_id(c['enodeb_id']), self.normalize_id(c['cell_id']))
+            for c in same_site_cells
+        }
+        is_indoor = bool(pd.notna(row.get('cell_cover_type')) and int(row['cell_cover_type']) == 4)
+        facing_cells = (
+            self.get_facing_cells(lat, lon, earfcn, row.get('azimuth'), is_indoor,
+                                  enodeb_id, cell_id, same_site_keys)
+            if self.enable_secondary_mod else []
+        )
+        constraint_cells = same_freq_site_cells + facing_cells
+        forbidden_secondary_mods = None
+        if self.enable_secondary_mod:
+            forbidden_secondary_mods = {
+                int(c['pci']) % self.secondary_mod_value
+                for c in constraint_cells
+                if pd.notna(c.get('pci')) and int(c['pci']) != -1
+            }
+        relaxed_tag = '_secondary_mod_relaxed' if forbidden_secondary_mods else ''
+
         # 计算同站同频小区的模值约束和已使用的PCI（硬约束）
         same_site_mods = set()
         same_site_mod3s = set()
@@ -520,7 +617,7 @@ class LTENRPCIPlanner:
         # 第一阶段：尝试同时满足模值约束和复用距离约束
         if target_mod is not None:
             compliant = self.get_reuse_compliant_pcis(lat, lon, earfcn, enodeb_id, cell_id, target_mod, strict_site_mod=True,
-                                                       pci_conflicts=pci_conflicts, same_site_cells=same_site_cells)
+                                                       pci_conflicts=pci_conflicts, same_site_cells=same_site_cells, forbidden_secondary_mods=forbidden_secondary_mods)
             if compliant:
                 pci, dist, _, _, name = compliant[0]
                 mod_source = "preferred" if preferred_mod3 is not None else "inherit"
@@ -533,7 +630,7 @@ class LTENRPCIPlanner:
                     continue
                 self.reuse_distance_km = step
                 compliant = self.get_reuse_compliant_pcis(lat, lon, earfcn, enodeb_id, cell_id, preferred_mod3, strict_site_mod=True,
-                                                           pci_conflicts=pci_conflicts, same_site_cells=same_site_cells)
+                                                           pci_conflicts=pci_conflicts, same_site_cells=same_site_cells, forbidden_secondary_mods=forbidden_secondary_mods)
                 self.reuse_distance_km = orig_threshold  # 恢复
                 if compliant:
                     pci, dist, _, _, name = compliant[0]
@@ -542,7 +639,7 @@ class LTENRPCIPlanner:
         
         # 第三阶段：不使用特定模值，但保持复用距离约束
         compliant = self.get_reuse_compliant_pcis(lat, lon, earfcn, enodeb_id, cell_id, None, strict_site_mod=True,
-                                           pci_conflicts=pci_conflicts, same_site_cells=same_site_cells)
+                                           pci_conflicts=pci_conflicts, same_site_cells=same_site_cells, forbidden_secondary_mods=forbidden_secondary_mods)
         if compliant:
             pci, dist, _, _, name = compliant[0]
             return pci, f'reuse_compliant_{orig_threshold}km_strict_site_mod', dist, name
@@ -553,7 +650,7 @@ class LTENRPCIPlanner:
                 continue
             self.reuse_distance_km = step
             compliant = self.get_reuse_compliant_pcis(lat, lon, earfcn, enodeb_id, cell_id, None, strict_site_mod=True,
-                                           pci_conflicts=pci_conflicts, same_site_cells=same_site_cells)
+                                           pci_conflicts=pci_conflicts, same_site_cells=same_site_cells, forbidden_secondary_mods=forbidden_secondary_mods)
             self.reuse_distance_km = orig_threshold  # 恢复
             if compliant:
                 pci, dist, _, _, name = compliant[0]
@@ -561,6 +658,9 @@ class LTENRPCIPlanner:
                 return pci, reason, dist, name
         
         # 第五阶段：遍历所有PCI，选择满足同站约束的最佳PCI
+        # 【刻意不放宽主模】本阶段及之后不检查次级模约束(模6/模4)：其优先级低于
+        # mod3/mod30，已在阶段1~4优先满足；无解时先在此放宽次级模、仍强制 mod3/mod30。
+        # 勿在此补 % secondary_mod_value 检查，否则次级模会变成与主模同级(破坏优先级)。
         candidates = []
         for pci in self.pci_range:
             # 【硬约束】首先检查同站同频小区是否已使用相同PCI
@@ -583,7 +683,7 @@ class LTENRPCIPlanner:
             candidates.sort(key=lambda x: (-x[1] if x[1] != 999.0 else 1000))
             best_pci, max_dist, best_name = candidates[0]
             constraint_status = "mod_violated" if len(same_site_mods) >= self.mod_value else "strict_site_mod"
-            return best_pci, f'emergency_pci_{max_dist:.2f}km_{constraint_status}', max_dist, best_name
+            return best_pci, f'emergency_pci_{max_dist:.2f}km_{constraint_status}{relaxed_tag}', max_dist, best_name
         
         # 第六阶段：如果同站同频小区数量 >= mod_value，必须放宽同站模约束
         # 但仍然保持【硬约束：同站同频小区不能使用相同PCI】
@@ -600,7 +700,7 @@ class LTENRPCIPlanner:
                 candidates.sort(key=lambda x: (-x[1] if x[1] != 999.0 else 1000))
                 best_pci, max_dist, best_name = candidates[0]
                 constraint_status = "preferred_mod3_mod_violated"
-                return best_pci, f'emergency_pci_{max_dist:.2f}km_{constraint_status}', max_dist, best_name
+                return best_pci, f'emergency_pci_{max_dist:.2f}km_{constraint_status}{relaxed_tag}', max_dist, best_name
         
         # 最后的保底方案：选择距离最大的PCI（但仍然保持【硬约束：同站同频小区不能使用相同PCI】）
         candidates = []
@@ -615,18 +715,18 @@ class LTENRPCIPlanner:
             candidates.sort(key=lambda x: (-x[1] if x[1] != 999.0 else 1000))
             best_pci, max_dist, best_name = candidates[0]
             constraint_status = "all_constraints_violated"
-            return best_pci, f'emergency_pci_{max_dist:.2f}km_{constraint_status}', max_dist, best_name
+            return best_pci, f'emergency_pci_{max_dist:.2f}km_{constraint_status}{relaxed_tag}', max_dist, best_name
         
         # 极端情况：所有PCI都被同频同PCI小区占用，或剩余PCI都是同站同频小区已使用的
         # 必须选择一个未使用的PCI（硬约束：同站同频小区不能使用相同PCI）
         for fallback_pci in self.pci_range:
             if fallback_pci not in same_site_used_pcis:
                 print(f"[WARNING] 同站({enodeb_id})无理想PCI，使用保底PCI {fallback_pci}（避开同站同频已用PCI）")
-                return fallback_pci, f'emergency_pci_fallback_{fallback_pci}_999.00km', 999.0, ""
+                return fallback_pci, f'emergency_pci_fallback_{fallback_pci}_999.00km{relaxed_tag}', 999.0, ""
 
         # 绝对极端：所有PCI都被同站同频小区占用（理论上不应该发生，除非PCI范围太小）
         print(f"[ERROR] 同站({enodeb_id})所有PCI都被同站同频小区占用，使用第一个PCI（违反约束！）")
-        return self.pci_range[0], 'emergency_pci_constraint_violation_999.00km', 999.0, ""
+        return self.pci_range[0], f'emergency_pci_constraint_violation_999.00km{relaxed_tag}', 999.0, ""
 
     def plan(self, cells_to_plan: List[Dict], all_cells: List[Dict],
              progress_callback: Optional[Callable[[float], Any]] = None) -> PCIPlanningResult:

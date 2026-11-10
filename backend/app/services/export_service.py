@@ -2,11 +2,16 @@
 导出服务 - 用于导出规划结果
 """
 
+import csv
 import logging
+import math
+import re
+import zipfile
 from pathlib import Path
 import pandas as pd
 from datetime import datetime
 from typing import Dict, Any
+from xml.sax.saxutils import escape
 
 logger = logging.getLogger(__name__)
 
@@ -482,3 +487,118 @@ async def export_pci_check_result(
     except Exception as e:
         logger.error(f"导出PCI核查结果失败: {e}")
         raise
+
+
+# ---- 大结果流式导出 ----
+# 邻区结果可达几十万行：pandas.to_excel(openpyxl) 需要为每个单元格构建 Cell 对象，
+# 实测 73 万行 > 277s（超过前端 300s 超时）。这里直接生成 xlsx 的 ZIP/XML 并逐行写，
+# 不构建对象树；csv 同理用 csv.writer 逐行写，内存与耗时都只随行数线性增长。
+
+_XLSX_CONTENT_TYPES = (
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+    '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+    '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+    '<Default Extension="xml" ContentType="application/xml"/>'
+    '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+    '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+    '</Types>'
+)
+_XLSX_ROOT_RELS = (
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+    '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+    '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
+    '</Relationships>'
+)
+_XLSX_WORKBOOK = (
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+    '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+    'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+    '<sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets></workbook>'
+)
+_XLSX_WORKBOOK_RELS = (
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+    '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+    '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>'
+    '</Relationships>'
+)
+_XML_ILLEGAL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+
+def _column_letter(index: int) -> str:
+    """0-based 列号转 Excel 列标（0 -> A, 26 -> AA）。"""
+    letters = ""
+    index += 1
+    while index:
+        index, remainder = divmod(index - 1, 26)
+        letters = chr(65 + remainder) + letters
+    return letters
+
+
+def _cell_xml(ref: str, value: Any) -> str:
+    if value is None or value == "":
+        return ""
+    if isinstance(value, bool):
+        value = "TRUE" if value else "FALSE"
+    elif isinstance(value, (int, float)):
+        if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
+            value = str(value)
+        else:
+            return f'<c r="{ref}"><v>{value}</v></c>'
+    text = _XML_ILLEGAL.sub("", escape(str(value)))
+    return f'<c r="{ref}" t="inlineStr"><is><t>{text}</t></is></c>'
+
+
+def _row_xml(row_number: int, values: list) -> str:
+    cells = "".join(
+        _cell_xml(f"{_column_letter(j)}{row_number}", value)
+        for j, value in enumerate(values)
+    )
+    return f'<row r="{row_number}">{cells}</row>'
+
+
+def _write_xlsx_stream(path: Path, columns: list, rows: list) -> None:
+    last_col = _column_letter(len(columns) - 1) if columns else "A"
+    dimension = f"A1:{last_col}{len(rows) + 1}"
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED, compresslevel=1) as archive:
+        archive.writestr("[Content_Types].xml", _XLSX_CONTENT_TYPES)
+        archive.writestr("_rels/.rels", _XLSX_ROOT_RELS)
+        archive.writestr("xl/workbook.xml", _XLSX_WORKBOOK)
+        archive.writestr("xl/_rels/workbook.xml.rels", _XLSX_WORKBOOK_RELS)
+        with archive.open("xl/worksheets/sheet1.xml", "w") as sheet:
+            sheet.write(
+                (
+                    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                    '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+                    f'<dimension ref="{dimension}"/><sheetData>'
+                ).encode("utf-8")
+            )
+            sheet.write(_row_xml(1, columns).encode("utf-8"))
+            buffer = []
+            for number, row in enumerate(rows, start=2):
+                buffer.append(_row_xml(number, [row.get(c) for c in columns]))
+                if len(buffer) >= 2000:
+                    sheet.write("".join(buffer).encode("utf-8"))
+                    buffer.clear()
+            if buffer:
+                sheet.write("".join(buffer).encode("utf-8"))
+            sheet.write(b"</sheetData></worksheet>")
+
+
+def _write_csv_stream(path: Path, columns: list, rows: list) -> None:
+    with open(path, "w", newline="", encoding="utf-8-sig") as handle:
+        writer = csv.writer(handle)
+        if columns:
+            writer.writerow(columns)
+        for row in rows:
+            writer.writerow([row.get(c) for c in columns])
+
+
+def write_result_file(path: Path, rows: list, fmt: str) -> None:
+    """流式写导出文件（xlsx / csv），列名取首行键顺序。"""
+    columns = list(rows[0].keys()) if rows else []
+    if fmt == "xlsx":
+        _write_xlsx_stream(path, columns, rows)
+    elif fmt == "csv":
+        _write_csv_stream(path, columns, rows)
+    else:
+        raise ValueError(f"不支持的导出格式: {fmt}")

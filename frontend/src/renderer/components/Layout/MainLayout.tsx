@@ -33,6 +33,7 @@ import { DesktopSyncIndicator } from '../DesktopSyncIndicator'
 import { useDesktopStatusLabel } from '../desktopStatusLabel'
 import { DesktopSessionGuard } from '../DesktopSessionGuard'
 import { AppDownloadDialog } from '../AppDownloadDialog'
+import { ChangePasswordDialog } from '../ChangePasswordDialog'
 import { prefetchPage } from '../../pageLoaders'
 
 // ===== APP 悬浮图标：可拖拽移动、松手吸附最近左右边缘，位置按登录用户持久化 =====
@@ -106,6 +107,8 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
   const [userInfoPinned, setUserInfoPinned] = useState(false)
   const userInfoRef = useRef<HTMLDivElement>(null)
   const showUserInfo = userInfoHovered || userInfoPinned
+  // 用户信息浮层中的「修改密码」弹窗（所有登录用户均可用）
+  const [showChangePassword, setShowChangePassword] = useState(false)
 
   useEffect(() => {
     if (!userInfoPinned) return
@@ -624,12 +627,26 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
                     onClick={(e) => e.stopPropagation()}
                     className="absolute left-full bottom-1 ml-2 z-[3000] w-56 rounded-lg border border-border bg-card px-3 py-2 shadow-lg"
                   >
-                    <div className="text-sm font-medium text-foreground break-all">{user.username}</div>
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="text-sm font-medium text-foreground break-all">{user.username}</div>
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          setUserInfoPinned(false)
+                          setUserInfoHovered(false)
+                          setShowChangePassword(true)
+                        }}
+                        className="shrink-0 whitespace-nowrap text-xs text-primary hover:underline"
+                      >
+                        {t('auth.changePassword', '修改密码')}
+                      </button>
+                    </div>
                     <div className="mt-1 text-xs text-muted-foreground break-all">
                       {t('auth.userGroup')}：{[user.city, user.operator].filter(Boolean).join(' · ') || '—'}
                     </div>
                     {user.is_admin && (
-                      <span className="mt-1.5 inline-block text-[10px] px-1.5 py-0.5 rounded bg-purple-500/10 text-purple-400">
+                      <span className="mt-1.5 inline-block text-[10px] px-1.5 py-0.5 rounded bg-primary/10 text-primary">
                         {t('auth.adminBadge')}
                       </span>
                     )}
@@ -732,6 +749,8 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
 
       {/* 应用下载弹窗（手机APP / 电脑端）- 放在 main 外部避免地图组件层叠上下文遮挡 */}
       <AppDownloadDialog open={showAppDownload} onClose={() => setShowAppDownload(false)} />
+      {/* 修改密码：成功后由 authStore.logout 切到登录页，弹窗随 MainLayout 一起卸载 */}
+      <ChangePasswordDialog open={showChangePassword} onClose={() => setShowChangePassword(false)} />
       <Toaster />
       {/* 页面冒泡引导：所有登录用户；停留 3 秒触发、同刻只显示一条；登录周期内每条一次、累计 30 次后停止 */}
       <GuideTipsHost />

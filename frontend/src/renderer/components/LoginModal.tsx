@@ -18,7 +18,7 @@ const FALLBACK_OPERATORS = ['移动', '联通', '电信', '广电']
 
 export function LoginModal({ isOpen, forceChangePassword = false, onClose }: LoginModalProps) {
   const { t } = useTranslation()
-  const { login, register, changePassword, cancelDesktopSwitch, dismissDesktopSwitch } = useAuthStore()
+  const { login, register, changePassword, fetchUser, cancelDesktopSwitch, dismissDesktopSwitch } = useAuthStore()
   const desktopMode = useAuthStore((s) => s.desktopMode)
   // 桌面端记住上次登录的账号与运行模式（切换模式需退出后重新登录）
   const lastDesktopLogin = useAuthStore((s) => s.lastDesktopLogin)
@@ -363,6 +363,8 @@ export function LoginModal({ isOpen, forceChangePassword = false, onClose }: Log
     try {
       if (forceChangePassword) {
         await changePassword(oldPassword, password, confirmPassword)
+        // 后端已把 must_change_password 置 false；刷新用户信息，AuthGuard 据此关闭强制修改弹窗
+        await fetchUser()
         onClose?.()
       } else if (mode === 'login') {
         if (desktopMode) {

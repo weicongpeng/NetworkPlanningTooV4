@@ -357,7 +357,7 @@ export function TaskConfigPage() {
                   min={50} max={95} step={5} />
               </div>
             </div>
-            <div className="px-3 py-2 bg-blue-500/5 border border-blue-500/20 rounded-lg">
+            <div className="px-3 py-2 bg-primary/5 border border-primary/20 rounded-lg">
               <p className="text-[10px] leading-relaxed">• 需导入TAC图层(4G_TAC.zip/5G_TAC.zip)</p>
               <p className="text-[10px] leading-relaxed">• 需导入全量工参(ProjectParameter)</p>
             </div>

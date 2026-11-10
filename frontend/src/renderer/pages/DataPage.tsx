@@ -1,5 +1,5 @@
 import { useState, useEffect, useLayoutEffect, useCallback, useRef, useMemo } from 'react'
-import { Upload, FileSpreadsheet, Trash2, Download, Loader2, AlertCircle, RefreshCw, CheckCircle2, Layers, FileDown, MapPin, Navigation, CheckSquare, Square, ScrollText, Maximize2, Minimize2, RadioTower, BarChart3, Search } from 'lucide-react'
+import { Upload, FileSpreadsheet, Trash2, Download, Loader2, AlertCircle, RefreshCw, CheckCircle2, Layers, FileDown, MapPin, Navigation, CheckSquare, Square, ScrollText, Maximize2, Minimize2, RadioTower, BarChart3, Search, Database } from 'lucide-react'
 import { useDataStore } from '../store/dataStore'
 import { dataApi, assistantApi, getStoredAuthToken } from '../services/api'
 import type { CellRow, DataItem } from '@shared/types'
@@ -860,8 +860,11 @@ export function DataPage() {
 
   return (
     <div className="p-8">
-      <div className="flex justify-between items-center mb-8">
-        <h1 className="text-base font-bold">{t('data.title')}</h1>
+      <div className="flex justify-between items-center mb-2">
+        <h1 className="text-base font-bold flex items-center gap-2">
+          <Database size={20} className="text-primary" />
+          {t('data.title')}
+        </h1>
       </div>
 
       {/* 错误提示：完整展示后端返回的具体原因，便于用户修改源文件后重新导入 */}
@@ -905,12 +908,12 @@ export function DataPage() {
 
       {/* 上传成功提示 */}
       {uploadSuccess && (
-        <div className="mb-6 p-4 bg-purple-500/10 border border-purple-500/20 rounded-lg flex items-center gap-3 text-purple-400">
+        <div className="mb-6 p-4 bg-primary/10 border border-primary/20 rounded-lg flex items-center gap-3 text-primary">
           <CheckCircle2 size={20} className="shrink-0" />
           <span className="flex-grow">{uploadSuccess}</span>
           <button
             onClick={() => setUploadSuccess(null)}
-            className="text-purple-400 hover:text-purple-300 transition-colors duration-200 p-1 hover:bg-purple-500/20 rounded-full"
+            className="text-primary hover:text-primary/80 transition-colors duration-200 p-1 hover:bg-primary/20 rounded-full"
             aria-label={t('data.close') || '关闭'}
           >
             ✕
@@ -933,8 +936,9 @@ export function DataPage() {
         </div>
       )}
 
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
-        <div className="space-y-8">
+      {/* 左列两张卡片决定行高；右列卡片贴满同一行高，文件列表拉伸填满卡片剩余空间 */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-2 items-stretch">
+        <div className="flex flex-col gap-2 min-w-0">
             {/* 文件上传 */}
             <div className="bg-card p-3 rounded-lg border border-border">
             <h2 data-guide="data-import-to-map" className="text-base font-semibold mb-2">{t('data.importData') || '导入数据'}</h2>
@@ -960,11 +964,11 @@ export function DataPage() {
                     <div className="w-24">
                         <button
                             onClick={() => handleDownloadTemplate('full_params')}
-                            className="w-full px-2 py-1.5 bg-blue-500 text-white rounded text-xs hover:bg-blue-600 disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-1"
+                            className="w-full px-2 py-1.5 rounded text-xs text-primary hover:bg-primary/10 disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-1"
                             title={t('data.downloadTemplate') || '下载全量工参模板'}
                         >
                             <FileDown size={12} />
-                            <span>{t('data.template') || '模板'}</span>
+                            <span>{t('data.downloadTemplate') || '下载模板'}</span>
                         </button>
                     </div>
                 </div>
@@ -1010,7 +1014,7 @@ export function DataPage() {
                             accept=".xlsx,.xls,.csv,.txt"
                             onUpload={(e) => handleFileUpload(e, 'excel', 'geo_data')}
                             loading={loading && uploadingType === 'geo_data'}
-                            icon={<MapPin size={20} className="text-purple-600" />}
+                            icon={<MapPin size={20} className="text-primary" />}
                             description={t('data.geoDataDesc') || '自动识别点状/扇区'}
                             inline={true}
                             status={uploadStatus.geo_data}
@@ -1020,11 +1024,11 @@ export function DataPage() {
                     <div className="w-24">
                         <button
                             onClick={() => handleDownloadTemplate('geo_data')}
-                            className="w-full px-2 py-1.5 bg-blue-500 text-white rounded text-xs hover:bg-blue-600 disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-1"
+                            className="w-full px-2 py-1.5 rounded text-xs text-primary hover:bg-primary/10 disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-1"
                             title={t('data.downloadTemplate') || '下载模板'}
                         >
                             <FileDown size={12} />
-                            <span>{t('data.template') || '模板'}</span>
+                            <span>{t('data.downloadTemplate') || '下载模板'}</span>
                         </button>
                     </div>
                 </div>
@@ -1045,7 +1049,7 @@ export function DataPage() {
                             accept=".xlsx,.xls,.csv,.txt"
                             onUpload={(e) => handleStationUpload(e, 'station_params')}
                             loading={stationBusy === 'station_params'}
-                            icon={<RadioTower size={20} className="text-pink-600" />}
+                            icon={<RadioTower size={20} className="text-primary" />}
                             description={t('data.stationParamsDesc') || '网管小区无线参数，供网优助手对话查询'}
                             inline={true}
                             status={uploadStatus.station_params}
@@ -1061,7 +1065,7 @@ export function DataPage() {
                             accept=".xlsx,.xls,.csv,.txt"
                             onUpload={(e) => handleStationUpload(e, 'station_metrics')}
                             loading={stationBusy === 'station_metrics'}
-                            icon={<BarChart3 size={20} className="text-teal-600" />}
+                            icon={<BarChart3 size={20} className="text-primary" />}
                             description={t('data.stationMetricsDesc') || '中兴指标(月/天/小时/忙时)，含小区名与时间列'}
                             inline={true}
                             status={uploadStatus.station_metrics}
@@ -1079,7 +1083,7 @@ export function DataPage() {
                 .filter(({ warnings }) => warnings.length > 0)
               if (warnedFiles.length === 0) return null
               return (
-                <div className="mb-4 px-3 py-2 bg-amber-500/10 border border-amber-500/20 rounded-lg text-xs text-warning-foreground">
+                <div className="px-3 py-2 bg-amber-500/10 border border-amber-500/20 rounded-lg text-xs text-warning-foreground">
                   {warnedFiles.map(({ item, warnings }, fileIndex) => (
                     <div key={item.id} className={fileIndex > 0 ? 'mt-2' : ''}>
                       <div className="flex items-center gap-2 font-medium">
@@ -1112,7 +1116,7 @@ export function DataPage() {
                 .flatMap(([net, v]) => (v.samples || []).map(s => ({ net, ...s })))
                 .slice(0, 8)
               return (
-                <div className="mb-4 px-3 py-2 bg-amber-500/10 border border-amber-500/20 rounded-lg text-xs text-warning-foreground">
+                <div className="px-3 py-2 bg-amber-500/10 border border-amber-500/20 rounded-lg text-xs text-warning-foreground">
                   <div className="flex items-center gap-2 font-medium">
                     <AlertCircle size={14} className="shrink-0" />
                     <span>{t('data.dupReportTitle') || '全量工参检测到重复小区行'}</span>
@@ -1155,9 +1159,10 @@ export function DataPage() {
             />
         </div>
 
-        {/* 数据列表 */}
-        <div className="bg-card p-6 rounded-lg border border-border h-full">
-          <div className="flex items-center justify-between mb-4">
+        {/* 数据列表：宽屏下卡片绝对定位贴满左列撑起的行高，自身内容不再撑高行 */}
+        <div className="relative min-w-0">
+          <div className="bg-card p-3 rounded-lg border border-border flex flex-col overflow-hidden lg:absolute lg:inset-0">
+          <div className="flex items-center justify-between mb-2 shrink-0">
             <h2 className="text-base font-semibold">{t('data.importedData') || '已导入数据'}</h2>
             <div className="flex items-center gap-2">
               {items.length > 0 && (
@@ -1213,7 +1218,7 @@ export function DataPage() {
 
           {/* 全量工参同步中提醒横幅 */}
           {hasSyncingItems && (
-            <div className="mb-3 px-4 py-2.5 bg-amber-500/10 border border-amber-500/20 rounded-lg flex items-center gap-2.5">
+            <div className="mb-2 px-4 py-2.5 bg-amber-500/10 border border-amber-500/20 rounded-lg flex items-center gap-2.5 shrink-0">
               <Loader2 size={16} className="animate-spin text-amber-500" />
               <span className="text-sm text-amber-400 font-medium">
                 {t('data.excelSyncing') || 'Excel同步中...'}
@@ -1225,15 +1230,15 @@ export function DataPage() {
           )}
 
           {items.length === 0 ? (
-            <p className="text-muted-foreground text-center py-8">
+            <div className="flex items-center justify-center py-8 text-sm text-muted-foreground lg:py-0 lg:flex-1 lg:min-h-0">
               {t('data.noData') || '暂无数据，请先导入'}
-            </p>
+            </div>
           ) : filteredItems.length === 0 ? (
-            <p className="text-muted-foreground text-center py-8">
+            <div className="flex items-center justify-center py-8 text-sm text-muted-foreground lg:py-0 lg:flex-1 lg:min-h-0">
               {t('data.noMatchingFiles') || '没有匹配的文件'}
-            </p>
+            </div>
           ) : (
-            <div className="space-y-2 max-h-[600px] overflow-y-auto">
+            <div className="overflow-y-auto space-y-2 max-h-[600px] lg:max-h-none lg:flex-1 lg:min-h-0">
               {filteredItems.map((item) => (
                 <div
                   key={item.id}
@@ -1250,31 +1255,31 @@ export function DataPage() {
                     <div className="flex items-center gap-2">
                       {/* 文件类型图标 */}
                       <div className={`p-1.5 rounded-md ${
-                        item.fileType === 'station_params' ? 'bg-pink-500/15' :
-                        item.fileType === 'station_metrics' ? 'bg-teal-500/15' :
-                        item.fileType === 'geo_data' ? 'bg-purple-500/15' :
-                        item.fileType === 'full_params' ? 'bg-blue-500/15' :
-                        item.fileType === 'target_cells' ? 'bg-orange-500/15' :
-                        item.type === 'excel' ? 'bg-green-500/15' :
-                        item.type === 'map' ? 'bg-cyan-500/15' :
+                        item.fileType === 'station_params' ? 'bg-primary/15' :
+                        item.fileType === 'station_metrics' ? 'bg-primary/15' :
+                        item.fileType === 'geo_data' ? 'bg-primary/15' :
+                        item.fileType === 'full_params' ? 'bg-primary/15' :
+                        item.fileType === 'target_cells' ? 'bg-primary/15' :
+                        item.type === 'excel' ? 'bg-primary/15' :
+                        item.type === 'map' ? 'bg-primary/15' :
                         'bg-muted'
                       }`}>
                         {item.fileType === 'station_params' ? (
-                          <RadioTower size={16} className="text-pink-500" />
+                          <RadioTower size={16} className="text-primary" />
                         ) : item.fileType === 'station_metrics' ? (
-                          <BarChart3 size={16} className="text-teal-500" />
+                          <BarChart3 size={16} className="text-primary" />
                         ) : item.fileType === 'geo_data' ? (
                           item.geometryType === 'sector'
-                            ? <Navigation size={16} className="text-purple-500" />
-                            : <MapPin size={16} className="text-purple-500" />
+                            ? <Navigation size={16} className="text-primary" />
+                            : <MapPin size={16} className="text-primary" />
                         ) : item.fileType === 'full_params' ? (
-                          <FileSpreadsheet size={16} className="text-blue-500" />
+                          <FileSpreadsheet size={16} className="text-primary" />
                         ) : item.fileType === 'target_cells' ? (
-                          <FileSpreadsheet size={16} className="text-orange-500" />
+                          <FileSpreadsheet size={16} className="text-primary" />
                         ) : item.type === 'excel' ? (
-                          <FileSpreadsheet size={16} className="text-green-500" />
+                          <FileSpreadsheet size={16} className="text-primary" />
                         ) : item.subType === 'mapinfo' ? (
-                          <Layers size={16} className="text-cyan-500" />
+                          <Layers size={16} className="text-primary" />
                         ) : (
                           <Upload size={16} className="text-muted-foreground" />
                         )}
@@ -1294,19 +1299,19 @@ export function DataPage() {
                         item.status === 'error'
                           ? 'bg-red-500/15 text-red-500'
                           : item.fileType === 'station_params'
-                          ? 'bg-pink-500/15 text-pink-500'
+                          ? 'bg-primary/15 text-primary'
                           : item.fileType === 'station_metrics'
-                          ? 'bg-teal-500/15 text-teal-500'
+                          ? 'bg-primary/15 text-primary'
                           : item.fileType === 'geo_data'
-                          ? 'bg-purple-500/15 text-purple-500'
+                          ? 'bg-primary/15 text-primary'
                           : item.fileType === 'full_params'
-                          ? 'bg-blue-500/15 text-blue-500'
+                          ? 'bg-primary/15 text-primary'
                           : item.fileType === 'target_cells'
-                          ? 'bg-orange-500/15 text-orange-500'
+                          ? 'bg-primary/15 text-primary'
                           : item.fileType === 'current_params'
-                          ? 'bg-indigo-500/15 text-indigo-500'
+                          ? 'bg-primary/15 text-primary'
                           : item.subType === 'mapinfo'
-                          ? 'bg-cyan-500/15 text-cyan-500'
+                          ? 'bg-primary/15 text-primary'
                           : 'bg-muted text-muted-foreground'
                       }`}>
                         {item.status === 'error'
@@ -1344,7 +1349,7 @@ export function DataPage() {
                       </span>
                       {/* 路径记录状态 */}
                       {item.originalPath && (
-                        <span className="text-[10px] px-1.5 py-0.5 rounded bg-green-500/15 text-green-400 flex items-center gap-0.5">
+                        <span className="text-[10px] px-1.5 py-0.5 rounded bg-primary/15 text-green-400 flex items-center gap-0.5">
                           <CheckCircle2 size={10} />
                           {t('data.recorded') || '已记录'}
                         </span>
@@ -1436,9 +1441,9 @@ export function DataPage() {
                     >
                       {downloadStore.downloadingIds.has(item.id) ? (
                         <div className="flex flex-col items-center gap-0.5">
-                          <Loader2 size={16} className="animate-spin text-blue-500" />
+                          <Loader2 size={16} className="animate-spin text-primary" />
                           {downloadStore.progress[item.id] > 0 && (
-                            <span className="text-[9px] font-mono text-blue-600 leading-none">
+                            <span className="text-[9px] font-mono text-primary leading-none">
                               {downloadStore.progress[item.id]}%
                             </span>
                           )}
@@ -1463,11 +1468,12 @@ export function DataPage() {
               ))}
             </div>
           )}
+          </div>
         </div>
       </div>
 
       {/* 运行结果 */}
-      <div className="mt-8 bg-card rounded-lg border border-border overflow-hidden">
+      <div className="mt-2 bg-card rounded-lg border border-border overflow-hidden">
         <div className="flex items-center justify-between px-5 py-3 border-b border-border bg-muted/30">
           <div className="flex items-center gap-2">
             <ScrollText size={16} className="text-muted-foreground" />
@@ -1511,7 +1517,7 @@ export function DataPage() {
                       {entry.time}
                     </span>
                     <span className={`shrink-0 mt-0.5 ${
-                      entry.type === 'upload' ? 'text-blue-500' :
+                      entry.type === 'upload' ? 'text-primary' :
                       entry.type === 'download' ? 'text-green-500' :
                       entry.type === 'delete' ? 'text-red-500' :
                       entry.type === 'update' ? 'text-amber-500' :
@@ -1543,8 +1549,8 @@ export function DataPage() {
                           {entry.message}
                         </span>
                         <span className={`text-[9px] px-1.5 py-0.5 rounded-full font-medium ${
-                          entry.type === 'upload' ? 'bg-blue-500/15 text-blue-500' :
-                          entry.type === 'download' ? 'bg-green-500/15 text-green-500' :
+                          entry.type === 'upload' ? 'bg-primary/15 text-primary' :
+                          entry.type === 'download' ? 'bg-primary/15 text-green-500' :
                           entry.type === 'delete' ? 'bg-red-500/15 text-red-500' :
                           entry.type === 'update' ? 'bg-amber-500/15 text-amber-500' :
                           entry.type === 'terminal' ? 'bg-zinc-500/15 text-zinc-500' :
@@ -2224,7 +2230,7 @@ function NewCellEntryContent({
         <button
           onClick={copyRows}
           disabled={!copyButtonEnabled || isAddingCell || !hasFullParams}
-          className={`px-3 py-1 text-xs rounded-md border border-dashed border-border bg-muted/20 ${copyButtonEnabled ? 'text-blue-500 hover:bg-blue-500/15 hover:border-blue-300' : 'text-muted-foreground'} disabled:opacity-50 disabled:cursor-not-allowed transition-colors flex items-center gap-1`}
+          className={`px-3 py-1 text-xs rounded-md border border-dashed border-border bg-muted/20 ${copyButtonEnabled ? 'text-primary hover:bg-primary/100/15 hover:border-primary' : 'text-muted-foreground'} disabled:opacity-50 disabled:cursor-not-allowed transition-colors flex items-center gap-1`}
         >
           + {t('newCellEntry.addRow') || '复制行'}
           {selectedRowIds.size > 0 && <span className="text-xs">({selectedRowIds.size})</span>}
@@ -2247,11 +2253,11 @@ function NewCellEntryContent({
           <button
             onClick={handleBatchImport}
             disabled={totalRows === 0 || importing || !hasFullParams}
-            className="px-4 py-1.5 text-xs font-medium rounded-md bg-blue-500 text-white hover:bg-blue-600 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1.5 transition-colors"
+            className="px-4 py-1.5 text-xs font-medium rounded-md bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1.5 transition-colors"
           >
             {importing ? <Loader2 size={14} className="animate-spin" /> : <CheckCircle2 size={14} />}
             {importing ? (t('data.saving') || '录入中...') : (t('newCellEntry.batchImport') || '一键导入')}
-            {totalRows > 0 && !importing && <span className="text-blue-100">({totalRows})</span>}
+            {totalRows > 0 && !importing && <span className="text-primary-foreground">({totalRows})</span>}
           </button>
         </div>
       </div>
@@ -2422,8 +2428,7 @@ function CellToolsCard({
         ? {
             position: 'fixed', top: contentBox.top, left: contentBox.left,
             width: contentBox.width, height: contentBox.height, zIndex: 9999,
-            // 父容器 space-y-8 会给兄弟节点加 margin-top，fixed 元素同样吃这个
-            // margin（top: 0 被推下 32px，表现为放大后顶端留有一条空隙），必须清零
+            // 放大态 fixed 定位时清掉父容器可能施加的 margin，避免顶端出现空隙
             marginTop: 0,
           }
         : undefined}
@@ -2431,7 +2436,7 @@ function CellToolsCard({
       <div
         className={expanded
           ? 'bg-card h-full flex flex-col p-5 overflow-hidden'
-          : 'bg-card p-3 rounded-lg border border-border -mt-6'}
+          : 'bg-card p-3 rounded-lg border border-border'}
       >
         {renderHeader()}
         {/* 放大态高度固定，内容超出时在此滚动（结构与普通态一致，切换不卸载子组件） */}
@@ -2503,7 +2508,7 @@ function ParamUpdatePanel({
         <button
           onClick={onUpdateParameters}
           disabled={isUpdating || !selectedFullParamId || !selectedCurrentParamId}
-          className="shrink-0 h-[calc(2.25rem*2+0.5rem)] px-3 bg-blue-400 text-white rounded-md hover:bg-blue-500 disabled:opacity-50 disabled:cursor-not-allowed flex flex-col items-center justify-center gap-0.5 text-xs font-medium transition-colors"
+          className="shrink-0 h-[calc(2.25rem*2+0.5rem)] px-3 bg-primary text-white rounded-md hover:bg-primary/100 disabled:opacity-50 disabled:cursor-not-allowed flex flex-col items-center justify-center gap-0.5 text-xs font-medium transition-colors"
         >
           {isUpdating ? <Loader2 className="animate-spin" size={16} /> : <RefreshCw size={16} />}
           {isUpdating ? (t('data.updating') || '更新中') : (t('data.startUpdate') || '开始更新')}

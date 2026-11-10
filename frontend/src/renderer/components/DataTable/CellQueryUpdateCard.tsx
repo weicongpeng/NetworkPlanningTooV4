@@ -545,7 +545,7 @@ export function CellQueryUpdateContent({
               <button
                 onClick={addCheckedResults}
                 disabled={checkedResults.size === 0}
-                className="ml-auto px-2.5 py-1 rounded bg-blue-500 text-white hover:bg-blue-600 disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-1 transition-colors"
+                className="ml-auto px-2.5 py-1 rounded bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-1 transition-colors"
               >
                 <CheckCircle2 size={12} />
                 {t('queryUpdate.addSelected') || '添加'} ({checkedResults.size})
@@ -639,7 +639,7 @@ export function CellQueryUpdateContent({
           <button
             onClick={handleUpdateClick}
             disabled={!hasFullParams || disabled || updating || totalRows === 0}
-            className="px-4 py-1.5 text-xs font-medium rounded-md bg-blue-500 text-white hover:bg-blue-600 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1.5 transition-colors"
+            className="px-4 py-1.5 text-xs font-medium rounded-md bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1.5 transition-colors"
           >
             {updating ? <Loader2 size={14} className="animate-spin" /> : <CheckCircle2 size={14} />}
             {updating ? (t('queryUpdate.updateRunning') || '更新中...') : (t('queryUpdate.update') || '更新')}
@@ -725,7 +725,7 @@ export function CellQueryUpdateContent({
               <button
                 onClick={handleConfirmExecute}
                 disabled={updating}
-                className="px-4 py-1.5 text-xs font-medium rounded-md bg-blue-500 text-white hover:bg-blue-600 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1.5 transition-colors"
+                className="px-4 py-1.5 text-xs font-medium rounded-md bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1.5 transition-colors"
               >
                 {updating ? <Loader2 size={14} className="animate-spin" /> : <CheckCircle2 size={14} />}
                 {updating ? (t('queryUpdate.updateRunning') || '更新中...') : (t('queryUpdate.confirmExecute') || '确认执行')}

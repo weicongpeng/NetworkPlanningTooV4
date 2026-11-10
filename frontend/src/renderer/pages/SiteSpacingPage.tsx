@@ -332,7 +332,7 @@ export default function SiteSpacingPage() {
   return (
     <div className="p-6 w-full h-full min-h-0 flex flex-col gap-4">
       <h1 className="text-base font-bold flex items-center gap-2 shrink-0">
-        <Ruler size={18} /> {t('nav.siteSpacing')}
+        <Ruler size={18} className="text-primary" /> {t('nav.siteSpacing')}
       </h1>
 
       {/* 表单区：横向铺满，三列卡片 */}
@@ -457,7 +457,7 @@ export default function SiteSpacingPage() {
             {parseTotal > 0 && <span className="text-muted-foreground ml-2">（{t('siteSpacing.parsedTotal').replace('{count}', String(parseTotal))}）</span>}
           </p>
           <div className="max-h-40 overflow-y-auto">
-            <table className="w-full text-left">
+            <table className="w-full text-left npt-resizable">
               <thead className="sticky top-0 bg-amber-500/10">
                 <tr className="border-b border-amber-500/20">
                   <th className="px-2 py-1 font-medium">{t('siteSpacing.sheet')}</th>
@@ -509,7 +509,7 @@ export default function SiteSpacingPage() {
               </div>
             </div>
             <a href={result.download_url + '?_t=' + Date.now()} download
-              className="inline-flex items-center justify-center gap-2 px-5 py-2.5 bg-green-600 text-white rounded-lg hover:opacity-90 text-sm shrink-0">
+              className="inline-flex items-center justify-center gap-2 px-5 py-2.5 bg-primary text-white rounded-lg hover:opacity-90 text-sm shrink-0">
               <Download size={16} /> {t('siteSpacing.download')} ({result.filename})
             </a>
           </div>

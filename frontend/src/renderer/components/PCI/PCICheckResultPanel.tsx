@@ -69,6 +69,24 @@ export function PCICheckResultPanel(props: PCICheckResultPanelProps) {
   if (loading) return <LoadingSpinner variant="spinner" text={t('common.loadingResult') || '正在加载核查结果...'} />
   if (!result) return <p className="text-sm text-muted-foreground">{emptyHint}</p>
 
+  // 分类页签：有结果时下传给结果表，与「搜索/导出」合并到同一行；无异常结果时单独显示
+  const categoryTabs = (
+    <div className="flex items-center gap-1 flex-1 min-w-0 overflow-x-auto">
+      {CHECK_TYPES.filter((category) => category.key in (result.results || {})).map((category) => (
+        <button
+          key={category.key}
+          onClick={() => onCategoryChange(category.key)}
+          className={`whitespace-nowrap px-3 py-1.5 text-sm rounded-t-md transition-colors ${activeCategory === category.key ? btn.activeTab : btn.ghost}`}
+        >
+          {t(`pciCheck.types.${category.key}`) || category.label}
+          <span className="ml-1.5 text-[10px] px-1.5 py-0.5 rounded-full bg-muted text-muted-foreground">
+            {result.summary?.[category.key] ?? 0}
+          </span>
+        </button>
+      ))}
+    </div>
+  )
+
   return (
     <div className="flex flex-col h-full min-h-0 overflow-hidden">
       {result.status === 'failed' && result.error && (
@@ -110,28 +128,18 @@ export function PCICheckResultPanel(props: PCICheckResultPanelProps) {
             </p>
           </div>
 
-          <div className="flex items-center gap-1 mb-3 border-b border-border shrink-0 overflow-x-auto">
-            {/* 只渲染本次启用的类别：后端按开关返回类别，NR/邻区口径不固定 */}
-            {CHECK_TYPES.filter((category) => category.key in (result.results || {})).map((category) => (
-              <button
-                key={category.key}
-                onClick={() => onCategoryChange(category.key)}
-                className={`whitespace-nowrap px-3 py-1.5 text-sm rounded-t-md transition-colors ${activeCategory === category.key ? btn.activeTab : btn.ghost}`}
-              >
-                {t(`pciCheck.types.${category.key}`) || category.label}
-                <span className="ml-1.5 text-[10px] px-1.5 py-0.5 rounded-full bg-muted text-muted-foreground">
-                  {result.summary?.[category.key] ?? 0}
-                </span>
-              </button>
-            ))}
-          </div>
-
           {totalRowCount(result) === 0 ? (
-            <div className="flex-1 flex items-center justify-center text-muted-foreground text-sm">
-              {t('pciCheck.noAbnormal') || '未发现PCI配置问题'}
-            </div>
+            <>
+              <div className="flex items-center mb-3 border-b border-border shrink-0">
+                {categoryTabs}
+              </div>
+              <div className="flex-1 flex items-center justify-center text-muted-foreground text-sm">
+                {t('pciCheck.noAbnormal') || '未发现PCI配置问题'}
+              </div>
+            </>
           ) : (
             <PCICheckResultTable
+              tabs={categoryTabs}
               rows={result.results?.[activeCategory] || []}
               checkType={activeCategory}
               exportState={exportState}
@@ -147,10 +155,10 @@ export function PCICheckResultPanel(props: PCICheckResultPanelProps) {
 
 function Stat({ label, value, tone, title }: { label: string; value: string | number; tone?: 'blue'; title?: string }) {
   const toneClass = tone === 'blue'
-    ? 'bg-blue-500/10 border border-blue-500/20'
+    ? 'bg-primary/10 border border-primary/20'
     : 'bg-muted/50'
-  const valueClass = tone === 'blue' ? 'text-sm font-semibold text-blue-600' : 'text-sm font-semibold'
-  const labelClass = tone === 'blue' ? 'text-[10px] text-blue-600' : 'text-[10px] text-muted-foreground'
+  const valueClass = tone === 'blue' ? 'text-sm font-semibold text-primary' : 'text-sm font-semibold'
+  const labelClass = tone === 'blue' ? 'text-[10px] text-primary' : 'text-[10px] text-muted-foreground'
   return (
     <div className={`px-2.5 py-1.5 rounded-md ${toneClass}`} title={title}>
       <p className={labelClass}>{label}</p>

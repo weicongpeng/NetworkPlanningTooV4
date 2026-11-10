@@ -2851,8 +2851,8 @@ export function MapPage() {
     return () => clearTimeout(timer)
   }, [pciRenderLegendItems, fetchPciRenderStats])
 
-  // 热力图例项：已启用热力图的设置（含基站扇区图层）。
-  // 设置 key 与图层 id 对不上时仍由图例兜底显示，避免跨端同步后图例整个消失
+  // 热力图例项：仅「控制面板已勾选可见 + 已启用热力图」的图层（含基站扇区图层）。
+  // 图层列表为唯一真源，孤立的历史设置 key 不再兜底出图例，避免显示无关字段标题。
   const heatmapLegendItems = useMemo(() => {
     const sources = [
       ...layerFiles.map(f => ({ id: f.id, name: f.name, visible: f.visible })),
@@ -3002,7 +3002,7 @@ export function MapPage() {
     /* 提取坐标按钮 */
     capture: (
       <button
-        className={`px-2 py-1.5 text-xs rounded transition-colors flex items-center gap-1 ${captureMode ? 'bg-blue-400 text-white hover:bg-blue-500' : 'text-foreground hover:bg-muted hover:text-primary'}`}
+        className={`px-2 py-1.5 text-xs rounded transition-colors flex items-center gap-1 ${captureMode ? 'bg-primary text-primary-foreground hover:bg-primary/90' : 'text-foreground hover:bg-muted hover:text-primary'}`}
         onClick={activateCaptureTool}
         title={captureMode ? (t('map.exitCaptureMode') || '退出打点') : (t('map.captureModeHint') || '点击地图任意位置抓取WGS84坐标')}
       >
@@ -3016,7 +3016,7 @@ export function MapPage() {
     /* 测距按钮 */
     measure: (
       <button
-        className={`px-2 py-1.5 text-xs rounded transition-colors flex items-center gap-1 ${measureMode ? 'bg-blue-400 text-white hover:bg-blue-500' : 'text-foreground hover:bg-muted hover:text-primary'
+        className={`px-2 py-1.5 text-xs rounded transition-colors flex items-center gap-1 ${measureMode ? 'bg-primary text-primary-foreground hover:bg-primary/90' : 'text-foreground hover:bg-muted hover:text-primary'
           }`}
         onClick={activateMeasureTool}
         title={measureMode ? (t('map.exitDistanceMode') || '退出测距模式') : (t('map.distanceMode') || '测距工具')}
@@ -3032,7 +3032,7 @@ export function MapPage() {
     drag: (
       <button
         data-guide="map-drag-tool"
-        className={`px-2 py-1.5 text-xs rounded transition-colors flex items-center gap-1 ${mapDragTool ? 'bg-blue-400 text-white hover:bg-blue-500' : 'text-foreground hover:bg-muted hover:text-primary'
+        className={`px-2 py-1.5 text-xs rounded transition-colors flex items-center gap-1 ${mapDragTool ? 'bg-primary text-primary-foreground hover:bg-primary/90' : 'text-foreground hover:bg-muted hover:text-primary'
           }`}
         onClick={handleMapDragToolToggle}
         title={mapDragTool ? (t('map.dragActiveHint') || '手形工具已激活（点击其他工具切换出去）') : (t('map.enableDrag') || '启用地图拖拽')}
@@ -3046,7 +3046,7 @@ export function MapPage() {
        标签始终显示"选择"并保持高亮，不再切换为"退出选择" */
     select: (
       <button
-        className={`px-2 py-1.5 text-xs rounded transition-colors flex items-center gap-1 ${selectMode ? 'bg-blue-400 text-white hover:bg-blue-500' : 'text-foreground hover:bg-muted hover:text-primary'}`}
+        className={`px-2 py-1.5 text-xs rounded transition-colors flex items-center gap-1 ${selectMode ? 'bg-primary text-primary-foreground hover:bg-primary/90' : 'text-foreground hover:bg-muted hover:text-primary'}`}
         onClick={handleSelectToolToggle}
         title={t('map.selectToolHint') || '点击地图要素选中，双击要素查看属性并配置风格'}
       >
@@ -3059,7 +3059,7 @@ export function MapPage() {
     marquee: (
       <div className="relative" ref={selectionMenuRef}>
         <button
-          className={`px-2 py-1.5 text-xs rounded transition-colors flex items-center gap-1 ${selectionMode !== 'none' ? 'bg-blue-400 text-white hover:bg-blue-500' : 'text-foreground hover:bg-muted hover:text-primary'
+          className={`px-2 py-1.5 text-xs rounded transition-colors flex items-center gap-1 ${selectionMode !== 'none' ? 'bg-primary text-primary-foreground hover:bg-primary/90' : 'text-foreground hover:bg-muted hover:text-primary'
             }`}
           onClick={() => {
             // 圈选工具"粘滞"：已激活时再次点击不退出模式（只能切换到其他工具退出），
@@ -3192,7 +3192,7 @@ export function MapPage() {
     draw: (
       <div className="relative" ref={drawMenuRef}>
         <button
-          className={`px-2 py-1.5 text-xs rounded transition-colors flex items-center gap-1 ${drawTool !== 'none' ? 'bg-blue-400 text-white hover:bg-blue-500' : 'text-foreground hover:bg-muted hover:text-primary'}`}
+          className={`px-2 py-1.5 text-xs rounded transition-colors flex items-center gap-1 ${drawTool !== 'none' ? 'bg-primary text-primary-foreground hover:bg-primary/90' : 'text-foreground hover:bg-muted hover:text-primary'}`}
           onClick={() => setOpenMenu(openMenu === 'draw' ? null : 'draw')}
           title={t('map.drawHint') || '在可编辑图层绘制点/线/面'}
         >
@@ -3262,7 +3262,7 @@ export function MapPage() {
       <button
         className={`px-2 py-1.5 text-xs rounded transition-colors flex items-center gap-1 ${
           snapEnabled
-            ? 'bg-blue-400 text-white hover:bg-blue-500'
+            ? 'bg-primary text-primary-foreground hover:bg-primary/90'
             : 'text-foreground hover:bg-muted hover:text-primary'
         }`}
         onClick={handleToggleSnap}
@@ -3280,7 +3280,7 @@ export function MapPage() {
       <button
         className={`px-2 py-1.5 text-xs rounded transition-colors flex items-center gap-1 ${
           nodeMergeMode
-            ? 'bg-blue-400 text-white hover:bg-blue-500'
+            ? 'bg-primary text-primary-foreground hover:bg-primary/90'
             : 'text-foreground hover:bg-muted hover:text-primary'
         }`}
         onClick={handleToggleNodeMerge}
@@ -3308,7 +3308,7 @@ export function MapPage() {
         <ClipboardPaste size={14} />
         <span className="toolbar-label">{t('map.pasteSelection') || '粘贴'}</span>
         {clipboardItems.length > 0 && (
-          <span className="ml-0.5 min-w-[16px] h-4 px-1 rounded-full bg-blue-500 text-white text-[10px] flex items-center justify-center">
+          <span className="ml-0.5 min-w-[16px] h-4 px-1 rounded-full bg-primary text-white text-[10px] flex items-center justify-center">
             {clipboardItems.length}
           </span>
         )}
@@ -3629,11 +3629,11 @@ export function MapPage() {
                           title={result.name}
                         >
                           <div className="flex items-start gap-2">
-                            <Database size={14} className={`mt-0.5 shrink-0 ${result.networkType === 'LTE' ? 'text-blue-500' : 'text-green-500'}`} />
+                            <Database size={14} className={`mt-0.5 shrink-0 ${result.networkType === 'LTE' ? 'text-primary' : 'text-green-500'}`} />
                             <div className="flex-1 min-w-0">
                               <div className="flex items-center gap-2">
                                 <span className="font-medium truncate">{result.name}</span>
-                                <span className={`text-xs px-1.5 py-0.5 rounded ${result.networkType === 'LTE' ? 'bg-blue-500/15 text-blue-400' : 'bg-green-500/15 text-green-400'}`}>
+                                <span className={`text-xs px-1.5 py-0.5 rounded ${result.networkType === 'LTE' ? 'bg-primary/15 text-primary' : 'bg-primary/15 text-green-400'}`}>
                                   {result.networkType}
                                 </span>
                               </div>

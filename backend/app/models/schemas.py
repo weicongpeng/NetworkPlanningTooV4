@@ -307,6 +307,14 @@ class PCIConfig(BaseModel):
         default=False,
         description="是否同步执行TAC规划"
     )
+    useMod6: bool = Field(
+        default=True,
+        description="LTE 同站/对打同频小区模6不相等约束（优先级低于模3）"
+    )
+    useMod4: bool = Field(
+        default=True,
+        description="NR 同站/对打同频小区模4不相等约束（优先级低于模30）"
+    )
     selectedCellIds: Optional[List[str]] = Field(
         default=None,
         description="选中的小区ID列表（格式：siteId_sectorId），当提供时使用选中小区的数据而非待规划小区文件"

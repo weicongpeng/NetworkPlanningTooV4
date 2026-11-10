@@ -501,7 +501,7 @@ export function LayerControl({
   // 图层颜色设置弹窗状态
   const [activeTab, setActiveTab] = useState<'label' | 'color'>('label')
   const [currentColorSettings, setCurrentColorSettings] = useState<LayerColorSettings>({
-    fillColor: '#3b82f6',
+    fillColor: 'hsl(var(--primary))',
     fillOpacity: 0.6,
     borderWidth: 2,
     borderColor: '#000000'
@@ -1277,7 +1277,7 @@ export function LayerControl({
         ? {
           // 默认填充色按制式取（与 SECTOR_CONFIG 渲染默认一致：LTE 蓝 / NR 绿），
           // 否则 NR 图层一保存就被刷成蓝色；不透明度 100%、边框 1px 同口径
-          fillColor: node.sectorLayer?.type === 'NR' ? '#10b981' : '#3b82f6',
+          fillColor: node.sectorLayer?.type === 'NR' ? '#10b981' : 'hsl(var(--primary))',
           fillOpacity: 1,
           borderWidth: 1,
           borderColor: '#000000',
@@ -1291,7 +1291,7 @@ export function LayerControl({
           // 默认不透明度恒为 100%（用户要求：所有图形默认不透明度都是 100%）——
           // 注意**不取 `ds.fillOpacity`**：文件自带的 defaultStyle 不参与渲染链
           // （2D/3D 都不用它出图），把它当初始值只会让弹窗显示 30% 而地图画的是 100%
-          fillColor: ds?.fillColor || ds?.markerColor || KIND_DEFAULT_FILL[geomType ?? ''] || '#3b82f6',
+          fillColor: ds?.fillColor || ds?.markerColor || KIND_DEFAULT_FILL[geomType ?? ''] || 'hsl(var(--primary))',
           fillOpacity: 1,
           borderWidth: ds?.strokeWidth ?? 2,
           // 点/面图层边框颜色默认无色（不描边）；线图层无边框色项，strokeColor 作为

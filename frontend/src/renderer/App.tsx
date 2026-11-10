@@ -31,6 +31,7 @@ import { useHeartbeat } from './hooks/useHeartbeat'
 import { useAuthStore } from './store/authStore'
 import { saveLastRoute } from './utils/lastRoute'
 import { WindowTitleBar } from './components/WindowTitleBar'
+import { enableTableColumnResize } from './utils/tableColumnResize'
 
 /** 记录已登录用户当前所在页面，重新登录后可恢复到该页面 */
 function LastRouteTracker() {
@@ -55,6 +56,9 @@ function App() {
     startHealthCheck(15000)
     return () => stopHealthCheck()
   }, [])
+
+  // 全局表格列宽拖拽：事件委托，所有功能页面与动态渲染的表格统一生效
+  useEffect(() => enableTableColumnResize(), [])
 
   return (
     <Router>

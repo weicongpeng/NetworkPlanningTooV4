@@ -276,7 +276,7 @@ export function AppVersionsPage() {
       {/* Table */}
       <div className="bg-card border border-border rounded-lg overflow-hidden">
         <div className="overflow-x-auto">
-          <table className="w-full text-sm">
+          <table className="w-full text-sm npt-resizable">
             <thead>
               <tr className="border-b border-border bg-muted/50">
                 <th className="text-left py-3 px-4 font-medium text-muted-foreground">{t('appVersions.version')}</th>

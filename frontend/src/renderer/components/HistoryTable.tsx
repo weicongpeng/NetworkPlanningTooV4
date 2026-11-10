@@ -1,5 +1,5 @@
 import { useMemo, useEffect, useState, useCallback, useRef } from 'react'
-import { Clock, Eye, Trash2, Check, CheckCheck, Loader2 } from 'lucide-react'
+import { Clock, Eye, Trash2, Check, Loader2 } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { useTaskStore, type TaskType, type Task } from '../store/taskStore'
 import { DESKTOP_SYNCED_EVENT } from '../store/desktopSyncStore'
@@ -408,7 +408,7 @@ export function HistoryTable({
     <>
       {confirmDialog}
       <div className="flex-1 min-h-0 overflow-auto bg-card border border-border rounded-xl">
-        <table className="w-full text-sm">
+        <table className="w-full text-sm npt-resizable">
           {/* 表头必须不透明：半透明背景会让滚动的正文透过表头显示 */}
           <thead className="sticky top-0 z-20">
             <tr className="border-b border-border">
@@ -506,9 +506,9 @@ export function HistoryTable({
                       </button>
                       {onApplyTask && task.status === 'completed' && (
                         task.isApplied ? (
-                          // 已应用：灰色双勾（与「待应用」的亮色单勾区分）
+                          // 已应用：灰色单勾（与「待应用」的亮色单勾以颜色区分）
                           <span className="p-0.5 text-muted-foreground/45 cursor-default" title={t('common.applied') || '已应用'}>
-                            <CheckCheck size={15} />
+                            <Check size={15} strokeWidth={3} />
                           </span>
                         ) : (
                           <button
@@ -540,7 +540,7 @@ export function HistoryTable({
                           >
                             {applyingTaskId === task.id
                               ? <Loader2 size={15} className="animate-spin" />
-                              : <Check size={15} strokeWidth={2.5} />}
+                              : <Check size={15} strokeWidth={3} />}
                           </button>
                         )
                       )}

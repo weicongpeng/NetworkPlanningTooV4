@@ -117,7 +117,7 @@ export function ResultTable({ resetKey, loadPage, emptyHint }: ResultTableProps)
   return (
     <div className="flex-1 min-h-0 flex flex-col">
       <div ref={scrollRef} className="flex-1 min-h-0 overflow-auto border border-border rounded-md">
-        <table className="w-full text-xs">
+        <table className="w-full text-xs npt-resizable">
           <thead className="bg-muted sticky top-0 z-10">
             <tr>
               <th className="px-2 py-2 text-left text-muted-foreground font-medium w-14">#</th>

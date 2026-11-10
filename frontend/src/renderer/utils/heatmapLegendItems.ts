@@ -13,11 +13,12 @@ export interface HeatmapLegendEntry {
 }
 
 /**
- * 构建热力图图例项：以「已启用的热力图设置」为真源，图层列表只用来补名字。
+ * 构建热力图图例项：只取「控制面板已勾选可见、且已启用热力图」的图层。
  *
- * 桌面端同组同步/重新导入后，图层 id 可能与保存设置时的 id 不一致，或图层列表
- * 仍在异步加载。仅按 id 精确匹配会让整个图例静默消失（专题图例恰好匹配上就正常），
- * 因此对未匹配到的已启用设置做兜底条目，保证图例一定出现、用户能看出配置状态。
+ * 图层列表是唯一真源，设置表仅按图层 id 补配置。未勾选的图层、以及设置 key
+ * 与当前图层对不上的历史残留（跨端同步 / 图层删除后遗留的 enabled 设置）都不出
+ * 图例——否则会出现「UUID - 字段」这类与当前图层无关的字段标题，且画面颜色
+ * 与图例不符。与专题图例口径一致（visible && enabled）。
  */
 export function buildHeatmapLegendItems(
   settingsMap: Record<string, HeatmapSettings> | undefined,
@@ -25,20 +26,11 @@ export function buildHeatmapLegendItems(
 ): HeatmapLegendEntry[] {
   const map = settingsMap || {}
   const items: HeatmapLegendEntry[] = []
-  const matched = new Set<string>()
-
   for (const layer of layers) {
     const settings = map[layer.id]
     if (layer.visible && settings?.enabled) {
       items.push({ id: layer.id, name: layer.name, settings })
-      matched.add(layer.id)
     }
   }
-
-  for (const [id, settings] of Object.entries(map)) {
-    if (!settings?.enabled || matched.has(id)) continue
-    items.push({ id, name: id, settings })
-  }
-
   return items
 }

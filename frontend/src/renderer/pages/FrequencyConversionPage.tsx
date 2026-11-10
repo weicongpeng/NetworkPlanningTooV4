@@ -109,7 +109,7 @@ export default function FrequencyConversionPage() {
     <div className="p-8 space-y-6">
       <div>
         <h1 className="text-base font-bold flex items-center gap-2">
-          <RadioTower size={20} className="text-indigo-500" />
+          <RadioTower size={20} className="text-primary" />
           {t('freqConversion.title')}
         </h1>
       </div>

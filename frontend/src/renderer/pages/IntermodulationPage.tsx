@@ -248,7 +248,7 @@ export default function IntermodulationPage() {
     <div className="p-8 space-y-6">
       <div>
         <h1 className="text-base font-bold flex items-center gap-2">
-          <Waves size={20} className="text-violet-500" />
+          <Waves size={20} className="text-primary" />
           {t('im3Evaluation.title')}
         </h1>
         <p className="text-sm text-muted-foreground mt-1">{t('im3Evaluation.subtitle')}</p>

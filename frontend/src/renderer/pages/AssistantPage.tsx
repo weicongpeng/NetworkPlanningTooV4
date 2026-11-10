@@ -169,7 +169,7 @@ function ArtifactView({ artifact }: { artifact: AssistantArtifact }) {
 
       {showTable && table && (
         <div className="max-h-72 overflow-auto rounded border border-border">
-          <table className="min-w-full text-xs">
+          <table className="min-w-full text-xs npt-resizable">
             <thead className="sticky top-0 bg-muted text-muted-foreground">
               <tr>
                 {table.columns.map((c) => (

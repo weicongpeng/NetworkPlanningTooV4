@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useMemo, useCallback } from 'react'
-import { Download, Loader2, AlertCircle, CheckCircle2, Search, GripVertical, Check, List, Save } from 'lucide-react'
+import { Download, Loader2, AlertCircle, CheckCircle2, Search, GripVertical, Check, List, Save, MapPin } from 'lucide-react'
 import { tacPlanningApi, dataApi } from '../services/api'
 import { useTACPlanningStore } from '../store/tacPlanningStore'
 import { useTaskStore, type Task } from '../store/taskStore'
@@ -92,7 +92,6 @@ export function TACPlanningPage() {
     const [cellFileUploading, setCellFileUploading] = useState(false)
     const cellFileInputRef = useRef<HTMLInputElement>(null)
     const viewedTaskIdRef = useRef<string | null>(null)
-    const isLoadingResultRef = useRef(false) // 标记结果加载是否有效，防止竞态
     const [resultLoading, setResultLoading] = useState(false) // 结果页加载动画
     const errorCountRef = useRef(0)
     const [selectedCount, setSelectedCount] = useState(0)
@@ -116,66 +115,76 @@ export function TACPlanningPage() {
       if (activeLeftTab === 'task-config') { resetConfig() }
     }, [activeLeftTab, resetConfig])
 
-    // ===== 结果自动加载 =====
+    // ===== 结果自动加载：与「历史任务 → 查看」保持同一条取数路径 =====
+    // 旧逻辑串行 await 一次 history 同步、再按摘要判断要不要取完整结果，且拿到完整结果后
+    // 会被下方响应式 effect 用 store 里的轻量摘要覆盖，导致直接点「结果」长时间转圈或空白。
     useEffect(() => {
-      if (activeLeftTab === 'planning-result') {
-        // 如果用户通过"查看"按钮加载了特定任务的结果，不要自动加载最新的
-        if (viewedTaskIdRef.current) {
-          return
-        }
-        isLoadingResultRef.current = true
-        // 仅当没有已有结果时才显示加载动画
-        if (!result) {
-          setResultLoading(true)
-        }
-        const loadLatest = async () => {
-          await syncHistoryFromBackend('tac_planning')
-          if (!isLoadingResultRef.current) return
-          const tasks = useTaskStore.getState().tasks
-          const tacPlanTasks = Object.values(tasks)
-            .filter(t => t.type === 'tac_planning')
-            .sort((a, b) => {
-              const aTime = a.endTime || a.startTime || 0
-              const bTime = b.endTime || b.startTime || 0
-              return bTime - aTime
-            })
-          if (tacPlanTasks.length > 0) {
-            const latest = tacPlanTasks[0]
-            // 恢复应用状态（跨页面同步）
-            if (latest.isApplied) {
-              setApplySuccess(true)
-            } else {
-              setApplySuccess(false)
-            }
-            // 如果缺少完整 results（来自 resultSummary），尝试从 API 重新获取
-            if (latest.result && !latest.result.results && latest.id) {
-              try {
-                const response = await tacPlanningApi.getResult(latest.id)
-                if (!isLoadingResultRef.current) return
-                if (response?.success && response?.data?.results) {
-                  setResult(response.data as TACResultData)
-                  setTaskId(latest.id)
-                  if (isLoadingResultRef.current) setWizardStep('completed')
-                  return
-                }
-              } catch (fetchErr: any) {
-                console.warn('[TACPlanningPage] 获取完整规划结果失败，使用缓存摘要:', fetchErr?.message)
-              }
-            }
-            if (latest.result) {
-              setResult(latest.result as TACResultData)
-              setTaskId(latest.id)
-              if (isLoadingResultRef.current) setWizardStep('completed')
-            }
-          }
-        }
-        loadLatest().finally(() => {
-          if (isLoadingResultRef.current) setResultLoading(false)
-        })
-        return () => { isLoadingResultRef.current = false; setResultLoading(false) }
-      } else {
+      if (activeLeftTab !== 'planning-result') {
         // 离开结果页时清除 viewedTaskIdRef
         viewedTaskIdRef.current = null
+        return
+      }
+      // 已由「查看」按钮加载指定任务（或本页自动加载完成）：跳过整条加载链
+      if (viewedTaskIdRef.current) return
+
+      const planningState = useTACPlanningStore.getState()
+      const current = planningState.result as TACResultData | null
+      // 已有完整结果：直接展示，不发请求
+      if (current?.results) {
+        viewedTaskIdRef.current = current.taskId || planningState.taskId || null
+        return
+      }
+
+      // 挂载时的 history 同步通常已把列表写进 store，直接复用，避免串行等待
+      const pickLatestTask = () => Object.values(useTaskStore.getState().tasks)
+        .filter(t => t.type === 'tac_planning')
+        .sort((a, b) => (b.endTime || b.startTime || 0) - (a.endTime || a.startTime || 0))[0]
+
+      let cancelled = false
+      const loadLatest = async () => {
+        setResultLoading(true)
+        try {
+          let latest = pickLatestTask()
+          if (!latest) {
+            // 仅 store 为空（冷启动）时才同步一次历史
+            await syncHistoryFromBackend('tac_planning')
+            if (cancelled) return
+            latest = pickLatestTask()
+          }
+          const targetId = latest?.id || planningState.taskId
+          if (!targetId) return // 没有历史任务：保持空状态
+
+          const taskState = useTaskStore.getState().tasks[targetId]
+          setApplySuccess(!!taskState?.isApplied)
+          // 未完成任务交给全局轮询/响应式 effect 推进进度，不请求完整结果、也不锁定 viewedTaskIdRef
+          if (taskState && taskState.status !== 'completed') {
+            if (taskState.result) {
+              setResult(taskState.result as TACResultData)
+              setTaskId(targetId)
+            }
+            return
+          }
+          const response = await tacPlanningApi.getResult(targetId)
+          if (cancelled) return
+          if (response?.success && response?.data) {
+            // 必须在 setTaskId 之前：阻止响应式 effect 用轻量摘要覆盖完整结果
+            viewedTaskIdRef.current = targetId
+            setResult(response.data as TACResultData)
+            setTaskId(targetId)
+            setWizardStep('completed')
+          } else {
+            setError('加载规划结果失败')
+          }
+        } catch (err: any) {
+          if (!cancelled) setError('加载规划结果失败: ' + (err?.message || '未知错误'))
+        } finally {
+          if (!cancelled) setResultLoading(false)
+        }
+      }
+      void loadLatest()
+      return () => {
+        cancelled = true
+        setResultLoading(false)
       }
     }, [activeLeftTab])
 
@@ -883,7 +892,10 @@ export function TACPlanningPage() {
                 </div>
             )}
 
-            <h1 className="text-base font-bold mb-4 shrink-0">{t('tacPlanning.title') || 'TAC规划'}</h1>
+            <h1 className="text-base font-bold mb-4 shrink-0 flex items-center gap-2">
+              <MapPin size={20} className="text-primary" />
+              {t('tacPlanning.title') || 'TAC规划'}
+            </h1>
 
             {error && (
                 <div className="mb-3 p-2.5 bg-red-500/10 border border-red-500/20 rounded-lg flex items-start gap-2 shrink-0">
@@ -941,7 +953,7 @@ export function TACPlanningPage() {
                         )}
                         {taskResult?.status === 'processing' && (
                             <span className="ml-2 inline-flex items-center">
-                                <Loader2 size={12} className="animate-spin text-blue-500" />
+                                <Loader2 size={12} className="animate-spin text-primary" />
                             </span>
                         )}
                     </button>
@@ -1119,9 +1131,9 @@ export function TACPlanningPage() {
                                         <div className="flex items-center justify-between gap-4 mb-3 flex-wrap">
                                             <div className="flex items-center gap-2">
                                                 {taskResult.status === 'completed' ? (
-                                                    <CheckCircle2 size={18} className="text-green-500" />
+                                                    <CheckCircle2 size={18} className="text-primary" />
                                                 ) : taskResult.status === 'failed' ? (
-                                                    <AlertCircle size={18} className="text-red-500" />
+                                                    <AlertCircle size={18} className="text-destructive" />
                                                 ) : (
                                                     <Loader2 size={18} className="animate-spin text-primary" />
                                                 )}
@@ -1129,13 +1141,13 @@ export function TACPlanningPage() {
                                                     <span className="text-xs text-muted-foreground">{t('tacPlanning.total') || '总'}</span>
                                                     <span className="text-xs font-bold">{taskResult.totalCells || 0}</span>
                                                 </div>
-                                                <div className="flex items-center gap-1 px-2 py-1.5 bg-green-500/10 border border-green-500/20 rounded-lg">
-                                                    <span className="text-xs text-green-600">{t('tacPlanning.success') || '成功'}</span>
-                                                    <span className="text-xs font-bold text-green-500">{taskResult.matchedCells || 0}</span>
+                                                <div className="flex items-center gap-1 px-2 py-1.5 bg-primary/10 border border-primary/20 rounded-lg">
+                                                    <span className="text-xs text-primary">{t('tacPlanning.success') || '成功'}</span>
+                                                    <span className="text-xs font-bold text-primary">{taskResult.matchedCells || 0}</span>
                                                 </div>
-                                                <div className="flex items-center gap-1 px-2 py-1.5 bg-blue-500/10 border border-blue-500/20 rounded-lg">
-                                                    <span className="text-xs text-blue-600">{t('tacPlanning.matchRate') || '匹配率'}</span>
-                                                    <span className="text-xs font-bold text-blue-500">
+                                                <div className="flex items-center gap-1 px-2 py-1.5 bg-primary/10 border border-primary/20 rounded-lg">
+                                                    <span className="text-xs text-primary">{t('tacPlanning.matchRate') || '匹配率'}</span>
+                                                    <span className="text-xs font-bold text-primary">
                                                         {taskResult.totalCells > 0 ? ((taskResult.matchedCells / taskResult.totalCells) * 100).toFixed(1) : 0}%
                                                     </span>
                                                 </div>
@@ -1155,7 +1167,7 @@ export function TACPlanningPage() {
                                                     }}
                                                     className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg transition-colors text-xs ${
                                                         searchEnabled
-                                                            ? 'bg-blue-400 text-white hover:bg-blue-500'
+                                                            ? 'bg-primary text-primary-foreground hover:bg-primary/90'
                                                             : 'bg-card border border-border hover:bg-muted/80'
                                                     }`}
                                                 >
@@ -1230,7 +1242,7 @@ export function TACPlanningPage() {
                                                         }
                                                     }}
                                                     disabled={applyingToParams || applySuccess}
-                                                    className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg transition-all text-xs ${applySuccess ? 'bg-green-500/20 border border-green-500/50 text-green-600 cursor-default' : applyingToParams ? 'bg-blue-500/20 border border-blue-500/50 text-blue-600' : 'bg-card border border-border hover:bg-muted/80'} disabled:opacity-60`}
+                                                    className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg transition-all text-xs ${applySuccess ? 'bg-green-500/20 border border-green-500/50 text-green-600 cursor-default' : applyingToParams ? 'bg-primary/20 border border-primary/50 text-primary' : 'bg-card border border-border hover:bg-muted/80'} disabled:opacity-60`}
                                                 >
                                                     {applyingToParams ? (
                                                         <><Loader2 size={16} className="animate-spin" /><span>{t('common.applying') || '应用中...'}</span></>

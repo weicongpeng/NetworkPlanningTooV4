@@ -26,6 +26,8 @@ const h = vi.hoisted(() => {
       inheritModulus: false,
       useMod3: true,
       useMod30: false,
+      useMod6: true,
+      useMod4: true,
       pciRange: '0-503',
       enableTACPlanning: true,
     },
@@ -197,5 +199,8 @@ describe('PCI 规划上传附件选择小区', () => {
     expect(payload.selectedCellIds).toHaveLength(CELL_COUNT)
     expect(payload.selectedCellIds).toContain('S1_1')
     expect(payload.selectedCellIds).toContain(`S1_${CELL_COUNT}`)
+    // 新增的次级模约束开关必须随请求体传到后端
+    expect(payload.useMod6).toBe(true)
+    expect(payload.useMod4).toBe(true)
   })
 })

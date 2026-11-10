@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { AlertCircle, Loader2 } from 'lucide-react'
+import { AlertCircle, Loader2, ClipboardCheck } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { pciCheckApi } from '../services/api'
 import { usePCICheckStore } from '../store/pciCheckStore'
@@ -82,6 +82,7 @@ export function PCICheckPage() {
       if (!isLoadingResultRef.current) return
       const latest = getLatestPCICheckTask()
       if (!latest?.result) return
+      setActiveTaskId('pci_check', latest.id)
       if (!latest.result.results) {
         try {
           const response = await pciCheckApi.getResult(latest.id)
@@ -303,10 +304,11 @@ export function PCICheckPage() {
   }
 
   const runExport = async (format: 'xlsx' | 'csv', checkType?: string) => {
-    if (!taskId || exportState !== 'idle') return
+    const exportTaskId = taskId || viewedTaskIdRef.current || latestTask?.id
+    if (!exportTaskId || exportState !== 'idle') return
     setExportState('exporting')
     try {
-      const blob = await pciCheckApi.export(taskId, format, checkType)
+      const blob = await pciCheckApi.export(exportTaskId, format, checkType)
       const networkType = taskResult?.networkType || config.networkType
       const category = CHECK_TYPES.find(item => item.key === checkType)
       const categoryLabel = category ? (t(`pciCheck.types.${category.key}`) || category.label) : ''
@@ -358,7 +360,10 @@ export function PCICheckPage() {
 
   return (
     <div className="h-full flex flex-col p-4 min-h-0">
-      <h1 className="text-base font-bold mb-6 shrink-0">{t('pciCheck.title') || 'PCI核查'}</h1>
+      <h1 className="text-base font-bold mb-6 shrink-0 flex items-center gap-2">
+        <ClipboardCheck size={20} className="text-primary" />
+        {t('pciCheck.title') || 'PCI核查'}
+      </h1>
 
       {error && (
         <div className="mb-6 p-3 bg-red-500/10 border border-red-500/20 rounded-lg flex items-start gap-2 shrink-0">
@@ -405,7 +410,7 @@ export function PCICheckPage() {
             {taskResult?.status === 'failed' && <span className={btn.badgeError}>!</span>}
             {taskResult?.status === 'processing' && (
               <span className="ml-2 inline-flex items-center">
-                <Loader2 size={12} className="animate-spin text-blue-500" />
+                <Loader2 size={12} className="animate-spin text-primary" />
               </span>
             )}
           </button>

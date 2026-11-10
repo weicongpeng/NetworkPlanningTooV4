@@ -427,7 +427,7 @@ export function LicensePage() {
                     </div>
 
                     {applyWaiting ? (
-                      <div className="p-2 rounded bg-blue-500/10 border border-blue-500/20 text-blue-500 text-xs flex items-center gap-2">
+                      <div className="p-2 rounded bg-primary/10 border border-primary/20 text-primary text-xs flex items-center gap-2">
                         <Loader2 size={14} className="animate-spin" />
                         {t('license.cloudApplyWaiting')}
                       </div>
@@ -754,7 +754,7 @@ export function LicensePage() {
         </div>
       )}
 
-      {/* 特别声明：声明内容在上，联系方式置于卡片底部 */}
+      {/* 关于：声明内容在上，联系方式置于卡片底部 */}
       <div className="bg-card p-5 rounded-lg border border-border">
         <div className="flex items-center gap-2 mb-4">
           <LifeBuoy size={20} className="text-primary" />

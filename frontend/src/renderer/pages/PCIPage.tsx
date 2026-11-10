@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
-import { Download, Loader2, AlertCircle, Search, X, Ruler, Save, Check, GripVertical, List, Eye } from 'lucide-react'
+import { Download, Loader2, AlertCircle, Search, X, Ruler, Save, Check, GripVertical, List, Eye, Settings } from 'lucide-react'
 import { pciApi, dataApi } from '../services/api'
 import type { ApiResponse } from '@shared/types'
 import { useTaskStore, type Task } from '../store/taskStore'
@@ -836,6 +836,8 @@ export function PCIPage() {
         inheritModulus: config.inheritModulus,
         pciRange: { min: pciMin, max: pciMax },
         enableTACPlanning: config.enableTACPlanning,
+        useMod6: config.useMod6,
+        useMod4: config.useMod4,
         selectedCellIds: selectedCellIdsSet.size > 0 ? Array.from(selectedCellIdsSet) : undefined
       })
       if (response.success && response.data) {
@@ -1260,7 +1262,10 @@ export function PCIPage() {
 
   return (
     <div className="h-full flex flex-col p-4 min-h-0">
-      <h1 className="text-base font-bold mb-6 shrink-0">{t('pci.title') || 'PCI规划'}</h1>
+      <h1 className="text-base font-bold mb-6 shrink-0 flex items-center gap-2">
+        <Settings size={20} className="text-primary" />
+        {t('pci.title') || 'PCI规划'}
+      </h1>
 
       {error && (
         <div className="mb-4 p-3 bg-red-500/10 border border-red-500/20 rounded-lg flex items-center gap-3 text-red-400 shrink-0">
@@ -1299,7 +1304,7 @@ export function PCIPage() {
                 {t('pci.planningResult') || '结果'}
                 {currentTaskResult?.status === 'completed' && <span className={btn.badgeSuccess}>✓</span>}
                 {currentTaskResult?.status === 'failed' && <span className={btn.badgeError}>!</span>}
-                {isRunning && <span className="ml-2 inline-flex items-center"><Loader2 size={12} className="animate-spin text-blue-500" /></span>}
+                {isRunning && <span className="ml-2 inline-flex items-center"><Loader2 size={12} className="animate-spin text-primary" /></span>}
               </button>
               {/* 历史任务操作：仅「历史任务」页签显示（刷新 / 全选 / 应用 / 删除） */}
               {activeLeftTab === 'history' && (
@@ -1414,7 +1419,7 @@ export function PCIPage() {
                               />
                             </div>
                           </div>
-                          <div className="flex items-center gap-4">
+                          <div className="flex flex-wrap items-center gap-4">
                             <label className="flex items-center gap-2 text-xs cursor-pointer">
                               <input
                                 type="checkbox"
@@ -1434,6 +1439,20 @@ export function PCIPage() {
                                 className="w-3.5 h-3.5 disabled:opacity-60"
                               />
                               TAC规划
+                            </label>
+                            <label className="flex items-center gap-2 text-xs cursor-pointer">
+                              <input
+                                type="checkbox"
+                                checked={config.networkType === 'LTE' ? config.useMod6 : config.useMod4}
+                                onChange={(e) => setConfig(
+                                  config.networkType === 'LTE'
+                                    ? { useMod6: e.target.checked }
+                                    : { useMod4: e.target.checked }
+                                )}
+                                disabled={wizardStep !== 'params_set'}
+                                className="w-3.5 h-3.5 disabled:opacity-60"
+                              />
+                              {config.networkType === 'LTE' ? t('pci.useMod6') : t('pci.useMod4')}
                             </label>
                           </div>
                         </div>
@@ -1556,14 +1575,14 @@ export function PCIPage() {
                     <div className="flex items-center justify-between mb-3 shrink-0">
                       <div className="flex items-center gap-6">
                         <div className="flex items-center gap-4 text-sm">
-                          <span className="text-blue-600">{t('pci.siteTotal') || '基站总数'}：<span className="font-bold text-blue-600">{currentTaskResult.totalSites || 0}</span></span>
-                          <span className="text-blue-600">{t('pci.cellTotal') || '小区总数'}：<span className="font-bold text-blue-600">{currentTaskResult.totalSectors || 0}</span></span>
+                          <span className="text-primary">{t('pci.siteTotal') || '基站总数'}：<span className="font-bold text-primary">{currentTaskResult.totalSites || 0}</span></span>
+                          <span className="text-primary">{t('pci.cellTotal') || '小区总数'}：<span className="font-bold text-primary">{currentTaskResult.totalSectors || 0}</span></span>
                         </div>
                       </div>
                       <div className="flex items-center gap-3">
                         <button
                           onClick={() => setResultSearchEnabled(!resultSearchEnabled)}
-                          className={`flex items-center gap-2 px-3 py-2 rounded-lg transition-colors text-xs font-medium ${resultSearchEnabled ? 'bg-blue-400 text-white hover:bg-blue-500' : 'bg-card border border-border hover:bg-muted/80'}`}
+                          className={`flex items-center gap-2 px-3 py-2 rounded-lg transition-colors text-xs font-medium ${resultSearchEnabled ? 'bg-primary text-primary-foreground hover:bg-primary/90' : 'bg-card border border-border hover:bg-muted/80'}`}
                         >
                           <Search size={14} />
                           {t('pci.search') || '搜索'}
@@ -1575,14 +1594,14 @@ export function PCIPage() {
                         <button
                           onClick={handleApplyToParams}
                           disabled={applyingToParams || applySuccess}
-                          className={`flex items-center justify-center gap-2 px-4 py-2 rounded-lg transition-all text-xs font-medium whitespace-nowrap ${applySuccess ? 'bg-green-500/20 border border-green-500/50 text-green-600' : applyingToParams ? 'bg-blue-500/20 border border-blue-500/50 text-blue-600' : 'bg-card border border-border hover:bg-muted/80'} disabled:opacity-50 disabled:cursor-not-allowed`}
+                          className={`flex items-center justify-center gap-2 px-4 py-2 rounded-lg transition-all text-xs font-medium whitespace-nowrap ${applySuccess ? 'bg-green-500/20 border border-green-500/50 text-green-600' : applyingToParams ? 'bg-primary/20 border border-primary/50 text-primary' : 'bg-card border border-border hover:bg-muted/80'} disabled:opacity-50 disabled:cursor-not-allowed`}
                         >
                           {applyingToParams ? <><Loader2 size={14} className="animate-spin" />{t('pci.applying') || '应用中...'}</> : applySuccess ? <><Check size={14} />{t('pci.applied') || '已应用'}</> : <><Save size={14} />{t('pci.apply') || '应用到工参'}</>}
                         </button>
                         <button
                           data-guide="result-show-map"
                           onClick={() => setShowMap(prev => !prev)}
-                          className={`flex items-center gap-2 px-4 py-2 rounded-lg transition-colors text-xs font-medium whitespace-nowrap ${showMap ? 'bg-blue-400 text-white hover:bg-blue-500' : 'bg-card border border-border hover:bg-muted/80'}`}
+                          className={`flex items-center gap-2 px-4 py-2 rounded-lg transition-colors text-xs font-medium whitespace-nowrap ${showMap ? 'bg-primary text-primary-foreground hover:bg-primary/90' : 'bg-card border border-border hover:bg-muted/80'}`}
                         >
                           <Eye size={14} />
                           {t('pci.showMap') || '地图展示'}
@@ -1704,9 +1723,9 @@ export function PCIPage() {
               <MapSourceSwitch />
             </div>
             {searchMarkers.length > 0 && (
-              <div className="mb-3 p-2 bg-blue-500/10 border border-blue-500/30 rounded-lg text-xs text-blue-600 flex items-center justify-between">
+              <div className="mb-3 p-2 bg-primary/10 border border-primary/30 rounded-lg text-xs text-primary flex items-center justify-between">
                 <span className="flex items-center gap-2"><Search size={14} />{t('pci.searchMarkersAdded') || `已添加 ${searchMarkers.length} 个搜索标记`}</span>
-                <button onClick={handleClearMarkers} className="text-blue-600 hover:text-blue-500 font-medium">{t('pci.clearAll') || '清除全部'}</button>
+                <button onClick={handleClearMarkers} className="text-primary hover:text-primary font-medium">{t('pci.clearAll') || '清除全部'}</button>
               </div>
             )}
             {searchError && (

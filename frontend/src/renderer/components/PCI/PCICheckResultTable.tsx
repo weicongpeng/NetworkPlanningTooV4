@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { ChevronDown, Download, GripVertical, Search } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 
@@ -129,10 +129,12 @@ interface PCICheckResultTableProps {
   exportState: 'idle' | 'exporting' | 'success'
   onExportAll: () => void
   onExportCsv: () => void
+  /** 分类页签，由结果面板下传，与搜索/导出按钮合并到同一行 */
+  tabs?: ReactNode
 }
 
 export function PCICheckResultTable({
-  rows, checkType, exportState, onExportAll, onExportCsv
+  rows, checkType, exportState, onExportAll, onExportCsv, tabs
 }: PCICheckResultTableProps) {
   const { t } = useTranslation()
   const columns = useMemo(() => columnsForCheckType(checkType), [checkType])
@@ -229,7 +231,7 @@ export function PCICheckResultTable({
     const value = row[key]
     if (key === 'networkType') {
       return (
-        <span className={`px-1.5 py-0.5 rounded text-[10px] ${value === 'LTE' ? 'bg-blue-500/10 text-blue-600' : 'bg-purple-500/10 text-purple-600'}`}>
+        <span className={`px-1.5 py-0.5 rounded text-[10px] ${value === 'LTE' ? 'bg-primary/10 text-primary' : 'bg-primary/10 text-primary'}`}>
           {value || '-'}
         </span>
       )
@@ -262,49 +264,52 @@ export function PCICheckResultTable({
 
   return (
     <div className="flex-1 min-h-0 flex flex-col overflow-hidden">
-      <div className="flex items-center justify-end gap-2 mb-3 shrink-0">
-        <button
-          onClick={() => {
-            if (searchEnabled) setSearchFilters({})
-            setSearchEnabled(!searchEnabled)
-          }}
-          className={`flex items-center gap-2 px-3 py-1.5 rounded-lg transition-colors text-sm ${searchEnabled ? 'bg-blue-400 text-white hover:bg-blue-500' : 'bg-muted hover:bg-muted/80'}`}
-        >
-          <Search size={16} />
-          {t('pciCheck.search') || '搜索'}
-        </button>
-        <div className="relative" ref={exportMenuRef}>
+      <div className="flex items-center gap-2 mb-3 border-b border-border shrink-0">
+        {tabs}
+        <div className="flex items-center gap-2 shrink-0 ml-auto">
           <button
-            onClick={() => setExportMenuOpen(prev => !prev)}
-            disabled={exportState !== 'idle'}
-            className="flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm bg-muted hover:bg-muted/80 disabled:opacity-50 disabled:cursor-not-allowed"
+            onClick={() => {
+              if (searchEnabled) setSearchFilters({})
+              setSearchEnabled(!searchEnabled)
+            }}
+            className={`flex items-center gap-2 px-3 py-1.5 rounded-lg transition-colors text-sm ${searchEnabled ? 'bg-primary text-primary-foreground hover:bg-primary/90' : 'bg-muted hover:bg-muted/80'}`}
           >
-            <Download size={16} />
-            {exportState === 'exporting'
-              ? (t('pciCheck.exporting') || '导出中')
-              : exportState === 'success'
-                ? (t('pciCheck.exportSuccess') || '已导出')
-                : (t('pciCheck.export') || '导出')}
-            <ChevronDown size={14} />
+            <Search size={16} />
+            {t('pciCheck.search') || '搜索'}
           </button>
-          {exportMenuOpen && (
-            <div className="absolute right-0 top-full mt-1 z-30 min-w-[140px] rounded-lg border border-border bg-background shadow-lg py-1">
-              <button
-                onClick={() => { setExportMenuOpen(false); onExportAll() }}
-                disabled={exportState !== 'idle'}
-                className="w-full text-left px-3 py-1.5 text-sm hover:bg-muted disabled:opacity-50"
-              >
-                {t('pciCheck.exportAll') || '全部导出'}
-              </button>
-              <button
-                onClick={() => { setExportMenuOpen(false); onExportCsv() }}
-                disabled={exportState !== 'idle' || rows.length === 0}
-                className="w-full text-left px-3 py-1.5 text-sm hover:bg-muted disabled:opacity-50"
-              >
-                {t('pciCheck.exportCsv') || '导出当前页'}
-              </button>
-            </div>
-          )}
+          <div className="relative" ref={exportMenuRef}>
+            <button
+              onClick={() => setExportMenuOpen(prev => !prev)}
+              disabled={exportState !== 'idle'}
+              className="flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm bg-muted hover:bg-muted/80 disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              <Download size={16} />
+              {exportState === 'exporting'
+                ? (t('pciCheck.exporting') || '导出中')
+                : exportState === 'success'
+                  ? (t('pciCheck.exportSuccess') || '已导出')
+                  : (t('pciCheck.export') || '导出')}
+              <ChevronDown size={14} />
+            </button>
+            {exportMenuOpen && (
+              <div className="absolute right-0 top-full mt-1 z-30 min-w-[140px] rounded-lg border border-border bg-background shadow-lg py-1">
+                <button
+                  onClick={() => { setExportMenuOpen(false); onExportAll() }}
+                  disabled={exportState !== 'idle'}
+                  className="w-full text-left px-3 py-1.5 text-sm hover:bg-muted disabled:opacity-50"
+                >
+                  {t('pciCheck.exportAll') || '全部导出'}
+                </button>
+                <button
+                  onClick={() => { setExportMenuOpen(false); onExportCsv() }}
+                  disabled={exportState !== 'idle' || rows.length === 0}
+                  className="w-full text-left px-3 py-1.5 text-sm hover:bg-muted disabled:opacity-50"
+                >
+                  {t('pciCheck.exportCsv') || '导出当前页'}
+                </button>
+              </div>
+            )}
+          </div>
         </div>
       </div>
 

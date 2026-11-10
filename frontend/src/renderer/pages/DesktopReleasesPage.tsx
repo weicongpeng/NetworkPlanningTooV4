@@ -269,7 +269,7 @@ export function DesktopReleasesPage() {
 
       {/* 列表 */}
       <div className="bg-card rounded-lg border border-border overflow-hidden">
-        <table className="w-full text-sm">
+        <table className="w-full text-sm npt-resizable">
           <thead className="bg-muted/50 text-xs text-muted-foreground">
             <tr>
               <th className="px-3 py-2 text-left">{t('desktopReleases.colVersion')}</th>

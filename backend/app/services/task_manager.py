@@ -1185,6 +1185,8 @@ class TaskManager:
                 reuse_distance_km=config.distanceThreshold,
                 inherit_mod=config.inheritModulus,
                 pci_range=pci_range,
+                use_mod6=config.useMod6,
+                use_mod4=config.useMod4,
             )
 
             # 获取数据 - 使用优化后的数据准备方法 (P1-2)
@@ -4741,7 +4743,6 @@ class TaskManager:
         logger.info(f"[TaskManager] 开始导出任务 {task_id[:8]}... type={getattr(task_type, 'value', task_type)}, format={format}, networkType={task_result.get('networkType', 'N/A')}")
 
         try:
-            import pandas as pd
             from pathlib import Path
             from app.core.config import settings
 
@@ -4815,7 +4816,6 @@ class TaskManager:
                         )
 
                 logger.info(f"[TaskManager] PCI导出: 共 {len(data)} 行数据")
-                df = pd.DataFrame(data)
 
             elif task_type == TaskType.NEIGHBOR:
                 # 邻区规划结果导出 (扁平化结构)
@@ -4841,7 +4841,6 @@ class TaskManager:
                         )
 
                 logger.info(f"[TaskManager] 邻区导出: 共 {len(data)} 行数据")
-                df = pd.DataFrame(data)
 
             elif task_type in [TaskType.TAC, TaskType.TAC_PLANNING]:
                 # TAC结果导出 (核查和规划共用)
@@ -4873,17 +4872,13 @@ class TaskManager:
                         )
 
                 logger.info(f"[TaskManager] TAC导出: 共 {len(data)} 行数据")
-                df = pd.DataFrame(data)
 
             else:
                 raise ValueError(f"未知的任务类型: {task_type}")
 
-            if format == "xlsx":
-                df.to_excel(output_file, index=False, engine="openpyxl")
-            elif format == "csv":
-                df.to_csv(output_file, index=False, encoding="utf-8-sig")
-            else:
-                raise ValueError(f"不支持的导出格式: {format}")
+            from app.services.export_service import write_result_file
+
+            write_result_file(output_file, data, format)
 
             file_size = output_file.stat().st_size
             logger.info(f"[TaskManager] 导出成功: {output_file.name} ({file_size} bytes)")
