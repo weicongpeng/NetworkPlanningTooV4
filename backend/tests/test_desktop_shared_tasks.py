@@ -31,6 +31,14 @@ def temp_db(tmp_path, monkeypatch):
     Session = sessionmaker(bind=engine, autoflush=False, autocommit=False)
     monkeypatch.setattr("app.core.database.SessionLocal", Session)
     monkeypatch.setattr("app.services.task_manager.SessionLocal", Session, raising=False)
+    # StaticPool 让所有 Session 共享同一个 SQLite 连接。upsert_shared_task 会启动后台
+    # 建索引线程，该线程的 commit/rollback 会串扰本连接上尚未提交的 DELETE，导致
+    # delete_shared_task 偶发 "expected to delete 1 row(s); 0 were matched" 且记录未删。
+    # 生产使用文件 SQLite + 连接池（各 Session 独立连接）不受影响，这里隔离后台线程。
+    monkeypatch.setattr(
+        "app.services.task_result_index_service.schedule_index",
+        lambda *args, **kwargs: False,
+    )
     return Session
 
 
