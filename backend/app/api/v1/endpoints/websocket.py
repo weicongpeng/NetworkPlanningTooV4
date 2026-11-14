@@ -13,12 +13,18 @@ router = APIRouter()
 
 
 def _resolve_ws_group(token: str):
-    """解码查询串/消息里的 JWT，返回用户的数据组 (city, operator)；失败返回 None。"""
+    """解码查询串/消息里的 JWT，返回 (city, operator, user_id)；失败返回 None。
+
+    user_id 用于「用户上线」提醒排除上线者自己的连接（含同一账号其它标签页）。
+    """
     if not token:
         return None
     try:
         from app.core.database import SessionLocal
-        from app.services import auth_service
+        # 注意：必须从模块里取「实例」（app.services.auth_service.auth_service），
+        # 直接 `from app.services import auth_service` 拿到的是模块本身，
+        # 调用 decode_token 会抛 AttributeError → 组/鉴权登记全部失效
+        from app.services.auth_service import auth_service
 
         payload = auth_service.decode_token(token)
         if not payload:
@@ -31,7 +37,7 @@ def _resolve_ws_group(token: str):
             db.close()
         if user is None or not getattr(user, "is_active", True):
             return None
-        return (user.city or "", user.operator or "")
+        return (user.city or "", user.operator or "", user_id)
     except Exception:  # noqa: BLE001
         return None
 
@@ -63,6 +69,9 @@ async def websocket_tasks_endpoint(websocket: WebSocket):
         group = _resolve_ws_group(websocket.query_params.get("token") or "")
         if group:
             websocket_manager.register_client_group(client_id, group[0], group[1])
+            websocket_manager.register_client_auth(client_id, group[2])
+            # 协作沟通通讯录：即时同步上线状态（离线由 finally 判定最后一个连接）
+            websocket_manager.notify_im_presence({"user_id": group[2], "online": True})
         logger.info(f"WebSocket客户端连接: {client_id}")
 
         # 持续接收客户端消息
@@ -103,6 +112,9 @@ async def websocket_tasks_endpoint(websocket: WebSocket):
                     auth_group = _resolve_ws_group(str(data.get("token") or ""))
                     if auth_group:
                         websocket_manager.register_client_group(client_id, auth_group[0], auth_group[1])
+                        websocket_manager.register_client_auth(client_id, auth_group[2])
+                        websocket_manager.notify_im_presence(
+                            {"user_id": auth_group[2], "online": True})
                         await websocket.send_json({"type": "auth_ok"})
                     else:
                         logger.warning(f"WebSocket 鉴权失败: {client_id}")
@@ -119,4 +131,11 @@ async def websocket_tasks_endpoint(websocket: WebSocket):
     except Exception as e:
         logger.error(f"WebSocket错误: {client_id}, {type(e).__name__}: {e}")
     finally:
+        # 先取 user_id 再清理；只有该用户没有任何剩余连接时才广播离线，
+        # 避免多标签页/多设备时把仍在线的人误标为离线。
+        offline_user_id = websocket_manager.client_user_ids.get(client_id)
         await websocket_manager.disconnect(client_id)
+        if offline_user_id and not websocket_manager.has_other_connections(
+                offline_user_id, client_id):
+            websocket_manager.notify_im_presence(
+                {"user_id": offline_user_id, "online": False})

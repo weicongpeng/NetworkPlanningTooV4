@@ -590,6 +590,10 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
   // 编辑态圈选命中的要素数（底部提示条"删除"按钮的显隐与删除数量）
   const [shapeSelectedCount, setShapeSelectedCount] = useState(0)
   const [selectedFeatureCount, setSelectedFeatureCount] = useState(0) // 当前选中要素数（控制导出按钮）
+  // 底部提示条"复制"按钮的"已复制"反馈：每次点击都刷新，
+  // 否则连续点击时 selectionTip 被设成相同值、界面无变化，会被误认为"点击无效"
+  const [selectionCopied, setSelectionCopied] = useState(false)
+  const selectionCopiedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   // 选中要素导出：命名对话框（确认文件名后再下载）
   const [exportDialogOpen, setExportDialogOpen] = useState(false)
   const [exportDefaultName, setExportDefaultName] = useState('')
@@ -8355,16 +8359,23 @@ function sectorPointGeometry(f: any): { type: 'Point'; coordinates: [number, num
             ref={(el) => { if (el) L.DomEvent.disableClickPropagation(el) }}
             className="absolute bottom-4 left-1/2 transform -translate-x-1/2 z-[1000] bg-primary/95 text-white px-4 py-2 rounded-lg shadow-lg flex items-center gap-2"
           >
-            <span className="text-sm font-medium">{selectionTip}</span>
+            {/* 固定文案宽度：复制成功后 selectionTip 会变长，若让它撑宽居中提示条，
+                复制/导出按钮会整体左移导致鼠标点不中（表现为"第二次点击无效"） */}
+            <span className="text-sm font-medium w-72 min-w-0 truncate" title={selectionTip}>{selectionTip}</span>
             {selectedFeatureCount > 0 && (
               <button
                 type="button"
-                onClick={() => { void copySelectionBoth() }}
+                onClick={() => {
+                  void copySelectionBoth()
+                  setSelectionCopied(true)
+                  if (selectionCopiedTimerRef.current) clearTimeout(selectionCopiedTimerRef.current)
+                  selectionCopiedTimerRef.current = setTimeout(() => setSelectionCopied(false), 1200)
+                }}
                 title={t('map.copySelectionHint') || '复制圈选要素：属性文本可粘贴到 Excel，几何+属性可粘贴到其他打开编辑开关的图层'}
-                className="flex items-center gap-1 bg-white text-primary text-sm font-medium px-2.5 py-1 rounded-md hover:bg-primary/10 active:bg-primary/20 transition-colors"
+                className={`flex items-center gap-1 bg-white text-sm font-medium px-2.5 py-1 rounded-md hover:bg-slate-100 active:bg-slate-200 transition-colors ${selectionCopied ? 'text-green-600' : 'text-primary'}`}
               >
                 <CopyIcon size={14} />
-                {t('map.copySelection') || '复制'}
+                {selectionCopied ? (t('map.copied') || '已复制') : (t('map.copySelection') || '复制')}
               </button>
             )}
             {selectedFeatureCount > 0 && (
@@ -8372,7 +8383,7 @@ function sectorPointGeometry(f: any): { type: 'Point'; coordinates: [number, num
                 type="button"
                 onClick={openSelectionExportDialog}
                 title={t('map.exportAction') || '导出'}
-                className="flex items-center gap-1 bg-white text-primary text-sm font-medium px-2.5 py-1 rounded-md hover:bg-primary/10 active:bg-primary/20 transition-colors"
+                className="flex items-center gap-1 bg-white text-primary text-sm font-medium px-2.5 py-1 rounded-md hover:bg-slate-100 active:bg-slate-200 transition-colors"
               >
                 <FileSpreadsheet size={14} />
                 {t('map.exportAction') || '导出'}

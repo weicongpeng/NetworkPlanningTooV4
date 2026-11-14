@@ -12,6 +12,18 @@ const SOURCE_FILES = [
   'pages/TACPage.tsx',
   'pages/TACPlanningPage.tsx',
   'pages/PCIPage.tsx',
+  // 协作沟通整模块接入 i18n，中英两份字典必须同步补齐
+  'components/Im/ImHost.tsx',
+  'components/Im/ImWindow.tsx',
+  'components/Im/ImSidebar.tsx',
+  'components/Im/ImChatPanel.tsx',
+  'components/Im/ImComposer.tsx',
+  'components/Im/ImMessageItem.tsx',
+  'components/Im/ImGroupDialog.tsx',
+  'components/Im/ImScreenshotDialog.tsx',
+  'components/Im/ImMentionPopup.tsx',
+  'components/Im/ImImageLightbox.tsx',
+  'components/Im/ImSystemNotice.tsx',
 ]
 
 const STATIC_KEY = /\bt\(\s*'([A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)+)'/g

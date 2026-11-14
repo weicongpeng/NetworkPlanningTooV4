@@ -31,6 +31,10 @@ import type {
   BufferRequest,
   BufferStats,
 } from '@shared/types'
+import type {
+  ImAttachmentUploadResult, ImContactsData, ImConversationsData, ImEnvelope,
+  ImGroup, ImMember, ImMessage, ImMessagesPage,
+} from '../components/Im/types'
 import { uploadStore } from '../store/uploadStore'
 
 const API_BASE_URL = '/api/v1'
@@ -705,7 +709,7 @@ export const desktopLoginApi = {
    * toggle-maximize 的响应带最新 maximized；非桌面壳 403，调用方静默忽略。
    */
   windowControl: async (
-    action: 'minimize' | 'toggle-maximize' | 'close' | 'drag' | 'resize-edge',
+    action: 'minimize' | 'toggle-maximize' | 'close' | 'drag' | 'resize-edge' | 'activate',
     params?: { direction?: 'n' | 's' | 'e' | 'w' | 'ne' | 'nw' | 'se' | 'sw' }
   ): Promise<ApiResponse<{ maximized?: boolean }>> => {
     return apiClient.post('/desktop/window-control', { action, ...(params || {}) }) as any
@@ -714,6 +718,11 @@ export const desktopLoginApi = {
   /** 查询壳层窗口状态缓存（maximized/fullscreen），窗口聚焦时校准标题栏图标，不轮询。 */
   windowState: async (): Promise<ApiResponse<{ maximized: boolean; fullscreen: boolean }>> => {
     return apiClient.get('/desktop/window-state') as any
+  },
+
+  /** 壳层 Win32 全局热键 Alt+Z 的序号；前端按增量触发截图弹窗 */
+  screenshotHotkey: async (): Promise<ApiResponse<{ seq: number }>> => {
+    return apiClient.get('/desktop/screenshot-hotkey') as any
   },
 }
 
@@ -978,9 +987,10 @@ export const dataApi = {
    * @param file 主文件（.tab/.mif/.kml/.zip 等）
    * @param filePath Electron 本地真实路径（后端据此在源文件夹查找关联文件）
    * @param extraFiles 配套文件列表（浏览器模式无路径时，同 stem 的 .dat/.mid/.map/.id 一起上传）
+   * @param fileType 用户导入路径（map_layer 图层文件 / current_params 现网工参），后端据此标记条目类型
    */
-  uploadMap: async (file: File | null, filePath?: string, extraFiles?: File[]): Promise<ApiResponse<any>> => {
-    console.log('[uploadMap] START - file:', file, 'filePath:', filePath, 'extraFiles:', extraFiles?.map(f => f.name))
+  uploadMap: async (file: File | null, filePath?: string, extraFiles?: File[], fileType?: string): Promise<ApiResponse<any>> => {
+    console.log('[uploadMap] START - file:', file, 'filePath:', filePath, 'extraFiles:', extraFiles?.map(f => f.name), 'fileType:', fileType)
 
     // 验证输入
     if (!file) {
@@ -1011,6 +1021,12 @@ export const dataApi = {
       console.log('[uploadMap] Added file_path:', filePath)
     } else {
       console.log('[uploadMap] Skipping file_path (not provided or invalid)')
+    }
+
+    // 用户导入路径（map_layer / current_params）：后端写入 fileType，前端据此渲染类型图标
+    if (fileType) {
+      formData.append('file_type', fileType)
+      console.log('[uploadMap] Added file_type:', fileType)
     }
 
     // 验证 FormData
@@ -2555,4 +2571,232 @@ export const assistantApi = {
   /** 删除数据集 */
   deleteDataset: async (id: string): Promise<{ success: boolean }> =>
     apiClient.delete(`/assistant/datasets/${id}`),
+}
+
+// ===== 表格合并 =====
+
+/** 合并模式：按表头结构分组 / 按工作表名分组 */
+export type TableMergeMode = 'structure' | 'sheet'
+
+export interface TableMergeSource {
+  file_name: string
+  sheet_name: string
+  row_count: number
+}
+
+export interface TableMergeSheetInfo {
+  sheet_name: string
+  columns: string[]
+  row_count: number
+}
+
+export interface TableMergeFileInfo {
+  file_name: string
+  sheets: TableMergeSheetInfo[]
+  error: string | null
+}
+
+export interface TableMergeGroup {
+  output_sheet: string
+  columns: string[]
+  total_rows: number
+  sources: TableMergeSource[]
+}
+
+export interface TableMergeInspectData {
+  files: TableMergeFileInfo[]
+  groups: TableMergeGroup[]
+  errors: { file_name: string; error: string }[]
+  total_tables: number
+}
+
+export interface TableMergeResultSheet {
+  output_sheet: string
+  columns: string[]
+  row_count: number
+  source_count: number
+  sources: TableMergeSource[]
+}
+
+export interface TableMergeResultData {
+  filename: string
+  download_url: string
+  sheets: TableMergeResultSheet[]
+  total_rows: number
+  errors: { file_name: string; error: string }[]
+}
+
+// ============== 协作沟通（IM）==============
+//
+// 附件不走 /static（dev 无代理且无鉴权），统一用 apiClient 的 blob 响应；
+// 拦截器对 responseType:'blob' 返回完整 AxiosResponse，因此必须取 .data。
+
+export const IM_CHUNK_SIZE = 512 * 1024
+
+function blobToBase64(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => resolve(String(reader.result || '').split(',')[1] || '')
+    reader.onerror = () => reject(new Error('读取文件分片失败'))
+    reader.readAsDataURL(blob)
+  })
+}
+
+export const imApi = {
+  conversations: (): Promise<ImEnvelope<ImConversationsData>> =>
+    apiClient.get('/im/conversations') as any,
+
+  createConversation: (payload: {
+    kind: 'direct' | 'custom_group'
+    peer_user_id?: number
+    name?: string
+    member_ids?: number[]
+  }): Promise<ImEnvelope<{ id: number; kind: string; name?: string; member_count?: number }>> =>
+    apiClient.post('/im/conversations', payload) as any,
+
+  createGroup: (name: string, memberIds: number[]): Promise<ImEnvelope<ImGroup>> =>
+    apiClient.post('/im/groups', { kind: 'custom_group', name, member_ids: memberIds }) as any,
+
+  conversation: (id: number): Promise<ImEnvelope<any>> =>
+    apiClient.get(`/im/conversations/${id}`) as any,
+
+  members: (id: number): Promise<ImEnvelope<ImMember[]>> =>
+    apiClient.get(`/im/conversations/${id}/members`) as any,
+
+  addMembers: (id: number, memberIds: number[]): Promise<ImEnvelope<any>> =>
+    apiClient.post(`/im/conversations/${id}/members`, { member_ids: memberIds }) as any,
+
+  removeMember: (id: number, userId: number): Promise<any> =>
+    apiClient.delete(`/im/conversations/${id}/members/${userId}`) as any,
+
+  /** 成员主动退群（群主须先解散群） */
+  leaveGroup: (id: number): Promise<any> =>
+    apiClient.delete(`/im/conversations/${id}/members/me`) as any,
+
+  /** 群主解散自建群 */
+  dissolveGroup: (id: number): Promise<any> =>
+    apiClient.delete(`/im/conversations/${id}`) as any,
+
+  /** 群主 / 管理员修改自建群头像（avatar 为空串恢复默认） */
+  updateGroupAvatar: (id: number, avatar: string): Promise<ImEnvelope<{ avatar: string | null }>> =>
+    apiClient.put(`/im/conversations/${id}/avatar`, { avatar }) as any,
+
+  /** 修改当前用户头像（共享桌面模式经 relay 同步到服务器） */
+  updateAvatar: (avatar: string): Promise<ImEnvelope<{ avatar: string | null }>> =>
+    apiClient.put('/im/avatar', { avatar }) as any,
+
+  /** 修改协作沟通昵称（仅 IM 展示名生效，空串清除并回落 username） */
+  updateNickname: (nickname: string): Promise<ImEnvelope<{ nickname: string | null }>> =>
+    apiClient.put('/im/nickname', { nickname }) as any,
+
+  /** 桌面端：把附件写到临时目录并交给系统默认应用打开（Excel / Word / PPT / 视频） */
+  openAttachment: (id: number): Promise<ImEnvelope<{ opened: boolean; path: string }>> =>
+    apiClient.post(`/im/attachments/${id}/open`) as any,
+
+  messages: (id: number, params: {
+    after_id?: number
+    before_id?: number
+    limit?: number
+  }): Promise<ImEnvelope<ImMessagesPage>> =>
+    apiClient.get(`/im/conversations/${id}/messages`, { params }) as any,
+
+  send: (id: number, payload: {
+    kind: 'text' | 'image' | 'file'
+    content_text?: string
+    attachment_id?: number
+    client_msg_id?: string
+    /** 结构化 @：群成员 id 名单；@所有人 由服务端按群角色独立校验权限 */
+    mentions?: number[]
+    mention_all?: boolean
+  }): Promise<ImEnvelope<ImMessage>> =>
+    apiClient.post(`/im/conversations/${id}/messages`, payload) as any,
+
+  markRead: (id: number, lastReadMessageId: number): Promise<ImEnvelope<any>> =>
+    apiClient.post(`/im/conversations/${id}/read`, { last_read_message_id: lastReadMessageId }) as any,
+
+  contacts: (): Promise<ImEnvelope<ImContactsData>> =>
+    apiClient.get('/im/contacts') as any,
+
+  attachmentStart: (payload: {
+    conversation_id: number
+    original_name: string
+    mime: string
+    size_bytes: number
+  }): Promise<ImEnvelope<{ upload_id: string; chunk_size: number; total_chunks: number }>> =>
+    apiClient.post('/im/attachments/start', payload) as any,
+
+  attachmentChunk: (uploadId: string, index: number, dataB64: string): Promise<ImEnvelope<any>> =>
+    apiClient.post('/im/attachments/chunk', {
+      upload_id: uploadId, chunk_index: index, data_b64: dataB64,
+    }) as any,
+
+  attachmentComplete: (uploadId: string): Promise<ImEnvelope<ImAttachmentUploadResult>> =>
+    apiClient.post('/im/attachments/complete', { upload_id: uploadId }) as any,
+
+  attachmentCancel: (uploadId: string): Promise<any> =>
+    apiClient.post('/im/attachments/cancel', { upload_id: uploadId }) as any,
+
+  /** 分片上传任意文件；切页不丢进度由 imStore 里的任务状态承载 */
+  uploadAttachment: async (
+    file: File,
+    conversationId: number,
+    onProgress?: (percent: number) => void,
+  ): Promise<ImAttachmentUploadResult> => {
+    const started = (await imApi.attachmentStart({
+      conversation_id: conversationId,
+      original_name: file.name,
+      mime: file.type || 'application/octet-stream',
+      size_bytes: file.size,
+    })).data
+    const chunkSize = started.chunk_size || IM_CHUNK_SIZE
+    const total = started.total_chunks || Math.ceil(file.size / chunkSize)
+    for (let index = 0; index < total; index += 1) {
+      const slice = file.slice(index * chunkSize, Math.min((index + 1) * chunkSize, file.size))
+      const dataB64 = await blobToBase64(slice)
+      await imApi.attachmentChunk(started.upload_id, index, dataB64)
+      onProgress?.(Math.round(((index + 1) / total) * 100))
+    }
+    return (await imApi.attachmentComplete(started.upload_id)).data
+  },
+
+  attachmentBlob: async (id: number, thumb = false): Promise<Blob> => {
+    const response: any = await apiClient.get(
+      `/im/attachments/${id}${thumb ? '/thumb' : ''}`, { responseType: 'blob' })
+    return response.data as Blob
+  },
+
+  downloadAttachment: async (id: number, filename: string): Promise<void> => {
+    const blob = await imApi.attachmentBlob(id)
+    const url = URL.createObjectURL(blob)
+    const anchor = document.createElement('a')
+    anchor.href = url
+    anchor.download = filename
+    document.body.appendChild(anchor)
+    anchor.click()
+    anchor.remove()
+    window.setTimeout(() => URL.revokeObjectURL(url), 2000)
+  },
+}
+
+export const tableMergeApi = {
+  /** 解析上传文件，返回工作表概览与合并分组预览（不产出文件） */
+  inspect: async (files: File[], mode: TableMergeMode = 'structure'): Promise<ApiResponse<TableMergeInspectData>> => {
+    const formData = new FormData()
+    files.forEach(file => formData.append('files', file))
+    formData.append('mode', mode)
+    return uploadClient.post('/table-merge/inspect', formData)
+  },
+
+  /** 合并并输出单个 Excel 文件 */
+  merge: async (
+    files: File[],
+    options: { mode: TableMergeMode; addSource: boolean; dedupe: boolean },
+  ): Promise<ApiResponse<TableMergeResultData>> => {
+    const formData = new FormData()
+    files.forEach(file => formData.append('files', file))
+    formData.append('mode', options.mode)
+    formData.append('add_source', String(options.addSource))
+    formData.append('dedupe', String(options.dedupe))
+    return uploadClient.post('/table-merge/merge', formData)
+  },
 }

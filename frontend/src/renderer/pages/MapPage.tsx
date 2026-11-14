@@ -3009,7 +3009,7 @@ export function MapPage() {
         <div className="w-4 h-4 flex items-center justify-center">
           <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/><circle cx="12" cy="10" r="3"/></svg>
         </div>
-        <span className="toolbar-label">{captureMode ? (t('map.exitCaptureMode') || '退出打点') : (t('map.extractCoord') || '打点')}</span>
+        <span className="toolbar-label">{t('map.extractCoord') || '定位'}</span>
       </button>
     ),
 
@@ -3428,7 +3428,7 @@ export function MapPage() {
     },
     capture: {
       icon: <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z" /><circle cx="12" cy="10" r="3" /></svg>,
-      label: captureMode ? (t('map.exitCaptureMode') || '退出打点') : (t('map.extractCoord') || '打点'),
+      label: t('map.extractCoord') || '定位',
       active: captureMode,
       onSelect: activateCaptureTool,
     },

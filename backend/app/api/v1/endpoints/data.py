@@ -559,13 +559,16 @@ async def upload_map(
     file: Optional[UploadFile] = File(None),
     files: Optional[List[UploadFile]] = File(None),
     file_path: Optional[str] = Form(None),
+    file_type: Optional[str] = Form(None),
     current_user=Depends(require_data_import),
 ) -> Dict[str, Any]:
     """上传地图文件（支持 MapInfo TAB/MIF、KML、ZIP、离线地图）
-    files: 配套文件列表（与主文件同 stem 的 .dat/.mid/.map/.id 等，浏览器模式补齐关联文件）"""
+    files: 配套文件列表（与主文件同 stem 的 .dat/.mid/.map/.id 等，浏览器模式补齐关联文件）
+    file_type: 用户导入路径（map_layer 图层文件 / current_params 现网工参），
+               写入索引 fileType，前端据此渲染对应类型图标（图层文件与现网工参同为 ZIP，需区分）"""
     try:
         try:
-            print(f"[API] upload_map: file={file}, files={[f.filename for f in files] if files else None}, file_path={file_path}")
+            print(f"[API] upload_map: file={file}, files={[f.filename for f in files] if files else None}, file_path={file_path}, file_type={file_type}")
         except:
             print(f"[API] upload_map: file_path encoding error")
     except:
@@ -574,6 +577,7 @@ async def upload_map(
         result = await data_service.upload_map(
             file, file_path, files=files,
             user_id=current_user.id, city=current_user.city, operator=current_user.operator,
+            file_type=file_type,
         )
         # 清除地图数据缓存
         import app.api.v1.endpoints.map as map_module

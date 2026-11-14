@@ -25,10 +25,13 @@ vi.mock('../../services/api', () => ({
   desktopCloudApi: { appVersion: vi.fn() },
   desktopReleasesApi: { latestPublic: vi.fn() },
   desktopUpdateApi: { status: vi.fn() },
+  // imStore 会 import services/api；这里只做入口渲染，不触发任何请求
+  imApi: {},
 }))
 
 import { WindowTitleBar } from '../WindowTitleBar'
 import { desktopCloudApi, desktopLoginApi } from '../../services/api'
+import { useImStore } from '../../store/imStore'
 
 describe('WindowTitleBar', () => {
   beforeEach(() => {
@@ -43,7 +46,8 @@ describe('WindowTitleBar', () => {
   })
   afterEach(() => {
     cleanup()
-    useAuthStore.setState({ desktopMode: false })
+    useAuthStore.setState({ desktopMode: false, desktopRunMode: null })
+    useImStore.setState({ open: false, unreadTotal: 0 })
   })
 
   it('网页端（非桌面形态）完全不渲染', () => {
@@ -52,15 +56,49 @@ describe('WindowTitleBar', () => {
     expect(container.firstChild).toBeNull()
   })
 
-  it('桌面端渲染四个按钮：下载 | 最小化 | 还原（启动即最大化）| 关闭', async () => {
+  it('桌面端按钮顺序：项目沟通 | 下载 | 最小化 | 还原 | 关闭，且图标风格一致', async () => {
     useAuthStore.setState({ desktopMode: true })
     render(<WindowTitleBar />)
 
-    expect(screen.getByTitle(i18n.t('app.downloadTitle'))).toBeTruthy()
+    const im = screen.getByTitle(i18n.t('im.title'))
+    const download = screen.getByTitle(i18n.t('app.downloadTitle'))
+    expect(im.nextElementSibling).toBe(download) // 项目沟通紧挨下载应用左侧
     expect(screen.getByTitle(i18n.t('titleBar.minimize'))).toBeTruthy()
     expect(screen.getByTitle(i18n.t('titleBar.restore'))).toBeTruthy()
     expect(screen.getByTitle(i18n.t('titleBar.close'))).toBeTruthy()
+
+    const imSvg = im.querySelector('svg')
+    const downloadSvg = download.querySelector('svg')
+    expect(imSvg?.getAttribute('width')).toBe('14')
+    expect(imSvg?.getAttribute('stroke-width')).toBe('1.5')
+    expect(downloadSvg?.getAttribute('width')).toBe('14')
+    expect(downloadSvg?.getAttribute('stroke-width')).toBe('1.5')
     await waitFor(() => expect(desktopLoginApi.windowState).toHaveBeenCalled())
+  })
+
+  it('点击项目沟通按钮切换全局窗口开关', () => {
+    useAuthStore.setState({ desktopMode: true })
+    useImStore.setState({ open: false })
+    render(<WindowTitleBar />)
+    const button = screen.getByTitle(i18n.t('im.title'))
+    fireEvent.click(button)
+    expect(useImStore.getState().open).toBe(true)
+    fireEvent.click(button)
+    expect(useImStore.getState().open).toBe(false)
+  })
+
+  it('有未读消息时项目沟通按钮显示红点', () => {
+    useAuthStore.setState({ desktopMode: true })
+    useImStore.setState({ unreadTotal: 3 })
+    render(<WindowTitleBar />)
+    expect(screen.getByTitle(i18n.t('im.title')).querySelector('.bg-red-500')).toBeTruthy()
+  })
+
+  it('单机模式禁用项目沟通按钮并提示需共享模式', () => {
+    useAuthStore.setState({ desktopMode: true, desktopRunMode: 'standalone' })
+    render(<WindowTitleBar />)
+    const button = screen.getByTitle(i18n.t('im.standaloneHint')) as HTMLButtonElement
+    expect(button.disabled).toBe(true)
   })
 
   it('按钮动作转发 window-control；toggle-maximize 响应回写图标状态', async () => {

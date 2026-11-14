@@ -1,0 +1,512 @@
+/**
+ * 输入工具栏：文字草稿 + 待发送附件（粘贴 / 拖拽 / 选图 / 截图）+ 表情。
+ *
+ * 所有来源只把内容放进本地待发送队列，必须由「发送消息」按钮或 Enter 统一提交；
+ * 粘贴、拖拽、选择文件、截图确认都不会直接调用发送接口。
+ * 截图弹窗由 ImHost 应用级挂载（Alt+Z / 剪刀按钮统一走 requestScreenshot），
+ * 结果经 imStore.pendingScreenshot 队列回到当前会话的输入框。
+ */
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import type {
+  ChangeEvent as ReactChangeEvent, ClipboardEvent as ReactClipboardEvent,
+  DragEvent as ReactDragEvent, KeyboardEvent as ReactKeyboardEvent, ReactNode,
+} from 'react'
+import { useTranslation } from 'react-i18next'
+import {
+  AtSign, File as FileIcon, ImagePlus, Loader2, Paperclip, Scissors, Send, Smile, X,
+} from 'lucide-react'
+
+import { useAuthStore } from '../../store/authStore'
+import { useImStore } from '../../store/imStore'
+import { EMOJI_GROUPS } from './emojis'
+import { ImMentionPopup } from './ImMentionPopup'
+import { requestScreenshot } from './screenshotBus'
+import { formatBytes } from './types'
+import type { ImMember, ImMentionTarget, ImSendMention } from './types'
+
+interface PendingAttachment {
+  id: string
+  file: File
+  previewUrl: string | null
+}
+
+let attachmentSeq = 0
+
+function makeAttachments(files: File[]): PendingAttachment[] {
+  return files.map(file => ({
+    id: `pending-${Date.now()}-${attachmentSeq += 1}`,
+    file,
+    previewUrl: file.type.startsWith('image/') ? URL.createObjectURL(file) : null,
+  }))
+}
+
+function releaseAttachments(items: PendingAttachment[]) {
+  items.forEach(item => { if (item.previewUrl) URL.revokeObjectURL(item.previewUrl) })
+}
+
+/** selector 空数组必须稳定，否则 zustand 每次返回新引用会反复重渲染 */
+const EMPTY_MEMBERS: ImMember[] = []
+/** 光标前最近的 @ 片段（兼容中文/字母数字用户名，最多 32 字） */
+const MENTION_RE = /@([^\s@]{0,32})$/u
+/** 「@所有人」的触发别名，中英文都能命中 */
+const ALL_ALIASES = ['all', 'everyone', '所有人', '所有']
+
+function parseMention(value: string, caret: number): { start: number; query: string } | null {
+  const match = MENTION_RE.exec(value.slice(0, caret))
+  if (!match) return null
+  return { start: caret - match[0].length, query: match[1] }
+}
+
+export function ImComposer({ conversationId }: { conversationId: number }) {
+  const { t } = useTranslation()
+  const [text, setText] = useState('')
+  const [pending, setPending] = useState<PendingAttachment[]>([])
+  const [emojiOpen, setEmojiOpen] = useState(false)
+  const [emojiGroup, setEmojiGroup] = useState(0)
+  const [dragOver, setDragOver] = useState(false)
+  const [notice, setNotice] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [mentionState, setMentionState] = useState<{ start: number; query: string } | null>(null)
+  const [mentionActiveIndex, setMentionActiveIndex] = useState(0)
+  const [pendingMentions, setPendingMentions] = useState<ImSendMention>({
+    mentions: [], mention_all: false,
+  })
+  const mentionRef = useRef<ImSendMention>({ mentions: [], mention_all: false })
+  const textareaRef = useRef<HTMLTextAreaElement>(null)
+  const imageInputRef = useRef<HTMLInputElement>(null)
+  const fileInputRef = useRef<HTMLInputElement>(null)
+  const emojiRef = useRef<HTMLDivElement>(null)
+  const pendingRef = useRef<PendingAttachment[]>([])
+
+  const draftFor = useImStore(s => s.draftFor)
+  const setDraft = useImStore(s => s.setDraft)
+  const sendText = useImStore(s => s.sendText)
+  const sendFiles = useImStore(s => s.sendFiles)
+  const pendingScreenshot = useImStore(s => s.pendingScreenshot)
+  const takeScreenshot = useImStore(s => s.takeScreenshot)
+  const clearError = useImStore(s => s.clearError)
+  const sending = useImStore(s => s.sending)
+  const uploadProgress = useImStore(s => s.uploadProgress)
+  const error = useImStore(s => s.error)
+  const ensureMembers = useImStore(s => s.ensureMembers)
+  const invalidateMembers = useImStore(s => s.invalidateMembers)
+  const setLightbox = useImStore(s => s.setLightbox)
+  const conversation = useImStore(s => s.conversations.find(c => c.id === conversationId) || null)
+  const members = useImStore(s => s.membersByConversation[conversationId]) || EMPTY_MEMBERS
+  const myId = useAuthStore(s => s.user?.id ?? null)
+  const isGroup = conversation !== null && conversation.kind !== 'direct'
+  // 权限口径与服务端 _require_admin 一致：严格按本群 role，不用系统管理员位
+  const canMentionAll = isGroup && myId !== null && members.some(
+    m => m.id === myId && (m.role === 'owner' || m.role === 'admin'))
+
+  useEffect(() => { pendingRef.current = pending }, [pending])
+
+  const clearPending = useCallback(() => {
+    releaseAttachments(pendingRef.current)
+    pendingRef.current = []
+    setPending([])
+  }, [])
+
+  const clearMentions = useCallback(() => {
+    const empty: ImSendMention = { mentions: [], mention_all: false }
+    mentionRef.current = empty
+    setPendingMentions(empty)
+    setMentionState(null)
+    setMentionActiveIndex(0)
+  }, [])
+
+  useEffect(() => {
+    setText(draftFor(conversationId))
+    setNotice('')
+    setEmojiOpen(false)
+    clearPending()
+    clearMentions()
+    // 每次进入会话让成员名单失效，下次输入 @ 会重新拉取，避免其他用户增删成员后名单过期
+    if (isGroup) invalidateMembers(conversationId)
+  }, [conversationId, draftFor, clearPending, clearMentions, isGroup, invalidateMembers])
+
+  // 全局截图（输入框按钮 / Alt+Z）产出的 File 由 imStore 队列送到「当前会话」输入框。
+  // 截图时若还没有激活会话，文件会一直留在队列里，等用户打开任一会话后自动补进来。
+  useEffect(() => {
+    if (!pendingScreenshot) return
+    addFiles([pendingScreenshot])
+    takeScreenshot()
+    textareaRef.current?.focus()
+    // addFiles / takeScreenshot 是稳定引用外的局部函数与 store action，只在队列变化时消费一次
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingScreenshot, takeScreenshot])
+
+  useEffect(() => () => releaseAttachments(pendingRef.current), [])
+
+  // 点面板外关闭；面板内可以连点多个表情，不再点一个就关
+  useEffect(() => {
+    if (!emojiOpen) return
+    const onDown = (event: PointerEvent) => {
+      if (emojiRef.current && !emojiRef.current.contains(event.target as Node)) setEmojiOpen(false)
+    }
+    document.addEventListener('pointerdown', onDown)
+    return () => document.removeEventListener('pointerdown', onDown)
+  }, [emojiOpen])
+
+  const updateText = (value: string) => {
+    setText(value)
+    setDraft(value)
+  }
+
+  const mentionTargets = useMemo<ImMentionTarget[]>(() => {
+    if (!isGroup || !mentionState) return []
+    const keyword = mentionState.query.toLowerCase()
+    const allLabel = t('im.mention.allLabel', '@所有人')
+    const list: ImMentionTarget[] = []
+    if (canMentionAll && (!keyword || ALL_ALIASES.some(alias => alias.includes(keyword))
+        || allLabel.toLowerCase().includes(keyword))) {
+      list.push({ id: 'all', username: allLabel })
+    }
+    for (const member of members) {
+      if (member.id === myId) continue
+      if (keyword && !member.username.toLowerCase().includes(keyword)) continue
+      list.push({ id: member.id, username: member.username, is_online: member.is_online })
+      if (list.length >= 30) break
+    }
+    return list
+  }, [isGroup, mentionState, canMentionAll, members, myId, t])
+
+  const onTextChange = (event: ReactChangeEvent<HTMLTextAreaElement>) => {
+    const value = event.target.value
+    updateText(value)
+    if (!isGroup) return
+    const parsed = parseMention(value, event.target.selectionStart ?? value.length)
+    setMentionState(parsed)
+    setMentionActiveIndex(0)
+    if (parsed) void ensureMembers(conversationId)
+  }
+
+  const selectMention = (target: ImMentionTarget) => {
+    if (!mentionState) return
+    const el = textareaRef.current
+    const caret = el?.selectionStart ?? text.length
+    const before = text.slice(0, mentionState.start)
+    const after = text.slice(caret)
+    const insert = `@${target.username.replace(/^@/, '')} `
+    updateText(before + insert + after)
+
+    const next: ImSendMention = {
+      mentions: [...mentionRef.current.mentions],
+      mention_all: mentionRef.current.mention_all,
+    }
+    if (target.id === 'all') next.mention_all = true
+    else if (!next.mentions.includes(target.id)) next.mentions.push(target.id)
+    mentionRef.current = next
+    setPendingMentions(next)
+    setMentionState(null)
+    setMentionActiveIndex(0)
+    window.requestAnimationFrame(() => {
+      const pos = before.length + insert.length
+      el?.setSelectionRange(pos, pos)
+      el?.focus()
+    })
+  }
+
+  const onComposerKeyDown = (event: ReactKeyboardEvent<HTMLTextAreaElement>) => {
+    if (mentionState && mentionTargets.length > 0) {
+      if (event.key === 'ArrowDown') {
+        event.preventDefault()
+        setMentionActiveIndex(index => (index + 1) % mentionTargets.length)
+        return
+      }
+      if (event.key === 'ArrowUp') {
+        event.preventDefault()
+        setMentionActiveIndex(index => (index - 1 + mentionTargets.length) % mentionTargets.length)
+        return
+      }
+      // 中文输入法选字期间的 Enter 不参与候选选择，也不发送消息
+      if ((event.key === 'Enter' || event.key === 'Tab') && !event.nativeEvent.isComposing) {
+        event.preventDefault()
+        selectMention(mentionTargets[mentionActiveIndex])
+        return
+      }
+      if (event.key === 'Escape') {
+        event.preventDefault()
+        setMentionState(null)
+        return
+      }
+    }
+    if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
+      event.preventDefault()
+      void submit()
+    }
+  }
+
+  const addFiles = (files: FileList | File[] | null) => {
+    if (!files || !files.length) return
+    const next = makeAttachments(Array.from(files))
+    pendingRef.current = [...pendingRef.current, ...next]
+    setPending(prev => [...prev, ...next])
+  }
+
+  const removeAttachment = (id: string) => {
+    releaseAttachments(pendingRef.current.filter(item => item.id === id))
+    pendingRef.current = pendingRef.current.filter(item => item.id !== id)
+    setPending(prev => prev.filter(item => item.id !== id))
+  }
+
+  /** 双击待发送附件打开预览：图片走可缩放灯箱，文件走新标签页 / 文件卡片 */
+  const previewAttachment = (item: PendingAttachment) => {
+    setLightbox({ name: item.file.name, mime: item.file.type || 'application/octet-stream', file: item.file })
+  }
+
+  /** 唯一的发送出口：文字 + 全部待发送附件一起提交 */
+  const submit = async () => {
+    const value = text.trim()
+    const files = pendingRef.current.map(item => item.file)
+    const mentionPayload = mentionRef.current
+    const hasMention = mentionPayload.mentions.length > 0 || mentionPayload.mention_all
+    if ((!value && !files.length) || busy || sending) return
+    setBusy(true)
+    updateText('')
+    clearPending()
+    setMentionState(null)
+    try {
+      let textOk = true
+      if (value) {
+        textOk = hasMention
+          ? await sendText(value, mentionPayload)
+          : await sendText(value)
+        // 失败保留草稿与结构化 @，点发送即可重发
+        if (!textOk) updateText(value)
+      }
+      if (textOk && hasMention) clearMentions()
+      if (files.length) {
+        const failed = await sendFiles(files)
+        if (failed.length) {
+          const restored = makeAttachments(failed)
+          pendingRef.current = restored
+          setPending(restored)
+        }
+      }
+    } finally {
+      setBusy(false)
+      textareaRef.current?.focus()
+    }
+  }
+
+  // 绑定在整个输入区而不是 textarea：焦点在工具栏/附件预览上时粘贴截图也能接住。
+  // 纯文本不 preventDefault，仍由聚焦的 textarea 默认插入草稿，绝不自动发送。
+  const onPaste = (event: ReactClipboardEvent<HTMLDivElement>) => {
+    const files = Array.from(event.clipboardData?.items || [])
+      .filter(item => item.kind === 'file')
+      .map(item => item.getAsFile())
+      .filter((file): file is File => Boolean(file))
+    if (files.length) {
+      event.preventDefault()
+      addFiles(files)
+    }
+  }
+
+  const onDrop = (event: ReactDragEvent<HTMLDivElement>) => {
+    event.preventDefault()
+    setDragOver(false)
+    addFiles(event.dataTransfer.files)
+  }
+
+  const disabled = (!text.trim() && pending.length === 0) || busy || sending
+  const hasPendingMention = pendingMentions.mention_all || pendingMentions.mentions.length > 0
+
+  return (
+    <div
+      className={`relative flex flex-col border-t border-border/60 bg-card/80 backdrop-blur-sm transition-colors
+        ${dragOver ? 'bg-primary/5' : ''}`}
+      onDragOver={event => { event.preventDefault(); setDragOver(true) }}
+      onDragLeave={() => setDragOver(false)}
+      onDrop={onDrop}
+      onPaste={onPaste}
+    >
+      {dragOver && (
+        <div className="pointer-events-none absolute inset-2 z-10 flex items-center justify-center rounded-xl border-2 border-dashed border-primary/60 bg-primary/5 text-sm font-medium text-primary">
+          {t('im.composer.dropHint', '松开即可添加为待发送附件')}
+        </div>
+      )}
+
+      {isGroup && mentionState && (
+        <ImMentionPopup
+          targets={mentionTargets}
+          activeIndex={mentionActiveIndex}
+          onSelect={selectMention}
+          onHover={setMentionActiveIndex}
+        />
+      )}
+
+      {pending.length > 0 && (
+        <div className="border-b border-border/50 px-3 py-2">
+          <div className="mb-1.5 flex items-center gap-1.5 text-[11px] text-muted-foreground">
+            <Paperclip size={12} />
+            <span className="flex-1">
+              {t('im.composer.pendingTitle', {
+                defaultValue: '待发送附件 · {{count}}', count: pending.length,
+              })}
+            </span>
+            <button type="button" onClick={clearPending}
+                    className="hover:text-foreground cursor-pointer">
+              {t('im.composer.clearAll', '清空附件')}
+            </button>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            {pending.map(item => (
+              <div key={item.id}
+                   onDoubleClick={() => previewAttachment(item)}
+                   title={t('im.composer.doubleClickPreview', '双击预览')}
+                   className="relative flex max-w-[220px] cursor-pointer items-center gap-2 rounded-lg border border-border/70 bg-background/60 p-1.5 pr-6 hover:border-primary/50">
+                {item.previewUrl
+                  ? <img src={item.previewUrl} alt={item.file.name}
+                         className="h-9 w-9 shrink-0 rounded object-cover" />
+                  : <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded bg-primary/10 text-primary">
+                      <FileIcon size={17} />
+                    </div>}
+                <div className="min-w-0">
+                  <p className="truncate text-[11px] font-medium">{item.file.name}</p>
+                  <p className="text-[10px] text-muted-foreground">{formatBytes(item.file.size)}</p>
+                </div>
+                <button type="button" onClick={() => removeAttachment(item.id)}
+                        onDoubleClick={event => event.stopPropagation()}
+                        title={t('im.composer.removeAttachment', '移除附件')}
+                        className="absolute right-1 top-1 flex h-4 w-4 items-center justify-center rounded-full text-muted-foreground hover:bg-destructive/15 hover:text-destructive cursor-pointer">
+                  <X size={11} />
+                </button>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {uploadProgress && (
+        <div className="flex items-center gap-2 border-b border-border/50 px-4 py-2 text-xs text-muted-foreground">
+          <Loader2 size={13} className="animate-spin text-primary" />
+          <span className="max-w-[180px] truncate">
+            {t('im.composer.uploading', {
+              defaultValue: '正在发送 {{name}}', name: uploadProgress.name,
+            })}
+          </span>
+          <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-muted">
+            <div className="h-full rounded-full bg-primary transition-all"
+                 style={{ width: `${uploadProgress.percent}%` }} />
+          </div>
+          <span>{uploadProgress.percent}%</span>
+        </div>
+      )}
+      {(notice || error) && (
+        <div className="flex items-center gap-2 border-b border-border/50 px-4 py-1.5 text-[11px] text-amber-500">
+          <span className="flex-1 truncate">{notice || (error ? t(error) : '')}</span>
+          <button type="button" className="cursor-pointer hover:text-foreground"
+                  onClick={() => { setNotice(''); clearError() }}>
+            <X size={12} />
+          </button>
+        </div>
+      )}
+
+      <div className="flex items-center gap-1 px-3 pt-2">
+        <ToolButton title={t('im.composer.sendImage', '添加图片')}
+                    onClick={() => imageInputRef.current?.click()}>
+          <ImagePlus size={17} />
+        </ToolButton>
+        <ToolButton title={t('im.composer.screenshot', '截图（Alt+Z）')}
+                    onClick={requestScreenshot}>
+          <Scissors size={17} />
+        </ToolButton>
+        <ToolButton title={t('im.composer.sendFile', '添加文件')}
+                    onClick={() => fileInputRef.current?.click()}>
+          <Paperclip size={17} />
+        </ToolButton>
+        <div className="relative" ref={emojiRef}>
+          <ToolButton title={t('im.composer.emoji', '表情')}
+                      onClick={() => setEmojiOpen(value => !value)}>
+            <Smile size={17} />
+          </ToolButton>
+          {emojiOpen && (
+            <div className="absolute bottom-10 left-0 z-20 w-[286px] rounded-xl border border-border bg-popover p-2 shadow-xl">
+              <div className="mb-1.5 flex gap-0.5 border-b border-border/60 pb-1.5">
+                {EMOJI_GROUPS.map((group, index) => (
+                  <button key={group.key} type="button" title={t(group.key)}
+                          onClick={() => setEmojiGroup(index)}
+                          className={`flex h-7 flex-1 items-center justify-center rounded-md text-base transition-colors cursor-pointer
+                            ${emojiGroup === index ? 'bg-primary/15' : 'hover:bg-accent'}`}>
+                    {group.icon}
+                  </button>
+                ))}
+              </div>
+              <p className="mb-1 px-0.5 text-[10px] text-muted-foreground">
+                {t(EMOJI_GROUPS[emojiGroup].key)}
+              </p>
+              <div className="grid max-h-[168px] grid-cols-8 gap-0.5 overflow-y-auto">
+                {EMOJI_GROUPS[emojiGroup].emojis.map((emoji, index) => (
+                  <button key={`${emojiGroup}-${index}`} type="button"
+                          onClick={() => {
+                            updateText((textareaRef.current?.value ?? text) + emoji)
+                            textareaRef.current?.focus()
+                          }}
+                          className="flex h-8 w-8 items-center justify-center rounded-lg text-lg hover:bg-accent cursor-pointer">
+                    {emoji}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+        {hasPendingMention && (
+          <button type="button" onClick={clearMentions}
+                  title={t('im.mention.clear', '清除 @')}
+                  className="flex items-center gap-1 rounded-md bg-primary/10 px-2 py-0.5 text-[10px] text-primary hover:bg-primary/20 cursor-pointer">
+            <AtSign size={11} />
+            {pendingMentions.mention_all
+              ? t('im.mention.allLabel', '@所有人')
+              : t('im.mention.count', {
+                defaultValue: '@ {{count}} 人', count: pendingMentions.mentions.length,
+              })}
+            <X size={10} />
+          </button>
+        )}
+      </div>
+
+      <div className="flex items-end gap-2 px-3 pb-3 pt-1.5">
+        <textarea
+          ref={textareaRef}
+          value={text}
+          rows={2}
+          onChange={onTextChange}
+          onKeyDown={onComposerKeyDown}
+          placeholder={t('im.composer.placeholder', '输入消息，输入 @ 可点名成员，粘贴截图/拖入文件后确认再发送…')}
+          className="max-h-28 min-h-[54px] flex-1 resize-none rounded-xl border border-border/70 bg-background/70 px-3 py-2 text-[13px] leading-relaxed text-foreground outline-none transition-colors placeholder:text-muted-foreground/70 focus:border-primary/70 focus:ring-2 focus:ring-primary/15"
+        />
+        <button
+          type="button"
+          onClick={() => void submit()}
+          disabled={disabled}
+          title={t('im.composer.sendMessage', '发送消息')}
+          className="flex h-[54px] w-[54px] shrink-0 items-center justify-center rounded-xl bg-primary text-primary-foreground shadow-lg transition-all hover:brightness-110 active:scale-95 disabled:cursor-not-allowed disabled:opacity-40 disabled:shadow-none"
+        >
+          {busy || sending ? <Loader2 size={19} className="animate-spin" /> : <Send size={19} />}
+        </button>
+      </div>
+
+      <input ref={imageInputRef} type="file" accept="image/*" multiple hidden
+             onChange={event => { addFiles(event.target.files); event.target.value = '' }} />
+      <input ref={fileInputRef} type="file" multiple hidden
+             onChange={event => { addFiles(event.target.files); event.target.value = '' }} />
+
+    </div>
+  )
+}
+
+function ToolButton({ title, onClick, children }: {
+  title: string
+  onClick: () => void
+  children: ReactNode
+}) {
+  return (
+    <button
+      type="button" title={title} onClick={onClick}
+      className="flex h-8 w-8 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-accent hover:text-primary cursor-pointer"
+    >
+      {children}
+    </button>
+  )
+}

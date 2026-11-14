@@ -536,6 +536,10 @@ export interface UserInfo {
   created_at: string | null
   city: string | null
   operator: string | null
+  /** 裁剪后的 base64 头像 data URL；null 为默认首字母头像 */
+  avatar?: string | null
+  /** 协作沟通昵称（仅 IM 展示名生效，不改登录账号 username）；null / 空串回落 username */
+  nickname?: string | null
   user_type?: 'pc' | 'app'
   /** 桌面版登录时选择的运行模式（网页端为 null） */
   desktop_run_mode?: 'shared' | 'standalone' | null
@@ -551,6 +555,22 @@ export interface TokenResponse {
   access_token: string
   token_type: string
   user: UserInfo
+}
+
+/**
+ * 用户上线事件：登录成功时由服务端通过 WebSocket 广播。
+ * 只推给「除上线者自身以外的其他用户端」，自身登录不弹气泡、不响敲门声。
+ */
+export interface OnlineEvent {
+  eventId: string
+  userId?: number | null
+  username: string
+  city: string
+  operator: string
+  isAdmin: boolean
+  clientType: string
+  /** 提示文案，如「河源_电信 admin」 */
+  text: string
 }
 
 export interface LoginRequest {

@@ -19,7 +19,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **规划**：PCI 规划（碰撞/混淆、模 3/模 30）、邻区规划（覆盖圆）、TAC 核查与 TAC 规划（异 TAC 孤岛/插花）
 - **地图**：在线（高德/OSM）/离线地图、工参扇区渲染、专题图层、值热力面、标签防重叠、图层制作与编辑（TAB/MIF/KML）、绘制/测量/圈选/节点合并、条件选择、缓冲区、图例与导出
 - **数据**：Excel/CSV/TXT/TAB/MIF 上传、全量工参、小区查询/批量更新、新站录入、地理化数据
-- **工具**：批量距离匹配、站间距、频点换算（LTE/NR/GSCN）
+- **工具**：批量距离匹配、站间距、频点换算（LTE/NR/GSCN）、表格合并（多文件同格式合并为一个文件）
 - **平台**：用户与权限、数据组隔离、网优助手（LLM）、APP 版本管理、许可证
 
 ## 常用开发命令
@@ -219,6 +219,8 @@ FastAPI (backend/app/)
 | `/distance-match` | `DistanceMatchPage` | 批量距离匹配 |
 | `/site-spacing` | `SiteSpacingPage` | 站间距计算 |
 | `/frequency-conversion` | `FrequencyConversionPage` | 频点换算 |
+| `/intermodulation` | `IntermodulationPage` | 三阶互调评估 |
+| `/table-merge` | `TableMergePage` | 表格合并（多文件同格式合并为一个 Excel，按表头结构或工作表名分组） |
 | `/admin/users` | `AdminUsersPage` | 用户管理（`requireAdmin`） |
 | `/app-versions` | `AppVersionsPage` | APP 版本管理（`requireAdmin`） |
 | `/assistant` | `AssistantPage` | 网优助手（`requirePermission="can_assistant"`） |
@@ -243,6 +245,7 @@ FastAPI (backend/app/)
 | `pci.py` / `neighbor.py` / `tac.py` | `/api/v1/pci` 等 | 规划/核查、进度、结果、历史、导出、应用到工参 |
 | `distance_match.py` | `/api/v1/distance-match` | 批量距离匹配 |
 | `site_spacing.py` | `/api/v1/site-spacing` | 站间距计算 |
+| `table_merge.py` | `/api/v1/table-merge` | 表格合并：`/inspect` 解析多文件多 sheet 并给出分组预览、`/merge` 按表头结构或工作表名合并输出单个 Excel（`/static` 下载） |
 | `attribute_join.py` | `/api/v1/attribute-join` | 条件选择（图层属性空间连接） |
 | `buffer.py` | `/api/v1/buffer` | 绘制缓冲区 |
 | `map.py` | `/api/v1/map` | 地图数据/小区/扇区、缓存清理、在线与离线配置 |
@@ -449,3 +452,16 @@ NPT_DESKTOP_SYNC_DEBOUNCE_SECONDS         # 本地改动上行防抖秒数，默
 - **桌面端 OTA 安装卡住 / 关不掉程序**：升级脚本在 `%APPDATA%\NetworkPlanningTool\updates\`，安装日志 `npt_setup.log`、运行日志 `logs/desktop.log`（关注「注入桌面桥接退出回调失败」「强制结束进程」）；脚本 60 秒等不到退出会 `taskkill`，应用侧 20 秒兜底 `os._exit`（后台更新模式下关窗不武装、等下载等待结束才武装，避免下载被杀在半路）；点「重启并安装」后版本没变时先看 `updates/npt_ota_result.txt`（`setup_rc` 非 0 = 安装器未成功，实际错误见同目录 `npt_setup.log`；`install_dir` 为注册表记录的实际安装目录、`restarted` 为实际拉起路径，配合 `updates/installed_version.json` 可判断"装到哪儿、装了什么版本"）——脚本先按当前运行目录 `/DIR` 安装、失败退回默认目录重试，重启优先从注册表 `InstallLocation` 拉起；若安装包自带控制台窗口，说明构建时 `NPT_CONSOLE` 不是 0（tag 发行由 CI 用 0 重新打包）
 - **GDAL 安装失败**：用预编译 wheel 或 conda 安装
 - **编码错误（如导入报 `'gbk' codec can't encode character '\U0001f534' ...`）**：`app/core/console_encoding.setup_console_encoding()` 已统一给 print 与 stdout/stderr 兜底（网页端 `main.py`、桌面端 `desktop/launcher.py` 各自在最早处调用）；若仍复现，多半是新加的 print/日志带了 emoji 等 GBK 外字符（改用纯文本标记），或该执行路径没经过两个入口之一
+
+## 协作沟通（IM）
+
+- **入口**：网页端为右下角「协作沟通」悬浮图标（`components/Im/ImHost.tsx`，挂在 `MainLayout` 的 `<main>` 外），尺寸/配色与「下载应用」悬浮图标一致（44px 圆形卡片、18px 线性图标），可拖拽吸附并按用户持久化。桌面端入口在自绘标题栏 `WindowTitleBar.tsx` 的「应用下载」按钮**左侧**，同款 `BUTTON_CLASS` 与 14px/1.5 图标；桌面端不渲染悬浮图标，但 `ImHost` 仍负责事件注册、轮询与窗口渲染。点击展开 `fixed z-[6000]` 可拖拽 / 8 向缩放窗口，右上角只留「最大化/还原」「关闭」（置顶与最小化已移除），关闭仅隐藏回入口，草稿与会话状态保留。`ImWindow` 用 `React.lazy` 独立分包。
+- **视图**：左侧「消息 / 通讯录」双 Tab；消息 = 近期个人或群组会话（摘要、时间、未读），通讯录 = 全站用户（在线 / 离线）+ **已加入的**自动数据组群 / 自建跨组群（后端 `list_contacts` 仍返回全站群并带 `joined` 标记，前端只渲染 `joined=true`，未加入的群不可点，避免非成员读消息 404 落到空态）。支持文字、图片、截图（来源卡片网格 + 本次图片素材缩略图列表，捕获 / 粘贴 / 选图都追加一张并自动进入编辑，点任意缩略图可重新编辑 → 裁剪框 + 矩形 / 圆形 / 直线 / 单箭头 / 文字备注 / 马赛克涂抹画笔，颜色可预设或自定义，支持撤销、清空、最大化 → 添加到待发送附件并同时复制剪贴板，可下载 PNG；`getDisplayMedia` / 剪贴板只在 HTTPS/localhost 安全上下文可用，HTTP 内网地址降级为 HTTPS 引导 + 系统截图粘贴 / 选图；共享其它应用窗口后网页端尽力聚焦并提示切回，Windows 桌面端经 `window-control activate` 用 Win32 把主窗口拉回前台）、表格文档与任意文件；粘贴 / 拖拽 / 选图 / 截图只进入「待发送列表」，由发送按钮或 Enter 统一提交。群聊输入 `@` 下拉选成员，`@所有人` 仅群主/群管理员可用；气泡高亮 @ 文本并显示「@我 / @所有人」标签，被 @ 时弹 Toast + 播专用上行三音提示音。
+- **后端**：`/api/v1/im/*`（`api/v1/endpoints/im.py`），6 张表 `im_conversations / im_conversation_members / im_messages / im_message_mentions / im_attachments / im_group_meta`（`im_messages.mention_all` 列由 `init_db()` 的 `PRAGMA table_info` 迁移补齐），新表由 `create_all` 自动建。业务核心 `services/im_service.py`、附件 `im_attachment_service.py`、操作白名单 `im_ops.py`。结构化 @ 名单在发送时刻展开并固化，`_serialize_message` 按请求者计算 `mentioned_me`；@所有人 权限复用 `_require_admin` 的群角色 `owner/admin`，**不使用** `users.is_admin`（自动群无 owner/admin 时无人可 @所有人）。群成员数以成员关系表为唯一真源：`_sync_meta_count` 计数前必须 `db.flush()`（`SessionLocal` 为 `autoflush=False`，否则新建群统计到 0），`list_contacts` / `list_conversations` 一次 `GROUP BY` 批量取真实数并幂等回写 `im_group_meta.member_count`，自愈存量错误值。
+- **实时**：消息以 SQLite 为唯一真源，复用 `/api/v1/ws/tasks` 单连接只推 `im_message` / `im_presence` 轻通知（`websocket_manager.send_to_users`），`im_message` 载荷带 `mention_all` / `mentioned_user_ids`（@所有人 时置空、仅带布尔量）。前端按 `after_id` 游标增量拉取并按 `message_id` 去重；WS 断线由可见窗口轮询（网页 15s / 桌面共享 5s）兜底，两条路径的 @ 提醒按 messageId 去重。
+- **隔离边界**：通讯录全员可见但只返回身份投影（id / username / is_online / city / operator）；IM 会话可见性由 `im_conversation_members` 判定，与业务数据 `(city, operator)` 组过滤完全解耦，业务门禁零改动。
+- **桌面共享**：本机 `/api/v1/im/*` 由 `services/im_desktop_proxy.py` 转发到线上 `POST /api/v1/desktop-cloud/im/relay`，凭证是 JSON body 里的 `license_file` + `machine_code`（**不是自定义签名头**），线上复用 `_verify_license` 并从 `DesktopLicense.user_id/username` 解析真实用户。单机模式禁用标题栏协作沟通按钮，移动端仅接口预留。
+- **附件**：落 `PROFILE_ROOT/uploads/im/<conversation_id>/`，UUID 重命名、扩展名白名单、`NPT_IM_MAX_FILE_MB`（默认 20MB，桌面共享经 JSON relay 限 5MB）、路径穿越防护；下载 / 缩略图走 `/api/v1/im/attachments/{id}` 的 blob + Bearer，不使用 `/static`。
+- **配置**：`NPT_IM_ATTACHMENT_DIR`、`NPT_IM_MAX_FILE_MB`、`NPT_IM_MESSAGE_PAGE_SIZE`、`NPT_IM_MAX_MEMBERS_PER_GROUP`、`NPT_IM_DESKTOP_POLL_MS`。
+- **切账号**：`authStore.clearUserDataCaches()` 动态 import `imStore.resetForUserSwitch()`，清消息 / 未读 / 订阅 / 轮询 / 群成员缓存 / @ 去重记录。
+- 完整契约与分阶段路线见 `docs/协作沟通设计方案.md`。

@@ -26,14 +26,19 @@ import { useAuthStore } from '../../store/authStore'
 import { useThemeStore } from '../../store/themeStore'
 import { reloadUserMapSettings } from '../../store/mapStore'
 import { Toaster } from './Toaster'
+import { UserOnlineBubble } from './UserOnlineBubble'
 import { GuideTipsHost } from '../GuideTipsHost'
+import { ImHost } from '../Im/ImHost'
 import { DesktopUpdateDialog } from '../DesktopUpdateDialog'
 import { DesktopUpdateReadyDialog } from '../DesktopUpdateReadyDialog'
 import { DesktopSyncIndicator } from '../DesktopSyncIndicator'
 import { useDesktopStatusLabel } from '../desktopStatusLabel'
 import { DesktopSessionGuard } from '../DesktopSessionGuard'
 import { AppDownloadDialog } from '../AppDownloadDialog'
-import { ChangePasswordDialog } from '../ChangePasswordDialog'
+import { UserSettingsDialog } from '../UserSettingsDialog'
+import { ImAvatar } from '../Im/ImAvatar'
+import { USER_SETTINGS_EVENT } from '../Im/userSettingsBus'
+import type { UserSettingsMode } from '../Im/userSettingsBus'
 import { prefetchPage } from '../../pageLoaders'
 
 // ===== APP 悬浮图标：可拖拽移动、松手吸附最近左右边缘，位置按登录用户持久化 =====
@@ -107,8 +112,10 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
   const [userInfoPinned, setUserInfoPinned] = useState(false)
   const userInfoRef = useRef<HTMLDivElement>(null)
   const showUserInfo = userInfoHovered || userInfoPinned
-  // 用户信息浮层中的「修改密码」弹窗（所有登录用户均可用）
-  const [showChangePassword, setShowChangePassword] = useState(false)
+  // 用户设置弹窗（所有登录用户均可用）：修改密码统一收口在「设置」里，
+  // 不再从用户冒泡框单独提供「修改密码」入口。mode 决定弹窗展示哪一组内容。
+  const [showUserSettings, setShowUserSettings] = useState(false)
+  const [userSettingsMode, setUserSettingsMode] = useState<UserSettingsMode>('app')
 
   useEffect(() => {
     if (!userInfoPinned) return
@@ -118,6 +125,17 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
     document.addEventListener('mousedown', onDocMouseDown)
     return () => document.removeEventListener('mousedown', onDocMouseDown)
   }, [userInfoPinned])
+
+  // 协作沟通侧栏底部的头像 / 齿轮入口复用同一个用户设置弹窗，按 mode 切换内容
+  useEffect(() => {
+    const onOpen = (event: Event) => {
+      const mode = (event as CustomEvent<UserSettingsMode>).detail
+      setUserSettingsMode(mode === 'im' ? 'im' : 'app')
+      setShowUserSettings(true)
+    }
+    window.addEventListener(USER_SETTINGS_EVENT, onOpen)
+    return () => window.removeEventListener(USER_SETTINGS_EVENT, onOpen)
+  }, [])
 
   const navigation: NavItem[] = [
     { type: 'link', name: t('nav.home'), href: '/', icon: Home },
@@ -156,6 +174,7 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
         { type: 'link', name: t('nav.siteSpacing'), href: '/site-spacing' },
         { type: 'link', name: t('nav.freqConversion'), href: '/frequency-conversion' },
         { type: 'link', name: t('nav.im3Evaluation'), href: '/intermodulation' },
+        { type: 'link', name: t('nav.tableMerge'), href: '/table-merge' },
       ],
     },
     { type: 'link', name: t('nav.config'), href: '/license', icon: Shield },
@@ -391,20 +410,26 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
               <div className="flex-shrink-0 w-6 flex justify-center">
                 <Boxes size={20} className="text-primary" />
               </div>
-              <span
-                className="text-sm font-semibold text-foreground"
-                style={{
-                  opacity: sidebarOpen ? 1 : 0,
-                  maxWidth: sidebarOpen ? '120px' : '0px',
-                  transition: 'opacity 0.2s cubic-bezier(0.4, 0, 0.2, 1), max-width 0.3s cubic-bezier(0.4, 0, 0.2, 1)',
-                  whiteSpace: 'nowrap',
-                  overflow: 'hidden',
-                  textOverflow: 'ellipsis',
-                  display: 'block',
-                }}
-              >
-                {desktopStatus?.appName || t('common.appName', '网优引擎')}
-              </span>
+              {/* 标题外再包一层 relative 容器：上线提醒气泡贴在「网优引擎」右侧，
+                  绝对定位不占布局，气泡溢出侧栏也不会被标题的 overflow:hidden 裁掉 */}
+              <div className="relative inline-block align-middle">
+                <span
+                  className="text-sm font-semibold text-foreground"
+                  style={{
+                    opacity: sidebarOpen ? 1 : 0,
+                    maxWidth: sidebarOpen ? '120px' : '0px',
+                    transition: 'opacity 0.2s cubic-bezier(0.4, 0, 0.2, 1), max-width 0.3s cubic-bezier(0.4, 0, 0.2, 1)',
+                    whiteSpace: 'nowrap',
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    display: 'inline-block',
+                    verticalAlign: 'middle',
+                  }}
+                >
+                  {desktopStatus?.appName || t('common.appName', '网优引擎')}
+                </span>
+                <UserOnlineBubble />
+              </div>
             </div>
             {/* 桌面端运行模式/同步状态不再在侧栏重复展示：窗口标题栏已有同一份文案
                 （DesktopSyncIndicator → desktopStatusLabel.title → 本机窗口标题） */}
@@ -604,9 +629,7 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
                   style={{ paddingLeft: '6px', paddingRight: '6px', gap: '8px' }}
                 >
                   <div className="flex-shrink-0 w-6 flex justify-center">
-                    <div className="w-6 h-6 rounded-full bg-primary/20 flex items-center justify-center">
-                      <span className="text-xs text-primary font-medium">{user.username.charAt(0).toUpperCase()}</span>
-                    </div>
+                    <ImAvatar name={user.username} avatar={user.avatar} kind="user" size={24} rounded="full" />
                   </div>
                   {/* 所属组（地市·运营商）：侧栏展开时显示；收起时仅头像，组信息仍在悬浮浮层中 */}
                   {sidebarOpen && (user.city || user.operator) && (
@@ -628,18 +651,23 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
                     className="absolute left-full bottom-1 ml-2 z-[3000] w-56 rounded-lg border border-border bg-card px-3 py-2 shadow-lg"
                   >
                     <div className="flex items-center justify-between gap-2">
-                      <div className="text-sm font-medium text-foreground break-all">{user.username}</div>
+                      <div className="flex min-w-0 items-center gap-2">
+                        <ImAvatar name={user.username} avatar={user.avatar} kind="user" size={28} rounded="full" />
+                        <div className="min-w-0 text-sm font-medium text-foreground break-all">{user.username}</div>
+                      </div>
                       <button
                         type="button"
                         onClick={(e) => {
                           e.stopPropagation()
                           setUserInfoPinned(false)
                           setUserInfoHovered(false)
-                          setShowChangePassword(true)
+                          setUserSettingsMode('app')
+                          setShowUserSettings(true)
                         }}
-                        className="shrink-0 whitespace-nowrap text-xs text-primary hover:underline"
+                        className="flex shrink-0 items-center gap-1 whitespace-nowrap rounded-md bg-primary/10 px-2 py-1 text-xs text-primary hover:bg-primary/20"
                       >
-                        {t('auth.changePassword', '修改密码')}
+                        <Settings size={12} />
+                        {t('im.settings.title', '设置')}
                       </button>
                     </div>
                     <div className="mt-1 text-xs text-muted-foreground break-all">
@@ -726,7 +754,8 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
       </div>
 
       {/* 应用下载悬浮图标（仅网页端：桌面端入口已迁到自绘标题栏 WindowTitleBar）：
-          可拖拽移动，默认吸附右侧中部，位置按用户持久化；点击打开下载弹窗 */}
+          可拖拽移动，默认吸附右侧中部，位置按用户持久化；点击打开下载弹窗。
+          协作沟通悬浮图标在 ImHost 中，样式/尺寸与本图标保持一致 */}
       {!desktopMode && (
         <button
           onPointerDown={onAppIconPointerDown}
@@ -749,8 +778,12 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
 
       {/* 应用下载弹窗（手机APP / 电脑端）- 放在 main 外部避免地图组件层叠上下文遮挡 */}
       <AppDownloadDialog open={showAppDownload} onClose={() => setShowAppDownload(false)} />
-      {/* 修改密码：成功后由 authStore.logout 切到登录页，弹窗随 MainLayout 一起卸载 */}
-      <ChangePasswordDialog open={showChangePassword} onClose={() => setShowChangePassword(false)} />
+      {/* 用户设置：修改密码统一在此（app 模式）；协作沟通入口为 im 模式（头像 + 昵称） */}
+      <UserSettingsDialog
+        open={showUserSettings}
+        mode={userSettingsMode}
+        onClose={() => setShowUserSettings(false)}
+      />
       <Toaster />
       {/* 页面冒泡引导：所有登录用户；停留 3 秒触发、同刻只显示一条；登录周期内每条一次、累计 30 次后停止 */}
       <GuideTipsHost />
@@ -758,6 +791,9 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
       <DesktopUpdateDialog />
       {/* 后台下载完成后的「重启更新 / 稍后更新」提示 */}
       <DesktopUpdateReadyDialog />
+      {/* 协作沟通：放 main 外避免地图层叠上下文裁切。网页端渲染悬浮入口 + 窗口；
+          桌面端入口已迁到 WindowTitleBar（下载应用左侧），此处仅保留窗口与事件/轮询 */}
+      <ImHost />
     </div>
   )
 }

@@ -79,6 +79,60 @@ def is_target_cells_filename(filename: str) -> bool:
     return any(name.startswith(p) for p in TARGET_CELLS_PREFIXES)
 
 
+# === 现网工参（中兴网管导出 ZIP 包）识别契约 ===
+# 网管 300 脚本导出包固定以 BaselineLab 开头（如 BaselineLab_20261111120000.zip），
+# 与「图层文件」同为 ZIP，不能只靠扩展名区分。
+CURRENT_PARAMS_PREFIX = "baselinelab"
+CURRENT_PARAMS_CSV_PATTERNS = (
+    r"LTE_SDR_CellInfo_.*\.csv",
+    r"LTE_ITBBU_CellInfo_.*\.csv",
+    r"NR_CellInfo_.*\.csv",
+)
+VECTOR_LAYER_SUFFIXES = (".mif", ".tab", ".kml", ".shp", ".geojson")
+
+
+def is_current_params_filename(filename: str) -> bool:
+    """识别现网工参包名/包内文件名（BaselineLab*，大小写不敏感）。"""
+    return (filename or "").strip().lower().startswith(CURRENT_PARAMS_PREFIX)
+
+
+def is_current_params_name(filename: str) -> bool:
+    """文件名是否具备现网工参特征（BaselineLab 前缀或网管 CellInfo CSV）。"""
+    name = (filename or "").strip()
+    if not name:
+        return False
+    if is_current_params_filename(name):
+        return True
+    return any(re.match(pat, name, re.IGNORECASE) for pat in CURRENT_PARAMS_CSV_PATTERNS)
+
+
+def has_current_params_content(names) -> bool:
+    """一组（解压后的）文件名里是否含现网工参特征。"""
+    return any(is_current_params_name(n) for n in names)
+
+
+def resolve_map_import_path(filename: str, import_path: Optional[str], extracted_names=()) -> str:
+    """判定 ZIP 导入条目的 fileType：current_params（现网工参）/ map_layer（图层文件）。
+
+    图层文件与现网工参都是 ZIP，优先级：
+    1. 包名以 BaselineLab 开头 → 现网工参（用户明确的文件名契约，最强证据）
+    2. 用户显式导入路径（现网工参入口 current_params / 图层文件入口 map_layer）
+    3. 缺导入路径时按 ZIP 内容：包内出现 BaselineLab / 网管 CellInfo CSV → 现网工参
+    4. 包内含矢量图层 → 图层文件
+    5. 兜底图层文件
+    """
+    if is_current_params_filename(filename):
+        return "current_params"
+    if import_path in ("current_params", "map_layer"):
+        return import_path
+    names = [n for n in extracted_names if n]
+    if has_current_params_content(names):
+        return "current_params"
+    if any((n or "").strip().lower().endswith(VECTOR_LAYER_SUFFIXES) for n in names):
+        return "map_layer"
+    return "map_layer"
+
+
 def stamp_name_with_timestamp(filename: str, when: Optional[datetime] = None) -> str:
     """把文件名里的 14 位时间戳换成指定时刻（缺省当前）；没有时间戳则追加一个。
 
@@ -430,14 +484,58 @@ class DataService:
         # 5) 回退：从遗留 index.json 导入 SQLite 中不存在的条目（map/geo_data 等）
         self._import_from_legacy_index()
 
+        # 6) 为缺少导入路径的历史 map 条目补标注类型（图层文件 / 现网工参）
+        self._mark_map_import_paths()
+
+    def _mark_map_import_paths(self):
+        """为历史 map 条目补标注/纠正导入路径类型（图层文件 / 现网工参）。
+
+        图层文件与现网工参都是 ZIP，早期版本不记录用户导入路径，只能按内容兜底：
+        - 包名以 BaselineLab 开头 → 现网工参（用户明确的文件名契约，优先纠正存量误判）
+        - 数据目录内含 BaselineLab* / 网管 CellInfo CSV → 现网工参
+        - 其余 → 图层文件
+        已标成 map_layer 但存在现网工参证据的条目会在启动时被纠正，避免
+        「现网工参包」一直错分在「图层文件」分类下。
+        """
+        changed = 0
+        for data_id, entry in list(self.index.items()):
+            if not isinstance(entry, dict) or entry.get("type") != "map":
+                continue
+            name = entry.get("name") or ""
+            # 存量误判纠正：BaselineLab 包名一律是现网工参，无论之前标了什么
+            if is_current_params_filename(name):
+                if entry.get("fileType") != "current_params":
+                    entry["fileType"] = "current_params"
+                    changed += 1
+                continue
+
+            data_dir = settings.DATA_DIR / data_id
+            has_current = False
+            if data_dir.is_dir():
+                try:
+                    has_current = has_current_params_content(
+                        [f.name for f in data_dir.rglob("*")]
+                    )
+                except Exception:  # noqa: BLE001
+                    has_current = False
+            if has_current:
+                if entry.get("fileType") != "current_params":
+                    entry["fileType"] = "current_params"
+                    changed += 1
+                continue
+            if entry.get("fileType"):
+                continue
+            entry["fileType"] = "map_layer"
+            changed += 1
+        if changed:
+            safe_print(f"[DataService] 已为 {changed} 个历史图层条目补充/纠正导入路径标记")
+            self._save_index()
+
     def _scan_missing_current_params(self):
-        """扫描 DATA_DIR 中已有的现网工参目录，补充缺失的 Workbook 条目"""
-        import re as _re
-        _current_params_patterns = [
-            r'LTE_SDR_CellInfo_.*\.csv',
-            r'LTE_ITBBU_CellInfo_.*\.csv',
-            r'NR_CellInfo_.*\.csv',
-        ]
+        """扫描 DATA_DIR 中已有的现网工参目录，补充缺失的 Workbook 条目。
+
+        识别口径与导入时一致：BaselineLab* / 网管 CellInfo CSV 都算现网工参。
+        """
 
         db = SessionLocal()
         try:
@@ -453,15 +551,10 @@ class DataService:
                 if _existing:
                     continue
 
-                # 检查子目录是否包含现网工参 CSV 文件
-                _is_params = False
-                for _f in _subdir.rglob('*.csv'):
-                    for _pat in _current_params_patterns:
-                        if _re.match(_pat, _f.name, _re.IGNORECASE):
-                            _is_params = True
-                            break
-                    if _is_params:
-                        break
+                # 检查子目录是否包含现网工参文件（BaselineLab* / 网管 CellInfo CSV）
+                _is_params = is_current_params_name(_subdir.name) or any(
+                    is_current_params_name(_f.name) for _f in _subdir.rglob('*')
+                )
 
                 if not _is_params:
                     continue
@@ -4561,25 +4654,19 @@ class DataService:
                 r'NR_CellInfo_.*\.csv',
             ]
             _is_current_params = False
-            # 检查候选文件名是否匹配
+            # 检查候选文件名是否匹配（含 BaselineLab* 网管导出包契约）
             _check_name = file_path.name if file_path else filename
-            for _pat in _current_params_patterns:
-                if re.match(_pat, _check_name, re.IGNORECASE):
-                    _is_current_params = True
-                    safe_print(f"[DataService] 文件名匹配现网工参模式: {_check_name}")
-                    break
+            if is_current_params_name(_check_name):
+                _is_current_params = True
+                safe_print(f"[DataService] 文件名匹配现网工参模式: {_check_name}")
             # 如果候选文件不匹配，扫描解压目录中的所有文件（处理ZIP内混合内容的情况）
             if not _is_current_params:
                 _extract_dir = settings.DATA_DIR / data_id
                 if _extract_dir.exists():
                     for _f in _extract_dir.rglob('*'):
-                        if _f.is_file():
-                            for _pat in _current_params_patterns:
-                                if re.match(_pat, _f.name, re.IGNORECASE):
-                                    _is_current_params = True
-                                    safe_print(f"[DataService] 目录扫描检测到现网工参文件: {_f.name}")
-                                    break
-                        if _is_current_params:
+                        if _f.is_file() and is_current_params_name(_f.name):
+                            _is_current_params = True
+                            safe_print(f"[DataService] 目录扫描检测到现网工参文件: {_f.name}")
                             break
 
             if _is_current_params:
@@ -6400,12 +6487,18 @@ class DataService:
         self, file: Optional[Any], original_path: Optional[str] = None,
         files: Optional[list] = None,
         user_id: int = 1, city: Optional[str] = None, operator: Optional[str] = None,
+        file_type: Optional[str] = None,
     ) -> Dict[str, str]:
         """上传地图文件（支持 MapInfo 图层文件 / KML / ZIP / 离线地图）
         files: 配套文件列表（与主文件同 stem 的 .dat/.mid/.map/.id 等，
         浏览器模式无真实路径时用于补齐关联文件）
         city/operator: 数据所属组（地市+运营商）归属快照，取自上传者
+        file_type: 用户导入路径（map_layer 图层文件 / current_params 现网工参）。
+        图层文件与现网工参都是 ZIP，仅凭文件内容无法区分，故按导入路径写入索引 fileType，
+        前端「已导入数据」列表据此渲染对应类型图标。
         """
+        # 用户导入路径：写入索引 fileType（图层文件 map_layer / 现网工参 current_params）
+        import_path = (file_type or "").strip() or None
         import asyncio
         data_id = str(uuid.uuid4())
 
@@ -6477,6 +6570,15 @@ class DataService:
                 if f.is_file()
             )
 
+            # ZIP 导入时按「包名 + 包内文件 + 用户导入路径」定类：
+            # 现网工参（BaselineLab* / 网管 CellInfo CSV）即便是从图层文件入口传上来、
+            # 或旧前端没带 file_type，也要正确落到「现网工参」，不会混进「图层文件」。
+            import_path = resolve_map_import_path(
+                filename,
+                import_path,
+                [f.name for f in extracted_files],
+            )
+
             if has_mapinfo:
                 # 解析 MapInfo 图层
                 from app.services.mapinfo_service import parse_mapinfo_files, get_last_parse_errors
@@ -6519,6 +6621,9 @@ class DataService:
                             "errorDetail": str(e),
                         },
                     }
+                    # 标记用户导入路径（图层文件 / 现网工参），前端据此渲染类型图标
+                    if import_path:
+                        self.index[data_id]["fileType"] = import_path
                     self._save_index()  # 持久化错误状态
 
                     raise ValueError(
@@ -6557,6 +6662,9 @@ class DataService:
                             "error": str(e),
                         },
                     }
+                    # 标记用户导入路径（图层文件 / 现网工参），前端据此渲染类型图标
+                    if import_path:
+                        self.index[data_id]["fileType"] = import_path
                     self._save_index()  # 持久化错误状态
 
                     raise ValueError(f"MapInfo 文件解析失败: {e}")
@@ -6891,6 +6999,10 @@ class DataService:
             }
 
 
+
+        # 标记用户导入路径（图层文件 / 现网工参均为 ZIP，靠导入路径区分类型）
+        if import_path and data_id in self.index:
+            self.index[data_id]["fileType"] = import_path
 
         self._save_index()  # 持久化地图上传索引
         self._bump_revision(data_id)

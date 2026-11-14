@@ -13,6 +13,7 @@ import {
   RadioTower,
   Waves,
   Bot,
+  Combine,
   LucideIcon
 } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
@@ -22,7 +23,7 @@ export function HomePage() {
 
   return (
     <div className="p-8">
-      <h1 className="text-base font-bold mb-8">{t('home.title')} v2.0</h1>
+      <h1 className="text-base font-bold mb-8">{t('home.overviewTitle', '功能概览')}</h1>
 
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
         {/* 功能卡片 */}
@@ -115,6 +116,13 @@ export function HomePage() {
           description={t('home.im3EvaluationDesc')}
           icon={Waves}
           link="/intermodulation"
+          iconColor="text-primary"
+        />
+        <FeatureCard
+          title={t('nav.tableMerge')}
+          description={t('home.tableMergeDesc')}
+          icon={Combine}
+          link="/table-merge"
           iconColor="text-primary"
         />
         <FeatureCard

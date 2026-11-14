@@ -160,6 +160,14 @@ class Settings(BaseSettings):
     # 本地数据改动后触发上行的防抖秒数（连续写入只同步一次）
     NPT_DESKTOP_SYNC_DEBOUNCE_SECONDS: int = 1
 
+    # ===== 协作沟通（IM）=====
+    # 附件目录必须挂 PROFILE_ROOT 下，才能与桌面 shared/standalone 配置档隔离一致
+    NPT_IM_ATTACHMENT_DIR: Path = _PROFILE_ROOT / "uploads" / "im"
+    NPT_IM_MAX_FILE_MB: int = 20
+    NPT_IM_MESSAGE_PAGE_SIZE: int = 30
+    NPT_IM_MAX_MEMBERS_PER_GROUP: int = 200
+    NPT_IM_DESKTOP_POLL_MS: int = 5000
+
     # 地图默认配置
     DEFAULT_MAP_CENTER: tuple = (39.9042, 116.4074)  # 北京
     DEFAULT_MAP_ZOOM: int = 10

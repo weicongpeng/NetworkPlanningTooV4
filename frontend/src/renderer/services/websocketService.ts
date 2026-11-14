@@ -4,7 +4,7 @@
  */
 
 interface WebSocketMessage {
-  type: 'progress' | 'complete' | 'failed' | 'pong' | 'task_deleted' | 'data_changed' | 'tasks_changed' | 'auth_ok'
+  type: 'progress' | 'complete' | 'failed' | 'pong' | 'task_deleted' | 'data_changed' | 'tasks_changed' | 'auth_ok' | 'user_online' | 'im_message' | 'im_presence'
   taskId: string
   data?: any
   timestamp?: number
@@ -12,6 +12,18 @@ interface WebSocketMessage {
 
 /** 同组共享任务历史变化（新增/删除/应用标记）→ 历史列表重载（窗口事件） */
 export const TASKS_CHANGED_EVENT = 'npt:tasks-changed'
+
+/** 有人上线 → 侧边栏顶部弹气泡提醒 + 敲门声（窗口事件） */
+export const USER_ONLINE_EVENT = 'npt:user-online'
+
+/** 协作沟通：有新消息（只推 id，正文由 REST 游标拉取） */
+export const IM_MESSAGE_EVENT = 'npt:im-message'
+
+/** 协作沟通：用户在线状态变化 */
+export const IM_PRESENCE_EVENT = 'npt:im-presence'
+
+/** 协作沟通：WS 重连成功，前端应主动补拉一次增量 */
+export const IM_RESYNC_EVENT = 'npt:im-resync'
 
 interface SubscribeCallback {
   (message: WebSocketMessage): void
@@ -103,6 +115,9 @@ class WebSocketService {
           // 重新订阅所有任务
           this.resubscribeAll()
 
+          // 协作沟通：连接（含重连）建立后补拉一次增量，覆盖断线期间的新消息
+          window.dispatchEvent(new CustomEvent(IM_RESYNC_EVENT))
+
           resolve(true)
         }
 
@@ -179,13 +194,16 @@ class WebSocketService {
   /**
    * 登录后补鉴权：服务器据此把连接归入数据组，仅接收同组的数据变更推送。
    * 已连接则原地发送 auth 消息，未连接则带 token 重连。
+   *
+   * 幂等：token 未变且连接已开时不重复发 auth；连接已断时仍会重连
+   * （否则「用户上线」等全局提醒会因连接缺失而收不到）。
    */
   authenticate(token: string | null): void {
     if (!token) return
-    if (token === this.authToken) return
+    const tokenChanged = token !== this.authToken
     this.authToken = token
     if (this.ws?.readyState === WebSocket.OPEN) {
-      this.sendMessage({ type: 'auth', token })
+      if (tokenChanged) this.sendMessage({ type: 'auth', token })
     } else {
       this.disconnect()
       void this.connect()
@@ -330,6 +348,22 @@ class WebSocketService {
     // 只让历史列表重载，不触发整表刷新
     if (type === 'tasks_changed') {
       window.dispatchEvent(new CustomEvent(TASKS_CHANGED_EVENT, { detail: message.data || {} }))
+      return
+    }
+
+    // 有人上线：广播给所有已登录端 → 侧边栏顶部气泡提醒 + 敲门声
+    if (type === 'user_online') {
+      window.dispatchEvent(new CustomEvent(USER_ONLINE_EVENT, { detail: message.data || {} }))
+      return
+    }
+
+    // 协作沟通：只派发窗口事件，由 imStore 决定如何按游标补拉（WS 不承载消息正文）
+    if (type === 'im_message') {
+      window.dispatchEvent(new CustomEvent(IM_MESSAGE_EVENT, { detail: message.data || {} }))
+      return
+    }
+    if (type === 'im_presence') {
+      window.dispatchEvent(new CustomEvent(IM_PRESENCE_EVENT, { detail: message.data || {} }))
       return
     }
 

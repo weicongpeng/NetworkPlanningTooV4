@@ -65,7 +65,7 @@ interface DataState {
   error: string | null
   fetchList: (page?: number, pageSize?: number, forceRefresh?: boolean) => Promise<void>
   uploadExcel: (file: File, context?: string) => Promise<boolean>
-  uploadMap: (file: File, context?: string, extraFiles?: File[]) => Promise<boolean>
+  uploadMap: (file: File, filePath?: string, extraFiles?: File[], importPath?: string) => Promise<boolean>
   uploadGeoData: (file: File, filePath?: string) => Promise<boolean>
   deleteItem: (id: string) => Promise<boolean>
   updateParameters: (fullParamId: string, currentParamId: string) => Promise<ApiResponse<{ newFileId: string; newFileName: string; savedToOriginal: boolean; stats?: Record<string, { matched: number; appended: number }> | null } | null>>
@@ -218,24 +218,24 @@ export const useDataStore = create<DataState>((set, get) => ({
     }
   },
 
-  uploadMap: async (file: File, context: string = 'map', extraFiles?: File[]) => {
-    set({ loading: true, uploadingType: context, error: null })
+  uploadMap: async (file: File, filePath?: string, extraFiles?: File[], importPath?: string) => {
+    set({ loading: true, uploadingType: importPath || 'map', error: null })
     try {
-      let filePath = (file as any).path;
+      let path = filePath || (file as any).path;
 
-      if (!filePath && (window as any).electronAPI?.getFilePath) {
+      if (!path && (window as any).electronAPI?.getFilePath) {
           try {
               // 修复：添加 await 等待 Promise 解析
-              filePath = await (window as any).electronAPI.getFilePath(file);
-              console.log('Got file path from electronAPI:', filePath);
+              path = await (window as any).electronAPI.getFilePath(file);
+              console.log('Got file path from electronAPI:', path);
           } catch (e) {
               console.warn('Failed to get path via electronAPI:', e);
           }
       }
 
-      console.log('Upload Map:', file.name, 'Path:', filePath, 'Companions:', extraFiles?.map(f => f.name));
+      console.log('Upload Map:', file.name, 'Path:', path, 'Companions:', extraFiles?.map(f => f.name), 'ImportPath:', importPath);
 
-      await dataApi.uploadMap(file, filePath, extraFiles)
+      await dataApi.uploadMap(file, path, extraFiles, importPath)
       await get().fetchList(1, 50, true)  // 上传成功后强制刷新
       set({ loading: false, uploadingType: null })
       return true

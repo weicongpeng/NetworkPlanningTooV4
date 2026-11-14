@@ -350,6 +350,9 @@ def _mirror_local_user(db: Session, incoming: dict, mode: str, password: Optiona
     row.desktop_run_mode = mode
     row.city = incoming.get("city")
     row.operator = incoming.get("operator")
+    # 协作沟通昵称：IM 展示名，随服务器账号信息镜像到本机，保证共享模式登录后
+    # 本地 /me 也能带出昵称（否则协作沟通左下角当前用户会退回 username）
+    row.nickname = incoming.get("nickname")
     for perm in PERMISSION_FIELDS:
         setattr(row, perm, bool(incoming.get(perm)))
     _mirror_local_expiry(row, incoming)
@@ -1151,6 +1154,8 @@ async def desktop_login(
     _apply_remember(payload.remember, username, password, mode)
     # 放行「登录优先」的后台重活队列（图层预热/索引对账/首次同步等）
     mark_login_completed()
+    # 自身登录不弹气泡/不响敲门声：共享模式下由服务器端广播给「除自身外的
+    # 其他用户端」，本机回包不再带 online_event
     return {
         "success": True,
         "data": {
@@ -1528,8 +1533,10 @@ async def desktop_fullscreen(
 
 
 class WindowControlRequest(BaseModel):
-    action: Literal["minimize", "toggle-maximize", "close", "resize-edge", "drag"] = Field(
-        ..., description="窗口控制动作（自绘标题栏按钮 / 边缘缩放把手 / 原生拖窗）"
+    action: Literal[
+        "minimize", "toggle-maximize", "close", "resize-edge", "drag", "activate"
+    ] = Field(
+        ..., description="窗口控制动作（自绘标题栏按钮 / 边缘缩放把手 / 原生拖窗 / 截图后回焦）"
     )
     direction: Optional[Literal["n", "s", "e", "w", "ne", "nw", "se", "sw"]] = Field(
         None, description="resize-edge 缩放方向（n/s/e/w/ne/nw/se/sw，对应上/下/右/左与四角）"
@@ -1542,10 +1549,12 @@ async def desktop_window_control(
     current_user: User = Depends(get_current_user),
     _: None = Depends(_require_desktop),
 ) -> Dict[str, Any]:
-    """frameless 窗口自绘标题栏的窗口动作：最小化/最大化还原/关闭/边缘缩放。
+    """frameless 窗口自绘标题栏的窗口动作：最小化/最大化还原/关闭/边缘缩放/回焦。
 
     关闭走 window.destroy() → events.closing（保留后台更新例外与看门狗兜底）；
-    缩放把方向交给壳层，由系统原生缩放循环接管（四边四角都能拉）。非桌面壳返回 403。
+    缩放把方向交给壳层，由系统原生缩放循环接管（四边四角都能拉）；activate 是截图
+    共享其它应用窗口后把主窗口带回前台，非 Windows / 无原生句柄时返回 activated=False。
+    非桌面壳（桥接未注入 / 动作执行失败）返回 403。
     """
     from app import desktop_bridge
 
@@ -1558,6 +1567,17 @@ async def desktop_window_control(
     if result is None:
         raise HTTPException(status_code=403, detail="当前运行环境不支持窗口控制（非桌面壳）")
     return {"success": True, "data": result}
+
+
+@router.get("/screenshot-hotkey")
+async def desktop_screenshot_hotkey(_: None = Depends(_require_desktop)) -> Dict[str, Any]:
+    """壳层 Win32 全局热键 Alt+Z 的序号（前端 400ms 轮询，增量即触发截图）。
+
+    不做登录校验：登录页也能拿到基线序号，避免登录后立刻把历史序号误判成一次热键。
+    """
+    from app import desktop_bridge
+
+    return {"success": True, "data": {"seq": desktop_bridge.screenshot_hotkey_seq()}}
 
 
 @router.get("/window-state")

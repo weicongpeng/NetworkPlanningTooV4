@@ -19,6 +19,7 @@ import {
   SiteSpacingPage,
   FrequencyConversionPage,
   IntermodulationPage,
+  TableMergePage,
   MapPage,
   AdminUsersPage,
   AppVersionsPage,
@@ -178,6 +179,14 @@ function App() {
                 element={
                   <ProtectedRoute>
                     <IntermodulationPage />
+                  </ProtectedRoute>
+                }
+              />
+              <Route
+                path="/table-merge"
+                element={
+                  <ProtectedRoute>
+                    <TableMergePage />
                   </ProtectedRoute>
                 }
               />

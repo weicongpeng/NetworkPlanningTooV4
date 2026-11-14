@@ -475,3 +475,12 @@ table.npt-resizable > tbody > tr > td {
 input[type="checkbox"] {
   accent-color: hsl(var(--primary));
 }
+
+/* 截图取景阶段（getDisplayMedia 选择窗口期间）：临时隐藏协作沟通窗口、悬浮图标
+   与截图工具自身的置顶浮层，避免这些 z-index 最高的层遮住底下要截取的页面/窗口内容。
+   抓帧完成进入编辑页后由脚本移除 data-npt-capturing 恢复显示。 */
+body[data-npt-capturing] [data-im-window],
+body[data-npt-capturing] [data-im-fab],
+body[data-npt-capturing] [data-screenshot-overlay] {
+  visibility: hidden !important;
+}

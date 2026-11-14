@@ -1,5 +1,6 @@
 import { useState, useEffect, useLayoutEffect, useCallback, useRef, useMemo } from 'react'
-import { Upload, FileSpreadsheet, Trash2, Download, Loader2, AlertCircle, RefreshCw, CheckCircle2, Layers, FileDown, MapPin, Navigation, CheckSquare, Square, ScrollText, Maximize2, Minimize2, RadioTower, BarChart3, Search, Database } from 'lucide-react'
+import { Upload, FileSpreadsheet, Trash2, Download, Loader2, AlertCircle, RefreshCw, CheckCircle2, Layers, FileDown, MapPin, Navigation, CheckSquare, Square, ScrollText, Maximize2, Minimize2, RadioTower, BarChart3, Antenna, Search, Database, ChevronDown, ChevronRight } from 'lucide-react'
+import type { LucideIcon } from 'lucide-react'
 import { useDataStore } from '../store/dataStore'
 import { dataApi, assistantApi, getStoredAuthToken } from '../services/api'
 import type { CellRow, DataItem } from '@shared/types'
@@ -15,6 +16,135 @@ import type { ImportWarning } from '../utils/importWarnings'
 import { useDownloadStore } from '../store/downloadStore'
 import { useTranslation } from 'react-i18next'
 import { useAuthStore } from '../store/authStore'
+
+// ===== 数据图标（导入区与已导入列表共用同一份映射，保证同类文件图标完全一致） =====
+
+/** 图标种类：按数据条目形态归类 */
+type DataIconKind =
+  | 'station_params'   // 基站参数
+  | 'station_metrics'  // 基站指标
+  | 'geo_point'        // 地理化数据（点）
+  | 'geo_sector'       // 地理化数据（扇区）
+  | 'excel'            // Excel 类工参（全量工参/待规划/普通 Excel）
+  | 'layers'           // 图层文件（MapInfo / 图层包）
+  | 'current_params'   // 现网工参（网管导出包，与图层文件同为 ZIP，需区分）
+  | 'archive'          // 未知来源的压缩包
+
+/** 种类 → 图标与配色（列表与导入区共用） */
+const DATA_ICONS: Record<DataIconKind, { Icon: LucideIcon; color: string }> = {
+  station_params: { Icon: RadioTower, color: 'text-primary' },
+  station_metrics: { Icon: BarChart3, color: 'text-primary' },
+  geo_point: { Icon: MapPin, color: 'text-primary' },
+  geo_sector: { Icon: Navigation, color: 'text-primary' },
+  excel: { Icon: FileSpreadsheet, color: 'text-primary' },
+  layers: { Icon: Layers, color: 'text-primary' },
+  current_params: { Icon: Antenna, color: 'text-primary' },
+  archive: { Icon: Upload, color: 'text-muted-foreground' },
+}
+
+/** 网管现网工参导出包文件名契约：BaselineLab*（与后端 CURRENT_PARAMS_PREFIX 一致） */
+export function isCurrentParamsFilename(name?: string): boolean {
+  return (name || '').trim().toLowerCase().startsWith('baselinelab')
+}
+
+/** 已导入条目 → 图标种类（优先按用户导入路径 fileType 判定） */
+function dataItemIconKind(item: DataItem): DataIconKind {
+  // fileType 的共享类型未覆盖助手数据集类型（station_params/station_metrics），此处按字符串比较
+  const fileType = item.fileType as string | undefined
+  if (fileType === 'station_params') return 'station_params'
+  if (fileType === 'station_metrics') return 'station_metrics'
+  if (fileType === 'geo_data') {
+    return item.geometryType === 'sector' ? 'geo_sector' : 'geo_point'
+  }
+  if (fileType === 'full_params') return 'excel'
+  if (fileType === 'target_cells') return 'excel'
+  // 现网工参：网管导出包与图层文件同为 ZIP。包名以 BaselineLab 开头时以包名为准，
+  // 覆盖存量索引里被误标成 map_layer / 没有 fileType 的条目（桌面同步包、旧前端上传）。
+  if (fileType === 'current_params' || isCurrentParamsFilename(item.name)) return 'current_params'
+  // 图层文件：用户从「图层文件」入口上传（图层包 / MapInfo）
+  if (fileType === 'map_layer' || fileType === 'tac_layer' || fileType === 'mapinfo_layer') return 'layers'
+  if (item.type === 'excel') return 'excel'
+  // 历史条目没有导入路径：按内容兜底（map 类型默认图层文件）
+  if (item.type === 'map') return 'layers'
+  return 'archive'
+}
+
+/** 导入区上传类型 → 图标种类（与该类型导入后生成的条目图标一致） */
+const UPLOAD_ICON_KIND: Record<string, DataIconKind> = {
+  full_params: 'excel',
+  current_params: 'current_params',
+  map_layer: 'layers',
+  geo_data: 'geo_point',
+  station_params: 'station_params',
+  station_metrics: 'station_metrics',
+}
+
+/** 统一的图标渲染 */
+function DataIcon({ kind, size = 16 }: { kind: DataIconKind; size?: number }) {
+  const { Icon, color } = DATA_ICONS[kind]
+  return <Icon size={size} className={color} />
+}
+
+// ===== 已导入数据：按「导入数据」的六个入口分六大类 =====
+
+/** 六大类，顺序与「导入数据」框一致 */
+type DataGroupKey =
+  | 'full_params'
+  | 'current_params'
+  | 'map_layer'
+  | 'geo_data'
+  | 'station_params'
+  | 'station_metrics'
+
+interface DataGroupDef {
+  key: DataGroupKey
+  /** 分组标题的 i18n key */
+  labelKey: string
+  /** 中文兜底文案 */
+  label: string
+  /** 分组图标：与「导入数据」框中该入口的图标完全一致 */
+  icon: DataIconKind
+}
+
+/** 分组定义（标题 + 图标），图标直接复用导入区的种类映射 */
+export const DATA_GROUPS: DataGroupDef[] = [
+  { key: 'full_params', labelKey: 'data.fullParams', label: '全量工参', icon: UPLOAD_ICON_KIND.full_params },
+  { key: 'current_params', labelKey: 'data.currentParams', label: '现网工参', icon: UPLOAD_ICON_KIND.current_params },
+  { key: 'map_layer', labelKey: 'data.mapLayer', label: '图层文件', icon: UPLOAD_ICON_KIND.map_layer },
+  { key: 'geo_data', labelKey: 'data.geoData', label: '地理化数据', icon: UPLOAD_ICON_KIND.geo_data },
+  { key: 'station_params', labelKey: 'data.stationParamsLabel', label: '基站参数', icon: UPLOAD_ICON_KIND.station_params },
+  { key: 'station_metrics', labelKey: 'data.stationMetricsLabel', label: '基站指标', icon: UPLOAD_ICON_KIND.station_metrics },
+]
+
+/** 图标种类 → 六大类（图标种类已按导入路径判定，故分组口径与其天然一致） */
+const ICON_KIND_GROUP: Record<DataIconKind, DataGroupKey> = {
+  station_params: 'station_params',
+  station_metrics: 'station_metrics',
+  geo_point: 'geo_data',
+  geo_sector: 'geo_data',
+  excel: 'full_params',
+  layers: 'map_layer',
+  current_params: 'current_params',
+  archive: 'full_params',
+}
+
+/**
+ * 数据条目 → 六大类（优先按用户导入路径 fileType，历史条目按内容兜底）。
+ * 直接复用 dataItemIconKind 的判定，保证分类与「导入数据」框的图标口径完全一致。
+ */
+export function dataGroupKeyOf(item: DataItem): DataGroupKey {
+  return ICON_KIND_GROUP[dataItemIconKind(item)]
+}
+
+/** 把过滤后的文件按六大类归桶（保持原有列表顺序，空类也保留） */
+export function groupDataItems(items: DataItem[]): Map<DataGroupKey, DataItem[]> {
+  const groups = new Map<DataGroupKey, DataItem[]>()
+  DATA_GROUPS.forEach(g => groups.set(g.key, []))
+  items.forEach(item => {
+    groups.get(dataGroupKeyOf(item))!.push(item)
+  })
+  return groups
+}
 
 export function DataPage() {
   const { t } = useTranslation()
@@ -332,12 +462,16 @@ export function DataPage() {
     const fileNames = files.map(f => f.name).join(', ')
     addLog('upload', `开始${context === 'geo_data' ? '地理化' : context === 'full_params' ? '全量工参' : context === 'current_params' ? '现网工参' : context === 'map_layer' ? '图层' : ''}上传: ${fileNames}`, 'running', undefined, `upload:${fileNames}`)
 
-    // 根据类型选择上传函数
-    let uploadFn
-    if (context === 'geo_data') {
-      uploadFn = uploadGeoData
-    } else {
-      uploadFn = type === 'excel' ? uploadExcel : uploadMap
+    // 按类型选择上传函数：
+    // - 地理化数据 → uploadGeoData(file, filePath)
+    // - Excel 类（全量工参）→ uploadExcel(file, context)
+    // - 地图类（图层文件 / 现网工参，均为 ZIP 等）→ uploadMap(file, filePath, extraFiles, context)
+    //   地图类必须带上「用户导入路径」：后端据此把条目标记为 map_layer / current_params，
+    //   「已导入数据」列表才能按导入路径渲染对应类型图标
+    const uploadOne = async (file: File, filePath?: string, extraFiles?: File[]) => {
+      if (context === 'geo_data') return uploadGeoData(file, filePath)
+      if (type === 'excel') return uploadExcel(file, context)
+      return uploadMap(file, filePath, extraFiles, context)
     }
 
     // 设置上传状态为进行中
@@ -389,7 +523,7 @@ export function DataPage() {
           const filePath = await resolvePath(main)
           console.log('[Upload] Path Captured:', filePath || 'NULL (Browser Restriction)')
           try {
-            const ok = await uploadMap(main, filePath, comps.length > 0 ? comps : undefined)
+            const ok = await uploadOne(main, filePath, comps.length > 0 ? comps : undefined)
             allSuccess = allSuccess && ok
           } catch (err: any) {
             allSuccess = false
@@ -406,7 +540,7 @@ export function DataPage() {
           console.log('[Upload] Path Captured:', filePath || 'NULL (Browser Restriction)')
           let success: boolean
           try {
-            success = await uploadFn(file, filePath || undefined)
+            success = await uploadOne(file, filePath || undefined)
           } catch (err: any) {
             success = false
             const errMsg = err?.message || '上传失败'
@@ -458,7 +592,7 @@ export function DataPage() {
       // 捕获 chunkedUpload 抛出的具体错误（如"坐标验证失败"），透传到前端
       let success: boolean
       try {
-        success = await uploadFn(file, filePath || undefined)
+        success = await uploadOne(file, filePath || undefined)
       } catch (err: any) {
         success = false
         const errMsg = err?.message || '上传失败'
@@ -698,6 +832,22 @@ export function DataPage() {
     if (!kw) return items
     return items.filter(item => item.name?.toLowerCase().includes(kw))
   }, [items, fileSearch])
+
+  // 六大类分组：默认全部展开；搜索时自动展开有匹配文件的类，避免结果被折叠藏起来
+  const [collapsedGroups, setCollapsedGroups] = useState<Set<DataGroupKey>>(new Set())
+  const groupedItems = useMemo(() => groupDataItems(filteredItems), [filteredItems])
+  const isGroupCollapsed = useCallback((key: DataGroupKey) => {
+    if (fileSearch.trim()) return false
+    return collapsedGroups.has(key)
+  }, [collapsedGroups, fileSearch])
+  const toggleGroup = useCallback((key: DataGroupKey) => {
+    setCollapsedGroups(prev => {
+      const next = new Set(prev)
+      if (next.has(key)) next.delete(key)
+      else next.add(key)
+      return next
+    })
+  }, [])
 
   // 全选作用于当前过滤结果（搜索后批量操作不会误删看不到的文件）
   const toggleSelectAll = useCallback(() => {
@@ -956,7 +1106,7 @@ export function DataPage() {
                             accept=".xlsx,.xls"
                             onUpload={(e) => handleFileUpload(e, 'excel', 'full_params')}
                             loading={loading && uploadingType === 'full_params'}
-                            icon={<FileSpreadsheet size={20} />}
+                            icon={<DataIcon kind={UPLOAD_ICON_KIND.full_params} size={20} />}
                             inline={true}
                             status={uploadStatus.full_params}
                         />
@@ -979,7 +1129,7 @@ export function DataPage() {
                             accept=".zip"
                             onUpload={(e) => handleFileUpload(e, 'map', 'current_params')}
                             loading={loading && uploadingType === 'current_params'}
-                            icon={<Upload size={20} />}
+                            icon={<DataIcon kind={UPLOAD_ICON_KIND.current_params} size={20} />}
                             inline={true}
                             description={t('data.currentParamsDesc') || '中兴网管300脚本导出数据'}
                             status={uploadStatus.current_params}
@@ -996,7 +1146,7 @@ export function DataPage() {
                             accept=".zip,.tab,.mif,.kml,.shp,.shx,.dbf,.prj,.cpg,.qml,.geojson,.json"
                             onUpload={(e) => handleFileUpload(e, 'map', 'map_layer')}
                             loading={loading && uploadingType === 'map_layer'}
-                            icon={<Layers size={20} />}
+                            icon={<DataIcon kind={UPLOAD_ICON_KIND.map_layer} size={20} />}
                             multiple={true}
                             inline={true}
                             status={uploadStatus.map_layer}
@@ -1014,7 +1164,7 @@ export function DataPage() {
                             accept=".xlsx,.xls,.csv,.txt"
                             onUpload={(e) => handleFileUpload(e, 'excel', 'geo_data')}
                             loading={loading && uploadingType === 'geo_data'}
-                            icon={<MapPin size={20} className="text-primary" />}
+                            icon={<DataIcon kind={UPLOAD_ICON_KIND.geo_data} size={20} />}
                             description={t('data.geoDataDesc') || '自动识别点状/扇区'}
                             inline={true}
                             status={uploadStatus.geo_data}
@@ -1049,7 +1199,7 @@ export function DataPage() {
                             accept=".xlsx,.xls,.csv,.txt"
                             onUpload={(e) => handleStationUpload(e, 'station_params')}
                             loading={stationBusy === 'station_params'}
-                            icon={<RadioTower size={20} className="text-primary" />}
+                            icon={<DataIcon kind={UPLOAD_ICON_KIND.station_params} size={20} />}
                             description={t('data.stationParamsDesc') || '网管小区无线参数，供网优助手对话查询'}
                             inline={true}
                             status={uploadStatus.station_params}
@@ -1065,7 +1215,7 @@ export function DataPage() {
                             accept=".xlsx,.xls,.csv,.txt"
                             onUpload={(e) => handleStationUpload(e, 'station_metrics')}
                             loading={stationBusy === 'station_metrics'}
-                            icon={<BarChart3 size={20} className="text-primary" />}
+                            icon={<DataIcon kind={UPLOAD_ICON_KIND.station_metrics} size={20} />}
                             description={t('data.stationMetricsDesc') || '中兴指标(月/天/小时/忙时)，含小区名与时间列'}
                             inline={true}
                             status={uploadStatus.station_metrics}
@@ -1239,233 +1389,197 @@ export function DataPage() {
             </div>
           ) : (
             <div className="overflow-y-auto space-y-2 max-h-[600px] lg:max-h-none lg:flex-1 lg:min-h-0">
-              {filteredItems.map((item) => (
-                <div
-                  key={item.id}
-                  className={`flex items-center justify-between p-3 rounded-lg border cursor-pointer transition-colors ${
-                    selectedIds.has(item.id)
-                      ? 'bg-primary/5 border-primary/30 ring-1 ring-primary/20'
-                      : selectedId === item.id
-                      ? 'bg-primary/10 border-primary'
-                      : 'bg-muted border-border hover:bg-muted/80'
-                  }`}
-                  onClick={() => setSelectedId(item.id)}
-                >
-                  <div className="flex-1 min-w-0">
-                    <div className="flex items-center gap-2">
-                      {/* 文件类型图标 */}
-                      <div className={`p-1.5 rounded-md ${
-                        item.fileType === 'station_params' ? 'bg-primary/15' :
-                        item.fileType === 'station_metrics' ? 'bg-primary/15' :
-                        item.fileType === 'geo_data' ? 'bg-primary/15' :
-                        item.fileType === 'full_params' ? 'bg-primary/15' :
-                        item.fileType === 'target_cells' ? 'bg-primary/15' :
-                        item.type === 'excel' ? 'bg-primary/15' :
-                        item.type === 'map' ? 'bg-primary/15' :
-                        'bg-muted'
-                      }`}>
-                        {item.fileType === 'station_params' ? (
-                          <RadioTower size={16} className="text-primary" />
-                        ) : item.fileType === 'station_metrics' ? (
-                          <BarChart3 size={16} className="text-primary" />
-                        ) : item.fileType === 'geo_data' ? (
-                          item.geometryType === 'sector'
-                            ? <Navigation size={16} className="text-primary" />
-                            : <MapPin size={16} className="text-primary" />
-                        ) : item.fileType === 'full_params' ? (
-                          <FileSpreadsheet size={16} className="text-primary" />
-                        ) : item.fileType === 'target_cells' ? (
-                          <FileSpreadsheet size={16} className="text-primary" />
-                        ) : item.type === 'excel' ? (
-                          <FileSpreadsheet size={16} className="text-primary" />
-                        ) : item.subType === 'mapinfo' ? (
-                          <Layers size={16} className="text-primary" />
-                        ) : (
-                          <Upload size={16} className="text-muted-foreground" />
-                        )}
-                      </div>
-                      <span className="truncate font-medium" title={item.name}>{item.name}</span>
-                      {/* 索引自愈恢复的历史数据：原分组信息已丢失，暂按管理员组归属，提示核对 */}
-                      {(item.metadata?.recovered || (item as any).recovered) && (
-                        <span
-                          className="text-[10px] px-2 py-0.5 rounded-full font-medium bg-amber-500/15 text-amber-600 whitespace-nowrap"
-                          title={t('data.recoveredHint', '索引修复时从磁盘找回的历史数据，原分组已丢失，请核对后保留或删除')}
-                        >
-                          {t('data.recovered', '历史数据')}
-                        </span>
-                      )}
-                      {/* 文件类型标签 */}
-                      <span className={`text-[10px] px-2 py-0.5 rounded-full font-medium inline-flex items-center gap-0.5 ${
-                        item.status === 'error'
-                          ? 'bg-red-500/15 text-red-500'
-                          : item.fileType === 'station_params'
-                          ? 'bg-primary/15 text-primary'
-                          : item.fileType === 'station_metrics'
-                          ? 'bg-primary/15 text-primary'
-                          : item.fileType === 'geo_data'
-                          ? 'bg-primary/15 text-primary'
-                          : item.fileType === 'full_params'
-                          ? 'bg-primary/15 text-primary'
-                          : item.fileType === 'target_cells'
-                          ? 'bg-primary/15 text-primary'
-                          : item.fileType === 'current_params'
-                          ? 'bg-primary/15 text-primary'
-                          : item.subType === 'mapinfo'
-                          ? 'bg-primary/15 text-primary'
-                          : 'bg-muted text-muted-foreground'
-                      }`}>
-                        {item.status === 'error'
-                          ? <>
-                              <AlertCircle size={10} />
-                              {(t('data.failed') || '处理失败')}
-                              {item.errorMessage ? (
-                                <span
-                                  className="max-w-[180px] truncate cursor-pointer underline decoration-dotted"
-                                  title={item.errorMessage}
-                                  onClick={(e) => {
-                                    e.stopPropagation()
-                                    alert(`${item.name}\n\n${item.errorMessage}\n\n${t('data.importFailedHint') || '若为文件内容问题，请按上述原因修改源文件后重新导入'}`)
-                                  }}
-                                >: {item.errorMessage}</span>
-                              ) : null}
-                            </>
-                          : item.fileType === 'geo_data'
-                          ? (item.geometryType === 'sector' ? (t('data.sectorData') || '扇区数据') : (t('data.geo') || '地理化'))
-                          : item.fileType === 'full_params'
-                          ? (t('data.fullParamsLabel') || '全量工参')
-                          : item.fileType === 'target_cells'
-                          ? (t('data.toPlan') || '待规划')
-                          : item.fileType === 'current_params'
-                          ? (t('data.currentParamsLabel') || '现网工参')
-                          : item.fileType === 'station_params'
-                          ? (t('data.stationParamsLabel') || '基站参数')
-                          : item.fileType === 'station_metrics'
-                          ? (t('data.stationMetricsLabel') || '基站指标')
-                          : item.subType === 'mapinfo'
-                          ? 'MapInfo'
-                          : item.type === 'excel'
-                          ? 'Excel'
-                          : 'ZIP'}
-                      </span>
-                      {/* 路径记录状态 */}
-                      {item.originalPath && (
-                        <span className="text-[10px] px-1.5 py-0.5 rounded bg-primary/15 text-green-400 flex items-center gap-0.5">
-                          <CheckCircle2 size={10} />
-                          {t('data.recorded') || '已记录'}
-                        </span>
-                      )}
-                    </div>
-                    <div className="text-xs text-muted-foreground mt-1.5 flex items-center gap-3">
-                      <span>
-                        {item.fileType === 'geo_data' ? (
-                          <>
-                            {item.geometryType === 'sector'
-                              ? `${item.metadata?.pointCount || 0} ${t('data.sectors') || '个扇区'}`
-                              : `${item.metadata?.pointCount || 0} ${t('data.points') || '个点'}`}
-                          </>
-                        ) : item.type === 'excel' ? (
-                            item.metadata?.LTESiteCount || item.metadata?.NRSiteCount
-                                ? [
-                                    item.metadata?.LTESiteCount ? `LTE ${item.metadata.LTESiteCount}站/${item.metadata.LTESectorCount}小区` : null,
-                                    item.metadata?.NRSiteCount ? `NR ${item.metadata.NRSiteCount}站/${item.metadata.NRSectorCount}小区` : null
-                                  ].filter(Boolean).join(' · ')
-                                : (item.fileType === 'full_params'
-                                    ? (t('data.fullParamsData') || '全量工参数据')
-                                    : (item.fileType === 'target_cells'
-                                        ? (t('data.targetCellsData') || '待规划小区数据')
-                                        : (item.fileType === 'default' && item.metadata?.siteCount
-                                            ? `${item.metadata.siteCount} ${t('data.baseStations') || '个基站'}`
-                                            : (t('data.excelData') || 'Excel 数据'))))
-                        ) : (
-                            item.type === 'map'
-                                ? (item.subType === 'mapinfo'
-                                    ? `${item.metadata?.layerCount || 0} ${t('data.layers') || '个图层'}`
-                                    : (t('data.zipFile') || '压缩文件'))
-                                : (t('data.unknownType') || '未知类型')
-                        )}
-                      </span>
-                      <span className="text-[10px] opacity-60">
-                        {/* 时间格式: YYYY/M/D HH:mm username */}
-                        {(() => {
-                          const d = new Date(item.uploadDate)
-                          const pad = (n: number) => String(n).padStart(2, '0')
-                          const timeStr = `${d.getFullYear()}/${d.getMonth() + 1}/${d.getDate()} ${pad(d.getHours())}:${pad(d.getMinutes())}`
-                          const userName = (item as any).userName || (item as any).user_name || ''
-                          return `${timeStr}${userName ? ' ' + userName : ''}`
-                        })()}
-                      </span>
-                      {(item as any).remark && (
-                        <span className="text-[10px] text-amber-600 bg-amber-500/10 px-1.5 py-0.5 rounded">
-                          {(item as any).remark}
-                        </span>
-                      )}
-                    </div>
-                  </div>
-                  <div className="flex gap-1 items-center">
+              {DATA_GROUPS.map((group) => {
+                const groupItems = groupedItems.get(group.key) || []
+                const collapsed = isGroupCollapsed(group.key)
+                // 搜索时隐藏没有匹配文件的分类，避免一堆空标题
+                if (fileSearch.trim() && groupItems.length === 0) return null
+                return (
+                  <div key={group.key}>
+                    {/* 分类标题：图标与「导入数据」框内该入口一致，点击收起/展开该类文件 */}
                     <button
-                      onClick={(e) => {
-                        if (loading || item.excelSynced === false || (item.inplaceUpdated && item.excelSynced === undefined)) return
-                        toggleSelectItem(item.id, e)
-                      }}
-                      className={`p-1.5 rounded transition-colors ${loading || item.excelSynced === false || (item.inplaceUpdated && item.excelSynced === undefined) ? 'text-muted-foreground/30 cursor-not-allowed' : 'hover:bg-background text-muted-foreground hover:text-primary'}`}
-                      disabled={loading || item.excelSynced === false || (item.inplaceUpdated && item.excelSynced === undefined)}
-                      title={loading ? (t('data.loading') || '加载中...') : (item.excelSynced === false || (item.inplaceUpdated && item.excelSynced === undefined) ? (t('data.syncingDisabled') || '同步中不可操作') : (selectedIds.has(item.id) ? (t('data.deselectItem') || '取消选择') : (t('data.selectItem') || '选择')))}
+                      type="button"
+                      onClick={() => toggleGroup(group.key)}
+                      aria-expanded={!collapsed}
+                      className="w-full flex items-center gap-2 px-2 py-1.5 rounded-md border border-border bg-muted/50 hover:bg-muted transition-colors text-left"
                     >
-                      {selectedIds.has(item.id) ? (
-                        <CheckSquare size={16} className="text-primary" />
-                      ) : (
-                        <Square size={16} />
-                      )}
+                      <span className="flex-shrink-0 p-1 rounded-md bg-primary/15">
+                        <DataIcon kind={group.icon} />
+                      </span>
+                      <span className="text-sm font-medium truncate">{t(group.labelKey) || group.label}</span>
+                      <span className="text-[10px] text-muted-foreground ml-1 flex-shrink-0">({groupItems.length})</span>
+                      <span className="ml-auto flex-shrink-0 text-muted-foreground">
+                        {collapsed ? <ChevronRight size={14} /> : <ChevronDown size={14} />}
+                      </span>
                     </button>
-                    {loading ? (
-                      <div className="p-2 text-muted-foreground/50" title={t('data.loading') || '加载中...'}>
-                        <Loader2 size={14} className="animate-spin text-muted-foreground" />
+                    {/* 左侧缩进 + 竖线构成层级：分类标题在上，所属文件在其下缩进一级 */}
+                    {!collapsed && groupItems.length > 0 && (
+                      <div className="mt-2 ml-3 pl-3 border-l-2 border-border/70 space-y-2">
+                        {groupItems.map((item) => (
+                          <div
+                            key={item.id}
+                            className={`flex items-center justify-between p-3 rounded-lg border cursor-pointer transition-colors ${
+                              selectedIds.has(item.id)
+                                ? 'bg-primary/5 border-primary/30 ring-1 ring-primary/20'
+                                : selectedId === item.id
+                                ? 'bg-primary/10 border-primary'
+                                : 'bg-muted border-border hover:bg-muted/80'
+                            }`}
+                            onClick={() => setSelectedId(item.id)}
+                          >
+                            <div className="flex-1 min-w-0">
+                              <div className="flex items-center gap-2">
+                                <span className="truncate font-medium" title={item.name}>{item.name}</span>
+                                {/* 索引自愈恢复的历史数据：原分组信息已丢失，暂按管理员组归属，提示核对 */}
+                                {(item.metadata?.recovered || (item as any).recovered) && (
+                                  <span
+                                    className="text-[10px] px-2 py-0.5 rounded-full font-medium bg-amber-500/15 text-amber-600 whitespace-nowrap"
+                                    title={t('data.recoveredHint', '索引修复时从磁盘找回的历史数据，原分组已丢失，请核对后保留或删除')}
+                                  >
+                                    {t('data.recovered', '历史数据')}
+                                  </span>
+                                )}
+                                {/* 处理失败状态（类型标签已移到分类标题，此处仅保留错误提示） */}
+                                {item.status === 'error' && (
+                                  <span className="text-[10px] px-2 py-0.5 rounded-full font-medium inline-flex items-center gap-0.5 bg-red-500/15 text-red-500">
+                                    <AlertCircle size={10} />
+                                    {(t('data.failed') || '处理失败')}
+                                    {item.errorMessage ? (
+                                      <span
+                                        className="max-w-[180px] truncate cursor-pointer underline decoration-dotted"
+                                        title={item.errorMessage}
+                                        onClick={(e) => {
+                                          e.stopPropagation()
+                                          alert(`${item.name}\n\n${item.errorMessage}\n\n${t('data.importFailedHint') || '若为文件内容问题，请按上述原因修改源文件后重新导入'}`)
+                                        }}
+                                      >: {item.errorMessage}</span>
+                                    ) : null}
+                                  </span>
+                                )}
+                                {/* 路径记录状态 */}
+                                {item.originalPath && (
+                                  <span className="text-[10px] px-1.5 py-0.5 rounded bg-primary/15 text-green-400 flex items-center gap-0.5">
+                                    <CheckCircle2 size={10} />
+                                    {t('data.recorded') || '已记录'}
+                                  </span>
+                                )}
+                              </div>
+                              <div className="text-xs text-muted-foreground mt-1.5 flex items-center gap-3">
+                                <span>
+                                  {item.fileType === 'geo_data' ? (
+                                    <>
+                                      {item.geometryType === 'sector'
+                                        ? `${item.metadata?.pointCount || 0} ${t('data.sectors') || '个扇区'}`
+                                        : `${item.metadata?.pointCount || 0} ${t('data.points') || '个点'}`}
+                                    </>
+                                  ) : item.type === 'excel' ? (
+                                      item.metadata?.LTESiteCount || item.metadata?.NRSiteCount
+                                          ? [
+                                              item.metadata?.LTESiteCount ? `LTE ${item.metadata.LTESiteCount}站/${item.metadata.LTESectorCount}小区` : null,
+                                              item.metadata?.NRSiteCount ? `NR ${item.metadata.NRSiteCount}站/${item.metadata.NRSectorCount}小区` : null
+                                            ].filter(Boolean).join(' · ')
+                                          : (item.fileType === 'full_params'
+                                              ? (t('data.fullParamsData') || '全量工参数据')
+                                              : (item.fileType === 'target_cells'
+                                                  ? (t('data.targetCellsData') || '待规划小区数据')
+                                                  : (item.fileType === 'default' && item.metadata?.siteCount
+                                                      ? `${item.metadata.siteCount} ${t('data.baseStations') || '个基站'}`
+                                                      : (t('data.excelData') || 'Excel 数据'))))
+                                  ) : (
+                                      item.type === 'map'
+                                          ? (item.subType === 'mapinfo'
+                                              ? `${item.metadata?.layerCount || 0} ${t('data.layers') || '个图层'}`
+                                              : (t('data.zipFile') || '压缩文件'))
+                                          : (t('data.unknownType') || '未知类型')
+                                  )}
+                                </span>
+                                <span className="text-[10px] opacity-60">
+                                  {/* 时间格式: YYYY/M/D HH:mm username */}
+                                  {(() => {
+                                    const d = new Date(item.uploadDate)
+                                    const pad = (n: number) => String(n).padStart(2, '0')
+                                    const timeStr = `${d.getFullYear()}/${d.getMonth() + 1}/${d.getDate()} ${pad(d.getHours())}:${pad(d.getMinutes())}`
+                                    const userName = (item as any).userName || (item as any).user_name || ''
+                                    return `${timeStr}${userName ? ' ' + userName : ''}`
+                                  })()}
+                                </span>
+                                {(item as any).remark && (
+                                  <span className="text-[10px] text-amber-600 bg-amber-500/10 px-1.5 py-0.5 rounded">
+                                    {(item as any).remark}
+                                  </span>
+                                )}
+                              </div>
+                            </div>
+                            <div className="flex gap-1 items-center">
+                              <button
+                                onClick={(e) => {
+                                  if (loading || item.excelSynced === false || (item.inplaceUpdated && item.excelSynced === undefined)) return
+                                  toggleSelectItem(item.id, e)
+                                }}
+                                className={`p-1.5 rounded transition-colors ${loading || item.excelSynced === false || (item.inplaceUpdated && item.excelSynced === undefined) ? 'text-muted-foreground/30 cursor-not-allowed' : 'hover:bg-background text-muted-foreground hover:text-primary'}`}
+                                disabled={loading || item.excelSynced === false || (item.inplaceUpdated && item.excelSynced === undefined)}
+                                title={loading ? (t('data.loading') || '加载中...') : (item.excelSynced === false || (item.inplaceUpdated && item.excelSynced === undefined) ? (t('data.syncingDisabled') || '同步中不可操作') : (selectedIds.has(item.id) ? (t('data.deselectItem') || '取消选择') : (t('data.selectItem') || '选择')))}
+                              >
+                                {selectedIds.has(item.id) ? (
+                                  <CheckSquare size={16} className="text-primary" />
+                                ) : (
+                                  <Square size={16} />
+                                )}
+                              </button>
+                              {loading ? (
+                                <div className="p-2 text-muted-foreground/50" title={t('data.loading') || '加载中...'}>
+                                  <Loader2 size={14} className="animate-spin text-muted-foreground" />
+                                </div>
+                              ) : item.excelSynced === false || (item.inplaceUpdated && item.excelSynced === undefined) ? (
+                                <div className="p-2 text-muted-foreground flex items-center gap-1.5" title={t('data.excelSyncing') || 'Excel同步中...'}>
+                                  <Loader2 size={14} className="animate-spin text-amber-500" />
+                                  <span className="text-[10px] text-amber-600">{t('data.syncing') || '同步中'}</span>
+                                </div>
+                              ) : (
+                              <button
+                                data-guide="imported-download"
+                                onClick={(e) => {
+                                  e.stopPropagation()
+                                  handleDownload(item)
+                                }}
+                                disabled={downloadStore.downloadingIds.has(item.id)}
+                                className="p-2 hover:bg-background rounded text-primary disabled:opacity-50 disabled:cursor-wait relative group"
+                                title={downloadStore.downloadingIds.has(item.id)
+                                  ? (downloadStore.statusText[item.id] || (t('data.downloading') || '下载中...'))
+                                  : (t('data.download') || '下载')}
+                              >
+                                {downloadStore.downloadingIds.has(item.id) ? (
+                                  <div className="flex flex-col items-center gap-0.5">
+                                    <Loader2 size={16} className="animate-spin text-primary" />
+                                    {downloadStore.progress[item.id] > 0 && (
+                                      <span className="text-[9px] font-mono text-primary leading-none">
+                                        {downloadStore.progress[item.id]}%
+                                      </span>
+                                    )}
+                                  </div>
+                                ) : <Download size={16} />}
+                              </button>
+                              )}
+                              <button
+                                onClick={(e) => {
+                                  if (!permDelete || loading || item.excelSynced === false || (item.inplaceUpdated && item.excelSynced === undefined)) return
+                                  e.stopPropagation()
+                                  handleDelete(item)
+                                }}
+                                className={`p-2 rounded ${!permDelete || loading || item.excelSynced === false || (item.inplaceUpdated && item.excelSynced === undefined) ? 'text-red-500/30 cursor-not-allowed' : 'hover:bg-background text-red-500'}`}
+                                disabled={!permDelete || loading || item.excelSynced === false || (item.inplaceUpdated && item.excelSynced === undefined)}
+                                title={!permDelete ? (t('data.noPermission', '无权限，请联系管理员')) : (loading ? (t('data.loading') || '加载中...') : (item.excelSynced === false || (item.inplaceUpdated && item.excelSynced === undefined) ? (t('data.syncingDisabled') || '同步中不可删除') : (t('data.delete') || '删除')))}
+                              >
+                                <Trash2 size={16} />
+                              </button>
+                            </div>
+                          </div>
+                        ))}
                       </div>
-                    ) : item.excelSynced === false || (item.inplaceUpdated && item.excelSynced === undefined) ? (
-                      <div className="p-2 text-muted-foreground flex items-center gap-1.5" title={t('data.excelSyncing') || 'Excel同步中...'}>
-                        <Loader2 size={14} className="animate-spin text-amber-500" />
-                        <span className="text-[10px] text-amber-600">{t('data.syncing') || '同步中'}</span>
-                      </div>
-                    ) : (
-                    <button
-                      data-guide="imported-download"
-                      onClick={(e) => {
-                        e.stopPropagation()
-                        handleDownload(item)
-                      }}
-                      disabled={downloadStore.downloadingIds.has(item.id)}
-                      className="p-2 hover:bg-background rounded text-primary disabled:opacity-50 disabled:cursor-wait relative group"
-                      title={downloadStore.downloadingIds.has(item.id)
-                        ? (downloadStore.statusText[item.id] || (t('data.downloading') || '下载中...'))
-                        : (t('data.download') || '下载')}
-                    >
-                      {downloadStore.downloadingIds.has(item.id) ? (
-                        <div className="flex flex-col items-center gap-0.5">
-                          <Loader2 size={16} className="animate-spin text-primary" />
-                          {downloadStore.progress[item.id] > 0 && (
-                            <span className="text-[9px] font-mono text-primary leading-none">
-                              {downloadStore.progress[item.id]}%
-                            </span>
-                          )}
-                        </div>
-                      ) : <Download size={16} />}
-                    </button>
                     )}
-                    <button
-                      onClick={(e) => {
-                        if (!permDelete || loading || item.excelSynced === false || (item.inplaceUpdated && item.excelSynced === undefined)) return
-                        e.stopPropagation()
-                        handleDelete(item)
-                      }}
-                      className={`p-2 rounded ${!permDelete || loading || item.excelSynced === false || (item.inplaceUpdated && item.excelSynced === undefined) ? 'text-red-500/30 cursor-not-allowed' : 'hover:bg-background text-red-500'}`}
-                      disabled={!permDelete || loading || item.excelSynced === false || (item.inplaceUpdated && item.excelSynced === undefined)}
-                      title={!permDelete ? (t('data.noPermission', '无权限，请联系管理员')) : (loading ? (t('data.loading') || '加载中...') : (item.excelSynced === false || (item.inplaceUpdated && item.excelSynced === undefined) ? (t('data.syncingDisabled') || '同步中不可删除') : (t('data.delete') || '删除')))}
-                    >
-                      <Trash2 size={16} />
-                    </button>
                   </div>
-                </div>
-              ))}
+                )
+              })}
             </div>
           )}
           </div>

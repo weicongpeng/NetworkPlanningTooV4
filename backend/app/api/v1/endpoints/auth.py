@@ -105,6 +105,16 @@ async def login(data: UserLogin, request: Request, db: Session = Depends(get_db)
     if ended_count > 0:
         result["warning"] = "该账号已在其它设备登录，之前的登录已退出（同一账号以最后登录为准）"
 
+    # 上线提醒：广播给所有已登录端，各端在侧边栏顶部弹气泡 + 敲门声
+    try:
+        from app.services.presence_service import notify_user_online_from_user
+
+        # 广播只推给「除上线者自身外的其他用户端」：本端登录不弹气泡、不响敲门声，
+        # 因此登录响应不再带回 online_event
+        notify_user_online_from_user(user, data.client_type or "pc")
+    except Exception:  # noqa: BLE001
+        pass
+
     return result
 
 

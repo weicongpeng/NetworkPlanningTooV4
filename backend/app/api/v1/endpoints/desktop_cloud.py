@@ -178,6 +178,16 @@ async def desktop_login(
         except Exception as exc:  # noqa: BLE001
             print(f"[DesktopCloud] 会话记账失败（不影响登录）：{exc}")
 
+        # 上线提醒：桌面端上线同样广播给「除自身外的其他用户端」（气泡 + 敲门声）
+        try:
+            from app.services.presence_service import notify_user_online_from_payload
+
+            notify_user_online_from_payload(
+                data.get("user") or {}, client_type="desktop"
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"[DesktopCloud] 上线广播失败（不影响登录）：{exc}")
+
     # 单机模式断网期间在本机登录的次数，联机时补报（不影响本次登录本身）
     if result == "ok" and payload.offline_logins:
         try:
@@ -1245,3 +1255,47 @@ async def download_release(
         )
 
     return FileResponse(path, media_type="application/octet-stream", headers=headers)
+
+
+# ------------------------------------------------- 协作沟通（IM）relay
+#
+# 桌面共享模式的前端只连本机后端，IM 请求由 im_desktop_proxy 转发到这里。
+# 凭证仍是签名许可 + 机器码（body 字段，不是自定义头），身份一律从许可
+# 绑定的网页账号解析，忽略客户端自报 user_id；只接受 im_ops 白名单操作。
+
+class ImRelayRequest(SyncCredential):
+    op: str = Field(..., max_length=64)
+    args: Dict[str, Any] = Field(default_factory=dict)
+
+
+def _relay_user_id(db: Session, record) -> int:
+    from app.models.database import User
+
+    uid = getattr(record, "user_id", None)
+    if uid:
+        user = db.query(User).filter(
+            User.id == int(uid), User.is_active == True  # noqa: E712
+        ).first()
+        if user is not None:
+            return int(user.id)
+    username = getattr(record, "username", None)
+    if username:
+        user = db.query(User).filter(
+            User.username == username, User.is_active == True  # noqa: E712
+        ).first()
+        if user is not None:
+            return int(user.id)
+    raise HTTPException(status_code=403, detail="IM_RELAY_NO_USER")
+
+
+@router.post("/im/relay")
+def im_relay(payload: ImRelayRequest, request: Request,
+             db: Session = Depends(get_db)):
+    """桌面共享模式 IM 操作中继：验签 → 解析真实用户 → 执行白名单 op。"""
+    _rate_limit(f"im-relay:{_client_ip(request)}", limit=180, window=60)
+    record, _ = _verify_license(payload.license_file, payload.machine_code, db)
+    user_id = _relay_user_id(db, record)
+    from app.services import im_ops
+
+    data = im_ops.run_local_op(db, user_id, payload.op, payload.args)
+    return {"success": True, "data": data}

@@ -721,6 +721,50 @@ def _make_fullscreen_handler(window: Any, state: Optional[dict] = None) -> Calla
     return _handler
 
 
+def _restore_foreground(window: Any) -> bool:
+    """把桌面主窗口带回前台（截图共享其它应用窗口后浏览器/WebView2 会切走焦点）。
+
+    非 Windows / 无原生句柄时直接返回 False，由前端的 visibilitychange 提示兜底。
+    Win32 调用派发到 UI 线程执行、HTTP 请求立即返回；SetForegroundWindow 受系统
+    「前台锁定」限制可能被忽略，故补一次 HWND_TOPMOST → HWND_NOTOPMOST 的 Z 序闪烁。
+    """
+    native = getattr(window, "native", None)
+    handle = getattr(native, "Handle", None) if native is not None else None
+    if os.name != "nt" or handle is None:
+        return False
+
+    def _perform() -> None:
+        try:
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+            hwnd = ctypes.c_void_p(
+                int(handle.ToInt64() if hasattr(handle, "ToInt64") else handle)
+            )
+            user32.ShowWindow.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            user32.ShowWindow.restype = ctypes.c_bool
+            user32.SetForegroundWindow.argtypes = [ctypes.c_void_p]
+            user32.SetForegroundWindow.restype = ctypes.c_bool
+            user32.BringWindowToTop.argtypes = [ctypes.c_void_p]
+            user32.BringWindowToTop.restype = ctypes.c_bool
+            user32.SetWindowPos.argtypes = [
+                ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint,
+            ]
+            user32.SetWindowPos.restype = ctypes.c_bool
+
+            user32.ShowWindow(hwnd, SW_RESTORE)
+            user32.SetForegroundWindow(hwnd)
+            user32.BringWindowToTop(hwnd)
+            # -1 = HWND_TOPMOST，-2 = HWND_NOTOPMOST；只改 Z 序不动位置尺寸
+            flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
+            user32.SetWindowPos(hwnd, ctypes.c_void_p(-1), 0, 0, 0, 0, flags)
+            user32.SetWindowPos(hwnd, ctypes.c_void_p(-2), 0, 0, 0, 0, flags)
+        except Exception:  # noqa: BLE001
+            _log.exception("恢复窗口前台失败（截图回焦降级为网页提示）")
+
+    _run_window_loop(window, _perform, "npt-window-activate")
+    return True
+
+
 def _make_window_control_handler(window: Any, state: dict) -> Callable[[str, dict], dict]:
     """构造窗口控制回调（frameless 自绘标题栏的按钮/把手 → pywebview 原生动作）。
 
@@ -779,6 +823,9 @@ def _make_window_control_handler(window: Any, state: dict) -> Callable[[str, dic
             # 系统移动循环会阻塞到用户松开鼠标 → 与 HTTP 请求解耦，立即返回
             _start_caption_drag(window)
             return {"maximized": bool(state.get("maximized", False))}
+        if action == "activate":
+            # 截图共享其它应用窗口后把主窗口拉回前台；非 Windows / 无句柄时返回 False
+            return {"activated": _restore_foreground(window)}
         if action == "resize-edge":
             # 系统缩放循环会阻塞到用户松开鼠标 → 与 HTTP 请求解耦，立即返回
             if not _start_native_resize(window, str(params.get("direction") or "")):
@@ -877,6 +924,61 @@ def _error_html(message: str) -> str:
     )
 
 
+def _start_screenshot_hotkey(on_hotkey: Callable[[], None]) -> None:
+    """注册系统级 Alt+Z 截图热键（仅 Windows 桌面壳）。
+
+    RegisterHotKey(hwnd=None) 会把 WM_HOTKEY 投到**注册线程**的消息队列，因此必须
+    在专用线程里跑 GetMessageW 循环；GUI 线程已被 pywebview/WinForms 占用，不能复用。
+    热键只负责「记一次事件」（见 desktop_bridge），由前端轮询端点拉取，避免跨线程
+    直接操作 WebView2 控件 / evaluate_js 在窗口最小化时失效。
+    """
+    if os.name != "nt":
+        return
+
+    def _loop() -> None:
+        try:
+            from ctypes import wintypes
+
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+            MOD_ALT = 0x0001
+            MOD_NOREPEAT = 0x4000
+            WM_HOTKEY = 0x0312
+            VK_Z = 0x5A
+            HOTKEY_ID = 0x4E50  # 'NP'
+
+            user32.RegisterHotKey.argtypes = [
+                wintypes.HWND, ctypes.c_int, ctypes.c_uint, ctypes.c_uint,
+            ]
+            user32.RegisterHotKey.restype = ctypes.c_bool
+            if not user32.RegisterHotKey(None, HOTKEY_ID, MOD_ALT | MOD_NOREPEAT, VK_Z):
+                _log.warning("注册全局截图热键 Alt+Z 失败（可能被其它程序占用）：%s",
+                             ctypes.get_last_error())
+                return
+            _log.info("已注册全局截图热键 Alt+Z")
+            msg = wintypes.MSG()
+            user32.GetMessageW.argtypes = [
+                ctypes.POINTER(wintypes.MSG), wintypes.HWND,
+                ctypes.c_uint, ctypes.c_uint,
+            ]
+            user32.GetMessageW.restype = ctypes.c_int
+            while True:
+                result = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
+                if result in (0, -1):  # WM_QUIT / 出错
+                    break
+                if msg.message == WM_HOTKEY and int(msg.wParam or 0) == HOTKEY_ID:
+                    try:
+                        on_hotkey()
+                    except Exception:  # noqa: BLE001
+                        _log.exception("处理全局截图热键失败")
+            user32.UnregisterHotKey(None, HOTKEY_ID)
+        except Exception:  # noqa: BLE001
+            _log.exception("全局截图热键线程异常（应用内 Alt+Z 仍可用）")
+
+    threading.Thread(
+        target=_loop, daemon=True, name="npt-screenshot-hotkey",
+    ).start()
+
+
 def _create_window() -> Any:
     """创建主窗口并注册各类回调（初始显示启动页）。"""
     import webview
@@ -947,6 +1049,13 @@ def _create_window() -> Any:
         )
     except Exception as exc:  # noqa: BLE001
         _log.warning("注入窗口全屏/控制回调失败（地图全屏将退化为应用内全屏）：%s", exc)
+    # 系统级截图快捷键 Alt+Z：窗口不在前台 / 最小化时也能激活协作沟通截图
+    try:
+        from app import desktop_bridge
+
+        _start_screenshot_hotkey(desktop_bridge.notify_screenshot_hotkey)
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("注册全局截图热键失败（应用内 Alt+Z 仍可用）：%s", exc)
     return window
 
 

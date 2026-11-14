@@ -11,12 +11,18 @@ launcher 创建 pywebview 窗口后注入 ``window.destroy`` / ``window.set_titl
 """
 from __future__ import annotations
 
+import threading
 from typing import Callable, Optional
 
 _exit_handler: Optional[Callable[[], None]] = None
 _title_handler: Optional[Callable[[str], None]] = None
 _fullscreen_handler: Optional[Callable[[bool], None]] = None
 _window_control_handler: Optional[Callable[[str, dict], Optional[dict]]] = None
+
+# 系统级截图热键（Alt+Z）由 launcher 的 Win32 RegisterHotKey 线程触发。
+# 前端按序号增量消费：即使 WebView 处于后台 / evaluate_js 不可用也不会丢事件。
+_hotkey_lock = threading.Lock()
+_screenshot_hotkey_seq = 0
 
 
 def set_exit_handler(handler: Optional[Callable[[], None]]) -> None:
@@ -87,3 +93,17 @@ def control_window(action: str, params: Optional[dict] = None) -> Optional[dict]
         return _window_control_handler(action, params or {})
     except Exception:  # noqa: BLE001
         return None
+
+
+def notify_screenshot_hotkey() -> int:
+    """壳层捕获到全局 Alt+Z 时调用；返回递增后的序号。"""
+    global _screenshot_hotkey_seq
+    with _hotkey_lock:
+        _screenshot_hotkey_seq += 1
+        return _screenshot_hotkey_seq
+
+
+def screenshot_hotkey_seq() -> int:
+    """前端轮询读取当前序号；与上次读数不同即视为有一次热键。"""
+    with _hotkey_lock:
+        return _screenshot_hotkey_seq

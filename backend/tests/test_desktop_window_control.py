@@ -240,3 +240,41 @@ def test_drag_action_hands_over_to_native_caption_drag(monkeypatch):
     # 原生拖动期间不做任何窗口动作（最大化/还原由系统在处理移动循环时自行决定）
     assert window.calls == []
     assert state["maximized"] is True
+
+
+def test_activate_returns_false_without_native_handle():
+    """非 Windows / 无原生句柄时不能抛异常：截图回焦降级为网页端提示。"""
+    launcher = _load_launcher()
+    window = _FakeWindow()  # 没有 native 属性
+    handler, _ = _make_handler(launcher, window)
+
+    assert handler("activate", {}) == {"activated": False}
+    assert launcher._restore_foreground(window) is False
+
+
+def test_activate_dispatches_win32_restore_to_ui_loop(monkeypatch):
+    """Windows + 原生句柄：把前台恢复派发到 UI 线程，HTTP 请求立即返回 True。"""
+    launcher = _load_launcher()
+    window = _FakeWindow()
+    window.native = SimpleNamespace(Handle=SimpleNamespace(ToInt64=lambda: 123))
+    dispatched: list = []
+    monkeypatch.setattr(launcher, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(
+        launcher, "_run_window_loop",
+        lambda win, perform, name: dispatched.append((win, name)),
+    )
+
+    assert launcher._restore_foreground(window) is True
+    assert dispatched == [(window, "npt-window-activate")]
+
+    handler, _ = _make_handler(launcher, window)
+    assert handler("activate", {}) == {"activated": True}
+
+
+def test_unknown_window_action_still_rejected():
+    launcher = _load_launcher()
+    window = _FakeWindow()
+    handler, _ = _make_handler(launcher, window)
+
+    with pytest.raises(ValueError):
+        handler("shuffle", {})

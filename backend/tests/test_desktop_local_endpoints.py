@@ -216,6 +216,7 @@ def test_window_control_forwarded_to_shell(desktop_local):
             {"action": "toggle-maximize"},
             {"action": "close"},
             {"action": "resize-edge", "direction": "nw"},
+            {"action": "activate"},
         ]:
             resp = desktop_local.client.post("/api/v1/desktop/window-control", json=body)
             assert resp.status_code == 200, resp.text
@@ -225,6 +226,7 @@ def test_window_control_forwarded_to_shell(desktop_local):
             ("toggle-maximize", {}),
             ("close", {}),
             ("resize-edge", {"direction": "nw"}),
+            ("activate", {}),
         ]
     finally:
         desktop_bridge.set_window_control_handler(None)

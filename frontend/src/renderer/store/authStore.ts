@@ -79,6 +79,10 @@ function clearUserDataCaches() {
   import('./mapDataCacheStore')
     .then(({ useMapDataCacheStore }) => useMapDataCacheStore.getState().clearAll())
     .catch(() => { /* 非关键 */ })
+  // 协作沟通：消息/未读/会话/草稿/轮询都是按账号隔离的内存态，切账号必须彻底清理
+  import('./imStore')
+    .then(({ useImStore }) => useImStore.getState().resetForUserSwitch())
+    .catch(() => { /* 非关键 */ })
 }
 
 export const useAuthStore = create<AuthState>()(
@@ -145,6 +149,7 @@ export const useAuthStore = create<AuthState>()(
                 mode: (data.mode || desktopRunMode || 'shared') as 'shared' | 'standalone',
               },
             })
+            // 自身登录不弹气泡/不响敲门声：服务端广播只会推给「除自身外的其他用户端」
             return null
           }
 
@@ -156,6 +161,7 @@ export const useAuthStore = create<AuthState>()(
               isAuthenticated: true,
               isLoading: false,
             })
+            // 自身登录不弹气泡/不响敲门声：服务端广播已排除本账号的全部连接
             return result.warning || null
           } else {
             throw new Error((result as any).message || '登录失败')
@@ -255,6 +261,11 @@ export const useAuthStore = create<AuthState>()(
         })
         // 登出后清空所有用户的内存数据缓存，杜绝下一账号 TTL 内读到本组数据
         clearUserDataCaches()
+        // 断开 WebSocket：服务器侧的「已鉴权」标记随之清除，
+        // 免得登出后仍收到「用户上线」这类只应发给登录用户的提醒
+        import('../services/websocketService')
+          .then(({ websocketService }) => websocketService.disconnect())
+          .catch(() => { /* 非关键 */ })
         // 后台等通知发完即可（不阻塞 UI；测试/异常路径下也不会 unhandled rejection）
         await logoutRequest
       },

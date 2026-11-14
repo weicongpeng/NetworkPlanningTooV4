@@ -6,7 +6,8 @@
  *   WM_NCLBUTTONDOWN(HTCAPTION) 走**系统原生移动循环**（贴边最大化、侧边分屏、四分屏都靠它）。
  *   单击不触发拖动：最大化窗口若在按下瞬间就交给壳层，壳层会先还原窗口（单击也会"掉下来"）。
  *   双击标题区 = 最大化/还原。
- * - 按钮（仿原生窗口按钮，右对齐）：应用下载（原悬浮图标入口迁入）| 最小化 | 最大化/还原 | 关闭
+ * - 按钮（仿原生窗口按钮，右对齐）：协作沟通 | 应用下载 | 最小化 | 最大化/还原 | 关闭
+ *   两者都由原悬浮图标入口迁入；协作沟通在下载应用左侧，同款 BUTTON_CLASS 与 14px/1.5 线性图标
  * - 缩放把手：frameless 后原生边缘拖拽消失，这里贴视口四边 + 四角共八条热区；
  *   按下即经 POST /desktop/window-control resize-edge 交给壳层，由壳层发
  *   WM_NCLBUTTONDOWN(HTLEFT/HTTOP…) 进入**系统原生缩放循环** —— 四边四角都能拉，
@@ -18,8 +19,9 @@
  */
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { Boxes, Download } from 'lucide-react'
+import { Boxes, Download, MessageSquare } from 'lucide-react'
 import { useAuthStore } from '../store/authStore'
+import { useImStore } from '../store/imStore'
 import { desktopLoginApi } from '../services/api'
 import { useDesktopStatusLabel } from './desktopStatusLabel'
 import { AppDownloadDialog } from './AppDownloadDialog'
@@ -56,6 +58,10 @@ type PendingDrag = {
 export function WindowTitleBar() {
   const { t } = useTranslation()
   const desktopMode = useAuthStore((s) => s.desktopMode)
+  const desktopRunMode = useAuthStore((s) => s.desktopRunMode)
+  const unreadTotal = useImStore((s) => s.unreadTotal)
+  // 单机模式没有跨用户通信能力，与 ImHost 保持同一判定，按钮禁用并给出提示
+  const standalone = desktopMode && desktopRunMode === 'standalone'
   const desktopStatus = useDesktopStatusLabel()
   const [maximized, setMaximized] = useState(true) // 桌面启动即最大化
   const [showAppDownload, setShowAppDownload] = useState(false)
@@ -182,8 +188,19 @@ export function WindowTitleBar() {
           <Boxes size={16} className="shrink-0 text-primary" />
           <span className="truncate text-xs text-foreground">{title}</span>
         </div>
-        {/* 窗口按钮：应用下载 | 最小化 | 最大化/还原 | 关闭（仿原生：透明底 hover 浅灰，关闭 hover 红） */}
+        {/* 窗口按钮：协作沟通 | 应用下载 | 最小化 | 最大化/还原 | 关闭（仿原生：透明底 hover 浅灰，关闭 hover 红） */}
         <div className="flex h-full items-stretch">
+          <button
+            className={`${BUTTON_CLASS} relative ${standalone ? 'cursor-not-allowed opacity-40' : ''}`}
+            title={standalone ? t('im.standaloneHint') : t('im.title')}
+            disabled={standalone}
+            onClick={() => useImStore.getState().toggleOpen()}
+          >
+            <MessageSquare size={14} strokeWidth={1.5} />
+            {!standalone && unreadTotal > 0 && (
+              <span className="pointer-events-none absolute right-1.5 top-1.5 h-1.5 w-1.5 rounded-full bg-red-500" />
+            )}
+          </button>
           <button
             className={BUTTON_CLASS}
             title={t('app.downloadTitle')}

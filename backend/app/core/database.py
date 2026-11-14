@@ -94,6 +94,8 @@ def init_db():
     from app.models.database import (
         User, UserSession, Workbook, Site, Sector, GeoFile, Layer, UserSettings, TaskResult,
         TaskResultRow, TaskResultSourceGroup, DatasetRevision, SystemSetting,
+        ImConversation, ImConversationMember, ImAttachment, ImMessage, ImMessageMention,
+        ImGroupMeta,
     )  # noqa: F401
     Base.metadata.create_all(bind=engine)
 
@@ -113,6 +115,8 @@ def init_db():
             ("can_cell_entry", "ALTER TABLE users ADD COLUMN can_cell_entry BOOLEAN NOT NULL DEFAULT 0"),
             ("can_cell_query_update", "ALTER TABLE users ADD COLUMN can_cell_query_update BOOLEAN NOT NULL DEFAULT 0"),
             ("can_assistant", "ALTER TABLE users ADD COLUMN can_assistant BOOLEAN NOT NULL DEFAULT 0"),
+            ("avatar", "ALTER TABLE users ADD COLUMN avatar TEXT"),
+            ("nickname", "ALTER TABLE users ADD COLUMN nickname VARCHAR(64)"),
             ("usage_accounted_at", "ALTER TABLE user_sessions ADD COLUMN usage_accounted_at DATETIME"),
         ]
         for col_name, sql in migrations:
@@ -246,6 +250,22 @@ def init_db():
                 conn.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN city VARCHAR(100)")
             if "operator" not in table_cols:
                 conn.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN operator VARCHAR(50)")
+
+        # 迁移：协作沟通消息支持 @ 所有人标记（存量消息一律为 False）。
+        # 新表 im_message_mentions 由上方 create_all 建立，这里只补旧库缺的列。
+        im_msg_cols = [
+            row[1] for row in conn.exec_driver_sql("PRAGMA table_info(im_messages)").fetchall()
+        ]
+        if im_msg_cols and "mention_all" not in im_msg_cols:
+            conn.exec_driver_sql(
+                "ALTER TABLE im_messages ADD COLUMN mention_all BOOLEAN NOT NULL DEFAULT 0"
+            )
+        # 迁移：自建群头像（存量库补列），与 users.avatar 同为裁剪后的 base64 data URL
+        im_conv_cols = [
+            row[1] for row in conn.exec_driver_sql("PRAGMA table_info(im_conversations)").fetchall()
+        ]
+        if im_conv_cols and "avatar" not in im_conv_cols:
+            conn.exec_driver_sql("ALTER TABLE im_conversations ADD COLUMN avatar TEXT")
         conn.commit()
 
     # 存量无组/误归组数据一次性纠正。两项都是全表扫描（大库 8 张表 + join），

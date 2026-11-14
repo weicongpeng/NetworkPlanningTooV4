@@ -47,6 +47,10 @@ class User(Base):
     city = Column(String(100), nullable=True)
     operator = Column(String(50), nullable=True)
     user_type = Column(String(10), default='pc', nullable=False)
+    # 用户头像：前端裁剪后的 data:image/...;base64 字符串（限 256KB），NULL 为默认首字母头像
+    avatar = Column(Text, nullable=True)
+    # 协作沟通昵称：仅 IM 展示名使用，不改动登录账号 username；NULL/空串回落 username
+    nickname = Column(String(64), nullable=True)
     # 桌面版登录时选择的运行模式：shared=共享模式（权限/分组与网页端一致）
     # / standalone=单机模式（数据本机私有；权限同样按下方权限位，与网页端一致）。网页端恒为 NULL。
     desktop_run_mode = Column(String(16), nullable=True)
@@ -78,6 +82,8 @@ class User(Base):
             "city": self.city,
             "operator": self.operator,
             "user_type": self.user_type,
+            "avatar": self.avatar,
+            "nickname": self.nickname,
             "is_desktop_shadow": self.is_desktop_shadow,
             "desktop_run_mode": self.desktop_run_mode,
             "can_data_import": self.can_data_import,
@@ -635,3 +641,116 @@ class StationMetricRow(Base):
     __table_args__ = (
         Index("idx_metric_rows_query", "user_id", "cell_name", "metric_name", "metric_time"),
     )
+
+
+def _utcnow_iso() -> str:
+    """协作沟通模块统一时间格式（与业务表 String(30) 约定一致）。"""
+    return datetime.now(timezone.utc).isoformat()
+
+
+class ImConversation(Base):
+    """协作沟通 - 会话。
+
+    kind: direct(单聊) / auto_group(按地市+运营商自动群) / custom_group(自建跨组群)
+    group_key 为幂等唯一键：direct = d:<小uid>:<大uid>，
+    auto_group = g:<city>:<operator>；custom_group 为 NULL。
+    """
+    __tablename__ = "im_conversations"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    kind = Column(String(20), nullable=False, index=True)
+    group_key = Column(String(191), nullable=True)
+    name = Column(String(128), nullable=True)
+    owner_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    # 群头像（仅自建群可改）：前端裁剪后的 data:image/...;base64 字符串，NULL 为默认群图标
+    avatar = Column(Text, nullable=True)
+    city = Column(String(100), nullable=True)
+    operator = Column(String(50), nullable=True)
+    last_message_id = Column(Integer, nullable=True)
+    last_message_at = Column(String(30), nullable=True, index=True)
+    created_at = Column(String(30), nullable=False, default=_utcnow_iso)
+
+    __table_args__ = (
+        Index("idx_im_conv_group_key", "group_key", unique=True),
+    )
+
+
+class ImConversationMember(Base):
+    """协作沟通 - 会话成员（IM 自身的可见性边界，与业务数据组隔离解耦）。"""
+    __tablename__ = "im_conversation_members"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    conversation_id = Column(Integer, ForeignKey("im_conversations.id"), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    role = Column(String(16), nullable=False, default="member")
+    last_read_message_id = Column(Integer, nullable=False, default=0)
+    muted = Column(Boolean, nullable=False, default=False)
+    joined_at = Column(String(30), nullable=False, default=_utcnow_iso)
+
+    __table_args__ = (
+        Index("idx_im_member_conv_user", "conversation_id", "user_id", unique=True),
+        Index("idx_im_member_user", "user_id"),
+    )
+
+
+class ImAttachment(Base):
+    """协作沟通 - 附件（先上传后发消息，落盘于 NPT_IM_ATTACHMENT_DIR）。"""
+    __tablename__ = "im_attachments"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    conversation_id = Column(Integer, ForeignKey("im_conversations.id"), nullable=False, index=True)
+    uploader_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    original_name = Column(String(255), nullable=False)
+    stored_name = Column(String(255), nullable=False)
+    mime = Column(String(128), nullable=False, default="application/octet-stream")
+    size_bytes = Column(Integer, nullable=False, default=0)
+    storage_path = Column(String(512), nullable=False)
+    thumb_path = Column(String(512), nullable=True)
+    created_at = Column(String(30), nullable=False, default=_utcnow_iso)
+
+
+class ImMessage(Base):
+    """协作沟通 - 消息（id 单调递增，直接作为增量拉取游标）。"""
+    __tablename__ = "im_messages"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    conversation_id = Column(Integer, ForeignKey("im_conversations.id"), nullable=False)
+    sender_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    kind = Column(String(16), nullable=False, default="text")
+    content_text = Column(Text, nullable=True)
+    attachment_id = Column(Integer, ForeignKey("im_attachments.id"), nullable=True)
+    client_msg_id = Column(String(64), nullable=True)
+    # 是否 @所有人；具体被点名成员固化在 im_message_mentions，成员后续增减不改历史归属
+    mention_all = Column(Boolean, nullable=False, default=False)
+    created_at = Column(String(30), nullable=False, default=_utcnow_iso)
+
+    __table_args__ = (
+        Index("idx_im_msg_conv_id", "conversation_id", "id"),
+        Index("idx_im_msg_client", "conversation_id", "sender_id", "client_msg_id", unique=True),
+    )
+
+
+class ImMessageMention(Base):
+    """协作沟通 - 被 @ 的成员（发送时刻展开后的用户 id 快照）。"""
+    __tablename__ = "im_message_mentions"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    message_id = Column(Integer, ForeignKey("im_messages.id"), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+
+    __table_args__ = (
+        Index("idx_im_mention_msg_user", "message_id", "user_id", unique=True),
+        Index("idx_im_mention_user", "user_id"),
+    )
+
+
+class ImGroupMeta(Base):
+    """协作沟通 - 群元信息（自动群标记与成员数冗余）。"""
+    __tablename__ = "im_group_meta"
+
+    conversation_id = Column(Integer, ForeignKey("im_conversations.id"), primary_key=True)
+    owner_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    is_auto = Column(Boolean, nullable=False, default=False)
+    city = Column(String(100), nullable=True)
+    operator = Column(String(50), nullable=True)
+    member_count = Column(Integer, nullable=False, default=0)

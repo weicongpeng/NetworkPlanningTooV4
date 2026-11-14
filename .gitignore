@@ -102,3 +102,6 @@ mobile-app/tsc_errors.txt
 /.tool_view_test.txt
 /.qoder/
 /frontend/src/renderer/utils/__tests__/zz-*.test.ts
+.gstack/
+# 本地 agent 会话草稿，不进产品仓库
+/.codebuddy/plans/
