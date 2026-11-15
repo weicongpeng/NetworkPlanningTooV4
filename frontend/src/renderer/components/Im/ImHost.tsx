@@ -100,7 +100,11 @@ export function ImHost() {
     if (!user || standalone) return
     const detach = attachImEvents()
     void useImStore.getState().bootstrap()
-    useImStore.getState().startPolling(desktopMode ? 5000 : 15000)
+    // 桌面共享模式没有服务端 WS 广播，消息全靠本机后端转发到云端 relay：
+    // 用 1.5s 高频轮询会话列表，且窗口收起/失焦也不停（单机模式不走这段逻辑）。
+    // 消息一落地就把未读数推到标题栏「项目沟通」红点并触发提示音；窗口重新
+    // 可见时 startPolling 还会立即补刷一次，避免等下一个 tick。
+    useImStore.getState().startPolling(desktopMode ? 1500 : 15000, desktopMode)
     return detach
   }, [user, desktopMode, standalone])
 

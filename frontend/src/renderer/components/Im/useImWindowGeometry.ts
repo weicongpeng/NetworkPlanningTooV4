@@ -1,5 +1,11 @@
-/** 全局 fixed 浮窗几何：拖拽 / 8 向缩放 / 视口钳制 / 最大化 / 按用户持久化。
- * 拖拽期间直接改 DOM style 且不触发 React 重渲染，松手才提交状态，保证不掉帧。
+/**
+ * 全局 fixed 浮窗几何：拖拽 / 8 向缩放 / 视口钳制 / 最大化 / 按用户持久化。
+ *
+ * 「用户期望几何」（preferred，落盘）与「当前视口钳制后的显示几何」（rect）分开保存：
+ * 桌面端切页面 / 地图全屏 / 窗口还原会让视口短暂变小，旧实现把钳制结果写回偏好，
+ * 视口恢复后窗口也不会自己变回来（用户报的「切页面回来窗口自动缩小」）。
+ * 现在 resize 只按偏好重新钳制，偏好只在用户主动拖拽 / 缩放 / 还原时更新；
+ * 最大化状态单独持久化，窗口重新挂载后不会退回普通尺寸。
  */
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import type { PointerEvent as ReactPointerEvent } from 'react'
@@ -17,6 +23,19 @@ function storageKey(userId: number | null): string {
   return `im-window-geometry-user-${userId ?? 'anon'}`
 }
 
+function maximizedKey(userId: number | null): string {
+  return `im-window-maximized-user-${userId ?? 'anon'}`
+}
+
+/** 最大化矩形：铺满自绘标题栏以下的窗口内容区 */
+function maximizedRect(topOffset: number): ImRect {
+  return {
+    x: EDGE, y: topOffset,
+    w: window.innerWidth - EDGE * 2,
+    h: window.innerHeight - topOffset - EDGE * 2,
+  }
+}
+
 function defaultRect(topOffset: number): ImRect {
   const w = Math.min(DEFAULT_W, Math.max(MIN_W, window.innerWidth - EDGE * 2))
   const h = Math.min(DEFAULT_H, Math.max(MIN_H, window.innerHeight - topOffset - EDGE * 2))
@@ -27,17 +46,31 @@ function defaultRect(topOffset: number): ImRect {
   }
 }
 
-function loadRect(userId: number | null, topOffset: number): ImRect {
+/** 读取用户期望几何；旧版本存的也是纯 ImRect，格式兼容 */
+function loadPreferred(userId: number | null, topOffset: number): ImRect {
   try {
     const raw = localStorage.getItem(storageKey(userId))
     if (raw) {
       const parsed = JSON.parse(raw) as ImRect
-      if (typeof parsed.x === 'number' && typeof parsed.w === 'number') {
-        return clampRect(parsed, topOffset)
+      if (typeof parsed.x === 'number' && typeof parsed.y === 'number'
+          && typeof parsed.w === 'number' && typeof parsed.h === 'number') {
+        return parsed
       }
     }
   } catch { /* 几何损坏时回落到默认 */ }
   return defaultRect(topOffset)
+}
+
+function loadMaximized(userId: number | null): boolean {
+  try { return localStorage.getItem(maximizedKey(userId)) === '1' } catch { return false }
+}
+
+function savePreferred(userId: number | null, rect: ImRect): void {
+  try { localStorage.setItem(storageKey(userId), JSON.stringify(rect)) } catch { /* 隐私模式忽略 */ }
+}
+
+function saveMaximized(userId: number | null, value: boolean): void {
+  try { localStorage.setItem(maximizedKey(userId), value ? '1' : '0') } catch { /* 隐私模式忽略 */ }
 }
 
 function clampRect(rect: ImRect, topOffset: number): ImRect {
@@ -59,30 +92,50 @@ function applyDom(element: HTMLElement | null, rect: ImRect): void {
 }
 
 export function useImWindowGeometry(userId: number | null, topOffset: number) {
-  const [rect, setRect] = useState<ImRect>(() => loadRect(userId, topOffset))
-  const [maximized, setMaximized] = useState(false)
+  // 懒初始化：localStorage 只在挂载时读一次，避免每次重渲染重复解析
+  const initialRef = useRef<{
+    preferred: ImRect; rect: ImRect; maximized: boolean
+  } | null>(null)
+  if (initialRef.current === null) {
+    const preferred = loadPreferred(userId, topOffset)
+    const maximized = loadMaximized(userId)
+    initialRef.current = {
+      preferred,
+      rect: maximized ? maximizedRect(topOffset) : clampRect(preferred, topOffset),
+      maximized,
+    }
+  }
+  const initial = initialRef.current
+
+  const [rect, setRect] = useState<ImRect>(initial.rect)
+  const [maximized, setMaximized] = useState(initial.maximized)
   const rectRef = useRef(rect)
+  /** 用户主动设定的尺寸：不随视口临时变化被改小 */
+  const preferredRef = useRef<ImRect>(initial.preferred)
   const restoreRef = useRef<ImRect | null>(null)
   const elementRef = useRef<HTMLDivElement | null>(null)
   const topOffsetRef = useRef(topOffset)
   topOffsetRef.current = topOffset
 
-  const commit = useCallback((next: ImRect) => {
+  /**
+   * 写入显示几何。只有 persist=true 才同步更新并落盘用户期望几何：
+   * resize 造成的视口钳制必须传 false，否则视口一小窗口尺寸就被永久改小。
+   */
+  const commit = useCallback((next: ImRect, persist = true) => {
     const clamped = clampRect(next, topOffsetRef.current)
     rectRef.current = clamped
     applyDom(elementRef.current, clamped)
     setRect(clamped)
-    try { localStorage.setItem(storageKey(userId), JSON.stringify(clamped)) } catch { /* 隐私模式忽略 */ }
+    if (persist) {
+      preferredRef.current = next
+      savePreferred(userId, next)
+    }
   }, [userId])
 
   useEffect(() => {
     const onResize = () => {
-      if (maximized) {
-        commit({ x: EDGE, y: topOffsetRef.current, w: window.innerWidth - EDGE * 2,
-                 h: window.innerHeight - topOffsetRef.current - EDGE * 2 })
-      } else {
-        commit(rectRef.current)
-      }
+      if (maximized) commit(maximizedRect(topOffsetRef.current), false)
+      else commit(preferredRef.current, false)
     }
     window.addEventListener('resize', onResize)
     return () => window.removeEventListener('resize', onResize)
@@ -158,16 +211,20 @@ export function useImWindowGeometry(userId: number | null, topOffset: number) {
 
   const toggleMaximize = useCallback(() => {
     if (maximized) {
-      commit(restoreRef.current || defaultRect(topOffsetRef.current))
+      // 重新挂载后 restoreRef 为空，回落到最后保存的普通尺寸
+      const restore = restoreRef.current || preferredRef.current
       restoreRef.current = null
+      commit(restore)
+      saveMaximized(userId, false)
       setMaximized(false)
     } else {
-      restoreRef.current = { ...rectRef.current }
-      commit({ x: EDGE, y: topOffsetRef.current, w: window.innerWidth - EDGE * 2,
-               h: window.innerHeight - topOffsetRef.current - EDGE * 2 })
+      restoreRef.current = { ...preferredRef.current }
+      // 最大化矩形只是临时显示，不能覆盖用户偏好
+      commit(maximizedRect(topOffsetRef.current), false)
+      saveMaximized(userId, true)
       setMaximized(true)
     }
-  }, [commit, maximized])
+  }, [commit, maximized, userId])
 
   return {
     rect, elementRef,

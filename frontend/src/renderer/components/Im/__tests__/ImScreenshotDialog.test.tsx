@@ -234,6 +234,16 @@ describe('协作沟通截图对话框', () => {
     await waitFor(() => expect(windowControl).toHaveBeenCalledWith('activate'))
   })
 
+  it('桌面端从自绘标题栏下方铺满窗口，编辑工具栏不被状态栏遮挡', async () => {
+    desktopState.desktopMode = true
+    const { img } = await captureFrame()
+    const overlay = document.body.querySelector('[data-screenshot-overlay]') as HTMLElement
+    expect(overlay.style.top).toBe('32px')
+    expect(overlay.className).toContain('z-[10000]')
+    // 图片显示高度同步扣掉标题栏，不会被容器裁切
+    expect(img.style.maxHeight).toBe('calc(100vh - 116px)')
+  })
+
   it('需求 1：抓帧成功、编辑页挂载后重试 activate（前台锁定也不停留在被选窗口）', async () => {
     desktopState.desktopMode = true
     const getDisplayMedia = vi.fn().mockResolvedValue(resolvedStream())

@@ -282,3 +282,21 @@ def test_group_management_routes_and_avatar(client):
     client.current["user"] = client.users[0]
     assert client.delete(f"/api/v1/im/conversations/{gid}").status_code == 200
     assert client.get(f"/api/v1/im/conversations/{gid}").status_code == 404
+
+
+def test_conversations_rate_limit_relaxed_in_shared_desktop(client, monkeypatch):
+    """桌面共享模式 1.5s 轮询会话列表及时刷红点，旧的 60 次/分钟限流不能把它打回 429。"""
+    monkeypatch.setattr(im_endpoint.im_desktop_proxy, "is_shared_desktop", lambda: True)
+    monkeypatch.setattr(
+        im_endpoint.im_desktop_proxy, "forward",
+        lambda op, args, **kwargs: {"items": [], "server_time": ""},
+    )
+    for _ in range(65):
+        assert client.get("/api/v1/im/conversations").status_code == 200
+
+
+def test_conversations_rate_limit_unchanged_on_web(client):
+    """网页端沿用旧阈值：超过 60 次/分钟仍返回 429。"""
+    for _ in range(60):
+        assert client.get("/api/v1/im/conversations").status_code == 200
+    assert client.get("/api/v1/im/conversations").status_code == 429

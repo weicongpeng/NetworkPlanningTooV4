@@ -1,6 +1,6 @@
 /** 真实 ImWindow 组件树冒烟：窗口壳、Tab 切换、置顶层级、最小化与 Esc。 */
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { fireEvent, render, screen } from '@testing-library/react'
+import { act, fireEvent, render, screen } from '@testing-library/react'
 
 // 与真实 i18next 行为对齐：t(key, 'default') / t(key, { defaultValue, ...interpolation })
 // 两种写法都要能拿到可读文案，否则 React 会把 options 对象当子节点渲染。
@@ -36,9 +36,28 @@ import { imApi } from '../../../services/api'
 import { useImStore } from '../../../store/imStore'
 import { ImWindow } from '../ImWindow'
 
+const GEOMETRY_KEY = 'im-window-geometry-user-1'
+const MAXIMIZED_KEY = 'im-window-maximized-user-1'
+
+function setViewport(width: number, height: number) {
+  Object.defineProperty(window, 'innerWidth', {
+    configurable: true, writable: true, value: width,
+  })
+  Object.defineProperty(window, 'innerHeight', {
+    configurable: true, writable: true, value: height,
+  })
+}
+
+function windowSize(): { w: number; h: number } {
+  const dialog = screen.getByRole('dialog') as HTMLElement
+  return { w: parseFloat(dialog.style.width), h: parseFloat(dialog.style.height) }
+}
+
 describe('项目沟通窗口', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    localStorage.clear()
+    setViewport(1024, 768)
     useImStore.getState().stopPolling()
     useImStore.setState({
       open: true, activeTab: 'messages', activeConversationId: null,
@@ -101,5 +120,46 @@ describe('项目沟通窗口', () => {
     fireEvent.keyDown(input, { key: 'Escape' })
     expect(onClose).toHaveBeenCalledTimes(1)
     input.remove()
+  })
+
+  it('桌面端切页面/窗口缩放导致视口临时变小时不缩水，视口恢复后回到原尺寸', () => {
+    const preferred = { x: 60, y: 60, w: 900, h: 600 }
+    localStorage.setItem(GEOMETRY_KEY, JSON.stringify(preferred))
+    render(<ImWindow userId={1} desktopMode onClose={vi.fn()} />)
+    expect(windowSize()).toEqual({ w: 900, h: 600 })
+
+    act(() => {
+      setViewport(700, 500)
+      window.dispatchEvent(new Event('resize'))
+    })
+    expect(windowSize().w).toBeLessThan(900)
+    // 视口钳制结果绝不能写回用户偏好，否则切回页面后窗口永久变小
+    expect(JSON.parse(localStorage.getItem(GEOMETRY_KEY)!)).toEqual(preferred)
+
+    act(() => {
+      setViewport(1024, 768)
+      window.dispatchEvent(new Event('resize'))
+    })
+    expect(windowSize()).toEqual({ w: 900, h: 600 })
+  })
+
+  it('最大化状态持久化：重新打开窗口仍铺满，还原后回到原尺寸', () => {
+    const preferred = { x: 60, y: 60, w: 900, h: 600 }
+    localStorage.setItem(GEOMETRY_KEY, JSON.stringify(preferred))
+    const first = render(<ImWindow userId={1} desktopMode onClose={vi.fn()} />)
+    fireEvent.click(screen.getByTitle('最大化'))
+    expect(windowSize()).toEqual({ w: 1008, h: 712 })
+    expect(localStorage.getItem(MAXIMIZED_KEY)).toBe('1')
+    expect(JSON.parse(localStorage.getItem(GEOMETRY_KEY)!)).toEqual(preferred)
+
+    // 切到其它页面再回来（窗口重新挂载）仍保持最大化，不会退回普通尺寸
+    first.unmount()
+    render(<ImWindow userId={1} desktopMode onClose={vi.fn()} />)
+    expect(windowSize()).toEqual({ w: 1008, h: 712 })
+    expect(screen.getByTitle('还原')).toBeTruthy()
+
+    fireEvent.click(screen.getByTitle('还原'))
+    expect(windowSize()).toEqual({ w: 900, h: 600 })
+    expect(localStorage.getItem(MAXIMIZED_KEY)).toBe('0')
   })
 })

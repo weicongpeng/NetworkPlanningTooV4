@@ -6,6 +6,13 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 
 const blobMock = vi.fn()
+const { desktopState } = vi.hoisted(() => ({ desktopState: { desktopMode: false } }))
+vi.mock('../../../store/authStore', () => ({
+  useAuthStore: Object.assign(
+    (selector: (state: typeof desktopState) => unknown) => selector(desktopState),
+    { getState: () => desktopState },
+  ),
+}))
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
     t: (key: string, arg?: string | Record<string, unknown>) => {
@@ -32,6 +39,7 @@ beforeEach(() => {
   createObjectURL.mockClear()
   revokeObjectURL.mockClear()
   blobMock.mockReset()
+  desktopState.desktopMode = false
   blobMock.mockResolvedValue(new Blob(['img'], { type: 'image/png' }))
 })
 
@@ -91,5 +99,19 @@ describe('图片灯箱', () => {
     await waitFor(() => expect(document.querySelector('img')).toBeTruthy())
     expect(blobMock).not.toHaveBeenCalled()
     expect(createObjectURL).toHaveBeenCalledWith(file)
+  })
+
+  it('桌面端避开自绘标题栏并置于最上层，顶部工具条不被遮挡', () => {
+    desktopState.desktopMode = true
+    const { unmount } = render(<ImImageLightbox source={source} onClose={() => {}} />)
+    const overlay = document.querySelector('[data-im-lightbox]') as HTMLElement
+    expect(overlay.style.top).toBe('32px')
+    expect(overlay.className).toContain('z-[10000]')
+    unmount()
+
+    // 网页端仍从视口顶部铺满
+    desktopState.desktopMode = false
+    render(<ImImageLightbox source={source} onClose={() => {}} />)
+    expect((document.querySelector('[data-im-lightbox]') as HTMLElement).style.top).toBe('')
   })
 })

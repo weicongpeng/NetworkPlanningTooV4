@@ -17,13 +17,42 @@ import { imApi } from '../../services/api'
 import { IM_MESSAGE_EVENT } from '../../services/websocketService'
 import { playImMessageSound } from '../../utils/messageSound'
 import { attachImEvents, useImStore } from '../imStore'
-import type { ImMessage } from '../../components/Im/types'
+import type {
+  ImConversation, ImConversationsData, ImEnvelope, ImMessage, ImMessageKind, ImMessagesPage,
+} from '../../components/Im/types'
 
 function message(id: number, text = `消息-${id}`): ImMessage {
   return {
     id, conversation_id: 7, sender_id: 1, sender_name: 'alice', kind: 'text',
     content_text: text, attachment: null, client_msg_id: null,
     created_at: new Date().toISOString(),
+  }
+}
+
+/** 会话列表轮询用：last_message 是桌面端无 WS 时唯一能看到的新消息线索 */
+function conversation(lastId: number | null, senderId = 2,
+                      kind: ImMessageKind = 'text'): ImConversation {
+  return {
+    id: 7, kind: 'direct', name: null, group_key: null, other_user: null,
+    member_count: 2,
+    last_message: lastId === null ? null : {
+      id: lastId, kind, preview: 'hi', sender_id: senderId,
+      sender_name: 'alice', created_at: new Date().toISOString(),
+    },
+    last_message_at: null, unread: 0, muted: false,
+  }
+}
+
+function conversationsPage(items: ImConversation[]): ImEnvelope<ImConversationsData> {
+  return { success: true, data: { items, server_time: '' } }
+}
+
+function messagesPage(items: ImMessage[], next: number | null): ImEnvelope<ImMessagesPage> {
+  return {
+    success: true,
+    data: {
+      items, has_more: false, next_cursor: next, prev_cursor: items[0]?.id ?? null,
+    },
   }
 }
 
@@ -331,5 +360,118 @@ describe('imStore', () => {
     expect(useImStore.getState().conversations.some(c => c.id === 6)).toBe(true)
     expect(imApi.messages).toHaveBeenCalled()
     expect(useImStore.getState().error).toBeNull()
+  })
+
+  it('桌面端会话列表轮询补播「叮咚」：首次只建基线，自己发的与 system 不响', async () => {
+    localStorage.setItem('auth-storage', JSON.stringify({ state: { user: { id: 1 } } }))
+    useImStore.setState({ open: true, activeConversationId: null })
+
+    vi.mocked(imApi.conversations).mockResolvedValue(conversationsPage([conversation(10)]))
+    await useImStore.getState().refreshConversations()
+    expect(playImMessageSound).not.toHaveBeenCalled()
+
+    vi.mocked(imApi.conversations).mockResolvedValue(conversationsPage([conversation(11)]))
+    await useImStore.getState().refreshConversations()
+    expect(playImMessageSound).toHaveBeenCalledTimes(1)
+
+    // 同一条消息重复刷新不叠播
+    await useImStore.getState().refreshConversations()
+    expect(playImMessageSound).toHaveBeenCalledTimes(1)
+
+    vi.mocked(imApi.conversations).mockResolvedValue(conversationsPage([conversation(12, 1)]))
+    await useImStore.getState().refreshConversations()
+    vi.mocked(imApi.conversations).mockResolvedValue(
+      conversationsPage([conversation(13, 2, 'system')]))
+    await useImStore.getState().refreshConversations()
+    expect(playImMessageSound).toHaveBeenCalledTimes(1)
+  })
+
+  it('轮询增量与 WS 共用同一条提示音：他人消息响，重复/自己/被@不叠播', async () => {
+    localStorage.setItem('auth-storage', JSON.stringify({ state: { user: { id: 1 } } }))
+    useImStore.setState({ activeConversationId: 7, open: true })
+    vi.mocked(imApi.messages)
+      .mockResolvedValueOnce(messagesPage([], 100))
+      .mockResolvedValueOnce(messagesPage([{ ...message(101), sender_id: 2 }], 101))
+      .mockResolvedValueOnce(messagesPage([{ ...message(102), sender_id: 2 }], 102))
+      .mockResolvedValueOnce(messagesPage([{ ...message(103), sender_id: 2, mentioned_me: true }], 103))
+      .mockResolvedValueOnce(messagesPage([{ ...message(104), sender_id: 1 }], 104))
+
+    await useImStore.getState().loadMessages(7, 'initial')
+    expect(playImMessageSound).not.toHaveBeenCalled()
+
+    const detach = attachImEvents()
+    window.dispatchEvent(new CustomEvent(IM_MESSAGE_EVENT, {
+      detail: { sender_id: 2, conversation_id: 7, message_id: 101 },
+    }))
+    expect(playImMessageSound).toHaveBeenCalledTimes(1)
+
+    await useImStore.getState().loadMessages(7, 'incremental')
+    expect(playImMessageSound).toHaveBeenCalledTimes(1) // WS 已登记，增量不双响
+
+    await useImStore.getState().loadMessages(7, 'incremental')
+    expect(playImMessageSound).toHaveBeenCalledTimes(2) // 无 WS 的桌面轮询路径
+
+    await useImStore.getState().loadMessages(7, 'incremental')
+    expect(playImMessageSound).toHaveBeenCalledTimes(2) // 被 @ 走专用三音，不叠播叮咚
+    expect(useImStore.getState().mentionNotice).not.toBeNull()
+
+    await useImStore.getState().loadMessages(7, 'incremental')
+    expect(playImMessageSound).toHaveBeenCalledTimes(2) // 自己发的不响
+    detach()
+  })
+
+  it('桌面共享模式窗口收起后仍轮询会话列表，网页端保持只在窗口打开时轮询', () => {
+    vi.useFakeTimers()
+    useImStore.setState({ open: false })
+    useImStore.getState().startPolling(1000, true)
+    vi.advanceTimersByTime(1000)
+    expect(imApi.conversations).toHaveBeenCalledTimes(1)
+    useImStore.getState().stopPolling()
+
+    vi.clearAllMocks()
+    useImStore.getState().startPolling(1000)
+    vi.advanceTimersByTime(1000)
+    expect(imApi.conversations).not.toHaveBeenCalled()
+    useImStore.getState().stopPolling()
+    vi.useRealTimers()
+  })
+
+  it('会话列表刷新失败（429/网络错误）时保留未读红点，不清空会话', async () => {
+    useImStore.setState({ open: false })
+    vi.mocked(imApi.conversations).mockResolvedValueOnce(
+      conversationsPage([{ ...conversation(20), unread: 3 }]))
+    await useImStore.getState().refreshConversations()
+    expect(useImStore.getState().unreadTotal).toBe(3)
+
+    vi.mocked(imApi.conversations).mockResolvedValueOnce({
+      success: false, message: 'IM_RATE_LIMITED', code: 429,
+    } as unknown as ImEnvelope<ImConversationsData>)
+    await useImStore.getState().refreshConversations()
+    expect(useImStore.getState().unreadTotal).toBe(3)
+    expect(useImStore.getState().conversations).toHaveLength(1)
+  })
+
+  it('桌面端页面隐藏仍轮询未读，窗口重新可见时立即补刷一次', () => {
+    vi.useFakeTimers()
+    const visibility = { value: 'hidden' as DocumentVisibilityState }
+    Object.defineProperty(document, 'visibilityState', {
+      configurable: true, get: () => visibility.value,
+    })
+    useImStore.setState({ open: false })
+    useImStore.getState().startPolling(1000, true)
+    vi.advanceTimersByTime(1000)
+    expect(imApi.conversations).toHaveBeenCalledTimes(1) // hidden 也继续刷红点
+
+    visibility.value = 'visible'
+    window.dispatchEvent(new Event('focus'))
+    expect(imApi.conversations).toHaveBeenCalledTimes(2) // 立即补刷，不等下一个 tick
+    window.dispatchEvent(new Event('focus'))
+    expect(imApi.conversations).toHaveBeenCalledTimes(2) // 1s 节流避免重复打
+
+    useImStore.getState().stopPolling()
+    window.dispatchEvent(new Event('focus'))
+    expect(imApi.conversations).toHaveBeenCalledTimes(2) // 停止后监听已移除
+    Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' })
+    vi.useRealTimers()
   })
 })

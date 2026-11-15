@@ -77,6 +77,13 @@ const MIN_SCALE = 0.2
 const MAX_SCALE = 8
 const ZOOM_STEP = 1.12
 
+/**
+ * 桌面端自绘标题栏（WindowTitleBar 的 h-8）高度。
+ * 截图编辑层默认全屏铺满，桌面端需从标题栏下沿开始，否则单行编辑工具栏
+ * 会被「共享模式 · 已同步」那一行盖住；剩余区域仍然铺满整个窗口。
+ */
+const DESKTOP_TITLEBAR_HEIGHT = 32
+
 /** 工具栏图标按钮：只显示图标，title 做悬浮冒泡提示 */
 function IconButton({ title, onClick, disabled, active, tone, children }: {
   title: string
@@ -312,6 +319,7 @@ function ShapeNode({ shape, stroke, index }: {
 
 export function ImScreenshotDialog({ open, onClose, onConfirm }: Props) {
   const { t, i18n: i18nInstance } = useTranslation()
+  const desktopMode = useAuthStore(s => s.desktopMode)
   const [source, setSource] = useState<SourceItem | null>(null)
   const [crop, setCrop] = useState<CropRect | null>(null)
   const [tool, setTool] = useState<Tool>('crop')
@@ -825,7 +833,8 @@ export function ImScreenshotDialog({ open, onClose, onConfirm }: Props) {
   // 都会给 position:fixed 创建新的包含块，导致遮罩只有输入框那么大且面板被裁掉。
   return createPortal(
     <div data-screenshot-overlay
-         className="fixed inset-0 z-[7500] flex bg-black/70 backdrop-blur-sm"
+         className="fixed inset-0 z-[10000] flex bg-black/70 backdrop-blur-sm"
+         style={desktopMode ? { top: DESKTOP_TITLEBAR_HEIGHT } : undefined}
          onMouseDown={event => { if (event.target === event.currentTarget) onClose() }}>
       <div className={`flex flex-col overflow-hidden bg-card shadow-2xl
         ${maximized
@@ -982,7 +991,10 @@ export function ImScreenshotDialog({ open, onClose, onConfirm }: Props) {
                   width: imgRef.current?.clientWidth ?? 0,
                   height: imgRef.current?.clientHeight ?? 0,
                 })}
-                className={`block max-w-full select-none object-contain ${maximized ? 'max-h-[calc(100vh-84px)]' : 'max-h-[calc(88vh-84px)]'}`}
+                className="block max-w-full select-none object-contain"
+                style={{
+                  maxHeight: `calc(${maximized ? '100vh' : '88vh'} - ${84 + (desktopMode ? DESKTOP_TITLEBAR_HEIGHT : 0)}px)`,
+                }}
               />
               <canvas ref={mosaicCanvasRef}
                       className="pointer-events-none absolute left-0 top-0 h-full w-full"

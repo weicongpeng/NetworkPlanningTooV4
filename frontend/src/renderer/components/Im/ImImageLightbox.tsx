@@ -16,12 +16,20 @@ import {
 } from 'lucide-react'
 
 import { imApi } from '../../services/api'
+import { useAuthStore } from '../../store/authStore'
 import { formatBytes } from './types'
 import type { ImLightboxSource } from './types'
 
 const MIN_SCALE = 0.2
 const MAX_SCALE = 8
 const ZOOM_STEP = 1.15
+
+/**
+ * 桌面端自绘标题栏（WindowTitleBar 的 h-8）高度。
+ * 灯箱 portal 到 body，若不避开标题栏，顶部缩放/下载/关闭工具条会被
+ * 「共享模式 · 已同步」那一行盖住；桌面端从标题栏下沿开始铺满窗口其余区域。
+ */
+const DESKTOP_TITLEBAR_HEIGHT = 32
 
 function clampScale(value: number): number {
   return Math.min(MAX_SCALE, Math.max(MIN_SCALE, value))
@@ -34,6 +42,7 @@ interface Props {
 
 export function ImImageLightbox({ source, onClose }: Props) {
   const { t } = useTranslation()
+  const desktopMode = useAuthStore(s => s.desktopMode)
   const [url, setUrl] = useState<string | null>(null)
   const [failed, setFailed] = useState(false)
   const [scale, setScale] = useState(1)
@@ -141,7 +150,9 @@ export function ImImageLightbox({ source, onClose }: Props) {
   })
 
   return createPortal(
-    <div className="fixed inset-0 z-[7000] flex flex-col bg-black/85 backdrop-blur-sm"
+    <div data-im-lightbox
+         className="fixed inset-0 z-[10000] flex flex-col bg-black/85 backdrop-blur-sm"
+         style={desktopMode ? { top: DESKTOP_TITLEBAR_HEIGHT } : undefined}
          onClick={onClose}>
       {/* 顶部工具条：图标 + title 悬浮提示 */}
       <div className="flex shrink-0 items-center justify-end gap-0.5 px-3 py-2"

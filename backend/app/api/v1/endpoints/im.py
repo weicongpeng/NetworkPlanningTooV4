@@ -112,7 +112,10 @@ class AttachmentIdRequest(BaseModel):
 @router.get("/conversations")
 def list_conversations(db: Session = Depends(get_db),
                        user: User = Depends(get_current_user)):
-    return _ok(_run("list_conversations", {}, db, user, limit=60))
+    # 桌面共享模式没有服务端 WS 广播，前端以 1.5s 轮询会话列表及时更新未读红点。
+    # 与打开会话、发送成功后的刷新叠加后，旧阈值 60 次/分钟会误触发 429，这里放宽。
+    limit = 240 if im_desktop_proxy.is_shared_desktop() else 60
+    return _ok(_run("list_conversations", {}, db, user, limit=limit))
 
 
 @router.post("/conversations")

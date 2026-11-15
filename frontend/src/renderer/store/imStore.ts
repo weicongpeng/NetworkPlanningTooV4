@@ -93,7 +93,8 @@ interface ImState {
   handleImMessage: (detail: any) => void
   handlePresence: (detail: any) => void
   resync: () => void
-  startPolling: (intervalMs?: number) => void
+  /** pollWhenClosed：桌面共享模式没有 WS 广播，窗口收起时也要继续感知新消息（未读 + 提示音） */
+  startPolling: (intervalMs?: number, pollWhenClosed?: boolean) => void
   stopPolling: () => void
   resetForUserSwitch: () => void
 }
@@ -143,6 +144,8 @@ function clearActiveUnread(conversations: ImConversation[], activeId: number | n
 let pollTimer: number | null = null
 let refreshTimer: number | null = null
 let refreshQueued = false
+/** 桌面端窗口重新可见时的立即刷新监听（由 startPolling 注册、stopPolling 移除） */
+let pollFocusHandler: (() => void) | null = null
 /** 同一会话的成员请求合并为一个 Promise，避免每次键入 @ 都发请求 */
 const membersInFlight = new Map<number, Promise<ImMember[]>>()
 /** WS 与轮询可能都带来同一条被 @ 消息，按 messageId 去重；限长防长会话内存增长 */
@@ -157,6 +160,55 @@ function markMentionNotified(messageId: number): boolean {
     if (oldest !== undefined) notifiedMentionIds.delete(oldest)
   }
   return true
+}
+
+/**
+ * 「新消息叮咚」按 messageId 去重：网页端 WS 通知、轮询增量与会话列表刷新
+ * 可能带来同一条消息，只响一次。桌面共享模式没有服务端 WS 推送，新消息全靠
+ * 5s 轮询，所以轮询路径也必须接上音效，声效才与网页端一致。
+ */
+const soundedMessageIds = new Set<number>()
+function markMessageSoundNotified(messageId: number): boolean {
+  if (!(messageId > 0) || soundedMessageIds.has(messageId)) return false
+  soundedMessageIds.add(messageId)
+  if (soundedMessageIds.size > 500) {
+    const oldest = soundedMessageIds.values().next().value
+    if (oldest !== undefined) soundedMessageIds.delete(oldest)
+  }
+  return true
+}
+
+/** 会话列表快照：conversationId → last_message.id。首次刷新只建基线，不把历史当新消息 */
+let conversationLastIds: Map<number, number> | null = null
+
+/**
+ * 桌面共享模式没有服务端 WS 广播：窗口打开但没进入任何会话、或消息落在其它会话时，
+ * 只有会话列表轮询能看到新消息。这里补播与网页端 WS 路径同款的「叮咚」。
+ * 当前激活会话交给 loadMessages 增量处理（能识别被 @ 并走专用上行三音），避免叠播。
+ */
+function playConversationMessageSound(
+  conversations: ImConversation[], activeId: number | null, open: boolean,
+) {
+  const myId = currentUserId()
+  const next = new Map<number, number>()
+  conversations.forEach(conv => {
+    if (conv.last_message) next.set(conv.id, conv.last_message.id)
+  })
+  const previous = conversationLastIds
+  conversationLastIds = next
+  if (!previous) return
+  let hasFresh = false
+  conversations.forEach(conv => {
+    const last = conv.last_message
+    // 窗口打开时活跃会话由 loadMessages 增量负责（能区分 @，走专用上行三音）；
+    // 窗口收起后没有增量补拉，所有会话都由这里补播「叮咚」。
+    if (!last || (open && conv.id === activeId) || last.kind === 'system') return
+    if (myId !== null && last.sender_id === myId) return
+    const before = previous.get(conv.id)
+    if (before !== undefined && last.id <= before) return
+    if (markMessageSoundNotified(last.id)) hasFresh = true
+  })
+  if (hasFresh) playImMessageSound()
 }
 
 const initialState = {
@@ -237,12 +289,16 @@ export const useImStore = create<ImState>()(
 
       refreshConversations: async () => {
         const response = await imApi.conversations()
+        // 高频轮询下偶发 429 / 网络失败时，响应拦截器返回 { success:false } 且没有 data。
+        // 此时不能把会话列表与未读红点清空，保留上次成功结果等下一个 tick 重试。
+        if (response && response.success === false) return
         const items = response?.data?.items || []
         const online = { ...get().online }
         items.forEach(conv => {
           if (conv.other_user) online[conv.other_user.id] = conv.other_user.is_online
         })
         const state = get()
+        playConversationMessageSound(items, state.activeConversationId, state.open)
         const conversations = clearActiveUnread(items, state.activeConversationId, state.open)
         set({
           conversations,
@@ -312,8 +368,8 @@ export const useImStore = create<ImState>()(
         if (direction === 'older' && !params.before_id) return
         try {
           const page = (await imApi.messages(id, params)).data
-          const merged = mergeMessages(
-            direction === 'initial' ? [] : (get().messages[id] || []), page.items)
+          const existing = direction === 'initial' ? [] : (get().messages[id] || [])
+          const merged = mergeMessages(existing, page.items)
           set(s => ({
             messages: { ...s.messages, [id]: merged },
             cursors: {
@@ -327,17 +383,31 @@ export const useImStore = create<ImState>()(
           }))
           // 桌面共享模式可能没有 WS，靠轮询兜底；只有 incremental 方向提醒，
           // 打开历史/上拉更早消息不触发，避免翻记录时刷屏。WS 路径与这里按 messageId 去重。
+          // 普通新消息在这里补播「叮咚」：桌面端没有 WS 通知，这是唯一能拿到消息正文的路径。
           if (direction === 'incremental') {
             const myId = currentUserId()
-            page.items.forEach(item => {
-              if (!item.mentioned_me || (myId !== null && item.sender_id === myId)) return
-              get().notifyMention({
-                messageId: item.id,
-                conversationId: id,
-                senderName: item.sender_name,
-                mentionAll: Boolean(item.mention_all),
+            const existingIds = new Set(existing.map(item => item.id))
+            // 没有游标说明尚未加载过该会话，整页都是历史，先建基线不提醒
+            const hasBaseline = Boolean(state.cursors[id])
+            let shouldChime = false
+            if (hasBaseline) {
+              page.items.forEach(item => {
+                if (existingIds.has(item.id) || item.kind === 'system') return
+                if (myId !== null && item.sender_id === myId) return
+                if (item.mentioned_me || item.mention_all) {
+                  // 被 @ 只走专用提醒（Toast + 上行三音），不叠播普通「叮咚」
+                  get().notifyMention({
+                    messageId: item.id,
+                    conversationId: id,
+                    senderName: item.sender_name,
+                    mentionAll: Boolean(item.mention_all),
+                  })
+                  return
+                }
+                if (markMessageSoundNotified(item.id)) shouldChime = true
               })
-            })
+              if (shouldChime) playImMessageSound()
+            }
           }
           const last = merged[merged.length - 1]
           if (direction !== 'older' && last && get().activeConversationId === id) {
@@ -655,26 +725,55 @@ export const useImStore = create<ImState>()(
         }
       },
 
-      startPolling: (intervalMs = 8000) => {
+      startPolling: (intervalMs = 8000, pollWhenClosed = false) => {
         if (pollTimer !== null) return
         let ticks = 0
+        // 通讯录/在线状态固定约 20s 校准一次，不随会话列表轮询变快而放大请求量
+        const contactsEveryTicks = Math.max(4, Math.ceil(20000 / intervalMs))
         pollTimer = window.setInterval(() => {
-          if (document.visibilityState !== 'visible') return
+          // 网页端窗口隐藏时省请求；桌面共享模式没有服务端 WS 广播，隐藏/失焦也要继续刷未读，
+          // 否则切出去再回来时标题栏「项目沟通」红点会一直停在旧值
+          if (document.visibilityState !== 'visible' && !pollWhenClosed) return
           const state = useImStore.getState()
-          if (!state.open) return
+          if (!state.open && !pollWhenClosed) return
           ticks += 1
           void state.refreshConversations().catch(() => {})
-          // 在线状态低频批量校准：约每 4 个 tick 一次，补齐页面隐藏期间漏掉的离线事件
-          if (ticks % 4 === 0) void state.refreshContacts().catch(() => {})
-          if (state.activeConversationId !== null) {
+          if (ticks % contactsEveryTicks === 0) void state.refreshContacts().catch(() => {})
+          // 窗口收起时只刷会话列表（未读 + 提示音），不补拉当前会话正文
+          if (state.open && state.activeConversationId !== null) {
             void state.loadMessages(state.activeConversationId, 'incremental')
           }
         }, intervalMs)
+
+        if (pollWhenClosed) {
+          // 切回桌面窗口 / 页面重新可见时立刻补一次：轮询间隔内到达的消息也能马上
+          // 反映到标题栏红点上，不必等下一个 tick。1s 节流避免 focus 与 visibilitychange 双触发
+          let lastRefreshAt = 0
+          const onVisible = () => {
+            if (document.visibilityState !== 'visible') return
+            const now = Date.now()
+            if (now - lastRefreshAt < 1000) return
+            lastRefreshAt = now
+            const state = useImStore.getState()
+            void state.refreshConversations().catch(() => {})
+            if (state.open && state.activeConversationId !== null) {
+              void state.loadMessages(state.activeConversationId, 'incremental').catch(() => {})
+            }
+          }
+          pollFocusHandler = onVisible
+          window.addEventListener('focus', onVisible)
+          document.addEventListener('visibilitychange', onVisible)
+        }
       },
 
       stopPolling: () => {
         if (pollTimer !== null) { window.clearInterval(pollTimer); pollTimer = null }
         if (refreshTimer !== null) { window.clearTimeout(refreshTimer); refreshTimer = null }
+        if (pollFocusHandler) {
+          window.removeEventListener('focus', pollFocusHandler)
+          document.removeEventListener('visibilitychange', pollFocusHandler)
+          pollFocusHandler = null
+        }
         refreshQueued = false
       },
 
@@ -684,6 +783,8 @@ export const useImStore = create<ImState>()(
         // 群成员名单与 @ 去重记录都按账号隔离，切账号必须一起清掉
         membersInFlight.clear()
         notifiedMentionIds.clear()
+        soundedMessageIds.clear()
+        conversationLastIds = null
         set({ ...initialState })
       },
     }),
@@ -718,7 +819,10 @@ export function attachImEvents(): () => void {
         mentionAll: Boolean(detail.mention_all),
       })
     } else if (!fromMe && !isSystem) {
-      playImMessageSound()
+      // 登记 message_id：随后 WS 触发的增量补拉 / 会话列表刷新不会再响一次。
+      // 旧服务端轻通知不带 id 时保持原行为（仍响），由提示音自身的节流兜底。
+      const messageId = Number(detail.message_id) || 0
+      if (!messageId || markMessageSoundNotified(messageId)) playImMessageSound()
     }
     useImStore.getState().handleImMessage(detail)
   }

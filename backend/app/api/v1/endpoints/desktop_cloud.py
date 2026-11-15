@@ -1292,7 +1292,9 @@ def _relay_user_id(db: Session, record) -> int:
 def im_relay(payload: ImRelayRequest, request: Request,
              db: Session = Depends(get_db)):
     """桌面共享模式 IM 操作中继：验签 → 解析真实用户 → 执行白名单 op。"""
-    _rate_limit(f"im-relay:{_client_ip(request)}", limit=180, window=60)
+    # 桌面端会话列表 1.5s 轮询（约 40 次/分钟/客户端），同一公网出口下多台桌面端
+    # 叠加时旧阈值 180 次/分钟会把读请求打回 429，导致未读红点丢失；仍保留限流防滥用。
+    _rate_limit(f"im-relay:{_client_ip(request)}", limit=600, window=60)
     record, _ = _verify_license(payload.license_file, payload.machine_code, db)
     user_id = _relay_user_id(db, record)
     from app.services import im_ops
