@@ -293,6 +293,20 @@ def init_db():
         conn.exec_driver_sql(
             "CREATE INDEX IF NOT EXISTS idx_im_msg_sender_conv_id "
             "ON im_messages(conversation_id, sender_id, id)")
+        # IM 在线状态在每次会话列表/通讯录/群成员查询里都要扫 user_sessions，
+        # 存量库没有这个复合索引时会随会话数增长线性变慢。
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_session_online "
+            "ON user_sessions(logout_time, last_activity)")
+        # 引用回复（历史消息右键菜单）
+        im_msg_cols = [
+            row[1] for row in conn.exec_driver_sql(
+                "PRAGMA table_info(im_messages)").fetchall()
+        ]
+        if im_msg_cols and "reply_to_id" not in im_msg_cols:
+            conn.exec_driver_sql(
+                "ALTER TABLE im_messages ADD COLUMN reply_to_id INTEGER "
+                "REFERENCES im_messages(id)")
         conn.commit()
 
     # 存量无组/误归组数据一次性纠正。两项都是全表扫描（大库 8 张表 + join），

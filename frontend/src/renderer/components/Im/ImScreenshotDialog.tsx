@@ -27,9 +27,9 @@ import { createPortal } from 'react-dom'
 import { useTranslation } from 'react-i18next'
 import type { LucideIcon } from 'lucide-react'
 import {
-  AppWindow, ArrowRight, Check, Circle, Crop, Download, Hand,
-  Image as ImageIcon, LayoutGrid, Loader2, Maximize2, Minimize2, Minus, Monitor,
-  Palette, RefreshCw, RotateCcw, Square, Trash2, Type, Undo2, X,
+  AppWindow, ArrowUpRight, Check, Circle, Crop, Download, Hand,
+  Image as ImageIcon, LayoutGrid, Loader2, Maximize2, Minimize2, Monitor,
+  Palette, RefreshCw, RotateCcw, RotateCw, Slash, Square, Trash2, Type, Undo2, X,
   ZoomIn, ZoomOut,
 } from 'lucide-react'
 
@@ -76,8 +76,8 @@ const TOOL_ITEMS: { key: Tool; icon: LucideIcon; label: string; fallback: string
   { key: 'crop', icon: Crop, label: 'im.screenshot.toolCrop', fallback: '裁剪' },
   { key: 'rect', icon: Square, label: 'im.screenshot.toolRect', fallback: '矩形' },
   { key: 'ellipse', icon: Circle, label: 'im.screenshot.toolEllipse', fallback: '圆形' },
-  { key: 'line', icon: Minus, label: 'im.screenshot.toolLine', fallback: '直线' },
-  { key: 'arrow', icon: ArrowRight, label: 'im.screenshot.toolArrow', fallback: '箭头' },
+  { key: 'line', icon: Slash, label: 'im.screenshot.toolLine', fallback: '直线' },
+  { key: 'arrow', icon: ArrowUpRight, label: 'im.screenshot.toolArrow', fallback: '箭头' },
   { key: 'text', icon: Type, label: 'im.screenshot.toolText', fallback: '文字' },
   { key: 'mosaic', icon: LayoutGrid, label: 'im.screenshot.toolMosaic', fallback: '马赛克' },
 ]
@@ -347,6 +347,9 @@ export function ImScreenshotDialog({
   const [scale, setScale] = useState(1)
   const [offset, setOffset] = useState<Offset>({ x: 0, y: 0 })
   const [panMode, setPanMode] = useState(false)
+  // 截图旋转角度（0/90/180/270）：施加在图片与所有标注的公共外层，
+  // 输出时按同角度旋转合成画布，标注/裁剪坐标始终保存在「原图」坐标系。
+  const [rotation, setRotation] = useState(0)
 
   const imgRef = useRef<HTMLImageElement | null>(null)
   const viewportRef = useRef<HTMLDivElement | null>(null)
@@ -403,6 +406,7 @@ export function ImScreenshotDialog({
     setDraftShape(null)
     setTextDraft(null)
     setTool('crop')
+    setRotation(0)
     dragRef.current = null
     resetView()
   }, [commitMosaicDraft, setDraftShape, resetView])
@@ -661,15 +665,23 @@ export function ImScreenshotDialog({
   const captureSupported = screenCaptureAvailable()
   const insecure = window.isSecureContext === false
 
-  /** 事件坐标 → 原图像素：getBoundingClientRect 已含缩放/平移变换，换算天然正确 */
+  /** 事件坐标 → 原图像素：getBoundingClientRect 已含缩放/平移/旋转，先反旋再换算 */
   const pointFromEvent = (clientX: number, clientY: number): Point | null => {
     const rendered = imgRef.current
-    if (!rendered || !source) return null
+    if (!rendered || !source || !displaySize.width || !displaySize.height) return null
     const rect = rendered.getBoundingClientRect()
     if (!rect.width || !rect.height) return null
+    // 旋转后 rect 是轴对齐包围盒；绕其中心反旋回图像自身坐标系（含 scale 的显示尺寸）
+    const shownW = displaySize.width * scale
+    const shownH = displaySize.height * scale
+    const rad = -rotation * Math.PI / 180
+    const dx = clientX - (rect.left + rect.width / 2)
+    const dy = clientY - (rect.top + rect.height / 2)
+    const rx = dx * Math.cos(rad) - dy * Math.sin(rad)
+    const ry = dx * Math.sin(rad) + dy * Math.cos(rad)
     return {
-      x: clamp((clientX - rect.left) * source.width / rect.width, 0, source.width),
-      y: clamp((clientY - rect.top) * source.height / rect.height, 0, source.height),
+      x: clamp((rx + shownW / 2) * source.width / shownW, 0, source.width),
+      y: clamp((ry + shownH / 2) * source.height / shownH, 0, source.height),
     }
   }
 
@@ -815,7 +827,17 @@ export function ImScreenshotDialog({
     ctx.drawImage(full, box.x, box.y, sw, sh, 0, 0, sw, sh)
     full.width = 0
     full.height = 0
-    return canvasToPng(canvas)
+    if (!rotation) return canvasToPng(canvas)
+    // 输出按同角度旋转：90/270 交换宽高；标注/裁剪仍在原图坐标系，无需重算
+    const turned = document.createElement('canvas')
+    turned.width = rotation % 180 === 90 ? sh : sw
+    turned.height = rotation % 180 === 90 ? sw : sh
+    const tctx = turned.getContext('2d')
+    if (!tctx) { setNoticeKey('im.screenshot.failed'); return null }
+    tctx.translate(turned.width / 2, turned.height / 2)
+    tctx.rotate(rotation * Math.PI / 180)
+    tctx.drawImage(canvas, -canvas.width / 2, -canvas.height / 2)
+    return canvasToPng(turned)
   }
 
   const emit = async (useCrop: boolean) => {
@@ -922,9 +944,13 @@ export function ImScreenshotDialog({
                           onClick={() => applyScale(scaleRef.current * ZOOM_STEP)}>
                 <ZoomIn size={16} />
               </IconButton>
-              <IconButton title={t('im.screenshot.zoomReset', '复位视图（100%）')}
-                          onClick={resetView}>
+              <IconButton title={t('im.screenshot.rotateLeft', '向左旋转 90°')}
+                          onClick={() => setRotation(value => (value + 270) % 360)}>
                 <RotateCcw size={16} />
+              </IconButton>
+              <IconButton title={t('im.screenshot.rotateRight', '向右旋转 90°')}
+                          onClick={() => setRotation(value => (value + 90) % 360)}>
+                <RotateCw size={16} />
               </IconButton>
             </>
           )}
@@ -1016,7 +1042,7 @@ export function ImScreenshotDialog({
                style={{ touchAction: 'none', cursor: panMode ? 'grab' : (tool === 'text' ? 'text' : 'crosshair') }}>
             <div className="relative inline-flex max-h-full max-w-full"
                  style={{
-                   transform: `translate(${offset.x}px, ${offset.y}px) scale(${scale})`,
+                   transform: `translate(${offset.x}px, ${offset.y}px) scale(${scale}) rotate(${rotation}deg)`,
                    transformOrigin: 'center center',
                  }}>
               <img

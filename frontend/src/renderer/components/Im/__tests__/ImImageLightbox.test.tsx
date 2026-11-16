@@ -74,6 +74,13 @@ describe('图片灯箱', () => {
     await waitFor(() => expect(screen.getByText('115%')).toBeTruthy())
   })
 
+  it('工具条不再提供「复位」按钮（保留双击复位手势）', async () => {
+    render(<ImImageLightbox source={source} onClose={() => {}} />)
+    await waitFor(() => expect(document.querySelector('img')).toBeTruthy())
+    expect(screen.queryByTitle('复位')).toBeNull()
+    expect(screen.queryByTitle('im.lightbox.reset')).toBeNull()
+  })
+
   it('双击舞台复位到 100%', async () => {
     render(<ImImageLightbox source={source} onClose={() => {}} />)
     await waitFor(() => expect(document.querySelector('img')).toBeTruthy())

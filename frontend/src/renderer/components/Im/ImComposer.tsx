@@ -97,8 +97,9 @@ export function ImComposer({ conversationId }: { conversationId: number }) {
   const uploadProgress = useImStore(s => s.uploadProgress)
   const error = useImStore(s => s.error)
   const ensureMembers = useImStore(s => s.ensureMembers)
-  const invalidateMembers = useImStore(s => s.invalidateMembers)
   const setLightbox = useImStore(s => s.setLightbox)
+  const replyTo = useImStore(s => s.replyTo)
+  const setReplyTo = useImStore(s => s.setReplyTo)
   const conversation = useImStore(s => s.conversations.find(c => c.id === conversationId) || null)
   const members = useImStore(s => s.membersByConversation[conversationId]) || EMPTY_MEMBERS
   const myId = useAuthStore(s => s.user?.id ?? null)
@@ -131,9 +132,8 @@ export function ImComposer({ conversationId }: { conversationId: number }) {
     setEmojiOpen(false)
     clearPending()
     clearMentions()
-    // 每次进入会话让成员名单失效，下次输入 @ 会重新拉取，避免其他用户增删成员后名单过期
-    if (isGroup) invalidateMembers(conversationId)
-  }, [conversationId, draftFor, clearPending, clearMentions, isGroup, invalidateMembers])
+    // 成员名单由 ensureMembers 的短 TTL 缓存维护；进入会话不再强制回源（共享模式走公网 relay）
+  }, [conversationId, draftFor, clearPending, clearMentions])
 
   // 全局截图（输入框按钮 / Alt+Z）产出的 File 由 imStore 队列送到「当前会话」输入框。
   // 截图时若还没有激活会话，文件会一直留在队列里，等用户打开任一会话后自动补进来。
@@ -538,6 +538,22 @@ export function ImComposer({ conversationId }: { conversationId: number }) {
           </button>
         )}
       </div>
+
+      {replyTo && (
+        <div className="mx-3 mt-2 flex items-center gap-2 rounded-lg border-l-2 border-primary bg-primary/5 px-3 py-1.5 text-[11px]">
+          <div className="min-w-0 flex-1">
+            <span className="font-medium">{replyTo.sender_name || t('im.message.me', '我')}：</span>
+            <span className="line-clamp-1">
+              {replyTo.content_text || (replyTo.attachment ? replyTo.attachment.original_name : '')}
+            </span>
+          </div>
+          <button type="button" onClick={() => setReplyTo(null)}
+                  title={t('im.common.cancel', '取消')}
+                  className="rounded p-0.5 text-muted-foreground hover:bg-accent cursor-pointer">
+            <X size={13} />
+          </button>
+        </div>
+      )}
 
       <div className="flex items-end gap-2 px-3 pb-3 pt-1.5">
         <textarea

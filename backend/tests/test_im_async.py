@@ -1,6 +1,7 @@
 """IM 实时链路的异步治理回归：并发广播、短超时 relay、来源 IP 归一化。"""
 from __future__ import annotations
 
+import base64
 from types import SimpleNamespace
 
 import httpx
@@ -134,6 +135,53 @@ def test_forward_maps_client_errors_without_retry(monkeypatch):
         proxy.forward("list_messages", {})
     assert exc.value.status_code == 429
     assert calls == [1]  # 4xx 不重试
+
+
+def test_fetch_signed_attachment_uses_binary_get(monkeypatch):
+    """签名直链拿到的是图片字节，不再 base64 塞在 JSON 里。"""
+    from app.services import im_desktop_proxy as proxy
+
+    monkeypatch.setattr(proxy, "server_url", lambda: "https://app.pengwc.asia")
+    calls = []
+
+    class _Client:
+        def get(self, url, **kwargs):
+            calls.append((url, kwargs))
+            return httpx.Response(
+                200, content=b"\x89PNGDATA",
+                headers={"Content-Type": "image/png",
+                         "Content-Disposition": "inline; filename*=UTF-8''%E7%85%A7%E7%89%87.png"},
+            )
+
+    monkeypatch.setattr(proxy, "_get_client", lambda: _Client())
+    content, mime, filename = proxy.fetch_signed_attachment({
+        "token": "123.3.abc", "path": "/api/v1/im/attachments/signed/7", "thumb": False,
+    })
+    assert content == b"\x89PNGDATA" and mime == "image/png" and filename == "照片.png"
+    assert calls[0][0].startswith("https://app.pengwc.asia/api/v1/im/attachments/signed/7?token=")
+    assert calls[0][1]["timeout"] == proxy.RELAY_ATTACHMENT_TIMEOUT_SECONDS
+
+
+def test_shared_attachment_bytes_falls_back_to_legacy(monkeypatch):
+    """老生产后端不认识 attachment_urls：自动退回 base64 relay，不让图片空白。"""
+    from fastapi import HTTPException
+
+    from app.api.v1.endpoints import im as im_endpoint
+
+    calls = []
+
+    def _fake_run(op, args, db, user, limit=60):
+        calls.append(op)
+        if op == "attachment_urls":
+            raise HTTPException(status_code=404, detail="IM_UNKNOWN_OP")
+        return {"content_b64": base64.b64encode(b"legacy").decode(),
+                "mime": "image/png", "filename": "old.png"}
+
+    monkeypatch.setattr(im_endpoint, "_run", _fake_run)
+    content, mime, filename = im_endpoint._shared_attachment_bytes(
+        7, False, object(), SimpleNamespace(id=3))
+    assert content == b"legacy" and mime == "image/png" and filename == "old.png"
+    assert calls == ["attachment_urls", "attachment_download"]
 
 
 def test_relay_client_ip_prefers_cf_connecting_ip():

@@ -50,6 +50,7 @@ export function ImSidebar({ onSelectConversation }: Props) {
   const titleLabels = useMemo(() => ({
     unknownUser: t('im.sidebar.unknownUser', '用户'),
     unnamedGroup: t('im.sidebar.unnamedGroup', '未命名群组'),
+    self: t('im.sidebar.self', '自己'),
   }), [t])
 
   const filteredConversations = useMemo(() => {

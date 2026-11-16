@@ -83,6 +83,10 @@ function clearUserDataCaches() {
   import('./imStore')
     .then(({ useImStore }) => useImStore.getState().resetForUserSwitch())
     .catch(() => { /* 非关键 */ })
+  // 聊天图片缓存里是上一账号可见的附件字节，同样不能跨账号保留
+  import('../services/imAttachmentCache')
+    .then(({ clearImAttachmentCache }) => clearImAttachmentCache())
+    .catch(() => { /* 非关键 */ })
 }
 
 export const useAuthStore = create<AuthState>()(

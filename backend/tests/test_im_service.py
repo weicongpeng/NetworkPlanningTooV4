@@ -56,9 +56,47 @@ def test_direct_conversation_is_idempotent_and_allows_cross_group(db):
     two = im_service.create_direct(db, ids["alice"], ids["carol"])
     assert one["conversation"]["id"] == two["conversation"]["id"]
     assert one["created"] is True and two["created"] is False
-    with pytest.raises(HTTPException) as exc:
-        im_service.create_direct(db, ids["alice"], ids["alice"])
-    assert exc.value.status_code == 400
+
+
+def test_self_direct_conversation_allows_sending_to_self(db):
+    """点击自己通讯录 / 发消息给自己：单成员 direct 会话，幂等且可读可写。"""
+    ids = _users(db)
+    one = im_service.create_direct(db, ids["alice"], ids["alice"])
+    two = im_service.create_direct(db, ids["alice"], ids["alice"])
+    assert one["created"] is True and two["created"] is False
+    conv_id = one["conversation"]["id"]
+    assert [m["id"] for m in im_service.list_members(db, conv_id, ids["alice"])] == [ids["alice"]]
+    sent = im_service.send_message(db, conv_id, ids["alice"], "text", "给自己留个备注")
+    assert sent["created"] is True
+    items = im_service.list_messages(db, conv_id, ids["alice"])["items"]
+    assert [m["content_text"] for m in items] == ["给自己留个备注"]
+    conv = next(c for c in im_service.list_conversations(db, ids["alice"])["items"]
+                if c["id"] == conv_id)
+    assert conv["is_self"] is True and conv["member_count"] == 1
+
+
+def test_message_quote_delete_and_forward(db):
+    """历史消息右键菜单的服务端语义：引用、删除（断引用）、转发到群。"""
+    ids = _users(db)
+    alice, bob = ids["alice"], ids["bob"]
+    conv = im_service.create_direct(db, alice, bob)["conversation"]["id"]
+    first = im_service.send_message(db, conv, alice, "text", "原始消息")["message"]
+    quoted = im_service.send_message(
+        db, conv, bob, "text", "收到", reply_to_id=first["id"])["message"]
+    assert quoted["reply_to"]["preview"] == "原始消息"
+    assert quoted["reply_to"]["sender_id"] == alice
+
+    target = im_service.create_custom_group(db, alice, "转发目标", [bob])["id"]
+    result = im_service.forward_messages(db, alice, [first["id"]], [target])
+    assert result["count"] == 1
+    forwarded = im_service.list_messages(db, target, alice)["items"]
+    assert [m["content_text"] for m in forwarded] == ["原始消息"]
+    assert forwarded[0]["sender_id"] == alice
+
+    im_service.delete_message(db, conv, first["id"], alice)
+    remaining = im_service.list_messages(db, conv, alice)["items"]
+    assert [m["id"] for m in remaining] == [quoted["id"]]
+    assert remaining[0]["reply_to"] is None  # 被引用消息删除后只清空引用，不删回复
 
 
 def test_custom_group_members_and_guard(db):

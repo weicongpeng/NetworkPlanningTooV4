@@ -9,15 +9,17 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { useTranslation } from 'react-i18next'
-import { Camera, KeyRound, Loader2, Settings2, Trash2, X } from 'lucide-react'
+import {
+  Camera, FolderOpen, HardDrive, KeyRound, Loader2, Settings2, Trash2, X,
+} from 'lucide-react'
 
-import { desktopLoginApi, imApi } from '../services/api'
+import { clearImAttachmentCache, desktopLoginApi, imApi } from '../services/api'
 import { useAuthStore } from '../store/authStore'
 import { useImStore } from '../store/imStore'
 import { useToastStore } from '../store/toastStore'
 import type { UserSettingsMode } from './Im/userSettingsBus'
 import { ImAvatar } from './Im/ImAvatar'
-import { imDisplayName } from './Im/types'
+import { formatBytes, imDisplayName } from './Im/types'
 import {
   prepareAvatar, prepareAvatarFromVideo, validateAvatarDataUrl,
 } from './Im/avatarUtils'
@@ -72,6 +74,15 @@ export function UserSettingsDialog({ open, onClose, mode = 'app' }: Props) {
   const [passwordError, setPasswordError] = useState('')
   const [passwordBusy, setPasswordBusy] = useState(false)
 
+  const [storagePath, setStoragePath] = useState('')
+  const [storageDefault, setStorageDefault] = useState('')
+  const [storageUsage, setStorageUsage] = useState<{
+    total_files: number; total_bytes: number
+  } | null>(null)
+  const [storageBusy, setStorageBusy] = useState(false)
+  const [cleanBusy, setCleanBusy] = useState(false)
+  const [storageError, setStorageError] = useState('')
+
   useEffect(() => {
     if (!open) return
     setAvatar(user?.avatar ?? null)
@@ -84,6 +95,22 @@ export function UserSettingsDialog({ open, onClose, mode = 'app' }: Props) {
     setConfirmPassword('')
     setCameraOpen(false)
   }, [open, user?.avatar, user?.nickname, user?.id, mode])
+
+  // 项目沟通左下角设置 + 桌面端：读取当前档的本地存储路径与占用
+  useEffect(() => {
+    if (!open || !desktopMode || mode !== 'im') return
+    let cancelled = false
+    void desktopLoginApi.imStorageState().then((res: any) => {
+      if (cancelled || !res?.data) return
+      setStoragePath(res.data.path || '')
+      setStorageDefault(res.data.default_path || '')
+      setStorageUsage(res.data.usage || null)
+      setStorageError('')
+    }).catch(() => {
+      if (!cancelled) setStorageError(t('im.storage.loadFailed', '读取本地存储设置失败'))
+    })
+    return () => { cancelled = true }
+  }, [open, desktopMode, mode, t])
 
   if (!open || !user) return null
 
@@ -185,6 +212,55 @@ export function UserSettingsDialog({ open, onClose, mode = 'app' }: Props) {
     }
   }
 
+  const reloadStorage = async () => {
+    const res: any = await desktopLoginApi.imStorageState()
+    if (res?.data) {
+      setStoragePath(res.data.path || '')
+      setStorageDefault(res.data.default_path || '')
+      setStorageUsage(res.data.usage || null)
+    }
+  }
+
+  const applyStoragePath = async () => {
+    setStorageBusy(true)
+    setStorageError('')
+    try {
+      await desktopLoginApi.imStorageSetPath(storagePath)
+      await reloadStorage()
+      clearImAttachmentCache()
+      useToastStore.getState().show(t('im.storage.applied', '保存路径已更新'))
+    } catch (err) {
+      setStorageError(serverErrorText(err, 'im.storage.applyFailed', '保存路径修改失败', tr))
+    } finally {
+      setStorageBusy(false)
+    }
+  }
+
+  const pickStorageDir = async () => {
+    try {
+      const res: any = await desktopLoginApi.imStoragePickDirectory()
+      if (res?.data?.picked) setStoragePath(res.data.picked)
+    } catch {
+      setStorageError(t('im.storage.pickFailed', '无法打开目录选择框，请手工输入路径'))
+    }
+  }
+
+  const cleanStorage = async () => {
+    setCleanBusy(true)
+    setStorageError('')
+    try {
+      const res: any = await desktopLoginApi.imStorageClean()
+      clearImAttachmentCache()
+      await reloadStorage()
+      useToastStore.getState().show(t('im.storage.cleaned', '已清理 {{count}} 个文件，释放 {{size}}',
+        { count: res?.data?.deleted_files ?? 0, size: formatBytes(res?.data?.freed_bytes ?? 0) }))
+    } catch (err) {
+      setStorageError(serverErrorText(err, 'im.storage.cleanFailed', '清理失败，请重试', tr))
+    } finally {
+      setCleanBusy(false)
+    }
+  }
+
   const inputClass = 'w-full rounded-lg border border-border bg-background px-3 py-2 text-sm text-foreground outline-none focus:border-primary/60 focus:ring-2 focus:ring-primary/15'
 
   return (
@@ -256,6 +332,54 @@ export function UserSettingsDialog({ open, onClose, mode = 'app' }: Props) {
                 {nicknameBusy && <Loader2 size={12} className="animate-spin" />}
                 {t('common.save', '保存')}
               </button>
+            </section>
+          )}
+
+          {/* 本地存储：仅桌面端 + 项目沟通设置入口 */}
+          {mode === 'im' && desktopMode && (
+            <section className="space-y-3">
+              <h4 className="flex items-center gap-1.5 text-xs font-semibold text-muted-foreground">
+                <HardDrive size={13} /> {t('im.storage.section', '本地存储与缓存')}
+              </h4>
+              <div className="rounded-xl border border-border/70 bg-background/40 p-3 text-[11px] leading-relaxed text-muted-foreground">
+                {t('im.storage.current', '当前保存路径')}：
+                <span className="break-all font-mono text-foreground">{storagePath || storageDefault || '—'}</span>
+                {storageDefault && storagePath !== storageDefault && (
+                  <> <br />{t('im.storage.default', '默认路径')}：
+                    <span className="break-all font-mono">{storageDefault}</span></>
+                )}
+              </div>
+              <input value={storagePath} onChange={event => setStoragePath(event.target.value)}
+                     aria-label={t('im.storage.pathLabel', '聊天记录与文件保存路径')}
+                     className={inputClass} />
+              <div className="flex flex-wrap gap-2">
+                <button type="button" onClick={() => void pickStorageDir()}
+                        className="flex items-center gap-1 rounded-lg border border-border px-3 py-1.5 text-xs hover:bg-accent cursor-pointer">
+                  <FolderOpen size={13} /> {t('im.storage.browse', '浏览…')}
+                </button>
+                <button type="button" onClick={() => void applyStoragePath()}
+                        disabled={storageBusy || !storagePath.trim() || storagePath === storageDefault}
+                        className="rounded-lg bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:brightness-110 disabled:opacity-50 cursor-pointer">
+                  {storageBusy && <Loader2 size={12} className="mr-1 inline animate-spin" />}
+                  {t('im.storage.apply', '应用并迁移')}
+                </button>
+              </div>
+              <div className="flex items-center justify-between rounded-xl border border-border/70 bg-background/40 px-3 py-2">
+                <span className="text-[11px] text-muted-foreground">
+                  {t('im.storage.usage', '可清理缓存：{{count}} 个文件 · {{size}}',
+                    { count: storageUsage?.total_files ?? 0,
+                      size: formatBytes(storageUsage?.total_bytes ?? 0) })}
+                </span>
+                <button type="button" onClick={() => void cleanStorage()}
+                        disabled={cleanBusy || !storageUsage?.total_files}
+                        className="flex items-center gap-1 rounded-lg border border-border px-3 py-1.5 text-xs text-destructive hover:bg-destructive/10 disabled:opacity-40 cursor-pointer">
+                  <Trash2 size={13} /> {t('im.storage.clean', '清理')}
+                </button>
+              </div>
+              <p className="text-[10px] leading-relaxed text-muted-foreground">
+                {t('im.storage.hint', '仅清理本机临时文件与图片缓存；不会删除聊天消息、正式附件或服务器数据。')}
+              </p>
+              {storageError && <p className="text-[11px] text-red-500">{storageError}</p>}
             </section>
           )}
 

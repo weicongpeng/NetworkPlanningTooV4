@@ -126,11 +126,22 @@ export interface ImConversation {
     id: number; username: string; nickname?: string | null
     is_online: boolean; avatar?: string | null
   } | null
+  /** 自己 ↔ 自己会话（文件传输助手），other_user 恒为 null */
+  is_self?: boolean
   member_count: number
   last_message: ImLastMessage | null
   last_message_at: string | null
   unread: number
   muted: boolean
+}
+
+/** 被引用的历史消息摘要（服务端已在发送时刻固化，不会递归嵌套） */
+export interface ImReplyPreview {
+  id: number
+  sender_id: number
+  sender_name: string
+  kind: ImMessageKind
+  preview: string
 }
 
 export interface ImMessage {
@@ -150,6 +161,9 @@ export interface ImMessage {
   mentions?: ImMention[]
   /** 服务端按当前请求用户计算，前端不靠解析正文猜测 */
   mentioned_me?: boolean
+  /** 引用回复：指向同会话的历史消息 */
+  reply_to_id?: number | null
+  reply_to?: ImReplyPreview | null
   /** 本地发送状态（乐观消息） */
   pending?: boolean
   failed?: boolean
@@ -191,8 +205,10 @@ export interface ImAttachmentUploadResult {
 export function conversationTitle(conv: ImConversation, labels?: {
   unknownUser?: string
   unnamedGroup?: string
+  self?: string
 }): string {
   if (conv.kind === 'direct') {
+    if (conv.is_self || !conv.other_user) return labels?.self || '自己'
     return imDisplayName(conv.other_user)
       || `${labels?.unknownUser || '用户'} ${conv.other_user?.id ?? ''}`.trim()
   }

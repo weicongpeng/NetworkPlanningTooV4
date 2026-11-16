@@ -114,10 +114,11 @@ def op_list_messages(db: Session, user_id: int, *, conversation_id: int,
 def op_send_message(db: Session, user_id: int, *, conversation_id: int, kind: str,
                     content_text: str | None = None, attachment_id: int | None = None,
                     client_msg_id: str | None = None, mentions: list | None = None,
-                    mention_all: bool = False, **_: Any) -> dict:
+                    mention_all: bool = False, reply_to_id: int | None = None,
+                    **_: Any) -> dict:
     result = im_service.send_message(
         db, conversation_id, user_id, kind, content_text, attachment_id, client_msg_id,
-        mentions, mention_all)
+        mentions, mention_all, reply_to_id)
     if result.get("created"):
         message = result["message"]
         targets = im_service.member_ids(db, conversation_id, exclude_user_id=user_id)
@@ -194,6 +195,35 @@ def op_attachment_download(db: Session, user_id: int, *, attachment_id: int,
     }
 
 
+def op_attachment_urls(db: Session, user_id: int, *, items: list, **_: Any) -> dict:
+    """批量换取短时签名直链（共享桌面模式图片加载快路径）。"""
+    return {"tokens": im_attachment_service.sign_attachments(db, user_id, items)}
+
+
+def op_delete_message(db: Session, user_id: int, *, conversation_id: int,
+                      message_id: int, **_: Any) -> dict:
+    return im_service.delete_message(db, conversation_id, int(message_id), user_id)
+
+
+def op_forward_messages(db: Session, user_id: int, *, message_ids: list,
+                        conversation_ids: list, **_: Any) -> dict:
+    result = im_service.forward_messages(db, user_id, message_ids, conversation_ids)
+    # 转发是写操作：给每个目标会话的在线成员发轻通知，正文仍由前端按游标增量拉
+    for item in result.get("items", []):
+        targets = im_service.member_ids(
+            db, int(item["conversation_id"]), exclude_user_id=user_id)
+        websocket_manager.notify_im_message(targets, {
+            "conversation_id": item["conversation_id"],
+            "message_id": item["id"],
+            "sender_id": user_id,
+            "sender_name": "",
+            "kind": "text",
+            "mention_all": False,
+            "mentioned_user_ids": [],
+        })
+    return result
+
+
 OPS: Dict[str, Callable] = {
     "list_conversations": op_list_conversations,
     "get_conversation": op_get_conversation,
@@ -209,6 +239,8 @@ OPS: Dict[str, Callable] = {
     "update_nickname": op_update_nickname,
     "list_messages": op_list_messages,
     "send_message": op_send_message,
+    "delete_message": op_delete_message,
+    "forward_messages": op_forward_messages,
     "mark_read": op_mark_read,
     "list_contacts": op_list_contacts,
     "attachment_start": op_attachment_start,
@@ -216,6 +248,7 @@ OPS: Dict[str, Callable] = {
     "attachment_complete": op_attachment_complete,
     "attachment_cancel": op_attachment_cancel,
     "attachment_download": op_attachment_download,
+    "attachment_urls": op_attachment_urls,
 }
 
 

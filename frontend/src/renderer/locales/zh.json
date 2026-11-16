@@ -40,6 +40,7 @@
       "customGroups": "自建群组",
       "unassignedGroup": "未分配数据组",
       "unknownUser": "用户",
+      "self": "自己",
       "unnamedGroup": "未命名群组",
       "memberCount": "{{count}} 位成员",
       "view": "查看",
@@ -117,7 +118,8 @@
       "pan": "平移（或按住鼠标中键拖动）",
       "zoomIn": "放大",
       "zoomOut": "缩小",
-      "zoomReset": "复位视图（100%）",
+      "rotateLeft": "向左旋转 90°",
+      "rotateRight": "向右旋转 90°",
       "recapture": "重新取景",
       "desktopHint": "正在取景：鼠标移到窗口上会高亮截取范围，单击即完成；按住拖拽可自由框选，ESC / 右键取消。",
       "settings": {
@@ -164,6 +166,23 @@
       "nicknameTooLong": "昵称最多 {{max}} 个字符",
       "nicknameInvalid": "昵称含非法字符或过长"
     },
+    "storage": {
+      "section": "本地存储与缓存",
+      "current": "当前保存路径",
+      "default": "默认路径",
+      "pathLabel": "聊天记录与文件保存路径",
+      "browse": "浏览…",
+      "apply": "应用并迁移",
+      "applied": "保存路径已更新",
+      "applyFailed": "保存路径修改失败，请检查目录后重试",
+      "pickFailed": "无法打开目录选择框，请手工输入路径",
+      "usage": "可清理缓存：{{count}} 个文件 · {{size}}",
+      "clean": "清理",
+      "cleaned": "已清理 {{count}} 个文件，释放 {{size}}",
+      "cleanFailed": "清理失败，请重试",
+      "loadFailed": "读取本地存储设置失败",
+      "hint": "仅清理本机临时文件与图片缓存；不会删除聊天消息、正式附件或服务器数据。"
+    },
     "groupManage": {
       "kick": "剔除成员",
       "kickConfirm": "确定将「{{name}}」移出群组吗？移出后 TA 将无法查看群内消息。",
@@ -201,7 +220,25 @@
       "doubleClickOpen": "双击打开",
       "openFailed": "打开失败，请下载后手动打开",
       "retry": "发送失败，重试",
-      "sending": "发送中"
+      "sending": "发送中",
+      "select": "选择",
+      "copied": "已复制到剪贴板",
+      "copyFailed": "复制失败",
+      "deleteFailed": "删除消息失败，请稍后重试",
+      "forwardFailed": "转发失败，请稍后重试",
+      "selected": "已选择 {{count}} 条",
+      "forwardTitle": "转发 {{count}} 条消息",
+      "noConversation": "暂无可转发的会话",
+      "person": "个人",
+      "group": "群聊",
+      "forward": "转发",
+      "menu": {
+        "copy": "复制",
+        "quote": "引用",
+        "multiSelect": "多选",
+        "forward": "转发",
+        "delete": "删除"
+      }
     },
     "group": {
       "title": "新建协作群组",
@@ -221,6 +258,8 @@
       "conversation": "发起会话失败",
       "group": "创建群组失败",
       "rateLimited": "操作过于频繁，请稍后重试",
+      "tooLarge": "图片或文件超过大小限制，请压缩后重试",
+      "relayBusy": "消息服务繁忙，请稍后重试",
       "network": "网络连接失败，请稍后重试",
       "notGroupMember": "你不是该群成员，无法进入群聊",
       "groupAction": "群操作失败，请确认权限后重试"

@@ -50,9 +50,10 @@ export function ImGroupMembersDialog({ conversation, onClose }: Props) {
   } | null>(null)
 
   useEffect(() => {
-    invalidateMembers(conversation.id)
+    // 共享桌面模式成员列表每次回源都要走公网 relay；ensureMembers 自带 60s 缓存，
+    // 打开弹窗不再强制失效，否则「看一下成员」就卡十几秒。成员变更走 afterChange。
     void ensureMembers(conversation.id)
-  }, [conversation.id, ensureMembers, invalidateMembers])
+  }, [conversation.id, ensureMembers])
 
   // Esc 只关本弹窗：ImWindow 有 window 级 Esc 监听会把整个协作沟通窗口关掉
   useEffect(() => {

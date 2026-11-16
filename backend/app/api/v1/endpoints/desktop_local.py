@@ -23,7 +23,9 @@ from app.services import desktop_screenshot_settings as screenshot_cfg
 from app.core.database import get_db
 from app.core.security import get_current_admin_user, get_current_user, security_scheme
 from app.core.startup_gate import mark_login_completed
+from app import desktop_bridge
 from app.models.database import User
+from app.services import desktop_im_storage
 from app.services import desktop_cloud_client as cloud
 from app.services.auth_service import auth_service
 from app.services.license_service import license_service
@@ -1573,6 +1575,10 @@ class WindowControlRequest(BaseModel):
     )
 
 
+class ImStoragePathRequest(BaseModel):
+    path: str = Field(..., max_length=1024, description="新的聊天附件本地保存目录（绝对路径）")
+
+
 @router.post("/window-control")
 async def desktop_window_control(
     payload: WindowControlRequest,
@@ -1627,6 +1633,61 @@ async def desktop_window_state(
     if result is None:
         raise HTTPException(status_code=403, detail="当前运行环境不支持窗口状态查询（非桌面壳）")
     return {"success": True, "data": result}
+
+
+# ------------------------------------------------------- 项目沟通本地存储管理
+#
+# 仅桌面形态可见：路径配置按 shared/standalone 档隔离，不影响网页端与服务器。
+# 迁移/清理是低频重活，全部丢线程池，不阻塞 uvicorn 事件循环。
+
+@router.get("/im-storage")
+async def desktop_im_storage_state(
+    _: None = Depends(_require_desktop),
+    __: User = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """当前档的附件保存路径、默认路径与可清理缓存占用。"""
+    state = await run_in_threadpool(desktop_im_storage.current_state)
+    return {"success": True, "data": state}
+
+
+@router.post("/im-storage/path")
+async def desktop_im_storage_set_path(
+    payload: ImStoragePathRequest,
+    db: Session = Depends(get_db),
+    _: None = Depends(_require_desktop),
+    __: User = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """修改路径并整体迁移；目标非空、系统目录、不可写或迁移校验失败一律拒绝。"""
+    def _apply() -> Dict[str, Any]:
+        target = desktop_im_storage.validate_path(payload.path)
+        return desktop_im_storage.migrate_attachment_dir(target)
+
+    try:
+        state = await run_in_threadpool(_apply)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"success": True, "data": state}
+
+
+@router.post("/im-storage/clean")
+async def desktop_im_storage_clean(
+    db: Session = Depends(get_db),
+    _: None = Depends(_require_desktop),
+    __: User = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """清理临时分片、未引用孤立文件与旧的输入附件临时副本（不动消息与正式附件）。"""
+    result = await run_in_threadpool(desktop_im_storage.cleanup_now, db)
+    return {"success": True, "data": result}
+
+
+@router.post("/im-storage/pick-directory")
+async def desktop_im_storage_pick_directory(
+    _: None = Depends(_require_desktop),
+    __: User = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """调壳层原生文件夹选择框；无壳 / 用户取消返回 picked=null。"""
+    picked = await run_in_threadpool(desktop_bridge.pick_folder)
+    return {"success": True, "data": {"picked": picked}}
 
 
 # ---------------------------------------------------------------- 桌面取景截图

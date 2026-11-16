@@ -13,6 +13,7 @@ const SOURCE_FILES = [
   'pages/TACPlanningPage.tsx',
   'pages/PCIPage.tsx',
   // 协作沟通整模块接入 i18n，中英两份字典必须同步补齐
+  'components/UserSettingsDialog.tsx',
   'components/Im/ImHost.tsx',
   'components/Im/ImWindow.tsx',
   'components/Im/ImSidebar.tsx',

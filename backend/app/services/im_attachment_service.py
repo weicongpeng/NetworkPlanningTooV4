@@ -5,11 +5,14 @@
   残留临时文件由 start 时的惰性清理回收；
 - 所有读取都经 im_service.get_attachment_for_member 做成员鉴权后再定位磁盘文件。
 """
+import hashlib
+import hmac
 import re
 import threading
+import time
 import uuid
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
@@ -46,13 +49,88 @@ def _extension(name: str) -> str:
 
 
 def _base_dir() -> Path:
-    path = Path(settings.NPT_IM_ATTACHMENT_DIR)
+    # 桌面端用户在设置里改过路径时，以档内配置为准；服务端/网页端恒为默认目录
+    from app.services.desktop_im_storage import effective_attachment_dir
+
+    path = Path(effective_attachment_dir())
     path.mkdir(parents=True, exist_ok=True)
     return path
 
 
 def _max_bytes() -> int:
     return max(1, int(settings.NPT_IM_MAX_FILE_MB)) * 1024 * 1024
+
+
+def _attachment_signature(attachment_id: int, user_id: int,
+                          thumb: bool, expires_at: int) -> str:
+    payload = f"{int(attachment_id)}|{int(user_id)}|{1 if thumb else 0}|{int(expires_at)}"
+    return hmac.new(
+        settings.IM_ATTACHMENT_URL_SECRET.encode("utf-8"),
+        payload.encode("utf-8"), hashlib.sha256,
+    ).hexdigest()
+
+
+def verify_attachment_token(token: str, attachment_id: int,
+                            user_id: int, thumb: bool) -> bool:
+    """校验签名直链 token（HMAC-SHA256 + 过期时间，恒定时间比较）。
+
+    token 只证明「谁在多长时间内可以看哪张图的哪种尺寸」，下载端点仍必须再查一次
+    会话成员关系，不能把 token 当作长期授权。
+    """
+    try:
+        expires_at, token_user_id, digest = _split_token(token)
+    except (ValueError, AttributeError):
+        return False
+    if expires_at < int(time.time()) or token_user_id != int(user_id):
+        return False
+    expected = _attachment_signature(attachment_id, user_id, thumb, expires_at)
+    return hmac.compare_digest(digest, expected)
+
+
+def _split_token(token: str) -> Tuple[int, int, str]:
+    parts = str(token).split(".")
+    if len(parts) != 3:
+        raise ValueError("bad attachment token")
+    return int(parts[0]), int(parts[1]), parts[2]
+
+
+def attachment_token_user_id(token: str) -> Optional[int]:
+    """从签名 token 取出绑定的 user_id；仅用于定位校验主体，不代表已验签。"""
+    try:
+        return _split_token(token)[1]
+    except (ValueError, AttributeError):
+        return None
+
+
+def sign_attachment(attachment_id: int, user_id: int, thumb: bool = False) -> dict:
+    expires_at = int(time.time()) + settings.IM_ATTACHMENT_URL_TTL_SECONDS
+    return {
+        "token": (f"{expires_at}.{int(user_id)}."
+                  f"{_attachment_signature(attachment_id, user_id, thumb, expires_at)}"),
+        "path": f"/api/v1/im/attachments/signed/{int(attachment_id)}",
+        "thumb": bool(thumb),
+        "expires_at": expires_at,
+    }
+
+
+def sign_attachments(db: Session, user_id: int, items: List[Any]) -> Dict[str, dict]:
+    """批量换取签名 URL；签发前逐个校验成员关系，key 为 ``id:thumb``。"""
+    from app.services import im_service
+
+    signed: Dict[str, dict] = {}
+    for item in items or []:
+        try:
+            attachment_id = int(item.get("attachment_id") or 0)
+        except (AttributeError, TypeError, ValueError):
+            continue
+        if attachment_id <= 0:
+            continue
+        thumb = bool(item.get("thumb"))
+        # 非会话成员一律 404：不能凭猜测 id 换到签名链接
+        im_service.get_attachment_for_member(db, attachment_id, user_id)
+        signed[f"{attachment_id}:{int(thumb)}"] = sign_attachment(
+            attachment_id, user_id, thumb)
+    return signed
 
 
 def _purge_stale_tmp() -> None:
@@ -179,6 +257,12 @@ def cancel_upload(user_id: int, upload_id: str) -> None:
         session = _UPLOADS.pop(upload_id, None)
     if session and session["user_id"] == user_id:
         Path(session["tmp_path"]).unlink(missing_ok=True)
+
+
+def active_upload_paths() -> Iterable[Path]:
+    """正在写入的分片临时文件：清理时必须跳过，否则会打断上传。"""
+    with _LOCK:
+        return {Path(session["tmp_path"]) for session in _UPLOADS.values()}
 
 
 def resolve_path(relative: str) -> Tuple[Path, str]:

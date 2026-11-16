@@ -208,8 +208,9 @@ async def lifespan(app: FastAPI):
     settings.LICENSE_DIR.mkdir(parents=True, exist_ok=True)
     settings.DATA_DIR.mkdir(parents=True, exist_ok=True)
     settings.TEMPLATE_DIR.mkdir(parents=True, exist_ok=True)
-    # 协作沟通附件目录（按配置档隔离）
-    settings.NPT_IM_ATTACHMENT_DIR.mkdir(parents=True, exist_ok=True)
+    # 协作沟通附件目录（按配置档隔离；桌面端可能已在设置里改过路径）
+    from app.services.desktop_im_storage import effective_attachment_dir
+    effective_attachment_dir().mkdir(parents=True, exist_ok=True)
 
     # 创建 APK 文件存储目录（可写数据根下）
     apks_dir = settings.APKS_DIR

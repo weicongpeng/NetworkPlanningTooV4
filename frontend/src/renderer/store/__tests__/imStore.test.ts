@@ -10,6 +10,8 @@ vi.mock('../../services/api', () => ({
     conversations: vi.fn(), contacts: vi.fn(), messages: vi.fn(), send: vi.fn(),
     markRead: vi.fn(), createConversation: vi.fn(), createGroup: vi.fn(),
     uploadAttachment: vi.fn(), downloadAttachment: vi.fn(), members: vi.fn(),
+    deleteMessage: vi.fn(), forwardMessages: vi.fn(),
+    prewarmAttachmentUrls: vi.fn(),
   },
 }))
 
@@ -17,6 +19,7 @@ import { imApi } from '../../services/api'
 import { IM_MESSAGE_EVENT } from '../../services/websocketService'
 import { playImMessageSound } from '../../utils/messageSound'
 import { attachImEvents, useImStore } from '../imStore'
+import { conversationTitle } from '../../components/Im/types'
 import type {
   ImConversation, ImConversationsData, ImEnvelope, ImMessage, ImMessageKind, ImMessagesPage,
 } from '../../components/Im/types'
@@ -501,6 +504,55 @@ describe('imStore', () => {
 
     useImStore.getState().stopPolling()
     vi.useRealTimers()
+  })
+
+  it('自己会话显示「自己」，创建失败时也能从会话列表兜底打开', async () => {
+    const selfConv: ImConversation = { ...conversation(1), is_self: true, other_user: null }
+    expect(conversationTitle(selfConv, { self: '自己' })).toBe('自己')
+    localStorage.setItem('auth-storage', JSON.stringify({ state: { user: { id: 1 } } }))
+    vi.mocked(imApi.createConversation).mockRejectedValueOnce(new Error('IM_RELAY_FAILED'))
+    vi.mocked(imApi.conversations).mockResolvedValue(conversationsPage([selfConv]))
+    const opened = await useImStore.getState().openDirect(1)
+    expect(opened).toBe(7)
+  })
+
+  it('引用回复：发送带 reply_to_id 并在成功后清空引用', async () => {
+    localStorage.setItem('auth-storage', JSON.stringify({ state: { user: { id: 1 } } }))
+    useImStore.setState({ activeConversationId: 7 })
+    useImStore.getState().setReplyTo(message(1, '原文'))
+    vi.mocked(imApi.send).mockResolvedValue({ success: true, data: message(2, '回复') } as any)
+    vi.mocked(imApi.messages).mockResolvedValue(messagesPage([], null))
+
+    expect(await useImStore.getState().sendText('收到')).toBe(true)
+    expect(imApi.send).toHaveBeenCalledWith(7, expect.objectContaining({ reply_to_id: 1 }))
+    expect(useImStore.getState().replyTo).toBeNull()
+  })
+
+  it('右键菜单：删除消息本地同步移除，转发调用后端', async () => {
+    useImStore.setState({
+      activeConversationId: 7,
+      messages: { 7: [message(1), message(2)] },
+    })
+    vi.mocked(imApi.deleteMessage).mockResolvedValue({ success: true, data: {} } as any)
+    expect(await useImStore.getState().deleteMessage(7, 1)).toBe(true)
+    expect(useImStore.getState().messages[7].map(m => m.id)).toEqual([2])
+
+    vi.mocked(imApi.forwardMessages).mockResolvedValue({ success: true, data: { count: 1 } } as any)
+    expect(await useImStore.getState().forwardMessages([2], [9])).toBe(true)
+    expect(imApi.forwardMessages).toHaveBeenCalledWith([2], [9])
+  })
+
+  it('加载一页历史后批量预热图片签名 URL，而不是逐张请求', async () => {
+    const withImage: ImMessage = {
+      ...message(11), kind: 'image',
+      attachment: { id: 88, original_name: 'p.png', mime: 'image/png',
+                    size_bytes: 10, has_thumb: true },
+    }
+    vi.mocked(imApi.messages).mockResolvedValueOnce(
+      messagesPage([withImage], 11) as any)
+    await useImStore.getState().loadMessages(7, 'initial')
+    expect(imApi.prewarmAttachmentUrls).toHaveBeenCalledWith(
+      [{ attachment_id: 88, thumb: true }])
   })
 
   it('发送消息不用全局自增 id 推进游标，对方的旧消息不再被永久跳过', async () => {

@@ -3,7 +3,7 @@
  * 文件卡片（Office / PDF 双击用本地应用打开，单击下载）。
  */
 import { memo, useEffect, useMemo, useRef, useState } from 'react'
-import type { ReactNode } from 'react'
+import type { MouseEvent as ReactMouseEvent, ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
 import {
   Download, File as FileIcon, FileSpreadsheet, FileText, Film, ImageIcon,
@@ -22,6 +22,11 @@ interface Props {
   isMine: boolean
   onPreview: (attachmentId: number, name: string, mime: string) => void
   onRetry?: () => void
+  /** 右键菜单：由 ImChatPanel 统一弹出 */
+  onContextMenu?: (event: ReactMouseEvent<HTMLDivElement>, message: ImMessage) => void
+  selectionMode?: boolean
+  selected?: boolean
+  onToggleSelect?: (messageId: number) => void
 }
 
 function fileIcon(name: string) {
@@ -68,16 +73,39 @@ function ImageBubble({ message, onPreview }: {
   const { t } = useTranslation()
   const [url, setUrl] = useState<string | null>(null)
   const [failed, setFailed] = useState(false)
+  const [visible, setVisible] = useState(false)
+  const [retryCount, setRetryCount] = useState(0)
+  const holderRef = useRef<HTMLDivElement>(null)
   const attachment = message.attachment
   const attachmentId = attachment?.id
+  const thumb = Boolean(attachment?.has_thumb)
+
+  // 只加载视口附近的图片：翻历史时不再给几十张图同时发公网请求
+  useEffect(() => {
+    const node = holderRef.current
+    if (!node || visible) return
+    if (typeof IntersectionObserver === 'undefined') {
+      setVisible(true)
+      return
+    }
+    const observer = new IntersectionObserver(entries => {
+      if (entries.some(entry => entry.isIntersecting)) {
+        setVisible(true)
+        observer.disconnect()
+      }
+    }, { rootMargin: '400px' })
+    observer.observe(node)
+    return () => observer.disconnect()
+  }, [visible, attachmentId])
 
   useEffect(() => {
-    if (!attachmentId) return
+    if (!attachmentId || !visible) return
     let objectUrl: string | null = null
     let cancelled = false
+    setFailed(false)
     const load = async () => {
       try {
-        const blob = await imApi.attachmentBlob(attachmentId, Boolean(attachment?.has_thumb))
+        const blob = await imApi.attachmentBlob(attachmentId, thumb)
         objectUrl = URL.createObjectURL(blob)
         if (!cancelled) setUrl(objectUrl)
         else URL.revokeObjectURL(objectUrl)
@@ -90,11 +118,11 @@ function ImageBubble({ message, onPreview }: {
       cancelled = true
       if (objectUrl) URL.revokeObjectURL(objectUrl)
     }
-  }, [attachmentId, attachment?.has_thumb])
+  }, [attachmentId, thumb, visible, retryCount])
 
   const name = attachment?.original_name || t('im.message.image', '图片')
   return (
-    <div className="w-[210px] max-w-full">
+    <div ref={holderRef} className="w-[210px] max-w-full">
       {url ? (
         <button
           type="button"
@@ -114,9 +142,18 @@ function ImageBubble({ message, onPreview }: {
           </span>
         </button>
       ) : (
-        <div className="flex h-[150px] w-full items-center justify-center rounded-xl border border-border/60 bg-muted/40 text-xs text-muted-foreground">
-          {failed ? <><ImageIcon size={16} className="mr-1" />{t('im.message.imageFailed', '图片加载失败')}</>
-            : <Loader2 size={18} className="animate-spin" />}
+        <div className="flex h-[150px] w-full flex-col items-center justify-center gap-1 rounded-xl border border-border/60 bg-muted/40 text-xs text-muted-foreground">
+          {failed ? (
+            <button type="button"
+                    onClick={() => setRetryCount(value => value + 1)}
+                    className="flex items-center gap-1 rounded px-2 py-1 hover:bg-accent cursor-pointer">
+              <RotateCcw size={14} /> {t('im.message.imageFailed', '图片加载失败，重试')}
+            </button>
+          ) : visible ? (
+            <Loader2 size={18} className="animate-spin" />
+          ) : (
+            <ImageIcon size={18} />
+          )}
         </div>
       )}
     </div>
@@ -254,7 +291,10 @@ function FileBubble({ attachment, isMine }: {
   )
 }
 
-function ImMessageItemBase({ message, isMine, onPreview, onRetry }: Props) {
+function ImMessageItemBase({
+  message, isMine, onPreview, onRetry, onContextMenu,
+  selectionMode = false, selected = false, onToggleSelect,
+}: Props) {
   const { t } = useTranslation()
   const initial = (message.sender_name || '?').slice(0, 1).toUpperCase()
   const allLabel = t('im.mention.allLabel', '@所有人')
@@ -268,7 +308,23 @@ function ImMessageItemBase({ message, isMine, onPreview, onRetry }: Props) {
   const attachment = message.attachment
 
   return (
-    <div className={`flex w-full gap-2 px-1 ${isMine ? 'flex-row-reverse' : 'flex-row'}`}>
+    <div
+      data-im-message-id={message.id}
+      onContextMenu={event => {
+        if (selectionMode) { onToggleSelect?.(message.id); return }
+        onContextMenu?.(event, message)
+      }}
+      className={`flex w-full gap-2 px-1 ${isMine ? 'flex-row-reverse' : 'flex-row'}
+        ${selectionMode ? 'rounded-lg bg-primary/5 py-0.5' : ''}
+        ${selected ? 'ring-1 ring-primary/70' : ''}`}>
+      {selectionMode && (
+        <button type="button" aria-label={t('im.message.select', '选择')}
+                onClick={() => onToggleSelect?.(message.id)}
+                className={`mt-3 h-5 w-5 shrink-0 rounded border cursor-pointer
+                  ${selected ? 'border-primary bg-primary text-primary-foreground' : 'border-border'}`}>
+          {selected ? '✓' : ''}
+        </button>
+      )}
       <ImAvatar
         name={message.sender_name || initial}
         avatar={message.sender_avatar}
@@ -287,6 +343,13 @@ function ImMessageItemBase({ message, isMine, onPreview, onRetry }: Props) {
             ? 'rounded-tr-md bg-primary text-primary-foreground'
             : 'rounded-tl-md border border-border/70 bg-card text-card-foreground'}
           ${message.mentioned_me ? 'ring-1 ring-primary/60' : ''}`}>
+          {message.reply_to && (
+            <div className={`mb-1.5 border-l-2 pl-2 text-[11px] opacity-80
+              ${isMine ? 'border-primary-foreground/60' : 'border-primary/60'}`}>
+              <span className="font-medium">{message.reply_to.sender_name || t('im.message.me', '我')}：</span>
+              <span className="line-clamp-2">{message.reply_to.preview || '[附件]'}</span>
+            </div>
+          )}
           {showMentionChips && (
             <div className="mb-1.5 flex flex-wrap gap-1">
               {message.mention_all && (

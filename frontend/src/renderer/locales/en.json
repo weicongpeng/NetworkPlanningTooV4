@@ -40,6 +40,7 @@
       "customGroups": "Custom groups",
       "unassignedGroup": "No data group",
       "unknownUser": "User",
+      "self": "Yourself",
       "unnamedGroup": "Unnamed group",
       "memberCount": "{{count}} members",
       "view": "View",
@@ -117,7 +118,8 @@
       "pan": "Pan (or hold the middle mouse button to drag)",
       "zoomIn": "Zoom in",
       "zoomOut": "Zoom out",
-      "zoomReset": "Reset view (100%)",
+      "rotateLeft": "Rotate left 90°",
+      "rotateRight": "Rotate right 90°",
       "recapture": "Recapture",
       "desktopHint": "Framing: hover a window to highlight its bounds, click to capture, or drag to select a free region. ESC / right-click cancels.",
       "settings": {
@@ -164,6 +166,23 @@
       "nicknameTooLong": "Nickname can be at most {{max}} characters",
       "nicknameInvalid": "Nickname contains invalid characters or is too long"
     },
+    "storage": {
+      "section": "Local storage & cache",
+      "current": "Current save path",
+      "default": "Default path",
+      "pathLabel": "Chat history & file save path",
+      "browse": "Browse…",
+      "apply": "Apply & migrate",
+      "applied": "Save path updated",
+      "applyFailed": "Could not change the save path, please check the directory",
+      "pickFailed": "Could not open the folder picker, please type a path",
+      "usage": "Cleanable cache: {{count}} files · {{size}}",
+      "clean": "Clean",
+      "cleaned": "Removed {{count}} files, freed {{size}}",
+      "cleanFailed": "Cleanup failed, please retry",
+      "loadFailed": "Could not read local storage settings",
+      "hint": "Only local temporary files and image cache are removed; messages, real attachments and server data are never deleted."
+    },
     "groupManage": {
       "kick": "Remove member",
       "kickConfirm": "Remove \"{{name}}\" from this group? They will no longer see group messages.",
@@ -201,7 +220,25 @@
       "doubleClickOpen": "Double-click to open",
       "openFailed": "Could not open the file. Download it and open manually",
       "retry": "Failed to send, retry",
-      "sending": "Sending"
+      "sending": "Sending",
+      "select": "Select",
+      "copied": "Copied to clipboard",
+      "copyFailed": "Copy failed",
+      "deleteFailed": "Failed to delete message, please retry",
+      "forwardFailed": "Failed to forward, please retry",
+      "selected": "{{count}} selected",
+      "forwardTitle": "Forward {{count}} messages",
+      "noConversation": "No conversation available",
+      "person": "Person",
+      "group": "Group",
+      "forward": "Forward",
+      "menu": {
+        "copy": "Copy",
+        "quote": "Quote",
+        "multiSelect": "Multi-select",
+        "forward": "Forward",
+        "delete": "Delete"
+      }
     },
     "group": {
       "title": "New collaboration group",
@@ -221,6 +258,8 @@
       "conversation": "Failed to start conversation",
       "group": "Failed to create group",
       "rateLimited": "Too many requests, please try again shortly",
+      "tooLarge": "Image or file exceeds the size limit — please compress it and retry",
+      "relayBusy": "Message service is busy, please try again shortly",
       "network": "Network unavailable, please try again",
       "notGroupMember": "You are not a member of this group",
       "groupAction": "Group operation failed. Check your permissions and retry"

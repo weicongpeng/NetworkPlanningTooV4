@@ -2,18 +2,22 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import {
-  ArrowDown, ChevronLeft, MessageSquareDashed, Users, X,
+  ArrowDown, ChevronLeft, Forward, MessageSquareDashed, Users, X,
 } from 'lucide-react'
 
 import { useAuthStore } from '../../store/authStore'
 import { useImStore } from '../../store/imStore'
+import { useToastStore } from '../../store/toastStore'
 import { ImAvatar } from './ImAvatar'
 import { ImComposer } from './ImComposer'
 import { ImGroupMembersDialog } from './ImGroupMembersDialog'
+import { ImForwardDialog } from './ImForwardDialog'
 import { ImImageLightbox } from './ImImageLightbox'
+import { ImMessageContextMenu } from './ImMessageContextMenu'
+import type { MessageMenuState } from './ImMessageContextMenu'
 import { ImMessageItem } from './ImMessageItem'
 import { ImSystemNotice } from './ImSystemNotice'
-import { conversationTitle, formatClock } from './types'
+import { conversationTitle, formatBytes, formatClock } from './types'
 import type { ImConversation, ImLightboxSource, ImMessage } from './types'
 
 interface Props {
@@ -38,6 +42,15 @@ export function ImChatPanel({ conversation, narrow, onBack }: Props) {
   const online = useImStore(s => s.online)
   const error = useImStore(s => s.error)
   const clearError = useImStore(s => s.clearError)
+  const setReplyTo = useImStore(s => s.setReplyTo)
+  const deleteMessage = useImStore(s => s.deleteMessage)
+  const forwardMessages = useImStore(s => s.forwardMessages)
+  const conversations = useImStore(s => s.conversations)
+  const [menu, setMenu] = useState<MessageMenuState | null>(null)
+  const [selectionMode, setSelectionMode] = useState(false)
+  const [selectedIds, setSelectedIds] = useState<number[]>([])
+  const [forwardOpen, setForwardOpen] = useState(false)
+  const [forwardIds, setForwardIds] = useState<number[]>([])
   const [atBottom, setAtBottom] = useState(true)
   const [membersOpen, setMembersOpen] = useState(false)
   const scrollRef = useRef<HTMLDivElement>(null)
@@ -112,6 +125,52 @@ export function ImChatPanel({ conversation, narrow, onBack }: Props) {
     })
   }
 
+  /** 复制消息全部内容：文字 + 图片/视频/文件名与大小，多选时按时间顺序拼接 */
+  const copyMessages = async (items: ImMessage[]) => {
+    const blocks = items.map(message => {
+      const who = message.sender_name || t('im.message.me', '我')
+      const attachment = message.attachment
+        ? `${message.attachment.original_name}（${formatBytes(message.attachment.size_bytes)}）`
+        : ''
+      const body = [message.content_text || '', attachment].filter(Boolean).join('\n')
+      return body ? `[${who} ${formatClock(message.created_at)}]\n${body}` : ''
+    }).filter(Boolean)
+    if (!blocks.length) return
+    const text = blocks.join('\n\n')
+    let ok = false
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text)
+        ok = true
+      }
+    } catch { /* 桌面 WebView2 / 非安全上下文降级到 execCommand */ }
+    if (!ok) {
+      try {
+        const holder = document.createElement('textarea')
+        holder.value = text
+        holder.style.position = 'fixed'
+        holder.style.opacity = '0'
+        document.body.appendChild(holder)
+        holder.select()
+        ok = typeof document.execCommand === 'function' && document.execCommand('copy')
+        holder.remove()
+      } catch { /* 复制失败由下方提示体现 */ }
+    }
+    useToastStore.getState().show(
+      ok ? t('im.message.copied', '已复制到剪贴板') : t('im.message.copyFailed', '复制失败'),
+    )
+  }
+
+  const toggleSelect = (id: number) => setSelectedIds(list =>
+    list.includes(id) ? list.filter(value => value !== id) : [...list, id])
+
+  const handleForward = (message: ImMessage) => {
+    setForwardIds(selectionMode && selectedIds.length ? selectedIds : [message.id])
+    setForwardOpen(true)
+  }
+
+  const exitSelection = () => { setSelectionMode(false); setSelectedIds([]) }
+
   // objectURL 由 ImImageLightbox 自己持有并在卸载时 revoke，这里只清状态
   const closeLightbox = () => setLightbox(null)
 
@@ -155,6 +214,7 @@ export function ImChatPanel({ conversation, narrow, onBack }: Props) {
           name={conversationTitle(conversation, {
             unknownUser: t('im.sidebar.unknownUser', '用户'),
             unnamedGroup: t('im.sidebar.unnamedGroup', '未命名群组'),
+            self: t('im.sidebar.self', '自己'),
           })}
           avatar={conversation.kind === 'direct' ? conversation.other_user?.avatar : conversation.avatar}
           kind={conversation.kind === 'direct' ? 'user' : 'group'}
@@ -183,6 +243,28 @@ export function ImChatPanel({ conversation, narrow, onBack }: Props) {
           </button>
         )}
       </header>
+
+      {selectionMode && (
+        <div className="flex shrink-0 items-center gap-3 border-b border-primary/30 bg-primary/5 px-4 py-1.5 text-xs">
+          <span className="flex-1 text-primary">
+            {t('im.message.selected', '已选择 {{count}} 条', { count: selectedIds.length })}
+          </span>
+          <button type="button" disabled={!selectedIds.length}
+                  onClick={() => void copyMessages(messages.filter(m => selectedIds.includes(m.id)))}
+                  className="rounded px-2 py-1 hover:bg-accent disabled:opacity-40 cursor-pointer">
+            {t('im.message.menu.copy', '复制')}
+          </button>
+          <button type="button" disabled={!selectedIds.length}
+                  onClick={() => { setForwardIds(selectedIds); setForwardOpen(true) }}
+                  className="flex items-center gap-1 rounded px-2 py-1 hover:bg-accent disabled:opacity-40 cursor-pointer">
+            <Forward size={13} /> {t('im.message.menu.forward', '转发')}
+          </button>
+          <button type="button" onClick={exitSelection}
+                  className="flex items-center gap-1 rounded px-2 py-1 hover:bg-accent cursor-pointer">
+            <X size={13} /> {t('im.common.cancel', '取消')}
+          </button>
+        </div>
+      )}
 
       <div ref={scrollRef} onScroll={onScroll}
            className="relative min-h-0 flex-1 space-y-3 overflow-y-auto px-4 py-4"
@@ -220,6 +302,13 @@ export function ImChatPanel({ conversation, narrow, onBack }: Props) {
                   isMine={message.sender_id === currentUserId}
                   onPreview={openPreview}
                   onRetry={() => void sendText(message.content_text || '')}
+                  onContextMenu={(event, item) => {
+                    event.preventDefault()
+                    setMenu({ message: item, x: event.clientX, y: event.clientY })
+                  }}
+                  selectionMode={selectionMode}
+                  selected={selectedIds.includes(message.id)}
+                  onToggleSelect={toggleSelect}
                 />
               )}
             </div>
@@ -243,6 +332,28 @@ export function ImChatPanel({ conversation, narrow, onBack }: Props) {
       {membersOpen && conversation && (
         <ImGroupMembersDialog conversation={conversation} onClose={() => setMembersOpen(false)} />
       )}
+
+      {menu && (
+        <ImMessageContextMenu
+          state={menu}
+          onClose={() => setMenu(null)}
+          onCopy={message => void copyMessages([message])}
+          onQuote={message => setReplyTo(message)}
+          onMultiSelect={message => { setSelectionMode(true); setSelectedIds([message.id]) }}
+          onForward={handleForward}
+          onDelete={message => {
+            if (conversation) void deleteMessage(conversation.id, message.id)
+          }}
+        />
+      )}
+
+      <ImForwardDialog
+        open={forwardOpen}
+        conversations={conversations.filter(c => c.id !== conversation?.id)}
+        count={forwardIds.length}
+        onClose={() => setForwardOpen(false)}
+        onConfirm={async ids => forwardMessages(forwardIds, ids)}
+      />
     </div>
   )
 }

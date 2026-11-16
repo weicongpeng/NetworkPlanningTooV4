@@ -1393,6 +1393,40 @@ def _create_window() -> Any:
         )
     except Exception as exc:  # noqa: BLE001
         _log.warning("注入窗口全屏/控制回调失败（地图全屏将退化为应用内全屏）：%s", exc)
+    # 注入原生目录选择：项目沟通设置里的本地存储路径可点「浏览」直接选目录。
+    # create_file_dialog 必须在 WinForms UI 线程执行，结果用可变容器带回工作线程。
+    try:
+        from app import desktop_bridge
+
+        def _pick_im_storage_folder() -> Optional[str]:
+            picked: dict = {"value": None}
+
+            def _show() -> None:
+                try:
+                    dialog = window.create_file_dialog(
+                        webview.FOLDER_DIALOG, allow_multiple=False)
+                    if isinstance(dialog, (list, tuple)) and dialog:
+                        picked["value"] = str(dialog[0])
+                    elif isinstance(dialog, str) and dialog:
+                        picked["value"] = dialog
+                except Exception as exc:  # noqa: BLE001
+                    _log.warning("原生目录选择失败：%s", exc)
+
+            native = getattr(window, "native", None)
+            if os.name == "nt" and native is not None:
+                try:
+                    from System import Func, Type
+
+                    native.Invoke(Func[Type](_show))
+                except Exception:  # noqa: BLE001
+                    _show()
+            else:
+                _show()
+            return picked["value"]
+
+        desktop_bridge.set_folder_dialog_handler(_pick_im_storage_folder)
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("注入目录选择回调失败（存储路径仍可手工输入）：%s", exc)
     # 注入取景截图会话：桌面端由壳层直接抓整屏 + 置顶蒙层框选，不再依赖
     # WebView2 的共享窗口选择器；未注入时端点返回 403，前端降级到网页端旧流程。
     try:

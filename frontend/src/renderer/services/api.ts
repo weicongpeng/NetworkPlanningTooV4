@@ -1,4 +1,11 @@
 import axios from 'axios'
+import {
+  cacheSignedUrls, clearImAttachmentCache, disableSignedUrls,
+  getCachedAttachmentBlob, getCachedSignedUrl, signedUrlsUsable,
+} from './imAttachmentCache'
+import type {
+  ImSignedAttachmentInfo,
+} from './imAttachmentCache'
 import type {
   ApiResponse,
   CellBulkUpdateResultItem,
@@ -36,6 +43,8 @@ import type {
   ImGroup, ImMember, ImMessage, ImMessagesPage,
 } from '../components/Im/types'
 import { uploadStore } from '../store/uploadStore'
+
+export { clearImAttachmentCache }
 
 const API_BASE_URL = '/api/v1'
 
@@ -762,6 +771,27 @@ export const desktopLoginApi = {
   windowState: async (): Promise<ApiResponse<{ maximized: boolean; fullscreen: boolean }>> => {
     return apiClient.get('/desktop/window-state', fastWindowConfig()) as any
   },
+
+  /** 项目沟通本地存储：当前档路径与可清理占用（仅桌面端） */
+  imStorageState: async (): Promise<ApiResponse<{
+    path: string; default_path: string; customized: boolean; profile: string
+    usage: { attachments: { files: number; bytes: number }
+             open_temp: { files: number; bytes: number }
+             total_files: number; total_bytes: number }
+  }>> => apiClient.get('/desktop/im-storage') as any,
+
+  /** 修改本地保存路径并整体迁移已有附件 */
+  imStorageSetPath: async (path: string): Promise<ApiResponse<unknown>> =>
+    apiClient.post('/desktop/im-storage/path', { path }) as any,
+
+  /** 清理本机临时文件与图片缓存 */
+  imStorageClean: async (): Promise<ApiResponse<{
+    deleted_files: number; freed_bytes: number; errors: string[]
+  }>> => apiClient.post('/desktop/im-storage/clean') as any,
+
+  /** 调壳层原生文件夹选择框；取消返回 picked=null */
+  imStoragePickDirectory: async (): Promise<ApiResponse<{ picked: string | null }>> =>
+    apiClient.post('/desktop/im-storage/pick-directory') as any,
 
   /** 桌面共享模式云端 IM 推送配置；许可凭证只经本机下发，不进 URL / 日志 */
   cloudWsConfig: async (): Promise<ApiResponse<DesktopCloudWsConfig>> => {
@@ -2817,10 +2847,22 @@ export const imApi = {
     /** 结构化 @：群成员 id 名单；@所有人 由服务端按群角色独立校验权限 */
     mentions?: number[]
     mention_all?: boolean
+    /** 引用回复的目标消息 id */
+    reply_to_id?: number | null
   }): Promise<ImEnvelope<ImMessage>> =>
     apiClient.post(`/im/conversations/${id}/messages`, payload, {
       timeout: IM_REQUEST_TIMEOUT_MS,
     }) as any,
+
+  deleteMessage: (conversationId: number, messageId: number): Promise<ImEnvelope<any>> =>
+    apiClient.delete(`/im/conversations/${conversationId}/messages/${messageId}`, {
+      timeout: IM_REQUEST_TIMEOUT_MS,
+    }) as any,
+
+  forwardMessages: (messageIds: number[], conversationIds: number[]): Promise<ImEnvelope<any>> =>
+    apiClient.post('/im/messages/forward', {
+      message_ids: messageIds, conversation_ids: conversationIds,
+    }, { timeout: IM_REQUEST_TIMEOUT_MS }) as any,
 
   markRead: (id: number, lastReadMessageId: number): Promise<ImEnvelope<any>> =>
     apiClient.post(`/im/conversations/${id}/read`,
@@ -2861,22 +2903,88 @@ export const imApi = {
       mime: file.type || 'application/octet-stream',
       size_bytes: file.size,
     })).data
+    const uploadId = started.upload_id
     const chunkSize = started.chunk_size || IM_CHUNK_SIZE
     const total = started.total_chunks || Math.ceil(file.size / chunkSize)
-    for (let index = 0; index < total; index += 1) {
-      const slice = file.slice(index * chunkSize, Math.min((index + 1) * chunkSize, file.size))
-      const dataB64 = await blobToBase64(slice)
-      await imApi.attachmentChunk(started.upload_id, index, dataB64)
-      onProgress?.(Math.round(((index + 1) / total) * 100))
+    try {
+      for (let index = 0; index < total; index += 1) {
+        const slice = file.slice(index * chunkSize, Math.min((index + 1) * chunkSize, file.size))
+        const dataB64 = await blobToBase64(slice)
+        // 桌面共享模式 relay 偶发 503/502/429（槽位、限流、隧道抖动）。分片按
+        // index 幂等覆盖，重试安全；不重试时任意一片失败都会让整张图片「放回待发送」。
+        let lastError: unknown
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+          try {
+            await imApi.attachmentChunk(uploadId, index, dataB64)
+            lastError = null
+            break
+          } catch (error: any) {
+            lastError = error
+            const transient = [0, 429, 502, 503, 504].includes(error?.code)
+            if (!transient || attempt === 2) break
+            await new Promise(resolve => setTimeout(resolve, 250 * (attempt + 1)))
+          }
+        }
+        if (lastError) throw lastError
+        onProgress?.(Math.round(((index + 1) / total) * 100))
+      }
+      return (await imApi.attachmentComplete(uploadId)).data
+    } catch (error) {
+      // 失败立即取消服务端会话：否则 _UPLOADS 会话与 .part 文件无超时回收，
+      // 反复失败会缓慢堆积磁盘并诱发 IM_UPLOAD_CONFLICT。
+      try { await imApi.attachmentCancel(uploadId) } catch { /* 取消失败不影响原错误 */ }
+      throw error
     }
-    return (await imApi.attachmentComplete(started.upload_id)).data
   },
 
-  attachmentBlob: async (id: number, thumb = false): Promise<Blob> => {
-    const response: any = await apiClient.get(
-      `/im/attachments/${id}${thumb ? '/thumb' : ''}`, { responseType: 'blob' })
-    return response.data as Blob
+  /** 批量换取短时签名直链；共享桌面模式一次返回绝对 url，其它模式只返回 token */
+  attachmentUrls: async (
+    items: Array<{ attachment_id: number; thumb?: boolean }>,
+  ): Promise<Record<string, ImSignedAttachmentInfo>> => {
+    if (!items.length) return {}
+    const response: any = await apiClient.post('/im/attachments/urls', { items })
+    const tokens: Record<string, ImSignedAttachmentInfo> = response?.data?.tokens || {}
+    cacheSignedUrls(tokens)
+    return tokens
   },
+
+  /** 加载一页消息后批量预热，避免每张图片各发一次 relay 控制请求 */
+  prewarmAttachmentUrls: async (
+    items: Array<{ attachment_id: number; thumb?: boolean }>,
+  ): Promise<void> => {
+    if (signedUrlsUsable() === false || !items.length) return
+    const missing = items.filter(
+      item => !getCachedSignedUrl(item.attachment_id, Boolean(item.thumb)))
+    if (!missing.length) return
+    try {
+      await imApi.attachmentUrls(missing)
+    } catch {
+      disableSignedUrls() // 老服务器没有该端点：后续直接走本机接口
+    }
+  },
+
+  attachmentBlob: async (id: number, thumb = false): Promise<Blob> =>
+    getCachedAttachmentBlob(id, thumb, async () => {
+      let info = getCachedSignedUrl(id, thumb)
+      if (!info && signedUrlsUsable() !== false) {
+        try {
+          await imApi.attachmentUrls([{ attachment_id: id, thumb }])
+        } catch {
+          disableSignedUrls()
+        }
+        info = getCachedSignedUrl(id, thumb)
+      }
+      if (info?.url) {
+        try {
+          // 直链带短时 token，不附加本机 Bearer；失败退回本机接口（其内部也会回退旧 relay）
+          const response = await fetch(info.url, { credentials: 'omit' })
+          if (response.ok) return await response.blob()
+        } catch { /* 网络抖动/过期：继续走本机接口 */ }
+      }
+      const response: any = await apiClient.get(
+        `/im/attachments/${id}${thumb ? '/thumb' : ''}`, { responseType: 'blob' })
+      return response.data as Blob
+    }),
 
   downloadAttachment: async (id: number, filename: string): Promise<void> => {
     const blob = await imApi.attachmentBlob(id)

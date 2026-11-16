@@ -3,6 +3,7 @@ import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
 
 import { imApi } from '../services/api'
+import { clearImAttachmentCache } from '../services/imAttachmentCache'
 import { IM_MESSAGE_EVENT, IM_PRESENCE_EVENT, IM_RESYNC_EVENT } from '../services/websocketService'
 import { playImMessageSound } from '../utils/messageSound'
 import type {
@@ -44,6 +45,8 @@ interface ImState {
   sending: boolean
   uploadProgress: { name: string; percent: number } | null
   lightbox: ImLightboxSource | null
+  /** 当前正在引用的历史消息；发送成功后自动清空 */
+  replyTo: ImMessage | null
   groupDialog: boolean
   /** 群成员缓存：@ 下拉与群成员弹窗共用，按会话 id 隔离 */
   membersByConversation: Record<number, ImMember[]>
@@ -63,6 +66,7 @@ interface ImState {
   setDraft: (text: string) => void
   draftFor: (conversationId: number | null) => string
   setLightbox: (value: ImState['lightbox']) => void
+  setReplyTo: (message: ImMessage | null) => void
   setGroupDialog: (open: boolean) => void
   bootstrap: () => Promise<void>
   refreshConversations: () => Promise<void>
@@ -71,6 +75,9 @@ interface ImState {
   sendText: (text: string, mention?: ImSendMention) => Promise<boolean>
   /** 返回发送失败的 File，供输入区把它们放回待发送列表 */
   sendFiles: (files: File[]) => Promise<File[]>
+  /** 右键菜单：删除单条历史消息 / 批量转发 */
+  deleteMessage: (conversationId: number, messageId: number) => Promise<boolean>
+  forwardMessages: (messageIds: number[], conversationIds: number[]) => Promise<boolean>
   /** 取群成员（带缓存与 in-flight 去重）；成员变更后用 invalidateMembers 失效 */
   ensureMembers: (conversationId: number) => Promise<ImMember[]>
   invalidateMembers: (conversationId: number) => void
@@ -155,8 +162,10 @@ async function fetchMessagesPage(
       }
     } catch (error) {
       lastError = error
-      if (attempt === 2) break
       const code = (error as { code?: number } | null)?.code
+      // relay 槽位忙 / 网关抖动是背压信号：立刻重试只会继续抢占名额，把一次
+      // 慢请求放大成 3×12s。留给下一轮轮询或用户操作重试即可。
+      if (code === 503 || code === 502 || attempt === 2) break
       const delay = code === 429 ? 800 * (attempt + 1) : 200 * (attempt + 1)
       await new Promise<void>(resolve => { window.setTimeout(resolve, delay) })
     }
@@ -179,6 +188,11 @@ function errorMessage(error: unknown, fallbackKey: string): string {
   } | null
   const raw = String(err?.response?.data?.detail || err?.message || err?.detail || '')
   if (raw.includes('IM_RATE_LIMITED') || err?.code === 429) return 'im.error.rateLimited'
+  // 附件失败以前一律折叠成「附件发送失败，已放回待发送列表」，用户无法判断
+  // 是文件太大、消息服务繁忙还是断网；这里把可操作的真实原因显示出来。
+  if (raw.includes('IM_ATTACHMENT_TOO_LARGE')) return 'im.error.tooLarge'
+  if (raw.includes('IM_RELAY_BUSY') || raw.includes('IM_RELAY_FAILED')) return 'im.error.relayBusy'
+  if (err?.code === 0) return 'im.error.network'
   return fallbackKey
 }
 
@@ -208,6 +222,9 @@ const dirtyConversations = new Set<number>()
 let pollFocusHandler: (() => void) | null = null
 /** 同一会话的成员请求合并为一个 Promise，避免每次键入 @ 都发请求 */
 const membersInFlight = new Map<number, Promise<ImMember[]>>()
+/** 成员列表缓存时间：共享桌面模式每次回源都是公网 relay，短 TTL 只挡重复弹窗 */
+const MEMBERS_CACHE_TTL_MS = 60_000
+const membersFetchedAt = new Map<number, number>()
 /** WS 与轮询可能都带来同一条被 @ 消息，按 messageId 去重；限长防长会话内存增长 */
 const notifiedMentionIds = new Set<number>()
 let mentionNoticeSeq = 0
@@ -287,6 +304,7 @@ const initialState = {
   sending: false,
   uploadProgress: null,
   lightbox: null,
+  replyTo: null,
   groupDialog: false,
   membersByConversation: {},
   mentionNotice: null,
@@ -302,6 +320,7 @@ export const useImStore = create<ImState>()(
       toggleOpen: () => set(state => ({ open: !state.open })),
       setTab: activeTab => set({ activeTab }),
       setLightbox: lightbox => set({ lightbox }),
+      setReplyTo: replyTo => set({ replyTo }),
       setGroupDialog: groupDialog => set({ groupDialog }),
       clearError: () => set({ error: null }),
 
@@ -338,6 +357,9 @@ export const useImStore = create<ImState>()(
         if (dirtyConversations.has(id) && get().cursors[id]) {
           dirtyConversations.delete(id)
           void get().loadMessages(id, 'incremental')
+        } else if (get().cursors[id] && (get().messages[id]?.length || 0) > 0) {
+          // 已加载过的会话切来切去不再反复走公网 relay 拉同一页；
+          // 新消息由 1.5s 轮询的 incremental 接上游标补拉。
         } else {
           void get().loadMessages(id, 'initial')
         }
@@ -416,12 +438,17 @@ export const useImStore = create<ImState>()(
 
       ensureMembers: async id => {
         const cached = get().membersByConversation[id]
-        if (cached) return cached
+        // 共享桌面模式每次成员列表都走公网 relay（12s 超时），而弹窗每次打开都
+        // invalidate 一次。缓存 60s 内直接复用，成员变更由 invalidateMembers 显式失效。
+        if (cached && Date.now() - (membersFetchedAt.get(id) || 0) < MEMBERS_CACHE_TTL_MS) {
+          return cached
+        }
         const pending = membersInFlight.get(id)
         if (pending) return pending
         const task = (async () => {
           try {
             const members = (await imApi.members(id)).data || []
+            membersFetchedAt.set(id, Date.now())
             set(s => ({
               membersByConversation: { ...s.membersByConversation, [id]: members },
             }))
@@ -437,12 +464,15 @@ export const useImStore = create<ImState>()(
         return task
       },
 
-      invalidateMembers: id => set(s => {
-        if (!(id in s.membersByConversation)) return {}
-        const next = { ...s.membersByConversation }
-        delete next[id]
-        return { membersByConversation: next }
-      }),
+      invalidateMembers: id => {
+        membersFetchedAt.delete(id)
+        set(s => {
+          if (!(id in s.membersByConversation)) return {}
+          const next = { ...s.membersByConversation }
+          delete next[id]
+          return { membersByConversation: next }
+        })
+      },
 
       notifyMention: event => {
         if (!markMentionNotified(event.messageId)) return
@@ -508,6 +538,14 @@ export const useImStore = create<ImState>()(
               },
             },
           }))
+          // 一页历史消息里的图片批量换签名 URL：一次 relay 控制请求覆盖整页，
+          // 避免每张缩略图各发一次（共享模式公网往返是主要耗时）。
+          void imApi.prewarmAttachmentUrls?.(
+            merged
+              .filter(m => m.kind === 'image' && m.attachment?.id)
+              .slice(-60)
+              .map(m => ({ attachment_id: m.attachment!.id, thumb: true })),
+          )?.catch(() => { /* 直链不可用由 api 层自动回退 */ })
           // 桌面共享模式可能没有 WS，靠轮询兜底；只有 incremental 方向提醒，
           // 打开历史/上拉更早消息不触发，避免翻记录时刷屏。WS 路径与这里按 messageId 去重。
           if (direction === 'incremental' && hasBaseline) {
@@ -551,11 +589,19 @@ export const useImStore = create<ImState>()(
         if (id === null || !value) return false
         const clientMsgId = `m-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
         const tempId = -Date.now()
+        const reply = get().replyTo
+        const replyId = reply?.id ?? null
         const optimistic: ImMessage = {
           id: tempId, conversation_id: id, sender_id: currentUserId() || 0,
           sender_name: '', kind: 'text', content_text: value, attachment: null,
           client_msg_id: clientMsgId, created_at: new Date().toISOString(), pending: true,
           mention_all: mention?.mention_all ?? false,
+          reply_to_id: replyId,
+          reply_to: reply ? {
+            id: reply.id, sender_id: reply.sender_id, sender_name: reply.sender_name,
+            kind: reply.kind,
+            preview: (reply.content_text || (reply.attachment ? '[附件]' : '')).slice(0, 120),
+          } : null,
         }
         set(s => ({ sending: true, messages: { ...s.messages, [id]: mergeMessages(s.messages[id] || [], [optimistic]) } }))
         try {
@@ -565,6 +611,7 @@ export const useImStore = create<ImState>()(
             ...(mention && (mention.mentions.length > 0 || mention.mention_all)
               ? { mentions: mention.mentions, mention_all: mention.mention_all }
               : {}),
+            ...(replyId ? { reply_to_id: replyId } : {}),
           })).data
           // 绝不能用服务端返回的**全局自增** message.id 直接推进 next：若此刻对方
           // 的消息 id 更小但还没被拉到，after_id 严格大于会把它永久跳过，服务端
@@ -572,6 +619,7 @@ export const useImStore = create<ImState>()(
           // 只合并消息，游标交给随后的 incremental 由服务端 next_cursor 单向推进。
           set(s => ({
             sending: false,
+            replyTo: null,
             messages: {
               ...s.messages,
               [id]: mergeMessages((s.messages[id] || []).filter(m => m.id !== tempId), [message]),
@@ -633,6 +681,37 @@ export const useImStore = create<ImState>()(
         return failed
       },
 
+      deleteMessage: async (conversationId, messageId) => {
+        try {
+          await imApi.deleteMessage(conversationId, messageId)
+          set(s => {
+            const next = (s.messages[conversationId] || []).filter(m => m.id !== messageId)
+            return {
+              messages: { ...s.messages, [conversationId]: next },
+              replyTo: s.replyTo?.id === messageId ? null : s.replyTo,
+            }
+          })
+          void get().refreshConversations().catch(() => {})
+          return true
+        } catch (error) {
+          console.warn('[IM] delete message failed', error)
+          set({ error: errorMessage(error, 'im.message.deleteFailed') })
+          return false
+        }
+      },
+
+      forwardMessages: async (messageIds, conversationIds) => {
+        try {
+          await imApi.forwardMessages(messageIds, conversationIds)
+          void get().refreshConversations().catch(() => {})
+          return true
+        } catch (error) {
+          console.warn('[IM] forward messages failed', error)
+          set({ error: errorMessage(error, 'im.message.forwardFailed') })
+          return false
+        }
+      },
+
       openDirect: async userId => {
         let conversationId: number | null = null
         let lastError: unknown = null
@@ -648,7 +727,9 @@ export const useImStore = create<ImState>()(
         if (conversationId === null) {
           await get().refreshConversations().catch(() => {})
           const existing = get().conversations.find(
-            c => c.kind === 'direct' && c.other_user?.id === userId)
+            c => c.kind === 'direct'
+              && (c.other_user?.id === userId
+                || (c.is_self && userId === currentUserId())))
           if (existing) conversationId = existing.id
         }
         if (conversationId === null) {
@@ -912,6 +993,8 @@ export const useImStore = create<ImState>()(
         // 灯箱的 objectURL 由 ImImageLightbox 自己持有并在卸载时 revoke，此处只清状态
         // 群成员名单与 @ 去重记录都按账号隔离，切账号必须一起清掉
         membersInFlight.clear()
+        membersFetchedAt.clear()
+        clearImAttachmentCache()
         notifiedMentionIds.clear()
         soundedMessageIds.clear()
         conversationLastIds = null

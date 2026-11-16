@@ -21,6 +21,8 @@ _fullscreen_handler: Optional[Callable[[bool], None]] = None
 _window_control_handler: Optional[Callable[[str, dict], Optional[dict]]] = None
 # 取景截图会话 / 可配置热键：单一 handler，按 action 分派（与 control_window 同范式）
 _screenshot_handler: Optional[Callable[[str, dict], Optional[dict]]] = None
+# 原生文件夹选择（IM 本地存储路径设置）；无壳时返回 None，前端保留手工输入
+_folder_dialog_handler: Optional[Callable[[], Optional[str]]] = None
 
 # 系统级截图热键（Alt+Z）由 launcher 的 Win32 RegisterHotKey 线程触发。
 # 前端按序号增量消费：即使 WebView 处于后台 / evaluate_js 不可用也不会丢事件。
@@ -98,6 +100,21 @@ def control_window(action: str, params: Optional[dict] = None) -> Optional[dict]
         return None
     try:
         return _window_control_handler(action, params or {})
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def set_folder_dialog_handler(handler: Optional[Callable[[], Optional[str]]]) -> None:
+    global _folder_dialog_handler
+    _folder_dialog_handler = handler
+
+
+def pick_folder() -> Optional[str]:
+    """打开系统文件夹选择框；无回调 / 用户取消返回 None。"""
+    if _folder_dialog_handler is None:
+        return None
+    try:
+        return _folder_dialog_handler()
     except Exception:  # noqa: BLE001
         return None
 

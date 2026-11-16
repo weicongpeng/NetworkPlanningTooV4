@@ -7,7 +7,9 @@
 from __future__ import annotations
 
 import base64
+import logging
 import os
+import re
 import subprocess
 import tempfile
 import threading
@@ -17,7 +19,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
@@ -29,6 +31,7 @@ from app.models.database import User
 from app.services import im_attachment_service, im_desktop_proxy, im_ops, im_service
 
 router = APIRouter(tags=["协作沟通"])
+logger = logging.getLogger(__name__)
 
 _RATE: Dict[str, List[float]] = defaultdict(list)
 _RATE_LOCK = threading.Lock()
@@ -87,6 +90,13 @@ class SendMessageRequest(BaseModel):
     # 结构化 @ 名单（群成员 id）；@所有人 由服务端按群角色 owner/admin 独立校验权限
     mentions: List[int] = Field(default_factory=list)
     mention_all: bool = False
+    # 引用回复：必须是同一会话内存在的消息 id
+    reply_to_id: Optional[int] = None
+
+
+class ForwardRequest(BaseModel):
+    message_ids: List[int] = Field(default_factory=list)
+    conversation_ids: List[int] = Field(default_factory=list)
 
 
 class ReadRequest(BaseModel):
@@ -108,6 +118,15 @@ class AttachmentChunkRequest(BaseModel):
 
 class AttachmentIdRequest(BaseModel):
     upload_id: str
+
+
+class AttachmentUrlItem(BaseModel):
+    attachment_id: int = Field(..., gt=0)
+    thumb: bool = False
+
+
+class AttachmentUrlsRequest(BaseModel):
+    items: List[AttachmentUrlItem] = Field(default_factory=list)
 
 
 @router.get("/conversations")
@@ -259,6 +278,7 @@ def send_message(conversation_id: int, payload: SendMessageRequest, response: Re
         "content_text": payload.content_text, "attachment_id": payload.attachment_id,
         "client_msg_id": payload.client_msg_id,
         "mentions": payload.mentions, "mention_all": payload.mention_all,
+        "reply_to_id": payload.reply_to_id,
     }, db, user, limit=60)
     if result.get("created"):
         response.status_code = 201
@@ -267,6 +287,25 @@ def send_message(conversation_id: int, payload: SendMessageRequest, response: Re
             f"{result['message']['id']}"
         )
     return _ok(result.get("message"))
+
+
+@router.delete("/conversations/{conversation_id}/messages/{message_id}")
+def delete_message(conversation_id: int, message_id: int,
+                   db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """删除单条历史消息（发送者本人或群主/管理员）。"""
+    return _ok(_run("delete_message", {
+        "conversation_id": conversation_id, "message_id": message_id,
+    }, db, user, limit=30))
+
+
+@router.post("/messages/forward")
+def forward_messages(payload: ForwardRequest, db: Session = Depends(get_db),
+                     user: User = Depends(get_current_user)):
+    """把选中的历史消息转发到指定个人/群会话。"""
+    return _ok(_run("forward_messages", {
+        "message_ids": payload.message_ids,
+        "conversation_ids": payload.conversation_ids,
+    }, db, user, limit=30))
 
 
 @router.post("/conversations/{conversation_id}/read")
@@ -304,11 +343,41 @@ def create_group(payload: CreateConversationRequest, response: Response,
 
 # ---------------- 附件：具体路径必须定义在 /attachments/{attachment_id} 之前 ----------------
 
+@router.post("/attachments/urls")
+def attachment_urls(payload: AttachmentUrlsRequest, db: Session = Depends(get_db),
+                    user: User = Depends(get_current_user)):
+    """批量换取短时签名直链：共享模式一次历史消息只发一次 relay 控制请求。"""
+    if len(payload.items) > 200:
+        raise HTTPException(status_code=400, detail="IM_TOO_MANY_ATTACHMENTS")
+    items = [
+        {"attachment_id": item.attachment_id, "thumb": item.thumb}
+        for item in payload.items
+    ]
+    data = _run("attachment_urls", {"items": items}, db, user, limit=600)
+    tokens = dict((data or {}).get("tokens") or {})
+    if im_desktop_proxy.is_shared_desktop():
+        from app.services.desktop_cloud_client import server_url
+
+        base = server_url()
+        if base:
+            for info in tokens.values():
+                thumb = 1 if info.get("thumb") else 0
+                info["url"] = (
+                    f"{base.rstrip('/')}{info['path']}"
+                    f"?token={urllib.parse.quote(str(info['token']), safe='')}"
+                    f"&thumb={thumb}"
+                )
+    return _ok({"tokens": tokens})
+
+
 @router.post("/attachments/start")
 def attachment_start(payload: AttachmentStartRequest, db: Session = Depends(get_db),
                      user: User = Depends(get_current_user)):
-    # 桌面共享经 JSON relay 传输，base64 膨胀与内存占用需更保守的上限
-    if im_desktop_proxy.is_shared_desktop() and payload.size_bytes > 5 * 1024 * 1024:
+    # 桌面共享同样走与网页端一致的上限：分片已是 512KB，base64 单片约 683KB，
+    # 原来的 5MB 硬上限会把手机拍照的 3~8MB 图片直接判失败（用户表现为
+    # 「附件发送失败，已放回待发送列表」）。真正限制慢请求的是独立 relay 槽池。
+    if im_desktop_proxy.is_shared_desktop() \
+            and payload.size_bytes > settings.NPT_IM_MAX_FILE_MB * 1024 * 1024:
         raise HTTPException(status_code=400, detail="IM_ATTACHMENT_TOO_LARGE")
     return _ok(_run("attachment_start", {
         "conversation_id": payload.conversation_id,
@@ -346,16 +415,13 @@ def open_attachment(attachment_id: int, db: Session = Depends(get_db),
     """桌面端：把聊天附件写到临时目录并交给系统默认应用打开（Excel / Word / PPT / 视频…）。
 
     网页端不提供该能力（在服务器进程里 startfile 只会打开服务器上的文件），
-    前端自动退化为「下载 / 新标签页预览」；共享模式经 relay 取回 base64 内容。
+    前端自动退化为「下载 / 新标签页预览」；共享模式优先用签名直链取二进制。
     """
     if not settings.NPT_DESKTOP:
         raise HTTPException(status_code=404, detail="Not Found")
     if im_desktop_proxy.is_shared_desktop():
-        payload = _run("attachment_download", {
-            "attachment_id": attachment_id, "thumb": False,
-        }, db, user, limit=60)
-        content = base64.b64decode(payload["content_b64"])
-        filename = payload.get("filename") or "attachment"
+        content, _, filename = _shared_attachment_bytes(
+            attachment_id, False, db, user)
     else:
         att = im_service.get_attachment_for_member(db, attachment_id, user.id)
         path, _ = im_attachment_service.resolve_path(att.storage_path)
@@ -386,19 +452,45 @@ def _attachment_headers(filename: str, thumb: bool) -> Dict[str, str]:
     return {
         "Content-Disposition": f"{disposition}; filename*=UTF-8''{quoted}",
         "X-Content-Type-Options": "nosniff",
-        "Cache-Control": "private, max-age=300",
+        "Cache-Control": f"private, max-age={settings.IM_ATTACHMENT_CACHE_SECONDS}",
     }
+
+
+def _shared_attachment_bytes(attachment_id: int, thumb: bool,
+                             db: Session, user: User) -> tuple[bytes, str, str]:
+    """共享模式取图：优先短时签名直链的二进制流，失败自动退回 base64 relay。
+
+    回退是为了兼容「新桌面端 + 未升级的生产后端」——旧 relay 不认识 attachment_urls
+    会返回 404；回退后功能不变，只是暂时没有性能收益。限流 429 不回退，避免叠加。
+    """
+    try:
+        data = _run("attachment_urls", {
+            "items": [{"attachment_id": attachment_id, "thumb": thumb}],
+        }, db, user, limit=120)
+        info = (data or {}).get("tokens", {}).get(f"{attachment_id}:{int(thumb)}")
+        if info:
+            return im_desktop_proxy.fetch_signed_attachment(info)
+    except HTTPException as exc:
+        if exc.status_code == 429:
+            raise
+        logger.warning("签名直链失败，回退旧 relay：attachment=%s thumb=%s detail=%s",
+                       attachment_id, thumb, exc.detail)
+    except Exception as exc:  # noqa: BLE001 - 任何异常都不能让图片直接空白
+        logger.warning("签名直链异常，回退旧 relay：attachment=%s thumb=%s err=%s",
+                       attachment_id, thumb, exc)
+    payload = _run("attachment_download", {
+        "attachment_id": attachment_id, "thumb": thumb,
+    }, db, user, limit=60)
+    content = base64.b64decode(payload["content_b64"])
+    return (content,
+            payload.get("mime") or "application/octet-stream",
+            payload.get("filename") or "attachment")
 
 
 def _download(attachment_id: int, thumb: bool, db: Session, user: User) -> Response:
     if im_desktop_proxy.is_shared_desktop():
-        # 共享模式经 relay 传输，协议约定返回 base64，无法流式（保留兼容）
-        payload = _run("attachment_download", {
-            "attachment_id": attachment_id, "thumb": thumb,
-        }, db, user, limit=60)
-        content = base64.b64decode(payload["content_b64"])
-        mime = payload.get("mime") or "application/octet-stream"
-        filename = payload.get("filename") or "attachment"
+        content, mime, filename = _shared_attachment_bytes(
+            attachment_id, thumb, db, user)
         return Response(content=content, media_type=mime,
                         headers=_attachment_headers(filename, thumb))
 
@@ -410,6 +502,39 @@ def _download(attachment_id: int, thumb: bool, db: Session, user: User) -> Respo
     # 请求线程内存，也不会拖慢同进程内的实时消息处理。
     return FileResponse(path=str(path), media_type=mime,
                         headers=_attachment_headers(att.original_name, thumb))
+
+
+_SIGNED_ORIGIN = re.compile(
+    r"^(https://app\.pengwc\.asia|https?://(localhost|127\.0\.0\.1)(:\d+)?)$"
+)
+
+
+@router.get("/attachments/signed/{attachment_id}")
+def signed_attachment(attachment_id: int, request: Request,
+                      token: str = Query(..., description="短时签名，不写入日志"),
+                      thumb: bool = Query(False),
+                      db: Session = Depends(get_db)) -> Response:
+    """无 Bearer 的图片直链：验签 + 成员校验后流式返回文件字节。
+
+    token 自带 user_id，但只用它定位校验主体；签名校验通过后仍要走一次会话成员
+    查询，防止被踢出群的人继续使用未过期链接看图。
+    """
+    user_id = im_attachment_service.attachment_token_user_id(token)
+    if user_id is None or not im_attachment_service.verify_attachment_token(
+            token, attachment_id, user_id, thumb):
+        raise HTTPException(status_code=403, detail="IM_ATTACHMENT_LINK_INVALID")
+    att = im_service.get_attachment_for_member(db, attachment_id, user_id)
+    relative = att.thumb_path if thumb and att.thumb_path else att.storage_path
+    path, _ = im_attachment_service.resolve_path(relative)
+    mime = "image/png" if thumb and att.thumb_path else att.mime
+    headers = _attachment_headers(att.original_name, thumb)
+    headers["Cache-Control"] = f"private, max-age={settings.IM_ATTACHMENT_CACHE_SECONDS}"
+    headers["Vary"] = "Origin"
+    origin = request.headers.get("origin", "")
+    if origin and _SIGNED_ORIGIN.match(origin):
+        # 只给桌面壳随机端口 / 本站回显 CORS，不放宽全局；token 本身不可猜测
+        headers["Access-Control-Allow-Origin"] = origin
+    return FileResponse(path=str(path), media_type=mime, headers=headers)
 
 
 @router.get("/attachments/{attachment_id}/thumb")

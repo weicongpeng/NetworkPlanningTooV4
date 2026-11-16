@@ -394,7 +394,10 @@ def list_conversations(db: Session, user_id: int,
             "owner_id": conv.owner_id,
             "my_role": member.role,
             "other_user": other,
-            "member_count": group_counts.get(conv.id, 0) if conv.kind != "direct" else 2,
+            # 自己会话：按成员关系表只有一个成员，前端据此显示「自己」而不是「用户 」
+            "is_self": conv.kind == "direct" and other is None,
+            "member_count": (group_counts.get(conv.id, 0) if conv.kind != "direct"
+                             else (1 if other is None else 2)),
             "last_message": _message_brief(
                 last_messages.get(conv.last_message_id), sender_names, attachments),
             "last_message_at": conv.last_message_at,
@@ -420,11 +423,12 @@ def _online_user_ids(db: Session) -> set:
 
 
 def create_direct(db: Session, user_id: int, peer_id: int) -> Dict[str, Any]:
-    if peer_id == user_id:
-        raise _err(400, "IM_INVALID_PEER")
-    peer = db.query(User).filter(User.id == peer_id, User.is_active == True).first()  # noqa: E712
-    if peer is None:
-        raise _err(400, "IM_INVALID_PEER")
+    # 允许「自己 ↔ 自己」会话（文件传输助手语义）；只有单成员，不重复插入成员行
+    self_chat = peer_id == user_id
+    if not self_chat:
+        peer = db.query(User).filter(User.id == peer_id, User.is_active == True).first()  # noqa: E712
+        if peer is None:
+            raise _err(400, "IM_INVALID_PEER")
 
     key = _direct_key(user_id, peer_id)
     conv = db.query(ImConversation).filter(ImConversation.group_key == key).first()
@@ -438,8 +442,9 @@ def create_direct(db: Session, user_id: int, peer_id: int) -> Dict[str, Any]:
             db.flush()
             db.add(ImConversationMember(conversation_id=conv.id, user_id=user_id,
                                         role="member", last_read_message_id=0, joined_at=_now()))
-            db.add(ImConversationMember(conversation_id=conv.id, user_id=peer_id,
-                                        role="member", last_read_message_id=0, joined_at=_now()))
+            if not self_chat:
+                db.add(ImConversationMember(conversation_id=conv.id, user_id=peer_id,
+                                            role="member", last_read_message_id=0, joined_at=_now()))
             db.commit()
         except IntegrityError:
             db.rollback()
@@ -667,12 +672,30 @@ def _load_mentions(db: Session, message_ids: List[int]) -> Dict[int, List[Dict[s
     return result
 
 
+def _reply_preview(message: Optional[ImMessage],
+                   sender_names: Dict[int, str]) -> Optional[Dict[str, Any]]:
+    """引用消息的轻量摘要（不递归嵌套引用，避免历史页传输膨胀）。"""
+    if message is None:
+        return None
+    text = (message.content_text or "").strip()
+    if not text and message.attachment_id:
+        text = "[附件]"
+    return {
+        "id": message.id,
+        "sender_id": message.sender_id,
+        "sender_name": sender_names.get(message.sender_id, ""),
+        "kind": message.kind,
+        "preview": text[:120],
+    }
+
+
 def _serialize_message(db: Session, message: ImMessage,
                        sender_names: Dict[int, str],
                        attachments: Optional[Dict[int, ImAttachment]] = None,
                        mention_map: Optional[Dict[int, List[Dict[str, Any]]]] = None,
                        viewer_id: Optional[int] = None,
-                       sender_avatars: Optional[Dict[int, Optional[str]]] = None) -> Dict[str, Any]:
+                       sender_avatars: Optional[Dict[int, Optional[str]]] = None,
+                       reply_map: Optional[Dict[int, ImMessage]] = None) -> Dict[str, Any]:
     attachment = None
     if message.attachment_id:
         att = (attachments.get(message.attachment_id) if attachments is not None
@@ -699,6 +722,11 @@ def _serialize_message(db: Session, message: ImMessage,
         "mentions": mentioned,
         "mentioned_me": viewer_id is not None
             and any(item["id"] == viewer_id for item in mentioned),
+        "reply_to_id": message.reply_to_id,
+        "reply_to": _reply_preview(
+            reply_map.get(message.reply_to_id) if reply_map else None,
+            sender_names,
+        ),
     }
 
 
@@ -739,10 +767,16 @@ def list_messages(db: Session, conversation_id: int, user_id: int,
         if attachment_ids else {}
     )
     mention_map = _load_mentions(db, [m.id for m in items])
+    reply_ids = {m.reply_to_id for m in items if m.reply_to_id}
+    reply_map = (
+        {r.id: r for r in db.query(ImMessage).filter(ImMessage.id.in_(list(reply_ids))).all()}
+        if reply_ids else {}
+    )
     return {
         "items": [_serialize_message(db, m, sender_names, attachments,
                                      mention_map, viewer_id=user_id,
-                                     sender_avatars=sender_avatars) for m in items],
+                                     sender_avatars=sender_avatars,
+                                     reply_map=reply_map) for m in items],
         "has_more": has_more,
         "next_cursor": next_cursor,
         "prev_cursor": prev_cursor,
@@ -785,11 +819,29 @@ def send_message(db: Session, conversation_id: int, user_id: int, kind: str,
                  content_text: Optional[str] = None, attachment_id: Optional[int] = None,
                  client_msg_id: Optional[str] = None,
                  mentions: Optional[List[int]] = None,
-                 mention_all: bool = False) -> Dict[str, Any]:
+                 mention_all: bool = False,
+                 reply_to_id: Optional[int] = None) -> Dict[str, Any]:
     _require_member(db, conversation_id, user_id)
     if kind not in MESSAGE_KINDS:
         raise _err(400, "IM_INVALID_MESSAGE")
     conv = db.query(ImConversation).filter(ImConversation.id == conversation_id).first()
+    reply_map: Dict[int, ImMessage] = {}
+
+    def _serialize(m: ImMessage) -> Dict[str, Any]:
+        names = _load_sender_names(db, {m.sender_id})
+        if m.reply_to_id and m.reply_to_id not in reply_map:
+            replied = db.query(ImMessage).filter(ImMessage.id == m.reply_to_id).first()
+            if replied:
+                reply_map[replied.id] = replied
+        return _serialize_message(db, m, names, viewer_id=user_id, reply_map=reply_map)
+
+    if reply_to_id is not None:
+        replied = db.query(ImMessage).filter(
+            ImMessage.id == int(reply_to_id),
+            ImMessage.conversation_id == conversation_id).first()
+        if replied is None:
+            raise _err(400, "IM_INVALID_MESSAGE")
+        reply_map[replied.id] = replied
 
     if client_msg_id:
         existing = (
@@ -800,8 +852,7 @@ def send_message(db: Session, conversation_id: int, user_id: int, kind: str,
             .first()
         )
         if existing:
-            names = _load_sender_names(db, {existing.sender_id})
-            return {"message": _serialize_message(db, existing, names, viewer_id=user_id), "created": False}
+            return {"message": _serialize(existing), "created": False}
 
     text_value = (content_text or "").strip()
     if kind == "text":
@@ -828,6 +879,7 @@ def send_message(db: Session, conversation_id: int, user_id: int, kind: str,
         conversation_id=conversation_id, sender_id=user_id, kind=kind,
         content_text=text_value, attachment_id=attachment_id,
         client_msg_id=(client_msg_id or None), mention_all=bool(mention_all),
+        reply_to_id=(reply_map[int(reply_to_id)].id if reply_to_id is not None else None),
         created_at=_now(),
     )
     db.add(message)
@@ -854,11 +906,94 @@ def send_message(db: Session, conversation_id: int, user_id: int, kind: str,
                 return {"message": _serialize_message(db, existing, names, viewer_id=user_id), "created": False}
         raise
 
-    names = _load_sender_names(db, {user_id})
     avatars = _load_user_avatars(db, {user_id})
-    return {"message": _serialize_message(db, message, names,
-                                          viewer_id=user_id,
-                                          sender_avatars=avatars), "created": True}
+    serialized = _serialize(message)
+    serialized["sender_avatar"] = (avatars or {}).get(user_id)
+    return {"message": serialized, "created": True}
+
+
+def delete_message(db: Session, conversation_id: int, message_id: int,
+                   user_id: int) -> Dict[str, Any]:
+    """删除单条历史消息：发送者本人或群主/管理员可删，引用它的消息只清空引用。"""
+    member = _require_member(db, conversation_id, user_id)
+    message = db.query(ImMessage).filter(
+        ImMessage.id == int(message_id),
+        ImMessage.conversation_id == conversation_id).first()
+    if message is None:
+        raise _err(404, "IM_CONVERSATION_NOT_FOUND")
+    if message.sender_id != user_id and member.role not in ("owner", "admin"):
+        raise _err(403, "IM_NO_PERMISSION")
+    conv = db.query(ImConversation).filter(ImConversation.id == conversation_id).first()
+    was_last = conv is not None and conv.last_message_id == message.id
+    # 外键无 ON DELETE SET NULL，先手动断开引用与 @ 名单，避免整批删消息时违反约束
+    db.query(ImMessage).filter(ImMessage.reply_to_id == message.id).update(
+        {ImMessage.reply_to_id: None}, synchronize_session=False)
+    db.query(ImMessageMention).filter(ImMessageMention.message_id == message.id).delete(
+        synchronize_session=False)
+    db.delete(message)
+    if was_last and conv is not None:
+        latest = (db.query(ImMessage)
+                  .filter(ImMessage.conversation_id == conversation_id)
+                  .order_by(ImMessage.id.desc()).first())
+        conv.last_message_id = latest.id if latest else None
+        conv.last_message_at = latest.created_at if latest else None
+    db.commit()
+    return {"deleted": int(message_id)}
+
+
+def forward_messages(db: Session, user_id: int, message_ids: List[int],
+                     conversation_ids: List[int]) -> Dict[str, Any]:
+    """把历史消息复制到多个目标会话（个人 / 群）；图片/视频复用同一份磁盘文件。"""
+    ids = [int(x) for x in (message_ids or [])][:50]
+    targets = [int(x) for x in (conversation_ids or [])][:50]
+    if not ids or not targets:
+        raise _err(400, "IM_INVALID_MESSAGE")
+    sources = (db.query(ImMessage).filter(ImMessage.id.in_(ids))
+               .order_by(ImMessage.id.asc()).all())
+    if len(sources) != len(set(ids)):
+        raise _err(404, "IM_CONVERSATION_NOT_FOUND")
+    for cid in {m.conversation_id for m in sources}:
+        _require_member(db, cid, user_id)
+    for cid in targets:
+        _require_member(db, cid, user_id)
+    attachment_ids = {m.attachment_id for m in sources if m.attachment_id}
+    attachments = (
+        {a.id: a for a in db.query(ImAttachment)
+         .filter(ImAttachment.id.in_(list(attachment_ids))).all()}
+        if attachment_ids else {}
+    )
+    created: List[Dict[str, Any]] = []
+    for target in targets:
+        conv = db.query(ImConversation).filter(ImConversation.id == target).first()
+        for source in sources:
+            attachment_id = None
+            original = attachments.get(source.attachment_id) if source.attachment_id else None
+            if original is not None:
+                clone = ImAttachment(
+                    conversation_id=target, uploader_id=user_id,
+                    original_name=original.original_name, stored_name=original.stored_name,
+                    mime=original.mime, size_bytes=original.size_bytes,
+                    storage_path=original.storage_path, thumb_path=original.thumb_path,
+                    created_at=_now(),
+                )
+                db.add(clone)
+                db.flush()
+                attachment_id = clone.id
+            message = ImMessage(
+                conversation_id=target, sender_id=user_id, kind=source.kind,
+                content_text=source.content_text if source.kind == "text" else None,
+                attachment_id=attachment_id, client_msg_id=None, mention_all=False,
+                created_at=_now(),
+            )
+            db.add(message)
+            db.flush()
+            _bump_unread(db, target, user_id)
+            if conv is not None:
+                conv.last_message_id = message.id
+                conv.last_message_at = message.created_at
+            created.append({"id": message.id, "conversation_id": target})
+    db.commit()
+    return {"items": created, "count": len(created)}
 
 
 def member_ids(db: Session, conversation_id: int, exclude_user_id: Optional[int] = None) -> List[int]:

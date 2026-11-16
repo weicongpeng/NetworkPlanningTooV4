@@ -122,6 +122,12 @@ class Settings(BaseSettings):
     NPT_JWT_ALGORITHM: str = "HS256"
     NPT_JWT_ACCESS_TOKEN_EXPIRE_MINUTES: int = 1440
 
+    # IM 附件签名直链：共享桌面模式用短时 token 换取二进制流，避免 base64 JSON 膨胀。
+    # 未单独配置时回退 JWT 密钥，防止生产漏配导致历史图片全部空白。
+    NPT_IM_ATTACHMENT_URL_SECRET: Optional[str] = None
+    NPT_IM_ATTACHMENT_URL_TTL_SECONDS: int = 900
+    NPT_IM_ATTACHMENT_CACHE_SECONDS: int = 300
+
     # 会话空闲超时（分钟）：连续无任何请求（含心跳）超过该时长才要求重新登录。
     # 期间换网络/IP（含 IPv4/IPv6 切换）不打断登录态；仅在新设备登录时踢掉旧会话。
     NPT_SESSION_IDLE_TIMEOUT_MINUTES: int = 180
@@ -226,6 +232,18 @@ class Settings(BaseSettings):
     @property
     def JWT_SECRET_KEY(self) -> str:
         return self.NPT_JWT_SECRET_KEY
+
+    @property
+    def IM_ATTACHMENT_URL_SECRET(self) -> str:
+        return self.NPT_IM_ATTACHMENT_URL_SECRET or self.JWT_SECRET_KEY
+
+    @property
+    def IM_ATTACHMENT_URL_TTL_SECONDS(self) -> int:
+        return max(60, int(self.NPT_IM_ATTACHMENT_URL_TTL_SECONDS))
+
+    @property
+    def IM_ATTACHMENT_CACHE_SECONDS(self) -> int:
+        return max(0, int(self.NPT_IM_ATTACHMENT_CACHE_SECONDS))
 
     @property
     def JWT_ALGORITHM(self) -> str:

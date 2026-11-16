@@ -13,7 +13,7 @@ import type { PointerEvent as ReactPointerEvent, ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
 import {
   ChevronLeft, ChevronRight, Download, ExternalLink, FileIcon, Loader2,
-  Maximize2, X, ZoomIn, ZoomOut,
+  RotateCcw, X, ZoomIn, ZoomOut,
 } from 'lucide-react'
 
 import { imApi } from '../../services/api'
@@ -49,6 +49,7 @@ export function ImImageLightbox({ source, onClose }: Props) {
   const desktopMode = useAuthStore(s => s.desktopMode)
   const [url, setUrl] = useState<string | null>(null)
   const [failed, setFailed] = useState(false)
+  const [retryCount, setRetryCount] = useState(0)
   const [scale, setScale] = useState(1)
   const [offset, setOffset] = useState({ x: 0, y: 0 })
   const stageRef = useRef<HTMLDivElement>(null)
@@ -101,7 +102,7 @@ export function ImImageLightbox({ source, onClose }: Props) {
       cancelled = true
       if (objectUrl) URL.revokeObjectURL(objectUrl)
     }
-  }, [current])
+  }, [current, retryCount])
 
   // 换一张图复位视图
   useEffect(() => {
@@ -202,9 +203,6 @@ export function ImImageLightbox({ source, onClose }: Props) {
             <IconButton title={t('im.lightbox.zoomIn', '放大')} onClick={() => zoomBy(ZOOM_STEP)}>
               <ZoomIn size={18} />
             </IconButton>
-            <IconButton title={t('im.lightbox.reset', '复位')} onClick={resetView}>
-              <Maximize2 size={17} />
-            </IconButton>
           </>
         )}
         {url && (
@@ -246,7 +244,11 @@ export function ImImageLightbox({ source, onClose }: Props) {
           </>
         )}
         {failed ? (
-          <p className="text-xs text-white/70">{t('im.message.imageFailed', '图片加载失败')}</p>
+          <button type="button"
+                  onClick={() => setRetryCount(value => value + 1)}
+                  className="flex items-center gap-1.5 rounded-lg bg-white/10 px-3 py-1.5 text-xs text-white/80 hover:bg-white/20 cursor-pointer">
+            <RotateCcw size={14} /> {t('im.message.imageFailed', '图片加载失败，重试')}
+          </button>
         ) : !url ? (
           <Loader2 size={28} className="animate-spin text-white/60" />
         ) : isImage ? (

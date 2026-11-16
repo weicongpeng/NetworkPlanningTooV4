@@ -195,6 +195,9 @@ describe('协作沟通截图对话框', () => {
     expect(screen.queryByText(/已为你打开应用窗口列表/)).toBeNull()
     // 需求 4：按钮只留图标 + title 悬浮提示，不再有可见文字标签
     expect(screen.getByTitle('矩形')).toBeTruthy()
+    // 直线/箭头按钮图标改为左下→右上的斜向样式（绘制逻辑不变）
+    expect(screen.getByTitle('直线').querySelector('svg')?.classList.contains('lucide-slash')).toBe(true)
+    expect(screen.getByTitle('箭头').querySelector('svg')?.classList.contains('lucide-arrow-up-right')).toBe(true)
     expect(screen.getByTitle('撤销')).toBeTruthy()
     expect(screen.queryByText('裁剪')).toBeNull()
     expect(screen.queryByText('矩形')).toBeNull()
@@ -208,6 +211,19 @@ describe('协作沟通截图对话框', () => {
     expect(document.body.querySelector('footer')).toBeNull()
     expect(onClose).not.toHaveBeenCalled()
     expect(onConfirm).not.toHaveBeenCalled()
+  })
+
+  it('截图编辑页支持左右旋转 90°，输出按同角度旋转', async () => {
+    await captureFrame()
+    const overlay = document.querySelector('[data-screenshot-overlay]') as HTMLElement
+    const transform = () => (overlay.querySelector('img')!.parentElement as HTMLElement).style.transform
+    expect(transform()).toContain('rotate(0deg)')
+    fireEvent.click(screen.getByTitle('向右旋转 90°'))
+    expect(transform()).toContain('rotate(90deg)')
+    fireEvent.click(screen.getByTitle('向右旋转 90°'))
+    expect(transform()).toContain('rotate(180deg)')
+    fireEvent.click(screen.getByTitle('向左旋转 90°'))
+    expect(transform()).toContain('rotate(90deg)')
   })
 
   it('自动唤起被取消 / 无手势时停留引导页，点大图标按钮用手势重试', async () => {
@@ -294,17 +310,14 @@ describe('协作沟通截图对话框', () => {
     expect(getDisplayMedia).toHaveBeenCalledTimes(1)
   })
 
-  it('需求 2：放大/缩小/复位按钮与滚轮缩放', async () => {
+  it('需求 2：放大/缩小按钮与滚轮缩放，且没有复位视图按钮', async () => {
     await captureFrame()
     expect(stage().style.transform).toContain('scale(1)')
+    expect(screen.queryByTitle('复位视图（100%）')).toBeNull()
     fireEvent.click(screen.getByTitle('放大'))
     expect(stage().style.transform).toContain('scale(1.12)')
     fireEvent.click(screen.getByTitle('缩小'))
     expect(stage().style.transform).toContain('scale(1)')
-    fireEvent.click(screen.getByTitle('放大'))
-    fireEvent.click(screen.getByTitle('复位视图（100%）'))
-    expect(stage().style.transform).toContain('scale(1)')
-    expect(stage().style.transform).toContain('translate(0px, 0px)')
     // 滚轮缩放（原生 wheel 监听）
     const viewport = stage().parentElement as HTMLElement
     fireEvent.wheel(viewport, { deltaY: -100 })

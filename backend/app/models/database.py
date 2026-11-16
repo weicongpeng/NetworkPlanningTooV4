@@ -109,6 +109,11 @@ class UserSession(Base):
     # 使用时长已结算到该时刻（增量结算标记，避免重复累加；与登录态无关）
     usage_accounted_at = Column(DateTime, nullable=True)
 
+    # IM 在线状态每次会话列表 / 通讯录 / 群成员都要按 logout_time + last_activity 扫描
+    __table_args__ = (
+        Index("idx_session_online", "logout_time", "last_activity"),
+    )
+
     user = relationship("User", back_populates="sessions")
 
     def to_dict(self):
@@ -723,6 +728,8 @@ class ImMessage(Base):
     content_text = Column(Text, nullable=True)
     attachment_id = Column(Integer, ForeignKey("im_attachments.id"), nullable=True)
     client_msg_id = Column(String(64), nullable=True)
+    # 引用回复：指向同会话的历史消息，删除被引用消息时置空而不是级联删除回复
+    reply_to_id = Column(Integer, ForeignKey("im_messages.id"), nullable=True)
     # 是否 @所有人；具体被点名成员固化在 im_message_mentions，成员后续增减不改历史归属
     mention_all = Column(Boolean, nullable=False, default=False)
     created_at = Column(String(30), nullable=False, default=_utcnow_iso)
