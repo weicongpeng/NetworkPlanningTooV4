@@ -11,6 +11,10 @@ from fastapi import WebSocket
 
 logger = logging.getLogger(__name__)
 
+# 单条 WS 推送的超时：慢连接不能拖住同一批其它连接（测试可缩短）
+IM_WS_SEND_TIMEOUT_SECONDS = 2.0
+IM_WS_MAX_CONCURRENT_SENDS = 32
+
 
 class WebSocketManager:
     """WebSocket连接管理器 - 单例模式"""
@@ -76,25 +80,47 @@ class WebSocketManager:
         if user_id:
             self.client_user_ids[client_id] = int(user_id)
 
+    async def _send_concurrently(self, pairs, message: dict) -> None:
+        """并发推送：单连接 2s 超时，慢连接不再串行拖住同一批其它连接。
+
+        用信号量限制并发，避免连接数暴涨时一次性创建过多 task；失败连接先收集，
+        推送结束后统一摘除，防止 disconnect 与正在进行的发送互相竞态。
+        """
+        if not pairs:
+            return
+        semaphore = asyncio.Semaphore(IM_WS_MAX_CONCURRENT_SENDS)
+
+        async def _send_one(client_id: str, ws) -> Optional[str]:
+            try:
+                async with semaphore:
+                    await asyncio.wait_for(
+                        ws.send_json(message), timeout=IM_WS_SEND_TIMEOUT_SECONDS)
+                return None
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("WebSocket 推送失败（摘除连接）: %s, %s", client_id, exc)
+                return client_id
+
+        results = await asyncio.gather(
+            *(_send_one(cid, ws) for cid, ws in pairs), return_exceptions=True)
+        for result in results:
+            if isinstance(result, str):
+                await self.disconnect(result)
+
     async def broadcast_authenticated(self, message: dict, exclude_user_id: Optional[int] = None) -> None:
         """向所有已鉴权的连接推送消息（跨数据组）。
 
         exclude_user_id 不为空时跳过该用户的全部连接：某人登录时，
         只让「除自身以外的其他用户端」看到上线提醒。
         """
-        for client_id in list(self.connections.keys()):
-            if client_id not in self.client_authed:
-                continue
-            if exclude_user_id and self.client_user_ids.get(client_id) == exclude_user_id:
-                continue
-            ws = self.connections.get(client_id)
-            if ws is None:
-                continue
-            try:
-                await ws.send_json(message)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(f"发送全局消息失败: {client_id}, {exc}")
-                await self.disconnect(client_id)
+        pairs = [
+            (cid, self.connections[cid])
+            for cid in list(self.connections.keys())
+            if cid in self.client_authed
+            and self.connections.get(cid) is not None
+            and not (exclude_user_id
+                     and self.client_user_ids.get(cid) == exclude_user_id)
+        ]
+        await self._send_concurrently(pairs, message)
 
     def notify_user_online(self, payload: Dict[str, Any]) -> None:
         """线程安全地广播「用户上线」事件（任意线程可调用，绝不抛异常）。
@@ -269,19 +295,14 @@ class WebSocketManager:
         targets = {int(uid) for uid in user_ids}
         if not targets:
             return
-        for client_id in list(self.connections.keys()):
-            if client_id not in self.client_authed:
-                continue
-            if self.client_user_ids.get(client_id) not in targets:
-                continue
-            ws = self.connections.get(client_id)
-            if ws is None:
-                continue
-            try:
-                await ws.send_json(message)
-            except Exception as exc:  # noqa: BLE001
-                logger.debug(f"IM 推送失败（忽略）: {client_id}, {exc}")
-                await self.disconnect(client_id)
+        pairs = [
+            (cid, self.connections[cid])
+            for cid in list(self.connections.keys())
+            if cid in self.client_authed
+            and self.client_user_ids.get(cid) in targets
+            and self.connections.get(cid) is not None
+        ]
+        await self._send_concurrently(pairs, message)
 
     def has_other_connections(self, user_id: int, exclude_client_id: str) -> bool:
         """该用户是否还有其它已鉴权连接（避免多标签页误判为离线）。"""

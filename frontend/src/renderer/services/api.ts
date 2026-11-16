@@ -609,6 +609,37 @@ export interface DesktopLoginResult {
   license_id?: number
 }
 
+export interface DesktopScreenshotHotkeyConfig {
+  modifiers: string[]
+  key: string
+}
+
+export interface DesktopScreenshotSettings {
+  hotkey: DesktopScreenshotHotkeyConfig
+  /** 截图时隐藏协作沟通会话浮窗（默认关闭） */
+  hideImWindow: boolean
+}
+
+/** 桌面共享模式直连云端 WS 的配置；许可凭证只在本机内存里流转 */
+export interface DesktopCloudWsConfig {
+  enabled: boolean
+  url?: string
+  license_file?: string
+  machine_code?: string
+  auth_timeout_ms?: number
+  reauth_interval_ms?: number
+  license_fingerprint?: string
+}
+
+export interface DesktopScreenshotSaveResult {
+  settings: DesktopScreenshotSettings
+  /** Win32 RegisterHotKey 返回 1409：组合键被其它应用占用，配置已回滚 */
+  conflict: boolean
+  registered: boolean
+  reverted: boolean
+  shellUnavailable?: boolean
+}
+
 // 桌面版账号登录：与网页端同一套账号（仅桌面版可用，网页端返回 404）
 export const desktopLoginApi = {
   login: async (data: {
@@ -720,9 +751,66 @@ export const desktopLoginApi = {
     return apiClient.get('/desktop/window-state') as any
   },
 
-  /** 壳层 Win32 全局热键 Alt+Z 的序号；前端按增量触发截图弹窗 */
+  /** 桌面共享模式云端 IM 推送配置；许可凭证只经本机下发，不进 URL / 日志 */
+  cloudWsConfig: async (): Promise<ApiResponse<DesktopCloudWsConfig>> => {
+    return apiClient.get('/desktop/cloud-ws-config') as any
+  },
+
+  /** 壳层 Win32 全局截图热键的序号；前端按增量触发取景 */
   screenshotHotkey: async (): Promise<ApiResponse<{ seq: number }>> => {
     return apiClient.get('/desktop/screenshot-hotkey') as any
+  },
+
+  /**
+   * 发起一次壳层取景；返回基线 seq，蒙层交互在壳层独立线程进行，HTTP 立即返回。
+   * frameReady 表示前端已完成 DOM 稳定化（清标记 / 关遮罩 / 收下拉 / 等两帧），
+   * 壳层可立即抓屏；watchdog 兜底路径不带该标志，壳层自行等待一帧。
+   */
+  screenshotCapture: async (hideImWindow: boolean, frameReady = false): Promise<ApiResponse<{
+    started: boolean
+    busy: boolean
+    unsupported: boolean
+    seq: number
+  }>> => {
+    return apiClient.post('/desktop/screenshot-capture', {
+      hide_im_window: hideImWindow, frame_ready: frameReady,
+    }) as any
+  },
+
+  /** 按序号增量轮询取景结果（ready / cancelled / pending） */
+  screenshotResult: async (after: number): Promise<ApiResponse<{
+    seq: number
+    ready: boolean
+    cancelled: boolean
+    pending: boolean
+  }>> => {
+    return apiClient.get('/desktop/screenshot-result', { params: { after } }) as any
+  },
+
+  /** 取走裁剪好的 PNG（二进制，读后即弃）；blob 响应拦截器返回完整 AxiosResponse */
+  screenshotImage: async (): Promise<Blob | null> => {
+    const response = await apiClient.get('/desktop/screenshot-image', { responseType: 'blob' }) as any
+    return response?.data instanceof Blob ? response.data : null
+  },
+
+  /** 用户提前关闭截图弹窗时中止壳层取景蒙层，避免置顶窗口残留 */
+  screenshotCancel: async (): Promise<ApiResponse<{ cancelled: boolean }>> => {
+    return apiClient.post('/desktop/screenshot-cancel') as any
+  },
+
+  /** 读本机截图设置（组合键 + 隐藏会话窗口开关）与热键注册状态 */
+  getScreenshotSettings: async (): Promise<ApiResponse<{
+    settings: DesktopScreenshotSettings
+    hotkey: { registered: boolean; conflict: boolean; display: string }
+  }>> => {
+    return apiClient.get('/desktop/screenshot-settings') as any
+  },
+
+  /** 保存设置并让壳层热键线程重注册；冲突时后端自动回滚并置 conflict=true */
+  putScreenshotSettings: async (
+    settings: DesktopScreenshotSettings,
+  ): Promise<ApiResponse<DesktopScreenshotSaveResult>> => {
+    return apiClient.put('/desktop/screenshot-settings', settings) as any
   },
 }
 
@@ -2642,9 +2730,16 @@ function blobToBase64(blob: Blob): Promise<string> {
   })
 }
 
+/** IM 交互路径独立短超时：apiClient 的 300s 是给分片上传用的，弱网时不能把
+ *  实时消息 / 红点轮询挂住几分钟；超时后由 imStore 的退避重试与降级轮询兜底。 */
+const IM_REQUEST_TIMEOUT_MS = 15000
+
 export const imApi = {
-  conversations: (): Promise<ImEnvelope<ImConversationsData>> =>
-    apiClient.get('/im/conversations') as any,
+  /** include_avatars=false 用于高频轮询：头像只在首次加载时取一次，之后由前端缓存合并 */
+  conversations: (includeAvatars = true): Promise<ImEnvelope<ImConversationsData>> =>
+    apiClient.get('/im/conversations', {
+      params: { include_avatars: includeAvatars }, timeout: IM_REQUEST_TIMEOUT_MS,
+    }) as any,
 
   createConversation: (payload: {
     kind: 'direct' | 'custom_group'
@@ -2698,7 +2793,9 @@ export const imApi = {
     before_id?: number
     limit?: number
   }): Promise<ImEnvelope<ImMessagesPage>> =>
-    apiClient.get(`/im/conversations/${id}/messages`, { params }) as any,
+    apiClient.get(`/im/conversations/${id}/messages`, {
+      params, timeout: IM_REQUEST_TIMEOUT_MS,
+    }) as any,
 
   send: (id: number, payload: {
     kind: 'text' | 'image' | 'file'
@@ -2709,13 +2806,17 @@ export const imApi = {
     mentions?: number[]
     mention_all?: boolean
   }): Promise<ImEnvelope<ImMessage>> =>
-    apiClient.post(`/im/conversations/${id}/messages`, payload) as any,
+    apiClient.post(`/im/conversations/${id}/messages`, payload, {
+      timeout: IM_REQUEST_TIMEOUT_MS,
+    }) as any,
 
   markRead: (id: number, lastReadMessageId: number): Promise<ImEnvelope<any>> =>
-    apiClient.post(`/im/conversations/${id}/read`, { last_read_message_id: lastReadMessageId }) as any,
+    apiClient.post(`/im/conversations/${id}/read`,
+      { last_read_message_id: lastReadMessageId },
+      { timeout: IM_REQUEST_TIMEOUT_MS }) as any,
 
   contacts: (): Promise<ImEnvelope<ImContactsData>> =>
-    apiClient.get('/im/contacts') as any,
+    apiClient.get('/im/contacts', { timeout: IM_REQUEST_TIMEOUT_MS }) as any,
 
   attachmentStart: (payload: {
     conversation_id: number

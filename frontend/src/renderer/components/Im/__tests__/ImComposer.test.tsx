@@ -32,6 +32,9 @@ vi.mock('../../../store/authStore', () => ({
 
 import { useImStore } from '../../../store/imStore'
 import { ImComposer } from '../ImComposer'
+import {
+  applyScreenshotSettings, DEFAULT_SCREENSHOT_SETTINGS, getScreenshotSettings,
+} from '../screenshotSettings'
 
 function mockState() {
   return {
@@ -194,5 +197,36 @@ describe('协作沟通输入区', () => {
     render(<ImComposer conversationId={7} />)
     fireEvent.change(screen.getByPlaceholderText(/输入消息/), { target: { value: '@' } })
     expect(screen.queryByText('选择要 @ 的成员')).toBeNull()
+  })
+
+  it('截图按钮下拉提供「隐藏窗口截图」与「设置」入口', () => {
+    const onSettings = vi.fn()
+    window.addEventListener('npt:screenshot-settings', onSettings)
+    render(<ImComposer conversationId={7} />)
+    expect(screen.queryByText('隐藏窗口截图')).toBeNull()
+
+    fireEvent.click(screen.getByTitle('截图选项'))
+    expect(screen.getByText('隐藏窗口截图')).toBeTruthy()
+    expect(screen.getByText('截图设置')).toBeTruthy()
+
+    fireEvent.click(screen.getByText('截图设置'))
+    expect(onSettings).toHaveBeenCalledTimes(1)
+    window.removeEventListener('npt:screenshot-settings', onSettings)
+  })
+
+  it('下拉切换「隐藏窗口截图」会持久化并同步勾选状态', async () => {
+    applyScreenshotSettings(DEFAULT_SCREENSHOT_SETTINGS)
+    render(<ImComposer conversationId={7} />)
+    fireEvent.click(screen.getByTitle('截图选项'))
+    const item = screen.getByText('隐藏窗口截图').closest('button') as HTMLButtonElement
+    expect(item.querySelector('.lucide-check')).toBeNull()
+
+    fireEvent.click(item)
+    await waitFor(() => expect(getScreenshotSettings().hideImWindow).toBe(true))
+    // 菜单点完即收起；重新展开时勾选状态仍与共享配置同步
+    fireEvent.click(screen.getByTitle('截图选项'))
+    expect(screen.getByText('隐藏窗口截图').closest('button')?.querySelector('.lucide-check'))
+      .toBeTruthy()
+    applyScreenshotSettings(DEFAULT_SCREENSHOT_SETTINGS)
   })
 })

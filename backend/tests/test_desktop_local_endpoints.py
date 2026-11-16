@@ -402,3 +402,235 @@ def test_renewal_policy_by_remaining_days(desktop_local):
     assert cloud.should_renew(info, {}) is True
     info["remaining_days"] = 25
     assert cloud.should_renew(info, {"last_renew_at": "2026-01-01T00:00:00"}) is True  # 距上次超过 7 天
+
+
+# ------------------------------------------------------------------ 取景截图端点
+
+def _screenshot_settings_root(desktop_local, tmp_path):
+    root = tmp_path / "shot-settings"
+    desktop_local.monkeypatch.setattr(desktop_local.settings, "DATA_ROOT", root)
+    return root
+
+
+def test_screenshot_capture_status_image_and_cancel(desktop_local, tmp_path):
+    """发起 / 轮询 / 取二进制 PNG / 取消逐条转发给壳层，图像不经 JSON 膨胀。"""
+    from app import desktop_bridge
+
+    _screenshot_settings_root(desktop_local, tmp_path)
+    seen: list = []
+    png = b"\x89PNG\r\n\x1a\nfake-frame"
+
+    def handler(action, params):
+        seen.append((action, params))
+        if action == "start":
+            return {"started": True, "busy": False, "unsupported": False, "seq": 3}
+        if action == "status":
+            return {"seq": 4, "ready": True, "cancelled": False, "pending": False}
+        if action == "image":
+            return {"png": png}
+        if action == "cancel":
+            return {"cancelled": True}
+        return {}
+
+    desktop_bridge.set_screenshot_handler(handler)
+    try:
+        start = desktop_local.client.post(
+            "/api/v1/desktop/screenshot-capture",
+            json={"hide_im_window": True, "frame_ready": True},
+        )
+        assert start.status_code == 200, start.text
+        assert start.json()["data"]["seq"] == 3
+
+        status = desktop_local.client.get("/api/v1/desktop/screenshot-result?after=3")
+        assert status.status_code == 200, status.text
+        assert status.json()["data"]["ready"] is True
+
+        image = desktop_local.client.get("/api/v1/desktop/screenshot-image")
+        assert image.status_code == 200
+        assert image.headers["content-type"].startswith("image/png")
+        assert image.content == png
+
+        cancel = desktop_local.client.post("/api/v1/desktop/screenshot-cancel")
+        assert cancel.json()["data"]["cancelled"] is True
+        assert seen == [
+            ("start", {"hideImWindow": True, "frameReady": True}),
+            ("status", {"after": 3}),
+            ("image", {}),
+            ("cancel", {}),
+        ]
+    finally:
+        desktop_bridge.set_screenshot_handler(None)
+
+
+def test_screenshot_capture_claims_hotkey_round_and_defaults_frame_ready(
+    desktop_local, tmp_path
+):
+    """旧前端不带 frame_ready 时默认 false；POST 会撤销壳层 watchdog 的待取景轮次。"""
+    from app import desktop_bridge
+
+    _screenshot_settings_root(desktop_local, tmp_path)
+    seen: list = []
+
+    def handler(action, params):
+        seen.append((action, params))
+        return {"started": True, "busy": False, "unsupported": False, "seq": 1}
+
+    desktop_bridge.set_screenshot_handler(handler)
+    try:
+        desktop_bridge.notify_screenshot_hotkey()  # 模拟一次全局热键登记
+        resp = desktop_local.client.post(
+            "/api/v1/desktop/screenshot-capture", json={"hide_im_window": False}
+        )
+        assert resp.status_code == 200, resp.text
+        assert seen == [("start", {"hideImWindow": False, "frameReady": False})]
+        # 前端已接管：watchdog 再 claim 应失败，不会重复铺蒙层
+        assert desktop_bridge.claim_screenshot_round() is False
+    finally:
+        desktop_bridge.set_screenshot_handler(None)
+
+
+def test_screenshot_capture_without_shell_returns_403(desktop_local, tmp_path):
+    """桥接未注入（网页端 / 旧壳）：端点统一 403，前端据此降级。"""
+    from app import desktop_bridge
+
+    _screenshot_settings_root(desktop_local, tmp_path)
+    desktop_bridge.set_screenshot_handler(None)
+    for resp in (
+        desktop_local.client.post("/api/v1/desktop/screenshot-capture", json={}),
+        desktop_local.client.get("/api/v1/desktop/screenshot-result"),
+        desktop_local.client.get("/api/v1/desktop/screenshot-image"),
+        desktop_local.client.post("/api/v1/desktop/screenshot-cancel"),
+    ):
+        assert resp.status_code == 403, resp.text
+
+
+def test_screenshot_settings_default_and_validation(desktop_local, tmp_path):
+    from app.services import desktop_screenshot_settings as cfg
+
+    root = _screenshot_settings_root(desktop_local, tmp_path)
+    resp = desktop_local.client.get("/api/v1/desktop/screenshot-settings")
+    assert resp.status_code == 200, resp.text
+    data = resp.json()["data"]
+    assert data["settings"] == cfg.default_settings()
+    assert data["hotkey"]["display"] == "Alt+Z"
+
+    bad = desktop_local.client.put(
+        "/api/v1/desktop/screenshot-settings",
+        json={"hotkey": {"modifiers": [], "key": "Z"}, "hideImWindow": False},
+    )
+    assert bad.status_code == 400
+    assert cfg.load_settings(root) == cfg.default_settings()
+
+
+def test_screenshot_settings_conflict_rolls_back(desktop_local, tmp_path):
+    """RegisterHotKey 1409：配置回滚到上一次可用值，并向前端回报 conflict。"""
+    from app import desktop_bridge
+    from app.services import desktop_screenshot_settings as cfg
+
+    root = _screenshot_settings_root(desktop_local, tmp_path)
+    seen: list = []
+
+    def handler(action, params):
+        seen.append(action)
+        if action == "apply":
+            return {"conflict": True, "registered": False, "error": 1409}
+        return {"registered": True}
+
+    desktop_bridge.set_screenshot_handler(handler)
+    try:
+        resp = desktop_local.client.put("/api/v1/desktop/screenshot-settings", json={
+            "hotkey": {"modifiers": ["ctrl", "shift"], "key": "F5"},
+            "hideImWindow": False,
+        })
+        assert resp.status_code == 200, resp.text
+        data = resp.json()["data"]
+        assert data["conflict"] is True
+        assert data["reverted"] is True
+        assert data["settings"] == cfg.default_settings()
+        # 落盘也必须是回滚后的配置，不能留下冲突组合键
+        assert cfg.load_settings(root) == cfg.default_settings()
+        # 一次尝试 + 一次按旧配置重注册
+        assert seen.count("apply") == 2
+    finally:
+        desktop_bridge.set_screenshot_handler(None)
+
+
+def test_screenshot_settings_hide_toggle_does_not_reregister_hotkey(desktop_local, tmp_path):
+    """只切换「隐藏窗口截图」开关时不重注册热键，避免无关的冲突回滚。"""
+    from app import desktop_bridge
+    from app.services import desktop_screenshot_settings as cfg
+
+    root = _screenshot_settings_root(desktop_local, tmp_path)
+    seen: list = []
+
+    def handler(action, params):
+        seen.append(action)
+        return {"registered": True, "conflict": False}
+
+    desktop_bridge.set_screenshot_handler(handler)
+    try:
+        resp = desktop_local.client.put("/api/v1/desktop/screenshot-settings", json={
+            "hotkey": {"modifiers": ["alt"], "key": "Z"},
+            "hideImWindow": True,
+        })
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["data"]["settings"]["hideImWindow"] is True
+        assert "apply" not in seen
+        assert cfg.load_settings(root)["hideImWindow"] is True
+    finally:
+        desktop_bridge.set_screenshot_handler(None)
+
+
+def test_screenshot_hotkey_round_is_claimed_once():
+    """热键登记 → 前端与 watchdog 竞争，只可能有一方抢到取景轮次。"""
+    from app import desktop_bridge
+
+    before = desktop_bridge.screenshot_hotkey_seq()
+    seq = desktop_bridge.notify_screenshot_hotkey()
+    assert seq == before + 1
+    assert desktop_bridge.screenshot_hotkey_seq() == seq
+    assert desktop_bridge.claim_screenshot_round() is True
+    assert desktop_bridge.claim_screenshot_round() is False
+
+
+def test_cloud_ws_config_disabled_when_flag_off(desktop_local):
+    desktop_local.monkeypatch.setattr(
+        desktop_local.settings, "NPT_IM_CLOUD_WS_ENABLED", False
+    )
+    resp = desktop_local.client.get("/api/v1/desktop/cloud-ws-config")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["data"]["enabled"] is False
+
+
+def test_cloud_ws_config_disabled_outside_shared(desktop_local):
+    from app.services import im_desktop_proxy
+
+    desktop_local.monkeypatch.setattr(
+        desktop_local.settings, "NPT_IM_CLOUD_WS_ENABLED", True
+    )
+    desktop_local.monkeypatch.setattr(
+        im_desktop_proxy, "is_shared_desktop", lambda: False
+    )
+    resp = desktop_local.client.get("/api/v1/desktop/cloud-ws-config")
+    assert resp.json()["data"]["enabled"] is False
+
+
+def test_cloud_ws_config_returns_license_credentials(desktop_local):
+    """共享模式返回 wss 地址与许可凭证；凭证只经本机端点下发，不进 URL。"""
+    from app.services import im_desktop_proxy
+
+    mp = desktop_local.monkeypatch
+    mp.setattr(desktop_local.settings, "NPT_IM_CLOUD_WS_ENABLED", True)
+    mp.setattr(desktop_local.settings, "NPT_SERVER_URL", "https://app.example.test")
+    mp.setattr(im_desktop_proxy, "is_shared_desktop", lambda: True)
+    mp.setattr(desktop_local.cloud, "_license_file_text", lambda: "signed-license")
+
+    resp = desktop_local.client.get("/api/v1/desktop/cloud-ws-config")
+    assert resp.status_code == 200, resp.text
+    data = resp.json()["data"]
+    assert data["enabled"] is True
+    assert data["url"] == "wss://app.example.test/api/v1/ws/tasks?kind=license"
+    assert data["license_file"] == "signed-license"
+    assert data["machine_code"]
+    assert len(data["license_fingerprint"]) == 16
+    assert data["auth_timeout_ms"] > 0

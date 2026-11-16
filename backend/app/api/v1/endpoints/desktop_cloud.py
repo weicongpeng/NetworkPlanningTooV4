@@ -52,6 +52,11 @@ def _rate_limit(key: str, limit: int = 20, window: int = 300) -> None:
 
 
 def _client_ip(request: Request) -> str:
+    # 生产经 Cloudflare Tunnel：CF-Connecting-IP 才是真实客户端 IP，
+    # XFF 首段可能被伪造，优先取不可被客户端覆盖的头。
+    cf = request.headers.get("cf-connecting-ip") or ""
+    if cf.strip():
+        return cf.strip()
     forwarded = request.headers.get("x-forwarded-for") or ""
     if forwarded:
         return forwarded.split(",")[0].strip()
@@ -1294,7 +1299,12 @@ def im_relay(payload: ImRelayRequest, request: Request,
     """桌面共享模式 IM 操作中继：验签 → 解析真实用户 → 执行白名单 op。"""
     # 桌面端会话列表 1.5s 轮询（约 40 次/分钟/客户端），同一公网出口下多台桌面端
     # 叠加时旧阈值 180 次/分钟会把读请求打回 429，导致未读红点丢失；仍保留限流防滥用。
-    _rate_limit(f"im-relay:{_client_ip(request)}", limit=600, window=60)
+    client_ip = _client_ip(request)
+    # 同一公网出口多台桌面端共享一个 IP 限流桶会互相挤掉：机器码纳入 key 让每台
+    # 桌面端独立配额；再保留一个按 IP 的总量阈值，防止伪造机器码绕过限流。
+    machine = str(payload.machine_code or "")[:64]
+    _rate_limit(f"im-relay:{client_ip}:{machine}", limit=600, window=60)
+    _rate_limit(f"im-relay-ip:{client_ip}", limit=1800, window=60)
     record, _ = _verify_license(payload.license_file, payload.machine_code, db)
     user_id = _relay_user_id(db, record)
     from app.services import im_ops

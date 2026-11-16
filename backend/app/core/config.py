@@ -166,7 +166,12 @@ class Settings(BaseSettings):
     NPT_IM_MAX_FILE_MB: int = 20
     NPT_IM_MESSAGE_PAGE_SIZE: int = 30
     NPT_IM_MAX_MEMBERS_PER_GROUP: int = 200
-    NPT_IM_DESKTOP_POLL_MS: int = 5000
+    # 降级轮询间隔（云 WS 不可用/旧服务端时由 ImHost 使用，单位毫秒）
+    NPT_IM_DESKTOP_POLL_MS: int = 1500
+    # 桌面共享模式是否启用直连云端 WS 的 IM 推送；关闭后完全退回 relay 轮询
+    NPT_IM_CLOUD_WS_ENABLED: bool = True
+    # 云 WS 许可鉴权超时（前端与服务端各自有超时，取较小者生效）
+    NPT_IM_CLOUD_WS_AUTH_TIMEOUT_MS: int = 8000
 
     # 地图默认配置
     DEFAULT_MAP_CENTER: tuple = (39.9042, 116.4074)  # 北京

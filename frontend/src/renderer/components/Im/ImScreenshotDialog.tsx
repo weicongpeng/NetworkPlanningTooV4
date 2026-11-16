@@ -1,12 +1,16 @@
 /**
- * 截图对话框（应用级挂载）：打开即全屏 → 唤起原生「应用窗口」选择器 → 双击窗口缩略图
- * 抓一帧 → 可缩放/平移/裁剪/标注 → 生成 File 并写入剪贴板 / 对话框。
+ * 截图对话框（应用级挂载）：网页端「打开即全屏 → 唤起原生应用窗口选择器 → 抓一帧」，
+ * 桌面端「壳层取景产出 PNG → initialBlob 直接进编辑页」；两条链路之后完全一致：
+ * 可缩放/平移/裁剪/标注 → 生成 File 并写入剪贴板 / 对话框。
  *
  * 设计要点：
  *  - 弹窗默认全屏铺满浏览器内容窗口（无标题、无底部栏，所有操作收进顶部单行工具栏）。
- *  - 点击剪刀按钮 / Alt+Z 打开弹窗时**自动**调用 getDisplayMedia，直接弹出系统原生的
- *    「应用窗口」选择器（里面就是各个窗口的小图）。用户在列表里双击目标窗口缩略图
- *    即完成截图加载，随即进入编辑页。
+ *  - captureMode='web'（默认，网页端）：点击剪刀按钮 / 快捷键打开弹窗时**自动**调用
+ *    getDisplayMedia，直接弹出系统原生的「应用窗口」选择器（里面就是各个窗口的小图）。
+ *    用户在列表里双击目标窗口缩略图即完成截图加载，随即进入编辑页。
+ *  - captureMode='desktop'（Windows 桌面端）：绝不唤起 getDisplayMedia，改为等待 ImHost
+ *    轮询壳层结果后传入 initialBlob。取景期间前端弹窗根本不打开，避免黑色遮罩被截进
+ *    整屏快照；裁剪出的图仍走原有的 loadFrame / emit / queueScreenshot 流程。
  *  - 浏览器不允许 JS 枚举其它进程窗口，窗口缩略图列表由 getDisplayMedia 原生选择器
  *    提供；displaySurface:'window' + monitorTypeSurfaces:'exclude' 让它默认停在
  *    「应用窗口」并隐藏整屏选项，选中后只抓一帧。
@@ -24,7 +28,7 @@ import { useTranslation } from 'react-i18next'
 import type { LucideIcon } from 'lucide-react'
 import {
   AppWindow, ArrowRight, Check, Circle, Crop, Download, Hand,
-  Image as ImageIcon, LayoutGrid, Maximize2, Minimize2, Minus, Monitor,
+  Image as ImageIcon, LayoutGrid, Loader2, Maximize2, Minimize2, Minus, Monitor,
   Palette, RefreshCw, RotateCcw, Square, Trash2, Type, Undo2, X,
   ZoomIn, ZoomOut,
 } from 'lucide-react'
@@ -32,6 +36,7 @@ import {
 import { desktopLoginApi } from '../../services/api'
 import { useAuthStore } from '../../store/authStore'
 import { useToastStore } from '../../store/toastStore'
+import { CAPTURE_FLAG } from './screenshotBus'
 import {
   arrowPoints, clamp, composeFullImage, createMosaicTile, drawMosaicStrokes, fontFor,
   isMosaic, mosaicSizeFor, paintMosaicPoint, paintMosaicSegment, shapeSize, strokeFor,
@@ -44,6 +49,13 @@ interface Props {
   open: boolean
   onClose: () => void
   onConfirm: (file: File) => void
+  /** 桌面端壳层取景产出的 PNG：直接进既有编辑页，跳过共享窗口选择器 */
+  initialBlob?: Blob | null
+  onInitialConsumed?: () => void
+  /** desktop：等待 initialBlob，不自动唤起 getDisplayMedia；web：保持原有窗口选择流程 */
+  captureMode?: 'web' | 'desktop'
+  /** 桌面端编辑页「重新取景」：重新发起一次壳层截图会话 */
+  onRecapture?: () => void
 }
 
 interface SourceItem extends SourceImage {
@@ -54,9 +66,6 @@ interface SourceItem extends SourceImage {
 type CaptureResult = { blob: Blob } | { error: 'unsupported' | 'cancelled' | 'failed' }
 type TextDraft = Point & { value: string; key: number }
 interface Offset { x: number; y: number }
-
-/** 取景期间挂在 <body> 上：CSS 据此隐藏截图工具 / 协作沟通窗口等置顶浮层 */
-const CAPTURE_FLAG = 'data-npt-capturing'
 
 const PRESET_COLORS = [
   '#ff3b30', '#ff9500', '#ffcc00', '#34c759',
@@ -317,7 +326,10 @@ function ShapeNode({ shape, stroke, index }: {
   return null
 }
 
-export function ImScreenshotDialog({ open, onClose, onConfirm }: Props) {
+export function ImScreenshotDialog({
+  open, onClose, onConfirm, initialBlob, onInitialConsumed,
+  captureMode = 'web', onRecapture,
+}: Props) {
   const { t, i18n: i18nInstance } = useTranslation()
   const desktopMode = useAuthStore(s => s.desktopMode)
   const [source, setSource] = useState<SourceItem | null>(null)
@@ -533,15 +545,25 @@ export function ImScreenshotDialog({ open, onClose, onConfirm }: Props) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, source])
 
-  /** 打开即自动唤起原生窗口选择器（无手势时会回落引导页，不自动重弹） */
+  /** 打开即自动唤起原生窗口选择器（仅网页端；无手势时会回落引导页，不自动重弹） */
   useEffect(() => {
     if (!open || autoCaptureRef.current) return
+    // 桌面端由壳层取景，绝不弹出「获取共享窗口」选择器，改为等待 initialBlob
+    if (captureMode === 'desktop') return
     if (!screenCaptureAvailable()) return
     autoCaptureRef.current = true
     const timer = window.setTimeout(() => { void onCapture(true) }, 30)
     return () => window.clearTimeout(timer)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open])
+  }, [open, captureMode])
+
+  /** 桌面端壳层裁剪好的 PNG 直接进编辑页；之后的标注 / 剪贴板 / 附件流程完全不变 */
+  useEffect(() => {
+    if (!open || captureMode !== 'desktop' || !initialBlob) return
+    loadFrame(initialBlob)
+    onInitialConsumed?.()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, captureMode, initialBlob])
 
   const openSecureVersion = () => {
     const url = `https://${window.location.host}${window.location.pathname}${window.location.search}`
@@ -911,8 +933,13 @@ export function ImScreenshotDialog({ open, onClose, onConfirm }: Props) {
 
           {source && (
             <>
-              <IconButton title={t('im.screenshot.reselect', '重新选择窗口')}
-                          onClick={releaseSource}>
+              <IconButton title={captureMode === 'desktop'
+                                ? t('im.screenshot.recapture', '重新取景')
+                                : t('im.screenshot.reselect', '重新选择窗口')}
+                          onClick={() => {
+                            releaseSource()
+                            if (captureMode === 'desktop') onRecapture?.()
+                          }}>
                 <RefreshCw size={16} />
               </IconButton>
               <IconButton title={t('im.screenshot.downloadHint', '下载为 PNG')}
@@ -940,8 +967,16 @@ export function ImScreenshotDialog({ open, onClose, onConfirm }: Props) {
           </IconButton>
         </div>
 
-        {/* 引导页：自动唤起被取消 / 无用户手势 / 不支持时的重试入口 */}
-        {!source && (
+        {/* 桌面端：壳层蒙层取景中；网页端：保留原有的窗口选择 / 重试引导页 */}
+        {!source && (captureMode === 'desktop' ? (
+          <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-3 p-6">
+            <Loader2 size={40} strokeWidth={1.4} className="animate-spin text-primary" />
+            <p className="max-w-md text-center text-[11px] leading-relaxed text-muted-foreground">
+              {t('im.screenshot.desktopHint',
+                '正在取景：鼠标移到窗口上会高亮截取范围，单击即完成；按住拖拽可自由框选，ESC / 右键取消。')}
+            </p>
+          </div>
+        ) : (
           <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-4 p-6">
             {captureSupported ? (
               <>
@@ -970,7 +1005,7 @@ export function ImScreenshotDialog({ open, onClose, onConfirm }: Props) {
               </>
             )}
           </div>
-        )}
+        ))}
 
         {/* 抓帧后的操作页：可缩放 / 平移 / 裁剪 / 标注 */}
         {source && (

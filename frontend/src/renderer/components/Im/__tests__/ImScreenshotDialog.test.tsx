@@ -393,4 +393,35 @@ describe('协作沟通截图对话框', () => {
     await waitFor(() => expect(write).toHaveBeenCalledTimes(1))
     expect(onClose).toHaveBeenCalledTimes(1)
   })
+
+  it('桌面端取景模式不弹出共享窗口选择器，只显示取景提示', async () => {
+    const getDisplayMedia = vi.fn().mockResolvedValue(resolvedStream())
+    setSecure(true, { getDisplayMedia })
+    render(
+      <ImScreenshotDialog open onClose={onClose} onConfirm={onConfirm}
+                          captureMode="desktop" />,
+    )
+    await waitFor(() => expect(screen.getByText(/正在取景/)).toBeTruthy())
+    // 等过网页端 30ms 自动唤起窗口后仍未调用，确保桌面端确实绕开 getDisplayMedia
+    await new Promise(resolve => setTimeout(resolve, 80))
+    expect(getDisplayMedia).not.toHaveBeenCalled()
+    expect(screen.queryByTitle('重新选择窗口')).toBeNull()
+  })
+
+  it('桌面端壳层裁剪出的 Blob 直接进编辑页，并只消费一次', async () => {
+    const getDisplayMedia = vi.fn()
+    setSecure(true, { getDisplayMedia })
+    desktopState.desktopMode = true
+    const onInitialConsumed = vi.fn()
+    render(
+      <ImScreenshotDialog open onClose={onClose} onConfirm={onConfirm}
+                          captureMode="desktop"
+                          initialBlob={new Blob(['png'], { type: 'image/png' })}
+                          onInitialConsumed={onInitialConsumed} />,
+    )
+    await waitFor(() => expect(screen.getByTitle('矩形')).toBeTruthy())
+    expect(getDisplayMedia).not.toHaveBeenCalled()
+    expect(onInitialConsumed).toHaveBeenCalledTimes(1)
+    expect(document.body.querySelector('img')).toBeTruthy()
+  })
 })

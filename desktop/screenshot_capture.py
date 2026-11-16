@@ -1,0 +1,517 @@
+"""Windows 桌面壳的「取景式截图」会话（仅桌面形态）。
+
+与网页端 ``getDisplayMedia`` 的窗口选择器不同，这里由壳层直接冻结整屏画面并铺一层
+置顶、鼠标穿透的 WinForms 蒙层：鼠标停在哪个顶层窗口上就高亮该窗口矩形，单击即截取；
+按住拖拽则自由框选；ESC / 右键取消。因为蒙层是系统级窗口，桌面应用即使不在前台、
+用户正在操作其它应用，全局热键一样能进入取景并截取别的窗口。
+
+设计约束（与 ``ImScreenshotDialog`` 的后续流程对齐）：
+- 只裁剪当前屏幕可见画面，不枚举后台窗口、不提供窗口列表；
+- 结果只产出一帧 PNG 二进制 + 递增序号，标注 / 剪贴板 / 待发送附件仍全部由前端负责；
+- 会话交互跑在独立 STA 线程，HTTP 端点立即返回，不阻塞 uvicorn / pywebview GUI 线程；
+- 蒙层设 ``WS_EX_TRANSPARENT`` 让 ``WindowFromPoint`` 穿透到真正的下层窗口，
+  鼠标与按键状态用 30ms 的 WinForms Timer 轮询，避免低级钩子与跨线程委托。
+"""
+from __future__ import annotations
+
+import ctypes
+import logging
+import os
+import threading
+import time
+from ctypes import wintypes
+from io import BytesIO
+from pathlib import Path
+from typing import Any, Dict, Optional, Tuple
+
+_log = logging.getLogger("desktop")
+
+# Win32 常量
+GWL_EXSTYLE = -20
+WS_EX_TRANSPARENT = 0x00000020
+WS_EX_NOACTIVATE = 0x08000000
+WS_EX_TOOLWINDOW = 0x00000080
+GA_ROOT = 2
+DWMWA_EXTENDED_FRAME_BOUNDS = 9
+VK_LBUTTON = 0x01
+VK_RBUTTON = 0x02
+VK_ESCAPE = 0x1B
+SM_XVIRTUALSCREEN = 76
+SM_YVIRTUALSCREEN = 77
+SM_CXVIRTUALSCREEN = 78
+SM_CYVIRTUALSCREEN = 79
+COINIT_APARTMENTTHREADED = 0x2
+# watchdog / 旧前端未做 DOM 稳定化时的兜底等待：让 WebView2 合成一帧再抓屏。
+# 与「隐藏窗口截图」开关无关；新前端带 frame_ready=true 时壳层立即抓屏。
+CAPTURE_SETTLE_SECONDS = 0.09
+# 取景蒙层的鼠标/按键轮询周期（毫秒）
+POLL_INTERVAL_MS = 30
+# 拖动超过该像素才算「自由框选」，否则视为单击选中自动识别的窗口
+DRAG_THRESHOLD = 4
+
+
+class RECT(ctypes.Structure):
+    _fields_ = [
+        ("left", ctypes.c_long), ("top", ctypes.c_long),
+        ("right", ctypes.c_long), ("bottom", ctypes.c_long),
+    ]
+
+
+class POINT(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+
+def supported() -> bool:
+    """只有 Windows 桌面壳支持取景截图（服务器 / Linux 开发环境降级返回 False）。"""
+    return os.name == "nt"
+
+
+def _ensure_dpi_aware() -> None:
+    """统一按物理像素工作，否则多屏 / 缩放时高亮框与裁剪会整体错位。
+
+    pywebview 可能已经设置过 DPI 感知，重复调用会返回失败，忽略即可。
+    """
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PROCESS_PER_MONITOR_DPI_AWARE
+        return
+    except Exception:  # noqa: BLE001 - 旧系统 / 已设置
+        pass
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def virtual_screen_rect() -> Tuple[int, int, int, int]:
+    """返回整个虚拟屏幕的 ``(left, top, width, height)``（物理像素）。"""
+    user32 = ctypes.windll.user32
+    return (
+        int(user32.GetSystemMetrics(SM_XVIRTUALSCREEN)),
+        int(user32.GetSystemMetrics(SM_YVIRTUALSCREEN)),
+        int(user32.GetSystemMetrics(SM_CXVIRTUALSCREEN)),
+        int(user32.GetSystemMetrics(SM_CYVIRTUALSCREEN)),
+    )
+
+
+def window_rect_at(point: Tuple[int, int], overlay_hwnd: int = 0) -> Optional[Tuple[int, int, int, int]]:
+    """鼠标所在位置的**顶层窗口**矩形（屏幕坐标，含不可见窗口过滤）。
+
+    ``DWMWA_EXTENDED_FRAME_BOUNDS`` 不含阴影边框，比 ``GetWindowRect`` 更贴合肉眼可见
+    的窗口边界；DWM 关闭 / 调用失败时回退 ``GetWindowRect``。蒙层自身因
+    ``WS_EX_TRANSPARENT`` 不参与命中测试，这里再做一次兜底。
+    """
+    if os.name != "nt":
+        return None
+    try:
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.WindowFromPoint.argtypes = [POINT]
+        user32.WindowFromPoint.restype = wintypes.HWND
+        user32.GetAncestor.argtypes = [wintypes.HWND, ctypes.c_uint]
+        user32.GetAncestor.restype = wintypes.HWND
+        user32.IsWindowVisible.argtypes = [wintypes.HWND]
+        user32.IsWindowVisible.restype = ctypes.c_bool
+
+        child = user32.WindowFromPoint(POINT(int(point[0]), int(point[1])))
+        if not child:
+            return None
+        root = user32.GetAncestor(child, GA_ROOT)
+        if not root:
+            root = child
+        root_int = int(root)
+        if (overlay_hwnd and root_int == overlay_hwnd) or not user32.IsWindowVisible(root):
+            return None
+
+        rect = RECT()
+        try:
+            dwm = ctypes.WinDLL("dwmapi")
+            # HRESULT：S_OK 时 rect 为可见边界
+            ok = dwm.DwmGetWindowAttribute(
+                wintypes.HWND(root_int), ctypes.c_uint(DWMWA_EXTENDED_FRAME_BOUNDS),
+                ctypes.byref(rect), ctypes.sizeof(rect),
+            )
+            if ok != 0:
+                raise OSError("DwmGetWindowAttribute failed")
+        except Exception:  # noqa: BLE001
+            user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(RECT)]
+            if not user32.GetWindowRect(wintypes.HWND(root_int), ctypes.byref(rect)):
+                return None
+        if rect.right <= rect.left or rect.bottom <= rect.top:
+            return None
+        return (int(rect.left), int(rect.top), int(rect.right), int(rect.bottom))
+    except Exception:  # noqa: BLE001 - 识别失败只影响高亮，用户仍可自由框选
+        return None
+
+
+def clip_rect_to_image(
+    rect: Tuple[int, int, int, int],
+    origin: Tuple[int, int],
+    image_size: Tuple[int, int],
+) -> Optional[Tuple[int, int, int, int]]:
+    """屏幕矩形 → 整屏快照内的裁剪框（左闭右开），并钳制到图像范围。
+
+    ``origin`` 是虚拟屏左上角（多屏时可能为负），把窗口/框选的屏幕坐标换成图像坐标。
+    """
+    left = max(0, min(image_size[0], int(rect[0]) - origin[0]))
+    top = max(0, min(image_size[1], int(rect[1]) - origin[1]))
+    right = max(0, min(image_size[0], int(rect[2]) - origin[0]))
+    bottom = max(0, min(image_size[1], int(rect[3]) - origin[1]))
+    if right <= left or bottom <= top:
+        return None
+    return (left, top, right, bottom)
+
+
+def _grab_screen(size: Tuple[int, int]) -> Any:
+    """冻结整屏一次；返回 RGB PIL Image，图像 (0,0) 即虚拟屏左上角。"""
+    from PIL import ImageGrab
+
+    image = ImageGrab.grab(all_screens=True)
+    # 少数环境 all_screens 与 GetSystemMetrics 口径差 1px，按虚拟屏尺寸兜底裁齐
+    if image.size != (size[0], size[1]):
+        _log.info("整屏快照尺寸 %s 与虚拟屏 %s 不一致，按虚拟屏对齐", image.size, size)
+        image = image.crop((0, 0, min(image.width, size[0]), min(image.height, size[1])))
+    return image.convert("RGB")
+
+
+def _encode_png(image: Any, box: Tuple[int, int, int, int]) -> bytes:
+    cropped = image.crop(box)
+    buffer = BytesIO()
+    cropped.save(buffer, format="PNG", optimize=True)
+    return buffer.getvalue()
+
+
+def _png_files(image: Any, temp_dir: Path) -> Tuple[Path, Path]:
+    """生成蒙层用的「原图」与「暗化图」临时 PNG（WinForms Bitmap 从文件加载最稳）。"""
+    from PIL import Image
+
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    raw_path = temp_dir / "capture-raw.png"
+    dim_path = temp_dir / "capture-dim.png"
+    image.save(raw_path, format="PNG")
+    dim = Image.blend(image, Image.new("RGB", image.size, (0, 0, 0)), 0.55)
+    dim.save(dim_path, format="PNG")
+    return raw_path, dim_path
+
+
+def _run_overlay(
+    raw_path: Path,
+    dim_path: Path,
+    origin: Tuple[int, int],
+    size: Tuple[int, int],
+    abort: threading.Event,
+) -> Optional[Tuple[int, int, int, int]]:
+    """铺满虚拟屏的置顶蒙层；返回屏幕坐标选区，取消返回 None。
+
+    交互在 WinForms Timer 的 Tick 里完成（UI 线程内，避免跨线程 Invoke）：
+    ``Cursor.Position`` + ``GetAsyncKeyState`` 轮询按键，``WindowFromPoint`` 取顶层窗口
+    矩形高亮。蒙层设 WS_EX_TRANSPARENT 使命中测试穿透到下层窗口。
+    """
+    import clr  # noqa: F401 - pythonnet，冻结包已由 pywebview 引入
+
+    clr.AddReference("System.Windows.Forms")
+    clr.AddReference("System.Drawing")
+    from System.Drawing import Bitmap, Color, Pen, Point, Rectangle
+    from System.Windows.Forms import (
+        Application, Cursor, Form, FormBorderStyle, FormStartPosition, Label, Timer,
+    )
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+    user32.GetAsyncKeyState.restype = ctypes.c_short
+    user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
+    user32.GetWindowLongW.restype = ctypes.c_long
+    user32.SetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_long]
+    user32.SetWindowLongW.restype = ctypes.c_long
+
+    def pressed(vk: int) -> bool:
+        return bool(int(user32.GetAsyncKeyState(vk)) & 0x8000)
+
+    raw_bitmap = Bitmap(str(raw_path))
+    dim_bitmap = Bitmap(str(dim_path))
+    white_pen = Pen(Color.FromArgb(255, 255, 255, 255), 2)
+    state: Dict[str, Any] = {
+        "selection": None,       # 屏幕坐标矩形（自动识别或自由框选）
+        "start": None,           # 自由框选起点
+        "dragging": False,
+        "lbutton": False,
+        "done": False,
+        "cancelled": False,
+        "overlay_hwnd": 0,
+    }
+
+    def to_client(rect: Tuple[int, int, int, int]) -> Tuple[int, int, int, int]:
+        return (
+            rect[0] - origin[0], rect[1] - origin[1],
+            rect[2] - origin[0], rect[3] - origin[1],
+        )
+
+    form = Form()
+    # .NET 枚举成员名 "None" 是 Python 关键字，不能用 FormBorderStyle.None 取值
+    form.FormBorderStyle = getattr(FormBorderStyle, "None")
+    form.StartPosition = FormStartPosition.Manual
+    form.Bounds = Rectangle(origin[0], origin[1], size[0], size[1])
+    form.TopMost = True
+    form.ShowInTaskbar = False
+    form.DoubleBuffered = True
+    form.BackColor = Color.Black
+    form.Text = "NPT Screenshot Overlay"
+    # 强制创建句柄后补扩展样式：透明命中（让 WindowFromPoint 穿透）、不抢焦点、不进任务栏
+    overlay_hwnd = int(form.Handle.ToInt64())
+    state["overlay_hwnd"] = overlay_hwnd
+    try:
+        ex_style = int(user32.GetWindowLongW(wintypes.HWND(overlay_hwnd), GWL_EXSTYLE))
+        user32.SetWindowLongW(
+            wintypes.HWND(overlay_hwnd), GWL_EXSTYLE,
+            ctypes.c_long(ex_style | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW),
+        )
+    except Exception:  # noqa: BLE001 - 样式失败时仍可用自由框选
+        _log.warning("设置截图蒙层扩展样式失败（窗口自动识别可能退化为整屏）")
+
+    hint = Label()
+    hint.Text = "鼠标移到窗口上单击截取 · 按住拖拽自由框选 · ESC / 右键取消"
+    hint.AutoSize = True
+    hint.BackColor = Color.FromArgb(190, 20, 20, 20)
+    hint.ForeColor = Color.White
+    hint.Location = Point(16, 16)
+    form.Controls.Add(hint)
+
+    def on_paint(_sender: Any, event: Any) -> None:
+        graphics = event.Graphics
+        graphics.DrawImage(dim_bitmap, 0, 0, size[0], size[1])
+        selection = state["selection"]
+        if selection:
+            l, t, r, b = to_client(selection)
+            width, height = r - l, b - t
+            if width > 0 and height > 0:
+                graphics.SetClip(Rectangle(l, t, width, height))
+                graphics.DrawImage(raw_bitmap, 0, 0, size[0], size[1])
+                graphics.ResetClip()
+                graphics.DrawRectangle(white_pen, l, t, width, height)
+
+    def finish(cancelled: bool, rect: Optional[Tuple[int, int, int, int]]) -> None:
+        if state["done"]:
+            return
+        state["done"] = True
+        state["cancelled"] = cancelled
+        state["selection"] = rect
+        timer.Stop()
+        form.Close()
+
+    def on_tick(_sender: Any, _event: Any) -> None:
+        if state["done"]:
+            return
+        if abort.is_set() or pressed(VK_ESCAPE) or pressed(VK_RBUTTON):
+            finish(True, None)
+            return
+        position = Cursor.Position
+        screen = (int(position.X), int(position.Y))
+        # 只读一次：高位=当前是否按下，低位=自上次轮询以来是否发生过按下。
+        # 低位用于兜住比轮询周期还短的单击，否则整段「按下→松开」会被采样漏掉。
+        lbutton_state = int(user32.GetAsyncKeyState(VK_LBUTTON))
+        left_down = bool(lbutton_state & 0x8000)
+        click_pulse = bool(lbutton_state & 0x0001)
+        if click_pulse and not left_down and not state["lbutton"]:
+            rect = window_rect_at(screen, state["overlay_hwnd"])
+            if rect is None:
+                rect = (origin[0], origin[1], origin[0] + size[0], origin[1] + size[1])
+            finish(False, rect)
+            return
+        if left_down and not state["lbutton"]:
+            state["start"] = screen
+            state["dragging"] = False
+        elif left_down and state["start"] is not None:
+            sx, sy = state["start"]
+            if abs(screen[0] - sx) > DRAG_THRESHOLD or abs(screen[1] - sy) > DRAG_THRESHOLD:
+                state["dragging"] = True
+            if state["dragging"]:
+                state["selection"] = (
+                    min(sx, screen[0]), min(sy, screen[1]),
+                    max(sx, screen[0]), max(sy, screen[1]),
+                )
+                form.Invalidate()
+        elif not left_down and state["lbutton"]:
+            # 松手瞬间：拖拽用框选，单击用当前鼠标下的顶层窗口矩形
+            if state["dragging"]:
+                rect = state["selection"]
+            else:
+                rect = window_rect_at(screen, state["overlay_hwnd"])
+                if rect is None:
+                    rect = (origin[0], origin[1], origin[0] + size[0], origin[1] + size[1])
+            finish(False, rect)
+            return
+        state["lbutton"] = left_down
+
+        if not left_down:
+            # 未按下时按鼠标停留位置自动识别顶层窗口范围
+            rect = window_rect_at(screen, state["overlay_hwnd"])
+            if rect is None:
+                rect = (origin[0], origin[1], origin[0] + size[0], origin[1] + size[1])
+            if rect != state["selection"]:
+                state["selection"] = rect
+                form.Invalidate()
+
+    timer = Timer()
+    timer.Interval = POLL_INTERVAL_MS
+    timer.Tick += on_tick
+    form.Paint += on_paint
+    # Timer 在本 UI 线程创建，先 Start 再进入消息循环即可驱动 Tick；
+    # 不依赖 Shown 事件，少一层跨语言委托绑定
+    timer.Start()
+
+    try:
+        Application.Run(form)
+    finally:
+        try:
+            timer.Stop()
+            timer.Dispose()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            white_pen.Dispose()
+            raw_bitmap.Dispose()
+            dim_bitmap.Dispose()
+        except Exception:  # noqa: BLE001
+            pass
+
+    if state["cancelled"] or not state["selection"]:
+        return None
+    return state["selection"]
+
+
+class ScreenshotCaptureController:
+    """截图会话状态机；端点只与它交互，不直接碰 Win32。
+
+    结果以「序号 + 二进制」发布：前端发起时拿基线 seq，之后轮询 status，
+    ``seq`` 增长且 ready 时再取一次 PNG。与既有 ``screenshot-hotkey`` 的序号轮询同范式，
+    不依赖 ``evaluate_js``（窗口最小化时不可靠）。
+    """
+
+    def __init__(self, data_root: Path) -> None:
+        self._data_root = Path(data_root)
+        self._temp_dir = self._data_root / "screenshot_tmp"
+        self._lock = threading.Lock()
+        self._seq = 0
+        self._image: Optional[bytes] = None
+        self._cancelled = False
+        self._running = False
+        self._abort = threading.Event()
+
+    def start(self, hide_im_window: bool = False,
+              frame_ready: bool = False) -> Dict[str, Any]:
+        """发起一次取景；已有会话进行中返回 ``busy``，不重复铺蒙层。
+
+        ``frame_ready`` 表示前端已完成 DOM 稳定化并等过两个渲染帧，壳层可以立即
+        抓屏；watchdog 兜底 / 旧前端传 False，壳层自行等待 WebView2 合成一帧。
+        """
+        if not supported():
+            return {"started": False, "busy": False, "unsupported": True, "seq": self._seq}
+        with self._lock:
+            if self._running:
+                return {"started": False, "busy": True, "unsupported": False, "seq": self._seq}
+            if self._image is not None or self._cancelled:
+                # 全局热键由壳层直接启动并已结束，前端轮询晚到时不能重开一轮蒙层：
+                # 回退基线序号，让前端的 status(after) 立刻读到这次结果
+                return {
+                    "started": True, "busy": False, "unsupported": False,
+                    "seq": max(0, self._seq - 1),
+                }
+            self._running = True
+            self._image = None
+            self._cancelled = False
+            self._abort = threading.Event()
+            seq = self._seq
+            abort = self._abort
+        thread = threading.Thread(
+            target=self._run, args=(bool(hide_im_window), bool(frame_ready), abort),
+            daemon=True, name="npt-screenshot-capture",
+        )
+        thread.start()
+        _log.info("截图取景会话已启动（隐藏会话窗口=%s，前端已稳定=%s，基线序号=%s）",
+                  hide_im_window, frame_ready, seq)
+        return {"started": True, "busy": False, "unsupported": False, "seq": seq}
+
+    def cancel_active(self) -> Dict[str, Any]:
+        """前端关闭弹窗时中止仍在进行的取景，避免残留置顶蒙层抢焦点。"""
+        with self._lock:
+            active = self._running
+            abort = self._abort
+        if active:
+            abort.set()
+        return {"cancelled": active}
+
+    def status(self, after_seq: int) -> Dict[str, Any]:
+        with self._lock:
+            changed = self._seq > int(after_seq or 0)
+            return {
+                "seq": self._seq,
+                "ready": changed and self._image is not None,
+                "cancelled": changed and self._cancelled,
+                "pending": self._running,
+            }
+
+    def take_image(self) -> Optional[bytes]:
+        """取出并清空最近一帧 PNG（读后即弃，避免敏感画面常驻磁盘/内存）。"""
+        with self._lock:
+            data = self._image
+            self._image = None
+            return data
+
+    def _publish(self, image: Optional[bytes], cancelled: bool, abort: threading.Event) -> None:
+        with self._lock:
+            # 被后续会话替换的旧线程不得再发布结果
+            if self._abort is not abort:
+                return
+            self._image = image
+            self._cancelled = cancelled
+            self._seq += 1
+            self._running = False
+
+    def _run(self, hide_im_window: bool, frame_ready: bool,
+             abort: threading.Event) -> None:
+        raw_path: Optional[Path] = None
+        dim_path: Optional[Path] = None
+        try:
+            # 关闭「隐藏窗口截图」时前端同样要等两帧，保证屏幕上已打开的会话窗口
+            # 完成懒加载 / 渐显后再抓；所以等待只由 frame_ready 决定，与开关无关。
+            if not frame_ready:
+                time.sleep(CAPTURE_SETTLE_SECONDS)
+            if abort.is_set():
+                self._publish(None, True, abort)
+                return
+            _ensure_dpi_aware()
+            left, top, width, height = virtual_screen_rect()
+            if width <= 0 or height <= 0:
+                self._publish(None, True, abort)
+                return
+            origin = (left, top)
+            image = _grab_screen((width, height))
+            if abort.is_set():
+                self._publish(None, True, abort)
+                return
+            raw_path, dim_path = _png_files(image, self._temp_dir)
+            # STA：WinForms 消息循环要求单线程套间
+            try:
+                ctypes.windll.ole32.CoInitializeEx(None, COINIT_APARTMENTTHREADED)
+            except Exception:  # noqa: BLE001
+                pass
+            rect = _run_overlay(raw_path, dim_path, origin, (width, height), abort)
+            if rect is None or abort.is_set():
+                _log.info("截图取景已取消")
+                self._publish(None, True, abort)
+                return
+            box = clip_rect_to_image(rect, origin, (width, height))
+            if box is None:
+                self._publish(None, True, abort)
+                return
+            png = _encode_png(image, box)
+            self._publish(png, False, abort)
+            _log.info("截图取景完成：%sx%s → %s 字节", box[2] - box[0], box[3] - box[1], len(png))
+        except Exception:  # noqa: BLE001
+            _log.exception("截图取景会话失败（前端按取消处理）")
+            self._publish(None, True, abort)
+        finally:
+            for path in (raw_path, dim_path):
+                try:
+                    if path and path.is_file():
+                        path.unlink()
+                except Exception:  # noqa: BLE001
+                    pass

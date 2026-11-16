@@ -146,7 +146,7 @@ class WebSocketService {
           }
         }
 
-        this.ws.onerror = (error) => {
+        this.ws.onerror = () => {
           // 静默处理连接错误，避免控制台噪音
           this.isConnecting = false
           resolve(false)

@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -110,12 +111,17 @@ class AttachmentIdRequest(BaseModel):
 
 
 @router.get("/conversations")
-def list_conversations(db: Session = Depends(get_db),
+def list_conversations(include_avatars: bool = Query(True),
+                       db: Session = Depends(get_db),
                        user: User = Depends(get_current_user)):
     # 桌面共享模式没有服务端 WS 广播，前端以 1.5s 轮询会话列表及时更新未读红点。
     # 与打开会话、发送成功后的刷新叠加后，旧阈值 60 次/分钟会误触发 429，这里放宽。
+    # 头像 base64 最多 256KB × 100 会话：前端只在首次加载时取一次，之后轮询
+    # 带 include_avatars=false，把每次响应从数十 MB 降到 KB 级。旧客户端不传参
+    # 默认 true，行为完全不变。
     limit = 240 if im_desktop_proxy.is_shared_desktop() else 60
-    return _ok(_run("list_conversations", {}, db, user, limit=limit))
+    return _ok(_run("list_conversations", {"include_avatars": include_avatars},
+                    db, user, limit=limit))
 
 
 @router.post("/conversations")
@@ -273,8 +279,17 @@ def mark_read(conversation_id: int, payload: ReadRequest,
 
 
 @router.get("/contacts")
-def list_contacts(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    return _ok(_run("list_contacts", {}, db, user, limit=30))
+def list_contacts(limit: Optional[int] = Query(None, ge=1, le=500),
+                  query: Optional[str] = Query(None, max_length=64),
+                  db: Session = Depends(get_db),
+                  user: User = Depends(get_current_user)):
+    """通讯录；不传 limit/query 时保持旧客户端的全量行为。"""
+    args: Dict[str, Any] = {}
+    if limit is not None:
+        args["limit"] = limit
+    if query:
+        args["query"] = query
+    return _ok(_run("list_contacts", args, db, user, limit=30))
 
 
 @router.post("/groups", status_code=201)
@@ -365,31 +380,36 @@ def open_attachment(attachment_id: int, db: Session = Depends(get_db),
     return _ok({"opened": True, "path": str(target)})
 
 
+def _attachment_headers(filename: str, thumb: bool) -> Dict[str, str]:
+    disposition = "inline" if thumb else "attachment"
+    quoted = urllib.parse.quote(filename)
+    return {
+        "Content-Disposition": f"{disposition}; filename*=UTF-8''{quoted}",
+        "X-Content-Type-Options": "nosniff",
+        "Cache-Control": "private, max-age=300",
+    }
+
+
 def _download(attachment_id: int, thumb: bool, db: Session, user: User) -> Response:
     if im_desktop_proxy.is_shared_desktop():
+        # 共享模式经 relay 传输，协议约定返回 base64，无法流式（保留兼容）
         payload = _run("attachment_download", {
             "attachment_id": attachment_id, "thumb": thumb,
         }, db, user, limit=60)
         content = base64.b64decode(payload["content_b64"])
         mime = payload.get("mime") or "application/octet-stream"
         filename = payload.get("filename") or "attachment"
-    else:
-        att = im_service.get_attachment_for_member(db, attachment_id, user.id)
-        relative = att.thumb_path if thumb and att.thumb_path else att.storage_path
-        path, _ = im_attachment_service.resolve_path(relative)
-        content = path.read_bytes()
-        mime = "image/png" if thumb and att.thumb_path else att.mime
-        filename = att.original_name
-    quoted = urllib.parse.quote(filename)
-    disposition = "inline" if thumb else "attachment"
-    return Response(
-        content=content, media_type=mime,
-        headers={
-            "Content-Disposition": f"{disposition}; filename*=UTF-8''{quoted}",
-            "X-Content-Type-Options": "nosniff",
-            "Cache-Control": "private, max-age=300",
-        },
-    )
+        return Response(content=content, media_type=mime,
+                        headers=_attachment_headers(filename, thumb))
+
+    att = im_service.get_attachment_for_member(db, attachment_id, user.id)
+    relative = att.thumb_path if thumb and att.thumb_path else att.storage_path
+    path, _ = im_attachment_service.resolve_path(relative)
+    mime = "image/png" if thumb and att.thumb_path else att.mime
+    # 网页端流式响应：不再把整个附件 read_bytes() 读进内存，大附件不会挤占
+    # 请求线程内存，也不会拖慢同进程内的实时消息处理。
+    return FileResponse(path=str(path), media_type=mime,
+                        headers=_attachment_headers(att.original_name, thumb))
 
 
 @router.get("/attachments/{attachment_id}/thumb")

@@ -44,6 +44,12 @@ export function ImWindow({ userId, desktopMode, onClose }: Props) {
   useEffect(() => {
     const frame = window.requestAnimationFrame(() => setEntered(true))
     void refreshConversations().catch(() => {})
+    // 窗口重新展开时补拉当前会话正文：收起期间桌面端只刷会话列表（红点），
+    // 不在这里补拉就会出现「红点有、聊天窗口没加载对方消息」。
+    const state = useImStore.getState()
+    if (state.activeConversationId !== null) {
+      void state.loadMessages(state.activeConversationId, 'incremental').catch(() => {})
+    }
     return () => window.cancelAnimationFrame(frame)
   }, [refreshConversations])
 

@@ -463,3 +463,74 @@ def test_nickname_is_im_display_name_only(db):
 def test_new_group_ops_are_whitelisted(db):
     for op in ("leave_group", "dissolve_group", "update_group_avatar", "update_avatar"):
         assert op in im_ops.OPS
+
+
+def _unread_count(db, conv_id, user_id):
+    return int(db.query(im_service.ImConversationMember).filter(
+        im_service.ImConversationMember.conversation_id == conv_id,
+        im_service.ImConversationMember.user_id == user_id,
+    ).one().unread_count)
+
+
+def test_unread_count_is_maintained_in_same_transaction(db):
+    """发送消息 → 除发送者外 +1；已读按服务端游标精算；列表读冗余列。"""
+    ids = _users(db)
+    conv_id = im_service.create_direct(db, ids["alice"], ids["bob"])["conversation"]["id"]
+    im_service.send_message(db, conv_id, ids["alice"], "text", content_text="hi")
+    im_service.send_message(db, conv_id, ids["alice"], "text", content_text="hi2")
+    assert _unread_count(db, conv_id, ids["alice"]) == 0
+    assert _unread_count(db, conv_id, ids["bob"]) == 2
+    assert im_service.list_conversations(db, ids["bob"])["items"][0]["unread"] == 2
+
+    msg_ids = [int(r[0]) for r in db.query(im_service.ImMessage.id)
+               .filter(im_service.ImMessage.conversation_id == conv_id)
+               .order_by(im_service.ImMessage.id.asc()).all()]
+    # 只读到第一条：剩余未读必须是 1，不能直接置 0
+    assert im_service.mark_read(db, conv_id, ids["bob"], msg_ids[0])["unread"] == 1
+    assert _unread_count(db, conv_id, ids["bob"]) == 1
+    assert im_service.mark_read(db, conv_id, ids["bob"], msg_ids[-1])["unread"] == 0
+    assert _unread_count(db, conv_id, ids["bob"]) == 0
+
+
+def test_unread_count_matches_legacy_count_query(db):
+    """冗余列口径必须与 init_db 回填用的旧 SQL 完全一致（排除自己发的消息）。"""
+    from sqlalchemy import text
+
+    ids = _users(db)
+    conv_id = im_service.create_direct(db, ids["alice"], ids["bob"])["conversation"]["id"]
+    im_service.send_message(db, conv_id, ids["alice"], "text", content_text="a")
+    im_service.send_message(db, conv_id, ids["bob"], "text", content_text="b")
+    im_service.send_message(db, conv_id, ids["alice"], "text", content_text="c")
+
+    for uid in (ids["alice"], ids["bob"]):
+        legacy = int(db.execute(text(
+            "SELECT COUNT(*) FROM im_messages m "
+            "JOIN im_conversation_members cm ON cm.conversation_id = m.conversation_id "
+            "WHERE cm.conversation_id = :cid AND cm.user_id = :uid "
+            "AND m.id > cm.last_read_message_id AND m.sender_id != cm.user_id"
+        ), {"cid": conv_id, "uid": uid}).scalar() or 0)
+        assert _unread_count(db, conv_id, uid) == legacy
+
+
+def test_list_conversations_can_omit_avatars(db):
+    """高频轮询省略 base64 头像，其它字段（含 unread）保持不变。"""
+    ids = _users(db)
+    conv_id = im_service.create_direct(db, ids["alice"], ids["bob"])["conversation"]["id"]
+    db.query(User).filter(User.id == ids["alice"]).one().avatar = "data:image/png;base64,AAAA"
+    db.commit()
+
+    full = im_service.list_conversations(db, ids["bob"], True)["items"][0]
+    lean = im_service.list_conversations(db, ids["bob"], False)["items"][0]
+    assert full["other_user"]["avatar"] == "data:image/png;base64,AAAA"
+    assert lean["other_user"]["avatar"] is None
+    assert lean["avatar"] is None
+    assert lean["unread"] == full["unread"] == 0
+    assert lean["id"] == conv_id
+
+
+def test_list_contacts_supports_limit_and_query(db):
+    ids = _users(db)
+    assert len(im_service.list_contacts(db, ids["alice"])["users"]) == 3
+    assert len(im_service.list_contacts(db, ids["alice"], limit=2)["users"]) == 2
+    matched = im_service.list_contacts(db, ids["alice"], query="ali")["users"]
+    assert [u["username"] for u in matched] == ["alice"]

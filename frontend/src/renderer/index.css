@@ -476,11 +476,20 @@ input[type="checkbox"] {
   accent-color: hsl(var(--primary));
 }
 
-/* 截图取景阶段（getDisplayMedia 选择窗口期间）：临时隐藏协作沟通窗口、悬浮图标
-   与截图工具自身的置顶浮层，避免这些 z-index 最高的层遮住底下要截取的页面/窗口内容。
-   抓帧完成进入编辑页后由脚本移除 data-npt-capturing 恢复显示。 */
+/* 网页端 getDisplayMedia 选择窗口期间：临时隐藏协作沟通窗口、悬浮图标与截图工具
+   自身的置顶浮层，避免 z-index 最高的层遮住要截取的页面/窗口内容。
+   桌面端壳层取景**不使用**该标记；任何一轮取景开始/结束都会由 clearCaptureFlags()
+   无条件清除，防止会话窗口被永久隐藏。 */
 body[data-npt-capturing] [data-im-window],
 body[data-npt-capturing] [data-im-fab],
 body[data-npt-capturing] [data-screenshot-overlay] {
+  visibility: hidden !important;
+}
+
+/* 桌面端「隐藏窗口截图」开关：只隐藏协作沟通会话窗口与悬浮图标，主窗口业务内容
+   仍可见可截。关闭开关时该标记不设置，屏幕原样（含已打开的会话窗口）会被截入。
+   取景前由前端先关闭 z-[10000] 编辑页遮罩并等两个渲染帧，故无需隐藏遮罩。 */
+body[data-npt-hide-im] [data-im-window],
+body[data-npt-hide-im] [data-im-fab] {
   visibility: hidden !important;
 }

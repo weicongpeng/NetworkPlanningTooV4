@@ -114,4 +114,58 @@ describe('图片灯箱', () => {
     render(<ImImageLightbox source={source} onClose={() => {}} />)
     expect((document.querySelector('[data-im-lightbox]') as HTMLElement).style.top).toBe('')
   })
+
+  const gallery = [
+    { name: 'a.png', mime: 'image/png', attachmentId: 7 },
+    { name: 'b.png', mime: 'image/png', attachmentId: 8 },
+    { name: 'c.png', mime: 'image/png', attachmentId: 9 },
+  ]
+  const gallerySource = { ...gallery[0], gallery, galleryIndex: 0 }
+  const counter = () => document.querySelector('[data-im-lightbox-counter]')?.textContent?.trim()
+  const navButton = (name: string) =>
+    document.querySelector(`[data-im-lightbox-${name}]`) as HTMLButtonElement
+
+  it('单张预览不显示上一张 / 下一张与计数', () => {
+    render(<ImImageLightbox source={source} onClose={() => {}} />)
+    expect(document.querySelector('[data-im-lightbox-next]')).toBeNull()
+    expect(document.querySelector('[data-im-lightbox-counter]')).toBeNull()
+  })
+
+  it('点击下一张 / 上一张切换当前会话的图片并更新计数', async () => {
+    render(<ImImageLightbox source={gallerySource} onClose={() => {}} />)
+    expect(counter()).toBe('1 / 3')
+    expect(navButton('prev').disabled).toBe(true)
+
+    fireEvent.click(navButton('next'))
+    await waitFor(() => expect(blobMock).toHaveBeenLastCalledWith(8, false))
+    expect(counter()).toBe('2 / 3')
+    expect(navButton('prev').disabled).toBe(false)
+
+    fireEvent.click(navButton('prev'))
+    await waitFor(() => expect(blobMock).toHaveBeenLastCalledWith(7, false))
+    expect(counter()).toBe('1 / 3')
+  })
+
+  it('键盘 ← → 切换，首尾越界不动且按钮禁用', async () => {
+    render(<ImImageLightbox source={gallerySource} onClose={() => {}} />)
+    fireEvent.keyDown(window, { key: 'ArrowRight' })
+    await waitFor(() => expect(counter()).toBe('2 / 3'))
+    fireEvent.keyDown(window, { key: 'ArrowRight' })
+    await waitFor(() => expect(counter()).toBe('3 / 3'))
+    expect(navButton('next').disabled).toBe(true)
+    fireEvent.keyDown(window, { key: 'ArrowRight' })
+    expect(counter()).toBe('3 / 3')
+    fireEvent.keyDown(window, { key: 'ArrowLeft' })
+    await waitFor(() => expect(counter()).toBe('2 / 3'))
+  })
+
+  it('换一张图复位缩放视图', async () => {
+    render(<ImImageLightbox source={gallerySource} onClose={() => {}} />)
+    await waitFor(() => expect(document.querySelector('img')).toBeTruthy())
+    fireEvent.wheel(document.querySelector('img')!.parentElement!, { deltaY: -100 })
+    expect(screen.getByText('115%')).toBeTruthy()
+    fireEvent.click(navButton('next'))
+    await waitFor(() => expect(blobMock).toHaveBeenLastCalledWith(8, false))
+    expect(screen.getByText('100%')).toBeTruthy()
+  })
 })

@@ -21,8 +21,9 @@ def _conv_dict(conv) -> Dict[str, Any]:
     }
 
 
-def op_list_conversations(db: Session, user_id: int, **_: Any) -> dict:
-    return im_service.list_conversations(db, user_id)
+def op_list_conversations(db: Session, user_id: int, *,
+                          include_avatars: bool = True, **_: Any) -> dict:
+    return im_service.list_conversations(db, user_id, include_avatars)
 
 
 def op_get_conversation(db: Session, user_id: int, *, conversation_id: int, **_: Any) -> dict:
@@ -142,8 +143,9 @@ def op_mark_read(db: Session, user_id: int, *, conversation_id: int,
     return im_service.mark_read(db, conversation_id, user_id, last_read_message_id)
 
 
-def op_list_contacts(db: Session, user_id: int, **_: Any) -> dict:
-    return im_service.list_contacts(db, user_id)
+def op_list_contacts(db: Session, user_id: int, *, limit: int | None = None,
+                     query: str | None = None, **_: Any) -> dict:
+    return im_service.list_contacts(db, user_id, limit, query)
 
 
 def op_attachment_start(db: Session, user_id: int, *, conversation_id: int,

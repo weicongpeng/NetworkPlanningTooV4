@@ -15,7 +15,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import HTTPException
-from sqlalchemy import func, text
+from sqlalchemy import func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -110,6 +110,21 @@ def _add_members(db: Session, conversation_id: int, user_ids: List[int], role: s
             ))
 
 
+def _bump_unread(db: Session, conversation_id: int, sender_id: int) -> None:
+    """新消息落库后给除发送者外的成员增量维护冗余未读计数。
+
+    必须与消息插入在**同一事务**里执行，否则列表读到的 unread_count 会与
+    last_read_message_id / im_messages 不一致（SQLAlchemy 默认 autoflush=False）。
+    """
+    db.query(ImConversationMember).filter(
+        ImConversationMember.conversation_id == conversation_id,
+        ImConversationMember.user_id != sender_id,
+    ).update(
+        {ImConversationMember.unread_count: ImConversationMember.unread_count + 1},
+        synchronize_session=False,
+    )
+
+
 def _emit_system_message(db: Session, conversation_id: int, sender_id: int,
                          payload: Dict[str, Any]) -> int:
     """群内友好提示：落一条 kind='system' 的结构化消息，文案由前端按语言 t() 渲染。
@@ -123,6 +138,7 @@ def _emit_system_message(db: Session, conversation_id: int, sender_id: int,
     )
     db.add(message)
     db.flush()
+    _bump_unread(db, conversation_id, sender_id)
     conv = db.query(ImConversation).filter(ImConversation.id == conversation_id).first()
     if conv is not None:
         conv.last_message_id = message.id
@@ -292,8 +308,10 @@ def _load_user_avatars(db: Session, user_ids: set) -> Dict[int, Optional[str]]:
     }
 
 
-def list_conversations(db: Session, user_id: int) -> Dict[str, Any]:
-    ensure_default_groups(db, user_id)
+def list_conversations(db: Session, user_id: int,
+                       include_avatars: bool = True) -> Dict[str, Any]:
+    # 桌面共享模式按 1.5s 轮询这条读路径；ensure_default_groups 会写库 + commit，
+    # 移到低频的 list_contacts（登录 bootstrap / ~20s 校准）执行，读路径零写事务。
     members = (
         db.query(ImConversationMember)
         .filter(ImConversationMember.user_id == user_id)
@@ -333,20 +351,9 @@ def list_conversations(db: Session, user_id: int) -> Dict[str, Any]:
     # 以成员关系表为准批量算真实成员数，不再无条件信任 im_group_meta 冗余缓存
     group_counts = _real_member_counts(db, group_ids)
 
-    # 一条 SQL 批量算未读，避免逐会话 COUNT(*) 的 N+1
-    unread_rows = db.execute(
-        text(
-            "SELECT cm.conversation_id, "
-            "(SELECT COUNT(*) FROM im_messages m WHERE m.conversation_id = cm.conversation_id "
-            " AND m.id > cm.last_read_message_id "
-            # 自己发出的消息不算未读：否则自己发完一条，本端会话列表和悬浮图标
-            # 立刻冒出红角标（对方还没读，发送者的 last_read 也不会被推进）。
-            " AND m.sender_id != cm.user_id) "
-            "FROM im_conversation_members cm WHERE cm.user_id = :uid"
-        ),
-        {"uid": user_id},
-    ).fetchall()
-    unread_map = {int(row[0]): int(row[1]) for row in unread_rows}
+    # 未读直接读成员行的冗余计数：不再对 im_messages 逐会话跑相关子查询。
+    # 计数由 send_message / _emit_system_message / mark_read 在同一事务内维护，
+    # init_db 对存量库按原 SQL 口径一次性回填。
 
     peer_ids = set()
     for conv in convs:
@@ -366,7 +373,8 @@ def list_conversations(db: Session, user_id: int) -> Dict[str, Any]:
         )
         other_users = {
             int(cid): {"id": int(uid), "username": uname,
-                       "nickname": nick, "avatar": avatar}
+                       "nickname": nick,
+                       "avatar": avatar if include_avatars else None}
             for cid, uid, uname, nick, avatar in rows
         }
 
@@ -382,7 +390,7 @@ def list_conversations(db: Session, user_id: int) -> Dict[str, Any]:
             "kind": conv.kind,
             "name": conv.name,
             "group_key": conv.group_key,
-            "avatar": conv.avatar,
+            "avatar": conv.avatar if include_avatars else None,
             "owner_id": conv.owner_id,
             "my_role": member.role,
             "other_user": other,
@@ -390,7 +398,8 @@ def list_conversations(db: Session, user_id: int) -> Dict[str, Any]:
             "last_message": _message_brief(
                 last_messages.get(conv.last_message_id), sender_names, attachments),
             "last_message_at": conv.last_message_at,
-            "unread": unread_map.get(conv.id, 0),
+            # 字段名保持 unread，旧客户端零改动；值来自冗余列
+            "unread": int(member.unread_count or 0),
             "muted": bool(member.muted),
         })
     # 放在 items 构造完成后：内部 commit 会让 session 内对象过期
@@ -823,6 +832,7 @@ def send_message(db: Session, conversation_id: int, user_id: int, kind: str,
     )
     db.add(message)
     db.flush()
+    _bump_unread(db, conversation_id, user_id)
     for uid in sorted(mention_ids):
         db.add(ImMessageMention(message_id=message.id, user_id=uid))
     conv.last_message_id = message.id
@@ -864,21 +874,41 @@ def mark_read(db: Session, conversation_id: int, user_id: int,
     member = _require_member(db, conversation_id, user_id)
     value = max(int(member.last_read_message_id or 0), int(last_read_message_id or 0))
     member.last_read_message_id = value
+    # 精算剩余未读：mark_read 是低频写路径，一次索引范围 COUNT 可接受；
+    # 直接置 0 会在「客户端只标记到中间某条」时与服务端真实未读不一致。
+    remaining = int(db.query(func.count(ImMessage.id)).filter(
+        ImMessage.conversation_id == conversation_id,
+        ImMessage.id > value,
+        ImMessage.sender_id != user_id,
+    ).scalar() or 0)
+    member.unread_count = remaining
     db.commit()
-    return {"unread": 0}
+    return {"unread": remaining}
 
 
-def list_contacts(db: Session, user_id: int) -> Dict[str, Any]:
+def list_contacts(db: Session, user_id: int, limit: Optional[int] = None,
+                  query: Optional[str] = None) -> Dict[str, Any]:
+    """通讯录；可选 limit/query 让新前端做增量搜索，旧客户端不传参仍拿全量。"""
     ensure_default_groups(db, user_id)
     online = _online_user_ids(db)
+    users_query = db.query(User).filter(
+        User.is_active == True,  # noqa: E712
+        User.is_desktop_shadow == False,  # noqa: E712
+    )
+    keyword = (query or "").strip()
+    if keyword:
+        # 参数化 like，避免把用户输入拼进 SQL
+        pattern = f"%{keyword}%"
+        users_query = users_query.filter(
+            or_(User.username.like(pattern), User.nickname.like(pattern)))
+    users_query = users_query.order_by(User.username.asc())
+    if limit is not None:
+        users_query = users_query.limit(max(1, min(int(limit), 500)))
     users = [
         {"id": u.id, "username": u.username, "nickname": u.nickname,
          "is_online": u.id in online,
          "city": u.city or "", "operator": u.operator or "", "avatar": u.avatar}
-        for u in db.query(User).filter(
-            User.is_active == True,  # noqa: E712
-            User.is_desktop_shadow == False,  # noqa: E712
-        ).order_by(User.username.asc()).all()
+        for u in users_query.all()
     ]
     joined = {
         int(row[0]) for row in db.query(ImConversationMember.conversation_id)

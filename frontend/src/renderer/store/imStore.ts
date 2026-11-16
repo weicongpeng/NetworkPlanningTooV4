@@ -109,11 +109,59 @@ function currentUserId(): number | null {
   }
 }
 
+/** 每会话最多保留最近 300 条，避免长时间上拉历史让内存无限增长（游标仍单独保留） */
+const MESSAGE_WINDOW_SIZE = 300
+/** incremental 一次最多翻的页数，防止断线积压 / 病态数据把一次刷新拖成死循环 */
+const MAX_INCREMENTAL_PAGES = 10
+/** 「红点有、正文没来」的补洞节流，避免每次轮询都重拉最新一页 */
+const HOLE_FILL_THROTTLE_MS = 5000
+
+interface MessagePage {
+  items: ImMessage[]
+  has_more: boolean
+  next_cursor: number | null
+  prev_cursor: number | null
+}
+
 function mergeMessages(existing: ImMessage[], incoming: ImMessage[]): ImMessage[] {
   const map = new Map<number, ImMessage>()
   existing.forEach(item => map.set(item.id, item))
   incoming.forEach(item => map.set(item.id, item))
-  return Array.from(map.values()).sort((a, b) => a.id - b.id)
+  const merged = Array.from(map.values()).sort((a, b) => a.id - b.id)
+  return merged.length > MESSAGE_WINDOW_SIZE
+    ? merged.slice(merged.length - MESSAGE_WINDOW_SIZE)
+    : merged
+}
+
+/**
+ * 带有限重试的消息分页请求。响应拦截器把错误压成 `{ success:false, code }` 普通对象，
+ * 必须显式判失败；429 用更长的退避，避免高频轮询时限流叠加导致列表永久卡住。
+ */
+async function fetchMessagesPage(
+  id: number,
+  params: { after_id?: number; before_id?: number; limit?: number },
+): Promise<MessagePage> {
+  let lastError: unknown
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      const response = await imApi.messages(id, params)
+      if (response && response.success === false) throw new Error('IM_REQUEST_FAILED')
+      const page = response?.data
+      return {
+        items: page?.items || [],
+        has_more: Boolean(page?.has_more),
+        next_cursor: page?.next_cursor ?? null,
+        prev_cursor: page?.prev_cursor ?? null,
+      }
+    } catch (error) {
+      lastError = error
+      if (attempt === 2) break
+      const code = (error as { code?: number } | null)?.code
+      const delay = code === 429 ? 800 * (attempt + 1) : 200 * (attempt + 1)
+      await new Promise<void>(resolve => { window.setTimeout(resolve, delay) })
+    }
+  }
+  throw lastError
 }
 
 /**
@@ -144,6 +192,12 @@ function clearActiveUnread(conversations: ImConversation[], activeId: number | n
 let pollTimer: number | null = null
 let refreshTimer: number | null = null
 let refreshQueued = false
+/** 上次「红点/最新 id 与本地正文不一致」补洞时间 */
+let lastHoleFillAt = 0
+/** 头像只在首次会话列表加载时传输一次，之后轮询带 include_avatars=false */
+let avatarsFetched = false
+/** 收到非激活会话的新消息：标记脏，切换进该会话时优先补拉而不是重新 initial */
+const dirtyConversations = new Set<number>()
 /** 桌面端窗口重新可见时的立即刷新监听（由 startPolling 注册、stopPolling 移除） */
 let pollFocusHandler: (() => void) | null = null
 /** 同一会话的成员请求合并为一个 Promise，避免每次键入 @ 都发请求 */
@@ -272,7 +326,15 @@ export const useImStore = create<ImState>()(
 
       setActiveConversation: id => {
         set({ activeConversationId: id })
-        if (id !== null) void get().loadMessages(id, 'initial')
+        if (id === null) return
+        // 该会话在后台收过新消息：用增量补拉接上游标，避免 initial 重置窗口
+        // 把还没读的历史消息丢掉；否则按原有行为拉最新一页。
+        if (dirtyConversations.has(id) && get().cursors[id]) {
+          dirtyConversations.delete(id)
+          void get().loadMessages(id, 'incremental')
+        } else {
+          void get().loadMessages(id, 'initial')
+        }
       },
 
       bootstrap: async () => {
@@ -288,11 +350,30 @@ export const useImStore = create<ImState>()(
       },
 
       refreshConversations: async () => {
-        const response = await imApi.conversations()
+        // 头像 base64 最多 256KB × 100 会话，1.5s 轮询时是最大的传输负担；
+        // 只在首次取一次，后续请求让服务端省略，前端用缓存补齐字段。
+        const includeAvatars = !avatarsFetched
+        const response = await imApi.conversations(includeAvatars)
         // 高频轮询下偶发 429 / 网络失败时，响应拦截器返回 { success:false } 且没有 data。
         // 此时不能把会话列表与未读红点清空，保留上次成功结果等下一个 tick 重试。
         if (response && response.success === false) return
-        const items = response?.data?.items || []
+        let items = response?.data?.items || []
+        if (includeAvatars) {
+          avatarsFetched = true
+        } else {
+          const cached = new Map(get().conversations.map(c => [c.id, c]))
+          items = items.map(c => {
+            const prev = cached.get(c.id)
+            return {
+              ...c,
+              avatar: c.avatar ?? prev?.avatar ?? null,
+              other_user: c.other_user
+                ? { ...c.other_user,
+                    avatar: c.other_user.avatar ?? prev?.other_user?.avatar ?? null }
+                : null,
+            }
+          })
+        }
         const online = { ...get().online }
         items.forEach(conv => {
           if (conv.other_user) online[conv.other_user.id] = conv.other_user.is_online
@@ -305,6 +386,18 @@ export const useImStore = create<ImState>()(
           online,
           unreadTotal: conversations.reduce((sum: number, c: ImConversation) => sum + (c.unread || 0), 0),
         })
+        // 红点有、正文没来的兜底：服务端最新消息 id 已超过本地正文最大值，
+        // 说明本地游标跳过了一段或窗口收起期间漏了补拉，重拉最新一页补洞。
+        // 用服务端返回的原始 items 判断（clearActiveUnread 会把当前会话置 0）。
+        const activeId = state.activeConversationId
+        if (activeId !== null && Date.now() - lastHoleFillAt > HOLE_FILL_THROTTLE_MS) {
+          const serverLast = items.find((c: ImConversation) => c.id === activeId)?.last_message?.id || 0
+          const localLast = get().messages[activeId]?.slice(-1)[0]?.id || 0
+          if (serverLast > localLast) {
+            lastHoleFillAt = Date.now()
+            void get().loadMessages(activeId, 'initial').catch(() => {})
+          }
+        }
       },
 
       refreshContacts: async () => {
@@ -360,58 +453,81 @@ export const useImStore = create<ImState>()(
       loadMessages: async (id, direction = 'initial') => {
         const state = get()
         const cursor = state.cursors[id]
-        const params = direction === 'older'
-          ? { before_id: cursor?.prev ?? undefined, limit: 30 }
-          : direction === 'incremental'
-            ? { after_id: cursor?.next ?? 0, limit: 100 }
-            : { limit: 30 }
-        if (direction === 'older' && !params.before_id) return
+        if (direction === 'older' && !cursor?.prev) return
+        const existing = direction === 'initial' ? [] : (get().messages[id] || [])
+        // 没有游标说明尚未加载过该会话，整页都是历史，先建基线不提醒
+        const hasBaseline = Boolean(state.cursors[id])
+        const myId = currentUserId()
+
+        let nextCursor = cursor?.next ?? null
+        let prevCursor = cursor?.prev ?? null
+        let hasMore = false
+        const incoming: ImMessage[] = []
         try {
-          const page = (await imApi.messages(id, params)).data
-          const existing = direction === 'initial' ? [] : (get().messages[id] || [])
-          const merged = mergeMessages(existing, page.items)
+          // 断线期间可能积压超过一页：incremental 循环翻到 has_more=false，
+          // 上限 10 页防止病态数据把一次刷新拖成死循环。
+          const pages = direction === 'incremental' ? MAX_INCREMENTAL_PAGES : 1
+          for (let pageIndex = 0; pageIndex < pages; pageIndex += 1) {
+            const params = direction === 'older'
+              ? { before_id: prevCursor ?? undefined, limit: 30 }
+              : direction === 'incremental'
+                ? { after_id: nextCursor ?? 0, limit: 100 }
+                : { limit: 30 }
+            const page = await fetchMessagesPage(id, params)
+            incoming.push(...page.items)
+            if (direction === 'incremental') {
+              // 增量游标只单向前进；服务端无新消息时保持原值，绝不回退
+              if (page.next_cursor !== null) nextCursor = page.next_cursor
+            } else if (direction === 'older') {
+              prevCursor = page.prev_cursor ?? prevCursor
+            } else {
+              nextCursor = page.next_cursor ?? null
+              prevCursor = page.prev_cursor ?? null
+            }
+            hasMore = page.has_more
+            if (direction !== 'incremental' || !hasMore || page.items.length === 0) break
+          }
+          const merged = mergeMessages(existing, incoming)
           set(s => ({
             messages: { ...s.messages, [id]: merged },
             cursors: {
               ...s.cursors,
               [id]: {
-                next: page.next_cursor ?? cursor?.next ?? null,
-                prev: page.prev_cursor ?? cursor?.prev ?? null,
-                hasMore: page.has_more,
+                // older 的历史批次不能覆盖增量游标（旧实现会回退 next 造成重复拉取）
+                next: direction === 'older' ? (s.cursors[id]?.next ?? null) : nextCursor,
+                prev: direction === 'incremental'
+                  ? (s.cursors[id]?.prev ?? prevCursor) : prevCursor,
+                hasMore: direction === 'incremental'
+                  ? (s.cursors[id]?.hasMore ?? false) : hasMore,
               },
             },
           }))
           // 桌面共享模式可能没有 WS，靠轮询兜底；只有 incremental 方向提醒，
           // 打开历史/上拉更早消息不触发，避免翻记录时刷屏。WS 路径与这里按 messageId 去重。
-          // 普通新消息在这里补播「叮咚」：桌面端没有 WS 通知，这是唯一能拿到消息正文的路径。
-          if (direction === 'incremental') {
-            const myId = currentUserId()
+          if (direction === 'incremental' && hasBaseline) {
             const existingIds = new Set(existing.map(item => item.id))
-            // 没有游标说明尚未加载过该会话，整页都是历史，先建基线不提醒
-            const hasBaseline = Boolean(state.cursors[id])
             let shouldChime = false
-            if (hasBaseline) {
-              page.items.forEach(item => {
-                if (existingIds.has(item.id) || item.kind === 'system') return
-                if (myId !== null && item.sender_id === myId) return
-                if (item.mentioned_me || item.mention_all) {
-                  // 被 @ 只走专用提醒（Toast + 上行三音），不叠播普通「叮咚」
-                  get().notifyMention({
-                    messageId: item.id,
-                    conversationId: id,
-                    senderName: item.sender_name,
-                    mentionAll: Boolean(item.mention_all),
-                  })
-                  return
-                }
-                if (markMessageSoundNotified(item.id)) shouldChime = true
-              })
-              if (shouldChime) playImMessageSound()
-            }
+            incoming.forEach(item => {
+              if (existingIds.has(item.id) || item.kind === 'system') return
+              if (myId !== null && item.sender_id === myId) return
+              if (item.mentioned_me || item.mention_all) {
+                // 被 @ 只走专用提醒（Toast + 上行三音），不叠播普通「叮咚」
+                get().notifyMention({
+                  messageId: item.id,
+                  conversationId: id,
+                  senderName: item.sender_name,
+                  mentionAll: Boolean(item.mention_all),
+                })
+                return
+              }
+              if (markMessageSoundNotified(item.id)) shouldChime = true
+            })
+            if (shouldChime) playImMessageSound()
           }
           const last = merged[merged.length - 1]
           if (direction !== 'older' && last && get().activeConversationId === id) {
-            void imApi.markRead(id, last.id).catch(() => {})
+            const readId = Math.max(nextCursor ?? 0, last.id)
+            void imApi.markRead(id, readId).catch(() => {})
             set(s => ({
               conversations: s.conversations.map(c => c.id === id ? { ...c, unread: 0 } : c),
               unreadTotal: s.conversations.reduce((sum, c) => sum + (c.id === id ? 0 : c.unread || 0), 0),
@@ -444,19 +560,15 @@ export const useImStore = create<ImState>()(
               ? { mentions: mention.mentions, mention_all: mention.mention_all }
               : {}),
           })).data
+          // 绝不能用服务端返回的**全局自增** message.id 直接推进 next：若此刻对方
+          // 的消息 id 更小但还没被拉到，after_id 严格大于会把它永久跳过，服务端
+          // unread 仍 >0 —— 正是「红点有了、聊天窗口永远看不到对方消息」的根因。
+          // 只合并消息，游标交给随后的 incremental 由服务端 next_cursor 单向推进。
           set(s => ({
             sending: false,
             messages: {
               ...s.messages,
               [id]: mergeMessages((s.messages[id] || []).filter(m => m.id !== tempId), [message]),
-            },
-            cursors: {
-              ...s.cursors,
-              [id]: {
-                next: Math.max(message.id, s.cursors[id]?.next || 0),
-                prev: s.cursors[id]?.prev ?? null,
-                hasMore: s.cursors[id]?.hasMore || false,
-              },
             },
           }))
           get().setDraft('')
@@ -466,6 +578,8 @@ export const useImStore = create<ImState>()(
             unreadTotal: s.conversations.reduce((sum, c) => sum + (c.id === id ? 0 : c.unread || 0), 0),
           }))
           void get().refreshConversations().catch(() => {})
+          // 用服务端 next_cursor 推进游标，同时把并发期间到达的对方消息一起补齐
+          void get().loadMessages(id, 'incremental').catch(() => {})
           return true
         } catch (error) {
           console.warn('[IM] sendText failed', error)
@@ -688,8 +802,11 @@ export const useImStore = create<ImState>()(
         }
       },
 
-      handleImMessage: () => {
-        // 多条通知合并成一次刷新；当前会话无条件补拉，避免合并时漏掉其中一条
+      handleImMessage: detail => {
+        // 多条通知合并成一次刷新；被合并掉的通知所属会话要标记脏，
+        // 否则用户切到那个会话时可能只看到红点、正文没补拉。
+        const conversationId = Number(detail?.conversation_id) || 0
+        if (conversationId > 0) dirtyConversations.add(conversationId)
         if (refreshQueued) return
         refreshQueued = true
         refreshTimer = window.setTimeout(() => {
@@ -720,9 +837,11 @@ export const useImStore = create<ImState>()(
       resync: () => {
         const state = get()
         void state.refreshConversations().catch(() => {})
-        if (state.activeConversationId !== null) {
-          void state.loadMessages(state.activeConversationId, 'incremental')
-        }
+        // WS / 云 WS 重连后要补齐断线期间所有已知会话的消息，不只当前激活会话。
+        // 只补拉已有游标的会话，避免刚启动时把每个会话都全量拉一遍。
+        const ids = new Set<number>(Object.keys(state.cursors).map(Number))
+        if (state.activeConversationId !== null) ids.add(state.activeConversationId)
+        ids.forEach(id => { void state.loadMessages(id, 'incremental').catch(() => {}) })
       },
 
       startPolling: (intervalMs = 8000, pollWhenClosed = false) => {
@@ -785,6 +904,9 @@ export const useImStore = create<ImState>()(
         notifiedMentionIds.clear()
         soundedMessageIds.clear()
         conversationLastIds = null
+        dirtyConversations.clear()
+        lastHoleFillAt = 0
+        avatarsFetched = false
         set({ ...initialState })
       },
     }),

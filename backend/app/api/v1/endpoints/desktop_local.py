@@ -11,12 +11,14 @@ import threading
 from datetime import datetime
 from typing import Any, Dict, Literal, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
 
 from app.core.config import settings
+from app.services import desktop_screenshot_settings as screenshot_cfg
 from app.core.database import get_db
 from app.core.security import get_current_admin_user, get_current_user
 from app.core.startup_gate import mark_login_completed
@@ -1592,3 +1594,200 @@ async def desktop_window_state(
     if result is None:
         raise HTTPException(status_code=403, detail="当前运行环境不支持窗口状态查询（非桌面壳）")
     return {"success": True, "data": result}
+
+
+# ---------------------------------------------------------------- 桌面取景截图
+#
+# 与 /screenshot-hotkey 一样不做登录校验：全局热键要求「应用不关闭就始终可用」，
+# 不能因为登录态过期 / 停留在登录页而让在其它应用窗口按下的快捷键失效。
+# 本机后端只绑定 127.0.0.1，且 _require_desktop 保证网页/服务器模式一律 404。
+
+class ScreenshotCaptureRequest(BaseModel):
+    hide_im_window: bool = Field(False, description="是否隐藏协作沟通会话浮窗后取景")
+    frame_ready: bool = Field(
+        False,
+        description="前端已完成 DOM 稳定化（清标记/关遮罩/收下拉/等两帧），壳层可立即抓屏",
+    )
+
+
+class ScreenshotSettingsRequest(BaseModel):
+    hotkey: Dict[str, Any] = Field(..., description="组合键：{modifiers: [...], key: 'Z'}")
+    hideImWindow: bool = Field(False, description="截图时隐藏会话窗口（默认关闭）")
+
+
+@router.post("/screenshot-capture")
+async def desktop_screenshot_capture(
+    payload: ScreenshotCaptureRequest,
+    _: None = Depends(_require_desktop),
+) -> Dict[str, Any]:
+    """发起一次壳层取景；HTTP 立即返回基线序号，蒙层交互在独立线程进行。
+
+    ``started=false`` 且 ``busy=true`` 表示已有取景进行中；``unsupported=true``
+    表示当前不是 Windows 桌面壳，前端应降级到网页端的窗口选择截图。
+    """
+    from app import desktop_bridge
+
+    # 前端已接管这一轮全局热键：撤销壳层的 watchdog 兜底，避免重复铺蒙层。
+    # 旧前端不带 frame_ready 也能正常 claim，只是壳层会多等一帧。
+    desktop_bridge.claim_screenshot_round()
+    result = desktop_bridge.screenshot(
+        "start", {
+            "hideImWindow": bool(payload.hide_im_window),
+            "frameReady": bool(payload.frame_ready),
+        }
+    )
+    if result is None:
+        raise HTTPException(status_code=403, detail="当前运行环境不支持壳层取景截图（非桌面壳）")
+    return {"success": True, "data": result}
+
+
+@router.post("/screenshot-cancel")
+async def desktop_screenshot_cancel(
+    _: None = Depends(_require_desktop),
+) -> Dict[str, Any]:
+    """中止仍在取景的蒙层（用户提前关闭截图弹窗时调用，避免置顶窗口残留）。"""
+    from app import desktop_bridge
+
+    result = desktop_bridge.screenshot("cancel")
+    if result is None:
+        raise HTTPException(status_code=403, detail="当前运行环境不支持壳层取景截图（非桌面壳）")
+    return {"success": True, "data": result}
+
+
+@router.get("/screenshot-result")
+async def desktop_screenshot_result(
+    after: int = Query(0, ge=0, description="发起时拿到的基线序号"),
+    _: None = Depends(_require_desktop),
+) -> Dict[str, Any]:
+    """按序号增量轮询取景结果：``ready`` / ``cancelled`` 决定前端下一步。"""
+    from app import desktop_bridge
+
+    result = desktop_bridge.screenshot("status", {"after": after})
+    if result is None:
+        raise HTTPException(status_code=403, detail="当前运行环境不支持壳层取景截图（非桌面壳）")
+    return {"success": True, "data": result}
+
+
+@router.get("/screenshot-image")
+async def desktop_screenshot_image(
+    _: None = Depends(_require_desktop),
+) -> Response:
+    """取走最近一帧裁剪好的 PNG（读后即弃）；走二进制避免 base64 膨胀与 JSON 内存峰值。"""
+    from app import desktop_bridge
+
+    result = desktop_bridge.screenshot("image")
+    if result is None:
+        raise HTTPException(status_code=403, detail="当前运行环境不支持壳层取景截图（非桌面壳）")
+    png = result.get("png")
+    if not png:
+        raise HTTPException(status_code=404, detail="截图结果已被取走或尚未生成")
+    return Response(
+        content=png, media_type="image/png",
+        headers={"Cache-Control": "no-store", "Content-Disposition": "inline"},
+    )
+
+
+@router.get("/screenshot-settings")
+async def desktop_get_screenshot_settings(
+    _: None = Depends(_require_desktop),
+) -> Dict[str, Any]:
+    """读本机截图设置（组合键 + 隐藏会话窗口开关）与热键当前注册状态。"""
+    from app import desktop_bridge
+
+    stored = screenshot_cfg.load_settings(settings.DATA_ROOT)
+    hotkey = desktop_bridge.screenshot("hotkey-status") or {}
+    return {"success": True, "data": {
+        "settings": stored,
+        "hotkey": {**hotkey, "display": screenshot_cfg.format_hotkey(stored)},
+    }}
+
+
+@router.put("/screenshot-settings")
+async def desktop_put_screenshot_settings(
+    payload: ScreenshotSettingsRequest,
+    _: None = Depends(_require_desktop),
+) -> Dict[str, Any]:
+    """保存截图设置并让壳层热键线程按新组合键重注册。
+
+    组合键被其它应用占用（RegisterHotKey 返回 1409）时**回滚**到上一次可用配置，
+    返回 ``conflict=true``，前端据此提示用户更换。配置写本机文件而非跨设备用户设置，
+    因为全局热键在其它应用窗口触发时前端可能未登录 / 不在前台。
+    """
+    from app import desktop_bridge
+
+    raw = {"hotkey": payload.hotkey, "hideImWindow": bool(payload.hideImWindow)}
+    candidate, error = screenshot_cfg.validate_settings(raw)
+    if error:
+        raise HTTPException(status_code=400, detail=f"截图快捷键设置无效：{error}")
+
+    previous = screenshot_cfg.load_settings(settings.DATA_ROOT)
+    hotkey_changed = candidate["hotkey"] != previous["hotkey"]
+    screenshot_cfg.save_settings(settings.DATA_ROOT, candidate)
+    # 只切换「隐藏窗口截图」开关时无需重注册：否则当前组合键恰好被占用会让一个
+    # 与热键无关的开关操作也被回滚，还会白白注销/注册一次系统热键。
+    if not hotkey_changed:
+        status = desktop_bridge.screenshot("hotkey-status") or {}
+        return {"success": True, "data": {
+            "settings": candidate, "conflict": False,
+            "registered": bool(status.get("registered")), "reverted": False,
+        }}
+    applied = desktop_bridge.screenshot("apply")
+    if applied is None:
+        # 桥接未注入（旧壳 / 非 Windows）：配置已落盘，下次启动生效
+        return {"success": True, "data": {
+            "settings": candidate, "conflict": False, "registered": False,
+            "shellUnavailable": True, "reverted": False,
+        }}
+    if applied.get("conflict"):
+        screenshot_cfg.save_settings(settings.DATA_ROOT, previous)
+        desktop_bridge.screenshot("apply")
+        return {"success": True, "data": {
+            "settings": previous, "conflict": True, "registered": False,
+            "reverted": True, "error": applied.get("error", 0),
+        }}
+    return {"success": True, "data": {
+        "settings": candidate, "conflict": False,
+        "registered": bool(applied.get("registered")), "reverted": False,
+    }}
+
+
+@router.get("/cloud-ws-config")
+async def desktop_cloud_ws_config(
+    _: None = Depends(_require_desktop),
+) -> Dict[str, Any]:
+    """桌面共享模式的云端 IM 推送配置（仅本机 127.0.0.1 下发许可凭证）。
+
+    桌面端没有云端 JWT，云 WS 靠「签名许可 + 机器码」鉴权；凭证只经本端点交给
+    本机 WebView2，由客户端放在**首条 auth 消息**里，绝不进 URL / 访问日志。
+    单机模式、网页端、未激活或开关关闭时返回 ``enabled=false``，前端退回 relay 轮询。
+    """
+    import hashlib
+
+    if not settings.NPT_IM_CLOUD_WS_ENABLED:
+        return {"success": True, "data": {"enabled": False}}
+    try:
+        from app.services import im_desktop_proxy
+
+        if not im_desktop_proxy.is_shared_desktop():
+            return {"success": True, "data": {"enabled": False}}
+    except Exception:  # noqa: BLE001
+        return {"success": True, "data": {"enabled": False}}
+
+    base = cloud.server_url()
+    if not base:
+        return {"success": True, "data": {"enabled": False}}
+    try:
+        license_file = cloud._license_file_text()
+    except Exception:  # noqa: BLE001
+        return {"success": True, "data": {"enabled": False}}
+    ws_base = base.replace("https://", "wss://", 1).replace("http://", "ws://", 1)
+    return {"success": True, "data": {
+        "enabled": True,
+        "url": f"{ws_base}/api/v1/ws/tasks?kind=license",
+        "license_file": license_file,
+        "machine_code": get_machine_code(),
+        "auth_timeout_ms": int(settings.NPT_IM_CLOUD_WS_AUTH_TIMEOUT_MS),
+        "reauth_interval_ms": 300000,
+        # 许可续期后指纹变化：客户端据此主动重连重鉴权，避免旧身份常驻
+        "license_fingerprint": hashlib.sha256(license_file.encode("utf-8")).hexdigest()[:16],
+    }}

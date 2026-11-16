@@ -266,6 +266,33 @@ def init_db():
         ]
         if im_conv_cols and "avatar" not in im_conv_cols:
             conn.exec_driver_sql("ALTER TABLE im_conversations ADD COLUMN avatar TEXT")
+
+        # 迁移：会话成员冗余未读计数。只在补列时回填一次（存量历史消息用与旧 SQL
+        # 完全相同的口径：id > last_read_message_id 且排除自己发出的消息）。
+        im_member_cols = [
+            row[1] for row in conn.exec_driver_sql(
+                "PRAGMA table_info(im_conversation_members)").fetchall()
+        ]
+        if im_member_cols and "unread_count" not in im_member_cols:
+            conn.exec_driver_sql(
+                "ALTER TABLE im_conversation_members "
+                "ADD COLUMN unread_count INTEGER NOT NULL DEFAULT 0"
+            )
+            conn.exec_driver_sql(
+                "UPDATE im_conversation_members SET unread_count = ("
+                "SELECT COUNT(*) FROM im_messages m "
+                "WHERE m.conversation_id = im_conversation_members.conversation_id "
+                "AND m.id > im_conversation_members.last_read_message_id "
+                "AND m.sender_id != im_conversation_members.user_id)"
+            )
+        # 存量库可能缺模型声明里的索引（create_all 只作用于新表），显式补建。
+        # IF NOT EXISTS 让每次启动的代价只是两次元数据查找。
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_im_msg_conv_id "
+            "ON im_messages(conversation_id, id)")
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_im_msg_sender_conv_id "
+            "ON im_messages(conversation_id, sender_id, id)")
         conn.commit()
 
     # 存量无组/误归组数据一次性纠正。两项都是全表扫描（大库 8 张表 + join），

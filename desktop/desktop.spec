@@ -49,6 +49,13 @@ hiddenimports = [
     # pywebview 运行时按平台选择的后端
     "webview.platforms.winforms",
     "tools.spike",
+    # 取景截图会话在 _create_window 内延迟导入，PyInstaller 静态分析容易漏收
+    "screenshot_capture",
+    "PIL.ImageGrab",
+    # 桌面共享模式 IM relay 的连接池；httpcore/h11 是 httpx 的传输后端
+    "httpx",
+    "httpcore",
+    "h11",
 ]
 
 a = Analysis(

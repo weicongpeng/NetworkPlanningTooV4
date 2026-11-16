@@ -722,11 +722,15 @@ def _make_fullscreen_handler(window: Any, state: Optional[dict] = None) -> Calla
 
 
 def _restore_foreground(window: Any) -> bool:
-    """把桌面主窗口带回前台（截图共享其它应用窗口后浏览器/WebView2 会切走焦点）。
+    """把桌面主窗口带回前台（取景截图后焦点可能留在别的应用窗口）。
 
     非 Windows / 无原生句柄时直接返回 False，由前端的 visibilitychange 提示兜底。
     Win32 调用派发到 UI 线程执行、HTTP 请求立即返回；SetForegroundWindow 受系统
     「前台锁定」限制可能被忽略，故补一次 HWND_TOPMOST → HWND_NOTOPMOST 的 Z 序闪烁。
+
+    注意：绝不能无条件 ``ShowWindow(SW_RESTORE)`` —— 它对最大化窗口就是「还原」，
+    会让每次截图后主窗口从最大化缩回普通尺寸（用户报的「截图完窗口自动变小」）。
+    只对最小化窗口做 restore，其余情况只改 Z 序，位置尺寸一律不动。
     """
     native = getattr(window, "native", None)
     handle = getattr(native, "Handle", None) if native is not None else None
@@ -741,6 +745,8 @@ def _restore_foreground(window: Any) -> bool:
             )
             user32.ShowWindow.argtypes = [ctypes.c_void_p, ctypes.c_int]
             user32.ShowWindow.restype = ctypes.c_bool
+            user32.IsIconic.argtypes = [ctypes.c_void_p]
+            user32.IsIconic.restype = ctypes.c_bool
             user32.SetForegroundWindow.argtypes = [ctypes.c_void_p]
             user32.SetForegroundWindow.restype = ctypes.c_bool
             user32.BringWindowToTop.argtypes = [ctypes.c_void_p]
@@ -751,7 +757,9 @@ def _restore_foreground(window: Any) -> bool:
             ]
             user32.SetWindowPos.restype = ctypes.c_bool
 
-            user32.ShowWindow(hwnd, SW_RESTORE)
+            # SW_RESTORE 会把最大化窗口还原成普通尺寸；只有最小化时才需要它
+            if user32.IsIconic(hwnd):
+                user32.ShowWindow(hwnd, SW_RESTORE)
             user32.SetForegroundWindow(hwnd)
             user32.BringWindowToTop(hwnd)
             # -1 = HWND_TOPMOST，-2 = HWND_NOTOPMOST；只改 Z 序不动位置尺寸
@@ -924,55 +932,215 @@ def _error_html(message: str) -> str:
     )
 
 
-def _start_screenshot_hotkey(on_hotkey: Callable[[], None]) -> None:
-    """注册系统级 Alt+Z 截图热键（仅 Windows 桌面壳）。
+# ------------------------------------------------------------ 全局截图热键（可配置）
 
-    RegisterHotKey(hwnd=None) 会把 WM_HOTKEY 投到**注册线程**的消息队列，因此必须
-    在专用线程里跑 GetMessageW 循环；GUI 线程已被 pywebview/WinForms 占用，不能复用。
+HOTKEY_ID = 0x4E50  # 'NP'
+WM_HOTKEY = 0x0312
+WM_APP_RELOAD_HOTKEY = 0x8000 + 1  # WM_APP + 1，通知热键线程重注册组合键
+
+_hotkey_lock = threading.Lock()
+_hotkey_thread_id = 0
+_hotkey_status: dict = {"registered": False, "conflict": False, "error": 0, "hotkey": ""}
+_hotkey_status_event = threading.Event()
+
+# 全局热键命中后优先让前端完成 DOM 稳定化再 POST（保证「屏幕原样」的会话窗口
+# 已合成进冻结帧）。WebView2 在后台久了定时器会被 Chromium 压到分钟级，故留一个
+# 2s watchdog 兜底：前端没接管时壳层自行抓屏，热键始终可用。
+SCREENSHOT_WATCHDOG_SECONDS = 2.0
+_screenshot_watchdog_lock = threading.Lock()
+_screenshot_watchdog: Optional[threading.Timer] = None
+_screenshot_watchdog_token = 0
+
+
+def _screenshot_watchdog_fire(token: int) -> None:
+    """前端 2s 内没有接管这一轮热键：壳层自行兜底抓屏（frameReady=False 让它等一帧）。"""
+    global _screenshot_watchdog
+    with _screenshot_watchdog_lock:
+        if token != _screenshot_watchdog_token:
+            return  # 已被更新的热键取代
+        _screenshot_watchdog = None
+    from app import desktop_bridge
+
+    if not desktop_bridge.claim_screenshot_round():
+        return  # 前端已 POST 接管，避免重复铺蒙层
+    try:
+        from app.services import desktop_screenshot_settings as cfg
+
+        settings = cfg.load_settings(_default_data_root())
+        result = desktop_bridge.screenshot("start", {
+            "hideImWindow": bool(settings["hideImWindow"]),
+            "frameReady": False,
+        })
+        _log.info("截图热键兜底取景已发起：%s", bool(result and result.get("started")))
+    except Exception:  # noqa: BLE001
+        _log.exception("截图热键兜底取景失败")
+
+
+def _arm_screenshot_watchdog(desktop_bridge: Any) -> None:
+    """登记一轮热键：递增前端轮询序号，并安排可取消的兜底 Timer。"""
+    global _screenshot_watchdog, _screenshot_watchdog_token
+    desktop_bridge.notify_screenshot_hotkey()
+    with _screenshot_watchdog_lock:
+        if _screenshot_watchdog is not None:
+            _screenshot_watchdog.cancel()
+        _screenshot_watchdog_token += 1
+        token = _screenshot_watchdog_token
+        timer = threading.Timer(
+            SCREENSHOT_WATCHDOG_SECONDS, _screenshot_watchdog_fire, args=(token,)
+        )
+        timer.daemon = True
+        _screenshot_watchdog = timer
+    timer.start()
+
+
+def _register_screenshot_hotkey(user32: Any, cfg: Any) -> None:
+    """按本机配置注册组合键；冲突与其它系统错误分开记录，供设置面板提示。
+
+    RegisterHotKey 必须在**注册线程**里调用/注销，所以本函数只被热键线程执行。
+    """
+    settings = cfg.load_settings(_default_data_root())
+    flags, vk = cfg.to_win32_hotkey(settings)
+    ok = bool(user32.RegisterHotKey(None, HOTKEY_ID, flags, vk))
+    error = int(ctypes.get_last_error()) if not ok else 0
+    conflict = (not ok) and cfg.is_conflict_error(error)
+    with _hotkey_lock:
+        _hotkey_status.update({
+            "registered": ok,
+            "conflict": conflict,
+            "error": error,
+            "hotkey": cfg.format_hotkey(settings),
+        })
+    if ok:
+        _log.info("已注册全局截图热键 %s", cfg.format_hotkey(settings))
+    elif conflict:
+        _log.warning("全局截图热键 %s 已被其它应用占用（1409）", cfg.format_hotkey(settings))
+    else:
+        _log.warning("注册全局截图热键失败：%s", error)
+
+
+def reload_screenshot_hotkey() -> dict:
+    """设置保存后让热键线程注销并按新配置重注册，返回注册结果。
+
+    线程通过 ``PostThreadMessageW`` 收到 WM_APP_RELOAD_HOTKEY 后自己完成切换，
+    不重建线程，避免出现热键真空期；``_hotkey_status_event`` 让 HTTP 请求等到结果，
+    前端据此判断「是否与其它应用冲突」。
+    """
+    global _hotkey_thread_id
+    if os.name != "nt":
+        return {"registered": False, "conflict": False, "unsupported": True}
+    with _hotkey_lock:
+        thread_id = _hotkey_thread_id
+    if not thread_id:
+        return {"registered": False, "conflict": False, "pending": True}
+
+    _hotkey_status_event.clear()
+    try:
+        from ctypes import wintypes
+
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.PostThreadMessageW.argtypes = [
+            wintypes.DWORD, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
+        ]
+        user32.PostThreadMessageW.restype = ctypes.c_bool
+        if not user32.PostThreadMessageW(thread_id, WM_APP_RELOAD_HOTKEY, 0, 0):
+            return {"registered": False, "conflict": False,
+                    "error": int(ctypes.get_last_error())}
+    except Exception:  # noqa: BLE001
+        _log.exception("通知截图热键线程重注册失败")
+        return {"registered": False, "conflict": False, "error": -1}
+    if not _hotkey_status_event.wait(1.5):
+        _log.warning("等待截图热键重注册结果超时")
+    with _hotkey_lock:
+        return dict(_hotkey_status)
+
+
+def _make_screenshot_handler(controller: Any) -> Callable[[str, dict], dict]:
+    """把截图会话控制器 + 热键重注册包装成 desktop_bridge 的单一回调。"""
+    def handler(action: str, params: dict) -> dict:
+        if action == "start":
+            return controller.start(
+                bool(params.get("hideImWindow", False)),
+                bool(params.get("frameReady", False)),
+            )
+        if action == "status":
+            return controller.status(int(params.get("after") or 0))
+        if action == "image":
+            return {"png": controller.take_image()}
+        if action == "cancel":
+            return controller.cancel_active()
+        if action == "apply":
+            return reload_screenshot_hotkey()
+        if action == "hotkey-status":
+            with _hotkey_lock:
+                return dict(_hotkey_status)
+        raise ValueError(f"未知截图动作: {action}")
+
+    return handler
+
+
+def _start_screenshot_hotkey(on_hotkey: Callable[[], None]) -> None:
+    """注册系统级截图快捷键（仅 Windows 桌面壳，组合键由本机配置读取）。
+
+    RegisterHotKey(hwnd=None) 把 WM_HOTKEY 投到**注册线程**的消息队列，因此必须在
+    专用线程里跑 GetMessageW 循环；GUI 线程已被 pywebview/WinForms 占用，不能复用。
     热键只负责「记一次事件」（见 desktop_bridge），由前端轮询端点拉取，避免跨线程
     直接操作 WebView2 控件 / evaluate_js 在窗口最小化时失效。
+    只要应用进程不退出，本线程常驻，故在其它应用窗口按快捷键也能触发截图。
     """
     if os.name != "nt":
         return
 
     def _loop() -> None:
+        global _hotkey_thread_id
         try:
             from ctypes import wintypes
 
-            user32 = ctypes.WinDLL("user32", use_last_error=True)
-            MOD_ALT = 0x0001
-            MOD_NOREPEAT = 0x4000
-            WM_HOTKEY = 0x0312
-            VK_Z = 0x5A
-            HOTKEY_ID = 0x4E50  # 'NP'
+            from app.services import desktop_screenshot_settings as cfg
 
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
             user32.RegisterHotKey.argtypes = [
                 wintypes.HWND, ctypes.c_int, ctypes.c_uint, ctypes.c_uint,
             ]
             user32.RegisterHotKey.restype = ctypes.c_bool
-            if not user32.RegisterHotKey(None, HOTKEY_ID, MOD_ALT | MOD_NOREPEAT, VK_Z):
-                _log.warning("注册全局截图热键 Alt+Z 失败（可能被其它程序占用）：%s",
-                             ctypes.get_last_error())
-                return
-            _log.info("已注册全局截图热键 Alt+Z")
-            msg = wintypes.MSG()
+            user32.UnregisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int]
+            user32.UnregisterHotKey.restype = ctypes.c_bool
+            user32.PeekMessageW.argtypes = [
+                ctypes.POINTER(wintypes.MSG), wintypes.HWND,
+                ctypes.c_uint, ctypes.c_uint, ctypes.c_uint,
+            ]
+            user32.PeekMessageW.restype = ctypes.c_bool
             user32.GetMessageW.argtypes = [
                 ctypes.POINTER(wintypes.MSG), wintypes.HWND,
                 ctypes.c_uint, ctypes.c_uint,
             ]
             user32.GetMessageW.restype = ctypes.c_int
+            kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+
+            msg = wintypes.MSG()
+            # PeekMessage 会为当前线程建立消息队列，之后 PostThreadMessageW 才能投递
+            user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 0)  # PM_NOREMOVE
+            with _hotkey_lock:
+                _hotkey_thread_id = int(kernel32.GetCurrentThreadId())
+            _register_screenshot_hotkey(user32, cfg)
+
             while True:
                 result = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
                 if result in (0, -1):  # WM_QUIT / 出错
                     break
-                if msg.message == WM_HOTKEY and int(msg.wParam or 0) == HOTKEY_ID:
+                if msg.message == WM_APP_RELOAD_HOTKEY:
+                    user32.UnregisterHotKey(None, HOTKEY_ID)
+                    _register_screenshot_hotkey(user32, cfg)
+                    _hotkey_status_event.set()
+                elif msg.message == WM_HOTKEY and int(msg.wParam or 0) == HOTKEY_ID:
                     try:
                         on_hotkey()
                     except Exception:  # noqa: BLE001
                         _log.exception("处理全局截图热键失败")
             user32.UnregisterHotKey(None, HOTKEY_ID)
         except Exception:  # noqa: BLE001
-            _log.exception("全局截图热键线程异常（应用内 Alt+Z 仍可用）")
+            _log.exception("全局截图热键线程异常（应用内快捷键仍可用）")
+            _hotkey_status_event.set()
 
     threading.Thread(
         target=_loop, daemon=True, name="npt-screenshot-hotkey",
@@ -1049,13 +1217,30 @@ def _create_window() -> Any:
         )
     except Exception as exc:  # noqa: BLE001
         _log.warning("注入窗口全屏/控制回调失败（地图全屏将退化为应用内全屏）：%s", exc)
-    # 系统级截图快捷键 Alt+Z：窗口不在前台 / 最小化时也能激活协作沟通截图
+    # 注入取景截图会话：桌面端由壳层直接抓整屏 + 置顶蒙层框选，不再依赖
+    # WebView2 的共享窗口选择器；未注入时端点返回 403，前端降级到网页端旧流程。
+    try:
+        from app import desktop_bridge
+        from screenshot_capture import ScreenshotCaptureController
+
+        controller = ScreenshotCaptureController(_default_data_root())
+        desktop_bridge.set_screenshot_handler(_make_screenshot_handler(controller))
+        _log.info("已注入桌面取景截图会话回调")
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("注入取景截图回调失败（截图将降级为窗口选择方式）：%s", exc)
+    # 系统级截图快捷键：组合键取自本机配置，窗口不在前台 / 最小化 / 其它应用窗口都能触发
     try:
         from app import desktop_bridge
 
-        _start_screenshot_hotkey(desktop_bridge.notify_screenshot_hotkey)
+        def _on_screenshot_hotkey() -> None:
+            # 只登记「待取景」并安排 watchdog，绝不在这里直接抓屏：会话窗口是 WebView2
+            # 内的 DOM 浮层，必须由前端先完成 DOM 稳定化（清标记 / 关遮罩 / 收下拉 /
+            # 等两帧）才能让屏幕原样出现在冻结帧里。Win32 消息线程必须保持极短。
+            _arm_screenshot_watchdog(desktop_bridge)
+
+        _start_screenshot_hotkey(_on_screenshot_hotkey)
     except Exception as exc:  # noqa: BLE001
-        _log.warning("注册全局截图热键失败（应用内 Alt+Z 仍可用）：%s", exc)
+        _log.warning("注册全局截图热键失败（应用内快捷键仍可用）：%s", exc)
     return window
 
 

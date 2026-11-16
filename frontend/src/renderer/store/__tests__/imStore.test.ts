@@ -474,4 +474,97 @@ describe('imStore', () => {
     Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' })
     vi.useRealTimers()
   })
+
+  it('发送消息不用全局自增 id 推进游标，对方的旧消息不再被永久跳过', async () => {
+    localStorage.setItem('auth-storage', JSON.stringify({ state: { user: { id: 1 } } }))
+    useImStore.setState({ activeConversationId: 7 })
+    vi.mocked(imApi.messages).mockResolvedValueOnce(messagesPage([message(5)], 5) as any)
+    await useImStore.getState().loadMessages(7, 'initial')
+    expect(useImStore.getState().cursors[7].next).toBe(5)
+
+    // 自己发出的消息服务端 id=8，而对方 id=6/7 还没拉到
+    vi.mocked(imApi.send).mockResolvedValueOnce({
+      success: true, data: message(8, '我方'),
+    } as any)
+    vi.mocked(imApi.messages).mockResolvedValue({
+      success: true, data: {
+        items: [message(6), message(7), message(8)], has_more: false,
+        next_cursor: 8, prev_cursor: 6,
+      },
+    } as any)
+    vi.mocked(imApi.conversations).mockResolvedValue(conversationsPage([]) as any)
+
+    expect(await useImStore.getState().sendText('我方')).toBe(true)
+    await vi.waitFor(() => {
+      const ids = useImStore.getState().messages[7].map(m => m.id)
+      expect(ids).toContain(6)
+      expect(ids).toContain(7)
+    })
+  })
+
+  it('增量消息超过一页时循环补拉到 has_more=false', async () => {
+    useImStore.setState({
+      activeConversationId: 7,
+      cursors: { 7: { next: 0, prev: 1, hasMore: true } },
+    })
+    vi.mocked(imApi.messages)
+      .mockResolvedValueOnce({ success: true, data: {
+        items: [message(1), message(2)], has_more: true, next_cursor: 2, prev_cursor: 1,
+      } } as any)
+      .mockResolvedValueOnce({ success: true, data: {
+        items: [message(3)], has_more: false, next_cursor: 3, prev_cursor: 3,
+      } } as any)
+    await useImStore.getState().loadMessages(7, 'incremental')
+    expect(imApi.messages).toHaveBeenCalledTimes(2)
+    expect(vi.mocked(imApi.messages).mock.calls[1][1]).toMatchObject({ after_id: 2 })
+    expect(useImStore.getState().messages[7].map(m => m.id)).toEqual([1, 2, 3])
+    expect(useImStore.getState().cursors[7].next).toBe(3)
+  })
+
+  it('上拉历史不回退增量游标', async () => {
+    useImStore.setState({
+      activeConversationId: 7,
+      cursors: { 7: { next: 20, prev: 10, hasMore: true } },
+      messages: { 7: [message(10), message(20)] },
+    })
+    vi.mocked(imApi.messages).mockResolvedValueOnce({ success: true, data: {
+      items: [message(5)], has_more: false, next_cursor: 5, prev_cursor: 5,
+    } } as any)
+    await useImStore.getState().loadMessages(7, 'older')
+    expect(useImStore.getState().cursors[7].next).toBe(20)
+    expect(useImStore.getState().cursors[7].prev).toBe(5)
+    expect(useImStore.getState().messages[7].map(m => m.id)).toEqual([5, 10, 20])
+  })
+
+  it('每会话消息只保留最近 300 条，游标仍单独保留', async () => {
+    const many = Array.from({ length: 320 }, (_, i) => message(i + 1))
+    vi.mocked(imApi.messages).mockResolvedValueOnce({ success: true, data: {
+      items: many, has_more: false, next_cursor: 320, prev_cursor: 1,
+    } } as any)
+    await useImStore.getState().loadMessages(7, 'initial')
+    const list = useImStore.getState().messages[7]
+    expect(list).toHaveLength(300)
+    expect(list[0].id).toBe(21)
+    expect(list[299].id).toBe(320)
+    expect(useImStore.getState().cursors[7].next).toBe(320)
+  })
+
+  it('服务端最新消息越过本地正文时重拉一页补洞（红点有、正文没来）', async () => {
+    localStorage.setItem('auth-storage', JSON.stringify({ state: { user: { id: 1 } } }))
+    useImStore.setState({
+      activeConversationId: 7, open: true,
+      messages: { 7: [message(1)] },
+      cursors: { 7: { next: 1, prev: 1, hasMore: false } },
+    })
+    vi.mocked(imApi.conversations).mockResolvedValue(
+      conversationsPage([{ ...conversation(9, 2), unread: 2 }]) as any)
+    vi.mocked(imApi.messages).mockResolvedValue({ success: true, data: {
+      items: [message(8), message(9)], has_more: false, next_cursor: 9, prev_cursor: 8,
+    } } as any)
+
+    await useImStore.getState().refreshConversations()
+    await vi.waitFor(() => {
+      expect(useImStore.getState().messages[7].some(m => m.id === 9)).toBe(true)
+    })
+  })
 })

@@ -11,7 +11,8 @@
     "standaloneHint": "Project Communication requires shared mode and network access",
     "common": {
       "cancel": "Cancel",
-      "close": "Close"
+      "close": "Close",
+      "save": "Save"
     },
     "host": {
       "hint": "Project Communication · Messages & Contacts",
@@ -63,7 +64,9 @@
     },
     "composer": {
       "sendImage": "Add image",
-      "screenshot": "Screenshot (Alt+Z)",
+      "screenshot": "Screenshot",
+      "screenshotOptions": "Screenshot options",
+      "screenshotHotkeyHint": "Hotkey {{hotkey}}",
       "sendFile": "Add file",
       "emoji": "Emoji",
       "placeholder": "Type a message; paste screenshots or drop files, then confirm before sending…",
@@ -114,7 +117,26 @@
       "pan": "Pan (or hold the middle mouse button to drag)",
       "zoomIn": "Zoom in",
       "zoomOut": "Zoom out",
-      "zoomReset": "Reset view (100%)"
+      "zoomReset": "Reset view (100%)",
+      "recapture": "Recapture",
+      "desktopHint": "Framing: hover a window to highlight its bounds, click to capture, or drag to select a free region. ESC / right-click cancels.",
+      "settings": {
+        "title": "Screenshot settings",
+        "hotkey": "Screenshot hotkey",
+        "clickToRecord": "Click to record",
+        "recording": "Press a key combination…",
+        "hotkeyHintDesktop": "This is a system-wide hotkey: it works while the app is running, even from other application windows.",
+        "hotkeyHintWeb": "This hotkey works within this page only. Install the desktop app for cross-application capture.",
+        "hideImWindow": "Hide window on capture",
+        "hideImWindowHint": "When enabled, the chat window controls are hidden from the capture; when disabled, they can be captured.",
+        "modifierRequired": "Hold at least one modifier: Ctrl / Alt / Shift / Win",
+        "reservedKey": "This key is reserved by the system. Choose another one.",
+        "invalidKey": "Unrecognized key. Please choose another one.",
+        "conflict": "This hotkey is already used by another application. Your previous setting was restored — please choose a different combination.",
+        "saved": "Screenshot settings saved",
+        "saveFailed": "Could not save settings. Please try again.",
+        "reset": "Restore defaults"
+      }
     },
     "settings": {
       "title": "Settings",
@@ -228,7 +250,10 @@
       "reset": "Reset",
       "download": "Download",
       "openFile": "Open in new tab",
-      "hint": "Scroll to zoom · Drag to pan · Double-click to reset"
+      "hint": "Scroll to zoom · Drag to pan · Double-click to reset",
+      "hintGallery": "Scroll to zoom · Drag to pan · Double-click to reset · ← → switch image",
+      "prev": "Previous",
+      "next": "Next"
     }
   },
   "guide": {

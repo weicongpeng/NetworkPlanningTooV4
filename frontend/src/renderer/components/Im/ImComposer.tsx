@@ -13,14 +13,20 @@ import type {
 } from 'react'
 import { useTranslation } from 'react-i18next'
 import {
-  AtSign, File as FileIcon, ImagePlus, Loader2, Paperclip, Scissors, Send, Smile, X,
+  AtSign, Check, ChevronDown, EyeOff, File as FileIcon, ImagePlus, Loader2,
+  Paperclip, Scissors, Send, Settings2, Smile, X,
 } from 'lucide-react'
 
 import { useAuthStore } from '../../store/authStore'
 import { useImStore } from '../../store/imStore'
 import { EMOJI_GROUPS } from './emojis'
 import { ImMentionPopup } from './ImMentionPopup'
-import { requestScreenshot } from './screenshotBus'
+import {
+  openScreenshotSettings, requestScreenshot, SCREENSHOT_STABILIZE_EVENT,
+} from './screenshotBus'
+import {
+  formatHotkey, getScreenshotSettings, saveScreenshotSettings, useScreenshotSettings,
+} from './screenshotSettings'
 import { formatBytes } from './types'
 import type { ImMember, ImMentionTarget, ImSendMention } from './types'
 
@@ -62,6 +68,7 @@ export function ImComposer({ conversationId }: { conversationId: number }) {
   const [text, setText] = useState('')
   const [pending, setPending] = useState<PendingAttachment[]>([])
   const [emojiOpen, setEmojiOpen] = useState(false)
+  const [screenshotMenuOpen, setScreenshotMenuOpen] = useState(false)
   const [emojiGroup, setEmojiGroup] = useState(0)
   const [dragOver, setDragOver] = useState(false)
   const [notice, setNotice] = useState('')
@@ -76,6 +83,7 @@ export function ImComposer({ conversationId }: { conversationId: number }) {
   const imageInputRef = useRef<HTMLInputElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const emojiRef = useRef<HTMLDivElement>(null)
+  const screenshotRef = useRef<HTMLDivElement>(null)
   const pendingRef = useRef<PendingAttachment[]>([])
 
   const draftFor = useImStore(s => s.draftFor)
@@ -94,6 +102,8 @@ export function ImComposer({ conversationId }: { conversationId: number }) {
   const conversation = useImStore(s => s.conversations.find(c => c.id === conversationId) || null)
   const members = useImStore(s => s.membersByConversation[conversationId]) || EMPTY_MEMBERS
   const myId = useAuthStore(s => s.user?.id ?? null)
+  const desktopMode = useAuthStore(s => s.desktopMode)
+  const screenshotSettings = useScreenshotSettings()
   const isGroup = conversation !== null && conversation.kind !== 'direct'
   // 权限口径与服务端 _require_admin 一致：严格按本群 role，不用系统管理员位
   const canMentionAll = isGroup && myId !== null && members.some(
@@ -140,13 +150,42 @@ export function ImComposer({ conversationId }: { conversationId: number }) {
 
   // 点面板外关闭；面板内可以连点多个表情，不再点一个就关
   useEffect(() => {
-    if (!emojiOpen) return
+    if (!emojiOpen && !screenshotMenuOpen) return
     const onDown = (event: PointerEvent) => {
       if (emojiRef.current && !emojiRef.current.contains(event.target as Node)) setEmojiOpen(false)
+      if (screenshotRef.current && !screenshotRef.current.contains(event.target as Node)) {
+        setScreenshotMenuOpen(false)
+      }
     }
     document.addEventListener('pointerdown', onDown)
     return () => document.removeEventListener('pointerdown', onDown)
-  }, [emojiOpen])
+  }, [emojiOpen, screenshotMenuOpen])
+
+  // 四个截图入口（按钮 / 应用内快捷键 / 系统热键 / 重新取景）都会先广播稳定化事件：
+  // 下拉必须收起，否则它会出现在壳层冻结的整屏快照里
+  useEffect(() => {
+    const onStabilize = () => {
+      setScreenshotMenuOpen(false)
+      setEmojiOpen(false)
+    }
+    window.addEventListener(SCREENSHOT_STABILIZE_EVENT, onStabilize)
+    return () => window.removeEventListener(SCREENSHOT_STABILIZE_EVENT, onStabilize)
+  }, [])
+
+  /** 下拉里的「隐藏窗口截图」与设置面板共用一个持久开关 */
+  const toggleHideImWindow = async () => {
+    const current = getScreenshotSettings()
+    try {
+      const result = await saveScreenshotSettings(
+        { ...current, hideImWindow: !current.hideImWindow }, Boolean(desktopMode))
+      if (result.conflict) {
+        setNotice(t('im.screenshot.settings.conflict',
+          '该快捷键已被其它应用占用，已恢复原来的设置，请更换一个组合键'))
+      }
+    } catch {
+      setNotice(t('im.screenshot.settings.saveFailed', '保存失败，请稍后重试'))
+    }
+  }
 
   const updateText = (value: string) => {
     setText(value)
@@ -408,10 +447,44 @@ export function ImComposer({ conversationId }: { conversationId: number }) {
                     onClick={() => imageInputRef.current?.click()}>
           <ImagePlus size={17} />
         </ToolButton>
-        <ToolButton title={t('im.composer.screenshot', '截图（Alt+Z）')}
-                    onClick={requestScreenshot}>
-          <Scissors size={17} />
-        </ToolButton>
+        <div className="relative flex items-center" ref={screenshotRef}>
+          <ToolButton
+            title={`${t('im.composer.screenshot', '截图')}（${formatHotkey(screenshotSettings.hotkey)}）`}
+            onClick={() => { setScreenshotMenuOpen(false); requestScreenshot() }}>
+            <Scissors size={17} />
+          </ToolButton>
+          <button type="button"
+                  title={t('im.composer.screenshotOptions', '截图选项')}
+                  onClick={() => setScreenshotMenuOpen(value => !value)}
+                  className="flex h-8 w-4 items-center justify-center rounded-r-lg text-muted-foreground transition-colors hover:bg-accent hover:text-primary cursor-pointer">
+            <ChevronDown size={12} />
+          </button>
+          {screenshotMenuOpen && (
+            <div className="absolute bottom-10 left-0 z-20 w-[228px] rounded-xl border border-border bg-popover p-1.5 shadow-xl">
+              <button type="button"
+                      onClick={() => { setScreenshotMenuOpen(false); void toggleHideImWindow() }}
+                      className="flex w-full items-center gap-2 rounded-lg px-2 py-2 text-left text-xs hover:bg-accent cursor-pointer">
+                <EyeOff size={14} className="shrink-0 text-muted-foreground" />
+                <span className="flex-1">
+                  {t('im.screenshot.settings.hideImWindow', '隐藏窗口截图')}
+                </span>
+                {screenshotSettings.hideImWindow && <Check size={14} className="text-primary" />}
+              </button>
+              <button type="button"
+                      onClick={() => { setScreenshotMenuOpen(false); openScreenshotSettings() }}
+                      className="flex w-full items-center gap-2 rounded-lg px-2 py-2 text-left text-xs hover:bg-accent cursor-pointer">
+                <Settings2 size={14} className="shrink-0 text-muted-foreground" />
+                <span className="flex-1">{t('im.screenshot.settings.title', '截图设置')}</span>
+              </button>
+              <p className="border-t border-border/60 px-2 pb-0.5 pt-1.5 text-[10px] leading-relaxed text-muted-foreground">
+                {t('im.composer.screenshotHotkeyHint', {
+                  defaultValue: '快捷键 {{hotkey}}',
+                  hotkey: formatHotkey(screenshotSettings.hotkey),
+                })}
+              </p>
+            </div>
+          )}
+        </div>
         <ToolButton title={t('im.composer.sendFile', '添加文件')}
                     onClick={() => fileInputRef.current?.click()}>
           <Paperclip size={17} />

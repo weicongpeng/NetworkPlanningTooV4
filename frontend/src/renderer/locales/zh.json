@@ -11,7 +11,8 @@
     "standaloneHint": "项目沟通需要共享模式联网",
     "common": {
       "cancel": "取消",
-      "close": "关闭"
+      "close": "关闭",
+      "save": "保存"
     },
     "host": {
       "hint": "项目沟通 · 消息与通讯录",
@@ -63,7 +64,9 @@
     },
     "composer": {
       "sendImage": "添加图片",
-      "screenshot": "截图（Alt+Z）",
+      "screenshot": "截图",
+      "screenshotOptions": "截图选项",
+      "screenshotHotkeyHint": "快捷键 {{hotkey}}",
       "sendFile": "添加文件",
       "emoji": "表情",
       "placeholder": "输入消息，可粘贴截图、拖入表格或任意文件，确认后再发送…",
@@ -114,7 +117,26 @@
       "pan": "平移（或按住鼠标中键拖动）",
       "zoomIn": "放大",
       "zoomOut": "缩小",
-      "zoomReset": "复位视图（100%）"
+      "zoomReset": "复位视图（100%）",
+      "recapture": "重新取景",
+      "desktopHint": "正在取景：鼠标移到窗口上会高亮截取范围，单击即完成；按住拖拽可自由框选，ESC / 右键取消。",
+      "settings": {
+        "title": "截图设置",
+        "hotkey": "截图快捷键",
+        "clickToRecord": "点击录制",
+        "recording": "请按下组合键…",
+        "hotkeyHintDesktop": "组合键为系统级快捷键：应用运行期间，在其它应用窗口按下也能唤起截图。",
+        "hotkeyHintWeb": "组合键在本页面内生效；跨应用截图请安装桌面版。",
+        "hideImWindow": "隐藏窗口截图",
+        "hideImWindowHint": "开启后截图画面不出现当前会话窗口控件；关闭时可把会话窗口一起截进去。",
+        "modifierRequired": "请同时按住 Ctrl / Alt / Shift / Win 中的至少一个修饰键",
+        "reservedKey": "该按键为系统保留键，请换一个",
+        "invalidKey": "无法识别该按键，请换一个",
+        "conflict": "该快捷键已被其它应用占用，已恢复原来的设置，请更换一个组合键",
+        "saved": "截图设置已保存",
+        "saveFailed": "保存失败，请稍后重试",
+        "reset": "恢复默认"
+      }
     },
     "settings": {
       "title": "设置",
@@ -228,7 +250,10 @@
       "reset": "复位",
       "download": "下载",
       "openFile": "在新标签页打开",
-      "hint": "滚轮缩放 · 拖拽平移 · 双击复位"
+      "hint": "滚轮缩放 · 拖拽平移 · 双击复位",
+      "hintGallery": "滚轮缩放 · 拖拽平移 · 双击复位 · ← → 切换图片",
+      "prev": "上一张",
+      "next": "下一张"
     }
   },
   "guide": {

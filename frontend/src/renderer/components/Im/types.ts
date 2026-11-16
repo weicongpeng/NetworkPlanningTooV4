@@ -29,6 +29,10 @@ export interface ImLightboxSource {
   mime: string
   attachmentId?: number
   file?: File
+  /** 当前会话内已加载的图片（按消息顺序）；有 2 张以上时灯箱可上一张 / 下一张 */
+  gallery?: ImLightboxSource[]
+  /** 打开时的起始下标 */
+  galleryIndex?: number
 }
 
 export interface ImUser {

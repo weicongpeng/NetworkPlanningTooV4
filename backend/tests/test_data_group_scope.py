@@ -299,9 +299,23 @@ def _main_admin_group():
 def test_fix_misattributed_task_groups(city_presets):
     """行组==主管理员组但创建人属其他组的任务行按创建人组重盖章；
     组==行组的创建人（含主管理员本人）与不存在用户的行不动；幂等"""
+    import uuid
+
     from app.core.database import SessionLocal, _fix_misattributed_task_groups
-    from app.models.database import TaskResult
+    from app.models.database import ImConversationMember, TaskResult
     from app.services.auth_service import auth_service
+
+    # 该测试直连 SessionLocal（不走 conftest 的 DATA_ROOT 隔离）。历史上用固定用户名，
+    # 一旦上一次运行中途失败就会在生产库留下残留，导致 create_user 返回 None、
+    # 后续 .id 抛 AttributeError。改用每次唯一的名称，保证可重复运行且不碰存量数据。
+    suffix = uuid.uuid4().hex[:8]
+    name_admin = f"grp_fix_admin_{suffix}"
+    name_user = f"grp_fix_user_{suffix}"
+    name_same = f"grp_fix_same_{suffix}"
+    name_ghost = f"grp_fix_ghost_{suffix}"
+    tid_mis = f"grp_fix_mis_{suffix}"
+    tid_ok = f"grp_fix_ok_{suffix}"
+    tid_ghost = f"grp_fix_ghost_{suffix}"
 
     main = _main_admin_group()
     admin_city, admin_operator = main if main else ("深圳", "移动")
@@ -312,27 +326,27 @@ def test_fix_misattributed_task_groups(city_presets):
     user_ids = []
     try:
         if main is None:
-            a, _ = auth_service.create_user(db, "grp_fix_admin", "Test@12345",
+            a, _ = auth_service.create_user(db, name_admin, "Test@12345",
                                             is_admin=True, city=admin_city, operator=admin_operator)
             user_ids.append(a.id)
-        u, _ = auth_service.create_user(db, "grp_fix_user", "Test@12345",
+        u, _ = auth_service.create_user(db, name_user, "Test@12345",
                                         city=other[0], operator=other[1])
-        same, _ = auth_service.create_user(db, "grp_fix_same", "Test@12345",
+        same, _ = auth_service.create_user(db, name_same, "Test@12345",
                                            city=admin_city, operator=admin_operator)
         user_ids.extend([u.id, same.id])
 
         rows = [
             # 误归：行组为主管理员组，创建人属其他组 → 应纠正
-            TaskResult(task_id="grp_fix_mis", task_type="pci", task_name="误归任务",
-                       user_name="grp_fix_user", status="COMPLETED", result_json="{}",
+            TaskResult(task_id=tid_mis, task_type="pci", task_name="误归任务",
+                       user_name=name_user, status="COMPLETED", result_json="{}",
                        created_at=datetime.now(), city=admin_city, operator=admin_operator),
             # 行组与创建人组一致 → 不动（主管理员本人的任务即此种）
-            TaskResult(task_id="grp_fix_ok", task_type="pci", task_name="正常任务",
-                       user_name="grp_fix_same", status="COMPLETED", result_json="{}",
+            TaskResult(task_id=tid_ok, task_type="pci", task_name="正常任务",
+                       user_name=name_same, status="COMPLETED", result_json="{}",
                        created_at=datetime.now(), city=admin_city, operator=admin_operator),
             # 创建人不存在 → 不动
-            TaskResult(task_id="grp_fix_ghost", task_type="pci", task_name="未知用户任务",
-                       user_name="grp_fix_ghost", status="COMPLETED", result_json="{}",
+            TaskResult(task_id=tid_ghost, task_type="pci", task_name="未知用户任务",
+                       user_name=name_ghost, status="COMPLETED", result_json="{}",
                        created_at=datetime.now(), city=admin_city, operator=admin_operator),
         ]
         for r in rows:
@@ -346,11 +360,11 @@ def test_fix_misattributed_task_groups(city_presets):
 
         db = SessionLocal()
         try:
-            mis = db.query(TaskResult).filter(TaskResult.task_id == "grp_fix_mis").first()
+            mis = db.query(TaskResult).filter(TaskResult.task_id == tid_mis).first()
             assert (mis.city, mis.operator) == other
-            ok = db.query(TaskResult).filter(TaskResult.task_id == "grp_fix_ok").first()
+            ok = db.query(TaskResult).filter(TaskResult.task_id == tid_ok).first()
             assert (ok.city, ok.operator) == (admin_city, admin_operator)
-            ghost = db.query(TaskResult).filter(TaskResult.task_id == "grp_fix_ghost").first()
+            ghost = db.query(TaskResult).filter(TaskResult.task_id == tid_ghost).first()
             assert (ghost.city, ghost.operator) == (admin_city, admin_operator)
         finally:
             db.close()
@@ -360,11 +374,16 @@ def test_fix_misattributed_task_groups(city_presets):
     finally:
         db = SessionLocal()
         try:
-            for tid in ("grp_fix_mis", "grp_fix_ok", "grp_fix_ghost"):
+            for tid in (tid_mis, tid_ok, tid_ghost):
                 row = db.query(TaskResult).filter(TaskResult.task_id == tid).first()
                 if row:
                     db.delete(row)
             for uid in user_ids:
+                # 自动群会把同组新建账号加进 im_conversation_members，先解除引用
+                # 再删用户，否则 SQLite 外键约束会让清理失败并留下残留账号。
+                db.query(ImConversationMember).filter(
+                    ImConversationMember.user_id == uid).delete(synchronize_session=False)
+                db.flush()
                 auth_service.delete_user(db, uid)
             db.commit()
         finally:

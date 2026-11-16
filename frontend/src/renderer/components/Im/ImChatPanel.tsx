@@ -1,5 +1,5 @@
 /** 会话区：标题栏、消息流（上拉历史 / 回到底部）、输入区、图片灯箱与群成员。 */
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import {
   ArrowDown, ChevronLeft, MessageSquareDashed, Users, X,
@@ -14,7 +14,7 @@ import { ImImageLightbox } from './ImImageLightbox'
 import { ImMessageItem } from './ImMessageItem'
 import { ImSystemNotice } from './ImSystemNotice'
 import { conversationTitle, formatClock } from './types'
-import type { ImConversation, ImMessage } from './types'
+import type { ImConversation, ImLightboxSource, ImMessage } from './types'
 
 interface Props {
   conversation: ImConversation | null
@@ -89,6 +89,27 @@ export function ImChatPanel({ conversation, narrow, onBack }: Props) {
   const openMembers = () => {
     if (!conversation) return
     setMembersOpen(true)
+  }
+
+  // 当前会话已加载的图片（按消息顺序）：灯箱据此支持上一张 / 下一张浏览。
+  // 只收有服务端 attachmentId 的图片，乐观消息 / 输入框待发送附件不进画廊。
+  const imageGallery = useMemo<ImLightboxSource[]>(() => messages.flatMap(message => {
+    const attachment = message.attachment
+    if (message.kind !== 'image' || !attachment || attachment.id == null) return []
+    return [{
+      name: attachment.original_name,
+      mime: attachment.mime || 'image/png',
+      attachmentId: attachment.id,
+    }]
+  }), [messages])
+
+  const openPreview = (attachmentId: number, name: string, mime: string) => {
+    const index = imageGallery.findIndex(item => item.attachmentId === attachmentId)
+    setLightbox({
+      name, mime, attachmentId,
+      gallery: imageGallery,
+      galleryIndex: index >= 0 ? index : 0,
+    })
   }
 
   // objectURL 由 ImImageLightbox 自己持有并在卸载时 revoke，这里只清状态
@@ -197,8 +218,7 @@ export function ImChatPanel({ conversation, narrow, onBack }: Props) {
                 <ImMessageItem
                   message={message}
                   isMine={message.sender_id === currentUserId}
-                  onPreview={(attachmentId, name, mime) =>
-                    setLightbox({ name, mime, attachmentId })}
+                  onPreview={openPreview}
                   onRetry={() => void sendText(message.content_text || '')}
                 />
               )}

@@ -12,7 +12,8 @@ import { createPortal } from 'react-dom'
 import type { PointerEvent as ReactPointerEvent, ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
 import {
-  Download, ExternalLink, FileIcon, Loader2, Maximize2, X, ZoomIn, ZoomOut,
+  ChevronLeft, ChevronRight, Download, ExternalLink, FileIcon, Loader2,
+  Maximize2, X, ZoomIn, ZoomOut,
 } from 'lucide-react'
 
 import { imApi } from '../../services/api'
@@ -40,6 +41,9 @@ interface Props {
   onClose: () => void
 }
 
+/** 单张预览时复用空数组，避免每次 render 新建引用导致键盘监听反复注册 */
+const EMPTY_GALLERY: ImLightboxSource[] = []
+
 export function ImImageLightbox({ source, onClose }: Props) {
   const { t } = useTranslation()
   const desktopMode = useAuthStore(s => s.desktopMode)
@@ -49,7 +53,24 @@ export function ImImageLightbox({ source, onClose }: Props) {
   const [offset, setOffset] = useState({ x: 0, y: 0 })
   const stageRef = useRef<HTMLDivElement>(null)
   const dragRef = useRef<{ x: number; y: number; ox: number; oy: number } | null>(null)
-  const isImage = source.mime.startsWith('image/')
+
+  // 画廊 = 当前会话已加载的全部图片。灯箱自己持有当前项，翻页不回写 store，
+  // 这样输入框待发送附件预览（无 gallery）仍是单张、不受影响。
+  const gallery = source.gallery ?? EMPTY_GALLERY
+  const [current, setCurrent] = useState<ImLightboxSource>(source)
+  useEffect(() => { setCurrent(source) }, [source])
+  const matchedIndex = gallery.findIndex(item =>
+    item.attachmentId != null && item.attachmentId === current.attachmentId)
+  const currentIndex = matchedIndex >= 0
+    ? matchedIndex
+    : Math.min(Math.max(0, source.galleryIndex ?? 0), Math.max(0, gallery.length - 1))
+  const canNavigate = gallery.length > 1
+  const isImage = current.mime.startsWith('image/')
+
+  const goTo = (index: number) => {
+    if (!canNavigate || index < 0 || index >= gallery.length || index === currentIndex) return
+    setCurrent(gallery[index])
+  }
 
   // 灯箱独享 objectURL：来源变化时重建，关闭 / 卸载时 revoke，不借用任何外部 URL
   useEffect(() => {
@@ -61,10 +82,10 @@ export function ImImageLightbox({ source, onClose }: Props) {
     const load = async () => {
       try {
         let blob: Blob
-        if (source.file) {
-          blob = source.file
-        } else if (source.attachmentId != null) {
-          blob = await imApi.attachmentBlob(source.attachmentId, false)
+        if (current.file) {
+          blob = current.file
+        } else if (current.attachmentId != null) {
+          blob = await imApi.attachmentBlob(current.attachmentId, false)
         } else {
           throw new Error('missing source')
         }
@@ -80,13 +101,13 @@ export function ImImageLightbox({ source, onClose }: Props) {
       cancelled = true
       if (objectUrl) URL.revokeObjectURL(objectUrl)
     }
-  }, [source])
+  }, [current])
 
   // 换一张图复位视图
   useEffect(() => {
     setScale(1)
     setOffset({ x: 0, y: 0 })
-  }, [source])
+  }, [current])
 
   // 原生 wheel 监听（passive:false 才能 preventDefault，避免页面一起滚动）
   useEffect(() => {
@@ -107,11 +128,17 @@ export function ImImageLightbox({ source, onClose }: Props) {
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') onClose()
+      if (event.key === 'Escape') { onClose(); return }
+      if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return
+      if (!canNavigate) return
+      event.preventDefault()
+      event.stopPropagation()
+      const next = currentIndex + (event.key === 'ArrowRight' ? 1 : -1)
+      if (next >= 0 && next < gallery.length) setCurrent(gallery[next])
     }
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
-  }, [onClose])
+  }, [onClose, canNavigate, currentIndex, gallery])
 
   const resetView = () => {
     setScale(1)
@@ -134,7 +161,7 @@ export function ImImageLightbox({ source, onClose }: Props) {
     if (!url) return
     const anchor = document.createElement('a')
     anchor.href = url
-    anchor.download = source.name
+    anchor.download = current.name
     document.body.appendChild(anchor)
     anchor.click()
     anchor.remove()
@@ -157,7 +184,13 @@ export function ImImageLightbox({ source, onClose }: Props) {
       {/* 顶部工具条：图标 + title 悬浮提示 */}
       <div className="flex shrink-0 items-center justify-end gap-0.5 px-3 py-2"
            onClick={event => event.stopPropagation()}>
-        <span className="mr-auto min-w-0 truncate pr-3 text-xs text-white/80">{source.name}</span>
+        <span className="mr-auto min-w-0 truncate pr-3 text-xs text-white/80">{current.name}</span>
+        {canNavigate && (
+          <span data-im-lightbox-counter
+                className="mr-2 shrink-0 text-[11px] tabular-nums text-white/60">
+            {currentIndex + 1} / {gallery.length}
+          </span>
+        )}
         {isImage && (
           <>
             <span className="mr-1 w-11 text-right text-[11px] tabular-nums text-white/60">
@@ -192,6 +225,26 @@ export function ImImageLightbox({ source, onClose }: Props) {
            onPointerUp={onPointerUp} onPointerCancel={onPointerUp}
            onClick={event => event.stopPropagation()}
            onDoubleClick={resetView}>
+        {canNavigate && (
+          <>
+            <button type="button" data-im-lightbox-prev
+                    title={t('im.lightbox.prev', '上一张')}
+                    disabled={currentIndex <= 0}
+                    onPointerDown={event => event.stopPropagation()}
+                    onClick={event => { event.stopPropagation(); goTo(currentIndex - 1) }}
+                    className="absolute left-3 top-1/2 z-10 flex h-11 w-11 -translate-y-1/2 items-center justify-center rounded-full bg-black/45 text-white/85 shadow-lg transition-colors hover:bg-black/70 hover:text-white disabled:cursor-not-allowed disabled:opacity-25 cursor-pointer">
+              <ChevronLeft size={24} />
+            </button>
+            <button type="button" data-im-lightbox-next
+                    title={t('im.lightbox.next', '下一张')}
+                    disabled={currentIndex >= gallery.length - 1}
+                    onPointerDown={event => event.stopPropagation()}
+                    onClick={event => { event.stopPropagation(); goTo(currentIndex + 1) }}
+                    className="absolute right-3 top-1/2 z-10 flex h-11 w-11 -translate-y-1/2 items-center justify-center rounded-full bg-black/45 text-white/85 shadow-lg transition-colors hover:bg-black/70 hover:text-white disabled:cursor-not-allowed disabled:opacity-25 cursor-pointer">
+              <ChevronRight size={24} />
+            </button>
+          </>
+        )}
         {failed ? (
           <p className="text-xs text-white/70">{t('im.message.imageFailed', '图片加载失败')}</p>
         ) : !url ? (
@@ -199,7 +252,7 @@ export function ImImageLightbox({ source, onClose }: Props) {
         ) : isImage ? (
           <img
             src={url}
-            alt={source.name}
+            alt={current.name}
             draggable={false}
             className="max-h-full max-w-full select-none object-contain"
             style={{ transform: `translate(${offset.x}px, ${offset.y}px) scale(${scale})` }}
@@ -207,9 +260,9 @@ export function ImImageLightbox({ source, onClose }: Props) {
         ) : (
           <div className="flex w-[280px] flex-col items-center gap-3 rounded-2xl border border-white/15 bg-white/5 px-6 py-7 text-white">
             <FileIcon size={40} strokeWidth={1.3} className="text-white/70" />
-            <p className="w-full truncate text-center text-xs">{source.name}</p>
-            {source.file && (
-              <p className="text-[11px] text-white/60">{formatBytes(source.file.size)}</p>
+            <p className="w-full truncate text-center text-xs">{current.name}</p>
+            {current.file && (
+              <p className="text-[11px] text-white/60">{formatBytes(current.file.size)}</p>
             )}
             <button type="button" onClick={openFile}
                     className="flex items-center gap-1.5 rounded-lg bg-primary px-3 py-1.5 text-xs text-primary-foreground hover:brightness-110 cursor-pointer">
@@ -222,7 +275,9 @@ export function ImImageLightbox({ source, onClose }: Props) {
 
       {isImage && (
         <p className="shrink-0 pb-3 text-center text-[11px] text-white/50">
-          {t('im.lightbox.hint', '滚轮缩放 · 拖拽平移 · 双击复位')}
+          {canNavigate
+            ? t('im.lightbox.hintGallery', '滚轮缩放 · 拖拽平移 · 双击复位 · ← → 切换图片')
+            : t('im.lightbox.hint', '滚轮缩放 · 拖拽平移 · 双击复位')}
         </p>
       )}
     </div>,

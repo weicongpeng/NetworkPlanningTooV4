@@ -684,6 +684,9 @@ class ImConversationMember(Base):
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     role = Column(String(16), nullable=False, default="member")
     last_read_message_id = Column(Integer, nullable=False, default=0)
+    # 冗余未读计数：列表读路径不再逐会话跑 COUNT(*) 相关子查询。
+    # 发送/系统消息时 +1、已读时按服务端游标重算，全部与消息落库在同一事务内。
+    unread_count = Column(Integer, nullable=False, default=0, server_default="0")
     muted = Column(Boolean, nullable=False, default=False)
     joined_at = Column(String(30), nullable=False, default=_utcnow_iso)
 
@@ -726,6 +729,8 @@ class ImMessage(Base):
 
     __table_args__ = (
         Index("idx_im_msg_conv_id", "conversation_id", "id"),
+        # 支撑未读计数回填 / mark_read 精算时的按会话范围扫描
+        Index("idx_im_msg_sender_conv_id", "conversation_id", "sender_id", "id"),
         Index("idx_im_msg_client", "conversation_id", "sender_id", "client_msg_id", unique=True),
     )
 

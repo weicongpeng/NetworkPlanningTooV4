@@ -1,18 +1,27 @@
 /** 协作沟通全局入口：网页端悬浮图标（与「下载应用」同款）+ 懒加载窗口；桌面端入口在标题栏。 */
-import { Suspense, lazy, useEffect, useRef, useState } from 'react'
+import { Suspense, lazy, useCallback, useEffect, useRef, useState } from 'react'
 import type { PointerEvent as ReactPointerEvent } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Loader2, MessageSquare } from 'lucide-react'
 
 import { desktopLoginApi } from '../../services/api'
+import {
+  IM_CLOUD_WS_ACTIVE_EVENT, IM_CLOUD_WS_FALLBACK_EVENT, imCloudWebSocket,
+} from '../../services/imCloudWebSocket'
 import { useAuthStore } from '../../store/authStore'
 import { attachImEvents, useImStore } from '../../store/imStore'
 import { useToastStore } from '../../store/toastStore'
 import { playImMentionSound } from '../../utils/messageSound'
 import { ImScreenshotDialog } from './ImScreenshotDialog'
+import { ImScreenshotSettingsDialog } from './ImScreenshotSettingsDialog'
 import {
-  fireScreenshotHotkey, SCREENSHOT_HOTKEY_EVENT, SCREENSHOT_OPEN_EVENT,
+  CAPTURE_FLAG, clearCaptureFlags, fireScreenshotHotkey, HOTKEY_RECORDING_FLAG,
+  prepareScreenshotDom, SCREENSHOT_HOTKEY_EVENT, SCREENSHOT_OPEN_EVENT,
+  SCREENSHOT_SETTINGS_EVENT, waitForStableFrames,
 } from './screenshotBus'
+import {
+  getScreenshotSettings, matchesScreenshotHotkey, refreshScreenshotSettings,
+} from './screenshotSettings'
 
 const ImWindow = lazy(() => import('./ImWindow').then(module => ({ default: module.ImWindow })))
 
@@ -67,7 +76,14 @@ export function ImHost() {
   const lastNoticeKeyRef = useRef<number | null>(null)
   const [hint, setHint] = useState('')
   const [screenshotOpen, setScreenshotOpen] = useState(false)
+  const [screenshotBlob, setScreenshotBlob] = useState<Blob | null>(null)
+  const [desktopCapture, setDesktopCapture] = useState(false)
+  const [settingsOpen, setSettingsOpen] = useState(false)
   const queueScreenshot = useImStore(s => s.queueScreenshot)
+  // 壳层取景会话：基线序号 + 轮询定时器；gen 用于丢弃上一轮遗留的轮询回调
+  const captureRef = useRef<{ seq: number; timer: number | null } | null>(null)
+  const captureGenRef = useRef(0)
+  const hideImRef = useRef(false)
 
   // 仅明确为单机模式时隐藏；探测阶段（null）保持可用，避免桌面共享模式误伤
   const standalone = desktopMode && desktopRunMode === 'standalone'
@@ -118,32 +134,184 @@ export function ImHost() {
     return () => window.removeEventListener('resize', onResize)
   }, [])
 
-  // 截图快捷键 Alt+Z：应用级监听，只要应用在运行（不必打开协作沟通窗口 / 会话）即可唤起。
-  // 桌面壳另注册了 Win32 全局热键，窗口不在前台时通过下方轮询投递同一事件。
-  useEffect(() => {
-    const trigger = () => {
-      if (!user) return
-      useImStore.getState().setOpen(true)
+  /** 结束一轮取景：停轮询、无条件恢复所有浮层、让上一轮遗留回调全部失效 */
+  const stopCapture = useCallback(() => {
+    captureGenRef.current += 1
+    const capture = captureRef.current
+    if (capture && capture.timer !== null) window.clearTimeout(capture.timer)
+    captureRef.current = null
+    clearCaptureFlags()
+    hideImRef.current = false
+  }, [])
+
+  const closeScreenshot = useCallback(() => {
+    if (captureRef.current) {
+      // 用户提前关窗：中止仍在进行中的壳层蒙层，避免置顶窗口残留
+      void desktopLoginApi.screenshotCancel().catch(() => { /* 会话已结束 */ })
+    }
+    stopCapture()
+    setScreenshotOpen(false)
+    setScreenshotBlob(null)
+    setDesktopCapture(false)
+  }, [stopCapture])
+
+  /** 壳层未注入 / 非 Windows：完整退回网页端原有的共享窗口选择流程 */
+  const fallbackToWebCapture = useCallback(() => {
+    stopCapture()
+    setDesktopCapture(false)
+    setScreenshotBlob(null)
+    setScreenshotOpen(true)
+  }, [stopCapture])
+
+  const pollCaptureResult = useCallback((seq: number, gen: number) => {
+    const startedAt = Date.now()
+    const tick = async () => {
+      if (gen !== captureGenRef.current) return
+      if (Date.now() - startedAt > 60000) { closeScreenshot(); return }
+      try {
+        const response = await desktopLoginApi.screenshotResult(seq)
+        const data = response?.data
+        if (data?.ready) {
+          const blob = await desktopLoginApi.screenshotImage()
+          stopCapture()
+          if (blob) {
+            setDesktopCapture(true)
+            setScreenshotBlob(blob)
+            setScreenshotOpen(true)
+          } else closeScreenshot()
+          return
+        }
+        if (data?.cancelled) { closeScreenshot(); return }
+      } catch { /* 旧壳 / 网络抖动，等下一次轮询 */ }
+      const capture = captureRef.current
+      if (!capture || gen !== captureGenRef.current) return
+      capture.timer = window.setTimeout(() => { void tick() }, 400)
+    }
+    const capture = captureRef.current
+    if (capture) capture.timer = window.setTimeout(() => { void tick() }, 250)
+  }, [stopCapture, closeScreenshot])
+
+  /**
+   * 桌面端发起壳层取景：按「屏幕原样」抓取 —— 不主动打开会话窗口，只保证
+   * 当前屏幕上已存在的浮层（含已打开的会话窗口）能完整出现在冻结帧里。
+   * 抓屏前先做 DOM 稳定化并等两个渲染帧，壳层收到 frame_ready 才允许 ImageGrab。
+   */
+  const startDesktopCapture = useCallback(async () => {
+    const settings = getScreenshotSettings()
+    stopCapture()
+    setScreenshotBlob(null)
+    setScreenshotOpen(false)                       // 关掉 z-[10000] 的编辑页遮罩
+    prepareScreenshotDom(settings.hideImWindow)   // 收起下拉 / 清残留标记 / 按开关设隐藏
+    hideImRef.current = settings.hideImWindow
+    const gen = captureGenRef.current
+    await waitForStableFrames()
+    // 等待期间可能被重复触发或关闭：旧轮不得再发 POST，也不能误杀新一轮的标记
+    if (gen !== captureGenRef.current) return
+    // 遮罩或取景标记仍在说明 React 批处理比预期慢一帧，再等一轮再抓屏
+    if (document.body.hasAttribute(CAPTURE_FLAG)
+        || document.querySelector('[data-screenshot-overlay]')) {
+      await waitForStableFrames()
+      if (gen !== captureGenRef.current) return
+    }
+    try {
+      const response = await desktopLoginApi.screenshotCapture(settings.hideImWindow, true)
+      if (gen !== captureGenRef.current) return
+      const data = response?.data
+      if (!data?.started) {
+        if (data?.busy) {
+          // 已有蒙层在取景（重复触发）：复用当前序号继续等结果，别把这一轮截图丢掉
+          const pendingSeq = Number(data.seq || 0)
+          captureRef.current = { seq: pendingSeq, timer: null }
+          setDesktopCapture(true)
+          pollCaptureResult(pendingSeq, gen)
+          return
+        }
+        fallbackToWebCapture()            // 非 Windows 壳 / 旧版本：降级
+        return
+      }
+      const seq = Number(data.seq || 0)
+      captureRef.current = { seq, timer: null }
+      setDesktopCapture(true)
+      pollCaptureResult(seq, gen)
+    } catch {
+      if (gen === captureGenRef.current) fallbackToWebCapture()
+    }
+  }, [stopCapture, fallbackToWebCapture, pollCaptureResult])
+
+  /**
+   * 截图统一入口：桌面端走壳层取景，网页端保留 getDisplayMedia 窗口选择。
+   * 桌面端「不强行开窗」——保持屏幕原样，确认截图后才由 onConfirm 展开会话窗口。
+   */
+  const triggerScreenshot = useCallback(() => {
+    if (!user) return
+    if (useAuthStore.getState().desktopMode) {
+      void startDesktopCapture()
+    } else {
+      setDesktopCapture(false)
+      setScreenshotBlob(null)
       setScreenshotOpen(true)
     }
+  }, [user, startDesktopCapture])
+
+  // 应用级快捷键：组合键读共享配置（网页端与桌面端同一份），不必打开会话也能唤起。
+  // 桌面壳另注册了 Win32 全局热键，其它应用窗口 / 窗口后台时通过下方轮询投递同一事件。
+  useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      if (!event.altKey || event.ctrlKey || event.metaKey) return
-      if (event.code !== 'KeyZ' && event.key.toLowerCase() !== 'z') return
+      // 设置面板录制快捷键时让路：按下当前组合键不应直接开始截图
+      if (document.body.hasAttribute(HOTKEY_RECORDING_FLAG)) return
+      if (!matchesScreenshotHotkey(event, getScreenshotSettings())) return
       event.preventDefault()
       event.stopPropagation()
-      trigger()
+      triggerScreenshot()
     }
     window.addEventListener('keydown', onKeyDown, true)
-    window.addEventListener(SCREENSHOT_OPEN_EVENT, trigger)
-    window.addEventListener(SCREENSHOT_HOTKEY_EVENT, trigger)
+    window.addEventListener(SCREENSHOT_OPEN_EVENT, triggerScreenshot)
+    window.addEventListener(SCREENSHOT_HOTKEY_EVENT, triggerScreenshot)
     return () => {
       window.removeEventListener('keydown', onKeyDown, true)
-      window.removeEventListener(SCREENSHOT_OPEN_EVENT, trigger)
-      window.removeEventListener(SCREENSHOT_HOTKEY_EVENT, trigger)
+      window.removeEventListener(SCREENSHOT_OPEN_EVENT, triggerScreenshot)
+      window.removeEventListener(SCREENSHOT_HOTKEY_EVENT, triggerScreenshot)
     }
-  }, [user])
+  }, [triggerScreenshot])
 
-  // 桌面壳 RegisterHotKey(Alt+Z) 的序号增量；400ms 轮询，窗口最小化 / 后台也能触发
+  // 桌面端从壳层拉权威配置（快捷键可能被设置面板改过）；网页端沿用 localStorage
+  useEffect(() => { void refreshScreenshotSettings(Boolean(desktopMode)) }, [desktopMode])
+
+  useEffect(() => {
+    const onOpenSettings = () => setSettingsOpen(true)
+    window.addEventListener(SCREENSHOT_SETTINGS_EVENT, onOpenSettings)
+    return () => window.removeEventListener(SCREENSHOT_SETTINGS_EVENT, onOpenSettings)
+  }, [])
+
+  // 组件卸载兜底：停轮询并无条件恢复所有浮层
+  useEffect(() => () => {
+    const capture = captureRef.current
+    if (capture && capture.timer !== null) window.clearTimeout(capture.timer)
+    captureRef.current = null
+    clearCaptureFlags()
+  }, [])
+
+  /**
+   * 桌面共享模式直连云端 WS 接收 im_message 轻通知：鉴权成功后停掉 1.5s relay 轮询，
+   * 旧服务端 / 许可失效 / Tunnel 抖动则自动恢复轮询。单机模式与网页端不启用。
+   * 监听必须先于 start() 注册：配置不可用时客户端会同步派发 fallback 事件。
+   */
+  useEffect(() => {
+    if (!user || !desktopMode || standalone) return
+    const onActive = () => useImStore.getState().stopPolling()
+    const onFallback = () => useImStore.getState().startPolling(1500, true)
+    window.addEventListener(IM_CLOUD_WS_ACTIVE_EVENT, onActive)
+    window.addEventListener(IM_CLOUD_WS_FALLBACK_EVENT, onFallback)
+    void imCloudWebSocket.start()
+    return () => {
+      window.removeEventListener(IM_CLOUD_WS_ACTIVE_EVENT, onActive)
+      window.removeEventListener(IM_CLOUD_WS_FALLBACK_EVENT, onFallback)
+      imCloudWebSocket.stop()
+    }
+  }, [user, desktopMode, standalone])
+
+  // 桌面壳 Win32 全局热键（组合键可配置）的序号增量；400ms 轮询，
+  // 窗口最小化 / 在其它应用窗口时也能触发截图 —— 只要应用进程不关闭就始终生效
   useEffect(() => {
     if (!desktopMode) return
     let baseline: number | null = null
@@ -248,15 +416,25 @@ export function ImHost() {
         </Suspense>
       )}
 
-      {/* 截图弹窗挂在应用级：Alt+Z 在未打开协作沟通窗口 / 无激活会话时同样可用。
+      {/* 截图弹窗挂在应用级：快捷键在未打开协作沟通窗口 / 无激活会话时同样可用。
+          桌面端用壳层裁剪出的 PNG 直接进编辑页（不弹共享窗口选择器），
           确认后 File 进 imStore 队列，由当前会话的 ImComposer 自动加载为待发送附件。 */}
       <ImScreenshotDialog
         open={screenshotOpen}
-        onClose={() => setScreenshotOpen(false)}
+        onClose={closeScreenshot}
         onConfirm={file => {
           queueScreenshot(file)
           useImStore.getState().setOpen(true)
         }}
+        initialBlob={screenshotBlob}
+        onInitialConsumed={() => setScreenshotBlob(null)}
+        captureMode={desktopCapture ? 'desktop' : 'web'}
+        onRecapture={() => { void startDesktopCapture() }}
+      />
+      <ImScreenshotSettingsDialog
+        open={settingsOpen}
+        onClose={() => setSettingsOpen(false)}
+        desktopMode={Boolean(desktopMode)}
       />
     </>
   )

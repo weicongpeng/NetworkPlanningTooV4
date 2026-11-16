@@ -278,3 +278,59 @@ def test_unknown_window_action_still_rejected():
 
     with pytest.raises(ValueError):
         handler("shuffle", {})
+
+
+def _patch_foreground(monkeypatch, launcher, minimized: bool):
+    """让 _restore_foreground 的 Win32 调用真正执行，并记录 ShowWindow 命令。"""
+    shown: list = []
+
+    def _show(_hwnd, command):
+        shown.append(command)
+        return True
+
+    def _is_iconic(_hwnd):
+        return minimized
+
+    user32 = SimpleNamespace(
+        ShowWindow=_show,
+        IsIconic=_is_iconic,
+        SetForegroundWindow=lambda _hwnd: True,
+        BringWindowToTop=lambda _hwnd: True,
+        SetWindowPos=lambda *_args: True,
+    )
+    fake_ctypes = SimpleNamespace(
+        c_void_p=lambda value=None: value,
+        c_int=int, c_bool=bool, c_uint=int,
+        WinDLL=lambda *_args, **_kwargs: user32,
+    )
+    monkeypatch.setattr(launcher, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(launcher, "ctypes", fake_ctypes)
+    # 去掉 UI 线程派发这层，直接跑 Win32 调用
+    monkeypatch.setattr(
+        launcher, "_run_window_loop", lambda _win, perform, _name: perform()
+    )
+    return shown
+
+
+def _native_window():
+    return SimpleNamespace(
+        native=SimpleNamespace(Handle=SimpleNamespace(ToInt64=lambda: 123))
+    )
+
+
+def test_activate_does_not_restore_maximized_window(monkeypatch):
+    """截图回焦不能把最大化窗口还原成小窗（用户报的「截图完窗口自动变小」）。"""
+    launcher = _load_launcher()
+    shown = _patch_foreground(monkeypatch, launcher, minimized=False)
+
+    assert launcher._restore_foreground(_native_window()) is True
+    assert shown == []  # 没有 SW_RESTORE，位置尺寸完全不动
+
+
+def test_activate_restores_minimized_window(monkeypatch):
+    """只有最小化窗口才需要 SW_RESTORE，否则用户从其它应用切回来看到的是任务栏。"""
+    launcher = _load_launcher()
+    shown = _patch_foreground(monkeypatch, launcher, minimized=True)
+
+    assert launcher._restore_foreground(_native_window()) is True
+    assert shown == [launcher.SW_RESTORE]
