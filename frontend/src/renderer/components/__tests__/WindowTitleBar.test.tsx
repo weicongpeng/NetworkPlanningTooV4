@@ -39,7 +39,8 @@ describe('WindowTitleBar', () => {
     vi.mocked(desktopLoginApi.windowControl).mockResolvedValue({ success: true, data: {} } as any)
     vi.mocked(desktopLoginApi.windowState).mockResolvedValue({
       success: true,
-      data: { maximized: true, fullscreen: false },
+      // 桌面以普通窗口启动（最大化窗口没有系统投影/圆角）
+      data: { maximized: false, fullscreen: false },
     } as any)
     // 下载弹窗打开即加载版本信息：桌面端取服务器最新 APK 版本
     vi.mocked(desktopCloudApi.appVersion).mockResolvedValue({ success: false } as any)
@@ -64,7 +65,8 @@ describe('WindowTitleBar', () => {
     const download = screen.getByTitle(i18n.t('app.downloadTitle'))
     expect(im.nextElementSibling).toBe(download) // 项目沟通紧挨下载应用左侧
     expect(screen.getByTitle(i18n.t('titleBar.minimize'))).toBeTruthy()
-    expect(screen.getByTitle(i18n.t('titleBar.restore'))).toBeTruthy()
+    // 普通窗口启动 → 显示「最大化」而不是「还原」
+    expect(screen.getByTitle(i18n.t('titleBar.maximize'))).toBeTruthy()
     expect(screen.getByTitle(i18n.t('titleBar.close'))).toBeTruthy()
 
     const imSvg = im.querySelector('svg')
@@ -108,12 +110,12 @@ describe('WindowTitleBar', () => {
     fireEvent.click(screen.getByTitle(i18n.t('titleBar.minimize')))
     await waitFor(() => expect(desktopLoginApi.windowControl).toHaveBeenCalledWith('minimize'))
 
-    // 还原：壳层返回 maximized=false → 按钮 title 切换为「最大化」
+    // 普通窗口点「最大化」：先乐观翻转图标，再按壳层响应校准回权威状态
     vi.mocked(desktopLoginApi.windowControl).mockResolvedValueOnce({
       success: true,
       data: { maximized: false },
     } as any)
-    fireEvent.click(screen.getByTitle(i18n.t('titleBar.restore')))
+    fireEvent.click(screen.getByTitle(i18n.t('titleBar.maximize')))
     expect(await screen.findByTitle(i18n.t('titleBar.maximize'))).toBeTruthy()
 
     // 关闭
@@ -148,9 +150,13 @@ describe('WindowTitleBar', () => {
 
   it('最大化时隐藏缩放热区', async () => {
     useAuthStore.setState({ desktopMode: true })
+    vi.mocked(desktopLoginApi.windowState).mockResolvedValue({
+      success: true,
+      data: { maximized: true, fullscreen: false },
+    } as any)
     const { container } = render(<WindowTitleBar />)
-    await waitFor(() => expect(desktopLoginApi.windowState).toHaveBeenCalled())
-    expect(container.querySelector('[data-resize-dir]')).toBeNull()
+    // 初始按普通窗口渲染，等壳层状态校准完成后热区才收起
+    await waitFor(() => expect(container.querySelector('[data-resize-dir]')).toBeNull())
   })
 
   it('单击标题区不触发拖窗（最大化窗口不得因单击被还原）', async () => {

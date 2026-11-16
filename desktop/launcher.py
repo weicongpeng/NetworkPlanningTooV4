@@ -17,6 +17,7 @@ import json
 import logging
 import multiprocessing
 import os
+import queue
 import socket
 import sys
 import threading
@@ -405,6 +406,31 @@ RESIZE_HIT_TESTS = {
     "sw": HTBOTTOMLEFT,
     "se": HTBOTTOMRIGHT,
 }
+# DWM 窗口外观：Win11 圆角偏好属性（DWMWA_WINDOW_CORNER_PREFERENCE = 33）
+DWMWA_WINDOW_CORNER_PREFERENCE = 33
+DWMWCP_ROUND = 2
+
+
+class _DwmMargins(ctypes.Structure):
+    """DwmExtendFrameIntoClientArea 的四边扩展量。"""
+
+    _fields_ = [
+        ("cxLeftWidth", ctypes.c_int),
+        ("cxRightWidth", ctypes.c_int),
+        ("cyTopHeight", ctypes.c_int),
+        ("cyBottomHeight", ctypes.c_int),
+    ]
+
+
+class _WindowRect(ctypes.Structure):
+    """GetWindowRect 的窗口矩形。"""
+
+    _fields_ = [
+        ("left", ctypes.c_long), ("top", ctypes.c_long),
+        ("right", ctypes.c_long), ("bottom", ctypes.c_long),
+    ]
+
+
 # 持有子类化后的窗口过程引用：ctypes 回调对象被 GC 之后再收到窗口消息会直接崩溃
 _wndproc_refs: list = []
 # 已装钩子的窗口句柄：全屏切换会让 WinForms 重建句柄，需要在新句柄上重装
@@ -507,6 +533,137 @@ def _install_client_area_wndproc(window: Any) -> None:
         _log.info("已子类化窗口过程：客户区铺满整窗（去掉 WS_THICKFRAME 的原生边框）")
     except Exception as exc:  # noqa: BLE001
         _log.warning("子类化窗口过程失败（无边框窗口会露出一圈原生边框）：%s", exc)
+
+
+def _nudge_window_rect(window: Any) -> None:
+    """让 DWM 立刻按新样式重合成一次：窗口矩形 +1px 再还原。
+
+    pywebview 先用 ``FormBorderStyle.None`` 建窗，DWM 在**建窗那一刻**就缓存了
+    「无边框 → 不画投影、直角」的合成结论；之后我们在 shown 事件里补 WS_THICKFRAME、
+    子类化 WM_NCCALCSIZE（客户区=整窗）并不会让它重新判定。只有窗口矩形真的变化
+    （移动 / 还原）才触发一次重新合成 —— 这就是用户报的「刚打开没有阴影、不是圆角，
+    拖动一下马上恢复正常」。这里在启动时主动做一次不可见的尺寸抖动替代用户拖窗。
+
+    最大化窗口不画投影（Windows 原生行为），也不做尺寸抖动，避免把最大化状态改掉。
+    """
+    native = getattr(window, "native", None)
+    handle = getattr(native, "Handle", None) if native is not None else None
+    if os.name != "nt" or handle is None:
+        return
+    try:
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        hwnd = int(handle.ToInt64() if hasattr(handle, "ToInt64") else handle)
+        hwnd_ptr = ctypes.c_void_p(hwnd)
+        user32.IsZoomed.argtypes = [ctypes.c_void_p]
+        user32.IsZoomed.restype = ctypes.c_bool
+        if user32.IsZoomed(hwnd_ptr):
+            return
+        user32.GetWindowRect.argtypes = [ctypes.c_void_p, ctypes.POINTER(_WindowRect)]
+        user32.GetWindowRect.restype = ctypes.c_bool
+        user32.SetWindowPos.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint,
+        ]
+        user32.SetWindowPos.restype = ctypes.c_bool
+        rect = _WindowRect()
+        if not user32.GetWindowRect(hwnd_ptr, ctypes.byref(rect)):
+            return
+        width = rect.right - rect.left
+        height = rect.bottom - rect.top
+        if width <= 0 or height <= 0:
+            return
+        flags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED
+        user32.SetWindowPos(hwnd_ptr, None, rect.left, rect.top, width + 1, height, flags)
+        user32.SetWindowPos(hwnd_ptr, None, rect.left, rect.top, width, height, flags)
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("强制 DWM 重合成失败（窗口外观可能要拖动一次才正常）：%s", exc)
+
+
+def _apply_window_frame_appearance(window: Any) -> None:
+    """补齐无边框窗口的系统投影与 Win11 圆角（不必等用户拖一下窗口）。
+
+    - ``DwmExtendFrameIntoClientArea`` 扩 1px 玻璃边框进客户区：我们的窗口过程对
+      ``WM_NCCALCSIZE`` 返回 0（客户区铺满整窗），DWM 默认就此判定没有边框可投影；
+      显式扩展一次才会给窗口画上和其它软件一样的系统阴影。
+    - ``DwmSetWindowAttribute(DWMWA_WINDOW_CORNER_PREFERENCE, ROUND)``：Win11 对
+      FormBorderStyle.None 的窗口默认不倒角，显式指定圆角；Win10 没有该属性，
+      调用失败只记日志，不影响其它窗口功能。
+    - 最后强制一次重合成（见 ``_nudge_window_rect``），让上述属性在首帧就生效。
+    """
+    native = getattr(window, "native", None)
+    handle = getattr(native, "Handle", None) if native is not None else None
+    if os.name != "nt" or handle is None:
+        return
+    try:
+        dwmapi = ctypes.WinDLL("dwmapi")
+        hwnd = ctypes.c_void_p(int(handle.ToInt64() if hasattr(handle, "ToInt64") else handle))
+        margins = _DwmMargins(1, 1, 1, 1)
+        dwmapi.DwmExtendFrameIntoClientArea.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(_DwmMargins),
+        ]
+        dwmapi.DwmExtendFrameIntoClientArea.restype = ctypes.c_long
+        dwmapi.DwmExtendFrameIntoClientArea(hwnd, ctypes.byref(margins))
+
+        preference = ctypes.c_int(DWMWCP_ROUND)
+        dwmapi.DwmSetWindowAttribute.argtypes = [
+            ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_int,
+        ]
+        dwmapi.DwmSetWindowAttribute.restype = ctypes.c_long
+        dwmapi.DwmSetWindowAttribute(
+            hwnd, DWMWA_WINDOW_CORNER_PREFERENCE,
+            ctypes.byref(preference), ctypes.sizeof(preference),
+        )
+        _nudge_window_rect(window)
+        _log.info("已补齐无边框窗口的 DWM 投影与圆角")
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("设置窗口投影/圆角失败（不影响窗口功能）：%s", exc)
+
+
+def _apply_window_frame(window: Any) -> None:
+    """窗口显示后 / 全屏切换重建句柄后，重刷样式位、窗口过程与 DWM 外观。
+
+    顺序要紧：先补 WS_THICKFRAME 等样式位，再子类化窗口过程吃掉多出来的原生边框，
+    最后显式让 DWM 按最终样式重画投影与圆角（否则要等用户拖一下窗口才正常）。
+    """
+    _enable_taskbar_minimize(window)
+    _install_client_area_wndproc(window)
+    _apply_window_frame_appearance(window)
+
+
+# 窗口动作串行队列：minimize / maximize / restore / destroy 内部会同步 Invoke 到
+# WinForms GUI 线程，绝不能在 uvicorn 事件循环线程里等它。用单 worker 保证动作按点击顺序执行。
+_window_action_queue: Optional["queue.Queue"] = None
+_window_action_lock = threading.Lock()
+
+
+def _window_action_worker() -> None:
+    while True:
+        perform, name = _window_action_queue.get()  # type: ignore[union-attr]
+        try:
+            perform()
+        except Exception:  # noqa: BLE001
+            _log.exception("窗口动作执行失败（%s）", name)
+        finally:
+            _window_action_queue.task_done()  # type: ignore[union-attr]
+
+
+def _dispatch_window_action(perform: Callable[[], None], name: str = "npt-window-action") -> None:
+    """把会阻塞的原生窗口动作丢进独立线程串行执行，HTTP 请求 / 事件循环立即返回。
+
+    用户报的「打开项目沟通后再点最小化/最大化没反应，几十秒后才生效」有两层原因：
+    IM 高频轮询把请求排在后面，而``window.minimize()/maximize()``本身又是 pywebview
+    内部的 ``Control.Invoke``（从 uvicorn 线程同步等 GUI 线程）——一旦排队或 GUI 线程忙，
+    整个 asyncio 事件循环跟着冻结。与 drag / resize-edge 一样解耦到独立线程后，
+    窗口动作只排队、不占用事件循环，请求立即应答。
+    """
+    global _window_action_queue
+    with _window_action_lock:
+        if _window_action_queue is None:
+            _window_action_queue = queue.Queue()
+            threading.Thread(
+                target=_window_action_worker, name="npt-window-actions", daemon=True
+            ).start()
+    _window_action_queue.put((perform, name))
 
 
 def _run_window_loop(window: Any, perform: Callable[[], None], thread_name: str) -> None:
@@ -696,27 +853,33 @@ def _make_fullscreen_handler(window: Any, state: Optional[dict] = None) -> Calla
     """
     if state is None:
         state = {"fullscreen": False}
+    # 记住进入全屏前的最大化状态：普通窗口启动后退出全屏不该被强行最大化，
+    # 否则自绘标题栏刚修好的圆角/阴影又没了（最大化窗口本来就不画投影/圆角）。
+    was_maximized = {"value": bool(state.get("maximized", False))}
 
     def _handler(fullscreen: bool) -> None:
         fullscreen = bool(fullscreen)
         if fullscreen == state.get("fullscreen", False):
             return
         if fullscreen:
+            was_maximized["value"] = bool(state.get("maximized", False))
             # 真全屏要盖住任务栏：先清掉工作区限制，否则最大化会被收口到任务栏之上
             _limit_maximized_to_work_area(window, False)
         window.toggle_fullscreen()
         # 全屏切换重设了 FormBorderStyle，样式位可能被 CreateParams 覆盖回去 → 再补一次；
-        # WinForms 还可能重建窗口句柄（旧句柄上的窗口过程钩子随之失效），按新句柄重装
-        _enable_taskbar_minimize(window)
-        _install_client_area_wndproc(window)
+        # WinForms 还可能重建窗口句柄（旧句柄上的窗口过程钩子随之失效），按新句柄重装，
+        # 并按最终样式重画 DWM 投影/圆角
+        _apply_window_frame(window)
         state["fullscreen"] = fullscreen
         if not fullscreen:
-            _limit_maximized_to_work_area(window, True)
-            window.maximize()
+            if was_maximized["value"]:
+                _limit_maximized_to_work_area(window, True)
+                window.maximize()
+            else:
+                _limit_maximized_to_work_area(window, False)
             # 与窗口控制共享 state 时同步缓存：不等 on_resize（GUI 线程时序），
-            # 否则标题栏按钮可能短暂显示"最大化"图标而窗口已最大化
-            if "maximized" in state:
-                state["maximized"] = True
+            # 否则标题栏按钮可能短暂显示错误图标
+            state["maximized"] = was_maximized["value"]
 
     return _handler
 
@@ -807,25 +970,36 @@ def _make_window_control_handler(window: Any, state: dict) -> Callable[[str, dic
                 "fullscreen": bool(state.get("fullscreen", False)),
             }
         if action == "minimize":
-            window.minimize()
+            # pywebview 的 minimize() 会同步 Invoke 到 GUI 线程；放独立线程执行，
+            # 不让事件循环等它（IM 浮窗打开后这一等就是几十秒）。
+            _dispatch_window_action(window.minimize, "npt-window-minimize")
             return {"maximized": bool(state.get("maximized", False))}
         if action == "toggle-maximize":
-            if state.get("maximized", False):
-                window.restore()
-                _limit_maximized_to_work_area(window, False)
-                state["maximized"] = False
-            else:
-                _limit_maximized_to_work_area(window, True)
-                window.maximize()
-                state["maximized"] = True
-            return {"maximized": state["maximized"]}
+            target = not state.get("maximized", False)
+
+            def _toggle() -> None:
+                if target:
+                    _limit_maximized_to_work_area(window, True)
+                    window.maximize()
+                else:
+                    window.restore()
+                    _limit_maximized_to_work_area(window, False)
+
+            _dispatch_window_action(_toggle, "npt-window-toggle-maximize")
+            # 乐观更新：响应立即带回目标状态，events.maximized/restored 再兜底校准
+            state["maximized"] = target
+            return {"maximized": target}
         if action == "close":
             _log.info("收到窗口关闭请求（标题栏关闭按钮）")
-            try:
-                window.destroy()
-            except Exception:  # noqa: BLE001
-                _log.exception("关闭窗口失败，2 秒后强制结束进程")
-                _force_exit_after(2)
+
+            def _close() -> None:
+                try:
+                    window.destroy()
+                except Exception:  # noqa: BLE001
+                    _log.exception("关闭窗口失败，2 秒后强制结束进程")
+                    _force_exit_after(2)
+
+            _dispatch_window_action(_close, "npt-window-close")
             return {}
         if action == "drag":
             # 系统移动循环会阻塞到用户松开鼠标 → 与 HTTP 请求解耦，立即返回
@@ -1163,7 +1337,10 @@ def _create_window() -> Any:
         width=width,
         height=height,
         min_size=min_size,
-        maximized=True,  # 启动即最大化（表格/地图列多，窗口越大越好用）
+        # 以普通窗口启动（窗口尺寸已按屏幕 92% 适配）：最大化窗口在 Windows 上本来
+        # 就没有系统投影和 Win11 圆角，用户看到的「刚打开样式不正常、拖一下才恢复」
+        # 正是启动了最大化态；普通窗口配合 _apply_window_frame 首帧就有阴影与圆角。
+        maximized=False,
         # pywebview 默认 text_select=False 会注入 CSS 全局禁用文本选择，网页端能复制的
         # 文字在桌面端选不中；打开后与浏览器行为一致
         text_select=True,
@@ -1174,13 +1351,12 @@ def _create_window() -> Any:
         easy_drag=False,
     )
     # 窗口状态缓存：最大化/还原事件 + 全屏回调共同维护，供自绘标题栏查询
-    win_state: dict = {"fullscreen": False, "maximized": True}
+    win_state: dict = {"fullscreen": False, "maximized": False}
     # 无边框窗口补最小化/最大化样式位：必须在窗体真正显示后再做（webview.start 的 func
     # 线程早于 create_window，这时 window.native 还没就绪，直调会静默跳过）
     def _on_shown(*_args: Any) -> None:
-        # 顺序要紧：先补样式位（含 WS_THICKFRAME），再子类化窗口过程把多出来的边框吃掉
-        _enable_taskbar_minimize(window)
-        _install_client_area_wndproc(window)
+        # 补样式位 → 子类化窗口过程吃掉原生边框 → 让 DWM 首帧就画投影/圆角
+        _apply_window_frame(window)
 
     try:
         window.events.shown += _on_shown

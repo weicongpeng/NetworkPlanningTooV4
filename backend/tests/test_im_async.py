@@ -96,6 +96,26 @@ def test_forward_fails_fast_on_timeout(monkeypatch):
     assert exc.value.status_code == 502
 
 
+def test_forward_fails_fast_when_relay_slots_exhausted(monkeypatch):
+    """慢 relay 不能无限堆积：名额占满时立刻 503，把连接/线程留给窗口控制请求。
+
+    桌面共享模式 1.5s 轮询 + 12s×2 慢 relay 曾把线程池与 WebView2 6 条连接打满，
+    用户表现为「打开项目沟通后点最小化/最大化几十秒没反应」。
+    """
+    import threading
+
+    from app.services import im_desktop_proxy as proxy
+
+    monkeypatch.setattr(proxy, "_relay_slots", threading.BoundedSemaphore(1))
+    assert proxy._relay_slots.acquire(blocking=False)
+    try:
+        with pytest.raises(HTTPException) as exc:
+            proxy.forward("list_conversations", {})
+        assert exc.value.status_code == 503
+    finally:
+        proxy._relay_slots.release()
+
+
 def test_forward_maps_client_errors_without_retry(monkeypatch):
     from app.services import im_desktop_proxy as proxy
 

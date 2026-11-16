@@ -168,11 +168,20 @@ export function useImWindowGeometry(userId: number | null, topOffset: number) {
       target.removeEventListener('pointermove', onMove)
       target.removeEventListener('pointerup', onUp)
       target.removeEventListener('pointercancel', onUp)
+      target.removeEventListener('lostpointercapture', onUp)
+      // 指针捕获不释放会让 WebView2 一直占着鼠标消息（窗口最小化/失焦时尤其明显），
+      // 连带拖慢壳层窗口动作的 GUI 线程响应；这里顺手归还。
+      try {
+        if (target.hasPointerCapture?.(event.pointerId)) {
+          target.releasePointerCapture(event.pointerId)
+        }
+      } catch { /* 捕获已自然释放 */ }
       commit(latest)
     }
     target.addEventListener('pointermove', onMove)
     target.addEventListener('pointerup', onUp)
     target.addEventListener('pointercancel', onUp)
+    target.addEventListener('lostpointercapture', onUp)
   }, [commit, maximized])
 
   const startResize = useCallback((event: ReactPointerEvent<HTMLElement>, dir: ResizeDir) => {
@@ -202,11 +211,20 @@ export function useImWindowGeometry(userId: number | null, topOffset: number) {
       target.removeEventListener('pointermove', onMove)
       target.removeEventListener('pointerup', onUp)
       target.removeEventListener('pointercancel', onUp)
+      target.removeEventListener('lostpointercapture', onUp)
+      // 指针捕获不释放会让 WebView2 一直占着鼠标消息（窗口最小化/失焦时尤其明显），
+      // 连带拖慢壳层窗口动作的 GUI 线程响应；这里顺手归还。
+      try {
+        if (target.hasPointerCapture?.(event.pointerId)) {
+          target.releasePointerCapture(event.pointerId)
+        }
+      } catch { /* 捕获已自然释放 */ }
       commit(latest)
     }
     target.addEventListener('pointermove', onMove)
     target.addEventListener('pointerup', onUp)
     target.addEventListener('pointercancel', onUp)
+    target.addEventListener('lostpointercapture', onUp)
   }, [commit, maximized])
 
   const toggleMaximize = useCallback(() => {

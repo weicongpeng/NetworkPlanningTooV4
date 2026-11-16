@@ -4,7 +4,7 @@ WebView2 里的 HTML Fullscreen API 只会让网页内容占满 WebView 自身�
 不变，所以桌面形态必须由壳层切换窗口全屏：前端 POST /desktop/fullscreen →
 desktop_bridge.set_window_fullscreen() → launcher._make_fullscreen_handler(window)。
 
-本文件覆盖壳层处理器语义（幂等 / 退出后回到最大化）与桥接的无回调行为；
+本文件覆盖壳层处理器语义（幂等 / 退出后按进入前的窗口状态还原）与桥接的无回调行为；
 端点转发见 tests/test_desktop_local_endpoints.py。
 """
 from __future__ import annotations
@@ -40,7 +40,9 @@ class _FakeWindow:
 def test_fullscreen_handler_enters_and_leaves_window_fullscreen():
     launcher = _load_launcher()
     window = _FakeWindow()
-    handler = launcher._make_fullscreen_handler(window)
+    handler = launcher._make_fullscreen_handler(
+        window, {"fullscreen": False, "maximized": True}
+    )
 
     handler(True)
     assert window.toggles == 1  # 进入全屏
@@ -48,8 +50,7 @@ def test_fullscreen_handler_enters_and_leaves_window_fullscreen():
 
     handler(False)
     assert window.toggles == 2  # 退出全屏
-    # 退出后补一次最大化：pywebview 的退出分支会把窗口置为 Normal + 进入前的尺寸，
-    # 不补 maximize 就回不到启动时的最大化窗口
+    # 从最大化窗口进入的：pywebview 退出分支会把窗口置为 Normal，补 maximize 才回得去
     assert window.maximizes == 1
 
 
@@ -57,7 +58,9 @@ def test_fullscreen_handler_is_idempotent():
     """pywebview 只有 toggle_fullscreen()、没有状态查询，重复请求同一状态不能来回翻转。"""
     launcher = _load_launcher()
     window = _FakeWindow()
-    handler = launcher._make_fullscreen_handler(window)
+    handler = launcher._make_fullscreen_handler(
+        window, {"fullscreen": False, "maximized": True}
+    )
 
     handler(True)
     handler(True)
@@ -80,11 +83,34 @@ def test_fullscreen_clears_and_restores_work_area_limit(monkeypatch):
         "_limit_maximized_to_work_area",
         lambda _window, enable: limited.append(enable),
     )
-    handler = launcher._make_fullscreen_handler(window)
+    handler = launcher._make_fullscreen_handler(
+        window, {"fullscreen": False, "maximized": True}
+    )
 
     handler(True)
     handler(False)
     assert limited == [False, True]
+
+
+def test_fullscreen_exit_keeps_normal_window(monkeypatch):
+    """以普通窗口启动后退出全屏不能被强行最大化：否则刚修好的投影/圆角又没了。"""
+    launcher = _load_launcher()
+    window = _FakeWindow()
+    limited: list[bool] = []
+    monkeypatch.setattr(
+        launcher, "_limit_maximized_to_work_area",
+        lambda _window, enable: limited.append(enable),
+    )
+    state = {"fullscreen": False, "maximized": False}
+    handler = launcher._make_fullscreen_handler(window, state)
+
+    handler(True)
+    handler(False)
+
+    assert window.toggles == 2
+    assert window.maximizes == 0
+    assert state["maximized"] is False
+    assert limited == [False, False]
 
 
 def test_bridge_without_shell_returns_false():

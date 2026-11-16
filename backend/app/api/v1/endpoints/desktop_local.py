@@ -13,6 +13,7 @@ from typing import Any, Dict, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import Response
+from fastapi.security import HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
@@ -20,7 +21,7 @@ from starlette.concurrency import run_in_threadpool
 from app.core.config import settings
 from app.services import desktop_screenshot_settings as screenshot_cfg
 from app.core.database import get_db
-from app.core.security import get_current_admin_user, get_current_user
+from app.core.security import get_current_admin_user, get_current_user, security_scheme
 from app.core.startup_gate import mark_login_completed
 from app.models.database import User
 from app.services import desktop_cloud_client as cloud
@@ -36,8 +37,35 @@ def _gbk_safe(message: str) -> str:
 
 
 def _require_desktop() -> None:
+    """桌面形态门禁（部分端点在函数体内直接调用，故保持同步）。"""
     if not settings.NPT_DESKTOP:
         raise HTTPException(status_code=404, detail="Not Found")
+
+
+async def _require_desktop_fast() -> None:
+    """交互快路径专用桌面门禁：async 依赖不占用 anyio 线程池 token。
+
+    同步依赖会被 Starlette 丢进线程池再申请一次 token；IM 慢 relay 把 40 个 token
+    占满时，连「最小化/最大化」和 400ms 截图热键轮询都会排队几十秒。
+    """
+    _require_desktop()
+
+
+async def _require_desktop_window_user(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security_scheme),
+) -> None:
+    """窗口控制/状态查询专用轻量鉴权：只校验本机 JWT 签名，不碰数据库。
+
+    ``get_current_user`` 依赖同步 generator ``get_db``，Starlette 会为它申请 anyio
+    线程池 token 并在请求结束时再申请一次。桌面共享模式打开「项目沟通」后，
+    IM 的 1.5s 无节流轮询叠加最多 12s×2 的慢 relay 会把默认 40 个 token 占满，
+    连依赖注入都排不上队 —— 用户看到的就是「点最小化/最大化几十秒没反应」。
+
+    窗口动作不读写任何业务数据，验签足够；其它桌面端点（截图热键、取景等）
+    本来就无鉴权，本机后端也只绑 127.0.0.1，这里不会降低实际防护。
+    """
+    if credentials is None or auth_service.decode_token(credentials.credentials) is None:
+        raise HTTPException(status_code=401, detail="请先登录")
 
 
 def _raise_cloud_error(exc: cloud.CloudError) -> None:
@@ -1548,8 +1576,8 @@ class WindowControlRequest(BaseModel):
 @router.post("/window-control")
 async def desktop_window_control(
     payload: WindowControlRequest,
-    current_user: User = Depends(get_current_user),
-    _: None = Depends(_require_desktop),
+    _: None = Depends(_require_desktop_fast),
+    __: None = Depends(_require_desktop_window_user),
 ) -> Dict[str, Any]:
     """frameless 窗口自绘标题栏的窗口动作：最小化/最大化还原/关闭/边缘缩放/回焦。
 
@@ -1557,6 +1585,9 @@ async def desktop_window_control(
     缩放把方向交给壳层，由系统原生缩放循环接管（四边四角都能拉）；activate 是截图
     共享其它应用窗口后把主窗口带回前台，非 Windows / 无原生句柄时返回 activated=False。
     非桌面壳（桥接未注入 / 动作执行失败）返回 403。
+
+    交互快路径：鉴权只验 JWT 签名（不占 anyio 线程池），壳层把原生窗口动作派发到
+    独立线程（不冻结事件循环），因此 IM 轮询/relay 再忙也不会把按钮点按排队几十秒。
     """
     from app import desktop_bridge
 
@@ -1572,7 +1603,9 @@ async def desktop_window_control(
 
 
 @router.get("/screenshot-hotkey")
-async def desktop_screenshot_hotkey(_: None = Depends(_require_desktop)) -> Dict[str, Any]:
+async def desktop_screenshot_hotkey(
+    _: None = Depends(_require_desktop_fast),
+) -> Dict[str, Any]:
     """壳层 Win32 全局热键 Alt+Z 的序号（前端 400ms 轮询，增量即触发截图）。
 
     不做登录校验：登录页也能拿到基线序号，避免登录后立刻把历史序号误判成一次热键。
@@ -1584,8 +1617,8 @@ async def desktop_screenshot_hotkey(_: None = Depends(_require_desktop)) -> Dict
 
 @router.get("/window-state")
 async def desktop_window_state(
-    current_user: User = Depends(get_current_user),
-    _: None = Depends(_require_desktop),
+    _: None = Depends(_require_desktop_fast),
+    __: None = Depends(_require_desktop_window_user),
 ) -> Dict[str, Any]:
     """查询窗口状态缓存（maximized/fullscreen），供自绘标题栏在窗口聚焦时校准按钮图标。"""
     from app import desktop_bridge

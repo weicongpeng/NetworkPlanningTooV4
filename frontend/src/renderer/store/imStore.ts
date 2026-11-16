@@ -192,6 +192,12 @@ function clearActiveUnread(conversations: ImConversation[], activeId: number | n
 let pollTimer: number | null = null
 let refreshTimer: number | null = null
 let refreshQueued = false
+/**
+ * 一轮轮询是否还在途。桌面共享模式 1.5s 一个 tick，relay 慢的时候旧请求能挂 12~24s；
+ * 不去重会持续叠加在途请求，打满 WebView2 的 6 条 HTTP/1.1 连接与后端线程池，
+ * 标题栏「最小化/最大化」这种交互请求也被排到几十秒后（用户实测复现）。
+ */
+let pollInFlight = false
 /** 上次「红点/最新 id 与本地正文不一致」补洞时间 */
 let lastHoleFillAt = 0
 /** 头像只在首次会话列表加载时传输一次，之后轮询带 include_avatars=false */
@@ -849,19 +855,27 @@ export const useImStore = create<ImState>()(
         let ticks = 0
         // 通讯录/在线状态固定约 20s 校准一次，不随会话列表轮询变快而放大请求量
         const contactsEveryTicks = Math.max(4, Math.ceil(20000 / intervalMs))
+        /** 上一轮还没回来就跳过：在途请求最多一轮，连接始终留给窗口控制等交互请求 */
+        const runPoll = () => {
+          if (pollInFlight) return
+          const state = useImStore.getState()
+          const jobs: Promise<void>[] = [state.refreshConversations()]
+          ticks += 1
+          if (ticks % contactsEveryTicks === 0) jobs.push(state.refreshContacts())
+          // 窗口收起时只刷会话列表（未读 + 提示音），不补拉当前会话正文
+          if (state.open && state.activeConversationId !== null) {
+            jobs.push(state.loadMessages(state.activeConversationId, 'incremental'))
+          }
+          pollInFlight = true
+          Promise.allSettled(jobs).finally(() => { pollInFlight = false })
+        }
         pollTimer = window.setInterval(() => {
           // 网页端窗口隐藏时省请求；桌面共享模式没有服务端 WS 广播，隐藏/失焦也要继续刷未读，
           // 否则切出去再回来时标题栏「项目沟通」红点会一直停在旧值
           if (document.visibilityState !== 'visible' && !pollWhenClosed) return
           const state = useImStore.getState()
           if (!state.open && !pollWhenClosed) return
-          ticks += 1
-          void state.refreshConversations().catch(() => {})
-          if (ticks % contactsEveryTicks === 0) void state.refreshContacts().catch(() => {})
-          // 窗口收起时只刷会话列表（未读 + 提示音），不补拉当前会话正文
-          if (state.open && state.activeConversationId !== null) {
-            void state.loadMessages(state.activeConversationId, 'incremental')
-          }
+          runPoll()
         }, intervalMs)
 
         if (pollWhenClosed) {
@@ -873,11 +887,7 @@ export const useImStore = create<ImState>()(
             const now = Date.now()
             if (now - lastRefreshAt < 1000) return
             lastRefreshAt = now
-            const state = useImStore.getState()
-            void state.refreshConversations().catch(() => {})
-            if (state.open && state.activeConversationId !== null) {
-              void state.loadMessages(state.activeConversationId, 'incremental').catch(() => {})
-            }
+            runPoll()
           }
           pollFocusHandler = onVisible
           window.addEventListener('focus', onVisible)
@@ -894,6 +904,7 @@ export const useImStore = create<ImState>()(
           pollFocusHandler = null
         }
         refreshQueued = false
+        pollInFlight = false
       },
 
       resetForUserSwitch: () => {

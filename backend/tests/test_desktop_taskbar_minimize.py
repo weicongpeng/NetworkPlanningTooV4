@@ -132,3 +132,137 @@ def test_skips_off_windows(monkeypatch):
 
     assert fake_ctypes.windll_calls == 0
     assert user32.set_calls == []
+
+
+# ------------------------------------------------------ 启动首帧的投影 / 圆角
+#
+# frameless 窗口由 pywebview 以 FormBorderStyle.None 创建，DWM 在建窗时就缓存了
+# 「无边框 → 不画投影、直角」；我们随后补 WS_THICKFRAME / 子类化 WM_NCCALCSIZE
+# 不会触发它重新判定，只有窗口矩形真变化（用户拖一下）才恢复。下面锁定修复：
+# 启动时显式设置 DWM 属性并强制重合成一次。
+
+class _FakeCtypesForDwm:
+    """两个 DWM 辅助函数用到的 ctypes 子集（byref 直接回传对象便于断言）。"""
+
+    c_void_p = staticmethod(lambda value=None: value)
+    c_int = int
+    c_long = int
+    c_bool = bool
+    c_uint = int
+    POINTER = staticmethod(lambda cls: cls)
+    byref = staticmethod(lambda obj: obj)
+    sizeof = staticmethod(lambda _obj: 4)
+
+    def __init__(self, dwmapi=None, user32=None):
+        self._dwmapi = dwmapi
+        self._user32 = user32
+        self.calls: list[str] = []
+
+    def WinDLL(self, name, *args, **kwargs):
+        self.calls.append(name)
+        return self._user32 if name == "user32" else self._dwmapi
+
+
+class _FakeDwmApi:
+    def __init__(self):
+        self.margins = None
+        self.attributes = []
+
+        def _extend(hwnd, margins):
+            self.margins = (
+                margins.cxLeftWidth, margins.cxRightWidth,
+                margins.cyTopHeight, margins.cyBottomHeight,
+            )
+            return 0
+
+        def _set_attribute(hwnd, attribute, value, size):
+            self.attributes.append((attribute, value, size))
+            return 0
+
+        self.DwmExtendFrameIntoClientArea = _extend
+        self.DwmSetWindowAttribute = _set_attribute
+
+
+class _FakeNudgeUser32:
+    def __init__(self, zoomed: bool = False):
+        self.calls = []
+        self._zoomed = zoomed
+
+        def _is_zoomed(hwnd):
+            return self._zoomed
+
+        def _get_rect(hwnd, rect):
+            rect.left, rect.top, rect.right, rect.bottom = 10, 20, 1010, 720
+            return True
+
+        def _set_pos(hwnd, after, x, y, w, h, flags):
+            self.calls.append((x, y, w, h, flags))
+            return True
+
+        self.IsZoomed = _is_zoomed
+        self.GetWindowRect = _get_rect
+        self.SetWindowPos = _set_pos
+
+
+def test_dwm_appearance_sets_shadow_and_win11_rounded_corners(monkeypatch):
+    """扩展 1px 玻璃边框拿回系统投影 + 显式 ROUND 圆角 + 强制重合成。"""
+    launcher = _load_launcher()
+    dwm = _FakeDwmApi()
+    fake_ctypes = _FakeCtypesForDwm(dwmapi=dwm)
+    nudged: list = []
+    monkeypatch.setattr(launcher, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(launcher, "ctypes", fake_ctypes)
+    monkeypatch.setattr(launcher, "_nudge_window_rect", lambda w: nudged.append(w))
+
+    window = _fake_window()
+    launcher._apply_window_frame_appearance(window)
+
+    assert dwm.margins == (1, 1, 1, 1)
+    assert dwm.attributes == [
+        (launcher.DWMWA_WINDOW_CORNER_PREFERENCE, launcher.DWMWCP_ROUND, 4),
+    ]
+    assert nudged == [window]
+    assert fake_ctypes.calls == ["dwmapi"]
+
+
+def test_dwm_appearance_skips_without_native_or_off_windows(monkeypatch):
+    """非 Windows / 窗体未就绪时静默跳过，绝不能让启动失败。"""
+    launcher = _load_launcher()
+    fake_ctypes = _FakeCtypesForDwm(dwmapi=_FakeDwmApi())
+    monkeypatch.setattr(launcher, "ctypes", fake_ctypes)
+
+    monkeypatch.setattr(launcher, "os", SimpleNamespace(name="posix"))
+    launcher._apply_window_frame_appearance(_fake_window())
+    monkeypatch.setattr(launcher, "os", SimpleNamespace(name="nt"))
+    launcher._apply_window_frame_appearance(_fake_window(native=False))
+
+    assert fake_ctypes.calls == []
+
+
+def test_nudge_forces_dwm_recompose_without_user_drag(monkeypatch):
+    """宽 +1px 再还原，让 DWM 立刻重合成（等价用户拖一下窗口，但无需用户操作）。"""
+    launcher = _load_launcher()
+    user32 = _FakeNudgeUser32()
+    monkeypatch.setattr(launcher, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(launcher, "ctypes", _FakeCtypesForDwm(user32=user32))
+
+    launcher._nudge_window_rect(_fake_window())
+
+    flags = (launcher.SWP_NOZORDER | launcher.SWP_NOACTIVATE
+             | launcher.SWP_FRAMECHANGED)
+    assert user32.calls == [
+        (10, 20, 1001, 700, flags),
+        (10, 20, 1000, 700, flags),
+    ]
+
+
+def test_nudge_skips_maximized_window(monkeypatch):
+    """最大化窗口不画投影，也不能用尺寸抖动把最大化状态改掉。"""
+    launcher = _load_launcher()
+    user32 = _FakeNudgeUser32(zoomed=True)
+    monkeypatch.setattr(launcher, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(launcher, "ctypes", _FakeCtypesForDwm(user32=user32))
+
+    launcher._nudge_window_rect(_fake_window())
+
+    assert user32.calls == []

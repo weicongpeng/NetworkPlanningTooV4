@@ -63,7 +63,8 @@ export function WindowTitleBar() {
   // 单机模式没有跨用户通信能力，与 ImHost 保持同一判定，按钮禁用并给出提示
   const standalone = desktopMode && desktopRunMode === 'standalone'
   const desktopStatus = useDesktopStatusLabel()
-  const [maximized, setMaximized] = useState(true) // 桌面启动即最大化
+  // 桌面以普通窗口启动（有系统投影与圆角）；真实状态由 windowState() 校准
+  const [maximized, setMaximized] = useState(false)
   const [showAppDownload, setShowAppDownload] = useState(false)
   /** 上一次标题栏按下的时间戳：用来判定双击（原生移动循环会吃掉 dblclick） */
   const lastDragDownRef = useRef(0)
@@ -72,6 +73,9 @@ export function WindowTitleBar() {
 
   /** 按钮动作统一入口：响应带 maximized 时同步图标状态 */
   const control = useCallback((action: 'minimize' | 'toggle-maximize' | 'close') => {
+    // 最大化/还原先乐观翻图标：即使本机请求被其它轮询挤到后面，点击也有即时反馈，
+    // 不再出现「点了没反应」。响应到达后再按壳层的权威状态校准（失败时由 focus 校准）。
+    if (action === 'toggle-maximize') setMaximized(prev => !prev)
     desktopLoginApi
       .windowControl(action)
       .then((res: any) => {

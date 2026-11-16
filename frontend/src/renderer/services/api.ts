@@ -72,6 +72,16 @@ const apiClient = axios.create({
   }
 })
 
+/**
+ * 窗口控制/状态/截图热键轮询属于交互快路径：短超时 + 禁止自动重试。
+ * 默认 300s 超时会让「点了最小化没反应」一直挂着（IM 轮询占满 WebView2 的
+ * 6 条 HTTP/1.1 连接时尤甚）；网络错误自动重试更会把 toggle-maximize 触发两次，
+ * 窗口来回翻转。窗口动作是幂等性弱的一次性操作，失败就交给下一次点击。
+ */
+const WINDOW_FAST_TIMEOUT_MS = 3000
+const fastWindowConfig = () =>
+  ({ timeout: WINDOW_FAST_TIMEOUT_MS, _noAutoRetry: true }) as any
+
 // 创建专门用于文件上传的 axios 实例（不设置默认 Content-Type）
 // 在开发环境中直接访问后端，避免 Vite 代理的 multipart/form-data 问题
 const uploadClient = axios.create({
@@ -158,8 +168,8 @@ apiClient.interceptors.response.use(
     // 网络错误（无响应）：自动重试一次
     if (!error.response && error.request) {
       const config = error.config
-      // 防止无限重试
-      if (config && !config._retry) {
+      // 防止无限重试；交互快路径（窗口控制等）不重试：一次性动作重放会来回翻转窗口状态
+      if (config && !config._retry && !config._noAutoRetry) {
         config._retry = true
         console.log('[API] 网络错误，1秒后自动重试:', config.url)
         await new Promise(resolve => setTimeout(resolve, 1000))
@@ -743,12 +753,14 @@ export const desktopLoginApi = {
     action: 'minimize' | 'toggle-maximize' | 'close' | 'drag' | 'resize-edge' | 'activate',
     params?: { direction?: 'n' | 's' | 'e' | 'w' | 'ne' | 'nw' | 'se' | 'sw' }
   ): Promise<ApiResponse<{ maximized?: boolean }>> => {
-    return apiClient.post('/desktop/window-control', { action, ...(params || {}) }) as any
+    return apiClient.post(
+      '/desktop/window-control', { action, ...(params || {}) }, fastWindowConfig(),
+    ) as any
   },
 
   /** 查询壳层窗口状态缓存（maximized/fullscreen），窗口聚焦时校准标题栏图标，不轮询。 */
   windowState: async (): Promise<ApiResponse<{ maximized: boolean; fullscreen: boolean }>> => {
-    return apiClient.get('/desktop/window-state') as any
+    return apiClient.get('/desktop/window-state', fastWindowConfig()) as any
   },
 
   /** 桌面共享模式云端 IM 推送配置；许可凭证只经本机下发，不进 URL / 日志 */
@@ -758,7 +770,7 @@ export const desktopLoginApi = {
 
   /** 壳层 Win32 全局截图热键的序号；前端按增量触发取景 */
   screenshotHotkey: async (): Promise<ApiResponse<{ seq: number }>> => {
-    return apiClient.get('/desktop/screenshot-hotkey') as any
+    return apiClient.get('/desktop/screenshot-hotkey', fastWindowConfig()) as any
   },
 
   /**

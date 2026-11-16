@@ -19,6 +19,13 @@ from app.services.desktop_cloud_client import CloudError, server_url
 # IM 是交互路径：宁可快速失败让前端退避/降级，也不能让一次慢 relay 占住
 # anyio 线程池里的工作线程 30s（桌面共享模式高频轮询会叠加打满线程池）。
 RELAY_TIMEOUT_SECONDS = 12.0
+# 共享模式 IM 轮询是 1.5s 一次、且没有 in-flight 去重；网络抖动时单次 relay 最坏
+# 12s×2。不限并发会把 anyio 的 40 个线程池 token 与浏览器 6 条 HTTP/1.1 连接全占住，
+# 连「最小化/最大化」这种纯交互请求都要排几十秒。这里给 relay 一个硬上限，
+# 抢不到名额立即 503（前端退避到下一轮），始终把连接/线程留给交互请求。
+RELAY_MAX_CONCURRENT = 4
+RELAY_SLOT_WAIT_SECONDS = 0.2
+_relay_slots = threading.BoundedSemaphore(RELAY_MAX_CONCURRENT)
 _client_lock = threading.Lock()
 _http_client: Optional[httpx.Client] = None
 
@@ -58,8 +65,21 @@ def forward(op: str, args: Dict[str, Any],
             timeout: float = RELAY_TIMEOUT_SECONDS) -> Any:
     """把白名单 op 转发到线上 relay，返回对端 data 字段。
 
-    连接池 + 12s 短超时 + 一次有限重试（仅网络抖动 / 5xx），4xx 立即透传不重试。
+    并发上限是本函数最重要的职责：慢 relay 不能无限堆积占住线程池与浏览器连接，
+    否则桌面端「项目沟通」打开后窗口控制按钮会失去响应（见 RELAY_MAX_CONCURRENT）。
     """
+    if not _relay_slots.acquire(timeout=RELAY_SLOT_WAIT_SECONDS):
+        raise HTTPException(
+            status_code=503, detail="IM_RELAY_BUSY: 消息服务繁忙，请稍后重试"
+        )
+    try:
+        return _forward_unlocked(op, args, timeout)
+    finally:
+        _relay_slots.release()
+
+
+def _forward_unlocked(op: str, args: Dict[str, Any], timeout: float) -> Any:
+    """连接池 + 12s 短超时 + 一次有限重试（仅网络抖动 / 5xx），4xx 立即透传不重试。"""
     try:
         payload = _credentials()
     except CloudError as exc:

@@ -65,27 +65,32 @@ class _FakeWindow:
             raise RuntimeError("gui not ready")
 
 
-def _make_handler(launcher, window, state=None):
+def _make_handler(launcher, window, state=None, *, sync_dispatch=True):
+    # 桌面以普通窗口启动（最大化窗口没有系统投影/圆角，见 launcher._create_window）
     if state is None:
-        state = {"fullscreen": False, "maximized": True}
+        state = {"fullscreen": False, "maximized": False}
+    if sync_dispatch:
+        # 大多数用例只验证动作语义：把「派发到独立线程」改成同步执行便于断言；
+        # 真正的不阻塞语义由 test_window_actions_do_not_block_http_request 覆盖。
+        launcher._dispatch_window_action = lambda perform, name=None: perform()
     return launcher._make_window_control_handler(window, state), state
 
 
 def test_toggle_maximize_uses_state_cache():
-    """启动即最大化：第一次点击必须走 restore，第二次走 maximize，且返回值同步前端。"""
+    """普通窗口启动：第一次点击必须走 maximize，第二次走 restore，且返回值同步前端。"""
     launcher = _load_launcher()
     window = _FakeWindow()
     handler, _ = _make_handler(launcher, window)
 
-    assert handler("toggle-maximize", {}) == {"maximized": False}
-    assert window.calls == ["restore"]
-
     assert handler("toggle-maximize", {}) == {"maximized": True}
-    assert window.calls == ["restore", "maximize"]
+    assert window.calls == ["maximize"]
+
+    assert handler("toggle-maximize", {}) == {"maximized": False}
+    assert window.calls == ["maximize", "restore"]
 
 
 def test_toggle_maximize_limits_borderless_window_to_work_area(monkeypatch):
-    """无边框窗口最大化默认会盖住任务栏：还原时清限制、最大化前按工作区收口。"""
+    """无边框窗口最大化默认会盖住任务栏：最大化前按工作区收口、还原时清限制。"""
     launcher = _load_launcher()
     window = _FakeWindow()
     limited: list[bool] = []
@@ -97,11 +102,11 @@ def test_toggle_maximize_limits_borderless_window_to_work_area(monkeypatch):
     handler, _ = _make_handler(launcher, window)
 
     handler("toggle-maximize", {})
-    assert limited == [False]  # 启动即最大化 → 还原并清掉工作区限制
+    assert limited == [True]  # 普通窗口 → 最大化前先按工作区收口
 
     handler("toggle-maximize", {})
-    assert limited == [False, True]  # 最大化前先按工作区收口
-    assert window.calls == ["restore", "maximize"]
+    assert limited == [True, False]  # 还原并清掉工作区限制
+    assert window.calls == ["maximize", "restore"]
 
 
 def test_state_events_converge_cache():
@@ -138,7 +143,7 @@ def test_resize_edge_hands_over_to_native_loop(monkeypatch):
         or direction in launcher.RESIZE_HIT_TESTS,
     )
 
-    assert handler("resize-edge", {"direction": "w"}) == {"maximized": True}
+    assert handler("resize-edge", {"direction": "w"}) == {"maximized": False}
     assert started == [(window, "w")]
     # 缩放期间不做任何窗口动作（尺寸由系统缩放循环自己改）
     assert window.calls == []
@@ -235,11 +240,11 @@ def test_drag_action_hands_over_to_native_caption_drag(monkeypatch):
     started: list = []
     monkeypatch.setattr(launcher, "_start_caption_drag", lambda win: started.append(win))
 
-    assert handler("drag", {}) == {"maximized": True}
+    assert handler("drag", {}) == {"maximized": False}
     assert started == [window]
     # 原生拖动期间不做任何窗口动作（最大化/还原由系统在处理移动循环时自行决定）
     assert window.calls == []
-    assert state["maximized"] is True
+    assert state["maximized"] is False
 
 
 def test_activate_returns_false_without_native_handle():
@@ -278,6 +283,57 @@ def test_unknown_window_action_still_rejected():
 
     with pytest.raises(ValueError):
         handler("shuffle", {})
+
+
+def test_window_actions_do_not_block_http_request(monkeypatch):
+    """最小化/最大化/关闭不能在 uvicorn 事件循环线程里同步等 GUI 线程的 Invoke。
+
+    pywebview 的窗口方法内部是 WinForms ``Control.Invoke``，从事件循环线程发起会
+    冻结整个 asyncio 循环：项目沟通打开后的一次慢 relay 就能把按钮点按拖成几十秒。
+    现在只把动作入队，handler 立即返回，由独立 worker 串行执行。
+    """
+    launcher = _load_launcher()
+    window = _FakeWindow()
+    dispatched: list = []
+    monkeypatch.setattr(
+        launcher, "_dispatch_window_action",
+        lambda perform, name=None: dispatched.append((name, perform)),
+    )
+    handler, _ = _make_handler(launcher, window, sync_dispatch=False)
+
+    assert handler("minimize", {}) == {"maximized": False}
+    assert handler("toggle-maximize", {}) == {"maximized": True}
+    assert handler("close", {}) == {}
+    assert window.calls == []  # 没有任何窗口动作在请求线程里执行
+    assert [name for name, _ in dispatched] == [
+        "npt-window-minimize", "npt-window-toggle-maximize", "npt-window-close",
+    ]
+    # 队列按点击顺序执行（真实壳层是单 worker）
+    for _, perform in dispatched:
+        perform()
+    assert window.calls == ["minimize", "maximize", "destroy"]
+
+
+def test_apply_window_frame_refreshes_dwm_appearance(monkeypatch):
+    """窗口显示后必须补样式位 → 吃掉原生边框 → 重画投影/圆角，顺序不能乱。"""
+    launcher = _load_launcher()
+    order: list[str] = []
+    for name in (
+        "_enable_taskbar_minimize",
+        "_install_client_area_wndproc",
+        "_apply_window_frame_appearance",
+    ):
+        monkeypatch.setattr(
+            launcher, name, lambda _window, n=name: order.append(n)
+        )
+
+    launcher._apply_window_frame(_FakeWindow())
+
+    assert order == [
+        "_enable_taskbar_minimize",
+        "_install_client_area_wndproc",
+        "_apply_window_frame_appearance",
+    ]
 
 
 def _patch_foreground(monkeypatch, launcher, minimized: bool):

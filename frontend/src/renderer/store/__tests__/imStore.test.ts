@@ -56,6 +56,11 @@ function messagesPage(items: ImMessage[], next: number | null): ImEnvelope<ImMes
   }
 }
 
+/** 排空若干微任务，让 Promise.allSettled().finally() 释放轮询在途标记 */
+async function flushMicrotasks() {
+  for (let i = 0; i < 6; i += 1) await Promise.resolve()
+}
+
 describe('imStore', () => {
   beforeEach(() => {
     vi.clearAllMocks()
@@ -451,8 +456,9 @@ describe('imStore', () => {
     expect(useImStore.getState().conversations).toHaveLength(1)
   })
 
-  it('桌面端页面隐藏仍轮询未读，窗口重新可见时立即补刷一次', () => {
+  it('桌面端页面隐藏仍轮询未读，窗口重新可见时立即补刷一次', async () => {
     vi.useFakeTimers()
+    vi.mocked(imApi.conversations).mockResolvedValue(conversationsPage([]) as any)
     const visibility = { value: 'hidden' as DocumentVisibilityState }
     Object.defineProperty(document, 'visibilityState', {
       configurable: true, get: () => visibility.value,
@@ -461,6 +467,7 @@ describe('imStore', () => {
     useImStore.getState().startPolling(1000, true)
     vi.advanceTimersByTime(1000)
     expect(imApi.conversations).toHaveBeenCalledTimes(1) // hidden 也继续刷红点
+    await flushMicrotasks() // 上一轮在途结束，释放连接
 
     visibility.value = 'visible'
     window.dispatchEvent(new Event('focus'))
@@ -472,6 +479,27 @@ describe('imStore', () => {
     window.dispatchEvent(new Event('focus'))
     expect(imApi.conversations).toHaveBeenCalledTimes(2) // 停止后监听已移除
     Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' })
+    vi.useRealTimers()
+  })
+
+  it('一轮轮询在途时跳过后续 tick，避免打满 WebView2 连接与后端线程池', async () => {
+    vi.useFakeTimers()
+    let finishFirst: (value: unknown) => void = () => {}
+    vi.mocked(imApi.conversations)
+      .mockReturnValueOnce(new Promise(resolve => { finishFirst = resolve }) as any)
+      .mockResolvedValue(conversationsPage([]) as any)
+    useImStore.setState({ open: false })
+    useImStore.getState().startPolling(1000, true)
+    // 3 个 tick 过去，第一个慢请求还没回来：只应有 1 个在途请求
+    vi.advanceTimersByTime(3000)
+    expect(imApi.conversations).toHaveBeenCalledTimes(1)
+
+    finishFirst(conversationsPage([]))
+    await flushMicrotasks()
+    vi.advanceTimersByTime(1000)
+    expect(imApi.conversations).toHaveBeenCalledTimes(2) // 释放后恢复轮询
+
+    useImStore.getState().stopPolling()
     vi.useRealTimers()
   })
 

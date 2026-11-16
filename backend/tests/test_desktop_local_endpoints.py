@@ -65,6 +65,8 @@ def desktop_local(tmp_path, monkeypatch):
     admin = SimpleNamespace(username="admin", is_admin=True)
     app.dependency_overrides[get_current_user] = lambda: admin
     app.dependency_overrides[get_current_admin_user] = lambda: admin
+    # 窗口控制/状态查询走「只验 JWT 签名」的轻量依赖，测试里同样桩掉
+    app.dependency_overrides[endpoint_module._require_desktop_window_user] = lambda: None
 
     yield SimpleNamespace(
         client=TestClient(app),
@@ -280,6 +282,29 @@ def test_window_state_without_shell_returns_403(desktop_local):
     desktop_bridge.set_window_control_handler(None)
     resp = desktop_local.client.get("/api/v1/desktop/window-state")
     assert resp.status_code == 403
+
+
+def test_window_control_fast_path_dependencies_are_async():
+    """窗口控制/状态/热键轮询的依赖必须全是 async。
+
+    同步依赖（含 get_current_user → 同步 generator get_db）会被 Starlette 丢进
+    anyio 线程池申请 token；IM 慢 relay 占满 40 个 token 时，按钮点按会排队几十秒。
+    """
+    import inspect
+
+    from app.api.v1.endpoints import desktop_local
+
+    assert inspect.iscoroutinefunction(desktop_local._require_desktop_fast)
+    assert inspect.iscoroutinefunction(desktop_local._require_desktop_window_user)
+    # 两个端点都不能再挂同步 DB 依赖（router 里的路径未带 /api/v1/desktop 前缀）
+    for path in ("/window-control", "/window-state"):
+        route = next(
+            r for r in desktop_local.router.routes if getattr(r, "path", None) == path
+        )
+        assert not any(
+            getattr(getattr(d, "call", None), "__name__", "") == "get_current_user"
+            for d in route.dependant.dependencies
+        )
 
 
 def test_activate_error_maps_status(desktop_local):
