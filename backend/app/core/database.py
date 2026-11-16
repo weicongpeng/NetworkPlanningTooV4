@@ -117,6 +117,7 @@ def init_db():
             ("can_assistant", "ALTER TABLE users ADD COLUMN can_assistant BOOLEAN NOT NULL DEFAULT 0"),
             ("avatar", "ALTER TABLE users ADD COLUMN avatar TEXT"),
             ("nickname", "ALTER TABLE users ADD COLUMN nickname VARCHAR(64)"),
+            ("im_user_id", "ALTER TABLE users ADD COLUMN im_user_id INTEGER"),
             ("usage_accounted_at", "ALTER TABLE user_sessions ADD COLUMN usage_accounted_at DATETIME"),
         ]
         for col_name, sql in migrations:

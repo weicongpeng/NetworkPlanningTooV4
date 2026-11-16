@@ -6,6 +6,7 @@ import { imApi } from '../services/api'
 import { clearImAttachmentCache } from '../services/imAttachmentCache'
 import { IM_MESSAGE_EVENT, IM_PRESENCE_EVENT, IM_RESYNC_EVENT } from '../services/websocketService'
 import { playImMessageSound } from '../utils/messageSound'
+import { imUserId } from '../components/Im/types'
 import type {
   ImContactsData, ImConversation, ImLightboxSource, ImMember, ImMessage,
   ImSendMention, ImTab, ImUser,
@@ -109,8 +110,8 @@ interface ImState {
 function currentUserId(): number | null {
   try {
     const raw = localStorage.getItem('auth-storage')
-    const id = JSON.parse(raw || '{}')?.state?.user?.id
-    return typeof id === 'number' ? id : null
+    const user = JSON.parse(raw || '{}')?.state?.user
+    return imUserId(user)
   } catch {
     return null
   }

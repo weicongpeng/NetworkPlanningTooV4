@@ -22,6 +22,7 @@ import {
 import {
   getScreenshotSettings, matchesScreenshotHotkey, refreshScreenshotSettings,
 } from './screenshotSettings'
+import { imUserId } from './types'
 
 const ImWindow = lazy(() => import('./ImWindow').then(module => ({ default: module.ImWindow })))
 
@@ -412,7 +413,7 @@ export function ImHost() {
             {t('im.host.opening', '正在打开项目沟通…')}
           </div>
         }>
-          <ImWindow userId={user.id ?? null} desktopMode={desktopMode} onClose={() => setOpen(false)} />
+          <ImWindow userId={imUserId(user)} desktopMode={desktopMode} onClose={() => setOpen(false)} />
         </Suspense>
       )}
 

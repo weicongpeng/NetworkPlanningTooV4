@@ -137,6 +137,10 @@ def current_state() -> Dict[str, Any]:
         "default_path": str(default_attachment_dir()),
         "customized": bool(_read_configured_path()),
         "profile": str(settings.DESKTOP_PROFILE or "default"),
+        # 共享模式的聊天附件实际存在服务器上，本机目录只承载上传分片/临时文件；
+        # 前端据此解释「目录为空」不是配置失效。
+        "mode": "shared" if settings.DESKTOP_PROFILE == "shared" else "standalone",
+        "remote_attachments": settings.DESKTOP_PROFILE == "shared",
         "usage": {
             "attachments": usage,
             "open_temp": temp_usage,

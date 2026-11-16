@@ -181,7 +181,8 @@
       "cleaned": "Removed {{count}} files, freed {{size}}",
       "cleanFailed": "Cleanup failed, please retry",
       "loadFailed": "Could not read local storage settings",
-      "hint": "Only local temporary files and image cache are removed; messages, real attachments and server data are never deleted."
+      "hint": "Only local temporary files and image cache are removed; messages, real attachments and server data are never deleted.",
+      "sharedHint": "In shared mode chat attachments live on the server. This folder only holds local upload parts and opened-file copies, so an empty folder is expected and the setting is still valid."
     },
     "groupManage": {
       "kick": "Remove member",

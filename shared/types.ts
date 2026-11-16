@@ -540,6 +540,11 @@ export interface UserInfo {
   avatar?: string | null
   /** 协作沟通昵称（仅 IM 展示名生效，不改登录账号 username）；null / 空串回落 username */
   nickname?: string | null
+  /**
+   * 桌面共享模式镜像账号对应的服务器上 user.id。IM 消息 sender_id / 会话成员 id
+   * 都是服务器 id，必须用本字段判定「自己」；网页端为 null。
+   */
+  im_user_id?: number | null
   user_type?: 'pc' | 'app'
   /** 桌面版登录时选择的运行模式（网页端为 null） */
   desktop_run_mode?: 'shared' | 'standalone' | null

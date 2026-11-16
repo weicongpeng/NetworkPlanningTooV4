@@ -54,6 +54,10 @@ class User(Base):
     # 桌面版登录时选择的运行模式：shared=共享模式（权限/分组与网页端一致）
     # / standalone=单机模式（数据本机私有；权限同样按下方权限位，与网页端一致）。网页端恒为 NULL。
     desktop_run_mode = Column(String(16), nullable=True)
+    # 共享模式镜像账号对应的服务器上 user.id。本机 users.id 由本机 SQLite 分配，
+    # 与 IM 消息 sender_id / 会话 other_user.id（服务器端 id）不一致会导致气泡左右错位、
+    # 头像串号；IM 身份一律用这个字段。
+    im_user_id = Column(Integer, nullable=True)
 
     # 细粒度权限（数据管理/功能页面操作权限，默认全部关闭，管理员自动拥有全部权限）
     # 由管理员在「用户管理 → 编辑」设置，网页端与桌面端（含单机模式）一致生效
@@ -86,6 +90,8 @@ class User(Base):
             "nickname": self.nickname,
             "is_desktop_shadow": self.is_desktop_shadow,
             "desktop_run_mode": self.desktop_run_mode,
+            # 桌面共享模式：本机镜像账号 id 与服务器账号 id 不同，IM 身份必须用后者
+            "im_user_id": getattr(self, "im_user_id", None),
             "can_data_import": self.can_data_import,
             "can_data_delete": self.can_data_delete,
             "can_data_update": self.can_data_update,

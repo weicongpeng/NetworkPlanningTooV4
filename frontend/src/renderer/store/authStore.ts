@@ -2,6 +2,7 @@ import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
 import type { UserInfo } from '@shared/types'
 import { authApi, desktopLoginApi, systemApi } from '../services/api'
+import { useImStore } from './imStore'
 
 /** 桌面端运行模式：共享模式（与网页端一致）/ 单机模式（单独授权、权限全开） */
 export type DesktopRunMode = 'shared' | 'standalone' | null
@@ -79,10 +80,10 @@ function clearUserDataCaches() {
   import('./mapDataCacheStore')
     .then(({ useMapDataCacheStore }) => useMapDataCacheStore.getState().clearAll())
     .catch(() => { /* 非关键 */ })
-  // 协作沟通：消息/未读/会话/草稿/轮询都是按账号隔离的内存态，切账号必须彻底清理
-  import('./imStore')
-    .then(({ useImStore }) => useImStore.getState().resetForUserSwitch())
-    .catch(() => { /* 非关键 */ })
+  // 协作沟通：消息/未读/会话/草稿/轮询都是按账号隔离的内存态。必须同步清：
+  // 动态 import 的 .then 是微任务，可能晚于新账号登录态写入与首轮拉取，
+  // 导致上一账号的数据被误当成当前账号显示（头像/气泡左右串号）。
+  useImStore.getState().resetForUserSwitch()
   // 聊天图片缓存里是上一账号可见的附件字节，同样不能跨账号保留
   import('../services/imAttachmentCache')
     .then(({ clearImAttachmentCache }) => clearImAttachmentCache())
@@ -370,6 +371,8 @@ export const useAuthStore = create<AuthState>()(
           'can_cell_entry', 'can_cell_query_update', 'can_assistant',
           // 联网校验授权后会续期并镜像到期日：让授权门禁即时拿到新期限
           'license_expiry', 'effective_license_expiry',
+          // IM 身份与头像：桌面镜像账号可能与服务器账号不同源，心跳发现后必须纠正
+          'im_user_id', 'avatar', 'nickname',
         ]
         const differs = (key: keyof UserInfo) => {
           const prev = current?.[key]

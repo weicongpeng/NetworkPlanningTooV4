@@ -775,6 +775,7 @@ export const desktopLoginApi = {
   /** 项目沟通本地存储：当前档路径与可清理占用（仅桌面端） */
   imStorageState: async (): Promise<ApiResponse<{
     path: string; default_path: string; customized: boolean; profile: string
+    mode: 'shared' | 'standalone'; remote_attachments: boolean
     usage: { attachments: { files: number; bytes: number }
              open_temp: { files: number; bytes: number }
              total_files: number; total_bytes: number }

@@ -659,3 +659,38 @@ def test_cloud_ws_config_returns_license_credentials(desktop_local):
     assert data["machine_code"]
     assert len(data["license_fingerprint"]) == 16
     assert data["auth_timeout_ms"] > 0
+
+
+def test_mirrored_user_keeps_server_im_identity_and_avatar(tmp_path, monkeypatch):
+    """桌面镜像账号的本地 id 与服务器 id 不同：IM 身份必须用 im_user_id，头像要一起镜像。"""
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from app.api.v1.endpoints import desktop_local as endpoint_module
+    from app.core.database import Base
+    from app.core.config import settings
+    from app.models.database import User
+
+    monkeypatch.setattr(settings, "DATA_ROOT", tmp_path)
+    engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    Base.metadata.create_all(engine)
+    db = sessionmaker(bind=engine, autoflush=False)()
+    try:
+        incoming = {
+            "id": 27, "username": "alice", "is_admin": False,
+            "avatar": "data:image/png;base64,AAAA", "nickname": "小张",
+        }
+        row = endpoint_module._mirror_local_user(db, incoming, "shared", "pwd123")
+        assert row.id != 27  # 本机 SQLite 自分配的 id，与服务器 id 不同
+        payload = endpoint_module.auth_service.user_payload(row)
+        assert payload["im_user_id"] == 27
+        assert payload["avatar"] == incoming["avatar"]
+        assert payload["nickname"] == "小张"
+
+        # 服务器改了头像/昵称后，心跳同步要覆盖旧的镜像值
+        incoming.update({"avatar": "data:image/png;base64,BBBB", "nickname": "小李"})
+        row2 = endpoint_module._mirror_local_user(db, incoming, "shared", "pwd123")
+        assert row2.im_user_id == 27
+        assert endpoint_module.auth_service.user_payload(row2)["avatar"].endswith("BBBB")
+    finally:
+        db.close()

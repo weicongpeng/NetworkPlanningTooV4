@@ -27,7 +27,7 @@ import {
 import {
   formatHotkey, getScreenshotSettings, saveScreenshotSettings, useScreenshotSettings,
 } from './screenshotSettings'
-import { formatBytes } from './types'
+import { formatBytes, imUserId } from './types'
 import type { ImMember, ImMentionTarget, ImSendMention } from './types'
 
 interface PendingAttachment {
@@ -102,7 +102,7 @@ export function ImComposer({ conversationId }: { conversationId: number }) {
   const setReplyTo = useImStore(s => s.setReplyTo)
   const conversation = useImStore(s => s.conversations.find(c => c.id === conversationId) || null)
   const members = useImStore(s => s.membersByConversation[conversationId]) || EMPTY_MEMBERS
-  const myId = useAuthStore(s => s.user?.id ?? null)
+  const myId = useAuthStore(s => imUserId(s.user))
   const desktopMode = useAuthStore(s => s.desktopMode)
   const screenshotSettings = useScreenshotSettings()
   const isGroup = conversation !== null && conversation.kind !== 'direct'

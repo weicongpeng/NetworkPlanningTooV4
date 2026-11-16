@@ -79,6 +79,7 @@ export function UserSettingsDialog({ open, onClose, mode = 'app' }: Props) {
   const [storageUsage, setStorageUsage] = useState<{
     total_files: number; total_bytes: number
   } | null>(null)
+  const [remoteAttachments, setRemoteAttachments] = useState(false)
   const [storageBusy, setStorageBusy] = useState(false)
   const [cleanBusy, setCleanBusy] = useState(false)
   const [storageError, setStorageError] = useState('')
@@ -105,6 +106,7 @@ export function UserSettingsDialog({ open, onClose, mode = 'app' }: Props) {
       setStoragePath(res.data.path || '')
       setStorageDefault(res.data.default_path || '')
       setStorageUsage(res.data.usage || null)
+      setRemoteAttachments(Boolean(res.data.remote_attachments))
       setStorageError('')
     }).catch(() => {
       if (!cancelled) setStorageError(t('im.storage.loadFailed', '读取本地存储设置失败'))
@@ -218,6 +220,7 @@ export function UserSettingsDialog({ open, onClose, mode = 'app' }: Props) {
       setStoragePath(res.data.path || '')
       setStorageDefault(res.data.default_path || '')
       setStorageUsage(res.data.usage || null)
+      setRemoteAttachments(Boolean(res.data.remote_attachments))
     }
   }
 
@@ -349,6 +352,11 @@ export function UserSettingsDialog({ open, onClose, mode = 'app' }: Props) {
                     <span className="break-all font-mono">{storageDefault}</span></>
                 )}
               </div>
+              {remoteAttachments && (
+                <p className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-[11px] leading-relaxed text-amber-700 dark:text-amber-300">
+                  {t('im.storage.sharedHint', '共享模式的聊天附件保存在服务器上；此目录只用于本机上传临时文件与打开附件的副本，为空属正常现象，配置依然有效。')}
+                </p>
+              )}
               <input value={storagePath} onChange={event => setStoragePath(event.target.value)}
                      aria-label={t('im.storage.pathLabel', '聊天记录与文件保存路径')}
                      className={inputClass} />

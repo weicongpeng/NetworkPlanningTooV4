@@ -13,7 +13,7 @@ import { useImStore } from '../../store/imStore'
 import { useToastStore } from '../../store/toastStore'
 import { ImAvatar } from './ImAvatar'
 import { prepareAvatar } from './avatarUtils'
-import { imDisplayName } from './types'
+import { imDisplayName, imUserId } from './types'
 import type { ImConversation, ImMember } from './types'
 
 interface Props {
@@ -26,7 +26,7 @@ const EMPTY_MEMBERS: ImMember[] = []
 
 export function ImGroupMembersDialog({ conversation, onClose }: Props) {
   const { t } = useTranslation()
-  const myId = useAuthStore(s => s.user?.id ?? null)
+  const myId = useAuthStore(s => imUserId(s.user))
   const members = useImStore(s => s.membersByConversation[conversation.id] ?? EMPTY_MEMBERS)
   const contacts = useImStore(s => s.contacts)
   const ensureMembers = useImStore(s => s.ensureMembers)

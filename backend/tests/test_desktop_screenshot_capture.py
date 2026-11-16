@@ -134,6 +134,8 @@ def test_start_reuses_pending_result_when_frontend_polls_late(tmp_path, monkeypa
     controller = capture.ScreenshotCaptureController(tmp_path)
     controller._publish(b"png", False, controller._abort)
     assert controller.status(0)["seq"] == 1
+    # 上面的 status 视作前端已消费；重新发布模拟一次新的晚到结果
+    controller._publish(b"late", False, controller._abort)
 
     class _NoopThread:
         def __init__(self, *_args, **_kwargs):
@@ -144,6 +146,41 @@ def test_start_reuses_pending_result_when_frontend_polls_late(tmp_path, monkeypa
 
     monkeypatch.setattr(capture.threading, "Thread", _NoopThread)
     result = controller.start(hide_im_window=False)
-    assert result == {"started": True, "busy": False, "unsupported": False, "seq": 0}
+    assert result == {"started": True, "busy": False, "unsupported": False, "seq": 1}
     assert controller.status(result["seq"])["ready"] is True
-    assert controller.take_image() == b"png"
+    assert controller.take_image() == b"late"
+    # 消费后再次调用 start 必须真正发起新会话，不能一直 replay 旧结果
+    second = controller.start(hide_im_window=False)
+    assert second["started"] is True and second["seq"] == 2
+
+
+def test_cancel_result_does_not_block_later_screenshots(tmp_path, monkeypatch):
+    """用户按 ESC 取消一轮后，后续 Alt+Z / 剪刀按钮必须还能正常发起新取景。"""
+    capture = _load_capture()
+    monkeypatch.setattr(capture, "supported", lambda: True)
+    started: list = []
+
+    class _NoopThread:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def start(self):
+            started.append(True)
+
+    monkeypatch.setattr(capture.threading, "Thread", _NoopThread)
+    controller = capture.ScreenshotCaptureController(tmp_path)
+    abort = controller._abort
+    controller._publish(None, True, abort)  # 模拟 ESC 取消
+    assert controller._cancelled is True
+
+    # 前端晚到的 POST：回放取消结果，让前端 poll 到 cancelled 并收起蒙层
+    first = controller.start(hide_im_window=False)
+    assert first["started"] is True and first["busy"] is False
+    assert controller.status(first["seq"])["cancelled"] is True
+    assert controller._result_unclaimed is False
+
+    # 关键回归：取消结果消费后，下一次热键/剪刀必须真正起新会话
+    second = controller.start(hide_im_window=False)
+    assert second["started"] is True and second["busy"] is False
+    assert second["seq"] == 1
+    assert len(started) == 1  # 只起了一个真实取景线程

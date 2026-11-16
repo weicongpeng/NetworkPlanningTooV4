@@ -385,6 +385,13 @@ def _mirror_local_user(db: Session, incoming: dict, mode: str, password: Optiona
     # 协作沟通昵称：IM 展示名，随服务器账号信息镜像到本机，保证共享模式登录后
     # 本地 /me 也能带出昵称（否则协作沟通左下角当前用户会退回 username）
     row.nickname = incoming.get("nickname")
+    if "avatar" in incoming:
+        row.avatar = incoming.get("avatar")
+    server_id = incoming.get("id")
+    if isinstance(server_id, int) and server_id > 0:
+        row.im_user_id = server_id
+    elif str(server_id or "").isdigit() and int(server_id) > 0:
+        row.im_user_id = int(server_id)
     for perm in PERMISSION_FIELDS:
         setattr(row, perm, bool(incoming.get(perm)))
     _mirror_local_expiry(row, incoming)
@@ -411,6 +418,14 @@ def _sync_permissions_from_remote(incoming: Optional[dict]) -> Optional[dict]:
         if row is None:
             return None
         row.is_admin = bool(incoming.get("is_admin"))
+        row.nickname = incoming.get("nickname")
+        if "avatar" in incoming:
+            row.avatar = incoming.get("avatar")
+        server_id = incoming.get("id")
+        if isinstance(server_id, int) and server_id > 0:
+            row.im_user_id = server_id
+        elif str(server_id or "").isdigit() and int(server_id) > 0:
+            row.im_user_id = int(server_id)
         for perm in PERMISSION_FIELDS:
             setattr(row, perm, bool(incoming.get(perm)))
         _mirror_local_expiry(row, incoming)

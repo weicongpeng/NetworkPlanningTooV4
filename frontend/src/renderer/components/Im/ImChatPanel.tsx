@@ -17,7 +17,7 @@ import { ImMessageContextMenu } from './ImMessageContextMenu'
 import type { MessageMenuState } from './ImMessageContextMenu'
 import { ImMessageItem } from './ImMessageItem'
 import { ImSystemNotice } from './ImSystemNotice'
-import { conversationTitle, formatBytes, formatClock } from './types'
+import { conversationTitle, formatBytes, formatClock, imUserId } from './types'
 import type { ImConversation, ImLightboxSource, ImMessage } from './types'
 
 interface Props {
@@ -31,7 +31,7 @@ const EMPTY_MESSAGES: ImMessage[] = []
 
 export function ImChatPanel({ conversation, narrow, onBack }: Props) {
   const { t } = useTranslation()
-  const currentUserId = useAuthStore(s => s.user?.id ?? null)
+  const currentUserId = useAuthStore(s => imUserId(s.user))
   const messages = useImStore(s => conversation
     ? (s.messages[conversation.id] ?? EMPTY_MESSAGES) : EMPTY_MESSAGES)
   const cursor = useImStore(s => conversation ? s.cursors[conversation.id] : undefined)

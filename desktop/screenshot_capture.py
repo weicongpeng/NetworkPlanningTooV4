@@ -393,6 +393,10 @@ class ScreenshotCaptureController:
         self._image: Optional[bytes] = None
         self._cancelled = False
         self._running = False
+        # 上一轮结果是否已经交给前端。只有「未消费」时才允许 replay 基线序号；
+        # 否则一次取消/异常会把 _cancelled 永久留成 True，后续所有截图都被判成旧结果。
+        self._result_unclaimed = False
+        self._run_started_at = 0.0
         self._abort = threading.Event()
 
     def start(self, hide_im_window: bool = False,
@@ -406,10 +410,23 @@ class ScreenshotCaptureController:
             return {"started": False, "busy": False, "unsupported": True, "seq": self._seq}
         with self._lock:
             if self._running:
-                return {"started": False, "busy": True, "unsupported": False, "seq": self._seq}
-            if self._image is not None or self._cancelled:
+                # 蒙层异常残留（例如 WinForms 消息循环没退出）不能永久占住会话：
+                # 超过 3 分钟视为卡死，终止旧轮并按新的一轮处理。
+                if self._run_started_at and time.monotonic() - self._run_started_at > 180:
+                    _log.warning("上一轮截图取景超时，强制中止并重新开始")
+                    self._abort.set()
+                    self._running = False
+                    self._cancelled = True
+                    self._seq += 1
+                    self._result_unclaimed = False
+                else:
+                    return {"started": False, "busy": True, "unsupported": False, "seq": self._seq}
+            if self._result_unclaimed:
                 # 全局热键由壳层直接启动并已结束，前端轮询晚到时不能重开一轮蒙层：
-                # 回退基线序号，让前端的 status(after) 立刻读到这次结果
+                # 回退基线序号，让前端的 status(after) 立刻读到这次结果。
+                # 只 replay 一次；前端消费后（status/take_image）标记清零，下一轮正常起蒙层。
+                self._result_unclaimed = False
+                _log.info("前端晚到，回放上一轮截图结果序号 %s", max(0, self._seq - 1))
                 return {
                     "started": True, "busy": False, "unsupported": False,
                     "seq": max(0, self._seq - 1),
@@ -417,6 +434,8 @@ class ScreenshotCaptureController:
             self._running = True
             self._image = None
             self._cancelled = False
+            self._result_unclaimed = False
+            self._run_started_at = time.monotonic()
             self._abort = threading.Event()
             seq = self._seq
             abort = self._abort
@@ -441,10 +460,16 @@ class ScreenshotCaptureController:
     def status(self, after_seq: int) -> Dict[str, Any]:
         with self._lock:
             changed = self._seq > int(after_seq or 0)
+            ready = changed and self._image is not None
+            cancelled = changed and self._cancelled
+            if ready or cancelled:
+                # 前端已看到这一轮结果：即使后续重复轮询也不能再当作「待回放」，
+                # 否则 cancel 之后每次 start 都会命中 replay 分支，截图彻底失效。
+                self._result_unclaimed = False
             return {
                 "seq": self._seq,
-                "ready": changed and self._image is not None,
-                "cancelled": changed and self._cancelled,
+                "ready": ready,
+                "cancelled": cancelled,
                 "pending": self._running,
             }
 
@@ -453,6 +478,7 @@ class ScreenshotCaptureController:
         with self._lock:
             data = self._image
             self._image = None
+            self._result_unclaimed = False
             return data
 
     def _publish(self, image: Optional[bytes], cancelled: bool, abort: threading.Event) -> None:
@@ -462,8 +488,10 @@ class ScreenshotCaptureController:
                 return
             self._image = image
             self._cancelled = cancelled
+            self._result_unclaimed = True
             self._seq += 1
             self._running = False
+            self._run_started_at = 0.0
 
     def _run(self, hide_im_window: bool, frame_ready: bool,
              abort: threading.Event) -> None:

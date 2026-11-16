@@ -96,6 +96,19 @@ export interface ImGroup {
   owner_id?: number | null
 }
 
+/**
+ * IM 身份 id：共享桌面模式下本机镜像账号 id 与服务器 id 不同，
+ * 消息 sender_id / 会话成员 id 一律是服务器 id，必须用 im_user_id 判定「自己」。
+ */
+export function imUserId(
+  user: { id: number; im_user_id?: number | null } | null | undefined,
+): number | null {
+  if (!user) return null
+  return typeof user.im_user_id === 'number' && user.im_user_id > 0
+    ? user.im_user_id
+    : user.id ?? null
+}
+
 export interface ImAttachmentInfo {
   id: number
   original_name: string

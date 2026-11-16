@@ -85,6 +85,16 @@ export function waitForStableFrames(): Promise<void> {
       window.setTimeout(resolve, 32)
       return
     }
-    requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
+    let done = false
+    const finish = () => {
+      if (done) return
+      done = true
+      window.clearTimeout(timer)
+      resolve()
+    }
+    // 后台/最小化时 Chromium 会把 rAF 压到分钟级甚至完全暂停，
+    // 只等 rAF 会让取景请求永远发不出去（Alt+Z / 剪刀按钮点了没反应）。
+    const timer = window.setTimeout(finish, 300)
+    requestAnimationFrame(() => requestAnimationFrame(finish))
   })
 }

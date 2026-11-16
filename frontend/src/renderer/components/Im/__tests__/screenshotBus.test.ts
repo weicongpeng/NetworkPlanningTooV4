@@ -58,4 +58,9 @@ describe('截图 DOM 稳定化', () => {
     expect(frames).toBe(2)
     expect(resolved).toBe(true)
   })
+
+  it('后台窗口 rAF 被节流时不永久卡住取景', async () => {
+    vi.stubGlobal('requestAnimationFrame', () => 0) // 永不回调
+    await waitForStableFrames() // 超时兜底必须 resolve
+  })
 })
