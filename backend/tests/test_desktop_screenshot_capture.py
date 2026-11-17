@@ -184,3 +184,29 @@ def test_cancel_result_does_not_block_later_screenshots(tmp_path, monkeypatch):
     assert second["started"] is True and second["busy"] is False
     assert second["seq"] == 1
     assert len(started) == 1  # 只起了一个真实取景线程
+
+
+def test_selection_handles_and_resize():
+    """四边四角把手可命中，拖动后按相反角固定重算选区。"""
+    capture = _load_capture()
+    rect = (100, 100, 300, 240)
+    assert len(capture.handles_for_rect(rect)) == 8
+    assert capture.hit_handle(rect, (200, 100)) == "n"
+    assert capture.hit_handle(rect, (300, 170)) == "e"
+    assert capture.hit_handle(rect, (100, 240)) == "sw"
+    assert capture.hit_handle(rect, (200, 170)) is None
+    assert capture.resize_rect(rect, "nw", (80, 70)) == (80, 70, 300, 240)
+    assert capture.resize_rect(rect, "se", (360, 260)) == (100, 100, 360, 260)
+    # 拖到对边之外会翻转：忽略，避免选区消失
+    assert capture.resize_rect(rect, "e", (90, 170)) == rect
+
+
+def test_confirm_button_and_magnifier_clamp():
+    """确认按钮与放大镜靠近屏幕边缘时不越界。"""
+    capture = _load_capture()
+    assert capture.confirm_rect_for((100, 100, 300, 240), (800, 600)) == (300, 248, 384, 278)
+    btn = capture.confirm_rect_for((700, 500, 790, 590), (800, 600))
+    assert btn[2] <= 800 and btn[3] <= 600
+    assert capture.point_in_rect((310, 255), capture.confirm_rect_for((100, 100, 300, 240), (800, 600)))
+    assert capture.magnifier_source((10, 20), (800, 600)) == (0, 0, 96, 96)
+    assert capture.magnifier_source((790, 590), (800, 600)) == (704, 504, 800, 600)

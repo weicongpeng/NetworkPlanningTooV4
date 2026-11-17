@@ -13,7 +13,7 @@ import type { PointerEvent as ReactPointerEvent, ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
 import {
   ChevronLeft, ChevronRight, Download, ExternalLink, FileIcon, Loader2,
-  RotateCcw, X, ZoomIn, ZoomOut,
+  RotateCcw, RotateCw, X, ZoomIn, ZoomOut,
 } from 'lucide-react'
 
 import { imApi } from '../../services/api'
@@ -52,7 +52,9 @@ export function ImImageLightbox({ source, onClose }: Props) {
   const [retryCount, setRetryCount] = useState(0)
   const [scale, setScale] = useState(1)
   const [offset, setOffset] = useState({ x: 0, y: 0 })
+  const [rotation, setRotation] = useState(0)
   const stageRef = useRef<HTMLDivElement>(null)
+  const imageRef = useRef<HTMLImageElement>(null)
   const dragRef = useRef<{ x: number; y: number; ox: number; oy: number } | null>(null)
 
   // 画廊 = 当前会话已加载的全部图片。灯箱自己持有当前项，翻页不回写 store，
@@ -104,10 +106,11 @@ export function ImImageLightbox({ source, onClose }: Props) {
     }
   }, [current, retryCount])
 
-  // 换一张图复位视图
+  // 换一张图复位视图（含旋转），避免上一张的角度带到下一张
   useEffect(() => {
     setScale(1)
     setOffset({ x: 0, y: 0 })
+    setRotation(0)
   }, [current])
 
   // 原生 wheel 监听（passive:false 才能 preventDefault，避免页面一起滚动）
@@ -158,14 +161,36 @@ export function ImImageLightbox({ source, onClose }: Props) {
   }
   const onPointerUp = () => { dragRef.current = null }
 
-  const download = () => {
-    if (!url) return
+  const saveUrl = (href: string, filename: string, revoke = false) => {
     const anchor = document.createElement('a')
-    anchor.href = url
-    anchor.download = current.name
+    anchor.href = href
+    anchor.download = filename
     document.body.appendChild(anchor)
     anchor.click()
     anchor.remove()
+    if (revoke) window.setTimeout(() => URL.revokeObjectURL(href), 2000)
+  }
+
+  const download = () => {
+    if (!url) return
+    const image = imageRef.current
+    if (!rotation || !image?.naturalWidth) {
+      saveUrl(url, current.name)
+      return
+    }
+    // 旋转后下载：按最终朝向重建 PNG，避免下载下来还是原方向
+    const canvas = document.createElement('canvas')
+    canvas.width = rotation % 180 === 0 ? image.naturalWidth : image.naturalHeight
+    canvas.height = rotation % 180 === 0 ? image.naturalHeight : image.naturalWidth
+    const context = canvas.getContext('2d')
+    if (!context) { saveUrl(url, current.name); return }
+    context.translate(canvas.width / 2, canvas.height / 2)
+    context.rotate((rotation * Math.PI) / 180)
+    context.drawImage(image, -image.naturalWidth / 2, -image.naturalHeight / 2)
+    canvas.toBlob(blob => {
+      if (blob) saveUrl(URL.createObjectURL(blob), current.name, true)
+      else saveUrl(url, current.name)
+    }, 'image/png')
   }
   const openFile = () => {
     if (url) window.open(url, '_blank', 'noopener,noreferrer')
@@ -202,6 +227,14 @@ export function ImImageLightbox({ source, onClose }: Props) {
             </IconButton>
             <IconButton title={t('im.lightbox.zoomIn', '放大')} onClick={() => zoomBy(ZOOM_STEP)}>
               <ZoomIn size={18} />
+            </IconButton>
+            <IconButton title={t('im.lightbox.rotateLeft', '向左旋转 90°')}
+                        onClick={() => setRotation(value => (value + 270) % 360)}>
+              <RotateCcw size={18} />
+            </IconButton>
+            <IconButton title={t('im.lightbox.rotateRight', '向右旋转 90°')}
+                        onClick={() => setRotation(value => (value + 90) % 360)}>
+              <RotateCw size={18} />
             </IconButton>
           </>
         )}
@@ -253,11 +286,14 @@ export function ImImageLightbox({ source, onClose }: Props) {
           <Loader2 size={28} className="animate-spin text-white/60" />
         ) : isImage ? (
           <img
+            ref={imageRef}
             src={url}
             alt={current.name}
             draggable={false}
             className="max-h-full max-w-full select-none object-contain"
-            style={{ transform: `translate(${offset.x}px, ${offset.y}px) scale(${scale})` }}
+            style={{
+              transform: `translate(${offset.x}px, ${offset.y}px) scale(${scale}) rotate(${rotation}deg)`,
+            }}
           />
         ) : (
           <div className="flex w-[280px] flex-col items-center gap-3 rounded-2xl border border-white/15 bg-white/5 px-6 py-7 text-white">
@@ -278,8 +314,8 @@ export function ImImageLightbox({ source, onClose }: Props) {
       {isImage && (
         <p className="shrink-0 pb-3 text-center text-[11px] text-white/50">
           {canNavigate
-            ? t('im.lightbox.hintGallery', '滚轮缩放 · 拖拽平移 · 双击复位 · ← → 切换图片')
-            : t('im.lightbox.hint', '滚轮缩放 · 拖拽平移 · 双击复位')}
+            ? t('im.lightbox.hintGallery', '滚轮缩放 · 拖拽平移 · 旋转 · 双击复位 · ← → 切换图片')
+            : t('im.lightbox.hint', '滚轮缩放 · 拖拽平移 · 旋转 · 双击复位')}
         </p>
       )}
     </div>,

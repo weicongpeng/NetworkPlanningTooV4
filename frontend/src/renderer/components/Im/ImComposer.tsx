@@ -17,8 +17,10 @@ import {
   Paperclip, Scissors, Send, Settings2, Smile, X,
 } from 'lucide-react'
 
+import { imApi } from '../../services/api'
 import { useAuthStore } from '../../store/authStore'
 import { useImStore } from '../../store/imStore'
+import { useToastStore } from '../../store/toastStore'
 import { EMOJI_GROUPS } from './emojis'
 import { ImMentionPopup } from './ImMentionPopup'
 import {
@@ -28,6 +30,7 @@ import {
   formatHotkey, getScreenshotSettings, saveScreenshotSettings, useScreenshotSettings,
 } from './screenshotSettings'
 import { formatBytes, imUserId } from './types'
+import { openReceivedFile } from './attachmentKinds'
 import type { ImMember, ImMentionTarget, ImSendMention } from './types'
 
 interface PendingAttachment {
@@ -348,6 +351,28 @@ export function ImComposer({ conversationId }: { conversationId: number }) {
     addFiles(event.dataTransfer.files)
   }
 
+  /** 引用预览里的附件链接：图片进灯箱，文件按桌面/网页各自方式打开 */
+  const openReplyAttachment = async () => {
+    const att = replyTo?.attachment
+    if (!att?.id) return
+    if (replyTo?.kind === 'image' || att.mime?.startsWith('image/')) {
+      setLightbox({
+        name: att.original_name, mime: att.mime || 'image/png',
+        attachmentId: att.id, gallery: [], galleryIndex: 0,
+      })
+      return
+    }
+    try {
+      await openReceivedFile(
+        att.id, att.original_name, Boolean(desktopMode),
+        id => imApi.openAttachment(id),
+        (id, thumb) => imApi.attachmentBlob(id, thumb),
+      )
+    } catch {
+      useToastStore.getState().show(t('im.message.openReplyAttachmentFailed', '打开引用附件失败'))
+    }
+  }
+
   const disabled = (!text.trim() && pending.length === 0) || busy || sending
   const hasPendingMention = pendingMentions.mention_all || pendingMentions.mentions.length > 0
 
@@ -546,6 +571,14 @@ export function ImComposer({ conversationId }: { conversationId: number }) {
             <span className="line-clamp-1">
               {replyTo.content_text || (replyTo.attachment ? replyTo.attachment.original_name : '')}
             </span>
+            {replyTo.attachment?.id && (
+              <button type="button" onClick={() => void openReplyAttachment()}
+                      title={t('im.message.openReplyAttachment', '打开引用的附件')}
+                      className="mt-0.5 flex max-w-full items-center gap-1 text-primary hover:underline cursor-pointer">
+                <FileIcon size={11} />
+                <span className="truncate">{replyTo.attachment.original_name}</span>
+              </button>
+            )}
           </div>
           <button type="button" onClick={() => setReplyTo(null)}
                   title={t('im.common.cancel', '取消')}

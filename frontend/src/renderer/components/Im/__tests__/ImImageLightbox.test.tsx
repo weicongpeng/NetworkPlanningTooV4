@@ -54,6 +54,19 @@ describe('图片灯箱', () => {
     expect(document.querySelector('img')?.getAttribute('src')).toBe('blob:lightbox-1')
   })
 
+  it('左右旋转 90°，显示与下载都按最终角度', async () => {
+    render(<ImImageLightbox source={source} onClose={() => {}} />)
+    await waitFor(() => expect(document.querySelector('img')).toBeTruthy())
+    const image = document.querySelector('img')!
+    expect(image.style.transform).toContain('rotate(0deg)')
+    fireEvent.click(screen.getByTitle('向右旋转 90°'))
+    expect(image.style.transform).toContain('rotate(90deg)')
+    fireEvent.click(screen.getByTitle('向左旋转 90°'))
+    expect(image.style.transform).toContain('rotate(0deg)')
+    fireEvent.click(screen.getByTitle('向左旋转 90°'))
+    expect(image.style.transform).toContain('rotate(270deg)')
+  })
+
   it('关闭 / 卸载时只 revoke 自己创建的 URL，不借用外部 URL', async () => {
     const { unmount } = render(<ImImageLightbox source={source} onClose={() => {}} />)
     await waitFor(() => expect(createObjectURL).toHaveBeenCalledTimes(1))

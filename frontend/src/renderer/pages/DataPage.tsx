@@ -1617,7 +1617,6 @@ export function DataPage() {
             <div className="flex flex-col items-center justify-center py-12 text-muted-foreground">
               <ScrollText size={28} className="opacity-30 mb-3" />
               <p className="text-xs">{t('data.noLogs') || '暂无运行记录'}</p>
-              <p className="text-[10px] opacity-60 mt-1">{t('data.noLogsHint') || '执行上传、下载、删除等操作后，记录将出现在这里'}</p>
             </div>
           ) : (
             <div className="divide-y divide-border/40">

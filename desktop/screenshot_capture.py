@@ -192,6 +192,82 @@ def _png_files(image: Any, temp_dir: Path) -> Tuple[Path, Path]:
     return raw_path, dim_path
 
 
+def point_in_rect(point: Tuple[int, int], rect: Tuple[int, int, int, int]) -> bool:
+    return rect[0] <= point[0] <= rect[2] and rect[1] <= point[1] <= rect[3]
+
+
+def normalize_rect(rect: Tuple[int, int, int, int]) -> Tuple[int, int, int, int]:
+    left, top, right, bottom = rect
+    if right < left:
+        left, right = right, left
+    if bottom < top:
+        top, bottom = bottom, top
+    return (left, top, right, bottom)
+
+
+def handles_for_rect(rect: Tuple[int, int, int, int]) -> Dict[str, Tuple[int, int]]:
+    """选区四边 + 四角的 8 个修整把手（屏幕坐标）。"""
+    left, top, right, bottom = rect
+    cx, cy = (left + right) // 2, (top + bottom) // 2
+    return {
+        "nw": (left, top), "n": (cx, top), "ne": (right, top),
+        "e": (right, cy), "se": (right, bottom), "s": (cx, bottom),
+        "sw": (left, bottom), "w": (left, cy),
+    }
+
+
+def hit_handle(rect: Tuple[int, int, int, int], point: Tuple[int, int],
+               tolerance: int = 8) -> Optional[str]:
+    for name, (hx, hy) in handles_for_rect(rect).items():
+        if abs(point[0] - hx) <= tolerance and abs(point[1] - hy) <= tolerance:
+            return name
+    return None
+
+
+def resize_rect(rect: Tuple[int, int, int, int], handle: str,
+                point: Tuple[int, int]) -> Tuple[int, int, int, int]:
+    """按拖到的位置重算选区；宽高太小时忽略本次移动，避免选区翻转消失。"""
+    left, top, right, bottom = rect
+    # 把手拖过对边会翻转选区：直接忽略这次移动
+    if "w" in handle and point[0] > right - 8:
+        return rect
+    if "e" in handle and point[0] < left + 8:
+        return rect
+    if "n" in handle and point[1] > bottom - 8:
+        return rect
+    if "s" in handle and point[1] < top + 8:
+        return rect
+    if "w" in handle:
+        left = point[0]
+    if "e" in handle:
+        right = point[0]
+    if "n" in handle:
+        top = point[1]
+    if "s" in handle:
+        bottom = point[1]
+    result = normalize_rect((left, top, right, bottom))
+    if result[2] - result[0] < 8 or result[3] - result[1] < 8:
+        return rect
+    return result
+
+
+def confirm_rect_for(rect: Tuple[int, int, int, int],
+                     screen_size: Tuple[int, int]) -> Tuple[int, int, int, int]:
+    """确认按钮贴选区右下角，且始终留在画面内（与 rect 同坐标系，通常是客户区）。"""
+    width, height = 84, 30
+    left = max(0, min(int(rect[2]), int(screen_size[0]) - width - 2))
+    top = max(0, min(int(rect[3]) + 8, int(screen_size[1]) - height - 2))
+    return (left, top, left + width, top + height)
+
+
+def magnifier_source(center: Tuple[int, int], image_size: Tuple[int, int],
+                     radius: int = 48) -> Tuple[int, int, int, int]:
+    """放大镜取 cursor 周围原始像素；靠近边缘时平移取样框而不是越界。"""
+    left = max(0, min(int(image_size[0]) - radius * 2, int(center[0]) - radius))
+    top = max(0, min(int(image_size[1]) - radius * 2, int(center[1]) - radius))
+    return (left, top, left + radius * 2, top + radius * 2)
+
+
 def _run_overlay(
     raw_path: Path,
     dim_path: Path,
@@ -209,7 +285,7 @@ def _run_overlay(
 
     clr.AddReference("System.Windows.Forms")
     clr.AddReference("System.Drawing")
-    from System.Drawing import Bitmap, Color, Pen, Point, Rectangle
+    from System.Drawing import Bitmap, Color, Font, GraphicsUnit, Pen, Point, Rectangle, SolidBrush
     from System.Windows.Forms import (
         Application, Cursor, Form, FormBorderStyle, FormStartPosition, Label, Timer,
     )
@@ -230,9 +306,13 @@ def _run_overlay(
     white_pen = Pen(Color.FromArgb(255, 255, 255, 255), 2)
     state: Dict[str, Any] = {
         "selection": None,       # 屏幕坐标矩形（自动识别或自由框选）
-        "start": None,           # 自由框选起点
-        "dragging": False,
+        "hover": None,           # 鼠标下的窗口候选框，虚线提示
+        "start": None,           # 框选 / 移动 / 缩放起点
+        "mode": "idle",          # idle / create / move / resize
+        "handle": None,
+        "origin_rect": None,     # 拖拽开始时的选区，用于 move / resize 的基准
         "lbutton": False,
+        "cursor": (-9999, -9999),
         "done": False,
         "cancelled": False,
         "overlay_hwnd": 0,
@@ -267,17 +347,29 @@ def _run_overlay(
         _log.warning("设置截图蒙层扩展样式失败（窗口自动识别可能退化为整屏）")
 
     hint = Label()
-    hint.Text = "鼠标移到窗口上单击截取 · 按住拖拽自由框选 · ESC / 右键取消"
+    hint.Text = "移动鼠标自动识别窗口 · 拖拽框选/拖动边框修整 · 点「确定」完成 · Esc/右键取消"
     hint.AutoSize = True
     hint.BackColor = Color.FromArgb(190, 20, 20, 20)
     hint.ForeColor = Color.White
     hint.Location = Point(16, 16)
     form.Controls.Add(hint)
 
+    hover_pen = Pen(Color.FromArgb(255, 96, 165, 250), 1)
+    handle_pen = Pen(Color.FromArgb(255, 37, 99, 235), 1)
+    cross_pen = Pen(Color.FromArgb(255, 255, 255, 255), 1)
+    handle_brush = SolidBrush(Color.FromArgb(255, 37, 99, 235))
+    button_brush = SolidBrush(Color.FromArgb(235, 37, 99, 235))
+    button_text = SolidBrush(Color.FromArgb(255, 255, 255, 255))
+    button_font = Font("Microsoft YaHei", 10)
+
     def on_paint(_sender: Any, event: Any) -> None:
         graphics = event.Graphics
         graphics.DrawImage(dim_bitmap, 0, 0, size[0], size[1])
         selection = state["selection"]
+        hover = state["hover"]
+        if hover and hover != selection:
+            hl, ht, hr, hb = to_client(hover)
+            graphics.DrawRectangle(hover_pen, hl, ht, max(1, hr - hl), max(1, hb - ht))
         if selection:
             l, t, r, b = to_client(selection)
             width, height = r - l, b - t
@@ -286,6 +378,36 @@ def _run_overlay(
                 graphics.DrawImage(raw_bitmap, 0, 0, size[0], size[1])
                 graphics.ResetClip()
                 graphics.DrawRectangle(white_pen, l, t, width, height)
+                # 四边四角把手：按下后进入 resize，松手不结束会话
+                for hx, hy in handles_for_rect((l, t, r, b)).values():
+                    graphics.FillRectangle(handle_brush, hx - 3, hy - 3, 6, 6)
+                    graphics.DrawRectangle(handle_pen, hx - 3, hy - 3, 6, 6)
+            btn = confirm_rect_for((l, t, r, b), size)
+            graphics.FillRectangle(button_brush, btn[0], btn[1], btn[2] - btn[0], btn[3] - btn[1])
+            graphics.DrawString("确定", button_font, button_text, btn[0] + 20, btn[1] + 5)
+        # 鼠标旁的 2 倍放大镜：让像素级细节（文字/表格线）在选区时也能看清
+        cursor = state["cursor"]
+        if cursor[0] > -9000:
+            image_x, image_y = cursor[0] - origin[0], cursor[1] - origin[1]
+            src = magnifier_source((image_x, image_y), size)
+            mw, mh = 192, 192  # 取样 96×96 → 2 倍显示，保持比例
+            mx, my = image_x + 18, image_y + 18
+            if mx + mw > size[0]:
+                mx = image_x - mw - 18
+            if my + mh > size[1]:
+                my = image_y - mh - 18
+            mx = max(0, min(size[0] - mw, mx))
+            my = max(0, min(size[1] - mh, my))
+            graphics.DrawImage(
+                raw_bitmap, Rectangle(mx, my, mw, mh),
+                Rectangle(src[0], src[1], src[2] - src[0], src[3] - src[1]),
+                GraphicsUnit.Pixel,
+            )
+            graphics.DrawRectangle(white_pen, mx, my, mw, mh)
+            cross_x = mx + (image_x - src[0]) * 2
+            cross_y = my + (image_y - src[1]) * 2
+            graphics.DrawLine(cross_pen, cross_x - 10, cross_y, cross_x + 10, cross_y)
+            graphics.DrawLine(cross_pen, cross_x, cross_y - 10, cross_x, cross_y + 10)
 
     def finish(cancelled: bool, rect: Optional[Tuple[int, int, int, int]]) -> None:
         if state["done"]:
@@ -304,50 +426,76 @@ def _run_overlay(
             return
         position = Cursor.Position
         screen = (int(position.X), int(position.Y))
+        cursor_changed = screen != state["cursor"]
+        state["cursor"] = screen
+        full_screen = (
+            origin[0], origin[1], origin[0] + size[0], origin[1] + size[1])
+        hover = window_rect_at(screen, state["overlay_hwnd"]) or full_screen
+        if hover != state["hover"]:
+            cursor_changed = True
+        state["hover"] = hover
+
         # 只读一次：高位=当前是否按下，低位=自上次轮询以来是否发生过按下。
         # 低位用于兜住比轮询周期还短的单击，否则整段「按下→松开」会被采样漏掉。
         lbutton_state = int(user32.GetAsyncKeyState(VK_LBUTTON))
         left_down = bool(lbutton_state & 0x8000)
         click_pulse = bool(lbutton_state & 0x0001)
-        if click_pulse and not left_down and not state["lbutton"]:
-            rect = window_rect_at(screen, state["overlay_hwnd"])
-            if rect is None:
-                rect = (origin[0], origin[1], origin[0] + size[0], origin[1] + size[1])
-            finish(False, rect)
-            return
+
+        # 确认按钮（画在选区右下角，蒙层透明所以这里用命中测试而非 WinForms 控件事件）
+        selection = state["selection"]
+        button_screen = None
+        if selection:
+            btn = confirm_rect_for(to_client(selection), size)
+            button_screen = (btn[0] + origin[0], btn[1] + origin[1],
+                             btn[2] + origin[0], btn[3] + origin[1])
+            if point_in_rect(screen, button_screen) and (
+                    left_down or (click_pulse and not state["lbutton"])):
+                finish(False, selection)
+                return
+
         if left_down and not state["lbutton"]:
             state["start"] = screen
-            state["dragging"] = False
+            handle = hit_handle(selection, screen) if selection else None
+            if handle:
+                state["mode"] = "resize"
+                state["handle"] = handle
+                state["origin_rect"] = selection
+            elif selection and point_in_rect(screen, selection):
+                state["mode"] = "move"
+                state["origin_rect"] = selection
+            else:
+                state["mode"] = "create"
         elif left_down and state["start"] is not None:
             sx, sy = state["start"]
-            if abs(screen[0] - sx) > DRAG_THRESHOLD or abs(screen[1] - sy) > DRAG_THRESHOLD:
-                state["dragging"] = True
-            if state["dragging"]:
-                state["selection"] = (
-                    min(sx, screen[0]), min(sy, screen[1]),
-                    max(sx, screen[0]), max(sy, screen[1]),
-                )
-                form.Invalidate()
+            if state["mode"] == "create":
+                state["selection"] = normalize_rect((sx, sy, screen[0], screen[1]))
+            elif state["mode"] == "move" and state["origin_rect"]:
+                base = state["origin_rect"]
+                dx, dy = screen[0] - sx, screen[1] - sy
+                state["selection"] = (base[0] + dx, base[1] + dy,
+                                      base[2] + dx, base[3] + dy)
+            elif state["mode"] == "resize" and state["origin_rect"]:
+                state["selection"] = resize_rect(
+                    state["origin_rect"], state["handle"] or "", screen)
+            cursor_changed = True
         elif not left_down and state["lbutton"]:
-            # 松手瞬间：拖拽用框选，单击用当前鼠标下的顶层窗口矩形
-            if state["dragging"]:
-                rect = state["selection"]
-            else:
-                rect = window_rect_at(screen, state["overlay_hwnd"])
-                if rect is None:
-                    rect = (origin[0], origin[1], origin[0] + size[0], origin[1] + size[1])
-            finish(False, rect)
-            return
+            # 松手只结束本轮拖拽，不结束取景；等待用户拖动把手修整或点「确定」
+            if state["mode"] == "create":
+                sx, sy = state["start"]
+                if (abs(screen[0] - sx) <= DRAG_THRESHOLD
+                        and abs(screen[1] - sy) <= DRAG_THRESHOLD):
+                    state["selection"] = hover
+            state["mode"] = "idle"
+            state["handle"] = None
+            state["origin_rect"] = None
+            cursor_changed = True
         state["lbutton"] = left_down
 
-        if not left_down:
-            # 未按下时按鼠标停留位置自动识别顶层窗口范围
-            rect = window_rect_at(screen, state["overlay_hwnd"])
-            if rect is None:
-                rect = (origin[0], origin[1], origin[0] + size[0], origin[1] + size[1])
-            if rect != state["selection"]:
-                state["selection"] = rect
-                form.Invalidate()
+        # 还没选区时，选区实时跟随鼠标下的窗口（自动识别任意窗口区域）
+        if not left_down and state["selection"] is None:
+            state["selection"] = hover
+        if cursor_changed or left_down or state["lbutton"]:
+            form.Invalidate()
 
     timer = Timer()
     timer.Interval = POLL_INTERVAL_MS
@@ -365,12 +513,14 @@ def _run_overlay(
             timer.Dispose()
         except Exception:  # noqa: BLE001
             pass
-        try:
-            white_pen.Dispose()
-            raw_bitmap.Dispose()
-            dim_bitmap.Dispose()
-        except Exception:  # noqa: BLE001
-            pass
+        for resource in (
+            white_pen, hover_pen, handle_pen, cross_pen, handle_brush,
+            button_brush, button_text, button_font, raw_bitmap, dim_bitmap,
+        ):
+            try:
+                resource.Dispose()
+            except Exception:  # noqa: BLE001
+                pass
 
     if state["cancelled"] or not state["selection"]:
         return None

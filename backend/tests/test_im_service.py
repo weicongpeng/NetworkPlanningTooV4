@@ -572,3 +572,24 @@ def test_list_contacts_supports_limit_and_query(db):
     assert len(im_service.list_contacts(db, ids["alice"], limit=2)["users"]) == 2
     matched = im_service.list_contacts(db, ids["alice"], query="ali")["users"]
     assert [u["username"] for u in matched] == ["alice"]
+
+
+def test_reply_preview_carries_attachment_link(db):
+    """引用图片/文件时必须带 attachment_id 与文件名，前端才能渲染可点击链接。"""
+    ids = _users(db)
+    conv_id = im_service.create_direct(db, ids["alice"], ids["bob"])["conversation"]["id"]
+    started = im_attachment_service.start_upload(
+        db, ids["alice"], conv_id, "现场照片.png", "image/png", 4)
+    im_attachment_service.write_chunk(db, ids["alice"], started["upload_id"], 0, b"PNG!")
+    completed = im_attachment_service.complete_upload(db, ids["alice"], started["upload_id"])
+
+    first = im_service.send_message(
+        db, conv_id, ids["alice"], "image", attachment_id=completed["id"])["message"]
+    second = im_service.send_message(
+        db, conv_id, ids["bob"], "text", "这是什么", reply_to_id=first["id"])["message"]
+
+    reply = second["reply_to"]
+    assert reply["id"] == first["id"]
+    assert reply["attachment"]["id"] == completed["id"]
+    assert reply["attachment"]["original_name"] == "现场照片.png"
+    assert reply["attachment"]["mime"] == "image/png"

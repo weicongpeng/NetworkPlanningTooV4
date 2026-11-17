@@ -291,6 +291,46 @@ function FileBubble({ attachment, isMine }: {
   )
 }
 
+/** 引用块里的附件链接：图片进灯箱，其它文件交给系统默认应用 / 浏览器打开。 */
+function ReplyAttachmentLink({ attachment, isImage, onPreview }: {
+  attachment: ImAttachmentInfo
+  isImage: boolean
+  onPreview: (attachmentId: number, name: string, mime: string) => void
+}) {
+  const { t } = useTranslation()
+  const desktopMode = useAuthStore(s => s.desktopMode)
+  const [busy, setBusy] = useState(false)
+
+  const open = async () => {
+    if (isImage) {
+      onPreview(attachment.id, attachment.original_name, attachment.mime)
+      return
+    }
+    setBusy(true)
+    try {
+      await openReceivedFile(
+        attachment.id, attachment.original_name, desktopMode,
+        id => imApi.openAttachment(id),
+        (id, thumb) => imApi.attachmentBlob(id, thumb),
+      )
+    } catch {
+      /* 失败保持原样，用户可重试 */
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const Icon = isImage ? ImageIcon : FileIcon
+  return (
+    <button type="button" onClick={() => void open()}
+            title={t('im.message.openReplyAttachment', '打开引用的附件')}
+            className="mt-1 flex max-w-full items-center gap-1 text-primary hover:underline cursor-pointer">
+      {busy ? <Loader2 size={12} className="animate-spin" /> : <Icon size={12} />}
+      <span className="truncate">{attachment.original_name}</span>
+    </button>
+  )
+}
+
 function ImMessageItemBase({
   message, isMine, onPreview, onRetry, onContextMenu,
   selectionMode = false, selected = false, onToggleSelect,
@@ -347,7 +387,20 @@ function ImMessageItemBase({
             <div className={`mb-1.5 border-l-2 pl-2 text-[11px] opacity-80
               ${isMine ? 'border-primary-foreground/60' : 'border-primary/60'}`}>
               <span className="font-medium">{message.reply_to.sender_name || t('im.message.me', '我')}：</span>
-              <span className="line-clamp-2">{message.reply_to.preview || '[附件]'}</span>
+              {message.reply_to.preview
+                && !(message.reply_to.attachment && message.reply_to.preview.startsWith('[附件]')) && (
+                <span className="line-clamp-2">{message.reply_to.preview}</span>
+              )}
+              {message.reply_to.attachment?.id ? (
+                <ReplyAttachmentLink
+                  attachment={message.reply_to.attachment}
+                  isImage={message.reply_to.kind === 'image'
+                    || Boolean(message.reply_to.attachment.mime?.startsWith('image/'))}
+                  onPreview={onPreview}
+                />
+              ) : !message.reply_to.preview ? (
+                <span className="line-clamp-2">[附件]</span>
+              ) : null}
             </div>
           )}
           {showMentionChips && (

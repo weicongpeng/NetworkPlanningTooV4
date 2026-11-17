@@ -3,6 +3,7 @@
 """
 from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
@@ -214,10 +215,20 @@ async def delete_user(
     admin_user: User = Depends(get_current_admin_user),
     db: Session = Depends(get_db),
 ):
-    """硬删除用户"""
+    """硬删除用户；组共享数据与 IM 历史改挂当前管理员，避免外键约束导致 500。"""
     if user_id == admin_user.id:
         raise HTTPException(status_code=400, detail="不能删除自己的账号")
-    success = auth_service.delete_user(db, user_id)
+    try:
+        success = auth_service.delete_user(db, user_id, reassign_to_id=admin_user.id)
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=f"无法删除：{exc}") from exc
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=400,
+            detail=f"删除失败：该用户仍被其它业务数据引用（{type(exc).__name__}）",
+        ) from exc
     if not success:
         raise HTTPException(status_code=404, detail="用户不存在")
     return {"success": True, "message": "用户已删除"}

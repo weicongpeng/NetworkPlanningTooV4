@@ -155,6 +155,8 @@ export interface ImReplyPreview {
   sender_name: string
   kind: ImMessageKind
   preview: string
+  /** 被引用消息的附件摘要：有 id 时前端渲染成可打开的链接 */
+  attachment?: ImAttachmentInfo | null
 }
 
 export interface ImMessage {

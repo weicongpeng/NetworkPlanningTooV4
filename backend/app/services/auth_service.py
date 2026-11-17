@@ -480,18 +480,58 @@ class AuthService:
         ).first()
         return session is not None
 
-    def delete_user(self, db: Session, user_id: int) -> bool:
-        """硬删除用户及其会话/设置。
+    def delete_user(self, db: Session, user_id: int,
+                    reassign_to_id: Optional[int] = None) -> bool:
+        """硬删除用户；把组共享数据、IM 历史等外键引用改挂到接手人。
 
-        注意：业务数据（Workbook/Site/Sector/GeoFile/Layer/TaskResult）不归用户所有，
-        而是归（地市+运营商）组所有，不随成员删除而级联删除。
+        业务数据（Workbook/Site/Sector/GeoFile/Layer 等）归（地市+运营商）组所有，
+        不该随成员删除而消失；但这些表仍有非空 user_id 外键，SQLite 打开
+        PRAGMA foreign_keys=ON 时直接 db.delete(user) 会抛 IntegrityError → 前端 500。
+        遍历所有指向 users.id 的外键统一处理：可空的置 NULL，非空的改挂接手人；
+        只删真正的私有数据（会话、设置、IM 成员/被 @ 记录）。
         """
+        from app.core.database import Base
+        from app.models.database import ImConversationMember, ImMessageMention
+
         user = self.get_user_by_id(db, user_id)
         if not user:
             return False
-        # 仅级联删除用户私有数据（会话与个性化设置）
-        db.query(UserSession).filter(UserSession.user_id == user_id).delete()
-        db.query(UserSettings).filter(UserSettings.user_id == user_id).delete()
+        if reassign_to_id is None or reassign_to_id == user_id:
+            target = (
+                db.query(User)
+                .filter(User.id != user_id, User.is_active.is_(True))
+                .order_by(User.is_admin.desc(), User.id.asc())
+                .first()
+            )
+            if target is None:
+                raise ValueError("NO_REASSIGN_TARGET")
+            reassign_to_id = target.id
+
+        private_tables = {
+            "user_sessions", "user_settings",
+            "im_conversation_members", "im_message_mentions",
+        }
+        for table in Base.metadata.sorted_tables:
+            if table.name in private_tables:
+                continue
+            for column in table.columns:
+                if not any(fk.target_fullname == "users.id" for fk in column.foreign_keys):
+                    continue
+                if column.nullable:
+                    db.query(table).filter(column == user_id).update(
+                        {column: None}, synchronize_session=False)
+                else:
+                    db.query(table).filter(column == user_id).update(
+                        {column: reassign_to_id}, synchronize_session=False)
+
+        db.query(UserSession).filter(UserSession.user_id == user_id).delete(
+            synchronize_session=False)
+        db.query(UserSettings).filter(UserSettings.user_id == user_id).delete(
+            synchronize_session=False)
+        db.query(ImConversationMember).filter(ImConversationMember.user_id == user_id).delete(
+            synchronize_session=False)
+        db.query(ImMessageMention).filter(ImMessageMention.user_id == user_id).delete(
+            synchronize_session=False)
         db.delete(user)
         db.commit()
         return True

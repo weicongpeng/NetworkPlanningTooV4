@@ -601,7 +601,9 @@ export const useImStore = create<ImState>()(
           reply_to: reply ? {
             id: reply.id, sender_id: reply.sender_id, sender_name: reply.sender_name,
             kind: reply.kind,
-            preview: (reply.content_text || (reply.attachment ? '[附件]' : '')).slice(0, 120),
+            preview: (reply.content_text
+              || (reply.attachment ? `[附件] ${reply.attachment.original_name}` : '')).slice(0, 120),
+            attachment: reply.attachment ?? null,
           } : null,
         }
         set(s => ({ sending: true, messages: { ...s.messages, [id]: mergeMessages(s.messages[id] || [], [optimistic]) } }))

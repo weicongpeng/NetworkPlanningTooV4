@@ -673,12 +673,30 @@ def _load_mentions(db: Session, message_ids: List[int]) -> Dict[int, List[Dict[s
 
 
 def _reply_preview(message: Optional[ImMessage],
-                   sender_names: Dict[int, str]) -> Optional[Dict[str, Any]]:
-    """引用消息的轻量摘要（不递归嵌套引用，避免历史页传输膨胀）。"""
+                   sender_names: Dict[int, str],
+                   db: Optional[Session] = None,
+                   attachments: Optional[Dict[int, Any]] = None) -> Optional[Dict[str, Any]]:
+    """引用消息的轻量摘要（不递归嵌套引用，避免历史页传输膨胀）。
+
+    附件摘要要带 attachment_id，前端才能把引用里的图片/文件渲染成可打开链接；
+    只写 "[附件]" 会让用户看到引用却点不开原图/原文件。
+    """
     if message is None:
         return None
     text = (message.content_text or "").strip()
-    if not text and message.attachment_id:
+    att = None
+    if message.attachment_id:
+        att = attachments.get(message.attachment_id) if attachments is not None else None
+        if att is None and db is not None:
+            att = db.query(ImAttachment).filter(ImAttachment.id == message.attachment_id).first()
+    def _field(name: str) -> Any:
+        if isinstance(att, dict):
+            return att.get(name)
+        return getattr(att, name, None) if att is not None else None
+
+    if not text and att is not None:
+        text = f"[附件] {_field('original_name') or ''}"
+    elif not text and message.attachment_id:
         text = "[附件]"
     return {
         "id": message.id,
@@ -686,6 +704,11 @@ def _reply_preview(message: Optional[ImMessage],
         "sender_name": sender_names.get(message.sender_id, ""),
         "kind": message.kind,
         "preview": text[:120],
+        "attachment": ({
+            "id": _field("id"), "original_name": _field("original_name"),
+            "mime": _field("mime"), "size_bytes": _field("size_bytes"),
+            "has_thumb": bool(_field("has_thumb") or _field("thumb_path")),
+        } if att is not None and _field("id") else None),
     }
 
 
@@ -725,7 +748,7 @@ def _serialize_message(db: Session, message: ImMessage,
         "reply_to_id": message.reply_to_id,
         "reply_to": _reply_preview(
             reply_map.get(message.reply_to_id) if reply_map else None,
-            sender_names,
+            sender_names, db, attachments,
         ),
     }
 
@@ -772,6 +795,15 @@ def list_messages(db: Session, conversation_id: int, user_id: int,
         {r.id: r for r in db.query(ImMessage).filter(ImMessage.id.in_(list(reply_ids))).all()}
         if reply_ids else {}
     )
+    # 引用消息可能是更早的消息，其附件不在本页 attachment_ids 里；一并预取，
+    # 让引用块能直接给出可打开的附件链接，且不会引入逐行 N+1。
+    reply_attachment_ids = {
+        r.attachment_id for r in reply_map.values() if r.attachment_id
+    } - set(attachments)
+    if reply_attachment_ids:
+        for att in db.query(ImAttachment).filter(
+                ImAttachment.id.in_(list(reply_attachment_ids))).all():
+            attachments[att.id] = att
     return {
         "items": [_serialize_message(db, m, sender_names, attachments,
                                      mention_map, viewer_id=user_id,
