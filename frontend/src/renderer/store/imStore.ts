@@ -66,6 +66,8 @@ interface ImState {
   toggleOpen: () => void
   setTab: (tab: ImTab) => void
   setActiveConversation: (id: number | null) => void
+  /** 用户点击聊天区时标记该会话已读（不必先点左侧列表头像） */
+  markConversationRead: (id: number) => void
   setDraft: (text: string) => void
   draftFor: (conversationId: number | null) => string
   setLightbox: (value: ImState['lightbox']) => void
@@ -391,10 +393,32 @@ export const useImStore = create<ImState>()(
         return get().drafts[userId]?.[conversationId] || ''
       },
 
-      setActiveConversation: id => {
+      markConversationRead: id => {
+        // 用户点开左侧会话或直接点聊天区都算已读：红点立刻消失，不等轮询/翻页。
         viewedConversationId = id
+        set(s => {
+          const conversations = clearActiveUnread(s.conversations, id, true)
+          return {
+            conversations,
+            unreadTotal: conversations.reduce(
+              (sum: number, c: ImConversation) => sum + (c.unread || 0), 0),
+          }
+        })
+        const lastId = Math.max(
+          get().cursors[id]?.next ?? 0,
+          get().messages[id]?.slice(-1)[0]?.id ?? 0,
+        )
+        if (lastId > 0) void imApi.markRead(id, lastId).catch(() => {})
+      },
+
+      setActiveConversation: id => {
+        if (id === null) {
+          viewedConversationId = null
+          set({ activeConversationId: null })
+          return
+        }
+        get().markConversationRead(id)
         set({ activeConversationId: id })
-        if (id === null) return
         // 该会话在后台收过新消息：用增量补拉接上游标，避免 initial 重置窗口
         // 把还没读的历史消息丢掉；否则按原有行为拉最新一页。
         if (dirtyConversations.has(id) && get().cursors[id]) {

@@ -167,10 +167,38 @@ describe('imStore', () => {
     expect(useImStore.getState().conversations[0].unread).toBe(3)
     expect(useImStore.getState().unreadTotal).toBe(3)
 
+    // 命中本地缓存的会话：点开瞬间就要清红点并回写已读，不等下一轮轮询
+    useImStore.setState({
+      conversations: [unreadConv], unreadTotal: 3,
+      cursors: { 7: { next: 9, prev: null, hasMore: false } },
+      messages: { 7: [message(9)] },
+    })
+    vi.mocked(imApi.markRead).mockClear()
     useImStore.getState().setActiveConversation(7)
-    await useImStore.getState().refreshConversations()
     expect(useImStore.getState().conversations[0].unread).toBe(0)
     expect(useImStore.getState().unreadTotal).toBe(0)
+    expect(imApi.markRead).toHaveBeenCalledWith(7, 9)
+  })
+
+  it('点击聊天区标记已读：左侧未读计数立即消失且回写服务端', async () => {
+    useImStore.getState().resetForUserSwitch()
+    const unreadConv = { ...conversation(7), unread: 4 }
+    useImStore.setState({
+      open: true, conversations: [unreadConv], unreadTotal: 4,
+      cursors: { 7: { next: 12, prev: null, hasMore: false } },
+      messages: { 7: [message(12)] },
+    })
+    vi.mocked(imApi.markRead).mockClear()
+    vi.mocked(imApi.conversations).mockResolvedValue(conversationsPage([unreadConv]) as any)
+
+    useImStore.getState().markConversationRead(7)
+
+    expect(useImStore.getState().conversations[0].unread).toBe(0)
+    expect(useImStore.getState().unreadTotal).toBe(0)
+    expect(imApi.markRead).toHaveBeenCalledWith(7, 12)
+    // 已查看标记同步写入，后续轮询也不会把红点刷回来
+    await useImStore.getState().refreshConversations()
+    expect(useImStore.getState().conversations[0].unread).toBe(0)
   })
 
   it('收起再展开窗口后旧会话未读不再被自动清掉', async () => {

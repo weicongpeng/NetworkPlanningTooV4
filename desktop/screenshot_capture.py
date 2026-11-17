@@ -291,6 +291,26 @@ def should_show_magnifier(selection_committed: bool) -> bool:
     return not selection_committed
 
 
+def cursor_for_point(selection_committed: bool,
+                     selection: Optional[Tuple[int, int, int, int]],
+                     point: Tuple[int, int]) -> str:
+    """返回光标语义名：框选十字、四向移动、双边缩放或默认箭头。"""
+    if not selection_committed:
+        return "cross"
+    if selection and point_in_rect(point, selection):
+        handle = hit_handle(selection, point)
+        if handle in ("n", "s"):
+            return "ns"
+        if handle in ("e", "w"):
+            return "we"
+        if handle in ("ne", "sw"):
+            return "nesw"
+        if handle in ("nw", "se"):
+            return "nwse"
+        return "move"
+    return "arrow"
+
+
 def magnifier_source(center: Tuple[int, int], image_size: Tuple[int, int],
                      radius: int = 48) -> Tuple[int, int, int, int]:
     """放大镜取 cursor 周围原始像素；靠近边缘时平移取样框而不是越界。"""
@@ -318,7 +338,7 @@ def _run_overlay(
     clr.AddReference("System.Drawing")
     from System.Drawing import Bitmap, Color, Font, GraphicsUnit, Pen, Point, Rectangle, SolidBrush
     from System.Windows.Forms import (
-        Application, Cursor, Form, FormBorderStyle, FormStartPosition, Label, Timer,
+        Application, Cursor, Cursors, Form, FormBorderStyle, FormStartPosition, Label, Timer,
     )
 
     user32 = ctypes.WinDLL("user32", use_last_error=True)
@@ -345,6 +365,7 @@ def _run_overlay(
         "origin_rect": None,     # 拖拽开始时的选区，用于 move / resize 的基准
         "lbutton": False,
         "cursor": (-9999, -9999),
+        "cursor_name": "",       # 避免每个 Tick 都给 form.Cursor 赋同一个对象
         "done": False,
         "cancelled": False,
         "overlay_hwnd": 0,
@@ -393,6 +414,15 @@ def _run_overlay(
     button_brush = SolidBrush(Color.FromArgb(235, 37, 99, 235))
     button_text = SolidBrush(Color.FromArgb(255, 255, 255, 255))
     button_font = Font("Microsoft YaHei", 10)
+    cursor_map = {
+        "cross": Cursors.Cross,       # 框选 / 自动识别窗口
+        "move": Cursors.SizeAll,      # 选区内部：四向十字箭头
+        "ns": Cursors.SizeNS,
+        "we": Cursors.SizeWE,
+        "nesw": Cursors.SizeNESW,
+        "nwse": Cursors.SizeNWSE,
+        "arrow": Cursors.Arrow,
+    }
 
     def on_paint(_sender: Any, event: Any) -> None:
         graphics = event.Graphics
@@ -490,6 +520,11 @@ def _run_overlay(
         # （蒙层透明，按钮用命中测试而非 WinForms 控件事件）
         selection = state["selection"]
         committed = state["selection_committed"]
+        # 光标反馈：框选十字；提交后边框把手是双向缩放箭头，选区内部是四向十字。
+        cursor_name = cursor_for_point(committed, selection, screen)
+        if cursor_name != state["cursor_name"]:
+            form.Cursor = cursor_map[cursor_name]
+            state["cursor_name"] = cursor_name
         button_screen = None
         if committed and selection:
             btn = confirm_rect_for(to_client(selection), size)

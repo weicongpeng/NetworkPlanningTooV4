@@ -47,6 +47,7 @@ export function ImChatPanel({ conversation, narrow, onBack }: Props) {
   const setReplyTo = useImStore(s => s.setReplyTo)
   const deleteMessage = useImStore(s => s.deleteMessage)
   const forwardMessages = useImStore(s => s.forwardMessages)
+  const markConversationRead = useImStore(s => s.markConversationRead)
   const conversations = useImStore(s => s.conversations)
   const [menu, setMenu] = useState<MessageMenuState | null>(null)
   const [selectionMode, setSelectionMode] = useState(false)
@@ -207,7 +208,8 @@ export function ImChatPanel({ conversation, narrow, onBack }: Props) {
     : undefined
 
   return (
-    <div className="relative flex min-w-0 flex-1 flex-col bg-background/30">
+    <div className="relative flex min-w-0 flex-1 flex-col bg-background/30"
+         onPointerDown={() => markConversationRead(conversation.id)}>
       <header className="flex h-14 shrink-0 items-center gap-2 border-b border-border/60 bg-card/70 px-3 backdrop-blur-sm">
         {narrow && (
           <button type="button" onClick={onBack} title={t('im.chat.back', '返回列表')}

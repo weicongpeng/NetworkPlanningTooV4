@@ -241,3 +241,16 @@ def test_magnifier_only_before_selection_commit():
     capture = _load_capture()
     assert capture.should_show_magnifier(False) is True
     assert capture.should_show_magnifier(True) is False
+
+
+def test_cursor_feedback_around_committed_selection():
+    """边框把手显示双向缩放光标，选区内部是四向十字，框选阶段是十字。"""
+    capture = _load_capture()
+    rect = (100, 100, 300, 240)
+    assert capture.cursor_for_point(False, rect, (200, 170)) == "cross"
+    assert capture.cursor_for_point(True, rect, (200, 170)) == "move"
+    assert capture.cursor_for_point(True, rect, (100, 170)) == "we"
+    assert capture.cursor_for_point(True, rect, (200, 100)) == "ns"
+    assert capture.cursor_for_point(True, rect, (300, 240)) == "nwse"
+    assert capture.cursor_for_point(True, rect, (100, 240)) == "nesw"
+    assert capture.cursor_for_point(True, rect, (10, 10)) == "arrow"
