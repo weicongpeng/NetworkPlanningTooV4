@@ -37,6 +37,38 @@ router = APIRouter(tags=["桌面客户端在线接口"])
 
 _rl_buckets: Dict[str, List[float]] = defaultdict(list)
 
+# 服务端对外公布的「内网直连地址」（Tailscale）。握手时下发给客户端，
+# 客户端探测通了就用它下载 OTA，绕开公网隧道。探测有开销，缓存结果。
+_lan_url_cache: Dict[str, Any] = {"url": "", "checked_at": 0.0}
+
+
+def _server_lan_url() -> str:
+    """返回本服务器可用的内网直连 URL；未接入 Tailscale/无配置时为空。
+
+    优先管理员显式配置的 NPT_SERVER_LAN_URL；否则尝试 `tailscale ip -4`
+    取本机 tailnet IPv4。只在本机执行一次并缓存（Tailscale IP 基本稳定）。
+    """
+    explicit = (getattr(settings, "NPT_SERVER_LAN_URL", "") or "").strip().rstrip("/")
+    if explicit.startswith(("http://", "https://")):
+        return explicit
+    now = time.monotonic()
+    if now - _lan_url_cache["checked_at"] < 600 and _lan_url_cache["url"]:
+        return _lan_url_cache["url"]
+    url = ""
+    try:
+        import subprocess
+
+        out = subprocess.run(
+            ["tailscale", "ip", "-4"], capture_output=True, text=True, timeout=3
+        )
+        ip = (out.stdout or "").strip().splitlines()
+        if out.returncode == 0 and ip:
+            url = f"http://{ip[0].strip()}:{settings.PORT}"
+    except Exception:  # noqa: BLE001 - 未装 tailscale / 超时都不影响正常握手
+        url = ""
+    _lan_url_cache.update(url=url, checked_at=now)
+    return url
+
 
 def _gbk_safe(message: str) -> str:
     return str(message).encode("gbk", "replace").decode("gbk")
@@ -364,6 +396,8 @@ async def client_config() -> Dict[str, Any]:
             "lease_days": int(settings.NPT_DESKTOP_LEASE_DAYS or 30),
             "channel": settings.NPT_DESKTOP_CHANNEL or "stable",
             "server_url": settings.NPT_SERVER_URL,
+            # 内网直连地址（Tailscale）：客户端探测通了就用它下载 OTA，绕开公网隧道
+            "lan_url": _server_lan_url(),
             "signing_configured": True,  # 私有实现细节不暴露；签发失败时激活接口会返回 503
         },
     }
@@ -1177,6 +1211,8 @@ async def latest_release(
             "published_at": record.created_at,
             "update_available": update_available,
             "download_url": f"/api/v1/desktop-cloud/releases/download/{record.id}",
+            # 内网直连地址（Tailscale）：客户端探测通后改用它下载，绕开公网隧道
+            "lan_url": _server_lan_url(),
         },
     }
 

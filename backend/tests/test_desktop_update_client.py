@@ -110,6 +110,95 @@ def test_download_resumes_from_part(updater_env):
     assert installer.read_bytes() == PAYLOAD  # 续传后内容完整
 
 
+# --------------------------------------------------- 并行分块下载（OTA 提速）
+BIG_PAYLOAD = bytes((i * 37 + 11) % 256 for i in range(1024 * 1024 + 4096))
+BIG_SHA = hashlib.sha256(BIG_PAYLOAD).hexdigest()
+
+
+class _BigRangeHandler(BaseHTTPRequestHandler):
+    """严格按 Range 结束位返回的分段服务器，用于验证多连接拼接。"""
+
+    hits: int = 0
+
+    def do_GET(self):  # noqa: N802
+        type(self).hits += 1
+        rng = self.headers.get("Range")
+        start, end = 0, len(BIG_PAYLOAD) - 1
+        if rng:
+            m = re.match(r"bytes=(\d+)-(\d*)", rng)
+            if m:
+                start = int(m.group(1))
+                if m.group(2):
+                    end = min(int(m.group(2)), end)
+        body = BIG_PAYLOAD[start : end + 1]
+        self.send_response(206 if rng else 200)
+        if rng:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{len(BIG_PAYLOAD)}")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+
+def test_parallel_download_reassembles_and_verifies(updater_env, monkeypatch):
+    """大文件走多连接分块下载，按区间顺序拼接后字节完整、sha256 通过。"""
+    updater = updater_env.updater
+    server = HTTPServer(("127.0.0.1", 0), _BigRangeHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    monkeypatch.setattr(updater_env.settings, "NPT_SERVER_URL", f"http://127.0.0.1:{server.server_port}")
+    monkeypatch.setattr(updater_env.settings, "NPT_OTA_CHUNKS", 4)
+    try:
+        updater.start_download(_release(sha256=BIG_SHA, file_size=len(BIG_PAYLOAD)))
+        state = _wait_ready(updater, timeout=30)
+        assert state["phase"] == "ready", state
+        installer = updater_env.tmp_path / "updates" / "NetOpt Engine_Setup-1.0.0.exe"
+        assert installer.read_bytes() == BIG_PAYLOAD
+        # 分段临时目录应已清理
+        assert not (updater_env.tmp_path / "updates" / ".NetOpt Engine_Setup-1.0.0.exe.part.segs").exists()
+        # 确实发起了多个 Range 请求（并行分块生效）
+        assert _BigRangeHandler.hits >= 4
+    finally:
+        server.shutdown()
+
+
+def test_lan_effective_url_probe_and_fallback(monkeypatch):
+    """内网地址探通则用它，探不通回退公网；显式配置优先于握手公布值。"""
+    from app.services import desktop_cloud_client as client
+
+    # 专门返回标准握手形状的探测 handler
+    class _Handshake(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            body = json.dumps({"success": True, "data": {"desktop_mode": True}}).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    lan = HTTPServer(("127.0.0.1", 0), _Handshake)
+    threading.Thread(target=lan.serve_forever, daemon=True).start()
+    monkeypatch.setattr(client.settings, "NPT_SERVER_URL", "https://app.pengwc.asia")
+    monkeypatch.setattr(client.settings, "NPT_LAN_PREFER", True)
+    monkeypatch.setattr(client.settings, "NPT_SERVER_LAN_URL", f"http://127.0.0.1:{lan.server_port}")
+    # 清除缓存
+    with client._lan_lock:
+        client._lan_state.update(url="", public="", checked_at=0.0, ok=False)
+    try:
+        assert client.get_effective_server_url() == f"http://127.0.0.1:{lan.server_port}"
+    finally:
+        lan.shutdown()
+
+    # 探不通时回退公网
+    monkeypatch.setattr(client.settings, "NPT_SERVER_LAN_URL", "http://127.0.0.1:1")
+    with client._lan_lock:
+        client._lan_state.update(url="", public="", checked_at=0.0, ok=False)
+    assert client.get_effective_server_url() == "https://app.pengwc.asia"
+
+
 class _FlakyHandler(BaseHTTPRequestHandler):
     """首次响应按完整长度声明、只写一半就断开：模拟链路被中途切断。
 

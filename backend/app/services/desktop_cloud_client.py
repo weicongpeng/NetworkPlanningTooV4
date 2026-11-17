@@ -9,6 +9,8 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -74,6 +76,81 @@ def clear_state(*keys: str) -> Dict[str, Any]:
 
 def server_url() -> str:
     return (settings.NPT_SERVER_URL or "").strip().rstrip("/")
+
+
+# ---------------------------------------------------------------- 内网直连（Tailscale）探测
+# 说明：server_url() 保持返回配置的公网地址（授权/同步/IM 等链路与既有测试不变）。
+# OTA 这类大流量下载改走 get_effective_server_url()：它在服务端握手公布（或管理员
+# 显式配置）的内网地址里挑一个「探得通」的用来下载，失败/未配置时原样回退公网。
+
+_lan_lock = threading.Lock()
+_lan_state: Dict[str, Any] = {"url": "", "public": "", "checked_at": 0.0, "ok": False}
+_LAN_TTL_SECONDS = 600.0  # 探测结果缓存 10 分钟；Tailscale 地址漂移后会自动重探
+
+
+def remember_lan_url(url: Any) -> None:
+    """记录服务端握手公布的内网地址（如 http://100.x.y.z:8000）。
+
+    只登记、不探测：真正的可达性校验在 get_effective_server_url() 里做，
+    避免为一次失败的内网地址反复打握手请求。
+    """
+    value = str(url or "").strip().rstrip("/")
+    if value.startswith("http://") or value.startswith("https://"):
+        with _lan_lock:
+            _lan_state["url"] = value
+            _lan_state["checked_at"] = 0.0  # 新地址触发重新探测
+            _lan_state["ok"] = False
+
+
+def _probe_base(base: str, timeout: float = 1.5) -> bool:
+    """探测 base 是否为可达的本系统后端（公开端点 /system/desktop-mode，响应快）。"""
+    try:
+        request = urllib.request.Request(
+            f"{base}/api/v1/system/desktop-mode",
+            headers={"User-Agent": "NPT-Desktop-LANProbe"},
+        )
+        with urllib.request.urlopen(request, timeout=timeout) as resp:
+            payload = json.load(resp)
+            return bool(payload.get("success"))
+    except Exception:  # noqa: BLE001 - 探测失败一律视为不可用
+        return False
+
+
+def get_effective_server_url() -> str:
+    """返回下载应使用的 base URL：内网通了用内网，否则回退公网。
+
+    候选来源：显式 NPT_SERVER_LAN_URL > 服务端握手公布的 lan_url。
+    未开启 NPT_LAN_PREFER、没有候选、或候选探不通时，均返回 server_url()。
+    """
+    public = server_url()
+    if not getattr(settings, "NPT_LAN_PREFER", True):
+        return public
+
+    now = time.monotonic()
+    explicit = (getattr(settings, "NPT_SERVER_LAN_URL", "") or "").strip().rstrip("/")
+    with _lan_lock:
+        remembered = _lan_state["url"]
+        checked_at = _lan_state["checked_at"]
+        cached_ok = _lan_state.get("ok", False)
+        cached_public = _lan_state.get("public", "")
+    candidate = explicit or remembered
+    if not candidate or candidate.rstrip("/") == public.rstrip("/"):
+        return public
+    # 缓存命中（同一公网 base + 同一候选）：探通过的直接用，探失败的按 TTL 定期重试
+    if (
+        checked_at
+        and cached_public == public
+        and now - checked_at < _LAN_TTL_SECONDS
+    ):
+        return candidate if cached_ok else public
+
+    ok = _probe_base(candidate)
+    with _lan_lock:
+        _lan_state["url"] = candidate
+        _lan_state["public"] = public
+        _lan_state["checked_at"] = now
+        _lan_state["ok"] = ok
+    return candidate if ok else public
 
 
 def _request(method: str, path: str, payload: Optional[dict] = None, timeout: int = 20) -> dict:

@@ -19,8 +19,9 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from app.core.config import settings
 from app.services import desktop_cloud_client as cloud
@@ -79,6 +80,8 @@ def check_latest(raise_on_error: bool = False) -> Optional[Dict[str, Any]]:
     data = resp.get("data")
     if not data:
         return None
+    # 服务端握手公布的内网直连地址（Tailscale），记下来供下载探测使用
+    cloud.remember_lan_url(data.get("lan_url"))
     data["current"] = current
     # 服务端已按版本比较；客户端再兜底一次：服务器记录格式差异（或 current 上报为空）
     # 不能把低于本机版本的包当「有更新」推送——手动装了新版本后最容易复现。
@@ -101,7 +104,8 @@ def _download_url(release: Dict[str, Any]) -> str:
     url = str(release.get("download_url") or "")
     if url.startswith("http"):
         return url
-    return f"{cloud.server_url()}{url}"
+    # 内网直连（Tailscale）探通用内网、否则回退公网；避免 OTA 大流量绕公网隧道
+    return f"{cloud.get_effective_server_url()}{url}"
 
 
 def _hash_file(path: Path) -> str:
@@ -112,6 +116,66 @@ def _hash_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _fetch_range(url: str, start: int, end: Optional[int], dest: Path, progress: List[int]) -> None:
+    """下载 [start, end] 区间到 dest（分段文件），带断点续传与重试。
+
+    - dest 已存在时按其大小续传（Range: bytes=<已下载起点>-），与单连接逻辑同口径；
+    - 服务端不支持 Range（返回 200）时从头下载并校验起点，避免拼出坏包；
+    - 连接中途被切断时 resp.read() 只返回 b""，必须按区间长度判断是否取满。
+    """
+    want = (end - start + 1) if end is not None else None
+    for attempt in range(1, 6):
+        pos = dest.stat().st_size if dest.exists() else 0
+        if want is not None and pos >= want:
+            progress[0] = want
+            return
+        headers = {"User-Agent": "NPT-Desktop-Updater"}
+        if pos:
+            headers["Range"] = f"bytes={start + pos}-"
+        request = urllib.request.Request(url, headers=headers)
+        written = 0
+        try:
+            with urllib.request.urlopen(request, timeout=60) as resp:
+                status = getattr(resp, "status", 200)
+                resumed = pos > 0 and status == 206
+                if resumed:
+                    match = re.match(r"bytes\s+(\d+)-", resp.headers.get("Content-Range") or "")
+                    if not match or int(match.group(1)) != start + pos:
+                        resumed = False
+                if pos and not resumed:
+                    # 服务端忽略了 Range（从头返回）：丢弃旧分片，从头写
+                    pos = 0
+                mode = "ab" if resumed else "wb"
+                written = pos if resumed else 0
+                with dest.open(mode) as out:
+                    while True:
+                        chunk = resp.read(1024 * 256)
+                        if not chunk:
+                            break
+                        # 分段下载不得越过本段边界：服务端对 Range 的结束位可能不精确
+                        if want is not None and written + len(chunk) > want:
+                            chunk = chunk[: want - written]
+                        if not chunk:
+                            break
+                        out.write(chunk)
+                        written += len(chunk)
+                        progress[0] = written
+        except Exception as exc:  # noqa: BLE001
+            if attempt >= 5:
+                raise
+            with _lock:
+                _state["error"] = f"分段下载中断，重试中（{attempt}/5）：{exc}"
+            continue
+
+        if want is not None and written < want:
+            with _lock:
+                _state["error"] = f"分段未完成（{written}/{want}），续传重试（{attempt}/5）"
+            continue
+        progress[0] = written
+        return
+    raise CloudError(500, f"分段下载多次中断，未取到完整数据（区间 {start}-{end}）")
+
+
 def _download_worker(release: Dict[str, Any]) -> None:
     version = str(release.get("version") or "unknown")
     expected_sha = (release.get("sha256") or "").lower()
@@ -120,63 +184,113 @@ def _download_worker(release: Dict[str, Any]) -> None:
     part = target.with_suffix(".exe.part")
     total = int(release.get("file_size") or 0)
 
+    # 并发度：配置值有限、且分段数不超过总字节数（每段至少 1 字节）
+    try:
+        chunks = max(1, min(16, int(getattr(settings, "NPT_OTA_CHUNKS", 4) or 1)))
+    except (TypeError, ValueError):
+        chunks = 4
+    parallel = chunks > 1 and total >= 1024 * 1024  # 小文件走单连接，避免多连接开销
+    # 已有旧版单连接续传分片时沿用旧路径，保证断点续传兼容
+    if part.exists() and part.stat().st_size > 0:
+        parallel = False
+    seg_dir = _updates_dir() / f".{part.name}.segs"
+    seg_files = sorted(seg_dir.glob("*.part")) if seg_dir.is_dir() else []
+
     try:
         with _lock:
             _state.update(
-                phase="downloading", version=version, downloaded=part.stat().st_size if part.exists() else 0,
+                phase="downloading", version=version,
+                downloaded=(seg_files and sum(f.stat().st_size for f in seg_files))
+                or (part.stat().st_size if part.exists() else 0),
                 total=total, error=None, installer=None, sha256=expected_sha,
             )
 
-        for attempt in range(1, 6):
-            pos = part.stat().st_size if part.exists() else 0
-            if total and pos >= total:
-                break
-            headers = {"User-Agent": "NPT-Desktop-Updater"}
-            if pos:
-                headers["Range"] = f"bytes={pos}-"
-            request = urllib.request.Request(url, headers=headers)
-            written = 0
-            try:
-                with urllib.request.urlopen(request, timeout=60) as resp:
-                    resumed = pos > 0 and getattr(resp, "status", 200) == 206
-                    if resumed:
-                        # 续传起点必须与本地已下载长度一致，否则追加会拼出坏包
-                        match = re.match(r"bytes\s+(\d+)-", resp.headers.get("Content-Range") or "")
-                        if not match or int(match.group(1)) != pos:
-                            resumed = False
-                    mode = "ab" if resumed else "wb"
-                    written = pos if resumed else 0
-                    with part.open(mode) as out:
-                        while True:
-                            chunk = resp.read(1024 * 256)
-                            if not chunk:
-                                break
-                            out.write(chunk)
-                            written += len(chunk)
-                            with _lock:
-                                _state["downloaded"] = written
-            except Exception as exc:  # noqa: BLE001
-                if attempt >= 5:
-                    raise
-                with _lock:
-                    _state["error"] = f"下载中断，重试中（{attempt}/5）：{exc}"
-                continue
+        if parallel:
+            seg_dir.mkdir(parents=True, exist_ok=True)
+            seg_size = (total + chunks - 1) // chunks
+            ranges: List[Tuple[int, int, Path, List[int]]] = []
+            for idx in range(chunks):
+                start = idx * seg_size
+                end = min(start + seg_size - 1, total - 1)
+                if start > end:
+                    continue
+                seg = seg_dir / f"{idx:03d}.part"
+                ranges.append((start, end, seg, [0]))
 
-            # 连接被中途切断时 resp.read() 只是返回 b"" 而不抛异常：
-            # 必须按大小判断是否取满，否则会拿残缺文件去算 sha256，报「校验失败」
-            if total and written < total:
-                with _lock:
-                    _state["error"] = (
-                        f"下载未完成（{written}/{total}），续传重试（{attempt}/5）"
-                    )
-                continue
-            break
+            with ThreadPoolExecutor(max_workers=len(ranges)) as pool:
+                futures = {
+                    pool.submit(_fetch_range, url, s, e, p, prog): (s, e)
+                    for s, e, p, prog in ranges
+                }
+                for future in as_completed(futures):
+                    future.result()  # 任一分段失败即整体失败（保留分片供下次续传）
+                    with _lock:
+                        _state["downloaded"] = sum(f.stat().st_size for f in seg_files) + sum(
+                            p.stat().st_size for _, _, p, _ in ranges if p.exists()
+                        )
+
+            # 顺序拼接成分片文件：范围按起点排序，保证字节序正确
+            with part.open("wb") as out:
+                for _, _, seg, _ in sorted(ranges, key=lambda r: r[0]):
+                    with seg.open("rb") as inp:
+                        while True:
+                            block = inp.read(1024 * 1024)
+                            if not block:
+                                break
+                            out.write(block)
+            for _, _, seg, _ in ranges:
+                seg.unlink(missing_ok=True)
+            try:
+                seg_dir.rmdir()
+            except OSError:
+                pass
         else:
-            raise CloudError(500, f"下载多次中断，未取到完整安装包（{part.stat().st_size}/{total}）")
+            # 单连接：保留原有断点续传逻辑（兼容旧分片与不支持 Range 的服务端）
+            for attempt in range(1, 6):
+                pos = part.stat().st_size if part.exists() else 0
+                if total and pos >= total:
+                    break
+                headers = {"User-Agent": "NPT-Desktop-Updater"}
+                if pos:
+                    headers["Range"] = f"bytes={pos}-"
+                request = urllib.request.Request(url, headers=headers)
+                written = 0
+                try:
+                    with urllib.request.urlopen(request, timeout=60) as resp:
+                        resumed = pos > 0 and getattr(resp, "status", 200) == 206
+                        if resumed:
+                            match = re.match(r"bytes\s+(\d+)-", resp.headers.get("Content-Range") or "")
+                            if not match or int(match.group(1)) != pos:
+                                resumed = False
+                        mode = "ab" if resumed else "wb"
+                        written = pos if resumed else 0
+                        with part.open(mode) as out:
+                            while True:
+                                block = resp.read(1024 * 256)
+                                if not block:
+                                    break
+                                out.write(block)
+                                written += len(block)
+                                with _lock:
+                                    _state["downloaded"] = written
+                except Exception as exc:  # noqa: BLE001
+                    if attempt >= 5:
+                        raise
+                    with _lock:
+                        _state["error"] = f"下载中断，重试中（{attempt}/5）：{exc}"
+                    continue
+
+                if total and written < total:
+                    with _lock:
+                        _state["error"] = f"下载未完成（{written}/{total}），续传重试（{attempt}/5）"
+                    continue
+                break
+            else:
+                raise CloudError(500, f"下载多次中断，未取到完整安装包（{part.stat().st_size}/{total}）")
 
         actual_sha = _hash_file(part)
         if expected_sha and actual_sha != expected_sha:
-            raise CloudError(500, f"安装包校验失败（sha256 不一致）")
+            raise CloudError(500, "安装包校验失败（sha256 不一致）")
 
         part.replace(target)
         with _lock:

@@ -1334,7 +1334,7 @@
     "nr": "NR",
     "sectorLabel": "扇区标签",
     "measure": "测量",
-    "drag": "拖拽",
+    "drag": "平移",
     "select": "选择",
     "circleSelect": "圆形",
     "polygonSelect": "多边形",

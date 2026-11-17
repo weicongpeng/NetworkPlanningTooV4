@@ -3022,7 +3022,7 @@ export function MapPage() {
         title={measureMode ? (t('map.exitDistanceMode') || '退出测距模式') : (t('map.distanceMode') || '测距工具')}
       >
         <div className="w-4 h-4 flex items-center justify-center">
-          <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M8 2h8v20H8V2z"></path><path d="M13 6h3"></path><path d="M13 10h3"></path><path d="M13 14h3"></path><path d="M13 18h3"></path></svg>
+          <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ transform: 'rotate(45deg)' }}><path d="M8 2h8v20H8V2z"></path><path d="M13 6h3"></path><path d="M13 10h3"></path><path d="M13 14h3"></path><path d="M13 18h3"></path></svg>
         </div>
         <span className="toolbar-label">{t('map.measure') || '测距'}</span>
       </button>
@@ -3038,7 +3038,7 @@ export function MapPage() {
         title={mapDragTool ? (t('map.dragActiveHint') || '手形工具已激活（点击其他工具切换出去）') : (t('map.enableDrag') || '启用地图拖拽')}
       >
         <Hand size={14} />
-        <span className="toolbar-label">{t('map.drag') || '拖拽'}</span>
+        <span className="toolbar-label">{t('map.drag') || '平移'}</span>
       </button>
     ),
 
@@ -3439,14 +3439,14 @@ export function MapPage() {
       onSelect: handlePasteFeatures,
     },
     measure: {
-      icon: <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M8 2h8v20H8V2z"></path><path d="M13 6h3"></path><path d="M13 10h3"></path><path d="M13 14h3"></path><path d="M13 18h3"></path></svg>,
+      icon: <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ transform: 'rotate(45deg)' }}><path d="M8 2h8v20H8V2z"></path><path d="M13 6h3"></path><path d="M13 10h3"></path><path d="M13 14h3"></path><path d="M13 18h3"></path></svg>,
       label: t('map.measure') || '测距',
       active: measureMode,
       onSelect: activateMeasureTool,
     },
     drag: {
       icon: <Hand size={14} />,
-      label: t('map.drag') || '拖拽',
+      label: t('map.drag') || '平移',
       active: mapDragTool,
       onSelect: handleMapDragToolToggle,
     },

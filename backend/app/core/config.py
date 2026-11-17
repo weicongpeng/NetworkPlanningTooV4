@@ -157,6 +157,13 @@ class Settings(BaseSettings):
     NPT_DESKTOP_LEASE_DAYS: int = 30
     # 客户端使用的服务器地址（桌面版 launcher 注入；服务器侧不用）
     NPT_SERVER_URL: str = "https://app.pengwc.asia"
+    # 客户端内网直连地址（Tailscale）。留空则自动采用服务端握手公布的 lan_url。
+    # 探测通过后才启用，探测失败回退 NPT_SERVER_URL（公网域名）。
+    NPT_SERVER_LAN_URL: str = ""
+    # 是否允许云端流量（授权/OTA/同步）优先走已探测通的内网直连。
+    NPT_LAN_PREFER: bool = True
+    # OTA 下载并发分块数（1 = 关闭并行、走单连接）。服务端需支持 Range（已支持）。
+    NPT_OTA_CHUNKS: int = 4
     # 客户端更新渠道
     NPT_DESKTOP_CHANNEL: str = "stable"
     # 客户端构建版本（launcher 从打包内的 version.json 注入）
