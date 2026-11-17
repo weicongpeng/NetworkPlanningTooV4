@@ -805,3 +805,51 @@ def test_launcher_splash_distinguishes_mode_switch(monkeypatch):
     monkeypatch.setenv("NPT_DESKTOP_PROFILE", "standalone")
     html = launcher._splash_html()
     assert "正在切换到单机模式" in html
+
+
+class _NoRangeHandler(BaseHTTPRequestHandler):
+    """模拟 CDN / 代理忽略 Range：任何请求都返回整包 200。"""
+
+    def do_GET(self):  # noqa: N802
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(BIG_PAYLOAD)))
+        self.end_headers()
+        self.wfile.write(BIG_PAYLOAD)
+
+    def log_message(self, *args):
+        pass
+
+
+def test_parallel_download_when_server_ignores_range(updater_env, monkeypatch):
+    """Range 被忽略时不能把整包头部写成后续分片，否则大小对但 sha 错。"""
+    updater = updater_env.updater
+    server = HTTPServer(("127.0.0.1", 0), _NoRangeHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    monkeypatch.setattr(updater_env.settings, "NPT_SERVER_URL", f"http://127.0.0.1:{server.server_port}")
+    monkeypatch.setattr(updater_env.settings, "NPT_OTA_CHUNKS", 4)
+    try:
+        updater.start_download(_release(sha256=BIG_SHA, file_size=len(BIG_PAYLOAD)))
+        state = _wait_ready(updater, timeout=30)
+        assert state["phase"] == "ready", state
+        installer = updater_env.tmp_path / "updates" / "NetOpt Engine_Setup-1.0.0.exe"
+        assert installer.read_bytes() == BIG_PAYLOAD
+    finally:
+        server.shutdown()
+
+
+def test_stale_part_from_other_sha_is_discarded(updater_env):
+    """同版本号换了安装包时，旧 .part 不能续传进新包。"""
+    updater = updater_env.updater
+    updates = updater_env.tmp_path / "updates"
+    updates.mkdir(parents=True, exist_ok=True)
+    part = updates / "NetOpt Engine_Setup-1.0.0.exe.part"
+    part.write_bytes(b"OLD" * 100)
+    (updates / ".NetOpt Engine_Setup-1.0.0.exe.part.segs").mkdir(exist_ok=True)
+    (updates / ".NetOpt Engine_Setup-1.0.0.exe.part.segs" / "000.part").write_bytes(b"OLD")
+    (updates / ".NetOpt Engine_Setup-1.0.0.exe.part.sha").write_text("0" * 64)
+
+    updater.start_download(_release())
+    state = _wait_ready(updater)
+    assert state["phase"] == "ready", state
+    installer = updates / "NetOpt Engine_Setup-1.0.0.exe"
+    assert installer.read_bytes() == PAYLOAD

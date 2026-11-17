@@ -13,6 +13,7 @@ import hashlib
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -119,60 +120,79 @@ def _hash_file(path: Path) -> str:
 def _fetch_range(url: str, start: int, end: Optional[int], dest: Path, progress: List[int]) -> None:
     """下载 [start, end] 区间到 dest（分段文件），带断点续传与重试。
 
-    - dest 已存在时按其大小续传（Range: bytes=<已下载起点>-），与单连接逻辑同口径；
-    - 服务端不支持 Range（返回 200）时从头下载并校验起点，避免拼出坏包；
-    - 连接中途被切断时 resp.read() 只返回 b""，必须按区间长度判断是否取满。
+    关键安全点：服务端/CDN 忽略 Range 返回 200，或 206 的 Content-Range 起点不符时，
+    **不能把响应体直接当成本段字节**（非 0 段会拿到从文件 0 开始的数据，长度仍被截断
+    成 want，拼出来大小对但内容错，最终只能靠 sha256 发现）。此时改为读整包并跳过
+    start 字节，保证拿到的确实是本段区间。写入先落 .tmp，成功才替换 dest。
     """
     want = (end - start + 1) if end is not None else None
+    tmp = dest.with_name(dest.name + ".tmp")
+
+    def _read_exact(resp: Any, out: Any, limit: Optional[int]) -> int:
+        written = 0
+        while limit is None or written < limit:
+            size = 1024 * 256 if limit is None else min(1024 * 256, limit - written)
+            chunk = resp.read(size)
+            if not chunk:
+                break
+            out.write(chunk)
+            written += len(chunk)
+            progress[0] = written
+        return written
+
     for attempt in range(1, 6):
         pos = dest.stat().st_size if dest.exists() else 0
-        if want is not None and pos >= want:
-            progress[0] = want
-            return
+        if want is not None:
+            pos = min(pos, want)
+            if pos >= want:
+                if pos > want:
+                    dest.write_bytes(dest.read_bytes()[:want])
+                progress[0] = want
+                return
         headers = {"User-Agent": "NPT-Desktop-Updater"}
         if pos:
-            headers["Range"] = f"bytes={start + pos}-"
-        request = urllib.request.Request(url, headers=headers)
+            headers["Range"] = f"bytes={start + pos}-" + (str(end) if end is not None else "")
         written = 0
         try:
-            with urllib.request.urlopen(request, timeout=60) as resp:
+            with urllib.request.urlopen(
+                urllib.request.Request(url, headers=headers), timeout=60
+            ) as resp:
                 status = getattr(resp, "status", 200)
-                resumed = pos > 0 and status == 206
-                if resumed:
-                    match = re.match(r"bytes\s+(\d+)-", resp.headers.get("Content-Range") or "")
-                    if not match or int(match.group(1)) != start + pos:
-                        resumed = False
-                if pos and not resumed:
-                    # 服务端忽略了 Range（从头返回）：丢弃旧分片，从头写
-                    pos = 0
-                mode = "ab" if resumed else "wb"
-                written = pos if resumed else 0
-                with dest.open(mode) as out:
-                    while True:
-                        chunk = resp.read(1024 * 256)
-                        if not chunk:
-                            break
-                        # 分段下载不得越过本段边界：服务端对 Range 的结束位可能不精确
-                        if want is not None and written + len(chunk) > want:
-                            chunk = chunk[: want - written]
-                        if not chunk:
-                            break
-                        out.write(chunk)
-                        written += len(chunk)
-                        progress[0] = written
+                resume = False
+                if pos and status == 206:
+                    match = re.match(
+                        r"bytes\s+(\d+)-(\d+)/(\d+)",
+                        resp.headers.get("Content-Range") or "",
+                    )
+                    if match and int(match.group(1)) == start + pos:
+                        resume = True
+                with tmp.open("wb") as out:
+                    if resume:
+                        out.write(dest.read_bytes()[:pos])
+                        written = pos + _read_exact(
+                            resp, out, None if want is None else want - pos)
+                    else:
+                        # 不可信的 Range：从整包头部读到本段起点，再取本段长度
+                        skip = start
+                        while skip > 0:
+                            chunk = resp.read(min(1024 * 256, skip))
+                            if not chunk:
+                                raise CloudError(
+                                    500, f"分段下载失败：服务端未返回偏移 {start}")
+                            skip -= len(chunk)
+                        written = _read_exact(resp, out, want)
+            if want is not None and written < want:
+                raise CloudError(500, f"分段未完成（{written}/{want}）")
+            tmp.replace(dest)
+            progress[0] = written
+            return
         except Exception as exc:  # noqa: BLE001
+            tmp.unlink(missing_ok=True)
             if attempt >= 5:
                 raise
             with _lock:
                 _state["error"] = f"分段下载中断，重试中（{attempt}/5）：{exc}"
-            continue
 
-        if want is not None and written < want:
-            with _lock:
-                _state["error"] = f"分段未完成（{written}/{want}），续传重试（{attempt}/5）"
-            continue
-        progress[0] = written
-        return
     raise CloudError(500, f"分段下载多次中断，未取到完整数据（区间 {start}-{end}）")
 
 
@@ -182,7 +202,25 @@ def _download_worker(release: Dict[str, Any]) -> None:
     url = _download_url(release)
     target = _updates_dir() / f"NetOpt Engine_Setup-{version}.exe"
     part = target.with_suffix(".exe.part")
+    seg_dir = _updates_dir() / f".{part.name}.segs"
+    sha_marker = _updates_dir() / f".{part.name}.sha"
     total = int(release.get("file_size") or 0)
+
+    # 同一版本号重新安装不同安装包时，旧分片必须作废，否则会把两个版本的字节拼在一起
+    if expected_sha and sha_marker.is_file():
+        try:
+            stale = sha_marker.read_text(encoding="utf-8").strip() != expected_sha
+        except OSError:
+            stale = True
+        if stale:
+            part.unlink(missing_ok=True)
+            shutil.rmtree(seg_dir, ignore_errors=True)
+            sha_marker.unlink(missing_ok=True)
+    if expected_sha:
+        try:
+            sha_marker.write_text(expected_sha, encoding="utf-8")
+        except OSError:
+            pass
 
     # 并发度：配置值有限、且分段数不超过总字节数（每段至少 1 字节）
     try:
@@ -193,7 +231,6 @@ def _download_worker(release: Dict[str, Any]) -> None:
     # 已有旧版单连接续传分片时沿用旧路径，保证断点续传兼容
     if part.exists() and part.stat().st_size > 0:
         parallel = False
-    seg_dir = _updates_dir() / f".{part.name}.segs"
     seg_files = sorted(seg_dir.glob("*.part")) if seg_dir.is_dir() else []
 
     try:
@@ -290,7 +327,11 @@ def _download_worker(release: Dict[str, Any]) -> None:
 
         actual_sha = _hash_file(part)
         if expected_sha and actual_sha != expected_sha:
-            raise CloudError(500, "安装包校验失败（sha256 不一致）")
+            # 内容已坏，留着下次续传只会继续错；清掉让下一轮从头下载
+            part.unlink(missing_ok=True)
+            shutil.rmtree(seg_dir, ignore_errors=True)
+            sha_marker.unlink(missing_ok=True)
+            raise CloudError(500, "安装包校验失败（sha256 不一致），已清除损坏文件，请重新下载")
 
         part.replace(target)
         with _lock:
