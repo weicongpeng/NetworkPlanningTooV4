@@ -503,9 +503,9 @@ class AuthService:
                 .order_by(User.is_admin.desc(), User.id.asc())
                 .first()
             )
-            if target is None:
-                raise ValueError("NO_REASSIGN_TARGET")
-            reassign_to_id = target.id
+            # 全新库/测试库里可能只有这一个用户：没有接手人并非错误，
+            # 只要没有非空外键引用就能直接删（下面逐表检查）。有引用才明确拒绝。
+            reassign_to_id = target.id if target is not None else None
 
         private_tables = {
             "user_sessions", "user_settings",
@@ -521,8 +521,12 @@ class AuthService:
                     db.query(table).filter(column == user_id).update(
                         {column: None}, synchronize_session=False)
                 else:
-                    db.query(table).filter(column == user_id).update(
-                        {column: reassign_to_id}, synchronize_session=False)
+                    rows = db.query(table).filter(column == user_id)
+                    if reassign_to_id is None:
+                        if rows.count() > 0:
+                            raise ValueError("DELETE_TARGET_REQUIRED")
+                        continue
+                    rows.update({column: reassign_to_id}, synchronize_session=False)
 
         db.query(UserSession).filter(UserSession.user_id == user_id).delete(
             synchronize_session=False)

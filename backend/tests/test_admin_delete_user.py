@@ -65,3 +65,23 @@ def test_cannot_delete_self(env):
     resp = env["client"].delete(f"/api/v1/admin/{env['admin'].id}")
     assert resp.status_code == 400
     assert "自己" in resp.json()["detail"]
+
+
+def test_delete_last_user_without_reassign_target():
+    """全新库只有一个用户且没有业务引用时也应能删掉（CI 注册校验的清理路径）。"""
+    from sqlalchemy import create_engine, event
+    from sqlalchemy.orm import sessionmaker
+
+    engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    event.listen(engine, "connect", _set_sqlite_pragma)
+    Base.metadata.create_all(engine)
+    db = sessionmaker(bind=engine, autoflush=False)()
+    try:
+        only = User(username="only", password_hash="x", is_admin=False,
+                    city="深圳", operator="移动")
+        db.add(only)
+        db.commit()
+        assert auth_service.delete_user(db, only.id) is True
+        assert auth_service.get_user_by_id(db, only.id) is None
+    finally:
+        db.close()
