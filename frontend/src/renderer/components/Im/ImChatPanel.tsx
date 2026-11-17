@@ -41,6 +41,8 @@ export function ImChatPanel({ conversation, narrow, onBack }: Props) {
   const setLightbox = useImStore(s => s.setLightbox)
   const online = useImStore(s => s.online)
   const error = useImStore(s => s.error)
+  const errorScope = useImStore(s => s.errorScope)
+  const activeId = useImStore(s => s.activeConversationId)
   const clearError = useImStore(s => s.clearError)
   const setReplyTo = useImStore(s => s.setReplyTo)
   const deleteMessage = useImStore(s => s.deleteMessage)
@@ -178,7 +180,10 @@ export function ImChatPanel({ conversation, narrow, onBack }: Props) {
     return (
       <div className="relative flex flex-1 flex-col items-center justify-center gap-3 bg-background/40 text-muted-foreground">
         {/* 空态下 ImComposer 不渲染，错误条只在这里出现，不会与输入区的错误条重复 */}
-        {error && (
+        {error && (!errorScope || errorScope === 'global' || (activeId !== null && [
+          `messages:${activeId}`, `send:${activeId}`,
+          `file:${activeId}`, `message:${activeId}`, `group:${activeId}`,
+        ].includes(errorScope))) && (
           <div className="absolute top-3 flex max-w-[90%] items-center gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-[11px] text-amber-500">
             <span className="flex-1">{t(error)}</span>
             <button type="button" onClick={clearError}

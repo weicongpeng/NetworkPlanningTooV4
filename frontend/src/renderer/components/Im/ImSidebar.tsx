@@ -150,20 +150,13 @@ export function ImSidebar({ onSelectConversation }: Props) {
                     ${selected ? 'bg-primary/10' : 'hover:bg-accent/60'}`}
                 >
                   {selected && <span className="absolute left-0 top-1/2 h-6 w-[3px] -translate-y-1/2 rounded-r bg-primary" />}
-                  <div className="relative shrink-0">
-                    <ImAvatar
-                      name={conversationTitle(conv, titleLabels)}
-                      avatar={conv.kind === 'direct' ? conv.other_user?.avatar : conv.avatar}
-                      kind={conv.kind === 'direct' ? 'user' : 'group'}
-                      size={36}
-                      online={conv.other_user ? (online[conv.other_user.id] ?? conv.other_user.is_online) : undefined}
-                    />
-                    {/* 未读红点：只要没点开该会话就一直挂头像上，与右侧计数相互独立 */}
-                    {conv.unread > 0 && (
-                      <span data-im-unread-dot={conv.id}
-                            className="pointer-events-none absolute -right-0.5 -top-0.5 h-2.5 w-2.5 rounded-full border-2 border-card bg-red-500" />
-                    )}
-                  </div>
+                  <ImAvatar
+                    name={conversationTitle(conv, titleLabels)}
+                    avatar={conv.kind === 'direct' ? conv.other_user?.avatar : conv.avatar}
+                    kind={conv.kind === 'direct' ? 'user' : 'group'}
+                    size={36}
+                    online={conv.other_user ? (online[conv.other_user.id] ?? conv.other_user.is_online) : undefined}
+                  />
                   <div className="min-w-0 flex-1">
                     <div className="flex items-center gap-1">
                       <span className="min-w-0 flex-1 truncate text-xs font-semibold">

@@ -210,3 +210,13 @@ def test_confirm_button_and_magnifier_clamp():
     assert capture.point_in_rect((310, 255), capture.confirm_rect_for((100, 100, 300, 240), (800, 600)))
     assert capture.magnifier_source((10, 20), (800, 600)) == (0, 0, 96, 96)
     assert capture.magnifier_source((790, 590), (800, 600)) == (704, 504, 800, 600)
+
+
+def test_confirm_by_enter_or_button_only_after_selection():
+    """松手后可用回车或点确定完成；没有选区时回车不能把取景当成取消。"""
+    capture = _load_capture()
+    button = (300, 248, 384, 278)
+    assert capture.confirm_requested((10, 10), None, False, False, True) is False
+    assert capture.confirm_requested((10, 10), button, False, False, True) is True
+    assert capture.confirm_requested((310, 255), button, True, False, False) is True
+    assert capture.confirm_requested((10, 10), button, False, False, False) is False

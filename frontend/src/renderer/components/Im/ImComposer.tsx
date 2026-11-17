@@ -9,7 +9,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type {
   ChangeEvent as ReactChangeEvent, ClipboardEvent as ReactClipboardEvent,
-  DragEvent as ReactDragEvent, KeyboardEvent as ReactKeyboardEvent, ReactNode,
+  DragEvent as ReactDragEvent, KeyboardEvent as ReactKeyboardEvent,
+  PointerEvent as ReactPointerEvent, ReactNode,
 } from 'react'
 import { useTranslation } from 'react-i18next'
 import {
@@ -99,6 +100,7 @@ export function ImComposer({ conversationId }: { conversationId: number }) {
   const sending = useImStore(s => s.sending)
   const uploadProgress = useImStore(s => s.uploadProgress)
   const error = useImStore(s => s.error)
+  const errorScope = useImStore(s => s.errorScope)
   const ensureMembers = useImStore(s => s.ensureMembers)
   const setLightbox = useImStore(s => s.setLightbox)
   const replyTo = useImStore(s => s.replyTo)
@@ -373,6 +375,37 @@ export function ImComposer({ conversationId }: { conversationId: number }) {
     }
   }
 
+  // 输入框高度可拖拽调整：记住上次高度，范围 54~360px
+  const [inputHeight, setInputHeight] = useState(() => {
+    const saved = Number(localStorage.getItem('im-composer-height'))
+    return Number.isFinite(saved) && saved >= 54 ? Math.min(360, saved) : 54
+  })
+  const resizeRef = useRef<{ y: number; height: number } | null>(null)
+
+  const onResizePointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
+    event.preventDefault()
+    resizeRef.current = { y: event.clientY, height: inputHeight }
+    event.currentTarget.setPointerCapture(event.pointerId)
+  }
+  const onResizePointerMove = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const drag = resizeRef.current
+    if (!drag) return
+    const next = Math.min(360, Math.max(54, drag.height - (event.clientY - drag.y)))
+    setInputHeight(next)
+  }
+  const onResizePointerUp = () => {
+    if (!resizeRef.current) return
+    resizeRef.current = null
+    try { localStorage.setItem('im-composer-height', String(inputHeight)) } catch { /* 忽略 */ }
+  }
+
+  /** 只显示与当前会话相关的错误：一次 relay 繁忙不应在其它会话的输入框里刷屏 */
+  const visibleError = error && (!errorScope || errorScope === 'global' || [
+    `send:${conversationId}`, `file:${conversationId}`,
+    `message:${conversationId}`, `group:${conversationId}`,
+    `messages:${conversationId}`,
+  ].includes(errorScope)) ? error : null
+
   const disabled = (!text.trim() && pending.length === 0) || busy || sending
   const hasPendingMention = pendingMentions.mention_all || pendingMentions.mentions.length > 0
 
@@ -457,9 +490,9 @@ export function ImComposer({ conversationId }: { conversationId: number }) {
           <span>{uploadProgress.percent}%</span>
         </div>
       )}
-      {(notice || error) && (
+      {(notice || visibleError) && (
         <div className="flex items-center gap-2 border-b border-border/50 px-4 py-1.5 text-[11px] text-amber-500">
-          <span className="flex-1 truncate">{notice || (error ? t(error) : '')}</span>
+          <span className="flex-1 truncate">{notice || (visibleError ? t(visibleError) : '')}</span>
           <button type="button" className="cursor-pointer hover:text-foreground"
                   onClick={() => { setNotice(''); clearError() }}>
             <X size={12} />
@@ -588,6 +621,17 @@ export function ImComposer({ conversationId }: { conversationId: number }) {
         </div>
       )}
 
+      {/* 拖拽此把手调整输入框高度（向上拖变高，向下拖变矮） */}
+      <div data-im-composer-resize
+           title={t('im.composer.resizeHint', '拖拽调整输入框高度')}
+           onPointerDown={onResizePointerDown}
+           onPointerMove={onResizePointerMove}
+           onPointerUp={onResizePointerUp}
+           onPointerCancel={onResizePointerUp}
+           className="mx-auto -mb-0.5 flex h-3 w-16 shrink-0 cursor-ns-resize touch-none items-center justify-center">
+        <span className="h-1 w-10 rounded-full bg-border transition-colors hover:bg-primary/60" />
+      </div>
+
       <div className="flex items-end gap-2 px-3 pb-3 pt-1.5">
         <textarea
           ref={textareaRef}
@@ -596,7 +640,8 @@ export function ImComposer({ conversationId }: { conversationId: number }) {
           onChange={onTextChange}
           onKeyDown={onComposerKeyDown}
           placeholder={t('im.composer.placeholder', '输入消息，输入 @ 可点名成员，粘贴截图/拖入文件后确认再发送…')}
-          className="max-h-28 min-h-[54px] flex-1 resize-none rounded-xl border border-border/70 bg-background/70 px-3 py-2 text-[13px] leading-relaxed text-foreground outline-none transition-colors placeholder:text-muted-foreground/70 focus:border-primary/70 focus:ring-2 focus:ring-primary/15"
+          style={{ height: inputHeight }}
+          className="min-h-[54px] flex-1 resize-none rounded-xl border border-border/70 bg-background/70 px-3 py-2 text-[13px] leading-relaxed text-foreground outline-none transition-colors placeholder:text-muted-foreground/70 focus:border-primary/70 focus:ring-2 focus:ring-primary/15"
         />
         <button
           type="button"

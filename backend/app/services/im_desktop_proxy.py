@@ -84,7 +84,8 @@ def forward(op: str, args: Dict[str, Any],
     )
     if not slots.acquire(timeout=RELAY_SLOT_WAIT_SECONDS):
         raise HTTPException(
-            status_code=503, detail="IM_RELAY_BUSY: 消息服务繁忙，请稍后重试"
+            status_code=503,
+            detail=f"IM_RELAY_BUSY:{op}: 消息服务繁忙，请稍后重试",
         )
     try:
         return _forward_unlocked(op, args, effective_timeout)

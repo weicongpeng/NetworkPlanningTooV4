@@ -113,6 +113,7 @@ def test_forward_fails_fast_when_relay_slots_exhausted(monkeypatch):
         with pytest.raises(HTTPException) as exc:
             proxy.forward("list_conversations", {})
         assert exc.value.status_code == 503
+        assert "IM_RELAY_BUSY:list_conversations" in str(exc.value.detail)
     finally:
         proxy._relay_slots.release()
 

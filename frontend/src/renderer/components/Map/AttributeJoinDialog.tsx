@@ -2,11 +2,12 @@
  * 条件选择（图层属性空间连接）弹窗
  *
  * 图层1要素按锚点判定是否落在图层2面边界内 → 命中追加图层2属性列 → 导出单个工作表 Excel。
- * 执行中弹窗不可关闭（遮罩 / X / Esc 均被拦截），完成或失败后才可操作。
+ * 执行中弹窗不可关闭（遮罩 / X / Esc 均被拦截）；完成后点「下载」直接弹系统另存为，
+ * 用户选路径并改文件名保存即自动关闭，页面内无重命名/确认步骤。
  */
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { X, AlertTriangle, Download, Check, Loader2, Filter } from 'lucide-react'
+import { X, AlertTriangle, Download, Loader2, Filter } from 'lucide-react'
 import { attributeJoinApi } from '../../services/api'
 import type { AttributeJoinStats } from '@shared/types'
 import type { SectorLayerOption, LayerFileOption } from './LayerControl'
@@ -20,12 +21,47 @@ import {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
-/** 触发浏览器下载 blob */
-function saveBlobAs(blob: Blob, filename: string) {
+/** 另存为的保存目标：fsa 为系统另存为对话框拿到的文件句柄，download 为不支持时的默认下载回退 */
+type SaveTarget =
+  | { kind: 'fsa'; handle: any; name: string }
+  | { kind: 'download'; name: string }
+
+/** 弹出系统另存为对话框（需用户手势，故在下载请求前调用）。用户取消返回 null。 */
+async function pickSaveTarget(defaultName: string): Promise<SaveTarget | null> {
+  const w = window as any
+  if (typeof w.showSaveFilePicker === 'function') {
+    try {
+      const handle = await w.showSaveFilePicker({
+        suggestedName: defaultName,
+        types: [{
+          description: 'Excel File',
+          accept: { 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': ['.xlsx'] },
+        }],
+      })
+      return { kind: 'fsa', handle, name: handle.name || defaultName }
+    } catch (e: any) {
+      if (e?.name === 'AbortError') return null
+      // 其它错误（非安全上下文等）回退为默认下载
+    }
+  }
+  return { kind: 'download', name: defaultName }
+}
+
+/** 把内容写入已选中的保存目标。 */
+async function writeSaveTarget(target: SaveTarget, blob: Blob): Promise<void> {
+  if (target.kind === 'fsa') {
+    const writable = await target.handle.createWritable()
+    try {
+      await writable.write(blob)
+    } finally {
+      await writable.close()
+    }
+    return
+  }
   const url = window.URL.createObjectURL(blob)
   const link = document.createElement('a')
   link.href = url
-  link.download = filename
+  link.download = target.name
   document.body.appendChild(link)
   link.click()
   link.remove()
@@ -59,11 +95,7 @@ export default function AttributeJoinDialog({ open, onClose, layers, layerFiles,
   const [errorMsg, setErrorMsg] = useState('')
   const [stats, setStats] = useState<AttributeJoinStats | null>(null)
   const [taskId, setTaskId] = useState('')
-  const [showNameInput, setShowNameInput] = useState(false)
-  const [filename, setFilename] = useState('')
   const [downloading, setDownloading] = useState(false)
-  /** 已下载文件名（下载成功后展示；弹窗保留，须用户点关闭才退出） */
-  const [downloadedName, setDownloadedName] = useState('')
 
   const cancelledRef = useRef(false)
 
@@ -78,10 +110,7 @@ export default function AttributeJoinDialog({ open, onClose, layers, layerFiles,
       setErrorMsg('')
       setStats(null)
       setTaskId('')
-      setShowNameInput(false)
-      setFilename('')
       setDownloading(false)
-      setDownloadedName('')
     }
   }, [open])
 
@@ -136,7 +165,6 @@ export default function AttributeJoinDialog({ open, onClose, layers, layerFiles,
     setPhase('running')
     setProgress(2)
     setErrorMsg('')
-    setShowNameInput(false)
     try {
       const resp = await attributeJoinApi.plan({
         layer1: o1.ref,
@@ -156,24 +184,20 @@ export default function AttributeJoinDialog({ open, onClose, layers, layerFiles,
     }
   }
 
-  const handleAskFilename = () => {
+  const handleDownload = async () => {
+    if (downloading) return
     const d = new Date()
     const stamp = `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}`
-    setFilename(`${t('map.attributeJoin') || '条件选择'}_${stamp}`)
-    setShowNameInput(true)
-  }
-
-  const confirmDownload = async () => {
-    let name = filename.trim()
-    if (!name) return
-    if (!name.toLowerCase().endsWith('.xlsx')) name += '.xlsx'
+    const defaultName = `${t('map.attributeJoin') || '条件选择'}_${stamp}.xlsx`
+    // 先在用户手势内弹出系统另存为对话框，用户可在其中重命名；取消则不下载
+    const target = await pickSaveTarget(defaultName)
+    if (!target) return
     setDownloading(true)
     try {
       const blob = await attributeJoinApi.download(taskId)
-      saveBlobAs(blob, name)
-      // 下载成功：弹窗保留，仅记录已下载文件名；必须由用户点击"完成/关闭"才退出
-      setDownloadedName(name)
-      setShowNameInput(false)
+      await writeSaveTarget(target, blob)
+      // 保存成功后直接关闭弹窗，全程无需在页面内做重命名/确认
+      onClose()
     } catch (e: any) {
       setErrorMsg(e?.message || t('map.downloadFailed') || '下载失败')
     } finally {
@@ -291,7 +315,7 @@ export default function AttributeJoinDialog({ open, onClose, layers, layerFiles,
           </div>
         )}
 
-        {/* 完成：统计 + 文件名输入 */}
+        {/* 完成：统计（下载走系统另存为对话框重命名） */}
         {phase === 'done' && stats && (
           <div className="flex flex-col gap-3">
             <div className="grid grid-cols-2 gap-2">
@@ -327,44 +351,11 @@ export default function AttributeJoinDialog({ open, onClose, layers, layerFiles,
               </div>
             )}
 
-            {/* 下载完成提示：弹窗保留，须用户点击"完成"才退出 */}
-            {downloadedName && (
-              <div className="flex items-center gap-1.5 text-xs text-emerald-600 dark:text-emerald-400">
-                <Check size={13} />
-                {t('map.downloadedHint', { name: downloadedName })}
-              </div>
-            )}
-
-            {showNameInput && (
-              <div className="flex flex-col gap-1.5">
-                <label className="text-xs text-muted-foreground">
-                  {t('map.inputFilename') || '文件名'}
-                </label>
-                <div className="flex gap-2">
-                  <input
-                    type="text"
-                    value={filename}
-                    autoFocus
-                    onChange={(e) => setFilename(e.target.value)}
-                    onKeyDown={(e) => { if (e.key === 'Enter') confirmDownload() }}
-                    className="px-2.5 py-1.5 text-xs rounded border border-border bg-background text-foreground outline-none focus:border-primary flex-1"
-                  />
-                  <button
-                    onClick={confirmDownload}
-                    disabled={downloading || !filename.trim()}
-                    className="px-3 py-1.5 text-xs rounded bg-primary text-primary-foreground hover:opacity-90 transition-opacity disabled:opacity-50 flex items-center gap-1"
-                  >
-                    {downloading ? <Loader2 size={12} className="animate-spin" /> : <Check size={12} />}
-                    {t('common.confirm') || '确认'}
-                  </button>
-                </div>
-              </div>
-            )}
           </div>
         )}
 
-        {/* 错误 */}
-        {phase === 'error' && (
+        {/* 错误（下载失败时 phase 仍为 done，故一并显示） */}
+        {(phase === 'error' || (phase === 'done' && errorMsg)) && (
           <div className="flex items-start gap-2 rounded border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
             <AlertTriangle size={14} className="mt-0.5 shrink-0" />
             <span>{errorMsg}</span>
@@ -399,24 +390,14 @@ export default function AttributeJoinDialog({ open, onClose, layers, layerFiles,
             </button>
           )}
           {phase === 'done' && (
-            <>
-              {!showNameInput && (
-                <button
-                  onClick={handleAskFilename}
-                  disabled={downloading}
-                  className="px-3 py-1.5 text-xs rounded bg-primary text-primary-foreground hover:opacity-90 transition-opacity flex items-center gap-1"
-                >
-                  <Download size={12} />
-                  {t('map.download') || '下载'}
-                </button>
-              )}
-              <button
-                onClick={onClose}
-                className="px-3 py-1.5 text-xs rounded border border-border text-muted-foreground hover:bg-muted transition-colors"
-              >
-                {t('map.finish') || '完成'}
-              </button>
-            </>
+            <button
+              onClick={handleDownload}
+              disabled={downloading}
+              className="px-3 py-1.5 text-xs rounded bg-primary text-primary-foreground hover:opacity-90 transition-opacity flex items-center gap-1"
+            >
+              <Download size={12} />
+              {t('map.download') || '下载'}
+            </button>
           )}
         </div>
       </div>

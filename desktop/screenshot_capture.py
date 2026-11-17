@@ -36,6 +36,7 @@ DWMWA_EXTENDED_FRAME_BOUNDS = 9
 VK_LBUTTON = 0x01
 VK_RBUTTON = 0x02
 VK_ESCAPE = 0x1B
+VK_RETURN = 0x0D
 SM_XVIRTUALSCREEN = 76
 SM_YVIRTUALSCREEN = 77
 SM_CXVIRTUALSCREEN = 78
@@ -260,6 +261,18 @@ def confirm_rect_for(rect: Tuple[int, int, int, int],
     return (left, top, left + width, top + height)
 
 
+def confirm_requested(point: Tuple[int, int],
+                      rect: Optional[Tuple[int, int, int, int]],
+                      left_down: bool, click_pulse: bool,
+                      enter_pressed: bool) -> bool:
+    """回车，或左键落在「确定」按钮内即完成取景。"""
+    if rect is None:
+        return False  # 还没有选区时回车不结束取景
+    if enter_pressed:
+        return True
+    return point_in_rect(point, rect) and (left_down or click_pulse)
+
+
 def magnifier_source(center: Tuple[int, int], image_size: Tuple[int, int],
                      radius: int = 48) -> Tuple[int, int, int, int]:
     """放大镜取 cursor 周围原始像素；靠近边缘时平移取样框而不是越界。"""
@@ -347,7 +360,7 @@ def _run_overlay(
         _log.warning("设置截图蒙层扩展样式失败（窗口自动识别可能退化为整屏）")
 
     hint = Label()
-    hint.Text = "移动鼠标自动识别窗口 · 拖拽框选/拖动边框修整 · 点「确定」完成 · Esc/右键取消"
+    hint.Text = "拖动框选 · 松手后拖边框修整 · 回车或点「确定」完成 · Esc/右键取消"
     hint.AutoSize = True
     hint.BackColor = Color.FromArgb(190, 20, 20, 20)
     hint.ForeColor = Color.White
@@ -383,11 +396,20 @@ def _run_overlay(
                     graphics.FillRectangle(handle_brush, hx - 3, hy - 3, 6, 6)
                     graphics.DrawRectangle(handle_pen, hx - 3, hy - 3, 6, 6)
             btn = confirm_rect_for((l, t, r, b), size)
-            graphics.FillRectangle(button_brush, btn[0], btn[1], btn[2] - btn[0], btn[3] - btn[1])
-            graphics.DrawString("确定", button_font, button_text, btn[0] + 20, btn[1] + 5)
-        # 鼠标旁的 2 倍放大镜：让像素级细节（文字/表格线）在选区时也能看清
+            btn_w, btn_h = btn[2] - btn[0], btn[3] - btn[1]
+            graphics.FillRectangle(button_brush, btn[0], btn[1], btn_w, btn_h)
+            graphics.DrawRectangle(white_pen, btn[0], btn[1], btn_w, btn_h)
+            # 按实测文字尺寸居中，此前硬编码偏移会让「确定」贴边/被裁掉
+            try:
+                measured = graphics.MeasureString("确定", button_font)
+                tx = btn[0] + (btn_w - measured.Width) / 2
+                ty = btn[1] + (btn_h - measured.Height) / 2
+            except Exception:  # noqa: BLE001 - 老 GDI+ 绑定缺 MeasureString 时退化为近似居中
+                tx, ty = btn[0] + btn_w / 2 - 11, btn[1] + btn_h / 2 - 8
+            graphics.DrawString("确定", button_font, button_text, tx, ty)
+        # 选区完成后放大镜立即退出：进入边框修整阶段，不再挡住选区右下角
         cursor = state["cursor"]
-        if cursor[0] > -9000:
+        if not selection and cursor[0] > -9000:
             image_x, image_y = cursor[0] - origin[0], cursor[1] - origin[1]
             src = magnifier_source((image_x, image_y), size)
             mw, mh = 192, 192  # 取样 96×96 → 2 倍显示，保持比例
@@ -440,18 +462,21 @@ def _run_overlay(
         lbutton_state = int(user32.GetAsyncKeyState(VK_LBUTTON))
         left_down = bool(lbutton_state & 0x8000)
         click_pulse = bool(lbutton_state & 0x0001)
+        enter_pressed = bool(int(user32.GetAsyncKeyState(VK_RETURN)) & 0x8000)
 
-        # 确认按钮（画在选区右下角，蒙层透明所以这里用命中测试而非 WinForms 控件事件）
+        # 确认：回车，或左键落在选区右下角「确定」按钮内
+        # （蒙层透明，按钮用命中测试而非 WinForms 控件事件）
         selection = state["selection"]
         button_screen = None
         if selection:
             btn = confirm_rect_for(to_client(selection), size)
             button_screen = (btn[0] + origin[0], btn[1] + origin[1],
                              btn[2] + origin[0], btn[3] + origin[1])
-            if point_in_rect(screen, button_screen) and (
-                    left_down or (click_pulse and not state["lbutton"])):
-                finish(False, selection)
-                return
+        if confirm_requested(
+                screen, button_screen, left_down,
+                click_pulse and not state["lbutton"], enter_pressed):
+            finish(False, selection)
+            return
 
         if left_down and not state["lbutton"]:
             state["start"] = screen

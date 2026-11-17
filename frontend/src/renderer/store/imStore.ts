@@ -43,6 +43,8 @@ interface ImState {
   unreadTotal: number
   loading: boolean
   error: string | null
+  /** 错误所属作用域（会话 id / 操作），避免一次异步异常在所有聊天窗口同时弹提示 */
+  errorScope: string | null
   sending: boolean
   uploadProgress: { name: string; percent: number } | null
   lightbox: ImLightboxSource | null
@@ -192,9 +194,34 @@ function errorMessage(error: unknown, fallbackKey: string): string {
   // 附件失败以前一律折叠成「附件发送失败，已放回待发送列表」，用户无法判断
   // 是文件太大、消息服务繁忙还是断网；这里把可操作的真实原因显示出来。
   if (raw.includes('IM_ATTACHMENT_TOO_LARGE')) return 'im.error.tooLarge'
+  const busyOp = raw.match(/IM_RELAY_BUSY:([a-z_]+)/)?.[1] || ''
+  const busyKeys: Record<string, string> = {
+    list_conversations: 'im.error.busyConversations',
+    list_messages: 'im.error.busyMessages',
+    send_message: 'im.error.busySend',
+    attachment_download: 'im.error.busyAttachment',
+    attachment_urls: 'im.error.busyAttachment',
+    attachment_start: 'im.error.busyUpload',
+    attachment_chunk: 'im.error.busyUpload',
+    attachment_complete: 'im.error.busyUpload',
+    list_members: 'im.error.busyMembers',
+  }
+  if (busyOp && busyKeys[busyOp]) return busyKeys[busyOp]
   if (raw.includes('IM_RELAY_BUSY') || raw.includes('IM_RELAY_FAILED')) return 'im.error.relayBusy'
   if (err?.code === 0) return 'im.error.network'
   return fallbackKey
+}
+
+/** 设置/清除某个作用域的错误；同作用域重试成功后立即消失，不会污染其它会话 */
+function setImError(scope: string, key: string | null): void {
+  const state = useImStore.getState()
+  if (key === null) {
+    if (state.errorScope === scope) {
+      useImStore.setState({ error: null, errorScope: null })
+    }
+    return
+  }
+  useImStore.setState({ error: key, errorScope: scope })
 }
 
 /** 只把用户本轮真正点开过的会话未读归零；窗口打开但没点会话时红点必须保留 */
@@ -308,6 +335,7 @@ const initialState = {
   unreadTotal: 0,
   loading: false,
   error: null,
+  errorScope: null,
   sending: false,
   uploadProgress: null,
   lightbox: null,
@@ -336,7 +364,7 @@ export const useImStore = create<ImState>()(
       setLightbox: lightbox => set({ lightbox }),
       setReplyTo: replyTo => set({ replyTo }),
       setGroupDialog: groupDialog => set({ groupDialog }),
-      clearError: () => set({ error: null }),
+      clearError: () => set({ error: null, errorScope: null }),
 
       queueScreenshot: file => set({ pendingScreenshot: file }),
       takeScreenshot: () => {
@@ -386,7 +414,7 @@ export const useImStore = create<ImState>()(
           await Promise.all([get().refreshConversations(), get().refreshContacts()])
         } catch (error) {
           console.warn('[IM] bootstrap failed', error)
-          set({ error: errorMessage(error, 'im.error.load') })
+          setImError('global', errorMessage(error, 'im.error.load'))
         } finally {
           set({ loading: false })
         }
@@ -429,6 +457,7 @@ export const useImStore = create<ImState>()(
           online,
           unreadTotal: conversations.reduce((sum: number, c: ImConversation) => sum + (c.unread || 0), 0),
         })
+        setImError('global', null) // 会话列表恢复后立即撤掉繁忙提示
         // 红点有、正文没来的兜底：服务端最新消息 id 已超过本地正文最大值，
         // 说明本地游标跳过了一段或窗口收起期间漏了补拉，重拉最新一页补洞。
         // 用服务端返回的原始 items 判断（clearActiveUnread 会把当前会话置 0）。
@@ -553,6 +582,7 @@ export const useImStore = create<ImState>()(
               },
             },
           }))
+          setImError(`messages:${id}`, null) // 同一会话重试成功后立即撤掉繁忙提示
           // 一页历史消息里的图片批量换签名 URL：一次 relay 控制请求覆盖整页，
           // 避免每张缩略图各发一次（共享模式公网往返是主要耗时）。
           void imApi.prewarmAttachmentUrls?.(
@@ -594,7 +624,7 @@ export const useImStore = create<ImState>()(
           }
         } catch (error) {
           console.warn('[IM] loadMessages failed', error)
-          set({ error: errorMessage(error, 'im.error.messages') })
+          setImError(`messages:${id}`, errorMessage(error, 'im.error.messages'))
         }
       },
 
@@ -642,6 +672,7 @@ export const useImStore = create<ImState>()(
               [id]: mergeMessages((s.messages[id] || []).filter(m => m.id !== tempId), [message]),
             },
           }))
+          setImError(`send:${id}`, null)
           get().setDraft('')
           // 自己发出的消息立即把本会话未读归零，不等服务端刷新（后端也会排除自己的消息）
           set(s => ({
@@ -661,6 +692,7 @@ export const useImStore = create<ImState>()(
               [id]: (s.messages[id] || []).map(m => m.id === tempId ? { ...m, pending: false, failed: true } : m),
             },
             error: errorMessage(error, 'im.error.send'),
+            errorScope: `send:${id}`,
           }))
           return false
         }
@@ -671,7 +703,8 @@ export const useImStore = create<ImState>()(
         if (id === null || !files.length) return []
         const failed: File[] = []
         for (const file of Array.from(files)) {
-          set({ uploadProgress: { name: file.name, percent: 0 }, error: null })
+          set({ uploadProgress: { name: file.name, percent: 0 } })
+          setImError(`file:${id}`, null)
           try {
             const attachment = await imApi.uploadAttachment(file, id, percent => {
               set({ uploadProgress: { name: file.name, percent } })
@@ -682,10 +715,11 @@ export const useImStore = create<ImState>()(
               client_msg_id: `f-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
             })).data
             set(s => ({ messages: { ...s.messages, [id]: mergeMessages(s.messages[id] || [], [message]) } }))
+            setImError(`file:${id}`, null)
           } catch (error) {
             console.warn('[IM] send attachment failed', file.name, error)
             failed.push(file)
-            set({ error: errorMessage(error, 'im.error.file') })
+            setImError(`file:${id}`, errorMessage(error, 'im.error.file'))
           } finally {
             set({ uploadProgress: null })
           }
@@ -708,11 +742,12 @@ export const useImStore = create<ImState>()(
               replyTo: s.replyTo?.id === messageId ? null : s.replyTo,
             }
           })
+          setImError(`message:${conversationId}`, null)
           void get().refreshConversations().catch(() => {})
           return true
         } catch (error) {
           console.warn('[IM] delete message failed', error)
-          set({ error: errorMessage(error, 'im.message.deleteFailed') })
+          setImError(`message:${conversationId}`, errorMessage(error, 'im.message.deleteFailed'))
           return false
         }
       },
@@ -720,11 +755,12 @@ export const useImStore = create<ImState>()(
       forwardMessages: async (messageIds, conversationIds) => {
         try {
           await imApi.forwardMessages(messageIds, conversationIds)
+          setImError('forward', null)
           void get().refreshConversations().catch(() => {})
           return true
         } catch (error) {
           console.warn('[IM] forward messages failed', error)
-          set({ error: errorMessage(error, 'im.message.forwardFailed') })
+          setImError('forward', errorMessage(error, 'im.message.forwardFailed'))
           return false
         }
       },
@@ -750,10 +786,11 @@ export const useImStore = create<ImState>()(
           if (existing) conversationId = existing.id
         }
         if (conversationId === null) {
-          set({ error: errorMessage(lastError, 'im.error.conversation') })
+          setImError('global', errorMessage(lastError, 'im.error.conversation'))
           return null
         }
-        set({ error: null, activeTab: 'messages' })
+        set({ activeTab: 'messages' })
+        setImError('global', null)
         // 新建会话可能还没进列表，先刷新再激活，避免 ImWindow 派生 conversation=null 停在空态
         if (!get().conversations.some(c => c.id === conversationId)) {
           await get().refreshConversations().catch(() => {})
@@ -771,14 +808,15 @@ export const useImStore = create<ImState>()(
         const group = state.contacts?.groups.find(g => g.id === id)
         if (group && !group.joined) {
           console.warn('[IM] openGroup rejected: not a member of conversation', id)
-          set({ error: 'im.error.notGroupMember' })
+          setImError(`group:${id}`, 'im.error.notGroupMember')
           return false
         }
         // 刚加入/刚建好的群可能还没进会话列表，先补齐再激活
         if (!state.conversations.some(c => c.id === id)) {
           await get().refreshConversations().catch(() => {})
         }
-        set({ error: null, activeTab: 'messages' })
+        set({ activeTab: 'messages' })
+        setImError('global', null)
         get().setActiveConversation(id)
         void get().refreshConversations().catch(() => {})
         return true
@@ -795,10 +833,11 @@ export const useImStore = create<ImState>()(
           console.warn('[IM] create_group failed', error)
         }
         if (conversationId === null) {
-          set({ error: errorMessage(lastError, 'im.error.group') })
+          setImError('global', errorMessage(lastError, 'im.error.group'))
           return null
         }
-        set({ error: null, activeTab: 'messages', groupDialog: false })
+        set({ activeTab: 'messages', groupDialog: false })
+        setImError('global', null)
         // 先让会话列表 / 通讯录包含新群再激活，避免首次进入时 conversation=null 停在空态
         await Promise.all([
           get().refreshConversations(), get().refreshContacts(),
@@ -823,12 +862,12 @@ export const useImStore = create<ImState>()(
       removeMember: async (conversationId, userId) => {
         try {
           await imApi.removeMember(conversationId, userId)
-          set({ error: null })
+          setImError(`group:${conversationId}`, null)
           await get().refreshGroupState(conversationId)
           return true
         } catch (error) {
           console.warn('[IM] removeMember failed', error)
-          set({ error: errorMessage(error, 'im.error.groupAction') })
+          setImError(`group:${conversationId}`, errorMessage(error, 'im.error.groupAction'))
           return false
         }
       },
@@ -837,12 +876,12 @@ export const useImStore = create<ImState>()(
         if (!memberIds.length) return false
         try {
           await imApi.addMembers(conversationId, memberIds)
-          set({ error: null })
+          setImError(`group:${conversationId}`, null)
           await get().refreshGroupState(conversationId)
           return true
         } catch (error) {
           console.warn('[IM] addGroupMembers failed', error)
-          set({ error: errorMessage(error, 'im.error.groupAction') })
+          setImError(`group:${conversationId}`, errorMessage(error, 'im.error.groupAction'))
           return false
         }
       },
@@ -850,12 +889,12 @@ export const useImStore = create<ImState>()(
       updateGroupAvatar: async (conversationId, avatar) => {
         try {
           await imApi.updateGroupAvatar(conversationId, avatar)
-          set({ error: null })
+          setImError(`group:${conversationId}`, null)
           await get().refreshGroupState(conversationId)
           return true
         } catch (error) {
           console.warn('[IM] updateGroupAvatar failed', error)
-          set({ error: errorMessage(error, 'im.error.groupAction') })
+          setImError(`group:${conversationId}`, errorMessage(error, 'im.error.groupAction'))
           return false
         }
       },
@@ -881,13 +920,13 @@ export const useImStore = create<ImState>()(
       leaveGroup: async conversationId => {
         try {
           await imApi.leaveGroup(conversationId)
-          set({ error: null })
+          setImError(`group:${conversationId}`, null)
           get().forgetConversation(conversationId)
           await get().refreshGroupState(conversationId)
           return true
         } catch (error) {
           console.warn('[IM] leaveGroup failed', error)
-          set({ error: errorMessage(error, 'im.error.groupAction') })
+          setImError(`group:${conversationId}`, errorMessage(error, 'im.error.groupAction'))
           return false
         }
       },
@@ -895,13 +934,13 @@ export const useImStore = create<ImState>()(
       dissolveGroup: async conversationId => {
         try {
           await imApi.dissolveGroup(conversationId)
-          set({ error: null })
+          setImError(`group:${conversationId}`, null)
           get().forgetConversation(conversationId)
           await get().refreshGroupState(conversationId)
           return true
         } catch (error) {
           console.warn('[IM] dissolveGroup failed', error)
-          set({ error: errorMessage(error, 'im.error.groupAction') })
+          setImError(`group:${conversationId}`, errorMessage(error, 'im.error.groupAction'))
           return false
         }
       },

@@ -397,11 +397,25 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning(f"⚠️ 启动任务元数据回填失败: {e}")
 
+    # IM 垃圾自动清理：后台守护线程，首次运行延迟数分钟，不拖慢启动/登录
+    try:
+        from app.services.im_garbage_cleanup import start_background_cleanup
+
+        start_background_cleanup()
+    except Exception as e:  # noqa: BLE001 - 清理任务失败不影响服务可用
+        logger.warning(f"⚠️ 启动 IM 自动清理失败: {e}")
+
     logger.info("应用启动完成")
     yield
 
     # 关闭时执行
     logger.info("应用关闭中...")
+    try:
+        from app.services.im_garbage_cleanup import stop_background_cleanup
+
+        stop_background_cleanup()
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"⚠️ 停止 IM 自动清理失败: {e}")
     if pool is not None:
         try:
             pool.shutdown(wait=False)

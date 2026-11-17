@@ -178,6 +178,14 @@ class Settings(BaseSettings):
     NPT_IM_CLOUD_WS_ENABLED: bool = True
     # 云 WS 许可鉴权超时（前端与服务端各自有超时，取较小者生效）
     NPT_IM_CLOUD_WS_AUTH_TIMEOUT_MS: int = 8000
+    # IM 垃圾自动清理：只清临时/孤儿文件，不动仍被消息引用的合法附件
+    NPT_IM_CLEANUP_ENABLED: bool = True
+    NPT_IM_CLEANUP_INTERVAL_HOURS: int = 24
+    NPT_IM_CLEANUP_INITIAL_DELAY_SECONDS: int = 300
+    NPT_IM_ORPHAN_RETENTION_DAYS: int = 90
+    NPT_IM_PART_RETENTION_DAYS: int = 7
+    NPT_IM_THUMB_RETENTION_DAYS: int = 7
+    NPT_IM_SCREENSHOT_RETENTION_DAYS: int = 7
 
     # 地图默认配置
     DEFAULT_MAP_CENTER: tuple = (39.9042, 116.4074)  # 北京

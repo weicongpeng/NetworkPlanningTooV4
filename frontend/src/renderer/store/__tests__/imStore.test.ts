@@ -158,7 +158,7 @@ describe('imStore', () => {
     useImStore.setState({ open: true, activeConversationId: 7 })
     const unreadConv = {
       ...conversation(7), unread: 3,
-      last_message: { id: 9, kind: 'text', sender_id: 2, sender_name: '对方',
+      last_message: { id: 9, kind: 'text' as const, sender_id: 2, sender_name: '对方',
                       preview: '新消息', created_at: '' },
     }
     vi.mocked(imApi.conversations).mockResolvedValue(conversationsPage([unreadConv]) as any)
@@ -186,6 +186,24 @@ describe('imStore', () => {
     vi.mocked(imApi.conversations).mockResolvedValue(conversationsPage([unreadConv]) as any)
     await useImStore.getState().refreshConversations()
     expect(useImStore.getState().conversations[0].unread).toBe(2)
+  })
+
+  it('繁忙提示按出错操作与会话作用域记录，成功后自动消失', async () => {
+    localStorage.setItem('auth-storage', JSON.stringify({ state: { user: { id: 1 } } }))
+    useImStore.setState({ activeConversationId: 7 })
+    vi.mocked(imApi.messages).mockRejectedValueOnce({
+      code: 503,
+      response: { data: { detail: 'IM_RELAY_BUSY:list_messages: 消息服务繁忙' } },
+    } as any)
+
+    await expect(useImStore.getState().loadMessages(7, 'initial')).resolves.toBeUndefined()
+    expect(useImStore.getState().error).toBe('im.error.busyMessages')
+    expect(useImStore.getState().errorScope).toBe('messages:7')
+
+    vi.mocked(imApi.messages).mockResolvedValueOnce(messagesPage([], null) as any)
+    await useImStore.getState().loadMessages(7, 'initial')
+    expect(useImStore.getState().error).toBeNull()
+    expect(useImStore.getState().errorScope).toBeNull()
   })
 
   it('resetForUserSwitch 清空会话/消息/未读并停止轮询', () => {
