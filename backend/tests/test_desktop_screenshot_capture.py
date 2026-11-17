@@ -220,3 +220,24 @@ def test_confirm_by_enter_or_button_only_after_selection():
     assert capture.confirm_requested((10, 10), button, False, False, True) is True
     assert capture.confirm_requested((310, 255), button, True, False, False) is True
     assert capture.confirm_requested((10, 10), button, False, False, False) is False
+
+
+def test_drag_mode_ignores_hover_until_committed():
+    """自动识别的虚线框不能当成已提交选区：未松手前拖动一律是框选。"""
+    capture = _load_capture()
+    rect = (100, 100, 300, 240)
+    # hover 草稿即使覆盖了鼠标，也绝不能进入 move/resize
+    assert capture.choose_drag_mode(False, rect, (200, 170), None) == "create"
+    assert capture.choose_drag_mode(False, rect, (200, 170), "n") == "create"
+    # 松手提交后：命中把手缩放、点内部移动、点外部重新框选
+    assert capture.choose_drag_mode(True, rect, (300, 170), "e") == "resize"
+    assert capture.choose_drag_mode(True, rect, (200, 170), None) == "move"
+    assert capture.choose_drag_mode(True, rect, (10, 10), None) == "create"
+    assert capture.choose_drag_mode(True, None, (200, 170), None) == "create"
+
+
+def test_magnifier_only_before_selection_commit():
+    """放大镜在框选阶段跟随鼠标，松手提交后立即退出。"""
+    capture = _load_capture()
+    assert capture.should_show_magnifier(False) is True
+    assert capture.should_show_magnifier(True) is False

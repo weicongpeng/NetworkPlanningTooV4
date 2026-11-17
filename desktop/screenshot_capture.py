@@ -273,6 +273,24 @@ def confirm_requested(point: Tuple[int, int],
     return point_in_rect(point, rect) and (left_down or click_pulse)
 
 
+def choose_drag_mode(selection_committed: bool,
+                     selection: Optional[Tuple[int, int, int, int]],
+                     point: Tuple[int, int], handle: Optional[str]) -> str:
+    """未提交选区时拖动一定是框选；提交后命中把手才缩放、点内部才移动。"""
+    if not selection_committed or selection is None:
+        return "create"
+    if handle:
+        return "resize"
+    if point_in_rect(point, selection):
+        return "move"
+    return "create"
+
+
+def should_show_magnifier(selection_committed: bool) -> bool:
+    """放大镜只在框选阶段可见；选区松手提交后立即退出。"""
+    return not selection_committed
+
+
 def magnifier_source(center: Tuple[int, int], image_size: Tuple[int, int],
                      radius: int = 48) -> Tuple[int, int, int, int]:
     """放大镜取 cursor 周围原始像素；靠近边缘时平移取样框而不是越界。"""
@@ -318,8 +336,9 @@ def _run_overlay(
     dim_bitmap = Bitmap(str(dim_path))
     white_pen = Pen(Color.FromArgb(255, 255, 255, 255), 2)
     state: Dict[str, Any] = {
-        "selection": None,       # 屏幕坐标矩形（自动识别或自由框选）
-        "hover": None,           # 鼠标下的窗口候选框，虚线提示
+        "selection": None,       # 屏幕坐标矩形：框选中是草稿，松手后才是已提交选区
+        "selection_committed": False,  # 松手提交前不显示把手/按钮，也不允许 resize/move
+        "hover": None,           # 鼠标下的窗口候选框，虚线提示（不参与拖拽模式判定）
         "start": None,           # 框选 / 移动 / 缩放起点
         "mode": "idle",          # idle / create / move / resize
         "handle": None,
@@ -379,8 +398,9 @@ def _run_overlay(
         graphics = event.Graphics
         graphics.DrawImage(dim_bitmap, 0, 0, size[0], size[1])
         selection = state["selection"]
+        committed = state["selection_committed"]
         hover = state["hover"]
-        if hover and hover != selection:
+        if hover and (not committed or hover != selection):
             hl, ht, hr, hb = to_client(hover)
             graphics.DrawRectangle(hover_pen, hl, ht, max(1, hr - hl), max(1, hb - ht))
         if selection:
@@ -391,25 +411,27 @@ def _run_overlay(
                 graphics.DrawImage(raw_bitmap, 0, 0, size[0], size[1])
                 graphics.ResetClip()
                 graphics.DrawRectangle(white_pen, l, t, width, height)
-                # 四边四角把手：按下后进入 resize，松手不结束会话
-                for hx, hy in handles_for_rect((l, t, r, b)).values():
-                    graphics.FillRectangle(handle_brush, hx - 3, hy - 3, 6, 6)
-                    graphics.DrawRectangle(handle_pen, hx - 3, hy - 3, 6, 6)
-            btn = confirm_rect_for((l, t, r, b), size)
-            btn_w, btn_h = btn[2] - btn[0], btn[3] - btn[1]
-            graphics.FillRectangle(button_brush, btn[0], btn[1], btn_w, btn_h)
-            graphics.DrawRectangle(white_pen, btn[0], btn[1], btn_w, btn_h)
-            # 按实测文字尺寸居中，此前硬编码偏移会让「确定」贴边/被裁掉
-            try:
-                measured = graphics.MeasureString("确定", button_font)
-                tx = btn[0] + (btn_w - measured.Width) / 2
-                ty = btn[1] + (btn_h - measured.Height) / 2
-            except Exception:  # noqa: BLE001 - 老 GDI+ 绑定缺 MeasureString 时退化为近似居中
-                tx, ty = btn[0] + btn_w / 2 - 11, btn[1] + btn_h / 2 - 8
-            graphics.DrawString("确定", button_font, button_text, tx, ty)
-        # 选区完成后放大镜立即退出：进入边框修整阶段，不再挡住选区右下角
+                if committed:
+                    # 四边四角把手只在松手提交后出现；框选草稿阶段不显示
+                    for hx, hy in handles_for_rect((l, t, r, b)).values():
+                        graphics.FillRectangle(handle_brush, hx - 3, hy - 3, 6, 6)
+                        graphics.DrawRectangle(handle_pen, hx - 3, hy - 3, 6, 6)
+            if committed:
+                btn = confirm_rect_for((l, t, r, b), size)
+                btn_w, btn_h = btn[2] - btn[0], btn[3] - btn[1]
+                graphics.FillRectangle(button_brush, btn[0], btn[1], btn_w, btn_h)
+                graphics.DrawRectangle(white_pen, btn[0], btn[1], btn_w, btn_h)
+                # 按实测文字尺寸居中，此前硬编码偏移会让「确定」贴边/被裁掉
+                try:
+                    measured = graphics.MeasureString("确定", button_font)
+                    tx = btn[0] + (btn_w - measured.Width) / 2
+                    ty = btn[1] + (btn_h - measured.Height) / 2
+                except Exception:  # noqa: BLE001 - 老 GDI+ 兼容
+                    tx, ty = btn[0] + btn_w / 2 - 11, btn[1] + btn_h / 2 - 8
+                graphics.DrawString("确定", button_font, button_text, tx, ty)
+        # 选区松手提交后放大镜退出；框选草稿阶段一直跟随鼠标（含拖动中）
         cursor = state["cursor"]
-        if not selection and cursor[0] > -9000:
+        if should_show_magnifier(committed) and cursor[0] > -9000:
             image_x, image_y = cursor[0] - origin[0], cursor[1] - origin[1]
             src = magnifier_source((image_x, image_y), size)
             mw, mh = 192, 192  # 取样 96×96 → 2 倍显示，保持比例
@@ -464,15 +486,16 @@ def _run_overlay(
         click_pulse = bool(lbutton_state & 0x0001)
         enter_pressed = bool(int(user32.GetAsyncKeyState(VK_RETURN)) & 0x8000)
 
-        # 确认：回车，或左键落在选区右下角「确定」按钮内
+        # 确认：仅已提交选区支持回车 / 点「确定」按钮
         # （蒙层透明，按钮用命中测试而非 WinForms 控件事件）
         selection = state["selection"]
+        committed = state["selection_committed"]
         button_screen = None
-        if selection:
+        if committed and selection:
             btn = confirm_rect_for(to_client(selection), size)
             button_screen = (btn[0] + origin[0], btn[1] + origin[1],
                              btn[2] + origin[0], btn[3] + origin[1])
-        if confirm_requested(
+        if committed and confirm_requested(
                 screen, button_screen, left_down,
                 click_pulse and not state["lbutton"], enter_pressed):
             finish(False, selection)
@@ -480,16 +503,16 @@ def _run_overlay(
 
         if left_down and not state["lbutton"]:
             state["start"] = screen
-            handle = hit_handle(selection, screen) if selection else None
-            if handle:
-                state["mode"] = "resize"
-                state["handle"] = handle
-                state["origin_rect"] = selection
-            elif selection and point_in_rect(screen, selection):
-                state["mode"] = "move"
-                state["origin_rect"] = selection
-            else:
-                state["mode"] = "create"
+            # hover 永远不参与模式判定；只有已提交选区才可能 resize/move
+            handle = hit_handle(selection, screen) if committed and selection else None
+            mode = choose_drag_mode(committed, selection, screen, handle)
+            state["mode"] = mode
+            state["handle"] = handle if mode == "resize" else None
+            state["origin_rect"] = selection if mode in ("move", "resize") else None
+            if mode == "create":
+                # 重新框选：草稿阶段放大镜仍在，把手/按钮隐藏
+                state["selection_committed"] = False
+                state["selection"] = None
         elif left_down and state["start"] is not None:
             sx, sy = state["start"]
             if state["mode"] == "create":
@@ -504,21 +527,23 @@ def _run_overlay(
                     state["origin_rect"], state["handle"] or "", screen)
             cursor_changed = True
         elif not left_down and state["lbutton"]:
-            # 松手只结束本轮拖拽，不结束取景；等待用户拖动把手修整或点「确定」
-            if state["mode"] == "create":
+            # 松手：提交本轮框选（拖拽画出的矩形，或单击采纳的窗口矩形），
+            # 但不结束取景；接下来只做边框修整直到回车/确定。
+            if state["mode"] == "create" and state["start"] is not None:
                 sx, sy = state["start"]
                 if (abs(screen[0] - sx) <= DRAG_THRESHOLD
                         and abs(screen[1] - sy) <= DRAG_THRESHOLD):
                     state["selection"] = hover
+                else:
+                    state["selection"] = normalize_rect(
+                        (sx, sy, screen[0], screen[1]))
+                state["selection_committed"] = state["selection"] is not None
             state["mode"] = "idle"
             state["handle"] = None
             state["origin_rect"] = None
             cursor_changed = True
         state["lbutton"] = left_down
 
-        # 还没选区时，选区实时跟随鼠标下的窗口（自动识别任意窗口区域）
-        if not left_down and state["selection"] is None:
-            state["selection"] = hover
         if cursor_changed or left_down or state["lbutton"]:
             form.Invalidate()
 
