@@ -153,6 +153,41 @@ describe('imStore', () => {
     expect(useImStore.getState().draftFor(7)).toBe('账号一的草稿')
   })
 
+  it('窗口打开但没点开会话时保留未读红点，点开后才清零', async () => {
+    useImStore.getState().resetForUserSwitch()
+    useImStore.setState({ open: true, activeConversationId: 7 })
+    const unreadConv = {
+      ...conversation(7), unread: 3,
+      last_message: { id: 9, kind: 'text', sender_id: 2, sender_name: '对方',
+                      preview: '新消息', created_at: '' },
+    }
+    vi.mocked(imApi.conversations).mockResolvedValue(conversationsPage([unreadConv]) as any)
+
+    await useImStore.getState().refreshConversations()
+    expect(useImStore.getState().conversations[0].unread).toBe(3)
+    expect(useImStore.getState().unreadTotal).toBe(3)
+
+    useImStore.getState().setActiveConversation(7)
+    await useImStore.getState().refreshConversations()
+    expect(useImStore.getState().conversations[0].unread).toBe(0)
+    expect(useImStore.getState().unreadTotal).toBe(0)
+  })
+
+  it('收起再展开窗口后旧会话未读不再被自动清掉', async () => {
+    useImStore.getState().resetForUserSwitch()
+    useImStore.setState({ open: true, activeConversationId: 7 })
+    useImStore.getState().setActiveConversation(7)
+    const unreadConv = { ...conversation(7), unread: 2 }
+    vi.mocked(imApi.conversations).mockResolvedValue(conversationsPage([unreadConv]) as any)
+    await useImStore.getState().refreshConversations()
+    expect(useImStore.getState().conversations[0].unread).toBe(0)
+
+    useImStore.getState().setOpen(false)
+    vi.mocked(imApi.conversations).mockResolvedValue(conversationsPage([unreadConv]) as any)
+    await useImStore.getState().refreshConversations()
+    expect(useImStore.getState().conversations[0].unread).toBe(2)
+  })
+
   it('resetForUserSwitch 清空会话/消息/未读并停止轮询', () => {
     useImStore.setState({
       activeConversationId: 7, open: true, unreadTotal: 3,

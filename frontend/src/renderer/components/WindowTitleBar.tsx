@@ -202,7 +202,10 @@ export function WindowTitleBar() {
           >
             <MessageSquare size={14} strokeWidth={1.5} />
             {!standalone && unreadTotal > 0 && (
-              <span className="pointer-events-none absolute right-1.5 top-1.5 h-1.5 w-1.5 rounded-full bg-red-500" />
+              <span data-im-unread-total={unreadTotal}
+                    className="pointer-events-none absolute right-1 top-1 flex h-4 min-w-4 items-center justify-center rounded-full border border-card bg-red-500 px-0.5 text-[9px] font-semibold leading-none text-white">
+                {unreadTotal > 99 ? '99+' : unreadTotal}
+              </span>
             )}
           </button>
           <button

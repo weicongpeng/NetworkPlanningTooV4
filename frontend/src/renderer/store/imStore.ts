@@ -197,16 +197,22 @@ function errorMessage(error: unknown, fallbackKey: string): string {
   return fallbackKey
 }
 
-/** 把当前正在查看的会话未读归零：后端已排除自己的消息，这里避免刷新间隙闪红点 */
-function clearActiveUnread(conversations: ImConversation[], activeId: number | null,
+/** 只把用户本轮真正点开过的会话未读归零；窗口打开但没点会话时红点必须保留 */
+function clearActiveUnread(conversations: ImConversation[], viewedId: number | null,
                            open: boolean): ImConversation[] {
-  if (!open || activeId === null) return conversations
-  return conversations.map(c => c.id === activeId && c.unread ? { ...c, unread: 0 } : c)
+  if (!open || viewedId === null) return conversations
+  return conversations.map(c => c.id === viewedId && c.unread ? { ...c, unread: 0 } : c)
 }
 
 let pollTimer: number | null = null
 let refreshTimer: number | null = null
 let refreshQueued = false
+/**
+ * 本轮窗口会话中用户**真正点开过**的会话。
+ * 不能再拿 activeConversationId + open 判断已读：窗口重新展开后仍停留在上次会话，
+ * 或用户停在通讯录 Tab 时，新消息会被误判已读、红点直接消失。
+ */
+let viewedConversationId: number | null = null
 /**
  * 一轮轮询是否还在途。桌面共享模式 1.5s 一个 tick，relay 慢的时候旧请求能挂 12~24s；
  * 不去重会持续叠加在途请求，打满 WebView2 的 6 条 HTTP/1.1 连接与后端线程池，
@@ -317,8 +323,15 @@ export const useImStore = create<ImState>()(
     (set, get) => ({
       ...initialState,
 
-      setOpen: open => set({ open }),
-      toggleOpen: () => set(state => ({ open: !state.open })),
+      setOpen: open => {
+        // 收起窗口即结束本轮查看：下次展开时旧会话的红点不能被自动清掉
+        if (!open) viewedConversationId = null
+        set({ open })
+      },
+      toggleOpen: () => set(state => {
+        if (state.open) viewedConversationId = null
+        return { open: !state.open }
+      }),
       setTab: activeTab => set({ activeTab }),
       setLightbox: lightbox => set({ lightbox }),
       setReplyTo: replyTo => set({ replyTo }),
@@ -351,6 +364,7 @@ export const useImStore = create<ImState>()(
       },
 
       setActiveConversation: id => {
+        viewedConversationId = id
         set({ activeConversationId: id })
         if (id === null) return
         // 该会话在后台收过新消息：用增量补拉接上游标，避免 initial 重置窗口
@@ -409,7 +423,7 @@ export const useImStore = create<ImState>()(
         })
         const state = get()
         playConversationMessageSound(items, state.activeConversationId, state.open)
-        const conversations = clearActiveUnread(items, state.activeConversationId, state.open)
+        const conversations = clearActiveUnread(items, viewedConversationId, state.open)
         set({
           conversations,
           online,
@@ -570,7 +584,7 @@ export const useImStore = create<ImState>()(
             if (shouldChime) playImMessageSound()
           }
           const last = merged[merged.length - 1]
-          if (direction !== 'older' && last && get().activeConversationId === id) {
+          if (direction !== 'older' && last && viewedConversationId === id) {
             const readId = Math.max(nextCursor ?? 0, last.id)
             void imApi.markRead(id, readId).catch(() => {})
             set(s => ({
@@ -631,7 +645,7 @@ export const useImStore = create<ImState>()(
           get().setDraft('')
           // 自己发出的消息立即把本会话未读归零，不等服务端刷新（后端也会排除自己的消息）
           set(s => ({
-            conversations: clearActiveUnread(s.conversations, id, true),
+            conversations: clearActiveUnread(s.conversations, viewedConversationId, true),
             unreadTotal: s.conversations.reduce((sum, c) => sum + (c.id === id ? 0 : c.unread || 0), 0),
           }))
           void get().refreshConversations().catch(() => {})
@@ -677,7 +691,7 @@ export const useImStore = create<ImState>()(
           }
         }
         set(s => ({
-          conversations: clearActiveUnread(s.conversations, id, true),
+          conversations: clearActiveUnread(s.conversations, viewedConversationId, true),
           unreadTotal: s.conversations.reduce((sum, c) => sum + (c.id === id ? 0 : c.unread || 0), 0),
         }))
         await get().refreshConversations().catch(() => {})
@@ -989,10 +1003,12 @@ export const useImStore = create<ImState>()(
         }
         refreshQueued = false
         pollInFlight = false
+        viewedConversationId = null
       },
 
       resetForUserSwitch: () => {
         get().stopPolling()
+        viewedConversationId = null
         // 灯箱的 objectURL 由 ImImageLightbox 自己持有并在卸载时 revoke，此处只清状态
         // 群成员名单与 @ 去重记录都按账号隔离，切账号必须一起清掉
         membersInFlight.clear()
