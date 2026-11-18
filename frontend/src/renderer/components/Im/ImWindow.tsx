@@ -37,7 +37,6 @@ export function ImWindow({ userId, desktopMode, onClose }: Props) {
   const [entered, setEntered] = useState(false)
   const [showChat, setShowChat] = useState(false)
   const conversation = useImStore(s => s.conversations.find(c => c.id === s.activeConversationId) || null)
-  const onlineCount = useImStore(s => s.contacts?.online_count ?? 0)
   const refreshConversations = useImStore(s => s.refreshConversations)
   const narrow = rect.w < 640
 
@@ -88,15 +87,8 @@ export function ImWindow({ userId, desktopMode, onClose }: Props) {
         className="flex h-12 shrink-0 cursor-grab select-none items-center gap-2 border-b border-border/60 bg-gradient-to-r from-primary/10 via-card/40 to-primary/5 px-3 active:cursor-grabbing"
         style={{ touchAction: 'none' }}
       >
-        <div className="flex h-7 w-7 items-center justify-center rounded-lg bg-primary text-primary-foreground shadow-sm">
-          <span className="text-xs font-bold">{t('im.window.badge', '协')}</span>
-        </div>
         <div className="min-w-0 flex-1">
           <h2 className="truncate text-[13px] font-semibold leading-tight">{t('im.title', '项目沟通')}</h2>
-          <p className="flex items-center gap-1 text-[10px] text-muted-foreground">
-            <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />
-            {t('im.window.onlineCount', { defaultValue: '{{count}} 人在线', count: onlineCount })}
-          </p>
         </div>
         <HeaderButton title={maximized ? t('im.window.restore', '还原') : t('im.window.maximize', '最大化')}
                       onClick={toggleMaximize}>

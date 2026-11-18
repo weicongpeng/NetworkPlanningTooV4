@@ -216,6 +216,52 @@ describe('imStore', () => {
     expect(useImStore.getState().conversations[0].unread).toBe(2)
   })
 
+  it('展开窗口时跳到最近一条未读消息所属会话，并只清掉该会话红点', async () => {
+    useImStore.getState().resetForUserSwitch()
+    vi.mocked(imApi.messages).mockResolvedValue(messagesPage([], null) as any)
+    const older = { ...conversation(7), id: 7, unread: 1, last_message_at: '2026-01-01T10:00:00Z' }
+    const newer = { ...conversation(8), id: 8, unread: 3, last_message_at: '2026-01-01T11:00:00Z' }
+    useImStore.setState({
+      open: false, activeConversationId: 7, conversations: [older, newer],
+      unreadTotal: 4, messages: {}, cursors: {},
+    })
+
+    useImStore.getState().toggleOpen()
+
+    expect(useImStore.getState().open).toBe(true)
+    expect(useImStore.getState().activeConversationId).toBe(8)
+    expect(useImStore.getState().conversations.find(c => c.id === 8)?.unread).toBe(0)
+    expect(useImStore.getState().conversations.find(c => c.id === 7)?.unread).toBe(1)
+  })
+
+  it('没有未读会话时展开窗口保留当前激活会话', () => {
+    useImStore.setState({
+      open: false, activeConversationId: 7,
+      conversations: [{ ...conversation(7), unread: 0 }], unreadTotal: 0,
+    })
+    useImStore.getState().toggleOpen()
+    expect(useImStore.getState().activeConversationId).toBe(7)
+  })
+
+  it('发送中的乐观消息排在列表末尾，服务端替换后仍在末尾', async () => {
+    localStorage.setItem('auth-storage', JSON.stringify({ state: { user: { id: 1 } } }))
+    let resolveSend!: (value: unknown) => void
+    vi.mocked(imApi.send).mockImplementation(() => new Promise(resolve => { resolveSend = resolve }) as any)
+    useImStore.setState({
+      activeConversationId: 7, messages: { 7: [message(9)] }, cursors: {}, drafts: {},
+    })
+
+    const pending = useImStore.getState().sendText('新消息')
+    const optimistic = useImStore.getState().messages[7]
+    expect(optimistic).toHaveLength(2)
+    expect(optimistic[optimistic.length - 1].content_text).toBe('新消息')
+
+    resolveSend({ success: true, data: { ...message(20), content_text: '新消息' } })
+    await pending
+    const final = useImStore.getState().messages[7]
+    expect(final[final.length - 1].id).toBe(20)
+  })
+
   it('繁忙提示按出错操作与会话作用域记录，成功后自动消失', async () => {
     localStorage.setItem('auth-storage', JSON.stringify({ state: { user: { id: 1 } } }))
     useImStore.setState({ activeConversationId: 7 })

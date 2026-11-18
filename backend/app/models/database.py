@@ -748,6 +748,25 @@ class ImMessage(Base):
     )
 
 
+class ImMessageHidden(Base):
+    """协作沟通 - 消息的单用户隐藏记录。
+
+    删除消息只对自己生效：写入一条 (message_id, user_id) 墓碑，消息行本身保留，
+    对方的消息列表 / 未读 / 会话预览完全不受影响。
+    """
+    __tablename__ = "im_message_hidden"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    message_id = Column(Integer, ForeignKey("im_messages.id"), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    created_at = Column(String(30), nullable=False, default=_utcnow_iso)
+
+    __table_args__ = (
+        Index("idx_im_hidden_msg_user", "message_id", "user_id", unique=True),
+        Index("idx_im_hidden_user", "user_id"),
+    )
+
+
 class ImMessageMention(Base):
     """协作沟通 - 被 @ 的成员（发送时刻展开后的用户 id 快照）。"""
     __tablename__ = "im_message_mentions"

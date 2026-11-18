@@ -292,7 +292,7 @@ def send_message(conversation_id: int, payload: SendMessageRequest, response: Re
 @router.delete("/conversations/{conversation_id}/messages/{message_id}")
 def delete_message(conversation_id: int, message_id: int,
                    db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    """删除单条历史消息（发送者本人或群主/管理员）。"""
+    """隐藏单条自己发出的历史消息（仅对操作者生效，对方无感）。"""
     return _ok(_run("delete_message", {
         "conversation_id": conversation_id, "message_id": message_id,
     }, db, user, limit=30))

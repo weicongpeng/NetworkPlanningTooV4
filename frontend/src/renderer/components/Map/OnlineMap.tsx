@@ -3493,13 +3493,9 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
       // 立即显示默认标签
       updateMarkerLabel(captureId, seq, defaultLabel, gcjLat, gcjLng)
 
-      // 左键点击：弹出可编辑属性框
-      // 选中规则（地图工具页）：需"可选"开关打开且激活"选择"工具，点击才能选中装饰图层要素
-      marker.on('click', () => {
-        if (modeRef.current === 'default') {
-          if (!selectModeRef.current) return
-          if (selectableMapRef.current?.['decoration-layer'] === false) return
-        }
+      // 打点属性框：打点后立即弹出；之后点击标记可再次弹出（无需切到"选择"工具）。
+      // 默认态（地图工具页）仍沿用选中规则："可选"开关打开且激活"选择"工具。
+      const openCapturePopup = () => {
         const labelData = markerLabelsRef.current.get(captureId)
         const currentLabel = labelData?.label || defaultLabel
         // 经纬度显示值：取属性中的 WGS84 原值（创建/编辑确认时写回），
@@ -3550,10 +3546,14 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
           closeButton: true,
           autoPan: true,
           offset: [0, -20]
-        }).openPopup()
+        })
+        marker.openPopup()
+        const popup = marker.getPopup()
 
         // 绑定事件
         setTimeout(() => {
+          // 期间又打了新点/切了工具导致本弹窗已关闭时，不把事件绑到别人的弹窗上
+          if (!popup?.isOpen()) return
           // 复制按钮事件 — 制表符分隔（粘贴到Excel为横向3列）
           document.querySelectorAll('.capture-popup-white .cp-all-btn').forEach(btn => {
             btn.addEventListener('click', function(this: HTMLButtonElement) {
@@ -3686,6 +3686,15 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
           input.focus()
           input.select()
         }, 100)
+      }
+
+      // 左键点击标记：打点工具下直接弹属性框；默认态需"选择"工具 + 装饰图层"可选"
+      marker.on('click', () => {
+        if (modeRef.current === 'default' && !captureModeRef.current) {
+          if (!selectModeRef.current) return
+          if (selectableMapRef.current?.['decoration-layer'] === false) return
+        }
+        openCapturePopup()
       })
 
       // 右键点击：阻止默认行为（不再弹出编辑框，编辑已整合到左键属性框）
@@ -3725,6 +3734,9 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
       } else {
         marker.addTo(map)
       }
+
+      // 打点后立即弹出属性框（无需再切到"选择"工具点标记）
+      openCapturePopup()
 
       onCaptureCoord(wgsLng, wgsLat)
       return

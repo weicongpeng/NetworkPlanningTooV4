@@ -377,7 +377,7 @@ export const CesiumMap = forwardRef<OnlineMapRef, CesiumMapProps>((props, ref) =
     props: Record<string, unknown>
     position: { x: number; y: number }
   } | null>(null)
-  /** 定位打点属性面板（「选择」工具点击已有打点标记时打开） */
+  /** 定位打点属性面板（打点后立即弹出；定位/选择工具点击已有打点标记时也可打开） */
   const [capturePanel, setCapturePanel] = useState<CapturePoint | null>(null)
   const [capturePanelPos, setCapturePanelPos] = useState<{ x: number; y: number }>({ x: 0, y: 0 })
 

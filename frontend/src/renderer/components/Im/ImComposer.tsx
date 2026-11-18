@@ -15,7 +15,7 @@ import type {
 import { useTranslation } from 'react-i18next'
 import {
   AtSign, Check, ChevronDown, EyeOff, File as FileIcon, ImagePlus, Loader2,
-  Paperclip, Scissors, Send, Settings2, Smile, X,
+  Paperclip, Scissors, Settings2, Smile, X,
 } from 'lucide-react'
 
 import { imApi } from '../../services/api'
@@ -67,7 +67,11 @@ function parseMention(value: string, caret: number): { start: number; query: str
   return { start: caret - match[0].length, query: match[1] }
 }
 
-export function ImComposer({ conversationId }: { conversationId: number }) {
+export function ImComposer({ conversationId, onSent }: {
+  conversationId: number
+  /** 提交发送后回调：会话区据此跳回最新消息（即便此前停留在历史位置） */
+  onSent?: () => void
+}) {
   const { t } = useTranslation()
   const [text, setText] = useState('')
   const [pending, setPending] = useState<PendingAttachment[]>([])
@@ -310,6 +314,8 @@ export function ImComposer({ conversationId }: { conversationId: number }) {
     updateText('')
     clearPending()
     setMentionState(null)
+    // 发送即回到底部：乐观消息由 store 同步写入，后续消息到达时 atBottom 已为 true
+    onSent?.()
     try {
       let textOk = true
       if (value) {
@@ -406,7 +412,8 @@ export function ImComposer({ conversationId }: { conversationId: number }) {
     `messages:${conversationId}`,
   ].includes(errorScope)) ? error : null
 
-  const disabled = (!text.trim() && pending.length === 0) || busy || sending
+  const hasInput = !!text.trim() || pending.length > 0
+  const disabled = !hasInput || busy || sending
   const hasPendingMention = pendingMentions.mention_all || pendingMentions.mentions.length > 0
 
   return (
@@ -500,7 +507,7 @@ export function ImComposer({ conversationId }: { conversationId: number }) {
         </div>
       )}
 
-      <div className="flex items-center gap-1 px-3 pt-2">
+      <div className="order-last flex items-center gap-1 px-3 pb-3 pt-2">
         <ToolButton title={t('im.composer.sendImage', '添加图片')}
                     onClick={() => imageInputRef.current?.click()}>
           <ImagePlus size={17} />
@@ -595,6 +602,20 @@ export function ImComposer({ conversationId }: { conversationId: number }) {
             <X size={10} />
           </button>
         )}
+        <button
+          type="button"
+          onClick={() => void submit()}
+          disabled={disabled}
+          title={t('im.composer.sendMessage', '发送消息')}
+          className={`ml-auto flex h-[30px] min-w-[66px] shrink-0 items-center justify-center gap-1 rounded-lg px-3 text-xs font-medium transition-all cursor-pointer ${
+            hasInput
+              ? 'bg-primary text-primary-foreground shadow-lg hover:brightness-110 active:scale-95 disabled:opacity-60 disabled:shadow-none'
+              : 'bg-muted text-muted-foreground shadow-none'
+          }`}
+        >
+          {(busy || sending) && <Loader2 size={13} className="animate-spin" />}
+          {t('im.send', '发送')}
+        </button>
       </div>
 
       {replyTo && (
@@ -632,7 +653,7 @@ export function ImComposer({ conversationId }: { conversationId: number }) {
         <span className="h-1 w-10 rounded-full bg-border transition-colors hover:bg-primary/60" />
       </div>
 
-      <div className="flex items-end gap-2 px-3 pb-3 pt-1.5">
+      <div className="px-3 pt-1.5">
         <textarea
           ref={textareaRef}
           value={text}
@@ -641,17 +662,8 @@ export function ImComposer({ conversationId }: { conversationId: number }) {
           onKeyDown={onComposerKeyDown}
           placeholder={t('im.composer.placeholder', '输入消息，输入 @ 可点名成员，粘贴截图/拖入文件后确认再发送…')}
           style={{ height: inputHeight }}
-          className="min-h-[54px] flex-1 resize-none rounded-xl border border-border/70 bg-background/70 px-3 py-2 text-[13px] leading-relaxed text-foreground outline-none transition-colors placeholder:text-muted-foreground/70 focus:border-primary/70 focus:ring-2 focus:ring-primary/15"
+          className="block min-h-[54px] w-full resize-none rounded-xl border border-border/70 bg-background/70 px-3 py-2 text-[13px] leading-relaxed text-foreground outline-none transition-colors placeholder:text-muted-foreground/70 focus:border-primary/70 focus:ring-2 focus:ring-primary/15"
         />
-        <button
-          type="button"
-          onClick={() => void submit()}
-          disabled={disabled}
-          title={t('im.composer.sendMessage', '发送消息')}
-          className="flex h-[54px] w-[54px] shrink-0 items-center justify-center rounded-xl bg-primary text-primary-foreground shadow-lg transition-all hover:brightness-110 active:scale-95 disabled:cursor-not-allowed disabled:opacity-40 disabled:shadow-none"
-        >
-          {busy || sending ? <Loader2 size={19} className="animate-spin" /> : <Send size={19} />}
-        </button>
       </div>
 
       <input ref={imageInputRef} type="file" accept="image/*" multiple hidden

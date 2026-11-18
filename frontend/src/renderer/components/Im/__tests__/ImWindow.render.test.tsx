@@ -82,6 +82,17 @@ describe('项目沟通窗口', () => {
     expect(screen.getByText('选择一个会话开始协作')).toBeTruthy()
   })
 
+  it('标题栏不显示「协」徽标图标', () => {
+    render(<ImWindow userId={1} desktopMode={false} onClose={vi.fn()} />)
+    expect(screen.queryByText('协')).toBeNull()
+  })
+
+  it('标题栏不再显示在线人数统计', () => {
+    useImStore.setState({ contacts: { users: [], groups: [], online_count: 3 } as any })
+    render(<ImWindow userId={1} desktopMode={false} onClose={vi.fn()} />)
+    expect(screen.queryByText(/人在线/)).toBeNull()
+  })
+
   it('切换通讯录 Tab 展示空联系人状态与建群入口', () => {
     render(<ImWindow userId={1} desktopMode={false} onClose={vi.fn()} />)
     fireEvent.click(screen.getByText('通讯录'))

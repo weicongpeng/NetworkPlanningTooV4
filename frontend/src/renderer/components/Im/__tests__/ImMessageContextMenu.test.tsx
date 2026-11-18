@@ -18,14 +18,14 @@ const message: ImMessage = {
 }
 
 describe('ImMessageContextMenu', () => {
-  it('提供复制 / 引用 / 多选 / 转发 / 删除五项并回调当前消息', () => {
+  it('自己的消息提供复制 / 引用 / 多选 / 转发 / 删除五项并回调当前消息', () => {
     const actions = {
       onCopy: vi.fn(), onQuote: vi.fn(), onMultiSelect: vi.fn(),
       onForward: vi.fn(), onDelete: vi.fn(),
     }
     render(
       <ImMessageContextMenu
-        state={{ message, x: 40, y: 60 }} onClose={vi.fn()} {...actions}
+        state={{ message, x: 40, y: 60 }} onClose={vi.fn()} canDelete {...actions}
       />,
     )
     for (const label of ['复制', '引用', '多选', '转发', '删除']) {
@@ -35,6 +35,19 @@ describe('ImMessageContextMenu', () => {
     fireEvent.click(screen.getByText('删除'))
     expect(actions.onQuote).toHaveBeenCalledWith(message)
     expect(actions.onDelete).toHaveBeenCalledWith(message)
+  })
+
+  it('对方的消息不显示删除项', () => {
+    const onDelete = vi.fn()
+    const noop = vi.fn()
+    render(
+      <ImMessageContextMenu
+        state={{ message, x: 40, y: 60 }} onClose={vi.fn()} canDelete={false}
+        onCopy={noop} onQuote={noop} onMultiSelect={noop} onForward={noop} onDelete={onDelete}
+      />,
+    )
+    expect(screen.getByText('复制')).toBeTruthy()
+    expect(screen.queryByText('删除')).toBeNull()
   })
 
   it('点击菜单外部或按 Esc 关闭', () => {

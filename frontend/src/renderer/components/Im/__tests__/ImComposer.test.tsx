@@ -116,6 +116,42 @@ describe('协作沟通输入区', () => {
     expect(state.sendText).toHaveBeenCalledWith('你好')
   })
 
+  it('提交发送时回调 onSent，让会话区跳回最新；空输入不回调', () => {
+    const onSent = vi.fn()
+    render(<ImComposer conversationId={7} onSent={onSent} />)
+    const textarea = screen.getByPlaceholderText(/输入消息/)
+
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+    expect(onSent).not.toHaveBeenCalled()
+
+    fireEvent.change(textarea, { target: { value: '你好' } })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+    expect(onSent).toHaveBeenCalledTimes(1)
+    expect(state.sendText).toHaveBeenCalledWith('你好')
+  })
+
+  it('输入框占满整行，工具栏与发送按钮同处底部一行', () => {
+    const { container } = render(<ImComposer conversationId={7} />)
+    const textarea = screen.getByPlaceholderText(/输入消息/)
+    expect(textarea.className).toContain('w-full')
+
+    const bottomRow = container.querySelector('.order-last') as HTMLElement
+    expect(bottomRow).toBeTruthy()
+    const sendButton = screen.getByTitle('发送消息')
+    expect(bottomRow.contains(sendButton)).toBe(true)
+    expect(sendButton.textContent).toContain('发送')
+    // 无输入时灰色，有输入后切到系统主题色
+    expect(sendButton.className).toContain('bg-muted')
+    expect(sendButton.className).not.toContain('bg-primary')
+    fireEvent.change(screen.getByPlaceholderText(/输入消息/), { target: { value: '你好' } })
+    expect(sendButton.className).toContain('bg-primary')
+    expect(sendButton.className).not.toContain('bg-muted')
+    expect(bottomRow.contains(textarea)).toBe(false)
+    // 截图 / 表情等工具仍在底部行
+    expect(bottomRow.querySelector('[title^="截图"]')).toBeTruthy()
+    expect(bottomRow.querySelector('[title="表情"]')).toBeTruthy()
+  })
+
   it('点击剪刀按钮派发全局截图事件，输入框自身不渲染弹窗、不抓屏、不发送', () => {
     const getDisplayMedia = vi.fn()
     Object.defineProperty(navigator, 'mediaDevices', {

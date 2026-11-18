@@ -10,8 +10,9 @@
  *
  * 打点（定位）：单击把地面 WGS84 经纬度回调给上层并加一个标记，**可以同时打多个点**
  * （自动编号「打点1/打点2…」）；切工具不清已打的点，只有工具栏「清除」/ Delete 才擦掉。
- * 「选择」工具点击已有标记可编辑经纬度、重命名、复制属性、删除（面板由宿主渲染，
- * 命中通过 `onCapturePick` 回调上报）。
+ * 打点后立即通过 `onCapturePick` 上报以弹出属性面板（无需切工具再点标记）；
+ * 悬停已有标记光标变 pointer，点击同样弹面板。面板可编辑经纬度、重命名、复制属性、删除，
+ * 由宿主渲染，命中经 `onCapturePick` 回调上报。
  *
  * 与编辑会话互斥（上层同一时刻只会激活一种工具）。
  */
@@ -242,9 +243,11 @@ export class CesiumMapTools {
       // 点中已有的标记 → 交给宿主打开展性面板（编辑经纬度/重命名/复制/删除），不再新加一个点
       const hit = this.pickCapture(position)
       if (hit) { this.onCapturePick(hit, { x: position.x, y: position.y }); return }
-      this.addCaptureMarker(g)
+      const point = this.addCaptureMarker(g)
       // 回传 WGS84（与 OnlineMap 抓取坐标口径一致）
       this.onCapture(g[0], g[1])
+      // 打点后立即弹出属性面板（无需切到"选择"工具再点标记）
+      this.onCapturePick(point, { x: position.x, y: position.y })
       return
     }
 
@@ -266,6 +269,12 @@ export class CesiumMapTools {
   }
 
   private onMouseMove(position: any) {
+    // 打点模式：悬停到已有标记时光标变 pointer，提示可点击弹出属性面板
+    if (this.active === 'capture') {
+      const canvas = this.viewer?.scene?.canvas
+      if (canvas) canvas.style.cursor = this.pickCapture(position) ? 'pointer' : ''
+      return
+    }
     if (this.active !== 'measure' || this.measurePoints.length === 0) {
       this.setPreviewVisible(false)
       return
@@ -523,12 +532,13 @@ export class CesiumMapTools {
    * **可同时存在多个**（与 2D 一致）：每个点自动编号「打点N」，带名称标签；
    * 只有工具栏「清除」/ Delete / 面板里的删除按钮才移除。
    */
-  private addCaptureMarker(g: Pos, label?: string) {
+  private addCaptureMarker(g: Pos, label?: string): CapturePoint {
     const C = this.C
     this.captureSeq += 1
     const id = `capture-${Date.now()}-${this.captureSeq}`
     const name = label ?? `${this.t('map.capturePoint') || '打点'}${this.captureSeq}`
-    this.captures.push({ id, name, lng: g[0], lat: g[1] })
+    const point: CapturePoint = { id, name, lng: g[0], lat: g[1] }
+    this.captures.push(point)
     const e = this.captureSource.entities.add(new C.Entity({
       position: C.Cartesian3.fromDegrees(g[0], g[1]),
       point: {
@@ -552,6 +562,7 @@ export class CesiumMapTools {
     }))
     // 拾取标识：pickCapture 靠它把点击结果映射回具体的打点
     e.captureId = id
+    return point
   }
 
   /** 外部（如搜索定位）追加一个定位标记，与打点标记同源；可自带名称 */

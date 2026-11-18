@@ -135,11 +135,16 @@ interface MessagePage {
   prev_cursor: number | null
 }
 
+/** 乐观消息 id 为负数（临时），按 id 升序会排到列表顶部；把它们排到末尾 */
+function messageOrder(message: ImMessage): number {
+  return message.id > 0 ? message.id : Number.MAX_SAFE_INTEGER + message.id
+}
+
 function mergeMessages(existing: ImMessage[], incoming: ImMessage[]): ImMessage[] {
   const map = new Map<number, ImMessage>()
   existing.forEach(item => map.set(item.id, item))
   incoming.forEach(item => map.set(item.id, item))
-  const merged = Array.from(map.values()).sort((a, b) => a.id - b.id)
+  const merged = Array.from(map.values()).sort((a, b) => messageOrder(a) - messageOrder(b))
   return merged.length > MESSAGE_WINDOW_SIZE
     ? merged.slice(merged.length - MESSAGE_WINDOW_SIZE)
     : merged
@@ -358,10 +363,25 @@ export const useImStore = create<ImState>()(
         if (!open) viewedConversationId = null
         set({ open })
       },
-      toggleOpen: () => set(state => {
-        if (state.open) viewedConversationId = null
-        return { open: !state.open }
-      }),
+      toggleOpen: () => {
+        const state = get()
+        if (state.open) {
+          viewedConversationId = null
+          set({ open: false })
+          return
+        }
+        set({ open: true })
+        // 收到新消息后从悬浮图标/标题栏展开窗口：直接跳到最近一条未读消息所属会话，
+        // 聊天区据此从最新消息开始，不必再手动去侧栏点一次。
+        // 只走 toggleOpen（用户主动展开）；截图确认等 setOpen(true) 不切会话，
+        // 否则待发送附件会落进被自动切走的会话。
+        const latestUnread = [...state.conversations]
+          .filter(c => (c.unread || 0) > 0)
+          .sort((a, b) => (b.last_message_at || '').localeCompare(a.last_message_at || ''))[0]
+        if (latestUnread && latestUnread.id !== state.activeConversationId) {
+          get().setActiveConversation(latestUnread.id)
+        }
+      },
       setTab: activeTab => set({ activeTab }),
       setLightbox: lightbox => set({ lightbox }),
       setReplyTo: replyTo => set({ replyTo }),

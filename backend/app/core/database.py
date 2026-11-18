@@ -95,7 +95,7 @@ def init_db():
         User, UserSession, Workbook, Site, Sector, GeoFile, Layer, UserSettings, TaskResult,
         TaskResultRow, TaskResultSourceGroup, DatasetRevision, SystemSetting,
         ImConversation, ImConversationMember, ImAttachment, ImMessage, ImMessageMention,
-        ImGroupMeta,
+        ImMessageHidden, ImGroupMeta,
     )  # noqa: F401
     Base.metadata.create_all(bind=engine)
 

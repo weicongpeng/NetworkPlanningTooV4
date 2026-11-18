@@ -22,7 +22,7 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.models.database import (
     ImAttachment, ImConversation, ImConversationMember, ImGroupMeta, ImMessage,
-    ImMessageMention, User, UserSession,
+    ImMessageHidden, ImMessageMention, User, UserSession,
 )
 
 KINDS = ("direct", "auto_group", "custom_group")
@@ -335,8 +335,23 @@ def list_conversations(db: Session, user_id: int,
     last_messages = {}
     if last_ids:
         last_messages = {
-            m.id: m for m in db.query(ImMessage).filter(ImMessage.id.in_(last_ids)).all()
+            m.id: m for m in _visible_messages_query(db, user_id)
+            .filter(ImMessage.id.in_(last_ids)).all()
         }
+    # 会话最后一条是对自己隐藏的消息时，预览回退到该会话可见的最新一条；
+    # 同时保持 conv.last_message_at 不变，对方看到的预览/排序完全不受影响。
+    preview_by_conv: Dict[int, Any] = {}
+    for conv in convs:
+        msg = last_messages.get(conv.last_message_id)
+        # 仅当会话确实有最后一条、但被当前用户隐藏时才回退查一次；
+        # 空会话（last_message_id=None）直接保持 None，避免逐会话空查询
+        if msg is None and conv.last_message_id is not None:
+            msg = (_visible_messages_query(db, user_id)
+                   .filter(ImMessage.conversation_id == conv.id)
+                   .order_by(ImMessage.id.desc()).first())
+            if msg is not None:
+                last_messages[msg.id] = msg
+        preview_by_conv[conv.id] = msg
     sender_ids = {m.sender_id for m in last_messages.values()}
     sender_names = _load_sender_names(db, sender_ids)
 
@@ -399,7 +414,7 @@ def list_conversations(db: Session, user_id: int,
             "member_count": (group_counts.get(conv.id, 0) if conv.kind != "direct"
                              else (1 if other is None else 2)),
             "last_message": _message_brief(
-                last_messages.get(conv.last_message_id), sender_names, attachments),
+                preview_by_conv.get(conv.id), sender_names, attachments),
             "last_message_at": conv.last_message_at,
             # 字段名保持 unread，旧客户端零改动；值来自冗余列
             "unread": int(member.unread_count or 0),
@@ -753,6 +768,13 @@ def _serialize_message(db: Session, message: ImMessage,
     }
 
 
+def _visible_messages_query(db: Session, user_id: int):
+    """排除当前用户已隐藏的消息。删除只对操作者生效，对方读取时不受影响。"""
+    hidden_ids = db.query(ImMessageHidden.message_id).filter(
+        ImMessageHidden.user_id == user_id)
+    return db.query(ImMessage).filter(~ImMessage.id.in_(hidden_ids))
+
+
 def list_messages(db: Session, conversation_id: int, user_id: int,
                   after_id: Optional[int] = None, before_id: Optional[int] = None,
                   limit: Optional[int] = None) -> Dict[str, Any]:
@@ -760,7 +782,9 @@ def list_messages(db: Session, conversation_id: int, user_id: int,
     size = limit or int(settings.NPT_IM_MESSAGE_PAGE_SIZE)
     size = max(1, min(int(size), 100))
 
-    query = db.query(ImMessage).filter(ImMessage.conversation_id == conversation_id)
+    # 隐藏消息不进入任何分页：游标取的是可见消息的 id，增量补拉也不会把它们带回来
+    query = _visible_messages_query(db, user_id).filter(
+        ImMessage.conversation_id == conversation_id)
     has_more = False
     if after_id is not None:
         rows = query.filter(ImMessage.id > int(after_id)).order_by(ImMessage.id.asc()).limit(size + 1).all()
@@ -792,7 +816,8 @@ def list_messages(db: Session, conversation_id: int, user_id: int,
     mention_map = _load_mentions(db, [m.id for m in items])
     reply_ids = {m.reply_to_id for m in items if m.reply_to_id}
     reply_map = (
-        {r.id: r for r in db.query(ImMessage).filter(ImMessage.id.in_(list(reply_ids))).all()}
+        {r.id: r for r in _visible_messages_query(db, user_id)
+         .filter(ImMessage.id.in_(list(reply_ids))).all()}
         if reply_ids else {}
     )
     # 引用消息可能是更早的消息，其附件不在本页 attachment_ids 里；一并预取，
@@ -946,30 +971,27 @@ def send_message(db: Session, conversation_id: int, user_id: int, kind: str,
 
 def delete_message(db: Session, conversation_id: int, message_id: int,
                    user_id: int) -> Dict[str, Any]:
-    """删除单条历史消息：发送者本人或群主/管理员可删，引用它的消息只清空引用。"""
-    member = _require_member(db, conversation_id, user_id)
+    """隐藏一条自己发的历史消息：仅对操作者生效，对方完全无感。
+
+    只写 (message_id, user_id) 墓碑，不物理删消息、不清引用、不改会话最后一条，
+    这样对方的列表 / 未读 / 会话预览都保持原样；对方也不会收到任何删除提示。
+    """
+    _require_member(db, conversation_id, user_id)
     message = db.query(ImMessage).filter(
         ImMessage.id == int(message_id),
         ImMessage.conversation_id == conversation_id).first()
     if message is None:
         raise _err(404, "IM_CONVERSATION_NOT_FOUND")
-    if message.sender_id != user_id and member.role not in ("owner", "admin"):
+    # 只能删自己发的：单聊与群聊一视同仁，群主/管理员也不能删别人的消息
+    if message.sender_id != user_id:
         raise _err(403, "IM_NO_PERMISSION")
-    conv = db.query(ImConversation).filter(ImConversation.id == conversation_id).first()
-    was_last = conv is not None and conv.last_message_id == message.id
-    # 外键无 ON DELETE SET NULL，先手动断开引用与 @ 名单，避免整批删消息时违反约束
-    db.query(ImMessage).filter(ImMessage.reply_to_id == message.id).update(
-        {ImMessage.reply_to_id: None}, synchronize_session=False)
-    db.query(ImMessageMention).filter(ImMessageMention.message_id == message.id).delete(
-        synchronize_session=False)
-    db.delete(message)
-    if was_last and conv is not None:
-        latest = (db.query(ImMessage)
-                  .filter(ImMessage.conversation_id == conversation_id)
-                  .order_by(ImMessage.id.desc()).first())
-        conv.last_message_id = latest.id if latest else None
-        conv.last_message_at = latest.created_at if latest else None
-    db.commit()
+    exists = db.query(ImMessageHidden.id).filter(
+        ImMessageHidden.message_id == message.id,
+        ImMessageHidden.user_id == user_id).first()
+    if exists is None:
+        db.add(ImMessageHidden(
+            message_id=message.id, user_id=user_id, created_at=_now()))
+        db.commit()
     return {"deleted": int(message_id)}
 
 
@@ -1043,11 +1065,11 @@ def mark_read(db: Session, conversation_id: int, user_id: int,
     member.last_read_message_id = value
     # 精算剩余未读：mark_read 是低频写路径，一次索引范围 COUNT 可接受；
     # 直接置 0 会在「客户端只标记到中间某条」时与服务端真实未读不一致。
-    remaining = int(db.query(func.count(ImMessage.id)).filter(
+    remaining = int(_visible_messages_query(db, user_id).filter(
         ImMessage.conversation_id == conversation_id,
         ImMessage.id > value,
         ImMessage.sender_id != user_id,
-    ).scalar() or 0)
+    ).count() or 0)
     member.unread_count = remaining
     db.commit()
     return {"unread": remaining}

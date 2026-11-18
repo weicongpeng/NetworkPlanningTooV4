@@ -76,7 +76,7 @@ def test_self_direct_conversation_allows_sending_to_self(db):
 
 
 def test_message_quote_delete_and_forward(db):
-    """历史消息右键菜单的服务端语义：引用、删除（断引用）、转发到群。"""
+    """历史消息右键菜单的服务端语义：引用、转发；删除=仅对自己隐藏，不断引用。"""
     ids = _users(db)
     alice, bob = ids["alice"], ids["bob"]
     conv = im_service.create_direct(db, alice, bob)["conversation"]["id"]
@@ -94,9 +94,56 @@ def test_message_quote_delete_and_forward(db):
     assert forwarded[0]["sender_id"] == alice
 
     im_service.delete_message(db, conv, first["id"], alice)
+    # 删除只对自己生效：自己的列表不再有这条，引用预览也不泄露已隐藏内容
     remaining = im_service.list_messages(db, conv, alice)["items"]
     assert [m["id"] for m in remaining] == [quoted["id"]]
-    assert remaining[0]["reply_to"] is None  # 被引用消息删除后只清空引用，不删回复
+    assert remaining[0]["reply_to"] is None
+    # 对方完全无感：消息、引用、未读都和没删一样
+    for_viewer = im_service.list_messages(db, conv, bob)["items"]
+    assert [m["id"] for m in for_viewer] == [first["id"], quoted["id"]]
+    assert [m["reply_to"]["preview"] for m in for_viewer if m["id"] == quoted["id"]] == ["原始消息"]
+    bob_conv = next(c for c in im_service.list_conversations(db, bob)["items"]
+                    if c["id"] == conv)
+    assert bob_conv["unread"] == 1
+    assert bob_conv["last_message"]["preview"] == "收到"
+    # 自己这边的会话预览回退到可见的最新一条，且不改变对方看到的 last_message
+    alice_conv = next(c for c in im_service.list_conversations(db, alice)["items"]
+                      if c["id"] == conv)
+    assert alice_conv["last_message"]["id"] == quoted["id"]
+
+    # 游标增量补拉也不会把隐藏的消息带回来
+    after = im_service.list_messages(db, conv, alice, after_id=0)["items"]
+    assert [m["id"] for m in after] == [quoted["id"]]
+    # 重复删除幂等
+    im_service.delete_message(db, conv, first["id"], alice)
+
+
+def test_delete_message_only_own_and_group_scope(db):
+    """删除仅限自己发出的消息；群聊同样可删自己的，不能删别人的。"""
+    ids = _users(db)
+    alice, bob = ids["alice"], ids["bob"]
+    conv = im_service.create_direct(db, alice, bob)["conversation"]["id"]
+    mine = im_service.send_message(db, conv, alice, "text", "我的")["message"]
+    theirs = im_service.send_message(db, conv, bob, "text", "对方的")["message"]
+    with pytest.raises(HTTPException) as exc:
+        im_service.delete_message(db, conv, theirs["id"], alice)
+    assert exc.value.status_code == 403
+    im_service.delete_message(db, conv, mine["id"], alice)
+    assert [m["id"] for m in im_service.list_messages(db, conv, alice)["items"]] == [theirs["id"]]
+
+    group = im_service.create_custom_group(db, alice, "跨市项目", [bob])["id"]
+    g_mine = im_service.send_message(db, group, alice, "text", "群内我的")["message"]
+    g_theirs = im_service.send_message(db, group, bob, "text", "群内对方的")["message"]
+    with pytest.raises(HTTPException) as exc:
+        im_service.delete_message(db, group, g_theirs["id"], alice)
+    assert exc.value.status_code == 403
+    im_service.delete_message(db, group, g_mine["id"], alice)
+    assert [m["id"] for m in im_service.list_messages(db, group, alice)["items"]] == [g_theirs["id"]]
+    assert [m["id"] for m in im_service.list_messages(db, group, bob)["items"]] == [
+        g_mine["id"], g_theirs["id"]]
+
+    # 删除后不把隐藏消息计入未读：alice 删了自己那条，对方 bob 发的那条仍算未读
+    assert im_service.mark_read(db, conv, alice, 0)["unread"] == 1
 
 
 def test_custom_group_members_and_guard(db):

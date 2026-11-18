@@ -21,10 +21,12 @@ interface Props {
   onMultiSelect: (message: ImMessage) => void
   onForward: (message: ImMessage) => void
   onDelete: (message: ImMessage) => void
+  /** 只有自己发出的消息才可删除（删除仅对自己隐藏） */
+  canDelete?: boolean
 }
 
 export function ImMessageContextMenu({
-  state, onClose, onCopy, onQuote, onMultiSelect, onForward, onDelete,
+  state, onClose, onCopy, onQuote, onMultiSelect, onForward, onDelete, canDelete = false,
 }: Props) {
   const { t } = useTranslation()
   const ref = useRef<HTMLDivElement>(null)
@@ -57,7 +59,10 @@ export function ImMessageContextMenu({
     { key: 'quote', label: t('im.message.menu.quote', '引用'), icon: <CornerUpLeft size={14} />, action: onQuote },
     { key: 'multiSelect', label: t('im.message.menu.multiSelect', '多选'), icon: <CheckSquare size={14} />, action: onMultiSelect },
     { key: 'forward', label: t('im.message.menu.forward', '转发'), icon: <Forward size={14} />, action: onForward },
-    { key: 'delete', label: t('im.message.menu.delete', '删除'), icon: <Trash2 size={14} />, action: onDelete },
+    // 删除只对操作者自己隐藏，且仅限自己发出的消息；对方的右键菜单不出现这一项
+    ...(canDelete
+      ? [{ key: 'delete', label: t('im.message.menu.delete', '删除'), icon: <Trash2 size={14} />, action: onDelete }]
+      : []),
   ]
 
   return createPortal(

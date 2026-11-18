@@ -2,13 +2,12 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import {
-  ArrowDown, ChevronLeft, Forward, MessageSquareDashed, Users, X,
+  ChevronLeft, Forward, MessageSquareDashed, Users, X,
 } from 'lucide-react'
 
 import { useAuthStore } from '../../store/authStore'
 import { useImStore } from '../../store/imStore'
 import { useToastStore } from '../../store/toastStore'
-import { ImAvatar } from './ImAvatar'
 import { ImComposer } from './ImComposer'
 import { ImGroupMembersDialog } from './ImGroupMembersDialog'
 import { ImForwardDialog } from './ImForwardDialog'
@@ -39,7 +38,6 @@ export function ImChatPanel({ conversation, narrow, onBack }: Props) {
   const sendText = useImStore(s => s.sendText)
   const lightbox = useImStore(s => s.lightbox)
   const setLightbox = useImStore(s => s.setLightbox)
-  const online = useImStore(s => s.online)
   const error = useImStore(s => s.error)
   const errorScope = useImStore(s => s.errorScope)
   const activeId = useImStore(s => s.activeConversationId)
@@ -57,7 +55,12 @@ export function ImChatPanel({ conversation, narrow, onBack }: Props) {
   const [atBottom, setAtBottom] = useState(true)
   const [membersOpen, setMembersOpen] = useState(false)
   const scrollRef = useRef<HTMLDivElement>(null)
+  const contentRef = useRef<HTMLDivElement>(null)
   const loadedFor = useRef<number | null>(null)
+  // 与 atBottom 状态同步的 ref：ResizeObserver / 滚动回调里读最新值，不受闭包影响
+  const atBottomRef = useRef(true)
+  // 程序性 scrollTo 也会派发 scroll 事件；短暂屏蔽，避免把"刚贴底"误判成"离开底部"
+  const ignoreScrollRef = useRef(false)
 
   const dayLabel = (iso: string) => {
     const date = new Date(iso)
@@ -72,26 +75,54 @@ export function ImChatPanel({ conversation, narrow, onBack }: Props) {
   const scrollToBottom = useCallback((smooth = false) => {
     const node = scrollRef.current
     if (!node) return
+    ignoreScrollRef.current = true
     node.scrollTo({ top: node.scrollHeight, behavior: smooth ? 'smooth' : 'auto' })
+    atBottomRef.current = true
     setAtBottom(true)
+    window.setTimeout(() => { ignoreScrollRef.current = false }, 150)
   }, [])
+
+  /**
+   * 内容高度变化（新消息落地、乐观消息被服务端消息替换、图片加载完成）后再贴一次底。
+   * 单靠 messages.length 的 effect 不够：发送时那次滚动发生在新消息渲染之前，
+   * 之后 DOM 变高但没有新的 length 变化，最新消息就会被截在容器底部。
+   */
+  useLayoutEffect(() => {
+    const content = contentRef.current
+    if (!content || typeof ResizeObserver === 'undefined') return
+    const observer = new ResizeObserver(() => {
+      if (atBottomRef.current) scrollToBottom()
+    })
+    observer.observe(content)
+    return () => observer.disconnect()
+    // conversation.id 必须进依赖：窗口先以空态挂载时 contentRef 还不存在，
+    // 只依赖稳定的 scrollToBottom 会让监听永远注册不上。
+  }, [scrollToBottom, conversation?.id])
 
   useLayoutEffect(() => {
     if (conversation && loadedFor.current !== conversation.id) {
       loadedFor.current = conversation.id
+      // 打开/切换会话一律先看最新消息：清掉上一个会话遗留的"停留在历史位置"状态
+      atBottomRef.current = true
+      setAtBottom(true)
       window.requestAnimationFrame(() => scrollToBottom())
     }
   }, [conversation, messages.length, scrollToBottom])
 
   useEffect(() => {
-    if (atBottom && messages.length) scrollToBottom()
-  }, [messages.length, atBottom, scrollToBottom])
+    if ((atBottom || atBottomRef.current) && messages.length) scrollToBottom()
+    // 依赖 messages 引用而非 length：乐观消息被服务端消息替换时长度不变，
+    // 只盯 length 会漏掉这次补滚，最新消息被截在容器底部。
+  }, [messages, atBottom, scrollToBottom])
 
   const onScroll = () => {
+    if (ignoreScrollRef.current) return
     const node = scrollRef.current
     if (!node) return
     const distance = node.scrollHeight - node.scrollTop - node.clientHeight
-    setAtBottom(distance < 80)
+    const next = distance < 80
+    atBottomRef.current = next
+    setAtBottom(next)
     if (node.scrollTop < 40 && cursor?.hasMore && conversation) {
       const before = node.scrollHeight
       void loadMessages(conversation.id, 'older').then(() => {
@@ -203,10 +234,6 @@ export function ImChatPanel({ conversation, narrow, onBack }: Props) {
     )
   }
 
-  const isOnline = conversation.kind === 'direct'
-    ? (conversation.other_user ? online[conversation.other_user.id] : false)
-    : undefined
-
   return (
     <div className="relative flex min-w-0 flex-1 flex-col bg-background/30"
          onPointerDown={() => markConversationRead(conversation.id)}>
@@ -217,31 +244,18 @@ export function ImChatPanel({ conversation, narrow, onBack }: Props) {
             <ChevronLeft size={18} />
           </button>
         )}
-        <ImAvatar
-          name={conversationTitle(conversation, {
-            unknownUser: t('im.sidebar.unknownUser', '用户'),
-            unnamedGroup: t('im.sidebar.unnamedGroup', '未命名群组'),
-            self: t('im.sidebar.self', '自己'),
-          })}
-          avatar={conversation.kind === 'direct' ? conversation.other_user?.avatar : conversation.avatar}
-          kind={conversation.kind === 'direct' ? 'user' : 'group'}
-          size={36}
-        />
-        <div className="min-w-0 flex-1">
+        <div className="flex min-w-0 flex-1 items-baseline gap-1">
           <p className="truncate text-sm font-semibold">
             {conversationTitle(conversation, {
               unknownUser: t('im.sidebar.unknownUser', '用户'),
               unnamedGroup: t('im.sidebar.unnamedGroup', '未命名群组'),
             })}
           </p>
-          <p className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
-            {conversation.kind === 'direct' ? (
-              <><span className={`h-1.5 w-1.5 rounded-full ${isOnline ? 'bg-emerald-500' : 'bg-slate-400'}`} />
-                {isOnline ? t('im.online', '在线') : t('im.offline', '离线')}</>
-            ) : t('im.sidebar.memberCount', {
-              defaultValue: '{{count}} 位成员', count: conversation.member_count,
-            })}
-          </p>
+          {conversation.kind !== 'direct' && (
+            <span className="shrink-0 text-xs font-normal text-muted-foreground">
+              ({conversation.member_count})
+            </span>
+          )}
         </div>
         {conversation.kind !== 'direct' && (
           <button type="button" onClick={openMembers} title={t('im.chat.groupMembers', '群成员')}
@@ -274,8 +288,9 @@ export function ImChatPanel({ conversation, narrow, onBack }: Props) {
       )}
 
       <div ref={scrollRef} onScroll={onScroll}
-           className="relative min-h-0 flex-1 space-y-3 overflow-y-auto px-4 py-4"
+           className="relative min-h-0 flex-1 overflow-y-auto px-4 py-4"
            style={{ backgroundImage: 'radial-gradient(hsl(var(--muted-foreground) / 0.07) 1px, transparent 1px)', backgroundSize: '18px 18px' }}>
+        <div ref={contentRef} className="flex min-h-full flex-col space-y-3">
         {cursor?.hasMore && (
           <div className="flex justify-center">
             <button type="button" onClick={() => void loadMessages(conversation.id, 'older')}
@@ -285,7 +300,7 @@ export function ImChatPanel({ conversation, narrow, onBack }: Props) {
           </div>
         )}
         {messages.length === 0 && (
-          <div className="flex h-full items-center justify-center text-xs text-muted-foreground">
+          <div className="flex flex-1 items-center justify-center text-xs text-muted-foreground">
             {t('im.chat.noMessages', '还没有消息，发送第一条开始沟通')}
           </div>
         )}
@@ -308,7 +323,7 @@ export function ImChatPanel({ conversation, narrow, onBack }: Props) {
                   message={message}
                   isMine={message.sender_id === currentUserId}
                   onPreview={openPreview}
-                  onRetry={() => void sendText(message.content_text || '')}
+                  onRetry={() => { void sendText(message.content_text || ''); scrollToBottom() }}
                   onContextMenu={(event, item) => {
                     event.preventDefault()
                     setMenu({ message: item, x: event.clientX, y: event.clientY })
@@ -321,16 +336,10 @@ export function ImChatPanel({ conversation, narrow, onBack }: Props) {
             </div>
           )
         })}
+        </div>
       </div>
 
-      {!atBottom && (
-        <button type="button" onClick={() => scrollToBottom(true)}
-                className="absolute bottom-32 right-6 z-10 flex items-center gap-1 rounded-full border border-border bg-popover px-3 py-1.5 text-xs shadow-lg hover:text-primary cursor-pointer">
-          <ArrowDown size={13} /> {t('im.chat.backToLatest', '回到最新')}
-        </button>
-      )}
-
-      <ImComposer conversationId={conversation.id} />
+      <ImComposer conversationId={conversation.id} onSent={() => scrollToBottom()} />
 
       {lightbox && (
         <ImImageLightbox source={lightbox} onClose={closeLightbox} />
@@ -348,6 +357,7 @@ export function ImChatPanel({ conversation, narrow, onBack }: Props) {
           onQuote={message => setReplyTo(message)}
           onMultiSelect={message => { setSelectionMode(true); setSelectedIds([message.id]) }}
           onForward={handleForward}
+          canDelete={menu.message.sender_id === currentUserId}
           onDelete={message => {
             if (conversation) void deleteMessage(conversation.id, message.id)
           }}
