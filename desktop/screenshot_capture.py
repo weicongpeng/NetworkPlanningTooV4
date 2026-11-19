@@ -143,6 +143,62 @@ def window_rect_at(point: Tuple[int, int], overlay_hwnd: int = 0) -> Optional[Tu
         return None
 
 
+_uia_bindings: Optional[Tuple[Any, Any]] = None
+_uia_tried = False
+
+
+def _uia_types() -> Optional[Tuple[Any, Any]]:
+    """UIA 程序集与类型只初始化一次：轮询每 30ms 调 element_rect_at。"""
+    global _uia_bindings, _uia_tried
+    if _uia_tried:
+        return _uia_bindings
+    _uia_tried = True
+    if os.name != "nt":
+        return None
+    try:
+        import clr  # noqa: F401 - pythonnet，桌面壳已加载
+
+        clr.AddReference("UIAutomationClient")
+        clr.AddReference("UIAutomationTypes")
+        from System.Windows import Point as WinPoint
+        from System.Windows.Automation import AutomationElement
+
+        _uia_bindings = (WinPoint, AutomationElement)
+    except Exception:  # noqa: BLE001 - 不可用则永久回退窗口识别，避免反复重试
+        _uia_bindings = None
+    return _uia_bindings
+
+
+def element_rect_at(point: Tuple[int, int]) -> Optional[Tuple[int, int, int, int]]:
+    """光标下 UI 元素的边界（UI Automation），用于「悬浮自动捕获、点击截取」。
+
+    任务栏按钮、工具栏图标等不是独立的顶层窗口，``WindowFromPoint`` 只能拿到父
+    窗口；UIA 的 ``FromPoint`` 能定位到控件级元素，得到图中那种紧贴图标的边框。
+    识别失败或尺寸异常时返回 None，由调用方回退到顶层窗口，保证任何环境下点击
+    都有可用的捕获区域。拖动自由框选始终不依赖这条路径。
+    """
+    bindings = _uia_types()
+    if bindings is None:
+        return None
+    win_point, automation_element = bindings
+    try:
+        element = automation_element.FromPoint(
+            win_point(float(point[0]), float(point[1])))
+        if element is None:
+            return None
+        rect = element.Current.BoundingRectangle
+        left, top = int(rect.Left), int(rect.Top)
+        width, height = int(rect.Width), int(rect.Height)
+        # 图标内部文字之类的极小元素、或整个桌面之类异常大元素都不适合作为截取框
+        if width < 16 or height < 16 or width > 8192 or height > 8192:
+            return None
+        if not (left <= point[0] <= left + width and top <= point[1] <= top + height):
+            return None
+        return (left, top, left + width, top + height)
+    except Exception:  # noqa: BLE001 - UIA 不可用时回退窗口识别
+        return None
+
+
 def clip_rect_to_image(
     rect: Tuple[int, int, int, int],
     origin: Tuple[int, int],
@@ -187,9 +243,10 @@ def _png_files(image: Any, temp_dir: Path) -> Tuple[Path, Path]:
     temp_dir.mkdir(parents=True, exist_ok=True)
     raw_path = temp_dir / "capture-raw.png"
     dim_path = temp_dir / "capture-dim.png"
-    image.save(raw_path, format="PNG")
+    # 临时预览图只用于本轮蒙层绘制，不追求体积；低压缩级别显著缩短首次启动等待
+    image.save(raw_path, format="PNG", compress_level=1)
     dim = Image.blend(image, Image.new("RGB", image.size, (0, 0, 0)), 0.55)
-    dim.save(dim_path, format="PNG")
+    dim.save(dim_path, format="PNG", compress_level=1)
     return raw_path, dim_path
 
 
@@ -294,9 +351,9 @@ def should_show_magnifier(selection_committed: bool) -> bool:
 def cursor_for_point(selection_committed: bool,
                      selection: Optional[Tuple[int, int, int, int]],
                      point: Tuple[int, int]) -> str:
-    """返回光标语义名：框选十字、四向移动、双边缩放或默认箭头。"""
+    """返回光标语义名：取景用传统箭头、提交后四向移动/双边缩放或默认箭头。"""
     if not selection_committed:
-        return "cross"
+        return "arrow"
     if selection and point_in_rect(point, selection):
         handle = hit_handle(selection, point)
         if handle in ("n", "s"):
@@ -307,7 +364,8 @@ def cursor_for_point(selection_committed: bool,
             return "nesw"
         if handle in ("nw", "se"):
             return "nwse"
-        return "move"
+        # 选区内部也用传统箭头；拖动移动选区的逻辑不依赖光标语义
+        return "arrow"
     return "arrow"
 
 
@@ -425,7 +483,7 @@ def _run_overlay(
         _log.warning("设置截图蒙层扩展样式失败（窗口自动识别可能退化为整屏）")
 
     hint = Label()
-    hint.Text = "拖动框选 · 松手后拖边框修整 · 回车或点「确定」完成 · Esc/右键取消"
+    hint.Text = "点击选取悬浮区域 · 拖动自由框选 · 松手后拖边框修整 · 回车或点「确定」完成 · Esc/右键取消"
     hint.AutoSize = True
     hint.BackColor = Color.FromArgb(190, 20, 20, 20)
     hint.ForeColor = Color.White
@@ -434,7 +492,7 @@ def _run_overlay(
 
     hover_pen = Pen(Color.FromArgb(255, 96, 165, 250), 1)
     handle_pen = Pen(Color.FromArgb(255, 37, 99, 235), 1)
-    cross_pen = Pen(Color.FromArgb(255, 255, 255, 255), 1)
+    cross_pen = Pen(Color.FromArgb(255, 46, 204, 113), 2)
     handle_brush = SolidBrush(Color.FromArgb(255, 37, 99, 235))
     button_brush = SolidBrush(Color.FromArgb(235, 37, 99, 235))
     button_text = SolidBrush(Color.FromArgb(255, 255, 255, 255))
@@ -522,7 +580,10 @@ def _run_overlay(
         state["cursor"] = screen
         full_screen = (
             origin[0], origin[1], origin[0] + size[0], origin[1] + size[1])
-        hover = window_rect_at(screen, state["overlay_hwnd"]) or full_screen
+        # 元素级自动捕获优先（任务栏图标/工具栏按钮等），失败再退到顶层窗口
+        hover = (element_rect_at(screen)
+                 or window_rect_at(screen, state["overlay_hwnd"])
+                 or full_screen)
         if hover != state["hover"]:
             cursor_changed = True
         state["hover"] = hover

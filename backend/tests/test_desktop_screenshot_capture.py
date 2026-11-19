@@ -243,6 +243,13 @@ def test_magnifier_only_before_selection_commit():
     assert capture.should_show_magnifier(True) is False
 
 
+def test_element_rect_at_degrades_off_windows():
+    """非 Windows：UIA 元素识别返回 None，调用方回退窗口/整屏，点击捕获仍可用。"""
+    capture = _load_capture()
+    if capture.os.name != "nt":
+        assert capture.element_rect_at((100, 100)) is None
+
+
 def test_magnifier_crosshair_marks_cursor_pixel_outside_cursor():
     """放大镜在光标右下不遮挡光标；十字交叉点对应光标指向的源像素。"""
     capture = _load_capture()
@@ -266,11 +273,11 @@ def test_magnifier_crosshair_marks_cursor_pixel_outside_cursor():
 
 
 def test_cursor_feedback_around_committed_selection():
-    """边框把手显示双向缩放光标，选区内部是四向十字，框选阶段是十字。"""
+    """取景阶段用传统箭头提示点击/拖动，提交后把手双向缩放、内部四向十字。"""
     capture = _load_capture()
     rect = (100, 100, 300, 240)
-    assert capture.cursor_for_point(False, rect, (200, 170)) == "cross"
-    assert capture.cursor_for_point(True, rect, (200, 170)) == "move"
+    assert capture.cursor_for_point(False, rect, (200, 170)) == "arrow"
+    assert capture.cursor_for_point(True, rect, (200, 170)) == "arrow"
     assert capture.cursor_for_point(True, rect, (100, 170)) == "we"
     assert capture.cursor_for_point(True, rect, (200, 100)) == "ns"
     assert capture.cursor_for_point(True, rect, (300, 240)) == "nwse"
