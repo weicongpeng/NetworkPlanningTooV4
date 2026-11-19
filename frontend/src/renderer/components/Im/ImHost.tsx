@@ -98,8 +98,8 @@ export function ImHost() {
       mentionNotice.mentionAll ? 'im.mention.noticeAll' : 'im.mention.notice',
       {
         defaultValue: mentionNotice.mentionAll
-          ? '{{sender}} 在项目沟通中 @ 了所有人'
-          : '{{sender}} 在项目沟通中 @ 了你',
+          ? '{{sender}} 在沟通助手中 @ 了所有人'
+          : '{{sender}} 在沟通助手中 @ 了你',
         sender: mentionNotice.senderName || t('im.mention.someone', '有人'),
       },
     ))
@@ -119,7 +119,7 @@ export function ImHost() {
     void useImStore.getState().bootstrap()
     // 桌面共享模式没有服务端 WS 广播，消息全靠本机后端转发到云端 relay：
     // 用 1.5s 高频轮询会话列表，且窗口收起/失焦也不停（单机模式不走这段逻辑）。
-    // 消息一落地就把未读数推到标题栏「项目沟通」红点并触发提示音；窗口重新
+    // 消息一落地就把未读数推到标题栏「沟通助手」红点并触发提示音；窗口重新
     // 可见时 startPolling 还会立即补刷一次，避免等下一个 tick。
     useImStore.getState().startPolling(desktopMode ? 1500 : 15000, desktopMode)
     return detach
@@ -386,9 +386,9 @@ export function ImHost() {
           type="button"
           data-im-fab
           onPointerDown={onPointerDown}
-          onMouseEnter={() => setHint(t('im.host.hint', '项目沟通 · 消息与通讯录'))}
+          onMouseEnter={() => setHint(t('im.host.hint', '沟通助手 · 消息与通讯录'))}
           onMouseLeave={() => setHint('')}
-          title={t('im.host.title', '项目沟通（拖动可移动，单击展开）')}
+          title={t('im.host.title', '沟通助手（拖动可移动，单击展开）')}
           className="group fixed z-[2900] flex h-11 w-11 items-center justify-center rounded-full border border-border bg-card text-muted-foreground shadow-lg transition-colors hover:bg-muted hover:text-foreground cursor-grab active:cursor-grabbing touch-none select-none"
           style={{ left: pos.x, top: pos.y, width: ICON_SIZE, height: ICON_SIZE, touchAction: 'none' }}
         >
@@ -410,7 +410,7 @@ export function ImHost() {
         <Suspense fallback={
           <div data-im-fab className="fixed bottom-24 right-6 z-[6000] flex items-center gap-2 rounded-xl border border-border bg-card px-4 py-3 text-xs shadow-2xl">
             <Loader2 size={15} className="animate-spin text-primary" />
-            {t('im.host.opening', '正在打开项目沟通…')}
+            {t('im.host.opening', '正在打开沟通助手…')}
           </div>
         }>
           <ImWindow userId={imUserId(user)} desktopMode={desktopMode} onClose={() => setOpen(false)} />

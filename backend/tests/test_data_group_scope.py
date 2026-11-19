@@ -43,6 +43,13 @@ def test_operators_constant():
     assert OPERATORS == ["移动", "联通", "电信", "广电"]
 
 
+def test_recovered_entries_do_not_inherit_admin_group():
+    """索引自愈恢复的条目不得擅自归管理员组（会让同组普通用户永久看不到）。"""
+    from app.services.data_service import data_service
+
+    assert data_service._recovered_group() == (None, None, None, None)
+
+
 def test_validate_group(city_presets):
     from app.services.data_group import validate_group
     assert validate_group("深圳", "移动") is None

@@ -1,6 +1,6 @@
 {
   "im": {
-    "title": "项目沟通",
+    "title": "沟通助手",
     "messages": "消息",
     "contacts": "通讯录",
     "online": "在线",
@@ -8,16 +8,16 @@
     "newGroup": "建群",
     "send": "发送",
     "uploading": "正在发送附件",
-    "standaloneHint": "项目沟通需要共享模式联网",
+    "standaloneHint": "沟通助手需要共享模式联网",
     "common": {
       "cancel": "取消",
       "close": "关闭",
       "save": "保存"
     },
     "host": {
-      "hint": "项目沟通 · 消息与通讯录",
-      "title": "项目沟通（拖动可移动，单击展开）",
-      "opening": "正在打开项目沟通…"
+      "hint": "沟通助手 · 消息与通讯录",
+      "title": "沟通助手（拖动可移动，单击展开）",
+      "opening": "正在打开沟通助手…"
     },
     "window": {
       "badge": "协",
@@ -110,7 +110,6 @@
       "undo": "撤销",
       "clearMarks": "清空",
       "textPlaceholder": "输入备注后回车",
-      "useFull": "使用全图",
       "download": "下载",
       "downloadHint": "下载为 PNG",
       "addHint": "添加到对话框并复制到剪贴板",
@@ -255,7 +254,7 @@
       "create": "创建群组"
     },
     "error": {
-      "load": "加载项目沟通数据失败",
+      "load": "加载沟通助手数据失败",
       "messages": "加载消息失败",
       "send": "消息发送失败",
       "file": "附件发送失败，已放回待发送列表",
@@ -281,8 +280,8 @@
       "meLabel": "@我",
       "clear": "清除 @",
       "count": "@ {{count}} 人",
-      "notice": "{{sender}} 在项目沟通中 @ 了你",
-      "noticeAll": "{{sender}} 在项目沟通中 @ 了所有人",
+      "notice": "{{sender}} 在沟通助手中 @ 了你",
+      "noticeAll": "{{sender}} 在沟通助手中 @ 了所有人",
       "someone": "有人",
       "noPermission": "只有群主/群管理员可以 @所有人"
     },
@@ -1314,6 +1313,7 @@
   },
   "map": {
     "title": "地图工具",
+    "layerLoadFailed": "图层「{{name}}」加载失败，请稍后重试",
     "layers": "图层控制",
     "onlineMap": "在线地图",
     "offlineMap": "离线地图",

@@ -1,6 +1,6 @@
 {
   "im": {
-    "title": "Project Communication",
+    "title": "Communication Assistant",
     "messages": "Messages",
     "contacts": "Contacts",
     "online": "Online",
@@ -8,16 +8,16 @@
     "newGroup": "New group",
     "send": "Send",
     "uploading": "Sending attachment",
-    "standaloneHint": "Project Communication requires shared mode and network access",
+    "standaloneHint": "Communication Assistant requires shared mode and network access",
     "common": {
       "cancel": "Cancel",
       "close": "Close",
       "save": "Save"
     },
     "host": {
-      "hint": "Project Communication · Messages & Contacts",
-      "title": "Project Communication (drag to move, click to open)",
-      "opening": "Opening Project Communication…"
+      "hint": "Communication Assistant · Messages & Contacts",
+      "title": "Communication Assistant (drag to move, click to open)",
+      "opening": "Opening Communication Assistant…"
     },
     "window": {
       "badge": "C",
@@ -110,7 +110,6 @@
       "undo": "Undo",
       "clearMarks": "Clear",
       "textPlaceholder": "Type a note, then press Enter",
-      "useFull": "Use full image",
       "download": "Download",
       "downloadHint": "Download as PNG",
       "addHint": "Add to conversation and copy to clipboard",
@@ -255,7 +254,7 @@
       "create": "Create group"
     },
     "error": {
-      "load": "Failed to load Project Communication data",
+      "load": "Failed to load Communication Assistant data",
       "messages": "Failed to load messages",
       "send": "Failed to send message",
       "file": "Failed to send attachment — it has been put back in the pending list",
@@ -281,8 +280,8 @@
       "meLabel": "@me",
       "clear": "Clear mentions",
       "count": "@ {{count}} people",
-      "notice": "{{sender}} mentioned you in Project Communication",
-      "noticeAll": "{{sender}} mentioned everyone in Project Communication",
+      "notice": "{{sender}} mentioned you in Communication Assistant",
+      "noticeAll": "{{sender}} mentioned everyone in Communication Assistant",
       "someone": "Someone",
       "noPermission": "Only group owners/admins can mention everyone"
     },
@@ -1384,6 +1383,7 @@
   },
   "map": {
     "title": "Map Tool",
+    "layerLoadFailed": "Failed to load layer \"{{name}}\". Please try again later.",
     "layers": "Layers",
     "onlineMap": "Online Map",
     "offlineMap": "Offline Map",

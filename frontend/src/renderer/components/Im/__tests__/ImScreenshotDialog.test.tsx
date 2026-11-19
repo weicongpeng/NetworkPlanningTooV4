@@ -206,7 +206,7 @@ describe('协作沟通截图对话框', () => {
     expect(screen.queryByText(/裁剪工具拖框选区/)).toBeNull()
     // 需求 3：底部尺寸标记、顶部标题、footer 文字按钮都删除
     expect(screen.queryByText('截图')).toBeNull()
-    expect(screen.queryByText('使用全图')).toBeNull()
+    expect(screen.queryByTitle('使用全图')).toBeNull()
     expect(screen.queryByText('添加到对话框')).toBeNull()
     expect(document.body.querySelector('footer')).toBeNull()
     expect(onClose).not.toHaveBeenCalled()

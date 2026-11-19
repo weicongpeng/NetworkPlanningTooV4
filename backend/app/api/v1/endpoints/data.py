@@ -34,6 +34,18 @@ from app.models.database import User
 
 router = APIRouter()
 
+# 下载端点认可的文件后缀。网优助手导入的 csv/txt 数据集此前只落 uploads/<id>.csv，
+# 不在候选里会导致「已导入数据」能看见却永远下载不下来（404）。
+_DOWNLOAD_SUFFIXES = ('.xlsx', '.xls', '.zip', '.csv', '.txt')
+
+
+def _downloadable_file(path: Path) -> bool:
+    """候选必须是普通文件：同名目录或损坏索引条目交给 FileResponse 会变成 500。"""
+    try:
+        return path.is_file() and path.suffix.lower() in _DOWNLOAD_SUFFIXES
+    except OSError:
+        return False
+
 
 @router.post("/import-points", response_model=Dict[str, Any])
 async def import_points(
@@ -86,43 +98,48 @@ async def download_file(data_id: str, _group=Depends(require_data_group_access))
         except Exception as e:
             print(f"[Download] 打包当前图层失败，回退原始文件: {data_id} {e}")
 
-        # 按优先级查找原始文件
+        # 按优先级查找原始文件（只接受普通文件，csv/txt 数据集同样可下载）
         candidates = [
             data_dir / "original.xlsx",
             data_dir / "original.zip",
             settings.UPLOAD_DIR / f"{data_id}.xlsx",
             settings.UPLOAD_DIR / f"{data_id}.zip",
+            settings.UPLOAD_DIR / f"{data_id}.csv",
+            settings.UPLOAD_DIR / f"{data_id}.txt",
         ]
         file_path = None
         for candidate in candidates:
-            if candidate.exists():
+            if _downloadable_file(candidate):
                 file_path = candidate
                 break
 
         # 备用：扫描 data 目录下此 ID 文件夹中的所有文件
-        if not file_path and data_dir.exists():
-            for item in data_dir.iterdir():
-                if item.is_file() and item.suffix.lower() in ('.xlsx', '.xls', '.zip'):
-                    file_path = item
-                    print(f"[Download] 通过目录扫描找到文件: {file_path}")
-                    break
+        if not file_path and data_dir.is_dir():
+            try:
+                for item in data_dir.iterdir():
+                    if _downloadable_file(item):
+                        file_path = item
+                        print(f"[Download] 通过目录扫描找到文件: {file_path}")
+                        break
+            except OSError as exc:
+                print(f"[Download] 扫描数据目录失败: {data_dir} {exc}")
 
         # 备用2：从 index 获取文件名，在 data 目录中按名查找
         if not file_path and data_id in data_service.index:
-            stored_name = data_service.index[data_id].get("name", "")
+            stored_name = data_service.index[data_id].get("name") or ""
             if stored_name:
                 named_path = data_dir / stored_name
-                if named_path.exists():
+                if _downloadable_file(named_path):
                     file_path = named_path
                     print(f"[Download] 通过索引文件名找到文件: {file_path}")
 
         # 备用3：清理上传文件名后缀
         if not file_path and data_id in data_service.index:
-            stored_name = data_service.index[data_id].get("name", "")
+            stored_name = data_service.index[data_id].get("name") or ""
             base_name = stored_name.rsplit(".", 1)[0] if "." in stored_name else stored_name
-            for ext in (".xlsx", ".xls", ".zip"):
+            for ext in _DOWNLOAD_SUFFIXES:
                 named_path = data_dir / f"{base_name}{ext}"
-                if named_path.exists():
+                if _downloadable_file(named_path):
                     file_path = named_path
                     print(f"[Download] 通过无后缀名查找找到文件: {file_path}")
                     break
@@ -132,9 +149,12 @@ async def download_file(data_id: str, _group=Depends(require_data_group_access))
             raise HTTPException(status_code=404, detail="文件不存在")
 
         # 获取原始文件名
-        default_name = "download.xlsx" if file_path.suffix == ".xlsx" else "download.zip"
+        suffix = file_path.suffix.lower()
+        default_name = {
+            ".zip": "download.zip", ".csv": "download.csv", ".txt": "download.txt",
+        }.get(suffix, "download.xlsx")
         if data_id in data_service.index:
-            stored_name = data_service.index[data_id].get("name", default_name)
+            stored_name = data_service.index[data_id].get("name") or default_name
             # 确保扩展名一致
             if not stored_name.lower().endswith(file_path.suffix.lower()):
                 stored_name = stored_name + file_path.suffix
@@ -176,17 +196,26 @@ async def download_file(data_id: str, _group=Depends(require_data_group_access))
         }
 
         # 根据文件类型设置正确的媒体类型
-        if file_path.suffix.lower() == ".zip":
+        if suffix == ".zip":
             media_type = "application/zip"
+        elif suffix == ".csv":
+            media_type = "text/csv"
+        elif suffix == ".txt":
+            media_type = "text/plain"
         else:
             media_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
-        return FileResponse(
-            path=file_path,
-            filename=filename,
-            headers=headers,
-            media_type=media_type,
-        )
+        try:
+            return FileResponse(
+                path=file_path,
+                filename=filename,
+                headers=headers,
+                media_type=media_type,
+            )
+        except (FileNotFoundError, NotADirectoryError, IsADirectoryError) as exc:
+            # 同步覆盖安装与下载并发时，文件可能在检查后被删除/替换
+            print(f"[Download] 文件在响应前消失: {file_path} {exc}")
+            raise HTTPException(status_code=404, detail="文件正在同步，请稍后重试")
     except HTTPException:
         raise
     except Exception as e:

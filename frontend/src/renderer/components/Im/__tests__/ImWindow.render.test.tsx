@@ -53,7 +53,7 @@ function windowSize(): { w: number; h: number } {
   return { w: parseFloat(dialog.style.width), h: parseFloat(dialog.style.height) }
 }
 
-describe('项目沟通窗口', () => {
+describe('沟通助手窗口', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     localStorage.clear()
@@ -75,7 +75,7 @@ describe('项目沟通窗口', () => {
 
   it('渲染固定置顶窗口壳、双 Tab 与空会话引导', () => {
     render(<ImWindow userId={1} desktopMode={false} onClose={vi.fn()} />)
-    const dialog = screen.getByRole('dialog', { name: '项目沟通' })
+    const dialog = screen.getByRole('dialog', { name: '沟通助手' })
     expect(dialog.className).toContain('z-[6000]')
     expect(screen.getByText('消息')).toBeTruthy()
     expect(screen.getByText('通讯录')).toBeTruthy()

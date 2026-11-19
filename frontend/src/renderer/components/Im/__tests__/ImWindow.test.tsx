@@ -43,7 +43,7 @@ import { imApi } from '../../../services/api'
 import { useImStore } from '../../../store/imStore'
 import { ImHost } from '../ImHost'
 
-describe('项目沟通悬浮入口', () => {
+describe('沟通助手悬浮入口', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     authState.desktopMode = false
@@ -67,12 +67,12 @@ describe('项目沟通悬浮入口', () => {
   it('未登录时不渲染悬浮图标', () => {
     // 当前 mock 固定返回已登录用户，这里验证图标存在即可（登录态由 AuthGuard 保证 MainLayout 不挂载）
     const { container } = render(<ImHost />)
-    expect(container.querySelector('[title*="项目沟通"]')).toBeTruthy()
+    expect(container.querySelector('[title*="沟通助手"]')).toBeTruthy()
   })
 
   it('单击图标展开窗口，最小化后隐藏回图标但保留会话状态', async () => {
     render(<ImHost />)
-    const icon = screen.getByTitle(/项目沟通/)
+    const icon = screen.getByTitle(/沟通助手/)
     fireEvent.pointerDown(icon, { button: 0, clientX: 100, clientY: 100 })
     fireEvent.pointerUp(icon, { button: 0, clientX: 100, clientY: 100 })
     expect(useImStore.getState().open).toBe(true)
@@ -82,7 +82,7 @@ describe('项目沟通悬浮入口', () => {
     fireEvent.click(screen.getByTestId('im-close'))
     expect(useImStore.getState().open).toBe(false)
     expect(screen.queryByTestId('im-window')).toBeNull()
-    expect(screen.getByTitle(/项目沟通/)).toBeTruthy()
+    expect(screen.getByTitle(/沟通助手/)).toBeTruthy()
     // 最小化不是销毁：会话与消息仍保留
     expect(useImStore.getState().activeConversationId).toBe(7)
     expect(useImStore.getState().messages[7]).toEqual([])
@@ -90,7 +90,7 @@ describe('项目沟通悬浮入口', () => {
 
   it('拖拽超过阈值时只移动图标，不展开窗口', () => {
     render(<ImHost />)
-    const icon = screen.getByTitle(/项目沟通/)
+    const icon = screen.getByTitle(/沟通助手/)
     fireEvent.pointerDown(icon, { button: 0, clientX: 200, clientY: 200 })
     fireEvent.pointerMove(icon, { clientX: 260, clientY: 230 })
     fireEvent.pointerUp(icon, { button: 0, clientX: 260, clientY: 230 })
@@ -100,7 +100,7 @@ describe('项目沟通悬浮入口', () => {
 
   it('网页端悬浮图标与「下载应用」同尺寸同配色', () => {
     render(<ImHost />)
-    const icon = screen.getByTitle(/项目沟通/) as HTMLElement
+    const icon = screen.getByTitle(/沟通助手/) as HTMLElement
     expect(icon.className).toContain('w-11')
     expect(icon.className).toContain('h-11')
     expect(icon.className).toContain('bg-card')
@@ -118,7 +118,7 @@ describe('项目沟通悬浮入口', () => {
     authState.desktopMode = true
     useImStore.setState({ open: true })
     render(<ImHost />)
-    expect(screen.queryByTitle(/项目沟通/)).toBeNull()
+    expect(screen.queryByTitle(/沟通助手/)).toBeNull()
     await waitFor(() => expect(screen.getByTestId('im-window')).toBeTruthy())
     expect(imApi.conversations).toHaveBeenCalled()
   })

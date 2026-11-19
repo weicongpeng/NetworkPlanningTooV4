@@ -70,7 +70,7 @@ export function ImWindow({ userId, desktopMode, onClose }: Props) {
       ref={elementRef}
       role="dialog"
       data-im-window
-      aria-label={t('im.title', '项目沟通')}
+      aria-label={t('im.title', '沟通助手')}
       className="fixed z-[6000] flex flex-col overflow-hidden rounded-2xl border border-border/80 bg-card/95 shadow-[0_24px_70px_-12px_rgba(0,0,0,0.45)] backdrop-blur-xl"
       style={{
         left: rect.x, top: rect.y, width: rect.w, height: rect.h,
@@ -88,7 +88,7 @@ export function ImWindow({ userId, desktopMode, onClose }: Props) {
         style={{ touchAction: 'none' }}
       >
         <div className="min-w-0 flex-1">
-          <h2 className="truncate text-[13px] font-semibold leading-tight">{t('im.title', '项目沟通')}</h2>
+          <h2 className="truncate text-[13px] font-semibold leading-tight">{t('im.title', '沟通助手')}</h2>
         </div>
         <HeaderButton title={maximized ? t('im.window.restore', '还原') : t('im.window.maximize', '最大化')}
                       onClick={toggleMaximize}>

@@ -649,8 +649,10 @@ export function MapPage() {
           // 勾选状态持久化：从 store 恢复该图层上次的可见性（无记录则默认 false）
           const layerFileVisibility = useMapStore.getState().mapSettings.layerFileVisibility
 
-          // 检查缓存
-          const cached = _layerListCache.get(mapItem.id)
+          // 缓存键带账号：同一 dataId 在切换账号/组后可能指向不同可见数据，
+          // 不按账号隔离会让新用户短暂拿到上一账号的图层列表（10 分钟 TTL）。
+          const cacheKey = `${useAuthStore.getState().user?.id ?? 0}:${mapItem.id}`
+          const cached = _layerListCache.get(cacheKey)
           if (cached && Date.now() - cached.time < _LAYER_LIST_CACHE_TTL) {
             console.log('[MapPage] 使用图层列表缓存:', mapItem.id)
             return cached.data.map((layer: any) => ({
@@ -670,7 +672,7 @@ export function MapPage() {
           const response = await layerApi.getLayers(mapItem.id)
           if (response.success && response.data?.layers) {
             // 写入缓存
-            _layerListCache.set(mapItem.id, {
+            _layerListCache.set(cacheKey, {
               data: response.data.layers,
               time: Date.now()
             })

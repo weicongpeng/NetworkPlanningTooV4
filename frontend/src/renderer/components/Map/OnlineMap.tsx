@@ -4806,6 +4806,9 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
         } else {
           // 数据不存在或加载失败，跳过此图层
           console.warn('[OnlineMap] 图层数据不存在或为空，跳过:', layerFile.id, layerFile.name, 'rawData存在:', !!rawData, 'rawData长度:', rawData?.length || 0)
+          useToastStore.getState().show(
+            t('map.layerLoadFailed', { name: layerFile.name || layerFile.id })
+          )
           return
         }
       } else {
@@ -4825,14 +4828,18 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
           } else {
             // 数据不存在或加载失败，跳过此图层
             console.log('[OnlineMap] 图层数据不存在，跳过:', layerFile.id, layerFile.name)
+            useToastStore.getState().show(
+              t('map.layerLoadFailed', { name: layerFile.name || layerFile.id })
+            )
             return
           }
         }
       }
 
       if (geojsonData) {
-        // 缓存后端已转换 GeoJSON（含版本指纹），避免下次重复拉取（仅 MapInfo 源）
-        if (layerFile.sourceType !== 'excel') {
+        // 空要素集不缓存：TAB/MIF 解析出 0 要素时后端仍返回 200 + {features:[]}，
+        // 缓存下来会让后续每次勾选都拿到空 GeoJSON，表现为「勾了但没有任何图形」。
+        if (layerFile.sourceType !== 'excel' && (geojsonData.features?.length ?? 0) > 0) {
           useMapDataCacheStore.getState().cacheLayerGeoJSON(layerFile.id, geojsonData, fetchedVersion)
         }
 
@@ -4934,8 +4941,11 @@ export const OnlineMap = forwardRef<OnlineMapRef, OnlineMapProps>(({
       }
     } catch (error) {
       console.error('[OnlineMap] 加载图层失败:', layerFile.id, error)
+      useToastStore.getState().show(
+        t('map.layerLoadFailed', { name: layerFile.name || layerFile.id })
+      )
     }
-  }, [pointFileLabelVisibility, labelSettingsMap, isHeatmapReplacement])
+  }, [pointFileLabelVisibility, labelSettingsMap, isHeatmapReplacement, t])
 
   /**
    * 懒加载：只拉取 MapInfo 图层数据并缓存，不构建图层

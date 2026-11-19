@@ -858,28 +858,12 @@ class DataService:
             db.close()
 
     def _recovered_group(self) -> Tuple[Optional[int], Optional[str], Optional[str], Optional[str]]:
-        """恢复条目时的兜底组：管理员账号的组。
+        """恢复条目不带组：原组信息已丢失，不得擅自归到管理员组。
 
-        条目的原组信息随索引一起丢失，而"没有组"的条目按数据组隔离规则谁都不
-        可见（等于没恢复），因此暂按管理员账号归属，并打 recovered 标记供核对。
+        组缺失的条目按数据组隔离规则对所有人不可见（管理员也不跨组），即「不进同组
+        清单」；恢复只是保住磁盘文件，待管理员在数据管理中核对后改组再使用。此前用
+        管理员组兜底会让同组普通用户永久看不到这份数据，反而制造同步不一致。
         """
-        db = SessionLocal()
-        try:
-            from app.models.database import User
-
-            row = (
-                db.query(User)
-                .filter(User.is_admin == True)  # noqa: E712
-                .filter(User.city.isnot(None), User.operator.isnot(None))
-                .order_by(User.id.asc())
-                .first()
-            )
-            if row is not None:
-                return row.id, row.username, row.city, row.operator
-        except Exception:  # noqa: BLE001
-            pass
-        finally:
-            db.close()
         return None, None, None, None
 
     def _build_recovered_entry(
@@ -1063,8 +1047,8 @@ class DataService:
                 )
                 if recovered:
                     safe_print(
-                        "[DataService] 恢复的数据条目暂按管理员账号的组归属"
-                        "（原组信息已丢失），请管理员核对后调整或删除"
+                        "[DataService] 恢复的数据条目未带组信息，按数据组隔离规则暂不对任何账号可见；"
+                        "请管理员在数据管理中核对后改组或删除"
                     )
             return {
                 "removed": removed,

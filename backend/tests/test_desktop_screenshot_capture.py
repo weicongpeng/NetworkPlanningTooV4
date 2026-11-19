@@ -243,6 +243,21 @@ def test_magnifier_only_before_selection_commit():
     assert capture.should_show_magnifier(True) is False
 
 
+def test_magnifier_crosshair_center_matches_cursor():
+    """放大镜十字中心与光标重合：屏幕中央与边缘（取样框平移）都不能错开。"""
+    capture = _load_capture()
+    for center in ((400, 300), (10, 20), (790, 590), (0, 0), (800, 600)):
+        src, lens, cross = capture.magnifier_layout(center, (800, 600))
+        assert cross == center
+        assert lens[2] - lens[0] == 192 and lens[3] - lens[1] == 192
+        assert 0 <= src[0] and src[2] <= 800
+        assert 0 <= src[1] and src[3] <= 600
+    # 屏幕中央取样框不平移：放大镜正好以光标为中心，十字落在方框正中
+    _src, lens, cross = capture.magnifier_layout((400, 300), (800, 600))
+    assert (lens[0] + lens[2]) // 2 == cross[0]
+    assert (lens[1] + lens[3]) // 2 == cross[1]
+
+
 def test_cursor_feedback_around_committed_selection():
     """边框把手显示双向缩放光标，选区内部是四向十字，框选阶段是十字。"""
     capture = _load_capture()

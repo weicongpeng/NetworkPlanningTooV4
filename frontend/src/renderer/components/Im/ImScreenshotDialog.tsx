@@ -28,7 +28,7 @@ import { useTranslation } from 'react-i18next'
 import type { LucideIcon } from 'lucide-react'
 import {
   AppWindow, ArrowUpRight, Check, Circle, Crop, Download, Hand,
-  Image as ImageIcon, LayoutGrid, Loader2, Maximize2, Minimize2, Monitor,
+  LayoutGrid, Loader2, Maximize2, Minimize2, Monitor,
   Palette, RefreshCw, RotateCcw, RotateCw, Slash, Square, Trash2, Type, Undo2, X,
   ZoomIn, ZoomOut,
 } from 'lucide-react'
@@ -971,10 +971,6 @@ export function ImScreenshotDialog({
               <IconButton title={t('im.screenshot.downloadHint', '下载为 PNG')}
                           disabled={busy} onClick={() => void onDownload()}>
                 <Download size={16} />
-              </IconButton>
-              <IconButton title={t('im.screenshot.useFull', '使用全图')}
-                          disabled={busy} onClick={() => void emit(false)}>
-                <ImageIcon size={16} />
               </IconButton>
               <IconButton title={t('im.screenshot.addHint', '添加到对话框并复制到剪贴板')}
                           tone="primary" disabled={busy} onClick={() => void emit(Boolean(crop))}>

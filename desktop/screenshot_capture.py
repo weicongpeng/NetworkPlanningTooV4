@@ -319,6 +319,24 @@ def magnifier_source(center: Tuple[int, int], image_size: Tuple[int, int],
     return (left, top, left + radius * 2, top + radius * 2)
 
 
+def magnifier_layout(center: Tuple[int, int], image_size: Tuple[int, int],
+                     radius: int = 48, scale: int = 2
+                     ) -> Tuple[Tuple[int, int, int, int], Tuple[int, int, int, int], Tuple[int, int]]:
+    """返回 (取样框, 放大镜方框, 十字中心)；十字中心与光标位置始终重合。
+
+    放大镜位置由取样框按缩放比例反推（lens = src * scale - center），而不是固定挂在
+    光标右下角：取样框靠近屏幕边缘会被平移，只有按映射反推，放大图里光标对应的像素
+    才仍落在光标自己的屏幕坐标上，十字才不会与光标错开。
+    """
+    cx, cy = int(center[0]), int(center[1])
+    src = magnifier_source((cx, cy), image_size, radius)
+    side = (src[2] - src[0]) * scale
+    mx = cx - (cx - src[0]) * scale
+    my = cy - (cy - src[1]) * scale
+    cross = (mx + (cx - src[0]) * scale, my + (cy - src[1]) * scale)
+    return src, (mx, my, mx + side, my + side), cross
+
+
 def _run_overlay(
     raw_path: Path,
     dim_path: Path,
@@ -463,25 +481,17 @@ def _run_overlay(
         cursor = state["cursor"]
         if should_show_magnifier(committed) and cursor[0] > -9000:
             image_x, image_y = cursor[0] - origin[0], cursor[1] - origin[1]
-            src = magnifier_source((image_x, image_y), size)
-            mw, mh = 192, 192  # 取样 96×96 → 2 倍显示，保持比例
-            mx, my = image_x + 18, image_y + 18
-            if mx + mw > size[0]:
-                mx = image_x - mw - 18
-            if my + mh > size[1]:
-                my = image_y - mh - 18
-            mx = max(0, min(size[0] - mw, mx))
-            my = max(0, min(size[1] - mh, my))
+            src, lens, (cross_x, cross_y) = magnifier_layout((image_x, image_y), size)
+            lens_w, lens_h = lens[2] - lens[0], lens[3] - lens[1]
             graphics.DrawImage(
-                raw_bitmap, Rectangle(mx, my, mw, mh),
+                raw_bitmap, Rectangle(lens[0], lens[1], lens_w, lens_h),
                 Rectangle(src[0], src[1], src[2] - src[0], src[3] - src[1]),
                 GraphicsUnit.Pixel,
             )
-            graphics.DrawRectangle(white_pen, mx, my, mw, mh)
-            cross_x = mx + (image_x - src[0]) * 2
-            cross_y = my + (image_y - src[1]) * 2
-            graphics.DrawLine(cross_pen, cross_x - 10, cross_y, cross_x + 10, cross_y)
-            graphics.DrawLine(cross_pen, cross_x, cross_y - 10, cross_x, cross_y + 10)
+            graphics.DrawRectangle(white_pen, lens[0], lens[1], lens_w, lens_h)
+            # 十字中心 = 光标指向像素在放大图里的位置，与光标屏幕坐标重合
+            graphics.DrawLine(cross_pen, cross_x - 12, cross_y, cross_x + 12, cross_y)
+            graphics.DrawLine(cross_pen, cross_x, cross_y - 12, cross_x, cross_y + 12)
 
     def finish(cancelled: bool, rect: Optional[Tuple[int, int, int, int]]) -> None:
         if state["done"]:

@@ -92,6 +92,23 @@ def test_mark_map_import_paths_distinguishes_current_params(tmp_path, monkeypatc
         svc.index.update(original_index)
 
 
+def test_downloadable_file_rejects_directories_and_unknown_suffixes(tmp_path):
+    """下载候选必须是普通文件且后缀受支持：同名目录/损坏索引条目不得变成 500。"""
+    from app.api.v1.endpoints.data import _DOWNLOAD_SUFFIXES, _downloadable_file
+
+    for suffix in (".xlsx", ".xls", ".zip", ".csv", ".txt"):
+        p = tmp_path / f"f{suffix}"
+        p.write_text("x", encoding="utf-8")
+        assert _downloadable_file(p) is True
+
+    assert _downloadable_file(tmp_path / "missing.xlsx") is False
+    (tmp_path / "as_dir.xlsx").mkdir()
+    assert _downloadable_file(tmp_path / "as_dir.xlsx") is False
+    (tmp_path / "a.tab").write_text("x", encoding="utf-8")
+    assert _downloadable_file(tmp_path / "a.tab") is False
+    assert ".csv" in _DOWNLOAD_SUFFIXES and ".txt" in _DOWNLOAD_SUFFIXES
+
+
 def test_upload_map_marks_index_entry(tmp_path, monkeypatch):
     """服务层：带导入路径上传后，索引条目记录该 fileType"""
     from app.services import data_service as ds_mod

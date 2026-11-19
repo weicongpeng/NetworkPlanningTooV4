@@ -361,11 +361,19 @@ def _local_group() -> tuple:
     db = SessionLocal()
     try:
         query = db.query(User).filter(User.is_desktop_shadow == False)  # noqa: E712
-        user = (
-            query.filter(User.username == username).first() if username else None
-        ) or query.filter(User.desktop_run_mode.isnot(None)).first()
-        if user is None:
-            raise SyncError("本机尚未登录，请先登录后再同步")
+        if username:
+            user = query.filter(User.username == username).first()
+            if user is None:
+                raise SyncError(f"同步账号 {username} 已不存在，请重新登录后再同步")
+        else:
+            # 不再兜底取「第一个」桌面账号：多账号并存时会拿错组，
+            # 进而把错误组写进服务器授权绑定，造成同组数据互相不可见。
+            candidates = query.filter(User.desktop_run_mode.isnot(None)).all()
+            if not candidates:
+                raise SyncError("本机尚未登录，请先登录后再同步")
+            if len(candidates) > 1:
+                raise SyncError("本机存在多个桌面账号，请重新登录以确认同步身份")
+            user = candidates[0]
         return user, (user.city or ""), (user.operator or "")
     finally:
         db.close()

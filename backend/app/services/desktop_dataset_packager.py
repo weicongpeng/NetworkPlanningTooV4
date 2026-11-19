@@ -230,10 +230,11 @@ def install_package(
     is_geo = _is_geo_entry(source_entry)
     backup: Dict[str, Any] = {}
 
-    # 1. 解到临时目录（Windows 下不能直接覆盖可能被 GDAL 占用的文件）
-    #    校验必须在删除旧数据之前完成：包损坏时若已先删了唯一的全量工参，
-    #    本机/同组的工参就彻底不可用了。
+    # 1. 解到临时目录并先落到 staging：校验/准备期间旧数据完全不动，
+    #    下载与图层渲染始终指向完整的旧文件，不会撞上「删了还没写」的窗口。
     extract_root = Path(tempfile.mkdtemp(prefix="npt-unpkg-"))
+    staging_dir = settings.DATA_DIR / f".{data_id}.staging"
+    staging_upload: Optional[Path] = None
     try:
         with zipfile.ZipFile(zip_path, "r") as zf:
             zf.extractall(extract_root)
@@ -247,39 +248,50 @@ def install_package(
                 raise DatasetPackageError("数据包缺少源数据文件")
             _assert_source_intact(src)
 
-        # 2. 已存在 → 备份后彻底删除（含文件/SQLite 行/索引），避免二次导入导致小区翻倍。
-        #    解析失败时用备份回滚：否则一个内容不合法的包会把本机/同组唯一一份工参删掉，
-        #    用户看到的就是「工参无法使用」。
-        if data_id in data_service.index:
-            backup = _backup_dataset(data_id)
-            data_service.delete_data(data_id, force=True)
-        shutil.rmtree(settings.DATA_DIR / data_id, ignore_errors=True)
-        for ext in (".xlsx", ".xls", ".zip"):
-            (settings.UPLOAD_DIR / f"{data_id}{ext}").unlink(missing_ok=True)
-
-        settings.DATA_DIR.mkdir(parents=True, exist_ok=True)
-        data_dir = settings.DATA_DIR / data_id
-
+        if staging_dir.exists():
+            shutil.rmtree(staging_dir, ignore_errors=True)
         if entry_type == "map" or is_geo:
-            data_dir.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(extract_root), str(data_dir))
-            (data_dir / META_NAME).unlink(missing_ok=True)
+            staging_dir.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(extract_root), str(staging_dir))
+            (staging_dir / META_NAME).unlink(missing_ok=True)
             if is_geo:
-                # 源文件恢复到 uploads/（与 geo_data 上传路径一致），供反向 push 再次打包
-                for cand in sorted(data_dir.glob(f"{SOURCE_PREFIX}.*")):
+                # 源文件恢复供反向 push 再次打包；staging 阶段先写临时名
+                for cand in sorted(staging_dir.glob(f"{SOURCE_PREFIX}.*")):
                     ext = cand.suffix.lower()
                     settings.UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(cand, settings.UPLOAD_DIR / f"{data_id}{ext}")
+                    staging_upload = settings.UPLOAD_DIR / f".{data_id}.staging{ext}"
+                    shutil.copy2(cand, staging_upload)
                     cand.unlink(missing_ok=True)
                     break
         else:
             ext = src.suffix.lower()
             settings.UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src, settings.UPLOAD_DIR / f"{data_id}{ext}")
-            data_dir.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src, data_dir / f"original{ext}")
+            staging_upload = settings.UPLOAD_DIR / f".{data_id}.staging{ext}"
+            shutil.copy2(src, staging_upload)
+            staging_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, staging_dir / f"original{ext}")
+
+        # 2. 已存在 → 备份后彻底删除（含文件/SQLite 行/索引），避免二次导入导致小区翻倍。
+        #    备份用 rename、staging 就位也用 rename：整个替换窗口只有两次原子操作。
+        if data_id in data_service.index:
+            backup = _backup_dataset(data_id)
+            data_service.delete_data(data_id, force=True)
+        shutil.rmtree(settings.DATA_DIR / data_id, ignore_errors=True)
+        for ext in (".xlsx", ".xls", ".zip", ".csv", ".txt"):
+            (settings.UPLOAD_DIR / f"{data_id}{ext}").unlink(missing_ok=True)
+
+        # 就位：紧跟删除，把「列表有条目但文件不在」的窗口压到最小
+        data_dir = settings.DATA_DIR / data_id
+        data_dir.parent.mkdir(parents=True, exist_ok=True)
+        if staging_dir.exists():
+            shutil.move(str(staging_dir), str(data_dir))
+        if staging_upload is not None and staging_upload.is_file():
+            staging_upload.replace(settings.UPLOAD_DIR / f"{data_id}{staging_upload.suffix}")
     finally:
         shutil.rmtree(extract_root, ignore_errors=True)
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        if staging_upload is not None:
+            staging_upload.unlink(missing_ok=True)
 
     # 3. 写索引条目（覆盖包名具体)。源条目的 city/operator 一律用接收方组覆盖
     new_entry = dict(source_entry)
@@ -384,7 +396,7 @@ def _backup_dataset(data_id: str) -> Dict[str, Any]:
         except OSError as exc:
             logger.warning(f"[数据集解包] 数据目录备份失败（继续安装）{data_id}: {exc}")
     uploads = []
-    for ext in (".xlsx", ".xls", ".zip"):
+    for ext in (".xlsx", ".xls", ".zip", ".csv", ".txt"):
         src = settings.UPLOAD_DIR / f"{data_id}{ext}"
         if src.is_file():
             bak = settings.UPLOAD_DIR / f".{data_id}.bak{ext}"
