@@ -221,9 +221,11 @@ export function conversationTitle(conv: ImConversation, labels?: {
   unknownUser?: string
   unnamedGroup?: string
   self?: string
+  selfName?: string
 }): string {
   if (conv.kind === 'direct') {
-    if (conv.is_self || !conv.other_user) return labels?.self || '自己'
+    // 自己↔自己会话按真实账号名展示，不再统一标成「自己」
+    if (conv.is_self || !conv.other_user) return labels?.selfName || labels?.self || '自己'
     return imDisplayName(conv.other_user)
       || `${labels?.unknownUser || '用户'} ${conv.other_user?.id ?? ''}`.trim()
   }

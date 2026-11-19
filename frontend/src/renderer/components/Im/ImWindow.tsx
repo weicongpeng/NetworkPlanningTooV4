@@ -84,7 +84,7 @@ export function ImWindow({ userId, desktopMode, onClose }: Props) {
       <header
         onPointerDown={startDrag}
         onDoubleClick={toggleMaximize}
-        className="flex h-12 shrink-0 cursor-grab select-none items-center gap-2 border-b border-border/60 bg-gradient-to-r from-primary/10 via-card/40 to-primary/5 px-3 active:cursor-grabbing"
+        className="flex h-8 shrink-0 cursor-grab select-none items-center gap-2 border-b border-border/60 bg-gradient-to-r from-primary/10 via-card/40 to-primary/5 px-2 active:cursor-grabbing"
         style={{ touchAction: 'none' }}
       >
         <div className="min-w-0 flex-1">

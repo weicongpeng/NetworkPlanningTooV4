@@ -633,8 +633,9 @@ describe('imStore', () => {
     vi.useRealTimers()
   })
 
-  it('自己会话显示「自己」，创建失败时也能从会话列表兜底打开', async () => {
+  it('自己会话按真实账号名显示，创建失败时也能从会话列表兜底打开', async () => {
     const selfConv: ImConversation = { ...conversation(1), is_self: true, other_user: null }
+    expect(conversationTitle(selfConv, { self: '自己', selfName: 'admin' })).toBe('admin')
     expect(conversationTitle(selfConv, { self: '自己' })).toBe('自己')
     localStorage.setItem('auth-storage', JSON.stringify({ state: { user: { id: 1 } } }))
     vi.mocked(imApi.createConversation).mockRejectedValueOnce(new Error('IM_RELAY_FAILED'))

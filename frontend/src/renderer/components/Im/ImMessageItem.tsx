@@ -336,6 +336,8 @@ function ImMessageItemBase({
   selectionMode = false, selected = false, onToggleSelect,
 }: Props) {
   const { t } = useTranslation()
+  // 自己发的消息也按服务端下发的真实账号名展示，不再写成「我」
+  const selfName = useAuthStore(s => s.user?.username || '')
   const initial = (message.sender_name || '?').slice(0, 1).toUpperCase()
   const allLabel = t('im.mention.allLabel', '@所有人')
   const mentionNames = useMemo(() => {
@@ -375,7 +377,7 @@ function ImMessageItemBase({
       />
       <div className={`flex max-w-[76%] flex-col ${isMine ? 'items-end' : 'items-start'}`}>
         <div className="mb-1 flex items-center gap-2 text-[11px] text-muted-foreground">
-          <span>{isMine ? t('im.message.me', '我') : message.sender_name}</span>
+          <span>{message.sender_name || selfName || t('im.message.me', '我')}</span>
           <span>{formatClock(message.created_at)}</span>
         </div>
         <div className={`relative rounded-2xl px-3.5 py-2.5 text-[13px] leading-relaxed shadow-sm
@@ -386,7 +388,7 @@ function ImMessageItemBase({
           {message.reply_to && (
             <div className={`mb-1.5 border-l-2 pl-2 text-[11px] opacity-80
               ${isMine ? 'border-primary-foreground/60' : 'border-primary/60'}`}>
-              <span className="font-medium">{message.reply_to.sender_name || t('im.message.me', '我')}：</span>
+              <span className="font-medium">{message.reply_to.sender_name || selfName || t('im.message.me', '我')}：</span>
               {message.reply_to.preview
                 && !(message.reply_to.attachment && message.reply_to.preview.startsWith('[附件]')) && (
                 <span className="line-clamp-2">{message.reply_to.preview}</span>

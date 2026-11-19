@@ -16,7 +16,7 @@ import { ImMessageContextMenu } from './ImMessageContextMenu'
 import type { MessageMenuState } from './ImMessageContextMenu'
 import { ImMessageItem } from './ImMessageItem'
 import { ImSystemNotice } from './ImSystemNotice'
-import { conversationTitle, formatBytes, formatClock, imUserId } from './types'
+import { conversationTitle, formatBytes, formatClock, imDisplayName, imUserId } from './types'
 import type { ImConversation, ImLightboxSource, ImMessage } from './types'
 
 interface Props {
@@ -31,6 +31,7 @@ const EMPTY_MESSAGES: ImMessage[] = []
 export function ImChatPanel({ conversation, narrow, onBack }: Props) {
   const { t } = useTranslation()
   const currentUserId = useAuthStore(s => imUserId(s.user))
+  const currentUser = useAuthStore(s => s.user)
   const messages = useImStore(s => conversation
     ? (s.messages[conversation.id] ?? EMPTY_MESSAGES) : EMPTY_MESSAGES)
   const cursor = useImStore(s => conversation ? s.cursors[conversation.id] : undefined)
@@ -237,11 +238,11 @@ export function ImChatPanel({ conversation, narrow, onBack }: Props) {
   return (
     <div className="relative flex min-w-0 flex-1 flex-col bg-background/30"
          onPointerDown={() => markConversationRead(conversation.id)}>
-      <header className="flex h-14 shrink-0 items-center gap-2 border-b border-border/60 bg-card/70 px-3 backdrop-blur-sm">
+      <header className="flex h-8 shrink-0 items-center gap-2 border-b border-border/60 bg-card/70 px-2 backdrop-blur-sm">
         {narrow && (
           <button type="button" onClick={onBack} title={t('im.chat.back', '返回列表')}
-                  className="flex h-8 w-8 items-center justify-center rounded-lg hover:bg-accent cursor-pointer">
-            <ChevronLeft size={18} />
+                  className="flex h-7 w-7 items-center justify-center rounded-lg hover:bg-accent cursor-pointer">
+            <ChevronLeft size={16} />
           </button>
         )}
         <div className="flex min-w-0 flex-1 items-baseline gap-1">
@@ -249,6 +250,7 @@ export function ImChatPanel({ conversation, narrow, onBack }: Props) {
             {conversationTitle(conversation, {
               unknownUser: t('im.sidebar.unknownUser', '用户'),
               unnamedGroup: t('im.sidebar.unnamedGroup', '未命名群组'),
+              selfName: imDisplayName(currentUser),
             })}
           </p>
           {conversation.kind !== 'direct' && (
@@ -259,8 +261,8 @@ export function ImChatPanel({ conversation, narrow, onBack }: Props) {
         </div>
         {conversation.kind !== 'direct' && (
           <button type="button" onClick={openMembers} title={t('im.chat.groupMembers', '群成员')}
-                  className="flex h-8 w-8 items-center justify-center rounded-lg text-muted-foreground hover:bg-accent hover:text-primary cursor-pointer">
-            <Users size={17} />
+                  className="flex h-7 w-7 items-center justify-center rounded-lg text-muted-foreground hover:bg-accent hover:text-primary cursor-pointer">
+            <Users size={16} />
           </button>
         )}
       </header>

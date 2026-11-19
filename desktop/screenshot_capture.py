@@ -320,19 +320,26 @@ def magnifier_source(center: Tuple[int, int], image_size: Tuple[int, int],
 
 
 def magnifier_layout(center: Tuple[int, int], image_size: Tuple[int, int],
-                     radius: int = 48, scale: int = 2
+                     radius: int = 48, scale: int = 2, gap: int = 18
                      ) -> Tuple[Tuple[int, int, int, int], Tuple[int, int, int, int], Tuple[int, int]]:
-    """返回 (取样框, 放大镜方框, 十字中心)；十字中心与光标位置始终重合。
+    """返回 (取样框, 放大镜方框, 十字交叉点)。
 
-    放大镜位置由取样框按缩放比例反推（lens = src * scale - center），而不是固定挂在
-    光标右下角：取样框靠近屏幕边缘会被平移，只有按映射反推，放大图里光标对应的像素
-    才仍落在光标自己的屏幕坐标上，十字才不会与光标错开。
+    放大镜固定挂在光标右下角 ``gap`` 像素处，让光标留在方框外面不被遮挡；靠近边缘
+    时翻到光标另一侧并夹在屏幕内。十字交叉点按「取样框→放大镜」的缩放映射计算，
+    因此它指示的始终是光标正下方那一个源像素，而不是方框的几何中心。
     """
     cx, cy = int(center[0]), int(center[1])
     src = magnifier_source((cx, cy), image_size, radius)
     side = (src[2] - src[0]) * scale
-    mx = cx - (cx - src[0]) * scale
-    my = cy - (cy - src[1]) * scale
+
+    mx, my = cx + gap, cy + gap
+    if mx + side > image_size[0]:
+        mx = cx - side - gap
+    if my + side > image_size[1]:
+        my = cy - side - gap
+    mx = max(0, min(image_size[0] - side, mx))
+    my = max(0, min(image_size[1] - side, my))
+
     cross = (mx + (cx - src[0]) * scale, my + (cy - src[1]) * scale)
     return src, (mx, my, mx + side, my + side), cross
 
@@ -489,9 +496,10 @@ def _run_overlay(
                 GraphicsUnit.Pixel,
             )
             graphics.DrawRectangle(white_pen, lens[0], lens[1], lens_w, lens_h)
-            # 十字中心 = 光标指向像素在放大图里的位置，与光标屏幕坐标重合
-            graphics.DrawLine(cross_pen, cross_x - 12, cross_y, cross_x + 12, cross_y)
-            graphics.DrawLine(cross_pen, cross_x, cross_y - 12, cross_x, cross_y + 12)
+            # 十字分割线贯穿整个放大镜方框；交叉点按缩放映射落在光标指向的源像素上，
+            # 与方框右下角的光标位置一一对应，方便精确对齐。
+            graphics.DrawLine(cross_pen, lens[0], cross_y, lens[2], cross_y)
+            graphics.DrawLine(cross_pen, cross_x, lens[1], cross_x, lens[3])
 
     def finish(cancelled: bool, rect: Optional[Tuple[int, int, int, int]]) -> None:
         if state["done"]:

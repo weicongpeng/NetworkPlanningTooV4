@@ -5,7 +5,7 @@ import { useTranslation } from 'react-i18next'
 import { X } from 'lucide-react'
 
 import { useAuthStore } from '../../store/authStore'
-import { conversationTitle } from './types'
+import { conversationTitle, imDisplayName } from './types'
 import type { ImConversation } from './types'
 
 interface Props {
@@ -19,6 +19,7 @@ interface Props {
 export function ImForwardDialog({ open, conversations, count, onClose, onConfirm }: Props) {
   const { t } = useTranslation()
   const desktopMode = useAuthStore(s => s.desktopMode)
+  const currentUser = useAuthStore(s => s.user)
   const [selected, setSelected] = useState<number[]>([])
   const [busy, setBusy] = useState(false)
 
@@ -72,7 +73,7 @@ export function ImForwardDialog({ open, conversations, count, onClose, onConfirm
                   {conversationTitle(conv, {
                     unknownUser: t('im.sidebar.unknownUser', '用户'),
                     unnamedGroup: t('im.sidebar.unnamedGroup', '未命名群组'),
-                    self: t('im.sidebar.self', '自己'),
+                    selfName: imDisplayName(currentUser),
                   })}
                 </span>
                 <span className="shrink-0 text-[10px] text-muted-foreground">

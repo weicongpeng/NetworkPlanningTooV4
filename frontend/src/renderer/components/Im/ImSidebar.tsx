@@ -51,7 +51,8 @@ export function ImSidebar({ onSelectConversation }: Props) {
     unknownUser: t('im.sidebar.unknownUser', '用户'),
     unnamedGroup: t('im.sidebar.unnamedGroup', '未命名群组'),
     self: t('im.sidebar.self', '自己'),
-  }), [t])
+    selfName: imDisplayName(currentUser),
+  }), [t, currentUser])
 
   const filteredConversations = useMemo(() => {
     const keyword = query.trim().toLowerCase()
