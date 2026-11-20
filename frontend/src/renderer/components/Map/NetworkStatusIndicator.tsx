@@ -2,12 +2,13 @@
  * 网络状态指示器组件
  *
  * 设计理念：航图雷达美学
- * - 网络规划工具处理"连接"和"信号"，使用雷达风格视觉元素
+ * - 网优引擎处理"连接"和"信号"，使用雷达风格视觉元素
  * - 状态指示器像飞机仪表盘一样清晰直观
  * - 非阻塞式设计，提供优雅的网络异常提示
  */
 import { useState, useEffect, useCallback } from 'react'
 import { Wifi, WifiOff, RefreshCw, X, ChevronDown, ChevronUp, AlertCircle, Activity } from 'lucide-react'
+import { getStoredAuthToken } from '../../services/api'
 
 /**
  * 网络状态类型
@@ -89,11 +90,15 @@ export const NetworkStatusIndicator = ({
       if (healthResponse?.ok) {
         newDiagnostics.backendAvailable = true
 
-        // 尝试检查地图数据API
+        // 尝试检查地图数据API（需携带登录 token）
         try {
+          const diagHeaders: Record<string, string> = {}
+          const diagToken = getStoredAuthToken()
+          if (diagToken) diagHeaders.Authorization = `Bearer ${diagToken}`
           const mapResponse = await fetch('/api/v1/map/data', {
             method: 'GET',
-            cache: 'no-store'
+            cache: 'no-store',
+            headers: diagHeaders
           }).catch(() => null)
           newDiagnostics.mapServiceAvailable = mapResponse?.ok || false
         } catch (e) {
@@ -189,7 +194,7 @@ export const NetworkStatusIndicator = ({
         return 'text-amber-400'
       case 'checking':
       default:
-        return 'text-blue-400'
+        return 'text-primary'
     }
   }
 
@@ -228,7 +233,7 @@ export const NetworkStatusIndicator = ({
           transition-all duration-300 ease-out
           ${status === 'offline' ? 'border-rose-500/50 bg-rose-950/80 shadow-lg shadow-rose-500/20' :
             status === 'degraded' ? 'border-amber-500/50 bg-amber-950/80 shadow-lg shadow-amber-500/20' :
-            status === 'checking' ? 'border-blue-500/50 bg-blue-950/80 shadow-lg shadow-blue-500/20' :
+            status === 'checking' ? 'border-primary/50 bg-blue-950/80 shadow-lg shadow-blue-500/20' :
             'border-emerald-500/30 bg-emerald-950/60 shadow-md'
           }
         `}

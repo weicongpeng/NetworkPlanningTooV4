@@ -10,6 +10,8 @@ interface PCIConfig {
   inheritModulus: boolean
   useMod3: boolean
   useMod30: boolean
+  useMod6: boolean
+  useMod4: boolean
   pciRange: string
   enableTACPlanning: boolean
 }
@@ -35,6 +37,8 @@ const defaultConfig: PCIConfig = {
   inheritModulus: false,
   useMod3: true,
   useMod30: false,
+  useMod6: true,
+  useMod4: true,
   pciRange: '0-503',
   enableTACPlanning: true,
 }
@@ -63,6 +67,15 @@ export const usePCIStore = create<PCIState>()(
     }),
     {
       name: 'pci-planning-storage',
+      // 旧版本缓存里没有新增约束开关字段，按默认值补齐
+      merge: (persisted, current) => {
+        const saved = (persisted ?? {}) as Partial<PCIState>
+        return {
+          ...current,
+          ...saved,
+          config: { ...defaultConfig, ...(saved.config ?? {}) },
+        }
+      },
       partialize: (state) => ({
         wizardStep: state.wizardStep,
         config: state.config,

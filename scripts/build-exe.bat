@@ -1,8 +1,8 @@
 @echo off
 chcp 65001 >nul
-title Network Planning Tool Build Script
+title NetOpt Engine Build Script
 
-REM Network Planning Tool - One-click Build Script
+REM NetOpt Engine - One-click Build Script
 REM Usage: build-exe.bat [win|mac|linux|all|portable] [clean]
 
 set "TARGET=win"
@@ -21,7 +21,7 @@ if "%~2"=="clean" set "CLEAN=-Clean"
 :continue
 echo.
 echo ============================================
-echo    Network Planning Tool Build Script
+echo    NetOpt Engine Build Script
 echo ============================================
 echo.
 echo Target Platform: %TARGET%

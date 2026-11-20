@@ -33,9 +33,12 @@ export interface GCJ02Coordinate {
  */
 export class CoordinateTransformer {
   // WGS84 转 GCJ02 的常数
-  private static readonly X_PI = (Math.PI * 3000.0) / 180.0
   private static readonly A = 6378245.0 // 长半轴
   private static readonly EE = 0.00669342162296594323 // 扁率
+  // GCJ02→WGS84 固定点迭代次数：w = g - offset(w)。
+  // 与后端 coordinate_transformer.py / 移动端 coordinate.ts 保持一致。
+  // 偏移场梯度极小，6 次迭代后正反转换达到机器精度（<0.1 毫米）。
+  private static readonly GCJ_INVERSE_ITERATIONS = 6
 
   /**
    * 判断是否在中国境内（粗略判断）
@@ -102,7 +105,10 @@ export class CoordinateTransformer {
    * - 高德API返回的坐标需要存储为标准坐标
    * - 高德Place API搜索结果需要与其他WGS84数据对比
    *
-   * 注意: 这是近似算法，精度约1-2米
+   * 采用固定点迭代求解 w = g - offset(w)，与正向 wgs84ToGcj02 严格互逆
+   * （残差 <0.1 毫米）。旧实现为一阶近似 w = g - offset(g)，因偏移场非线性
+   * d(w)≠d(g)，往返残留厘米至米级误差并随反复保存累积——表现为搜索定位
+   * （正向转换后落图）与提取坐标（逆向反算 WGS84）对同一坐标相差约 2 米。
    *
    * @param gcjLat GCJ02 纬度
    * @param gcjLng GCJ02 经度
@@ -114,19 +120,17 @@ export class CoordinateTransformer {
       return [gcjLat, gcjLng]
     }
 
-    let dLat = this.transformLat(gcjLng - 105.0, gcjLat - 35.0)
-    let dLng = this.transformLon(gcjLng - 105.0, gcjLat - 35.0)
-    const radLat = (gcjLat / 180.0) * Math.PI
-    let magic = Math.sin(radLat)
-    magic = 1 - this.EE * magic * magic
-    const sqrtMagic = Math.sqrt(magic)
-    dLat = (dLat * 180.0) / (((this.A * (1 - this.EE)) / (magic * sqrtMagic)) * Math.PI)
-    dLng = (dLng * 180.0) / (this.A / sqrtMagic * Math.cos(radLat) * Math.PI)
-    const mgLat = gcjLat + dLat
-    const mgLng = gcjLng + dLng
-
-    // 逆向转换: WGS84 = GCJ02 - 偏移
-    return [gcjLat * 2 - mgLat, gcjLng * 2 - mgLng]
+    let wLat = gcjLat
+    let wLng = gcjLng
+    for (let i = 0; i < this.GCJ_INVERSE_ITERATIONS; i++) {
+      const [gLat, gLng] = this.wgs84ToGcj02(wLat, wLng)
+      const dLat = gcjLat - gLat
+      const dLng = gcjLng - gLng
+      wLat += dLat
+      wLng += dLng
+      if (Math.abs(dLat) < 1e-10 && Math.abs(dLng) < 1e-10) break
+    }
+    return [wLat, wLng]
   }
 
   /**
@@ -194,27 +198,8 @@ export class CoordinateTransformer {
 
     for (let i = 0; i < coords.length; i++) {
       const [gcjLat, gcjLng] = coords[i]
-
-      // 不在中国境内不需要转换
-      if (!this.isInChina(gcjLat, gcjLng)) {
-        results[i] = [gcjLat, gcjLng]
-        continue
-      }
-
-      // GCJ02 转 WGS84 变换（内联以减少函数调用）
-      let dLat = this.transformLat(gcjLng - 105.0, gcjLat - 35.0)
-      let dLng = this.transformLon(gcjLng - 105.0, gcjLat - 35.0)
-      const radLat = (gcjLat / 180.0) * Math.PI
-      let magic = Math.sin(radLat)
-      magic = 1 - this.EE * magic * magic
-      const sqrtMagic = Math.sqrt(magic)
-      dLat = (dLat * 180.0) / (((this.A * (1 - this.EE)) / (magic * sqrtMagic)) * Math.PI)
-      dLng = (dLng * 180.0) / (this.A / sqrtMagic * Math.cos(radLat) * Math.PI)
-      const mgLat = gcjLat + dLat
-      const mgLng = gcjLng + dLng
-
-      // 逆向转换: WGS84 = GCJ02 - 偏移
-      results[i] = [gcjLat * 2 - mgLat, gcjLng * 2 - mgLng]
+      // 复用标量实现（固定点迭代），避免两套实现精度不一致导致图层批量纠偏与单点反算出现偏差
+      results[i] = this.gcj02ToWgs84(gcjLat, gcjLng)
     }
 
     return results

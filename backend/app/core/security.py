@@ -2,19 +2,43 @@
 安全依赖
 FastAPI Depends 可调用对象，用于认证和授权
 """
-from fastapi import Depends, HTTPException, Request, status
+from typing import Optional
+
+from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.core.database import get_db
 from app.services.auth_service import auth_service
 
 security_scheme = HTTPBearer(auto_error=False)
 
 
+def _desktop_idle_timeout_minutes() -> Optional[int]:
+    """桌面单机模式：无操作自动退出登录的分钟数（管理员按用户设定，默认 2 天）。
+
+    单机模式才生效；共享模式沿用服务器统一的会话空闲超时。
+    """
+    if not settings.NPT_DESKTOP:
+        return None
+    try:
+        from app.services.license_service import license_service
+
+        info = license_service.desktop_license_info() or {}
+    except Exception:  # noqa: BLE001
+        return None
+    if not info.get("valid") or info.get("mode") != "standalone":
+        return None
+    try:
+        days = int(info.get("idle_logout_days") or 2)
+    except (TypeError, ValueError):
+        days = 2
+    return max(1, days) * 24 * 60
+
+
 async def get_current_user(
     credentials: HTTPAuthorizationCredentials | None = Depends(security_scheme),
-    request: Request = None,
     db: Session = Depends(get_db),
 ):
     """从 Bearer Token 解析当前用户。未认证返回 401。"""
@@ -38,15 +62,18 @@ async def get_current_user(
             detail="会话已注销，请重新登录",
         )
 
-    # IP 校验：防止 token 被其他 IP 使用
-    # 主要场景：同一账号在新 IP 登录后，历史 token 在旧 IP 的请求被拒绝
-    if jti and request is not None:
-        current_ip = auth_service.get_client_ip(request)
-        if not auth_service.verify_session_ip(db, jti, current_ip):
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="账号已在其他设备登录，请重新登录",
-            )
+    # 空闲超时校验：连续无操作（含心跳）超过阈值才要求重新登录。
+    # 注意：不校验请求 IP——客户端 IPv4/IPv6 切换或换网络不应打断登录态；
+    # 同一账号仅在新设备登录时踢掉旧会话（见 auth_service.end_other_ip_sessions）。
+    # 桌面单机模式的阈值由管理员在「桌面授权」页按用户设定（默认 2 天）。
+    idle_minutes = None
+    if settings.NPT_DESKTOP:
+        idle_minutes = _desktop_idle_timeout_minutes()
+    if jti and auth_service.is_session_idle_expired(db, jti, idle_minutes):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="长时间未操作，请重新登录",
+        )
 
     user_id = int(payload.get("sub"))
     user = auth_service.get_user_by_id(db, user_id)
@@ -92,8 +119,21 @@ async def get_token_jti(
     return payload.get("jti")
 
 
+def reject_desktop_mode() -> None:
+    """桌面版禁用依赖：服务器专用管理端点在 NPT_DESKTOP=1 下一律 404。
+
+    桌面端是单用户形态，没有管理员，也不需要用户/APP版本/安装包/授权管理入口。
+    """
+    if settings.NPT_DESKTOP:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
+
+
 def require_permission(perm: str):
-    """权限校验依赖工厂：管理员自动通过，普通用户需对应权限位为 True"""
+    """权限校验依赖工厂：管理员自动通过，普通用户需对应权限位为 True。
+
+    权限位由管理员在「用户管理 → 编辑」设置，**网页端与桌面端（含单机模式）
+    一致生效**；桌面端不再整体放行，账号没给权限就与网页端一样被拒绝。
+    """
     async def checker(current_user=Depends(get_current_user)):
         if current_user.is_admin:
             return current_user
@@ -110,3 +150,5 @@ require_data_import = require_permission("can_data_import")
 require_data_delete = require_permission("can_data_delete")
 require_data_update = require_permission("can_data_update")
 require_cell_entry = require_permission("can_cell_entry")
+require_cell_query_update = require_permission("can_cell_query_update")
+require_assistant = require_permission("can_assistant")

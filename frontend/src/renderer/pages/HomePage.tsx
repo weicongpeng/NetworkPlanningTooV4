@@ -2,10 +2,18 @@ import {
   Database,
   Settings,
   Network,
-  Layers,
+  GitCompare,
   MapPin,
   Map,
   Shield,
+  ClipboardCheck,
+  Wrench,
+  Ruler,
+  MoveHorizontal,
+  RadioTower,
+  Waves,
+  Bot,
+  Combine,
   LucideIcon
 } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
@@ -15,7 +23,7 @@ export function HomePage() {
 
   return (
     <div className="p-8">
-      <h1 className="text-base font-bold mb-8">{t('home.title')} v2.0</h1>
+      <h1 className="text-base font-bold mb-8">{t('home.overviewTitle', '功能概览')}</h1>
 
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
         {/* 功能卡片 */}
@@ -24,49 +32,105 @@ export function HomePage() {
           description={t('home.dataDesc') || '导入和管理工参数据'}
           icon={Database}
           link="/data"
-          iconColor="text-blue-500"
+          iconColor="text-primary"
+        />
+        <FeatureCard
+          title={t('nav.assistant', '网优助手')}
+          description={t('home.assistantDesc', '对话查询基站参数与小区指标，自动生成趋势图/柱状图/周边站点')}
+          icon={Bot}
+          link="/assistant"
+          iconColor="text-primary"
         />
         <FeatureCard
           title={t('nav.pci')}
           description={t('home.pciDesc') || 'LTE和NR的PCI自动规划'}
           icon={Settings}
           link="/pci"
-          iconColor="text-purple-500"
+          iconColor="text-primary"
         />
         <FeatureCard
           title={t('nav.neighbor')}
           description={t('home.neighborDesc') || '自动生成邻区关系'}
           icon={Network}
           link="/neighbor"
-          iconColor="text-green-500"
+          iconColor="text-primary"
         />
         <FeatureCard
           title={t('nav.tac')}
           description={t('home.tacDesc') || '对比图层TAC与现网TAC，统计一致性'}
-          icon={Layers}
+          icon={GitCompare}
           link="/tac"
-          iconColor="text-orange-500"
+          iconColor="text-primary"
+        />
+        <FeatureCard
+          title={t('nav.pciCheck')}
+          description={t('home.pciCheckDesc') || '核查PCI复用距离、冲突混淆与模3/模30冲突'}
+          icon={ClipboardCheck}
+          link="/pci-check"
+          iconColor="text-primary"
         />
         <FeatureCard
           title={t('nav.tacPlanning')}
           description={t('home.tacPlanningDesc') || '数据驱动的新站小区TAC分配'}
           icon={MapPin}
           link="/tac-planning"
-          iconColor="text-red-500"
+          iconColor="text-primary"
         />
         <FeatureCard
           title={t('nav.map')}
           description={t('home.mapDesc') || '查看基站分布和覆盖'}
           icon={Map}
           link="/map"
-          iconColor="text-cyan-500"
+          iconColor="text-primary"
+        />
+        <FeatureCard
+          title={t('nav.layerTools')}
+          description={t('home.layerToolsDesc') || '根据工参文件制作扇区/点图层 (tab/mif/kml)'}
+          icon={Wrench}
+          link="/layer"
+          iconColor="text-primary"
+        />
+        <FeatureCard
+          title={t('nav.distanceMatch')}
+          description={t('home.distanceMatchDesc')}
+          icon={Ruler}
+          link="/distance-match"
+          iconColor="text-primary"
+        />
+        <FeatureCard
+          title={t('nav.siteSpacing')}
+          description={t('home.siteSpacingDesc')}
+          icon={MoveHorizontal}
+          link="/site-spacing"
+          iconColor="text-primary"
+        />
+        <FeatureCard
+          title={t('nav.freqConversion')}
+          description={t('home.freqConversionDesc')}
+          icon={RadioTower}
+          link="/frequency-conversion"
+          iconColor="text-primary"
+        />
+        <FeatureCard
+          title={t('nav.im3Evaluation')}
+          description={t('home.im3EvaluationDesc')}
+          icon={Waves}
+          link="/intermodulation"
+          iconColor="text-primary"
+        />
+        <FeatureCard
+          title={t('nav.tableMerge')}
+          description={t('home.tableMergeDesc')}
+          icon={Combine}
+          link="/table-merge"
+          iconColor="text-primary"
         />
         <FeatureCard
           title={t('nav.config')}
           description={t('home.configDesc') || '管理系统配置'}
           icon={Shield}
           link="/license"
-          iconColor="text-slate-500"
+          iconColor="text-primary"
         />
       </div>
 

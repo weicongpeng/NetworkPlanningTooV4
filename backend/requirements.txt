@@ -30,6 +30,7 @@ python-dotenv==1.0.0
 # gdal==3.8.4
 geopandas>=1.0.1
 shapely>=2.0.6
+pyproj>=3.6
 
 # 空间索引（TAC插花检测 BallTree）
 scikit-learn>=1.5.0
@@ -42,3 +43,4 @@ aiofiles==24.1.0
 pytest==8.3.0
 pytest-asyncio==0.24.0
 httpx==0.28.0
+openai>=1.0.0  # 网优助手 LLM（OpenAI兼容协议）

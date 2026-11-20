@@ -1,8 +1,8 @@
 @echo off
 chcp 65001 >nul
-title Network Planning Tool Build Script
+title NetOpt Engine Build Script
 
-REM Network Planning Tool - Simple Build Script
+REM NetOpt Engine - Simple Build Script
 REM Usage: build-simple.bat [win|portable]
 
 set "TARGET=win"
@@ -10,7 +10,7 @@ if "%~1"=="portable" set "TARGET=portable"
 
 echo.
 echo ============================================
-echo    Network Planning Tool Build Script
+echo    NetOpt Engine Build Script
 echo ============================================
 echo.
 echo Target: %TARGET%

@@ -13,7 +13,13 @@
  */
 import L from 'leaflet'
 import { CoordinateTransformer } from '../../utils/coordinate'
-import { GeoDataCanvasLabelLayer, CanvasLabelData } from './GeoDataCanvasLabelLayer'
+import type { LabelCandidate, LabelLayoutManager } from './LabelLayoutManager'
+import { getFieldValue, matchThematicColor, matchRangeIndex, hasValue, toNumber, NO_FILL_COLOR } from '../../utils/fieldValue'
+import type { ThematicSettings } from './LabelSettingsModal'
+import type { HeatPoint } from '../../utils/heatmap'
+import { centroidFromLatLngRing } from '../../utils/heatmap'
+import { layerHitAt, CLICK_HIT_TOLERANCE_PX, layerGeometry, type FeatureHitType } from './mapHitTest'
+import { geometryAnchor } from '../../services/boundarySelection'
 
 console.log('🔥🔥🔥 GeoDataLayer.tsx 已加载 (2025-03-29-v3 Canvas优化版) 🔥🔥🔥')
 
@@ -35,6 +41,9 @@ export interface GeoDataItem {
 
   // 多边形专用（已转换好的GCJ02坐标，[lat, lng]顺序）
   path?: [number, number][]
+
+  /** 圈选结果附带 GeoJSON 几何（GCJ02；跨图层复制粘贴用，getFeaturesIn* 方法填充） */
+  geometry?: { type: string; coordinates: any }
 }
 
 export interface GeoDataLayerOptions {
@@ -43,9 +52,10 @@ export interface GeoDataLayerOptions {
   geometryType: GeoDataGeometryType
   data: GeoDataItem[]
   visible?: boolean
-  onFeatureClick?: (properties: Record<string, any>, event: L.LeafletMouseEvent, name?: string) => void
   /** 缩放级别（用于LOD策略） */
   zoom?: number
+  /** 共享标签布局引擎（统一防重叠，跨图层不重叠） */
+  labelManager?: LabelLayoutManager
 }
 
 // 默认样式：黑框白底
@@ -63,7 +73,8 @@ const DEFAULT_SECTOR_STYLE = {
   color: '#000000',
   weight: 2,
   opacity: 1,
-  fillOpacity: 0.6
+  // 默认不透明度 100%（用户要求：地图上所有图形的默认不透明度都是 100%）
+  fillOpacity: 1
 }
 
 const DEFAULT_POLYGON_STYLE = {
@@ -71,7 +82,8 @@ const DEFAULT_POLYGON_STYLE = {
   color: '#000000',
   weight: 2,
   opacity: 1,
-  fillOpacity: 0.5
+  // 默认不透明度 100%（同上）
+  fillOpacity: 1
 }
 
 // LOD 阈值
@@ -134,36 +146,60 @@ export class GeoDataLayer {
   private leafletLayer: L.LayerGroup | null = null
   private featureGroup: L.FeatureGroup | null = null  // 聚合图层
   private currentZoom: number = 12
-  private onFeatureClick?: (properties: Record<string, any>, event: L.LeafletMouseEvent, name?: string) => void
   private labelsEnabled: boolean = false
   private visible: boolean = false
   private map: L.Map | null = null
 
-  // Canvas 标签层（替代 DOM 标签）
-  private canvasLabelLayer: GeoDataCanvasLabelLayer | null = null
+  // 共享标签布局引擎（标签防重叠统一由 LabelLayoutManager 处理）
+  private labelManager: LabelLayoutManager | null
+  private labelSourceId: string
+
+  // 共享 Canvas renderer：几万个 circleMarker/polygon 用 SVG 渲染会 DOM 爆炸卡顿，
+  // Canvas 大幅减少 DOM 节点（circleMarker/polygon 均支持 Canvas + 点击 + tooltip）
+  private canvasRenderer: L.Renderer | null = null
 
   // 标签配置
   private labelConfig: {
     content: string
     color: string
     fontSize: number
+    fontFamily?: string
+    bold?: boolean
+    italic?: boolean
+    shadow?: boolean
+    background?: 'none' | 'halo' | 'box'
+    backgroundColor?: string
   } = {
     content: 'name',
     color: '#000000',
     fontSize: 12
   }
 
-  // 地图移动节流定时器
-  private _mapMoveTimer: number | null = null
+  // 图层颜色覆盖（图形颜色 / 透明度 / 边框宽度 / 边框颜色）
+  private styleOverrides: { fillColor: string; fillOpacity: number; borderWidth: number; borderColor: string; pointSize?: number } | null = null
+
+  // 专题图层设置（启用时优先于 styleOverrides；null 表示未启用）
+  private thematicSettings: ThematicSettings | null = null
+  // 专题区间统计（每个区间的要素数/总数，用于图例展示）
+  private thematicStats: { counts: number[]; total: number; other: number } | null = null
+
   // 几何图形重新渲染定时器
   private _geometryRenderTimer: number | null = null
+  // 初始分块渲染定时器 + 令牌（令牌递增用于取消过期批次）
+  private _chunkTimer: number | null = null
+  private _renderToken: number = 0
   // 缩放事件处理函数引用（用于取消注册）
   private _onZoomBound: (() => void) | null = null
   private _onZoomEndBound: (() => void) | null = null
+  // 拖拽（move）节流字段
+  private _onMoveBound: (() => void) | null = null
+  private _lastMoveRenderTime: number = 0
   // 缩放动画帧 ID
   private _zoomAnimFrameId: number | null = null
   // 交互状态标志
   private isInteractive: boolean = true
+  // 测距模式标志：测距时要素不拦截鼠标事件（点击/悬停穿透到地图，供测量加点）
+  private measureMode: boolean = false
   // 框选高亮状态
   private selectionHighlightIds: Set<string> | null = null
   private _originalMarkerStyles: Map<L.Marker, string> = new Map() // Marker高亮前保存原始outline
@@ -175,12 +211,16 @@ export class GeoDataLayer {
     this.name = options.name
     this.geometryType = options.geometryType
     this.data = options.data
-    this.onFeatureClick = options.onFeatureClick
     this.currentZoom = options.zoom || 12
     this.visible = options.visible ?? false
+    this.labelManager = options.labelManager || null
+    this.labelSourceId = `geo-${options.id}`
 
     // 创建聚合图层
     this.featureGroup = L.featureGroup()
+
+    // 共享 Canvas renderer（大点/扇区/多边形数据集渲染加速）
+    this.canvasRenderer = L.canvas()
   }
 
   /**
@@ -207,6 +247,13 @@ export class GeoDataLayer {
     this._onZoomEndBound = this._handleZoomEnd.bind(this)
     map.on('zoom', this._onZoomBound)
     map.on('zoomend', this._onZoomEndBound)
+
+    // 🔧 拖拽（纯平移）实时刷新可视区域：move 高频触发，_handleMove 内做固定间隔节流
+    if (this._onMoveBound) {
+      map.off('move', this._onMoveBound)
+    }
+    this._onMoveBound = () => this._handleMove()
+    map.on('move', this._onMoveBound)
 
     // 🔧 修复：添加到地图时，清理可能存在的旧定时器
     // 防止之前的 _reRenderGeometries 定时器在新图层创建后触发并清空它
@@ -266,22 +313,9 @@ export class GeoDataLayer {
       this.currentZoom = currentMapZoom
     }
 
-    switch (this.geometryType) {
-      case 'point':
-        console.log('[GeoDataLayer] 调用 _renderPoints(false)')
-        this._renderPoints(false)  // 初始渲染不使用裁剪
-        break
-      case 'sector':
-        console.log('[GeoDataLayer] 调用 _renderSectors(false)')
-        this._renderSectors(false)  // 初始渲染不使用裁剪
-        break
-      case 'polygon':
-        console.log('[GeoDataLayer] 调用 _renderPolygons(false)')
-        this._renderPolygons(false)  // 初始渲染不使用裁剪
-        break
-      default:
-        console.warn('[GeoDataLayer] ❌ 未知的 geometryType:', this.geometryType)
-    }
+    // 🔧 分块渲染：视口裁剪 + 批次让步，避免一次性创建全量要素阻塞主线程
+    // 大数据集渐进显示；小数据集因分块粒度小，耗时差异可忽略
+    this._renderChunked()
 
     console.log('[GeoDataLayer] 将 leafletLayer 添加到地图，已渲染', this.leafletLayer.getLayers().length, '个图层')
     this.leafletLayer.addTo(map)
@@ -291,8 +325,97 @@ export class GeoDataLayer {
       this.setSelectionHighlight(this.selectionHighlightIds)
     }
 
+    // 勾选图层时同步标签候选到共享布局引擎（幂等：全量替换本层候选）
+    if (this.labelsEnabled && this.visible) {
+      this._createLabels(map)
+    }
+
     console.log('[GeoDataLayer] ========== addTo 完成 ==========')
     return this
+  }
+
+  /**
+   * 过滤当前视口（含缓冲）内的要素
+   * 点/扇区按中心点判断；多边形按任一顶点是否在视口内判断
+   */
+  private _filterVisible(pad: L.LatLngBounds): GeoDataItem[] {
+    const out: GeoDataItem[] = []
+    for (const item of this.data) {
+      if (this.geometryType === 'polygon') {
+        if (item.path && item.path.some(p => pad.contains([p[0], p[1]]))) out.push(item)
+        continue
+      }
+      if (item.longitude === undefined || item.latitude === undefined) continue
+      const [dlat, dlng] = item.displayLat !== undefined && item.displayLng !== undefined
+        ? [item.displayLat, item.displayLng]
+        : CoordinateTransformer.wgs84ToGcj02(item.latitude, item.longitude)
+      if (pad.contains([dlat, dlng])) out.push(item)
+    }
+    return out
+  }
+
+  /**
+   * 分块渲染（初始渲染 / 视口裁剪 + 批次让步）
+   *
+   * 大数据集一次性创建数万个 Leaflet 图层会阻塞主线程，导致勾选后长时间无响应。
+   * 这里按批次（每帧一批）用 setTimeout 让步渲染，UI 保持响应、要素渐进显示。
+   * 新渲染会递增令牌使旧的未完成批次失效；移动/缩放过时由 _reRenderGeometries 接管。
+   */
+  private _renderChunked(): void {
+    if (!this.leafletLayer || !this.map) return
+
+    // 取消旧的分块渲染
+    this._renderToken++
+    const token = this._renderToken
+    if (this._chunkTimer !== null) {
+      clearTimeout(this._chunkTimer)
+      this._chunkTimer = null
+    }
+
+    this.leafletLayer.clearLayers()
+
+    const pad = this._padBounds(this.map.getBounds(), 0.2)
+    const visible = this._filterVisible(pad)
+
+    // 🔧 性能：批次 300→600 减半 setTimeout 空闲间隙（加快首屏出图，桌面端可接受）
+    const BATCH = 600
+    let i = 0
+    const self = this
+
+    const step = () => {
+      if (token !== self._renderToken || !self.leafletLayer) {
+        self._chunkTimer = null
+        return
+      }
+      const end = Math.min(i + BATCH, visible.length)
+      const slice = visible.slice(i, end)
+      i = end
+      if (slice.length > 0) {
+        switch (self.geometryType) {
+          case 'point':
+            self._renderPoints(false, slice, self.leafletLayer)
+            break
+          case 'sector':
+            self._renderSectors(false, slice, self.leafletLayer)
+            break
+          case 'polygon':
+            self._renderPolygons(false, slice, self.leafletLayer)
+            break
+        }
+      }
+      if (i < visible.length) {
+        self._chunkTimer = window.setTimeout(step, 0)
+      } else {
+        self._chunkTimer = null
+        console.log(`[GeoDataLayer] 分块渲染完成: 视口内 ${visible.length}/${self.data.length} 个要素`)
+        // 重新渲染后恢复选中高亮
+        if (self.selectionHighlightIds) {
+          self.setSelectionHighlight(self.selectionHighlightIds)
+        }
+      }
+    }
+
+    this._chunkTimer = window.setTimeout(step, 0)
   }
 
   /**
@@ -303,10 +426,14 @@ export class GeoDataLayer {
    * 可以在每次缩放时精确控制显示大小。
    *
    * @param useCulling 是否使用视口裁剪（默认false显示全部，地图移动后设为true）
+   * @param dataSlice 可选：只渲染数据切片（分块渲染用）
+   * @param destLayer 可选：渲染目标图层（分块渲染用，默认 this.leafletLayer）
    */
-  private _renderPoints(useCulling: boolean = false): void {
+  private _renderPoints(useCulling: boolean = false, dataSlice?: GeoDataItem[], destLayer?: L.LayerGroup): void {
     if (!this.leafletLayer || !this.map) return
 
+    const source = dataSlice || this.data
+    const target = destLayer || this.leafletLayer
     const bounds = this.map.getBounds()
     const paddedBounds = bounds ? this._padBounds(bounds, 0.1) : null
     const zoom = this.map.getZoom()
@@ -315,8 +442,8 @@ export class GeoDataLayer {
     let renderedCount = 0
     let skippedNoCoords = 0
 
-    for (let i = 0; i < this.data.length; i++) {
-      const item = this.data[i]
+    for (let i = 0; i < source.length; i++) {
+      const item = source[i]
       if (item.longitude === undefined || item.latitude === undefined) {
         skippedNoCoords++
         continue
@@ -333,39 +460,51 @@ export class GeoDataLayer {
 
       // 动态计算像素半径，模拟 10 米在当前缩放级别下的视觉大小
       const pixelRadius = this._metersToPixels(10, displayLat, zoom)
+      // 基础配置"图形大小"设置：设置后以固定像素半径渲染（覆盖默认随缩放的 10 米半径）
+      const baseRadius = (this.styleOverrides && typeof this.styleOverrides.pointSize === 'number')
+        ? this.styleOverrides.pointSize
+        : pixelRadius
+      // 专题启用时用固定点大小（图形大小设置，优先于基础配置）
+      const radius = (this.thematicSettings?.enabled && this.thematicSettings.pointSize)
+        ? this.thematicSettings.pointSize
+        : baseRadius
 
       const marker = L.circleMarker([displayLat, displayLng], {
-        ...DEFAULT_POINT_STYLE,
-        radius: pixelRadius,
+        ...this._mergeStyleOverrides(DEFAULT_POINT_STYLE, item),
+        radius,
+        renderer: this.canvasRenderer || undefined,
+        // 测距模式下要素不参与鼠标命中检测，点击穿透到地图（测量加点）
+        interactive: !this.measureMode,
         properties: item.properties,
         name: item.name
       })
 
-      if (this.onFeatureClick && this.isInteractive) {
-        marker.on('click', (e) => {
-          L.DomEvent.stopPropagation(e)
-          this.onFeatureClick!(item.properties, e as L.LeafletMouseEvent, item.name)
-        })
-      }
-
+      // 要素点击属性弹窗统一由地图 click 穿透所有图层检测处理，
+      // 不再逐要素绑定 click + stopPropagation（否则最上层 Canvas 图层会吞掉点击，
+      // 下层图层要素无法点选）；tooltip 仍按交互开关绑定
       // 只在交互启用时绑定 tooltip
       if (this.isInteractive) {
         marker.bindTooltip(item.name || `点${i+1}`, { permanent: false, direction: 'top' })
       }
-      marker.addTo(this.leafletLayer!)
+      marker.addTo(target!)
       renderedCount++
     }
 
-    console.log(`[GeoDataLayer] _renderPoints 完成: 总数据=${this.data.length}, 无坐标=${skippedNoCoords}, 过滤=${filteredCount}, 渲染=${renderedCount}`)
+    console.log(`[GeoDataLayer] _renderPoints 完成: 总数据=${source.length}, 无坐标=${skippedNoCoords}, 过滤=${filteredCount}, 渲染=${renderedCount}`)
   }
 
   /**
    * 渲染扇区数据
    * LOD策略: zoom <= 9 用圆点, zoom > 9 用扇形
    * @param useCulling 是否使用视口裁剪（默认false显示全部，地图移动后设为true）
+   * @param dataSlice 可选：只渲染数据切片（分块渲染用）
+   * @param destLayer 可选：渲染目标图层（分块渲染用，默认 this.leafletLayer）
    */
-  private _renderSectors(useCulling: boolean = false): void {
+  private _renderSectors(useCulling: boolean = false, dataSlice?: GeoDataItem[], destLayer?: L.LayerGroup): void {
     if (!this.leafletLayer) return
+
+    const source = dataSlice || this.data
+    const target = destLayer || this.leafletLayer
 
     // 🔧 视口裁剪优化：获取当前视口边界
     const bounds = this.map?.getBounds()
@@ -380,8 +519,8 @@ export class GeoDataLayer {
     let renderedCount = 0
     let skippedNoCoords = 0
 
-    for (let i = 0; i < this.data.length; i++) {
-      const item = this.data[i]
+    for (let i = 0; i < source.length; i++) {
+      const item = source[i]
       if (item.longitude === undefined || item.latitude === undefined) {
         skippedNoCoords++
         continue
@@ -410,21 +549,23 @@ export class GeoDataLayer {
       if (is360Degree || coverType === 4 || this.currentZoom <= LOD_THRESHOLD) {
         // 渲染为圆点
         const marker = L.circleMarker([displayLat, displayLng], {
-          ...DEFAULT_POINT_STYLE,
+          ...this._mergeStyleOverrides(DEFAULT_POINT_STYLE, item),
+          // 扇区属面状图层：尺寸设置语义为边框宽度（描边），圆点半径保持默认
+          ...(this.thematicSettings?.enabled && this.thematicSettings.pointSize
+            ? { weight: this.thematicSettings.pointSize }
+            : {}),
+          renderer: this.canvasRenderer || undefined,
+          // 测距模式下要素不参与鼠标命中检测，点击穿透到地图（测量加点）
+          interactive: !this.measureMode,
           properties: item.properties,
           name: item.name
         })
-        if (this.onFeatureClick && this.isInteractive) {
-          marker.on('click', (e) => {
-            L.DomEvent.stopPropagation(e)
-            this.onFeatureClick!(item.properties, e as L.LeafletMouseEvent, item.name)
-          })
-        }
+        // 要素点击属性弹窗统一由地图 click 穿透检测处理（不再逐要素绑定 click）
         // 只在交互启用时绑定 tooltip
         if (this.isInteractive) {
           marker.bindTooltip(item.name || `扇区${i+1}`, { permanent: false, direction: 'top' })
         }
-        marker.addTo(this.leafletLayer!)
+        marker.addTo(target!)
         renderedCount++
       } else {
         // 渲染为扇形
@@ -434,27 +575,29 @@ export class GeoDataLayer {
 
         const points = createSectorPolygon(displayLat, displayLng, azimuth, beamwidth, SECTOR_RADIUS)
         const polygon = L.polygon(points, {
-          ...DEFAULT_SECTOR_STYLE,
+          ...this._mergeStyleOverrides(DEFAULT_SECTOR_STYLE, item),
+          // 扇区属面状图层：尺寸设置语义为边框宽度
+          ...(this.thematicSettings?.enabled && this.thematicSettings.pointSize
+            ? { weight: this.thematicSettings.pointSize }
+            : {}),
+          renderer: this.canvasRenderer || undefined,
+          // 测距模式下要素不参与鼠标命中检测，点击穿透到地图（测量加点）
+          interactive: !this.measureMode,
           properties: item.properties,
           name: item.name
         })
 
-        if (this.onFeatureClick && this.isInteractive) {
-          polygon.on('click', (e) => {
-            L.DomEvent.stopPropagation(e)
-            this.onFeatureClick!(item.properties, e as L.LeafletMouseEvent, item.name)
-          })
-        }
+        // 要素点击属性弹窗统一由地图 click 穿透检测处理（不再逐要素绑定 click）
         // 只在交互启用时绑定 tooltip
         if (this.isInteractive) {
           polygon.bindTooltip(item.name || `扇区${i+1}`, { permanent: false, direction: 'top' })
         }
-        polygon.addTo(this.leafletLayer!)
+        polygon.addTo(target!)
         renderedCount++
       }
     }
 
-    console.log(`[GeoDataLayer] _renderSectors 完成: 总数据=${this.data.length}, 无坐标=${skippedNoCoords}, 过滤=${filteredCount}, 渲染=${renderedCount}`)
+    console.log(`[GeoDataLayer] _renderSectors 完成: 总数据=${source.length}, 无坐标=${skippedNoCoords}, 过滤=${filteredCount}, 渲染=${renderedCount}`)
   }
 
   /**
@@ -463,15 +606,20 @@ export class GeoDataLayer {
    * 坐标说明：item.path 已在后端转换为 GCJ02 坐标，格式为 [[lat, lng], ...]
    * 直接传给 L.polygon 即可，Leaflet 不会进行额外的坐标转换
    * @param useCulling 是否使用视口裁剪（默认false显示全部，地图移动后设为true）
+   * @param dataSlice 可选：只渲染数据切片（分块渲染用）
+   * @param destLayer 可选：渲染目标图层（分块渲染用，默认 this.leafletLayer）
    */
-  private _renderPolygons(useCulling: boolean = false): void {
+  private _renderPolygons(useCulling: boolean = false, dataSlice?: GeoDataItem[], destLayer?: L.LayerGroup): void {
     if (!this.leafletLayer) return
+
+    const source = dataSlice || this.data
+    const target = destLayer || this.leafletLayer
 
     // 🔧 视口裁剪优化：获取当前视口边界
     const bounds = this.map?.getBounds()
     const paddedBounds = bounds ? this._padBounds(bounds, 0.3) : null  // 30% 缓冲（多边形需要更大缓冲）
 
-    console.log('[GeoDataLayer] _renderPolygons 开始，数据量:', this.data.length)
+    console.log('[GeoDataLayer] _renderPolygons 开始，数据量:', source.length)
     console.log('[GeoDataLayer] _renderPolygons this.geometryType:', this.geometryType)
     console.log('[GeoDataLayer] _renderPolygons: useCulling=', useCulling, 'bounds=', bounds, 'paddedBounds=', paddedBounds)
 
@@ -479,8 +627,8 @@ export class GeoDataLayer {
     let renderedCount = 0
     let skippedInvalidPath = 0
 
-    for (let i = 0; i < this.data.length; i++) {
-      const item = this.data[i]
+    for (let i = 0; i < source.length; i++) {
+      const item = source[i]
 
       if (!item.path || item.path.length < 3) {
         skippedInvalidPath++
@@ -508,30 +656,32 @@ export class GeoDataLayer {
       try {
         // 直接使用 L.polygon，path 已经是正确的 [lat, lng] 格式（GCJ02）
         const polygon = L.polygon(item.path as L.LatLngExpression[], {
-          ...DEFAULT_POLYGON_STYLE,
+          ...this._mergeStyleOverrides(DEFAULT_POLYGON_STYLE, item),
+          // 面状图层：尺寸设置语义为边框宽度
+          ...(this.thematicSettings?.enabled && this.thematicSettings.pointSize
+            ? { weight: this.thematicSettings.pointSize }
+            : {}),
+          renderer: this.canvasRenderer || undefined,
+          // 测距模式下要素不参与鼠标命中检测，点击穿透到地图（测量加点）
+          interactive: !this.measureMode,
           properties: item.properties,
           name: item.name
         })
 
-        if (this.onFeatureClick && this.isInteractive) {
-          polygon.on('click', (e) => {
-            L.DomEvent.stopPropagation(e)
-            this.onFeatureClick!(item.properties, e as L.LeafletMouseEvent, item.name)
-          })
-        }
+        // 要素点击属性弹窗统一由地图 click 穿透检测处理（不再逐要素绑定 click）
 
         // 只在交互启用时绑定 tooltip
         if (this.isInteractive) {
           polygon.bindTooltip(item.name || `多边形${i+1}`, { permanent: false, direction: 'top' })
         }
-        polygon.addTo(this.leafletLayer!)
+        polygon.addTo(target!)
         renderedCount++
       } catch (error) {
         console.error(`[GeoDataLayer] ❌ 第 ${i} 个多边形渲染失败:`, error)
       }
     }
 
-    console.log(`[GeoDataLayer] _renderPolygons 完成: 总数据=${this.data.length}, 无效路径=${skippedInvalidPath}, 过滤=${filteredCount}, 渲染=${renderedCount}`)
+    console.log(`[GeoDataLayer] _renderPolygons 完成: 总数据=${source.length}, 无效路径=${skippedInvalidPath}, 过滤=${filteredCount}, 渲染=${renderedCount}`)
   }
 
   /**
@@ -550,6 +700,10 @@ export class GeoDataLayer {
         targetMap.off('zoomend', this._onZoomEndBound)
         this._onZoomEndBound = null
       }
+      if (this._onMoveBound) {
+        targetMap.off('move', this._onMoveBound)
+        this._onMoveBound = null
+      }
     }
 
     // 取消待处理的缩放动画帧
@@ -566,11 +720,15 @@ export class GeoDataLayer {
       console.log('[GeoDataLayer] remove: 已取消待处理的 _geometryRenderTimer')
     }
 
-    // 移除 Canvas 标签层
-    if (this.canvasLabelLayer && targetMap) {
-      targetMap.removeLayer(this.canvasLabelLayer)
-      this.canvasLabelLayer = null
+    // 取消分块渲染（递增令牌使未完成批次失效）
+    this._renderToken++
+    if (this._chunkTimer !== null) {
+      clearTimeout(this._chunkTimer)
+      this._chunkTimer = null
     }
+
+    // 移除共享标签引擎中的本层候选
+    this.labelManager?.removeSource(this.labelSourceId)
 
     if (this.leafletLayer && targetMap) {
       targetMap.removeLayer(this.leafletLayer)
@@ -588,6 +746,13 @@ export class GeoDataLayer {
    */
   isVisible(): boolean {
     return this.visible
+  }
+
+  /**
+   * 获取图层名称
+   */
+  getName(): string {
+    return this.name
   }
 
   /**
@@ -625,11 +790,28 @@ export class GeoDataLayer {
 
     // 立即强制重绘所有现有图层（更新 CircleMarker 投影位置）
     this._forceRedrawLayers()
+  }
 
-    // 标签更新
-    if (this.labelsEnabled) {
-      this._updateLabelsThrottled()
-    }
+  /**
+   * 拖拽（纯平移）时按固定间隔节流刷新视口裁剪
+   *
+   * 🔧 修复：原实现只在 moveend 才刷新，拖拽过程中移入视口的要素不出现。
+   * 这里在 move 事件上做固定间隔节流（throttle），拖拽过程中每 150ms 重建一次
+   * 视口裁剪，保证"拖拽实时刷新可视区域"；缩放动画期间的 move 由 _handleZoom 处理。
+   */
+  private _handleMove(): void {
+    if (!this.map || !this.visible) return
+
+    // 固定间隔节流：避免每次 move 都全量重建（move 高频触发）
+    const now = performance.now()
+    if (now - this._lastMoveRenderTime < 150) return
+    this._lastMoveRenderTime = now
+
+    // 缩放动画也触发 move，几何已由 _handleZoom 实时处理，这里跳过
+    if (this.map.getZoom() !== this.currentZoom) return
+
+    // 视口裁剪重建：移入视口的要素实时出现
+    this._reRenderGeometries()
   }
 
   /**
@@ -686,11 +868,6 @@ export class GeoDataLayer {
     // 🔧 修复：直接重新渲染，不使用延迟定时器
     // zoomend 只在动画完成后触发一次，直接执行是安全的
     this._reRenderGeometries()
-
-    // 更新标签
-    if (this.labelsEnabled) {
-      this._updateLabelsThrottled()
-    }
   }
 
   /**
@@ -722,15 +899,12 @@ export class GeoDataLayer {
       this.currentZoom = newZoom
     }
 
-    // 标签更新（使用节流）
-    if (this.labelsEnabled) {
-      this._updateLabelsThrottled()
-    }
+    // 标签由共享 LabelLayoutManager 监听地图事件自行处理视口/缩放，无需在此更新
 
     // 纯平移时直接重新渲染几何图形（视口裁剪需要更新）
-    // 缩放引起的 moveend 不需要在此处理，_handleZoomEnd 已负责
+    // 说明：move 已由 _handleMove 节流实时刷新，此处为 moveend 兜底；
+    // 缩放场景由 _handleZoomEnd 全量重渲染，此处按 zoomChanged 跳过避免重复全量重建
     if (!zoomChanged) {
-      // 取消之前的定时器
       if (this._geometryRenderTimer) {
         clearTimeout(this._geometryRenderTimer)
       }
@@ -760,27 +934,11 @@ export class GeoDataLayer {
     }
 
     if (visible) {
-      // 创建 Canvas 标签层（如果尚未创建）
-      if (!this.canvasLabelLayer) {
-        console.log(`[GeoDataLayer] 创建新的 Canvas 标签层`)
-        this.canvasLabelLayer = new GeoDataCanvasLabelLayer({
-          fontSize: this.labelConfig.fontSize,
-          fontColor: this.labelConfig.color
-        })
-        this.canvasLabelLayer.addTo(this.map)
-      } else {
-        console.log(`[GeoDataLayer] Canvas 标签层已存在`)
-      }
-
-      console.log(`[GeoDataLayer] 调用 _createLabels()`)
+      console.log(`[GeoDataLayer] 注册标签候选到共享布局引擎`)
       this._createLabels(this.map)
     } else {
-      // 移除 Canvas 标签层
-      if (this.canvasLabelLayer) {
-        console.log(`[GeoDataLayer] 移除 Canvas 标签层`)
-        this.map.removeLayer(this.canvasLabelLayer)
-        this.canvasLabelLayer = null
-      }
+      // 从共享标签引擎移除本层候选
+      this.labelManager?.removeSource(this.labelSourceId)
     }
 
     console.log(`[GeoDataLayer] ========== setLabelVisibility 完成 ==========`)
@@ -790,7 +948,17 @@ export class GeoDataLayer {
   /**
    * 设置标签配置
    */
-  setLabelConfig(config: { content: string; color: string; fontSize: number }): this {
+  setLabelConfig(config: {
+    content: string
+    color: string
+    fontSize: number
+    fontFamily?: string
+    bold?: boolean
+    italic?: boolean
+    shadow?: boolean
+    background?: 'none' | 'halo' | 'box'
+    backgroundColor?: string
+  }): this {
     console.log(`[GeoDataLayer] setLabelConfig 被调用:`, {
       id: this.id,
       oldConfig: this.labelConfig,
@@ -801,20 +969,18 @@ export class GeoDataLayer {
     this.labelConfig = {
       content: config.content || 'name',
       color: config.color || '#000000',
-      fontSize: config.fontSize || 12
+      fontSize: config.fontSize || 12,
+      fontFamily: config.fontFamily,
+      bold: config.bold,
+      italic: config.italic,
+      shadow: config.shadow,
+      background: config.background,
+      backgroundColor: config.backgroundColor
     }
 
-    // 更新 Canvas 标签层配置
-    if (this.canvasLabelLayer) {
-      this.canvasLabelLayer.updateConfig({
-        fontColor: this.labelConfig.color,
-        fontSize: this.labelConfig.fontSize
-      })
-    }
-
-    // 如果标签已启用，重新创建标签以应用新配置
+    // 如果标签已启用，重新同步标签候选以应用新配置
     if (this.labelsEnabled && this.map) {
-      console.log(`[GeoDataLayer] 标签已启用，重新创建标签以应用新配置`)
+      console.log(`[GeoDataLayer] 标签已启用，重新同步标签候选以应用新配置`)
       this._createLabels(this.map)
     }
 
@@ -822,86 +988,64 @@ export class GeoDataLayer {
   }
 
   /**
-   * 创建标签 - 使用 Canvas 渲染
+   * 同步标签候选到共享标签布局引擎
    *
-   * 🔧 延时显示方式：创建所有元素的标签，由 Canvas 层根据屏幕可见性动态渲染
-   *
-   * 优化策略：
-   * - 创建所有元素的标签数据（不使用视口裁剪）
-   * - Canvas 层根据屏幕坐标判断可见性
-   * - 地图移动时标签自动跟随显示/隐藏
-   * - 使用 Canvas 代替 DOM 元素，性能更好
+   * 所有元素的标签候选（地理坐标 + 文本 + 样式）注册到 LabelLayoutManager，
+   * 由引擎按屏幕空间统一做矩形碰撞检测与避让，跨图层全局不重叠；
+   * 视口裁剪、地图移动/缩放后的显隐均由引擎处理。
    */
-  private _createLabels(map: L.Map): void {
-    // 防御性检查：确保只在图层可见时才创建标签
-    if (!this.visible) {
-      console.log('[GeoDataLayer] ⚠️ _createLabels: 图层不可见，跳过标签创建')
+  private _createLabels(_map: L.Map): void {
+    if (!this.labelManager) return
+
+    // 标签开关关闭或图层不可见：清空本层候选
+    if (!this.labelsEnabled || !this.visible) {
+      this.labelManager.removeSource(this.labelSourceId)
       return
     }
 
-    // 确保 Canvas 标签层已创建
-    if (!this.canvasLabelLayer) {
-      this.canvasLabelLayer = new GeoDataCanvasLabelLayer({
-        fontSize: this.labelConfig.fontSize,
-        fontColor: this.labelConfig.color
-      })
-      this.canvasLabelLayer.addTo(map)
-    }
-
-    console.log('[GeoDataLayer] ========== _createLabels 开始（延时显示模式）=========')
-    console.log('[GeoDataLayer] id:', this.id, 'geometryType:', this.geometryType)
-    console.log('[GeoDataLayer] 数据量:', this.data.length, 'zoom:', this.currentZoom)
-
-    // 🔧 延时显示方式：收集所有元素的标签数据，不使用视口裁剪
-    // Canvas 层会根据屏幕坐标动态判断哪些标签应该显示
-    const labels: CanvasLabelData[] = []
-
+    const candidates: LabelCandidate[] = []
     let skippedNoPosition = 0
     let skippedNoContent = 0
 
     for (let i = 0; i < this.data.length; i++) {
       const item = this.data[i]
 
-      // 获取位置
       const latLng = this._getLatLng(item)
       if (!latLng) {
         skippedNoPosition++
         continue
       }
 
-      // 🔧 移除视口裁剪：创建所有元素的标签
-      // Canvas 层会在渲染时根据屏幕坐标判断可见性
-      // 这样地图移动时新进入视窗的元素会自动显示标签
-
-      // 获取标签内容
-      const content = this._getLabelContent(item, i)
+      const content = this._getLabelContent(item)
       if (!content) {
         skippedNoContent++
         continue
       }
 
-      labels.push({
-        index: i,
-        position: latLng,
-        content
+      candidates.push({
+        id: String(i),
+        lat: latLng.lat,
+        lng: latLng.lng,
+        text: content,
+        fontSize: this.labelConfig.fontSize,
+        fontFamily: this.labelConfig.fontFamily,
+        bold: this.labelConfig.bold,
+        italic: this.labelConfig.italic,
+        shadow: this.labelConfig.shadow,
+        background: this.labelConfig.background,
+        backgroundColor: this.labelConfig.backgroundColor,
+        color: this.labelConfig.color
       })
     }
 
-    console.log('[GeoDataLayer] 标签收集统计（所有元素，无视口裁剪）:')
-    console.log('  - 无位置:', skippedNoPosition)
-    console.log('  - 无内容:', skippedNoContent)
-    console.log('  - ✅ 创建标签:', labels.length, '/', this.data.length)
-
-    // 更新到 Canvas 图层
-    this.canvasLabelLayer.setLabels(labels)
-
-    console.log('[GeoDataLayer] ========== _createLabels 完成 ==========')
+    console.log(`[GeoDataLayer] 标签候选注册: ${candidates.length}/${this.data.length}（无位置 ${skippedNoPosition}，无内容 ${skippedNoContent}）`)
+    this.labelManager.setCandidates(this.labelSourceId, candidates)
   }
 
   /**
    * 获取标签内容
    */
-  private _getLabelContent(dataItem: GeoDataItem, index: number): string {
+  private _getLabelContent(dataItem: GeoDataItem): string {
     if (!dataItem) return ''
 
     // 根据 labelConfig.content 获取字段值
@@ -909,7 +1053,7 @@ export class GeoDataLayer {
 
     // 如果是 'name' 或默认，使用 item.name
     if (field === 'name') {
-      return dataItem.name || this._getDefaultLabel(index)
+      return dataItem.name || ''
     }
 
     // 从 properties 中获取字段值（根级：OnlineMap 将整条 item 存入 properties，所以此处查 item 根字段）
@@ -923,24 +1067,9 @@ export class GeoDataLayer {
       return String(dataItem.properties.properties[field])
     }
 
-    // 回退到 name
-    return dataItem.name || this._getDefaultLabel(index)
-  }
-
-  /**
-   * 获取默认标签文本
-   */
-  private _getDefaultLabel(index: number): string {
-    switch (this.geometryType) {
-      case 'point':
-        return `点${index + 1}`
-      case 'sector':
-        return `扇区${index + 1}`
-      case 'polygon':
-        return `多边形${index + 1}`
-      default:
-        return `要素${index + 1}`
-    }
+    // 严格按用户选择的标签字段显示：所选字段缺失时不回退到 name/默认标签，
+    // 直接返回空串（该要素不在地图显示标签）
+    return ''
   }
 
   /**
@@ -990,6 +1119,40 @@ export class GeoDataLayer {
   }
 
   /**
+   * 设置测距模式
+   * 测距时所有要素不参与 Canvas 命中检测（options.interactive=false）：
+   * 面状要素的 click stopPropagation 不再吞掉地图 click（测量无法加点），悬停 tooltip 也不弹出。
+   * Canvas 渲染器在命中检测时实时读取 options.interactive，无需重绘；
+   * 测距期间新渲染的要素在创建时按此标志设置 interactive。
+   * @param enabled 是否启用测距模式
+   */
+  setMeasureMode(enabled: boolean): void {
+    this.measureMode = enabled
+    if (this.leafletLayer) {
+      this.leafletLayer.eachLayer((layer: any) => {
+        if (layer.options) {
+          layer.options.interactive = !enabled
+        }
+        if (enabled && layer.closeTooltip) {
+          layer.closeTooltip()
+        }
+      })
+    }
+  }
+
+  /**
+   * 把 canvas 渲染层移到 pane 顶部，使其成为点击命中目标。
+   * 对 Canvas，路径 bringToFront 只重绘不移动 DOM，必须直接操作 canvas 元素。
+   */
+  bringToFrontForZOrder(): void {
+    const renderer = this.canvasRenderer as any
+    const container = renderer?._container as HTMLElement | undefined
+    if (container && container.parentNode) {
+      container.parentNode.appendChild(container)
+    }
+  }
+
+  /**
    * 设置框选高亮
    * @param ids 选中的要素ID集合，null表示清除
    */
@@ -1010,11 +1173,14 @@ export class GeoDataLayer {
               color: layer.options.color,
               weight: layer.options.weight,
               fillColor: layer.options.fillColor,
-              fillOpacity: layer.options.fillOpacity
+              fillOpacity: layer.options.fillOpacity,
+              // 记录描边开关：无色边框要素为 stroke:false，恢复时需还原
+              stroke: layer.options.stroke !== false
             })
           }
-          // 应用高亮样式：红色边框
+          // 应用高亮样式：红色边框（stroke:false 要素临时恢复描边，否则高亮不可见）
           layer.setStyle({
+            stroke: true,
             color: '#ef4444',
             weight: 3,
             fillColor: layer.options.fillColor, // 保持原填充色
@@ -1027,10 +1193,11 @@ export class GeoDataLayer {
           if (originalStyle) {
             layer.setStyle(originalStyle)
             this.originalStyles.delete(layer)
-          } else {
-            // 如果没有保存的样式，使用默认样式
-            layer.setStyle(this._getDefaultStyle())
           }
+          // 无保存的原始样式说明该要素从未被高亮过，其样式本就是渲染时的正确状态
+          // （点半径为按缩放动态计算的像素半径、配色含专题/用户覆盖）。
+          // 不再 setStyle(_getDefaultStyle())：那会把半径强制改为固定 10px、
+          // 并把配色改回基础色，导致圈选时未选中的点突然变大且专题配色丢失。
         }
       } else if (layer instanceof L.Marker) {
         // Marker（点要素）高亮：修改DOM元素添加高亮边框
@@ -1054,19 +1221,235 @@ export class GeoDataLayer {
   }
 
   /**
-   * 获取默认样式
+   * 计算要素的专题样式（按字段值匹配区间/文本配色）
+   * - fillColor: 专题填充配色
+   * - borderColor: 专题边框色（用户配置；'none'=无色不描边；undefined=未配置，边框用专题色）
+   * - fillOpacity: 专题图形透明度（缺省不覆盖，回退基础配置/默认样式）
+   * @returns 或 null（未启用专题）
    */
-  private _getDefaultStyle(): any {
-    switch (this.geometryType) {
-      case 'point':
-        return DEFAULT_POINT_STYLE
-      case 'sector':
-        return DEFAULT_SECTOR_STYLE
-      case 'polygon':
-        return DEFAULT_POLYGON_STYLE
-      default:
-        return DEFAULT_POINT_STYLE
+  private _thematicStyleFor(item: GeoDataItem): { fillColor: string; borderColor?: string; fillOpacity?: number } | null {
+    const ts = this.thematicSettings
+    if (!ts || !ts.enabled || !ts.field) return null
+    const color = matchThematicColor(ts, getFieldValue(item.properties, ts.field))
+    return {
+      fillColor: color,
+      borderColor: ts.borderColor,
+      ...(typeof ts.fillOpacity === 'number' ? { fillOpacity: ts.fillOpacity } : {})
     }
+  }
+
+  /**
+   * 将颜色覆盖合并到基础样式（专题启用时优先于基础覆盖）
+   * 映射：fillColor→fillColor，fillOpacity→fillOpacity，borderColor→color，borderWidth→weight
+   * 填充色为无色哨兵（NO_FILL_COLOR）时转为 fill:false（镂空，仅显示边框）；
+   * 边框色为无色哨兵时转为 stroke:false（不描边）。
+   */
+  private _mergeStyleOverrides(baseStyle: any, item?: GeoDataItem): any {
+    let style = baseStyle
+    if (this.styleOverrides) {
+      style = {
+        ...baseStyle,
+        fillColor: this.styleOverrides.fillColor,
+        fillOpacity: this.styleOverrides.fillOpacity,
+        color: this.styleOverrides.borderColor,
+        weight: this.styleOverrides.borderWidth,
+        opacity: 1
+      }
+    }
+    if (item && this.thematicSettings?.enabled) {
+      const t = this._thematicStyleFor(item)
+      if (t) {
+        style = {
+          ...style,
+          fillColor: t.fillColor,
+          // 边框色：专题显式配置优先（'none'=无色 → 不描边）；未配置时专题填充色即
+          // 边框色，填充无色（镂空）则保留基础/默认边框色
+          ...(t.borderColor
+            ? (t.borderColor === NO_FILL_COLOR ? { stroke: false } : { color: t.borderColor })
+            : (t.fillColor !== NO_FILL_COLOR ? { color: t.fillColor } : {})),
+          ...(typeof t.fillOpacity === 'number' ? { fillOpacity: t.fillOpacity } : {})
+        }
+      }
+    }
+    // 无色（镂空）：面/点不填充，仅描边
+    if (style.fillColor === NO_FILL_COLOR) {
+      style = { ...style, fill: false }
+    }
+    // 边框无色：不描边（stroke:false），color 置基础色占位避免非法颜色
+    if (style.color === NO_FILL_COLOR) {
+      style = { ...style, stroke: false, color: baseStyle.color }
+    }
+    return style
+  }
+
+  /**
+   * 设置图层颜色覆盖（图形颜色 / 透明度 / 边框宽度 / 边框颜色）
+   * 立即应用到已渲染的几何，后续重渲染也会沿用覆盖。
+   *
+   * 采用「全量重渲染」而非逐要素 setStyle：
+   * - 所有渲染函数在创建几何时都会调 _mergeStyleOverrides 读取 styleOverrides，
+   *   因此重建图层必然带上新颜色，避免不同要素类型（circleMarker/polygon）与
+   *   Canvas 渲染器在 setStyle 重绘上的细微差异导致不生效。
+   */
+  setStyleOverrides(settings: { fillColor: string; fillOpacity: number; borderWidth: number; borderColor: string; pointSize?: number } | null): void {
+    // null = 清除图层级颜色覆盖：恢复到逐要素自带样式（_mergeStyleOverrides 在
+    // styleOverrides 为 null 时自然回退 baseStyle）。设置弹窗"取消实时预览"时用它还原，
+    // 不能拿弹窗构造的文件默认样式顶替——文件级 defaultStyle 并不参与渲染链，颜色可能不一致。
+    this.styleOverrides = settings
+
+    // 未渲染/不可见时仅保存覆盖，几何由后续 addTo/_reRenderGeometries 统一按新覆盖渲染
+    if (!this.map || !this.leafletLayer || !this.visible) return
+
+    this._reRenderGeometries()
+  }
+
+  /**
+   * 设置专题图层覆盖（与基础配置相互独立：专题启用时优先渲染；null 关闭专题后由渲染层回退到基础配置色）
+   */
+  setThematicOverrides(settings: ThematicSettings | null): void {
+    this.thematicSettings = settings
+    // 关闭专题时不清除基础配置：基础配置与专题图层相互独立，
+    // 专题关闭时由 _mergeStyleOverrides 自然回退到基础配置色（无基础配置则用导入默认色）。
+    this.computeThematicStats()
+
+    // 未渲染/不可见时仅保存覆盖，几何由后续 addTo/_reRenderGeometries 统一按新覆盖渲染
+    if (!this.map || !this.leafletLayer || !this.visible) return
+
+    this._reRenderGeometries()
+  }
+
+  /**
+   * 计算专题图例统计（各配色模式的要素数与总数，供图例展示）
+   * - 区间配色：counts[每区间] + other（未匹配）
+   * - 属性值配色：counts[每个值] + other（未配置值）
+   * - 文本配色：counts[每个类别，含 __other__] + other（无兜底时的未列出值）
+   */
+  private computeThematicStats(): void {
+    const ts = this.thematicSettings
+    if (!ts?.enabled || !this.data || this.data.length === 0) {
+      this.thematicStats = null
+      return
+    }
+    const isRange = ts.fieldType === 'numeric' && ts.colorMode !== 'value' && ts.ranges.length > 0
+    const isValue = ts.fieldType === 'numeric' && ts.colorMode === 'value' && (ts.valueColors?.length ?? 0) > 0
+    const isText = ts.fieldType === 'text' && ts.categories.length > 0
+    if (!isRange && !isValue && !isText) {
+      this.thematicStats = null
+      return
+    }
+    const counts = new Array(
+      isRange ? ts.ranges.length : isValue ? ts.valueColors!.length : ts.categories.length
+    ).fill(0)
+    let total = 0
+    let other = 0
+    if (isRange) {
+      for (const item of this.data) {
+        total++
+        const idx = matchRangeIndex(ts, getFieldValue(item.properties, ts.field))
+        if (idx >= 0) counts[idx]++; else other++
+      }
+    } else if (isValue) {
+      const valueIndex = new Map(ts.valueColors!.map((c, i) => [c.value, i]))
+      for (const item of this.data) {
+        total++
+        const raw = getFieldValue(item.properties, ts.field)
+        if (!hasValue(raw)) { other++; continue }
+        const idx = valueIndex.get(String(raw))
+        if (idx !== undefined) counts[idx]++; else other++
+      }
+    } else {
+      const otherIdx = ts.categories.findIndex(c => c.value === '__other__')
+      const categoryIndex = new Map(ts.categories.map((c, i) => [c.value, i]))
+      for (const item of this.data) {
+        total++
+        const raw = getFieldValue(item.properties, ts.field)
+        if (!hasValue(raw)) { if (otherIdx >= 0) counts[otherIdx]++; else other++; continue }
+        const idx = categoryIndex.get(String(raw))
+        if (idx !== undefined) counts[idx]++
+        else if (otherIdx >= 0) counts[otherIdx]++
+        else other++
+      }
+    }
+    this.thematicStats = { counts, total, other }
+  }
+
+  /**
+   * 获取专题区间统计（图例显示每个区间的个数与占比；other = 未匹配区间/无兜底分类的要素数）
+   */
+  getThematicStats(): { counts: number[]; total: number; other: number } | null {
+    return this.thematicStats
+  }
+
+  /**
+   * 获取图层全部要素的地理范围（图层预览：居中最大化显示）
+   * 注意：视口裁剪下已渲染几何可能为空，必须从数据源计算
+   * @returns LatLngBounds；无要素返回 null
+   */
+  getFeaturesBounds(): L.LatLngBounds | null {
+    if (!this.data || this.data.length === 0) return null
+    const bounds = L.latLngBounds([])
+    let has = false
+    for (const item of this.data) {
+      try {
+        // 无效坐标（工参/撒点解析失败默认 (0,0)、越界值）不并入包围盒：
+        // 否则双击"显示全部"会被拉到印度洋（视野覆盖非洲-印度洋-亚洲）
+        const isValid = (lat: number | undefined, lng: number | undefined): boolean =>
+          typeof lat === 'number' && typeof lng === 'number'
+          && !(lat === 0 && lng === 0)
+          && Math.abs(lng) <= 180 && Math.abs(lat) <= 90
+        if (Array.isArray(item.path) && item.path.length > 0) {
+          for (const p of item.path) {
+            const plat: number | undefined = p[0]
+            const plng: number | undefined = p[1]
+            if (!isValid(plat, plng)) continue
+            bounds.extend([plat as number, plng as number])
+            has = true
+          }
+        } else {
+          const lat = item.displayLat ?? item.latitude
+          const lng = item.displayLng ?? item.longitude
+          if (isValid(lat, lng)) {
+            bounds.extend([lat as number, lng as number])
+            has = true
+          }
+        }
+      } catch { /* 忽略单要素异常 */ }
+    }
+    return has ? bounds : null
+  }
+
+  /**
+   * 收集热力图点（渲染坐标 GCJ02 + 字段权重）：
+   * - 点/扇区：displayLat/displayLng 优先，否则现场纠偏
+   * - 多边形：外环顶点质心
+   * - 权重字段非数值的要素跳过
+   */
+  getHeatPoints(field: string): HeatPoint[] {
+    if (!this.data || this.data.length === 0 || !field) return []
+    const points: HeatPoint[] = []
+    for (const item of this.data) {
+      const weight = toNumber(getFieldValue(item.properties, field))
+      if (weight === null) continue
+
+      let lat: number | undefined
+      let lng: number | undefined
+      if (Array.isArray(item.path) && item.path.length > 0) {
+        const c = centroidFromLatLngRing(item.path)
+        lat = c?.lat
+        lng = c?.lng
+      } else if (item.latitude !== undefined && item.longitude !== undefined) {
+        if (item.displayLat !== undefined && item.displayLng !== undefined) {
+          lat = item.displayLat
+          lng = item.displayLng
+        } else {
+          [lat, lng] = CoordinateTransformer.wgs84ToGcj02(item.latitude, item.longitude)
+        }
+      }
+      if (typeof lat !== 'number' || typeof lng !== 'number') continue
+      if (!Number.isFinite(lat) || !Number.isFinite(lng)) continue
+      points.push({ lat, lng, weight })
+    }
+    return points
   }
 
   /**
@@ -1086,41 +1469,86 @@ export class GeoDataLayer {
 
   /**
    * 获取多边形内的要素（用于框选）
-   * @param polygon Leaflet多边形对象
+   *
+   * 🔧 遍历完整数据集（this.data）而非仅已渲染的 leafletLayer。
+   * 原先只遍历 leafletLayer，而 GeoDataLayer 在地图平移/缩放时会做视口裁剪
+   * （_reRenderGeometries 仅保留视口内要素），导致位于视口外的要素被物理移除，
+   * 框选（多边形/矩形）无法命中它们——表现为只有扇区图层可圈选、点/面图层无效。
+   * 改为直接使用原始坐标遍历全量数据，与 SectorRendererSVG.getSectorsInPolygon 保持一致。
+   *
+   * @param polygon Leaflet多边形对象（坐标为渲染坐标/GCJ02）
    */
-  getFeaturesInPolygon(polygon: L.Polygon): GeoDataItem[] {
-    if (!this.leafletLayer) return []
+  /**
+   * 圈选附带几何（GCJ02）：点用 display 坐标；面/线用 path（[lat,lng] → [lng,lat]）。
+   * 供跨图层复制粘贴使用。
+   */
+  private buildItemGeometry(item: GeoDataItem): { type: string; coordinates: any } | undefined {
+    if (item.path && item.path.length >= 2) {
+      const coords = item.path.map(pt => [pt[1], pt[0]] as [number, number])
+      if (this.geometryType === 'polygon' && item.path.length >= 3) {
+        const ring = [...coords]
+        const a = ring[0]
+        const b = ring[ring.length - 1]
+        if (a[0] !== b[0] || a[1] !== b[1]) ring.push(a)
+        return { type: 'Polygon', coordinates: [ring] }
+      }
+      return { type: 'LineString', coordinates: coords }
+    }
+    const lat = item.displayLat ?? item.latitude
+    const lng = item.displayLng ?? item.longitude
+    if (lat !== undefined && lng !== undefined) {
+      return { type: 'Point', coordinates: [lng, lat] }
+    }
+    return undefined
+  }
+
+  getFeaturesInPolygon(polygon: L.Polygon, byAnchor: boolean = false): GeoDataItem[] {
     const results: GeoDataItem[] = []
+    if (!this.data || this.data.length === 0) return results
+
     const bounds = polygon.getBounds()
     // 将多边形顶点转为 [lat, lng] 二维数组用于射线法判断
     const polygonPoints: number[][] = (polygon.getLatLngs()[0] as L.LatLng[]).map(p => [p.lat, p.lng])
 
-    this.leafletLayer.eachLayer((layer: any) => {
-      let isInside = false
-      let layerLatLng: L.LatLng | null = null
-
-      if (layer.getLatLng) {
-        // 点要素（CircleMarker）
-        layerLatLng = layer.getLatLng()
-        if (bounds.contains(layerLatLng)) {
-          isInside = GeoDataLayer._isPointInPolygon([layerLatLng.lat, layerLatLng.lng], polygonPoints)
+    for (const item of this.data) {
+      // 边界选择锚点口径：仅要素归属经纬度（点=自身；线/面=包围盒中心）落入才选中，
+      // 保证相邻边界选择时同一要素不会被重复选中。点/线/面统一经 geometryAnchor 判定。
+      if (byAnchor) {
+        const anchor = geometryAnchor(this.buildItemGeometry(item))
+        if (anchor
+          && bounds.contains([anchor.lat, anchor.lng])
+          && GeoDataLayer._isPointInPolygon([anchor.lat, anchor.lng], polygonPoints)) {
+          results.push({ name: item.name, properties: item.properties, geometry: this.buildItemGeometry(item) })
         }
-      } else if (layer.getBounds) {
-        // 线/面要素：检查中心点
-        const layerBounds = layer.getBounds()
-        layerLatLng = layerBounds.getCenter()
-        if (bounds.contains(layerLatLng)) {
-          isInside = GeoDataLayer._isPointInPolygon([layerLatLng.lat, layerLatLng.lng], polygonPoints)
-        }
+        continue
       }
 
-      if (isInside && layer.options?.properties) {
-        results.push({
-          name: layer.options.name || layer.options.properties?.name,
-          properties: layer.options.properties
-        })
+      // 面状要素：以其任一顶点是否落在框选范围内判定（覆盖整片区域被框住的情况）
+      if (this.geometryType === 'polygon' && item.path && item.path.length > 0) {
+        const inside = item.path.some(pt =>
+          bounds.contains([pt[ 0], pt[1]]) &&
+          GeoDataLayer._isPointInPolygon([pt[0], pt[1]], polygonPoints)
+        )
+        if (inside) {
+          results.push({ name: item.name, properties: item.properties, geometry: this.buildItemGeometry(item) })
+        }
+        continue
       }
-    })
+
+      if (item.longitude === undefined || item.latitude === undefined) continue
+
+      // 与渲染逻辑保持一致：优先 display 坐标，否则由 GCJ02 转换
+      const [dLat, dLng] = (item.displayLat !== undefined && item.displayLng !== undefined)
+        ? [item.displayLat, item.displayLng]
+        : CoordinateTransformer.wgs84ToGcj02(item.latitude, item.longitude)
+
+      if (
+        bounds.contains([dLat, dLng]) &&
+        GeoDataLayer._isPointInPolygon([dLat, dLng], polygonPoints)
+      ) {
+        results.push({ name: item.name, properties: item.properties, geometry: this.buildItemGeometry(item) })
+      }
+    }
 
     return results
   }
@@ -1151,9 +1579,52 @@ export class GeoDataLayer {
       }
 
       if (isInside && layer.options?.properties) {
+        const srcItem = this.data.find(d => d.properties === layer.options.properties)
         results.push({
           name: layer.options.name || layer.options.properties?.name,
-          properties: layer.options.properties
+          properties: layer.options.properties,
+          geometry: srcItem ? this.buildItemGeometry(srcItem) : undefined,
+        })
+      }
+    })
+
+    return results
+  }
+
+  /** 获取底层 Leaflet 图层（只读遍历用，如编辑态自动捕获节点收集可见图层顶点） */
+  getLeafletLayer(): L.LayerGroup | null {
+    return this.leafletLayer
+  }
+
+  /**
+   * 获取点击位置精确命中的要素（用于「点击查属性」）
+   *
+   * 与 getFeaturesInCircle（包围盒/中心粗检，供圈选/点选工具使用）不同：
+   * 面要素按点击点是否落在封闭区域内判定，仅包围盒/边框相交不算命中，
+   * 避免点击面内部时因其他要素包围盒压到点击点而误弹重叠列表；
+   * 点要素按像素距离、线要素按到折线段的像素距离判定。
+   * 命中附带 hitType（direct/border）供调用方做穿透收敛。
+   *
+   * @param latlng 点击位置（渲染坐标/GCJ02）
+   * @param tolerancePx 像素容差
+   */
+  getFeaturesAtPoint(
+    latlng: L.LatLng,
+    tolerancePx: number = CLICK_HIT_TOLERANCE_PX
+  ): Array<GeoDataItem & { hitType: FeatureHitType; distancePx: number }> {
+    if (!this.leafletLayer || !this.map) return []
+    const results: Array<GeoDataItem & { hitType: FeatureHitType; distancePx: number }> = []
+
+    this.leafletLayer.eachLayer((layer: any) => {
+      if (!layer.options?.properties) return
+      const hit = layerHitAt(this.map!, layer, latlng, tolerancePx)
+      if (hit) {
+        results.push({
+          name: layer.options.name || layer.options.properties?.name,
+          properties: layer.options.properties,
+          geometry: layerGeometry(layer) ?? undefined,
+          hitType: hit.type,
+          distancePx: hit.distancePx,
         })
       }
     })
@@ -1162,56 +1633,6 @@ export class GeoDataLayer {
   }
 
   /**
-   * 节流更新标签（用于地图移动和缩放）
-   *
-   * 🔧 延时显示模式：
-   * - 首次创建时调用 _createLabels() 创建所有元素的标签
-   * - 地图移动时调用 updateViewport() 更新标签可见性
-   * - 新进入视窗的元素自动显示标签，移出视窗的自动隐藏
-   */
-  private _updateLabelsThrottled(): void {
-    console.log('[GeoDataLayer] _updateLabelsThrottled 被调用:', {
-      hasCanvasLabelLayer: !!this.canvasLabelLayer,
-      hasMap: !!this.map,
-      existingLabels: this.canvasLabelLayer?.getLabelCount() || 0
-    })
-
-    if (!this.canvasLabelLayer || !this.map) {
-      console.log('[GeoDataLayer] _updateLabelsThrottled: 跳过（缺少 Canvas 层或地图）')
-      return
-    }
-
-    // 防抖：150ms 内只执行一次
-    if (this._mapMoveTimer) {
-      clearTimeout(this._mapMoveTimer)
-      console.log('[GeoDataLayer] _updateLabelsThrottled: 取消之前的定时器')
-    }
-
-    this._mapMoveTimer = window.setTimeout(() => {
-      if (!this.canvasLabelLayer || !this.map) return
-
-      const existingLabelCount = this.canvasLabelLayer.getLabelCount()
-      console.log('[GeoDataLayer] _updateLabelsThrottled: 定时器触发，现有标签数 =', existingLabelCount)
-
-      // 🔧 延时显示模式：只更新标签可见性，不重新创建
-      // 首次调用 _createLabels() 时已创建所有元素的标签
-      // 后续只需更新屏幕坐标和可见性即可
-      if (existingLabelCount === 0) {
-        // 没有标签数据，首次创建
-        console.log('[GeoDataLayer] _updateLabelsThrottled: 首次创建标签，调用 _createLabels()')
-        this._createLabels(this.map)
-      } else {
-        // 有标签数据，只更新可见性
-        const bounds = this.map.getBounds()
-        const zoom = this.map.getZoom()
-        console.log('[GeoDataLayer] _updateLabelsThrottled: 更新标签可见性')
-        this.canvasLabelLayer.updateViewport(bounds, zoom)
-      }
-
-      this._mapMoveTimer = null
-    }, 150) as unknown as number
-  }
-
   /**
    * 获取元素的 LatLng 位置
    */
@@ -1268,6 +1689,13 @@ export class GeoDataLayer {
 
     console.log('[GeoDataLayer] _reRenderGeometries: 重新渲染几何图形（启用视口裁剪）')
 
+    // 取消分块渲染（移动/缩放过时，改由本方法同步渲染当前视口）
+    this._renderToken++
+    if (this._chunkTimer !== null) {
+      clearTimeout(this._chunkTimer)
+      this._chunkTimer = null
+    }
+
     // 清空现有图层
     this.leafletLayer.clearLayers()
 
@@ -1300,12 +1728,29 @@ export class GeoDataLayer {
 export class GeoDataLayerManager {
   private layers: Map<string, GeoDataLayer> = new Map()
   private map: L.Map | null = null
+  /** 共享标签布局引擎（所有图层的标签统一防重叠） */
+  private labelManager: LabelLayoutManager | null = null
+  /** 测距模式标志：新增图层时自动应用（测距中加载的图层也要穿透） */
+  private measureMode: boolean = false
 
   /**
    * 初始化管理器
    */
-  init(map: L.Map): void {
+  init(map: L.Map, labelManager?: LabelLayoutManager | null): void {
     this.map = map
+    if (labelManager !== undefined) this.labelManager = labelManager
+  }
+
+  /**
+   * 设置所有图层的测距模式
+   * 测距时要素不参与鼠标命中检测，点击/悬停穿透到地图（测量加点不被面状要素拦截）
+   * @param enabled 是否启用测距模式
+   */
+  setMeasureMode(enabled: boolean): void {
+    this.measureMode = enabled
+    this.layers.forEach(layer => {
+      layer.setMeasureMode(enabled)
+    })
   }
 
   /**
@@ -1320,7 +1765,21 @@ export class GeoDataLayerManager {
     console.log('[GeoDataLayerManager] data.length:', options.data.length)
     console.log('[GeoDataLayerManager] map 已初始化:', !!this.map)
 
-    const layer = new GeoDataLayer(options)
+    // 若已存在同 id 图层，先移除旧实例（避免切换/重复加载导致地图叠加）
+    const existing = this.layers.get(options.id)
+    if (existing && this.map) {
+      console.log('[GeoDataLayerManager] 存在同 id 旧图层，先移除:', options.id)
+      existing.remove(this.map)
+    }
+
+    // 注入共享标签布局引擎（标签统一防重叠）
+    const layer = new GeoDataLayer(this.labelManager
+      ? { ...options, labelManager: this.labelManager }
+      : options)
+    // 测距中加载的新图层自动继承测距模式（要素点击穿透到地图）
+    if (this.measureMode) {
+      layer.setMeasureMode(true)
+    }
     this.layers.set(options.id, layer)
     console.log('[GeoDataLayerManager] GeoDataLayer 已创建并存储')
 
@@ -1348,6 +1807,13 @@ export class GeoDataLayerManager {
       layer.remove(this.map)
     }
     this.layers.delete(layerId)
+  }
+
+  /**
+   * 遍历所有已注册图层
+   */
+  forEachLayer(cb: (layer: GeoDataLayer, id: string) => void): void {
+    this.layers.forEach((layer, id) => cb(layer, id))
   }
 
   /**

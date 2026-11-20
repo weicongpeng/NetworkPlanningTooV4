@@ -17,6 +17,21 @@ export type NetworkType = 'LTE' | 'NR'
 export type CellCoverType = 1 | 4  // 1=室外小区(扇形60m/40度), 4=室内小区(圆形30m)
 
 /**
+ * 基站字段展示别名 → 扇区数据真实字段名
+ * 预置字段清单（标签/专题/热力图共用）使用展示名，按字段取数时需映射回真实字段
+ */
+export const SECTOR_FIELD_ALIAS: Record<string, string> = {
+  coverageType: 'cell_cover_type',
+  isShared: 'is_shared',
+  firstGroup: 'first_group'
+}
+
+/** 解析基站字段名：别名映射为真实字段名，其余原样返回 */
+export function resolveSectorField(field: string): string {
+  return SECTOR_FIELD_ALIAS[field] ?? field
+}
+
+/**
  * 扇区样式配置
  */
 export interface SectorStyle {
@@ -82,19 +97,19 @@ export interface PerformanceTarget {
 export const SECTOR_CONFIG: Record<NetworkType, SectorStyle> = {
   LTE: {
     color: '#3b82f6',      // 蓝色
-    opacity: 1,            // 0%透明度（完全不透明）
+    opacity: 1,            // 图形透明度 100%（完全不透明）
     radius: 60,            // 60米（默认，会根据覆盖类型调整）
     angle: 40,             // 40度夹角（默认，会根据覆盖类型调整）
     strokeColor: '#000000',
-    strokeWidth: 0.5
+    strokeWidth: 1         // 边框宽度 1px（与"默认设置"面板初始值一致）
   },
   NR: {
     color: '#10b981',      // 绿色
-    opacity: 1,            // 0%透明度（完全不透明）
+    opacity: 1,            // 图形透明度 100%（完全不透明）
     radius: 60,            // 60米（默认，会根据覆盖类型调整）
     angle: 40,             // 40度夹角（默认，会根据覆盖类型调整）
     strokeColor: '#000000',
-    strokeWidth: 0.5
+    strokeWidth: 1         // 边框宽度 1px（与"默认设置"面板初始值一致）
   }
 } as const
 
