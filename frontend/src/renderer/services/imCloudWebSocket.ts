@@ -209,7 +209,7 @@ class ImCloudWebSocketClient {
   private scheduleRetry(): void {
     if (this.stopped || this.retryTimer !== null) return
     this.retry += 1
-    const delay = Math.min(1000 * 2 ** Math.min(this.retry, 5), MAX_RETRY_DELAY_MS)
+    const delay = Math.min(500 * 2 ** Math.min(this.retry, 5), MAX_RETRY_DELAY_MS)
     this.retryTimer = window.setTimeout(() => {
       this.retryTimer = null
       if (!this.stopped) this.open()

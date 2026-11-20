@@ -38,7 +38,7 @@ class WebSocketService {
   private globalCallbacks: Set<GlobalCallback> = new Set()
   private reconnectAttempts = 0
   private maxReconnectAttempts = 2  // 减少重连次数，更快降级到轮询
-  private reconnectDelay = 3000
+  private reconnectDelay = 1500
   private heartbeatInterval: NodeJS.Timeout | null = null
   private isConnecting = false
   private usePollingFallback = false

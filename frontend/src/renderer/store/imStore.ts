@@ -125,8 +125,8 @@ function currentUserId(): number | null {
 const MESSAGE_WINDOW_SIZE = 300
 /** incremental 一次最多翻的页数，防止断线积压 / 病态数据把一次刷新拖成死循环 */
 const MAX_INCREMENTAL_PAGES = 10
-/** 「红点有、正文没来」的补洞节流，避免每次轮询都重拉最新一页 */
-const HOLE_FILL_THROTTLE_MS = 5000
+/** 「红点有、正文没来」的补洞节流；5s 会让 WS 丢通知时约 6s 才看到正文 */
+const HOLE_FILL_THROTTLE_MS = 800
 
 interface MessagePage {
   items: ImMessage[]
@@ -1019,6 +1019,13 @@ export const useImStore = create<ImState>()(
           conversations: s.conversations.map(c => c.other_user?.id === userId
             ? { ...c, other_user: { ...c.other_user, is_online: online } } : c),
         }))
+        // WS 断开广播的 offline 不等于真离线：桌面端云 WS 抖动会触发它，
+        // 但服务器 session 仍有 5 分钟窗口。用通讯录 DB 状态异步校准，避免误判。
+        if (!online) {
+          window.setTimeout(() => {
+            void useImStore.getState().refreshContacts().catch(() => {})
+          }, 600)
+        }
       },
 
       resync: () => {

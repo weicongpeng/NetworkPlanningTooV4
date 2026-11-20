@@ -304,6 +304,16 @@ async def desktop_session_check(
     desktop_license_service.mirror_client_version(db, record, payload.client_version)
     db.commit()
 
+    # 心跳即在线：同步广播到服务器内存 presence，纠正云 WS 抖动被广播 offline
+    # 导致「桌面在线、网页显示离线」。DB session 已是权威，这里只是即时校准。
+    try:
+        from app.services.websocket_manager import websocket_manager
+
+        websocket_manager.notify_im_presence(
+            {"user_id": session.user_id, "online": True})
+    except Exception:  # noqa: BLE001 - presence 广播非关键，失败不影响会话有效性
+        pass
+
     data: Dict[str, Any] = {"valid": True}
     user = db.query(User).filter(User.id == session.user_id).first()
     if user is not None:
