@@ -66,11 +66,13 @@ def _default_state() -> Dict[str, Any]:
         "last_result": None,
         "last_error": None,
         "server_fingerprint": None,  # 服务器上次已知的本组数据指纹（变更监听基线）
+        # 跨档切换前的旧待上行状态快照：冻结后只 pull 不 push，用户确认后才能放行
+        "frozen_local_changes": None,
     }
 
 
-def load_state() -> Dict[str, Any]:
-    path = state_file()
+def load_state(state_path: Optional[Path] = None) -> Dict[str, Any]:
+    path = state_path or state_file()
     if not path.is_file():
         return _default_state()
     try:
@@ -86,8 +88,13 @@ def load_state() -> Dict[str, Any]:
     return base
 
 
-def save_state(patch: Optional[Dict[str, Any]] = None, **kwargs: Any) -> Dict[str, Any]:
-    state = load_state()
+def save_state(
+    patch: Optional[Dict[str, Any]] = None,
+    state_path: Optional[Path] = None,
+    **kwargs: Any,
+) -> Dict[str, Any]:
+    path = state_path or state_file()
+    state = load_state(path)
     if patch:
         state.update(patch)
     if kwargs:
@@ -97,8 +104,8 @@ def save_state(patch: Optional[Dict[str, Any]] = None, **kwargs: Any) -> Dict[st
         if item.get("data_id") not in datasets:
             state["conflicts"].remove(item)
     try:
-        state_file().parent.mkdir(parents=True, exist_ok=True)
-        state_file().write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
     except OSError:
         pass
     return state
@@ -243,6 +250,76 @@ class _PullingGuard:
 def _is_pulling(data_id: str) -> bool:
     with _pulling_lock:
         return data_id in _pulling_ids
+
+
+def freeze_pending_changes(reason: str = "跨档切换", state_path: Optional[Path] = None) -> bool:
+    """冻结当前档遗留的待上行状态（dirty / 待删 / 任务队列）。
+
+    跨模式切回共享档时，共享档自己的 `sync_state.json` 可能还留着上一轮登录的
+    dirty/pending_deletes；登录即同步会把这些旧状态当成"本轮改动"push 到服务器，
+    覆盖同组其他用户的新数据。这里把它们整体挪到快照，同步只 pull；用户显式确认
+    后再决定丢弃还是放行。没有待上行状态时不做任何事。
+    """
+    state = load_state(state_path)
+    datasets = state.get("datasets") or {}
+    dirty_ids = [k for k, v in datasets.items() if v.get("dirty")]
+    pending_deletes = list(state.get("pending_deletes") or [])
+    task_deletes = list(state.get("task_deletes") or [])
+    task_updates = list(state.get("task_updates") or [])
+    conflicts = list(state.get("conflicts") or [])
+    if not (dirty_ids or pending_deletes or task_deletes or task_updates or conflicts):
+        return False
+    frozen = {
+        "frozen_at": _now_iso(),
+        "reason": reason,
+        "datasets": {k: dict(datasets[k]) for k in dirty_ids},
+        "pending_deletes": pending_deletes,
+        "deleted_at": {k: v for k, v in (state.get("deleted_at") or {}).items()
+                       if k in pending_deletes},
+        "task_deletes": task_deletes,
+        "task_updates": task_updates,
+        "conflicts": conflicts,
+    }
+    # 快照保留原始 dirty=True，restore 时才能恢复为待上行；active 状态里整体移除
+    clean_datasets = {k: dict(v) for k, v in datasets.items() if not v.get("dirty")}
+    save_state(
+        datasets=clean_datasets,
+        pending_deletes=[], deleted_at={
+            k: v for k, v in (state.get("deleted_at") or {}).items() if k not in pending_deletes
+        },
+        task_deletes=[], task_updates=[], conflicts=[],
+        frozen_local_changes=frozen,
+        state_path=state_path,
+    )
+    return True
+
+
+def resolve_frozen_changes(action: str) -> Dict[str, Any]:
+    """确认冻结的旧改动：discard=丢弃；restore=恢复为待上行（下轮同步 push）。"""
+    if action not in ("discard", "restore"):
+        raise SyncError("未知的冻结处理方式")
+    state = load_state()
+    frozen = state.get("frozen_local_changes")
+    if not frozen:
+        raise SyncError("当前没有冻结的旧改动")
+    if action == "restore":
+        datasets = dict(state.get("datasets") or {})
+        datasets.update(frozen.get("datasets") or {})
+        save_state(
+            datasets=datasets,
+            pending_deletes=list(frozen.get("pending_deletes") or []),
+            deleted_at={
+                **(state.get("deleted_at") or {}), **(frozen.get("deleted_at") or {})
+            },
+            task_deletes=list(frozen.get("task_deletes") or []),
+            task_updates=list(frozen.get("task_updates") or []),
+            conflicts=list(frozen.get("conflicts") or []),
+            frozen_local_changes=None,
+        )
+        schedule_sync(1)
+    else:
+        save_state(frozen_local_changes=None)
+    return {"action": action, "count": len(frozen.get("datasets") or {})}
 
 
 def note_change(data_id: str, deleted: bool = False) -> None:
@@ -405,8 +482,14 @@ def _sync_group(user, city: str, operator: str) -> Dict[str, Any]:
     server_city = group.get("city") or ""
     server_operator = group.get("operator") or ""
     if session.get("group_locked") and (server_city != city or server_operator != operator):
-        _apply_local_group(user, server_city, server_operator)
-        city, operator = server_city, server_operator
+        # 服务器锁定的组与本机不一致：静改本机组会调 migrate_group_data 删除新组已有的
+        # 单例工参（full_params/target_cells）并重置应用标记——这正是"切模式/换账号后
+        # 数据被旧数据覆盖"的直接路径。改为停止同步，交管理员在网页端调整组归属。
+        raise SyncError(
+            f"服务器授权已锁定数据组「{server_city}·{server_operator}」，与本机"
+            f"「{city or '未设置'}·{operator or '未设置'}」不一致。为避免覆盖同组工参，"
+            "同步已停止，请联系管理员在网页端调整本账号的数据组。"
+        )
     elif not city or not operator:
         if server_city and server_operator:
             _apply_local_group(user, server_city, server_operator)
@@ -899,9 +982,16 @@ def sync_once() -> Dict[str, Any]:
         datasets_state = local_state["datasets"]
         # 本机已删、删除尚未上行的 id（工参更新就是"新建 + 删旧"，本轮不能再拉回旧副本）
         pending_deletes = set(local_state.get("pending_deletes") or [])
+        # 冻结的旧改动：本轮既不 pull 覆盖也不 push 上行，保持原样等用户确认
+        frozen = local_state.get("frozen_local_changes") or {}
+        frozen_ids = set((frozen.get("datasets") or {}).keys()) | set(
+            frozen.get("pending_deletes") or []
+        )
 
         # 1. 服务器 → 本地
         for data_id, item in items.items():
+            if data_id in frozen_ids:
+                continue
             if (data_service.index.get(data_id) or {}).get("status") == "processing":
                 continue  # 本机正在导入该数据集：本轮不动，整包覆盖会把导入打断
             if item.get("deleted"):
@@ -988,6 +1078,8 @@ def sync_once() -> Dict[str, Any]:
 
         # 2. 本地 → 服务器（服务器上没有的数据集 = 本机新建）
         for data_id in list(data_service.index.keys()):
+            if data_id in frozen_ids:
+                continue  # 冻结的旧改动：既不上行也不当作"服务器已删"清掉
             if data_id in items:
                 continue
             if (data_service.index.get(data_id) or {}).get("status") == "processing":
@@ -1087,8 +1179,12 @@ def sync_once() -> Dict[str, Any]:
         _sync_lock.release()
 
 
-def resolve_conflict(data_id: str, resolution: str) -> Dict[str, Any]:
-    """冲突选边：server=取服务器版本（丢弃本地修改）；local=用本地覆盖服务器。"""
+def resolve_conflict(data_id: str, resolution: str, force: bool = False) -> Dict[str, Any]:
+    """冲突选边：server=取服务器版本（丢弃本地修改）；local=用本地覆盖服务器。
+
+    local 会不带 base_rev 强制覆盖服务器当前版本，可能抹掉同组其他用户刚上行的
+    改动，必须显式 ``force=True`` 二次确认，避免误点。
+    """
     user, city, operator = _local_group()
     state = load_state()
     conflict = next((c for c in state["conflicts"] if c.get("data_id") == data_id), None)
@@ -1097,6 +1193,10 @@ def resolve_conflict(data_id: str, resolution: str) -> Dict[str, Any]:
     if resolution == "server":
         result = _pull(data_id, user, city, operator, int(conflict.get("server_rev") or 0))
     elif resolution == "local":
+        if not force:
+            raise SyncError(
+                "用本地覆盖服务器会丢弃同组其他用户刚上行的改动，请确认后再执行"
+            )
         result = _push(data_id, None)  # 不带 base_rev = 强制覆盖服务器当前版本
     else:
         raise SyncError("未知的解决方式")
@@ -1118,6 +1218,7 @@ def status() -> Dict[str, Any]:
         "last_error": state.get("last_error"),
         "last_result": state.get("last_result"),
         "pending_uploads": len(pending),
+        "frozen_local_changes": state.get("frozen_local_changes"),
         "conflicts": state.get("conflicts") or [],
         "synced_datasets": len([d for d in state["datasets"] if not state["datasets"][d].get("dirty")]),
     }

@@ -214,6 +214,36 @@ describe('图片灯箱', () => {
   const navButton = (name: string) =>
     document.querySelector(`[data-im-lightbox-${name}]`) as HTMLButtonElement
 
+  it('翻页按钮灰底浅箭头，靠近两侧边缘才显示', async () => {
+    const gallerySource = { ...source, gallery, galleryIndex: 0 }
+    render(<ImImageLightbox source={gallerySource} onClose={() => {}} />)
+    await waitFor(() => expect(document.querySelector('img')).toBeTruthy())
+    const prev = navButton('prev')
+    const next = navButton('next')
+    for (const button of [prev, next]) {
+      expect(button.className).toContain('bg-[#929292]')
+      expect(button.className).toContain('text-[#F7F7F7]')
+    }
+    const stage = document.querySelector('img')!.parentElement as HTMLElement
+    expect(stage.className).toContain('bg-[#F7F7F7]')
+
+    // 默认隐藏，光标靠近对应边缘才显示（无需落在按钮上）
+    expect(prev.className).toContain('opacity-0')
+    expect(next.className).toContain('opacity-0')
+    vi.spyOn(stage, 'getBoundingClientRect').mockReturnValue({
+      left: 0, top: 0, width: 1000, height: 600, right: 1000, bottom: 600,
+      x: 0, y: 0, toJSON: () => ({}),
+    } as DOMRect)
+    fireEvent.pointerMove(stage, { clientX: 30, clientY: 300 })
+    expect(prev.className).toContain('opacity-100')
+    expect(next.className).toContain('opacity-0')
+    fireEvent.pointerMove(stage, { clientX: 980, clientY: 300 })
+    expect(prev.className).toContain('opacity-0')
+    expect(next.className).toContain('opacity-100')
+    fireEvent.pointerMove(stage, { clientX: 500, clientY: 300 })
+    expect(next.className).toContain('opacity-0')
+  })
+
   it('单张预览不显示上一张 / 下一张与计数', () => {
     render(<ImImageLightbox source={source} onClose={() => {}} />)
     expect(document.querySelector('[data-im-lightbox-next]')).toBeNull()

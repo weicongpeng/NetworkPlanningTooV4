@@ -336,6 +336,30 @@ export const useAuthStore = create<AuthState>()(
           desktopMode = false
           desktopError = `运行形态探测失败：${error?.message || error}`
         }
+        // 桌面壳两档数据严格隔离：持久化 token / desktopRunMode 若与后端当前档不符
+        // （崩溃、手改 active_profile、旧版本残留），直接清登录态并要求重新登录，
+        // 避免用旧档身份进入新档或命中错档的 IndexedDB 缓存。
+        if (desktopMode) {
+          try {
+            const { desktopLoginApi } = await import('../services/api')
+            const profileRes = await desktopLoginApi.getProfile()
+            const profile = profileRes?.data?.profile
+            const localRunMode = get().desktopRunMode
+            const localMode = localRunMode === 'shared' || localRunMode === 'standalone'
+              ? localRunMode
+              : null
+            if (profile && localMode && profile !== localMode) {
+              set({
+                token: null,
+                user: null,
+                isAuthenticated: false,
+                desktopRunMode: profile,
+              })
+              try { localStorage.removeItem('auth-storage') } catch { /* 存储不可用忽略 */ }
+              clearUserDataCaches()
+            }
+          } catch { /* 探测档失败不阻断启动，后端 JWT 校验仍是兜底 */ }
+        }
         set({ desktopMode, desktopProbed: true, desktopError })
       },
 

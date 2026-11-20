@@ -86,6 +86,56 @@ def test_forget_clears_dataset_and_pending_delete(sync_state):
     assert state["pending_deletes"] == [] and state["datasets"] == {}
 
 
+def test_freeze_pending_changes_isolates_old_uploads(sync_state):
+    """跨档切换前冻结旧改动：状态移入快照，不再有 dirty/待删除。"""
+    sync_state.mark_dirty("old-ds")
+    sync_state.mark_local_deleted("deleted-ds")
+    sync_state.queue_task_delete("old-task")
+    assert sync_state.freeze_pending_changes("切换到共享模式") is True
+
+    state = sync_state.load_state()
+    assert "old-ds" not in state["datasets"]  # 冻结项整体移出 active 状态
+    assert state["pending_deletes"] == []
+    assert state["task_deletes"] == []
+    frozen = state["frozen_local_changes"]
+    assert frozen["reason"] == "切换到共享模式"
+    assert "old-ds" in frozen["datasets"]
+    assert "deleted-ds" in frozen["pending_deletes"]
+
+    # 无待上行状态时再次冻结不做任何事
+    assert sync_state.freeze_pending_changes() is False
+
+
+def test_freeze_then_restore_or_discard(sync_state, monkeypatch):
+    sync_state.mark_dirty("old-ds")
+    sync_state.freeze_pending_changes()
+    monkeypatch.setattr(sync_state, "schedule_sync", lambda *a, **kw: None)
+
+    result = sync_state.resolve_frozen_changes("restore")
+    assert result["count"] == 1
+    assert sync_state.load_state()["datasets"]["old-ds"]["dirty"] is True
+    assert sync_state.load_state()["frozen_local_changes"] is None
+
+    sync_state.freeze_pending_changes()
+    sync_state.resolve_frozen_changes("discard")
+    assert sync_state.load_state()["frozen_local_changes"] is None
+    assert "old-ds" not in sync_state.load_state()["datasets"]
+
+
+def test_freeze_can_target_another_profile(sync_state, tmp_path):
+    """切档时当前 PROFILE_ROOT 还是旧档，必须能冻结目标档的状态文件。"""
+    target = tmp_path / "profiles" / "shared" / "sync_state.json"
+    target.parent.mkdir(parents=True)
+    target.write_text(
+        '{"datasets": {"ds-x": {"dirty": true, "rev": 3}}, '
+        '"pending_deletes": [], "conflicts": []}', encoding="utf-8"
+    )
+    assert sync_state.freeze_pending_changes("切换到共享模式", state_path=target) is True
+    data = __import__("json").loads(target.read_text(encoding="utf-8"))
+    assert data["frozen_local_changes"]["datasets"]["ds-x"]["rev"] == 3
+    assert "ds-x" not in data["datasets"]
+
+
 def test_note_change_noop_when_not_desktop(sync_state, monkeypatch):
     monkeypatch.setattr(settings, "NPT_DESKTOP", False)
     sync_state.note_change("ds-4")
@@ -345,6 +395,49 @@ def test_sync_once_does_not_push_half_imported_dataset(sync_state, monkeypatch):
     summary = sync_state.sync_once()
     assert pushed == [] and pulled == []
     assert summary["errors"] == []
+
+
+def test_group_locked_conflict_stops_sync(sync_state, monkeypatch):
+    """服务器锁定组与本机不一致时停止同步，不能静默迁移覆盖单例工参。"""
+    from app.services import desktop_cloud_client as cloud
+
+    monkeypatch.setattr(sync_state, "_local_group", lambda: (object(), "广州", "移动"))
+    monkeypatch.setattr(
+        cloud, "sync_session",
+        lambda *a, **kw: {"group_locked": True, "group": {"city": "深圳", "operator": "联通"}},
+    )
+    called = []
+    monkeypatch.setattr(sync_state, "_apply_local_group", lambda *a: called.append(True))
+
+    try:
+        sync_state._sync_group(object(), "广州", "移动")
+    except sync_state.SyncError as exc:
+        assert "同步已停止" in str(exc)
+    else:
+        raise AssertionError("组锁定冲突应当停止同步")
+    assert called == []
+
+
+def test_resolve_local_requires_explicit_force(sync_state, monkeypatch):
+    """本地覆盖服务器必须显式确认，避免误点抹掉同组其他用户改动。"""
+    sync_state.mark_dirty("ds-9")  # save_state 会清掉 datasets 里不存在的 conflict
+    sync_state.save_state(conflicts=[{
+        "data_id": "ds-9", "name": "工参", "server_rev": 3, "local_rev": 4,
+    }])
+    monkeypatch.setattr(sync_state, "_local_group", lambda: (object(), "广州", "移动"))
+    pushed = []
+    monkeypatch.setattr(sync_state, "_push", lambda *a, **kw: pushed.append(a) or {})
+
+    try:
+        sync_state.resolve_conflict("ds-9", "local")
+    except sync_state.SyncError as exc:
+        assert "确认" in str(exc)
+    else:
+        raise AssertionError("强制覆盖必须要求二次确认")
+    assert pushed == []
+
+    sync_state.resolve_conflict("ds-9", "local", force=True)
+    assert pushed == [("ds-9", None)]
 
 
 def test_sync_once_keeps_manual_conflict_without_timestamps(sync_state, monkeypatch):

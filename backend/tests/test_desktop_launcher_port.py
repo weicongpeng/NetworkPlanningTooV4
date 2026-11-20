@@ -36,6 +36,28 @@ def test_bound_port_is_stable_across_restarts(tmp_path):
     assert port2 == port
 
 
+def test_profiles_use_different_ports_and_state_files(tmp_path, monkeypatch):
+    """共享/单机必须用不同 origin，否则 WebView2 存储会跨档串数据。"""
+    launcher = _load_launcher()
+    monkeypatch.delenv("NPT_DESKTOP_PROFILE", raising=False)
+
+    monkeypatch.setenv("NPT_DESKTOP_PROFILE", "shared")
+    sock1, port1 = launcher._create_bound_socket(tmp_path)
+    sock1.close()
+    monkeypatch.setenv("NPT_DESKTOP_PROFILE", "standalone")
+    sock2, port2 = launcher._create_bound_socket(tmp_path)
+    sock2.close()
+
+    shared_base = launcher.PROFILE_PREFERRED_PORT["shared"]
+    standalone_base = launcher.PROFILE_PREFERRED_PORT["standalone"]
+    # 端口被占用时会在本档区段内向上找，不能要求精确等于基准值
+    assert shared_base <= port1 < shared_base + launcher.PREFERRED_PORT_TRIES
+    assert standalone_base <= port2 < standalone_base + launcher.PREFERRED_PORT_TRIES
+    assert port1 != port2
+    assert (tmp_path / launcher.PORT_STATE_FILE).is_file()  # shared 沿用旧路径
+    assert (tmp_path / "profiles" / "standalone" / launcher.PORT_STATE_FILE).is_file()
+
+
 def test_app_url_keeps_bundled_backend_without_dev_flag(monkeypatch):
     launcher = _load_launcher()
     monkeypatch.delenv("NPT_DESKTOP_DEV_URL", raising=False)

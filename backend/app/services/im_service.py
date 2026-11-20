@@ -102,11 +102,17 @@ def _add_members(db: Session, conversation_id: int, user_ids: List[int], role: s
         )
         .all()
     }
+    # 入群起点必须在本次 add_members 发出的系统提示之前取值：新成员能看到
+    # "XX邀请你加入群聊"，但看不到进群前的历史消息。
+    conv = db.query(ImConversation).filter(ImConversation.id == conversation_id).first()
+    start_id = int(conv.last_message_id or 0) if conv is not None else 0
     for uid in user_ids:
         if uid not in existing:
             db.add(ImConversationMember(
                 conversation_id=conversation_id, user_id=uid, role=role,
-                last_read_message_id=0, muted=False, joined_at=_now(),
+                # 已读游标也从入群起点开始，避免打开会话时把历史消息算成未读
+                last_read_message_id=start_id, muted=False, joined_at=_now(),
+                joined_message_id=start_id,
             ))
 
 
@@ -769,10 +775,21 @@ def _serialize_message(db: Session, message: ImMessage,
 
 
 def _visible_messages_query(db: Session, user_id: int):
-    """排除当前用户已隐藏的消息。删除只对操作者生效，对方读取时不受影响。"""
+    """排除当前用户已隐藏的消息，并过滤掉其入群前的历史消息。
+
+    删除只对操作者生效，对方读取时不受影响；群成员入群起点按消息 id 游标比较，
+    与列表分页游标语义一致，且不受本地时区影响。存量成员起点为 0，行为不变。
+    """
     hidden_ids = db.query(ImMessageHidden.message_id).filter(
         ImMessageHidden.user_id == user_id)
-    return db.query(ImMessage).filter(~ImMessage.id.in_(hidden_ids))
+    joined = db.query(ImConversationMember.joined_message_id).filter(
+        ImConversationMember.user_id == user_id,
+        ImConversationMember.conversation_id == ImMessage.conversation_id,
+    ).correlate(ImMessage).scalar_subquery()
+    return db.query(ImMessage).filter(
+        ~ImMessage.id.in_(hidden_ids),
+        ImMessage.id > joined,
+    )
 
 
 def list_messages(db: Session, conversation_id: int, user_id: int,
@@ -887,13 +904,14 @@ def send_message(db: Session, conversation_id: int, user_id: int, kind: str,
     def _serialize(m: ImMessage) -> Dict[str, Any]:
         names = _load_sender_names(db, {m.sender_id})
         if m.reply_to_id and m.reply_to_id not in reply_map:
-            replied = db.query(ImMessage).filter(ImMessage.id == m.reply_to_id).first()
+            replied = _visible_messages_query(db, user_id).filter(
+                ImMessage.id == m.reply_to_id).first()
             if replied:
                 reply_map[replied.id] = replied
         return _serialize_message(db, m, names, viewer_id=user_id, reply_map=reply_map)
 
     if reply_to_id is not None:
-        replied = db.query(ImMessage).filter(
+        replied = _visible_messages_query(db, user_id).filter(
             ImMessage.id == int(reply_to_id),
             ImMessage.conversation_id == conversation_id).first()
         if replied is None:
@@ -1002,7 +1020,9 @@ def forward_messages(db: Session, user_id: int, message_ids: List[int],
     targets = [int(x) for x in (conversation_ids or [])][:50]
     if not ids or not targets:
         raise _err(400, "IM_INVALID_MESSAGE")
-    sources = (db.query(ImMessage).filter(ImMessage.id.in_(ids))
+    # 只能转发自己可见的消息（含入群起点），否则新成员可凭 id 转发出群前内容
+    sources = (_visible_messages_query(db, user_id)
+               .filter(ImMessage.id.in_(ids))
                .order_by(ImMessage.id.asc()).all())
     if len(sources) != len(set(ids)):
         raise _err(404, "IM_CONVERSATION_NOT_FOUND")
@@ -1061,7 +1081,11 @@ def member_ids(db: Session, conversation_id: int, exclude_user_id: Optional[int]
 def mark_read(db: Session, conversation_id: int, user_id: int,
               last_read_message_id: int) -> Dict[str, Any]:
     member = _require_member(db, conversation_id, user_id)
-    value = max(int(member.last_read_message_id or 0), int(last_read_message_id or 0))
+    value = max(
+        int(member.joined_message_id or 0),
+        int(member.last_read_message_id or 0),
+        int(last_read_message_id or 0),
+    )
     member.last_read_message_id = value
     # 精算剩余未读：mark_read 是低频写路径，一次索引范围 COUNT 可接受；
     # 直接置 0 会在「客户端只标记到中间某条」时与服务端真实未读不一致。

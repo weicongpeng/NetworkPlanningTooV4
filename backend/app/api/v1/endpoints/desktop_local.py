@@ -110,6 +110,11 @@ class RunModeRequest(BaseModel):
 class SyncResolveRequest(BaseModel):
     data_id: str
     resolution: str = Field(..., description="server=取服务器版本 / local=用本地覆盖")
+    force: bool = Field(default=False, description="local 强制覆盖服务器需显式二次确认")
+
+
+class FrozenChangesRequest(BaseModel):
+    action: str = Field(..., description="discard=丢弃冻结的旧改动 / restore=恢复为待上行")
 
 
 class DesktopRegisterRequest(BaseModel):
@@ -302,10 +307,22 @@ def _cross_profile_required(mode: str) -> bool:
 
 def _accept_cross_profile_switch(mode: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     """跨档登录/注册短路：记账目标档与一次性凭据，不触碰当前档任何数据。"""
-    from app.core.desktop_profiles import write_active_profile
+    from app.core.desktop_profiles import profile_root_for, write_active_profile
 
     normalized = MODE_STANDALONE if str(mode).lower() != MODE_SHARED else MODE_SHARED
     save_pending_login({**payload, "mode": normalized})
+    # 切回共享档前先冻结目标档遗留的待上行状态：否则重启登录后登录即同步会把它
+    # 当成"本轮改动"push，覆盖同组其他用户刚上行的工参（跨档数据覆盖的主要路径）。
+    if normalized == MODE_SHARED:
+        try:
+            from app.services import desktop_sync_service as sync
+
+            sync.freeze_pending_changes(
+                reason="切换到共享模式",
+                state_path=profile_root_for(settings.DATA_ROOT, normalized) / "sync_state.json",
+            )
+        except Exception as exc:  # noqa: BLE001 - 冻结失败不阻断登录，但记日志
+            print(f"[DesktopSync] 跨档冻结旧改动失败（忽略）：{exc}")
     write_active_profile(settings.DATA_ROOT, normalized)
     return {
         "success": True,
@@ -448,7 +465,8 @@ def _issue_local_token(db: Session, user, idle_logout_days: Optional[int] = None
     days = int(idle_logout_days or 2)
     delta = timedelta(days=max(days, 2)) if settings.NPT_DESKTOP else None
     token, jti = auth_service.create_access_token(
-        user.id, user.username, user.is_admin, expires_delta=delta
+        user.id, user.username, user.is_admin, expires_delta=delta,
+        profile=getattr(settings, "DESKTOP_PROFILE", "") or "",
     )
     # 写会话记录 → 空闲超时（单机模式为管理员设定的天数）才会要求重新登录
     auth_service.record_session(db, user.id, jti, "127.0.0.1", "pc")
@@ -1026,7 +1044,25 @@ async def sync_resolve(
 
     try:
         result = await run_in_threadpool(
-            _sync_service().resolve_conflict, payload.data_id, payload.resolution
+            _sync_service().resolve_conflict, payload.data_id, payload.resolution, payload.force
+        )
+    except _sync_service().SyncError as exc:
+        raise HTTPException(status_code=400, detail=_gbk_safe(str(exc)))
+    return {"success": True, "data": {**result, **_sync_service().status()}}
+
+
+@router.post("/sync-frozen-resolve")
+async def sync_frozen_resolve(
+    payload: FrozenChangesRequest,
+    current_user: User = Depends(get_current_user),
+    _: None = Depends(_require_desktop),
+) -> Dict[str, Any]:
+    """确认跨档切换前冻结的旧待上行改动：discard 丢弃 / restore 恢复后上行。"""
+    from starlette.concurrency import run_in_threadpool
+
+    try:
+        result = await run_in_threadpool(
+            _sync_service().resolve_frozen_changes, payload.action
         )
     except _sync_service().SyncError as exc:
         raise HTTPException(status_code=400, detail=_gbk_safe(str(exc)))

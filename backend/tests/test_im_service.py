@@ -50,6 +50,38 @@ def test_auto_group_is_idempotent(db):
     assert ids["carol"] not in {m["id"] for m in members}
 
 
+def test_new_member_only_sees_messages_after_joining(db):
+    """群主加人后，新成员看不到入群前历史；能看到入群系统提示与之后的新消息。"""
+    ids = _users(db)
+    group = im_service.create_custom_group(db, ids["alice"], "项目群", [ids["carol"]])
+    conv_id = group["id"]
+    im_service.send_message(db, conv_id, ids["alice"], "text", "进群前的机密")
+    before = im_service.list_messages(db, conv_id, ids["alice"])["items"]
+    assert [m["content_text"] for m in before] == ["进群前的机密"]
+
+    im_service.add_members(db, conv_id, ids["alice"], [ids["bob"]])
+    bob_items = im_service.list_messages(db, conv_id, ids["bob"])["items"]
+    # 新成员只看得到 members_added 系统提示，看不到进群前的普通消息
+    assert all(m["kind"] == "system" for m in bob_items)
+    assert all(m["content_text"] != "进群前的机密" for m in bob_items)
+
+    # 入群后的新消息对新成员可见，且未读数不含入群前历史
+    im_service.send_message(db, conv_id, ids["alice"], "text", "欢迎入群")
+    bob_items = im_service.list_messages(db, conv_id, ids["bob"])["items"]
+    assert [m["content_text"] for m in bob_items if m["kind"] == "text"] == ["欢迎入群"]
+    conv = next(c for c in im_service.list_conversations(db, ids["bob"])["items"]
+                if c["id"] == conv_id)
+    assert conv["unread"] == 2  # 系统提示 + 新消息
+
+    # 进群前的消息不能被引用或转发
+    old_id = before[0]["id"]
+    with pytest.raises(HTTPException):
+        im_service.send_message(db, conv_id, ids["bob"], "text", "引用旧消息",
+                                reply_to_id=old_id)
+    with pytest.raises(HTTPException):
+        im_service.forward_messages(db, ids["bob"], [old_id], [conv_id])
+
+
 def test_direct_conversation_is_idempotent_and_allows_cross_group(db):
     ids = _users(db)
     one = im_service.create_direct(db, ids["alice"], ids["carol"])

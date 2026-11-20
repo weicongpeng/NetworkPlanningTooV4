@@ -700,6 +700,8 @@ class ImConversationMember(Base):
     unread_count = Column(Integer, nullable=False, default=0, server_default="0")
     muted = Column(Boolean, nullable=False, default=False)
     joined_at = Column(String(30), nullable=False, default=_utcnow_iso)
+    # 入群时的消息游标：新成员只看 id 大于该值的消息。0 = 旧数据，维持可读全历史。
+    joined_message_id = Column(Integer, nullable=False, default=0, server_default="0")
 
     __table_args__ = (
         Index("idx_im_member_conv_user", "conversation_id", "user_id", unique=True),

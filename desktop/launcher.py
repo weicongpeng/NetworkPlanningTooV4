@@ -37,10 +37,13 @@ READY_TIMEOUT_SECONDS = 120
 EXIT_GRACE_SECONDS = 20
 # 本机后端端口：必须是固定值，否则每次启动 origin（含端口）都变，WebView2 的
 # localStorage 会整体重置 —— 语言/主题/登录态等设置永远"保存不住"。
-# 端口被占用时向上找一个空闲端口并记进 DATA_ROOT/last_port.json，下次优先复用。
+# 共享/单机两档必须用不同端口段：WebView2 的 localStorage/IndexedDB 按 origin
+# (scheme+host+port) 隔离，同端口会导致两档浏览器存储互相串档。
 PREFERRED_PORT = 18789
 PREFERRED_PORT_TRIES = 20
 PORT_STATE_FILE = "last_port.json"
+# 各档端口基准，间隔大于 PREFERRED_PORT_TRIES，避免占用时向上探查跨到另一档
+PROFILE_PREFERRED_PORT = {"shared": 18789, "standalone": 18809}
 
 _MUTEX_HANDLE: Optional[int] = None
 _log = logging.getLogger("desktop")
@@ -248,13 +251,30 @@ def _release_single_instance() -> None:
 
 # -------------------------------------------------------------- 服务与窗口
 
-def _saved_port_path(data_root: Optional[Path]) -> Optional[Path]:
-    return data_root / PORT_STATE_FILE if data_root else None
+def _saved_port_path(data_root: Optional[Path], profile: Optional[str] = None) -> Optional[Path]:
+    """端口状态按档隔离：切档后 origin 不同，浏览器存储才不会互相串。"""
+    if not data_root:
+        return None
+    normalized = str(profile or os.environ.get("NPT_DESKTOP_PROFILE", "")).strip().lower()
+    if normalized not in PROFILE_PREFERRED_PORT:
+        try:
+            from app.core.desktop_profiles import normalize_profile, read_active_profile
+
+            normalized = normalize_profile(
+                os.environ.get("NPT_DESKTOP_PROFILE") or read_active_profile(data_root)
+            )
+        except Exception:  # noqa: BLE001
+            normalized = "shared"
+    # 兼容旧版：shared 沿用根目录 last_port.json（它本来就是共享档用的），
+    # 单机档单独放 profiles/standalone/last_port.json。
+    if normalized == "shared":
+        return data_root / PORT_STATE_FILE
+    return data_root / "profiles" / normalized / PORT_STATE_FILE
 
 
-def _read_saved_port(data_root: Optional[Path]) -> Optional[int]:
+def _read_saved_port(data_root: Optional[Path], profile: Optional[str] = None) -> Optional[int]:
     """上次成功监听的端口（保证 origin 稳定）。"""
-    path = _saved_port_path(data_root)
+    path = _saved_port_path(data_root, profile)
     if not path or not path.is_file():
         return None
     try:
@@ -264,8 +284,8 @@ def _read_saved_port(data_root: Optional[Path]) -> Optional[int]:
         return None
 
 
-def _write_saved_port(data_root: Optional[Path], port: int) -> None:
-    path = _saved_port_path(data_root)
+def _write_saved_port(data_root: Optional[Path], port: int, profile: Optional[str] = None) -> None:
+    path = _saved_port_path(data_root, profile)
     if not path:
         return
     try:
@@ -294,25 +314,28 @@ def _try_bind(port: int) -> Optional[socket.socket]:
 def _create_bound_socket(data_root: Optional[Path] = None) -> Tuple[socket.socket, int]:
     """绑定 127.0.0.1 的稳定端口，返回已监听 socket 与实际端口。
 
-    端口必须尽量固定：WebView2 的 localStorage 按 origin（含端口）隔离，
-    随机端口会让语言/主题/登录态等本地设置每次启动都被清空。
+    端口按档固定且分档：WebView2 的 localStorage/IndexedDB 按 origin（含端口）
+    隔离，端口相同会让共享/单机两档浏览器存储串在一起。
     """
+    profile = os.environ.get("NPT_DESKTOP_PROFILE", "") or "shared"
+    normalized = profile if profile in PROFILE_PREFERRED_PORT else "shared"
+    base_port = PROFILE_PREFERRED_PORT[normalized]
     candidates: list = []
-    saved = _read_saved_port(data_root)
+    saved = _read_saved_port(data_root, normalized)
     if saved:
         candidates.append(saved)
-    candidates.extend(range(PREFERRED_PORT, PREFERRED_PORT + PREFERRED_PORT_TRIES))
+    candidates.extend(range(base_port, base_port + PREFERRED_PORT_TRIES))
     for port in candidates:
         sock = _try_bind(port)
         if sock is not None:
-            _write_saved_port(data_root, port)
+            _write_saved_port(data_root, port, normalized)
             return sock, port
     # 兜底：系统分配空闲端口（仍记录下来，下次优先复用）
     sock = _try_bind(0)
     if sock is None:  # pragma: no cover - 极端情况
         raise RuntimeError("无法绑定本机回环端口")
     port = sock.getsockname()[1]
-    _write_saved_port(data_root, port)
+    _write_saved_port(data_root, port, normalized)
     _log.warning("固定端口均被占用，本次使用随机端口 %s（本地设置可能无法保留）", port)
     return sock, port
 

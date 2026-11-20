@@ -55,6 +55,19 @@ async def get_current_user(
             detail="登录已过期，请重新登录",
         )
 
+    # 桌面端两档共用签名密钥与本机端口段隔离前的历史 token：必须校验档声明，
+    # 否则上一档残留 token 可被同数值 user id 在当前档通过认证。
+    if settings.NPT_DESKTOP:
+        token_profile = str(payload.get("profile") or "").strip()
+        current_profile = str(getattr(settings, "DESKTOP_PROFILE", "") or "").strip()
+        if current_profile and token_profile != current_profile:
+            # 缺 profile 的旧 token 同样拒绝：升级后强制重新登录一次，
+            # 避免历史上无声明 token 绕过隔离。
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="登录状态与当前运行模式不符，请重新登录",
+            )
+
     jti = payload.get("jti")
     if jti and auth_service.is_token_revoked(db, jti):
         raise HTTPException(

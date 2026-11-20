@@ -1095,7 +1095,7 @@ export function ImScreenshotDialog({
           <div ref={viewportRef}
                onPointerDown={onPointerDown} onPointerMove={onPointerMove}
                onPointerUp={onPointerUp} onPointerCancel={onPointerUp}
-               className="relative flex min-h-0 flex-1 select-none items-center justify-center overflow-hidden bg-black/40 p-3"
+               className="relative flex min-h-0 flex-1 select-none items-center justify-center overflow-hidden bg-[#F7F7F7] p-3"
                style={{ touchAction: 'none', cursor: panMode ? 'grab' : (tool === 'text' ? 'text' : 'crosshair') }}>
             <div className="relative inline-flex max-h-full max-w-full"
                  style={{

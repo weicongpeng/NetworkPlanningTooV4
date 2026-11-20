@@ -261,6 +261,13 @@ describe('协作沟通截图对话框', () => {
     expect(img.style.maxHeight).toBe('calc(88vh - 116px)')
   })
 
+  it('画布区背景为 #F7F7F7', async () => {
+    await captureFrame()
+    const viewport = document.body.querySelector('[data-screenshot-panel] img')!.parentElement!
+      .parentElement as HTMLElement
+    expect(viewport.className).toContain('bg-[#F7F7F7]')
+  })
+
   it('作为独立窗口展示：无遮罩/虚化，背景点击穿透', async () => {
     await captureFrame()
     const overlay = document.body.querySelector('[data-screenshot-overlay]') as HTMLElement

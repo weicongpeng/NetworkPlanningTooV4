@@ -64,6 +64,7 @@ export function ImImageLightbox({ source, onClose }: Props) {
   const stageRef = useRef<HTMLDivElement>(null)
   const imageRef = useRef<HTMLImageElement>(null)
   const dragRef = useRef<{ x: number; y: number; ox: number; oy: number } | null>(null)
+  const [hoverSide, setHoverSide] = useState<'left' | 'right' | null>(null)
 
   // 画廊 = 当前会话已加载的全部图片。灯箱自己持有当前项，翻页不回写 store，
   // 这样输入框待发送附件预览（无 gallery）仍是单张、不受影响。
@@ -167,11 +168,21 @@ export function ImImageLightbox({ source, onClose }: Props) {
     event.currentTarget.setPointerCapture(event.pointerId)
   }
   const onPointerMove = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const node = event.currentTarget
+    // 光标靠近舞台左右边缘时高亮对应翻页按钮，无需精确移到按钮上
+    if (canNavigate) {
+      const rect = node.getBoundingClientRect()
+      const x = event.clientX - rect.left
+      const zone = Math.min(120, rect.width * 0.22)
+      const side = x <= zone ? 'left' : x >= rect.width - zone ? 'right' : null
+      setHoverSide(prev => (prev === side ? prev : side))
+    }
     const drag = dragRef.current
     if (!drag) return
     setOffset({ x: drag.ox + event.clientX - drag.x, y: drag.oy + event.clientY - drag.y })
   }
   const onPointerUp = () => { dragRef.current = null }
+  const onPointerLeave = () => setHoverSide(null)
 
   const saveUrl = (href: string, filename: string, revoke = false) => {
     const anchor = document.createElement('a')
@@ -282,10 +293,11 @@ export function ImImageLightbox({ source, onClose }: Props) {
 
       {/* 舞台：滚轮缩放 + 拖拽平移 + 双击复位 */}
       <div ref={stageRef}
-           className={`relative flex min-h-0 flex-1 items-center justify-center overflow-hidden bg-black/40
+           className={`relative flex min-h-0 flex-1 items-center justify-center overflow-hidden bg-[#F7F7F7]
              ${isImage && scale > 1 ? 'cursor-grab active:cursor-grabbing' : ''}`}
            onPointerDown={onPointerDown} onPointerMove={onPointerMove}
            onPointerUp={onPointerUp} onPointerCancel={onPointerUp}
+           onPointerLeave={onPointerLeave}
            onClick={event => event.stopPropagation()}
            onDoubleClick={resetView}>
         {canNavigate && (
@@ -295,7 +307,9 @@ export function ImImageLightbox({ source, onClose }: Props) {
                     disabled={currentIndex <= 0}
                     onPointerDown={event => event.stopPropagation()}
                     onClick={event => { event.stopPropagation(); goTo(currentIndex - 1) }}
-                    className="absolute left-3 top-1/2 z-10 flex h-11 w-11 -translate-y-1/2 items-center justify-center rounded-full border border-border/60 bg-card/90 text-muted-foreground shadow-lg transition-colors hover:bg-accent hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40 cursor-pointer">
+                    className={`absolute left-3 top-1/2 z-10 flex h-11 w-11 -translate-y-1/2 items-center justify-center rounded-full bg-[#929292] text-[#F7F7F7] shadow-md transition-all
+                      ${hoverSide === 'left' ? 'opacity-100' : 'pointer-events-none opacity-0'}
+                      hover:bg-[#7d7d7d] disabled:cursor-not-allowed disabled:opacity-30`}>
               <ChevronLeft size={24} />
             </button>
             <button type="button" data-im-lightbox-next
@@ -303,7 +317,9 @@ export function ImImageLightbox({ source, onClose }: Props) {
                     disabled={currentIndex >= gallery.length - 1}
                     onPointerDown={event => event.stopPropagation()}
                     onClick={event => { event.stopPropagation(); goTo(currentIndex + 1) }}
-                    className="absolute right-3 top-1/2 z-10 flex h-11 w-11 -translate-y-1/2 items-center justify-center rounded-full border border-border/60 bg-card/90 text-muted-foreground shadow-lg transition-colors hover:bg-accent hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40 cursor-pointer">
+                    className={`absolute right-3 top-1/2 z-10 flex h-11 w-11 -translate-y-1/2 items-center justify-center rounded-full bg-[#929292] text-[#F7F7F7] shadow-md transition-all
+                      ${hoverSide === 'right' ? 'opacity-100' : 'pointer-events-none opacity-0'}
+                      hover:bg-[#7d7d7d] disabled:cursor-not-allowed disabled:opacity-30`}>
               <ChevronRight size={24} />
             </button>
           </>

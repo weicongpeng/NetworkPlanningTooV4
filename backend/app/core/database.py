@@ -286,6 +286,13 @@ def init_db():
                 "AND m.id > im_conversation_members.last_read_message_id "
                 "AND m.sender_id != im_conversation_members.user_id)"
             )
+        # 入群起点：新成员只加载加入后的消息。存量成员默认 0（维持旧语义，可读全历史），
+        # 避免一次性回填把老成员的历史聊天也藏掉。
+        if im_member_cols and "joined_message_id" not in im_member_cols:
+            conn.exec_driver_sql(
+                "ALTER TABLE im_conversation_members "
+                "ADD COLUMN joined_message_id INTEGER NOT NULL DEFAULT 0"
+            )
         # 存量库可能缺模型声明里的索引（create_all 只作用于新表），显式补建。
         # IF NOT EXISTS 让每次启动的代价只是两次元数据查找。
         conn.exec_driver_sql(

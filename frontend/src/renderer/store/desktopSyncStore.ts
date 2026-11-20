@@ -16,6 +16,7 @@ interface DesktopSyncState {
 }
 
 let timer: number | null = null
+let frozenNotifiedAt: string | null = null
 
 export const useDesktopSyncStore = create<DesktopSyncState>((set, get) => ({
   status: null,
@@ -32,6 +33,19 @@ export const useDesktopSyncStore = create<DesktopSyncState>((set, get) => ({
         const next = res.data
         const prev = get().status
         set({ status: next })
+
+        // 跨档切回共享时冻结的旧改动：暂停上行以防覆盖同组数据，提示一次并引导确认
+        const frozen = next?.frozen_local_changes
+        const frozenKey = frozen?.frozen_at ? `${frozen.frozen_at}:${frozen.reason ?? ''}` : null
+        if (frozenKey && frozenKey !== frozenNotifiedAt) {
+          frozenNotifiedAt = frozenKey
+          useToastStore.getState().show(
+            '检测到切换模式前遗留的未同步改动，已暂停上行以防覆盖同组数据；'
+            + '请在同步设置中确认丢弃或恢复（恢复后将重新上行）。',
+          )
+        } else if (!frozenKey) {
+          frozenNotifiedAt = null
+        }
 
         // 新一次同步落地：提示结果并通知页面刷新（避免正在用的数据仍旧是旧版本）
         // 首次轮询（prev=null）只做基线：不弹提示，但若上次同步已有落地变更

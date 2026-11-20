@@ -39,6 +39,7 @@ class AuthService:
         username: str,
         is_admin: bool,
         expires_delta: Optional[timedelta] = None,
+        profile: str = "",
     ) -> Tuple[str, str]:
         """创建JWT令牌，返回 (token, jti)。
 
@@ -55,6 +56,8 @@ class AuthService:
             "username": username,
             "is_admin": is_admin,
             "jti": jti,
+            # 桌面端两档同密钥签 token，必须带档声明防止跨档复用（网页端为空）
+            "profile": str(profile or ""),
             "exp": expire,
             "iat": datetime.now(timezone.utc),
         }

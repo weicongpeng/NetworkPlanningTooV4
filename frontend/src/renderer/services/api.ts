@@ -584,6 +584,13 @@ export const desktopCloudApi = {
     return apiClient.get('/desktop/sync-status') as any
   },
 
+  /** 确认跨档切换前冻结的旧改动：discard=丢弃 / restore=恢复为待上行 */
+  resolveFrozenChanges: async (
+    action: 'discard' | 'restore',
+  ): Promise<ApiResponse<DesktopSyncStatus>> => {
+    return apiClient.post('/desktop/sync-frozen-resolve', { action }) as any
+  },
+
   // 登录态校验：同一账号在别处登录时返回 valid=false；单机模式顺带返回离线状态与授权校验结果
   getSessionStatus: async (): Promise<
     ApiResponse<{
@@ -888,6 +895,13 @@ export interface DesktopSyncStatus {
   pending_uploads: number
   conflicts: { data_id: string; name: string; server_rev: number; local_rev: number }[]
   synced_datasets: number
+  /** 跨档切换前被冻结的旧待上行改动（已停止上行，需用户确认丢弃/恢复） */
+  frozen_local_changes?: {
+    frozen_at: string
+    reason: string
+    datasets: Record<string, unknown>
+    pending_deletes: string[]
+  } | null
 }
 
 /** 桌面端登录态校验结果（同一账号在别处登录时 valid=false） */
