@@ -36,6 +36,29 @@ def test_bound_port_is_stable_across_restarts(tmp_path):
     assert port2 == port
 
 
+def test_app_url_keeps_bundled_backend_without_dev_flag(monkeypatch):
+    launcher = _load_launcher()
+    monkeypatch.delenv("NPT_DESKTOP_DEV_URL", raising=False)
+    monkeypatch.setattr(launcher, "_asset_version", lambda: "12345")
+
+    assert launcher._app_url(18789) == "http://127.0.0.1:18789/?v=12345"
+    assert launcher._app_url(18789, "") == "http://127.0.0.1:18789/?v=12345"
+
+
+def test_app_url_uses_dev_url_when_explicit(monkeypatch):
+    launcher = _load_launcher()
+    monkeypatch.setattr(launcher, "_asset_version", lambda: "12345")
+
+    # 命令行参数优先
+    assert launcher._app_url(18789, "http://127.0.0.1:5173/") == "http://127.0.0.1:5173/"
+    # 环境变量同样生效，且 dev URL 不追加 ?v= 缓存参数
+    monkeypatch.setenv("NPT_DESKTOP_DEV_URL", "http://127.0.0.1:5173")
+    assert launcher._app_url(18789) == "http://127.0.0.1:5173"
+    # 空白值回落到正常路径
+    monkeypatch.setenv("NPT_DESKTOP_DEV_URL", "   ")
+    assert launcher._app_url(18789) == "http://127.0.0.1:18789/?v=12345"
+
+
 def test_saved_port_file_is_ignored_when_corrupt(tmp_path):
     launcher = _load_launcher()
     (tmp_path / launcher.PORT_STATE_FILE).write_text("not-json", encoding="utf-8")

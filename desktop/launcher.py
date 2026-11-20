@@ -162,6 +162,16 @@ def _asset_version() -> str:
         return "0"
 
 
+def _app_url(port: int, dev_url: str = "") -> str:
+    """窗口最终加载的 URL：开发模式用 Vite dev server，默认仍由壳内后端托管构建产物。
+
+    `NPT_DESKTOP_DEV_URL` / `--dev-url` 只在显式给出时生效；生产路径一字不改。
+    dev URL 原样使用，不追加 `?v=` 缓存参数（HMR 由 Vite 自己管）。
+    """
+    dev = (dev_url or os.environ.get("NPT_DESKTOP_DEV_URL", "")).strip()
+    return dev or f"http://127.0.0.1:{port}/?v={_asset_version()}"
+
+
 def _desktop_version() -> str:
     """读取打包时注入的 version.json（CI 在 PyInstaller 前写入；缺失返回空串）。"""
     try:
@@ -1552,6 +1562,10 @@ def main(argv: Optional[list] = None) -> int:
     parser.add_argument(
         "--selftest", action="store_true", help="启动后端并执行冒烟测试后退出（CI 用）"
     )
+    parser.add_argument(
+        "--dev-url", default=os.environ.get("NPT_DESKTOP_DEV_URL", ""),
+        help="开发调试：让窗口加载指定 URL（如 Vite dev server），留空走正常构建产物",
+    )
     args = parser.parse_args(argv)
 
     # 编码加固必须早于任何 print/日志：桌面端不走 backend/main.py，Windows 下业务
@@ -1605,9 +1619,11 @@ def main(argv: Optional[list] = None) -> int:
     window = _create_window()
     _log.info("打开桌面窗口（启动页），等待后端就绪")
     # private_mode=False + storage_path：localStorage 持久化（否则每次启动掉登录）
+    app_url = _app_url(port, args.dev_url)
+    _log.info("窗口加载地址: %s", app_url)
     webview.start(
         _open_when_ready,
-        (window, port, f"http://127.0.0.1:{port}/?v={_asset_version()}"),
+        (window, port, app_url),
         private_mode=False,
         storage_path=str(data_root / "webview"),
     )

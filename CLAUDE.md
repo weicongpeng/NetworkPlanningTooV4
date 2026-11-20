@@ -97,6 +97,19 @@ ISCC desktop/installer.iss                              # → installer-out/NetO
 - CI 触发：`workflow_dispatch`、push 到 `feat/windows-desktop`、push tag `desktop-v*`；仅 tag 触发时用 `gh release create` 发布安装包
 - CI 会跑桌面相关 pytest（`test_desktop_license*` / `test_desktop_local_*` / `test_desktop_releases` / `test_desktop_update_client` / `test_desktop_shared_mode` 等）并校验打包产物含 gdal/proj DLL、`proj.db`、`WebView2Loader.dll`、`frontend/dist-renderer/index.html`
 
+#### 桌面端快速验证（dev URL 开关，无需打包）
+
+前端改动想秒级看效果、同时又要保留 `/api/v1/desktop/*` 壳层能力时，让 pywebview 直接加载 Vite dev server：
+
+```bash
+# 终端 1：Vite dev server（/api 与 /layer-files 转发到 launcher 的 18789；上传直连地址同步覆盖；业务 WS 走 /api）
+cd frontend && NPT_DESKTOP_DEV_URL=http://127.0.0.1:5173 npm run dev
+# 终端 2：源码启动桌面壳（后端仍由 launcher 启动并注入窗口控制/截图等 bridge）
+cd /home/pwc/NetworkPlanningTooV3 && NPT_DESKTOP_DEV_URL=http://127.0.0.1:5173 python desktop/launcher.py
+```
+
+也可用 `python desktop/launcher.py --dev-url http://127.0.0.1:5173`。后端端口默认 18789，不同可用 `NPT_DEV_BACKEND_PORT` 覆盖；显式 `VITE_API_URL` 优先于自动推导。**开关只在 Vite `serve` 阶段生效**，`npm run build:vite` 与 PyInstaller 产物完全走原路径，生产包不含 dev URL。壳层/后端 Python 改动仍需重启 launcher（里面没有 reload）。
+
 ### 生产部署（Linux + systemd + Cloudflare Tunnel）
 
 ```bash
