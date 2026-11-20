@@ -22,7 +22,7 @@ import { useImStore } from '../../store/imStore'
 import { ImScreenshotDialog } from './ImScreenshotDialog'
 import { formatBytes } from './types'
 import type { ImLightboxSource } from './types'
-import { useImDialogGeometry } from './useImDialogGeometry'
+import { IM_DIALOG_RESIZE_HANDLES, useImDialogGeometry } from './useImDialogGeometry'
 
 const MIN_SCALE = 0.2
 const MAX_SCALE = 8
@@ -50,7 +50,7 @@ const EMPTY_GALLERY: ImLightboxSource[] = []
 export function ImImageLightbox({ source, onClose }: Props) {
   const { t } = useTranslation()
   const desktopMode = useAuthStore(s => s.desktopMode)
-  const { panelRef, maximized, toggleMaximize, startDrag, panelStyle } =
+  const { panelRef, maximized, toggleMaximize, startDrag, startResize, panelStyle } =
     useImDialogGeometry(true, desktopMode ? DESKTOP_TITLEBAR_HEIGHT : 0)
   const [url, setUrl] = useState<string | null>(null)
   const [blob, setBlob] = useState<Blob | null>(null)
@@ -218,46 +218,44 @@ export function ImImageLightbox({ source, onClose }: Props) {
     <>
       {createPortal(
     <div data-im-lightbox
-         className="fixed inset-0 z-[10000] flex bg-black/85 backdrop-blur-sm"
-         style={desktopMode ? { top: DESKTOP_TITLEBAR_HEIGHT } : undefined}
-         onClick={onClose}>
+         className="pointer-events-none fixed inset-0 z-[10000] flex"
+         style={desktopMode ? { top: DESKTOP_TITLEBAR_HEIGHT } : undefined}>
       <div ref={panelRef} data-im-lightbox-panel
-           className={`flex flex-col overflow-hidden bg-black/40 shadow-2xl
+           className={`pointer-events-auto relative flex flex-col overflow-hidden bg-card shadow-[0_20px_70px_rgba(0,0,0,0.35)]
              ${maximized ? 'h-full w-full'
-               : 'm-auto h-[88vh] w-[min(1200px,94vw)] rounded-2xl border border-white/15'}`}
-           style={panelStyle}
-           onClick={event => event.stopPropagation()}>
+               : 'm-auto h-[88vh] w-[min(1200px,94vw)] rounded-2xl border border-border'}`}
+           style={panelStyle}>
       {/* 顶部工具条：图标 + title 悬浮提示；空白区域可左键拖动窗口 */}
       <div data-im-lightbox-toolbar
-           className={`flex shrink-0 items-center justify-end gap-0.5 px-3 py-2
+           className={`flex shrink-0 items-center justify-end gap-0.5 border-b border-border/60 px-2 py-1.5
              ${maximized ? '' : 'cursor-grab active:cursor-grabbing'}`}
            onPointerDown={startDrag}
            onClick={event => event.stopPropagation()}>
-        <span className="mr-auto min-w-0 truncate pr-3 text-xs text-white/80">{current.name}</span>
+        <span className="mr-auto min-w-0 truncate pr-3 text-xs text-foreground">{current.name}</span>
         {canNavigate && (
           <span data-im-lightbox-counter
-                className="mr-2 shrink-0 text-[11px] tabular-nums text-white/60">
+                className="mr-2 shrink-0 text-[11px] tabular-nums text-muted-foreground">
             {currentIndex + 1} / {gallery.length}
           </span>
         )}
         {isImage && (
           <>
-            <span className="mr-1 w-11 text-right text-[11px] tabular-nums text-white/60">
+            <span className="mr-1 w-11 text-right text-[11px] tabular-nums text-muted-foreground">
               {Math.round(scale * 100)}%
             </span>
             <IconButton title={t('im.lightbox.zoomOut', '缩小')} onClick={() => zoomBy(1 / ZOOM_STEP)}>
-              <ZoomOut size={18} />
+              <ZoomOut size={16} />
             </IconButton>
             <IconButton title={t('im.lightbox.zoomIn', '放大')} onClick={() => zoomBy(ZOOM_STEP)}>
-              <ZoomIn size={18} />
+              <ZoomIn size={16} />
             </IconButton>
             <IconButton title={t('im.lightbox.rotateLeft', '向左旋转 90°')}
                         onClick={() => setRotation(value => (value + 270) % 360)}>
-              <RotateCcw size={18} />
+              <RotateCcw size={16} />
             </IconButton>
             <IconButton title={t('im.lightbox.rotateRight', '向右旋转 90°')}
                         onClick={() => setRotation(value => (value + 90) % 360)}>
-              <RotateCw size={18} />
+              <RotateCw size={16} />
             </IconButton>
             {blob && (
               <IconButton title={t('im.lightbox.edit', '编辑')}
@@ -269,22 +267,22 @@ export function ImImageLightbox({ source, onClose }: Props) {
         )}
         {url && (
           <IconButton title={t('im.lightbox.download', '下载')} onClick={download}>
-            <Download size={18} />
+            <Download size={16} />
           </IconButton>
         )}
         <IconButton title={t(maximized ? 'im.lightbox.restore' : 'im.lightbox.maximize',
                               maximized ? '还原' : '最大化')}
                     onClick={toggleMaximize}>
-          {maximized ? <Minimize2 size={18} /> : <Maximize2 size={18} />}
+          {maximized ? <Minimize2 size={16} /> : <Maximize2 size={16} />}
         </IconButton>
         <IconButton title={t('im.common.close', '关闭')} onClick={onClose}>
-          <X size={20} />
+          <X size={17} />
         </IconButton>
       </div>
 
       {/* 舞台：滚轮缩放 + 拖拽平移 + 双击复位 */}
       <div ref={stageRef}
-           className={`relative flex min-h-0 flex-1 items-center justify-center overflow-hidden
+           className={`relative flex min-h-0 flex-1 items-center justify-center overflow-hidden bg-black/40
              ${isImage && scale > 1 ? 'cursor-grab active:cursor-grabbing' : ''}`}
            onPointerDown={onPointerDown} onPointerMove={onPointerMove}
            onPointerUp={onPointerUp} onPointerCancel={onPointerUp}
@@ -297,7 +295,7 @@ export function ImImageLightbox({ source, onClose }: Props) {
                     disabled={currentIndex <= 0}
                     onPointerDown={event => event.stopPropagation()}
                     onClick={event => { event.stopPropagation(); goTo(currentIndex - 1) }}
-                    className="absolute left-3 top-1/2 z-10 flex h-11 w-11 -translate-y-1/2 items-center justify-center rounded-full bg-black/45 text-white/85 shadow-lg transition-colors hover:bg-black/70 hover:text-white disabled:cursor-not-allowed disabled:opacity-25 cursor-pointer">
+                    className="absolute left-3 top-1/2 z-10 flex h-11 w-11 -translate-y-1/2 items-center justify-center rounded-full border border-border/60 bg-card/90 text-muted-foreground shadow-lg transition-colors hover:bg-accent hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40 cursor-pointer">
               <ChevronLeft size={24} />
             </button>
             <button type="button" data-im-lightbox-next
@@ -305,7 +303,7 @@ export function ImImageLightbox({ source, onClose }: Props) {
                     disabled={currentIndex >= gallery.length - 1}
                     onPointerDown={event => event.stopPropagation()}
                     onClick={event => { event.stopPropagation(); goTo(currentIndex + 1) }}
-                    className="absolute right-3 top-1/2 z-10 flex h-11 w-11 -translate-y-1/2 items-center justify-center rounded-full bg-black/45 text-white/85 shadow-lg transition-colors hover:bg-black/70 hover:text-white disabled:cursor-not-allowed disabled:opacity-25 cursor-pointer">
+                    className="absolute right-3 top-1/2 z-10 flex h-11 w-11 -translate-y-1/2 items-center justify-center rounded-full border border-border/60 bg-card/90 text-muted-foreground shadow-lg transition-colors hover:bg-accent hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40 cursor-pointer">
               <ChevronRight size={24} />
             </button>
           </>
@@ -313,11 +311,11 @@ export function ImImageLightbox({ source, onClose }: Props) {
         {failed ? (
           <button type="button"
                   onClick={() => setRetryCount(value => value + 1)}
-                  className="flex items-center gap-1.5 rounded-lg bg-white/10 px-3 py-1.5 text-xs text-white/80 hover:bg-white/20 cursor-pointer">
+                  className="flex items-center gap-1.5 rounded-lg bg-muted px-3 py-1.5 text-xs text-muted-foreground hover:bg-accent hover:text-foreground cursor-pointer">
             <RotateCcw size={14} /> {t('im.message.imageFailed', '图片加载失败，重试')}
           </button>
         ) : !url ? (
-          <Loader2 size={28} className="animate-spin text-white/60" />
+          <Loader2 size={28} className="animate-spin text-muted-foreground" />
         ) : isImage ? (
           <img
             ref={imageRef}
@@ -330,11 +328,11 @@ export function ImImageLightbox({ source, onClose }: Props) {
             }}
           />
         ) : (
-          <div className="flex w-[280px] flex-col items-center gap-3 rounded-2xl border border-white/15 bg-white/5 px-6 py-7 text-white">
-            <FileIcon size={40} strokeWidth={1.3} className="text-white/70" />
+          <div className="flex w-[280px] flex-col items-center gap-3 rounded-2xl border border-border bg-background/60 px-6 py-7 text-foreground">
+            <FileIcon size={40} strokeWidth={1.3} className="text-muted-foreground" />
             <p className="w-full truncate text-center text-xs">{current.name}</p>
             {current.file && (
-              <p className="text-[11px] text-white/60">{formatBytes(current.file.size)}</p>
+              <p className="text-[11px] text-muted-foreground">{formatBytes(current.file.size)}</p>
             )}
             <button type="button" onClick={openFile}
                     className="flex items-center gap-1.5 rounded-lg bg-primary px-3 py-1.5 text-xs text-primary-foreground hover:brightness-110 cursor-pointer">
@@ -345,13 +343,12 @@ export function ImImageLightbox({ source, onClose }: Props) {
         )}
       </div>
 
-      {isImage && (
-        <p className="shrink-0 pb-3 text-center text-[11px] text-white/50">
-          {canNavigate
-            ? t('im.lightbox.hintGallery', '滚轮缩放 · 拖拽平移 · 旋转 · 双击复位 · ← → 切换图片')
-            : t('im.lightbox.hint', '滚轮缩放 · 拖拽平移 · 旋转 · 双击复位')}
-        </p>
-      )}
+      {/* 最大化时隐藏，其余状态从四边四角拖拽改窗口尺寸 */}
+      {!maximized && IM_DIALOG_RESIZE_HANDLES.map(handle => (
+        <div key={handle.dir} data-im-resize={handle.dir}
+             className={`absolute z-20 ${handle.className}`}
+             onPointerDown={event => startResize(event, handle.dir)} />
+      ))}
       </div>
     </div>,
     document.body,
@@ -376,9 +373,10 @@ function IconButton({ title, onClick, children }: {
   onClick: () => void
   children: ReactNode
 }) {
+  // 与图片编辑页工具栏按钮同款：浅色底、图标用 muted-foreground，悬浮高亮
   return (
     <button type="button" title={title} onClick={onClick}
-            className="flex h-9 w-9 items-center justify-center rounded-lg text-white/75 hover:bg-white/10 hover:text-white cursor-pointer">
+            className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-accent hover:text-foreground cursor-pointer">
       {children}
     </button>
   )

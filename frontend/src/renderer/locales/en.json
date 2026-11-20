@@ -306,8 +306,6 @@
       "restore": "Restore",
       "download": "Download",
       "openFile": "Open in new tab",
-      "hint": "Scroll to zoom · Drag to pan · Rotate · Double-click to reset",
-      "hintGallery": "Scroll to zoom · Drag to pan · Rotate · Double-click to reset · ← → switch image",
       "prev": "Previous",
       "next": "Next"
     }

@@ -153,6 +153,17 @@ def get_effective_server_url() -> str:
     return candidate if ok else public
 
 
+# 云端/隧道层 5xx 只有状态码没有业务 detail（Cloudflare 530 甚至返回 HTML），
+# 直接把 "HTTP 530" 传给前端会被当成授权被拒。这里统一换成可读的临时故障文案。
+_CLOUD_HTTP_ERROR_HINTS: Dict[int, str] = {
+    500: "授权服务器内部错误，请稍后重试",
+    502: "授权服务器网关异常，请稍后重试",
+    503: "授权服务器暂不可用，请稍后重试",
+    504: "授权服务器响应超时，请稍后重试",
+    530: "云端服务暂不可用（隧道/源站异常），请稍后重试",
+}
+
+
 def _request(method: str, path: str, payload: Optional[dict] = None, timeout: int = 20) -> dict:
     base = server_url()
     if not base:
@@ -168,13 +179,16 @@ def _request(method: str, path: str, payload: Optional[dict] = None, timeout: in
         with urllib.request.urlopen(request, timeout=timeout) as resp:
             return json.load(resp)
     except urllib.error.HTTPError as exc:
-        detail = f"HTTP {exc.code}"
+        detail = ""
         try:
             body = json.loads(exc.read().decode("utf-8", "replace"))
-            detail = body.get("detail") or body.get("message") or detail
+            detail = str(body.get("detail") or body.get("message") or "")
         except Exception:
             pass
-        raise CloudError(exc.code, str(detail)) from exc
+        # 业务 detail 优先（如「该授权已被禁用」）；没有时用可读文案，不再直出 HTTP 状态码
+        if not detail:
+            detail = _CLOUD_HTTP_ERROR_HINTS.get(exc.code, f"HTTP {exc.code}")
+        raise CloudError(exc.code, detail) from exc
     except urllib.error.URLError as exc:
         raise CloudError(0, f"无法连接授权服务器（{exc.reason}）") from exc
     except Exception as exc:  # noqa: BLE001
@@ -725,6 +739,8 @@ async def renewal_loop() -> None:
             state = load_state()
             if should_renew(info, state):
                 result = renew_local_license()
+                # 续期成功说明云端已恢复，清掉此前临时故障留下的授权异常提示
+                clear_state("license_error")
                 print(f"[DesktopCloud] 已自动续期至 {result.get('expire_date')}")
         except Exception as exc:  # noqa: BLE001
             print(f"[DesktopCloud] 自动续期未完成（忽略）：{exc}")

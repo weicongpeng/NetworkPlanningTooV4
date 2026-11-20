@@ -47,7 +47,7 @@ import {
 import type {
   Annotation, Crop as CropRect, MosaicAnnotation, MosaicPainter, Point, SourceImage, Tool,
 } from './screenshotAnnotation'
-import { useImDialogGeometry } from './useImDialogGeometry'
+import { IM_DIALOG_RESIZE_HANDLES, useImDialogGeometry } from './useImDialogGeometry'
 
 interface Props {
   open: boolean
@@ -287,8 +287,17 @@ function saveBlob(blob: Blob, fileName: string) {
   window.setTimeout(() => URL.revokeObjectURL(url), 1000)
 }
 
+/**
+ * 文件名时间戳按北京时间（UTC+8）展示：toISOString() 取的是 UTC，
+ * 直接拼接会比用户本地时间少 8 小时。北京无夏令时，固定偏移即可。
+ */
+function beijingStamp(): string {
+  return new Date(Date.now() + 8 * 60 * 60 * 1000)
+    .toISOString().slice(0, 19).replace(/[:T]/g, '-')
+}
+
 function screenshotFileName(language: string): string {
-  const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')
+  const stamp = beijingStamp()
   return `${language.startsWith('en') ? 'Screenshot' : '截图'}-${stamp}.png`
 }
 
@@ -337,7 +346,7 @@ export function ImScreenshotDialog({
   const { t, i18n: i18nInstance } = useTranslation()
   const desktopMode = useAuthStore(s => s.desktopMode)
   const conversations = useImStore(s => s.conversations)
-  const { panelRef, maximized, toggleMaximize, startDrag, panelStyle } =
+  const { panelRef, maximized, size, toggleMaximize, startDrag, startResize, panelStyle } =
     useImDialogGeometry(open, desktopMode ? DESKTOP_TITLEBAR_HEIGHT : 0)
   const [source, setSource] = useState<SourceItem | null>(null)
   const [crop, setCrop] = useState<CropRect | null>(null)
@@ -515,7 +524,7 @@ export function ImScreenshotDialog({
         setNoticeKey('im.screenshot.invalidImage')
         return
       }
-      const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')
+      const stamp = beijingStamp()
       sourceElRef.current = probe
       setSource({
         id: `win-${Date.now()}`, url,
@@ -917,11 +926,10 @@ export function ImScreenshotDialog({
     <>
       {createPortal(
     <div data-screenshot-overlay
-         className="fixed inset-0 z-[10000] flex bg-black/70 backdrop-blur-sm"
-         style={desktopMode ? { top: DESKTOP_TITLEBAR_HEIGHT } : undefined}
-         onMouseDown={event => { if (event.target === event.currentTarget) onClose() }}>
+         className="pointer-events-none fixed inset-0 z-[10000] flex"
+         style={desktopMode ? { top: DESKTOP_TITLEBAR_HEIGHT } : undefined}>
       <div ref={panelRef} data-screenshot-panel
-           className={`flex flex-col overflow-hidden bg-card shadow-2xl
+           className={`pointer-events-auto relative flex flex-col overflow-hidden bg-card shadow-[0_20px_70px_rgba(0,0,0,0.35)]
         ${maximized
           ? 'h-full w-full'
           : 'm-auto h-[88vh] w-[min(1100px,94vw)] rounded-2xl border border-border'}`}
@@ -1103,7 +1111,8 @@ export function ImScreenshotDialog({
                 })}
                 className="block max-w-full select-none object-contain"
                 style={{
-                  maxHeight: `calc(${maximized ? '100vh' : '88vh'} - ${84 + (desktopMode ? DESKTOP_TITLEBAR_HEIGHT : 0)}px)`,
+                  // 拖拽改尺寸后用实际像素高度，未拖拽时保持原默认视口高度
+                  maxHeight: `calc(${maximized ? '100vh' : size ? `${size.h}px` : '88vh'} - ${84 + (desktopMode ? DESKTOP_TITLEBAR_HEIGHT : 0)}px)`,
                 }}
               />
               <canvas ref={mosaicCanvasRef}
@@ -1149,6 +1158,12 @@ export function ImScreenshotDialog({
           </div>
         )}
         {notice}
+        {/* 最大化时隐藏，其余状态从四边四角拖拽改窗口尺寸 */}
+        {!maximized && IM_DIALOG_RESIZE_HANDLES.map(handle => (
+          <div key={handle.dir} data-screenshot-resize={handle.dir}
+               className={`absolute z-20 ${handle.className}`}
+               onPointerDown={event => startResize(event, handle.dir)} />
+        ))}
       </div>
     </div>,
     document.body,

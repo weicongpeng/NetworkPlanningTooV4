@@ -142,6 +142,54 @@ describe('图片灯箱', () => {
     expect(createObjectURL).toHaveBeenCalledWith(file)
   })
 
+  it('作为独立窗口展示：无遮罩/虚化，背景点击穿透，面板自成窗口', () => {
+    const onClose = vi.fn()
+    render(<ImImageLightbox source={source} onClose={onClose} />)
+    const overlay = document.querySelector('[data-im-lightbox]') as HTMLElement
+    const panel = document.querySelector('[data-im-lightbox-panel]') as HTMLElement
+    expect(overlay.className).toContain('pointer-events-none')
+    expect(overlay.className).not.toContain('bg-black/85')
+    expect(overlay.className).not.toContain('backdrop-blur')
+    expect(panel.className).toContain('pointer-events-auto')
+    // 独立窗口点击浮层外部不关闭，背景保持可交互
+    fireEvent.click(overlay)
+    expect(onClose).not.toHaveBeenCalled()
+  })
+
+  it('UI 风格与图片编辑页一致：浅色卡片面板与带分隔线的工具栏', () => {
+    render(<ImImageLightbox source={source} onClose={() => {}} />)
+    const panel = document.querySelector('[data-im-lightbox-panel]') as HTMLElement
+    const toolbar = document.querySelector('[data-im-lightbox-toolbar]') as HTMLElement
+    expect(panel.className).toContain('bg-card')
+    expect(panel.className).not.toContain('bg-neutral-950')
+    expect(toolbar.className).toContain('border-b')
+    expect(toolbar.className).toContain('border-border/60')
+  })
+
+  it('八向热区可拖拽调整窗口尺寸，最大化时隐藏', async () => {
+    render(<ImImageLightbox source={source} onClose={() => {}} />)
+    await waitFor(() => expect(document.querySelector('img')).toBeTruthy())
+    const handles = document.querySelectorAll('[data-im-resize]')
+    expect(handles).toHaveLength(8)
+
+    const handle = document.querySelector('[data-im-resize="se"]') as HTMLElement
+    fireEvent.pointerDown(handle, { button: 0, clientX: 100, clientY: 100, pointerId: 1 })
+    fireEvent.pointerMove(handle, { clientX: 900, clientY: 700, pointerId: 1 })
+    fireEvent.pointerUp(handle, { pointerId: 1 })
+    const panel = document.querySelector('[data-im-lightbox-panel]') as HTMLElement
+    expect(panel.style.width).toBe('800px')
+    expect(panel.style.height).toBe('600px')
+
+    fireEvent.click(screen.getByTitle('最大化'))
+    expect(document.querySelectorAll('[data-im-resize]')).toHaveLength(0)
+  })
+
+  it('窗口下方不再显示操作提示文案', () => {
+    render(<ImImageLightbox source={source} onClose={() => {}} />)
+    expect(document.body.textContent).not.toContain('滚轮缩放')
+    expect(document.body.textContent).not.toContain('双击复位')
+  })
+
   it('桌面端避开自绘标题栏并置于最上层，顶部工具条不被遮挡', () => {
     desktopState.desktopMode = true
     const { unmount } = render(<ImImageLightbox source={source} onClose={() => {}} />)

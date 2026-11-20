@@ -631,6 +631,38 @@ def test_verify_pending_license_once_records_disabled_error(local_env):
     assert "禁用" in data["license_error"]
 
 
+def test_verify_pending_license_once_retries_on_server_error(local_env):
+    """云端 5xx/隧道 530 属临时故障：不报授权异常，保留待校验标记下轮再试。"""
+    (local_env.settings.LICENSE_DIR / "license.nptlic").write_text(
+        local_env.make_license(), encoding="utf-8"
+    )
+    local_env.cloud.save_state(needs_license_verify=True)
+
+    def unavailable():
+        raise local_env.cloud.CloudError(
+            530, "云端服务暂不可用（隧道/源站异常），请稍后重试"
+        )
+
+    local_env.monkeypatch.setattr(local_env.cloud, "renew_local_license", unavailable)
+    assert local_env.desktop_local.verify_pending_license_once() is None
+
+    state = local_env.cloud.load_state()
+    assert state.get("needs_license_verify") is True
+    assert not state.get("license_error")
+    # 巡检结果也不带授权异常，前端不会弹「授权校验异常」
+    assert not local_env.desktop_local.check_session_once().get("license_error")
+
+
+def test_check_session_once_clears_legacy_5xx_license_error(local_env):
+    """旧版本遗留的 HTTP 530 提示巡检时清掉；真实业务拒绝文案保留。"""
+    local_env.cloud.save_state(license_error="HTTP530")
+    assert not local_env.desktop_local.check_session_once().get("license_error")
+    assert not local_env.cloud.load_state().get("license_error")
+
+    local_env.cloud.save_state(license_error="该授权已被禁用")
+    assert local_env.desktop_local.check_session_once()["license_error"] == "该授权已被禁用"
+
+
 def test_verify_pending_license_once_skips_offline_issued(local_env):
     """离线导入的许可无法在线续期：直接清除标记，不误报授权异常。"""
     (local_env.settings.LICENSE_DIR / "license.nptlic").write_text(
@@ -783,6 +815,51 @@ def test_auth_poll_still_pending(local_env):
     )
     assert resp.status_code == 200
     assert resp.json()["data"]["result"] == "pending"
+
+
+def test_cloud_request_readable_message_on_cloudflare_530(monkeypatch):
+    """Cloudflare 530 只有 HTML 错误页：换成可读文案，不再直出 HTTP 530。"""
+    import urllib.error
+    from io import BytesIO
+
+    from app.services import desktop_cloud_client as cloud
+
+    def _boom(request, timeout):
+        raise urllib.error.HTTPError(
+            request.full_url, 530, "Origin DNS error", {},
+            BytesIO(b"<html>Error 530</html>"),
+        )
+
+    monkeypatch.setattr(cloud.settings, "NPT_SERVER_URL", "https://app.pengwc.asia")
+    monkeypatch.setattr(cloud.urllib.request, "urlopen", _boom)
+
+    with pytest.raises(cloud.CloudError) as excinfo:
+        cloud._request("POST", "/desktop-cloud/license/renew", {"license_file": "x"})
+
+    assert excinfo.value.status_code == 530
+    assert "HTTP 530" not in excinfo.value.message
+    assert "暂不可用" in excinfo.value.message
+
+
+def test_cloud_request_keeps_business_detail(monkeypatch):
+    """服务器返回业务 detail（授权被禁用等）时原样保留，不被通用文案覆盖。"""
+    import urllib.error
+    from io import BytesIO
+
+    from app.services import desktop_cloud_client as cloud
+
+    def _boom(request, timeout):
+        body = json.dumps({"detail": "该授权已被禁用"}).encode("utf-8")
+        raise urllib.error.HTTPError(request.full_url, 403, "Forbidden", {}, BytesIO(body))
+
+    monkeypatch.setattr(cloud.settings, "NPT_SERVER_URL", "https://app.pengwc.asia")
+    monkeypatch.setattr(cloud.urllib.request, "urlopen", _boom)
+
+    with pytest.raises(cloud.CloudError) as excinfo:
+        cloud._request("POST", "/desktop-cloud/license/renew", {})
+
+    assert excinfo.value.status_code == 403
+    assert excinfo.value.message == "该授权已被禁用"
 
 
 def test_session_check_never_kicks_on_server_error(monkeypatch):

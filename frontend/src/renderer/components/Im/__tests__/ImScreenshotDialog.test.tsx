@@ -261,6 +261,33 @@ describe('协作沟通截图对话框', () => {
     expect(img.style.maxHeight).toBe('calc(88vh - 116px)')
   })
 
+  it('作为独立窗口展示：无遮罩/虚化，背景点击穿透', async () => {
+    await captureFrame()
+    const overlay = document.body.querySelector('[data-screenshot-overlay]') as HTMLElement
+    const panel = document.body.querySelector('[data-screenshot-panel]') as HTMLElement
+    expect(overlay.className).toContain('pointer-events-none')
+    expect(overlay.className).not.toContain('bg-black/70')
+    expect(overlay.className).not.toContain('backdrop-blur')
+    expect(panel.className).toContain('pointer-events-auto')
+  })
+
+  it('八向热区可拖拽调整窗口尺寸，图片高度随窗口变化，最大化时隐藏', async () => {
+    const { img } = await captureFrame()
+    expect(document.body.querySelectorAll('[data-screenshot-resize]')).toHaveLength(8)
+
+    const handle = document.body.querySelector('[data-screenshot-resize="se"]') as HTMLElement
+    fireEvent.pointerDown(handle, { button: 0, clientX: 100, clientY: 100, pointerId: 1 })
+    fireEvent.pointerMove(handle, { clientX: 500, clientY: 400, pointerId: 1 })
+    fireEvent.pointerUp(handle, { pointerId: 1 })
+    const panel = document.body.querySelector('[data-screenshot-panel]') as HTMLElement
+    expect(panel.style.width).toBe('800px')
+    expect(panel.style.height).toBe('600px')
+    expect(img.style.maxHeight).toBe('calc(516px)') // 600 - 84px 工具栏留白
+
+    fireEvent.click(screen.getByTitle('最大化'))
+    expect(document.body.querySelectorAll('[data-screenshot-resize]')).toHaveLength(0)
+  })
+
   it('需求 1：抓帧成功、编辑页挂载后重试 activate（前台锁定也不停留在被选窗口）', async () => {
     desktopState.desktopMode = true
     const getDisplayMedia = vi.fn().mockResolvedValue(resolvedStream())
@@ -419,6 +446,16 @@ describe('协作沟通截图对话框', () => {
     expect(file.name).toContain('截图')
     await waitFor(() => expect(write).toHaveBeenCalledTimes(1))
     expect(onClose).toHaveBeenCalledTimes(1)
+  })
+
+  it('截图文件名时间戳按北京时间（UTC+8）生成', async () => {
+    // UTC 07:51:07 → 北京时间 15:51:07
+    vi.spyOn(Date, 'now').mockReturnValue(Date.parse('2026-11-20T07:51:07Z'))
+    await captureFrame()
+    fireEvent.click(screen.getByTitle('添加到对话框并复制到剪贴板'))
+    await waitFor(() => expect(onConfirm).toHaveBeenCalledTimes(1))
+    const file = onConfirm.mock.calls[0][0] as File
+    expect(file.name).toBe('截图-2026-11-20-15-51-07.png')
   })
 
   it('桌面端取景模式不弹出共享窗口选择器，只显示取景提示', async () => {

@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import threading
 from datetime import datetime
 from typing import Any, Dict, Literal, Optional
@@ -705,8 +706,9 @@ def verify_pending_license_once() -> Optional[str]:
     """联网时用许可续期通道补一次授权校验（离线登录后调用，不依赖密码/会话）。
 
     成功返回新到期日（顺带把过期授权续期、把到期日镜像回本机用户）；
-    授权被禁用/解绑/机器不匹配等由服务器拒绝时写 license_error 供前端提示；
-    网络不可达保留标记下轮再试，离线导入的许可无需也无法在线校验。
+    仅服务器 4xx 明确拒绝（禁用/解绑/机器不匹配等）时写 license_error 并停止重试；
+    5xx（含 Cloudflare 隧道 530）与网络不可达都属于临时故障，保留标记下轮再试，
+    避免把「云端服务暂不可用」误报成「授权校验异常」。离线导入的许可无需在线校验。
     """
     if not cloud.load_state().get("needs_license_verify"):
         return None
@@ -717,11 +719,12 @@ def verify_pending_license_once() -> Optional[str]:
     try:
         data = cloud.renew_local_license()
     except cloud.CloudError as exc:
-        if exc.status_code >= 400:
+        if 400 <= exc.status_code < 500:
             # 服务器明确拒绝（禁用/解绑/机器不匹配/许可被改）：提示用户并停止重试
             cloud.save_state(license_error=_gbk_safe(exc.message))
             cloud.clear_state("needs_license_verify")
-        return None  # 网络不可达：保留标记，下轮巡检再试
+        # status_code=0（网络不可达）或 >=500（服务端/隧道临时故障）：保留标记下轮再试
+        return None
     cloud.clear_state("needs_license_verify", "license_error")
     print(f"[DesktopAuth] 联网后授权校验通过，已续期至 {data.get('expire_date')}")
     return str(data.get("expire_date") or "")
@@ -753,6 +756,12 @@ def check_session_once() -> Dict[str, Any]:
     授权：离线登录留下的待校验标记在能连上服务器时自动校验一次。
     """
     state = cloud.load_state()
+    # 兼容旧版本误报：此前把云端 5xx / 隧道 530 当授权拒绝写进 license_error，
+    # 形如 "HTTP 530"（也可能无空格）。这类纯状态码文案清掉，真实业务拒绝文案保留。
+    stale_error = str(state.get("license_error") or "").strip()
+    if re.fullmatch(r"HTTP\s?5\d{2}", stale_error):
+        cloud.clear_state("license_error")
+        state = cloud.load_state()
     jti = (state.get("session_jti") or "").strip()
     data: Dict[str, Any] = {"valid": True}
     if jti:
