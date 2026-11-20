@@ -253,10 +253,21 @@ def test_disable_blocks_activate_and_renew(cloud_env):
 
 def test_unbind_allows_new_machine(cloud_env):
     record = _create(cloud_env.client)
-    assert _activate(cloud_env.client, record["activation_code"]).status_code == 200
+    activated = _activate(cloud_env.client, record["activation_code"])
+    assert activated.status_code == 200
+    old_license = activated.json()["data"]["license_file"]
     assert (
         cloud_env.client.post(f"/api/v1/desktop-licenses/{record['id']}/unbind").status_code == 200
     )
+
+    # 旧机器持有的签名许可必须随解绑失效，续期不得把它悄悄绑回原机器。
+    denied = cloud_env.client.post(
+        "/api/v1/desktop-cloud/license/renew",
+        json={"license_file": old_license, "machine_code": MACHINE_A},
+    )
+    assert denied.status_code == 403
+    assert "解绑" in denied.json()["detail"]
+
     resp = _activate(cloud_env.client, record["activation_code"], machine=MACHINE_B)
     assert resp.status_code == 200
     assert resp.json()["data"]["machine_code"] == MACHINE_B

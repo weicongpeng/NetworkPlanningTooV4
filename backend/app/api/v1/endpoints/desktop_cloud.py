@@ -279,7 +279,14 @@ async def desktop_session_check(
         record, _ = _verify_license(payload.license_file, payload.machine_code, db)
     except HTTPException as exc:
         if exc.status_code in (400, 403, 404, 409):
-            return {"success": True, "data": {"valid": False, "reason": _gbk_safe(str(exc.detail))}}
+            return {
+                "success": True,
+                "data": {
+                    "valid": False,
+                    "reason": _gbk_safe(str(exc.detail)),
+                    "license_invalid": True,
+                },
+            }
         raise
 
     jti = (payload.session_jti or "").strip()
@@ -433,6 +440,30 @@ async def activate_license(
     return {"success": True, "data": _payload_data(record, license_file, expire_date)}
 
 
+@router.post("/license/check")
+async def check_license(
+    payload: RenewRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """只校验授权当前状态，不续期；供没有云端会话标识的本机登录心跳使用。"""
+    _rate_limit(f"session:{_client_ip(request)}", limit=120, window=300)
+    try:
+        _verify_license(payload.license_file, payload.machine_code, db)
+    except HTTPException as exc:
+        if exc.status_code in (400, 403, 404, 409):
+            return {
+                "success": True,
+                "data": {
+                    "valid": False,
+                    "reason": _gbk_safe(str(exc.detail)),
+                    "license_invalid": True,
+                },
+            }
+        raise
+    return {"success": True, "data": {"valid": True}}
+
+
 @router.post("/license/renew")
 async def renew_license(
     payload: RenewRequest,
@@ -545,12 +576,13 @@ def _verify_license(license_file: str, machine_code: str, db: Session):
         raise HTTPException(status_code=404, detail="授权记录不存在，请联系管理员")
     if record.status == "disabled":
         raise HTTPException(status_code=403, detail="该授权已被禁用，请联系管理员")
+    if record.status != "active" or not record.machine_code:
+        raise HTTPException(status_code=403, detail="该授权已解绑或尚未激活，请重新激活")
 
     machine = normalize_machine_code(machine_code)
-    if record.machine_code:
-        stored = normalize_machine_code(record.machine_code)
-        if stored and stored != machine:
-            raise HTTPException(status_code=409, detail="许可与机器码不匹配")
+    stored = normalize_machine_code(record.machine_code)
+    if not stored or stored != machine:
+        raise HTTPException(status_code=409, detail="许可与机器码不匹配")
     return record, payload
 
 

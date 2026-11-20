@@ -511,6 +511,10 @@ def _local_offline_login(db: Session, username: str, password: str, mode: str):
         db.commit()
         return row, ""
 
+    known_denial = str(cloud.load_state().get("license_error") or "").strip()
+    if known_denial and not re.fullmatch(r"HTTP\s?5\d{2}", known_denial):
+        return None, known_denial
+
     info = license_service.desktop_license_info()
     if not info:
         return None, "no_license"
@@ -617,7 +621,7 @@ def _sync_service():
 
 
 def _force_local_logout(reason: str) -> None:
-    """账号在别处登录 → 注销本机会话并记账（前端下次请求即 401）。"""
+    """注销本机会话并记账（前端下次请求即 401）。"""
     state = cloud.load_state()
     jti = (state.get("local_jti") or "").strip()
     if jti:
@@ -630,11 +634,22 @@ def _force_local_logout(reason: str) -> None:
             pass
         finally:
             db.close()
+    # save_state 的 None 表示“不更新”，注销标识必须显式删除，否则旧 jti 会残留。
+    cloud.clear_state("session_jti", "local_jti")
     cloud.save_state(
-        session_jti=None, local_jti=None, kicked=True,
+        kicked=True,
         kicked_reason=reason or "该账号已在其它设备登录，本机已退出登录",
     )
     print(f"[DesktopAuth] {reason or '该账号已在其它设备登录'}，本机已退出登录")
+
+
+def _reject_local_license(reason: str) -> Dict[str, Any]:
+    """服务器明确撤销授权：持久化拒绝原因并注销本机令牌。"""
+    message = _gbk_safe(reason or "授权已失效，请重新登录")
+    cloud.save_state(license_error=message)
+    cloud.clear_state("needs_license_verify")
+    _force_local_logout(message)
+    return {"valid": False, "reason": message, "license_error": message}
 
 
 def notify_server_logout() -> None:
@@ -737,11 +752,10 @@ def verify_pending_license_once() -> Optional[str]:
     try:
         data = cloud.renew_local_license()
     except cloud.CloudError as exc:
-        if 400 <= exc.status_code < 500:
-            # 服务器明确拒绝（禁用/解绑/机器不匹配/许可被改）：提示用户并停止重试
-            cloud.save_state(license_error=_gbk_safe(exc.message))
-            cloud.clear_state("needs_license_verify")
-        # status_code=0（网络不可达）或 >=500（服务端/隧道临时故障）：保留标记下轮再试
+        if 400 <= exc.status_code < 500 and exc.status_code != 429:
+            # 禁用/解绑/机器不匹配等明确拒绝必须撤销本机会话，不能只给前端提示。
+            _reject_local_license(exc.message)
+        # status_code=0、429 或 >=500：保留标记下轮再试，不误伤离线使用
         return None
     cloud.clear_state("needs_license_verify", "license_error")
     print(f"[DesktopAuth] 联网后授权校验通过，已续期至 {data.get('expire_date')}")
@@ -767,19 +781,25 @@ def _local_user_payload_from_state() -> Optional[dict]:
 
 
 def check_session_once() -> Dict[str, Any]:
-    """周期性巡检：本机登录是否仍有效 + 单机模式联网后的授权校验。
-
-    登录态：只有服务器**明确回复** valid=False（账号已在别处登录）才登出；
-    网络不可达/超时/5xx 一律按"无法确定"处理，断网时继续可用。
-    授权：离线登录留下的待校验标记在能连上服务器时自动校验一次。
-    """
+    """周期性巡检本机会话与授权；仅明确失效才登出，网络故障继续离线使用。"""
     state = cloud.load_state()
-    # 兼容旧版本误报：此前把云端 5xx / 隧道 530 当授权拒绝写进 license_error，
-    # 形如 "HTTP 530"（也可能无空格）。这类纯状态码文案清掉，真实业务拒绝文案保留。
+    if state.get("kicked"):
+        result: Dict[str, Any] = {
+            "valid": False,
+            "reason": state.get("kicked_reason") or "登录已失效，请重新登录",
+        }
+        if state.get("license_error"):
+            result["license_error"] = state["license_error"]
+        return result
+
+    # 兼容旧版本误报：纯 HTTP 5xx 是临时故障，真实业务拒绝则立即撤销本机会话。
     stale_error = str(state.get("license_error") or "").strip()
     if re.fullmatch(r"HTTP\s?5\d{2}", stale_error):
         cloud.clear_state("license_error")
         state = cloud.load_state()
+    elif stale_error:
+        return _reject_local_license(stale_error)
+
     jti = (state.get("session_jti") or "").strip()
     data: Dict[str, Any] = {"valid": True}
     if jti:
@@ -789,32 +809,45 @@ def check_session_once() -> Dict[str, Any]:
             result = {"valid": True, "offline": True, "reason": str(exc)}
         if result.get("valid") is False:
             reason = str(result.get("reason") or "")
+            if result.get("license_invalid"):
+                return _reject_local_license(reason)
             _force_local_logout(reason)
             return {"valid": False, "reason": reason}
-        if result.get("offline"):
-            # 服务器不可达/异常：按"无法确定"处理（断网继续用，不踢下线）
-            data["offline"] = True
-        else:
-            # 心跳能到达服务器：前端据此确认已联网（清除离线提示）
-            data["offline"] = False
-        # 权限位随心跳同步：管理员改权限后运行中的桌面端无需重登即可生效
+        data["offline"] = bool(result.get("offline"))
         user_payload = _sync_permissions_from_remote(result.get("user"))
         if user_payload is not None:
             data["user"] = user_payload
     else:
         data["skipped"] = True
+        # 离线登录/批准轮询没有云端 session_jti，也必须持续检查授权，不能首次成功后就跳过。
+        if not state.get("needs_license_verify"):
+            info = license_service.desktop_license_info() or {}
+            if info.get("issued_via") == "online" and info.get("license_id"):
+                try:
+                    license_result = cloud.license_check()
+                except Exception:  # noqa: BLE001
+                    # 接口的明确授权拒绝会以 valid=false 正常返回；HTTP 404 等只可能是
+                    # 旧版服务器尚无此接口或临时网络故障，不能据此踢人。
+                    data["offline"] = True
+                else:
+                    if license_result.get("valid") is False:
+                        return _reject_local_license(str(license_result.get("reason") or ""))
+                    data["offline"] = False
 
     expire_date = verify_pending_license_once()
+    state = cloud.load_state()
+    if state.get("kicked"):
+        return {
+            "valid": False,
+            "reason": state.get("kicked_reason") or "授权已失效，请重新登录",
+            "license_error": state.get("license_error") or state.get("kicked_reason"),
+        }
     if expire_date:
         data["license_verified"] = True
         data["license_expire_date"] = expire_date
-        # 续期已把新到期日镜像到本机用户：随响应回传，授权门禁即时解除"过期"状态
         refreshed = _local_user_payload_from_state()
         if refreshed is not None:
             data["user"] = refreshed
-    license_error = cloud.load_state().get("license_error")
-    if license_error:
-        data["license_error"] = license_error
     return data
 
 
@@ -877,7 +910,8 @@ def _complete_online_login(
     user = _mirror_local_user(db, incoming, mode, password)
     info = license_service.desktop_license_info() or (fallback_license or {})
     _remember_sync_user(username)
-    # 记住服务器会话标识：后续周期性校验"是否仍是最后一次登录"
+    # 在线登录成功即清除旧撤销标记，重新登录是恢复授权后的显式入口。
+    cloud.clear_state("license_error", "needs_license_verify")
     cloud.save_state(session_jti=server_jti or None, kicked=False, kicked_reason=None)
     if mode == MODE_STANDALONE:
         # 单机模式数据本机私有，不参与服务器数据同步
@@ -906,6 +940,7 @@ def _apply_late_login_result(data: Optional[Dict[str, Any]]) -> None:
             _sync_permissions_from_remote(incoming)
         server_jti = (data.get("session_jti") or "").strip()
         if server_jti:
+            cloud.clear_state("license_error", "needs_license_verify")
             cloud.save_state(session_jti=server_jti, kicked=False, kicked_reason=None)
     except Exception as exc:  # noqa: BLE001
         print(f"[DesktopAuth] 迟到的服务器登录结果处理失败（忽略）：{exc}")

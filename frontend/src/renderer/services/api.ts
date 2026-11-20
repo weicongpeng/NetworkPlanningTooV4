@@ -602,7 +602,7 @@ export const desktopCloudApi = {
       /** 联网后自动校验授权成功（一次性，附续期后的到期日） */
       license_verified?: boolean
       license_expire_date?: string
-      /** 服务器明确拒绝的授权异常（被禁用/解绑/换机等），供前端提示 */
+      /** 服务器明确拒绝的授权异常（被禁用/解绑/换机等），前端应提示并退出登录 */
       license_error?: string
     }>
   > => {

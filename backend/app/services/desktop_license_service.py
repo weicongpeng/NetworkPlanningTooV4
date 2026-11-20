@@ -134,6 +134,15 @@ def _normalize_machine(machine_code: Optional[str]) -> str:
     return "-".join(normalized[i : i + 4] for i in range(0, 16, 4))
 
 
+def _unbound_after_activation(record: DesktopLicense) -> bool:
+    """区分管理员预建的待激活授权与激活后被管理员解绑的授权。"""
+    return (
+        record.status == "issued"
+        and not record.machine_code
+        and bool(record.activated_at)
+    )
+
+
 def _remaining_days(expire_date: Optional[str]) -> int:
     if not expire_date:
         return 0
@@ -608,15 +617,15 @@ class DesktopLicenseService:
             raise DesktopLicenseError(404, "授权记录不存在，请联系管理员")
         if record.status == "disabled":
             raise DesktopLicenseError(403, "该授权已被禁用，请联系管理员")
+        if record.status != "active" or not record.machine_code:
+            raise DesktopLicenseError(403, "该授权已解绑或尚未激活，请使用激活码重新激活")
 
         machine = _normalize_machine(machine_code)
-        if record.machine_code and record.machine_code != machine:
+        if record.machine_code != machine:
             raise DesktopLicenseError(409, "许可与本机机器码不匹配")
         if payload.get("machine_code") and payload.get("machine_code") != machine:
             raise DesktopLicenseError(409, "许可文件与本机机器码不匹配")
 
-        record.machine_code = record.machine_code or machine
-        record.status = "active"
         record.renewal_count = (record.renewal_count or 0) + 1
         record.last_renewed_at = _iso()
         record.client_version = (client_version or "").strip() or record.client_version
@@ -742,6 +751,22 @@ class DesktopLicenseService:
             .first()
         )
         if record is None:
+            revoked = (
+                db.query(DesktopLicense)
+                .filter(
+                    DesktopLicense.mode == MODE_SHARED,
+                    DesktopLicense.username == user.username,
+                    DesktopLicense.machine_code.is_(None),
+                    DesktopLicense.status == "issued",
+                    DesktopLicense.activated_at.isnot(None),
+                )
+                .first()
+            )
+            if revoked is not None:
+                raise DesktopLicenseError(
+                    403, "该账号的共享授权已解绑，请使用激活码重新激活"
+                )
+        if record is None:
             record = DesktopLicense(
                 mode=MODE_SHARED,
                 username=user.username,
@@ -757,6 +782,8 @@ class DesktopLicenseService:
             db.add(record)
         if record.status == "disabled":
             raise DesktopLicenseError(403, "该授权已被禁用，请联系管理员")
+        if record.status != "active":
+            raise DesktopLicenseError(403, "该授权尚未激活，请联系管理员")
         record.licensee_username = user.username
         record.user_id = user.id
         record.city = user.city
@@ -956,6 +983,10 @@ class DesktopLicenseService:
             if record.status == "disabled":
                 db.commit()
                 raise DesktopLicenseError(403, "该账号的单机授权已被禁用，请联系管理员")
+            if _unbound_after_activation(record):
+                raise DesktopLicenseError(
+                    403, "该账号的单机授权已解绑，请使用激活码重新激活"
+                )
             if record.machine_code and record.machine_code != machine:
                 db.commit()
                 raise DesktopLicenseError(409, "该单机授权已绑定其它机器，换机请联系管理员解绑")
@@ -1018,6 +1049,10 @@ class DesktopLicenseService:
                 "status": record.status,
                 "message": record.review_note or "授权申请未通过，请联系管理员",
             }
+        if _unbound_after_activation(record):
+            raise DesktopLicenseError(
+                403, "该账号的单机授权已解绑，请使用激活码重新激活"
+            )
 
         record.status = "active"
         record.activated_at = _iso()

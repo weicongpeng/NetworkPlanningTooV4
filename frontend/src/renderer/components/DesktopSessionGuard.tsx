@@ -10,7 +10,7 @@ import { useToastStore } from '../store/toastStore'
  *
  * 同时消费巡检结果：
  * - 离线/在线状态（单机模式离线登录后，联网即自动校验授权）
- * - 授权校验通过（一次性提示续期后的到期日）/ 授权异常（服务器明确拒绝时提示）
+ * - 授权校验通过（一次性提示续期后的到期日）；授权异常（服务器明确拒绝）则提示并退出
  */
 export function DesktopSessionGuard() {
   const { t } = useTranslation()
@@ -48,15 +48,20 @@ export function DesktopSessionGuard() {
             })
           )
         }
-        if (data?.license_error && data.license_error !== lastLicenseError.current) {
-          lastLicenseError.current = data.license_error
+        if (data?.license_error) {
           useAuthStore.getState().setDesktopOffline(false)
-          useToastStore.getState().show(
-            t('desktopAuth.licenseError', {
-              message: data.license_error,
-              defaultValue: '授权校验异常：{{message}}',
-            })
-          )
+          if (data.license_error !== lastLicenseError.current) {
+            lastLicenseError.current = data.license_error
+            useToastStore.getState().show(
+              t('desktopAuth.licenseError', {
+                message: data.license_error,
+                defaultValue: '授权校验异常：{{message}}',
+              })
+            )
+          }
+          // 明确授权拒绝是终态：兼容旧本机后端仍返回 valid=true 的情况，必须退出而不是只提示。
+          await useAuthStore.getState().logout()
+          return
         }
         // 心跳同时同步权限位：管理员在「用户管理 → 编辑」改动后无需重登即生效
         if (data?.user) {

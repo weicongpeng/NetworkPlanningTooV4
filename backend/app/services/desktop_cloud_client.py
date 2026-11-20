@@ -552,6 +552,22 @@ def app_version() -> Dict[str, Any]:
     return resp.get("data") or {}
 
 
+def license_check() -> Dict[str, Any]:
+    """只校验本机在线许可，不续期、不依赖云端登录会话。"""
+    from app.utils.machine_code import get_machine_code
+
+    resp = _request(
+        "POST",
+        "/desktop-cloud/license/check",
+        {
+            "license_file": _license_file_text(),
+            "machine_code": get_machine_code(),
+        },
+        timeout=15,
+    )
+    return resp.get("data") or {}
+
+
 def session_check(session_jti: str) -> Dict[str, Any]:
     """登录态校验：本机本次登录是否仍是该账号的最后一次登录。
 

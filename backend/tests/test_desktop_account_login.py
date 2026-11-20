@@ -404,6 +404,115 @@ def test_session_check_rejects_unknown_or_invalid_license(login_env):
     assert resp2.json()["data"]["valid"] is False
 
 
+@pytest.mark.parametrize("mode", ["shared", "standalone"])
+def test_disable_revokes_session_and_blocks_relogin(login_env, mode):
+    first = _login(login_env.client, "alice", "alice-pwd", mode=mode)
+    if mode == "standalone":
+        license_id = first.json()["data"]["license_id"]
+        assert login_env.client.post(
+            f"/api/v1/desktop-licenses/{license_id}/approve", json={}
+        ).status_code == 200
+        first = _login(login_env.client, "alice", "alice-pwd", mode=mode)
+
+    data = first.json()["data"]
+    license_id = data["license_id"]
+    assert login_env.client.post(
+        f"/api/v1/desktop-licenses/{license_id}/disable"
+    ).status_code == 200
+
+    check = login_env.client.post(
+        "/api/v1/desktop-cloud/auth/session-check",
+        json={
+            "license_file": data["license_file"],
+            "machine_code": MACHINE_A,
+            "session_jti": data["session_jti"],
+        },
+    )
+    assert check.json()["data"]["valid"] is False
+    assert check.json()["data"]["license_invalid"] is True
+
+    denied = _login(login_env.client, "alice", "alice-pwd", mode=mode)
+    assert denied.status_code == 403
+    assert "禁用" in denied.json()["detail"]
+
+
+def test_license_check_reports_revocation(login_env):
+    """无会话授权心跳：active 返回 valid=true，禁用后返回明确失效原因。"""
+    ok = _login(login_env.client, "alice", "alice-pwd", mode="shared")
+    data = ok.json()["data"]
+
+    def check():
+        return login_env.client.post(
+            "/api/v1/desktop-cloud/license/check",
+            json={"license_file": data["license_file"], "machine_code": MACHINE_A},
+        ).json()["data"]
+
+    assert check()["valid"] is True
+    assert login_env.client.post(
+        f"/api/v1/desktop-licenses/{data['license_id']}/disable"
+    ).status_code == 200
+    denied = check()
+    assert denied["valid"] is False
+    assert denied["license_invalid"] is True
+    assert "禁用" in denied["reason"]
+
+
+def test_standalone_precreated_license_can_still_be_claimed(login_env):
+    """管理员预先签发但从未激活的单机授权，首次登录仍可直接认领。"""
+    created = login_env.client.post(
+        "/api/v1/desktop-licenses",
+        json={"licensee_username": "alice", "username": "alice"},
+    )
+    assert created.status_code == 200, created.text
+
+    resp = _login(login_env.client, "alice", "alice-pwd", mode="standalone")
+    assert resp.status_code == 200, resp.text
+    data = resp.json()["data"]
+    assert data["result"] == "ok"
+    assert data["machine_code"] == MACHINE_A
+
+
+@pytest.mark.parametrize("mode", ["shared", "standalone"])
+def test_unbind_revokes_session_and_blocks_password_reactivation(login_env, mode):
+    first = _login(login_env.client, "alice", "alice-pwd", mode=mode)
+    if mode == "standalone":
+        license_id = first.json()["data"]["license_id"]
+        assert login_env.client.post(
+            f"/api/v1/desktop-licenses/{license_id}/approve", json={}
+        ).status_code == 200
+        first = _login(login_env.client, "alice", "alice-pwd", mode=mode)
+
+    data = first.json()["data"]
+    license_id = data["license_id"]
+    assert login_env.client.post(
+        f"/api/v1/desktop-licenses/{license_id}/unbind"
+    ).status_code == 200
+
+    check = login_env.client.post(
+        "/api/v1/desktop-cloud/auth/session-check",
+        json={
+            "license_file": data["license_file"],
+            "machine_code": MACHINE_A,
+            "session_jti": data["session_jti"],
+        },
+    )
+    assert check.json()["data"]["valid"] is False
+    assert check.json()["data"]["license_invalid"] is True
+    assert "解绑" in check.json()["data"]["reason"]
+
+    denied = _login(login_env.client, "alice", "alice-pwd", mode=mode)
+    assert denied.status_code == 403
+    assert "解绑" in denied.json()["detail"]
+
+    db = login_env.session_factory()
+    try:
+        record = db.query(DesktopLicense).filter(DesktopLicense.id == license_id).first()
+        assert record.status == "issued"
+        assert record.machine_code is None
+    finally:
+        db.close()
+
+
 def test_session_check_returns_current_permissions(login_env):
     """心跳回传账号当前权限位：管理员在「用户管理 → 编辑」改动后桌面端可即时同步。"""
     from app.services.auth_service import auth_service

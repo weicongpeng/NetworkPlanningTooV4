@@ -610,11 +610,14 @@ def test_verify_pending_license_renews_expired_license(local_env):
 
 
 def test_verify_pending_license_once_records_disabled_error(local_env):
-    """服务器明确拒绝（授权被禁用）：记录错误供前端提示，并停止重试。"""
+    """服务器明确拒绝（授权被禁用）：撤销本机会话并停止重试，而不是只提示。"""
     (local_env.settings.LICENSE_DIR / "license.nptlic").write_text(
         local_env.make_license(), encoding="utf-8"
     )
-    local_env.cloud.save_state(needs_license_verify=True)
+    local_env.cloud.save_state(needs_license_verify=True, local_jti="local-jti")
+    import app.core.database as core_database
+
+    local_env.monkeypatch.setattr(core_database, "SessionLocal", local_env.session_factory)
 
     def denied():
         raise local_env.cloud.CloudError(403, "该授权已被禁用，请联系管理员")
@@ -626,9 +629,13 @@ def test_verify_pending_license_once_records_disabled_error(local_env):
     state = local_env.cloud.load_state()
     assert not state.get("needs_license_verify")
     assert "禁用" in state["license_error"]
-    # 错误也会随巡检结果带给前端
+    assert state.get("kicked") is True
+    assert "local_jti" not in state
+
+    # 撤销是终态：巡检必须返回 valid=false，前端据此清理登录态。
     data = local_env.desktop_local.check_session_once()
-    assert "禁用" in data["license_error"]
+    assert data["valid"] is False
+    assert "禁用" in data["reason"]
 
 
 def test_verify_pending_license_once_retries_on_server_error(local_env):
@@ -654,13 +661,104 @@ def test_verify_pending_license_once_retries_on_server_error(local_env):
 
 
 def test_check_session_once_clears_legacy_5xx_license_error(local_env):
-    """旧版本遗留的 HTTP 530 提示巡检时清掉；真实业务拒绝文案保留。"""
+    """旧版本遗留的 HTTP 530 提示巡检时清掉；真实业务拒绝必须撤销登录。"""
     local_env.cloud.save_state(license_error="HTTP530")
     assert not local_env.desktop_local.check_session_once().get("license_error")
     assert not local_env.cloud.load_state().get("license_error")
 
     local_env.cloud.save_state(license_error="该授权已被禁用")
-    assert local_env.desktop_local.check_session_once()["license_error"] == "该授权已被禁用"
+    data = local_env.desktop_local.check_session_once()
+    assert data["valid"] is False
+    assert "禁用" in data["reason"]
+    assert local_env.cloud.load_state().get("kicked") is True
+
+
+def test_check_session_without_cloud_session_still_rechecks_license(local_env):
+    """离线登录/批准轮询没有云端 jti：后续心跳也必须持续检查授权状态。"""
+    (local_env.settings.LICENSE_DIR / "license.nptlic").write_text(
+        local_env.make_license(), encoding="utf-8"
+    )
+    local_env.cloud.save_state(session_jti=None)
+    local_env.monkeypatch.setattr(
+        local_env.cloud,
+        "license_check",
+        lambda: {"valid": False, "reason": "该授权已被禁用，请联系管理员"},
+    )
+
+    data = local_env.desktop_local.check_session_once()
+
+    assert data["valid"] is False
+    assert "禁用" in data["reason"]
+    state = local_env.cloud.load_state()
+    assert state.get("kicked") is True
+    assert "禁用" in state.get("license_error", "")
+
+
+def test_check_session_without_cloud_session_tolerates_network_error(local_env):
+    """无 jti 的授权心跳遇网络故障仍按离线处理，不能误踢用户。"""
+    (local_env.settings.LICENSE_DIR / "license.nptlic").write_text(
+        local_env.make_license(), encoding="utf-8"
+    )
+    local_env.cloud.save_state(session_jti=None)
+
+    def offline():
+        raise local_env.cloud.CloudError(503, "服务暂时不可用")
+
+    local_env.monkeypatch.setattr(local_env.cloud, "license_check", offline)
+    data = local_env.desktop_local.check_session_once()
+
+    assert data["valid"] is True
+    assert data.get("offline") is True
+    assert not local_env.cloud.load_state().get("kicked")
+
+
+def test_check_session_without_cloud_session_tolerates_missing_endpoint(local_env):
+    """旧版服务器没有授权心跳接口（404）时不得误判为授权撤销。"""
+    (local_env.settings.LICENSE_DIR / "license.nptlic").write_text(
+        local_env.make_license(), encoding="utf-8"
+    )
+    local_env.cloud.save_state(session_jti=None)
+
+    def missing():
+        raise local_env.cloud.CloudError(404, "HTTP 404")
+
+    local_env.monkeypatch.setattr(local_env.cloud, "license_check", missing)
+    data = local_env.desktop_local.check_session_once()
+
+    assert data["valid"] is True
+    assert data.get("offline") is True
+    assert not local_env.cloud.load_state().get("kicked")
+
+
+def test_known_license_denial_blocks_offline_relogin(local_env):
+    """已知被禁用的授权在断网时也不能凭本机缓存重新登录。"""
+    (local_env.settings.LICENSE_DIR / "license.nptlic").write_text(
+        local_env.make_license(), encoding="utf-8"
+    )
+    db = local_env.session_factory()
+    try:
+        db.add(User(
+            username="alice",
+            password_hash=auth_service.hash_password("pwd123"),
+            is_active=True,
+            desktop_run_mode="standalone",
+        ))
+        db.commit()
+    finally:
+        db.close()
+    local_env.cloud.save_state(license_error="该授权已被禁用，请联系管理员")
+
+    def offline(*args, **kwargs):
+        raise local_env.cloud.CloudError(0, "无法连接授权服务器")
+
+    local_env.monkeypatch.setattr(local_env.cloud, "login", offline)
+    resp = local_env.client.post(
+        "/api/v1/desktop/login",
+        json={"username": "alice", "password": "pwd123", "mode": "standalone"},
+    )
+
+    assert resp.status_code == 403
+    assert "禁用" in resp.json()["detail"]
 
 
 def test_verify_pending_license_once_skips_offline_issued(local_env):
