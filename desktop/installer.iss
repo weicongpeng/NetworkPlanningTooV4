@@ -4,8 +4,8 @@
 ;   1) pip install -r backend/requirements.txt -r desktop/requirements-desktop.txt
 ;   2) python desktop/tools/make_icon.py        （生成 app.ico）
 ;   3) pyinstaller --noconfirm --clean desktop/desktop.spec
-;   4) 下载 WebView2 引导安装器到 desktop/webview2/MicrosoftEdgeWebview2Setup.exe
-;      （离线机器用；缺失时安装器仍可编译，仅跳过随包安装）
+;   4) 下载 WebView2 联网引导器到 desktop/webview2/MicrosoftEdgeWebview2Setup.exe
+;      （约 2MB，仅无 WebView2 的机器安装时联网下载；离线完整包由 tag Release 单独分发）
 ;   5) ISCC desktop/installer.iss               （可用 /DMyAppVersion=x.y.z 覆盖版本号）
 ;
 ; 说明：per-user 安装（无需管理员）；用户数据在 %APPDATA%\NetworkPlanningTool，
@@ -47,7 +47,8 @@ Source: "..\dist\NetworkPlanningTool\*"; DestDir: "{app}"; Flags: ignoreversion 
 ; 快捷方式图标：随版本换名（app-{#MyAppVersion}.ico），避开 Windows 图标缓存
 ; 一直沿用旧图标的问题——换了文件名，资源管理器必然重新读取
 Source: "app.ico"; DestDir: "{app}"; DestName: "app-{#MyAppVersion}.ico"; Flags: ignoreversion
-; WebView2 引导安装器（缺失的机器上静默安装；安装完自动删除）
+; WebView2 联网引导器（缺失的机器上静默下载安装；安装完自动删除）
+; 无外网的机器请使用 Release 中单独发布的 WebView2 完整离线包
 Source: "webview2\MicrosoftEdgeWebview2Setup.exe"; DestDir: "{tmp}"; Flags: deleteafterinstall skipifsourcedoesntexist
 
 [InstallDelete]
@@ -107,8 +108,8 @@ begin
   InstallerPath := ExpandConstant('{tmp}\MicrosoftEdgeWebview2Setup.exe');
   if not FileExists(InstallerPath) then
   begin
-    MsgBox('未检测到 Microsoft Edge WebView2 运行时，且安装包内未包含引导安装器。' + #13#10 +
-           '请联网后手动安装 WebView2 运行时，否则程序无法启动。', mbError, MB_OK);
+    MsgBox('未检测到 Microsoft Edge WebView2 运行时，安装包内的联网引导器不可用。' + #13#10 +
+           '请检查网络后重新安装，或下载 Release 中单独提供的 WebView2 完整离线包手动安装。', mbError, MB_OK);
     exit;
   end;
 
