@@ -43,6 +43,7 @@ vi.mock('../../../store/authStore', () => ({
 }))
 
 import { ImScreenshotDialog } from '../ImScreenshotDialog'
+import { useImStore } from '../../../store/imStore'
 
 class FakeImage {
   onload: (() => void) | null = null
@@ -256,8 +257,8 @@ describe('协作沟通截图对话框', () => {
     const overlay = document.body.querySelector('[data-screenshot-overlay]') as HTMLElement
     expect(overlay.style.top).toBe('32px')
     expect(overlay.className).toContain('z-[10000]')
-    // 图片显示高度同步扣掉标题栏，不会被容器裁切
-    expect(img.style.maxHeight).toBe('calc(100vh - 116px)')
+    // 图片显示高度按默认还原窗口计算，并同步扣掉标题栏，不会被容器裁切
+    expect(img.style.maxHeight).toBe('calc(88vh - 116px)')
   })
 
   it('需求 1：抓帧成功、编辑页挂载后重试 activate（前台锁定也不停留在被选窗口）', async () => {
@@ -367,15 +368,28 @@ describe('协作沟通截图对话框', () => {
     await waitFor(() => expect(ctx.clearRect).toHaveBeenCalled())
   })
 
-  it('需求 3：默认全屏铺满，最大化/还原按钮在工具栏行切换窗口尺寸', async () => {
+  it('默认非最大化，最大化/还原按钮在工具栏行切换窗口尺寸', async () => {
     await captureFrame()
-    const panel = document.body.querySelector('.shadow-2xl') as HTMLElement
-    expect(panel.className).toContain('w-full')
-    // 默认全屏时图标为「还原」
-    fireEvent.click(screen.getByTitle('还原'))
+    const panel = document.body.querySelector('[data-screenshot-panel]') as HTMLElement
     expect(panel.className).toContain('rounded-2xl')
+    expect(panel.className).not.toContain('w-full')
     fireEvent.click(screen.getByTitle('最大化'))
     expect(panel.className).toContain('w-full')
+    fireEvent.click(screen.getByTitle('还原'))
+    expect(panel.className).toContain('rounded-2xl')
+  })
+
+  it('还原状态下按住工具栏左键可拖动窗口位置，最大化后禁用拖动', async () => {
+    await captureFrame()
+    const panel = document.body.querySelector('[data-screenshot-panel]') as HTMLElement
+    const toolbar = document.body.querySelector('[data-screenshot-toolbar]') as HTMLElement
+    drag(toolbar, 7, [500, 200], [560, 240])
+    expect(panel.style.transform).toBe('translate(60px, 40px)')
+    fireEvent.click(screen.getByTitle('最大化'))
+    expect(panel.style.transform).toBe('')
+    drag(toolbar, 8, [500, 200], [700, 400])
+    fireEvent.click(screen.getByTitle('还原'))
+    expect(panel.style.transform).toBe('translate(60px, 40px)')
   })
 
   it('标注矩形与文字、下载 PNG、添加到对话框同时复制剪贴板', async () => {
@@ -436,5 +450,37 @@ describe('协作沟通截图对话框', () => {
     expect(getDisplayMedia).not.toHaveBeenCalled()
     expect(onInitialConsumed).toHaveBeenCalledTimes(1)
     expect(document.body.querySelector('img')).toBeTruthy()
+  })
+
+  it('已有图片进入编辑页，导出结果可多选会话直接转发', async () => {
+    const getDisplayMedia = vi.fn()
+    setSecure(true, { getDisplayMedia })
+    const forwardImage = vi.fn().mockResolvedValue({ sent: 1, failed: 0 })
+    useImStore.setState({
+      conversations: [{
+        id: 11, kind: 'group', name: '测试群组', group_key: 'g1', other_user: null,
+        member_count: 3, last_message: null, last_message_at: null,
+        unread: 0, muted: false,
+      }] as any,
+      sendImageToConversations: forwardImage as any,
+    })
+    render(
+      <ImScreenshotDialog open onClose={onClose} onConfirm={onConfirm}
+                          captureMode="image"
+                          initialBlob={new Blob(['png'], { type: 'image/png' })} />,
+    )
+    await waitFor(() => expect(screen.getByTitle('矩形')).toBeTruthy())
+    expect(getDisplayMedia).not.toHaveBeenCalled()
+    expect(screen.queryByTitle('重新选择窗口')).toBeNull()
+
+    fireEvent.click(screen.getByTitle('转发'))
+    const dialog = await screen.findByText('测试群组')
+    fireEvent.click(dialog)
+    fireEvent.click(screen.getByText('转发', { selector: 'button' }))
+    await waitFor(() => expect(forwardImage).toHaveBeenCalledTimes(1))
+    const forwarded = forwardImage.mock.calls[0][0] as File
+    expect(forwarded.type).toBe('image/png')
+    expect(forwardImage.mock.calls[0][1]).toEqual([11])
+    expect(onConfirm).not.toHaveBeenCalled()
   })
 })

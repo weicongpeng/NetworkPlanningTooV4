@@ -13,13 +13,16 @@ import type { PointerEvent as ReactPointerEvent, ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
 import {
   ChevronLeft, ChevronRight, Download, ExternalLink, FileIcon, Loader2,
-  RotateCcw, RotateCw, X, ZoomIn, ZoomOut,
+  Maximize2, Minimize2, Pencil, RotateCcw, RotateCw, X, ZoomIn, ZoomOut,
 } from 'lucide-react'
 
 import { imApi } from '../../services/api'
 import { useAuthStore } from '../../store/authStore'
+import { useImStore } from '../../store/imStore'
+import { ImScreenshotDialog } from './ImScreenshotDialog'
 import { formatBytes } from './types'
 import type { ImLightboxSource } from './types'
+import { useImDialogGeometry } from './useImDialogGeometry'
 
 const MIN_SCALE = 0.2
 const MAX_SCALE = 8
@@ -47,7 +50,12 @@ const EMPTY_GALLERY: ImLightboxSource[] = []
 export function ImImageLightbox({ source, onClose }: Props) {
   const { t } = useTranslation()
   const desktopMode = useAuthStore(s => s.desktopMode)
+  const { panelRef, maximized, toggleMaximize, startDrag, panelStyle } =
+    useImDialogGeometry(true, desktopMode ? DESKTOP_TITLEBAR_HEIGHT : 0)
   const [url, setUrl] = useState<string | null>(null)
+  const [blob, setBlob] = useState<Blob | null>(null)
+  const [editorOpen, setEditorOpen] = useState(false)
+  const [editorBlob, setEditorBlob] = useState<Blob | null>(null)
   const [failed, setFailed] = useState(false)
   const [retryCount, setRetryCount] = useState(0)
   const [scale, setScale] = useState(1)
@@ -80,21 +88,24 @@ export function ImImageLightbox({ source, onClose }: Props) {
     let objectUrl: string | null = null
     let cancelled = false
     setUrl(null)
+    setBlob(null)
     setFailed(false)
 
     const load = async () => {
       try {
-        let blob: Blob
+        let loadedBlob: Blob
         if (current.file) {
-          blob = current.file
+          loadedBlob = current.file
         } else if (current.attachmentId != null) {
-          blob = await imApi.attachmentBlob(current.attachmentId, false)
+          loadedBlob = await imApi.attachmentBlob(current.attachmentId, false)
         } else {
           throw new Error('missing source')
         }
-        objectUrl = URL.createObjectURL(blob)
-        if (!cancelled) setUrl(objectUrl)
-        else URL.revokeObjectURL(objectUrl)
+        objectUrl = URL.createObjectURL(loadedBlob)
+        if (!cancelled) {
+          setBlob(loadedBlob)
+          setUrl(objectUrl)
+        } else URL.revokeObjectURL(objectUrl)
       } catch {
         if (!cancelled) setFailed(true)
       }
@@ -131,6 +142,7 @@ export function ImImageLightbox({ source, onClose }: Props) {
   }, [isImage])
 
   useEffect(() => {
+    if (editorOpen) return
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape') { onClose(); return }
       if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return
@@ -142,7 +154,7 @@ export function ImImageLightbox({ source, onClose }: Props) {
     }
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
-  }, [onClose, canNavigate, currentIndex, gallery])
+  }, [onClose, canNavigate, currentIndex, gallery, editorOpen])
 
   const resetView = () => {
     setScale(1)
@@ -202,13 +214,24 @@ export function ImImageLightbox({ source, onClose }: Props) {
     return next
   })
 
-  return createPortal(
+  return (
+    <>
+      {createPortal(
     <div data-im-lightbox
-         className="fixed inset-0 z-[10000] flex flex-col bg-black/85 backdrop-blur-sm"
+         className="fixed inset-0 z-[10000] flex bg-black/85 backdrop-blur-sm"
          style={desktopMode ? { top: DESKTOP_TITLEBAR_HEIGHT } : undefined}
          onClick={onClose}>
-      {/* 顶部工具条：图标 + title 悬浮提示 */}
-      <div className="flex shrink-0 items-center justify-end gap-0.5 px-3 py-2"
+      <div ref={panelRef} data-im-lightbox-panel
+           className={`flex flex-col overflow-hidden bg-black/40 shadow-2xl
+             ${maximized ? 'h-full w-full'
+               : 'm-auto h-[88vh] w-[min(1200px,94vw)] rounded-2xl border border-white/15'}`}
+           style={panelStyle}
+           onClick={event => event.stopPropagation()}>
+      {/* 顶部工具条：图标 + title 悬浮提示；空白区域可左键拖动窗口 */}
+      <div data-im-lightbox-toolbar
+           className={`flex shrink-0 items-center justify-end gap-0.5 px-3 py-2
+             ${maximized ? '' : 'cursor-grab active:cursor-grabbing'}`}
+           onPointerDown={startDrag}
            onClick={event => event.stopPropagation()}>
         <span className="mr-auto min-w-0 truncate pr-3 text-xs text-white/80">{current.name}</span>
         {canNavigate && (
@@ -236,6 +259,12 @@ export function ImImageLightbox({ source, onClose }: Props) {
                         onClick={() => setRotation(value => (value + 90) % 360)}>
               <RotateCw size={18} />
             </IconButton>
+            {blob && (
+              <IconButton title={t('im.lightbox.edit', '编辑')}
+                          onClick={() => { setEditorBlob(blob); setEditorOpen(true) }}>
+                <Pencil size={17} />
+              </IconButton>
+            )}
           </>
         )}
         {url && (
@@ -243,6 +272,11 @@ export function ImImageLightbox({ source, onClose }: Props) {
             <Download size={18} />
           </IconButton>
         )}
+        <IconButton title={t(maximized ? 'im.lightbox.restore' : 'im.lightbox.maximize',
+                              maximized ? '还原' : '最大化')}
+                    onClick={toggleMaximize}>
+          {maximized ? <Minimize2 size={18} /> : <Maximize2 size={18} />}
+        </IconButton>
         <IconButton title={t('im.common.close', '关闭')} onClick={onClose}>
           <X size={20} />
         </IconButton>
@@ -318,8 +352,22 @@ export function ImImageLightbox({ source, onClose }: Props) {
             : t('im.lightbox.hint', '滚轮缩放 · 拖拽平移 · 旋转 · 双击复位')}
         </p>
       )}
+      </div>
     </div>,
     document.body,
+      )}
+      <ImScreenshotDialog
+        open={editorOpen}
+        onClose={() => { setEditorOpen(false); setEditorBlob(null) }}
+        onConfirm={file => {
+          useImStore.getState().queueScreenshot(file)
+          useImStore.getState().setOpen(true)
+        }}
+        initialBlob={editorBlob}
+        onInitialConsumed={() => setEditorBlob(null)}
+        captureMode="image"
+      />
+    </>
   )
 }
 

@@ -28,6 +28,12 @@ vi.mock('../../../services/api', () => ({
   imApi: { attachmentBlob: (...args: unknown[]) => blobMock(...args) },
 }))
 
+vi.mock('../ImScreenshotDialog', () => ({
+  ImScreenshotDialog: ({ open }: { open: boolean }) => open
+    ? <div data-testid="image-editor" />
+    : null,
+}))
+
 import { ImImageLightbox } from '../ImImageLightbox'
 
 const createObjectURL = vi.fn(() => 'blob:lightbox-1')
@@ -46,6 +52,21 @@ beforeEach(() => {
 const source = { name: 'a.png', mime: 'image/png', attachmentId: 7 }
 
 describe('图片灯箱', () => {
+  it('默认非最大化，可切换最大化；原图可进入截图编辑器', async () => {
+    render(<ImImageLightbox source={source} onClose={() => {}} />)
+    await waitFor(() => expect(document.querySelector('img')).toBeTruthy())
+    const panel = document.querySelector('[data-im-lightbox-panel]') as HTMLElement
+    expect(panel.className).toContain('rounded-2xl')
+    expect(panel.className).not.toContain('w-full')
+    fireEvent.click(screen.getByTitle('最大化'))
+    expect(panel.className).toContain('w-full')
+    fireEvent.click(screen.getByTitle('还原'))
+    expect(panel.className).toContain('rounded-2xl')
+
+    fireEvent.click(screen.getByTitle('编辑'))
+    expect(screen.getByTestId('image-editor')).toBeTruthy()
+  })
+
   it('按附件 id 拉全图，自己创建 objectURL 并显示', async () => {
     render(<ImImageLightbox source={source} onClose={() => {}} />)
     expect(blobMock).toHaveBeenCalledWith(7, false) // 拉全图而非缩略图

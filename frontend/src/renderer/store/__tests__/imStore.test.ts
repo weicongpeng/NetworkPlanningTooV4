@@ -364,6 +364,27 @@ describe('imStore', () => {
     expect(failed).toEqual([badFile])
   })
 
+  it('编辑图片可直发多个会话，单个目标失败不影响其它目标', async () => {
+    useImStore.setState({ activeConversationId: 7 })
+    const file = new File(['png'], 'edited.png', { type: 'image/png' })
+    vi.mocked(imApi.uploadAttachment)
+      .mockResolvedValueOnce({
+        id: 31, original_name: file.name, mime: file.type, size_bytes: 3, has_thumb: false,
+      } as any)
+      .mockRejectedValueOnce(new Error('upload failed'))
+    vi.mocked(imApi.send).mockResolvedValue({ success: true, data: message(32) } as any)
+
+    const result = await useImStore.getState().sendImageToConversations(file, [7, 7, 8])
+    expect(result).toEqual({ sent: 1, failed: 1 })
+    expect(imApi.uploadAttachment).toHaveBeenCalledTimes(2)
+    expect(imApi.uploadAttachment).toHaveBeenNthCalledWith(1, file, 7)
+    expect(imApi.send).toHaveBeenCalledWith(7, expect.objectContaining({
+      kind: 'image', attachment_id: 31,
+    }))
+    expect(useImStore.getState().messages[7].map(item => item.id)).toEqual([32])
+    expect(useImStore.getState().activeConversationId).toBe(7)
+  })
+
   it('收到他人消息才播放提示音，自己发出的消息不响', () => {
     localStorage.setItem('auth-storage', JSON.stringify({ state: { user: { id: 1 } } }))
     const detach = attachImEvents()

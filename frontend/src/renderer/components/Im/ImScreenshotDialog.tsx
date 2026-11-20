@@ -4,7 +4,8 @@
  * 可缩放/平移/裁剪/标注 → 生成 File 并写入剪贴板 / 对话框。
  *
  * 设计要点：
- *  - 弹窗默认全屏铺满浏览器内容窗口（无标题、无底部栏，所有操作收进顶部单行工具栏）。
+ *  - 弹窗默认以居中的还原窗口显示（无标题、无底部栏，所有操作收进顶部单行工具栏）；
+ *    按住工具栏空白区左键拖动可移动窗口，也可手动最大化。
  *  - captureMode='web'（默认，网页端）：点击剪刀按钮 / 快捷键打开弹窗时**自动**调用
  *    getDisplayMedia，直接弹出系统原生的「应用窗口」选择器（里面就是各个窗口的小图）。
  *    用户在列表里双击目标窗口缩略图即完成截图加载，随即进入编辑页。
@@ -29,13 +30,15 @@ import type { LucideIcon } from 'lucide-react'
 import {
   AppWindow, ArrowUpRight, Check, Circle, Crop, Download, Hand,
   LayoutGrid, Loader2, Maximize2, Minimize2, Monitor,
-  Palette, RefreshCw, RotateCcw, RotateCw, Slash, Square, Trash2, Type, Undo2, X,
+  Palette, RefreshCw, RotateCcw, RotateCw, Send, Slash, Square, Trash2, Type, Undo2, X,
   ZoomIn, ZoomOut,
 } from 'lucide-react'
 
 import { desktopLoginApi } from '../../services/api'
 import { useAuthStore } from '../../store/authStore'
+import { useImStore } from '../../store/imStore'
 import { useToastStore } from '../../store/toastStore'
+import { ImForwardDialog } from './ImForwardDialog'
 import { CAPTURE_FLAG } from './screenshotBus'
 import {
   arrowPoints, clamp, composeFullImage, createMosaicTile, drawMosaicStrokes, fontFor,
@@ -44,6 +47,7 @@ import {
 import type {
   Annotation, Crop as CropRect, MosaicAnnotation, MosaicPainter, Point, SourceImage, Tool,
 } from './screenshotAnnotation'
+import { useImDialogGeometry } from './useImDialogGeometry'
 
 interface Props {
   open: boolean
@@ -52,8 +56,8 @@ interface Props {
   /** 桌面端壳层取景产出的 PNG：直接进既有编辑页，跳过共享窗口选择器 */
   initialBlob?: Blob | null
   onInitialConsumed?: () => void
-  /** desktop：等待 initialBlob，不自动唤起 getDisplayMedia；web：保持原有窗口选择流程 */
-  captureMode?: 'web' | 'desktop'
+  /** desktop：等待壳层 initialBlob；image：编辑已有图片；web：保持窗口选择流程 */
+  captureMode?: 'web' | 'desktop' | 'image'
   /** 桌面端编辑页「重新取景」：重新发起一次壳层截图会话 */
   onRecapture?: () => void
 }
@@ -332,6 +336,9 @@ export function ImScreenshotDialog({
 }: Props) {
   const { t, i18n: i18nInstance } = useTranslation()
   const desktopMode = useAuthStore(s => s.desktopMode)
+  const conversations = useImStore(s => s.conversations)
+  const { panelRef, maximized, toggleMaximize, startDrag, panelStyle } =
+    useImDialogGeometry(open, desktopMode ? DESKTOP_TITLEBAR_HEIGHT : 0)
   const [source, setSource] = useState<SourceItem | null>(null)
   const [crop, setCrop] = useState<CropRect | null>(null)
   const [tool, setTool] = useState<Tool>('crop')
@@ -342,7 +349,8 @@ export function ImScreenshotDialog({
   const [displaySize, setDisplaySize] = useState({ width: 0, height: 0 })
   const [noticeKey, setNoticeKey] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
-  const [maximized, setMaximized] = useState(true)
+  const [forwardOpen, setForwardOpen] = useState(false)
+  const [forwardFile, setForwardFile] = useState<File | null>(null)
   // 视图：缩放 / 平移 / 抓手模式
   const [scale, setScale] = useState(1)
   const [offset, setOffset] = useState<Offset>({ x: 0, y: 0 })
@@ -423,14 +431,17 @@ export function ImScreenshotDialog({
   useEffect(() => {
     activeRef.current = open
     if (open) {
-      // 新一轮打开：允许再次自动唤起原生窗口选择器，默认全屏铺满
+      // 新一轮打开：允许再次自动唤起原生窗口选择器
       autoCaptureRef.current = false
-      setMaximized(true)
+      setForwardOpen(false)
+      setForwardFile(null)
     } else {
       dragRef.current = null
       mosaicDraftRef.current = null
       setNoticeKey(null)
       setBusy(false)
+      setForwardOpen(false)
+      setForwardFile(null)
       releaseSource()
     }
     return () => {
@@ -553,7 +564,7 @@ export function ImScreenshotDialog({
   useEffect(() => {
     if (!open || autoCaptureRef.current) return
     // 桌面端由壳层取景，绝不弹出「获取共享窗口」选择器，改为等待 initialBlob
-    if (captureMode === 'desktop') return
+    if (captureMode !== 'web') return
     if (!screenCaptureAvailable()) return
     autoCaptureRef.current = true
     const timer = window.setTimeout(() => { void onCapture(true) }, 30)
@@ -563,7 +574,7 @@ export function ImScreenshotDialog({
 
   /** 桌面端壳层裁剪好的 PNG 直接进编辑页；之后的标注 / 剪贴板 / 附件流程完全不变 */
   useEffect(() => {
-    if (!open || captureMode !== 'desktop' || !initialBlob) return
+    if (!open || captureMode === 'web' || !initialBlob) return
     loadFrame(initialBlob)
     onInitialConsumed?.()
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -637,7 +648,7 @@ export function ImScreenshotDialog({
       event.stopPropagation()
       event.preventDefault()
       if (textDraftRef.current) { setTextDraft(null); return }
-      if (source) { releaseSource(); return }
+      if (source && captureMode !== 'image') { releaseSource(); return }
       onClose()
     }
     document.addEventListener('keydown', onKeyDown, true)
@@ -862,6 +873,33 @@ export function ImScreenshotDialog({
     saveBlob(blob, screenshotFileName(i18nInstance.language))
   }
 
+  const openForward = async () => {
+    if (!source || busy) return
+    setBusy(true)
+    const blob = await renderBlob(Boolean(crop))
+    setBusy(false)
+    if (!blob) { setNoticeKey('im.screenshot.failed'); return }
+    setForwardFile(new File([blob], screenshotFileName(i18nInstance.language), { type: 'image/png' }))
+    setForwardOpen(true)
+    if (!conversations.length) void useImStore.getState().refreshConversations().catch(() => {})
+  }
+
+  const confirmForward = async (conversationIds: number[]): Promise<boolean> => {
+    if (!forwardFile) return false
+    const result = await useImStore.getState().sendImageToConversations(forwardFile, conversationIds)
+    if (result.failed === 0) {
+      useToastStore.getState().show(t('im.screenshot.forwardSuccess',
+        '已转发到 {{count}} 个会话', { count: result.sent }))
+    } else if (result.sent > 0) {
+      useToastStore.getState().show(t('im.screenshot.forwardPartial',
+        '已转发 {{sent}} 个会话，{{failed}} 个失败', result))
+    } else {
+      useToastStore.getState().show(t('im.message.forwardFailed', '转发失败，请稍后重试'))
+    }
+    setForwardFile(null)
+    return true
+  }
+
   const scaleX = source && displaySize.width ? source.width / displaySize.width : 1
   const scaleY = source && displaySize.height ? source.height / displaySize.height : 1
   const notice = noticeKey ? (
@@ -875,18 +913,25 @@ export function ImScreenshotDialog({
 
   // 必须挂到 body：ImComposer 有 backdrop-blur、ImWindow 有 transform + overflow-hidden，
   // 都会给 position:fixed 创建新的包含块，导致遮罩只有输入框那么大且面板被裁掉。
-  return createPortal(
+  return (
+    <>
+      {createPortal(
     <div data-screenshot-overlay
          className="fixed inset-0 z-[10000] flex bg-black/70 backdrop-blur-sm"
          style={desktopMode ? { top: DESKTOP_TITLEBAR_HEIGHT } : undefined}
          onMouseDown={event => { if (event.target === event.currentTarget) onClose() }}>
-      <div className={`flex flex-col overflow-hidden bg-card shadow-2xl
+      <div ref={panelRef} data-screenshot-panel
+           className={`flex flex-col overflow-hidden bg-card shadow-2xl
         ${maximized
           ? 'h-full w-full'
-          : 'm-auto h-[88vh] w-[min(1100px,94vw)] rounded-2xl border border-border'}`}>
+          : 'm-auto h-[88vh] w-[min(1100px,94vw)] rounded-2xl border border-border'}`}
+           style={panelStyle}>
 
-        {/* 单行工具栏：左侧编辑工具，右侧操作按钮 + 窗口控制（全部图标 + 悬浮提示） */}
-        <div className="flex shrink-0 flex-wrap items-center gap-0.5 border-b border-border/60 px-2 py-1.5">
+        {/* 单行工具栏：左侧编辑工具，右侧操作按钮 + 窗口控制；空白区左键拖动 */}
+        <div data-screenshot-toolbar
+             className={`flex shrink-0 flex-wrap items-center gap-0.5 border-b border-border/60 px-2 py-1.5
+               ${maximized ? '' : 'cursor-grab active:cursor-grabbing'}`}
+             onPointerDown={startDrag}>
           {source && (
             <>
               {TOOL_ITEMS.map(item => {
@@ -952,6 +997,10 @@ export function ImScreenshotDialog({
                           onClick={() => setRotation(value => (value + 90) % 360)}>
                 <RotateCw size={16} />
               </IconButton>
+              <IconButton title={t('im.message.forward', '转发')}
+                          disabled={busy} onClick={() => void openForward()}>
+                <Send size={16} />
+              </IconButton>
             </>
           )}
 
@@ -959,15 +1008,17 @@ export function ImScreenshotDialog({
 
           {source && (
             <>
-              <IconButton title={captureMode === 'desktop'
-                                ? t('im.screenshot.recapture', '重新取景')
-                                : t('im.screenshot.reselect', '重新选择窗口')}
-                          onClick={() => {
-                            releaseSource()
-                            if (captureMode === 'desktop') onRecapture?.()
-                          }}>
-                <RefreshCw size={16} />
-              </IconButton>
+              {captureMode !== 'image' && (
+                <IconButton title={captureMode === 'desktop'
+                                  ? t('im.screenshot.recapture', '重新取景')
+                                  : t('im.screenshot.reselect', '重新选择窗口')}
+                            onClick={() => {
+                              releaseSource()
+                              if (captureMode === 'desktop') onRecapture?.()
+                            }}>
+                  <RefreshCw size={16} />
+                </IconButton>
+              )}
               <IconButton title={t('im.screenshot.downloadHint', '下载为 PNG')}
                           disabled={busy} onClick={() => void onDownload()}>
                 <Download size={16} />
@@ -981,7 +1032,7 @@ export function ImScreenshotDialog({
           )}
           <IconButton title={t(maximized ? 'im.screenshot.restore' : 'im.screenshot.maximize',
                               maximized ? '还原' : '最大化')}
-                      onClick={() => setMaximized(value => !value)}>
+                      onClick={toggleMaximize}>
             {maximized ? <Minimize2 size={16} /> : <Maximize2 size={16} />}
           </IconButton>
           <IconButton title={t('im.common.close', '关闭')} onClick={onClose}>
@@ -990,11 +1041,13 @@ export function ImScreenshotDialog({
         </div>
 
         {/* 桌面端：壳层蒙层取景中；网页端：保留原有的窗口选择 / 重试引导页 */}
-        {!source && (captureMode === 'desktop' ? (
+        {!source && (captureMode !== 'web' ? (
           <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-3 p-6">
             <Loader2 size={40} strokeWidth={1.4} className="animate-spin text-primary" />
             <p className="max-w-md text-center text-[11px] leading-relaxed text-muted-foreground">
-              {t('im.screenshot.desktopHint',
+              {captureMode === 'image'
+                ? t('im.screenshot.loadingImage', '正在加载图片…')
+                : t('im.screenshot.desktopHint',
                 '正在取景：鼠标移到窗口上会高亮截取范围，单击即完成；按住拖拽可自由框选，ESC / 右键取消。')}
             </p>
           </div>
@@ -1099,5 +1152,14 @@ export function ImScreenshotDialog({
       </div>
     </div>,
     document.body,
+      )}
+      <ImForwardDialog
+        open={forwardOpen}
+        conversations={conversations}
+        count={1}
+        onClose={() => { setForwardOpen(false); setForwardFile(null) }}
+        onConfirm={confirmForward}
+      />
+    </>
   )
 }

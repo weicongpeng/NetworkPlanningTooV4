@@ -80,6 +80,10 @@ interface ImState {
   sendText: (text: string, mention?: ImSendMention) => Promise<boolean>
   /** 返回发送失败的 File，供输入区把它们放回待发送列表 */
   sendFiles: (files: File[]) => Promise<File[]>
+  /** 编辑后的图片直接发送到多个目标会话，不切换当前会话 */
+  sendImageToConversations: (
+    file: File, conversationIds: number[],
+  ) => Promise<{ sent: number; failed: number }>
   /** 右键菜单：删除单条历史消息 / 批量转发 */
   deleteMessage: (conversationId: number, messageId: number) => Promise<boolean>
   forwardMessages: (messageIds: number[], conversationIds: number[]) => Promise<boolean>
@@ -774,6 +778,30 @@ export const useImStore = create<ImState>()(
         }))
         await get().refreshConversations().catch(() => {})
         return failed
+      },
+
+      sendImageToConversations: async (file, conversationIds) => {
+        let sent = 0
+        let failed = 0
+        const targets = Array.from(new Set(conversationIds))
+        for (const id of targets) {
+          try {
+            const attachment = await imApi.uploadAttachment(file, id)
+            const message = (await imApi.send(id, {
+              kind: 'image', attachment_id: attachment.id,
+              client_msg_id: `fw-${Date.now()}-${id}-${Math.random().toString(36).slice(2, 8)}`,
+            })).data
+            set(s => ({ messages: { ...s.messages, [id]: mergeMessages(s.messages[id] || [], [message]) } }))
+            sent += 1
+          } catch (error) {
+            console.warn('[IM] forward edited image failed', id, error)
+            failed += 1
+          }
+        }
+        if (failed) setImError('forward', 'im.message.forwardFailed')
+        else setImError('forward', null)
+        await get().refreshConversations().catch(() => {})
+        return { sent, failed }
       },
 
       deleteMessage: async (conversationId, messageId) => {
