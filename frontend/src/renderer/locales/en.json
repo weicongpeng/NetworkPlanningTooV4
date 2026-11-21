@@ -11,6 +11,7 @@
     "standaloneHint": "Communication Assistant requires shared mode and network access",
     "common": {
       "cancel": "Cancel",
+      "clear": "Clear",
       "close": "Close",
       "save": "Save"
     },
@@ -194,7 +195,9 @@
       "addTitle": "Add members",
       "add": "Add",
       "added": "Invited {{count}} member(s) to the group; a notice was posted in the group",
+      "searchPlaceholder": "Search members (nickname / account / city / operator)",
       "noCandidates": "No contacts available to add",
+      "noMatches": "No matching members",
       "avatar": "Group avatar",
       "changeAvatar": "Change group avatar",
       "avatarSaved": "Group avatar updated",

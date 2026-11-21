@@ -11,6 +11,7 @@
     "standaloneHint": "沟通助手需要共享模式联网",
     "common": {
       "cancel": "取消",
+      "clear": "清空",
       "close": "关闭",
       "save": "保存"
     },
@@ -194,7 +195,9 @@
       "addTitle": "添加成员",
       "add": "添加",
       "added": "已邀请 {{count}} 位成员加入群聊，群内已同步提示",
+      "searchPlaceholder": "搜索成员（昵称 / 账号 / 地市 / 运营商）",
       "noCandidates": "没有可添加的联系人",
+      "noMatches": "没有匹配的成员",
       "avatar": "群头像",
       "changeAvatar": "修改群头像",
       "avatarSaved": "群头像已更新",

@@ -785,7 +785,7 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
         onClose={() => setShowUserSettings(false)}
       />
       <Toaster />
-      {/* 页面冒泡引导：所有登录用户；停留 3 秒触发、同刻只显示一条；登录周期内每条一次、累计 30 次后停止 */}
+      {/* 页面冒泡引导：所有登录用户；停留 3 秒触发、同刻只显示一条；登录周期内每条一次、账号累计 30 次后停止 */}
       <GuideTipsHost />
       {/* 桌面版 OTA 更新提示（网页端自动静默：接口 404） */}
       <DesktopUpdateDialog />

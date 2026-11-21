@@ -5,7 +5,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import {
-  Camera, Check, Loader2, LogOut, Trash2, UserPlus, X,
+  Camera, Check, Loader2, LogOut, Search, Trash2, UserPlus, X,
 } from 'lucide-react'
 
 import { useAuthStore } from '../../store/authStore'
@@ -40,6 +40,7 @@ export function ImGroupMembersDialog({ conversation, onClose }: Props) {
 
   const [busy, setBusy] = useState(false)
   const [addOpen, setAddOpen] = useState(false)
+  const [addQuery, setAddQuery] = useState('')
   const [selected, setSelected] = useState<number[]>([])
   const [avatarPreview, setAvatarPreview] = useState<string | null>(null)
   // 不用 window.confirm：WebView2 / pywebview 可能禁用 JS 原生对话框，导致按钮静默失效
@@ -77,6 +78,17 @@ export function ImGroupMembersDialog({ conversation, onClose }: Props) {
     const joined = new Set(members.map(member => member.id))
     return (contacts?.users || []).filter(user => !joined.has(user.id) && user.id !== myId)
   }, [contacts, members, myId])
+
+  const filteredCandidates = useMemo(() => {
+    const keyword = addQuery.trim().toLowerCase()
+    if (!keyword) return candidates
+    return candidates.filter(user => [
+      imDisplayName(user),
+      user.username,
+      user.city,
+      user.operator,
+    ].some(value => (value || '').toLowerCase().includes(keyword)))
+  }, [addQuery, candidates])
 
   const afterChange = async () => {
     invalidateMembers(conversation.id)
@@ -122,6 +134,12 @@ export function ImGroupMembersDialog({ conversation, onClose }: Props) {
     ? t('im.chat.roleOwner', '群主')
     : role === 'admin' ? t('im.chat.roleAdmin', '管理员')
       : t('im.chat.roleMember', '成员')
+
+  const closeAddPanel = () => {
+    setAddOpen(false)
+    setSelected([])
+    setAddQuery('')
+  }
 
   return (
     <div className="absolute inset-0 z-30 flex items-center justify-center bg-black/45 p-4"
@@ -181,13 +199,35 @@ export function ImGroupMembersDialog({ conversation, onClose }: Props) {
               <p className="mb-1.5 text-[11px] font-medium text-muted-foreground">
                 {t('im.groupManage.addTitle', '添加成员')}
               </p>
+              <div className="relative mb-1.5">
+                <Search size={12} className="absolute left-2 top-1/2 -translate-y-1/2 text-muted-foreground" />
+                <input
+                  autoFocus
+                  value={addQuery}
+                  onChange={event => setAddQuery(event.target.value)}
+                  placeholder={t('im.groupManage.searchPlaceholder', '搜索成员（昵称 / 账号 / 地市 / 运营商）')}
+                  className="h-7 w-full rounded-lg border border-border/60 bg-background/60 pl-7 pr-7 text-[11px] outline-none focus:border-primary/60"
+                />
+                {addQuery && (
+                  <button type="button" onClick={() => setAddQuery('')}
+                          title={t('im.common.clear', '清空')}
+                          className="absolute right-1.5 top-1/2 flex h-4 w-4 -translate-y-1/2 items-center justify-center rounded text-muted-foreground hover:bg-accent cursor-pointer">
+                    <X size={11} />
+                  </button>
+                )}
+              </div>
               <div className="max-h-[160px] space-y-0.5 overflow-y-auto">
                 {candidates.length === 0 && (
                   <p className="py-3 text-center text-[11px] text-muted-foreground">
                     {t('im.groupManage.noCandidates', '没有可添加的联系人')}
                   </p>
                 )}
-                {candidates.map(user => (
+                {candidates.length > 0 && filteredCandidates.length === 0 && (
+                  <p className="py-3 text-center text-[11px] text-muted-foreground">
+                    {t('im.groupManage.noMatches', '没有匹配的成员')}
+                  </p>
+                )}
+                {filteredCandidates.map(user => (
                   <button key={user.id} type="button"
                           onClick={() => setSelected(list => list.includes(user.id)
                             ? list.filter(id => id !== user.id) : [...list, user.id])}
@@ -198,11 +238,16 @@ export function ImGroupMembersDialog({ conversation, onClose }: Props) {
                     </span>
                     <ImAvatar name={imDisplayName(user)} avatar={user.avatar} kind="user" size={20} />
                     <span className="min-w-0 flex-1 truncate text-[11px]">{imDisplayName(user)}</span>
+                    {(user.city || user.operator) && (
+                      <span className="shrink-0 text-[10px] text-muted-foreground">
+                        {[user.city, user.operator].filter(Boolean).join(' · ')}
+                      </span>
+                    )}
                   </button>
                 ))}
               </div>
               <div className="mt-2 flex justify-end gap-1.5">
-                <button type="button" onClick={() => { setAddOpen(false); setSelected([]) }}
+                <button type="button" onClick={closeAddPanel}
                         className="rounded-lg border border-border px-2.5 py-1 text-[11px] hover:bg-accent cursor-pointer">
                   {t('im.common.cancel', '取消')}
                 </button>
@@ -214,7 +259,7 @@ export function ImGroupMembersDialog({ conversation, onClose }: Props) {
                               defaultValue: '已邀请 {{count}} 位成员加入群聊，群内已同步提示',
                               count: selected.length,
                             }))
-                          if (ok) { setSelected([]); setAddOpen(false) }
+                          if (ok) closeAddPanel()
                         })()}
                         className="rounded-lg bg-primary px-2.5 py-1 text-[11px] font-medium text-primary-foreground disabled:opacity-40 cursor-pointer">
                   {t('im.groupManage.add', '添加')}
@@ -240,7 +285,8 @@ export function ImGroupMembersDialog({ conversation, onClose }: Props) {
                     <Trash2 size={12} />
                   </button>
                 )}
-                <button type="button" disabled={busy} onClick={() => setAddOpen(value => !value)}
+                <button type="button" disabled={busy}
+                        onClick={() => { if (addOpen) closeAddPanel(); else setAddOpen(true) }}
                         title={t('im.groupManage.addTitle', '添加成员')}
                         className="flex h-7 w-7 items-center justify-center rounded-lg border border-border text-muted-foreground hover:bg-accent disabled:opacity-40 cursor-pointer">
                   <UserPlus size={12} />

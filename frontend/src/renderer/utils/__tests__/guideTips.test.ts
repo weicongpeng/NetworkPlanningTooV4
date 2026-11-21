@@ -6,17 +6,19 @@ import {
   GUIDE_TIPS,
   sessionFingerprint,
   getTipShowCounts,
+  getTipTotalShows,
   canShowTip,
   bumpTipShowCount,
   getSessionShown,
   markSessionShown,
 } from '../guideTips'
 
-describe('跨周期累计计数（每条按账号累计 30 次后不再提示）', () => {
+describe('跨周期累计计数（每个账号所有提示合计 30 次后不再提示）', () => {
   beforeEach(() => localStorage.clear())
 
   it('初始计数为空且可展示', () => {
     expect(getTipShowCounts('alice')).toEqual({})
+    expect(getTipTotalShows('alice')).toBe(0)
     expect(canShowTip('alice', 'pci-new-task')).toBe(true)
   })
 
@@ -24,6 +26,7 @@ describe('跨周期累计计数（每条按账号累计 30 次后不再提示）
     bumpTipShowCount('alice', 'pci-new-task')
     bumpTipShowCount('alice', 'pci-new-task')
     expect(getTipShowCounts('alice')).toEqual({ 'pci-new-task': 2 })
+    expect(getTipTotalShows('alice')).toBe(2)
     expect(getTipShowCounts('bob')).toEqual({})
     expect(canShowTip('bob', 'pci-new-task')).toBe(true)
   })
@@ -32,13 +35,31 @@ describe('跨周期累计计数（每条按账号累计 30 次后不再提示）
     for (let i = 0; i < GUIDE_TIP_MAX_SHOWS - 1; i++) bumpTipShowCount('alice', 'result-show-map')
     expect(canShowTip('alice', 'result-show-map')).toBe(true)
     bumpTipShowCount('alice', 'result-show-map')
+    expect(getTipTotalShows('alice')).toBe(30)
     expect(canShowTip('alice', 'result-show-map')).toBe(false)
   })
 
-  it('一条达上限不影响其它提示', () => {
+  it('不同页面文案合计达到 30 次后全部停止', () => {
+    const shownIds = ['pci-new-task', 'data-import-to-map', 'map-layer-control']
+    for (let i = 0; i < GUIDE_TIP_MAX_SHOWS - 1; i++) {
+      bumpTipShowCount('alice', shownIds[i % shownIds.length])
+    }
+    expect(getTipTotalShows('alice')).toBe(29)
+    expect(canShowTip('alice', 'result-show-map')).toBe(true)
+
+    bumpTipShowCount('alice', 'map-clear-markers')
+    expect(getTipTotalShows('alice')).toBe(30)
+    for (const tip of GUIDE_TIPS) {
+      expect(canShowTip('alice', tip.id)).toBe(false)
+    }
+  })
+
+  it('达到上限后不再继续累加计数', () => {
     for (let i = 0; i < GUIDE_TIP_MAX_SHOWS; i++) bumpTipShowCount('alice', 'pci-new-task')
-    expect(canShowTip('alice', 'pci-new-task')).toBe(false)
-    expect(canShowTip('alice', 'cell-tools-expand')).toBe(true)
+    bumpTipShowCount('alice', 'pci-new-task')
+    bumpTipShowCount('alice', 'cell-tools-expand')
+    expect(getTipTotalShows('alice')).toBe(30)
+    expect(getTipShowCounts('alice')['cell-tools-expand']).toBeUndefined()
   })
 
   it('损坏数据按空处理', () => {

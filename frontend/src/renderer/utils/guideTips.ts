@@ -2,7 +2,7 @@
  * 页面冒泡引导：对所有登录用户（网页端 / 桌面端共享·单机）生效。
  * 两个独立的限制维度：
  * - 登录周期内：每条文案只出现一次（刷新网页不重弹，重新登录才算新周期）；
- * - 跨周期累计：每条文案累计展示 30 次后永久停止。
+ * - 跨周期累计：每个账号的所有冒泡文案合计展示 30 次后永久停止。
  * 纯逻辑（计数 / 会话去重持久化 / 配置）与 UI 分离，便于单测。
  */
 
@@ -10,7 +10,7 @@
 export const GUIDE_TIP_TRIGGER_DELAY_MS = 3 * 1000
 /** 气泡显示后的默认停留时长：2 分钟 */
 export const GUIDE_TIP_DURATION_MS = 2 * 60 * 1000
-/** 每条提示按账号累计最多展示次数，达到后不再提示 */
+/** 每个账号所有冒泡文案合计最多展示次数，达到后不再提示 */
 export const GUIDE_TIP_MAX_SHOWS = 30
 
 export interface GuideTip {
@@ -63,15 +63,27 @@ export function getTipShowCounts(username: string): Record<string, number> {
   }
 }
 
-/** 是否还能向该账号展示这条提示（未达 30 次累计上限） */
+/** 该账号所有冒泡文案的累计展示次数 */
+export function getTipTotalShows(username: string): number {
+  return Object.values(getTipShowCounts(username))
+    .reduce((total, count) => total + count, 0)
+}
+
+/** 是否还能向该账号展示这条提示（账号累计未达 30 次） */
 export function canShowTip(username: string, id: string): boolean {
-  return (getTipShowCounts(username)[id] || 0) < GUIDE_TIP_MAX_SHOWS
+  const counts = getTipShowCounts(username)
+  const total = Object.values(counts).reduce((sum, count) => sum + count, 0)
+  return total < GUIDE_TIP_MAX_SHOWS
+    && (counts[id] || 0) < GUIDE_TIP_MAX_SHOWS
 }
 
 /** 记一次展示；调用方保证只在气泡真正触发显示时调一次，避免重复计数 */
 export function bumpTipShowCount(username: string, id: string): void {
   try {
     const counts = getTipShowCounts(username)
+    const total = Object.values(counts).reduce((sum, count) => sum + count, 0)
+    // 多标签页/多端共享同一个计数时，也不能越过账号总门限继续累加
+    if (total >= GUIDE_TIP_MAX_SHOWS) return
     counts[id] = (counts[id] || 0) + 1
     localStorage.setItem(countsKey(username), JSON.stringify(counts))
   } catch {

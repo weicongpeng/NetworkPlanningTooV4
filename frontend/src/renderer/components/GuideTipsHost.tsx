@@ -20,18 +20,49 @@ const GAP = 10
 const MARGIN = 12
 const BUBBLE_WIDTH = 320
 
+/** 页面必须可见且窗口在前台；被其它标签页或窗口遮挡时不累计停留时间 */
+export function isGuideSurfaceActive(
+  visibilityState: DocumentVisibilityState = document.visibilityState,
+  focused: boolean = typeof document.hasFocus === 'function' ? document.hasFocus() : true,
+): boolean {
+  return visibilityState === 'visible' && focused
+}
+
+/** 锚点中心必须仍是最上层可交互元素，避免被弹窗/遮罩挡住时仍弹提示 */
+export function isGuideAnchorUnobstructed(
+  el: HTMLElement,
+  rect: Pick<DOMRect, 'left' | 'top' | 'width' | 'height'>,
+  topElementAt: (x: number, y: number) => Element | null =
+    (x, y) => document.elementFromPoint(x, y),
+): boolean {
+  const x = rect.left + rect.width / 2
+  const y = rect.top + rect.height / 2
+  if (x < 0 || y < 0 || x > window.innerWidth || y > window.innerHeight) return false
+  const top = topElementAt(x, y)
+  if (!top) return false
+  if (top === el || el.contains(top)) return true
+  // 部分锚点是纯展示文案（pointer-events:none），命中结果会是其父容器；
+  // 仅此场景允许父容器，避免把真正覆盖页面的祖先层误判为未遮挡。
+  return top.contains(el) && getComputedStyle(el).pointerEvents === 'none'
+}
+
+interface VisibleAnchor {
+  el: HTMLElement
+  rect: DOMRect
+}
+
 /** 找到锚点并确认其当前可见：锚点只在对应「时机」才带 data-guide 属性 */
-function visibleAnchorRect(id: string): DOMRect | null {
+function visibleAnchor(id: string): VisibleAnchor | null {
   const el = document.querySelector<HTMLElement>(`[data-guide="${id}"]`)
   if (!el) return null
-  const r = el.getBoundingClientRect()
-  if (r.width < 1 || r.height < 1) return null
-  if (r.bottom < MARGIN || r.top > window.innerHeight - MARGIN) return null
-  if (r.right < MARGIN || r.left > window.innerWidth - MARGIN) return null
+  const rect = el.getBoundingClientRect()
+  if (rect.width < 1 || rect.height < 1) return null
+  if (rect.bottom < MARGIN || rect.top > window.innerHeight - MARGIN) return null
+  if (rect.right < MARGIN || rect.left > window.innerWidth - MARGIN) return null
   // 工具栏「更多」收纳项会保留在 DOM 里用 visibility:hidden 测宽，不能当成可见锚点
   const cs = getComputedStyle(el)
   if (cs.visibility === 'hidden' || cs.display === 'none' || Number(cs.opacity) === 0) return null
-  return r
+  return { el, rect }
 }
 
 interface BubbleProps {
@@ -47,8 +78,9 @@ interface BubbleProps {
 
 /**
  * 单条冒泡：portal 到 body，用 fixed 定位跟随锚点。
- * 触发条件为「锚点连续可见超过 3 秒」；触发瞬间才记一次累计次数并标记本登录周期已展示。
- * 锚点连续不可见超过 3 秒则跳过本条，避免串行队列卡死。
+ * 触发条件为「页面处于前台且锚点连续可见、未被弹窗遮挡超过 3 秒」；
+ * 触发瞬间才记一次累计次数并标记本登录周期已展示。
+ * 失焦/切后台/被遮挡时暂停并保留本条；前台且锚点持续不存在才跳过，避免队列卡死。
  */
 function Bubble({ tip, text, username, fp, closeLabel, onDone }: BubbleProps) {
   const boxRef = useRef<HTMLDivElement>(null)
@@ -66,6 +98,21 @@ function Bubble({ tip, text, username, fp, closeLabel, onDone }: BubbleProps) {
     onDone()
   }, [onDone])
 
+  // 切到其它标签页/窗口或被遮挡后重新计时：rAF 在后台会被暂停，
+  // 不能只靠下一帧比较时间，否则回来时会拿遮挡前的起点立即触发。
+  useEffect(() => {
+    const resetAnchorTimer = () => {
+      anchorVisibleRef.current = null
+      anchorSinceRef.current = Date.now()
+    }
+    window.addEventListener('blur', resetAnchorTimer)
+    document.addEventListener('visibilitychange', resetAnchorTimer)
+    return () => {
+      window.removeEventListener('blur', resetAnchorTimer)
+      document.removeEventListener('visibilitychange', resetAnchorTimer)
+    }
+  }, [])
+
   // rAF 逐帧跟随：地图展开/折叠等带过渡的布局变化也能保持箭头对准锚点
   useLayoutEffect(() => {
     let raf = 0
@@ -75,9 +122,12 @@ function Bubble({ tip, text, username, fp, closeLabel, onDone }: BubbleProps) {
       if (!box) { raf = requestAnimationFrame(tick); return }
 
       const now = Date.now()
-      const r = visibleAnchorRect(tip.id)
-      const visible = !!r
-      // 可见状态切换即重置计时：要求「连续」停留，离开模块就重新计时
+      const surfaceActive = isGuideSurfaceActive()
+      const anchor = surfaceActive ? visibleAnchor(tip.id) : null
+      const r = anchor?.rect ?? null
+      const unobstructed = !!anchor && isGuideAnchorUnobstructed(anchor.el, anchor.rect)
+      const visible = surfaceActive && unobstructed
+      // 可见状态切换即重置计时：要求「连续」停留，离开模块/失焦/被遮挡都重新计时
       if (anchorVisibleRef.current !== visible) {
         anchorVisibleRef.current = visible
         anchorSinceRef.current = now
@@ -86,8 +136,16 @@ function Bubble({ tip, text, username, fp, closeLabel, onDone }: BubbleProps) {
 
       if (phaseRef.current === 'pending') {
         box.style.visibility = 'hidden'
+        // 窗口失焦/页面不可见或被弹窗遮挡时只暂停，不消耗候选队列
+        if (!surfaceActive || (anchor && !unobstructed)) {
+          raf = requestAnimationFrame(tick)
+          return
+        }
         if (waited >= GUIDE_TIP_TRIGGER_DELAY_MS) {
-          if (!visible) { finish(); return }  // 长时间不在对应模块 → 跳过
+          // 页面在前台但锚点始终没出现（如结果尚未生成）→ 跳过本条
+          if (!anchor) { finish(); return }
+          // 队列创建后计数可能已被其它标签页/窗口推到上限，显示前必须再校验一次
+          if (!canShowTip(username, tip.id)) { finish(); return }
           phaseRef.current = 'shown'
           shownAtRef.current = now
           bumpTipShowCount(username, tip.id)
@@ -101,7 +159,7 @@ function Bubble({ tip, text, username, fp, closeLabel, onDone }: BubbleProps) {
           finish()
           return
         }
-        if (r) {
+        if (visible && r) {
           const w = box.offsetWidth || BUBBLE_WIDTH
           const h = box.offsetHeight
           let top = r.bottom + GAP
@@ -173,7 +231,7 @@ function Bubble({ tip, text, username, fp, closeLabel, onDone }: BubbleProps) {
 
 /**
  * 全局冒泡引导宿主：挂载在 MainLayout 内（AuthGuard 之下）。
- * 对所有登录用户生效；按「路由 + 登录周期去重 + 30 次累计上限」算出候选队列，
+ * 对所有登录用户生效；按「路由 + 登录周期去重 + 账号累计 30 次上限」算出候选队列，
  * 同一时刻只渲染队首一条（不并排弹多个），关闭/超时/跳过后推进下一条。
  */
 export function GuideTipsHost() {
