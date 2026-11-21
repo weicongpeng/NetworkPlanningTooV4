@@ -23,13 +23,12 @@
  *  - 输出同时写入系统剪贴板并交给 onConfirm（由 ImHost 送到「协作沟通」输入框）。
  */
 import { useCallback, useEffect, useRef, useState } from 'react'
-import type { PointerEvent as ReactPointerEvent, ReactNode } from 'react'
+import type { ComponentType, PointerEvent as ReactPointerEvent, ReactNode } from 'react'
 import { createPortal } from 'react-dom'
 import { useTranslation } from 'react-i18next'
-import type { LucideIcon } from 'lucide-react'
 import {
-  AppWindow, ArrowUpRight, Check, Circle, Crop, Download, Hand,
-  LayoutGrid, Loader2, Maximize2, Minimize2, Monitor,
+  AppWindow, Circle, Crop, Download, Hand,
+  Loader2, Maximize2, Minimize2, Monitor,
   Palette, RefreshCw, RotateCcw, RotateCw, Send, Slash, Square, Trash2, Type, Undo2, X,
   ZoomIn, ZoomOut,
 } from 'lucide-react'
@@ -41,11 +40,14 @@ import { useToastStore } from '../../store/toastStore'
 import { ImForwardDialog } from './ImForwardDialog'
 import { CAPTURE_FLAG } from './screenshotBus'
 import {
-  arrowPoints, clamp, composeFullImage, createMosaicTile, drawMosaicStrokes, fontFor,
-  isMosaic, mosaicSizeFor, paintMosaicPoint, paintMosaicSegment, shapeSize, strokeFor,
+  arrowPoints, arrowShaftEnd, clamp, composeFullImage, createMosaicTile, drawMosaicStrokes,
+  fontFor, fontRangeFor, isEditableShape, isMosaic, mosaicRangeFor, mosaicSizeFor,
+  moveShapeVertex, paintMosaicPoint, paintMosaicSegment, shapeHandleIndex, shapeHit,
+  shapeSize, shapeVertices, strokeFor, textBounds, textLines, translateShape,
 } from './screenshotAnnotation'
 import type {
-  Annotation, Crop as CropRect, MosaicAnnotation, MosaicPainter, Point, SourceImage, Tool,
+  Annotation, Crop as CropRect, MosaicAnnotation, MosaicPainter, Point, ShapeAnnotation,
+  SourceImage, TextAnnotation, Tool,
 } from './screenshotAnnotation'
 import { IM_DIALOG_RESIZE_HANDLES, useImDialogGeometry } from './useImDialogGeometry'
 
@@ -68,7 +70,8 @@ interface SourceItem extends SourceImage {
 }
 
 type CaptureResult = { blob: Blob } | { error: 'unsupported' | 'cancelled' | 'failed' }
-type TextDraft = Point & { value: string; key: number }
+/** editIndex 非 null 表示在修改已落图的文字，提交时替换而非追加 */
+type TextDraft = Point & { value: string; key: number; editIndex: number | null }
 interface Offset { x: number; y: number }
 
 const PRESET_COLORS = [
@@ -76,14 +79,45 @@ const PRESET_COLORS = [
   '#00c7be', '#007aff', '#af52de', '#ffffff', '#1c1c1e',
 ]
 
-const TOOL_ITEMS: { key: Tool; icon: LucideIcon; label: string; fallback: string }[] = [
+/**
+ * 箭头工具图标：尾线与直线工具（Slash 的 M22 2 2 22）完全等长，只把末端换成折角箭头。
+ * lucide 自带 ArrowUpRight 的尾线仅 14px（Slash 约 28px），视觉上明显短一截。
+ */
+function LongArrowIcon({ size = 16 }: { size?: string | number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none"
+         stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round"
+         className="lucide lucide-arrow-up-right" aria-hidden="true">
+      <path d="M22 2 2 22" />
+      <polygon points="22,2 11,5 19,13" fill="currentColor" stroke="none" />
+    </svg>
+  )
+}
+
+/** 马赛克图标：方框内 4×4 小点阵，直观表达「像素化」 */
+function MosaicIcon({ size = 16 }: { size?: string | number }) {
+  const dots: number[] = [7, 11, 15, 19]
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none"
+         stroke="currentColor" strokeWidth={1.8} strokeLinejoin="round"
+         className="lucide lucide-mosaic" aria-hidden="true">
+      <rect x="2.5" y="2.5" width="19" height="19" rx="2" />
+      {dots.map(x => dots.map(y => (
+        <circle key={`${x}-${y}`} cx={x} cy={y} r="1" fill="currentColor" stroke="none" />
+      )))}
+    </svg>
+  )
+}
+
+type ToolIcon = ComponentType<{ size?: string | number }>
+const TOOL_ITEMS: { key: Tool; icon: ToolIcon; label: string; fallback: string }[] = [
   { key: 'crop', icon: Crop, label: 'im.screenshot.toolCrop', fallback: '裁剪' },
   { key: 'rect', icon: Square, label: 'im.screenshot.toolRect', fallback: '矩形' },
   { key: 'ellipse', icon: Circle, label: 'im.screenshot.toolEllipse', fallback: '圆形' },
   { key: 'line', icon: Slash, label: 'im.screenshot.toolLine', fallback: '直线' },
-  { key: 'arrow', icon: ArrowUpRight, label: 'im.screenshot.toolArrow', fallback: '箭头' },
+  { key: 'arrow', icon: LongArrowIcon, label: 'im.screenshot.toolArrow', fallback: '箭头' },
   { key: 'text', icon: Type, label: 'im.screenshot.toolText', fallback: '文字' },
-  { key: 'mosaic', icon: LayoutGrid, label: 'im.screenshot.toolMosaic', fallback: '马赛克' },
+  { key: 'mosaic', icon: MosaicIcon, label: 'im.screenshot.toolMosaic', fallback: '马赛克' },
 ]
 
 const MIN_SCALE = 0.2
@@ -314,11 +348,15 @@ function ShapeNode({ shape, stroke, index }: {
                     rx={Math.abs(shape.w / 2)} ry={Math.abs(shape.h / 2)} {...common} />
   }
   if (shape.kind === 'line' || shape.kind === 'arrow') {
+    const headSize = Math.max(stroke * 7, 16)
+    const shaft = shape.kind === 'arrow'
+      ? arrowShaftEnd(shape.x1, shape.y1, shape.x2, shape.y2, headSize)
+      : { x: shape.x2, y: shape.y2 }
     return (
       <g key={index}>
-        <line x1={shape.x1} y1={shape.y1} x2={shape.x2} y2={shape.y2} {...common} />
+        <line x1={shape.x1} y1={shape.y1} x2={shaft.x} y2={shaft.y} {...common} />
         {shape.kind === 'arrow' && (
-          <polygon points={arrowPoints(shape.x1, shape.y1, shape.x2, shape.y2, stroke * 5)}
+          <polygon points={arrowPoints(shape.x1, shape.y1, shape.x2, shape.y2, headSize)}
                    fill={shape.color} />
         )}
       </g>
@@ -328,7 +366,7 @@ function ShapeNode({ shape, stroke, index }: {
     return (
       <text key={index} x={shape.x} y={shape.y} fill={shape.color} fontSize={shape.fontSize}
             dominantBaseline="hanging" style={{ fontFamily: '"Microsoft YaHei", "PingFang SC", sans-serif' }}>
-        {shape.text.split('\n').map((line, lineIndex) => (
+        {textLines(shape).map((line, lineIndex) => (
           <tspan key={lineIndex} x={shape.x} dy={lineIndex === 0 ? 0 : shape.fontSize * 1.35}>
             {line}
           </tspan>
@@ -352,9 +390,19 @@ export function ImScreenshotDialog({
   const [crop, setCrop] = useState<CropRect | null>(null)
   const [tool, setTool] = useState<Tool>('crop')
   const [color, setColor] = useState('#ff3b30')
+  // null = 跟随图片分辨率的默认值；滑杆值（原图像素）由用户自由覆盖
+  const [fontSize, setFontSize] = useState<number | null>(null)
+  const [fontPopoverOpen, setFontPopoverOpen] = useState(false)
+  const [mosaicSize, setMosaicSize] = useState<number | null>(null)
+  const [mosaicPopoverOpen, setMosaicPopoverOpen] = useState(false)
   const [annotations, setAnnotations] = useState<Annotation[]>([])
   const [draft, setDraft] = useState<Annotation | null>(null)
   const [textDraft, setTextDraft] = useState<TextDraft | null>(null)
+  // 单击已落图形状后进入顶点编辑态：显示控制点，拖拽可改长短 / 形状
+  const [selectedShapeIndex, setSelectedShapeIndex] = useState<number | null>(null)
+  const [hoverShapeIndex, setHoverShapeIndex] = useState<number | null>(null)
+  // 非编辑态下鼠标悬停的已落图文字；悬停时显示十字光标，只有此时才可拖动文字
+  const [hoverTextIndex, setHoverTextIndex] = useState<number | null>(null)
   const [displaySize, setDisplaySize] = useState({ width: 0, height: 0 })
   const [noticeKey, setNoticeKey] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
@@ -370,11 +418,23 @@ export function ImScreenshotDialog({
 
   const imgRef = useRef<HTMLImageElement | null>(null)
   const viewportRef = useRef<HTMLDivElement | null>(null)
+  const stageRef = useRef<HTMLDivElement | null>(null)
   const mosaicCanvasRef = useRef<HTMLCanvasElement | null>(null)
   const mosaicTileRef = useRef<HTMLCanvasElement | null>(null)
   const sourceElRef = useRef<HTMLImageElement | null>(null)
-  const textInputRef = useRef<HTMLInputElement | null>(null)
+  const textInputRef = useRef<HTMLTextAreaElement | null>(null)
   const dragRef = useRef<Point | null>(null)
+  const textDragRef = useRef<{
+    index: number; start: Point; x: number; y: number; moved: boolean
+  } | null>(null)
+  const lastTextClickRef = useRef<{ index: number; time: number } | null>(null)
+  const lastCropClickRef = useRef<number | null>(null)
+  const vertexDragRef = useRef<{ index: number; vertex: number } | null>(null)
+  const shapeDragRef = useRef<{
+    index: number; start: Point; origin: ShapeAnnotation
+  } | null>(null)
+  const emitRef = useRef<((useCrop: boolean) => Promise<void>) | null>(null)
+  const applyCropRef = useRef<(() => Promise<void>) | null>(null)
   const panDragRef = useRef<{ sx: number; sy: number; ox: number; oy: number } | null>(null)
   const scaleRef = useRef(1)
   const activeRef = useRef(false)
@@ -387,8 +447,27 @@ export function ImScreenshotDialog({
   const activateTimersRef = useRef<number[]>([])
 
   const textDraftKey = textDraft?.key ?? 0
+  const sourceWidth = source?.width ?? 1200
+  const fontRange = fontRangeFor(sourceWidth)
+  const effectiveFontSize = clamp(fontSize ?? fontFor(sourceWidth), fontRange.min, fontRange.max)
+  const mosaicRange = mosaicRangeFor(sourceWidth)
+  const effectiveMosaicSize = clamp(
+    mosaicSize ?? mosaicSizeFor(sourceWidth), mosaicRange.min, mosaicRange.max,
+  )
 
   useEffect(() => { textDraftRef.current = textDraft }, [textDraft])
+
+  // 字号 / 马赛克浮层点外部即收起；浮层自身 stopPropagation，避免触发工具栏拖窗
+  useEffect(() => {
+    if (!fontPopoverOpen && !mosaicPopoverOpen) return
+    const onOutside = (event: PointerEvent) => {
+      const target = event.target as HTMLElement | null
+      if (fontPopoverOpen && !target?.closest('[data-font-size-control]')) setFontPopoverOpen(false)
+      if (mosaicPopoverOpen && !target?.closest('[data-mosaic-size-control]')) setMosaicPopoverOpen(false)
+    }
+    document.addEventListener('pointerdown', onOutside)
+    return () => document.removeEventListener('pointerdown', onOutside)
+  }, [fontPopoverOpen, mosaicPopoverOpen])
 
   const setDraftShape = useCallback((shape: Annotation | null) => {
     draftRef.current = shape
@@ -422,8 +501,19 @@ export function ImScreenshotDialog({
     setAnnotations([])
     setDraftShape(null)
     setTextDraft(null)
+    textDraftRef.current = null
+    textDragRef.current = null
+    lastTextClickRef.current = null
+    vertexDragRef.current = null
+    shapeDragRef.current = null
+    lastCropClickRef.current = null
+    setSelectedShapeIndex(null)
+    setHoverTextIndex(null)
+    setHoverShapeIndex(null)
     setTool('crop')
     setRotation(0)
+    setFontPopoverOpen(false)
+    setMosaicPopoverOpen(false)
     dragRef.current = null
     resetView()
   }, [commitMosaicDraft, setDraftShape, resetView])
@@ -532,6 +622,8 @@ export function ImScreenshotDialog({
         name: `${i18nInstance.language.startsWith('en') ? 'Window' : '应用窗口'}-${stamp}`,
       })
       resetEditor()
+      setFontSize(fontFor(probe.naturalWidth))
+      setMosaicSize(mosaicSizeFor(probe.naturalWidth))
       setNoticeKey(null)
     }
     probe.onerror = () => {
@@ -665,6 +757,22 @@ export function ImScreenshotDialog({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, onClose, source])
 
+  // Enter：有裁剪框时应用裁剪并覆盖原图；否则等同点击「完成」
+  useEffect(() => {
+    if (!open || !source) return
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Enter') return
+      const target = event.target as HTMLElement | null
+      if (target && ['INPUT', 'TEXTAREA'].includes(target.tagName)) return
+      if (textDraftRef.current) return
+      event.preventDefault()
+      if (crop) void applyCropRef.current?.()
+      else void emitRef.current?.(false)
+    }
+    document.addEventListener('keydown', onKeyDown)
+    return () => document.removeEventListener('keydown', onKeyDown)
+  }, [open, source, crop])
+
   // Ctrl/Cmd+Z 撤销最近一个标注（文字输入框内交给输入框自己处理）
   useEffect(() => {
     if (!open || !source) return
@@ -705,6 +813,37 @@ export function ImScreenshotDialog({
     }
   }
 
+  /** 自后向前命中已落图文字（含换行后的包围盒），用于再次编辑 / 拖动 */
+  const findTextAt = (point: Point): number => {
+    for (let index = annotations.length - 1; index >= 0; index -= 1) {
+      const shape = annotations[index]
+      if (shape.kind !== 'text') continue
+      const box = textBounds(shape)
+      const pad = Math.max(4, sourceWidth / 240)
+      if (point.x >= box.x - pad && point.x <= box.x + box.w + pad
+        && point.y >= box.y - pad && point.y <= box.y + box.h + pad) return index
+    }
+    return -1
+  }
+
+  /** 双击已落图文字：回填原文 / 颜色 / 字号，进入编辑态 */
+  const openTextEditor = (index: number) => {
+    const shape = annotations[index]
+    if (!shape || shape.kind !== 'text') return
+    setColor(shape.color)
+    setFontSize(shape.fontSize)
+    textDragRef.current = null
+    lastTextClickRef.current = null
+    vertexDragRef.current = null
+    shapeDragRef.current = null
+    setSelectedShapeIndex(null)
+    setHoverTextIndex(null)
+    setTextDraft({
+      x: shape.x, y: shape.y, value: shape.text,
+      key: Date.now(), editIndex: index,
+    })
+  }
+
   const onPointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
     if (!source) return
     // 抓手模式或鼠标中键：拖拽平移视图
@@ -721,19 +860,78 @@ export function ImScreenshotDialog({
     if (!point) return
     if (tool === 'text') {
       event.preventDefault()
-      if (textDraft?.value.trim()) commitText(true)
-      setTextDraft({ ...point, value: '', key: Date.now() })
+      // 已有草稿时本次点击只负责收尾，避免 blur 与新建同时发生导致索引错位
+      if (textDraft) { commitText(Boolean(textDraft.value.trim())); return }
+      const hit = findTextAt(point)
+      if (hit >= 0) {
+        // 双击才重新编辑；单击仅准备拖动，不在 pointerup 里打开输入框
+        const last = lastTextClickRef.current
+        const now = Date.now()
+        if (last && last.index === hit && now - last.time < 400) {
+          lastTextClickRef.current = null
+          openTextEditor(hit)
+          return
+        }
+        lastTextClickRef.current = { index: hit, time: now }
+        const shape = annotations[hit] as TextAnnotation
+        textDragRef.current = { index: hit, start: point, x: shape.x, y: shape.y, moved: false }
+        // 捕获到图片容器，拖动过程中保留其十字光标（捕获到 viewport 会显示箭头）
+        stageRef.current?.setPointerCapture?.(event.pointerId)
+        return
+      }
+      lastTextClickRef.current = null
+      setTextDraft({ ...point, value: '', key: Date.now(), editIndex: null })
       return
     }
-    event.currentTarget.setPointerCapture?.(event.pointerId)
     if (tool === 'mosaic') {
       event.preventDefault()
-      const size = mosaicSizeFor(source.width)
+      // 捕获到图片容器，涂抹全程保留半透明圆形笔刷光标
+      stageRef.current?.setPointerCapture?.(event.pointerId)
+      const size = effectiveMosaicSize
       mosaicDraftRef.current = { kind: 'mosaic', points: [point], size }
       const painter = mosaicPainter()
       if (painter) paintMosaicPoint(painter, point, size)
       return
     }
+    if (tool === 'crop' && crop && crop.w > 0 && crop.h > 0
+      && point.x >= crop.x && point.x <= crop.x + crop.w
+      && point.y >= crop.y && point.y <= crop.y + crop.h) {
+      // 双击裁剪框内部直接完成裁剪；单击只保留当前框，不清除重画
+      const now = Date.now()
+      if (lastCropClickRef.current !== null && now - lastCropClickRef.current < 400) {
+        lastCropClickRef.current = null
+        event.preventDefault()
+        void applyCrop()
+        return
+      }
+      lastCropClickRef.current = now
+      return
+    }
+    lastCropClickRef.current = null
+    if (tool === 'rect' || tool === 'ellipse' || tool === 'line' || tool === 'arrow') {
+      const tolerance = Math.max(8, source.width / 120)
+      const selected = selectedShapeIndex !== null ? annotations[selectedShapeIndex] : null
+      if (selected && isEditableShape(selected)) {
+        const vertex = shapeHandleIndex(selected, point, tolerance)
+        if (vertex >= 0) {
+          vertexDragRef.current = { index: selectedShapeIndex!, vertex }
+          event.currentTarget.setPointerCapture?.(event.pointerId)
+          return
+        }
+      }
+      // 单击命中已有图形 → 选中并显示控制点；未命中则新建图形
+      for (let index = annotations.length - 1; index >= 0; index -= 1) {
+        const shape = annotations[index]
+        if (!isEditableShape(shape) || !shapeHit(shape, point, tolerance)) continue
+        setSelectedShapeIndex(index)
+        // 按住图形本体拖动即整体平移（控制点拖动改形状，走上面的 vertexDrag 分支）
+        shapeDragRef.current = { index, start: point, origin: { ...shape } }
+        event.currentTarget.setPointerCapture?.(event.pointerId)
+        return
+      }
+      setSelectedShapeIndex(null)
+    }
+    event.currentTarget.setPointerCapture?.(event.pointerId)
     dragRef.current = point
     if (tool === 'crop') setCrop(null)
     else setDraftShape(null)
@@ -743,6 +941,47 @@ export function ImScreenshotDialog({
     const pan = panDragRef.current
     if (pan) {
       setOffset({ x: pan.ox + (event.clientX - pan.sx), y: pan.oy + (event.clientY - pan.sy) })
+      return
+    }
+    const textDrag = textDragRef.current
+    if (textDrag && source) {
+      const point = pointFromEvent(event.clientX, event.clientY)
+      if (!point) return
+      const dx = point.x - textDrag.start.x
+      const dy = point.y - textDrag.start.y
+      if (Math.hypot(dx, dy) > Math.max(4, source.width / 240)) textDrag.moved = true
+      setAnnotations(list => list.map((shape, index) => {
+        if (index !== textDrag.index || shape.kind !== 'text') return shape
+        return {
+          ...shape,
+          x: clamp(textDrag.x + dx, 0, Math.max(0, source.width - shape.fontSize)),
+          y: clamp(textDrag.y + dy, 0, Math.max(0, source.height - shape.fontSize)),
+        }
+      }))
+      return
+    }
+    const shapeDrag = shapeDragRef.current
+    if (shapeDrag) {
+      const point = pointFromEvent(event.clientX, event.clientY)
+      if (!point) return
+      const dx = point.x - shapeDrag.start.x
+      const dy = point.y - shapeDrag.start.y
+      setAnnotations(list => list.map((shape, index) => (
+        index === shapeDrag.index
+          ? translateShape(shapeDrag.origin, dx, dy)
+          : shape
+      )))
+      return
+    }
+    const vertexDrag = vertexDragRef.current
+    if (vertexDrag) {
+      const point = pointFromEvent(event.clientX, event.clientY)
+      if (!point) return
+      setAnnotations(list => list.map((shape, index) => (
+        index === vertexDrag.index && isEditableShape(shape)
+          ? moveShapeVertex(shape, vertexDrag.vertex, point)
+          : shape
+      )))
       return
     }
     if (tool === 'mosaic') {
@@ -755,6 +994,28 @@ export function ImScreenshotDialog({
       const painter = mosaicPainter()
       if (!painter) return
       stroke.points.push(...paintMosaicSegment(painter, last, point, stroke.size))
+      return
+    }
+    // 文字工具且未编辑时，悬停命中已落图文字才给出十字光标与可拖动提示
+    if (tool === 'text' && !textDraft && !dragRef.current) {
+      const point = pointFromEvent(event.clientX, event.clientY)
+      const hit = point ? findTextAt(point) : -1
+      setHoverTextIndex(hit >= 0 ? hit : null)
+      return
+    }
+    // 形状工具下悬停已落图图形：与文字一致，显示十字光标提示可拖动 / 编辑
+    if ((tool === 'rect' || tool === 'ellipse' || tool === 'line' || tool === 'arrow')
+      && !dragRef.current) {
+      const point = pointFromEvent(event.clientX, event.clientY)
+      const tolerance = source ? Math.max(8, source.width / 120) : 8
+      let hit = -1
+      if (point) {
+        for (let index = annotations.length - 1; index >= 0; index -= 1) {
+          const shape = annotations[index]
+          if (isEditableShape(shape) && shapeHit(shape, point, tolerance)) { hit = index; break }
+        }
+      }
+      setHoverShapeIndex(hit >= 0 ? hit : null)
       return
     }
     const start = dragRef.current
@@ -779,6 +1040,13 @@ export function ImScreenshotDialog({
 
   const onPointerUp = () => {
     if (panDragRef.current) { panDragRef.current = null; return }
+    if (vertexDragRef.current) { vertexDragRef.current = null; return }
+    if (shapeDragRef.current) { shapeDragRef.current = null; return }
+    if (textDragRef.current) {
+      // 单击不进入编辑（双击才进入），这里只结束拖动状态
+      textDragRef.current = null
+      return
+    }
     dragRef.current = null
     if (tool === 'mosaic') { commitMosaicDraft(); return }
     if (tool === 'crop') {
@@ -795,11 +1063,23 @@ export function ImScreenshotDialog({
     if (!current || !source) return
     const value = current.value.trim()
     if (submit && value) {
-      setAnnotations(list => [...list, {
-        kind: 'text', x: current.x, y: current.y, text: value, color,
-        fontSize: fontFor(source.width),
-      }])
+      const size = effectiveFontSize
+      // 自动换行宽度取图片宽度上限与「距右边界可用空间」的较小值
+      const maxWidth = Math.max(size * 3, Math.min(source.width * 0.7, source.width - current.x - size))
+      if (current.editIndex !== null) {
+        setAnnotations(list => list.map((shape, index) => (
+          index === current.editIndex && shape.kind === 'text'
+            ? { ...shape, text: value, color, fontSize: size, maxWidth }
+            : shape
+        )))
+      } else {
+        setAnnotations(list => [...list, {
+          kind: 'text', x: current.x, y: current.y, text: value, color,
+          fontSize: size, maxWidth,
+        }])
+      }
     }
+    textDraftRef.current = null
     setTextDraft(null)
   }
 
@@ -860,6 +1140,21 @@ export function ImScreenshotDialog({
     return canvasToPng(turned)
   }
 
+  /**
+   * 应用裁剪：把裁剪区域（含已有标注）合成为新图并覆盖当前原图，
+   * 只结束本次裁剪、继续留在编辑页；真正复制到剪贴板 / 送到对话框由「完成」按钮负责。
+   */
+  const applyCrop = async () => {
+    if (!source || !crop || busy) return
+    setBusy(true)
+    const blob = await renderBlob(true)
+    setBusy(false)
+    if (!blob) { setNoticeKey('im.screenshot.failed'); return }
+    URL.revokeObjectURL(source.url)
+    loadFrame(blob)
+  }
+  applyCropRef.current = applyCrop
+
   const emit = async (useCrop: boolean) => {
     if (!source || busy) return
     setBusy(true)
@@ -872,6 +1167,7 @@ export function ImScreenshotDialog({
     onConfirm(new File([blob], screenshotFileName(i18nInstance.language), { type: 'image/png' }))
     onClose()
   }
+  emitRef.current = emit
 
   const onDownload = async () => {
     if (!source || busy) return
@@ -920,6 +1216,26 @@ export function ImScreenshotDialog({
     ? { width: displaySize.width, height: displaySize.height }
     : undefined
 
+  /** 马赛克笔刷光标：半透明圆形，直径跟随笔刷实际显示尺寸（含视图缩放） */
+  const mosaicCursor = (() => {
+    if (!source) return 'default'
+    const diameter = clamp(Math.round(effectiveMosaicSize * scale / scaleX), 10, 128)
+    const radius = diameter / 2
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${diameter}" height="${diameter}" viewBox="0 0 ${diameter} ${diameter}"><circle cx="${radius}" cy="${radius}" r="${Math.max(1, radius - 1)}" fill="rgba(128,128,128,0.35)" stroke="rgba(255,255,255,0.9)" stroke-width="1.5"/></svg>`
+    return `url("data:image/svg+xml,${encodeURIComponent(svg)}") ${radius} ${radius}, crosshair`
+  })()
+
+  const selectedShape = selectedShapeIndex !== null ? annotations[selectedShapeIndex] : null
+  const editingShape = selectedShape && isEditableShape(selectedShape) ? selectedShape : null
+  const shapeHandles = editingShape ? shapeVertices(editingShape) : []
+
+  /** 光标只施加在图片容器上：空白蒙版区始终系统箭头；绘制工具也用传统箭头 */
+  const imageCursor = panMode ? 'move'
+    : tool === 'mosaic' ? mosaicCursor
+      : tool === 'text'
+        ? (textDraft || hoverTextIndex === null ? 'text' : 'move')
+        : (hoverShapeIndex !== null ? 'move' : 'default')
+
   // 必须挂到 body：ImComposer 有 backdrop-blur、ImWindow 有 transform + overflow-hidden，
   // 都会给 position:fixed 创建新的包含块，导致遮罩只有输入框那么大且面板被裁掉。
   return (
@@ -944,7 +1260,9 @@ export function ImScreenshotDialog({
             <>
               {TOOL_ITEMS.map(item => {
                 const Icon = item.icon
-                return (
+                const isFont = item.key === 'text'
+                const isMosaic = item.key === 'mosaic'
+                const button = (
                   <IconButton key={item.key} title={t(item.label, item.fallback)}
                               active={!panMode && tool === item.key}
                               onClick={() => {
@@ -953,9 +1271,50 @@ export function ImScreenshotDialog({
                                 setTool(item.key)
                                 setTextDraft(null)
                                 setDraftShape(null)
+                                setHoverTextIndex(null)
+                                setHoverShapeIndex(null)
+                                setSelectedShapeIndex(null)
+                                vertexDragRef.current = null
+                                shapeDragRef.current = null
+                                lastTextClickRef.current = null
+                                // 字号 / 笔刷大小浮层直接挂在对应工具图标上
+                                if (isFont) setFontPopoverOpen(value => !value)
+                                if (isMosaic) setMosaicPopoverOpen(value => !value)
                               }}>
                     <Icon size={16} />
                   </IconButton>
+                )
+                if (!isFont && !isMosaic) return button
+                const open = isFont ? fontPopoverOpen : mosaicPopoverOpen
+                const labelKey = isFont ? 'im.screenshot.fontSize' : 'im.screenshot.toolMosaicSize'
+                const label = t(labelKey, isFont ? '字体大小' : '马赛克大小')
+                const range = isFont ? fontRange : mosaicRange
+                const size = isFont ? effectiveFontSize : effectiveMosaicSize
+                const setValue = isFont ? setFontSize : setMosaicSize
+                return (
+                  <div key={item.key}
+                       data-font-size-control={isFont ? '' : undefined}
+                       data-mosaic-size-control={isMosaic ? '' : undefined}
+                       className="relative shrink-0"
+                       onPointerDown={event => event.stopPropagation()}>
+                    {button}
+                    {open && (
+                      <div className="absolute left-0 top-9 z-30 w-56 rounded-lg border border-border bg-card p-3 shadow-lg">
+                        <div className="mb-2 flex items-center justify-between text-[11px] text-muted-foreground">
+                          <span>{label}</span>
+                          <span className="tabular-nums text-foreground">{Math.round(size)} px</span>
+                        </div>
+                        <input type="range" aria-label={label}
+                               min={range.min} max={range.max} step={1}
+                               value={clamp(size, range.min, range.max)}
+                               onChange={event => setValue(Number(event.target.value))}
+                               className="w-full cursor-pointer accent-primary" />
+                        <div className="mt-1 flex justify-between text-[10px] text-muted-foreground">
+                          <span>{range.min}</span><span>{range.max}</span>
+                        </div>
+                      </div>
+                    )}
+                  </div>
                 )
               })}
               <span className="mx-1 h-5 w-px shrink-0 bg-border/70" />
@@ -1009,6 +1368,11 @@ export function ImScreenshotDialog({
                           disabled={busy} onClick={() => void openForward()}>
                 <Send size={16} />
               </IconButton>
+              <button type="button" title={t('im.screenshot.addHint', '添加到对话框并复制到剪贴板')}
+                      disabled={busy} onClick={() => void emit(Boolean(crop))}
+                      className="flex h-8 shrink-0 cursor-pointer items-center justify-center rounded-lg bg-primary px-3 text-xs font-medium text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-40">
+                {t('im.screenshot.done', '完成')}
+              </button>
             </>
           )}
 
@@ -1030,10 +1394,6 @@ export function ImScreenshotDialog({
               <IconButton title={t('im.screenshot.downloadHint', '下载为 PNG')}
                           disabled={busy} onClick={() => void onDownload()}>
                 <Download size={16} />
-              </IconButton>
-              <IconButton title={t('im.screenshot.addHint', '添加到对话框并复制到剪贴板')}
-                          tone="primary" disabled={busy} onClick={() => void emit(Boolean(crop))}>
-                <Check size={18} />
               </IconButton>
               <span className="mx-1 h-5 w-px shrink-0 bg-border/70" />
             </>
@@ -1095,10 +1455,12 @@ export function ImScreenshotDialog({
           <div ref={viewportRef}
                onPointerDown={onPointerDown} onPointerMove={onPointerMove}
                onPointerUp={onPointerUp} onPointerCancel={onPointerUp}
+               onPointerLeave={() => { setHoverTextIndex(null); setHoverShapeIndex(null) }}
                className="relative flex min-h-0 flex-1 select-none items-center justify-center overflow-hidden bg-[#F7F7F7] p-3"
-               style={{ touchAction: 'none', cursor: panMode ? 'grab' : (tool === 'text' ? 'text' : 'crosshair') }}>
-            <div className="relative inline-flex max-h-full max-w-full"
+               style={{ touchAction: 'none', cursor: 'default' }}>
+            <div ref={stageRef} className="relative inline-flex max-h-full max-w-full"
                  style={{
+                   cursor: imageCursor,
                    transform: `translate(${offset.x}px, ${offset.y}px) scale(${scale}) rotate(${rotation}deg)`,
                    transformOrigin: 'center center',
                  }}>
@@ -1135,22 +1497,35 @@ export function ImScreenshotDialog({
                 {draft && (
                   <ShapeNode shape={draft} stroke={strokeFor(source.width)} index={-1} />
                 )}
+                {editingShape && shapeHandles.map((vertex, index) => (
+                  <circle key={`handle-${index}`} data-shape-handle={index}
+                          cx={vertex.x} cy={vertex.y}
+                          r={Math.max(strokeFor(source.width) * 2.5, 6)}
+                          fill="#fff" stroke="#007aff"
+                          strokeWidth={Math.max(strokeFor(source.width), 2)} />
+                ))}
               </svg>
+              {/* 点击任何非输入框区域都收尾：有内容落图，空内容丢弃草稿 */}
               {textDraft && (
-                <input
-                  ref={textInputRef} value={textDraft.value}
-                  placeholder={t('im.screenshot.textPlaceholder', '输入备注后回车')}
+                <textarea
+                  ref={textInputRef} value={textDraft.value} rows={2}
+                  placeholder={t('im.screenshot.textPlaceholder', '输入备注')}
+                  onPointerDown={event => event.stopPropagation()}
                   onChange={event => setTextDraft({ ...textDraft, value: event.target.value })}
                   onKeyDown={event => {
                     event.stopPropagation()
-                    if (event.key === 'Enter') { event.preventDefault(); commitText(true) }
+                    // Enter 确认落图；Shift+Enter 手动换行（超宽文字另由 wrapText 自动折行）
+                    if (event.key === 'Enter' && !event.shiftKey) {
+                      event.preventDefault()
+                      commitText(true)
+                    }
                   }}
-                  onBlur={() => { if (textDraftRef.current?.value.trim()) commitText(true) }}
-                  className="absolute z-10 min-w-[140px] max-w-[70%] rounded border border-primary bg-background/90 px-1 py-0.5 outline-none"
+                  onBlur={() => commitText(Boolean(textDraftRef.current?.value.trim()))}
+                  className="absolute z-10 min-w-[160px] max-w-[70%] resize-none whitespace-pre-wrap rounded border border-primary bg-background/90 px-1 py-0.5 leading-tight outline-none"
                   style={{
-                    left: clamp(textDraft.x / scaleX, 0, Math.max(0, displaySize.width - 160)),
-                    top: clamp(textDraft.y / scaleY, 0, Math.max(0, displaySize.height - 32)),
-                    color, fontSize: Math.max(12, fontFor(source.width) / scaleX),
+                    left: clamp(textDraft.x / scaleX, 0, Math.max(0, displaySize.width - 170)),
+                    top: clamp(textDraft.y / scaleY, 0, Math.max(0, displaySize.height - 48)),
+                    color, fontSize: Math.max(12, effectiveFontSize / scaleX),
                   }}
                 />
               )}

@@ -27,12 +27,12 @@ function maximizedKey(userId: number | null): string {
   return `im-window-maximized-user-${userId ?? 'anon'}`
 }
 
-/** 最大化矩形：铺满自绘标题栏以下的窗口内容区 */
+/** 最大化矩形：与图片编辑页一致，铺满自绘标题栏以下的整个内容区（不留 8px 边距） */
 function maximizedRect(topOffset: number): ImRect {
   return {
-    x: EDGE, y: topOffset,
-    w: window.innerWidth - EDGE * 2,
-    h: window.innerHeight - topOffset - EDGE * 2,
+    x: 0, y: topOffset,
+    w: window.innerWidth,
+    h: window.innerHeight - topOffset,
   }
 }
 
@@ -121,8 +121,9 @@ export function useImWindowGeometry(userId: number | null, topOffset: number) {
    * 写入显示几何。只有 persist=true 才同步更新并落盘用户期望几何：
    * resize 造成的视口钳制必须传 false，否则视口一小窗口尺寸就被永久改小。
    */
-  const commit = useCallback((next: ImRect, persist = true) => {
-    const clamped = clampRect(next, topOffsetRef.current)
+  const commit = useCallback((next: ImRect, persist = true, skipClamp = false) => {
+    // 最大化矩形本身已铺满视口，不能再按普通窗口的 8px 边距钳制
+    const clamped = skipClamp ? next : clampRect(next, topOffsetRef.current)
     rectRef.current = clamped
     applyDom(elementRef.current, clamped)
     setRect(clamped)
@@ -134,7 +135,7 @@ export function useImWindowGeometry(userId: number | null, topOffset: number) {
 
   useEffect(() => {
     const onResize = () => {
-      if (maximized) commit(maximizedRect(topOffsetRef.current), false)
+      if (maximized) commit(maximizedRect(topOffsetRef.current), false, true)
       else commit(preferredRef.current, false)
     }
     window.addEventListener('resize', onResize)
@@ -238,7 +239,7 @@ export function useImWindowGeometry(userId: number | null, topOffset: number) {
     } else {
       restoreRef.current = { ...preferredRef.current }
       // 最大化矩形只是临时显示，不能覆盖用户偏好
-      commit(maximizedRect(topOffsetRef.current), false)
+      commit(maximizedRect(topOffsetRef.current), false, true)
       saveMaximized(userId, true)
       setMaximized(true)
     }

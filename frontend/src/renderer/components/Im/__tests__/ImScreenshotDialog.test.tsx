@@ -196,9 +196,9 @@ describe('协作沟通截图对话框', () => {
     expect(screen.queryByText(/已为你打开应用窗口列表/)).toBeNull()
     // 需求 4：按钮只留图标 + title 悬浮提示，不再有可见文字标签
     expect(screen.getByTitle('矩形')).toBeTruthy()
-    // 直线/箭头按钮图标改为左下→右上的斜向样式（绘制逻辑不变）
+    // 直线/箭头按钮图标均为左下→右上斜向；箭头尾线与直线等长（M22 2 2 22）
     expect(screen.getByTitle('直线').querySelector('svg')?.classList.contains('lucide-slash')).toBe(true)
-    expect(screen.getByTitle('箭头').querySelector('svg')?.classList.contains('lucide-arrow-up-right')).toBe(true)
+    expect(screen.getByTitle('箭头').querySelector('path[d="M22 2 2 22"]')).toBeTruthy()
     expect(screen.getByTitle('撤销')).toBeTruthy()
     expect(screen.queryByText('裁剪')).toBeNull()
     expect(screen.queryByText('矩形')).toBeNull()
@@ -233,6 +233,8 @@ describe('协作沟通截图对话框', () => {
       .mockResolvedValue(resolvedStream())
     setSecure(true, { getDisplayMedia })
     renderDialog()
+    // 等自动唤起那一发真正结束（busy 复位）后再点手动重试，避免点击被 busy 吞掉
+    await waitFor(() => expect(getDisplayMedia).toHaveBeenCalledTimes(1))
     await waitFor(() => expect(screen.getByTitle('重新选择窗口')).toBeTruthy())
     // 引导页没有编辑工具栏
     expect(screen.queryByTitle('放大')).toBeNull()
@@ -366,20 +368,156 @@ describe('协作沟通截图对话框', () => {
     await waitFor(() => expect(stage().style.transform).toContain('translate(100px, 60px)'))
   })
 
-  it('文字备注：立即 blur 空内容不销毁输入框，输入后回车可提交', async () => {
+  it('文字备注：点击非输入框区域即收尾（空内容丢弃），输入后回车可提交', async () => {
     const { img } = await captureFrame()
     fireEvent.click(screen.getByTitle('文字'))
     fireEvent(img, pointerEvent('pointerdown', 120, 120, 2))
-    const note = await screen.findByPlaceholderText('输入备注后回车')
+    const note = await screen.findByPlaceholderText('输入备注')
     fireEvent.blur(note)
-    expect(screen.getByPlaceholderText('输入备注后回车')).toBeTruthy()
+    expect(screen.queryByPlaceholderText('输入备注')).toBeNull()
 
-    fireEvent.change(screen.getByPlaceholderText('输入备注后回车'), {
-      target: { value: '需核查' },
-    })
-    fireEvent.keyDown(screen.getByPlaceholderText('输入备注后回车'), { key: 'Enter' })
+    fireEvent(img, pointerEvent('pointerdown', 120, 120, 2))
+    const next = await screen.findByPlaceholderText('输入备注')
+    fireEvent.change(next, { target: { value: '需核查' } })
+    fireEvent.keyDown(next, { key: 'Enter' })
     expect(document.body.querySelector(`${annotationLayer} text`)?.textContent)
       .toContain('需核查')
+  })
+
+  it('点击 T 图标即展开字号滑杆（无独立字号按钮），调整后应用到新标注', async () => {
+    const { img } = await captureFrame()
+    expect(screen.queryByTitle('字体大小')).toBeNull()
+    fireEvent.click(screen.getByTitle('文字'))
+    const slider = screen.getByLabelText('字体大小') as HTMLInputElement
+    fireEvent.change(slider, { target: { value: '40' } })
+    fireEvent(img, pointerEvent('pointerdown', 120, 120, 2))
+    const note = await screen.findByPlaceholderText('输入备注')
+    fireEvent.change(note, { target: { value: '放大字号' } })
+    fireEvent.keyDown(note, { key: 'Enter' })
+    expect(document.body.querySelector(`${annotationLayer} text`)?.getAttribute('font-size'))
+      .toBe('40')
+  })
+
+  it('光标只作用于图片区：蒙版区用系统箭头，绘制工具用箭头，马赛克用半透明圆形', async () => {
+    await captureFrame()
+    const img = document.body.querySelector('[data-screenshot-panel] img') as HTMLImageElement
+    const stage = img.parentElement as HTMLElement
+    const viewport = stage.parentElement as HTMLElement
+    expect(viewport.style.cursor).toBe('default')
+    // 裁剪及矩形 / 圆形 / 直线 / 箭头：传统箭头
+    expect(stage.style.cursor).toBe('default')
+    for (const title of ['矩形', '圆形', '直线', '箭头']) {
+      fireEvent.click(screen.getByTitle(title))
+      expect(viewport.style.cursor).toBe('default')
+      expect(stage.style.cursor).toBe('default')
+    }
+    // 马赛克：方框点阵图标 + 半透明圆形笔刷光标
+    fireEvent.click(screen.getByTitle('马赛克'))
+    expect(screen.getByTitle('马赛克').querySelectorAll('circle').length).toBeGreaterThanOrEqual(16)
+    expect(stage.style.cursor).toContain('data:image/svg+xml')
+    expect(decodeURIComponent(stage.style.cursor)).toContain('rgba(128,128,128,0.35)')
+    fireEvent.click(screen.getByTitle(/平移/))
+    expect(stage.style.cursor).toBe('move')
+  })
+
+  it('马赛克图标下拉可调笔刷大小，圆形光标随尺寸变化且涂抹全程保留', async () => {
+    const { img } = await captureFrame()
+    const stage = img.parentElement as HTMLElement
+    fireEvent.click(screen.getByTitle('马赛克'))
+    const slider = screen.getByLabelText('马赛克大小') as HTMLInputElement
+    const before = stage.style.cursor
+    fireEvent.change(slider, { target: { value: '80' } })
+    const after = stage.style.cursor
+    expect(after).toContain('data:image/svg+xml')
+    expect(after).not.toBe(before)
+    expect(decodeURIComponent(after)).toContain('width="40"')
+
+    // pointer capture 落在图片容器上，按下并涂抹时不会退回系统箭头
+    fireEvent(img, pointerEvent('pointerdown', 60, 60, 8))
+    expect(stage.style.cursor).toBe(after)
+    fireEvent(img, pointerEvent('pointermove', 120, 60, 8))
+    expect(stage.style.cursor).toBe(after)
+    fireEvent(img, pointerEvent('pointerup', 120, 60, 8))
+  })
+
+  it('已落图文字双击才编辑、单击只拖动；悬停显示十字光标', async () => {
+    const { img } = await captureFrame()
+    fireEvent.click(screen.getByTitle('文字'))
+    fireEvent(img, pointerEvent('pointerdown', 120, 120, 2))
+    let note = await screen.findByPlaceholderText('输入备注')
+    fireEvent.change(note, { target: { value: '原始备注' } })
+    fireEvent.keyDown(note, { key: 'Enter' })
+    let text = document.body.querySelector(`${annotationLayer} text`) as SVGTextElement
+    expect(text.getAttribute('x')).toBe('240')
+    const stage = img.parentElement as HTMLElement
+    const viewport = stage.parentElement as HTMLElement
+    expect(viewport.style.cursor).toBe('default')
+    expect(stage.style.cursor).toBe('text')
+
+    // 悬停到文字上 → 带箭头的十字（可拖动）；移开 → 恢复文本光标
+    fireEvent(img, pointerEvent('pointermove', 125, 125, 3))
+    expect(stage.style.cursor).toBe('move')
+    fireEvent(img, pointerEvent('pointermove', 350, 250, 3))
+    expect(stage.style.cursor).toBe('text')
+
+    // 单击不进入编辑；间隔小于 400ms 的第二次点击才回填原文
+    const now = vi.spyOn(Date, 'now')
+    now.mockReturnValue(1000)
+    fireEvent(img, pointerEvent('pointerdown', 125, 125, 4))
+    fireEvent(img, pointerEvent('pointerup', 125, 125, 4))
+    expect(screen.queryByPlaceholderText('输入备注')).toBeNull()
+    now.mockReturnValue(2000)
+    fireEvent(img, pointerEvent('pointerdown', 125, 125, 5))
+    fireEvent(img, pointerEvent('pointerup', 125, 125, 5))
+    expect(screen.queryByPlaceholderText('输入备注')).toBeNull()
+    now.mockReturnValue(2100)
+    fireEvent(img, pointerEvent('pointerdown', 125, 125, 6))
+    fireEvent(img, pointerEvent('pointerup', 125, 125, 6))
+    note = await screen.findByPlaceholderText('输入备注')
+    expect((note as HTMLTextAreaElement).value).toBe('原始备注')
+    fireEvent.change(note, { target: { value: '改后的备注' } })
+    fireEvent.keyDown(note, { key: 'Enter' })
+    text = document.body.querySelector(`${annotationLayer} text`) as SVGTextElement
+    expect(text.textContent).toContain('改后的备注')
+    expect(document.body.querySelectorAll(`${annotationLayer} text`)).toHaveLength(1)
+
+    // 拖动文字 → x 从原图像素 240 右移
+    drag(img, 7, [125, 125], [165, 145])
+    text = document.body.querySelector(`${annotationLayer} text`) as SVGTextElement
+    expect(Number(text.getAttribute('x'))).toBeGreaterThan(240)
+  })
+
+  it('点击非输入框区域完成文字编辑闭环：有内容落图，空内容丢弃草稿', async () => {
+    const { img } = await captureFrame()
+    fireEvent.click(screen.getByTitle('文字'))
+    fireEvent(img, pointerEvent('pointerdown', 120, 120, 2))
+    let note = await screen.findByPlaceholderText('输入备注')
+    fireEvent.blur(note)
+    expect(screen.queryByPlaceholderText('输入备注')).toBeNull()
+    expect(document.body.querySelector(`${annotationLayer} text`)).toBeNull()
+
+    fireEvent(img, pointerEvent('pointerdown', 120, 120, 3))
+    note = await screen.findByPlaceholderText('输入备注')
+    fireEvent.change(note, { target: { value: '点击别处提交' } })
+    fireEvent.blur(note)
+    expect(screen.queryByPlaceholderText('输入备注')).toBeNull()
+    expect(document.body.querySelector(`${annotationLayer} text`)?.textContent)
+      .toContain('点击别处提交')
+  })
+
+  it('文字过长无法一行显示时自动换行，导出与预览行数一致', async () => {
+    const { img } = await captureFrame()
+    fireEvent.click(screen.getByTitle('文字'))
+    fireEvent(img, pointerEvent('pointerdown', 100, 100, 2))
+    const note = await screen.findByPlaceholderText('输入备注')
+    fireEvent.change(note, { target: { value: '需要核查的小区数量较多'.repeat(5) } })
+    fireEvent.keyDown(note, { key: 'Enter' })
+    const lines = document.body.querySelectorAll(`${annotationLayer} text tspan`)
+    expect(lines.length).toBeGreaterThan(1)
+
+    ctx.fillText.mockClear()
+    fireEvent.click(screen.getByTitle('下载为 PNG'))
+    await waitFor(() => expect(ctx.fillText.mock.calls.length).toBe(lines.length))
   })
 
   it('箭头工具绘制带三角形头部的线段；马赛克画笔逐点采样且可撤销', async () => {
@@ -400,6 +538,119 @@ describe('协作沟通截图对话框', () => {
 
     fireEvent.click(screen.getByTitle('撤销'))
     await waitFor(() => expect(ctx.clearRect).toHaveBeenCalled())
+  })
+
+  it('已绘制的矩形 / 直线单击进入顶点编辑，拖拽控制点改变形状', async () => {
+    const { img } = await captureFrame()
+    fireEvent.click(screen.getByTitle('矩形'))
+    drag(img, 1, [10, 10], [100, 80])
+    expect(document.body.querySelector(`${annotationLayer} rect`)?.getAttribute('width'))
+      .toBe('180')
+
+    // 单击矩形内部选中，出现 4 个控制点
+    fireEvent(img, pointerEvent('pointerdown', 50, 40, 2))
+    fireEvent(img, pointerEvent('pointerup', 50, 40, 2))
+    expect(document.body.querySelectorAll(`${annotationLayer} [data-shape-handle]`)).toHaveLength(4)
+
+    // 拖右下角控制点：x/y 不动，w/h 变大
+    drag(img, 3, [100, 80], [150, 110])
+    expect(document.body.querySelector(`${annotationLayer} rect`)?.getAttribute('width'))
+      .toBe('280')
+    expect(document.body.querySelector(`${annotationLayer} rect`)?.getAttribute('height'))
+      .toBe('200')
+
+    // 切换到直线工具后选中线段，拖末端点改变长度
+    fireEvent.click(screen.getByTitle('直线'))
+    expect(document.body.querySelectorAll(`${annotationLayer} [data-shape-handle]`)).toHaveLength(0)
+    // 从矩形外的空白区起笔，避免单击命中已有矩形
+    drag(img, 4, [180, 180], [280, 240])
+    fireEvent(img, pointerEvent('pointerdown', 230, 210, 5))
+    fireEvent(img, pointerEvent('pointerup', 230, 210, 5))
+    expect(document.body.querySelectorAll(`${annotationLayer} [data-shape-handle]`)).toHaveLength(2)
+    drag(img, 6, [280, 240], [330, 210])
+    const lines = document.body.querySelectorAll(`${annotationLayer} line`)
+    expect(Array.from(lines).some(line => line.getAttribute('x2') === '660')).toBe(true)
+  })
+
+  it('按住已绘制的形状本体拖动可整体平移，尺寸保持不变', async () => {
+    const { img } = await captureFrame()
+    fireEvent.click(screen.getByTitle('矩形'))
+    drag(img, 1, [10, 10], [100, 80])
+    const rect = () => document.body.querySelector(`${annotationLayer} rect`) as SVGRectElement
+    expect(rect().getAttribute('x')).toBe('20')
+    expect(rect().getAttribute('width')).toBe('180')
+
+    // 从图形内部（非控制点）起笔拖动
+    drag(img, 2, [50, 40], [80, 55])
+    expect(rect().getAttribute('x')).toBe('80')
+    expect(rect().getAttribute('y')).toBe('50')
+    expect(rect().getAttribute('width')).toBe('180')
+    expect(rect().getAttribute('height')).toBe('140')
+  })
+
+  it('悬停已绘制的方框 / 直线时光标变为十字，移开恢复箭头', async () => {
+    const { img } = await captureFrame()
+    const stage = img.parentElement as HTMLElement
+    fireEvent.click(screen.getByTitle('矩形'))
+    drag(img, 1, [10, 10], [100, 80])
+    expect(stage.style.cursor).toBe('default')
+
+    fireEvent(img, pointerEvent('pointermove', 50, 40, 2))
+    expect(stage.style.cursor).toBe('move')
+    fireEvent(img, pointerEvent('pointermove', 350, 250, 2))
+    expect(stage.style.cursor).toBe('default')
+
+    fireEvent.click(screen.getByTitle('直线'))
+    drag(img, 3, [180, 180], [280, 240])
+    fireEvent(img, pointerEvent('pointermove', 230, 210, 4))
+    expect(stage.style.cursor).toBe('move')
+  })
+
+  it('双击裁剪框只应用裁剪覆盖原图，不提交；再点完成才送入对话框', async () => {
+    const { img } = await captureFrame()
+    drag(img, 1, [50, 50], [200, 150])
+    const cropMask = () => document.body.querySelector('[style*="9999px"]')
+    expect(cropMask()).toBeTruthy()
+
+    const now = vi.spyOn(Date, 'now')
+    now.mockReturnValue(1000)
+    fireEvent(img, pointerEvent('pointerdown', 100, 100, 2))
+    expect(cropMask()).toBeTruthy()
+    now.mockReturnValue(1100)
+    fireEvent(img, pointerEvent('pointerdown', 100, 100, 3))
+    // 裁剪被应用：遮罩消失、停留在编辑页、没有提交
+    await waitFor(() => expect(cropMask()).toBeNull())
+    expect(onConfirm).not.toHaveBeenCalled()
+    expect(onClose).not.toHaveBeenCalled()
+
+    fireEvent.click(screen.getByTitle('添加到对话框并复制到剪贴板'))
+    await waitFor(() => expect(onConfirm).toHaveBeenCalledTimes(1))
+    expect(onClose).toHaveBeenCalledTimes(1)
+  })
+
+  it('回车应用裁剪覆盖原图；没有裁剪框时回车等同完成', async () => {
+    const { img } = await captureFrame()
+    drag(img, 1, [50, 50], [200, 150])
+    fireEvent.keyDown(document, { key: 'Enter' })
+    await waitFor(() => expect(document.body.querySelector('[style*="9999px"]')).toBeNull())
+    expect(onConfirm).not.toHaveBeenCalled()
+
+    fireEvent.keyDown(document, { key: 'Enter' })
+    await waitFor(() => expect(onConfirm).toHaveBeenCalledTimes(1))
+    expect(onClose).toHaveBeenCalledTimes(1)
+  })
+
+  it('文字输入框内回车只提交文字，不误触裁剪完成', async () => {
+    const { img } = await captureFrame()
+    drag(img, 1, [50, 50], [200, 150])
+    fireEvent.click(screen.getByTitle('文字'))
+    fireEvent(img, pointerEvent('pointerdown', 100, 100, 3))
+    const note = await screen.findByPlaceholderText('输入备注')
+    fireEvent.change(note, { target: { value: '备注' } })
+    fireEvent.keyDown(note, { key: 'Enter' })
+    expect(onConfirm).not.toHaveBeenCalled()
+    expect(onClose).not.toHaveBeenCalled()
+    expect(document.body.querySelector('[style*="9999px"]')).toBeTruthy()
   })
 
   it('默认非最大化，最大化/还原按钮在工具栏行切换窗口尺寸', async () => {
@@ -437,7 +688,7 @@ describe('协作沟通截图对话框', () => {
 
     fireEvent.click(screen.getByTitle('文字'))
     fireEvent(img, pointerEvent('pointerdown', 120, 120, 2))
-    const note = await screen.findByPlaceholderText('输入备注后回车')
+    const note = await screen.findByPlaceholderText('输入备注')
     fireEvent.change(note, { target: { value: '需核查' } })
     fireEvent.keyDown(note, { key: 'Enter' })
     expect(document.body.querySelector(`${annotationLayer} text`)?.textContent).toContain('需核查')
@@ -446,7 +697,13 @@ describe('协作沟通截图对话框', () => {
     await waitFor(() => expect(downloadCount).toBe(1))
     expect(onConfirm).not.toHaveBeenCalled()
 
-    fireEvent.click(screen.getByTitle('添加到对话框并复制到剪贴板'))
+    const done = screen.getByTitle('添加到对话框并复制到剪贴板')
+    expect(done.textContent).toContain('完成')
+    // 「完成」紧跟在「转发」右侧，不再用右侧的勾选图标
+    const forward = screen.getByTitle('转发')
+    expect(forward.compareDocumentPosition(done) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect(screen.queryByTitle('添加到对话框')).toBeNull()
+    fireEvent.click(done)
     await waitFor(() => expect(onConfirm).toHaveBeenCalledTimes(1))
     const file = onConfirm.mock.calls[0][0] as File
     expect(file.type).toBe('image/png')

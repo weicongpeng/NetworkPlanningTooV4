@@ -30,7 +30,8 @@ const HANDLES: { dir: ResizeDir; className: string; cursor: string }[] = [
 
 export function ImWindow({ userId, desktopMode, onClose }: Props) {
   const { t } = useTranslation()
-  const topOffset = desktopMode ? 40 : 8
+  // 与图片编辑页 / 桌面壳层标题栏（h-8 = 32px）保持一致，最大化时从标题栏下沿铺满
+  const topOffset = desktopMode ? 32 : 0
   const {
     rect, elementRef, maximized, toggleMaximize, startDrag, startResize,
   } = useImWindowGeometry(userId, topOffset)
@@ -71,7 +72,8 @@ export function ImWindow({ userId, desktopMode, onClose }: Props) {
       role="dialog"
       data-im-window
       aria-label={t('im.title', '沟通助手')}
-      className="fixed z-[6000] flex flex-col overflow-hidden rounded-2xl border border-border/80 bg-card/95 shadow-[0_24px_70px_-12px_rgba(0,0,0,0.45)] backdrop-blur-xl"
+      className={`fixed z-[6000] flex flex-col overflow-hidden bg-card/95 shadow-[0_24px_70px_-12px_rgba(0,0,0,0.45)] backdrop-blur-xl
+        ${maximized ? '' : 'rounded-2xl border border-border/80'}`}
       style={{
         left: rect.x, top: rect.y, width: rect.w, height: rect.h,
         opacity: entered ? 1 : 0,

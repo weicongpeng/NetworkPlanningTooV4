@@ -1,9 +1,10 @@
 /** 截图标注纯函数：箭头几何、各类型尺寸与 canvas 绘制（含马赛克采样）。 */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
-  arrowHead, arrowPoints, clamp, composeFullImage, createMosaicTile, drawAnnotations,
-  drawMosaicStrokes, fontFor, isMosaic, mosaicSizeFor, paintMosaicPoint,
-  paintMosaicSegment, shapeSize, strokeFor,
+  arrowHead, arrowPoints, arrowShaftEnd, clamp, composeFullImage, createMosaicTile,
+  drawAnnotations, drawMosaicStrokes, fontFor, isEditableShape, isMosaic, mosaicBlocksFor,
+  mosaicRangeFor, mosaicSizeFor, moveShapeVertex, paintMosaicPoint, paintMosaicSegment,
+  shapeHandleIndex, shapeHit, shapeSize, shapeVertices, strokeFor, translateShape,
 } from '../screenshotAnnotation'
 import type { Annotation } from '../screenshotAnnotation'
 
@@ -35,7 +36,11 @@ describe('screenshotAnnotation', () => {
     expect(wingA.x).toBeLessThan(100)
     expect(wingB.x).toBeLessThan(100)
     expect(wingA.y).toBeCloseTo(-wingB.y, 6)
+    // 尖嘴：张角收窄到 π/12，无论缩放都是细长尖角
+    expect(Math.abs(wingA.y) / (100 - wingA.x)).toBeCloseTo(Math.tan(Math.PI / 12), 6)
     expect(arrowPoints(0, 0, 100, 0, 20)).toContain('100,0')
+    // 箭杆末端回退，粗线圆帽不会盖住三角形尖端
+    expect(arrowShaftEnd(0, 0, 100, 0, 20).x).toBeCloseTo(83, 6)
   })
 
   it('尺寸 / 颜色辅助函数边界稳定', () => {
@@ -46,6 +51,12 @@ describe('screenshotAnnotation', () => {
     // 笔刷按图片宽度放大，避免高分辨率截图上色块小到看不见
     expect(mosaicSizeFor(800)).toBe(25)
     expect(mosaicSizeFor(1920)).toBe(60)
+    expect(mosaicRangeFor(800)).toEqual({ min: 12, max: 100 })
+    // 小笔刷用更少色块 → 每块更大 → 模糊更明显；大笔刷保持 8×8
+    expect(mosaicBlocksFor(16)).toBe(5)
+    expect(mosaicBlocksFor(25)).toBe(5)
+    expect(mosaicBlocksFor(40)).toBe(6)
+    expect(mosaicBlocksFor(60)).toBe(8)
     expect(isMosaic({ kind: 'mosaic', points: [], size: 25 })).toBe(true)
   })
 
@@ -62,6 +73,33 @@ describe('screenshotAnnotation', () => {
     })).toBe(11)
   })
 
+  it('形状顶点编辑：矩形四角 / 线段两端，命中与拖动后几何正确', () => {
+    const rect: Annotation = { kind: 'rect', x: 20, y: 30, w: 180, h: 140, color: '#f00' }
+    const line: Annotation = { kind: 'line', x1: 0, y1: 0, x2: 100, y2: 0, color: '#f00' }
+    expect(isEditableShape(rect)).toBe(true)
+    expect(isEditableShape(line)).toBe(true)
+    expect(isEditableShape({ kind: 'text', x: 0, y: 0, text: 'a', color: '#f00', fontSize: 18 }))
+      .toBe(false)
+
+    if (!isEditableShape(rect) || !isEditableShape(line)) return
+    expect(shapeVertices(rect)).toEqual([
+      { x: 20, y: 30 }, { x: 200, y: 30 }, { x: 20, y: 170 }, { x: 200, y: 170 },
+    ])
+    expect(shapeVertices(line)).toEqual([{ x: 0, y: 0 }, { x: 100, y: 0 }])
+    expect(shapeHandleIndex(rect, { x: 200, y: 170 }, 8)).toBe(3)
+    expect(shapeHandleIndex(line, { x: 100, y: 2 }, 8)).toBe(1)
+    expect(shapeHit(line, { x: 50, y: 3 }, 8)).toBe(true)
+    expect(shapeHit(line, { x: 50, y: 30 }, 8)).toBe(false)
+
+    const grown = moveShapeVertex(rect, 3, { x: 300, y: 270 })
+    expect(grown).toMatchObject({ x: 20, y: 30, w: 280, h: 240 })
+    const moved = moveShapeVertex(line, 1, { x: 150, y: 40 })
+    expect(moved).toMatchObject({ x1: 0, y1: 0, x2: 150, y2: 40 })
+
+    expect(translateShape(rect, 30, 15)).toMatchObject({ x: 50, y: 45, w: 180, h: 140 })
+    expect(translateShape(line, 30, 15)).toMatchObject({ x1: 30, y1: 15, x2: 130, y2: 15 })
+  })
+
   it('drawAnnotations：矩形 / 箭头 / 文字分别落到 canvas，马赛克不在这里绘制', () => {
     const items: Annotation[] = [
       { kind: 'rect', x: 10, y: 20, w: 30, h: 40, color: '#ff3b30' },
@@ -73,7 +111,9 @@ describe('screenshotAnnotation', () => {
 
     expect(ctx.strokeRect).toHaveBeenCalledWith(5, 13, 30, 40) // dx/dy 裁剪偏移生效
     expect(ctx.moveTo).toHaveBeenCalledWith(-5, -7)
-    expect(ctx.lineTo).toHaveBeenCalledWith(95, -7)
+    // 箭头箭杆末端回退到三角形内部（x2-dx=95，headSize=16，back=13.6 → 81.4）
+    expect(ctx.lineTo.mock.calls.some(([x, y]) =>
+      Math.abs(x - 81.4) < 0.01 && Math.abs(y + 7) < 0.01)).toBe(true)
     expect(ctx.fill).toHaveBeenCalledTimes(1) // 箭头头部三角形
     expect(ctx.fillText).toHaveBeenCalledTimes(2) // 多行文字
     expect(ctx.drawImage).not.toHaveBeenCalled() // 马赛克交给 drawMosaicStrokes
@@ -92,6 +132,9 @@ describe('screenshotAnnotation', () => {
     paintMosaicPoint(painter, { x: 190, y: 10 }, 20)
     // mock 下 tile 与目标画布共用同一个 ctx：采样（源图→tile）+ 放大（tile→画布）各一次
     expect(ctx.drawImage).toHaveBeenCalledTimes(2)
+    // size=20 → 采样到 5×5 小画布（而非固定 8×8），色块更大、模糊更强
+    expect(ctx.drawImage.mock.calls[0].slice(5)).toEqual([0, 0, 5, 5])
+    expect(ctx.drawImage.mock.calls[1].slice(3, 5)).toEqual([5, 5])
     expect(ctx.imageSmoothingEnabled).toBe(true) // 调用后恢复
 
     drawMosaicStrokes(painter, [

@@ -159,14 +159,16 @@ describe('沟通助手窗口', () => {
     localStorage.setItem(GEOMETRY_KEY, JSON.stringify(preferred))
     const first = render(<ImWindow userId={1} desktopMode onClose={vi.fn()} />)
     fireEvent.click(screen.getByTitle('最大化'))
-    expect(windowSize()).toEqual({ w: 1008, h: 712 })
+    // 与图片编辑页最大化一致：铺满整个内容区（桌面标题栏 32px 以下），不留 8px 边距
+    expect(windowSize()).toEqual({ w: 1024, h: 736 })
+    expect((screen.getByRole('dialog') as HTMLElement).style.top).toBe('32px')
     expect(localStorage.getItem(MAXIMIZED_KEY)).toBe('1')
     expect(JSON.parse(localStorage.getItem(GEOMETRY_KEY)!)).toEqual(preferred)
 
     // 切到其它页面再回来（窗口重新挂载）仍保持最大化，不会退回普通尺寸
     first.unmount()
     render(<ImWindow userId={1} desktopMode onClose={vi.fn()} />)
-    expect(windowSize()).toEqual({ w: 1008, h: 712 })
+    expect(windowSize()).toEqual({ w: 1024, h: 736 })
     expect(screen.getByTitle('还原')).toBeTruthy()
 
     fireEvent.click(screen.getByTitle('还原'))
