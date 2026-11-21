@@ -98,6 +98,39 @@ def test_activate_writes_license(desktop_local):
     assert (desktop_local.settings.LICENSE_DIR / "license.nptlic").is_file()
 
 
+def test_non_admin_can_activate_and_renew(desktop_local):
+    """桌面授权是每台机器的凭据：普通用户也应能自行激活和续期。"""
+    from app.core.security import get_current_user
+
+    desktop_local.client.app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(
+        username="alice", is_admin=False
+    )
+    license_file = desktop_local.make_license(30)
+    desktop_local.monkeypatch.setattr(
+        desktop_local.cloud,
+        "activate",
+        lambda code, hostname=None: {"license_file": license_file},
+    )
+    activated = desktop_local.client.post(
+        "/api/v1/desktop/cloud-activate",
+        json={"activation_code": "NPT-ABCD-EFGH-JKMN-PQRS"},
+    )
+    assert activated.status_code == 200, activated.text
+    assert activated.json()["data"]["license"]["valid"] is True
+
+    desktop_local.monkeypatch.setattr(
+        desktop_local.cloud,
+        "renew_remote",
+        lambda license_file, **kwargs: {
+            "license_file": desktop_local.make_license(60),
+            "expire_date": "future",
+        },
+    )
+    renewed = desktop_local.client.post("/api/v1/desktop/cloud-renew")
+    assert renewed.status_code == 200, renewed.text
+    assert renewed.json()["data"]["license"]["valid"] is True
+
+
 def test_app_version_uses_server_absolute_url(desktop_local):
     """桌面端不分发 APK：取服务器最新版本，且下载/二维码地址必须是服务器绝对地址。"""
     desktop_local.monkeypatch.setattr(

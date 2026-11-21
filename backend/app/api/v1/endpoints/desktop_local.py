@@ -1434,7 +1434,7 @@ async def cloud_status(
 @router.post("/cloud-activate")
 def cloud_activate(
     payload: ActivateRequest,
-    admin_user: User = Depends(get_current_admin_user),
+    _current_user: User = Depends(get_current_user),
     _: None = Depends(_require_desktop),
 ) -> Dict[str, Any]:
     try:
@@ -1450,7 +1450,7 @@ def cloud_activate(
 
 @router.post("/cloud-renew")
 def cloud_renew(
-    admin_user: User = Depends(get_current_admin_user),
+    _current_user: User = Depends(get_current_user),
     _: None = Depends(_require_desktop),
 ) -> Dict[str, Any]:
     try:
@@ -1467,7 +1467,7 @@ def cloud_renew(
 @router.post("/cloud-apply")
 def cloud_apply(
     payload: ApplyRequest,
-    admin_user: User = Depends(get_current_admin_user),
+    _current_user: User = Depends(get_current_user),
     _: None = Depends(_require_desktop),
 ) -> Dict[str, Any]:
     try:
@@ -1479,7 +1479,7 @@ def cloud_apply(
 
 @router.get("/cloud-apply")
 def cloud_apply_poll(
-    admin_user: User = Depends(get_current_admin_user),
+    _current_user: User = Depends(get_current_user),
     _: None = Depends(_require_desktop),
 ) -> Dict[str, Any]:
     try:

@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
-import { Check, Palette, Sun, Moon, Key, RefreshCw, X, Globe, Calendar, Infinity, Loader2, LifeBuoy, Monitor, Copy, Upload, Cloud, Send, Settings, Info } from 'lucide-react'
+import { useCallback, useEffect, useState } from 'react'
+import { Check, Palette, Sun, Moon, Key, RefreshCw, X, Globe, Calendar, Infinity, Loader2, LifeBuoy, Monitor, Copy, Cloud, Send, Settings, Info } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import type { MachineInfo, LicenseStatus, DesktopCloudStatus } from '@shared/types'
 import {
@@ -26,8 +26,6 @@ export function LicensePage() {
   const { themeMode, colorScheme, setThemeMode, setColorScheme, applyTheme } = useThemeStore()
   const { user, fetchUser } = useAuthStore()
   const desktopMode = useAuthStore((s) => s.desktopMode)
-  const desktopRunMode = useAuthStore((s) => s.desktopRunMode)
-  const isStandalone = desktopRunMode === 'standalone'
   const [previewTheme, setPreviewTheme] = useState<ThemeMode | null>(null)
   const [previewColor, setPreviewColor] = useState<ColorScheme | null>(null)
 
@@ -36,10 +34,7 @@ export function LicensePage() {
   // 桌面端授权：机器码与授权状态
   const [machineInfo, setMachineInfo] = useState<MachineInfo | null>(null)
   const [licenseStatus, setLicenseStatus] = useState<LicenseStatus | null>(null)
-  const [uploading, setUploading] = useState(false)
-  const [uploadMessage, setUploadMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
   const [copied, setCopied] = useState(false)
-  const licenseFileRef = useRef<HTMLInputElement>(null)
 
   const refreshLicenseState = useCallback(async () => {
     try {
@@ -208,27 +203,6 @@ export function LicensePage() {
     setTimeout(() => setCopied(false), 2000)
   }
 
-  const handleUploadLicense = async (file: File) => {
-    setUploading(true)
-    setUploadMessage(null)
-    try {
-      const result: any = await licenseApi.upload(file)
-      if (result?.success) {
-        setUploadMessage({ type: 'success', text: result.message || t('license.uploadSuccess') })
-        await fetchUser()
-        await refreshLicenseState()
-      } else {
-        setUploadMessage({ type: 'error', text: result?.message || t('license.uploadError') })
-      }
-    } catch (err: any) {
-      setUploadMessage({ type: 'error', text: err?.message || t('license.uploadError') })
-    } finally {
-      setUploading(false)
-      if (licenseFileRef.current) licenseFileRef.current.value = ''
-      setTimeout(() => setUploadMessage(null), 8000)
-    }
-  }
-
   const handleThemeSelect = (mode: ThemeMode) => {
     setPreviewTheme(mode)
     const root = document.documentElement
@@ -329,8 +303,8 @@ export function LicensePage() {
       {/* 大模型配置（网优助手）：仅管理员或被授予网优助手权限的用户可见 */}
       {(isAdmin || user?.can_assistant) && <LLMConfigCard />}
 
-      {/* 桌面端授权：在线激活/续期 + 机器码 + 离线导入（仅共享模式桌面版的管理员） */}
-      {machineInfo?.desktopMode && isAdmin && !isStandalone && (
+      {/* 桌面端授权：共享/单机的所有桌面用户都可用授权码激活并自行续期 */}
+      {machineInfo?.desktopMode && (
         <div className="bg-card p-5 rounded-lg border border-border">
           <div className="flex items-center justify-between mb-4">
             <div className="flex items-center gap-2">
@@ -405,76 +379,11 @@ export function LicensePage() {
                     )}
                   </div>
                 ) : (
-                  <div className="space-y-3">
-                    <div className="flex items-center gap-2">
-                      <input
-                        value={activationCode}
-                        onChange={(e) => setActivationCode(e.target.value)}
-                        onKeyDown={(e) => {
-                          if (e.key === 'Enter') handleCloudActivate()
-                        }}
-                        placeholder={t('license.activationCodePlaceholder')}
-                        className="flex-1 px-3 py-2 bg-background border border-border rounded-lg text-sm font-mono tracking-wider focus:outline-none focus:ring-2 focus:ring-primary/50"
-                      />
-                      <button
-                        onClick={handleCloudActivate}
-                        disabled={cloudBusy !== '' || !activationCode.trim()}
-                        className="px-4 py-2 bg-primary text-primary-foreground rounded-lg hover:opacity-90 disabled:opacity-50 text-sm font-medium flex items-center gap-1.5"
-                      >
-                        {cloudBusy === 'activate' ? <Loader2 size={14} className="animate-spin" /> : <Cloud size={14} />}
-                        {cloudBusy === 'activate' ? t('license.cloudActivating') : t('license.cloudActivateButton')}
-                      </button>
-                    </div>
-
-                    {applyWaiting ? (
-                      <div className="p-2 rounded bg-primary/10 border border-primary/20 text-primary text-xs flex items-center gap-2">
-                        <Loader2 size={14} className="animate-spin" />
-                        {t('license.cloudApplyWaiting')}
-                      </div>
-                    ) : !showApplyForm ? (
-                      <button
-                        onClick={() => setShowApplyForm(true)}
-                        className="text-xs text-primary hover:underline flex items-center gap-1"
-                      >
-                        <Send size={12} /> {t('license.cloudApplyToggle')}
-                      </button>
-                    ) : (
-                      <div className="space-y-2 p-3 border border-border rounded-lg">
-                        <p className="text-xs text-muted-foreground">{t('license.cloudApplyHint')}</p>
-                        <input
-                          value={applyName}
-                          onChange={(e) => setApplyName(e.target.value)}
-                          placeholder={t('license.cloudApplyName')}
-                          className="w-full px-3 py-2 bg-background border border-border rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary/50"
-                        />
-                        <input
-                          value={applyOrg}
-                          onChange={(e) => setApplyOrg(e.target.value)}
-                          placeholder={t('license.cloudApplyOrg')}
-                          className="w-full px-3 py-2 bg-background border border-border rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary/50"
-                        />
-                        <div className="flex gap-2">
-                          <button
-                            onClick={handleCloudApply}
-                            disabled={cloudBusy !== '' || !applyName.trim()}
-                            className="px-4 py-2 bg-primary text-primary-foreground rounded-lg hover:opacity-90 disabled:opacity-50 text-sm font-medium flex items-center gap-1.5"
-                          >
-                            {cloudBusy === 'apply' ? <Loader2 size={14} className="animate-spin" /> : <Send size={14} />}
-                            {t('license.cloudApplySubmit')}
-                          </button>
-                          <button
-                            onClick={() => setShowApplyForm(false)}
-                            className="px-4 py-2 bg-secondary text-secondary-foreground rounded-lg hover:opacity-90 text-sm font-medium"
-                          >
-                            {t('theme.cancel')}
-                          </button>
-                        </div>
-                      </div>
-                    )}
-
-                    {cloudStatus?.license?.errorMessage && (
-                      <p className="text-xs text-amber-600">{cloudStatus.license.errorMessage}</p>
-                    )}
+                  <div className="p-2 rounded flex items-center gap-2 border bg-amber-500/10 border-amber-500/20 text-amber-600">
+                    <X size={14} />
+                    <span className="text-xs">
+                      {cloudStatus?.license?.errorMessage || t('license.desktopStatusInactive')}
+                    </span>
                   </div>
                 )}
 
@@ -485,44 +394,80 @@ export function LicensePage() {
 
             </div>
 
-            {/* 右列：离线导入（内网/无网络时由厂商签发）与状态提示 */}
+            {/* 右列：授权码激活（共享/单机的普通用户均可操作） */}
             <div className="min-w-0 space-y-4 pt-4 border-t border-border xl:pt-0 xl:border-t-0 xl:border-l xl:pl-8">
               <div>
-                <label className="block text-xs text-muted-foreground mb-1.5">{t('license.importLabel')}</label>
-                <input
-                  ref={licenseFileRef}
-                  type="file"
-                  accept=".nptlic,.lic,.dat,.txt"
-                  className="hidden"
-                  onChange={(e) => {
-                    const f = e.target.files?.[0]
-                    if (f) handleUploadLicense(f)
-                  }}
-                />
-                <button
-                  onClick={() => licenseFileRef.current?.click()}
-                  disabled={uploading}
-                  className="px-4 py-2 border border-border rounded-lg hover:bg-muted disabled:opacity-50 text-sm font-medium flex items-center gap-1.5"
-                >
-                  {uploading ? <Loader2 size={14} className="animate-spin" /> : <Upload size={14} />}
-                  {uploading ? t('license.uploading') : t('license.importButton')}
-                </button>
-                <p className="text-xs text-muted-foreground mt-1.5">{t('license.importHint')}</p>
+                <label className="text-xs text-muted-foreground mb-1.5 flex items-center gap-1.5">
+                  <Key size={13} /> {t('license.activationLabel')}
+                </label>
+                <div className="flex items-center gap-2">
+                  <input
+                    value={activationCode}
+                    onChange={(e) => setActivationCode(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') handleCloudActivate()
+                    }}
+                    placeholder={t('license.activationCodePlaceholder')}
+                    className="flex-1 min-w-0 px-3 py-2 bg-background border border-border rounded-lg text-sm font-mono tracking-wider focus:outline-none focus:ring-2 focus:ring-primary/50"
+                  />
+                  <button
+                    onClick={handleCloudActivate}
+                    disabled={cloudBusy !== '' || !activationCode.trim()}
+                    className="px-4 py-2 bg-primary text-primary-foreground rounded-lg hover:opacity-90 disabled:opacity-50 text-sm font-medium flex items-center gap-1.5 flex-shrink-0"
+                  >
+                    {cloudBusy === 'activate' ? <Loader2 size={14} className="animate-spin" /> : <Cloud size={14} />}
+                    {cloudBusy === 'activate' ? t('license.cloudActivating') : t('license.cloudActivateButton')}
+                  </button>
+                </div>
+                <p className="text-xs text-muted-foreground mt-1.5">{t('license.activationHint')}</p>
               </div>
 
-              {licenseStatus && !cloudStatus?.license?.valid && (
-                <div className={`p-2 rounded flex items-center gap-2 border ${
-                  licenseStatus.valid
-                    ? 'bg-green-500/10 border-green-500/20 text-green-500'
-                    : 'bg-amber-500/10 border-amber-500/20 text-amber-600'
-                }`}>
-                  {licenseStatus.valid ? <Check size={14} /> : <X size={14} />}
-                  <span className="text-xs">
-                    {licenseStatus.valid
-                      ? t('license.desktopStatusActive', { date: licenseStatus.expiryDate })
-                      : (licenseStatus.errorMessage || t('license.desktopStatusInactive'))}
-                  </span>
-                </div>
+              {cloudStatus && !cloudStatus.license?.valid && (
+                applyWaiting ? (
+                  <div className="p-2 rounded bg-primary/10 border border-primary/20 text-primary text-xs flex items-center gap-2">
+                    <Loader2 size={14} className="animate-spin" />
+                    {t('license.cloudApplyWaiting')}
+                  </div>
+                ) : !showApplyForm ? (
+                  <button
+                    onClick={() => setShowApplyForm(true)}
+                    className="text-xs text-primary hover:underline flex items-center gap-1"
+                  >
+                    <Send size={12} /> {t('license.cloudApplyToggle')}
+                  </button>
+                ) : (
+                  <div className="space-y-2 p-3 border border-border rounded-lg">
+                    <p className="text-xs text-muted-foreground">{t('license.cloudApplyHint')}</p>
+                    <input
+                      value={applyName}
+                      onChange={(e) => setApplyName(e.target.value)}
+                      placeholder={t('license.cloudApplyName')}
+                      className="w-full px-3 py-2 bg-background border border-border rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary/50"
+                    />
+                    <input
+                      value={applyOrg}
+                      onChange={(e) => setApplyOrg(e.target.value)}
+                      placeholder={t('license.cloudApplyOrg')}
+                      className="w-full px-3 py-2 bg-background border border-border rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary/50"
+                    />
+                    <div className="flex gap-2">
+                      <button
+                        onClick={handleCloudApply}
+                        disabled={cloudBusy !== '' || !applyName.trim()}
+                        className="px-4 py-2 bg-primary text-primary-foreground rounded-lg hover:opacity-90 disabled:opacity-50 text-sm font-medium flex items-center gap-1.5"
+                      >
+                        {cloudBusy === 'apply' ? <Loader2 size={14} className="animate-spin" /> : <Send size={14} />}
+                        {t('license.cloudApplySubmit')}
+                      </button>
+                      <button
+                        onClick={() => setShowApplyForm(false)}
+                        className="px-4 py-2 bg-secondary text-secondary-foreground rounded-lg hover:opacity-90 text-sm font-medium"
+                      >
+                        {t('theme.cancel')}
+                      </button>
+                    </div>
+                  </div>
+                )
               )}
 
               {cloudMessage && (
@@ -533,17 +478,6 @@ export function LicensePage() {
                 }`}>
                   {cloudMessage.type === 'success' ? <Check size={14} /> : <X size={14} />}
                   <span className="text-xs">{cloudMessage.text}</span>
-                </div>
-              )}
-
-              {uploadMessage && (
-                <div className={`p-2 rounded flex items-center gap-2 ${
-                  uploadMessage.type === 'success'
-                    ? 'bg-green-500/10 border border-green-500/20 text-green-500'
-                    : 'bg-red-500/10 border border-red-500/20 text-red-500'
-                }`}>
-                  {uploadMessage.type === 'success' ? <Check size={14} /> : <X size={14} />}
-                  <span className="text-xs">{uploadMessage.text}</span>
                 </div>
               )}
             </div>
