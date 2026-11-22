@@ -1,6 +1,6 @@
-/** 系统设置 → 桌面端授权：所有普通用户都能用授权码激活。 */
+/** 系统设置：桌面端授权卡片已移除，页面只保留版本更新、语言、主题等设置。 */
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { render, screen, waitFor } from '@testing-library/react'
 
 const mocks = vi.hoisted(() => {
   const auth = {
@@ -13,7 +13,6 @@ const mocks = vi.hoisted(() => {
     getMachineInfo: vi.fn(),
     getLicenseStatus: vi.fn(),
     getCloudStatus: vi.fn(),
-    activate: vi.fn(),
   }
 })
 
@@ -48,13 +47,7 @@ vi.mock('../../services/api', () => ({
     getMachineInfo: mocks.getMachineInfo,
     getStatus: mocks.getLicenseStatus,
   },
-  desktopCloudApi: {
-    getStatus: mocks.getCloudStatus,
-    activate: mocks.activate,
-    renew: vi.fn(),
-    apply: vi.fn(),
-    pollApply: vi.fn(),
-  },
+  desktopCloudApi: { getStatus: mocks.getCloudStatus },
   desktopUpdateApi: { status: vi.fn() },
 }))
 
@@ -66,13 +59,11 @@ vi.mock('react-i18next', () => ({
     i18n: { language: 'zh', changeLanguage: vi.fn() },
     t: (key: string, options?: any) => {
       const labels: Record<string, string> = {
+        'license.title': '许可证与主题',
         'license.desktopTitle': '桌面端授权',
-        'license.activationLabel': '授权码激活',
-        'license.activationHint': '输入管理员发放的授权码后激活',
-        'license.activationCodePlaceholder': '输入授权码（NPT-XXXX-XXXX-XXXX-XXXX）',
-        'license.cloudActivateButton': '立即激活',
-        'license.cloudLabel': '在线授权',
-        'license.desktopStatusInactive': '未激活',
+        'license.machineCodeLabel': '本机机器码',
+        'desktopUpdate.versionTitle': '版本与更新',
+        'language.title': '语言设置',
       }
       const text = labels[key] ?? key
       return options?.message ? text.replace('{{message}}', options.message) : text
@@ -82,7 +73,7 @@ vi.mock('react-i18next', () => ({
 
 import { LicensePage } from '../LicensePage'
 
-describe('LicensePage 桌面端授权', () => {
+describe('LicensePage 桌面端设置', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     mocks.getMachineInfo.mockResolvedValue({
@@ -102,29 +93,15 @@ describe('LicensePage 桌面端授权', () => {
         cloud: {},
       },
     })
-    mocks.activate.mockResolvedValue({ success: true, message: '激活成功' })
   })
 
-  it('普通用户不显示文件导入，改为授权码激活', async () => {
-    const { container } = render(<LicensePage />)
-
-    await waitFor(() => expect(screen.getByText('桌面端授权')).toBeTruthy())
-    expect(screen.getByText('授权码激活')).toBeTruthy()
-    expect(screen.getByText('输入管理员发放的授权码后激活')).toBeTruthy()
-    expect(screen.queryByText('导入授权文件')).toBeNull()
-    expect(container.querySelector('input[type="file"]')).toBeNull()
-  })
-
-  it('输入授权码后可提交激活', async () => {
+  it('桌面端不再渲染系统设置的桌面端授权卡片', async () => {
     render(<LicensePage />)
 
-    const input = await screen.findByPlaceholderText('输入授权码（NPT-XXXX-XXXX-XXXX-XXXX）')
-    fireEvent.change(input, { target: { value: 'NPT-ABCD-EFGH-JKMN-PQRS' } })
-    fireEvent.click(screen.getByRole('button', { name: /立即激活/ }))
-
-    await waitFor(() =>
-      expect(mocks.activate).toHaveBeenCalledWith('NPT-ABCD-EFGH-JKMN-PQRS'),
-    )
-    expect(await screen.findByText('激活成功')).toBeTruthy()
+    await waitFor(() => expect(screen.getByText('版本与更新')).toBeTruthy())
+    expect(screen.queryByText('桌面端授权')).toBeNull()
+    expect(screen.queryByText('本机机器码')).toBeNull()
+    expect(screen.queryByText('在线授权')).toBeNull()
+    expect(screen.getByText('语言设置')).toBeTruthy()
   })
 })

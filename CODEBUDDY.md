@@ -201,7 +201,7 @@ FastAPI (backend/app/)
 | `pci.py` / `neighbor.py` / `tac.py` | `/api/v1/pci` 等 | 规划/核查、进度、结果、历史、导出、应用到工参 |
 | `distance_match.py` | `/api/v1/distance-match` | 批量距离匹配 |
 | `site_spacing.py` | `/api/v1/site-spacing` | 站间距计算 |
-| `table_merge.py` | `/api/v1/table-merge` | 表格合并：`/inspect` 解析多文件多 sheet 并给出分组预览、`/merge` 按表头结构或工作表名合并输出单个 Excel（`/static` 下载） |
+| `table_merge.py` | `/api/v1/table-merge` | 表格合并：`/inspect` 解析多文件多 sheet 并给出分组预览、`/merge` 按表头结构 / 工作表名分组，或所有文件按列名（忽略大小写）对齐为一张表（columns 模式仅接受 CSV 或单 sheet Excel），输出单个 Excel（`/static` 下载） |
 | `attribute_join.py` | `/api/v1/attribute-join` | 条件选择（图层属性空间连接，`/plan` + 进度/结果/下载） |
 | `buffer.py` | `/api/v1/buffer` | 绘制缓冲区（`/plan` + 进度/结果） |
 | `map.py` | `/api/v1/map` | 地图数据/小区/扇区、缓存清理、在线与离线配置 |

@@ -94,6 +94,7 @@ export function ImHost() {
   useEffect(() => {
     if (!mentionNotice || lastNoticeKeyRef.current === mentionNotice.key) return
     lastNoticeKeyRef.current = mentionNotice.key
+    if (standalone) return
     useToastStore.getState().show(t(
       mentionNotice.mentionAll ? 'im.mention.noticeAll' : 'im.mention.notice',
       {
@@ -104,7 +105,7 @@ export function ImHost() {
       },
     ))
     playImMentionSound()
-  }, [mentionNotice, t])
+  }, [mentionNotice, t, standalone])
 
   useEffect(() => {
     const next = clampPos(loadPos(user?.id ?? null))
@@ -244,7 +245,8 @@ export function ImHost() {
    * 桌面端「不强行开窗」——保持屏幕原样，确认截图后才由 onConfirm 展开会话窗口。
    */
   const triggerScreenshot = useCallback(() => {
-    if (!user) return
+    // 单机模式没有沟通助手，截图也没有可发送的会话：连快捷键/壳层热键一并禁用
+    if (!user || standalone) return
     if (useAuthStore.getState().desktopMode) {
       void startDesktopCapture()
     } else {
@@ -252,7 +254,7 @@ export function ImHost() {
       setScreenshotBlob(null)
       setScreenshotOpen(true)
     }
-  }, [user, startDesktopCapture])
+  }, [user, standalone, startDesktopCapture])
 
   // 应用级快捷键：组合键读共享配置（网页端与桌面端同一份），不必打开会话也能唤起。
   // 桌面壳另注册了 Win32 全局热键，其它应用窗口 / 窗口后台时通过下方轮询投递同一事件。

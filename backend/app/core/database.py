@@ -162,6 +162,12 @@ def init_db():
                 conn.exec_driver_sql(
                     "ALTER TABLE desktop_licenses ADD COLUMN idle_logout_days INTEGER NOT NULL DEFAULT 2"
                 )
+            # 凭证轮换号：旧库里的已签发许可一律视为第 1 版；
+            # 管理员禁用/解绑/重发激活码后递增，旧许可文件随即失效。
+            if "credential_version" not in dl_cols:
+                conn.exec_driver_sql(
+                    "ALTER TABLE desktop_licenses ADD COLUMN credential_version INTEGER NOT NULL DEFAULT 1"
+                )
 
         # 迁移：桌面共享模式数据集修订号表（早期版本可能缺组归属列）
         dr_cols = [row[1] for row in conn.exec_driver_sql("PRAGMA table_info(dataset_revisions)").fetchall()]

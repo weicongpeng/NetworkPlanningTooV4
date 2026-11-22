@@ -462,6 +462,9 @@ class DesktopLicense(Base):
     username = Column(String(100), nullable=True, index=True)
     user_id = Column(Integer, nullable=True, index=True)
     status = Column(String(16), nullable=False, default="issued", index=True)
+    # 凭证轮换号：禁用 / 解绑 / 重发激活码时递增，写进签名许可。
+    # 服务端验签时比对，旧 .nptlic 即使没过期也不能再用于登录、续期和数据访问。
+    credential_version = Column(Integer, nullable=False, default=1)
     source = Column(String(10), nullable=False, default="precreate")
     lease_days = Column(Integer, nullable=False, default=30)
     expire_date = Column(String(10), nullable=True)
@@ -501,6 +504,7 @@ class DesktopLicense(Base):
             "username": self.username,
             "user_id": self.user_id,
             "status": self.status,
+            "credential_version": self.credential_version or 1,
             "source": self.source,
             "lease_days": self.lease_days,
             "login_count": self.login_count or 0,

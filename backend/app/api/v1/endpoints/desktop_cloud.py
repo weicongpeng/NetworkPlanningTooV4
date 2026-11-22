@@ -200,9 +200,11 @@ async def desktop_login(
     except DesktopLicenseError as exc:
         raise HTTPException(status_code=exc.status_code, detail=_gbk_safe(exc.message))
 
-    # 同一账号以最后登录为准：桌面端登录同样占用服务器会话，并踢掉该账号其它
-    # 网页端/桌面端登录（客户端据此周期性校验，被踢后本机自动登出）
-    if result == "ok":
+    # 单机模式的登录态只属于本机：不写云端会话（也就不会与网页端/共享模式互踢），
+    # 不广播上线（网页端因此不会弹上线气泡、不会响敲门声）。许可校验仍照常执行。
+    # 共享模式沿用原来的会话记账与 presence 广播。
+    standalone_login = payload.mode == "standalone"
+    if result == "ok" and not standalone_login:
         try:
             from app.services.auth_service import auth_service
 
@@ -574,6 +576,11 @@ def _verify_license(license_file: str, machine_code: str, db: Session):
     record = db.query(DesktopLicense).filter(DesktopLicense.id == int(license_id)).first()
     if record is None:
         raise HTTPException(status_code=404, detail="授权记录不存在，请联系管理员")
+    if int(payload.get("credential_version") or 1) != int(record.credential_version or 1):
+        raise HTTPException(
+            status_code=403,
+            detail="授权已禁用/解绑或激活码已重发，请在系统设置 → 桌面授权重新输入激活码",
+        )
     if record.status == "disabled":
         raise HTTPException(status_code=403, detail="该授权已被禁用，请联系管理员")
     if record.status != "active" or not record.machine_code:

@@ -24,8 +24,7 @@ export function DesktopLicensesPage() {
   const [pageSize] = useState(20)
   const [status, setStatus] = useState('')
   const [keyword, setKeyword] = useState('')
-  // 共享模式登录会自动签发许可（无需管理），默认只看单机授权
-  const [mode, setMode] = useState<'standalone' | 'shared' | ''>('standalone')
+  // 桌面端授权不再按共享 / 单机模式拆分：管理员看到并配置的是同一套授权
   const [loading, setLoading] = useState(false)
   const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
 
@@ -62,7 +61,7 @@ export function DesktopLicensesPage() {
   const fetchItems = useCallback(async () => {
     setLoading(true)
     try {
-      const res = await desktopLicensesApi.list(page, pageSize, status || undefined, keyword || undefined, mode || undefined)
+      const res = await desktopLicensesApi.list(page, pageSize, status || undefined, keyword || undefined)
       if (res.success) {
         setItems(res.data.items)
         setTotal(res.data.total)
@@ -72,7 +71,7 @@ export function DesktopLicensesPage() {
     } finally {
       setLoading(false)
     }
-  }, [page, pageSize, status, keyword, mode, t])
+  }, [page, pageSize, status, keyword, t])
 
   useEffect(() => {
     fetchItems()
@@ -213,18 +212,6 @@ export function DesktopLicensesPage() {
           <option value="active">{t('desktopLicenses.status_active')}</option>
           <option value="disabled">{t('desktopLicenses.status_disabled')}</option>
           <option value="rejected">{t('desktopLicenses.status_rejected')}</option>
-        </select>
-        <select
-          value={mode}
-          onChange={(e) => {
-            setPage(1)
-            setMode(e.target.value as 'standalone' | 'shared' | '')
-          }}
-          className="px-3 py-2 bg-background border border-border rounded-lg text-sm"
-        >
-          <option value="standalone">{t('desktopLicenses.modeStandalone', '单机授权')}</option>
-          <option value="shared">{t('desktopLicenses.modeShared', '共享模式')}</option>
-          <option value="">{t('desktopLicenses.allMode', '全部模式')}</option>
         </select>
         <input
           value={keyword}

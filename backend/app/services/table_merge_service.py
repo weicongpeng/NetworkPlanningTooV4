@@ -4,9 +4,12 @@
 合并规则
 --------
 - 每个输入文件按工作表拆成多张「表」（CSV/TXT 视为单表，表名取文件名）。
-- 「相同格式」的判定有两种模式：
+- 「相同格式」的判定有三种模式：
   - ``structure``（默认）：列名集合相同即视为同一格式 → 归入一组；
-  - ``sheet``：工作表名相同即视为同一格式 → 分 sheet 配对合并。
+  - ``sheet``：工作表名相同即视为同一格式 → 分 sheet 配对合并；
+  - ``columns``：所有输入表合并为一张表；按列名对齐（忽略大小写），
+    同名列并入一列、不同名列追加为新列。仅支持 CSV 或只含一个工作表的 Excel，
+    多 sheet 文件在读取阶段直接报错。
 - 分组内列按首次出现顺序取并集，缺失列补空；可选「去除完全重复行」
   与「附加来源文件/来源表列」。
 - 每个分组输出为一个工作表，工作表名取组内首个来源的表名并做合法化/去重。
@@ -37,7 +40,10 @@ CSV_ENCODINGS = ("utf-8", "utf-8-sig", "gbk", "gb18030", "latin-1")
 # 合并模式
 MODE_STRUCTURE = "structure"
 MODE_SHEET = "sheet"
-MERGE_MODES = (MODE_STRUCTURE, MODE_SHEET)
+MODE_COLUMNS = "columns"
+MERGE_MODES = (MODE_STRUCTURE, MODE_SHEET, MODE_COLUMNS)
+# columns 模式下所有表合并为一张表时的工作表名
+MERGED_SHEET_NAME = "合并结果"
 
 # 输出工作表名限制（Excel 规则）
 INVALID_SHEET_CHARS = r"[\[\]:*?/\\]"
@@ -178,16 +184,25 @@ def _frame_to_table(file_name: str, sheet_name: str, raw: pd.DataFrame) -> Optio
     )
 
 
-def read_tables(file_name: str, file_path: Path) -> List[SourceTable]:
+def read_tables(
+    file_name: str, file_path: Path, require_single_table: bool = False
+) -> List[SourceTable]:
     """读取一个文件中的所有表。
 
     - Excel（.xlsx/.xls/.xlsm）：每个工作表一张表；
     - CSV/TXT：单表，表名取文件名（去扩展名）。
+    - require_single_table=True 时，含多个工作表的 Excel 直接报错（CSV 不受限）。
     """
     suffix = Path(file_path).suffix.lower()
     tables: List[SourceTable] = []
     if suffix in (".xlsx", ".xls", ".xlsm"):
-        for sheet_name, raw in _read_excel_frames(file_path).items():
+        frames = _read_excel_frames(file_path)
+        if require_single_table and len(frames) > 1:
+            raise ValueError(
+                f"按列名合并仅支持 CSV 或只包含一个工作表的 Excel 文件，"
+                f"{file_name} 包含 {len(frames)} 个工作表"
+            )
+        for sheet_name, raw in frames.items():
             table = _frame_to_table(file_name, sheet_name, raw)
             if table is not None:
                 tables.append(table)
@@ -206,10 +221,13 @@ def group_tables(tables: Sequence[SourceTable], mode: str = MODE_STRUCTURE) -> L
     """按合并模式分组。
 
     - ``structure``：列名集合相同 → 同一组；
-    - ``sheet``：工作表名相同（忽略大小写与首尾空格）→ 同一组。
+    - ``sheet``：工作表名相同（忽略大小写与首尾空格）→ 同一组；
+    - ``columns``：所有表归入同一组，合并为一张表（组内按列名忽略大小写对齐）。
     """
     if mode not in MERGE_MODES:
         raise ValueError(f"不支持的合并模式: {mode}")
+    if mode == MODE_COLUMNS:
+        return [list(tables)] if tables else []
     groups: Dict[Any, List[SourceTable]] = {}
     for table in tables:
         if mode == MODE_STRUCTURE:
@@ -218,6 +236,11 @@ def group_tables(tables: Sequence[SourceTable], mode: str = MODE_STRUCTURE) -> L
             key = table.sheet_name.strip().casefold()
         groups.setdefault(key, []).append(table)
     return list(groups.values())
+
+
+def _column_key(name: str) -> str:
+    """按列名对齐时的匹配键：忽略大小写与首尾空格。"""
+    return name.strip().casefold()
 
 
 def _cell_key(value: Any) -> str:
@@ -231,29 +254,48 @@ def merge_group(
     group: Sequence[SourceTable],
     add_source: bool = True,
     dedupe: bool = False,
+    match_columns_ignore_case: bool = False,
 ) -> Tuple[List[str], List[List[Any]]]:
     """合并一个分组：列取并集、行按列对齐拼接。
 
+    match_columns_ignore_case=True 时按列名（忽略大小写）对齐：同名列并入
+    同一列（输出列名取首次出现的写法），不同名列追加；同名多列取首个非空值。
     add_source=True 时在首部附加「来源文件 / 来源Sheet」两列；
     dedupe=True 时去除数据列完全相同的重复行（来源列不参与比较）。
     """
     columns: List[str] = []
+    column_keys: List[str] = []
     seen: Set[str] = set()
     for table in group:
         for col in table.columns:
-            if col not in seen:
-                seen.add(col)
+            key = _column_key(col) if match_columns_ignore_case else col
+            if key not in seen:
+                seen.add(key)
+                column_keys.append(key)
                 columns.append(col)
 
     rows: List[List[Any]] = []
     dedupe_keys: Set[Tuple[str, ...]] = set()
     for table in group:
-        index = {col: i for i, col in enumerate(table.columns)}
+        index: Dict[str, List[int]] = {}
+        for i, col in enumerate(table.columns):
+            index.setdefault(_column_key(col) if match_columns_ignore_case else col, []).append(i)
         for raw_row in table.rows:
             aligned: List[Any] = []
-            for col in columns:
-                pos = index.get(col)
-                aligned.append(raw_row[pos] if pos is not None and pos < len(raw_row) else None)
+            for key in column_keys:
+                value: Any = None
+                if match_columns_ignore_case:
+                    for pos in index.get(key, ()):
+                        candidate = raw_row[pos] if pos < len(raw_row) else None
+                        if candidate is not None and (
+                            not isinstance(candidate, str) or candidate.strip()
+                        ):
+                            value = candidate
+                            break
+                elif key in index:
+                    pos = index[key][0]
+                    value = raw_row[pos] if pos < len(raw_row) else None
+                aligned.append(value)
             if dedupe:
                 key = tuple(_cell_key(v) for v in aligned)
                 if key in dedupe_keys:
@@ -293,8 +335,14 @@ def plan_merge(
     used: Set[str] = set()
     plans: List[MergePlan] = []
     for group in groups:
-        columns, rows = merge_group(group, add_source=add_source, dedupe=dedupe)
-        output_sheet = sanitize_sheet_name(group[0].sheet_name, used)
+        columns, rows = merge_group(
+            group,
+            add_source=add_source,
+            dedupe=dedupe,
+            match_columns_ignore_case=(mode == MODE_COLUMNS),
+        )
+        sheet_source = MERGED_SHEET_NAME if mode == MODE_COLUMNS else group[0].sheet_name
+        output_sheet = sanitize_sheet_name(sheet_source, used)
         sources = [
             {
                 "file_name": t.file_name,

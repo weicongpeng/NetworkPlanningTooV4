@@ -42,6 +42,7 @@ vi.mock('../ImWindow', () => ({
 import { imApi } from '../../../services/api'
 import { useImStore } from '../../../store/imStore'
 import { ImHost } from '../ImHost'
+import { SCREENSHOT_OPEN_EVENT } from '../screenshotBus'
 
 describe('沟通助手悬浮入口', () => {
   beforeEach(() => {
@@ -112,6 +113,17 @@ describe('沟通助手悬浮入口', () => {
     // 不再有主题渐变 / 呼吸光晕
     expect(icon.className).not.toContain('from-blue')
     expect(icon.querySelector('.animate-pulse')).toBeNull()
+  })
+
+  it('桌面单机模式下截图快捷键不打开截图弹窗（没有沟通助手可发送）', async () => {
+    authState.desktopMode = true
+    authState.desktopRunMode = 'standalone'
+    useImStore.setState({ open: false })
+    render(<ImHost />)
+    window.dispatchEvent(new Event(SCREENSHOT_OPEN_EVENT))
+    await new Promise(resolve => setTimeout(resolve, 60))
+    expect(document.body.querySelector('[data-screenshot-overlay]')).toBeNull()
+    expect(screen.queryByTitle(/沟通助手/)).toBeNull()
   })
 
   it('桌面端不渲染悬浮图标，但仍注册事件/轮询并可打开窗口', async () => {

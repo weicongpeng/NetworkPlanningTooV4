@@ -213,6 +213,14 @@ export default function TableMergePage() {
                 <span className="block text-muted-foreground">{t('tableMerge.modeSheetHint')}</span>
               </span>
             </label>
+            <label className="flex items-start gap-2 text-xs cursor-pointer">
+              <input type="radio" className="mt-0.5" checked={mode === 'columns'}
+                onChange={() => handleModeChange('columns')} disabled={busy} />
+              <span>
+                {t('tableMerge.modeColumns')}
+                <span className="block text-muted-foreground">{t('tableMerge.modeColumnsHint')}</span>
+              </span>
+            </label>
           </div>
 
           <label className="flex items-center gap-2 text-xs cursor-pointer mb-1.5">

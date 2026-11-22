@@ -3,6 +3,8 @@
 
 - POST /api/v1/table-merge/inspect：上传多个表格文件，返回每个文件的工作表与合并分组预览
 - POST /api/v1/table-merge/merge：按分组合并并输出单个 Excel（/static 下载）
+  支持 structure（表头结构）/ sheet（同名 sheet）/ columns（所有文件按列名忽略大小写对齐合并为一张表，
+  仅接受 CSV 或单 sheet 的 Excel）三种模式
 """
 from datetime import datetime
 from pathlib import Path
@@ -16,6 +18,7 @@ from app.core.security import require_data_import
 from app.services.table_merge_service import (
     ALLOWED_EXTS,
     MERGE_MODES,
+    MODE_COLUMNS,
     MODE_STRUCTURE,
     SourceTable,
     build_output_filename,
@@ -56,9 +59,12 @@ def _cleanup(paths: List[Path]) -> None:
             pass
 
 
-def _read_all(saved: List[Tuple[str, Path]]) -> Tuple[List[SourceTable], List[Dict[str, str]], List[Dict[str, Any]]]:
+def _read_all(
+    saved: List[Tuple[str, Path]], require_single_table: bool = False
+) -> Tuple[List[SourceTable], List[Dict[str, str]], List[Dict[str, Any]]]:
     """读取所有文件的表；单个文件失败不影响其余文件。
 
+    require_single_table=True（columns 模式）时，多 sheet Excel 的 ValueError 直接抛出 → 400。
     返回 (所有表, 读取失败的文件, 每个文件的工作表概览)。
     """
     tables: List[SourceTable] = []
@@ -66,7 +72,13 @@ def _read_all(saved: List[Tuple[str, Path]]) -> Tuple[List[SourceTable], List[Di
     file_summaries: List[Dict[str, Any]] = []
     for name, path in saved:
         try:
-            file_tables = read_tables(name, path)
+            file_tables = read_tables(name, path, require_single_table=require_single_table)
+        except ValueError as e:
+            if require_single_table:
+                raise
+            errors.append({"file_name": name, "error": str(e)})
+            file_summaries.append({"file_name": name, "sheets": [], "error": str(e)})
+            continue
         except Exception as e:  # noqa: BLE001 - 单文件解析失败降级为提示
             errors.append({"file_name": name, "error": str(e)})
             file_summaries.append({"file_name": name, "sheets": [], "error": str(e)})
@@ -101,7 +113,9 @@ async def inspect(
         if mode not in MERGE_MODES:
             raise HTTPException(status_code=400, detail=f"不支持的合并模式: {mode}")
         saved = await run_in_threadpool(_save_uploads, files)
-        tables, errors, file_summaries = await run_in_threadpool(_read_all, saved)
+        tables, errors, file_summaries = await run_in_threadpool(
+            _read_all, saved, require_single_table=(mode == MODE_COLUMNS)
+        )
         if not tables:
             raise HTTPException(status_code=400, detail="未读取到任何有效表格（文件为空或格式不支持）")
 
@@ -150,7 +164,9 @@ async def merge(
         if mode not in MERGE_MODES:
             raise HTTPException(status_code=400, detail=f"不支持的合并模式: {mode}")
         saved = await run_in_threadpool(_save_uploads, files)
-        tables, errors, _ = await run_in_threadpool(_read_all, saved)
+        tables, errors, _ = await run_in_threadpool(
+            _read_all, saved, require_single_table=(mode == MODE_COLUMNS)
+        )
         if not tables:
             raise HTTPException(status_code=400, detail="未读取到任何有效表格（文件为空或格式不支持）")
 

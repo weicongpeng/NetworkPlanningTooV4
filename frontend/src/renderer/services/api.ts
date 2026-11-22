@@ -553,11 +553,6 @@ export const desktopCloudApi = {
     return apiClient.get('/desktop/cloud-status')
   },
 
-  // 用激活码在线激活
-  activate: async (activationCode: string): Promise<ApiResponse<DesktopCloudStatus>> => {
-    return apiClient.post('/desktop/cloud-activate', { activation_code: activationCode })
-  },
-
   // 用现有许可续期
   renew: async (): Promise<ApiResponse<DesktopCloudStatus>> => {
     return apiClient.post('/desktop/cloud-renew')
@@ -2720,8 +2715,8 @@ export const assistantApi = {
 
 // ===== 表格合并 =====
 
-/** 合并模式：按表头结构分组 / 按工作表名分组 */
-export type TableMergeMode = 'structure' | 'sheet'
+/** 合并模式：按表头结构分组 / 按工作表名分组 / 所有文件按列名（忽略大小写）对齐合并为一张表 */
+export type TableMergeMode = 'structure' | 'sheet' | 'columns'
 
 export interface TableMergeSource {
   file_name: string

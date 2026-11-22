@@ -912,7 +912,13 @@ def _complete_online_login(
     _remember_sync_user(username)
     # 在线登录成功即清除旧撤销标记，重新登录是恢复授权后的显式入口。
     cloud.clear_state("license_error", "needs_license_verify")
-    cloud.save_state(session_jti=server_jti or None, kicked=False, kicked_reason=None)
+    # 单机模式不保留云端会话标识：即使旧服务器仍返回 session_jti，也不能让它参与
+    # 「同一账号最后登录」校验，否则网页端/共享模式登录会把本机踢下线。
+    cloud.save_state(
+        session_jti=None if mode == MODE_STANDALONE else (server_jti or None),
+        desktop_mode=mode,
+        kicked=False, kicked_reason=None,
+    )
     if mode == MODE_STANDALONE:
         # 单机模式数据本机私有，不参与服务器数据同步
         from app.services.desktop_sync_service import MODE_OFFLINE, set_run_mode
@@ -939,7 +945,8 @@ def _apply_late_login_result(data: Optional[Dict[str, Any]]) -> None:
         if incoming:
             _sync_permissions_from_remote(incoming)
         server_jti = (data.get("session_jti") or "").strip()
-        if server_jti:
+        # 单机模式迟到的服务器结果也不接管云端会话（与 _complete_online_login 一致）
+        if server_jti and cloud.load_state().get("desktop_mode") != MODE_STANDALONE:
             cloud.clear_state("license_error", "needs_license_verify")
             cloud.save_state(session_jti=server_jti, kicked=False, kicked_reason=None)
     except Exception as exc:  # noqa: BLE001

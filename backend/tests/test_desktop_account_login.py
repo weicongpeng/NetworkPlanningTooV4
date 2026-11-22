@@ -206,7 +206,7 @@ def test_standalone_admin_login_auto_issued_without_approval(login_env):
     assert other.status_code == 200, other.text
     assert other.json()["data"]["machine_code"] == "ZZZZ-ZZZZ-ZZZZ-ZZZZ"
 
-    # 授权被禁用过也照常签发（管理员不参与授权管控）
+    # 管理员同样受显式禁用约束：禁用后不再自动重签许可
     db = login_env.session_factory()
     try:
         db.query(DesktopLicense).filter(DesktopLicense.username == "root").update(
@@ -217,8 +217,8 @@ def test_standalone_admin_login_auto_issued_without_approval(login_env):
         db.close()
     again = _login(login_env.client, "root", "root-pwd", mode="standalone",
                    machine="ZZZZ-ZZZZ-ZZZZ-ZZZZ")
-    assert again.status_code == 200, again.text
-    assert again.json()["data"]["result"] == "ok"
+    assert again.status_code == 403, again.text
+    assert "禁用" in again.json()["detail"]
 
 
 def test_standalone_login_pending_then_approved(login_env):
@@ -265,6 +265,60 @@ def test_standalone_login_counts_logins(login_env):
     # 断网期间本机记账的登录次数，联机时补报
     third = _login(login_env.client, "alice", "alice-pwd", mode="standalone", offline_logins=3)
     assert third.json()["data"]["login_count"] == 6
+
+
+def test_standalone_login_skips_cloud_session_and_online_broadcast(login_env, monkeypatch):
+    """单机模式登录只在本地生效：不写云端会话、不与网页端/共享模式互踢、不广播上线声音。"""
+    from app.services import presence_service
+
+    notified = []
+    monkeypatch.setattr(
+        presence_service,
+        "notify_user_online_from_payload",
+        lambda payload, client_type="pc", event_id="": notified.append(
+            (payload.get("id"), client_type)
+        ),
+    )
+
+    shared = _login(login_env.client, "alice", "alice-pwd", mode="shared")
+    assert shared.status_code == 200, shared.text
+    shared_data = shared.json()["data"]
+    jti_shared = shared_data.get("session_jti")
+    assert jti_shared
+    assert notified  # 共享模式仍会广播上线
+
+    # 另一台机器：同一账号 + 机器只认一条授权，避免复用上面共享模式那台的记录
+    standalone_machine = "ZZZZ-ZZZZ-ZZZZ-ZZZZ"
+    pending = _login(
+        login_env.client, "alice", "alice-pwd", mode="standalone",
+        machine=standalone_machine,
+    )
+    license_id = pending.json()["data"]["license_id"]
+    assert login_env.client.post(
+        f"/api/v1/desktop-licenses/{license_id}/approve", json={}
+    ).status_code == 200
+
+    notified.clear()
+    standalone = _login(
+        login_env.client, "alice", "alice-pwd", mode="standalone",
+        machine=standalone_machine,
+    )
+    assert standalone.status_code == 200, standalone.text
+    data = standalone.json()["data"]
+    assert data["result"] == "ok"
+    assert not data.get("session_jti")
+    assert notified == []
+
+    # 共享模式那次登录没有被单机登录踢掉
+    check = login_env.client.post(
+        "/api/v1/desktop-cloud/auth/session-check",
+        json={
+            "license_file": shared_data["license_file"],
+            "machine_code": MACHINE_A,
+            "session_jti": jti_shared,
+        },
+    )
+    assert check.json()["data"]["valid"] is True
 
 
 def test_login_issues_session_and_kicks_previous_login(login_env):
@@ -425,7 +479,8 @@ def test_disable_revokes_session_and_blocks_relogin(login_env, mode):
         json={
             "license_file": data["license_file"],
             "machine_code": MACHINE_A,
-            "session_jti": data["session_jti"],
+            # 单机模式不建云端会话；授权禁用仍会在 jti 校验之前被识别
+            "session_jti": data.get("session_jti", ""),
         },
     )
     assert check.json()["data"]["valid"] is False
@@ -473,7 +528,7 @@ def test_standalone_precreated_license_can_still_be_claimed(login_env):
 
 
 @pytest.mark.parametrize("mode", ["shared", "standalone"])
-def test_unbind_revokes_session_and_blocks_password_reactivation(login_env, mode):
+def test_unbind_revokes_session_and_allows_terminal_reapply(login_env, mode):
     first = _login(login_env.client, "alice", "alice-pwd", mode=mode)
     if mode == "standalone":
         license_id = first.json()["data"]["license_id"]
@@ -493,24 +548,59 @@ def test_unbind_revokes_session_and_blocks_password_reactivation(login_env, mode
         json={
             "license_file": data["license_file"],
             "machine_code": MACHINE_A,
-            "session_jti": data["session_jti"],
+            "session_jti": data.get("session_jti", ""),
         },
     )
     assert check.json()["data"]["valid"] is False
     assert check.json()["data"]["license_invalid"] is True
     assert "解绑" in check.json()["data"]["reason"]
 
-    denied = _login(login_env.client, "alice", "alice-pwd", mode=mode)
-    assert denied.status_code == 403
-    assert "解绑" in denied.json()["detail"]
+    # 解绑后终端再次登录：复用原记录重建待批准申请，轮询批准后可继续登录
+    reapplied = _login(login_env.client, "alice", "alice-pwd", mode=mode)
+    assert reapplied.status_code == 200
+    assert reapplied.json()["data"]["result"] == "pending"
+    assert reapplied.json()["data"]["license_id"] == license_id
 
     db = login_env.session_factory()
     try:
         record = db.query(DesktopLicense).filter(DesktopLicense.id == license_id).first()
-        assert record.status == "issued"
+        assert record.status == "pending"
         assert record.machine_code is None
     finally:
         db.close()
+
+    assert login_env.client.post(
+        f"/api/v1/desktop-licenses/{license_id}/approve", json={}
+    ).status_code == 200
+    polled = login_env.client.post(
+        "/api/v1/desktop-cloud/auth/poll",
+        json={"username": "alice", "machine_code": MACHINE_A},
+    )
+    assert polled.json()["data"]["result"] == "ok"
+
+
+def test_admin_license_list_deduplicates_same_account_and_machine(login_env):
+    """历史双模式记录不重复出现在管理页：同账号 + 同机器只展示最新一条。"""
+    first = _login(login_env.client, "alice", "alice-pwd", mode="shared")
+    assert first.status_code == 200
+    # 人为造一条同账号同机器的旧记录（模拟早期共享/单机各建一条）
+    db = login_env.session_factory()
+    try:
+        db.add(DesktopLicense(
+            activation_code="NPT-OLD-CODE-FOR-DEDUPE",
+            licensee_username="alice", username="alice",
+            machine_code=MACHINE_A, mode="standalone", status="issued",
+            lease_days=30, source="precreate", created_at="2020-01-01 00:00:00",
+        ))
+        db.commit()
+    finally:
+        db.close()
+
+    resp = login_env.client.get("/api/v1/desktop-licenses")
+    assert resp.status_code == 200
+    data = resp.json()["data"]
+    assert data["total"] == 1
+    assert data["items"][0]["id"] == first.json()["data"]["license_id"]
 
 
 def test_session_check_returns_current_permissions(login_env):
@@ -570,17 +660,15 @@ def test_standalone_default_idle_logout_days(login_env):
     assert payload["username"] == "alice"
 
 
-def test_license_list_filters_shared_records(login_env):
-    """共享模式登录自动签发的许可不占「桌面授权」页（默认只看单机授权）。"""
+def test_license_list_is_mode_agnostic(login_env):
+    """桌面授权不按共享 / 单机拆分：同账号同机器只保留一条，管理页统一展示。"""
     assert _login(login_env.client, "alice", "alice-pwd", mode="shared").status_code == 200
-    _login(login_env.client, "alice", "alice-pwd", mode="standalone")
+    assert _login(login_env.client, "alice", "alice-pwd", mode="standalone").status_code == 200
 
-    standalone = login_env.client.get("/api/v1/desktop-licenses?mode=standalone")
-    assert standalone.json()["data"]["total"] == 1
-    shared = login_env.client.get("/api/v1/desktop-licenses?mode=shared")
-    assert shared.json()["data"]["total"] == 1
-    # 单机授权记录带上登录次数与退出时长，管理页据此展示
-    item = standalone.json()["data"]["items"][0]
+    all_records = login_env.client.get("/api/v1/desktop-licenses")
+    assert all_records.json()["data"]["total"] == 1
+    # 授权记录带上登录次数与退出时长，管理页据此统一配置下发
+    item = all_records.json()["data"]["items"][0]
     assert item["idle_logout_days"] == 2
     assert "login_count" in item
 

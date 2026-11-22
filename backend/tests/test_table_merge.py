@@ -11,6 +11,7 @@ from app.api import create_app
 from app.core.config import settings
 from app.core.security import require_data_import
 from app.services.table_merge_service import (
+    MODE_COLUMNS,
     MODE_SHEET,
     MODE_STRUCTURE,
     group_tables,
@@ -94,6 +95,121 @@ def test_merge_by_sheet_mode_pairs_same_named_sheets():
     assert len(plans[0].rows) == 2
     for p in (a, b):
         os.unlink(p)
+
+
+def test_merge_columns_mode_aligns_case_insensitive_into_one_table():
+    """columns 模式：多文件不同 sheet 名也合并到一张表，同名列忽略大小写并为一列"""
+    a = _write_xlsx(
+        tempfile.mktemp(suffix=".xlsx"),
+        {"甲": pd.DataFrame({"Name": ["A"], "Frequency": [1]})},
+    )
+    b = _write_xlsx(
+        tempfile.mktemp(suffix=".xlsx"),
+        {"乙": pd.DataFrame({"NAME": ["B"], "Longitude": [116.0]})},
+    )
+    tables = read_tables("a.xlsx", Path(a)) + read_tables("b.xlsx", Path(b))
+    assert len(group_tables(tables, mode=MODE_COLUMNS)) == 1
+    plans = plan_merge(tables, MODE_COLUMNS, add_source=False, dedupe=False)
+    assert len(plans) == 1
+    assert plans[0].output_sheet == "合并结果"
+    assert plans[0].columns == ["Name", "Frequency", "Longitude"]
+    assert plans[0].rows == [["A", 1, None], ["B", None, 116.0]]
+    for p in (a, b):
+        os.unlink(p)
+
+
+def test_merge_columns_mode_rejects_multi_sheet_files():
+    """columns 模式只接受 CSV 或单 sheet Excel，多 sheet 文件读取/接口均报错"""
+    multi = _write_xlsx(
+        tempfile.mktemp(suffix=".xlsx"),
+        {
+            "小区": pd.DataFrame({"名称": ["A"]}),
+            "站址": pd.DataFrame({"名称": ["S1"]}),
+        },
+    )
+    try:
+        try:
+            read_tables("multi.xlsx", Path(multi), require_single_table=True)
+            assert False, "多 sheet 文件应当报错"
+        except ValueError as e:
+            assert "2 个工作表" in str(e)
+    finally:
+        os.unlink(multi)
+
+    single = _write_xlsx(
+        tempfile.mktemp(suffix=".xlsx"),
+        {"数据": pd.DataFrame({"名称": ["A"]})},
+    )
+    csv = tempfile.mktemp(suffix=".csv")
+    with open(csv, "w", encoding="utf-8") as f:
+        f.write("名称,频点\nB,1\n")
+    client = _make_client()
+    try:
+        with open(single, "rb") as fs, open(csv, "rb") as fc:
+            resp = client.post(
+                "/api/v1/table-merge/inspect",
+                data={"mode": MODE_COLUMNS},
+                files=[
+                    ("files", ("single.xlsx", fs, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")),
+                    ("files", ("b.csv", fc, "text/csv")),
+                ],
+            )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["data"]["total_tables"] == 2
+    finally:
+        os.unlink(single)
+        os.unlink(csv)
+
+    multi = _write_xlsx(
+        tempfile.mktemp(suffix=".xlsx"),
+        {"小区": pd.DataFrame({"名称": ["A"]}), "站址": pd.DataFrame({"名称": ["S1"]})},
+    )
+    try:
+        with open(multi, "rb") as fm:
+            resp = client.post(
+                "/api/v1/table-merge/merge",
+                data={"mode": MODE_COLUMNS},
+                files=[("files", ("multi.xlsx", fm, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"))],
+            )
+        assert resp.status_code == 400, resp.text
+        assert "只包含一个工作表" in resp.json()["detail"]
+    finally:
+        os.unlink(multi)
+
+
+def test_merge_columns_mode_endpoint_merges_csv_and_single_sheet():
+    """接口：CSV + 单 sheet Excel 按列名合并为一张表（sheet 名不参与分组）"""
+    a = _write_xlsx(
+        tempfile.mktemp(suffix=".xlsx"),
+        {"数据": pd.DataFrame({"Name": ["A"], "Frequency": [1]})},
+    )
+    csv = tempfile.mktemp(suffix=".csv")
+    with open(csv, "w", encoding="utf-8") as f:
+        f.write("name,Longitude\nB,116.0\n")
+    client = _make_client()
+    try:
+        with open(a, "rb") as fa, open(csv, "rb") as fc:
+            resp = client.post(
+                "/api/v1/table-merge/merge",
+                data={"mode": MODE_COLUMNS, "add_source": "false", "dedupe": "false"},
+                files=[
+                    ("files", ("a.xlsx", fa, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")),
+                    ("files", ("b.csv", fc, "text/csv")),
+                ],
+            )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()["data"]
+        assert len(data["sheets"]) == 1
+        assert data["sheets"][0]["output_sheet"] == "合并结果"
+        assert data["sheets"][0]["row_count"] == 2
+        df = pd.read_excel(settings.OUTPUT_DIR / data["filename"], sheet_name="合并结果")
+        assert list(df.columns) == ["Name", "Frequency", "Longitude"]
+        assert df["Name"].tolist() == ["A", "B"]
+        assert pd.isna(df.loc[0, "Longitude"])
+        assert df.loc[1, "Longitude"] == 116.0
+    finally:
+        os.unlink(a)
+        os.unlink(csv)
 
 
 def test_merge_add_source_columns_and_dedupe():

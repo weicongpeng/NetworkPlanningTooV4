@@ -179,14 +179,51 @@ class DesktopLicenseService:
                 | (DesktopLicense.activation_code.like(like))
                 | (DesktopLicense.hostname.like(like))
             )
-        total = query.count()
-        items = (
-            query.order_by(DesktopLicense.id.desc())
-            .offset((page - 1) * page_size)
-            .limit(page_size)
+        # 历史数据里同账号 + 同机器可能留下共享 / 单机两条记录；管理页已不区分模式，
+        # 这里按 (账号, 机器码) 去重，只展示最新一条，避免管理员重复操作。
+        rows = sorted(
+            query.all(), key=lambda row: (row.status == "active", row.id), reverse=True
+        )
+        seen = set()
+        deduped = []
+        for row in rows:
+            key = (row.username or row.licensee_username, row.machine_code)
+            if key[1] is not None:
+                if key in seen:
+                    continue
+                seen.add(key)
+            deduped.append(row)
+        total = len(deduped)
+        start = (page - 1) * page_size
+        return total, deduped[start:start + page_size]
+
+    @staticmethod
+    def _find_revoked_for_login(db: Session, user, machine: str) -> Optional[DesktopLicense]:
+        """解绑 / 轮换凭证后仍绑在本机的旧记录：终端再次登录时转成重新申请。"""
+        rows = (
+            db.query(DesktopLicense)
+            .filter(
+                DesktopLicense.username == user.username,
+                or_(
+                    DesktopLicense.machine_code == machine,
+                    DesktopLicense.machine_code.is_(None),
+                ),
+            )
+            .order_by(DesktopLicense.id.desc())
             .all()
         )
-        return total, items
+        return next((row for row in rows if _unbound_after_activation(row)), None)
+
+    @staticmethod
+    def _reset_for_reapply(record: DesktopLicense) -> None:
+        """把已解绑记录重置为待批准申请，复用原记录而不是再建一条。"""
+        record.status = "pending"
+        record.request_token = secrets.token_urlsafe(24)
+        record.machine_code = None
+        record.machine_bound_at = None
+        # 清空激活痕迹：管理员批准后的轮询才会把它当作首次激活而不是「已解绑」
+        record.activated_at = None
+        record.updated_at = _iso()
 
     def get(self, db: Session, license_id: int) -> DesktopLicense:
         record = db.query(DesktopLicense).filter(DesktopLicense.id == license_id).first()
@@ -364,10 +401,16 @@ class DesktopLicenseService:
         db.refresh(record)
         return record
 
+    @staticmethod
+    def _bump_credential(record: DesktopLicense) -> None:
+        """作废此前签发的 .nptlic：后续验签会发现载荷版本落后。"""
+        record.credential_version = int(record.credential_version or 1) + 1
+
     def disable(self, db: Session, license_id: int) -> DesktopLicense:
         record = self.get(db, license_id)
         if record.status == "disabled":
             return record
+        self._bump_credential(record)
         record.status = "disabled"
         record.disabled_at = _iso()
         record.updated_at = _iso()
@@ -387,10 +430,15 @@ class DesktopLicenseService:
         return record
 
     def unbind(self, db: Session, license_id: int) -> DesktopLicense:
-        """解绑机器（换机场景）：保留激活码与租约设置，回到 issued 待激活。"""
+        """解绑机器（换机场景）：保留激活码与租约设置，回到 issued 待激活。
+
+        旧许可必须立即失效：递增轮换号，否则旧 .nptlic 仍能在别处登录/续期。
+        """
         record = self.get(db, license_id)
+        self._bump_credential(record)
         record.machine_code = None
         record.machine_bound_at = None
+        # 保留 activated_at：标记这是「曾激活后被解绑」，登录时据此要求重新激活
         record.status = "issued"
         record.updated_at = _iso()
         db.commit()
@@ -398,12 +446,16 @@ class DesktopLicenseService:
         return record
 
     def regenerate_code(self, db: Session, license_id: int) -> Tuple[DesktopLicense, str]:
+        """重发激活码 = 轮换凭证：旧许可立即作废，对端必须重新输入新码激活。"""
         record = self.get(db, license_id)
         if record.status == "disabled":
             raise DesktopLicenseError(409, "已禁用的授权不能重发激活码")
+        self._bump_credential(record)
         code = self._assign_unique_code(db, record)
-        if record.status in ("pending", "rejected"):
-            record.status = "issued"
+        record.machine_code = None
+        record.machine_bound_at = None
+        # 保留 activated_at：登录时据此判定「曾激活但凭证已轮换」，要求重新激活
+        record.status = "issued"
         record.updated_at = _iso()
         db.commit()
         db.refresh(record)
@@ -530,6 +582,9 @@ class DesktopLicenseService:
             "machine_code": record.machine_code,
             "lease_days": int(record.lease_days or 30),
             "renew_count": int(record.renewal_count or 0),
+            # 凭证轮换号：服务端 _verify_license / renew 会与数据库当前值比对，
+            # 禁用 / 解绑 / 重发激活码后旧许可文件立即失效。
+            "credential_version": int(record.credential_version or 1),
             "issued_via": "online",
             "issued_at": _now().strftime("%Y-%m-%d %H:%M:%S"),
             "expire_date": expire_date,
@@ -615,6 +670,10 @@ class DesktopLicenseService:
         )
         if record is None:
             raise DesktopLicenseError(404, "授权记录不存在，请联系管理员")
+        if int(payload.get("credential_version") or 1) != int(record.credential_version or 1):
+            raise DesktopLicenseError(
+                403, "授权已禁用/解绑或激活码已重发，请在系统设置 → 桌面授权重新输入激活码"
+            )
         if record.status == "disabled":
             raise DesktopLicenseError(403, "该授权已被禁用，请联系管理员")
         if record.status != "active" or not record.machine_code:
@@ -728,6 +787,32 @@ class DesktopLicenseService:
             "user": auth_service.user_payload(user),
         }
 
+    @staticmethod
+    def _find_record_for_login(
+        db: Session, user, machine: str, preferred_mode: str,
+        scope: str = "all",
+    ) -> Optional[DesktopLicense]:
+        """桌面端授权不按运行模式拆分：同一账号 + 机器只认一条有效授权。
+
+        优先取当前请求模式那条（兼容历史双记录），但没有时其它模式的记录同样生效，
+        这样管理员在任一模式下的禁用/解绑都能立即阻断该账号的桌面登录。
+        scope=active：只认已激活记录（共享模式自动签发用）；
+        scope=activated_or_active：还认曾激活后被禁用/解绑的记录（用于阻断管理员登录）。
+        """
+        base = db.query(DesktopLicense).filter(
+            DesktopLicense.username == user.username,
+            DesktopLicense.machine_code == machine,
+        )
+        if scope == "active":
+            base = base.filter(DesktopLicense.status == "active")
+        elif scope == "activated_or_active":
+            base = base.filter(or_(
+                DesktopLicense.status == "active",
+                DesktopLicense.activated_at.isnot(None),
+            ))
+        return (base.filter(DesktopLicense.mode == preferred_mode).first()
+                or base.first())
+
     def _ensure_shared_license(
         self,
         db: Session,
@@ -741,30 +826,27 @@ class DesktopLicenseService:
         共享模式不需要管理员批准——账号本身就是凭据，且组归属跟随账号，
         因此这里一律直接签发，同时保持服务器上的组与账号组一致。
         """
-        record = (
-            db.query(DesktopLicense)
-            .filter(
-                DesktopLicense.mode == MODE_SHARED,
-                DesktopLicense.username == user.username,
-                DesktopLicense.machine_code == machine,
-            )
-            .first()
-        )
+        record = self._find_record_for_login(db, user, machine, MODE_SHARED, scope="active")
         if record is None:
+            # 曾激活但被禁用/解绑/轮换的记录仍绑在本机时，不允许共享模式绕开它新建授权
             revoked = (
                 db.query(DesktopLicense)
                 .filter(
-                    DesktopLicense.mode == MODE_SHARED,
                     DesktopLicense.username == user.username,
-                    DesktopLicense.machine_code.is_(None),
-                    DesktopLicense.status == "issued",
+                    or_(
+                        DesktopLicense.machine_code == machine,
+                        DesktopLicense.machine_code.is_(None),
+                    ),
                     DesktopLicense.activated_at.isnot(None),
+                    DesktopLicense.status != "active",
                 )
                 .first()
             )
             if revoked is not None:
                 raise DesktopLicenseError(
-                    403, "该账号的共享授权已解绑，请使用激活码重新激活"
+                    403,
+                    "该授权已被禁用，请联系管理员" if revoked.status == "disabled"
+                    else "该账号的桌面授权已解绑或变更，请使用激活码重新激活",
                 )
         if record is None:
             record = DesktopLicense(
@@ -811,26 +893,25 @@ class DesktopLicenseService:
         按「模式 + 账号 + 机器」取记录（可认领预建未绑定的），没有就新建；
         命中的记录直接被激活（禁用/待批准都覆盖）。记录只是许可证与同步凭证。
         """
-        record = (
-            db.query(DesktopLicense)
-            .filter(
-                DesktopLicense.mode == mode,
-                DesktopLicense.username == user.username,
-                DesktopLicense.machine_code == machine,
-            )
-            .first()
+        record = self._find_record_for_login(
+            db, user, machine, mode, scope="activated_or_active"
         )
         if record is None:
             # 认领管理员预建但未绑定机器的记录；再没有就新建（不抢占同账号其它机器的记录）
             record = (
                 db.query(DesktopLicense)
                 .filter(
-                    DesktopLicense.mode == mode,
                     DesktopLicense.username == user.username,
                     DesktopLicense.machine_code.is_(None),
                 )
                 .first()
             )
+        if record is not None:
+            # 管理员同样受禁用/解绑约束：只有「从未激活的预建记录」可由管理员直接认领
+            if record.status == "disabled":
+                raise DesktopLicenseError(403, "该授权已被禁用，请联系管理员")
+            if record.status != "active" and record.activated_at is not None:
+                raise DesktopLicenseError(403, "该授权已解绑或尚未激活，请使用激活码重新激活")
         if record is None:
             record = DesktopLicense(
                 mode=mode,
@@ -873,18 +954,16 @@ class DesktopLicenseService:
         管理员预建但未绑定机器码的授权也能被认领（machine_code 为空即待绑定）；
         未申请过 → 建 pending 申请单并由调用方返回「等待管理员批准」。
         """
-        record = (
-            db.query(DesktopLicense)
-            .filter(
-                DesktopLicense.mode == MODE_STANDALONE,
-                DesktopLicense.username == user.username,
-                or_(
-                    DesktopLicense.machine_code == machine,
+        record = self._find_record_for_login(db, user, machine, MODE_STANDALONE)
+        if record is None:
+            record = (
+                db.query(DesktopLicense)
+                .filter(
+                    DesktopLicense.username == user.username,
                     DesktopLicense.machine_code.is_(None),
-                ),
+                )
+                .first()
             )
-            .first()
-        )
         if record is None:
             record = DesktopLicense(
                 mode=MODE_STANDALONE,
@@ -956,6 +1035,22 @@ class DesktopLicenseService:
                 400, "该账号未分配数据组（地市+运营商），请联系管理员分配后再使用共享模式"
             )
 
+        if not user.is_admin:
+            # 管理员解绑 / 重发激活码后，终端再次登录即重建待批准申请，
+            # 复用原记录而不是新建，也不再要求用户先手工输入激活码。
+            revoked = self._find_revoked_for_login(db, user, machine)
+            if revoked is not None:
+                self._reset_for_reapply(revoked)
+                db.commit()
+                db.refresh(revoked)
+                return "pending", {
+                    "status": "pending",
+                    "mode": MODE_SHARED if shared else MODE_STANDALONE,
+                    "username": user.username,
+                    "license_id": revoked.id,
+                    "message": "已重新提交授权申请，请等待管理员在「桌面授权」页面确认",
+                }
+
         if user.is_admin:
             # 管理员免授权：不需要审批/预授权，任何模式都直接签发（换机也允许）
             record = self._ensure_admin_license(
@@ -1026,7 +1121,6 @@ class DesktopLicenseService:
         record = (
             db.query(DesktopLicense)
             .filter(
-                DesktopLicense.mode == MODE_STANDALONE,
                 DesktopLicense.username == name,
                 or_(
                     DesktopLicense.machine_code == machine,
@@ -1055,6 +1149,8 @@ class DesktopLicenseService:
             )
 
         record.status = "active"
+        record.machine_code = machine
+        record.machine_bound_at = record.machine_bound_at or _iso()
         record.activated_at = _iso()
         record.login_count = (record.login_count or 0) + 1
         record.last_login_at = _iso()

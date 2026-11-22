@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
-import { Check, Palette, Sun, Moon, Key, RefreshCw, X, Globe, Calendar, Infinity, Loader2, LifeBuoy, Monitor, Copy, Cloud, Send, Settings, Info } from 'lucide-react'
+import { Check, Palette, Sun, Moon, Key, RefreshCw, X, Globe, Calendar, Infinity, Loader2, LifeBuoy, Settings, Info } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import type { MachineInfo, LicenseStatus, DesktopCloudStatus } from '@shared/types'
 import {
@@ -31,10 +31,9 @@ export function LicensePage() {
 
   const isAdmin = user?.is_admin ?? false
 
-  // 桌面端授权：机器码与授权状态
+  // 机器信息 / 授权状态：桌面版版本卡片与网页端期限配置仍需要
   const [machineInfo, setMachineInfo] = useState<MachineInfo | null>(null)
   const [licenseStatus, setLicenseStatus] = useState<LicenseStatus | null>(null)
-  const [copied, setCopied] = useState(false)
 
   const refreshLicenseState = useCallback(async () => {
     try {
@@ -49,15 +48,8 @@ export function LicensePage() {
     }
   }, [])
 
-  // ---- 在线激活 / 续期（桌面版；网页端接口返回 404，静默忽略）----
+  // 桌面端云端状态：仅版本与更新卡片读取 version / channel
   const [cloudStatus, setCloudStatus] = useState<DesktopCloudStatus | null>(null)
-  const [activationCode, setActivationCode] = useState('')
-  const [cloudBusy, setCloudBusy] = useState<'' | 'activate' | 'renew' | 'apply'>('')
-  const [cloudMessage, setCloudMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
-  const [showApplyForm, setShowApplyForm] = useState(false)
-  const [applyName, setApplyName] = useState('')
-  const [applyOrg, setApplyOrg] = useState('')
-  const [applyWaiting, setApplyWaiting] = useState(false)
 
   const refreshCloudStatus = useCallback(async () => {
     try {
@@ -97,111 +89,10 @@ export function LicensePage() {
     }
   }
 
-  const handleCloudActivate = async () => {
-    const code = activationCode.trim()
-    if (!code) return
-    setCloudBusy('activate')
-    setCloudMessage(null)
-    try {
-      const res: any = await desktopCloudApi.activate(code)
-      setCloudMessage({ type: 'success', text: res?.message || t('license.cloudActivateSuccess') })
-      setActivationCode('')
-      setShowApplyForm(false)
-      setApplyWaiting(false)
-      await fetchUser()
-      await refreshLicenseState()
-      await refreshCloudStatus()
-    } catch (err: any) {
-      setCloudMessage({ type: 'error', text: err?.message || t('license.cloudActivateFailed') })
-    } finally {
-      setCloudBusy('')
-      setTimeout(() => setCloudMessage(null), 8000)
-    }
-  }
-
-  const handleCloudRenew = async () => {
-    setCloudBusy('renew')
-    setCloudMessage(null)
-    try {
-      const res: any = await desktopCloudApi.renew()
-      setCloudMessage({ type: 'success', text: res?.message || t('license.cloudRenewSuccess') })
-      await fetchUser()
-      await refreshLicenseState()
-      await refreshCloudStatus()
-    } catch (err: any) {
-      setCloudMessage({ type: 'error', text: err?.message || t('license.cloudRenewFailed') })
-    } finally {
-      setCloudBusy('')
-      setTimeout(() => setCloudMessage(null), 8000)
-    }
-  }
-
-  const handleCloudApply = async () => {
-    if (!applyName.trim()) return
-    setCloudBusy('apply')
-    setCloudMessage(null)
-    try {
-      const res: any = await desktopCloudApi.apply({
-        applicant_name: applyName.trim(),
-        organization: applyOrg.trim() || undefined,
-      })
-      if (res?.success) {
-        setApplyWaiting(true)
-        setCloudMessage({ type: 'success', text: t('license.cloudApplySubmitted') })
-      }
-    } catch (err: any) {
-      setCloudMessage({ type: 'error', text: err?.message || t('license.cloudApplyFailed') })
-    } finally {
-      setCloudBusy('')
-      setTimeout(() => setCloudMessage(null), 8000)
-    }
-  }
-
-  // 申请后每 5 秒轮询一次批准结果（批准后本机自动完成激活）
-  useEffect(() => {
-    if (!applyWaiting) return
-    const timer = window.setInterval(async () => {
-      try {
-        const res: any = await desktopCloudApi.pollApply()
-        const data = res?.data
-        if (data?.activated) {
-          setApplyWaiting(false)
-          setCloudMessage({ type: 'success', text: t('license.cloudApplyApproved') })
-          await fetchUser()
-          await refreshLicenseState()
-          await refreshCloudStatus()
-        } else if (data?.status === 'rejected') {
-          setApplyWaiting(false)
-          setCloudMessage({ type: 'error', text: data?.message || t('license.cloudApplyRejected') })
-        }
-      } catch {
-        // 网络抖动：下个周期重试
-      }
-    }, 5000)
-    return () => window.clearInterval(timer)
-  }, [applyWaiting, fetchUser, refreshLicenseState, refreshCloudStatus])
-
   useEffect(() => {
     // 桌面版所有用户都要机器信息（版本卡片/授权展示）；网页端仅管理员需要
     if (isAdmin || desktopMode) refreshLicenseState()
   }, [isAdmin, desktopMode, refreshLicenseState])
-
-  const handleCopyMachineCode = async () => {
-    const code = machineInfo?.machineCode
-    if (!code) return
-    try {
-      await navigator.clipboard.writeText(code)
-    } catch {
-      const ta = document.createElement('textarea')
-      ta.value = code
-      document.body.appendChild(ta)
-      ta.select()
-      document.execCommand('copy')
-      document.body.removeChild(ta)
-    }
-    setCopied(true)
-    setTimeout(() => setCopied(false), 2000)
-  }
 
   const handleThemeSelect = (mode: ThemeMode) => {
     setPreviewTheme(mode)
@@ -302,188 +193,6 @@ export function LicensePage() {
 
       {/* 大模型配置（网优助手）：仅管理员或被授予网优助手权限的用户可见 */}
       {(isAdmin || user?.can_assistant) && <LLMConfigCard />}
-
-      {/* 桌面端授权：共享/单机的所有桌面用户都可用授权码激活并自行续期 */}
-      {machineInfo?.desktopMode && (
-        <div className="bg-card p-5 rounded-lg border border-border">
-          <div className="flex items-center justify-between mb-4">
-            <div className="flex items-center gap-2">
-              <Monitor size={20} className="text-primary" />
-              <h2 className="text-base font-semibold">{t('license.desktopTitle')}</h2>
-            </div>
-            <button
-              onClick={() => {
-                refreshLicenseState()
-                refreshCloudStatus()
-              }}
-              className="p-1.5 hover:bg-muted rounded-lg transition-colors"
-              title={t('license.refresh')}
-            >
-              <RefreshCw size={16} />
-            </button>
-          </div>
-
-          {isAdmin && (
-            <p className="mb-4 text-xs text-muted-foreground">{t('license.desktopAdminHint', '管理员账号默认享有全部权限，无需授权激活')}</p>
-          )}
-
-          <div className="grid grid-cols-1 xl:grid-cols-2 gap-x-8 gap-y-5">
-            <div className="min-w-0 space-y-5">
-              <div>
-                <label className="block text-xs text-muted-foreground mb-1.5">{t('license.machineCodeLabel')}</label>
-                <div className="flex items-center gap-2">
-                  <code className="flex-1 px-3 py-2 bg-muted rounded-lg text-sm font-mono tracking-wider break-all">
-                    {machineInfo.machineCode}
-                  </code>
-                  <button
-                    onClick={handleCopyMachineCode}
-                    className="px-3 py-2 border border-border rounded-lg hover:bg-muted text-sm font-medium flex items-center gap-1.5 flex-shrink-0"
-                  >
-                    {copied ? <Check size={14} className="text-green-500" /> : <Copy size={14} />}
-                    {copied ? t('license.copied') : t('license.copy')}
-                  </button>
-                </div>
-                <p className="text-xs text-muted-foreground mt-1.5">{t('license.machineCodeHint')}</p>
-              </div>
-
-              {/* 在线激活 / 续期 */}
-              <div className="pt-4 border-t border-border">
-                <label className="text-xs text-muted-foreground mb-1.5 flex items-center gap-1.5">
-                  <Cloud size={13} /> {t('license.cloudLabel')}
-                </label>
-
-                {cloudStatus?.license?.valid ? (
-                  <div className="space-y-3">
-                    <div className="p-2 rounded flex items-center gap-2 border bg-green-500/10 border-green-500/20 text-green-500">
-                      <Check size={14} />
-                      <span className="text-xs">
-                        {t('license.desktopStatusActive', { date: cloudStatus.license.expire_date || '' })}
-                        {typeof cloudStatus.license.remaining_days === 'number' &&
-                          `（${t('license.remainingDaysLabel')} ${cloudStatus.license.remaining_days} ${t('license.daysUnit')}）`}
-                        {cloudStatus.license.subject ? ` · ${cloudStatus.license.subject}` : ''}
-                        {' · '}
-                        {cloudStatus.license.issued_via === 'online'
-                          ? t('license.issuedViaOnline')
-                          : t('license.issuedViaOffline')}
-                      </span>
-                    </div>
-                    {cloudStatus.license.issued_via === 'online' && (
-                      <button
-                        onClick={handleCloudRenew}
-                        disabled={cloudBusy !== ''}
-                        className="px-4 py-2 border border-border rounded-lg hover:bg-muted disabled:opacity-50 text-sm font-medium flex items-center gap-1.5"
-                      >
-                        {cloudBusy === 'renew' ? <Loader2 size={14} className="animate-spin" /> : <RefreshCw size={14} />}
-                        {cloudBusy === 'renew' ? t('license.cloudRenewing') : t('license.cloudRenewButton')}
-                      </button>
-                    )}
-                  </div>
-                ) : (
-                  <div className="p-2 rounded flex items-center gap-2 border bg-amber-500/10 border-amber-500/20 text-amber-600">
-                    <X size={14} />
-                    <span className="text-xs">
-                      {cloudStatus?.license?.errorMessage || t('license.desktopStatusInactive')}
-                    </span>
-                  </div>
-                )}
-
-                <p className="text-xs text-muted-foreground mt-2">
-                  {t('license.cloudServerHint', { url: cloudStatus?.server_url || '' })}
-                </p>
-              </div>
-
-            </div>
-
-            {/* 右列：授权码激活（共享/单机的普通用户均可操作） */}
-            <div className="min-w-0 space-y-4 pt-4 border-t border-border xl:pt-0 xl:border-t-0 xl:border-l xl:pl-8">
-              <div>
-                <label className="text-xs text-muted-foreground mb-1.5 flex items-center gap-1.5">
-                  <Key size={13} /> {t('license.activationLabel')}
-                </label>
-                <div className="flex items-center gap-2">
-                  <input
-                    value={activationCode}
-                    onChange={(e) => setActivationCode(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter') handleCloudActivate()
-                    }}
-                    placeholder={t('license.activationCodePlaceholder')}
-                    className="flex-1 min-w-0 px-3 py-2 bg-background border border-border rounded-lg text-sm font-mono tracking-wider focus:outline-none focus:ring-2 focus:ring-primary/50"
-                  />
-                  <button
-                    onClick={handleCloudActivate}
-                    disabled={cloudBusy !== '' || !activationCode.trim()}
-                    className="px-4 py-2 bg-primary text-primary-foreground rounded-lg hover:opacity-90 disabled:opacity-50 text-sm font-medium flex items-center gap-1.5 flex-shrink-0"
-                  >
-                    {cloudBusy === 'activate' ? <Loader2 size={14} className="animate-spin" /> : <Cloud size={14} />}
-                    {cloudBusy === 'activate' ? t('license.cloudActivating') : t('license.cloudActivateButton')}
-                  </button>
-                </div>
-                <p className="text-xs text-muted-foreground mt-1.5">{t('license.activationHint')}</p>
-              </div>
-
-              {cloudStatus && !cloudStatus.license?.valid && (
-                applyWaiting ? (
-                  <div className="p-2 rounded bg-primary/10 border border-primary/20 text-primary text-xs flex items-center gap-2">
-                    <Loader2 size={14} className="animate-spin" />
-                    {t('license.cloudApplyWaiting')}
-                  </div>
-                ) : !showApplyForm ? (
-                  <button
-                    onClick={() => setShowApplyForm(true)}
-                    className="text-xs text-primary hover:underline flex items-center gap-1"
-                  >
-                    <Send size={12} /> {t('license.cloudApplyToggle')}
-                  </button>
-                ) : (
-                  <div className="space-y-2 p-3 border border-border rounded-lg">
-                    <p className="text-xs text-muted-foreground">{t('license.cloudApplyHint')}</p>
-                    <input
-                      value={applyName}
-                      onChange={(e) => setApplyName(e.target.value)}
-                      placeholder={t('license.cloudApplyName')}
-                      className="w-full px-3 py-2 bg-background border border-border rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary/50"
-                    />
-                    <input
-                      value={applyOrg}
-                      onChange={(e) => setApplyOrg(e.target.value)}
-                      placeholder={t('license.cloudApplyOrg')}
-                      className="w-full px-3 py-2 bg-background border border-border rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary/50"
-                    />
-                    <div className="flex gap-2">
-                      <button
-                        onClick={handleCloudApply}
-                        disabled={cloudBusy !== '' || !applyName.trim()}
-                        className="px-4 py-2 bg-primary text-primary-foreground rounded-lg hover:opacity-90 disabled:opacity-50 text-sm font-medium flex items-center gap-1.5"
-                      >
-                        {cloudBusy === 'apply' ? <Loader2 size={14} className="animate-spin" /> : <Send size={14} />}
-                        {t('license.cloudApplySubmit')}
-                      </button>
-                      <button
-                        onClick={() => setShowApplyForm(false)}
-                        className="px-4 py-2 bg-secondary text-secondary-foreground rounded-lg hover:opacity-90 text-sm font-medium"
-                      >
-                        {t('theme.cancel')}
-                      </button>
-                    </div>
-                  </div>
-                )
-              )}
-
-              {cloudMessage && (
-                <div className={`p-2 rounded flex items-center gap-2 ${
-                  cloudMessage.type === 'success'
-                    ? 'bg-green-500/10 border border-green-500/20 text-green-500'
-                    : 'bg-red-500/10 border border-red-500/20 text-red-500'
-                }`}>
-                  {cloudMessage.type === 'success' ? <Check size={14} /> : <X size={14} />}
-                  <span className="text-xs">{cloudMessage.text}</span>
-                </div>
-              )}
-            </div>
-          </div>
-        </div>
-      )}
 
       {/* 版本与更新（仅桌面版）：当前版本 + 检查更新 */}
       {machineInfo?.desktopMode && (

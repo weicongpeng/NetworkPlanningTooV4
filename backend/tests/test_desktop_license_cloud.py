@@ -242,11 +242,18 @@ def test_disable_blocks_activate_and_renew(cloud_env):
     )
     assert resp.status_code == 403
 
-    # 恢复后可续期
+    # 恢复后旧许可依旧无效（禁用已轮换凭证），必须用激活码重新激活拿新许可
     assert cloud_env.client.post(f"/api/v1/desktop-licenses/{record['id']}/enable").status_code == 200
-    resp = cloud_env.client.post(
+    denied = cloud_env.client.post(
         "/api/v1/desktop-cloud/license/renew",
         json={"license_file": license_file, "machine_code": MACHINE_A},
+    )
+    assert denied.status_code == 403
+    reissued = _activate(cloud_env.client, record["activation_code"])
+    assert reissued.status_code == 200
+    resp = cloud_env.client.post(
+        "/api/v1/desktop-cloud/license/renew",
+        json={"license_file": reissued.json()["data"]["license_file"], "machine_code": MACHINE_A},
     )
     assert resp.status_code == 200
 
@@ -285,6 +292,40 @@ def test_regenerate_code_and_delete(cloud_env):
     assert cloud_env.client.delete(f"/api/v1/desktop-licenses/{record['id']}").status_code == 200
     resp = cloud_env.client.get("/api/v1/desktop-licenses")
     assert resp.json()["data"]["total"] == 0
+
+
+def test_regenerate_code_invalidates_existing_license(cloud_env):
+    """重发激活码即轮换凭证：对端旧 .nptlic 不能再续期/校验，必须重新输入新码激活。"""
+    record = _create(cloud_env.client)
+    old = _activate(cloud_env.client, record["activation_code"])
+    assert old.status_code == 200
+    old_license = old.json()["data"]["license_file"]
+
+    resp = cloud_env.client.post(f"/api/v1/desktop-licenses/{record['id']}/regenerate-code")
+    assert resp.status_code == 200
+    new_code = resp.json()["data"]["activation_code"]
+
+    denied = cloud_env.client.post(
+        "/api/v1/desktop-cloud/license/renew",
+        json={"license_file": old_license, "machine_code": MACHINE_A},
+    )
+    assert denied.status_code == 403
+    assert "激活码" in denied.json()["detail"]
+
+    checked = cloud_env.client.post(
+        "/api/v1/desktop-cloud/license/check",
+        json={"license_file": old_license, "machine_code": MACHINE_A},
+    )
+    assert checked.json()["data"]["valid"] is False
+    assert "激活码" in checked.json()["data"]["reason"]
+
+    new = _activate(cloud_env.client, new_code)
+    assert new.status_code == 200
+    checked = cloud_env.client.post(
+        "/api/v1/desktop-cloud/license/check",
+        json={"license_file": new.json()["data"]["license_file"], "machine_code": MACHINE_A},
+    )
+    assert checked.json()["data"]["valid"] is True
 
 
 def test_approve_flow(cloud_env):

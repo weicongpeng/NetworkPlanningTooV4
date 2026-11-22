@@ -19,7 +19,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **规划**：PCI 规划（碰撞/混淆、模 3/模 30）、邻区规划（覆盖圆）、TAC 核查与 TAC 规划（异 TAC 孤岛/插花）
 - **地图**：在线（高德/OSM）/离线地图、工参扇区渲染、专题图层、值热力面、标签防重叠、图层制作与编辑（TAB/MIF/KML）、绘制/测量/圈选/节点合并、条件选择、缓冲区、图例与导出
 - **数据**：Excel/CSV/TXT/TAB/MIF 上传、全量工参、小区查询/批量更新、新站录入、地理化数据
-- **工具**：批量距离匹配、站间距、频点换算（LTE/NR/GSCN）、表格合并（多文件同格式合并为一个文件）
+- **工具**：批量距离匹配、站间距、频点换算（LTE/NR/GSCN）、表格合并（多文件按表头结构 / 工作表名 / 列名对齐合并；列名模式仅支持 CSV 或单 sheet 文件）
 - **平台**：用户与权限、数据组隔离、网优助手（LLM）、APP 版本管理、许可证
 
 ## 常用开发命令
@@ -235,7 +235,7 @@ FastAPI (backend/app/)
 | `/site-spacing` | `SiteSpacingPage` | 站间距计算 |
 | `/frequency-conversion` | `FrequencyConversionPage` | 频点换算 |
 | `/intermodulation` | `IntermodulationPage` | 三阶互调评估 |
-| `/table-merge` | `TableMergePage` | 表格合并（多文件同格式合并为一个 Excel，按表头结构或工作表名分组） |
+| `/table-merge` | `TableMergePage` | 表格合并（多文件合并为一个 Excel，按表头结构 / 工作表名分组，或所有文件按列名忽略大小写对齐为一张表） |
 | `/admin/users` | `AdminUsersPage` | 用户管理（`requireAdmin`） |
 | `/app-versions` | `AppVersionsPage` | APP 版本管理（`requireAdmin`） |
 | `/assistant` | `AssistantPage` | 网优助手（`requirePermission="can_assistant"`） |
@@ -260,7 +260,7 @@ FastAPI (backend/app/)
 | `pci.py` / `neighbor.py` / `tac.py` | `/api/v1/pci` 等 | 规划/核查、进度、结果、历史、导出、应用到工参 |
 | `distance_match.py` | `/api/v1/distance-match` | 批量距离匹配 |
 | `site_spacing.py` | `/api/v1/site-spacing` | 站间距计算 |
-| `table_merge.py` | `/api/v1/table-merge` | 表格合并：`/inspect` 解析多文件多 sheet 并给出分组预览、`/merge` 按表头结构或工作表名合并输出单个 Excel（`/static` 下载） |
+| `table_merge.py` | `/api/v1/table-merge` | 表格合并：`/inspect` 解析多文件多 sheet 并给出分组预览、`/merge` 按表头结构 / 工作表名分组，或所有文件按列名（忽略大小写）对齐为一张表（columns 模式仅接受 CSV 或单 sheet Excel），输出单个 Excel（`/static` 下载） |
 | `attribute_join.py` | `/api/v1/attribute-join` | 条件选择（图层属性空间连接） |
 | `buffer.py` | `/api/v1/buffer` | 绘制缓冲区 |
 | `map.py` | `/api/v1/map` | 地图数据/小区/扇区、缓存清理、在线与离线配置 |
