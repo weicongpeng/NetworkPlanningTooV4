@@ -45,6 +45,11 @@ def _is_geo_entry(entry: Dict[str, Any]) -> bool:
     return entry.get("fileType") == "geo_data"
 
 
+def _is_merged_params_entry(entry: Dict[str, Any]) -> bool:
+    """现网工参合并（中兴）产物：列结构与全量工参不同，不能走工参解析管线。"""
+    return entry.get("fileType") == "merged_current_params"
+
+
 # ---------------------------------------------------------------- 内部工具
 
 def _entry(data_id: str) -> Dict[str, Any]:
@@ -145,8 +150,9 @@ def build_package(data_id: str, *, workdir: Optional[Path] = None) -> Dict[str, 
     entry = _entry(data_id)
     entry_type = entry.get("type") or "excel"
     is_geo = _is_geo_entry(entry)
-    # 目录型数据集：map 的图层文件、geo_data 的 default.json 都在 data/<id>/ 下
-    packs_directory = entry_type == "map" or is_geo
+    is_merged = _is_merged_params_entry(entry)
+    # 目录型数据集：map 的图层文件、geo_data 的 default.json、合并产物 original.xlsx 都在 data/<id>/ 下
+    packs_directory = entry_type == "map" or is_geo or is_merged
 
     tmp_root = Path(tempfile.mkdtemp(prefix="npt-pkg-", dir=str(workdir) if workdir else None))
     zip_path = tmp_root / f"{data_id}.zip"
@@ -228,6 +234,7 @@ def install_package(
         raise DatasetPackageError("数据包缺少 data_id")
     entry_type = source_entry.get("type") or "excel"
     is_geo = _is_geo_entry(source_entry)
+    is_merged = _is_merged_params_entry(source_entry)
     backup: Dict[str, Any] = {}
 
     # 1. 解到临时目录并先落到 staging：校验/准备期间旧数据完全不动，
@@ -250,7 +257,7 @@ def install_package(
 
         if staging_dir.exists():
             shutil.rmtree(staging_dir, ignore_errors=True)
-        if entry_type == "map" or is_geo:
+        if entry_type == "map" or is_geo or is_merged:
             staging_dir.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(extract_root), str(staging_dir))
             (staging_dir / META_NAME).unlink(missing_ok=True)
@@ -326,13 +333,14 @@ def install_package(
         data_service.index[data_id] = new_entry
         data_service._save_index()
         _upsert_layers(data_id, new_entry, user_id, city, operator)
-    elif is_geo:
-        # 地理化数据不走工参 Excel 管线：条目原样落地（保住 fileType/geometryType/metadata）
+    elif is_geo or is_merged:
+        # 地理化/合并产物不走工参 Excel 管线：条目原样落地（保住 fileType/metadata）
         new_entry["status"] = "ready"
         new_entry.pop("errorMessage", None)
         data_service.index[data_id] = new_entry
         data_service._save_index()
-        _upsert_geo_file(data_id, new_entry, user_id, city, operator)
+        if is_geo:
+            _upsert_geo_file(data_id, new_entry, user_id, city, operator)
     else:
         new_entry["status"] = "processing"
         data_service.index[data_id] = new_entry

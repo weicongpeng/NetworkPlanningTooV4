@@ -56,6 +56,8 @@ hiddenimports = [
     "httpx",
     "httpcore",
     "h11",
+    # pandas 按引擎名动态导入；现网工参合并改用 xlsxwriter 流式写出
+    "xlsxwriter",
 ]
 
 a = Analysis(

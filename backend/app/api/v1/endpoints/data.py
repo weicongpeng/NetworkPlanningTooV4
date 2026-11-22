@@ -25,6 +25,7 @@ from app.models.schemas import (
     CellSearchRequest,
     CellBulkUpdateRequest,
     UpdateParametersRequest,
+    MergeCurrentParamsZteRequest,
     ImportPointsRequest,
 )
 from app.services.data_service import data_service, validate_excel_upload_contract
@@ -509,6 +510,107 @@ async def get_update_params_result(task_id: str) -> Dict[str, Any]:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/merge-current-params-zte", response_model=Dict[str, Any])
+async def merge_current_params_zte(
+    request: MergeCurrentParamsZteRequest,
+    current_user=Depends(require_data_update),
+) -> Dict[str, Any]:
+    """现网工参合并（中兴）：产出「4G现网工参(中兴)」与「5G现网工参(中兴)」"""
+    try:
+        from app.services.data_group import index_entry_visible
+        from app.services.data_service import data_service
+
+        # 组隔离：跨组数据集一律 404
+        for data_id in (request.fullParamId, request.currentParamId):
+            entry = data_service.index.get(data_id)
+            if entry is None or not index_entry_visible(entry, current_user):
+                raise HTTPException(status_code=404, detail="数据不存在")
+
+        from app.services.task_manager import task_manager
+        task_id = await task_manager.create_merge_current_params_zte_task(
+            request.fullParamId, request.currentParamId,
+            username=current_user.username,
+            user_id=current_user.id,
+            city=getattr(current_user, "city", None),
+            operator=getattr(current_user, "operator", None),
+        )
+        return {
+            "success": True,
+            "data": {"taskId": task_id, "message": "现网工参合并任务已启动"},
+        }
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e).encode("utf-8", "replace").decode("utf-8"))
+    except Exception as e:
+        import traceback
+
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e).encode("utf-8", "replace").decode("utf-8"))
+
+
+@router.get("/merge-current-params-zte/progress/{task_id}", response_model=Dict[str, Any])
+async def get_merge_current_params_zte_progress(task_id: str) -> Dict[str, Any]:
+    """获取现网工参合并进度"""
+    return await get_update_params_progress(task_id)
+
+
+@router.get("/merge-current-params-zte/result/{task_id}", response_model=Dict[str, Any])
+async def get_merge_current_params_zte_result(task_id: str) -> Dict[str, Any]:
+    """获取现网工参合并结果"""
+    return await get_update_params_result(task_id)
+
+
+@router.post("/zte-update-and-merge", response_model=Dict[str, Any])
+async def zte_update_and_merge(
+    request: UpdateParametersRequest,
+    current_user=Depends(require_data_update),
+) -> Dict[str, Any]:
+    """工参更新(中兴)：一个任务内依次执行全量更新与 4G/5G 现网工参合并。"""
+    try:
+        from app.services.data_group import index_entry_visible
+        from app.services.data_service import data_service
+
+        for data_id in (request.fullParamId, request.currentParamId):
+            entry = data_service.index.get(data_id)
+            if entry is None or not index_entry_visible(entry, current_user):
+                raise HTTPException(status_code=404, detail="数据不存在")
+
+        from app.services.task_manager import task_manager
+        task_id = await task_manager.create_zte_update_and_merge_task(
+            request.fullParamId, request.currentParamId,
+            username=current_user.username,
+            user_id=current_user.id,
+            city=getattr(current_user, "city", None),
+            operator=getattr(current_user, "operator", None),
+        )
+        return {
+            "success": True,
+            "data": {"taskId": task_id, "message": "工参更新(中兴)任务已启动"},
+        }
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e).encode("utf-8", "replace").decode("utf-8"))
+    except Exception as e:
+        import traceback
+
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e).encode("utf-8", "replace").decode("utf-8"))
+
+
+@router.get("/zte-update-and-merge/progress/{task_id}", response_model=Dict[str, Any])
+async def get_zte_update_and_merge_progress(task_id: str) -> Dict[str, Any]:
+    """获取工参更新(中兴)进度"""
+    return await get_update_params_progress(task_id)
+
+
+@router.get("/zte-update-and-merge/result/{task_id}", response_model=Dict[str, Any])
+async def get_zte_update_and_merge_result(task_id: str) -> Dict[str, Any]:
+    """获取工参更新(中兴)结果"""
+    return await get_update_params_result(task_id)
 
 
 @router.post("/upload/excel", response_model=Dict[str, Any])

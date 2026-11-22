@@ -181,6 +181,13 @@ class UpdateParametersRequest(BaseModel):
     currentParamId: str
 
 
+class MergeCurrentParamsZteRequest(BaseModel):
+    """现网工参合并（中兴）请求"""
+
+    fullParamId: str
+    currentParamId: str
+
+
 class ImportPointsRequest(BaseModel):
     """导入点数据请求"""
 

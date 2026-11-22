@@ -58,6 +58,8 @@ function dataItemIconKind(item: DataItem): DataIconKind {
   }
   if (fileType === 'full_params') return 'excel'
   if (fileType === 'target_cells') return 'excel'
+  // 现网工参合并（中兴）产物按「现网工参」归类展示
+  if (fileType === 'merged_current_params') return 'current_params'
   // 现网工参：网管导出包与图层文件同为 ZIP。包名以 BaselineLab 开头时以包名为准，
   // 覆盖存量索引里被误标成 map_layer / 没有 fileType 的条目（桌面同步包、旧前端上传）。
   if (fileType === 'current_params' || isCurrentParamsFilename(item.name)) return 'current_params'
@@ -950,6 +952,13 @@ export function DataPage() {
 
          if (result?.success || newFileFound) {
              const statsSuffix = statsLine ? `\n${t('data.updateStatsSummary', { stats: statsLine, defaultValue: `更新统计：{{stats}}` })}` : ''
+             const dataset = result?.data?.dataset as { name: string; sheets: Array<{ name: string; rows: number; matched: number }> } | null | undefined
+             const mergeSummary = dataset
+                 ? dataset.sheets.map(s => `${s.name}（${s.rows} 行，匹配 ${s.matched} 行）`).join('；')
+                 : ''
+             const datasetSuffix = dataset
+                 ? `\n${t('data.zteMergeSuccess') || '现网工参合并完成'}：${dataset.name}${mergeSummary ? `（${mergeSummary}）` : ''}`
+                 : ''
              if (savedToOriginal && newFileName) {
                  // 从列表中查找具有 originalPath 的文件以构造完整路径
                  const items = useDataStore.getState().items;
@@ -957,18 +966,20 @@ export function DataPage() {
                  if (matchedFile?.originalPath) {
                      const originalDir = matchedFile.originalPath.substring(0, matchedFile.originalPath.lastIndexOf('\\') + 1);
                      const fullPath = `${originalDir}${newFileName}`;
-                     setUpdateSuccess(`${t('data.updateSuccess') || '更新成功'}！${t('data.savedTo') || '已保存至：'}\n${fullPath}${statsSuffix}`)
-                 } else {
-                     setUpdateSuccess(`${t('data.updateSuccess') || '更新成功'}！${t('data.savedToSystem') || '文件已保存在系统内，请手动下载。'}${statsSuffix}`)
-                 }
-             } else {
-                 setUpdateSuccess(`${t('data.updateSuccess') || '更新成功'}！${t('data.savedToSystem') || '文件已保存在系统内，请手动下载。'}${statsSuffix}`)
-             }
+                     setUpdateSuccess(`${t('data.updateSuccess') || '更新成功'}！${t('data.savedTo') || '已保存至：'}\n${fullPath}${statsSuffix}${datasetSuffix}`)
+                     } else {
+                     setUpdateSuccess(`${t('data.updateSuccess') || '更新成功'}！${t('data.savedToSystem') || '文件已保存在系统内，请手动下载。'}${statsSuffix}${datasetSuffix}`)
+                     }
+                     } else {
+                     setUpdateSuccess(`${t('data.updateSuccess') || '更新成功'}！${t('data.savedToSystem') || '文件已保存在系统内，请手动下载。'}${statsSuffix}${datasetSuffix}`)
+                     }
 
+             // 同一后端任务内已完成的 4G/5G 现网工参合并结果
+             await fetchList(1, 50, true)
              setSelectedFullParamId('')
              setSelectedCurrentParamId('')
              addLog('update', '工参更新完成', 'success', newFileName || '', 'update:params')
-         } else {
+             } else {
              // 更新失败（后端返回错误状态且列表中也未找到新文件）
              throw new Error(result?.message || t('data.updateFailed') || '工参更新失败')
          }
@@ -2462,11 +2473,11 @@ function CellToolsCard({
     }
   }, [expanded])
 
-  // 页签顺序（从左到右）：新站录入 | 查询/修改 | 工参更新
+  // 页签顺序（从左到右）：新站录入 | 查询/修改 | 工参更新(中兴)
   const TABS: Array<{ key: 'entry' | 'query' | 'update'; label: string }> = [
     { key: 'entry', label: t('newCellEntry.title') || '新站录入' },
     { key: 'query', label: t('queryUpdate.title') || '查询/修改' },
-    { key: 'update', label: t('data.updateParameters') || '工参更新' },
+    { key: 'update', label: t('data.zteUpdateTitle') || '工参更新(中兴)' },
   ]
 
   // 页签 + 缩放按钮头部（普通态与放大态共用，页签字号/字重与"导入数据""已导入数据"标题一致）

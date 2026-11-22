@@ -19,10 +19,103 @@ import {
 
 const cardCls = 'p-4 bg-card border border-border rounded-lg'
 
+const mergeModeExamples: { variant: TableMergeMode; titleKey: string; hintKey: string }[] = [
+  { variant: 'structure', titleKey: 'tableMerge.modeStructure', hintKey: 'tableMerge.modeStructureHint' },
+  { variant: 'sheet', titleKey: 'tableMerge.modeSheet', hintKey: 'tableMerge.modeSheetHint' },
+  { variant: 'columns', titleKey: 'tableMerge.modeColumns', hintKey: 'tableMerge.modeColumnsHint' },
+]
+
 function formatSize(size: number): string {
   if (size < 1024) return `${size} B`
   if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`
   return `${(size / 1024 / 1024).toFixed(1)} MB`
+}
+
+type MiniTableProps = {
+  label: string
+  columns: string[]
+  rows: (string | number | null)[][]
+  highlight?: number[]
+}
+
+/** 示例图中的迷你表格：高亮列用主色标出，便于区分列对齐方式 */
+function MiniTable({ label, columns, rows, highlight = [] }: MiniTableProps) {
+  return (
+    <div className="flex flex-col items-center gap-0.5 shrink-0">
+      <span className="text-[9px] text-muted-foreground leading-none whitespace-nowrap">{label}</span>
+      <table className="border-collapse text-[9px] leading-tight">
+        <thead>
+          <tr>
+            {columns.map((col, i) => (
+              <th key={i}
+                className={`border border-border px-1 py-0.5 whitespace-nowrap font-medium ${highlight.includes(i) ? 'bg-primary/20 text-primary' : 'bg-muted/60 text-foreground'}`}>
+                {col}
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((row, r) => (
+            <tr key={r}>
+              {columns.map((_, c) => (
+                <td key={c}
+                  className="border border-border px-1 py-0.5 text-center whitespace-nowrap text-muted-foreground">
+                  {row[c] ?? ''}
+                </td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  )
+}
+
+function MergeExample({ variant }: { variant: TableMergeMode }) {
+  const arrow = <span className="text-[11px] text-muted-foreground shrink-0">→</span>
+  const plus = <span className="text-[11px] text-muted-foreground shrink-0">+</span>
+
+  if (variant === 'sheet') {
+    return (
+      <div className="space-y-1.5">
+        <div className="flex items-center justify-center gap-1.5 flex-wrap">
+          <MiniTable label="A.xlsx / 小区" columns={['Name', 'Freq']} rows={[['a1', '1']]} />
+          {plus}
+          <MiniTable label="B.xlsx / 小区" columns={['Name', 'Freq']} rows={[['b1', '2']]} />
+          {arrow}
+          <MiniTable label="输出 / 小区" columns={['Name', 'Freq']} rows={[['a1', '1'], ['b1', '2']]} />
+        </div>
+        <div className="flex items-center justify-center gap-1.5 flex-wrap">
+          <MiniTable label="A.xlsx / 站址" columns={['Name', 'Lon']} rows={[['s1', '116']]} />
+          {arrow}
+          <MiniTable label="输出 / 站址" columns={['Name', 'Lon']} rows={[['s1', '116']]} />
+        </div>
+      </div>
+    )
+  }
+
+  if (variant === 'columns') {
+    return (
+      <div className="flex items-center justify-center gap-1.5 flex-wrap">
+        <MiniTable label="A.xlsx（1 sheet）" columns={['Name', 'Freq']} rows={[['a1', '1']]} highlight={[0]} />
+        {plus}
+        <MiniTable label="B.csv" columns={['name', 'Lon']} rows={[['b1', '116']]} highlight={[0]} />
+        {arrow}
+        <MiniTable label="输出（1 张表）" columns={['Name', 'Freq', 'Lon']}
+          rows={[['a1', '1', ''], ['b1', '', '116']]} highlight={[0]} />
+      </div>
+    )
+  }
+
+  return (
+    <div className="flex items-center justify-center gap-1.5 flex-wrap">
+      <MiniTable label="A.xlsx" columns={['Name', 'Freq']} rows={[['a1', '1']]} />
+      {plus}
+      <MiniTable label="B.xlsx" columns={['Name', 'Freq']} rows={[['b1', '2']]} />
+      {arrow}
+      <MiniTable label="输出" columns={['Name', 'Freq']} rows={[['a1', '1'], ['b1', '2']]} />
+    </div>
+  )
 }
 
 export default function TableMergePage() {
@@ -195,7 +288,6 @@ export default function TableMergePage() {
         <div className={cardCls}>
           <p className="text-xs font-medium mb-3">{t('tableMerge.settings')}</p>
 
-          <p className="text-xs font-medium mb-1">{t('tableMerge.modeLabel')}</p>
           <div className="space-y-1.5 mb-3">
             <label className="flex items-start gap-2 text-xs cursor-pointer">
               <input type="radio" className="mt-0.5" checked={mode === 'structure'}
@@ -251,6 +343,35 @@ export default function TableMergePage() {
               <Loader2 size={12} className="animate-spin" /> {t('tableMerge.inspecting')}
             </p>
           )}
+        </div>
+      </div>
+
+      {/* 合并方式示例图：点击示例卡片可直接切换模式 */}
+      <div className="shrink-0">
+        <p className="text-xs font-medium text-foreground mb-2">{t('tableMerge.examplesTitle')}</p>
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-3">
+          {mergeModeExamples.map(({ variant, titleKey, hintKey }) => (
+            <button type="button" key={variant} disabled={busy}
+              onClick={() => handleModeChange(variant)}
+              className={`p-3 text-left bg-card border rounded-lg transition-colors disabled:opacity-60 ${
+                mode === variant
+                  ? 'border-primary ring-1 ring-primary/30'
+                  : 'border-border hover:border-primary/60'
+              }`}>
+              <div className="flex items-center gap-2 mb-2">
+                <span className="text-xs font-medium flex-1">{t(titleKey)}</span>
+                {mode === variant && (
+                  <span className="text-[10px] px-1.5 py-0.5 rounded bg-primary/15 text-primary shrink-0">
+                    {t('tableMerge.examplesCurrent')}
+                  </span>
+                )}
+              </div>
+              <div className="rounded bg-muted/30 border border-border/60 p-2 overflow-x-auto">
+                <MergeExample variant={variant} />
+              </div>
+              <p className="text-[10px] text-muted-foreground mt-2">{t(hintKey)}</p>
+            </button>
+          ))}
         </div>
       </div>
 

@@ -1276,19 +1276,19 @@ export const dataApi = {
     return apiClient.get(`/data/${id}`)
   },
 
-  // 工参更新（异步任务）
+  // 工参更新(中兴)：一个任务同时执行全量更新与 4G/5G 现网工参合并
   updateParameters: async (fullParamId: string, currentParamId: string): Promise<ApiResponse<{ taskId: string; message: string }>> => {
-    return apiClient.post('/data/update-parameters', { fullParamId, currentParamId })
+    return apiClient.post('/data/zte-update-and-merge', { fullParamId, currentParamId })
   },
 
-  /** 获取工参更新任务进度 */
+  /** 获取工参更新(中兴)任务进度 */
   getUpdateParamsProgress: async (taskId: string): Promise<ApiResponse<any>> => {
-    return apiClient.get(`/data/update-parameters/progress/${taskId}`)
+    return apiClient.get(`/data/zte-update-and-merge/progress/${taskId}`)
   },
 
-  /** 获取工参更新任务结果 */
+  /** 获取工参更新(中兴)任务结果 */
   getUpdateParamsResult: async (taskId: string): Promise<ApiResponse<any>> => {
-    return apiClient.get(`/data/update-parameters/result/${taskId}`)
+    return apiClient.get(`/data/zte-update-and-merge/result/${taskId}`)
   },
 
   // 导入点数据

@@ -1530,6 +1530,468 @@ class DataService:
             "stats": stats,
         }
 
+    # === 现网工参合并（中兴网管 CellInfo） ===
+    # 输出列顺序固定；值与全量工参按对应列名匹配填充（列名兼容常见别名）。
+    ZTE_MERGE_COLUMNS = (
+        "CGI", "区县", "经度", "纬度", "天线挂高", "方向角", "机械下倾角", "小区覆盖类型", "是否高铁小区",
+    )
+    ZTE_FIELD_ALIASES = {
+        "CGI": ("CGI",),
+        # 「区县」取全量工参的第二分组
+        "区县": ("第二分组", "区县", "区县名称", "区域", "县区"),
+        "经度": ("经度", "小区经度", "基站经度", "longitude", "lon"),
+        "纬度": ("纬度", "小区纬度", "基站纬度", "latitude", "lat"),
+        "天线挂高": ("天线挂高", "挂高", "antenna height", "height"),
+        "方向角": ("方向角", "天线方向角", "方位角", "antenna azimuth", "azimuth"),
+        "机械下倾角": ("机械下倾角", "天线机械下倾角", "下倾角", "mechanical downtilt"),
+        "小区覆盖类型": ("小区覆盖类型", "Cell Coverage Attribute"),
+    }
+    ZTE_COVERAGE_LABELS = {"1": "宏站", "4": "室分"}
+
+    @staticmethod
+    def _zte_header(value) -> str:
+        """Excel 多行表头取首行中文名；CSV 表头去空格。"""
+        if value is None:
+            return ""
+        return str(value).strip().split("\n")[0].strip()
+
+    @staticmethod
+    def _zte_key_value(value) -> str:
+        """标识归一化：123.0 / ' 123 ' 统一为 '123'，避免浮点与字符串不匹配。"""
+        if value is None:
+            return ""
+        try:
+            if pd.isna(value):
+                return ""
+        except (TypeError, ValueError):
+            pass
+        text = str(value).strip()
+        if not text or text.lower() in ("nan", "none", "nat"):
+            return ""
+        try:
+            return str(int(float(text)))
+        except (ValueError, OverflowError):
+            return text
+
+    @classmethod
+    def _zte_coverage_label(cls, value):
+        """全量工参小区覆盖类型：1→宏站，4→室分；其它值原样保留。"""
+        normalized = cls._zte_key_value(value)
+        if normalized in cls.ZTE_COVERAGE_LABELS:
+            return cls.ZTE_COVERAGE_LABELS[normalized]
+        return value if value is not None and not pd.isna(value) else ""
+
+    @staticmethod
+    def _zte_find_column(columns, candidates):
+        folded = {str(c).strip().casefold(): c for c in columns}
+        for candidate in candidates:
+            found = folded.get(candidate.strip().casefold())
+            if found is not None:
+                return found
+        return None
+
+    @classmethod
+    def _zte_read_cellinfo_csv(cls, path: Path) -> pd.DataFrame:
+        """读取单个 CellInfo CSV；同文件内大小写同名列合并（保留首次列名，空值互补）。"""
+        last_error = None
+        for encoding in ("gbk", "utf-8-sig", "utf-8", "gb18030"):
+            try:
+                df = pd.read_csv(path, encoding=encoding, dtype=str)
+                last_error = None
+                break
+            except (UnicodeDecodeError, UnicodeError) as exc:
+                last_error = exc
+        if last_error is not None:
+            raise ValueError(f"无法识别现网工参 CSV 编码（{path.name}）")
+        df.columns = [cls._zte_header(col) for col in df.columns]
+        groups: Dict[str, list] = {}
+        for col in df.columns:
+            groups.setdefault(str(col).casefold(), []).append(col)
+        if all(len(cols) == 1 for cols in groups.values()):
+            return df
+        result = pd.DataFrame(index=df.index)
+        for cols in groups.values():
+            series = df[cols[0]]
+            for extra in cols[1:]:
+                series = series.fillna(df[extra])
+            result[cols[0]] = series
+        return result
+
+    @classmethod
+    def _zte_merge_cellinfo(cls, files: List[Path]) -> pd.DataFrame:
+        """同列名（不区分大小写）纵向合并，不同列名追加；按首次出现的列名统一。"""
+        frames = [cls._zte_read_cellinfo_csv(path) for path in files]
+        canonical: Dict[str, str] = {}
+        for frame in frames:
+            for col in frame.columns:
+                canonical.setdefault(str(col).casefold(), col)
+        frames = [
+            frame.rename(columns={col: canonical[str(col).casefold()] for col in frame.columns})
+            for frame in frames
+        ]
+        merged = pd.concat(frames, ignore_index=True, sort=False)
+        groups: Dict[str, list] = {}
+        for col in merged.columns:
+            groups.setdefault(str(col).casefold(), []).append(col)
+        if any(len(cols) > 1 for cols in groups.values()):
+            result = pd.DataFrame(index=merged.index)
+            for cols in groups.values():
+                series = merged[cols[0]]
+                for extra in cols[1:]:
+                    series = series.fillna(merged[extra])
+                result[cols[0]] = series
+            merged = result
+        return merged
+
+    @staticmethod
+    def _zte_norm_series(series: pd.Series) -> pd.Series:
+        """向量化标识归一化：123.0 / ' 123 ' → '123'（与 _zte_key_value 同口径）。"""
+        raw = series.fillna("").astype(str).str.strip()
+        raw = raw.replace({"nan": "", "none": "", "nat": "", "NaN": "", "None": ""})
+        numeric = pd.to_numeric(raw.where(raw != ""), errors="coerce")
+        return numeric.astype("Int64").astype("string").fillna(raw).fillna("").astype(str)
+
+    @classmethod
+    def _zte_read_full_params_frame(cls, xls: pd.ExcelFile, network: str) -> pd.DataFrame:
+        """用 calamine 读取全量工参工作表（比 openpyxl 逐行流式解析快约一个数量级）。"""
+        sheet_name = f"{network} Project Parameters"
+        if sheet_name not in xls.sheet_names:
+            raise ValueError(f"全量工参缺少工作表「{sheet_name}」，无法执行现网工参合并")
+        head = pd.read_excel(xls, sheet_name=sheet_name, header=None, nrows=3)
+        raw_header = head.iloc[0].tolist() if len(head) else []
+        if not raw_header:
+            return pd.DataFrame()
+        headers = [cls._zte_header(value) for value in raw_header]
+        # 复杂表头（单元格内含换行说明）：与 _parse_sheet_data 一致，数据从第 4 行开始
+        complex_header = any("\n" in str(value) for value in raw_header if pd.notna(value))
+        frame = pd.read_excel(
+            xls, sheet_name=sheet_name, header=None,
+            skiprows=3 if complex_header else 1,
+        )
+        if len(headers) < frame.shape[1]:
+            headers += [f"col_{i}" for i in range(len(headers), frame.shape[1])]
+        frame.columns = headers[:frame.shape[1]]
+        return frame
+
+    @classmethod
+    def _zte_full_params_lookup(cls, frame: pd.DataFrame, network: str) -> pd.DataFrame:
+        """全量工参唯一键 -> 待填充字段（DataFrame 索引承载键，便于向量化 reindex）。"""
+        if frame is None or frame.empty:
+            return pd.DataFrame(columns=list(cls.ZTE_FIELD_ALIASES))
+        id_columns = (
+            ("eNodeB标识", "eNBId", "eNodeB ID", "基站标识")
+            if network == "LTE"
+            else ("gNodeB标识", "gNBId", "gNodeB ID", "基站标识")
+        )
+        key_parts = []
+        for candidates in (id_columns, ("小区标识", "cellLocalId", "小区ID")):
+            column = cls._zte_find_column(frame.columns, candidates)
+            if column is None:
+                raise ValueError(f"全量工参缺少「{candidates[0]}」列，无法执行现网工参合并")
+            key_parts.append(cls._zte_norm_series(frame[column]))
+        key = key_parts[0] + "_" + key_parts[1]
+        valid = ~(key_parts[0].eq("") & key_parts[1].eq(""))
+
+        lookup = pd.DataFrame(index=key[valid].values)
+        for field, aliases in cls.ZTE_FIELD_ALIASES.items():
+            column = cls._zte_find_column(frame.columns, aliases)
+            if column is None:
+                lookup[field] = ""
+            elif field == "小区覆盖类型":
+                lookup[field] = frame.loc[valid, column].map(cls._zte_coverage_label).values
+            else:
+                lookup[field] = frame.loc[valid, column].values
+        # 唯一键：重复时保留首条
+        return lookup[~lookup.index.duplicated(keep="first")]
+
+    @classmethod
+    def _zte_sheet_stats(cls, frame: pd.DataFrame, network: str) -> Dict[str, int]:
+        """合并结果的站点/小区统计，供「已导入数据」列表按全量工参口径展示。"""
+        candidates = (
+            ("eNBId", "eNodeBId", "ENBId")
+            if network == "LTE"
+            else ("gNBId", "gNodeBId", "GNBId")
+        )
+        column = cls._zte_find_column(frame.columns, candidates)
+        if column is None:
+            return {"sites": 0, "sectors": int(len(frame))}
+        normalized = cls._zte_norm_series(frame[column])
+        return {"sites": int(normalized[normalized != ""].nunique()), "sectors": int(len(frame))}
+
+    @classmethod
+    def _zte_enrich(cls, df: pd.DataFrame, lookup: pd.DataFrame, network: str):
+        """现网工参按 eNBId/gNBId + cellLocalId 匹配全量工参，左侧插入 9 列。"""
+        if network == "LTE":
+            id_candidates = (("eNBId", "eNodeBId", "ENBId"), ("cellLocalId", "CellId", "cellId"))
+        else:
+            id_candidates = (("gNBId", "gNodeBId", "GNBId"), ("cellLocalId", "CellId", "cellId"))
+        key_parts = []
+        for candidates in id_candidates:
+            col = cls._zte_find_column(df.columns, candidates)
+            if col is None:
+                raise ValueError(
+                    f"现网工参 CSV 缺少 {candidates[0]} 列，无法合并（实际列名：{list(df.columns)}）"
+                )
+            key_parts.append(cls._zte_norm_series(df[col]))
+        keys = (key_parts[0] + "_" + key_parts[1]).values
+        enriched = df.copy()
+        # 一次 reindex 取回全部匹配字段，替代逐行/逐列 Python 循环
+        filled = lookup.reindex(keys).fillna("")
+        filled.index = range(len(keys))
+        for field in cls.ZTE_FIELD_ALIASES:
+            enriched[field] = filled[field].values if field in filled.columns else ""
+        # 是否高铁小区来自现网工参自身，不从全量工参匹配
+        enriched["是否高铁小区"] = ""
+        scene_column = cls._zte_find_column(
+            df.columns, ("sceneCfg",) if network == "LTE" else ("nrCellScene",)
+        )
+        if scene_column is not None:
+            if network == "LTE":
+                scene = cls._zte_norm_series(df[scene_column])
+                enriched["是否高铁小区"] = scene.map({"2": "是", "0": "否"}).fillna("").values
+            else:
+                scene = df[scene_column].fillna("").astype(str).str.strip().str.casefold()
+                enriched["是否高铁小区"] = scene.map({"highway": "是", "normal": "否"}).fillna("").values
+        ordered = list(cls.ZTE_MERGE_COLUMNS) + [
+            col for col in enriched.columns if col not in cls.ZTE_MERGE_COLUMNS
+        ]
+        return enriched[ordered], int(pd.Series(keys).isin(lookup.index).sum())
+
+    @classmethod
+    def _zte_drop_empty_columns(cls, frame: pd.DataFrame) -> pd.DataFrame:
+        """删除整列为空的源 CSV 列；9 个新增列即使全空也保留。"""
+        keep = []
+        for column in frame.columns:
+            if column in cls.ZTE_MERGE_COLUMNS:
+                keep.append(column)
+            elif frame[column].fillna("").astype(str).str.strip().ne("").any():
+                keep.append(column)
+        return frame[keep]
+
+    @staticmethod
+    def _zte_write_merged_xlsx(output_path: Path, sheets: Dict[str, pd.DataFrame]) -> None:
+        """按行写出合并结果（共享字符串压体积）；pandas 的 to_excel 是列优先，速度慢得多。"""
+        try:
+            import xlsxwriter
+        except ImportError:
+            wb = openpyxl.Workbook(write_only=True)
+            for sheet_name, frame in sheets.items():
+                ws = wb.create_sheet(sheet_name)
+                ws.append(list(frame.columns))
+                for row in frame.itertuples(index=False, name=None):
+                    ws.append(row)
+            wb.save(output_path)
+            return
+
+        # 用共享字符串而非流式 inline string：同为按行写出，体积约小 18%，耗时不变
+        workbook = xlsxwriter.Workbook(str(output_path))
+        try:
+            for sheet_name, frame in sheets.items():
+                ws = workbook.add_worksheet(sheet_name[:31])
+                for col_idx, column in enumerate(frame.columns):
+                    ws.write_string(0, col_idx, str(column))
+                for row_idx, row in enumerate(frame.itertuples(index=False, name=None), start=1):
+                    for col_idx, value in enumerate(row):
+                        if value is None or value is pd.NA:
+                            continue
+                        if isinstance(value, float) and math.isnan(value):
+                            continue
+                        if isinstance(value, bool):
+                            ws.write_boolean(row_idx, col_idx, value)
+                        elif isinstance(value, (int, float, np.integer, np.floating)):
+                            ws.write_number(row_idx, col_idx, float(value))
+                        else:
+                            ws.write_string(row_idx, col_idx, str(value))
+        finally:
+            workbook.close()
+
+    def _zte_register_dataset(
+        self, name: str, sheets: Dict[str, pd.DataFrame],
+        full_info: Dict[str, Any], username: str,
+        stats: Dict[str, Dict[str, int]],
+    ) -> Dict[str, Any]:
+        """登记合并结果数据集（同名同组重复执行时覆盖原条目，不产生重复数据）。"""
+        user_id = full_info.get("user_id", 1)
+        city = full_info.get("city")
+        operator = full_info.get("operator")
+        data_id = None
+        for existing_id, entry in self.index.items():
+            if (entry.get("fileType") == "merged_current_params"
+                    and entry.get("name") == name
+                    and (entry.get("city"), entry.get("operator")) == (city, operator)):
+                data_id = existing_id
+                break
+        if not data_id:
+            data_id = str(uuid.uuid4())
+
+        # 源 CSV 常带大量全空列，写出前剔除以缩小文件（9 个新增列始终保留）
+        sheets = {
+            sheet_name: self._zte_drop_empty_columns(frame)
+            for sheet_name, frame in sheets.items()
+        }
+        data_dir = settings.DATA_DIR / data_id
+        data_dir.mkdir(parents=True, exist_ok=True)
+        output_path = data_dir / "original.xlsx"
+        self._zte_write_merged_xlsx(output_path, sheets)
+        settings.UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+        shutil.copy(output_path, settings.UPLOAD_DIR / f"{data_id}.xlsx")
+
+        sheet_stats = [
+            {
+                "name": sheet_name,
+                "rows": int(len(frame)),
+                "matched": int((stats.get(sheet_name) or {}).get("matched", 0)),
+            }
+            for sheet_name, frame in sheets.items()
+        ]
+        metadata = {
+            "mergeType": "zte_current_params",
+            "sourceFullParamId": full_info.get("id"),
+            "sheets": sheet_stats,
+        }
+        # 与全量工参相同的元数据键，供「已导入数据」列表展示 LTE/NR 站点与小区统计
+        for stat in stats.values():
+            network = stat.get("network")
+            if network:
+                metadata[f"{network}SiteCount"] = int(stat.get("sites", 0))
+                metadata[f"{network}SectorCount"] = int(stat.get("sectors", 0))
+        remark = f"{datetime.now().strftime('%Y/%m/%d %H:%M')} {username} 合并" if username else ""
+        db = SessionLocal()
+        try:
+            row = db.query(Workbook).filter(Workbook.id == data_id).first()
+            fields = {
+                "name": name,
+                "file_type": "merged_current_params",
+                "network_types": json.dumps(list(sheets.keys()), ensure_ascii=False),
+                "status": "ready",
+                "size": output_path.stat().st_size,
+                "user_id": user_id,
+                "city": city,
+                "operator": operator,
+                "metadata_json": json.dumps(metadata, ensure_ascii=False),
+                "remark": remark,
+                "updated_at": datetime.now().isoformat(),
+            }
+            if row:
+                for key, value in fields.items():
+                    setattr(row, key, value)
+            else:
+                db.add(Workbook(id=data_id, created_at=datetime.now().isoformat(), **fields))
+            db.commit()
+        except Exception as exc:
+            db.rollback()
+            safe_print(f"[DataService] 合并结果登记 SQLite 失败（非致命）: {exc}")
+        finally:
+            db.close()
+
+        self.index[data_id] = {
+            "id": data_id,
+            "name": name,
+            "type": "excel",
+            "fileType": "merged_current_params",
+            "size": output_path.stat().st_size,
+            "uploadDate": datetime.now().isoformat(),
+            "status": "ready",
+            "user_id": user_id,
+            "city": city,
+            "operator": operator,
+            "metadata": metadata,
+            "remark": remark,
+        }
+        self._bump_revision(data_id)
+        return {"id": data_id, "name": name, "sheets": sheet_stats}
+
+    def merge_current_params_zte(
+        self, full_param_id: str, current_param_id: str,
+        username: str = "", user_id: int = 1,
+    ) -> Dict[str, Any]:
+        """现网工参合并（中兴）：4G 合并 SDR+ITBBU，5G 取 NR，补齐全量工参字段。"""
+        full_info = self.index.get(full_param_id)
+        current_info = self.index.get(current_param_id)
+        if not full_info or not current_info:
+            self.reload_index()
+            full_info = self.index.get(full_param_id)
+            current_info = self.index.get(current_param_id)
+        if not full_info:
+            full_dir = settings.DATA_DIR / full_param_id
+            if (full_dir / "original.xlsx").exists():
+                full_info = {"id": full_param_id, "name": full_dir.name, "type": "excel",
+                             "fileType": "full_params", "status": "ready"}
+        if not current_info:
+            current_dir = settings.DATA_DIR / current_param_id
+            if current_dir.exists():
+                current_info = {"id": current_param_id, "name": current_dir.name, "type": "map",
+                                "fileType": "current_params", "status": "ready"}
+        missing = []
+        if not full_info:
+            missing.append(f"全量工参({full_param_id[:8]}...)")
+        if not current_info:
+            missing.append(f"现网工参({current_param_id[:8]}...)")
+        if missing:
+            raise ValueError(f"找不到指定的文件ID: {', '.join(missing)}")
+
+        full_dir = settings.DATA_DIR / full_param_id
+        current_dir = settings.DATA_DIR / current_param_id
+        original_excel = full_dir / "original.xlsx"
+        if not original_excel.exists():
+            raise ValueError(f"全量工参原始文件不存在（{original_excel}）")
+
+        # 桌面共享模式：本机数据体不完整时先尝试补拉一次
+        if not self._current_params_csv_files(current_dir, "LTE") and \
+                not self._current_params_csv_files(current_dir, "NR"):
+            repaired = self._repair_current_params_from_server(current_param_id)
+            if repaired:
+                current_dir = settings.DATA_DIR / current_param_id
+
+        lte_files = self._current_params_csv_files(current_dir, "LTE")
+        # 先 SDR 后 ITBBU（与用户描述一致；同模式内按文件名排序）
+        lte_files.sort(key=lambda p: (0 if p.name.lower().startswith("lte_sdr_cellinfo") else 1, str(p)))
+        nr_files = sorted(self._current_params_csv_files(current_dir, "NR"))
+        if not lte_files and not nr_files:
+            raise ValueError(
+                "未找到现网工参 CSV（LTE_SDR_CellInfo_* / LTE_ITBBU_CellInfo_* / NR_CellInfo_*），"
+                "请确认已上传现网工参 ZIP 并同步到本机后重试"
+            )
+
+        # 一次打开全量工参，LTE/NR 共用同一次 Excel 解析
+        needed_networks = (["LTE"] if lte_files else []) + (["NR"] if nr_files else [])
+        with pd.ExcelFile(original_excel, engine="calamine") as xls:
+            full_frames = {
+                network: self._zte_read_full_params_frame(xls, network)
+                for network in needed_networks
+            }
+        lookups = {
+            network: self._zte_full_params_lookup(full_frames[network], network)
+            for network in needed_networks
+        }
+
+        sheets: Dict[str, pd.DataFrame] = {}
+        stats: Dict[str, Dict[str, int]] = {}
+        if lte_files:
+            safe_print(f"[DataService] 合并 4G 现网工参: {[f.name for f in lte_files]}")
+            merged = self._zte_merge_cellinfo(lte_files)
+            enriched, matched = self._zte_enrich(merged, lookups["LTE"], "LTE")
+            sheets["4G现网工参(中兴)"] = enriched
+            stats["4G现网工参(中兴)"] = {
+                "matched": matched, "network": "LTE", **self._zte_sheet_stats(enriched, "LTE")
+            }
+        if nr_files:
+            safe_print(f"[DataService] 合并 5G 现网工参: {[f.name for f in nr_files]}")
+            merged = self._zte_merge_cellinfo(nr_files)
+            enriched, matched = self._zte_enrich(merged, lookups["NR"], "NR")
+            sheets["5G现网工参(中兴)"] = enriched
+            stats["5G现网工参(中兴)"] = {
+                "matched": matched, "network": "NR", **self._zte_sheet_stats(enriched, "NR")
+            }
+
+        # 输出文件名带 14 位时间戳，多次合并的产物各自保留
+        output_name = stamp_name_with_timestamp("现网4G5G工参(中兴)")
+        dataset = self._zte_register_dataset(
+            output_name, sheets, full_info, username, stats
+        )
+        self._save_index()
+        return {"dataset": dataset}
+
     def _repair_current_params_from_server(self, data_id: str) -> bool:
         """桌面端共享模式：本机现网工参数据体不完整时，从服务器补拉一次整包。
 

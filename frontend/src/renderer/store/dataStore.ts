@@ -60,7 +60,7 @@ interface DataState {
   pageSize: number
   loading: boolean
   uploadingType: string | null
-  isUpdating: boolean  // 工参更新专用 loading 状态
+  isUpdating: boolean  // 工参更新(中兴)专用 loading 状态
   isAddingCell: boolean  // 新站录入专用 loading 状态
   error: string | null
   fetchList: (page?: number, pageSize?: number, forceRefresh?: boolean) => Promise<void>
@@ -68,7 +68,11 @@ interface DataState {
   uploadMap: (file: File, filePath?: string, extraFiles?: File[], importPath?: string) => Promise<boolean>
   uploadGeoData: (file: File, filePath?: string) => Promise<boolean>
   deleteItem: (id: string) => Promise<boolean>
-  updateParameters: (fullParamId: string, currentParamId: string) => Promise<ApiResponse<{ newFileId: string; newFileName: string; savedToOriginal: boolean; stats?: Record<string, { matched: number; appended: number }> | null } | null>>
+  updateParameters: (fullParamId: string, currentParamId: string) => Promise<ApiResponse<{
+    newFileId: string; newFileName: string; savedToOriginal: boolean
+    stats?: Record<string, { matched: number; appended: number }> | null
+    dataset?: { id: string; name: string; sheets: Array<{ name: string; rows: number; matched: number }> } | null
+  } | null>>
   downloadTemplate: (templateType: 'full_params' | 'target_cells') => Promise<void>
   addCell: (data: {
     networkType: 'LTE' | 'NR'
@@ -343,6 +347,8 @@ export const useDataStore = create<DataState>((set, get) => ({
             savedToOriginal: finalResult.savedToOriginal,
             // 合并统计（LTE/NR 匹配行数、新增行数）：前端展示实际更新量
             stats: finalResult.stats || null,
+            // 同任务内完成的现网 4G/5G 合并产物
+            dataset: finalResult.dataset || null,
           }
         }
       }

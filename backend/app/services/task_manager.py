@@ -45,6 +45,8 @@ class TaskType(str, Enum):
     TAC_PLANNING = "tac_planning"  # 规划
     PCI_CHECK = "pci_check"  # PCI核查
     UPDATE_PARAMS = "update_params"  # 工参更新
+    MERGE_CURRENT_PARAMS_ZTE = "merge_current_params_zte"  # 现网工参合并（中兴）
+    ZTE_UPDATE_AND_MERGE = "zte_update_and_merge"  # 工参更新(中兴)：全量更新+现网合并
     APPLY_PCI = "apply_pci"  # PCI应用到工参
     APPLY_TAC_PLANNING = "apply_tac_planning"  # TAC规划应用到工参
     APPLY_PCI_BATCH = "apply_pci_batch"  # PCI批量应用到工参
@@ -2114,6 +2116,184 @@ class TaskManager:
             task.progress = task.progress if hasattr(task, 'progress') else 0
             self._persist_task(task.task_id)
             logger.error(f"[TaskManager] 工参更新任务失败: {task.task_id}, error: {e}")
+
+    async def create_merge_current_params_zte_task(
+        self, full_param_id: str, current_param_id: str,
+        username: str = "", user_id: int = 1,
+        city: Optional[str] = None, operator: Optional[str] = None,
+    ) -> str:
+        """创建现网工参合并（中兴）任务"""
+        logger.info(f"[TaskManager] 创建现网工参合并任务: full={full_param_id[:8]}..., current={current_param_id[:8]}...")
+        city, operator = self._task_group(city, operator, username or None)
+        task = Task(TaskType.MERGE_CURRENT_PARAMS_ZTE, {
+            "fullParamId": full_param_id,
+            "currentParamId": current_param_id,
+            "username": username,
+            "userId": user_id,
+        }, user_name=username or None, city=city, operator=operator)
+        self.tasks[task.task_id] = task
+        self._persist_task(task.task_id)
+        task.task = asyncio.create_task(self._run_task_with_slot(task, self._run_merge_current_params_zte_task))
+        return task.task_id
+
+    async def _run_merge_current_params_zte_task(self, task: Task):
+        """运行现网工参合并（中兴）任务"""
+        try:
+            task.status = TaskStatus.PROCESSING
+            task.started_at = datetime.now()
+            task.progress = 10
+            data_service.start_capture_logs()
+            task.log_messages = []
+
+            async def _poll_logs():
+                while task.status == TaskStatus.PROCESSING:
+                    lines = data_service.get_and_clear_captured_logs()
+                    if lines:
+                        if not hasattr(task, 'log_messages'):
+                            task.log_messages = []
+                        task.log_messages.extend(lines)
+                    await asyncio.sleep(0.5)
+
+            poller = asyncio.create_task(_poll_logs())
+            result = await asyncio.to_thread(
+                data_service.merge_current_params_zte,
+                task.config["fullParamId"], task.config["currentParamId"],
+                username=task.config.get("username", ""),
+                user_id=task.config.get("userId", 1),
+            )
+            poller.cancel()
+            try:
+                await poller
+            except asyncio.CancelledError:
+                pass
+            task.log_messages.extend(data_service.get_and_clear_captured_logs())
+            data_service.stop_capture_logs()
+
+            task.status = TaskStatus.COMPLETED
+            task.completed_at = datetime.now()
+            task.progress = 100
+            task.result = {
+                "taskId": task.task_id,
+                "status": "completed",
+                "progress": 100,
+                "dataset": result.get("dataset") or None,
+            }
+            self._persist_task(task.task_id)
+            logger.info(f"[TaskManager] 现网工参合并任务完成: {task.task_id}")
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            data_service.stop_capture_logs()
+            try:
+                lines = data_service.get_and_clear_captured_logs()
+                if lines and not hasattr(task, 'log_messages'):
+                    task.log_messages = lines
+            except Exception:
+                pass
+            task.status = TaskStatus.FAILED
+            task.error = str(e)
+            task.completed_at = datetime.now()
+            task.progress = task.progress if hasattr(task, 'progress') else 0
+            self._persist_task(task.task_id)
+            logger.error(f"[TaskManager] 现网工参合并任务失败: {task.task_id}, error: {e}")
+
+    async def create_zte_update_and_merge_task(
+        self, full_param_id: str, current_param_id: str,
+        username: str = "", user_id: int = 1,
+        city: Optional[str] = None, operator: Optional[str] = None,
+    ) -> str:
+        """创建工参更新(中兴)任务：一次执行全量工参更新 + 4G/5G 现网工参合并。"""
+        city, operator = self._task_group(city, operator, username or None)
+        task = Task(TaskType.ZTE_UPDATE_AND_MERGE, {
+            "fullParamId": full_param_id,
+            "currentParamId": current_param_id,
+            "username": username,
+            "userId": user_id,
+        }, user_name=username or None, city=city, operator=operator)
+        self.tasks[task.task_id] = task
+        self._persist_task(task.task_id)
+        task.task = asyncio.create_task(self._run_task_with_slot(task, self._run_zte_update_and_merge_task))
+        return task.task_id
+
+    async def _run_zte_update_and_merge_task(self, task: Task):
+        """全量更新完成后，以更新后的全量工参为基准继续合并现网工参。"""
+        try:
+            task.status = TaskStatus.PROCESSING
+            task.started_at = datetime.now()
+            task.progress = 10
+            data_service.start_capture_logs()
+            task.log_messages = []
+
+            async def _poll_logs():
+                while task.status == TaskStatus.PROCESSING:
+                    lines = data_service.get_and_clear_captured_logs()
+                    if lines:
+                        if not hasattr(task, 'log_messages'):
+                            task.log_messages = []
+                        task.log_messages.extend(lines)
+                    await asyncio.sleep(0.5)
+
+            poller = asyncio.create_task(_poll_logs())
+            full_param_id = task.config["fullParamId"]
+            current_param_id = task.config["currentParamId"]
+            username = task.config.get("username", "")
+            user_id = task.config.get("userId", 1)
+
+            update_result = await asyncio.to_thread(
+                data_service.update_parameters,
+                full_param_id, current_param_id,
+                username=username, user_id=user_id,
+            )
+            task.progress = 55
+            merge_full_id = update_result.get("newFileId") or full_param_id
+            merge_result = await asyncio.to_thread(
+                data_service.merge_current_params_zte,
+                merge_full_id, current_param_id,
+                username=username, user_id=user_id,
+            )
+
+            poller.cancel()
+            try:
+                await poller
+            except asyncio.CancelledError:
+                pass
+            task.log_messages.extend(data_service.get_and_clear_captured_logs())
+            data_service.stop_capture_logs()
+
+            import app.api.v1.endpoints.map as map_module
+            map_module.invalidate_map_data_cache()
+
+            task.status = TaskStatus.COMPLETED
+            task.completed_at = datetime.now()
+            task.progress = 100
+            task.result = {
+                "taskId": task.task_id,
+                "status": "completed",
+                "progress": 100,
+                "newFileId": update_result.get("newFileId"),
+                "newFileName": update_result.get("newFileName"),
+                "savedToOriginal": update_result.get("savedToOriginal", False),
+                "stats": update_result.get("stats") or {},
+                "dataset": merge_result.get("dataset") or None,
+            }
+            self._persist_task(task.task_id)
+            logger.info(f"[TaskManager] 工参更新(中兴)任务完成: {task.task_id}")
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            data_service.stop_capture_logs()
+            try:
+                lines = data_service.get_and_clear_captured_logs()
+                if lines and not hasattr(task, 'log_messages'):
+                    task.log_messages = lines
+            except Exception:
+                pass
+            task.status = TaskStatus.FAILED
+            task.error = str(e)
+            task.completed_at = datetime.now()
+            task.progress = task.progress if hasattr(task, 'progress') else 0
+            self._persist_task(task.task_id)
+            logger.error(f"[TaskManager] 工参更新(中兴)任务失败: {task.task_id}, error: {e}")
 
     async def create_attribute_join_task(
         self, cfg: Dict, username: str = "",
