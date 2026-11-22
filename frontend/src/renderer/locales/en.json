@@ -638,6 +638,7 @@
     "unknownType": "Unknown Type",
     "updateParameters": "Update Parameters",
     "zteUpdateTitle": "Update Parameters (ZTE)",
+    "outputAllColumns": "Output all columns (default: common columns only)",
     "startMerge": "Start Merge",
     "merging": "Merging...",
     "zteMergeSuccess": "Current parameters merged",

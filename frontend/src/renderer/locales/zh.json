@@ -567,6 +567,7 @@
     "unknownType": "未知类型",
     "updateParameters": "工参更新",
     "zteUpdateTitle": "工参更新(中兴)",
+    "outputAllColumns": "输出全部列（默认仅常用列）",
     "startMerge": "开始合并",
     "merging": "合并中...",
     "zteMergeSuccess": "现网工参合并完成",

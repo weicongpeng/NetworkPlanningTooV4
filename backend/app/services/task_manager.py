@@ -2121,6 +2121,7 @@ class TaskManager:
         self, full_param_id: str, current_param_id: str,
         username: str = "", user_id: int = 1,
         city: Optional[str] = None, operator: Optional[str] = None,
+        output_all_columns: bool = False,
     ) -> str:
         """创建现网工参合并（中兴）任务"""
         logger.info(f"[TaskManager] 创建现网工参合并任务: full={full_param_id[:8]}..., current={current_param_id[:8]}...")
@@ -2130,6 +2131,7 @@ class TaskManager:
             "currentParamId": current_param_id,
             "username": username,
             "userId": user_id,
+            "outputAllColumns": output_all_columns,
         }, user_name=username or None, city=city, operator=operator)
         self.tasks[task.task_id] = task
         self._persist_task(task.task_id)
@@ -2160,6 +2162,7 @@ class TaskManager:
                 task.config["fullParamId"], task.config["currentParamId"],
                 username=task.config.get("username", ""),
                 user_id=task.config.get("userId", 1),
+                output_all_columns=task.config.get("outputAllColumns", False),
             )
             poller.cancel()
             try:
@@ -2201,6 +2204,7 @@ class TaskManager:
         self, full_param_id: str, current_param_id: str,
         username: str = "", user_id: int = 1,
         city: Optional[str] = None, operator: Optional[str] = None,
+        output_all_columns: bool = False,
     ) -> str:
         """创建工参更新(中兴)任务：一次执行全量工参更新 + 4G/5G 现网工参合并。"""
         city, operator = self._task_group(city, operator, username or None)
@@ -2209,6 +2213,7 @@ class TaskManager:
             "currentParamId": current_param_id,
             "username": username,
             "userId": user_id,
+            "outputAllColumns": output_all_columns,
         }, user_name=username or None, city=city, operator=operator)
         self.tasks[task.task_id] = task
         self._persist_task(task.task_id)
@@ -2250,6 +2255,7 @@ class TaskManager:
                 data_service.merge_current_params_zte,
                 merge_full_id, current_param_id,
                 username=username, user_id=user_id,
+                output_all_columns=task.config.get("outputAllColumns", False),
             )
 
             poller.cancel()

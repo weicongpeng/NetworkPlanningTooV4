@@ -535,6 +535,7 @@ async def merge_current_params_zte(
             user_id=current_user.id,
             city=getattr(current_user, "city", None),
             operator=getattr(current_user, "operator", None),
+            output_all_columns=request.outputAllColumns,
         )
         return {
             "success": True,
@@ -585,6 +586,7 @@ async def zte_update_and_merge(
             user_id=current_user.id,
             city=getattr(current_user, "city", None),
             operator=getattr(current_user, "operator", None),
+            output_all_columns=request.outputAllColumns,
         )
         return {
             "success": True,

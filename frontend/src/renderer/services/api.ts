@@ -1277,8 +1277,8 @@ export const dataApi = {
   },
 
   // 工参更新(中兴)：一个任务同时执行全量更新与 4G/5G 现网工参合并
-  updateParameters: async (fullParamId: string, currentParamId: string): Promise<ApiResponse<{ taskId: string; message: string }>> => {
-    return apiClient.post('/data/zte-update-and-merge', { fullParamId, currentParamId })
+  updateParameters: async (fullParamId: string, currentParamId: string, outputAllColumns: boolean = false): Promise<ApiResponse<{ taskId: string; message: string }>> => {
+    return apiClient.post('/data/zte-update-and-merge', { fullParamId, currentParamId, outputAllColumns })
   },
 
   /** 获取工参更新(中兴)任务进度 */

@@ -179,6 +179,8 @@ class UpdateParametersRequest(BaseModel):
 
     fullParamId: str
     currentParamId: str
+    # 默认只输出常用列；开启后输出全部列（含中兴内部引用列）
+    outputAllColumns: bool = False
 
 
 class MergeCurrentParamsZteRequest(BaseModel):
@@ -186,6 +188,7 @@ class MergeCurrentParamsZteRequest(BaseModel):
 
     fullParamId: str
     currentParamId: str
+    outputAllColumns: bool = False
 
 
 class ImportPointsRequest(BaseModel):

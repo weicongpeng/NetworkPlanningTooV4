@@ -68,7 +68,7 @@ interface DataState {
   uploadMap: (file: File, filePath?: string, extraFiles?: File[], importPath?: string) => Promise<boolean>
   uploadGeoData: (file: File, filePath?: string) => Promise<boolean>
   deleteItem: (id: string) => Promise<boolean>
-  updateParameters: (fullParamId: string, currentParamId: string) => Promise<ApiResponse<{
+  updateParameters: (fullParamId: string, currentParamId: string, outputAllColumns?: boolean) => Promise<ApiResponse<{
     newFileId: string; newFileName: string; savedToOriginal: boolean
     stats?: Record<string, { matched: number; appended: number }> | null
     dataset?: { id: string; name: string; sheets: Array<{ name: string; rows: number; matched: number }> } | null
@@ -275,7 +275,7 @@ export const useDataStore = create<DataState>((set, get) => ({
     }
   },
 
-  updateParameters: async (fullParamId: string, currentParamId: string) => {
+  updateParameters: async (fullParamId: string, currentParamId: string, outputAllColumns: boolean = false) => {
     set({ isUpdating: true, error: null })
 
     // 生成任务ID用于全局跟踪
@@ -286,7 +286,7 @@ export const useDataStore = create<DataState>((set, get) => ({
       useTaskStore.getState().startTask(taskId, 'parameter_update', '正在更新工参...')
 
       // 1. 创建异步任务（立即返回 taskId，避免 Cloudflare 120s 超时）
-      const response = await dataApi.updateParameters(fullParamId, currentParamId)
+      const response = await dataApi.updateParameters(fullParamId, currentParamId, outputAllColumns)
       const actualTaskId = response?.data?.taskId
 
       if (!actualTaskId) {

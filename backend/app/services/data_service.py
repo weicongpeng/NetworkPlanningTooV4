@@ -1547,6 +1547,8 @@ class DataService:
         "小区覆盖类型": ("小区覆盖类型", "Cell Coverage Attribute"),
     }
     ZTE_COVERAGE_LABELS = {"1": "宏站", "4": "室分"}
+    # 默认保留列：4G A~AU（47 列）、5G A~CM（91 列）；其余列仅在"输出全部列"时写出
+    ZTE_DEFAULT_COLUMN_LIMITS = {"LTE": 47, "NR": 91}
 
     @staticmethod
     def _zte_header(value) -> str:
@@ -1758,6 +1760,14 @@ class DataService:
         return enriched[ordered], int(pd.Series(keys).isin(lookup.index).sum())
 
     @classmethod
+    def _zte_limit_columns(cls, frame: pd.DataFrame, network: Optional[str], output_all_columns: bool) -> pd.DataFrame:
+        """默认只写常用列（4G A~AU / 5G A~CM）；开启开关时保留全部列。"""
+        if output_all_columns or not network:
+            return frame
+        limit = cls.ZTE_DEFAULT_COLUMN_LIMITS.get(network)
+        return frame.iloc[:, :limit] if limit and len(frame.columns) > limit else frame
+
+    @classmethod
     def _zte_drop_empty_columns(cls, frame: pd.DataFrame) -> pd.DataFrame:
         """删除整列为空的源 CSV 列；9 个新增列即使全空也保留。"""
         keep = []
@@ -1808,7 +1818,7 @@ class DataService:
     def _zte_register_dataset(
         self, name: str, sheets: Dict[str, pd.DataFrame],
         full_info: Dict[str, Any], username: str,
-        stats: Dict[str, Dict[str, int]],
+        stats: Dict[str, Dict[str, int]], output_all_columns: bool = False,
     ) -> Dict[str, Any]:
         """登记合并结果数据集（同名同组重复执行时覆盖原条目，不产生重复数据）。"""
         user_id = full_info.get("user_id", 1)
@@ -1826,7 +1836,11 @@ class DataService:
 
         # 源 CSV 常带大量全空列，写出前剔除以缩小文件（9 个新增列始终保留）
         sheets = {
-            sheet_name: self._zte_drop_empty_columns(frame)
+            sheet_name: self._zte_limit_columns(
+                self._zte_drop_empty_columns(frame),
+                (stats.get(sheet_name) or {}).get("network"),
+                output_all_columns,
+            )
             for sheet_name, frame in sheets.items()
         }
         data_dir = settings.DATA_DIR / data_id
@@ -1903,7 +1917,7 @@ class DataService:
 
     def merge_current_params_zte(
         self, full_param_id: str, current_param_id: str,
-        username: str = "", user_id: int = 1,
+        username: str = "", user_id: int = 1, output_all_columns: bool = False,
     ) -> Dict[str, Any]:
         """现网工参合并（中兴）：4G 合并 SDR+ITBBU，5G 取 NR，补齐全量工参字段。"""
         full_info = self.index.get(full_param_id)
@@ -1987,7 +2001,7 @@ class DataService:
         # 输出文件名带 14 位时间戳，多次合并的产物各自保留
         output_name = stamp_name_with_timestamp("现网4G5G工参(中兴)")
         dataset = self._zte_register_dataset(
-            output_name, sheets, full_info, username, stats
+            output_name, sheets, full_info, username, stats, output_all_columns
         )
         self._save_index()
         return {"dataset": dataset}
@@ -4520,22 +4534,16 @@ class DataService:
                             break
 
                     if lon_col_name and lat_col_name:
-                        # 使用 CGI 列（gNBId-cellLocalId）分组填充空经纬度
+                        # 使用 CGI 列（gNBId-cellLocalId）分组填充空经纬度。
+                        # 原实现按每个重复 CGI 全表筛选（本例 6522 组 × 14824 行 ≈ 1 亿次比较，约 97s），
+                        # 改为 groupby.transform('first') 一次线性扫描，结果等价。
                         df["_cgi"] = df["gNBId"].fillna("").astype(str).apply(_safe_int_str) + "_" + df["cellLocalId"].fillna("").astype(str).apply(_safe_int_str)
-                        cgi_dup_mask = df.duplicated(subset=["_cgi"], keep=False)
-                        if cgi_dup_mask.any():
-                            for _cgi_val in df.loc[cgi_dup_mask, "_cgi"].unique():
-                                _mask = df["_cgi"] == _cgi_val
-                                _group = df.loc[_mask]
-                                # 找到该CGI组中非空的经纬度
-                                _lon_val = _group[lon_col_name].dropna()
-                                _lat_val = _group[lat_col_name].dropna()
-                                if not _lon_val.empty:
-                                    _known_lon = _lon_val.iloc[0]
-                                    df.loc[_mask & df[lon_col_name].isna(), lon_col_name] = _known_lon
-                                if not _lat_val.empty:
-                                    _known_lat = _lat_val.iloc[0]
-                                    df.loc[_mask & df[lat_col_name].isna(), lat_col_name] = _known_lat
+                        for coord_col in (lon_col_name, lat_col_name):
+                            known = df[coord_col].where(df[coord_col].notna())
+                            first = known.groupby(df["_cgi"], sort=False).transform("first")
+                            mask = df[coord_col].isna() & first.notna()
+                            if mask.any():
+                                df.loc[mask, coord_col] = first[mask]
                         df.drop(columns=["_cgi"], inplace=True)
 
                     # 去重：相同 _key（NR唯一键）只保留第一条

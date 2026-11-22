@@ -170,6 +170,7 @@ export function DataPage() {
   const [selectedFullParamId, setSelectedFullParamId] = useState<string>('')
   const [selectedCurrentParamId, setSelectedCurrentParamId] = useState<string>('')
   const [updateSuccess, setUpdateSuccess] = useState<string | null>(null)
+  const [outputAllColumns, setOutputAllColumns] = useState(false)
 
   // 上传成功消息
   const [uploadSuccess, setUploadSuccess] = useState<string | null>(null)
@@ -892,7 +893,7 @@ export function DataPage() {
      let lastLogCount = 0
 
      try {
-         const result = await updateParameters(selectedFullParamId, selectedCurrentParamId)
+         const result = await updateParameters(selectedFullParamId, selectedCurrentParamId, outputAllColumns)
          console.log('Update parameters result:', result);
 
          // 获取 taskId 用于轮询后端终端日志
@@ -1317,6 +1318,8 @@ export function DataPage() {
               setSelectedCurrentParamId={setSelectedCurrentParamId}
               isUpdating={isUpdating}
               onUpdateParameters={handleUpdateParameters}
+              outputAllColumns={outputAllColumns}
+              setOutputAllColumns={setOutputAllColumns}
             />
         </div>
 
@@ -2433,6 +2436,8 @@ function CellToolsCard({
   setSelectedCurrentParamId,
   isUpdating,
   onUpdateParameters,
+  outputAllColumns,
+  setOutputAllColumns,
 }: {
   fullParamFiles: DataItem[]
   currentParamFiles: DataItem[]
@@ -2446,6 +2451,8 @@ function CellToolsCard({
   setSelectedCurrentParamId: (v: string) => void
   isUpdating: boolean
   onUpdateParameters: () => void
+  outputAllColumns: boolean
+  setOutputAllColumns: (v: boolean) => void
 }) {
   const { t } = useTranslation()
   const [activeTab, setActiveTab] = useState<'entry' | 'query' | 'update'>('entry')
@@ -2537,6 +2544,8 @@ function CellToolsCard({
           setSelectedCurrentParamId={setSelectedCurrentParamId}
           isUpdating={isUpdating}
           onUpdateParameters={onUpdateParameters}
+          outputAllColumns={outputAllColumns}
+          setOutputAllColumns={setOutputAllColumns}
           permUpdate={permUpdate}
         />
       </div>
@@ -2582,6 +2591,8 @@ function ParamUpdatePanel({
   setSelectedCurrentParamId,
   isUpdating,
   onUpdateParameters,
+  outputAllColumns,
+  setOutputAllColumns,
   permUpdate,
 }: {
   fullParamFiles: DataItem[]
@@ -2592,6 +2603,8 @@ function ParamUpdatePanel({
   setSelectedCurrentParamId: (v: string) => void
   isUpdating: boolean
   onUpdateParameters: () => void
+  outputAllColumns: boolean
+  setOutputAllColumns: (v: boolean) => void
   permUpdate: boolean
 }) {
   const { t } = useTranslation()
@@ -2628,6 +2641,16 @@ function ParamUpdatePanel({
               <option key={f.id} value={f.id}>{f.name}</option>
             ))}
           </select>
+          <label className="flex items-center gap-1.5 mt-2 text-xs text-muted-foreground cursor-pointer">
+            <input
+              type="checkbox"
+              className="h-3.5 w-3.5 accent-primary"
+              checked={outputAllColumns}
+              onChange={(e) => setOutputAllColumns(e.target.checked)}
+              disabled={isUpdating}
+            />
+            {t('data.outputAllColumns') || '输出全部列（默认仅常用列）'}
+          </label>
         </div>
         <button
           onClick={onUpdateParameters}
