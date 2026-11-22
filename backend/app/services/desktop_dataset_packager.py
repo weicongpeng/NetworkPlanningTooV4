@@ -247,7 +247,9 @@ def install_package(
             zf.extractall(extract_root)
 
         src = None
-        if entry_type != "map" and not is_geo:
+        # 合并产物按整目录打包（包内只有 data/<id>/ 文件，没有 source.* 标记），
+        # 不能像普通 Excel 那样强制找源文件，否则同组 pull/push 一律失败。
+        if entry_type != "map" and not is_geo and not is_merged:
             for cand in sorted(extract_root.glob(f"{SOURCE_PREFIX}.*")):
                 src = cand
                 break
@@ -341,6 +343,9 @@ def install_package(
         data_service._save_index()
         if is_geo:
             _upsert_geo_file(data_id, new_entry, user_id, city, operator)
+        else:
+            # 接收端也要有 Workbook 行：否则重启对账/按组清理时这个条目会被当作残余
+            _upsert_merged_workbook(data_id, new_entry, user_id, city, operator)
     else:
         new_entry["status"] = "processing"
         data_service.index[data_id] = new_entry
@@ -500,6 +505,47 @@ def _upsert_layers(
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"[数据集解包] 图层元数据写入失败 {layer_id}: {exc}")
+
+
+def _upsert_merged_workbook(
+    data_id: str, entry: Dict[str, Any], user_id: int, city: Optional[str], operator: Optional[str]
+) -> None:
+    """现网工参合并产物：只补 Workbook 元数据，不解析成 Site/Sector。"""
+    from datetime import datetime
+
+    from app.core.database import SessionLocal
+    from app.models.database import Workbook
+
+    metadata = entry.get("metadata") or {}
+    db = SessionLocal()
+    try:
+        row = db.query(Workbook).filter(Workbook.id == data_id).first()
+        fields = {
+            "name": entry.get("name") or data_id,
+            "file_type": "merged_current_params",
+            "network_types": json.dumps(
+                [s.get("name") for s in (metadata.get("sheets") or []) if s.get("name")],
+                ensure_ascii=False,
+            ),
+            "status": "ready",
+            "size": entry.get("size"),
+            "user_id": user_id,
+            "city": city,
+            "operator": operator,
+            "metadata_json": json.dumps(metadata, ensure_ascii=False) if metadata else None,
+            "updated_at": datetime.now().isoformat(),
+        }
+        if row:
+            for key, value in fields.items():
+                setattr(row, key, value)
+        else:
+            db.add(Workbook(id=data_id, created_at=datetime.now().isoformat(), **fields))
+        db.commit()
+    except Exception as exc:  # noqa: BLE001
+        db.rollback()
+        logger.warning(f"[数据集解包] 合并产物元数据写入失败 {data_id}: {exc}")
+    finally:
+        db.close()
 
 
 def _upsert_geo_file(
