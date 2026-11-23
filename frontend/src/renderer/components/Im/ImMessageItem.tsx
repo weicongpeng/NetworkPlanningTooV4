@@ -21,7 +21,8 @@ interface Props {
   message: ImMessage
   isMine: boolean
   onPreview: (attachmentId: number, name: string, mime: string) => void
-  onRetry?: () => void
+  /** 重发本条消息；参数即当前消息，调用方可以传稳定回调让 memo 生效 */
+  onRetry?: (message: ImMessage) => void
   /** 右键菜单：由 ImChatPanel 统一弹出 */
   onContextMenu?: (event: ReactMouseEvent<HTMLDivElement>, message: ImMessage) => void
   selectionMode?: boolean
@@ -438,7 +439,7 @@ function ImMessageItemBase({
           {message.failed && (
             <button
               type="button"
-              onClick={onRetry}
+              onClick={() => onRetry?.(message)}
               className="mt-2 flex items-center gap-1 text-[11px] text-red-200 hover:text-white cursor-pointer"
             >
               <RotateCcw size={12} /> {t('im.message.retry', '发送失败，重试')}

@@ -38,6 +38,8 @@ export function ImWindow({ userId, desktopMode, onClose }: Props) {
   const [entered, setEntered] = useState(false)
   const [showChat, setShowChat] = useState(false)
   const conversation = useImStore(s => s.conversations.find(c => c.id === s.activeConversationId) || null)
+  // 通讯录点人后会话 id 还没返回：先把对方信息交给聊天区渲染骨架
+  const pendingDirect = useImStore(s => s.pendingDirect)
   const refreshConversations = useImStore(s => s.refreshConversations)
   const narrow = rect.w < 640
 
@@ -103,11 +105,12 @@ export function ImWindow({ userId, desktopMode, onClose }: Props) {
 
       <div className="relative flex min-h-0 flex-1">
         {(!narrow || !showChat) && (
-          <ImSidebar onSelectConversation={() => { if (narrow) setShowChat(true) }} />
+          <ImSidebar onOpenChat={() => { if (narrow) setShowChat(true) }} />
         )}
         {(!narrow || showChat) && (
           <ImChatPanel
             conversation={conversation}
+            pendingPeer={pendingDirect}
             narrow={narrow}
             onBack={() => setShowChat(false)}
           />

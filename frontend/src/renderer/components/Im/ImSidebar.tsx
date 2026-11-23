@@ -14,7 +14,8 @@ import { conversationTitle, formatConversationTime, imDisplayName, parseSystemMe
 import type { ImGroup, ImLastMessage, ImUser } from './types'
 
 interface Props {
-  onSelectConversation: (id: number) => void
+  /** 窄窗口下切到聊天区：点会话 / 点通讯录时立即调用，不再等会话请求返回 */
+  onOpenChat: () => void
 }
 
 type Tr = (key: string, options?: Record<string, unknown>) => string
@@ -31,7 +32,7 @@ function lastMessagePreview(last: ImLastMessage | null, t: Tr): string {
   return last.preview || noMessage()
 }
 
-export function ImSidebar({ onSelectConversation }: Props) {
+export function ImSidebar({ onOpenChat }: Props) {
   const { t } = useTranslation()
   // 包一层简单签名，避免 i18next TFunction 重载签名与纯函数类型不兼容
   const tr: Tr = (key, options) => String(t(key, options as never))
@@ -83,23 +84,20 @@ export function ImSidebar({ onSelectConversation }: Props) {
   }, [contacts, online, query])
 
   const selectConversation = (id: number) => {
-    onSelectConversation(id)
+    onOpenChat()
     useImStore.getState().setActiveConversation(id)
   }
 
-  // 通讯录入口原先只调 store，从不触发 onSelectConversation，
-  // 导致窄窗口（rect.w < 640）下点人/点群时 showChat 仍为 false、聊天面板根本不渲染。
-  // 只在确实进入会话后才通知切视图。
-  const selectContact = async (userId: number): Promise<number | null> => {
-    const id = await openDirect(userId)
-    if (id !== null) onSelectConversation(id)
-    return id
+  // 通讯录点人/点群：先切视图（窄窗口立刻换到聊天区，store 内部也会先切 Tab +
+  // 用本地资料占位），网络请求完全放到后台，点击不再等 1~3 个 RTT。
+  const selectContact = (userId: number) => {
+    onOpenChat()
+    void openDirect(userId)
   }
 
-  const selectGroup = async (id: number): Promise<boolean> => {
-    const ok = await openGroup(id)
-    if (ok) onSelectConversation(id)
-    return ok
+  const selectGroup = (id: number) => {
+    onOpenChat()
+    void openGroup(id)
   }
 
   return (
@@ -254,7 +252,7 @@ function EmptyHint({ text }: { text: string }) {
 function ContactRow({ user, online, onSelect }: {
   user: ImUser
   online: boolean
-  onSelect: (id: number) => Promise<number | null>
+  onSelect: (id: number) => void
 }) {
   const { t } = useTranslation()
   return (
@@ -277,7 +275,7 @@ function ContactRow({ user, online, onSelect }: {
 
 function GroupRow({ group, onSelect }: {
   group: ImGroup
-  onSelect: (id: number) => Promise<boolean>
+  onSelect: (id: number) => void
 }) {
   const { t } = useTranslation()
   return (

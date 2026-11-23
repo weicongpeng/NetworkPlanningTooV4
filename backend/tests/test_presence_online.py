@@ -136,6 +136,76 @@ def test_notify_user_online_never_raises(monkeypatch):
     notify_user_online(build_online_event(username="admin"))
 
 
+# ---------------------------------------------------------------- 事件日志（桌面端中继）
+#
+# 桌面壳内渲染进程只连本机后端 WS，收不到这里的广播，靠事件日志按游标补齐：
+# 因此「入日志」必须发生在广播之前 / 独立于广播成功与否。
+
+
+def test_event_log_serves_desktop_relay_by_cursor(monkeypatch):
+    from app.services import presence_service
+
+    _install_fake_manager(monkeypatch)
+    baseline = presence_service.events_since(0)["seq"]
+
+    first = notify_user_online(
+        build_online_event(user_id=11, username="a1", city="河源", operator="电信")
+    )
+    second = notify_user_online(
+        build_online_event(user_id=12, username="a2", city="河源", operator="联通")
+    )
+
+    batch = presence_service.events_since(baseline)
+    assert batch["seq"] >= baseline + 2
+    ids = [item["eventId"] for item in batch["events"]]
+    assert first["eventId"] in ids and second["eventId"] in ids
+    assert ids.index(first["eventId"]) < ids.index(second["eventId"])
+    # 用最新游标再取一次：不重复下发（否则桌面端会重复敲门）
+    assert presence_service.events_since(batch["seq"])["events"] == []
+
+
+def test_event_log_records_even_when_broadcast_fails(monkeypatch):
+    """WS 广播失败不该让桌面端漏掉这次上线。"""
+    from app.services import presence_service
+
+    def _boom(_payload):
+        raise RuntimeError("WS 挂了")
+
+    monkeypatch.setattr(
+        "app.services.websocket_manager.websocket_manager.notify_user_online",
+        _boom,
+        raising=True,
+    )
+    baseline = presence_service.events_since(0)["seq"]
+    event = notify_user_online(build_online_event(user_id=13, username="a3"))
+
+    ids = [item["eventId"] for item in presence_service.events_since(baseline)["events"]]
+    assert event["eventId"] in ids
+
+
+def test_event_log_is_bounded_but_cursor_moves(monkeypatch):
+    """环形日志有上限（不无限增长），但游标照常推进，客户端不会卡住。"""
+    from app.services import presence_service
+
+    _install_fake_manager(monkeypatch)
+    baseline = presence_service.events_since(0)["seq"]
+    for index in range(presence_service.EVENT_LOG_MAX + 5):
+        notify_user_online(build_online_event(user_id=100 + index, username=f"u{index}"))
+
+    batch = presence_service.events_since(baseline, limit=0)
+    assert batch["seq"] == baseline + presence_service.EVENT_LOG_MAX + 5
+    assert len(batch["events"]) <= presence_service.EVENT_LOG_MAX
+
+
+def test_events_since_tolerates_bad_cursor():
+    """客户端传了脏游标（None/负/非数字）按 0 处理，不抛异常。"""
+    from app.services import presence_service
+
+    assert presence_service.events_since(None)["seq"] >= 0
+    assert presence_service.events_since(-5)["seq"] >= 0
+    assert presence_service.events_since("abc")["seq"] >= 0
+
+
 # ---------------------------------------------------------------- 连接鉴权
 
 

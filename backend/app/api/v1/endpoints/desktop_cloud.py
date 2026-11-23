@@ -850,6 +850,40 @@ async def data_changes(
     }
 
 
+class PresenceRequest(SyncCredential):
+    """用户上线事件长轮询（桌面端中继用）。since=已收到的最大事件序号。"""
+
+    since: int = Field(default=0, ge=0)
+    wait_seconds: int = Field(default=25, ge=0, le=60)
+
+
+@router.post("/presence/online")
+async def presence_online(
+    payload: PresenceRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """「有人上线」事件长轮询：桌面端拉回去后在本机 WS 广播一遍。
+
+    桌面壳内的渲染进程只连本机后端（127.0.0.1），云端登录广播的 ``user_online``
+    到不了那里 —— 表现为「网页端有人登录会响敲门声，桌面端完全没反应」。
+    桌面端用本接口按游标补齐事件（无事件则挂起到 wait_seconds），再用本机
+    WebSocketManager 广播，前端气泡 / 敲门声逻辑无需改动。
+    """
+    from app.services import presence_service
+
+    _rate_limit(f"presence:{_client_ip(request)}", limit=120, window=300)
+    _verify_license(payload.license_file, payload.machine_code, db)
+
+    since = max(0, int(payload.since or 0))
+    batch = presence_service.events_since(since)
+    deadline = time.time() + int(payload.wait_seconds or 0)
+    while not batch.get("events") and time.time() < deadline:
+        await asyncio.sleep(1)
+        batch = presence_service.events_since(since)
+    return {"success": True, "data": batch}
+
+
 @router.get("/data/dataset/{data_id}/package")
 async def download_dataset_package(
     data_id: str,

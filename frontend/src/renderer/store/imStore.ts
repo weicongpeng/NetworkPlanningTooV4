@@ -8,7 +8,7 @@ import { IM_MESSAGE_EVENT, IM_PRESENCE_EVENT, IM_RESYNC_EVENT } from '../service
 import { playImMessageSound } from '../utils/messageSound'
 import { imUserId } from '../components/Im/types'
 import type {
-  ImContactsData, ImConversation, ImLightboxSource, ImMember, ImMessage,
+  ImContactsData, ImConversation, ImGroup, ImLightboxSource, ImMember, ImMessage,
   ImSendMention, ImTab, ImUser,
 } from '../components/Im/types'
 
@@ -34,6 +34,8 @@ interface ImState {
   open: boolean
   activeTab: ImTab
   activeConversationId: number | null
+  /** 通讯录点人后、服务端会话 id 尚未返回时的占位；聊天区据此立即渲染对方信息与骨架 */
+  pendingDirect: { userId: number; user: ImUser | null } | null
   conversations: ImConversation[]
   messages: Record<number, ImMessage[]>
   cursors: Cursors
@@ -242,6 +244,59 @@ function clearActiveUnread(conversations: ImConversation[], viewedId: number | n
   return conversations.map(c => c.id === viewedId && c.unread ? { ...c, unread: 0 } : c)
 }
 
+/** 本地会话列表里找与某人的单聊（自己↔自己的文件传输助手按 is_self 判定） */
+function findDirectConversation(
+  conversations: ImConversation[], userId: number, selfId: number | null,
+): ImConversation | null {
+  return conversations.find(c => c.kind === 'direct'
+    && (c.other_user?.id === userId || (Boolean(c.is_self) && userId === selfId))) || null
+}
+
+/** 用通讯录资料拼一条单聊会话：新会话还没进列表时让聊天区立刻能派生标题 / 输入区 */
+function buildDirectConversation(
+  id: number, peer: ImUser | null, isSelf: boolean,
+): ImConversation {
+  return {
+    id,
+    kind: 'direct',
+    name: null,
+    group_key: null,
+    other_user: peer
+      ? {
+          id: peer.id,
+          username: peer.username,
+          nickname: peer.nickname,
+          is_online: peer.is_online,
+          avatar: peer.avatar ?? null,
+        }
+      : null,
+    is_self: isSelf,
+    member_count: isSelf ? 1 : 2,
+    last_message: null,
+    last_message_at: null,
+    unread: 0,
+    muted: false,
+  }
+}
+
+/** 用通讯录里的群资料拼一条群会话（点群不必再等一次全量会话列表刷新） */
+function buildGroupConversation(group: ImGroup): ImConversation {
+  return {
+    id: group.id,
+    kind: group.kind,
+    name: group.name,
+    group_key: null,
+    avatar: group.avatar ?? null,
+    owner_id: group.owner_id ?? null,
+    other_user: null,
+    member_count: group.member_count,
+    last_message: null,
+    last_message_at: null,
+    unread: 0,
+    muted: false,
+  }
+}
+
 let pollTimer: number | null = null
 let refreshTimer: number | null = null
 let refreshQueued = false
@@ -263,6 +318,13 @@ let lastHoleFillAt = 0
 let avatarsFetched = false
 /** 收到非激活会话的新消息：标记脏，切换进该会话时优先补拉而不是重新 initial */
 const dirtyConversations = new Set<number>()
+/**
+ * 正文请求去重：点开会话触发的 initial 与 1.5s 轮询增量 / 列表补洞会针对同一会话
+ * 并发发请求，正文重复铺入 + 二次滚底，看起来就是「卡一下、跳一下」。
+ */
+const messagesInFlight = new Set<number>()
+/** 通讯录连续点人时只让最后一次点击生效，慢响应的旧请求不能把会话抢回去 */
+let openDirectSeq = 0
 /** 桌面端窗口重新可见时的立即刷新监听（由 startPolling 注册、stopPolling 移除） */
 let pollFocusHandler: (() => void) | null = null
 /** 同一会话的成员请求合并为一个 Promise，避免每次键入 @ 都发请求 */
@@ -337,6 +399,7 @@ const initialState = {
   open: false,
   activeTab: 'messages' as ImTab,
   activeConversationId: null,
+  pendingDirect: null,
   conversations: [],
   messages: {},
   cursors: {},
@@ -436,13 +499,16 @@ export const useImStore = create<ImState>()(
       },
 
       setActiveConversation: id => {
+        // 用户主动切了会话（左侧列表 / 返回列表 / 窗口收起）：作废通讯录点人还在途的
+        // 请求，避免慢响应回来把用户已经切走的会话又抢回去
+        openDirectSeq += 1
         if (id === null) {
           viewedConversationId = null
-          set({ activeConversationId: null })
+          set({ activeConversationId: null, pendingDirect: null })
           return
         }
         get().markConversationRead(id)
-        set({ activeConversationId: id })
+        set({ activeConversationId: id, pendingDirect: null })
         // 该会话在后台收过新消息：用增量补拉接上游标，避免 initial 重置窗口
         // 把还没读的历史消息丢掉；否则按原有行为拉最新一页。
         if (dirtyConversations.has(id) && get().cursors[id]) {
@@ -499,7 +565,14 @@ export const useImStore = create<ImState>()(
         })
         const state = get()
         playConversationMessageSound(items, state.activeConversationId, state.open)
-        const conversations = clearActiveUnread(items, viewedConversationId, state.open)
+        let conversations = clearActiveUnread(items, viewedConversationId, state.open)
+        // 刚新建的会话 last_message_at 为空，会排在服务端 100 条上限的最后甚至被截断；
+        // 当前激活的会话若不在响应里就保留本地那条，避免聊天区突然退回「选择一个会话」空态
+        if (state.activeConversationId !== null
+            && !conversations.some(conv => conv.id === state.activeConversationId)) {
+          const activeConv = state.conversations.find(conv => conv.id === state.activeConversationId)
+          if (activeConv) conversations = [...conversations, activeConv]
+        }
         set({
           conversations,
           online,
@@ -510,7 +583,10 @@ export const useImStore = create<ImState>()(
         // 说明本地游标跳过了一段或窗口收起期间漏了补拉，重拉最新一页补洞。
         // 用服务端返回的原始 items 判断（clearActiveUnread 会把当前会话置 0）。
         const activeId = state.activeConversationId
-        if (activeId !== null && Date.now() - lastHoleFillAt > HOLE_FILL_THROTTLE_MS) {
+        // 正文正在加载时不要补洞：刚点开的会话必然「服务端最新 id > 本地 0」，
+        // 不跳过就会把同一页 initial 再拉一遍（看起来像是点了两次、闪两下）
+        if (activeId !== null && !messagesInFlight.has(activeId)
+            && Date.now() - lastHoleFillAt > HOLE_FILL_THROTTLE_MS) {
           const serverLast = items.find((c: ImConversation) => c.id === activeId)?.last_message?.id || 0
           const localLast = get().messages[activeId]?.slice(-1)[0]?.id || 0
           if (serverLast > localLast) {
@@ -582,6 +658,10 @@ export const useImStore = create<ImState>()(
         const state = get()
         const cursor = state.cursors[id]
         if (direction === 'older' && !cursor?.prev) return
+        // 同一会话同时只允许一次正文请求：切会话 / 轮询可能在同一瞬间各发一次，
+        // 后返回的那次会用旧快照覆盖新快照，正文重复插入并重复滚底
+        if (messagesInFlight.has(id)) return
+        messagesInFlight.add(id)
         const existing = direction === 'initial' ? [] : (get().messages[id] || [])
         // 没有游标说明尚未加载过该会话，整页都是历史，先建基线不提醒
         const hasBaseline = Boolean(state.cursors[id])
@@ -673,6 +753,8 @@ export const useImStore = create<ImState>()(
         } catch (error) {
           console.warn('[IM] loadMessages failed', error)
           setImError(`messages:${id}`, errorMessage(error, 'im.error.messages'))
+        } finally {
+          messagesInFlight.delete(id)
         }
       },
 
@@ -838,6 +920,24 @@ export const useImStore = create<ImState>()(
       },
 
       openDirect: async userId => {
+        const seq = (openDirectSeq += 1)
+        const selfId = currentUserId()
+        const state = get()
+        // 通讯录点人必须立刻有反应：先把 Tab 切到消息，再查本地已有单聊。
+        // 旧实现每次点击都先 POST /im/conversations（共享桌面模式还经公网 relay），
+        // 再串最多 3 次全量列表刷新，点击到切视图要等 1~3 个 RTT。
+        set({ activeTab: 'messages' })
+        const existing = findDirectConversation(state.conversations, userId, selfId)
+        if (existing) {
+          set({ pendingDirect: null })
+          setImError('global', null)
+          get().setActiveConversation(existing.id)
+          return existing.id
+        }
+        // 首次对话：先用通讯录资料占位，聊天区立刻渲染对方信息 + 骨架，而不是干等
+        const peer = (state.contacts?.users || []).find(user => user.id === userId) || null
+        set({ pendingDirect: { userId, user: peer } })
+
         let conversationId: number | null = null
         let lastError: unknown = null
         try {
@@ -849,28 +949,34 @@ export const useImStore = create<ImState>()(
           lastError = error
           console.warn('[IM] create_direct failed, retry from conversation list', error)
         }
+        // 慢响应期间用户可能已点了别人：只让最后一次点击生效
+        if (seq !== openDirectSeq) return null
         if (conversationId === null) {
           await get().refreshConversations().catch(() => {})
-          const existing = get().conversations.find(
-            c => c.kind === 'direct'
-              && (c.other_user?.id === userId
-                || (c.is_self && userId === currentUserId())))
-          if (existing) conversationId = existing.id
+          if (seq !== openDirectSeq) return null
+          conversationId = findDirectConversation(get().conversations, userId, selfId)?.id ?? null
         }
         if (conversationId === null) {
+          set({ pendingDirect: null })
           setImError('global', errorMessage(lastError, 'im.error.conversation'))
           return null
         }
-        set({ activeTab: 'messages' })
+        const newId = conversationId
+        const latest = get()
+        // 新会话还没进列表时先按本地资料补一条，ImWindow 才能派生标题 / 输入区，
+        // 不必等列表刷新回来；last_message、未读等字段交给后台刷新补全
+        set({
+          pendingDirect: null,
+          conversations: latest.conversations.some(c => c.id === newId)
+            ? latest.conversations
+            : [buildDirectConversation(newId, peer, selfId !== null && userId === selfId),
+                ...latest.conversations],
+        })
         setImError('global', null)
-        // 新建会话可能还没进列表，先刷新再激活，避免 ImWindow 派生 conversation=null 停在空态
-        if (!get().conversations.some(c => c.id === conversationId)) {
-          await get().refreshConversations().catch(() => {})
-        }
-        get().setActiveConversation(conversationId)
-        // 刷新只是让列表出现新会话；失败不能反过来把已打开、可发消息的会话显示成失败
+        get().setActiveConversation(newId)
+        // 刷新只用于补齐列表字段；失败不能反过来把已打开、可发消息的会话显示成失败
         void get().refreshConversations().catch(() => {})
-        return conversationId
+        return newId
       },
 
       openGroup: async id => {
@@ -883,12 +989,20 @@ export const useImStore = create<ImState>()(
           setImError(`group:${id}`, 'im.error.notGroupMember')
           return false
         }
-        // 刚加入/刚建好的群可能还没进会话列表，先补齐再激活
-        if (!state.conversations.some(c => c.id === id)) {
-          await get().refreshConversations().catch(() => {})
-        }
         set({ activeTab: 'messages' })
         setImError('global', null)
+        // 刚加入/刚建好的群可能还没进会话列表：通讯录里有群资料就直接本地补一条，
+        // 只有在完全没资料时才回源刷新（旧实现每次点群都先等一次全量刷新）
+        if (!state.conversations.some(c => c.id === id)) {
+          if (group) {
+            const synthetic = buildGroupConversation(group)
+            set(s => (s.conversations.some(c => c.id === id)
+              ? {}
+              : { conversations: [synthetic, ...s.conversations] }))
+          } else {
+            await get().refreshConversations().catch(() => {})
+          }
+        }
         get().setActiveConversation(id)
         void get().refreshConversations().catch(() => {})
         return true
@@ -1136,6 +1250,8 @@ export const useImStore = create<ImState>()(
         soundedMessageIds.clear()
         conversationLastIds = null
         dirtyConversations.clear()
+        messagesInFlight.clear()
+        openDirectSeq += 1
         lastHoleFillAt = 0
         avatarsFetched = false
         set({ ...initialState })

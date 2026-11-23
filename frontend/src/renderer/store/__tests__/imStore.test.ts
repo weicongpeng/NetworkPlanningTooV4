@@ -349,6 +349,62 @@ describe('imStore', () => {
     expect(useImStore.getState().error).toBeNull()
   })
 
+  it('通讯录点已有单聊：直接激活本地会话，不再发创建请求', async () => {
+    localStorage.setItem('auth-storage', JSON.stringify({ state: { user: { id: 1 } } }))
+    vi.mocked(imApi.messages).mockResolvedValue(emptyPage as any)
+    const existing: ImConversation = {
+      id: 31, kind: 'direct', name: null, group_key: null,
+      other_user: { id: 5, username: 'bob', is_online: true },
+      member_count: 2, last_message: null, last_message_at: null, unread: 2, muted: false,
+    }
+    useImStore.setState({
+      activeTab: 'contacts', conversations: [existing], unreadTotal: 2,
+    })
+
+    const id = await useImStore.getState().openDirect(5)
+
+    expect(id).toBe(31)
+    expect(imApi.createConversation).not.toHaveBeenCalled()
+    expect(useImStore.getState().activeTab).toBe('messages')
+    expect(useImStore.getState().activeConversationId).toBe(31)
+    expect(useImStore.getState().conversations[0].unread).toBe(0)
+  })
+
+  it('首次和某人聊天：先切 Tab 并给出占位，创建返回后插入会话并激活', async () => {
+    localStorage.setItem('auth-storage', JSON.stringify({ state: { user: { id: 1 } } }))
+    vi.mocked(imApi.messages).mockResolvedValue(emptyPage as any)
+    const created: ImConversation = {
+      id: 21, kind: 'direct', name: null, group_key: null,
+      other_user: { id: 5, username: 'bob', is_online: true },
+      member_count: 2, last_message: null, last_message_at: null, unread: 0, muted: false,
+    }
+    vi.mocked(imApi.conversations).mockResolvedValue(conversationsPage([created]))
+    useImStore.setState({
+      activeTab: 'contacts',
+      contacts: {
+        users: [{ id: 5, username: 'bob', is_online: true, city: '河源', operator: '电信' }],
+        groups: [], online_count: 1, server_time: '',
+      },
+    })
+    let resolveCreate!: (value: unknown) => void
+    vi.mocked(imApi.createConversation)
+      .mockImplementationOnce(() => new Promise(resolve => { resolveCreate = resolve }) as any)
+
+    const opening = useImStore.getState().openDirect(5)
+    // 同步阶段就该有反馈：Tab 已切到消息，占位对象已就位，还没有真实会话 id
+    expect(useImStore.getState().activeTab).toBe('messages')
+    expect(useImStore.getState().pendingDirect?.user?.id).toBe(5)
+    expect(useImStore.getState().conversations).toHaveLength(0)
+
+    resolveCreate({ success: true, data: { id: 21, kind: 'direct' } })
+    await expect(opening).resolves.toBe(21)
+
+    const state = useImStore.getState()
+    expect(state.pendingDirect).toBeNull()
+    expect(state.activeConversationId).toBe(21)
+    expect(state.conversations.some(item => item.id === 21)).toBe(true)
+  })
+
   it('附件发送失败时返回失败文件，供输入区放回待发送列表', async () => {
     useImStore.setState({ activeConversationId: 7 })
     const okFile = new File(['a'], 'ok.png', { type: 'image/png' })

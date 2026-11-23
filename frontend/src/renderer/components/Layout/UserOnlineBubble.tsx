@@ -4,6 +4,7 @@ import { usePresenceStore } from '../../store/presenceStore'
 import { useAuthStore } from '../../store/authStore'
 import { USER_ONLINE_EVENT } from '../../services/websocketService'
 import { playKnockSound } from '../../utils/knockSound'
+import { imUserId } from '../Im/types'
 
 /** 气泡停留时长（毫秒）：到点后开始渐变消失 */
 const VISIBLE_MS = 5000
@@ -30,8 +31,10 @@ export function UserOnlineBubble() {
   useEffect(() => {
     const handler = (event: Event) => {
       const detail = (event as CustomEvent).detail || {}
-      // 兜底：即便服务端版本较旧把事件推回本端，自己上线也不提示
-      const myId = useAuthStore.getState().user?.id
+      // 兜底：即便服务端版本较旧把事件推回本端，自己上线也不提示。
+      // 桌面共享模式本机镜像账号 id 与服务器 id 不同，必须用 im_user_id 判定「自己」，
+      // 否则桌面端会为自己的登录敲一遍门
+      const myId = imUserId(useAuthStore.getState().user)
       if (myId != null && detail.userId != null && Number(detail.userId) === Number(myId)) return
       const text = String(detail.text || detail.username || '')
       if (!text) return

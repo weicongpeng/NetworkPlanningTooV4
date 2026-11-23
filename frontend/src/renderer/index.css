@@ -206,6 +206,22 @@
   animation: bounce-subtle 1s ease-in-out infinite;
 }
 
+/* 沟通助手窄窗口：通讯录点人后切到聊天区的入场过渡（原来是无过渡硬切） */
+@keyframes im-pane-in {
+  from {
+    opacity: 0;
+    transform: translateX(8px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.im-pane-in {
+  animation: im-pane-in 140ms ease-out;
+}
+
 /* 扇区鼠标悬停提示框样式 - 紧凑灰色框 */
 .leaflet-tooltip.sector-tooltip {
   background: rgba(100, 100, 100, 0.95);
