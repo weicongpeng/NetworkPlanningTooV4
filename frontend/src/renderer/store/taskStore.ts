@@ -1,6 +1,6 @@
 import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
-import { pciApi, neighborApi, tacApi, tacPlanningApi } from '../services/api'
+import { pciApi, pciCheckApi, neighborApi, tacApi, tacPlanningApi } from '../services/api'
 
 /**
  * 全局任务状态管理
@@ -40,7 +40,7 @@ function _initWsTaskDeleteListener() {
 _initWsTaskDeleteListener()
 
 
-export type TaskType = 'parameter_update' | 'pci_planning' | 'neighbor_planning' | 'tac_check' | 'tac_planning' | 'upload'
+export type TaskType = 'parameter_update' | 'pci_planning' | 'neighbor_planning' | 'tac_check' | 'tac_planning' | 'pci_check' | 'upload'
 export type TaskStatus = 'idle' | 'running' | 'completed' | 'failed'
 
 export interface Task {
@@ -60,6 +60,8 @@ export interface Task {
 interface TaskState {
   tasks: Record<string, Task>
   activeTaskIds: Record<TaskType, string | null> // 记录每个模块当前活跃的任务ID
+  /** 各模块历史任务真实总数（来自后端 COUNT，不受本地 store 缓存条数限制） */
+  historyCounts: Record<TaskType, number>
 
   // 获取所有运行中的任务
   getRunningTasks: () => Task[]
@@ -96,11 +98,13 @@ interface TaskState {
 
   // 获取最新的TAC核查任务结果
   getLatestTACCheckTask: () => Task | undefined
+  // 获取最新的PCI核查任务结果
+  getLatestPCICheckTask: () => Task | undefined
   // 设置模块活跃任务ID
   setActiveTaskId: (type: TaskType, id: string | null) => void
 
-  // 从后端同步历史任务到本地 store
-  syncHistoryFromBackend: (type: TaskType) => Promise<void>
+  // 从后端同步历史任务到本地 store（支持分页，返回分页信息与当前页 ID）
+  syncHistoryFromBackend: (type: TaskType, page?: number, pageSize?: number) => Promise<{ total: number; page: number; page_size: number; taskIds: string[] } | undefined>
 
   // 标记任务为已应用（本地状态同步，不依赖后端刷新）
   markTaskApplied: (taskId: string) => void
@@ -159,7 +163,17 @@ export const useTaskStore = create<TaskState>()(
         neighbor_planning: null,
         tac_check: null,
         tac_planning: null,
+        pci_check: null,
         upload: null
+      },
+      historyCounts: {
+        parameter_update: 0,
+        pci_planning: 0,
+        neighbor_planning: 0,
+        tac_check: 0,
+        tac_planning: 0,
+        pci_check: 0,
+        upload: 0
       },
 
       getRunningTasks: () => {
@@ -226,7 +240,10 @@ export const useTaskStore = create<TaskState>()(
         set(state => {
           const task = state.tasks[id]
           if (!task) return state
-
+          // 进度轮询只带轻量摘要：与已有 result 合并，避免把 totals / 完整结果覆盖掉
+          const mergedResult = task.result && typeof task.result === 'object'
+            ? { ...task.result, ...(result && typeof result === 'object' ? result : {}) }
+            : result
           return {
             tasks: {
               ...state.tasks,
@@ -235,7 +252,7 @@ export const useTaskStore = create<TaskState>()(
                 status: 'completed',
                 progress: 100,
                 endTime: Date.now(),
-                result
+                result: mergedResult
               }
             }
           }
@@ -341,6 +358,18 @@ export const useTaskStore = create<TaskState>()(
         return sortedTasks.length > 0 ? sortedTasks[0] : undefined;
       },
 
+      getLatestPCICheckTask: () => {
+        const state = get();
+        const pciCheckTasks = Object.values(state.tasks)
+          .filter(task => task.type === 'pci_check');
+        const sortedTasks = pciCheckTasks.sort((a, b) => {
+          const endTimeA = a.endTime || a.startTime || 0;
+          const endTimeB = b.endTime || b.startTime || 0;
+          return endTimeB - endTimeA;
+        });
+        return sortedTasks.length > 0 ? sortedTasks[0] : undefined;
+      },
+
       setActiveTaskId: (type, id) => {
         set(state => ({
           activeTaskIds: {
@@ -350,34 +379,34 @@ export const useTaskStore = create<TaskState>()(
         }))
       },
 
-      syncHistoryFromBackend: async (type) => {
+      syncHistoryFromBackend: async (type, page = 1, pageSize = 20): Promise<{ total: number; page: number; page_size: number; taskIds: string[] } | undefined> => {
         try {
           let response: any
           switch (type) {
             case 'pci_planning':
-              response = await pciApi.getHistory()
+              response = await pciApi.getHistory(page, pageSize)
               break
             case 'neighbor_planning':
-              response = await neighborApi.getHistory()
+              response = await neighborApi.getHistory(page, pageSize)
               break
             case 'tac_check':
-              response = await tacApi.getHistory()
+              response = await tacApi.getHistory(page, pageSize)
               break
             case 'tac_planning':
-              response = await tacPlanningApi.getHistory()
+              response = await tacPlanningApi.getHistory(page, pageSize)
+              break
+            case 'pci_check':
+              response = await pciCheckApi.getHistory(page, pageSize)
               break
             default:
               return
           }
 
-          const historyTasks = response?.data
-          if (!Array.isArray(historyTasks)) return
-
-          // 🔍 诊断日志：打印从后端接收的原始数据
-          console.log(`[taskStore.syncHistoryFromBackend] type=${type} count=${historyTasks.length}`)
-          historyTasks.slice(0, 5).forEach((ht: any) => {
-            console.log(`  taskId=${ht.taskId?.slice(0,12)}... taskName=${ht.taskName} resultSummary=`, ht.resultSummary)
-          })
+          const data = response?.data
+          const historyTasks = data?.tasks
+          const historyTotal = typeof data?.total === 'number' ? data.total : (Array.isArray(historyTasks) ? historyTasks.length : 0)
+          if (!Array.isArray(historyTasks)) return { total: historyTotal, page, page_size: pageSize, taskIds: [] }
+          const taskIds = historyTasks.map((ht: any) => ht.taskId).filter(Boolean)
 
           set(state => {
             const merged: Record<string, any> = {}
@@ -389,17 +418,40 @@ export const useTaskStore = create<TaskState>()(
               }
             }
 
+            // 跨端删除：同组其他端删掉的历史记录，本机缓存要同步移除。
+            // 列表按创建时间倒序分页，"比本页最早一条更新、却不在本页响应里"的任务
+            // 只可能已被删除（否则必然排在本页内），可从本地安全剔除。
+            // 运行中/正在查看（activeTaskIds）的任务保留，避免打断进行中的流程。
+            const responseIds = new Set<string>(
+              historyTasks.map((ht: any) => ht.taskId).filter(Boolean)
+            )
+            let boundaryTime: number | null = null
+            for (const ht of historyTasks) {
+              if (!ht?.createdAt) continue
+              const t = new Date(ht.createdAt).getTime()
+              if (!Number.isNaN(t) && (boundaryTime === null || t < boundaryTime)) boundaryTime = t
+            }
+            if (boundaryTime !== null) {
+              const activeId = state.activeTaskIds?.[type] ?? null
+              for (const [id, task] of Object.entries(merged)) {
+                if (task.type !== type || responseIds.has(id)) continue
+                if (task.status === 'running' || id === activeId) continue
+                if (typeof task.startTime === 'number' && task.startTime >= boundaryTime) {
+                  delete merged[id]
+                }
+              }
+            }
+
             // 合并后端返回的历史任务
             for (const ht of historyTasks) {
               const id = ht.taskId
               if (!id) continue
-              // 🔥 优化：后端历史列表现在直接返回完整 result（含 results 数组），
-              // 优先使用后端返回的完整 result，其次保留已有的完整结果，最后回退到 resultSummary
+              // 🔥 性能优化：后端历史列表不再返回完整 result（含 results 数组），
+              // 只返回轻量 resultSummary。本地已有完整结果的任务保留完整结果，
+              // 否则回退到摘要；前端"查看"时通过 /result/{taskId} 按需获取完整结果
               const preserved = merged[id]
               let taskResult
-              if (ht.result?.results) {
-                taskResult = ht.result       // 后端直接返回了完整结果
-              } else if (preserved?.result?.results) {
+              if (preserved?.result?.results) {
                 taskResult = preserved.result // 已有完整结果，保留
               } else {
                 taskResult = ht.resultSummary || undefined  // 回退到摘要
@@ -417,16 +469,20 @@ export const useTaskStore = create<TaskState>()(
                 result: taskResult,
               }
             }
-            // 🔍 诊断日志：验证 merge 结果
-            console.log(`[taskStore.syncHistoryFromBackend] merge done, tasks count=${Object.keys(merged).length}`)
-            Object.entries(merged).slice(0, 5).forEach(([id, t]: [string, any]) => {
-              console.log(`  merged[${id.slice(0,12)}...] type=${t.type} name=${t.taskName} result.totalSites=${t.result?.totalSites} result.totalSectors=${t.result?.totalSectors}`)
-            })
 
-            return { tasks: merged }
+            return {
+              tasks: merged,
+              historyCounts: {
+                ...state.historyCounts,
+                [type]: historyTotal
+              }
+            }
           })
+          // 🔥 分页：返回后端的分页信息（供 HistoryTable 翻页栏显示）
+          return { total: historyTotal, page: data?.page ?? page, page_size: data?.page_size ?? pageSize, taskIds }
         } catch (err) {
           console.warn(`[taskStore] 同步 ${type} 历史任务失败:`, err)
+          return { total: 0, page, page_size: pageSize, taskIds: [] }
         }
       },
 
@@ -462,6 +518,9 @@ export const useTaskStore = create<TaskState>()(
             case 'tac_planning':
               response = await tacPlanningApi.deleteHistory(taskId)
               break
+            case 'pci_check':
+              response = await pciCheckApi.deleteHistory(taskId)
+              break
             default:
               console.warn(`[taskStore] 不支持的删除类型: ${type}`)
               return false
@@ -471,13 +530,18 @@ export const useTaskStore = create<TaskState>()(
             set(state => {
               const newTasks = { ...state.tasks }
               delete newTasks[taskId]
-              // 删除任务时同步清除 activeTaskIds 中的引用，
-              // 避免 GlobalTaskIndicator 显示已删除任务的进度通知
+              // 删除任务时同步清除 activeTaskIds 中的引用（各规划页据此判断"进行中"）
               const newActiveTaskIds = { ...state.activeTaskIds }
               if (state.activeTaskIds[type] === taskId) {
                 newActiveTaskIds[type] = null
               }
-              return { tasks: newTasks, activeTaskIds: newActiveTaskIds }
+              // 删除成功后同步递减历史任务计数（保持 badge 与后端一致）
+              const newCount = Math.max(0, (state.historyCounts[type] || 0) - 1)
+              return {
+                tasks: newTasks,
+                activeTaskIds: newActiveTaskIds,
+                historyCounts: { ...state.historyCounts, [type]: newCount }
+              }
             })
             return true
           }
@@ -502,7 +566,8 @@ export const useTaskStore = create<TaskState>()(
               case 'neighbor_planning': response = await neighborApi.getProgress(taskId); break
               case 'tac_check': response = await tacApi.getProgress(taskId); break
               case 'tac_planning': response = await tacPlanningApi.getProgress(taskId); break
-              default: return
+              case 'pci_check': response = await pciCheckApi.getProgress(taskId); break
+              default: get().stopGlobalPolling(type); return
             }
             if (response?.success && response?.data) {
               const data = response.data
@@ -539,14 +604,18 @@ export const useTaskStore = create<TaskState>()(
               }
               delete (pollingIntervals as any)[errorKey]
             }
+          } finally {
+            // 串行轮询：上次请求返回后再排下一次，慢请求（大结果）不会叠加并发
+            if (pollingIntervals[type]) {
+              pollingIntervals[type] = setTimeout(poll, 2000) as unknown as NodeJS.Timeout
+            }
           }
         }
-        poll()
-        pollingIntervals[type] = setInterval(poll, 2000) as unknown as NodeJS.Timeout
+        pollingIntervals[type] = setTimeout(poll, 0) as unknown as NodeJS.Timeout
       },
 
       stopGlobalPolling: (type) => {
-        if (pollingIntervals[type]) { clearInterval(pollingIntervals[type]); delete pollingIntervals[type] }
+        if (pollingIntervals[type]) { clearTimeout(pollingIntervals[type]); delete pollingIntervals[type] }
       },
 
       isGlobalPollingActive: (type) => {
@@ -573,7 +642,8 @@ export const useTaskStore = create<TaskState>()(
               { ...task, result: undefined }
             ])
           ),
-          activeTaskIds: state.activeTaskIds
+          activeTaskIds: state.activeTaskIds,
+          historyCounts: state.historyCounts
         }
       }
     }

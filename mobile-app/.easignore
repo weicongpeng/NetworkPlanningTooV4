@@ -1,0 +1,43 @@
+# EAS Build 忽略文件
+
+# Android 构建产物
+android/app/build/
+android/.gradle/
+android/build/
+android/local.properties
+android/gradle_error*.txt
+
+# iOS 构建产物
+ios/build/
+ios/Pods/
+ios/*.xcworkspace/xcuserdata/
+ios/*.xcodeproj/xcuserdata/
+ios/*.xcodeproj/project.xcworkspace/
+
+# Node modules
+node_modules/
+
+# Expo
+.expo/
+dist/
+web-build/
+
+# 日志和临时文件
+*.log
+npm-debug.*
+*.jks
+*.p8
+*.p12
+*.key
+*.mobileprovision
+*.orig.*
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~

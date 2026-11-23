@@ -16,7 +16,10 @@ interface SectorCacheEntry {
 interface LayerCacheEntry {
   layerId: string
   bounds: any
+  geojson?: any          // 后端已转 GCJ02 的 GeoJSON，缓存避免重新拉取/重建
   loadedAt: number
+  /** 该 GeoJSON 对应的图层版本指纹（图层数据端点 ETag），增量保存基底校验用 */
+  version?: string | null
 }
 
 interface GeoDataCacheEntry {
@@ -42,11 +45,14 @@ interface MapDataCacheState {
   cacheSectors: (workbookId: string, data: any[]) => void
   getCachedSectors: (workbookId: string) => any[] | null
   cacheLayer: (layerId: string, bounds: any) => void
+  cacheLayerGeoJSON: (layerId: string, geojson: any, version?: string | null) => void
   cacheGeoData: (dataId: string, data: any) => void
 
   // 标记脏数据（工参更新后调用）
   markSectorsDirty: (workbookIds?: string[]) => void
   markAllDirty: () => void
+  /** 丢弃单个图层的缓存（保存后源文件已变，缓存 GeoJSON 立即失效） */
+  invalidateLayer: (layerId: string) => void
 
   // 清除缓存
   clearAll: () => void
@@ -102,6 +108,25 @@ export const useMapDataCacheStore = create<MapDataCacheState>()((set, get) => ({
     }))
   },
 
+  cacheLayerGeoJSON: (layerId, geojson, version) => {
+    set(state => {
+      const existing = state.layers[layerId]
+      return {
+        layers: {
+          ...state.layers,
+          [layerId]: {
+            layerId,
+            bounds: existing?.bounds ?? null,
+            geojson,
+            // 未显式传入版本时清空：避免"新 GeoJSON 配旧指纹"导致增量保存按错行写入
+            version: version ?? null,
+            loadedAt: Date.now()
+          }
+        }
+      }
+    })
+  },
+
   cacheGeoData: (dataId, data) => {
     set(state => ({
       geoData: {
@@ -133,15 +158,28 @@ export const useMapDataCacheStore = create<MapDataCacheState>()((set, get) => ({
       for (const key of Object.keys(sectors)) {
         sectors[key] = { ...sectors[key], dirty: true }
       }
+      // 图层缓存的 GeoJSON 必须一并丢弃：远端（同组其他端）改写源文件后它已失效，
+      // 只置 loadedAt=0 没用 —— 渲染器/导出/搜索都直接读 geojson 字段（不检查 loadedAt），
+      // 保留旧值会让地图一直显示旧图层（"编辑后其他用户不刷新"的根因）。
+      // bounds 保留（几何范围不变，图层定位/编辑会话仍可用）。
       const layers = { ...state.layers }
       for (const key of Object.keys(layers)) {
-        layers[key] = { ...layers[key], loadedAt: 0 }
+        layers[key] = { ...layers[key], geojson: undefined, version: null, loadedAt: 0 }
       }
       const geoData = { ...state.geoData }
       for (const key of Object.keys(geoData)) {
         geoData[key] = { ...geoData[key], loadedAt: 0 }
       }
       return { sectors, layers, geoData }
+    })
+  },
+
+  invalidateLayer: (layerId) => {
+    set(state => {
+      if (!state.layers[layerId]) return state
+      const layers = { ...state.layers }
+      delete layers[layerId]
+      return { layers }
     })
   },
 
@@ -152,8 +190,11 @@ export const useMapDataCacheStore = create<MapDataCacheState>()((set, get) => ({
 }))
 
 // 监听数据刷新事件，自动标记所有缓存为脏
+// layer 范围（图层保存）：数据条目未变，仅由保存流程精确失效对应图层，不做全量失效
 if (typeof window !== 'undefined') {
-  window.addEventListener(DATA_REFRESH_EVENT, () => {
+  window.addEventListener(DATA_REFRESH_EVENT, (e: Event) => {
+    const scope = (e as CustomEvent)?.detail?.scope
+    if (scope === 'layer') return
     useMapDataCacheStore.getState().markAllDirty()
   })
 }

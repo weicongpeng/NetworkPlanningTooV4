@@ -1,14 +1,152 @@
-import { useState, useEffect, useCallback, useRef } from 'react'
-import { Upload, FileSpreadsheet, Trash2, Download, Loader2, AlertCircle, RefreshCw, CheckCircle2, Layers, FileDown, MapPin, Navigation, CheckSquare, Square, ScrollText, Maximize2, Minimize2 } from 'lucide-react'
+import { useState, useEffect, useLayoutEffect, useCallback, useRef, useMemo } from 'react'
+import { Upload, FileSpreadsheet, Trash2, Download, Loader2, AlertCircle, RefreshCw, CheckCircle2, Layers, FileDown, MapPin, Navigation, CheckSquare, Square, ScrollText, Maximize2, Minimize2, RadioTower, BarChart3, Antenna, Search, Database, ChevronDown, ChevronRight } from 'lucide-react'
+import type { LucideIcon } from 'lucide-react'
 import { useDataStore } from '../store/dataStore'
-import { dataApi } from '../services/api'
-import type { DataItem } from '@shared/types'
+import { dataApi, assistantApi, getStoredAuthToken } from '../services/api'
+import type { CellRow, DataItem } from '@shared/types'
 import { DATA_REFRESH_EVENT, triggerDataRefresh } from '../store/dataStore'
+import { DESKTOP_SYNCED_EVENT } from '../store/desktopSyncStore'
 import { mapDataService } from '../services/mapDataService'
 import { indexedDBService } from '../services/indexedDBService'
+import { CellParamsTable } from '../components/DataTable/CellParamsTable'
+import { CellQueryUpdateContent } from '../components/DataTable/CellQueryUpdateCard'
+import { cellDedupKey } from '../utils/cellDedup'
+import { formatImportWarning, formatImportWarningTitle } from '../utils/importWarnings'
+import type { ImportWarning } from '../utils/importWarnings'
 import { useDownloadStore } from '../store/downloadStore'
 import { useTranslation } from 'react-i18next'
 import { useAuthStore } from '../store/authStore'
+
+// ===== 数据图标（导入区与已导入列表共用同一份映射，保证同类文件图标完全一致） =====
+
+/** 图标种类：按数据条目形态归类 */
+type DataIconKind =
+  | 'station_params'   // 基站参数
+  | 'station_metrics'  // 基站指标
+  | 'geo_point'        // 地理化数据（点）
+  | 'geo_sector'       // 地理化数据（扇区）
+  | 'excel'            // Excel 类工参（全量工参/待规划/普通 Excel）
+  | 'layers'           // 图层文件（MapInfo / 图层包）
+  | 'current_params'   // 现网工参（网管导出包，与图层文件同为 ZIP，需区分）
+  | 'archive'          // 未知来源的压缩包
+
+/** 种类 → 图标与配色（列表与导入区共用） */
+const DATA_ICONS: Record<DataIconKind, { Icon: LucideIcon; color: string }> = {
+  station_params: { Icon: RadioTower, color: 'text-primary' },
+  station_metrics: { Icon: BarChart3, color: 'text-primary' },
+  geo_point: { Icon: MapPin, color: 'text-primary' },
+  geo_sector: { Icon: Navigation, color: 'text-primary' },
+  excel: { Icon: FileSpreadsheet, color: 'text-primary' },
+  layers: { Icon: Layers, color: 'text-primary' },
+  current_params: { Icon: Antenna, color: 'text-primary' },
+  archive: { Icon: Upload, color: 'text-muted-foreground' },
+}
+
+/** 网管现网工参导出包文件名契约：BaselineLab*（与后端 CURRENT_PARAMS_PREFIX 一致） */
+export function isCurrentParamsFilename(name?: string): boolean {
+  return (name || '').trim().toLowerCase().startsWith('baselinelab')
+}
+
+/** 已导入条目 → 图标种类（优先按用户导入路径 fileType 判定） */
+function dataItemIconKind(item: DataItem): DataIconKind {
+  // fileType 的共享类型未覆盖助手数据集类型（station_params/station_metrics），此处按字符串比较
+  const fileType = item.fileType as string | undefined
+  if (fileType === 'station_params') return 'station_params'
+  if (fileType === 'station_metrics') return 'station_metrics'
+  if (fileType === 'geo_data') {
+    return item.geometryType === 'sector' ? 'geo_sector' : 'geo_point'
+  }
+  if (fileType === 'full_params') return 'excel'
+  if (fileType === 'target_cells') return 'excel'
+  // 现网工参合并（中兴）产物按「现网工参」归类展示
+  if (fileType === 'merged_current_params') return 'current_params'
+  // 现网工参：网管导出包与图层文件同为 ZIP。包名以 BaselineLab 开头时以包名为准，
+  // 覆盖存量索引里被误标成 map_layer / 没有 fileType 的条目（桌面同步包、旧前端上传）。
+  if (fileType === 'current_params' || isCurrentParamsFilename(item.name)) return 'current_params'
+  // 图层文件：用户从「图层文件」入口上传（图层包 / MapInfo）
+  if (fileType === 'map_layer' || fileType === 'tac_layer' || fileType === 'mapinfo_layer') return 'layers'
+  if (item.type === 'excel') return 'excel'
+  // 历史条目没有导入路径：按内容兜底（map 类型默认图层文件）
+  if (item.type === 'map') return 'layers'
+  return 'archive'
+}
+
+/** 导入区上传类型 → 图标种类（与该类型导入后生成的条目图标一致） */
+const UPLOAD_ICON_KIND: Record<string, DataIconKind> = {
+  full_params: 'excel',
+  current_params: 'current_params',
+  map_layer: 'layers',
+  geo_data: 'geo_point',
+  station_params: 'station_params',
+  station_metrics: 'station_metrics',
+}
+
+/** 统一的图标渲染 */
+function DataIcon({ kind, size = 16 }: { kind: DataIconKind; size?: number }) {
+  const { Icon, color } = DATA_ICONS[kind]
+  return <Icon size={size} className={color} />
+}
+
+// ===== 已导入数据：按「导入数据」的六个入口分六大类 =====
+
+/** 六大类，顺序与「导入数据」框一致 */
+type DataGroupKey =
+  | 'full_params'
+  | 'current_params'
+  | 'map_layer'
+  | 'geo_data'
+  | 'station_params'
+  | 'station_metrics'
+
+interface DataGroupDef {
+  key: DataGroupKey
+  /** 分组标题的 i18n key */
+  labelKey: string
+  /** 中文兜底文案 */
+  label: string
+  /** 分组图标：与「导入数据」框中该入口的图标完全一致 */
+  icon: DataIconKind
+}
+
+/** 分组定义（标题 + 图标），图标直接复用导入区的种类映射 */
+export const DATA_GROUPS: DataGroupDef[] = [
+  { key: 'full_params', labelKey: 'data.fullParams', label: '全量工参', icon: UPLOAD_ICON_KIND.full_params },
+  { key: 'current_params', labelKey: 'data.currentParams', label: '现网工参', icon: UPLOAD_ICON_KIND.current_params },
+  { key: 'map_layer', labelKey: 'data.mapLayer', label: '图层文件', icon: UPLOAD_ICON_KIND.map_layer },
+  { key: 'geo_data', labelKey: 'data.geoData', label: '地理化数据', icon: UPLOAD_ICON_KIND.geo_data },
+  { key: 'station_params', labelKey: 'data.stationParamsLabel', label: '基站参数', icon: UPLOAD_ICON_KIND.station_params },
+  { key: 'station_metrics', labelKey: 'data.stationMetricsLabel', label: '基站指标', icon: UPLOAD_ICON_KIND.station_metrics },
+]
+
+/** 图标种类 → 六大类（图标种类已按导入路径判定，故分组口径与其天然一致） */
+const ICON_KIND_GROUP: Record<DataIconKind, DataGroupKey> = {
+  station_params: 'station_params',
+  station_metrics: 'station_metrics',
+  geo_point: 'geo_data',
+  geo_sector: 'geo_data',
+  excel: 'full_params',
+  layers: 'map_layer',
+  current_params: 'current_params',
+  archive: 'full_params',
+}
+
+/**
+ * 数据条目 → 六大类（优先按用户导入路径 fileType，历史条目按内容兜底）。
+ * 直接复用 dataItemIconKind 的判定，保证分类与「导入数据」框的图标口径完全一致。
+ */
+export function dataGroupKeyOf(item: DataItem): DataGroupKey {
+  return ICON_KIND_GROUP[dataItemIconKind(item)]
+}
+
+/** 把过滤后的文件按六大类归桶（保持原有列表顺序，空类也保留） */
+export function groupDataItems(items: DataItem[]): Map<DataGroupKey, DataItem[]> {
+  const groups = new Map<DataGroupKey, DataItem[]>()
+  DATA_GROUPS.forEach(g => groups.set(g.key, []))
+  items.forEach(item => {
+    groups.get(dataGroupKeyOf(item))!.push(item)
+  })
+  return groups
+}
 
 export function DataPage() {
   const { t } = useTranslation()
@@ -19,6 +157,8 @@ export function DataPage() {
   const permDelete = isAdmin || !!currentUser?.can_data_delete
   const permUpdate = isAdmin || !!currentUser?.can_data_update
   const permCellEntry = isAdmin || !!currentUser?.can_cell_entry
+  const permCellQueryUpdate = isAdmin || !!currentUser?.can_cell_query_update
+  const permAssistant = isAdmin || !!currentUser?.can_assistant
 
   const [selectedId, setSelectedId] = useState<string | null>(null)
 
@@ -30,9 +170,13 @@ export function DataPage() {
   const [selectedFullParamId, setSelectedFullParamId] = useState<string>('')
   const [selectedCurrentParamId, setSelectedCurrentParamId] = useState<string>('')
   const [updateSuccess, setUpdateSuccess] = useState<string | null>(null)
+  const [outputAllColumns, setOutputAllColumns] = useState(false)
 
   // 上传成功消息
   const [uploadSuccess, setUploadSuccess] = useState<string | null>(null)
+
+  // 上传失败详细错误（透传后端真实原因，不再只显示"上传失败"）
+  const [uploadError, setUploadError] = useState<string | null>(null)
 
   // 各上传项的状态
   const [uploadStatus, setUploadStatus] = useState<Record<string, 'idle' | 'success' | 'error'>>({
@@ -40,12 +184,14 @@ export function DataPage() {
     current_params: 'idle',
     map_layer: 'idle',
     geo_data: 'idle',
+    station_params: 'idle',
+    station_metrics: 'idle',
   })
 
   // 下载状态跟踪
   const downloadStore = useDownloadStore()
 
-  // 操作日志（持久化到 sessionStorage，退出登录/刷新页面时清除）
+  // 操作日志（模块级按账号分桶：页面切换保留、刷新后消失；同一设备切换/注册账号互不串日志）
   interface LogEntry {
     id: number
     time: string
@@ -56,19 +202,29 @@ export function DataPage() {
     // 用于去重覆盖的 key（同一操作的多次状态变更共用同一 key）
     opKey?: string
   }
-  // 模块级持久化存储（页面切换保留，刷新页面后自然消失）
-  const _store: { entries: LogEntry[]; id: number } = (window as any).__nptLog || ((window as any).__nptLog = { entries: [], id: 0 })
+  interface LogBucket { entries: LogEntry[]; id: number }
+  const _buckets: Record<string, LogBucket> =
+    (window as any).__nptLogByUser || ((window as any).__nptLogByUser = {})
 
-  const [logs, setLogs] = useState<LogEntry[]>(_store.entries)
-  const LOG_STORAGE_KEY = 'npt_operation_logs'
+  // 按当前账号取桶；addLog 经 ref 读取，保证换账号后闭包指向新账号的桶
+  const logUsername = currentUser?.username || '__anonymous__'
+  const currentBucket = () => _buckets[logUsername] || (_buckets[logUsername] = { entries: [], id: 0 })
+  const bucketRef = useRef<LogBucket>(currentBucket())
+  bucketRef.current = currentBucket()
+
+  const [logs, setLogs] = useState<LogEntry[]>(() => [...bucketRef.current.entries])
   const logEndRef = useRef<HTMLDivElement>(null)
 
-  // 退出登录时清除日志
+  // 账号变化（含同一设备注册新用户）时切到该账号自己的日志桶
+  useEffect(() => {
+    setLogs([...bucketRef.current.entries])
+  }, [logUsername])
+
+  // 退出登录时清空当前账号日志（事件由 authStore.logout 派发）
   useEffect(() => {
     const handleLogout = () => {
-      _store.entries = []
+      bucketRef.current.entries = []
       setLogs([])
-      try { sessionStorage.removeItem(LOG_STORAGE_KEY) } catch {}
     }
     window.addEventListener('auth:logout', handleLogout)
     return () => window.removeEventListener('auth:logout', handleLogout)
@@ -84,11 +240,12 @@ export function DataPage() {
     const now = new Date()
     const pad = (n: number) => String(n).padStart(2, '0')
     const time = `${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`
-    _store.id += 1
-    const entry: LogEntry = { id: _store.id, time, type, message, status, detail, opKey }
+    const store = bucketRef.current
+    store.id += 1
+    const entry: LogEntry = { id: store.id, time, type, message, status, detail, opKey }
 
-    // 直接在模块级数组上操作，避免 React 闭包问题
-    const arr = _store.entries
+    // 直接在当前账号的桶上操作，避免 React 闭包问题
+    const arr = store.entries
     let replaced = false
     if (opKey && arr.length > 0) {
       for (let i = arr.length - 1; i >= 0; i--) {
@@ -138,9 +295,16 @@ export function DataPage() {
     }
 
     window.addEventListener(DATA_REFRESH_EVENT, handleDataRefresh)
+    // 桌面端共享模式同步落地后刷新：避免正在用的数据仍是旧版本
+    const handleDesktopSynced = () => {
+      console.log('[DataPage] 桌面端同步完成，正在刷新列表...')
+      fetchList(1, 50, true)
+    }
+    window.addEventListener(DESKTOP_SYNCED_EVENT, handleDesktopSynced)
 
     return () => {
       window.removeEventListener(DATA_REFRESH_EVENT, handleDataRefresh)
+      window.removeEventListener(DESKTOP_SYNCED_EVENT, handleDesktopSynced)
     }
   }, [])
 
@@ -160,12 +324,60 @@ export function DataPage() {
 
   const isDesktop = !!(window as any).electronAPI
 
+  const [stationBusy, setStationBusy] = useState('')
+
+  // 网优助手基站参数/指标导入（独立端点，后台解析后刷新列表）
+  const handleStationUpload = async (e: React.ChangeEvent<HTMLInputElement>, dataType: 'station_params' | 'station_metrics') => {
+    const file = e.target.files?.[0]
+    e.target.value = ''
+    if (!file) return
+    const label = dataType === 'station_params'
+      ? t('data.stationParamsLabel')
+      : t('data.stationMetricsLabel')
+    addLog('upload', t('data.stationUploadStart', { label, name: file.name }),
+      'running', undefined, `upload:${file.name}`)
+    setStationBusy(dataType)
+    setUploadStatus(prev => ({ ...prev, [dataType]: 'idle' }))
+    try {
+      const res: any = await assistantApi.uploadDataset(file, dataType)
+      const pollKey = res.pollKey || file.name
+      const timer = setInterval(async () => {
+        const st: any = await assistantApi.uploadStatus(pollKey)
+        if (st.status === 'ready' || st.status === 'error') {
+          clearInterval(timer)
+          setStationBusy('')
+          if (st.status === 'error') {
+            setUploadStatus(prev => ({ ...prev, [dataType]: 'error' }))
+            const failure = t('data.stationParseFailed', { label, error: st.error })
+            addLog('upload', failure, 'error', undefined, `upload:${file.name}`)
+            alert(failure)
+          } else {
+            setUploadStatus(prev => ({ ...prev, [dataType]: 'success' }))
+            setTimeout(() => setUploadStatus(prev => ({ ...prev, [dataType]: 'idle' })), 3000)
+            addLog('upload', t('data.stationImported', { label, name: file.name }),
+              'success', undefined, `upload:${file.name}`)
+          }
+          await indexedDBService.delete('data_list_cache')
+          fetchList(1, 50, true)
+          triggerDataRefresh()
+        }
+      }, 1500)
+    } catch (err: any) {
+      setStationBusy('')
+      setUploadStatus(prev => ({ ...prev, [dataType]: 'error' }))
+      const detail = err?.response?.data?.detail || err.message
+      const failure = t('data.stationUploadFailed', { label, error: detail })
+      addLog('upload', failure, 'error', undefined, `upload:${file.name}`)
+      alert(failure)
+    }
+  }
+
   const handleDownloadTemplate = async (templateType: 'full_params' | 'target_cells' | 'geo_data') => {
     try {
       // 确定下载文件名
       let filename: string
       if (templateType === 'full_params') {
-        filename = 'ProjectParameter_mongoose.xlsx'
+        filename = 'ProjectParameter.xlsx'
       } else if (templateType === 'target_cells') {
         filename = 'cell-tree-export.xlsx'
       } else if (templateType === 'geo_data') {
@@ -234,6 +446,16 @@ export function DataPage() {
     const files = Array.from(event.target.files || [])
     if (files.length === 0) return
 
+    // 全量工参文件名契约：必须以 ProjectParameter 开头（后端同样强校验）
+    if (context === 'full_params') {
+      const invalid = files.find(f => !f.name.toLowerCase().startsWith('projectparameter'))
+      if (invalid) {
+        event.target.value = ''
+        alert(`${t('data.invalidFullParamsName') || '文件名不符合规范：全量工参文件名必须以 "ProjectParameter" 开头，请下载最新模板并保持模板文件名前缀不变。'}\n\n${invalid.name}`)
+        return
+      }
+    }
+
     // 详尽日志
     console.log('[Upload] Starting upload process')
     console.log('[Upload] Mode:', isDesktop ? 'Desktop' : 'Web Browser')
@@ -243,41 +465,95 @@ export function DataPage() {
     const fileNames = files.map(f => f.name).join(', ')
     addLog('upload', `开始${context === 'geo_data' ? '地理化' : context === 'full_params' ? '全量工参' : context === 'current_params' ? '现网工参' : context === 'map_layer' ? '图层' : ''}上传: ${fileNames}`, 'running', undefined, `upload:${fileNames}`)
 
-    // 根据类型选择上传函数
-    let uploadFn
-    if (context === 'geo_data') {
-      uploadFn = uploadGeoData
-    } else {
-      uploadFn = type === 'excel' ? uploadExcel : uploadMap
+    // 按类型选择上传函数：
+    // - 地理化数据 → uploadGeoData(file, filePath)
+    // - Excel 类（全量工参）→ uploadExcel(file, context)
+    // - 地图类（图层文件 / 现网工参，均为 ZIP 等）→ uploadMap(file, filePath, extraFiles, context)
+    //   地图类必须带上「用户导入路径」：后端据此把条目标记为 map_layer / current_params，
+    //   「已导入数据」列表才能按导入路径渲染对应类型图标
+    const uploadOne = async (file: File, filePath?: string, extraFiles?: File[]) => {
+      if (context === 'geo_data') return uploadGeoData(file, filePath)
+      if (type === 'excel') return uploadExcel(file, context)
+      return uploadMap(file, filePath, extraFiles, context)
     }
 
     // 设置上传状态为进行中
     setUploadStatus(prev => ({ ...prev, [context]: 'idle' }))
 
-    // 多选文件上传逻辑（仅用于图层文件）
+    // 多选文件上传逻辑
     if (files.length > 1) {
-      console.log('[Upload] Multiple files detected, processing sequentially')
-      let allSuccess = true
+      console.log('[Upload] Multiple files detected')
 
-      for (const file of files) {
-        let filePath = (file as any).path
-
-        if (!filePath && (window as any).electronAPI?.getFilePath) {
+      // 辅助：获取文件的本地真实路径（Electron），后端据此在源文件夹查找关联文件
+      const resolvePath = async (f: File): Promise<string | undefined> => {
+        let p = (f as any).path
+        if (!p && (window as any).electronAPI?.getFilePath) {
           try {
-            filePath = await (window as any).electronAPI.getFilePath(file)
+            p = await (window as any).electronAPI.getFilePath(f)
           } catch (e) {
             console.error('[Upload] Error getting path:', e)
           }
         }
+        return p || undefined
+      }
 
-        console.log('[Upload] Path Captured:', filePath || 'NULL (Browser Restriction)')
+      // 图层文件（map_layer）：按 stem 分组，主文件 + 配套文件一次上传
+      // （浏览器模式无真实路径时，配套的 .dat/.mid/.map/.id、.shx/.dbf/.prj/.qml
+      //   需与主文件一起选中上传）
+      const MAP_MAIN_RANK = ['.shp', '.tab', '.kml', '.geojson', '.json', '.mif', '.dat', '.zip']
+      let allSuccess = true
 
-        // 修复：uploadExcel/uploadMap 的第二个参数是 context，不是 filePath
-        const success = context === 'geo_data'
-          ? await uploadFn(file, filePath || undefined)
-          : await uploadFn(file, context)
-        if (!success) {
-          allSuccess = false
+      if (context === 'map_layer') {
+        const groups = new Map<string, { main?: File; companions: File[] }>()
+        for (const f of files) {
+          const ext = ('.' + (f.name.split('.').pop() || '').toLowerCase())
+          const stem = f.name.replace(/\.\w+$/, '').toLowerCase()
+          if (!groups.has(stem)) groups.set(stem, { companions: [] })
+          const g = groups.get(stem)!
+          const rank = MAP_MAIN_RANK.indexOf(ext)
+          const curRank = g.main ? MAP_MAIN_RANK.indexOf('.' + (g.main.name.split('.').pop() || '').toLowerCase()) : -1
+          if (!g.main || (rank !== -1 && (curRank === -1 || rank < curRank))) {
+            if (g.main) g.companions.push(g.main)
+            g.main = f
+          } else {
+            g.companions.push(f)
+          }
+        }
+        for (const [, g] of groups) {
+          const main = g.main || g.companions[0]
+          if (!main) continue
+          const comps = g.companions.filter(c => c !== main)
+          const filePath = await resolvePath(main)
+          console.log('[Upload] Path Captured:', filePath || 'NULL (Browser Restriction)')
+          try {
+            const ok = await uploadOne(main, filePath, comps.length > 0 ? comps : undefined)
+            allSuccess = allSuccess && ok
+          } catch (err: any) {
+            allSuccess = false
+            const errMsg = err?.message || '上传失败'
+            console.error('[Upload] 上传异常:', err)
+            setUploadError(errMsg)
+            setTimeout(() => setUploadError(null), 8000)
+          }
+        }
+      } else {
+        // 其他上下文：逐个上传（传真实路径，后端用于查找关联文件）
+        for (const file of files) {
+          const filePath = await resolvePath(file)
+          console.log('[Upload] Path Captured:', filePath || 'NULL (Browser Restriction)')
+          let success: boolean
+          try {
+            success = await uploadOne(file, filePath || undefined)
+          } catch (err: any) {
+            success = false
+            const errMsg = err?.message || '上传失败'
+            console.error('[Upload] 上传异常:', err)
+            setUploadError(errMsg)
+            setTimeout(() => setUploadError(null), 8000)
+          }
+          if (!success) {
+            allSuccess = false
+          }
         }
       }
 
@@ -314,10 +590,19 @@ export function DataPage() {
 
       console.log('[Upload] Path Captured:', filePath || 'NULL (Browser Restriction)')
 
-      // 修复：uploadExcel/uploadMap 的第二个参数是 context，不是 filePath
-      const success = context === 'geo_data'
-        ? await uploadFn(file, filePath || undefined)
-        : await uploadFn(file, context)
+      // 传真实文件路径给后端（Electron 桌面模式可据此在源文件夹查找 tab/mif 的关联文件）；
+      // 浏览器模式 filePath 为 undefined，后端回退到仅上传的文件
+      // 捕获 chunkedUpload 抛出的具体错误（如"坐标验证失败"），透传到前端
+      let success: boolean
+      try {
+        success = await uploadOne(file, filePath || undefined)
+      } catch (err: any) {
+        success = false
+        const errMsg = err?.message || '上传失败'
+        console.error('[Upload] 上传异常:', err)
+        setUploadError(errMsg)
+        setTimeout(() => setUploadError(null), 8000)
+      }
       if (success) {
         event.target.value = ''
         setUploadStatus(prev => ({ ...prev, [context]: 'success' }))
@@ -369,8 +654,11 @@ export function DataPage() {
         const url = `/api/v1/data/${item.id}/download`
         const filename = item.name || 'download'
 
-        // 使用 fetch + stream reader 追踪下载进度
-        const response = await fetch(url)
+        // 使用 fetch + stream reader 追踪下载进度（组门禁端点必须携带登录 token）
+        const downloadHeaders: Record<string, string> = {}
+        const downloadToken = getStoredAuthToken()
+        if (downloadToken) downloadHeaders.Authorization = `Bearer ${downloadToken}`
+        const response = await fetch(url, { headers: downloadHeaders })
         if (!response.ok) throw new Error(`HTTP ${response.status}`)
 
         const contentLength = response.headers.get('content-length')
@@ -540,13 +828,44 @@ export function DataPage() {
     }
   }
 
+  // 文件名模糊搜索（大小写不敏感）；无关键字时返回全部
+  const [fileSearch, setFileSearch] = useState('')
+  const filteredItems = useMemo(() => {
+    const kw = fileSearch.trim().toLowerCase()
+    if (!kw) return items
+    return items.filter(item => item.name?.toLowerCase().includes(kw))
+  }, [items, fileSearch])
+
+  // 六大类分组：默认全部展开；搜索时自动展开有匹配文件的类，避免结果被折叠藏起来
+  const [collapsedGroups, setCollapsedGroups] = useState<Set<DataGroupKey>>(new Set())
+  const groupedItems = useMemo(() => groupDataItems(filteredItems), [filteredItems])
+  const isGroupCollapsed = useCallback((key: DataGroupKey) => {
+    if (fileSearch.trim()) return false
+    return collapsedGroups.has(key)
+  }, [collapsedGroups, fileSearch])
+  const toggleGroup = useCallback((key: DataGroupKey) => {
+    setCollapsedGroups(prev => {
+      const next = new Set(prev)
+      if (next.has(key)) next.delete(key)
+      else next.add(key)
+      return next
+    })
+  }, [])
+
+  // 全选作用于当前过滤结果（搜索后批量操作不会误删看不到的文件）
   const toggleSelectAll = useCallback(() => {
-    if (selectedIds.size === items.length) {
-      setSelectedIds(new Set())
-    } else {
-      setSelectedIds(new Set(items.map(item => item.id)))
-    }
-  }, [selectedIds.size, items])
+    const allFilteredSelected =
+      filteredItems.length > 0 && filteredItems.every(item => selectedIds.has(item.id))
+    setSelectedIds(prev => {
+      const next = new Set(prev)
+      if (allFilteredSelected) {
+        filteredItems.forEach(item => next.delete(item.id))
+      } else {
+        filteredItems.forEach(item => next.add(item.id))
+      }
+      return next
+    })
+  }, [filteredItems, selectedIds])
 
   const toggleSelectItem = useCallback((id: string, e: React.MouseEvent) => {
     e.stopPropagation()
@@ -561,7 +880,7 @@ export function DataPage() {
     })
   }, [])
 
-  const allSelected = items.length > 0 && selectedIds.size === items.length
+  const allSelected = filteredItems.length > 0 && filteredItems.every(item => selectedIds.has(item.id))
   const hasSyncingItems = items.some(item => item.excelSynced === false || (item.inplaceUpdated && item.excelSynced === undefined))
 
   const handleUpdateParameters = async () => {
@@ -574,7 +893,7 @@ export function DataPage() {
      let lastLogCount = 0
 
      try {
-         const result = await updateParameters(selectedFullParamId, selectedCurrentParamId)
+         const result = await updateParameters(selectedFullParamId, selectedCurrentParamId, outputAllColumns)
          console.log('Update parameters result:', result);
 
          // 获取 taskId 用于轮询后端终端日志
@@ -606,6 +925,18 @@ export function DataPage() {
          const newFileId = result?.data?.newFileId;
          const newFileName = result?.data?.newFileName;
          const savedToOriginal = result?.data?.savedToOriginal;
+         // 合并统计（LTE/NR 匹配与新增行数）：让用户直观看到"确实更新进去了多少"
+         const stats = result?.data?.stats as Record<string, { matched?: number; appended?: number }> | null;
+         const statsLine = stats
+             ? Object.entries(stats)
+                 .map(([net, s]) => t('data.updateStatsNet', {
+                     net,
+                     matched: s?.matched ?? 0,
+                     appended: s?.appended ?? 0,
+                     defaultValue: `${net} 匹配 {{matched}} 行/新增 {{appended}} 行`,
+                 }))
+                 .join('，')
+             : '';
 
          // 轮询刷新列表，最多重试 5 次，确保新文件出现
          let newFileFound = false;
@@ -621,6 +952,14 @@ export function DataPage() {
          }
 
          if (result?.success || newFileFound) {
+             const statsSuffix = statsLine ? `\n${t('data.updateStatsSummary', { stats: statsLine, defaultValue: `更新统计：{{stats}}` })}` : ''
+             const dataset = result?.data?.dataset as { name: string; sheets: Array<{ name: string; rows: number; matched: number }> } | null | undefined
+             const mergeSummary = dataset
+                 ? dataset.sheets.map(s => `${s.name}（${s.rows} 行，匹配 ${s.matched} 行）`).join('；')
+                 : ''
+             const datasetSuffix = dataset
+                 ? `\n${t('data.zteMergeSuccess') || '现网工参合并完成'}：${dataset.name}${mergeSummary ? `（${mergeSummary}）` : ''}`
+                 : ''
              if (savedToOriginal && newFileName) {
                  // 从列表中查找具有 originalPath 的文件以构造完整路径
                  const items = useDataStore.getState().items;
@@ -628,20 +967,20 @@ export function DataPage() {
                  if (matchedFile?.originalPath) {
                      const originalDir = matchedFile.originalPath.substring(0, matchedFile.originalPath.lastIndexOf('\\') + 1);
                      const fullPath = `${originalDir}${newFileName}`;
-                     setUpdateSuccess(`${t('data.updateSuccess') || '更新成功'}！${t('data.savedTo') || '已保存至：'}\n${fullPath}`)
-                 } else if (matchedFile?.originalPath) {
-                     setUpdateSuccess(`${t('data.updateSuccess') || '更新成功'}！${t('data.savedToSystemNoPath') || '文件已保存在系统内 (由于未记录原路径，无法写回原文件夹)，请手动下载。'}`)
-                 } else {
-                     setUpdateSuccess(`${t('data.updateSuccess') || '更新成功'}！${t('data.savedToSystem') || '文件已保存在系统内，请手动下载。'}`)
-                 }
-             } else {
-                 setUpdateSuccess(`${t('data.updateSuccess') || '更新成功'}！${t('data.savedToSystem') || '文件已保存在系统内，请手动下载。'}`)
-             }
+                     setUpdateSuccess(`${t('data.updateSuccess') || '更新成功'}！${t('data.savedTo') || '已保存至：'}\n${fullPath}${statsSuffix}${datasetSuffix}`)
+                     } else {
+                     setUpdateSuccess(`${t('data.updateSuccess') || '更新成功'}！${t('data.savedToSystem') || '文件已保存在系统内，请手动下载。'}${statsSuffix}${datasetSuffix}`)
+                     }
+                     } else {
+                     setUpdateSuccess(`${t('data.updateSuccess') || '更新成功'}！${t('data.savedToSystem') || '文件已保存在系统内，请手动下载。'}${statsSuffix}${datasetSuffix}`)
+                     }
 
+             // 同一后端任务内已完成的 4G/5G 现网工参合并结果
+             await fetchList(1, 50, true)
              setSelectedFullParamId('')
              setSelectedCurrentParamId('')
              addLog('update', '工参更新完成', 'success', newFileName || '', 'update:params')
-         } else {
+             } else {
              // 更新失败（后端返回错误状态且列表中也未找到新文件）
              throw new Error(result?.message || t('data.updateFailed') || '工参更新失败')
          }
@@ -683,27 +1022,45 @@ export function DataPage() {
 
   return (
     <div className="p-8">
-      <div className="flex justify-between items-center mb-8">
-        <h1 className="text-base font-bold">{t('data.title')}</h1>
+      <div className="flex justify-between items-center mb-2">
+        <h1 className="text-base font-bold flex items-center gap-2">
+          <Database size={20} className="text-primary" />
+          {t('data.title')}
+        </h1>
       </div>
 
-      {/* 错误提示 */}
+      {/* 错误提示：完整展示后端返回的具体原因，便于用户修改源文件后重新导入 */}
       {error && (
-        <div className="mb-6 p-4 bg-red-50 border border-red-200 rounded-lg flex items-center gap-3 text-red-700">
-          <AlertCircle size={20} />
-          <span>{error}</span>
-          <button onClick={() => fetchList(1, 50, true)} className="ml-auto text-sm underline">{t('data.retry') || '重试'}</button>
+        <div className="mb-6 p-4 bg-red-500/10 border border-red-500/20 rounded-lg flex items-start gap-3 text-red-400">
+          <AlertCircle size={20} className="shrink-0 mt-0.5" />
+          <div className="flex-1 min-w-0 space-y-1">
+            <div className="text-sm font-medium">{t('data.uploadFailed') || '上传失败'}</div>
+            <div className="text-xs font-mono whitespace-pre-wrap break-words">{error}</div>
+            <div className="text-xs text-red-400/80">
+              {t('data.importFailedHint') || '若为文件内容问题，请按上述原因修改源文件后重新导入'}
+            </div>
+          </div>
+          <div className="flex items-center gap-2 shrink-0">
+            <button onClick={() => fetchList(1, 50, true)} className="text-sm underline">{t('data.retry') || '重试'}</button>
+            <button
+              onClick={() => useDataStore.setState({ error: null })}
+              className="p-1 rounded-full hover:bg-red-500/20 transition-colors"
+              aria-label={t('data.close') || '关闭'}
+            >
+              ✕
+            </button>
+          </div>
         </div>
       )}
       
       {/* 成功提示 */}
       {updateSuccess && (
-        <div className="mb-6 p-4 bg-green-50 border border-green-200 rounded-lg flex items-center gap-3 text-green-700 whitespace-pre-wrap">
+        <div className="mb-6 p-4 bg-green-500/10 border border-green-500/20 rounded-lg flex items-center gap-3 text-green-400 whitespace-pre-wrap">
           <CheckCircle2 size={20} className="shrink-0" />
           <span className="flex-grow">{updateSuccess}</span>
           <button
             onClick={() => setUpdateSuccess(null)}
-            className="text-green-700 hover:text-green-900 transition-colors duration-200 p-1 hover:bg-green-100 rounded-full"
+            className="text-green-400 hover:text-green-300 transition-colors duration-200 p-1 hover:bg-green-500/20 rounded-full"
             aria-label={t('data.close') || '关闭'}
           >
             ✕
@@ -713,12 +1070,12 @@ export function DataPage() {
 
       {/* 上传成功提示 */}
       {uploadSuccess && (
-        <div className="mb-6 p-4 bg-purple-50 border border-purple-200 rounded-lg flex items-center gap-3 text-purple-700">
+        <div className="mb-6 p-4 bg-primary/10 border border-primary/20 rounded-lg flex items-center gap-3 text-primary">
           <CheckCircle2 size={20} className="shrink-0" />
           <span className="flex-grow">{uploadSuccess}</span>
           <button
             onClick={() => setUploadSuccess(null)}
-            className="text-purple-700 hover:text-purple-900 transition-colors duration-200 p-1 hover:bg-purple-100 rounded-full"
+            className="text-primary hover:text-primary/80 transition-colors duration-200 p-1 hover:bg-primary/20 rounded-full"
             aria-label={t('data.close') || '关闭'}
           >
             ✕
@@ -726,11 +1083,27 @@ export function DataPage() {
         </div>
       )}
 
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
-        <div className="space-y-8">
+      {/* 上传失败详细错误提示（透传后端真实原因） */}
+      {uploadError && (
+        <div className="mb-6 p-4 bg-red-500/10 border border-red-500/20 rounded-lg flex items-center gap-3 text-red-400">
+          <AlertCircle size={20} className="shrink-0" />
+          <span className="flex-grow whitespace-pre-wrap">{uploadError}</span>
+          <button
+            onClick={() => setUploadError(null)}
+            className="text-red-400 hover:text-red-300 transition-colors duration-200 p-1 hover:bg-red-500/20 rounded-full"
+            aria-label={t('data.close') || '关闭'}
+          >
+            ✕
+          </button>
+        </div>
+      )}
+
+      {/* 左列两张卡片决定行高；右列卡片贴满同一行高，文件列表拉伸填满卡片剩余空间 */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-2 items-stretch">
+        <div className="flex flex-col gap-2 min-w-0">
             {/* 文件上传 */}
             <div className="bg-card p-3 rounded-lg border border-border">
-            <h2 className="text-base font-semibold mb-2">{t('data.importData') || '导入数据'}</h2>
+            <h2 data-guide="data-import-to-map" className="text-base font-semibold mb-2">{t('data.importData') || '导入数据'}</h2>
             {!permImport && (
               <p className="text-xs text-muted-foreground mb-2 bg-muted/40 px-2 py-1 rounded">
                 {t('data.noPermission', '无权限，请联系管理员')}
@@ -745,7 +1118,7 @@ export function DataPage() {
                             accept=".xlsx,.xls"
                             onUpload={(e) => handleFileUpload(e, 'excel', 'full_params')}
                             loading={loading && uploadingType === 'full_params'}
-                            icon={<FileSpreadsheet size={20} />}
+                            icon={<DataIcon kind={UPLOAD_ICON_KIND.full_params} size={20} />}
                             inline={true}
                             status={uploadStatus.full_params}
                         />
@@ -753,11 +1126,11 @@ export function DataPage() {
                     <div className="w-24">
                         <button
                             onClick={() => handleDownloadTemplate('full_params')}
-                            className="w-full px-2 py-1.5 bg-blue-500 text-white rounded text-xs hover:bg-blue-600 disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-1"
+                            className="w-full px-2 py-1.5 rounded text-xs text-primary hover:bg-primary/10 disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-1"
                             title={t('data.downloadTemplate') || '下载全量工参模板'}
                         >
                             <FileDown size={12} />
-                            <span>{t('data.template') || '模板'}</span>
+                            <span>{t('data.downloadTemplate') || '下载模板'}</span>
                         </button>
                     </div>
                 </div>
@@ -768,7 +1141,7 @@ export function DataPage() {
                             accept=".zip"
                             onUpload={(e) => handleFileUpload(e, 'map', 'current_params')}
                             loading={loading && uploadingType === 'current_params'}
-                            icon={<Upload size={20} />}
+                            icon={<DataIcon kind={UPLOAD_ICON_KIND.current_params} size={20} />}
                             inline={true}
                             description={t('data.currentParamsDesc') || '中兴网管300脚本导出数据'}
                             status={uploadStatus.current_params}
@@ -782,14 +1155,14 @@ export function DataPage() {
                     <div className="flex-1">
                         <UploadArea
                             title={t('data.mapLayer') || '图层文件'}
-                            accept=".zip,.tab,.mif"
+                            accept=".zip,.tab,.mif,.kml,.shp,.shx,.dbf,.prj,.cpg,.qml,.geojson,.json"
                             onUpload={(e) => handleFileUpload(e, 'map', 'map_layer')}
                             loading={loading && uploadingType === 'map_layer'}
-                            icon={<Layers size={20} />}
+                            icon={<DataIcon kind={UPLOAD_ICON_KIND.map_layer} size={20} />}
                             multiple={true}
                             inline={true}
                             status={uploadStatus.map_layer}
-                            description={t('data.mapLayerDesc') || '支持ZIP/TAB/MIF，TAB需配套DAT文件'}
+                            hint={t('data.mapLayerHint') || '点击上传支持 TAB/MIF/KML/SHP/GeoJSON'}
                         />
                     </div>
                     <div className="w-24">
@@ -803,7 +1176,7 @@ export function DataPage() {
                             accept=".xlsx,.xls,.csv,.txt"
                             onUpload={(e) => handleFileUpload(e, 'excel', 'geo_data')}
                             loading={loading && uploadingType === 'geo_data'}
-                            icon={<MapPin size={20} className="text-purple-600" />}
+                            icon={<DataIcon kind={UPLOAD_ICON_KIND.geo_data} size={20} />}
                             description={t('data.geoDataDesc') || '自动识别点状/扇区'}
                             inline={true}
                             status={uploadStatus.geo_data}
@@ -813,78 +1186,163 @@ export function DataPage() {
                     <div className="w-24">
                         <button
                             onClick={() => handleDownloadTemplate('geo_data')}
-                            className="w-full px-2 py-1.5 bg-blue-500 text-white rounded text-xs hover:bg-blue-600 disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-1"
+                            className="w-full px-2 py-1.5 rounded text-xs text-primary hover:bg-primary/10 disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-1"
                             title={t('data.downloadTemplate') || '下载模板'}
                         >
                             <FileDown size={12} />
-                            <span>{t('data.template') || '模板'}</span>
+                            <span>{t('data.downloadTemplate') || '下载模板'}</span>
                         </button>
                     </div>
                 </div>
             </div>
-            </div>
 
-            {/* 工参更新 */}
-            <div className={`bg-card p-3 rounded-lg border border-border -mt-6 ${permUpdate ? '' : 'opacity-50 pointer-events-none'}`}>
-                <h2 className="text-base font-semibold mb-2">{t('data.updateParameters') || '工参更新'}</h2>
-                {!permUpdate && (
-                  <p className="text-xs text-muted-foreground mb-2 bg-muted/40 px-2 py-1 rounded">
-                    {t('data.noPermission', '无权限，请联系管理员')}
-                  </p>
-                )}
-                <div className="flex items-end gap-2">
-                  <div className="flex-1 min-w-0">
-                    <select
-                        className="w-full p-2 border rounded-md bg-background text-sm mb-2"
-                        value={selectedFullParamId}
-                        onChange={(e) => setSelectedFullParamId(e.target.value)}
-                        title={t('data.selectFullParams') || '选择全量工参'}
-                    >
-                        <option value="" disabled>{t('data.selectFullParams') || '选择全量工参'}</option>
-                        {fullParamFiles.map(f => (
-                            <option key={f.id} value={f.id}>
-                                {f.name} {f.originalPath ? '✓' : `(${t('data.noPath') || '无路径'})`}
-                            </option>
-                        ))}
-                    </select>
-                    <select
-                        className="w-full p-2 border rounded-md bg-background text-sm"
-                        value={selectedCurrentParamId}
-                        onChange={(e) => setSelectedCurrentParamId(e.target.value)}
-                        title={t('data.selectCurrentParams') || '选择现网工参 (ZIP)'}
-                    >
-                        <option value="" disabled>{t('data.selectCurrentParams') || '选择现网工参 (ZIP)'}</option>
-                        {currentParamFiles.map(f => (
-                            <option key={f.id} value={f.id}>{f.name}</option>
-                        ))}
-                    </select>
-                  </div>
-                  <button
-                      onClick={handleUpdateParameters}
-                      disabled={isUpdating || !selectedFullParamId || !selectedCurrentParamId}
-                      className="shrink-0 h-[calc(2.25rem*2+0.5rem)] px-3 bg-blue-400 text-white rounded-md hover:bg-blue-500 disabled:opacity-50 disabled:cursor-not-allowed flex flex-col items-center justify-center gap-0.5 text-xs font-medium transition-colors"
-                  >
-                      {isUpdating ? <Loader2 className="animate-spin" size={16} /> : <RefreshCw size={16} />}
-                      {isUpdating ? (t('data.updating') || '更新中') : (t('data.startUpdate') || '开始更新')}
-                  </button>
+            {/* 网优助手数据集（基站参数/指标）：独立于数据导入权限，由网优助手功能权限控制 */}
+            {!permAssistant && (
+              <p className="text-xs text-muted-foreground mt-2 bg-muted/40 px-2 py-1 rounded">
+                {t('data.noPermission', '无权限，请联系管理员')}
+              </p>
+            )}
+            <div className={`space-y-2 mt-2 ${permAssistant ? '' : 'opacity-50 pointer-events-none'}`}>
+                {/* 网优助手：基站参数（无线参数） */}
+                <div className="flex items-center gap-2">
+                    <div className="flex-1">
+                        <UploadArea
+                            title={t('data.stationParams') || '基站参数（网优助手）'}
+                            accept=".xlsx,.xls,.csv,.txt"
+                            onUpload={(e) => handleStationUpload(e, 'station_params')}
+                            loading={stationBusy === 'station_params'}
+                            icon={<DataIcon kind={UPLOAD_ICON_KIND.station_params} size={20} />}
+                            description={t('data.stationParamsDesc') || '网管小区无线参数，供网优助手对话查询'}
+                            inline={true}
+                            status={uploadStatus.station_params}
+                        />
+                    </div>
+                    <div className="w-24" />
+                </div>
+                {/* 网优助手：基站指标 */}
+                <div className="flex items-center gap-2">
+                    <div className="flex-1">
+                        <UploadArea
+                            title={t('data.stationMetrics') || '基站指标（网优助手）'}
+                            accept=".xlsx,.xls,.csv,.txt"
+                            onUpload={(e) => handleStationUpload(e, 'station_metrics')}
+                            loading={stationBusy === 'station_metrics'}
+                            icon={<DataIcon kind={UPLOAD_ICON_KIND.station_metrics} size={20} />}
+                            description={t('data.stationMetricsDesc') || '中兴指标(月/天/小时/忙时)，含小区名与时间列'}
+                            inline={true}
+                            status={uploadStatus.station_metrics}
+                        />
+                    </div>
+                    <div className="w-24" />
                 </div>
             </div>
+            </div>
 
-            {/* 新站录入 */}
-            <NewCellEntryCard
-                fullParamFiles={fullParamFiles}
-                addLog={addLog}
-                disabled={!permCellEntry}
+            {/* 导入提醒（工参/地理化数据：重复列名、坐标缺失/为 0 等，数据已导入，仅提示修正源文件） */}
+            {(() => {
+              const warnedFiles = items
+                .map(item => ({ item, warnings: (item.metadata?.importWarnings || []) as ImportWarning[] }))
+                .filter(({ warnings }) => warnings.length > 0)
+              if (warnedFiles.length === 0) return null
+              return (
+                <div className="px-3 py-2 bg-amber-500/10 border border-amber-500/20 rounded-lg text-xs text-warning-foreground">
+                  {warnedFiles.map(({ item, warnings }, fileIndex) => (
+                    <div key={item.id} className={fileIndex > 0 ? 'mt-2' : ''}>
+                      <div className="flex items-center gap-2 font-medium">
+                        <AlertCircle size={14} className="shrink-0" />
+                        <span>{formatImportWarningTitle(item.fileType, item.name, t)}</span>
+                      </div>
+                      <div className="mt-1 ml-6 space-y-0.5">
+                        {warnings.map((w, i) => (
+                          <div key={i}>
+                            {formatImportWarning(w, t)}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+                  <div className="mt-1 ml-6">{t('data.importWarnHint') || '请核对源文件，如有问题修改后重新导入即可（现有数据可正常使用）'}</div>
+                </div>
+              )
+            })()}
+
+            {/* 全量工参导入重复行提示（LTE=基站_小区、NR=MCC_MNC_基站_小区 唯一键检测） */}
+            {(() => {
+              const dupNets = fullParamFiles
+                .map(f => f.metadata?.duplicateReport)
+                .filter(Boolean)
+                .flatMap(r => Object.entries(r as Record<string, any>))
+                .filter(([, v]: [string, any]) => (v?.groups ?? 0) > 0) as Array<[string, { groups: number; extra: number; samples: Array<{ cellName: string; siteId: string; cellId: string; mcc?: string; mnc?: string }> }]>
+              if (dupNets.length === 0) return null
+              const samples = dupNets
+                .flatMap(([net, v]) => (v.samples || []).map(s => ({ net, ...s })))
+                .slice(0, 8)
+              return (
+                <div className="px-3 py-2 bg-amber-500/10 border border-amber-500/20 rounded-lg text-xs text-warning-foreground">
+                  <div className="flex items-center gap-2 font-medium">
+                    <AlertCircle size={14} className="shrink-0" />
+                    <span>{t('data.dupReportTitle') || '全量工参检测到重复小区行'}</span>
+                  </div>
+                  <div className="mt-1 ml-6 space-y-0.5">
+                    {dupNets.map(([net, v]) => (
+                      <div key={net}>
+                        [{net}] {t('data.dupReportNet', { groups: v.groups, extra: v.extra }) || `${v.groups} 组重复（多 ${v.extra} 行）`}
+                      </div>
+                    ))}
+                    {samples.length > 0 && (
+                      <div className="text-muted-foreground">
+                        {samples.map((s, i) => (
+                          <span key={i} className="inline-block mr-3">
+                            {s.cellName || '-'}（{s.net}{s.mcc ? ` ${s.mcc}-${s.mnc}` : ''} {s.siteId}_{s.cellId}）
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                    <div>{t('data.dupReportHint') || '已按最后一条自动去重，请修改源文件后重新导入'}</div>
+                  </div>
+                </div>
+              )
+            })()}
+
+            {/* 数据工具统一卡片：新站录入 | 查询/修改 | 工参更新（共享缩放，放大态可切换页签） */}
+            <CellToolsCard
+              fullParamFiles={fullParamFiles}
+              currentParamFiles={currentParamFiles}
+              addLog={addLog}
+              permCellEntry={permCellEntry}
+              permCellQueryUpdate={permCellQueryUpdate}
+              permUpdate={permUpdate}
+              selectedFullParamId={selectedFullParamId}
+              setSelectedFullParamId={setSelectedFullParamId}
+              selectedCurrentParamId={selectedCurrentParamId}
+              setSelectedCurrentParamId={setSelectedCurrentParamId}
+              isUpdating={isUpdating}
+              onUpdateParameters={handleUpdateParameters}
+              outputAllColumns={outputAllColumns}
+              setOutputAllColumns={setOutputAllColumns}
             />
         </div>
 
-        {/* 数据列表 */}
-        <div className="bg-card p-6 rounded-lg border border-border h-full">
-          <div className="flex items-center justify-between mb-4">
+        {/* 数据列表：宽屏下卡片绝对定位贴满左列撑起的行高，自身内容不再撑高行 */}
+        <div className="relative min-w-0">
+          <div className="bg-card p-3 rounded-lg border border-border flex flex-col overflow-hidden lg:absolute lg:inset-0">
+          <div className="flex items-center justify-between mb-2 shrink-0">
             <h2 className="text-base font-semibold">{t('data.importedData') || '已导入数据'}</h2>
             <div className="flex items-center gap-2">
               {items.length > 0 && (
                 <>
+                  {/* 文件名模糊搜索 */}
+                  <div className="relative">
+                    <Search size={13} className="absolute left-2 top-1/2 -translate-y-1/2 text-muted-foreground pointer-events-none" />
+                    <input
+                      type="text"
+                      value={fileSearch}
+                      onChange={(e) => setFileSearch(e.target.value)}
+                      placeholder={t('data.searchFiles') || '搜索文件'}
+                      className="w-40 pl-7 pr-2 py-1 text-xs border border-border rounded bg-background text-foreground
+                                 focus:outline-none focus:ring-1 focus:ring-primary"
+                    />
+                  </div>
                   <button
                     onClick={toggleSelectAll}
                     className={`text-xs px-2.5 py-1 rounded border transition-colors ${
@@ -898,7 +1356,7 @@ export function DataPage() {
                   <button
                     onClick={() => { if (!permDelete) return; handleBatchDelete() }}
                     disabled={!permDelete || selectedIds.size === 0 || batchDeleting || hasSyncingItems}
-                    className="text-xs px-2.5 py-1 rounded border bg-background border-border text-red-500 hover:bg-red-50 hover:border-red-200 disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-background disabled:hover:border-border transition-colors flex items-center gap-1"
+                    className="text-xs px-2.5 py-1 rounded border bg-background border-border text-red-500 hover:bg-red-500/15 hover:border-red-500/20 disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-background disabled:hover:border-border transition-colors flex items-center gap-1"
                     title={!permDelete ? (t('data.noPermission', '无权限，请联系管理员')) : (hasSyncingItems ? (t('data.syncingDisabled') || '同步中不可操作') : '')}
                   >
                     {batchDeleting ? (
@@ -924,9 +1382,9 @@ export function DataPage() {
 
           {/* 全量工参同步中提醒横幅 */}
           {hasSyncingItems && (
-            <div className="mb-3 px-4 py-2.5 bg-amber-50 border border-amber-200 rounded-lg flex items-center gap-2.5">
+            <div className="mb-2 px-4 py-2.5 bg-amber-500/10 border border-amber-500/20 rounded-lg flex items-center gap-2.5 shrink-0">
               <Loader2 size={16} className="animate-spin text-amber-500" />
-              <span className="text-sm text-amber-700 font-medium">
+              <span className="text-sm text-amber-400 font-medium">
                 {t('data.excelSyncing') || 'Excel同步中...'}
               </span>
               <span className="text-xs text-amber-500 ml-auto">
@@ -936,211 +1394,214 @@ export function DataPage() {
           )}
 
           {items.length === 0 ? (
-            <p className="text-muted-foreground text-center py-8">
+            <div className="flex items-center justify-center py-8 text-sm text-muted-foreground lg:py-0 lg:flex-1 lg:min-h-0">
               {t('data.noData') || '暂无数据，请先导入'}
-            </p>
+            </div>
+          ) : filteredItems.length === 0 ? (
+            <div className="flex items-center justify-center py-8 text-sm text-muted-foreground lg:py-0 lg:flex-1 lg:min-h-0">
+              {t('data.noMatchingFiles') || '没有匹配的文件'}
+            </div>
           ) : (
-            <div className="space-y-2 max-h-[600px] overflow-y-auto">
-              {items.map((item) => (
-                <div
-                  key={item.id}
-                  className={`flex items-center justify-between p-3 rounded-lg border cursor-pointer transition-colors ${
-                    selectedIds.has(item.id)
-                      ? 'bg-primary/5 border-primary/30 ring-1 ring-primary/20'
-                      : selectedId === item.id
-                      ? 'bg-primary/10 border-primary'
-                      : 'bg-muted border-border hover:bg-muted/80'
-                  }`}
-                  onClick={() => setSelectedId(item.id)}
-                >
-                  <div className="flex-1 min-w-0">
-                    <div className="flex items-center gap-2">
-                      {/* 文件类型图标 */}
-                      <div className={`p-1.5 rounded-md ${
-                        item.fileType === 'geo_data' ? 'bg-purple-100' :
-                        item.fileType === 'full_params' ? 'bg-blue-100' :
-                        item.fileType === 'target_cells' ? 'bg-orange-100' :
-                        item.type === 'excel' ? 'bg-green-100' :
-                        item.type === 'map' ? 'bg-cyan-100' :
-                        'bg-gray-100'
-                      }`}>
-                        {item.fileType === 'geo_data' ? (
-                          item.geometryType === 'sector'
-                            ? <Navigation size={16} className="text-purple-600" />
-                            : <MapPin size={16} className="text-purple-600" />
-                        ) : item.fileType === 'full_params' ? (
-                          <FileSpreadsheet size={16} className="text-blue-600" />
-                        ) : item.fileType === 'target_cells' ? (
-                          <FileSpreadsheet size={16} className="text-orange-600" />
-                        ) : item.type === 'excel' ? (
-                          <FileSpreadsheet size={16} className="text-green-600" />
-                        ) : item.subType === 'mapinfo' ? (
-                          <Layers size={16} className="text-cyan-600" />
-                        ) : (
-                          <Upload size={16} className="text-gray-600" />
-                        )}
-                      </div>
-                      <span className="truncate font-medium" title={item.name}>{item.name}</span>
-                      {/* 文件类型标签 */}
-                      <span className={`text-[10px] px-2 py-0.5 rounded-full font-medium inline-flex items-center gap-0.5 ${
-                        item.status === 'error'
-                          ? 'bg-red-100 text-red-700'
-                          : item.fileType === 'geo_data'
-                          ? 'bg-purple-100 text-purple-700'
-                          : item.fileType === 'full_params'
-                          ? 'bg-blue-100 text-blue-700'
-                          : item.fileType === 'target_cells'
-                          ? 'bg-orange-100 text-orange-700'
-                          : item.fileType === 'current_params'
-                          ? 'bg-indigo-100 text-indigo-700'
-                          : item.subType === 'mapinfo'
-                          ? 'bg-cyan-100 text-cyan-700'
-                          : 'bg-gray-100 text-gray-700'
-                      }`}>
-                        {item.status === 'error'
-                          ? <>
-                              <AlertCircle size={10} />
-                              {(t('data.failed') || '处理失败')}
-                            </>
-                          : item.fileType === 'geo_data'
-                          ? (item.geometryType === 'sector' ? (t('data.sectorData') || '扇区数据') : (t('data.geo') || '地理化'))
-                          : item.fileType === 'full_params'
-                          ? (t('data.fullParamsLabel') || '全量工参')
-                          : item.fileType === 'target_cells'
-                          ? (t('data.toPlan') || '待规划')
-                          : item.fileType === 'current_params'
-                          ? (t('data.currentParamsLabel') || '现网工参')
-                          : item.subType === 'mapinfo'
-                          ? 'MapInfo'
-                          : item.type === 'excel'
-                          ? 'Excel'
-                          : 'ZIP'}
-                      </span>
-                      {/* 路径记录状态 */}
-                      {item.originalPath && (
-                        <span className="text-[10px] px-1.5 py-0.5 rounded bg-green-100 text-green-700 flex items-center gap-0.5">
-                          <CheckCircle2 size={10} />
-                          {t('data.recorded') || '已记录'}
-                        </span>
-                      )}
-                    </div>
-                    <div className="text-xs text-muted-foreground mt-1.5 flex items-center gap-3">
-                      <span>
-                        {item.fileType === 'geo_data' ? (
-                          <>
-                            {item.geometryType === 'sector'
-                              ? `${item.metadata?.pointCount || 0} ${t('data.sectors') || '个扇区'}`
-                              : `${item.metadata?.pointCount || 0} ${t('data.points') || '个点'}`}
-                          </>
-                        ) : item.type === 'excel' ? (
-                            item.metadata?.LTESiteCount || item.metadata?.NRSiteCount
-                                ? [
-                                    item.metadata?.LTESiteCount ? `LTE ${item.metadata.LTESiteCount}站/${item.metadata.LTESectorCount}小区` : null,
-                                    item.metadata?.NRSiteCount ? `NR ${item.metadata.NRSiteCount}站/${item.metadata.NRSectorCount}小区` : null
-                                  ].filter(Boolean).join(' · ')
-                                : (item.fileType === 'full_params'
-                                    ? (t('data.fullParamsData') || '全量工参数据')
-                                    : (item.fileType === 'target_cells'
-                                        ? (t('data.targetCellsData') || '待规划小区数据')
-                                        : (item.fileType === 'default' && item.metadata?.siteCount
-                                            ? `${item.metadata.siteCount} ${t('data.baseStations') || '个基站'}`
-                                            : (t('data.excelData') || 'Excel 数据'))))
-                        ) : (
-                            item.type === 'map'
-                                ? (item.subType === 'mapinfo'
-                                    ? `${item.metadata?.layerCount || 0} ${t('data.layers') || '个图层'}`
-                                    : (t('data.zipFile') || '压缩文件'))
-                                : (t('data.unknownType') || '未知类型')
-                        )}
-                      </span>
-                      <span className="text-[10px] opacity-60">
-                        {/* 时间格式: YYYY/M/D HH:mm username */}
-                        {(() => {
-                          const d = new Date(item.uploadDate)
-                          const pad = (n: number) => String(n).padStart(2, '0')
-                          const timeStr = `${d.getFullYear()}/${d.getMonth() + 1}/${d.getDate()} ${pad(d.getHours())}:${pad(d.getMinutes())}`
-                          const userName = (item as any).userName || (item as any).user_name || ''
-                          return `${timeStr}${userName ? ' ' + userName : ''}`
-                        })()}
-                      </span>
-                      {(item as any).remark && (
-                        <span className="text-[10px] text-amber-600 bg-amber-50 px-1.5 py-0.5 rounded">
-                          {(item as any).remark}
-                        </span>
-                      )}
-                    </div>
-                  </div>
-                  <div className="flex gap-1 items-center">
+            <div className="overflow-y-auto space-y-2 max-h-[600px] lg:max-h-none lg:flex-1 lg:min-h-0">
+              {DATA_GROUPS.map((group) => {
+                const groupItems = groupedItems.get(group.key) || []
+                const collapsed = isGroupCollapsed(group.key)
+                // 搜索时隐藏没有匹配文件的分类，避免一堆空标题
+                if (fileSearch.trim() && groupItems.length === 0) return null
+                return (
+                  <div key={group.key}>
+                    {/* 分类标题：图标与「导入数据」框内该入口一致，点击收起/展开该类文件 */}
                     <button
-                      onClick={(e) => {
-                        if (loading || item.excelSynced === false || (item.inplaceUpdated && item.excelSynced === undefined)) return
-                        toggleSelectItem(item.id, e)
-                      }}
-                      className={`p-1.5 rounded transition-colors ${loading || item.excelSynced === false || (item.inplaceUpdated && item.excelSynced === undefined) ? 'text-muted-foreground/30 cursor-not-allowed' : 'hover:bg-background text-muted-foreground hover:text-primary'}`}
-                      disabled={loading || item.excelSynced === false || (item.inplaceUpdated && item.excelSynced === undefined)}
-                      title={loading ? (t('data.loading') || '加载中...') : (item.excelSynced === false || (item.inplaceUpdated && item.excelSynced === undefined) ? (t('data.syncingDisabled') || '同步中不可操作') : (selectedIds.has(item.id) ? (t('data.deselectItem') || '取消选择') : (t('data.selectItem') || '选择')))}
+                      type="button"
+                      onClick={() => toggleGroup(group.key)}
+                      aria-expanded={!collapsed}
+                      className="w-full flex items-center gap-2 px-2 py-1.5 rounded-md border border-border bg-muted/50 hover:bg-muted transition-colors text-left"
                     >
-                      {selectedIds.has(item.id) ? (
-                        <CheckSquare size={16} className="text-primary" />
-                      ) : (
-                        <Square size={16} />
-                      )}
+                      <span className="flex-shrink-0 p-1 rounded-md bg-primary/15">
+                        <DataIcon kind={group.icon} />
+                      </span>
+                      <span className="text-sm font-medium truncate">{t(group.labelKey) || group.label}</span>
+                      <span className="text-[10px] text-muted-foreground ml-1 flex-shrink-0">({groupItems.length})</span>
+                      <span className="ml-auto flex-shrink-0 text-muted-foreground">
+                        {collapsed ? <ChevronRight size={14} /> : <ChevronDown size={14} />}
+                      </span>
                     </button>
-                    {loading ? (
-                      <div className="p-2 text-muted-foreground/50" title={t('data.loading') || '加载中...'}>
-                        <Loader2 size={14} className="animate-spin text-muted-foreground" />
+                    {/* 左侧缩进 + 竖线构成层级：分类标题在上，所属文件在其下缩进一级 */}
+                    {!collapsed && groupItems.length > 0 && (
+                      <div className="mt-2 ml-3 pl-3 border-l-2 border-border/70 space-y-2">
+                        {groupItems.map((item) => (
+                          <div
+                            key={item.id}
+                            className={`flex items-center justify-between p-3 rounded-lg border cursor-pointer transition-colors ${
+                              selectedIds.has(item.id)
+                                ? 'bg-primary/5 border-primary/30 ring-1 ring-primary/20'
+                                : selectedId === item.id
+                                ? 'bg-primary/10 border-primary'
+                                : 'bg-muted border-border hover:bg-muted/80'
+                            }`}
+                            onClick={() => setSelectedId(item.id)}
+                          >
+                            <div className="flex-1 min-w-0">
+                              <div className="flex items-center gap-2">
+                                <span className="truncate font-medium" title={item.name}>{item.name}</span>
+                                {/* 索引自愈恢复的历史数据：原分组信息已丢失，暂按管理员组归属，提示核对 */}
+                                {(item.metadata?.recovered || (item as any).recovered) && (
+                                  <span
+                                    className="text-[10px] px-2 py-0.5 rounded-full font-medium bg-amber-500/15 text-amber-600 whitespace-nowrap"
+                                    title={t('data.recoveredHint', '索引修复时从磁盘找回的历史数据，原分组已丢失，请核对后保留或删除')}
+                                  >
+                                    {t('data.recovered', '历史数据')}
+                                  </span>
+                                )}
+                                {/* 处理失败状态（类型标签已移到分类标题，此处仅保留错误提示） */}
+                                {item.status === 'error' && (
+                                  <span className="text-[10px] px-2 py-0.5 rounded-full font-medium inline-flex items-center gap-0.5 bg-red-500/15 text-red-500">
+                                    <AlertCircle size={10} />
+                                    {(t('data.failed') || '处理失败')}
+                                    {item.errorMessage ? (
+                                      <span
+                                        className="max-w-[180px] truncate cursor-pointer underline decoration-dotted"
+                                        title={item.errorMessage}
+                                        onClick={(e) => {
+                                          e.stopPropagation()
+                                          alert(`${item.name}\n\n${item.errorMessage}\n\n${t('data.importFailedHint') || '若为文件内容问题，请按上述原因修改源文件后重新导入'}`)
+                                        }}
+                                      >: {item.errorMessage}</span>
+                                    ) : null}
+                                  </span>
+                                )}
+                                {/* 路径记录状态 */}
+                                {item.originalPath && (
+                                  <span className="text-[10px] px-1.5 py-0.5 rounded bg-primary/15 text-green-400 flex items-center gap-0.5">
+                                    <CheckCircle2 size={10} />
+                                    {t('data.recorded') || '已记录'}
+                                  </span>
+                                )}
+                              </div>
+                              <div className="text-xs text-muted-foreground mt-1.5 flex items-center gap-3">
+                                <span>
+                                  {item.fileType === 'geo_data' ? (
+                                    <>
+                                      {item.geometryType === 'sector'
+                                        ? `${item.metadata?.pointCount || 0} ${t('data.sectors') || '个扇区'}`
+                                        : `${item.metadata?.pointCount || 0} ${t('data.points') || '个点'}`}
+                                    </>
+                                  ) : item.type === 'excel' ? (
+                                      item.metadata?.LTESiteCount || item.metadata?.NRSiteCount
+                                          ? [
+                                              item.metadata?.LTESiteCount ? `LTE ${item.metadata.LTESiteCount}站/${item.metadata.LTESectorCount}小区` : null,
+                                              item.metadata?.NRSiteCount ? `NR ${item.metadata.NRSiteCount}站/${item.metadata.NRSectorCount}小区` : null
+                                            ].filter(Boolean).join(' · ')
+                                          : (item.fileType === 'full_params'
+                                              ? (t('data.fullParamsData') || '全量工参数据')
+                                              : (item.fileType === 'target_cells'
+                                                  ? (t('data.targetCellsData') || '待规划小区数据')
+                                                  : (item.fileType === 'default' && item.metadata?.siteCount
+                                                      ? `${item.metadata.siteCount} ${t('data.baseStations') || '个基站'}`
+                                                      : (t('data.excelData') || 'Excel 数据'))))
+                                  ) : (
+                                      item.type === 'map'
+                                          ? (item.subType === 'mapinfo'
+                                              ? `${item.metadata?.layerCount || 0} ${t('data.layers') || '个图层'}`
+                                              : (t('data.zipFile') || '压缩文件'))
+                                          : (t('data.unknownType') || '未知类型')
+                                  )}
+                                </span>
+                                <span className="text-[10px] opacity-60">
+                                  {/* 时间格式: YYYY/M/D HH:mm username */}
+                                  {(() => {
+                                    const d = new Date(item.uploadDate)
+                                    const pad = (n: number) => String(n).padStart(2, '0')
+                                    const timeStr = `${d.getFullYear()}/${d.getMonth() + 1}/${d.getDate()} ${pad(d.getHours())}:${pad(d.getMinutes())}`
+                                    const userName = (item as any).userName || (item as any).user_name || ''
+                                    return `${timeStr}${userName ? ' ' + userName : ''}`
+                                  })()}
+                                </span>
+                                {(item as any).remark && (
+                                  <span className="text-[10px] text-amber-600 bg-amber-500/10 px-1.5 py-0.5 rounded">
+                                    {(item as any).remark}
+                                  </span>
+                                )}
+                              </div>
+                            </div>
+                            <div className="flex gap-1 items-center">
+                              <button
+                                onClick={(e) => {
+                                  if (loading || item.excelSynced === false || (item.inplaceUpdated && item.excelSynced === undefined)) return
+                                  toggleSelectItem(item.id, e)
+                                }}
+                                className={`p-1.5 rounded transition-colors ${loading || item.excelSynced === false || (item.inplaceUpdated && item.excelSynced === undefined) ? 'text-muted-foreground/30 cursor-not-allowed' : 'hover:bg-background text-muted-foreground hover:text-primary'}`}
+                                disabled={loading || item.excelSynced === false || (item.inplaceUpdated && item.excelSynced === undefined)}
+                                title={loading ? (t('data.loading') || '加载中...') : (item.excelSynced === false || (item.inplaceUpdated && item.excelSynced === undefined) ? (t('data.syncingDisabled') || '同步中不可操作') : (selectedIds.has(item.id) ? (t('data.deselectItem') || '取消选择') : (t('data.selectItem') || '选择')))}
+                              >
+                                {selectedIds.has(item.id) ? (
+                                  <CheckSquare size={16} className="text-primary" />
+                                ) : (
+                                  <Square size={16} />
+                                )}
+                              </button>
+                              {loading ? (
+                                <div className="p-2 text-muted-foreground/50" title={t('data.loading') || '加载中...'}>
+                                  <Loader2 size={14} className="animate-spin text-muted-foreground" />
+                                </div>
+                              ) : item.excelSynced === false || (item.inplaceUpdated && item.excelSynced === undefined) ? (
+                                <div className="p-2 text-muted-foreground flex items-center gap-1.5" title={t('data.excelSyncing') || 'Excel同步中...'}>
+                                  <Loader2 size={14} className="animate-spin text-amber-500" />
+                                  <span className="text-[10px] text-amber-600">{t('data.syncing') || '同步中'}</span>
+                                </div>
+                              ) : (
+                              <button
+                                data-guide="imported-download"
+                                onClick={(e) => {
+                                  e.stopPropagation()
+                                  handleDownload(item)
+                                }}
+                                disabled={downloadStore.downloadingIds.has(item.id)}
+                                className="p-2 hover:bg-background rounded text-primary disabled:opacity-50 disabled:cursor-wait relative group"
+                                title={downloadStore.downloadingIds.has(item.id)
+                                  ? (downloadStore.statusText[item.id] || (t('data.downloading') || '下载中...'))
+                                  : (t('data.download') || '下载')}
+                              >
+                                {downloadStore.downloadingIds.has(item.id) ? (
+                                  <div className="flex flex-col items-center gap-0.5">
+                                    <Loader2 size={16} className="animate-spin text-primary" />
+                                    {downloadStore.progress[item.id] > 0 && (
+                                      <span className="text-[9px] font-mono text-primary leading-none">
+                                        {downloadStore.progress[item.id]}%
+                                      </span>
+                                    )}
+                                  </div>
+                                ) : <Download size={16} />}
+                              </button>
+                              )}
+                              <button
+                                onClick={(e) => {
+                                  if (!permDelete || loading || item.excelSynced === false || (item.inplaceUpdated && item.excelSynced === undefined)) return
+                                  e.stopPropagation()
+                                  handleDelete(item)
+                                }}
+                                className={`p-2 rounded ${!permDelete || loading || item.excelSynced === false || (item.inplaceUpdated && item.excelSynced === undefined) ? 'text-red-500/30 cursor-not-allowed' : 'hover:bg-background text-red-500'}`}
+                                disabled={!permDelete || loading || item.excelSynced === false || (item.inplaceUpdated && item.excelSynced === undefined)}
+                                title={!permDelete ? (t('data.noPermission', '无权限，请联系管理员')) : (loading ? (t('data.loading') || '加载中...') : (item.excelSynced === false || (item.inplaceUpdated && item.excelSynced === undefined) ? (t('data.syncingDisabled') || '同步中不可删除') : (t('data.delete') || '删除')))}
+                              >
+                                <Trash2 size={16} />
+                              </button>
+                            </div>
+                          </div>
+                        ))}
                       </div>
-                    ) : item.excelSynced === false || (item.inplaceUpdated && item.excelSynced === undefined) ? (
-                      <div className="p-2 text-muted-foreground flex items-center gap-1.5" title={t('data.excelSyncing') || 'Excel同步中...'}>
-                        <Loader2 size={14} className="animate-spin text-amber-500" />
-                        <span className="text-[10px] text-amber-600">{t('data.syncing') || '同步中'}</span>
-                      </div>
-                    ) : (
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation()
-                        handleDownload(item)
-                      }}
-                      disabled={downloadStore.downloadingIds.has(item.id)}
-                      className="p-2 hover:bg-background rounded text-primary disabled:opacity-50 disabled:cursor-wait relative group"
-                      title={downloadStore.downloadingIds.has(item.id)
-                        ? (downloadStore.statusText[item.id] || (t('data.downloading') || '下载中...'))
-                        : (t('data.download') || '下载')}
-                    >
-                      {downloadStore.downloadingIds.has(item.id) ? (
-                        <div className="flex flex-col items-center gap-0.5">
-                          <Loader2 size={16} className="animate-spin text-blue-500" />
-                          {downloadStore.progress[item.id] > 0 && (
-                            <span className="text-[9px] font-mono text-blue-600 leading-none">
-                              {downloadStore.progress[item.id]}%
-                            </span>
-                          )}
-                        </div>
-                      ) : <Download size={16} />}
-                    </button>
                     )}
-                    <button
-                      onClick={(e) => {
-                        if (!permDelete || loading || item.excelSynced === false || (item.inplaceUpdated && item.excelSynced === undefined)) return
-                        e.stopPropagation()
-                        handleDelete(item)
-                      }}
-                      className={`p-2 rounded ${!permDelete || loading || item.excelSynced === false || (item.inplaceUpdated && item.excelSynced === undefined) ? 'text-red-500/30 cursor-not-allowed' : 'hover:bg-background text-red-500'}`}
-                      disabled={!permDelete || loading || item.excelSynced === false || (item.inplaceUpdated && item.excelSynced === undefined)}
-                      title={!permDelete ? (t('data.noPermission', '无权限，请联系管理员')) : (loading ? (t('data.loading') || '加载中...') : (item.excelSynced === false || (item.inplaceUpdated && item.excelSynced === undefined) ? (t('data.syncingDisabled') || '同步中不可删除') : (t('data.delete') || '删除')))}
-                    >
-                      <Trash2 size={16} />
-                    </button>
                   </div>
-                </div>
-              ))}
+                )
+              })}
             </div>
           )}
+          </div>
         </div>
       </div>
 
       {/* 运行结果 */}
-      <div className="mt-8 bg-card rounded-lg border border-border overflow-hidden">
+      <div className="mt-2 bg-card rounded-lg border border-border overflow-hidden">
         <div className="flex items-center justify-between px-5 py-3 border-b border-border bg-muted/30">
           <div className="flex items-center gap-2">
             <ScrollText size={16} className="text-muted-foreground" />
@@ -1155,7 +1616,7 @@ export function DataPage() {
             {logs.length > 0 && (
               <button
                 onClick={() => {
-              _store.entries = []
+              bucketRef.current.entries = []
               setLogs([])
             }}
                 className="text-[11px] px-2 py-1 rounded text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
@@ -1170,7 +1631,6 @@ export function DataPage() {
             <div className="flex flex-col items-center justify-center py-12 text-muted-foreground">
               <ScrollText size={28} className="opacity-30 mb-3" />
               <p className="text-xs">{t('data.noLogs') || '暂无运行记录'}</p>
-              <p className="text-[10px] opacity-60 mt-1">{t('data.noLogsHint') || '执行上传、下载、删除等操作后，记录将出现在这里'}</p>
             </div>
           ) : (
             <div className="divide-y divide-border/40">
@@ -1184,7 +1644,7 @@ export function DataPage() {
                       {entry.time}
                     </span>
                     <span className={`shrink-0 mt-0.5 ${
-                      entry.type === 'upload' ? 'text-blue-500' :
+                      entry.type === 'upload' ? 'text-primary' :
                       entry.type === 'download' ? 'text-green-500' :
                       entry.type === 'delete' ? 'text-red-500' :
                       entry.type === 'update' ? 'text-amber-500' :
@@ -1209,20 +1669,20 @@ export function DataPage() {
                         <span className={`text-xs font-medium font-mono ${
                           entry.type === 'terminal' ? 'text-emerald-600' :
                           entry.status === 'running' ? 'text-foreground' :
-                          entry.status === 'success' ? 'text-green-700' :
+                          entry.status === 'success' ? 'text-green-400' :
                           entry.status === 'error' ? 'text-red-600' :
                           'text-foreground'
                         }`}>
                           {entry.message}
                         </span>
                         <span className={`text-[9px] px-1.5 py-0.5 rounded-full font-medium ${
-                          entry.type === 'upload' ? 'bg-blue-100 text-blue-700' :
-                          entry.type === 'download' ? 'bg-green-100 text-green-700' :
-                          entry.type === 'delete' ? 'bg-red-100 text-red-700' :
-                          entry.type === 'update' ? 'bg-amber-100 text-amber-700' :
-                          entry.type === 'terminal' ? 'bg-zinc-100 text-zinc-600' :
-                          entry.type === 'error' ? 'bg-red-100 text-red-700' :
-                          'bg-gray-100 text-gray-600'
+                          entry.type === 'upload' ? 'bg-primary/15 text-primary' :
+                          entry.type === 'download' ? 'bg-primary/15 text-green-500' :
+                          entry.type === 'delete' ? 'bg-red-500/15 text-red-500' :
+                          entry.type === 'update' ? 'bg-amber-500/15 text-amber-500' :
+                          entry.type === 'terminal' ? 'bg-zinc-500/15 text-zinc-500' :
+                          entry.type === 'error' ? 'bg-red-500/15 text-red-500' :
+                          'bg-muted text-muted-foreground'
                         }`}>
                           {entry.type === 'upload' ? '上传' :
                            entry.type === 'download' ? '下载' :
@@ -1259,7 +1719,8 @@ function UploadArea({
   multiple = false,
   description,
   inline = false,
-  status = 'idle'
+  status = 'idle',
+  hint
 }: {
   title: string
   accept: string
@@ -1270,13 +1731,16 @@ function UploadArea({
   description?: string
   inline?: boolean
   status?: 'idle' | 'success' | 'error'
+  /** 自定义提示文案；不传时显示「点击上传 + accept 扩展名列表」（扩展名过多时用） */
+  hint?: string
 }) {
   const { t } = useTranslation()
+  const hintText = hint || `${t('data.clickToUpload') || '点击上传'} ${accept}`
   // 根据状态获取边框颜色
   const getBorderClass = () => {
     if (loading) return 'border-muted bg-muted/50 cursor-not-allowed'
-    if (status === 'success') return 'border-green-500 bg-green-50 hover:bg-green-100'
-    if (status === 'error') return 'border-red-500 bg-red-50 hover:bg-red-100'
+    if (status === 'success') return 'border-green-500 bg-green-500/10 hover:bg-green-500/20'
+    if (status === 'error') return 'border-red-500 bg-red-500/10 hover:bg-red-500/20'
     return 'border-border hover:border-primary hover:bg-primary/5'
   }
 
@@ -1305,9 +1769,7 @@ function UploadArea({
             ) : (
               <>
                 <span className="flex-shrink-0">{icon}</span>
-                <p className="text-xs whitespace-nowrap">
-                  {t('data.clickToUpload') || '点击上传'} {accept}
-                </p>
+                <p className="text-xs whitespace-nowrap">{hintText}</p>
                 {description && (
                   <span className="text-[10px] text-muted-foreground ml-1 whitespace-nowrap hidden sm:inline">· {description}</span>
                 )}
@@ -1351,9 +1813,7 @@ function UploadArea({
           ) : (
             <>
               <span className="flex-shrink-0 transition-transform duration-200 group-hover:scale-110">{icon}</span>
-              <p className="text-xs flex-1 text-center">
-                {t('data.clickToUpload') || '点击上传'} {accept}
-              </p>
+              <p className="text-xs flex-1 text-center">{hintText}</p>
             </>
           )}
         </div>
@@ -1373,14 +1833,16 @@ function UploadArea({
   )
 }
 
-function NewCellEntryCard({
+function NewCellEntryContent({
   fullParamFiles,
   addLog,
   disabled,
+  expanded,
 }: {
   fullParamFiles: DataItem[]
   addLog: (type: any, message: string, status?: any, detail?: string, opKey?: string) => void
   disabled?: boolean
+  expanded?: boolean
 }) {
   const { t } = useTranslation()
   const { batchAddCells, isAddingCell } = useDataStore()
@@ -1393,13 +1855,12 @@ function NewCellEntryCard({
   const [selectedRowIds, setSelectedRowIds] = useState<Set<string>>(new Set())
   const [batchResults, setBatchResults] = useState<Array<{ index: number; networkType: string; cellName: string; siteId: string; cellId: string; success: boolean; message: string }> | null>(null)
   const [batchError, setBatchError] = useState<string | null>(null)
-  const [expanded, setExpanded] = useState(false)
   const [importing, setImporting] = useState(false) // 一键导入进行中（覆盖预查重阶段，保证即时反馈）
   const [duplicateMap, setDuplicateMap] = useState<Record<string, 'same' | 'cross'>>({})
   // 列宽：默认宽度表（基准 70px）+ localStorage 持久化
   const DEFAULT_COL_WIDTHS: Record<string, number> = {
     managedElementId: 52, siteId: 52, cellId: 52, cellName: 175,
-    mcc: 52, mnc: 52, longitude: 70, latitude: 70,
+    mcc: 52, mnc: 52, longitude: 70, latitude: 70, height: 52,
     azimuth: 52, frequency: 52, ssbFrequency: 52, cellCoverType: 70,
   }
   const COL_WIDTHS_KEY = 'npt_cell_entry_col_widths'
@@ -1423,6 +1884,7 @@ function NewCellEntryCard({
       mnc: '11',
       longitude: '',
       latitude: '',
+      height: '',
       azimuth: '',
       frequency: '',
       ssbFrequency: '',
@@ -1443,8 +1905,6 @@ function NewCellEntryCard({
 
   /** Filter: keep only digits for integer fields */
   const filterDigits = (v: string) => v.replace(/\D/g, '')
-  /** Filter: keep digits, dot, minus for numeric fields */
-  const filterNumeric = (v: string) => v.replace(/[^\d.\-]/g, '')
 
   const isRowComplete = (row: CellRow, nt: 'LTE' | 'NR') => {
     const freqOk = nt === 'LTE' ? isFloat(row.frequency) : isFloat(row.ssbFrequency)
@@ -1476,6 +1936,7 @@ function NewCellEntryCard({
       mnc: r.mnc,
       longitude: r.longitude,
       latitude: r.latitude,
+      height: r.height,
       azimuth: r.azimuth,
       frequency: r.frequency,
       ssbFrequency: r.ssbFrequency,
@@ -1535,6 +1996,7 @@ function NewCellEntryCard({
     { key: 'mnc', kind: 'digits' },
     { key: 'longitude', kind: 'numeric' },
     { key: 'latitude', kind: 'numeric' },
+    { key: 'height', kind: 'numeric' },
     { key: 'azimuth', kind: 'digits' },
     { key: 'frequency', kind: 'numeric' },   // LTE 面板
     { key: 'ssbFrequency', kind: 'numeric' }, // NR 面板
@@ -1645,11 +2107,10 @@ function NewCellEntryCard({
     }
   }
 
+  // 清空：仅重置当前 LTE/NR 页签；切换页签时另一页签已录入数据保留
   const resetAll = () => {
-    setRows({ LTE: createEmptyRows(), NR: createEmptyRows() })
+    setRows(prev => ({ ...prev, [activeTab]: createEmptyRows() }))
     setSelectedRowIds(new Set())
-    setBatchResults(null)
-    setBatchError(null)
     setDuplicateMap({})
   }
 
@@ -1665,6 +2126,7 @@ function NewCellEntryCard({
       mnc?: string
       longitude: number
       latitude: number
+      height?: number
       azimuth: number
       frequency?: string
       ssbFrequency?: string
@@ -1690,6 +2152,7 @@ function NewCellEntryCard({
           mnc: r.mnc.trim() || undefined,
           longitude: parseFloat(r.longitude),
           latitude: parseFloat(r.latitude),
+          height: r.height.trim() ? parseFloat(r.height) : undefined,
           azimuth: parseFloat(r.azimuth),
           frequency: nt === 'LTE' ? r.frequency.trim() : undefined,
           ssbFrequency: nt === 'NR' ? r.ssbFrequency.trim() : undefined,
@@ -1720,17 +2183,18 @@ function NewCellEntryCard({
       return
     }
 
-    // 查重：按制式检查 CGI (siteId_cellId) 是否已存在于数据库
+    // 查重：LTE 按 基站_小区、NR 按 MCC_MNC_基站_小区 检查是否已存在于数据库
+    // （NR 共享小区同基站/同小区、不同 MNC 是两条记录，互不视为重复）
     try {
       const dupCheck = await dataApi.checkCellDuplicates(
-        validRows.map(r => ({ siteId: r.siteId, cellId: r.cellId, networkType: r.networkType }))
+        validRows.map(r => ({ siteId: r.siteId, cellId: r.cellId, networkType: r.networkType, mcc: r.mcc, mnc: r.mnc }))
       )
       const exists = dupCheck?.data?.exists
       if (exists && Object.keys(exists).length > 0) {
         // 分类：same=同制式重复(红)，cross=跨制式重复(橙)
         const dupMap: Record<string, 'same' | 'cross'> = {}
         for (const r of validRows) {
-          const key = `${r.siteId}_${r.cellId}`
+          const key = cellDedupKey(r.networkType, r)
           const hit = exists[key]
           if (!hit) continue
           const panel = r.networkType === 'LTE' ? 'lte' : 'nr'
@@ -1743,11 +2207,11 @@ function NewCellEntryCard({
 
         if (dupKeys.length > 0) {
           const crossNames = validRows
-            .filter(r => dupMap[`${r.siteId}_${r.cellId}`] === 'cross')
+            .filter(r => dupMap[cellDedupKey(r.networkType, r)] === 'cross')
             .map(r => r.cellName)
             .join('、')
           const sameNames = validRows
-            .filter(r => dupMap[`${r.siteId}_${r.cellId}`] === 'same')
+            .filter(r => dupMap[cellDedupKey(r.networkType, r)] === 'same')
             .map(r => r.cellName)
             .join('、')
           const dupMsgs = [
@@ -1759,7 +2223,7 @@ function NewCellEntryCard({
             setTimeout(() => setBatchError(null), 8000)
           }
           // 过滤掉重复行（同制式 + 跨制式），只导入不重复的
-          const uniqueRows = validRows.filter(r => !dupMap[`${r.siteId}_${r.cellId}`])
+          const uniqueRows = validRows.filter(r => !dupMap[cellDedupKey(r.networkType, r)])
           if (uniqueRows.length === 0) {
             return // 全部重复
           }
@@ -1809,12 +2273,6 @@ function NewCellEntryCard({
     }
   }
 
-  const isLte = activeTab === 'LTE'
-  const inputCls = 'w-full min-w-[40px] px-1.5 py-1 text-xs bg-background border border-border rounded focus:outline-none focus:ring-1 focus:ring-primary disabled:opacity-50 disabled:cursor-not-allowed'
-  const inputClsExp = 'w-full min-w-[40px] px-2 py-1.5 text-sm bg-background border border-border rounded focus:outline-none focus:ring-1 focus:ring-primary disabled:opacity-50 disabled:cursor-not-allowed'
-  const labelCls = 'text-xs text-muted-foreground text-center leading-tight px-0.5 whitespace-nowrap'
-  const curInputCls = expanded ? inputClsExp : inputCls
-
   // Count total valid rows across both tabs
   const totalRows = rows.LTE.filter(r => r.managedElementId.trim() || r.siteId.trim() || r.cellId.trim() || r.cellName.trim()).length
     + rows.NR.filter(r => r.managedElementId.trim() || r.siteId.trim() || r.cellId.trim() || r.cellName.trim()).length
@@ -1823,20 +2281,9 @@ function NewCellEntryCard({
   const completeInTab = rows[activeTab].filter(r => isRowComplete(r, activeTab))
   const allSelected = completeInTab.length > 0 && completeInTab.every(r => selectedRowIds.has(r.id))
 
-  // ---- Render the main card (used both inline and in overlay) ----
+  // ---- Render the main content (title/缩放按钮由父级 CellToolsCard 统一提供) ----
   const renderCardContent = () => (
     <>
-      <div className={`flex items-center justify-between ${expanded ? 'mb-4' : 'mb-2'}`}>
-        <h2 className={`font-semibold ${expanded ? 'text-lg' : 'text-base'}`}>{t('newCellEntry.title') || '新站录入'}</h2>
-        <button
-          onClick={() => setExpanded(!expanded)}
-          className="text-muted-foreground hover:text-foreground transition-colors p-1 rounded hover:bg-muted"
-          title={expanded ? (t('newCellEntry.collapse') || '缩回') : (t('newCellEntry.expand') || '展开')}
-        >
-          {expanded ? <Minimize2 size={16} /> : <Maximize2 size={14} />}
-        </button>
-      </div>
-
       {disabled && (
         <div className="px-3 py-2 bg-muted/40 border border-border rounded-lg text-xs text-muted-foreground mb-3">
           {t('data.noPermission', '无权限，请联系管理员')}
@@ -1844,16 +2291,16 @@ function NewCellEntryCard({
       )}
 
       {!hasFullParams && (
-        <div className={`px-3 py-2 bg-amber-50 border border-amber-200 rounded-lg ${expanded ? 'text-sm mb-4' : 'text-xs mb-3'} text-amber-700`}>
+        <div className={`px-3 py-2 bg-amber-500/10 border border-amber-500/20 rounded-lg ${expanded ? 'text-sm mb-4' : 'text-xs mb-3'} text-amber-400`}>
           {t('newCellEntry.noFullParams') || '请先上传全量工参文件'}
         </div>
       )}
 
       {batchError && (
-        <div className={`px-3 py-2 bg-red-50 border border-red-200 rounded-lg flex items-center gap-2 ${expanded ? 'text-sm mb-4' : 'text-xs mb-3'} text-red-700`}>
+        <div className={`px-3 py-2 bg-red-500/10 border border-red-500/20 rounded-lg flex items-center gap-2 ${expanded ? 'text-sm mb-4' : 'text-xs mb-3'} text-red-400`}>
           <AlertCircle size={14} />
           <span>{batchError}</span>
-          <button onClick={() => setBatchError(null)} className="ml-auto text-red-500 hover:text-red-700">✕</button>
+          <button onClick={() => setBatchError(null)} className="ml-auto text-red-500 hover:text-red-400">✕</button>
         </div>
       )}
 
@@ -1883,187 +2330,26 @@ function NewCellEntryCard({
       <div className="text-[10px] text-muted-foreground/70 mb-1">
         {t('newCellEntry.pasteHint')}
       </div>
-      <div className={expanded ? 'overflow-x-auto' : 'overflow-x-auto'} onPaste={handlePaste}>
-        <table className="w-full border-collapse">
-          <thead>
-            <tr>
-              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30 w-0'}>
-                <input
-                  type="checkbox"
-                  checked={allSelected}
-                  onChange={toggleSelectAll}
-                  disabled={isAddingCell || !hasFullParams}
-                  className="cursor-pointer"
-                />
-              </th>
-              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30 w-0'}>{/* 操作列 */}</th>
-              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30 relative'} style={{ width: colWidths.managedElementId }}>
-                {t('newCellEntry.fieldManagedElementId') || '网元ID'}
-                <div
-                  className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-blue-400/60"
-                  onMouseDown={e => startColResize(e, 'managedElementId')}
-                />
-              </th>
-              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30 relative'} style={{ width: colWidths.siteId }}>
-                {t('newCellEntry.fieldSiteIdLTE') || '基站ID'}
-                <div
-                  className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-blue-400/60"
-                  onMouseDown={e => startColResize(e, 'siteId')}
-                />
-              </th>
-              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30 relative'} style={{ width: colWidths.cellId }}>
-                {t('newCellEntry.fieldCellId') || '小区ID'}
-                <div
-                  className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-blue-400/60"
-                  onMouseDown={e => startColResize(e, 'cellId')}
-                />
-              </th>
-              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30 relative'} style={{ width: colWidths.cellName }}>
-                {t('newCellEntry.fieldCellName') || '小区名称'}
-                <div
-                  className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-blue-400/60"
-                  onMouseDown={e => startColResize(e, 'cellName')}
-                />
-              </th>
-              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30 relative'} style={{ width: colWidths.mcc }}>
-                {t('newCellEntry.fieldMCC') || 'MCC'}
-                <div
-                  className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-blue-400/60"
-                  onMouseDown={e => startColResize(e, 'mcc')}
-                />
-              </th>
-              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30 relative'} style={{ width: colWidths.mnc }}>
-                {t('newCellEntry.fieldMNC') || 'MNC'}
-                <div
-                  className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-blue-400/60"
-                  onMouseDown={e => startColResize(e, 'mnc')}
-                />
-              </th>
-              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30 relative'} style={{ width: colWidths.longitude }}>
-                {t('newCellEntry.fieldLongitude') || '经度'}
-                <div
-                  className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-blue-400/60"
-                  onMouseDown={e => startColResize(e, 'longitude')}
-                />
-              </th>
-              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30 relative'} style={{ width: colWidths.latitude }}>
-                {t('newCellEntry.fieldLatitude') || '纬度'}
-                <div
-                  className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-blue-400/60"
-                  onMouseDown={e => startColResize(e, 'latitude')}
-                />
-              </th>
-              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30 relative'} style={{ width: colWidths.azimuth }}>
-                {t('newCellEntry.fieldAzimuth') || '方向角'}
-                <div
-                  className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-blue-400/60"
-                  onMouseDown={e => startColResize(e, 'azimuth')}
-                />
-              </th>
-              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30 relative'} style={{ width: isLte ? colWidths.frequency : colWidths.ssbFrequency }}>
-                {isLte ? (t('newCellEntry.fieldFrequency') || '下行频点') : (t('newCellEntry.fieldSsbFrequency') || 'SSB频点')}
-                <div
-                  className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-blue-400/60"
-                  onMouseDown={e => startColResize(e, isLte ? 'frequency' : 'ssbFrequency')}
-                />
-              </th>
-              <th className={labelCls + ' border border-border px-1 py-1 bg-muted/30 relative'} style={{ width: colWidths.cellCoverType }}>
-                {t('newCellEntry.fieldCellCoverType') || '覆盖类型'}
-                <div
-                  className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-blue-400/60"
-                  onMouseDown={e => startColResize(e, 'cellCoverType')}
-                />
-              </th>
-            </tr>
-          </thead>
-          <tbody>
-            {rows[activeTab].map((row) => {
-              const complete = isRowComplete(row, activeTab)
-              return (
-                <tr key={row.id} data-row-id={row.id} className={`${selectedRowIds.has(row.id) ? 'bg-blue-50/50' : ''} ${
-                  duplicateMap[`${row.siteId}_${row.cellId}`] === 'same' ? 'bg-red-50' :
-                  duplicateMap[`${row.siteId}_${row.cellId}`] === 'cross' ? 'bg-amber-50' : ''
-                }`}>
-                  <td className="border border-border px-1 py-1 text-center">
-                    <input
-                      type="checkbox"
-                      checked={selectedRowIds.has(row.id)}
-                      onChange={() => toggleRowSelection(row.id)}
-                      disabled={!complete || isAddingCell || !hasFullParams}
-                      className="cursor-pointer"
-                    />
-                  </td>
-                  <td className="border border-border px-1 py-1 text-center">
-                    <button
-                      onClick={() => deleteRow(row.id)}
-                      disabled={isAddingCell || rows[activeTab].length <= 1}
-                      className="text-muted-foreground hover:text-red-500 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
-                      title={t('newCellEntry.deleteRow') || '删除'}
-                    >
-                      <span className="text-xs">✕</span>
-                    </button>
-                  </td>
-                  <td className="border border-border px-1 py-1">
-                    <input className={curInputCls} data-field="managedElementId" type="text" inputMode="numeric" value={row.managedElementId} onChange={e => updateRow(row.id, 'managedElementId', filterDigits(e.target.value))} disabled={!hasFullParams || isAddingCell} placeholder="" />
-                  </td>
-                  <td className="border border-border px-1 py-1">
-                    <input className={curInputCls} data-field="siteId" type="text" inputMode="numeric" value={row.siteId} onChange={e => updateRow(row.id, 'siteId', filterDigits(e.target.value))} disabled={!hasFullParams || isAddingCell} placeholder="" />
-                  </td>
-                  <td className="border border-border px-1 py-1">
-                    <input className={curInputCls} data-field="cellId" type="text" inputMode="numeric" value={row.cellId} onChange={e => updateRow(row.id, 'cellId', filterDigits(e.target.value))} disabled={!hasFullParams || isAddingCell} placeholder="" />
-                  </td>
-                  <td className="border border-border px-1 py-1">
-                    <input className={curInputCls} data-field="cellName" value={row.cellName} onChange={e => updateRow(row.id, 'cellName', e.target.value)} disabled={!hasFullParams || isAddingCell} placeholder="" />
-                  </td>
-                  <td className="border border-border px-1 py-1">
-                    <input className={curInputCls} data-field="mcc" type="text" inputMode="numeric" value={row.mcc} onChange={e => updateRow(row.id, 'mcc', filterDigits(e.target.value))} disabled={!hasFullParams || isAddingCell} placeholder="460" />
-                  </td>
-                  <td className="border border-border px-1 py-1">
-                    <select
-                      className={curInputCls}
-                      data-field="mnc"
-                      value={row.mnc}
-                      onChange={e => updateRow(row.id, 'mnc', e.target.value)}
-                      disabled={!hasFullParams || isAddingCell}
-                    >
-                      <option value="11">11</option>
-                      <option value="01">01</option>
-                      <option value="00">00</option>
-                    </select>
-                  </td>
-                  <td className="border border-border px-1 py-1">
-                    <input className={curInputCls} data-field="longitude" type="text" inputMode="decimal" value={row.longitude} onChange={e => updateRow(row.id, 'longitude', filterNumeric(e.target.value))} disabled={!hasFullParams || isAddingCell} placeholder="114.0" />
-                  </td>
-                  <td className="border border-border px-1 py-1">
-                    <input className={curInputCls} data-field="latitude" type="text" inputMode="decimal" value={row.latitude} onChange={e => updateRow(row.id, 'latitude', filterNumeric(e.target.value))} disabled={!hasFullParams || isAddingCell} placeholder="23.0" />
-                  </td>
-                  <td className="border border-border px-1 py-1">
-                    <input className={curInputCls} data-field="azimuth" type="text" inputMode="numeric" value={row.azimuth} onChange={e => handleAzimuthChange(row.id, e.target.value)} disabled={!hasFullParams || isAddingCell} placeholder="0-360" />
-                  </td>
-                  <td className="border border-border px-1 py-1">
-                    {isLte ? (
-                      <input className={curInputCls} data-field="frequency" type="text" inputMode="decimal" value={row.frequency} onChange={e => updateRow(row.id, 'frequency', filterNumeric(e.target.value))} disabled={!hasFullParams || isAddingCell} placeholder="" />
-                    ) : (
-                      <input className={curInputCls} data-field="ssbFrequency" type="text" inputMode="decimal" value={row.ssbFrequency} onChange={e => updateRow(row.id, 'ssbFrequency', filterNumeric(e.target.value))} disabled={!hasFullParams || isAddingCell} placeholder="" />
-                    )}
-                  </td>
-                  <td className="border border-border px-1 py-1">
-                    <select
-                      className={curInputCls}
-                      data-field="cellCoverType"
-                      value={row.cellCoverType}
-                      onChange={e => updateRow(row.id, 'cellCoverType', parseInt(e.target.value))}
-                      disabled={!hasFullParams || isAddingCell}
-                    >
-                      <option value={1}>{t('newCellEntry.cellCoverTypeOutdoor') || '室外站'}</option>
-                      <option value={4}>{t('newCellEntry.cellCoverTypeIndoor') || '室分站'}</option>
-                    </select>
-                  </td>
-                </tr>
-              )
-            })}
-          </tbody>
-        </table>
+      <div className="overflow-x-auto" onPaste={handlePaste}>
+        <CellParamsTable
+          rows={rows[activeTab]}
+          activeTab={activeTab}
+          colWidths={colWidths}
+          onColResize={startColResize}
+          onFieldChange={updateRow}
+          onAzimuthChange={handleAzimuthChange}
+          disabled={!hasFullParams || isAddingCell}
+          selectedRowIds={selectedRowIds}
+          onToggleSelect={toggleRowSelection}
+          allSelected={allSelected}
+          onToggleSelectAll={toggleSelectAll}
+          onDeleteRow={deleteRow}
+          deleteDisabled={rows[activeTab].length <= 1}
+          isRowComplete={isRowComplete}
+          duplicateMap={duplicateMap}
+          expanded={expanded}
+          t={t}
+        />
       </div>
 
       {/* Copy Row button */}
@@ -2071,7 +2357,7 @@ function NewCellEntryCard({
         <button
           onClick={copyRows}
           disabled={!copyButtonEnabled || isAddingCell || !hasFullParams}
-          className={`px-3 py-1 text-xs rounded-md border border-dashed border-border bg-muted/20 ${copyButtonEnabled ? 'text-blue-500 hover:bg-blue-50 hover:border-blue-300' : 'text-muted-foreground'} disabled:opacity-50 disabled:cursor-not-allowed transition-colors flex items-center gap-1`}
+          className={`px-3 py-1 text-xs rounded-md border border-dashed border-border bg-muted/20 ${copyButtonEnabled ? 'text-primary hover:bg-primary/100/15 hover:border-primary' : 'text-muted-foreground'} disabled:opacity-50 disabled:cursor-not-allowed transition-colors flex items-center gap-1`}
         >
           + {t('newCellEntry.addRow') || '复制行'}
           {selectedRowIds.size > 0 && <span className="text-xs">({selectedRowIds.size})</span>}
@@ -2089,16 +2375,16 @@ function NewCellEntryCard({
             disabled={isAddingCell}
             className="px-3 py-1.5 text-xs rounded-md border border-border bg-background text-muted-foreground hover:bg-muted disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
           >
-            {t('newCellEntry.reset') || '重置'}
+            {t('newCellEntry.clear') || '清空'}
           </button>
           <button
             onClick={handleBatchImport}
             disabled={totalRows === 0 || importing || !hasFullParams}
-            className="px-4 py-1.5 text-xs font-medium rounded-md bg-blue-500 text-white hover:bg-blue-600 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1.5 transition-colors"
+            className="px-4 py-1.5 text-xs font-medium rounded-md bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1.5 transition-colors"
           >
             {importing ? <Loader2 size={14} className="animate-spin" /> : <CheckCircle2 size={14} />}
             {importing ? (t('data.saving') || '录入中...') : (t('newCellEntry.batchImport') || '一键导入')}
-            {totalRows > 0 && !importing && <span className="text-blue-100">({totalRows})</span>}
+            {totalRows > 0 && !importing && <span className="text-primary-foreground">({totalRows})</span>}
           </button>
         </div>
       </div>
@@ -2131,39 +2417,250 @@ function NewCellEntryCard({
     </>
   )
 
-  // ---- If expanded, render as fixed overlay ----
-  if (expanded) {
-    return (
-      <div className="fixed inset-0 z-[9999] bg-black/40 backdrop-blur-sm flex items-start justify-center pt-8 overflow-y-auto" style={{ paddingLeft: '280px' }}>
-        <div className={`bg-card rounded-xl shadow-2xl border border-border w-full mx-6 overflow-hidden ${disabled ? 'opacity-50 pointer-events-none' : ''}`} style={{ maxWidth: 'min(90vw, 1400px)' }}>
-          <div className="p-5">
-            {renderCardContent()}
-          </div>
+  return renderCardContent()
+}
+
+// ---- 数据工具统一卡片：新站录入 | 查询/修改 | 工参更新 ----
+// 三个页签从左到右排列、共用缩放按钮；放大态下页签仍可切换；
+// 三个模块保持挂载（hidden 切换），页签切换不丢失各自状态
+function CellToolsCard({
+  fullParamFiles,
+  currentParamFiles,
+  addLog,
+  permCellEntry,
+  permCellQueryUpdate,
+  permUpdate,
+  selectedFullParamId,
+  setSelectedFullParamId,
+  selectedCurrentParamId,
+  setSelectedCurrentParamId,
+  isUpdating,
+  onUpdateParameters,
+  outputAllColumns,
+  setOutputAllColumns,
+}: {
+  fullParamFiles: DataItem[]
+  currentParamFiles: DataItem[]
+  addLog: (type: any, message: string, status?: any, detail?: string, opKey?: string) => void
+  permCellEntry: boolean
+  permCellQueryUpdate: boolean
+  permUpdate: boolean
+  selectedFullParamId: string
+  setSelectedFullParamId: (v: string) => void
+  selectedCurrentParamId: string
+  setSelectedCurrentParamId: (v: string) => void
+  isUpdating: boolean
+  onUpdateParameters: () => void
+  outputAllColumns: boolean
+  setOutputAllColumns: (v: boolean) => void
+}) {
+  const { t } = useTranslation()
+  const [activeTab, setActiveTab] = useState<'entry' | 'query' | 'update'>('entry')
+  const [expanded, setExpanded] = useState(false)
+  // 放大态只铺到应用内容区（<main>）矩形，不覆盖侧栏/顶栏。
+  // 侧栏宽度可折叠（180px ↔ 42px），因此不写死数值，直接量 main 的矩形。
+  const [contentBox, setContentBox] = useState<DOMRect | null>(null)
+  useLayoutEffect(() => {
+    if (!expanded) {
+      setContentBox(null)
+      return
+    }
+    const measure = () => {
+      const main = document.querySelector('main')
+      setContentBox(main ? main.getBoundingClientRect() : null)
+    }
+    measure()
+    window.addEventListener('resize', measure)
+    const observer = new ResizeObserver(measure)
+    const main = document.querySelector('main')
+    if (main) observer.observe(main)
+    return () => {
+      window.removeEventListener('resize', measure)
+      observer.disconnect()
+    }
+  }, [expanded])
+
+  // 页签顺序（从左到右）：新站录入 | 查询/修改 | 工参更新(中兴)
+  const TABS: Array<{ key: 'entry' | 'query' | 'update'; label: string }> = [
+    { key: 'entry', label: t('newCellEntry.title') || '新站录入' },
+    { key: 'query', label: t('queryUpdate.title') || '查询/修改' },
+    { key: 'update', label: t('data.zteUpdateTitle') || '工参更新(中兴)' },
+  ]
+
+  // 页签 + 缩放按钮头部（普通态与放大态共用，页签字号/字重与"导入数据""已导入数据"标题一致）
+  const renderHeader = () => (
+    <div className="flex items-center border-b border-border mb-3 shrink-0">
+      <div className="flex items-center gap-5 -mb-px">
+        {TABS.map(tab => (
+          <button
+            key={tab.key}
+            onClick={() => setActiveTab(tab.key)}
+            className={`text-base font-semibold pb-2 border-b-2 transition-colors ${
+              activeTab === tab.key
+                ? 'text-primary border-primary'
+                : 'text-muted-foreground border-transparent hover:text-foreground'
+            }`}
+          >
+            {tab.label}
+          </button>
+        ))}
+      </div>
+      <button
+        data-guide="cell-tools-expand"
+        onClick={() => setExpanded(!expanded)}
+        className="ml-auto text-muted-foreground hover:text-foreground transition-colors p-1 rounded hover:bg-muted"
+        title={expanded ? (t('newCellEntry.collapse') || '缩回') : (t('newCellEntry.expand') || '展开')}
+      >
+        {expanded ? <Minimize2 size={16} /> : <Maximize2 size={14} />}
+      </button>
+    </div>
+  )
+
+  const renderContent = () => (
+    <>
+      <div className={activeTab === 'entry' ? '' : 'hidden'}>
+        <NewCellEntryContent
+          fullParamFiles={fullParamFiles}
+          addLog={addLog}
+          disabled={!permCellEntry}
+          expanded={expanded}
+        />
+      </div>
+      <div className={activeTab === 'query' ? '' : 'hidden'}>
+        <CellQueryUpdateContent
+          fullParamFiles={fullParamFiles}
+          addLog={addLog}
+          disabled={!permCellQueryUpdate}
+          expanded={expanded}
+        />
+      </div>
+      <div className={activeTab === 'update' ? '' : 'hidden'}>
+        <ParamUpdatePanel
+          fullParamFiles={fullParamFiles}
+          currentParamFiles={currentParamFiles}
+          selectedFullParamId={selectedFullParamId}
+          setSelectedFullParamId={setSelectedFullParamId}
+          selectedCurrentParamId={selectedCurrentParamId}
+          setSelectedCurrentParamId={setSelectedCurrentParamId}
+          isUpdating={isUpdating}
+          onUpdateParameters={onUpdateParameters}
+          outputAllColumns={outputAllColumns}
+          setOutputAllColumns={setOutputAllColumns}
+          permUpdate={permUpdate}
+        />
+      </div>
+    </>
+  )
+
+  // 普通态/放大态共用同一 React 树形状（仅切换 className），
+  // 保证三个内容组件在缩放切换时不卸载、表单/搜索/操作结果等状态持久化
+  return (
+    // 放大态定位容器贴合 <main> 内容区（普通态为无样式普通块，保持卡片在文档流中）
+    <div
+      style={expanded && contentBox
+        ? {
+            position: 'fixed', top: contentBox.top, left: contentBox.left,
+            width: contentBox.width, height: contentBox.height, zIndex: 9999,
+            // 放大态 fixed 定位时清掉父容器可能施加的 margin，避免顶端出现空隙
+            marginTop: 0,
+          }
+        : undefined}
+    >
+      <div
+        className={expanded
+          ? 'bg-card h-full flex flex-col p-5 overflow-hidden'
+          : 'bg-card p-3 rounded-lg border border-border'}
+      >
+        {renderHeader()}
+        {/* 放大态高度固定，内容超出时在此滚动（结构与普通态一致，切换不卸载子组件） */}
+        <div className={expanded ? 'flex-1 min-h-0 overflow-y-auto' : ''}>
+          {renderContent()}
         </div>
       </div>
-    )
-  }
-
-  // ---- Normal inline mode ----
-  return (
-    <div className={`bg-card p-3 rounded-lg border border-border -mt-6 ${disabled ? 'opacity-50 pointer-events-none' : ''}`}>
-      {renderCardContent()}
     </div>
   )
 }
 
-interface CellRow {
-  id: string
-  managedElementId: string
-  siteId: string
-  cellId: string
-  cellName: string
-  mcc: string
-  mnc: string
-  longitude: string
-  latitude: string
-  azimuth: string
-  frequency: string
-  ssbFrequency: string
-  cellCoverType: number
+// ---- 工参更新面板（原"工参更新"独立卡片内容，迁入统一卡片第三个页签） ----
+function ParamUpdatePanel({
+  fullParamFiles,
+  currentParamFiles,
+  selectedFullParamId,
+  setSelectedFullParamId,
+  selectedCurrentParamId,
+  setSelectedCurrentParamId,
+  isUpdating,
+  onUpdateParameters,
+  outputAllColumns,
+  setOutputAllColumns,
+  permUpdate,
+}: {
+  fullParamFiles: DataItem[]
+  currentParamFiles: DataItem[]
+  selectedFullParamId: string
+  setSelectedFullParamId: (v: string) => void
+  selectedCurrentParamId: string
+  setSelectedCurrentParamId: (v: string) => void
+  isUpdating: boolean
+  onUpdateParameters: () => void
+  outputAllColumns: boolean
+  setOutputAllColumns: (v: boolean) => void
+  permUpdate: boolean
+}) {
+  const { t } = useTranslation()
+  return (
+    <div className={permUpdate ? '' : 'opacity-50 pointer-events-none'}>
+      {!permUpdate && (
+        <p className="text-xs text-muted-foreground mb-2 bg-muted/40 px-2 py-1 rounded">
+          {t('data.noPermission', '无权限，请联系管理员')}
+        </p>
+      )}
+      <div className="flex items-end gap-2">
+        <div className="flex-1 min-w-0">
+          <select
+            className="w-full p-2 border rounded-md bg-background text-sm mb-2"
+            value={selectedFullParamId}
+            onChange={(e) => setSelectedFullParamId(e.target.value)}
+            title={t('data.selectFullParams') || '选择全量工参'}
+          >
+            <option value="" disabled>{t('data.selectFullParams') || '选择全量工参'}</option>
+            {fullParamFiles.map(f => (
+              <option key={f.id} value={f.id}>
+                {f.name} {f.originalPath ? '✓' : `(${t('data.noPath') || '无路径'})`}
+              </option>
+            ))}
+          </select>
+          <select
+            className="w-full p-2 border rounded-md bg-background text-sm"
+            value={selectedCurrentParamId}
+            onChange={(e) => setSelectedCurrentParamId(e.target.value)}
+            title={t('data.selectCurrentParams') || '选择现网工参 (ZIP)'}
+          >
+            <option value="" disabled>{t('data.selectCurrentParams') || '选择现网工参 (ZIP)'}</option>
+            {currentParamFiles.map(f => (
+              <option key={f.id} value={f.id}>{f.name}</option>
+            ))}
+          </select>
+          <label className="flex items-center gap-1.5 mt-2 text-xs text-muted-foreground cursor-pointer">
+            <input
+              type="checkbox"
+              className="h-3.5 w-3.5 accent-primary"
+              checked={outputAllColumns}
+              onChange={(e) => setOutputAllColumns(e.target.checked)}
+              disabled={isUpdating}
+            />
+            {t('data.outputAllColumns') || '输出全部列（默认仅常用列）'}
+          </label>
+        </div>
+        <button
+          onClick={onUpdateParameters}
+          disabled={isUpdating || !selectedFullParamId || !selectedCurrentParamId}
+          className="shrink-0 h-[calc(2.25rem*2+0.5rem)] px-3 bg-primary text-white rounded-md hover:bg-primary/100 disabled:opacity-50 disabled:cursor-not-allowed flex flex-col items-center justify-center gap-0.5 text-xs font-medium transition-colors"
+        >
+          {isUpdating ? <Loader2 className="animate-spin" size={16} /> : <RefreshCw size={16} />}
+          {isUpdating ? (t('data.updating') || '更新中') : (t('data.startUpdate') || '开始更新')}
+        </button>
+      </div>
+    </div>
+  )
 }

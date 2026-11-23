@@ -3,12 +3,13 @@ TAC规划API端点
 """
 
 import asyncio
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Request
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Request, Query, Response
 from typing import Dict, Any
 from datetime import datetime
 from app.models.schemas import TACConfig, TACResult
 from app.services.task_manager import task_manager
 from app.core.security import get_current_user
+from app.core.data_access import require_task_access, ensure_task_access
 
 router = APIRouter()
 
@@ -39,10 +40,11 @@ async def start_tac_planning(
 
 
 @router.get("/progress/{task_id}", response_model=Dict[str, Any])
-async def get_tac_progress(task_id: str) -> Dict[str, Any]:
-    """获取TAC规划进度"""
+async def get_tac_progress(task_id: str, _group=Depends(require_task_access)) -> Dict[str, Any]:
+    """获取TAC规划进度（只返回状态/统计，不返回完整结果）"""
     try:
-        progress = task_manager.get_task_progress(task_id)
+        # 任务完成后进度轮询若带完整结果，会每 2 秒重复解析/传输数 MB JSON
+        progress = task_manager.get_task_progress_meta(task_id)
         if not progress:
             raise HTTPException(status_code=404, detail="任务不存在")
         return {"success": True, "data": progress}
@@ -52,11 +54,93 @@ async def get_tac_progress(task_id: str) -> Dict[str, Any]:
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.get("/result/{task_id}/meta", response_model=Dict[str, Any])
+async def get_tac_result_meta(task_id: str, _group=Depends(require_task_access)) -> Dict[str, Any]:
+    """TAC 核查结果轻量元数据（不加载完整结果）。"""
+    try:
+        from app.services import task_result_index_service as index_service
+
+        meta = index_service.get_task_meta(task_id)
+        if meta is None:
+            raise HTTPException(status_code=404, detail="任务不存在")
+        if meta["status"] == "completed" and not meta["rowsReady"]:
+            index_service.schedule_index(task_id, "tac")
+        return {"success": True, "data": meta}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/result/{task_id}/rows", response_model=Dict[str, Any])
+async def get_tac_result_rows(
+    task_id: str,
+    request: Request,
+    response: Response,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(200, ge=1, le=1000),
+    _group=Depends(require_task_access),
+) -> Dict[str, Any]:
+    """TAC 核查结果分页；搜索条件通过查询参数透传。"""
+    try:
+        from starlette.concurrency import run_in_threadpool
+        from app.services import task_result_index_service as index_service
+        from app.api.v1.endpoints import _result_cache
+
+        cached = _result_cache.not_modified(request, task_id)
+        if cached is not None:
+            return cached
+        if not index_service.ensure_indexed(task_id, "tac"):
+            return {"success": True, "data": {"preparing": True, "rows": [], "total": 0}}
+        filters = {
+            key: value for key, value in request.query_params.items()
+            if key not in ("page", "page_size")
+        }
+        data = await run_in_threadpool(
+            index_service.query_rows, task_id, "tac", page, page_size, filters
+        )
+        _result_cache.apply_headers(request, response, task_id)
+        return {"success": True, "data": data}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/result/{task_id}/map", response_model=Dict[str, Any])
+async def get_tac_result_map(
+    task_id: str,
+    request: Request,
+    response: Response,
+    _group=Depends(require_task_access),
+) -> Dict[str, Any]:
+    """地图专用精简结果（TAC 核查/规划字段较少，可整包下发）。"""
+    try:
+        from starlette.concurrency import run_in_threadpool
+        from app.services import task_result_index_service as index_service
+        from app.api.v1.endpoints import _result_cache
+
+        cached = _result_cache.not_modified(request, task_id)
+        if cached is not None:
+            return cached
+        if not index_service.ensure_indexed(task_id, "tac"):
+            return {"success": True, "data": {"preparing": True, "rows": []}}
+        rows = await run_in_threadpool(index_service.query_map_rows, task_id, "tac")
+        _result_cache.apply_headers(request, response, task_id)
+        return {"success": True, "data": {"rows": rows}}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get("/result/{task_id}", response_model=Dict[str, Any])
-async def get_tac_result(task_id: str) -> Dict[str, Any]:
+async def get_tac_result(task_id: str, _group=Depends(require_task_access)) -> Dict[str, Any]:
     """获取TAC规划结果"""
     try:
-        result = task_manager.get_task_result(task_id)
+        from starlette.concurrency import run_in_threadpool
+
+        result = await run_in_threadpool(task_manager.get_task_result, task_id)
         if not result:
             raise HTTPException(status_code=404, detail="任务不存在")
         return {"success": True, "data": result}
@@ -67,11 +151,12 @@ async def get_tac_result(task_id: str) -> Dict[str, Any]:
 
 
 @router.get("/export/{task_id}")
-async def export_tac_result(task_id: str, format: str = "xlsx"):
+async def export_tac_result(task_id: str, format: str = "xlsx", _group=Depends(require_task_access)):
     """导出TAC规划结果"""
     try:
-        # 从任务管理器获取任务结果
-        result = task_manager.get_task_result(task_id)
+        from starlette.concurrency import run_in_threadpool
+
+        result = await run_in_threadpool(task_manager.get_task_result, task_id)
         if not result:
             raise HTTPException(status_code=404, detail="任务不存在")
 
@@ -86,7 +171,7 @@ async def export_tac_result(task_id: str, format: str = "xlsx"):
 
 
 @router.delete("/history/{task_id}", response_model=Dict[str, Any])
-async def delete_tac_history(task_id: str) -> Dict[str, Any]:
+async def delete_tac_history(task_id: str, _group=Depends(require_task_access)) -> Dict[str, Any]:
     """删除指定的 TAC 核查历史任务"""
     try:
         success = task_manager.delete_task(task_id)
@@ -101,10 +186,14 @@ async def delete_tac_history(task_id: str) -> Dict[str, Any]:
 
 
 @router.get("/history", response_model=Dict[str, Any])
-async def get_tac_history() -> Dict[str, Any]:
-    """获取所有用户的 TAC 核查历史任务列表"""
+async def get_tac_history(
+    page: int = Query(1, ge=1, description="页码（从 1 开始）"),
+    page_size: int = Query(20, ge=1, le=100, description="每页条数"),
+    current_user=Depends(get_current_user),
+) -> Dict[str, Any]:
+    """获取 TAC 核查历史任务列表（分页，按地市+运营商组隔离）"""
     try:
-        results = task_manager.list_task_history(task_type="tac")
+        results = task_manager.list_task_history(task_type="tac", page=page, page_size=page_size, user=current_user)
         return {"success": True, "data": results}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -136,10 +225,10 @@ async def start_tac_planning_task(
  
  
 @router.get("/planning/progress/{task_id}", response_model=Dict[str, Any])
-async def get_tac_planning_progress(task_id: str) -> Dict[str, Any]:
-    """获取TAC规划任务进度"""
+async def get_tac_planning_progress(task_id: str, _group=Depends(require_task_access)) -> Dict[str, Any]:
+    """获取TAC规划任务进度（只返回状态/统计）"""
     try:
-        progress = task_manager.get_task_progress(task_id)
+        progress = task_manager.get_task_progress_meta(task_id)
         if not progress:
             raise HTTPException(status_code=404, detail="任务不存在")
         return {"success": True, "data": progress}
@@ -149,11 +238,92 @@ async def get_tac_planning_progress(task_id: str) -> Dict[str, Any]:
         raise HTTPException(status_code=500, detail=str(e))
  
  
+@router.get("/planning/result/{task_id}/meta", response_model=Dict[str, Any])
+async def get_tac_planning_result_meta(task_id: str, _group=Depends(require_task_access)) -> Dict[str, Any]:
+    try:
+        from app.services import task_result_index_service as index_service
+
+        meta = index_service.get_task_meta(task_id)
+        if meta is None:
+            raise HTTPException(status_code=404, detail="任务不存在")
+        if meta["status"] == "completed" and not meta["rowsReady"]:
+            index_service.schedule_index(task_id, "tac_planning")
+        return {"success": True, "data": meta}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/planning/result/{task_id}/rows", response_model=Dict[str, Any])
+async def get_tac_planning_result_rows(
+    task_id: str,
+    request: Request,
+    response: Response,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(200, ge=1, le=1000),
+    _group=Depends(require_task_access),
+) -> Dict[str, Any]:
+    try:
+        from starlette.concurrency import run_in_threadpool
+        from app.services import task_result_index_service as index_service
+        from app.api.v1.endpoints import _result_cache
+
+        cached = _result_cache.not_modified(request, task_id)
+        if cached is not None:
+            return cached
+        if not index_service.ensure_indexed(task_id, "tac_planning"):
+            return {"success": True, "data": {"preparing": True, "rows": [], "total": 0}}
+        filters = {
+            key: value for key, value in request.query_params.items()
+            if key not in ("page", "page_size")
+        }
+        data = await run_in_threadpool(
+            index_service.query_rows, task_id, "tac_planning", page, page_size, filters
+        )
+        _result_cache.apply_headers(request, response, task_id)
+        return {"success": True, "data": data}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/planning/result/{task_id}/map", response_model=Dict[str, Any])
+async def get_tac_planning_result_map(
+    task_id: str,
+    request: Request,
+    response: Response,
+    _group=Depends(require_task_access),
+) -> Dict[str, Any]:
+    try:
+        from starlette.concurrency import run_in_threadpool
+        from app.services import task_result_index_service as index_service
+        from app.api.v1.endpoints import _result_cache
+
+        cached = _result_cache.not_modified(request, task_id)
+        if cached is not None:
+            return cached
+        if not index_service.ensure_indexed(task_id, "tac_planning"):
+            return {"success": True, "data": {"preparing": True, "rows": []}}
+        rows = await run_in_threadpool(
+            index_service.query_map_rows, task_id, "tac_planning"
+        )
+        _result_cache.apply_headers(request, response, task_id)
+        return {"success": True, "data": {"rows": rows}}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get("/planning/result/{task_id}", response_model=Dict[str, Any])
-async def get_tac_planning_result_data(task_id: str) -> Dict[str, Any]:
+async def get_tac_planning_result_data(task_id: str, _group=Depends(require_task_access)) -> Dict[str, Any]:
     """获取TAC规划任务结果"""
     try:
-        result = task_manager.get_task_result(task_id)
+        from starlette.concurrency import run_in_threadpool
+
+        result = await run_in_threadpool(task_manager.get_task_result, task_id)
         if not result:
             raise HTTPException(status_code=404, detail="任务不存在")
         return {"success": True, "data": result}
@@ -164,13 +334,14 @@ async def get_tac_planning_result_data(task_id: str) -> Dict[str, Any]:
  
  
 @router.get("/planning/export/{task_id}")
-async def export_tac_planning_result_file(task_id: str, format: str = "xlsx"):
+async def export_tac_planning_result_file(task_id: str, format: str = "xlsx", _group=Depends(require_task_access)):
     """导出TAC规划任务结果"""
     try:
         # 从任务管理器获取任务结果 (使用统一的 export_result)
         # 或者使用专用的 export_tac_planning_result (如果需要特殊格式)
+        from starlette.concurrency import run_in_threadpool
         from app.services.export_service import export_tac_planning_result
-        result = task_manager.get_task_result(task_id)
+        result = await run_in_threadpool(task_manager.get_task_result, task_id)
         if not result:
             raise HTTPException(status_code=404, detail="任务不存在")
         return await export_tac_planning_result(task_id, result, format)
@@ -181,7 +352,7 @@ async def export_tac_planning_result_file(task_id: str, format: str = "xlsx"):
 
 
 @router.delete("/planning/history/{task_id}", response_model=Dict[str, Any])
-async def delete_tac_planning_history(task_id: str) -> Dict[str, Any]:
+async def delete_tac_planning_history(task_id: str, _group=Depends(require_task_access)) -> Dict[str, Any]:
     """删除指定的 TAC 规划历史任务"""
     try:
         success = task_manager.delete_task(task_id)
@@ -196,17 +367,21 @@ async def delete_tac_planning_history(task_id: str) -> Dict[str, Any]:
 
 
 @router.get("/planning/history", response_model=Dict[str, Any])
-async def get_tac_planning_history() -> Dict[str, Any]:
-    """获取所有用户的 TAC 规划历史任务列表"""
+async def get_tac_planning_history(
+    page: int = Query(1, ge=1, description="页码（从 1 开始）"),
+    page_size: int = Query(20, ge=1, le=100, description="每页条数"),
+    current_user=Depends(get_current_user),
+) -> Dict[str, Any]:
+    """获取 TAC 规划历史任务列表（分页，按地市+运营商组隔离）"""
     try:
-        results = task_manager.list_task_history(task_type="tac_planning")
+        results = task_manager.list_task_history(task_type="tac_planning", page=page, page_size=page_size, user=current_user)
         return {"success": True, "data": results}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.post("/planning/apply-to-params/{task_id}", response_model=Dict[str, Any])
-async def apply_tac_planning_to_params(task_id: str) -> Dict[str, Any]:
+async def apply_tac_planning_to_params(task_id: str, _group=Depends(require_task_access)) -> Dict[str, Any]:
     """
     将TAC规划结果应用到全量工参
 
@@ -246,7 +421,7 @@ async def apply_tac_planning_to_params(task_id: str) -> Dict[str, Any]:
 
 
 @router.post("/planning/apply-batch", response_model=Dict[str, Any])
-async def apply_tac_planning_batch(request: Dict[str, Any]) -> Dict[str, Any]:
+async def apply_tac_planning_batch(request: Dict[str, Any], current_user=Depends(get_current_user)) -> Dict[str, Any]:
     """
     批量将多个TAC规划结果应用到全量工参
 
@@ -256,6 +431,9 @@ async def apply_tac_planning_batch(request: Dict[str, Any]) -> Dict[str, Any]:
         task_ids = request.get("taskIds", [])
         if not task_ids or not isinstance(task_ids, list):
             raise HTTPException(status_code=400, detail="请提供有效的taskIds列表")
+        # 跨组隔离：仅允许应用本组任务
+        for _tid in task_ids:
+            ensure_task_access(_tid, current_user)
 
         apply_task_id = await task_manager.create_apply_tac_planning_batch_task(task_ids)
 
@@ -289,7 +467,7 @@ async def apply_tac_planning_batch(request: Dict[str, Any]) -> Dict[str, Any]:
 
 
 @router.get("/planning/apply-to-params/progress/{apply_task_id}", response_model=Dict[str, Any])
-async def get_apply_tac_planning_progress(apply_task_id: str) -> Dict[str, Any]:
+async def get_apply_tac_planning_progress(apply_task_id: str, _group=Depends(require_task_access)) -> Dict[str, Any]:
     """获取TAC规划应用到工参任务进度"""
     try:
         progress = task_manager.get_task_progress(apply_task_id)
@@ -303,7 +481,7 @@ async def get_apply_tac_planning_progress(apply_task_id: str) -> Dict[str, Any]:
 
 
 @router.get("/planning/apply-to-params/result/{apply_task_id}", response_model=Dict[str, Any])
-async def get_apply_tac_planning_result(apply_task_id: str) -> Dict[str, Any]:
+async def get_apply_tac_planning_result(apply_task_id: str, _group=Depends(require_task_access)) -> Dict[str, Any]:
     """获取TAC规划应用到工参结果"""
     try:
         result = task_manager.get_task_result(apply_task_id)
@@ -317,7 +495,7 @@ async def get_apply_tac_planning_result(apply_task_id: str) -> Dict[str, Any]:
 
 
 @router.post("/planning/history/{task_id}/mark-applied", response_model=Dict[str, Any])
-async def mark_tac_planning_task_applied(task_id: str) -> Dict[str, Any]:
+async def mark_tac_planning_task_applied(task_id: str, _group=Depends(require_task_access)) -> Dict[str, Any]:
     """标记TAC规划任务为已应用（跨用户共享），同时清除地图缓存"""
     try:
         success = task_manager.mark_task_applied(task_id)
@@ -326,8 +504,7 @@ async def mark_tac_planning_task_applied(task_id: str) -> Dict[str, Any]:
         # 清除后端地图缓存，使扇区属性更新生效
         try:
             import app.api.v1.endpoints.map as map_module
-            map_module._map_data_cache = None
-            map_module._map_data_cache_time = 0
+            map_module.invalidate_map_data_cache()
         except Exception:
             pass
         from app.services.mapinfo_service import clear_layer_cache

@@ -1,6 +1,7 @@
-import { useState } from 'react'
-import { Check, Palette, Sun, Moon, Key, RefreshCw, X, Globe, Calendar, Infinity, Loader2 } from 'lucide-react'
+import { useCallback, useEffect, useState } from 'react'
+import { Check, Palette, Sun, Moon, Key, RefreshCw, X, Globe, Calendar, Infinity, Loader2, LifeBuoy, Settings, Info } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
+import type { MachineInfo, LicenseStatus, DesktopCloudStatus } from '@shared/types'
 import {
   useThemeStore,
   ThemeMode,
@@ -11,7 +12,10 @@ import {
   kebabCase
 } from '../store/themeStore'
 import { useAuthStore } from '../store/authStore'
-import { licenseApi } from '../services/api'
+import { useDesktopUpdateStore } from '../store/desktopUpdateStore'
+import { licenseApi, desktopCloudApi, desktopUpdateApi } from '../services/api'
+import { LLMConfigCard } from '../components/LLMConfigCard'
+import { DesktopUpdateReadyBanner } from '../components/DesktopUpdateReadyBanner'
 
 export function LicensePage() {
   const { t, i18n } = useTranslation()
@@ -21,18 +25,82 @@ export function LicensePage() {
 
   const { themeMode, colorScheme, setThemeMode, setColorScheme, applyTheme } = useThemeStore()
   const { user, fetchUser } = useAuthStore()
+  const desktopMode = useAuthStore((s) => s.desktopMode)
   const [previewTheme, setPreviewTheme] = useState<ThemeMode | null>(null)
   const [previewColor, setPreviewColor] = useState<ColorScheme | null>(null)
 
   const isAdmin = user?.is_admin ?? false
-  const licenseExpiry = user?.license_expiry ?? null
+
+  // 机器信息 / 授权状态：桌面版版本卡片与网页端期限配置仍需要
+  const [machineInfo, setMachineInfo] = useState<MachineInfo | null>(null)
+  const [licenseStatus, setLicenseStatus] = useState<LicenseStatus | null>(null)
+
+  const refreshLicenseState = useCallback(async () => {
+    try {
+      const [infoRes, statusRes] = await Promise.all([
+        licenseApi.getMachineInfo(),
+        licenseApi.getStatus(),
+      ])
+      if (infoRes.success) setMachineInfo(infoRes.data)
+      if (statusRes.success) setLicenseStatus(statusRes.data)
+    } catch {
+      // 服务器部署无机器码接口时静默忽略
+    }
+  }, [])
+
+  // 桌面端云端状态：仅版本与更新卡片读取 version / channel
+  const [cloudStatus, setCloudStatus] = useState<DesktopCloudStatus | null>(null)
+
+  const refreshCloudStatus = useCallback(async () => {
+    try {
+      const res = await desktopCloudApi.getStatus()
+      if (res.success) setCloudStatus(res.data)
+    } catch {
+      // 非桌面版或本机后端不可用
+    }
+  }, [])
+
+  useEffect(() => {
+    if (machineInfo?.desktopMode) refreshCloudStatus()
+  }, [machineInfo?.desktopMode, refreshCloudStatus])
+
+  // ---- 版本与更新（桌面版）：当前版本 + 手动检查更新 ----
+  const [checkingUpdate, setCheckingUpdate] = useState(false)
+  const [checkMessage, setCheckMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
+  const requestUpdateCheck = useDesktopUpdateStore((s) => s.requestCheck)
+
+  const handleCheckUpdate = async () => {
+    setCheckingUpdate(true)
+    setCheckMessage(null)
+    try {
+      const res = await desktopUpdateApi.status()
+      const data = res?.data
+      if (data?.update_available && data.release) {
+        // 有新版本：交给全局更新弹窗展示与下载，避免维护两套更新 UI
+        requestUpdateCheck(data)
+      } else {
+        setCheckMessage({ type: 'success', text: t('desktopUpdate.upToDate') })
+      }
+    } catch (err: any) {
+      setCheckMessage({ type: 'error', text: err?.message || t('desktopUpdate.checkFailed') })
+    } finally {
+      setCheckingUpdate(false)
+      setTimeout(() => setCheckMessage(null), 6000)
+    }
+  }
+
+  useEffect(() => {
+    // 桌面版所有用户都要机器信息（版本卡片/授权展示）；网页端仅管理员需要
+    if (isAdmin || desktopMode) refreshLicenseState()
+  }, [isAdmin, desktopMode, refreshLicenseState])
 
   const handleThemeSelect = (mode: ThemeMode) => {
     setPreviewTheme(mode)
     const root = document.documentElement
     const themeVars = mode === 'dark' ? DARK_THEME_VARS : LIGHT_THEME_VARS
     Object.entries(themeVars).forEach(([key, value]) => {
-      root.style.setProperty(`--${key}`, value)
+      // kebab-case：与 applyTheme / CSS 变量名一致（驼峰名写不进 --muted-foreground 等）
+      root.style.setProperty(`--${kebabCase(key)}`, value)
     })
   }
 
@@ -69,9 +137,12 @@ export function LicensePage() {
     try {
       const result = await licenseApi.updateExpiry(selectedDate || null)
       if (result.success) {
-        setUpdateMessage({ type: 'success', text: t('license.updateSuccess') })
+        setUpdateMessage({
+          type: 'success',
+          text: t('license.updateSuccess', { count: result.data?.users_updated ?? 0 }),
+        })
         await fetchUser()
-        setSelectedDate('')
+        await refreshLicenseState()
       } else {
         setUpdateMessage({ type: 'error', text: (result as any).message || t('license.updateFailed') })
       }
@@ -89,9 +160,12 @@ export function LicensePage() {
     try {
       const result = await licenseApi.updateExpiry(null)
       if (result.success) {
-        setUpdateMessage({ type: 'success', text: t('license.unlimitedSet') })
+        setUpdateMessage({
+          type: 'success',
+          text: t('license.unlimitedSet', { count: result.data?.users_updated ?? 0 }),
+        })
         await fetchUser()
-        setSelectedDate('')
+        await refreshLicenseState()
       } else {
         setUpdateMessage({ type: 'error', text: (result as any).message || t('license.updateFailed') })
       }
@@ -103,262 +177,247 @@ export function LicensePage() {
     }
   }
 
-  const getExpiryDisplay = () => {
-    if (!licenseExpiry) return { text: t('license.unlimited'), remaining: null, expired: false }
-    try {
-      const expiry = new Date(licenseExpiry)
-      const now = new Date()
-      const remaining = Math.ceil((expiry.getTime() - now.getTime()) / (1000 * 60 * 60 * 24))
-      const locale = i18n.language === 'en' ? 'en-US' : 'zh-CN'
-      return {
-        text: expiry.toLocaleDateString(locale, { year: 'numeric', month: 'long', day: 'numeric' }),
-        remaining,
-        expired: remaining < 0,
-      }
-    } catch {
-      return { text: licenseExpiry, remaining: null, expired: false }
-    }
-  }
-
-  const expiryInfo = getExpiryDisplay()
+  // 输入框预填**全局**授权期限（/license/status 返回的就是全局值）。
+  // 不能用 user.license_expiry：那是管理员个人的例外期限，与该卡片改的全局值不是一回事。
+  useEffect(() => {
+    if (!isAdmin) return
+    setSelectedDate(licenseStatus?.expiryDate ? licenseStatus.expiryDate.slice(0, 10) : '')
+  }, [isAdmin, licenseStatus?.expiryDate])
 
   return (
-    <div className="p-6">
-      <h1 className="text-base font-bold mb-6">{t('license.title')}</h1>
+    <div className="p-6 w-full space-y-6">
+      <div className="flex items-center gap-2">
+        <Settings size={20} className="text-primary" />
+        <h1 className="text-base font-bold">{t('license.title')}</h1>
+      </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 max-w-5xl">
-        {/* 语言设置 */}
+      {/* 大模型配置（网优助手）：仅管理员或被授予网优助手权限的用户可见 */}
+      {(isAdmin || user?.can_assistant) && <LLMConfigCard />}
+
+      {/* 版本与更新（仅桌面版）：当前版本 + 检查更新 */}
+      {machineInfo?.desktopMode && (
         <div className="bg-card p-5 rounded-lg border border-border">
           <div className="flex items-center gap-2 mb-4">
-            <Globe size={20} className="text-primary" />
-            <h2 className="text-base font-semibold">{t('language.title')}</h2>
+            <Info size={20} className="text-primary" />
+            <h2 className="text-base font-semibold">{t('desktopUpdate.versionTitle')}</h2>
           </div>
 
-          <div className="space-y-3">
-            <p className="text-xs text-muted-foreground">{t('language.select')}</p>
-            <div className="flex gap-2">
-              <button
-                onClick={() => handleLanguageChange('zh')}
-                className={`flex-1 px-4 py-2.5 rounded-lg border-2 transition-all text-sm font-medium ${
-                  i18n.language === 'zh'
-                    ? 'border-primary bg-primary/10 text-primary'
-                    : 'border-border hover:border-primary/50'
-                }`}
-              >
-                {t('language.zh')}
-              </button>
-              <button
-                onClick={() => handleLanguageChange('en')}
-                className={`flex-1 px-4 py-2.5 rounded-lg border-2 transition-all text-sm font-medium ${
-                  i18n.language === 'en'
-                    ? 'border-primary bg-primary/10 text-primary'
-                    : 'border-border hover:border-primary/50'
-                }`}
-              >
-                {t('language.en')}
-              </button>
+          <div className="flex flex-wrap items-end gap-x-8 gap-y-3">
+            <div>
+              <div className="text-xs text-muted-foreground mb-1">{t('desktopUpdate.currentVersion')}</div>
+              <div className="text-sm font-mono">{cloudStatus?.version || t('desktopUpdate.versionUnknown')}</div>
+            </div>
+            <div>
+              <div className="text-xs text-muted-foreground mb-1">{t('desktopUpdate.channelLabel')}</div>
+              <div className="text-sm">{cloudStatus?.channel || '-'}</div>
+            </div>
+            <button
+              onClick={handleCheckUpdate}
+              disabled={checkingUpdate}
+              className="px-4 py-2 border border-border rounded-lg hover:bg-muted disabled:opacity-50 text-sm font-medium flex items-center gap-1.5"
+            >
+              {checkingUpdate ? <Loader2 size={14} className="animate-spin" /> : <RefreshCw size={14} />}
+              {checkingUpdate ? t('desktopUpdate.checking') : t('desktopUpdate.checkButton')}
+            </button>
+          </div>
+
+          {/* 安装包已下载完成 → 「更新已就绪，重启后完成更新」+ 立即重启 */}
+          <DesktopUpdateReadyBanner />
+
+          {checkMessage && (
+            <div className={`mt-3 p-2 rounded flex items-center gap-2 ${
+              checkMessage.type === 'success'
+                ? 'bg-green-500/10 border border-green-500/20 text-green-500'
+                : 'bg-red-500/10 border border-red-500/20 text-red-500'
+            }`}>
+              {checkMessage.type === 'success' ? <Check size={14} /> : <X size={14} />}
+              <span className="text-xs">{checkMessage.text}</span>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* 语言设置 */}
+      <div className="bg-card p-5 rounded-lg border border-border">
+        <div className="flex items-center gap-2 mb-4">
+          <Globe size={20} className="text-primary" />
+          <h2 className="text-base font-semibold">{t('language.title')}</h2>
+        </div>
+
+        <p className="text-xs text-muted-foreground mb-3">{t('language.select')}</p>
+        <div className="flex gap-2 max-w-md">
+          <button
+            onClick={() => handleLanguageChange('zh')}
+            className={`flex-1 px-4 py-2.5 rounded-lg border-2 transition-all text-sm font-medium ${
+              i18n.language === 'zh'
+                ? 'border-primary bg-primary/10 text-primary'
+                : 'border-border hover:border-primary/50'
+            }`}
+          >
+            {t('language.zh')}
+          </button>
+          <button
+            onClick={() => handleLanguageChange('en')}
+            className={`flex-1 px-4 py-2.5 rounded-lg border-2 transition-all text-sm font-medium ${
+              i18n.language === 'en'
+                ? 'border-primary bg-primary/10 text-primary'
+                : 'border-border hover:border-primary/50'
+            }`}
+          >
+            {t('language.en')}
+          </button>
+        </div>
+      </div>
+
+      {/* 主题与配色 */}
+      <div className="bg-card p-5 rounded-lg border border-border">
+        <div className="flex items-center gap-2 mb-4">
+          <Palette size={20} className="text-primary" />
+          <h2 className="text-base font-semibold">{t('theme.title')}</h2>
+        </div>
+
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+          <div>
+            <h3 className="text-xs font-medium text-muted-foreground mb-3">{t('theme.themeMode')}</h3>
+            <div className="grid grid-cols-2 gap-3 max-w-md">
+              <ThemeModeCard
+                mode="dark"
+                icon={<Moon size={18} />}
+                label={t('theme.dark')}
+                isSelected={(previewTheme || themeMode) === 'dark'}
+                onSelect={() => handleThemeSelect('dark')}
+                previewBg="bg-slate-900"
+                previewText="text-white"
+              />
+              <ThemeModeCard
+                mode="light"
+                icon={<Sun size={18} />}
+                label={t('theme.light')}
+                isSelected={(previewTheme || themeMode) === 'light'}
+                onSelect={() => handleThemeSelect('light')}
+                previewBg="bg-white"
+                previewText="text-slate-900"
+              />
+            </div>
+          </div>
+
+          <div>
+            <h3 className="text-xs font-medium text-muted-foreground mb-3">{t('theme.colorScheme')}</h3>
+            <div className="flex flex-wrap gap-2">
+              {(['blue', 'green', 'purple', 'orange', 'pink'] as ColorScheme[]).map((color) => (
+                <ColorSwatch
+                  key={color}
+                  color={color}
+                  isSelected={(previewColor || colorScheme) === color}
+                  onSelect={() => handleColorSelect(color)}
+                />
+              ))}
             </div>
           </div>
         </div>
 
-        {/* License管理 */}
+        {(previewTheme || previewColor) && (
+          <div className="flex gap-2 pt-4 mt-4 border-t border-border max-w-md">
+            <button
+              onClick={handleApplyTheme}
+              className="flex-1 px-4 py-2 bg-primary text-primary-foreground rounded-lg hover:opacity-90 text-sm font-medium"
+            >
+              {t('theme.apply')}
+            </button>
+            <button
+              onClick={handleCancelTheme}
+              className="flex-1 px-4 py-2 bg-secondary text-secondary-foreground rounded-lg hover:opacity-90 text-sm font-medium"
+            >
+              {t('theme.cancel')}
+            </button>
+          </div>
+        )}
+      </div>
+
+      {/* 授权管理（仅管理员，且非桌面版）：桌面版期限由授权文件控制 */}
+      {isAdmin && !machineInfo?.desktopMode && (
         <div className="bg-card p-5 rounded-lg border border-border">
           <div className="flex items-center justify-between mb-4">
             <div className="flex items-center gap-2">
               <Key size={20} className="text-primary" />
-              <h2 className="text-base font-semibold">
-                {isAdmin ? t('license.adminTitle') : t('license.userTitle')}
-              </h2>
+              <h2 className="text-base font-semibold">{t('license.adminTitle')}</h2>
             </div>
-            {isAdmin && (
-              <button
-                onClick={() => fetchUser()}
-                className="p-1.5 hover:bg-muted rounded-lg transition-colors"
-                title={t('license.refresh')}
-              >
-                <RefreshCw size={16} />
-              </button>
-            )}
+            <button
+              onClick={() => fetchUser()}
+              className="p-1.5 hover:bg-muted rounded-lg transition-colors"
+              title={t('license.refresh')}
+            >
+              <RefreshCw size={16} />
+            </button>
           </div>
 
-          <div className="space-y-3">
-            {/* 授权状态 */}
-            <div className="flex items-center justify-between py-2 border-b border-border">
-              <span className="text-sm text-muted-foreground">{t('license.statusLabel')}</span>
-              <div className="flex items-center gap-1.5">
-                {expiryInfo.expired ? (
-                  <>
-                    <X size={14} className="text-red-500" />
-                    <span className="text-sm text-red-500 font-medium">{t('license.expired')}</span>
-                  </>
-                ) : (
-                  <>
-                    <Check size={14} className="text-green-500" />
-                    <span className="text-sm text-green-500 font-medium">{t('license.valid')}</span>
-                  </>
-                )}
-              </div>
+          <div className="space-y-3 max-w-2xl">
+            <p className="text-xs text-muted-foreground">{t('license.adminHint')}</p>
+
+            <div className="max-w-xs">
+              <label className="block text-xs text-muted-foreground mb-1.5">{t('license.expiryDateInput')}</label>
+              <input
+                type="date"
+                value={selectedDate}
+                onChange={(e) => setSelectedDate(e.target.value)}
+                className="w-full px-3 py-2 bg-background border border-border rounded-lg text-foreground text-sm focus:outline-none focus:ring-2 focus:ring-primary/50"
+              />
             </div>
 
-            {/* 授权到期日期 */}
-            <div className="flex items-center justify-between py-2 border-b border-border">
-              <span className="text-sm text-muted-foreground">{t('license.expiryDateLabel')}</span>
-              <span className={`text-sm font-mono font-medium ${expiryInfo.expired ? 'text-red-500' : ''}`}>
-                {expiryInfo.text}
-              </span>
+            <div className="flex gap-2">
+              <button
+                onClick={handleUpdateExpiry}
+                disabled={isUpdating || !selectedDate}
+                className="px-4 py-2 bg-primary text-primary-foreground rounded-lg hover:opacity-90 disabled:opacity-50 text-sm font-medium flex items-center justify-center gap-1.5"
+              >
+                {isUpdating ? <Loader2 size={14} className="animate-spin" /> : <Calendar size={14} />}
+                {t('license.updateButton')}
+              </button>
+              <button
+                onClick={handleSetUnlimited}
+                disabled={isUpdating}
+                className="px-4 py-2 border border-border rounded-lg hover:bg-muted text-sm font-medium flex items-center gap-1.5 disabled:opacity-50"
+              >
+                <Infinity size={14} />
+                {t('license.setUnlimited')}
+              </button>
             </div>
 
-            {/* 剩余天数 */}
-            {expiryInfo.remaining !== null && (
-              <div className="flex items-center justify-between py-2">
-                <span className="text-sm text-muted-foreground">{t('license.remainingDaysLabel')}</span>
-                <span className={`text-sm font-medium ${expiryInfo.remaining <= 30 ? 'text-orange-500' : ''}`}>
-                  {expiryInfo.remaining} {t('license.daysUnit')}
-                </span>
-              </div>
-            )}
-
-            {!licenseExpiry && (
-              <div className="flex items-center justify-between py-2">
-                <span className="text-sm text-muted-foreground">{t('license.remainingDaysLabel')}</span>
-                <span className="text-sm font-medium text-muted-foreground flex items-center gap-1">
-                  <Infinity size={14} /> {t('license.unlimited')}
-                </span>
-              </div>
-            )}
-
-            {/* 管理员操作区 */}
-            {isAdmin && (
-              <div className="pt-3 border-t border-border space-y-3">
-                <p className="text-xs text-muted-foreground">{t('license.adminHint')}</p>
-
-                <div>
-                  <label className="block text-xs text-muted-foreground mb-1.5">{t('license.expiryDateInput')}</label>
-                  <input
-                    type="date"
-                    value={selectedDate}
-                    onChange={(e) => setSelectedDate(e.target.value)}
-                    className="w-full px-3 py-2 bg-background border border-border rounded-lg text-foreground text-sm focus:outline-none focus:ring-2 focus:ring-primary/50"
-                  />
-                </div>
-
-                <div className="flex gap-2">
-                  <button
-                    onClick={handleUpdateExpiry}
-                    disabled={isUpdating || !selectedDate}
-                    className="flex-1 px-4 py-2 bg-primary text-primary-foreground rounded-lg hover:opacity-90 disabled:opacity-50 text-sm font-medium flex items-center justify-center gap-1.5"
-                  >
-                    {isUpdating ? <Loader2 size={14} className="animate-spin" /> : <Calendar size={14} />}
-                    {t('license.updateButton')}
-                  </button>
-                  <button
-                    onClick={handleSetUnlimited}
-                    disabled={isUpdating}
-                    className="px-4 py-2 border border-border rounded-lg hover:bg-muted text-sm font-medium flex items-center gap-1.5 disabled:opacity-50"
-                  >
-                    <Infinity size={14} />
-                    {t('license.setUnlimited')}
-                  </button>
-                </div>
-
-                {updateMessage && (
-                  <div className={`p-2 rounded flex items-center gap-2 ${
-                    updateMessage.type === 'success'
-                      ? 'bg-green-500/10 border border-green-500/20 text-green-500'
-                      : 'bg-red-500/10 border border-red-500/20 text-red-500'
-                  }`}>
-                    {updateMessage.type === 'success' ? <Check size={14} /> : <X size={14} />}
-                    <span className="text-xs">{updateMessage.text}</span>
-                  </div>
-                )}
-              </div>
-            )}
-
-            {/* 普通用户过期提示 */}
-            {!isAdmin && expiryInfo.expired && (
-              <div className="pt-3 border-t border-border">
-                <div className="p-3 bg-red-500/10 border border-red-500/20 rounded-lg">
-                  <p className="text-sm text-red-500 font-medium mb-2">{t('license.expiredContactAdmin')}</p>
-                  <div className="space-y-1 text-sm">
-                    <div className="flex items-center gap-2">
-                      <span className="text-red-400">{t('license.email')}</span>
-                      <a href="mailto:weicongpeng1@163.com" className="text-primary hover:underline">
-                        weicongpeng1@163.com
-                      </a>
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <span className="text-red-400">{t('license.wechat')}</span>
-                      <span className="font-mono text-red-300">pengwc2010</span>
-                    </div>
-                  </div>
-                </div>
+            {updateMessage && (
+              <div className={`p-2 rounded flex items-center gap-2 ${
+                updateMessage.type === 'success'
+                  ? 'bg-green-500/10 border border-green-500/20 text-green-500'
+                  : 'bg-red-500/10 border border-red-500/20 text-red-500'
+              }`}>
+                {updateMessage.type === 'success' ? <Check size={14} /> : <X size={14} />}
+                <span className="text-xs">{updateMessage.text}</span>
               </div>
             )}
           </div>
         </div>
+      )}
 
-        {/* 主题与配色 */}
-        <div className="bg-card p-5 rounded-lg border border-border">
-          <div className="flex items-center gap-2 mb-4">
-            <Palette size={20} className="text-primary" />
-            <h2 className="text-base font-semibold">{t('theme.title')}</h2>
+      {/* 关于：声明内容在上，联系方式置于卡片底部 */}
+      <div className="bg-card p-5 rounded-lg border border-border">
+        <div className="flex items-center gap-2 mb-4">
+          <LifeBuoy size={20} className="text-primary" />
+          <h2 className="text-base font-semibold">{t('license.authorTitle')}</h2>
+        </div>
+
+        <p className="text-sm text-muted-foreground">{t('license.authorHint')}</p>
+
+        <div className="pt-3 mt-3 border-t border-border flex flex-wrap gap-x-8 gap-y-2">
+          <div className="flex items-center gap-3">
+            <span className="text-sm text-muted-foreground">{t('license.adminEmailLabel')}</span>
+            <a href="mailto:weicongpeng1@163.com" className="text-sm text-primary hover:underline break-all">
+              weicongpeng1@163.com
+            </a>
           </div>
-
-          <div className="space-y-4">
-            <div>
-              <h3 className="text-xs font-medium text-muted-foreground mb-3">{t('theme.themeMode')}</h3>
-              <div className="grid grid-cols-2 gap-3">
-                <ThemeModeCard
-                  mode="dark"
-                  icon={<Moon size={18} />}
-                  label={t('theme.dark')}
-                  isSelected={(previewTheme || themeMode) === 'dark'}
-                  onSelect={() => handleThemeSelect('dark')}
-                  previewBg="bg-slate-900"
-                  previewText="text-white"
-                />
-                <ThemeModeCard
-                  mode="light"
-                  icon={<Sun size={18} />}
-                  label={t('theme.light')}
-                  isSelected={(previewTheme || themeMode) === 'light'}
-                  onSelect={() => handleThemeSelect('light')}
-                  previewBg="bg-white"
-                  previewText="text-slate-900"
-                />
-              </div>
-            </div>
-
-            <div>
-              <h3 className="text-xs font-medium text-muted-foreground mb-3">{t('theme.colorScheme')}</h3>
-              <div className="flex flex-wrap gap-2">
-                {(['blue', 'green', 'purple', 'orange', 'pink'] as ColorScheme[]).map((color) => (
-                  <ColorSwatch
-                    key={color}
-                    color={color}
-                    isSelected={(previewColor || colorScheme) === color}
-                    onSelect={() => handleColorSelect(color)}
-                  />
-                ))}
-              </div>
-            </div>
-
-            {(previewTheme || previewColor) && (
-              <div className="flex gap-2 pt-3 border-t border-border">
-                <button
-                  onClick={handleApplyTheme}
-                  className="flex-1 px-4 py-2 bg-primary text-primary-foreground rounded-lg hover:opacity-90 text-sm font-medium"
-                >
-                  {t('theme.apply')}
-                </button>
-                <button
-                  onClick={handleCancelTheme}
-                  className="flex-1 px-4 py-2 bg-secondary text-secondary-foreground rounded-lg hover:opacity-90 text-sm font-medium"
-                >
-                  {t('theme.cancel')}
-                </button>
-              </div>
-            )}
+          <div className="flex items-center gap-3">
+            <span className="text-sm text-muted-foreground">{t('license.adminPhoneLabel')}</span>
+            <a href="tel:15220958556" className="text-sm text-primary hover:underline">
+              15220958556
+            </a>
           </div>
         </div>
       </div>

@@ -98,10 +98,20 @@ class PCIPlanningResult:
 class PCIPlanningService:
     """PCI规划服务 - 简化版本，匹配V1代码逻辑"""
 
-    def __init__(self, config: PlanningConfig, enable_tac_planning: bool = False, data_dir: Optional[str] = None):
+    def __init__(
+        self,
+        config: PlanningConfig,
+        enable_tac_planning: bool = False,
+        data_dir: Optional[str] = None,
+        city: Optional[str] = None,
+        operator: Optional[str] = None,
+    ):
         self.config = config
         self.enable_tac_planning = enable_tac_planning
         self.data_dir = data_dir
+        # TAC 图层查找的组快照（严格组隔离）
+        self.city = city
+        self.operator = operator
         self.tac_planning_service = None
 
         # 如果启用TAC规划，初始化TAC规划服务
@@ -1154,12 +1164,16 @@ class PCIPlanningService:
             # 动态导入数据服务，避免循环依赖
             from app.services.data_service import data_service
 
-            # 获取所有数据项
+            # 获取数据项（严格组隔离：仅同组全量工参）
             data_items = data_service.list_data()
 
-            # 查找全量工参文件
+            # 查找本组全量工参文件（组信息不完整时不使用任何工参）
             full_params_items = [
-                item for item in data_items if item.fileType == "full_params"
+                item for item in data_items
+                if item.fileType == "full_params"
+                and self.city and self.operator
+                and getattr(item, "city", None) == self.city
+                and getattr(item, "operator", None) == self.operator
             ]
 
             if full_params_items:
@@ -1517,7 +1531,9 @@ class PCIPlanningService:
                 tac_results, planned_count, unplanned_count = self.tac_planning_service.plan_tac_for_list(
                     network_type=network_type_str,
                     cells_to_plan=cells_to_plan,
-                    progress_callback=None  # 不单独显示TAC规划进度
+                    progress_callback=None,  # 不单独显示TAC规划进度
+                    city=self.city,
+                    operator=self.operator,
                 )
 
                 # 将TAC规划结果合并到PCI规划结果中
@@ -1558,6 +1574,8 @@ async def run_pci_planning(
     background_sites_data: Optional[List[Dict]] = None,
     enable_tac_planning: bool = False,
     data_dir: Optional[str] = None,
+    city: Optional[str] = None,
+    operator: Optional[str] = None,
 ) -> Dict:
     """
     运行PCI规划
@@ -1573,7 +1591,7 @@ async def run_pci_planning(
     Returns:
         规划结果字典
     """
-    service = PCIPlanningService(config, enable_tac_planning, data_dir)
+    service = PCIPlanningService(config, enable_tac_planning, data_dir, city, operator)
     result = await service.plan(sites_data, progress_callback, background_sites_data)
 
     # 转换为前端需要的格式

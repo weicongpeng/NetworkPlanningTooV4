@@ -39,9 +39,9 @@ function StatusIcon({ status }: { status: string }) {
     case 'failed':
       return <AlertCircle size={16} className="text-red-500" />
     case 'running':
-      return <Loader2 size={16} className="animate-spin text-blue-500" />
+      return <Loader2 size={16} className="animate-spin text-primary" />
     default:
-      return <Clock size={16} className="text-gray-400" />
+      return <Clock size={16} className="text-muted-foreground" />
   }
 }
 
@@ -51,10 +51,10 @@ function StatusBadge({ status, labels }: { status: string; labels: HistoryTaskPa
     : status === 'running' ? labels.running
     : status
 
-  const colorClass = status === 'completed' ? 'bg-green-100 text-green-700'
-    : status === 'failed' ? 'bg-red-100 text-red-700'
-    : status === 'running' ? 'bg-blue-100 text-blue-700'
-    : 'bg-gray-100 text-gray-600'
+  const colorClass = status === 'completed' ? 'bg-primary/15 text-green-500'
+    : status === 'failed' ? 'bg-red-500/15 text-red-500'
+    : status === 'running' ? 'bg-primary/15 text-primary'
+    : 'bg-muted text-muted-foreground'
 
   return (
     <span className={`px-1.5 py-0.5 text-[10px] rounded-full font-medium ${colorClass}`}>
@@ -142,7 +142,7 @@ export function HistoryTaskPanel({
                   <div
                     key={task.id}
                     className={`px-4 py-3 hover:bg-muted/30 transition-colors ${
-                      isActive ? 'bg-blue-50/50 border-l-2 border-blue-400' : 'border-l-2 border-transparent'
+                      isActive ? 'bg-primary/10 border-l-2 border-primary' : 'border-l-2 border-transparent'
                     }`}
                   >
                     <div className="flex items-start justify-between gap-2">
@@ -164,7 +164,7 @@ export function HistoryTaskPanel({
                       {hasResult ? (
                         <button
                           onClick={() => onSelectTask(task)}
-                          className="flex items-center gap-1 px-2 py-1 text-[10px] bg-blue-500 text-white rounded hover:bg-blue-600 transition-colors shrink-0"
+                          className="flex items-center gap-1 px-2 py-1 text-[10px] bg-primary text-white rounded hover:bg-primary/90 transition-colors shrink-0"
                         >
                           <Eye size={10} />
                           {labels.loadResult}
@@ -173,11 +173,11 @@ export function HistoryTaskPanel({
                         <div className="flex items-center gap-2 shrink-0">
                           <div className="w-16 bg-muted rounded-full h-1">
                             <div
-                              className="bg-blue-500 h-1 rounded-full transition-all duration-300"
+                              className="bg-primary h-1 rounded-full transition-all duration-300"
                               style={{ width: `${task.progress || 0}%` }}
                             />
                           </div>
-                          <span className="text-[10px] text-blue-600">{task.progress || 0}%</span>
+                          <span className="text-[10px] text-primary">{task.progress || 0}%</span>
                         </div>
                       ) : task.status === 'failed' ? (
                         <span className="text-[10px] text-red-500 max-w-[100px] truncate" title={task.message}>
