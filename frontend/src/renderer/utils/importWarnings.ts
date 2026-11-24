@@ -8,6 +8,11 @@ export interface ImportWarning {
   columns?: string[]
   present?: string
   missing?: string
+  samples?: Array<{
+    field: 'eNBId' | 'cellId' | 'both'
+    siteId?: string | number
+    cellId?: string | number
+  }>
 }
 
 type Translate = (key: string, options?: Record<string, unknown>) => string
@@ -33,6 +38,19 @@ export function formatImportWarningTitle(
   })
 }
 
+/** 单条号段越界样本 → “基站ID-小区ID(eNBId/cellId不合规)” */
+export function formatIdRangeSample(
+  sample: NonNullable<ImportWarning['samples']>[number],
+  t: Translate,
+): string {
+  const key = sample.field === 'both'
+    ? 'data.importWarnIdRangeBoth'
+    : sample.field === 'cellId'
+      ? 'data.importWarnIdRangeCell'
+      : 'data.importWarnIdRangeSite'
+  return t(key, { siteId: sample.siteId ?? '-', cellId: sample.cellId ?? '-' })
+}
+
 /** 单条提醒 → 文案；未知 code 原样回显，便于后端新增类型时不至于空白 */
 export function formatImportWarning(warning: ImportWarning, t: Translate): string {
   const prefix = warning.network ? `[${warning.network}] ` : ''
@@ -49,6 +67,11 @@ export function formatImportWarning(warning: ImportWarning, t: Translate): strin
       return prefix + t('data.importWarnSectorNameMissing')
     case 'single_network':
       return t('data.importWarnSingleNetwork', { present: warning.present ?? '', missing: warning.missing ?? '' })
+    case 'id_range': {
+      const summary = t('data.importWarnIdRangeCount', { count: warning.count ?? warning.samples?.length ?? 0 })
+      const lines = (warning.samples || []).map((sample) => formatIdRangeSample(sample, t))
+      return [summary, ...lines].filter(Boolean).join('，')
+    }
     default:
       return prefix + warning.code
   }

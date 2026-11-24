@@ -10,6 +10,10 @@ const t = (key: string, options: Record<string, unknown> = {}) => {
     'data.importWarnSiteIdDropped': '已丢弃 {{count}} 行基站标识为空的数据',
     'data.importWarnSectorNameMissing': '未找到「小区名称」列（列名可能被误改），小区名称按「基站名称_小区标识」显示',
     'data.importWarnSingleNetwork': '文件只含 {{present}} 制式，请确认是否漏传 {{missing}} 工参',
+    'data.importWarnIdRangeCount': '{{count}} 处 4G 标识不在分配号段内',
+    'data.importWarnIdRangeSite': '{{siteId}}-{{cellId}}(eNBId不合规)',
+    'data.importWarnIdRangeCell': '{{siteId}}-{{cellId}}(cellId不合规)',
+    'data.importWarnIdRangeBoth': '{{siteId}}-{{cellId}}(均不合格)',
     'data.importWarnTitle': '{{type}}文件「{{name}}」存在问题，数据已导入',
     'data.importWarnGenericType': '数据',
     'data.fullParams': '全量工参',
@@ -49,6 +53,28 @@ describe('formatImportWarning', () => {
   it('单一制式：不带制式前缀，说明缺失的制式', () => {
     expect(formatImportWarning({ code: 'single_network', present: 'LTE', missing: 'NR' }, t))
       .toBe('文件只含 LTE 制式，请确认是否漏传 NR 工参')
+  })
+
+  it('号段越界：用基站ID-小区ID紧凑列出不合规项', () => {
+    expect(formatImportWarning({
+      code: 'id_range',
+      count: 2,
+      samples: [
+        { field: 'eNBId', siteId: 103423, cellId: 127 },
+        { field: 'cellId', siteId: 936192, cellId: 127 },
+      ],
+    }, t)).toBe(
+      '2 处 4G 标识不在分配号段内，' +
+      '103423-127(eNBId不合规)，936192-127(cellId不合规)'
+    )
+  })
+
+  it('两项都不合规时只输出一条均不合格', () => {
+    expect(formatImportWarning({
+      code: 'id_range',
+      count: 1,
+      samples: [{ field: 'both', siteId: 878592, cellId: 256 }],
+    }, t)).toBe('1 处 4G 标识不在分配号段内，878592-256(均不合格)')
   })
 
   it('未知 code 原样回显，避免新增后端类型时显示空白', () => {

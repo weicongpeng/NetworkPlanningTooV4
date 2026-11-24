@@ -792,10 +792,10 @@ def test_backfill_applied_flags_marks_matching_results(temp_db, monkeypatch):
     """存量回填：结果与当前工参一致 → 置 1；不一致 / 无可比值的类型 → 不动。"""
     db = temp_db()
     try:
-        db.add(TaskResult(**_task_row(task_id="t-ok", result_json=json.dumps({
+        db.add(TaskResult(**_task_row(task_id="t-ok", task_type="tac_planning", result_json=json.dumps({
             "results": [{"siteId": "S1", "sectorId": "1", "tac": 100}],
         }))))
-        db.add(TaskResult(**_task_row(task_id="t-diff", result_json=json.dumps({
+        db.add(TaskResult(**_task_row(task_id="t-diff", task_type="tac_planning", result_json=json.dumps({
             "results": [{"siteId": "S1", "sectorId": "1", "tac": 999}],
         }))))
         # neighbor 类型不在回填范围（结果不含 PCI/TAC 值，误判会把全部邻区任务标成已应用）
@@ -891,7 +891,7 @@ def test_backfill_ignores_cells_absent_from_work_params(temp_db, monkeypatch):
     """存量回填与列表同口径：规划结果里不在工参的小区剔除后再判定。"""
     db = temp_db()
     try:
-        db.add(TaskResult(**_task_row(task_id="t-mixed", result_json=json.dumps({
+        db.add(TaskResult(**_task_row(task_id="t-mixed", task_type="tac_planning", result_json=json.dumps({
             "results": [
                 {"siteId": "S1", "sectorId": "1", "tac": 100},
                 {"siteId": "S9", "sectorId": "99", "tac": 777},   # 不在工参内 → 剔除

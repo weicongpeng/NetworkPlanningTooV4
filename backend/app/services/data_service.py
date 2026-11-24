@@ -199,6 +199,193 @@ def geo_file_metadata(gf: GeoFile) -> Dict[str, Any]:
     return metadata
 
 
+# === 全量工参 4G 号段合规性核查 ===
+# 全量工参可选 sheet「4G号段使用范围」按「地市 + 运营商」给出 eNBId / cellId 的十进制起止范围；
+# LTE 工参行的「城市」「运营商」列分别映射到该 sheet 的「地市」「运营商」列。
+# 号段表无对应组合时不核查；核查为非致命提醒，不阻断导入。
+_ID_RANGE_SHEET = "4G号段使用范围"
+_ID_RANGE_HEADERS = {
+    "city": ("地市", "城市"),
+    "operator": ("运营商",),
+    "enb_start": ("eNBId十进制起始值", "eNodeBId十进制起始值", "eNB ID十进制起始值"),
+    "enb_end": ("eNBId十进制结束值", "eNodeBId十进制结束值", "eNB ID十进制结束值"),
+    "cell_start": ("cellId十进制起始值",),
+    "cell_end": ("cellId十进制结束值",),
+}
+_LTE_RANGE_HEADERS = {
+    "city": ("城市", "地市"),
+    "operator": ("运营商",),
+    "enb": ("eNodeB标识", "eNBId", "eNodeBId", "eNodeB ID", "基站标识"),
+    "cell": ("小区标识", "cellLocalId", "cellId", "Cell ID"),
+}
+
+
+def _norm_excel_header(value: Any) -> str:
+    """表头归一化：去空白/换行并转小写，兼容多行中文表头与大小写写法。"""
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    return re.sub(r"\s+", "", str(value)).casefold()
+
+
+def _header_variants(value: Any) -> Set[str]:
+    """多行表头按行拆分后归一化，兼容「城市\\nCity\\nString[...]」写法。"""
+    if value is None:
+        return set()
+    try:
+        if pd.isna(value):
+            return set()
+    except (TypeError, ValueError):
+        pass
+    return {
+        normalized
+        for normalized in (_norm_excel_header(line) for line in str(value).split("\n"))
+        if normalized
+    }
+
+
+def _range_key_part(value: Any) -> str:
+    """号段匹配键（地市/运营商）归一化：去首尾空白，避免 1 与 1.0 分裂。"""
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value).strip()
+
+
+def _parse_decimal_id(value: Any) -> Optional[int]:
+    """把 Excel 中的十进制 ID/号段端点转成整数；空值或非整数返回 None。"""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, (int, float)):
+        number = float(value)
+    else:
+        text = str(value).strip().replace(",", "")
+        if not text:
+            return None
+        try:
+            number = float(text)
+        except ValueError:
+            return None
+    if not math.isfinite(number) or not number.is_integer():
+        return None
+    return int(number)
+
+
+def _excel_header_rows(xls, sheet_name: str):
+    """读取工参表头（最多 3 行），并据此判断数据起始行。"""
+    header_rows = pd.read_excel(xls, sheet_name=sheet_name, header=None, nrows=3)
+    complex_header = any(
+        "\n" in str(v) for v in header_rows.iloc[0] if pd.notna(v)
+    ) if len(header_rows) else False
+    return header_rows, (3 if complex_header else 1)
+
+
+def _find_header_column(header_rows, aliases) -> Optional[int]:
+    """在前几行表头里按别名定位列序号（0 基）。"""
+    targets = {_norm_excel_header(name) for name in aliases}
+    for r in range(len(header_rows)):
+        for c in range(header_rows.shape[1]):
+            if _header_variants(header_rows.iat[r, c]) & targets:
+                return c
+    return None
+
+
+def _load_city_id_ranges(
+    xls, sheet_name: str
+) -> Dict[Tuple[str, str], List[Tuple[int, int, int, int]]]:
+    """读取「4G号段使用范围」，返回 {(地市, 运营商): [(eNBId起, eNBId止, cellId起, cellId止)]}。
+
+    同一行的 eNBId 与 cellId 范围必须成对使用：基站标识落在某行 eNBId 范围内时，
+    小区标识只能与该行的 cellId 范围比对。缺少地市/运营商或四个端点不完整的行跳过。
+    """
+    raw = pd.read_excel(xls, sheet_name=sheet_name, header=None)
+    if raw.empty:
+        return {}
+    header_idx = None
+    alias_map: Dict[str, str] = {}
+    for field, names in _ID_RANGE_HEADERS.items():
+        for name in names:
+            alias_map[_norm_excel_header(name)] = field
+
+    def field_of(value: Any) -> Optional[str]:
+        return next(
+            (alias_map[v] for v in _header_variants(value) if v in alias_map), None
+        )
+
+    for r in range(min(5, len(raw))):
+        fields = {field_of(raw.iat[r, c]) for c in range(raw.shape[1])}
+        if "city" in fields and "operator" in fields and (
+            "enb_start" in fields or "cell_start" in fields
+        ):
+            header_idx = r
+            break
+    if header_idx is None:
+        return {}
+
+    # 同一字段可能出现多列（如十六进制与十进制两对 cellId 列）：全部记住，
+    # 逐行取第一个能解析成十进制整数的列，避免误用十六进制列导致整张表失效。
+    columns: Dict[str, List[int]] = {}
+    for c in range(raw.shape[1]):
+        field = field_of(raw.iat[header_idx, c])
+        if field:
+            columns.setdefault(field, []).append(c)
+
+    def text_value(row, field: str) -> str:
+        for c in columns.get(field, []):
+            text = _range_key_part(row.iloc[c])
+            if text:
+                return text
+        return ""
+
+    def decimal_value(row, field: str) -> Optional[int]:
+        # 右侧列通常是补齐后的十进制列（左侧可能是十六进制/旧列），优先取右侧
+        for c in reversed(columns.get(field, [])):
+            value = _parse_decimal_id(row.iloc[c])
+            if value is not None:
+                return value
+        return None
+
+    ranges: Dict[Tuple[str, str], List[Tuple[int, int, int, int]]] = {}
+    invalid_rows = 0
+    for _, row in raw.iloc[header_idx + 1:].iterrows():
+        city = text_value(row, "city")
+        operator = text_value(row, "operator")
+        if not city or not operator:
+            continue
+        endpoints = [
+            decimal_value(row, key)
+            for key in ("enb_start", "enb_end", "cell_start", "cell_end")
+        ]
+        if any(value is None for value in endpoints):
+            invalid_rows += 1
+            continue
+        enb_start, enb_end, cell_start, cell_end = endpoints
+        if enb_start > enb_end or cell_start > cell_end:
+            invalid_rows += 1
+            continue
+        ranges.setdefault((city, operator), []).append(
+            (enb_start, enb_end, cell_start, cell_end)
+        )
+    if invalid_rows:
+        safe_print(f"[DataService] 号段表跳过 {invalid_rows} 行起止值无效的记录")
+    return ranges
+
+
 class DataService:
     """数据管理服务类"""
 
@@ -240,6 +427,102 @@ class DataService:
                 present=present[0],
                 missing="NR" if present[0] == "LTE" else "LTE",
             )
+
+    def _check_4g_id_ranges(self, xls, sheet_names) -> None:
+        """按可选 sheet「4G号段使用范围」核查 LTE 工参的 eNBId / cellId。
+
+        全量工参的「城市」「运营商」分别映射号段表的「地市」「运营商」，按
+        (地市, 运营商) 精确匹配；号段表没有该组合时跳过该行。同一行的 eNBId 与
+        cellId 范围成对匹配，不跨行混用；越界只写入 importWarnings，不阻断导入。
+        """
+        range_sheet = next(
+            (name for name in sheet_names if str(name).strip() == _ID_RANGE_SHEET), None
+        )
+        lte_sheet = next(
+            (name for name in sheet_names if str(name).strip() == "LTE Project Parameters"), None
+        )
+        if not range_sheet or not lte_sheet:
+            return
+
+        def cell_value(row, index: Optional[int]):
+            if index is None or index >= len(row):
+                return None
+            value = row.iloc[index]
+            return None if pd.isna(value) else value
+
+        try:
+            city_op_ranges = _load_city_id_ranges(xls, range_sheet)
+            if not city_op_ranges:
+                safe_print("[DataService] 4G号段核查：号段表无可用地市+运营商/起止值，跳过")
+                return
+            header_rows, skip_rows = _excel_header_rows(xls, lte_sheet)
+            columns = {
+                field: _find_header_column(header_rows, names)
+                for field, names in _LTE_RANGE_HEADERS.items()
+            }
+            if any(columns[f] is None for f in ("city", "operator", "enb", "cell")):
+                safe_print(
+                    "[DataService] 4G号段核查：LTE 工参缺少城市/运营商/eNodeB标识/小区标识列，跳过"
+                )
+                return
+
+            df = pd.read_excel(xls, sheet_name=lte_sheet, header=None, skiprows=skip_rows)
+            samples: List[Dict[str, Any]] = []
+            total = 0
+            unknown_group = 0
+            for _, row in df.iterrows():
+                city = _range_key_part(cell_value(row, columns["city"]))
+                operator = _range_key_part(cell_value(row, columns["operator"]))
+                if not city or not operator:
+                    continue
+                ranges = city_op_ranges.get((city, operator))
+                if not ranges:
+                    unknown_group += 1
+                    continue
+                enb_id = _parse_decimal_id(cell_value(row, columns["enb"]))
+                cell_id = _parse_decimal_id(cell_value(row, columns["cell"]))
+                if enb_id is None or cell_id is None:
+                    continue
+                # 严格按同一行的成对范围判断：eNBId 落在某行范围内时，cellId
+                # 必须同时落在该行的 cellId 范围内，不能跨行混用号段。
+                enb_hit = any(
+                    enb_start <= enb_id <= enb_end
+                    for enb_start, enb_end, _, _ in ranges
+                )
+                cell_hit = any(
+                    cell_start <= cell_id <= cell_end
+                    for _, _, cell_start, cell_end in ranges
+                )
+                paired_hit = any(
+                    enb_start <= enb_id <= enb_end and cell_start <= cell_id <= cell_end
+                    for enb_start, enb_end, cell_start, cell_end in ranges
+                )
+                if paired_hit:
+                    continue
+                if not enb_hit and not cell_hit:
+                    field = "both"
+                elif not enb_hit:
+                    field = "eNBId"
+                else:
+                    field = "cellId"
+                total += 1
+                # 一个小区只出一条：全部罗列，展开/收起交给前端控制
+                samples.append({
+                    "field": field,
+                    "siteId": enb_id,
+                    "cellId": cell_id,
+                })
+        except Exception as exc:  # 提醒型核查，任何解析异常都不影响导入主流程
+            safe_print(f"[DataService] 4G号段核查失败（非致命，跳过）: {exc}")
+            return
+
+        if total:
+            self._add_import_warning("id_range", count=total, samples=samples)
+        detail = f"，无号段地市+运营商 {unknown_group} 行" if unknown_group else ""
+        safe_print(
+            f"[DataService] 4G号段核查完成：地市+运营商组合 {len(city_op_ranges)} 个，"
+            f"越界 {total} 条{detail}"
+        )
 
     def start_capture_logs(self):
         """激活日志捕获，开始收集 safe_print 输出到缓冲区"""
@@ -1229,7 +1512,7 @@ class DataService:
 
     def update_parameters(
         self, full_param_id: str, current_param_id: str,
-        username: str = "", user_id: int = 1,
+        username: str = "", user_id: int = 1, scene_matcher=None,
     ) -> Dict[str, Any]:
         """更新工参"""
         safe_print(
@@ -1331,17 +1614,25 @@ class DataService:
         except Exception as e:
             raise ValueError(f"无法打开Excel文件: {e}")
 
+        # 场景名称匹配（缺图层只告警，不阻断工参更新）
+        if scene_matcher is None:
+            from app.services.scene_matcher import SceneMatcher
+            scene_matcher = SceneMatcher(self)
+            scene_matcher.load(full_info.get("city"), full_info.get("operator"))
+        if not scene_matcher.available and scene_matcher.warning:
+            safe_print(f"[DataService] {scene_matcher.warning}")
+
         # 4/5. 处理 LTE / NR（统计匹配与新增行数，供任务结果展示与"空更新"判定）
         stats: Dict[str, Dict[str, int]] = {}
         if "LTE Project Parameters" in wb.sheetnames:
             safe_print(f"[DataService] 处理LTE工参...")
-            stats["LTE"] = self._update_sheet(wb["LTE Project Parameters"], current_dir, "LTE")
+            stats["LTE"] = self._update_sheet(wb["LTE Project Parameters"], current_dir, "LTE", scene_matcher)
         else:
             safe_print(f"[DataService] 警告: 未找到 'LTE Project Parameters' Sheet")
 
         if "NR Project Parameters" in wb.sheetnames:
             safe_print(f"[DataService] 处理NR工参...")
-            stats["NR"] = self._update_sheet(wb["NR Project Parameters"], current_dir, "NR")
+            stats["NR"] = self._update_sheet(wb["NR Project Parameters"], current_dir, "NR", scene_matcher)
         else:
             safe_print(f"[DataService] 警告: 未找到 'NR Project Parameters' Sheet")
 
@@ -1397,6 +1688,7 @@ class DataService:
                             len(s.get("sectors", [])) for s in sites
                         )
                 self._collect_file_level_import_warnings(parsed_data)
+                self._check_4g_id_ranges(xls, sheet_names)
                 if self.full_params_dup_report:
                     metadata["duplicateReport"] = self.full_params_dup_report
                 if self.full_params_import_warnings:
@@ -1528,13 +1820,16 @@ class DataService:
             "newFileName": new_filename,
             "savedToOriginal": saved_to_original,
             "stats": stats,
+            "sceneLayerWarning": scene_matcher.warning if not scene_matcher.available else "",
         }
 
     # === 现网工参合并（中兴网管 CellInfo） ===
     # 输出列顺序固定；值与全量工参按对应列名匹配填充（列名兼容常见别名）。
     ZTE_MERGE_COLUMNS = (
-        "CGI", "区县", "经度", "纬度", "天线挂高", "方向角", "机械下倾角", "小区覆盖类型", "是否高铁小区",
+        "CGI", "区县", "经度", "纬度", "天线挂高", "方向角", "机械下倾角", "小区覆盖类型", "场景名称", "是否高铁小区",
     )
+    SCENE_NAME_COLUMN = "场景名称"
+    DEFAULT_SCENE_NAME = "农村"
     ZTE_FIELD_ALIASES = {
         "CGI": ("CGI",),
         # 「区县」取全量工参的第二分组
@@ -1721,8 +2016,8 @@ class DataService:
         return {"sites": int(normalized[normalized != ""].nunique()), "sectors": int(len(frame))}
 
     @classmethod
-    def _zte_enrich(cls, df: pd.DataFrame, lookup: pd.DataFrame, network: str):
-        """现网工参按 eNBId/gNBId + cellLocalId 匹配全量工参，左侧插入 9 列。"""
+    def _zte_enrich(cls, df: pd.DataFrame, lookup: pd.DataFrame, network: str, scene_matcher=None):
+        """现网工参按 eNBId/gNBId + cellLocalId 匹配全量工参，左侧插入固定列（含场景名称）。"""
         if network == "LTE":
             id_candidates = (("eNBId", "eNodeBId", "ENBId"), ("cellLocalId", "CellId", "cellId"))
         else:
@@ -1754,6 +2049,14 @@ class DataService:
             else:
                 scene = df[scene_column].fillna("").astype(str).str.strip().str.casefold()
                 enriched["是否高铁小区"] = scene.map({"highway": "是", "normal": "否"}).fillna("").values
+        # 场景名称按小区经纬度匹配「场景图层.zip」边界；坐标无效留空，有效未命中填农村
+        if scene_matcher is not None:
+            enriched[cls.SCENE_NAME_COLUMN] = [
+                scene_matcher.match(lon, lat)
+                for lon, lat in zip(enriched["经度"], enriched["纬度"])
+            ]
+        else:
+            enriched[cls.SCENE_NAME_COLUMN] = cls.DEFAULT_SCENE_NAME
         ordered = list(cls.ZTE_MERGE_COLUMNS) + [
             col for col in enriched.columns if col not in cls.ZTE_MERGE_COLUMNS
         ]
@@ -1769,7 +2072,7 @@ class DataService:
 
     @classmethod
     def _zte_drop_empty_columns(cls, frame: pd.DataFrame) -> pd.DataFrame:
-        """删除整列为空的源 CSV 列；9 个新增列即使全空也保留。"""
+        """删除整列为空的源 CSV 列；10 个新增列（含场景名称）即使全空也保留。"""
         keep = []
         for column in frame.columns:
             if column in cls.ZTE_MERGE_COLUMNS:
@@ -1834,7 +2137,7 @@ class DataService:
         if not data_id:
             data_id = str(uuid.uuid4())
 
-        # 源 CSV 常带大量全空列，写出前剔除以缩小文件（9 个新增列始终保留）
+        # 源 CSV 常带大量全空列，写出前剔除以缩小文件（10 个新增列始终保留）
         sheets = {
             sheet_name: self._zte_limit_columns(
                 self._zte_drop_empty_columns(frame),
@@ -1918,6 +2221,7 @@ class DataService:
     def merge_current_params_zte(
         self, full_param_id: str, current_param_id: str,
         username: str = "", user_id: int = 1, output_all_columns: bool = False,
+        scene_matcher=None,
     ) -> Dict[str, Any]:
         """现网工参合并（中兴）：4G 合并 SDR+ITBBU，5G 取 NR，补齐全量工参字段。"""
         full_info = self.index.get(full_param_id)
@@ -1967,6 +2271,14 @@ class DataService:
                 "请确认已上传现网工参 ZIP 并同步到本机后重试"
             )
 
+        # 场景名称匹配（缺图层只告警，不阻断合并）
+        if scene_matcher is None:
+            from app.services.scene_matcher import SceneMatcher
+            scene_matcher = SceneMatcher(self)
+            scene_matcher.load(full_info.get("city"), full_info.get("operator"))
+        if not scene_matcher.available and scene_matcher.warning:
+            safe_print(f"[DataService] {scene_matcher.warning}")
+
         # 一次打开全量工参，LTE/NR 共用同一次 Excel 解析
         needed_networks = (["LTE"] if lte_files else []) + (["NR"] if nr_files else [])
         with pd.ExcelFile(original_excel, engine="calamine") as xls:
@@ -1984,7 +2296,7 @@ class DataService:
         if lte_files:
             safe_print(f"[DataService] 合并 4G 现网工参: {[f.name for f in lte_files]}")
             merged = self._zte_merge_cellinfo(lte_files)
-            enriched, matched = self._zte_enrich(merged, lookups["LTE"], "LTE")
+            enriched, matched = self._zte_enrich(merged, lookups["LTE"], "LTE", scene_matcher)
             sheets["4G现网工参(中兴)"] = enriched
             stats["4G现网工参(中兴)"] = {
                 "matched": matched, "network": "LTE", **self._zte_sheet_stats(enriched, "LTE")
@@ -1992,7 +2304,7 @@ class DataService:
         if nr_files:
             safe_print(f"[DataService] 合并 5G 现网工参: {[f.name for f in nr_files]}")
             merged = self._zte_merge_cellinfo(nr_files)
-            enriched, matched = self._zte_enrich(merged, lookups["NR"], "NR")
+            enriched, matched = self._zte_enrich(merged, lookups["NR"], "NR", scene_matcher)
             sheets["5G现网工参(中兴)"] = enriched
             stats["5G现网工参(中兴)"] = {
                 "matched": matched, "network": "NR", **self._zte_sheet_stats(enriched, "NR")
@@ -2004,7 +2316,10 @@ class DataService:
             output_name, sheets, full_info, username, stats, output_all_columns
         )
         self._save_index()
-        return {"dataset": dataset}
+        return {
+            "dataset": dataset,
+            "sceneLayerWarning": scene_matcher.warning if not scene_matcher.available else "",
+        }
 
     def _repair_current_params_from_server(self, data_id: str) -> bool:
         """桌面端共享模式：本机现网工参数据体不完整时，从服务器补拉一次整包。
@@ -3536,7 +3851,23 @@ class DataService:
         pairs = self._field_col_pairs(network_type)
         return {src: col for src, col in pairs if fields.get(src) not in (None, "")}
 
-    def _update_sheet(self, ws, current_dir: Path, network_type: str):
+    def _ensure_scene_name_column(self, ws, col_map: Dict[str, int]) -> Dict[str, int]:
+        """存量全量工参缺少「场景名称」时，按新模板插到「是否共享」右侧。"""
+        if self.SCENE_NAME_COLUMN in col_map:
+            return col_map
+        insert_at = col_map.get("是否共享") or col_map.get("小区覆盖类型")
+        if insert_at is None:
+            insert_at = ws.max_column
+        ws.insert_cols(insert_at + 1)
+        ws.cell(row=1, column=insert_at + 1, value=self.SCENE_NAME_COLUMN)
+        rebuilt = {}
+        for idx, value in enumerate(next(ws.iter_rows(min_row=1, max_row=1, values_only=True))):
+            if value:
+                rebuilt[str(value).strip().split("\n")[0].strip()] = idx + 1
+        safe_print(f"[DataService] 已按新模板插入「{self.SCENE_NAME_COLUMN}」列，索引={rebuilt.get(self.SCENE_NAME_COLUMN)}")
+        return rebuilt
+
+    def _update_sheet(self, ws, current_dir: Path, network_type: str, scene_matcher=None):
         """更新单个Sheet"""
         # 1. 确定列索引映射
         header_row = list(ws.iter_rows(min_row=1, max_row=1, values_only=True))[0]
@@ -3556,6 +3887,9 @@ class DataService:
             )
         else:
             safe_print(f"[DataService] 警告: 未找到'小区覆盖类型'列")
+
+        # 场景名称：存量工参没有该列时按新模板插入（在「是否共享」右侧）
+        col_map = self._ensure_scene_name_column(ws, col_map)
 
         # 2. 读取现网工参数据
         updates = self._load_current_params(current_dir, network_type)
@@ -3946,6 +4280,19 @@ class DataService:
                     cgi_str = str(cgi_val).strip()
                     mnc_set = cgi_mnc_map.get(cgi_str, set())
                     row[shared_col_idx].value = "是" if ("01" in mnc_set and "11" in mnc_set) else "否"
+
+        # 场景名称：按小区经纬度匹配场景图层；坐标无效留空，有效未命中/无图层填「农村」
+        if self.SCENE_NAME_COLUMN in col_map:
+            scene_col_idx = col_map[self.SCENE_NAME_COLUMN] - 1
+            for row in ws.iter_rows(min_row=4):
+                if not any(self._get_cell_val(row, col_map, key) for key in key_cols):
+                    continue
+                longitude = self._get_cell_val(row, col_map, "小区经度") or self._get_cell_val(row, col_map, "基站经度")
+                latitude = self._get_cell_val(row, col_map, "小区纬度") or self._get_cell_val(row, col_map, "基站纬度")
+                row[scene_col_idx].value = (
+                    scene_matcher.match(longitude, latitude)
+                    if scene_matcher is not None else self.DEFAULT_SCENE_NAME
+                )
 
         safe_print(
             f"[DataService] 更新完成: 现有匹配 {matched_count} 行, "
@@ -5244,6 +5591,7 @@ class DataService:
                                     len(s.get("sectors", [])) for s in sites
                                 )
                         self._collect_file_level_import_warnings(parsed_data)
+                        self._check_4g_id_ranges(xls, sheet_names)
                         if self.full_params_dup_report:
                             metadata["duplicateReport"] = self.full_params_dup_report
                         if self.full_params_import_warnings:

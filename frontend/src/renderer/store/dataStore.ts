@@ -61,6 +61,7 @@ interface DataState {
   loading: boolean
   uploadingType: string | null
   isUpdating: boolean  // 工参更新(中兴)专用 loading 状态
+  updateProgress: number | null  // 工参更新(中兴)实时进度百分比
   isAddingCell: boolean  // 新站录入专用 loading 状态
   error: string | null
   fetchList: (page?: number, pageSize?: number, forceRefresh?: boolean) => Promise<void>
@@ -68,10 +69,12 @@ interface DataState {
   uploadMap: (file: File, filePath?: string, extraFiles?: File[], importPath?: string) => Promise<boolean>
   uploadGeoData: (file: File, filePath?: string) => Promise<boolean>
   deleteItem: (id: string) => Promise<boolean>
-  updateParameters: (fullParamId: string, currentParamId: string, outputAllColumns?: boolean) => Promise<ApiResponse<{
+  updateParameters: (fullParamId: string, currentParamId: string, outputAllColumns?: boolean, sceneLayerId?: string) => Promise<ApiResponse<{
+    taskId?: string
     newFileId: string; newFileName: string; savedToOriginal: boolean
     stats?: Record<string, { matched: number; appended: number }> | null
     dataset?: { id: string; name: string; sheets: Array<{ name: string; rows: number; matched: number }> } | null
+    sceneLayerWarning?: string
   } | null>>
   downloadTemplate: (templateType: 'full_params' | 'target_cells') => Promise<void>
   addCell: (data: {
@@ -113,6 +116,7 @@ export const useDataStore = create<DataState>((set, get) => ({
   loading: false,
   uploadingType: null,
   isUpdating: false,
+  updateProgress: null,
   isAddingCell: false,
   error: null,
 
@@ -275,8 +279,8 @@ export const useDataStore = create<DataState>((set, get) => ({
     }
   },
 
-  updateParameters: async (fullParamId: string, currentParamId: string, outputAllColumns: boolean = false) => {
-    set({ isUpdating: true, error: null })
+  updateParameters: async (fullParamId: string, currentParamId: string, outputAllColumns: boolean = false, sceneLayerId?: string) => {
+    set({ isUpdating: true, updateProgress: 0, error: null })
 
     // 生成任务ID用于全局跟踪
     const taskId = `param_update_${fullParamId}_${currentParamId}`
@@ -286,7 +290,7 @@ export const useDataStore = create<DataState>((set, get) => ({
       useTaskStore.getState().startTask(taskId, 'parameter_update', '正在更新工参...')
 
       // 1. 创建异步任务（立即返回 taskId，避免 Cloudflare 120s 超时）
-      const response = await dataApi.updateParameters(fullParamId, currentParamId, outputAllColumns)
+      const response = await dataApi.updateParameters(fullParamId, currentParamId, outputAllColumns, sceneLayerId)
       const actualTaskId = response?.data?.taskId
 
       if (!actualTaskId) {
@@ -312,6 +316,9 @@ export const useDataStore = create<DataState>((set, get) => ({
           const progressResp = await dataApi.getUpdateParamsProgress(actualTaskId)
           const progressData = progressResp?.data
 
+          if (typeof progressData?.progress === 'number') {
+            set({ updateProgress: progressData.progress })
+          }
           if (progressData?.status === 'completed') {
             finalResult = progressData
             break
@@ -338,7 +345,7 @@ export const useDataStore = create<DataState>((set, get) => ({
       useTaskStore.getState().completeTask(taskId)
 
       if (finalResult) {
-        set({ isUpdating: false })
+        set({ isUpdating: false, updateProgress: null })
         return {
           success: true,
           data: {
@@ -349,18 +356,20 @@ export const useDataStore = create<DataState>((set, get) => ({
             stats: finalResult.stats || null,
             // 同任务内完成的现网 4G/5G 合并产物
             dataset: finalResult.dataset || null,
+            // 未导入「场景图层.zip」时后端告警，仍正常完成更新
+            sceneLayerWarning: finalResult.sceneLayerWarning || '',
           }
         }
       }
 
       // 超时但后台可能仍在处理，视为失败
-      set({ isUpdating: false })
+      set({ isUpdating: false, updateProgress: null })
       return { success: false, message: '工参更新超时，请稍后刷新数据列表查看结果', data: null }
     } catch (error: any) {
       // 任务失败 - 不在store中设置error（由页面组件处理异常后的刷新逻辑）
       useTaskStore.getState().failTask(taskId, error.message || '工参更新失败')
 
-      set({ isUpdating: false })
+      set({ isUpdating: false, updateProgress: null })
       return { success: false, message: error.message || '工参更新失败', data: null }
     }
   },

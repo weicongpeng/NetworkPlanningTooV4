@@ -78,11 +78,11 @@ def _seed_params(Session, *, pci=486, tac=33807):
 
 
 def _add_task(Session, *, task_id="t-shared-1", is_applied=0, result=PCI_RESULT,
-              applied_values=None, origin="shared"):
+              applied_values=None, origin="shared", task_type="pci"):
     db = Session()
     try:
         db.add(TaskResult(
-            task_id=task_id, task_type="pci", task_name="PCI规划", user_name="tester",
+            task_id=task_id, task_type=task_type, task_name="PCI规划", user_name="tester",
             status="completed", city=CITY, operator=OPERATOR,
             created_at="2026-11-04T01:00:00", origin=origin,
             is_applied=is_applied,
@@ -194,3 +194,33 @@ def test_shared_task_manifest_false_when_all_cells_absent(temp_db):
               applied_values={"S9_99": [300, "12345"]})
     items = task_manager.list_shared_tasks(CITY, OPERATOR)
     assert next(i for i in items if i["task_id"] == "t-absent")["is_applied"] is False
+
+
+def test_pci_applied_ignores_tac_mismatch(temp_db):
+    """PCI 任务的已应用勾只要求工参 PCI 与规划 PCI 一致，TAC 不一致不影响。"""
+    _seed_params(temp_db, pci=486, tac=99999)
+    _add_task(temp_db, task_id="t-pci-tac", is_applied=0,
+              applied_values={"S1_32": [486, "33807"]})
+    items = task_manager.list_shared_tasks(CITY, OPERATOR)
+    assert next(i for i in items if i["task_id"] == "t-pci-tac")["is_applied"] is True
+
+
+def test_tac_planning_still_compares_tac(temp_db):
+    """TAC 规划任务仍要求工参 TAC 与规划 TAC 一致。"""
+    _seed_params(temp_db, pci=486, tac=99999)
+    _add_task(temp_db, task_id="t-tac-plan", is_applied=1, task_type="tac_planning",
+              result=None, applied_values={"S1_32": [None, "33807"]})
+    items = task_manager.list_shared_tasks(CITY, OPERATOR)
+    assert next(i for i in items if i["task_id"] == "t-tac-plan")["is_applied"] is False
+
+
+def test_applied_compare_helpers_skip_tac_for_pci():
+    """列表口径与桌面补拉口径在 PCI 任务上都跳过 TAC，TAC 规划仍比对。"""
+    values = {"S1_32": [486, "33807"]}
+    current = {"S1_32": {"pci": 486, "tac": 99999}}
+    assert TaskManager._compare_tac_for_task("pci") is False
+    assert TaskManager._compare_tac_for_task("tac_planning") is True
+    assert TaskManager._compare_applied_values(values, current, compare_tac=False) is True
+    assert TaskManager._compare_applied_values(values, current, compare_tac=True) is False
+    assert TaskManager._verify_applied_values(values, current, compare_tac=False) is True
+    assert TaskManager._verify_applied_values(values, current, compare_tac=True) is False

@@ -7,7 +7,8 @@
 - PCI/TAC 也可能一边是 486、另一边是 "486.0"，字符串直比会误判为不一致。
 
 口径：操作列一律把规划结果与**当前全量工参的 PCI/TAC 列值**比对，一致即「已应用」
-（高亮消失），不一致即「未应用」（保持高亮）。
+（高亮消失），不一致即「未应用」（保持高亮）；PCI 规划任务只比 PCI，TAC 变化
+不再影响其「已应用」勾。
 """
 from __future__ import annotations
 
@@ -160,15 +161,15 @@ def test_applied_state_follows_current_work_params(params_db):
     assert _applied_of("t-verify-pci") is True
 
 
-def test_applied_state_follows_tac_of_current_work_params(params_db):
-    """TAC 数值同理：工参 tac 变化后立即反映到状态上。"""
+def test_applied_state_ignores_tac_for_pci_task(params_db):
+    """PCI 规划的已应用只跟 PCI 走：工参 TAC 变化不再把勾翻成未应用。"""
     _seed_work_params(params_db, tac=33807)
     _add_pci_task(params_db, task_id="t-verify-tac", tac="33807")
 
     assert _applied_of("t-verify-tac") is True
 
     _rewrite_work_params(params_db, tac=33808)
-    assert _applied_of("t-verify-tac") is False
+    assert _applied_of("t-verify-tac") is True
 
 
 def test_applied_state_follows_pci_value_rotation(params_db):

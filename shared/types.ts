@@ -182,7 +182,7 @@ export interface DataItem {
   status: 'processing' | 'ready' | 'error'
   metadata?: Record<string, any>
   originalPath?: string
-  fileType?: 'full_params' | 'current_params' | 'target_cells' | 'tac_layer' | 'mapinfo_layer' | 'geo_data' | 'default'
+  fileType?: 'full_params' | 'current_params' | 'target_cells' | 'map_layer' | 'tac_layer' | 'mapinfo_layer' | 'geo_data' | 'default'
   geometryType?: 'point' | 'sector' | 'polygon'
   sourceType?: 'excel' | 'mapinfo'
   subType?: string

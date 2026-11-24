@@ -11,7 +11,7 @@ import { indexedDBService } from '../services/indexedDBService'
 import { CellParamsTable } from '../components/DataTable/CellParamsTable'
 import { CellQueryUpdateContent } from '../components/DataTable/CellQueryUpdateCard'
 import { cellDedupKey } from '../utils/cellDedup'
-import { formatImportWarning, formatImportWarningTitle } from '../utils/importWarnings'
+import { formatIdRangeSample, formatImportWarning, formatImportWarningTitle } from '../utils/importWarnings'
 import type { ImportWarning } from '../utils/importWarnings'
 import { useDownloadStore } from '../store/downloadStore'
 import { useTranslation } from 'react-i18next'
@@ -171,12 +171,18 @@ export function DataPage() {
   const [selectedCurrentParamId, setSelectedCurrentParamId] = useState<string>('')
   const [updateSuccess, setUpdateSuccess] = useState<string | null>(null)
   const [outputAllColumns, setOutputAllColumns] = useState(false)
+  // 工参更新(中兴)使用的场景图层；空串表示不加载，touched 标记防止刷新列表覆盖用户选择
+  const [selectedSceneLayerId, setSelectedSceneLayerId] = useState<string>('')
+  const [sceneLayerTouched, setSceneLayerTouched] = useState(false)
 
   // 上传成功消息
   const [uploadSuccess, setUploadSuccess] = useState<string | null>(null)
 
   // 上传失败详细错误（透传后端真实原因，不再只显示"上传失败"）
   const [uploadError, setUploadError] = useState<string | null>(null)
+
+  // 号段越界提醒默认只展示前几条，点击可展开/收起全部（按文件+提醒索引记忆）
+  const [expandedIdWarnings, setExpandedIdWarnings] = useState<Set<string>>(new Set())
 
   // 各上传项的状态
   const [uploadStatus, setUploadStatus] = useState<Record<string, 'idle' | 'success' | 'error'>>({
@@ -278,6 +284,16 @@ export function DataPage() {
     deleteItem,
     updateParameters,
   } = useDataStore()
+
+  // 已导入数据中的图层（含用户自由选择的其他场景图层）；首次加载默认选中名为「场景图层」的条目
+  const sceneLayerFiles = items.filter(i => i.fileType === 'map_layer')
+  useEffect(() => {
+    if (sceneLayerTouched || selectedSceneLayerId) return
+    const files = items.filter(i => i.fileType === 'map_layer')
+    const preferred = files.find(i => i.name === '场景图层')
+      || files.find(i => i.name.includes('场景'))
+    if (preferred) setSelectedSceneLayerId(preferred.id)
+  }, [items, sceneLayerTouched, selectedSceneLayerId])
 
   // 打开数据页时刷新用户权限（感知管理员的最新权限配置）
   useEffect(() => {
@@ -893,7 +909,7 @@ export function DataPage() {
      let lastLogCount = 0
 
      try {
-         const result = await updateParameters(selectedFullParamId, selectedCurrentParamId, outputAllColumns)
+         const result = await updateParameters(selectedFullParamId, selectedCurrentParamId, outputAllColumns, selectedSceneLayerId)
          console.log('Update parameters result:', result);
 
          // 获取 taskId 用于轮询后端终端日志
@@ -960,6 +976,13 @@ export function DataPage() {
              const datasetSuffix = dataset
                  ? `\n${t('data.zteMergeSuccess') || '现网工参合并完成'}：${dataset.name}${mergeSummary ? `（${mergeSummary}）` : ''}`
                  : ''
+             const sceneWarning = result?.data?.sceneLayerWarning as string | undefined
+             const sceneWarningSuffix = sceneWarning
+                 ? `\n${t('data.sceneLayerWarningPrefix') || '注意：'}${sceneWarning}`
+                 : ''
+             if (sceneWarning) {
+                 addLog('update', sceneWarning, undefined, undefined, 'update:scene-layer')
+             }
              if (savedToOriginal && newFileName) {
                  // 从列表中查找具有 originalPath 的文件以构造完整路径
                  const items = useDataStore.getState().items;
@@ -967,12 +990,12 @@ export function DataPage() {
                  if (matchedFile?.originalPath) {
                      const originalDir = matchedFile.originalPath.substring(0, matchedFile.originalPath.lastIndexOf('\\') + 1);
                      const fullPath = `${originalDir}${newFileName}`;
-                     setUpdateSuccess(`${t('data.updateSuccess') || '更新成功'}！${t('data.savedTo') || '已保存至：'}\n${fullPath}${statsSuffix}${datasetSuffix}`)
+                     setUpdateSuccess(`${t('data.updateSuccess') || '更新成功'}！${t('data.savedTo') || '已保存至：'}\n${fullPath}${statsSuffix}${datasetSuffix}${sceneWarningSuffix}`)
                      } else {
-                     setUpdateSuccess(`${t('data.updateSuccess') || '更新成功'}！${t('data.savedToSystem') || '文件已保存在系统内，请手动下载。'}${statsSuffix}${datasetSuffix}`)
+                     setUpdateSuccess(`${t('data.updateSuccess') || '更新成功'}！${t('data.savedToSystem') || '文件已保存在系统内，请手动下载。'}${statsSuffix}${datasetSuffix}${sceneWarningSuffix}`)
                      }
                      } else {
-                     setUpdateSuccess(`${t('data.updateSuccess') || '更新成功'}！${t('data.savedToSystem') || '文件已保存在系统内，请手动下载。'}${statsSuffix}${datasetSuffix}`)
+                     setUpdateSuccess(`${t('data.updateSuccess') || '更新成功'}！${t('data.savedToSystem') || '文件已保存在系统内，请手动下载。'}${statsSuffix}${datasetSuffix}${sceneWarningSuffix}`)
                      }
 
              // 同一后端任务内已完成的 4G/5G 现网工参合并结果
@@ -1019,6 +1042,8 @@ export function DataPage() {
   // 筛选文件列表
   const fullParamFiles = items.filter(i => i.fileType === 'full_params')
   const currentParamFiles = items.filter(i => i.type === 'map')
+  // 场景匹配依赖「场景图层.zip」；未导入时仅提示，不阻断工参更新
+  const sceneLayerReady = sceneLayerFiles.length > 0
 
   return (
     <div className="p-8">
@@ -1253,11 +1278,41 @@ export function DataPage() {
                         <span>{formatImportWarningTitle(item.fileType, item.name, t)}</span>
                       </div>
                       <div className="mt-1 ml-6 space-y-0.5">
-                        {warnings.map((w, i) => (
-                          <div key={i}>
-                            {formatImportWarning(w, t)}
-                          </div>
-                        ))}
+                        {warnings.map((w, i) => {
+                          if (w.code !== 'id_range' || !w.samples?.length) {
+                            return <div key={i}>{formatImportWarning(w, t)}</div>
+                          }
+                          const samples = w.samples
+                          const previewCount = 8
+                          const key = `${item.id}:${i}`
+                          const expanded = expandedIdWarnings.has(key)
+                          const shown = expanded ? samples : samples.slice(0, previewCount)
+                          return (
+                            <div key={i}>
+                              <span>{formatImportWarning({ code: 'id_range', count: w.count ?? samples.length }, t)}</span>
+                              {'，'}
+                              {shown.map((sample, si) => (
+                                <span key={si}>{si > 0 ? '，' : ''}{formatIdRangeSample(sample, t)}</span>
+                              ))}
+                              {samples.length > previewCount && (
+                                <button
+                                  type="button"
+                                  className="ml-2 underline text-primary hover:opacity-80"
+                                  onClick={() => setExpandedIdWarnings(prev => {
+                                    const next = new Set(prev)
+                                    if (next.has(key)) next.delete(key)
+                                    else next.add(key)
+                                    return next
+                                  })}
+                                >
+                                  {expanded
+                                    ? (t('data.importWarnIdRangeLess') || '收起')
+                                    : (t('data.importWarnIdRangeMore', { count: samples.length - previewCount }) || `展开其余 ${samples.length - previewCount} 条`)}
+                                </button>
+                              )}
+                            </div>
+                          )
+                        })}
                       </div>
                     </div>
                   ))}
@@ -1320,6 +1375,11 @@ export function DataPage() {
               onUpdateParameters={handleUpdateParameters}
               outputAllColumns={outputAllColumns}
               setOutputAllColumns={setOutputAllColumns}
+              sceneLayerReady={sceneLayerReady}
+              sceneLayerFiles={sceneLayerFiles}
+              selectedSceneLayerId={selectedSceneLayerId}
+              setSelectedSceneLayerId={setSelectedSceneLayerId}
+              setSceneLayerTouched={setSceneLayerTouched}
             />
         </div>
 
@@ -2438,6 +2498,11 @@ function CellToolsCard({
   onUpdateParameters,
   outputAllColumns,
   setOutputAllColumns,
+  sceneLayerReady,
+  sceneLayerFiles,
+  selectedSceneLayerId,
+  setSelectedSceneLayerId,
+  setSceneLayerTouched,
 }: {
   fullParamFiles: DataItem[]
   currentParamFiles: DataItem[]
@@ -2453,6 +2518,11 @@ function CellToolsCard({
   onUpdateParameters: () => void
   outputAllColumns: boolean
   setOutputAllColumns: (v: boolean) => void
+  sceneLayerReady: boolean
+  sceneLayerFiles: DataItem[]
+  selectedSceneLayerId: string
+  setSelectedSceneLayerId: (v: string) => void
+  setSceneLayerTouched: (v: boolean) => void
 }) {
   const { t } = useTranslation()
   const [activeTab, setActiveTab] = useState<'entry' | 'query' | 'update'>('entry')
@@ -2547,6 +2617,11 @@ function CellToolsCard({
           outputAllColumns={outputAllColumns}
           setOutputAllColumns={setOutputAllColumns}
           permUpdate={permUpdate}
+          sceneLayerReady={sceneLayerReady}
+          sceneLayerFiles={sceneLayerFiles}
+          selectedSceneLayerId={selectedSceneLayerId}
+          setSelectedSceneLayerId={setSelectedSceneLayerId}
+          setSceneLayerTouched={setSceneLayerTouched}
         />
       </div>
     </>
@@ -2594,6 +2669,11 @@ function ParamUpdatePanel({
   outputAllColumns,
   setOutputAllColumns,
   permUpdate,
+  sceneLayerReady,
+  sceneLayerFiles,
+  selectedSceneLayerId,
+  setSelectedSceneLayerId,
+  setSceneLayerTouched,
 }: {
   fullParamFiles: DataItem[]
   currentParamFiles: DataItem[]
@@ -2606,8 +2686,14 @@ function ParamUpdatePanel({
   outputAllColumns: boolean
   setOutputAllColumns: (v: boolean) => void
   permUpdate: boolean
+  sceneLayerReady: boolean
+  sceneLayerFiles: DataItem[]
+  selectedSceneLayerId: string
+  setSelectedSceneLayerId: (v: string) => void
+  setSceneLayerTouched: (v: boolean) => void
 }) {
   const { t } = useTranslation()
+  const updateProgress = useDataStore(s => s.updateProgress)
   return (
     <div className={permUpdate ? '' : 'opacity-50 pointer-events-none'}>
       {!permUpdate && (
@@ -2615,10 +2701,15 @@ function ParamUpdatePanel({
           {t('data.noPermission', '无权限，请联系管理员')}
         </p>
       )}
+      {!sceneLayerReady && (
+        <p className="text-xs text-amber-600 mb-2 bg-amber-50 dark:bg-amber-950/30 px-2 py-1 rounded">
+          {t('data.sceneLayerMissingHint') || '未检测到已导入的「场景图层.zip」：仍可更新工参，场景名称将统一填写「农村」。'}
+        </p>
+      )}
       <div className="flex items-end gap-2">
         <div className="flex-1 min-w-0">
           <select
-            className="w-full p-2 border rounded-md bg-background text-sm mb-2"
+            className={`w-full p-2 border rounded-md bg-background text-sm mb-2 ${selectedFullParamId ? '' : 'text-muted-foreground'}`}
             value={selectedFullParamId}
             onChange={(e) => setSelectedFullParamId(e.target.value)}
             title={t('data.selectFullParams') || '选择全量工参'}
@@ -2626,18 +2717,32 @@ function ParamUpdatePanel({
             <option value="" disabled>{t('data.selectFullParams') || '选择全量工参'}</option>
             {fullParamFiles.map(f => (
               <option key={f.id} value={f.id}>
-                {f.name} {f.originalPath ? '✓' : `(${t('data.noPath') || '无路径'})`}
+                {f.name}{f.originalPath ? ' ✓' : ''}
               </option>
             ))}
           </select>
           <select
-            className="w-full p-2 border rounded-md bg-background text-sm"
+            className={`w-full p-2 border rounded-md bg-background text-sm mb-2 ${selectedCurrentParamId ? '' : 'text-muted-foreground'}`}
             value={selectedCurrentParamId}
             onChange={(e) => setSelectedCurrentParamId(e.target.value)}
             title={t('data.selectCurrentParams') || '选择现网工参 (ZIP)'}
           >
             <option value="" disabled>{t('data.selectCurrentParams') || '选择现网工参 (ZIP)'}</option>
             {currentParamFiles.map(f => (
+              <option key={f.id} value={f.id}>{f.name}</option>
+            ))}
+          </select>
+          <select
+            className={`w-full p-2 border rounded-md bg-background text-sm ${selectedSceneLayerId ? '' : 'text-muted-foreground'}`}
+            value={selectedSceneLayerId}
+            onChange={(e) => {
+              setSelectedSceneLayerId(e.target.value)
+              setSceneLayerTouched(true)
+            }}
+            title={t('data.selectSceneLayer') || '选择场景图层（ZIP）'}
+          >
+            <option value="">{t('data.selectSceneLayer') || '选择场景图层（ZIP）'}</option>
+            {sceneLayerFiles.map(f => (
               <option key={f.id} value={f.id}>{f.name}</option>
             ))}
           </select>
@@ -2649,16 +2754,25 @@ function ParamUpdatePanel({
               onChange={(e) => setOutputAllColumns(e.target.checked)}
               disabled={isUpdating}
             />
-            {t('data.outputAllColumns') || '输出全部列（默认仅常用列）'}
+            {t('data.outputAllColumns') || '输出现网300工参全部列（默认仅常用列），全量工参无影响'}
           </label>
         </div>
         <button
           onClick={onUpdateParameters}
           disabled={isUpdating || !selectedFullParamId || !selectedCurrentParamId}
-          className="shrink-0 h-[calc(2.25rem*2+0.5rem)] px-3 bg-primary text-white rounded-md hover:bg-primary/100 disabled:opacity-50 disabled:cursor-not-allowed flex flex-col items-center justify-center gap-0.5 text-xs font-medium transition-colors"
+          className="shrink-0 self-center h-10 px-4 bg-primary text-white rounded-md hover:bg-primary/100 disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-1.5 text-xs font-medium transition-colors whitespace-nowrap"
         >
-          {isUpdating ? <Loader2 className="animate-spin" size={16} /> : <RefreshCw size={16} />}
-          {isUpdating ? (t('data.updating') || '更新中') : (t('data.startUpdate') || '开始更新')}
+          {isUpdating ? (
+            <>
+              <Loader2 className="animate-spin" size={14} />
+              <span>{`${t('data.updating') || '执行中'}${updateProgress == null ? '' : ` ${updateProgress}%`}`}</span>
+            </>
+          ) : (
+            <>
+              <RefreshCw size={14} />
+              <span>{t('data.startUpdate') || '执行'}</span>
+            </>
+          )}
         </button>
       </div>
     </div>

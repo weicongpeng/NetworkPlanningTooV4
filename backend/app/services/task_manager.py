@@ -2097,6 +2097,7 @@ class TaskManager:
                 "savedToOriginal": result.get("savedToOriginal", False),
                 # 合并统计（匹配/新增行数）：前端据此告知用户实际更新了多少小区
                 "stats": result.get("stats") or {},
+                "sceneLayerWarning": result.get("sceneLayerWarning") or "",
             }
             self._persist_task(task.task_id)
             logger.info(f"[TaskManager] 工参更新任务完成: {task.task_id}")
@@ -2180,6 +2181,7 @@ class TaskManager:
                 "status": "completed",
                 "progress": 100,
                 "dataset": result.get("dataset") or None,
+                "sceneLayerWarning": result.get("sceneLayerWarning") or "",
             }
             self._persist_task(task.task_id)
             logger.info(f"[TaskManager] 现网工参合并任务完成: {task.task_id}")
@@ -2205,6 +2207,7 @@ class TaskManager:
         username: str = "", user_id: int = 1,
         city: Optional[str] = None, operator: Optional[str] = None,
         output_all_columns: bool = False,
+        scene_layer_id: Optional[str] = None,
     ) -> str:
         """创建工参更新(中兴)任务：一次执行全量工参更新 + 4G/5G 现网工参合并。"""
         city, operator = self._task_group(city, operator, username or None)
@@ -2214,6 +2217,7 @@ class TaskManager:
             "username": username,
             "userId": user_id,
             "outputAllColumns": output_all_columns,
+            "sceneLayerId": scene_layer_id,
         }, user_name=username or None, city=city, operator=operator)
         self.tasks[task.task_id] = task
         self._persist_task(task.task_id)
@@ -2244,10 +2248,23 @@ class TaskManager:
             username = task.config.get("username", "")
             user_id = task.config.get("userId", 1)
 
+            # 场景名称匹配：全量工参与现网工参合并复用同一份图层索引
+            from app.services.scene_matcher import SceneMatcher
+            scene_matcher = SceneMatcher(data_service)
+            scene_layer_id = task.config.get("sceneLayerId")
+            if scene_layer_id == "":
+                # 用户主动选择「不加载」：不搜索图层，也不提示缺图层
+                pass
+            else:
+                scene_matcher.load(task.city, task.operator, data_id=scene_layer_id or None)
+            if not scene_matcher.available and scene_matcher.warning:
+                task.log_messages.append(scene_matcher.warning)
+
             update_result = await asyncio.to_thread(
                 data_service.update_parameters,
                 full_param_id, current_param_id,
                 username=username, user_id=user_id,
+                scene_matcher=scene_matcher,
             )
             task.progress = 55
             merge_full_id = update_result.get("newFileId") or full_param_id
@@ -2256,6 +2273,7 @@ class TaskManager:
                 merge_full_id, current_param_id,
                 username=username, user_id=user_id,
                 output_all_columns=task.config.get("outputAllColumns", False),
+                scene_matcher=scene_matcher,
             )
 
             poller.cancel()
@@ -2281,6 +2299,9 @@ class TaskManager:
                 "savedToOriginal": update_result.get("savedToOriginal", False),
                 "stats": update_result.get("stats") or {},
                 "dataset": merge_result.get("dataset") or None,
+                "sceneLayerWarning": (
+                    scene_matcher.warning if not scene_matcher.available else ""
+                ),
             }
             self._persist_task(task.task_id)
             logger.info(f"[TaskManager] 工参更新(中兴)任务完成: {task.task_id}")
@@ -3846,7 +3867,10 @@ class TaskManager:
                         current_values = self._load_current_sector_values(
                             db, city=city, operator=operator
                         )
-                    verdict = self._compare_applied_values(applied_values, current_values)
+                    verdict = self._compare_applied_values(
+                        applied_values, current_values,
+                        compare_tac=TaskManager._compare_tac_for_task(row.task_type),
+                    )
                     meta["is_applied"] = bool(verdict) if verdict is not None else False
                 items.append(meta)
             return items
@@ -4225,7 +4249,10 @@ class TaskManager:
                             current_sector_values = self._load_current_sector_values(
                                 db, city=_grp[0], operator=_grp[1]
                             )
-                        verdict = self._compare_applied_values(applied_values, current_sector_values)
+                        verdict = self._compare_applied_values(
+                            applied_values, current_sector_values,
+                            compare_tac=TaskManager._compare_tac_for_task(r.task_type),
+                        )
                         # 规划小区全都不在工参里时保守判未应用，不能凭空变成「已应用」
                         is_applied = bool(verdict) if verdict is not None else False
                     if result_summary is None and (r.cell_count or 0) > 0:
@@ -4403,7 +4430,9 @@ class TaskManager:
         return values
 
     @staticmethod
-    def _verify_applied(result: Dict, current_values: Dict[str, Dict]) -> bool:
+    def _verify_applied(
+        result: Dict, current_values: Dict[str, Dict], compare_tac: bool = True
+    ) -> bool:
         """启动回填用的入口：把完整结果转成紧凑规划值后，按列表统一口径判定。
 
         统一走 `_compare_applied_values`（剔除不在工参内的小区），避免回填的
@@ -4412,7 +4441,9 @@ class TaskManager:
         values = TaskManager._extract_applied_values(result)
         if not values:
             return False
-        return TaskManager._compare_applied_values(values, current_values) is True
+        return TaskManager._compare_applied_values(
+            values, current_values, compare_tac=compare_tac
+        ) is True
 
     @staticmethod
     def _extract_cell_count(result: Optional[Dict]) -> Optional[int]:
@@ -4539,7 +4570,10 @@ class TaskManager:
                 values = values_by_group[key]
                 if not values:
                     continue
-                if TaskManager._verify_applied(parsed, values):
+                if TaskManager._verify_applied(
+                    parsed, values,
+                    compare_tac=TaskManager._compare_tac_for_task(row.task_type),
+                ):
                     row.is_applied = 1
                     updated += 1
                     TaskManager._history_verify_cache.pop(row.task_id, None)
@@ -4599,7 +4633,14 @@ class TaskManager:
         return values or None
 
     @staticmethod
-    def _verify_applied_values(values: Dict[str, list], current_values: Dict[str, Dict]) -> bool:
+    def _compare_tac_for_task(task_type: Optional[str]) -> bool:
+        """PCI 规划任务的「已应用」只要求 PCI 一致；TAC 规划等仍比对 TAC。"""
+        return str(task_type or "").strip().lower() != "pci"
+
+    @staticmethod
+    def _verify_applied_values(
+        values: Dict[str, list], current_values: Dict[str, Dict], compare_tac: bool = True
+    ) -> bool:
         """严格比对：任一规划小区不在当前工参里即判未应用。
 
         仅用于检测「本机工参副本是否落后」（桌面端自动补拉），不是列表展示口径：
@@ -4612,7 +4653,9 @@ class TaskManager:
             if current is None:
                 return False
             pci = pair[0] if isinstance(pair, list) and len(pair) > 0 else None
-            tac = pair[1] if isinstance(pair, list) and len(pair) > 1 else None
+            tac = (pair[1] if isinstance(pair, list) and len(pair) > 1 else None) if compare_tac else None
+            if pci is None and tac is None:
+                continue
             if pci is not None and not TaskManager._same_param_value(current.get("pci"), pci):
                 return False
             if tac is not None and not TaskManager._same_param_value(current.get("tac"), tac):
@@ -4621,14 +4664,15 @@ class TaskManager:
 
     @staticmethod
     def _compare_applied_values(
-        values: Dict[str, list], current_values: Dict[str, Dict]
+        values: Dict[str, list], current_values: Dict[str, Dict], compare_tac: bool = True
     ) -> Optional[bool]:
         """历史任务「已应用」判定口径：剔除不在当前工参内的小区，只比对工参里存在的小区。
 
-        - 存在的小区 PCI/TAC 全部与规划值一致 → True（已应用）
+        - 存在的小区规划参数（PCI；TAC 规划任务含 TAC）全部一致 → True（已应用）
         - 存在的小区任一不一致（含工参里该参数为空）→ False（未应用）
         - 规划小区全都不在工参里 → None（无可比小区，调用方保守判未应用）
 
+        PCI 规划任务只比对 PCI：全量工参 TAC 与规划 TAC 是否一致不再影响「已应用」勾。
         Why：规划结果常含已从工参删除/新建后未同步的小区，若把「小区不存在」也当作
         「未应用」，整条任务会永远显示未应用，即使工参内的小区确实已按规划改过。
         """
@@ -4639,9 +4683,11 @@ class TaskManager:
             current = current_values.get(key)
             if current is None:
                 continue  # 该小区不在当前工参内 → 剔除，不参与判定
-            comparable += 1
             pci = pair[0] if isinstance(pair, list) and len(pair) > 0 else None
-            tac = pair[1] if isinstance(pair, list) and len(pair) > 1 else None
+            tac = (pair[1] if isinstance(pair, list) and len(pair) > 1 else None) if compare_tac else None
+            if pci is None and tac is None:
+                continue  # 无可比对参数的小区不参与判定
+            comparable += 1
             if pci is not None and not TaskManager._same_param_value(current.get("pci"), pci):
                 return False
             if tac is not None and not TaskManager._same_param_value(current.get("tac"), tac):
