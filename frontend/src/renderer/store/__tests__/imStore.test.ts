@@ -312,6 +312,42 @@ describe('imStore', () => {
     vi.useRealTimers()
   })
 
+  it('WS 消息到达即同步更新红点，回源失败也不「只响不亮」，重复通知不重复计数', () => {
+    vi.useFakeTimers()
+    // relay 回源失败时 refreshConversations 直接 early return，红点不会被服务端数据覆盖
+    vi.mocked(imApi.conversations).mockResolvedValue({ success: false } as any)
+    useImStore.setState({
+      open: true,
+      conversations: [{ ...conversation(null), id: 9, unread: 1 }],
+      unreadTotal: 1,
+    })
+
+    useImStore.getState().handleImMessage({ conversation_id: 9, message_id: 101, sender_id: 8 })
+    // 不等 180ms 防抖刷新：红点与提示音同一帧出现
+    expect(useImStore.getState().unreadTotal).toBe(2)
+    expect(useImStore.getState().conversations[0].unread).toBe(2)
+
+    useImStore.getState().handleImMessage({ conversation_id: 9, message_id: 101, sender_id: 8 })
+    vi.advanceTimersByTime(250)
+    expect(useImStore.getState().unreadTotal).toBe(2)
+    vi.useRealTimers()
+  })
+
+  it('自己发的与系统消息不增加未读红点', () => {
+    vi.useFakeTimers()
+    localStorage.setItem('auth-storage', JSON.stringify({ state: { user: { id: 1 } } }))
+    useImStore.setState({
+      open: true,
+      conversations: [{ ...conversation(null), id: 10, unread: 0 }],
+      unreadTotal: 0,
+    })
+    useImStore.getState().handleImMessage({ conversation_id: 10, message_id: 301, sender_id: 1 })
+    useImStore.getState().handleImMessage({ conversation_id: 10, message_id: 302, kind: 'system' })
+    expect(useImStore.getState().unreadTotal).toBe(0)
+    vi.advanceTimersByTime(250)
+    vi.useRealTimers()
+  })
+
   const emptyPage = {
     success: true,
     data: { items: [], has_more: false, next_cursor: null, prev_cursor: null },

@@ -362,6 +362,22 @@ function markMessageSoundNotified(messageId: number): boolean {
   return true
 }
 
+/**
+ * 未读红点按 messageId 去重：WS 通知与会话列表轮询 / 正文补拉会重复带同一条消息。
+ * 收到 WS 通知时先乐观 +1（与提示音同一帧渲染），随后的 refreshConversations
+ * 用服务端权威 unread 覆盖，重复通知不再累加。
+ */
+const badgedMessageIds = new Set<number>()
+function markMessageBadgeNotified(messageId: number): boolean {
+  if (!(messageId > 0) || badgedMessageIds.has(messageId)) return false
+  badgedMessageIds.add(messageId)
+  if (badgedMessageIds.size > 500) {
+    const oldest = badgedMessageIds.values().next().value
+    if (oldest !== undefined) badgedMessageIds.delete(oldest)
+  }
+  return true
+}
+
 /** 会话列表快照：conversationId → last_message.id。首次刷新只建基线，不把历史当新消息 */
 let conversationLastIds: Map<number, number> | null = null
 
@@ -1136,6 +1152,25 @@ export const useImStore = create<ImState>()(
         // 否则用户切到那个会话时可能只看到红点、正文没补拉。
         const conversationId = Number(detail?.conversation_id) || 0
         if (conversationId > 0) dirtyConversations.add(conversationId)
+
+        // 提示音在 attachImEvents 里随 WS 通知立即响；红点原先要等 180ms 防抖 +
+        // 一次 relay 回源（桌面共享模式可能 1~2s，回源失败就一直不亮），表现为
+        // 「先响后亮 / 只响不亮」。这里同步把未读 +1，与提示音同一帧渲染；
+        // 随后的 refreshConversations 用服务端权威 unread 覆盖，不会重复计数。
+        const messageId = Number(detail?.message_id) || 0
+        const myId = currentUserId()
+        const fromMe = myId !== null && detail?.sender_id != null
+          && Number(detail.sender_id) === Number(myId)
+        const isSystem = detail?.kind === 'system'
+        if (conversationId > 0 && !fromMe && !isSystem && conversationId !== viewedConversationId
+            && markMessageBadgeNotified(messageId)) {
+          set(s => ({
+            conversations: s.conversations.map(c => c.id === conversationId
+              ? { ...c, unread: (c.unread || 0) + 1 } : c),
+            unreadTotal: s.unreadTotal + 1,
+          }))
+        }
+
         if (refreshQueued) return
         refreshQueued = true
         refreshTimer = window.setTimeout(() => {
@@ -1248,6 +1283,7 @@ export const useImStore = create<ImState>()(
         clearImAttachmentCache()
         notifiedMentionIds.clear()
         soundedMessageIds.clear()
+        badgedMessageIds.clear()
         conversationLastIds = null
         dirtyConversations.clear()
         messagesInFlight.clear()
