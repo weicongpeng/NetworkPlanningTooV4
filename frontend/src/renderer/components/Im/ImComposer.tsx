@@ -20,7 +20,7 @@ import {
 
 import { imApi } from '../../services/api'
 import { useAuthStore } from '../../store/authStore'
-import { useImStore } from '../../store/imStore'
+import { IM_COMPOSER_FILL_EVENT, useImStore } from '../../store/imStore'
 import { useToastStore } from '../../store/toastStore'
 import { EMOJI_GROUPS } from './emojis'
 import { ImMentionPopup } from './ImMentionPopup'
@@ -196,10 +196,26 @@ export function ImComposer({ conversationId, onSent }: {
     }
   }
 
-  const updateText = (value: string) => {
+  const updateText = useCallback((value: string) => {
     setText(value)
     setDraft(value)
-  }
+  }, [setDraft])
+
+  // 撤回消息点「重新编辑」：store 广播原文，这里同步本地 textarea（只回填当前会话）
+  useEffect(() => {
+    const onFill = (event: Event) => {
+      const detail = (event as CustomEvent).detail || {}
+      if (Number(detail.conversationId) !== conversationId) return
+      const value = String(detail.text || '')
+      updateText(value)
+      textareaRef.current?.focus()
+      window.requestAnimationFrame(() => {
+        textareaRef.current?.setSelectionRange(value.length, value.length)
+      })
+    }
+    window.addEventListener(IM_COMPOSER_FILL_EVENT, onFill)
+    return () => window.removeEventListener(IM_COMPOSER_FILL_EVENT, onFill)
+  }, [conversationId, updateText])
 
   const mentionTargets = useMemo<ImMentionTarget[]>(() => {
     if (!isGroup || !mentionState) return []

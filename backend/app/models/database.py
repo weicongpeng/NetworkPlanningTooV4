@@ -744,6 +744,8 @@ class ImMessage(Base):
     reply_to_id = Column(Integer, ForeignKey("im_messages.id"), nullable=True)
     # 是否 @所有人；具体被点名成员固化在 im_message_mentions，成员后续增减不改历史归属
     mention_all = Column(Boolean, nullable=False, default=False)
+    # 撤回时间（UTC ISO）：非空即已撤回，原正文/附件仍保留在库里，仅对发送者可见
+    recalled_at = Column(String(30), nullable=True)
     created_at = Column(String(30), nullable=False, default=_utcnow_iso)
 
     __table_args__ = (

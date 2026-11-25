@@ -579,6 +579,13 @@ async def zte_update_and_merge(
             if entry is None or not index_entry_visible(entry, current_user):
                 raise HTTPException(status_code=404, detail="数据不存在")
 
+        # 场景图层按组隔离校验；空串表示用户主动选择不加载
+        scene_layer_id = request.sceneLayerId
+        if scene_layer_id:
+            entry = data_service.index.get(scene_layer_id)
+            if entry is None or not index_entry_visible(entry, current_user):
+                raise HTTPException(status_code=404, detail="场景图层不存在")
+
         from app.services.task_manager import task_manager
         task_id = await task_manager.create_zte_update_and_merge_task(
             request.fullParamId, request.currentParamId,
@@ -587,6 +594,7 @@ async def zte_update_and_merge(
             city=getattr(current_user, "city", None),
             operator=getattr(current_user, "operator", None),
             output_all_columns=request.outputAllColumns,
+            scene_layer_id=scene_layer_id,
         )
         return {
             "success": True,

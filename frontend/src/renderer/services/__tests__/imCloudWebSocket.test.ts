@@ -10,7 +10,7 @@ import {
   IM_CLOUD_WS_ACTIVE_EVENT, IM_CLOUD_WS_FALLBACK_EVENT, imCloudWebSocket,
 } from '../imCloudWebSocket'
 import {
-  IM_MESSAGE_EVENT, IM_PRESENCE_EVENT, IM_RESYNC_EVENT,
+  IM_MESSAGE_EVENT, IM_PRESENCE_EVENT, IM_RECALL_EVENT, IM_RESYNC_EVENT,
 } from '../websocketService'
 
 const CONFIG = {
@@ -107,17 +107,21 @@ describe('imCloudWebSocket', () => {
     expect(resync).toHaveBeenCalledTimes(1)
   })
 
-  it('im_message / im_presence 派发既有 window 事件，零改动复用 imStore', async () => {
+  it('im_message / im_recall / im_presence 派发既有 window 事件，零改动复用 imStore', async () => {
     const message = on(IM_MESSAGE_EVENT)
+    const recall = on(IM_RECALL_EVENT)
     const presence = on(IM_PRESENCE_EVENT)
     await imCloudWebSocket.start()
     const ws = FakeWebSocket.instances[0]
     ws.open()
     ws.emit({ type: 'auth_ok' })
     ws.emit({ type: 'im_message', data: { conversation_id: 7, message_id: 12 } })
+    ws.emit({ type: 'im_recall', data: { conversation_id: 7, message_id: 12, sender_id: 2 } })
     ws.emit({ type: 'im_presence', data: { user_id: 3, online: true } })
     expect(message).toHaveBeenCalledTimes(1)
     expect((message.mock.calls[0][0] as CustomEvent).detail).toMatchObject({ conversation_id: 7 })
+    expect(recall).toHaveBeenCalledTimes(1)
+    expect((recall.mock.calls[0][0] as CustomEvent).detail).toMatchObject({ message_id: 12 })
     expect(presence).toHaveBeenCalledTimes(1)
   })
 

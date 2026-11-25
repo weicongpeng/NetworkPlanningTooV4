@@ -176,7 +176,11 @@ class Settings(BaseSettings):
     # ===== 协作沟通（IM）=====
     # 附件目录必须挂 PROFILE_ROOT 下，才能与桌面 shared/standalone 配置档隔离一致
     NPT_IM_ATTACHMENT_DIR: Path = _PROFILE_ROOT / "uploads" / "im"
-    NPT_IM_MAX_FILE_MB: int = 20
+    # 聊天附件上限：分片上传（2MB/片）后可承载安装包/数据集等大文件；
+    # 生产可用 NPT_IM_MAX_FILE_MB 覆盖，注意同时受 relay 每分钟分片数限制。
+    NPT_IM_MAX_FILE_MB: int = 512
+    # 桌面共享模式：云端附件首次下载后在本地保留的 LRU 上限（MB），0=关闭本地缓存
+    NPT_IM_LOCAL_ATTACHMENT_CACHE_MB: int = 2048
     NPT_IM_MESSAGE_PAGE_SIZE: int = 30
     NPT_IM_MAX_MEMBERS_PER_GROUP: int = 200
     # 降级轮询间隔（云 WS 不可用/旧服务端时由 ImHost 使用，单位毫秒）

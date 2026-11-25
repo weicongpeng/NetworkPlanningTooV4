@@ -107,8 +107,9 @@ def op_update_nickname(db: Session, user_id: int, *, nickname: str | None = None
 
 def op_list_messages(db: Session, user_id: int, *, conversation_id: int,
                      after_id: int | None = None, before_id: int | None = None,
-                     limit: int | None = None, **_: Any) -> dict:
-    return im_service.list_messages(db, conversation_id, user_id, after_id, before_id, limit)
+                     limit: int | None = None, ids: list[int] | None = None,
+                     **_: Any) -> dict:
+    return im_service.list_messages(db, conversation_id, user_id, after_id, before_id, limit, ids)
 
 
 def op_send_message(db: Session, user_id: int, *, conversation_id: int, kind: str,
@@ -205,6 +206,21 @@ def op_delete_message(db: Session, user_id: int, *, conversation_id: int,
     return im_service.delete_message(db, conversation_id, int(message_id), user_id)
 
 
+def op_recall_message(db: Session, user_id: int, *, conversation_id: int,
+                      message_id: int, **_: Any) -> dict:
+    result = im_service.recall_message(db, conversation_id, int(message_id), user_id)
+    message = result["message"]
+    # 不排除发送者：同一账号的其它设备也要立刻把气泡换成撤回占位
+    targets = im_service.member_ids(db, conversation_id)
+    websocket_manager.notify_im_recall(targets, {
+        "conversation_id": conversation_id,
+        "message_id": message["id"],
+        "sender_id": user_id,
+        "recalled_at": message.get("recalled_at"),
+    })
+    return result
+
+
 def op_forward_messages(db: Session, user_id: int, *, message_ids: list,
                         conversation_ids: list, **_: Any) -> dict:
     result = im_service.forward_messages(db, user_id, message_ids, conversation_ids)
@@ -240,6 +256,7 @@ OPS: Dict[str, Callable] = {
     "list_messages": op_list_messages,
     "send_message": op_send_message,
     "delete_message": op_delete_message,
+    "recall_message": op_recall_message,
     "forward_messages": op_forward_messages,
     "mark_read": op_mark_read,
     "list_contacts": op_list_contacts,

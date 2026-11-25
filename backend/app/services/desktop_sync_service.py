@@ -923,7 +923,10 @@ def _repair_stale_params(city: str, operator: str, items: Dict[str, Dict[str, An
                 values = TaskManager._load_current_sector_values(db, city=city, operator=operator)
             if not values:
                 return None
-            if not TaskManager._verify_applied_values(applied_values, values):
+            if not TaskManager._verify_applied_values(
+                applied_values, values,
+                compare_tac=TaskManager._compare_tac_for_task(row.task_type),
+            ):
                 break
         else:
             return None  # 本机工参与服务器应用结果一致，无需补拉

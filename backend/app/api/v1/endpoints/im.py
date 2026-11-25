@@ -24,11 +24,15 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
+from app import desktop_bridge
 from app.core.config import settings
 from app.core.database import get_db
 from app.core.security import get_current_user
 from app.models.database import User
-from app.services import im_attachment_service, im_desktop_proxy, im_ops, im_service
+from app.services import (
+    desktop_im_storage, im_attachment_service, im_desktop_proxy, im_download_jobs,
+    im_ops, im_service,
+)
 
 router = APIRouter(tags=["协作沟通"])
 logger = logging.getLogger(__name__)
@@ -118,6 +122,12 @@ class AttachmentChunkRequest(BaseModel):
 
 class AttachmentIdRequest(BaseModel):
     upload_id: str
+
+
+class AttachmentCacheRequest(BaseModel):
+    attachment_id: int = Field(..., gt=0)
+    filename: str = Field("", max_length=255)
+    reveal: bool = False
 
 
 class AttachmentUrlItem(BaseModel):
@@ -261,12 +271,19 @@ def list_messages(conversation_id: int,
                   after_id: Optional[int] = Query(None),
                   before_id: Optional[int] = Query(None),
                   limit: Optional[int] = Query(None, ge=1, le=100),
+                  ids: Optional[str] = Query(None, description="逗号分隔的消息 id，用于撤回状态对账"),
                   db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     if after_id is not None and before_id is not None:
         raise HTTPException(status_code=400, detail="IM_INVALID_MESSAGE")
+    parsed_ids: Optional[List[int]] = None
+    if ids:
+        parts = [part.strip() for part in ids.split(',') if part.strip()]
+        if not parts or len(parts) > 100 or any(not re.fullmatch(r'\d+', part) for part in parts):
+            raise HTTPException(status_code=400, detail="IM_INVALID_MESSAGE")
+        parsed_ids = [int(part) for part in parts]
     return _ok(_run("list_messages", {
         "conversation_id": conversation_id, "after_id": after_id,
-        "before_id": before_id, "limit": limit,
+        "before_id": before_id, "limit": limit, "ids": parsed_ids,
     }, db, user, limit=120))
 
 
@@ -294,6 +311,15 @@ def delete_message(conversation_id: int, message_id: int,
                    db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     """隐藏单条自己发出的历史消息（仅对操作者生效，对方无感）。"""
     return _ok(_run("delete_message", {
+        "conversation_id": conversation_id, "message_id": message_id,
+    }, db, user, limit=30))
+
+
+@router.post("/conversations/{conversation_id}/messages/{message_id}/recall")
+def recall_message(conversation_id: int, message_id: int,
+                   db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """撤回自己 5 分钟内发出的消息：原文仅自己可见，其他成员看到撤回占位。"""
+    return _ok(_run("recall_message", {
         "conversation_id": conversation_id, "message_id": message_id,
     }, db, user, limit=30))
 
@@ -373,9 +399,8 @@ def attachment_urls(payload: AttachmentUrlsRequest, db: Session = Depends(get_db
 @router.post("/attachments/start")
 def attachment_start(payload: AttachmentStartRequest, db: Session = Depends(get_db),
                      user: User = Depends(get_current_user)):
-    # 桌面共享同样走与网页端一致的上限：分片已是 512KB，base64 单片约 683KB，
-    # 原来的 5MB 硬上限会把手机拍照的 3~8MB 图片直接判失败（用户表现为
-    # 「附件发送失败，已放回待发送列表」）。真正限制慢请求的是独立 relay 槽池。
+    # 桌面共享同样走与网页端一致的上限：分片已是 2MB，base64 单片约 2.7MB，
+    # 默认上限 512MB；生产可通过 NPT_IM_MAX_FILE_MB 调整。真正限制慢请求的是独立 relay 槽池。
     if im_desktop_proxy.is_shared_desktop() \
             and payload.size_bytes > settings.NPT_IM_MAX_FILE_MB * 1024 * 1024:
         raise HTTPException(status_code=400, detail="IM_ATTACHMENT_TOO_LARGE")
@@ -446,6 +471,41 @@ def open_attachment(attachment_id: int, db: Session = Depends(get_db),
     return _ok({"opened": True, "path": str(target)})
 
 
+@router.post("/attachments/cache")
+def start_attachment_cache(payload: AttachmentCacheRequest,
+                           user: User = Depends(get_current_user)):
+    """桌面端：后台缓存附件到本机下载目录（重复点击复用同一任务）。"""
+    if not settings.NPT_DESKTOP:
+        raise HTTPException(status_code=404, detail="Not Found")
+    return _ok(im_download_jobs.start(
+        int(user.id), payload.attachment_id, payload.filename, payload.reveal))
+
+
+@router.get("/attachments/{attachment_id}/cache")
+def attachment_cache_status(attachment_id: int,
+                            user: User = Depends(get_current_user)):
+    """桌面端：查询后台缓存进度，供前端显示进度条。"""
+    if not settings.NPT_DESKTOP:
+        raise HTTPException(status_code=404, detail="Not Found")
+    return _ok(im_download_jobs.status(int(user.id), attachment_id))
+
+
+@router.post("/attachments/{attachment_id}/reveal")
+def reveal_attachment(attachment_id: int,
+                      user: User = Depends(get_current_user)):
+    """桌面端：在本地已缓存的附件上调用系统文件管理器定位。"""
+    if not settings.NPT_DESKTOP:
+        raise HTTPException(status_code=404, detail="Not Found")
+    try:
+        return _ok(im_download_jobs.reveal_cached(int(user.id), attachment_id))
+    except HTTPException as exc:
+        if exc.status_code != 409:
+            raise
+        # 兼容未先调用 /cache 的旧前端：后台缓存完成后自动定位
+        return _ok(im_download_jobs.start(
+            int(user.id), attachment_id, f"attachment-{attachment_id}", reveal=True))
+
+
 def _attachment_headers(filename: str, thumb: bool) -> Dict[str, str]:
     disposition = "inline" if thumb else "attachment"
     quoted = urllib.parse.quote(filename)
@@ -463,13 +523,18 @@ def _shared_attachment_bytes(attachment_id: int, thumb: bool,
     回退是为了兼容「新桌面端 + 未升级的生产后端」——旧 relay 不认识 attachment_urls
     会返回 404；回退后功能不变，只是暂时没有性能收益。限流 429 不回退，避免叠加。
     """
+    cached = im_attachment_service.read_remote_cache(attachment_id, thumb)
+    if cached is not None:
+        return cached
     try:
         data = _run("attachment_urls", {
             "items": [{"attachment_id": attachment_id, "thumb": thumb}],
         }, db, user, limit=120)
         info = (data or {}).get("tokens", {}).get(f"{attachment_id}:{int(thumb)}")
         if info:
-            return im_desktop_proxy.fetch_signed_attachment(info)
+            result = im_desktop_proxy.fetch_signed_attachment(info)
+            im_attachment_service.write_remote_cache(attachment_id, thumb, *result)
+            return result
     except HTTPException as exc:
         if exc.status_code == 429:
             raise
@@ -482,9 +547,11 @@ def _shared_attachment_bytes(attachment_id: int, thumb: bool,
         "attachment_id": attachment_id, "thumb": thumb,
     }, db, user, limit=60)
     content = base64.b64decode(payload["content_b64"])
-    return (content,
-            payload.get("mime") or "application/octet-stream",
-            payload.get("filename") or "attachment")
+    result = (content,
+              payload.get("mime") or "application/octet-stream",
+              payload.get("filename") or "attachment")
+    im_attachment_service.write_remote_cache(attachment_id, thumb, *result)
+    return result
 
 
 def _download(attachment_id: int, thumb: bool, db: Session, user: User) -> Response:

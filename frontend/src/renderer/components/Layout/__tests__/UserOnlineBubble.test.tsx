@@ -6,8 +6,10 @@ vi.mock('../../../utils/knockSound', () => ({
   playKnockSound: vi.fn(),
 }))
 
-// 登录态：只用到 getState().user?.id，避免拉起真实 store 的副作用
-const { authState } = vi.hoisted(() => ({ authState: { user: null as { id: number } | null } }))
+// 登录态：只用到 getState().user 的 id / im_user_id，避免拉起真实 store 的副作用
+const { authState } = vi.hoisted(() => ({
+  authState: { user: null as { id: number; im_user_id?: number | null } | null },
+}))
 vi.mock('../../../store/authStore', () => ({
   useAuthStore: { getState: () => authState },
 }))
@@ -50,6 +52,25 @@ describe('UserOnlineBubble（用户上线气泡）', () => {
       dispatchOnline({ eventId: 'other-1', userId: 8, text: '梅州_移动 zhangsan' })
     })
     expect(screen.getByText('梅州_移动 zhangsan')).toBeTruthy()
+  })
+
+  it('桌面共享模式按 im_user_id 判定「自己」，本机镜像 id 不同也不为自己敲门', () => {
+    // 桌面端本机 users.id（3）与服务器 user.id（7）不同，事件里带的是服务器 id
+    authState.user = { id: 3, im_user_id: 7 }
+    render(<UserOnlineBubble />)
+    act(() => {
+      dispatchOnline({ eventId: 'self-desktop', userId: 7, text: '河源_电信 admin' })
+    })
+    expect(usePresenceStore.getState().notice).toBeNull()
+  })
+
+  it('桌面端其它用户上线照常弹气泡（用 im_user_id 不会误伤）', () => {
+    authState.user = { id: 3, im_user_id: 7 }
+    render(<UserOnlineBubble />)
+    act(() => {
+      dispatchOnline({ eventId: 'other-desktop', userId: 8, text: '河源_联通 lisi' })
+    })
+    expect(screen.getByText('河源_联通 lisi')).toBeTruthy()
   })
 
   it('展示上线文案', () => {

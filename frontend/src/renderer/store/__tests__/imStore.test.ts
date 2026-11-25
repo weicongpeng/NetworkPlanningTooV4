@@ -5,20 +5,21 @@ vi.mock('../../utils/messageSound', () => ({
 }))
 
 vi.mock('../../services/api', () => ({
-  IM_CHUNK_SIZE: 512 * 1024,
+  IM_CHUNK_SIZE: 2 * 1024 * 1024,
   imApi: {
     conversations: vi.fn(), contacts: vi.fn(), messages: vi.fn(), send: vi.fn(),
     markRead: vi.fn(), createConversation: vi.fn(), createGroup: vi.fn(),
     uploadAttachment: vi.fn(), downloadAttachment: vi.fn(), members: vi.fn(),
-    deleteMessage: vi.fn(), forwardMessages: vi.fn(),
-    prewarmAttachmentUrls: vi.fn(),
+    deleteMessage: vi.fn(), recallMessage: vi.fn(), forwardMessages: vi.fn(),
+    prewarmAttachmentUrls: vi.fn(), startAttachmentCache: vi.fn(),
+    attachmentCacheStatus: vi.fn(), revealAttachment: vi.fn(),
   },
 }))
 
 import { imApi } from '../../services/api'
 import { IM_MESSAGE_EVENT } from '../../services/websocketService'
 import { playImMessageSound } from '../../utils/messageSound'
-import { attachImEvents, useImStore } from '../imStore'
+import { attachImEvents, IM_COMPOSER_FILL_EVENT, useImStore } from '../imStore'
 import { conversationTitle } from '../../components/Im/types'
 import type {
   ImConversation, ImConversationsData, ImEnvelope, ImMessage, ImMessageKind, ImMessagesPage,
@@ -312,6 +313,42 @@ describe('imStore', () => {
     vi.useRealTimers()
   })
 
+  it('WS 消息到达即同步更新红点，回源失败也不「只响不亮」，重复通知不重复计数', () => {
+    vi.useFakeTimers()
+    // relay 回源失败时 refreshConversations 直接 early return，红点不会被服务端数据覆盖
+    vi.mocked(imApi.conversations).mockResolvedValue({ success: false } as any)
+    useImStore.setState({
+      open: true,
+      conversations: [{ ...conversation(null), id: 9, unread: 1 }],
+      unreadTotal: 1,
+    })
+
+    useImStore.getState().handleImMessage({ conversation_id: 9, message_id: 101, sender_id: 8 })
+    // 不等 180ms 防抖刷新：红点与提示音同一帧出现
+    expect(useImStore.getState().unreadTotal).toBe(2)
+    expect(useImStore.getState().conversations[0].unread).toBe(2)
+
+    useImStore.getState().handleImMessage({ conversation_id: 9, message_id: 101, sender_id: 8 })
+    vi.advanceTimersByTime(250)
+    expect(useImStore.getState().unreadTotal).toBe(2)
+    vi.useRealTimers()
+  })
+
+  it('自己发的与系统消息不增加未读红点', () => {
+    vi.useFakeTimers()
+    localStorage.setItem('auth-storage', JSON.stringify({ state: { user: { id: 1 } } }))
+    useImStore.setState({
+      open: true,
+      conversations: [{ ...conversation(null), id: 10, unread: 0 }],
+      unreadTotal: 0,
+    })
+    useImStore.getState().handleImMessage({ conversation_id: 10, message_id: 301, sender_id: 1 })
+    useImStore.getState().handleImMessage({ conversation_id: 10, message_id: 302, kind: 'system' })
+    expect(useImStore.getState().unreadTotal).toBe(0)
+    vi.advanceTimersByTime(250)
+    vi.useRealTimers()
+  })
+
   const emptyPage = {
     success: true,
     data: { items: [], has_more: false, next_cursor: null, prev_cursor: null },
@@ -349,6 +386,62 @@ describe('imStore', () => {
     expect(useImStore.getState().error).toBeNull()
   })
 
+  it('通讯录点已有单聊：直接激活本地会话，不再发创建请求', async () => {
+    localStorage.setItem('auth-storage', JSON.stringify({ state: { user: { id: 1 } } }))
+    vi.mocked(imApi.messages).mockResolvedValue(emptyPage as any)
+    const existing: ImConversation = {
+      id: 31, kind: 'direct', name: null, group_key: null,
+      other_user: { id: 5, username: 'bob', is_online: true },
+      member_count: 2, last_message: null, last_message_at: null, unread: 2, muted: false,
+    }
+    useImStore.setState({
+      activeTab: 'contacts', conversations: [existing], unreadTotal: 2,
+    })
+
+    const id = await useImStore.getState().openDirect(5)
+
+    expect(id).toBe(31)
+    expect(imApi.createConversation).not.toHaveBeenCalled()
+    expect(useImStore.getState().activeTab).toBe('messages')
+    expect(useImStore.getState().activeConversationId).toBe(31)
+    expect(useImStore.getState().conversations[0].unread).toBe(0)
+  })
+
+  it('首次和某人聊天：先切 Tab 并给出占位，创建返回后插入会话并激活', async () => {
+    localStorage.setItem('auth-storage', JSON.stringify({ state: { user: { id: 1 } } }))
+    vi.mocked(imApi.messages).mockResolvedValue(emptyPage as any)
+    const created: ImConversation = {
+      id: 21, kind: 'direct', name: null, group_key: null,
+      other_user: { id: 5, username: 'bob', is_online: true },
+      member_count: 2, last_message: null, last_message_at: null, unread: 0, muted: false,
+    }
+    vi.mocked(imApi.conversations).mockResolvedValue(conversationsPage([created]))
+    useImStore.setState({
+      activeTab: 'contacts',
+      contacts: {
+        users: [{ id: 5, username: 'bob', is_online: true, city: '河源', operator: '电信' }],
+        groups: [], online_count: 1, server_time: '',
+      },
+    })
+    let resolveCreate!: (value: unknown) => void
+    vi.mocked(imApi.createConversation)
+      .mockImplementationOnce(() => new Promise(resolve => { resolveCreate = resolve }) as any)
+
+    const opening = useImStore.getState().openDirect(5)
+    // 同步阶段就该有反馈：Tab 已切到消息，占位对象已就位，还没有真实会话 id
+    expect(useImStore.getState().activeTab).toBe('messages')
+    expect(useImStore.getState().pendingDirect?.user?.id).toBe(5)
+    expect(useImStore.getState().conversations).toHaveLength(0)
+
+    resolveCreate({ success: true, data: { id: 21, kind: 'direct' } })
+    await expect(opening).resolves.toBe(21)
+
+    const state = useImStore.getState()
+    expect(state.pendingDirect).toBeNull()
+    expect(state.activeConversationId).toBe(21)
+    expect(state.conversations.some(item => item.id === 21)).toBe(true)
+  })
+
   it('附件发送失败时返回失败文件，供输入区放回待发送列表', async () => {
     useImStore.setState({ activeConversationId: 7 })
     const okFile = new File(['a'], 'ok.png', { type: 'image/png' })
@@ -362,6 +455,54 @@ describe('imStore', () => {
 
     const failed = await useImStore.getState().sendFiles([okFile, badFile])
     expect(failed).toEqual([badFile])
+  })
+
+  it('被拒绝的文件类型显示明确原因，而不是泛化附件失败', async () => {
+    useImStore.setState({ activeConversationId: 7, error: null, errorScope: null })
+    const file = new File(['x'], 'Umi-OCR.exe', { type: 'application/octet-stream' })
+    vi.mocked(imApi.uploadAttachment).mockRejectedValueOnce({
+      success: false, message: 'IM_ATTACHMENT_TYPE', code: 400,
+    } as any)
+
+    const failed = await useImStore.getState().sendFiles([file])
+    expect(failed).toEqual([file])
+    expect(useImStore.getState().error).toBe('im.error.attachmentType')
+  })
+
+  it('桌面端附件缓存显示进度并在完成后定位文件', async () => {
+    vi.useFakeTimers()
+    try {
+      const fileMessage: ImMessage = {
+        ...message(1), kind: 'file',
+        attachment: {
+          id: 12, original_name: '包.zip', mime: 'application/zip',
+          size_bytes: 1024, has_thumb: false,
+        },
+      }
+      vi.mocked(imApi.startAttachmentCache).mockResolvedValue({
+        success: true, data: { status: 'running', percent: 0, phase: '准备', path: '', error: '' },
+      } as any)
+      vi.mocked(imApi.attachmentCacheStatus)
+        .mockResolvedValueOnce({ success: true, data: {
+          status: 'running', percent: 40, phase: '下载中', path: '', error: '',
+        } } as any)
+        .mockResolvedValueOnce({ success: true, data: {
+          status: 'done', percent: 100, phase: '完成', path: 'D:\\downloads\\包.zip', error: '',
+        } } as any)
+      vi.mocked(imApi.revealAttachment).mockResolvedValue({
+        success: true, data: { revealed: true, path: 'D:\\downloads\\包.zip' },
+      } as any)
+
+      const pending = useImStore.getState().downloadAttachment(fileMessage, true)
+      await vi.advanceTimersByTimeAsync(300)
+      await vi.advanceTimersByTimeAsync(300)
+      await pending
+      expect(imApi.startAttachmentCache).toHaveBeenCalledWith(12, '包.zip', true)
+      expect(imApi.revealAttachment).toHaveBeenCalledWith(12)
+      expect(useImStore.getState().downloadProgress).toBeNull()
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('编辑图片可直发多个会话，单个目标失败不影响其它目标', async () => {
@@ -607,6 +748,46 @@ describe('imStore', () => {
     expect(useImStore.getState().conversations).toHaveLength(1)
   })
 
+  it('通讯录刷新失败（relay 繁忙/限流）时保留上次结果，不再退回「暂无联系人」', async () => {
+    const previous = {
+      users: [{ id: 5, username: 'bob', is_online: false, city: '', operator: '' }],
+      groups: [], online_count: 0, server_time: '',
+    }
+    useImStore.setState({ contacts: previous } as any)
+    vi.mocked(imApi.contacts).mockResolvedValueOnce({
+      success: false, message: 'IM_RELAY_BUSY', code: 503,
+    } as any)
+    await useImStore.getState().refreshContacts()
+    expect(useImStore.getState().contacts).toBe(previous)
+  })
+
+  it('重连补拉通讯录，且通讯录轮询不随消息轮询一起被停掉', async () => {
+    vi.useFakeTimers()
+    vi.mocked(imApi.contacts).mockResolvedValue({ success: true, data: {
+      users: [], groups: [], online_count: 0, server_time: '',
+    } } as any)
+    useImStore.getState().startContactsPolling(1000)
+    vi.advanceTimersByTime(1000)
+    expect(imApi.contacts).toHaveBeenCalledTimes(1)
+    await flushMicrotasks()
+
+    // 桌面云 WS active 会停掉消息轮询：通讯录仍要继续校准，否则断联后永久空态
+    useImStore.getState().stopPolling()
+    vi.advanceTimersByTime(1000)
+    expect(imApi.contacts).toHaveBeenCalledTimes(2)
+    await flushMicrotasks()
+
+    useImStore.getState().stopContactsPolling()
+    vi.advanceTimersByTime(1000)
+    expect(imApi.contacts).toHaveBeenCalledTimes(2)
+
+    vi.mocked(imApi.contacts).mockClear()
+    useImStore.getState().resync()
+    await flushMicrotasks()
+    expect(imApi.contacts).toHaveBeenCalledTimes(1)
+    vi.useRealTimers()
+  })
+
   it('桌面端页面隐藏仍轮询未读，窗口重新可见时立即补刷一次', async () => {
     vi.useFakeTimers()
     vi.mocked(imApi.conversations).mockResolvedValue(conversationsPage([]) as any)
@@ -689,6 +870,65 @@ describe('imStore', () => {
     vi.mocked(imApi.forwardMessages).mockResolvedValue({ success: true, data: { count: 1 } } as any)
     expect(await useImStore.getState().forwardMessages([2], [9])).toBe(true)
     expect(imApi.forwardMessages).toHaveBeenCalledWith([2], [9])
+  })
+
+  it('撤回消息原地保留占位，原文可回填输入框', async () => {
+    localStorage.setItem('auth-storage', JSON.stringify({ state: { user: { id: 1 } } }))
+    const original = message(1, '撤回原文')
+    useImStore.setState({ activeConversationId: 7, messages: { 7: [original, message(2)] } })
+    const recalled = { ...original, recalled: true, recalled_at: '2026-11-25T00:00:00Z' }
+    vi.mocked(imApi.recallMessage).mockResolvedValue(
+      { success: true, data: { message: recalled, recalled: true } } as any)
+
+    expect(await useImStore.getState().recallMessage(7, 1)).toBe(true)
+    const list = useImStore.getState().messages[7]
+    expect(list.map(m => m.id)).toEqual([1, 2])
+    expect(list[0].recalled).toBe(true)
+    expect(list[0].content_text).toBe('撤回原文')
+
+    const fill = vi.fn()
+    window.addEventListener(IM_COMPOSER_FILL_EVENT, fill)
+    useImStore.getState().fillComposer(7, list[0].content_text || '')
+    window.removeEventListener(IM_COMPOSER_FILL_EVENT, fill)
+    expect(fill).toHaveBeenCalledTimes(1)
+    expect((fill.mock.calls[0][0] as CustomEvent).detail).toEqual({
+      conversationId: 7, text: '撤回原文',
+    })
+  })
+
+  it('WS 撤回事件把对方消息立即脱敏，自己的其它端保留原文', () => {
+    localStorage.setItem('auth-storage', JSON.stringify({ state: { user: { id: 1 } } }))
+    const mine = message(1, '我的原文')
+    const theirs = { ...message(2, '对方原文'), sender_id: 2 }
+    useImStore.setState({ messages: { 7: [mine, theirs] } })
+
+    useImStore.getState().handleImRecall({
+      conversation_id: 7, message_id: 1, sender_id: 1, recalled_at: 'now',
+    })
+    useImStore.getState().handleImRecall({
+      conversation_id: 7, message_id: 2, sender_id: 2, recalled_at: 'now',
+    })
+    const list = useImStore.getState().messages[7]
+    expect(list[0]).toMatchObject({ recalled: true, content_text: '我的原文' })
+    expect(list[1]).toMatchObject({ recalled: true, content_text: null })
+  })
+
+  it('漏掉 WS 时按 id 对账，接收端也能把旧消息改成撤回占位', async () => {
+    const original = message(1, 'SaaS')
+    useImStore.setState({ activeConversationId: 7, messages: { 7: [original] } })
+    vi.mocked(imApi.messages).mockResolvedValue({
+      success: true,
+      data: {
+        items: [{ ...original, recalled: true, content_text: null, recalled_at: 'now' }],
+        has_more: false, next_cursor: null, prev_cursor: null,
+      },
+    } as any)
+
+    await useImStore.getState().reconcileRecalls(7)
+    expect(imApi.messages).toHaveBeenCalledWith(7, { ids: '1' })
+    expect(useImStore.getState().messages[7][0]).toMatchObject({
+      recalled: true, content_text: null,
+    })
   })
 
   it('加载一页历史后批量预热图片签名 URL，而不是逐张请求', async () => {

@@ -778,6 +778,7 @@ export const desktopLoginApi = {
   imStorageState: async (): Promise<ApiResponse<{
     path: string; default_path: string; customized: boolean; profile: string
     mode: 'shared' | 'standalone'; remote_attachments: boolean
+    attachment_download_mode: 'manual' | 'auto'
     usage: { attachments: { files: number; bytes: number }
              open_temp: { files: number; bytes: number }
              total_files: number; total_bytes: number }
@@ -786,6 +787,10 @@ export const desktopLoginApi = {
   /** 修改本地保存路径并整体迁移已有附件 */
   imStorageSetPath: async (path: string): Promise<ApiResponse<unknown>> =>
     apiClient.post('/desktop/im-storage/path', { path }) as any,
+
+  /** 设置收到附件时自动缓存还是点击后再下载 */
+  imStorageSetDownloadMode: async (mode: 'manual' | 'auto'): Promise<ApiResponse<{ mode: string }>> =>
+    apiClient.post('/desktop/im-storage/download-mode', { mode }) as any,
 
   /** 清理本机临时文件与图片缓存 */
   imStorageClean: async (): Promise<ApiResponse<{
@@ -1277,8 +1282,8 @@ export const dataApi = {
   },
 
   // 工参更新(中兴)：一个任务同时执行全量更新与 4G/5G 现网工参合并
-  updateParameters: async (fullParamId: string, currentParamId: string, outputAllColumns: boolean = false): Promise<ApiResponse<{ taskId: string; message: string }>> => {
-    return apiClient.post('/data/zte-update-and-merge', { fullParamId, currentParamId, outputAllColumns })
+  updateParameters: async (fullParamId: string, currentParamId: string, outputAllColumns: boolean = false, sceneLayerId?: string): Promise<ApiResponse<{ taskId: string; message: string }>> => {
+    return apiClient.post('/data/zte-update-and-merge', { fullParamId, currentParamId, outputAllColumns, sceneLayerId })
   },
 
   /** 获取工参更新(中兴)任务进度 */
@@ -2771,7 +2776,8 @@ export interface TableMergeResultData {
 // 附件不走 /static（dev 无代理且无鉴权），统一用 apiClient 的 blob 响应；
 // 拦截器对 responseType:'blob' 返回完整 AxiosResponse，因此必须取 .data。
 
-export const IM_CHUNK_SIZE = 512 * 1024
+/** IM 附件分片：与后端 im_attachment_service.CHUNK_SIZE 保持一致；大文件减少往返次数 */
+export const IM_CHUNK_SIZE = 2 * 1024 * 1024
 
 function blobToBase64(blob: Blob): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -2840,10 +2846,29 @@ export const imApi = {
   openAttachment: (id: number): Promise<ImEnvelope<{ opened: boolean; path: string }>> =>
     apiClient.post(`/im/attachments/${id}/open`) as any,
 
+  /** 桌面端：后台缓存附件到本机下载目录，返回任务状态 */
+  startAttachmentCache: (attachmentId: number, filename: string, reveal = false): Promise<ImEnvelope<{
+    status: 'running' | 'done' | 'failed'; percent: number; phase: string
+    path: string; error: string
+  }>> => apiClient.post('/im/attachments/cache', {
+    attachment_id: attachmentId, filename, reveal,
+  }) as any,
+
+  attachmentCacheStatus: (attachmentId: number): Promise<ImEnvelope<{
+    status: 'running' | 'done' | 'failed'; percent: number; phase: string
+    path: string; error: string
+  }>> => apiClient.get(`/im/attachments/${attachmentId}/cache`) as any,
+
+  /** 桌面端：在系统文件管理器中定位已缓存的附件 */
+  revealAttachment: (id: number): Promise<ImEnvelope<{ revealed: boolean; path: string }>> =>
+    apiClient.post(`/im/attachments/${id}/reveal`) as any,
+
   messages: (id: number, params: {
     after_id?: number
     before_id?: number
     limit?: number
+    /** 逗号分隔的消息 id：撤回漏通知时按 id 对账真实状态 */
+    ids?: string
   }): Promise<ImEnvelope<ImMessagesPage>> =>
     apiClient.get(`/im/conversations/${id}/messages`, {
       params, timeout: IM_REQUEST_TIMEOUT_MS,
@@ -2868,6 +2893,14 @@ export const imApi = {
     apiClient.delete(`/im/conversations/${conversationId}/messages/${messageId}`, {
       timeout: IM_REQUEST_TIMEOUT_MS,
     }) as any,
+
+  recallMessage: (conversationId: number, messageId: number): Promise<ImEnvelope<{
+    message: ImMessage; recalled: boolean
+  }>> =>
+    apiClient.post(
+      `/im/conversations/${conversationId}/messages/${messageId}/recall`,
+      undefined, { timeout: IM_REQUEST_TIMEOUT_MS },
+    ) as any,
 
   forwardMessages: (messageIds: number[], conversationIds: number[]): Promise<ImEnvelope<any>> =>
     apiClient.post('/im/messages/forward', {

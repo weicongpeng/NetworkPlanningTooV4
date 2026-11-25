@@ -19,6 +19,7 @@ from app.core.config import settings
 
 SETTINGS_FILE_NAME = "im_storage_settings.json"
 OPEN_TEMP_DIR_NAME = "npt-im-open"
+VALID_DOWNLOAD_MODES = {"manual", "auto"}
 # 最近几分钟内打开过的文件不清理，降低误删正在被外部程序占用的副本
 OPEN_TEMP_KEEP_SECONDS = 300
 
@@ -32,6 +33,41 @@ def _settings_path() -> Path:
 
 def default_attachment_dir() -> Path:
     return Path(settings.NPT_IM_ATTACHMENT_DIR)
+
+
+def _read_config() -> Dict[str, Any]:
+    try:
+        data = json.loads(_settings_path().read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:  # noqa: BLE001 - 配置损坏时按默认处理
+        return {}
+
+
+def _write_config(data: Dict[str, Any]) -> None:
+    path = _settings_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_suffix(".json.tmp")
+    temp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(temp, path)
+
+
+def download_mode() -> str:
+    """manual=用户点击才下载（默认）；auto=收到新附件时自动缓存到本地。"""
+    raw = str(_read_config().get("attachment_download_mode") or "manual")
+    return raw if raw in VALID_DOWNLOAD_MODES else "manual"
+
+
+def set_download_mode(mode: str) -> str:
+    value = str(mode or "").strip().lower()
+    if value not in VALID_DOWNLOAD_MODES:
+        raise ValueError("IM_INVALID_DOWNLOAD_MODE")
+    global _cache
+    with _lock:
+        data = _read_config()
+        data["attachment_download_mode"] = value
+        _write_config(data)
+        _cache = None
+    return value
 
 
 def _read_configured_path() -> str:
@@ -65,16 +101,11 @@ def effective_attachment_dir() -> Path:
 def save_path(target: Path) -> None:
     """原子写配置；空字符串表示恢复默认目录。"""
     global _cache
-    path = _settings_path()
     raw = str(target) if target else ""
     with _lock:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temp = path.with_suffix(".json.tmp")
-        temp.write_text(
-            json.dumps({"attachment_dir": raw}, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        os.replace(temp, path)
+        data = _read_config()
+        data["attachment_dir"] = raw
+        _write_config(data)
         _cache = None
 
 
@@ -141,6 +172,7 @@ def current_state() -> Dict[str, Any]:
         # 前端据此解释「目录为空」不是配置失效。
         "mode": "shared" if settings.DESKTOP_PROFILE == "shared" else "standalone",
         "remote_attachments": settings.DESKTOP_PROFILE == "shared",
+        "attachment_download_mode": download_mode(),
         "usage": {
             "attachments": usage,
             "open_temp": temp_usage,

@@ -267,6 +267,29 @@ def wait_change(since: Optional[str], timeout: int = 25) -> Dict[str, Any]:
     return resp.get("data") or {}
 
 
+def wait_online_events(since: int, timeout: int = 25) -> Dict[str, Any]:
+    """长轮询「用户上线」事件：返回 ``{"seq": 最新游标, "events": [...]}``。
+
+    桌面端的本机后端用它把云端的上线广播取回来，再经本机 WebSocket 转给渲染进程
+    （桌面渲染进程只连本机后端，云端 WS 广播到不了）。
+    ``timeout=0`` 时只取当前游标，用于启动时对齐、避免重播历史事件。
+    """
+    from app.utils.machine_code import get_machine_code
+
+    resp = _request(
+        "POST",
+        "/desktop-cloud/presence/online",
+        {
+            "license_file": _license_file_text(),
+            "machine_code": get_machine_code(),
+            "since": max(0, int(since or 0)),
+            "wait_seconds": max(0, int(timeout or 0)),
+        },
+        timeout=max(0, int(timeout or 0)) + 15,
+    )
+    return resp.get("data") or {}
+
+
 def download_package(data_id: str, destdir: Optional[Path] = None) -> Path:
     """下载数据集整包，返回 zip 路径（位于专用临时目录，调用方负责清理）。"""
     import shutil

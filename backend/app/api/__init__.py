@@ -309,6 +309,16 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning(f"⚠️ 启动桌面数据变更监听失败: {e}")
 
+    # 桌面模式：把云端「有人上线」事件中继到本机 WS（渲染进程只连本机后端，收不到云端广播，
+    # 否则桌面端别人登录没有敲门声/气泡）
+    if settings.NPT_DESKTOP:
+        try:
+            import asyncio
+            from app.services.desktop_presence_relay import relay_loop as presence_relay_loop
+            asyncio.create_task(presence_relay_loop())
+        except Exception as e:
+            logger.warning(f"⚠️ 启动桌面上线事件中继失败: {e}")
+
     # 历史安装包清理（每份约 320MB）已并入 npt-startup-maintenance 后台线程，不阻塞就绪
 
     # 桌面模式：登录态守卫（同一账号在别处登录 → 本机自动登出）

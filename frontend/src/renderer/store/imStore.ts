@@ -4,13 +4,19 @@ import { persist } from 'zustand/middleware'
 
 import { imApi } from '../services/api'
 import { clearImAttachmentCache } from '../services/imAttachmentCache'
-import { IM_MESSAGE_EVENT, IM_PRESENCE_EVENT, IM_RESYNC_EVENT } from '../services/websocketService'
+import { clearAllSnapshots, readSnapshot, writeSnapshot } from '../services/imLocalCache'
+import {
+  IM_MESSAGE_EVENT, IM_PRESENCE_EVENT, IM_RECALL_EVENT, IM_RESYNC_EVENT,
+} from '../services/websocketService'
 import { playImMessageSound } from '../utils/messageSound'
 import { imUserId } from '../components/Im/types'
 import type {
-  ImContactsData, ImConversation, ImLightboxSource, ImMember, ImMessage,
+  ImContactsData, ImConversation, ImGroup, ImLightboxSource, ImMember, ImMessage,
   ImSendMention, ImTab, ImUser,
 } from '../components/Im/types'
+
+/** 撤回后点「重新编辑」：由 store 广播，输入区把原文回填到当前会话草稿 */
+export const IM_COMPOSER_FILL_EVENT = 'npt:im-composer-fill'
 
 type Cursors = Record<number, { next: number | null; prev: number | null; hasMore: boolean }>
 type Drafts = Record<number, Record<number, string>>
@@ -34,6 +40,8 @@ interface ImState {
   open: boolean
   activeTab: ImTab
   activeConversationId: number | null
+  /** 通讯录点人后、服务端会话 id 尚未返回时的占位；聊天区据此立即渲染对方信息与骨架 */
+  pendingDirect: { userId: number; user: ImUser | null } | null
   conversations: ImConversation[]
   messages: Record<number, ImMessage[]>
   cursors: Cursors
@@ -47,6 +55,10 @@ interface ImState {
   errorScope: string | null
   sending: boolean
   uploadProgress: { name: string; percent: number } | null
+  /** 桌面端后台附件缓存进度 */
+  downloadProgress: { name: string; percent: number; phase: string } | null
+  /** 桌面端附件下载方式，默认手动点击 */
+  attachmentDownloadMode: 'manual' | 'auto'
   lightbox: ImLightboxSource | null
   /** 当前正在引用的历史消息；发送成功后自动清空 */
   replyTo: ImMessage | null
@@ -70,6 +82,8 @@ interface ImState {
   markConversationRead: (id: number) => void
   setDraft: (text: string) => void
   draftFor: (conversationId: number | null) => string
+  /** 把撤回消息的原文放回指定会话输入框（同时更新草稿与本地 text） */
+  fillComposer: (conversationId: number, text: string) => void
   setLightbox: (value: ImState['lightbox']) => void
   setReplyTo: (message: ImMessage | null) => void
   setGroupDialog: (open: boolean) => void
@@ -77,15 +91,21 @@ interface ImState {
   refreshConversations: () => Promise<void>
   refreshContacts: () => Promise<void>
   loadMessages: (id: number, direction?: 'initial' | 'older' | 'incremental') => Promise<void>
+  /** 按已加载的 message_id 对账撤回状态，兜底漏掉的 im_recall 事件 */
+  reconcileRecalls: (conversationId?: number) => Promise<void>
   sendText: (text: string, mention?: ImSendMention) => Promise<boolean>
   /** 返回发送失败的 File，供输入区把它们放回待发送列表 */
   sendFiles: (files: File[]) => Promise<File[]>
+  /** 桌面端后台缓存附件；reveal=true 时完成后在文件管理器定位 */
+  downloadAttachment: (message: ImMessage, reveal?: boolean) => Promise<boolean>
+  setAttachmentDownloadMode: (mode: 'manual' | 'auto') => void
   /** 编辑后的图片直接发送到多个目标会话，不切换当前会话 */
   sendImageToConversations: (
     file: File, conversationIds: number[],
   ) => Promise<{ sent: number; failed: number }>
-  /** 右键菜单：删除单条历史消息 / 批量转发 */
+  /** 右键菜单：删除单条历史消息 / 撤回自己的消息 / 批量转发 */
   deleteMessage: (conversationId: number, messageId: number) => Promise<boolean>
+  recallMessage: (conversationId: number, messageId: number) => Promise<boolean>
   forwardMessages: (messageIds: number[], conversationIds: number[]) => Promise<boolean>
   /** 取群成员（带缓存与 in-flight 去重）；成员变更后用 invalidateMembers 失效 */
   ensureMembers: (conversationId: number) => Promise<ImMember[]>
@@ -107,11 +127,15 @@ interface ImState {
   refreshGroupState: (conversationId: number) => Promise<void>
   forgetConversation: (conversationId: number) => void
   handleImMessage: (detail: any) => void
+  handleImRecall: (detail: any) => void
   handlePresence: (detail: any) => void
   resync: () => void
   /** pollWhenClosed：桌面共享模式没有 WS 广播，窗口收起时也要继续感知新消息（未读 + 提示音） */
   startPolling: (intervalMs?: number, pollWhenClosed?: boolean) => void
   stopPolling: () => void
+  /** 通讯录/在线状态独立低频校准：云 WS active 停掉消息轮询后仍继续自愈 */
+  startContactsPolling: (intervalMs?: number) => void
+  stopContactsPolling: () => void
   resetForUserSwitch: () => void
 }
 
@@ -129,6 +153,28 @@ function currentUserId(): number | null {
 const MESSAGE_WINDOW_SIZE = 300
 /** incremental 一次最多翻的页数，防止断线积压 / 病态数据把一次刷新拖成死循环 */
 const MAX_INCREMENTAL_PAGES = 10
+
+/** 本地快照按用户+会话隔离，避免切账号后读到上一个账号的聊天内容 */
+function snapshotKey(conversationId: number): string {
+  return `conv:${currentUserId() ?? 'anon'}:${conversationId}`
+}
+
+const snapshotWriteAt = new Map<string, number>()
+const hydrateVersion = new Map<number, number>()
+/** 轮询成功不必每 8s 重写整屏；撤回/删除等状态变更强制立即落盘 */
+function persistSnapshot(conversationId: number, force = false): void {
+  const key = snapshotKey(conversationId)
+  const now = Date.now()
+  if (!force && now - (snapshotWriteAt.get(key) || 0) < 10_000) return
+  snapshotWriteAt.set(key, now)
+  const state = useImStore.getState()
+  void writeSnapshot({
+    key,
+    messages: state.messages[conversationId] || [],
+    cursors: state.cursors[conversationId],
+    savedAt: now,
+  })
+}
 /** 「红点有、正文没来」的补洞节流；5s 会让 WS 丢通知时约 6s 才看到正文 */
 const HOLE_FILL_THROTTLE_MS = 800
 
@@ -205,6 +251,7 @@ function errorMessage(error: unknown, fallbackKey: string): string {
   // 附件失败以前一律折叠成「附件发送失败，已放回待发送列表」，用户无法判断
   // 是文件太大、消息服务繁忙还是断网；这里把可操作的真实原因显示出来。
   if (raw.includes('IM_ATTACHMENT_TOO_LARGE')) return 'im.error.tooLarge'
+  if (raw.includes('IM_ATTACHMENT_TYPE')) return 'im.error.attachmentType'
   const busyOp = raw.match(/IM_RELAY_BUSY:([a-z_]+)/)?.[1] || ''
   const busyKeys: Record<string, string> = {
     list_conversations: 'im.error.busyConversations',
@@ -219,6 +266,7 @@ function errorMessage(error: unknown, fallbackKey: string): string {
   }
   if (busyOp && busyKeys[busyOp]) return busyKeys[busyOp]
   if (raw.includes('IM_RELAY_BUSY') || raw.includes('IM_RELAY_FAILED')) return 'im.error.relayBusy'
+  if (raw.includes('IM_RECALL_EXPIRED')) return 'im.message.recallExpired'
   if (err?.code === 0) return 'im.error.network'
   return fallbackKey
 }
@@ -242,9 +290,68 @@ function clearActiveUnread(conversations: ImConversation[], viewedId: number | n
   return conversations.map(c => c.id === viewedId && c.unread ? { ...c, unread: 0 } : c)
 }
 
+/** 本地会话列表里找与某人的单聊（自己↔自己的文件传输助手按 is_self 判定） */
+function findDirectConversation(
+  conversations: ImConversation[], userId: number, selfId: number | null,
+): ImConversation | null {
+  return conversations.find(c => c.kind === 'direct'
+    && (c.other_user?.id === userId || (Boolean(c.is_self) && userId === selfId))) || null
+}
+
+/** 用通讯录资料拼一条单聊会话：新会话还没进列表时让聊天区立刻能派生标题 / 输入区 */
+function buildDirectConversation(
+  id: number, peer: ImUser | null, isSelf: boolean,
+): ImConversation {
+  return {
+    id,
+    kind: 'direct',
+    name: null,
+    group_key: null,
+    other_user: peer
+      ? {
+          id: peer.id,
+          username: peer.username,
+          nickname: peer.nickname,
+          is_online: peer.is_online,
+          avatar: peer.avatar ?? null,
+        }
+      : null,
+    is_self: isSelf,
+    member_count: isSelf ? 1 : 2,
+    last_message: null,
+    last_message_at: null,
+    unread: 0,
+    muted: false,
+  }
+}
+
+/** 用通讯录里的群资料拼一条群会话（点群不必再等一次全量会话列表刷新） */
+function buildGroupConversation(group: ImGroup): ImConversation {
+  return {
+    id: group.id,
+    kind: group.kind,
+    name: group.name,
+    group_key: null,
+    avatar: group.avatar ?? null,
+    owner_id: group.owner_id ?? null,
+    other_user: null,
+    member_count: group.member_count,
+    last_message: null,
+    last_message_at: null,
+    unread: 0,
+    muted: false,
+  }
+}
+
 let pollTimer: number | null = null
 let refreshTimer: number | null = null
 let refreshQueued = false
+/**
+ * 通讯录专用低频校准定时器。与 1.5s 消息轮询解耦：桌面共享模式云 WS 鉴权成功后
+ * 会 stopPolling()，若通讯录仍挂在那个定时器上，启动/断联期一次失败就永久空态。
+ */
+let contactsTimer: number | null = null
+let contactsInFlight = false
 /**
  * 本轮窗口会话中用户**真正点开过**的会话。
  * 不能再拿 activeConversationId + open 判断已读：窗口重新展开后仍停留在上次会话，
@@ -263,6 +370,13 @@ let lastHoleFillAt = 0
 let avatarsFetched = false
 /** 收到非激活会话的新消息：标记脏，切换进该会话时优先补拉而不是重新 initial */
 const dirtyConversations = new Set<number>()
+/**
+ * 正文请求去重：点开会话触发的 initial 与 1.5s 轮询增量 / 列表补洞会针对同一会话
+ * 并发发请求，正文重复铺入 + 二次滚底，看起来就是「卡一下、跳一下」。
+ */
+const messagesInFlight = new Set<number>()
+/** 通讯录连续点人时只让最后一次点击生效，慢响应的旧请求不能把会话抢回去 */
+let openDirectSeq = 0
 /** 桌面端窗口重新可见时的立即刷新监听（由 startPolling 注册、stopPolling 移除） */
 let pollFocusHandler: (() => void) | null = null
 /** 同一会话的成员请求合并为一个 Promise，避免每次键入 @ 都发请求 */
@@ -296,6 +410,22 @@ function markMessageSoundNotified(messageId: number): boolean {
   if (soundedMessageIds.size > 500) {
     const oldest = soundedMessageIds.values().next().value
     if (oldest !== undefined) soundedMessageIds.delete(oldest)
+  }
+  return true
+}
+
+/**
+ * 未读红点按 messageId 去重：WS 通知与会话列表轮询 / 正文补拉会重复带同一条消息。
+ * 收到 WS 通知时先乐观 +1（与提示音同一帧渲染），随后的 refreshConversations
+ * 用服务端权威 unread 覆盖，重复通知不再累加。
+ */
+const badgedMessageIds = new Set<number>()
+function markMessageBadgeNotified(messageId: number): boolean {
+  if (!(messageId > 0) || badgedMessageIds.has(messageId)) return false
+  badgedMessageIds.add(messageId)
+  if (badgedMessageIds.size > 500) {
+    const oldest = badgedMessageIds.values().next().value
+    if (oldest !== undefined) badgedMessageIds.delete(oldest)
   }
   return true
 }
@@ -337,6 +467,7 @@ const initialState = {
   open: false,
   activeTab: 'messages' as ImTab,
   activeConversationId: null,
+  pendingDirect: null,
   conversations: [],
   messages: {},
   cursors: {},
@@ -349,6 +480,8 @@ const initialState = {
   errorScope: null,
   sending: false,
   uploadProgress: null,
+  downloadProgress: null,
+  attachmentDownloadMode: 'manual' as const,
   lightbox: null,
   replyTo: null,
   groupDialog: false,
@@ -417,6 +550,20 @@ export const useImStore = create<ImState>()(
         return get().drafts[userId]?.[conversationId] || ''
       },
 
+      fillComposer: (conversationId, text) => {
+        const userId = currentUserId()
+        if (userId === null) return
+        set(s => ({
+          drafts: {
+            ...s.drafts,
+            [userId]: { ...(s.drafts[userId] || {}), [conversationId]: text },
+          },
+        }))
+        window.dispatchEvent(new CustomEvent(IM_COMPOSER_FILL_EVENT, {
+          detail: { conversationId, text },
+        }))
+      },
+
       markConversationRead: id => {
         // 用户点开左侧会话或直接点聊天区都算已读：红点立刻消失，不等轮询/翻页。
         viewedConversationId = id
@@ -436,13 +583,16 @@ export const useImStore = create<ImState>()(
       },
 
       setActiveConversation: id => {
+        // 用户主动切了会话（左侧列表 / 返回列表 / 窗口收起）：作废通讯录点人还在途的
+        // 请求，避免慢响应回来把用户已经切走的会话又抢回去
+        openDirectSeq += 1
         if (id === null) {
           viewedConversationId = null
-          set({ activeConversationId: null })
+          set({ activeConversationId: null, pendingDirect: null })
           return
         }
         get().markConversationRead(id)
-        set({ activeConversationId: id })
+        set({ activeConversationId: id, pendingDirect: null })
         // 该会话在后台收过新消息：用增量补拉接上游标，避免 initial 重置窗口
         // 把还没读的历史消息丢掉；否则按原有行为拉最新一页。
         if (dirtyConversations.has(id) && get().cursors[id]) {
@@ -499,7 +649,14 @@ export const useImStore = create<ImState>()(
         })
         const state = get()
         playConversationMessageSound(items, state.activeConversationId, state.open)
-        const conversations = clearActiveUnread(items, viewedConversationId, state.open)
+        let conversations = clearActiveUnread(items, viewedConversationId, state.open)
+        // 刚新建的会话 last_message_at 为空，会排在服务端 100 条上限的最后甚至被截断；
+        // 当前激活的会话若不在响应里就保留本地那条，避免聊天区突然退回「选择一个会话」空态
+        if (state.activeConversationId !== null
+            && !conversations.some(conv => conv.id === state.activeConversationId)) {
+          const activeConv = state.conversations.find(conv => conv.id === state.activeConversationId)
+          if (activeConv) conversations = [...conversations, activeConv]
+        }
         set({
           conversations,
           online,
@@ -510,7 +667,10 @@ export const useImStore = create<ImState>()(
         // 说明本地游标跳过了一段或窗口收起期间漏了补拉，重拉最新一页补洞。
         // 用服务端返回的原始 items 判断（clearActiveUnread 会把当前会话置 0）。
         const activeId = state.activeConversationId
-        if (activeId !== null && Date.now() - lastHoleFillAt > HOLE_FILL_THROTTLE_MS) {
+        // 正文正在加载时不要补洞：刚点开的会话必然「服务端最新 id > 本地 0」，
+        // 不跳过就会把同一页 initial 再拉一遍（看起来像是点了两次、闪两下）
+        if (activeId !== null && !messagesInFlight.has(activeId)
+            && Date.now() - lastHoleFillAt > HOLE_FILL_THROTTLE_MS) {
           const serverLast = items.find((c: ImConversation) => c.id === activeId)?.last_message?.id || 0
           const localLast = get().messages[activeId]?.slice(-1)[0]?.id || 0
           if (serverLast > localLast) {
@@ -522,9 +682,13 @@ export const useImStore = create<ImState>()(
 
       refreshContacts: async () => {
         const response = await imApi.contacts()
-        const contacts = response?.data || null
+        // 与 refreshConversations 同口径：relay 繁忙/限流时拦截器返回 {success:false}，
+        // 一次失败不能把通讯录清成「暂无联系人」，保留上次成功结果等下个 tick 重试。
+        if (response && response.success === false) return
+        const contacts = response?.data
+        if (!contacts || !Array.isArray(contacts.users)) return
         const online = { ...get().online }
-        contacts?.users?.forEach((user: ImUser) => { online[user.id] = user.is_online })
+        contacts.users.forEach((user: ImUser) => { online[user.id] = user.is_online })
         set({ contacts, online })
       },
 
@@ -582,7 +746,11 @@ export const useImStore = create<ImState>()(
         const state = get()
         const cursor = state.cursors[id]
         if (direction === 'older' && !cursor?.prev) return
-        const existing = direction === 'initial' ? [] : (get().messages[id] || [])
+        // 同一会话同时只允许一次正文请求：切会话 / 轮询可能在同一瞬间各发一次，
+        // 后返回的那次会用旧快照覆盖新快照，正文重复插入并重复滚底
+        if (messagesInFlight.has(id)) return
+        messagesInFlight.add(id)
+        let existing = direction === 'initial' ? [] : (get().messages[id] || [])
         // 没有游标说明尚未加载过该会话，整页都是历史，先建基线不提醒
         const hasBaseline = Boolean(state.cursors[id])
         const myId = currentUserId()
@@ -591,6 +759,20 @@ export const useImStore = create<ImState>()(
         let prevCursor = cursor?.prev ?? null
         let hasMore = false
         const incoming: ImMessage[] = []
+        // 本地优先：首次打开并发读快照先渲染，服务端请求不等待 IndexedDB；
+        // 若服务端先返回，版本号会让晚到的快照失效，避免旧数据覆盖新数据。
+        if (direction === 'initial') {
+          const version = (hydrateVersion.get(id) || 0) + 1
+          hydrateVersion.set(id, version)
+          void readSnapshot(snapshotKey(id)).then(snapshot => {
+            if (!snapshot?.messages?.length || hydrateVersion.get(id) !== version) return
+            if ((get().messages[id] || []).length) return
+            set(s => ({
+              messages: { ...s.messages, [id]: snapshot.messages },
+              cursors: { ...s.cursors, [id]: snapshot.cursors ?? s.cursors[id] },
+            }))
+          })
+        }
         try {
           // 断线期间可能积压超过一页：incremental 循环翻到 has_more=false，
           // 上限 10 页防止病态数据把一次刷新拖成死循环。
@@ -631,6 +813,15 @@ export const useImStore = create<ImState>()(
             },
           }))
           setImError(`messages:${id}`, null) // 同一会话重试成功后立即撤掉繁忙提示
+          persistSnapshot(id)
+          // 自动下载模式：对方新到附件立即后台缓存；手动模式只有点击才下载
+          if (get().attachmentDownloadMode === 'auto') {
+            incoming.forEach(item => {
+              if (item.attachment?.id && !item.recalled && item.sender_id !== myId) {
+                void get().downloadAttachment(item)
+              }
+            })
+          }
           // 一页历史消息里的图片批量换签名 URL：一次 relay 控制请求覆盖整页，
           // 避免每张缩略图各发一次（共享模式公网往返是主要耗时）。
           void imApi.prewarmAttachmentUrls?.(
@@ -673,6 +864,33 @@ export const useImStore = create<ImState>()(
         } catch (error) {
           console.warn('[IM] loadMessages failed', error)
           setImError(`messages:${id}`, errorMessage(error, 'im.error.messages'))
+        } finally {
+          messagesInFlight.delete(id)
+        }
+      },
+
+      reconcileRecalls: async conversationId => {
+        const id = conversationId ?? get().activeConversationId
+        if (id === null) return
+        // 只查本地还没标记撤回的消息：撤回后已被 WS/对账改写的无需再问服务端。
+        // 取最近 80 条即可覆盖 5 分钟撤回窗口，避免长会话每轮拉回整屏历史。
+        const ids = (get().messages[id] || [])
+          .filter(m => m.id > 0 && !m.recalled)
+          .slice(-80)
+          .map(m => m.id)
+        if (!ids.length) return
+        try {
+          const response = await imApi.messages(id, { ids: ids.join(',') })
+          const incoming = response?.data?.items || []
+          if (!incoming.length) return
+          set(s => ({
+            messages: {
+              ...s.messages,
+              [id]: mergeMessages(s.messages[id] || [], incoming),
+            },
+          }))
+        } catch {
+          /* 静默：WS / 轮询下一轮仍会纠正 */
         }
       },
 
@@ -780,6 +998,45 @@ export const useImStore = create<ImState>()(
         return failed
       },
 
+      downloadAttachment: async (message, reveal = false) => {
+        const attachment = message.attachment
+        if (!attachment?.id) return false
+        const name = attachment.original_name || `attachment-${attachment.id}`
+        set({ downloadProgress: { name, percent: 0, phase: '准备下载' } })
+        try {
+          await imApi.startAttachmentCache(attachment.id, name, reveal)
+          await new Promise<void>((resolve, reject) => {
+            const timer = window.setInterval(() => {
+              void imApi.attachmentCacheStatus(attachment.id).then(res => {
+                const state = res.data
+                set({ downloadProgress: { name, percent: state.percent, phase: state.phase } })
+                if (state.status === 'done') {
+                  window.clearInterval(timer)
+                  resolve()
+                } else if (state.status === 'failed') {
+                  window.clearInterval(timer)
+                  reject(new Error(state.error || 'attachment cache failed'))
+                }
+              }).catch(error => {
+                window.clearInterval(timer)
+                reject(error)
+              })
+            }, 250)
+          })
+          if (reveal) await imApi.revealAttachment(attachment.id)
+          setImError(`file:${message.conversation_id}`, null)
+          return true
+        } catch (error) {
+          console.warn('[IM] cache attachment failed', name, error)
+          setImError(`file:${message.conversation_id}`, errorMessage(error, 'im.error.downloadFailed'))
+          return false
+        } finally {
+          set({ downloadProgress: null })
+        }
+      },
+
+      setAttachmentDownloadMode: mode => set({ attachmentDownloadMode: mode }),
+
       sendImageToConversations: async (file, conversationIds) => {
         let sent = 0
         let failed = 0
@@ -815,11 +1072,36 @@ export const useImStore = create<ImState>()(
             }
           })
           setImError(`message:${conversationId}`, null)
+          persistSnapshot(conversationId, true)
           void get().refreshConversations().catch(() => {})
           return true
         } catch (error) {
           console.warn('[IM] delete message failed', error)
           setImError(`message:${conversationId}`, errorMessage(error, 'im.message.deleteFailed'))
+          return false
+        }
+      },
+
+      recallMessage: async (conversationId, messageId) => {
+        try {
+          const response = await imApi.recallMessage(conversationId, messageId)
+          const message = response?.data?.message
+          if (!message) throw new Error('IM_RECALL_FAILED')
+          // 原地替换而不是移除：双方都保留一个「消息已撤回」占位
+          set(s => ({
+            messages: {
+              ...s.messages,
+              [conversationId]: mergeMessages(s.messages[conversationId] || [], [message]),
+            },
+            replyTo: s.replyTo?.id === messageId ? null : s.replyTo,
+          }))
+          setImError(`message:${conversationId}`, null)
+          persistSnapshot(conversationId, true)
+          void get().refreshConversations().catch(() => {})
+          return true
+        } catch (error) {
+          console.warn('[IM] recall message failed', error)
+          setImError(`message:${conversationId}`, errorMessage(error, 'im.message.recallFailed'))
           return false
         }
       },
@@ -838,6 +1120,24 @@ export const useImStore = create<ImState>()(
       },
 
       openDirect: async userId => {
+        const seq = (openDirectSeq += 1)
+        const selfId = currentUserId()
+        const state = get()
+        // 通讯录点人必须立刻有反应：先把 Tab 切到消息，再查本地已有单聊。
+        // 旧实现每次点击都先 POST /im/conversations（共享桌面模式还经公网 relay），
+        // 再串最多 3 次全量列表刷新，点击到切视图要等 1~3 个 RTT。
+        set({ activeTab: 'messages' })
+        const existing = findDirectConversation(state.conversations, userId, selfId)
+        if (existing) {
+          set({ pendingDirect: null })
+          setImError('global', null)
+          get().setActiveConversation(existing.id)
+          return existing.id
+        }
+        // 首次对话：先用通讯录资料占位，聊天区立刻渲染对方信息 + 骨架，而不是干等
+        const peer = (state.contacts?.users || []).find(user => user.id === userId) || null
+        set({ pendingDirect: { userId, user: peer } })
+
         let conversationId: number | null = null
         let lastError: unknown = null
         try {
@@ -849,28 +1149,34 @@ export const useImStore = create<ImState>()(
           lastError = error
           console.warn('[IM] create_direct failed, retry from conversation list', error)
         }
+        // 慢响应期间用户可能已点了别人：只让最后一次点击生效
+        if (seq !== openDirectSeq) return null
         if (conversationId === null) {
           await get().refreshConversations().catch(() => {})
-          const existing = get().conversations.find(
-            c => c.kind === 'direct'
-              && (c.other_user?.id === userId
-                || (c.is_self && userId === currentUserId())))
-          if (existing) conversationId = existing.id
+          if (seq !== openDirectSeq) return null
+          conversationId = findDirectConversation(get().conversations, userId, selfId)?.id ?? null
         }
         if (conversationId === null) {
+          set({ pendingDirect: null })
           setImError('global', errorMessage(lastError, 'im.error.conversation'))
           return null
         }
-        set({ activeTab: 'messages' })
+        const newId = conversationId
+        const latest = get()
+        // 新会话还没进列表时先按本地资料补一条，ImWindow 才能派生标题 / 输入区，
+        // 不必等列表刷新回来；last_message、未读等字段交给后台刷新补全
+        set({
+          pendingDirect: null,
+          conversations: latest.conversations.some(c => c.id === newId)
+            ? latest.conversations
+            : [buildDirectConversation(newId, peer, selfId !== null && userId === selfId),
+                ...latest.conversations],
+        })
         setImError('global', null)
-        // 新建会话可能还没进列表，先刷新再激活，避免 ImWindow 派生 conversation=null 停在空态
-        if (!get().conversations.some(c => c.id === conversationId)) {
-          await get().refreshConversations().catch(() => {})
-        }
-        get().setActiveConversation(conversationId)
-        // 刷新只是让列表出现新会话；失败不能反过来把已打开、可发消息的会话显示成失败
+        get().setActiveConversation(newId)
+        // 刷新只用于补齐列表字段；失败不能反过来把已打开、可发消息的会话显示成失败
         void get().refreshConversations().catch(() => {})
-        return conversationId
+        return newId
       },
 
       openGroup: async id => {
@@ -883,12 +1189,20 @@ export const useImStore = create<ImState>()(
           setImError(`group:${id}`, 'im.error.notGroupMember')
           return false
         }
-        // 刚加入/刚建好的群可能还没进会话列表，先补齐再激活
-        if (!state.conversations.some(c => c.id === id)) {
-          await get().refreshConversations().catch(() => {})
-        }
         set({ activeTab: 'messages' })
         setImError('global', null)
+        // 刚加入/刚建好的群可能还没进会话列表：通讯录里有群资料就直接本地补一条，
+        // 只有在完全没资料时才回源刷新（旧实现每次点群都先等一次全量刷新）
+        if (!state.conversations.some(c => c.id === id)) {
+          if (group) {
+            const synthetic = buildGroupConversation(group)
+            set(s => (s.conversations.some(c => c.id === id)
+              ? {}
+              : { conversations: [synthetic, ...s.conversations] }))
+          } else {
+            await get().refreshConversations().catch(() => {})
+          }
+        }
         get().setActiveConversation(id)
         void get().refreshConversations().catch(() => {})
         return true
@@ -1022,6 +1336,25 @@ export const useImStore = create<ImState>()(
         // 否则用户切到那个会话时可能只看到红点、正文没补拉。
         const conversationId = Number(detail?.conversation_id) || 0
         if (conversationId > 0) dirtyConversations.add(conversationId)
+
+        // 提示音在 attachImEvents 里随 WS 通知立即响；红点原先要等 180ms 防抖 +
+        // 一次 relay 回源（桌面共享模式可能 1~2s，回源失败就一直不亮），表现为
+        // 「先响后亮 / 只响不亮」。这里同步把未读 +1，与提示音同一帧渲染；
+        // 随后的 refreshConversations 用服务端权威 unread 覆盖，不会重复计数。
+        const messageId = Number(detail?.message_id) || 0
+        const myId = currentUserId()
+        const fromMe = myId !== null && detail?.sender_id != null
+          && Number(detail.sender_id) === Number(myId)
+        const isSystem = detail?.kind === 'system'
+        if (conversationId > 0 && !fromMe && !isSystem && conversationId !== viewedConversationId
+            && markMessageBadgeNotified(messageId)) {
+          set(s => ({
+            conversations: s.conversations.map(c => c.id === conversationId
+              ? { ...c, unread: (c.unread || 0) + 1 } : c),
+            unreadTotal: s.unreadTotal + 1,
+          }))
+        }
+
         if (refreshQueued) return
         refreshQueued = true
         refreshTimer = window.setTimeout(() => {
@@ -1032,6 +1365,41 @@ export const useImStore = create<ImState>()(
             void state.loadMessages(state.activeConversationId, 'incremental')
           }
         }, 180)
+      },
+
+      handleImRecall: detail => {
+        const conversationId = Number(detail?.conversation_id) || 0
+        const messageId = Number(detail?.message_id) || 0
+        if (!conversationId || !messageId) return
+        const myId = currentUserId()
+        const fromMe = myId !== null && detail?.sender_id != null
+          && Number(detail.sender_id) === Number(myId)
+        // WS 只带 id：先本地把占位打上去，非发送者立刻脱敏；正文随后由 REST 校准
+        set(s => {
+          const list = s.messages[conversationId]
+          if (!list) return {}
+          return {
+            messages: {
+              ...s.messages,
+              [conversationId]: list.map(m => m.id === messageId ? {
+                ...m,
+                recalled: true,
+                recalled_at: String(detail?.recalled_at || m.recalled_at || ''),
+                content_text: fromMe ? m.content_text : null,
+                attachment: fromMe ? m.attachment : null,
+              } : m),
+            },
+            replyTo: s.replyTo?.id === messageId ? null : s.replyTo,
+          }
+        })
+        persistSnapshot(conversationId, true)
+        void get().refreshConversations().catch(() => {})
+        if (get().activeConversationId === conversationId) {
+          void get().loadMessages(conversationId, 'incremental').catch(() => {})
+        }
+        // 以服务端序列化结果为准：桌面共享模式下本机 user.id 与云端 sender_id
+        // 可能只是数值巧合，不能只靠本地 id 判断谁撤回的。
+        void get().reconcileRecalls(conversationId).catch(() => {})
       },
 
       handlePresence: detail => {
@@ -1059,28 +1427,30 @@ export const useImStore = create<ImState>()(
       resync: () => {
         const state = get()
         void state.refreshConversations().catch(() => {})
+        // 重连后必须一起补通讯录：断线期间它可能一次都没拉到（contacts=null），
+        // 而桌面云 WS active 又会停掉消息轮询，漏掉这里就只能靠重启恢复。
+        void state.refreshContacts().catch(() => {})
         // WS / 云 WS 重连后要补齐断线期间所有已知会话的消息，不只当前激活会话。
         // 只补拉已有游标的会话，避免刚启动时把每个会话都全量拉一遍。
         const ids = new Set<number>(Object.keys(state.cursors).map(Number))
         if (state.activeConversationId !== null) ids.add(state.activeConversationId)
         ids.forEach(id => { void state.loadMessages(id, 'incremental').catch(() => {}) })
+        // 增量只拉 id > 游标的新消息，断线期间被撤回的旧消息不会被带回来
+        void state.reconcileRecalls().catch(() => {})
       },
 
       startPolling: (intervalMs = 8000, pollWhenClosed = false) => {
         if (pollTimer !== null) return
-        let ticks = 0
-        // 通讯录/在线状态固定约 20s 校准一次，不随会话列表轮询变快而放大请求量
-        const contactsEveryTicks = Math.max(4, Math.ceil(20000 / intervalMs))
         /** 上一轮还没回来就跳过：在途请求最多一轮，连接始终留给窗口控制等交互请求 */
         const runPoll = () => {
           if (pollInFlight) return
           const state = useImStore.getState()
           const jobs: Promise<void>[] = [state.refreshConversations()]
-          ticks += 1
-          if (ticks % contactsEveryTicks === 0) jobs.push(state.refreshContacts())
+          // 通讯录已拆成独立的 startContactsPolling()，不能随这里一起被云 WS 停掉
           // 窗口收起时只刷会话列表（未读 + 提示音），不补拉当前会话正文
           if (state.open && state.activeConversationId !== null) {
             jobs.push(state.loadMessages(state.activeConversationId, 'incremental'))
+            jobs.push(state.reconcileRecalls(state.activeConversationId))
           }
           pollInFlight = true
           Promise.allSettled(jobs).finally(() => { pollInFlight = false })
@@ -1124,18 +1494,43 @@ export const useImStore = create<ImState>()(
         viewedConversationId = null
       },
 
+      startContactsPolling: (intervalMs = 20000) => {
+        if (contactsTimer !== null) return
+        // 固定低频、单飞：断联期间失败只跳过本轮，恢复后下个 tick 自然补齐；
+        // 不走 pollInFlight，避免与 1.5s 消息轮询互相挤占 relay 槽位。
+        contactsTimer = window.setInterval(() => {
+          if (contactsInFlight) return
+          contactsInFlight = true
+          void useImStore.getState().refreshContacts()
+            .catch(() => {})
+            .finally(() => { contactsInFlight = false })
+        }, intervalMs)
+      },
+
+      stopContactsPolling: () => {
+        if (contactsTimer !== null) { window.clearInterval(contactsTimer); contactsTimer = null }
+        contactsInFlight = false
+      },
+
       resetForUserSwitch: () => {
         get().stopPolling()
+        get().stopContactsPolling()
         viewedConversationId = null
         // 灯箱的 objectURL 由 ImImageLightbox 自己持有并在卸载时 revoke，此处只清状态
         // 群成员名单与 @ 去重记录都按账号隔离，切账号必须一起清掉
         membersInFlight.clear()
         membersFetchedAt.clear()
         clearImAttachmentCache()
+        void clearAllSnapshots()
+        snapshotWriteAt.clear()
+        hydrateVersion.clear()
         notifiedMentionIds.clear()
         soundedMessageIds.clear()
+        badgedMessageIds.clear()
         conversationLastIds = null
         dirtyConversations.clear()
+        messagesInFlight.clear()
+        openDirectSeq += 1
         lastHoleFillAt = 0
         avatarsFetched = false
         set({ ...initialState })
@@ -1150,6 +1545,8 @@ export const useImStore = create<ImState>()(
 
 /** ImHost 挂载时注册全局 WS 事件；返回清理函数。 */
 export function attachImEvents(): () => void {
+  // 通讯录独立低频校准：即使桌面云 WS active 停掉了消息轮询，断联后仍能自愈
+  useImStore.getState().startContactsPolling()
   const onMessage = (event: Event) => {
     const detail = (event as CustomEvent).detail || {}
     // 服务端 notify_im_message 只推给「除发送者外的成员」，这里再兜底过滤一次，
@@ -1179,15 +1576,25 @@ export function attachImEvents(): () => void {
     }
     useImStore.getState().handleImMessage(detail)
   }
+  const onRecall = (event: Event) => useImStore.getState().handleImRecall((event as CustomEvent).detail)
   const onPresence = (event: Event) => useImStore.getState().handlePresence((event as CustomEvent).detail)
   const onResync = () => useImStore.getState().resync()
   window.addEventListener(IM_MESSAGE_EVENT, onMessage)
+  window.addEventListener(IM_RECALL_EVENT, onRecall)
   window.addEventListener(IM_PRESENCE_EVENT, onPresence)
   window.addEventListener(IM_RESYNC_EVENT, onResync)
+  // 独立于消息轮询/云 WS 状态的兜底：WS 漏一次 im_recall 时，最多 10s 后对账回来
+  const recallReconcileTimer = window.setInterval(() => {
+    if (!useImStore.getState().open) return
+    void useImStore.getState().reconcileRecalls().catch(() => {})
+  }, 10000)
   return () => {
+    window.clearInterval(recallReconcileTimer)
     window.removeEventListener(IM_MESSAGE_EVENT, onMessage)
+    window.removeEventListener(IM_RECALL_EVENT, onRecall)
     window.removeEventListener(IM_PRESENCE_EVENT, onPresence)
     window.removeEventListener(IM_RESYNC_EVENT, onResync)
     useImStore.getState().stopPolling()
+    useImStore.getState().stopContactsPolling()
   }
 }

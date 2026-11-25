@@ -77,6 +77,15 @@ const MAX_ERRORS = 5
 
 type WizardStep = 'idle' | 'task_created' | 'params_set' | 'cells_selected' | 'executing' | 'completed'
 
+/** TAC核查专用步骤标签：第二步显示“算法参数”，与规划类任务区分 */
+const TAC_CHECK_STEPS = [
+  { key: 'new_task', labelKey: 'common.newTask', fallback: '新建' },
+  { key: 'params', labelKey: 'pciCheck.algorithmParams', fallback: '算法参数' },
+  { key: 'cells', labelKey: 'pci.cellSelection', fallback: '选择小区' },
+  { key: 'execute', labelKey: 'common.execute', fallback: '执行' },
+  { key: 'done', labelKey: 'common.completed', fallback: '完成' },
+]
+
 export function TACPage() {
   const perfRef = useRef({ mountTime: performance.now(), renderCount: 0, firstCommitLogged: false })
   perfRef.current.renderCount++
@@ -1170,6 +1179,7 @@ export function TACPage() {
                     : 4
                   }
                   executingProgress={wizardStep === 'executing' ? (taskResult?.progress ?? 0) : undefined}
+                  steps={TAC_CHECK_STEPS}
                 />
                 {/* 每步仅渲染当前操作卡片，居中显示 */}
                 <div className="flex-1 min-h-0 overflow-y-auto flex justify-center px-4">

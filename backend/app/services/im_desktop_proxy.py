@@ -10,7 +10,8 @@ from __future__ import annotations
 import re
 import threading
 import urllib.parse
-from typing import Any, Dict, Optional, Tuple
+from pathlib import Path
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import httpx
 from fastapi import HTTPException
@@ -178,3 +179,42 @@ def fetch_signed_attachment(info: Dict[str, Any]) -> Tuple[bytes, str, str]:
         filename = urllib.parse.unquote(match.group(1)) or filename
     mime = response.headers.get("content-type", "application/octet-stream").split(";", 1)[0]
     return response.content, mime, filename
+
+
+def stream_signed_attachment_to_file(
+    info: Dict[str, Any], target: Path, on_progress: Callable[[int], None],
+) -> Tuple[str, str, int]:
+    """把签名直链分块写到本地文件并回报进度；避免大附件整文件驻留内存。"""
+    base = server_url()
+    token = str(info.get("token") or "")
+    path = str(info.get("path") or "")
+    if not base or not token or not path.startswith("/api/v1/"):
+        raise HTTPException(status_code=502, detail="IM_ATTACHMENT_LINK_FAILED")
+    thumb = 1 if info.get("thumb") else 0
+    url = (f"{base.rstrip('/')}{path}?token={urllib.parse.quote(token, safe='')}"
+           f"&thumb={thumb}")
+    try:
+        with _get_client().stream(
+            "GET", url, timeout=RELAY_ATTACHMENT_TIMEOUT_SECONDS, follow_redirects=True,
+        ) as response:
+            if response.status_code >= 400:
+                raise HTTPException(
+                    status_code=502, detail="IM_ATTACHMENT_FETCH_FAILED")
+            total = int(response.headers.get("content-length") or 0)
+            received = 0
+            with target.open("wb") as handle:
+                for chunk in response.iter_bytes(64 * 1024):
+                    if not chunk:
+                        continue
+                    handle.write(chunk)
+                    received += len(chunk)
+                    on_progress(min(98, int(received * 100 / total)) if total else 50)
+            disposition = response.headers.get("content-disposition", "")
+            match = re.search(r"filename\*=UTF-8''([^;]+)", disposition)
+            filename = urllib.parse.unquote(match.group(1)) if match else "attachment"
+            mime = response.headers.get(
+                "content-type", "application/octet-stream").split(";", 1)[0]
+            return mime, filename or "attachment", received
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=502, detail=f"IM_ATTACHMENT_FETCH_FAILED: {exc}") from exc

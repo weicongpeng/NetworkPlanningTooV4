@@ -181,6 +181,8 @@ class UpdateParametersRequest(BaseModel):
     currentParamId: str
     # 默认只输出常用列；开启后输出全部列（含中兴内部引用列）
     outputAllColumns: bool = False
+    # 场景图层数据ID：未传(None)=自动匹配默认场景图层；空串=不加载；非空=用户指定图层
+    sceneLayerId: Optional[str] = None
 
 
 class MergeCurrentParamsZteRequest(BaseModel):

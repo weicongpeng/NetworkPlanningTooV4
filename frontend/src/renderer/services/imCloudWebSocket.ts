@@ -13,7 +13,7 @@
 import { desktopLoginApi } from './api'
 import type { DesktopCloudWsConfig } from './api'
 import {
-  IM_MESSAGE_EVENT, IM_PRESENCE_EVENT, IM_RESYNC_EVENT,
+  IM_MESSAGE_EVENT, IM_PRESENCE_EVENT, IM_RECALL_EVENT, IM_RESYNC_EVENT,
 } from './websocketService'
 
 /** 云 WS 不可用（未激活 / 旧服务端 / 鉴权失败 / Tunnel 抖动）→ 恢复 relay 轮询 */
@@ -60,7 +60,10 @@ class ImCloudWebSocketClient {
 
     this.stopped = false
     if (!cfg.enabled || !cfg.url || !cfg.license_file || !cfg.machine_code) {
+      // 本机端点瞬时不可用 / Tunnel 抖动时不能永久停在降级态：退避重试，
+      // 否则要等退出桌面端重启才能重新鉴权、广播在线。
       this.notifyFallback()
+      this.scheduleRetry()
       return
     }
     this.config = cfg as ActiveConfig
@@ -147,6 +150,9 @@ class ImCloudWebSocketClient {
           break
         case 'im_message':
           window.dispatchEvent(new CustomEvent(IM_MESSAGE_EVENT, { detail: payload.data || {} }))
+          break
+        case 'im_recall':
+          window.dispatchEvent(new CustomEvent(IM_RECALL_EVENT, { detail: payload.data || {} }))
           break
         case 'im_presence':
           window.dispatchEvent(new CustomEvent(IM_PRESENCE_EVENT, { detail: payload.data || {} }))

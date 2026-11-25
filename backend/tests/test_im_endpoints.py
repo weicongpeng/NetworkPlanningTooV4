@@ -179,6 +179,16 @@ def _capture_ws(monkeypatch):
     return notifications
 
 
+def _capture_recall_ws(monkeypatch):
+    from app.services import im_ops
+
+    notifications = []
+    monkeypatch.setattr(
+        im_ops.websocket_manager, "notify_im_recall",
+        lambda targets, payload: notifications.append((list(targets), payload)))
+    return notifications
+
+
 def test_send_with_mentions_and_ws_payload(client, monkeypatch):
     notifications = _capture_ws(monkeypatch)
     bob_id = client.users[1].id
@@ -203,6 +213,44 @@ def test_send_with_mentions_and_ws_payload(client, monkeypatch):
     client.current["user"] = client.users[1]
     page = client.get(f"/api/v1/im/conversations/{conv_id}/messages").json()["data"]
     assert page["items"][-1]["mentioned_me"] is True
+
+
+def test_recall_endpoint_and_ws_payload(client, monkeypatch):
+    notifications = _capture_recall_ws(monkeypatch)
+    bob_id = client.users[1].id
+    conv_id = _group(client, [bob_id])
+    sent = client.post(f"/api/v1/im/conversations/{conv_id}/messages", json={
+        "kind": "text", "content_text": "撤回内容",
+    })
+    assert sent.status_code == 201
+    message_id = sent.json()["data"]["id"]
+
+    recalled = client.post(
+        f"/api/v1/im/conversations/{conv_id}/messages/{message_id}/recall")
+    assert recalled.status_code == 200
+    data = recalled.json()["data"]
+    assert data["recalled"] is True
+    assert data["message"]["content_text"] == "撤回内容"  # 发送者仍可拿到原文回填输入框
+
+    assert len(notifications) == 1
+    targets, payload = notifications[0]
+    assert set(targets) == {client.users[0].id, bob_id}
+    assert payload["message_id"] == message_id
+    assert "content_text" not in payload
+
+    client.current["user"] = client.users[1]
+    page = client.get(f"/api/v1/im/conversations/{conv_id}/messages").json()["data"]
+    assert page["items"][-1]["recalled"] is True
+    assert page["items"][-1]["content_text"] is None
+
+    # 接收端漏掉 WS 后可按 id 对账拿到撤回状态
+    by_ids = client.get(
+        f"/api/v1/im/conversations/{conv_id}/messages",
+        params={"ids": str(message_id)},
+    ).json()["data"]
+    assert [m["id"] for m in by_ids["items"]] == [message_id]
+    assert by_ids["items"][0]["recalled"] is True
+    assert by_ids["items"][0]["content_text"] is None
 
 
 def test_mention_all_permission_and_compact_ws_payload(client, monkeypatch):

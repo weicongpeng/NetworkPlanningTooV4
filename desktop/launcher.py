@@ -17,6 +17,7 @@ import json
 import logging
 import multiprocessing
 import os
+import subprocess
 import queue
 import socket
 import sys
@@ -1458,8 +1459,44 @@ def _create_window() -> Any:
             return picked["value"]
 
         desktop_bridge.set_folder_dialog_handler(_pick_im_storage_folder)
+
+        def _reveal_im_file(path: str) -> bool:
+            """在系统文件管理器中选中附件；必须在 WinForms UI 线程启动 explorer。"""
+            result = {"value": False}
+
+            def _show() -> None:
+                try:
+                    target = str(Path(path))
+                    if os.name == "nt":
+                        subprocess.Popen(  # noqa: S603 - 参数列表，无 shell
+                            ["explorer", f"/select,{target}"],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        )
+                    else:
+                        subprocess.Popen(  # noqa: S603
+                            ["xdg-open", str(Path(target).parent)],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            start_new_session=True,
+                        )
+                    result["value"] = True
+                except Exception as exc:  # noqa: BLE001
+                    _log.warning("在文件夹中显示失败：%s", exc)
+
+            native = getattr(window, "native", None)
+            if os.name == "nt" and native is not None:
+                try:
+                    from System import Func, Type
+
+                    native.Invoke(Func[Type](_show))
+                except Exception:  # noqa: BLE001
+                    _show()
+            else:
+                _show()
+            return result["value"]
+
+        desktop_bridge.set_reveal_path_handler(_reveal_im_file)
     except Exception as exc:  # noqa: BLE001
-        _log.warning("注入目录选择回调失败（存储路径仍可手工输入）：%s", exc)
+        _log.warning("注入目录选择/文件定位回调失败：%s", exc)
     # 注入取景截图会话：桌面端由壳层直接抓整屏 + 置顶蒙层框选，不再依赖
     # WebView2 的共享窗口选择器；未注入时端点返回 403，前端降级到网页端旧流程。
     try:

@@ -23,6 +23,8 @@ _window_control_handler: Optional[Callable[[str, dict], Optional[dict]]] = None
 _screenshot_handler: Optional[Callable[[str, dict], Optional[dict]]] = None
 # 原生文件夹选择（IM 本地存储路径设置）；无壳时返回 None，前端保留手工输入
 _folder_dialog_handler: Optional[Callable[[], Optional[str]]] = None
+# 在系统文件管理器中定位文件（IM 附件「在文件夹中显示」）；无壳时返回 False
+_reveal_path_handler: Optional[Callable[[str], bool]] = None
 
 # 系统级截图热键（Alt+Z）由 launcher 的 Win32 RegisterHotKey 线程触发。
 # 前端按序号增量消费：即使 WebView 处于后台 / evaluate_js 不可用也不会丢事件。
@@ -117,6 +119,21 @@ def pick_folder() -> Optional[str]:
         return _folder_dialog_handler()
     except Exception:  # noqa: BLE001
         return None
+
+
+def set_reveal_path_handler(handler: Optional[Callable[[str], bool]]) -> None:
+    global _reveal_path_handler
+    _reveal_path_handler = handler
+
+
+def reveal_path(path: str) -> bool:
+    """在文件管理器中选中文件；无壳/执行失败返回 False。"""
+    if _reveal_path_handler is None:
+        return False
+    try:
+        return bool(_reveal_path_handler(path))
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def set_screenshot_handler(

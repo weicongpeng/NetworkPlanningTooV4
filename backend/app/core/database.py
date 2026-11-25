@@ -267,6 +267,8 @@ def init_db():
             conn.exec_driver_sql(
                 "ALTER TABLE im_messages ADD COLUMN mention_all BOOLEAN NOT NULL DEFAULT 0"
             )
+        if im_msg_cols and "recalled_at" not in im_msg_cols:
+            conn.exec_driver_sql("ALTER TABLE im_messages ADD COLUMN recalled_at VARCHAR(30)")
         # 迁移：自建群头像（存量库补列），与 users.avatar 同为裁剪后的 base64 data URL
         im_conv_cols = [
             row[1] for row in conn.exec_driver_sql("PRAGMA table_info(im_conversations)").fetchall()

@@ -7,6 +7,7 @@
 """
 import hashlib
 import hmac
+import json
 import re
 import threading
 import time
@@ -19,7 +20,8 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 
-CHUNK_SIZE = 512 * 1024
+# 2MB/片：512MB 文件约 256 片，避免 512KB 方案下上千次 relay 往返把大文件上传拖到不可用
+CHUNK_SIZE = 2 * 1024 * 1024
 DENY_EXTENSIONS = {
     "exe", "bat", "cmd", "com", "scr", "pif", "msi", "dll", "so", "sh", "bash",
     "ps1", "psm1", "vbs", "vbe", "js", "jse", "jar", "py", "pyc", "php", "phtml",
@@ -59,6 +61,92 @@ def _base_dir() -> Path:
 
 def _max_bytes() -> int:
     return max(1, int(settings.NPT_IM_MAX_FILE_MB)) * 1024 * 1024
+
+
+# 共享模式的云端附件在本地的只读副本：附件一旦上传即不可变，可长期复用，
+# 避免每次预览/下载都走公网 relay；按 LRU 控制磁盘占用。
+_REMOTE_CACHE_DIR = "remote-cache"
+
+
+def _remote_cache_folder(attachment_id: int, thumb: bool) -> Path:
+    return _base_dir() / _REMOTE_CACHE_DIR / str(int(attachment_id)) / ("thumb" if thumb else "full")
+
+
+def read_remote_cache(attachment_id: int, thumb: bool) -> Optional[Tuple[bytes, str, str]]:
+    limit_mb = int(getattr(settings, "NPT_IM_LOCAL_ATTACHMENT_CACHE_MB", 0))
+    if limit_mb <= 0:
+        return None
+    folder = _remote_cache_folder(attachment_id, thumb)
+    data_path = folder / "data.bin"
+    meta_path = folder / "meta.json"
+    if not data_path.is_file() or not meta_path.is_file():
+        return None
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        return (data_path.read_bytes(),
+                str(meta.get("mime") or "application/octet-stream"),
+                str(meta.get("filename") or "attachment"))
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def _prune_remote_cache() -> None:
+    limit = max(0, int(getattr(settings, "NPT_IM_LOCAL_ATTACHMENT_CACHE_MB", 0))) * 1024 * 1024
+    root = _base_dir() / _REMOTE_CACHE_DIR
+    entries: List[Tuple[float, int, Path]] = []
+    for path in root.glob("*/*/data.bin"):
+        try:
+            stat = path.stat()
+            entries.append((stat.st_mtime, stat.st_size, path))
+        except OSError:
+            pass
+    total = sum(size for _, size, _ in entries)
+    for _, size, path in sorted(entries):
+        if total <= limit:
+            break
+        try:
+            path.unlink(missing_ok=True)
+            (path.parent / "meta.json").unlink(missing_ok=True)
+            total -= size
+        except OSError:
+            pass
+
+
+def write_remote_cache(attachment_id: int, thumb: bool,
+                       content: bytes, mime: str, filename: str) -> None:
+    if int(getattr(settings, "NPT_IM_LOCAL_ATTACHMENT_CACHE_MB", 0)) <= 0:
+        return
+    folder = _remote_cache_folder(attachment_id, thumb)
+    folder.mkdir(parents=True, exist_ok=True)
+    data_path = folder / "data.bin"
+    tmp = folder / "data.part"
+    tmp.write_bytes(content)
+    tmp.replace(data_path)
+    (folder / "meta.json").write_text(
+        json.dumps({"mime": mime, "filename": filename}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    _prune_remote_cache()
+
+
+def write_remote_cache_file(attachment_id: int, thumb: bool,
+                            source: Path, mime: str, filename: str) -> None:
+    """把已落盘的附件流式复制进本地缓存，避免大文件再次整块读入内存。"""
+    import shutil
+
+    if int(getattr(settings, "NPT_IM_LOCAL_ATTACHMENT_CACHE_MB", 0)) <= 0:
+        return
+    folder = _remote_cache_folder(attachment_id, thumb)
+    folder.mkdir(parents=True, exist_ok=True)
+    data_path = folder / "data.bin"
+    tmp = folder / "data.part"
+    shutil.copyfile(source, tmp)
+    tmp.replace(data_path)
+    (folder / "meta.json").write_text(
+        json.dumps({"mime": mime, "filename": filename}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    _prune_remote_cache()
 
 
 def _attachment_signature(attachment_id: int, user_id: int,

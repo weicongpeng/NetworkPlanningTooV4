@@ -1,6 +1,6 @@
 /** 输入区交互：粘贴/选图/截图只入待发送队列，统一由发送按钮或 Enter 提交。 */
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
@@ -17,7 +17,7 @@ vi.mock('react-i18next', () => ({
 }))
 
 vi.mock('../../../services/api', () => ({
-  IM_CHUNK_SIZE: 512 * 1024,
+  IM_CHUNK_SIZE: 2 * 1024 * 1024,
   imApi: {
     conversations: vi.fn(), contacts: vi.fn(), messages: vi.fn(), send: vi.fn(),
     markRead: vi.fn(), createConversation: vi.fn(), createGroup: vi.fn(),
@@ -30,7 +30,7 @@ vi.mock('../../../store/authStore', () => ({
     selector({ user: { id: 1 } }),
 }))
 
-import { useImStore } from '../../../store/imStore'
+import { IM_COMPOSER_FILL_EVENT, useImStore } from '../../../store/imStore'
 import { ImComposer } from '../ImComposer'
 import {
   applyScreenshotSettings, DEFAULT_SCREENSHOT_SETTINGS, getScreenshotSettings,
@@ -103,6 +103,26 @@ describe('协作沟通输入区', () => {
     fireEvent.click(screen.getByTitle('发送消息'))
     await waitFor(() => expect(state.sendFiles).toHaveBeenCalledWith([file]))
     expect(screen.queryByText('待发送附件 · 1')).toBeNull()
+  })
+
+  it('撤回回填事件把原文写入当前会话输入框，其它会话不受影响', () => {
+    render(<ImComposer conversationId={7} />)
+    const textarea = screen.getByPlaceholderText(/输入消息/) as HTMLTextAreaElement
+
+    act(() => {
+      window.dispatchEvent(new CustomEvent(IM_COMPOSER_FILL_EVENT, {
+        detail: { conversationId: 8, text: '别的会话' },
+      }))
+    })
+    expect(textarea.value).toBe('')
+
+    act(() => {
+      window.dispatchEvent(new CustomEvent(IM_COMPOSER_FILL_EVENT, {
+        detail: { conversationId: 7, text: '撤回原文' },
+      }))
+    })
+    expect(textarea.value).toBe('撤回原文')
+    expect(state.setDraft).toHaveBeenCalledWith('撤回原文')
   })
 
   it('输入 / 粘贴文字只留草稿，按 Enter 才发送', () => {
