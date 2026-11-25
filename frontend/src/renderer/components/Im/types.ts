@@ -5,6 +5,17 @@ export type ImConversationKind = 'direct' | 'auto_group' | 'custom_group'
 export type ImMessageKind = 'text' | 'image' | 'file' | 'system'
 export type ImTab = 'messages' | 'contacts'
 
+/** 发出后 5 分钟内可撤回；菜单置灰与服务端权威校验共用此时限 */
+export const IM_RECALL_WINDOW_MS = 5 * 60 * 1000
+
+/** 消息是否已过撤回时限（本地仅用于交互提示，服务端仍会再次校验） */
+export function isWithinRecallWindow(createdAt: string, now = Date.now()): boolean {
+  const sentAt = new Date(createdAt).getTime()
+  if (!Number.isFinite(sentAt)) return false
+  const age = now - sentAt
+  return age >= -60_000 && age <= IM_RECALL_WINDOW_MS
+}
+
 /** 群内系统提示的结构化载荷（content_text 里的 JSON），文案一律前端 t() 渲染 */
 export interface ImSystemPayload {
   event: string
@@ -171,6 +182,9 @@ export interface ImMessage {
   attachment: ImAttachmentInfo | null
   client_msg_id: string | null
   created_at: string
+  /** 撤回状态：原文只对发送者保留，其他成员收到 null */
+  recalled?: boolean
+  recalled_at?: string | null
   /** 结构化 @：名单在发送时刻由服务端固化，历史消息重拉/换设备后仍在 */
   mention_all?: boolean
   mentions?: ImMention[]

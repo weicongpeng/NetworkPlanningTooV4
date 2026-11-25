@@ -13,7 +13,7 @@ vi.mock('react-i18next', () => ({
 }))
 
 vi.mock('../../../services/api', () => ({
-  IM_CHUNK_SIZE: 512 * 1024,
+  IM_CHUNK_SIZE: 2 * 1024 * 1024,
   imApi: {
     conversations: vi.fn(), contacts: vi.fn(), messages: vi.fn(), send: vi.fn(),
     markRead: vi.fn(), createConversation: vi.fn(), createGroup: vi.fn(),

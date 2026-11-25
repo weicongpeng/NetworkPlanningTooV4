@@ -24,7 +24,7 @@ vi.mock('react-i18next', () => ({
   }),
 }))
 vi.mock('../../../services/api', () => ({
-  IM_CHUNK_SIZE: 512 * 1024,
+  IM_CHUNK_SIZE: 2 * 1024 * 1024,
   imApi: { attachmentBlob: (...args: unknown[]) => blobMock(...args) },
 }))
 

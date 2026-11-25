@@ -28,6 +28,8 @@ from app.models.database import (
 KINDS = ("direct", "auto_group", "custom_group")
 MESSAGE_KINDS = ("text", "image", "file")
 MAX_TEXT_LENGTH = 8000
+# 发出 5 分钟内可撤回；前端菜单按同一时限置灰，服务端再做权威校验
+RECALL_WINDOW_SECONDS = 300
 # 头像一律是前端裁剪到 128×128 后的 base64 data URL，限制体积避免把 data.db 撑爆
 MAX_AVATAR_BYTES = 256 * 1024
 _AVATAR_RE = re.compile(r"^data:image/(png|jpeg|webp|gif);base64,([A-Za-z0-9+/=]+)$")
@@ -275,10 +277,13 @@ def _message_brief(message: Optional[ImMessage], sender_names: Dict[int, str],
                    attachments: Dict[int, ImAttachment]) -> Optional[Dict[str, Any]]:
     if message is None:
         return None
-    preview = message.content_text or ""
-    if message.kind not in ("text", "system"):
-        att = attachments.get(message.attachment_id) if message.attachment_id else None
-        preview = f"[{message.kind}] {att.original_name if att else '附件'}"
+    if getattr(message, "recalled_at", None):
+        preview = "[消息已撤回]"
+    else:
+        preview = message.content_text or ""
+        if message.kind not in ("text", "system"):
+            att = attachments.get(message.attachment_id) if message.attachment_id else None
+            preview = f"[{message.kind}] {att.original_name if att else '附件'}"
     return {
         "id": message.id,
         "kind": message.kind,
@@ -704,6 +709,15 @@ def _reply_preview(message: Optional[ImMessage],
     """
     if message is None:
         return None
+    if getattr(message, "recalled_at", None):
+        return {
+            "id": message.id,
+            "sender_id": message.sender_id,
+            "sender_name": sender_names.get(message.sender_id, ""),
+            "kind": message.kind,
+            "preview": "[消息已撤回]",
+            "attachment": None,
+        }
     text = (message.content_text or "").strip()
     att = None
     if message.attachment_id:
@@ -740,8 +754,12 @@ def _serialize_message(db: Session, message: ImMessage,
                        viewer_id: Optional[int] = None,
                        sender_avatars: Optional[Dict[int, Optional[str]]] = None,
                        reply_map: Optional[Dict[int, ImMessage]] = None) -> Dict[str, Any]:
+    recalled = bool(getattr(message, "recalled_at", None))
+    # 撤回后原正文/附件只在发送者自己的响应里保留，供「点击回填输入框重新编辑」；
+    # 其他成员拿到 null，即使绕过前端也看不到已撤回内容。
+    sender_view = recalled and viewer_id is not None and viewer_id == message.sender_id
     attachment = None
-    if message.attachment_id:
+    if message.attachment_id and (not recalled or sender_view):
         att = (attachments.get(message.attachment_id) if attachments is not None
                else db.query(ImAttachment).filter(ImAttachment.id == message.attachment_id).first())
         if att:
@@ -757,9 +775,11 @@ def _serialize_message(db: Session, message: ImMessage,
         "sender_id": message.sender_id,
         "sender_name": sender_names.get(message.sender_id, ""),
         "sender_avatar": (sender_avatars or {}).get(message.sender_id),
-        "kind": message.kind, "content_text": message.content_text,
+        "kind": message.kind,
+        "content_text": message.content_text if (not recalled or sender_view) else None,
         "attachment": attachment, "client_msg_id": message.client_msg_id,
         "created_at": message.created_at,
+        "recalled": recalled, "recalled_at": getattr(message, "recalled_at", None),
         # mention_all 是消息属性（气泡显示 @所有人）；mentioned_me 按发送时刻固化的
         # mention 行判定，不受后来加入/退出的成员影响，也不把发送者自己算进去。
         "mention_all": bool(message.mention_all),
@@ -794,7 +814,8 @@ def _visible_messages_query(db: Session, user_id: int):
 
 def list_messages(db: Session, conversation_id: int, user_id: int,
                   after_id: Optional[int] = None, before_id: Optional[int] = None,
-                  limit: Optional[int] = None) -> Dict[str, Any]:
+                  limit: Optional[int] = None,
+                  ids: Optional[List[int]] = None) -> Dict[str, Any]:
     _require_member(db, conversation_id, user_id)
     size = limit or int(settings.NPT_IM_MESSAGE_PAGE_SIZE)
     size = max(1, min(int(size), 100))
@@ -803,7 +824,15 @@ def list_messages(db: Session, conversation_id: int, user_id: int,
     query = _visible_messages_query(db, user_id).filter(
         ImMessage.conversation_id == conversation_id)
     has_more = False
-    if after_id is not None:
+    next_cursor = None
+    prev_cursor = None
+    if ids:
+        # 按 id 定向对账：撤回通知漏达时，接收端用本地已加载的 id 重新取一遍真实状态。
+        # 不推进游标，也不影响分页语义。
+        wanted = list(dict.fromkeys(int(value) for value in ids))[:100]
+        rows = query.filter(ImMessage.id.in_(wanted)).order_by(ImMessage.id.asc()).all()
+        items = rows
+    elif after_id is not None:
         rows = query.filter(ImMessage.id > int(after_id)).order_by(ImMessage.id.asc()).limit(size + 1).all()
         has_more = len(rows) > size
         rows = rows[:size]
@@ -1013,6 +1042,40 @@ def delete_message(db: Session, conversation_id: int, message_id: int,
     return {"deleted": int(message_id)}
 
 
+def recall_message(db: Session, conversation_id: int, message_id: int,
+                   user_id: int) -> Dict[str, Any]:
+    """撤回自己 5 分钟内发出的消息：消息行与原文保留，但仅发送者还能看到原文。
+
+    对方看到的是「消息已撤回」占位，会话预览 / 引用预览 / 转发也同步脱敏。
+    服务端做权威时限校验，前端菜单置灰只是交互提示。
+    """
+    _require_member(db, conversation_id, user_id)
+    message = db.query(ImMessage).filter(
+        ImMessage.id == int(message_id),
+        ImMessage.conversation_id == conversation_id).first()
+    if message is None:
+        raise _err(404, "IM_CONVERSATION_NOT_FOUND")
+    if message.sender_id != user_id:
+        raise _err(403, "IM_NO_PERMISSION")
+    if not getattr(message, "recalled_at", None):
+        try:
+            created = datetime.fromisoformat(str(message.created_at).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            raise _err(400, "IM_INVALID_MESSAGE") from None
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        age = (datetime.now(timezone.utc) - created).total_seconds()
+        if age > RECALL_WINDOW_SECONDS:
+            raise _err(403, "IM_RECALL_EXPIRED")
+        message.recalled_at = _now()
+        db.commit()
+    names = _load_sender_names(db, {message.sender_id})
+    return {
+        "message": _serialize_message(db, message, names, viewer_id=user_id),
+        "recalled": True,
+    }
+
+
 def forward_messages(db: Session, user_id: int, message_ids: List[int],
                      conversation_ids: List[int]) -> Dict[str, Any]:
     """把历史消息复制到多个目标会话（个人 / 群）；图片/视频复用同一份磁盘文件。"""
@@ -1026,6 +1089,9 @@ def forward_messages(db: Session, user_id: int, message_ids: List[int],
                .order_by(ImMessage.id.asc()).all())
     if len(sources) != len(set(ids)):
         raise _err(404, "IM_CONVERSATION_NOT_FOUND")
+    # 已撤回的消息即使对发送者保留原文，也不能再转发到别的会话扩散
+    if any(getattr(m, "recalled_at", None) for m in sources):
+        raise _err(400, "IM_INVALID_MESSAGE")
     for cid in {m.conversation_id for m in sources}:
         _require_member(db, cid, user_id)
     for cid in targets:

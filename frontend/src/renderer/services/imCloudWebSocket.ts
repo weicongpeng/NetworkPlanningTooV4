@@ -13,7 +13,7 @@
 import { desktopLoginApi } from './api'
 import type { DesktopCloudWsConfig } from './api'
 import {
-  IM_MESSAGE_EVENT, IM_PRESENCE_EVENT, IM_RESYNC_EVENT,
+  IM_MESSAGE_EVENT, IM_PRESENCE_EVENT, IM_RECALL_EVENT, IM_RESYNC_EVENT,
 } from './websocketService'
 
 /** 云 WS 不可用（未激活 / 旧服务端 / 鉴权失败 / Tunnel 抖动）→ 恢复 relay 轮询 */
@@ -150,6 +150,9 @@ class ImCloudWebSocketClient {
           break
         case 'im_message':
           window.dispatchEvent(new CustomEvent(IM_MESSAGE_EVENT, { detail: payload.data || {} }))
+          break
+        case 'im_recall':
+          window.dispatchEvent(new CustomEvent(IM_RECALL_EVENT, { detail: payload.data || {} }))
           break
         case 'im_presence':
           window.dispatchEvent(new CustomEvent(IM_PRESENCE_EVENT, { detail: payload.data || {} }))

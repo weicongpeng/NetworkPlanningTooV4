@@ -4,7 +4,7 @@
  */
 
 interface WebSocketMessage {
-  type: 'progress' | 'complete' | 'failed' | 'pong' | 'task_deleted' | 'data_changed' | 'tasks_changed' | 'auth_ok' | 'user_online' | 'im_message' | 'im_presence'
+  type: 'progress' | 'complete' | 'failed' | 'pong' | 'task_deleted' | 'data_changed' | 'tasks_changed' | 'auth_ok' | 'user_online' | 'im_message' | 'im_recall' | 'im_presence'
   taskId: string
   data?: any
   timestamp?: number
@@ -18,6 +18,9 @@ export const USER_ONLINE_EVENT = 'npt:user-online'
 
 /** 协作沟通：有新消息（只推 id，正文由 REST 游标拉取） */
 export const IM_MESSAGE_EVENT = 'npt:im-message'
+
+/** 协作沟通：某条消息被撤回（只推 id，正文不进 WS） */
+export const IM_RECALL_EVENT = 'npt:im-recall'
 
 /** 协作沟通：用户在线状态变化 */
 export const IM_PRESENCE_EVENT = 'npt:im-presence'
@@ -360,6 +363,10 @@ class WebSocketService {
     // 协作沟通：只派发窗口事件，由 imStore 决定如何按游标补拉（WS 不承载消息正文）
     if (type === 'im_message') {
       window.dispatchEvent(new CustomEvent(IM_MESSAGE_EVENT, { detail: message.data || {} }))
+      return
+    }
+    if (type === 'im_recall') {
+      window.dispatchEvent(new CustomEvent(IM_RECALL_EVENT, { detail: message.data || {} }))
       return
     }
     if (type === 'im_presence') {

@@ -335,6 +335,11 @@ class WebSocketManager:
         self._notify({"type": "im_message", "taskId": "", "data": payload},
                      user_ids=user_ids or [])
 
+    def notify_im_recall(self, user_ids, payload: Dict[str, Any]) -> None:
+        """线程安全：通知会话成员某条消息已撤回（同样只带 id，不传正文）。"""
+        self._notify({"type": "im_recall", "taskId": "", "data": payload},
+                     user_ids=user_ids or [])
+
     def notify_im_presence(self, payload: Dict[str, Any]) -> None:
         """线程安全：通知全站某用户上线 / 离线。"""
         self._notify({"type": "im_presence", "taskId": "", "data": payload})

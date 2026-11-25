@@ -1,5 +1,5 @@
 /** 引用块里的图片/文件附件必须可点击打开，而不是只显示 [附件] 文本。 */
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { fireEvent, render, screen } from '@testing-library/react'
 
 const mocks = vi.hoisted(() => ({ preview: vi.fn(), openFile: vi.fn() }))
@@ -39,7 +39,8 @@ const message = (kind: 'image' | 'file'): ImMessage => ({
 })
 
 describe('ImMessageItem 引用附件', () => {
-  beforeEach(() => vi.clearAllMocks())
+  beforeEach(() => { vi.clearAllMocks() })
+  afterEach(() => { vi.restoreAllMocks() })
 
   it('引用图片点击后打开灯箱预览', () => {
     render(<ImMessageItem message={message('image')} isMine={false}
@@ -60,5 +61,56 @@ describe('ImMessageItem 引用附件', () => {
     expect(mocks.openFile).toHaveBeenCalledWith(
       42, '方案.pdf', false, expect.any(Function), expect.any(Function))
     expect(mocks.preview).not.toHaveBeenCalled()
+  })
+})
+
+describe('ImMessageItem 正文网址', () => {
+  afterEach(() => { vi.restoreAllMocks() })
+
+  it('网址渲染为链接，点击交给系统浏览器打开且不带尾部标点', () => {
+    const open = vi.spyOn(window, 'open').mockImplementation(() => null)
+    const url = 'https://github.com/weicongpeng/NetworkPlanningTooV4/releases/download/v0.0.91/NetOpt.Engine_Setup-0.0.91.exe'
+    const textMessage: ImMessage = {
+      ...message('image'), kind: 'text', reply_to: null, attachment: null,
+      content_text: `安装包：${url}。`,
+    }
+    render(<ImMessageItem message={textMessage} isMine={false} onPreview={mocks.preview} />)
+
+    const link = screen.getByRole('link')
+    expect(link.getAttribute('href')).toBe(url)
+    expect(link.textContent).toBe(url)
+    expect(link.className).not.toContain('text-primary')
+    fireEvent.click(link)
+    expect(open).toHaveBeenCalledWith(url, '_blank', 'noopener,noreferrer')
+    expect(link.previousSibling?.textContent).toBe('安装包：')
+  })
+})
+
+describe('ImMessageItem 撤回占位', () => {
+  const recalled = (contentText: string | null): ImMessage => ({
+    ...message('image'), kind: 'text', reply_to: null, attachment: null,
+    content_text: contentText, recalled: true,
+  })
+
+  it('自己撤回的消息仍显示原文，点击交给回填回调', () => {
+    const edit = vi.fn()
+    const item = recalled('撤回原文')
+    render(<ImMessageItem message={item} isMine onPreview={mocks.preview} onEditRecalled={edit} />)
+    fireEvent.click(screen.getByText('撤回原文'))
+    expect(edit).toHaveBeenCalledWith(item)
+  })
+
+  it('自己撤回的非文本消息显示“你撤回了一条消息”', () => {
+    const item: ImMessage = { ...recalled(null), kind: 'image' }
+    render(<ImMessageItem message={item} isMine onPreview={mocks.preview} />)
+    expect(screen.getByText('你撤回了一条消息')).toBeTruthy()
+    expect(screen.queryByText('对方撤回了一条消息')).toBeNull()
+  })
+
+  it('对方撤回的消息只显示占位，不泄露正文', () => {
+    render(<ImMessageItem message={recalled('对方原文')} isMine={false}
+                          onPreview={mocks.preview} />)
+    expect(screen.getByText('对方撤回了一条消息')).toBeTruthy()
+    expect(screen.queryByText('对方原文')).toBeNull()
   })
 })

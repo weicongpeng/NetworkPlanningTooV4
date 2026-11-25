@@ -23,6 +23,10 @@ interface Props {
   onPreview: (attachmentId: number, name: string, mime: string) => void
   /** 重发本条消息；参数即当前消息，调用方可以传稳定回调让 memo 生效 */
   onRetry?: (message: ImMessage) => void
+  /** 撤回后点击占位把原文放回输入框（只有发送者能编辑） */
+  onEditRecalled?: (message: ImMessage) => void
+  /** 桌面端文件下载：保存本地并在文件夹定位；网页端不传则走浏览器下载 */
+  onDownloadFile?: (message: ImMessage) => void
   /** 右键菜单：由 ImChatPanel 统一弹出 */
   onContextMenu?: (event: ReactMouseEvent<HTMLDivElement>, message: ImMessage) => void
   selectionMode?: boolean
@@ -42,25 +46,52 @@ function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
+/** 只识别 http/https，避免 javascript: 等协议被渲染成可点链接 */
+const URL_PATTERN = String.raw`https?:\/\/[^\s<>"']+`
+const URL_TRAILING_PUNCTUATION = /[.,;:!?，。；：！？、）】」』]+$/
+
+/** 点击聊天里的网址：桌面 pywebview 中 window.open 会交给系统浏览器，网页端开新标签页 */
+function openMessageUrl(event: ReactMouseEvent<HTMLAnchorElement>, url: string) {
+  event.preventDefault()
+  event.stopPropagation()
+  window.open(url, '_blank', 'noopener,noreferrer')
+}
+
 /**
- * 只按服务端给的结构化名单高亮 @ 文本，切成 React 节点渲染。
- * 不用 innerHTML：用户名来自用户输入，拼 HTML 会引入 XSS。
+ * 把正文切成 React 节点：@ 按服务端结构化名单高亮，网址渲染成可点链接。
+ * 不用 innerHTML：用户名和网址都来自用户输入，拼 HTML 会引入 XSS。
  */
-function highlightMentions(content: string, names: string[]): ReactNode[] {
+function renderMessageContent(content: string, names: string[]): ReactNode[] {
   const unique = [...new Set(names.filter(Boolean))].sort((a, b) => b.length - a.length)
-  if (!unique.length) return [content]
-  const pattern = new RegExp(`@(${unique.map(escapeRegExp).join('|')})`, 'g')
+  const mentionPattern = unique.length ? `@(${unique.map(escapeRegExp).join('|')})` : ''
+  const pattern = new RegExp(mentionPattern ? `${mentionPattern}|${URL_PATTERN}` : URL_PATTERN, 'g')
   const nodes: ReactNode[] = []
   let last = 0
   let match: RegExpExecArray | null
   while ((match = pattern.exec(content)) !== null) {
     if (match.index > last) nodes.push(content.slice(last, match.index))
-    nodes.push(
-      <mark key={`mention-${match.index}`}
-            className="rounded bg-amber-300/70 px-0.5 font-medium text-amber-950 dark:bg-amber-400/40 dark:text-amber-50">
-        {match[0]}
-      </mark>,
-    )
+    if (match[1]) {
+      nodes.push(
+        <mark key={`mention-${match.index}`}
+              className="rounded bg-amber-300/70 px-0.5 font-medium text-amber-950 dark:bg-amber-400/40 dark:text-amber-50">
+          {match[0]}
+        </mark>,
+      )
+    } else {
+      const url = match[0].replace(URL_TRAILING_PUNCTUATION, '')
+      const urlEnd = match.index + url.length
+      const matchEnd = match.index + match[0].length
+      if (url) {
+        nodes.push(
+          <a key={`url-${match.index}`} href={url} target="_blank" rel="noopener noreferrer"
+             onClick={event => openMessageUrl(event, url)}
+             className="break-words [overflow-wrap:anywhere] underline underline-offset-2 hover:opacity-80 cursor-pointer">
+            {url}
+          </a>,
+        )
+      }
+      if (urlEnd < matchEnd) nodes.push(content.slice(urlEnd, matchEnd))
+    }
     last = match.index + match[0].length
   }
   if (last < content.length) nodes.push(content.slice(last))
@@ -225,9 +256,10 @@ function VideoBubble({ attachment }: { attachment: ImAttachmentInfo }) {
 }
 
 /** Office / PDF 等文件：双击交给系统默认应用打开（桌面端），网页端退化为新标签页预览。 */
-function FileBubble({ attachment, isMine }: {
+function FileBubble({ attachment, isMine, onDownload }: {
   attachment: ImAttachmentInfo
   isMine: boolean
+  onDownload?: () => void
 }) {
   const { t } = useTranslation()
   const desktopMode = useAuthStore(s => s.desktopMode)
@@ -280,7 +312,8 @@ function FileBubble({ attachment, isMine }: {
         title={t('im.message.download', '下载文件')}
         onClick={event => {
           event.stopPropagation()
-          void imApi.downloadAttachment(attachment.id, attachment.original_name)
+          if (onDownload) onDownload()
+          else void imApi.downloadAttachment(attachment.id, attachment.original_name)
         }}
         onDoubleClick={event => event.stopPropagation()}
         className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg transition-colors cursor-pointer
@@ -333,7 +366,7 @@ function ReplyAttachmentLink({ attachment, isImage, onPreview }: {
 }
 
 function ImMessageItemBase({
-  message, isMine, onPreview, onRetry, onContextMenu,
+  message, isMine, onPreview, onRetry, onEditRecalled, onDownloadFile, onContextMenu,
   selectionMode = false, selected = false, onToggleSelect,
 }: Props) {
   const { t } = useTranslation()
@@ -376,65 +409,93 @@ function ImMessageItemBase({
         rounded="full"
         className="mt-0.5"
       />
-      <div className={`flex max-w-[76%] flex-col ${isMine ? 'items-end' : 'items-start'}`}>
+      <div className={`flex min-w-0 max-w-[76%] flex-col ${isMine ? 'items-end' : 'items-start'}`}>
         <div className="mb-1 flex items-center gap-2 text-[11px] text-muted-foreground">
           <span>{message.sender_name || selfName || t('im.message.me', '我')}</span>
           <span>{formatClock(message.created_at)}</span>
         </div>
-        <div className={`relative rounded-2xl px-3.5 py-2.5 text-[13px] leading-relaxed shadow-sm
+        <div className={`relative max-w-full min-w-0 rounded-2xl px-3.5 py-2.5 text-[13px] leading-relaxed shadow-sm
           ${isMine
             ? 'rounded-tr-md bg-primary text-primary-foreground'
             : 'rounded-tl-md border border-border/70 bg-card text-card-foreground'}
           ${message.mentioned_me ? 'ring-1 ring-primary/60' : ''}`}>
-          {message.reply_to && (
-            <div className={`mb-1.5 border-l-2 pl-2 text-[11px] opacity-80
-              ${isMine ? 'border-primary-foreground/60' : 'border-primary/60'}`}>
-              <span className="font-medium">{message.reply_to.sender_name || selfName || t('im.message.me', '我')}：</span>
-              {message.reply_to.preview
-                && !(message.reply_to.attachment && message.reply_to.preview.startsWith('[附件]')) && (
-                <span className="line-clamp-2">{message.reply_to.preview}</span>
-              )}
-              {message.reply_to.attachment?.id ? (
-                <ReplyAttachmentLink
-                  attachment={message.reply_to.attachment}
-                  isImage={message.reply_to.kind === 'image'
-                    || Boolean(message.reply_to.attachment.mime?.startsWith('image/'))}
-                  onPreview={onPreview}
-                />
-              ) : !message.reply_to.preview ? (
-                <span className="line-clamp-2">[附件]</span>
-              ) : null}
-            </div>
-          )}
-          {showMentionChips && (
-            <div className="mb-1.5 flex flex-wrap gap-1">
-              {message.mention_all && (
-                <span className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${chipClass}`}>
-                  {allLabel}
+          {message.recalled ? (
+            isMine
+              ? message.content_text ? (
+                <button type="button" onClick={() => onEditRecalled?.(message)}
+                        title={t('im.message.recalledEditHint', '点击回填到输入框重新编辑')}
+                        className="block w-full cursor-pointer text-left opacity-75 hover:opacity-100">
+                  <span className="mb-1 block text-[11px] italic">
+                    {t('im.message.recalledByMe', '已撤回，点击重新编辑')}
+                  </span>
+                  <span className="whitespace-pre-wrap break-words [overflow-wrap:anywhere]">
+                    {message.content_text}
+                  </span>
+                </button>
+              ) : (
+                <span className="italic opacity-75">
+                  {t('im.message.recalledByMeNoText', '你撤回了一条消息')}
                 </span>
-              )}
-              {message.mentioned_me && (
-                <span className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${chipClass}`}>
-                  {t('im.mention.meLabel', '@我')}
+              )
+              : (
+                <span className="italic opacity-75">
+                  {t('im.message.recalledByOther', '对方撤回了一条消息')}
                 </span>
+              )
+          ) : (
+            <>
+              {message.reply_to && (
+                <div className={`mb-1.5 border-l-2 pl-2 text-[11px] opacity-80
+                  ${isMine ? 'border-primary-foreground/60' : 'border-primary/60'}`}>
+                  <span className="font-medium">{message.reply_to.sender_name || selfName || t('im.message.me', '我')}：</span>
+                  {message.reply_to.preview
+                    && !(message.reply_to.attachment && message.reply_to.preview.startsWith('[附件]')) && (
+                    <span className="line-clamp-2">{message.reply_to.preview}</span>
+                  )}
+                  {message.reply_to.attachment?.id ? (
+                    <ReplyAttachmentLink
+                      attachment={message.reply_to.attachment}
+                      isImage={message.reply_to.kind === 'image'
+                        || Boolean(message.reply_to.attachment.mime?.startsWith('image/'))}
+                      onPreview={onPreview}
+                    />
+                  ) : !message.reply_to.preview ? (
+                    <span className="line-clamp-2">[附件]</span>
+                  ) : null}
+                </div>
               )}
-            </div>
-          )}
-          {message.kind === 'text' && (
-            <p className="whitespace-pre-wrap break-words">
-              {highlightMentions(message.content_text || '', mentionNames)}
-            </p>
-          )}
-          {message.kind === 'image' && attachment && (
-            <ImageBubble message={message} onPreview={onPreview} />
-          )}
-          {(message.kind === 'file' || message.kind === 'image') && attachment
-            && isVideoFile(attachment.original_name, attachment.mime) && (
-            <VideoBubble attachment={attachment} />
-          )}
-          {message.kind === 'file' && attachment
-            && !isVideoFile(attachment.original_name, attachment.mime) && (
-            <FileBubble attachment={attachment} isMine={isMine} />
+              {showMentionChips && (
+                <div className="mb-1.5 flex flex-wrap gap-1">
+                  {message.mention_all && (
+                    <span className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${chipClass}`}>
+                      {allLabel}
+                    </span>
+                  )}
+                  {message.mentioned_me && (
+                    <span className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${chipClass}`}>
+                      {t('im.mention.meLabel', '@我')}
+                    </span>
+                  )}
+                </div>
+              )}
+              {message.kind === 'text' && (
+                <p className="whitespace-pre-wrap break-words [overflow-wrap:anywhere]">
+                  {renderMessageContent(message.content_text || '', mentionNames)}
+                </p>
+              )}
+              {message.kind === 'image' && attachment && (
+                <ImageBubble message={message} onPreview={onPreview} />
+              )}
+              {(message.kind === 'file' || message.kind === 'image') && attachment
+                && isVideoFile(attachment.original_name, attachment.mime) && (
+                <VideoBubble attachment={attachment} />
+              )}
+              {message.kind === 'file' && attachment
+                && !isVideoFile(attachment.original_name, attachment.mime) && (
+                <FileBubble attachment={attachment} isMine={isMine}
+                            onDownload={onDownloadFile ? () => onDownloadFile(message) : undefined} />
+              )}
+            </>
           )}
           {message.failed && (
             <button

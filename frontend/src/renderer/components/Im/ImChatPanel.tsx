@@ -6,6 +6,7 @@ import {
   ChevronLeft, Forward, Loader2, MessageSquareDashed, Users, X,
 } from 'lucide-react'
 
+import { imApi } from '../../services/api'
 import { useAuthStore } from '../../store/authStore'
 import { useImStore } from '../../store/imStore'
 import { useToastStore } from '../../store/toastStore'
@@ -18,7 +19,9 @@ import { ImMessageContextMenu } from './ImMessageContextMenu'
 import type { MessageMenuState } from './ImMessageContextMenu'
 import { ImMessageItem } from './ImMessageItem'
 import { ImSystemNotice } from './ImSystemNotice'
-import { conversationTitle, formatBytes, formatClock, imDisplayName, imUserId } from './types'
+import {
+  conversationTitle, formatBytes, formatClock, imDisplayName, imUserId, isWithinRecallWindow,
+} from './types'
 import type { ImConversation, ImLightboxSource, ImMessage, ImUser } from './types'
 
 interface Props {
@@ -36,6 +39,7 @@ export function ImChatPanel({ conversation, pendingPeer, narrow, onBack }: Props
   const { t } = useTranslation()
   const currentUserId = useAuthStore(s => imUserId(s.user))
   const currentUser = useAuthStore(s => s.user)
+  const desktopMode = useAuthStore(s => s.desktopMode)
   const messages = useImStore(s => conversation
     ? (s.messages[conversation.id] ?? EMPTY_MESSAGES) : EMPTY_MESSAGES)
   const cursor = useImStore(s => conversation ? s.cursors[conversation.id] : undefined)
@@ -54,6 +58,8 @@ export function ImChatPanel({ conversation, pendingPeer, narrow, onBack }: Props
   const clearError = useImStore(s => s.clearError)
   const setReplyTo = useImStore(s => s.setReplyTo)
   const deleteMessage = useImStore(s => s.deleteMessage)
+  const recallMessage = useImStore(s => s.recallMessage)
+  const fillComposer = useImStore(s => s.fillComposer)
   const forwardMessages = useImStore(s => s.forwardMessages)
   const markConversationRead = useImStore(s => s.markConversationRead)
   const [menu, setMenu] = useState<MessageMenuState | null>(null)
@@ -171,40 +177,78 @@ export function ImChatPanel({ conversation, pendingPeer, narrow, onBack }: Props
     })
   }, [imageGallery, setLightbox])
 
-  /** 复制消息全部内容：文字 + 图片/视频/文件名与大小，多选时按时间顺序拼接 */
-  const copyMessages = async (items: ImMessage[]) => {
-    const blocks = items.map(message => {
-      const who = message.sender_name || t('im.message.me', '我')
-      const attachment = message.attachment
-        ? `${message.attachment.original_name}（${formatBytes(message.attachment.size_bytes)}）`
-        : ''
-      const body = [message.content_text || '', attachment].filter(Boolean).join('\n')
-      return body ? `[${who} ${formatClock(message.created_at)}]\n${body}` : ''
-    }).filter(Boolean)
-    if (!blocks.length) return
-    const text = blocks.join('\n\n')
-    let ok = false
+  /** 复制单张图片消息时写入原图字节，粘贴到输入框才是图片本身而不是文件名文本 */
+  const copyImageMessage = async (message: ImMessage): Promise<boolean> => {
+    const attachment = message.attachment
+    if (message.kind !== 'image' || !attachment?.id || !attachment.mime.startsWith('image/')) return false
+    if (typeof ClipboardItem === 'undefined' || !navigator.clipboard?.write) return false
+    try {
+      const mime = attachment.mime.startsWith('image/') ? attachment.mime : 'image/png'
+      // 立即调用 clipboard.write（在用户手势有效期内），字节异步填入；避免慢图下载后失去剪贴板权限
+      const blobPromise = imApi.attachmentBlob(attachment.id, false).then(blob =>
+        blob.type.startsWith('image/') ? blob : new Blob([blob], { type: mime }))
+      await navigator.clipboard.write([new ClipboardItem({ [mime]: blobPromise })])
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  const copyText = async (text: string): Promise<boolean> => {
     try {
       if (navigator.clipboard?.writeText) {
         await navigator.clipboard.writeText(text)
-        ok = true
+        return true
       }
     } catch { /* 桌面 WebView2 / 非安全上下文降级到 execCommand */ }
-    if (!ok) {
-      try {
-        const holder = document.createElement('textarea')
-        holder.value = text
-        holder.style.position = 'fixed'
-        holder.style.opacity = '0'
-        document.body.appendChild(holder)
-        holder.select()
-        ok = typeof document.execCommand === 'function' && document.execCommand('copy')
-        holder.remove()
-      } catch { /* 复制失败由下方提示体现 */ }
+    const holder = document.createElement('textarea')
+    holder.value = text
+    holder.style.position = 'fixed'
+    holder.style.opacity = '0'
+    document.body.appendChild(holder)
+    try {
+      holder.select()
+      return typeof document.execCommand === 'function' && document.execCommand('copy')
+    } catch {
+      return false
+    } finally {
+      holder.remove()
     }
+  }
+
+  /** 复制消息正文：不带发送人和时间；多选时按时间顺序拼接 */
+  const copyMessages = async (items: ImMessage[]) => {
+    if (!items.length) return
+    if (items.length === 1 && await copyImageMessage(items[0])) {
+      useToastStore.getState().show(t('im.message.copied', '已复制到剪贴板'))
+      return
+    }
+    const text = items.map(message => {
+      const attachment = message.attachment
+        ? `${message.attachment.original_name}（${formatBytes(message.attachment.size_bytes)}）`
+        : ''
+      return [message.content_text || '', attachment].filter(Boolean).join('\n')
+    }).filter(Boolean).join('\n\n')
+    if (!text) return
+    const ok = await copyText(text)
     useToastStore.getState().show(
       ok ? t('im.message.copied', '已复制到剪贴板') : t('im.message.copyFailed', '复制失败'),
     )
+  }
+
+  /** 桌面端：附件落到本地下载目录并在文件管理器中定位；网页端保持浏览器下载 */
+  const revealFile = async (message: ImMessage) => {
+    const attachment = message.attachment
+    if (!attachment?.id) return
+    try {
+      const response = await imApi.revealAttachment(attachment.id)
+      useToastStore.getState().show(t('im.message.revealSaved', {
+        defaultValue: '已保存到 {{path}}', path: response.data.path,
+      }))
+    } catch (error) {
+      console.warn('[IM] reveal attachment failed', error)
+      useToastStore.getState().show(t('im.message.revealFailed', '在文件夹中显示失败'))
+    }
   }
 
   // 以下回调全部 useCallback 稳定：ImMessageItem 是 memo 组件，每次渲染新建闭包
@@ -385,6 +429,10 @@ export function ImChatPanel({ conversation, pendingPeer, narrow, onBack }: Props
                   isMine={message.sender_id === currentUserId}
                   onPreview={openPreview}
                   onRetry={handleRetry}
+                  onEditRecalled={item => {
+                    if (item.content_text) fillComposer(item.conversation_id, item.content_text)
+                  }}
+                  onDownloadFile={desktopMode ? item => void revealFile(item) : undefined}
                   onContextMenu={handleContextMenu}
                   selectionMode={selectionMode}
                   selected={selectedIds.includes(message.id)}
@@ -412,9 +460,17 @@ export function ImChatPanel({ conversation, pendingPeer, narrow, onBack }: Props
           state={menu}
           onClose={() => setMenu(null)}
           onCopy={message => void copyMessages([message])}
+          onRevealFile={message => void revealFile(message)}
+          canRevealFile={desktopMode && Boolean(menu.message.attachment?.id)}
+          onRecall={message => {
+            if (conversation) void recallMessage(conversation.id, message.id)
+          }}
           onQuote={message => setReplyTo(message)}
           onMultiSelect={message => { setSelectionMode(true); setSelectedIds([message.id]) }}
           onForward={handleForward}
+          canRecall={menu.message.sender_id !== currentUserId
+            ? null
+            : !menu.message.recalled && isWithinRecallWindow(menu.message.created_at)}
           canDelete={menu.message.sender_id === currentUserId}
           onDelete={message => {
             if (conversation) void deleteMessage(conversation.id, message.id)

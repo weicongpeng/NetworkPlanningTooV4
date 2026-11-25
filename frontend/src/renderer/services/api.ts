@@ -2771,7 +2771,8 @@ export interface TableMergeResultData {
 // 附件不走 /static（dev 无代理且无鉴权），统一用 apiClient 的 blob 响应；
 // 拦截器对 responseType:'blob' 返回完整 AxiosResponse，因此必须取 .data。
 
-export const IM_CHUNK_SIZE = 512 * 1024
+/** IM 附件分片：与后端 im_attachment_service.CHUNK_SIZE 保持一致；大文件减少往返次数 */
+export const IM_CHUNK_SIZE = 2 * 1024 * 1024
 
 function blobToBase64(blob: Blob): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -2840,10 +2841,16 @@ export const imApi = {
   openAttachment: (id: number): Promise<ImEnvelope<{ opened: boolean; path: string }>> =>
     apiClient.post(`/im/attachments/${id}/open`) as any,
 
+  /** 桌面端：把附件保存到本地下载目录，并在系统文件管理器中选中 */
+  revealAttachment: (id: number): Promise<ImEnvelope<{ revealed: boolean; path: string }>> =>
+    apiClient.post(`/im/attachments/${id}/reveal`) as any,
+
   messages: (id: number, params: {
     after_id?: number
     before_id?: number
     limit?: number
+    /** 逗号分隔的消息 id：撤回漏通知时按 id 对账真实状态 */
+    ids?: string
   }): Promise<ImEnvelope<ImMessagesPage>> =>
     apiClient.get(`/im/conversations/${id}/messages`, {
       params, timeout: IM_REQUEST_TIMEOUT_MS,
@@ -2868,6 +2875,14 @@ export const imApi = {
     apiClient.delete(`/im/conversations/${conversationId}/messages/${messageId}`, {
       timeout: IM_REQUEST_TIMEOUT_MS,
     }) as any,
+
+  recallMessage: (conversationId: number, messageId: number): Promise<ImEnvelope<{
+    message: ImMessage; recalled: boolean
+  }>> =>
+    apiClient.post(
+      `/im/conversations/${conversationId}/messages/${messageId}/recall`,
+      undefined, { timeout: IM_REQUEST_TIMEOUT_MS },
+    ) as any,
 
   forwardMessages: (messageIds: number[], conversationIds: number[]): Promise<ImEnvelope<any>> =>
     apiClient.post('/im/messages/forward', {

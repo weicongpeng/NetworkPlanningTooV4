@@ -3,6 +3,7 @@
 使用独立 in-memory SQLite，不触碰仓库生产 data/data.db。
 """
 import base64
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastapi import HTTPException
@@ -178,6 +179,61 @@ def test_delete_message_only_own_and_group_scope(db):
     assert im_service.mark_read(db, conv, alice, 0)["unread"] == 1
 
 
+def test_recall_keeps_text_for_sender_only_and_enforces_window(db):
+    """撤回：双方都看到占位，原文只对发送者保留；5 分钟后服务端拒绝撤回。"""
+    ids = _users(db)
+    alice, bob = ids["alice"], ids["bob"]
+    conv = im_service.create_direct(db, alice, bob)["conversation"]["id"]
+    first = im_service.send_message(db, conv, alice, "text", "撤回原文")["message"]
+
+    result = im_service.recall_message(db, conv, first["id"], alice)
+    assert result["recalled"] is True
+    assert result["message"]["recalled"] is True
+    assert result["message"]["content_text"] == "撤回原文"
+
+    mine = next(m for m in im_service.list_messages(db, conv, alice)["items"]
+                if m["id"] == first["id"])
+    theirs = next(m for m in im_service.list_messages(db, conv, bob)["items"]
+                  if m["id"] == first["id"])
+    assert mine["recalled"] and mine["content_text"] == "撤回原文"
+    assert theirs["recalled"] is True and theirs["content_text"] is None
+    assert theirs["attachment"] is None
+    # WS 漏达时，按 id 对账能拿到服务端真实状态；不推进游标
+    by_ids = im_service.list_messages(db, conv, bob, ids=[first["id"]])
+    assert [m["id"] for m in by_ids["items"]] == [first["id"]]
+    assert by_ids["items"][0]["recalled"] is True
+    assert by_ids["items"][0]["content_text"] is None
+    assert by_ids["next_cursor"] is None and by_ids["prev_cursor"] is None
+    bob_conv = next(c for c in im_service.list_conversations(db, bob)["items"]
+                    if c["id"] == conv)
+    assert bob_conv["last_message"]["preview"] == "[消息已撤回]"
+
+    # 引用与转发都不泄露已撤回原文
+    quoted = im_service.send_message(
+        db, conv, bob, "text", "回复", reply_to_id=first["id"])["message"]
+    assert quoted["reply_to"]["preview"] == "[消息已撤回]"
+    target = im_service.create_custom_group(db, alice, "转发目标", [bob])["id"]
+    with pytest.raises(HTTPException):
+        im_service.forward_messages(db, alice, [first["id"]], [target])
+
+    # 不能撤回别人的消息；重复撤回幂等
+    theirs_msg = im_service.send_message(db, conv, bob, "text", "对方的")["message"]
+    with pytest.raises(HTTPException) as exc:
+        im_service.recall_message(db, conv, theirs_msg["id"], alice)
+    assert exc.value.status_code == 403
+    assert im_service.recall_message(db, conv, first["id"], alice)["recalled"] is True
+
+    # 超过 5 分钟即使前端误点了也拒绝
+    expired = im_service.send_message(db, conv, alice, "text", "超时消息")["message"]
+    row = db.query(im_service.ImMessage).filter(im_service.ImMessage.id == expired["id"]).first()
+    row.created_at = (datetime.now(timezone.utc) - timedelta(seconds=301)).isoformat()
+    db.commit()
+    with pytest.raises(HTTPException) as exc:
+        im_service.recall_message(db, conv, expired["id"], alice)
+    assert exc.value.status_code == 403
+    assert exc.value.detail == "IM_RECALL_EXPIRED"
+
+
 def test_custom_group_members_and_guard(db):
     ids = _users(db)
     group = im_service.create_custom_group(db, ids["alice"], "跨市项目", [ids["carol"]])
@@ -256,18 +312,43 @@ def test_contacts_only_expose_identity_projection(db):
     assert any(g["is_auto"] for g in contacts["groups"])
 
 
-def test_attachment_rejects_dangerous_type_and_oversize(db, tmp_path):
+def test_attachment_rejects_dangerous_type_and_oversize(db, tmp_path, monkeypatch):
     ids = _users(db)
     conv_id = im_service.create_direct(db, ids["alice"], ids["bob"])["conversation"]["id"]
     with pytest.raises(HTTPException) as exc:
         im_attachment_service.start_upload(
             db, ids["alice"], conv_id, "setup.exe", "application/octet-stream", 100)
     assert exc.value.detail == "IM_ATTACHMENT_TYPE"
+    monkeypatch.setattr(settings, "NPT_IM_MAX_FILE_MB", 20)
     with pytest.raises(HTTPException) as exc:
         im_attachment_service.start_upload(
-            db, ids["alice"], conv_id, "big.xlsx", "application/octet-stream", 999 * 1024 * 1024)
+            db, ids["alice"], conv_id, "big.xlsx", "application/octet-stream", 21 * 1024 * 1024)
     assert exc.value.detail == "IM_ATTACHMENT_TOO_LARGE"
     assert im_attachment_service.clean_filename("../../etc/passwd") == "passwd"
+
+
+def test_remote_attachment_local_cache(db, monkeypatch):
+    """共享模式云端附件首次下载后落本地，二次读取不再走公网 relay。"""
+    payload = b"zip-content" * 100
+    im_attachment_service.write_remote_cache(
+        77, False, payload, "application/zip", "安装包.zip")
+    assert im_attachment_service.read_remote_cache(77, False) == (
+        payload, "application/zip", "安装包.zip")
+    assert im_attachment_service.read_remote_cache(77, True) is None
+    monkeypatch.setattr(settings, "NPT_IM_LOCAL_ATTACHMENT_CACHE_MB", 0)
+    assert im_attachment_service.read_remote_cache(77, False) is None
+
+
+def test_attachment_allows_large_zip_with_2mb_chunks(db, monkeypatch):
+    """176MB 级安装包走 2MB 分片，默认上限内可创建上传会话。"""
+    ids = _users(db)
+    conv_id = im_service.create_direct(db, ids["alice"], ids["bob"])["conversation"]["id"]
+    monkeypatch.setattr(settings, "NPT_IM_MAX_FILE_MB", 200)
+    size = 176 * 1024 * 1024 + int(0.3 * 1024 * 1024)
+    started = im_attachment_service.start_upload(
+        db, ids["alice"], conv_id, "Umi-OCR_Paddle_v2.1.5.zip", "application/zip", size)
+    assert started["chunk_size"] == 2 * 1024 * 1024
+    assert started["total_chunks"] == 89
 
 
 def test_attachment_upload_then_send_file_message(db):

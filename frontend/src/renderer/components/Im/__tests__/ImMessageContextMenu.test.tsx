@@ -20,15 +20,15 @@ const message: ImMessage = {
 describe('ImMessageContextMenu', () => {
   it('自己的消息提供复制 / 引用 / 多选 / 转发 / 删除五项并回调当前消息', () => {
     const actions = {
-      onCopy: vi.fn(), onQuote: vi.fn(), onMultiSelect: vi.fn(),
+      onCopy: vi.fn(), onRecall: vi.fn(), onQuote: vi.fn(), onMultiSelect: vi.fn(),
       onForward: vi.fn(), onDelete: vi.fn(),
     }
     render(
       <ImMessageContextMenu
-        state={{ message, x: 40, y: 60 }} onClose={vi.fn()} canDelete {...actions}
+        state={{ message, x: 40, y: 60 }} onClose={vi.fn()} canDelete canRecall={false} {...actions}
       />,
     )
-    for (const label of ['复制', '引用', '多选', '转发', '删除']) {
+    for (const label of ['复制', '撤回', '引用', '多选', '转发', '删除']) {
       expect(screen.getByText(label)).toBeTruthy()
     }
     fireEvent.click(screen.getByText('引用'))
@@ -37,17 +37,67 @@ describe('ImMessageContextMenu', () => {
     expect(actions.onDelete).toHaveBeenCalledWith(message)
   })
 
+  it('撤回项可置灰，置灰后点击不触发撤回', () => {
+    const onRecall = vi.fn()
+    const noop = vi.fn()
+    const { rerender } = render(
+      <ImMessageContextMenu
+        state={{ message, x: 40, y: 60 }} onClose={vi.fn()} canRecall={false}
+        onCopy={noop} onRecall={onRecall} onQuote={noop}
+        onMultiSelect={noop} onForward={noop} onDelete={noop}
+      />,
+    )
+    const recall = screen.getByText('撤回').closest('button') as HTMLButtonElement
+    expect(recall.disabled).toBe(true)
+    fireEvent.click(recall)
+    expect(onRecall).not.toHaveBeenCalled()
+
+    rerender(
+      <ImMessageContextMenu
+        state={{ message, x: 40, y: 60 }} onClose={vi.fn()} canRecall
+        onCopy={noop} onRecall={onRecall} onQuote={noop}
+        onMultiSelect={noop} onForward={noop} onDelete={noop}
+      />,
+    )
+    fireEvent.click(screen.getByText('撤回'))
+    expect(onRecall).toHaveBeenCalledWith(message)
+  })
+
+  it('桌面端附件消息提供“在文件夹中显示”', () => {
+    const onRevealFile = vi.fn()
+    const noop = vi.fn()
+    const fileMessage: ImMessage = {
+      ...message, kind: 'file',
+      attachment: {
+        id: 12, original_name: '包.zip', mime: 'application/zip',
+        size_bytes: 1024, has_thumb: false,
+      },
+    }
+    render(
+      <ImMessageContextMenu
+        state={{ message: fileMessage, x: 40, y: 60 }} onClose={vi.fn()}
+        canRevealFile onCopy={noop} onRevealFile={onRevealFile}
+        onRecall={noop} onQuote={noop} onMultiSelect={noop}
+        onForward={noop} onDelete={noop}
+      />,
+    )
+    fireEvent.click(screen.getByText('在文件夹中显示'))
+    expect(onRevealFile).toHaveBeenCalledWith(fileMessage)
+  })
+
   it('对方的消息不显示删除项', () => {
     const onDelete = vi.fn()
     const noop = vi.fn()
     render(
       <ImMessageContextMenu
         state={{ message, x: 40, y: 60 }} onClose={vi.fn()} canDelete={false}
-        onCopy={noop} onQuote={noop} onMultiSelect={noop} onForward={noop} onDelete={onDelete}
+        onCopy={noop} onRecall={noop} onQuote={noop} onMultiSelect={noop}
+        onForward={noop} onDelete={onDelete}
       />,
     )
     expect(screen.getByText('复制')).toBeTruthy()
     expect(screen.queryByText('删除')).toBeNull()
+    expect(screen.queryByText('撤回')).toBeNull()
   })
 
   it('点击菜单外部或按 Esc 关闭', () => {
@@ -56,7 +106,8 @@ describe('ImMessageContextMenu', () => {
     render(
       <ImMessageContextMenu
         state={{ message, x: 40, y: 60 }} onClose={onClose}
-        onCopy={noop} onQuote={noop} onMultiSelect={noop} onForward={noop} onDelete={noop}
+        onCopy={noop} onRecall={noop} onQuote={noop} onMultiSelect={noop}
+        onForward={noop} onDelete={noop}
       />,
     )
     fireEvent.mouseDown(document.body)
