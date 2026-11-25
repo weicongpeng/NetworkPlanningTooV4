@@ -114,6 +114,9 @@ interface ImState {
   /** pollWhenClosed：桌面共享模式没有 WS 广播，窗口收起时也要继续感知新消息（未读 + 提示音） */
   startPolling: (intervalMs?: number, pollWhenClosed?: boolean) => void
   stopPolling: () => void
+  /** 通讯录/在线状态独立低频校准：云 WS active 停掉消息轮询后仍继续自愈 */
+  startContactsPolling: (intervalMs?: number) => void
+  stopContactsPolling: () => void
   resetForUserSwitch: () => void
 }
 
@@ -300,6 +303,12 @@ function buildGroupConversation(group: ImGroup): ImConversation {
 let pollTimer: number | null = null
 let refreshTimer: number | null = null
 let refreshQueued = false
+/**
+ * 通讯录专用低频校准定时器。与 1.5s 消息轮询解耦：桌面共享模式云 WS 鉴权成功后
+ * 会 stopPolling()，若通讯录仍挂在那个定时器上，启动/断联期一次失败就永久空态。
+ */
+let contactsTimer: number | null = null
+let contactsInFlight = false
 /**
  * 本轮窗口会话中用户**真正点开过**的会话。
  * 不能再拿 activeConversationId + open 判断已读：窗口重新展开后仍停留在上次会话，
@@ -614,9 +623,13 @@ export const useImStore = create<ImState>()(
 
       refreshContacts: async () => {
         const response = await imApi.contacts()
-        const contacts = response?.data || null
+        // 与 refreshConversations 同口径：relay 繁忙/限流时拦截器返回 {success:false}，
+        // 一次失败不能把通讯录清成「暂无联系人」，保留上次成功结果等下个 tick 重试。
+        if (response && response.success === false) return
+        const contacts = response?.data
+        if (!contacts || !Array.isArray(contacts.users)) return
         const online = { ...get().online }
-        contacts?.users?.forEach((user: ImUser) => { online[user.id] = user.is_online })
+        contacts.users.forEach((user: ImUser) => { online[user.id] = user.is_online })
         set({ contacts, online })
       },
 
@@ -1208,6 +1221,9 @@ export const useImStore = create<ImState>()(
       resync: () => {
         const state = get()
         void state.refreshConversations().catch(() => {})
+        // 重连后必须一起补通讯录：断线期间它可能一次都没拉到（contacts=null），
+        // 而桌面云 WS active 又会停掉消息轮询，漏掉这里就只能靠重启恢复。
+        void state.refreshContacts().catch(() => {})
         // WS / 云 WS 重连后要补齐断线期间所有已知会话的消息，不只当前激活会话。
         // 只补拉已有游标的会话，避免刚启动时把每个会话都全量拉一遍。
         const ids = new Set<number>(Object.keys(state.cursors).map(Number))
@@ -1217,16 +1233,12 @@ export const useImStore = create<ImState>()(
 
       startPolling: (intervalMs = 8000, pollWhenClosed = false) => {
         if (pollTimer !== null) return
-        let ticks = 0
-        // 通讯录/在线状态固定约 20s 校准一次，不随会话列表轮询变快而放大请求量
-        const contactsEveryTicks = Math.max(4, Math.ceil(20000 / intervalMs))
         /** 上一轮还没回来就跳过：在途请求最多一轮，连接始终留给窗口控制等交互请求 */
         const runPoll = () => {
           if (pollInFlight) return
           const state = useImStore.getState()
           const jobs: Promise<void>[] = [state.refreshConversations()]
-          ticks += 1
-          if (ticks % contactsEveryTicks === 0) jobs.push(state.refreshContacts())
+          // 通讯录已拆成独立的 startContactsPolling()，不能随这里一起被云 WS 停掉
           // 窗口收起时只刷会话列表（未读 + 提示音），不补拉当前会话正文
           if (state.open && state.activeConversationId !== null) {
             jobs.push(state.loadMessages(state.activeConversationId, 'incremental'))
@@ -1273,8 +1285,27 @@ export const useImStore = create<ImState>()(
         viewedConversationId = null
       },
 
+      startContactsPolling: (intervalMs = 20000) => {
+        if (contactsTimer !== null) return
+        // 固定低频、单飞：断联期间失败只跳过本轮，恢复后下个 tick 自然补齐；
+        // 不走 pollInFlight，避免与 1.5s 消息轮询互相挤占 relay 槽位。
+        contactsTimer = window.setInterval(() => {
+          if (contactsInFlight) return
+          contactsInFlight = true
+          void useImStore.getState().refreshContacts()
+            .catch(() => {})
+            .finally(() => { contactsInFlight = false })
+        }, intervalMs)
+      },
+
+      stopContactsPolling: () => {
+        if (contactsTimer !== null) { window.clearInterval(contactsTimer); contactsTimer = null }
+        contactsInFlight = false
+      },
+
       resetForUserSwitch: () => {
         get().stopPolling()
+        get().stopContactsPolling()
         viewedConversationId = null
         // 灯箱的 objectURL 由 ImImageLightbox 自己持有并在卸载时 revoke，此处只清状态
         // 群成员名单与 @ 去重记录都按账号隔离，切账号必须一起清掉
@@ -1302,6 +1333,8 @@ export const useImStore = create<ImState>()(
 
 /** ImHost 挂载时注册全局 WS 事件；返回清理函数。 */
 export function attachImEvents(): () => void {
+  // 通讯录独立低频校准：即使桌面云 WS active 停掉了消息轮询，断联后仍能自愈
+  useImStore.getState().startContactsPolling()
   const onMessage = (event: Event) => {
     const detail = (event as CustomEvent).detail || {}
     // 服务端 notify_im_message 只推给「除发送者外的成员」，这里再兜底过滤一次，
@@ -1341,5 +1374,6 @@ export function attachImEvents(): () => void {
     window.removeEventListener(IM_PRESENCE_EVENT, onPresence)
     window.removeEventListener(IM_RESYNC_EVENT, onResync)
     useImStore.getState().stopPolling()
+    useImStore.getState().stopContactsPolling()
   }
 }

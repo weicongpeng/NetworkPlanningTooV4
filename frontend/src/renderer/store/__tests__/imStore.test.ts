@@ -699,6 +699,46 @@ describe('imStore', () => {
     expect(useImStore.getState().conversations).toHaveLength(1)
   })
 
+  it('通讯录刷新失败（relay 繁忙/限流）时保留上次结果，不再退回「暂无联系人」', async () => {
+    const previous = {
+      users: [{ id: 5, username: 'bob', is_online: false, city: '', operator: '' }],
+      groups: [], online_count: 0, server_time: '',
+    }
+    useImStore.setState({ contacts: previous } as any)
+    vi.mocked(imApi.contacts).mockResolvedValueOnce({
+      success: false, message: 'IM_RELAY_BUSY', code: 503,
+    } as any)
+    await useImStore.getState().refreshContacts()
+    expect(useImStore.getState().contacts).toBe(previous)
+  })
+
+  it('重连补拉通讯录，且通讯录轮询不随消息轮询一起被停掉', async () => {
+    vi.useFakeTimers()
+    vi.mocked(imApi.contacts).mockResolvedValue({ success: true, data: {
+      users: [], groups: [], online_count: 0, server_time: '',
+    } } as any)
+    useImStore.getState().startContactsPolling(1000)
+    vi.advanceTimersByTime(1000)
+    expect(imApi.contacts).toHaveBeenCalledTimes(1)
+    await flushMicrotasks()
+
+    // 桌面云 WS active 会停掉消息轮询：通讯录仍要继续校准，否则断联后永久空态
+    useImStore.getState().stopPolling()
+    vi.advanceTimersByTime(1000)
+    expect(imApi.contacts).toHaveBeenCalledTimes(2)
+    await flushMicrotasks()
+
+    useImStore.getState().stopContactsPolling()
+    vi.advanceTimersByTime(1000)
+    expect(imApi.contacts).toHaveBeenCalledTimes(2)
+
+    vi.mocked(imApi.contacts).mockClear()
+    useImStore.getState().resync()
+    await flushMicrotasks()
+    expect(imApi.contacts).toHaveBeenCalledTimes(1)
+    vi.useRealTimers()
+  })
+
   it('桌面端页面隐藏仍轮询未读，窗口重新可见时立即补刷一次', async () => {
     vi.useFakeTimers()
     vi.mocked(imApi.conversations).mockResolvedValue(conversationsPage([]) as any)

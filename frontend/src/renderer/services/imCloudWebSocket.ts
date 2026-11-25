@@ -60,7 +60,10 @@ class ImCloudWebSocketClient {
 
     this.stopped = false
     if (!cfg.enabled || !cfg.url || !cfg.license_file || !cfg.machine_code) {
+      // 本机端点瞬时不可用 / Tunnel 抖动时不能永久停在降级态：退避重试，
+      // 否则要等退出桌面端重启才能重新鉴权、广播在线。
       this.notifyFallback()
+      this.scheduleRetry()
       return
     }
     this.config = cfg as ActiveConfig
