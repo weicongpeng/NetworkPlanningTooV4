@@ -241,8 +241,10 @@ export function ImChatPanel({ conversation, pendingPeer, narrow, onBack }: Props
   /** 桌面端：后台缓存附件，完成后自动在文件管理器中定位 */
   const revealFile = async (message: ImMessage) => {
     if (!message.attachment?.id) return
-    await downloadAttachment(message, true)
-    useToastStore.getState().show(t('im.message.revealStarted', '已开始下载，完成后将打开文件夹'))
+    const ok = await downloadAttachment(message, true)
+    useToastStore.getState().show(ok
+      ? t('im.message.revealStarted', '已完成下载，正在打开文件夹')
+      : t('im.message.revealFailed', '附件下载失败'))
   }
 
   // 以下回调全部 useCallback 稳定：ImMessageItem 是 memo 组件，每次渲染新建闭包

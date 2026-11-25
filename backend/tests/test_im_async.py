@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import base64
+import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
@@ -188,6 +190,46 @@ def test_shared_attachment_bytes_falls_back_to_legacy(monkeypatch):
         7, False, object(), SimpleNamespace(id=3))
     assert content == b"legacy" and mime == "image/png" and filename == "old.png"
     assert calls == ["attachment_urls", "attachment_download"]
+
+
+def test_download_job_shared_mode_uses_relay(monkeypatch, tmp_path):
+    """共享模式附件在云端：后台下载必须走 relay，不能查本机 ImAttachment。"""
+    from app.core.config import settings
+    from app.services import im_download_jobs
+
+    calls = []
+
+    def _fake_forward(op, args, timeout=None):
+        calls.append(op)
+        if op == "attachment_urls":
+            return {"tokens": {"9:0": {"token": "t", "path": "/api/v1/im/attachments/signed/9"}}}
+        return {"content_b64": base64.b64encode(b"data").decode(),
+                "mime": "application/zip", "filename": "x.zip"}
+
+    def _fake_stream(info, target, on_progress):
+        target.write_bytes(b"data")
+        on_progress(100)
+        return "application/zip", "x.zip", 4
+
+    monkeypatch.setattr(settings, "DESKTOP_PROFILE", "shared")
+    monkeypatch.setattr(im_download_jobs.im_desktop_proxy, "forward", _fake_forward)
+    monkeypatch.setattr(
+        im_download_jobs.im_desktop_proxy, "stream_signed_attachment_to_file", _fake_stream)
+    monkeypatch.setattr(im_download_jobs.desktop_im_storage,
+                        "effective_attachment_dir", lambda: tmp_path / "im")
+    monkeypatch.setattr(im_download_jobs, "SessionLocal",
+                        lambda: SimpleNamespace(close=lambda: None))
+    monkeypatch.setattr(im_download_jobs.desktop_bridge, "reveal_path", lambda path: True)
+
+    im_download_jobs.start(1, 9, "x.zip", reveal=True)
+    for _ in range(100):
+        result = im_download_jobs.status(1, 9)
+        if result["status"] != "running":
+            break
+        time.sleep(0.01)
+    assert result["status"] == "done"
+    assert calls[0] == "attachment_urls"
+    assert Path(result["path"]).read_bytes() == b"data"
 
 
 def test_relay_client_ip_prefers_cf_connecting_ip():

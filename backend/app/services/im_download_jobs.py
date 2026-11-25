@@ -80,7 +80,9 @@ def _run_job(key: Tuple[int, int], user_id: int, attachment_id: int,
 
         mime = "application/octet-stream"
         if settings.DESKTOP_PROFILE == "shared" or im_desktop_proxy.is_shared_desktop():
-            data = im_ops.run_local_op(db, user_id, "attachment_urls", {
+            # 共享模式的附件只存在云端：必须和 im.py 的 _run 一样走 relay 转发，
+            # 直接 run_local_op 查不到本机 ImAttachment，下载会立刻失败。
+            data = im_desktop_proxy.forward("attachment_urls", {
                 "items": [{"attachment_id": attachment_id, "thumb": False}],
             })
             info = (data or {}).get("tokens", {}).get(f"{attachment_id}:0")
@@ -90,7 +92,7 @@ def _run_job(key: Tuple[int, int], user_id: int, attachment_id: int,
                         key, percent=max(2, int(p * 0.95)), phase="下载中"))
                 filename = resolved_name or filename
             else:
-                payload = im_ops.run_local_op(db, user_id, "attachment_download", {
+                payload = im_desktop_proxy.forward("attachment_download", {
                     "attachment_id": attachment_id, "thumb": False,
                 })
                 content = base64.b64decode(payload["content_b64"])

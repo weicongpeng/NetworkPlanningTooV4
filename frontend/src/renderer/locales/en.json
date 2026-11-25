@@ -285,6 +285,7 @@
       "messages": "Failed to load messages",
       "send": "Failed to send message",
       "file": "Failed to send attachment — it has been put back in the pending list",
+      "downloadFailed": "Failed to download attachment, please retry",
       "conversation": "Failed to start conversation",
       "group": "Failed to create group",
       "rateLimited": "Too many requests, please try again shortly",

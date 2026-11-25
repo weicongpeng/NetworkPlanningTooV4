@@ -97,7 +97,7 @@ interface ImState {
   /** 返回发送失败的 File，供输入区把它们放回待发送列表 */
   sendFiles: (files: File[]) => Promise<File[]>
   /** 桌面端后台缓存附件；reveal=true 时完成后在文件管理器定位 */
-  downloadAttachment: (message: ImMessage, reveal?: boolean) => Promise<void>
+  downloadAttachment: (message: ImMessage, reveal?: boolean) => Promise<boolean>
   setAttachmentDownloadMode: (mode: 'manual' | 'auto') => void
   /** 编辑后的图片直接发送到多个目标会话，不切换当前会话 */
   sendImageToConversations: (
@@ -1000,7 +1000,7 @@ export const useImStore = create<ImState>()(
 
       downloadAttachment: async (message, reveal = false) => {
         const attachment = message.attachment
-        if (!attachment?.id) return
+        if (!attachment?.id) return false
         const name = attachment.original_name || `attachment-${attachment.id}`
         set({ downloadProgress: { name, percent: 0, phase: '准备下载' } })
         try {
@@ -1025,9 +1025,11 @@ export const useImStore = create<ImState>()(
           })
           if (reveal) await imApi.revealAttachment(attachment.id)
           setImError(`file:${message.conversation_id}`, null)
+          return true
         } catch (error) {
           console.warn('[IM] cache attachment failed', name, error)
-          setImError(`file:${message.conversation_id}`, errorMessage(error, 'im.error.file'))
+          setImError(`file:${message.conversation_id}`, errorMessage(error, 'im.error.downloadFailed'))
+          return false
         } finally {
           set({ downloadProgress: null })
         }

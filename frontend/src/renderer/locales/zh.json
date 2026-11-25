@@ -285,6 +285,7 @@
       "messages": "加载消息失败",
       "send": "消息发送失败",
       "file": "附件发送失败，已放回待发送列表",
+      "downloadFailed": "附件下载失败，请重试",
       "conversation": "发起会话失败",
       "group": "创建群组失败",
       "rateLimited": "操作过于频繁，请稍后重试",
