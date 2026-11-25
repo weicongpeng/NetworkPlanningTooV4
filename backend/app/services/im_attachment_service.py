@@ -129,6 +129,26 @@ def write_remote_cache(attachment_id: int, thumb: bool,
     _prune_remote_cache()
 
 
+def write_remote_cache_file(attachment_id: int, thumb: bool,
+                            source: Path, mime: str, filename: str) -> None:
+    """把已落盘的附件流式复制进本地缓存，避免大文件再次整块读入内存。"""
+    import shutil
+
+    if int(getattr(settings, "NPT_IM_LOCAL_ATTACHMENT_CACHE_MB", 0)) <= 0:
+        return
+    folder = _remote_cache_folder(attachment_id, thumb)
+    folder.mkdir(parents=True, exist_ok=True)
+    data_path = folder / "data.bin"
+    tmp = folder / "data.part"
+    shutil.copyfile(source, tmp)
+    tmp.replace(data_path)
+    (folder / "meta.json").write_text(
+        json.dumps({"mime": mime, "filename": filename}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    _prune_remote_cache()
+
+
 def _attachment_signature(attachment_id: int, user_id: int,
                           thumb: bool, expires_at: int) -> str:
     payload = f"{int(attachment_id)}|{int(user_id)}|{1 if thumb else 0}|{int(expires_at)}"

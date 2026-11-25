@@ -1681,6 +1681,10 @@ class ImStoragePathRequest(BaseModel):
     path: str = Field(..., max_length=1024, description="新的聊天附件本地保存目录（绝对路径）")
 
 
+class ImDownloadModeRequest(BaseModel):
+    mode: str = Field(..., pattern="^(manual|auto)$", description="manual=点击下载；auto=收到即缓存")
+
+
 @router.post("/window-control")
 async def desktop_window_control(
     payload: WindowControlRequest,
@@ -1780,6 +1784,17 @@ async def desktop_im_storage_clean(
     """清理临时分片、未引用孤立文件与旧的输入附件临时副本（不动消息与正式附件）。"""
     result = await run_in_threadpool(desktop_im_storage.cleanup_now, db)
     return {"success": True, "data": result}
+
+
+@router.post("/im-storage/download-mode")
+async def desktop_im_storage_download_mode(
+    payload: ImDownloadModeRequest,
+    _: None = Depends(_require_desktop),
+    __: User = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """设置聊天附件下载方式；默认 manual，设置按 shared/standalone 分档保存。"""
+    mode = await run_in_threadpool(desktop_im_storage.set_download_mode, payload.mode)
+    return {"success": True, "data": {"mode": mode}}
 
 
 @router.post("/im-storage/pick-directory")

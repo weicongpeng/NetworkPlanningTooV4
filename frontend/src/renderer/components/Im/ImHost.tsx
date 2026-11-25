@@ -114,6 +114,16 @@ export function ImHost() {
   }, [user?.id])
 
   useEffect(() => {
+    if (!desktopMode) return
+    void desktopLoginApi.imStorageState().then((res: any) => {
+      const mode = res.data?.attachment_download_mode
+      if (mode === 'auto' || mode === 'manual') {
+        useImStore.getState().setAttachmentDownloadMode(mode)
+      }
+    }).catch(() => { /* 老后端无该字段时保持默认手动 */ })
+  }, [desktopMode])
+
+  useEffect(() => {
     // 单机模式没有跨用户通信能力：不注册事件、不请求、不轮询
     if (!user || standalone) return
     const detach = attachImEvents()

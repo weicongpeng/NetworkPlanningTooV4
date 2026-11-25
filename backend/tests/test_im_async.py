@@ -179,6 +179,11 @@ def test_shared_attachment_bytes_falls_back_to_legacy(monkeypatch):
                 "mime": "image/png", "filename": "old.png"}
 
     monkeypatch.setattr(im_endpoint, "_run", _fake_run)
+    # 本机可能已有真实缓存，隔离掉后端本地 LRU 才能验证回退链路
+    monkeypatch.setattr(
+        im_endpoint.im_attachment_service, "read_remote_cache", lambda *args: None)
+    monkeypatch.setattr(
+        im_endpoint.im_attachment_service, "write_remote_cache", lambda *args: None)
     content, mime, filename = im_endpoint._shared_attachment_bytes(
         7, False, object(), SimpleNamespace(id=3))
     assert content == b"legacy" and mime == "image/png" and filename == "old.png"

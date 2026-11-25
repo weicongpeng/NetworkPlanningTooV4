@@ -778,6 +778,7 @@ export const desktopLoginApi = {
   imStorageState: async (): Promise<ApiResponse<{
     path: string; default_path: string; customized: boolean; profile: string
     mode: 'shared' | 'standalone'; remote_attachments: boolean
+    attachment_download_mode: 'manual' | 'auto'
     usage: { attachments: { files: number; bytes: number }
              open_temp: { files: number; bytes: number }
              total_files: number; total_bytes: number }
@@ -786,6 +787,10 @@ export const desktopLoginApi = {
   /** 修改本地保存路径并整体迁移已有附件 */
   imStorageSetPath: async (path: string): Promise<ApiResponse<unknown>> =>
     apiClient.post('/desktop/im-storage/path', { path }) as any,
+
+  /** 设置收到附件时自动缓存还是点击后再下载 */
+  imStorageSetDownloadMode: async (mode: 'manual' | 'auto'): Promise<ApiResponse<{ mode: string }>> =>
+    apiClient.post('/desktop/im-storage/download-mode', { mode }) as any,
 
   /** 清理本机临时文件与图片缓存 */
   imStorageClean: async (): Promise<ApiResponse<{
@@ -2841,7 +2846,20 @@ export const imApi = {
   openAttachment: (id: number): Promise<ImEnvelope<{ opened: boolean; path: string }>> =>
     apiClient.post(`/im/attachments/${id}/open`) as any,
 
-  /** 桌面端：把附件保存到本地下载目录，并在系统文件管理器中选中 */
+  /** 桌面端：后台缓存附件到本机下载目录，返回任务状态 */
+  startAttachmentCache: (attachmentId: number, filename: string, reveal = false): Promise<ImEnvelope<{
+    status: 'running' | 'done' | 'failed'; percent: number; phase: string
+    path: string; error: string
+  }>> => apiClient.post('/im/attachments/cache', {
+    attachment_id: attachmentId, filename, reveal,
+  }) as any,
+
+  attachmentCacheStatus: (attachmentId: number): Promise<ImEnvelope<{
+    status: 'running' | 'done' | 'failed'; percent: number; phase: string
+    path: string; error: string
+  }>> => apiClient.get(`/im/attachments/${attachmentId}/cache`) as any,
+
+  /** 桌面端：在系统文件管理器中定位已缓存的附件 */
   revealAttachment: (id: number): Promise<ImEnvelope<{ revealed: boolean; path: string }>> =>
     apiClient.post(`/im/attachments/${id}/reveal`) as any,
 

@@ -11,7 +11,8 @@ vi.mock('../../services/api', () => ({
     markRead: vi.fn(), createConversation: vi.fn(), createGroup: vi.fn(),
     uploadAttachment: vi.fn(), downloadAttachment: vi.fn(), members: vi.fn(),
     deleteMessage: vi.fn(), recallMessage: vi.fn(), forwardMessages: vi.fn(),
-    prewarmAttachmentUrls: vi.fn(),
+    prewarmAttachmentUrls: vi.fn(), startAttachmentCache: vi.fn(),
+    attachmentCacheStatus: vi.fn(), revealAttachment: vi.fn(),
   },
 }))
 
@@ -466,6 +467,42 @@ describe('imStore', () => {
     const failed = await useImStore.getState().sendFiles([file])
     expect(failed).toEqual([file])
     expect(useImStore.getState().error).toBe('im.error.attachmentType')
+  })
+
+  it('桌面端附件缓存显示进度并在完成后定位文件', async () => {
+    vi.useFakeTimers()
+    try {
+      const fileMessage: ImMessage = {
+        ...message(1), kind: 'file',
+        attachment: {
+          id: 12, original_name: '包.zip', mime: 'application/zip',
+          size_bytes: 1024, has_thumb: false,
+        },
+      }
+      vi.mocked(imApi.startAttachmentCache).mockResolvedValue({
+        success: true, data: { status: 'running', percent: 0, phase: '准备', path: '', error: '' },
+      } as any)
+      vi.mocked(imApi.attachmentCacheStatus)
+        .mockResolvedValueOnce({ success: true, data: {
+          status: 'running', percent: 40, phase: '下载中', path: '', error: '',
+        } } as any)
+        .mockResolvedValueOnce({ success: true, data: {
+          status: 'done', percent: 100, phase: '完成', path: 'D:\\downloads\\包.zip', error: '',
+        } } as any)
+      vi.mocked(imApi.revealAttachment).mockResolvedValue({
+        success: true, data: { revealed: true, path: 'D:\\downloads\\包.zip' },
+      } as any)
+
+      const pending = useImStore.getState().downloadAttachment(fileMessage, true)
+      await vi.advanceTimersByTimeAsync(300)
+      await vi.advanceTimersByTimeAsync(300)
+      await pending
+      expect(imApi.startAttachmentCache).toHaveBeenCalledWith(12, '包.zip', true)
+      expect(imApi.revealAttachment).toHaveBeenCalledWith(12)
+      expect(useImStore.getState().downloadProgress).toBeNull()
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('编辑图片可直发多个会话，单个目标失败不影响其它目标', async () => {

@@ -75,6 +75,24 @@ def test_default_path_and_profile_config(env, monkeypatch):
     assert storage.effective_attachment_dir() == env["default"]
 
 
+def test_download_mode_defaults_manual_and_survives_path_change(env):
+    assert storage.download_mode() == "manual"
+    assert storage.current_state()["attachment_download_mode"] == "manual"
+    storage.set_download_mode("auto")
+    storage.save_path(env["root"] / "custom-im")
+    assert storage.download_mode() == "auto"
+    assert storage.current_state()["attachment_download_mode"] == "auto"
+    with pytest.raises(ValueError):
+        storage.set_download_mode("all")
+    assert storage.download_mode() == "auto"
+
+    res = env["client"].post(
+        "/api/v1/desktop/im-storage/download-mode", json={"mode": "manual"})
+    assert res.status_code == 200
+    assert res.json()["data"] == {"mode": "manual"}
+    assert storage.download_mode() == "manual"
+
+
 @pytest.mark.parametrize("raw,code", [
     ("", "IM_STORAGE_PATH_REQUIRED"),
     ("relative/path", "IM_STORAGE_PATH_ABSOLUTE"),

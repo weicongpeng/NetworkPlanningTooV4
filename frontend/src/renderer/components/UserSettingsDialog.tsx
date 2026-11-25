@@ -83,6 +83,8 @@ export function UserSettingsDialog({ open, onClose, mode = 'app' }: Props) {
   const [storageBusy, setStorageBusy] = useState(false)
   const [cleanBusy, setCleanBusy] = useState(false)
   const [storageError, setStorageError] = useState('')
+  const [downloadMode, setDownloadMode] = useState<'manual' | 'auto'>('manual')
+  const [downloadModeBusy, setDownloadModeBusy] = useState(false)
 
   useEffect(() => {
     if (!open) return
@@ -107,6 +109,7 @@ export function UserSettingsDialog({ open, onClose, mode = 'app' }: Props) {
       setStorageDefault(res.data.default_path || '')
       setStorageUsage(res.data.usage || null)
       setRemoteAttachments(Boolean(res.data.remote_attachments))
+      setDownloadMode(res.data.attachment_download_mode === 'auto' ? 'auto' : 'manual')
       setStorageError('')
     }).catch(() => {
       if (!cancelled) setStorageError(t('im.storage.loadFailed', '读取本地存储设置失败'))
@@ -221,6 +224,22 @@ export function UserSettingsDialog({ open, onClose, mode = 'app' }: Props) {
       setStorageDefault(res.data.default_path || '')
       setStorageUsage(res.data.usage || null)
       setRemoteAttachments(Boolean(res.data.remote_attachments))
+      setDownloadMode(res.data.attachment_download_mode === 'auto' ? 'auto' : 'manual')
+    }
+  }
+
+  const applyDownloadMode = async (mode: 'manual' | 'auto') => {
+    setDownloadMode(mode)
+    setDownloadModeBusy(true)
+    setStorageError('')
+    try {
+      await desktopLoginApi.imStorageSetDownloadMode(mode)
+      useImStore.getState().setAttachmentDownloadMode(mode)
+      useToastStore.getState().show(t('im.storage.downloadModeSaved', '附件下载方式已保存'))
+    } catch (err) {
+      setStorageError(serverErrorText(err, 'im.storage.downloadModeFailed', '附件下载方式保存失败', tr))
+    } finally {
+      setDownloadModeBusy(false)
     }
   }
 
@@ -371,6 +390,27 @@ export function UserSettingsDialog({ open, onClose, mode = 'app' }: Props) {
                   {storageBusy && <Loader2 size={12} className="mr-1 inline animate-spin" />}
                   {t('im.storage.apply', '应用并迁移')}
                 </button>
+              </div>
+              <div className="rounded-xl border border-border/70 bg-background/40 px-3 py-2">
+                <p className="mb-1.5 text-[11px] font-medium text-foreground">
+                  {t('im.storage.downloadMode', '收到附件时')}
+                </p>
+                <div className="flex flex-wrap gap-3 text-[11px]">
+                  {(['manual', 'auto'] as const).map(mode => (
+                    <label key={mode} className="flex items-center gap-1.5 cursor-pointer">
+                      <input type="radio" name="im-download-mode" checked={downloadMode === mode}
+                             disabled={downloadModeBusy}
+                             onChange={() => void applyDownloadMode(mode)}
+                             className="accent-primary" />
+                      {mode === 'manual'
+                        ? t('im.storage.downloadManual', '点击后下载（默认）')
+                        : t('im.storage.downloadAuto', '自动下载到本地')}
+                    </label>
+                  ))}
+                </div>
+                <p className="mt-1 text-[10px] leading-relaxed text-muted-foreground">
+                  {t('im.storage.downloadModeHint', '自动下载会在收到对方附件后缓存到本机下载目录；手动模式可点文件旁按钮或右键“在文件夹中显示”。')}
+                </p>
               </div>
               <div className="flex items-center justify-between rounded-xl border border-border/70 bg-background/40 px-3 py-2">
                 <span className="text-[11px] text-muted-foreground">

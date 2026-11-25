@@ -30,7 +30,8 @@ from app.core.database import get_db
 from app.core.security import get_current_user
 from app.models.database import User
 from app.services import (
-    desktop_im_storage, im_attachment_service, im_desktop_proxy, im_ops, im_service,
+    desktop_im_storage, im_attachment_service, im_desktop_proxy, im_download_jobs,
+    im_ops, im_service,
 )
 
 router = APIRouter(tags=["协作沟通"])
@@ -121,6 +122,12 @@ class AttachmentChunkRequest(BaseModel):
 
 class AttachmentIdRequest(BaseModel):
     upload_id: str
+
+
+class AttachmentCacheRequest(BaseModel):
+    attachment_id: int = Field(..., gt=0)
+    filename: str = Field("", max_length=255)
+    reveal: bool = False
 
 
 class AttachmentUrlItem(BaseModel):
@@ -464,35 +471,39 @@ def open_attachment(attachment_id: int, db: Session = Depends(get_db),
     return _ok({"opened": True, "path": str(target)})
 
 
-@router.post("/attachments/{attachment_id}/reveal")
-def reveal_attachment(attachment_id: int, db: Session = Depends(get_db),
-                      user: User = Depends(get_current_user)):
-    """桌面端：把聊天附件落到本地下载目录，并在系统文件管理器中选中。"""
+@router.post("/attachments/cache")
+def start_attachment_cache(payload: AttachmentCacheRequest,
+                           user: User = Depends(get_current_user)):
+    """桌面端：后台缓存附件到本机下载目录（重复点击复用同一任务）。"""
     if not settings.NPT_DESKTOP:
         raise HTTPException(status_code=404, detail="Not Found")
-    if im_desktop_proxy.is_shared_desktop():
-        content, _, filename = _shared_attachment_bytes(attachment_id, False, db, user)
-    else:
-        att = im_service.get_attachment_for_member(db, attachment_id, user.id)
-        path, _ = im_attachment_service.resolve_path(att.storage_path)
-        content = path.read_bytes()
-        filename = att.original_name
+    return _ok(im_download_jobs.start(
+        int(user.id), payload.attachment_id, payload.filename, payload.reveal))
 
-    out_dir = desktop_im_storage.effective_attachment_dir().parent / "downloads"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    safe_name = im_attachment_service.clean_filename(filename)
-    target = out_dir / safe_name
-    suffix = target.suffix
-    stem = target.stem
-    index = 1
-    while target.exists():
-        target = out_dir / f"{stem}-{index}{suffix}"
-        index += 1
-    target.write_bytes(content)
-    return _ok({
-        "revealed": desktop_bridge.reveal_path(str(target)),
-        "path": str(target),
-    })
+
+@router.get("/attachments/{attachment_id}/cache")
+def attachment_cache_status(attachment_id: int,
+                            user: User = Depends(get_current_user)):
+    """桌面端：查询后台缓存进度，供前端显示进度条。"""
+    if not settings.NPT_DESKTOP:
+        raise HTTPException(status_code=404, detail="Not Found")
+    return _ok(im_download_jobs.status(int(user.id), attachment_id))
+
+
+@router.post("/attachments/{attachment_id}/reveal")
+def reveal_attachment(attachment_id: int,
+                      user: User = Depends(get_current_user)):
+    """桌面端：在本地已缓存的附件上调用系统文件管理器定位。"""
+    if not settings.NPT_DESKTOP:
+        raise HTTPException(status_code=404, detail="Not Found")
+    try:
+        return _ok(im_download_jobs.reveal_cached(int(user.id), attachment_id))
+    except HTTPException as exc:
+        if exc.status_code != 409:
+            raise
+        # 兼容未先调用 /cache 的旧前端：后台缓存完成后自动定位
+        return _ok(im_download_jobs.start(
+            int(user.id), attachment_id, f"attachment-{attachment_id}", reveal=True))
 
 
 def _attachment_headers(filename: str, thumb: bool) -> Dict[str, str]:

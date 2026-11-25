@@ -55,6 +55,10 @@ interface ImState {
   errorScope: string | null
   sending: boolean
   uploadProgress: { name: string; percent: number } | null
+  /** 桌面端后台附件缓存进度 */
+  downloadProgress: { name: string; percent: number; phase: string } | null
+  /** 桌面端附件下载方式，默认手动点击 */
+  attachmentDownloadMode: 'manual' | 'auto'
   lightbox: ImLightboxSource | null
   /** 当前正在引用的历史消息；发送成功后自动清空 */
   replyTo: ImMessage | null
@@ -92,6 +96,9 @@ interface ImState {
   sendText: (text: string, mention?: ImSendMention) => Promise<boolean>
   /** 返回发送失败的 File，供输入区把它们放回待发送列表 */
   sendFiles: (files: File[]) => Promise<File[]>
+  /** 桌面端后台缓存附件；reveal=true 时完成后在文件管理器定位 */
+  downloadAttachment: (message: ImMessage, reveal?: boolean) => Promise<void>
+  setAttachmentDownloadMode: (mode: 'manual' | 'auto') => void
   /** 编辑后的图片直接发送到多个目标会话，不切换当前会话 */
   sendImageToConversations: (
     file: File, conversationIds: number[],
@@ -473,6 +480,8 @@ const initialState = {
   errorScope: null,
   sending: false,
   uploadProgress: null,
+  downloadProgress: null,
+  attachmentDownloadMode: 'manual' as const,
   lightbox: null,
   replyTo: null,
   groupDialog: false,
@@ -805,6 +814,14 @@ export const useImStore = create<ImState>()(
           }))
           setImError(`messages:${id}`, null) // 同一会话重试成功后立即撤掉繁忙提示
           persistSnapshot(id)
+          // 自动下载模式：对方新到附件立即后台缓存；手动模式只有点击才下载
+          if (get().attachmentDownloadMode === 'auto') {
+            incoming.forEach(item => {
+              if (item.attachment?.id && !item.recalled && item.sender_id !== myId) {
+                void get().downloadAttachment(item)
+              }
+            })
+          }
           // 一页历史消息里的图片批量换签名 URL：一次 relay 控制请求覆盖整页，
           // 避免每张缩略图各发一次（共享模式公网往返是主要耗时）。
           void imApi.prewarmAttachmentUrls?.(
@@ -980,6 +997,43 @@ export const useImStore = create<ImState>()(
         await get().refreshConversations().catch(() => {})
         return failed
       },
+
+      downloadAttachment: async (message, reveal = false) => {
+        const attachment = message.attachment
+        if (!attachment?.id) return
+        const name = attachment.original_name || `attachment-${attachment.id}`
+        set({ downloadProgress: { name, percent: 0, phase: '准备下载' } })
+        try {
+          await imApi.startAttachmentCache(attachment.id, name, reveal)
+          await new Promise<void>((resolve, reject) => {
+            const timer = window.setInterval(() => {
+              void imApi.attachmentCacheStatus(attachment.id).then(res => {
+                const state = res.data
+                set({ downloadProgress: { name, percent: state.percent, phase: state.phase } })
+                if (state.status === 'done') {
+                  window.clearInterval(timer)
+                  resolve()
+                } else if (state.status === 'failed') {
+                  window.clearInterval(timer)
+                  reject(new Error(state.error || 'attachment cache failed'))
+                }
+              }).catch(error => {
+                window.clearInterval(timer)
+                reject(error)
+              })
+            }, 250)
+          })
+          if (reveal) await imApi.revealAttachment(attachment.id)
+          setImError(`file:${message.conversation_id}`, null)
+        } catch (error) {
+          console.warn('[IM] cache attachment failed', name, error)
+          setImError(`file:${message.conversation_id}`, errorMessage(error, 'im.error.file'))
+        } finally {
+          set({ downloadProgress: null })
+        }
+      },
+
+      setAttachmentDownloadMode: mode => set({ attachmentDownloadMode: mode }),
 
       sendImageToConversations: async (file, conversationIds) => {
         let sent = 0

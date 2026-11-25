@@ -60,6 +60,8 @@ export function ImChatPanel({ conversation, pendingPeer, narrow, onBack }: Props
   const deleteMessage = useImStore(s => s.deleteMessage)
   const recallMessage = useImStore(s => s.recallMessage)
   const fillComposer = useImStore(s => s.fillComposer)
+  const downloadAttachment = useImStore(s => s.downloadAttachment)
+  const downloadProgress = useImStore(s => s.downloadProgress)
   const forwardMessages = useImStore(s => s.forwardMessages)
   const markConversationRead = useImStore(s => s.markConversationRead)
   const [menu, setMenu] = useState<MessageMenuState | null>(null)
@@ -236,19 +238,11 @@ export function ImChatPanel({ conversation, pendingPeer, narrow, onBack }: Props
     )
   }
 
-  /** 桌面端：附件落到本地下载目录并在文件管理器中定位；网页端保持浏览器下载 */
+  /** 桌面端：后台缓存附件，完成后自动在文件管理器中定位 */
   const revealFile = async (message: ImMessage) => {
-    const attachment = message.attachment
-    if (!attachment?.id) return
-    try {
-      const response = await imApi.revealAttachment(attachment.id)
-      useToastStore.getState().show(t('im.message.revealSaved', {
-        defaultValue: '已保存到 {{path}}', path: response.data.path,
-      }))
-    } catch (error) {
-      console.warn('[IM] reveal attachment failed', error)
-      useToastStore.getState().show(t('im.message.revealFailed', '在文件夹中显示失败'))
-    }
+    if (!message.attachment?.id) return
+    await downloadAttachment(message, true)
+    useToastStore.getState().show(t('im.message.revealStarted', '已开始下载，完成后将打开文件夹'))
   }
 
   // 以下回调全部 useCallback 稳定：ImMessageItem 是 memo 组件，每次渲染新建闭包
@@ -364,6 +358,21 @@ export function ImChatPanel({ conversation, pendingPeer, narrow, onBack }: Props
           </button>
         )}
       </header>
+
+      {downloadProgress && (
+        <div className="flex shrink-0 items-center gap-2 border-b border-border/60 bg-card/70 px-4 py-1.5 text-[11px] text-muted-foreground">
+          <Loader2 size={12} className="animate-spin text-primary" />
+          <span className="max-w-[160px] truncate">
+            {t('im.message.downloading', '正在缓存 {{name}}', { name: downloadProgress.name })}
+          </span>
+          <span className="truncate">{downloadProgress.phase}</span>
+          <div className="h-1 flex-1 overflow-hidden rounded-full bg-muted">
+            <div className="h-full rounded-full bg-primary transition-all"
+                 style={{ width: `${downloadProgress.percent}%` }} />
+          </div>
+          <span>{downloadProgress.percent}%</span>
+        </div>
+      )}
 
       {selectionMode && (
         <div className="flex shrink-0 items-center gap-3 border-b border-primary/30 bg-primary/5 px-4 py-1.5 text-xs">

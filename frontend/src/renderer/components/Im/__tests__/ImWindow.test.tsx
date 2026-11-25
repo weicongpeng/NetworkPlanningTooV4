@@ -14,6 +14,9 @@ vi.mock('react-i18next', () => ({
 
 vi.mock('../../../services/api', () => ({
   IM_CHUNK_SIZE: 2 * 1024 * 1024,
+  desktopLoginApi: {
+    imStorageState: vi.fn().mockResolvedValue({ success: true, data: {} }),
+  },
   imApi: {
     conversations: vi.fn(), contacts: vi.fn(), messages: vi.fn(), send: vi.fn(),
     markRead: vi.fn(), createConversation: vi.fn(), createGroup: vi.fn(),
