@@ -45,3 +45,16 @@ android/gradle_debug.txt
 # iOS
 ios/build/
 ios/Pods/
+
+# Windows 迁移残留 / 本地诊断临时文件
+/cmake-3.30.3/
+/cmake-3.30.3.zip
+/cmdline-tools-temp/
+/cmdline-tools.zip
+/ninja-temp/
+/ninja-win.zip
+/$buildDir/
+/~/
+/build_log.txt
+/tsc_errors.txt
+/.tmp_verify2.js
