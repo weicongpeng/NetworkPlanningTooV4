@@ -10,6 +10,7 @@ import base64
 import logging
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -137,6 +138,10 @@ class AttachmentUrlItem(BaseModel):
 
 class AttachmentUrlsRequest(BaseModel):
     items: List[AttachmentUrlItem] = Field(default_factory=list)
+
+
+class AttachmentRevealRequest(BaseModel):
+    filename: str = Field("", max_length=255)
 
 
 @router.get("/conversations")
@@ -379,20 +384,15 @@ def attachment_urls(payload: AttachmentUrlsRequest, db: Session = Depends(get_db
         {"attachment_id": item.attachment_id, "thumb": item.thumb}
         for item in payload.items
     ]
+    if im_desktop_proxy.is_shared_desktop():
+        # 连控制请求都不必发：前端据此走本机 /im/attachments/{id}，由本机后端
+        # 决定是否真的需要向云端取字节。老版本桌面端收到空 tokens 也会自动回退。
+        return _ok({"tokens": {}})
     data = _run("attachment_urls", {"items": items}, db, user, limit=600)
     tokens = dict((data or {}).get("tokens") or {})
-    if im_desktop_proxy.is_shared_desktop():
-        from app.services.desktop_cloud_client import server_url
-
-        base = server_url()
-        if base:
-            for info in tokens.values():
-                thumb = 1 if info.get("thumb") else 0
-                info["url"] = (
-                    f"{base.rstrip('/')}{info['path']}"
-                    f"?token={urllib.parse.quote(str(info['token']), safe='')}"
-                    f"&thumb={thumb}"
-                )
+    # 桌面共享模式特意不下发云端直链：本机 /im/attachments/{id} 会先读本地
+    # remote-cache，命中时不走公网；只有 miss 才由本机后端向云端取一次并落盘。
+    # 前端见不到 url 后也会跳过这条控制请求，历史图片零公网往返。
     return _ok({"tokens": tokens})
 
 
@@ -444,7 +444,12 @@ def open_attachment(attachment_id: int, db: Session = Depends(get_db),
     """
     if not settings.NPT_DESKTOP:
         raise HTTPException(status_code=404, detail="Not Found")
-    if im_desktop_proxy.is_shared_desktop():
+    local = im_download_jobs.cached_source(int(user.id), attachment_id)
+    content: Optional[bytes] = None
+    if local is not None:
+        # 下载目录 / remote-cache 已有副本：本机复制一次即可，不再访问云端
+        source, filename = local
+    elif im_desktop_proxy.is_shared_desktop():
         content, _, filename = _shared_attachment_bytes(
             attachment_id, False, db, user)
     else:
@@ -457,7 +462,10 @@ def open_attachment(attachment_id: int, db: Session = Depends(get_db),
     out_dir.mkdir(parents=True, exist_ok=True)
     safe_name = im_attachment_service.clean_filename(filename)
     target = out_dir / safe_name
-    target.write_bytes(content)
+    if content is not None:
+        target.write_bytes(content)
+    elif source.resolve() != target.resolve():
+        shutil.copyfile(source, target)
     try:
         if os.name == "nt":
             os.startfile(str(target))  # type: ignore[attr-defined]
@@ -491,19 +499,23 @@ def attachment_cache_status(attachment_id: int,
 
 
 @router.post("/attachments/{attachment_id}/reveal")
-def reveal_attachment(attachment_id: int,
+def reveal_attachment(attachment_id: int, payload: Optional[AttachmentRevealRequest] = None,
                       user: User = Depends(get_current_user)):
-    """桌面端：在本地已缓存的附件上调用系统文件管理器定位。"""
+    """桌面端：本地已缓存则直接定位；否则后台下载，完成后定位一次。
+
+    返回 ``status=done`` 表示这是本地命中，前端不应再显示下载进度。
+    """
     if not settings.NPT_DESKTOP:
         raise HTTPException(status_code=404, detail="Not Found")
     try:
-        return _ok(im_download_jobs.reveal_cached(int(user.id), attachment_id))
+        return _ok({**im_download_jobs.reveal_cached(int(user.id), attachment_id),
+                    "status": "done", "cached": True})
     except HTTPException as exc:
         if exc.status_code != 409:
             raise
-        # 兼容未先调用 /cache 的旧前端：后台缓存完成后自动定位
-        return _ok(im_download_jobs.start(
-            int(user.id), attachment_id, f"attachment-{attachment_id}", reveal=True))
+    filename = (payload.filename if payload else "") or f"attachment-{attachment_id}"
+    return _ok({**im_download_jobs.start(
+        int(user.id), attachment_id, filename, reveal=True), "cached": False})
 
 
 def _attachment_headers(filename: str, thumb: bool) -> Dict[str, str]:
@@ -556,6 +568,13 @@ def _shared_attachment_bytes(attachment_id: int, thumb: bool,
 
 def _download(attachment_id: int, thumb: bool, db: Session, user: User) -> Response:
     if im_desktop_proxy.is_shared_desktop():
+        # 本地优先：已有只读副本时直接流式返回，不发任何云端请求、
+        # 也不把整份文件读进内存（103MB 安装包曾因此占满工作线程内存）。
+        cached = im_attachment_service.remote_cache_info(attachment_id, thumb)
+        if cached is not None:
+            path, mime, filename = cached
+            return FileResponse(path=str(path), media_type=mime,
+                                headers=_attachment_headers(filename, thumb))
         content, mime, filename = _shared_attachment_bytes(
             attachment_id, thumb, db, user)
         return Response(content=content, media_type=mime,

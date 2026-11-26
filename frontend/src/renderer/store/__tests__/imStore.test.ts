@@ -500,11 +500,32 @@ describe('imStore', () => {
       // 定位只走 revealAttachment 一次：/cache 再带 reveal 会让文件夹被打开两次
       expect(imApi.startAttachmentCache).toHaveBeenCalledWith(12, '包.zip')
       expect(imApi.revealAttachment).toHaveBeenCalledTimes(1)
-      expect(imApi.revealAttachment).toHaveBeenCalledWith(12)
+      expect(imApi.revealAttachment).toHaveBeenCalledWith(12, '包.zip')
       expect(useImStore.getState().downloadProgress).toBeNull()
     } finally {
       vi.useRealTimers()
     }
+  })
+
+  it('本地已缓存的附件定位时不再显示下载进度', async () => {
+    vi.mocked(imApi.revealAttachment).mockResolvedValue({
+      success: true, data: {
+        status: 'done', revealed: true, cached: true, path: 'D:\\downloads\\已缓存.png',
+      },
+    } as any)
+
+    const imageMessage: ImMessage = {
+      ...message(1), kind: 'image',
+      attachment: {
+        id: 15, original_name: '已缓存.png', mime: 'image/png',
+        size_bytes: 1024, has_thumb: true,
+      },
+    }
+    const ok = await useImStore.getState().revealAttachment(imageMessage)
+    expect(ok).toBe(true)
+    expect(imApi.revealAttachment).toHaveBeenCalledWith(15, '已缓存.png')
+    expect(imApi.attachmentCacheStatus).not.toHaveBeenCalled()
+    expect(useImStore.getState().downloadProgress).toBeNull()
   })
 
   it('编辑图片可直发多个会话，单个目标失败不影响其它目标', async () => {

@@ -60,7 +60,7 @@ export function ImChatPanel({ conversation, pendingPeer, narrow, onBack }: Props
   const deleteMessage = useImStore(s => s.deleteMessage)
   const recallMessage = useImStore(s => s.recallMessage)
   const fillComposer = useImStore(s => s.fillComposer)
-  const downloadAttachment = useImStore(s => s.downloadAttachment)
+  const revealAttachment = useImStore(s => s.revealAttachment)
   const downloadProgress = useImStore(s => s.downloadProgress)
   const forwardMessages = useImStore(s => s.forwardMessages)
   const markConversationRead = useImStore(s => s.markConversationRead)
@@ -238,13 +238,12 @@ export function ImChatPanel({ conversation, pendingPeer, narrow, onBack }: Props
     )
   }
 
-  /** 桌面端：后台缓存附件，完成后自动在文件管理器中定位 */
-  const revealFile = async (message: ImMessage) => {
+  /** 桌面端：本地命中直接定位（零提示），只有真要下载时才显示进度 */
+  const revealFile = (message: ImMessage) => {
     if (!message.attachment?.id) return
-    const ok = await downloadAttachment(message, true)
-    useToastStore.getState().show(ok
-      ? t('im.message.revealStarted', '已在文件夹中定位')
-      : t('im.message.revealFailed', '附件下载失败'))
+    void revealAttachment(message).then(ok => {
+      if (!ok) useToastStore.getState().show(t('im.message.revealFailed', '在文件夹中显示失败'))
+    })
   }
 
   // 以下回调全部 useCallback 稳定：ImMessageItem 是 memo 组件，每次渲染新建闭包

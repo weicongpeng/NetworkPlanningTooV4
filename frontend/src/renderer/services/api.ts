@@ -2846,22 +2846,23 @@ export const imApi = {
   openAttachment: (id: number): Promise<ImEnvelope<{ opened: boolean; path: string }>> =>
     apiClient.post(`/im/attachments/${id}/open`) as any,
 
-  /** 桌面端：后台缓存附件到本机下载目录，返回任务状态 */
+  /** 桌面端：后台缓存附件到本机下载目录；cached=true 表示本机已有，无需显示进度 */
   startAttachmentCache: (attachmentId: number, filename: string, reveal = false): Promise<ImEnvelope<{
-    status: 'running' | 'done' | 'failed'; percent: number; phase: string
-    path: string; error: string
+    status: 'idle' | 'running' | 'done' | 'failed'; percent: number; phase: string
+    path: string; error: string; cached: boolean
   }>> => apiClient.post('/im/attachments/cache', {
     attachment_id: attachmentId, filename, reveal,
   }) as any,
 
   attachmentCacheStatus: (attachmentId: number): Promise<ImEnvelope<{
-    status: 'running' | 'done' | 'failed'; percent: number; phase: string
-    path: string; error: string
+    status: 'idle' | 'running' | 'done' | 'failed'; percent: number; phase: string
+    path: string; error: string; cached: boolean
   }>> => apiClient.get(`/im/attachments/${attachmentId}/cache`) as any,
 
-  /** 桌面端：在系统文件管理器中定位已缓存的附件 */
-  revealAttachment: (id: number): Promise<ImEnvelope<{ revealed: boolean; path: string }>> =>
-    apiClient.post(`/im/attachments/${id}/reveal`) as any,
+  /** 桌面端：本地命中直接定位（status=done）；未缓存则后台下载，完成后定位一次 */
+  revealAttachment: (id: number, filename = ''): Promise<ImEnvelope<{
+    status: 'running' | 'done'; revealed: boolean; cached: boolean; path: string
+  }>> => apiClient.post(`/im/attachments/${id}/reveal`, { filename }) as any,
 
   messages: (id: number, params: {
     after_id?: number

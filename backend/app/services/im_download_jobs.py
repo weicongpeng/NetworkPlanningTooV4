@@ -6,12 +6,16 @@
 落盘结果按附件持久化索引（``<附件目录同级>/im_downloads.json``）：同一附件再次
 「在文件夹中显示」时直接定位上次下载的文件，进程重启后依然有效；
 同名且大小一致的文件视为同一份，不再每点一次就多出 ``-1/-2`` 副本。
+
+共享模式还有一份只读副本（``remote-cache``）：已浏览过的图片/文件先复用本机副本，
+不向云端重复取字节，服务器只承担新数据的桥接。
 """
 from __future__ import annotations
 
 import base64
 import json
 import os
+import shutil
 import threading
 import time
 import uuid
@@ -52,10 +56,16 @@ def _index_path() -> Path:
     return desktop_im_storage.effective_attachment_dir().parent / INDEX_FILE_NAME
 
 
+def _done_state(path: str) -> Dict[str, Any]:
+    return {"status": "done", "percent": 100, "phase": "已完成",
+            "path": path, "error": "", "cached": True}
+
+
 def status(user_id: int, attachment_id: int) -> Dict[str, Any]:
     with _lock:
         return dict(_jobs.get(_key(user_id, attachment_id), {
-            "status": "idle", "percent": 0, "phase": "", "path": "", "error": "",
+            "status": "idle", "percent": 0, "phase": "", "path": "",
+            "error": "", "cached": False,
         }))
 
 
@@ -205,6 +215,22 @@ def _finalize(part: Path, preferred: Path, attachment_id: int) -> Path:
     return preferred
 
 
+def _copy_cached_to_downloads(attachment_id: int, source: Path, filename: str) -> Path:
+    """把 remote-cache 的只读副本复制到下载目录并登记索引（不删源、不联网）。"""
+    out_dir = _download_dir()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    preferred = out_dir / im_attachment_service.clean_filename(
+        filename or f"attachment-{attachment_id}")
+    part = out_dir / f"~{uuid.uuid4().hex}.part"
+    try:
+        shutil.copyfile(source, part)
+        target = _finalize(part, preferred, attachment_id)
+    finally:
+        part.unlink(missing_ok=True)
+    _remember(attachment_id, target, target.stat().st_size)
+    return target
+
+
 def _copy_with_progress(source: Path, part: Path, total: int,
                         key: Tuple[int, int]) -> None:
     done = 0
@@ -266,7 +292,8 @@ def _run_job(key: Tuple[int, int], user_id: int, attachment_id: int,
         target = _finalize(part, out_dir / safe, attachment_id)
         part = None
         _remember(attachment_id, target, target.stat().st_size)
-        _update(key, percent=100, status="done", phase="完成", path=str(target), error="")
+        _update(key, percent=100, status="done", phase="完成",
+                path=str(target), cached=True, error="")
         if reveal:
             desktop_bridge.reveal_path(str(target))
     except Exception as exc:  # noqa: BLE001 - 后台任务异常必须落到状态里供前端提示
@@ -281,27 +308,38 @@ def start(user_id: int, attachment_id: int, filename: str = "",
           reveal: bool = False) -> Dict[str, Any]:
     key = _key(user_id, attachment_id)
     result: Optional[Dict[str, Any]] = None
+    local_source: Optional[Tuple[Path, str, str]] = None
     with _lock:
         old = _jobs.get(key)
         if old and old["status"] == "running":
             return dict(old)
         saved = _saved_path_locked(attachment_id) or _job_path_locked(old)
         if saved:
-            state = {"status": "done", "percent": 100, "phase": "已完成",
-                     "path": saved, "error": ""}
-            _jobs[key] = state
-            result = dict(state)
+            _jobs[key] = _done_state(saved)
+            result = dict(_jobs[key])
         else:
+            # 历史数据本地优先：附件只要被浏览过就有 remote-cache 只读副本，
+            # 直接从磁盘复制到下载目录，不必再向云端取一遍字节。
+            local_source = im_attachment_service.remote_cache_info(attachment_id, False)
             _prune_jobs_locked()
             _jobs[key] = {
-                "status": "running", "percent": 0, "phase": "排队中",
-                "path": "", "error": "",
+                "status": "running", "percent": 0,
+                "phase": "复用本地缓存" if local_source else "排队中",
+                "path": "", "error": "", "cached": False,
             }
     if result is not None:
         # 已经在本地：直接定位，不再重新下载；壳层调用放在锁外，不阻塞进度轮询
         if reveal:
             desktop_bridge.reveal_path(result["path"])
         return result
+    if local_source is not None:
+        # 本机复制即可，同步完成让前端连进度条都不必显示
+        target = _copy_cached_to_downloads(attachment_id, local_source[0], local_source[2])
+        _update(key, status="done", percent=100, phase="完成",
+                path=str(target), cached=True, error="")
+        if reveal:
+            desktop_bridge.reveal_path(str(target))
+        return _done_state(str(target))
     threading.Thread(
         target=_run_job, args=(key, user_id, attachment_id, filename, reveal),
         daemon=True,
@@ -309,10 +347,35 @@ def start(user_id: int, attachment_id: int, filename: str = "",
     return status(user_id, attachment_id)
 
 
-def reveal_cached(user_id: int, attachment_id: int) -> Dict[str, Any]:
-    path = ""
+def cached_source(user_id: int, attachment_id: int) -> Optional[Tuple[Path, str]]:
+    """返回本机已有的附件副本 (路径, 原始文件名)；没有则返回 None。
+
+    供「双击用本地应用打开」复用，避免已缓存文件每次都经云端取字节。
+    """
     with _lock:
         state = _jobs.get(_key(user_id, attachment_id)) or {}
+        if state.get("status") == "done":
+            raw = str(state.get("path") or "")
+            if raw and Path(raw).is_file():
+                return Path(raw), Path(raw).name
+        raw = _saved_path_locked(attachment_id)
+        if raw:
+            _jobs[_key(user_id, attachment_id)] = _done_state(raw)
+            return Path(raw), Path(raw).name
+    cached = im_attachment_service.remote_cache_info(attachment_id, False)
+    if cached is not None:
+        return cached[0], cached[2]
+    return None
+
+
+def reveal_cached(user_id: int, attachment_id: int) -> Dict[str, Any]:
+    path = ""
+    local_source: Optional[Tuple[Path, str, str]] = None
+    with _lock:
+        state = _jobs.get(_key(user_id, attachment_id)) or {}
+        if state.get("status") == "running":
+            # 正在缓存中：交给 /reveal 的 start 分支复用同一个任务，避免重复落盘
+            raise HTTPException(status_code=409, detail="IM_ATTACHMENT_CACHING")
         if state.get("status") == "done":
             candidate = str(state.get("path") or "")
             path = candidate if candidate and Path(candidate).is_file() else ""
@@ -320,10 +383,14 @@ def reveal_cached(user_id: int, attachment_id: int) -> Dict[str, Any]:
             # 进程重启后内存任务表是空的，靠持久化索引找回上次落盘的文件
             path = _saved_path_locked(attachment_id)
             if path:
-                _jobs[_key(user_id, attachment_id)] = {
-                    "status": "done", "percent": 100, "phase": "已完成",
-                    "path": path, "error": "",
-                }
+                _jobs[_key(user_id, attachment_id)] = _done_state(path)
+            else:
+                local_source = im_attachment_service.remote_cache_info(attachment_id, False)
+    if local_source is not None:
+        target = _copy_cached_to_downloads(attachment_id, local_source[0], local_source[2])
+        path = str(target)
+        with _lock:
+            _jobs[_key(user_id, attachment_id)] = _done_state(path)
     if not path or not Path(path).is_file():
         raise HTTPException(status_code=409, detail="IM_ATTACHMENT_NOT_CACHED")
     return {"revealed": desktop_bridge.reveal_path(path), "path": path}

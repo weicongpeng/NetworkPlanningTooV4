@@ -4,7 +4,10 @@ import { persist } from 'zustand/middleware'
 
 import { imApi } from '../services/api'
 import { clearImAttachmentCache } from '../services/imAttachmentCache'
-import { clearAllSnapshots, readSnapshot, writeSnapshot } from '../services/imLocalCache'
+import {
+  clearAllMeta, clearAllSnapshots, readAllSnapshots, readMeta,
+  readSnapshot, writeMeta, writeSnapshot,
+} from '../services/imLocalCache'
 import {
   IM_MESSAGE_EVENT, IM_PRESENCE_EVENT, IM_RECALL_EVENT, IM_RESYNC_EVENT,
 } from '../services/websocketService'
@@ -96,8 +99,10 @@ interface ImState {
   sendText: (text: string, mention?: ImSendMention) => Promise<boolean>
   /** 返回发送失败的 File，供输入区把它们放回待发送列表 */
   sendFiles: (files: File[]) => Promise<File[]>
-  /** 桌面端后台缓存附件；reveal=true 时完成后在文件管理器定位 */
+  /** 桌面端后台缓存附件；本机已有则直接返回，不显示进度 */
   downloadAttachment: (message: ImMessage, reveal?: boolean) => Promise<boolean>
+  /** 桌面端「在文件夹中显示」：本地命中零提示，未缓存才显示下载进度 */
+  revealAttachment: (message: ImMessage) => Promise<boolean>
   setAttachmentDownloadMode: (mode: 'manual' | 'auto') => void
   /** 编辑后的图片直接发送到多个目标会话，不切换当前会话 */
   sendImageToConversations: (
@@ -160,7 +165,20 @@ function snapshotKey(conversationId: number): string {
 }
 
 const snapshotWriteAt = new Map<string, number>()
+const metaWriteAt = new Map<string, number>()
 const hydrateVersion = new Map<number, number>()
+
+function persistMeta<T>(key: string, value: T): void {
+  const now = Date.now()
+  if (now - (metaWriteAt.get(key) || 0) < 10_000) return
+  metaWriteAt.set(key, now)
+  void writeMeta(key, value)
+}
+
+/** 按用户隔离的元数据 key（会话列表 / 通讯录） */
+function metaKey(name: string): string {
+  return `${name}:${currentUserId() ?? 'anon'}`
+}
 /** 轮询成功不必每 8s 重写整屏；撤回/删除等状态变更强制立即落盘 */
 function persistSnapshot(conversationId: number, force = false): void {
   const key = snapshotKey(conversationId)
@@ -177,6 +195,35 @@ function persistSnapshot(conversationId: number, force = false): void {
 }
 /** 「红点有、正文没来」的补洞节流；5s 会让 WS 丢通知时约 6s 才看到正文 */
 const HOLE_FILL_THROTTLE_MS = 800
+
+/** 只在真正需要下载时轮询进度；本地命中的附件根本不会走到这里。 */
+function pollAttachmentCache(attachmentId: number, name: string): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    const timer = window.setInterval(() => {
+      void imApi.attachmentCacheStatus(attachmentId).then(res => {
+        const state = res?.data
+        if (!state) {
+          window.clearInterval(timer)
+          reject(new Error('attachment cache status unavailable'))
+          return
+        }
+        useImStore.setState({
+          downloadProgress: { name, percent: state.percent || 0, phase: state.phase || '' },
+        })
+        if (state.status === 'done') {
+          window.clearInterval(timer)
+          resolve()
+        } else if (state.status === 'failed' || state.status === 'idle') {
+          window.clearInterval(timer)
+          reject(new Error(state.error || 'attachment cache failed'))
+        }
+      }).catch(error => {
+        window.clearInterval(timer)
+        reject(error)
+      })
+    }, 250)
+  })
+}
 
 interface MessagePage {
   items: ImMessage[]
@@ -599,23 +646,45 @@ export const useImStore = create<ImState>()(
           dirtyConversations.delete(id)
           void get().loadMessages(id, 'incremental')
         } else if (get().cursors[id] && (get().messages[id]?.length || 0) > 0) {
-          // 已加载过的会话切来切去不再反复走公网 relay 拉同一页；
-          // 新消息由 1.5s 轮询的 incremental 接上游标补拉。
+          // 本地已有历史：正文立即渲染，后台按游标补增量；即使网络慢也不转圈
+          void get().loadMessages(id, 'incremental')
         } else {
           void get().loadMessages(id, 'initial')
         }
       },
 
       bootstrap: async () => {
-        set({ loading: true, error: null })
-        try {
-          await Promise.all([get().refreshConversations(), get().refreshContacts()])
-        } catch (error) {
-          console.warn('[IM] bootstrap failed', error)
-          setImError('global', errorMessage(error, 'im.error.load'))
-        } finally {
-          set({ loading: false })
-        }
+        // 本地优先：先从磁盘还原历史，UI 立刻可看；网络刷新放后台，
+        // 不再让用户每次打开聊天窗口都对着骨架屏等待公网 relay。
+        const [cachedConversations, cachedContacts, snapshots] = await Promise.all([
+          readMeta<ImConversation[]>(metaKey('conversations')),
+          readMeta<ImContactsData>(metaKey('contacts')),
+          readAllSnapshots(`conv:${currentUserId() ?? 'anon'}:`),
+        ])
+        const messages: Record<number, ImMessage[]> = {}
+        const cursors: Cursors = {}
+        snapshots.forEach(snapshot => {
+          const id = Number(String(snapshot.key).split(':').pop())
+          if (!Number.isFinite(id) || !snapshot.messages?.length) return
+          messages[id] = snapshot.messages
+          if (snapshot.cursors) cursors[id] = snapshot.cursors
+        })
+        set({
+          conversations: cachedConversations || [],
+          contacts: cachedContacts,
+          messages,
+          cursors,
+          unreadTotal: (cachedConversations || []).reduce(
+            (sum: number, c: ImConversation) => sum + (c.unread || 0), 0),
+          loading: false,
+          error: null,
+        })
+        // 权威数据后台校准：失败只影响提示，本地历史仍然可用
+        void Promise.all([get().refreshConversations(), get().refreshContacts()])
+          .catch(error => {
+            console.warn('[IM] background refresh failed', error)
+            setImError('global', errorMessage(error, 'im.error.load'))
+          })
       },
 
       refreshConversations: async () => {
@@ -662,6 +731,7 @@ export const useImStore = create<ImState>()(
           online,
           unreadTotal: conversations.reduce((sum: number, c: ImConversation) => sum + (c.unread || 0), 0),
         })
+        persistMeta(metaKey('conversations'), conversations)
         setImError('global', null) // 会话列表恢复后立即撤掉繁忙提示
         // 红点有、正文没来的兜底：服务端最新消息 id 已超过本地正文最大值，
         // 说明本地游标跳过了一段或窗口收起期间漏了补拉，重拉最新一页补洞。
@@ -675,7 +745,9 @@ export const useImStore = create<ImState>()(
           const localLast = get().messages[activeId]?.slice(-1)[0]?.id || 0
           if (serverLast > localLast) {
             lastHoleFillAt = Date.now()
-            void get().loadMessages(activeId, 'initial').catch(() => {})
+            // 本地已有游标时只补增量，不重拉整页历史（减轻共享模式公网负担）
+            void get().loadMessages(
+              activeId, get().cursors[activeId] ? 'incremental' : 'initial').catch(() => {})
           }
         }
       },
@@ -690,6 +762,7 @@ export const useImStore = create<ImState>()(
         const online = { ...get().online }
         contacts.users.forEach((user: ImUser) => { online[user.id] = user.is_online })
         set({ contacts, online })
+        persistMeta(metaKey('contacts'), contacts)
       },
 
       ensureMembers: async id => {
@@ -746,6 +819,11 @@ export const useImStore = create<ImState>()(
         const state = get()
         const cursor = state.cursors[id]
         if (direction === 'older' && !cursor?.prev) return
+        // 本地快照已 hydrated：历史直接可见，只需后台补增量，不重拉最新一页
+        if (direction === 'initial' && cursor && (state.messages[id]?.length || 0) > 0) {
+          void get().loadMessages(id, 'incremental')
+          return
+        }
         // 同一会话同时只允许一次正文请求：切会话 / 轮询可能在同一瞬间各发一次，
         // 后返回的那次会用旧快照覆盖新快照，正文重复插入并重复滚底
         if (messagesInFlight.has(id)) return
@@ -1002,35 +1080,48 @@ export const useImStore = create<ImState>()(
         const attachment = message.attachment
         if (!attachment?.id) return false
         const name = attachment.original_name || `attachment-${attachment.id}`
-        set({ downloadProgress: { name, percent: 0, phase: '准备下载' } })
         try {
-          // reveal 只交给下面的 revealAttachment：同时让 /cache 带 reveal 会让
-          // 后台任务和本请求各调一次壳层，资源管理器被打开两次
-          await imApi.startAttachmentCache(attachment.id, name)
-          await new Promise<void>((resolve, reject) => {
-            const timer = window.setInterval(() => {
-              void imApi.attachmentCacheStatus(attachment.id).then(res => {
-                const state = res.data
-                set({ downloadProgress: { name, percent: state.percent, phase: state.phase } })
-                if (state.status === 'done') {
-                  window.clearInterval(timer)
-                  resolve()
-                } else if (state.status === 'failed') {
-                  window.clearInterval(timer)
-                  reject(new Error(state.error || 'attachment cache failed'))
-                }
-              }).catch(error => {
-                window.clearInterval(timer)
-                reject(error)
-              })
-            }, 250)
-          })
-          if (reveal) await imApi.revealAttachment(attachment.id)
+          // 本机已有（下载索引或 remote-cache 副本）时后端立刻返回 done：
+          // 不闪进度条、不发公网请求；reveal 只由 /reveal 端点触发一次。
+          const started = await imApi.startAttachmentCache(attachment.id, name)
+          if (started?.data?.status === 'done') {
+            if (reveal) await imApi.revealAttachment(attachment.id, name)
+            setImError(`file:${message.conversation_id}`, null)
+            return true
+          }
+          set({ downloadProgress: { name, percent: 0, phase: '准备下载' } })
+          await pollAttachmentCache(attachment.id, name)
+          if (reveal) await imApi.revealAttachment(attachment.id, name)
           setImError(`file:${message.conversation_id}`, null)
           return true
         } catch (error) {
           console.warn('[IM] cache attachment failed', name, error)
           setImError(`file:${message.conversation_id}`, errorMessage(error, 'im.error.downloadFailed'))
+          return false
+        } finally {
+          set({ downloadProgress: null })
+        }
+      },
+
+      revealAttachment: async message => {
+        const attachment = message.attachment
+        if (!attachment?.id) return false
+        const name = attachment.original_name || `attachment-${attachment.id}`
+        try {
+          const result = await imApi.revealAttachment(attachment.id, name)
+          // status=done 表示本地命中，壳层已经定位完：不弹进度、不弹成功提示
+          if (result?.data?.status === 'done') {
+            setImError(`file:${message.conversation_id}`, null)
+            return true
+          }
+          // 未缓存：后台任务下载完成后由后端定位一次，这里只显示进度
+          set({ downloadProgress: { name, percent: 0, phase: '准备下载' } })
+          await pollAttachmentCache(attachment.id, name)
+          setImError(`file:${message.conversation_id}`, null)
+          return true
+        } catch (error) {
+          console.warn('[IM] reveal attachment failed', name, error)
+          setImError(`file:${message.conversation_id}`, errorMessage(error, 'im.error.revealFailed'))
           return false
         } finally {
           set({ downloadProgress: null })
@@ -1524,6 +1615,8 @@ export const useImStore = create<ImState>()(
         membersFetchedAt.clear()
         clearImAttachmentCache()
         void clearAllSnapshots()
+        void clearAllMeta()
+        metaWriteAt.clear()
         snapshotWriteAt.clear()
         hydrateVersion.clear()
         notifiedMentionIds.clear()

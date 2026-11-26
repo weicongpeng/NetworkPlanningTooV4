@@ -1,6 +1,8 @@
 """IM 附件签名直链：签发/验签/过期/越权/批量 op 与流式下载端点。"""
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
@@ -114,20 +116,47 @@ def test_signed_get_rejects_invalid_token_and_non_member(env):
     assert resp.status_code == 404
 
 
-def test_batch_urls_endpoint_adds_absolute_url_in_shared_mode(env, monkeypatch):
+def test_download_streams_local_copy_before_relay(env, monkeypatch):
+    """共享桌面模式已有本地副本：图片/文件下载不再触碰云端 relay。"""
+    aid = env["attachment_id"]
+    im_attachment_service.write_remote_cache(aid, False, b"LOCAL", "image/png", "照片.png")
     monkeypatch.setattr(im_endpoint.im_desktop_proxy, "is_shared_desktop", lambda: True)
-    monkeypatch.setattr(
-        "app.services.desktop_cloud_client.server_url", lambda: "https://app.pengwc.asia")
-    monkeypatch.setattr(im_endpoint, "_run", lambda *a, **kw: {
-        "tokens": {
-            f"{env['attachment_id']}:0": im_attachment_service.sign_attachment(
-                env["attachment_id"], env["users"]["alice"], False),
-        },
-    })
+
+    def _unexpected(*args, **kwargs):
+        raise AssertionError("本地副本命中时不应访问云端")
+
+    monkeypatch.setattr(im_endpoint, "_shared_attachment_bytes", _unexpected)
+    resp = env["client"].get(f"/api/v1/im/attachments/{aid}")
+    assert resp.status_code == 200, resp.text
+    assert resp.content == b"LOCAL"
+
+
+def test_open_uses_local_copy_instead_of_relay(env, monkeypatch):
+    """双击打开已缓存文件：本机复制到临时目录，不再让云端返回字节。"""
+    aid = env["attachment_id"]
+    im_attachment_service.write_remote_cache(
+        aid, False, b"LOCALDOC", "application/zip", "本地包.zip")
+    monkeypatch.setattr(settings, "NPT_DESKTOP", True)
+    monkeypatch.setattr(im_endpoint.im_desktop_proxy, "is_shared_desktop", lambda: True)
+    monkeypatch.setattr(im_endpoint.os, "startfile", lambda path: None, raising=False)
+
+    def _unexpected(*args, **kwargs):
+        raise AssertionError("已有本地副本时不应访问云端")
+
+    monkeypatch.setattr(im_endpoint, "_shared_attachment_bytes", _unexpected)
+    resp = env["client"].post(f"/api/v1/im/attachments/{aid}/open")
+    assert resp.status_code == 200, resp.text
+    assert Path(resp.json()["data"]["path"]).read_bytes() == b"LOCALDOC"
+
+
+def test_batch_urls_endpoint_stays_local_in_shared_mode(env, monkeypatch):
+    """桌面共享模式本地优先：连换直链的控制请求都不发，字节走本机 remote-cache。"""
+    calls = []
+    monkeypatch.setattr(im_endpoint.im_desktop_proxy, "is_shared_desktop", lambda: True)
+    monkeypatch.setattr(im_endpoint, "_run", lambda *a, **kw: calls.append(a) or {"tokens": {}})
     resp = env["client"].post("/api/v1/im/attachments/urls", json={
         "items": [{"attachment_id": env["attachment_id"], "thumb": False}],
     })
     assert resp.status_code == 200, resp.text
-    info = resp.json()["data"]["tokens"][f"{env['attachment_id']}:0"]
-    assert info["url"].startswith("https://app.pengwc.asia/api/v1/im/attachments/signed/")
-    assert "token=" in info["url"]
+    assert resp.json()["data"]["tokens"] == {}
+    assert calls == []

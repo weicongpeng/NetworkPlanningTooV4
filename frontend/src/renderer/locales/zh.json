@@ -250,7 +250,6 @@
       "recalledByOther": "对方撤回了一条消息",
       "recalledEditHint": "点击回填到输入框重新编辑",
       "revealSaved": "已保存到 {{path}}",
-      "revealStarted": "已在文件夹中定位",
       "downloading": "正在缓存 {{name}}",
       "revealFailed": "在文件夹中显示失败",
       "forwardFailed": "转发失败，请稍后重试",

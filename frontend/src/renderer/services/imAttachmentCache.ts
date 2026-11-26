@@ -2,9 +2,12 @@
  * 历史消息附件的内存缓存：签名 URL（短时）+ Blob（有界 LRU）+ 在途请求去重。
  *
  * 共享桌面模式下每张图片原先都要走一次 relay JSON；这里让同一张图片在一次会话中
- * 只取一次字节，滚动回滚时直接命中内存。不缓存 ObjectURL：它由各组件自己创建/释放，
+ * 只取一次字节，滚动回滚时直接命中内存；重启后还能命中 IndexedDB 的磁盘副本，
+ * 连本机 HTTP 都不发。不缓存 ObjectURL：它由各组件自己创建/释放，
  * 避免跨组件 revoke 导致「第二次打开空白」。
  */
+import { clearAllBlobs, readBlob, writeBlob } from './imLocalCache'
+
 export interface ImSignedAttachmentInfo {
   token: string
   path: string
@@ -15,6 +18,8 @@ export interface ImSignedAttachmentInfo {
 }
 
 const MAX_BLOBS = 160
+/** 单张超过 12MB 的附件不走浏览器 IndexedDB，避免和后端磁盘缓存重复占空间 */
+const MAX_DISK_BLOB_BYTES = 12 * 1024 * 1024
 const blobs = new Map<string, Blob>()
 const signed = new Map<string, ImSignedAttachmentInfo>()
 const inFlight = new Map<string, Promise<Blob>>()
@@ -79,15 +84,25 @@ export async function getCachedAttachmentBlob(
   const pending = inFlight.get(key)
   if (pending) return pending
 
-  const task = loader().then(blob => {
+  const task = (async () => {
+    // 磁盘副本优先：应用重启 / WebView 刷新后内存为空，但历史图片仍可秒开。
+    const disk = await readBlob(key)
+    if (disk) {
+      touch(blobs, key, disk)
+      return disk
+    }
+    const blob = await loader()
     touch(blobs, key, blob)
+    // 大文件交给本机后端的 remote-cache（2GB 配额），浏览器里不再存一份；
+    // 签名直链已过期也不影响复用磁盘字节。
+    if (blob.size <= MAX_DISK_BLOB_BYTES) void writeBlob(key, blob).catch(() => {})
     while (blobs.size > MAX_BLOBS) {
       const oldest = blobs.keys().next().value as string | undefined
       if (!oldest) break
       blobs.delete(oldest)
     }
     return blob
-  }).finally(() => {
+  })().finally(() => {
     inFlight.delete(key)
   })
   inFlight.set(key, task)
@@ -100,4 +115,5 @@ export function clearImAttachmentCache(): void {
   signed.clear()
   inFlight.clear()
   signedUrlsAvailable = null
+  void clearAllBlobs()
 }

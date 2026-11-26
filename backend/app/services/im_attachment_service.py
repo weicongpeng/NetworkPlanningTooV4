@@ -72,6 +72,27 @@ def _remote_cache_folder(attachment_id: int, thumb: bool) -> Path:
     return _base_dir() / _REMOTE_CACHE_DIR / str(int(attachment_id)) / ("thumb" if thumb else "full")
 
 
+def remote_cache_info(attachment_id: int, thumb: bool) -> Optional[Tuple[Path, str, str]]:
+    """本地只读副本的 (路径, mime, 原始文件名)；没有副本时返回 None。
+
+    供下载/定位场景流式返回或复制，避免把 100MB 级文件整块读进内存。
+    """
+    if int(getattr(settings, "NPT_IM_LOCAL_ATTACHMENT_CACHE_MB", 0)) <= 0:
+        return None
+    folder = _remote_cache_folder(attachment_id, thumb)
+    data_path = folder / "data.bin"
+    meta_path = folder / "meta.json"
+    if not data_path.is_file() or not meta_path.is_file():
+        return None
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        return (data_path,
+                str(meta.get("mime") or "application/octet-stream"),
+                str(meta.get("filename") or "attachment"))
+    except (OSError, ValueError, TypeError):
+        return None
+
+
 def read_remote_cache(attachment_id: int, thumb: bool) -> Optional[Tuple[bytes, str, str]]:
     limit_mb = int(getattr(settings, "NPT_IM_LOCAL_ATTACHMENT_CACHE_MB", 0))
     if limit_mb <= 0:

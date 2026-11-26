@@ -309,6 +309,34 @@ def test_download_job_reuses_existing_same_name_file(monkeypatch, tmp_path):
     assert sorted(item.name for item in downloads.iterdir()) == ["截图.png"]
 
 
+def test_reveal_prefers_local_remote_cache_without_network(monkeypatch, tmp_path):
+    """历史附件的只读副本在本机：定位时直接复制，不向云端重新取字节。"""
+    from app.services import im_download_jobs
+
+    revealed: list = []
+    forwards: list = []
+    monkeypatch.setattr(im_download_jobs.desktop_im_storage,
+                        "effective_attachment_dir", lambda: tmp_path / "im")
+    monkeypatch.setattr(im_download_jobs.desktop_bridge, "reveal_path",
+                        lambda path: revealed.append(path) or True)
+    monkeypatch.setattr(im_download_jobs.im_desktop_proxy, "forward",
+                        lambda *a, **kw: forwards.append(a))
+    monkeypatch.setattr(im_download_jobs, "_jobs", {})
+    monkeypatch.setattr(im_download_jobs, "_index_cache", ("", {}))
+
+    folder = tmp_path / "im" / "remote-cache" / "9" / "full"
+    folder.mkdir(parents=True)
+    (folder / "data.bin").write_bytes(b"cached")
+    (folder / "meta.json").write_text('{"mime":"image/png","filename":"本地图.png"}')
+
+    result = im_download_jobs.reveal_cached(1, 9)
+
+    assert result["path"] == str(tmp_path / "downloads" / "本地图.png")
+    assert (tmp_path / "downloads" / "本地图.png").read_bytes() == b"cached"
+    assert revealed == [result["path"]]  # 只定位一次
+    assert forwards == []  # 零公网请求
+
+
 def test_relay_client_ip_prefers_cf_connecting_ip():
     from app.api.v1.endpoints import desktop_cloud
 
