@@ -232,6 +232,83 @@ def test_download_job_shared_mode_uses_relay(monkeypatch, tmp_path):
     assert Path(result["path"]).read_bytes() == b"data"
 
 
+def test_download_job_reuses_saved_file_across_restart(monkeypatch, tmp_path):
+    """同一附件再点「在文件夹中显示」：定位上次落盘的文件，不再重复下载 -1 副本。"""
+    from app.core.config import settings
+    from app.services import im_download_jobs
+
+    calls: list = []
+    revealed: list = []
+
+    def _fake_forward(op, args, timeout=None):
+        calls.append(op)
+        return {"tokens": {"9:0": {"token": "t", "path": "/api/v1/im/attachments/signed/9"}}}
+
+    def _fake_stream(info, target, on_progress):
+        target.write_bytes(b"data")
+        on_progress(100)
+        return "application/zip", "x.zip", 4
+
+    monkeypatch.setattr(settings, "DESKTOP_PROFILE", "shared")
+    monkeypatch.setattr(im_download_jobs.im_desktop_proxy, "forward", _fake_forward)
+    monkeypatch.setattr(
+        im_download_jobs.im_desktop_proxy, "stream_signed_attachment_to_file", _fake_stream)
+    monkeypatch.setattr(im_download_jobs.desktop_im_storage,
+                        "effective_attachment_dir", lambda: tmp_path / "im")
+    monkeypatch.setattr(im_download_jobs, "SessionLocal",
+                        lambda: SimpleNamespace(close=lambda: None))
+    monkeypatch.setattr(im_download_jobs.desktop_bridge, "reveal_path",
+                        lambda path: revealed.append(path) or True)
+    monkeypatch.setattr(im_download_jobs, "_jobs", {})
+    monkeypatch.setattr(im_download_jobs, "_index_cache", ("", {}))
+
+    def _wait() -> dict:
+        state = im_download_jobs.status(1, 9)
+        for _ in range(200):
+            if state["status"] != "running":
+                return state
+            time.sleep(0.01)
+            state = im_download_jobs.status(1, 9)
+        return state
+
+    im_download_jobs.start(1, 9, "x.zip")
+    first = _wait()
+    assert first["status"] == "done"
+    assert revealed == []  # /cache 不再自己弹资源管理器
+
+    # 模拟进程重启：内存任务表与索引缓存都清空，只能靠持久化索引找回
+    im_download_jobs._jobs.clear()
+    im_download_jobs._index_cache = ("", {})
+    resumed = im_download_jobs.start(1, 9, "x.zip")
+    assert resumed["status"] == "done" and resumed["path"] == first["path"]
+    assert sorted(p.name for p in (tmp_path / "downloads").iterdir()) == ["x.zip"]
+    assert calls == ["attachment_urls"]  # 第二次没有重新下载
+
+    result = im_download_jobs.reveal_cached(1, 9)
+    assert result["path"] == first["path"] and result["revealed"] is True
+    assert revealed == [first["path"]]  # 定位只发生一次
+
+
+def test_download_job_reuses_existing_same_name_file(monkeypatch, tmp_path):
+    """索引丢失（换目录/清缓存）时同名同大小的既有文件仍复用，不再多出 -1 副本。"""
+    from app.services import im_download_jobs
+
+    monkeypatch.setattr(im_download_jobs.desktop_im_storage,
+                        "effective_attachment_dir", lambda: tmp_path / "im")
+    monkeypatch.setattr(im_download_jobs, "_index_cache", ("", {}))
+
+    downloads = tmp_path / "downloads"
+    downloads.mkdir()
+    existing = downloads / "截图.png"
+    existing.write_bytes(b"data")
+    part = downloads / "~abc.part"
+    part.write_bytes(b"data")
+
+    assert im_download_jobs._finalize(part, existing, 9) == existing
+    assert not part.exists()
+    assert sorted(item.name for item in downloads.iterdir()) == ["截图.png"]
+
+
 def test_relay_client_ip_prefers_cf_connecting_ip():
     from app.api.v1.endpoints import desktop_cloud
 

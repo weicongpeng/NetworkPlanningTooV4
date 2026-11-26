@@ -250,7 +250,7 @@
       "recalledByOther": "This message was recalled",
       "recalledEditHint": "Click to put the original text back in the composer",
       "revealSaved": "Saved to {{path}}",
-      "revealStarted": "Download started — the folder will open when it finishes",
+      "revealStarted": "Shown in Folder",
       "downloading": "Caching {{name}}",
       "revealFailed": "Failed to show the file in Folder",
       "forwardFailed": "Failed to forward, please retry",

@@ -474,7 +474,7 @@ def open_attachment(attachment_id: int, db: Session = Depends(get_db),
 @router.post("/attachments/cache")
 def start_attachment_cache(payload: AttachmentCacheRequest,
                            user: User = Depends(get_current_user)):
-    """桌面端：后台缓存附件到本机下载目录（重复点击复用同一任务）。"""
+    """桌面端：后台缓存附件到本机下载目录（已下载过的附件直接复用本机文件）。"""
     if not settings.NPT_DESKTOP:
         raise HTTPException(status_code=404, detail="Not Found")
     return _ok(im_download_jobs.start(

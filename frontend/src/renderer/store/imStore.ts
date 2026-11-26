@@ -1004,7 +1004,9 @@ export const useImStore = create<ImState>()(
         const name = attachment.original_name || `attachment-${attachment.id}`
         set({ downloadProgress: { name, percent: 0, phase: '准备下载' } })
         try {
-          await imApi.startAttachmentCache(attachment.id, name, reveal)
+          // reveal 只交给下面的 revealAttachment：同时让 /cache 带 reveal 会让
+          // 后台任务和本请求各调一次壳层，资源管理器被打开两次
+          await imApi.startAttachmentCache(attachment.id, name)
           await new Promise<void>((resolve, reject) => {
             const timer = window.setInterval(() => {
               void imApi.attachmentCacheStatus(attachment.id).then(res => {

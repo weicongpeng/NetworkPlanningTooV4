@@ -243,7 +243,7 @@ export function ImChatPanel({ conversation, pendingPeer, narrow, onBack }: Props
     if (!message.attachment?.id) return
     const ok = await downloadAttachment(message, true)
     useToastStore.getState().show(ok
-      ? t('im.message.revealStarted', '已完成下载，正在打开文件夹')
+      ? t('im.message.revealStarted', '已在文件夹中定位')
       : t('im.message.revealFailed', '附件下载失败'))
   }
 

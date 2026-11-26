@@ -497,7 +497,9 @@ describe('imStore', () => {
       await vi.advanceTimersByTimeAsync(300)
       await vi.advanceTimersByTimeAsync(300)
       await pending
-      expect(imApi.startAttachmentCache).toHaveBeenCalledWith(12, '包.zip', true)
+      // 定位只走 revealAttachment 一次：/cache 再带 reveal 会让文件夹被打开两次
+      expect(imApi.startAttachmentCache).toHaveBeenCalledWith(12, '包.zip')
+      expect(imApi.revealAttachment).toHaveBeenCalledTimes(1)
       expect(imApi.revealAttachment).toHaveBeenCalledWith(12)
       expect(useImStore.getState().downloadProgress).toBeNull()
     } finally {
