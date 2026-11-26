@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 import re
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -367,6 +367,9 @@ def _mirror_local_expiry(row, incoming: dict) -> None:
     if raw is None:
         raw = incoming.get("license_expiry")
     row.license_expiry = _parse_expiry(raw)
+    # 标记来源：桌面端启动时会用本机授权文件给「没有服务器期限」的账号兜底，
+    # 这条标记保证服务器下发的真值不会被那个兜底逻辑覆盖（管理员改短期限才生效）
+    row.license_expiry_source = "server"
 
 
 def _mirror_local_user(db: Session, incoming: dict, mode: str, password: Optional[str] = None):
@@ -529,6 +532,17 @@ def _local_offline_login(db: Session, username: str, password: str, mode: str):
         return None, "no_local_user"
     if not auth_service.verify_password(password, row.password_hash):
         return None, "bad_password"
+    # 账号在「用户管理」里的授权期限同样是登录闸门（与网页端、桌面端联网登录一致）：
+    # 本机许可文件只是「这台机器」的租约快照，不能替代账号期限。不判这一条的话，
+    # 管理员把期限改短后本机仍能凭旧文件离线直登，表现为「网页端提示已过期、
+    # 桌面端照常能用」。
+    expiry = auth_service.effective_license_expiry(row)
+    if expiry is not None:
+        now = datetime.now(timezone.utc)
+        if expiry.tzinfo is None:
+            expiry = expiry.replace(tzinfo=timezone.utc)
+        if expiry < now:
+            return None, "授权已过期，请联系管理员"
     row.desktop_run_mode = mode
     db.commit()
     return row, ""
@@ -675,21 +689,6 @@ STANDALONE_ONLINE_PROBE_SECONDS = 4
 STANDALONE_FAST_PROBE_SECONDS = 1.2
 
 
-def _task_result_or_none(task: "asyncio.Task") -> Optional[Dict[str, Any]]:
-    """取出已完成的探测任务结果；异常/取消一律当"没探测到"处理。
-
-    必须在这里取一次异常，否则 asyncio 会打 "Task exception was never retrieved"。
-    """
-    if task.cancelled():
-        return None
-    exc = task.exception()
-    if exc is not None:
-        print(f"[DesktopAuth] 服务器探测失败（已按离线登录处理）：{exc}")
-        return None
-    result = task.result()
-    return result if isinstance(result, dict) else None
-
-
 def _finish_offline_login(db: Session, user, mode: str = MODE_STANDALONE) -> Dict[str, Any]:
     """离线登录：本地许可 + 本机账号密码校验通过即签发令牌，不等网络。
 
@@ -757,6 +756,14 @@ def verify_pending_license_once() -> Optional[str]:
             _reject_local_license(exc.message)
         # status_code=0、429 或 >=500：保留标记下轮再试，不误伤离线使用
         return None
+    # 续期响应同时带账号最新的到期日/权限位（「用户管理」是真源）：镜像回本机，
+    # 让离线登录进来的机器也能在联网后收敛到服务器期限，而不是停在文件快照上
+    try:
+        incoming = data.get("user") if isinstance(data, dict) else None
+        if incoming:
+            _sync_permissions_from_remote(incoming)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[DesktopAuth] 续期后同步账号期限失败（忽略）：{exc}")
     cloud.clear_state("needs_license_verify", "license_error")
     print(f"[DesktopAuth] 联网后授权校验通过，已续期至 {data.get('expire_date')}")
     return str(data.get("expire_date") or "")
@@ -833,6 +840,12 @@ def check_session_once() -> Dict[str, Any]:
                     if license_result.get("valid") is False:
                         return _reject_local_license(str(license_result.get("reason") or ""))
                     data["offline"] = False
+                    # 离线登录进来的机器没有云端 jti，这条心跳是唯一能拿到「用户管理」
+                    # 里最新期限的通道：把账号载荷镜像回本机，前端门禁才能在管理员
+                    # 改短期限后按时拦人（否则一直停在授权文件的旧日期上）
+                    synced = _sync_permissions_from_remote(license_result.get("user"))
+                    if synced is not None:
+                        data["user"] = synced
 
     expire_date = verify_pending_license_once()
     state = cloud.load_state()
@@ -953,10 +966,41 @@ def _apply_late_login_result(data: Optional[Dict[str, Any]]) -> None:
         print(f"[DesktopAuth] 迟到的服务器登录结果处理失败（忽略）：{exc}")
 
 
+def _reject_late_login(exc: Exception) -> None:
+    """快速探测迟到且被服务器明确拒绝（4xx）：撤销本次离线登录。
+
+    离线优先登录只等 1.2 秒，而服务器登录要做 TLS + bcrypt，「授权已过期 / 账号
+    已禁用 / 已在其它设备登录」这类明确拒绝常常晚到。旧实现把它连同网络错误一起
+    当成"探测失败"丢掉，等于本地凭据可以绕过服务器闸门。这里补上撤销动作：
+    下一次 30 秒心跳前端就会回到登录页并提示原因。
+    """
+    if not isinstance(exc, cloud.CloudError):
+        print(f"[DesktopAuth] 服务器探测失败（已按离线登录处理）：{exc}")
+        return
+    code = int(exc.status_code or 0)
+    if 400 <= code < 500:
+        print(f"[DesktopAuth] 服务器明确拒绝（HTTP {code}）：{exc.message}，撤销本机离线会话")
+        _reject_local_license(str(exc.message or "授权校验未通过，请重新登录"))
+        return
+    # status_code=0/429/5xx：网络或服务端临时故障，保留离线使用
+    print(f"[DesktopAuth] 服务器探测失败（已按离线登录处理）：{exc}")
+
+
 def _apply_late_login_probe(task: "asyncio.Task") -> None:
-    """asyncio 完成回调：起个线程去补账，绝不在事件循环里做 DB 写。"""
-    data = _task_result_or_none(task)
-    if data is None:
+    """asyncio 完成回调：起个线程去补账/撤销，绝不在事件循环里做 DB 写。"""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        threading.Thread(
+            target=_reject_late_login,
+            args=(exc,),
+            daemon=True,
+            name="npt-late-login-reject",
+        ).start()
+        return
+    data = task.result()
+    if not isinstance(data, dict):
         return
     threading.Thread(
         target=_apply_late_login_result,

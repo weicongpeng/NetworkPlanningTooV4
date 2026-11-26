@@ -157,3 +157,54 @@ def test_desktop_expiry_unauthorized_when_tampered(desktop_license):
     expiry = service.desktop_expiry_datetime()
     assert expiry is not None
     assert expiry.year == 1970
+
+
+def test_license_file_mirror_never_overrides_server_expiry(monkeypatch):
+    """启动时用授权文件兜底，但不得覆盖「用户管理」下发的期限（source=server）。
+
+    回归：每次桌面端启动都把全部账号的 license_expiry 覆写成授权文件日期，
+    管理员在网页端改短的期限因此在桌面端失效（网页端提示过期、桌面端照常能用）。
+    """
+    from datetime import datetime
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from sqlalchemy.pool import StaticPool
+    from app.models.database import Base, User
+    from app.services import license_service as license_module
+
+    engine = create_engine(
+        "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
+    )
+    Base.metadata.create_all(bind=engine)
+    Session = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+
+    db = Session()
+    try:
+        db.add(
+            User(
+                username="from-server",
+                password_hash="x",
+                license_expiry=datetime(2030, 1, 1),
+                license_expiry_source="server",
+            )
+        )
+        db.add(User(username="no-expiry", password_hash="x"))
+        db.commit()
+    finally:
+        db.close()
+
+    service = license_module.license_service
+    monkeypatch.setattr(service, "_get_db", lambda: Session())
+    service._mirror_desktop_license_expiry("2026-11-25")
+
+    db = Session()
+    try:
+        server_user = db.query(User).filter(User.username == "from-server").first()
+        assert server_user.license_expiry == datetime(2030, 1, 1)
+        assert server_user.license_expiry_source == "server"
+
+        fallback = db.query(User).filter(User.username == "no-expiry").first()
+        assert fallback.license_expiry == datetime(2026, 11, 25)
+        assert fallback.license_expiry_source == "license_file"
+    finally:
+        db.close()

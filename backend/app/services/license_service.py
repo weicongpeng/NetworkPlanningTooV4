@@ -303,19 +303,33 @@ class LicenseService:
         return True, f"授权文件已导入，有效期至 {payload.get('expire_date', '')}"
 
     def _mirror_desktop_license_expiry(self, expire_date: Optional[str]) -> None:
-        """桌面模式：把授权到期日镜像到所有本地用户。
+        """桌面模式：把授权文件到期日兜底写入「没有服务器下发期限」的本地账号。
 
         前端门禁（licenseStore.setFromUser）基于 user.license_expiry：
         null 会被视为"无限期已授权"，因此未激活/无效时必须写入一个过去日期。
         失败不影响授权本身（授权校验始终以签名文件为准）。
+
+        **只补缺、不覆盖**：`license_expiry_source == "server"` 的行是「用户管理」
+        下发的真实期限（登录/心跳镜像而来），授权文件只是本机快照 —— 管理员事后在
+        网页端把期限改短时文件不会跟着变，用它覆盖会让桌面端拿到更宽的日期，表现
+        为「网页端提示已过期、桌面端照常能用」。
         """
         try:
+            from sqlalchemy import or_
             from app.models.database import User
 
             value = datetime.strptime(expire_date, "%Y-%m-%d") if expire_date else None
             db = self._get_db()
             try:
-                db.query(User).update({User.license_expiry: value})
+                db.query(User).filter(
+                    or_(
+                        User.license_expiry_source.is_(None),
+                        User.license_expiry_source != "server",
+                    )
+                ).update(
+                    {User.license_expiry: value, User.license_expiry_source: "license_file"},
+                    synchronize_session=False,
+                )
                 db.commit()
             finally:
                 db.close()
@@ -383,7 +397,11 @@ class LicenseService:
         }
 
     def sync_desktop_admin_expiry(self) -> None:
-        """桌面模式启动时调用：让所有本地用户的 license_expiry 与授权文件保持一致。"""
+        """桌面模式启动时调用：用授权文件给「没有服务器期限」的本地账号兜底。
+
+        不能覆盖 `license_expiry_source == "server"` 的账号：那是「用户管理」下发的
+        真实期限，每次启动都用文件日期覆写会让管理员改短的期限在桌面端失效。
+        """
         if not settings.NPT_DESKTOP:
             return
         expiry = self.desktop_expiry_datetime()

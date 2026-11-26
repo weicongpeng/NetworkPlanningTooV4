@@ -890,6 +890,8 @@ def test_mirror_local_expiry_handles_expired_and_unlimited():
     row = UserModel(username="u", password_hash="x")
     _mirror_local_expiry(row, {"effective_license_expiry": "2020-01-02T00:00:00"})
     assert row.license_expiry == datetime(2020, 1, 2)
+    # 标记来源：桌面端启动时用授权文件兜底的逻辑不得覆盖服务器下发的真值
+    assert row.license_expiry_source == "server"
 
     # effective_license_expiry 优先于用户自身的例外期限
     _mirror_local_expiry(
@@ -897,9 +899,11 @@ def test_mirror_local_expiry_handles_expired_and_unlimited():
         {"effective_license_expiry": "2031-05-06T00:00:00", "license_expiry": "2020-01-01T00:00:00"},
     )
     assert row.license_expiry == datetime(2031, 5, 6)
+    assert row.license_expiry_source == "server"
 
     _mirror_local_expiry(row, {"effective_license_expiry": None, "license_expiry": None})
     assert row.license_expiry is None
+    assert row.license_expiry_source == "server"
 
 
 def test_auth_poll_still_pending(local_env):
@@ -1022,3 +1026,149 @@ def test_login_shared_sync_is_deferred(local_env):
     assert calls == ["mode:shared", "timer-started"]
     assert started == [dl.LOGIN_SYNC_DELAY_SECONDS]
     assert "sync" not in calls  # 同步不得在登录路径上同步执行
+
+
+# ---------------------------------------------- 账号授权期限：桌面端不得绕过
+
+def _add_local_user(local_env, username="alice", password="pwd123", **kwargs):
+    db = local_env.session_factory()
+    try:
+        db.add(
+            User(
+                username=username,
+                password_hash=auth_service.hash_password(password),
+                is_active=True,
+                **kwargs,
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+
+def test_offline_login_rejects_expired_account_license(local_env):
+    """本机许可有效但账号在「用户管理」里已过期：不能离线绕过服务器闸门。
+
+    回归：管理员把期限改短后，本机旧的 .nptlic 仍是更晚的日期，离线直登会把
+    过期账号放进系统（表现为「网页端提示已过期、桌面端照常能用」）。
+    """
+    (local_env.settings.LICENSE_DIR / "license.nptlic").write_text(
+        local_env.make_license(), encoding="utf-8"
+    )
+    _add_local_user(
+        local_env,
+        license_expiry=datetime.now() - timedelta(days=1),
+        license_expiry_source="server",
+    )
+
+    def boom(*a, **kw):
+        raise local_env.cloud.CloudError(0, "无法连接授权服务器")
+
+    local_env.monkeypatch.setattr(local_env.cloud, "login", boom)
+
+    resp = local_env.client.post(
+        "/api/v1/desktop/login",
+        json={"username": "alice", "password": "pwd123", "mode": "standalone"},
+    )
+
+    assert resp.status_code == 403, resp.text
+    assert "过期" in resp.json()["detail"]
+
+
+def test_offline_login_allows_user_without_account_expiry(local_env):
+    """账号没设期限（无限期）时行为不变：本机许可有效即可离线登录。"""
+    (local_env.settings.LICENSE_DIR / "license.nptlic").write_text(
+        local_env.make_license(), encoding="utf-8"
+    )
+    _add_local_user(local_env)
+
+    def boom(*a, **kw):
+        raise local_env.cloud.CloudError(0, "无法连接授权服务器")
+
+    local_env.monkeypatch.setattr(local_env.cloud, "login", boom)
+
+    resp = local_env.client.post(
+        "/api/v1/desktop/login",
+        json={"username": "alice", "password": "pwd123", "mode": "standalone"},
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["data"]["offline"] is True
+
+
+def test_late_probe_rejection_revokes_offline_session(local_env):
+    """快速探测迟到但服务器明确拒绝（4xx）：撤销本机离线会话，不再静默丢弃。
+
+    离线优先登录只等 1.2s，服务器「授权已过期」的 403 常常晚到；旧实现把它当作
+    网络失败忽略，等于本地凭据可以绕过服务器闸门。
+    """
+    local_env.cloud.save_state(desktop_username="alice")
+
+    local_env.desktop_local._reject_late_login(
+        local_env.cloud.CloudError(403, "授权已过期，请联系管理员续期")
+    )
+
+    state = local_env.cloud.load_state()
+    assert state.get("kicked") is True
+    assert "过期" in (state.get("license_error") or "")
+
+
+def test_late_probe_network_error_keeps_offline_session(local_env):
+    """网络不可达/5xx 仍按离线可用处理，不能把断网用户踢下线。"""
+    local_env.cloud.save_state(desktop_username="alice")
+
+    local_env.desktop_local._reject_late_login(
+        local_env.cloud.CloudError(0, "无法连接授权服务器")
+    )
+    local_env.desktop_local._reject_late_login(
+        local_env.cloud.CloudError(502, "Bad Gateway")
+    )
+
+    state = local_env.cloud.load_state()
+    assert not state.get("kicked")
+    assert not state.get("license_error")
+
+
+def test_session_status_mirrors_expiry_without_cloud_session(local_env):
+    """离线登录进来的机器没有云端 jti：心跳靠 license/check 回传账号期限并镜像。
+
+    这是「管理员改短期限后桌面端 60s 内收敛」的唯一通道，否则前端门禁一直读
+    本机授权文件的旧日期。
+    """
+    import app.core.database as core_database
+
+    # 本机镜像读写走 SessionLocal（生产是真实库），测试里指到临时库
+    local_env.monkeypatch.setattr(core_database, "SessionLocal", local_env.session_factory)
+    (local_env.settings.LICENSE_DIR / "license.nptlic").write_text(
+        local_env.make_license(), encoding="utf-8"
+    )
+    _add_local_user(
+        local_env,
+        license_expiry=datetime(2030, 1, 1),
+        license_expiry_source="server",
+    )
+    local_env.cloud.save_state(desktop_username="alice")
+    local_env.monkeypatch.setattr(
+        local_env.cloud,
+        "license_check",
+        lambda: {
+            "valid": True,
+            "user": {
+                "username": "alice",
+                "is_admin": False,
+                "effective_license_expiry": "2020-01-02T00:00:00",
+            },
+        },
+    )
+
+    result = local_env.desktop_local.check_session_once()
+
+    assert result["valid"] is True
+    assert result["user"]["effective_license_expiry"]
+    db = local_env.session_factory()
+    try:
+        row = db.query(User).filter(User.username == "alice").first()
+        assert row.license_expiry == datetime(2020, 1, 2)
+        assert row.license_expiry_source == "server"
+    finally:
+        db.close()

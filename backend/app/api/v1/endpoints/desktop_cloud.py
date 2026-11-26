@@ -95,6 +95,35 @@ def _client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
+def _account_payload(db: Session, record) -> Optional[Dict[str, Any]]:
+    """授权绑定的网页端账号载荷（含 effective_license_expiry）；未绑定返回 None。
+
+    客户端心跳/续期拿到它才能把「用户管理」里的最新期限镜像回本机：离线登录
+    进来的机器没有云端 session_jti，这条通道是它唯一能感知管理员改短期限的路径。
+    """
+    user = desktop_license_service._bound_user(db, record)
+    if user is None:
+        return None
+    from app.services.auth_service import auth_service
+
+    return auth_service.user_payload(user)
+
+
+def _account_expired(db: Session, record) -> bool:
+    """授权绑定账号在「用户管理」里是否已过期（管理员不受期限约束）。"""
+    user = desktop_license_service._bound_user(db, record)
+    if user is None or getattr(user, "is_admin", False):
+        return False
+    from app.services.auth_service import auth_service
+
+    expiry = auth_service.effective_license_expiry(user)
+    if expiry is None:
+        return False
+    if expiry.tzinfo is None:
+        expiry = expiry.replace(tzinfo=timezone.utc)
+    return expiry < datetime.now(timezone.utc)
+
+
 def _payload_data(record, license_file: str, expire_date: str) -> Dict[str, Any]:
     return {
         "license_file": license_file,
@@ -451,7 +480,7 @@ async def check_license(
     """只校验授权当前状态，不续期；供没有云端会话标识的本机登录心跳使用。"""
     _rate_limit(f"session:{_client_ip(request)}", limit=120, window=300)
     try:
-        _verify_license(payload.license_file, payload.machine_code, db)
+        record, _ = _verify_license(payload.license_file, payload.machine_code, db)
     except HTTPException as exc:
         if exc.status_code in (400, 403, 404, 409):
             return {
@@ -463,7 +492,23 @@ async def check_license(
                 },
             }
         raise
-    return {"success": True, "data": {"valid": True}}
+    # 机器许可有效不代表账号还有效：账号期限过期要和网页端一样拦住，
+    # 否则离线登录进来的桌面端会一直显示可用
+    if _account_expired(db, record):
+        return {
+            "success": True,
+            "data": {
+                "valid": False,
+                "reason": "授权已过期，请联系管理员",
+                "license_invalid": True,
+                "user": _account_payload(db, record),
+            },
+        }
+    data: Dict[str, Any] = {"valid": True}
+    account = _account_payload(db, record)
+    if account is not None:
+        data["user"] = account
+    return {"success": True, "data": data}
 
 
 @router.post("/license/renew")
@@ -482,7 +527,12 @@ async def renew_license(
         )
     except DesktopLicenseError as exc:
         raise HTTPException(status_code=exc.status_code, detail=_gbk_safe(exc.message))
-    return {"success": True, "data": _payload_data(record, license_file, expire_date)}
+    data = _payload_data(record, license_file, expire_date)
+    # 续期顺手带回账号期限/权限位：客户端据此把「用户管理」的真值镜像回本机
+    account = _account_payload(db, record)
+    if account is not None:
+        data["user"] = account
+    return {"success": True, "data": data}
 
 
 @router.post("/license/apply")

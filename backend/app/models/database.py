@@ -40,6 +40,9 @@ class User(Base):
     is_desktop_shadow = Column(Boolean, default=False, nullable=False)
     must_change_password = Column(Boolean, default=False, nullable=False)
     license_expiry = Column(DateTime, nullable=True)
+    # 到期日来源：server=「用户管理」下发（唯一真源）/ license_file=本机授权文件兜底
+    # 桌面端启动会用授权文件补缺，但绝不能覆盖 server 值（否则管理员改短的期限失效）
+    license_expiry_source = Column(String(16), nullable=True)
     total_usage_seconds = Column(Integer, default=0, nullable=False)
     last_login = Column(DateTime, nullable=True)
     last_login_ip = Column(String(45), nullable=True)

@@ -568,9 +568,20 @@ class DesktopLicenseService:
 
         到期以「用户管理 → 许可证到期」为准（账号例外期限优先，其次全局期限）；
         账号侧未设期限（管理员/未绑定账号）时退回租约天数推算。
+
+        账号期限已过时直接拒绝签发：签出一份「出生即过期」的许可文件只会让客户端
+        在 license_service.activate 里报「文件已过期」（500，被当成临时故障反复重试），
+        用户看不到真正原因。这里提前给出 403，客户端据此撤销本机会话。
         """
+        override = self.user_expire_override(db, record)
+        if override:
+            try:
+                if datetime.strptime(override, "%Y-%m-%d").date() < _now().date():
+                    raise DesktopLicenseError(403, "授权已过期，请联系管理员续期")
+            except ValueError:
+                pass
         expire_date = (
-            self.user_expire_override(db, record)
+            override
             or (_now().date() + timedelta(days=int(record.lease_days or 30))).isoformat()
         )
         payload: Dict[str, Any] = {
@@ -684,6 +695,21 @@ class DesktopLicenseService:
             raise DesktopLicenseError(409, "许可与本机机器码不匹配")
         if payload.get("machine_code") and payload.get("machine_code") != machine:
             raise DesktopLicenseError(409, "许可文件与本机机器码不匹配")
+
+        # 账号期限（「用户管理」）是唯一真源：过期后不再续签，否则会签出一份
+        # 「出生即过期」的许可文件，客户端把它当成文件校验失败（500）反复重试，
+        # 用户只看到"联网校验异常"而不是"授权已过期"。
+        bound = self._bound_user(db, record)
+        if bound is not None and not getattr(bound, "is_admin", False):
+            from app.services.auth_service import auth_service
+
+            expiry = auth_service.effective_license_expiry(bound)
+            if expiry is not None:
+                now = datetime.now(timezone.utc)
+                if expiry.tzinfo is None:
+                    expiry = expiry.replace(tzinfo=timezone.utc)
+                if expiry < now:
+                    raise DesktopLicenseError(403, "授权已过期，请联系管理员续期")
 
         record.renewal_count = (record.renewal_count or 0) + 1
         record.last_renewed_at = _iso()

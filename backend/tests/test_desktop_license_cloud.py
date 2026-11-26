@@ -483,3 +483,77 @@ def test_data_changes_reports_group_change(cloud_env):
     finally:
         data_service.index.pop("ds-test-1", None)
         revs.remove("ds-test-1")
+
+
+def _bind_account(cloud_env, license_id: int, *, username: str = "张三", days: int | None = -1):
+    """把授权记录绑定到「用户管理」里的账号，模拟桌面端共享模式登录后的状态。"""
+    from app.models.database import DesktopLicense, User
+
+    db = cloud_env.session_factory()
+    try:
+        user = User(
+            username=username,
+            password_hash="x",
+            is_active=True,
+            license_expiry=None if days is None else datetime.now() + timedelta(days=days),
+        )
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+        record = db.query(DesktopLicense).filter(DesktopLicense.id == license_id).first()
+        record.username = username
+        record.user_id = user.id
+        db.commit()
+        return user.id
+    finally:
+        db.close()
+
+
+def test_expired_account_blocks_check_and_renew(cloud_env):
+    """机器许可仍有效但账号在「用户管理」里已过期：心跳/续期都要拒绝。
+
+    回归：桌面端离线登录后只做 license/check（不碰账号），账号过期也照常可用。
+    """
+    record = _create(cloud_env.client)
+    license_file = _activate(cloud_env.client, record["activation_code"]).json()["data"]["license_file"]
+    _bind_account(cloud_env, record["id"], days=-1)
+
+    checked = cloud_env.client.post(
+        "/api/v1/desktop-cloud/license/check",
+        json={"license_file": license_file, "machine_code": MACHINE_A},
+    )
+    assert checked.status_code == 200, checked.text
+    data = checked.json()["data"]
+    assert data["valid"] is False
+    assert "过期" in data["reason"]
+    assert data["license_invalid"] is True
+
+    renewed = cloud_env.client.post(
+        "/api/v1/desktop-cloud/license/renew",
+        json={"license_file": license_file, "machine_code": MACHINE_A},
+    )
+    assert renewed.status_code == 403, renewed.text
+    assert "过期" in renewed.json()["detail"]
+
+
+def test_check_returns_account_payload_for_expiry_mirroring(cloud_env):
+    """心跳/续期回传账号载荷（含 effective_license_expiry）：客户端据此镜像到本机。"""
+    record = _create(cloud_env.client)
+    license_file = _activate(cloud_env.client, record["activation_code"]).json()["data"]["license_file"]
+    _bind_account(cloud_env, record["id"], days=10)
+
+    checked = cloud_env.client.post(
+        "/api/v1/desktop-cloud/license/check",
+        json={"license_file": license_file, "machine_code": MACHINE_A},
+    )
+    assert checked.status_code == 200, checked.text
+    payload = checked.json()["data"]
+    assert payload["valid"] is True
+    assert payload["user"]["effective_license_expiry"]
+
+    renewed = cloud_env.client.post(
+        "/api/v1/desktop-cloud/license/renew",
+        json={"license_file": license_file, "machine_code": MACHINE_A},
+    )
+    assert renewed.status_code == 200, renewed.text
+    assert renewed.json()["data"]["user"]["effective_license_expiry"]
