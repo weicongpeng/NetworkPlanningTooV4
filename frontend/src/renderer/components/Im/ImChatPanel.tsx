@@ -9,6 +9,7 @@ import {
 import { imApi } from '../../services/api'
 import { useAuthStore } from '../../store/authStore'
 import { useImStore } from '../../store/imStore'
+import { useThemeStore } from '../../store/themeStore'
 import { useToastStore } from '../../store/toastStore'
 import { ImAvatar } from './ImAvatar'
 import { ImComposer } from './ImComposer'
@@ -37,6 +38,7 @@ const EMPTY_MESSAGES: ImMessage[] = []
 
 export function ImChatPanel({ conversation, pendingPeer, narrow, onBack }: Props) {
   const { t } = useTranslation()
+  const lightTheme = useThemeStore(s => s.themeMode === 'light')
   const currentUserId = useAuthStore(s => imUserId(s.user))
   const currentUser = useAuthStore(s => s.user)
   const desktopMode = useAuthStore(s => s.desktopMode)
@@ -285,7 +287,7 @@ export function ImChatPanel({ conversation, pendingPeer, narrow, onBack }: Props
         ? imDisplayName(pendingPeer.user)
         : t('im.sidebar.unknownUser', '用户')
       return (
-        <div className={`relative flex min-w-0 flex-1 flex-col bg-background/30 ${narrow ? 'im-pane-in' : ''}`}>
+        <div className={`relative flex min-w-0 flex-1 flex-col ${lightTheme ? 'bg-[#FAFAFA]' : 'bg-background/30'} ${narrow ? 'im-pane-in' : ''}`}>
           <header className="flex h-8 shrink-0 items-center gap-2 border-b border-border/60 bg-card/70 px-2 backdrop-blur-sm">
             {narrow && (
               <button type="button" onClick={onBack} title={t('im.chat.back', '返回列表')}
@@ -304,7 +306,9 @@ export function ImChatPanel({ conversation, pendingPeer, narrow, onBack }: Props
       )
     }
     return (
-      <div className="relative flex flex-1 flex-col items-center justify-center gap-3 bg-background/40 text-muted-foreground">
+      <div className={`relative flex flex-1 flex-col items-center justify-center gap-3 text-muted-foreground ${
+        lightTheme ? 'bg-[#FAFAFA]' : 'bg-background/40'
+      }`}>
         {/* 空态下 ImComposer 不渲染，错误条只在这里出现，不会与输入区的错误条重复 */}
         {error && (!errorScope || errorScope === 'global' || (activeId !== null && [
           `messages:${activeId}`, `send:${activeId}`,
@@ -329,7 +333,7 @@ export function ImChatPanel({ conversation, pendingPeer, narrow, onBack }: Props
   }
 
   return (
-    <div className={`relative flex min-w-0 flex-1 flex-col bg-background/30 ${narrow ? 'im-pane-in' : ''}`}
+    <div className={`relative flex min-w-0 flex-1 flex-col ${lightTheme ? 'bg-[#FAFAFA]' : 'bg-background/30'} ${narrow ? 'im-pane-in' : ''}`}
          onPointerDown={() => markConversationRead(conversation.id)}>
       <header className="flex h-8 shrink-0 items-center gap-2 border-b border-border/60 bg-card/70 px-2 backdrop-blur-sm">
         {narrow && (
@@ -398,8 +402,7 @@ export function ImChatPanel({ conversation, pendingPeer, narrow, onBack }: Props
       )}
 
       <div ref={scrollRef} onScroll={onScroll}
-           className="relative min-h-0 flex-1 overflow-y-auto px-4 py-4"
-           style={{ backgroundImage: 'radial-gradient(hsl(var(--muted-foreground) / 0.07) 1px, transparent 1px)', backgroundSize: '18px 18px' }}>
+           className="relative min-h-0 flex-1 overflow-y-auto px-4 py-4">
         <div ref={contentRef} className="flex min-h-full flex-col space-y-3">
         {cursor?.hasMore && (
           <div className="flex justify-center">

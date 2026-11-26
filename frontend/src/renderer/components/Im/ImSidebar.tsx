@@ -1,5 +1,6 @@
 /** 左侧导航：消息 / 通讯录双 Tab、近期会话、在线离线联系人与群组。 */
-import { useMemo, useState } from 'react'
+import { useMemo, useRef, useState } from 'react'
+import type { PointerEvent as ReactPointerEvent } from 'react'
 import { useTranslation } from 'react-i18next'
 import {
   Building2, MessageSquare, Plus, Search, Settings2, Users,
@@ -7,6 +8,7 @@ import {
 
 import { useAuthStore } from '../../store/authStore'
 import { useImStore } from '../../store/imStore'
+import { useThemeStore } from '../../store/themeStore'
 import { ImAvatar } from './ImAvatar'
 import { systemNoticeText } from './ImSystemNotice'
 import { openUserSettings } from './userSettingsBus'
@@ -34,6 +36,29 @@ function lastMessagePreview(last: ImLastMessage | null, t: Tr): string {
 
 export function ImSidebar({ onOpenChat }: Props) {
   const { t } = useTranslation()
+  const lightTheme = useThemeStore(s => s.themeMode === 'light')
+  // 侧栏宽度可拖拽，上次宽度本地留存；220~480 保证会话列表与聊天区都够用
+  const [sidebarWidth, setSidebarWidth] = useState(() => {
+    const saved = Number(localStorage.getItem('im-sidebar-width'))
+    return Number.isFinite(saved) && saved >= 220 ? Math.min(480, saved) : 300
+  })
+  const sidebarResizeRef = useRef<{ x: number; width: number } | null>(null)
+
+  const onSidebarResizeDown = (event: ReactPointerEvent<HTMLDivElement>) => {
+    event.preventDefault()
+    sidebarResizeRef.current = { x: event.clientX, width: sidebarWidth }
+    event.currentTarget.setPointerCapture(event.pointerId)
+  }
+  const onSidebarResizeMove = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const drag = sidebarResizeRef.current
+    if (!drag) return
+    setSidebarWidth(Math.min(480, Math.max(220, drag.width + event.clientX - drag.x)))
+  }
+  const onSidebarResizeUp = () => {
+    if (!sidebarResizeRef.current) return
+    sidebarResizeRef.current = null
+    try { localStorage.setItem('im-sidebar-width', String(sidebarWidth)) } catch { /* 忽略 */ }
+  }
   // 包一层简单签名，避免 i18next TFunction 重载签名与纯函数类型不兼容
   const tr: Tr = (key, options) => String(t(key, options as never))
   const activeTab = useImStore(s => s.activeTab)
@@ -101,7 +126,8 @@ export function ImSidebar({ onOpenChat }: Props) {
   }
 
   return (
-    <aside className="flex w-[300px] shrink-0 flex-col border-r border-border/60 bg-card/60 backdrop-blur-sm">
+    <aside className="relative flex shrink-0 flex-col border-r border-border/60 bg-card/60 backdrop-blur-sm"
+           style={{ width: sidebarWidth }}>
       <div className="shrink-0 px-3 pt-3">
         <div className="relative flex rounded-xl bg-muted/60 p-1">
           <div className={`absolute inset-y-1 w-[calc(50%-4px)] rounded-lg bg-card shadow-sm transition-transform duration-300
@@ -126,7 +152,9 @@ export function ImSidebar({ onOpenChat }: Props) {
             placeholder={activeTab === 'messages'
               ? t('im.sidebar.searchMessages', '搜索近期聊天')
               : t('im.sidebar.searchContacts', '搜索联系人或群组')}
-            className="h-8 w-full rounded-lg border border-border/60 bg-background/60 pl-8 pr-2 text-xs outline-none transition-colors placeholder:text-muted-foreground/70 focus:border-primary/60 focus:ring-2 focus:ring-primary/10"
+            className={`h-8 w-full rounded-lg border border-border/60 pl-8 pr-2 text-xs outline-none transition-colors placeholder:text-muted-foreground/70 focus:border-primary/60 focus:ring-2 focus:ring-primary/10 ${
+              lightTheme ? 'bg-[#FAFAFA]' : 'bg-background/60'
+            }`}
           />
         </div>
       </div>
@@ -237,6 +265,16 @@ export function ImSidebar({ onOpenChat }: Props) {
           <Settings2 size={14} className="shrink-0 text-muted-foreground" />
         </button>
       )}
+
+      {/* 拖拽此分隔条调整侧栏宽度；absolute 覆盖在右边界上，不占用布局 */}
+      <div
+        title={t('im.sidebar.resizeHint', '拖拽调整侧栏宽度')}
+        onPointerDown={onSidebarResizeDown}
+        onPointerMove={onSidebarResizeMove}
+        onPointerUp={onSidebarResizeUp}
+        onPointerCancel={onSidebarResizeUp}
+        className="absolute -right-0.5 top-0 z-20 h-full w-1.5 cursor-col-resize touch-none transition-colors hover:bg-primary/40"
+      />
     </aside>
   )
 }

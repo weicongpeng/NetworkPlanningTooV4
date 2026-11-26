@@ -5,8 +5,7 @@ import { persist } from 'zustand/middleware'
 import { imApi } from '../services/api'
 import { clearImAttachmentCache } from '../services/imAttachmentCache'
 import {
-  clearAllMeta, clearAllSnapshots, readAllSnapshots, readMeta,
-  readSnapshot, writeMeta, writeSnapshot,
+  readAllSnapshots, readMeta, readSnapshot, writeMeta, writeSnapshot,
 } from '../services/imLocalCache'
 import {
   IM_MESSAGE_EVENT, IM_PRESENCE_EVENT, IM_RECALL_EVENT, IM_RESYNC_EVENT,
@@ -1614,8 +1613,10 @@ export const useImStore = create<ImState>()(
         membersInFlight.clear()
         membersFetchedAt.clear()
         clearImAttachmentCache()
-        void clearAllSnapshots()
-        void clearAllMeta()
+        // 快照/元数据按用户 id 前缀隔离（conv:<im_user_id>:<会话 id>），切账号不会串号。
+        // 这里只清内存态，保留 IndexedDB 里的本地历史：否则每次登录（桌面端每次启动
+        // 也会登录）都把快照抹掉，bootstrap 读不到任何缓存，打开聊天框只能对着骨架屏
+        // 等公网 relay 的半秒往返。
         metaWriteAt.clear()
         snapshotWriteAt.clear()
         hydrateVersion.clear()

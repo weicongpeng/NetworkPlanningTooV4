@@ -21,6 +21,7 @@ import {
 import { imApi } from '../../services/api'
 import { useAuthStore } from '../../store/authStore'
 import { IM_COMPOSER_FILL_EVENT, useImStore } from '../../store/imStore'
+import { useThemeStore } from '../../store/themeStore'
 import { useToastStore } from '../../store/toastStore'
 import { EMOJI_GROUPS } from './emojis'
 import { ImMentionPopup } from './ImMentionPopup'
@@ -73,6 +74,7 @@ export function ImComposer({ conversationId, onSent }: {
   onSent?: () => void
 }) {
   const { t } = useTranslation()
+  const lightTheme = useThemeStore(s => s.themeMode === 'light')
   const [text, setText] = useState('')
   const [pending, setPending] = useState<PendingAttachment[]>([])
   const [emojiOpen, setEmojiOpen] = useState(false)
@@ -523,117 +525,6 @@ export function ImComposer({ conversationId, onSent }: {
         </div>
       )}
 
-      <div className="order-last flex items-center gap-1 px-3 pb-3 pt-2">
-        <ToolButton title={t('im.composer.sendImage', '添加图片')}
-                    onClick={() => imageInputRef.current?.click()}>
-          <ImagePlus size={17} />
-        </ToolButton>
-        <div className="relative flex items-center" ref={screenshotRef}>
-          <ToolButton
-            title={`${t('im.composer.screenshot', '截图')}（${formatHotkey(screenshotSettings.hotkey)}）`}
-            onClick={() => { setScreenshotMenuOpen(false); requestScreenshot() }}>
-            <Scissors size={17} />
-          </ToolButton>
-          <button type="button"
-                  title={t('im.composer.screenshotOptions', '截图选项')}
-                  onClick={() => setScreenshotMenuOpen(value => !value)}
-                  className="flex h-8 w-4 items-center justify-center rounded-r-lg text-muted-foreground transition-colors hover:bg-accent hover:text-primary cursor-pointer">
-            <ChevronDown size={12} />
-          </button>
-          {screenshotMenuOpen && (
-            <div className="absolute bottom-10 left-0 z-20 w-[228px] rounded-xl border border-border bg-popover p-1.5 shadow-xl">
-              <button type="button"
-                      onClick={() => { setScreenshotMenuOpen(false); void toggleHideImWindow() }}
-                      className="flex w-full items-center gap-2 rounded-lg px-2 py-2 text-left text-xs hover:bg-accent cursor-pointer">
-                <EyeOff size={14} className="shrink-0 text-muted-foreground" />
-                <span className="flex-1">
-                  {t('im.screenshot.settings.hideImWindow', '隐藏窗口截图')}
-                </span>
-                {screenshotSettings.hideImWindow && <Check size={14} className="text-primary" />}
-              </button>
-              <button type="button"
-                      onClick={() => { setScreenshotMenuOpen(false); openScreenshotSettings() }}
-                      className="flex w-full items-center gap-2 rounded-lg px-2 py-2 text-left text-xs hover:bg-accent cursor-pointer">
-                <Settings2 size={14} className="shrink-0 text-muted-foreground" />
-                <span className="flex-1">{t('im.screenshot.settings.title', '截图设置')}</span>
-              </button>
-              <p className="border-t border-border/60 px-2 pb-0.5 pt-1.5 text-[10px] leading-relaxed text-muted-foreground">
-                {t('im.composer.screenshotHotkeyHint', {
-                  defaultValue: '快捷键 {{hotkey}}',
-                  hotkey: formatHotkey(screenshotSettings.hotkey),
-                })}
-              </p>
-            </div>
-          )}
-        </div>
-        <ToolButton title={t('im.composer.sendFile', '添加文件')}
-                    onClick={() => fileInputRef.current?.click()}>
-          <Paperclip size={17} />
-        </ToolButton>
-        <div className="relative" ref={emojiRef}>
-          <ToolButton title={t('im.composer.emoji', '表情')}
-                      onClick={() => setEmojiOpen(value => !value)}>
-            <Smile size={17} />
-          </ToolButton>
-          {emojiOpen && (
-            <div className="absolute bottom-10 left-0 z-20 w-[286px] rounded-xl border border-border bg-popover p-2 shadow-xl">
-              <div className="mb-1.5 flex gap-0.5 border-b border-border/60 pb-1.5">
-                {EMOJI_GROUPS.map((group, index) => (
-                  <button key={group.key} type="button" title={t(group.key)}
-                          onClick={() => setEmojiGroup(index)}
-                          className={`flex h-7 flex-1 items-center justify-center rounded-md text-base transition-colors cursor-pointer
-                            ${emojiGroup === index ? 'bg-primary/15' : 'hover:bg-accent'}`}>
-                    {group.icon}
-                  </button>
-                ))}
-              </div>
-              <p className="mb-1 px-0.5 text-[10px] text-muted-foreground">
-                {t(EMOJI_GROUPS[emojiGroup].key)}
-              </p>
-              <div className="grid max-h-[168px] grid-cols-8 gap-0.5 overflow-y-auto">
-                {EMOJI_GROUPS[emojiGroup].emojis.map((emoji, index) => (
-                  <button key={`${emojiGroup}-${index}`} type="button"
-                          onClick={() => {
-                            updateText((textareaRef.current?.value ?? text) + emoji)
-                            textareaRef.current?.focus()
-                          }}
-                          className="flex h-8 w-8 items-center justify-center rounded-lg text-lg hover:bg-accent cursor-pointer">
-                    {emoji}
-                  </button>
-                ))}
-              </div>
-            </div>
-          )}
-        </div>
-        {hasPendingMention && (
-          <button type="button" onClick={clearMentions}
-                  title={t('im.mention.clear', '清除 @')}
-                  className="flex items-center gap-1 rounded-md bg-primary/10 px-2 py-0.5 text-[10px] text-primary hover:bg-primary/20 cursor-pointer">
-            <AtSign size={11} />
-            {pendingMentions.mention_all
-              ? t('im.mention.allLabel', '@所有人')
-              : t('im.mention.count', {
-                defaultValue: '@ {{count}} 人', count: pendingMentions.mentions.length,
-              })}
-            <X size={10} />
-          </button>
-        )}
-        <button
-          type="button"
-          onClick={() => void submit()}
-          disabled={disabled}
-          title={t('im.composer.sendMessage', '发送消息')}
-          className={`ml-auto flex h-[30px] min-w-[66px] shrink-0 items-center justify-center gap-1 rounded-lg px-3 text-xs font-medium transition-all cursor-pointer ${
-            hasInput
-              ? 'bg-primary text-primary-foreground shadow-lg hover:brightness-110 active:scale-95 disabled:opacity-60 disabled:shadow-none'
-              : 'bg-muted text-muted-foreground shadow-none'
-          }`}
-        >
-          {(busy || sending) && <Loader2 size={13} className="animate-spin" />}
-          {t('im.send', '发送')}
-        </button>
-      </div>
-
       {replyTo && (
         <div className="mx-3 mt-2 flex items-center gap-2 rounded-lg border-l-2 border-primary bg-primary/5 px-3 py-1.5 text-[11px]">
           <div className="min-w-0 flex-1">
@@ -669,7 +560,9 @@ export function ImComposer({ conversationId, onSent }: {
         <span className="h-1 w-10 rounded-full bg-border transition-colors hover:bg-primary/60" />
       </div>
 
-      <div className="px-3 pt-1.5">
+      <div className={`mx-3 mb-3 flex flex-col rounded-xl border border-border/70 transition-colors focus-within:border-primary/70 focus-within:ring-2 focus-within:ring-primary/15 ${
+        lightTheme ? 'bg-[#FAFAFA]' : 'bg-background/70'
+      }`}>
         <textarea
           ref={textareaRef}
           value={text}
@@ -678,8 +571,118 @@ export function ImComposer({ conversationId, onSent }: {
           onKeyDown={onComposerKeyDown}
           placeholder={t('im.composer.placeholder', '输入消息，输入 @ 可点名成员，粘贴截图/拖入文件后确认再发送…')}
           style={{ height: inputHeight }}
-          className="block min-h-[54px] w-full resize-none rounded-xl border border-border/70 bg-background/70 px-3 py-2 text-[13px] leading-relaxed text-foreground outline-none transition-colors placeholder:text-muted-foreground/70 focus:border-primary/70 focus:ring-2 focus:ring-primary/15"
+          className="block min-h-[54px] w-full resize-none bg-transparent px-3 py-2 text-[13px] leading-relaxed text-foreground outline-none placeholder:text-muted-foreground/70"
         />
+        <div className="order-last flex items-center gap-1 px-2 pb-2 pt-1">
+          <ToolButton title={t('im.composer.sendImage', '添加图片')}
+                      onClick={() => imageInputRef.current?.click()}>
+            <ImagePlus size={17} />
+          </ToolButton>
+          <div className="relative flex items-center" ref={screenshotRef}>
+            <ToolButton
+              title={`${t('im.composer.screenshot', '截图')}（${formatHotkey(screenshotSettings.hotkey)}）`}
+              onClick={() => { setScreenshotMenuOpen(false); requestScreenshot() }}>
+              <Scissors size={17} />
+            </ToolButton>
+            <button type="button"
+                    title={t('im.composer.screenshotOptions', '截图选项')}
+                    onClick={() => setScreenshotMenuOpen(value => !value)}
+                    className="flex h-8 w-4 items-center justify-center text-muted-foreground transition-colors hover:text-primary cursor-pointer">
+              <ChevronDown size={12} />
+            </button>
+            {screenshotMenuOpen && (
+              <div className="absolute bottom-10 left-0 z-20 w-[228px] rounded-xl border border-border bg-popover p-1.5 shadow-xl">
+                <button type="button"
+                        onClick={() => { setScreenshotMenuOpen(false); void toggleHideImWindow() }}
+                        className="flex w-full items-center gap-2 rounded-lg px-2 py-2 text-left text-xs hover:bg-accent cursor-pointer">
+                  <EyeOff size={14} className="shrink-0 text-muted-foreground" />
+                  <span className="flex-1">
+                    {t('im.screenshot.settings.hideImWindow', '隐藏窗口截图')}
+                  </span>
+                  {screenshotSettings.hideImWindow && <Check size={14} className="text-primary" />}
+                </button>
+                <button type="button"
+                        onClick={() => { setScreenshotMenuOpen(false); openScreenshotSettings() }}
+                        className="flex w-full items-center gap-2 rounded-lg px-2 py-2 text-left text-xs hover:bg-accent cursor-pointer">
+                  <Settings2 size={14} className="shrink-0 text-muted-foreground" />
+                  <span className="flex-1">{t('im.screenshot.settings.title', '截图设置')}</span>
+                </button>
+                <p className="border-t border-border/60 px-2 pb-0.5 pt-1.5 text-[10px] leading-relaxed text-muted-foreground">
+                  {t('im.composer.screenshotHotkeyHint', {
+                    defaultValue: '快捷键 {{hotkey}}',
+                    hotkey: formatHotkey(screenshotSettings.hotkey),
+                  })}
+                </p>
+              </div>
+            )}
+          </div>
+          <ToolButton title={t('im.composer.sendFile', '添加文件')}
+                      onClick={() => fileInputRef.current?.click()}>
+            <Paperclip size={17} />
+          </ToolButton>
+          <div className="relative" ref={emojiRef}>
+            <ToolButton title={t('im.composer.emoji', '表情')}
+                        onClick={() => setEmojiOpen(value => !value)}>
+              <Smile size={17} />
+            </ToolButton>
+            {emojiOpen && (
+              <div className="absolute bottom-10 left-0 z-20 w-[286px] rounded-xl border border-border bg-popover p-2 shadow-xl">
+                <div className="mb-1.5 flex gap-0.5 border-b border-border/60 pb-1.5">
+                  {EMOJI_GROUPS.map((group, index) => (
+                    <button key={group.key} type="button" title={t(group.key)}
+                            onClick={() => setEmojiGroup(index)}
+                            className={`flex h-7 flex-1 items-center justify-center rounded-md text-base transition-colors cursor-pointer
+                              ${emojiGroup === index ? 'bg-primary/15' : 'hover:bg-accent'}`}>
+                      {group.icon}
+                    </button>
+                  ))}
+                </div>
+                <p className="mb-1 px-0.5 text-[10px] text-muted-foreground">
+                  {t(EMOJI_GROUPS[emojiGroup].key)}
+                </p>
+                <div className="grid max-h-[168px] grid-cols-8 gap-0.5 overflow-y-auto">
+                  {EMOJI_GROUPS[emojiGroup].emojis.map((emoji, index) => (
+                    <button key={`${emojiGroup}-${index}`} type="button"
+                            onClick={() => {
+                              updateText((textareaRef.current?.value ?? text) + emoji)
+                              textareaRef.current?.focus()
+                            }}
+                            className="flex h-8 w-8 items-center justify-center rounded-lg text-lg hover:bg-accent cursor-pointer">
+                      {emoji}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+          {hasPendingMention && (
+            <button type="button" onClick={clearMentions}
+                    title={t('im.mention.clear', '清除 @')}
+                    className="flex items-center gap-1 rounded-md bg-primary/10 px-2 py-0.5 text-[10px] text-primary hover:bg-primary/20 cursor-pointer">
+              <AtSign size={11} />
+              {pendingMentions.mention_all
+                ? t('im.mention.allLabel', '@所有人')
+                : t('im.mention.count', {
+                  defaultValue: '@ {{count}} 人', count: pendingMentions.mentions.length,
+                })}
+              <X size={10} />
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={() => void submit()}
+            disabled={disabled}
+            title={t('im.composer.sendMessage', '发送消息')}
+            className={`ml-auto flex h-[30px] min-w-[66px] shrink-0 items-center justify-center gap-1 rounded-lg px-3 text-xs font-medium transition-all cursor-pointer ${
+              hasInput
+                ? 'bg-primary text-primary-foreground shadow-lg hover:brightness-110 active:scale-95 disabled:opacity-60 disabled:shadow-none'
+                : `${lightTheme ? 'bg-[#EDEDED]' : 'bg-muted'} text-muted-foreground shadow-none`
+            }`}
+          >
+            {(busy || sending) && <Loader2 size={13} className="animate-spin" />}
+            {t('im.send', '发送')}
+          </button>
+        </div>
       </div>
 
       <input ref={imageInputRef} type="file" accept="image/*" multiple hidden
@@ -699,7 +702,7 @@ function ToolButton({ title, onClick, children }: {
   return (
     <button
       type="button" title={title} onClick={onClick}
-      className="flex h-8 w-8 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-accent hover:text-primary cursor-pointer"
+      className="flex h-8 w-8 items-center justify-center text-muted-foreground transition-colors hover:text-primary cursor-pointer"
     >
       {children}
     </button>
