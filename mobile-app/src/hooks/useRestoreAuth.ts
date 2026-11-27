@@ -12,6 +12,7 @@
 import { useEffect } from 'react';
 import { useMapStore } from '../store/mapStore';
 import { getStoredUser, getToken, fetchMe } from '../services/auth';
+import { useImStore } from '../store/imStore';
 
 export function useRestoreAuth() {
   const setLoggedIn = useMapStore((s) => s.setLoggedIn);
@@ -27,6 +28,7 @@ export function useRestoreAuth() {
 
         if (stored && token && !cancelled) {
           setLoggedIn(stored);
+          void useImStore.getState().bootstrap();
         }
 
         // 2. 若有 token，尝试从后端拉取最新用户信息（静默失败）

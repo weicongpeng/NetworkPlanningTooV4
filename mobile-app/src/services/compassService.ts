@@ -35,9 +35,14 @@ interface SensorVector {
 }
 
 // 平滑滤波器窗口大小，越大越平滑但延迟越高
-const SMOOTH_WINDOW_SIZE = 8;
-// 朝向变化最小阈值（度），低于此变化不通知，避免抖动
-const HEADING_CHANGE_THRESHOLD = 3;
+const SMOOTH_WINDOW_SIZE = 10;
+// 朝向变化死区阈值（度），低于此变化不通知，避免抖动
+const HEADING_CHANGE_THRESHOLD = 6;
+// 大幅跳变判定阈值（度）：行车抖动/车内电磁干扰时磁力计可能出现瞬时大跳变，
+// 超过该角度的变化必须连续多个采样同向确认后才采用，防止导航图标随意旋转
+const JUMP_DETECT_DEG = 45;
+// 大幅跳变确认所需的连续同向采样次数（约 SENSOR_INTERVAL_MS × N 毫秒内持续同向变化）
+const JUMP_CONFIRM_COUNT = 2;
 // 传感器采样间隔（毫秒）
 const SENSOR_INTERVAL_MS = 100;
 
@@ -54,6 +59,10 @@ class CompassService {
   // 平滑滤波：环形缓冲
   private headingBuffer: number[] = [];
   private lastOutputHeading: number | null = null;
+
+  // 大幅跳变待确认状态：pendingJumpDir 1=顺时针 -1=逆时针 0=无
+  private pendingJumpDir = 0;
+  private pendingJumpCount = 0;
 
   private callback: HeadingCallback | null = null;
   private isRunning = false;
@@ -72,6 +81,8 @@ class CompassService {
     this.lastMag = null;
     this.headingBuffer = [];
     this.lastOutputHeading = null;
+    this.pendingJumpDir = 0;
+    this.pendingJumpCount = 0;
 
     Accelerometer.setUpdateInterval(SENSOR_INTERVAL_MS);
     Magnetometer.setUpdateInterval(SENSOR_INTERVAL_MS);
@@ -120,6 +131,8 @@ class CompassService {
     this.lastMag = null;
     this.headingBuffer = [];
     this.lastOutputHeading = null;
+    this.pendingJumpDir = 0;
+    this.pendingJumpCount = 0;
     console.log('[CompassService] 罗盘监听已停止');
   }
 
@@ -138,10 +151,39 @@ class CompassService {
     const smoothed = this.getSmoothedHeading();
     if (smoothed === null) return;
 
-    // 朝向变化阈值过滤
+    // 朝向变化过滤：死区 + 大幅跳变确认（防抖）
     if (this.lastOutputHeading !== null) {
-      const diff = Math.abs(this.angleDiff(smoothed, this.lastOutputHeading));
-      if (diff < HEADING_CHANGE_THRESHOLD) return;
+      const diff = this.angleDiff(smoothed, this.lastOutputHeading);
+      const absDiff = Math.abs(diff);
+
+      if (absDiff < HEADING_CHANGE_THRESHOLD) {
+        // 死区内：忽略微小抖动，同时清除大幅跳变待确认状态
+        this.pendingJumpDir = 0;
+        this.pendingJumpCount = 0;
+        return;
+      }
+
+      if (absDiff >= JUMP_DETECT_DEG) {
+        // 大幅变化：行车抖动/电磁干扰产生的瞬时大跳变方向不稳定，
+        // 必须连续多个采样持续同向变化才认定为真实转向
+        const dir = diff > 0 ? 1 : -1;
+        if (dir === this.pendingJumpDir) {
+          this.pendingJumpCount++;
+          if (this.pendingJumpCount < JUMP_CONFIRM_COUNT) return;
+          // 连续同向确认通过，按真实转向处理
+          this.pendingJumpDir = 0;
+          this.pendingJumpCount = 0;
+        } else {
+          // 方向反转或首次大幅变化，进入待确认状态
+          this.pendingJumpDir = dir;
+          this.pendingJumpCount = 1;
+          return;
+        }
+      } else {
+        // 中等变化（死区 ~ 大幅阈值之间）：平滑输出，清除待确认状态
+        this.pendingJumpDir = 0;
+        this.pendingJumpCount = 0;
+      }
     }
     this.lastOutputHeading = smoothed;
     this.callback(smoothed);

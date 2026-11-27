@@ -16,12 +16,16 @@
       "permissions": [
         "ACCESS_FINE_LOCATION",
         "ACCESS_COARSE_LOCATION",
+        "ACCESS_BACKGROUND_LOCATION",
         "INTERNET",
         "ACCESS_NETWORK_STATE",
         "READ_EXTERNAL_STORAGE",
         "WRITE_EXTERNAL_STORAGE",
+        "CAMERA",
+        "READ_MEDIA_IMAGES",
         "android.permission.ACCESS_COARSE_LOCATION",
         "android.permission.ACCESS_FINE_LOCATION",
+        "android.permission.ACCESS_BACKGROUND_LOCATION",
         "android.permission.REQUEST_INSTALL_PACKAGES"
       ],
       "runtimeVersion": "2.0.2"
@@ -40,7 +44,14 @@
           "isIosBackgroundLocationEnabled": false
         }
       ],
-      "expo-task-manager"
+      "expo-task-manager",
+      [
+        "expo-image-picker",
+        {
+          "cameraPermission": "允许\"网优伴侣\"使用相机拍摄聊天图片",
+          "photosPermission": "允许\"网优伴侣\"访问相册以发送图片"
+        }
+      ]
     ],
     "web": {
       "bundler": "metro"

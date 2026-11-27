@@ -6,6 +6,7 @@ import { StatusBar } from 'expo-status-bar';
 import { useMapStore, MarkerPoint } from '../../src/store/mapStore';
 import { wgs84ToGcj02 } from '../../src/utils/coordinate';
 import AuthGuard from '../../src/components/Auth/AuthGuard';
+import { navigateToTab } from '../../src/utils/navigation';
 
 const LIGHT_COLORS = {
   bg: '#f5f5f5', card: '#FFFFFF', cardBorder: '#E5E5E5', divider: '#EEEEEE',
@@ -72,16 +73,18 @@ export default function FavoritesScreen() {
     setPendingNavi({ lat: item.lat, lng: item.lng, name: item.name || '收藏点' });
     // 跳转到地图页面（navigation 已通过 useNavigation 获取）
     if (navigation) {
-      navigation.navigate('map');
+      navigateToTab(navigation, 'map');
     }
   };
 
   const handleLocation = (item: MarkerPoint) => {
-    // 收藏点存储为 WGS84，转换为 GCJ-02 用于高德地图定位
+    // 收藏点存储为 WGS84
+    // - setFocusLocation 需要 GCJ02（webview moveCamera 直接使用）
+    // - setSearchMarker 存原始 WGS84，由地图 JS 端统一转换为 GCJ02 渲染（避免双重转换偏差）
     const [gcjLat, gcjLng] = wgs84ToGcj02(item.lat, item.lng);
     setFocusLocation({ lat: gcjLat, lng: gcjLng });
-    setSearchMarker({ lat: gcjLat, lng: gcjLng, name: item.name || '收藏点' });
-    navigation.navigate('map');
+    setSearchMarker({ lat: item.lat, lng: item.lng, name: item.name || '收藏点' });
+    navigateToTab(navigation, 'map');
   };
 
   const handleCopy = (item: MarkerPoint) => {
@@ -151,6 +154,9 @@ export default function FavoritesScreen() {
       <View style={[styles.container, { paddingTop: insets.top, backgroundColor: COLORS.bg }]}>
         <StatusBar style={darkMode ? 'light' : 'dark'} />
       <View style={[styles.header, { backgroundColor: COLORS.card, borderBottomColor: COLORS.divider }]}>
+        <TouchableOpacity onPress={() => navigation.goBack()} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
+          <Text style={[styles.back, { color: COLORS.accent }]}>‹</Text>
+        </TouchableOpacity>
         <Text style={[styles.title, { color: COLORS.textPrimary }]}>我的收藏 ({favorites.length})</Text>
         {favorites.length > 0 && (
           <TouchableOpacity onPress={handleClearAll}>
@@ -219,6 +225,7 @@ const styles = StyleSheet.create({
     padding: 16,
     borderBottomWidth: 1,
   },
+  back: { fontSize: 28, lineHeight: 24, marginLeft: -8 },
   title: { fontSize: 18, fontWeight: 'bold' },
   clearBtn: { fontSize: 14 },
   list: { padding: 12 },

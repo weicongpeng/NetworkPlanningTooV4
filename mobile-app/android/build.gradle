@@ -11,8 +11,6 @@ buildscript {
         ndkVersion = "26.1.10909125"
     }
     repositories {
-        maven { url 'https://maven.aliyun.com/repository/public' }
-        maven { url 'https://maven.aliyun.com/repository/google' }
         google()
         mavenCentral()
     }
@@ -29,14 +27,13 @@ allprojects {
     repositories {
         maven {
             // All of React Native (JS, Obj-C sources, Android binaries) is installed from npm
-            // 使用阿里云 Maven 镜像（国内访问加速，2024年起域名已变更为 maven.aliyun.com）
-            url 'https://maven.aliyun.com/repository/public'
+            url(new File(['node', '--print', "require.resolve('react-native/package.json')"].execute(null, rootDir).text.trim(), '../android'))
         }
         maven {
-            url 'https://maven.aliyun.com/repository/google'
+            // Android JSC is installed from npm
+            url(new File(['node', '--print', "require.resolve('jsc-android/package.json', { paths: [require.resolve('react-native/package.json')] })"].execute(null, rootDir).text.trim(), '../dist'))
         }
 
-        // Fallback：当镜像找不到依赖时回退官方仓库
         google()
         mavenCentral()
         maven { url 'https://www.jitpack.io' }

@@ -11,6 +11,7 @@ import React from 'react';
 import { View, Text, StyleSheet, TouchableOpacity } from 'react-native';
 import { useNavigation } from '@react-navigation/native';
 import { useMapStore } from '../../store/mapStore';
+import { navigateToTab } from '../../utils/navigation';
 
 export default function AuthGuard({ children }: { children: React.ReactNode }) {
   const isLoggedIn = useMapStore((s) => s.isLoggedIn);
@@ -25,7 +26,7 @@ export default function AuthGuard({ children }: { children: React.ReactNode }) {
         <TouchableOpacity
           style={styles.button}
           activeOpacity={0.85}
-          onPress={() => navigation.navigate('profile')}
+          onPress={() => navigateToTab(navigation, 'profile')}
         >
           <Text style={styles.buttonText}>前往登录</Text>
         </TouchableOpacity>

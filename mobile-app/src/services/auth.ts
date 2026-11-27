@@ -31,6 +31,7 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import axios, { AxiosInstance } from 'axios';
 import { getEffectiveApiUrl } from '../utils/config';
+import { reportUnauthorized } from './sessionEvents';
 
 // ==================== 存储键 ====================
 
@@ -247,6 +248,10 @@ export async function fetchMe(): Promise<AuthUser> {
     await setStoredUser(user);
     return user;
   } catch (e: any) {
+    if (e?.response?.status === 401) {
+      const detail = e?.response?.data?.detail;
+      reportUnauthorized(typeof detail === 'string' && detail ? detail : '登录已过期，请重新登录');
+    }
     throw extractError(e, '获取用户信息失败');
   }
 }
@@ -294,7 +299,7 @@ export async function ping(): Promise<void> {
   if (!token) return;
   try {
     const baseURL = await getEffectiveApiUrl();
-    await fetch(`${baseURL}/auth/ping`, {
+    const response = await fetch(`${baseURL}/auth/ping`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -302,6 +307,8 @@ export async function ping(): Promise<void> {
         'Authorization': `Bearer ${token}`,
       },
     });
+    // ping 走 fetch 不抛异常；401 说明会话已空闲超时，必须上报否则会一直假装登录
+    if (response.status === 401) reportUnauthorized('长时间未操作，请重新登录');
     // console.log('[Auth] ping ok');
   } catch (e: any) {
     console.warn('[Auth] ping failed（不影响）:', e?.message);

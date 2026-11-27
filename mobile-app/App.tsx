@@ -1,17 +1,37 @@
 import { registerRootComponent } from 'expo';
 import React, { useEffect } from 'react';
-import { Alert } from 'react-native';
+import { Alert, AppState } from 'react-native';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import { NavigationContainer } from '@react-navigation/native';
 import Constants from 'expo-constants';
-import TabsLayout from './app/(tabs)/_layout';
+import AppNavigator from './app/navigation/AppNavigator';
 import { useRestoreAuth } from './src/hooks/useRestoreAuth';
+import { useHeartbeat } from './src/hooks/useHeartbeat';
 import { apiService } from './src/services/api';
 import { downloadAndInstall } from './src/services/downloadService';
+import { setUnauthorizedHandler } from './src/services/sessionEvents';
+import { invalidateSession } from './src/services/sessionGuard';
+import { useImStore } from './src/store/imStore';
 
 function App() {
   // APP 启动时从 AsyncStorage 恢复登录状态，确保 AuthGuard 在所有页面正确判断
   useRestoreAuth();
+  // 心跳放在根组件常驻，避免 Tab 懒加载导致 profile 未挂载、会话空闲超时
+  useHeartbeat();
+
+  // 任意带 token 的请求返回 401：统一清理本地登录态，不再让页面停在「假登录」
+  useEffect(() => {
+    setUnauthorizedHandler((message) => { void invalidateSession(message); });
+    return () => setUnauthorizedHandler(null);
+  }, []);
+
+  // 前后台切换：前台补拉 IM 增量，后台停掉轮询省电
+  useEffect(() => {
+    const subscription = AppState.addEventListener('change', (state) => {
+      useImStore.getState().setAppActive(state === 'active');
+    });
+    return () => subscription.remove();
+  }, []);
 
   // APP 启动时检查新版本（静默失败不阻塞启动）
   useEffect(() => {
@@ -76,7 +96,7 @@ function App() {
   return (
     <SafeAreaProvider>
       <NavigationContainer>
-        <TabsLayout />
+        <AppNavigator />
       </NavigationContainer>
     </SafeAreaProvider>
   );

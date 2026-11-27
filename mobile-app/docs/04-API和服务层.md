@@ -797,3 +797,56 @@ async function testApiConnection(url: string): Promise<boolean> {
 │  - viewportFilter.ts (RBush 视窗过滤)                       │
 └─────────────────────────────────────────────────────────────┘
 ```
+
+## 协作沟通（IM）服务层
+
+移动端复用网页端 `/api/v1/im/*`，后端零改动；`apiService.request()` 统一动态 baseURL + Bearer + `X-Client: app`。
+
+| 文件 | 职责 |
+|---|---|
+| `src/services/imApi.ts` | 会话/消息/通讯录/成员/撤回/转发/附件的 REST 封装；短时签名图片直链按 `id:thumb` 缓存，过期前 30s 不复用 |
+| `src/services/imAttachment.ts` | 拍照/相册/文件选择、2MB base64 分片上传、Bearer 回退下载、`expo-sharing` 打开 |
+| `src/services/imWebSocket.ts` | `wss(s)://<当前 API 地址>/api/v1/ws/tasks?token=<JWT>`，25s 心跳、2 次重连后降级轮询 |
+| `src/store/imStore.ts` | 会话/消息分桶、`after_id` 游标、未读、在线、@草稿、轮询与切账号清理 |
+
+关键口径：SQLite 是消息真源，WS 只推 `im_message` / `im_recall` / `im_presence` 的 id；正文由 REST 增量拉取并按 id 去重，游标只由 `next_cursor` 推进，发送成功不推进游标；切后台停轮询、回前台 resync。
+
+补充说明：
+
+- **头像/昵称**：`PUT /im/avatar`（`< 256KB` 的 png/jpeg/webp/gif data URL）、`PUT /im/nickname`（≤24 字），与网页端写同一 `users` 表；保存后 `loadContacts()` 刷新手机通讯录，电脑端在通讯录校准或刷新页面后显示。
+- **发送性能**：分片读取+上传并发 3（后端 `write_chunk` 带锁按 offset 写入，顺序无关）；发送前插入乐观本地图片消息，发送响应用 `client_msg_id` 直接替换，省掉一次增量拉取；一页消息批量预热签名链接，避免每张缩略图各发一次请求。
+- **进入会话**：通讯录点人优先命中本地 `direct` 会话零请求直达；新建会话只打一次 `POST /conversations`，列表刷新放后台。
+- **原生模块容错**：`expo-image-picker` 未编译进安装包时，拍照给出明确提示、相册降级到 `expo-document-picker`；重新出包后能力自动恢复。
+
+- **会话失效**：带 token 请求返回 401 时由 `src/services/sessionGuard.ts` 统一清理，不再把 `长时间未操作，请重新登录` 当普通 IM 错误红字显示；`useHeartbeat()` 挂在 `App.tsx` 根组件保证 5 分钟 ping 不漏跑。
+
+- **网址与视频**：文本 URL 由 `src/utils/linkify.ts` 切分后用 `Linking.openURL` 打开；`video/*` 附件走 `MediaLightbox` 的 WebView `<video>`，打开前强制刷新签名直链（TTL 15 分钟，避免播放中途 Range 请求 403），签名不可用时降级系统播放器。
+
+- **媒体打开与交互**：图片点击先用会话页已预热的 `thumb=true` 签名瞬时显示、后台再换全图；视频直接复用缓存签名，WebView 显示加载圈。灯箱底部为编辑/下载/转发/查看；「查看」网格直接读签名缓存，点击缩略图切换媒体；图片标注用 WebView Canvas 画圈+文字后导出 dataURL 存本地，通过系统分享面板交付。
+
+- **打开会话定位**：进入会话用 `onContentSizeChange` 的真实内容高度 + `onLayout` 的视口高度算 `scrollToOffset`，并在下一帧补定位，覆盖已加载会话重新打开的场景；加载更早消息保持视口，新消息仅在用户已处于底部时跟随。
+- **图片打开与翻页**：消息气泡加载缩略图时即下载到本地缓存，灯箱打开只读本地文件（无网络等待）且去掉淡入动画；未放大时左右滑动超过 60px 切换上/下一张媒体。
+
+- **历史消息本地缓存**：`src/services/imMessageCache.ts` 按 username 分桶，把每会话最近 300 条消息写入 `documentDirectory/im_chat_cache/`；进入会话先渲染缓存再按游标增量同步，翻页/发送/撤回后落盘，切账号只清内存不清各自缓存。消息列表用 `windowSize=7` / `maxToRenderPerBatch=10` / `removeClippedSubviews` 降低长列表渲染开销。
+
+- **图片预览防闪**：灯箱底层常驻本地缩略图，全图作为上层 Image 叠加、`onLoadEnd` 后才显现，不再替换底层 uri，避免「显示→消失→显示」。
+
+- **编辑页手势**：Canvas 双指缩放（1–4 倍）与单指画圈互不干扰；点 T 进入文字放置模式，点击图片坐标后 RN 弹输入框，确认后在该坐标绘制。
+- **消息页流畅度**：消息缓存写盘 500ms 防抖；会话/聊天列表启用窗口化渲染；聊天滚动定位同帧只调度一次；轮询、WS 通知与重连的增量同步每轮最多 2 页，进入会话仍补 10 页；401 仅对 `/im/`、`/auth/me`、`/admin/` 生效，避免公开接口偶发 401 误清登录态、弹出遮罩挡住点击。
+
+- **灯箱翻页**：`PanResponder` 在首次渲染创建，回调必须通过 ref 读取最新的 `onSwitchByOffset`，否则每次滑动都从初次打开的那张计算 +1/-1，表现为只能看前后两张。
+- **编辑页**：含图片 dataURL 的 HTML 落本地文件按 `HTML_VERSION`（当前 v7）复用；工具为画笔/尖头箭头/文字三选一，颜色条独立选择并应用于当前工具；Canvas 快照栈支持右上角 ↶/↷ 撤销重做；画笔用二次贝塞尔按中点平滑绘制，箭头从按下点到当前点画单条 butt 线端 + 三角尖头；文字模式下点击图片坐标，在该屏幕位置放 TextInput 光标并唤起系统键盘。
+
+- **消息多选转发**：右上角不再常驻「转发」；长按消息进入多选并选中该条，点击其它消息切换选中，顶部出现「转发(n)」「取消」；多选态长按仍弹引用/复制/撤回菜单。
+- **编辑页加载**：HTML 仍按 `HTML_VERSION` 落本地文件复用（省去重复生成 dataURL），但 WebView 用已验证的 `source={{html}}` 而非 `file://` URI——后者在 Android 上曾导致整页黑屏。
+
+- **编辑页文字所见即所得**：输入每个字符都通过 `renderPendingText` 实时画到点击坐标（基于 beginText 快照重绘），TextInput 文字透明只留光标；换位置/切工具/导出/撤销时先 `finishText` 固化当前画面，文字始终以光标位置为起点，不产生偏移。
+
+- **编辑页落点精度**：触摸监听从 `canvas` 提到 `document`，覆盖图片外的黑边区域；`point()` 把超出图片范围的坐标 clamp 到图片边界，保证任何位置都能落笔/落字；文字光标输入框移到 WebView 容器内相对定位，`clientX/clientY` 与 WebView 内坐标一致，不再被 header 偏移影响，光标跟手。
+
+- **通讯 tab**：底栏由 4 个收敛为 3 个（地图 / 通讯 / 我的）；`communication.tsx` 内分「消息 / 通讯录」两栏，默认消息栏，未读数显示在两栏切换处与通讯 tab 角标。
+- **编辑页形状工具**：工具栏在画笔/箭头/文字之外新增矩形 ▭ 与椭圆 ○，拖动范围实时预览；与颜色选择、撤销重做共用同一套 Canvas 快照与工具状态。
+
+- **通讯子栏**：消息/通讯录不再渲染各自的页头标题与消息页刷新按钮（两栏切换处已有标题，聚焦与下拉刷新仍生效）；新建群入口与通讯录搜索框同一行。
+
+- **我的页分组**：原「工具」分组标题改为「个性设置」（设置、我的足迹两项不变）；底部 tab 图标均为 View 自绘：地图=定位图钉（水滴+镂空），通讯=消息气泡+三个省略点，我的=人形剪影。

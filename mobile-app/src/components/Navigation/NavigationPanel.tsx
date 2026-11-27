@@ -20,7 +20,7 @@ if (Platform.OS === 'android' && UIManager.setLayoutAnimationEnabledExperimental
 }
 import { MapViewRef } from '../Map/MapView';
 import {
-  getCurrentPosition, planRoute, planRoutes,
+  getCurrentPosition, getLastLocationError, planRoute, planRoutes,
   startNavigation, stopNavigation, isNavigating,
   onNaviStateChange, NaviStateSnapshot, NaviMode, GpsSignalQuality,
   RouteData, selectReroute,
@@ -42,7 +42,7 @@ interface Props {
 }
 
 /** GPS/N*/
-function GpsSignalIndicator({ quality }: { quality: GpsSignalQuality }) {
+function GpsSignalIndicator({ quality, source }: { quality: GpsSignalQuality; source?: string }) {
   const config: Record<GpsSignalQuality, { icon: string; color: string; label: string }> = {
     excellent: { icon: '●●●●', color: '#4CAF50', label: '优' },
     good: { icon: '●●●○', color: '#8BC34A', label: '良' },
@@ -50,9 +50,12 @@ function GpsSignalIndicator({ quality }: { quality: GpsSignalQuality }) {
     none: { icon: '○○○○', color: '#F44336', label: '无' },
   };
   const { icon, color, label } = config[quality];
+  // 网络/IP/高德Web 模糊定位时提示当前非卫星精确定位
+  const fuzzy = source === 'network' || source === 'amap-web' || source === 'ip';
   return (
     <View style={styles.signalContainer}>
       <Text style={[styles.signalIcon, { color }]}>{icon}</Text>
+      {fuzzy && <Text style={styles.signalSource}>网络</Text>}
     </View>
   );
 }
@@ -194,13 +197,16 @@ export default function NavigationPanel({
       if (!state.isNavigating) {
         return;
       }
-      setNavState(state);
-      if (state.isNavigating && state.routeData) {
+      // 到达终点：状态栏固定显示「已到达终点XXX」，不再刷新为路口指令
+      if (state.arrivalMessage) {
+        setStatusText(state.arrivalMessage);
+      } else if (state.routeData) {
         const step = state.routeData.steps[state.currentStepIndex];
         if (step) {
           setStatusText(step.instruction || '正在导航...');
         }
       }
+      setNavState(state);
       // 处理重规划选项
       if (state.rerouteOptions) {
         setRerouteOptions(state.rerouteOptions);
@@ -258,6 +264,19 @@ export default function NavigationPanel({
     return unsub;
   }, []);
 
+  // 到达终点后自动停止导航：仅停止自动跟随并收起导航面板，
+  // 不清除路线/终点标记，导航轨迹保留在地图上（手动点停止/关闭仍会清除）
+  const isNavActive = useMapStore(s => s.isNavigating);
+  const prevNavActiveRef = useRef(false);
+  useEffect(() => {
+    const wasActive = prevNavActiveRef.current;
+    prevNavActiveRef.current = isNavActive;
+    if (wasActive && !isNavActive && visible && !setupMode) {
+      mapRef.current?.stopAutoFit();
+      onClose();
+    }
+  }, [isNavActive]);
+
   // 导航开始后渲染地图路线（使用已选路线，不重新规划）
   useEffect(() => {
     if (setupMode || !startPos || !mapRef.current || naviRouteKey === 0) return;
@@ -274,6 +293,17 @@ export default function NavigationPanel({
     mapRef.current.updateUserLocation(gcjLat, gcjLng, 0);
     mapRef.current.startAutoFit();
   }, [naviRouteKey]);
+
+  // 根据定位失败原因生成用户友好的提示信息
+  const getLocationErrorMsg = (reason: string | null): string => {
+    switch (reason) {
+      case 'permission_denied':       return '定位权限未授权，请在系统设置中允许"网优伴侣"访问位置信息';
+      case 'service_disabled':        return '手机位置服务未开启，请在系统设置中打开"位置信息"开关';
+      case 'gps_provider_disabled':   return 'GPS和网络定位均不可用，请检查手机位置服务设置';
+      case 'all_methods_failed':      return '所有定位方式均失败，请检查手机位置服务和网络连接';
+      default:                        return '无法获取起点位置，请检查GPS权限和网络连接';
+    }
+  };
 
   // 
   const getOrigin = useCallback(async () => {
@@ -299,7 +329,8 @@ export default function NavigationPanel({
       setErrorMsg('');
       const origin = await getOrigin();
       if (!origin) {
-        setErrorMsg('无法获取起点位置');
+        const errorReason = getLastLocationError();
+        setErrorMsg(getLocationErrorMsg(errorReason));
         setIsLoading(false);
         return;
       }
@@ -414,14 +445,15 @@ export default function NavigationPanel({
   // 
   const handleStopNavi = useCallback(() => {
     stopNavigation();
-    if (mapRef.current) {
-      mapRef.current.stopAutoFit();
-      mapRef.current.clearRoute();
-      mapRef.current.hideDestinationMarker();
-      mapRef.current.clearUserLocation();
+    const localMap = mapRef.current;
+    if (localMap) {
+      localMap.stopAutoFit();
+      localMap.clearRoute();
+      localMap.hideDestinationMarker();
+      localMap.clearUserLocation();
       setTimeout(() => {
-        mapRef.current.hideDestinationMarker();
-        mapRef.current.clearRoute();
+        localMap.hideDestinationMarker();
+        localMap.clearRoute();
       }, 100);
     }
     setSetupMode(true);
@@ -466,7 +498,7 @@ export default function NavigationPanel({
             {startPos ? `${startPos.lat.toFixed(5)}, ${startPos.lng.toFixed(5)}` : '正在获取起点...'}
           </Text>
           {gpsSignal.quality !== 'none' && (
-            <GpsSignalIndicator quality={gpsSignal.quality} />
+            <GpsSignalIndicator quality={gpsSignal.quality} source={gpsSignal.source} />
           )}
         </View>
         <View style={styles.routeLine} />
@@ -553,6 +585,7 @@ export default function NavigationPanel({
   // === ===
   const renderNavigating = () => {
     const state = navState;
+    if (!state) return null;
 
     // e
     const containerHeight = slideAnim.interpolate({
@@ -573,7 +606,7 @@ export default function NavigationPanel({
           <Text style={styles.collapsedMode}>
             {state.mode === 'drive' ? '🚗 驾车' : '🚶 步行'}
           </Text>
-          <GpsSignalIndicator quality={state.gpsSignal.quality || 'none'} />
+          <GpsSignalIndicator quality={state.gpsSignal.quality || 'none'} source={state.gpsSignal.source} />
           <Text style={styles.collapsedDest} numberOfLines={1}>
             {destName || ''}
           </Text>
@@ -935,11 +968,19 @@ const styles = StyleSheet.create({
     borderRadius: 4,
     backgroundColor: 'rgba(0,0,0,0.05)',
     marginLeft: 4,
+    flexDirection: 'row',
+    alignItems: 'center',
   },
   signalIcon: {
     fontSize: 10,
     fontWeight: 'bold',
     letterSpacing: -1,
+  },
+  signalSource: {
+    fontSize: 9,
+    color: '#FF9800',
+    marginLeft: 3,
+    fontWeight: '600',
   },
 
   // 路线选择卡片

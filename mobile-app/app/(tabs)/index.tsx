@@ -21,7 +21,7 @@ import { apiService } from '../../src/services/api';
 import * as FileSystem from 'expo-file-system';
 import { cacheService } from '../../src/services/cacheService';
 import { wgs84ToGcj02 } from '../../src/utils/coordinate';
-import { getCurrentPosition, isNavigating as checkIsNavigating, stopNavigation } from '../../src/services/navigationService';
+import { getCurrentPosition, getLastLocationError, isNavigating as checkIsNavigating, stopNavigation } from '../../src/services/navigationService';
 import * as Location from 'expo-location';
 import AuthGuard from '../../src/components/Auth/AuthGuard';
 
@@ -97,6 +97,8 @@ export default function MapScreen() {
   // 当 pendingNavi 被设置时，自动打开导航面板
   useEffect(() => {
     if (pendingNavi) {
+      // 打开导航面板时清除搜索结果标记，避免与导航终点标记重复显示
+      setSearchMarker(null);
       setShowNaviPanel(true);
     }
   }, [pendingNavi]);
@@ -331,11 +333,11 @@ export default function MapScreen() {
       const now = new Date();
       const timeStr = `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}:${now.getSeconds().toString().padStart(2, '0')}`;
       const defaultName = `打点 ${timeStr}`;
+      // 统一生成标记 ID，保证取消重命名时能精确删除本次打点
+      const newId = `marker-${Date.now()}`;
       // AMap 返回 GCJ-02，存储为 WGS84
       const [wgsLat, wgsLng] = gcj02ToWgs84(lat, lng);
-      addMarker(wgsLat, wgsLng, defaultName);
-      // 记录刚添加的标记 ID（addMarker 用 Date.now() 生成 ID）
-      const newId = `marker-${Date.now()}`;
+      addMarker(wgsLat, wgsLng, defaultName, newId);
       setPendingMarkerCoords({ lat, lng });
       setPendingMarkerId(newId);
       setMarkerNameInput(defaultName);
@@ -382,18 +384,20 @@ export default function MapScreen() {
     if (!isNaN(lat) && !isNaN(lng)) {
       if (searchMode === 'coordinate') {
         // coordinate: 用户输入 WGS84，转换为 GCJ-02 用于高德地图定位
+        // searchMarker 存原始 WGS84，由地图 JS 端统一转换后渲染
         const [gcjLat, gcjLng] = wgs84ToGcj02(lat, lng);
         setSelectedLocation({ lat: gcjLat, lng: gcjLng, name: result.name });
-        setSearchMarker({ lat: gcjLat, lng: gcjLng, name: result.name });
+        setSearchMarker({ lat, lng, name: result.name });
         // 直接调用 moveCamera 移动地图到目标位置
         if (mapRef.current) {
           mapRef.current.moveCamera(gcjLat, gcjLng, 16);
         }
       } else if (searchMode === 'parameter') {
         // parameter: 后端返回 WGS84，转换为 GCJ-02 用于高德地图定位
+        // searchMarker 存原始 WGS84，由地图 JS 端统一转换后渲染
         // 不设置 selectedLocation（避免触发底部 NavControl），改用 SectorInfoPanel 展示扇区属性
         const [gcjLat, gcjLng] = wgs84ToGcj02(lat, lng);
-        setSearchMarker({ lat: gcjLat, lng: gcjLng, name: result.name });
+        setSearchMarker({ lat, lng, name: result.name });
         // 直接调用 moveCamera 移动地图到目标位置
         if (mapRef.current) {
           mapRef.current.moveCamera(gcjLat, gcjLng, 16);
@@ -406,9 +410,9 @@ export default function MapScreen() {
           }
         }
       } else {
-        // place 模式：高德 POI 接口返回的已是 GCJ-02，直接使用
+        // place 模式：高德 POI 接口返回的已是 GCJ-02，直接使用（isGcj: true 让地图端跳过转换）
         setSelectedLocation({ lat, lng, name: result.name });
-        setSearchMarker({ lat, lng, name: result.name });
+        setSearchMarker({ lat, lng, name: result.name, isGcj: true });
         // 直接调用 moveCamera 移动地图到目标位置
         if (mapRef.current) {
           mapRef.current.moveCamera(lat, lng, 16);
@@ -451,6 +455,18 @@ export default function MapScreen() {
     }
   }, []);
 
+  // 根据定位失败原因生成用户友好的提示信息
+  const getLocationErrorMsg = useCallback((reason: string | null): string => {
+    switch (reason) {
+      case 'permission_denied':       return '定位权限未授权，请在系统设置中允许"网优伴侣"访问位置信息';
+      case 'service_disabled':        return '手机位置服务未开启，请在系统设置中打开"位置信息"开关';
+      case 'gps_provider_disabled':   return 'GPS和网络定位均不可用，请检查手机位置服务设置';
+      case 'timeout':                 return '定位超时，请移至开阔地带或检查网络连接后重试';
+      case 'all_methods_failed':      return '所有定位方式均失败，请检查手机位置服务和网络连接';
+      default:                        return '无法获取当前位置，请检查GPS权限和网络连接';
+    }
+  }, []);
+
   // 定位到手机当前位置，并启动持续位置+朝向跟踪
   const handleLocateMe = useCallback(async () => {
     // 如果已在跟踪，先停止再重新启动
@@ -458,7 +474,8 @@ export default function MapScreen() {
 
     const pos = await getCurrentPosition();
     if (!pos || !mapRef?.current) {
-      Alert.alert('定位失败', '无法获取当前位置，请检查GPS权限');
+      const errorReason = getLastLocationError();
+      Alert.alert('定位失败', getLocationErrorMsg(errorReason));
       return;
     }
 

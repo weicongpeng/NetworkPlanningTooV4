@@ -1,0 +1,1 @@
+PS E:\mobile-app> npx expo run:android

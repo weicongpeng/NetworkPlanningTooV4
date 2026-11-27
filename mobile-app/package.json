@@ -24,6 +24,7 @@
     "expo-dev-client": "~5.0.20",
     "expo-document-picker": "13.0.3",
     "expo-file-system": "~18.0.12",
+    "expo-image-picker": "~16.0.6",
     "expo-keep-awake": "~14.0.0",
     "expo-location": "~18.0.10",
     "expo-sensors": "~14.0.0",

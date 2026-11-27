@@ -1,6 +1,7 @@
-import axios, { AxiosInstance } from 'axios';
+import axios, { AxiosInstance, AxiosRequestConfig } from 'axios';
 import { getEffectiveApiUrl, getEffectiveApiBaseUrl, setCustomApiUrl, resetCustomApiUrl, testApiConnection } from '../utils/config';
 import { getToken } from './auth';
+import { reportUnauthorized } from './sessionEvents';
 
 class ApiService {
   private client: AxiosInstance;
@@ -29,6 +30,32 @@ class ApiService {
       }
       return config;
     });
+
+    // 带 token 的请求返回 401：会话空闲超时或被注销，统一上报给根组件清理登录态
+    this.client.interceptors.response.use(
+      (response) => response,
+      (error) => {
+        const status = error?.response?.status;
+        const hadToken = !!(error?.config?.headers as any)?.Authorization;
+        // 只对受保护接口生效：公开接口（版本检查、系统信息等）偶发 401 不该清登录态、弹出登录遮罩
+        const url = String(error?.config?.url || '');
+        const protectedRequest = url.startsWith('/im/') || url === '/auth/me' || url.startsWith('/admin/');
+        if (status === 401 && hadToken && protectedRequest) {
+          const detail = error?.response?.data?.detail;
+          reportUnauthorized(typeof detail === 'string' && detail ? detail : '登录已过期，请重新登录');
+        }
+        return Promise.reject(error);
+      },
+    );
+  }
+
+  /**
+   * 通用请求：供按业务分层的服务（如 imApi）复用本实例，
+   * 动态 baseURL / JWT / X-Client 仍由上面的拦截器统一处理。
+   */
+  async request<T = any>(config: AxiosRequestConfig): Promise<T> {
+    const response = await this.client.request<T>(config);
+    return response.data;
   }
 
   // ==================== 运行时地址切换 ====================

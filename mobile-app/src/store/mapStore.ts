@@ -47,6 +47,8 @@ export interface SearchMarker {
   lat: number;
   lng: number;
   name: string;
+  /** true 表示坐标已是 GCJ-02（高德 POI），无需再转换；false/缺省表示 WGS-84（工参/用户输入） */
+  isGcj?: boolean;
 }
 
 /** 导航轨迹条目（用户记录） */
@@ -120,7 +122,7 @@ interface MapState {
   cacheAvailable: boolean;
   cacheUpdatedAt: string | null;
   cacheLoading: boolean;
-  addMarker: (lat: number, lng: number, name?: string) => void;
+  addMarker: (lat: number, lng: number, name?: string, id?: string) => void;
   removeMarker: (id: string) => void;
   clearMarkers: () => void;
   updateMarkerName: (id: string, name: string) => void;
@@ -214,8 +216,8 @@ export const useMapStore = create<MapState>()(
       cacheAvailable: false,
       cacheUpdatedAt: null,
       cacheLoading: false,
-      addMarker: (lat, lng, name = '') => set((state) => ({
-        markers: [...state.markers, { id: `marker-${Date.now()}`, lat, lng, name, createdAt: Date.now() }]
+      addMarker: (lat, lng, name = '', id) => set((state) => ({
+        markers: [...state.markers, { id: id || `marker-${Date.now()}`, lat, lng, name, createdAt: Date.now() }]
       })),
       removeMarker: (id) => set((state) => ({
         markers: state.markers.filter(m => m.id !== id)

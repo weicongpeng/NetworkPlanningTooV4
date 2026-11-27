@@ -13,9 +13,8 @@
  *     return <NavigationContainer>...</NavigationContainer>;
  *   }
  *
- * 这里放在 profile.tsx，因为：
- *   1. profile.tsx 是 Tab 之一，默认 lazy:false，登录进入 APP 后即被挂载
- *   2. profile.tsx 负责登录/登出逻辑，心跳与登录状态天然耦合
+ * 必须在 App 根组件调用：底部 Tab 是懒加载的，放在 profile.tsx 时用户不进「我的」
+ * 就不会挂载，心跳不跑，会话 180 分钟空闲后会被后端判定为需要重新登录。
  */
 
 import { useEffect, useRef } from 'react';

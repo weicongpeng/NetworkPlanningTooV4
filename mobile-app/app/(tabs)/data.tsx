@@ -5,7 +5,7 @@ import {
 } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { useFocusEffect } from '@react-navigation/native';
+import { useFocusEffect, useNavigation } from '@react-navigation/native';
 import * as FileSystem from 'expo-file-system';
 import { cacheService } from '../../src/services/cacheService';
 import { useMapStore, SectorData } from '../../src/store/mapStore';
@@ -141,6 +141,7 @@ type ColorScheme = {
 
 export default function DataScreen() {
   const insets = useSafeAreaInsets();
+  const navigation = useNavigation<any>();
   const { setCacheAvailable, setCacheUpdatedAt } = useMapStore();
   const darkMode = useMapStore((s) => s.darkMode);
   const COLORS: ColorScheme = darkMode ? DARK_COLORS : LIGHT_COLORS;
@@ -410,6 +411,9 @@ export default function DataScreen() {
       >
         {/* 顶部标题 */}
         <View style={[styles.header, { backgroundColor: COLORS.bg }]}>
+          <TouchableOpacity onPress={() => navigation.goBack()} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
+            <Text style={[styles.headerBack, { color: COLORS.accent }]}>‹</Text>
+          </TouchableOpacity>
           <Text style={[styles.headerTitle, { color: COLORS.textPrimary }]}>数据</Text>
         </View>
 
@@ -644,6 +648,7 @@ const styles = StyleSheet.create({
   header: {
     paddingHorizontal: 20, paddingTop: 8, paddingBottom: 16,
   },
+  headerBack: { fontSize: 28, lineHeight: 30, marginLeft: -8 },
   headerTitle: {
     fontSize: 28, fontWeight: '700',
     letterSpacing: -0.4,

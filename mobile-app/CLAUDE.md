@@ -21,28 +21,24 @@ npm run build:android  # 出 release APK
 
 ### 目录分层
 
-- `App.tsx` — 应用入口,组合 `SafeAreaProvider` + `NavigationContainer` + Tab 布局
-- `app/` — 路由层(Expo Router 风格目录,但实际用 React Navigation,无路由文件即路由)
-  - `app/_layout.tsx` — 根布局
-  - `app/(tabs)/` — 4 个底部 Tab 页面:
-    - `index.tsx` (地图主屏,1k+ 行,业务核心)
-    - `data.tsx` (数据管理:刷新/导入/缓存状态)
-    - `favorites.tsx` (收藏点列表)
-    - `settings.tsx` (后端地址配置)
-  - `app/(tabs)/_layout.tsx` — 自定义底部 TabBar(支持导航时隐藏)
-- `src/components/` — 按功能分的 UI 组件
-  - `Map/MapView.tsx` (核心,封装 AMap WebView)
-  - `Navigation/NavigationPanel.tsx` (导航面板,~25k 行)
-  - `Search/SearchBar.tsx` `Marker/MarkerList.tsx` 等
-- `src/services/` — 业务服务层
-  - `api.ts` (axios 封装,运行时动态解析 baseURL)
-  - `cacheService.ts` (本地文件缓存 + 首次启动自动缓存,~67k 行,核心)
-  - `navigationService.ts` (GPS 定位 + 路径规划 + TTS,~54k 行,核心)
-  - `dataParser.ts` `streamingParser.ts` `asyncParser.ts` (Excel/CSV/GeoJSON/MIF 解析)
-  - `navi.ts` (导航辅助)
-- `src/store/mapStore.ts` — Zustand 全局状态(扇区/标记/收藏/测量/导航/缓存)
-- `src/types/data.ts` — 共享类型:缓存元数据、解析结果、GeoJSON 特征
-- `src/utils/` — `coordinate.ts` (WGS84↔GCJ02 转换)、`clusterManager.ts` (Supercluster)、`viewportFilter.ts` (RBush 空间索引)、`config.ts` (API 地址解析)
+- `App.tsx` — 应用入口，组合 `SafeAreaProvider` + `NavigationContainer` + 根栈导航
+- `app/navigation/AppNavigator.tsx` — 根栈：Tabs / 聊天 / 群资料 / 转发 / 数据管理 / 收藏
+- `app/` — 路由层（Expo Router 风格目录，实际用 React Navigation）
+  - `app/(tabs)/` — 3 个底部 Tab：地图、通讯（消息/通讯录两栏）、我的
+    - `index.tsx` (地图主屏)
+    - `communication.tsx` (通讯 tab，默认消息栏) / `messages.tsx` / `contacts.tsx` (以 embedded 子页复用)
+    - `profile.tsx` (我的：账号/数据/个性设置/关于四组入口，登录与设置弹层)
+    - `data.tsx` / `favorites.tsx` 已改为根栈二级页，从「我的」进入
+  - `app/chat/` — `ChatScreen` / `GroupInfoScreen` / `ForwardScreen`
+- `src/components/Im/` — 会话行、消息气泡（网址可点）、四控件输入区、@选择、媒体灯箱（渐进加载 + 捏合缩放 + WebView 视频 + 编辑/下载/转发/查看）、Canvas 图片标注器、明暗配色
+- `src/components/Profile/` — 我的页共用行组件、资料编辑（头像/昵称）、更新检查、登录/设置弹层、样式与后端地址设置
+- `src/services/`
+  - `api.ts` (axios 单例，通用 `request()`，运行时动态解析 baseURL)
+  - `imApi.ts` / `imAttachment.ts` / `imWebSocket.ts` (协作沟通 REST、分片附件、WS 轻通知+轮询)
+  - `cacheService.ts` / `navigationService.ts` / `auth.ts` 等原有服务
+- `src/store/mapStore.ts` — 地图状态；`src/store/imStore.ts` — IM 会话/消息/游标/未读/实时状态
+- `src/types/im.ts` — IM 前后端契约类型与展示辅助
+- `src/utils/` — `coordinate.ts`、`clusterManager.ts`、`viewportFilter.ts`、`config.ts`、`navigation.ts` (根栈/Tab 跳转)、`linkify.ts` (网址切分)
 
 ### 数据流关键路径
 
@@ -67,7 +63,11 @@ npm run build:android  # 出 release APK
 
 ## 关键约定
 
-- **状态管理**: 全部走 `useMapStore`(Zustand),不要引入新状态库;只有 `favorites` 走 `persist` + AsyncStorage 持久化
+- **状态管理**: 地图状态走 `useMapStore`，IM 状态走 `src/store/imStore.ts`（同为 Zustand，不引入新状态库）；只有 `favorites` 走 `persist` + AsyncStorage 持久化
+- **Zustand v5 selector**: 必须返回稳定引用，禁止在 selector 里写 `|| []`、`.map()` 或对象字面量（会触发 `getSnapshot should be cached` 无限重渲染）；空集合用 `imStore.ts` 导出的 `EMPTY_MESSAGES` / `EMPTY_ATTACHMENTS`
+- **IM 原生依赖**: `expo-image-picker` 必须在 `imAttachment.ts` 里 `try/catch` 安全加载，旧 APK 缺模块时不得阻断启动；不要为此新增其它原生库，图片缩放用 RN 内置 `PanResponder`
+- **401 会话失效**: 后端空闲阈值为 180 分钟，隔夜必然过期；`api.ts` / `auth.ts` 的带 token 请求遇到 401 一律 `reportUnauthorized` → `sessionGuard.invalidateSession()` 清凭证、停 IM 链路、置全局未登录并显示重登入口。心跳 `useHeartbeat()` 必须挂在 `App.tsx` 根组件，不能放 Tab 页（懒加载会漏跑）
+- **媒体预览**: 视频复用已装的 `react-native-webview` + 签名直链 HTML5 `<video>`；图片先显示已预热的缩略图再后台换全图，点击图片本身退出，视频仍点媒体外暗色区域退出；图片标注用 WebView Canvas 导出 dataURL 存本地后交系统分享面板，禁止新增播放器/绘图原生依赖
 - **缓存目录**: `FileSystem.documentDirectory}cache/{fullParams|geoData|layers|meta}/` — 加新缓存类型需在 `CACHE_DIRS` 注册
 - **服务单例**: `apiService` `cacheService` 已导出单例,业务模块直接导入,不要重复实例化
 - **WebView 通信**: `MapView.tsx` 通过 `injectJavaScript` 调 AMap,JS↔Native 用约定的 `postMessage` 协议
