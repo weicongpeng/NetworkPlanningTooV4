@@ -1370,6 +1370,7 @@ class TaskManager:
 
                 logger.info(f"邻区规划: 使用前端选中的小区, 数量={len(config.selectedCellIds)}")
                 target_cell_keys = set(config.selectedCellIds)
+                selected_set = set(target_cell_keys)
 
                 logger.info(f"邻区规划: 待规划源小区数量: {len(target_cell_keys)}")
                 if not target_cell_keys:
@@ -1442,33 +1443,50 @@ class TaskManager:
                     logger.info(f"邻区规划: NR目标候选站点去重完成，去重后数量: {len(target_candidates)}, 唯一小区数: {len(seen_sectors)}")
                     
                 # 4. 过滤Source Sites (合并Info)
-                # 使用PCI task类似的匹配逻辑
+                # 工参不全的小区跳过规划，执行完成后通过 skippedCells 回传提示
                 combined_source_sites = {}
+                loaded_skipped: List[Dict] = []
+                used_keys: set = set()
                 for site in source_candidates:
                     site_id = site.get("id", "")
                     for sector in site.get("sectors", []):
                         sector_id = sector.get("id", "")
-                        
+
                         # 匹配检查
                         keys_to_check = [f"{site_id}_{sector_id}", sector_id]
                         matched_key = next((k for k in keys_to_check if k in target_cell_keys), None)
-                        
-                        if matched_key:
-                            if site_id not in combined_source_sites:
-                                combined_source_sites[site_id] = {
-                                    **site,
-                                    "sectors": []
-                                }
-                            combined_source_sites[site_id]["sectors"].append(sector)
-                            target_cell_keys.remove(matched_key)
-                
+
+                        if not matched_key:
+                            continue
+                        target_cell_keys.remove(matched_key)
+
+                        reason = self._planning_cell_skip_reason(site, sector)
+                        if reason:
+                            loaded_skipped.append({
+                                "siteId": site_id,
+                                "siteName": site.get("name", ""),
+                                "sectorId": sector_id,
+                                "sectorName": sector.get("name", ""),
+                                "reason": reason,
+                            })
+                            continue
+
+                        if site_id not in combined_source_sites:
+                            combined_source_sites[site_id] = {**site, "sectors": []}
+                        combined_source_sites[site_id]["sectors"].append(sector)
+                        used_keys.update(keys_to_check)
+
+                skipped_cells = self._collect_skipped_cells(loaded_skipped, used_keys, selected_set)
                 source_sites = list(combined_source_sites.values())
                 target_sites = target_candidates # Target直接用全量
-                
-                logger.info(f"邻区规划: 最终源站点数: {len(source_sites)}, 目标站点数: {len(target_sites)}")
-                
+
+                logger.info(f"邻区规划: 最终源站点数: {len(source_sites)}, 目标站点数: {len(target_sites)}, 跳过小区数: {len(skipped_cells)}")
+
                 if not source_sites:
-                     raise ValueError("无法匹配待规划小区与工参信息，请检查ID一致性")
+                    raise ValueError(
+                        "选中的小区均因工参数据不全被跳过，无可规划小区"
+                        f"（共 {len(skipped_cells)} 个：{self._format_skipped_reason_summary(skipped_cells)}）"
+                    )
 
             except Exception as e:
                 logger.error(f"邻区规划数据准备失败: {e}")
@@ -1500,6 +1518,9 @@ class TaskManager:
                 "totalSectors": result["totalSectors"],
                 "totalNeighbors": result["totalNeighbors"],
                 "avgNeighbors": result["avgNeighbors"],
+                "totalCells": sum(len(s.get("sectors", [])) for s in source_sites),
+                "skippedCells": skipped_cells,
+                "skippedCount": len(skipped_cells),
                 "results": result["results"],
                 "startTime": task.started_at.isoformat(),
                 "endTime": task.completed_at.isoformat(),
@@ -1564,6 +1585,26 @@ class TaskManager:
             })
 
         return collected
+
+    @staticmethod
+    def _planning_cell_skip_reason(site: Dict, sector: Dict) -> Optional[str]:
+        """邻区规划的工参完整性判定；返回跳过原因，None 表示可用于规划。"""
+        site_id = str(site.get("id") or site.get("siteId") or "")
+        sector_id = str(sector.get("id") or sector.get("cellId") or sector.get("sectorId") or "")
+        if not site_id or not sector_id:
+            return "missing_ids"
+        # 只认小区自身坐标，不回退站点：与 /map/cells 小区选择列表及 PCI 执行前校验同口径
+        for key in ("latitude", "longitude"):
+            value = sector.get(key)
+            if value is None or isinstance(value, bool):
+                return "missing_coordinates"
+            try:
+                coord = float(value)
+            except (TypeError, ValueError):
+                return "missing_coordinates"
+            if not math.isfinite(coord) or coord == 0:
+                return "missing_coordinates"
+        return None
 
     @staticmethod
     def _format_skipped_reason_summary(skipped_cells: List[Dict]) -> str:
@@ -4746,6 +4787,9 @@ class TaskManager:
                 "matchedCells": r.get("matchedCells", 0),
                 "unmatchedCells": r.get("unmatchedCells", 0),
                 "singularityCount": r.get("singularityCount", 0),
+                # 跳过小区明细只需供提示横幅展示前几条；数量以 skippedCount 为准
+                "skippedCells": (r.get("skippedCells") or [])[:20],
+                "skippedCount": r.get("skippedCount", len(r.get("skippedCells") or [])),
                 # 归一化的小区数量（totalSectors/totalCells/results 长度三者取一），
                 # 前端历史列表「小区数量」列统一读它
                 "cellCount": TaskManager._extract_cell_count(r),

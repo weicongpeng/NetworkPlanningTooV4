@@ -10,6 +10,7 @@ from app.core.security import get_current_user
 import asyncio
 import logging
 import json
+import math
 import time
 import uuid
 import httpx
@@ -176,7 +177,8 @@ def _load_map_data_from_files(data_service, user=None) -> Dict[str, Any]:
                 "name": s.name or "",
                 "longitude": s.longitude or 0.0,
                 "latitude": s.latitude or 0.0,
-                "azimuth": s.azimuth or 0.0,
+                # 不把缺失方向角折叠成 0：0 度合法，缺失必须让小区选择阶段拦截
+                "azimuth": s.azimuth,
                 "beamwidth": s.beamwidth or 65.0,
                 "height": s.height or 30.0,
                 "pci": s.pci,
@@ -312,6 +314,16 @@ async def get_cell_list(limit: int = 50000, current_user=Depends(get_current_use
                 latitude = sector_lat if 0 < sector_lat < 90 else None
                 longitude = sector_lng if 0 < sector_lng < 180 else None
 
+                # 方向角同样回传原始有效性：缺失/非数字/越界统一为 None，0 度合法。
+                # 前端小区选择阶段据此拦截工参不合法的小区。
+                raw_azimuth = sector.get("azimuth")
+                try:
+                    azimuth = float(raw_azimuth) if not isinstance(raw_azimuth, bool) else None
+                except (TypeError, ValueError):
+                    azimuth = None
+                if azimuth is not None and (not math.isfinite(azimuth) or not 0 <= azimuth <= 360):
+                    azimuth = None
+
                 cell_item = {
                     "id": unique_key,
                     "name": sector_name,
@@ -320,7 +332,8 @@ async def get_cell_list(limit: int = 50000, current_user=Depends(get_current_use
                     "frequency": sector.get("frequency"),
                     "pci": sector.get("pci"),
                     "longitude": longitude,
-                    "latitude": latitude
+                    "latitude": latitude,
+                    "azimuth": azimuth,
                 }
 
                 if network_type == "LTE":

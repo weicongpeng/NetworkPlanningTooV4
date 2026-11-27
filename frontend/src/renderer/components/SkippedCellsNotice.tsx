@@ -6,12 +6,14 @@ import type { SkippedCellInfo } from '@shared/types'
 const MAX_LISTED = 5
 
 interface SkippedCellsNoticeProps {
-  /** i18n 分组：tac=核查 / tacPlanning=规划 / pciCheck=PCI核查 */
-  group: 'tac' | 'tacPlanning' | 'pciCheck'
-  /** 因工参数据不全被跳过的小区 */
+  /** i18n 分组：tac=TAC核查 / tacPlanning=TAC规划 / pciCheck=PCI核查 / neighbor=邻区规划 */
+  group: 'tac' | 'tacPlanning' | 'pciCheck' | 'neighbor'
+  /** 因工参数据不全被跳过的小区（历史任务摘要可能只保留前若干条） */
   skipped: SkippedCellInfo[]
   /** 实际完成核查/规划的小区数 */
   checkedCount: number
+  /** 跳过总数；摘要只带部分明细时用它显示准确数量 */
+  skippedCount?: number
   /** 只保留标题行（核查页要求：明细与补充说明都不展示） */
   titleOnly?: boolean
 }
@@ -20,9 +22,10 @@ interface SkippedCellsNoticeProps {
  * 工参数据不全被跳过的小区提示横幅（黄色，非阻断）
  * 挂在错误横幅同区域，核查/规划完成与查看历史任务时均展示
  */
-export function SkippedCellsNotice({ group, skipped, checkedCount, titleOnly = false }: SkippedCellsNoticeProps) {
+export function SkippedCellsNotice({ group, skipped, checkedCount, skippedCount, titleOnly = false }: SkippedCellsNoticeProps) {
   const { t } = useTranslation()
   if (!skipped || skipped.length === 0) return null
+  const total = skippedCount ?? skipped.length
 
   const reasonText = (reason: SkippedCellInfo['reason']) => {
     switch (reason) {
@@ -44,13 +47,13 @@ export function SkippedCellsNotice({ group, skipped, checkedCount, titleOnly = f
       <AlertCircle size={16} className="text-amber-500 flex-shrink-0 mt-0.5" />
       <div className="flex-1">
         <p className="text-amber-500 text-sm font-medium">
-          {t(`${group}.skippedCellsTitle`, { count: skipped.length }) ||
-            `已跳过 ${skipped.length} 个工参数据不全的小区`}
+          {t(`${group}.skippedCellsTitle`, { count: total }) ||
+            `已跳过 ${total} 个工参数据不全的小区`}
         </p>
         {!titleOnly && (
           <>
             <p className="text-amber-600 text-xs mt-0.5">
-              {t(`${group}.skippedCellsSummary`, { skipped: skipped.length, checked: checkedCount })}
+              {t(`${group}.skippedCellsSummary`, { skipped: total, checked: checkedCount })}
             </p>
             <ul className="mt-1 ml-4 list-disc text-xs text-amber-600 space-y-0.5">
               {skipped.slice(0, MAX_LISTED).map((cell, i) => (
@@ -61,7 +64,7 @@ export function SkippedCellsNotice({ group, skipped, checkedCount, titleOnly = f
             </ul>
             {skipped.length > MAX_LISTED && (
               <p className="mt-1 ml-4 text-xs text-amber-600">
-                {t(`${group}.skippedCellsMore`, { count: skipped.length - MAX_LISTED })}
+                {t(`${group}.skippedCellsMore`, { count: total - MAX_LISTED })}
               </p>
             )}
           </>

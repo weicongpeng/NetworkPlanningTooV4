@@ -334,5 +334,44 @@ class TestTaskManagerDataPrep:
         assert target_cell_keys == original_keys, "原始集合不应该被修改"
 
 
+class TestNeighborSkippedCells:
+    """邻区规划：工参不全的小区判定与结果摘要回传"""
+
+    def test_planning_cell_skip_reason(self):
+        site = {"id": "S1", "name": "站点1", "latitude": 23.0, "longitude": 113.0}
+        valid = {"id": "1", "name": "小区1", "latitude": 23.1, "longitude": 113.1}
+        assert TaskManager._planning_cell_skip_reason(site, valid) is None
+        assert TaskManager._planning_cell_skip_reason(
+            site, {**valid, "latitude": 0, "longitude": 0}
+        ) == "missing_coordinates"
+        assert TaskManager._planning_cell_skip_reason(
+            site, {**valid, "longitude": None}
+        ) == "missing_coordinates"
+        assert TaskManager._planning_cell_skip_reason(
+            {"id": "", "latitude": 23.0, "longitude": 113.0}, valid
+        ) == "missing_ids"
+
+    def test_collect_skipped_cells_includes_not_in_params(self):
+        skipped = TaskManager._collect_skipped_cells(
+            [{"siteId": "S1", "sectorId": "1", "reason": "missing_coordinates"}],
+            {"S1_2"},
+            {"S1_1", "S1_2", "S1_3"},
+        )
+        reasons = {item["sectorId"]: item["reason"] for item in skipped}
+        assert reasons["1"] == "missing_coordinates"
+        assert reasons.get("S1_2") is None  # 已用于规划，不在跳过列表
+        assert reasons["S1_3"] == "not_in_params"
+
+    def test_extract_result_summary_keeps_skipped_cells(self):
+        summary = TaskManager._extract_result_summary({
+            "status": "completed",
+            "totalCells": 8,
+            "skippedCells": [{"sectorId": str(i)} for i in range(30)],
+            "skippedCount": 30,
+        })
+        assert summary["skippedCount"] == 30
+        assert len(summary["skippedCells"]) == 20
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])

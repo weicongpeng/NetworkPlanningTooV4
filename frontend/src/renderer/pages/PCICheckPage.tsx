@@ -379,8 +379,8 @@ export function PCICheckPage() {
         <SkippedCellsNotice
           group="pciCheck"
           skipped={taskResult.skippedCells}
+          skippedCount={taskResult.skippedCount}
           checkedCount={taskResult.totalCells || 0}
-          titleOnly
         />
       )}
 

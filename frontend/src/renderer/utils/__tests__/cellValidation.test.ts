@@ -13,6 +13,7 @@ function makeCell(overrides: Partial<CellListItem> = {}): CellListItem {
     frequency: 1850,
     longitude: 114.96,
     latitude: 24.2,
+    azimuth: 120,
     ...overrides,
   }
 }
@@ -23,6 +24,7 @@ const LABELS = {
   frequency: '频点',
   longitude: '经度',
   latitude: '纬度',
+  azimuth: '方向角',
 }
 
 const MAIN_TPL = '选中的小区中有 {{count}} 个缺少必要数据，缺失示例：{{examples}}'
@@ -51,6 +53,31 @@ describe('findCellsMissingRequiredFields', () => {
     const result = findCellsMissingRequiredFields(sectors, new Set(['B_1']))
     expect(result[0].missing).toContain('longitude')
     expect(result[0].missing).toContain('latitude')
+  })
+
+  it('经纬度全 0 或越界视为不合法', () => {
+    const sectors = [
+      makeCell({ id: 'ZERO_1', longitude: 0, latitude: 0 }),
+      makeCell({ id: 'OUT_1', longitude: 200, latitude: -91 }),
+    ]
+    const result = findCellsMissingRequiredFields(sectors, new Set(['ZERO_1', 'OUT_1']))
+    expect(result).toHaveLength(2)
+    result.forEach(cell => {
+      expect(cell.missing).toContain('longitude')
+      expect(cell.missing).toContain('latitude')
+    })
+  })
+
+  it('方向角缺失或越界视为不合法，0 度合法', () => {
+    const sectors = [
+      makeCell({ id: 'A_1', azimuth: null }),
+      makeCell({ id: 'A_2', azimuth: 361 }),
+      makeCell({ id: 'A_3', azimuth: 0 }),
+    ]
+    const result = findCellsMissingRequiredFields(sectors, new Set(['A_1', 'A_2', 'A_3']))
+    expect(result.map(cell => cell.id)).toEqual(['A_1', 'A_2'])
+    expect(result[0].missing).toContain('azimuth')
+    expect(result[1].missing).toContain('azimuth')
   })
 
   it('只校验选中的小区', () => {
@@ -87,7 +114,7 @@ describe('buildMissingCellsError', () => {
   it('英文模式使用英文分隔符与括号', () => {
     const sectors = [makeCell({ id: 'BAD_1', name: 'BadCell', frequency: null })]
     const err = buildMissingCellsError(sectors, new Set(['BAD_1']), {
-      labels: { siteId: 'Site ID', cellId: 'Cell ID', frequency: 'Frequency', longitude: 'Longitude', latitude: 'Latitude' },
+      labels: { siteId: 'Site ID', cellId: 'Cell ID', frequency: 'Frequency', longitude: 'Longitude', latitude: 'Latitude', azimuth: 'Azimuth' },
       mainTemplate: '{{count}} cell(s) invalid: {{examples}}',
       missingTemplate: 'Missing: {{fields}}',
       lang: 'en',

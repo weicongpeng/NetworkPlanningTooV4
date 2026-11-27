@@ -627,6 +627,8 @@ export interface CellListItem {
   pci?: number
   longitude?: number | null
   latitude?: number | null
+  /** 方向角（0-360 度）；缺失或非法时后端返回 null */
+  azimuth?: number | null
 }
 
 /** 小区列表响应 */
@@ -643,7 +645,8 @@ const _CELL_LIST_CACHE_TTL = 24 * 60 * 60 * 1000 // 24小时缓存
 // v5：小区经纬度改为只取小区自身值（不再回退站点坐标），旧缓存会残留错误坐标
 // v6：桌面端在后台同步落地前可能把"空列表"写进 IndexedDB（TTL 24h），
 //     旧版本（v5）留下的空缓存升级后仍会被命中，导致「小区选择」一直空白
-const _CELL_LIST_CACHE_VERSION = 6
+// v7：新增 azimuth 字段，旧缓存没有方向角会让 PCI 规划校验误判为缺失
+export const CELL_LIST_CACHE_VERSION = 7
 
 // 内存缓存（持久化，仅在数据更新时失效），按登录用户分键防止切账号串组
 const _cellListCacheByUser = new Map<string, { data: CellListResponse; time: number }>()
@@ -673,7 +676,7 @@ export async function getCellList(): Promise<CellListResponse> {
   // 2. 检查 IndexedDB 缓存（仅版本匹配时使用）
   try {
     const cached = await indexedDBService.get<CellListResponse>(_CELL_LIST_CACHE_KEY())
-    if (cached && cached.cacheVersion === _CELL_LIST_CACHE_VERSION) {
+    if (cached && cached.cacheVersion === CELL_LIST_CACHE_VERSION) {
       if (cached.lte.length === 0 && cached.nr.length === 0) {
         // 旧版本或同步前写入的空缓存：删除后走网络请求，避免「小区选择」长期空白
         console.log('[CellList] 缓存的空列表不生效，改为重新请求')
@@ -685,7 +688,7 @@ export async function getCellList(): Promise<CellListResponse> {
       }
     }
     // 版本不匹配时清除旧缓存
-    if (cached && cached.cacheVersion !== _CELL_LIST_CACHE_VERSION) {
+    if (cached && cached.cacheVersion !== CELL_LIST_CACHE_VERSION) {
       console.log('[CellList] 缓存版本不匹配，清除旧缓存')
       indexedDBService.delete(_CELL_LIST_CACHE_KEY()).catch(() => {})
     }
@@ -725,7 +728,7 @@ export async function getCellList(): Promise<CellListResponse> {
     const data: CellListResponse = {
       lte: dedupLte,
       nr: dedupNr,
-      cacheVersion: _CELL_LIST_CACHE_VERSION
+      cacheVersion: CELL_LIST_CACHE_VERSION
     }
 
     // 写入双缓存（按用户分键）
@@ -745,9 +748,9 @@ export async function getCellList(): Promise<CellListResponse> {
 
 /**
  * 执行规划前小区必须具备的字段
- * - siteId: 基站ID；id: 小区ID；frequency: 频点；longitude/latitude: 经纬度
+ * - siteId: 基站ID；id: 小区ID；frequency: 频点；longitude/latitude: 经纬度；azimuth: 方向角
  */
-export type CellRequiredField = 'siteId' | 'id' | 'frequency' | 'longitude' | 'latitude'
+export type CellRequiredField = 'siteId' | 'id' | 'frequency' | 'longitude' | 'latitude' | 'azimuth'
 
 /** 存在字段缺失的小区 */
 export interface CellMissingFields {
@@ -757,7 +760,8 @@ export interface CellMissingFields {
 }
 
 /**
- * 校验选中小区的必要字段完整性（经度/纬度/频点/基站ID/小区ID）
+ * 校验选中小区的必要字段完整性（基站ID/小区ID/频点/经纬度/方向角）。
+ * 经纬度为 0 或超出合法范围、方向角缺失或越界均视为工参不合格。
  *
  * @returns 存在缺失的小区列表（含每个小区缺失的字段），为空表示全部通过
  */
@@ -772,13 +776,20 @@ export function findCellsMissingRequiredFields(
     if (!s.siteId) missing.push('siteId')
     if (!s.id) missing.push('id')
     if (s.frequency == null || !Number.isFinite(s.frequency)) missing.push('frequency')
-    if (s.longitude == null || !Number.isFinite(s.longitude)) missing.push('longitude')
-    if (s.latitude == null || !Number.isFinite(s.latitude)) missing.push('latitude')
+    if (!isUsableCoordinate(s.longitude, SECTOR_VALIDATION.longitudeRange)) missing.push('longitude')
+    if (!isUsableCoordinate(s.latitude, SECTOR_VALIDATION.latitudeRange)) missing.push('latitude')
+    if (s.azimuth == null || !Number.isFinite(s.azimuth)
+      || s.azimuth < SECTOR_VALIDATION.azimuthRange.min
+      || s.azimuth > SECTOR_VALIDATION.azimuthRange.max) missing.push('azimuth')
     if (missing.length > 0) {
       invalid.push({ id: s.id, name: s.name || s.id, missing })
     }
   }
   return invalid
+}
+
+function isUsableCoordinate(value: number | null | undefined, range: { min: number; max: number }): boolean {
+  return value != null && Number.isFinite(value) && value !== 0 && value >= range.min && value <= range.max
 }
 
 /**

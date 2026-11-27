@@ -788,7 +788,7 @@ export function PCIPage() {
       setError(t('pci.noCellsSelected') || '请在小区选择列表中至少选择一个小区后再执行PCI规划')
       return
     }
-    // 校验选中小区的必要字段（经度/纬度/频点/基站ID/小区ID）
+    // 校验选中小区的必要字段（基站ID/小区ID/频点/经纬度/方向角），不合格则拦截执行
     const sourceSectors = config.networkType === 'LTE' ? cellListData.lte : cellListData.nr
     const missingCellsError = buildMissingCellsError(sourceSectors, selectedCellIdsSet, {
       labels: {
@@ -796,10 +796,11 @@ export function PCIPage() {
         cellId: t('pci.sectorId') || '小区ID',
         frequency: t('pci.cellFreq') || '频点',
         longitude: t('pci.cellLng') || '经度',
-        latitude: t('pci.cellLat') || '纬度'
+        latitude: t('pci.cellLat') || '纬度',
+        azimuth: t('pci.cellAzimuth') || '方向角'
       },
-      mainTemplate: t('pci.cellsMissingData') || '选中的小区中有 {{count}} 个缺少必要数据（经度/纬度/频点/基站ID/小区ID），请补充工参后再执行。缺失示例：{{examples}}',
-      missingTemplate: t('pci.missingFieldsLabel') || '缺少：{{fields}}',
+      mainTemplate: t('pci.cellsMissingData') || '选中的小区中有 {{count}} 个工参数据缺失或填写不合法（基站ID/小区ID/频点/经度/纬度/方向角），请修正工参数据后再执行。问题小区示例：{{examples}}',
+      missingTemplate: t('pci.missingFieldsLabel') || '缺失或不合法：{{fields}}',
       lang: i18n.language === 'en' ? 'en' : 'zh'
     })
     if (missingCellsError) {

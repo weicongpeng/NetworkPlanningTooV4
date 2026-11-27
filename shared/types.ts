@@ -330,6 +330,8 @@ export interface NeighborResult {
   totalSectors: number
   totalNeighbors: number
   avgNeighbors: number
+  skippedCells?: SkippedCellInfo[]
+  skippedCount?: number
   results: SiteNeighborResult[]
   startTime: string
   endTime?: string

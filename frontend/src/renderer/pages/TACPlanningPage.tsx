@@ -912,6 +912,7 @@ export function TACPlanningPage() {
                 <SkippedCellsNotice
                     group="tacPlanning"
                     skipped={taskResult.skippedCells}
+                    skippedCount={taskResult.skippedCount}
                     checkedCount={taskResult.totalCells || 0}
                 />
             )}

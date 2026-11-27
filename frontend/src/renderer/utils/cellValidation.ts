@@ -15,6 +15,7 @@ export interface CellFieldLabels {
   frequency: string
   longitude: string
   latitude: string
+  azimuth: string
 }
 
 export interface BuildMissingCellsErrorOptions {
@@ -31,8 +32,8 @@ export interface BuildMissingCellsErrorOptions {
 }
 
 /**
- * 校验选中小区的必要字段（经度/纬度/频点/基站ID/小区ID），
- * 全部齐全返回 null；存在缺失返回拼好的错误消息。
+ * 校验选中小区的必要字段（基站ID/小区ID/频点/经纬度/方向角），
+ * 全部齐全返回 null；存在缺失或非法值返回拼好的错误消息。
  */
 export function buildMissingCellsError(
   sectors: CellListItem[],
@@ -49,6 +50,7 @@ export function buildMissingCellsError(
     frequency: labels.frequency,
     longitude: labels.longitude,
     latitude: labels.latitude,
+    azimuth: labels.azimuth,
   }
 
   const fieldSep = lang === 'en' ? ', ' : '、'

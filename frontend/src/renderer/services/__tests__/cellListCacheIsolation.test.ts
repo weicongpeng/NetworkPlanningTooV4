@@ -27,7 +27,7 @@ vi.mock('../indexedDBService', () => ({
   },
 }))
 
-import { getCellList, clearCellListCache, clearAllInMemoryMapCaches } from '../mapDataService'
+import { getCellList, clearCellListCache, clearAllInMemoryMapCaches, CELL_LIST_CACHE_VERSION } from '../mapDataService'
 
 function setLoginUserId(id: number | null) {
   if (id == null) {
@@ -135,9 +135,9 @@ describe('getCellList 空缓存（IndexedDB）不生效', () => {
     clearAllInMemoryMapCaches()
   })
 
-  it('旧版本（v5）遗留的空缓存不命中，重新请求后端', async () => {
+  it('旧版本遗留的空缓存不命中，重新请求后端', async () => {
     setLoginUserId(1)
-    indexedGet.mockResolvedValueOnce({ lte: [], nr: [], cacheVersion: 5 })
+    indexedGet.mockResolvedValueOnce({ lte: [], nr: [], cacheVersion: CELL_LIST_CACHE_VERSION - 2 })
     getCellsMock.mockResolvedValueOnce({ success: true, data: groupAData })
 
     const data = await getCellList()
@@ -147,7 +147,7 @@ describe('getCellList 空缓存（IndexedDB）不生效', () => {
 
   it('当前版本的空缓存同样不命中（同步前写入的残留）', async () => {
     setLoginUserId(1)
-    indexedGet.mockResolvedValueOnce({ lte: [], nr: [], cacheVersion: 6 })
+    indexedGet.mockResolvedValueOnce({ lte: [], nr: [], cacheVersion: CELL_LIST_CACHE_VERSION })
     getCellsMock.mockResolvedValueOnce({ success: true, data: groupAData })
 
     const data = await getCellList()
@@ -157,7 +157,7 @@ describe('getCellList 空缓存（IndexedDB）不生效', () => {
 
   it('非空且版本匹配的缓存仍然命中（不破坏原有缓存行为）', async () => {
     setLoginUserId(1)
-    indexedGet.mockResolvedValueOnce({ ...groupAData, cacheVersion: 6 })
+    indexedGet.mockResolvedValueOnce({ ...groupAData, cacheVersion: CELL_LIST_CACHE_VERSION })
 
     const data = await getCellList()
     expect(data.lte).toHaveLength(1)

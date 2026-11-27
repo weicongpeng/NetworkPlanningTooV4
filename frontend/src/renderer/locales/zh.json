@@ -830,8 +830,9 @@
     "cellPci": "PCI",
     "cellLng": "经度",
     "cellLat": "纬度",
-    "cellsMissingData": "选中的小区中有 {{count}} 个缺少必要数据（经度/纬度/频点/基站ID/小区ID），请补充工参后再执行。缺失示例：{{examples}}",
-    "missingFieldsLabel": "缺少：{{fields}}",
+    "cellAzimuth": "方向角",
+    "cellsMissingData": "选中的小区中有 {{count}} 个工参数据缺失或填写不合法（基站ID/小区ID/频点/经度/纬度/方向角），请修正工参数据后再执行。问题小区示例：{{examples}}",
+    "missingFieldsLabel": "缺失或不合法：{{fields}}",
     "frequency": "频点",
     "originalPci": "原PCI",
     "newPci": "新PCI",
@@ -1041,7 +1042,14 @@
     "cellLng": "经度",
     "cellLat": "纬度",
     "cellsMissingData": "选中的小区中有 {{count}} 个缺少必要数据（经度/纬度/频点/基站ID/小区ID），请补充工参后再执行。缺失示例：{{examples}}",
-    "missingFieldsLabel": "缺少：{{fields}}"
+    "missingFieldsLabel": "缺少：{{fields}}",
+    "skippedCellsTitle": "已跳过 {{count}} 个工参数据不全的小区",
+    "skippedCellsSummary": "其余 {{checked}} 个小区已完成规划；被跳过的小区请补充工参后重新执行",
+    "skippedCellItem": "{{name}}（{{reason}}）",
+    "skippedCellsMore": "另有 {{count}} 个未列出",
+    "skipReasonMissingCoordinates": "缺少经纬度，无法定位",
+    "skipReasonMissingIds": "缺少基站ID或小区ID",
+    "skipReasonNotInParams": "工参中未找到该小区"
   },
   "tac": {
     "preparingResult": "正在准备结果明细（首次查看大结果约需数秒）...",

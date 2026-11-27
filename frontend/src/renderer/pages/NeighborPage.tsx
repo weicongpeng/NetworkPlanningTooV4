@@ -12,7 +12,7 @@ const BUFFER_COUNT = 5 // 缓冲行数
 // 结果表按「源小区」分页：每页包含该源小区的全部目标小区
 const NEIGHBOR_SOURCE_PAGE_SIZE = 50
 import { neighborApi } from '../services/api'
-import type { ApiResponse } from '@shared/types'
+import type { ApiResponse, SkippedCellInfo } from '@shared/types'
 import { useTaskStore, type Task } from '../store/taskStore'
 import { useMapStore } from '../store/mapStore'
 import { useAuthStore } from '../store/authStore'
@@ -30,7 +30,7 @@ import { CellSelectionTable } from '../components/CellSelectionTable'
 import { HistoryTable } from '../components/HistoryTable'
 import { HistoryTabActions } from '../components/HistoryTabActions'
 import { generateFullTaskName } from '../utils/taskNameUtils'
-import { buildMissingCellsError } from '../utils/cellValidation'
+import { SkippedCellsNotice } from '../components/SkippedCellsNotice'
 import { StepIndicator } from '../components/StepIndicator'
 import { WizardFooter } from '../components/WizardFooter'
 import { NumberInput } from '../components/NumberInput'
@@ -45,6 +45,8 @@ interface NeighborResultData {
   totalSectors: number
   totalNeighbors: number
   avgNeighbors: number
+  skippedCells?: SkippedCellInfo[]
+  skippedCount?: number
   results?: any[]
   startTime: string
   endTime?: string
@@ -62,7 +64,7 @@ const MAX_NEIGHBORS_LIMIT: Record<string, number> = {
 }
 
 export function NeighborPage() {
-  const { t, i18n: i18nInstance } = useTranslation()
+  const { t } = useTranslation()
   const user = useAuthStore((s) => s.user)
   const { wizardStep, setWizardStep, config, setConfig, selectedCellIds: storeSelectedCellIds, activeLeftTab, setActiveLeftTab, taskName, setTaskName, resetConfig: storeResetConfig } = useNeighborStore()
   const [taskNameError, setTaskNameError] = useState<string | null>(null)
@@ -1186,24 +1188,7 @@ export function NeighborPage() {
       setError(i18n.noCellsSelected || '请在小区选择列表中至少选择一个小区后再执行邻区规划')
       return
     }
-    // 校验选中小区的必要字段（经度/纬度/频点/基站ID/小区ID）
-    const sourceSectors = config.planningType.split('-')[0] === 'LTE' ? cellListData.lte : cellListData.nr
-    const missingCellsError = buildMissingCellsError(sourceSectors, selectedCellIdsSet, {
-      labels: {
-        siteId: i18n.sourceSiteId,
-        cellId: i18n.sourceCellId,
-        frequency: i18n.cellFreq,
-        longitude: i18n.cellLng,
-        latitude: i18n.cellLat
-      },
-      mainTemplate: t('neighbor.cellsMissingData') || '选中的小区中有 {{count}} 个缺少必要数据（经度/纬度/频点/基站ID/小区ID），请补充工参后再执行。缺失示例：{{examples}}',
-      missingTemplate: t('neighbor.missingFieldsLabel') || '缺少：{{fields}}',
-      lang: i18nInstance.language === 'en' ? 'en' : 'zh'
-    })
-    if (missingCellsError) {
-      setError(missingCellsError)
-      return
-    }
+    // 工参不全的小区不再阻断执行：后端跳过并在结果中回传 skippedCells 提示
     const validationError = validateNeighborConfig(config)
     if (validationError) { setError(validationError); return }
     setError(null); setLocalTaskResult(null); setLoading(true)
@@ -1582,6 +1567,16 @@ export function NeighborPage() {
           <span className="text-sm">{error}</span>
           <button onClick={() => setError(null)} className="ml-auto text-sm underline">{i18n.close}</button>
         </div>
+      )}
+
+      {/* 工参数据不全被跳过的小区提示（非阻断） */}
+      {taskResult?.skippedCells && taskResult.skippedCells.length > 0 && (
+        <SkippedCellsNotice
+          group="neighbor"
+          skipped={taskResult.skippedCells}
+          skippedCount={taskResult.skippedCount}
+          checkedCount={taskResult.totalSectors || 0}
+        />
       )}
 
       {/* 两列布局：左侧参数+结果，右侧地图 */}
