@@ -14,7 +14,6 @@ import {
   Download,
   Wrench,
   Bot,
-  MonitorDown,
   KeyRound,
   Sun,
   Moon,
@@ -181,9 +180,8 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
     // 桌面版是单用户形态，没有管理员与用户管理，以下服务器端管理入口全部隐藏
     ...(isAuthenticated && user?.is_admin && !desktopMode ? [
       { type: 'link' as const, name: t('admin.title', '用户管理'), href: '/admin/users', icon: Users },
-      { type: 'link' as const, name: t('sidebar.appVersions', 'APP 版本管理'), href: '/app-versions', icon: Package },
+      { type: 'link' as const, name: t('sidebar.versionManagement', '版本管理'), href: '/version-management', icon: Package },
       { type: 'link' as const, name: t('sidebar.desktopLicenses', '桌面授权'), href: '/desktop-licenses', icon: KeyRound },
-      { type: 'link' as const, name: t('sidebar.desktopReleases', '桌面版分发'), href: '/desktop-releases', icon: MonitorDown },
     ] : []),
   ]
 

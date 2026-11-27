@@ -22,8 +22,7 @@ import {
   TableMergePage,
   MapPage,
   AdminUsersPage,
-  AppVersionsPage,
-  DesktopReleasesPage,
+  VersionManagementPage,
   DesktopLicensesPage,
   AssistantPageLazy,
 } from './pageLoaders'
@@ -200,19 +199,14 @@ function App() {
                   </ProtectedRoute>
                 }
               />
+              {/* 历史入口兼容：旧链接与已保存的上次访问路径转到合并后的版本管理页 */}
+              <Route path="/app-versions" element={<Navigate to="/version-management?tab=mobile" replace />} />
+              <Route path="/desktop-releases" element={<Navigate to="/version-management" replace />} />
               <Route
-                path="/app-versions"
+                path="/version-management"
                 element={
                   <ProtectedRoute requireAdmin>
-                    <AppVersionsPage />
-                  </ProtectedRoute>
-                }
-              />
-              <Route
-                path="/desktop-releases"
-                element={
-                  <ProtectedRoute requireAdmin>
-                    <DesktopReleasesPage />
+                    <VersionManagementPage />
                   </ProtectedRoute>
                 }
               />

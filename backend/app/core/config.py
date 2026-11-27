@@ -55,6 +55,8 @@ def _city_presets_default() -> str:
 
 _BUNDLE_DIR = _bundle_dir()
 _DATA_ROOT = _data_root()
+# 移动端 APK 默认目录：Gradle release 构建输出；可用 NPT_APKS_DIR 覆盖
+_MOBILE_APK_DIR = _BUNDLE_DIR / "mobile-app" / "android" / "app" / "build" / "outputs" / "apk" / "release"
 
 
 def _is_desktop_env() -> bool:
@@ -106,7 +108,9 @@ class Settings(BaseSettings):
     EXPORT_DIR: Path = _PROFILE_ROOT / "exports"
     LICENSE_DIR: Path = _DATA_ROOT / "licenses"
     DATA_DIR: Path = _PROFILE_ROOT / "data"
-    APKS_DIR: Path = _DATA_ROOT / "apks"
+    # 移动端 APK 目录默认指向构建输出，环境变量 NPT_APKS_DIR 可覆盖
+    NPT_APKS_DIR: Optional[str] = None
+    APKS_DIR: Path = _MOBILE_APK_DIR
     DESKTOP_RELEASES_DIR: Path = _DATA_ROOT / "desktop_releases"
     TEMPLATE_DIR: Path = _BUNDLE_DIR / "template"
 
@@ -299,6 +303,12 @@ class Settings(BaseSettings):
     @property
     def CITY_PRESETS(self) -> List[str]:
         return [c.strip() for c in (self.NPT_CITY_PRESETS or "").split(",") if c.strip()]
+
+    @field_validator("APKS_DIR", mode="before")
+    @classmethod
+    def resolve_apks_dir(cls, v, info):
+        override = (info.data.get("NPT_APKS_DIR") or "").strip()
+        return Path(override) if override else v
 
     @field_validator("NPT_CORS_ORIGINS", mode="before")
     @classmethod

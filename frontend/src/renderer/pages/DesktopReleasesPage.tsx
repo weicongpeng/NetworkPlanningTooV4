@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { Check, Download, Loader2, MonitorDown, Pencil, RefreshCw, Trash2, Upload, X } from 'lucide-react'
+import { Check, Download, Loader2, Pencil, RefreshCw, Trash2, Upload, X } from 'lucide-react'
 import type { DesktopReleaseInfo } from '@shared/types'
 import { desktopReleasesApi } from '../services/api'
 import { parallelDownload } from '../utils/parallelDownload'
@@ -13,6 +13,12 @@ interface UploadDraft {
   channel: string
   releaseNotes: string
   isLatest: boolean
+}
+
+function formatPackageTime(value?: string | null): string {
+  if (!value) return '-'
+  const date = new Date(value)
+  return Number.isNaN(date.getTime()) ? '-' : date.toLocaleString('zh-CN', { hour12: false })
 }
 
 // 组件卸载后仍存活的模块级草稿；上传进度由同样模块级的 uploadStore 承载，
@@ -146,12 +152,8 @@ export function DesktopReleasesPage() {
   const totalPages = Math.max(1, Math.ceil(total / pageSize))
 
   return (
-    <div className="p-6 w-full space-y-5">
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-2">
-          <MonitorDown size={20} className="text-primary" />
-          <h1 className="text-base font-bold">{t('desktopReleases.title')}</h1>
-        </div>
+    <div className="px-6 pb-6 pt-4 w-full space-y-5">
+      <div className="flex justify-end">
         <button
           onClick={() => fetchReleases()}
           className="p-2 hover:bg-muted rounded-lg transition-colors"
@@ -273,6 +275,7 @@ export function DesktopReleasesPage() {
           <thead className="bg-muted/50 text-xs text-muted-foreground">
             <tr>
               <th className="px-3 py-2 text-left">{t('desktopReleases.colVersion')}</th>
+              <th className="px-3 py-2 text-left">{t('versionManagement.timeColumn')}</th>
               <th className="px-3 py-2 text-left">{t('desktopReleases.colChannel')}</th>
               <th className="px-3 py-2 text-left">{t('desktopReleases.colSize')}</th>
               <th className="px-3 py-2 text-left">{t('desktopReleases.colNotes')}</th>
@@ -299,6 +302,7 @@ export function DesktopReleasesPage() {
                     </span>
                   )}
                 </td>
+                <td className="px-3 py-2 whitespace-nowrap text-muted-foreground">{formatPackageTime(item.file_time)}</td>
                 <td className="px-3 py-2">{item.channel}</td>
                 <td className="px-3 py-2">{item.file_size_display || '-'}</td>
                 <td className="px-3 py-2 max-w-[280px] truncate" title={item.release_notes || ''}>
@@ -342,7 +346,7 @@ export function DesktopReleasesPage() {
             ))}
             {items.length === 0 && !loading && (
               <tr>
-                <td colSpan={6} className="px-3 py-8 text-center text-muted-foreground text-sm">
+                <td colSpan={7} className="px-3 py-8 text-center text-muted-foreground text-sm">
                   {t('desktopReleases.empty')}
                 </td>
               </tr>

@@ -43,6 +43,16 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _file_time_iso(path: str | None) -> str | None:
+    """安装包文件的生成时间（mtime），文件缺失时返回 None"""
+    if not path:
+        return None
+    try:
+        return datetime.fromtimestamp(Path(path).stat().st_mtime, timezone.utc).isoformat(timespec="seconds")
+    except OSError:
+        return None
+
+
 def _safe_filename(version: str, original_name: str) -> str:
     safe_version = "".join(c for c in version if c.isalnum() or c in "._-")
     safe_name = "".join(
@@ -219,6 +229,7 @@ async def list_releases(
     for record in records:
         data = record.to_dict()
         data["file_size_display"] = _format_size(record.file_size)
+        data["file_time"] = _file_time_iso(record.file_path)
         # 文件被删掉（手工清理/迁移）时前端要能看出来，否则 OTA 会拿到 404
         data["file_missing"] = not (record.file_path and Path(record.file_path).is_file())
         items.append(data)

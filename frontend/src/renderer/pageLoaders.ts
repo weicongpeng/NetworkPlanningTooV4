@@ -19,8 +19,7 @@ export const loadIntermodulationPage = () => import('./pages/IntermodulationPage
 export const loadTableMergePage = () => import('./pages/TableMergePage')
 export const loadMapPage = () => import('./pages/MapPage').then(m => ({ default: m.MapPage }))
 export const loadAdminUsersPage = () => import('./pages/AdminUsersPage').then(m => ({ default: m.AdminUsersPage }))
-export const loadAppVersionsPage = () => import('./pages/AppVersionsPage').then(m => ({ default: m.AppVersionsPage }))
-export const loadDesktopReleasesPage = () => import('./pages/DesktopReleasesPage').then(m => ({ default: m.DesktopReleasesPage }))
+export const loadVersionManagementPage = () => import('./pages/VersionManagementPage').then(m => ({ default: m.VersionManagementPage }))
 export const loadDesktopLicensesPage = () => import('./pages/DesktopLicensesPage').then(m => ({ default: m.DesktopLicensesPage }))
 
 /**
@@ -75,8 +74,7 @@ export const IntermodulationPage = lazy(recoverable(loadIntermodulationPage))
 export const TableMergePage = lazy(recoverable(loadTableMergePage))
 export const MapPage = lazy(recoverable(loadMapPage))
 export const AdminUsersPage = lazy(recoverable(loadAdminUsersPage))
-export const AppVersionsPage = lazy(recoverable(loadAppVersionsPage))
-export const DesktopReleasesPage = lazy(recoverable(loadDesktopReleasesPage))
+export const VersionManagementPage = lazy(recoverable(loadVersionManagementPage))
 export const DesktopLicensesPage = lazy(recoverable(loadDesktopLicensesPage))
 
 /**
@@ -100,8 +98,9 @@ export function prefetchPage(href: string) {
     case '/table-merge': loadTableMergePage(); break
     case '/map': loadMapPage(); break
     case '/admin/users': loadAdminUsersPage(); break
-    case '/app-versions': loadAppVersionsPage(); break
-    case '/desktop-releases': loadDesktopReleasesPage(); break
+    case '/version-management': loadVersionManagementPage(); break
+    case '/app-versions':
+    case '/desktop-releases': loadVersionManagementPage(); break
     case '/desktop-licenses': loadDesktopLicensesPage(); break
     case '/assistant': loadAssistantPage(); break
     default: break

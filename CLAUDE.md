@@ -20,7 +20,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **地图**：在线（高德/OSM）/离线地图、工参扇区渲染、专题图层、值热力面、标签防重叠、图层制作与编辑（TAB/MIF/KML）、绘制/测量/圈选/节点合并、条件选择、缓冲区、图例与导出
 - **数据**：Excel/CSV/TXT/TAB/MIF 上传、全量工参、小区查询/批量更新、新站录入、地理化数据
 - **工具**：批量距离匹配、站间距、频点换算（LTE/NR/GSCN）、表格合并（多文件按表头结构 / 工作表名 / 列名对齐合并；列名模式仅支持 CSV 或单 sheet 文件）
-- **平台**：用户与权限、数据组隔离、网优助手（LLM）、APP 版本管理、许可证
+- **平台**：用户与权限、数据组隔离、网优助手（LLM）、版本管理（桌面端/移动端分发）、许可证
 
 ## 常用开发命令
 
@@ -238,9 +238,8 @@ FastAPI (backend/app/)
 | `/intermodulation` | `IntermodulationPage` | 三阶互调评估 |
 | `/table-merge` | `TableMergePage` | 表格合并（多文件合并为一个 Excel，按表头结构 / 工作表名分组，或所有文件按列名忽略大小写对齐为一张表） |
 | `/admin/users` | `AdminUsersPage` | 用户管理（`requireAdmin`） |
-| `/app-versions` | `AppVersionsPage` | APP 版本管理（`requireAdmin`） |
+| `/version-management` | `VersionManagementPage` | 版本管理：桌面端分发 / 移动端分发两页签（`requireAdmin`，侧栏仅非桌面形态的管理员可见）；旧 `/app-versions`、`/desktop-releases` 重定向至此 |
 | `/assistant` | `AssistantPage` | 网优助手（`requirePermission="can_assistant"`） |
-| `/desktop-releases` | `DesktopReleasesPage` | 桌面版安装包分发（`requireAdmin`，侧栏仅非桌面形态的管理员可见） |
 | `/desktop-licenses` | `DesktopLicensesPage` | 桌面授权管理（`requireAdmin`，同上）；编辑弹窗只保留「无操作退出登录时长（天）」，到期/数据组跟随用户管理 |
 | `*` | — | 重定向 `/` |
 
@@ -266,7 +265,7 @@ FastAPI (backend/app/)
 | `buffer.py` | `/api/v1/buffer` | 绘制缓冲区 |
 | `map.py` | `/api/v1/map` | 地图数据/小区/扇区、缓存清理、在线与离线配置 |
 | `license.py` | `/api/v1/license` | 许可证状态/上传/激活 |
-| `app_versions.py` | `/api/v1/app-versions` | APP 版本管理：latest/download（公开）、上传（admin、分片） |
+| `app_versions.py` | `/api/v1/app-versions` | 移动端分发：latest/download（公开）、上传（admin、分片）、列表时按 mtime 加载 `APKS_DIR` 中最新 APK（版本留空待配） |
 | `assistant.py` | `/api/v1/assistant` | LLM 配置、数据集、对话（需 `can_assistant`） |
 | `desktop_licenses.py` | `/api/v1/desktop-licenses` | 桌面授权管理（admin）：创建激活码/批准/禁用/解绑换机/重发码；数据组与到期以「用户管理」的（地市+运营商）/许可证到期为准（列表回写授权记录） |
 | `desktop_cloud.py` | `/api/v1/desktop-cloud` | 桌面客户端**公开**接口（授权服务器侧）：账号登录/单设备会话校验、激活/续期/申请（凭证=激活码或签名许可 + 机器码，非 JWT）、`/config`、数据集同步（`/data/session|manifest|dataset/{id}/package`）、`releases/latest` 与 `releases/download/{id}`（Range） |
@@ -313,7 +312,7 @@ FastAPI (backend/app/)
 - **工参更新**（现网工参合并进全量工参）：`POST /api/v1/data/update-parameters` → `task_manager.create_update_params_task` → `data_service.update_parameters()`（新建带时间戳的**新**全量工参条目，删同组旧全量工参，组归属继承）。三条硬约束（2026-10-08 加）：① 现网工参 CSV（`LTE_SDR_CellInfo_*` / `LTE_ITBBU_CellInfo_*` / `NR_CellInfo_*`）在本机缺失 → 桌面共享模式先 `desktop_sync_service.repair_dataset()` 从服务器补拉一次，仍缺失则**报错**；② 合并后一个小区都没匹配上也没新增行 → **报错**（否则会产出与更新前一致的文件）；③ 工作表缺 Key 列 → **报错**（原来静默跳过）。任务结果带 `stats`（每制式匹配/新增行数），前端展示"更新统计"。**场景名称**（2026-11 加）：`工参更新(中兴)` 复用 `services/scene_matcher.py`（参考 TAC 的 STRtree + contains/touches）按经纬度匹配组内「场景图层.zip」图层，把「场景名称」写进全量工参与 4G/5G 合并结果的「小区覆盖类型」右侧；场景名取要素属性 `NAME`（如「一般城区核心区域」），跳过 `.cache` 下以图层 UUID 命名的 GeoJSON，也不把「场景图层」当场景名；经纬度为空/0/非数字/超范围时该列留空，有效坐标未命中/无图层填「农村」，缺图层只提示不阻断更新。前端「工参更新(中兴)」面板提供「选择场景图层（ZIP）」下拉，默认选中已导入数据中名为「场景图层」的条目，可选其他 map_layer 或显式不加载；选中 dataId 经接口组隔离校验后只加载该图层（`SceneMatcher.load(data_id=...)`），未传时仍自动搜索默认图层（兼容旧调用）。下载模板 `template/ProjectParameter_mongoose.xlsx` 已在「是否共享」右侧内置该列，首部另补「城市 → 运营商 → 是否现网 → CGI」（与已导入全量工参一致；运营商用于按地市+运营商匹配 4G 号段范围）；模板还内置「4G号段使用范围」sheet（当前已导入工参的全部号段，同一行 eNBId/cellId 成对匹配）与 NR 表「天线方向角」右侧的「天线机械下倾角」（非必填 / Mechanical Downtilt，NR 表单元格无填充色）。
 - **图层保存**：前端 GeoJSON（GCJ02）→ `PUT /api/v1/data/{dataId}/layers/{layerId}/data` → `layer_edit_service` 整层重写 TAB/MIF（含样式元数据列）→ 刷新数据条目时间戳。`source_file` 跨端后由 `services/layer_paths.py` 按当前数据目录同名文件回退；网页端写服务器 `DATA_DIR`，桌面共享写 `profiles/shared/` 再上行，单机写 `profiles/standalone/`
 - **图层下载**：`GET /api/v1/data/{dataId}/layers/{layerId}/download` 打包同 stem 的 `.tab/.dat/.id/.map/.ind`
-- **APP 分发**：管理端分片上传 APK（绕过 Cloudflare 100MB 限制）→ `app_versions` 表 + `backend/app/apks/`；客户端 `GET /api/v1/app-versions/latest` 与 `/download/{id}`（支持 Range、下载计数）
+- **APP 分发**：默认 APK 目录为 `mobile-app/android/app/build/outputs/apk/release`（`NPT_APKS_DIR` 可覆盖），手动上传也落到该目录；打开移动端分发页时按文件 mtime 只加载最新的一个 APK（版本号留空，管理员编辑填写），旧批量扫描已移除；两页列表均显示包文件时间列。客户端 `GET /api/v1/app-versions/latest` 与 `/download/{id}`（支持 Range、下载计数）
 - **桌面版登录与授权（2026-10 改版）**：桌面端不再有 owner 免登录账号，与网页端**共用同一套账号**；桌面形态的登录页多一组「运行模式」选择：
   - **共享模式**：`POST /desktop/login`（本机）→ 代理 `POST /desktop-cloud/auth/login`（服务器）→ 用 `auth_service.authenticate_user` 校验网页端账号 → 为「账号 + 机器」自动签发许可（`DesktopLicense.mode='shared'`，兼作同步凭证）→ 本机镜像同名本地账号（组/权限位/管理员位照搬）→ 签发本机 JWT。**登录优先**：首次同步不在登录路径上跑，登录响应返回后 `LOGIN_SYNC_DELAY_SECONDS`（15s）由后台定时器触发一次 `sync_once`。
     - **离线/弱网登录（共享与单机一致，2026-10-17）**：两种模式都先在**线程池**里做本机凭据校验（`_local_offline_login`：管理员镜像账号免许可；普通用户要求本机许可 valid 且归属账号匹配 + bcrypt）。本机凭据有效时服务器只做 1.2s 快速探测（`STANDALONE_FAST_PROBE_SECONDS`，不重试），超时/网络不可达/5xx 立即离线进入（`_finish_offline_login(db, user, mode)`）：单机置 run_mode=offline，**共享保持 shared**（同步循环联网后自动恢复）；迟到的探测结果由 `_apply_late_login_probe` 后台补权限位/会话。本机无凭据（首次登录/换机/许可归属他人）才走完整在线请求（10s，`cloud.login` 对网络类错误含 TLS 握手超时自动重试 1 次，4xx/5xx 不重试）——修掉共享模式频繁报 `_ssl.c:993 handshake timed out` 后被挡在门外的问题。

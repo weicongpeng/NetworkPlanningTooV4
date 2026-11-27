@@ -93,6 +93,55 @@ def _cleanup_orphaned_records(db: Session) -> int:
     return cleaned
 
 
+def _file_time_iso(path: str | None) -> str | None:
+    """安装包文件的生成时间（mtime），文件缺失时返回 None"""
+    if not path:
+        return None
+    try:
+        return datetime.fromtimestamp(Path(path).stat().st_mtime, timezone.utc).isoformat(timespec="seconds")
+    except OSError:
+        return None
+
+
+def _load_latest_local_apk(db: Session) -> AppVersion | None:
+    """默认加载 APK 目录中生成时间最新的包。
+
+    只处理最新的那一个文件：首次出现时登记入库（版本号留空，由管理员配置），
+    随后每次加载都保证它的 is_latest 为真。旧包只保留记录，不再批量扫描。
+    """
+    if not APKS_DIR.is_dir():
+        return None
+    newest = max(
+        (path for path in APKS_DIR.glob("*.apk") if path.is_file()),
+        key=lambda path: path.stat().st_mtime,
+        default=None,
+    )
+    if newest is None:
+        return None
+
+    file_path = str(newest.resolve())
+    record = db.query(AppVersion).filter(AppVersion.apk_path == file_path).first()
+    if record is None:
+        _clear_other_latest(db)
+        record = AppVersion(
+            version="",
+            changelog="",
+            apk_filename=newest.name,
+            apk_path=file_path,
+            file_size=newest.stat().st_size,
+            is_latest=True,
+            created_at=datetime.now(timezone.utc).isoformat(),
+        )
+        db.add(record)
+        db.commit()
+        db.refresh(record)
+    elif not record.is_latest:
+        _clear_other_latest(db)
+        record.is_latest = True
+        db.commit()
+    return record
+
+
 @router.get("")
 @router.get("/")
 async def list_versions(
@@ -101,9 +150,14 @@ async def list_versions(
     admin_user: User = Depends(get_current_admin_user),
     db: Session = Depends(get_db),
 ):
-    """管理员分页获取版本列表（自动清理文件已缺失的孤立记录）"""
-    # 自动清理 APK 文件已不存在的孤立数据库记录
+    """管理员分页获取版本列表（加载目录中最新 APK、清理文件缺失记录）"""
     _cleanup_orphaned_records(db)
+    # 默认按文件生成时间加载最新的一个包；不再批量扫描目录
+    try:
+        _load_latest_local_apk(db)
+    except Exception as exc:  # noqa: BLE001
+        db.rollback()
+        logger.warning("加载本地最新 APK 失败: %s", exc)
 
     total = db.query(AppVersion).count()
     versions = (
@@ -117,6 +171,7 @@ async def list_versions(
     for v in versions:
         item = v.to_dict()
         item["file_size_display"] = _format_size(v.file_size)
+        item["file_time"] = _file_time_iso(v.apk_path)
         items.append(item)
     return {
         "success": True,
@@ -376,105 +431,6 @@ async def download_apk(
         media_type="application/vnd.android.package-archive",
         headers=base_headers,
     )
-
-
-@router.post("/import-local")
-async def import_local_apks(
-    version_override: str | None = Form(default=None, description="强制指定版本号（可选）"),
-    changelog: str = Form(default="", description="更新说明（可选）"),
-    mark_latest: bool = Form(default=True, description="是否标记为最新版本"),
-    admin_user: User = Depends(get_current_admin_user),
-    db: Session = Depends(get_db),
-):
-    """管理员导入 APK 目录中已有的 APK 文件到数据库
-
-    扫描 apks/ 目录下的所有 .apk 文件，将未注册的文件导入数据库。
-    版本号优先从文件名中提取（如 'V2.0.0'、'v1.3.0-beta'、'2.0.1'），
-    提取失败则使用文件名作为版本号。
-    已注册的文件（apk_filename 匹配）会被跳过。
-    """
-    APKS_DIR.mkdir(parents=True, exist_ok=True)
-
-    # 获取已有记录的文件名集合
-    existing_filenames = set()
-    for v in db.query(AppVersion).all():
-        if v.apk_filename:
-            existing_filenames.add(v.apk_filename)
-
-    imported = []
-    skipped = []
-
-    for f in sorted(APKS_DIR.iterdir()):
-        if not f.is_file() or not f.name.endswith(".apk"):
-            continue
-
-        # 跳过已注册的文件
-        if f.name in existing_filenames:
-            skipped.append({"filename": f.name, "reason": "数据库已存在"})
-            continue
-
-        # 提取版本号
-        if version_override:
-            ver = version_override
-        else:
-            # 尝试从文件名提取版本号：V2.0.0 / v1.3.0-beta / 2.0.1 ...
-            import re
-            match = re.search(r"[vV]?(\d[\d.]*(?:-\w+)?)", f.stem)
-            if match:
-                ver = match.group(1)
-            else:
-                ver = f.stem  # 回退：使用文件名（不含扩展名）
-
-        now = datetime.now(timezone.utc).isoformat()
-        file_size = f.stat().st_size
-
-        app_version = AppVersion(
-            version=ver,
-            changelog=changelog.strip() if changelog else "",
-            apk_filename=f.name,
-            apk_path=str(f.resolve()),
-            file_size=file_size,
-            is_latest=mark_latest,
-            created_at=now,
-        )
-        db.add(app_version)
-
-        # 如果标记为最新，清除其他版本的最新标记
-        if mark_latest:
-            _clear_other_latest(db)
-
-        imported.append({
-            "filename": f.name,
-            "version": ver,
-            "file_size": file_size,
-            "file_size_display": _format_size(file_size),
-        })
-
-    db.commit()
-
-    # 重新查询导入的记录以获得 id
-    for item in imported:
-        record = db.query(AppVersion).filter(
-            AppVersion.apk_filename == item["filename"]
-        ).first()
-        if record:
-            item["id"] = record.id
-
-    logger.info(
-        f"管理员 {admin_user.username} 执行了本地APK导入: "
-        f"成功 {len(imported)} 个, 跳过 {len(skipped)} 个"
-    )
-
-    return {
-        "success": True,
-        "data": {
-            "imported": imported,
-            "skipped": skipped,
-            "total_imported": len(imported),
-            "total_skipped": len(skipped),
-        },
-        "message": f"成功导入 {len(imported)} 个 APK 文件",
-    }
 
 
 # ===== 分块上传端点（解决 Cloudflare 413 Payload Too Large）=====

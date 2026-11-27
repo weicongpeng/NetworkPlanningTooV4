@@ -434,9 +434,17 @@
     "en": "English"
   },
   "sidebar": {
-    "appVersions": "APP 版本管理",
-    "desktopReleases": "桌面版分发",
+    "versionManagement": "版本管理",
     "desktopLicenses": "桌面授权"
+  },
+  "versionManagement": {
+    "title": "版本管理",
+    "desktopTab": "桌面端分发",
+    "mobileTab": "移动端分发",
+    "timeColumn": "时间",
+    "versionUnset": "未配置版本",
+    "mobileFileLabel": "安装包（.apk）",
+    "mobileImportHint": "默认加载 apks 目录中生成时间最新的 APK（可在后端用 NPT_APKS_DIR 调整路径）；自动加载的包版本号留空，请在编辑中填写"
   },
   "app": {
     "download": "APP",

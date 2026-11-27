@@ -2497,7 +2497,7 @@ export const appVersionsApi = {
    * APK 文件通常 >100MB，Cloudflare 默认限制 100MB。
    * 使用 1MB 分块（比数据文件 500KB 更大，减少分块数）和指数退避重试。
    */
-  upload: async (formData: FormData) => {
+  upload: async (formData: FormData, onProgress?: (percent: number) => void) => {
     const file = formData.get('file') as File
     const version = formData.get('version') as string
     const changelog = (formData.get('changelog') as string) || ''
@@ -2521,6 +2521,7 @@ export const appVersionsApi = {
   const startResp = await uploadClient.post(`${basePath}/start`, startForm)
     const uploadId = startResp.data?.id || startResp.data?.data?.id
     if (!uploadId) throw new Error('无法创建上传会话')
+    onProgress?.(3)
 
     // 阶段2: 逐块上传（指数退避重试）
     for (let i = 0; i < totalChunks; i++) {
@@ -2537,6 +2538,7 @@ export const appVersionsApi = {
           chunkForm.append('chunk_index', String(i))
           await uploadClient.post(`${basePath}/${uploadId}/chunk`, chunkForm)
           success = true
+          onProgress?.(3 + Math.round(((i + 1) / totalChunks) * 95))
           console.log(`[AppVersions] 分块 ${i + 1}/${totalChunks} 上传完成`)
         } catch {
           retries++
@@ -2553,6 +2555,7 @@ export const appVersionsApi = {
     }
 
     // 阶段3: 完成上传（传递版本信息）- 需要管理员 token
+    onProgress?.(99)
     const completeForm = new FormData()
     completeForm.append('version', version)
     completeForm.append('changelog', changelog)
@@ -2576,6 +2579,7 @@ export const appVersionsApi = {
     const result = await uploadClient.post(`${basePath}/${uploadId}/complete`, completeForm, {
       headers: completeHeaders,
     })
+    onProgress?.(100)
     return result
   },
 
@@ -2588,17 +2592,6 @@ export const appVersionsApi = {
   /** 删除版本（管理员） */
   delete: async (id: number) => {
     const res = await apiClient.delete(`/app-versions/${id}`)
-    return res
-  },
-
-  /** 扫描导入本地 APK 文件（管理员）
-   *  将 apks/ 目录下未注册的 .apk 文件导入数据库 */
-  importLocal: async (params?: { mark_latest?: boolean; changelog?: string }) => {
-    const formData = new FormData()
-    // 必须至少发送一个字段，避免空 FormData 导致 FastAPI 解析失败
-    formData.append('mark_latest', params?.mark_latest !== undefined ? String(params.mark_latest) : 'true')
-    if (params?.changelog) formData.append('changelog', params.changelog)
-    const res = await apiClient.post('/app-versions/import-local', formData)
     return res
   },
 }

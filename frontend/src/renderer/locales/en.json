@@ -511,9 +511,17 @@
     "en": "English"
   },
   "sidebar": {
-    "appVersions": "App Versions",
-    "desktopReleases": "Desktop Releases",
+    "versionManagement": "Version Management",
     "desktopLicenses": "Desktop Licenses"
+  },
+  "versionManagement": {
+    "title": "Version Management",
+    "desktopTab": "Desktop Distribution",
+    "mobileTab": "Mobile Distribution",
+    "timeColumn": "Time",
+    "versionUnset": "Version not set",
+    "mobileFileLabel": "Installer (.apk)",
+    "mobileImportHint": "Loads the newest APK by file time from the apks directory (override with NPT_APKS_DIR); auto-loaded packages have no version - set it via Edit"
   },
   "app": {
     "download": "APP",

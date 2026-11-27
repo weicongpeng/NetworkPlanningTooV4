@@ -13,7 +13,7 @@ This file provides guidance to CodeBuddy Code when working with code in this rep
 - **Electron / Capacitor 已废弃**：`frontend/package.json.electron`、`frontend/capacitor.config.ts`、`frontend/start-electron-dev.bat` 均为遗留文件，`frontend/electron/` 目录与 electron 依赖不存在，不要按 Electron/Capacitor 方式启动或构建。
 - 本文件与根 `CLAUDE.md` **互为镜像**（改其一需同步另一份），`README.md` 是面向用户的功能概览；三者与代码不一致时以当前代码为准，发现滞后请顺手更新对应文件。
 
-**主要功能**：PCI 规划（碰撞/混淆、模 3/模 30）、邻区规划（覆盖圆）、TAC 核查与规划（异 TAC 孤岛/插花）、地图可视化与图层制作/编辑（在线高德/OSM、离线；TAB/MIF/KML/Excel 地理数据；专题与值热力面、标签防重叠、条件选择、绘制缓冲区）、数据管理（上传、全量工参、小区查询/批量更新、新站录入、数据组隔离）、距离匹配、站间距、频点换算（LTE/NR/GSCN）、表格合并、网优助手（LLM）、用户与权限、APP 版本管理。
+**主要功能**：PCI 规划（碰撞/混淆、模 3/模 30）、邻区规划（覆盖圆）、TAC 核查与规划（异 TAC 孤岛/插花）、地图可视化与图层制作/编辑（在线高德/OSM、离线；TAB/MIF/KML/Excel 地理数据；专题与值热力面、标签防重叠、条件选择、绘制缓冲区）、数据管理（上传、全量工参、小区查询/批量更新、新站录入、数据组隔离）、距离匹配、站间距、频点换算（LTE/NR/GSCN）、表格合并、网优助手（LLM）、用户与权限、版本管理（桌面端/移动端分发）。
 
 ## 常用开发命令
 
@@ -175,7 +175,7 @@ FastAPI (backend/app/)
 ### 前端架构（`frontend/src/renderer/`）
 
 - 路由在 `App.tsx`（`LastRouteTracker > AuthGuard > MainLayout > Suspense > Routes`）：除 `HomePage` 直接 import 外，页面均由 `pageLoaders.ts` 做 React.lazy 分包 + 导航悬停预取；`recoverable()` 处理部署更新后旧 chunk 加载失败（自动刷新一次）；`LastRouteTracker` + `utils/lastRoute.ts` 支持重新登录后恢复上次页面。
-  `/` 首页、`/data` 数据管理、`/pci`、`/neighbor`、`/tac`（核查）、`/tac-planning`、`/map` 地图与图层编辑、`/layer` 图层制作、`/distance-match` 距离匹配、`/site-spacing` 站间距、`/frequency-conversion` 频点换算、`/intermodulation` 三阶互调评估、`/table-merge` 表格合并、`/license`（许可证/主题/语言/LLM 配置，唯一不受 ProtectedRoute 限制）、`/admin/users`、`/app-versions`、`/assistant` 网优助手、`/desktop-releases` 桌面版分发、`/desktop-licenses` 桌面授权管理（后两者 `requireAdmin`，侧栏仅非桌面形态的管理员可见）。
+  `/` 首页、`/data` 数据管理、`/pci`、`/neighbor`、`/tac`（核查）、`/tac-planning`、`/map` 地图与图层编辑、`/layer` 图层制作、`/distance-match` 距离匹配、`/site-spacing` 站间距、`/frequency-conversion` 频点换算、`/intermodulation` 三阶互调评估、`/table-merge` 表格合并、`/license`（许可证/主题/语言/LLM 配置，唯一不受 ProtectedRoute 限制）、`/admin/users`、`/assistant` 网优助手、`/version-management` 版本管理（桌面端分发/移动端分发）、`/desktop-licenses` 桌面授权管理（后两者 `requireAdmin`，侧栏仅非桌面形态的管理员可见）；旧 `/app-versions`、`/desktop-releases` 重定向到 `/version-management`。
   `pages/HistoryPage.tsx`、`TaskConfigPage.tsx`、`NetworkStatusDemo.tsx` 未挂路由（遗留/演示）。
 - Zustand store（`store/`，17 个文件）：`authStore`（含桌面端 `desktopMode`/`desktopProbed`/`desktopRunMode`/`desktopPendingUsername`，`probeDesktopMode()` 探测本机后端）、`dataStore`、`taskStore`、`mapStore`（按用户持久化 `map-settings-user-<id>`，与后端 user settings 同步）、`layerEditStore`（图层编辑真源：workspaces/撤销/剪贴板/保存计划）、`mapDataCacheStore`（跨页 LRU 缓存）、`desktopSyncStore`（共享模式每 5s 轮询 `/desktop/sync-status`，同步落地派发 `DESKTOP_SYNCED_EVENT`）、`licenseStore`、`pciStore`/`neighborStore`/`tacCheckStore`/`tacPlanningStore`（向导状态）、`tacStore`（旧版，@deprecated）、`themeStore`、`toastStore`（全局 Toast）、`downloadStore`；`uploadStore` 不是 Zustand（分片上传单例）。
 **切账号时的内存态清理**：`authStore.clearUserDataCaches()`（登录/注册/登出/桌面登录四处调用）统一清 `mapDataService` 内存缓存、数据列表、`layerEditStore`（工作集/撤销栈/剪贴板/编辑态，`resetForUserSwitch`）与 `mapDataCacheStore`（图层 GeoJSON/工参/地理化 LRU）；新增「按用户隔离」的内存态必须挂到这里，否则会出现「上一账号打开过的图层/未保存改动」带到下一个账号（2026-10-13 修：3D 基站图层显隐曾停在挂载那一刻的值、编辑工作集跨账号残留）。
@@ -207,7 +207,7 @@ FastAPI (backend/app/)
 | `buffer.py` | `/api/v1/buffer` | 绘制缓冲区（`/plan` + 进度/结果） |
 | `map.py` | `/api/v1/map` | 地图数据/小区/扇区、缓存清理、在线与离线配置 |
 | `license.py` | `/api/v1/license` | 许可证状态/上传/激活 |
-| `app_versions.py` | `/api/v1/app-versions` | APP 版本管理：latest/download（公开）、上传（admin、分片） |
+| `app_versions.py` | `/api/v1/app-versions` | 移动端分发：latest/download（公开）、上传（admin、分片）、列表时按 mtime 加载 `APKS_DIR` 中最新 APK（版本留空待配） |
 | `desktop_licenses.py` | `/api/v1/desktop-licenses` | 桌面授权管理（admin）：创建激活码/批准/禁用/解绑换机/重发码；数据组与到期以「用户管理」的（地市+运营商）/许可证到期为准（列表回写授权记录） |
 | `desktop_cloud.py` | `/api/v1/desktop-cloud` | 桌面客户端公开接口：激活/续期/申请（激活码或旧许可即凭证）、`/config`、`releases/latest`、`releases/download/{id}`（Range） |
 | `desktop_local.py` | `/api/v1/desktop` | 桌面版**本机**接口（仅 `NPT_DESKTOP=1`，否则 404）：`login/auth-poll`（账号登录与单机授权轮询）、`cloud-status/activate/renew/apply`、共享模式 `sync-status/run-mode/sync/sync-resolve/group`、`update/status|download|progress|snooze|install`、`exit`（经 `app/desktop_bridge.py` 关闭窗口）、`window-title`/`fullscreen`（写标题栏 / 切窗口全屏）、`window-control`/`window-state`（自绘标题栏窗口动作与状态校准） |
@@ -254,7 +254,7 @@ FastAPI (backend/app/)
 - **条件选择**：`POST /api/v1/attribute-join/plan` → `task_manager` → `attribute_join_service`（锚点落入 TAC/县界面图层，追加属性列）→ 结果 Excel 下载。
 - **绘制缓冲区**：`POST /api/v1/buffer/plan` → `buffer_service`（each 逐要素 / dissolve 融合，点用测地线、线面用局部切平面）→ 写回装饰图层（前端 IndexedDB）或已有 MapInfo 图层（`layer_patch_service`）。
 - **图层下载**：`GET /api/v1/data/{dataId}/layers/{layerId}/download` 打包同 stem 的 .tab/.dat/.id/.map/.ind；数据管理页原文件下载走 `GET /api/v1/data/{id}/download`。
-- **APP 分发**：管理端分片上传 APK（绕过 Cloudflare 100MB 限制）→ `app_versions` 表 + `backend/app/apks/`；客户端 `GET /api/v1/app-versions/latest` 与 `/download/{id}`（支持 Range、下载计数）。
+- **APP 分发**：默认 APK 目录为 `mobile-app/android/app/build/outputs/apk/release`（`NPT_APKS_DIR` 可覆盖），手动上传也落到该目录；打开移动端分发页时按文件 mtime 只加载最新的一个 APK（版本号留空，管理员编辑填写），旧批量扫描已移除；两页列表均显示包文件时间列。客户端 `GET /api/v1/app-versions/latest` 与 `/download/{id}`（支持 Range、下载计数）。
 - **桌面版登录与授权（2026-10 改版）**：桌面端不再有 owner 免登录账号，与网页端**共用同一套账号**。登录页在桌面形态下多一组「运行模式」选择：
   - **共享/单机数据物理隔离（2026-10-16）**：两种运行模式各用独立配置档，`%APPDATA%/NetworkPlanningTool/profiles/<shared|standalone>/` 下各持一套 `data/data.db`（工参/图层/历史任务/用户镜像全部表）、`data/<id>/`（导入文件）、`uploads/`、`outputs/`、`exports/`、`sync_state.json`；授权、记住密码、OTA、webview、日志、端口仍全局共享。配置档由 `core/desktop_profiles.py` 管理，launcher 导入 app 前读 `active_profile.json` 注入 `NPT_DESKTOP_PROFILE`；首启把旧版平铺数据幂等迁入 shared 档（单机档从空库开始）。切模式必须重启进程：`/desktop/login`（注册同理）发现请求模式 ≠ 当前档即短路（不建镜像、不发 token、不触服务器），写加密一次性凭据 `pending_login.json` 并改 `active_profile.json`，前端收到 `restart_required` 调 `/desktop/restart`（Windows 自动拉起，非 Windows 提示手动重启），新档登录页消费凭据自动登录；前端 IndexedDB 缓存键追加 `_dshared/_dstandalone` 后缀防串缓存。
     - **切档重启后仍进旧模式的根因与修复**：重启脚本继承父进程 `NPT_DESKTOP_PROFILE=shared` 环境变量，launcher 看到显式变量就跳过读 `active_profile.json`（与 OTA 的 `NPT_DESKTOP_VERSION` 继承坑同源）。双保险：① `write_relaunch_helper` 生成的 `.cmd` 在 `:launch` 前 `set "NPT_DESKTOP_PROFILE="`；② `spawn_relaunch` 用净化环境（剔掉 `NPT_DESKTOP_PROFILE`）拉起子进程。
