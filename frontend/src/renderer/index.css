@@ -72,6 +72,27 @@
   @apply bg-muted-foreground/50;
 }
 
+/* 沟通助手会话列表/消息流：由 useImScrollbarHover 按光标坐标切换显隐；
+   轨道与滑块保持占位，避免显隐前后内容宽度跳动。 */
+[data-im-window] .im-scroll-on-hover::-webkit-scrollbar,
+[data-im-window] .im-scroll-on-hover::-webkit-scrollbar-track,
+[data-im-window] .im-scroll-on-hover::-webkit-scrollbar-thumb,
+[data-im-window] .im-scroll-on-hover::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+[data-im-window] .im-scroll-on-hover.im-scrollbar-visible::-webkit-scrollbar-track {
+  background: hsl(var(--secondary));
+}
+
+[data-im-window] .im-scroll-on-hover.im-scrollbar-visible::-webkit-scrollbar-thumb {
+  background: hsl(var(--muted-foreground) / 0.3);
+}
+
+[data-im-window] .im-scroll-on-hover.im-scrollbar-visible::-webkit-scrollbar-thumb:hover {
+  background: hsl(var(--muted-foreground) / 0.5);
+}
+
 /* Leaflet地图样式覆盖 */
 .leaflet-container {
   background: hsl(var(--muted));

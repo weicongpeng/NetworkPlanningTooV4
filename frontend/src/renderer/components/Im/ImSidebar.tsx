@@ -11,6 +11,7 @@ import { useImStore } from '../../store/imStore'
 import { useThemeStore } from '../../store/themeStore'
 import { ImAvatar } from './ImAvatar'
 import { systemNoticeText } from './ImSystemNotice'
+import { useImScrollbarHover } from './useImScrollbarHover'
 import { openUserSettings } from './userSettingsBus'
 import { conversationTitle, formatConversationTime, imDisplayName, parseSystemMessage } from './types'
 import type { ImGroup, ImLastMessage, ImUser } from './types'
@@ -43,6 +44,8 @@ export function ImSidebar({ onOpenChat }: Props) {
     return Number.isFinite(saved) && saved >= 220 ? Math.min(480, saved) : 300
   })
   const sidebarResizeRef = useRef<{ x: number; width: number } | null>(null)
+  const listScrollRef = useRef<HTMLDivElement>(null)
+  useImScrollbarHover(listScrollRef)
 
   const onSidebarResizeDown = (event: ReactPointerEvent<HTMLDivElement>) => {
     event.preventDefault()
@@ -159,7 +162,7 @@ export function ImSidebar({ onOpenChat }: Props) {
         </div>
       </div>
 
-      <div className="min-h-0 flex-1 overflow-y-auto px-2 pb-3 pt-2">
+      <div ref={listScrollRef} className="min-h-0 flex-1 overflow-y-auto px-2 pb-3 pt-2 im-scroll-on-hover">
         {activeTab === 'messages' ? (
           <>
             {filteredConversations.length === 0 && (

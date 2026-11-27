@@ -20,6 +20,7 @@ import { ImMessageContextMenu } from './ImMessageContextMenu'
 import type { MessageMenuState } from './ImMessageContextMenu'
 import { ImMessageItem } from './ImMessageItem'
 import { ImSystemNotice } from './ImSystemNotice'
+import { useImScrollbarHover } from './useImScrollbarHover'
 import {
   conversationTitle, formatBytes, formatClock, imDisplayName, imUserId, isWithinRecallWindow,
 } from './types'
@@ -77,6 +78,7 @@ export function ImChatPanel({ conversation, pendingPeer, narrow, onBack }: Props
   const [atBottom, setAtBottom] = useState(true)
   const [membersOpen, setMembersOpen] = useState(false)
   const scrollRef = useRef<HTMLDivElement>(null)
+  useImScrollbarHover(scrollRef)
   const contentRef = useRef<HTMLDivElement>(null)
   const loadedFor = useRef<number | null>(null)
   // 与 atBottom 状态同步的 ref：ResizeObserver / 滚动回调里读最新值，不受闭包影响
@@ -402,7 +404,7 @@ export function ImChatPanel({ conversation, pendingPeer, narrow, onBack }: Props
       )}
 
       <div ref={scrollRef} onScroll={onScroll}
-           className="relative min-h-0 flex-1 overflow-y-auto px-4 py-4">
+           className="relative min-h-0 flex-1 overflow-y-auto px-4 py-4 im-scroll-on-hover">
         <div ref={contentRef} className="flex min-h-full flex-col space-y-3">
         {cursor?.hasMore && (
           <div className="flex justify-center">
